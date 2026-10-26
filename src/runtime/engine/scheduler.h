@@ -227,6 +227,44 @@ public:
         throw std::logic_error("admitted request is absent from the fresh queue");
     }
 
+    // Cache-affinity overtake (EngineOptions::admission_affinity, opt-in): a waiter whose prompt
+    // resumes a prefix already held on the device may be tried ahead of the FIFO head, and each
+    // older waiter can be passed this way at most kMaxAffinityOvertakes times. This allowance and
+    // the bypass allowance above are separate counters: an overtake does not spend
+    // admission_bypasses, a bypass does not spend overtakes, and neither barrier limits the other,
+    // so a waiter is passed at most `concurrency + kMaxAffinityOvertakes` times in all.
+    static constexpr std::uint32_t kMaxAffinityOvertakes = 4;
+    // `affine` is asked about the head and at most this many waiters behind it.
+    static constexpr std::size_t kAffinityScanDepth = 8;
+
+    // The oldest affine waiter, when it is behind the head and every waiter older than it has
+    // overtakes < kMaxAffinityOvertakes. An affine head is ordinary FIFO (nullopt). Charges nothing.
+    template <class Fresh, class Pred>
+    [[nodiscard]] std::optional<std::size_t> affinity_candidate(const Fresh& fresh,
+                                                                Pred affine) const {
+        const std::size_t end = std::min<std::size_t>(fresh.size(), kAffinityScanDepth + 1);
+        for (std::size_t i = 0; i < end; ++i) {
+            if (affine(fresh[i])) { return i == 0 ? std::nullopt : std::optional(i); }
+            if (fresh[i]->overtakes >= kMaxAffinityOvertakes) { break; }
+        }
+        return std::nullopt;
+    }
+
+    // The waiter at `index` was admitted by an overtake: every older waiter was passed once.
+    template <class Fresh>
+    void overtook(const Fresh& fresh, std::size_t index) const {
+        if (index == 0 || index >= fresh.size()) {
+            throw std::logic_error("an overtake needs a waiter behind the FIFO head");
+        }
+        for (std::size_t i = 0; i < index; ++i) {
+            if (fresh[i]->overtakes >= kMaxAffinityOvertakes) {
+                throw std::logic_error("fresh admission exceeded the cache-affinity overtake "
+                                       "allowance");
+            }
+        }
+        for (std::size_t i = 0; i < index; ++i) { ++fresh[i]->overtakes; }
+    }
+
     template <class Slots>
     [[nodiscard]] std::optional<std::uint32_t>
     youngest_victim(const Slots& slots, std::uint32_t concurrency,

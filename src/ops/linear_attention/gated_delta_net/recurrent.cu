@@ -19,15 +19,15 @@ static_assert(sizeof(GdnReplayFoldKernelRows) == 128);
 static_assert(alignof(GdnReplayFoldKernelRows) == 16);
 static_assert(std::is_trivially_copyable_v<GdnReplayFoldKernelRows>);
 
-template <bool NormalizeQK, class StateT>
+template <bool NormalizeQK, class StateT, GdnHeadMap Map>
 void launch_recurrent_direct_typed(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& state_read, Tensor& state_write, Tensor& out,
                                    cudaStream_t stream) {
-    const auto heads = head_map::of(q.ne[1], v.ne[1]);
+    const auto heads = head_map<Map>::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), 1, static_cast<unsigned>(kStateDim / kBlockDv));
     const dim3 block(kWarpSize, kNumWarps, 1);
-    recurrent_bf16_direct_kernel<NormalizeQK, StateT><<<grid, block, 0, stream>>>(
+    recurrent_bf16_direct_kernel<NormalizeQK, StateT, Map><<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data), static_cast<const float*>(g.data),
         static_cast<const float*>(beta.data), static_cast<const StateT*>(state_read.data),
@@ -40,32 +40,44 @@ template <bool NormalizeQK>
 void launch_recurrent_direct_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& state_read, Tensor& state_write, Tensor& out,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, GdnHeadMap map) {
     if (state_read.dtype != state_write.dtype) {
         throw std::invalid_argument("GDN recurrent: state read/write dtypes differ");
     }
+    if (map == GdnHeadMap::Tiled) {
+        // Instantiated for Qwen3.8-Flash-Next's call only: normalized q/k, an FP32 state.
+        if constexpr (NormalizeQK) {
+            if (state_read.dtype == DType::FP32) {
+                launch_recurrent_direct_typed<true, float, GdnHeadMap::Tiled>(
+                    q, k, v, g, beta, scale, state_read, state_write, out, stream);
+                return;
+            }
+        }
+        throw std::invalid_argument(
+            "GDN recurrent: the tiled head map needs normalized q/k and an FP32 state");
+    }
     if (state_read.dtype == DType::FP16) {
-        launch_recurrent_direct_typed<NormalizeQK, __half>(q, k, v, g, beta, scale, state_read,
-                                                            state_write, out, stream);
+        launch_recurrent_direct_typed<NormalizeQK, __half, GdnHeadMap::Blocked>(
+            q, k, v, g, beta, scale, state_read, state_write, out, stream);
     } else {
-        launch_recurrent_direct_typed<NormalizeQK, float>(q, k, v, g, beta, scale, state_read,
-                                                           state_write, out, stream);
+        launch_recurrent_direct_typed<NormalizeQK, float, GdnHeadMap::Blocked>(
+            q, k, v, g, beta, scale, state_read, state_write, out, stream);
     }
 }
 
-template <bool NormalizeInputs, class StateT>
+template <bool NormalizeInputs, class StateT, GdnHeadMap Map>
 void launch_recurrent_batch_update_typed(const Tensor& q, const Tensor& k, const Tensor& v,
                                          const Tensor& g, const Tensor& beta, float scale,
                                          Tensor& ssm_states, const Tensor& source_state_slots,
                                          const Tensor& destination_state_slots, Tensor& out,
                                          cudaStream_t stream) {
-    const auto heads = head_map::of(q.ne[1], v.ne[1]);
+    const auto heads = head_map<Map>::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), static_cast<unsigned>(q.ne[3]),
                     static_cast<unsigned>(kStateDim / kBlockDv));
     const dim3 block(kWarpSize, kNumWarps, 1);
     const std::int64_t state_slot_stride =
         static_cast<std::int64_t>(kStateDim) * kStateDim * ssm_states.ne[2];
-    const BatchUpdateAccess<StateT> access{
+    const BatchUpdateAccess<StateT, Map> access{
         static_cast<const __nv_bfloat16*>(q.data),
         static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data),
@@ -80,7 +92,7 @@ void launch_recurrent_batch_update_typed(const Tensor& q, const Tensor& k, const
         state_slot_stride,
         scale,
     };
-    recurrent_batch_update_kernel<NormalizeInputs, StateT><<<grid, block, 0, stream>>>(access);
+    recurrent_batch_update_kernel<NormalizeInputs, StateT, Map><<<grid, block, 0, stream>>>(access);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -89,32 +101,45 @@ void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const
                                          const Tensor& g, const Tensor& beta, float scale,
                                          Tensor& ssm_states, const Tensor& source_state_slots,
                                          const Tensor& destination_state_slots, Tensor& out,
-                                         cudaStream_t stream) {
+                                         cudaStream_t stream, GdnHeadMap map) {
+    if (map == GdnHeadMap::Tiled) {
+        // Instantiated for Qwen3.8-Flash-Next's call only: normalized q/k, an FP32 state.
+        if constexpr (NormalizeInputs) {
+            if (ssm_states.dtype == DType::FP32) {
+                launch_recurrent_batch_update_typed<true, float, GdnHeadMap::Tiled>(
+                    q, k, v, g, beta, scale, ssm_states, source_state_slots,
+                    destination_state_slots, out, stream);
+                return;
+            }
+        }
+        throw std::invalid_argument(
+            "GDN batch update: the tiled head map needs normalized q/k and an FP32 state");
+    }
     if (ssm_states.dtype == DType::FP16) {
-        launch_recurrent_batch_update_typed<NormalizeInputs, __half>(
+        launch_recurrent_batch_update_typed<NormalizeInputs, __half, GdnHeadMap::Blocked>(
             q, k, v, g, beta, scale, ssm_states, source_state_slots, destination_state_slots, out,
             stream);
     } else {
-        launch_recurrent_batch_update_typed<NormalizeInputs, float>(
+        launch_recurrent_batch_update_typed<NormalizeInputs, float, GdnHeadMap::Blocked>(
             q, k, v, g, beta, scale, ssm_states, source_state_slots, destination_state_slots, out,
             stream);
     }
 }
 
-template <bool Masked, class StateT>
+template <bool Masked, class StateT, GdnHeadMap Map>
 void launch_recurrent_record_typed(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
                                    cudaStream_t stream) {
-    const auto heads = head_map::of(q.ne[1], v.ne[1]);
+    const auto heads = head_map<Map>::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), static_cast<unsigned>(q.ne[3]),
                     static_cast<unsigned>(kStateDim / kBlockDv));
     const dim3 block(kWarpSize, kNumWarps, 1);
     const std::int64_t state_slot_stride =
         static_cast<std::int64_t>(kStateDim) * kStateDim * ssm_states.ne[2];
-    const RecordAccess<Masked, StateT> access{
+    const RecordAccess<Masked, StateT, Map> access{
         static_cast<const __nv_bfloat16*>(q.data),
         static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data),
@@ -132,7 +157,7 @@ void launch_recurrent_record_typed(const Tensor& q, const Tensor& k, const Tenso
         state_slot_stride,
         scale,
     };
-    recurrent_record_kernel<Masked, StateT><<<grid, block, 0, stream>>>(access);
+    recurrent_record_kernel<Masked, StateT, Map><<<grid, block, 0, stream>>>(access);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -142,17 +167,28 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, GdnHeadMap map) {
+    if (map == GdnHeadMap::Tiled) {
+        // Instantiated for Qwen3.8-Flash-Next's call only: dense rows, an FP32 state.
+        if constexpr (!Masked) {
+            if (ssm_states.dtype == DType::FP32) {
+                launch_recurrent_record_typed<false, float, GdnHeadMap::Tiled>(
+                    q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
+                    key_record, value_record, gate_record, out, stream);
+                return;
+            }
+        }
+        throw std::invalid_argument(
+            "GDN replay record: the tiled head map needs dense rows and an FP32 state");
+    }
     if (ssm_states.dtype == DType::FP16) {
-        launch_recurrent_record_typed<Masked, __half>(q, k, v, g, beta, scale, ssm_states,
-                                                      valid_columns, initial_state_slots,
-                                                      key_record, value_record, gate_record, out,
-                                                      stream);
+        launch_recurrent_record_typed<Masked, __half, GdnHeadMap::Blocked>(
+            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, key_record,
+            value_record, gate_record, out, stream);
     } else {
-        launch_recurrent_record_typed<Masked, float>(q, k, v, g, beta, scale, ssm_states,
-                                                     valid_columns, initial_state_slots,
-                                                     key_record, value_record, gate_record, out,
-                                                     stream);
+        launch_recurrent_record_typed<Masked, float, GdnHeadMap::Blocked>(
+            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, key_record,
+            value_record, gate_record, out, stream);
     }
 }
 
@@ -198,26 +234,26 @@ void launch_replay_fold_fixed(const GdnReplayRecords& records,
 
 void launch_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                       const Tensor& beta, float scale, bool normalize_qk, Tensor& ssm_state,
-                      Tensor& out, cudaStream_t stream) {
+                      Tensor& out, cudaStream_t stream, GdnHeadMap map) {
     if (normalize_qk) {
         launch_recurrent_direct_fixed<true>(q, k, v, g, beta, scale, ssm_state, ssm_state, out,
-                                            stream);
+                                            stream, map);
     } else {
         launch_recurrent_direct_fixed<false>(q, k, v, g, beta, scale, ssm_state, ssm_state, out,
-                                             stream);
+                                             stream, map);
     }
 }
 
 void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                             const Tensor& beta, float scale, bool normalize_qk,
                             const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
-                            cudaStream_t stream) {
+                            cudaStream_t stream, GdnHeadMap map) {
     if (normalize_qk) {
         launch_recurrent_direct_fixed<true>(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out,
-                                            out, stream);
+                                            out, stream, map);
     } else {
         launch_recurrent_direct_fixed<false>(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out,
-                                             out, stream);
+                                             out, stream, map);
     }
 }
 
@@ -226,15 +262,15 @@ void launch_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tenso
                                    bool normalize_qk, Tensor& ssm_states,
                                    const Tensor& source_state_slots,
                                    const Tensor& destination_state_slots, Tensor& out,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, GdnHeadMap map) {
     if (normalize_qk) {
         launch_recurrent_batch_update_fixed<true>(q, k, v, g, beta, scale, ssm_states,
                                                   source_state_slots, destination_state_slots, out,
-                                                  stream);
+                                                  stream, map);
     } else {
         launch_recurrent_batch_update_fixed<false>(q, k, v, g, beta, scale, ssm_states,
                                                    source_state_slots, destination_state_slots, out,
-                                                   stream);
+                                                   stream, map);
     }
 }
 
@@ -242,21 +278,36 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
                              const Tensor& beta, float scale, const Tensor& ssm_states,
                              const Tensor& valid_columns, const Tensor& initial_state_slots,
                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                             Tensor& out, cudaStream_t stream) {
+                             Tensor& out, cudaStream_t stream, GdnHeadMap map) {
     if (valid_columns.data == nullptr) {
         launch_recurrent_record_fixed<false>(q, k, v, g, beta, scale, ssm_states, valid_columns,
                                              initial_state_slots, key_record, value_record,
-                                             gate_record, out, stream);
+                                             gate_record, out, stream, map);
     } else {
         launch_recurrent_record_fixed<true>(q, k, v, g, beta, scale, ssm_states, valid_columns,
                                             initial_state_slots, key_record, value_record,
-                                            gate_record, out, stream);
+                                            gate_record, out, stream, map);
     }
 }
 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                         cudaStream_t stream) {
+    if (records.spec.head_map == GdnHeadMap::Tiled) {
+        if (records.spec.qk_heads == FoldGeometry16x48Tiled::kQkHeads &&
+            records.spec.value_heads == FoldGeometry16x48Tiled::kValueHeads &&
+            records.spec.conv_channels == FoldGeometry16x48Tiled::kConvChannels) {
+            // Instantiated for Qwen3.8-Flash-Next's FP32 state only.
+            if (states.recurrent_layer0.dtype != DType::FP32) {
+                throw std::invalid_argument(
+                    "GDN replay fold: the tiled head map needs an FP32 state");
+            }
+            launch_replay_fold_typed<FoldGeometry16x48Tiled, float>(records, states, rows,
+                                                                    active_rows, stream);
+            return;
+        }
+        throw std::invalid_argument("GDN replay fold launcher received an unregistered geometry");
+    }
     if (records.spec.qk_heads == FoldGeometry16x48::kQkHeads &&
         records.spec.value_heads == FoldGeometry16x48::kValueHeads &&
         records.spec.conv_channels == FoldGeometry16x48::kConvChannels) {

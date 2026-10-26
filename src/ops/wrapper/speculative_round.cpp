@@ -170,7 +170,8 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
-                                      WorkspaceArena& workspace, cudaStream_t stream) {
+                                      WorkspaceArena& workspace, cudaStream_t stream,
+                                      Tensor* relaxed_kept) {
     constexpr const char* op = "speculative_accept_greedy_drafts";
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t batch = drafts.ne[1];
@@ -198,13 +199,15 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     if (configs == nullptr) {
         throw std::invalid_argument("speculative_accept_greedy_drafts: configs must be non-null");
     }
+    if (relaxed_kept != nullptr) { require_vector(*relaxed_kept, DType::I32, batch, op, "relaxed_kept"); }
     auto scratch_scope = workspace.scope();
     const std::size_t bytes =
         speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch, batch);
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::speculative_accept_greedy_drafts_launch(
         target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
-        licensed_counts, accepted, token_domain, configs, scratch, stream);
+        licensed_counts, accepted, token_domain, configs, scratch, stream,
+        relaxed_kept != nullptr ? static_cast<std::int32_t*>(relaxed_kept->data) : nullptr);
 }
 
 void speculative_accept_sparse_drafts(
@@ -212,7 +215,8 @@ void speculative_accept_sparse_drafts(
     const Tensor& candidate_ids, const Tensor& proposal_q, const Tensor& current_extents,
     Tensor& round_lengths, Tensor& round_anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
     Tensor& accepted_drafts, std::int32_t token_domain, const SamplingConfig* configs,
-    SpeculativeAcceptExecutionEnvelope envelope, WorkspaceArena& workspace, cudaStream_t stream) {
+    SpeculativeAcceptExecutionEnvelope envelope, WorkspaceArena& workspace, cudaStream_t stream,
+    Tensor* relaxed_kept) {
     constexpr const char* op = "speculative_accept_sparse_drafts";
     if (token_domain != kSparseTokenDomain) {
         throw std::invalid_argument(
@@ -240,6 +244,7 @@ void speculative_accept_sparse_drafts(
     if (configs == nullptr) {
         throw std::invalid_argument("speculative_accept_sparse_drafts: configs must be non-null");
     }
+    if (relaxed_kept != nullptr) { require_vector(*relaxed_kept, DType::I32, batch, op, "relaxed_kept"); }
 
     auto scratch_scope      = workspace.scope();
     const std::size_t bytes = speculative_accept_sparse_drafts_workspace_capacity_bytes(
@@ -248,7 +253,8 @@ void speculative_accept_sparse_drafts(
     detail::speculative_accept_sparse_drafts_launch(
         target_tokens, logits, drafts, candidate_ids, proposal_q, current_extents, round_lengths,
         round_anchors, licensed_tokens, licensed_counts, accepted_drafts, token_domain, configs,
-        envelope.all_rows_greedy_without_penalties, scratch, stream);
+        envelope.all_rows_greedy_without_penalties, scratch, stream,
+        relaxed_kept != nullptr ? static_cast<std::int32_t*>(relaxed_kept->data) : nullptr);
 }
 
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,

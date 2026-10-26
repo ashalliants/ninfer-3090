@@ -129,6 +129,7 @@ public:
         : instance_(instance), device_(device), max_context_(options.max_context),
           max_concurrency_(options.max_concurrency),
           admission_fit_check_(options.admission_fit_check),
+          admission_affinity_(options.admission_affinity),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
@@ -849,6 +850,9 @@ private:
     };
 
     void publish_runtime_stats();
+    // One occupied lane's row of RuntimeStats::lanes as of `now`.
+    [[nodiscard]] static RuntimeLaneStats lane_stats(const Request& request,
+                                                     Clock::time_point now) noexcept;
 
     GenerationResult wait_for_request(std::shared_ptr<Request> request, OutputSink* sink,
                                       const CancellationView& cancellation) {
@@ -965,6 +969,8 @@ private:
         std::vector<typename ResourceManagement::SourceChoice> sources;
         std::size_t current = 0;
         typename ResourceManagement::ReclaimCursor reclaim;
+        // Tried ahead of the FIFO head by a cache-affinity overtake (admission_affinity).
+        bool overtake = false;
     };
 
     struct CaptureDecision {
@@ -1619,6 +1625,8 @@ private:
                 counters.ngram_drafted_tokens - observed.ngram_drafted_tokens;
             cumulative_stats_.speculative_ngram_accepted_tokens +=
                 counters.ngram_accepted_tokens - observed.ngram_accepted_tokens;
+            cumulative_stats_.speculative_relaxed_kept +=
+                counters.relaxed_kept - observed.relaxed_kept;
             observed.rounds                = counters.rounds;
             observed.drafted_tokens        = counters.drafted_tokens;
             observed.accepted_tokens       = counters.accepted_tokens;
@@ -1626,6 +1634,7 @@ private:
             observed.ngram_rounds          = counters.ngram_rounds;
             observed.ngram_drafted_tokens  = counters.ngram_drafted_tokens;
             observed.ngram_accepted_tokens = counters.ngram_accepted_tokens;
+            observed.relaxed_kept          = counters.relaxed_kept;
             if (cancelled[row] || failed[row]) {
                 request->generation_timings = committed.rows[row].timings;
                 request->speculative_stats  = std::move(committed.rows[row].speculative);
@@ -2566,6 +2575,7 @@ private:
             return false;
         }
         call.finish(call.failed_timing());
+        request->paused_while_replaying = request->is_replaying();
         if (!request->is_replaying()) { request->resume_phase = request->model_state; }
         request->model_state = EngineRequestState::Pausing;
         request->paused_at   = pause_started;
@@ -2820,6 +2830,65 @@ private:
         return true;
     }
 
+    // A source that resumes a prefix held on the device: it reuses tokens from a checkpoint the
+    // request may take over or that its session left, and needs no Host-to-device copy.
+    [[nodiscard]] static bool resumes_held_prefix(
+        const typename ResourceManagement::SourceChoice& choice) noexcept {
+        return choice.source.reused_tokens > 0 && (choice.take_over || choice.session_hint) &&
+               std::none_of(choice.source.transfers.begin(), choice.source.transfers.end(),
+                            [](const auto& transfer) {
+                                return transfer.direction == ContextTransferDirection::HostToDevice;
+                            });
+    }
+
+    // Whether the source admission would try first for this waiter resumes a prefix held on the
+    // device (resumes_held_prefix). Asked once per admission generation; a waiter that is being
+    // hydrated, waits for a sibling or was already tried in this generation is not affine.
+    [[nodiscard]] bool admission_affine(const std::shared_ptr<Request>& request) {
+        if (request->hydrating || request->awaiting_sibling ||
+            request->admission_generation == admission_generation_ ||
+            request->cancelled.load(std::memory_order_acquire)) {
+            return false;
+        }
+        if (request->affinity_generation != admission_generation_) {
+            request->affinity_generation = admission_generation_;
+            request->affine              = false;
+            // As in admission itself, a planning failure here belongs to this request alone.
+            admission_subject_ = request;
+            ensure_base_plan(request);
+            const auto sources = resources_.candidates(
+                *instance_.program, *request->base_plan, UINT32_MAX, std::nullopt, request->id,
+                request->publication_order);
+            admission_subject_.reset();
+            request->affine = !sources.empty() && resumes_held_prefix(sources.front());
+        }
+        return request->affine;
+    }
+
+    // The waiter a cache-affinity overtake would try first, if any. Only a head that is about to
+    // be tried is overtaken: one already tried in this generation, being hydrated or waiting for a
+    // sibling cannot take the lane now, and the ordinary bypass (charged as such) serves the
+    // waiters behind it. The predicate plans and prices sources outside the queue lock: only this
+    // worker removes waiters, so the copied prefix of the queue stays its prefix meanwhile.
+    [[nodiscard]] std::shared_ptr<Request> affinity_overtaker() {
+        std::vector<std::shared_ptr<Request>> waiting;
+        {
+            std::lock_guard lock(queue_mutex_);
+            const auto count =
+                std::min<std::size_t>(pending_.size(), Scheduling::kAffinityScanDepth + 1);
+            waiting.assign(pending_.begin(), pending_.begin() + static_cast<std::ptrdiff_t>(count));
+        }
+        if (waiting.empty()) { return nullptr; }
+        const auto& head = *waiting.front();
+        if (head.hydrating || head.awaiting_sibling ||
+            head.admission_generation == admission_generation_) {
+            return nullptr;
+        }
+        const auto index = scheduler_.affinity_candidate(
+            waiting, [&](const std::shared_ptr<Request>& request) { return admission_affine(request); });
+        return index ? waiting[*index] : nullptr;
+    }
+
     bool try_admit_one(bool restoring) {
         if (instance_.program->has_context_transaction()) { return false; }
         const auto lane = free_lane();
@@ -2849,6 +2918,17 @@ private:
             std::lock_guard lock(queue_mutex_);
             candidates = scheduler_.fresh_candidates(pending_, max_concurrency_);
         }
+        // A waiter resuming a prefix held on the device goes ahead of the head, only while a pass is
+        // open and a lane is free (without one every candidate just keeps its source and waits).
+        std::shared_ptr<Request> overtaker;
+        if (admission_affinity_ && lane && !admission_decision_ && !restoring &&
+            !candidates.empty()) {
+            overtaker = affinity_overtaker();
+            if (overtaker) {
+                std::erase(candidates, overtaker);
+                candidates.insert(candidates.begin(), overtaker);
+            }
+        }
         for (const auto& request : candidates) {
             // Until admission touches a resident lane (pause_resident clears it), a failure from
             // here on belongs to this request alone; see contain_admission_failure.
@@ -2857,8 +2937,10 @@ private:
                                                  : ReclaimPurpose::FreshAdmission,
                                        request->id};
             if (!admission_decision_) {
+                const auto examined_generation = request->admission_generation;
                 if (!restoring) {
-                    scheduler_.admission_candidate_checked(request->id);
+                    // The overtaker is outside the rotating pass; its ticket there is untouched.
+                    if (request != overtaker) { scheduler_.admission_candidate_checked(request->id); }
                     // Its stored session is being read back; offered again once that settles.
                     if (request->hydrating || request->awaiting_sibling) { continue; }
                     if (request->admission_generation == admission_generation_) { continue; }
@@ -2892,6 +2974,16 @@ private:
                                                         : std::nullopt,
                                                     request->id, request->publication_order);
                 }
+                // The cached answer can be stale by now. A promoted waiter whose re-priced first source
+                // no longer resumes a held prefix returns to its own place in the ordinary pass (its
+                // scan ticket is untouched): it is neither charged as an overtake nor tried here as a
+                // bypass, which could pass a waiter whose bypass allowance is spent.
+                if (request == overtaker &&
+                    (sources.empty() || !resumes_held_prefix(sources.front()))) {
+                    request->admission_generation = examined_generation;
+                    request->affine               = false;
+                    continue;
+                }
                 if (!restoring && start_hydration(request, sources)) { continue; }
                 if (!restoring && await_sibling(request, sources)) { continue; }
                 if (!restoring && !sources.empty()) {
@@ -2905,7 +2997,8 @@ private:
                 }
                 admission_decision_.emplace(AdmissionDecision{
                     request, restoring, std::move(sources), 0,
-                    resources_.begin_reclaim(*instance_.program, std::nullopt, rights)});
+                    resources_.begin_reclaim(*instance_.program, std::nullopt, rights),
+                    request == overtaker});
             }
             auto& decision = *admission_decision_;
             ContextResourceUsage shortage;
@@ -3049,7 +3142,20 @@ private:
                                        binding_started);
                 } else {
                     std::lock_guard lock(queue_mutex_);
-                    scheduler_.admitted(pending_, *request, max_concurrency_);
+                    std::size_t passed = 0;
+                    if (decision.overtake) {
+                        // Cancelled older waiters can have left the overtaker at the head by now.
+                        const auto position = std::find(pending_.begin(), pending_.end(), request);
+                        if (position != pending_.end()) {
+                            passed = static_cast<std::size_t>(position - pending_.begin());
+                        }
+                    }
+                    if (passed != 0) {
+                        scheduler_.overtook(pending_, passed);
+                        ++cumulative_stats_.admission_overtakes;
+                    } else {
+                        scheduler_.admitted(pending_, *request, max_concurrency_);
+                    }
                     std::erase(pending_, request);
                 }
                 request->model_state = EngineRequestState::Materializing;
@@ -5036,6 +5142,7 @@ private:
     const std::uint32_t max_context_;
     const std::uint32_t max_concurrency_;
     const bool admission_fit_check_;
+    const bool admission_affinity_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const std::uint32_t prefill_chunk_;

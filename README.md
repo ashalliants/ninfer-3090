@@ -134,7 +134,8 @@ of paused requests share once they leave the card. It is host memory, not GPU me
 now pins all of it too (earlier releases clamped it there to about 4.6 GiB).
 
 **Overrides**, from the environment: `NINFER_HOST`, `NINFER_PORT`, `NINFER_MODEL`, `NINFER_SERVER`,
-`NINFER_CHAT_TEMPLATE` for every profile, plus `NINFER_CONTEXT`, `NINFER_CONCURRENCY`,
+`NINFER_CHAT_TEMPLATE`, `NINFER_ALLOWED_HOST` (more names the server answers to, such as
+`gpubox.lan`; see [Host and Origin checks](docs/serving.md#host-and-origin-checks)) for every profile, plus `NINFER_CONTEXT`, `NINFER_CONCURRENCY`,
 `NINFER_KV_CAPACITY`, `NINFER_KV_DTYPE`, `NINFER_SPEC`, `NINFER_DRAFT_TOKENS`, `NINFER_PREFILL_CHUNK`,
 `NINFER_VISION`, `NINFER_HOST_CONTEXT_MIB` (8192), `NINFER_MIN_P` (0.03) and `NINFER_PRESENCE_PENALTY` (0.5) for the
 default ones; the last two are the loop guard, and `default` leaves the registered sampling preset in force. Other serving flags are opt-in overrides too: `NINFER_AUTO_HOST_CACHE=on`, `NINFER_MAX_OUTPUT_TOKENS`, `NINFER_MLP_A8_DECODE=on`, `NINFER_CONTEXT_STORE` and `NINFER_REASONING_LOOP=stop|conclude` (listed with their caps at the top of `run.sh` / `run.bat`). The reasoning-loop guard stays off unless set: it has not yet fired on a real Qwen3.8 run, and its thresholds were measured on other models ([serving](docs/serving.md#openai-chat-completions), under `--reasoning-loop`). The launchers bind `127.0.0.1`;
@@ -399,6 +400,8 @@ The server supports:
 - retained conversations survive a restart in a local context store (`--context-store`),
   optionally copied to an S3-compatible bucket ([docs](docs/serving.md#context-store));
 - Prometheus metrics at `GET /metrics` ([docs](docs/serving.md#metrics)) and a read-only `GET /props`;
+- a live dashboard page at `GET /dashboard`: throughput, draft acceptance, lanes and GPU
+  readings ([docs](docs/serving.md#dashboard));
 - prompt-rendered function tools and parsed tool calls (returned to the client, not executed);
 - bounded pending-request admission and JSONL request logs.
 
@@ -807,8 +810,9 @@ and the design are in `docs/maintainer/pipeline-parallel-plan.md`.
 ## Release history
 
 **v0.14.2:** `--host-cache-max-mib` caps the RAM cache on shared machines. This release also
-added `--max-prefill-lanes` and `GET /slots`, which the current engine no longer provides
-(see [docs/serving.md](docs/serving.md)). See the [v0.14.2 release notes](docs/release-notes/RELEASE_NOTES_0.14.2.md).
+added `--max-prefill-lanes` and a `GET /slots` with session-file fields. The current `GET /slots`
+is read-only and reports each lane's progress (see [docs/serving.md](docs/serving.md#slots)). See
+the [v0.14.2 release notes](docs/release-notes/RELEASE_NOTES_0.14.2.md).
 
 **v0.14.1:** a stability fix for `ninfer-serve`. A large or unplannable request no longer fails
 every running request (`internal error generation`) or clears the context cache; only that request

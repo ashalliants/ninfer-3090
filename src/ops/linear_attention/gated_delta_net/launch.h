@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/gdn_head_map.h"
 #include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
@@ -23,25 +24,26 @@ struct alignas(16) GdnReplayFoldKernelRows {
 
 void launch_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                       const Tensor& beta, float scale, bool normalize_qk, Tensor& ssm_state,
-                      Tensor& out, cudaStream_t stream);
+                      Tensor& out, cudaStream_t stream, GdnHeadMap map = GdnHeadMap::Blocked);
 
 void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                             const Tensor& beta, float scale, bool normalize_qk,
                             const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
-                            cudaStream_t stream);
+                            cudaStream_t stream, GdnHeadMap map = GdnHeadMap::Blocked);
 
 void launch_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    bool normalize_qk, Tensor& ssm_states,
                                    const Tensor& source_state_slots,
                                    const Tensor& destination_state_slots, Tensor& out,
-                                   cudaStream_t stream);
+                                   cudaStream_t stream, GdnHeadMap map = GdnHeadMap::Blocked);
 
 void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                              const Tensor& beta, float scale, const Tensor& ssm_states,
                              const Tensor& valid_columns, const Tensor& initial_state_slots,
                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                             Tensor& out, cudaStream_t stream);
+                             Tensor& out, cudaStream_t stream,
+                             GdnHeadMap map = GdnHeadMap::Blocked);
 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,

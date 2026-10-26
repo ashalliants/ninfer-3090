@@ -53,6 +53,7 @@ struct Request {
 
     std::uint64_t id                 = 0;
     std::uint32_t admission_bypasses = 0;
+    std::uint32_t overtakes          = 0;
     Phase phase                      = Phase::Waiting;
     bool capture_pending             = false;
     bool slice_in_flight             = false;
@@ -398,6 +399,168 @@ void test_prompt_fit_beside_residents() {
             "only full pages of a reused prefix are shared with its donor");
 }
 
+// Cache-affinity overtake (EngineOptions::admission_affinity). `affine` names the waiters whose
+// prompt resumes a prefix held on the device; it counts how often the predicate was asked.
+struct Affinity {
+    std::vector<std::uint64_t> ids;
+    std::size_t asked = 0;
+
+    [[nodiscard]] auto predicate() {
+        return [this](const RequestPtr& waiter) {
+            ++asked;
+            return std::find(ids.begin(), ids.end(), waiter->id) != ids.end();
+        };
+    }
+};
+
+std::deque<RequestPtr> waiters(std::uint64_t first, std::uint64_t count) {
+    std::deque<RequestPtr> fresh;
+    for (std::uint64_t id = first; id < first + count; ++id) { fresh.push_back(request(id)); }
+    return fresh;
+}
+
+void test_affine_jumps() {
+    Scheduler scheduler;
+    auto fresh = waiters(1, 4);
+    Affinity affinity{.ids = {3}};
+    require(scheduler.affinity_candidate(fresh, affinity.predicate()) == 2,
+            "a waiter resuming a held prefix was not offered ahead of the FIFO head");
+    affinity.ids = {4, 2};
+    require(scheduler.affinity_candidate(fresh, affinity.predicate()) == 1,
+            "the oldest affine waiter was not the one offered");
+    scheduler.overtook(fresh, 2);
+    require(fresh[0]->overtakes == 1 && fresh[1]->overtakes == 1 && fresh[2]->overtakes == 0 &&
+                fresh[3]->overtakes == 0,
+            "an overtake did not charge exactly the waiters it passed");
+}
+
+void test_non_affine_waits() {
+    Scheduler scheduler;
+    auto fresh = waiters(1, 4);
+    Affinity affinity;
+    require(!scheduler.affinity_candidate(fresh, affinity.predicate()),
+            "a waiter with no held prefix was offered ahead of the head");
+    // The head itself resuming a held prefix is ordinary FIFO: nobody overtakes it.
+    affinity.ids = {1, 3};
+    require(!scheduler.affinity_candidate(fresh, affinity.predicate()),
+            "an affine head let a younger affine waiter overtake it");
+    require(affinity.asked == 5, "the scan did not stop at the affine head");
+    for (const auto& waiter : fresh) {
+        require(waiter->overtakes == 0, "a refused overtake charged a waiter");
+    }
+    require(!scheduler.affinity_candidate(waiters(1, 1), affinity.predicate()),
+            "a lone head was offered as its own overtaker");
+}
+
+void test_older_passed_at_most_four() {
+    Scheduler scheduler;
+    auto fresh = waiters(1, 2);
+    Affinity affinity;
+    for (std::uint64_t id = 10; id < 10 + Scheduler::kMaxAffinityOvertakes; ++id) {
+        fresh.push_back(request(id));
+        affinity.ids = {id};
+        const auto index = scheduler.affinity_candidate(fresh, affinity.predicate());
+        require(index == fresh.size() - 1, "an overtake within the allowance was refused");
+        scheduler.overtook(fresh, *index);
+        fresh.erase(fresh.begin() + static_cast<std::ptrdiff_t>(*index));
+    }
+    require(fresh[0]->overtakes == 4 && fresh[1]->overtakes == 4, "the overtakes were not counted");
+    fresh.push_back(request(20));
+    affinity.ids = {20};
+    require(!scheduler.affinity_candidate(fresh, affinity.predicate()),
+            "a waiter was passed a fifth time");
+    bool refused = false;
+    try {
+        scheduler.overtook(fresh, 2);
+    } catch (const std::logic_error&) { refused = true; }
+    require(refused && fresh[0]->overtakes == 4 && fresh[2]->overtakes == 0,
+            "an overtake past the allowance was charged instead of refused");
+
+    // The head goes next and is admitted normally; the waiter it leaves at the front keeps its own
+    // count, so it cannot be passed again either.
+    scheduler.admitted(fresh, *fresh[0], 2);
+    fresh.pop_front();
+    require(fresh[0]->admission_bypasses == 0 && fresh[0]->overtakes == 4,
+            "the head's ordinary admission charged the waiters behind it");
+    require(!scheduler.affinity_candidate(fresh, affinity.predicate()),
+            "an overtaken waiter that became the head was passed past its allowance");
+    scheduler.admitted(fresh, *fresh[0], 2);
+    fresh.pop_front();
+    require(scheduler.affinity_candidate(fresh, affinity.predicate()) == std::nullopt &&
+                fresh.front()->id == 20,
+            "the affine waiter, now the head, was not left to ordinary FIFO");
+
+    // An exhausted waiter behind the head stops overtakes that would pass it, not ones ahead of it.
+    auto queue          = waiters(30, 4);
+    queue[1]->overtakes = Scheduler::kMaxAffinityOvertakes;
+    affinity.ids        = {33};
+    require(!scheduler.affinity_candidate(queue, affinity.predicate()),
+            "an overtake passed a waiter whose allowance was spent");
+    affinity.ids = {31};
+    require(scheduler.affinity_candidate(queue, affinity.predicate()) == 1,
+            "the exhausted waiter could not pass the head it is behind");
+    affinity.ids = {32};
+    require(!scheduler.affinity_candidate(queue, affinity.predicate()),
+            "an overtake passed a waiter whose allowance was spent");
+}
+
+void test_charged_only_on_admit() {
+    Scheduler scheduler;
+    auto fresh = waiters(1, 4);
+    Affinity affinity{.ids = {4}};
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        require(scheduler.affinity_candidate(fresh, affinity.predicate()) == 3,
+                "the affine waiter was not offered");
+        scheduler.begin_admission_scan();
+        for (const auto& candidate : scheduler.fresh_candidates(fresh, 2)) {
+            scheduler.admission_candidate_checked(candidate->id);
+        }
+    }
+    for (const auto& waiter : fresh) {
+        require(waiter->overtakes == 0 && waiter->admission_bypasses == 0,
+                "offering an overtake that was not admitted charged a waiter");
+    }
+
+    // The predicate is asked about the head and a bounded number of waiters behind it only.
+    const auto deep = waiters(100, Scheduler::kAffinityScanDepth + 4);
+    affinity.ids    = {deep[Scheduler::kAffinityScanDepth + 1]->id};
+    affinity.asked  = 0;
+    require(!scheduler.affinity_candidate(deep, affinity.predicate()) &&
+                affinity.asked == Scheduler::kAffinityScanDepth + 1,
+            "the affinity scan was not bounded");
+    affinity.ids = {deep[Scheduler::kAffinityScanDepth]->id};
+    require(scheduler.affinity_candidate(deep, affinity.predicate()) == Scheduler::kAffinityScanDepth,
+            "the last waiter inside the scan depth was not offered");
+}
+
+void test_bypass_allowance_unchanged() {
+    Scheduler scheduler;
+    auto fresh = waiters(1, 4);
+    // Overtakes do not spend the resource-bypass allowance, nor narrow the bypass scan.
+    scheduler.overtook(fresh, 3);
+    scheduler.overtook(fresh, 3);
+    require(fresh[0]->admission_bypasses == 0 && fresh[1]->admission_bypasses == 0,
+            "an overtake consumed FIFO bypass allowance");
+    fresh[0]->overtakes = Scheduler::kMaxAffinityOvertakes;
+    scheduler.begin_admission_scan();
+    require(scheduler.fresh_candidates(fresh, 2).size() == 3,
+            "a spent overtake allowance narrowed the resource-bypass scan");
+    // A resource bypass does not spend the overtake allowance.
+    fresh[0]->overtakes = 0;
+    scheduler.admitted(fresh, *fresh[2], 2);
+    require(fresh[0]->admission_bypasses == 1 && fresh[0]->overtakes == 0,
+            "a resource bypass was charged as an overtake");
+    // The two allowances are independent: a head with no bypass allowance left can still be
+    // overtaken by a waiter resuming a held prefix, within its own overtake allowance.
+    fresh[0]->admission_bypasses = 2;
+    scheduler.begin_admission_scan();
+    require(scheduler.fresh_candidates(fresh, 2).size() == 1,
+            "the exhausted bypass barrier changed");
+    Affinity affinity{.ids = {4}};
+    require(scheduler.affinity_candidate(fresh, affinity.predicate()) == 3,
+            "an exhausted bypass allowance blocked a cache-affinity overtake");
+}
+
 } // namespace
 
 int main() {
@@ -412,6 +575,11 @@ int main() {
         test_progress_anchor_frontiers();
         test_pause_host_target();
         test_prompt_fit_beside_residents();
+        test_affine_jumps();
+        test_non_affine_waits();
+        test_older_passed_at_most_four();
+        test_charged_only_on_admit();
+        test_bypass_allowance_unchanged();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {

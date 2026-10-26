@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/gdn_head_map.h"
 #include "core/layout.h"
 #include "core/tensor.h"
 
@@ -17,6 +18,8 @@ struct GdnReplayRecordSpec {
     std::int32_t value_heads     = 0;
     std::int32_t key_dim         = 0;
     std::int32_t value_dim       = 0;
+    // Which key head value head h reads (core/gdn_head_map.h); the fold replays the records with it.
+    GdnHeadMap head_map = GdnHeadMap::Blocked;
 };
 
 struct GdnReplayRecordLayout {

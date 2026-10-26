@@ -100,6 +100,12 @@ foreach ($script in @('run.bat', 'download-model.bat')) {
     if (-not (Test-Path -LiteralPath $source)) { throw "Missing release script: $source" }
     Copy-Item -LiteralPath $source -Destination $ProductRoot
 }
+# run.bat serves each profile from its --config file, which it looks for in profiles\ beside itself.
+$ProfilesRoot = Join-Path $ProductRoot 'profiles'
+New-Item -ItemType Directory -Path $ProfilesRoot | Out-Null
+$launcherProfiles = @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot 'scripts\profiles') -Filter '*.json' -File)
+if ($launcherProfiles.Count -eq 0) { throw "No launcher profiles in $(Join-Path $RepoRoot 'scripts\profiles')" }
+foreach ($launcherProfile in $launcherProfiles) { Copy-Item -LiteralPath $launcherProfile.FullName -Destination $ProfilesRoot }
 
 # A missing DLL only shows up on a machine that lacks it, and this one has the CUDA Toolkit and the
 # vcpkg tree on its PATH -- which is how the executables nearly shipped needing cublas64_12.dll, so
@@ -171,10 +177,13 @@ if ($HaveDriver -and $env:NINFER_PACKAGE_STATIC_DEPENDENCY_CHECK -ne '1') {
     Assert-ArchiveDependenciesSatisfied $ProductRoot
 }
 
-$innerHashes = Get-ChildItem -LiteralPath $ProductRoot -File | Sort-Object Name | ForEach-Object {
+$innerHashes = @(Get-ChildItem -LiteralPath $ProductRoot -File | Sort-Object Name | ForEach-Object {
     $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
     "$($hash.Hash.ToLowerInvariant())  $($_.Name)"
-}
+}) + @(Get-ChildItem -LiteralPath $ProfilesRoot -File | Sort-Object Name | ForEach-Object {
+    $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
+    "$($hash.Hash.ToLowerInvariant())  profiles/$($_.Name)"
+})
 # LF, not CRLF. `Set-Content` writes CRLF on Windows, and `sha256sum -c` then looks for a file whose
 # name ends in a carriage return: "avcodec-62.dll: FAILED open or read" for every line. The Linux
 # archive's list is written by sha256sum itself and has always been LF, so this also makes the two

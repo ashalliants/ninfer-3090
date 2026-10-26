@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -24,6 +25,8 @@ struct ServeOptions {
     std::string host = "127.0.0.1";
     int port         = 8080;
     std::string api_key;                          // empty => no auth
+    // --allowed-host NAME, repeatable: more names the Host check accepts (see make_host_policy).
+    std::vector<std::string> allowed_hosts;
     std::optional<std::string> model_id_override; // unset => artifact metadata.name
     std::string request_log_jsonl;                // empty => structured request logging disabled
     // --request-log-lossy-detail: request_done records add lossy_prefill.kept_runs (the kept offsets
@@ -62,6 +65,10 @@ struct ServeOptions {
     std::vector<std::uint32_t> stage_layers;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
+    // --relaxed-drafting [P]: EngineOptions::relaxed_drafting (nullopt: off; bare: 0.5).
+    std::optional<float> relaxed_drafting;
+    // --draft-context-rows N: EngineOptions::draft_context_rows (0: off).
+    std::uint32_t draft_context_rows = 0;
     ContextCacheOptions context_cache;
     PrefillScheduleOptions prefill_schedule;
     LossyPrefillOptions lossy_prefill;
@@ -78,6 +85,7 @@ struct ServeOptions {
     bool mtp_experts_q4     = false;
     bool gdn_state_fp16     = false;
     bool admission_fit_check = false;
+    bool admission_affinity  = false;
     bool mlp_a8_decode      = false;
     bool prefill_a8         = true;
     bool prefill_cublas     = false;
@@ -164,6 +172,12 @@ struct ServeOptions {
     // Exact process argv for the server-start record. Secret-bearing option values are redacted
     // while parsing; this is provenance only and never affects execution.
     std::vector<std::string> startup_argv;
+    // The words the options were parsed from: a --config file's, then the command line's without
+    // --config FILE. Redacted like startup_argv; provenance only.
+    std::vector<std::string> effective_argv;
+    // Where each option given came from, by flag ("--max-context"): "cli", the --config path as
+    // given, or "default" for a key the file set to false. An option missing here was not given.
+    std::map<std::string, std::string> setting_sources;
 };
 
 // Parse-time limits. A request that omits max_tokens / max_completion_tokens / max_output_tokens

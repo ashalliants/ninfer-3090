@@ -27,8 +27,12 @@ DEFAULT_OUT = ROOT / "tests" / "fixtures" / "ggml"
 # ggml's C names for the dequantizers.
 GGML_NAMES = {
     "ggml_q8_0": "q8_0",
+    "ggml_q4_k": "q4_K",
+    "ggml_q5_k": "q5_K",
     "ggml_q6_k": "q6_K",
     "ggml_iq2_xxs": "iq2_xxs",
+    "ggml_iq2_xs": "iq2_xs",
+    "ggml_iq3_xxs": "iq3_xxs",
     "ggml_iq4_nl": "iq4_nl",
     "ggml_iq3_s": "iq3_s",
     "ggml_iq2_s": "iq2_s",
@@ -97,7 +101,17 @@ def structured_blocks(spec: GgmlBlockFormat, count: int, seed: int = 0) -> np.nd
         b[1, 192:208] = 0x7F  # int8 127 scales
     elif name != "ggml_iq1_m":
         _put_u16(b, 0, d)
-    if name == "ggml_iq4_xs":
+    if name in ("ggml_q4_k", "ggml_q5_k"):
+        # dmin takes every special scale too, in other blocks than d.
+        _put_u16(b, 2, np.roll(d, 21))
+        j = np.arange(8)
+        sc = (n[:, None] + 7 * j) % 64  # every 6-bit scale and min in every sub-block j
+        m = (3 * n[:, None] + 5 * j + 11) % 64
+        for i in range(4):  # get_scale_min_k4's packing: j < 4 in bytes 0..7, j >= 4 split
+            b[:, 4 + i] = sc[:, i] | ((sc[:, i + 4] >> 4) << 6)
+            b[:, 8 + i] = m[:, i] | ((m[:, i + 4] >> 4) << 6)
+            b[:, 12 + i] = (sc[:, i + 4] & 0xF) | ((m[:, i + 4] & 0xF) << 4)
+    elif name == "ggml_iq4_xs":
         ls = (8 * n[:, None] + np.arange(8)) % 64  # every 6-bit sub-block scale
         low, high = ls & 0xF, ls >> 4
         b[:, 4:8] = low[:, 0::2] | (low[:, 1::2] << 4)
@@ -117,6 +131,24 @@ def structured_blocks(spec: GgmlBlockFormat, count: int, seed: int = 0) -> np.nd
             aux |= (((n + ib) % 16).astype(np.uint64)) << np.uint64(28)
             for byte in range(4):
                 b[:, base + 4 + byte] = (aux >> np.uint64(8 * byte)) & 0xFF
+    elif name == "ggml_iq2_xs":
+        for ib in range(8):
+            for l in range(4):
+                k = 32 * n + 4 * ib + l  # 2048 codes: every grid index and sign selector
+                code = (k % 512) | (((k + k // 512) % 128) << 9)
+                _put_u16(b, 2 + 2 * (4 * ib + l), code.astype(np.uint16))
+        nibble = (n[:, None] + np.arange(16)) % 16  # every 4-bit scale in both halves
+        b[:, 66:74] = nibble[:, 0::2] | (nibble[:, 1::2] << 4)
+    elif name == "ggml_iq3_xxs":
+        b[:, 2:66] = (64 * n[:, None] + np.arange(64)) % 256  # every grid index
+        for ib in range(8):
+            k = 32 * n + 4 * ib  # sign selectors of the 4 groups
+            aux = np.zeros(count, dtype=np.uint64)
+            for l in range(4):
+                aux |= (((k + l) % 128).astype(np.uint64)) << np.uint64(7 * l)
+            aux |= (((n + ib) % 16).astype(np.uint64)) << np.uint64(28)
+            for byte in range(4):
+                b[:, 66 + 4 * ib + byte] = (aux >> np.uint64(8 * byte)) & 0xFF
     elif name == "ggml_iq2_s":
         qh = np.zeros((count, 8), dtype=np.uint8)
         for ib in range(8):

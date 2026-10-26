@@ -41,10 +41,12 @@ struct GdnReplayFoldRow {
  * copies row descriptors by value; replay consumes record/state contents at the bound addresses,
  * while changing host row descriptors requires a new capture.
  *
- * The Op admits the three registered all-layer geometries only ([qk heads, value heads, conv
- * channels] = [16, 48, 10240], [16, 32, 8192] and Qwen3.8-Flash-Next's tiled [48, 48, 10240]),
- * owns no workspace or device
- * allocation, and does not read query or generate token output. The four record planes are
+ * The Op admits the four registered all-layer geometries only ([qk heads, value heads, conv
+ * channels, head map] = [16, 48, 10240, Blocked], [16, 32, 8192, Blocked], Qwen3.8-Flash-Next's
+ * tiled heads expanded to [48, 48, 10240, Blocked], and the same read in place as [16, 48, 10240,
+ * Tiled] over an FP32 recurrent state; records.spec.head_map pairs value head h with key head
+ * gdn_qk_head(h, ...)), owns no workspace or device allocation, and does not read query or
+ * generate token output. The four record planes are
  * read-only, disjoint, and do not overlap either state region.
  */
 class GdnReplayFoldPlan {

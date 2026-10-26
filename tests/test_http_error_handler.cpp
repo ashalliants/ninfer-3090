@@ -1,8 +1,10 @@
 #include "serve/http_server.h"
 
 #include <nlohmann/json.hpp>
+#include <spdlog/logger.h>
 
 #include <iostream>
+#include <memory>
 #include <string>
 
 namespace {
@@ -58,6 +60,96 @@ int main() {
                           !ninfer::serve::matches_bearer_credential("Bearersecret", "secret") &&
                           !ninfer::serve::matches_bearer_credential("Bearer secret", ""),
                       "invalid Bearer credentials were accepted");
+    failures += check(!ninfer::serve::matches_bearer_credential("Bearer secre", "secret") &&
+                          !ninfer::serve::matches_bearer_credential("Bearer secrets", "secret"),
+                      "a Bearer credential that is a prefix or extension of the key was accepted");
+
+    // The Host and Origin checks, ahead of every route: a 403 in the endpoint's error shape.
+    {
+        ServeOptions local;
+        const ninfer::serve::HostPolicy policy =
+            ninfer::serve::make_host_policy(local.host, local.port, local.allowed_hosts, "gpubox");
+        const auto refused = [&](const ServeOptions& serve, std::string path, std::string host,
+                                 std::string origin, httplib::Response& response) {
+            httplib::Request request;
+            request.path = std::move(path);
+            if (!host.empty()) { request.set_header("Host", host); }
+            if (!origin.empty()) { request.set_header("Origin", origin); }
+            return ninfer::serve::reject_untrusted_request(policy, serve, request, response);
+        };
+
+        httplib::Response rebound;
+        failures += check(refused(local, "/v1/chat/completions", "evil.example:8080", "", rebound),
+                          "a DNS-rebinding Host was not refused");
+        const Json rebound_body = Json::parse(rebound.body);
+        failures += check(rebound.status == 403 &&
+                              rebound_body.at("error").at("code") == "host_not_allowed" &&
+                              rebound_body.at("error").at("message").get<std::string>().find(
+                                  "--allowed-host") != std::string::npos &&
+                              rebound.get_header_value("x-request-id").starts_with("req_"),
+                          "a refused Host did not get an OpenAI-shaped 403 naming --allowed-host");
+
+        httplib::Response binary_host;
+        failures += check(refused(local, "/v1/models", "\xff\xfe.example", "", binary_host) &&
+                              binary_host.status == 403 &&
+                              Json::parse(binary_host.body)
+                                      .at("error")
+                                      .at("message")
+                                      .get<std::string>()
+                                      .starts_with("Host '??.example'"),
+                          "a Host that is not UTF-8 did not get a readable 403");
+
+        httplib::Response rebound_messages;
+        failures += check(refused(local, "/v1/messages", "evil.example", "", rebound_messages),
+                          "a DNS-rebinding Host on /v1/messages was not refused");
+        const Json messages_body = Json::parse(rebound_messages.body);
+        failures += check(rebound_messages.status == 403 && messages_body.at("type") == "error" &&
+                              messages_body.at("error").at("type") == "permission_error",
+                          "a refused Host on /v1/messages did not get an Anthropic-shaped 403");
+
+        httplib::Response health_host;
+        failures += check(refused(local, "/health", "evil.example", "", health_host) &&
+                              health_host.status == 403,
+                          "the Host check did not apply on /health");
+
+        // With a key the Host check is skipped: any name a client uses (a Docker, mesh VPN or
+        // proxy name) reaches the server, and a rebound page still cannot send the key.
+        httplib::Response keyed_host;
+        ServeOptions keyed = local;
+        keyed.api_key      = "secret";
+        failures += check(!refused(keyed, "/health", "evil.example", "", keyed_host) &&
+                              !refused(keyed, "/v1/models", "gpubox.tailnet.ts.net", "",
+                                       keyed_host) &&
+                              keyed_host.status == -1,
+                          "the Host check applied on a server with a key");
+
+        httplib::Response foreign;
+        failures += check(refused(local, "/v1/responses", "127.0.0.1:8080",
+                                  "http://evil.example", foreign),
+                          "a foreign Origin was not refused without a key");
+        const Json foreign_body = Json::parse(foreign.body);
+        failures += check(foreign.status == 403 &&
+                              foreign_body.at("error").at("code") == "origin_not_allowed",
+                          "a refused Origin did not get an OpenAI-shaped 403");
+
+        ServeOptions cors = local;
+        cors.enable_cors  = true;
+        httplib::Response allowed;
+        failures += check(!refused(keyed, "/v1/responses", "localhost:8080", "http://evil.example",
+                                   allowed) &&
+                              !refused(cors, "/v1/responses", "localhost:8080",
+                                       "http://evil.example", allowed) &&
+                              !refused(local, "/v1/responses", "localhost:8080",
+                                       "http://localhost:8080", allowed) &&
+                              !refused(local, "/v1/responses", "192.168.1.5:8080", "", allowed) &&
+                              !refused(local, "/v1/responses", "192.168.1.5:8080",
+                                       "http://192.168.1.5:8080", allowed) &&
+                              !refused(local, "/v1/responses", "localhost:8080",
+                                       "chrome-extension://abcdef", allowed) &&
+                              !refused(local, "/v1/responses", "", "", allowed) &&
+                              allowed.body.empty() && allowed.status == -1,
+                          "an allowed request was refused or given a response");
+    }
 
     httplib::Request messages_request;
     messages_request.path = "/v1/messages";
@@ -156,6 +248,44 @@ int main() {
     failures += check(other_result == httplib::Server::HandlerResponse::Unhandled &&
                           other_response.body.empty(),
                       "non-413 response was changed by the payload-limit handler");
+
+    // dashboard_while_loading: a keyed server still loading its model serves GET /dashboard
+    // without the key (the page holds no data) with its CSP and nosniff headers, under any Host
+    // (a keyed server skips the Host check), and still answers every other route, POST /dashboard
+    // included, with the loading 503 -- and, once that is past, the key check.
+    {
+        ServeOptions keyed;
+        keyed.host    = "127.0.0.1";
+        keyed.api_key = "secret";
+        ninfer::serve::HttpServer server(keyed, std::make_shared<spdlog::logger>("dashboard-test"));
+        const int port = server.bind_any_port();
+        failures += check(port > 0, "dashboard_while_loading: could not bind a loopback port");
+        if (port > 0) {
+            server.start_serving_during_startup();
+            httplib::Client client("127.0.0.1", port);
+            client.set_connection_timeout(5, 0);
+            client.set_read_timeout(5, 0);
+            const auto page = client.Get("/dashboard");
+            failures += check(
+                page && page->status == 200 &&
+                    page->get_header_value("Content-Type") == "text/html; charset=utf-8" &&
+                    page->get_header_value("X-Content-Type-Options") == "nosniff" &&
+                    page->get_header_value("Content-Security-Policy").find("default-src 'none'") !=
+                        std::string::npos &&
+                    page->body.rfind("<!doctype html>", 0) == 0,
+                "dashboard_while_loading: GET /dashboard was not served without the key");
+            const auto rebound =
+                client.Get("/dashboard", httplib::Headers{{"Host", "evil.example:8080"}});
+            failures += check(rebound && rebound->status == 200,
+                              "dashboard_while_loading: a keyed server ran the Host check");
+            const auto metrics = client.Get("/metrics");
+            const auto posted  = client.Post("/dashboard", "", "text/plain");
+            failures += check(metrics && metrics->status == 503 && posted && posted->status == 503,
+                              "dashboard_while_loading: another route skipped the loading 503");
+            server.stop();
+            (void)server.await_startup_listener();
+        }
+    }
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

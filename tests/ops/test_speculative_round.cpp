@@ -1964,6 +1964,261 @@ int transforms_conformance() {
     return failures;
 }
 
+// Relaxed drafting (speculative_round.h). Four acceptance paths: the dense single-block kernel
+// (token domain 64), the dense partial/group pipeline (257), and the sparse verifier (248077) with
+// a real sparse q and with a copy's one-hot q. On each:
+//   - threshold 0 through the relaxed instance is the exact instance bit for bit, and so is a
+//     threshold above every p, a zero added-token floor, and a greedy row;
+//   - a threshold at or below p keeps every eligible draft, and relaxed_kept counts exactly the
+//     positions the exact rule rejects (from the oracle's accept draw);
+//   - a drafted added token (id >= floor) ends relaxing for that position and every later one.
+struct RelaxedPath {
+    const char* name;
+    bool sparse;
+    bool one_hot;
+    int token_domain;
+    int physical_rows;
+};
+
+struct RelaxedOutputs {
+    std::vector<std::int32_t> licensed, counts, accepted, lengths, anchors, kept;
+    bool operator==(const RelaxedOutputs&) const = default;
+};
+
+constexpr int kRelaxedDrafts = 5;
+constexpr int kRelaxedBatch  = 2;
+constexpr int kRelaxedTopK   = 2;
+
+struct RelaxedFixture {
+    RelaxedPath path;
+    std::vector<std::int32_t> drafts, rivals, targets, candidates, lengths;
+    std::vector<float> q;
+    std::vector<std::uint16_t> logits;
+    std::vector<double> pd; // [row * K + i]: the target's final probability of draft i
+    float qd = 1.0F;
+
+    // Every column: the draft (or, at the bonus column, a free token) at logit 2 and one rival
+    // below it, so top_k=2 at temperature 1 gives p(draft) ~ 0.6; the rest of the domain at -8.
+    RelaxedFixture(RelaxedPath p, int special_at, std::int32_t special_id) : path(p) {
+        const int K = kRelaxedDrafts, B = kRelaxedBatch, W = K + 1;
+        drafts.resize(static_cast<std::size_t>(K * B));
+        rivals.resize(static_cast<std::size_t>(W * B));
+        targets.resize(static_cast<std::size_t>(W * B));
+        lengths = {1000, 2017};
+        logits.assign(static_cast<std::size_t>(p.physical_rows) * W * B, f32_to_bf16(-8.0F));
+        pd.resize(static_cast<std::size_t>(K * B));
+        const float high = 2.0F, low = 2.0F - std::log(1.5F);
+        for (int b = 0; b < B; ++b) {
+            for (int c = 0; c < W; ++c) {
+                const std::int32_t winner = 3 * c + 1 + 20 * b;
+                std::int32_t draft        = winner;
+                if (c < K && b == 0 && special_at >= 0 && c == special_at) { draft = special_id; }
+                const std::int32_t rival = 3 * c + 2 + 20 * b;
+                if (c < K) { drafts[static_cast<std::size_t>(b * K + c)] = draft; }
+                rivals[static_cast<std::size_t>(b * W + c)]  = rival;
+                targets[static_cast<std::size_t>(b * W + c)] = draft;
+                const std::size_t base = (static_cast<std::size_t>(b) * W + c) * p.physical_rows;
+                logits[base + static_cast<std::size_t>(draft)] = f32_to_bf16(high);
+                logits[base + static_cast<std::size_t>(rival)] = f32_to_bf16(low);
+                if (c < K) {
+                    const double gap = static_cast<double>(bf16_to_f32(f32_to_bf16(low))) -
+                                       static_cast<double>(bf16_to_f32(f32_to_bf16(high)));
+                    pd[static_cast<std::size_t>(b * K + c)] = 1.0 / (1.0 + std::exp(gap));
+                }
+            }
+        }
+        if (p.sparse) {
+            // Candidate 0 is the draft; the other 15 are distinct ids above the fixture's tokens.
+            qd = p.one_hot ? 1.0F : 0.8F;
+            candidates.resize(static_cast<std::size_t>(kSparseCandidates) * K * B);
+            q.resize(candidates.size());
+            for (int b = 0; b < B; ++b) {
+                for (int i = 0; i < K; ++i) {
+                    for (int slot = 0; slot < kSparseCandidates; ++slot) {
+                        const std::size_t at =
+                            (static_cast<std::size_t>(b) * K + i) * kSparseCandidates + slot;
+                        candidates[at] = slot == 0 ? drafts[static_cast<std::size_t>(b * K + i)]
+                                                   : 1000 + 40 * (b * K + i) + slot;
+                        q[at] = slot == 0 ? qd : (1.0F - qd) / (kSparseCandidates - 1);
+                    }
+                }
+            }
+        }
+    }
+
+    // The exact rule's verdict at row b, position i, for accept draw u.
+    [[nodiscard]] bool exact_keeps(int b, int i, double u) const {
+        const double p = pd[static_cast<std::size_t>(b * kRelaxedDrafts + i)];
+        return path.sparse ? (p >= qd || u * qd < p) : u < p;
+    }
+
+    RelaxedOutputs run(std::vector<ops::SamplingConfig> configs, bool relaxed_instance) const {
+        const int K = kRelaxedDrafts, B = kRelaxedBatch, W = K + 1;
+        DeviceBuffer d_targets = to_device(targets), d_logits = to_device(logits);
+        DeviceBuffer d_drafts = to_device(drafts), d_lengths = to_device(lengths);
+        DeviceBuffer d_extents = to_device(std::vector<std::int32_t>(B, K));
+        DeviceBuffer d_anchors  = to_device(std::vector<std::int32_t>(B, -5));
+        DeviceBuffer d_licensed = to_device(std::vector<std::int32_t>(W * B, -7));
+        DeviceBuffer d_counts   = to_device(std::vector<std::int32_t>(B, -9));
+        DeviceBuffer d_accepted = to_device(std::vector<std::int32_t>(B, -11));
+        DeviceBuffer d_kept     = to_device(std::vector<std::int32_t>(B, -13));
+        DeviceBuffer d_candidates, d_q;
+        if (path.sparse) {
+            d_candidates = to_device(candidates);
+            d_q          = to_device(q);
+        }
+        DeviceBuffer d_configs = to_device(configs);
+        Tensor target(d_targets.p, DType::I32, {W, B});
+        Tensor logit(d_logits.p, DType::BF16, {path.physical_rows, W, B});
+        Tensor draft(d_drafts.p, DType::I32, {K, B}), extent(d_extents.p, DType::I32, {B});
+        Tensor length(d_lengths.p, DType::I32, {B}), anchor(d_anchors.p, DType::I32, {B});
+        Tensor licensed(d_licensed.p, DType::I32, {W, B}), count(d_counts.p, DType::I32, {B});
+        Tensor accepted(d_accepted.p, DType::I32, {B}), kept(d_kept.p, DType::I32, {B});
+        const auto* device_configs = static_cast<const ops::SamplingConfig*>(d_configs.p);
+        Tensor* const kept_out     = relaxed_instance ? &kept : nullptr;
+        if (path.sparse) {
+            Tensor candidate(d_candidates.p, DType::I32, {kSparseCandidates, K, B});
+            Tensor proposal(d_q.p, DType::FP32, {kSparseCandidates, K, B});
+            WorkspaceArena workspace(std::max<std::size_t>(
+                256, ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
+                         path.token_domain, {false}, K, K, B, B)));
+            ops::speculative_accept_sparse_drafts(target, logit, draft, candidate, proposal, extent,
+                                                  length, anchor, licensed, count, accepted,
+                                                  path.token_domain, device_configs, {false},
+                                                  workspace, nullptr, kept_out);
+        } else {
+            WorkspaceArena workspace(std::max<std::size_t>(
+                256, ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                         path.token_domain, K, K, B, B)));
+            ops::speculative_accept_greedy_drafts(target, logit, draft, extent, length, anchor,
+                                                  licensed, count, accepted, path.token_domain,
+                                                  device_configs, workspace, nullptr, kept_out);
+        }
+        cuda_synchronize();
+        RelaxedOutputs out{from_device<std::int32_t>(d_licensed, W * B),
+                           from_device<std::int32_t>(d_counts, B),
+                           from_device<std::int32_t>(d_accepted, B),
+                           from_device<std::int32_t>(d_lengths, B),
+                           from_device<std::int32_t>(d_anchors, B),
+                           relaxed_instance ? from_device<std::int32_t>(d_kept, B)
+                                            : std::vector<std::int32_t>(B, 0)};
+        return out;
+    }
+};
+
+ops::SamplingConfig relaxed_config(std::uint64_t seed, float threshold, std::int32_t floor,
+                                   float temperature = 1.0F) {
+    ops::SamplingConfig config{};
+    config.temperature       = temperature;
+    config.top_k             = kRelaxedTopK;
+    config.seed              = seed;
+    config.relaxed_threshold = threshold;
+    config.added_token_floor = floor;
+    return config;
+}
+
+int relaxed_drafting_case(const RelaxedPath& path) {
+    SparseAcceptSuite oracle(1, 1);
+    const std::int32_t floor   = path.token_domain - 8;
+    const std::int32_t special = path.token_domain - 3;
+    const std::string label    = std::string("relaxed drafting ") + path.name;
+    int failures               = 0;
+    int forced                 = 0;
+    for (const int special_at : {-1, 2}) {
+        const RelaxedFixture fixture(path, special_at, special);
+        for (std::uint64_t seed = 1; seed <= 24; ++seed) {
+            const std::uint64_t seed_b = seed * 7919U;
+            const auto both = [&](float t0, float t1, std::int32_t f, float temperature = 1.0F) {
+                return std::vector<ops::SamplingConfig>{
+                    relaxed_config(seed, t0, f, temperature), relaxed_config(seed_b, t1, f)};
+            };
+            const RelaxedOutputs exact = fixture.run(both(0.0F, 0.0F, floor), false);
+            const std::string at       = label + " seed " + std::to_string(seed) + " special " +
+                                   std::to_string(special_at);
+            // Off through the relaxed instance: the exact Op bit for bit, relaxing nothing.
+            for (const auto& [configs, what] :
+                 {std::pair{both(0.0F, 0.0F, floor), "threshold 0"},
+                  std::pair{both(0.95F, 0.95F, floor), "threshold above p"},
+                  std::pair{both(0.5F, 0.5F, 0), "zero floor"}}) {
+                const RelaxedOutputs relaxed = fixture.run(configs, true);
+                if (!(relaxed == exact)) {
+                    std::cerr << at << ": " << what << " differs from the exact instance\n";
+                    ++failures;
+                }
+            }
+            // A greedy row is untouched by its threshold.
+            const RelaxedOutputs greedy_exact = fixture.run(both(0.0F, 0.0F, floor, 0.0F), false);
+            if (!(fixture.run(both(0.5F, 0.0F, floor, 0.0F), true) == greedy_exact)) {
+                std::cerr << at << ": a greedy row relaxed\n";
+                ++failures;
+            }
+            // Threshold 0.5 on row 0 only (p ~ 0.6): row 1 stays exact bit for bit.
+            const RelaxedOutputs relaxed = fixture.run(both(0.5F, 0.0F, floor), true);
+            int expected_a    = kRelaxedDrafts;
+            int expected_kept = 0;
+            bool ambiguous    = false;
+            for (int i = 0; i < kRelaxedDrafts; ++i) {
+                const double u = oracle.oracle_uniform(seed, fixture.lengths[0] + i + 1,
+                                                       ops::kSamplePurposeSpeculativeAccept);
+                const double p = fixture.pd[static_cast<std::size_t>(i)];
+                ambiguous      = ambiguous || std::abs(u * fixture.qd - p) < 1e-4;
+                const bool exact_keep = fixture.exact_keeps(0, i, u);
+                const bool eligible   = special_at < 0 || i < special_at;
+                if (exact_keep) { continue; }
+                if (eligible) {
+                    ++expected_kept;
+                    continue;
+                }
+                expected_a = i;
+                break;
+            }
+            if (ambiguous) { continue; }
+            forced += expected_kept;
+            const int W = kRelaxedDrafts + 1;
+            if (relaxed.accepted[0] != expected_a || relaxed.kept[0] != expected_kept ||
+                relaxed.counts[0] != expected_a + 1) {
+                std::cerr << at << ": relaxed row accepted " << relaxed.accepted[0] << " kept "
+                          << relaxed.kept[0] << ", expected " << expected_a << " and "
+                          << expected_kept << '\n';
+                ++failures;
+            }
+            for (int i = 0; i < relaxed.accepted[0] && i < kRelaxedDrafts; ++i) {
+                if (relaxed.licensed[static_cast<std::size_t>(i)] !=
+                    fixture.drafts[static_cast<std::size_t>(i)]) {
+                    std::cerr << at << ": relaxed row licensed a token other than its draft\n";
+                    ++failures;
+                }
+            }
+            const auto row1 = [&](const RelaxedOutputs& o) {
+                return std::vector<std::int32_t>(o.licensed.begin() + W, o.licensed.end());
+            };
+            if (row1(relaxed) != row1(exact) || relaxed.accepted[1] != exact.accepted[1] ||
+                relaxed.lengths[1] != exact.lengths[1] || relaxed.anchors[1] != exact.anchors[1] ||
+                relaxed.kept[1] != 0) {
+                std::cerr << at << ": the exact row of a mixed batch changed\n";
+                ++failures;
+            }
+        }
+    }
+    if (forced == 0) {
+        std::cerr << label << ": no seed exercised a forced keep\n";
+        ++failures;
+    }
+    return failures;
+}
+
+int relaxed_drafting_conformance() {
+    int failures = 0;
+    for (const RelaxedPath& path :
+         {RelaxedPath{"dense single-block", false, false, 64, 64},
+          RelaxedPath{"dense group", false, false, 257, 257},
+          RelaxedPath{"sparse", true, false, kSparseTokenDomain, kSparsePhysicalRows},
+          RelaxedPath{"sparse one-hot copy", true, true, kSparseTokenDomain, kSparsePhysicalRows}}) {
+        failures += relaxed_drafting_case(path);
+    }
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2090,6 +2345,8 @@ int main(int argc, char** argv) {
             }
         }
     }
+
+    failures += relaxed_drafting_conformance();
 
     if (failures != 0) {
         std::cerr << "speculative_round failures=" << failures << '\n';

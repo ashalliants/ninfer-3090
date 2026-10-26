@@ -374,6 +374,8 @@ qb::BenchEnvironment sample_environment() {
     env.warmup                            = 1;
     env.corpus_path                       = "bench/fixtures/bench_corpus.ids";
     env.corpus_tokens                     = 65536;
+    env.power_limit_watts_start           = 350.0;
+    env.power_limit_watts_end             = 287.5;
     return env;
 }
 
@@ -389,7 +391,17 @@ int test_report_contract() {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 19, "report schema v19");
+    failures += expect(report.at("schema_version") == 20, "report schema v20");
+    failures += expect(report.at("environment").at("power_limit_watts_start") == 350.0 &&
+                           report.at("environment").at("power_limit_watts_end") == 287.5,
+                       "the report stamps the power limit before and after the run");
+    auto unknown_limit                    = env;
+    unknown_limit.power_limit_watts_start = std::nullopt;
+    unknown_limit.power_limit_watts_end   = std::nullopt;
+    const Json unknown = Json::parse(qb::format_json(unknown_limit, "bench", results));
+    failures += expect(unknown.at("environment").at("power_limit_watts_start").is_null() &&
+                           unknown.at("environment").at("power_limit_watts_end").is_null(),
+                       "a power limit NVML cannot read is null, never 0");
     failures += expect(report.at("config").at("speculative_backend") == "mtp" &&
                            report.at("config").at("draft_tokens") == 5,
                        "report identifies its backend and window");
@@ -486,6 +498,13 @@ int test_human_and_csv_reports() {
                            std::string("CSV field ") + std::string(field));
     }
     failures += expect(std::count(csv.begin(), csv.end(), '\n') == 3, "CSV header plus two rows");
+    failures += expect(csv.find(",power_limit_watts_start,power_limit_watts_end\n") !=
+                               std::string::npos &&
+                           csv.find(",350,287.5\n") != std::string::npos,
+                       "CSV rows carry the power limit before and after the run");
+    failures += expect(table.find("power limit: 350 W at start, 287.5 W at end") !=
+                           std::string::npos,
+                       "table shows the power limit");
     return failures;
 }
 
@@ -523,6 +542,303 @@ int test_constrained_batch_metrics() {
     return failures;
 }
 
+
+qb::BenchOptions parse_preset(std::vector<std::string> extra) {
+    std::vector<std::string> arguments{"ninfer_bench", "--preset", "community-1", "--weights",
+                                       "model.ninfer", "--submitter", "Ash"};
+    arguments.insert(arguments.end(), extra.begin(), extra.end());
+    return parse_for_test(std::move(arguments));
+}
+
+std::string parse_error(std::vector<std::string> arguments) {
+    try {
+        (void)parse_for_test(std::move(arguments));
+    } catch (const std::invalid_argument& error) { return error.what(); }
+    return {};
+}
+
+int test_power_limit_change_warning() {
+    int failures = 0;
+    failures += expect(!qb::power_limit_change_warning(350.0, 350.0),
+                       "an unchanged power limit gives no warning");
+    failures += expect(!qb::power_limit_change_warning(std::nullopt, 350.0) &&
+                           !qb::power_limit_change_warning(350.0, std::nullopt),
+                       "an unknown power limit gives no warning");
+    const auto changed = qb::power_limit_change_warning(350.0, 287.5);
+    failures += expect(changed && changed->find("350 W -> 287.5 W") != std::string::npos,
+                       "a changed power limit is reported with both values");
+    return failures;
+}
+
+int test_community_preset_cli() {
+    int failures                 = 0;
+    const qb::BenchOptions plain = parse_preset({});
+    failures += expect(plain.preset == "community-1" && plain.submitter == "Ash" &&
+                           plain.artifact_path == "model.ninfer",
+                       "the preset parses with --weights and --submitter");
+    failures += expect(plain.repetitions == 1 && plain.warmup == 0,
+                       "the preset measures one cold run, no warmup");
+    failures += expect(parse_preset({"--device", "1"}).device == 1,
+                       "the preset lets --device pick the card");
+    failures += expect(qb::usage_text("ninfer_bench").find("--preset community-1") !=
+                           std::string::npos,
+                       "help names the preset");
+
+    // Every flag that changes what is measured, in either order around --preset.
+    const std::vector<std::vector<std::string>> refused = {
+        {"-p", "512"},
+        {"--n-prompt", "512"},
+        {"-n", "128"},
+        {"--n-gen", "128"},
+        {"-pg", "512,128"},
+        {"--prompt-gen", "512,128"},
+        {"-r", "3"},
+        {"--repetitions", "3"},
+        {"--warmup", "1"},
+        {"--corpus", "other.ids"},
+        {"--concurrency", "2"},
+        {"--grammar-file", "g.gbnf"},
+        {"--json-schema-file", "s.json"},
+        {"--json-object"},
+        {"--regex", "a"},
+        {"--choice", "a"},
+        {"--mixed-constraints"},
+        {"--max-ctx", "70000"},
+        {"--prefill-chunk", "2048"},
+        {"--kv-dtype", "int8"},
+        {"--spec", "mtp"},
+        {"--draft-tokens", "3"},
+        {"--lm-head-draft"},
+        {"--ngram-draft-tokens", "15"},
+        {"--ngram-min-match", "8"},
+        {"--no-cuda-graph"},
+        {"--no-prefill-a8"},
+        {"--prefill-cublas"},
+        {"--no-prefill-cublas-projections"},
+        {"--profile-measured"},
+        {"-o", "json"},
+        {"--output", "json"},
+        {"--output-file", "row.json"},
+    };
+    for (const auto& flags : refused) {
+        std::vector<std::string> after{"ninfer_bench", "--preset", "community-1", "--weights",
+                                       "model.ninfer", "--submitter", "Ash"};
+        after.insert(after.end(), flags.begin(), flags.end());
+        std::vector<std::string> before{"ninfer_bench"};
+        before.insert(before.end(), flags.begin(), flags.end());
+        before.insert(before.end(), {"--preset", "community-1", "--weights", "model.ninfer",
+                                     "--submitter", "Ash"});
+        for (const auto& arguments : {after, before}) {
+            const std::string message = parse_error(arguments);
+            failures += expect(message.find("--preset community-1") != std::string::npos &&
+                                   message.find(flags.front()) != std::string::npos &&
+                                   message.find("--weights, --submitter and --device") !=
+                                       std::string::npos,
+                               "the preset refuses " + flags.front() +
+                                   ", naming it and the flags it takes: `" + message + "`");
+        }
+    }
+
+    failures += expect(parse_error({"ninfer_bench", "--preset", "community-2", "--weights",
+                                    "model.ninfer", "--submitter", "Ash"})
+                               .find("community-1") != std::string::npos,
+                       "an unknown preset is refused, naming the known one");
+    failures += expect(parse_error({"ninfer_bench", "--preset", "community-1", "--weights",
+                                    "model.ninfer"})
+                               .find("--submitter") != std::string::npos,
+                       "the preset needs --submitter");
+    failures += expect(parse_error({"ninfer_bench", "--weights", "model.ninfer", "--submitter",
+                                    "Ash"})
+                               .find("--preset") != std::string::npos,
+                       "--submitter without the preset is refused");
+    std::string forty_accents;
+    for (int i = 0; i < 40; ++i) { forty_accents += "\xC3\xA9"; } // U+00E9, two bytes each
+    failures += expect(parse_preset({}).submitter == "Ash" &&
+                           parse_for_test({"ninfer_bench", "--preset", "community-1", "--weights",
+                                           "model.ninfer", "--submitter", forty_accents})
+                                   .submitter == forty_accents,
+                       "a submitter of 40 characters is accepted, counted in characters");
+    // The same rules as tools/bench/check_bench_rows.py: only U+0020 is trimmed, and the length
+    // counts every character, spaces included.
+    for (const std::string& good : {std::string("  Ash  "), " " + std::string(39, 'a'),
+                                    std::string("\xE3\x80\x80")}) { // U+3000 is not a space here
+        failures += expect(parse_error({"ninfer_bench", "--preset", "community-1", "--weights",
+                                        "model.ninfer", "--submitter", good})
+                               .empty(),
+                           "the preset accepts the submitter `" + good + "`");
+    }
+    for (const std::string& bad :
+         {std::string(""), std::string("   "), std::string(41, 'a'), " " + std::string(40, 'a'),
+          std::string("YOUR_NAME"), std::string("your_name"), std::string("  YOUR_NAME "),
+          std::string("tab\there"), std::string("\t"), std::string("\xC3")}) {
+        failures += expect(!parse_error({"ninfer_bench", "--preset", "community-1", "--weights",
+                                         "model.ninfer", "--submitter", bad})
+                                .empty(),
+                           "the preset refuses the submitter `" + bad + "`");
+    }
+    return failures;
+}
+
+int test_community_preset_workload() {
+    int failures     = 0;
+    const auto tests = qb::community_prefill_tests();
+    failures += expect(tests.size() == 2 && tests[0].label == "pp16384" &&
+                           tests[0].n_prompt == 16384 && tests[1].label == "pp65536" &&
+                           tests[1].n_prompt == 65536 &&
+                           tests[0].kind == qb::TestKind::Prefill &&
+                           tests[1].kind == qb::TestKind::Prefill,
+                       "the preset prefills 16K and 64K tokens");
+    const auto corpus = qb::load_corpus_ids(std::string(qb::kDefaultCorpusPath));
+    failures += expect(corpus.size() == 65536,
+                       "the 64K prefill is the whole committed corpus, no padding or repeat");
+    qb::validate_prompt_lengths(tests, corpus.size());
+    const auto prompts = qb::load_chat_prompts(std::string(qb::kDefaultChatPromptsPath));
+    failures += expect(prompts.size() == 24 &&
+                           std::all_of(prompts.begin(), prompts.end(),
+                                       [](const std::string& p) { return !p.empty(); }),
+                       "the decode leg reads the 24 committed chat prompts");
+    failures += expect_throws<std::runtime_error>(
+        [] { (void)qb::load_chat_prompts("no/such/prompts.jsonl"); }, "missing chat prompts");
+
+    qb::TestResult decode;
+    decode.test = qb::community_decode_test();
+    failures += expect(decode.test.kind == qb::TestKind::Decode &&
+                           decode.test.n_gen == qb::kCommunityDecodeTokens,
+                       "the decode leg is a fixed-length tg test");
+    decode.reps = {{timings(0, 0.1, 1.0, 1.1), {}, 11}, {timings(0, 0.1, 3.0, 3.1), {}, 61}};
+    failures += expect_near(qb::pooled_decode_tok_s(decode), 70.0 / 4.0,
+                            "decode rate pools every prompt's tokens over their decode time");
+
+    failures += expect_string(qb::community_commit("0123abcde", false), "0123abcde",
+                              "a clean build gives its commit");
+    failures += expect_throws<std::invalid_argument>(
+        [] { (void)qb::community_commit("0123abcde", true); }, "a dirty build");
+    failures += expect_throws<std::invalid_argument>(
+        [] { (void)qb::community_commit("", false); }, "a build without git metadata");
+
+    failures += expect_string(qb::os_name(false, "6.6.87.2-microsoft-standard-WSL2"), "WSL2",
+                              "WSL kernel");
+    failures += expect_string(qb::os_name(false, "6.8.0-45-generic"), "Linux", "Linux kernel");
+    failures += expect_string(qb::os_name(true, ""), "Windows", "Windows");
+    failures += expect_string(qb::pcie_text(4, 16), "4.0 x16", "PCIe link text");
+
+    // The corpus is Qwen3.6 token ids and the preset is defined on the 27B dense models, the only
+    // ones of this architecture the project ships.
+    qb::check_community_architecture("Qwen3_5ForCausalLM");
+    for (const char* other : {"Qwen3_5MoeForCausalLM", "Qwen4ExpForCausalLM", ""}) {
+        std::string message;
+        try {
+            qb::check_community_architecture(other);
+        } catch (const std::invalid_argument& error) { message = error.what(); }
+        failures += expect(message.find("27B") != std::string::npos &&
+                               message.find("Qwen3_5ForCausalLM") != std::string::npos,
+                           std::string("the preset refuses the architecture `") + other + "`");
+    }
+    return failures;
+}
+
+int test_community_row() {
+    int failures = 0;
+    qb::CommunityRow row;
+    row.submitter       = "Ash \"3090\" \xC3\xA9";
+    row.date            = "2026-10-26";
+    row.commit          = "61561d88a";
+    row.gpus            = {{"NVIDIA GeForce RTX 3090", 25438126080ULL, 349.6, "4.0 x16"}};
+    row.ram_bytes       = 68719476736ULL - 1024ULL;
+    row.cpu             = "AMD Ryzen 9 5950X, 32 threads";
+    row.os              = "WSL2";
+    row.model           = "qwen3.6-27b";
+    row.prefill_16k_tps = 2345.678;
+    row.prefill_64k_tps = 1999.95;
+    row.decode_tps      = 41.04;
+    const std::string line = qb::format_community_row(row);
+    failures += expect(line.find('\n') == std::string::npos, "the row is one line");
+    Json parsed;
+    try {
+        parsed = Json::parse(line);
+    } catch (const nlohmann::json::exception& error) {
+        return fail(std::string("invalid community row: ") + error.what());
+    }
+    std::vector<std::string> keys;
+    for (const auto& item : parsed.items()) { keys.push_back(item.key()); }
+    // Json sorts its keys, so the order is checked on the text.
+    std::size_t at = 0;
+    for (const char* key : {"submitter", "date", "commit", "preset", "gpus", "ram_gib", "cpu",
+                            "os", "model", "prefill_16k_tps", "prefill_64k_tps", "decode_tps"}) {
+        const std::size_t found = line.find('"' + std::string(key) + "\":", at);
+        failures += expect(found != std::string::npos, std::string("row key in order: ") + key);
+        if (found != std::string::npos) { at = found; }
+    }
+    failures += expect(keys.size() == 12, "the row has exactly the twelve fields");
+    failures += expect(parsed.at("submitter") == row.submitter && parsed.at("date") == row.date &&
+                           parsed.at("commit") == row.commit &&
+                           parsed.at("preset") == "community-1" && parsed.at("os") == "WSL2" &&
+                           parsed.at("model") == "qwen3.6-27b" && parsed.at("cpu") == row.cpu,
+                       "row identity fields");
+    const Json& gpu = parsed.at("gpus").at(0);
+    failures += expect(gpu.size() == 4 && gpu.at("name") == "NVIDIA GeForce RTX 3090" &&
+                           gpu.at("vram_gib") == 24 && gpu.at("power_limit_w") == 350 &&
+                           gpu.at("pcie") == "4.0 x16",
+                       "GPU fields: whole GiB and watts, the link as text");
+    failures += expect(line.find("\"power_limit_w\":350,") != std::string::npos &&
+                           line.find("\"ram_gib\":64,") != std::string::npos,
+                       "whole numbers are written as integers");
+    failures += expect(parsed.at("ram_gib") == 64, "host RAM in whole GiB");
+    failures += expect(line.find("\"prefill_16k_tps\":2345.7,") != std::string::npos &&
+                           line.find("\"prefill_64k_tps\":2000.0,") != std::string::npos &&
+                           line.find("\"decode_tps\":41.0}") != std::string::npos,
+                       "rates are written with one decimal: `" + line + "`");
+
+    // The line tools/bench/check_bench_rows.py's self-test pastes into a rows file (PRINTED_ROW).
+    auto plain      = row;
+    plain.submitter = "Ash";
+    failures += expect_string(
+        qb::format_community_row(plain),
+        R"({"submitter":"Ash","date":"2026-10-26","commit":"61561d88a","preset":"community-1",)"
+        R"("gpus":[{"name":"NVIDIA GeForce RTX 3090","vram_gib":24,"power_limit_w":350,)"
+        R"("pcie":"4.0 x16"}],"ram_gib":64,"cpu":"AMD Ryzen 9 5950X, 32 threads","os":"WSL2",)"
+        R"("model":"qwen3.6-27b","prefill_16k_tps":2345.7,"prefill_64k_tps":2000.0,)"
+        R"("decode_tps":41.0})",
+        "the printed row, byte for byte");
+
+    auto unknown         = row;
+    unknown.cpu          = "";
+    unknown.gpus[0].pcie = "";
+    const Json bare      = Json::parse(qb::format_community_row(unknown));
+    failures += expect(!bare.contains("cpu") && !bare.at("gpus").at(0).contains("pcie"),
+                       "a CPU or PCIe link that cannot be read is left out, not blank");
+
+    // A row the rows checker would reject is never printed; these mirror its rules.
+    const auto refused = [&](std::string_view label, auto&& change) {
+        auto bad = plain;
+        change(bad);
+        failures += expect_throws<std::invalid_argument>(
+            [&] { (void)qb::format_community_row(bad); }, label);
+    };
+    refused("a model of 81 characters",
+            [](qb::CommunityRow& r) { r.model = std::string(81, 'm'); });
+    refused("a blank model", [](qb::CommunityRow& r) { r.model = "  "; });
+    refused("a model with a newline", [](qb::CommunityRow& r) { r.model = "a\nb"; });
+    refused("a CPU of 81 characters", [](qb::CommunityRow& r) { r.cpu = std::string(81, 'c'); });
+    refused("a blank GPU name", [](qb::CommunityRow& r) { r.gpus[0].name = " "; });
+    refused("no GPU", [](qb::CommunityRow& r) { r.gpus.clear(); });
+    refused("a zero power limit", [](qb::CommunityRow& r) { r.gpus[0].power_limit_watts = 0.2; });
+    refused("no VRAM", [](qb::CommunityRow& r) { r.gpus[0].memory_bytes = 0; });
+    refused("no RAM", [](qb::CommunityRow& r) { r.ram_bytes = 0; });
+    refused("a rate that rounds to 0", [](qb::CommunityRow& r) { r.decode_tps = 0.04; });
+    refused("an unknown OS", [](qb::CommunityRow& r) { r.os = "macOS"; });
+    refused("a dirty commit", [](qb::CommunityRow& r) { r.commit = "61561d88a-dirty"; });
+    refused("a malformed date", [](qb::CommunityRow& r) { r.date = "26/10/2026"; });
+    auto long_ok  = plain;
+    long_ok.model = std::string(80, 'm');
+    long_ok.cpu   = std::string(80, 'c');
+    const Json long_row = Json::parse(qb::format_community_row(long_ok));
+    failures += expect(long_row.at("model").get<std::string>().size() == 80 &&
+                           long_row.at("cpu").get<std::string>().size() == 80,
+                       "a model and CPU of 80 characters are accepted");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -532,5 +848,9 @@ int main() {
     failures += test_measurement_contract();
     failures += test_report_contract();
     failures += test_human_and_csv_reports();
+    failures += test_power_limit_change_warning();
+    failures += test_community_preset_cli();
+    failures += test_community_preset_workload();
+    failures += test_community_row();
     return failures == 0 ? 0 : fail("ninfer_bench support contract failed");
 }

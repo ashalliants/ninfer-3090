@@ -1,8 +1,8 @@
 #pragma once
 
 // Adapted from Infernix a3edb450 include/infernix/ops/offloaded_sparse_moe.h (Apache-2.0).
-// Modified for NInfer-3090: GGML expert records (three record formats, canonical A8 arithmetic)
-// instead of NVFP4 records with per-expert scales; an exact wide route (Infernix's W4A16 contract,
+// Modified for NInfer-3090: GGML expert records (twelve text record formats and the MTP drafter's,
+// canonical A8 arithmetic) instead of NVFP4 records with per-expert scales; an exact wide route (Infernix's W4A16 contract,
 // not its W4A4 one, which only met an FP64 bound); the SSD tier, fetch channel, landing, streamed
 // records, overlap/fork streams and L2 warming are not part of this contract (prefill streaming lives
 // in the model, which publishes streamed records as resident frames).
@@ -59,12 +59,17 @@ namespace ninfer::ops {
  *   T >= 1 columns. Expert outputs are BF16 [H, top_k * T]: column t * top_k + i holds y_i[:, t].
  *
  * Supported domain:
- *   Records of format GGML_REC_IQ2_S_Q2_0, GGML_REC_IQ2_XXS_Q2_0 or GGML_REC_IQ1_M_Q2_0 in layout
- *   ggml_expert_record_v1 at [E, 2560, 640] (storage-layouts.md Section 7): one record per expert,
+ *   Records in layout ggml_expert_record_v1 at [E, 2560, 640] (storage-layouts.md Section 7) of one
+ *   of the twelve text formats: gate/up IQ2_S, IQ2_XXS or IQ1_M with Q2_0 down (the IQ2_XS pack),
+ *   and the further pairs of the GSQ-RCO IQ3_XXS and IQ3_S packs: GGML_REC_IQ2_XS_Q2_0,
+ *   GGML_REC_IQ2_XS_IQ4_NL, GGML_REC_IQ2_XXS_IQ4_NL, GGML_REC_IQ2_S_IQ4_NL, GGML_REC_IQ3_XXS_Q2_0,
+ *   GGML_REC_IQ3_XXS_IQ4_NL, GGML_REC_IQ3_S_Q2_0, GGML_REC_IQ3_S_IQ4_NL, GGML_REC_IQ4_XS_IQ4_NL
+ *   (record_geometry refuses any other format; a call takes one format). One record per expert,
  *   gate, up and down at the layout's part offsets. Expert e's record is read from the device frame
  *   frame_base + frames[e] * frame_stride (record_stride when frame_stride is zero) when
- *   frames[e] >= 0, else from the pinned, mapped host bank host_records + e * record_stride
- *   (zero-copy, or first copied to a staging slot), or it is computed by the host
+ *   frames[e] >= 0, else from the pinned, mapped host bank host_records + e * record_stride (or,
+ *   with MoeExpertSource::host_slots, the host address the expert's entry in that table names),
+ *   zero-copy or first copied to a staging slot, or it is computed by the host
  *   (MoeCpuChannel). Every positive T; an expert with any number of columns.
  *   GGML_REC_Q2_0_Q2_0 (the MTP drafter's Q2_0 gate/up and down) is supported on the narrow route
  *   only: an expert of such a call takes at most offloaded_moe::kMaxColumns columns.
@@ -87,9 +92,10 @@ namespace ninfer::ops {
  *
  * Workspace:
  *   moe_dispatch: caller-owned device arrays of moe_dispatch_bytes(). moe_experts: caller-owned
- *   device scratch of moe_experts_workspace_bytes(max_jobs, entries, columns), reserved from the
- *   call until its outputs are placed (moe_experts_cpu_wait for wait_for_cpu == false). Staging
- *   slots are caller-owned device scratch of the call, shared by every layer.
+ *   device scratch of moe_experts_workspace_bytes(max_jobs, entries, columns, precast_input),
+ *   reserved from the call until its outputs are placed (moe_experts_cpu_wait for wait_for_cpu ==
+ *   false); with source.precast_input it also holds the call's A8-cast x. Staging slots are
+ *   caller-owned device scratch of the call, shared by every layer.
  *
  * Execution:
  *   Every call is enqueued on `stream` without host synchronization; none allocates device memory.
@@ -171,7 +177,6 @@ public:
         CpuIsa isa          = best_cpu_isa();
         int max_jobs        = 16; // per round
         int spin_iterations = 1 << 16;
-        std::vector<int> cpus; // optional CPU of worker i (worker 0 is the caller, not pinned)
         // Optional liveness word: every worker atomically increments it as it takes each work item,
         // so it keeps changing for as long as a round makes progress (CpuMissService's heartbeat).
         std::uint32_t* progress = nullptr;
@@ -218,21 +223,41 @@ struct MoeDispatch {
 [[nodiscard]] MoeDispatch carve_moe_dispatch(void* base, std::int32_t experts, std::int32_t entries);
 /// Fills `dispatch` from routing.ids: counts, offsets (exclusive scan, offsets[E] = k*T), jobs in
 /// ascending expert id, job_count, and entries grouped by expert (their order within an expert is
-/// unspecified). When `route_log` is not null it also receives a copy of the k*T ids. An id outside
-/// [0, E) (moe_route never writes one) is logged but not dispatched, and offsets[E] counts only the
-/// dispatched entries. The arrays need no clearing between calls, so a captured call replays correctly.
+/// unspecified: atomics; moe_route_dispatch fixes it for decode-width calls). When `route_log` is
+/// not null it also receives a copy of the k*T ids. An id outside [0, E) (moe_route writes one only
+/// for a column it cannot rank, an all-NaN one) is logged but not dispatched, and offsets[E] counts
+/// only the dispatched entries. The arrays need no clearing between calls, so a captured call replays correctly.
 void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& dispatch,
                   std::int32_t* route_log, cudaStream_t stream);
+
+/// The widest call moe_route_dispatch routes and dispatches in one launch (decode, MTP rounds).
+inline constexpr std::int32_t kMoeRouteDispatchColumns = 8;
+
+/// moe_route(logits, top_k, routing) then moe_dispatch(routing, E, dispatch, route_log) with
+/// E = logits.ne[0] - 1, with the same requirements: the same routing bits (the same device code),
+/// counts, offsets, jobs, job_count and route log. A call of at most kMoeRouteDispatchColumns
+/// columns runs as one launch (one CTA) whose entries are in a fixed order: within each expert in
+/// ascending entry index (t * k + slot), so every array equals offloaded_moe::plan_dispatch
+/// (src/ops/offloaded_sparse_moe/dispatch_plan.h) of the routed ids. A wider call runs the two Ops,
+/// whose order within an expert is unspecified. Consumers still must not depend on that order (both
+/// routes feed them): moe_experts and moe_combine give the same bits for any order.
+void moe_route_dispatch(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, MoeDispatch& dispatch,
+                        std::int32_t* route_log, cudaStream_t stream);
 
 /// CPU-served misses. When enabled for a call (max_jobs > 0 and the call has at most max_columns
 /// columns), up to max_jobs of its non-resident experts with at most max_job_columns columns, the
 /// fewest-column ones first, are published as a request in mapped host memory with the x columns
 /// they read (compacted: the request's column k is x's k-th column read by a chosen job, in column
 /// order) and computed by the host's expert engine while the GPU computes the other jobs. Of the
-/// call's M misses, M / pcie_divisor stay on the GPU (0: the CPU takes up to max_jobs). The wait
+/// call's M misses, M / pcie_divisor stay on the GPU (0: the CPU takes up to max_jobs); with
+/// share_den > 0 the share rule replaces the divisor: the CPU takes min(max_jobs,
+/// (2 * share_num * M + share_den) / (2 * share_den)) of them (share_num / share_den of the misses,
+/// halves rounded up; offloaded_moe::select_prefill_cpu_jobs states it on the host). The wait
 /// lasts as long as the host's heartbeat word keeps changing; when it stops for
 /// kHeartbeatTimeoutNs the call writes kErrorHostSilent to the source's error word and leaves its
-/// CPU outputs unwritten (without an error word it traps).
+/// CPU outputs unwritten (without an error word it traps). A call whose error word is already set
+/// when it starts hands the host nothing: the GPU computes every job, and the call neither publishes
+/// nor waits, so a host that stopped costs one timeout until the caller clears the word.
 struct MoeCpuChannel {
     offloaded_moe::MissRequest* request = nullptr; // mapped host memory
     std::uint16_t* x                    = nullptr; // mapped BF16 [H, max_columns]
@@ -245,10 +270,41 @@ struct MoeCpuChannel {
     std::int32_t max_columns            = 0;
     std::int32_t pcie_divisor           = 3;
     std::int32_t max_job_columns        = offloaded_moe::kMaxColumns; // 1..kMaxColumns
+    // The share rule (prefill calls): 0 <= share_num <= share_den; share_den == 0 keeps the divisor.
+    // Two 16-bit words in the struct's tail padding, so its size and every kernel's parameter
+    // offsets are unchanged.
+    std::int16_t share_num = 0;
+    std::int16_t share_den = 0;
 };
+
+/// The narrow route's gate/up kernel (MoeExpertSource::gate_up_variant). Both compute the canonical
+/// rowdot of every gate and up row, so the outputs are the same bits.
+///   Staged:    a CTA per (16 intermediates, job) copies its weight slice to shared memory with
+///              cp.async and computes it there (the default).
+///   Registers: a co-resident grid loops over (8 intermediates, job) items; a warp loads one gate
+///              and one up row straight into registers, and the third pass of their 80 sub-blocks
+///              runs the gate row on lanes 0-15 and the up row on lanes 16-31. Reads the precast
+///              input, so it requires MoeExpertSource::precast_input.
+enum class GateUpVariant : std::uint8_t { Staged, Registers };
 
 struct MoeExpertSource {
     QType format                     = QType::BF16; // the layer's record format
+    // Cast x to A8 once per call into the workspace (codes [T][2560], then FP32 scales [T][80]: the
+    // canonical cast), which the narrow route's gate/up CTAs read instead of each casting their
+    // columns again. The same codes, so the same outputs bit for bit. The call's workspace grows by
+    // the two planes (moe_experts_workspace_bytes with precast_input). Declared beside `format` so
+    // it lies in that field's padding and the struct's layout is unchanged.
+    bool precast_input               = false;
+    // The narrow route's gate/up kernel (GateUpVariant); Registers requires precast_input. Also in
+    // `format`'s padding.
+    GateUpVariant gate_up_variant    = GateUpVariant::Staged;
+    // Partial RAM residency (NInfer-3090, --partial-ram-residency): host_records is a device table of
+    // E device-readable host addresses (const std::uint8_t* const*, set_host_slots), expert e's
+    // record at entry e, instead of a bank of records record_stride apart. An entry is read only
+    // for an expert whose frames[e] is -1 (it may be null otherwise); each address is 16-byte
+    // aligned. Requires staging_slots > 0: the stage pass resolves every record, so the expert
+    // kernels never read the table. Also in `format`'s padding.
+    bool host_slots                  = false;
     const std::uint8_t* frame_base   = nullptr;
     const std::int32_t* frames       = nullptr; // device [E]: frame of a resident expert, else -1
     const std::uint8_t* host_records = nullptr; // pinned host bank, device-readable (mapped)
@@ -270,9 +326,18 @@ struct MoeExpertSource {
     MoeCpuChannel cpu;
 };
 
+/// Points `source` at a per-expert host address table (MoeExpertSource::host_slots): device memory
+/// [E] of mapped host addresses.
+inline void set_host_slots(MoeExpertSource& source, const std::uint8_t* const* table) noexcept {
+    source.host_slots   = true;
+    source.host_records = reinterpret_cast<const std::uint8_t*>(table);
+}
+
 /// Workspace of one moe_experts call of `columns` (T) columns and `entries` (k*T) routed entries.
+/// With `precast_input` (MoeExpertSource::precast_input) it holds the call's A8 input too: T * 2560
+/// code bytes and T * 320 scale bytes more, each rounded up to 256 bytes.
 [[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries,
-                                                      std::int32_t columns);
+                                                      std::int32_t columns, bool precast_input = false);
 
 /// x: BF16 [H, T]. outputs: BF16 [H, k*T], column t*k + slot receives expert ids[slot, t]'s
 /// output for column t. max_jobs bounds the job count the grid covers (min(E, k*T)).
@@ -290,12 +355,29 @@ struct MoeExpertSource {
 /// route is invisible in the outputs. A call of more than kMaxColumns
 /// columns needs the larger workspace moe_experts_workspace_bytes returns for it.
 ///
+/// With source.precast_input one kernel casts every column of x to A8 before the passes (skipped
+/// in a call where every expert takes the wide route, which casts x itself) and the narrow gate/up
+/// kernels copy a column's codes and scales instead of casting it in every CTA. With
+/// source.gate_up_variant == GateUpVariant::Registers (which requires precast_input or an `input`
+/// cast; refused otherwise) the narrow gate/up rows are computed from registers by a co-resident grid instead,
+/// reading the precast codes in place; the down kernel is the same.
+///
 /// With wait_for_cpu == false the call returns before placing CPU-served outputs; the caller may
 /// enqueue unrelated work (the shared expert) and must call moe_experts_cpu_wait with the same
 /// arguments before reading `outputs`. The workspace stays reserved until then.
+///
+/// `input`, when its planes are set, is x's A8 cast already made by the caller (hc_fused_read
+/// writes it beside x): codes [T][2560] and FP32 scales [T][80], 16-byte aligned, the canonical
+/// cast's bits (those the precast kernel writes). The call then runs as with source.precast_input,
+/// reading these planes instead of casting x (no cast kernel), and the workspace needs no planes of
+/// its own (moe_experts_workspace_bytes with precast_input false suffices). The same outputs.
+struct MoeA8Input {
+    const std::int8_t* codes = nullptr;
+    const float* scales      = nullptr;
+};
 void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                  std::int32_t top_k, std::int32_t max_jobs, void* workspace, Tensor& outputs,
-                 cudaStream_t stream, bool wait_for_cpu = true);
+                 cudaStream_t stream, bool wait_for_cpu = true, MoeA8Input input = {});
 
 /// Waits for the host's answer to a moe_experts call made with wait_for_cpu == false and places
 /// its outputs; a no-op when that call published no request.
@@ -324,6 +406,11 @@ public:
         const std::uint8_t* records = nullptr; // pinned host bank, record_stride apart
         std::uint64_t record_stride = 0;
         QType format                = QType::BF16;
+        // Partial RAM residency: host [E] addresses of each expert's record (null for one in VRAM,
+        // which the GPU never hands the CPU), read in place of `records`; owned by the caller, who
+        // changes entries only while no call is pending, each with a release store through
+        // std::atomic_ref (the service loads them with acquire). Null: the bank.
+        const std::uint8_t* const* slots = nullptr;
     };
     struct Options {
         int workers         = 6;  // including the service thread
@@ -332,7 +419,6 @@ public:
         int pcie_divisor    = 3;  // misses / pcie_divisor stay on the GPU (0: none)
         int max_job_columns = kMaxColumns;
         CpuIsa isa          = best_cpu_isa();
-        std::vector<int> cpus; // optional CPU of worker i (worker 0 is the service thread)
     };
 
     CpuMissService(std::vector<Layer> layers, Options options);
@@ -340,9 +426,16 @@ public:
     CpuMissService(const CpuMissService&)            = delete;
     CpuMissService& operator=(const CpuMissService&) = delete;
 
+    // Layer `layer`'s channel with the service's options. A caller may narrow its max_jobs and
+    // max_columns (never above the options, which size the buffers) and choose its rule
+    // (pcie_divisor, or share_num / share_den); channels of one service share its buffers, so their
+    // calls must not overlap (calls in stream order, each wait before the next call's plan).
     [[nodiscard]] MoeCpuChannel channel(int layer) const;
     [[nodiscard]] std::uint64_t served_requests() const noexcept;
     [[nodiscard]] std::uint64_t served_experts() const noexcept;
+    // The experts every service of this process has computed since it started (tests and
+    // diagnostics that cannot reach the service itself).
+    [[nodiscard]] static std::uint64_t process_served_experts() noexcept;
     // Why the service thread stopped serving; empty while it serves.
     [[nodiscard]] std::string failure() const;
 

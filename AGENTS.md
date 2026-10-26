@@ -50,13 +50,13 @@ upstream tuning constant as a hypothesis until measured on this card. The build 
 compatibility constraints are in "Windows build environment (RTX 3090 fork host)" below.
 
 Generation uses one resident model on one GPU, one to eight resident execution lanes fixed at
-startup, bounded FIFO ingress with finite bypass, resource-pressure preemption with
-Snapshot/Replay recovery, and one compact decode batch per round. The layer pipeline over up to
-eight GPUs (`--devices`, Linux only; each stage owns whole layers with their KV and state, and the
-head, round state and sampling stay on the first device; design in
+startup, bounded FIFO ingress with finite bypass (plus an opt-in, bounded cache-affinity overtake),
+resource-pressure preemption with Snapshot/Replay recovery, and one compact decode batch per round.
+The layer pipeline over up to eight GPUs (`--devices`, Linux only; each stage owns whole layers with
+their KV and state, and the head, round state and sampling stay on the first device; design in
 `docs/maintainer/pipeline-parallel-plan.md`) is parked while it is ported to the replaced context
-engine: its sources stay in the tree, and startup rejects more than one device. Tensor
-parallelism is not built.
+engine: its sources stay in the tree, and startup rejects more than one device. Tensor parallelism
+is not built.
 Generation and offline CausalScoring use the same public `.ninfer` Engine route. Delivered
 capabilities and commands are documented in `README.md`, the product guides, and executable
 `--help`. New mathematical architectures, execution platforms, large-scale continuous

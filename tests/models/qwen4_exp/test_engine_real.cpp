@@ -21,18 +21,112 @@
 //
 //   ninfer_qwen4_exp_engine_real_test --bench [--max-context N] [--generate N] [--no-graph]
 //       [--expert-cache-mib N] [--no-expert-state] [--split N] [--print-ids] [--vision] [--prefill-chunk N]
-//       [--mtp K [--mtp-fixed] [--width-cost X]] TOKENS...
+//       [--mtp K [--mtp-fixed | --mtp-joint-acceptance] [--width-cost X]] TOKENS...
 //
 // --vision loads the artifact's vision tower (an Engine started with --vision; the jobs stay text).
 //
+// Flash-Next options, in their ninfer-serve spelling, so one build can be timed with an option off
+// and on (tools/bench/basalt_gpu_verify.py runs these A/Bs): --shared-expert-stream,
+// --mtp-constrained, --ngram-prefetch, --gdn-head-map, --moe-precast-input, --moe-gate-up-registers,
+// --moe-fused-route, --cpu-verify-misses, --gdn-async-commit, --hc-int8, --hc-fused-read,
+// --ngram-flag-wait, --partial-ram-residency, --ggml-decode-mma, and the valued --hot-embedding-rows N,
+// --cpu-verify-workers N, --prefill-cpu-share F (two decimals at most), --ngram-keepalive-ms N,
+// --expert-state FILE and --default-expert-state FILE. The Engine refuses a combination it cannot run,
+// as ninfer-serve does.
+//
 // --mtp K decodes with MTP speculation (the artifact must hold the drafter), verifying up to K
-// drafts per round (--mtp-fixed: always K); each job also prints its acceptance.
+// drafts per round (--mtp-fixed: always K; --mtp-joint-acceptance: Basalt's joint-acceptance window
+// over K drafts; the two are refused together); each job also prints its acceptance.
 //
 // MTP exactness mode: greedy output with MTP speculation must equal plain greedy output. One plain
 // Engine decodes every job, then one MTP Engine per depth K; the ids must be identical.
 //
 //   ninfer_qwen4_exp_engine_real_test --mtp-exact K[,K...] [--max-context N] [--generate N]
-//       [--mtp-fixed] TOKENS...
+//       [--mtp-fixed | --mtp-joint-acceptance] TOKENS...
+//   --mtp-joint-acceptance: the MTP Engines choose their windows by the joint-acceptance rule.
+//
+// Hot embedding rows (hot_embedding_matches_plain below, --hot-embedding-rows): greedy ids with only
+// the embedding's first N rows in VRAM (the rest read from the pinned block) equal those of an Engine
+// with the whole table in VRAM. --mtp K runs both Engines with MTP, so the drafter's embedding takes
+// the split route too. Without TOKENS the chat fixture's first 300 tokens are the prompt.
+//
+//   ninfer_qwen4_exp_engine_real_test --hot-embedding-exact N [--mtp K] [--max-context N] [--generate N]
+//       [TOKENS...]
+//
+// Partial RAM residency (partial_ram_residency_matches_full below, --partial-ram-residency): greedy
+// ids with only the experts the VRAM cache does not hold in RAM equal those with every bank pinned,
+// and at least one VRAM-only expert was written back. --expert-cache-mib N (both Engines) makes the
+// evictions common; --mtp K compares the MTP statistics too.
+//
+//   ninfer_qwen4_exp_engine_real_test --partial-ram-exact [--expert-cache-mib N] [--mtp K
+//       [--cpu-verify-misses]] [--max-context N] [--generate N] [TOKENS...]
+//
+// GDN head map (gdn_head_map_matches_copies below, --gdn-head-map): greedy ids with the GDN reading
+// its key heads through the tiled head map equal those of an Engine with the q/k copies. --mtp K runs
+// both Engines with MTP, so the verification's replay records (16 key heads) and their fold run too.
+// Without TOKENS the chat fixture's first 300 tokens are the prompt (a chunked-route prefill).
+//
+//   ninfer_qwen4_exp_engine_real_test --gdn-head-map-exact [--mtp K] [--max-context N] [--generate N]
+//       [TOKENS...]
+//
+// MoE precast input (moe_precast_matches_plain below, --moe-precast-input): greedy ids with every
+// routed-expert call casting its input to A8 once equal those of an Engine casting it per block.
+// --mtp K runs both Engines with MTP, so the drafter's and the verification's calls take it too.
+// Without TOKENS the chat fixture's first 300 tokens are the prompt (a prefill wider than 8 columns).
+//
+//   ninfer_qwen4_exp_engine_real_test --moe-precast-exact [--mtp K] [--max-context N] [--generate N]
+//       [TOKENS...]
+//
+// MoE register gate/up (moe_gate_up_registers_matches_plain below, --moe-gate-up-registers with the
+// --moe-precast-input it needs): greedy ids equal those of an Engine with the default gate/up kernel
+// and per-block casts. The same arguments as --moe-precast-exact.
+//
+//   ninfer_qwen4_exp_engine_real_test --moe-gate-up-registers-exact [--mtp K] [--max-context N]
+//       [--generate N] [TOKENS...]
+//
+// MoE one-launch route and dispatch (moe_fused_route_matches_plain below, --moe-fused-route): greedy
+// ids equal those of an Engine that routes and dispatches with two launches. The same arguments as
+// --moe-precast-exact.
+//
+//   ninfer_qwen4_exp_engine_real_test --moe-fused-route-exact [--mtp K] [--max-context N]
+//       [--generate N] [TOKENS...]
+//
+// CPU verification misses (cpu_verify_misses_matches_plain below, --cpu-verify-misses): greedy ids,
+// MTP rounds, drafts and acceptances equal those of the GPU-only verification. The same arguments as
+// --moe-precast-exact; --mtp K is what exercises the option, and the CPU must serve an expert.
+//
+//   ninfer_qwen4_exp_engine_real_test --cpu-verify-misses-exact --mtp K [--expert-cache-mib N]
+//       [--max-context N] [--generate N] [TOKENS...]
+//
+// Prefill CPU share (prefill_cpu_share_matches_plain below, --prefill-cpu-share 0.6): greedy ids
+// (and with --mtp K the MTP rounds, drafts and acceptances) equal those of a GPU-only prefill, and the
+// CPU must serve an expert. The same arguments as --moe-precast-exact, plus --prompt-lengths A,B,...
+// (prompts cut from the fixtures, up to 4,096 tokens): a prompt under 512 tokens is one static call,
+// one of 512 or more one streamed call, which must leave predicted-cold experts out of the stream.
+//
+//   ninfer_qwen4_exp_engine_real_test --prefill-cpu-share-exact [--mtp K] [--expert-cache-mib N]
+//       [--prompt-lengths A,B,...] [--max-context N] [--generate N] [TOKENS...]
+//
+// GDN commit on a side stream (gdn_async_commit_matches_serial below, --gdn-async-commit): greedy
+// ids, MTP rounds, drafts and acceptances equal those of the commit folded on the device stream, and
+// at least one fold ran on the side stream. The same arguments as --moe-precast-exact; --mtp K is
+// what exercises the option.
+//
+//   ninfer_qwen4_exp_engine_real_test --gdn-async-commit-exact --mtp K [--max-context N]
+//       [--generate N] [TOKENS...]
+//
+// In-graph n-gram flag wait (ngram_flag_wait_matches_split below, --ngram-flag-wait): greedy ids
+// (and with --mtp K the MTP rounds, drafts and acceptances) equal those of the two-part rounds, and at
+// least one plain round (with --mtp K: one verification) ran as one graph waiting for its rows. The
+// same arguments as --moe-precast-exact; without --mtp every decode round is a plain one.
+//
+//   ninfer_qwen4_exp_engine_real_test --ngram-flag-wait-exact [--mtp K] [--max-context N]
+//       [--generate N] [TOKENS...]
+//
+// MTP for constrained requests (mtp_constrained_matches_plain below): a greedy JSON-schema request
+// with --mtp-constrained (K drafts, default 3) gives the ids of plain constrained decoding.
+//
+//   ninfer_qwen4_exp_engine_real_test --mtp-constrained [K] [--max-context N] [--generate N]
 //
 // --split N streams each request with live timings and also reports decode tok/s over generated
 // tokens 2..N and N+1..end (decode right after a prefill, while the expert cache refills).
@@ -49,12 +143,18 @@
 //
 // TOKENS is @FILE (ids separated by commas or whitespace) or a comma-separated id list.
 
+#include "core/side_stream_delay.h"
 #include "core/vram_budget.h"
+#include "models/qwen4_exp/execution/expert_stream.h"
+#include "models/qwen4_exp/program/expert_residency.h"
+#include "models/qwen4_exp/program/program.h"
 #include "ninfer/engine.h"
+#include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ninfer/types.h"
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -63,10 +163,12 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -401,19 +503,81 @@ bool same(const char* label, const std::vector<TokenId>& reference, const std::v
     return false;
 }
 
+// The bench's on/off Flash-Next options (see the file comment), set on the Engine's options as
+// ninfer-serve sets them.
+struct BenchFlag {
+    const char* name;
+    void (*set)(EngineOptions&);
+};
+constexpr BenchFlag kBenchFlags[] = {
+    {"--shared-expert-stream", [](EngineOptions& o) { o.flash_next.shared_expert_stream = true; }},
+    {"--mtp-constrained", [](EngineOptions& o) { o.flash_next.mtp_constrained = true; }},
+    {"--ngram-prefetch", [](EngineOptions& o) { o.flash_next.ngram_prefetch = true; }},
+    {"--gdn-head-map", [](EngineOptions& o) { o.flash_next.gdn_head_map = true; }},
+    {"--moe-precast-input", [](EngineOptions& o) { o.flash_next.moe_precast_input = true; }},
+    {"--moe-gate-up-registers", [](EngineOptions& o) { o.flash_next.moe_gate_up_registers = true; }},
+    {"--moe-fused-route", [](EngineOptions& o) { o.flash_next.moe_fused_route = true; }},
+    {"--cpu-verify-misses", [](EngineOptions& o) { o.flash_next.cpu_verify_misses = true; }},
+    {"--gdn-async-commit", [](EngineOptions& o) { o.flash_next.gdn_async_commit = true; }},
+    {"--hc-int8", [](EngineOptions& o) { o.flash_next.hc_int8 = true; }},
+    {"--hc-fused-read", [](EngineOptions& o) { o.flash_next.hc_fused_read = true; }},
+    {"--ngram-flag-wait", [](EngineOptions& o) { o.flash_next.ngram_flag_wait = true; }},
+    {"--partial-ram-residency", [](EngineOptions& o) { o.flash_next.partial_ram_residency = true; }},
+    {"--ggml-decode-mma", [](EngineOptions& o) { o.flash_next.ggml_decode_mma = true; }},
+};
+
+// --prefill-cpu-share F: F in [0, 1] with at most two decimals, as the serve flag takes it.
+FlashNextOptions::Fraction parse_bench_share(const std::string& text) {
+    const std::size_t point = text.find('.');
+    const std::string whole = text.substr(0, point);
+    const std::string part  = point == std::string::npos ? std::string() : text.substr(point + 1);
+    const auto digits = [](const std::string& d) { return d.find_first_not_of("0123456789") == std::string::npos; };
+    if ((whole.empty() && part.empty()) || whole.size() > 1 || part.size() > 2 || !digits(whole) || !digits(part)) {
+        throw std::invalid_argument("--prefill-cpu-share takes a value in [0, 1] with at most two decimals: " + text);
+    }
+    const auto hundredths = static_cast<std::uint32_t>(std::stoul((whole.empty() ? "0" : whole) + (part + "00").substr(0, 2)));
+    if (hundredths > 100) { throw std::invalid_argument("--prefill-cpu-share must be at most 1: " + text); }
+    const std::uint32_t common = std::gcd(hundredths, 100U);
+    return {hundredths / common, 100 / common};
+}
+
 int bench(const std::string& artifact, const std::vector<std::string>& args) {
     std::uint32_t max_context = 33'792, tokens = 512, split = 0, mtp = 0, prefill_chunk = 1024;
-    bool graph = true, state = true, print_ids = false, mtp_fixed = false, vision = false;
+    bool graph = true, state = true, print_ids = false, mtp_fixed = false, vision = false, joint = false;
     double width_cost = -1.0;
     std::optional<std::uint64_t> cache;
     std::vector<std::string> jobs;
+    std::vector<void (*)(EngineOptions&)> flags; // kBenchFlags given, applied after the defaults below
+    std::optional<std::uint32_t> hot_rows, workers, keepalive_ms;
+    std::optional<FlashNextOptions::Fraction> share;
+    std::optional<std::filesystem::path> state_path, default_state_path;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
         const auto value     = [&] {
             if (i + 1 >= args.size()) { throw std::invalid_argument(a + " needs a value"); }
             return std::stoull(args[++i]);
         };
-        if (a == "--max-context") {
+        const auto text = [&] {
+            if (i + 1 >= args.size()) { throw std::invalid_argument(a + " needs a value"); }
+            return args[++i];
+        };
+        const auto flag = std::find_if(std::begin(kBenchFlags), std::end(kBenchFlags),
+                                       [&](const BenchFlag& f) { return a == f.name; });
+        if (flag != std::end(kBenchFlags)) {
+            flags.push_back(flag->set);
+        } else if (a == "--hot-embedding-rows") {
+            hot_rows = static_cast<std::uint32_t>(value());
+        } else if (a == "--cpu-verify-workers") {
+            workers = static_cast<std::uint32_t>(value());
+        } else if (a == "--prefill-cpu-share") {
+            share = parse_bench_share(text());
+        } else if (a == "--ngram-keepalive-ms") {
+            keepalive_ms = static_cast<std::uint32_t>(value());
+        } else if (a == "--expert-state") {
+            state_path = text();
+        } else if (a == "--default-expert-state") {
+            default_state_path = text();
+        } else if (a == "--max-context") {
             max_context = static_cast<std::uint32_t>(value());
         } else if (a == "--generate") {
             tokens = static_cast<std::uint32_t>(value());
@@ -431,6 +595,8 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
             mtp = static_cast<std::uint32_t>(value());
         } else if (a == "--mtp-fixed") {
             mtp_fixed = true;
+        } else if (a == "--mtp-joint-acceptance") {
+            joint = true;
         } else if (a == "--vision") {
             vision = true;
         } else if (a == "--width-cost" && i + 1 < args.size()) {
@@ -452,8 +618,16 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
         options.speculative.backend         = SpeculativeBackend::Mtp;
         options.speculative.draft_tokens    = mtp;
         options.flash_next.mtp_fixed_drafts = mtp_fixed;
+        options.flash_next.mtp_joint_acceptance = joint;
         if (width_cost >= 0.0) { options.flash_next.mtp_width_cost = width_cost; }
     }
+    for (const auto set : flags) { set(options); }
+    if (hot_rows) { options.flash_next.hot_embedding_rows = *hot_rows; }
+    if (workers) { options.flash_next.cpu_verify_workers = *workers; }
+    if (share) { options.flash_next.prefill_cpu_share = *share; }
+    if (keepalive_ms) { options.flash_next.ngram_keepalive_ms = *keepalive_ms; }
+    if (state_path) { options.flash_next.expert_state_path = *state_path; }
+    if (default_state_path) { options.flash_next.default_expert_state_path = *default_state_path; }
     const auto load = std::chrono::steady_clock::now();
     Engine engine(options);
     std::printf("engine loaded in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - load).count());
@@ -476,7 +650,7 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
 // verified drafts (so acceptance, rejection and the commit paths all ran).
 int mtp_exact(const std::string& artifact, const std::vector<std::string>& args) {
     std::uint32_t max_context = 33'792, tokens = 256;
-    bool fixed = false;
+    bool fixed = false, joint = false;
     std::vector<std::uint32_t> depths;
     std::vector<std::string> jobs;
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -487,6 +661,8 @@ int mtp_exact(const std::string& artifact, const std::vector<std::string>& args)
             tokens = static_cast<std::uint32_t>(std::stoul(args[++i]));
         } else if (a == "--mtp-fixed") {
             fixed = true;
+        } else if (a == "--mtp-joint-acceptance") {
+            joint = true;
         } else if (depths.empty() && a.find_first_not_of("0123456789,") == std::string::npos) {
             std::stringstream list(a);
             std::string item;
@@ -517,6 +693,7 @@ int mtp_exact(const std::string& artifact, const std::vector<std::string>& args)
         options.speculative.backend          = SpeculativeBackend::Mtp;
         options.speculative.draft_tokens     = depth;
         options.flash_next.mtp_fixed_drafts  = fixed;
+        options.flash_next.mtp_joint_acceptance = joint;
         Engine engine(options);
         for (std::size_t j = 0; j < jobs.size(); ++j) {
             const auto prompt       = parse_tokens(jobs[j]);
@@ -532,6 +709,454 @@ int mtp_exact(const std::string& artifact, const std::vector<std::string>& args)
         }
     }
     std::printf(ok ? "qwen4_exp mtp exactness passed\n" : "FAIL: qwen4_exp mtp exactness\n");
+    return ok ? 0 : 1;
+}
+
+// hot_embedding_matches_plain (--hot-embedding-exact, FlashNextOptions::hot_embedding_rows): the
+// whole route through the Program (the table bound in the pinned block, its device pointer, the hot
+// rows' copy and the forward's two planes) gives the greedy ids of the table in VRAM. Each job must
+// gather ids on both sides of the boundary (its prompt and its output together), so both planes ran.
+int hot_embedding_matches_plain(const std::string& artifact, const std::vector<std::string>& args) {
+    std::uint32_t max_context = 8192, tokens = 128, rows = 0, mtp = 0;
+    std::vector<std::string> jobs;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--max-context" && i + 1 < args.size()) {
+            max_context = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        } else if (a == "--generate" && i + 1 < args.size()) {
+            tokens = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        } else if (a == "--mtp" && i + 1 < args.size()) {
+            mtp = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        } else if (rows == 0 && a.find_first_not_of("0123456789") == std::string::npos) {
+            rows = static_cast<std::uint32_t>(std::stoul(a));
+        } else {
+            jobs.push_back(a);
+        }
+    }
+    if (rows == 0) { throw std::invalid_argument("--hot-embedding-exact needs a nonzero row count"); }
+    std::vector<std::vector<TokenId>> prompts;
+    for (const std::string& job : jobs) { prompts.push_back(parse_tokens(job)); }
+    if (prompts.empty()) {
+        auto ids = parse_tokens("@" + std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/qwen4_exp/ppl_tokens-chat.ids");
+        ids.resize(std::min<std::size_t>(ids.size(), 300));
+        prompts.push_back(std::move(ids));
+        jobs.push_back("ppl_tokens-chat[0:300]");
+    }
+    const auto engine_options = [&](std::uint32_t hot_rows) {
+        EngineOptions options                  = base_options(artifact, max_context);
+        options.flash_next.save_expert_state   = false;
+        options.flash_next.hot_embedding_rows  = hot_rows;
+        if (mtp != 0) {
+            options.speculative.backend      = SpeculativeBackend::Mtp;
+            options.speculative.draft_tokens = mtp;
+        }
+        return options;
+    };
+    const double ram_before = available_ram_gib();
+    std::vector<std::vector<TokenId>> plain;
+    {
+        Engine engine(engine_options(0));
+        for (std::size_t j = 0; j < prompts.size(); ++j) {
+            const Run run = generate(engine, prompts[j], tokens);
+            print_run(("whole table in VRAM " + jobs[j]).c_str(), run, prompts[j].size());
+            plain.push_back(run.ids);
+        }
+    }
+    wait_for_ram(ram_before);
+    bool ok = true;
+    Engine engine(engine_options(rows));
+    for (std::size_t j = 0; j < prompts.size(); ++j) {
+        const Run run           = generate(engine, prompts[j], tokens);
+        const std::string label = "hot rows " + std::to_string(rows) + " " + jobs[j];
+        print_run(label.c_str(), run, prompts[j].size());
+        if (mtp != 0) { print_speculation(label.c_str(), run.speculative); }
+        ok = same(label.c_str(), plain[j], run.ids) && ok;
+        std::size_t hot = 0, cold = 0;
+        for (const std::vector<TokenId>* ids : {&std::as_const(prompts[j]), &run.ids}) {
+            for (const TokenId id : *ids) { (static_cast<std::uint32_t>(id) < rows ? hot : cold) += 1; }
+        }
+        std::printf("%s: %zu hot and %zu cold gathers\n", label.c_str(), hot, cold);
+        if (hot == 0 || cold == 0) {
+            std::printf("FAIL: %s did not gather on both sides of the boundary\n", label.c_str());
+            ok = false;
+        }
+        if (mtp != 0 && run.speculative.rounds == 0) {
+            std::printf("FAIL: %s ran no MTP round, so the drafter's embedding was not exercised\n", label.c_str());
+            ok = false;
+        }
+    }
+    std::printf(ok ? "qwen4_exp hot embedding exactness passed\n" : "FAIL: qwen4_exp hot embedding exactness\n");
+    return ok ? 0 : 1;
+}
+
+// The greedy ids of an Engine with a Flash-Next option that is designed to change no bit (`set`
+// turns it on) against an Engine without it, through the whole route of the Program. `on` and `off`
+// label the runs; with --mtp K the option's Engine must run MTP rounds.
+struct BitwiseOption {
+    const char* off;
+    const char* on;
+    const char* name; // in the verdict
+    void (*set)(EngineOptions&);
+    // Optional: a process-wide count of the work only the option does; the gate fails when the
+    // option's Engine leaves it unchanged (the option's route never ran).
+    std::uint64_t (*exercised)() = nullptr;
+    // Optional: the same for the option's streamed-call route, required when a prompt is at least
+    // 512 tokens (one streamed call when the cache lends the stream its ring).
+    std::uint64_t (*exercised_streamed)() = nullptr;
+    // Optional: a second count of the option's own work, required like `exercised`.
+    std::uint64_t (*exercised_too)() = nullptr;
+};
+
+int option_matches_off(const std::string& artifact, const std::vector<std::string>& args,
+                       const BitwiseOption& option) {
+    std::uint32_t max_context = 8192, tokens = 128, mtp = 0;
+    std::optional<std::uint64_t> cache_bytes;
+    std::vector<std::string> jobs;
+    std::vector<std::size_t> lengths; // --prompt-lengths: prompts of these lengths from the fixtures
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--prompt-lengths" && i + 1 < args.size()) {
+            std::stringstream list(args[++i]);
+            for (std::string item; std::getline(list, item, ',');) { lengths.push_back(std::stoul(item)); }
+        } else if (a == "--max-context" && i + 1 < args.size()) {
+            max_context = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        } else if (a == "--expert-cache-mib" && i + 1 < args.size()) {
+            cache_bytes = static_cast<std::uint64_t>(std::stoull(args[++i])) << 20;
+        } else if (a == "--generate" && i + 1 < args.size()) {
+            tokens = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        } else if (a == "--mtp" && i + 1 < args.size()) {
+            mtp = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        } else {
+            jobs.push_back(a);
+        }
+    }
+    std::vector<std::vector<TokenId>> prompts;
+    for (const std::string& job : jobs) { prompts.push_back(parse_tokens(job)); }
+    if (!lengths.empty()) {
+        // The chat and doc fixtures one after the other (4,096 tokens), cut to each length.
+        std::vector<TokenId> pool;
+        for (const char* name : {"ppl_tokens-chat", "ppl_tokens-doc", "infernix_texts-chat", "infernix_texts-doc"}) {
+            const auto ids = parse_tokens("@" + std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/qwen4_exp/" + name + ".ids");
+            pool.insert(pool.end(), ids.begin(), ids.end());
+        }
+        for (const std::size_t n : lengths) {
+            if (n == 0 || n > pool.size()) { throw std::invalid_argument("--prompt-lengths: 1.." + std::to_string(pool.size())); }
+            prompts.emplace_back(pool.begin(), pool.begin() + static_cast<std::ptrdiff_t>(n));
+            jobs.push_back("fixtures[0:" + std::to_string(n) + "]");
+        }
+    }
+    if (prompts.empty()) {
+        auto ids = parse_tokens("@" + std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/qwen4_exp/ppl_tokens-chat.ids");
+        ids.resize(std::min<std::size_t>(ids.size(), 300));
+        prompts.push_back(std::move(ids));
+        jobs.push_back("ppl_tokens-chat[0:300]");
+    }
+    const auto engine_options = [&](bool on) {
+        EngineOptions options                = base_options(artifact, max_context);
+        options.flash_next.save_expert_state = false;
+        if (cache_bytes) { options.flash_next.expert_cache_bytes = cache_bytes; }
+        if (on) { option.set(options); }
+        if (mtp != 0) {
+            options.speculative.backend      = SpeculativeBackend::Mtp;
+            options.speculative.draft_tokens = mtp;
+        }
+        return options;
+    };
+    const double ram_before = available_ram_gib();
+    std::vector<std::vector<TokenId>> reference;
+    std::vector<SpeculativeStats> reference_speculation;
+    try {
+        Engine engine(engine_options(false));
+        for (std::size_t j = 0; j < prompts.size(); ++j) {
+            const Run run = generate(engine, prompts[j], tokens);
+            print_run((std::string(option.off) + " " + jobs[j]).c_str(), run, prompts[j].size());
+            if (mtp != 0) { print_speculation((std::string(option.off) + " " + jobs[j]).c_str(), run.speculative); }
+            reference.push_back(run.ids);
+            reference_speculation.push_back(run.speculative);
+        }
+    } catch (const std::exception& error) {
+        if (mtp == 0 || std::string(error.what()).find("no MTP drafter") == std::string::npos) { throw; }
+        std::printf("SKIP: the artifact has no MTP drafter (%s)\n", error.what());
+        return 77;
+    }
+    wait_for_ram(ram_before);
+    bool ok = true;
+    const std::uint64_t exercised_before = option.exercised != nullptr ? option.exercised() : 0;
+    const std::uint64_t streamed_before  = option.exercised_streamed != nullptr ? option.exercised_streamed() : 0;
+    const std::uint64_t too_before       = option.exercised_too != nullptr ? option.exercised_too() : 0;
+    Engine engine(engine_options(true));
+    for (std::size_t j = 0; j < prompts.size(); ++j) {
+        const Run run           = generate(engine, prompts[j], tokens);
+        const std::string label = std::string(option.on) + " " + jobs[j];
+        print_run(label.c_str(), run, prompts[j].size());
+        if (mtp != 0) { print_speculation(label.c_str(), run.speculative); }
+        ok = same(label.c_str(), reference[j], run.ids) && ok;
+        if (mtp != 0 && run.speculative.rounds == 0) {
+            std::printf("FAIL: %s ran no MTP round, so the option's MTP route was not exercised\n", label.c_str());
+            ok = false;
+        }
+        // Greedy rounds are deterministic, so a bitwise option leaves the drafter's proposals and
+        // their acceptance unchanged too; equal ids alone would not show a drafter that diverged.
+        const SpeculativeStats& ref = reference_speculation[j];
+        if (mtp != 0 && (run.speculative.rounds != ref.rounds || run.speculative.drafted_tokens != ref.drafted_tokens ||
+                         run.speculative.accepted_tokens != ref.accepted_tokens ||
+                         run.speculative.fallback_steps != ref.fallback_steps ||
+                         run.speculative.accepted_per_position != ref.accepted_per_position)) {
+            std::printf("FAIL: %s: MTP rounds, drafts or acceptances differ from %s\n", label.c_str(), option.off);
+            ok = false;
+        }
+    }
+    if (option.exercised != nullptr) {
+        const std::uint64_t done = option.exercised() - exercised_before;
+        std::printf("%s: %llu units of the option's own work\n", option.on, static_cast<unsigned long long>(done));
+        if (done == 0) {
+            std::printf("FAIL: %s never ran its own route, so the identity says nothing about it\n", option.on);
+            ok = false;
+        }
+    }
+    if (option.exercised_too != nullptr) {
+        const std::uint64_t done = option.exercised_too() - too_before;
+        std::printf("%s: %llu units of the option's second route\n", option.on, static_cast<unsigned long long>(done));
+        if (done == 0) {
+            std::printf("FAIL: %s never ran its second route, so the identity says nothing about it\n", option.on);
+            ok = false;
+        }
+    }
+    const bool long_prompt = std::any_of(prompts.begin(), prompts.end(), [](const auto& p) { return p.size() >= 512; });
+    if (option.exercised_streamed != nullptr && long_prompt) {
+        const std::uint64_t done = option.exercised_streamed() - streamed_before;
+        std::printf("%s: %llu units of the option's streamed-call work\n", option.on, static_cast<unsigned long long>(done));
+        if (done == 0) {
+            std::printf("FAIL: %s never ran its streamed-call route (did the cache lend the stream its ring?)\n",
+                        option.on);
+            ok = false;
+        }
+    }
+    if (ok) {
+        std::printf("qwen4_exp %s exactness passed\n", option.name);
+    } else {
+        std::printf("FAIL: qwen4_exp %s exactness\n", option.name);
+    }
+    return ok ? 0 : 1;
+}
+
+// gdn_head_map_matches_copies (--gdn-head-map-exact, FlashNextOptions::gdn_head_map): the whole route
+// through the Program (the forward's option, and with MTP the records planned with 16 key heads and
+// their fold) gives the greedy ids of the q/k copies.
+int gdn_head_map_matches_copies(const std::string& artifact, const std::vector<std::string>& args) {
+    return option_matches_off(artifact, args,
+                              {"q/k copies", "gdn head map", "gdn head map",
+                               [](EngineOptions& o) { o.flash_next.gdn_head_map = true; }});
+}
+
+// moe_precast_matches_plain (--moe-precast-exact, FlashNextOptions::moe_precast_input): every
+// routed-expert call casting its input to A8 once (the text model's prefill and decode calls, with
+// MTP the drafter's and the verification's, in the workspace the Program plans for it) gives the
+// greedy ids of the per-block casts.
+int moe_precast_matches_plain(const std::string& artifact, const std::vector<std::string>& args) {
+    return option_matches_off(artifact, args,
+                              {"per-block casts", "moe precast input", "moe precast input",
+                               [](EngineOptions& o) { o.flash_next.moe_precast_input = true; }});
+}
+
+// moe_gate_up_registers_matches_plain (--moe-gate-up-registers-exact,
+// FlashNextOptions::moe_gate_up_registers with moe_precast_input): every routed-expert call's narrow
+// gate/up rows computed from registers by the co-resident grid (prefill, decode, with MTP the
+// drafter's and the verification's calls) give the greedy ids of the staged kernel.
+int moe_gate_up_registers_matches_plain(const std::string& artifact, const std::vector<std::string>& args) {
+    return option_matches_off(artifact, args,
+                              {"staged gate/up", "register gate/up", "moe register gate/up", [](EngineOptions& o) {
+                                   o.flash_next.moe_precast_input     = true;
+                                   o.flash_next.moe_gate_up_registers = true;
+                               }});
+}
+
+// moe_fused_route_matches_plain (--moe-fused-route-exact, FlashNextOptions::moe_fused_route): every
+// routed-expert call of at most 8 columns routed and dispatched in one launch (decode, with MTP the
+// drafter's and the verification's calls; prefill chunks take the two Ops) gives the greedy ids of
+// the two-launch route.
+int moe_fused_route_matches_plain(const std::string& artifact, const std::vector<std::string>& args) {
+    return option_matches_off(artifact, args,
+                              {"two-launch route", "one-launch route", "moe fused route",
+                               [](EngineOptions& o) { o.flash_next.moe_fused_route = true; }});
+}
+
+// cpu_verify_misses_matches_plain (--cpu-verify-misses-exact, FlashNextOptions::cpu_verify_misses):
+// each MTP verification round's CPU-served misses (the CPU miss service's worker team beside the
+// GPU) give the greedy ids, rounds, drafts and acceptances of the GPU-only verification, and the
+// CPU serves at least one expert. Needs --mtp; --expert-cache-mib N (both Engines) makes misses common.
+int cpu_verify_misses_matches_plain(const std::string& artifact, const std::vector<std::string>& args) {
+    return option_matches_off(artifact, args,
+                              {"GPU misses", "CPU verification misses", "cpu verify misses",
+                               [](EngineOptions& o) { o.flash_next.cpu_verify_misses = true; },
+                               [] { return ops::offloaded_moe::CpuMissService::process_served_experts(); }});
+}
+
+// prefill_cpu_share_matches_plain (--prefill-cpu-share-exact, FlashNextOptions::prefill_cpu_share
+// at Basalt's 0.6): each layer of a prefill call hands the CPU miss service 3 / 5 of its misses (those
+// with the fewest columns, at most 8), computed beside the GPU's staging, a streamed call's misses
+// being the predicted-cold experts its stream left out; the greedy ids (and MTP statistics with
+// --mtp) equal those of the GPU-only prefill, the CPU serves at least one expert, and with a prompt
+// of 512 tokens or more a stream left at least one expert out. --expert-cache-mib N (both Engines)
+// makes misses common.
+int prefill_cpu_share_matches_plain(const std::string& artifact, const std::vector<std::string>& args) {
+    return option_matches_off(artifact, args,
+                              {"GPU prefill", "prefill CPU share 3/5", "prefill cpu share",
+                               [](EngineOptions& o) { o.flash_next.prefill_cpu_share = {3, 5}; },
+                               [] { return ops::offloaded_moe::CpuMissService::process_served_experts(); },
+                               [] { return models::qwen4_exp::execution::ExpertStream::process_cold_experts(); }});
+}
+
+// gdn_async_commit_matches_serial (--gdn-async-commit-exact, FlashNextOptions::gdn_async_commit):
+// every MTP verification commit a row continues from folds its GDN columns on the Program's fold
+// stream, beside the drafter's catch-up and the next round's drafts, with the next round's front
+// waiting for it. The greedy ids, rounds, drafts and acceptances equal those of the fold on the device
+// stream (a fold the front did not wait for would change the state the next round reads), and the
+// side stream ran at least one fold. Needs --mtp.
+int gdn_async_commit_matches_serial(const std::string& artifact, const std::vector<std::string>& args) {
+    // Every fold starts late on its stream, so a front that did not wait for it reads the state
+    // before the fold and diverges (core/side_stream_delay.h).
+    const ninfer::GateSideStreamDelay late_folds;
+    return option_matches_off(artifact, args,
+                              {"device-stream fold", "side-stream fold", "gdn async commit",
+                               [](EngineOptions& o) { o.flash_next.gdn_async_commit = true; },
+                               [] { return ninfer::models::qwen4_exp::Program::process_async_gdn_folds(); }});
+}
+
+// ngram_flag_wait_matches_split (--ngram-flag-wait-exact, FlashNextOptions::ngram_flag_wait): every
+// decode round after a lane's first (a plain round, and with MTP each verification width after its
+// first) runs as one graph whose wait kernel spins until the host has read the round's n-gram rows
+// into the pinned block and raised the flag. The greedy ids, rounds, drafts and acceptances equal
+// those of the two graphs around the host's read (a wait the rows did not stay behind would read the
+// previous round's rows and diverge). Without --mtp at least one plain round ran as one graph; with
+// it at least one verification did.
+int ngram_flag_wait_matches_split(const std::string& artifact, const std::vector<std::string>& args) {
+    using ninfer::models::qwen4_exp::Program;
+    const bool mtp = std::find(args.begin(), args.end(), "--mtp") != args.end();
+    const auto set = [](EngineOptions& o) { o.flash_next.ngram_flag_wait = true; };
+    if (mtp) {
+        return option_matches_off(artifact, args,
+                                  {"two-part rounds", "one-graph rounds", "ngram flag wait", set,
+                                   [] { return Program::process_ngram_flag_verifications(); }});
+    }
+    return option_matches_off(artifact, args,
+                              {"two-part rounds", "one-graph rounds", "ngram flag wait", set,
+                               [] { return Program::process_ngram_flag_rounds(); }});
+}
+
+// partial_ram_residency_matches_full (--partial-ram-exact, FlashNextOptions::partial_ram_residency):
+// with only the experts the VRAM cache does not hold in RAM (the hottest read straight into frames,
+// held only there; promotions from RAM slots; an evicted VRAM-only expert written back first) the
+// greedy ids (and with --mtp the rounds, drafts and acceptances) equal those of the whole pinned
+// banks, and at least one promotion copied a slot that a write-back had filled (bytes that came from
+// a frame, not the artifact: a wrong write-back would change the ids). --expert-cache-mib N (both
+// Engines) makes evictions common. With --cpu-verify-misses (needs --mtp) the partial Engine also
+// hands verification misses to the CPU, which reads them from the RAM slots.
+int partial_ram_residency_matches_full(const std::string& artifact, std::vector<std::string> args) {
+    const auto cpu = std::find(args.begin(), args.end(), "--cpu-verify-misses");
+    const bool cpu_leg = cpu != args.end();
+    if (cpu_leg) { args.erase(cpu); }
+    if (cpu_leg) {
+        return option_matches_off(artifact, args,
+                                  {"whole pinned banks", "partial RAM residency + CPU verification misses",
+                                   "partial ram residency with cpu verify misses",
+                                   [](EngineOptions& o) {
+                                       o.flash_next.partial_ram_residency = true;
+                                       o.flash_next.cpu_verify_misses     = true;
+                                   },
+                                   [] { return models::qwen4_exp::ExpertResidency::process_written_back_promotions(); },
+                                   nullptr,
+                                   [] { return ops::offloaded_moe::CpuMissService::process_served_experts(); }});
+    }
+    return option_matches_off(artifact, args,
+                              {"whole pinned banks", "partial RAM residency", "partial ram residency",
+                               [](EngineOptions& o) { o.flash_next.partial_ram_residency = true; },
+                               [] { return models::qwen4_exp::ExpertResidency::process_written_back_promotions(); }});
+}
+
+// mtp_constrained_matches_plain (--mtp-constrained, FlashNextOptions::mtp_constrained): a greedy
+// JSON-schema request on an MTP Engine with the option gives the ids of plain constrained decoding.
+// The reference is an MTP Engine without the option, where the constrained row runs plain rounds
+// (checked: no verification round); with the option the row must have verified drafts, each column
+// accepted under its own grammar mask (the Engine's mask provider), so both paths ran.
+int mtp_constrained_matches_plain(const std::string& artifact, const std::vector<std::string>& args) {
+    std::uint32_t max_context = 8192, tokens = 160, depth = 3;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--max-context" && i + 1 < args.size()) {
+            max_context = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        } else if (a == "--generate" && i + 1 < args.size()) {
+            tokens = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        } else if (a.find_first_not_of("0123456789") == std::string::npos) {
+            depth = static_cast<std::uint32_t>(std::stoul(a));
+        } else {
+            throw std::invalid_argument("unknown option " + a + " in --mtp-constrained mode");
+        }
+    }
+    PromptInput prompt;
+    prompt.options.enable_thinking = false;
+    prompt.messages.push_back(
+        {.role  = ChatRole::User,
+         .parts = {{.kind = MessagePartKind::Text,
+                    .text = "Describe three large cities as JSON: each with its name, its country and "
+                            "its population."}}});
+    RequestOptions request;
+    request.constraint = OutputConstraint::json_schema(R"({
+        "type": "object",
+        "properties": {"cities": {"type": "array", "minItems": 3, "maxItems": 3, "items": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "maxLength": 40},
+                           "country": {"type": "string", "maxLength": 40},
+                           "population": {"type": "integer", "minimum": 0}},
+            "required": ["name", "country", "population"],
+            "additionalProperties": false}}},
+        "required": ["cities"],
+        "additionalProperties": false})");
+    request.execution.requested_output_tokens = tokens;
+    request.execution.allow_prefix_reuse      = false;
+    request.execution.sampling.temperature    = 0.0F;
+    const auto run = [&](bool constrained_mtp) {
+        EngineOptions options                = base_options(artifact, max_context);
+        options.flash_next.save_expert_state = false;
+        options.speculative.backend          = SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens     = depth;
+        options.flash_next.mtp_constrained   = constrained_mtp;
+        Engine engine(options);
+        return engine.generate(engine.prepare(prompt), request);
+    };
+    const double ram_before = available_ram_gib();
+    GenerationResult off;
+    try {
+        off = run(false);
+    } catch (const std::exception& error) {
+        if (std::string(error.what()).find("no MTP drafter") == std::string::npos) { throw; }
+        std::printf("SKIP: the artifact has no MTP drafter (%s)\n", error.what());
+        return 77;
+    }
+    wait_for_ram(ram_before);
+    const GenerationResult on  = run(true);
+    bool ok = true;
+    const auto valid = [&](const char* label, const GenerationResult& r) {
+        const bool closed = r.finish_reason == FinishReason::StopToken && !r.content.empty() &&
+                            r.content.front() == '{' && r.content.back() == '}';
+        std::printf("%s: %zu ids, %s: %s\n", label, r.generated_token_ids.size(),
+                    closed ? "a closed JSON object" : "FAIL: not a complete JSON object", r.content.c_str());
+        print_speculation(label, r.speculative);
+        return closed;
+    };
+    ok = valid("plain constrained (MTP Engine without --mtp-constrained)", off) && ok;
+    ok = valid("--mtp-constrained", on) && ok;
+    if (off.speculative.rounds != 0) {
+        std::printf("FAIL: without --mtp-constrained the constrained request ran %llu verification rounds\n",
+                    static_cast<unsigned long long>(off.speculative.rounds));
+        ok = false;
+    }
+    if (on.speculative.rounds == 0 || on.speculative.drafted_tokens == 0) {
+        std::printf("FAIL: with --mtp-constrained the constrained request verified no drafts\n");
+        ok = false;
+    }
+    ok = same("mtp_constrained_matches_plain", off.generated_token_ids, on.generated_token_ids) && ok;
+    std::printf(ok ? "qwen4_exp mtp constrained checks passed\n" : "FAIL: qwen4_exp mtp constrained checks\n");
     return ok ? 0 : 1;
 }
 
@@ -890,6 +1515,39 @@ int main(int argc, char** argv) {
         }
         if (!args.empty() && args.front() == "--mtp-exact") {
             return mtp_exact(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--hot-embedding-exact") {
+            return hot_embedding_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--gdn-head-map-exact") {
+            return gdn_head_map_matches_copies(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--moe-precast-exact") {
+            return moe_precast_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--moe-gate-up-registers-exact") {
+            return moe_gate_up_registers_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--moe-fused-route-exact") {
+            return moe_fused_route_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--cpu-verify-misses-exact") {
+            return cpu_verify_misses_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--prefill-cpu-share-exact") {
+            return prefill_cpu_share_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--gdn-async-commit-exact") {
+            return gdn_async_commit_matches_serial(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--ngram-flag-wait-exact") {
+            return ngram_flag_wait_matches_split(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--partial-ram-exact") {
+            return partial_ram_residency_matches_full(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--mtp-constrained") {
+            return mtp_constrained_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
         }
         std::string tokens_arg = "@" + std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/qwen4_exp/ppl_tokens-chat.ids";
         std::uint32_t generate_tokens = 48, max_context = 8192, prompt_tokens = 300;

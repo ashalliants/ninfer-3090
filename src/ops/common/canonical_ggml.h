@@ -14,10 +14,27 @@
 //      tiny group (a < 2^-100, e.g. BF16 subnormals, where 127 / a would overflow) first scales a
 //      and x by 2^100, which is exact and leaves x * (127 / a) finite (a8_prescale); every other
 //      group has scale 1, so its bits are those of the unscaled formula.
-//   2. Each 32-value sub-block s of row r decodes exactly to integer weights w_j (|w_j| <= 43), two
-//      integer half multipliers m_0 (values 0-15) and m_1 (values 16-31) and an FP32 scale c_s, with
-//      W[r, 32 s + j] = c_s * m_{j / 16} * w_j exactly (ExpertSub, per format below).
-//   3. P_s = m_0 sum_{j<16} w_j q_j + m_1 sum_{j>=16} w_j q_j, an exact int32.
+//   2. Each 32-value sub-block s of row r decodes exactly to integer weights w_j, two integer half
+//      multipliers m_0 (values 0-15) and m_1 (values 16-31) and an FP32 scale c_s, with
+//      W[r, 32 s + j] = c_s * m_{j / 16} * w_j exactly (ExpertSub in cpu/expert_cpu.h, one decoder
+//      per format there and in cuda/expert_decode.cuh). Per format (d the block's binary16 scale):
+//        IQ2_XXS  c = d / 8, m = 2 ls + 1 (both halves), w = +-grid       |w| <= 43, m <= 31
+//        IQ2_XS   c = d / 8, m_h = 2 ls_h + 1 (per half), w = +-grid       |w| <= 43, m <= 31
+//        IQ2_S    c = d / 8, m_h = 2 ls_h + 1 (per half), w = +-grid       |w| <= 43, m <= 31
+//        IQ1_M    c = d / 8, m_h = 2 s_h + 1 (per half), w = 8 grid +- 1   |w| <= 9,  m <= 15
+//        IQ3_XXS  c = d / 4, m = 2 ls + 1, w = +-grid                      |w| <= 62, m <= 31
+//        IQ3_S    c = d, m = 1 + 2 nibble, w = +-grid                      |w| <= 15, m <= 31
+//        IQ4_XS   c = d, m = ls - 32 (signed), w = kvalues_iq4nl[code]     |w| <= 127, |m| <= 32
+//        IQ4_NL   c = d, m = 1, w = kvalues_iq4nl[code]                    |w| <= 127
+//        Q2_0     c = d, m = 1, w = code - 1                               |w| <= 2
+//      Each product c * m * w is exact in binary32 (at most 11 + 5 + 7 significant bits), so it is
+//      ggml's reference value (tests/ops/test_offloaded_moe_cpu.cpp checks every format).
+//   3. P_s = m_0 sum_{j<16} w_j q_j + m_1 sum_{j>=16} w_j q_j, an exact int32 with |q_j| <= 127:
+//      |P_s| <= max |m| * 32 * max |w| * 127, at most 32 * 32 * 127^2 = 16,516,096 < 2^24 (IQ4_XS,
+//      the tight case), so float(P_s) is exact. The partial sums behind it stay exact as well: a
+//      16- or 32-value dp4a or MMA sum is at most 32 * 127^2 = 516,128 < 2^22 (the wide route's
+//      accumulator bias, wide_expert.h), and the AVX2 route's byte-pair sums (_mm256_maddubs_epi16
+//      of |w| and +-q) are at most 2 * 127^2 = 32,258 < 2^15, so they never saturate.
 //   4. Lane partials: partial[l] = +0 for l < 32, then for s = 0, 1, ..., K/32 - 1 in order
 //      partial[s % 32] = fma(c_s * d_s, float(P_s), partial[s % 32]) (one FP32 product, one fma).
 //   5. The row value is the butterfly of the 32 partials: for o = 16, 8, 4, 2, 1 each lane i adds

@@ -5,6 +5,18 @@
 
 namespace ninfer::serve {
 
+ServeOptions routed_model_options(ServeOptions model, const std::string& id) {
+    model.host = "127.0.0.1";
+    model.port = 0;
+    model.api_key.clear();
+    // Keyless on loopback, so its Origin check is what keeps a browser page out; --cors (passed on
+    // to every model with the other options) would switch that check off and allow any origin.
+    model.enable_cors = false;
+    model.allowed_hosts.clear();
+    model.model_id_override = id;
+    return model;
+}
+
 void RoutedPorts::set(const std::string& model, int port) {
     std::lock_guard lock(mutex_);
     ports_[model] = port;
@@ -27,15 +39,8 @@ RoutedModelService::RoutedModelService(std::string id, std::unique_ptr<Generatio
                                        std::shared_ptr<RoutedPorts> ports,
                                        std::shared_ptr<OpenAIResponsesStore> responses_store)
     : id_(std::move(id)), service_(std::move(service)), ports_(std::move(ports)) {
-    // The router owns the public address and the API key; a model answers on loopback to the router
-    // alone, so it needs neither.
-    ServeOptions options = service_->options();
-    options.host         = "127.0.0.1";
-    options.port         = 0;
-    options.api_key.clear();
-    options.model_id_override = id_;
-    server_                   = std::make_unique<HttpServer>(std::move(options), std::move(logger),
-                                                 std::move(responses_store));
+    server_ = std::make_unique<HttpServer>(routed_model_options(service_->options(), id_),
+                                           std::move(logger), std::move(responses_store));
     port_                     = server_->bind_any_port();
     if (port_ == 0) { throw std::runtime_error("cannot bind a loopback port for model " + id_); }
     server_->start_serving_during_startup();

@@ -263,6 +263,29 @@ execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint3
     return out;
 }
 
+std::vector<GraphExecutionProfile> served_decode_profiles(std::uint32_t capacity,
+                                                          std::uint32_t width,
+                                                          const MtpGraphAttention& attention) {
+    if (width == 0 || capacity == 0) {
+        throw std::invalid_argument("served decode profiles need a width and a capacity");
+    }
+    return width == 1 ? ordinary_graph_profiles(capacity)
+                      : mtp_graph_profiles(capacity, width - 1U, attention);
+}
+
+ops::CausalAttentionExecutionEnvelope
+served_decode_envelope(std::span<const GraphExecutionProfile> profiles, std::uint32_t capacity,
+                       std::uint32_t width, std::uint32_t frontier) {
+    const auto it = std::find_if(profiles.begin(), profiles.end(), [&](const auto& profile) {
+        return profile.min <= frontier && frontier <= profile.max;
+    });
+    if (it == profiles.end()) {
+        throw std::logic_error("served decode profiles do not cover the scoring frontier");
+    }
+    if (width == 1) { return {it->min + 1U, it->max + 1U}; }
+    return mtp_causal_attention_envelopes(it->max, width - 1U, capacity).target_verify;
+}
+
 execution::DFlashEnvelopes dflash_envelopes(std::uint32_t max_frontier,
                                             std::uint32_t append_drafts) {
     return execution::DFlashEnvelopes{

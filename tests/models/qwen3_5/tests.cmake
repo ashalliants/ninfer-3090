@@ -22,7 +22,7 @@ ninfer_add_test(ninfer_qwen3_5_reasoning_loop_test
 
 ninfer_add_test(ninfer_qwen3_5_runtime_mechanisms_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_runtime_mechanisms.cpp"
-  LIBRARIES ninfer_engine ninfer_core)
+  LIBRARIES ninfer_engine ninfer_core ninfer::json)
 
 ninfer_add_test(ninfer_qwen3_5_state_image_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_state_image.cpp"
@@ -102,6 +102,13 @@ ninfer_add_test(ninfer_qwen3_5_moe_real_test
 
 ninfer_add_test(ninfer_qwen3_5_dflash_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash_real.cpp"
+  LIBRARIES ninfer_engine)
+
+# Draft-head context rows (--draft-context-rows) on a real artifact: greedy ids unchanged with the
+# option on, one and two requests at a time, with both acceptance rates reported.
+# NINFER_CONTEXT_ROWS_SPEC selects mtp (default), dflash or dflash2.
+ninfer_add_test(ninfer_qwen3_5_context_rows_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_context_rows_real.cpp"
   LIBRARIES ninfer_engine)
 
 # Captures the 27B's own KV/state after a real prompt prefix into graft containers, then checks that
@@ -288,6 +295,11 @@ ninfer_add_test(ninfer_qwen3_5_text_positions_test
 ninfer_add_test(ninfer_qwen3_5_ngram_proposer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_proposer.cpp"
   LIBRARIES ninfer_core)
+# The draft head's context rows (--draft-context-rows): the per-round id set and the head formats
+# the option runs with (CPU only).
+ninfer_add_test(ninfer_qwen3_5_context_rows_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_context_rows.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_core)
 # STANDALONE: the Python schema oracle drives this probe by executable path.
 ninfer_add_test(ninfer_qwen3_5_tool_constraints_test
   STANDALONE

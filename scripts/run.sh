@@ -16,22 +16,21 @@
 # Every measurement behind these defaults, the memory model, and the reasoning for each flag are
 # in docs/maintainer/launcher-profiles.md. What follows is what you need to run it.
 #
+# PROFILE FILES. Each profile's fixed flags are a `ninfer-serve --config` file under profiles/
+# (profiles/<model>-<profile>[-<spec>].json), shared with run.bat, so Linux and Windows serve the
+# same flag set. What stays here is what differs between the two or is decided at start: the
+# context, KV pool and lanes of the `tuned` profiles, n-gram copies, vision, the Host context
+# budget, the sampling guard, the context fit and the host retry. An environment override is passed
+# after --config, where it wins over the file.
+#
 # QWEN3.8-27B, `tuned`: two flag sets, each measured (docs/performance.md, "Recommended
 # configurations"), chosen with NINFER_SPEC. The default is the fast one.
 #
 #   NINFER_SPEC=dflash2 (default): fastest at one stream, the full 262,144-token context headless
-#
-#     --spec dflash2 --draft-tokens 7 --lm-head-draft --ngram-draft-tokens 15 \
-#     --prefill-cublas --prefill-chunk 4096 \
-#     --kv-dtype rk4v4 --gdn-state-fp16 \
-#     --vision --vision-residency overlay
+#     (profiles/qwen38-27b-tuned-dflash2.json, plus --ngram-draft-tokens 15 and vision)
 #
 #   NINFER_SPEC=mtp: the full context, two lanes sharing it, still fast
-#
-#     --spec mtp --draft-tokens 3 --lm-head-draft \
-#     --prefill-cublas --prefill-chunk 2048 \
-#     --kv-dtype rk4v4 --gdn-state-fp16 \
-#     --vision --vision-residency overlay
+#     (profiles/qwen38-27b-tuned-mtp.json, plus vision)
 #
 #   MTP accepts NINFER_DRAFT_TOKENS up to 15. Three suits chat and prose; for coding work that
 #   returns edited files, 11-15 decodes up to 1.85x faster (docs/performance.md has the table).
@@ -58,7 +57,9 @@
 # NINFER_AUTO_HOST_CACHE=on) the host retry, and NINFER_FALLBACK=off turns both off.
 #
 # OVERRIDES, from the environment. All profiles: NINFER_MODEL (artifact path), NINFER_MODEL_DIR,
-# NINFER_SERVER, NINFER_HOST, NINFER_PORT, NINFER_CHAT_TEMPLATE (path to a local Jinja file, passed
+# NINFER_SERVER, NINFER_HOST, NINFER_PORT, NINFER_ALLOWED_HOST (more names the server answers to
+# without a key, e.g. "gpubox.lan,ninfer.example", comma- or space-separated; each becomes
+# --allowed-host), NINFER_CHAT_TEMPLATE (path to a local Jinja file, passed
 # straight to --chat-template; overrides the artifact's built-in template). `tuned` also:
 # NINFER_CONTEXT, NINFER_CONCURRENCY,
 # NINFER_KV_CAPACITY, NINFER_KV_DTYPE, NINFER_SPEC, NINFER_DRAFT_TOKENS, NINFER_PREFILL_CHUNK,
@@ -112,6 +113,9 @@ fi
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd -- "$script_dir/.." && pwd)"
+# The profile files sit beside this launcher in both layouts: scripts/profiles/ in a checkout, and
+# profiles/ at the root of the release archive.
+profiles_dir="$script_dir/profiles"
 # Two layouts reach this script: a checkout, where the artifacts sit in the repository's own
 # models/ directory beside build-linux/, and an unpacked release archive, where the launcher
 # sits next to ninfer-serve and models/. Probe for the checkout first, then the archive -- the
@@ -138,36 +142,58 @@ server="${NINFER_SERVER:-$root/build-linux/apps/ninfer-serve}"
 # root, where this launcher sits beside the binary.
 [[ -x "$server" ]] || server="$script_dir/ninfer-serve"
 
-# The profile fixes the whole serving shape. `label` is the banner; `profile_args` is everything
-# after --host/--port.
+# use_profile <name>: serve profiles/<name>.json, the profile's fixed flags (--config).
+use_profile() {
+  profile_file="$profiles_dir/$1.json"
+  [[ -f "$profile_file" ]] && return 0
+  printf 'Missing launcher profile: %s\n' "$profile_file" >&2
+  exit 1
+}
+# profile_value <key>: the value the profile file gives <key>, or nothing, for the banner. Every
+# file under profiles/ holds one "key": value pair per line, which scripts/check-linux-scripts.sh
+# checks along with the banner this builds.
+profile_value() {
+  sed -n "s/^[[:space:]]*\"$1\":[[:space:]]*\"\{0,1\}\([^\",[:space:]]*\).*/\1/p" "$profile_file"
+}
+# tuned_overrides: the environment's overrides of a `tuned` profile file's values, passed after
+# --config so they win over it. A draft count means nothing without speculation.
+tuned_overrides() {
+  [[ -z "${NINFER_KV_DTYPE:-}" ]] || profile_args+=(--kv-dtype "$NINFER_KV_DTYPE")
+  [[ "$SPEC" == 'none' || -z "${NINFER_DRAFT_TOKENS:-}" ]] || profile_args+=(--draft-tokens "$NINFER_DRAFT_TOKENS")
+  [[ -z "${NINFER_PREFILL_CHUNK:-}" ]] || profile_args+=(--prefill-chunk "$NINFER_PREFILL_CHUNK")
+}
+
+# The profile fixes the whole serving shape. `label` is the banner; `profile_file` is the profile
+# file and `profile_args` everything after it on the command line.
 label=''
+profile_file=''
 profile_args=()
 case "$model_key/$profile" in
   qwen38-27b/tuned)
-    # The speculative backend fixes everything that has to move with it: the prefill chunk (the
-    # cuBLAS route's workspace scales with it) and the context and lanes that fit. The artifact
-    # stores the embedding as Q4 and the head as Q6, so no load-time transcode is passed.
+    # The speculative backend fixes everything that has to move with it, so each has its own file:
+    # the prefill chunk (the cuBLAS route's workspace scales with it) and the draft count there,
+    # the context and lanes that fit here (Windows fits less of the DFlash2 context beside a
+    # desktop). The artifact stores the embedding as Q4 and the head as Q6, so no load-time
+    # transcode is passed.
     SPEC="${NINFER_SPEC:-dflash2}"
     case "$SPEC" in
-      dflash2)
-        spec_args=(--spec dflash2 --draft-tokens "${NINFER_DRAFT_TOKENS:-7}" --lm-head-draft)
-        default_context=262144; default_concurrency=1; default_chunk=4096
-        spec_label="DFlash2 K=${NINFER_DRAFT_TOKENS:-7} + draft head" ;;
-      mtp)
-        spec_args=(--spec mtp --draft-tokens "${NINFER_DRAFT_TOKENS:-3}" --lm-head-draft)
-        default_context=262144; default_concurrency=2; default_chunk=2048
-        spec_label="MTP${NINFER_DRAFT_TOKENS:-3} + draft head, two lanes" ;;
-      none)
-        spec_args=()
-        default_context=262144; default_concurrency=2; default_chunk=2048
-        spec_label='no speculation' ;;
+      dflash2) default_context=262144; default_concurrency=1 ;;
+      mtp|none) default_context=262144; default_concurrency=2 ;;
       *) printf 'NINFER_SPEC must be dflash2, mtp or none, got %s\n' "$SPEC" >&2; exit 2 ;;
     esac
+    use_profile "qwen38-27b-tuned-$SPEC"
+    DRAFT_TOKENS="${NINFER_DRAFT_TOKENS:-$(profile_value draft-tokens)}"
+    case "$SPEC" in
+      dflash2) spec_label="DFlash2 K=$DRAFT_TOKENS + draft head" ;;
+      mtp) spec_label="MTP$DRAFT_TOKENS + draft head, two lanes" ;;
+      none) spec_label='no speculation' ;;
+    esac
+    spec_args=()
     CONTEXT="${NINFER_CONTEXT:-$default_context}"
     CONCURRENCY="${NINFER_CONCURRENCY:-$default_concurrency}"
     KV_CAPACITY="${NINFER_KV_CAPACITY:-$CONTEXT}"
-    KV_DTYPE="${NINFER_KV_DTYPE:-rk4v4}"
-    PREFILL_CHUNK="${NINFER_PREFILL_CHUNK:-$default_chunk}"
+    KV_DTYPE="${NINFER_KV_DTYPE:-$(profile_value kv-dtype)}"
+    PREFILL_CHUNK="${NINFER_PREFILL_CHUNK:-$(profile_value prefill-chunk)}"
     # N-gram copy drafting rides on DFlash2 and is on at one and two lanes: +42% decode at one lane on
     # agent traffic that writes back files it has read, +15% batch throughput at two, where a lane
     # without a copy is widened only as far as its own balance allows (about 3% of its round time).
@@ -187,11 +213,9 @@ case "$model_key/$profile" in
     esac
     profile_args=(
       --max-concurrency "$CONCURRENCY" --max-context "$CONTEXT" --kv-capacity "$KV_CAPACITY"
-      --kv-dtype "$KV_DTYPE"
       ${spec_args[@]+"${spec_args[@]}"}
-      --gdn-state-fp16
-      --prefill-cublas --prefill-chunk "$PREFILL_CHUNK"
     )
+    tuned_overrides
     label="C$CONCURRENCY  |  context $CONTEXT  |  KV pool $KV_CAPACITY  |  $KV_DTYPE  |  $spec_label"
     prefill_note="Prefill: cuBLAS route, chunk $PREFILL_CHUNK"
     if [[ "$SPEC" == 'dflash2' ]]; then
@@ -201,9 +225,7 @@ case "$model_key/$profile" in
   qwen36-35b-a3b/tuned)
     SPEC="${NINFER_SPEC:-mtp}"
     case "$SPEC" in
-      mtp)  spec_args=(--spec mtp --draft-tokens "${NINFER_DRAFT_TOKENS:-3}" --lm-head-draft --mtp-experts-q4)
-            spec_label="MTP${NINFER_DRAFT_TOKENS:-3} + draft head" ;;
-      none) spec_args=(); spec_label='no speculation' ;;
+      mtp|none) ;;
       *) printf 'NINFER_SPEC must be mtp or none, got %s\n' "$SPEC" >&2; exit 2 ;;
     esac
     # DFlash2 is 27B-only and n-gram copy rounds ride on it, so refuse rather than ignore the flag.
@@ -212,31 +234,31 @@ case "$model_key/$profile" in
       on) printf 'NINFER_NGRAM=on needs NINFER_SPEC=dflash2, which only qwen38-27b has\n' >&2; exit 2 ;;
       *) printf 'NINFER_NGRAM must be on or off, got %s\n' "$NINFER_NGRAM" >&2; exit 2 ;;
     esac
+    use_profile "qwen36-35b-a3b-tuned-$SPEC"
+    DRAFT_TOKENS="${NINFER_DRAFT_TOKENS:-$(profile_value draft-tokens)}"
+    case "$SPEC" in
+      mtp) spec_label="MTP$DRAFT_TOKENS + draft head" ;;
+      none) spec_label='no speculation' ;;
+    esac
     # rk4v4 fits three lanes at the full context even beside a desktop (2026-09-24; four fall 48 MB
     # short there, so a headless card may take NINFER_CONCURRENCY=4). Lanes share the one
     # --kv-capacity pool: any request may use all of it, but not every lane at once.
     CONTEXT="${NINFER_CONTEXT:-262144}"
     CONCURRENCY="${NINFER_CONCURRENCY:-3}"
     KV_CAPACITY="${NINFER_KV_CAPACITY:-$CONTEXT}"
-    KV_DTYPE="${NINFER_KV_DTYPE:-rk4v4}"
-    # cuBLAS prefill at chunk 4096: 8,848 tok/s on a 4K prompt against 5,470 at the old
-    # default-route chunk 512 (2026-10-02), for about 240 MiB more workspace.
-    PREFILL_CHUNK="${NINFER_PREFILL_CHUNK:-4096}"
+    KV_DTYPE="${NINFER_KV_DTYPE:-$(profile_value kv-dtype)}"
+    # cuBLAS prefill at chunk 4096 (the profile file): 8,848 tok/s on a 4K prompt against 5,470 at
+    # the old default-route chunk 512 (2026-10-02), for about 240 MiB more workspace.
+    PREFILL_CHUNK="${NINFER_PREFILL_CHUNK:-$(profile_value prefill-chunk)}"
     profile_args=(
       --max-concurrency "$CONCURRENCY" --max-context "$CONTEXT" --kv-capacity "$KV_CAPACITY"
-      --kv-dtype "$KV_DTYPE"
-      ${spec_args[@]+"${spec_args[@]}"}
-      --gdn-state-fp16 --prefill-cublas --prefill-chunk "$PREFILL_CHUNK"
     )
+    tuned_overrides
     label="C$CONCURRENCY  |  context $CONTEXT  |  KV pool $KV_CAPACITY  |  $KV_DTYPE  |  $spec_label" ;;
 
   qwen38-27b/int8)
-    profile_args=(
-      --max-context 65536 --kv-capacity 65536
-      --max-concurrency 1 --max-pending-requests 16 --pending-timeout-ms 600000
-      --prefill-chunk 1024 --kv-dtype int8
-      --spec mtp --draft-tokens 3 --lm-head-draft
-    )
+    # Every flag is in the file: one lane at 64K of INT8 KV, MTP3 and the draft head.
+    use_profile qwen38-27b-int8
     label='one request  |  64K context  |  INT8 KV  |  MTP3, ReplaySSM' ;;
 
   qwen38-27b/c8)
@@ -247,14 +269,8 @@ case "$model_key/$profile" in
     # so a StateImage is 147 MiB. The device slots take 8 x 147 MiB = 1.15 GiB of VRAM, the engine
     # default at eight lanes; the Host budget pins 8 GiB of RAM (StateImages, KV pages and pause
     # snapshots share it). Retention on the card is still bounded by the 16,384-token KV pool.
-    c8_lanes=8
-    profile_args=(
-      --max-context 8192 --kv-capacity 16384
-      --max-concurrency "$c8_lanes" --max-pending-requests 32 --pending-timeout-ms 600000
-      --prefill-chunk 512 --kv-dtype int8
-      --spec mtp --draft-tokens 3 --lm-head-draft
-      --device-state-slots "$c8_lanes" --host-context-mib 8192
-    )
+    # Every flag is in the file, which keeps --device-state-slots equal to --max-concurrency.
+    use_profile qwen38-27b-c8
     label='up to eight requests  |  8K context  |  INT8 KV  |  MTP3, ReplaySSM' ;;
 
   *)
@@ -280,10 +296,7 @@ if [[ "$profile" == 'tuned' ]]; then
   # host RAM, not device memory, pinned in full at startup. Lower it if the box is short on RAM; 0
   # keeps everything on the card.
   HOST_CONTEXT_MIB="${NINFER_HOST_CONTEXT_MIB:-8192}"
-  profile_args+=(
-    --max-pending-requests 16 --pending-timeout-ms 600000
-    ${vision_args[@]+"${vision_args[@]}"}
-  )
+  profile_args+=(${vision_args[@]+"${vision_args[@]}"})
   # --auto-host-cache sizes that budget from the RAM still free once the model has loaded, and
   # refuses --host-context-mib, so it is either/or: with it on, NINFER_HOST_CONTEXT_MIB (and the
   # host retry's smaller budget) is ignored.
@@ -358,6 +371,15 @@ fi
 if [[ -n "${NINFER_CHAT_TEMPLATE:-}" ]]; then
   profile_args+=(--chat-template "$NINFER_CHAT_TEMPLATE")
 fi
+# Names for the Host check (a DNS alias, a proxy's public name). ninfer-serve refuses a value that
+# is not a plain host name or address, naming it, so nothing is checked here.
+allowed_hosts=()
+if [[ -n "${NINFER_ALLOWED_HOST:-}" ]]; then
+  IFS=$', \t' read -r -a allowed_hosts <<< "$NINFER_ALLOWED_HOST"
+  for allowed_name in ${allowed_hosts[@]+"${allowed_hosts[@]}"}; do
+    [[ -z "$allowed_name" ]] || profile_args+=(--allowed-host "$allowed_name")
+  done
+fi
 
 if [[ ! -x "$server" ]]; then
   printf 'Missing ninfer-serve (looked for %s)\n' "$server" >&2
@@ -379,6 +401,7 @@ if [[ "$profile" == 'tuned' ]]; then
   [[ -z "$loop_note" ]] || printf '%s\n' "$loop_note"
 fi
 [[ -z "${NINFER_CHAT_TEMPLATE:-}" ]] || printf 'Chat template: %s\n' "$NINFER_CHAT_TEMPLATE"
+(( ${#allowed_hosts[@]} == 0 )) || printf 'Allowed host names: %s\n' "$NINFER_ALLOWED_HOST"
 [[ -z "${hint:-}" ]] || printf '%s\n' "$hint"
 printf 'API: http://%s:%s/v1\n\n' "$HOST" "$PORT"
 
@@ -399,7 +422,8 @@ memory_advice() {
 # --host-context-mib 8192 really pins 8 GiB of host RAM, here and in run.bat alike (see
 # docs/maintainer/launcher-profiles.md).
 if [[ "$profile" != 'tuned' ]]; then
-  exec "$server" "$MODEL" --host "$HOST" --port "$PORT" "${profile_args[@]}"
+  exec "$server" "$MODEL" --host "$HOST" --port "$PORT" --config "$profile_file" \
+    ${profile_args[@]+"${profile_args[@]}"}
 fi
 
 # Run the server with its output shown and kept, so a failure the launcher can explain or retry is
@@ -407,7 +431,8 @@ fi
 server_log="$(mktemp)"
 trap 'rm -f -- "$server_log"' EXIT
 set +e
-"$server" "$MODEL" --host "$HOST" --port "$PORT" "${profile_args[@]}" 2>&1 | tee "$server_log"
+"$server" "$MODEL" --host "$HOST" --port "$PORT" --config "$profile_file" \
+  ${profile_args[@]+"${profile_args[@]}"} 2>&1 | tee "$server_log"
 status="${PIPESTATUS[0]}"
 set -e
 if (( status != 0 )) && grep -q 'not enough free GPU memory' "$server_log"; then

@@ -932,6 +932,9 @@ std::string format_server_start_json(
              {"cuda_runtime_version", environment.cuda_runtime_version},
              {"cuda_driver_version", environment.cuda_driver_version}};
     record["argv"] = options.startup_argv;
+    // With --config, what the options were parsed from and where each came from.
+    record["effective_argv"]  = options.effective_argv;
+    record["setting_sources"] = options.setting_sources;
     return record.dump();
 }
 

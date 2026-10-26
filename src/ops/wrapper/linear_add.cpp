@@ -92,6 +92,8 @@ void validate_policy(LinearPolicy policy) {
     // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
     // one engine-wide setting does not have to be threaded per Op.
     case LinearPolicy::AllowPrefillCublas:
+    // The GGML block formats' policy only (require_policy_format).
+    case LinearPolicy::AllowA8GgmlDecodeMma:
     // The scout's int4 route: AllowA8Int, with int4 activations for Q4 wherever the A8 route runs.
     case LinearPolicy::ScoutA4Int:
         return;
@@ -133,7 +135,16 @@ std::size_t grouped_integer_workspace_bytes(std::size_t a16, std::int32_t output
 }
 
 // GGML formats register only the Q8_1 (A8) profile; any policy except A16Only admits it.
-bool ggml_a8_admitted(LinearPolicy policy) { return allows_a8(policy) || allows_a8_int(policy); }
+bool ggml_a8_admitted(LinearPolicy policy) {
+    return allows_a8(policy) || allows_a8_int(policy) || allows_ggml_decode_mma(policy);
+}
+
+// AllowA8GgmlDecodeMma is the GGML block formats' policy only.
+void require_policy_format(QType qtype, LinearPolicy policy) {
+    if (allows_ggml_decode_mma(policy) && !is_ggml_block(qtype)) {
+        throw std::invalid_argument("linear_add: AllowA8GgmlDecodeMma admits GGML block-format weights only");
+    }
+}
 
 } // namespace
 
@@ -148,6 +159,7 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
                                                 std::int32_t input_rows, LinearPolicy policy,
                                                 std::int32_t min_tokens, std::int32_t max_tokens) {
     validate_policy(policy);
+    require_policy_format(qtype, policy);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("linear_add workspace: invalid token interval");
     }
@@ -234,6 +246,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, Workspac
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPolicy policy,
                 WorkspaceArena& ws, cudaStream_t stream) {
     validate_policy(policy);
+    require_policy_format(w.qtype, policy);
     const std::int32_t t = x.ne[1];
     if (t <= 0) { throw std::invalid_argument("linear_add: T must be positive"); }
     require_tensor(x, DType::BF16, w.k, t, "x");
@@ -380,7 +393,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
             throw std::invalid_argument("linear_add: GGML requires 16-byte x/residual alignment");
         }
-        detail::ggml_linear_dispatch(x, w, residual_out, true, &ws, stream);
+        detail::ggml_linear_dispatch(x, w, residual_out, true, allows_ggml_decode_mma(policy), &ws, stream);
         return;
     }
 

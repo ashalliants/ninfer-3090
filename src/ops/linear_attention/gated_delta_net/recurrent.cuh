@@ -171,10 +171,11 @@ struct RecurrentCoordinates {
     std::uint32_t dqk_base;
 };
 
+template <class HeadMap>
 __device__ __forceinline__ RecurrentCoordinates make_coordinates(std::int32_t batch,
                                                                  std::int32_t layer,
                                                                  std::int32_t state_tile,
-                                                                 head_map heads) {
+                                                                 HeadMap heads) {
     const int lane                 = threadIdx.x;
     const int warp                 = threadIdx.y;
     const std::uint32_t value_head = static_cast<std::uint32_t>(blockIdx.x);
@@ -247,7 +248,7 @@ struct FoldEffects {
                    std::int32_t) {}
 };
 
-template <class StateT = float>
+template <class StateT = float, GdnHeadMap Map = GdnHeadMap::Blocked>
 struct DirectAccess {
     const __nv_bfloat16* q;
     const __nv_bfloat16* k;
@@ -257,7 +258,7 @@ struct DirectAccess {
     const StateT* state_read;
     StateT* state_write;
     __nv_bfloat16* out;
-    head_map heads;
+    head_map<Map> heads;
     std::int32_t width;
     float scale;
 
@@ -306,7 +307,7 @@ struct DirectAccess {
     }
 };
 
-template <class StateT = float>
+template <class StateT = float, GdnHeadMap Map = GdnHeadMap::Blocked>
 struct BatchUpdateAccess {
     const __nv_bfloat16* q;
     const __nv_bfloat16* k;
@@ -318,7 +319,7 @@ struct BatchUpdateAccess {
     const std::int32_t* source_state_slots;
     const std::int32_t* destination_state_slots;
     __nv_bfloat16* out;
-    head_map heads;
+    head_map<Map> heads;
     std::int64_t state_slot_stride;
     float scale;
 
@@ -372,7 +373,7 @@ struct BatchUpdateAccess {
     }
 };
 
-template <bool Masked, class StateT = float>
+template <bool Masked, class StateT = float, GdnHeadMap Map = GdnHeadMap::Blocked>
 struct RecordAccess {
     const __nv_bfloat16* q;
     const __nv_bfloat16* k;
@@ -386,7 +387,7 @@ struct RecordAccess {
     __nv_bfloat16* value_record;
     uint2* gate_record;
     __nv_bfloat16* out;
-    head_map heads;
+    head_map<Map> heads;
     std::int32_t width;
     std::int64_t state_slot_stride;
     float scale;
@@ -441,7 +442,7 @@ struct RecordAccess {
     __device__ __forceinline__ void store_key(const RecurrentCoordinates& coord, std::int32_t token,
                                               const RawQkLane& raw) const {
         if (coord.state_tile == 0 && coord.warp == 0 &&
-            static_cast<int>(coord.value_head) % heads.group_size() == 0) {
+            heads.first_reader(static_cast<int>(coord.value_head))) {
             __nv_bfloat16* destination =
                 key_record + (column(coord, token) * heads.H_qk + coord.qk_head) * kStateDim;
             store_vec(destination + coord.dqk_base, raw.bits);
@@ -468,20 +469,27 @@ struct RecordAccess {
 // The per-layer shape of a fold. The number of layers is not part of it: each layer folds
 // independently, so the launch grid takes the count from the records. That is what lets a model split
 // into pipeline stages fold each stage's layers with the same kernel.
-template <int QkHeads, int ValueHeads, int ConvChannels>
+template <int QkHeads, int ValueHeads, int ConvChannels, GdnHeadMap Map = GdnHeadMap::Blocked>
 struct FoldGeometry {
-    static constexpr int kQkHeads      = QkHeads;
-    static constexpr int kValueHeads   = ValueHeads;
-    static constexpr int kConvChannels = ConvChannels;
+    static constexpr int kQkHeads        = QkHeads;
+    static constexpr int kValueHeads     = ValueHeads;
+    static constexpr int kConvChannels   = ConvChannels;
+    static constexpr GdnHeadMap kHeadMap = Map;
     static_assert(ValueHeads % QkHeads == 0);
     static_assert(ConvChannels % 128 == 0);
+
+    __device__ __forceinline__ static std::uint32_t qk_head(std::uint32_t value_head) {
+        if constexpr (Map == GdnHeadMap::Tiled) { return value_head % QkHeads; }
+        return value_head / (ValueHeads / QkHeads);
+    }
 };
 
 using FoldGeometry16x48 = FoldGeometry<16, 48, 10240>;
 using FoldGeometry16x32 = FoldGeometry<16, 32, 8192>;
-// Qwen3.8-Flash-Next: the GGUF's tiled value heads (value head h reads key head h % 16) reach the
-// recurrence as 48 key heads, one per value head.
-using FoldGeometry48x48 = FoldGeometry<48, 48, 10240>;
+// Qwen3.8-Flash-Next: the GGUF's tiled value heads (value head h reads key head h % 16), either
+// expanded by the caller to 48 key heads, one per value head, or read in place through the map.
+using FoldGeometry48x48      = FoldGeometry<48, 48, 10240>;
+using FoldGeometry16x48Tiled = FoldGeometry<16, 48, 10240, GdnHeadMap::Tiled>;
 
 template <class Geometry, class StateT = float>
 struct FoldAccess {
@@ -504,8 +512,7 @@ struct FoldAccess {
         const int warp                 = threadIdx.y;
         const std::int32_t state_tile  = layer_tile & 7;
         const std::uint32_t value_head = static_cast<std::uint32_t>(blockIdx.x);
-        constexpr std::uint32_t kGroup = Geometry::kValueHeads / Geometry::kQkHeads;
-        const std::uint32_t qk_head    = value_head / kGroup;
+        const std::uint32_t qk_head    = Geometry::qk_head(value_head);
         const std::uint32_t dv_base =
             static_cast<std::uint32_t>(state_tile * kBlockDv + warp * kDvPerWarp);
         return {lane,
@@ -677,7 +684,7 @@ __device__ __forceinline__ void zero_output_suffix(const Access& access,
     }
 }
 
-template <bool NormalizeInputs, class StateT>
+template <bool NormalizeInputs, class StateT, GdnHeadMap Map = GdnHeadMap::Blocked>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_bf16_direct_kernel(const __nv_bfloat16* __restrict__ q,
                                  const __nv_bfloat16* __restrict__ k,
@@ -685,8 +692,8 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                                  const float* __restrict__ beta,
                                  const StateT* __restrict__ state_read,
                                  StateT* __restrict__ state_write, __nv_bfloat16* __restrict__ out,
-                                 std::int32_t width, head_map heads, float scale) {
-    const DirectAccess<StateT> access{q,     k,          v,   g,     beta, state_read,
+                                 std::int32_t width, head_map<Map> heads, float scale) {
+    const DirectAccess<StateT, Map> access{q,     k,          v,   g,     beta, state_read,
                                       state_write, out, heads, width, scale};
     const RecurrentCoordinates coord = access.coordinates();
     __align__(16) float state[kDvPerWarp][kQkPerLane];
@@ -695,9 +702,9 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     store_state_tile(state, access.state_write_base(coord), coord);
 }
 
-template <bool NormalizeInputs, class StateT>
+template <bool NormalizeInputs, class StateT, GdnHeadMap Map = GdnHeadMap::Blocked>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
-    recurrent_batch_update_kernel(BatchUpdateAccess<StateT> access) {
+    recurrent_batch_update_kernel(BatchUpdateAccess<StateT, Map> access) {
     const RecurrentCoordinates coord = access.coordinates();
     __align__(16) float state[kDvPerWarp][kQkPerLane];
     load_state_tile(state, access.state_read_base(coord), coord);
@@ -731,9 +738,9 @@ __device__ __forceinline__ RawQkLane staged_qk_lane(const __nv_bfloat16 (&row)[k
     return out;
 }
 
-template <bool Masked, class StateT>
+template <bool Masked, class StateT, GdnHeadMap Map = GdnHeadMap::Blocked>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
-    recurrent_record_kernel(RecordAccess<Masked, StateT> access) {
+    recurrent_record_kernel(RecordAccess<Masked, StateT, Map> access) {
     __shared__ RecordStage stage;
     const RecurrentCoordinates coord = access.coordinates();
     const std::int32_t valid         = access.active_columns(coord);

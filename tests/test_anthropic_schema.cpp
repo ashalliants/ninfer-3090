@@ -93,6 +93,27 @@ Json parse_event(const std::string& value) {
     return payload;
 }
 
+// relaxed_drafting on Messages: the same NInfer extension as the OpenAI endpoints.
+int test_relaxed_drafting_extension() {
+    Json body    = base_request();
+    int failures = check(!parse(body).generation.sampling.relaxed_drafting,
+                         "absent Messages relaxed_drafting was not left unset");
+    for (const auto& [value, expected] :
+         {std::pair{Json(0.3), 0.3}, std::pair{Json(false), 0.0}, std::pair{Json(true), 0.5}}) {
+        body["relaxed_drafting"] = value;
+        const auto parsed        = parse(body).generation.sampling.relaxed_drafting;
+        failures += check(parsed && *parsed == expected,
+                          "Messages relaxed_drafting was not parsed: " + value.dump());
+    }
+    for (const Json& invalid : {Json(-1), Json(2)}) {
+        body["relaxed_drafting"] = invalid;
+        failures += check(api_code([&] { (void)parse(body); }) == "invalid_relaxed_drafting" &&
+                              api_param([&] { (void)parse(body); }) == "relaxed_drafting",
+                          "invalid Messages relaxed_drafting was accepted: " + invalid.dump());
+    }
+    return failures;
+}
+
 int test_envelope_and_field_policy() {
     Json body             = base_request();
     body["stream"]        = true;
@@ -958,6 +979,7 @@ int main() {
     failures += test_graft_extension();
     failures += test_constrained_decoding();
     failures += test_envelope_and_field_policy();
+    failures += test_relaxed_drafting_extension();
     failures += test_message_normalization();
     failures += test_attribution_system_block();
     failures += test_system_message_positions();

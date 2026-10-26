@@ -98,19 +98,30 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
                             const Tensor& beta, float scale, const Tensor& states,
                             const Tensor& valid_columns, const Tensor& initial_slots,
                             const Tensor& key_record, const Tensor& value_record,
-                            const Tensor& gate_record, const Tensor& out) {
+                            const Tensor& gate_record, const Tensor& out, GdnHeadMap map) {
     constexpr const char* kOp      = "gated_delta_net_replay_record";
     const std::int32_t qk_heads    = q.ne[1];
     const std::int32_t value_heads = v.ne[1];
     const std::int32_t width       = q.ne[2];
     const std::int32_t rows        = q.ne[3];
-    const bool registered_heads    = (qk_heads == 16 && (value_heads == 48 || value_heads == 32)) ||
-                                  (qk_heads == 48 && value_heads == 48);
+    // Blocked: Qwen3.5's grouped heads and Flash-Next's tiled heads expanded to one per value
+    // head; Tiled: Flash-Next's 16 key heads read in place.
+    const bool registered_heads =
+        map == GdnHeadMap::Tiled
+            ? qk_heads == 16 && value_heads == 48
+            : (qk_heads == 16 && (value_heads == 48 || value_heads == 32)) ||
+                  (qk_heads == 48 && value_heads == 48);
     if (!registered_heads || width < 2 || width > 16 || rows <= 0 || rows > kMaximumRows) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported geometry");
     }
     if (states.ne[3] <= 0) {
         throw std::invalid_argument(std::string(kOp) + ": state slot count must be positive");
+    }
+    // The tiled map is instantiated for Qwen3.8-Flash-Next's call only.
+    if (map == GdnHeadMap::Tiled &&
+        (valid_columns.data != nullptr || states.dtype != DType::FP32)) {
+        throw std::invalid_argument(std::string(kOp) +
+                                    ": the tiled head map needs dense rows and an FP32 state");
     }
 
     require_tensor(q, DType::BF16, {kStateDim, qk_heads, width, rows}, 8, kOp, "q");
@@ -154,6 +165,11 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
 
 bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
     // Any number of layers: a pipeline stage folds only the layers it holds.
+    if (spec.head_map == GdnHeadMap::Tiled) {
+        // Qwen3.8-Flash-Next's 16 key heads, value head h reading key head h % 16.
+        return spec.layers > 0 && spec.qk_heads == 16 && spec.value_heads == 48 &&
+               spec.conv_channels == 10240;
+    }
     const bool geometry_48 =
         spec.qk_heads == 16 && spec.value_heads == 48 && spec.conv_channels == 10240;
     const bool geometry_32 =
@@ -305,12 +321,12 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, GdnHeadMap map) {
     validate_replay_record(q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
-                           key_record, value_record, gate_record, out);
+                           key_record, value_record, gate_record, out, map);
     detail::gated_delta_net::launch_recurrent_record(q, k, v, g, beta, scale, ssm_states,
                                                      valid_columns, initial_state_slots, key_record,
-                                                     value_record, gate_record, out, stream);
+                                                     value_record, gate_record, out, stream, map);
 }
 
 GdnReplayFoldPlan::GdnReplayFoldPlan(const GdnReplayRecords& records,
@@ -318,6 +334,12 @@ GdnReplayFoldPlan::GdnReplayFoldPlan(const GdnReplayRecords& records,
     : records_(records), states_(states) {
     validate_fold_records(records_);
     validate_fold_states(records_, states_);
+    // The tiled map is instantiated for Qwen3.8-Flash-Next's FP32 state only.
+    if (records_.spec.head_map == GdnHeadMap::Tiled &&
+        states_.recurrent_layer0.dtype != DType::FP32) {
+        throw std::invalid_argument(
+            "gdn_replay_fold: the tiled head map needs an FP32 recurrent state");
+    }
     require_records_disjoint_from_states(records_, states_);
 }
 

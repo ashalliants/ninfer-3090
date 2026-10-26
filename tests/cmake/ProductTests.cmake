@@ -10,13 +10,16 @@ ninfer_add_test(ninfer_pretty_logging_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_pretty_logging.cpp"
   LIBRARIES ninfer_product_logging)
 
+# ninfer-perplexity's evaluation code (host C++), for its own test and the Flash-Next forward
+# harness's KLD gate. One library, because the bundled tests would otherwise each define it.
+add_library(ninfer_perplexity_evaluation STATIC ${PROJECT_SOURCE_DIR}/apps/perplexity/evaluation.cpp)
+ninfer_internal_includes(ninfer_perplexity_evaluation)
+target_include_directories(ninfer_perplexity_evaluation PUBLIC ${PROJECT_SOURCE_DIR}/apps/perplexity)
+target_link_libraries(ninfer_perplexity_evaluation PUBLIC ninfer_core)
+
 ninfer_add_test(ninfer_perplexity_evaluation_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_perplexity_evaluation.cpp"
-          ${PROJECT_SOURCE_DIR}/apps/perplexity/evaluation.cpp
-  LIBRARIES ninfer_core)
-
-target_include_directories(ninfer_perplexity_evaluation_test PRIVATE
-  ${PROJECT_SOURCE_DIR}/apps/perplexity)
+  LIBRARIES ninfer_perplexity_evaluation ninfer_core)
 
 ninfer_add_test(ninfer_cli_options_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_cli_options.cpp" ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp
@@ -40,9 +43,10 @@ ninfer_add_test(ninfer_anthropic_schema_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_anthropic_schema.cpp"
   LIBRARIES ninfer_serve)
 
-ninfer_add_test(ninfer_serve_options_test
+# NEEDS_SOURCE_DIR: shipped_profiles_parse reads the launchers' profiles under scripts/profiles/.
+ninfer_add_test(ninfer_serve_options_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_options.cpp"
-  LIBRARIES ninfer_serve)
+  LIBRARIES ninfer_serve ninfer_serve_config_file)
 
 ninfer_add_test(ninfer_model_registry_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_model_registry.cpp"
@@ -56,6 +60,10 @@ ninfer_add_test(ninfer_load_report_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_load_report.cpp"
   LIBRARIES ninfer_serve)
 
+ninfer_add_test(ninfer_slots_report_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_slots_report.cpp"
+  LIBRARIES ninfer_serve)
+
 ninfer_add_test(ninfer_metrics_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_metrics.cpp"
   LIBRARIES ninfer_serve)
@@ -66,7 +74,19 @@ ninfer_add_test(ninfer_gpu_telemetry_test
 
 ninfer_add_test(ninfer_http_error_handler_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_error_handler.cpp"
-  LIBRARIES ninfer_serve)
+  LIBRARIES ninfer_serve ninfer_product_logging)
+
+ninfer_add_test(ninfer_http_security_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_security.cpp"
+  LIBRARIES ninfer_serve_security)
+
+ninfer_add_test(ninfer_serve_config_file_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_config_file.cpp"
+  LIBRARIES ninfer_serve_config_file)
+
+ninfer_add_test(ninfer_dashboard_page_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_dashboard_page.cpp"
+  LIBRARIES ninfer_serve_dashboard)
 
 ninfer_add_test(ninfer_http_transport_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_transport.cpp"

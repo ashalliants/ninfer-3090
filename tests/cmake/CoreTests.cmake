@@ -19,6 +19,20 @@ ninfer_add_test(ninfer_arena_ranks_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_arena_ranks.cpp"
   LIBRARIES ninfer_core)
 
+# GPU: wait_flag_ge / wait_flag_sequence (core/host_flag_wait.h), the stream-ordered wait for a
+# mapped host flag (--ngram-flag-wait): a flag raised late by a host thread holds the work behind it
+# back, a flag never raised times out into the error word, a stale flag never releases the next call,
+# and one captured wait waits for a new value at each replay.
+ninfer_add_test(ninfer_host_flag_wait_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_flag_wait.cpp"
+  LIBRARIES ninfer_core)
+
+# Host only: the test-only side-stream delay's variable (core/side_stream_delay.h), which the
+# side-stream identity gates use so a missing join diverges.
+ninfer_add_test(ninfer_side_stream_delay_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_side_stream_delay.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_device_buffer_visibility_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device_buffer_visibility.cu"
   LIBRARIES ninfer_core)

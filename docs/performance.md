@@ -519,6 +519,18 @@ against a 22.3 ms step, 1.15x.
 | drafting with the full output head | +2% acceptance for 4 ms more per round |
 | programmatic dependent launch to hide kernel ramp | needs sm_90; compiled out on `sm_86` |
 
+The 40,960-row row shows how much acceptance the rarer rows carry, and the full-head row bounds what
+the rows past 131,072 can add at this prompt mix (+2%). `--draft-context-rows` (opt-in,
+[serving](serving.md#draft-head-context-rows)) adds only the ones a request actually holds: up to
+2048 rows of the full head chosen by id, aimed at names and identifiers that a prompt introduces and
+the output repeats. Each draft call reads those rows from the full head (Q8: about 5 KB a row at the
+27B's hidden size, so about 10 MB for 2048 rows, against the full head's 1.27 GB). With a full set
+each row is read once per call, whatever the draft width; with fewer rows the kernel splits the
+draft columns across block rows to fill the card and re-reads each row once per block row, so a
+call reads at most about 2048 + `C` rows' worth for `C` rows (never more than twice the full-set
+read). Not measured on the RTX 3090 yet; `ninfer_qwen3_5_context_rows_real_test`
+reports both acceptance rates.
+
 What is left at C1 is mostly ramp-up and drain at the ~500 kernel boundaries of a round (the
 Q5 residual kernels reach 68-82% of their streaming floor, gate_up 89%).
 
@@ -589,9 +601,11 @@ repetitions and tied the fourth, against a spread of about 1.7% within the unfla
 
 **What it costs.** Output changes -- this is a lossy trade, not a free one. Against an FP64 oracle
 the Op measures 0.0080 to 0.0371 relative L2 across 2..32 columns, inside the 0.04 allowance the
-integer-activation path is held to everywhere else in the tree. Perplexity cannot see this trade at
-all: the route is admitted only in the verify phase, and scoring runs the prefill phase, so
-`ninfer-perplexity` reports the same score with and without the flag. Judge it on the oracle bound
+integer-activation path is held to everywhere else in the tree. Corpus perplexity cannot see this
+trade at all: the route is admitted only in the verify phase, and `--corpus`/`--text` scoring runs the
+prefill phase, so `ninfer-perplexity` reports the same score with and without the flag. Its
+`--kld-base` gate decodes through the verify forward and can reach the route at a wide enough
+`--decode-window` ([`docs/perplexity.md`](perplexity.md)). Judge it on the oracle bound
 and on your own outputs. It does nothing for single-stream use, where one request decodes one
 column per step, far below the sixteen the route needs.
 

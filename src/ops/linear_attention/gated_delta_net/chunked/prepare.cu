@@ -3,6 +3,8 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 
+#include <stdexcept>
+
 namespace ninfer::ops::detail::gated_delta_net::chunked {
 namespace {
 
@@ -14,7 +16,7 @@ struct PrepareShared {
     float lower[kChunkSize * kChunkSize];
 };
 
-template <bool Normalize>
+template <bool Normalize, GdnHeadMap Map>
 __global__
 __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restrict__ qk_workspace,
                                               ControlChunk* __restrict__ control_workspace) {
@@ -22,7 +24,7 @@ __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restric
     const int tid = threadIdx.x, lane = tid & 31;
     const int head = blockIdx.x % args.value_heads, chunk = blockIdx.x / args.value_heads;
     const int start = chunk * kChunkSize, length = min(kChunkSize, args.tokens - start);
-    const int group = args.value_heads / args.qk_heads, qh = head / group;
+    const int qh    = qk_head_of<Map>(args, head);
     const int row = tid / 16, col = (tid & 15) * 8;
     const auto qo = (static_cast<std::int64_t>(start + row) * args.qk_heads + qh) * kStateDim;
 
@@ -135,9 +137,9 @@ __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restric
                                                 static_cast<std::int64_t>(head) * chunks + chunk);
     const auto* src  = reinterpret_cast<const uint4*>(&sm.control);
     if (tid < sizeof(ControlChunk) / 16) ctrl[tid] = src[tid];
-    // Only the first value head in a group publishes Q/K. Other producers never read this
+    // Only the first value head reading a Q/K head publishes it. Other producers never read this
     // workspace; the following kernel supplies the only producer/consumer synchronization.
-    if (head % group == 0) {
+    if (publishes_qk<Map>(args, head)) {
         auto* dst =
             reinterpret_cast<uint4*>(qk_workspace + static_cast<std::int64_t>(qh) * chunks + chunk);
         const auto* data = reinterpret_cast<const uint4*>(&sm.qk);
@@ -148,13 +150,19 @@ __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restric
 } // namespace
 
 void launch_prepare(const Arguments& args, QkChunk* qk, ControlChunk* control, bool normalize_qk,
-                    cudaStream_t stream) {
+                    cudaStream_t stream, GdnHeadMap map) {
     const unsigned blocks = static_cast<unsigned>(static_cast<std::int64_t>(args.value_heads) *
                                                   chunk_count(args.tokens));
-    if (normalize_qk)
-        prepare_kernel<true><<<blocks, 256, 0, stream>>>(args, qk, control);
+    if (map == GdnHeadMap::Tiled) {
+        if (!normalize_qk) {
+            throw std::invalid_argument(
+                "GDN chunked prepare: the tiled head map needs normalized q/k");
+        }
+        prepare_kernel<true, GdnHeadMap::Tiled><<<blocks, 256, 0, stream>>>(args, qk, control);
+    } else if (normalize_qk)
+        prepare_kernel<true, GdnHeadMap::Blocked><<<blocks, 256, 0, stream>>>(args, qk, control);
     else
-        prepare_kernel<false><<<blocks, 256, 0, stream>>>(args, qk, control);
+        prepare_kernel<false, GdnHeadMap::Blocked><<<blocks, 256, 0, stream>>>(args, qk, control);
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops::detail::gated_delta_net::chunked

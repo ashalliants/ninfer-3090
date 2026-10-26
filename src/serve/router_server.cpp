@@ -1,5 +1,6 @@
 #include "serve/router_server.h"
 
+#include "serve/dashboard_page.h"
 #include "serve/http_server.h"
 #include "serve/http_transport.h"
 #include "product/version/version.h"
@@ -289,8 +290,9 @@ bool is_json_content_type(std::string_view content_type) {
 RouterServer::RouterServer(ServeOptions options, ModelRegistry& registry,
                            std::shared_ptr<RoutedPorts> ports,
                            std::shared_ptr<spdlog::logger> logger)
-    : options_(std::move(options)), registry_(registry), ports_(std::move(ports)),
-      logger_(std::move(logger)) {
+    : options_(std::move(options)),
+      host_policy_(make_server_host_policy(options_.host, options_.port, options_.allowed_hosts)),
+      registry_(registry), ports_(std::move(ports)), logger_(std::move(logger)) {
     // cpp-httplib is thread-per-connection, and a relayed request holds a router worker for as long
     // as its model holds the matching worker of its own server.
     constexpr std::size_t kBaseWorkers = 32;
@@ -345,12 +347,18 @@ void RouterServer::register_routes() {
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
         // On every response, errors included, as on a single-model server.
         res.set_header("X-NInfer-Version", std::string(ninfer::product::build_version()));
-        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
+        if (reject_untrusted_request(host_policy_, options_, req, res)) {
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        // The dashboard page holds no data; the requests its script makes carry the key.
+        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS" ||
+            is_dashboard_request(req.method, req.path)) {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         const bool bearer_ok =
             matches_bearer_credential(req.get_header_value("Authorization"), options_.api_key);
-        const bool x_api_key_ok = req.get_header_value("x-api-key") == options_.api_key;
+        const bool x_api_key_ok =
+            constant_time_equal(req.get_header_value("x-api-key"), options_.api_key);
         if (!bearer_ok && !x_api_key_ok) {
             write_error(req, res, 401, "invalid_api_key", "missing or invalid API key");
             return httplib::Server::HandlerResponse::Handled;
@@ -398,8 +406,13 @@ void RouterServer::register_routes() {
     server_.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
         handle_model(req, res);
     });
+    // The router serves the dashboard itself; the endpoints it polls are the status endpoints
+    // below, which answer for the model that last served.
+    server_.Get("/dashboard", [](const httplib::Request&, httplib::Response& res) {
+        write_dashboard_page(res);
+    });
     // Status endpoints read the model that last served without waking a sleeping one.
-    for (const char* path : {"/props", "/metrics", "/v1/load"}) {
+    for (const char* path : {"/props", "/metrics", "/v1/load", "/slots"}) {
         server_.Get(path, [this](const httplib::Request& req, httplib::Response& res) {
             route_status(req, res);
         });
@@ -702,10 +715,11 @@ void RouterServer::relay(const httplib::Request& req, httplib::Response& res,
     upstream.body   = std::move(body);
     for (const auto& [name, value] : req.headers) {
         const std::string lower = lower_ascii(name);
-        // The model needs no credentials (it listens on loopback for the router alone), and
+        // The model needs no credentials (it listens on loopback for the router alone) and no
+        // Origin or Sec-Fetch-* (the router has checked them, and the keyless model would refuse
+        // what the router's key or --cors let in), and
         // compression is the router's business with its client, not the model's.
-        if (hop_by_hop(name) || lower == "authorization" || lower == "x-api-key" ||
-            lower == "accept-encoding") {
+        if (hop_by_hop(name) || dropped_when_relaying(name) || lower == "accept-encoding") {
             continue;
         }
         upstream.headers.emplace(name, value);

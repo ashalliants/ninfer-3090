@@ -25,7 +25,8 @@ vision-only launchers are gone: `tuned` serves vision in overlay residency, whic
 10 MiB, and `NINFER_VISION=off` turns it off.
 
 The Qwen3.8-27B `tuned` profile has three speculative variants, selected with `NINFER_SPEC`. Each
-carries the context, lane count and prefill chunk that fit it:
+carries the context, lane count and prefill chunk that fit it. The flags below are its profile file
+plus what the launcher adds (`--ngram-draft-tokens 15` and vision):
 
 | `NINFER_SPEC` | flags | context (Linux / Windows) | lanes (Linux / Windows) |
 |---|---|---|---|
@@ -102,7 +103,9 @@ The sections below record the measurements behind the earlier `rk8v4` defaults. 
 too, so one file serves all three.
 
 Overrides, from the environment, so a launcher never needs editing: `NINFER_MODEL` (artifact path),
-`NINFER_MODEL_DIR`, `NINFER_SERVER`, `NINFER_HOST`, `NINFER_PORT` for every profile; `tuned` also
+`NINFER_MODEL_DIR`, `NINFER_SERVER`, `NINFER_HOST`, `NINFER_PORT`, `NINFER_ALLOWED_HOST` (names
+for the [Host check](../serving.md#host-and-origin-checks), comma- or space-separated, one
+`--allowed-host` each) for every profile; `tuned` also
 reads `NINFER_CONTEXT`, `NINFER_CONCURRENCY`, `NINFER_KV_CAPACITY` (Linux), `NINFER_KV_DTYPE`,
 `NINFER_SPEC`, `NINFER_DRAFT_TOKENS`, `NINFER_PREFILL_CHUNK`, `NINFER_VISION`,
 `NINFER_VISION_RESIDENCY`, `NINFER_HOST_CONTEXT_MIB` (default 8192), `NINFER_FALLBACK`, `NINFER_MIN_P` (default 0.03) and
@@ -125,6 +128,51 @@ provoke a loop, the guard never reached its 25% repeated-passage threshold, so o
 buy no observed benefit, while the thresholds (Strata's, from other models) leave the false-positive
 rate on legitimately repetitive thinking unmeasured here. Its cost when on was within run-to-run
 noise (0.1-0.5% decode, C=1 and C=4).
+
+**Profile files.** Each profile's fixed flags are a `--config` file
+([serving](../serving.md#options-from-a-file)) in `scripts/profiles/`, or `profiles/` at the root of
+a release archive. `run.sh` and `run.bat` pass the same file, so Linux and Windows serve the same
+flag set:
+
+| file | profile |
+|---|---|
+| `qwen38-27b-tuned-dflash2.json`, `qwen38-27b-tuned-mtp.json`, `qwen38-27b-tuned-none.json` | Qwen3.8-27B `tuned`, one per `NINFER_SPEC` |
+| `qwen36-35b-a3b-tuned-mtp.json`, `qwen36-35b-a3b-tuned-none.json` | Qwen3.6-35B-A3B `tuned`, one per `NINFER_SPEC` |
+| `qwen38-27b-int8.json`, `qwen38-27b-c8.json` | the reference profiles: every flag |
+| `qwen38-flash-next-tuned.json` | Qwen3.8-Flash-Next (`run.bat` only): INT8 KV, the prefill chunk, the request queue |
+
+The launchers keep what differs between the platforms or is decided at start, and pass it after
+`--config`, where the command line wins over the file: the context, KV pool and lanes of the
+`tuned` profiles (the Linux defaults are the headless extrapolation, the Windows ones fit beside a
+desktop), n-gram copies (on by lane count), vision, the Host context budget (the host retry halves
+it), the sampling guard (`default` leaves its flag out), `--fit-context`, and an environment override such
+as `NINFER_DRAFT_TOKENS`, `NINFER_PREFILL_CHUNK` or `NINFER_KV_DTYPE`, which replaces the file's
+value.
+
+To change a profile, edit its file; both launchers pick it up. Keep to what the launchers rely on:
+
+- One `"key": value` pair per line, laid out as `json.dumps(..., indent=2)` writes it, with string
+  values that are not empty and hold no spaces, commas, colons or quotes. The launchers read
+  `draft-tokens`, `prefill-chunk` and `kv-dtype` back for their banner with a line reader, not a
+  JSON parser: it splits each line at the colon, commas and spaces and strips the quotes, so a
+  value breaking these rules shows wrong or blank in the banner while the server still reads the
+  file correctly. A `false` value is refused too: leave the key out.
+- Integers as integers. The server reads `1024.0` as `1024`, but the banner would show `1024.0`,
+  and the layout check refuses it.
+- No paths. A relative path in a file is read against the working directory, not the file's own;
+  model, store and template paths stay in the launchers.
+- Nothing a launcher may have to leave out. The command line cannot undo a switch the file sets
+  unless the switch has a `no-` flag, nor unset a value, so `--vision` (`NINFER_VISION=off`) and
+  the sampling guard (`NINFER_MIN_P=default`) stay in the launchers.
+
+`bash scripts/check-linux-scripts.sh` checks the layout and pins every option in force for each
+profile and variant, so a moved or changed value fails there; `ninfer_serve_options_test`
+(`shipped_profiles_parse`) runs every file through the server's option parser, so a key that is no
+serve option fails there. `run.bat` reads the same files but is not covered by either.
+
+A file also works without a launcher: `ninfer-serve model.ninfer --config
+scripts/profiles/qwen38-27b-int8.json` serves the `int8` profile. The `tuned` files leave the
+context, KV pool, lanes and vision to the command line.
 
 **When the card is busy.** A desktop or another job holding VRAM can leave too little for the default
 context, and a machine short of RAM can fail to pin the Host context budget.

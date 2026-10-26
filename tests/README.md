@@ -189,20 +189,48 @@ Optional environment variables extend the Python GGML and GGUF checks:
 
 `python -m tools.artifact.gen_ggml_fixtures --dll PATH` regenerates the fixtures.
 
-`ninfer_linear_ggml_test` qualifies Linear and LinearAdd over the six GGML formats they register,
+`ninfer_linear_ggml_test` qualifies Linear and LinearAdd over the eight GGML formats they register,
 at every registered problem and T in {1..8, 9, 63, 64, 65, 300}: the weight is decoded by that host
 oracle, the activation passes through an independent host copy of the contract's Q8_1 cast, and
 the output is compared with the FP64 product. It also checks the cast exactly, byte for byte against
 the wide route's cast kernel and through the public Op on both routes, and the admission rules.
 `--format NAME` and `--shape N K` select problems; the full run takes about a minute, most of it the
-host oracle.
+host oracle. `ninfer_linear_ggml_device_decode_test` checks the linears' device sub-block decoders on
+their own, each value (the int8 code times its FP32 scale) bit for bit against the golden fixtures;
+it is the only device check of IQ2_XS and IQ3_XXS in the linears, which have a decoder but no
+registered problem (the expert routes check them through their records, below). For the affine
+Q4_K and Q5_K the GPU test also requires every output bit for bit equal to the host emulation of
+both routes' arithmetic (`tests/ops/ggml_linear_emulation.h`), which the host-only
+`ninfer_ggml_linear_affine_test` qualifies: the emulated sub-block decomposition reproduces ggml's
+values exactly, and at every registered Q4_K/Q5_K problem the emulated outputs meet the GPU
+suite's FP64 criterion and the FP32 accumulation bound, including rows built to cancel. The
+host-only `ninfer_ggml_linear_registry_test` checks the registry against a table of the packs'
+dense tensors: every (family, format) is a registered Linear (LinearAdd) problem, every format pair
+of the two-projection families a linear_pair problem, every output head a projection_fp32 head
+format, and no registered problem unused.
+
+The host-only `ninfer_ggml_mma_emulation_test` qualifies the opt-in int8 tensor-core decode route
+(`LinearPolicy::AllowA8GgmlDecodeMma`, `--ggml-decode-mma`) through its host emulation
+(`src/ops/linear/ggml/ggml_mma_emulation.h`): the exact sub-block decode reproduces ggml's values
+on the golden fixtures and random blocks of all eight formats, every registered problem meets the
+GPU suite's FP64 criterion and the FP32 accumulation bound, the kernel's tile order equals the
+canonical row order bit for bit at T = 1..8 wherever a column sits, and the MMA's int32 sums stay
+below 2^22 (their scaled products below 2^24) on extreme blocks. `ninfer_linear_ggml_test` then
+requires the device route bit for bit equal to that emulation at T = 1..8 and T = 9 equal to the
+AllowA8 wide route. `ninfer_linear_ggml_test --time [--format NAME] [--shape N K]` checks nothing and
+instead times each registered problem's dp4a decode route against the tensor-core route at T = 1,
+2, 4 and 8 (weights cycled through copies larger than L2, so every launch reads VRAM), for
+`--ggml-decode-mma`'s per-shape on/off table.
 
 `ninfer_offloaded_moe_cpu_test` (host only) and `ninfer_offloaded_moe_layer_test` qualify
-offloaded_sparse_moe over the three GGML expert record formats. The CPU test checks the canonical A8
-cast bit for bit against an independent FP64 formulation, the exact sub-block decode of IQ2_S,
-IQ2_XXS, IQ1_M and Q2_0 against the host decoder above, the CPU expert engine against the FP64
-expert oracle at T in {1, 2, 7, 8}, and AVX2, scalar and the worker team at 1-16 workers for equal
-bits. The layer test checks routing (exact top-10 with ties to the lower id) and dispatch exactly,
+offloaded_sparse_moe over the twelve GGML text expert record formats (the IQ2_XS pack's three and
+the further nine of the GSQ-RCO IQ3 packs). The CPU test checks the canonical A8 cast bit for bit
+against an independent FP64 formulation, the exact sub-block decode of every expert block format
+(IQ2_S, IQ2_XXS, IQ2_XS, IQ1_M, IQ3_XXS, IQ3_S, IQ4_XS, Q2_0 and IQ4_NL) against the host decoder
+above, the CPU expert engine against the FP64 expert oracle at T in {1, 2, 7, 8}, AVX2, scalar and
+the worker team at 1-16 workers for equal bits, and rows at the largest |P_s| of the arithmetic
+(IQ4_XS with multiplier -32 and |w| = 127, IQ3_XXS's largest grid entries, IQ4_NL) against exact
+int64 sums on both ISAs. The layer test checks routing (exact top-10 with ties to the lower id) and dispatch exactly,
 then requires every routed output of the GPU narrow route to equal the CPU engine's bits for records
 in device frames, read zero-copy, staged through 1, 3 or 64 slots, and served by the CPU miss service
 at 1 and 6 workers (T in {1, 2, 7, 8, 16}), and the whole layer, with a shared expert composed of
@@ -220,7 +248,11 @@ compute-sanitizer set; `--bench` times 512 resident experts at T in {256, 1024, 
 
 The Qwen3.8-Flash-Next Ops ported from Infernix have their own suites, each a few seconds:
 `ninfer_hyper_connection_test` (the mixer against its FP64 formula on both arithmetic profiles,
-fused T ≤ 16 and composed above, column invariance, graph equal to eager; inject and expand exact),
+fused T ≤ 16 and composed above, column invariance, graph equal to eager; the `--hc-int8` copies
+bit for bit against the host codec and the int8 form against FP64 on their values; the
+`--hc-fused-read` Op bit for bit against the composition of the Ops it fuses, the dispatch against
+`plan_dispatch` and the A8 cast against `canon::a8_quantize_f32`; inject and expand exact; the codec
+itself is the host-only `ninfer_hc_int8_codec_test`),
 `ninfer_ple_test` (the IQ4_NL row decode exact against the host decoder; the gate and the stateful
 convolution against FP64, states bit for bit, split calls equal to one call, commit equal to the
 in-place update), `ninfer_projection_fp32_test` (BF16 router segments and the IQ4_XS head against
@@ -244,6 +276,10 @@ check the available memory first. Given a token list it prefills it once, writes
 `--decode N` tokens again and decodes them one call each (timed), and requires the last decode's
 top token to equal the single prefill's. With `--dump-logits OUT.bin [--chunk N]` after each of
 several token lists it scores them teacher-forced in Strata's `--dump-logits` layout instead.
+With `--kld-base FILE [--chunks N] [--window T]` it is the decode-path KLD gate against a llama.cpp
+base (see "Decode-path KLD gate" in `docs/maintainer/flash-next-plan.md`); `--hc-int8` and
+`--ggml-decode-mma` run it with those numerics options on.
+
 `tests/fixtures/qwen4_exp/` holds the PR 0 token sets (`ppl_tokens`, `infernix_texts`; JSON and
 `strata_compare`'s `.ids`). The FP64 reference that checks it is `tools/flash_next`:
 
@@ -257,6 +293,17 @@ build-ninja\tests\ninfer_tests.exe ninfer_qwen4_exp_forward_real_test "@DIR\code
   --dump-logits DIR\ninfer-code.bin "@DIR\doc.ids" --dump-logits DIR\ninfer-doc.bin
 python -m tools.flash_next.strata_compare --texts DIR
 ```
+
+The side-stream identity gates (the forward harness's `--shared-expert-stream` and
+`--hc-fused-read-side-stream` modes, `ninfer_qwen4_exp_mtp_real_test`'s shared-expert check and
+the engine's `--gdn-async-commit-exact`) compare an option that forks work onto a second stream
+with the serial route. A short branch finishes before the main stream reaches the join anyway, so
+a missing join would still pass; the gates therefore delay the start of every side-stream branch
+by 2 ms (`GateSideStreamDelay`, `src/core/side_stream_delay.h`), and a missing join then reads
+unfinished results and diverges. `NINFER_TEST_SIDE_STREAM_DELAY_US` (whole microseconds, 0 to
+100,000) sets the delay for a whole process instead, including the gates' (0 turns their delay
+off); unset or 0 elsewhere launches nothing. It is a test hook: timing runs must leave it unset,
+and `tools/bench/basalt_gpu_verify.py` passes it to none of its children.
 
 The Program and Engine integration adds two host-only tests and one Engine-level real test.
 `ninfer_qwen4_exp_expert_cache_test` (lifted from Infernix with the expert cache) checks the LFRU
@@ -272,7 +319,10 @@ capped at 1 GiB (evicting every round) with a 64-token KV base and no CUDA graph
 prompt (every fixture text: past QSA's 2,048-token selection budget, and past the small Engine's KV
 base, which grows) must give the same ids in the default and the small-cache Engine. It loads the model three times (about five minutes). With `--bench` it loads once and
 runs each `@FILE` prompt in order with greedy output and model stops off (`--generate N`, default
-512), printing prefill and decode rates; the Program logs each request's expert hit rate:
+512), printing prefill and decode rates; the Program logs each request's expert hit rate. The
+bench also takes the Flash-Next options in their ninfer-serve spelling (`--moe-fused-route`,
+`--prefill-cpu-share 0.6`, ...; the file's header lists them), so one build can be timed with an
+option off and on (`tools/bench/basalt_gpu_verify.py` does):
 
 ```powershell
 build-ninja\tests\ninfer_tests.exe ninfer_qwen4_exp_engine_real_test --bench --max-context 33792 `

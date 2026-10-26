@@ -71,15 +71,18 @@ API key blank.
 | `ninfer_bench` | throughput benchmark against the public Engine route |
 | `download-model.sh` | pinned, resumable artifact downloads with verification |
 | `run.sh` | serving profiles: `run.sh <model> [profile]` |
+| `profiles/` | each profile's fixed flags, as `ninfer-serve --config` files that `run.sh` passes |
 | `LICENSE` | NInfer's licence (Apache-2.0) |
 | `THIRD_PARTY_NOTICES.txt` | the notice for the ported conversation projector (hermes-vcc-engine, Apache-2.0) |
-| `SHA256SUMS.txt` | checksums for every file in this directory |
+| `SHA256SUMS.txt` | checksums for every file in this directory and in `profiles/` |
 
 ## Overrides
 
 Nothing here needs editing. `NINFER_SERVER`, `NINFER_MODEL_DIR`, `NINFER_MODEL`, `NINFER_HOST`,
-`NINFER_PORT` and `NINFER_CHAT_TEMPLATE` (a local Jinja file, passed to `--chat-template`,
-overriding the artifact's built-in template) work for every profile.
+`NINFER_PORT`, `NINFER_CHAT_TEMPLATE` (a local Jinja file, passed to `--chat-template`,
+overriding the artifact's built-in template) and `NINFER_ALLOWED_HOST` (more names the server
+answers to, such as `gpubox.lan`, comma- or space-separated, each passed as `--allowed-host`) work
+for every profile.
 
 | profile | also reads |
 |---|---|

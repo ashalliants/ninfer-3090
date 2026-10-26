@@ -94,8 +94,12 @@ NVFP4 = Nvfp4Format("nvfp4", 16)
 FP8_E4M3FN_ROW_BF16 = Fp8RowFormat("fp8_e4m3fn_row_bf16")
 
 GGML_Q8_0 = GgmlBlockFormat("ggml_q8_0", 8, 32, 34)
+GGML_Q4_K = GgmlBlockFormat("ggml_q4_k", 12, 256, 144)
+GGML_Q5_K = GgmlBlockFormat("ggml_q5_k", 13, 256, 176)
 GGML_Q6_K = GgmlBlockFormat("ggml_q6_k", 14, 256, 210)
 GGML_IQ2_XXS = GgmlBlockFormat("ggml_iq2_xxs", 16, 256, 66)
+GGML_IQ2_XS = GgmlBlockFormat("ggml_iq2_xs", 17, 256, 74)
+GGML_IQ3_XXS = GgmlBlockFormat("ggml_iq3_xxs", 18, 256, 98)
 GGML_IQ4_NL = GgmlBlockFormat("ggml_iq4_nl", 20, 32, 18)
 GGML_IQ3_S = GgmlBlockFormat("ggml_iq3_s", 21, 256, 110)
 GGML_IQ2_S = GgmlBlockFormat("ggml_iq2_s", 22, 256, 82)
@@ -103,7 +107,8 @@ GGML_IQ4_XS = GgmlBlockFormat("ggml_iq4_xs", 23, 256, 136)
 GGML_IQ1_M = GgmlBlockFormat("ggml_iq1_m", 29, 256, 56)
 GGML_Q2_0 = GgmlBlockFormat("ggml_q2_0", 42, 64, 18)
 
-# The closed set of expert records: every gate/up type of the qwen4exp GGUF with its Q2_0 down.
+# The closed set of expert records: every (gate/up, down) type pair of the qwen4exp GGUFs' routed
+# experts. The IQ2_XS pack's three, with Q2_0 down:
 GGML_REC_IQ2_S_Q2_0 = GgmlExpertRecordFormat("ggml_rec_iq2_s_q2_0", GGML_IQ2_S, GGML_Q2_0)
 GGML_REC_IQ2_XXS_Q2_0 = GgmlExpertRecordFormat(
     "ggml_rec_iq2_xxs_q2_0", GGML_IQ2_XXS, GGML_Q2_0
@@ -111,6 +116,21 @@ GGML_REC_IQ2_XXS_Q2_0 = GgmlExpertRecordFormat(
 GGML_REC_IQ1_M_Q2_0 = GgmlExpertRecordFormat("ggml_rec_iq1_m_q2_0", GGML_IQ1_M, GGML_Q2_0)
 # The MTP drafter's routed experts (Strata's mtp-q2_0.gguf): Q2_0 gate/up and down.
 GGML_REC_Q2_0_Q2_0 = GgmlExpertRecordFormat("ggml_rec_q2_0_q2_0", GGML_Q2_0, GGML_Q2_0)
+# The further pairs of the GSQ-RCO IQ3_XXS and IQ3_S packs (their published tensor allocations),
+# whose downs are Q2_0 or IQ4_NL.
+GGML_REC_IQ2_XS_Q2_0 = GgmlExpertRecordFormat("ggml_rec_iq2_xs_q2_0", GGML_IQ2_XS, GGML_Q2_0)
+GGML_REC_IQ2_XS_IQ4_NL = GgmlExpertRecordFormat("ggml_rec_iq2_xs_iq4_nl", GGML_IQ2_XS, GGML_IQ4_NL)
+GGML_REC_IQ2_XXS_IQ4_NL = GgmlExpertRecordFormat(
+    "ggml_rec_iq2_xxs_iq4_nl", GGML_IQ2_XXS, GGML_IQ4_NL
+)
+GGML_REC_IQ2_S_IQ4_NL = GgmlExpertRecordFormat("ggml_rec_iq2_s_iq4_nl", GGML_IQ2_S, GGML_IQ4_NL)
+GGML_REC_IQ3_XXS_Q2_0 = GgmlExpertRecordFormat("ggml_rec_iq3_xxs_q2_0", GGML_IQ3_XXS, GGML_Q2_0)
+GGML_REC_IQ3_XXS_IQ4_NL = GgmlExpertRecordFormat(
+    "ggml_rec_iq3_xxs_iq4_nl", GGML_IQ3_XXS, GGML_IQ4_NL
+)
+GGML_REC_IQ3_S_Q2_0 = GgmlExpertRecordFormat("ggml_rec_iq3_s_q2_0", GGML_IQ3_S, GGML_Q2_0)
+GGML_REC_IQ3_S_IQ4_NL = GgmlExpertRecordFormat("ggml_rec_iq3_s_iq4_nl", GGML_IQ3_S, GGML_IQ4_NL)
+GGML_REC_IQ4_XS_IQ4_NL = GgmlExpertRecordFormat("ggml_rec_iq4_xs_iq4_nl", GGML_IQ4_XS, GGML_IQ4_NL)
 
 
 DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT32)})
@@ -127,8 +147,12 @@ GGML_BLOCK_FORMATS = MappingProxyType(
         item.name: item
         for item in (
             GGML_Q8_0,
+            GGML_Q4_K,
+            GGML_Q5_K,
             GGML_Q6_K,
             GGML_IQ2_XXS,
+            GGML_IQ2_XS,
+            GGML_IQ3_XXS,
             GGML_IQ4_NL,
             GGML_IQ3_S,
             GGML_IQ2_S,
@@ -142,7 +166,19 @@ GGML_RECORD_FORMATS = MappingProxyType(
     {
         item.name: item
         for item in (
-            GGML_REC_IQ2_S_Q2_0, GGML_REC_IQ2_XXS_Q2_0, GGML_REC_IQ1_M_Q2_0, GGML_REC_Q2_0_Q2_0
+            GGML_REC_IQ2_S_Q2_0,
+            GGML_REC_IQ2_XXS_Q2_0,
+            GGML_REC_IQ1_M_Q2_0,
+            GGML_REC_Q2_0_Q2_0,
+            GGML_REC_IQ2_XS_Q2_0,
+            GGML_REC_IQ2_XS_IQ4_NL,
+            GGML_REC_IQ2_XXS_IQ4_NL,
+            GGML_REC_IQ2_S_IQ4_NL,
+            GGML_REC_IQ3_XXS_Q2_0,
+            GGML_REC_IQ3_XXS_IQ4_NL,
+            GGML_REC_IQ3_S_Q2_0,
+            GGML_REC_IQ3_S_IQ4_NL,
+            GGML_REC_IQ4_XS_IQ4_NL,
         )
     }
 )
@@ -246,8 +282,12 @@ __all__ = [
     "NVFP4",
     "FP8_E4M3FN_ROW_BF16",
     "GGML_Q8_0",
+    "GGML_Q4_K",
+    "GGML_Q5_K",
     "GGML_Q6_K",
     "GGML_IQ2_XXS",
+    "GGML_IQ2_XS",
+    "GGML_IQ3_XXS",
     "GGML_IQ4_NL",
     "GGML_IQ3_S",
     "GGML_IQ2_S",
@@ -258,6 +298,15 @@ __all__ = [
     "GGML_REC_IQ2_XXS_Q2_0",
     "GGML_REC_IQ1_M_Q2_0",
     "GGML_REC_Q2_0_Q2_0",
+    "GGML_REC_IQ2_XS_Q2_0",
+    "GGML_REC_IQ2_XS_IQ4_NL",
+    "GGML_REC_IQ2_XXS_IQ4_NL",
+    "GGML_REC_IQ2_S_IQ4_NL",
+    "GGML_REC_IQ3_XXS_Q2_0",
+    "GGML_REC_IQ3_XXS_IQ4_NL",
+    "GGML_REC_IQ3_S_Q2_0",
+    "GGML_REC_IQ3_S_IQ4_NL",
+    "GGML_REC_IQ4_XS_IQ4_NL",
     "DIRECT_FORMATS",
     "QUANT_FORMATS",
     "NVFP4_FORMATS",

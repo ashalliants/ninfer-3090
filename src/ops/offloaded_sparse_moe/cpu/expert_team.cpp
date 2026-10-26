@@ -11,16 +11,6 @@
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ops/offloaded_sparse_moe/cpu/expert_cpu.h"
 
-#if defined(_WIN32)
-#    ifndef WIN32_LEAN_AND_MEAN
-#        define WIN32_LEAN_AND_MEAN
-#    endif
-#    ifndef NOMINMAX
-#        define NOMINMAX
-#    endif
-#    include <windows.h>
-#endif
-
 #include <atomic>
 #include <stdexcept>
 #include <thread>
@@ -28,10 +18,6 @@
 
 #if defined(__x86_64__) || defined(_M_X64)
 #    include <immintrin.h>
-#endif
-#if defined(__linux__)
-#    include <pthread.h>
-#    include <sched.h>
 #endif
 
 namespace ninfer::ops::offloaded_moe {
@@ -44,20 +30,6 @@ inline void cpu_relax() {
 }
 
 } // namespace
-
-void detail::pin_current_thread(int cpu) {
-#if defined(__linux__)
-    if (cpu < 0 || cpu >= CPU_SETSIZE) { return; }
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    CPU_SET(cpu, &set);
-    (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
-#elif defined(_WIN32)
-    if (cpu >= 0 && cpu < 64) { (void)SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR{1} << cpu); }
-#else
-    (void)cpu;
-#endif
-}
 
 struct CpuExpertTeam::Impl {
     int workers;
@@ -199,11 +171,7 @@ CpuExpertTeam::CpuExpertTeam(Options options) : impl_(std::make_unique<Impl>()) 
     t.geometry.resize(static_cast<std::size_t>(t.max_jobs));
     t.threads.reserve(static_cast<std::size_t>(t.workers - 1));
     for (int w = 1; w < t.workers; ++w) {
-        const int cpu = w < static_cast<int>(options.cpus.size()) ? options.cpus[static_cast<std::size_t>(w)] : -1;
-        t.threads.emplace_back([&t, cpu] {
-            detail::pin_current_thread(cpu);
-            t.worker_main();
-        });
+        t.threads.emplace_back([&t] { t.worker_main(); });
     }
 }
 

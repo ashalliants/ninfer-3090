@@ -4,6 +4,7 @@
 #include "serve/request_events.h"
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -38,6 +39,10 @@ render_tool_call_fallback(const RequestLogContext& context, const GenerationOutc
                                                         const RequestFailure& failure);
 [[nodiscard]] OperationalRecord render_throughput(const ThroughputReport& report);
 [[nodiscard]] OperationalRecord render_engine_fault(const ninfer::EngineFaultEvent& event);
+// "settings | command line: --port, --spec | profiles/x.json: --vision": the options given, grouped
+// by where they came from (ServeOptions::setting_sources). Nothing when every option is a default.
+[[nodiscard]] std::optional<OperationalRecord>
+render_setting_sources(const std::map<std::string, std::string>& sources);
 
 class OperationalLog {
 public:
@@ -61,10 +66,13 @@ public:
     void listen_failure(std::string_view host, int port) const;
     void server_ready(std::string_view host, int port, std::string_view model_id,
                       bool auth_enabled) const;
+    // The server listens beyond loopback without --api-key.
+    void exposure_warning(std::string_view host, int port) const;
     void server_stopped() const;
     void server_failure(bool serving, std::string_view detail) const;
     void engine_fault(const ninfer::EngineFaultEvent& event) const;
     void engine_fatal_exit(double grace_seconds, bool will_exit) const;
+    void setting_sources(const std::map<std::string, std::string>& sources) const;
 
 private:
     void write(OperationalRecord record) const;

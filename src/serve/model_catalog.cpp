@@ -68,7 +68,8 @@ void check_key(const std::string& section, const std::string& key) {
     }
     // The router decides these for every model (main.cpp overwrites them), so a preset value
     // would be dropped silently -- an api-key most of all, leaving the router open.
-    if (key == "api-key" || key == "host" || key == "port" || key == "model-id") {
+    if (key == "api-key" || key == "host" || key == "port" || key == "model-id" ||
+        key == "allowed-host") {
         throw std::invalid_argument("preset [" + section + "]: '" + key +
                                     "' is owned by the router; give it on the command line"
                                     " (a model's id is its section name)");

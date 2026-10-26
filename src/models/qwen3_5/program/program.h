@@ -16,6 +16,7 @@
 
 namespace ninfer {
 struct DeviceContext;
+class ScoreRowSink;
 }
 
 namespace ninfer::models::qwen3_5 {
@@ -383,6 +384,7 @@ struct CommitRowResult {
         std::uint64_t ngram_rounds          = 0;
         std::uint64_t ngram_drafted_tokens  = 0;
         std::uint64_t ngram_accepted_tokens = 0;
+        std::uint64_t relaxed_kept          = 0;
     } speculative_counters;
 };
 
@@ -492,8 +494,11 @@ public:
     Program& operator=(Program&&)      = delete;
     [[nodiscard]] RequestBasePlan plan_request(PreparedPrompt&& prompt,
                                                const runtime::ResolvedExecutionOptions& options);
+    // Engine::score_tokens' work; `sink` may be non-null only in the Decode phase.
     [[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt,
-                                                  std::uint32_t first_target);
+                                                  std::uint32_t first_target,
+                                                  const ScoringOptions& options,
+                                                  ScoreRowSink* sink);
     // Installs a direct_kv or softprompt_kv graft's attention K/V and Gated DeltaNet state as an
     // immutable SharedPrefix checkpoint whose identity is the graft's placeholder ids at [0, n).
     // A request that selects the graft carries those ids and binds this checkpoint as an exact

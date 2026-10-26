@@ -1,5 +1,6 @@
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/memory_plan.cpp (Apache-2.0).
-// Modified for NInfer-3090: full mode only (every expert pinned in RAM); the SSD tier is not ported, so a ledger that cannot hold every expert refuses to start.
+// Modified for NInfer-3090: full mode (every expert pinned in RAM) by default; the SSD tier is not ported, so a ledger that cannot hold every expert refuses to start.
+// Partial RAM residency's slot pool (plan_partial_ram) and the WDDM page-lock cap are NInfer-3090's.
 // kv_growth_frames is Infernix's grow_kv arithmetic (program_impl.h) as a pure function.
 
 #include "models/qwen4_exp/memory_plan.h"
@@ -7,7 +8,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <span>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace ninfer::models::qwen4_exp {
 namespace {
@@ -50,6 +54,134 @@ HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const Host
         out.fits         = false;
     }
     return out;
+}
+
+namespace {
+
+// plan_partial_ram's slots and bytes for `vram` VRAM-only experts taken from `order`.
+void partial_slots(const PartialRamDemand& d, std::span<const std::uint32_t> order, std::uint32_t vram,
+                   PartialRamPlan& out) {
+    const std::uint32_t layers = static_cast<std::uint32_t>(d.strides.size());
+    std::vector<std::uint32_t> in_vram(layers, 0);
+    out.vram_keys.assign(order.begin(), order.begin() + vram);
+    for (const std::uint32_t key : out.vram_keys) { ++in_vram[key / d.experts]; }
+    out.slots.assign(layers, 0);
+    out.bytes = 0;
+    for (std::uint32_t l = 0; l < layers; ++l) {
+        out.slots[l] = std::min(d.experts, d.experts - in_vram[l] + d.spares_per_layer);
+        out.bytes += static_cast<std::uint64_t>(out.slots[l]) * d.strides[l];
+    }
+}
+
+} // namespace
+
+std::uint64_t wddm_pin_cap(std::uint64_t total_physical) noexcept {
+    return saturating_sub(total_physical / 2, 8 * kLedgerGiB);
+}
+
+PartialRamPlan plan_partial_ram(const PartialRamDemand& d) {
+    if (d.experts == 0 || d.strides.empty() || d.frame_bytes == 0) {
+        throw std::invalid_argument("partial RAM residency: no experts, banks or frames");
+    }
+    const std::uint32_t layers = static_cast<std::uint32_t>(d.strides.size());
+    const std::uint32_t keys   = layers * d.experts;
+    // The ranking, then every layer's experts in turn, each key once.
+    std::vector<std::uint32_t> order;
+    order.reserve(keys);
+    std::vector<std::uint8_t> taken(keys, 0);
+    const auto take = [&](std::uint32_t key) {
+        if (key < keys && !taken[key]) {
+            taken[key] = 1;
+            order.push_back(key);
+        }
+    };
+    for (const std::uint32_t key : d.ranked) { take(key); }
+    for (std::uint32_t e = 0; e < d.experts; ++e) {
+        for (std::uint32_t l = 0; l < layers; ++l) { take(l * d.experts + e); }
+    }
+    const auto margin = static_cast<std::uint32_t>((d.margin_bytes + d.frame_bytes - 1) / d.frame_bytes);
+    const auto vram_for = [&](std::uint64_t frames) {
+        return static_cast<std::uint32_t>(std::min<std::uint64_t>(keys, frames > margin ? frames - margin : 0));
+    };
+    PartialRamPlan out;
+    partial_slots(d, order, vram_for(d.frames), out);
+    if (!d.pin_cap || out.bytes + d.other_pinned <= *d.pin_cap) { return out; }
+    // The fewest frames whose pool fits the cap (the pool shrinks as frames grow), if any does.
+    const auto fits = [&](std::uint64_t frames) {
+        PartialRamPlan probe;
+        partial_slots(d, order, vram_for(frames), probe);
+        return probe.bytes + d.other_pinned <= *d.pin_cap;
+    };
+    std::uint64_t low = d.frames, high = static_cast<std::uint64_t>(keys) + margin;
+    if (fits(high)) {
+        while (high - low > 1) {
+            const std::uint64_t mid = low + (high - low) / 2;
+            (fits(mid) ? high : low) = mid;
+        }
+        out.frames_needed = static_cast<std::uint32_t>(high);
+    }
+    char line[800];
+    const int used = std::snprintf(
+        line, sizeof(line),
+        "--partial-ram-residency pins %.1f GiB (%.1f GiB of expert slots for %u VRAM frames, %.1f GiB of "
+        "other pins), above the %.1f GiB (half the RAM less 8 GiB) that Windows lets one process register "
+        "with cudaHostRegister; NInfer pins with cudaHostAlloc, which may still succeed. If startup fails to "
+        "pin: ",
+        gib(out.bytes + d.other_pinned), gib(out.bytes), d.frames, gib(d.other_pinned), gib(*d.pin_cap));
+    std::string advice;
+    if (out.frames_needed == 0) {
+        advice = "no expert cache size fits; use a smaller pack or a machine with more RAM";
+    } else {
+        const std::uint64_t extra = (static_cast<std::uint64_t>(out.frames_needed) - d.frames) * d.frame_bytes;
+        const std::uint64_t cache_mib =
+            (static_cast<std::uint64_t>(out.frames_needed) * d.frame_bytes + kLedgerMiB - 1) / kLedgerMiB;
+        if (d.cache_limited) {
+            advice = "the expert cache needs " + std::to_string(out.frames_needed) +
+                     " frames: start with --expert-cache-mib " + std::to_string(cache_mib) + " or more";
+        } else if (extra <= d.headroom) {
+            advice = "the expert cache needs " + std::to_string(out.frames_needed) +
+                     " frames: start with --vram-headroom-mib " + std::to_string((d.headroom - extra) / kLedgerMiB) +
+                     " or less, or free VRAM";
+        } else {
+            advice = "the expert cache needs " + std::to_string(out.frames_needed) + " frames (" +
+                     std::to_string(cache_mib) + " MiB), more than this GPU has free; free VRAM or use a smaller pack";
+        }
+    }
+    const std::size_t prefix = used > 0 ? std::min<std::size_t>(static_cast<std::size_t>(used), sizeof(line) - 1) : 0;
+    out.cap_warning          = std::string(line, prefix) + advice;
+    return out;
+}
+
+HotEmbeddingPlan plan_hot_embedding(std::uint64_t vocab, std::uint64_t hidden, std::uint32_t hot_rows) {
+    if (hot_rows == 0) { return {}; }
+    if (hot_rows > vocab) {
+        throw std::invalid_argument("--hot-embedding-rows " + std::to_string(hot_rows) + " exceeds the model's " +
+                                    std::to_string(vocab) + " embedding rows: use at most " + std::to_string(vocab));
+    }
+    if (hidden == 0 || hidden % 256 != 0) {
+        throw std::invalid_argument("--hot-embedding-rows needs IQ4_XS embedding rows of whole 256-value blocks");
+    }
+    HotEmbeddingPlan out;
+    out.row_bytes = hidden / 256 * 136;
+    out.table     = vocab * out.row_bytes;
+    out.hot       = static_cast<std::uint64_t>(hot_rows) * out.row_bytes;
+    return out;
+}
+
+void require_hot_embedding_format(QType embedding, std::uint32_t hot_rows) {
+    if (hot_rows != 0 && embedding != QType::GGML_IQ4_XS) {
+        throw std::invalid_argument("--hot-embedding-rows needs a GGML IQ4_XS token embedding; this model's is " +
+                                    std::string(embedding == QType::GGML_IQ3_S ? "ggml_iq3_s" : "another format") +
+                                    " (start without --hot-embedding-rows)");
+    }
+}
+
+void plan_pinned_weights(HostMemoryDemand& demand, std::uint64_t pinned_block, const HotEmbeddingPlan& hot) {
+    if (pinned_block < hot.table) {
+        throw std::logic_error("Qwen3.8-Flash-Next: the pinned block is smaller than the embedding it holds");
+    }
+    demand.expert_banks = pinned_block - hot.table;
+    demand.other_pinned = hot.table;
 }
 
 ContextCacheFit fit_context_cache(const HostMemorySnapshot& snapshot, HostMemoryDemand demand, std::uint64_t requested,
@@ -97,7 +229,8 @@ std::string HostMemoryLedger::describe() const {
                   gib(demand.load_staging), gib(demand.process_growth), gib(expert_ram), gib(full_need),
                   gib(demand.expert_banks), gib(demand.full_margin), commit_limited ? ", limited by the page file" : "",
                   lock_limited ? "the memory-lock limit is below the pinned total"
-                                           : fits ? "every expert fits in RAM" : "the experts do not fit");
+                  : fits        ? "every expert fits in RAM"
+                                : "the experts do not fit");
     return line;
 }
 
@@ -111,18 +244,19 @@ std::string HostMemoryLedger::summary() const {
                       gib(*snapshot.lock_limit), gib(pinned_total));
     } else if (fits) {
         std::snprintf(line, sizeof(line), "RAM: %.1f of %.1f GiB free; every expert fits in RAM (%.1f GiB pinned)",
-                      gib(snapshot.available_physical), gib(snapshot.total_physical), gib(demand.expert_banks));
+                      gib(snapshot.available_physical), gib(snapshot.total_physical),
+                      gib(demand.expert_banks + demand.other_pinned));
     } else {
         // What the reserve, every planned allocation and the experts need beyond what is available.
         const std::uint64_t need      = demand.reserve + planned + full_need;
         const std::uint64_t available = commit_limited ? snapshot.available_commit : snapshot.available_physical;
         const std::uint64_t short_by  = need > available ? need - available : 0;
         std::snprintf(line, sizeof(line),
-                      "RAM: %.1f of %.1f GiB free, but Qwen3.8-Flash-Next pins %.1f GiB of experts and keeps %.1f GiB "
+                      "RAM: %.1f of %.1f GiB free, but Qwen3.8-Flash-Next pins %.1f GiB of experts and weights and keeps %.1f GiB "
                       "free for Windows: %.1f GiB short%s. Close other programs (WSL, Docker, browsers) and start "
                       "again",
-                      gib(snapshot.available_physical), gib(snapshot.total_physical), gib(demand.expert_banks),
-                      gib(demand.reserve), gib(short_by), commit_limited ? " (the page file is too small)" : "");
+                      gib(snapshot.available_physical), gib(snapshot.total_physical),
+                      gib(demand.expert_banks + demand.other_pinned), gib(demand.reserve), gib(short_by), commit_limited ? " (the page file is too small)" : "");
     }
     return line;
 }

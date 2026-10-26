@@ -44,6 +44,7 @@ int main() {
     running.speculative_ngram_rounds          = 2;
     running.speculative_ngram_draft_tokens    = 30;
     running.speculative_ngram_accepted_tokens = 28;
+    running.speculative_relaxed_kept          = 4;
     running.running_requests            = 1;
     running.host_context_occupied_bytes = 4096;
     running.host_context_reserved_bytes = 1024;
@@ -60,6 +61,8 @@ int main() {
               live.find("ninfer_spec_decode_ngram_draft_tokens_total 30\n") != std::string::npos &&
               live.find("ninfer_spec_decode_ngram_accepted_tokens_total 28\n") != std::string::npos,
           "n-gram copy rounds must be exported with the speculative counters");
+    check(live.find("ninfer_spec_decode_relaxed_kept_tokens_total 4\n") != std::string::npos,
+          "relaxed drafting keeps must be exported with the speculative counters");
     check(live.find("ninfer_time_to_first_token_seconds_count 1\n") != std::string::npos &&
               live.find("ninfer_requests_total{outcome=\"completed\"} 0\n") != std::string::npos,
           "TTFT must be visible before completion");
@@ -150,6 +153,7 @@ int main() {
     fork.sliced_prefill_steps             = 8;
     fork.prefill_slice_boundaries         = 56;
     fork.engine_recoveries                = 1;
+    fork.admission_overtakes              = 3;
     fork.lossy_prefills_completed         = baseline.lossy_prefills_completed + 2;
     fork.lossy_prefills_skipped           = baseline.lossy_prefills_skipped + 1;
     fork.lossy_prefills_aborted           = baseline.lossy_prefills_aborted + 3;
@@ -200,7 +204,8 @@ int main() {
               has_line(series, "ninfer_deferred_prefill_turns_total 31") &&
               has_line(series, "ninfer_sliced_prefill_steps_total 8") &&
               has_line(series, "ninfer_prefill_slice_boundaries_total 56") &&
-              has_line(series, "ninfer_engine_recoveries_total 1"),
+              has_line(series, "ninfer_engine_recoveries_total 1") &&
+              has_line(series, "ninfer_admission_overtakes_total 3"),
           "abandoned, cancelled, recovery and phase-time series must be reported");
     check(has_line(series, "ninfer_lossy_prefill_total{outcome=\"completed\"} 2") &&
               has_line(series, "ninfer_lossy_prefill_total{outcome=\"skipped\"} 1") &&
@@ -307,6 +312,7 @@ int main() {
         gpu.memory_total_bytes     = 25769803776ULL;
         gpu.temperature_celsius    = 71;
         gpu.power_watts            = 312.5;
+        gpu.power_limit_watts      = 287.5;
         return gpu;
     });
     const auto gpu_body = metrics.render(running, true, 0);
@@ -314,7 +320,8 @@ int main() {
               has_line(gpu_body, "ninfer_gpu_memory_used_bytes 21474836480") &&
               has_line(gpu_body, "ninfer_gpu_memory_total_bytes 25769803776") &&
               has_line(gpu_body, "ninfer_gpu_temperature_celsius 71") &&
-              has_line(gpu_body, "ninfer_gpu_power_watts 312.5"),
+              has_line(gpu_body, "ninfer_gpu_power_watts 312.5") &&
+              has_line(gpu_body, "ninfer_gpu_power_limit_watts 287.5"),
           "GPU gauges must be reported from the sampler");
     check(gpu_body.find("ninfer_gpu_memory_utilization_percent") == std::string::npos,
           "an unknown GPU reading must be omitted, not reported as zero");

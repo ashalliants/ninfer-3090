@@ -13,6 +13,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace ninfer;
@@ -44,7 +45,7 @@ int verify_equal(const std::string& label, const std::vector<std::uint16_t>& lhs
 
 int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
              std::vector<std::int32_t> valid_columns, std::uint32_t seed,
-             std::int32_t kQkHeads = 16) {
+             std::int32_t kQkHeads = 16, GdnHeadMap map = GdnHeadMap::Blocked) {
     const bool dense                = valid_columns.empty();
     if (dense) { valid_columns.assign(static_cast<std::size_t>(batch), width); }
     const std::int32_t columns       = width * batch;
@@ -154,13 +155,13 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
                 reference_final_states.slice(3, row, 1).view({kStateDim, kStateDim, value_heads});
             ops::detail::gated_delta_net::launch_recurrent_inout(q_row, k_row, v_row, g_row,
                                                                  beta_row, kScale, true, state_row,
-                                                                 final_row, out_row, stream);
+                                                                 final_row, out_row, stream, map);
         }
     };
     const auto launch_record = [&] {
         ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, record_states,
                                            valid, initial, key_record_tensor, value_record_tensor,
-                                           gate_record_tensor, record_output, stream);
+                                           gate_record_tensor, record_output, stream, map);
     };
     launch_reference();
     launch_record();
@@ -194,7 +195,8 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     CUDA_CHECK(cudaStreamDestroy(stream));
 
     int failures             = 0;
-    const std::string suffix = " Hv=" + std::to_string(value_heads) +
+    const std::string suffix = std::string(map == GdnHeadMap::Tiled ? " tiled" : "") +
+                               " Hq=" + std::to_string(kQkHeads) + " Hv=" + std::to_string(value_heads) +
                                " T=" + std::to_string(width) + " B=" + std::to_string(batch);
     const std::vector<std::uint16_t> reference_output_bits =
         from_device<std::uint16_t>(reference_out, value_elements);
@@ -276,6 +278,146 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     return failures;
 }
 
+// The tiled map on the 16 key heads against the blocked map on q/k expanded to 48 heads (value head
+// h's copy of key head h % 16), from the same states: the outputs, value and gate records must be
+// bitwise equal, and the 16 key records equal the raw keys (the expanded records' first 16 heads).
+int tiled_matches_expanded(std::int32_t width, std::int32_t batch,
+                           std::vector<std::int32_t> valid_columns, std::uint32_t seed) {
+    constexpr std::int32_t kQk = 16, kValue = 48, kSlots = 8;
+    const bool dense = valid_columns.empty();
+    if (dense) { valid_columns.assign(static_cast<std::size_t>(batch), width); }
+    const std::int32_t columns       = width * batch;
+    const std::size_t qk_elements    = static_cast<std::size_t>(kStateDim) * kQk * columns;
+    const std::size_t wide_elements  = static_cast<std::size_t>(kStateDim) * kValue * columns;
+    const std::size_t gate_elements  = static_cast<std::size_t>(kValue) * columns;
+    const std::size_t state_elements = static_cast<std::size_t>(kStateDim) * kStateDim * kValue * kSlots;
+    const std::vector<std::uint16_t> q_bits = make_bf16(qk_elements, seed);
+    const std::vector<std::uint16_t> k_bits = make_bf16(qk_elements, seed + 1);
+    const std::vector<std::uint16_t> v_bits = make_bf16(wide_elements, seed + 2);
+    std::vector<float> g(gate_elements), beta(gate_elements), state(state_elements);
+    fill_uniform(g, seed + 3, -1.2F, -0.02F);
+    fill_uniform(beta, seed + 4, 0.02F, 0.98F);
+    fill_uniform(state, seed + 5, -0.03F, 0.03F);
+    const auto expand = [&](const std::vector<std::uint16_t>& in) {
+        std::vector<std::uint16_t> out(wide_elements);
+        for (std::int32_t c = 0; c < columns; ++c) {
+            for (std::int32_t h = 0; h < kValue; ++h) {
+                std::copy_n(in.begin() + (static_cast<std::ptrdiff_t>(c) * kQk + h % kQk) * kStateDim,
+                            kStateDim,
+                            out.begin() + (static_cast<std::ptrdiff_t>(c) * kValue + h) * kStateDim);
+            }
+        }
+        return out;
+    };
+    std::vector<std::int32_t> initial_slots(static_cast<std::size_t>(batch));
+    for (std::int32_t row = 0; row < batch; ++row) {
+        initial_slots[static_cast<std::size_t>(row)] = (row * 3 + 5) % kSlots;
+    }
+    DeviceBuffer device_v       = to_device(v_bits);
+    DeviceBuffer device_g       = to_device(g);
+    DeviceBuffer device_beta    = to_device(beta);
+    DeviceBuffer device_state   = to_device(state);
+    DeviceBuffer device_initial = to_device(initial_slots);
+    DeviceBuffer device_valid;
+    if (!dense) { device_valid = to_device(valid_columns); }
+    const float kScale = 1.0F / std::sqrt(128.0F);
+
+    struct Outputs {
+        std::vector<std::uint16_t> out, key, value;
+        std::vector<std::uint32_t> gate;
+    };
+    const auto run = [&](const std::vector<std::uint16_t>& q_host, const std::vector<std::uint16_t>& k_host,
+                         std::int32_t qk_heads, GdnHeadMap map) {
+        const std::size_t qk = static_cast<std::size_t>(kStateDim) * qk_heads * columns;
+        DeviceBuffer device_q = to_device(q_host);
+        DeviceBuffer device_k = to_device(k_host);
+        DeviceBuffer out(wide_elements * sizeof(std::uint16_t));
+        DeviceBuffer key_record(qk * sizeof(std::uint16_t));
+        DeviceBuffer value_record(wide_elements * sizeof(std::uint16_t));
+        DeviceBuffer gate_record(gate_elements * 2 * sizeof(std::uint32_t));
+        out.fill(0xff);
+        key_record.fill(0xff);
+        value_record.fill(0xff);
+        gate_record.fill(0xff);
+        Tensor q(device_q.p, DType::BF16, {kStateDim, qk_heads, width, batch});
+        Tensor k(device_k.p, DType::BF16, {kStateDim, qk_heads, width, batch});
+        Tensor v(device_v.p, DType::BF16, {kStateDim, kValue, width, batch});
+        Tensor g_tensor(device_g.p, DType::FP32, {kValue, width, batch});
+        Tensor beta_tensor(device_beta.p, DType::FP32, {kValue, width, batch});
+        Tensor states(device_state.p, DType::FP32, {kStateDim, kStateDim, kValue, kSlots});
+        Tensor valid;
+        if (!dense) { valid = Tensor(device_valid.p, DType::I32, {batch}); }
+        Tensor initial(device_initial.p, DType::I32, {batch});
+        Tensor key_tensor(key_record.p, DType::BF16, {kStateDim, qk_heads, width, batch});
+        Tensor value_tensor(value_record.p, DType::BF16, {kStateDim, kValue, width, batch});
+        Tensor gate_tensor(gate_record.p, DType::FP32, {2, kValue, width, batch});
+        Tensor output(out.p, DType::BF16, {kStateDim, kValue, width, batch});
+        ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, states, valid, initial,
+                                           key_tensor, value_tensor, gate_tensor, output, nullptr, map);
+        cuda_synchronize();
+        return Outputs{from_device<std::uint16_t>(out, wide_elements), from_device<std::uint16_t>(key_record, qk),
+                       from_device<std::uint16_t>(value_record, wide_elements),
+                       from_device<std::uint32_t>(gate_record, gate_elements * 2)};
+    };
+    const Outputs tiled = run(q_bits, k_bits, kQk, GdnHeadMap::Tiled);
+    const Outputs copy  = run(expand(q_bits), expand(k_bits), kValue, GdnHeadMap::Blocked);
+
+    int failures             = 0;
+    const std::string suffix = " T=" + std::to_string(width) + " B=" + std::to_string(batch);
+    failures += verify_equal("tiled replay record output" + suffix, tiled.out, copy.out);
+    failures += verify_equal("tiled replay value record" + suffix, tiled.value, copy.value);
+    if (tiled.gate != copy.gate) {
+        std::cerr << "tiled replay gate record" << suffix << ": bits differ\n";
+        ++failures;
+    }
+    // Key head h < 16 of the expanded records is raw key head h, as is the tiled record's head h.
+    std::vector<std::uint16_t> first_heads(qk_elements);
+    for (std::int32_t c = 0; c < columns; ++c) {
+        std::copy_n(copy.key.begin() + static_cast<std::ptrdiff_t>(c) * kValue * kStateDim, kQk * kStateDim,
+                    first_heads.begin() + static_cast<std::ptrdiff_t>(c) * kQk * kStateDim);
+    }
+    failures += verify_equal("tiled replay key record" + suffix, tiled.key, first_heads);
+    if (from_device<float>(device_state, state_elements) != state) {
+        std::cerr << "tiled replay record modified the source state" << suffix << "\n";
+        ++failures;
+    }
+    return failures;
+}
+
+// The tiled map is instantiated for Qwen3.8-Flash-Next's dense rows only: masked rows are refused.
+int tiled_rejects_masked_rows() {
+    constexpr std::int32_t kQk = 16, kValue = 48, kWidth = 2;
+    DeviceBuffer q(static_cast<std::size_t>(kStateDim) * kQk * kWidth * 2);
+    DeviceBuffer k(q.bytes), key(q.bytes);
+    DeviceBuffer v(static_cast<std::size_t>(kStateDim) * kValue * kWidth * 2);
+    DeviceBuffer value(v.bytes), out(v.bytes);
+    DeviceBuffer g(static_cast<std::size_t>(kValue) * kWidth * 4), beta(g.bytes), gate(g.bytes * 2);
+    DeviceBuffer states(static_cast<std::size_t>(kStateDim) * kStateDim * kValue * 4);
+    DeviceBuffer slot = to_device(std::vector<std::int32_t>{0});
+    DeviceBuffer valid = to_device(std::vector<std::int32_t>{1});
+    Tensor qt(q.p, DType::BF16, {kStateDim, kQk, kWidth, 1}), kt(k.p, DType::BF16, {kStateDim, kQk, kWidth, 1});
+    Tensor vt(v.p, DType::BF16, {kStateDim, kValue, kWidth, 1});
+    Tensor gt(g.p, DType::FP32, {kValue, kWidth, 1}), bt(beta.p, DType::FP32, {kValue, kWidth, 1});
+    Tensor st(states.p, DType::FP32, {kStateDim, kStateDim, kValue, 1});
+    Tensor validt(valid.p, DType::I32, {1}), slott(slot.p, DType::I32, {1});
+    Tensor keyt(key.p, DType::BF16, {kStateDim, kQk, kWidth, 1});
+    Tensor valuet(value.p, DType::BF16, {kStateDim, kValue, kWidth, 1});
+    Tensor gatet(gate.p, DType::FP32, {2, kValue, kWidth, 1});
+    Tensor outt(out.p, DType::BF16, {kStateDim, kValue, kWidth, 1});
+    try {
+        ops::gated_delta_net_replay_record(qt, kt, vt, gt, bt, 1.0F / std::sqrt(128.0F), st, validt, slott,
+                                           keyt, valuet, gatet, outt, nullptr, GdnHeadMap::Tiled);
+    } catch (const std::invalid_argument& error) {
+        // The tiled-map refusal itself, not some other shape check that happens to throw.
+        if (std::string_view(error.what()).find("tiled head map") != std::string_view::npos) { return 0; }
+        std::cerr << "gated_delta_net_replay_record refused for another reason: " << error.what() << '\n';
+        return 1;
+    }
+    cuda_synchronize();
+    std::cerr << "gated_delta_net_replay_record accepted the tiled map with masked rows\n";
+    return 1;
+}
+
 } // namespace
 
 int main() {
@@ -297,6 +439,15 @@ int main() {
     failures += run_case(48, 5, 3, {5, 3, 1}, 1791U);
     // Qwen3.8-Flash-Next's tiled heads: one q/k head per value head, one row, widths 2..8.
     for (int width = 2; width <= 8; ++width) { failures += run_case(48, width, 1, {}, 1800U + width, 48); }
+    // The same heads read in place through the tiled map: against the recurrent kernel with that map,
+    // then bitwise against the expanded heads.
+    for (int width = 2; width <= 8; ++width) {
+        failures += run_case(48, width, 1, {}, 1810U + width, 16, GdnHeadMap::Tiled);
+        failures += tiled_matches_expanded(width, 1, {}, 1820U + width);
+    }
+    failures += run_case(48, 16, 8, {}, 1831U, 16, GdnHeadMap::Tiled);
+    failures += tiled_matches_expanded(6, 3, {}, 1841U);
+    failures += tiled_rejects_masked_rows();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net_replay_record\n";
     return failures == 0 ? 0 : 1;
 }

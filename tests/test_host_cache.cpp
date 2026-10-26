@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -169,6 +170,41 @@ int check_automatic_normalization() {
     return failures;
 }
 
+// Decode scoring (EngineOptions::scoring_decode_window) is a CausalScoring plan on one device, at
+// most the 16-column verify domain wide; anything else is refused before sizing.
+int check_scoring_decode_window() {
+    using ninfer::runtime::normalize_engine_options;
+    const auto normalized = [](auto&& edit) -> std::optional<ninfer::EngineOptions> {
+        ninfer::EngineOptions options;
+        options.purpose = ninfer::EnginePurpose::CausalScoring;
+        edit(options);
+        try {
+            return normalize_engine_options(options);
+        } catch (const std::invalid_argument&) { return std::nullopt; }
+    };
+    int failures = 0;
+    const auto planned = normalized([](ninfer::EngineOptions& o) { o.scoring_decode_window = 4; });
+    failures += check(planned && planned->scoring_decode_window == 4,
+                      "a CausalScoring decode window of four was not kept");
+    const auto widest = normalized([](ninfer::EngineOptions& o) { o.scoring_decode_window = 16; });
+    failures += check(widest.has_value(), "the 16-column decode window was refused");
+    failures += check(!normalized([](ninfer::EngineOptions& o) { o.scoring_decode_window = 17; }),
+                      "a decode window wider than the verify domain was accepted");
+    failures += check(!normalized([](ninfer::EngineOptions& o) {
+                          o.purpose               = ninfer::EnginePurpose::Generation;
+                          o.scoring_decode_window = 3;
+                      }),
+                      "a decode scoring window on a Generation Engine was accepted");
+    failures += check(!normalized([](ninfer::EngineOptions& o) {
+                          o.devices               = {0, 1};
+                          o.scoring_decode_window = 3;
+                      }),
+                      "decode scoring over pipeline stages was accepted");
+    failures += check(normalized([](ninfer::EngineOptions& o) { o.devices = {0, 1}; }).has_value(),
+                      "prefill-only scoring over pipeline stages was refused");
+    return failures;
+}
+
 // Fork features that were once parked are accepted by option normalization again.
 int check_fork_options_accepted() {
     using ninfer::runtime::normalize_engine_options;
@@ -196,12 +232,109 @@ int check_fork_options_accepted() {
     return failures;
 }
 
+// Relaxed drafting changes which drafts speculation keeps, so it is refused without a speculative
+// backend, on a scoring Engine and outside [0,1]; with a backend any threshold in [0,1] is kept.
+int check_relaxed_drafting() {
+    using ninfer::runtime::normalize_engine_options;
+    const auto normalized = [](auto&& edit) -> std::optional<ninfer::EngineOptions> {
+        ninfer::EngineOptions options;
+        options.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens = 3;
+        options.relaxed_drafting         = 0.5F;
+        edit(options);
+        try {
+            return normalize_engine_options(options);
+        } catch (const std::invalid_argument& error) {
+            if (std::string(error.what()).find("--relaxed-drafting") == std::string::npos) {
+                std::cerr << "relaxed drafting refusal does not name the flag: " << error.what()
+                          << '\n';
+            }
+            return std::nullopt;
+        }
+    };
+    int failures = 0;
+    for (const float threshold : {0.0F, 0.2F, 1.0F}) {
+        const auto kept =
+            normalized([&](ninfer::EngineOptions& o) { o.relaxed_drafting = threshold; });
+        failures += check(kept && kept->relaxed_drafting == threshold,
+                          "a relaxed drafting threshold in [0,1] was not kept");
+    }
+    failures += check(!normalized([](ninfer::EngineOptions& o) { o.speculative = {}; }),
+                      "relaxed drafting was accepted without a speculative backend");
+    failures += check(!normalized([](ninfer::EngineOptions& o) {
+                          o.purpose = ninfer::EnginePurpose::CausalScoring;
+                      }),
+                      "relaxed drafting was accepted on a scoring Engine");
+    for (const float bad : {-0.1F, 1.5F}) {
+        failures += check(!normalized([&](ninfer::EngineOptions& o) { o.relaxed_drafting = bad; }),
+                          "an out-of-range relaxed drafting threshold was accepted");
+    }
+    failures += check(normalized([](ninfer::EngineOptions& o) {
+                          o.speculative      = {};
+                          o.relaxed_drafting = std::nullopt;
+                      }).has_value(),
+                      "options without relaxed drafting were refused");
+    return failures;
+}
+
+// Draft-head context rows add rows to the reduced proposal head's drafts, so they are refused
+// without a speculative backend reading it, on a scoring Engine and above the slot maximum.
+int check_draft_context_rows() {
+    using ninfer::runtime::normalize_engine_options;
+    const auto normalized = [](auto&& edit) -> std::optional<ninfer::EngineOptions> {
+        ninfer::EngineOptions options;
+        options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens  = 3;
+        options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+        options.draft_context_rows        = 512;
+        edit(options);
+        try {
+            return normalize_engine_options(options);
+        } catch (const std::invalid_argument& error) {
+            if (std::string(error.what()).find("--draft-context-rows") == std::string::npos) {
+                std::cerr << "draft context row refusal does not name the flag: " << error.what()
+                          << '\n';
+            }
+            return std::nullopt;
+        }
+    };
+    int failures = 0;
+    for (const std::uint32_t rows : {1U, 512U, ninfer::kMaximumDraftContextRows}) {
+        const auto kept = normalized([&](ninfer::EngineOptions& o) { o.draft_context_rows = rows; });
+        failures += check(kept && kept->draft_context_rows == rows,
+                          "a draft context row count in [1,2048] was not kept");
+    }
+    failures += check(!normalized([](ninfer::EngineOptions& o) {
+                          o.draft_context_rows = ninfer::kMaximumDraftContextRows + 1;
+                      }),
+                      "more than 2048 draft context rows were accepted");
+    failures += check(!normalized([](ninfer::EngineOptions& o) { o.speculative = {}; }),
+                      "draft context rows were accepted without a speculative backend");
+    failures += check(!normalized([](ninfer::EngineOptions& o) {
+                          o.speculative.proposal_head = ninfer::ProposalHead::Full;
+                      }),
+                      "draft context rows were accepted with the full proposal head");
+    failures += check(!normalized([](ninfer::EngineOptions& o) {
+                          o.purpose = ninfer::EnginePurpose::CausalScoring;
+                      }),
+                      "draft context rows were accepted on a scoring Engine");
+    failures += check(normalized([](ninfer::EngineOptions& o) {
+                          o.speculative        = {};
+                          o.draft_context_rows = 0;
+                      }).has_value(),
+                      "options without draft context rows were refused");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
     failures += check_automatic_normalization();
+    failures += check_relaxed_drafting();
+    failures += check_draft_context_rows();
     failures += check_fork_options_accepted();
+    failures += check_scoring_decode_window();
 
     // Everything free but the 3 GiB default reserve is pinned.
     failures += check(resolve_host_capacity_bytes(requested(), 64 * kGiB) == 61 * kGiB,

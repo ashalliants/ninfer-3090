@@ -38,6 +38,13 @@ enum class LinearPolicy : std::uint8_t {
     /// scales and per-token activation scales, where the integer route carries per-group ones -- so
     /// it is opt-in per engine, and it falls back to AllowA8Int below the width where it pays.
     AllowPrefillCublas,
+    /// AllowA8 for the GGML block formats plus their int8 tensor-core decode route at T <= 8
+    /// (ops/linear/ggml/ggml_mma_decode.cuh, --ggml-decode-mma). The same Q8_1 cast and exact
+    /// integer products as AllowA8's dp4a route, scaled and summed in a different fixed order, so the
+    /// outputs differ from AllowA8's in their FP32 rounding (both are column invariant). Opt-in per
+    /// engine. Only GGML block-format weights admit it: Linear and LinearAdd reject it for every
+    /// other format, and wider calls (T > 8) take AllowA8's route.
+    AllowA8GgmlDecodeMma,
     /// The lossy-prefill scout's int4 route (docs/maintainer/lossy-long-prefill.md, "Int4 scout
     /// GEMMs"): AllowA8Int, except that wherever the integer-A8 prefill route would run on a
     /// Q4_G64_FP16 matrix, the activations are quantised to int4 per 64-wide group instead
@@ -54,7 +61,8 @@ enum class LinearPolicy : std::uint8_t {
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
            policy == LinearPolicy::AllowA4 || policy == LinearPolicy::AllowA8Int ||
-           policy == LinearPolicy::AllowA8IntDecode || policy == LinearPolicy::AllowPrefillCublas;
+           policy == LinearPolicy::AllowA8IntDecode || policy == LinearPolicy::AllowPrefillCublas ||
+           policy == LinearPolicy::AllowA8GgmlDecodeMma;
 }
 
 [[nodiscard]] constexpr bool allows_a8(LinearPolicy policy) noexcept {
@@ -74,6 +82,19 @@ enum class LinearPolicy : std::uint8_t {
 /// The scout's int4-activation route for Q4_G64_FP16 matrices (LinearPolicy::ScoutA4Int).
 [[nodiscard]] constexpr bool allows_scout_a4(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::ScoutA4Int;
+}
+
+/// The GGML block formats' int8 tensor-core decode route (GGML weights only).
+[[nodiscard]] constexpr bool allows_ggml_decode_mma(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::AllowA8GgmlDecodeMma;
+}
+
+/// valid_linear_policy for the Ops whose weights are never GGML block formats (the
+/// hyper-connection mix, the FP8 and NVFP4 GDN plans, the NVFP4 SwiGLU): AllowA8GgmlDecodeMma
+/// names a GGML-only route, so they refuse it at their own check instead of a later Linear doing
+/// so mid-call.
+[[nodiscard]] constexpr bool valid_dense_linear_policy(LinearPolicy policy) noexcept {
+    return valid_linear_policy(policy) && !allows_ggml_decode_mma(policy);
 }
 
 /// The cuBLAS prefill route. Only ever admitted above `kCublasPrefillMinTokens`, because its
@@ -140,11 +161,12 @@ inline constexpr std::int32_t kCublasPrefillMinTokens = 129;
  * represent a text token. FP32 is unsupported.
  *
  * GGML block formats in layout `ggml_blocks_v1` (tensor-formats.md Section 3.5) register the dense
- * projections of Qwen3.8-Flash-Next at every positive T: GGML_IQ4_XS and GGML_IQ3_S at `[N,K]` in
- * `{[10240,2560], [6144,2560], [12288,2560], [512,2560], [2560,6144], [640,2560]}`, GGML_Q6_K at
- * `{[6144,2560], [512,2560], [2560,6144], [640,2560]}`, and GGML_IQ4_NL, GGML_Q8_0 and GGML_Q2_0
- * at `[2560,640]`. The weight view is the codes-only native form (no scale or high plane); IQ4_XS
- * rows are 8-byte aligned, the others 2-byte aligned.
+ * projections of Qwen3.8-Flash-Next's GGUF packs at every positive T: GGML_IQ4_XS, GGML_IQ3_S,
+ * GGML_Q6_K, GGML_Q5_K and GGML_Q4_K at `[N,K]` in `{[10240,2560], [6144,2560], [12288,2560],
+ * [512,2560], [2560,6144], [640,2560]}`, and GGML_IQ4_NL, GGML_Q8_0 and GGML_Q2_0 at `[2560,640]`.
+ * The weight view is the codes-only native form (no scale or high plane); IQ4_XS rows are 8-byte
+ * aligned, Q4_K and Q5_K rows 16-byte aligned, the others 2-byte aligned. Under
+ * AllowA8GgmlDecodeMma the matrix (its first row) must also be 16-byte aligned for T <= 8.
  *
  * @par Numerical contract
  * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.
@@ -177,7 +199,13 @@ inline constexpr std::int32_t kCublasPrefillMinTokens = 129;
  * AllowA8; AllowA4 permits the private resolver to select either a qualified A16 route or
  * activation quantization to NVFP4 at every positive T. GGML block formats register only the Q8_1
  * (A8) profile above: AllowA8 and AllowA4 admit it, and A16Only, including the A16 convenience
- * overload, is rejected for them. The selected route depends only on the registered problem and T.
+ * overload, is rejected for them. AllowA8GgmlDecodeMma admits the same profile and, at T <= 8,
+ * selects the int8 tensor-core decode route instead of the dp4a one: the same cast and the same
+ * exact int32 products per 32 values, each sub-block's term fma(c * d, float(P), partial) added
+ * into 32 lane partials and those reduced by a fixed butterfly (ops/linear/ggml/ggml_mma_emulation.h),
+ * so a column's bits depend on neither T nor its position; at T > 8 it is AllowA8. It is admitted
+ * for GGML block formats only; every other format rejects it. The selected route depends only on
+ * the registered problem, the policy and T.
  *
  * @par Workspace
  * `workspace` is caller-owned call-scoped transient storage sized by

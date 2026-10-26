@@ -38,22 +38,21 @@ rem
 rem Every measurement behind these defaults, the memory model, and the reasoning for each flag are
 rem in docs\maintainer\launcher-profiles.md. What follows is what you need to run it.
 rem
+rem PROFILE FILES. Each profile's fixed flags are a `ninfer-serve --config` file under profiles\
+rem (profiles\<model>-<profile>[-<spec>].json), shared with run.sh, so Windows and Linux serve the
+rem same flag set. What stays here is what differs between the two or is decided at start: the
+rem context, KV pool and lanes of the `tuned` profiles, n-gram copies, vision, the Host context
+rem budget, the sampling guard, the context fit and the host retry, and Flash-Next's speculation,
+rem vision and cache. An environment override is passed after --config, where it wins over the file.
+rem
 rem QWEN3.8-27B, `tuned`: two flag sets, each measured (docs\performance.md, "Recommended
 rem configurations"), chosen with NINFER_SPEC. The default is the fast one.
 rem
 rem   NINFER_SPEC=dflash2 (default): fastest at one stream, up to 188,416 tokens of context
-rem
-rem     --spec dflash2 --draft-tokens 7 --lm-head-draft --ngram-draft-tokens 15
-rem     --prefill-cublas --prefill-chunk 4096
-rem     --kv-dtype rk4v4 --gdn-state-fp16
-rem     --vision --vision-residency overlay
+rem     (profiles\qwen38-27b-tuned-dflash2.json, plus --ngram-draft-tokens 15 and vision)
 rem
 rem   NINFER_SPEC=mtp: the full 262,144-token native context, two lanes sharing it, still fast
-rem
-rem     --spec mtp --draft-tokens 3 --lm-head-draft
-rem     --prefill-cublas --prefill-chunk 2048
-rem     --kv-dtype rk4v4 --gdn-state-fp16
-rem     --vision --vision-residency overlay
+rem     (profiles\qwen38-27b-tuned-mtp.json, plus vision)
 rem
 rem   set NINFER_SPEC=mtp && run.bat qwen38-27b
 rem
@@ -70,7 +69,9 @@ rem MTP weights too, so one file serves both. It stores the embedding as Q4 and 
 rem the --embedding-q4 and --lm-head-q6 load-time transcodes the upstream file needed are not passed.
 rem
 rem OVERRIDES, from the environment. All profiles: NINFER_MODEL (artifact path), NINFER_MODEL_DIR,
-rem NINFER_SERVER, NINFER_HOST, NINFER_PORT, NINFER_GRAFT_DIR (phantom-kv graft directory),
+rem NINFER_SERVER, NINFER_HOST, NINFER_PORT, NINFER_ALLOWED_HOST (more names the server answers to
+rem without a key, e.g. "gpubox.lan,ninfer.example", comma- or space-separated; each becomes
+rem --allowed-host), NINFER_GRAFT_DIR (phantom-kv graft directory),
 rem NINFER_GRAFTS (set to "off" to disable graft loading), NINFER_DEFAULT_GRAFT (set to "on" to
 rem apply the loaded graft to every request that names none), NINFER_CHAT_TEMPLATE (path to a local
 rem Jinja file, passed straight to --chat-template; overrides the artifact's built-in template).
@@ -197,10 +198,24 @@ rem downloaded there with download-model.bat is found here.
 if not "%NINFER_MODEL_DIR%"=="" set "MODEL=%NINFER_MODEL_DIR%\%ARTIFACT%"
 set "HOST=127.0.0.1"
 set "PORT=8080"
-set "KV_DTYPE=rk4v4"
+rem The profile files sit beside this launcher in both layouts: scripts\profiles in a checkout, and
+rem profiles\ at the root of the release archive.
+set "PROFILES_DIR=%~dp0profiles"
 if not "%NINFER_MODEL%"=="" set "MODEL=%NINFER_MODEL%"
 if not "%NINFER_HOST%"=="" set "HOST=%NINFER_HOST%"
 if not "%NINFER_PORT%"=="" set "PORT=%NINFER_PORT%"
+rem Names for the Host check (a DNS alias, a proxy's public name), one --allowed-host each.
+rem ninfer-serve refuses a value that is not a plain host name or address, naming it. A "*" or "?"
+rem is refused here instead: "for" would treat it as a file pattern and silently drop it.
+set "ALLOWED_HOST_ARGS="
+if "%NINFER_ALLOWED_HOST%"=="" goto :allowed_host_done
+echo(%NINFER_ALLOWED_HOST%| findstr /r "[*?]" >nul
+if not errorlevel 1 (
+  echo NINFER_ALLOWED_HOST takes plain host names, not wildcards: %NINFER_ALLOWED_HOST%
+  exit /b 1
+)
+for %%H in (%NINFER_ALLOWED_HOST%) do call set "ALLOWED_HOST_ARGS=%%ALLOWED_HOST_ARGS%% --allowed-host %%H"
+:allowed_host_done
 
 set "SERVER=%ROOT%\build-ninja\apps\ninfer-serve.exe"
 if not exist "%SERVER%" set "SERVER=%~dp0ninfer-serve.exe"
@@ -212,10 +227,11 @@ rem NINFER_GRAFT_DIR overrides where to look.
 set "GRAFT_DIR=%ROOT%\artifacts\grafts"
 if not "%NINFER_GRAFT_DIR%"=="" set "GRAFT_DIR=%NINFER_GRAFT_DIR%"
 
-rem The profile fixes the whole serving shape. LABEL is the banner; PROFILE_ARGS is everything
-rem after --host/--port. Values below use ^| for the separator: a bare pipe inside an expanded
-rem variable would be parsed as a pipe when echoed.
+rem The profile fixes the whole serving shape. LABEL is the banner; PROFILE_FILE is the profile
+rem file (--config) and PROFILE_ARGS everything after it on the command line. Values below use ^|
+rem for the separator: a bare pipe inside an expanded variable would be parsed as a pipe when echoed.
 set "LABEL="
+set "PROFILE_FILE="
 set "PROFILE_ARGS="
 set "PREFILL_NOTE="
 set "HINT="
@@ -238,9 +254,10 @@ call :usage 1>&2
 exit /b 2
 
 :profile_27b_tuned
-rem The speculative backend fixes everything that has to move with it: the prefill chunk (the
-rem cuBLAS route's workspace scales with it) and the context that fits. The overrides are applied after these defaults, so an explicit
-rem NINFER_CONTEXT or NINFER_PREFILL_CHUNK always wins.
+rem The speculative backend fixes everything that has to move with it, so each has its own file: the
+rem prefill chunk (the cuBLAS route's workspace scales with it) and the draft count there, the
+rem context that fits here (it is smaller than Linux's beside a desktop). The overrides are applied
+rem after these defaults, so an explicit NINFER_CONTEXT or NINFER_PREFILL_CHUNK always wins.
 set "SPEC=dflash2"
 if not "%NINFER_SPEC%"=="" set "SPEC=%NINFER_SPEC%"
 if /i "%SPEC%"=="dflash2" goto :spec_dflash2
@@ -253,26 +270,22 @@ exit /b 2
 set "SPEC=dflash2"
 set "CONTEXT=188416"
 set "CONCURRENCY=1"
-set "PREFILL_CHUNK=4096"
-set "DRAFT_TOKENS=7"
 goto :spec_done
 
 :spec_mtp
 set "SPEC=mtp"
 set "CONTEXT=262144"
 set "CONCURRENCY=2"
-set "PREFILL_CHUNK=2048"
-set "DRAFT_TOKENS=3"
 goto :spec_done
 
 :spec_none
 set "SPEC=none"
 set "CONTEXT=262144"
 set "CONCURRENCY=2"
-set "PREFILL_CHUNK=2048"
-set "DRAFT_TOKENS="
 
 :spec_done
+set "PROFILE_FILE=%PROFILES_DIR%\qwen38-27b-tuned-%SPEC%.json"
+call :read_profile || exit /b 1
 if not "%NINFER_DRAFT_TOKENS%"=="" set "DRAFT_TOKENS=%NINFER_DRAFT_TOKENS%"
 if not "%NINFER_CONTEXT%"=="" set "CONTEXT=%NINFER_CONTEXT%"
 if not "%NINFER_CONCURRENCY%"=="" set "CONCURRENCY=%NINFER_CONCURRENCY%"
@@ -295,13 +308,13 @@ if /i "%NGRAM%"=="on" if /i not "%SPEC%"=="dflash2" (
   exit /b 2
 )
 set "SPEC_ARGS="
-if /i not "%SPEC%"=="none" set "SPEC_ARGS=--spec %SPEC% --draft-tokens %DRAFT_TOKENS% --lm-head-draft"
-if /i "%NGRAM%"=="on" set "SPEC_ARGS=%SPEC_ARGS% --ngram-draft-tokens 15"
+if /i "%NGRAM%"=="on" set "SPEC_ARGS= --ngram-draft-tokens 15"
+call :tuned_overrides
 if /i "%SPEC%"=="dflash2" set "SPEC_LABEL=DFlash2 K=%DRAFT_TOKENS% + draft head"
 if /i "%NGRAM%"=="on" set "SPEC_LABEL=%SPEC_LABEL% + n-gram copies"
 if /i "%SPEC%"=="mtp" set "SPEC_LABEL=MTP%DRAFT_TOKENS% + draft head, full context"
 if /i "%SPEC%"=="none" set "SPEC_LABEL=no speculation"
-set "PROFILE_ARGS=--max-concurrency %CONCURRENCY% --max-context %CONTEXT% --kv-capacity %CONTEXT% --kv-dtype %KV_DTYPE% %SPEC_ARGS% --gdn-state-fp16 --prefill-cublas --prefill-chunk %PREFILL_CHUNK%"
+set "PROFILE_ARGS=--max-concurrency %CONCURRENCY% --max-context %CONTEXT% --kv-capacity %CONTEXT%%OVERRIDE_ARGS%%SPEC_ARGS%"
 set "LABEL=C%CONCURRENCY%  ^|  %CONTEXT_WORD% %CONTEXT%  ^|  %KV_DTYPE% KV  ^|  %SPEC_LABEL%"
 set "PREFILL_NOTE=Prefill: cuBLAS route, chunk %PREFILL_CHUNK%"
 if /i "%SPEC%"=="dflash2" set "HINT=Need the full 262K context or a second lane? Set NINFER_SPEC=mtp: slower decode."
@@ -315,15 +328,13 @@ rem one --kv-capacity pool: any request may use all 262,144 tokens, but the lane
 rem hold at most that many at a time.
 set "SPEC=mtp"
 if not "%NINFER_SPEC%"=="" set "SPEC=%NINFER_SPEC%"
-rem cuBLAS prefill at chunk 4096: 8,848 tok/s on a 4K prompt against 5,470 at the old default-route
-rem chunk 512 (2026-10-02). Its larger runtime reservation is what costs context: beside a desktop
-rem holding 1.3 GiB the old profile started at 262,144 with 154 MiB free, while this one is refused
-rem at 229,376 (27 MB short) and starts at 212,992 with 220 MiB free, so that is the default. For
-rem the full 262,144, set NINFER_PREFILL_CHUNK=1024 (7,140 tok/s, fits with 138 MiB free).
+rem cuBLAS prefill at chunk 4096 (the profile file): 8,848 tok/s on a 4K prompt against 5,470 at the
+rem old default-route chunk 512 (2026-10-02). Its larger runtime reservation is what costs context:
+rem beside a desktop holding 1.3 GiB the old profile started at 262,144 with 154 MiB free, while this
+rem one is refused at 229,376 (27 MB short) and starts at 212,992 with 220 MiB free, so that is the
+rem default. For the full 262,144, set NINFER_PREFILL_CHUNK=1024 (7,140 tok/s, fits with 138 MiB free).
 set "CONTEXT=212992"
 set "CONCURRENCY=2"
-set "PREFILL_CHUNK=4096"
-set "DRAFT_TOKENS=3"
 rem DFlash2 is 27B-only and n-gram copy rounds ride on it, so refuse rather than ignore the flag.
 if "%NINFER_NGRAM%"=="" goto :ngram35_done
 if /i "%NINFER_NGRAM%"=="off" goto :ngram35_done
@@ -346,15 +357,16 @@ goto :spec35_done
 set "SPEC=none"
 set "SPEC_LABEL=no speculation"
 :spec35_done
+set "PROFILE_FILE=%PROFILES_DIR%\qwen36-35b-a3b-tuned-%SPEC%.json"
+call :read_profile || exit /b 1
 if not "%NINFER_DRAFT_TOKENS%"=="" set "DRAFT_TOKENS=%NINFER_DRAFT_TOKENS%"
 if not "%NINFER_CONTEXT%"=="" set "CONTEXT=%NINFER_CONTEXT%"
 if not "%NINFER_CONCURRENCY%"=="" set "CONCURRENCY=%NINFER_CONCURRENCY%"
 if not "%NINFER_KV_DTYPE%"=="" set "KV_DTYPE=%NINFER_KV_DTYPE%"
 if not "%NINFER_PREFILL_CHUNK%"=="" set "PREFILL_CHUNK=%NINFER_PREFILL_CHUNK%"
-set "SPEC_ARGS="
-if /i "%SPEC%"=="mtp" set "SPEC_ARGS=--spec mtp --draft-tokens %DRAFT_TOKENS% --lm-head-draft --mtp-experts-q4"
+call :tuned_overrides
 if /i "%SPEC%"=="mtp" set "SPEC_LABEL=MTP%DRAFT_TOKENS% + draft head"
-set "PROFILE_ARGS=--max-concurrency %CONCURRENCY% --max-context %CONTEXT% --kv-capacity %CONTEXT% --kv-dtype %KV_DTYPE% %SPEC_ARGS% --gdn-state-fp16 --prefill-cublas --prefill-chunk %PREFILL_CHUNK%"
+set "PROFILE_ARGS=--max-concurrency %CONCURRENCY% --max-context %CONTEXT% --kv-capacity %CONTEXT%%OVERRIDE_ARGS%"
 set "LABEL=C%CONCURRENCY%  ^|  %CONTEXT_WORD% %CONTEXT%  ^|  %KV_DTYPE% KV  ^|  %SPEC_LABEL%"
 goto :profile_tuned_common
 
@@ -365,6 +377,9 @@ rem step-down ladder does not apply (its refusals are another model's); a refusa
 rem change. PROFILE is renamed so the tuned profiles' cache and sampling notes are not printed for it.
 set "LADDER=0"
 set "PROFILE=flash-next"
+rem The file holds the INT8 KV, the prefill chunk and the request queue; the rest is chosen below.
+set "PROFILE_FILE=%PROFILES_DIR%\qwen38-flash-next-tuned.json"
+call :read_profile || exit /b 1
 set "CONTEXT=32768"
 if not "%NINFER_CONTEXT%"=="" set "CONTEXT=%NINFER_CONTEXT%"
 rem MTP speculation needs the artifact converted with the drafter (--mtp-gguf). Without an explicit
@@ -435,7 +450,7 @@ if not "%FN_LANES%"=="1" if not "%FN_LANES%"=="2" (
 )
 set "FN_LANES_LABEL=one request"
 if "%FN_LANES%"=="2" set "FN_LANES_LABEL=two requests at once"
-set "PROFILE_ARGS=--max-concurrency %FN_LANES% --max-context %CONTEXT% --kv-capacity %CONTEXT% --kv-dtype int8 --prefill-chunk 1024 --max-pending-requests 16 --pending-timeout-ms 600000 %SPEC_ARGS% %FN_VISION_ARGS% %FN_CACHE_ARGS%"
+set "PROFILE_ARGS=--max-concurrency %FN_LANES% --max-context %CONTEXT% --kv-capacity %CONTEXT% %SPEC_ARGS% %FN_VISION_ARGS% %FN_CACHE_ARGS%"
 set "LABEL=%FN_LANES_LABEL%  ^|  context %CONTEXT%  ^|  INT8 KV  ^|  %FN_INPUT%, %SPEC_LABEL%  ^|  %FN_CACHE_LABEL%"
 if /i "%FN_VISION%"=="off" if "%NINFER_VISION%"=="" set "HINT=Images: convert with --mtp-gguf and --mmproj to qwen4exp-iq2xs-mtp-vision.ninfer (docs\weight-conversion.md); this launcher then uses it."
 if /i "%FN_VISION%"=="off" if "%NINFER_VISION%"=="" if not "%NINFER_MODEL%"=="" if exist "%MODEL_FOLDER%qwen4exp-iq2xs-mtp-vision.ninfer" set "HINT=Images: qwen4exp-iq2xs-mtp-vision.ninfer is beside this model; clear NINFER_MODEL to use it."
@@ -466,7 +481,9 @@ exit /b 2
 goto :launch
 
 :profile_27b_int8
-set "PROFILE_ARGS=--max-context 65536 --kv-capacity 65536 --max-concurrency 1 --max-pending-requests 16 --pending-timeout-ms 600000 --prefill-chunk 1024 --kv-dtype int8 --spec mtp --draft-tokens 3 --lm-head-draft"
+rem Every flag is in the file: one lane at 64K of INT8 KV, MTP3 and the draft head.
+set "PROFILE_FILE=%PROFILES_DIR%\qwen38-27b-int8.json"
+call :read_profile || exit /b 1
 set "LABEL=one request  ^|  64K context  ^|  INT8 KV  ^|  MTP3, ReplaySSM"
 goto :launch
 
@@ -477,10 +494,10 @@ rem the card beyond the active ones, and the same 8 GiB pinned Host context budg
 rem the conversations that leave the card. MEMORY COST: this profile keeps the GDN state in BF16, so
 rem a StateImage is 147 MiB. The device slots take 8 x 147 MiB = 1.15 GiB of VRAM, the engine default
 rem at eight lanes; the Host budget pins 8 GiB of RAM (StateImages, KV pages and pause snapshots
-rem share it). Retention on the card is still bounded by the 16,384-token KV pool below.
-set "C8_LANES=8"
-set /a C8_DEVICE_STATES=C8_LANES
-set "PROFILE_ARGS=--max-context 8192 --kv-capacity 16384 --max-concurrency %C8_LANES% --max-pending-requests 32 --pending-timeout-ms 600000 --prefill-chunk 512 --kv-dtype int8 --spec mtp --draft-tokens 3 --lm-head-draft --device-state-slots %C8_DEVICE_STATES% --host-context-mib 8192"
+rem share it). Retention on the card is still bounded by the 16,384-token KV pool. Every flag is in
+rem the file, which keeps --device-state-slots equal to --max-concurrency.
+set "PROFILE_FILE=%PROFILES_DIR%\qwen38-27b-c8.json"
+call :read_profile || exit /b 1
 set "LABEL=up to eight requests  ^|  8K context  ^|  INT8 KV  ^|  MTP3, ReplaySSM"
 goto :launch
 
@@ -598,7 +615,7 @@ rem The profile's context is a ceiling unless the caller chose it: --fit-context
 rem at the largest context that fits the GPU memory free right now (never below FIT_FLOOR) and say so.
 set "FIT_ARGS="
 if "%FIT%"=="1" set "FIT_ARGS= --fit-context %FIT_FLOOR%"
-set "PROFILE_ARGS=%PROFILE_ARGS% --max-pending-requests 16 --pending-timeout-ms 600000 %VISION_ARGS% %CACHE_ARGS%%KNOB_ARGS%%FIT_ARGS% %SAMPLING_ARGS%"
+set "PROFILE_ARGS=%PROFILE_ARGS% %VISION_ARGS% %CACHE_ARGS%%KNOB_ARGS%%FIT_ARGS% %SAMPLING_ARGS%"
 
 :launch
 set "GRAFT_ARGS="
@@ -647,6 +664,7 @@ rem string comparison here garbles the quoting and breaks the if statement. `def
 rem that: it tests the variable directly, with no substitution.
 if defined GRAFT_ARGS echo Graft: godmode = %GRAFT_FILE%
 if defined CHAT_TEMPLATE_ARGS echo Chat template: "%NINFER_CHAT_TEMPLATE%"
+if defined ALLOWED_HOST_ARGS echo Allowed host names: %NINFER_ALLOWED_HOST%
 if not "%HINT%"=="" echo %HINT%
 echo API: http://%HOST%:%PORT%/v1
 echo.
@@ -661,7 +679,7 @@ rem "( ... )" command group, that character can be taken as the group's own clos
 rem break the batch parse, quoting notwithstanding -- so this invocation runs unparenthesised, with
 rem goto standing in for the logged/unlogged branch instead.
 if /i "%PROFILE%"=="tuned" goto :launch_logged
-"%SERVER%" "%MODEL%" --host %HOST% --port %PORT% %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %CHAT_TEMPLATE_ARGS%
+"%SERVER%" "%MODEL%" --host %HOST% --port %PORT% --config "%PROFILE_FILE%" %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %CHAT_TEMPLATE_ARGS% %ALLOWED_HOST_ARGS%
 endlocal
 exit /b %ERRORLEVEL%
 
@@ -670,7 +688,7 @@ rem Run the server with its output shown and kept, so a failure the launcher can
 rem told apart from any other. Only a failed host pin retries; a crash or a bad artifact does not.
 rem The log is written as ASCII on purpose: Tee-Object writes UTF-16, which findstr cannot search.
 set "SERVER_LOG=%TEMP%\ninfer-run-%RANDOM%%RANDOM%.log"
-"%SERVER%" "%MODEL%" --host %HOST% --port %PORT% %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %CHAT_TEMPLATE_ARGS% 2>&1 | powershell -NoProfile -Command "$input | ForEach-Object { $_; Add-Content -LiteralPath '%SERVER_LOG%' -Value $_ -Encoding Ascii }"
+"%SERVER%" "%MODEL%" --host %HOST% --port %PORT% --config "%PROFILE_FILE%" %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %CHAT_TEMPLATE_ARGS% %ALLOWED_HOST_ARGS% 2>&1 | powershell -NoProfile -Command "$input | ForEach-Object { $_; Add-Content -LiteralPath '%SERVER_LOG%' -Value $_ -Encoding Ascii }"
 findstr /c:"not enough free GPU memory" "%SERVER_LOG%" >nul 2>&1
 if not errorlevel 1 goto :memory_advice
 if not "%HOST_RETRY%"=="1" goto :server_done
@@ -700,6 +718,35 @@ set "SERVER_STATUS=0"
 if not errorlevel 1 set "SERVER_STATUS=1"
 del "%SERVER_LOG%" >nul 2>&1
 endlocal & exit /b %SERVER_STATUS%
+
+:read_profile
+rem PROFILE_FILE's flags reach the server through --config. The banner shows a few of its values,
+rem so they are read back here: every file under profiles\ holds one "key": value pair per line,
+rem split at the colon, the comma and spaces, and the tilde modifier drops the quotes. The path is
+rem only ever expanded inside quotes (it may contain ")"), and the existence check is not a
+rem parenthesised block.
+set "DRAFT_TOKENS="
+set "PREFILL_CHUNK="
+set "KV_DTYPE="
+if exist "%PROFILE_FILE%" goto :read_profile_found
+echo Missing launcher profile: "%PROFILE_FILE%" 1>&2
+exit /b 1
+:read_profile_found
+for /f "usebackq tokens=1,2 delims=:, " %%A in ("%PROFILE_FILE%") do (
+  if "%%~A"=="draft-tokens" set "DRAFT_TOKENS=%%~B"
+  if "%%~A"=="prefill-chunk" set "PREFILL_CHUNK=%%~B"
+  if "%%~A"=="kv-dtype" set "KV_DTYPE=%%~B"
+)
+exit /b 0
+
+:tuned_overrides
+rem The environment's overrides of a tuned profile file's values, passed after --config so they win
+rem over it. A draft count means nothing without speculation.
+set "OVERRIDE_ARGS="
+if not "%NINFER_KV_DTYPE%"=="" set "OVERRIDE_ARGS=%OVERRIDE_ARGS% --kv-dtype %NINFER_KV_DTYPE%"
+if /i not "%SPEC%"=="none" if not "%NINFER_DRAFT_TOKENS%"=="" set "OVERRIDE_ARGS=%OVERRIDE_ARGS% --draft-tokens %NINFER_DRAFT_TOKENS%"
+if not "%NINFER_PREFILL_CHUNK%"=="" set "OVERRIDE_ARGS=%OVERRIDE_ARGS% --prefill-chunk %NINFER_PREFILL_CHUNK%"
+exit /b 0
 
 :usage
 echo usage: run.bat ^<model^> [profile]

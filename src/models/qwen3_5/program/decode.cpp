@@ -5,6 +5,7 @@
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "core/nvtx.h"
 #include "core/device.h"
+#include "ops/common/relaxed_accept.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scatter.h"
@@ -14,6 +15,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -85,7 +87,17 @@ void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
 
 namespace ninfer::models::qwen3_5::detail {
 
-namespace {} // namespace
+namespace {
+
+// A row's relaxed keeps from the round egress: a subset of its accepted drafts.
+std::uint64_t checked_relaxed_kept(std::int32_t kept, std::int32_t accepted) {
+    if (kept < 0 || kept > accepted) {
+        throw std::runtime_error("speculative batch returned an invalid relaxed drafting count");
+    }
+    return static_cast<std::uint64_t>(kept);
+}
+
+} // namespace
 
 const GdnReplayRecords* ProgramImpl::round_replay_records(std::uint32_t verify_drafts) const {
     if (!replay_records) { return nullptr; }
@@ -126,6 +138,7 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)
                         .view({dimension(parameters.model.resources().public_token_count)});
     request.sampling_host     = config;
+    apply_relaxed_drafting(request.sampling_host);
     request.speculative_stats = SpeculativeStats{
         .backend               = speculative_backend,
         .enabled               = speculative_backend != SpeculativeBackend::None,
@@ -142,6 +155,51 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
     CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
                                sizeof(request.sampling_host), cudaMemcpyHostToDevice,
                                device.stream));
+}
+
+void ProgramImpl::apply_relaxed_drafting(ops::SamplingConfig& config) const {
+    // The tokenizer's added-token floor; zero, which relaxes nothing, without relaxed drafting.
+    config.added_token_floor = relaxed_tokens.added_token_floor;
+    if (!relaxed_drafting) { config.relaxed_threshold = 0.0F; }
+}
+
+float ProgramImpl::round_relaxed_threshold(const SequenceState& sequence,
+                                           const RequestControl& request,
+                                           const ops::SamplingMask& mask) const {
+    const ops::SamplingConfig& config = request.sampling_host;
+    if (!relaxed_drafting || !(config.relaxed_threshold > 0.0F) || !(config.temperature > 0.0F) ||
+        mask.words != nullptr) {
+        return 0.0F;
+    }
+    // A tool call's name and arguments are sampled exactly.
+    if (ops::ledger_in_tool_call(sequence.ledger, relaxed_tokens.tool_call_open,
+                                 relaxed_tokens.tool_call_close)) {
+        return 0.0F;
+    }
+    return config.relaxed_threshold;
+}
+
+void ProgramImpl::refresh_draft_context_rows(std::span<const std::uint32_t> lanes) {
+    if (!draft_context_rows) { return; }
+    for (const std::uint32_t lane : lanes) {
+        const std::vector<TokenId>& ledger = active_sequence(lane).ledger;
+        std::size_t& noted                 = draft_context_rows_noted[lane];
+        // A ledger rewound below what was noted notes its new tail; the ids it no longer holds
+        // stay until the lane is released.
+        noted = std::min(noted, ledger.size());
+        draft_context_rows->note(static_cast<int>(lane),
+                                 std::span<const TokenId>(ledger).subspan(noted));
+        noted = ledger.size();
+    }
+    if (draft_context_rows->version() == draft_context_rows_version) { return; }
+    // The previous upload has to have read the pinned copy before it is rewritten.
+    draft_context_rows_uploaded->synchronize();
+    const std::span<const std::int32_t> slots = draft_context_rows->slots();
+    std::memcpy(draft_context_rows_host->data(), slots.data(), slots.size_bytes());
+    CUDA_CHECK(cudaMemcpyAsync(io.draft_context_rows.data, draft_context_rows_host->data(),
+                               slots.size_bytes(), cudaMemcpyHostToDevice, device.stream));
+    draft_context_rows_uploaded->record(device.stream);
+    draft_context_rows_version = draft_context_rows->version();
 }
 
 void ProgramImpl::copy_tail(SequenceState& sequence, const Tensor& source) {
@@ -485,9 +543,12 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
             mtp_host_ingress->sampling[row].mask           = bind_grammar_mask(masks, row);
+            mtp_host_ingress->sampling[row].relaxed_threshold =
+                round_relaxed_threshold(sequence, request, mtp_host_ingress->sampling[row].mask);
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
                                       std::min(capacity, frontier + extent + draft_window));
         }
+        refresh_draft_context_rows(lanes);
 
         execution::MtpBatchContext schedule_state{{device, parameters, work, state_images->linear(0),
                                                    replay_records ? &*replay_records : nullptr, io,
@@ -551,6 +612,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                 for (std::int32_t i = 0; i < accepted_i; ++i) {
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
+                }
+                if (relaxed_drafting) {
+                    request.speculative_stats.relaxed_kept +=
+                        checked_relaxed_kept(mtp_host_egress->relaxed_kept[row], accepted_i);
                 }
             }
             request.pending = PendingCandidate{
@@ -781,6 +846,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             dflash_host_ingress->state_destination_slots[row] = selectors.destination;
             dflash_host_ingress->sampling[row]                = request.sampling_host;
             dflash_host_ingress->sampling[row].mask           = bind_grammar_mask(masks, row);
+            dflash_host_ingress->sampling[row].relaxed_threshold = round_relaxed_threshold(
+                sequence, request, dflash_host_ingress->sampling[row].mask);
             if (copy_round) {
                 // The copy at the round's [k, B] layout; columns past it hold the anchor, which
                 // verification never reads.
@@ -794,6 +861,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1U,
                                       backend_kv_cache() ? frontier : 0U);
         }
+        refresh_draft_context_rows(lanes);
 
         execution::DFlashBatchContext schedule_state{
             {device, parameters, work, state_images->linear(0), round_replay_records(verify_drafts),
@@ -867,6 +935,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                 request.speculative_stats.rounds += 1;
                 request.speculative_stats.drafted_tokens += extent;
                 request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
+                if (relaxed_drafting) {
+                    request.speculative_stats.relaxed_kept +=
+                        checked_relaxed_kept(dflash_host_egress->relaxed_kept[row], accepted_i);
+                }
                 if (copies_row(row)) {
                     request.speculative_stats.ngram_rounds += 1;
                     request.speculative_stats.ngram_drafted_tokens += extent;

@@ -279,6 +279,80 @@ def test_conversion_stores_gguf_bytes_exactly(tmp_path):
     assert {"ggml_q8_0", "ggml_iq4_nl", "ggml_q2_0", "bf16", "fp32"} <= formats
 
 
+# The GSQ-RCO IQ3_XXS and IQ3_S packs choose a (gate/up, down) pair per layer, downs Q2_0 or IQ4_NL
+# mixed across layers (iq3-pack inventory): three four-layer GGUFs give every one of their pairs,
+# each converted to its record format with the GGUF's bytes unchanged.
+_IQ3_PACK_LAYERS = (
+    ((fixture.IQ3_XXS, fixture.IQ4_NL), (fixture.IQ3_S, fixture.Q2_0),
+     (fixture.IQ2_XS, fixture.IQ4_NL), (fixture.IQ4_XS, fixture.IQ4_NL)),
+    ((fixture.IQ2_XS, fixture.Q2_0), (fixture.IQ2_XXS, fixture.IQ4_NL),
+     (fixture.IQ2_S, fixture.IQ4_NL), (fixture.IQ3_XXS, fixture.Q2_0)),
+    ((fixture.IQ3_S, fixture.IQ4_NL), (fixture.IQ2_S, fixture.Q2_0),
+     (fixture.IQ3_S, fixture.IQ4_NL), (fixture.IQ2_XXS, fixture.Q2_0)),
+)
+_TYPE_NAMES = {
+    fixture.IQ2_XXS: "iq2_xxs", fixture.IQ2_XS: "iq2_xs", fixture.IQ2_S: "iq2_s",
+    fixture.IQ3_XXS: "iq3_xxs", fixture.IQ3_S: "iq3_s", fixture.IQ4_XS: "iq4_xs",
+    fixture.IQ4_NL: "iq4_nl", fixture.Q2_0: "q2_0",
+}
+
+
+@pytest.mark.parametrize("experts", _IQ3_PACK_LAYERS)
+def test_iq3_pack_records_with_mixed_downs(tmp_path, experts):
+    path = fixture.write(tmp_path / "iq3.gguf", experts=experts)
+    out = tmp_path / "iq3.ninfer"
+    with GgufModel(path) as gguf:
+        report = _convert(gguf, out)
+        summary = verify(out, gguf, volume=str(out) + ".ngram")
+    assert summary["records"] == 4
+    banks = {
+        item["parameters"][0]: (item["format"], item["layout"], tuple(item["shape"]))
+        for item in report["methods"]
+        if item["parameters"][0].endswith("/moe/experts")
+    }
+    shape = (fixture.E, fixture.H, fixture.F)
+    assert banks == {
+        f"text/layers/{layer}/moe/experts": (
+            f"ggml_rec_{_TYPE_NAMES[gate_up]}_{_TYPE_NAMES[down]}", "ggml_expert_record_v1", shape
+        )
+        for layer, (gate_up, down) in enumerate(experts)
+    }
+
+
+def test_unregistered_record_pair_is_refused(tmp_path):
+    # IQ4_XS gate/up appears only with IQ4_NL down in the packs: no record holds it with Q2_0.
+    experts = ((fixture.IQ4_XS, fixture.Q2_0),) + fixture.EXPERT_TYPES[1:]
+    path = fixture.write(tmp_path / "t.gguf", experts=experts)
+    message = "layer 0: no expert record format holds ggml_iq4_xs gate/up with ggml_q2_0 down"
+    with GgufModel(path) as gguf, pytest.raises(GgufError, match=message):
+        qwen4_exp.build_model(gguf)
+
+
+def test_iq3_pack_dense_formats_are_copied(tmp_path):
+    # The GSQ-RCO IQ3 packs' dense K-quants, Q5_K output head and IQ3_S token embedding: each is
+    # imported as its own GGML block format, byte for byte (verify).
+    retyped = {
+        "token_embd.weight": (fixture.IQ3_S, (fixture.H, 16), "text/token_embedding", "ggml_iq3_s"),
+        "output.weight": (fixture.Q5_K, (fixture.H, 16), "text/output_head", "ggml_q5_k"),
+        "blk.0.attn_qkv.weight": (fixture.Q4_K, (fixture.H, 128), "text/layers/0/gdn/qkv", "ggml_q4_k"),
+        "blk.1.ffn_gate_shexp.weight": (
+            fixture.Q5_K, (fixture.H, fixture.F), "text/layers/1/moe/shared/gate", "ggml_q5_k"
+        ),
+        "blk.3.attn_q.weight": (
+            fixture.Q4_K, (fixture.H, 128), "text/layers/3/attention/query_gate", "ggml_q4_k"
+        ),
+    }
+    extra = tuple((name, kind, ne) for name, (kind, ne, _, _) in retyped.items())
+    path = fixture.write(tmp_path / "dense.gguf", drop=tuple(retyped), extra=extra)
+    out = tmp_path / "dense.ninfer"
+    with GgufModel(path) as gguf:
+        report = _convert(gguf, out)
+        verify(out, gguf, volume=str(out) + ".ngram")
+    formats = {item["parameters"][0]: item["format"] for item in report["methods"]}
+    for _, _, parameter, name in retyped.values():
+        assert formats[parameter] == name
+
+
 def test_mtp_drafter_is_stored_exactly(tmp_path):
     from tools.artifact.reader import Artifact
 

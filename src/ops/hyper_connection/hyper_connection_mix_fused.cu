@@ -1,8 +1,10 @@
 // Adapted from Infernix a3edb450 src/ops/hyper_connection/hyper_connection_mix_fused.cu
 // (Apache-2.0).
-// Modified for NInfer-3090: BF16 contiguous weights only (Infernix's Q8 codec is dropped), its
-// no-L1-allocate weight load kept local to this file, the norm weight is the stored FP32
-// multiplier (Rn = R * inv * w), and the namespaces and includes are NInfer's. Re-fitted to the
+// Adapted from Basalt 8d73a39 src/kernels/cuda/hc_fused.cu (MIT, third_party/basalt/LICENSE).
+// Modified for NInfer-3090: BF16 contiguous weights (Infernix's Q8 codec is dropped; Basalt's int8
+// copies take its place, below), its no-L1-allocate weight load kept private to the Op
+// (hyper_connection_mix_kernels.cuh), the norm weight is the stored FP32 multiplier
+// (Rn = R * inv * w), and the namespaces and includes are NInfer's. Re-fitted to the
 // RTX 3090's 82 SMs: K1a stages 4 columns per pass (40 KiB) at two CTAs per SM, and K1b spreads a
 // warp's S * rank / 8 W_up chunks over all lanes (5 per lane at rank 320, where Infernix's layout
 // left 24 of 32 lanes idle on the second chunk) at two 512-thread CTAs per SM, so each kernel's
@@ -28,13 +30,21 @@
 // No intermediate is rounded to BF16: Rn, z, m and u stay FP32. Each column is computed
 // independently in a fixed order, so a column's result does not depend on how many columns share
 // the call.
+//
+// --hc-int8 adds Int8Codec, a K1a instance over the int8 down copy: each chunk's eight codes share
+// one binary16 scale and decode exactly to q * s, so the same FP32 fmaf chain runs on the
+// represented weights. The BF16 instances are unchanged; the int8 K1b is in
+// hyper_connection_mix_int8.cu. --hc-fused-read adds a Fold instance of the int8 K1a (the previous
+// block's inject applied as the slice is read; hc_fused_read.cu).
 
 #include "ops/hyper_connection/hyper_connection_mix_fused.h"
 
 #include "ops/common/math.cuh"
+#include "ops/hyper_connection/hyper_connection_mix_kernels.cuh"
 #include "ops/common/memory.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <stdexcept>
 #include <string>
@@ -56,26 +66,6 @@ constexpr int kUpThreads   = kUpFeatures * 32;
 constexpr int kUpMinBlocks = 2; // 160 CTAs in one wave on 82 SMs
 constexpr std::size_t kDownSharedBytes =
     static_cast<std::size_t>(kPassColumns) * kHidden * sizeof(float);
-
-void check_launch(const char* what) {
-    const cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) {
-        throw std::runtime_error(std::string("hyper_connection_mix ") + what + ": " +
-                                 cudaGetErrorString(error));
-    }
-}
-
-// Read-only global load that does not allocate in L1: weights streamed once per call (Infernix's
-// ops/common/memory.cuh ld_nc_na, 16-byte form; sm_70+).
-__device__ __forceinline__ uint4 ld_nc_na_16(const void* ptr) {
-    uint4 value;
-    asm("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
-        : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
-        : "l"(ptr));
-    return value;
-}
-
-__device__ __forceinline__ float sigmoidf(float x) { return 1.0F / (1.0F + expf(-x)); }
 
 __device__ __forceinline__ float warp_sum(float value) {
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -118,11 +108,44 @@ struct Bf16Codec {
     }
 };
 
-template <class Codec>
+// Int8 copies (--hc-int8): rows of `stride` codes and `scale_stride` binary16 scales, one per 32
+// values. A chunk starts at a multiple of 8, so its eight codes share one scale; each decodes to
+// q * s, exact in FP32.
+struct Int8Codec {
+    struct Params {
+        const std::int8_t* codes;
+        const unsigned short* scales;
+        int stride, scale_stride;
+    };
+
+    struct Chunk {
+        uint2 bits;
+        unsigned short scale;
+    };
+
+    __device__ static Chunk load(const Params& p, std::int64_t row, int k) {
+        return {ld_nc_na_8(p.codes + row * p.stride + k),
+                __ldg(p.scales + row * p.scale_stride + k / 32)};
+    }
+
+    __device__ static void decode(const Chunk& c, float (&w)[8]) {
+        const float s  = __half2float(__ushort_as_half(c.scale));
+        const float4 a = i8x4_to_float4(c.bits.x), b = i8x4_to_float4(c.bits.y);
+        w[0] = a.x * s, w[1] = a.y * s, w[2] = a.z * s, w[3] = a.w * s, w[4] = b.x * s,
+        w[5] = b.y * s, w[6] = b.z * s, w[7] = b.w * s;
+    }
+};
+
+// Fold (hc_fused_read): the slice read is R' = bf16(R + g y) with g = fold_inject[t][s] and
+// y = fold_y[t][d], the bits hyper_connection_inject writes (one FP32 fma, rounded once to
+// BF16), and the rest runs on R' unchanged; R is not written here. Without Fold the fold
+// arguments are unused.
+template <class Codec, bool Fold>
 __global__ __launch_bounds__(kDownThreads, 2) void hc_down_partials_kernel(
     const bf16* __restrict__ residual, const float* __restrict__ norm_weight,
     typename Codec::Params down, int rows, int columns, float eps, float* __restrict__ partial,
-    float* __restrict__ inv_out) {
+    float* __restrict__ inv_out, const bf16* __restrict__ fold_y,
+    const float* __restrict__ fold_inject) {
     extern __shared__ __align__(16) float rn[]; // [kPassColumns][kHidden]
     __shared__ float scratch[kDownThreads / 32];
     __shared__ float inv[kPassColumns];
@@ -154,8 +177,20 @@ __global__ __launch_bounds__(kDownThreads, 2) void hc_down_partials_kernel(
                 const uint4 values = load_ldg<uint4>(r + i);
                 const float2 v0 = bf16x2_bits_to_float2(values.x), v1 = bf16x2_bits_to_float2(values.y);
                 const float2 v2 = bf16x2_bits_to_float2(values.z), v3 = bf16x2_bits_to_float2(values.w);
-                const float v[8] = {v0.x, v0.y, v1.x, v1.y, v2.x, v2.y, v3.x, v3.y};
-                float* out       = rn + c * kHidden + i;
+                float v[8] = {v0.x, v0.y, v1.x, v1.y, v2.x, v2.y, v3.x, v3.y};
+                if constexpr (Fold) {
+                    const std::int64_t t = c0 + c;
+                    const uint4 ys       = load_ldg<uint4>(fold_y + t * kHidden + i);
+                    const float g        = fold_inject[t * kStreams + s];
+                    const float2 y0 = bf16x2_bits_to_float2(ys.x), y1 = bf16x2_bits_to_float2(ys.y);
+                    const float2 y2 = bf16x2_bits_to_float2(ys.z), y3 = bf16x2_bits_to_float2(ys.w);
+                    const float y[8] = {y0.x, y0.y, y1.x, y1.y, y2.x, y2.y, y3.x, y3.y};
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        v[j] = __bfloat162float(__float2bfloat16_rn(__fmaf_rn(g, y[j], v[j])));
+                    }
+                }
+                float* out = rn + c * kHidden + i;
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
                     out[j] = v[j];
@@ -348,7 +383,7 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
             Tensor* inject, void* partials, cudaStream_t stream) {
     static const bool configured = [] {
         const cudaError_t error = cudaFuncSetAttribute(
-            hc_down_partials_kernel<Codec>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            hc_down_partials_kernel<Codec, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
             static_cast<int>(kDownSharedBytes));
         if (error != cudaSuccess) {
             throw std::runtime_error(std::string("hyper_connection_mix: shared memory: ") +
@@ -359,15 +394,14 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
     (void)configured;
     const int columns = residual.ne[1];
     auto* partial     = static_cast<float*>(partials);
-    const std::size_t partial_bytes =
-        (static_cast<std::size_t>(streams) * down_rows * columns * sizeof(float) + 255) / 256 * 256;
-    auto* inv = reinterpret_cast<float*>(static_cast<std::byte*>(partials) + partial_bytes);
-    hc_down_partials_kernel<Codec>
+    const std::size_t at = hc_mix_fused_inv_offset(down_rows, streams, columns);
+    auto* inv            = reinterpret_cast<float*>(static_cast<std::byte*>(partials) + at);
+    hc_down_partials_kernel<Codec, false>
         <<<dim3((down_rows + kDownRows - 1) / kDownRows, streams), kDownThreads, kDownSharedBytes,
            stream>>>(static_cast<const bf16*>(residual.data),
                      static_cast<const float*>(norm_weight.data), down, down_rows, columns, eps,
-                     partial, inv);
-    check_launch("down partials");
+                     partial, inv, nullptr, nullptr);
+    check_mix_launch("down partials");
     using UpLaunch = void (*)(const float*, const float*, const bf16*, const float*,
                               typename Codec::Params, int, int, int, float*, bf16*, cudaStream_t);
     // Chunks per lane: ceil(S * rank / 8 / 32), 1..8 for rank 8..512.
@@ -379,7 +413,7 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
                       static_cast<const float*>(norm_weight.data), up, rank, down_rows, columns,
                       inject != nullptr ? static_cast<float*>(inject->data) : nullptr,
                       static_cast<bf16*>(x.data), stream);
-    check_launch("up collapse");
+    check_mix_launch("up collapse");
 }
 
 } // namespace
@@ -396,9 +430,8 @@ bool hc_mix_fused_supported(const Weight& down, const Weight& up, std::int32_t h
 
 std::size_t hc_mix_fused_workspace_bytes(std::int32_t down_rows, std::int32_t streams,
                                          std::int32_t columns) noexcept {
-    const auto align = [](std::size_t bytes) { return (bytes + 255) / 256 * 256; };
-    return align(static_cast<std::size_t>(streams) * down_rows * columns * sizeof(float)) +
-           align(static_cast<std::size_t>(streams) * columns * sizeof(float));
+    return hc_mix_fused_inv_offset(down_rows, streams, columns) +
+           (static_cast<std::size_t>(streams) * columns * sizeof(float) + 255) / 256 * 256;
 }
 
 void hc_mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
@@ -414,6 +447,42 @@ void hc_mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weigh
     }
     launch<Bf16Codec>(residual, norm_weight, bf16_params(down), bf16_params(up), down.n, rank,
                       streams, eps, x, inject, partials, stream);
+}
+
+void hc_mix_down_partials_int8(const Tensor& residual, const Tensor& norm_weight,
+                               const HcInt8Weights& down, std::int32_t streams, float eps,
+                               void* partials, cudaStream_t stream, const void* fold_y,
+                               const float* fold_inject) {
+    const auto configure = [](auto kernel) {
+        const cudaError_t error = cudaFuncSetAttribute(kernel,
+                                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                       static_cast<int>(kDownSharedBytes));
+        if (error != cudaSuccess) {
+            throw std::runtime_error(std::string("hyper_connection_mix: shared memory: ") +
+                                     cudaGetErrorString(error));
+        }
+        return true;
+    };
+    const bool fold = fold_y != nullptr;
+    if (fold) {
+        static const bool configured = configure(hc_down_partials_kernel<Int8Codec, true>);
+        (void)configured;
+    } else {
+        static const bool configured = configure(hc_down_partials_kernel<Int8Codec, false>);
+        (void)configured;
+    }
+    const int columns = residual.ne[1];
+    auto* inv         = reinterpret_cast<float*>(static_cast<std::byte*>(partials) +
+                                                 hc_mix_fused_inv_offset(down.n, streams, columns));
+    const Int8Codec::Params params{down.codes, down.scales, down.k, down.k / kHcInt8Group};
+    auto* kernel = fold ? hc_down_partials_kernel<Int8Codec, true>
+                        : hc_down_partials_kernel<Int8Codec, false>;
+    kernel<<<dim3((down.n + kDownRows - 1) / kDownRows, streams), kDownThreads, kDownSharedBytes,
+             stream>>>(static_cast<const bf16*>(residual.data),
+                       static_cast<const float*>(norm_weight.data), params, down.n, columns, eps,
+                       static_cast<float*>(partials), inv, static_cast<const bf16*>(fold_y),
+                       fold_inject);
+    check_mix_launch(fold ? "int8 down partials (fold)" : "int8 down partials");
 }
 
 } // namespace ninfer::ops::detail

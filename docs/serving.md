@@ -50,6 +50,63 @@ and prefill remain outside speculative acceleration. A later request cannot enab
 omitted at startup. The artifact need only contain the Text backbone and the optional components
 selected for this process.
 
+### Options from a file
+
+`--config FILE` reads serve options from a JSON object whose keys are the flag names without their
+leading dashes, so a setup can be kept in a file and started the same way each time:
+
+```json
+{
+  "max-context": 65536,
+  "kv-capacity": 65536,
+  "kv-dtype": "int8",
+  "spec": "mtp",
+  "draft-tokens": 3,
+  "lm-head-draft": true,
+  "preserve-thinking": true,
+  "cors": false,
+  "allowed-host": ["gpubox.lan"]
+}
+```
+
+```bash
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer --config serve.json --max-context 32768
+```
+
+- A string or a number is the flag's value. `true` is a bare flag (`"lm-head-draft": true` is
+  `--lm-head-draft`) and `false` leaves the option at its default. An array repeats the flag, and
+  only the options that collect their occurrences take one (`graft`, `allowed-host`,
+  `context-store-peer`).
+- The command line wins over the file wherever `--config` stands, and the file over the defaults.
+  A repeatable option given in both keeps the file's entries and adds the command line's.
+- The file is the command line written down: a relative path in it is read against the working
+  directory, as the same word on the command line would be, not against the file's own directory.
+- A key no option has fails at startup with `FILE: unknown key "KEY"`; so do a value an option
+  refuses (`FILE: "port": invalid port: eighty`), a value for a switch, `true` or `false` for an
+  option that takes a value, a nested object and `null`.
+- `api-key` is refused in the file: a secret belongs on the command line or in the launcher's
+  environment, not in a file that is copied and shared. A file cannot name another (`config`), and
+  one `--config` is accepted per command line.
+- The launchers' profiles are such files: `scripts/profiles/` (`profiles/` in a release archive);
+  [launcher profiles](maintainer/launcher-profiles.md) says what each holds.
+- A switch the file turns on can be turned off from the command line only where its `no-` flag
+  exists (`--no-models-autoload` against `"models-autoload": true`). Where none exists, the attempt
+  fails rather than leaving the switch on: `--no-vision` against `"vision": true` stops startup with
+  `FILE: "vision" is set and has no command-line override`. Edit the file, or use another one.
+- In router mode the file's options are part of the command line passed on to every model, so they
+  win over a preset's sections as the command line does, and the router's own options
+  (`models-dir`, `models-max`, ...) may be given in it too.
+
+At startup the server logs where each option came from, the defaults left out:
+
+```text
+INFO  settings | command line: --config, --max-context | serve.json: --allowed-host, --draft-tokens, --kv-capacity, --kv-dtype, --lm-head-draft, --preserve-thinking, --spec
+```
+
+The `server_start` record of `--request-log-jsonl` carries the same as `setting_sources` (each
+option given: `cli`, the file's path, or `default` for a key the file set to `false`) beside
+`effective_argv`, the words the options were parsed from.
+
 ### Qwen3.8-Flash-Next (preview)
 
 The one command:
@@ -70,7 +127,7 @@ model's positions; KV above 32,768 tokens is borrowed from the expert cache). Wh
 the Qwen3.5 models:
 
 - **One request at a time by default; two lanes opt-in** (`--max-concurrency 2`, `NINFER_CONCURRENCY=2` in the launcher). `--max-concurrency` above 2, `--kv-dtype` other than `int8`,
-  `--spec dflash|dflash2`, `--ngram-draft-tokens`, `--graft`, `--auto-host-cache` and the load-time
+  `--spec dflash|dflash2`, `--ngram-draft-tokens`, `--draft-context-rows`, `--graft`, `--auto-host-cache` and the load-time
   weight flags are refused at startup with the flag to change.
 - **Images** (`--vision`, an artifact converted with `--mmproj`; otherwise startup refuses with that
   instruction): OpenAI `image_url` parts (data URIs, local files) and Anthropic image blocks, through
@@ -88,6 +145,8 @@ the Qwen3.5 models:
   ceiling: each round drafts as many tokens as the recent acceptance pays for, mostly two on prose;
   a ceiling of 3 measured best or tied against 2 and against deeper fixed drafts (the
   [plan's PR 13 measurements](maintainer/flash-next-plan.md#pr-13-measurements)), about 1.4x plain decode.
+  [Relaxed drafting](#relaxed-drafting) (`--relaxed-drafting`) applies to its verification rounds
+  as to the Qwen3.5 models' and changes the output distribution the same way.
 - **Prefix reuse** through the same context cache as the other models, with checkpoints in pinned
   host RAM or on local disk ([design](maintainer/flash-next-context-cache.md)). A conversation's next turn
   (or an agent's next tool round) restores the previous turn's state and prefills only the new
@@ -117,12 +176,18 @@ the Qwen3.5 models:
   all). Before anything is pinned, a RAM ledger checks that the experts, every other planned allocation and a reserve for
   Windows (`--ram-headroom-mib`, default 2048) fit in the memory available now; if not, startup
   refuses with the shortfall ("... 2.9 GiB short. Close other programs ..."). Loading takes about
-  two minutes from a SATA SSD, less when the files are in the page cache.
+  two minutes from a SATA SSD, less when the files are in the page cache. With
+  `--partial-ram-residency` RAM holds only the experts the VRAM cache does not (see the table
+  below), so a pack whose experts exceed RAM can still load.
 - **The VRAM expert cache.** Whatever VRAM the dense weights, the KV and the workspace leave, less
   a headroom for the desktop, holds the most-used experts (about 11,000-12,500 of the 24,576). Its
   state is saved beside the model (`<model>.expert-state`) at shutdown and every ten minutes
   between requests, and loaded at the next start, so the second start is warm. A cold cache fills
-  at one promotion per layer per decoded token; decode speeds up as it fills. Each finished
+  at one promotion per layer per decoded token; decode speeds up as it fills. A model release may also ship a
+  default state (`<model>.expert-state.default`) for the first start: it is read only when the
+  saved state is missing or belongs to another artifact, it is never written, and
+  `--no-expert-state` skips it too. No such file ships yet; see [A default expert
+  state](#a-default-expert-state). Each finished
   request logs one line with its expert hit rate, promotions and decode speed.
 - **Prefill.** A prompt of 512 tokens or more prefills in calls of 4,096 tokens (independent of
   `--prefill-chunk`, which sizes shorter prompts and forced tokens). For the prompt, the expert cache
@@ -165,11 +230,31 @@ the Qwen3.5 models:
 | Flash-Next option | Meaning | Default |
 |---|---|---|
 | `--ngram-volume FILE` | the per-layer n-gram embedding volume | `<model>.ngram` |
+| `--ngram-keepalive-ms N` | read one block of the n-gram volume after N ms idle so the drive does not sleep (SSDs sleep after about 100 ms); `0` turns it off; N is at most 60000 because keep-alive reads run only during the minute after a request; changes timing only | `40` (was a fixed 100) |
 | `--expert-state FILE` | where the expert cache's state is saved and read | `<model>.expert-state` |
 | `--no-expert-state` | start the expert cache empty and save nothing | off |
+| `--default-expert-state FILE` | a default expert state for a fresh install, read only when the saved state does not load (missing, from another copy of the model, damaged, or of another expert count) and never written; it is matched by artifact id, so it fits every copy of the model; absent file: nothing changes; `--no-expert-state` does not read it either | `<model>.expert-state.default` |
 | `--vram-headroom-mib N` | VRAM the expert cache leaves free for the desktop and other programs | 512 with a display, 256 without |
 | `--ram-headroom-mib N` | host RAM left free for Windows once every expert is pinned; startup refuses when it cannot be kept | `2048` |
+| `--partial-ram-residency` | keep in host RAM only the routed experts the VRAM expert cache does not hold, plus 16 spare slots per layer, instead of pinning all 24,576: at startup the hottest experts (by the saved expert state, else an equal share of every layer) are read from the model file straight into VRAM and live only there, and every other expert gets a pinned RAM slot. A promoted expert keeps its RAM copy; an expert that lives only in VRAM is copied back into a RAM slot before its VRAM frame is reused. The output is designed to stay bit for bit unchanged. The cost: the expert cache keeps its startup size (it no longer shrinks when the desktop needs VRAM, so the default `--vram-headroom-mib` with a display is 1 GiB instead of 512 MiB), the whole KV of `--max-context` is mapped at startup (fewer frames for short prompts), prompts prefill through static calls without the expert stream (long prompts are slower), and the cache admits experts one victim at a time even when a round could admit every miss (an expert held only in VRAM leaves only when its layer has a RAM slot for it). Designed to work with two lanes, MTP, `--hot-embedding-rows`, `--cpu-verify-misses` and `--prefill-cpu-share` (the CPU computes only experts that are not in VRAM, and each of those has a RAM copy). Refused with `--vision`. RAM needed for the experts, estimated from the packs' expert sizes with about 15 GiB of VRAM frames (not measured): the IQ2_XS pack about 20 GiB (33 GiB whole), the IQ3_XXS pack about 30 GiB (40 GiB), the IQ3_S pack about 37 GiB (46.8 GiB); the context cache, the n-gram row cache and `--ram-headroom-mib` come on top. So the IQ3_XXS pack and probably the IQ3_S pack fit a 64 GB Linux machine, and the IQ2_XS pack a 32 GB one with the context cache shrunk. On Windows, when everything pinned exceeds half the RAM less 8 GiB (24 GiB on 64 GB, 8 GiB on 32 GB), startup prints a warning naming the `--vram-headroom-mib` or `--expert-cache-mib` that would stay under it: Basalt reports WDDM capping page-lock registration (`cudaHostRegister`) there, but NInfer pins with `cudaHostAlloc`, which may still succeed (full mode pins about 35 GiB on a 64 GB Windows machine). If the pin fails, startup stops with an error naming `--vram-headroom-mib` and `--partial-ram-residency`. Startup also refuses when the expert cache comes out smaller than planned. Not yet checked or measured on a GPU | off (every expert pinned) |
 | `--expert-cache-mib N` | cap the expert cache (measurement) | what fits |
+| `--shared-expert-stream` | run each MoE block's shared expert on a second CUDA stream beside the routed experts (high priority in eager calls only; CUDA graph replays ignore stream priority). Designed to leave the output bit for bit unchanged and to work with two lanes, MTP and vision; neither the identity nor the speed has been checked on a GPU yet | off |
+| `--mtp-constrained` | keep MTP speculation on for constrained requests (JSON schema, grammar, tool calls): the verification accepts each draft under the grammar mask of its own position, as the Qwen3.5 models do, so greedy requests are designed to get the ids plain constrained decoding gives and sampled ones the same masked distribution. That holds for requests that finish: when the grammar reaches a dead end, the request fails with `constraint_failed` as without the flag, but the round that finds it commits none of its tokens, so the output streamed before the error can be shorter. Needs `--spec mtp` (refused otherwise). Works with two lanes (a constrained request speculates while it decodes alone, like any request) and with vision. Not yet checked or measured on a GPU | off (constrained requests decode without MTP) |
+| `--mtp-joint-acceptance` | choose how many MTP drafts a round verifies by Basalt's joint-acceptance rule instead of the acceptance estimate: each round drafts `--draft-tokens` (fewer near the request's end) and the drafter also returns each draft's probability; the round verifies the longest prefix whose estimated chance of being accepted whole stays above a threshold that adapts per request, and always at least the first draft. Only what is proposed changes, so the output is designed to stay what MTP gives without it. Needs `--spec mtp` (refused otherwise). Works with two lanes (while a request decodes alone, like any MTP round), vision and `--mtp-constrained` (the grammar masks cover the verified drafts). Every round pays for the full draft chain. Not yet checked or measured on a GPU | off (the acceptance estimate picks the draft count before drafting) |
+| `--ngram-prefetch` | read the anchor column's n-gram rows into the volume's host cache while the MTP draft graph runs, so verification's row read finds them cached instead of waiting on the drive; the drafts' own rows are unknown until drafting ends and are read as before. Only when the host reads them moves, so the output is unchanged. The prefetch reads go through the volume's cache, so they count in its row and hit counters: with the option on, the volume's hit rate is inflated by the prefetch. Needs `--spec mtp` (refused otherwise); works with two lanes, vision, `--mtp-constrained` and `--mtp-joint-acceptance`. A round whose rows are already cached gains nothing. Not yet measured on a GPU | off (verification reads every row) |
+| `--hot-embedding-rows N` | keep only the token embedding's first N rows (the lowest ids, which the tokenizer gives the most frequent tokens) in VRAM, as Basalt does with 8192: the whole table (322 MiB) moves to pinned RAM, the GPU reads the other rows from it over PCIe, and the VRAM saved goes to the expert cache (at 8192, 311 MiB, about 220 more experts). Designed to give the same embedding values, bit for bit, and to work with two lanes, MTP (the drafter takes the same route) and vision. Startup refuses N above the vocabulary (248,320), and any N with a token embedding that is not IQ4_XS (the GSQ-RCO IQ3_XXS pack's is IQ3_S). Not yet checked or measured on a GPU | `0` (the whole table in VRAM) |
+| `--gdn-head-map` | read each GatedDeltaNet layer's 16 key heads for its 48 value heads in place, through the GGUF's tiled head map (value head h reads key head h mod 16), instead of first copying them to one key head per value head (216 copy nodes a decode token); MTP's GDN replay records then hold 16 key heads instead of 48. The same values reach the same arithmetic, so the output is designed to stay bit for bit unchanged; works with two lanes, MTP and vision. Not yet checked or measured on a GPU | off (the copies) |
+| `--moe-gate-up-registers` | compute the routed experts' gate/up rows in a grid that stays resident on the GPU, each warp loading one gate and one up row straight into registers instead of staging 16 rows per thread block in shared memory, with the last sub-blocks of the two rows split across the warp's halves (Basalt's gate/up kernel). The same arithmetic in the same order, so the output is designed to stay bit for bit unchanged. Needs `--moe-precast-input` (refused without it); works with two lanes, MTP and vision. Not yet checked or measured on a GPU | off (rows staged in shared memory) |
+| `--moe-precast-input` | cast each routed-expert call's input to A8 once (into the call's workspace, about 2.8 KiB a column) instead of in each of the 40 gate/up thread blocks per expert that read it. The same codes, so the output is designed to stay bit for bit unchanged; works with two lanes, MTP (the drafter's and the verification's calls too) and vision. The wide route of a prefill call casts its own copy as before. Not yet checked or measured on a GPU | off (each block casts its columns) |
+| `--moe-fused-route` | route and dispatch the routed experts of each call of at most 8 columns (decode steps, MTP drafting and verification) in one kernel launch instead of two (one thread block picks each column's top 10 of 512 experts with the same code as before, then groups the entries by expert), with each expert's columns in ascending order rather than the order atomics happen to give. The same routing and the same arithmetic, so the output is designed to stay bit for bit unchanged; wider calls (prefill chunks) take the two launches as before. Works with two lanes, MTP and vision. Not yet checked or measured on a GPU | off (two launches) |
+| `--cpu-verify-misses` | in each MTP verification round, compute some of every layer's routed experts that are not in the VRAM cache on the CPU instead of reading them over PCIe: per layer up to 4 of them, the ones with the fewest columns, with a third of the misses left on the GPU, computed by a team of CPU threads while the GPU runs the other experts and the shared expert. The CPU's arithmetic is the GPU's bit for bit, so the output is designed to stay unchanged. Plain decode and prefill are unchanged (a CPU leg cannot win at one column). Needs `--spec mtp` (refused otherwise); works with two lanes (while a request decodes alone, like any MTP round) and vision. The GPU waits for the CPU by spinning on a host flag inside the round; on Windows with a display attached a long wait could trip the driver's 2 s watchdog (TDR). A CPU that stops answering for 1 s ends the request with an error (nothing from that round is committed); later requests use the CPU again unless the CPU service itself has failed, in which case MTP is off for the rest of the run. The CPU threads spin while decoding, and after an idle gap the first answer can be late by the operating system's sleep granularity (on Windows up to about 15 ms). Not yet checked or measured on a GPU | off (misses are read over PCIe) |
+| `--prefill-cpu-share F` | in prefill (and forced-token) calls, compute the share F of every layer's routed experts that are not in the VRAM cache on the CPU while the GPU copies the rest over PCIe and runs them: of a layer's n such experts, F × n rounded (halves up), the ones routed the fewest tokens first and none routed more than 8, on the same CPU threads as `--cpu-verify-misses` (`--cpu-verify-workers`). This reaches every prompt: one under 512 tokens (or the tail of one) is staged per call after routing, and one of 512 or more (a 1K-4K prompt is one 4,096-token call) copies its experts to the GPU ahead of time, so it leaves out the share F of each layer's experts that the cache has seen used least, and the CPU computes every one of those the prompt routes to at most 8 tokens (the GPU copies the others during the call). F is a decimal in [0, 1] with at most two places (Basalt uses 0.6); more places are refused rather than rounded; 0 is off. The CPU's arithmetic is the GPU's bit for bit, so the output is designed to stay unchanged. Needs no MTP; works with two lanes and vision, and beside `--cpu-verify-misses` (one CPU service serves both). Its channel pins about 40 MiB of RAM; with `--partial-ram-residency` (no streamed calls, every prompt goes through static calls) it is sized for `--prefill-chunk` columns instead of at least 4,096, so it pins less. The GPU waits for the CPU by spinning on a host flag inside each layer; on Windows with a display attached a long wait could trip the driver's 2 s watchdog (TDR). A CPU that stops answering for 1 s ends the request with an error; if the CPU service itself has failed, prefill stays on the GPU for the rest of the run. Calls wider than 4,096 tokens (`--prefill-chunk` above 4096) stay on the GPU. Not yet checked or measured on a GPU | `0` (off) |
+| `--cpu-verify-workers N` | the CPU threads of `--cpu-verify-misses` and `--prefill-cpu-share`, the service thread included (1..64; needs one of them). PR 11 measured one expert alone (GPU idle) at 119 / 98 / 146 µs on 6 threads and 67 / 70 / 84 µs on 16 (IQ2_S / IQ2_XXS / IQ1_M); not measured inside a round | `6` |
+| `--gdn-async-commit` | fold each MTP verification's accepted columns into the GDN recurrent state (the commit) on a CUDA stream of its own instead of the main one, so it runs beside the drafter's catch-up, the next round's drafts and the host's work between rounds; the next round's forward, and anything else that reads or writes the state (a prefill, a two-lane round, a context-cache capture or restore, the end of a request), waits for it first. A commit that ends the request folds on the main stream before the round is reported. The same fold in the same order, so the state is designed to stay bit for bit unchanged. Needs `--spec mtp` (refused otherwise); works with two lanes (while a request decodes alone, like any MTP round) and vision. No memory. Not yet checked or measured on a GPU | off (the commit folds on the main stream) |
+| `--hc-int8` | read the hyper-connection mixers' weights (the 97 mixers that combine the residual streams before each block and at the end, 100 with the MTP drafter) from int8 copies with one scale per 32 weights instead of BF16: about 0.53 times the bytes each mixer reads per decode step, where the mixers are the largest single cost (about 2.8 ms of a ~12.5 ms token, from PR 6's per-call measurement of the BF16 mixer). Every mixer call of up to 16 columns reads the copies: decode steps, MTP drafts and verification, and prefill calls that short (the tail of a prompt, for example); calls of more than 16 columns keep reading the BF16 weights, unchanged bit for bit. The copies are made at startup from the BF16 weights, which stay loaded, so it takes about 0.68 GB more VRAM (that much less expert cache). **Changes the numerics**: each weight is rounded to its int8 step, so the output is not bit for bit the same; activations stay in FP32. Judge it with the decode-path KLD gate (`--hc-int8` in the forward harness's `--kld-base` mode, [flash-next-plan.md](maintainer/flash-next-plan.md#decode-path-kld-gate)) before relying on it. Works with two lanes, MTP and vision. Not yet checked or measured on a GPU | off (BF16 weights) |
+| `--hc-fused-read` | with `--hc-int8`: read each MoE block's input in one fused step on decode steps, MTP drafts and verification (up to 16 columns per call): the attention block's injection into the residual is applied as the int8 mixer reads it, and the router logits, the top-10 routing, the dispatch of the routed experts and the A8 cast the routed experts read are written by one kernel after the mixer's two. That is three launches per block instead of six (five with `--moe-fused-route`, one more with `--moe-precast-input`), and one pass fewer over the residual. The mixer kernels themselves are unchanged: a single persistent mixer kernel was measured slower on the RTX 3090 (PR 11). The same output as `--hc-int8` alone, bit for bit (dispatched experts in ascending entry order, as with `--moe-fused-route`); prefill is unchanged. With `--shared-expert-stream` the shared expert starts once the mixer's output is written. The shared expert's own input cast is not shared. Refused without `--hc-int8`. Works with two lanes, MTP and vision. Not yet checked or measured on a GPU | off |
+| `--ngram-flag-wait` | run each decode round of a request decoding alone (and each MTP verification) as one CUDA graph instead of two. Today the layers before the first n-gram (PLE) layer run as one graph while the CPU reads the round's n-gram rows from the volume, then the CPU uploads them and launches the rest as a second graph. With this flag the whole round is launched at once: a one-thread kernel before the PLE layer waits on the GPU until the CPU has read the rows into pinned memory and set a flag, then the graph copies them in and runs the rest. The same kernels on the same data, so the output is designed to stay bit for bit unchanged. The first plain round and the first verification of each width on each lane, once per server run, still run as before (they set the kernels up). Two-lane rounds (two requests decoding together), `--no-cuda-graph` and `CUDA_LAUNCH_BLOCKING=1` keep the two parts (with launches serialized, as also under compute-sanitizer, a round waiting for the CPU would always time out: do not combine this flag with compute-sanitizer). The GPU waits by spinning on a host flag inside the round; on Windows with a display attached a long wait could trip the driver's 2 s watchdog (TDR). If the CPU does not set the flag within 1 s the request ends with an error (nothing from that round is committed). PR 11 measured +1.2% for the two-graph split this replaces; the one-graph form is not yet checked or measured on a GPU | off (two graphs around the row read) |
+| `--ggml-decode-mma` | run the dense GGML layers (attention and GDN projections, the shared expert) of every call of at most 8 columns (decode steps, MTP drafts and verification, two-lane rounds) on the int8 tensor cores: 16 weight rows by 8 columns per `mma.sync` instruction, the weights streamed through shared memory with `cp.async` (IQ3_S decoded from shared memory), instead of the dp4a GEMV. The same A8 cast of the activations and the same exact integer products, but the scale terms are summed in a different fixed order, so the output changes slightly (FP32 rounding only; a column still does not depend on the batch width). The shared-expert gate/up and the attention key/value pairs run as two projections instead of one paired launch. Prefill, the output head and the routed experts are unchanged. Covers every dense format of the packs (IQ4_XS, IQ3_S, Q6_K, Q5_K, Q4_K, IQ4_NL, Q8_0, Q2_0). Every GGML projection it moves must be 16-byte aligned: startup refuses a misaligned artifact, naming the flag. The hyper-connection mixers, FP8 and NVFP4 GDN layers and NVFP4 SwiGLU refuse the policy outright. Designed to work with two lanes, MTP, vision (the vision tower runs its own code, which the option does not touch) and `--partial-ram-residency` (it touches only the dense layers). Not yet checked or measured on a GPU | off (dp4a) |
 | `--max-concurrency 1\|2` | requests that decode in the same rounds (two lanes: see below) | 1 |
 
 Two lanes (`set NINFER_CONCURRENCY=2`, opt-in): a second request no longer waits for the first. Two requests
@@ -178,6 +263,32 @@ prefill calls run between the other lane's decode rounds, so it pauses for up to
 4,096-token call). On the spike's eight-conversation agent burst it finished 6.5% sooner and cut the mean time to
 first token by 19%, which is less than the 1.15x aggregate decode the design aimed for
 ([measurements](maintainer/flash-next-plan.md#pr-16-two-lanes)). One lane stays the default; three or more are refused.
+
+### A default expert state
+
+The saved state (`<model>.expert-state`) is tied to the copy of the model that wrote it (its path,
+size and modification time), so a fresh install, or a re-downloaded model, starts with an empty
+cache. A default state is tied to the artifact id instead, which every copy of one conversion
+shares, so it can ship with the model and warm the first start. The server loads files in this
+order: the saved state, when it loads (it exists, belongs to this copy of the model, is intact and
+has this model's expert count); else, whatever kept the saved state from loading, the default
+(`<model>.expert-state.default`, or `--default-expert-state FILE`), when it exists and its artifact id
+matches; else it starts empty. The default is only ever read: the server saves to the saved state
+beside it, which takes over from the next start. A default of another model, another expert count
+or a damaged one is skipped with a line in the log. `--no-expert-state` starts empty and does not
+read the default. No default ships with any model yet, so nothing changes until one is present.
+
+To make one for a release, run a representative session so the saved state fills, stop the server,
+and rewrite the saved state with the artifact's identity (the tool is built with the apps, in
+`build/tools/`):
+
+```
+ninfer-qwen4-exp-expert-state-export <model>.expert-state <model>.expert-state.default <model>.ninfer
+```
+
+It reads the artifact id from the model and refuses a saved state written for another copy; pass
+`--artifact-id <32 hex digits>` in place of the model path to skip that check. Not yet measured on a
+GPU: how much a default warms the first start.
 
 ### Vision residency
 
@@ -217,7 +328,9 @@ and the JSON record carries `vision_overlay`, including `exclusive_windows` and 
 |---|---|
 | `GET /health` | process health and build version (see [Server version](#server-version)) |
 | `GET /v1/load` | serving capacity, current load, and monotonic token counters (see [Load](#load)) |
+| `GET /slots` | each execution lane's state and progress, in llama.cpp's array shape (see [Slots](#slots)) |
 | `GET /metrics` | Prometheus counters, gauges and latency histograms, plus llama.cpp-compatible series (see [Metrics](#metrics)) |
+| `GET /dashboard` | a live dashboard page for a browser, drawn from `/metrics`, `/v1/load` and `/slots` (see [Dashboard](#dashboard)) |
 | `GET /v1/models` | configured OpenAI model alias, effective context limit (`max_model_len`/`context_window`/`context_length`) and input modalities (see [Model discovery](#model-discovery)) |
 | `GET /v1/models/{id}` | lookup of the same model object by its alias |
 | `GET /props` | read-only llama.cpp-style server properties (see [Model discovery](#model-discovery)) |
@@ -284,7 +397,8 @@ for the default thinking mode (thinking unless `--no-thinking`) under the proces
 requests otherwise draw a fresh random seed. `model_alias` is the public model id and `model_path`
 the artifact path the server was started with. `build_info` is `ninfer <version>` (see
 [Server version](#server-version)). There is no `chat_template` or
-writable `POST /props`, and `/slots` and llama.cpp's non-`/v1` route aliases are not served.
+writable `POST /props`, and llama.cpp's non-`/v1` route aliases are not served. `GET /slots`
+follows llama.cpp's array shape (see [Slots](#slots)).
 
 ### Server version
 
@@ -305,7 +419,8 @@ release must be built after `VERSION` is set.
 The server binds its port and starts accepting connections before the Engine has loaded weights
 and finished warmup, so a port clash is reported in milliseconds rather than after loading. Every
 route -- including `/health`, `OPTIONS`, and requests that would otherwise be unauthenticated --
-answers `503` with `Retry-After: 2` until warmup completes, in the target's own error shape:
+answers `503` with `Retry-After: 2` until warmup completes, in the target's own error shape (only
+the static [dashboard](#dashboard) page is served meanwhile, and it shows the `503` its polls get):
 
 ```json
 {"error":{"message":"The model is still loading. Retry shortly.","type":"service_unavailable","code":"model_loading"}}
@@ -361,7 +476,10 @@ curl http://127.0.0.1:8080/v1/load -H 'Authorization: Bearer local-secret'
                "max_context": 65536, "kv_capacity_tokens": 131072, "kv_capacity_pages": 2048,
                "kv_page_tokens": 64, "device_state_slots": 8, "host_context_bytes": 17179869184},
   "requests": {"admitted": 6, "running": 4, "prefilling": 1, "decode_ready": 3, "waiting": 2,
-               "paused": 0, "replaying": 0, "materializing": 0, "prefill_backlog_seconds": 14.2},
+               "paused": 0, "replaying": 0, "materializing": 0, "prefill_backlog_seconds": 14.2,
+               "queue": [{"id": 311, "prompt_tokens": 18240, "waited_s": 4.1},
+                         {"id": 312, "prompt_tokens": 96, "waited_s": 0.3}],
+               "queue_total": 2},
   "occupancy": {"device_main_kv_pages": 1500, "device_main_kv_tokens": 96000,
                 "device_state_slots": 5, "host_context_bytes": 2684354560,
                 "host_state_slots": 7, "host_kv_bytes": 2147483648},
@@ -391,6 +509,14 @@ curl http://127.0.0.1:8080/v1/load -H 'Authorization: Bearer local-secret'
   plus what each queued request costs from scratch (a cache hit makes it cheaper). It leaves out decode
   and paused requests and is 0 when idle, so a gateway choosing between servers can prefer the smaller
   backlog; it is a prediction from the machine's fitted costs, not a promise.
+- `requests.queue` lists the waiting requests, oldest first: the Engine request `id` (the
+  [structured request log](#structured-request-log)'s `engine_request_id`), its `prompt_tokens`
+  and the seconds since it was submitted (`waited_s`). It lists at most the first 64;
+  `queue_total` counts them all and equals `waiting`. Paused requests are not in it. Oldest first
+  is arrival order, not necessarily the order they start: the bypass allowance and
+  `--admission-affinity` can admit a later waiter ahead of older ones.
+  `tools/bench/serve_soak.py` assumes arrival order when it takes queued time off its stall clock,
+  so with overtaking it may credit the wrong requests (its header explains how).
 - `capacity.host_context_bytes` is the one pinned Host budget (see
   [Automatic host cache](#automatic-host-cache)). `occupancy` reports current Main KV pages (and
   tokens), Device StateImage slots, and the Host context bytes in use, including destinations
@@ -412,6 +538,86 @@ curl http://127.0.0.1:8080/v1/load -H 'Authorization: Bearer local-secret'
   gaps. A healthy Engine stays in milliseconds; an Engine that stalls for seconds right after every
   first token reports whole seconds even for a short answer while `/health` stays 200, so a
   supervisor can restart on, say, `inter_token_seconds > 0.25` for several consecutive polls.
+
+### Slots
+
+`GET /slots` shows what each execution lane is doing, for clients that probe a llama.cpp server's
+`/slots` and for watching a long prefill. Like `/v1/load` it requires the API key when one is
+configured, answers `503 model_loading` until warmup completes, and reads only the snapshot the
+Engine already publishes at every prefill step and decode round, so polling it never waits on the
+GPU executor. The body follows llama.cpp's shape, a top-level array with one object per slot
+carrying llama.cpp's `id`, `is_processing` and `n_ctx`, and adds NInfer's progress and
+speculative-decoding fields:
+
+```json
+[{"id": 0, "is_processing": true, "state": "prefill", "request_id": 7, "n_ctx": 65536,
+  "prompt_tokens": 4096, "prompt_done": 3072, "reused": 2048, "generated": 0, "n_ctx_used": 3072,
+  "tokens_per_second": 0.0, "drafted": 0, "accepted": 0, "relaxed_kept": 0},
+ {"id": 1, "is_processing": true, "state": "decoding", "request_id": 5, "n_ctx": 65536,
+  "prompt_tokens": 100, "prompt_done": 100, "reused": 0, "generated": 41, "n_ctx_used": 141,
+  "tokens_per_second": 62.5, "drafted": 48, "accepted": 30, "relaxed_kept": 2}]
+```
+
+- There is one entry per execution lane (`--max-concurrency`). `id` is the lane, and `n_ctx` is
+  `--max-context`, the context any one request may use. `request_id` is the Engine request id that
+  the [structured request log](#structured-request-log) records as `engine_request_id`, or `null`
+  on an idle lane, whose counts are all 0.
+- `state` is `idle`, `prefill` (the lane is prefilling its prompt, or rebuilding a paused request's
+  state) or `decoding` (the prompt is done and the lane is producing tokens); `is_processing` is
+  `state != "idle"`. A lane being paused reports the phase it was in: the rebuild it interrupted,
+  or else the phase it resumes in.
+- `prompt_tokens` is the request's prompt. `prompt_done` is how much of it the lane holds so far,
+  `reused` (the prefix taken from the context cache) included, so `prompt_done / prompt_tokens` is
+  the prefill progress and the two are equal once prefill is done. `generated` counts committed
+  output tokens, the first included, and `n_ctx_used` is `prompt_done + generated`. While a lane
+  rebuilds a paused request's state, `prompt_done` and `n_ctx_used` stay where they were: the
+  replayed tokens are counted separately (`replayed_tokens` in the request log).
+- `tokens_per_second` is the lane's tokens after the first over the time since the first, so it
+  includes any pause; it is 0 until the second token.
+- `drafted`, `accepted` and `relaxed_kept` are the request's speculative-decoding counts so far:
+  draft tokens offered, drafts accepted, and the accepted drafts that
+  [relaxed drafting](#relaxed-drafting) kept (a subset of `accepted`). All are 0 without a draft
+  source.
+- Requests waiting for a lane are not slots: `/v1/load` lists them under `requests.queue`.
+- The snapshot can trail the poll by up to one prefill step or decode round, so a long decode round
+  or prefill chunk shows as a pause in the counts.
+
+### Dashboard
+
+Open `http://127.0.0.1:8080/dashboard` (your `--host` and `--port`) in a browser for a live view of
+the server. It is one page built into `ninfer-serve`, with nothing fetched from elsewhere, so it
+works offline. Once a second while its tab is visible (it stops polling when the tab is hidden) it
+reads `/metrics`, `/v1/load` and `/slots` from the same server and shows:
+
+- the current decode and prefill tokens/s, and charts of both over the last two minutes, from
+  `ninfer_decode_tokens_total` and `ninfer_prefill_tokens_total` (prefix-cache hits excluded);
+- draft acceptance: a chart of each second's accepted / drafted tokens, and the figure since startup
+  (`off` without a draft source);
+- running and waiting requests, and the share of the Main KV pool in use (retained prefixes
+  included, as in `/v1/load`'s `occupancy`);
+- GPU power (with a chart), utilization, VRAM in use by every process on the card, and core
+  temperature, from the `ninfer_gpu_*` gauges (`-` when NVML gives no reading);
+- one row per lane from `/slots`: its state, request, prompt progress with the reused prefix,
+  generated tokens, context use against `--max-context`, tokens/s and accepted drafts; and below
+  them the requests waiting for a lane, from `/v1/load`'s `requests.queue`.
+
+The history lives in the page, so a reload starts the charts empty. Rates are differences between
+two polls of the counters, and the counters advance at prefill steps and decode rounds, so a second
+can read high or low next to its neighbours.
+
+**The key.** The page itself is served without `--api-key`, since it holds no data, but everything
+it polls needs the key. If the server has one, the page says so: type the key into the field at the
+top and press Enter or **Use key**. The page sends it as `Authorization: Bearer` on its own
+requests and keeps it in the tab's session storage, so it survives a reload of that tab but not
+closing it; **Forget** clears it. The key never appears in the URL. On a server without a key the
+[Host check](#host-and-origin-checks) applies to the page like every route, so open it by a name
+the server answers to (or an address); its requests go to its own origin, so they pass the Origin
+check.
+
+The page is served with a `Content-Security-Policy` that lets it run only its own inline script and
+style and connect only to its own origin, forbids framing it, and with
+`X-Content-Type-Options: nosniff`. Under the [router](#several-models-router) the router serves the
+page itself, and what it polls answers for the model that last served.
 
 ### Context store
 
@@ -769,19 +975,20 @@ max-context = 8192
 `[*]` holds defaults for every model; any other section is a model (`model` or `artifact` is its
 path, `alias` a comma-separated list, `load-on-startup` a boolean, every other key a serve option
 without its leading dashes). A section named after a model found in `--models-dir` needs no path.
-The command line wins over a preset where they repeat an option. Comments sit on lines of their own
-(`;` or `#` first). The router's own options (`models-max`, `models-autoload`, `sleep-idle-seconds`,
+The command line (a `--config` file included) wins over a preset where they repeat an option.
+Comments sit on lines of their own (`;` or `#` first). The router's own options (`models-max`, `models-autoload`, `sleep-idle-seconds`,
 `unload-idle-seconds`) are command-line only, as are the options the router overrides for every
-model (`api-key`, `host`, `port`, `model-id`): a preset that sets one is rejected at startup. A model
-id may not contain `/`, `?`, `#`, `%` or `\`. With
+model (`api-key`, `allowed-host`, `host`, `port`, `model-id`): a preset that sets one is rejected
+at startup. A model id may not contain `/`, `?`, `#`, `%` or `\`. With
 `--context-store DIR` each model keeps its store in `DIR/<model id>` (and under `<prefix><model id>/`
 in S3; characters other than letters, digits, `-` and `_` are written as `%XX`). `--request-log-jsonl`
 may not name any model's artifact, n-gram volume or expert state, whether it comes from the command
 line or a model's own section; models that name the same file append to one shared log, one record
 at a time. The router accepts a request body up to the largest `--max-request-mib` of any model, and
 that model's own server then applies its limit.
-`--ngram-volume` and `--expert-state` may not give the same file to two models, and one model's
-n-gram volume, expert state and artifact must be three different files.
+`--ngram-volume`, `--expert-state` and `--default-expert-state` may not give the same file to two
+models, and one model's n-gram volume, expert state, default expert state and artifact must be
+different files.
 
 `--models-max N` (default 1, 0 for no limit) bounds how many models are loaded at once. To make room
 the least recently used model without a request in flight **sleeps** when it was started with
@@ -802,11 +1009,13 @@ The router answers llama.cpp's model API itself:
 | `GET /models/sse` | a stream of `{"model", "status"}` events |
 | `POST /v1/models/{id}/suspend`, `/resume`, `GET /v1/models/{id}/residency` | the [model suspend](#model-suspend) endpoints of one model |
 
-`GET /health` is 200 while the router runs. `GET /props`, `/metrics` and `/v1/load` answer for the
-model that last served, without waking or loading it (a 503 while it is unloaded). Everything
-else (chat completions, Responses, Messages and the rest) is forwarded to the model it names: each model runs the ordinary
-single-model server on a loopback port of its own, so every endpoint, request log and metric works
-per model unchanged. The router checks `--api-key` and applies `--cors`; models need neither.
+`GET /health` is 200 while the router runs. `GET /props`, `/metrics`, `/v1/load` and `/slots`
+answer for the model that last served, without waking or loading it (a 503 while it is unloaded).
+The router serves `GET /dashboard` itself, and the page reads those status endpoints.
+Everything else (chat completions, Responses, Messages and the rest) is forwarded to the model it
+names: each model runs the ordinary single-model server on a loopback port of its own, so every
+endpoint, request log and metric works per model unchanged. The router checks `--api-key`, runs the
+[Host and Origin checks](#host-and-origin-checks) and applies `--cors`; models need none of them.
 Streamed responses stream, and a client that disconnects cancels the generation, also while the
 model is still loading or working on the prompt. The router rewrites only the `"model"` member of a
 body it forwards (to the model's id), so every other value reaches the model as you wrote it.
@@ -867,9 +1076,11 @@ server restarts.
 | `ninfer_decode_rounds_total`, `ninfer_decode_row_rounds_total` | decode batch executions and the sum of their batch sizes |
 | `ninfer_spec_decode_{rounds,draft_tokens,accepted_tokens,fallback_steps}_total` | live native speculative work, including MTP and DFlash/DFlash2 |
 | `ninfer_spec_decode_ngram_{rounds,draft_tokens,accepted_tokens}_total` | the n-gram copy rounds among them (`--ngram-draft-tokens`); zero when it is off |
+| `ninfer_spec_decode_relaxed_kept_tokens_total` | accepted drafts that [relaxed drafting](#relaxed-drafting) kept and exact verification would have rejected, a subset of the accepted tokens; zero when it is off |
 | `ninfer_root_selections_total`, `ninfer_checkpoint_selections_total` | admissions by the context-cache source they started from: root is a miss (full prefill), checkpoint a reuse. Hit rate is `checkpoint / (root + checkpoint)` |
 | `ninfer_{preemptions,snapshot_restores,replay_restores}_total` | resource-pressure pauses and recovery routes |
 | `ninfer_admission_fit_deferrals_total` | fresh requests queued by `--admission-fit-check` because their whole prompt could not fit in the KV pool beside the resident requests; zero when the flag is off |
+| `ninfer_admission_overtakes_total` | fresh requests `--admission-affinity` admitted ahead of older waiters because they resume a prefix held on the GPU; zero when the flag is off |
 | `ninfer_waiting_cancelled_requests_total`, `ninfer_waiting_expired_requests_total`, `ninfer_waiting_abandoned_seconds_total` | requests the client cancelled, or the pending timeout expired, before admission, and the total time they had waited (a client that gives up after 60 s shows up here) |
 | `ninfer_cancelled_prefills_total`, `ninfer_cancelled_prefill_computed_tokens_total` | requests cancelled while prefilling, and the prompt tokens they had computed |
 | `ninfer_paced_prefill_steps_total`, `ninfer_paced_prefill_deferred_tokens_total` | prefill steps cut short by `--prefill-stall-budget-ms` because another lane was decoding, and the prompt tokens they pushed to later steps |
@@ -899,7 +1110,8 @@ server restarts.
 | `ninfer_request_duration_seconds`, `ninfer_request_queue_seconds` | histograms for settled generation outcomes, including cancellation; exceptional failures have separate counts |
 | `ninfer_gpu_utilization_percent`, `ninfer_gpu_memory_utilization_percent` | gauges: share of NVML's last sample period in which any kernel ran, and in which device memory was read or written. Measured on the first device (`--device`, or the first of `--devices`) |
 | `ninfer_gpu_memory_used_bytes`, `ninfer_gpu_memory_total_bytes` | gauges: device memory in use by every process on the card (not only this server), and installed |
-| `ninfer_gpu_temperature_celsius`, `ninfer_gpu_power_watts` | gauges: GPU core temperature and board power draw. All six `ninfer_gpu_*` series are omitted, not reported as 0, when NVML or the device cannot be opened (no driver library, a container without it); a single reading NVML cannot give is omitted on its own |
+| `ninfer_gpu_temperature_celsius`, `ninfer_gpu_power_watts` | gauges: GPU core temperature and board power draw |
+| `ninfer_gpu_power_limit_watts` | gauge: the board power limit the driver enforces now, after every limiter (`nvidia-smi -pl` included). A capped card is slower, so read throughput against it. All seven `ninfer_gpu_*` gauges are omitted, not reported as 0, when NVML or the device cannot be opened (no driver library, a container without it); a single reading NVML cannot give is omitted on its own |
 | `ninfer_gpu_energy_joules_total` | counter: board energy used since the server attached to the GPU, from NVML's lifetime energy counter. The rate over any window is the mean power over it (`rate(ninfer_gpu_energy_joules_total[5m])` is watts), which the instantaneous `ninfer_gpu_power_watts` cannot give. It starts at 0 at attachment, not at driver load, and keeps counting through an NVML counter reset. Omitted, like the other `ninfer_gpu_*` series, when NVML cannot supply it (older drivers, a card without an energy counter) |
 | `ninfer_context_store_images`, `ninfer_context_store_used_bytes` | gauges: sessions and bytes held by the [context store](#context-store) (zero when it is off) |
 | `ninfer_context_store_writes_total`, `_write_failures_total`, `_dropped_total` | sessions written, writes that failed, sessions not queued because the write queue was full |
@@ -965,6 +1177,8 @@ The endpoint supports:
   [default output limit](#default-output-limit);
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
 - the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
+- the NInfer `relaxed_drafting` extension (a number in `[0,1]`, `true` for 0.5, `false` for
+  exact), which CHANGES THE OUTPUT DISTRIBUTION; see [Relaxed drafting](#relaxed-drafting);
 - up to four non-empty stop strings, applied to both reasoning and answer output;
 - the `ignore_eos` benchmarking extension shared with vLLM, SGLang and llama.cpp: a boolean,
   default `false`, that drops the checkpoint's own stop tokens so generation runs to the output
@@ -1545,6 +1759,7 @@ wire response contains typed `output` Items.
 | `preserve_thinking` | alias for `chat_template_kwargs.preserve_thinking`; conflicting values are rejected |
 | `graft` | NInfer extension: name of a [prompt graft](#prompt-grafts), or `null`; also accepted by input token count |
 | `thinking_budget` | NInfer extension: positive per-request [thinking cap](#openai-chat-completions), or `null`; rejected by input token count, which does not generate |
+| `relaxed_drafting` | NInfer extension: this request's [relaxed drafting](#relaxed-drafting) threshold, a number in `[0,1]`, `true` (0.5), `false` (exact) or `null` (the server default); CHANGES THE OUTPUT DISTRIBUTION |
 | `text.format` | `text` (default), `json_object`, or `json_schema`; see [Output constraints](#output-constraints) |
 | `tools` | direct function and free-form `custom` definitions, or namespace groups containing them; see below |
 | `tool_choice` | `auto`, `none`, `required`, a named function or `custom` tool, or `allowed_tools` of function and custom entries with mode `auto`/`required`; namespaced selection carries both `namespace` and `name` |
@@ -1842,7 +2057,8 @@ enabled.
 [default output limit](#default-output-limit); a positive
 value is the complete output budget. `max_tokens:0` is rejected because NInfer does not expose a
 completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, and
-`stop_sequences` enter Engine execution. A matched custom stop is returned as
+`stop_sequences` enter Engine execution, as does the NInfer `relaxed_drafting` extension
+([Relaxed drafting](#relaxed-drafting), which changes the output distribution). A matched custom stop is returned as
 `stop_reason:"stop_sequence"` together with the actual `stop_sequence`; context exhaustion returns
 `model_context_window_exceeded`.
 
@@ -1963,8 +2179,9 @@ matched by requests using the same graft.
 ## Authentication and CORS
 
 Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or Anthropic
-`x-api-key` header. `GET /health` and CORS preflight requests remain unauthenticated; `GET /v1/load`
-and `GET /metrics` require the key.
+`x-api-key` header. `GET /health`, the [dashboard](#dashboard) page (`GET /dashboard`, which holds
+no data and sends the key on its own requests) and CORS preflight requests remain unauthenticated;
+`GET /v1/load`, `GET /slots` and `GET /metrics` require the key.
 
 ```bash
 curl http://127.0.0.1:8080/v1/models \
@@ -1972,6 +2189,96 @@ curl http://127.0.0.1:8080/v1/models \
 ```
 
 `--cors` adds permissive browser CORS headers. It is disabled by default.
+
+The key is compared in constant time, so response times say nothing about how much of a guess was
+right.
+
+### Host and Origin checks
+
+These checks run before every route, `GET /health` and the loading `503` included. They stop a web
+page in a browser on this machine (or on the LAN) from using a server that has no key behind your
+back. A server started with `--api-key` needs none of them: a page cannot send the key, so the
+key alone decides access.
+
+- **Host**, only when the server has no `--api-key`. A request whose `Host` header names something
+  the server does not answer to is refused. This is what defeats DNS rebinding, where an
+  attacker's domain is made to resolve to `127.0.0.1`. Accepted:
+  - `localhost`, `127.0.0.1` and `[::1]`;
+  - the `--host` address or name, unless it is a wildcard (`0.0.0.0`, `::`);
+  - when it is a wildcard, the names other machines and containers use for this one: the machine's
+    host name, its first label plus `.local` (mDNS, for example `gpubox.local`), its fully
+    qualified DNS name, and `host.docker.internal` (a container reaching the host);
+  - each `--allowed-host NAME` (repeatable; the launchers pass `NINFER_ALLOWED_HOST`);
+  - any IPv4 or bracketed IPv6 address, such as `192.168.1.5:8080` from another machine on the
+    LAN, because a rebinding attack needs a name.
+
+  Names are matched in any case and with or without a trailing dot. The port is not compared, so
+  SSH tunnels and port forwards keep working. A request with no `Host` header at all (HTTP/1.0
+  tools) is accepted.
+- **Origin**, only when the server has no `--api-key` and no `--cors`. A browser request from
+  another site carries that site's `Origin`, and is refused unless the origin is the server's own.
+  Clients that are not browser pages (`curl`, the OpenAI and Anthropic SDKs, a chat UI's
+  server-side backend) send no `Origin` and are not affected. Accepted:
+  - `http://name:port` or `https://name:port` with a name from the list above on the server's
+    port (80 and 443 when the origin names no port);
+  - an origin whose host and port are exactly those of the request's (accepted) `Host` header:
+    the page came from the address or proxy name the request reached, such as
+    `http://192.168.1.5:8080` for a request to `192.168.1.5:8080`;
+  - an origin of any scheme other than `http` and `https`: browser extensions
+    (`chrome-extension://`, `moz-extension://`) and app shells (`app://`, `tauri://`,
+    `vscode-webview://`). A browser gives these only to installed code, so no web page can send
+    one.
+
+  Refused: an `http(s)` origin of another site or another port, and `Origin: null` (sent by
+  `file://` pages and sandboxed frames). Give such a client a key, or start the server with
+  `--cors`.
+- **Sec-Fetch-Site**, under the same condition. A request a browser marks `cross-site` (a link,
+  an image or a `no-cors` fetch from another site, some of which carry no `Origin`) is refused,
+  so a page elsewhere cannot make the router load, wake or evict a model. `same-origin`,
+  `same-site`, `none` (an address typed by the user) and no header at all pass. `same-site` means
+  a page on another port or subdomain of the same site (`http://localhost:3000` calling
+  `http://localhost:8080`): a request it sends with an `Origin` is still refused by the Origin
+  check, but a `GET` with no `Origin` (a link or an image) passes. Such a request reaches only
+  `GET` routes and its response stays with the browser, so the risk is small; set `--api-key` to
+  close it.
+
+A refused request gets `403` in the error shape of the endpoint it called: the Anthropic shape (type
+`permission_error`) under `/v1/messages`, and the OpenAI shape (code `host_not_allowed`,
+`origin_not_allowed` or `cross_site_request`) everywhere else.
+
+```json
+{"error": {"message": "Host 'evil.example:8080' is not a name this server answers to; ...",
+           "type": "invalid_request_error", "param": null, "code": "host_not_allowed"}}
+```
+
+The router runs these checks on its public address and drops `Host`, `Origin` and every
+`Sec-Fetch-*` header (with the credentials) from the requests it relays to its models. Each
+model's own server listens on loopback with no key, no `--cors` and no `--allowed-host`, whatever
+the command line gives the router, so a browser page
+cannot reach it directly around the router's key.
+
+**Serving on a LAN.** Bind a wildcard or the LAN address, and give it a key:
+
+```bash
+ninfer-serve model.ninfer --host 0.0.0.0 --api-key "$(openssl rand -hex 24)"
+```
+
+Clients reach it at `http://<lan-ip>:8080`, `http://<machine-name>:8080`,
+`http://<machine-name>.local:8080`, the machine's fully qualified name, or (from a container)
+`http://host.docker.internal:8080`. With `--api-key` any other name works too (a DNS alias, a
+mesh-VPN name, a Docker Compose service name). A server without a key accepts another name only
+when it is listed: `--allowed-host gpubox.lan`, or `NINFER_ALLOWED_HOST=gpubox.lan` for the
+launchers (several names comma- or space-separated). The value is a host name or an address, with
+no scheme, port, path or wildcard; anything else is refused at startup. Without `--api-key`, a
+server listening beyond loopback logs a warning at startup: anyone who can reach the address can
+use the model.
+
+**Behind a reverse proxy.** Caddy and nginx (with `proxy_set_header Host $host`, which most
+configurations use) pass on the Host the client used, so a keyless server needs each public name
+in `--allowed-host`. A web UI served from the proxy's own origin (`https://name`) then passes the
+Origin check, because its origin equals the Host the request reached (on a proxy port other than
+443, pass the port on too: nginx's `$http_host` keeps it, `$host` drops it). A UI on any other
+origin needs `--api-key` (the UI sends the key) or `--cors`.
 
 ## Server options
 
@@ -1982,6 +2289,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--host H` | listen address | `127.0.0.1` |
 | `--port N` | listen port | `8080` |
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
+| `--allowed-host NAME` | one more name the [Host check](#host-and-origin-checks) of a server without `--api-key` accepts; a host name or address without a scheme, port or wildcard; repeatable | none |
 | `--model-id ID` | override the public OpenAI model alias | artifact `metadata.name`, or architecture name |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
@@ -1989,6 +2297,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-concurrency N` | resident execution lanes; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--admission-fit-check` | queue a fresh request whose whole prompt cannot fit in the KV pool beside the resident requests, instead of starting it, pausing it when the pool fills and recomputing its history; always admits when nothing is resident (counted by `ninfer_admission_fit_deferrals_total`) | off |
+| `--admission-affinity` | when a lane is free, let a waiting request whose prompt resumes a prefix already held on the GPU (a cached checkpoint it may take over, or one its own session left, with no copy from Host memory) start ahead of older waiters (counted by `ninfer_admission_overtakes_total`); each waiter can be passed this way at most four times, separately from the ordinary bypass allowance. Only the eight waiters behind the head are considered. Qwen3.5 and Flash-Next; no effect with `--no-prefix-reuse`. Not run on a GPU yet | off |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
 | `--progress-anchor-tokens N` | during a long prefill, keep a private checkpoint every N tokens (a multiple of `--prefill-chunk`; needs prefix reuse; each request keeps its newest four) so a paused request that loses its snapshot replays from the nearest checkpoint instead of from the start. Each checkpoint costs one State image; Qwen3.5-family models only | `0` (off) |
@@ -2007,11 +2316,13 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|nvfp4\|k8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant and `rk4v4` opt-in Lloyd-Max 4-bit keys; all seven are accepted on this fork's sm_86/sm_89 targets | `bf16` |
-| `--ngram-volume`, `--expert-state`, `--no-expert-state`, `--vram-headroom-mib`, `--ram-headroom-mib`, `--expert-cache-mib` | Qwen3.8-Flash-Next only; see [Qwen3.8-Flash-Next](#qwen38-flash-next-preview) | see there |
+| `--ngram-volume`, `--expert-state`, `--no-expert-state`, `--default-expert-state`, `--vram-headroom-mib`, `--ram-headroom-mib`, `--expert-cache-mib`, `--shared-expert-stream`, `--mtp-constrained`, `--mtp-joint-acceptance`, `--ngram-prefetch`, `--hot-embedding-rows`, `--gdn-head-map`, `--moe-precast-input`, `--moe-gate-up-registers`, `--moe-fused-route`, `--cpu-verify-misses`, `--prefill-cpu-share`, `--cpu-verify-workers`, `--gdn-async-commit`, `--hc-int8`, `--hc-fused-read`, `--ngram-flag-wait`, `--partial-ram-residency`, `--ggml-decode-mma` | Qwen3.8-Flash-Next only; see [Qwen3.8-Flash-Next](#qwen38-flash-next-preview) | see there |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--lm-head-draft` | optimized proposal head; implied by `--spec`, accepted for compatibility | on with `--spec` |
 | `--ngram-draft-tokens 0\|15` | n-gram copy drafting beside `--spec dflash2`: when the text being written already appeared in the request (the prompt, a tool result -- including `cat -n` numbered ones -- or the output so far), a round verifies up to 15 copied tokens instead of the draft model's proposal; verification licenses every token, so a wrong copy costs speed, never output. Copies run when a round holds one or two requests (at two only for copies of 12 or more tokens, and only while the other request, whose row pays the copy width too, has the balance for it: about 3% of its round time if it never copies); see [the CLI guide](cli.md#n-gram-copy-drafting) | `0` (off) |
+| `--relaxed-drafting [P]` | [relaxed drafting](#relaxed-drafting), opt-in and it CHANGES THE OUTPUT DISTRIBUTION: under sampling, keep a draft the model gives probability `P` or more (`0..1`; `0.5` without a value) even where exact speculative sampling would draw another token. The default `P` of requests that do not set `relaxed_drafting`; `0` leaves requests exact unless they ask. Needs `--spec` (refused otherwise) | off (exact; requests asking for it are refused) |
+| `--draft-context-rows N` | [draft-head context rows](#draft-head-context-rows): up to `N` (`0..2048`) ids the requests' prompts and outputs hold that the reduced draft head lacks are scored from the full output head and may be drafted; drafts only, so output is unchanged. Needs `--spec`; refused on Qwen3.8-Flash-Next | `0` (off) |
 | `--ngram-min-match N` | tokens the end of the text must match before a copy is proposed, `4..64` | `12` |
 | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
@@ -2123,7 +2434,7 @@ they do not infer request behavior from process-global counter deltas.
 
 | Event | Contents |
 |---|---|
-| `server_start` | build version, artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, unified Host context capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
+| `server_start` | build version, artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, unified Host context capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, redacted `argv`, `effective_argv` (a `--config` file's words, then the command line's) and `setting_sources` (each option given: `cli`, the config path, or `default`) |
 | `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, preemption/recovery counters, thinking-budget application counters, model thinking tokens, reasoning-loop guard firing, unrounded request-stage seconds, per-request Engine Host exposure, complete speculative-decoding counters, and `lossy_prefill` when the request took or considered the lossy path (the key is absent otherwise) |
@@ -2226,7 +2537,8 @@ using transfer-event time and bytes. GPU intervals overlap Host submission and w
 separate evidence, not additional wall-time stages. Background reclamation remains Engine-wide.
 
 `result.generated_token_ids` records committed output token IDs for exact prefix analysis.
-The JSONL file never records an API-key value; `argv` replaces it with `<redacted>`.
+The JSONL file never records an API-key value; `argv` and `effective_argv` replace it with
+`<redacted>`.
 Operational stderr summaries are rounded and are not the
 aggregation source. OpenAI Responses, OpenAI Chat, and Anthropic generation requests receive a
 request ID when they enter synchronous preparation. Successful preparation produces
@@ -2284,12 +2596,14 @@ capacity returns HTTP 429 with code `server_overloaded`. The absolute
 waiting, and returns HTTP 503 with code `request_queue_timeout` if admission does not occur in time.
 Once admitted, a request may pause for resource pressure without restarting this initial-admission
 deadline. Fresh requests enter in FIFO order with a bounded bypass allowance when an earlier request
-cannot fit. There is no admission ETA or unbounded overflow queue. A fresh request never preempts a
-resident one, so when every lane is busy a queued request waits out the generations ahead of it, and
-the deadline has to be scaled to the longest response the deployment allows rather than to a
-connection timeout: at C1 on an RTX 3090 a single 6,500-token response occupies the engine for about
-106 seconds. The 600,000 ms default admits a queued caller behind roughly ten such responses; lower
-it only to fail fast on purpose.
+cannot fit. With `--admission-affinity`, a request that resumes a prefix still held on the GPU may
+also start ahead of an older request that could have started, at most four times per older request.
+There is no admission ETA or unbounded overflow queue. A fresh request never preempts a resident
+one, so when every lane is busy a queued request waits out the generations ahead of it, and the
+deadline has to be scaled to the longest response the deployment allows rather than to a connection
+timeout: at C1 on an RTX 3090 a single 6,500-token response occupies the engine for about 106
+seconds. The 600,000 ms default admits a queued caller behind roughly ten such responses; lower it
+only to fail fast on purpose.
 
 Each worker cycle runs the permitted control and decode work and then one prefill or replay chunk.
 Prefill chunks rotate among resident requests, so a short prompt that already holds a lane is not
@@ -2432,6 +2746,70 @@ responses. NInfer does not execute tools or enforce tool-argument schemas throug
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.
+
+### Relaxed drafting
+
+`--relaxed-drafting [P]` (off by default) and the request key `relaxed_drafting` give up exact
+speculative sampling for speed. **They change the output distribution.** With them off, speculative
+decoding (MTP, DFlash, DFlash2, n-gram copies, and Qwen3.8-Flash-Next MTP) keeps a draft only as
+the exact rejection rule allows, so the output has the model's own sampling distribution. With a
+threshold `P`, a sampled request also keeps a draft whenever the target gives it probability `P` or
+more under the request's final distribution (after the penalties, any token mask, `top_k`, `min_p`,
+`top_p` and `temperature`), even where exact sampling would have drawn another token. At such a
+row the output is the draft every time instead of a draw: that row is deterministic (the draft,
+which need not be the top token when `P < 0.5`), its total-variation distance from the model's
+distribution is `1 - p(draft)`, and every other row is unchanged. The
+logits are unchanged, so a teacher-forced perplexity or KLD check cannot see this change.
+
+What stays exact:
+
+- greedy requests (`temperature: 0` or `--greedy`): nothing is drawn;
+- constrained requests (`response_format` JSON or schema, `structured_outputs`, a required or named
+  `tool_choice`): their grammar rows are never relaxed;
+- every token inside a tool call (from `<tool_call>` to `</tool_call>`), so a tool's name and
+  arguments are sampled exactly: a request whose committed text ends inside an open call is not
+  relaxed, and no position at or after a drafted control token, think or tool tag (the tokenizer's
+  added tokens) in a round is relaxed;
+- `logit_bias`: nonzero values are refused on Chat Completions, so no biased request reaches it.
+
+The server option sets the default threshold and turns the relaxed acceptance kernels on; with it
+off (the default) only the exact kernels run and a request with `relaxed_drafting` above 0 fails
+with 400 `relaxed_drafting_not_enabled`.
+A request overrides the default with a number in `[0,1]`, `true` (0.5) or `false` (exact); other
+values fail with 400 `invalid_relaxed_drafting`. `--relaxed-drafting 0` keeps requests exact unless
+they ask. The startup refuses the option without `--spec`, and with a tokenizer whose added tokens
+are not one contiguous id range or whose tool tags are not single added tokens.
+`ninfer_spec_decode_relaxed_kept_tokens_total` counts the drafts it kept.
+
+Basalt, which introduced the rule, measured on its own engine and model (an RTX 5090; the numbers
+are context, not NInfer measurements, and nothing here has been measured on an RTX 3090): at
+`P = 0.5` about +3 to +7% tokens per window for a total-variation cost of 0.02 to 0.04 per token,
+at `P = 0.3` +6 to +12% for 0.04 to 0.07, at `P = 0.2` +7 to +15% for 0.05 to 0.09, roughly +1.5%
+per 0.01 of total variation at every threshold; decode speed +3 to +20% at temperature 0.6 and 1.0;
+no measurable loss on gsm8k and MMLU-Pro at 300 and 280 items, and tool calls with declared names
+only. The cost is diversity, which those tasks do not measure.
+
+### Draft-head context rows
+
+The Qwen3.8-27B and Qwen3.6-35B-A3B drafters (MTP, DFlash and DFlash2 with the optimized proposal
+head that `--spec` loads) score only the head's 131,072 most frequent tokens, so a name or
+identifier outside them can never be drafted, however often the request repeats it.
+`--draft-context-rows N` (off by default; `N` up to 2048) keeps up to `N` token ids that the running
+requests' prompts and committed outputs hold and the proposal head lacks, one set shared by every
+lane, and scores them from the full output head beside the proposal head: MTP and DFlash take the
+best of both, DFlash2's sixteen candidates may include them. Ids are noted as they enter a request
+(its prompt at admission, its output tokens as they are committed, sampled or greedy) and leave with
+the request; an id the proposal head already scores is never noted. Once `N` slots are taken, a new
+id is dropped rather than queued: it takes a slot only when a request writes it again after one has
+freed. **Drafts only**: verification decides every token, so the
+output is unchanged (greedy and exact sampling alike); only acceptance, and the time the extra rows
+take, change.
+
+The rows are read from a Q8, Q6 or Q4 row-split output head (the stored head, `--lm-head-q6` or
+`--lm-head-q4`); startup refuses the option with another head format, without `--spec`, and on
+Qwen3.8-Flash-Next, which drafts with its full output head already. No RTX 3090 measurement has been
+made yet: the gain to expect is bounded by the acceptance a full-vocabulary draft head would add
+(see [performance](performance.md)).
 
 ### Lossy long-prompt prefill (experimental)
 

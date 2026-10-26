@@ -294,8 +294,10 @@ version:
   the 0.04 allowance, plus the fact that output demonstrably changes at C8.
 
 **Why perplexity is silent on it, and what to use instead.** The route is admitted only in the
-verify phase, and `CausalScoring` runs the prefill phase, so scoring never reaches it -- the flag is
-accepted by `ninfer-perplexity` and changes nothing there.
+verify phase, and `--corpus`/`--text` scoring runs the prefill phase, so it never reaches it -- the
+flag is accepted there and changes nothing. `--kld-base` scores through the decode path and runs
+the verify forward at `--decode-window T`, so it reaches the route once T is wide enough for it
+(see [`docs/perplexity.md`](../perplexity.md)); no such measurement has been made yet.
 
 That phase guard is load-bearing, and the first cut of this did not have it. Width alone is not
 enough: `causal_score` sends its remainder through prefill unchanged, so a 1,041-token input scores
@@ -408,3 +410,45 @@ What the rows say:
   UD-Q4_K_XL (17.56 GB, 0.0156) is still clearly better than anything NInfer's formats reach; the
   closest, `ladder4-attn-kv`, needs 17.96 GB for 0.0168.
 - **All-Q4 is not an option**: 0.0457 and +3.31% perplexity for 1.4 GB.
+
+## Tried and rejected: two-stage output head (Basalt X-B)
+
+**The idea.** Basalt (8d73a39, `src/kernels/cuda/head_proxy.cuh`) scores its draft head from a
+2-bit copy and rescores only a short list. Applied to the 27B's Text head on decode and
+verification rounds, it would read about 0.4 GB of copy instead of the 1.27 GB Q8 head, plus the
+rows rescored exactly. Sampling would stay exact as long as every row the sampler reads (at most its
+top 20, `kSamplerCandidateCap`) is rescored.
+
+**A fixed margin cannot be proven.** The first version rescored every row whose 2-bit score was
+within a fixed 4-logit margin of a bound on the 64th best. On a synthetic Gaussian head
+(8192 x 1024, scores with a standard deviation of 3), the copy's error reached 4.878 logits, over
+the margin on 10 of 65,536 scores. Any fixed margin can miss a top row, which breaks greedy identity.
+
+**The provable bound selects everything.** The second version stored a residual norm per
+32-weight group. That gave each row a rigorous interval for the dense head's BF16 value, covering:
+- Cauchy-Schwarz per group for the weight residual;
+- the int8 cast's half step;
+- the FP32 and BF16 rounding of both routes.
+
+A row was rescored when its upper bound reached a lower bound on the 64th best. On four synthetic
+heads (4096 x 1024: Gaussian, hot rows above a Gaussian bulk, outlier activation channels,
+heavy-tailed weights), the interval always held. It also selected **100% of rows**: the bounds
+were 40-287 logits wide, while the largest real error was 12-18% of its bound. The copy would have
+cost 455 MiB of VRAM plus a proxy pass, for no work saved.
+
+**Dense bits needed the dense kernels.** For the rescored rows to carry the dense head's exact bits,
+the exact stage had to be the dense head's own route over a gathered row list:
+- a row-gathering row policy;
+- a scattering output;
+- a `skip_cta` hook in the Q8 sliced-K and MMA kernels;
+- one shared route table.
+
+That limited the head to the [248320, 5120] shape. None of this was run on a GPU.
+
+**Worth revisiting only if** a bound much tighter than per-group norms can be proven, or if the
+real 27B's columns turn out to separate far more than these heads. The second case would need a
+measured rescored-row count well under the vocabulary, with greedy identity checked by an Engine
+harness built on that branch, option off against on: the `ninfer` CLI does not parse the branch's
+head option, so `tools/bench/greedy_identity.py` cannot drive it. The code (codec, kernels, companion object,
+gathered route, tests) is on the branch `basalt-two-stage-head-attempt` on origin, at commit
+`5a834731`.

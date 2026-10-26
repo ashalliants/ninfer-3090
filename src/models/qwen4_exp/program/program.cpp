@@ -28,10 +28,13 @@
 
 #include "models/qwen4_exp/program/program.h"
 
+#include "artifact/reader.h"
+
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
+#include "core/host_flag_wait.h"
 #include "core/host_gather.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
@@ -43,6 +46,7 @@
 #include "core/tensor.h"
 #include "core/vmm_arena.h"
 #include "core/vram_budget.h"
+#include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/program/vision_control.h"
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/execution/parameters.h"
@@ -51,8 +55,13 @@
 #include "models/qwen4_exp/model.h"
 #include "models/qwen4_exp/program/checkpoint_image.h"
 #include "models/qwen4_exp/program/context_cache.h"
+#include "models/qwen4_exp/program/constrained_window.h"
+#include "models/qwen4_exp/program/cpu_error_word.h"
+#include "models/qwen4_exp/program/draft_policy.h"
 #include "models/qwen4_exp/program/expert_cache/expert_state.h"
 #include "models/qwen4_exp/program/expert_residency.h"
+#include "models/qwen4_exp/program/fold_stream.h"
+#include "models/qwen4_exp/program/ngram_rows.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/nvme_tier.h"
 #include "models/qwen4_exp/program/rope_positions.h"
@@ -60,23 +69,28 @@
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/cast.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ninfer/ops/ple.h"
 #include "ninfer/ops/qsa.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ops/common/relaxed_accept.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <exception>
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -149,11 +163,12 @@ struct ContractAccess {
         out.constraint_failed_[0] = constraint_failed;
         return out;
     }
-    // A verification round's batch: the row licenses `count` tokens of `tokens` (stride wide).
+    // A verification round's batch: the row licenses `count` tokens of `tokens` (stride wide), or
+    // fails when they run into a grammar dead end.
     static PendingBatch make_speculative(const void* owner, std::uint64_t transaction, SequenceHandle row,
                                          std::span<const TokenId> tokens, std::int32_t count, std::uint32_t stride,
-                                         runtime::ExecutionTiming timing) {
-        PendingBatch out = make_pending(owner, transaction, row, tokens, timing, false);
+                                         runtime::ExecutionTiming timing, bool constraint_failed) {
+        PendingBatch out = make_pending(owner, transaction, row, tokens, timing, constraint_failed);
         out.counts_[0]   = count;
         out.stride_      = stride;
         out.speculative_ = true;
@@ -198,6 +213,23 @@ inline std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); 
 inline std::size_t align(std::size_t v, std::size_t a = 256) { return (v + a - 1) / a * a; }
 
 double seconds(std::uint64_t ns) { return static_cast<double>(ns) * 1e-9; }
+
+// --gdn-async-commit: folds run on fold streams in this process (Program::process_async_gdn_folds).
+std::atomic<std::uint64_t> g_async_gdn_folds{0};
+// --ngram-flag-wait: plain rounds and verifications run as one graph waiting for their rows
+// (Program::process_ngram_flag_rounds / process_ngram_flag_verifications).
+std::atomic<std::uint64_t> g_ngram_flag_rounds{0};
+std::atomic<std::uint64_t> g_ngram_flag_verifications{0};
+static_assert(kWaitFlagTimeoutNs == ops::offloaded_moe::kHeartbeatTimeoutNs,
+              "the n-gram flag wait times out like the CPU-miss wait");
+
+// CUDA_LAUNCH_BLOCKING=1 (which compute-sanitizer's serialization resembles): a launch returns only
+// once its work is done, so a round graph whose flag the host raises after the launch would always
+// time out.
+bool launch_blocking() noexcept {
+    const char* value = std::getenv("CUDA_LAUNCH_BLOCKING");
+    return value != nullptr && std::string_view(value) == "1";
+}
 
 // The KV pool's chunk: the VMM allocation granularity of the RTX 3090 (2 MiB).
 constexpr std::size_t kKvChunkBytes = 2ULL << 20;
@@ -258,6 +290,7 @@ ops::SamplingConfig translate(const ResolvedSamplingParameters& s) {
     out.presence_penalty  = s.presence_penalty;
     out.frequency_penalty = s.frequency_penalty;
     out.seed              = s.seed;
+    out.relaxed_threshold = s.relaxed_drafting;
     return out;
 }
 
@@ -389,19 +422,22 @@ struct SpecLayout {
     // each lane's verification (`slot`: a word per lane holding the lane's index).
     std::size_t saved_stride = 0;
     // Round words (I32): the drafts, verification targets, licensed tokens, then one word each.
+    // w_relaxed: the relaxed drafting count of a round that ran the relaxed instance.
     std::size_t w_drafts = 0, w_target = 0, w_licensed = 0, w_counts = 0, w_accepted = 0, w_extents = 0,
-                w_lengths = 0, w_anchors = 0, w_commit = 0, w_mtp_ids = 0, w_count = 0;
+                w_lengths = 0, w_anchors = 0, w_commit = 0, w_mtp_ids = 0, w_relaxed = 0, w_count = 0;
 
     static SpecLayout plan(const TextConfig& c, std::int32_t drafts, std::size_t tail_bytes, std::size_t conv_bytes,
-                           std::size_t lanes) {
+                           std::size_t lanes, const ProgramOptions& o) {
         SpecLayout out;
         out.drafts = drafts;
         out.width  = drafts + 1;
         const std::size_t W = static_cast<std::size_t>(out.width), w = c.residual_width();
         const std::size_t di = c.qsa.index_head_dim;
         LayoutBuilder builder;
-        out.gdn = plan_gdn_replay_records(builder, records_spec(c, out.width));
-        out.gdn_bytes = align(out.gdn.payload_bytes());
+        out.gdn = plan_gdn_replay_records(builder, gdn_records_spec(c, out.width, o.gdn_head_map));
+        // The records' share of the plan (what ninfer_qwen4_exp_program_plan_test checks); `drafts` is
+        // o.mtp_draft_tokens.
+        out.gdn_bytes = plan_gdn_record_bytes(o, c);
         std::size_t at = out.gdn_bytes;
         const auto take = [&](std::size_t bytes) {
             const std::size_t here = at;
@@ -432,21 +468,11 @@ struct SpecLayout {
         out.w_anchors  = out.w_lengths + 1;
         out.w_commit   = out.w_anchors + 1;
         out.w_mtp_ids  = out.w_commit + 1;
-        out.w_count    = out.w_mtp_ids + W;
+        out.w_relaxed  = out.w_mtp_ids + W;
+        out.w_count    = out.w_relaxed + 1;
         out.words      = take(4 * out.w_count);
         out.bytes      = at;
         return out;
-    }
-
-    static GdnReplayRecordSpec records_spec(const TextConfig& c, std::int32_t width) {
-        return {.layers          = static_cast<std::int32_t>(c.gdn_layers),
-                .record_capacity = 1,
-                .width           = width,
-                .conv_channels   = static_cast<std::int32_t>(c.gdn.conv_channels()),
-                .qk_heads        = static_cast<std::int32_t>(c.gdn.value_heads), // tiled: one per value head
-                .value_heads     = static_cast<std::int32_t>(c.gdn.value_heads),
-                .key_dim         = static_cast<std::int32_t>(c.gdn.key_head_dim),
-                .value_dim       = static_cast<std::int32_t>(c.gdn.value_head_dim)};
     }
 };
 
@@ -498,6 +524,46 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     if (o.mtp_draft_tokens > 7) {
         throw std::invalid_argument("Qwen3.8-Flash-Next verifies at most 7 MTP drafts per round: use --draft-tokens 1..7");
     }
+    if (o.mtp_joint_acceptance && o.mtp_fixed_drafts) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: --mtp-joint-acceptance chooses how many drafts each round "
+                                    "verifies and --mtp-fixed always verifies --draft-tokens: use one of them");
+    }
+    if (o.cpu_verify_misses && o.mtp_draft_tokens == 0) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: --cpu-verify-misses computes MTP verification rounds' misses "
+                                    "on the CPU and needs --spec mtp: add --spec mtp or remove --cpu-verify-misses");
+    }
+    if (o.cpu_verify_workers < 1 || o.cpu_verify_workers > 64) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: --cpu-verify-workers must be in [1, 64]");
+    }
+    if (o.prefill_cpu_share_den < 1 || o.prefill_cpu_share_den > 32767 ||
+        o.prefill_cpu_share_num > o.prefill_cpu_share_den) {
+        throw std::invalid_argument(
+            "Qwen3.8-Flash-Next: --prefill-cpu-share must be a fraction in [0, 1] (denominator 1..32767)");
+    }
+    if (o.gdn_async_commit && o.mtp_draft_tokens == 0) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: --gdn-async-commit folds MTP verification commits on a side "
+                                    "stream and needs --spec mtp: add --spec mtp or remove --gdn-async-commit");
+    }
+    // Refused here too, not only by the serve parser and Qwen4ExpInstance: a Program built without
+    // them would otherwise throw at its first MoE call, possibly inside a graph capture.
+    if (o.moe_gate_up_registers && !o.moe_precast_input) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: --moe-gate-up-registers reads the input that "
+                                    "--moe-precast-input casts once per call: add --moe-precast-input or remove "
+                                    "--moe-gate-up-registers");
+    }
+    if (o.hc_fused_read && !o.hc_int8) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: --hc-fused-read reads the int8 mixer copies that --hc-int8 "
+                                    "makes: add --hc-int8 or remove --hc-fused-read");
+    }
+    (void)plan_hot_embedding(c.vocab_size, c.hidden_size, o.hot_embedding_rows); // refuses N above the vocabulary
+    if (o.partial_ram_residency && o.vision) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: --partial-ram-residency lends no expert frames, and images are "
+                                    "encoded in lent frames: remove --vision or --partial-ram-residency");
+    }
+    if (o.partial_ram_residency && o.kv_base_tokens != 0) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: --partial-ram-residency maps the whole KV at startup (it "
+                                    "takes no expert frames): leave kv_base_tokens at 0");
+    }
     Layout d;
     d.drafts       = static_cast<std::int32_t>(o.mtp_draft_tokens);
     d.max_width    = 1 + d.drafts;
@@ -514,6 +580,9 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     d.pool_pages   = d.pages * d.lanes;
     const std::uint32_t base_tokens = o.kv_base_tokens != 0 ? o.kv_base_tokens : kKvBaseTokens;
     d.base_pages = std::min(d.pool_pages, std::max(1U, base_tokens / kPagedKVPageSize));
+    // Partial RAM residency backs the whole pool at startup: a growth would take frames whose
+    // experts may live only in VRAM.
+    if (o.partial_ram_residency) { d.base_pages = d.pool_pages; }
     // The drafter's KV is one more attention layer through the same block table.
     d.kv         = KvLayout::plan(c, d.pool_pages, c.attention_layers + (d.drafts > 0 ? 1U : 0U),
                                   static_cast<std::size_t>(d.pages) * d.lanes);
@@ -551,7 +620,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
         d.slots_at    = align(at);
         d.state_total = d.slots_at + align(4ULL * d.lanes);
     }
-    if (d.drafts > 0) { d.spec = SpecLayout::plan(c, d.drafts, d.tail, d.gdn_conv, d.lanes); }
+    if (d.drafts > 0) { d.spec = SpecLayout::plan(c, d.drafts, d.tail, d.gdn_conv, d.lanes, o); }
     for (const std::uint64_t stride : strides) { d.frame_stride = std::max(d.frame_stride, stride); }
     if (d.frame_stride == 0) { throw std::invalid_argument("Qwen3.8-Flash-Next: no expert banks"); }
     d.staging    = static_cast<std::size_t>(kStagingSlots) * d.frame_stride;
@@ -564,20 +633,25 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     }
     // A rows round decodes and samples one row per lane, so neither a --prefill-chunk below the lane
     // count nor a one-row sampling profile may size the workspace below that round.
-    d.work = execution::Forward::workspace_bytes(c, std::max(d.chunk, static_cast<std::int32_t>(d.lanes)), d.pages * kPagedKVPageSize,
-                                                 DeviceExecutionView{nullptr, sms}) +
-             ops::sampling_workspace_capacity_bytes(d.token_domain, 1, static_cast<std::int32_t>(d.lanes));
+    const std::int32_t widest = std::max(d.chunk, static_cast<std::int32_t>(d.lanes));
+    d.work = execution::Forward::workspace_bytes(c, widest, d.pages * kPagedKVPageSize,
+                                                 DeviceExecutionView{nullptr, sms}, o.moe_precast_input) +
+             ops::sampling_workspace_capacity_bytes(d.token_domain, 1, static_cast<std::int32_t>(d.lanes)) +
+             plan_hc_fused_read_workspace(o, c, widest);
     if (d.drafts > 0) {
         // A drafter step (one column and the head's logits), and a prefill call's drafter cells: a
         // sub-chunk's residual rows beside the call's residual. Acceptance's workspace.
         const std::size_t step = execution::Forward::mtp_workspace_bytes(c, 1, d.pages * kPagedKVPageSize,
-                                                                         DeviceExecutionView{nullptr, sms});
+                                                                         DeviceExecutionView{nullptr, sms},
+                                                                         o.moe_precast_input) +
+                                 plan_hc_fused_read_workspace(o, c, 1);
         d.work = std::max(d.work, step) + std::size_t(c.residual_width()) * execution::kMtpChunkColumns * 2 * 3 +
                  ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(d.token_domain, 1, d.drafts, 1, 1);
     }
     d.sms       = sms;
     d.wide_work = execution::Forward::workspace_bytes(c, d.wide_chunk, d.pages * kPagedKVPageSize,
-                                                      DeviceExecutionView{nullptr, sms});
+                                                      DeviceExecutionView{nullptr, sms}, o.moe_precast_input) +
+                  (o.shared_expert_stream ? execution::Forward::shared_expert_workspace_bytes(c, d.wide_chunk) : 0);
     d.vmm = VmmArena::supported(o.device);
 
     auto& b     = d.bytes;
@@ -585,6 +659,13 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.kv_max    = d.kv.bytes;
     b.kv        = d.vmm ? d.kv.mapped_bytes(d.base_pages) : d.kv.bytes;
     b.workspace = d.work;
+    b.shared_expert_workspace = plan_shared_expert_workspace(o, c);
+    b.mtp_constrained_masks   = plan_mtp_constrained_masks(o, public_tokens);
+    b.mtp_draft_probs         = plan_mtp_draft_probs(o);
+    b.hot_embedding           = plan_hot_embedding(c.vocab_size, c.hidden_size, o.hot_embedding_rows).hot;
+    b.cpu_misses              = plan_cpu_misses(o).device;
+    b.hc_int8_bytes           = plan_hc_int8(o, c);
+    b.ngram_flag_wait         = plan_ngram_flag_wait(o).device;
     b.staging   = d.staging;
     b.state     = d.state_total;
     // Logits of the widest round (FP32 and BF16; at least one column per lane), then the sampling
@@ -593,13 +674,14 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.io        = d.io.bytes + (sizeof(float) + 2ULL) * c.vocab_size * logit_columns + 2ULL * c.vocab_size * d.lanes +
                   256 * 4 +
                   (sizeof(ops::SamplingConfig) + 4ULL * public_tokens + 4ULL * d.mask_words + 256) * d.lanes + 4096;
-    b.residency            = ExpertResidency::table_bytes(c, d.columns);
+    b.residency            = ExpertResidency::table_bytes(c, d.columns, o.partial_ram_residency);
     b.speculation          = d.drafts > 0 ? d.spec.bytes : 0;
     b.expert_record_stride = d.frame_stride;
     b.max_frames           = ExpertResidency::max_frames(c);
     // Each lane's decode forward in two parts (and with MTP its verification forwards in two parts
     // per width, a draft graph per step count, a drafter catch-up per committed count and the
-    // pending cell's), plus the plain round over every lane in two parts.
+    // pending cell's), plus the plain round over every lane in two parts. --ngram-flag-wait's one
+    // graph per round replaces a round's two parts (they then run only eagerly), so the bound holds.
     b.graph_bound = d.lanes * (2 * graph_bound(1, 1, 0) +
                                (d.drafts > 0 ? static_cast<std::uint32_t>(2 * d.drafts + d.drafts + d.max_width + 1) : 0U)) +
                     (d.lanes > 1 ? 2 * graph_bound(1, 1, 0) + (d.drafts > 0 ? 1U : 0U) * d.lanes : 0U);
@@ -639,6 +721,11 @@ public:
         std::uint64_t mtp_policy_rounds = 0;
         // Per draft position: rounds that drafted it, and rounds that accepted it.
         std::array<std::uint64_t, 8> mtp_offered{}, mtp_taken{};
+        // --mtp-joint-acceptance: the request's threshold, and the probabilities of the drafts the
+        // pending verification offers (joint_offered of them; observed at its commit).
+        JointAcceptanceThreshold joint_threshold;
+        std::array<float, 8> joint_probs{};
+        std::int32_t joint_offered = 0;
         SpeculativeStats speculative;
         // Image input: the lane's RoPE positions; the handoff of its encoded images (lent frames,
         // given back once the prompt's last call ran) and the encode's measurements.
@@ -682,8 +769,14 @@ public:
           volume_(options_.ngram_volume, c_.ple.table), hash_(c_.ple.ngram, 0),
           plan_(plan_layout(options_, c_, parameters.model.resources().public_token_count, strides(parameters))) {
         exempt_process_from_power_throttling();
-        // A read after 100 ms idle within a minute of a request keeps the volume's drive awake.
-        volume_.set_keepalive(std::chrono::milliseconds(100), std::chrono::milliseconds(60000));
+        // Relaxed drafting's tokenizer facts, refused here when the tokenizer cannot give them.
+        if (options_.relaxed_drafting) {
+            relaxed_tokens_ = qwen3_5::frontend::relaxed_drafting_tokens(*parameters.model.resources().tokenizer);
+        }
+        // A read after ngram_keepalive_ms of idleness within a minute of a request keeps the volume's
+        // drive awake (a zero period leaves the keep-alive off).
+        volume_.set_keepalive(std::chrono::milliseconds(options_.ngram_keepalive_ms),
+                              std::chrono::milliseconds(kNgramKeepaliveWindowMs));
         vocab_ = dim(c_.vocab_size);
 
         // Every fixed allocation is checked against the plan and against device free memory (an
@@ -720,7 +813,10 @@ public:
         allocated += plan_.bytes.io;
         io_host_ = PinnedHostBuffer(plan_.io.bytes);
         host_token_ = PinnedHostBuffer(64);
-        mask_host_  = PinnedHostBuffer(4ULL * plan_.mask_words * plan_.lanes + 64);
+        // A grammar mask per lane, or with --mtp-constrained one per verified position when more.
+        mask_host_  = PinnedHostBuffer(std::max<std::uint64_t>(4ULL * plan_.mask_words * plan_.lanes,
+                                                               plan_.bytes.mtp_constrained_masks) +
+                                       64);
         config_host_ = PinnedHostBuffer(sizeof(ops::SamplingConfig) * plan_.lanes + 64);
         auto* io = static_cast<std::byte*>(io_device_.p);
         std::size_t at = align(plan_.io.bytes);
@@ -746,9 +842,35 @@ public:
         masks_ = reinterpret_cast<std::uint32_t*>(io + at);
         at = align(at + 4ULL * plan_.mask_words * plan_.lanes);
         if (at > io_device_.bytes) { throw std::logic_error("Qwen3.8-Flash-Next: io layout exceeds its plan"); }
+        if (plan_.bytes.mtp_constrained_masks != 0) {
+            verify_masks_ = DeviceBuffer(plan_.bytes.mtp_constrained_masks);
+            allocated += plan_.bytes.mtp_constrained_masks;
+        }
+        if (plan_.bytes.mtp_draft_probs != 0) {
+            draft_probs_ = DeviceBuffer(plan_.bytes.mtp_draft_probs);
+            allocated += plan_.bytes.mtp_draft_probs;
+            draft_probs_host_ = PinnedHostBuffer(plan_.bytes.mtp_draft_probs);
+        }
+        if (plan_.bytes.hot_embedding != 0) {
+            // --hot-embedding-rows: the token embedding is in the mapped pinned block (the forward reads
+            // its rows through the device pointer); its first rows get a device copy.
+            const Weight& table = parameters_.token_embedding;
+            void* mapped        = nullptr;
+            if (cudaHostGetDevicePointer(&mapped, const_cast<void*>(table.qdata), 0) != cudaSuccess ||
+                mapped == nullptr) {
+                (void)cudaGetLastError();
+                throw std::runtime_error("--hot-embedding-rows: the token embedding is not in mapped pinned memory "
+                                         "(load the model with its embedding in the pinned block)");
+            }
+            cold_embedding_ = mapped;
+            hot_embedding_  = DeviceBuffer(plan_.bytes.hot_embedding);
+            allocated += plan_.bytes.hot_embedding;
+            CUDA_CHECK(cudaMemcpy(hot_embedding_.p, table.qdata, plan_.bytes.hot_embedding, cudaMemcpyHostToDevice));
+        }
 
-        work_ = std::make_unique<WorkspaceArena>(plan_.work);
-        allocated += plan_.work;
+        // The shared expert's side-stream carve (when on) comes out of the same arena.
+        work_ = std::make_unique<WorkspaceArena>(plan_.work + plan_.bytes.shared_expert_workspace);
+        allocated += plan_.work + plan_.bytes.shared_expert_workspace;
         staging_ = DeviceBuffer(plan_.staging);
         allocated += plan_.staging;
         if (plan_.drafts > 0) {
@@ -756,7 +878,23 @@ public:
             spec_backing_.fill(0);
             allocated += plan_.spec.bytes;
             spec_host_ = PinnedHostBuffer(4 * plan_.spec.w_count + 64);
+            // --gdn-async-commit: a stream and two events, no device memory.
+            if (options_.gdn_async_commit) { fold_stream_ = std::make_unique<GdnFoldStream>(); }
         }
+
+        if (plan_.bytes.cpu_misses != 0 && !options_.partial_ram_residency) { start_cpu_misses(); }
+        allocated += plan_.bytes.cpu_misses;
+        if (plan_.bytes.ngram_flag_wait != 0) { start_ngram_flag(); }
+        allocated += plan_.bytes.ngram_flag_wait;
+        if (plan_.bytes.hc_int8_bytes != 0) {
+            // --hc-int8: the int8 copies of every mixer the forward runs, made from the BF16 weights
+            // (which stay loaded); the forward's mixers read them.
+            hc_int8_ = std::make_unique<execution::HcInt8Copies>(
+                execution::HcInt8Copies::mixers(parameters_.layers, parameters_.final_mixer,
+                                                parameters_.mtp ? &*parameters_.mtp : nullptr),
+                plan_.bytes.hc_int8_bytes, device_.stream);
+        }
+        allocated += plan_.bytes.hc_int8_bytes;
 
         std::vector<const std::uint8_t*> banks;
         std::vector<std::uint64_t> bank_strides;
@@ -765,8 +903,10 @@ public:
             bank_strides.push_back(bank.record_stride);
         }
         residency_ = std::make_unique<ExpertResidency>(c_, std::move(banks), std::move(bank_strides), plan_.columns,
-                                                       device_.device);
+                                                       device_.device, partial_setup());
         allocated += plan_.bytes.residency;
+        // Partial RAM residency: the CPU miss service reads the residency's host slot tables.
+        if (options_.partial_ram_residency && plan_.bytes.cpu_misses != 0) { start_cpu_misses(); }
         if (allocated != plan_.bytes.fixed_bytes()) {
             throw std::logic_error("Qwen3.8-Flash-Next: the Program's device allocations differ from its plan");
         }
@@ -782,7 +922,9 @@ public:
         if (options_.expert_cache) {
             VramDemand demand;
             demand.headroom    = options_.vram_headroom;
-            demand.elastic     = residency_->elastic() && options_.vram_monitor;
+            // Partial RAM residency keeps the pool's startup size: a shrink would evict experts held
+            // only in VRAM without a round to write them back in.
+            demand.elastic     = residency_->elastic() && options_.vram_monitor && !options_.partial_ram_residency;
             demand.graphs      = plan_.bytes.graph_bound;
             demand.frame_bytes = plan_.frame_stride;
             demand.max_frames  = residency_->frame_limit();
@@ -908,7 +1050,41 @@ public:
         experts.staging_slots = kStagingSlots;
         experts.zero_copy_misses = kZeroCopyMisses;
         for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) { experts.frames.push_back(residency_->table(l)); }
-        if (residency_->frames() > 0 && plan_.wide_work > 0) {
+        if (residency_->partial()) {
+            for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
+                experts.host_slots.push_back(residency_->host_slot_table(l));
+            }
+        }
+        if (cpu_misses_) {
+            // --cpu-verify-misses: verification calls hand misses to the service; --prefill-cpu-share:
+            // prefill and forced-token calls hand it their share. A timed-out wait reports to the
+            // error word, which every verification round and prefill call checks. Both channels use
+            // the service's one buffer (layer calls run in stream order, each wait before the next
+            // call's plan), each narrowed to its own jobs, columns and rule.
+            const CpuMissPlan p  = plan_cpu_misses(options_);
+            experts.error        = cpu_error_device_;
+            prefill_cpu_columns_ = p.prefill_columns;
+            for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
+                ops::MoeCpuChannel channel = cpu_misses_->channel(static_cast<int>(l));
+                if (p.verify_jobs > 0) {
+                    ops::MoeCpuChannel verify = channel;
+                    verify.max_jobs           = p.verify_jobs;
+                    verify.max_columns        = p.verify_columns;
+                    verify.pcie_divisor       = p.pcie_divisor;
+                    experts.cpu.push_back(verify);
+                }
+                if (p.prefill_jobs > 0) {
+                    ops::MoeCpuChannel prefill = channel;
+                    prefill.max_jobs           = p.prefill_jobs;
+                    prefill.max_columns        = p.prefill_columns;
+                    prefill.share_num          = static_cast<std::int16_t>(p.share_num);
+                    prefill.share_den          = static_cast<std::int16_t>(p.share_den);
+                    experts.prefill_cpu.push_back(prefill);
+                }
+            }
+        }
+        // No stream with partial RAM residency: its ring is lent frames, and the pool lends none.
+        if (residency_->frames() > 0 && plan_.wide_work > 0 && !residency_->partial()) {
             std::vector<execution::ExpertStream::Bank> stream_banks;
             for (const auto& bank : parameters_.model.expert_banks()) {
                 stream_banks.push_back({bank.host_records, bank.record_stride});
@@ -919,8 +1095,21 @@ public:
             experts.stream = stream_.get();
         }
         ngram_next_ = PinnedHostBuffer(plan_.io.bytes - plan_.io.ngram);
-        forward_ = std::make_unique<execution::Forward>(parameters_, device_, *work_, std::move(state), std::move(kv),
-                                                        std::move(experts), std::move(drafter));
+        forward_ = std::make_unique<execution::Forward>(
+            parameters_, device_, *work_, std::move(state), std::move(kv), std::move(experts), std::move(drafter),
+            forward_options());
+        if (options_.shared_expert_stream) {
+            // The plan was made before the weights were read: refuse weights whose shared expert
+            // Linears need more scratch than the static workspace or a wide call's lent arena hold.
+            const std::uint32_t columns = shared_expert_columns(options_);
+            require_shared_expert_workspace(forward_->max_shared_expert_scratch_bytes(static_cast<std::int32_t>(columns)),
+                                            plan_.bytes.shared_expert_workspace, columns);
+            if (plan_.wide_work > 0) {
+                require_shared_expert_workspace(forward_->max_shared_expert_scratch_bytes(plan_.wide_chunk),
+                                                execution::Forward::shared_expert_workspace_bytes(c_, plan_.wide_chunk),
+                                                static_cast<std::uint32_t>(plan_.wide_chunk));
+            }
+        }
         lane_graphs_.resize(plan_.lanes);
         select_lane(0);
         warm_vision();
@@ -931,15 +1120,267 @@ public:
     }
 
     ~ProgramImpl() noexcept {
+        settle_gdn_fold(); // the synchronization below then covers the fold in flight
         try {
             device_.synchronize();
         } catch (...) {}
+        if (cpu_misses_) {
+            // The service outlives the forward (declared before it) and stops after this
+            // synchronization, when no call can be waiting for it.
+            try {
+                diagnostic("cpu miss service: " + std::to_string(cpu_misses_->served_requests()) + " requests, " +
+                           std::to_string(cpu_misses_->served_experts()) + " experts served on the CPU");
+            } catch (...) {}
+        }
+        if (residency_ && residency_->partial()) {
+            try {
+                diagnostic("partial RAM residency: " + std::to_string(residency_->stats().write_backs) +
+                           " experts held only in VRAM were written back to RAM");
+            } catch (...) {}
+        }
         save_expert_state();
         monitor_.reset();
     }
 
     ProgramImpl(const ProgramImpl&)            = delete;
     ProgramImpl& operator=(const ProgramImpl&) = delete;
+
+    // The forward's options; with --hot-embedding-rows its two embedding planes: the device copy of
+    // the first rows and the whole table through its device pointer in the mapped pinned block.
+    execution::ForwardOptions forward_options() const {
+        execution::ForwardOptions out{.shared_expert_stream = options_.shared_expert_stream,
+                                      .gdn_head_map         = options_.gdn_head_map,
+                                      .moe_precast_input    = options_.moe_precast_input,
+                                      .moe_gate_up_registers = options_.moe_gate_up_registers,
+                                      .moe_fused_route       = options_.moe_fused_route,
+                                      .hc_int8               = hc_int8_.get(),
+                                      .hc_fused_read         = options_.hc_fused_read,
+                                      .ggml_decode_mma       = options_.ggml_decode_mma};
+        if (plan_.bytes.hot_embedding == 0) { return out; }
+        const Weight& table        = parameters_.token_embedding;
+        const auto rows            = static_cast<std::int32_t>(options_.hot_embedding_rows);
+        out.hot_embedding_rows     = rows;
+        out.cold_embedding         = table;
+        // Each plane's payload starts at its codes (ggml_blocks_v1 has no other plane), and its
+        // payload_bytes count from there.
+        const auto codes_at = static_cast<std::uint64_t>(static_cast<const std::byte*>(table.qdata) -
+                                                         static_cast<const std::byte*>(table.payload));
+        out.cold_embedding.payload       = cold_embedding_;
+        out.cold_embedding.qdata         = cold_embedding_;
+        out.cold_embedding.payload_bytes = table.payload_bytes - codes_at;
+        out.hot_embedding          = table;
+        out.hot_embedding.payload  = hot_embedding_.p;
+        out.hot_embedding.qdata    = hot_embedding_.p;
+        out.hot_embedding.payload_bytes   = plan_.bytes.hot_embedding;
+        out.hot_embedding.shape[0]        = rows;
+        out.hot_embedding.padded_shape[0] = rows;
+        out.hot_embedding.n               = rows;
+        return out;
+    }
+
+    // --cpu-verify-misses or --prefill-cpu-share: the CPU miss service over the text model's expert
+    // banks (the CPU reads each bank's host address), its buffers sized for both uses, and the zeroed
+    // error word, through its device address.
+    void start_cpu_misses() {
+        const CpuMissPlan p = plan_cpu_misses(options_);
+        std::vector<ops::offloaded_moe::CpuMissService::Layer> layers;
+        for (const auto& bank : parameters_.model.expert_banks()) {
+            if (residency_ && residency_->partial()) {
+                // Partial RAM residency: the experts without a frame each have a RAM slot, and the
+                // GPU hands the CPU only those (frame -1), so every CPU job finds its record.
+                const auto layer = static_cast<std::uint32_t>(layers.size());
+                layers.push_back({nullptr, bank.record_stride, bank.format, residency_->cpu_slot_table(layer)});
+                continue;
+            }
+            if (bank.host_records == nullptr) {
+                throw std::logic_error("Qwen3.8-Flash-Next: the CPU miss service (--cpu-verify-misses, "
+                                       "--prefill-cpu-share) needs every expert bank in host memory");
+            }
+            layers.push_back({bank.host_records, bank.record_stride, bank.format});
+        }
+        if (layers.size() != c_.num_hidden_layers) {
+            throw std::logic_error("Qwen3.8-Flash-Next: the CPU miss service (--cpu-verify-misses, "
+                                   "--prefill-cpu-share) needs one expert bank per layer");
+        }
+        ops::offloaded_moe::CpuMissService::Options o;
+        o.workers     = p.workers;
+        o.max_jobs    = p.max_jobs;
+        o.max_columns = p.max_columns;
+        cpu_error_.emplace(64);
+        std::memset(cpu_error_->data(), 0, 64);
+        void* mapped = nullptr;
+        if (cudaHostGetDevicePointer(&mapped, cpu_error_->data(), 0) != cudaSuccess || mapped == nullptr) {
+            (void)cudaGetLastError();
+            throw std::runtime_error("the CPU miss service's error word has no device address");
+        }
+        cpu_error_device_ = static_cast<std::uint32_t*>(mapped);
+        cpu_error_word_   = CpuErrorWord(static_cast<std::uint32_t*>(cpu_error_->data()));
+        cpu_misses_       = std::make_unique<ops::offloaded_moe::CpuMissService>(std::move(layers), o);
+    }
+
+    // --ngram-flag-wait: the mapped flag (line 0) and error word (line 1), zeroed, their device
+    // addresses, and the waits' device counter (zero: the first replay wants 1, the host's first
+    // raise).
+    void start_ngram_flag() {
+        const NgramFlagPlan p = plan_ngram_flag_wait(options_);
+        ngram_flag_.emplace(p.pinned);
+        std::memset(ngram_flag_->data(), 0, p.pinned);
+        void* mapped = nullptr;
+        if (cudaHostGetDevicePointer(&mapped, ngram_flag_->data(), 0) != cudaSuccess || mapped == nullptr) {
+            (void)cudaGetLastError();
+            throw std::runtime_error("--ngram-flag-wait: the round flag has no device address");
+        }
+        ngram_flag_device_  = static_cast<std::uint32_t*>(mapped);
+        ngram_error_device_ = ngram_flag_device_ + 16;
+        ngram_sequence_     = DeviceBuffer(p.device);
+        ngram_sequence_.fill(0);
+        ngram_raised_ = 0;
+        ngram_launch_blocking_ = launch_blocking();
+        if (ngram_launch_blocking_) {
+            diagnostic("ngram flag wait: CUDA_LAUNCH_BLOCKING=1 serializes launches, so a round graph waiting "
+                       "for the host's n-gram rows would always time out; rounds keep their two parts");
+        }
+    }
+
+    // --ngram-flag-wait: whether this round runs as one graph (the rule, with the launch mode).
+    bool rows_in_graph(bool eager_done) const noexcept {
+        return ngram_rows_in_graph(options_, eager_done, ngram_launch_blocking_);
+    }
+
+    // --ngram-flag-wait: one launch of a round graph that waits for its n-gram rows (the caller ran
+    // its parts eagerly first, so the capture runs no kernel's one-time setup): captured on its first
+    // use, then replayed, counted in `launched`. The error word is cleared first: a word an earlier
+    // round left set must not fail this round.
+    void launch_round(DecodeGraphDefinition& graph, DecodeGraphExecutable& exec, const std::function<void()>& body,
+                      std::atomic<std::uint64_t>& launched) {
+        if (!exec.ready()) {
+            graph.capture(device_.stream, body);
+            exec.instantiate(graph);
+            exec.upload(device_.stream);
+        }
+        (void)take_ngram_flag_error();
+        exec.launch(device_.stream);
+        launched.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // The part of a round graph between the front and the back: the wait for this replay's flag
+    // value, then the rows of `width` columns from the pinned block (where gather_rows reads them).
+    void wait_for_rows(std::int32_t width) {
+        const cudaStream_t s = device_.stream;
+        wait_flag_sequence(ngram_flag_device_, static_cast<std::uint32_t*>(ngram_sequence_.p), ngram_error_device_,
+                           s);
+        const std::size_t rows = static_cast<std::size_t>(width) * hash_.heads() * c_.ple.table.row_bytes;
+        upload_pinned(static_cast<std::byte*>(io_device_.p) + plan_.io.ngram,
+                      static_cast<std::byte*>(io_host_.data()) + plan_.io.ngram, rows, s);
+    }
+
+    // After a round graph's launch: reads its rows into the pinned block, then raises the flag to the
+    // count of launches with a release store, so the device's acquire load sees the rows. The flag
+    // is raised even when the read throws (the device must not spin for the timeout; the round fails
+    // with the exception).
+    void gather_rows(std::int32_t begin, std::int32_t width) {
+        struct Raise {
+            ProgramImpl* self;
+            ~Raise() {
+                std::atomic_ref<std::uint32_t>(*static_cast<std::uint32_t*>(self->ngram_flag_->data()))
+                    .store(++self->ngram_raised_, std::memory_order_release);
+            }
+        } raise{this};
+        (void)read_rows(begin, width);
+    }
+
+    // --ngram-flag-wait, after a round synchronized: a wait that timed out wrote kWaitFlagErrorTimeout
+    // to the error word, and its round read rows the host had not finished, so the round throws (the
+    // caller releases the lane; nothing is committed). take_ngram_flag_error reads and clears the
+    // word (0 when off); throw_ngram_flag throws for a nonzero one.
+    std::uint32_t take_ngram_flag_error() noexcept {
+        if (!ngram_flag_) { return 0; }
+        auto* word                 = static_cast<volatile std::uint32_t*>(ngram_flag_->data()) + 16;
+        const std::uint32_t failed = *word;
+        if (failed != 0) { *word = 0; }
+        return failed;
+    }
+    void check_ngram_flag() { throw_ngram_flag(take_ngram_flag_error()); }
+    static void throw_ngram_flag(std::uint32_t failed) {
+        if (failed == 0) { return; }
+        char code[16];
+        std::snprintf(code, sizeof(code), "0x%04X", failed);
+        throw std::runtime_error(std::string("Qwen3.8-Flash-Next: --ngram-flag-wait: the round's n-gram rows were not "
+                                             "ready within 1 s (code ") +
+                                 code + "); the request ends and nothing of this round is committed");
+    }
+
+    // --cpu-verify-misses, before a verification is drafted: whether its CPU leg can be served. A
+    // service whose thread has failed never answers again (each layer's wait would time out), so
+    // rounds decode plain from then on; the output is the same.
+    bool cpu_verify_failed() noexcept {
+        if (!options_.cpu_verify_misses || !cpu_misses_) { return false; }
+        const std::string why = cpu_service_failure();
+        if (why.empty()) { return false; }
+        if (!cpu_verify_off_reported_) {
+            cpu_verify_off_reported_ = true;
+            diagnostic("cpu verify misses: the CPU miss service stopped (" + why +
+                       "); MTP speculation is off for the rest of this run");
+        }
+        return true;
+    }
+
+    // --prefill-cpu-share, before a prefill or forced-token call: whether it hands its share to the
+    // CPU. Once the service thread has failed (it never answers again) prefill stays on the GPU, with
+    // the same output; a one-time diagnostic says so.
+    bool prefill_cpu_share_live() noexcept {
+        if (options_.prefill_cpu_share_num == 0 || !cpu_misses_) { return false; }
+        const std::string why = cpu_service_failure();
+        if (why.empty()) { return true; }
+        if (!prefill_share_off_reported_) {
+            prefill_share_off_reported_ = true;
+            diagnostic("prefill cpu share: the CPU miss service stopped (" + why +
+                       "); prefill stays on the GPU for the rest of this run");
+        }
+        return false;
+    }
+
+    // Why the CPU miss service's thread stopped serving; empty while it serves (or without one).
+    std::string cpu_service_failure() const noexcept {
+        if (!cpu_misses_) { return {}; }
+        try {
+            return cpu_misses_->failure();
+        } catch (...) {
+            return "unknown";
+        }
+    }
+
+    // Before launching a call that may hand the CPU miss service jobs (a verification round, or a
+    // prefill or forced-token call handing its share): clears the error word, so a code an earlier
+    // call left when it threw before its check cannot fail this one (CpuErrorWord).
+    void arm_cpu_error(bool prefill) {
+        cpu_error_word_.arm(prefill, [this] { device_.synchronize(); });
+    }
+
+    // After a call that may have used the CPU miss service synchronized (`flag` names the option,
+    // `call` the call): a layer whose CPU leg timed out wrote layer << 16 | code to the error word and
+    // left its CPU outputs unwritten (later layers computed their misses on the GPU), so the call
+    // throws: its lane is released, nothing is committed and the request ends with an error. The word
+    // is cleared for the next call.
+    void check_cpu_misses(const char* flag, const char* call) {
+        if (!cpu_misses_) { return; }
+        const std::uint32_t failed = cpu_error_word_.take();
+        if (failed == 0) { return; }
+        release_lane();
+        const std::string why = cpu_service_failure();
+        char code[64];
+        std::snprintf(code, sizeof(code), "layer %u, code 0x%04X", failed >> 16U, failed & 0xFFFFU);
+        throw std::runtime_error(std::string("Qwen3.8-Flash-Next: ") + flag +
+                                 ": the CPU miss service did not answer " + call + " (" + code +
+                                 (why.empty() ? std::string() : "; " + why) + ")");
+    }
+    void check_cpu_verify() { check_cpu_misses("--cpu-verify-misses", "a verification"); }
+    // After a prefill or forced-token call: only a call that handed the service its share can have
+    // set the word (a verification checks its own round).
+    void check_cpu_prefill() {
+        if (!cpu_error_word_.prefill_armed()) { return; }
+        check_cpu_misses("--prefill-cpu-share", "a prefill call");
+    }
 
     const ProgramDevicePlan& device_plan() const noexcept { return plan_.bytes; }
     const VramSizing& vram_sizing() const noexcept { return sizing_; }
@@ -981,6 +1422,9 @@ public:
                                                     ? FinishReason::OutputLimit
                                                     : FinishReason::ContextCapacity;
         base->sampling      = translate(options.sampling);
+        // The added-token floor relaxed drafting compares drafts against (zero relaxes nothing).
+        base->sampling.added_token_floor = relaxed_tokens_.added_token_floor;
+        if (!options_.relaxed_drafting) { base->sampling.relaxed_threshold = 0.0F; }
         base->context_cache = data.context_cache;
         // Prefix reuse (the Qwen3.5 Program's plan_request): the prompt's identity and its capture
         // groups, an InputReplay point at the typed recovery frontier (else the prompt's end) and the
@@ -1201,6 +1645,7 @@ public:
             out.kind = ContextOperationKind::Bind;
             return out;
         }
+        join_gdn_fold(); // a restore or a fresh lane's zeroing writes the state, a capture reads it
         select_lane(tx_lane_);
         if (tx_ == Tx::Capture) { return finish_capture(cancellation); }
         out.kind = ContextOperationKind::Bind;
@@ -1239,6 +1684,8 @@ public:
                      .prefix_reuse_path    = L().reused != 0 ? PrefixReusePath::Checkpoint : PrefixReusePath::Root};
         install_sampling(base.sampling);
         L().mtp_accept.fill(kAcceptancePrior);
+        L().joint_threshold = JointAcceptanceThreshold{};
+        L().joint_offered   = 0;
         L().mtp_live = plan_.drafts > 0;
         plan_lane_vision(base, L().reused);
         if (base.reuse) {
@@ -1291,6 +1738,7 @@ public:
         PrefillProgress out;
         out.summary = L().begin;
         try {
+            join_gdn_fold();
             // An exact hit: the restored state is the prompt's, and its last position's logits
             // were restored with it. The first token is sampled from them as the prompt's last call
             // would (same logits, position and seed).
@@ -1347,6 +1795,7 @@ public:
                 out.timing.device_wait_ns = elapsed_ns(wait);
                 const TokenId token = sampled_token();
                 residency_->after_round(device_.stream, width, promotions);
+                check_cpu_prefill(); // before anything of the call is kept
                 if (owns_lease) { return_lease(); }
                 return_vision();
                 apply_vram_target(false);
@@ -1362,6 +1811,7 @@ public:
                 device_.synchronize();
                 out.timing.device_wait_ns = elapsed_ns(wait);
                 residency_->after_round(device_.stream, width, promotions);
+                check_cpu_prefill();
                 apply_vram_target(false);
                 out.timing.submit_host_ns = elapsed_ns(start) - out.timing.device_wait_ns;
             }
@@ -1396,7 +1846,10 @@ public:
         }
         // Several rows decode together in one plain round (MTP drafts only when one row decodes:
         // docs/maintainer/flash-next-lanes-spike.md); one row runs the single-sequence round.
-        if (sequences.size() > 1) { return decode_rows(sequences, failed, masks, start); }
+        if (sequences.size() > 1) {
+            join_gdn_fold();
+            return decode_rows(sequences, failed, masks, start);
+        }
         const nvtx::ScopedRange range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode);
         try {
             // With the MTP drafter, a verification round when the policy drafts.
@@ -1410,15 +1863,23 @@ public:
             }
             const std::int32_t position = static_cast<std::int32_t>(L().state_tokens);
             // The layers before the PLE layer run while the host reads the round's n-gram rows from
-            // the volume; the rest of the forward follows their upload.
+            // the volume; the rest of the forward follows their upload (--ngram-flag-wait: in the
+            // same graph, behind the flag the host raises once the rows are in the pinned block).
             upload_inputs(position, 1);
             residency_->before_round(device_.stream);
-            run_decode(Part::Front);
-            {
+            join_gdn_fold(); // the front reads and writes the recurrent state
+            if (rows_in_graph(G().front_runs > 0 && G().back_runs > 0)) {
+                run_decode_round();
                 const nvtx::ScopedRange rows(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode);
-                upload_rows(position, 1);
+                gather_rows(position, 1);
+            } else {
+                run_decode(Part::Front);
+                {
+                    const nvtx::ScopedRange rows(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode);
+                    upload_rows(position, 1);
+                }
+                run_decode(Part::Back);
             }
-            run_decode(Part::Back);
             L().state_tokens += 1;
             const bool failed_constraint = sample(position, masks);
             residency_->enqueue_route_download(device_.stream, 1);
@@ -1427,6 +1888,7 @@ public:
                 const nvtx::ScopedRange waiting(nvtx::Name::DecodeOrdinaryWait, nvtx::Category::Decode);
                 device_.synchronize();
             }
+            check_ngram_flag(); // before anything reads the round's outputs
             runtime::ExecutionTiming timing;
             timing.device_wait_ns = elapsed_ns(wait);
             pending_token_        = sampled_token();
@@ -1473,6 +1935,7 @@ public:
             if (token < 0 || token >= plan_.token_domain) { throw std::invalid_argument("forced token outside the domain"); }
         }
         try {
+            join_gdn_fold();
             // The model reads the pending input token and every forced token but the last, which
             // becomes the next decode input.
             L().history.insert(L().history.end(), tokens.begin(), tokens.end());
@@ -1491,6 +1954,7 @@ public:
                 residency_->enqueue_route_download(device_.stream, width);
                 device_.synchronize();
                 residency_->after_round(device_.stream, width, kDecodePromotionsPerLayer);
+                check_cpu_prefill();
                 L().state_tokens += static_cast<std::uint32_t>(width);
                 begin += width;
             }
@@ -1519,6 +1983,7 @@ public:
         for (const auto& row : rows) {
             if (!valid(row)) { throw std::logic_error("Qwen3.8-Flash-Next: commit decisions are not row aligned"); }
         }
+        join_gdn_fold(); // none in flight after a decode round, which joined; kept for the rule
         if (rows.size() > 1) {
             std::array<bool, kMaximumLanes> constraint{};
             for (std::size_t row = 0; row < rows.size(); ++row) { constraint[row] = pending.constraint_failed(row); }
@@ -1600,6 +2065,7 @@ public:
         const std::size_t count = rows.size();
         ContractAccess::consume(pending);
         pending_     = 0;
+        settle_gdn_fold();
         // The round ran on the device: settle its cache update before the lanes go, as a commit would.
         try {
             settle_round(count > 1 ? static_cast<std::int32_t>(count) : round_width_, 0);
@@ -1622,6 +2088,7 @@ public:
             if (!valid(sequence)) { return out; }
             select_lane(ContractAccess::lane(sequence));
             if (L().phase != Phase::Finishable || pending_ != 0) { return out; }
+            settle_gdn_fold(); // the endpoint capture reads the state
             out.timings     = timings();
             out.speculative = speculative_stats();
             out.checkpoint  = capture_endpoint();
@@ -1641,6 +2108,7 @@ public:
             select_lane(ContractAccess::lane(sequence));
             out.timings     = timings();
             out.speculative = speculative_stats();
+            settle_gdn_fold();
             device_.synchronize();
             release_lane();
             apply_vram_target(true);
@@ -1659,6 +2127,7 @@ public:
     }
 
     void fail_all_cleanup() noexcept {
+        settle_gdn_fold();
         (void)device_.synchronize_status();
         abandon_capture();
         tx_          = Tx::None;
@@ -1920,6 +2389,7 @@ public:
         const auto start = Clock::now();
         std::optional<HostCheckpoint> captured;
         try {
+            join_gdn_fold(); // the capture copies the lane's state
             captured = capture_record(std::move(slabs), true);
         } catch (const std::system_error& error) {
             // The tier could not store the bytes (an NVMe tier's I/O failure, a full disk): the
@@ -1983,7 +2453,7 @@ public:
         out.kv_capacity_max_page_groups  = plan_.pool_pages;
         out.kv_cache                     = KvCacheStorage::Int8Group64;
         out.kv_payload_bytes             = kv_vmm_ ? kv_vmm_->mapped_bytes() : kv_backing_.bytes;
-        out.workspace_logical_peak_bytes = plan_.work;
+        out.workspace_logical_peak_bytes = plan_.work + plan_.bytes.shared_expert_workspace;
         out.cuda_graph_allowance_bytes   = kGraphExecutableBytes * plan_.bytes.graph_bound;
         if (cache_) {
             const auto use                  = usage();
@@ -2759,13 +3229,8 @@ private:
         const auto& io = plan_.io;
         auto* host     = static_cast<std::byte*>(io_host_.data());
         // n-gram rows: the window of ngram_size - 1 earlier tokens, EOS-padded at the start.
-        const std::int32_t context = dim(c_.ple.ngram.ngram_size) - 1;
-        ngram_window_.assign(static_cast<std::size_t>(std::max(0, context - begin)), c_.eos_token_id);
-        const std::int32_t from = std::max(0, begin - context);
-        ngram_window_.insert(ngram_window_.end(), L().history.begin() + from, L().history.begin() + begin + width);
-        const std::size_t heads = hash_.heads();
-        row_ids_.resize(static_cast<std::size_t>(width) * heads);
-        hash_.row_ids(ngram_window_, static_cast<std::size_t>(width), row_ids_.data());
+        row_ids_.resize(static_cast<std::size_t>(width) * hash_.heads());
+        ngram_window_rows(hash_, L().history, {}, begin, width, ngram_window_, row_ids_);
         const std::size_t row_bytes = c_.ple.table.row_bytes;
         const std::size_t rows      = static_cast<std::size_t>(width) * hash_.heads() * row_bytes;
         if (next_begin_ == begin && next_width_ == width && next_lane_ == cur_) {
@@ -2783,16 +3248,12 @@ private:
     std::size_t read_rows_of(std::span<const std::uint32_t> rows_lanes) {
         const auto& io = plan_.io;
         auto* host     = static_cast<std::byte*>(io_host_.data());
-        const std::int32_t context = dim(c_.ple.ngram.ngram_size) - 1;
-        const std::size_t heads    = hash_.heads();
+        const std::size_t heads = hash_.heads();
         row_ids_.resize(rows_lanes.size() * heads);
         for (std::size_t b = 0; b < rows_lanes.size(); ++b) {
-            const Lane& lane       = lanes_[rows_lanes[b]];
-            const std::int32_t at  = static_cast<std::int32_t>(lane.state_tokens);
-            ngram_window_.assign(static_cast<std::size_t>(std::max(0, context - at)), c_.eos_token_id);
-            const std::int32_t from = std::max(0, at - context);
-            ngram_window_.insert(ngram_window_.end(), lane.history.begin() + from, lane.history.begin() + at + 1);
-            hash_.row_ids(ngram_window_, 1, row_ids_.data() + b * heads);
+            const Lane& lane = lanes_[rows_lanes[b]];
+            ngram_window_rows(hash_, lane.history, {}, static_cast<std::int64_t>(lane.state_tokens), 1,
+                              ngram_window_, std::span<std::uint32_t>(row_ids_).subspan(b * heads, heads));
         }
         const std::size_t row_bytes = c_.ple.table.row_bytes;
         volume_.read_rows(row_ids_, std::span<std::byte>(host + io.ngram, row_ids_.size() * row_bytes));
@@ -2802,17 +3263,24 @@ private:
     // Reads the n-gram rows of positions [begin, begin + width) into ngram_next_ (the next call's
     // stage takes them from there).
     void prefetch_rows(std::int32_t begin, std::int32_t width) {
-        const std::int32_t context = dim(c_.ple.ngram.ngram_size) - 1;
-        ngram_window_.assign(static_cast<std::size_t>(std::max(0, context - begin)), c_.eos_token_id);
-        const std::int32_t from = std::max(0, begin - context);
-        ngram_window_.insert(ngram_window_.end(), L().history.begin() + from, L().history.begin() + begin + width);
         row_ids_.resize(static_cast<std::size_t>(width) * hash_.heads());
-        hash_.row_ids(ngram_window_, static_cast<std::size_t>(width), row_ids_.data());
+        ngram_window_rows(hash_, L().history, {}, begin, width, ngram_window_, row_ids_);
         volume_.read_rows(row_ids_, std::span<std::byte>(static_cast<std::byte*>(ngram_next_.data()),
                                                          row_ids_.size() * c_.ple.table.row_bytes));
         next_begin_ = begin;
         next_width_ = width;
         next_lane_  = cur_;
+    }
+
+    // --ngram-prefetch: reads the n-gram rows of the lane's anchor column (the token at the state
+    // position, the first column verification reads) into the volume's host cache. They depend only
+    // on the history, so this runs on the Program thread while the draft graph runs on the device;
+    // the volume's read is not reentrant, so no other thread may do it.
+    void prefetch_anchor_rows() {
+        const std::vector<std::uint32_t> rows =
+            ngram_window_rows(hash_, L().history, {}, static_cast<std::int64_t>(L().state_tokens), 1);
+        prefetch_sink_.resize(rows.size() * c_.ple.table.row_bytes);
+        volume_.read_rows(rows, prefetch_sink_);
     }
 
     // The width of a prefill call. A half-width first call (to start the GPU after fewer n-gram
@@ -2873,7 +3341,10 @@ private:
         const std::int32_t widest   = std::min(plan_.wide_chunk, remaining);
         const std::uint32_t keys    = plan_.pages * kPagedKVPageSize;
         const std::size_t work      = std::min<std::size_t>(
-            plan_.wide_work, execution::Forward::workspace_bytes(c_, widest, keys, DeviceExecutionView{nullptr, plan_.sms}));
+            plan_.wide_work,
+            execution::Forward::workspace_bytes(c_, widest, keys, DeviceExecutionView{nullptr, plan_.sms},
+                                                options_.moe_precast_input) +
+                (options_.shared_expert_stream ? forward_->max_shared_expert_scratch_bytes(widest) : 0));
         const std::uint64_t stride  = residency_->frame_stride();
         const std::size_t tables    = align(stream_->table_bytes());
         const auto work_frames      = static_cast<std::uint32_t>((tables + work + stride - 1) / stride);
@@ -3241,6 +3712,15 @@ private:
         stage(begin, width);
         residency_->before_round(device_.stream);
         auto b = batch(width);
+        // --prefill-cpu-share: the call hands the CPU its share of each layer's misses (a call wider
+        // than the prefill channel's columns stays on the GPU). A streamed call first leaves each
+        // layer's predicted-cold experts out of the stream (ExpertStream::Share), so they are misses.
+        b.cpu_share = width <= prefill_cpu_columns_ && prefill_cpu_share_live();
+        if (b.cpu_share) {
+            arm_cpu_error(true);
+        } else {
+            cpu_error_word_.skip();
+        }
         if (mtp_chunk_) { b.mtp_chunk = &*mtp_chunk_; }
         b.vision = call_vision_;
         if (!wide) {
@@ -3248,7 +3728,14 @@ private:
         } else {
             forward_->use_workspace(*wide_work_);
             try {
-                stream_->begin(residency_->host_table(), stream_tables_, ring_first_, ring_frames_, device_.stream);
+                execution::ExpertStream::Share share;
+                if (b.cpu_share) {
+                    residency_->use_counts(stream_counts_);
+                    share = {static_cast<int>(options_.prefill_cpu_share_num),
+                             static_cast<int>(options_.prefill_cpu_share_den), stream_counts_.data()};
+                }
+                stream_->begin(residency_->host_table(), stream_tables_, ring_first_, ring_frames_, device_.stream,
+                               share);
                 forward_->run(b, logits32_);
             } catch (...) {
                 stream_->end();
@@ -3288,6 +3775,20 @@ private:
         } else {
             replay(G().back_graph, G().back_exec, G().back_runs, body);
         }
+    }
+    // --ngram-flag-wait: the same forward as one graph, the front and the back around the wait for
+    // the round's rows (wait_for_rows); the host reads them after the launch (gather_rows).
+    void run_decode_round() {
+        const std::uint32_t split = forward_->rows_layer();
+        launch_round(
+            G().round_graph, G().round_exec,
+            [this, split] {
+                forward_->run_front(batch(1, true), split);
+                wait_for_rows(1);
+                forward_->run_back(batch(1, true), split, logits32_);
+                ops::cast_fp32_to_bf16(logits32_, logits16_, device_.stream);
+            },
+            g_ngram_flag_rounds);
     }
 
     // Samples the next token from the last call's logits (`logits`, or the shared logits16_) at
@@ -3657,6 +4158,8 @@ private:
             g.verify_back.resize(static_cast<std::size_t>(plan_.max_width) + 1);
             g.verify_front_exec.resize(static_cast<std::size_t>(plan_.max_width) + 1);
             g.verify_back_exec.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+            g.verify_round.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+            g.verify_round_exec.resize(static_cast<std::size_t>(plan_.max_width) + 1);
             g.verify_runs.assign(static_cast<std::size_t>(plan_.max_width) + 1, 0);
             g.verify_back_runs.assign(static_cast<std::size_t>(plan_.max_width) + 1, 0);
             g.draft_graphs.resize(static_cast<std::size_t>(plan_.drafts) + 1);
@@ -3680,7 +4183,7 @@ private:
         auto& records = records_.at(static_cast<std::size_t>(W));
         if (!records) {
             LayoutBuilder builder;
-            const auto layout = plan_gdn_replay_records(builder, SpecLayout::records_spec(c_, W));
+            const auto layout = plan_gdn_replay_records(builder, gdn_records_spec(c_, W, options_.gdn_head_map));
             records.emplace(DeviceSpan{spec_base(), plan_.spec.gdn_bytes}, layout);
         }
         const auto& s = plan_.spec;
@@ -3728,6 +4231,18 @@ private:
             plan.emplace(*records_.at(static_cast<std::size_t>(W)), view);
         }
         return *plan;
+    }
+
+    // --gdn-async-commit: the device stream waits for the fold in flight (none: nothing). Every
+    // entry point that enqueues device work joins first, except a single-row decode round, which
+    // joins just before its forward's front (verify, or a plain round's run_decode): its drafter
+    // steps before that read no GDN state or records, so they overlap the fold. Never inside a
+    // capture.
+    void join_gdn_fold() {
+        if (fold_stream_) { fold_stream_->join(device_.stream); }
+    }
+    void settle_gdn_fold() noexcept {
+        if (fold_stream_) { fold_stream_->settle(device_.stream); }
     }
 
     // Runs `body` eagerly on its first use (the kernels' one-time setup runs outside a capture),
@@ -3840,7 +4355,8 @@ private:
 
     // `steps` chained drafter steps from the saved residual and the anchor (Infernix mtp_draft):
     // step j writes the cell S - 1 + j and drafts the token at S + 1 + j. The steps pool from a copy
-    // of the drafter's tail. Returns the drafts on the host.
+    // of the drafter's tail. Returns the drafts on the host (with --mtp-joint-acceptance their
+    // probabilities are in draft_probs_host_ too).
     std::span<const TokenId> mtp_draft(std::int32_t steps) {
         const cudaStream_t s = device_.stream;
         const nvtx::ScopedRange range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Decode);
@@ -3864,64 +4380,84 @@ private:
                        call.kv_only      = false;
                        call.residual_out = chain_tensor;
                        call.drafts       = spec_word(plan_.spec.w_drafts + static_cast<std::size_t>(j), 1);
+                       if (options_.mtp_joint_acceptance) {
+                           call.probs = Tensor(static_cast<std::byte*>(draft_probs_.p) + 4 * static_cast<std::size_t>(j),
+                                               DType::FP32, {1});
+                       }
                        forward_->run_mtp(call);
                    }
                });
         CUDA_CHECK(cudaMemcpyAsync(spec_words_host() + plan_.spec.w_drafts, spec_words_device() + plan_.spec.w_drafts,
                                    4ULL * steps, cudaMemcpyDeviceToHost, s));
+        if (options_.mtp_joint_acceptance) {
+            CUDA_CHECK(cudaMemcpyAsync(draft_probs_host_.data(), draft_probs_.p, 4ULL * steps, cudaMemcpyDeviceToHost, s));
+        }
         {
             const nvtx::ScopedRange wait(nvtx::Name::DecodeMtpWait, nvtx::Category::Decode);
+            // The graph runs while the host reads the anchor column's n-gram rows (the drafts' rows
+            // are unknown until the sync), so verification's row read finds them cached.
+            if (options_.ngram_prefetch) { prefetch_anchor_rows(); }
             device_.synchronize();
         }
         drafts_.assign(spec_words_host() + plan_.spec.w_drafts, spec_words_host() + plan_.spec.w_drafts + steps);
         return drafts_;
     }
 
-    // Infernix choose_draft_length: the K in [0, limit] maximizing expected tokens per round time,
-    // where a round of K drafts costs 1 + width_cost * K plain rounds; every kProbeInterval rounds
-    // one draft more than the choice keeps the next position's estimate current.
+    // Infernix choose_draft_length: ema_draft_length (draft_policy.h) picks the K in [0, limit]
+    // maximizing expected tokens per round time, where a round of K drafts costs 1 + width_cost * K
+    // plain rounds; every kProbeInterval rounds one draft more than the choice keeps the next
+    // position's estimate current.
     std::int32_t choose_draft_length(std::int32_t limit) {
-        std::int32_t best = 0;
-        double best_score = 1.0, reach = 1.0, tokens = 1.0;
-        for (std::int32_t k = 1; k <= limit; ++k) {
-            reach *= L().mtp_accept[static_cast<std::size_t>(k - 1)];
-            tokens += reach;
-            const double score = tokens / (1.0 + width_cost() * k);
-            if (score > best_score) {
-                best_score = score;
-                best       = k;
-            }
-        }
+        std::int32_t best = ema_draft_length(L().mtp_accept, limit, width_cost());
         if (++L().mtp_policy_rounds % kProbeInterval == 0) { best = std::min(best + 1, limit); }
         if (options_.mtp_fixed_drafts) { best = limit; }
         return best;
     }
 
     // The round's speculative verification, or nullopt for a plain round (no drafter, a
-    // constrained row, too little budget or context, or the policy chose no drafts).
+    // constrained row without --mtp-constrained, too little budget or context, or the policy chose
+    // no drafts).
     std::optional<PendingBatch> try_speculate(SequenceHandle row, const runtime::RoundBudget& budget,
                                               runtime::TokenMaskProvider* masks, Clock::time_point start) {
-        if (plan_.drafts == 0 || !L().mtp_live || (masks != nullptr && masks->constrained(0))) { return std::nullopt; }
+        if (plan_.drafts == 0 || !L().mtp_live ||
+            (masks != nullptr && masks->constrained(0) && !options_.mtp_constrained) || cpu_verify_failed()) {
+            return std::nullopt;
+        }
         // A row drafts at most one token fewer than it may still emit, and every verified position
         // lies within the request's reserved extent.
         const std::int64_t room = std::min<std::int64_t>(static_cast<std::int64_t>(budget.generated_tokens_remaining) - 1,
                                                          static_cast<std::int64_t>(L().extent) - L().state_tokens - 1);
         const std::int32_t limit = static_cast<std::int32_t>(std::clamp<std::int64_t>(room, 0, plan_.drafts));
         if (limit <= 0) { return std::nullopt; }
-        const std::int32_t steps = choose_draft_length(limit);
+        // --mtp-joint-acceptance (phase A): draft the ceiling, then verify the prefix the joint rule
+        // keeps under the request's threshold (at least the first draft). A constrained row's masks
+        // are filled for the verified drafts only.
+        const std::int32_t steps = options_.mtp_joint_acceptance ? limit : choose_draft_length(limit);
         if (steps == 0) { return std::nullopt; }
-        const auto drafts = mtp_draft(steps);
-        return verify(row, drafts, start);
+        auto drafts = mtp_draft(steps);
+        if (options_.mtp_joint_acceptance) {
+            const std::span<const float> probs(static_cast<const float*>(draft_probs_host_.data()),
+                                               static_cast<std::size_t>(steps));
+            const int kept = joint_acceptance_window(probs, L().joint_threshold.current());
+            std::copy_n(probs.begin(), kept, L().joint_probs.begin());
+            L().joint_offered = kept;
+            drafts            = drafts.first(static_cast<std::size_t>(kept));
+        }
+        return verify(row, drafts, start, masks != nullptr && masks->constrained(0) ? masks : nullptr);
     }
 
     // One verification round (Infernix verify): the anchor and the drafts as W consecutive
     // columns, one forward that leaves the recurrent state in place, then acceptance on the device.
-    PendingBatch verify(SequenceHandle row, std::span<const TokenId> drafts, Clock::time_point start) {
+    // A constrained row (`masks`, with --mtp-constrained) accepts under one grammar mask per column.
+    PendingBatch verify(SequenceHandle row, std::span<const TokenId> drafts, Clock::time_point start,
+                        runtime::TokenMaskProvider* masks) {
         const cudaStream_t s  = device_.stream;
         const std::int32_t K  = static_cast<std::int32_t>(drafts.size()), W = K + 1;
         const std::int32_t S  = static_cast<std::int32_t>(L().state_tokens);
         const auto& sp        = plan_.spec;
         const nvtx::ScopedRange range(nvtx::Name::DecodeMtpRound, nvtx::Category::Decode);
+        // --cpu-verify-misses: the round's CPU legs report to a clear error word.
+        arm_cpu_error(false);
         // The columns' tokens: the history's anchor, then the drafts (appended while staging).
         const std::size_t history = L().history.size();
         L().history.insert(L().history.end(), drafts.begin(), drafts.end());
@@ -3942,28 +4478,53 @@ private:
         const Tensor wide32(logits32_.data, DType::FP32, {vocab_, W});
         Tensor wide16(logits16_.data, DType::BF16, {vocab_, W});
         const auto w = static_cast<std::size_t>(W);
-        replay(G().verify_front.at(w), G().verify_front_exec.at(w), G().verify_runs.at(w), [&] {
-            // The verification pools from copies of the live tails.
-            // (the lane's tails sit one lane stride apart per layer; the copies are packed)
+        // --gdn-async-commit: the previous commit's fold lands before the front reads the state and
+        // rewrites the records the fold reads.
+        join_gdn_fold();
+        // The verification pools from copies of the live tails.
+        // (the lane's tails sit one lane stride apart per layer; the copies are packed)
+        const auto front = [&] {
             CUDA_CHECK(cudaMemcpy2DAsync(spec_base() + sp.tails, align(plan_.tail), tails_base_, tail_layer_stride_,
                                          plan_.tail, c_.attention_layers, cudaMemcpyDeviceToDevice, s));
             forward_->run_front(batch(W, true, &view), split);
-        });
-        {
-            const nvtx::ScopedRange rows(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode);
-            upload_rows(S, W);
-        }
-        L().history.resize(history);
-        replay(G().verify_back.at(w), G().verify_back_exec.at(w), G().verify_back_runs.at(w), [&] {
+        };
+        const auto back = [&] {
             Tensor logits = wide32;
             forward_->run_back(batch(W, true, &view), split, logits);
             ops::cast_fp32_to_bf16(wide32, wide16, s);
-        });
+        };
+        if (rows_in_graph(G().verify_runs.at(w) > 0 && G().verify_back_runs.at(w) > 0)) {
+            // --ngram-flag-wait: one graph, the rows behind the flag (raised once they are read).
+            launch_round(
+                G().verify_round.at(w), G().verify_round_exec.at(w),
+                [&] {
+                    front();
+                    wait_for_rows(W);
+                    back();
+                },
+                g_ngram_flag_verifications);
+            const nvtx::ScopedRange rows(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode);
+            gather_rows(S, W);
+        } else {
+            replay(G().verify_front.at(w), G().verify_front_exec.at(w), G().verify_runs.at(w), front);
+            {
+                const nvtx::ScopedRange rows(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode);
+                upload_rows(S, W);
+            }
+            replay(G().verify_back.at(w), G().verify_back_exec.at(w), G().verify_back_runs.at(w), back);
+        }
+        L().history.resize(history);
         residency_->enqueue_route_download(s, W);
+        // A constrained row's masks, filled on the host while the forward runs (the drafts are
+        // already here) and uploaded ahead of acceptance.
+        ops::SamplingMask mask;
+        std::uint32_t dead = 0;
+        if (masks != nullptr) { dead = stage_verify_masks(*masks, drafts, mask); }
         // Acceptance from BF16 logits, as plain decode samples them.
         Tensor target = spec_word(sp.w_target, W);
         ops::argmax(wide16, target, plan_.token_domain, s);
-        install_round_config();
+        // A positive threshold runs the relaxed acceptance instance (relaxed drafting).
+        const bool relaxed = install_round_config(mask) > 0.0F;
         {
             auto scope = work_->scope();
             Tensor licensed = spec_word(sp.w_licensed, W).view({W, 1});
@@ -3971,13 +4532,18 @@ private:
             Tensor accepted = spec_word(sp.w_accepted, 1);
             Tensor lengths  = spec_word(sp.w_lengths, 1);
             Tensor anchors  = spec_word(sp.w_anchors, 1);
+            Tensor kept     = spec_word(sp.w_relaxed, 1);
             ops::speculative_accept_greedy_drafts(target.view({W, 1}), wide16.view({vocab_, W, 1}),
                                                   spec_word(sp.w_drafts, K).view({K, 1}), spec_word(sp.w_extents, 1),
                                                   lengths, anchors, licensed, counts, accepted, plan_.token_domain,
-                                                  configs_, *work_, s);
+                                                  configs_, *work_, s, relaxed ? &kept : nullptr);
         }
         CUDA_CHECK(cudaMemcpyAsync(words + sp.w_licensed, spec_words_device() + sp.w_licensed,
                                    4ULL * (sp.w_accepted + 1 - sp.w_licensed), cudaMemcpyDeviceToHost, s));
+        if (relaxed) {
+            CUDA_CHECK(cudaMemcpyAsync(words + sp.w_relaxed, spec_words_device() + sp.w_relaxed, 4,
+                                       cudaMemcpyDeviceToHost, s));
+        }
         const auto wait = Clock::now();
         {
             const nvtx::ScopedRange waiting(nvtx::Name::DecodeMtpWait, nvtx::Category::Decode);
@@ -3985,11 +4551,19 @@ private:
         }
         runtime::ExecutionTiming timing;
         timing.device_wait_ns = elapsed_ns(wait);
+        // Before anything reads the round's outputs. Both words are read before either check throws,
+        // so neither is left set for a later round; decode()'s catch releases the lane.
+        const std::uint32_t flag_error = take_ngram_flag_error();
+        check_cpu_verify();
+        throw_ngram_flag(flag_error);
         const std::int32_t LC = words[sp.w_counts], A = words[sp.w_accepted];
-        if (LC < 1 || LC > W || A != LC - 1) {
+        const std::int32_t kept = relaxed ? words[sp.w_relaxed] : 0;
+        if (LC < 1 || LC > W || A != LC - 1 || kept < 0 || kept > A) {
             release_lane();
             throw std::logic_error("Qwen3.8-Flash-Next: acceptance returned an invalid extent");
         }
+        // The licensed tokens run into a dead end: the row fails, committing none of them.
+        const bool constraint_failed = masks != nullptr && constrained_accept_limit(dead, LC) < LC;
         for (std::int32_t j = 0; j < LC; ++j) {
             const TokenId token = words[sp.w_licensed + j];
             if (token < 0 || token >= plan_.token_domain) {
@@ -4003,6 +4577,7 @@ private:
         ++stats.rounds;
         stats.drafted_tokens += static_cast<std::uint64_t>(K);
         stats.accepted_tokens += static_cast<std::uint64_t>(A);
+        stats.relaxed_kept += static_cast<std::uint64_t>(kept);
         if (stats.accepted_per_position.size() < static_cast<std::size_t>(plan_.drafts)) {
             stats.accepted_per_position.resize(static_cast<std::size_t>(plan_.drafts), 0);
         }
@@ -4026,14 +4601,42 @@ private:
         ++decode_rounds_;
         return ContractAccess::make_speculative(this, pending_, row,
                                                 {pending_tokens_.data(), static_cast<std::size_t>(W)}, LC,
-                                                static_cast<std::uint32_t>(W), timing);
+                                                static_cast<std::uint32_t>(W), timing, constraint_failed);
     }
 
-    // The row's sampling config on the device (acceptance reads it), without a grammar mask.
-    void install_round_config() {
+    // A constrained verification's grammar masks: one per position 0..K from the drafts (position j
+    // follows the committed output and drafts[0:j]), written to the pinned staging and uploaded to
+    // the planned device masks. Returns the dead-end position bits; `mask` addresses the masks.
+    std::uint32_t stage_verify_masks(runtime::TokenMaskProvider& masks, std::span<const TokenId> drafts,
+                                     ops::SamplingMask& mask) {
+        const std::size_t bytes = 4ULL * plan_.mask_words * (drafts.size() + 1);
+        if (bytes > plan_.bytes.mtp_constrained_masks) {
+            throw std::logic_error("Qwen3.8-Flash-Next: a constrained verification is wider than its planned masks");
+        }
+        auto* words = static_cast<std::uint32_t*>(mask_host_.data());
+        const std::uint32_t dead = masks.fill(0, drafts, std::span<std::uint32_t>(words, bytes / 4));
+        upload_pinned(verify_masks_.p, words, bytes, device_.stream);
+        masks.uploaded(0, bytes);
+        mask = {static_cast<const std::uint32_t*>(verify_masks_.p), static_cast<std::int32_t>(plan_.mask_words)};
+        return dead;
+    }
+
+    // The row's sampling config on the device (acceptance reads it), with a constrained row's
+    // per-position grammar masks (null: none). Returns the round's relaxed drafting threshold: the
+    // request's, or 0 for a constrained row, a greedy one and one whose committed ids end inside a
+    // tool call (a tool call's name and arguments are sampled exactly).
+    float install_round_config(ops::SamplingMask mask) {
         auto* host_config = static_cast<ops::SamplingConfig*>(config_host_.data());
         *host_config      = L().sampling;
+        host_config->mask = mask;
+        if (!options_.relaxed_drafting || !(host_config->relaxed_threshold > 0.0F) ||
+            !(host_config->temperature > 0.0F) || mask.words != nullptr ||
+            ops::ledger_in_tool_call(L().history, relaxed_tokens_.tool_call_open,
+                                     relaxed_tokens_.tool_call_close)) {
+            host_config->relaxed_threshold = 0.0F;
+        }
         upload_pinned(configs_, host_config, sizeof(ops::SamplingConfig), device_.stream);
+        return host_config->relaxed_threshold;
     }
 
     // The drafter's cells of `k` committed positions from S (Infernix mtp_catch_up, the committed
@@ -4100,6 +4703,14 @@ private:
             release_lane();
             throw std::logic_error("Qwen3.8-Flash-Next: commit exceeds the licensed tokens");
         }
+        // The joint rule's evidence: the offered drafts' probabilities and how many the device
+        // accepted (pending_count_ - 1), whatever the commit keeps of them.
+        if (L().joint_offered > 0) {
+            L().joint_threshold.observe(std::span<const float>(L().joint_probs.data(),
+                                                               static_cast<std::size_t>(L().joint_offered)),
+                                        pending_count_ - 1);
+            L().joint_offered = 0;
+        }
         if (L().history.size() == L().prompt_tokens) {
             L().first_token_seconds = std::chrono::duration<double>(Clock::now() - L().admitted).count();
             L().cache_at_decode     = residency_->stats();
@@ -4111,7 +4722,17 @@ private:
         words[sp.w_commit]  = k;
         upload_pinned(spec_words_device() + sp.w_commit, words + sp.w_commit, 4, s);
         const ops::GdnReplayFoldRow row{0, 0, k};
-        fold(W).execute(std::span<const ops::GdnReplayFoldRow>(&row, 1), s);
+        const std::span<const ops::GdnReplayFoldRow> rows(&row, 1);
+        if (fold_stream_ && gdn_fold_on_side_stream(options_, d.terminal)) {
+            // --gdn-async-commit, a row that continues: the fold runs on the fold stream beside the
+            // commits and the drafter's catch-up below (none reads the recurrent state or the GDN
+            // records) and the next round's drafts; the next device use of the state joins it.
+            const ops::GdnReplayFoldPlan& plan = fold(W);
+            fold_stream_->run(s, [&](cudaStream_t side) { plan.execute(rows, side); });
+            g_async_gdn_folds.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            fold(W).execute(rows, s);
+        }
         auto* base = static_cast<std::byte*>(io_device_.p);
         const Tensor positions(base + plan_.io.positions, DType::I32, {W});
         const Tensor commit = spec_word(sp.w_commit, 1);
@@ -4149,7 +4770,7 @@ private:
     CommitRowResult::SpeculativeCounters speculative_counters() const {
         if (plan_.drafts == 0) { return {}; }
         const auto& s = L().speculative;
-        return {s.rounds, s.drafted_tokens, s.accepted_tokens, s.fallback_steps};
+        return {s.rounds, s.drafted_tokens, s.accepted_tokens, s.fallback_steps, 0, 0, 0, s.relaxed_kept};
     }
 
     // ---------------------------------------------------------------- expert cache
@@ -4187,7 +4808,9 @@ private:
         if (rate <= 0.0 && !banks.empty() && staging_.p != nullptr) {
             // An idle GPU parks its PCIe link at a low rate: enough repetitions (~0.1-0.3 s) wake it
             // before the best one is taken.
-            rate = measure_h2d_bytes_per_second(banks.front().host_records, staging_.p, plan_.staging, 32);
+            const std::uint8_t* source = banks.front().host_records;
+            if (residency_->partial() && residency_->ram_pool_bytes() >= plan_.staging) { source = residency_->ram_pool(); }
+            if (source != nullptr) { rate = measure_h2d_bytes_per_second(source, staging_.p, plan_.staging, 32); }
         }
         if (rate > 0.0) { link_ = rate; }
         char text[160];
@@ -4222,10 +4845,80 @@ private:
         }
     }
 
+    // --partial-ram-residency: the residency's RAM slots and a reader of the records left in the
+    // artifact (plan_load with partial), through a Reader of its own, kept until the experts are placed.
+    std::optional<ExpertResidency::PartialSetup> partial_setup() {
+        if (!options_.partial_ram_residency) { return std::nullopt; }
+        const auto banks = parameters_.model.expert_banks();
+        if (options_.partial_slots.size() != banks.size()) {
+            throw std::invalid_argument("Qwen3.8-Flash-Next: --partial-ram-residency needs one RAM slot count per layer");
+        }
+        for (const auto& bank : banks) {
+            if (bank.host_records != nullptr) {
+                throw std::logic_error("Qwen3.8-Flash-Next: --partial-ram-residency needs banks left in the artifact");
+            }
+        }
+        partial_reader_ = std::make_unique<artifact::Reader>(options_.artifact_path);
+        if (artifact::artifact_id_hex(partial_reader_->artifact_id()) !=
+            artifact::artifact_id_hex(parameters_.model.info().artifact_id)) {
+            throw std::invalid_argument("Qwen3.8-Flash-Next: --partial-ram-residency reads its experts from another "
+                                        "artifact than the one loaded");
+        }
+        ExpertResidency::PartialSetup setup;
+        setup.slots = options_.partial_slots;
+        setup.read  = [this](std::uint32_t layer, std::uint32_t first, std::uint32_t count, std::span<std::byte> out) {
+            const auto& bank = parameters_.model.expert_banks()[layer];
+            if (out.size() != static_cast<std::uint64_t>(count) * bank.record_stride || first + count > bank.experts) {
+                throw std::logic_error("Qwen3.8-Flash-Next: an expert record read outside its bank");
+            }
+            partial_reader_->read_into(bank.artifact_offset + static_cast<std::uint64_t>(first) * bank.record_stride, out);
+        };
+        return setup;
+    }
+
+    // --partial-ram-residency: every expert into its frame or RAM slot, before the first request,
+    // with the warm start's counts (when a state loads) seeded into the LFRU.
+    void place_partial_experts() {
+        const auto keys = c_.num_hidden_layers * c_.moe.experts;
+        std::optional<expert_cache::WarmStartLoad> warm;
+        if (!options_.expert_state.empty() && !options_.partial_state) {
+            warm.emplace(expert_cache::load_warm_start({options_.expert_state, options_.expert_state_identity,
+                                                        options_.default_expert_state,
+                                                        options_.default_expert_state_identity},
+                                                       keys));
+            expert_state_saved_ = Clock::now();
+        }
+        if (options_.partial_state) { expert_state_saved_ = Clock::now(); }
+        const auto* state = options_.partial_state ? options_.partial_state.get()
+                            : warm && warm->load.state ? &*warm->load.state
+                                                       : nullptr;
+        const auto start  = Clock::now();
+        const std::uint32_t loaded =
+            residency_->place_partial(options_.partial_vram_keys, state, kSeedCountCap, device_.stream);
+        partial_reader_.reset();
+        char line[320];
+        std::snprintf(line, sizeof(line),
+                      "partial RAM residency: %u experts read into VRAM frames (held only there), %u of %u frames; "
+                      "the other %u in %.1f GiB of pinned RAM slots (%.2f s)",
+                      loaded, loaded, residency_->frames(), keys - loaded,
+                      static_cast<double>(residency_->ram_pool_bytes()) / (1ULL << 30),
+                      std::chrono::duration<double>(Clock::now() - start).count());
+        diagnostic(line);
+        expert_state_routed_ = residency_->stats().routed;
+    }
+
     void warm_start_experts() {
+        if (options_.partial_ram_residency) {
+            place_partial_experts();
+            return;
+        }
         if (options_.expert_state.empty() || !options_.expert_cache || residency_->frames() == 0) { return; }
         const auto keys = c_.num_hidden_layers * c_.moe.experts;
-        const auto load = expert_cache::load_expert_state(options_.expert_state, options_.expert_state_identity, keys);
+        const auto warm = expert_cache::load_warm_start(
+            {options_.expert_state, options_.expert_state_identity, options_.default_expert_state,
+             options_.default_expert_state_identity},
+            keys);
+        const auto& load    = warm.load;
         expert_state_saved_ = Clock::now();
         if (!load.state) {
             diagnostic("expert cache: " + load.message + "; it starts empty and fills as requests arrive");
@@ -4236,9 +4929,12 @@ private:
         const std::uint32_t loaded = residency_->warm_start(*load.state, kSeedCountCap, max_keys, device_.stream);
         device_.synchronize();
         char line[200];
-        std::snprintf(line, sizeof(line), "expert cache: restored the %u most-used experts from the last session (%.1f GiB in %.2f s)",
-                      loaded, static_cast<double>(loaded) * static_cast<double>(residency_->frame_stride()) / (1ULL << 30),
-                      std::chrono::duration<double>(Clock::now() - start).count());
+        const char* source = warm.from_fallback ? "the default state shipped with the model" : "the last session";
+        const double gib   = static_cast<double>(loaded) * static_cast<double>(residency_->frame_stride()) /
+                           (1ULL << 30);
+        std::snprintf(line, sizeof(line),
+                      "expert cache: restored the %u most-used experts from %s (%.1f GiB in %.2f s)", loaded,
+                      source, gib, std::chrono::duration<double>(Clock::now() - start).count());
         diagnostic(line);
         expert_state_routed_ = residency_->stats().routed;
     }
@@ -4529,6 +5225,7 @@ private:
     VramDemand demand_; // as sized at startup: the frames' and the KV's one device ledger
     std::optional<VramControl> control_;
     std::unique_ptr<VramMonitor> monitor_;
+    std::unique_ptr<artifact::Reader> partial_reader_; // --partial-ram-residency, until the experts are placed
     Clock::time_point vram_epoch_{};
     std::uint32_t frames_now_ = 0, startup_frames_ = 0;
     std::uint64_t pool_now_ = 0;
@@ -4545,14 +5242,51 @@ private:
     PinnedHostBuffer io_host_{1};
     PinnedHostBuffer host_token_{1};
     PinnedHostBuffer mask_host_{1};
+    // --mtp-joint-acceptance: the drafts' probabilities on the device and their pinned staging.
+    DeviceBuffer draft_probs_;
+    PinnedHostBuffer draft_probs_host_{1};
+    // --hot-embedding-rows: the token embedding's first rows (ProgramDevicePlan::hot_embedding).
+    DeviceBuffer hot_embedding_;
+    const void* cold_embedding_ = nullptr; // the whole table's device pointer in the mapped pinned block
     PinnedHostBuffer config_host_{1};
+    // Relaxed drafting's tokenizer facts (ProgramOptions::relaxed_drafting; empty when off).
+    qwen3_5::frontend::RelaxedDraftingTokens relaxed_tokens_;
     Tensor logits32_, logits16_, sampled_, sample_position_, token_counts_;
     Tensor lane_logits_; // BF16 [V, lanes]: each lane's last prefill call's logits (checkpoints, exact hits)
     ops::SamplingConfig* configs_ = nullptr;
     std::uint32_t* masks_         = nullptr;
+    // --mtp-constrained: a verification's grammar masks, one per position (empty when off).
+    DeviceBuffer verify_masks_;
     std::unique_ptr<WorkspaceArena> work_;
     DeviceBuffer staging_;
+    // --cpu-verify-misses or --prefill-cpu-share: the CPU miss service (its thread runs for the
+    // Program's life; declared before the forward and the graphs so it is destroyed after them, once
+    // the destructor has synchronized) and the mapped error word its calls' waits report to.
+    std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_misses_;
+    std::optional<PinnedHostBuffer> cpu_error_; // set only with either option
+    std::uint32_t* cpu_error_device_ = nullptr;
+    bool cpu_verify_off_reported_    = false;
+    bool prefill_share_off_reported_ = false;
+    // The error word's host side: armed before a call that may hand the service jobs, read after it
+    // (check_cpu_verify, check_cpu_prefill); unbound when off.
+    CpuErrorWord cpu_error_word_;
+    // --prefill-cpu-share: the widest call the prefill channel serves (0: off) and the LFRU use
+    // counts a streamed call's cold sets are ranked by.
+    std::int32_t prefill_cpu_columns_ = 0;
+    std::vector<std::uint32_t> stream_counts_;
+    // --ngram-flag-wait: the mapped flag and error word (64 bytes apart), their device addresses, the
+    // round graphs' wait counter, and the flag's last raised value (the count of round launches).
+    // Declared before the forward and the graphs, like the CPU miss service's words. Unset when off.
+    // ngram_launch_blocking_: CUDA_LAUNCH_BLOCKING=1 at startup, so rounds keep their two parts.
+    std::optional<PinnedHostBuffer> ngram_flag_;
+    bool ngram_launch_blocking_ = false;
+    std::uint32_t* ngram_flag_device_  = nullptr;
+    std::uint32_t* ngram_error_device_ = nullptr;
+    DeviceBuffer ngram_sequence_;
+    std::uint32_t ngram_raised_ = 0;
     std::unique_ptr<ExpertResidency> residency_;
+    // --hc-int8: the mixers' int8 copies (declared before the forward, which reads them).
+    std::unique_ptr<execution::HcInt8Copies> hc_int8_;
     std::unique_ptr<execution::Forward> forward_;
     // Wide prefill: the frames lent for the prompt (workspace, stream tables, ring), the arena over
     // their workspace part, and the stream.
@@ -4576,6 +5310,11 @@ private:
         DecodeGraphDefinition front_graph, back_graph;
         DecodeGraphExecutable front_exec, back_exec;
         std::uint64_t front_runs = 0, back_runs = 0;
+        // --ngram-flag-wait: the plain round and each width's verification as one graph.
+        DecodeGraphDefinition round_graph;
+        DecodeGraphExecutable round_exec;
+        std::vector<DecodeGraphDefinition> verify_round;
+        std::vector<DecodeGraphExecutable> verify_round_exec;
         std::vector<std::optional<ops::GdnReplayFoldPlan>> folds;
         std::vector<DecodeGraphDefinition> verify_front, verify_back, draft_graphs, catch_graphs, row_catch_graphs;
         std::vector<DecodeGraphExecutable> verify_front_exec, verify_back_exec, draft_execs, catch_execs, row_catch_execs;
@@ -4598,6 +5337,9 @@ private:
     const execution::VisionInput* call_vision_ = nullptr;
     std::vector<execution::VisionInput> mtp_vision_inputs_;
     std::vector<std::optional<GdnReplayRecords>> records_;
+    // --gdn-async-commit: the fold stream (null when off). Declared after the state and the
+    // speculation buffers, so it is destroyed (waiting for the fold in flight) before they are freed.
+    std::unique_ptr<GdnFoldStream> fold_stream_;
     std::vector<TokenId> pending_tokens_, drafts_;
     std::int32_t pending_count_ = 0, round_width_ = 1;
     bool plain_round_           = false;
@@ -4630,8 +5372,9 @@ private:
     bool deferred_             = false; // a decode round's cache update awaits its commit
     std::uint64_t decode_rounds_ = 0, rows_rounds_ = 0;
     std::uint64_t budget_tokens_ = 0;
-    std::vector<std::int32_t> ngram_window_;
     std::vector<std::uint32_t> row_ids_;
+    std::vector<std::int32_t> ngram_window_; // ngram_window_rows' token window, kept between calls
+    std::vector<std::byte> prefetch_sink_; // the anchor prefetch's rows, read only to fill the volume's cache
     Clock::time_point expert_state_saved_{};
     std::uint64_t expert_state_routed_ = 0;
 
@@ -4719,6 +5462,133 @@ Program::Program(const execution::Parameters& parameters, DeviceContext& device,
 
 Program::~Program() noexcept = default;
 
+std::uint32_t shared_expert_columns(const ProgramOptions& options) {
+    return std::max({std::min(options.prefill_chunk, options.max_context), options.max_concurrency,
+                     1U + options.mtp_draft_tokens});
+}
+
+std::uint64_t plan_shared_expert_workspace(const ProgramOptions& options, const TextConfig& config) {
+    if (!options.shared_expert_stream) { return 0; }
+    return execution::Forward::shared_expert_workspace_bytes(config,
+                                                             static_cast<std::int32_t>(shared_expert_columns(options)));
+}
+
+std::uint64_t plan_mtp_constrained_masks(const ProgramOptions& options, std::uint32_t public_tokens) {
+    if (!options.mtp_constrained || options.mtp_draft_tokens == 0) { return 0; }
+    const std::uint64_t words = (static_cast<std::uint64_t>(public_tokens) + 31) / 32;
+    return 4ULL * words * (1ULL + options.mtp_draft_tokens);
+}
+
+std::size_t plan_hc_fused_read_workspace(const ProgramOptions& options, const TextConfig& config,
+                                         std::int32_t columns) {
+    return options.hc_fused_read ? execution::Forward::hc_fused_read_workspace_bytes(config, columns) : 0;
+}
+
+std::uint64_t plan_hc_int8(const ProgramOptions& options, const TextConfig& config) {
+    if (!options.hc_int8) { return 0; }
+    const std::uint32_t width = config.residual_width(), rank = config.hc.rank;
+    const std::uint64_t block = execution::HcInt8Copies::mixer_bytes(rank + config.hc.streams, width, rank);
+    const std::uint64_t final_mixer = execution::HcInt8Copies::mixer_bytes(rank, width, rank);
+    const bool drafter = options.mtp_draft_tokens > 0;
+    return (2ULL * config.num_hidden_layers + (drafter ? 2U : 0U)) * block + (drafter ? 2U : 1U) * final_mixer +
+           execution::HcInt8Copies::kStatusBytes;
+}
+
+std::uint64_t plan_mtp_draft_probs(const ProgramOptions& options) {
+    if (!options.mtp_joint_acceptance || options.mtp_draft_tokens == 0) { return 0; }
+    return 4ULL * options.mtp_draft_tokens;
+}
+
+CpuMissPlan plan_cpu_misses(const ProgramOptions& options) {
+    namespace om        = ops::offloaded_moe;
+    const bool verify   = options.cpu_verify_misses && options.mtp_draft_tokens > 0;
+    const bool prefill  = options.prefill_cpu_share_num > 0;
+    if (!verify && !prefill) { return {}; }
+    CpuMissPlan p;
+    p.workers = static_cast<int>(options.cpu_verify_workers);
+    if (verify) {
+        // The service's defaults (PR 11: one or two misses hide behind a verification layer's GPU
+        // work) but its column cap: the widest verification.
+        const om::CpuMissService::Options defaults;
+        p.verify_jobs    = defaults.max_jobs;
+        p.verify_columns = static_cast<int>(1 + options.mtp_draft_tokens);
+        p.pcie_divisor   = defaults.pcie_divisor;
+    }
+    if (prefill) {
+        // Every miss may go (Basalt's share has no count cap), in calls of up to the wider of the
+        // static chunk and the streamed call (kWideChunk), at most kMaxCpuCallColumns (a wider call
+        // stays on the GPU). Partial RAM residency has no expert stream, so its calls are at most
+        // the static chunk.
+        const std::uint32_t widest =
+            options.partial_ram_residency
+                ? options.prefill_chunk
+                : std::max(options.prefill_chunk, static_cast<std::uint32_t>(detail::kWideChunk));
+        p.prefill_jobs    = om::kMaxCpuJobs;
+        p.prefill_columns = static_cast<int>(std::min<std::uint32_t>(
+            {widest, options.max_context, static_cast<std::uint32_t>(om::kMaxCpuCallColumns)}));
+        p.share_num = static_cast<int>(options.prefill_cpu_share_num);
+        p.share_den = static_cast<int>(options.prefill_cpu_share_den);
+    }
+    p.max_jobs    = std::max(p.verify_jobs, p.prefill_jobs);
+    p.max_columns = std::max(p.verify_columns, p.prefill_columns);
+    p.device      = sizeof(std::uint32_t);
+    // The service's mapped request, x [H, max_columns], y [H, max_jobs * 8] and its done/heartbeat
+    // line (CpuMissService's constructor), then the Program's 64-byte error word.
+    p.pinned = sizeof(om::MissRequest) + 2ULL * om::kHidden * static_cast<std::uint64_t>(p.max_columns) +
+               2ULL * om::kHidden * static_cast<std::uint64_t>(p.max_jobs) * om::kMaxColumns + 64 + 64;
+    // The worker team's buffers (CpuExpertTeam: per job column the A8 codes and scales of x and of
+    // h; per job its record geometry) and the service's job list.
+    constexpr std::uint64_t kColumnBytes = om::kHidden + 4 * (om::kHidden / 32) + om::kIntermediate + 4 * (om::kIntermediate / 32);
+    p.pageable = static_cast<std::uint64_t>(p.max_jobs) *
+                 (om::kMaxColumns * kColumnBytes + sizeof(om::RecordGeometry) + sizeof(om::CpuExpertJob));
+    return p;
+}
+
+bool gdn_fold_on_side_stream(const ProgramOptions& options, bool terminal) noexcept {
+    return options.gdn_async_commit && options.mtp_draft_tokens > 0 && !terminal;
+}
+
+bool ngram_rows_in_graph(const ProgramOptions& options, bool eager_done, bool launch_blocking) noexcept {
+    return options.ngram_flag_wait && options.use_cuda_graph && eager_done && !launch_blocking;
+}
+
+NgramFlagPlan plan_ngram_flag_wait(const ProgramOptions& options) noexcept {
+    if (!options.ngram_flag_wait) { return {}; }
+    // The flag and the error word, each on its own 64-byte line (the host writes one, the device the
+    // other); the waits' sequence counter on the device.
+    return {sizeof(std::uint32_t), 128};
+}
+
+GdnReplayRecordSpec gdn_records_spec(const TextConfig& c, std::int32_t width, bool gdn_head_map) {
+    // The copy route tiles q/k to one key head per value head; the map reads the key heads in place.
+    const std::uint32_t qk_heads = gdn_head_map ? c.gdn.key_heads : c.gdn.value_heads;
+    return {.layers          = static_cast<std::int32_t>(c.gdn_layers),
+            .record_capacity = 1,
+            .width           = width,
+            .conv_channels   = static_cast<std::int32_t>(c.gdn.conv_channels()),
+            .qk_heads        = static_cast<std::int32_t>(qk_heads),
+            .value_heads     = static_cast<std::int32_t>(c.gdn.value_heads),
+            .key_dim         = static_cast<std::int32_t>(c.gdn.key_head_dim),
+            .value_dim       = static_cast<std::int32_t>(c.gdn.value_head_dim),
+            .head_map        = gdn_head_map ? GdnHeadMap::Tiled : GdnHeadMap::Blocked};
+}
+
+std::uint64_t plan_gdn_record_bytes(const ProgramOptions& options, const TextConfig& config) {
+    if (options.mtp_draft_tokens == 0) { return 0; }
+    LayoutBuilder builder;
+    const auto width = static_cast<std::int32_t>(1 + options.mtp_draft_tokens);
+    return detail::align(plan_gdn_replay_records(builder, gdn_records_spec(config, width, options.gdn_head_map)).payload_bytes());
+}
+
+void require_shared_expert_workspace(std::uint64_t need, std::uint64_t planned, std::uint32_t columns) {
+    if (need > planned) {
+        throw std::invalid_argument("--shared-expert-stream: this model's shared expert Linears need " +
+                                    std::to_string(need) + " bytes of scratch at " + std::to_string(columns) +
+                                    " columns, more than the " + std::to_string(planned) +
+                                    " planned for GGML weights; start without --shared-expert-stream");
+    }
+}
+
 ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const TextConfig& config,
                                        std::uint32_t public_tokens, std::span<const std::uint64_t> record_strides) {
     return detail::ProgramImpl::plan_device(options, config, public_tokens, record_strides);
@@ -4727,6 +5597,15 @@ ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Text
 const ProgramDevicePlan& Program::device_plan() const noexcept { return impl_->device_plan(); }
 const VramSizing& Program::vram_sizing() const noexcept { return impl_->vram_sizing(); }
 Program::ExpertCacheCounters Program::expert_cache_counters() const noexcept { return impl_->cache_counters(); }
+std::uint64_t Program::process_async_gdn_folds() noexcept {
+    return detail::g_async_gdn_folds.load(std::memory_order_relaxed);
+}
+std::uint64_t Program::process_ngram_flag_rounds() noexcept {
+    return detail::g_ngram_flag_rounds.load(std::memory_order_relaxed);
+}
+std::uint64_t Program::process_ngram_flag_verifications() noexcept {
+    return detail::g_ngram_flag_verifications.load(std::memory_order_relaxed);
+}
 
 RequestBasePlan Program::plan_request(PreparedPrompt&& prompt, const runtime::ResolvedExecutionOptions& options) {
     return impl_->plan_request(std::move(prompt), options);

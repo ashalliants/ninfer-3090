@@ -14,8 +14,11 @@ from .gguf_writer import tensor_bytes, write_gguf
 # H is one 256-value super-block so the routed experts can use the IQ record formats.
 H, F, E, HC, LOW = 256, 128, 4, 2, 8
 F32, F16, Q8_0, IQ2_XXS, IQ4_NL, IQ2_S, IQ1_M, BF16, Q2_0 = 0, 1, 8, 16, 20, 22, 29, 30, 42
-# Gate/up type of each layer's experts (down is Q2_0): all three expert record formats.
-EXPERT_TYPES = (IQ2_S, IQ2_XXS, IQ1_M, IQ2_S)
+IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS = 17, 18, 21, 23
+Q4_K, Q5_K = 12, 13
+# (gate/up, down) types of each layer's experts: the IQ2_XS pack's three record formats. The
+# GSQ-RCO IQ3 packs mix other pairs, and downs, across layers (``write(experts=...)``).
+EXPERT_TYPES = ((IQ2_S, Q2_0), (IQ2_XXS, Q2_0), (IQ1_M, Q2_0), (IQ2_S, Q2_0))
 # Four PLE heads (two per n-gram order) of 32 values: head sizes are the consecutive primes from
 # 101 (101, 103, 107, 109), whose sum 420 pads to 512 table rows, Infernix's derivation.
 PLE_HEADS, PLE_DIM, PLE_BASE = 4, 32, 101
@@ -90,7 +93,9 @@ def metadata(**changes) -> list[tuple[str, int, object]]:
     return [(key, kind, value) for key, (kind, value) in items.items() if kind is not None]
 
 
-def tensors(drop=(), extra=()) -> list[tuple[str, int, tuple[int, ...], bytes]]:
+def tensors(
+    drop=(), extra=(), experts=EXPERT_TYPES
+) -> list[tuple[str, int, tuple[int, ...], bytes]]:
     specs = [
         ("token_embd.weight", Q8_0, (H, 16)),
         ("output.weight", Q8_0, (H, 16)),
@@ -114,9 +119,9 @@ def tensors(drop=(), extra=()) -> list[tuple[str, int, tuple[int, ...], bytes]]:
             (p + "ffn_gate_shexp.weight", Q8_0, (H, F)),
             (p + "ffn_up_shexp.weight", IQ4_NL, (H, F)),
             (p + "ffn_down_shexp.weight", Q2_0, (F, H)),
-            (p + "ffn_gate_exps.weight", EXPERT_TYPES[layer], (H, F, E)),
-            (p + "ffn_up_exps.weight", EXPERT_TYPES[layer], (H, F, E)),
-            (p + "ffn_down_exps.weight", Q2_0, (F, H, E)),
+            (p + "ffn_gate_exps.weight", experts[layer][0], (H, F, E)),
+            (p + "ffn_up_exps.weight", experts[layer][0], (H, F, E)),
+            (p + "ffn_down_exps.weight", experts[layer][1], (F, H, E)),
         ]
         if layer == 3:
             specs += [
@@ -171,8 +176,8 @@ def _bytes(name: str, kind: int, ne: tuple[int, ...], seed: int) -> bytes:
     return (np.float32(1.0) + words if rule == "gamma" else words).astype("<f4").tobytes()
 
 
-def write(path: Path, *, metadata_changes=None, drop=(), extra=()) -> Path:
-    return write_gguf(path, metadata(**(metadata_changes or {})), tensors(drop, extra))
+def write(path: Path, *, metadata_changes=None, drop=(), extra=(), experts=EXPERT_TYPES) -> Path:
+    return write_gguf(path, metadata(**(metadata_changes or {})), tensors(drop, extra, experts))
 
 
 def mtp_tensors(drop=()) -> list[tuple[str, int, tuple[int, ...], bytes]]:

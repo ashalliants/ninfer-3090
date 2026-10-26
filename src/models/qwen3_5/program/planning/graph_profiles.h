@@ -1,6 +1,10 @@
 #pragma once
 #include "models/qwen3_5/program/program.h"
 #include "ninfer/ops/attention_geometry.h"
+#include "ninfer/ops/softmax_attention.h"
+
+#include <span>
+#include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
 struct MtpCausalAttentionEnvelopes;
@@ -80,6 +84,21 @@ dflash_graph_profiles(SpeculativeBackend backend, std::uint32_t capacity,
 
 [[nodiscard]] execution::MtpCausalAttentionEnvelopes
 mtp_causal_attention_envelopes(std::uint32_t max_frontier, std::uint32_t k, std::uint32_t capacity);
+// Teacher-forced decode scoring runs eagerly, but with the attention envelopes served graph decode
+// captures at batch one, so it selects the same attention routes: a window of `width` columns is
+// the ordinary step (width 1, ordinary_graph_profiles) or the target verify of an MTP round with
+// width - 1 drafts (mtp_graph_profiles). `capacity` is the scoring Engine's context, so these are
+// a served Engine's envelopes at that context.
+[[nodiscard]] std::vector<GraphExecutionProfile>
+served_decode_profiles(std::uint32_t capacity, std::uint32_t width,
+                       const MtpGraphAttention& attention);
+// The envelope the served profile holding `frontier` captures: {min+1, max+1} for the ordinary
+// step, the MTP target verify's (mtp_causal_attention_envelopes at the profile's maximum)
+// otherwise. Throws std::logic_error when no profile holds the frontier.
+[[nodiscard]] ops::CausalAttentionExecutionEnvelope
+served_decode_envelope(std::span<const GraphExecutionProfile> profiles, std::uint32_t capacity,
+                       std::uint32_t width, std::uint32_t frontier);
+
 // `append_drafts` is the round family's own: its context catch-up appends at most that many plus
 // one columns, and a wider previous round is caught up before a narrower one starts.
 [[nodiscard]] execution::DFlashEnvelopes dflash_envelopes(std::uint32_t max_frontier,

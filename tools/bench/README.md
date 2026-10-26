@@ -107,6 +107,160 @@ Two things it refuses rather than lets you get wrong:
 line and needs changing for `ninfer_bench`, which prints CSV. A run where any sample produced no
 number exits 1, because a comparison with a hole in it is not a comparison.
 
+**One build, an option off and on.** Leave out `--arm-b` and give `--a-args` and `--b-args`
+(they must differ): the one executable runs both arms, each command with its arm's arguments
+appended. The interleaving and the statistics are the same. `--log-dir DIR` keeps every run's
+output, and `--json FILE` writes the result for a script:
+
+```bash
+python tools/bench/run_interleaved_ab.py --arm-a build-ninja/tests/ninfer_tests.exe --reps 12 \
+    --b-args="--moe-fused-route" \
+    --config 'decode:{exe} ninfer_qwen4_exp_engine_real_test --bench --generate 256 --mtp 3 @prompt.ids' \
+    --metric-regex 'decode [0-9.]+ s \(([0-9.]+) tok/s\)' --log-dir ab-logs --json ab.json
+```
+
+Its self-test, `ninfer_interleaved_ab_test`, uses a fake executable and needs no GPU.
+
+## Greedy identity between two builds (`greedy_identity.py`)
+
+Do two builds produce the same tokens? The tool runs each `ninfer` CLI on every prompt of a JSONL file
+(default `bench/fixtures/chat_prompts.jsonl`, 24 prompts) with `--greedy --print-token-ids --max-new N`,
+reads the generated ids the CLI prints on stderr, and prints `GREEDY IDENTICAL`, or `GREEDY DIFFERS`
+with the first differing prompt and token index (exit 1) and the ids around it. Exit 2 means nothing
+was compared: a build crashed, printed no ids line, or neither build generated a token for a prompt.
+
+```bash
+python3 tools/bench/greedy_identity.py \
+    --a build-ninja/apps/ninfer.exe --b build-ninja/apps/ninfer-new.exe \
+    --model models/qwen3_8_27b.ninfer --tokens 128 --limit 6 \
+    --extra-args="--kv-dtype rk4v4 --max-context 8192"
+```
+
+`--extra-args` is one string given to **both** builds; use it for the option under test and to pin
+what would otherwise differ. Write it with `=` so a leading `--` is not read as another option.
+`--limit N` runs only the first N prompts. Both builds must sit in the same directory under different
+names (the same preflight as `run_interleaved_ab.py`). Equal ids say the builds take the same
+numerical path; unequal ids are not necessarily a bug (a different reduction order flips a near-tie), but
+the index says how far in they agree.
+
+`--a-args` and `--b-args` add arguments to one side only. Leave out `--b` and the one build runs as
+both sides, which is how to check that an option designed to keep the output does (the per-side
+arguments must differ):
+
+```bash
+python3 tools/bench/greedy_identity.py --a build-ninja/apps/ninfer.exe \
+    --model models/qwen3_8_27b.ninfer --b-args="--no-cuda-graph"
+```
+
+It runs the builds one after the other on the card, a process per prompt and build, and does not take
+the GPU lock itself. **Hold the lock per prompt**, not around the whole set (CLAUDE.md, "GPU lock": a
+hold over 48 model loads keeps every other session waiting). Give the tool a one-line prompts file
+and wrap each invocation, as `basalt_gpu_verify.py` does:
+
+```powershell
+. tools/gpu-lock.ps1
+foreach ($line in Get-Content bench/fixtures/chat_prompts.jsonl | Where-Object { $_.Trim() }) {
+    Set-Content -Encoding utf8 prompt.jsonl $line
+    Invoke-WithGpuLock { python tools/bench/greedy_identity.py --a ... --b ... --model ... `
+        --prompts prompt.jsonl }
+}
+```
+
+Its self-test, `ninfer_greedy_identity_test`, uses fake CLIs and needs no GPU.
+
+## Verifying the Basalt options on a GPU
+
+The Basalt-learnings branch (issue #383) adds about 25 options, each compiled and CPU-tested but
+never run on a GPU. `basalt_gpu_verify.ps1` (Windows) and `basalt_gpu_verify.sh` (Linux) run every
+GPU check they need in one go, from `basalt_options.json`: each option's kind (identity, quality,
+speed or serving), its GPU-test regex, its identity harness runs, its KLD-gate flag and its A/B
+workload. The status of each is in
+[docs/maintainer/flash-next-plan.md](../../docs/maintainer/flash-next-plan.md#verification-status).
+
+1. Build the branch (`build-ninja`, Release, sm_86, tests and apps; `-DNINFER_BUILD_BENCHMARKS=ON`
+   too for the community preset). For the "every option off equals master" check, build
+   origin/master's `ninfer` CLI and copy it into the same `apps` directory under another name, such
+   as `ninfer-master.exe`.
+2. Gather the inputs. Each step that lacks one is skipped and says which:
+   - `--flash-next`: the Flash-Next artifact with the MTP drafter (`qwen4exp-iq2xs-mtp.ninfer`), its
+     n-gram volume beside it; `--qwen27b`: the 27B DFlash2 bundle; `--qwen35b`: the 35B-A3B
+     (optional);
+   - `--kld-base-flash-next` and `--kld-base-27b`: llama.cpp KL-divergence bases
+     ([flash-next-plan.md](../../docs/maintainer/flash-next-plan.md#decode-path-kld-gate),
+     [perplexity.md](../../docs/perplexity.md)); `--master-cli`: the master CLI from step 1;
+   - `--iq3-pack` (repeatable): the converted IQ3_XXS and IQ3_S packs; `--gguf`: the Flash-Next
+     GGUF for the converter's real-file test; torch, pytest and numpy for the converter suites;
+     `nsys` on the PATH for the `--ggml-decode-mma` policy check.
+3. Look at the plan. The dry run prints every step with its commands and checks that every test
+   regex matches a name `ctest -N` lists; it exits 1 if one does not:
+
+   ```powershell
+   pwsh tools/bench/basalt_gpu_verify.ps1 --build-dir build-ninja --dry-run --flash-next <...> --qwen27b <...>
+   ```
+
+4. Run it, in the background (it takes many hours, mostly model loads: every A/B is 24 processes):
+
+   ```powershell
+   pwsh tools/bench/basalt_gpu_verify.ps1 --build-dir build-ninja --flash-next <...> --qwen27b <...> `
+       --kld-base-flash-next <...> --master-cli build-ninja\apps\ninfer-master.exe
+   ```
+
+   `--only ab:,kld:` or `--skip launchers:,full-suite` picks steps by id prefix; `--reps N` changes
+   the A/B pairs (12 by default); a step can be rerun alone with
+   `python tools/bench/basalt_gpu_verify.py <the same arguments> --action run --step <id>`.
+
+5. Continue an interrupted run with the same arguments plus `--resume`. It leaves out every step
+   whose `results/<step>.json` says PASS, MEASURED or REVIEW and runs the rest (FAIL, ERROR, SKIP
+   and steps never run). Without `--out` it continues the newest run (the newest
+   `profiles/bench/basalt-*` with a `run.json` manifest), so a rerun on a later day lands in the
+   same directory. The wrappers resolve the directory once, before the first step, and pass it to
+   every call, so a run that crosses midnight stays in one directory too.
+
+A given path that does not exist (a misspelt model, a missing base) stops the run before the first
+step, and a step whose input was not given at all is skipped without waiting for the GPU lock.
+
+Order: the GPU tests of every touched area (`tools/run-tests.ps1 -GpuOnly -Regex`, grouped by the
+artifact their real tests read), the identity harness runs, the KLD gate (one option-off run at 20
+and at 100 chunks serves every option; the window check compares window 1 with window 3), the
+`--ggml-decode-mma` per-shape timing and nsys policy check (100-chunk runs only after their
+20-chunk run passes), one ABBA A/B per option and variant (n = 12, the Engine bench through
+`run_interleaved_ab.py` in its same-build mode, the 27B options through `run_chat_decode.py`), four
+combined rows with every winning option on (Flash-Next decode without and with the quality options,
+Flash-Next prefill, the 27B), the ledger's checks (every option off against master with
+`greedy_identity.py`, one step per configuration and prompt, `--relaxed-drafting` starts, a
+`--partial-ram-residency` start, the default expert state, a real-server smoke and soak, the
+community preset, the converter suites, the IQ3 packs, the launchers from a path with spaces and
+`(x86)`, with `package-release.ps1` on Windows), and last the rest of the GPU suite without the slow
+tests (`softmax_attention|kv_materialize`, AGENTS.md).
+
+**What an A/B compares besides speed.** For an identity option each Flash-Next A/B run prints, for
+each of its two jobs, an FNV hash of the greedy ids and, with MTP, the job's MTP rounds, plain steps,
+drafts and accepted drafts; every job's hash and line must be the same in all 24 runs, on and off, or
+the step fails (a drafter that diverged changes the second even when the ids agree). Each arm
+warm-starts from its own copy of `<model>.expert-state` and saves into that copy, so the arms share
+no state and the user's file is only read; the checks that start servers pass `--no-expert-state`.
+The 27B greedy A/B compares the answers' text, off against on, in every repetition.
+
+**The GPU lock.** On Windows the script holds the shared lock (`tools/gpu-lock.ps1`) for each step
+marked `hold` (one ABBA set, one KLD run, one server start and its probes, one prompt of the master
+comparison), releasing it between steps; test steps go through `tools/run-tests.ps1`, which takes it
+per test. The Linux script takes no lock: no Linux script here does, because the Linux box is a
+rented machine used by one session at a time. Do not run it on a shared Linux machine without one.
+It refuses to run under WSL, where the card is the shared Windows 3090 whose lock only Windows can
+hold: use the .ps1 there (the dry run still works).
+
+**Results** go to `profiles/bench/basalt-<date>/` (`--out` to change): `results/<step>.json`,
+`logs/<step>/`, the KLD rows, the generated inputs, and `summary.md`, a table of every option (its
+GPU tests, identity run, KLD numbers and A/B) and every check, ready to paste into the pull request.
+A GPU test that skips although its model was given, or a harness that exits 77, is REVIEW or FAIL,
+never PASS. A speed variant is marked a win at a paired median of at least +1% with three quarters of
+the pairs positive; that only decides what the combined rows turn on, not what ships. Two things stay manual:
+the dashboard (open `/dashboard` in a browser at desktop and phone width) and `--mtp-constrained`'s
+speed (it needs constrained requests through ninfer-serve).
+
+Its self-test, `ninfer_basalt_gpu_verify_test`, checks `basalt_options.json` against the flags
+ninfer-serve parses and the plan against a fake `ctest -N` listing; it needs no GPU.
+
 ## External Serve TTFT
 
 [`ttft/README.md`](ttft/README.md) defines the black-box latency benchmark. The measurement runner
@@ -393,13 +547,14 @@ Use `--resume` to skip completed JSON reports in an existing `--output-dir`, and
 for a minimal script/runner check. `--no-build` uses the binary supplied by `--bench` without
 building it.
 
-Each raw report must be `ninfer_bench_report` schema v19. The flattened summary and schema-v4 matrix
+Each raw report must be `ninfer_bench_report` schema v20. The flattened summary and schema-v4 matrix
 manifest carry native facts from the report: architecture, public name, actual formats, prefill signature, artifact,
 load/read/upload/staging values, Engine memory arenas including the non-additive Vision layout
 inside the unified workspace and CUDA Graph allowance, per-test planned logical and
 allocator-observed workspace peaks, KV capacity and
 payload, configured proposal head and graph mode, phase timings and throughput, and speculative
-rounds/drafts/acceptance/fallbacks. The matrix manifest is descriptive and records the commands and
+rounds/drafts/acceptance/fallbacks, and the GPU power limit at the start and end of each run. The
+matrix manifest is descriptive and records the commands and
 selected local inputs; it does not make repository state part of report validity.
 
 ## Serving corpus benchmark
@@ -544,3 +699,100 @@ have placed it right now?) and the live set stays the real run's, so the engine'
 placement, which would change every later event, is not modelled. A live A/B of plain two-ended placement did
 not show what the replay predicted for it. `python -I tools/bench/test_replay_host_arena.py` checks the tool
 itself and runs as `ninfer_host_arena_replay_test`.
+
+## Randomised serving soak (`serve_soak.py`)
+
+`serve_soak.py` sends a seeded random mix of requests to a running `ninfer-serve` for a fixed time and
+reports what went wrong. It is the long-run check the single-purpose probes above are not: leaks, a lane
+that stops answering, and error paths that only break after hours. It is adapted in shape from Basalt's
+`tools/serve_soak.py` and built on `tools/streaming_http`, so stalls are timed from SSE event arrivals.
+
+| Kind | What it sends | A pass is |
+|---|---|---|
+| `chat` | OpenAI `/v1/chat/completions` and Anthropic `/v1/messages` streams, 32 to 1200 tokens; half carry a unique prefix, so the prompt cache sees both hits and misses | 200 and the stream's terminator (`[DONE]`, `message_stop`) |
+| `cancel` | a stream dropped after 1 to 40 events, or 50 ms to 1.5 s after the send (often mid-prefill) | no error status; nothing else is asserted |
+| `near` | a prompt of context minus the reply and 256 tokens, sized with `/v1/messages/count_tokens` | 200 |
+| `over` | a prompt 2000 tokens beyond the context | 400 `context_length_exceeded` (Anthropic: 400 `invalid_request_error`) |
+| `oversize` | a body one MiB above `--max-request-mib` | 413; a reset while uploading is also accepted and counted as `ok_reset`, since the server answers before it reads the body. `ok_reset` can mask a server that dies on the upload: watch for it in `by_kind` and in the sampler's `server_lost` finding |
+| `image` | base64 data-URL images from `--images DIR` in OpenAI `image_url` / Anthropic `image` parts | 200, or 400 `vision_disabled` from a server without `--vision`, which skips images for the rest of the run |
+
+The first requests are one of every enabled kind, then random picks with 1 to `--max-concurrency` in
+flight; the default is the server's lane count (`len` of `/slots`), so nothing waits in the server's queue
+unless you raise it. `near`, `over` and `oversize` are rationed (a few per ten minutes) because each costs a context-sized
+prefill or a body of hundreds of MiB (the `oversize` body is streamed from one reused 1 MiB chunk, so the
+client holds about 1 MiB however large the limit). `--kinds chat,cancel` narrows the mix. The context is read from `/slots` (`n_ctx`); pass
+`--context` to override it.
+
+Every `--sample-seconds` (2) it reads `/v1/load` (queue depth), `/metrics` (the unlabelled `ninfer_*`
+series), `/slots` (busy lanes, context in use) and the server's resident memory, and keeps them in the
+report's `samples`. It sends a normal `Host`, no `Origin` or `Sec-Fetch-*`, and `--api-key` as
+`Authorization: Bearer`, so it passes the server's Host and Origin checks.
+
+**Run it against a live server under the GPU lock.** The server holds the card for the whole soak, so
+take the lock for the server's lifetime (`CLAUDE.md`, "GPU lock"), then run the soak from a second shell:
+
+```powershell
+. tools/gpu-lock.ps1
+Invoke-WithGpuLock {
+    $server = Start-Process ninfer-serve -ArgumentList 'model.ninfer','--max-context','32768','--vision' -PassThru
+    Start-Sleep 60      # or poll /health
+    python tools/bench/serve_soak.py --url http://127.0.0.1:8080 --minutes 30 --pid $server.Id `
+        --images C:\soak-images --out soak.json
+    $code = $LASTEXITCODE
+    Stop-Process $server
+}
+exit $code
+```
+
+On Linux the memory is read from `/proc/<pid>/status` (`VmRSS`). On Windows it needs `psutil`; when that
+is not installed the run prints a note and leaves memory out (nothing is installed for it). Without
+`--pid` memory is not sampled either. Pass `--seed` to repeat a mix.
+
+**What it flags, and the exit code.** 0 is a clean run; 1 is any of the findings below; 2 is a run that
+could not start (unreachable server, `/v1/models` refused, `--images` with no usable file). The report's
+`findings`, `failures`, `stalls` and `rss` say which.
+
+- **Unexpected result:** a status or error code other than the table's, a stream that ends without its
+  terminator, an error event inside a stream, or a transport error.
+- **Stall:** no SSE event for `--stall-seconds` (60), counted from the end of the upload until the first event
+  and after that from the previous one (a keep-alive comment does not count). Time the server reports as
+  queued does not count: each sampler tick, of the requests still waiting for a first event, the newest
+  `requests.queue_total` from `/v1/load` (the server queues in arrival order, so the older ones hold lanes)
+  have their clock reset. A request that holds a lane and sends nothing for the limit is flagged with its
+  phase (before the first event or mid-stream) and cancelled so the run can end. A request still running
+  when the `--drain-seconds` grace period (stall plus 30 s) after the last launch ends is reported the same
+  way. With `--max-concurrency` above the lane count the extra requests queue; the queue credit covers them
+  only while `/v1/load` reports the queue.
+- **Idle lane with a queue:** `queue_total > 0` while some lane in `/slots` has `is_processing` false, for
+  `--stall-seconds`, or the queue head's `waited_s` is past that on two samples in a row with an idle lane
+  (one sample can fall between a lane finishing and the next admission). Reported once per episode as a
+  `stalls` entry with `kind: "queue"`.
+- **Memory growth:** the median of the last fifth of the second half of the run minus the median of its
+  first fifth is above `--rss-growth-mib` (512). Fewer than 4 samples gives no verdict (the report says so).
+- **Server gone:** `/v1/load`, `/metrics` and `/slots` all fail 3 sampling rounds in a row.
+- **Harness error:** an exception in a sampler step is recorded in `harness_errors` and fails the run instead of
+  silently ending the sampling.
+
+Ctrl-C cancels what is in flight and writes a partial report (`"interrupted": true`, exit 2 unless it already
+holds findings). An unexpected exception in the harness exits 2, never 1. `--out` is checked for
+writability before the run starts.
+
+`python -I tools/bench/test_serve_soak.py` checks the tool against a fake server (a clean run, a stall, an
+unexpected 400 and 500, growing and flat memory, a vanished server) and runs as `ninfer_serve_soak_test`
+without a GPU. It says nothing about the real server: the first run against one is the check that the
+expected statuses above match what that build returns.
+
+
+The report (`--out`, `schema_version` 1) holds:
+
+| Field | Content |
+|---|---|
+| `url`, `model`, `context`, `seed`, `minutes`, `started_unix`, `duration_seconds` | what was run, and for how long |
+| `settings` | `kinds`, `max_concurrency`, `lanes`, `stall_seconds`, `rss_growth_mib`, `sample_seconds`, `max_request_mib`, `images` |
+| `requests` | `total`, and `by_kind`: for each kind a count per outcome (`ok`, `ok_reset`, `cancelled`, `skipped_no_vision`, `failed`) |
+| `failures` | one entry per failed request: `id`, `kind`, `protocol`, `status`, `code`, `events`, `expected`, `at_seconds`, `reason` |
+| `stalls` | stalled streams (`id`, `kind`, `protocol`, `phase`, `events`, `quiet_seconds`) and `kind: "queue"` entries (`queue_total`, `lanes`, `busy`, `head_waited_s`) |
+| `rss` | `sampled`, `samples`, `first_mib`, `last_mib`, `max_mib`, `growth_last_half_mib`, `limit_mib`, `flagged`, and a `note` when memory was not sampled |
+| `samples` | every tick: `t`, `queue`, `queue_total`, `queue_head_waited_s`, `slots`, `slots_busy`, `ctx_used`, `metrics` (unlabelled `ninfer_*`), `rss_mib`, `in_flight`, `requests`, `failed` |
+| `interrupted`, `harness_errors` | Ctrl-C and sampler bugs |
+| `findings`, `exit_code` | the reasons the run failed (empty when clean), and the process exit code |

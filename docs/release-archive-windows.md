@@ -67,18 +67,20 @@ API key blank.
 | `ninfer_bench.exe` | throughput benchmark against the public Engine route |
 | `download-model.bat` | pinned, resumable artifact downloads with verification |
 | `run.bat` | serving profiles: `run.bat <model> [profile]`, or double-click it to pick a model |
+| `profiles/` | each profile's fixed flags, as `ninfer-serve --config` files that `run.bat` passes |
 | `*.dll` | the FFmpeg and libcurl runtime dependencies, and NVIDIA's cuBLAS (`cublas64_12.dll`, `cublasLt64_12.dll`) |
 | `NVIDIA-CUDA-EULA.txt` | the licence under which the two cuBLAS DLLs are redistributed |
 | `LICENSE` | NInfer's licence (Apache-2.0) |
 | `THIRD_PARTY_NOTICES.txt` | the notice for the ported conversation projector (hermes-vcc-engine, Apache-2.0) |
-| `SHA256SUMS.txt` | checksums for every file in this directory |
+| `SHA256SUMS.txt` | checksums for every file in this directory and in `profiles/` |
 
 ## Overrides
 
 Nothing here needs editing. **Every** profile reads `NINFER_MODEL`, `NINFER_MODEL_DIR`,
-`NINFER_SERVER`, `NINFER_HOST`, `NINFER_PORT` and `NINFER_CHAT_TEMPLATE` (a local Jinja file,
-passed to `--chat-template`, overriding the artifact's built-in template). The default (`tuned`)
-profiles read more:
+`NINFER_SERVER`, `NINFER_HOST`, `NINFER_PORT`, `NINFER_CHAT_TEMPLATE` (a local Jinja file,
+passed to `--chat-template`, overriding the artifact's built-in template) and
+`NINFER_ALLOWED_HOST` (more names the server answers to, such as `gpubox.lan`, comma- or
+space-separated, each passed as `--allowed-host`). The default (`tuned`) profiles read more:
 
 | profile | also reads |
 |---|---|

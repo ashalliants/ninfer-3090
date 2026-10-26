@@ -153,6 +153,8 @@ public:
     // role markers, tool-call delimiters, thinking tags.
     [[nodiscard]] std::span<const AddedToken> added_tokens() const noexcept { return added_tokens_; }
     [[nodiscard]] bool is_valid_token(int id) const noexcept;
+    // Every added token's id (special or not: control tokens, think and tool tags), unordered.
+    [[nodiscard]] std::vector<int> added_token_ids() const;
     [[nodiscard]] bool has_exact_token_domain(std::size_t size) const noexcept;
 
 private:
@@ -166,5 +168,18 @@ private:
     std::array<std::vector<std::size_t>, 256> added_token_candidates_;
     std::vector<int> default_stop_token_ids_;
 };
+
+// The token facts relaxed drafting (--relaxed-drafting) reads, found once at startup: the lowest
+// added-token id (every drafted id from it on never relaxes, nor any later draft of the round) and
+// the single added tokens that open and close a tool call (a request inside one never relaxes).
+// Refuses a tokenizer whose added ids are not one contiguous run or whose tool tags are not single
+// added tokens, naming the option.
+struct RelaxedDraftingTokens {
+    std::int32_t added_token_floor = 0;
+    std::int32_t tool_call_open    = -1;
+    std::int32_t tool_call_close   = -1;
+};
+
+[[nodiscard]] RelaxedDraftingTokens relaxed_drafting_tokens(const Tokenizer& tokenizer);
 
 } // namespace ninfer::models::qwen3_5::frontend

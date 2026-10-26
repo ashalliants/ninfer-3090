@@ -28,6 +28,7 @@
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
+#include "ninfer/ops/linear_rows.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/position.h"
@@ -580,7 +581,20 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
                         ? proposal_head_n_
                         : dimension(parameters_.model.resources().public_token_count),
                     ctx_.stream);
-        if (proposal_head_ids_ != nullptr) {
+        if (io_.draft_context_rows.data != nullptr) {
+            // --draft-context-rows: the ids the requests' own text holds and the subset lacks,
+            // scored from the full Text head, compete with the subset's argmax.
+            auto rows_scope       = work_.scope();
+            const Tensor& row_ids = io_.draft_context_rows;
+            Tensor row_scores     = work_.alloc(DType::FP32, {row_ids.ne[0], T});
+            const Tensor head_input =
+                rotated_input(hidden, lm_head_->hadamard_signs, work_, ctx_.stream);
+            ops::linear_rows(head_input, lm_head_->weight, row_ids, row_scores, ctx_.stream);
+            const Tensor id_map(const_cast<std::int32_t*>(proposal_head_ids_), DType::I32,
+                                {proposal_head_n_});
+            ops::merge_row_argmax(proposal_logits, proposal_head_ids_ ? &id_map : nullptr,
+                                  row_scores, row_ids, proposal_tokens, ctx_.stream);
+        } else if (proposal_head_ids_ != nullptr) {
             ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
                                           ctx_.stream);
         }

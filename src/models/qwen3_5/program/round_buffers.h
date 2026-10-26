@@ -26,6 +26,27 @@ struct RoundStateSpec {
     std::uint32_t draft_window   = 0;
     SpeculativeBackend backend   = SpeculativeBackend::None;
     bool causal_scoring          = false;
+    // Causal scoring only: the widest teacher-forced decode window (EngineOptions::
+    // scoring_decode_window), or zero for prefill-only scoring, which plans no decode frame.
+    std::uint32_t score_decode_width = 0;
+    // EngineOptions::draft_context_rows: the drafters' context-row ids, one I32 per slot, or zero
+    // for none (the layout is then exactly the one without the option).
+    std::uint32_t draft_context_rows = 0;
+};
+
+inline constexpr std::uint32_t kScoreDecodeMaximumWidth = 16;
+
+// Stable pinned/device transfer format of one teacher-forced scoring window, copied once per
+// forward. Columns past the window's live count repeat its last live token and position.
+struct ScoreDecodeIngress {
+    std::array<TokenId, kScoreDecodeMaximumWidth> tokens{};
+    std::array<std::int32_t, kScoreDecodeMaximumWidth> cache_positions{};
+    std::array<std::int32_t, kScoreDecodeMaximumWidth> rope_positions{};
+    std::array<TokenId, kScoreDecodeMaximumWidth> targets{};
+    std::int32_t valid_columns          = 0;
+    std::int32_t text_kv_table_row      = 0;
+    std::int32_t state_source_slot      = 0;
+    std::int32_t state_destination_slot = 0;
 };
 
 struct PrefillRoundHost {
@@ -74,6 +95,8 @@ struct MtpDecodeEgress {
     // Step-major: all B rows for proposal step 0, followed by all B rows for step 1, etc.
     std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumDrafts> next_drafts{};
     std::array<std::int32_t, kMaximumConcurrency> next_extents{};
+    // Relaxed drafting only (else never written): the accepted drafts the threshold kept.
+    std::array<std::int32_t, kMaximumConcurrency> relaxed_kept{};
 };
 
 // Prefill binds the current chunk independently of the compact decode batch.
@@ -117,6 +140,8 @@ struct DFlashDecodeEgress {
     std::array<TokenId, kMaximumConcurrency * kDFlashDecodeMaximumWidth> licensed_tokens{};
     std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
     std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
+    // Relaxed drafting only (else never written): the accepted drafts the threshold kept.
+    std::array<std::int32_t, kMaximumConcurrency> relaxed_kept{};
 };
 
 struct OrdinaryDecodeStateLayout {
@@ -124,6 +149,14 @@ struct OrdinaryDecodeStateLayout {
     LayoutRegion egress;
     TensorRegion logits;
     TensorRegion hidden;
+};
+
+struct ScoreDecodeStateLayout {
+    LayoutRegion ingress;
+    TensorRegion logits;
+    TensorRegion hidden;
+    TensorRegion target_tokens;
+    TensorRegion logprobs;
 };
 
 struct MtpPrefillStateLayout {
@@ -179,6 +212,7 @@ struct DFlashDecodeStateLayout {
 struct RoundStateLayout {
     RoundStateSpec spec;
     std::optional<OrdinaryDecodeStateLayout> ordinary;
+    std::optional<ScoreDecodeStateLayout> score_decode;
     TensorRegion token;
     TensorRegion pos;
     TensorRegion rope_pos;
@@ -190,6 +224,9 @@ struct RoundStateLayout {
     std::optional<DFlashPrefillStateLayout> dflash_prefill;
     std::optional<MtpDecodeStateLayout> mtp_decode;
     std::optional<DFlashDecodeStateLayout> dflash_decode;
+    // I32 [draft_context_rows], after the round state's other regions; absent without context
+    // rows.
+    std::optional<TensorRegion> draft_context_rows;
     bool complete = false;
 };
 
@@ -210,6 +247,28 @@ struct OrdinaryDecodeState {
     OrdinaryDecodeState() = default;
     OrdinaryDecodeState(DeviceSpan backing, const OrdinaryDecodeStateLayout& layout,
                         std::uint32_t batch_capacity);
+};
+
+// One teacher-forced scoring frame at the planned width W. Every tensor is [W] (or [rows, W]); a
+// window views its leading columns.
+struct ScoreDecodeState {
+    DeviceSpan ingress;
+    Tensor tokens;
+    Tensor cache_positions;
+    Tensor rope_positions;
+    Tensor targets;
+    Tensor valid_columns;
+    Tensor text_kv_table_row;
+    Tensor state_source_slot;
+    Tensor state_destination_slot;
+    Tensor logits;
+    Tensor hidden;
+    Tensor target_tokens;
+    Tensor logprobs;
+
+    ScoreDecodeState() = default;
+    ScoreDecodeState(DeviceSpan backing, const ScoreDecodeStateLayout& layout,
+                     std::uint32_t width);
 };
 
 // The two planning calls expose one deliberate exact-target extension seam after scalar logits.
@@ -263,6 +322,8 @@ struct MtpDecodeState {
     Tensor accepted_drafts;
     Tensor next_drafts;
     Tensor next_extents;
+    // Empty (no data) when the Program runs without relaxed drafting.
+    Tensor relaxed_kept;
     Tensor verify_ids;
     Tensor target_positions;
     Tensor target_argmax;
@@ -304,6 +365,8 @@ struct DFlashDecodeState {
     Tensor licensed_tokens;
     Tensor licensed_counts;
     Tensor accepted_drafts;
+    // Empty (no data) when the Program runs without relaxed drafting.
+    Tensor relaxed_kept;
     Tensor proposal_ids;
     Tensor proposal_positions;
     Tensor verify_positions;
@@ -331,6 +394,7 @@ struct DFlashDecodeState {
 
 struct RoundState {
     std::optional<OrdinaryDecodeState> ordinary;
+    std::optional<ScoreDecodeState> score_decode;
     Tensor token;
     Tensor pos;
     Tensor rope_pos;
@@ -342,6 +406,9 @@ struct RoundState {
     std::optional<DFlashPrefillState> dflash_prefill;
     std::optional<MtpDecodeState> mtp_decode;
     std::optional<DFlashDecodeState> dflash_decode;
+    // The drafters' context-row ids (-1: an empty slot), uploaded by the Program before a round
+    // that drafts; empty (no data) without --draft-context-rows.
+    Tensor draft_context_rows;
 
     RoundState() = default;
     RoundState(DeviceSpan backing, const RoundStateLayout& layout);

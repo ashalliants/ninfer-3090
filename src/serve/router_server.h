@@ -13,6 +13,7 @@
 // Bytes are relayed as they arrive, so streamed responses stream, and a client that disconnects
 // closes the upstream connection, which cancels the generation.
 
+#include "serve/http_security.h"
 #include "serve/model_registry.h"
 #include "serve/routed_model.h"
 #include "serve/serve_options.h"
@@ -65,8 +66,8 @@ private:
     void handle_health(const httplib::Request& req, httplib::Response& res) const;
     // Routes a request to the model it names (waking or loading it first) and relays the response.
     void route(const httplib::Request& req, httplib::Response& res);
-    // Reads a status endpoint (/props, /metrics, /v1/load) from the most recently used model
-    // without waking it.
+    // Reads a status endpoint (/props, /metrics, /v1/load, /slots) from the most recently used
+    // model without waking it.
     void route_status(const httplib::Request& req, httplib::Response& res);
 
     // Relays `method target` with `body` to the server of the model `lease` holds, taking the lease
@@ -75,6 +76,7 @@ private:
                const std::string& method, const std::string& target, std::string body);
 
     ServeOptions options_;
+    HostPolicy host_policy_;
     ModelRegistry& registry_;
     std::shared_ptr<RoutedPorts> ports_;
     std::shared_ptr<spdlog::logger> logger_;

@@ -18,6 +18,9 @@
 //    combine) and the draft head (the IQ4_XS LM head rows on the Q8_1-cast final hidden, and its
 //    argmax).
 //
+// 3. ForwardOptions::shared_expert_stream (the shared expert on a side stream) leaves the prompt's
+//    logits and the drafter step's MoE output, logits, residual and draft bitwise unchanged.
+//
 //   ninfer_qwen4_exp_mtp_real_test [TOKENS] [--prompt N]
 //
 // TOKENS is @FILE or a comma-separated id list (default: the code fixture text); the first N
@@ -30,6 +33,7 @@
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
+#include "core/side_stream_delay.h"
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
@@ -131,7 +135,8 @@ Error error_of(const std::vector<double>& got, const std::vector<double>& want) 
 // the drafter's buffers of one sequence, laid out as the Program lays them out (uniform per-layer
 // GDN stride, contiguous QSA tails), and the forward over them.
 struct Harness {
-    Harness(const ex::Parameters& parameters, DeviceContext& device, std::int32_t context, std::int32_t columns)
+    Harness(const ex::Parameters& parameters, DeviceContext& device, std::int32_t context, std::int32_t columns,
+            ex::ForwardOptions options = {})
         : c(parameters.model.config()) {
         conv_bytes      = std::size_t(c.gdn.conv_channels()) * (c.gdn.conv_kernel - 1) * 2;
         recurrent_bytes = std::size_t(c.gdn.key_head_dim) * c.gdn.value_head_dim * c.gdn.value_heads * 4;
@@ -248,12 +253,13 @@ struct Harness {
         experts.staging_slots  = 64;
         const auto keys        = static_cast<std::uint32_t>(context);
         work = std::make_unique<WorkspaceArena>(
-            std::max(ex::Forward::workspace_bytes(c, columns, keys, device.execution_view()),
+            std::max(ex::Forward::workspace_bytes(c, columns, keys, device.execution_view(), options.moe_precast_input),
                      ex::Forward::mtp_workspace_bytes(c, std::min(columns, ex::kMtpChunkColumns), keys,
-                                                      device.execution_view())) +
-            w * ex::kMtpChunkColumns * 6);
+                                                      device.execution_view(), options.moe_precast_input)) +
+            w * ex::kMtpChunkColumns * 6 +
+            (options.shared_expert_stream ? ex::Forward::shared_expert_workspace_bytes(c, columns) : 0));
         forward = std::make_unique<ex::Forward>(parameters, device, *work, std::move(fs), std::move(fkv),
-                                                std::move(experts), std::move(drafter));
+                                                std::move(experts), std::move(drafter), options);
     }
 
     GdnReplayRecordSpec records_spec(std::int32_t width) const {
@@ -718,6 +724,104 @@ void test_drafter(Harness& h, DeviceContext& device, const ex::Parameters& param
 
 } // namespace
 
+// ------------------------------------------------------------------ 3. the shared expert stream
+// The prompt and one full drafter step after it (as test_drafter runs them), for comparing two
+// Forwards: the prompt's last logits, and the step's MoE output, head logits, output residual and
+// draft.
+struct DrafterRun {
+    std::vector<float> prompt_logits, logits;
+    std::vector<std::uint16_t> moe_out, residual;
+    std::int32_t draft = -1;
+};
+
+DrafterRun run_drafter(Harness& h, DeviceContext& device, const q4::NgramVolume& volume,
+                       const std::vector<std::int32_t>& tokens, std::int32_t prompt) {
+    const auto& c       = h.c;
+    const std::size_t V = c.vocab_size, H = c.hidden_size, Wr = c.residual_width();
+    DrafterRun out;
+    DeviceBuffer residuals(Wr * prompt * 2);
+    {
+        auto call               = make_call(c, volume, tokens, 0, prompt, false);
+        call.batch.residual_out = Tensor(residuals.p, DType::BF16, {dim(Wr), prompt});
+        DeviceBuffer logits(V * sizeof(float));
+        Tensor logits_out(logits.p, DType::FP32, {dim(V), 1});
+        h.forward->run(call.batch, logits_out);
+        device.synchronize();
+        out.prompt_logits = download<float>(logits.p, V);
+    }
+    for (std::int32_t first = 0; first < prompt - 1; first += ex::kMtpChunkColumns) {
+        const std::int32_t n = std::min(ex::kMtpChunkColumns, prompt - 1 - first);
+        const Cells cells    = make_cells(c, tokens, first, n);
+        ex::MtpCall call;
+        call.residuals        = Tensor(static_cast<std::byte*>(residuals.p) + Wr * 2 * first, DType::BF16, {dim(Wr), n});
+        call.ids              = cells.ids;
+        call.positions        = cells.positions;
+        call.rope_positions   = cells.rope;
+        call.block_start_rope = cells.block;
+        call.tail             = h.mtp_tail;
+        h.forward->run_mtp(call);
+    }
+    const std::int32_t cell = prompt - 1;
+    const Cells step        = make_cells(c, tokens, cell, 1);
+    DeviceBuffer taps(H * 2 + V * 4 + Wr * 2 + 4 + 4096);
+    std::size_t at   = 0;
+    const auto carve = [&](DType dtype, std::initializer_list<std::int32_t> shape) {
+        Tensor t(static_cast<std::byte*>(taps.p) + at, dtype, shape);
+        at += align256(t.bytes());
+        return t;
+    };
+    ex::MtpCall::Tap tap;
+    tap.moe_out                   = carve(DType::BF16, {dim(H), 1});
+    tap.logits                    = carve(DType::FP32, {dim(V), 1});
+    const Tensor residual         = carve(DType::BF16, {dim(Wr), 1});
+    const Tensor draft            = carve(DType::I32, {1});
+    ex::MtpCall call;
+    call.residuals        = Tensor(static_cast<std::byte*>(residuals.p) + Wr * 2 * cell, DType::BF16, {dim(Wr), 1});
+    call.ids              = step.ids;
+    call.positions        = step.positions;
+    call.rope_positions   = step.rope;
+    call.block_start_rope = step.block;
+    call.tail             = h.mtp_tail;
+    call.kv_only          = false;
+    call.residual_out     = residual;
+    call.drafts           = draft;
+    call.tap              = &tap;
+    h.forward->run_mtp(call);
+    device.synchronize();
+    out.moe_out  = download<std::uint16_t>(tap.moe_out.data, H);
+    out.logits   = download<float>(tap.logits.data, V);
+    out.residual = download<std::uint16_t>(residual.data, Wr);
+    out.draft    = download<std::int32_t>(draft.data, 1).front();
+    return out;
+}
+
+template <class T>
+bool bitwise_equal(const std::vector<T>& a, const std::vector<T>& b) {
+    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0;
+}
+
+// ForwardOptions::shared_expert_stream runs the shared expert of the text model's MoE blocks and of
+// the drafter's on a side stream: every output equals the serial run's, bit for bit.
+void test_shared_expert_stream(const ex::Parameters& parameters, DeviceContext& device, const q4::NgramVolume& volume,
+                               const std::vector<std::int32_t>& tokens, std::int32_t prompt, std::int32_t context) {
+    DrafterRun serial, side;
+    {
+        Harness h(parameters, device, context, prompt);
+        serial = run_drafter(h, device, volume, tokens, prompt);
+    }
+    {
+        // Every branch starts late, so a missing join diverges (core/side_stream_delay.h).
+        const ninfer::GateSideStreamDelay late_branches;
+        Harness h(parameters, device, context, prompt, ex::ForwardOptions{.shared_expert_stream = true});
+        side = run_drafter(h, device, volume, tokens, prompt);
+    }
+    expect(bitwise_equal(serial.prompt_logits, side.prompt_logits),
+           "shared expert stream: the prompt's logits are bitwise the serial run's");
+    expect(bitwise_equal(serial.moe_out, side.moe_out) && bitwise_equal(serial.logits, side.logits) &&
+               bitwise_equal(serial.residual, side.residual) && serial.draft == side.draft,
+           "shared expert stream: the drafter step's MoE output, logits, residual and draft are bitwise the serial run's");
+}
+
 int main(int argc, char** argv) {
     const char* artifact_env = std::getenv("NINFER_TEST_QWEN4EXP_ARTIFACT");
     if (artifact_env == nullptr) {
@@ -762,6 +866,7 @@ int main(int argc, char** argv) {
             Harness h(parameters, device, context, prompt);
             test_drafter(h, device, parameters, volume, tokens, prompt);
         }
+        test_shared_expert_stream(parameters, device, volume, tokens, prompt, context);
         std::printf(g_failures == 0 ? "qwen4_exp mtp checks passed\n" : "FAIL: %d qwen4_exp mtp check(s)\n", g_failures);
         return g_failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

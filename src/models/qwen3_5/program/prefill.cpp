@@ -563,6 +563,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {
+        // The prompt's own ids are context rows for the drafts MTP proposes from its last chunk.
+        if (staged.prepare_mtp) {
+            const std::uint32_t lane = sequence.lane;
+            refresh_draft_context_rows({&lane, 1});
+        }
         StateImageSelectors selectors = state_selectors(sequence);
         Tensor rewrite_capture_hidden;
         Tensor* rewrite_capture_hidden_ptr = nullptr;

@@ -4,4 +4,8 @@ namespace ninfer::product {
 
 std::string_view build_version() { return "@NINFER_BUILD_VERSION@"; }
 
+std::string_view build_commit() { return "@NINFER_BUILD_COMMIT@"; }
+
+bool build_dirty() { return @NINFER_BUILD_DIRTY@; }
+
 } // namespace ninfer::product

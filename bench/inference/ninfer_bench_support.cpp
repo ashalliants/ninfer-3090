@@ -2,8 +2,11 @@
 #include "product/constraint_observation.h"
 #include "product/speculative_options.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
 #include <cmath>
 #include <filesystem>
@@ -156,6 +159,97 @@ std::string number(double value) {
     out << std::setprecision(10) << value;
     return out.str();
 }
+
+std::string optional_number(const std::optional<double>& value, std::string_view unknown) {
+    return value ? number(*value) : std::string(unknown);
+}
+
+std::string power_limit_line(const BenchEnvironment& env) {
+    if (!env.power_limit_watts_start && !env.power_limit_watts_end) { return "unknown"; }
+    const auto watts = [](const std::optional<double>& value) {
+        return value ? number(*value) + " W" : std::string("unknown");
+    };
+    return watts(env.power_limit_watts_start) + " at start, " + watts(env.power_limit_watts_end) +
+           " at end";
+}
+
+// Code points of valid UTF-8 text, or nullopt when it is not valid UTF-8 or holds a control
+// character (C0, DEL, C1, or the line and paragraph separators U+2028/U+2029).
+std::optional<std::size_t> printable_utf8_length(std::string_view text) {
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < text.size(); ++count) {
+        const auto lead     = static_cast<unsigned char>(text[i]);
+        std::size_t length  = 0;
+        std::uint32_t point = 0;
+        if (lead < 0x80) {
+            length = 1;
+            point  = lead;
+        } else if ((lead & 0xE0) == 0xC0) {
+            length = 2;
+            point  = lead & 0x1FU;
+        } else if ((lead & 0xF0) == 0xE0) {
+            length = 3;
+            point  = lead & 0x0FU;
+        } else if ((lead & 0xF8) == 0xF0) {
+            length = 4;
+            point  = lead & 0x07U;
+        } else {
+            return std::nullopt;
+        }
+        if (i + length > text.size()) { return std::nullopt; }
+        for (std::size_t k = 1; k < length; ++k) {
+            const auto next = static_cast<unsigned char>(text[i + k]);
+            if ((next & 0xC0) != 0x80) { return std::nullopt; }
+            point = (point << 6U) | (next & 0x3FU);
+        }
+        constexpr std::uint32_t kMinimum[] = {0, 0, 0x80, 0x800, 0x10000};
+        if (point < kMinimum[length] || point > 0x10FFFF || (point >= 0xD800 && point <= 0xDFFF)) {
+            return std::nullopt; // overlong, out of range or a surrogate
+        }
+        if (point < 0x20 || (point >= 0x7F && point <= 0x9F) || point == 0x2028 ||
+            point == 0x2029) {
+            return std::nullopt;
+        }
+        i += length;
+    }
+    return count;
+}
+
+// The text rules of tools/bench/check_bench_rows.py: valid UTF-8 without control characters, not
+// blank once U+0020 spaces are trimmed (nothing else is trimmed), and at most `limit` characters
+// counting every one, spaces included.
+bool row_text(std::string_view text, std::size_t limit) {
+    const auto length = printable_utf8_length(text);
+    return length && *length <= limit && text.find_first_not_of(' ') != std::string_view::npos;
+}
+
+constexpr std::size_t kRowTextMaxCharacters = 80;
+
+void validate_submitter(std::string_view submitter) {
+    const auto first = submitter.find_first_not_of(' ');
+    if (first == std::string_view::npos) {
+        throw std::invalid_argument(
+            "--preset community-1 needs --submitter <name>, the name shown with the row");
+    }
+    const auto length = printable_utf8_length(submitter);
+    if (!length) {
+        throw std::invalid_argument("--submitter must be UTF-8 text without control characters");
+    }
+    if (*length > kSubmitterMaxCharacters) {
+        throw std::invalid_argument("--submitter takes at most " +
+                                    std::to_string(kSubmitterMaxCharacters) + " characters");
+    }
+    std::string upper(submitter.substr(first, submitter.find_last_not_of(' ') - first + 1));
+    for (char& c : upper) { c = static_cast<char>(std::toupper(static_cast<unsigned char>(c))); }
+    if (upper == "YOUR_NAME") {
+        throw std::invalid_argument("--submitter is still the placeholder YOUR_NAME; give the name "
+                                    "you want shown");
+    }
+}
+
+// The preset fixes every measurement setting; these are the only flags it leaves to the caller.
+constexpr std::array<std::string_view, 4> kPresetFlags = {"--preset", "--weights", "--submitter",
+                                                          "--device"};
 
 std::string format_bytes(std::uint64_t bytes) {
     if (bytes == 0) { return "-"; }
@@ -363,7 +457,15 @@ std::string usage_text(std::string_view program) {
         << "  --profile-measured          bracket one measured repetition with CUDA profiler API\n"
         << "  -o, --output <table|json|csv>  output format (default: table)\n"
         << "  --output-file <path>        write report to a file\n"
+        << "  --preset community-1        the frozen community run: pp16384, pp65536 and decode\n"
+        << "                              over " << kDefaultChatPromptsPath << ", printed as\n"
+        << "                              one JSON row for bench/community/rows.json\n"
+        << "                              (see bench/README.md)\n"
+        << "  --submitter <name>          with --preset: the name shown with the row, up to "
+        << kSubmitterMaxCharacters << " characters\n"
         << "  -h, --help                  show this help\n\n"
+        << "--preset community-1 takes only --weights, --submitter and --device; every other flag\n"
+        << "above would change what is measured and is refused.\n\n"
         << "With no -p/-n/-pg, the matrix is pp" << kDefaultNPrompt << " and tg" << kDefaultNGen
         << ".\n";
     return out.str();
@@ -371,9 +473,12 @@ std::string usage_text(std::string_view program) {
 
 BenchOptions parse_args(int argc, char** argv) {
     BenchOptions options;
-    bool saw_artifact = false;
+    bool saw_artifact  = false;
+    bool saw_submitter = false;
+    std::vector<std::string> flags; // as given, without their values: the preset checks them
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
+        flags.emplace_back(arg);
         auto value = [&](std::string_view flag) -> std::string {
             if (i + 1 >= argc) {
                 throw std::invalid_argument(std::string(flag) + " requires value");
@@ -466,9 +571,35 @@ BenchOptions parse_args(int argc, char** argv) {
             }
         } else if (arg == "--output-file") {
             options.output_file = value("--output-file");
+        } else if (arg == "--preset") {
+            options.preset = value("--preset");
+        } else if (arg == "--submitter") {
+            options.submitter = value("--submitter");
+            saw_submitter     = true;
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(arg));
         }
+    }
+    // Before every other check, so that a refused flag is reported as such and not as whatever
+    // it would have needed alongside it.
+    if (!options.preset.empty()) {
+        if (options.preset != kCommunityPreset) {
+            throw std::invalid_argument("unknown --preset " + options.preset +
+                                        "; the only preset is " + std::string(kCommunityPreset));
+        }
+        for (const std::string& flag : flags) {
+            if (std::find(kPresetFlags.begin(), kPresetFlags.end(), flag) == kPresetFlags.end()) {
+                throw std::invalid_argument(
+                    "--preset community-1 fixes what is measured, so that every row compares: it "
+                    "takes only --weights, --submitter and --device, not " + flag);
+            }
+        }
+        validate_submitter(options.submitter);
+        options.repetitions = 1; // one cold run of each test
+        options.warmup      = 0;
+    } else if (saw_submitter) {
+        throw std::invalid_argument("--submitter names a community row; it needs --preset " +
+                                    std::string(kCommunityPreset));
     }
     if (!saw_artifact) { throw std::invalid_argument("--weights is required"); }
     if (options.concurrency > kMaximumConcurrency) {
@@ -686,6 +817,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << "  gpu:        " << env.gpu_name << " (device " << env.device_id << ")\n"
         << "  cuda:       runtime " << env.cuda_runtime_version << ", driver "
         << env.cuda_driver_version << '\n'
+        << "  power limit: " << power_limit_line(env) << '\n'
         << "  artifact:   " << env.artifact_path << " (" << env.artifact_file_size_bytes
         << " bytes)\n"
         << "  load:       " << env.load.load_seconds << " s, upload " << env.load.upload_seconds
@@ -790,7 +922,10 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "  \"environment\": {\"gpu_name\": \"" << json_escape(env.gpu_name)
         << "\", \"cuda_runtime_version\": \"" << json_escape(env.cuda_runtime_version)
         << "\", \"cuda_driver_version\": \"" << json_escape(env.cuda_driver_version)
-        << "\", \"device_id\": " << env.device_id << "},\n"
+        << "\", \"device_id\": " << env.device_id
+        << ", \"power_limit_watts_start\": " << optional_number(env.power_limit_watts_start, "null")
+        << ", \"power_limit_watts_end\": " << optional_number(env.power_limit_watts_end, "null")
+        << "},\n"
         << "  \"artifact\": {\"path\": \"" << json_escape(env.artifact_path)
         << "\", \"file_size_bytes\": " << env.artifact_file_size_bytes << "},\n"
         << "  \"load\": {\n"
@@ -960,7 +1095,8 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
            "repetitions,prefill_tok_s_mean,prefill_tok_s_stddev,decode_output_tok_s_mean,"
            "decode_output_tok_s_stddev,decode_engine_tok_s_mean,decode_engine_tok_s_stddev,"
            "prepare_seconds_mean,prefill_seconds_mean,decode_seconds_mean,total_seconds_mean,"
-           "output_tok_s_mean,output_tok_s_stddev\n";
+           "output_tok_s_mean,output_tok_s_stddev,power_limit_watts_start,"
+           "power_limit_watts_end\n";
     const auto mean = [](const std::vector<double>& values) {
         return values.empty() ? std::string() : number(compute_stats(values).mean);
     };
@@ -1010,9 +1146,175 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << mean(prepare_time_series(result)) << ',' << mean(prefill_time_series(result)) << ','
             << mean(decode_time_series(result)) << ',' << mean(total_time_series(result)) << ','
             << mean(output_tok_s_series(result)) << ',' << stddev(output_tok_s_series(result))
-            << '\n';
+            << ',' << optional_number(env.power_limit_watts_start, "") << ','
+            << optional_number(env.power_limit_watts_end, "") << '\n';
     }
     return out.str();
+}
+
+std::optional<std::string> power_limit_change_warning(std::optional<double> start,
+                                                      std::optional<double> end) {
+    if (!start || !end || *start == *end) { return std::nullopt; }
+    return "the GPU power limit changed during the run (" + number(*start) + " W -> " +
+           number(*end) + " W); its results do not compare with runs at either limit";
+}
+
+std::vector<BenchTest> community_prefill_tests() {
+    return {{TestKind::Prefill, kCommunityShortPrefill, 0,
+             "pp" + std::to_string(kCommunityShortPrefill)},
+            {TestKind::Prefill, kCommunityLongPrefill, 0,
+             "pp" + std::to_string(kCommunityLongPrefill)}};
+}
+
+BenchTest community_decode_test() {
+    return {TestKind::Decode, 0, kCommunityDecodeTokens,
+            "chat-tg" + std::to_string(kCommunityDecodeTokens)};
+}
+
+std::vector<std::string> load_chat_prompts(const std::string& path) {
+    std::ifstream input(existing_read_path(path));
+    if (!input) { throw std::runtime_error("failed to open chat prompts file: " + path); }
+    std::vector<std::string> prompts;
+    std::string line;
+    for (std::size_t line_number = 1; std::getline(input, line); ++line_number) {
+        if (line.find_first_not_of(" \t\r") == std::string::npos) { continue; }
+        const auto where = path + ":" + std::to_string(line_number);
+        nlohmann::json record;
+        try {
+            record = nlohmann::json::parse(line);
+        } catch (const nlohmann::json::exception& error) {
+            throw std::invalid_argument(where + ": " + error.what());
+        }
+        if (!record.is_object() || !record.contains("prompt") || !record["prompt"].is_string() ||
+            record["prompt"].get_ref<const std::string&>().empty()) {
+            throw std::invalid_argument(where + ": expected an object with a non-empty \"prompt\"");
+        }
+        prompts.push_back(record["prompt"].get<std::string>());
+    }
+    if (prompts.empty()) { throw std::invalid_argument("chat prompts file is empty: " + path); }
+    return prompts;
+}
+
+double pooled_decode_tok_s(const TestResult& result) {
+    double tokens  = 0.0;
+    double seconds = 0.0;
+    for (const RepTiming& rep : result.reps) {
+        tokens += rep.generated_output_tokens ? rep.generated_output_tokens - 1U : 0U;
+        seconds += rep.timings.decode_seconds;
+    }
+    return seconds > 0.0 ? tokens / seconds : 0.0;
+}
+
+std::string community_commit(std::string_view commit, bool dirty) {
+    if (commit.empty()) {
+        throw std::invalid_argument("--preset community-1 needs a build from a git checkout, so "
+                                    "that the row names the commit it measured");
+    }
+    if (dirty) {
+        throw std::invalid_argument(
+            "--preset community-1 refuses a build with uncommitted changes (" +
+            std::string(commit) +
+            "-dirty): the row would name a commit that is not what ran. Commit, rebuild and run "
+            "again");
+    }
+    return std::string(commit);
+}
+
+std::string os_name(bool windows, std::string_view kernel_release) {
+    if (windows) { return "Windows"; }
+    std::string lower(kernel_release);
+    for (char& c : lower) { c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }
+    return lower.find("microsoft") != std::string::npos ? "WSL2" : "Linux";
+}
+
+std::string pcie_text(unsigned max_generation, unsigned width) {
+    return std::to_string(max_generation) + ".0 x" + std::to_string(width);
+}
+
+void check_community_architecture(std::string_view architecture) {
+    if (architecture != "Qwen3_5ForCausalLM") {
+        const std::string actual = architecture.empty() ? std::string("of unknown architecture")
+                                                        : std::string(architecture);
+        throw std::invalid_argument(
+            "--preset community-1 is defined on the 27B dense models (Qwen3_5ForCausalLM): its "
+            "corpus is Qwen3.6 token ids and its rows compare those models only; this artifact "
+            "is " + actual);
+    }
+}
+
+std::string format_community_row(const CommunityRow& row) {
+    constexpr double kGib = 1024.0 * 1024.0 * 1024.0;
+    const auto whole = [](double value) { return static_cast<std::int64_t>(std::llround(value)); };
+    const auto rate  = [](double value) { return std::round(value * 10.0) / 10.0; };
+    // Every rule tools/bench/check_bench_rows.py applies, so that a printed row always passes it.
+    const auto refuse = [](const std::string& what) {
+        throw std::invalid_argument("cannot write a community row: " + what);
+    };
+    const auto is_hex = [](std::string_view text) {
+        return text.size() >= 7 && text.size() <= 40 &&
+               text.find_first_not_of("0123456789abcdef") == std::string_view::npos;
+    };
+    const auto is_date = [](std::string_view text) {
+        if (text.size() != 10 || text[4] != '-' || text[7] != '-') { return false; }
+        for (const std::size_t i : {0, 1, 2, 3, 5, 6, 8, 9}) {
+            if (text[i] < '0' || text[i] > '9') { return false; }
+        }
+        return true;
+    };
+    if (!printable_utf8_length(row.submitter) ||
+        *printable_utf8_length(row.submitter) > kSubmitterMaxCharacters ||
+        row.submitter.find_first_not_of(' ') == std::string::npos) {
+        refuse("the submitter breaks the --submitter rules");
+    }
+    if (!is_date(row.date)) { refuse("the date must be YYYY-MM-DD"); }
+    if (!is_hex(row.commit)) { refuse("the commit must be 7-40 lowercase hex digits"); }
+    if (row.gpus.empty()) { refuse("it names no GPU"); }
+    for (const CommunityGpu& gpu : row.gpus) {
+        if (!row_text(gpu.name, kRowTextMaxCharacters)) {
+            refuse("the GPU name must be text of at most 80 characters");
+        }
+        if (whole(static_cast<double>(gpu.memory_bytes) / kGib) <= 0 ||
+            whole(gpu.power_limit_watts) <= 0) {
+            refuse("the GPU's memory and power limit must be at least 1 GiB and 1 W");
+        }
+    }
+    if (whole(static_cast<double>(row.ram_bytes) / kGib) <= 0) { refuse("host RAM is unknown"); }
+    if (!row.cpu.empty() && !row_text(row.cpu, kRowTextMaxCharacters)) {
+        refuse("the CPU must be text of at most 80 characters");
+    }
+    if (row.os != "Linux" && row.os != "Windows" && row.os != "WSL2") {
+        refuse("the OS must be Linux, Windows or WSL2");
+    }
+    if (!row_text(row.model, kRowTextMaxCharacters)) {
+        refuse("the model name must be text of at most 80 characters");
+    }
+    if (!(rate(row.prefill_16k_tps) > 0.0) || !(rate(row.prefill_64k_tps) > 0.0) ||
+        !(rate(row.decode_tps) > 0.0)) {
+        refuse("every rate must be at least 0.1 token/s");
+    }
+    nlohmann::ordered_json gpus = nlohmann::ordered_json::array();
+    for (const CommunityGpu& gpu : row.gpus) {
+        nlohmann::ordered_json entry;
+        entry["name"]          = gpu.name;
+        entry["vram_gib"]      = whole(static_cast<double>(gpu.memory_bytes) / kGib);
+        entry["power_limit_w"] = whole(gpu.power_limit_watts);
+        if (!gpu.pcie.empty()) { entry["pcie"] = gpu.pcie; }
+        gpus.push_back(std::move(entry));
+    }
+    nlohmann::ordered_json out;
+    out["submitter"] = row.submitter;
+    out["date"]      = row.date;
+    out["commit"]    = row.commit;
+    out["preset"]    = kCommunityPreset;
+    out["gpus"]      = std::move(gpus);
+    out["ram_gib"]   = whole(static_cast<double>(row.ram_bytes) / kGib);
+    if (!row.cpu.empty()) { out["cpu"] = row.cpu; }
+    out["os"]              = row.os;
+    out["model"]           = row.model;
+    out["prefill_16k_tps"] = rate(row.prefill_16k_tps);
+    out["prefill_64k_tps"] = rate(row.prefill_64k_tps);
+    out["decode_tps"]      = rate(row.decode_tps);
+    return out.dump(-1, ' ', false, nlohmann::ordered_json::error_handler_t::replace);
 }
 
 std::string json_escape(std::string_view value) {

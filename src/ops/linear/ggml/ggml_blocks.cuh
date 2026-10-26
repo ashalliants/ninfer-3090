@@ -12,8 +12,9 @@
 // Modified for NInfer: each format is split into a decoder that turns one 32-value sub-block into
 // eight words of four signed int8 values plus its FP32 scale(s), so the dp4a GEMV and the int8 MMA
 // GEMM share one decode; the Q8_1 cast keeps its scale in FP32, multiplies by the reciprocal of
-// the scale and rounds ties to even (ggml divides and rounds ties away), and carries no sum term,
-// because none of the formats here has an offset that needs it.
+// the scale and rounds ties to even (ggml divides and rounds ties away), and carries no sum term;
+// the affine K-quants (Q4_K, Q5_K), whose sub-blocks have an offset, take the sum of each group's
+// codes from the routes instead (AffineSubBlock below).
 //
 // MIT License
 // Copyright (c) 2023-2026 The ggml authors
@@ -44,8 +45,9 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <type_traits>
 
-// The device copy of ggml's IQ3_S grid (third_party/ggml/ggml-common-tables.h is the one table
+// The device copy of ggml's lookup tables (third_party/ggml/ggml-common-tables.h is the one table
 // set; tests read the same header as host arrays). Static per translation unit.
 #define NINFER_GGML_TABLE_BEGIN(type, name, size) static __device__ const type name[size] = {
 #define NINFER_GGML_TABLE_END() };
@@ -56,7 +58,8 @@ namespace ninfer::ops::ggml {
 inline constexpr int kSubValues = 32;
 
 // One decoded 32-value sub-block: v[w] packs values 4w..4w+3 as signed bytes (little endian).
-// scale[0] multiplies values 0..15 and scale[1] values 16..31; they differ only for Q6_K.
+// scale[0] multiplies values 0..15 and scale[1] values 16..31; they differ only for Q6_K and
+// IQ2_XS.
 struct SubBlock {
     int v[8];
     float scale[2];
@@ -213,6 +216,79 @@ struct Format<QType::GGML_IQ3_S> {
     }
 };
 
+// ksigns_iq2xs[v & 127] in each byte of a word: the 7-bit selector with bit 7 set to its parity
+// (ggml's unpack_ksigns). Bit 7 of the given byte may hold another selector's bit: the parity of all
+// eight bits, xored into bit 7, cancels it. Bit j of a byte negates value j of its eight. The one
+// copy of the GGML linears and offloaded_sparse_moe's expert decoders (expert_decode.cuh).
+__device__ __forceinline__ std::uint32_t ksigns_word(std::uint32_t v) {
+    v &= 0xFFU;
+    const std::uint32_t p = __popc(v) & 1U;
+    const std::uint32_t s = v ^ (p << 7);
+    return s * 0x01010101U;
+}
+
+// Eight grid magnitudes (two words of four bytes) with the signs of `signs` applied.
+__device__ __forceinline__ void signed_grid(std::uint32_t g0, std::uint32_t g1, std::uint32_t signs,
+                                            int& v0, int& v1) {
+    const int m0 = static_cast<int>(__vcmpne4(signs & 0x08040201U, 0));
+    const int m1 = static_cast<int>(__vcmpne4(signs & 0x80402010U, 0));
+    v0           = static_cast<int>(__vsub4(static_cast<int>(g0) ^ m0, m0));
+    v1           = static_cast<int>(__vsub4(static_cast<int>(g1) ^ m1, m1));
+}
+
+// IQ2_XS: {fp16 d; u16 qs[32]; u8 scales[8]} per 256 values. Code qs[4 ib + l] holds a 9-bit
+// iq2xs_grid index and a 7-bit sign selector for values 8 l..8 l + 7 of sub-block ib; values 0..15
+// have scale d (0.5 + (scales[ib] & 15)) / 4 and values 16..31 d (0.5 + (scales[ib] >> 4)) / 4,
+// formed as ggml's dequantize_row_iq2_xs forms db. No GGML linear instance takes it yet (no
+// registered problem is IQ2_XS); the grid is read from global memory.
+template <>
+struct Format<QType::GGML_IQ2_XS> {
+    static constexpr int kBlockValues = 256, kBlockBytes = 74;
+    static constexpr bool kSplitScale = true;
+    __device__ static void decode(const std::uint8_t* row, int s, const Tables&, SubBlock& out) {
+        const std::uint8_t* b = row + (s >> 3) * kBlockBytes;
+        const int ib          = s & 7;
+        const float d         = load_half(b);
+        const int sc          = b[66 + ib];
+        out.scale[0]          = d * (0.5F + static_cast<float>(sc & 0x0F)) * 0.25F;
+        out.scale[1]          = d * (0.5F + static_cast<float>(sc >> 4)) * 0.25F;
+        const std::uint32_t codes[2] = {static_cast<std::uint32_t>(load_i32_b2(b + 2 + 8 * ib)),
+                                        static_cast<std::uint32_t>(load_i32_b2(b + 6 + 8 * ib))};
+        const auto* grid_table = reinterpret_cast<const uint2*>(ggml_tables::iq2xs_grid);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const std::uint32_t code = (codes[l >> 1] >> (16 * (l & 1))) & 0xFFFFU;
+            const uint2 grid         = grid_table[code & 511U];
+            signed_grid(grid.x, grid.y, ksigns_word(code >> 9), out.v[2 * l], out.v[2 * l + 1]);
+        }
+    }
+};
+
+// IQ3_XXS: {fp16 d; u8 qs[64]; u32 scales_and_signs[8]} per 256 values. Sub-block ib reads
+// qs[8 ib..8 ib + 7] (one iq3xxs_grid index per four values) and word ib: four 7-bit sign selectors
+// (one per eight values) and a 4-bit scale ls in bits 28..31; its scale is d (0.5 + ls) / 2, formed
+// as ggml's dequantize_row_iq3_xxs forms db. No GGML linear instance takes it yet (no registered
+// problem is IQ3_XXS); the grid is read from global memory.
+template <>
+struct Format<QType::GGML_IQ3_XXS> {
+    static constexpr int kBlockValues = 256, kBlockBytes = 98;
+    static constexpr bool kSplitScale = false;
+    __device__ static void decode(const std::uint8_t* row, int s, const Tables&, SubBlock& out) {
+        const std::uint8_t* b     = row + (s >> 3) * kBlockBytes;
+        const int ib              = s & 7;
+        const std::uint32_t aux32 = static_cast<std::uint32_t>(load_i32_b2(b + 66 + 4 * ib));
+        const float db            = load_half(b) * (0.5F + static_cast<float>(aux32 >> 28)) * 0.5F;
+        out.scale[0] = out.scale[1] = db;
+        const std::uint8_t* qs = b + 2 + 8 * ib;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            signed_grid(ggml_tables::iq3xxs_grid[qs[2 * l + 0]],
+                        ggml_tables::iq3xxs_grid[qs[2 * l + 1]], ksigns_word(aux32 >> (7 * l)),
+                        out.v[2 * l], out.v[2 * l + 1]);
+        }
+    }
+};
+
 // Q6_K: {u8 ql[128]; u8 qh[64]; int8 scales[16]; fp16 d} per 256 values. Sub-block ib = 4 h + qd
 // reads ql[64 h + 32 (qd & 1) + l] (nibble qd >> 1) and qh[32 h + l] (bits 2 qd), values q - 32;
 // values 16 g .. 16 g + 15 of the block use scales[g].
@@ -237,6 +313,77 @@ struct Format<QType::GGML_Q6_K> {
             const int vl = (load_i32_b2(ql + 4 * w) >> low_shift) & 0x0F0F0F0F;
             const int vh = ((load_i32_b2(qh + 4 * w) >> high_shift) & 0x03030303) << 4;
             out.v[w]     = static_cast<int>(__vsubss4(vl | vh, 0x20202020));
+        }
+    }
+};
+
+// The affine K-quants: value l of a sub-block is scale[0] * v_l - offset (v unsigned, at most 31),
+// so its dot product with Q8_1 codes a (scale xd) is xd * (scale[0] * sum(v a) - offset * sum(a)).
+// The routes add -offset * xm with xm = xd * float(sum(a)) after the scale term; the other formats
+// decode to a plain SubBlock and their instances are unchanged.
+struct AffineSubBlock : SubBlock {
+    float offset;
+};
+
+template <QType F>
+inline constexpr bool kAffine = F == QType::GGML_Q4_K || F == QType::GGML_Q5_K;
+
+template <QType F>
+using SubBlockOf = std::conditional_t<kAffine<F>, AffineSubBlock, SubBlock>;
+
+// The scale d * sc and offset dmin * m of sub-block ib of a Q4_K/Q5_K block (ggml's d1 and m1):
+// get_scale_min_k4 over the 12 scale bytes at b + 4, without a branch on ib.
+__device__ __forceinline__ void k_quant_scales(const std::uint8_t* b, int ib, AffineSubBlock& out) {
+    const int i   = ib & 3;
+    const int a0  = b[4 + i];
+    const int a1  = b[8 + i];
+    const int a2  = b[12 + i];
+    const int sc  = ib < 4 ? (a0 & 63) : ((a2 & 0x0F) | ((a0 >> 6) << 4));
+    const int m   = ib < 4 ? (a1 & 63) : ((a2 >> 4) | ((a1 >> 6) << 4));
+    out.scale[0]  = out.scale[1] = load_half(b) * static_cast<float>(sc);
+    out.offset    = load_half(b + 2) * static_cast<float>(m);
+}
+
+// Q4_K: {fp16 d; fp16 dmin; u8 scales[12]; u8 qs[128]} per 256 values. Sub-block ib takes the low
+// (even ib) or high (odd ib) nibbles of qs[32 (ib / 2)..+31]. Rows are 16-byte aligned
+// (ggml_dispatch.cpp) and blocks 144 bytes, so the codes are 16-byte aligned.
+template <>
+struct Format<QType::GGML_Q4_K> {
+    static constexpr int kBlockValues = 256, kBlockBytes = 144;
+    static constexpr bool kSplitScale = false;
+    __device__ static void decode(const std::uint8_t* row, int s, const Tables&, AffineSubBlock& out) {
+        const std::uint8_t* b = row + (s >> 3) * kBlockBytes;
+        const int ib          = s & 7;
+        k_quant_scales(b, ib, out);
+        const auto* qs     = reinterpret_cast<const uint4*>(b + 16 + 32 * (ib >> 1));
+        const uint4 q0     = qs[0];
+        const uint4 q1     = qs[1];
+        const std::uint32_t words[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+        const int shift    = 4 * (ib & 1);
+#pragma unroll
+        for (int w = 0; w < 8; ++w) out.v[w] = static_cast<int>((words[w] >> shift) & 0x0F0F0F0FU);
+    }
+};
+
+// Q5_K: {fp16 d; fp16 dmin; u8 scales[12]; u8 qh[32]; u8 qs[128]} per 256 values: Q4_K's nibble
+// plus 16 times bit ib of qh[l]. 176-byte blocks keep qh and qs 16-byte aligned in an aligned row.
+template <>
+struct Format<QType::GGML_Q5_K> {
+    static constexpr int kBlockValues = 256, kBlockBytes = 176;
+    static constexpr bool kSplitScale = false;
+    __device__ static void decode(const std::uint8_t* row, int s, const Tables&, AffineSubBlock& out) {
+        const std::uint8_t* b = row + (s >> 3) * kBlockBytes;
+        const int ib          = s & 7;
+        k_quant_scales(b, ib, out);
+        const auto* qh     = reinterpret_cast<const uint4*>(b + 16);
+        const auto* qs     = reinterpret_cast<const uint4*>(b + 48 + 32 * (ib >> 1));
+        const uint4 h0 = qh[0], h1 = qh[1], q0 = qs[0], q1 = qs[1];
+        const std::uint32_t high[8]  = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
+        const std::uint32_t words[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+        const int shift = 4 * (ib & 1);
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            out.v[w] = static_cast<int>(((words[w] >> shift) & 0x0F0F0F0FU) | (((high[w] >> ib) & 0x01010101U) << 4));
         }
     }
 };

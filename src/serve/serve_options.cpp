@@ -1,14 +1,19 @@
 #include "serve/serve_options.h"
 
+#include "serve/http_security.h"
+#include "serve/serve_config_file.h"
+
 #include <algorithm>
 #include "models/qwen3_5/lossy_options.h"
 #include "product/reasoning_loop_options.h"
 #include "product/speculative_options.h"
 
+#include <cctype>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -26,6 +31,14 @@ int parse_nonnegative_int(const char* text, const char* label) {
     return static_cast<int>(value);
 }
 
+// Whether an optional flag value follows: a number ("0.3", ".5", "1", "-1"), never another flag.
+bool looks_like_number(const char* text) {
+    const std::string_view v(text);
+    const std::size_t digit = !v.empty() && (v.front() == '-' || v.front() == '+') ? 1 : 0;
+    return v.size() > digit &&
+           (std::isdigit(static_cast<unsigned char>(v[digit])) != 0 || v[digit] == '.');
+}
+
 float parse_float_in(const char* text, const char* label, float lo, float hi) {
     char* end          = nullptr;
     const double value = std::strtod(text, &end);
@@ -33,6 +46,41 @@ float parse_float_in(const char* text, const char* label, float lo, float hi) {
         throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
     }
     return static_cast<float>(value);
+}
+
+// --prefill-cpu-share F: a decimal in [0, 1] with at most two digits after the point ("0.6", "0.55",
+// "1", ".5"), kept exactly as the reduced fraction F * 100 / 100 (0.6 is 3 / 5). More digits are
+// refused rather than rounded, so the share the CPU takes is the one asked for.
+ninfer::FlashNextOptions::Fraction parse_share(const char* text) {
+    const std::string_view v(text);
+    const auto refuse = [&] {
+        return std::invalid_argument("--prefill-cpu-share takes a value in [0, 1] with at most two decimal places "
+                                     "(for example 0.6): " +
+                                     std::string(v));
+    };
+    const std::size_t point = v.find('.');
+    const std::string_view whole = v.substr(0, point);
+    const std::string_view part  = point == std::string_view::npos ? std::string_view() : v.substr(point + 1);
+    const auto digits = [](std::string_view d) {
+        return std::all_of(d.begin(), d.end(), [](char c) { return c >= '0' && c <= '9'; });
+    };
+    if ((whole.empty() && part.empty()) || whole.size() > 3 || part.size() > 2 || !digits(whole) || !digits(part)) {
+        throw refuse();
+    }
+    std::uint32_t hundredths = 0;
+    for (const char c : whole) { hundredths = hundredths * 10 + static_cast<std::uint32_t>(c - '0'); }
+    hundredths *= 100;
+    for (std::size_t i = 0; i < 2; ++i) {
+        hundredths += (i < part.size() ? static_cast<std::uint32_t>(part[i] - '0') : 0U) * (i == 0 ? 10U : 1U);
+    }
+    if (hundredths > 100) { throw refuse(); }
+    std::uint32_t a = hundredths, b = 100; // a becomes gcd(hundredths, 100)
+    while (b != 0) {
+        const std::uint32_t r = a % b;
+        a                     = b;
+        b                     = r;
+    }
+    return {hundredths / a, 100 / a}; // 0 reduces to 0 / 1
 }
 
 std::uint64_t parse_u64(const char* text, const char* label) {
@@ -145,7 +193,8 @@ std::string serve_usage_text(const char* argv0) {
            "[options passed to every model]    (router mode: several models, no artifact path)\n"
            "   or: " +
            argv0 +
-           " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
+           " <model.ninfer> [--config FILE] [--host H] [--port N] [--api-key KEY] "
+           "[--allowed-host NAME]... "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--fit-context MIN] "
            "[--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
@@ -171,16 +220,21 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] "
            "[--spec mtp|dflash|dflash2 --draft-tokens N] "
-           "[--ngram-draft-tokens 0|15] [--ngram-min-match N] "
+           "[--ngram-draft-tokens 0|15] [--ngram-min-match N] [--relaxed-drafting [P]] "
+           "[--draft-context-rows N] "
            "[--default-max-tokens N] [--max-output-tokens N] [--default-thinking-budget N] "
            "[--reasoning-loop off|stop|conclude] "
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] "
            "[--no-cuda-graph] [--no-prefix-reuse] [--devices N,M,...] [--stage-layers A,B,...] "
-           "[--ngram-volume FILE] [--expert-state FILE|--no-expert-state] [--vram-headroom-mib N] "
+           "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
+           "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--ngram-prefetch] "
+           "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
+           "[--moe-fused-route] [--cpu-verify-misses] [--prefill-cpu-share F] [--cpu-verify-workers N] [--gdn-async-commit] [--hc-int8 [--hc-fused-read]] "
+           "[--ngram-flag-wait] [--partial-ram-residency] [--ggml-decode-mma] "
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
-           "[--gdn-state-fp16] [--progress-anchor-tokens N [--progress-anchors-shared]] [--admission-fit-check] "
+           "[--gdn-state-fp16] [--progress-anchor-tokens N [--progress-anchors-shared]] [--admission-fit-check] [--admission-affinity] "
            "[--model-suspend [--suspend-snapshot pageable|pinned] "
            "[--suspend-weights artifact|host] [--no-auto-resume] [--sleep-idle-seconds N]] "
            "[--models-dir DIR] [--models-preset FILE] [--models-max N] [--no-models-autoload] "
@@ -194,6 +248,11 @@ std::string serve_usage_text(const char* argv0) {
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
+           "       --config FILE reads options from a JSON object of flag names without dashes "
+           "(\"max-context\": 65536, \"vision\": true; an array repeats a repeatable flag); the "
+           "command line wins over the file, except that a repeatable flag (--graft, --allowed-host, "
+           "--context-store-peer) keeps the file's entries and adds the command line's. Not "
+           "--api-key\n"
            "       --default-max-tokens fixes the output budget of requests that omit a limit; "
            "unset, such a request may run to the end of its context\n"
            "       --max-output-tokens caps the output budget of every request, including ones "
@@ -206,6 +265,11 @@ std::string serve_usage_text(const char* argv0) {
            "       --request-log-lossy-detail adds lossy_prefill.kept_runs (the kept offsets of the "
            "filtered part) to request_done records, for the lossy sweep's kept-block overlap\n"
            "       --model-id overrides the artifact metadata.name reported by the server\n"
+           "       --allowed-host NAME is one more name the Host check of a server without "
+           "--api-key accepts, besides localhost, IP addresses and the --host name (with --host "
+           "0.0.0.0: the machine's names and host.docker.internal). Repeatable\n"
+           "       without --api-key or --cors, a browser request from another web origin is "
+           "refused\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
@@ -269,18 +333,68 @@ std::string serve_usage_text(const char* argv0) {
            "small perplexity cost (docs/performance.md), off by default, and it wants a larger "
            "--prefill-chunk to pay; --no-prefill-cublas-projections keeps the attention and GDN "
            "input projections off that route\n"
-           "       Qwen3.8-Flash-Next (one or two requests at once, --kv-dtype int8): prefix reuse keeps "
+           "       Qwen3.8-Flash-Next (one or two requests at once, --kv-dtype int8; \"the same "
+           "output\" below is what an option is designed to keep, not yet checked on a GPU): prefix "
+           "reuse keeps "
            "checkpoints in pinned RAM (--host-context-mib, default 4096, 0 turns reuse off) or, with "
            "--context-nvme-mib N, in a scratch file of up to N MiB on local disk (removed at exit; "
            "--context-nvme-dir DIR, default beside the model) with --host-context-mib as its RAM "
            "cache (0: disk only); --context-store DIR keeps it across restarts; "
-           "--ngram-volume FILE is its n-gram table (default <model>.ngram); --expert-state FILE "
+           "--ngram-volume FILE is its n-gram table (default <model>.ngram); --ngram-keepalive-ms N "
+           "reads a block from it after N ms of idleness so the drive stays awake (default 40, "
+           "0 turns it off, at most 60000); --expert-state FILE "
            "keeps the VRAM expert cache's state across restarts (default <model>.expert-state; "
-           "--no-expert-state starts it empty and saves nothing); --vram-headroom-mib N is the VRAM "
+           "--no-expert-state starts it empty and saves nothing); --default-expert-state FILE is a state "
+           "shipped for a fresh install, read only when the saved one does not load (missing, another "
+           "copy, damaged; default <model>.expert-state.default); --vram-headroom-mib N is the VRAM "
            "the expert cache leaves free for the desktop (default 512 with a display, 256 without); "
            "--ram-headroom-mib N is the RAM left free for Windows once every expert is pinned "
            "(default 2048; startup refuses when it cannot be kept); --expert-cache-mib N caps the "
-           "expert cache (for measurement); --vision takes images when the model was converted with "
+           "expert cache (for measurement); --shared-expert-stream runs each MoE block's shared "
+           "expert on a second CUDA stream beside the routed experts (high priority in eager calls "
+           "only; CUDA graphs ignore stream priority; the same output, bit for bit; off by default); --mtp-constrained keeps MTP speculation (--spec mtp) on for "
+           "constrained requests (JSON schema, grammar, tool calls), accepting each draft under its "
+           "own grammar mask (off by default: they decode without MTP); --mtp-joint-acceptance "
+           "(--spec mtp) drafts --draft-tokens each round and verifies the drafts whose joint chance "
+           "of acceptance, estimated from each draft's probability, stays above an adaptive threshold "
+           "(off by default: an acceptance estimate picks the count before drafting); --ngram-prefetch "
+           "(--spec mtp) reads the anchor column's n-gram rows while the drafter runs, so verification "
+           "finds them cached (off by default); --hot-embedding-rows N keeps only the token embedding's "
+           "first N rows in VRAM and reads the rest from pinned RAM, freeing VRAM for the expert cache "
+           "(the same output; 0, the default, keeps the whole table in VRAM; at most the vocabulary); "
+           "--gdn-head-map reads the GDN's key heads through the tiled head map instead of copying "
+           "them per value head (the same output, bit for bit; off by default); --moe-precast-input "
+           "casts each routed-expert call's input to A8 once instead of in every gate/up block (the same "
+           "output, bit for bit; off by default); --moe-gate-up-registers computes the routed experts' "
+           "gate/up rows from registers in a grid that stays resident (the same output, bit for bit; off "
+           "by default; needs --moe-precast-input); --moe-fused-route routes and dispatches the routed "
+           "experts of a decode call in one launch instead of two (the same output, bit for bit; off by "
+           "default); --cpu-verify-misses (--spec mtp) computes some of each verification round's "
+           "uncached experts on N CPU threads (--cpu-verify-workers, default 6) beside the GPU instead "
+           "of reading them over PCIe (the same output, bit for bit; off by default); --prefill-cpu-share F "
+           "computes the share F (0..1, two decimals; Basalt uses 0.6) of each layer's uncached experts of "
+           "a prefill call on the same CPU threads, the ones routed fewest tokens first, while the GPU "
+           "copies the rest (a call that streams its experts leaves out the least-used ones for it; the "
+           "same output, bit for bit; 0, the default, is off); --gdn-async-commit "
+           "(--spec mtp) folds each verification's accepted columns into the GDN state on a side stream "
+           "while the drafter catches up and drafts the next round (the same state, bit for bit; off by "
+           "default); --hc-int8 makes int8 copies of the hyper-connection mixers' weights at startup and "
+           "reads those (fewer bytes per token; changes the numerics; about 0.68 GB more VRAM; off by "
+           "default); --hc-fused-read (with --hc-int8) reads each decode MoE block's input in one fused "
+           "read: the previous inject, the int8 mixer, the router with its routing and dispatch, and the "
+           "experts' A8 input (fewer launches; the same output as --hc-int8 alone, bit for bit; off by "
+           "default); --ngram-flag-wait runs a decode round (and an MTP verification) as one CUDA graph that "
+           "waits on the GPU for the host to read the round's n-gram rows, instead of two graphs around the "
+           "read (the same output, bit for bit; off by default); --partial-ram-residency keeps only the "
+           "experts the VRAM cache does not hold in RAM (the hottest are read straight into VRAM), so packs "
+           "larger than RAM load; the same output, bit for bit; the cache keeps its startup size and long "
+           "prompts prefill without the expert stream (off by default); --ggml-decode-mma runs the dense "
+           "GGML layers of decode steps, MTP drafts and verification on the int8 tensor cores (16 rows by 8 "
+           "columns per instruction) instead of the dp4a GEMV (the same A8 cast and integer products, summed "
+           "in another fixed order: changes the numerics slightly; prefill unchanged; off by default); "
+           "--vision takes "
+           "images when "
+           "the model was converted with "
            "--mmproj (its vision tower stays in host memory and borrows expert-cache memory per image)\n"
            "       --ngram-draft-tokens 15 adds n-gram copy drafting beside --spec dflash2: when the "
            "text being written already appeared in the request (a tool result, the prompt or the "
@@ -289,6 +403,16 @@ std::string serve_usage_text(const char* argv0) {
            "output. 0 (the default) disables it. "
            "--ngram-min-match N (4..64, default 12) is how many tokens must match before a copy "
            "is proposed\n"
+           "       --relaxed-drafting [P] (off by default; CHANGES THE OUTPUT DISTRIBUTION) keeps a "
+           "sampled draft whenever the model gives it probability P or more (0..1, 0.5 without a "
+           "value), even where exact speculative sampling would have drawn another token: faster, "
+           "but no longer the model's exact distribution. Greedy and constrained requests, tool "
+           "calls and control tokens stay exact; a request sets its own P with relaxed_drafting "
+           "(false: exact). P 0 makes it per-request only. Needs --spec\n"
+           "       --draft-context-rows N (0..2048, off by default) lets the drafter propose up to N "
+           "token ids the requests' own prompts and outputs hold (names, identifiers) that the "
+           "reduced draft head lacks, scored from the full output head; drafts only, so output is "
+           "unchanged. Needs --spec (not Qwen3.8-Flash-Next, which drafts with its full head)\n"
            "       --no-prefix-reuse disables cross-request history; request pause/replay "
            "resources remain available\n"
            "       --context-store DIR keeps retained sessions on disk so a restart or crash does "
@@ -415,25 +539,49 @@ std::vector<std::uint32_t> parse_stage_layers(std::string_view text) {
     return counts;
 }
 
-ServeOptions parse_serve_options(int argc, char** argv) {
-    ServeOptions options;
-    options.startup_argv.reserve(static_cast<std::size_t>(argc));
-    bool redact_next = false;
-    for (int i = 0; i < argc; ++i) {
-        if (redact_next) {
-            options.startup_argv.emplace_back("<redacted>");
-            redact_next = false;
-            continue;
-        }
-        options.startup_argv.emplace_back(argv[i] == nullptr ? "" : argv[i]);
-        redact_next = options.startup_argv.back() == "--api-key";
+namespace {
+
+// Where an argument word came from: the command line, or a --config file's key.
+struct WordOrigin {
+    std::string file;   // the --config path as given; empty for the command line
+    std::string key;    // the file's key (file words only)
+    bool value = false; // a file word that is its key's value, not the flag
+};
+
+// A word no flag matches; --config tells its own unknown keys apart from it.
+struct UnknownArgument : std::invalid_argument {
+    using std::invalid_argument::invalid_argument;
+};
+// A flag given last, with no value after it.
+struct MissingValue : std::invalid_argument {
+    using std::invalid_argument::invalid_argument;
+};
+// A refusal that already names the config file and its key.
+struct ConfigError : std::invalid_argument {
+    using std::invalid_argument::invalid_argument;
+};
+
+std::vector<std::string> redacted(const std::vector<std::string>& words) {
+    std::vector<std::string> out;
+    out.reserve(words.size());
+    for (const std::string& word : words) {
+        out.push_back(!out.empty() && out.back() == "--api-key" ? "<redacted>" : word);
     }
+    return out;
+}
+
+// The flag loop and the cross-checks, over the words --config expanded. `current` is the word the
+// loop is at, or npos once it is done, so a refusal can be blamed on a file's key.
+ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin>& origins,
+                             std::size_t& current) {
+    ServeOptions options;
     bool kv_capacity_explicit  = false;
     bool device_explicit       = false;
     bool context_store_tuning  = false;
     bool host_reserve_explicit = false;
     bool host_max_explicit     = false;
     bool host_percent_explicit = false;
+    bool cpu_verify_workers_set = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -450,25 +598,45 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     // Flags that only mean something to a router (--sleep-idle-seconds also works on one model).
     std::string router_only_flag;
     for (int i = artifact_given ? 2 : 1; i < argc; ++i) {
-        const std::string_view current = argv[i];
-        if (router_option(current)) {
-            if (current == "--models-max" || current == "--unload-idle-seconds") {
-                router_only_flag = std::string(current);
+        const std::string_view word = argv[i];
+        if (router_option(word)) {
+            if (word == "--models-max" || word == "--unload-idle-seconds") {
+                router_only_flag = std::string(word);
             }
             ++i;
             continue;
         }
-        if (current == "--models-autoload" || current == "--no-models-autoload") {
-            router_only_flag = std::string(current);
+        if (word == "--models-autoload" || word == "--no-models-autoload") {
+            router_only_flag = std::string(word);
             continue;
         }
-        options.model_arguments.emplace_back(current);
+        options.model_arguments.emplace_back(word);
     }
+    // A file's flag takes only its own value, never the next key or the command line's next word.
+    const auto value_follows = [&](int at) {
+        return at + 1 < argc && (origins[static_cast<std::size_t>(at)].file.empty() ||
+                                 origins[static_cast<std::size_t>(at) + 1].value);
+    };
     for (int i = artifact_given ? 2 : 1; i < argc; ++i) {
         const std::string arg    = argv[i];
+        const WordOrigin& origin = origins[static_cast<std::size_t>(i)];
+        current                  = static_cast<std::size_t>(i);
+        if (origin.value) {
+            // A file's value the flag before it did not take: that flag is a switch.
+            throw ConfigError(origin.file + ": \"" + origin.key + "\" does not take the value \"" +
+                              arg + "\"; set it to true or false");
+        }
+        if (arg.rfind("--", 0) == 0) {
+            options.setting_sources[arg] = origin.file.empty() ? "cli" : origin.file;
+        }
         const auto require_value = [&](const char* flag) -> const char* {
-            if (++i >= argc) { throw std::invalid_argument(std::string(flag) + " needs a value"); }
-            return argv[i];
+            if (!value_follows(i)) {
+                if (!origin.file.empty()) {
+                    throw ConfigError(origin.file + ": \"" + origin.key + "\" needs a value");
+                }
+                throw MissingValue(std::string(flag) + " needs a value");
+            }
+            return argv[++i];
         };
         if (arg == "--host") {
             options.host = require_value("--host");
@@ -476,6 +644,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.port = parse_nonnegative_int(require_value("--port"), "port");
         } else if (arg == "--api-key") {
             options.api_key = require_value("--api-key");
+        } else if (arg == "--allowed-host") {
+            const std::string_view name = require_value("--allowed-host");
+            // Only what the Host check can match: the port is not compared, and a scheme, path,
+            // wildcard or userinfo would never match anything.
+            if (!valid_allowed_host(name)) {
+                throw std::invalid_argument(
+                    "--allowed-host '" + std::string(name) +
+                    "' is not a host name or address (no scheme, port, path or wildcard), e.g. "
+                    "--allowed-host gpubox.lan");
+            }
+            options.allowed_hosts.emplace_back(name);
         } else if (arg == "--model-id") {
             options.model_id_override = require_value("--model-id");
             if (options.model_id_override->empty()) {
@@ -680,6 +859,22 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--ngram-min-match") {
             options.speculative.ngram_min_match = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--ngram-min-match"), "ngram-min-match"));
+        } else if (arg == "--relaxed-drafting") {
+            // The value is optional: a number in [0,1] when the next argument is one.
+            options.relaxed_drafting = ninfer::kRelaxedDraftingDefault;
+            if (value_follows(i) && looks_like_number(argv[i + 1])) {
+                options.relaxed_drafting =
+                    parse_float_in(argv[++i], "relaxed-drafting", 0.0f, 1.0f);
+            }
+        } else if (arg == "--draft-context-rows") {
+            const int rows =
+                parse_nonnegative_int(require_value("--draft-context-rows"), "draft-context-rows");
+            if (static_cast<std::uint32_t>(rows) > ninfer::kMaximumDraftContextRows) {
+                throw std::invalid_argument("--draft-context-rows N must be in [0," +
+                                            std::to_string(ninfer::kMaximumDraftContextRows) +
+                                            "]");
+            }
+            options.draft_context_rows = static_cast<std::uint32_t>(rows);
         } else if (arg == "--max-output-tokens") {
             options.max_output_tokens =
                 parse_nonnegative_int(require_value("--max-output-tokens"), "max-output-tokens");
@@ -718,10 +913,63 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--ngram-volume") {
             options.flash_next.ngram_volume_path = require_value("--ngram-volume");
+        } else if (arg == "--ngram-keepalive-ms") {
+            const int ms = parse_nonnegative_int(require_value("--ngram-keepalive-ms"), "ngram-keepalive-ms");
+            if (static_cast<std::uint32_t>(ms) > kNgramKeepaliveWindowMs) {
+                throw std::invalid_argument("--ngram-keepalive-ms must be in [0, " +
+                                            std::to_string(kNgramKeepaliveWindowMs) +
+                                            "]: keep-alive reads run only for a minute after a request");
+            }
+            options.flash_next.ngram_keepalive_ms = static_cast<std::uint32_t>(ms);
+        } else if (arg == "--shared-expert-stream") {
+            options.flash_next.shared_expert_stream = true;
+        } else if (arg == "--mtp-constrained") {
+            options.flash_next.mtp_constrained = true;
+        } else if (arg == "--mtp-joint-acceptance") {
+            options.flash_next.mtp_joint_acceptance = true;
+        } else if (arg == "--ngram-prefetch") {
+            options.flash_next.ngram_prefetch = true;
+        } else if (arg == "--gdn-head-map") {
+            options.flash_next.gdn_head_map = true;
+        } else if (arg == "--moe-precast-input") {
+            options.flash_next.moe_precast_input = true;
+        } else if (arg == "--moe-gate-up-registers") {
+            options.flash_next.moe_gate_up_registers = true;
+        } else if (arg == "--moe-fused-route") {
+            options.flash_next.moe_fused_route = true;
+        } else if (arg == "--cpu-verify-misses") {
+            options.flash_next.cpu_verify_misses = true;
+        } else if (arg == "--gdn-async-commit") {
+            options.flash_next.gdn_async_commit = true;
+        } else if (arg == "--hc-int8") {
+            options.flash_next.hc_int8 = true;
+        } else if (arg == "--hc-fused-read") {
+            options.flash_next.hc_fused_read = true;
+        } else if (arg == "--ngram-flag-wait") {
+            options.flash_next.ngram_flag_wait = true;
+        } else if (arg == "--partial-ram-residency") {
+            options.flash_next.partial_ram_residency = true;
+        } else if (arg == "--ggml-decode-mma") {
+            options.flash_next.ggml_decode_mma = true;
+        } else if (arg == "--prefill-cpu-share") {
+            options.flash_next.prefill_cpu_share = parse_share(require_value("--prefill-cpu-share"));
+        } else if (arg == "--cpu-verify-workers") {
+            const int workers = parse_nonnegative_int(require_value("--cpu-verify-workers"), "cpu-verify-workers");
+            if (workers < 1 || workers > 64) { throw std::invalid_argument("--cpu-verify-workers must be in [1, 64]"); }
+            options.flash_next.cpu_verify_workers = static_cast<std::uint32_t>(workers);
+            cpu_verify_workers_set = true;
+        } else if (arg == "--hot-embedding-rows") {
+            options.flash_next.hot_embedding_rows = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--hot-embedding-rows"), "hot-embedding-rows"));
         } else if (arg == "--expert-state") {
             options.flash_next.expert_state_path = require_value("--expert-state");
             if (options.flash_next.expert_state_path.empty()) {
                 throw std::invalid_argument("--expert-state must not be empty");
+            }
+        } else if (arg == "--default-expert-state") {
+            options.flash_next.default_expert_state_path = require_value("--default-expert-state");
+            if (options.flash_next.default_expert_state_path.empty()) {
+                throw std::invalid_argument("--default-expert-state must not be empty");
             }
         } else if (arg == "--no-expert-state") {
             options.flash_next.save_expert_state = false;
@@ -824,6 +1072,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.gdn_state_fp16 = true;
         } else if (arg == "--admission-fit-check") {
             options.admission_fit_check = true;
+        } else if (arg == "--admission-affinity") {
+            options.admission_affinity = true;
         } else if (arg == "--model-suspend") {
             options.suspend.enabled = true;
         } else if (arg == "--suspend-snapshot") {
@@ -929,10 +1179,24 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.greedy = true;
         } else if (arg == "--log-level") {
             options.log_level = product::parse_log_level(require_value("--log-level"));
+        } else if (!origin.file.empty()) {
+            throw ConfigError(origin.file + ": unknown key \"" + origin.key + "\"");
         } else {
-            throw std::invalid_argument("unknown argument: " + arg);
+            // The command line trying to undo a file's switch with a negation that does not exist
+            // (--no-vision against "vision": true, --thinking against "no-thinking": true).
+            const std::string undone = arg.rfind("--no-", 0) == 0 ? "--" + arg.substr(5)
+                                       : arg.rfind("--", 0) == 0  ? "--no-" + arg.substr(2)
+                                                                  : std::string();
+            for (std::size_t j = 0; !undone.empty() && j < origins.size(); ++j) {
+                if (!origins[j].file.empty() && !origins[j].value && argv[j] == undone) {
+                    throw ConfigError(origins[j].file + ": \"" + origins[j].key +
+                                      "\" is set and has no command-line override");
+                }
+            }
+            throw UnknownArgument("unknown argument: " + arg);
         }
     }
+    current = std::string::npos;
     if (!options.default_graft.empty() &&
         std::none_of(options.grafts.begin(), options.grafts.end(), [&](const GraftSource& source) {
             return source.name == options.default_graft;
@@ -965,6 +1229,39 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (!options.stage_layers.empty() && options.devices.size() < 2) {
         throw std::invalid_argument("--stage-layers needs --devices naming more than one device");
+    }
+    if (options.relaxed_drafting && options.speculative.backend == SpeculativeBackend::None) {
+        throw std::invalid_argument("--relaxed-drafting changes which drafts speculative decoding keeps and "
+                                    "needs --spec mtp, dflash or dflash2");
+    }
+    if (options.draft_context_rows != 0 && options.speculative.backend == SpeculativeBackend::None) {
+        throw std::invalid_argument("--draft-context-rows adds rows to the draft head's proposals and needs "
+                                    "--spec mtp, dflash or dflash2");
+    }
+    if (options.flash_next.mtp_constrained && options.speculative.backend != SpeculativeBackend::Mtp) {
+        throw std::invalid_argument("--mtp-constrained keeps MTP speculation on for constrained requests and "
+                                    "needs --spec mtp");
+    }
+    if (options.flash_next.mtp_joint_acceptance && options.speculative.backend != SpeculativeBackend::Mtp) {
+        throw std::invalid_argument("--mtp-joint-acceptance chooses how many MTP drafts a round verifies and "
+                                    "needs --spec mtp");
+    }
+    if (options.flash_next.ngram_prefetch && options.speculative.backend != SpeculativeBackend::Mtp) {
+        throw std::invalid_argument("--ngram-prefetch reads the anchor column's n-gram rows while the MTP "
+                                    "drafter runs and needs --spec mtp");
+    }
+    if (options.flash_next.cpu_verify_misses && options.speculative.backend != SpeculativeBackend::Mtp) {
+        throw std::invalid_argument("--cpu-verify-misses computes MTP verification rounds' misses on the CPU and "
+                                    "needs --spec mtp");
+    }
+    if (options.flash_next.gdn_async_commit && options.speculative.backend != SpeculativeBackend::Mtp) {
+        throw std::invalid_argument("--gdn-async-commit folds MTP verification commits on a side stream and needs "
+                                    "--spec mtp");
+    }
+    if (cpu_verify_workers_set && !options.flash_next.cpu_verify_misses &&
+        options.flash_next.prefill_cpu_share.num == 0) {
+        throw std::invalid_argument("--cpu-verify-workers sizes the CPU team of --cpu-verify-misses and "
+                                    "--prefill-cpu-share: add one of them");
     }
     if (options.context_store_path.empty() &&
         (context_store_tuning || options.context_store_max_gib)) {
@@ -1068,6 +1365,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     models::qwen3_5::validate_lossy_prefill_options(options.lossy_prefill);
     product::apply_speculative_defaults(options.speculative);
     product::validate_speculative_cli_options(options.speculative);
+    if (options.flash_next.moe_gate_up_registers && !options.flash_next.moe_precast_input) {
+        throw std::invalid_argument("--moe-gate-up-registers reads the input that --moe-precast-input casts once "
+                                    "per call: add --moe-precast-input");
+    }
+    if (options.flash_next.hc_fused_read && !options.flash_next.hc_int8) {
+        throw std::invalid_argument("--hc-fused-read reads the int8 mixer copies that --hc-int8 makes: add --hc-int8");
+    }
     if (options.vision_residency == VisionResidency::Overlay && !options.enable_vision) {
         throw std::invalid_argument("--vision-residency overlay requires --vision");
     }
@@ -1092,6 +1396,107 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.sleep_idle_seconds != 0 && !options.suspend.enabled && !options.router()) {
         throw std::invalid_argument("--sleep-idle-seconds requires --model-suspend");
+    }
+    return options;
+}
+
+enum class FlagKind : std::uint8_t { Unknown, Switch, Value };
+
+// What the flag loop makes of `flag` alone: the parser is the one list of flags, so a key a
+// config file sets to false (which adds no word) is checked against it.
+FlagKind flag_kind(const std::string& flag) {
+    std::vector<std::string> words{"ninfer-serve", "probe.ninfer", flag};
+    std::vector<char*> argv;
+    for (std::string& word : words) { argv.push_back(word.data()); }
+    std::size_t current = std::string::npos;
+    try {
+        (void)parse_arguments(static_cast<int>(argv.size()), argv.data(),
+                              std::vector<WordOrigin>(words.size()), current);
+    } catch (const UnknownArgument&) {
+        return FlagKind::Unknown;
+    } catch (const MissingValue&) {
+        return FlagKind::Value;
+    } catch (const std::exception&) {
+        // A switch the cross-checks want another option beside (--progress-anchors-shared).
+    }
+    return FlagKind::Switch;
+}
+
+} // namespace
+
+ServeOptions parse_serve_options(int argc, char** argv) {
+    std::vector<std::string> raw;
+    for (int i = 0; i < argc; ++i) { raw.emplace_back(argv[i] == nullptr ? "" : argv[i]); }
+    // --config FILE: the file's words go first, after the artifact path, and the command line's
+    // after them, so the command line's win wherever --config stands (the flag loop keeps the last
+    // value). --help reads no file.
+    std::vector<std::string> words;
+    std::vector<WordOrigin> origins;
+    const auto add = [&](std::string word, WordOrigin origin) {
+        words.push_back(std::move(word));
+        origins.push_back(std::move(origin));
+    };
+    const bool help        = raw.size() >= 2 && (raw[1] == "--help" || raw[1] == "-h");
+    const std::size_t rest = raw.size() >= 2 && raw[1].rfind("--", 0) != 0 ? 2 : 1;
+    for (std::size_t i = 0; i < std::min(rest, raw.size()); ++i) { add(raw[i], {}); }
+    std::optional<std::string> config;
+    for (std::size_t i = rest; i < raw.size() && !help; ++i) {
+        if (raw[i] != "--config") { continue; }
+        if (config) { throw std::invalid_argument("--config may be given once"); }
+        if (i + 1 >= raw.size()) { throw std::invalid_argument("--config needs a value"); }
+        config = raw[i + 1];
+    }
+    ConfigWords file;
+    if (config) {
+        file = read_serve_config(*config);
+        for (std::size_t i = 0; i < file.words.size(); ++i) {
+            add(file.words[i], {.file = *config, .key = file.keys[i], .value = file.values[i]});
+        }
+        for (const std::string& key : file.false_keys) {
+            const FlagKind kind = flag_kind("--" + key);
+            if (kind == FlagKind::Unknown) {
+                throw std::invalid_argument(*config + ": unknown key \"" + key + "\"");
+            }
+            if (kind == FlagKind::Value) {
+                throw std::invalid_argument(*config + ": \"" + key +
+                                            "\" takes a value, not false");
+            }
+        }
+    }
+    for (std::size_t i = rest; i < raw.size(); ++i) {
+        if (config && raw[i] == "--config") {
+            ++i;
+            continue;
+        }
+        add(raw[i], {});
+    }
+
+    std::vector<char*> pointers;
+    for (std::string& word : words) { pointers.push_back(word.data()); }
+    std::size_t current = std::string::npos;
+    ServeOptions options;
+    try {
+        options = parse_arguments(static_cast<int>(pointers.size()), pointers.data(), origins,
+                                  current);
+    } catch (const ConfigError&) {
+        throw;
+    } catch (const std::invalid_argument& error) {
+        // A value the file gave that its option refuses: name the file and the key.
+        if (current < origins.size() && !origins[current].file.empty()) {
+            throw std::invalid_argument(origins[current].file + ": \"" + origins[current].key +
+                                        "\": " + error.what());
+        }
+        throw;
+    }
+    // Secret-bearing values are redacted: these are provenance only.
+    options.startup_argv   = redacted(raw);
+    options.effective_argv = redacted(words);
+    if (config) {
+        options.setting_sources["--config"] = "cli";
+        for (const std::string& key : file.false_keys) {
+            // Unless the command line set it.
+            options.setting_sources.emplace("--" + key, "default");
+        }
     }
     return options;
 }

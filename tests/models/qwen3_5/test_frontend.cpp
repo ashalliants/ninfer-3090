@@ -534,6 +534,48 @@ int test_tokenizer_config_merge() {
     return failures;
 }
 
+// Relaxed drafting's tokenizer facts: the lowest added id when the added ids are one contiguous
+// run, and the tool tags as single added tokens; a split run or a missing tag refuses the option.
+int test_relaxed_drafting_tokens() {
+    const auto tokenizer_with = [](nlohmann::json tokens) {
+        const std::string tokenizer_json = nlohmann::json{
+            {"model",
+             {{"type", "BPE"},
+              {"vocab", {{"a", 0}, {"b", 1}, {"c", 2}}},
+              {"merges", nlohmann::json::array()}}},
+            {"added_tokens", std::move(tokens)}}.dump();
+        const std::string config =
+            nlohmann::json{{"added_tokens_decoder", nlohmann::json::object()}}.dump();
+        return fi::Tokenizer({.tokenizer_json         = tokenizer_json,
+                              .tokenizer_config_json  = config,
+                              .generation_config_json = R"({"eos_token_id":3})"});
+    };
+    const fi::Tokenizer contiguous = tokenizer_with(nlohmann::json::array(
+        {added(3, "<|endoftext|>", true), added(4, "<tool_call>"), added(5, "</tool_call>"),
+         added(6, "<think>")}));
+    const fi::RelaxedDraftingTokens facts = fi::relaxed_drafting_tokens(contiguous);
+    int failures = check(facts.added_token_floor == 3 && facts.tool_call_open == 4 &&
+                             facts.tool_call_close == 5,
+                         "relaxed drafting token facts are wrong");
+    const auto refused = [](const fi::Tokenizer& tokenizer) {
+        try {
+            (void)fi::relaxed_drafting_tokens(tokenizer);
+        } catch (const std::invalid_argument& error) {
+            return std::string(error.what()).find("--relaxed-drafting") != std::string::npos;
+        }
+        return false;
+    };
+    failures += check(refused(tokenizer_with(nlohmann::json::array(
+                          {added(3, "<tool_call>"), added(5, "</tool_call>")}))),
+                      "a split added-token range was accepted for relaxed drafting");
+    failures += check(refused(tokenizer_with(nlohmann::json::array(
+                          {added(3, "<|endoftext|>", true), added(4, "<tool_call>")}))),
+                      "a tokenizer without </tool_call> was accepted for relaxed drafting");
+    failures += check(refused(fixture_tokenizer()),
+                      "the fixture's split added tokens were accepted for relaxed drafting");
+    return failures;
+}
+
 int test_bpe_merge_order() {
     const std::string tokenizer_json = nlohmann::json{
         {"model",
@@ -3650,6 +3692,7 @@ int main() {
     int failures                  = 0;
     failures += test_declared_frontend_semantics();
     failures += test_tokenizer_config_merge();
+    failures += test_relaxed_drafting_tokens();
     failures += test_bpe_merge_order();
     failures += test_boundary_aware_tokenization();
     failures += test_rendered_special_tokens();

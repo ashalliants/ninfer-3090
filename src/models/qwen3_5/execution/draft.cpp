@@ -19,6 +19,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
+#include "ninfer/ops/linear_rows.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/prepare_masked_block.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
@@ -261,6 +262,19 @@ void finish_dynamic_branch(ExecutionCore& execution, const Tensor& input,
                                          finish_delta, residual, scratch, execution.device.stream);
 }
 
+// --draft-context-rows: the rows' scores from the Text output head for every column of the primal
+// `hidden`, FP32 [C, columns] in the caller's workspace scope.
+Tensor score_context_rows(ExecutionCore& execution, const Tensor& hidden) {
+    const Tensor& row_ids = execution.io.draft_context_rows;
+    const auto& head      = execution.parameters.text.output_head;
+    Tensor scores         = execution.work.alloc(DType::FP32, {row_ids.ne[0], hidden.ne[1]});
+    auto scope            = execution.work.scope();
+    const Tensor input =
+        rotated_input(hidden, head.hadamard_signs, execution.work, execution.device.stream);
+    ops::linear_rows(input, head.weight, row_ids, scores, execution.device.stream);
+    return scores;
+}
+
 void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame, int batch,
                            int k, DFlashEnvelopes envelopes) {
     if (state.execution.parameters.model.config().draft->dflash2) {
@@ -374,6 +388,13 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                     head_input, head.head.weight,
                     dimension(state.execution.parameters.model.resources().public_token_count),
                     ids_flat, scores, work, stream);
+            }
+            if (state.execution.io.draft_context_rows.data != nullptr) {
+                // The rows the subset lacks compete for the sixteen candidates.
+                auto rows_scope         = work.scope();
+                const Tensor row_scores = score_context_rows(state.execution, hidden);
+                ops::merge_row_topk(row_scores, state.execution.io.draft_context_rows, ids_flat,
+                                    scores, stream);
             }
         }
         Tensor projected =
@@ -560,10 +581,18 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                     ? dimension(proposal.rows)
                     : dimension(state.execution.parameters.model.resources().public_token_count),
                 state.execution.device.stream);
-            if (proposal.token_ids)
+            if (state.execution.io.draft_context_rows.data != nullptr) {
+                // The rows the subset lacks compete with its argmax.
+                auto rows_scope         = state.execution.work.scope();
+                const Tensor row_scores = score_context_rows(state.execution, proposal_hidden);
+                ops::merge_row_argmax(logits, proposal.token_ids ? &*proposal.token_ids : nullptr,
+                                      row_scores, state.execution.io.draft_context_rows,
+                                      flat_drafts, state.execution.device.stream);
+            } else if (proposal.token_ids) {
                 ops::proposal_remap_token_ids(
                     flat_drafts, static_cast<const std::int32_t*>(proposal.token_ids->data),
                     dimension(proposal.rows), state.execution.device.stream);
+            }
         }
         state.execution.work.reset();
     }
@@ -752,6 +781,9 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 .licensed_tokens = licensed_tokens,
                 .licensed_counts = licensed_counts,
                 .accepted_drafts = accepted,
+                .relaxed_kept    = frame.relaxed_kept.data
+                                       ? frame.relaxed_kept.slice(0, 0, batch_size)
+                                       : Tensor{},
                 .selected_hidden = selected_hidden,
                 .replay_records  = state.execution.replay_records,
                 .sampling        = frame.sampling,

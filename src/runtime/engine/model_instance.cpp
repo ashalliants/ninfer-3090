@@ -12,6 +12,7 @@
 #include "runtime/engine/validate_options.h"
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <cstdio>
 #include <limits>
@@ -24,6 +25,43 @@
 #include <vector>
 
 namespace ninfer::runtime {
+
+namespace {
+
+// --draft-context-rows adds rows to the drafts of the reduced proposal head, so it needs a drafter
+// that reads one.
+void validate_draft_context_rows(const EngineOptions& options) {
+    if (options.draft_context_rows == 0) { return; }
+    if (options.draft_context_rows > kMaximumDraftContextRows) {
+        throw std::invalid_argument("--draft-context-rows N must be in [0," +
+                                    std::to_string(kMaximumDraftContextRows) + "]");
+    }
+    if (options.purpose != EnginePurpose::Generation ||
+        options.speculative.backend == SpeculativeBackend::None ||
+        options.speculative.proposal_head != ProposalHead::Optimized) {
+        throw std::invalid_argument(
+            "--draft-context-rows adds rows to the reduced proposal head's drafts and needs "
+            "--spec mtp, dflash or dflash2 with the optimized proposal head (--lm-head-draft)");
+    }
+}
+
+// --relaxed-drafting P: a threshold in [0, 1], and speculation for it to relax. ninfer-serve
+// refuses the missing backend at parse time too, so a command line fails before any load.
+void validate_relaxed_drafting(const EngineOptions& options) {
+    if (!options.relaxed_drafting) { return; }
+    const float threshold = *options.relaxed_drafting;
+    if (!std::isfinite(threshold) || threshold < 0.0F || threshold > 1.0F) {
+        throw std::invalid_argument("--relaxed-drafting P must be in [0,1]");
+    }
+    if (options.purpose != EnginePurpose::Generation ||
+        options.speculative.backend == SpeculativeBackend::None) {
+        throw std::invalid_argument(
+            "--relaxed-drafting changes which drafts speculative decoding keeps and needs "
+            "--spec mtp, dflash or dflash2");
+    }
+}
+
+} // namespace
 
 void validate_engine_options(const EngineOptions& options) {
     if (options.artifact_path.empty()) {
@@ -89,6 +127,8 @@ void validate_engine_options(const EngineOptions& options) {
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
+    validate_relaxed_drafting(options);
+    validate_draft_context_rows(options);
     if (options.max_pending_requests == 0 || options.pending_timeout_ms == 0) {
         throw std::invalid_argument("Engine pending request capacity and timeout must be nonzero");
     }
@@ -245,9 +285,23 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     default:
         throw std::invalid_argument("Engine purpose is invalid");
     }
+    if (options.scoring_decode_window != 0) {
+        if (options.purpose != EnginePurpose::CausalScoring) {
+            throw std::invalid_argument("scoring_decode_window requires a CausalScoring Engine");
+        }
+        if (options.scoring_decode_window > kMaximumScoringDecodeWindow) {
+            throw std::invalid_argument("scoring_decode_window must be in [1,16]");
+        }
+        if (options.devices.size() > 1) {
+            throw std::invalid_argument(
+                "scoring_decode_window supports one device; drop the pipeline device list");
+        }
+    }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
+    validate_relaxed_drafting(options);
+    validate_draft_context_rows(options);
 
     if (options.prefill_schedule.stall_budget_ms > kMaximumPrefillStallBudgetMs) {
         throw std::invalid_argument("prefill_schedule.stall_budget_ms must be at most 60000");

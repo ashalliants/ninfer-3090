@@ -343,12 +343,15 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.mtp_experts_q4           = options.mtp_experts_q4;
     engine_options.gdn_state_fp16           = options.gdn_state_fp16;
     engine_options.admission_fit_check      = options.admission_fit_check;
+    engine_options.admission_affinity       = options.admission_affinity;
     engine_options.suspend                  = options.suspend;
     engine_options.mlp_a8_decode            = options.mlp_a8_decode;
     engine_options.prefill_a8               = options.prefill_a8;
     engine_options.prefill_cublas           = options.prefill_cublas;
     engine_options.prefill_cublas_projections = options.prefill_cublas_projections;
     engine_options.speculative              = options.speculative;
+    engine_options.relaxed_drafting         = options.relaxed_drafting;
+    engine_options.draft_context_rows       = options.draft_context_rows;
     engine_options.context_cache            = options.context_cache;
     engine_options.prefill_schedule         = options.prefill_schedule;
     engine_options.lossy_prefill            = options.lossy_prefill;

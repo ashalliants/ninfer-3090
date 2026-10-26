@@ -46,33 +46,142 @@
 //     distinct experts per layer and misses per round, and the cost per extra row.
 //     --configs LIST (0 = the single-sequence call, B = B rows) instead runs the listed
 //     configurations once each inside a cudaProfilerStart/Stop range, for an nsys kernel breakdown.
+//
+// KLD mode (the decode-path quality gate against a llama.cpp base; docs/maintainer/flash-next-plan.md):
+//
+//   ninfer_qwen4_exp_forward_real_test --kld-base FILE [--chunks N] [--window T] [--tsv OUT.tsv]
+//       [--staging SLOTS] [--hc-int8] [--ggml-decode-mma]
+//
+// FILE is a `llama-perplexity --kl-divergence-base` file; its n_ctx-token chunks hold the tokens.
+// Each chunk (the first N, default all) is a fresh sequence: positions [0, n_ctx/2) are prefilled as
+// one call, then every target in [n_ctx/2 + 1, n_ctx) is predicted by a decode forward, T targets
+// per call (default 3, at most 8): one column through the plain decode call, wider windows through
+// the verification call the Program runs for an MTP round (T - 1 drafts) with every column committed
+// by the GDN fold, qsa_commit_tails and ple_conv_commit; a partial last window is a narrower round.
+// Each row's FP32 logits over the public token domain are scored against the base row (score_row);
+// the rows go to OUT.tsv (default kld-rows.tsv) and the summary to stdout. Numerics options run
+// under the gate as flags: --hc-int8 makes the mixers' int8 copies once (ex::HcInt8Copies) and every
+// chunk's forward reads them (ForwardOptions::hc_int8) in its decode and verification calls; the
+// prompt half (more than 16 columns) reads the BF16 weights. --ggml-decode-mma runs the dense GGML
+// linears of the decode and verification calls (at most 8 columns) on the int8 tensor-core route
+// (ForwardOptions::ggml_decode_mma); the prompt half keeps the wide route either way.
+//
+// --hc-int8 prefill mode (ForwardOptions::hc_int8 leaves calls of more than 16 columns bit-exact):
+//
+//   ninfer_qwen4_exp_forward_real_test --hc-int8-prefill TOKENS [--staging SLOTS]
+//
+// From a fresh state, twice (off, then with the mixers' int8 copies): all but the last token are
+// prefilled as one call (at least 17 tokens, so every mixer call is wider than the int8 route),
+// then the last is decoded by one call. The prompt call's logits must be bitwise equal; the decode
+// call's must differ (it reads the copies, a check that the option is in effect).
+//
+// Shared-expert-stream mode (ForwardOptions::shared_expert_stream is bit-exact):
+//
+//   ninfer_qwen4_exp_forward_real_test --shared-expert-stream TOKENS [--decode N] [--staging SLOTS]
+//
+// All but the last N tokens (default 4; more than 8 must remain, so the prompt call is wider than the
+// GGML decode route and its Linears use the side stream's carve) are prefilled as one call, then each
+// of the N is decoded by one call, from a fresh state, four times: the shared expert after the routed
+// experts or beside them on its side stream, with the decode calls eager or each captured in a CUDA
+// graph and replayed. The
+// prompt call's last logits and every decode call's must be bitwise equal between the serial and the
+// side-stream run of the same decode mode.
+//
+// GDN head-map mode (ForwardOptions::gdn_head_map is bit-exact):
+//
+//   ninfer_qwen4_exp_forward_real_test --gdn-head-map TOKENS [--window W] [--decode N] [--staging SLOTS]
+//
+// From a fresh state, twice (q/k tiled by copies, then read in place through the tiled head map):
+// all but the last W + N tokens are prefilled as one call (at least 16 tokens, the GDN's chunked
+// route), the next W (default 3, 2..8) are one verification call (the recorded recurrence, every
+// column's logits) committed in full by the GDN fold, then each of the last N (default 2) is decoded
+// by one call (the recurrent kernel). Every logits column must be bitwise equal between the runs.
+//
+// MoE precast mode (ForwardOptions::moe_precast_input is bit-exact):
+//
+//   ninfer_qwen4_exp_forward_real_test --moe-precast-input TOKENS [--window W] [--decode N] [--staging SLOTS]
+//
+// The same calls as the head-map mode (a prompt call wider than 8 columns, whose experts take the
+// narrow and the wide route; a verification window; decode calls), each routed-expert call casting
+// its input to A8 per block, then once per call. Every logits column must be bitwise equal.
+//
+// MoE register gate/up mode (ForwardOptions::moe_gate_up_registers is bit-exact):
+//
+//   ninfer_qwen4_exp_forward_real_test --moe-gate-up-registers TOKENS [--window W] [--decode N] [--staging SLOTS]
+//
+// The same calls, first with the default gate/up kernel (per-block casts, rows staged in shared
+// memory), then with the precast input and the register gate/up kernel. Every logits column must be
+// bitwise equal.
+//
+// MoE one-launch route and dispatch mode (ForwardOptions::moe_fused_route is bit-exact):
+//
+//   ninfer_qwen4_exp_forward_real_test --moe-fused-route TOKENS [--window W] [--decode N] [--staging SLOTS]
+//
+// The same calls, first with moe_route then moe_dispatch, then with moe_route_dispatch (one launch
+// for the verification and decode calls; the prompt call, wider than 8 columns, takes the two Ops
+// either way). Every logits column must be bitwise equal.
+//
+// Fused hyper-connection read mode (ForwardOptions::hc_fused_read is bit-exact against hc_int8 alone):
+//
+//   ninfer_qwen4_exp_forward_real_test --hc-fused-read TOKENS [--window W] [--decode N] [--staging SLOTS]
+//
+// The same calls, both runs with the mixers' int8 copies (made once): first each routed-expert
+// block's input through the inject, the int8 mixer, the router projection, moe_route and
+// moe_dispatch, then through one hc_fused_read (the verification and decode calls, and the prompt
+// call when it has at most 16 columns; a wider one runs as off). Every logits column must be bitwise
+// equal.
+//
+//   ninfer_qwen4_exp_forward_real_test --hc-fused-read-side-stream TOKENS [--window W] [--decode N]
+//       [--staging SLOTS]
+//
+// The same with the shared expert on its side stream in both runs (ForwardOptions::
+// shared_expert_stream), which forks at the event the fused read records before its routing kernel:
+// the side stream's allocations must not reuse the read's workspace while that kernel runs.
 
 #include "artifact/reader.h"
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "core/gdn_replay_records.h"
+#include "core/layout.h"
+#include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
+#include "core/side_stream_delay.h"
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/model.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
+#include "models/qwen4_exp/program/program.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
+#include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/ple.h"
+#include "ninfer/ops/qsa.h"
+
+#include "evaluation.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iterator>
 #include <memory>
 #include <numeric>
+#include <optional>
+#include <span>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #ifdef _WIN32
@@ -86,8 +195,25 @@
 using namespace ninfer;
 namespace q4 = ninfer::models::qwen4_exp;
 namespace ex = ninfer::models::qwen4_exp::execution;
+namespace ppl = ninfer::perplexity;
 
 namespace {
+
+// An option's whole value as an integer: "12x", "", "1e3" and out-of-range values are refused,
+// naming the option (std::stoi would take "12x" as 12 and throw a bare "stoi" otherwise).
+template <typename Int>
+Int option_integer(const std::string& option, const std::string& value) {
+    Int out{};
+    const char* end           = value.data() + value.size();
+    const auto [stop, status] = std::from_chars(value.data(), end, out);
+    if (value.empty() || status != std::errc{} || stop != end) {
+        throw std::invalid_argument(option + " needs an integer, got '" + value + "'");
+    }
+    return out;
+}
+int option_int(const std::string& option, const std::string& value) {
+    return option_integer<int>(option, value);
+}
 
 std::vector<std::int32_t> parse_tokens(const std::string& argument) {
     std::string text = argument;
@@ -133,7 +259,7 @@ double seconds_since(std::chrono::steady_clock::time_point t) {
 // sources: no resident experts, misses staged through `staging_slots` device slots.
 struct Harness {
     Harness(const ex::Parameters& parameters, DeviceContext& device, std::int32_t context, std::int32_t columns,
-            std::int32_t staging_slots)
+            std::int32_t staging_slots, ex::ForwardOptions options = {})
         : config(parameters.model.config()) {
         const auto& c = config;
         const auto gdn_layers = static_cast<std::size_t>(c.gdn_layers);
@@ -220,12 +346,17 @@ struct Harness {
             experts.staging_slots = staging_slots;
         }
         work = std::make_unique<WorkspaceArena>(
-            ex::Forward::workspace_bytes(c, columns, static_cast<std::uint32_t>(context), device.execution_view()));
+            ex::Forward::workspace_bytes(c, columns, static_cast<std::uint32_t>(context), device.execution_view(),
+                                         options.moe_precast_input) +
+            (options.shared_expert_stream ? ex::Forward::shared_expert_workspace_bytes(c, columns) : 0) +
+            (options.hc_fused_read ? ex::Forward::hc_fused_read_workspace_bytes(c, columns) : 0));
+        views   = state;
         forward = std::make_unique<ex::Forward>(parameters, device, *work, std::move(state), std::move(kv),
-                                                std::move(experts));
+                                                std::move(experts), std::nullopt, options);
     }
 
     const q4::TextConfig& config;
+    ex::ForwardState views; // the state's tensors (the Forward holds the same views)
     DeviceBuffer state_backing, kv_backing, frames_backing, staging;
     std::unique_ptr<WorkspaceArena> work;
     std::unique_ptr<ex::Forward> forward;
@@ -432,7 +563,8 @@ struct RowsHarness {
         experts.route_log     = static_cast<std::int32_t*>(route_log.p);
         experts.route_stride  = route_stride;
         work = std::make_unique<WorkspaceArena>(
-            ex::Forward::workspace_bytes(c, kPrefillChunk, static_cast<std::uint32_t>(context), device.execution_view()));
+            ex::Forward::workspace_bytes(c, kPrefillChunk, static_cast<std::uint32_t>(context), device.execution_view(),
+                                         false));
         forward = std::make_unique<ex::Forward>(parameters, device, *work, std::move(state), std::move(kv),
                                                 std::move(experts));
     }
@@ -586,13 +718,13 @@ int rows_mode(int argc, char** argv, const char* artifact_env) {
         if (i + 1 >= argc) { throw std::invalid_argument(arg + " needs a value"); }
         const std::string value = argv[++i];
         if (arg == "--rows") {
-            steps = std::stoi(value);
+            steps = option_int(arg, value);
         } else if (arg == "--time") {
-            time_rounds = std::stoi(value);
+            time_rounds = option_int(arg, value);
         } else if (arg == "--frames-mib") {
-            frames_mib = std::stoll(value);
+            frames_mib = option_integer<std::int64_t>(arg, value);
         } else if (arg == "--staging") {
-            staging_slots = std::stoi(value);
+            staging_slots = option_int(arg, value);
         } else if (arg == "--configs") {
             configs = parse_tokens(value);
         } else {
@@ -901,7 +1033,595 @@ int rows_mode(int argc, char** argv, const char* artifact_env) {
     return 0;
 }
 
+// -------------------------------------------------------------------------------- KLD mode
+
+// The widest verification call the Program runs: the anchor and at most 7 MTP drafts
+// (program.cpp plan_layout).
+constexpr std::int32_t kMaxVerifyColumns = 8;
+
+// The bytes from layer 0's tensor to layer 1's (uniform per-layer strides), or `single` with one layer.
+std::size_t layer_stride(const std::vector<Tensor>& layers, std::size_t single) {
+    if (layers.size() < 2) { return single; }
+    return static_cast<std::size_t>(static_cast<const std::byte*>(layers[1].data) -
+                                    static_cast<const std::byte*>(layers[0].data));
+}
+
+// What a Harness's one sequence needs for W-column verification calls (W in [2, max_width]) and
+// their commit, as the Program's SpecLayout holds it: the GDN records planned at the widest width
+// (a narrower width's planes fit in them), the PLE convolution inputs, the raw index keys, copies of
+// the QSA tails, the convolution's discarded window, the slot word (0) and commit words 0..max_width.
+struct Verifier {
+    static std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); }
+    static std::size_t align256(std::size_t v) { return (v + 255) / 256 * 256; }
+
+    Verifier(const Harness& h, std::int32_t max_width, bool gdn_head_map = false)
+        : h(h), c(h.config), gdn_head_map(gdn_head_map) {
+        di = dim(c.qsa.index_head_dim);
+        r  = dim(c.qsa.compress_ratio);
+        LayoutBuilder builder;
+        records_bytes = align256(plan_gdn_replay_records(builder, records_spec(max_width)).payload_bytes());
+        tail_stride   = layer_stride(h.views.qsa_tails, h.views.qsa_tails[0].bytes());
+        const auto W  = static_cast<std::size_t>(max_width);
+        const std::size_t ple_bytes   = align256(std::size_t(c.residual_width()) * W * 2);
+        const std::size_t keys_bytes  = align256(std::size_t(di) * W * c.attention_layers * 2);
+        const std::size_t tails_bytes = align256(tail_stride * c.attention_layers);
+        const std::size_t conv_bytes  = align256(std::size_t(c.gdn.conv_channels()) * (c.gdn.conv_kernel - 1) * 2);
+        backing = DeviceBuffer(records_bytes + ple_bytes + keys_bytes + tails_bytes + conv_bytes + 256 +
+                               align256(4 * (W + 1)));
+        backing.fill(0);
+        auto* p      = static_cast<std::byte*>(backing.p);
+        ple_inputs   = p + records_bytes;
+        qsa_keys     = ple_inputs + ple_bytes;
+        tail_copies  = qsa_keys + keys_bytes;
+        conv         = tail_copies + tails_bytes;
+        slot         = conv + conv_bytes; // holds 0
+        commit_words = slot + 256;
+        std::vector<std::int32_t> words(W + 1);
+        std::iota(words.begin(), words.end(), 0);
+        backing.copy_from_host(words.data(), words.size() * 4, static_cast<std::size_t>(commit_words - p));
+        folds.resize(W + 1);
+    }
+
+    // The Program's records (one key head per value head, or the key heads under the tiled map).
+    GdnReplayRecordSpec records_spec(std::int32_t width) const { return q4::gdn_records_spec(c, width, gdn_head_map); }
+
+    ex::ForwardVerify view(std::int32_t W) const {
+        LayoutBuilder builder;
+        ex::ForwardVerify v;
+        v.gdn        = GdnReplayRecords(DeviceSpan{backing.p, records_bytes},
+                                        plan_gdn_replay_records(builder, records_spec(W)));
+        v.ple_inputs = Tensor(ple_inputs, DType::BF16, {dim(c.residual_width()), W});
+        v.qsa_keys   = Tensor(qsa_keys, DType::BF16, {di, W, dim(c.attention_layers)});
+        for (std::uint32_t l = 0; l < c.attention_layers; ++l) {
+            v.qsa_tails.emplace_back(tail_copies + tail_stride * l, DType::BF16,
+                                     std::initializer_list<std::int32_t>{di, r - 1});
+        }
+        v.conv_scratch = Tensor(conv, DType::BF16, {dim(c.gdn.conv_channels()), dim(c.gdn.conv_kernel - 1)});
+        v.initial_slot = Tensor(slot, DType::I32, {1});
+        return v;
+    }
+
+    // Before a verification call: it pools from copies of the live tails.
+    void copy_tails(cudaStream_t s) const {
+        CUDA_CHECK(cudaMemcpyAsync(tail_copies, h.views.qsa_tails[0].data, tail_stride * c.attention_layers,
+                                   cudaMemcpyDeviceToDevice, s));
+    }
+
+    // After a W-column verification call over `positions`: commits all W columns, as
+    // commit_verified commits an accepted round (the GDN fold, qsa_commit_tails, ple_conv_commit).
+    void commit(const ex::ForwardVerify& view, std::int32_t W, const Tensor& positions, cudaStream_t s) {
+        auto& fold = folds.at(static_cast<std::size_t>(W));
+        if (!fold) {
+            // The one sequence's convolution windows and recurrences, one slot, a uniform layer stride.
+            const auto stride = static_cast<std::int64_t>(layer_stride(h.views.gdn_conv, 0));
+            LinearAttentionStateAllLayersView state;
+            state.conv_layer0      = Tensor(h.views.gdn_conv[0].data, DType::BF16,
+                                            {dim(c.gdn.conv_channels()), dim(c.gdn.conv_kernel - 1), 1});
+            state.recurrent_layer0 = Tensor(h.views.gdn_recurrent[0].data, DType::FP32,
+                                            {dim(c.gdn.key_head_dim), dim(c.gdn.value_head_dim),
+                                             dim(c.gdn.value_heads), 1});
+            state.conv_layer_stride_bytes      = stride;
+            state.recurrent_layer_stride_bytes = stride;
+            state.spec = LinearAttentionStatePoolSpec{.layers         = c.gdn_layers,
+                                                      .conv_channels  = dim(c.gdn.conv_channels()),
+                                                      .conv_width     = dim(c.gdn.conv_kernel - 1),
+                                                      .value_heads    = dim(c.gdn.value_heads),
+                                                      .value_head_dim = dim(c.gdn.value_head_dim),
+                                                      .key_head_dim   = dim(c.gdn.key_head_dim),
+                                                      .slot_count     = 1};
+            fold.emplace(view.gdn, state);
+        }
+        const ops::GdnReplayFoldRow row{0, 0, W};
+        fold->execute(std::span<const ops::GdnReplayFoldRow>(&row, 1), s);
+        const Tensor count(reinterpret_cast<std::int32_t*>(commit_words) + W, DType::I32, {1});
+        Tensor tail0 = h.views.qsa_tails[0];
+        ops::qsa_commit_tails(view.qsa_keys, positions, count, tail0, static_cast<std::int64_t>(tail_stride), s);
+        Tensor ple_state = h.views.ple_conv;
+        ops::ple_conv_commit(view.ple_inputs.view({dim(c.residual_width()), W, 1}), count, ple_state,
+                             h.views.ple_slot, s);
+    }
+
+    const Harness& h;
+    const q4::TextConfig& c;
+    bool gdn_head_map = false;
+    std::int32_t di = 0, r = 0;
+    std::size_t records_bytes = 0, tail_stride = 0;
+    DeviceBuffer backing;
+    std::byte *ple_inputs = nullptr, *qsa_keys = nullptr, *tail_copies = nullptr, *conv = nullptr, *slot = nullptr,
+              *commit_words = nullptr;
+    std::vector<std::optional<ops::GdnReplayFoldPlan>> folds;
+};
+
+// KLD mode: see the file comment.
+int kld_mode(int argc, char** argv, const char* artifact_env) {
+    std::optional<std::filesystem::path> base_path;
+    std::optional<int> chunks;
+    std::int32_t window = ppl::kDefaultDecodeWindow, staging_slots = 64;
+    std::string tsv_path = "kld-rows.tsv";
+    bool hc_int8         = false;
+    bool ggml_decode_mma = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--hc-int8") {
+            hc_int8 = true;
+            continue;
+        }
+        if (arg == "--ggml-decode-mma") {
+            ggml_decode_mma = true;
+            continue;
+        }
+        if (i + 1 >= argc) { throw std::invalid_argument(arg + " needs a value"); }
+        const std::string value = argv[++i];
+        if (arg == "--kld-base") {
+            base_path = value;
+        } else if (arg == "--chunks") {
+            chunks = ppl::parse_kld_chunks(value);
+        } else if (arg == "--window") {
+            window = option_int(arg, value);
+            if (window < 1 || window > kMaxVerifyColumns) {
+                throw std::invalid_argument("--window must be 1 to " + std::to_string(kMaxVerifyColumns) +
+                                            ": the Flash-Next verify forward is at most the anchor and 7 MTP drafts");
+            }
+        } else if (arg == "--tsv") {
+            tsv_path = value;
+        } else if (arg == "--staging") {
+            staging_slots = option_int(arg, value);
+        } else {
+            throw std::invalid_argument("unknown option " + arg + " in --kld-base mode");
+        }
+    }
+    if (!base_path) { throw std::invalid_argument("--kld-base FILE is required"); }
+    const ppl::KldBase base  = ppl::read_kld_base(*base_path);
+    const int chunk_count    = ppl::kld_chunk_count(base, chunks);
+    const auto n_ctx         = static_cast<std::int32_t>(base.n_ctx);
+    const std::int32_t first = static_cast<std::int32_t>(base.n_ctx / 2U) + 1; // the first target
+    std::printf("KLD base %s: n_ctx %d, n_vocab %d, %d of %d chunks; window T = %d, staging slots %d%s\n",
+                base.path.string().c_str(), n_ctx, base.n_vocab, chunk_count, base.n_chunk, window, staging_slots,
+                (std::string(hc_int8 ? "; --hc-int8" : "") + (ggml_decode_mma ? "; --ggml-decode-mma" : "")).c_str());
+
+    print_memory("start");
+    DeviceContext device(0);
+    auto t0 = std::chrono::steady_clock::now();
+    artifact::Reader reader(artifact_env);
+    if (!q4::is_qwen4_exp(reader)) {
+        std::printf("SKIP: %s is not a Qwen4Exp artifact\n", artifact_env);
+        return 77;
+    }
+    const auto model = q4::load_model(reader, device);
+    device.synchronize();
+    std::printf("loaded in %.1f s: %.2f GiB device, %.2f GiB pinned host\n", seconds_since(t0),
+                gib(model->storage_stats().device_capacity_bytes), gib(model->storage_stats().pinned_bytes));
+    const ex::Parameters parameters(*model);
+    const auto& c         = model->config();
+    const char* ngram_env = std::getenv("NINFER_TEST_QWEN4EXP_NGRAM");
+    q4::NgramVolume volume(ngram_env != nullptr ? std::filesystem::path(ngram_env)
+                                                : q4::default_ngram_volume(artifact_env),
+                           c.ple.table);
+    volume.set_keepalive(std::chrono::milliseconds(100), std::chrono::milliseconds(60000));
+    // --hc-int8: the mixers' int8 copies, made once from the BF16 weights for every chunk's forward.
+    std::unique_ptr<ex::HcInt8Copies> hc_int8_copies;
+    ex::ForwardOptions options;
+    options.ggml_decode_mma = ggml_decode_mma;
+    if (hc_int8) {
+        auto mixers = ex::HcInt8Copies::mixers(parameters.layers, parameters.final_mixer,
+                                               parameters.mtp ? &*parameters.mtp : nullptr);
+        const std::uint64_t bytes = ex::HcInt8Copies::bytes(mixers);
+        hc_int8_copies = std::make_unique<ex::HcInt8Copies>(std::move(mixers), bytes, device.stream);
+        options.hc_int8 = hc_int8_copies.get();
+        std::printf("--hc-int8: %.1f MiB of int8 copies\n", static_cast<double>(bytes) / (1 << 20));
+    }
+    const std::size_t vocab = c.vocab_size;
+    // The comparison domain is the public token domain (llama.cpp may pad n_vocab past it).
+    const auto valid_vocab = static_cast<std::int32_t>(model->resources().public_token_count);
+    if (base.n_vocab < valid_vocab) {
+        throw std::runtime_error(base.path.string() + " has " + std::to_string(base.n_vocab) +
+                                 " vocabulary rows, fewer than the model's " + std::to_string(valid_vocab) +
+                                 " public tokens");
+    }
+
+    std::ofstream tsv(tsv_path, std::ios::binary | std::ios::trunc);
+    if (!tsv) { throw std::runtime_error("cannot create " + tsv_path); }
+    tsv << "chunk\tposition\ttarget\tnll\tnll_base\tkld\tsame_top1\tdlogp_top1\n" << std::setprecision(9);
+    std::vector<ppl::ScoredRow> rows;
+    DeviceBuffer logits(vocab * static_cast<std::size_t>(window) * sizeof(float));
+    std::vector<float> host(vocab * static_cast<std::size_t>(window));
+    const std::int32_t context = std::max<std::int32_t>(256, (n_ctx + 63) / 64 * 64);
+    const auto scoring_started = std::chrono::steady_clock::now();
+    for (int chunk = 0; chunk < chunk_count; ++chunk) {
+        const ppl::KldChunk input = ppl::kld_chunk(base, chunk);
+        const auto& tokens        = input.tokens;
+        // A fresh sequence: positions [0, first - 1) prefilled as one call, then every target
+        // [first, n_ctx) predicted by a decode forward: targets [b, e) are the logits of positions
+        // [b - 1, e - 1), one plain decode call when e - b = 1, else one verification call of
+        // e - b columns (an MTP round of e - b - 1 drafts) committed in full.
+        Harness harness(parameters, device, context, std::max(first - 1, window), staging_slots, options);
+        std::optional<Verifier> verifier;
+        if (window > 1) { verifier.emplace(harness, window); }
+        {
+            auto prompt = make_call(c, volume, tokens, 0, first - 1, false);
+            Tensor last(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 1});
+            harness.forward->run(prompt.batch, last);
+            device.synchronize();
+        }
+        for (std::int32_t b = first; b < n_ctx; b += window) {
+            const std::int32_t W = std::min(window, n_ctx - b);
+            auto call            = make_call(c, volume, tokens, b - 1, W, W > 1);
+            Tensor out(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), W});
+            if (W == 1) {
+                harness.forward->run(call.batch, out);
+                device.synchronize();
+            } else {
+                const ex::ForwardVerify view = verifier->view(W);
+                call.batch.verify            = &view;
+                verifier->copy_tails(device.stream);
+                harness.forward->run(call.batch, out);
+                verifier->commit(view, W, call.batch.positions, device.stream);
+                device.synchronize();
+            }
+            logits.copy_to_host(host.data(), vocab * static_cast<std::size_t>(W) * sizeof(float));
+            for (std::int32_t j = 0; j < W; ++j) {
+                const std::int32_t position = b + j;
+                const auto base_logprobs    = ppl::kld_base_logprobs(base, chunk, ppl::kld_row(base, position));
+                const std::span<const float> row(host.data() + vocab * static_cast<std::size_t>(j), vocab);
+                const ppl::ScoredRow scored =
+                    ppl::score_row(row, base_logprobs, tokens[static_cast<std::size_t>(position)], valid_vocab);
+                rows.push_back(scored);
+                tsv << chunk << '\t' << position << '\t' << tokens[static_cast<std::size_t>(position)] << '\t'
+                    << scored.nll << '\t' << scored.nll_base << '\t' << scored.kld << '\t' << (scored.same_top1 ? 1 : 0)
+                    << '\t' << scored.dlogp_top1 << '\n';
+            }
+        }
+        if (!tsv) { throw std::runtime_error("cannot write " + tsv_path); }
+        const ppl::KldSummary partial = ppl::summarize(rows);
+        std::printf("chunk %d/%d: PPL %.4f, KLD mean %.5f, same top-1 %.2f%%, %.1f s elapsed\n", chunk + 1, chunk_count,
+                    partial.ppl, partial.kld_mean, 100.0 * partial.same_top1, seconds_since(scoring_started));
+    }
+    tsv.flush();
+    if (!tsv) { throw std::runtime_error("cannot write " + tsv_path); }
+    const ppl::KldSummary summary = ppl::summarize(rows);
+    double base_nll = 0.0;
+    for (const auto& row : rows) { base_nll += row.nll_base; }
+    std::printf("KL-divergence gate (decode path, T = %d, %d chunks, %zu rows)\n"
+                "PPL:        %.6f +/- %.6f  (base %.6f)\n"
+                "KLD mean:   %.6f\nKLD median: %.6f\nKLD p99:    %.6f\nKLD max:    %.6f\n"
+                "same top-1: %.4f%%\nrows: %s\n",
+                window, chunk_count, summary.rows, summary.ppl, summary.ppl_err,
+                std::exp(base_nll / static_cast<double>(rows.size())), summary.kld_mean, summary.kld_median,
+                summary.kld_p99, summary.kld_max, 100.0 * summary.same_top1, tsv_path.c_str());
+    print_memory("done");
+    return 0;
+}
+
 } // namespace
+
+// The --hc-int8 prefill mode: see the file comment.
+int hc_int8_prefill_mode(int argc, char** argv, const char* artifact_env) {
+    std::vector<std::int32_t> tokens;
+    std::int32_t staging_slots = 64;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--hc-int8-prefill") { continue; }
+        if (arg.rfind("--", 0) != 0) {
+            if (!tokens.empty()) { throw std::invalid_argument("--hc-int8-prefill takes one token list"); }
+            tokens = parse_tokens(arg);
+            continue;
+        }
+        if (i + 1 >= argc) { throw std::invalid_argument(arg + " needs a value"); }
+        const std::string value = argv[++i];
+        if (arg == "--staging") {
+            staging_slots = option_int(arg, value);
+        } else {
+            throw std::invalid_argument("unknown option " + arg + " in --hc-int8-prefill mode");
+        }
+    }
+    const auto n            = static_cast<std::int32_t>(tokens.size());
+    const std::int32_t head = n - 1;
+    if (head <= ops::kHcInt8MaxColumns) {
+        throw std::invalid_argument("--hc-int8-prefill needs at least " + std::to_string(ops::kHcInt8MaxColumns + 2) +
+                                    " tokens: a prompt call wider than the int8 route, then one decode token");
+    }
+    DeviceContext device(0);
+    artifact::Reader reader(artifact_env);
+    if (!q4::is_qwen4_exp(reader)) {
+        std::printf("SKIP: %s is not a Qwen4Exp artifact\n", artifact_env);
+        return 77;
+    }
+    const auto model = q4::load_model(reader, device);
+    device.synchronize();
+    const ex::Parameters parameters(*model);
+    const auto& c         = model->config();
+    const char* ngram_env = std::getenv("NINFER_TEST_QWEN4EXP_NGRAM");
+    q4::NgramVolume volume(ngram_env != nullptr ? std::filesystem::path(ngram_env)
+                                                : q4::default_ngram_volume(artifact_env),
+                           c.ple.table);
+    auto mixers = ex::HcInt8Copies::mixers(parameters.layers, parameters.final_mixer,
+                                           parameters.mtp ? &*parameters.mtp : nullptr);
+    const std::uint64_t bytes = ex::HcInt8Copies::bytes(mixers);
+    const ex::HcInt8Copies copies(std::move(mixers), bytes, device.stream);
+    const std::size_t vocab    = c.vocab_size;
+    const std::int32_t context = std::max<std::int32_t>(256, (n + 63) / 64 * 64);
+    const Call prompt          = make_call(c, volume, tokens, 0, head, false);
+    const Call step            = make_call(c, volume, tokens, head, 1, false);
+    DeviceBuffer logits(vocab * sizeof(float));
+    std::printf("prompt %d tokens as one call, then one decode call; staging slots %d\n", head, staging_slots);
+    const auto run = [&](bool on) {
+        const ex::ForwardOptions options{.hc_int8 = on ? &copies : nullptr};
+        Harness harness(parameters, device, context, head, staging_slots, options);
+        std::vector<std::vector<float>> rows;
+        Tensor one(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 1});
+        for (const Call* call : {&prompt, &step}) {
+            harness.forward->run(call->batch, one);
+            device.synchronize();
+            rows.push_back(to_float(logits, vocab));
+        }
+        return rows;
+    };
+    const auto off           = run(false);
+    const auto on            = run(true);
+    const bool prompt_equal  = std::memcmp(off[0].data(), on[0].data(), vocab * sizeof(float)) == 0;
+    const bool decode_differ = std::memcmp(off[1].data(), on[1].data(), vocab * sizeof(float)) != 0;
+    std::printf("prompt logits %s; decode logits %s with --hc-int8\n", prompt_equal ? "bitwise equal" : "DIFFER",
+                decode_differ ? "differ" : "are bitwise EQUAL");
+    if (prompt_equal && decode_differ) {
+        std::printf("--hc-int8-prefill checks passed\n");
+        return 0;
+    }
+    if (!prompt_equal) { std::printf("FAIL: --hc-int8 changed a call wider than 16 columns\n"); }
+    if (!decode_differ) { std::printf("FAIL: the decode call did not read the int8 copies\n"); }
+    return 1;
+}
+
+// The identity check of ForwardOptions::shared_expert_stream (see the header): four runs from a
+// fresh state over the same device inputs, the shared expert serial or on its side stream, the
+// decode calls eager or each captured in a CUDA graph and replayed once (the Program's decode). Each
+// side-stream run's logits must be bitwise those of the serial run with the same decode mode.
+int shared_expert_mode(int argc, char** argv, const char* artifact_env) {
+    std::vector<std::int32_t> tokens;
+    std::int32_t decode = 4, staging_slots = 64;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--shared-expert-stream") { continue; }
+        if (arg.rfind("--", 0) != 0) {
+            if (!tokens.empty()) { throw std::invalid_argument("--shared-expert-stream takes one token list"); }
+            tokens = parse_tokens(arg);
+            continue;
+        }
+        if (i + 1 >= argc) { throw std::invalid_argument(arg + " needs a value"); }
+        const std::string value = argv[++i];
+        if (arg == "--decode") {
+            decode = option_int(arg, value);
+        } else if (arg == "--staging") {
+            staging_slots = option_int(arg, value);
+        } else {
+            throw std::invalid_argument("unknown option " + arg + " in --shared-expert-stream mode");
+        }
+    }
+    const auto n = static_cast<std::int32_t>(tokens.size());
+    if (decode < 1 || n - decode <= 8) {
+        throw std::invalid_argument("--decode must be at least 1 and leave more than 8 prompt tokens (the prompt "
+                                    "call must be wider than 8 columns to use the side stream's carve)");
+    }
+    // Every shared expert branch starts late, so a join the device stream did not wait for reads
+    // unfinished outputs and the logits diverge (core/side_stream_delay.h).
+    const ninfer::GateSideStreamDelay late_branches;
+
+    DeviceContext device(0);
+    artifact::Reader reader(artifact_env);
+    if (!q4::is_qwen4_exp(reader)) {
+        std::printf("SKIP: %s is not a Qwen4Exp artifact\n", artifact_env);
+        return 77;
+    }
+    const auto model = q4::load_model(reader, device);
+    device.synchronize();
+    const ex::Parameters parameters(*model);
+    const auto& c         = model->config();
+    const char* ngram_env = std::getenv("NINFER_TEST_QWEN4EXP_NGRAM");
+    q4::NgramVolume volume(ngram_env != nullptr ? std::filesystem::path(ngram_env)
+                                                : q4::default_ngram_volume(artifact_env),
+                           c.ple.table);
+    const std::size_t vocab    = c.vocab_size;
+    const std::int32_t context = std::max<std::int32_t>(256, (n + 63) / 64 * 64);
+    const std::int32_t head    = n - decode;
+    // Every run reads the same device inputs: the prompt as one call (wider than 8 columns, the side
+    // stream's Linears take their Q8_1 scratch from the carve), then one call per decode token.
+    const Call prompt = make_call(c, volume, tokens, 0, head, false);
+    std::vector<Call> steps;
+    for (std::int32_t p = head; p < n; ++p) { steps.push_back(make_call(c, volume, tokens, p, 1, false)); }
+    DeviceBuffer logits(vocab * sizeof(float));
+    Tensor out(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 1});
+    std::printf("prompt %d tokens as one call, then %d decode calls; staging slots %d\n", head, decode, staging_slots);
+
+    // The logits of the prompt call, then of every decode call.
+    const auto run = [&](bool side, bool graphs) {
+        Harness harness(parameters, device, context, head, staging_slots, ex::ForwardOptions{.shared_expert_stream = side});
+        std::vector<std::vector<float>> rows;
+        harness.forward->run(prompt.batch, out);
+        device.synchronize();
+        rows.push_back(to_float(logits, vocab));
+        for (const Call& step : steps) {
+            if (graphs) {
+                DecodeGraphDefinition graph;
+                DecodeGraphExecutable exec;
+                graph.capture(device.stream, [&] { harness.forward->run(step.batch, out); });
+                exec.instantiate(graph);
+                exec.launch(device.stream);
+            } else {
+                harness.forward->run(step.batch, out);
+            }
+            device.synchronize();
+            rows.push_back(to_float(logits, vocab));
+        }
+        return rows;
+    };
+    bool ok = true;
+    for (const bool graphs : {false, true}) {
+        const auto serial = run(false, graphs);
+        const auto side   = run(true, graphs);
+        std::size_t equal = 0;
+        for (std::size_t r = 0; r < serial.size(); ++r) {
+            equal += std::memcmp(serial[r].data(), side[r].data(), vocab * sizeof(float)) == 0 ? 1 : 0;
+        }
+        std::printf("decode %s: %zu of %zu calls' logits bitwise equal with --shared-expert-stream\n",
+                    graphs ? "in CUDA graphs" : "eager", equal, serial.size());
+        ok &= equal == serial.size();
+    }
+    std::printf(ok ? "shared expert stream checks passed\n" : "FAIL: the shared expert stream changed the logits\n");
+    return ok ? 0 : 1;
+}
+
+// The identity checks of ForwardOptions::gdn_head_map, ForwardOptions::moe_precast_input,
+// ForwardOptions::moe_gate_up_registers, ForwardOptions::moe_fused_route and
+// ForwardOptions::hc_fused_read (see the header; `flag` names the one checked, moe_gate_up_registers
+// with the precast input it needs, hc_fused_read with the int8 copies in both runs): the same calls
+// from a fresh state without and with the option; every logits column must be bitwise equal.
+int identity_mode(int argc, char** argv, const char* artifact_env, const std::string& flag) {
+    std::vector<std::int32_t> tokens;
+    std::int32_t window = 3, decode = 2, staging_slots = 64;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == flag) { continue; }
+        if (arg.rfind("--", 0) != 0) {
+            if (!tokens.empty()) { throw std::invalid_argument(flag + " takes one token list"); }
+            tokens = parse_tokens(arg);
+            continue;
+        }
+        if (i + 1 >= argc) { throw std::invalid_argument(arg + " needs a value"); }
+        const std::string value = argv[++i];
+        if (arg == "--window") {
+            window = option_int(arg, value);
+        } else if (arg == "--decode") {
+            decode = option_int(arg, value);
+        } else if (arg == "--staging") {
+            staging_slots = option_int(arg, value);
+        } else {
+            throw std::invalid_argument("unknown option " + arg + " in " + flag + " mode");
+        }
+    }
+    if (window < 2 || window > kMaxVerifyColumns) {
+        throw std::invalid_argument("--window must be 2 to " + std::to_string(kMaxVerifyColumns));
+    }
+    if (decode < 1) { throw std::invalid_argument("--decode must be at least 1"); }
+    const auto n            = static_cast<std::int32_t>(tokens.size());
+    const std::int32_t head = n - window - decode;
+    if (head < 16) {
+        throw std::invalid_argument(flag + " needs at least 16 prompt tokens before the window and the decode "
+                                    "tokens (the GDN's chunked route, routed-expert calls wider than 8 columns)");
+    }
+
+    DeviceContext device(0);
+    artifact::Reader reader(artifact_env);
+    if (!q4::is_qwen4_exp(reader)) {
+        std::printf("SKIP: %s is not a Qwen4Exp artifact\n", artifact_env);
+        return 77;
+    }
+    const auto model = q4::load_model(reader, device);
+    device.synchronize();
+    const ex::Parameters parameters(*model);
+    const auto& c         = model->config();
+    const char* ngram_env = std::getenv("NINFER_TEST_QWEN4EXP_NGRAM");
+    q4::NgramVolume volume(ngram_env != nullptr ? std::filesystem::path(ngram_env)
+                                                : q4::default_ngram_volume(artifact_env),
+                           c.ple.table);
+    const std::size_t vocab    = c.vocab_size;
+    const std::int32_t context = std::max<std::int32_t>(256, (n + 63) / 64 * 64);
+    // Every run reads the same device inputs: the prompt, the verification window (every column's
+    // logits), then one call per decode token.
+    const Call prompt = make_call(c, volume, tokens, 0, head, false);
+    Call verify       = make_call(c, volume, tokens, head, window, true);
+    std::vector<Call> steps;
+    for (std::int32_t p = head + window; p < n; ++p) { steps.push_back(make_call(c, volume, tokens, p, 1, false)); }
+    DeviceBuffer logits(vocab * static_cast<std::size_t>(window) * sizeof(float));
+    std::printf("prompt %d tokens as one call, a %d-column verification committed by the fold, %d decode calls; "
+                "staging slots %d\n",
+                head, window, decode, staging_slots);
+
+    // --hc-fused-read: the int8 copies both runs read.
+    std::unique_ptr<ex::HcInt8Copies> copies;
+    const bool fused_read_mode = flag == "--hc-fused-read" || flag == "--hc-fused-read-side-stream";
+    // The side-stream form: every branch starts late, so a missing join shows (core/side_stream_delay.h).
+    std::optional<ninfer::GateSideStreamDelay> late_branches;
+    if (flag == "--hc-fused-read-side-stream") { late_branches.emplace(); }
+    if (fused_read_mode) {
+        auto mixers = ex::HcInt8Copies::mixers(parameters.layers, parameters.final_mixer,
+                                               parameters.mtp ? &*parameters.mtp : nullptr);
+        const std::uint64_t bytes = ex::HcInt8Copies::bytes(mixers);
+        copies = std::make_unique<ex::HcInt8Copies>(std::move(mixers), bytes, device.stream);
+    }
+    // Every logits column of the prompt, the verification and the decode calls, in order.
+    const bool head_map_mode = flag == "--gdn-head-map";
+    const auto run = [&](bool on) {
+        const bool registers = on && flag == "--moe-gate-up-registers";
+        const bool precast   = registers || (on && flag == "--moe-precast-input");
+        const ex::ForwardOptions options{.shared_expert_stream  = flag == "--hc-fused-read-side-stream",
+                                         .gdn_head_map          = on && head_map_mode,
+                                         .moe_precast_input     = precast,
+                                         .moe_gate_up_registers = registers,
+                                         .moe_fused_route       = on && flag == "--moe-fused-route",
+                                         .hc_int8               = copies.get(),
+                                         .hc_fused_read         = on && fused_read_mode};
+        Harness harness(parameters, device, context, head, staging_slots, options);
+        Verifier verifier(harness, window, options.gdn_head_map);
+        std::vector<std::vector<float>> rows;
+        Tensor one(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 1});
+        harness.forward->run(prompt.batch, one);
+        device.synchronize();
+        rows.push_back(to_float(logits, vocab));
+        const ex::ForwardVerify view = verifier.view(window);
+        verify.batch.verify          = &view;
+        Tensor all(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), window});
+        verifier.copy_tails(device.stream);
+        harness.forward->run(verify.batch, all);
+        verifier.commit(view, window, verify.batch.positions, device.stream);
+        device.synchronize();
+        verify.batch.verify = nullptr;
+        const std::vector<float> columns = to_float(logits, vocab * static_cast<std::size_t>(window));
+        for (std::int32_t j = 0; j < window; ++j) {
+            rows.emplace_back(columns.begin() + static_cast<std::ptrdiff_t>(vocab) * j,
+                              columns.begin() + static_cast<std::ptrdiff_t>(vocab) * (j + 1));
+        }
+        for (const Call& step : steps) {
+            harness.forward->run(step.batch, one);
+            device.synchronize();
+            rows.push_back(to_float(logits, vocab));
+        }
+        return rows;
+    };
+    const auto off = run(false);
+    const auto on  = run(true);
+    std::size_t equal = 0;
+    for (std::size_t r = 0; r < off.size(); ++r) {
+        equal += std::memcmp(off[r].data(), on[r].data(), vocab * sizeof(float)) == 0 ? 1 : 0;
+    }
+    std::printf("%zu of %zu logits columns bitwise equal with %s (prompt, %d verified, %d decoded)\n", equal,
+                off.size(), flag.c_str(), window, decode);
+    const bool ok = equal == off.size();
+    if (ok) {
+        std::printf("%s checks passed\n", flag.c_str());
+    } else {
+        std::printf("FAIL: %s changed the logits\n", flag.c_str());
+    }
+    return ok ? 0 : 1;
+}
 
 int main(int argc, char** argv) {
     const char* artifact_env = std::getenv("NINFER_TEST_QWEN4EXP_ARTIFACT");
@@ -918,6 +1638,22 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
         if (std::string(argv[1]) == "--rows") { return rows_mode(argc, argv, artifact_env); }
+        if (std::any_of(argv + 1, argv + argc, [](const char* a) { return std::string(a) == "--kld-base"; })) {
+            return kld_mode(argc, argv, artifact_env);
+        }
+        if (std::any_of(argv + 1, argv + argc, [](const char* a) { return std::string(a) == "--hc-int8-prefill"; })) {
+            return hc_int8_prefill_mode(argc, argv, artifact_env);
+        }
+        if (std::any_of(argv + 1, argv + argc, [](const char* a) { return std::string(a) == "--shared-expert-stream"; })) {
+            return shared_expert_mode(argc, argv, artifact_env);
+        }
+        for (const char* flag :
+             {"--gdn-head-map", "--moe-precast-input", "--moe-gate-up-registers", "--moe-fused-route",
+              "--hc-fused-read", "--hc-fused-read-side-stream"}) {
+            if (std::any_of(argv + 1, argv + argc, [&](const char* a) { return std::string(a) == flag; })) {
+                return identity_mode(argc, argv, artifact_env, flag);
+            }
+        }
         std::vector<Job> jobs;
         std::int32_t staging_slots = 64;
         for (int i = 1; i < argc; ++i) {
@@ -930,7 +1666,7 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { throw std::invalid_argument(arg + " needs a value"); }
             const std::string value = argv[++i];
             if (arg == "--staging") {
-                staging_slots = std::stoi(value);
+                staging_slots = option_int(arg, value);
                 continue;
             }
             if (jobs.empty()) { throw std::invalid_argument(arg + " needs a token list before it"); }
@@ -946,10 +1682,10 @@ int main(int argc, char** argv) {
             } else if (arg == "--dump-logits") {
                 job.dump_path = value;
             } else if (arg == "--chunk") {
-                job.chunk = std::stoi(value);
+                job.chunk = option_int(arg, value);
                 if (job.chunk <= 0) { throw std::invalid_argument("--chunk must be positive"); }
             } else if (arg == "--decode") {
-                job.decode = std::stoi(value);
+                job.decode = option_int(arg, value);
             } else {
                 throw std::invalid_argument("unknown option " + arg);
             }

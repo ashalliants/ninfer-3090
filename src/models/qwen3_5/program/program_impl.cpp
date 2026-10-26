@@ -215,7 +215,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       draft_window(plan.draft_window),
       max_verify_drafts(detail::max_verify_drafts(plan.round_shapes)),
       ngram_draft_tokens(plan.ngram_draft_tokens), ngram_min_match(plan.ngram_min_match),
-      speculative_backend(plan.speculative_backend),
+      speculative_backend(plan.speculative_backend), relaxed_drafting(plan.relaxed_drafting),
+      relaxed_tokens(plan.relaxed_drafting
+                         ? frontend::relaxed_drafting_tokens(*parameters_in.model.resources().tokenizer)
+                         : frontend::RelaxedDraftingTokens{}),
       kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
@@ -238,6 +241,17 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       score_logprobs_host(plan.causal_scoring ? std::make_optional<PinnedHostBuffer>(
                                                     kCausalScoreTile * sizeof(float))
                                               : std::nullopt),
+      score_decode_host(plan.scoring_decode_window != 0
+                            ? std::make_optional<PinnedHostBuffer>(
+                                  sizeof(qwen3_5::ScoreDecodeIngress) +
+                                  qwen3_5::kScoreDecodeMaximumWidth * sizeof(float))
+                            : std::nullopt),
+      score_decode_logits_host(
+          plan.scoring_decode_window != 0
+              ? std::make_optional<PinnedHostBuffer>(
+                    static_cast<std::size_t>(parameters_in.model.config().text.vocab_size) *
+                    plan.scoring_decode_window * sizeof(std::uint16_t))
+              : std::nullopt),
       ordinary_host(
           !plan.causal_scoring && plan.speculative_backend == SpeculativeBackend::None
               ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::OrdinaryDecodeIngress) +
@@ -430,6 +444,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
 
     io = qwen3_5::RoundState(backing, plan.persistent.round);
+    // Without relaxed drafting the verification Ops get no relaxed_kept output, which selects their
+    // exact instances. Cleared before any graph is captured.
+    if (!relaxed_drafting) {
+        if (io.mtp_decode) { io.mtp_decode->relaxed_kept = Tensor{}; }
+        if (io.dflash_decode) { io.dflash_decode->relaxed_kept = Tensor{}; }
+    }
     if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
         throw std::logic_error("round-state MTP extension does not match the sequence plan");
     }
@@ -439,6 +459,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (io.ordinary.has_value() !=
         (!causal_scoring && speculative_backend == SpeculativeBackend::None)) {
         throw std::logic_error("ordinary decode frame does not match the sequence plan");
+    }
+    if (io.score_decode.has_value() != (plan.scoring_decode_window != 0) ||
+        (causal_scoring && replay_records.has_value() != (plan.scoring_decode_window >= 2))) {
+        throw std::logic_error("decode scoring storage does not match the sequence plan");
     }
     if (io.dflash_prefill.has_value() != is_masked_draft_backend(speculative_backend)) {
         throw std::logic_error("DFlash prefill scratch does not match the sequence plan");
@@ -535,6 +559,21 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         *dflash_prefill_host_ingress = {};
     }
     CUDA_CHECK(cudaMemsetAsync(io.rope_delta.data, 0, io.rope_delta.bytes(), device.stream));
+    if (io.draft_context_rows.data != nullptr) {
+        const auto& proposal = parameters.model.weights().proposal;
+        if (!proposal || proposal->global_token_ids.empty()) {
+            throw std::logic_error("draft context rows need the proposal head's token subset");
+        }
+        draft_context_rows.emplace(
+            proposal->global_token_ids,
+            execution::dimension(parameters.model.resources().public_token_count),
+            io.draft_context_rows.ne[0]);
+        draft_context_rows_host.emplace(io.draft_context_rows.bytes());
+        draft_context_rows_uploaded.emplace(device);
+        // Every slot starts empty (-1), which is the empty set's version 0.
+        CUDA_CHECK(cudaMemsetAsync(io.draft_context_rows.data, 0xff, io.draft_context_rows.bytes(),
+                                   device.stream));
+    }
     if (io.mtp) {
         CUDA_CHECK(
             cudaMemsetAsync(io.mtp->position.data, 0, io.mtp->position.bytes(), device.stream));
@@ -579,7 +618,8 @@ ProgramImpl::~ProgramImpl() noexcept {
 }
 
 std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
-                                             std::uint32_t first_target) {
+                                             std::uint32_t first_target,
+                                             const ScoringOptions& options, ScoreRowSink* sink) {
     if (!causal_scoring || !score_hidden || !score_logprobs_host ||
         workspace_plan.causal_score == 0) {
         throw std::logic_error("Program was not constructed for causal scoring");
@@ -587,6 +627,14 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
     if (speculative_backend != SpeculativeBackend::None || vision_enabled || use_cuda_graph ||
         context_cache.enabled) {
         throw std::logic_error("causal scoring Program has generation-only startup features");
+    }
+    if (options.phase == ScoringOptions::Phase::Decode) {
+        if (options.window < 1) { throw std::invalid_argument("decode scoring window is empty"); }
+        return causal_score_decode(prompt, first_target,
+                                   static_cast<std::uint32_t>(options.window), sink);
+    }
+    if (sink != nullptr) {
+        throw std::invalid_argument("a score row sink requires the Decode scoring phase");
     }
     const std::size_t token_count_size = prompt.token_ids.size();
     if (token_count_size < 2 || token_count_size > capacity) {

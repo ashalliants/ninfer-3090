@@ -10,4 +10,10 @@ namespace ninfer::product {
 // `git archive` snapshot, reports `VERSION` alone.
 std::string_view build_version();
 
+// The short commit (9 hex digits) the binary was built from; empty without git metadata.
+std::string_view build_commit();
+
+// Whether tracked files differed from that commit at build time.
+bool build_dirty();
+
 } // namespace ninfer::product

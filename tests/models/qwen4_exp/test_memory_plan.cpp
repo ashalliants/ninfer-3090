@@ -14,10 +14,13 @@
 
 #include "models/qwen4_exp/memory_plan.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <deque>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 using namespace ninfer;
 using namespace ninfer::models::qwen4_exp;
@@ -418,6 +421,176 @@ void test_kv_growth() {
     }
 }
 
+// --hot-embedding-rows: the token embedding (248,320 IQ4_XS rows of 2,560 values, 1,360 bytes each)
+// leaves the dense device weights for the pinned block, whole, and its first N rows get a device
+// copy. With N = 8192 (Basalt's) the device holds (V - N) rows fewer and the pinned demand grows by
+// the whole table; with N = 0 nothing changes.
+void test_hot_embedding_ledgers() {
+    constexpr std::uint64_t kVocab = 248'320, kHidden = 2'560, kRow = 10 * 136;
+    const HotEmbeddingPlan off = plan_hot_embedding(kVocab, kHidden, 0);
+    require(off.row_bytes == 0 && off.table == 0 && off.hot == 0, "N = 0 plans nothing");
+    const HotEmbeddingPlan on = plan_hot_embedding(kVocab, kHidden, 8192);
+    require(on.row_bytes == kRow, "a row is hidden / 256 IQ4_XS blocks of 136 bytes");
+    require(on.table == kVocab * kRow && on.table == 337'715'200ULL, "the whole table moves to the pinned block");
+    require(on.hot == 8192 * kRow && on.hot == 11'141'120ULL, "the hot copy is the first 8192 rows");
+    // Device: the dense weights lose the table, the Program's fixed allocations gain the hot rows.
+    require(on.table - on.hot == (kVocab - 8192) * kRow && on.table - on.hot == 326'574'080ULL,
+            "the device plan shrinks by (V - N) rows");
+    require(plan_hot_embedding(kVocab, kHidden, static_cast<std::uint32_t>(kVocab)).hot == on.table,
+            "N = V copies every row");
+    bool refused = false;
+    try {
+        (void)plan_hot_embedding(kVocab, kHidden, static_cast<std::uint32_t>(kVocab) + 1);
+    } catch (const std::invalid_argument& error) {
+        refused = std::string(error.what()).find("--hot-embedding-rows") != std::string::npos;
+    }
+    require(refused, "N above the vocabulary is refused naming --hot-embedding-rows");
+    // The two planes are IQ4_XS rows (embedding_split): an IQ3_S embedding (the GSQ-RCO IQ3_XXS
+    // pack's) is refused with the flag, and accepted without it.
+    refused = false;
+    try {
+        require_hot_embedding_format(ninfer::QType::GGML_IQ3_S, 8192);
+    } catch (const std::invalid_argument& error) {
+        refused = std::string(error.what()).find("--hot-embedding-rows") != std::string::npos &&
+                  std::string(error.what()).find("ggml_iq3_s") != std::string::npos;
+    }
+    require(refused, "an IQ3_S embedding with --hot-embedding-rows is refused naming the flag and the format");
+    require_hot_embedding_format(ninfer::QType::GGML_IQ3_S, 0);
+    require_hot_embedding_format(ninfer::QType::GGML_IQ4_XS, 8192);
+
+    // Host: the pinned block holds the banks, and with the option the table too; the ledger plans
+    // the table as other_pinned and the rest as the banks.
+    const HostMemoryDemand base = flash_next();
+    HostMemoryDemand plain      = base;
+    plan_pinned_weights(plain, base.expert_banks, off);
+    require(plain.expert_banks == base.expert_banks && plain.other_pinned == 0, "N = 0 leaves the pinned terms");
+    HostMemoryDemand hot = base;
+    plan_pinned_weights(hot, base.expert_banks + on.table, on);
+    require(hot.expert_banks == base.expert_banks && hot.other_pinned == on.table,
+            "the table is other_pinned and the banks are unchanged");
+    const HostMemorySnapshot s = snapshot(60 * kGiB, 200 * kGiB);
+    const HostMemoryLedger a = plan_host_memory(s, plain), b = plan_host_memory(s, hot);
+    require(b.pinned_total - a.pinned_total == kVocab * kRow, "the pinned total grows by the whole table");
+    // The lock overhead is rounded up over every other pin at once: within a byte of 0.25 % of the table.
+    const std::uint64_t overhead = (on.table * 25) / 10'000;
+    require(b.planned - a.planned >= on.table + overhead && b.planned - a.planned <= on.table + overhead + 1,
+            "the ledger plans the table with its lock overhead");
+    require(b.full_need == a.full_need, "the experts' need is unchanged");
+    char pinned[64];
+    std::snprintf(pinned, sizeof(pinned), "(%.1f GiB pinned)",
+                  static_cast<double>(hot.expert_banks + on.table) / static_cast<double>(kGiB));
+    require(b.fits && b.summary().find(pinned) != std::string::npos, "the summary counts the pinned table");
+}
+
+// Partial RAM residency (--partial-ram-residency): with every layer's record the same size the slot
+// pool is (E_total - vram_frames + spares) * stride, spares being 2 x the most experts one round
+// promotes per layer, in every layer; the VRAM-only experts are the frames less the load margin,
+// the warm start's ranking first and then every layer in turn; a layer never gets more slots than
+// experts; and per-layer strides weigh each layer's slots.
+void partial_plan_bytes() {
+    constexpr std::uint32_t kLayers = 48, kExperts = 512;
+    constexpr std::uint64_t kStride = 1'510'400;
+    PartialRamDemand d;
+    d.experts     = kExperts;
+    d.strides.assign(kLayers, kStride);
+    d.frame_bytes = kStride;
+    d.frames      = 9'600;
+    const std::uint32_t margin = static_cast<std::uint32_t>((kPartialFrameMarginBytes + kStride - 1) / kStride);
+    const PartialRamPlan p = plan_partial_ram(d);
+    const std::uint32_t vram = d.frames - margin;
+    require(p.vram_keys.size() == vram, "the VRAM-only experts are the frames less the load margin");
+    require(kPartialSparesPerLayer == 2 * 8, "spares are 2 x the 8 promotions a round makes per layer");
+    const std::uint64_t spares = std::uint64_t(kLayers) * kPartialSparesPerLayer;
+    require(p.bytes == (std::uint64_t(kLayers) * kExperts - vram + spares) * kStride,
+            "host = (E_total - vram_frames + spares) * stride");
+    require(p.cap_warning.empty() && p.slots.size() == kLayers, "no cap: the plan fits");
+    std::set<std::uint32_t> unique(p.vram_keys.begin(), p.vram_keys.end());
+    require(unique.size() == p.vram_keys.size() && *unique.rbegin() < kLayers * kExperts, "VRAM keys are distinct");
+    // Without a ranking every layer takes its turn: the first 48 keys are expert 0 of each layer.
+    require(p.vram_keys[0] == 0 && p.vram_keys[1] == kExperts && p.vram_keys[kLayers] == 1, "round robin over layers");
+    // A ranking comes first; repeats and keys out of range are skipped.
+    PartialRamDemand ranked = d;
+    ranked.ranked = {7, 7, 1'000'000, 3 * kExperts + 5};
+    const PartialRamPlan r = plan_partial_ram(ranked);
+    require(r.vram_keys[0] == 7 && r.vram_keys[1] == 3 * kExperts + 5 && r.vram_keys[2] == 0, "the ranking leads");
+    require(r.bytes == p.bytes, "the same counts of slots in total");
+    // A cache smaller than the margin keeps nothing only in VRAM: every expert has a slot, no spares
+    // beyond the layer's experts.
+    PartialRamDemand tiny = d;
+    tiny.frames = margin;
+    const PartialRamPlan t = plan_partial_ram(tiny);
+    require(t.vram_keys.empty() && t.bytes == std::uint64_t(kLayers) * kExperts * kStride,
+            "a cache within the margin: every expert in RAM, slots capped at the experts");
+    // Per-layer strides: each layer's slots at its own stride.
+    PartialRamDemand mixed = d;
+    for (std::uint32_t l = 0; l < kLayers; ++l) { mixed.strides[l] = l % 2 == 0 ? 1'382'400 : 2'329'600; }
+    mixed.frame_bytes = 2'329'600;
+    mixed.frames      = 4'800 + static_cast<std::uint32_t>((kPartialFrameMarginBytes + mixed.frame_bytes - 1) /
+                                                          mixed.frame_bytes);
+    const PartialRamPlan m = plan_partial_ram(mixed);
+    std::uint64_t expect = 0;
+    for (std::uint32_t l = 0; l < kLayers; ++l) {
+        expect += std::uint64_t(kExperts - 100 + kPartialSparesPerLayer) * mixed.strides[l];
+    }
+    require(m.vram_keys.size() == 4'800 && m.bytes == expect, "100 VRAM-only experts per layer, each at its stride");
+    require(partial_place_bounce_bytes(kStride) == 2 * kPartialPlaceRecords * kStride,
+            "the placement's bounce is two halves of 16 records, a named later pin");
+    require(wddm_pin_cap(64 * kGiB) == 24 * kGiB && wddm_pin_cap(12 * kGiB) == 0, "the WDDM cap is RAM/2 - 8 GiB");
+}
+
+// Over the WDDM page-lock cap (cudaHostRegister's, as Basalt reports it) the plan warns with what
+// would fit: the fewest frames whose slot pool fits, as the largest --vram-headroom-mib that gives
+// them, or the --expert-cache-mib that does when that option bounded the cache, or no fit at all;
+// within the cap, or with no cap, it does not warn. The cap never changes the plan itself.
+void partial_plan_wddm_cap_warning() {
+    constexpr std::uint32_t kLayers = 48, kExperts = 512;
+    constexpr std::uint64_t kStride = 2'329'600;
+    PartialRamDemand d;
+    d.experts      = kExperts;
+    d.strides.assign(kLayers, kStride);
+    d.frame_bytes  = kStride;
+    d.frames       = 6'000;
+    d.other_pinned = 300 * kMiB;
+    d.headroom     = 4 * kGiB;
+    const PartialRamPlan open = plan_partial_ram(d);
+    require(open.cap_warning.empty(), "no cap: no warning");
+    d.pin_cap = open.bytes + d.other_pinned;
+    require(plan_partial_ram(d).cap_warning.empty(), "exactly at the cap fits");
+    d.pin_cap = open.bytes + d.other_pinned - 100 * kStride;
+    const PartialRamPlan over = plan_partial_ram(d);
+    require(!over.cap_warning.empty() && over.frames_needed == d.frames + 100, "100 more frames would fit the cap");
+    const std::uint64_t headroom = d.headroom - 100 * kStride;
+    require(over.cap_warning.find("--vram-headroom-mib " + std::to_string(headroom / kMiB)) != std::string::npos &&
+                over.cap_warning.find("--partial-ram-residency") != std::string::npos,
+            "the warning names the largest headroom that fits: " + over.cap_warning);
+    // Fits at the needed frame count, and not one frame fewer.
+    PartialRamDemand at = d;
+    at.frames = over.frames_needed;
+    require(plan_partial_ram(at).cap_warning.empty(), "the named frame count fits");
+    at.frames = over.frames_needed - 1;
+    require(!plan_partial_ram(at).cap_warning.empty(), "one frame fewer does not");
+    // --expert-cache-mib bounded the cache: the advice is the cache size.
+    PartialRamDemand limited = d;
+    limited.cache_limited = true;
+    const std::uint64_t cache_mib = (std::uint64_t(over.frames_needed) * kStride + kMiB - 1) / kMiB;
+    require(plan_partial_ram(limited).cap_warning.find("--expert-cache-mib " + std::to_string(cache_mib)) != std::string::npos,
+            "a bounded cache is told the size that fits");
+    // More frames than the headroom can give: no headroom fits.
+    PartialRamDemand short_headroom = d;
+    short_headroom.headroom = 50 * kStride;
+    require(plan_partial_ram(short_headroom).cap_warning.find("--vram-headroom-mib") == std::string::npos,
+            "a headroom that cannot give the frames is not offered");
+    // A cap below the pins that never fit.
+    PartialRamDemand hopeless = d;
+    hopeless.pin_cap = d.other_pinned / 2;
+    const PartialRamPlan never = plan_partial_ram(hopeless);
+    require(!never.cap_warning.empty() && never.frames_needed == 0, "no frame count fits a cap below the other pins");
+    require(over.bytes == open.bytes && over.vram_keys == open.vram_keys, "the cap only warns: the plan is unchanged");
+    require(over.cap_warning.find("cudaHostRegister") != std::string::npos &&
+                over.cap_warning.find("cudaHostAlloc") != std::string::npos,
+            "the warning says the cap is cudaHostRegister's and cudaHostAlloc may still succeed");
+}
+
 } // namespace
 
 int main() {
@@ -435,6 +608,9 @@ int main() {
         test_spill();
         test_control_law();
         test_kv_growth();
+        test_hot_embedding_ledgers();
+        partial_plan_bytes();
+        partial_plan_wddm_cap_warning();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

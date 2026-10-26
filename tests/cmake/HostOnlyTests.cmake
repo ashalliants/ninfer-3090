@@ -11,24 +11,37 @@
 set(NINFER_HOST_ONLY_TESTS
   ninfer_a4_g64_reference_test
   ninfer_artifact_reader_test
+  ninfer_basalt_gpu_verify_test
+  ninfer_bench_rows_check_test
   ninfer_chat_templates_test
   ninfer_chunked_reservation_test
   ninfer_cli_options_test
   ninfer_context_cost_measure_test
   ninfer_context_cost_test
   ninfer_context_store_test
+  ninfer_dashboard_page_test
   ninfer_effective_thinking_budget_test
+  ninfer_gdn_head_map_test
   ninfer_gdn_replay_records_test
   ninfer_ggml_blocks_decode_test
+  ninfer_ggml_linear_affine_test
+  ninfer_ggml_linear_registry_test
+  ninfer_ggml_mma_emulation_test
   ninfer_gpu_telemetry_test
+  ninfer_greedy_identity_test
+  ninfer_hc_int8_codec_test
   ninfer_grammar_test
   ninfer_host_arena_replay_test
   ninfer_host_timing_test
+  ninfer_http_security_test
+  ninfer_interleaved_ab_test
   ninfer_jinja_test
   ninfer_json_schema_oracle_test
   ninfer_json_schema_test
   ninfer_kv_capacity_test
   ninfer_media_decode_test
+  ninfer_moe_cpu_selection_test
+  ninfer_moe_dispatch_plan_test
   ninfer_perplexity_evaluation_test
   ninfer_lossy_prefill_sweep_test
   ninfer_prefill_depth_sweep_test
@@ -44,12 +57,21 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_qwen3_5_lossy_selection_test
   ninfer_qwen3_5_ngram_proposer_test
   ninfer_qwen3_5_text_positions_test
+  ninfer_qwen4_exp_constrained_window_test
+  ninfer_qwen4_exp_cpu_error_word_test
+  ninfer_qwen4_exp_draft_policy_test
   ninfer_read_only_file_test
   ninfer_regex_choice_oracle_test
   ninfer_regex_choice_test
+  ninfer_relaxed_accept_test
   ninfer_resource_manager_test
   ninfer_s3_object_store_test
   ninfer_scheduler_test
+  ninfer_serve_config_file_test
+  ninfer_serve_soak_test
+  ninfer_side_stream_delay_test
+  ninfer_stderr_logging_check_test
+  ninfer_stderr_logging_ratchet_test
   ninfer_tensor_test
   ninfer_vcc_projector_test
   ninfer_summary_strategy_test

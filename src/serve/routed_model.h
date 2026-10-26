@@ -23,6 +23,14 @@
 
 namespace ninfer::serve {
 
+// The options a routed model's own server runs with: `model` (the options the model was started
+// with) on 127.0.0.1, a port the system picks, `id` as its public id, and none of the public
+// address's access settings. The router owns those: it checks the key, the Host and the Origin,
+// answers CORS preflights and drops access-control-* headers from what it relays. A model with a
+// key or --cors of its own would let a browser page reach it on its loopback port, around the
+// router's key.
+[[nodiscard]] ServeOptions routed_model_options(ServeOptions model, const std::string& id);
+
 // The loopback port each loaded model's server listens on, by model id.
 class RoutedPorts {
 public:

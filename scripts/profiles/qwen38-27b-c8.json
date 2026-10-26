@@ -1,0 +1,14 @@
+{
+  "max-context": 8192,
+  "kv-capacity": 16384,
+  "max-concurrency": 8,
+  "max-pending-requests": 32,
+  "pending-timeout-ms": 600000,
+  "prefill-chunk": 512,
+  "kv-dtype": "int8",
+  "spec": "mtp",
+  "draft-tokens": 3,
+  "lm-head-draft": true,
+  "device-state-slots": 8,
+  "host-context-mib": 8192
+}

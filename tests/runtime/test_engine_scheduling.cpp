@@ -9,11 +9,14 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <filesystem>
 #include <future>
 #include <iostream>
 #include <map>
+#include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -45,7 +48,9 @@ struct Settings {
     std::chrono::microseconds prefill_sleep{0};
     std::uint32_t layer_slices = 0;
     bool admission_fit_check = false;
+    bool admission_affinity  = false;
     std::uint32_t pending_timeout_ms = 60'000;
+    std::uint32_t max_pending        = 8;
     // Lossy prefill: LossyPrefillOptions::min_tokens (0: off).
     std::uint32_t lossy_min_tokens = 0;
     LossyStrategy lossy_strategy   = LossyStrategy::Select;
@@ -69,11 +74,12 @@ public:
         EngineOptions options;
         options.max_context           = 1U << 20;
         options.max_concurrency       = settings.lanes;
-        options.max_pending_requests  = 8;
+        options.max_pending_requests  = settings.max_pending;
         options.pending_timeout_ms    = settings.pending_timeout_ms;
         options.prefill_chunk         = settings.chunk;
         options.context_cache.enabled = settings.context_cache;
         options.admission_fit_check   = settings.admission_fit_check;
+        options.admission_affinity    = settings.admission_affinity;
         options.lossy_prefill.min_tokens = settings.lossy_min_tokens;
         options.lossy_prefill.strategy   = settings.lossy_strategy;
         // The fake Program keeps 0.2 of U (fake::Program::set_lossy_keep); the Engine prices the
@@ -562,6 +568,29 @@ void test_the_fit_answer_is_not_asked_without_the_flag() {
             "the fit check ran with the flag off");
 }
 
+// --admission-affinity on the real worker loop with nothing held on the device (the fake keeps no
+// checkpoints): asking every waiter whether it is affine leaves admission in FIFO order.
+void test_affinity_without_a_held_prefix_keeps_fifo() {
+    Rig rig({.chunk = 1024, .lanes = 1, .admission_affinity = true});
+    Result long_result;
+    start_long_prompt(rig, long_result);
+    std::vector<Result> results;
+    for (std::uint64_t id = 2; id <= 6; ++id) { results.push_back(rig.run(id, 100, 1)); }
+    rig.release();
+    require(finished(long_result), "the long request did not finish\n" + rig.dump());
+    for (const Result& result : results) {
+        require(finished(result), "a request did not finish\n" + rig.dump());
+    }
+    std::vector<std::uint64_t> binds;
+    for (const Event& event : rig.events()) {
+        if (event.kind == Event::Kind::Bind) { binds.push_back(event.request); }
+    }
+    require(binds == std::vector<std::uint64_t>({1, 2, 3, 4, 5, 6}),
+            "admission left FIFO order with no prefix held on the device\n" + rig.dump());
+    require(rig.core().runtime_stats().admission_overtakes == 0,
+            "an overtake was counted with no prefix held on the device");
+}
+
 void test_backlog_gauge_tracks_queued_and_resident_prefill() {
     Rig rig({.chunk = 1024, .lanes = 1, .prefill_sleep = std::chrono::microseconds(10'000)});
     // The gauge as published before each prefill step: stats are published at unit boundaries.
@@ -588,6 +617,144 @@ void test_backlog_gauge_tracks_queued_and_resident_prefill() {
     require(samples[2] > samples[6], "the backlog did not shrink as the resident prompt advanced");
     require(rig.wait_for([&] { return rig.core().runtime_stats().prefill_backlog_seconds == 0.0; }),
             "the backlog did not return to zero when idle");
+}
+
+// ---- per-lane stats (GET /slots) -------------------------------------------------------------
+
+using LaneState = RuntimeLaneStats::State;
+
+void test_lanes_report_prefill_then_decode() {
+    // One lane: request 1 (3,072 prompt tokens, 3 chunks, 4 output tokens) runs while request 2
+    // waits. Stats are sampled as published before request 1's second prefill step and before its
+    // first and third decode rounds.
+    Rig rig({.chunk = 1024, .lanes = 1});
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool second_submitted = false;
+    std::optional<RuntimeStats> at_second_step, at_first_decode, at_third_decode;
+    int decodes = 0;
+    rig.program().before_unit = [&](const Event& event) {
+        if (event.request != 1) { return; }
+        std::unique_lock lock(mutex);
+        if (event.kind == Event::Kind::Prefill && event.position == 0) {
+            // Hold the first step until request 2 is queued, so every later sample sees it wait.
+            cv.wait(lock, [&] { return second_submitted; });
+        } else if (event.kind == Event::Kind::Prefill && event.position == 1024) {
+            at_second_step = rig.core().runtime_stats();
+        } else if (event.kind == Event::Kind::Decode) {
+            ++decodes;
+            if (decodes == 1) { at_first_decode = rig.core().runtime_stats(); }
+            if (decodes == 3) { at_third_decode = rig.core().runtime_stats(); }
+        }
+    };
+    auto first  = rig.run(1, 3072, 4);
+    auto second = rig.run(2, 512, 2);
+    {
+        std::lock_guard lock(mutex);
+        second_submitted = true;
+    }
+    cv.notify_all();
+    require(finished(first) && finished(second), "a request did not finish\n" + rig.dump());
+
+    std::lock_guard lock(mutex);
+    require(at_second_step && at_first_decode && at_third_decode, "a sample was not taken");
+    {
+        const RuntimeStats& stats   = *at_second_step;
+        const RuntimeLaneStats lane = stats.lanes[0];
+        require(stats.lane_count == 1, "lane_count is not the Engine's lane count");
+        require(lane.state == LaneState::Prefill && lane.request_id == 1 &&
+                    lane.prompt_tokens == 3072 && lane.computed_prompt_tokens == 1024 &&
+                    lane.reused_prompt_tokens == 0 && lane.generated_tokens == 0 &&
+                    lane.context_tokens == 1024 && lane.decode_tokens_per_second == 0.0,
+                "a prefilling lane after one chunk reported the wrong progress");
+        require(stats.waiting.size() == 1 && stats.waiting[0].request_id == 2 &&
+                    stats.waiting[0].prompt_tokens == 512 && stats.waiting[0].waited_seconds > 0.0,
+                "the queued request is not listed");
+    }
+    {
+        const RuntimeStats& stats   = *at_first_decode;
+        const RuntimeLaneStats lane = stats.lanes[0];
+        require(lane.state == LaneState::Decoding && lane.request_id == 1 &&
+                    lane.computed_prompt_tokens == 3072 && lane.generated_tokens == 1 &&
+                    lane.context_tokens == 3073 && lane.decode_tokens_per_second == 0.0,
+                "a lane past its prompt did not report decoding with the first token");
+        require(stats.waiting.size() == 1 && stats.waiting[0].request_id == 2 &&
+                    stats.waiting[0].waited_seconds >= at_second_step->waiting[0].waited_seconds,
+                "the queued request's wait did not grow");
+    }
+    {
+        const RuntimeLaneStats lane = at_third_decode->lanes[0];
+        require(lane.state == LaneState::Decoding && lane.generated_tokens == 3 &&
+                    lane.context_tokens == 3075 && lane.decode_tokens_per_second > 0.0 &&
+                    std::isfinite(lane.decode_tokens_per_second),
+                "a decoding lane did not report its decode rate");
+        require(lane.drafted_tokens == 0 && lane.accepted_tokens == 0,
+                "drafts were reported without speculative decoding");
+    }
+    require(rig.wait_for([&] {
+                const RuntimeStats stats = rig.core().runtime_stats();
+                return stats.lanes[0].state == LaneState::Idle && stats.waiting.empty();
+            }),
+            "the lane and the queue did not empty once both requests finished");
+}
+
+void test_a_long_queue_lists_its_oldest_waiters() {
+    // 70 requests wait behind the only lane: the snapshot lists the oldest 64, in order, and counts
+    // all 70.
+    constexpr std::uint32_t kWaiters = 70;
+    Rig rig({.chunk = 1024, .lanes = 1, .max_pending = kWaiters + 1});
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool all_submitted = false;
+    std::optional<RuntimeStats> sample;
+    rig.program().before_unit = [&](const Event& event) {
+        if (event.request != 1 || event.kind != Event::Kind::Prefill) { return; }
+        std::unique_lock lock(mutex);
+        if (event.position == 0) {
+            cv.wait(lock, [&] { return all_submitted; });
+        } else if (!sample) {
+            sample = rig.core().runtime_stats();
+        }
+    };
+    std::vector<Result> results;
+    results.push_back(rig.run(1, 2048, 1));
+    for (std::uint64_t id = 2; id <= kWaiters + 1; ++id) { results.push_back(rig.run(id, 16, 1)); }
+    {
+        std::lock_guard lock(mutex);
+        all_submitted = true;
+    }
+    cv.notify_all();
+    for (const Result& result : results) {
+        require(finished(result), "a request did not finish\n" + rig.dump());
+    }
+    std::lock_guard lock(mutex);
+    require(sample.has_value(), "the second prefill step was not sampled");
+    require(sample->waiting_requests == kWaiters, "the waiting count is not every waiter");
+    require(sample->waiting.size() == kMaximumReportedWaitingRequests,
+            "the listed waiters are not capped at kMaximumReportedWaitingRequests");
+    for (std::size_t i = 0; i < sample->waiting.size(); ++i) {
+        require(sample->waiting[i].request_id == i + 2 && sample->waiting[i].prompt_tokens == 16,
+                "the listed waiters are not the oldest, oldest first");
+    }
+}
+
+void test_idle_lanes() {
+    Rig rig({.chunk = 1024, .lanes = 2});
+    const auto idle = [](const RuntimeStats& stats) {
+        if (stats.lane_count != 2 || !stats.waiting.empty()) { return false; }
+        for (const RuntimeLaneStats& lane : stats.lanes) {
+            if (lane.state != LaneState::Idle || lane.request_id != 0 || lane.prompt_tokens != 0 ||
+                lane.generated_tokens != 0 || lane.context_tokens != 0) {
+                return false;
+            }
+        }
+        return true;
+    };
+    require(idle(rig.core().runtime_stats()), "a fresh Engine did not report two idle lanes");
+    auto result = rig.run(1, 2000, 3);
+    require(finished(result), "the request did not finish\n" + rig.dump());
+    require(rig.wait_for([&] { return idle(rig.core().runtime_stats()); }),
+            "the lanes did not return to idle after the request finished");
 }
 
 // ---- layer slices ----------------------------------------------------------------------------
@@ -2149,8 +2316,13 @@ int main() {
     run("a long newcomer does not displace a long prefill",
         test_a_long_newcomer_does_not_displace_a_long_prefill);
     run("a prefill with little left is not paused", test_a_prefill_with_little_left_is_not_paused);
+    run("affinity without a held prefix keeps FIFO",
+        test_affinity_without_a_held_prefix_keeps_fifo);
     run("backlog gauge tracks queued and resident prefill",
         test_backlog_gauge_tracks_queued_and_resident_prefill);
+    run("lanes report prefill then decode", test_lanes_report_prefill_then_decode);
+    run("a long queue lists its oldest waiters", test_a_long_queue_lists_its_oldest_waiters);
+    run("idle lanes", test_idle_lanes);
     run("layer slices run a neighbour between slices",
         test_layer_slices_run_a_neighbour_between_slices);
     run("a capped sliced chunk counts as paced once",

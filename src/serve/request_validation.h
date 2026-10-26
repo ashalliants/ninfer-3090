@@ -37,6 +37,12 @@ std::optional<std::string> parse_graft_field(const RequestJson& body);
 // not think. Anthropic Messages carries the same cap as `thinking.budget_tokens`.
 std::optional<std::uint32_t> parse_thinking_budget_field(const RequestJson& body);
 
+// The NInfer `relaxed_drafting` extension field (relaxed drafting; changes the output
+// distribution): a threshold in [0,1], `true` for 0.5, `false` for 0 (exact), or absent/null
+// (nullopt) to take the server's --relaxed-drafting default. Anything else fails with
+// `invalid_relaxed_drafting`.
+std::optional<double> parse_relaxed_drafting_field(const RequestJson& body);
+
 [[nodiscard]] bool valid_tool_name(std::string_view name, std::size_t maximum_length) noexcept;
 
 } // namespace ninfer::serve

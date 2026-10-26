@@ -2,10 +2,12 @@
 
 #include "product/version/version.h"
 #include "serve/anthropic_messages.h"
+#include "serve/dashboard_page.h"
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
 #include "serve/props.h"
 #include "serve/request_log.h"
+#include "serve/slots_report.h"
 
 #include <nlohmann/json.hpp>
 
@@ -118,6 +120,7 @@ const char* endpoint_name(std::string_view path) noexcept {
     if (path == "/v1/messages") { return "anthropic_messages"; }
     if (path == "/v1/messages/count_tokens") { return "anthropic_count_tokens"; }
     if (path == "/v1/load") { return "load"; }
+    if (path == "/slots") { return "slots"; }
     return "http_route";
 }
 
@@ -186,6 +189,16 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
     return httplib::Server::HandlerResponse::Handled;
 }
 
+void write_dashboard_page(httplib::Response& response) {
+    response.set_header("Content-Security-Policy", std::string(dashboard_content_security_policy()));
+    response.set_header("X-Content-Type-Options", "nosniff");
+    response.set_header("Referrer-Policy", "no-referrer");
+    // Revalidate, so the page an upgraded server serves is the one its endpoints match.
+    response.set_header("Cache-Control", "no-cache");
+    const std::string_view page = dashboard_page();
+    response.set_content(page.data(), page.size(), "text/html; charset=utf-8");
+}
+
 bool matches_bearer_credential(std::string_view authorization, std::string_view api_key) noexcept {
     if (api_key.empty()) { return false; }
     const auto is_whitespace = [](char value) { return value == ' ' || value == '\t'; };
@@ -213,12 +226,61 @@ bool matches_bearer_credential(std::string_view authorization, std::string_view 
     }
     std::size_t end = authorization.size();
     while (end > position && is_whitespace(authorization[end - 1])) { --end; }
-    return authorization.substr(position, end - position) == api_key;
+    return constant_time_equal(authorization.substr(position, end - position), api_key);
+}
+
+bool reject_untrusted_request(const HostPolicy& policy, const ServeOptions& options,
+                              const httplib::Request& request, httplib::Response& response) {
+    // A refused header may hold any bytes; the JSON error body takes printable ASCII only.
+    const auto quoted = [](std::string_view value) {
+        constexpr std::size_t kMaxQuoted = 200;
+        std::string out;
+        for (const char c : value.substr(0, kMaxQuoted)) {
+            out.push_back(c >= 0x20 && c < 0x7f ? c : '?');
+        }
+        return "'" + out + (value.size() > kMaxQuoted ? "...'" : "'");
+    };
+    const std::string host   = request.get_header_value("Host");
+    const std::string origin = request.get_header_value("Origin");
+    ApiError error;
+    error.status = 403;
+    error.type   = "invalid_request_error";
+    const bool has_key = !options.api_key.empty();
+    if (!has_key && !host_allowed(policy, host)) {
+        // A name this server was not told about: DNS rebinding, or a name to add. With a key the
+        // check is skipped: a rebound page cannot send the key, and any name a client uses works.
+        error.code    = "host_not_allowed";
+        error.message = "Host " + quoted(host) +
+                        " is not a name this server answers to; start it with --allowed-host "
+                        "NAME to accept another name (a server with --api-key accepts any)";
+    } else if (!origin_allowed(policy, origin, host, has_key, options.enable_cors)) {
+        // A browser page from another site, and nothing else (a key, --cors) to decide access.
+        error.code    = "origin_not_allowed";
+        error.message = "Origin " + quoted(origin) +
+                        " is another site; a server without --api-key accepts browser requests "
+                        "only from its own origin (set --api-key or --cors to allow others)";
+    } else if (!fetch_site_allowed(request.get_header_value("Sec-Fetch-Site"), has_key,
+                                   options.enable_cors)) {
+        // A link, image or no-cors fetch from another site, which may carry no Origin.
+        error.code    = "cross_site_request";
+        error.message = "a request another site started is refused by a server without --api-key "
+                        "(set --api-key or --cors to allow it)";
+    } else {
+        return false;
+    }
+    ensure_http_request_id(request, response);
+    if (is_anthropic_path(request.path)) {
+        write_anthropic_error(response, error, response.get_header_value("request-id"));
+    } else {
+        write_openai_error(response, error);
+    }
+    return true;
 }
 
 HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger,
                        std::shared_ptr<OpenAIResponsesStore> responses_store)
     : options_(std::move(options)),
+      host_policy_(make_server_host_policy(options_.host, options_.port, options_.allowed_hosts)),
       responses_store_(responses_store ? std::move(responses_store)
                                        : std::make_shared<OpenAIResponsesStore>(
                                              options_.response_store_max_records,
@@ -389,10 +451,17 @@ void HttpServer::register_routes() {
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
         ensure_http_request_id(req, res);
         set_version_header(res);
-        if (!ready_.load(std::memory_order_acquire)) {
+        // Before readiness and the key: a refused name or origin learns nothing, not even that
+        // the model is loading.
+        if (reject_untrusted_request(host_policy_, options_, req, res)) {
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        const bool dashboard = is_dashboard_request(req.method, req.path);
+        if (!ready_.load(std::memory_order_acquire) && !dashboard) {
             // Runs for every route, including /health and OPTIONS, so a caller cannot tell "not
             // ready" apart from "unauthenticated" -- and skips the API-key check below, since a
-            // loading-status response carries nothing worth protecting.
+            // loading-status response carries nothing worth protecting. The dashboard page is
+            // static and served anyway: it then shows this 503 from its own polls.
             ApiError error;
             error.status  = 503;
             error.type    = "service_unavailable";
@@ -408,7 +477,9 @@ void HttpServer::register_routes() {
             }
             return httplib::Server::HandlerResponse::Handled;
         }
-        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
+        // The dashboard page holds no data; the requests its script makes carry the key.
+        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS" ||
+            dashboard) {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         // Accept both the OpenAI-style bearer token and the Anthropic-style
@@ -416,7 +487,8 @@ void HttpServer::register_routes() {
         // -> x-api-key, ANTHROPIC_AUTH_TOKEN -> Authorization: Bearer) both work.
         const bool bearer_ok =
             matches_bearer_credential(req.get_header_value("Authorization"), options_.api_key);
-        const bool x_api_key_ok = req.get_header_value("x-api-key") == options_.api_key;
+        const bool x_api_key_ok =
+            constant_time_equal(req.get_header_value("x-api-key"), options_.api_key);
         if (!bearer_ok && !x_api_key_ok) {
             ApiError error;
             error.status  = 401;
@@ -489,11 +561,20 @@ void HttpServer::register_routes() {
                             .dump(),
                         "application/json");
     });
+    server_.Get("/dashboard", [](const httplib::Request&, httplib::Response& res) {
+        write_dashboard_page(res);
+    });
     server_.Get("/v1/load", [this](const httplib::Request& req, httplib::Response& res) {
         handle_load(req, res);
     });
     server_.Get("/props", [this](const httplib::Request& req, httplib::Response& res) {
         handle_props(req, res);
+    });
+    server_.Get("/slots", [this](const httplib::Request&, httplib::Response& res) {
+        // The Engine's last published lanes: never waits on the executor.
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(render_slots_json(service_->runtime_stats(), options_.max_context),
+                        "application/json");
     });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
@@ -726,7 +807,10 @@ bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.po
 
 int HttpServer::bind_any_port() {
     const int port = server_.bind_to_any_port(options_.host);
-    return port > 0 ? port : 0;
+    if (port <= 0) { return 0; }
+    // Origins name the port, so the policy follows the one the system chose.
+    host_policy_ = make_server_host_policy(options_.host, port, options_.allowed_hosts);
+    return port;
 }
 
 void HttpServer::start_serving_during_startup() {

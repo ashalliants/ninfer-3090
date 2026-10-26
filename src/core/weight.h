@@ -26,8 +26,8 @@ enum class QType : std::uint16_t {
     GGML_IQ4_XS  = 15,
     GGML_IQ1_M   = 16,
     GGML_Q2_0    = 17,
-    // One routed expert per record: gate and up rows in the first GGML type, down rows in Q2_0
-    // (tensor-formats.md Section 3.6). Only the GgmlExpertRecord layout holds them.
+    // One routed expert per record: gate and up rows in the first GGML type, down rows in the
+    // second (tensor-formats.md Section 3.6). Only the GgmlExpertRecord layout holds them.
     GGML_REC_IQ2_S_Q2_0   = 18,
     GGML_REC_IQ2_XXS_Q2_0 = 19,
     GGML_REC_IQ1_M_Q2_0   = 20,
@@ -36,6 +36,24 @@ enum class QType : std::uint16_t {
     // Ternary codes {-1, 0, +1} as two-bit two's complement (0b10 unused), four per byte in
     // column order, one binary16 multiplier per 128 columns. Row-split only.
     T2_G128_FP16 = 22,
+    // More of ggml's block types (tensor-formats.md Section 3.5), numbered after the formats above.
+    GGML_IQ2_XS  = 23,
+    GGML_IQ3_XXS = 24,
+    // More expert records (tensor-formats.md Section 3.6): the gate/up and down pairs of the
+    // GSQ-RCO IQ3_XXS and IQ3_S packs, whose downs are Q2_0 or IQ4_NL.
+    GGML_REC_IQ2_XS_Q2_0    = 25,
+    GGML_REC_IQ2_XS_IQ4_NL  = 26,
+    GGML_REC_IQ2_XXS_IQ4_NL = 27,
+    GGML_REC_IQ2_S_IQ4_NL   = 28,
+    GGML_REC_IQ3_XXS_Q2_0   = 29,
+    GGML_REC_IQ3_XXS_IQ4_NL = 30,
+    GGML_REC_IQ3_S_Q2_0     = 31,
+    GGML_REC_IQ3_S_IQ4_NL   = 32,
+    GGML_REC_IQ4_XS_IQ4_NL  = 33,
+    // ggml's affine K-quants (tensor-formats.md Section 3.5): the dense projections and output head
+    // of the GSQ-RCO IQ3 packs.
+    GGML_Q4_K = 34,
+    GGML_Q5_K = 35,
 };
 
 // One GGML block: `values` consecutive K values encoded in `bytes` bytes, scales included.
@@ -65,6 +83,14 @@ struct GgmlBlock {
         return {256, 56};
     case QType::GGML_Q2_0:
         return {64, 18};
+    case QType::GGML_IQ2_XS:
+        return {256, 74};
+    case QType::GGML_IQ3_XXS:
+        return {256, 98};
+    case QType::GGML_Q4_K:
+        return {256, 144};
+    case QType::GGML_Q5_K:
+        return {256, 176};
     default:
         return {};
     }
@@ -91,6 +117,24 @@ struct GgmlRecordParts {
         return {QType::GGML_IQ1_M, QType::GGML_Q2_0};
     case QType::GGML_REC_Q2_0_Q2_0:
         return {QType::GGML_Q2_0, QType::GGML_Q2_0};
+    case QType::GGML_REC_IQ2_XS_Q2_0:
+        return {QType::GGML_IQ2_XS, QType::GGML_Q2_0};
+    case QType::GGML_REC_IQ2_XS_IQ4_NL:
+        return {QType::GGML_IQ2_XS, QType::GGML_IQ4_NL};
+    case QType::GGML_REC_IQ2_XXS_IQ4_NL:
+        return {QType::GGML_IQ2_XXS, QType::GGML_IQ4_NL};
+    case QType::GGML_REC_IQ2_S_IQ4_NL:
+        return {QType::GGML_IQ2_S, QType::GGML_IQ4_NL};
+    case QType::GGML_REC_IQ3_XXS_Q2_0:
+        return {QType::GGML_IQ3_XXS, QType::GGML_Q2_0};
+    case QType::GGML_REC_IQ3_XXS_IQ4_NL:
+        return {QType::GGML_IQ3_XXS, QType::GGML_IQ4_NL};
+    case QType::GGML_REC_IQ3_S_Q2_0:
+        return {QType::GGML_IQ3_S, QType::GGML_Q2_0};
+    case QType::GGML_REC_IQ3_S_IQ4_NL:
+        return {QType::GGML_IQ3_S, QType::GGML_IQ4_NL};
+    case QType::GGML_REC_IQ4_XS_IQ4_NL:
+        return {QType::GGML_IQ4_XS, QType::GGML_IQ4_NL};
     default:
         return {};
     }

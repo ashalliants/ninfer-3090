@@ -37,7 +37,7 @@ Fp8GdnProjectedWorkspace allocate_projected(Allocator& allocator, std::int32_t c
 }
 
 void require_policy(LinearPolicy policy, const char* operation) {
-    if (!valid_linear_policy(policy)) {
+    if (!valid_dense_linear_policy(policy)) {
         throw std::invalid_argument(std::string(operation) + ": invalid compute policy");
     }
 }

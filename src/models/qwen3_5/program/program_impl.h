@@ -11,7 +11,9 @@
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen3_5/frontend/tokenizer.h"
 
+#include "models/qwen3_5/program/context_rows.h"
 #include "models/qwen3_5/program/lossy/gap_map.h"
 #include "models/qwen3_5/program/lossy/lossy_flow.h"
 #include "models/qwen3_5/program/planning/startup.h"
@@ -36,6 +38,10 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+namespace ninfer {
+class ScoreRowSink;
+} // namespace ninfer
 
 namespace ninfer::models::qwen3_5::detail {
 using execution::dimension;
@@ -323,7 +329,9 @@ public:
                                                const runtime::ResolvedExecutionOptions&);
     [[nodiscard]] CheckpointHandle install_external_checkpoint(const PromptGraft&);
     [[nodiscard]] std::uint32_t prefix_identity_tag() const noexcept;
-    [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&&, std::uint32_t first_target);
+    [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&&, std::uint32_t first_target,
+                                                  const ScoringOptions& options,
+                                                  ScoreRowSink* sink);
     // Prefill cost features for prompt positions [begin, end) of a planned request.
     [[nodiscard]] runtime::PrefillWork prefill_work(const RequestBasePlan&, std::uint32_t begin,
                                                    std::uint32_t end) const;
@@ -500,6 +508,10 @@ public:
     const std::uint32_t ngram_draft_tokens;
     const std::uint32_t ngram_min_match;
     const SpeculativeBackend speculative_backend;
+    // EngineOptions::relaxed_drafting is set: verification runs the relaxed acceptance instances,
+    // with the tokenizer facts below (found at startup; empty when off).
+    const bool relaxed_drafting;
+    frontend::RelaxedDraftingTokens relaxed_tokens;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
     const bool vision_enabled;
@@ -616,9 +628,30 @@ public:
     std::optional<DFlashDraftHandoff> dflash_draft_handoff;
     std::array<std::uint32_t, kMaximumConcurrency> grammar_dead_positions{};
     ops::SamplingMask bind_grammar_mask(runtime::TokenMaskProvider*, std::size_t row);
+    // Relaxed drafting's request-lifetime config fields: the added-token floor, and threshold 0
+    // when the Program runs without it.
+    void apply_relaxed_drafting(ops::SamplingConfig& config) const;
+    // A verification row's relaxed drafting threshold: the request's, or 0 for a constrained row
+    // (`mask` set) and for a request whose committed ids end inside a tool call.
+    [[nodiscard]] float round_relaxed_threshold(const SequenceState& sequence,
+                                                const RequestControl& request,
+                                                const ops::SamplingMask& mask) const;
     ops::SamplingMask fill_grammar_mask(runtime::TokenMaskProvider*, std::size_t row,
                                         std::span<const TokenId> drafts);
     Tensor token_counts;
+    // --draft-context-rows (all empty when off): the ids the lanes' ledgers hold that the proposal
+    // head's subset lacks, how many of each lane's ledger tokens are noted, and the pinned copy
+    // the last upload to io.draft_context_rows read, with its completion and the set version it
+    // holds.
+    std::optional<ContextRowSet> draft_context_rows;
+    std::array<std::size_t, kMaximumConcurrency> draft_context_rows_noted{};
+    std::optional<PinnedHostBuffer> draft_context_rows_host;
+    std::optional<CudaCompletionEvent> draft_context_rows_uploaded;
+    std::uint64_t draft_context_rows_version = 0;
+    // Notes the ledger tokens of `lanes` not noted yet and, when the set changed, uploads it on the
+    // compute stream ahead of the work that drafts with it. Graphs read the device ids at replay,
+    // so nothing is recaptured.
+    void refresh_draft_context_rows(std::span<const std::uint32_t> lanes);
 
     VisionHandoffState vision_handoff;
     std::array<SequenceState, kMaximumConcurrency> sequences;
@@ -628,6 +661,10 @@ public:
 
     std::optional<PinnedHostBuffer> round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
+    // Decode scoring only (EngineOptions::scoring_decode_window): the window's ingress and
+    // log-probabilities, and its BF16 logits for a row sink.
+    std::optional<PinnedHostBuffer> score_decode_host;
+    std::optional<PinnedHostBuffer> score_decode_logits_host;
     TokenId* host_tokens = nullptr;
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_5::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
@@ -883,6 +920,11 @@ public:
                                        std::span<const std::uint32_t> counts);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;
+    // causal_score's Decode phase: prefill [0, first_target - 1), then teacher-force the targets
+    // through the ordinary step (window 1) or the verify forward and ReplaySSM commit (wider).
+    [[nodiscard]] std::vector<float> causal_score_decode(const PreparedPromptData& prompt,
+                                                         std::uint32_t first_target,
+                                                         std::uint32_t window, ScoreRowSink* sink);
     [[nodiscard]] runtime::BatchedGeneratedRound decode_ordinary_batch(
         std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,
         runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks);

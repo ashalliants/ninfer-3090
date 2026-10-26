@@ -30,7 +30,8 @@ references, `engine-architecture.md`).
 | 16 | Two lanes (`--max-concurrency 2`): slotted state and KV, a batched plain round for two decoding lanes (MTP stays at one), per-lane context cache, graphs and leases ([measurements](#pr-16-two-lanes), spike [#284](https://github.com/ashalliants/ninfer-3090/pull/284)) | done, opt-in (aggregate gate missed, below) |
 
 The C++ loader reads and places every `ggml_*` and `ggml_rec_*` object. Linear and LinearAdd execute
-the six dense formats (PR 3); offloaded_sparse_moe executes the three expert record formats (PR 7).
+the six dense formats (PR 3); offloaded_sparse_moe executes the three expert record formats (PR 7)
+and the nine further pairs of the GSQ-RCO IQ3 packs (Basalt items below).
 
 ## PR 3 measurements
 
@@ -164,6 +165,84 @@ over positions): hyper-connection mixers 0.2-1.0%, GDN 0.7-1.0%, QSA 2.5-2.9% (t
 exact K/V, the engine INT8-G64), MoE <= 0.07% (most positions bit-equal after BF16 rounding),
 residual updates <= 0.6%, layers 0-3, 7-9, 46 and 47.
 
+### Decode-path KLD gate
+
+The quality gate above scores teacher-forced prefill chunks, so it cannot see a change to the
+decode or MTP verify forward. Flash-Next has no CausalScoring Engine, so `ninfer-perplexity
+--kld-base` ([perplexity.md](../perplexity.md#decode-path-kl-divergence-gate)) cannot score it.
+The forward harness has the same gate instead, with the same scoring code (`score_row`,
+`summarize`). Use it to judge a numerics change to the Flash-Next forward. Each such change adds
+its own option to this mode as a harness flag.
+
+The base is a llama.cpp KL-divergence file from a higher-precision reference model of the same
+weights, such as a Q8_0 GGUF of Qwen3.8-Flash-Next, with wikitext-2 in 512-token chunks. Basalt's
+gate appears to use such a base, but which Q8_0 file it used, and whether it comes from the same
+checkpoint as the IQ2_XS GGUF the artifact is converted from, was not checked here. The llama.cpp
+build must load the GGUF's architecture; Basalt's notes mention a commit (436f6f89e) that was not
+verified either. The base fixes the tokens, so the artifact's tokenizer is not involved:
+
+```bash
+llama-perplexity -m qwen3.8-flash-next-q8_0.gguf -f wiki.test.raw -c 512 \
+  --kl-divergence-base flash-next-q8_0-512.kld
+```
+
+Then score the same tokens under the GPU lock:
+
+```powershell
+$env:NINFER_TEST_QWEN4EXP_ARTIFACT = "K:\ninfer-models\qwen4exp\qwen4exp-iq2xs.ninfer"
+. tools/gpu-lock.ps1
+Invoke-WithGpuLock {
+  build-ninja\tests\ninfer_tests.exe ninfer_qwen4_exp_forward_real_test `
+    --kld-base flash-next-q8_0-512.kld --chunks 20 --window 3 --tsv kld-t3.tsv
+}
+```
+
+Each chunk of `n_ctx` tokens (the first `--chunks N`, default all) is a fresh sequence:
+
+- Positions `[0, n_ctx/2)` are prefilled as one call.
+- Every target in `[n_ctx/2 + 1, n_ctx)` is predicted by a decode forward, `T` targets per call
+  (`--window T`, default 3). These are exactly the base's rows, including row 0, as in
+  `ninfer-perplexity`'s Qwen3.5 gate.
+- `T = 1` is the plain decode call.
+- `T` from 2 to 8 is the verification call of an MTP round with `T - 1` drafts. Every column is
+  committed through the GDN replay fold, `qsa_commit_tails` and `ple_conv_commit`, as
+  `commit_verified` commits an accepted round.
+- The last window of a chunk may be partial. It runs as a narrower round; one column runs as a
+  plain decode call.
+- `T` above 8 is refused: the Program verifies at most the anchor and 7 drafts.
+
+The verification forward is built to give every column the logits of a one-column decode call,
+bit for bit (`ninfer_qwen4_exp_mtp_real_test`). On the current code the window therefore changes
+which code runs but should not change the rows. A change that breaks that shows up as a
+difference between `T = 1` and a wider window.
+
+What differs from the served Program:
+
+- every call runs eagerly, without CUDA graphs;
+- every routed expert is read from the pinned bank through staging slots (`--staging`, default
+  64); placement does not change bits;
+- rows are scored from the forward's FP32 logits, while the Program samples a BF16 cast of them;
+- the prompt half goes through the harness's single prefill call, not the Program's chunked or wide
+  prefill. Only the state and KV it leaves can differ; no row is scored from it;
+- no MTP drafter runs.
+
+Rows are compared over the model's public token domain; rows past it in the base (llama.cpp's
+padded vocabulary) are left out. stdout shows PPL with its standard error and the base's PPL, the
+KLD mean, median, p99 and max, and the top-1 agreement, with a running line per chunk. `--tsv`
+(default `kld-rows.tsv`) gets one line per row, in the columns of `ninfer-perplexity`'s `rows.tsv`.
+Basalt found about 0.01-0.02 KLD of noise in the reference itself, so compare builds with each
+other: the same base, chunks and window, with the change off and on, in one GPU-lock hold. The
+mode has not been run yet; no result is recorded here.
+
+Numerics options under the gate, each a harness flag:
+
+- `--hc-int8`: the mixers read their int8 copies (Basalt items, below). The harness makes the
+  copies once and every chunk's decode and verification calls read them; the prompt half (one
+  call of more than 16 columns) reads the BF16 weights, as the Program's prefill does.
+- `--ggml-decode-mma`: the dense GGML linears of the decode and verification calls (at most 8
+  columns) take the int8 tensor-core route (Basalt items, below); the prompt half keeps the wide
+  route either way.
+
 ## PR 9 (M1) measurements
 
 RTX 3090 (WDDM, display attached), CUDA 12.8, Ryzen 9 5950X, DDR4-2133; artifact and volume on K:
@@ -271,7 +350,8 @@ IQ1_M layers. Strata holds 12,375-12,583.
 
 **Host and n-gram rows (11c).** The decode round now runs the layers before the PLE layer (two of
 48) as one graph while the host reads the round's n-gram rows from the volume (median 0.6 ms, p90
-1.2 ms per token under nsys), then the rest as a second graph.
+1.2 ms per token under nsys), then the rest as a second graph. `--ngram-flag-wait` (Basalt items, below) makes it
+one graph that waits on the device for the rows.
 
 **Not changed, with reasons.** Power throttling: the opt-out exists since PR 9. WDDM event batching:
 a decode round queries at most a few promotion events and records two per promotion batch; nothing
@@ -520,6 +600,760 @@ Gates (RTX 3090, WDDM, artifact `qwen4exp-iq2xs-mtp-vision.ninfer`, every run un
 Decision: C = 2 beats C = 1 in makespan and queued time to first token but not by the aggregate decode the
 spike promised (about 1.07x against 1.18x modelled). It ships opt-in; the launcher default stays at one lane.
 
+## Basalt items (issue #383)
+
+Speed items taken from Basalt (commit 8d73a39), each behind its own option that is off by default.
+None has been measured on the RTX 3090 yet.
+
+- **Shared expert on a side stream** (`--shared-expert-stream`). Each MoE block (and the MTP
+  drafter's) forks a second stream after the block's input and runs the shared expert's gate/up,
+  SiLU-mul and down there while the routing and routed experts run on the device stream; the device
+  stream waits for it before the combine. The fork and join are events, so the decode and
+  verification graphs capture them; an exception between them rejoins the stream. The stream has
+  the greatest priority, but that holds for eager calls only: `DecodeGraphExecutable` instantiates
+  graphs without `cudaGraphInstantiateFlagUseNodePriority`, so a graph replay runs the branch
+  concurrently at the default priority (instantiation is left unchanged).
+  - Designed to be bit-exact: the same Ops run on the same inputs. Checked by
+    `ninfer_qwen4_exp_forward_real_test --shared-expert-stream TOKENS` (eager and in CUDA graphs)
+    and `ninfer_qwen4_exp_mtp_real_test` (the drafter), neither run yet.
+  - The shared expert's Linears take their scratch from a region carved out of the call's
+    workspace, never from scratch the device stream frees and reuses. The carve is what the Linear
+    Op asks for (`ops::linear_workspace_capacity_bytes` over the block's gate, up and down).
+  - The static workspace plans it before the weights are read as
+    `ProgramDevicePlan::shared_expert_workspace`: the Q8_1 rows of the shared expert's widest
+    input, 1.125 bytes per value, at the widest static call. A wide prefill's lent arena grows by
+    the same at its width.
+  - At startup the Program checks the loaded weights' need against both, and refuses
+    `--shared-expert-stream` if a format needs more (only the GGML formats are planned for).
+  - Designed to work with two lanes, MTP and vision. Basalt estimates 0.25-0.5 ms per token. Not
+    measured.
+- **MTP for constrained requests** (`--mtp-constrained`, needs `--spec mtp`). Without it a
+  constrained row (JSON schema, grammar, tool calls) decodes plain rounds. With it the row drafts as
+  any other; once the drafts are on the host the Program asks the Engine's mask provider for one
+  grammar mask per position 0..K (position j follows the committed output and drafts[0:j]) while
+  the verification forward runs, uploads them, and installs them in the round's sampling config.
+  The acceptance Op then takes a masked argmax (greedy) or the masked target distribution
+  (sampled, mask-then-top-k as in `constrained-decoding.md` §7.4) per column, so an illegal draft is
+  rejected and the correction is legal. The drafter itself runs unmasked: drafts are proposals.
+  - Dead-end bits from the provider fail the row when its licensed tokens reach one
+    (`constrained_accept_limit`, `program/constrained_window.h`), committing none of them, as the
+    Qwen3.5 Program does.
+  - The K + 1 masks are the planned term `ProgramDevicePlan::mtp_constrained_masks` (about 31 KB
+    per position at Qwen's vocabulary; zero when off).
+  - Basalt instead checks the grammar after each window and redraws the first refused row with
+    the mask as a bias; that is exact for greedy rows only, so the per-position masks are used.
+  - Checked by `ninfer_qwen4_exp_engine_real_test` (`mtp_constrained_matches_plain`: greedy ids for
+    a JSON-schema request equal plain constrained decoding), not run yet. Basalt's estimate is about
+    81 to 110 tok/s on greedy constrained requests. Not measured.
+- **Joint-acceptance draft length** (`--mtp-joint-acceptance`, needs `--spec mtp`), phase A. Without
+  it `choose_draft_length` picks the draft count before drafting from the per-position acceptance
+  estimate (PR 13 found it no better than fixed 2 drafts). With it every round drafts the ceiling
+  (`--draft-tokens`, fewer near the request's end) in the existing per-step-count draft graph, and
+  each drafter step runs `ops::argmax_probability` on the head's FP32 logits in place of the BF16
+  cast and `ops::argmax`. The Op returns the same ids, since its argmax keys are the BF16 roundings,
+  and the winner's softmax probability.
+  - After the drafts are on the host, the round verifies `joint_acceptance_window`
+    (`program/draft_policy.h`) of them: Basalt's rule (keep draft j while the product of the
+    table's acceptance rates for drafts 0..j stays at or above the threshold), but at least the
+    first draft, since the drafts are already made. Basalt can choose no draft (a plain round).
+  - The lane's `JointAcceptanceThreshold` (base 0.35, floor 0.25, reset per request) supplies the
+    threshold and observes the offered probabilities and the accepted count at each committed round.
+  - With `--mtp-constrained` the grammar masks are filled for the verified drafts only (K + 1
+    positions of the trimmed window).
+  - The probabilities are the planned term `ProgramDevicePlan::mtp_draft_probs` (4 bytes per draft;
+    zero when off). Off, the drafter graphs, the drafts and the window are those of master.
+  - Only what is proposed changes, so greedy output is designed to equal plain greedy output:
+    `ninfer_qwen4_exp_engine_real_test --mtp-exact K --mtp-joint-acceptance TOKENS` checks it, not
+    run yet. Basalt estimates +3-8% on Flash-Next. Not measured.
+  - Not done (phase B): stopping the draft chain early on the device once the product falls below
+    the threshold (Basalt's conditional draft graph, `verify_kernels.cu:824-827`,
+    `src/core/mtp.cpp:1390-1453`). Phase A pays for every draft step even when the window keeps one,
+    so it can lose to the acceptance estimate when the rule keeps short windows.
+- **N-gram prefetch for the anchor column** (`--ngram-prefetch`, needs `--spec mtp`). Verification's
+  `upload_rows` reads W columns of rows (`program/ngram_rows.h`, `ngram_window_rows`) after the front
+  half of the verify forward is enqueued; the volume reads are the host's critical path when the rows
+  miss the 2^20-row cache. The anchor column's rows depend only on history known before drafting, so
+  `mtp_draft` reads them between enqueueing the draft graph and its sync, into a scratch buffer, only
+  to fill the volume's cache; verification then finds them cached.
+  - Runs on the Program thread, since `NgramVolume::read_rows` is not reentrant. It can lengthen a
+    round only when the volume read outlasts the draft graph, and then by what verification would
+    have waited for the same rows.
+  - The drafts' rows (columns 1..K) are unknown until the sync and are read as before.
+  - No device memory; the rows, the drafts and the output are unchanged. Off: verification reads
+    every row, as on master. `ngram_window_rows` is also what the prefill and decode row reads use
+    (the same ids, in the same order).
+  - Checked on the CPU only (`ninfer_qwen4_exp_ngram_volume_test`: the ids against hand-derived
+    windows, the prefetched rows cached). Not measured.
+- **Hot embedding rows in VRAM** (`--hot-embedding-rows N`; Basalt keeps 8192). The token embedding
+  (248,320 IQ4_XS rows of 1,360 bytes, 322 MiB) is bound in the pinned block, before the expert
+  banks, instead of device memory, and the Program copies rows [0, N) to a device buffer. The text
+  model and the MTP drafter gather through `ops::embedding_split`: ids below N from the device copy,
+  the rest through the block's device pointer (it is `cudaHostAllocMapped`, as the expert banks'
+  zero-copy reads already use; no new registration). The byte-level BPE gives the most frequent
+  tokens the lowest ids, so Basalt expects most gathers to stay in VRAM. Designed to work with two
+  lanes, MTP and vision (the vision tower is pinned after the banks, so its groups stay contiguous).
+  - Ledgers: `LoadPlan::device_bytes` loses the whole table, `ProgramDevicePlan::hot_embedding` gains
+    N rows (11 MiB at 8192), and the RAM ledger plans the table as `HostMemoryDemand::other_pinned`
+    (`plan_hot_embedding` and `plan_pinned_weights` in `memory_plan.h`). At 8192 the frames get
+    311 MiB more, about 220 experts of 1.5 MB. Off, every term is zero and the embedding is in device
+    memory as on master.
+  - The same values: the split route decodes each row exactly as `ops::embedding`.
+    `ninfer_embedding_test` (`embedding_split_matches_embedding`) checks it bitwise across the
+    boundary, with the cold plane in mapped pinned memory. End to end,
+    `ninfer_qwen4_exp_hot_embedding_test` (`ninfer_qwen4_exp_engine_real_test --hot-embedding-exact
+    8192 [--mtp K]`) checks that greedy ids through the Program equal those with the table in VRAM.
+    Neither has run yet.
+  - Cost: a cold id's row (1,360 bytes) crosses PCIe inside the embedding kernel; a decode step
+    gathers one row per column. The 322 MiB join the pinned block (one `cudaHostAlloc` at load,
+    so no extra `cudaHostRegister` under WDDM); the RAM ledger counts them, so a host that only
+    just fits the banks does not start with the option. Not measured.
+- **GDN key heads through a head map** (`--gdn-head-map`). The GGUF pairs value head h with key
+  head h mod 16 (tiled order). Without the option `tile_heads` copies q and k to 48 heads, one per
+  value head, before each GDN layer's recurrence: 3 `cudaMemcpy2DAsync` per tensor, 216 copy nodes
+  per decode token (the copies' share of the "QSA, GDN, norms, copies" row above; this change is not
+  measured). With it the GatedDeltaNet Ops take an `ops::GdnHeadMap`: `Tiled` reads key head
+  h mod Hqk, `Blocked` (the default, Qwen3.5's grouped heads) h / (Hv / Hqk). The map is a
+  compile-time kernel parameter: the Blocked kernels are master's code, and the Tiled ones are
+  instantiated only for Flash-Next's calls (normalized q/k, an FP32 state, dense replay rows; other
+  combinations are refused). Every route Flash-Next calls takes it: the
+  recurrent kernel (decode, prefill calls under 16 tokens), the chunked route (prefill; the Q/K
+  packet is published by the first value head that reads it, h < 16), the rows route's batch update
+  (two lanes), and MTP's replay record and fold.
+  - The same values reach the same arithmetic in the same order, so the outputs and the state are
+    designed to equal the copy route's bit for bit. `ninfer_gdn_head_map_test` (cpu) checks it on
+    the FP64 oracle; the GPU checks (`ninfer_gated_delta_net_test`,
+    `ninfer_gated_delta_net_replay_record_test`, `ninfer_gdn_replay_fold_test`: the tiled map
+    against the blocked map on expanded q/k, bitwise) and end to end
+    `ninfer_qwen4_exp_forward_real_test --gdn-head-map TOKENS` (the prompt, a verification round and
+    its fold, and decode calls: logits bitwise against off) have not run yet.
+  - MTP's GDN replay records hold the 16 key heads (`gdn_records_spec`, `spec.head_map` Tiled), so
+    their key plane is a third of the copy route's (`plan_gdn_record_bytes`, part of
+    `ProgramDevicePlan::speculation`); the fold registers the [16, 48, 10240, Tiled] geometry. Off,
+    the copies, the records and the fold are those of master. Works with two lanes, MTP and vision.
+    Not measured.
+- **The routed experts' input cast once per call** (`--moe-precast-input`). Without it every
+  narrow-route gate/up CTA casts its expert's columns of x to A8 (q8_1: int8 codes and an FP32 scale
+  per 32 values) into shared memory: the 40 CTAs of an expert each cast the same columns, and every
+  expert a column is routed to casts it again. With it `moe_experts` runs one kernel that casts every
+  column of x into the call's workspace (codes [T][2560], scales [T][80]) before the passes, and the
+  gate/up CTAs copy their columns' codes and scales into the same shared layout instead
+  (`MoeExpertSource::precast_input`; a compile-time kernel parameter, so the default instances are
+  master's code: cuobjdump SASS of all 24 kernels of `moe_layer.cu` is identical to f6bf9e4d). The
+  wide route keeps its own cast (leaf-major, `wide_expert.cu`), and a call whose experts all take it
+  (512 columns or more) runs no precast kernel. The down kernel still casts h per CTA (a follow-up).
+  - The same cast (`ggml::quantize_q8_1_group`, the canonical A8 cast) on the same values, so the
+    codes and the outputs are designed to equal the per-CTA casts bit for bit:
+    `ninfer_offloaded_moe_layer_test` runs every placement (device frames, zero-copy, staged,
+    mixed, CPU-served, the zero-copy rule) with and without it against the CPU engine at
+    T in {1, 2, 7, 8, 16} (precast_bitwise); end to end `ninfer_qwen4_exp_forward_real_test
+    --moe-precast-input TOKENS` (prompt, verification and decode logits bitwise against off) and
+    `ninfer_qwen4_exp_moe_precast_test` (greedy ids with MTP). None has run yet.
+  - Memory: the call's workspace grows by T * (2560 + 320) bytes (each plane rounded up to 256), in
+    the forward's workspace term (`Forward::moe_workspace_bytes`, so `ProgramDevicePlan::workspace`
+    and a wide prefill's lent arena include it: 2.8 MiB at a 1,024-column chunk; the MoE term is one
+    of the maxima, so the total may not grow). No other device memory.
+  - Works with two lanes, MTP (the drafter's and the verification's calls) and vision. Not
+    measured.
+- **The routed experts' gate/up rows from registers** (`--moe-gate-up-registers`, with the
+  `--moe-precast-input` it needs; Basalt's `gu2.cuh` / `dm_glue_gu_kernel`). PR 7 and PR 11 found
+  the narrow route bound by per-CTA arithmetic latency at low occupancy (three staged gate/up CTAs
+  per SM, ~12 us of compute each after their slice lands), not by DRAM, and the persistent variants
+  tried there (cp.async slot rings) were no faster. This variant removes the shared-memory staging
+  instead: `ops::GateUpVariant::Registers` launches a grid of (SMs - SMs / 8) x the kernel's
+  measured blocks per SM (`offloaded_moe::coresident_blocks`, the eighth left to the shared
+  expert's side stream; 144 on the RTX 3090 at the two blocks per SM that `launch_bounds` asks for,
+  more for instances that use fewer registers) that loops over (8 intermediates, job) items; a warp
+  decodes one intermediate's gate and up rows straight from the record into registers (no shared
+  memory, no barrier), reads its columns' codes in place from the precast planes and applies SwiGLU
+  itself. A row's 80 sub-blocks leave half a
+  warp idle in the third pass (lanes 16-31 have no sub-block 80-95), so lanes 0-15 take the gate
+  row's sub-blocks 64-79 and lanes 16-31 the up row's, handing each fma's operands (c * d,
+  float(P)) to lane l - 16 by `__shfl_down_sync` before that lane's fma. The down kernel is
+  unchanged. The variant is a separate kernel template; every existing instance's SASS is
+  unchanged (cuobjdump of all 37 kernels of `moe_layer.cu` identical to 25bcd28d, encodings
+  included; `wide_expert.cu` byte-identical).
+  - Each lane partial receives the same fma operands in the same order (s = l, l + 32, then l + 64
+    for l < 16) and the same butterfly, so the outputs are designed to equal the staged kernel's
+    bit for bit (the argument is in the kernel's comment). `ninfer_offloaded_moe_layer_test` runs
+    every placement a third time with the precast input and the register kernel
+    (registers_bitwise), and precast_read_proof checks on a captured call that both gate/up kernels
+    read the precast planes rather than x (the precast node disabled and x set to NaN must leave the
+    outputs as expected; a control without the precast input must change them). End to end
+    `ninfer_qwen4_exp_forward_real_test --moe-gate-up-registers TOKENS` (logits bitwise against
+    the default) and `ninfer_qwen4_exp_moe_gate_up_registers_test` (greedy ids with MTP). None has
+    run yet.
+  - No memory: the kernel uses neither workspace nor shared memory. Records read zero-copy (misses
+    under the zero-copy rule, no staging) are read with the decoders' small loads instead of 16-byte
+    `cp.async` copies, which may cost more over PCIe; unmeasured. Refused without
+    `--moe-precast-input` (parser and startup). Works with two lanes, MTP and vision. Not measured.
+- **The routed experts' route and dispatch in one launch** (`--moe-fused-route`; F4d of the Basalt
+  learnings, narrowed). The learnings' plan put the expert union's planning inside the gate/up
+  kernel; here the staging pass (misses copied to slots before the expert kernels) needs the
+  dispatch before gate/up in every decode call, so the narrower change fuses the two launches that
+  precede the experts: `ops::moe_route_dispatch` runs, for a call of at most 8 columns
+  (`kMoeRouteDispatchColumns`: decode, MTP drafting and verification), one CTA of 512 threads
+  (`kRouteDispatchThreads`) in which warp t routes column t with `route_kernel`'s own code (`route_column`: the top 10 of 512 in
+  FP32 with the lower id on ties, their weights as the renormalised softmax, and the shared gate)
+  and the CTA then dispatches the k*T entries as `dispatch_small_kernel` does (counts, the shared
+  scan, the route log), except that an entry's place in its expert is its rank among that expert's
+  entries, so each expert's entries are in ascending entry index instead of the order the atomics
+  resolve in. Wider calls run the two Ops. One launch fewer per routed-expert call (each layer's MoE
+  block, the drafter's too); the kernel is tiny and latency-bound, so the gain is the launch (a
+  graph node) and the dependency between the two. Not measured.
+  - The routing is the same code on the same values, so ids, weights and the shared gate are
+    designed to equal `moe_route`'s bit for bit (the PTX of the route's floating-point operations is
+    the same sequence in both kernels; NVVM has already made every contraction, so ptxas has none
+    to choose). At 512 threads the kernel takes 120 registers and spills nothing
+    (`cuobjdump -res-usage`: REG 120, STACK 0); a first version at 1,024 threads hit the
+    64-register cap and spilled 48 bytes per thread. The dispatch scan's `warp_totals[16..31]` are zeroed, so the scan
+    written for 32 warps is unchanged. The counts, offsets, jobs and route log equal
+    `moe_dispatch`'s, and the entries equal `offloaded_moe::plan_dispatch`
+    (`src/ops/offloaded_sparse_moe/dispatch_plan.h`, `ninfer_moe_dispatch_plan_test`, cpu and
+    host-only). Consumers do not depend on the order within an expert (each column's expert output
+    is computed alone), so the layer's output is unchanged. `ninfer_offloaded_moe_layer_test`
+    (fused_route) checks the routing bitwise against `moe_route`, the arrays against
+    `plan_dispatch` (all-equal, tied and all-NaN columns; a second call into the same arrays), and
+    the whole layer (every placement, then the combine) bitwise against the two launches at
+    T in {1, 2, 7, 8}; end to end `ninfer_qwen4_exp_forward_real_test --moe-fused-route TOKENS`
+    (logits bitwise against off) and `ninfer_qwen4_exp_moe_fused_route_test` (greedy ids with MTP).
+    None has run yet.
+  - Off path: every existing kernel of `moe_layer.cu` (49, `route_kernel` and the dispatch kernels
+    included) has the same SASS as d262e955, encodings included; `wide_expert.cu`'s six too. No
+    memory. Works with two lanes, MTP (the drafter's calls too) and vision.
+- **Verification misses on the CPU** (`--cpu-verify-misses [--cpu-verify-workers N]`, needs
+  `--spec mtp`; F4e of the Basalt learnings). PR 11 left the CPU route of `moe_experts` unwired
+  because a CPU leg cannot win at T = 1 (one cold expert takes 67-146 µs on the worker team, a
+  zero-copy miss adds 30-45 µs to a layer). A verification window (W >= 2 columns) gives the GPU
+  ~130-170 µs of expert work per layer, behind which one or two CPU misses at 67-84 µs can hide. The
+  Program now owns an `ops::offloaded_moe::CpuMissService` over the text model's 48 expert banks
+  (the CPU reads each bank's host address), started before the Forward and stopped after the
+  destructor's synchronization, with its defaults (4 jobs per layer call, a third of the misses
+  left on the GPU, `pcie_divisor` 3) but its column cap set to the widest verification (1 + drafts)
+  and its worker count from `--cpu-verify-workers` (default 6, the op's; PR 11 measured 12-16
+  faster for a single expert, so the flag is there to sweep). `ForwardExperts::cpu` holds a channel
+  per layer, and `Forward::moe` takes `verify` from its caller (a verification call and a two-lane
+  plain round are both T = 2): only a verification's text-model layers set `MoeExpertSource::cpu`;
+  plain decode, prefill and the drafter never do.
+  - Overlap: the experts run with `wait_for_cpu = false`, the shared expert is enqueued next (or
+    joined, with `--shared-expert-stream`, where it already runs on the side stream), then
+    `moe_experts_cpu_wait` places the CPU's outputs before the combine. Both orders read the same
+    outputs, so either is correct; the CPU works while the GPU runs the resident experts, the GPU
+    misses and the shared expert. The device decides everything (`cpu_plan_kernel`, one CTA: which
+    jobs, the compacted x columns, the request's sequence), so the verification graphs capture it
+    and each replay follows its own routing.
+  - Bit-identical by construction: the CPU engine's outputs equal every GPU placement's (PR 7).
+    `offloaded_moe::select_cpu_jobs` (`src/ops/offloaded_sparse_moe/cpu_selection.h`, host-only
+    `ninfer_moe_cpu_selection_test`) states the kernel's selection rule (want = min(cap, M - M /
+    divisor), the fewest-column jobs of at most `max_job_columns` first, ties in job order).
+    `ninfer_offloaded_moe_layer_test` (cpu_verify_leg) runs T in {2, 3, 8, 16} with the CPU leg in
+    the Forward's order (experts without the wait, other work, then the wait), eagerly and replayed
+    from a captured graph, against the CPU engine bit for bit, and checks the published
+    `MissRequest` (jobs, experts, widths, compacted columns) against `select_cpu_jobs`. End to end
+    `ninfer_qwen4_exp_cpu_verify_misses_test` (greedy ids with MTP equal those without the option,
+    and so do the rounds, drafts and acceptances; the option-identity gates now compare those for
+    every option). None has run yet.
+  - Failure: a wait whose host heartbeat stops for 1 s writes `layer << 16 | kErrorHostSilent` to
+    the Program's mapped error word (zero-initialised; the outputs of that call are undefined).
+    Every later layer of the round sees the word set in `cpu_plan_kernel`, publishes nothing and
+    computes its misses on the GPU, so a host that stopped costs one 1 s wait per round, not one per
+    layer. Each verification round reads the word after its synchronization, before acceptance; a
+    set word clears it and throws. The request then ends with an error, as any failed round
+    does (decode's catch releases the lane and the Engine fails the request): nothing from that
+    round is committed and the lane's state is reset. The round is not retried. Later requests use
+    the CPU leg again unless the service thread itself has died (`failure()` set): it never answers
+    again, so the Program then stops speculating (plain rounds, the same output) and says so once.
+  - Memory: the service's 4-byte device counter is `ProgramDevicePlan::cpu_misses`; its mapped
+    channel (request, x for 1 + drafts columns, y for 4 jobs of 8 columns, the done line) and the
+    error word (220 KiB at 7 drafts) are pinned and charged to the RAM ledger (`plan_cpu_misses`;
+    with `--prefill-cpu-share` too the one channel is sized for that, below). On Windows a pinned
+    allocation is mapped into the GPU's address space too.
+  - GPU-session checks: the GPU spins on a mapped host flag inside the verification graph. With a
+    display attached (WDDM) a kernel that spins past TdrDelay (2 s) resets the driver; a healthy
+    wait is tens of microseconds, but check that a stalled CPU (heartbeat timeout 1 s) does not trip
+    it, and that 6 spinning CPU threads do not slow the rest of the round. The service thread spins
+    while requests arrive and, after 20 ms without one, sleeps `sleep_for(50 µs)` between polls. On
+    Windows that sleep typically lasts 1-15.6 ms unless the timer resolution is raised, so the first
+    layer of a round after an idle gap (a new request, a slow host step) can wait that long: check
+    on Windows how often a round's first wait is that late. Measure tok/s on vs off at 6, 12 and 16
+    workers, and the share of layers whose wait finds the answer ready. Works with two lanes and
+    vision. Not measured.
+- **GDN commit on a side stream** (`--gdn-async-commit`, needs `--spec mtp`; F10c of the Basalt
+  learnings). `commit_verified` folds the accepted columns into the recurrent state
+  (`GdnReplayFoldPlan`, eager, not captured) on the device stream ahead of the QSA tail and PLE
+  commits and the drafter's catch-up, none of which reads the recurrent state or the GDN records.
+  With the option a commit the row continues from forks the Program's `GdnFoldStream`
+  (`program/fold_stream.h`: a default-priority non-blocking stream and two events) from the device
+  stream, runs the same fold there and records its end; the catch-up, the next round's drafter
+  steps (`mtp_write_pending`, `mtp_draft` and its host wait, which synchronizes the device stream
+  only) and the host's work between rounds overlap it. A terminal commit folds on the device stream
+  as before, so the state is final when the Engine sees the round. Basalt (`verify_kernels.cu:358-450`)
+  goes further: its commit claims work items from a device counter and the next window starts with
+  a finisher kernel that drains what is left. The plain event form is enough here because the next
+  round's first use of the state comes after the drafter's steps and their host wait, so the wait
+  serializes only when the fold outlasts them; whether it does is a GPU-session measurement.
+  - Readers that join (the device stream waits for the fold event, `join_gdn_fold`): the next
+    verification's front (before `replay(verify_front)`, which reads the state and rewrites the
+    records the fold reads) and a plain round's front (`run_decode(Front)`); at entry
+    `advance_prefill`, `append_forced`, a two-lane `decode_rows`, `commit`, `poll_context` (a
+    restore, a fresh lane's zeroing, a capture's publication) and `start_capture` (copies the
+    state); `finish` (endpoint capture), `abort`, `abort_pending`, `fail_all_cleanup` and the
+    destructor settle it (noexcept: the host waits for the side stream when the wait cannot be
+    enqueued). The fold stream is declared after the state and speculation buffers, so its
+    destructor (which synchronizes it) runs before they are freed. Readers that do not join: the
+    QSA tail and PLE commits, the drafter's catch-up and drafts (the drafter has no GDN layer),
+    `settle_round`'s promotions and the VRAM target (expert frames and the KV pool only), and the
+    host-only context-store and checkpoint calls. No join or fork runs inside a stream capture.
+  - Bit-identical by construction: the same Op, plan and row, only on another stream, and every
+    device use of the state is ordered after it. `ninfer_qwen4_exp_gdn_async_commit_test` (greedy
+    ids, MTP rounds, drafts and acceptances on vs off; `Program::process_async_gdn_folds` must
+    count at least one side-stream fold) has not run yet. `gdn_fold_on_side_stream` and the
+    refusal are pinned on the CPU (`ninfer_qwen4_exp_program_plan_test`).
+  - GPU-session checks: nsys should show the fold kernel on its own stream overlapping the catch-up
+    and draft kernels, and the next verification's front starting after it. Measure tok/s with MTP
+    on vs off. No memory. Works with two lanes and vision. Not measured.
+- **Int8 hyper-connection copies with FP32 activations** (`--hc-int8`; F1 of the Basalt
+  learnings). The BF16 mixer reads 13.2 MB per decode call at about 50% of 936 GB/s (PR 6), about
+  2.8 ms of the token over its 97 mixers. With the option the Program makes int8 copies of every
+  mixer's down (with the injection rows) and up matrices at construction (`execution::HcInt8Copies`,
+  `ops::hc_int8_quantize`): int8 codes with one binary16 scale per 32 consecutive inputs of a row,
+  Basalt's `hc8_quant_kernel` rule `s = f16(absmax / 127)`, `q = clamp(rint(w / s), -127, 127)`
+  (`src/ops/hyper_connection/hc_int8_codec.h`, shared by the kernel and the host tests). The
+  mixers then read 7.0 MB per block mixer, about 0.53 of the BF16 bytes.
+  - **Numerics change.** Each weight becomes `q * s`, within half a step of the BF16 value; the
+    activations stay FP32 (Basalt notes that llama.cpp's Q8_0 *activation* quantization in this
+    read costs about 1% error; there is none here). So the output is not bit for bit the BF16
+    route's, and there is no identity gate: judge it with the decode-path KLD gate above
+    (`--hc-int8` in the harness's `--kld-base` mode, on vs off against the same base, chunks and
+    window in one GPU-lock hold).
+  - The rule differs from Basalt's only for a low binary16-subnormal scale (a group whose largest
+    value is below about 1e-3): Basalt's rounded scale can leave that value clamped by more than
+    half a step (or, rounded to zero, unencoded), and the copy raises it to the next binary16. The
+    persistent `q8_g32_fp16` format is not reused: its encoder picks codes by a reciprocal multiply
+    and never writes a zero scale, so its bits differ (this copy is a runtime form, never stored).
+  - Kernels (`src/ops/hyper_connection/hyper_connection_mix_int8.cu`, sm_86, no TMA or
+    mbarriers): K1a is the BF16 route's kernel template with an `Int8Codec` (each 8-code chunk
+    decoded exactly to `q * s`, then the same FP32 `fmaf` chain against FP32 Rn); K1b is new: a
+    warp per 4 features (their 16 W_up rows are one `mma.sync.m16n8k16` tile), the codes as exact
+    FP16 pairs, `m` split into FP16 high and low parts, two mma per 16 values with FP32
+    accumulation, each 32-value group's sums times its row's scale (Basalt's `hc_up_main_mma8`
+    arithmetic), then the collapse. The codes and scales are loaded straight into the registers
+    the arithmetic reads, before any activation, as the BF16 kernels do; nothing is staged in
+    shared memory but `m`. 80 CTAs of 8 warps. A column's result does not depend on T within
+    1..16, and the FP16 split represents each `m[k]` within `max(2^-22 |m[k]|, 2^-25)` (for
+    `|m[k]| < 65520`). The int8 form serves every call of up to 16 columns, a short prefill call
+    (a prompt's tail, say) included; calls of more than 16 columns keep the BF16 weights and route,
+    bit for bit as off, since the BF16 copies stay loaded. A
+    composed int8 route (the copies rounded to BF16 in the workspace) returns with the later step
+    that drops the BF16 weights. The BF16 kernels compile to the same SASS as before.
+  - Memory: the copies are `ProgramDevicePlan::hc_int8_bytes` (`plan_hc_int8`: 97 mixers, 648 MiB;
+    100 with the drafter, 668 MiB, plus a 256-byte status word), checked against the mixers the
+    Program binds at construction. No workspace beyond the BF16 route's. The BF16 weights stay
+    loaded in this change (about 0.68 GB more VRAM, about 450 fewer expert frames); dropping them is
+    a later step once the gate passes.
+  - Qualification: `ninfer_hc_int8_codec_test` (host only: bounds, zero groups, subnormal scales
+    and refusals, 1,000 groups against an independent FP64 re-implementation of Basalt's rule);
+    `ninfer_qwen4_exp_program_plan_test` (the plan term against the bound mixers);
+    `ninfer_hyper_connection_test` (GPU, not run: the quantize kernel bit for bit against the
+    codec, the int8 form against the FP64 oracle on the copies' values at T = 1, 2, 4, 8, 9, 16 at
+    the model's shapes, column invariance, graph capture, refusals including T = 17);
+    `ninfer_qwen4_exp_forward_real_test --hc-int8-prefill TOKENS` (GPU, not run: a prompt call of
+    more than 16 columns gives bitwise the logits of off, and the decode call after it differs).
+  - GPU-session checks: `--hc-int8-prefill`; the KLD gate on vs off; the mixer's time at T = 1, 2,
+    4, 8, 16 against the BF16 route (target: the bytes' 0.53); tok/s on vs off. Works with two
+    lanes, MTP and vision. Not measured.
+- **One fused hyper-connection read per routed-expert block** (`--hc-fused-read`, requires
+  `--hc-int8`; F10d of the Basalt learnings, Basalt's `hc_fused_kernel` in `hc_fused.cu`). Basalt
+  reads a block's input in one persistent kernel: the previous half's inject applied as the residual
+  is read, the mixer, the router logits with the top-10, and the q8_1 codes of the output for the
+  next projections. On this card a one-kernel persistent mixer has already lost: PR 11's variant
+  (ticket counters, both weights' loads up front, B items waiting on finished A items) measured
+  47-50 us against 26.6-27.0 us for the two-kernel route (above, "Rejected in PR 11"), and Basalt's
+  own full-layer fusion lost too (its `docs/unified-kernel.md`). So this item keeps the int8 mixer's
+  two kernels and their arithmetic and removes the launches and passes around them instead.
+  `ops::hc_fused_read` (`src/ops/hyper_connection/hc_fused_read.cu`) is three launches where the
+  MLP side ran six (five with `--moe-fused-route`, seven with `--moe-precast-input`): the
+  attention block's inject, the mixer's two kernels, the router projection, `moe_route` and
+  `moe_dispatch` (and the experts' precast).
+  - K1a and K1b take the inject as they read the residual (`R' = bf16(R + g y)`, the inject Op's
+    one fma); K1b writes `R'` back in place, each element from the one thread that reads it, so no
+    separate inject pass reads and writes the residual. K1b's CTAs each own 32 features, one A8
+    group of every column, and cast their group of x to A8 (the canonical cast) after the collapse;
+    the routed experts read those planes in place of their own cast (`ops::MoeA8Input`).
+  - A third kernel computes the router and shared-gate logits, a warp per row in
+    `projection_fp32`'s order (the same bits). The last CTA of each 8-column group to take a
+    ticket routes that group's columns with `moe_route`'s code (`route_column`, now in
+    `route_column.cuh`). The last group then dispatches every entry in ascending entry order
+    (`plan_dispatch`, as `--moe-fused-route` orders them). No CTA waits on another, so it cannot
+    deadlock without co-residency. K1b zeroes the tickets every call, so graph replays need no
+    memset.
+  - Bit-exact against `--hc-int8` alone: every output is the composition's, bit for bit. Checked by
+    `ninfer_hyper_connection_test` (against the composed Ops at T = 1, 2, 5, 8, 9, 16, repeated calls
+    and graph replays) and end to end by `ninfer_qwen4_exp_forward_real_test --hc-fused-read
+    TOKENS` (prompt, verification and decode logits). Neither has run yet. The existing kernels'
+    SASS is unchanged. cuobjdump shows every instance identical to 73276277, including the encodings
+    of all 50 `moe_layer.cu` kernels after `route_column` moved; the Fold/Read instances are new.
+  - Not fused: the shared expert's GGML Linears still cast x themselves (Linear takes no
+    prequantized input). The MoE output's inject into the residual also stays its own launch: the
+    next block's PLE, the block taps and the layer's workspace scope sit between it and the next
+    mixer. With `--shared-expert-stream` the side stream forks from an event recorded after K1b, so
+    the shared expert still overlaps the routing.
+  - Memory: workspace only. `Forward::hc_fused_read_workspace_bytes` (the second inject, the A8
+    planes and the Op's own workspace at 16 columns, about 127 KiB) is in
+    `ProgramDevicePlan::workspace` through `plan_hc_fused_read_workspace`. The Op's workspace (the
+    mixer's partials and the tickets) is a carve held for the layer, not a scope the Op releases:
+    the routing kernel still uses it after the side stream forks at the event the Op records, and
+    the shared expert's allocations must not reuse it before the join. Works with two lanes, MTP
+    (the drafter's MoE block too) and vision; prefill (more than 16 columns) runs as off.
+  - GPU-session checks: the identity mode above; nsys of a decode step on vs off (three kernels per
+    MLP side, the routing kernel against `projection_fp32`'s 10.2 us at T = 1); tok/s on vs off.
+    Not measured.
+- **The n-gram rows' wait inside the round graph** (`--ngram-flag-wait`; F7c of the Basalt
+  learnings, Basalt's `wait_flag_ge_kernel` in `verify_kernels.cu` and its use in `verify.cpp`).
+  PR 11's split (11c above) runs a round's layers before the PLE layer as one graph, reads the rows
+  on the host, uploads them and launches the rest as a second graph: two launches, and the back's
+  launch waits for the host's read. With the option a single-request plain round and each MTP
+  verification width run as one graph: the front, `wait_flag_sequence` (`src/core/host_flag_wait.h`,
+  core infrastructure beside `upload_pinned`, not an Op: it has no tensor effect; one thread spinning
+  with `__nanosleep(200)` on an `ld.acquire.sys` of a flag in mapped host memory), the rows' copy
+  from the pinned io block (`upload_pinned`, captured), the back and the logits cast. After the
+  launch the host reads the rows into the pinned block (`read_rows`, including a prefill-prefetched
+  call's rows), then raises the flag with a release store, and the device's acquire load orders the
+  copy after the rows. The verification keeps `--mtp-constrained`'s order (the grammar masks are
+  filled after the round is launched and the flag raised) and `--ngram-prefetch`'s (the anchor
+  column's rows are warmed while the drafter runs, before the round).
+  - Sequence numbers: a captured kernel's arguments are fixed, so the wait takes a device counter
+    and wants its next value at each execution (`wait_flag_sequence`). The host raises the flag to
+    the count of round launches, so a flag left at the previous round's value never releases the
+    next one, and the comparison is wrap-aware (`(int32)(flag - want) >= 0`). Every lane's and width's
+    round graph shares the counter; rounds are serialized by the host's per-round synchronization.
+  - Bit-identical by construction: the same kernels on the same inputs in the same stream order;
+    only the host's read moves behind the launch. A round's first run on a lane (and each
+    verification width's) stays eager in two parts (`ngram_rows_in_graph`): the kernels' one-time
+    setup runs outside a capture, and an eager wait could deadlock if any of that setup blocked the
+    host on the stream before it raised the flag. The two-part graphs are then never captured, so
+    `graph_bound` still bounds the executables. `ninfer_host_flag_wait_test` (a flag raised late by a host
+    thread holds back the stream work behind the wait; a flag never raised times out into the error
+    word and the stream continues; a stale flag holds the next call back; one captured wait waits
+    for a new value at each replay; the 2^32 wrap) and the engine gates
+    `ninfer_qwen4_exp_ngram_flag_wait_test` (plain rounds) and `ninfer_qwen4_exp_ngram_flag_wait_mtp_test`
+    (verifications; greedy ids, rounds, drafts and acceptances on vs off, and
+    `Program::process_ngram_flag_rounds`, with MTP `process_ngram_flag_verifications`, must count a
+    one-graph round) have not run yet.
+  - Not applied: a two-lane round (`decode_rows`) keeps its two parts (one graph pair shared by the
+    lanes; a later change could give it the same form), and so does every round with
+    `--no-cuda-graph`, prefill and forced tokens. With `CUDA_LAUNCH_BLOCKING=1` at startup the Program
+    says so once and keeps the two parts: a serialized launch returns only after the wait, so every
+    one-graph round would time out. compute-sanitizer serializes launches the same way and is not
+    detected, so do not run the option under it.
+  - Failure: a wait that sees no flag for 1 s (`kWaitFlagTimeoutNs`, the CPU-miss wait's
+    `kHeartbeatTimeoutNs`) writes `kWaitFlagErrorTimeout` to the Program's mapped error word and the
+    round runs on with rows the host may not have finished. Each round reads the word after its
+    synchronization and before anything reads its outputs; a set word is cleared and the round
+    throws, so the request ends with an error and nothing of the round is committed (decode's catch
+    releases the lane). The word is cleared before each one-graph launch, and a verification reads it
+    before the CPU-miss check can throw, so a set word never fails a later round. The host raises the
+    flag even when its read throws, so the device does not wait out the timeout and the counter
+    and the flag stay in step.
+  - Memory: the 4-byte device counter is `ProgramDevicePlan::ngram_flag_wait`; the flag and the
+    error word (a 64-byte line each, 128 bytes) are pinned and charged to the RAM ledger
+    (`plan_ngram_flag_wait`). The rows use the existing pinned io block. Off allocates nothing (nor,
+    now, does `--cpu-verify-misses` off: its error word was a 1-byte pinned placeholder).
+  - GPU-session checks: with a display attached (WDDM) a kernel spinning past TdrDelay (2 s) resets
+    the driver. A healthy wait is at most the row read (median 0.6 ms, p90 1.2 ms in PR 11) and the
+    timeout is 1 s, so check that a stalled host (a cold SSD read, a paging stall) does not trip it,
+    and how often a round waits at all (the front, two layers, takes ~0.5 ms). Under WDDM the
+    driver may also hold the launch in its command buffer until the next synchronization; nsys
+    should show the front running while the host reads. Measure tok/s on vs off, plain and with MTP.
+    Untested under WDDM. Works with MTP and vision. Not measured.
+- **Prefill CPU share** (`--prefill-cpu-share F`; F9 of the Basalt learnings, Basalt's
+  `--prefill-cpu-share`, default 0.6 there). PR 12's reproduction measured 1,260 tok/s at 1K against
+  2,450 at 8K. With default chunking a 1K-2K prompt is one streamed call (4,096-token calls from 512
+  tokens up), so the 1K figure is bound by the expert stream: its copies of every layer's
+  non-resident experts, two layers ahead, have little compute to hide behind in a short call. Only
+  prompts and tails under 512 tokens (and every call when the cache cannot lend the ring) stage their
+  misses through the MoE's staging kernel. With the option the CPU miss service computes a share of a
+  layer's non-resident experts while the GPU streams or stages and runs the rest. Basalt takes
+  llround(share × n) of a layer's n streamed experts, the candidates (at most 8 rows, a host copy)
+  ordered by (rows, id). Ours takes the same count exactly, (2 × num × n + den) / (2 × den), with F
+  stored as num / den (0.6 is 3 / 5), the fewest-column misses of at most 8 columns first, ties to the
+  lower expert id (job order: jobs are in ascending id).
+  - Static calls (`run_call` with the stream off): the static route stages after routing, on the
+    device, per call; the CPU's jobs are left out of staging by the existing `cpu_flags` path (the
+    stage kernel and the narrow and wide expert kernels skip them).
+  - Streamed calls: the stream decides its copies before the layer routes, so it needs a prior.
+    `ExpertStream::begin` takes a `Share` (num / den and the expert cache's LFRU use counts,
+    `ExpertResidency::use_counts`: every key's global use count, kept by the cache's policy from
+    every routed call, decode and prefill, and seeded by the warm start; the cheapest prior that
+    exists before routing). Per layer `offloaded_moe::select_stream_cold` leaves out round(F × s) of
+    the layer's non-resident experts, s being the number the half-ring would stream, those with the
+    lowest counts (ties to the lower id); they stay -1 in the stream table, so `covers_all()` is
+    false and the call keeps its staging pass. The left-out set already encodes the share, so on a
+    streamed call the Forward sets the channel's share to 1 / 1: the CPU takes every miss (the cold
+    set the call routes, plus any beyond the ring) with at most 8 columns, and the GPU stages only
+    the misses with more (a cold guess the routing gave many rows). Static calls keep the F rule.
+    `Forward::cpu_channels` no longer drops the share while the stream is active.
+  - Design: the same `CpuMissService` as `--cpu-verify-misses`, started for either option, with its
+    buffers sized for the larger use (`plan_cpu_misses`). `MoeCpuChannel` gains `share_num` /
+    `share_den` beside `pcie_divisor`, as two 16-bit words in its tail padding, so the struct size and
+    every kernel's parameter offsets are unchanged; `share_den > 0` selects the share rule in
+    `cpu_plan_kernel`, otherwise the divisor rule, so verification keeps `--cpu-verify-misses`' divisor.
+    `ForwardExperts::prefill_cpu` holds the prefill channels (512 jobs, calls up to the wider of the
+    static chunk and the 4,096-column streamed call, at most `kMaxCpuCallColumns` and the context),
+    narrowed from the same service channel as the verification's. Layer calls run in stream order and
+    each wait precedes the next call's plan, so one request buffer serves both. The order is the
+    verification's: experts without the wait, the shared expert, then `moe_experts_cpu_wait`.
+  - Bit-identical by construction: placement only (the CPU engine equals every GPU placement).
+    Host mirror: `cpu_share_take`, `select_prefill_cpu_jobs` and `select_stream_cold`
+    (`src/ops/offloaded_sparse_moe/cpu_share.h`, in `ninfer_moe_cpu_selection_test`). GPU
+    (`ninfer_offloaded_moe_wide_test`): prefill_cpu_share (shares 3/5, 1/1 and 1/3, staged through 4
+    or 64 slots and zero-copy, T in {1, 16, 65, 300, 600}) and prefill_cpu_share_streamed (a stream
+    table of cache and ring frames with the 3/5 cold set left -1 and the plan share 1/1, 512 experts,
+    T in {1024, 2048}), each
+    eagerly and in two graph replays: outputs against the CPU engine bit for bit, each `MissRequest`
+    against `select_prefill_cpu_jobs` with compacted columns. End to end
+    `ninfer_qwen4_exp_prefill_cpu_share_test` (greedy ids of 300-, 1,024- and 2,048-token prompts with a
+    4 GiB cache equal those without the option, the CPU served at least one expert and a stream left
+    at least one out). None has run yet.
+  - Failure: as for verification, a layer whose wait times out writes the error word; each prefill
+    and forced-token call that handed the service its share checks it after its synchronization and
+    throws (the request ends, the lane is released). Once the service thread has died the Program
+    stops setting `cpu_share` (and the stream stops leaving experts out) and says so once.
+  - Memory: one 4-byte device counter (`ProgramDevicePlan::cpu_misses`, shared with
+    `--cpu-verify-misses`); pinned for the RAM ledger: the request, x for 4,096 columns (20 MiB) and y
+    for 512 jobs of 8 columns (20 MiB), about 40 MiB; pageable for the ledger: the worker team's
+    buffers for 512 jobs (about 14 MiB, `CpuMissPlan::pageable`).
+  - GPU-session checks: tok/s at 300 tokens, 1K and 2K on vs off at shares 0.4-0.8 and 6, 12 and 16
+    workers (`--cpu-verify-workers`; about 100 µs per expert at 6 in PR 11, and a layer may hand the
+    CPU over a hundred); the cost of `cpu_plan_kernel`'s one-CTA x publish at 1-2K columns (a few
+    MiB over PCIe per layer from one CTA, and thread 0 compacts the columns serially); whether
+    leaving experts out of the stream costs more staging (on the SMs, inside the layer) than the CPU
+    saves (the share of routed cold experts with more than 8 columns), and whether the cold-set size
+    F is right for streamed calls (it sets how much the CPU takes there); and the WDDM/TDR check of
+    `--cpu-verify-misses` (a layer's wait here is milliseconds). Works with two lanes, MTP and
+    vision. Not measured.
+- **Relaxed drafting** (`--relaxed-drafting [P]` and the request key `relaxed_drafting`, cross-model;
+  X-C of the Basalt learnings, [serving.md](../serving.md#relaxed-drafting)). **A numerics change:
+  it changes the output distribution**, which is why it is opt-in and why the KLD gate cannot see
+  it (the logits do not change, only which token is emitted). A sampled MTP verification also keeps
+  a draft whose final target probability is at least P; the row's threshold is zeroed for a
+  constrained row, a greedy one and one whose history ends inside `<tool_call>`, and the kernel stops
+  relaxing at the first drafted added token. A round with a threshold runs the Op's relaxed
+  instance and reads back one more spec word (`w_relaxed`, the keep count); without one the exact
+  instance runs and the round is as before. Off, the default instances' SASS is the base kernels'
+  with the 64-byte `SamplingConfig`. Basalt's own measurements (RTX 5090, its models) are in
+  serving.md; nothing has been measured here.
+- **Expert records of the GSQ-RCO IQ3_XXS and IQ3_S packs** (F8 of the Basalt learnings, part 2;
+  no option: new formats only). The packs' published tensor allocations choose a (gate/up, down)
+  pair per layer, gate/up from IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S or IQ4_XS and down Q2_0 or
+  IQ4_NL, mixed across layers. Nine pairs are new record formats (`ggml_rec_iq2_xs_q2_0` ...
+  `ggml_rec_iq4_xs_iq4_nl`, [tensor formats](tensor-formats.md) Section 3.6); the converter picks
+  each layer's from its GGUF types, and offloaded_sparse_moe runs them on the CPU engine (scalar
+  and AVX2), the narrow route (dp4a; `down_kernel` is templated on the down format) and the wide
+  route (int8 MMA).
+  - Numerics: the canonical A8 arithmetic, unchanged; every new decoder gives ggml's reference
+    value exactly as c * m * w. IQ4_XS brings a signed multiplier ls - 32 and |w| up to 127, so
+    the bound of `canonical_ggml.h` is now |P_s| <= 32 * 32 * 127^2 = 16,516,096 < 2^24 (tight,
+    pinned by `extreme_magnitude_records` in `ninfer_offloaded_moe_cpu_test` on both ISAs); MMA and
+    dp4a sums stay below 2^22 and AVX2's byte pairs below 2^15. The existing formats' kernels
+    compile to the base commit's SASS (all 50 narrow kernels and the 6 wide ones: the plan, the
+    input cast, IQ2_XXS/IQ2_S/IQ1_M gate/up and the Q2_0 down).
+  - Memory: frames are sized by the largest record stride of the artifact (`frame_stride`), so the
+    same frame budget holds fewer frames: 2,662,400 bytes for the IQ3_S pack (its one IQ4_XS layer)
+    and 2,329,600 for the IQ3_XXS pack, against 1,510,400 for the IQ2_XS pack.
+  - The wide route's gate/up units of IQ3_XXS, IQ3_S and IQ4_XS do not stage their 64-row slice in
+    shared memory (62,720-87,040 bytes beside the tiles' 47,360 exceed the 101,376-byte limit):
+    their decodes read the record where it lives, so a job's later 64-column tiles re-read it (from
+    L2 for a device frame or staging slot, over PCIe for a zero-copy host record). The narrow
+    route stages them as before (IQ4_XS gate/up: 67,584 bytes of shared memory at 8 columns, one
+    CTA per SM).
+  - Not yet loadable: the dense, head and embedding formats are the next item; the larger expert
+    banks still need partial residency to fit host RAM (`--partial-ram-residency`).
+  - GPU-session checks: `ninfer_offloaded_moe_layer_test` and `ninfer_offloaded_moe_wide_test`
+    (every record format bitwise against the CPU engine; compiled, not run), the bench rows of the
+    new formats (`ninfer_offloaded_moe_bench`), and whether the wide route's unstaged IQ3/IQ4 slices
+    want a split staging scheme.
+- **Dense, head and embedding formats of the GSQ-RCO IQ3_XXS and IQ3_S packs** (F8, part 2b; no
+  option: new formats and new registered problems only). From the packs' published tensor
+  allocations: their dense projections are IQ4_XS, IQ3_S, Q6_K, Q5_K or Q4_K per layer (the
+  shared-expert down IQ4_NL, Q8_0 or Q2_0), the output head Q6_K (IQ3_S pack) or Q5_K (IQ3_XXS
+  pack) and the token embedding IQ4_XS or IQ3_S. New block formats `ggml_q4_k` and `ggml_q5_k`
+  ([tensor formats](tensor-formats.md) Section 3.5, ggml's goldens); the GGML linear registry
+  (`ggml_shapes.h`) takes every (format, shape) of the three packs, `linear_pair` every ordered
+  pair of IQ4_XS, IQ3_S, Q6_K, Q5_K and Q4_K, projection_fp32's GGML head IQ4_XS, Q6_K and Q5_K,
+  and `ops::embedding` IQ3_S rows. `ninfer_ggml_linear_registry_test` mirrors the packs' tables.
+  - Numerics: Q4_K and Q5_K are affine (d sc q - dmin m per 32 values). Both routes add the
+    sub-block's offset term -dmin m * xm with xm = xd * float(sum of the group's Q8_1 codes) after
+    its scale term (llama.cpp's `vec_dot_q4_K_q8_1` form), so the result is still the contract's
+    dequantized weight times the cast activation, under the same FP64 criterion; the wide route
+    applies a K tile's four offset terms after its four scale terms. A bit-exact host emulation
+    (`tests/ops/ggml_linear_emulation.h`) meets the criterion and the FP32 accumulation bound at
+    every registered Q4_K/Q5_K problem, also on rows built to cancel; the GPU suite compares the
+    device with it bit for bit (compiled, not run).
+  - Kernels: 212 new linear, pair and head instances (Q4_K and Q5_K 34 each, 128 pair kernels, 16
+    head kernels) and one embedding kernel; the existing 356 kernels of these objects (and the
+    expert routes') compile to the base commit's SASS, encodings included. The pair instances
+    build in one translation unit per first format (the slowest 60 s, the old single unit 105 s).
+  - `--hot-embedding-rows` stays IQ4_XS only (`embedding_split`) and is refused at startup for
+    the IQ3_XXS pack's IQ3_S embedding.
+  - Loading an IQ3 pack now needs only `--partial-ram-residency` on a 64 GB box (its
+    banks do not fit host RAM whole).
+  - GPU-session checks: `ninfer_linear_ggml_test` (new formats, shapes and pairs, Q4_K/Q5_K bit for
+    bit against the emulation), `ninfer_linear_ggml_device_decode_test`,
+    `ninfer_projection_fp32_test` (Q6_K and Q5_K heads) and `ninfer_embedding_test` (IQ3_S); the
+    decode and prefill speed of the K-quant projections is unmeasured.
+- **Partial RAM residency** (`--partial-ram-residency`, F8 part 3; Basalt's resident RAM mode,
+  `expert_source.hpp`). Host RAM holds only the routed experts the VRAM cache does not, plus
+  spares, instead of every bank pinned whole.
+  - Load: the text banks are bound `Residency::File` (not materialized). The startup VRAM check
+    runs before the RAM ledger; `plan_partial_ram` takes its frame count, less a 512 MiB margin, as
+    the experts read straight from the file into frames (the saved state's ranking, else every
+    layer in turn), which then live only in VRAM. Every other expert gets a pinned RAM slot of its
+    layer's stride: layer l has min(E, E - N_l + 16) slots, so (E_total - vram_frames + spares) *
+    stride with one stride. The Program refuses when its cache comes out smaller than the plan.
+  - Runtime (`program/ram_slots.h`, `ExpertResidency::PartialSetup`): every expert has a valid copy
+    in a published frame, a RAM slot or both. A promotion copies from the slot and keeps it (the
+    pool is fixed, so the copy costs no RAM and a later eviction needs no copy). The LFRU's eviction
+    gate lets an expert held only in VRAM leave only when its layer has a slot for it: a free one,
+    else one reclaimed from the layer's best-scoring VRAM resident with a copy (which then lives
+    only in VRAM). The victim is the lowest-scoring resident the gate approves (refused ones are
+    skipped for the step), so a layer whose slots are spent does not stop admissions elsewhere; the
+    gate makes admission the budgeted one-victim loop even when the budget covers every miss. The
+    controller emits `kWriteBack` and holds the frame (`complete_writeback` frees it); the device
+    table keeps the frame until the device-to-host copy lands, then names the slot. Loads read slots
+    on the same copy stream after any write-back into them; a landed load of a key whose write-back
+    event was read not ready publishes the write-backs again first. `plan_swap` checks each round's
+    write-backs against the evictions and refuses an admission without a RAM copy.
+  - The Op: `MoeExpertSource::host_slots` makes `host_records` a device table of per-expert
+    addresses, read by the stage kernel only (a call with host slots must stage), so the expert
+    kernels keep the base commit's SASS (88 of 89 narrow-route kernels and all 11 wide ones
+    identical; `stage_kernel` differs). The CPU miss service reads `CpuMissService::Layer::slots`.
+    The GPU hands the CPU only experts whose frame is -1, and each of those has a RAM copy, so
+    `--cpu-verify-misses` and `--prefill-cpu-share` work unchanged (static prefill calls only).
+  - Refused or off: `--vision` (images use lent frames), a KV base (`kv_base_tokens`: the whole KV
+    is mapped at startup, so the elastic KV never takes frames), the VRAM monitor's resizing, frame
+    lending and so the expert stream (wide prefill calls fall back to static calls). Each of these
+    would evict without a round in which to write VRAM-only experts back; supporting lending needs
+    RAM homes for the lent run (Basalt keeps the lent slots' experts in RAM). `ExpertStream::Bank`
+    is left unchanged (a deliberate deviation from the task's plan): the stream never runs in this
+    mode, so a slot table there would be dead code until lending exists.
+  - Windows: Basalt's `docs/platforms.md` reports WDDM capping page-lock registration
+    (`cudaHostRegister`) at RAM/2 - 8 GiB. NInfer pins with `cudaHostAlloc`, and full mode pins
+    about 35 GiB on the 64 GB Windows box (the README's preview), above that cap; so the cap is a
+    startup warning naming the largest `--vram-headroom-mib` or the `--expert-cache-mib` that stays
+    under it, and a failed pin of the slot pool is a startup error naming `--vram-headroom-mib` and
+    `--partial-ram-residency`. The startup placement's bounce (2 x 16 records) is a planned later pin.
+  - GPU-session checks: `ninfer_qwen4_exp_partial_ram_residency_test` (greedy ids against full
+    mode on a 4 GiB cache, at least one promotion copied from a slot a write-back filled) and
+    `ninfer_qwen4_exp_partial_ram_residency_cpu_test` (the same with MTP statistics and
+    `--cpu-verify-misses`, which must serve an expert), the host-slot
+    placements of `ninfer_offloaded_moe_layer_test` and `ninfer_offloaded_moe_wide_test`; a Windows
+    start of the IQ3_XXS pack on 64 GB. Not measured: decode with write-backs, startup time.
+- **Int8 tensor-core GEMV for the dense GGML linears** (`--ggml-decode-mma`; F6 of the Basalt
+  learnings, Basalt's `dense_tc`). Issue #383 put the dp4a decode route's IQ3_S at about 42% of
+  bandwidth (about nine sub-word global loads per 32 values), with T = 8 at 30.9 us against 20.2 us
+  at T = 1.
+  With the option the Forward runs every GGML dense Linear whose policy admits A8 under
+  `ops::LinearPolicy::AllowA8GgmlDecodeMma` (the text model's and the drafter's), and calls of at
+  most 8 columns take `src/ops/linear/ggml/ggml_mma_decode.cuh`: persistent CTAs of 8 warps over
+  16-row tiles; each tile's 256-value chunks (16 rows) stream through a ring of 3 shared-memory slots
+  by 16-byte `cp.async`, issued two chunks ahead across tiles; the activation's Q8_1 cast is made
+  in shared memory by the same canonical cast as the dp4a route; warp w takes sub-block w of each
+  chunk and runs one `mma.sync.m16n8k32.s8` for its 16 rows by 8 columns (two `m16n8k16` for Q6_K's
+  16-value scales); IQ3_S is decoded from shared memory (grid and codes). Every dense format of the
+  packs: IQ4_XS, IQ3_S, Q6_K, Q5_K, Q4_K, IQ4_NL, Q8_0, Q2_0 (Basalt's Q3_K has no registered
+  problem here). The output heads (`projection_fp32`), `linear_pair` and the wide route are
+  unchanged; under the option the two-projection pairs (shared-expert gate/up, attention key/value)
+  run as two Linears.
+  - **Numerics change (order only).** The same A8 cast and the same exact integer products per 32
+    values; each sub-block's term is `fma(c * d, float(P), partial[s % 32])` (plus the affine
+    K-quants' offset term `fma(c_min * d, float(-m_min A), ...)`), the 32 lane partials reduced by a
+    fixed butterfly (`ggml_mma_emulation.h`, canonical_ggml.h's order), so the FP32 rounding differs
+    from the dp4a route's while a column's bits still do not depend on T or its position (verify
+    and two-lane columns stay those of a one-column call). Judge it with the decode-path KLD gate
+    (on vs off); there is no identity gate.
+  - Off: every existing GGML kernel compiles to the same SASS as before (the new instances live in
+    their own translation unit, `ggml_mma_decode.cu`), and the dispatch picks the dp4a route as before.
+  - Qualification: `ninfer_ggml_mma_emulation_test` (host only: the exact sub-block decode against
+    ggml's values on the golden fixtures and random blocks, every registered problem against FP64
+    within the GGML suite's criterion, the kernel's tile order equal to the row order bit for bit at
+    T = 1..8 in every column position, and the int32 range of the MMA sums on extreme blocks);
+    `ninfer_linear_ggml_test` (GPU, not run: every registered Linear and LinearAdd problem at
+    T = 1..8 bit for bit against the emulation and within FP64, T = 9 equal to AllowA8's wide route,
+    the policy's admission).
+  - Memory: none (no workspace; up to about 74 KiB of shared memory per CTA, Q5_K at K = 6144 and
+    T = 8).
+  - GPU-session checks: `ninfer_linear_ggml_test`; the KLD gate on vs off (the harness flag
+    `--ggml-decode-mma`); each dense shape's time at T = 1, 2, 4, 8 against the dp4a route
+    (`ninfer_linear_ggml_test --time`, IQ3_S above all); that the served decode runs
+    `ggml_mma_decode_kernel` (nsys); tok/s on vs off with and without MTP.
+    Basalt estimates 0.3-0.5 ms per token plus a flatter verify. Designed to work with two lanes,
+    MTP and `--partial-ram-residency`. Not measured.
+
+### Verification status
+
+Every item below is compiled for sm_86 and covered by the CPU tests, and none has run on a GPU: each
+is **compiled, CPU-tested, GPU-unverified**. `tools/bench/basalt_gpu_verify.ps1` (Windows, under the
+GPU lock) or `.sh` (the Linux box) runs every GPU check in one go from
+`tools/bench/basalt_options.json`;
+[tools/bench/README.md](../../tools/bench/README.md#verifying-the-basalt-options-on-a-gpu) says how.
+Kinds: identity = designed bit for bit unchanged, quality = numerics or the output distribution
+change, speed = timing or scheduling only, serving = a server feature. The checks named are the
+script's step ids, and the Item column is the issue #383 item (`F<n>`: Flash-Next item n, with the
+issue's sub-items lettered in order; `X-<letter>`: the cross-model items; `S<n>`: the serving and
+process items in the issue's order, S1 the soak harness to S8 the process checks); every option also
+has its targeted GPU tests (`tests:<model>`) and, where it has a workload, an ABBA A/B at n = 12
+(`ab:<flag>`). For an identity option the Flash-Next A/B also compares outputs across all 24
+processes, on and off: each job's FNV hash of its greedy ids (the warm-up job and the measured one)
+and, with MTP, each job's line of MTP rounds, plain steps, drafts and accepted drafts
+(`print_speculation`) must be the same in every run. The 27B A/B with greedy sampling compares the
+answers' text, off against on, per repetition.
+
+Flash-Next options (Qwen3.8-Flash-Next):
+
+| Option | Item | Kind | Checks besides its GPU tests and A/B |
+|---|---|---|---|
+| `--ngram-keepalive-ms N` (default 40, was a fixed 100) | F7a | speed | none scripted: TTFT after an idle pause |
+| `--shared-expert-stream` | F4a | identity | `identity:` forward harness, eager and in graphs |
+| `--mtp-constrained` | F2 | identity | `ninfer_qwen4_exp_mtp_constrained_test`; no speed workload |
+| `--mtp-joint-acceptance` | F3 | identity | `identity:` engine `--mtp-exact 3 --mtp-joint-acceptance` |
+| `--ngram-prefetch` | F7b | identity | the A/B: every job's greedy-id hash and MTP rounds, drafts and acceptances equal in all 24 runs |
+| `--default-expert-state FILE` | F10a | speed | `default-expert-state`: export, then a fresh start from it |
+| `--hot-embedding-rows N` | F10b | identity | `ninfer_qwen4_exp_hot_embedding_test` |
+| `--gdn-head-map` | F5 | identity | `identity:` forward harness; `ninfer_qwen4_exp_gdn_head_map_test` |
+| `--moe-precast-input` | F4b | identity | `identity:` forward harness; `ninfer_qwen4_exp_moe_precast_test` |
+| `--moe-gate-up-registers` | F4c | identity | `identity:` forward harness; its engine test (capture-safe occupancy query) |
+| `--moe-fused-route` | F4d | identity | `identity:` forward harness; `ninfer_qwen4_exp_moe_fused_route_test` |
+| `--cpu-verify-misses` | F4e | identity | `ninfer_qwen4_exp_cpu_verify_misses_test` |
+| `--cpu-verify-workers N` | F4e | speed | A/B 6 against 12 workers |
+| `--prefill-cpu-share F` | F9 | identity | `ninfer_qwen4_exp_prefill_cpu_share_test`; A/B sweep F = 0.2, 0.4, 0.6 on a 2K prompt |
+| `--gdn-async-commit` | F10c | identity | `ninfer_qwen4_exp_gdn_async_commit_test` |
+| `--hc-int8` | F1 | quality | `kld:hc-int8-20`, `-100` against `kld:off-*`; `identity:` prefill bit-exact |
+| `--hc-fused-read` | F10d | identity | `identity:` forward harness, plain and side stream (against `--hc-int8`) |
+| `--ngram-flag-wait` | F7c | identity | `ninfer_qwen4_exp_ngram_flag_wait_test` and `_mtp_test` |
+| `--partial-ram-residency` | F8 | identity | both engine gates; `partial-start` (Windows page-lock warning, pinning) |
+| `--ggml-decode-mma` | F6 | quality | `kld:ggml-decode-mma-*`; `ggml-mma:timing` per shape; `ggml-mma:policy` (nsys) |
+
+Qwen3.8-27B (and Qwen3.6-35B-A3B) and cross-model options:
+
+| Option | Item | Kind | Checks besides its GPU tests and A/B |
+|---|---|---|---|
+| `--relaxed-drafting [P]` (and the `relaxed_drafting` request key) | X-C | quality | `relaxed-startup:` every model (added ids contiguous); A/B at temperature 0.7 reports acceptance; `greedy-master:` for the 64-byte `SamplingConfig` |
+| `--draft-context-rows N` | X-D | identity | `ninfer_qwen3_5_context_rows_real_test` on the 27B (MTP, DFlash2) and the 35B (MTP); the A/B's greedy answer texts equal, off against on, in every repetition |
+| `--admission-affinity` | S7 | speed | `serve-soak`: overtakes under 4 requests on one lane |
+| `--allowed-host NAME` (Host, Origin and Sec-Fetch-Site checks) | S3 | serving | `serve-smoke` |
+| `--config FILE` | S6 | serving | `serve-smoke`; `launchers:` (the profiles are config files) |
+
+Other items: the decode-path KLD gate (X-A: `ninfer-perplexity --kld-base` is
+`kld-qwen35:w1`/`w3`, and the forward harness's `kld:off-20-w1` must equal window 3's rows);
+unpinned CPU expert workers (F10e: no option, covered by the Flash-Next tests and A/Bs);
+`GET /slots` and `GET /dashboard` (S4, S5: `serve-smoke`, and the dashboard still needs a look in a
+browser at desktop and phone width); the GPU power limit in bench rows and the community preset
+(S2: `community-preset`); the soak harness (S1: `serve-soak`, its first real run); the stderr
+ratchet and the greedy-identity tool (S8: CPU-only, run by ctest; the tool's two-build mode is
+`greedy-master:`); the IQ2_XS/IQ3_XXS/IQ3_S formats and the IQ3 packs (F8: `iq3:`, and
+`converter-pytests`, which needs torch). The two-stage head (X-B) was tried and dropped; see
+[quality-trade experiments](quality-trade-experiments.md).
+
 ## Artifact decisions
 
 Taken in PR 1 and revised in PR 2b, which aligned the artifact with Infernix (the model code and
@@ -534,7 +1368,8 @@ expert cache are lifted from it in PRs 7-9).
 - **Expert banks (PR 2b).** Each layer's routed experts are one parameter
   `text/layers/L/moe/experts` of shape `[512, 2560, 640]` in `ggml_expert_record_v1`: one record
   per expert holding its gate, up and down blocks, in one of three record formats
-  (`ggml_rec_iq2_s_q2_0`, `ggml_rec_iq2_xxs_q2_0`, `ggml_rec_iq1_m_q2_0`). Infernix's frame pool,
+  (`ggml_rec_iq2_s_q2_0`, `ggml_rec_iq2_xxs_q2_0`, `ggml_rec_iq1_m_q2_0`; the IQ3 packs use nine
+  more, [tensor formats](tensor-formats.md) Section 3.6). Infernix's frame pool,
   residency table, staging and CPU jobs treat an expert as one opaque record with one
   `record_stride`; packing records on the host at load would be runtime repacking, so the converter
   writes them. Records are 1,510,400 / 1,305,600 / 1,177,600 bytes, back to back: the stride is
@@ -586,26 +1421,27 @@ Infernix is Apache-2.0; each adapted file carries the notice the spec's licensin
 | `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` | `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` (`398cf2cc`) | Route, dispatch, staging, CPU plan/wait and combine kept; narrow kernels rewritten for GGML sub-blocks |
 | `src/ops/offloaded_sparse_moe/cuda/wide_expert.{h,cu}` (PR 10) | `src/ops/offloaded_sparse_moe/cuda/wide_expert.{h,cu}` (`17681db5`) | The plan kernel (tiles per pass) kept; the GEMMs are new: exact int8 `mma.sync` over decoded GGML codes in the canonical leaf order, cp.async instead of TMA/mbarrier, the A8 cast of h fused into gate/up |
 | `src/models/qwen4_exp/execution/expert_stream.{h,cpp}` (PR 10) | `src/models/qwen4_exp/execution/expert_stream.{h,cpp}` | The ring is lent frames, published as per-layer frame tables (no `prefetched` source); 2-D run copies; no gated chunks or SSD holds |
-| `include/ninfer/ops/hyper_connection.h` | `include/infernix/ops/hyper_connection.h` | FP32 multiplier norm weight; no Q8 weight form |
-| `src/ops/hyper_connection/hyper_connection.cu` | `src/ops/hyper_connection/hyper_connection.cu` | BF16 weights only |
-| `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | Grids re-fitted to 82 SMs |
+| `include/ninfer/ops/hyper_connection.h` | `include/infernix/ops/hyper_connection.h` | FP32 multiplier norm weight; Infernix's Q8 weight form dropped, Basalt's int8 copies (`--hc-int8`) in its place |
+| `src/ops/hyper_connection/hyper_connection.cu` | `src/ops/hyper_connection/hyper_connection.cu` | BF16 weights; the int8 form's composed route rounds its copies to BF16 |
+| `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | `src/ops/hyper_connection/hyper_connection_mix_fused.{h,cu}` | Grids re-fitted to 82 SMs; an int8 codec instance of K1a (`--hc-int8`) |
 | `include/ninfer/ops/ple.h`, `src/ops/ple/ple.cu` | `include/infernix/ops/ple.h`, `src/ops/ple/ple.cu` | IQ4_NL `ple_embed`; FP32 multiplier norms; FP32 `[K, C]` conv weight (the F16 taps widened) |
 | `include/ninfer/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` | `include/infernix/ops/projection_fp32.h`, `src/ops/projection_fp32/projection_fp32.cu` | BF16 segment form plus a GGML IQ4_XS head |
 | `include/ninfer/ops/rows.h`, `src/ops/rows/rows.cu` | `include/infernix/ops/rows.h`, `src/ops/rows/rows.cu` | Verbatim |
 | `tests/ops/test_hyper_connection.cpp`, `test_projection_fp32.cpp`, `test_rows.cpp` | `tests/ops/test_hyper_connection.cpp`, `tests/ops/linear/test_projection_fp32.cpp`, `tests/ops/test_rows.cpp` | Ported with their Ops |
 | `src/core/read_only_file{.h,_win32.cpp,_posix.cpp}` | `src/core/read_only_file*` | Unbuffered reads only (no mapping); each `read_direct` waits on its own event |
 | `src/models/qwen4_exp/config.{h,cpp}` | `src/models/qwen4_exp/config.{h,cpp}` | IQ4_NL volume rows; no load options, MTP or YaRN; the vision config is Qwen3.5's (PR 14) |
-| `src/models/qwen4_exp/frontend/ngram_hash.{h,cpp}` | same path | Verbatim |
+| `src/models/qwen4_exp/frontend/ngram_hash.{h,cpp}` | same path | Verbatim, plus `ngram_size()` and `eos_token_id()` accessors |
 | `src/models/qwen4_exp/weights.h`, `model.h`, `load.cpp` | `weights.h`, `model.h`, `load.{h,cpp}` | GGUF-mirroring parameters; record banks with no scales |
 | `src/models/qwen4_exp/execution/parameters.{h,cpp}` | same path | One Linear per GGUF tensor |
 | `src/models/qwen4_exp/execution/forward.{h,cpp}` | same path | One sequence; NInfer's single-sequence QSA Ops; interleaved query/gate rows; tiled GDN heads |
 | `src/models/qwen4_exp/program/ngram_volume.{h,cpp}` | same path | Version 2 volume; keep-alive after Strata's PLE reader |
+| `src/models/qwen4_exp/program/ngram_rows.h` | Program's inline row-id code | NInfer's; one pure function for the row read and the prefetch |
 | `tests/models/qwen4_exp/test_{ngram_hash,ngram_volume,forward_real}.cpp`, `tests/fixtures/qwen4_exp/ngram_rows.txt` | same paths (`forward_real` with `45f20fb9`'s taps) | One sequence; INT8 KV built directly; timed decode |
 | `tools/flash_next/{ngram,reference,block_check,strata_compare}.py` | same paths | The reference reads the `.ninfer` through the exact GGML decoders, with the canonical A8 cast |
 | `src/core/{vmm_arena.{h,cu},cuda_vmm.h,vram_budget.{h,cpp},copy_batch.{h,cpp},link_probe.{h,cpp},power_throttling.{h,cpp}}` | same paths | Namespace; `CopyBatch` takes CUDA 12.8's `cudaMemcpyBatchAsync` form and falls back to single copies; a `cuMemSetAccess` that WDDM cannot make resident (`CUDA_ERROR_NOT_READY`) is a refusal, like an out-of-memory `cuMemCreate` (PR 12) |
 | `src/core/host_memory.{h,cpp}` | same path | The snapshot and working-set reserve only |
 | `src/core/pinned_upload.{h,cu}` | `src/core/device.{h,cu}` (`upload_pinned`) | Own translation unit |
-| `src/models/qwen4_exp/memory_plan.{h,cpp}` | same path | Full RAM mode only (fits or refuses; no SSD tier, no `--expert-ram-mib`); the VRAM sizing and control law unchanged; `kv_growth_frames` is `grow_kv`'s arithmetic as a pure function (PR 12) |
+| `src/models/qwen4_exp/memory_plan.{h,cpp}` | same path | Full RAM mode (fits or refuses; no SSD tier, no `--expert-ram-mib`), or NInfer's partial RAM residency (`plan_partial_ram`); the VRAM sizing and control law unchanged; `kv_growth_frames` is `grow_kv`'s arithmetic as a pure function (PR 12) |
 | `src/models/qwen4_exp/program/expert_cache/expert_{cache,state}.{h,cpp}` | same paths | Verbatim but for `lend` reporting the keys it evicts (PR 12) |
 | `src/models/qwen4_exp/program/expert_residency.{h,cpp}` | same path | Per-layer record strides in one frame size; no SSD tier or landing; frame lending (PR 10) whose give-back restores the displaced experts first (PR 12); a grow refills its new frames by score |
 | `src/models/qwen4_exp/program/vram_monitor.{h,cpp}` | same path | Verbatim |

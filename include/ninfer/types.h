@@ -55,6 +55,19 @@ enum class EnginePurpose : std::uint8_t {
     CausalScoring,
 };
 
+// Widest teacher-forced decode window a CausalScoring Engine can plan (the verify domain).
+inline constexpr std::uint32_t kMaximumScoringDecodeWindow = 16;
+
+// How Engine::score_tokens runs a window. Prefill scores every target from one prefill pass (the
+// original route). Decode prefills positions [0, first_target - 1) and feeds the rest through the
+// decode path, `window` tokens per forward: window 1 is the ordinary decode step, a wider window
+// the speculative verify forward with every live column committed. window is in
+// [1,kMaximumScoringDecodeWindow] and, for Decode, at most EngineOptions::scoring_decode_window.
+struct ScoringOptions {
+    enum class Phase : std::uint8_t { Prefill, Decode } phase = Phase::Prefill;
+    int window = 1;
+};
+
 enum class KvCapacityMode : std::uint8_t {
     Explicit,
     Automatic,
@@ -74,6 +87,9 @@ inline constexpr std::uint32_t kMaximumPrefillYieldRemainingMs = 3'600'000;
 inline constexpr std::uint32_t kMaximumPrefillDecodeSharePercent = 90;
 // PrefillScheduleOptions::layer_slices: more slices than this leaves a few layers per slice.
 inline constexpr std::uint32_t kMaximumPrefillLayerSlices = 16;
+// FlashNextOptions::ngram_keepalive_ms: keep-alive reads run for this long after the last request,
+// and the period between them is at most this (a longer one would never fire).
+inline constexpr std::uint32_t kNgramKeepaliveWindowMs = 60'000;
 
 struct KvCapacityPolicy {
     KvCapacityMode mode                  = KvCapacityMode::Explicit;
@@ -445,12 +461,22 @@ struct GraftSource {
 struct FlashNextOptions {
     // The per-layer n-gram embedding volume. Empty uses `<artifact>.ngram`.
     std::filesystem::path ngram_volume_path;
+    // Milliseconds of volume idleness after which one 4 KiB block is read to keep the drive from
+    // sleeping (SSDs drop into a slow power state after about 100 ms idle), for a minute after the
+    // last request; 0 turns the keep-alive off. Changes timing only, never the output.
+    std::uint32_t ngram_keepalive_ms = 40;
     // The VRAM expert cache's saved state: read at startup to fill the cache with the experts the
     // last session used most (warm start), written at shutdown and between requests every 10
     // minutes. Empty uses `<artifact>.expert-state`; `save_expert_state = false` neither reads nor
     // writes it.
     std::filesystem::path expert_state_path;
     bool save_expert_state = true;
+    // A default expert state shipped beside the model, for a fresh install: read (never written)
+    // only when the saved state above is missing or belongs to another artifact, and accepted for
+    // any copy of the artifact because its identity is the artifact id. Empty uses
+    // `<artifact>.expert-state.default`; no such file ships yet, and a missing one changes nothing.
+    // `save_expert_state = false` reads it no more than the saved state.
+    std::filesystem::path default_expert_state_path;
     // Device memory the expert cache leaves free for the display and other programs once every
     // fixed allocation is made. Empty: 512 MiB with a display attached, 256 MiB headless.
     std::optional<std::uint64_t> vram_headroom_bytes;
@@ -459,6 +485,14 @@ struct FlashNextOptions {
     // Physical Host memory left free for Windows and other programs once every expert is pinned;
     // startup refuses when it cannot be kept.
     std::uint64_t ram_headroom_bytes = 2ULL << 30;
+    // Keep only the routed experts the VRAM expert cache does not hold in host RAM, plus spare slots
+    // (--partial-ram-residency), instead of pinning every expert: the hottest are read from the
+    // artifact straight into VRAM and live only there, and an expert evicted from VRAM is first
+    // copied back into a RAM slot. Lets packs whose experts exceed RAM load (the IQ3 packs on 64 GB).
+    // The same outputs, bit for bit. The expert cache keeps its startup size (no VRAM monitor), the
+    // whole KV is mapped at startup, and prefill runs without the expert stream (slower long
+    // prompts). Off: every expert is pinned, or startup refuses.
+    bool partial_ram_residency = false;
     // Tokens of KV backed at startup; requests needing more borrow it from the expert cache (0:
     // 32,768). Measurement and tests.
     std::uint32_t kv_base_tokens = 0;
@@ -466,6 +500,104 @@ struct FlashNextOptions {
     // relative to a plain round, and a measurement mode that always drafts --draft-tokens.
     double mtp_width_cost = 0.38;
     bool mtp_fixed_drafts = false;
+    // Keep MTP speculation on for constrained requests (JSON schema, grammar, tool calls) with one
+    // grammar mask per verified position, as the Qwen3.5 path does (--mtp-constrained; needs
+    // --spec mtp). Off: a constrained request decodes plain rounds.
+    bool mtp_constrained = false;
+    // Basalt's joint-acceptance draft length (--mtp-joint-acceptance; needs --spec mtp): each round
+    // drafts --draft-tokens and verifies the longest prefix whose estimated chance of being accepted
+    // whole, from each draft's probability, stays above a per-request adaptive threshold. Off: the
+    // acceptance-estimate policy picks the count before drafting.
+    bool mtp_joint_acceptance = false;
+    // Read the anchor column's n-gram rows into the volume's host cache while the draft graph runs
+    // (--ngram-prefetch; needs --spec mtp), so verification's row read finds them cached. The rows
+    // and the output are unchanged; only when the host reads them moves. Off: verification reads
+    // them all.
+    bool ngram_prefetch = false;
+    // Run each MoE block's shared expert on a second CUDA stream beside the routed experts (high
+    // priority in eager calls; graph replays ignore it), joined before they are combined
+    // (--shared-expert-stream). Designed to give the same outputs, bit for bit (not yet checked on
+    // a GPU); the workspace grows by the shared expert's Linear scratch at its widest call.
+    bool shared_expert_stream = false;
+    // Keep only the token embedding's first N rows (the lowest ids, the most frequent tokens) in VRAM
+    // (--hot-embedding-rows N; Basalt keeps 8192): the whole table moves to the pinned host block,
+    // the GPU reads the other rows from it over PCIe, and the device memory saved (about 311 MiB at
+    // 8192) goes to the expert cache. The same embedding values, bit for bit. 0: the table stays in
+    // VRAM. At most the vocabulary.
+    std::uint32_t hot_embedding_rows = 0;
+    // Read the GatedDeltaNet's 16 key heads for its 48 value heads in place, through the GGUF's tiled
+    // head map (value head h reads key head h % 16), instead of copying them to one key head per value
+    // head first (--gdn-head-map): 216 copies a decode token fewer, and MTP's GDN replay records hold
+    // a third of the key heads. The same output, bit for bit.
+    bool gdn_head_map = false;
+    // Cast each routed-expert call's input to A8 once (--moe-precast-input) instead of in every one
+    // of its gate/up thread blocks (40 per expert): the same codes, so the same output bit for bit;
+    // the call's workspace grows by about 2.8 KiB a column.
+    bool moe_precast_input = false;
+    // Compute the routed experts' gate/up rows from registers (--moe-gate-up-registers): a grid that
+    // stays resident loops over the rows, a warp loads one gate and one up row straight into
+    // registers and splits their last sub-blocks across its two half-warps. The same arithmetic in
+    // the same order, so the same output bit for bit. Reads the precast input, so it requires
+    // moe_precast_input.
+    bool moe_gate_up_registers = false;
+    // Route and dispatch the routed experts of a call of at most 8 columns (decode, MTP rounds) in
+    // one launch instead of two (--moe-fused-route), with each expert's columns in a fixed order. The
+    // same routing and the same output, bit for bit.
+    bool moe_fused_route = false;
+    // Compute some of each MTP verification round's non-resident routed experts on the CPU
+    // (--cpu-verify-misses; needs --spec mtp): per layer up to 4 misses, the fewest-column ones,
+    // a third of them left on the GPU, computed by a worker team of cpu_verify_workers threads
+    // (--cpu-verify-workers, 1..64) while the GPU runs the other experts and the shared expert,
+    // instead of reading them over PCIe. The CPU's arithmetic equals the GPU's bit for bit, so the
+    // same output. Plain decode and prefill are unchanged. cpu_verify_workers also sizes the team
+    // of prefill_cpu_share (one CPU miss service serves both).
+    bool cpu_verify_misses           = false;
+    std::uint32_t cpu_verify_workers = 6;
+    // In prefill and forced-token calls (--prefill-cpu-share F), of each layer's n non-resident
+    // routed experts, round(F * n) (halves up), the ones with the fewest columns first and none of
+    // more than 8, are computed by the CPU miss service's cpu_verify_workers threads while the GPU
+    // stages and runs the others, instead of reading them over PCIe. A call that streams its experts
+    // ahead of time (512 tokens or more) instead leaves the share F of each layer's experts with the
+    // lowest expert-cache use counts out of the stream, and the CPU computes every one of those misses
+    // with at most 8 columns. F = num / den in [0, 1];
+    // num 0 (the default) is off; Basalt's default 0.6 is 3 / 5. The CPU's arithmetic equals the
+    // GPU's bit for bit, so the same output. den is at most 32767.
+    struct Fraction {
+        std::uint32_t num = 0;
+        std::uint32_t den = 1;
+    };
+    Fraction prefill_cpu_share{};
+    // Run an MTP verification commit's GDN replay fold (the accepted columns folded into the
+    // recurrent state) on a stream of its own (--gdn-async-commit; needs --spec mtp), beside the
+    // drafter's catch-up and next drafts and the host's work; the next round's forward waits for it.
+    // A commit that ends the request folds before the round is reported. The same state, bit for bit.
+    bool gdn_async_commit = false;
+    // Int8 copies of every hyper-connection mixer's matrices (--hc-int8), made at startup from the
+    // BF16 weights with one binary16 scale per 32 values; mixer calls of up to 16 columns (decode,
+    // MTP drafts and verification, and prefill calls that short) read them, about 0.53x the bytes
+    // per call; calls of more than 16 columns keep the BF16 weights, bit for bit. CHANGES THE
+    // NUMERICS (the weights are rounded); the BF16 weights stay loaded, so it costs about 0.68 GB
+    // of VRAM (fewer expert frames). Off: BF16.
+    bool hc_int8 = false;
+    // One fused read per decode-width routed-expert block input (--hc-fused-read; requires hc_int8):
+    // the attention block's inject, the int8 mixer, the router with its top-10 and dispatch, and the
+    // A8 cast of the mixer's output in three launches instead of five to seven. Bitwise the outputs
+    // of hc_int8 alone. Off: the separate Ops.
+    bool hc_fused_read = false;
+    // Run a single-request decode round (and an MTP verification) as one CUDA graph instead of two
+    // around the n-gram row read (--ngram-flag-wait): a one-thread kernel before the PLE layer spins
+    // on a flag in mapped host memory until the host has read the round's rows into the pinned block
+    // and raised it, then the graph copies them in and runs the rest. The same kernels on the same
+    // data, so the same output bit for bit. A host that does not raise the flag within 1 s ends the
+    // request with an error. Two-lane rounds and runs without CUDA graphs keep the two parts.
+    bool ngram_flag_wait = false;
+    // The dense GGML linears' int8 tensor-core decode route (--ggml-decode-mma): calls of at most 8
+    // columns (decode, MTP drafts and verification, two-lane rows) compute 16 rows by 8 columns per
+    // mma.sync instruction from weights staged in shared memory, instead of the dp4a GEMV. The same
+    // A8 cast and the same exact integer products; the scale terms are summed in another fixed order,
+    // so CHANGES THE NUMERICS slightly (FP32 rounding only; still independent of the batch width).
+    // Prefill is unchanged. No memory. Off: the dp4a route.
+    bool ggml_decode_mma = false;
     // The context cache's NVMe tier: a scratch file of up to this many bytes holds the checkpoints,
     // with the Host context budget as its RAM cache (a zero Host budget then reuses prefixes from
     // disk alone); 0: none. The file is created in `context_nvme_dir` (empty: beside the artifact),
@@ -536,6 +668,11 @@ struct EngineOptions {
     // instead of starting: it would fill the pool, be paused, and (without a Host snapshot)
     // recompute its history. Off by default; a request is always admitted when none is resident.
     bool admission_fit_check           = false;
+    // Cache-affinity overtake. When on, a waiting request whose prompt resumes a prefix already
+    // held on the device (a reusable checkpoint it may take over or that its session left, with no
+    // Host-to-device copy) may be admitted ahead of older waiters; each waiter can be passed this
+    // way at most four times. Off by default (plain FIFO with the resource bypass allowance).
+    bool admission_affinity            = false;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     // Zero (off), or a multiple of prefill_chunk: a long prefill leaves a private LongAnchor
@@ -550,6 +687,24 @@ struct EngineOptions {
     bool progress_anchors_shared = false;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
+    // Relaxed drafting (opt-in; CHANGES THE OUTPUT DISTRIBUTION). Under sampling, a draft whose
+    // final target probability (after penalties, mask, top-k, min-p, top-p and temperature) is at
+    // least P is kept even when the exact speculative rule would have rejected it, so that row is
+    // greedy. nullopt keeps the exact acceptance kernels and refuses requests that ask for it; a
+    // value in [0,1] selects the relaxed kernels and is the default P of requests that do not set
+    // SamplingOverrides::relaxed_drafting (0: exact unless the request asks). Never applies to
+    // greedy rows, constrained rows, tokens inside a tool call or drafted added tokens. Needs a
+    // speculative backend.
+    std::optional<float> relaxed_drafting;
+    // Draft-head context rows (opt-in; 0 = off). The reduced proposal head scores only its
+    // frequency-sorted token subset, so a name or identifier outside it can never be drafted. With
+    // N > 0 the Qwen3.5 Program keeps up to N ids that the requests' prompts and generated text
+    // hold and the subset lacks, scores them from the full output head and merges them into the
+    // drafter's argmax (MTP, DFlash) or top sixteen (DFlash2). Drafts only: verification decides
+    // every token, so output is unchanged. Needs a speculative backend with
+    // ProposalHead::Optimized (--lm-head-draft, implied by --spec); at most
+    // kMaximumDraftContextRows.
+    std::uint32_t draft_context_rows = 0;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
     // Zero selects a bounded worker count from the detected host concurrency.
@@ -598,6 +753,11 @@ struct EngineOptions {
     // preprocessing. Also bounds the overlay window.
     std::uint32_t vision_max_merged_tokens = 16384;
     bool use_cuda_graph                    = true;
+    // CausalScoring only: the widest decode window ScoringOptions::Phase::Decode may use, in
+    // [1,kMaximumScoringDecodeWindow]. Plans the decode frame, the decode workspace up to this
+    // width and, from width two, the ReplaySSM records the verify forward writes. Zero plans no
+    // decode scoring and leaves the scoring Program as before. One device only.
+    std::uint32_t scoring_decode_window    = 0;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     PrefillScheduleOptions prefill_schedule;
@@ -641,6 +801,13 @@ struct ModelSamplingDefaults {
     }
 };
 
+// Relaxed drafting's threshold for `--relaxed-drafting` without a value and a request's
+// `"relaxed_drafting": true`.
+inline constexpr float kRelaxedDraftingDefault = 0.5F;
+
+// The most draft-head context rows (EngineOptions::draft_context_rows, --draft-context-rows).
+inline constexpr std::uint32_t kMaximumDraftContextRows = 2048;
+
 // Public request-side overrides. std::nullopt means "use the registered model/mode default";
 // explicit zero remains a real override (including temperature=0 for exact argmax).
 struct SamplingOverrides {
@@ -651,6 +818,9 @@ struct SamplingOverrides {
     std::optional<float> presence_penalty;
     std::optional<float> frequency_penalty;
     std::optional<std::uint64_t> seed;
+    // Relaxed drafting threshold P in [0,1] for this request (0: exact); nullopt takes the Engine
+    // default (EngineOptions::relaxed_drafting). Changes the output distribution; see there.
+    std::optional<float> relaxed_drafting;
 };
 
 // Complete parameters after Engine resolution. Target runtimes consume only this type.
@@ -662,6 +832,8 @@ struct ResolvedSamplingParameters {
     float presence_penalty  = 0.0F;
     float frequency_penalty = 0.0F;
     std::uint64_t seed      = 0;
+    // Relaxed drafting threshold in [0,1]; 0 is the exact speculative rule.
+    float relaxed_drafting = 0.0F;
 };
 
 enum class OutputChannel : std::uint8_t {
@@ -1338,6 +1510,9 @@ struct SpeculativeStats {
     std::uint64_t ngram_rounds          = 0;
     std::uint64_t ngram_drafted_tokens  = 0;
     std::uint64_t ngram_accepted_tokens = 0;
+    // Relaxed drafting: accepted drafts the exact rule would have rejected and the threshold kept,
+    // a subset of `accepted_tokens`. Zero unless the request ran with a threshold.
+    std::uint64_t relaxed_kept = 0;
 };
 
 struct ThinkingBudgetStats {
@@ -1591,6 +1766,37 @@ struct RuntimeHostWorkStats {
     }
 };
 
+// One execution lane as of the last published snapshot (GET /slots).
+struct RuntimeLaneStats {
+    // Prefill covers a lane rebuilding or prefilling its prompt (replay included); Decoding a lane
+    // past its prompt, in or waiting for the decode batch.
+    enum class State : std::uint8_t { Idle, Prefill, Decoding } state = State::Idle;
+    std::uint64_t request_id = 0; // the Engine request id (the request log's engine_request_id)
+    std::int64_t prompt_tokens = 0;
+    // Prompt tokens prefill has evaluated, reused prefix tokens excluded.
+    std::int64_t computed_prompt_tokens = 0;
+    std::int64_t reused_prompt_tokens   = 0;
+    std::int64_t generated_tokens       = 0;
+    // Tokens the lane's sequence holds: reused + computed prompt tokens + generated tokens.
+    std::int64_t context_tokens = 0;
+    // Tokens after the first over the time since the first, 0 before the second token.
+    double decode_tokens_per_second = 0.0;
+    std::uint64_t drafted_tokens    = 0;
+    std::uint64_t accepted_tokens   = 0;
+    std::uint64_t relaxed_kept      = 0;
+};
+
+// One request waiting in the Engine FIFO for a lane.
+struct RuntimeWaitingStats {
+    std::uint64_t request_id   = 0;
+    std::int64_t prompt_tokens = 0;
+    double waited_seconds      = 0.0;
+};
+
+// RuntimeStats::waiting lists at most this many requests, oldest first, so publishing a snapshot
+// stays cheap with a long queue; RuntimeStats::waiting_requests is the full count.
+inline constexpr std::size_t kMaximumReportedWaitingRequests = 64;
+
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
@@ -1608,6 +1814,8 @@ struct RuntimeStats {
     std::uint64_t speculative_ngram_rounds          = 0;
     std::uint64_t speculative_ngram_draft_tokens    = 0;
     std::uint64_t speculative_ngram_accepted_tokens = 0;
+    // Relaxed drafting: accepted drafts kept by the threshold, a subset of the accepted tokens.
+    std::uint64_t speculative_relaxed_kept = 0;
     // Initial prompt tokens evaluated by prefill. Reused checkpoint-prefix tokens and replay
     // recomputation are excluded; replayed_tokens separately counts that additional model work.
     std::uint64_t computed_prefill_tokens = 0;
@@ -1633,11 +1841,19 @@ struct RuntimeStats {
     std::uint32_t materializing_requests    = 0;
     std::uint32_t capture_pending_requests  = 0;
     std::uint32_t terminal_pending_requests = 0;
+    // Per lane, gauges like the counts above: lanes[0, lane_count) are the Engine's lanes.
+    std::array<RuntimeLaneStats, kMaximumConcurrency> lanes{};
+    std::uint8_t lane_count = 0;
+    // The first kMaximumReportedWaitingRequests waiting requests, oldest first.
+    std::vector<RuntimeWaitingStats> waiting;
     std::uint64_t active_captures_completed = 0;
     std::uint64_t active_captures_aborted   = 0;
     std::uint64_t preemptions               = 0;
     // Fresh requests held back once because their whole prompt could not fit beside residents.
     std::uint64_t admission_fit_deferrals   = 0;
+    // Fresh requests admitted ahead of older waiters because they resume a prefix held on the
+    // device (EngineOptions::admission_affinity).
+    std::uint64_t admission_overtakes       = 0;
     std::uint64_t snapshot_restores         = 0;
     std::uint64_t replay_restores           = 0;
     std::uint64_t replayed_tokens           = 0;

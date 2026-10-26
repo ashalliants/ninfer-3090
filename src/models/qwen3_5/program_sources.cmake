@@ -6,6 +6,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/program.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/program_impl.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/residency.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/context_rows.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/context_work.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefix_identity.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/round_buffers.cpp"
@@ -13,6 +14,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/graphs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefill.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/decode.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/score_decode.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/grammar_masks.cpp"
 
   "${CMAKE_CURRENT_LIST_DIR}/program/planning/startup.cpp"

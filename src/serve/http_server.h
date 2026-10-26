@@ -1,6 +1,7 @@
 #pragma once
 
 #include "serve/generation_service.h"
+#include "serve/http_security.h"
 #include "serve/load_report.h"
 #include "serve/metrics.h"
 #include "serve/openai_common.h"
@@ -37,8 +38,17 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
                                                               const httplib::Request& request,
                                                               httplib::Response& response);
 
+// The dashboard page (serve/dashboard_page.h) with its Content-Security-Policy and nosniff.
+void write_dashboard_page(httplib::Response& response);
+
 [[nodiscard]] bool matches_bearer_credential(std::string_view authorization,
                                              std::string_view api_key) noexcept;
+
+// Without a key, the Host check; without a key and without --cors, the Origin and Sec-Fetch-Site
+// checks. A refused request gets a 403 in its endpoint's error shape and the result is true.
+[[nodiscard]] bool reject_untrusted_request(const HostPolicy& policy, const ServeOptions& options,
+                                            const httplib::Request& request,
+                                            httplib::Response& response);
 
 class HttpServer {
 public:
@@ -151,6 +161,9 @@ private:
     std::thread startup_listener_;
     std::atomic<bool> startup_listener_result_{false};
     ServeOptions options_;
+    // The names this server answers to. Rebuilt by bind_any_port() once the port is known, before
+    // any request can arrive.
+    HostPolicy host_policy_;
     std::string public_model_id_;
     // Written by attach() together with service_, before ready_ is published.
     LoadCapacity load_capacity_;

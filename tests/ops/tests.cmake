@@ -16,6 +16,7 @@ set(ninfer_op_tests
   layer_norm
   embedding
   argmax
+  argmax_probability
   gdn_gating
   gdn_gating_proj
   rope
@@ -40,6 +41,32 @@ ninfer_add_op_test(ninfer_ggml_blocks_decode_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_blocks_decode.cpp"
   LIBRARIES ninfer_core)
 
+# Host-only: the GGML linear registry against the dense tensors, heads and two-projection pairs of
+# the Qwen3.8-Flash-Next GGUF packs (a table in the test mirrors their tensor allocations).
+ninfer_add_op_test(ninfer_ggml_linear_registry_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_linear_registry.cpp"
+  LIBRARIES ninfer_core)
+
+# Host-only: the GGML linears' affine Q4_K/Q5_K arithmetic (ggml_linear_emulation.h, both routes)
+# against ggml's decode and an FP64 oracle at every registered Q4_K/Q5_K problem.
+ninfer_add_op_test(ninfer_ggml_linear_affine_test NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_linear_affine.cpp"
+  LIBRARIES ninfer_core)
+
+# Host-only: the GGML linears' int8 tensor-core decode route (LinearPolicy::AllowA8GgmlDecodeMma,
+# ggml_mma_emulation.h) against ggml's decode and an FP64 oracle at every registered problem, its
+# tile order against the row order at T = 1..8, and the int32 range of its MMA sums.
+ninfer_add_op_test(ninfer_ggml_mma_emulation_test NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_mma_emulation.cpp"
+  LIBRARIES ninfer_core)
+
+# Host-only: the GatedDeltaNet head map in the FP64 oracle. The tiled map (value head h reads key
+# head h % Hqk, Qwen3.8-Flash-Next) on 16 q/k heads equals, bit for bit, the blocked map on q/k
+# tiled to one head per value head.
+ninfer_add_op_test(ninfer_gdn_head_map_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_head_map.cpp"
+  LIBRARIES ninfer_core)
+
 # offloaded_sparse_moe over GGML expert records. The CPU test needs no GPU: the canonical A8 cast,
 # the exact sub-block decode, the FP64 expert oracle, AVX2 = scalar and the worker team. The layer
 # test runs routing, dispatch, every record placement, the CPU miss channel and the combine on the
@@ -48,6 +75,19 @@ ninfer_add_op_test(ninfer_ggml_blocks_decode_test NEEDS_SOURCE_DIR
 ninfer_add_op_test(ninfer_offloaded_moe_cpu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_cpu.cpp"
   LIBRARIES ninfer_ops)
+# Host-only: offloaded_moe::plan_dispatch, the exact dispatch (counts, offsets, jobs ascending,
+# entries ascending within each expert) that moe_route_dispatch's one-launch route writes for a
+# decode-width call, and the oracle the layer test checks it against.
+ninfer_add_op_test(ninfer_moe_dispatch_plan_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_dispatch_plan.cpp"
+  LIBRARIES ninfer_core)
+# Host-only: offloaded_moe::select_cpu_jobs, the experts a call with a CPU channel hands the CPU
+# miss service (the fewest-column misses first, the divisor's share left on the GPU), and the oracle
+# the layer test checks the published request against; and the prefill share's cpu_share_take and
+# select_prefill_cpu_jobs (cpu_share.h), the oracle of the wide test's prefill_cpu_share.
+ninfer_add_op_test(ninfer_moe_cpu_selection_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_cpu_selection.cpp"
+  LIBRARIES ninfer_core)
 ninfer_add_op_test(ninfer_offloaded_moe_layer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_layer.cu"
   LIBRARIES ninfer_ops ninfer_artifact)
@@ -61,6 +101,11 @@ ninfer_add_op_test(ninfer_offloaded_moe_wide_test
 ninfer_add_op_test(ninfer_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES ninfer_ops)
+# The draft head's context rows (--draft-context-rows): selected head rows by id against the FP64
+# oracle in every head format, and their argmax and top-sixteen merges against dense references.
+ninfer_add_op_test(ninfer_linear_rows_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_rows.cpp"
+  LIBRARIES ninfer_ops)
 
 # Qwen3.8-Flash-Next (qwen4exp) Ops ported from Infernix: hyper-connection mixers, the PLE
 # injection (with its IQ4_NL row decode), FP32 projections (BF16 router, IQ4_XS head) and row
@@ -68,6 +113,16 @@ ninfer_add_op_test(ninfer_linear_topk_test
 ninfer_add_op_test(ninfer_hyper_connection_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hyper_connection.cpp"
   LIBRARIES ninfer_linear_test_support)
+# Host-only: the int8 hyper-connection codec (--hc-int8): the group rule the quantize kernel runs,
+# against exact FP64 checks and an independent re-implementation of Basalt's rule.
+ninfer_add_op_test(ninfer_hc_int8_codec_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hc_int8_codec.cpp"
+  LIBRARIES ninfer_core)
+# Host-only: relaxed drafting's acceptance rule and eligibility (--relaxed-drafting), the rule the
+# speculative acceptance kernels run and the host checks the Programs make.
+ninfer_add_op_test(ninfer_relaxed_accept_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_relaxed_accept.cpp"
+  LIBRARIES ninfer_core)
 
 foreach(op IN ITEMS ple projection_fp32 rows)
   ninfer_add_op_test(ninfer_${op}_test

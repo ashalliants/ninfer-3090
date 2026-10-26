@@ -1,12 +1,20 @@
 #include "serve/generation_service.h"
+#include "serve/operational_log.h"
 #include "serve/props.h"
+#include "serve/serve_config_file.h"
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,6 +34,248 @@ ServeOptions parse(std::vector<std::string> arguments) {
     argv.reserve(arguments.size());
     for (std::string& argument : arguments) { argv.push_back(argument.data()); }
     return parse_serve_options(static_cast<int>(argv.size()), argv.data());
+}
+
+// --config FILE through parse_serve_options. Each case returns its failures.
+std::filesystem::path config_directory() {
+    return std::filesystem::temp_directory_path() / "ninfer_serve_options_config_test";
+}
+
+std::string config_file(const std::string& name, const std::string& text) {
+    const std::filesystem::path path = config_directory() / name;
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream(path, std::ios::binary) << text;
+    return path.string();
+}
+
+// The message parse_serve_options throws for these arguments, or "" when it accepts them.
+std::string refusal(std::vector<std::string> arguments) {
+    try {
+        (void)parse(std::move(arguments));
+    } catch (const std::invalid_argument& error) { return error.what(); }
+    return "";
+}
+
+int config_strings_numbers_bools_arrays() {
+    const std::string path = config_file(
+        "shapes.json", R"({"max-context": 16384, "kv-dtype": "int8", "top-p": 0.9, "vision": true,
+                          "cors": false, "graft": ["a=a.safetensors", "b=b.safetensors"],
+                          "allowed-host": ["gpubox.lan"], "relaxed-drafting": 0.25,
+                          "spec": "mtp", "draft-tokens": 3})");
+    const ServeOptions options = parse({"ninfer-serve", "model.ninfer", "--config", path});
+    int failures = 0;
+    failures += check(options.max_context == 16384 && options.kv_capacity.explicit_tokens == 16384,
+                      "config: a number did not reach its option");
+    failures += check(options.kv_cache == ninfer::KvCacheStorage::Int8Group64,
+                      "config: a string did not reach its option");
+    failures += check(options.sampling_overrides.top_p == 0.9f && options.relaxed_drafting == 0.25f,
+                      "config: a decimal did not reach its option");
+    failures += check(options.enable_vision && !options.enable_cors,
+                      "config: true did not set a switch, or false did");
+    failures += check(options.grafts.size() == 2 && options.grafts[0].name == "a" &&
+                          options.grafts[1].name == "b" &&
+                          options.allowed_hosts == std::vector<std::string>{"gpubox.lan"},
+                      "config: an array did not repeat its flag");
+    // Every option that collects its occurrences takes an array (the reader's list matches).
+    const ServeOptions repeated = parse(
+        {"ninfer-serve", "model.ninfer", "--config",
+         config_file("repeated.json",
+                     R"({"allowed-host": ["a.lan", "b.lan"], "context-store": "store",
+                        "context-store-peer": ["peer-a", "peer-b"]})")});
+    failures += check(repeated.allowed_hosts.size() == 2 &&
+                          repeated.context_store_peers.size() == 2,
+                      "config: a repeatable option kept only one array element");
+    return failures;
+}
+
+int config_refuses_api_key() {
+    const std::string path = config_file("secret.json", R"({"api-key": "sk-secret"})");
+    const std::string message = refusal({"ninfer-serve", "model.ninfer", "--config", path});
+    int failures = 0;
+    failures += check(message.find(path) != std::string::npos &&
+                          message.find("\"api-key\"") != std::string::npos &&
+                          message.find("sk-secret") == std::string::npos,
+                      "config: an api-key in the file was not refused naming file and key");
+    // The key stays a command-line option beside a file, and stays redacted.
+    const std::string port = config_file("port.json", R"({"port": 9000})");
+    const ServeOptions keyed =
+        parse({"ninfer-serve", "model.ninfer", "--config", port, "--api-key", "sk-cli"});
+    failures += check(keyed.api_key == "sk-cli" && keyed.port == 9000,
+                      "config: --api-key on the command line beside a file was lost");
+    for (const auto* argv : {&keyed.startup_argv, &keyed.effective_argv}) {
+        failures += check(std::find(argv->begin(), argv->end(), "sk-cli") == argv->end() &&
+                              std::find(argv->begin(), argv->end(), "<redacted>") != argv->end(),
+                          "config: the API key was not redacted from the logged arguments");
+    }
+    return failures;
+}
+
+int config_unknown_key_names_file() {
+    int failures = 0;
+    const std::string typo = config_file("typo.json", R"({"max-contxt": 4096})");
+    failures += check(refusal({"ninfer-serve", "model.ninfer", "--config", typo}) ==
+                          typo + ": unknown key \"max-contxt\"",
+                      "config: an unknown key was not refused naming the file and key");
+    // A key set to false adds no word, but is still checked.
+    const std::string false_typo = config_file("false-typo.json", R"({"visoin": false})");
+    failures += check(refusal({"ninfer-serve", "model.ninfer", "--config", false_typo}) ==
+                          false_typo + ": unknown key \"visoin\"",
+                      "config: an unknown key set to false was accepted");
+    // The command line's own unknown flags keep their message.
+    const std::string empty = config_file("empty.json", "{}");
+    failures += check(refusal({"ninfer-serve", "model.ninfer", "--config", empty, "--max-contxt",
+                               "1"}) == "unknown argument: --max-contxt",
+                      "config: an unknown command-line flag was blamed on the file");
+    // Values of the wrong kind name the file and the key.
+    const auto refused = [&](const std::string& name, const std::string& text, const char* what) {
+        const std::string path    = config_file(name, text);
+        const std::string message = refusal({"ninfer-serve", "model.ninfer", "--config", path});
+        const std::string key     = text.substr(2, text.find('"', 2) - 2);
+        const std::string failure =
+            std::string("config: ") + what + " was not refused naming the file and key: " + message;
+        failures += check(message.rfind(path + ": \"" + key + "\"", 0) == 0, failure.c_str());
+    };
+    refused("switch-value.json", R"({"vision": "yes"})", "a value for a switch");
+    refused("missing-value.json", R"({"port": true, "host": "0.0.0.0"})",
+            "true for an option with a value");
+    refused("false-value.json", R"({"max-context": false})", "false for an option with a value");
+    refused("bad-value.json", R"({"port": "eighty"})", "an invalid value");
+    // One file per command line, and none inside a file.
+    failures += check(refusal({"ninfer-serve", "model.ninfer", "--config", typo, "--config",
+                               typo}) == "--config may be given once",
+                      "config: a second --config was accepted");
+    failures += check(refusal({"ninfer-serve", "model.ninfer", "--config"}) ==
+                          "--config needs a value",
+                      "config: --config without a file was accepted");
+    return failures;
+}
+
+int cli_overrides_file() {
+    const std::string path = config_file(
+        "override.json", R"({"max-context": 4096, "port": 9000, "graft": ["a=a.safetensors"]})");
+    // The command line wins wherever it stands, before --config or after it.
+    const ServeOptions options = parse({"ninfer-serve", "model.ninfer", "--max-context", "8192",
+                                        "--config", path, "--graft", "b=b.safetensors"});
+    int failures = 0;
+    failures += check(options.max_context == 8192, "config: the file overrode the command line");
+    failures += check(options.port == 9000, "config: the file did not override the default");
+    failures += check(options.host == "127.0.0.1", "config: a default changed");
+    failures += check(options.grafts.size() == 2 && options.grafts[0].name == "a" &&
+                          options.grafts[1].name == "b",
+                      "config: a repeatable option did not add the command line's to the file's");
+    return failures;
+}
+
+int bool_without_negation_errors() {
+    int failures = 0;
+    const std::string vision = config_file("vision.json", R"({"vision": true})");
+    failures += check(refusal({"ninfer-serve", "model.ninfer", "--config", vision,
+                               "--no-vision"}) ==
+                          vision + ": \"vision\" is set and has no command-line override",
+                      "config: a switch the command line cannot negate was not refused");
+    const std::string thinking = config_file("no-thinking.json", R"({"no-thinking": true})");
+    failures += check(refusal({"ninfer-serve", "model.ninfer", "--config", thinking,
+                               "--thinking"}) ==
+                          thinking + ": \"no-thinking\" is set and has no command-line override",
+                      "config: a negation the command line cannot undo was not refused");
+    // Without the file the same flag is an unknown argument.
+    failures += check(refusal({"ninfer-serve", "model.ninfer", "--no-vision"}) ==
+                          "unknown argument: --no-vision",
+                      "config: --no-vision changed meaning without a file");
+    // Where the negation exists, the command line resolves it.
+    const std::string autoload = config_file("autoload.json", R"({"models-autoload": true})");
+    failures += check(!parse({"ninfer-serve", "--models-dir", "models", "--config", autoload,
+                              "--no-models-autoload"})
+                           .models_autoload,
+                      "config: the command line's negation did not win over the file");
+    return failures;
+}
+
+int sources_recorded() {
+    const std::string path =
+        config_file("sources.json", R"({"max-context": 4096, "vision": true, "cors": false})");
+    const ServeOptions options = parse({"ninfer-serve", "model.ninfer", "--config", path,
+                                        "--max-context", "8192", "--port", "9000"});
+    const std::map<std::string, std::string> expected{{"--config", "cli"},
+                                                      {"--cors", "default"},
+                                                      {"--max-context", "cli"},
+                                                      {"--port", "cli"},
+                                                      {"--vision", path}};
+    int failures = 0;
+    failures += check(options.setting_sources == expected,
+                      "config: the setting sources are not the file's, the command line's and the "
+                      "defaults'");
+    failures += check(options.effective_argv ==
+                          std::vector<std::string>{"ninfer-serve", "model.ninfer", "--max-context",
+                                                   "4096", "--vision", "--max-context", "8192",
+                                                   "--port", "9000"},
+                      "config: the effective arguments are not the file's words then the command "
+                      "line's");
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).setting_sources.empty(),
+                      "config: a source was recorded for an option nobody set");
+    const std::optional<OperationalRecord> line = render_setting_sources(options.setting_sources);
+    failures += check(line && line->message == "settings | command line: --config, --max-context, "
+                                               "--port | " +
+                                                   path + ": --vision",
+                      "config: the startup line does not name each setting's source");
+    failures += check(!render_setting_sources({{"--cors", "default"}}),
+                      "config: a startup line was rendered with nothing set");
+    return failures;
+}
+
+// A path in the file is read as the same word on the command line would be: against the working
+// directory, not the file's own directory.
+int config_relative_paths_follow_cwd() {
+    const std::string path =
+        config_file("profiles/relative.json", R"({"chat-template": "templates/chat.jinja"})");
+    return check(parse({"ninfer-serve", "model.ninfer", "--config", path}).chat_template_path ==
+                     std::filesystem::path("templates/chat.jinja"),
+                 "config: a relative path was not kept as written");
+}
+
+// Router mode: the file is expanded before the per-model arguments are split off.
+int config_router_model_arguments() {
+    const std::string path =
+        config_file("router.json", R"({"models-dir": "models", "max-context": 4096})");
+    const ServeOptions options =
+        parse({"ninfer-serve", "--config", path, "--max-concurrency", "2"});
+    return check(options.router() && options.models_dir == std::filesystem::path("models") &&
+                     options.model_arguments == std::vector<std::string>{"--max-context", "4096",
+                                                                         "--max-concurrency", "2"},
+                 "config: router mode did not pass the file's options on to each model");
+}
+
+// The launchers' profiles (scripts/profiles/, shipped in both release archives): every file there
+// is a JSON profile with at least one option, and every key in it is a serve option this parser
+// takes, so a typo or a renamed flag fails here instead of at a user's first start.
+int shipped_profiles_parse() {
+    const std::filesystem::path directory =
+        std::filesystem::path(NINFER_SOURCE_DIR) / "scripts" / "profiles";
+    int failures = 0;
+    int profiles = 0;
+    if (std::filesystem::is_directory(directory)) {
+        for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+            const std::string name = entry.path().filename().string();
+            if (!entry.is_regular_file() || entry.path().extension() != ".json") {
+                std::cerr << "shipped profiles: " << name << " is not a .json file\n";
+                ++failures;
+                continue;
+            }
+            ++profiles;
+            try {
+                if (read_serve_config(entry.path()).words.empty()) {
+                    std::cerr << "shipped profiles: " << name << " sets no option\n";
+                    ++failures;
+                }
+                (void)parse({"ninfer-serve", "model.ninfer", "--config", entry.path().string()});
+            } catch (const std::invalid_argument& error) {
+                std::cerr << "shipped profiles: " << error.what() << '\n';
+                ++failures;
+            }
+        }
+    }
+    failures += check(profiles > 0, "shipped profiles: scripts/profiles/ holds no profile");
+    return failures;
 }
 
 } // namespace
@@ -58,6 +308,10 @@ int main() {
     failures += check(parse({"ninfer-serve", "model.ninfer", "--admission-fit-check"})
                           .admission_fit_check,
                       "--admission-fit-check did not reach serving options");
+    failures += check(!defaults.admission_affinity, "the cache-affinity overtake is on by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--admission-affinity"})
+                          .admission_affinity,
+                      "--admission-affinity did not reach serving options");
     failures += check(!defaults.progress_anchors_shared, "shared progress anchors are on by default");
     failures += check(parse({"ninfer-serve", "model.ninfer", "--progress-anchor-tokens", "4096",
                              "--progress-anchors-shared"})
@@ -102,7 +356,8 @@ int main() {
                           defaults.flash_next.expert_state_path.empty() &&
                           defaults.flash_next.save_expert_state && !defaults.flash_next.vram_headroom_bytes &&
                           !defaults.flash_next.expert_cache_bytes &&
-                          defaults.flash_next.ram_headroom_bytes == (2ULL << 30),
+                          defaults.flash_next.ram_headroom_bytes == (2ULL << 30) &&
+                          defaults.flash_next.ngram_keepalive_ms == 40 && !defaults.flash_next.shared_expert_stream,
                       "Flash-Next defaults mismatch");
     const ServeOptions flash = parse({"ninfer-serve", "model.ninfer", "--ngram-volume", "K:/v.ngram",
                                       "--expert-state", "K:/s.state", "--vram-headroom-mib", "300",
@@ -115,8 +370,276 @@ int main() {
                       "Flash-Next flags were not parsed");
     failures += check(make_engine_options(flash).flash_next.expert_cache_bytes == (1024ULL << 20),
                       "Flash-Next options do not reach the Engine");
+    failures += check(defaults.flash_next.default_expert_state_path.empty(),
+                      "--default-expert-state holds a path before the flag is given");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--default-expert-state", "K:/d.default"}))
+                              .flash_next.default_expert_state_path == "K:/d.default",
+                      "--default-expert-state does not reach the Engine");
+    {
+        bool empty_rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--default-expert-state", ""}); }
+        catch (const std::invalid_argument&) { empty_rejected = true; }
+        failures += check(empty_rejected, "--default-expert-state accepted an empty path");
+    }
     failures += check(!parse({"ninfer-serve", "model.ninfer", "--no-expert-state"}).flash_next.save_expert_state,
                       "--no-expert-state did not turn the saved state off");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--shared-expert-stream"}))
+                          .flash_next.shared_expert_stream,
+                      "--shared-expert-stream does not reach the Engine");
+    failures += check(!defaults.flash_next.gdn_head_map, "the GDN head map is on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--gdn-head-map"})).flash_next.gdn_head_map,
+                      "--gdn-head-map does not reach the Engine");
+    failures += check(!defaults.flash_next.moe_precast_input, "the MoE precast input is on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--moe-precast-input"}))
+                          .flash_next.moe_precast_input,
+                      "--moe-precast-input does not reach the Engine");
+    failures += check(!defaults.flash_next.moe_gate_up_registers, "the register gate/up kernel is on by default");
+    {
+        const ninfer::EngineOptions both = make_engine_options(
+            parse({"ninfer-serve", "model.ninfer", "--moe-precast-input", "--moe-gate-up-registers"}));
+        failures += check(both.flash_next.moe_gate_up_registers && both.flash_next.moe_precast_input,
+                          "--moe-gate-up-registers does not reach the Engine");
+        bool refused = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--moe-gate-up-registers"});
+        } catch (const std::invalid_argument& error) {
+            refused = std::string(error.what()).find("--moe-gate-up-registers") != std::string::npos &&
+                      std::string(error.what()).find("--moe-precast-input") != std::string::npos;
+        }
+        failures += check(refused, "--moe-gate-up-registers without --moe-precast-input was not refused naming both flags");
+    }
+    failures += check(!defaults.flash_next.moe_fused_route, "the one-launch MoE route and dispatch is on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--moe-fused-route"}))
+                          .flash_next.moe_fused_route,
+                      "--moe-fused-route does not reach the Engine");
+    failures += check(!defaults.flash_next.cpu_verify_misses && defaults.flash_next.cpu_verify_workers == 6,
+                      "the CPU leg for verification misses is on by default, or its team is not 6 threads");
+    {
+        const ninfer::EngineOptions on = make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
+                                                                    "--draft-tokens", "3", "--cpu-verify-misses",
+                                                                    "--cpu-verify-workers", "12"}));
+        failures += check(on.flash_next.cpu_verify_misses && on.flash_next.cpu_verify_workers == 12,
+                          "--cpu-verify-misses --cpu-verify-workers 12 does not reach the Engine");
+        const auto refused = [](std::vector<std::string> args, std::vector<std::string> names) {
+            try {
+                (void)parse(std::move(args));
+            } catch (const std::invalid_argument& error) {
+                for (const auto& name : names) {
+                    if (std::string(error.what()).find(name) == std::string::npos) { return false; }
+                }
+                return true;
+            }
+            return false;
+        };
+        failures += check(refused({"ninfer-serve", "model.ninfer", "--cpu-verify-misses"},
+                                  {"--cpu-verify-misses", "--spec mtp"}),
+                          "--cpu-verify-misses without --spec mtp was not refused naming both flags");
+        failures += check(refused({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                                   "--cpu-verify-workers", "8"},
+                                  {"--cpu-verify-workers", "--cpu-verify-misses", "--prefill-cpu-share"}),
+                          "--cpu-verify-workers without --cpu-verify-misses or --prefill-cpu-share was not refused "
+                          "naming the flags");
+        for (const char* bad : {"0", "65"}) {
+            failures += check(refused({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                                       "--cpu-verify-misses", "--cpu-verify-workers", bad},
+                                      {"--cpu-verify-workers"}),
+                              (std::string("--cpu-verify-workers ") + bad + " was not refused").c_str());
+        }
+    }
+    {
+        // --prefill-cpu-share F: off by default (0 / 1); a decimal of at most two places is kept as the
+        // reduced fraction; needs no MTP, and --cpu-verify-workers then sizes its team.
+        failures += check(defaults.flash_next.prefill_cpu_share.num == 0 && defaults.flash_next.prefill_cpu_share.den == 1,
+                          "the prefill CPU share is on by default");
+        const auto share = [](const char* value) {
+            return make_engine_options(parse({"ninfer-serve", "model.ninfer", "--prefill-cpu-share", value}))
+                .flash_next.prefill_cpu_share;
+        };
+        const struct {
+            const char* text;
+            std::uint32_t num, den;
+        } kept[] = {{"0.6", 3, 5}, {"0.60", 3, 5}, {".6", 3, 5}, {"0.55", 11, 20}, {"0.5", 1, 2},
+                    {"1", 1, 1},   {"1.00", 1, 1}, {"0", 0, 1},  {"0.01", 1, 100}, {"0.25", 1, 4}};
+        for (const auto& k : kept) {
+            const auto got = share(k.text);
+            failures += check(got.num == k.num && got.den == k.den,
+                              (std::string("--prefill-cpu-share ") + k.text + " is not kept as " +
+                               std::to_string(k.num) + " / " + std::to_string(k.den))
+                                  .c_str());
+        }
+        for (const char* bad : {"0.125", "1.01", "2", "-0.5", "0.6.1", ".", "", "abc", "0,6", "1e-1"}) {
+            bool refused = false;
+            try {
+                (void)parse({"ninfer-serve", "model.ninfer", "--prefill-cpu-share", bad});
+            } catch (const std::invalid_argument& error) {
+                refused = std::string(error.what()).find("--prefill-cpu-share") != std::string::npos;
+            }
+            failures += check(refused, (std::string("--prefill-cpu-share '") + bad + "' was not refused").c_str());
+        }
+        const ninfer::EngineOptions workers = make_engine_options(
+            parse({"ninfer-serve", "model.ninfer", "--prefill-cpu-share", "0.6", "--cpu-verify-workers", "16"}));
+        failures += check(workers.flash_next.prefill_cpu_share.num == 3 && workers.flash_next.cpu_verify_workers == 16 &&
+                              !workers.flash_next.cpu_verify_misses,
+                          "--prefill-cpu-share 0.6 --cpu-verify-workers 16 does not reach the Engine without MTP");
+        failures += check(serve_usage_text("ninfer-serve").find("--prefill-cpu-share") != std::string::npos,
+                          "the usage text does not list --prefill-cpu-share");
+    }
+    failures += check(!defaults.flash_next.hc_int8, "the int8 hyper-connection copies are on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--hc-int8"})).flash_next.hc_int8,
+                      "--hc-int8 does not reach the Engine");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                                                 "--max-concurrency", "2", "--hc-int8"}))
+                          .flash_next.hc_int8,
+                      "--hc-int8 with MTP and two lanes does not reach the Engine");
+    failures += check(serve_usage_text("ninfer-serve").find("--hc-int8") != std::string::npos,
+                      "the usage text does not name --hc-int8");
+    failures += check(!defaults.flash_next.hc_fused_read, "the fused hyper-connection read is on by default");
+    {
+        const ninfer::EngineOptions both =
+            make_engine_options(parse({"ninfer-serve", "model.ninfer", "--hc-int8", "--hc-fused-read"}));
+        failures += check(both.flash_next.hc_fused_read && both.flash_next.hc_int8,
+                          "--hc-fused-read does not reach the Engine");
+        failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
+                                                     "3", "--max-concurrency", "2", "--hc-int8", "--hc-fused-read"}))
+                              .flash_next.hc_fused_read,
+                          "--hc-fused-read with MTP and two lanes does not reach the Engine");
+        bool refused = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--hc-fused-read"});
+        } catch (const std::invalid_argument& error) {
+            refused = std::string(error.what()).find("--hc-fused-read") != std::string::npos &&
+                      std::string(error.what()).find("--hc-int8") != std::string::npos;
+        }
+        failures += check(refused, "--hc-fused-read without --hc-int8 was not refused naming both flags");
+        failures += check(serve_usage_text("ninfer-serve").find("--hc-fused-read") != std::string::npos,
+                          "the usage text does not name --hc-fused-read");
+    }
+    failures += check(!defaults.flash_next.ngram_flag_wait, "the in-graph n-gram flag wait is on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--ngram-flag-wait"}))
+                          .flash_next.ngram_flag_wait,
+                      "--ngram-flag-wait does not reach the Engine");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                                                 "--max-concurrency", "2", "--ngram-flag-wait"}))
+                          .flash_next.ngram_flag_wait,
+                      "--ngram-flag-wait with MTP and two lanes does not reach the Engine");
+    failures += check(serve_usage_text("ninfer-serve").find("--ngram-flag-wait") != std::string::npos,
+                      "the usage text does not name --ngram-flag-wait");
+    failures += check(!defaults.flash_next.ggml_decode_mma, "the GGML int8 tensor-core decode route is on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--ggml-decode-mma"}))
+                          .flash_next.ggml_decode_mma,
+                      "--ggml-decode-mma does not reach the Engine");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                                                 "--max-concurrency", "2", "--partial-ram-residency",
+                                                 "--ggml-decode-mma"}))
+                          .flash_next.ggml_decode_mma,
+                      "--ggml-decode-mma with MTP, two lanes and partial RAM residency does not reach the Engine");
+    failures += check(serve_usage_text("ninfer-serve").find("--ggml-decode-mma") != std::string::npos,
+                      "the usage text does not name --ggml-decode-mma");
+    failures += check(!defaults.flash_next.partial_ram_residency, "partial RAM residency is on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--partial-ram-residency"}))
+                          .flash_next.partial_ram_residency,
+                      "--partial-ram-residency does not reach the Engine");
+    failures += check(serve_usage_text("ninfer-serve").find("--partial-ram-residency") != std::string::npos,
+                      "the usage text does not name --partial-ram-residency");
+    failures += check(!defaults.flash_next.gdn_async_commit, "the GDN commit on a side stream is on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                                                 "--gdn-async-commit"}))
+                          .flash_next.gdn_async_commit,
+                      "--gdn-async-commit does not reach the Engine");
+    for (const auto& spec : {std::vector<std::string>{}, std::vector<std::string>{"--spec", "dflash"}}) {
+        std::vector<std::string> args{"ninfer-serve", "model.ninfer", "--gdn-async-commit"};
+        args.insert(args.end(), spec.begin(), spec.end());
+        bool named = false;
+        try {
+            (void)parse(std::move(args));
+        } catch (const std::invalid_argument& error) {
+            const std::string what = error.what();
+            named = what.find("--gdn-async-commit") != std::string::npos &&
+                    what.find("--spec mtp") != std::string::npos;
+        }
+        failures += check(named, "--gdn-async-commit without --spec mtp was not refused naming both flags");
+    }
+    failures += check(!defaults.flash_next.mtp_constrained, "MTP for constrained requests is on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                                                 "--mtp-constrained"}))
+                          .flash_next.mtp_constrained,
+                      "--mtp-constrained does not reach the Engine");
+    for (const auto& spec : {std::vector<std::string>{}, std::vector<std::string>{"--spec", "dflash"}}) {
+        std::vector<std::string> args{"ninfer-serve", "model.ninfer", "--mtp-constrained"};
+        args.insert(args.end(), spec.begin(), spec.end());
+        bool refused = false;
+        try {
+            (void)parse(args);
+        } catch (const std::invalid_argument& error) {
+            refused = std::string(error.what()).find("--mtp-constrained") != std::string::npos &&
+                      std::string(error.what()).find("--spec mtp") != std::string::npos;
+        }
+        failures += check(refused, "--mtp-constrained without --spec mtp was not refused naming both flags");
+    }
+    failures += check(!defaults.flash_next.mtp_joint_acceptance, "the joint-acceptance draft length is on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "7",
+                                                 "--mtp-joint-acceptance"}))
+                          .flash_next.mtp_joint_acceptance,
+                      "--mtp-joint-acceptance does not reach the Engine");
+    for (const auto& spec : {std::vector<std::string>{}, std::vector<std::string>{"--spec", "dflash"}}) {
+        std::vector<std::string> args{"ninfer-serve", "model.ninfer", "--mtp-joint-acceptance"};
+        args.insert(args.end(), spec.begin(), spec.end());
+        bool refused = false;
+        try {
+            (void)parse(args);
+        } catch (const std::invalid_argument& error) {
+            refused = std::string(error.what()).find("--mtp-joint-acceptance") != std::string::npos &&
+                      std::string(error.what()).find("--spec mtp") != std::string::npos;
+        }
+        failures += check(refused, "--mtp-joint-acceptance without --spec mtp was not refused naming both flags");
+    }
+    failures += check(!defaults.flash_next.ngram_prefetch, "the n-gram prefetch is on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                                                 "--ngram-prefetch"}))
+                          .flash_next.ngram_prefetch,
+                      "--ngram-prefetch does not reach the Engine");
+    for (const auto& spec : {std::vector<std::string>{}, std::vector<std::string>{"--spec", "dflash"}}) {
+        std::vector<std::string> args{"ninfer-serve", "model.ninfer", "--ngram-prefetch"};
+        args.insert(args.end(), spec.begin(), spec.end());
+        bool refused = false;
+        try {
+            (void)parse(args);
+        } catch (const std::invalid_argument& error) {
+            refused = std::string(error.what()).find("--ngram-prefetch") != std::string::npos &&
+                      std::string(error.what()).find("--spec mtp") != std::string::npos;
+        }
+        failures += check(refused, "--ngram-prefetch without --spec mtp was not refused naming both flags");
+    }
+    failures += check(defaults.flash_next.hot_embedding_rows == 0, "hot embedding rows are on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--hot-embedding-rows", "8192"}))
+                              .flash_next.hot_embedding_rows == 8192,
+                      "--hot-embedding-rows does not reach the Engine");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--hot-embedding-rows", "0"})
+                              .flash_next.hot_embedding_rows == 0,
+                      "--hot-embedding-rows 0 did not keep the whole table in VRAM");
+    {
+        bool negative_rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--hot-embedding-rows", "-1"}); }
+        catch (const std::invalid_argument&) { negative_rejected = true; }
+        failures += check(negative_rejected, "--hot-embedding-rows accepted a negative count");
+    }
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--ngram-keepalive-ms", "25"})
+                              .flash_next.ngram_keepalive_ms == 25,
+                      "--ngram-keepalive-ms was not parsed");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--ngram-keepalive-ms", "0"})
+                              .flash_next.ngram_keepalive_ms == 0,
+                      "--ngram-keepalive-ms 0 did not turn the keep-alive off");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--ngram-keepalive-ms", "25"}))
+                              .flash_next.ngram_keepalive_ms == 25,
+                      "--ngram-keepalive-ms does not reach the Engine");
+    {
+        bool negative_rejected = false, huge_rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--ngram-keepalive-ms", "-1"}); }
+        catch (const std::invalid_argument&) { negative_rejected = true; }
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--ngram-keepalive-ms", "60001"}); }
+        catch (const std::invalid_argument&) { huge_rejected = true; }
+        failures += check(negative_rejected && huge_rejected, "--ngram-keepalive-ms accepted a value outside [0, 60000]");
+    }
 
     // Without --default-max-tokens an omitted request limit is derived per request as the prompt's
     // remaining context, bounded above by --max-context; the flag replaces it with a fixed cap.
@@ -227,6 +750,58 @@ int main() {
                                      "--draft-tokens", "7", "--ngram-draft-tokens", "31"},
                                     "31, 63"),
                       "serve accepted a copy window other than 15, or did not name the wider ones");
+    // Relaxed drafting: off by default, bare is 0.5, a value in [0,1] is kept, the next flag is
+    // never taken as its value, and it needs a speculative backend.
+    failures += check(!default_engine.relaxed_drafting, "relaxed drafting is on by default");
+    const auto relaxed = [&](std::vector<std::string> extra) {
+        std::vector<std::string> args{"ninfer-serve", "model.ninfer", "--spec", "mtp",
+                                      "--draft-tokens", "3"};
+        args.insert(args.end(), extra.begin(), extra.end());
+        return make_engine_options(parse(std::move(args))).relaxed_drafting;
+    };
+    failures += check(relaxed({"--relaxed-drafting"}) == 0.5F, "bare --relaxed-drafting is not 0.5");
+    failures += check(relaxed({"--relaxed-drafting", "0.3"}) == 0.3F &&
+                          relaxed({"--relaxed-drafting", "0"}) == 0.0F &&
+                          relaxed({"--relaxed-drafting", "1"}) == 1.0F,
+                      "a --relaxed-drafting value did not reach the Engine");
+    const ninfer::EngineOptions followed = make_engine_options(
+        parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--relaxed-drafting",
+               "--draft-tokens", "3"}));
+    failures += check(followed.relaxed_drafting == 0.5F && followed.speculative.draft_tokens == 3,
+                      "--relaxed-drafting took the next flag as its value");
+    for (const char* bad : {"-1", "2", "1.5"}) {
+        failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "mtp",
+                                         "--draft-tokens", "3", "--relaxed-drafting", bad},
+                                        "relaxed-drafting"),
+                          "an out-of-range --relaxed-drafting was accepted");
+    }
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--relaxed-drafting"},
+                                    "--relaxed-drafting changes which drafts"),
+                      "--relaxed-drafting without --spec was not refused naming the flag");
+    failures += check(kv_help.find("--relaxed-drafting") != std::string::npos,
+                      "serve help omits --relaxed-drafting");
+    // Draft-head context rows: off by default, a count in [0,2048] reaches the Engine, and it needs
+    // a speculative backend.
+    failures += check(default_engine.draft_context_rows == 0, "draft context rows are on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
+                                                 "--draft-tokens", "3", "--draft-context-rows",
+                                                 "512"}))
+                              .draft_context_rows == 512,
+                      "--draft-context-rows did not reach the Engine");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2",
+                                                 "--draft-tokens", "7", "--draft-context-rows",
+                                                 "2048"}))
+                              .draft_context_rows == 2048,
+                      "--draft-context-rows 2048 was not accepted");
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
+                                     "3", "--draft-context-rows", "2049"},
+                                    "--draft-context-rows N must be in [0,2048]"),
+                      "--draft-context-rows above 2048 was accepted");
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--draft-context-rows", "512"},
+                                    "--draft-context-rows adds rows"),
+                      "--draft-context-rows without --spec was not refused naming the flag");
+    failures += check(kv_help.find("--draft-context-rows") != std::string::npos,
+                      "serve help omits --draft-context-rows");
     // 2^44 MiB shifted by 20 bits wraps a uint64_t to 0; it must be refused, not wrapped.
     for (const char* flag : {"--vram-headroom-mib", "--ram-headroom-mib", "--expert-cache-mib"}) {
         failures += check(serve_rejects({"ninfer-serve", "model.ninfer", flag, "17592186044416"}, "out of range"),
@@ -770,6 +1345,23 @@ int main() {
                           std::string::npos,
                       "serve help omits --context-store");
 
+    // --allowed-host: repeatable, appended in order; a name, never a URL or name:port.
+    failures += check(defaults.allowed_hosts.empty(), "--allowed-host names are set by default");
+    const ServeOptions hosts = parse({"ninfer-serve", "model.ninfer", "--allowed-host",
+                                      "gpubox.lan", "--allowed-host", "[fe80::5]"});
+    failures += check(hosts.allowed_hosts == std::vector<std::string>{"gpubox.lan", "[fe80::5]"},
+                      "--allowed-host did not append each name");
+    for (const char* bad : {"", "http://gpubox", "gpubox:8080", "gpubox/v1", "fe80::5", "a b",
+                            "*", "*.lan", "gpu%box", "gpubox?", "user@gpubox"}) {
+        failures += check(rejected({"ninfer-serve", "model.ninfer", "--allowed-host", bad}),
+                          "--allowed-host accepted something that is not a host name");
+    }
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--allowed-host"}),
+                      "--allowed-host without a value was accepted");
+    failures += check(serve_usage_text("ninfer-serve").find("--allowed-host NAME") !=
+                          std::string::npos,
+                      "serve help omits --allowed-host");
+
     // Model suspend.
     failures += check(!defaults.suspend.enabled && defaults.sleep_idle_seconds == 0 &&
                           defaults.suspend.auto_resume,
@@ -1275,6 +1867,17 @@ int main() {
                                        "4096"}) == 4096,
                           "/props did not report the effective --max-output-tokens cap");
     }
+
+    failures += config_strings_numbers_bools_arrays();
+    failures += config_refuses_api_key();
+    failures += config_unknown_key_names_file();
+    failures += cli_overrides_file();
+    failures += bool_without_negation_errors();
+    failures += sources_recorded();
+    failures += config_relative_paths_follow_cwd();
+    failures += config_router_model_arguments();
+    failures += shipped_profiles_parse();
+    std::filesystem::remove_all(config_directory());
 
     return failures == 0 ? 0 : 1;
 }

@@ -139,6 +139,8 @@ struct TargetVerifyFrameView {
     Tensor licensed_tokens;
     Tensor licensed_counts;
     Tensor accepted_drafts;
+    // Relaxed drafting's per-row count, or empty: no data selects the exact acceptance instances.
+    Tensor relaxed_kept;
     Tensor selected_hidden;
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;

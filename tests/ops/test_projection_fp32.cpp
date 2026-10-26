@@ -1,19 +1,21 @@
 // Adapted from Infernix a3edb450 tests/ops/linear/test_projection_fp32.cpp (Apache-2.0).
 // Modified for NInfer-3090: the BF16 cases are kept (the q8_g32_fp16/q4_g64_fp16 and BF16 tall
-// and tensor-core head cases are not ported, nor are those routes), and GGML IQ4_XS head cases are
-// new.
+// and tensor-core head cases are not ported, nor are those routes), and GGML IQ4_XS, Q6_K and Q5_K
+// head cases are new.
 //
 // projection_fp32 against the FP64 product of the represented weights and activations, within the
 // documented FP32 accumulation bound sum_k |w x| * K * 2^-24, plus its column invariance: a
-// column's bits do not depend on the batch width or the column's position. For the IQ4_XS head
+// column's bits do not depend on the batch width or the column's position. For the GGML heads
 // the weight is decoded by the test-owned exact decoder (ops/ggml_blocks_decode.h) and x passes
-// through an independent host copy of the Q8_1 cast, the contract's activation cast.
+// through an independent host copy of the Q8_1 cast, the contract's activation cast. The affine
+// Q5_K head's bound sums (|d sc q| + |dmin m|) |x| instead of |w x| (projection_fp32.h).
 
 #include "ninfer/ops/projection_fp32.h"
 
 #include "core/arena.h"
 #include "core/weight.h"
 #include "ops/ggml_blocks_decode.h"
+#include "ops/ggml_linear_emulation.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -71,11 +73,13 @@ void random_activations(std::int32_t k, std::int32_t t, std::uint32_t seed,
 
 // w(r, i): the represented weight value of row r, column i.
 using WeightAt = std::function<double(std::int32_t, std::int32_t)>;
+// The magnitude the bound scales for row r and column c (default: sum_k |w x|).
+using MagnitudeAt = std::function<double(std::int32_t, std::int32_t)>;
 
 // Checks out [t][n] against the FP64 product on `rows` (all rows when empty).
 void verify(const std::string& tag, const std::vector<float>& out, const WeightAt& w,
             const std::vector<float>& x, std::int32_t n, std::int32_t k, std::int32_t t,
-            const std::vector<std::int32_t>& rows) {
+            const std::vector<std::int32_t>& rows, const MagnitudeAt& magnitude = {}) {
     std::vector<std::int32_t> all;
     if (rows.empty()) {
         for (std::int32_t r = 0; r < n; ++r) { all.push_back(r); }
@@ -96,6 +100,7 @@ void verify(const std::string& tag, const std::vector<float>& out, const WeightA
                         ref += p;
                         mag += std::fabs(p);
                     }
+                    if (magnitude) { mag = magnitude(r, c); }
                     const double got   = out[static_cast<std::size_t>(c) * n + r];
                     const double bound = mag * k * std::ldexp(1.0, -24) + 1e-30;
                     worst[id] = std::max(worst[id], std::fabs(got - ref) / bound);
@@ -234,7 +239,7 @@ void bf16_wide_case(const std::vector<std::int32_t>& rows, std::int32_t k, std::
     for (auto* p : devices) { cudaFree(p); }
 }
 
-// --- the IQ4_XS head -------------------------------------------------------------------------------
+// --- the GGML heads (IQ4_XS, Q6_K, Q5_K) ---------------------------------------------------------
 
 // The contract's Q8_1 cast of BF16 values [t][k], host side: per 32 values d = amax / 127 and
 // q = rne(x * (127 / amax)); returns the represented values q * d.
@@ -253,28 +258,36 @@ std::vector<float> cast_q81(const std::vector<std::uint16_t>& x) {
     return out;
 }
 
-// Random IQ4_XS blocks (every code byte is valid) with finite FP16 super-scales of either sign.
-std::vector<std::uint8_t> iq4_xs_blocks(std::int32_t n, std::int32_t k, std::uint32_t seed) {
-    const ninfer::GgmlBlock block = ninfer::ggml_block(QType::GGML_IQ4_XS);
+const char* head_name(QType format) {
+    return format == QType::GGML_IQ4_XS ? "iq4_xs" : format == QType::GGML_Q6_K ? "q6_k" : "q5_k";
+}
+
+// Random blocks (every code byte is valid) with finite FP16 super-scales of either sign (Q5_K: d
+// and dmin; Q6_K: its d after the codes).
+std::vector<std::uint8_t> head_blocks(QType format, std::int32_t n, std::int32_t k, std::uint32_t seed) {
+    const ninfer::GgmlBlock block = ninfer::ggml_block(format);
     const std::size_t blocks      = static_cast<std::size_t>(n) * (k / block.values);
     std::vector<std::uint8_t> bytes(blocks * block.bytes);
     std::mt19937 rng(seed);
     for (auto& b : bytes) b = static_cast<std::uint8_t>(rng());
+    const std::size_t at = format == QType::GGML_Q6_K ? 208 : 0;
     for (std::size_t i = 0; i < blocks; ++i) {
-        const auto h = static_cast<std::uint16_t>(((rng() & 1U) << 15) |
-                                                  ((static_cast<unsigned>(-14 + static_cast<int>(rng() % 4)) + 15U) << 10) |
-                                                  (rng() & 0x3FFU));
-        std::memcpy(&bytes[i * block.bytes], &h, 2);
+        for (int field = 0; field < (format == QType::GGML_Q5_K ? 2 : 1); ++field) {
+            const auto h = static_cast<std::uint16_t>(((rng() & 1U) << 15) |
+                                                      ((static_cast<unsigned>(-14 + static_cast<int>(rng() % 4)) + 15U) << 10) |
+                                                      (rng() & 0x3FFU));
+            std::memcpy(&bytes[i * block.bytes + at + 2 * field], &h, 2);
+        }
     }
     return bytes;
 }
 
-ninfer::Weight iq4_xs_weight(std::int32_t n, std::int32_t k, void* data) {
-    const ninfer::GgmlBlock block = ninfer::ggml_block(QType::GGML_IQ4_XS);
+ninfer::Weight head_weight(QType format, std::int32_t n, std::int32_t k, void* data) {
+    const ninfer::GgmlBlock block = ninfer::ggml_block(format);
     ninfer::Weight w;
     w.payload       = data;
     w.payload_bytes = static_cast<std::uint64_t>(n) * (k / block.values) * block.bytes;
-    w.qtype         = QType::GGML_IQ4_XS;
+    w.qtype         = format;
     w.layout        = ninfer::QuantLayout::GgmlBlocks;
     w.ndim          = 2;
     w.n = w.shape[0] = w.padded_shape[0] = n;
@@ -287,11 +300,12 @@ ninfer::Weight iq4_xs_weight(std::int32_t n, std::int32_t k, void* data) {
 
 // N rows of K = 2560; `sampled` checks every 977th row and the last against FP64 (the vocabulary
 // head's 248,320 rows), otherwise every row.
-void iq4_xs_case(std::int32_t n, std::uint32_t seed, bool sampled) {
+void head_case(QType format, std::int32_t n, std::uint32_t seed, bool sampled) {
     constexpr std::int32_t k = 2560;
-    const auto bytes         = iq4_xs_blocks(n, k, seed);
+    const std::string name   = head_name(format);
+    const auto bytes         = head_blocks(format, n, k, seed);
     auto* dw                 = device(bytes);
-    const ninfer::Weight weight = iq4_xs_weight(n, k, dw);
+    const ninfer::Weight weight = head_weight(format, n, k, dw);
     std::vector<std::int32_t> rows;
     if (sampled) {
         for (std::int32_t r = 0; r < n; r += 977) { rows.push_back(r); }
@@ -300,14 +314,16 @@ void iq4_xs_case(std::int32_t n, std::uint32_t seed, bool sampled) {
         for (std::int32_t r = 0; r < n; ++r) { rows.push_back(r); }
     }
     // The decoded rows the oracle reads (only those checked).
-    const std::size_t row_bytes = static_cast<std::size_t>(k) / 256 * 136;
+    const std::size_t row_bytes = static_cast<std::size_t>(k) / 256 * ninfer::ggml_block(format).bytes;
+    namespace em = ninfer::test::ggml_linear;
+    std::vector<std::vector<em::AffineSub>> affine(em::is_affine(format) ? n : 0);
     std::vector<float> decoded(static_cast<std::size_t>(n) * (sampled ? 0 : k));
     std::vector<std::vector<float>> sampled_rows;
     std::vector<std::int32_t> index_of(sampled ? n : 0, -1);
     for (const std::int32_t r : rows) {
         const auto values = ninfer::test::ggml::decode_blocks(
-            QType::GGML_IQ4_XS,
-            std::as_bytes(std::span<const std::uint8_t>(bytes.data() + r * row_bytes, row_bytes)));
+            format, std::as_bytes(std::span<const std::uint8_t>(bytes.data() + r * row_bytes, row_bytes)));
+        if (!affine.empty()) { affine[r] = em::affine_row(format, bytes.data() + r * row_bytes, k); }
         if (sampled) {
             index_of[r] = static_cast<std::int32_t>(sampled_rows.size());
             sampled_rows.push_back(values);
@@ -335,11 +351,17 @@ void iq4_xs_case(std::int32_t n, std::uint32_t seed, bool sampled) {
         cudaMalloc(&dout, sizeof(float) * static_cast<std::size_t>(n) * t);
         Tensor x(dx, DType::BF16, {k, t}), out(dout, DType::FP32, {n, t});
         ninfer::ops::projection_fp32(x, weight, out, nullptr);
-        if (cudaDeviceSynchronize() != cudaSuccess) { throw std::runtime_error("projection iq4_xs failed"); }
+        if (cudaDeviceSynchronize() != cudaSuccess) { throw std::runtime_error("projection " + name + " failed"); }
         std::vector<float> host(static_cast<std::size_t>(n) * t);
         cudaMemcpy(host.data(), dout, host.size() * sizeof(float), cudaMemcpyDeviceToHost);
-        verify("iq4_xs N=" + std::to_string(n) + " T=" + std::to_string(t), host, w, cast_q81(bits), n,
-               k, t, rows);
+        MagnitudeAt magnitude;
+        em::Q81 q81;
+        if (!affine.empty()) {
+            q81       = em::cast_q81(bits, k, t);
+            magnitude = [&](std::int32_t r, std::int32_t c) { return em::term_magnitude(affine[r], q81, k, c); };
+        }
+        verify(name + " N=" + std::to_string(n) + " T=" + std::to_string(t), host, w, cast_q81(bits), n, k, t,
+               rows, magnitude);
         if (t == 1) {
             single = host;
         } else {
@@ -356,7 +378,7 @@ void iq4_xs_case(std::int32_t n, std::uint32_t seed, bool sampled) {
             same = same && std::memcmp(last.data(), host.data() + static_cast<std::size_t>(t - 1) * n,
                                        sizeof(float) * n) == 0;
             cudaFree(dlast);
-            check(same, "iq4_xs column invariance (first and last column) T=" + std::to_string(t));
+            check(same, name + " column invariance (first and last column) T=" + std::to_string(t));
         }
         cudaFree(dx);
         cudaFree(dout);
@@ -369,14 +391,14 @@ void iq4_xs_case(std::int32_t n, std::uint32_t seed, bool sampled) {
             float* dout = nullptr;
             cudaMalloc(&dout, sizeof(float) * bad_n);
             Tensor x(dx, DType::BF16, {bad_k, 1}), out(dout, DType::FP32, {bad_n, 1});
-            const ninfer::Weight bad = iq4_xs_weight(bad_n, bad_k, dw);
+            const ninfer::Weight bad = head_weight(format, bad_n, bad_k, dw);
             try {
                 ninfer::ops::projection_fp32(x, bad, out, nullptr);
             } catch (const std::invalid_argument&) { threw = true; }
             cudaFree(dx);
             cudaFree(dout);
         } catch (const std::runtime_error&) {}
-        check(threw, "iq4_xs N=" + std::to_string(bad_n) + " K=" + std::to_string(bad_k) + " is refused");
+        check(threw, name + " N=" + std::to_string(bad_n) + " K=" + std::to_string(bad_k) + " is refused");
     }
     // An activation view off the 16-byte grid is refused (the Q8_1 cast reads x with uint4 loads).
     {
@@ -390,7 +412,7 @@ void iq4_xs_case(std::int32_t n, std::uint32_t seed, bool sampled) {
         } catch (const std::invalid_argument&) { threw = true; }
         cudaFree(dx);
         cudaFree(dout);
-        check(threw, "iq4_xs refuses a misaligned x");
+        check(threw, name + " refuses a misaligned x");
     }
     cudaFree(dw);
 }
@@ -411,8 +433,28 @@ int main() {
         bf16_wide_case({512, 1}, 2560, 4096, 37);       // a 4096-token prefill chunk's router
         bf16_wide_case({7, 300, 1, 64}, 3072, 301, 41); // K at its limit, partial CTA range and pass
         bf16_wide_case({129}, 1024, 135, 43);
-        iq4_xs_case(1000, 51, false);
-        iq4_xs_case(248320, 53, true); // the Flash-Next LM head, sampled rows
+        for (const QType format : {QType::GGML_IQ4_XS, QType::GGML_Q6_K, QType::GGML_Q5_K}) {
+            head_case(format, 1000, 51, false);
+            head_case(format, 248320, 53, true); // the Flash-Next LM head, sampled rows
+        }
+        // A head format outside the registry (Q4_K) is refused.
+        {
+            bool threw = false;
+            void* dw   = nullptr;
+            cudaMalloc(&dw, static_cast<std::size_t>(2) * 10 * 144);
+            void* dx = nullptr;
+            float* dout = nullptr;
+            cudaMalloc(&dx, 2560 * 2);
+            cudaMalloc(&dout, 2 * sizeof(float));
+            Tensor x(dx, DType::BF16, {2560, 1}), out(dout, DType::FP32, {2, 1});
+            try {
+                ninfer::ops::projection_fp32(x, head_weight(QType::GGML_Q4_K, 2, 2560, dw), out, nullptr);
+            } catch (const std::invalid_argument&) { threw = true; }
+            cudaFree(dw);
+            cudaFree(dx);
+            cudaFree(dout);
+            check(threw, "a Q4_K head is refused");
+        }
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << "\n";
         return 1;

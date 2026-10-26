@@ -8,13 +8,15 @@
 // (docs/maintainer/flash-next-context-cache.md), one lane, MTP speculation (Infernix's drafter,
 // verification and commit), image input (Infernix's vision program: the tower encodes in frames
 // lent by the expert cache at the prompt's first prefill unit, the handoff stays lent until the
-// prompt's last call), no n-gram copy drafts, CPU-served misses or SSD expert tier.
+// prompt's last call), CPU-served misses in verification rounds only (opt-in), no n-gram copy
+// drafts or SSD expert tier.
 //
 // The Qwen4Exp Program: the Engine-facing execution of Qwen3.8-Flash-Next. It owns the lane, its
 // paged INT8 KV (an elastic VMM pool), recurrent state, sampling state and the one pending model
 // unit, the VRAM expert cache (LFRU frames, warm-start state) and the decode CUDA graph. Prompts and
 // outputs use the Qwen3.5 frontend (the same tokenizer and chat template).
 
+#include "core/gdn_replay_records.h"
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/frontend/output_session.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
@@ -24,6 +26,7 @@
 #include "models/qwen3_5/program/program.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/memory_plan.h"
+#include "models/qwen4_exp/program/expert_cache/expert_cache.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/request.h"
@@ -247,6 +250,7 @@ struct CommitRowResult {
         std::uint64_t ngram_rounds          = 0;
         std::uint64_t ngram_drafted_tokens  = 0;
         std::uint64_t ngram_accepted_tokens = 0;
+        std::uint64_t relaxed_kept          = 0;
     } speculative_counters;
 };
 
@@ -326,12 +330,37 @@ struct ProgramDevicePlan {
     std::uint64_t residency = 0; // the expert frame tables and route log
     // MTP speculation: verification records, tail copies, the drafter's residuals and round words.
     std::uint64_t speculation = 0;
+    // --shared-expert-stream: the static workspace's room for the shared expert's side-stream carve
+    // at its widest call (plan_shared_expert_workspace; 0 when off), allocated with `workspace`.
+    std::uint64_t shared_expert_workspace = 0;
+    // --mtp-constrained: a verification round's grammar masks, one per draft and the bonus position
+    // (plan_mtp_constrained_masks; 0 when off or without MTP).
+    std::uint64_t mtp_constrained_masks = 0;
+    // --mtp-joint-acceptance: the drafts' probabilities, one FP32 word per draft
+    // (plan_mtp_draft_probs; 0 when off or without MTP).
+    std::uint64_t mtp_draft_probs = 0;
+    // --hot-embedding-rows: the device copy of the token embedding's first rows
+    // (plan_hot_embedding(...).hot; 0 when off). The whole table is in the pinned block then.
+    std::uint64_t hot_embedding = 0;
+    // --cpu-verify-misses or --prefill-cpu-share: the CPU miss service's device counter of published
+    // requests (plan_cpu_misses(...).device; 0 when both are off). Its channel and the calls' error
+    // word are pinned host memory (.pinned), charged to the RAM ledger.
+    std::uint64_t cpu_misses = 0;
+    // --hc-int8: the int8 copies of every mixer's hyper-connection matrices (plan_hc_int8; 0 when
+    // off), beside the BF16 weights, which stay loaded.
+    std::uint64_t hc_int8_bytes = 0;
+    // --ngram-flag-wait: the device counter of the round graphs' flag waits
+    // (plan_ngram_flag_wait(...).device; 0 when off). The flag and the error word are pinned host
+    // memory (.pinned), charged to the RAM ledger.
+    std::uint64_t ngram_flag_wait = 0;
     std::uint64_t expert_record_stride = 0; // one expert frame
     std::uint32_t max_frames           = 0; // the most frames the expert cache uses
     std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate (counts both halves of the split decode)
 
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept {
-        return kv + workspace + staging + state + io + residency + speculation;
+        return kv + workspace + staging + state + io + residency + speculation + shared_expert_workspace +
+               mtp_constrained_masks + mtp_draft_probs + hot_embedding + cpu_misses + hc_int8_bytes +
+               ngram_flag_wait;
     }
 };
 
@@ -342,11 +371,18 @@ struct ProgramOptions {
     std::uint32_t prefill_chunk   = 1024;
     bool use_cuda_graph           = true;
     std::filesystem::path ngram_volume;
+    // The n-gram volume's keep-alive period in milliseconds (0: off); see FlashNextOptions.
+    std::uint32_t ngram_keepalive_ms = 40;
     // The expert cache's saved state: read at startup to fill the frames (warm start), written at
     // shutdown and, between requests, every 10 minutes. Empty: no warm start. The identity names
     // the artifact the state belongs to.
     std::filesystem::path expert_state;
     std::string expert_state_identity;
+    // The default state shipped beside the model: read (never written) only when `expert_state`
+    // is set and could not be used, so a fresh install starts warm. Its identity is the artifact
+    // id, which every copy of the conversion shares. Empty: none.
+    std::filesystem::path default_expert_state;
+    std::string default_expert_state_identity;
     // Device memory left free for the display and other programs once the fixed allocations and
     // the expert frames are made; empty selects it from the display state.
     std::optional<std::uint64_t> vram_headroom;
@@ -371,6 +407,23 @@ struct ProgramOptions {
     // (Infernix measured 0.38 on the RTX 5090), and a measurement mode that always drafts the most.
     double mtp_width_cost = 0.38;
     bool mtp_fixed_drafts = false;
+    // A constrained row speculates too: the verification takes one grammar mask per position from
+    // the round's drafts (FlashNextOptions::mtp_constrained). Off: a constrained row decodes plain.
+    bool mtp_constrained = false;
+    // Basalt's joint-acceptance draft length (FlashNextOptions::mtp_joint_acceptance): every round
+    // drafts the ceiling (mtp_draft_tokens, or less near the request's end) with each draft's
+    // probability, then verifies joint_acceptance_window of them (draft_policy.h) under the lane's
+    // JointAcceptanceThreshold. It replaces the acceptance-estimate policy; with mtp_fixed_drafts
+    // it is refused. Off: the drafter graphs, the drafts and the window are as before.
+    bool mtp_joint_acceptance = false;
+    // EngineOptions::relaxed_drafting is set: a sampled verification whose request has a threshold
+    // runs the relaxed acceptance instance (relaxed drafting; changes the output distribution).
+    // Off: every verification runs the exact instance, as before.
+    bool relaxed_drafting = false;
+    // FlashNextOptions::ngram_prefetch: each MTP round reads the anchor column's n-gram rows into
+    // the volume's host cache while the draft graph runs, so verification finds them cached. Only
+    // the host work moves; the rows, the drafts and the output are unchanged.
+    bool ngram_prefetch = false;
     // Image input: the model loaded its vision tower. Prompts with media encode it into frames lent
     // by the expert cache (its io words are planned only when set).
     bool vision = false;
@@ -384,7 +437,175 @@ struct ProgramOptions {
     std::uint64_t context_nvme_bytes = 0;
     std::filesystem::path context_nvme_path;
     std::uint64_t context_bounce_bytes = 128ULL << 20;
+    // Each MoE block's shared expert on a side stream beside the routed experts (high priority in
+    // eager calls; graph replays ignore it) (execution::ForwardOptions::shared_expert_stream).
+    // Designed to give the same outputs, bit for bit; not yet checked on a GPU.
+    bool shared_expert_stream = false;
+    // FlashNextOptions::hot_embedding_rows: the model loaded its token embedding into the pinned
+    // block (plan_load with hot_embedding), and the Program copies its first rows to the device; the
+    // forward reads the rest from the pinned block (execution::ForwardOptions::hot_embedding_rows).
+    // 0: the embedding is in device memory.
+    std::uint32_t hot_embedding_rows = 0;
+    // FlashNextOptions::gdn_head_map: the GDN recurrence reads the key heads in place through the
+    // tiled head map (execution::ForwardOptions::gdn_head_map) instead of tiled copies; the GDN
+    // replay records then hold the key heads only (gdn_records_spec). The same outputs, bit for bit.
+    bool gdn_head_map = false;
+    // FlashNextOptions::moe_precast_input: each routed-expert call casts its input to A8 once
+    // (execution::ForwardOptions::moe_precast_input); the workspace terms include its planes.
+    bool moe_precast_input = false;
+    // FlashNextOptions::moe_gate_up_registers: the routed experts' gate/up rows from registers
+    // (execution::ForwardOptions::moe_gate_up_registers); requires moe_precast_input. No memory.
+    bool moe_gate_up_registers = false;
+    // FlashNextOptions::moe_fused_route: decode-width routed-expert calls route and dispatch in one
+    // launch (execution::ForwardOptions::moe_fused_route). No memory.
+    bool moe_fused_route = false;
+    // FlashNextOptions::cpu_verify_misses: a CPU miss service (ops::offloaded_moe::CpuMissService)
+    // over the expert banks, running for the Program's life; each MTP verification's routed experts
+    // hand it some of their misses (execution::ForwardExperts::cpu), computed by its worker team
+    // while the GPU runs the other experts and the shared expert. The same outputs, bit for bit. A
+    // round whose CPU leg times out throws (its request ends with an error, nothing of the round is
+    // committed); once the service thread has failed, rounds decode plain.
+    // Requires MTP (mtp_draft_tokens > 0). cpu_verify_workers: the team's threads, the service thread
+    // included (1..64).
+    bool cpu_verify_misses           = false;
+    std::uint32_t cpu_verify_workers = 6;
+    // FlashNextOptions::prefill_cpu_share (num / den, num 0: off): the same service (started for
+    // either option) takes that share of each layer's misses in prefill and forced-token calls
+    // (execution::ForwardExperts::prefill_cpu, ForwardBatch::cpu_share), the fewest-column ones of
+    // at most 8 columns first, while the GPU stages and runs the rest. A streamed call instead leaves
+    // that share of each layer's experts, the lowest LFRU use counts, out of the expert stream
+    // (ExpertStream::Share), and the CPU takes every one of those misses of at most 8 columns. The
+    // same outputs, bit for bit. A call whose CPU leg times out throws (its request ends with an error);
+    // once the service thread has failed, prefill stays on the GPU. 0 <= num <= den, 1 <= den <= 32767.
+    std::uint32_t prefill_cpu_share_num = 0;
+    std::uint32_t prefill_cpu_share_den = 1;
+    // FlashNextOptions::gdn_async_commit: a verification commit the row continues from folds its
+    // GDN columns on the Program's fold stream (gdn_fold_on_side_stream); every later device use of
+    // the state (the next round's front, any other entry point) waits for it. Requires MTP
+    // (mtp_draft_tokens > 0). The same state, bit for bit. No device memory (a stream and two events).
+    bool gdn_async_commit = false;
+    // FlashNextOptions::hc_int8: the Program makes int8 copies of every mixer's hyper-connection
+    // matrices at construction (execution::HcInt8Copies, ProgramDevicePlan::hc_int8_bytes) and the
+    // forward's mixer calls of up to 16 columns read them (execution::ForwardOptions::hc_int8;
+    // calls of more than 16 columns keep the BF16 weights). Changes the numerics; no workspace.
+    bool hc_int8 = false;
+    // FlashNextOptions::hc_fused_read: every decode-width routed-expert block's input is read by one
+    // ops::hc_fused_read (execution::ForwardOptions::hc_fused_read: the previous inject, the int8
+    // mixer, the router, routing, dispatch and the A8 cast of x). Requires hc_int8. Bitwise the
+    // outputs of hc_int8 alone; the workspace terms add Forward::hc_fused_read_workspace_bytes.
+    bool hc_fused_read = false;
+    // FlashNextOptions::ngram_flag_wait: a single-row plain round and an MTP verification run as one
+    // graph (ngram_rows_in_graph): the front, wait_flag_sequence (core/host_flag_wait.h) on the
+    // Program's mapped flag, the rows' copy from the pinned block, the back. The host reads the rows
+    // into the pinned block after launching the graph and raises the flag. Bitwise the two-part
+    // round. A wait that times out (the host did not raise the flag within kWaitFlagTimeoutNs) fails
+    // the round: its request ends with an error and nothing of it is committed. Memory:
+    // plan_ngram_flag_wait.
+    bool ngram_flag_wait = false;
+    // FlashNextOptions::ggml_decode_mma: the forward's GGML dense Linears of at most 8 columns run
+    // the int8 tensor-core decode route (execution::ForwardOptions::ggml_decode_mma). Changes the
+    // numerics (summation order); no memory, no workspace.
+    bool ggml_decode_mma = false;
+    // FlashNextOptions::partial_ram_residency: the model's text banks were left in the artifact
+    // (plan_load with partial). The Program reads `partial_vram_keys` (hottest first) into frames,
+    // where they live only in VRAM, and every other expert into `partial_slots[l]` pinned RAM slots of
+    // layer l (plan_partial_ram), from `artifact_path`. Promotions keep their RAM copy; evicting an
+    // expert held only in VRAM writes it back first (ExpertResidency::PartialSetup). The frame pool
+    // keeps its startup size (no VRAM monitor), the whole KV is mapped at startup (no frames taken
+    // for it) and no frames are lent (prefill runs static calls, no expert stream). The same outputs,
+    // bit for bit. Refused when the frames cannot hold every VRAM key.
+    bool partial_ram_residency = false;
+    std::vector<std::uint32_t> partial_slots;
+    std::vector<std::uint32_t> partial_vram_keys;
+    std::filesystem::path artifact_path;
+    // The saved expert state the startup already read for the placement (its counts seed the LFRU);
+    // empty: the Program reads `expert_state` itself.
+    std::shared_ptr<const expert_cache::SavedState> partial_state;
 };
+
+// --ngram-flag-wait: whether a round runs as one graph that waits for its n-gram rows (true) or in
+// two parts around the host's row read, as off. Only with the option and CUDA graphs on, and once
+// the round's two parts have run eagerly (`eager_done`: their kernels' one-time setup is done, and
+// a round never spins on the device while the host could still block on it), and not when launches
+// are serialized (`launch_blocking`: CUDA_LAUNCH_BLOCKING=1 at startup, where every one-graph round
+// would time out, since the host raises the flag only after the launch returns).
+[[nodiscard]] bool ngram_rows_in_graph(const ProgramOptions& options, bool eager_done,
+                                       bool launch_blocking = false) noexcept;
+
+// The memory of --ngram-flag-wait: `device` is ProgramDevicePlan::ngram_flag_wait (the waits'
+// 4-byte sequence counter), `pinned` the mapped flag and error word (one 64-byte line each). Both 0
+// without ngram_flag_wait.
+struct NgramFlagPlan {
+    std::uint64_t device = 0;
+    std::uint64_t pinned = 0;
+};
+[[nodiscard]] NgramFlagPlan plan_ngram_flag_wait(const ProgramOptions& options) noexcept;
+
+// --gdn-async-commit: whether a verification commit runs its GDN replay fold on the fold stream
+// (true) or on the device stream as before. Only a commit the row continues from (`terminal`
+// false) goes to the fold stream: a terminal one (the end of the request, or of its budget) folds
+// on the device stream, so the state is final before the Engine sees the round.
+[[nodiscard]] bool gdn_fold_on_side_stream(const ProgramOptions& options, bool terminal) noexcept;
+
+// ProgramDevicePlan::hc_int8_bytes of these options: execution::HcInt8Copies::bytes of the mixers
+// the Program binds, from the configuration (each layer's attn_hc and mlp_hc with their injection
+// rows, the final mixer without, and with MTP the drafter's two block mixers and final mixer: 97,
+// or 100 with MTP, on Flash-Next); 0 without hc_int8.
+[[nodiscard]] std::uint64_t plan_hc_int8(const ProgramOptions& options, const TextConfig& config);
+
+// --hc-fused-read's share of the forward workspace for calls of up to `columns` columns
+// (execution::Forward::hc_fused_read_workspace_bytes), part of ProgramDevicePlan::workspace (the
+// static arena and the drafter step's term); 0 without hc_fused_read. The wide prefill arena takes
+// none (its calls are wider than the fused read).
+[[nodiscard]] std::size_t plan_hc_fused_read_workspace(const ProgramOptions& options, const TextConfig& config,
+                                                       std::int32_t columns);
+
+// The CPU miss service of --cpu-verify-misses and --prefill-cpu-share (one service, started for
+// either) and its memory. Its channel buffers fit the larger use: max_jobs CPU-served experts per
+// layer call and calls of up to max_columns columns. The verification channel (0 without
+// cpu_verify_misses or MTP): verify_jobs experts per call (the service's default 4), calls of up to
+// 1 + mtp_draft_tokens columns, M / pcie_divisor misses left on the GPU. The prefill channel (0
+// without prefill_cpu_share): up to offloaded_moe::kMaxCpuJobs experts per call (every miss may go),
+// calls of up to the wider of the static prefill chunk and a streamed call's 4,096 columns (the
+// chunk alone with partial_ram_residency, which streams nothing; at most kMaxCpuCallColumns and the
+// context; a wider call stays on the GPU), share_num / share_den of the
+// misses. `device` is ProgramDevicePlan::cpu_misses (the service's 4-byte request counter); `pinned`
+// its mapped channel (the request, the x columns and the outputs, the done and heartbeat words) and
+// the Program's error word; `pageable` the worker team's buffers. All 0 when neither use is on.
+struct CpuMissPlan {
+    int workers = 0, max_jobs = 0, max_columns = 0;
+    int verify_jobs = 0, verify_columns = 0, pcie_divisor = 0;
+    int prefill_jobs = 0, prefill_columns = 0, share_num = 0, share_den = 0;
+    std::uint64_t device   = 0;
+    std::uint64_t pinned   = 0;
+    std::uint64_t pageable = 0; // the worker team's buffers and the service's job list
+};
+[[nodiscard]] CpuMissPlan plan_cpu_misses(const ProgramOptions& options);
+
+// ProgramDevicePlan::shared_expert_workspace of these options: the side-stream carve
+// (execution::Forward::shared_expert_workspace_bytes) of the static workspace's widest call, a
+// prefill chunk, a round over every lane or an MTP verification; 0 without shared_expert_stream.
+[[nodiscard]] std::uint64_t plan_shared_expert_workspace(const ProgramOptions& options, const TextConfig& config);
+// The widest call on the static workspace the term above is planned for.
+[[nodiscard]] std::uint32_t shared_expert_columns(const ProgramOptions& options);
+// The startup check of --shared-expert-stream: the loaded weights' shared expert Linears take `need`
+// bytes of scratch at calls of up to `columns` columns (execution::Forward::
+// max_shared_expert_scratch_bytes), against the `planned` bytes; refuses (std::invalid_argument
+// naming the flag) when they do not fit.
+void require_shared_expert_workspace(std::uint64_t need, std::uint64_t planned, std::uint32_t columns);
+// ProgramDevicePlan::mtp_constrained_masks of these options over a tokenizer of `public_tokens`:
+// 1 + mtp_draft_tokens masks of ceil(public_tokens / 32) words; 0 without mtp_constrained or MTP.
+[[nodiscard]] std::uint64_t plan_mtp_constrained_masks(const ProgramOptions& options, std::uint32_t public_tokens);
+// ProgramDevicePlan::mtp_draft_probs of these options: one FP32 word per draft (mtp_draft_tokens);
+// 0 without mtp_joint_acceptance or MTP.
+[[nodiscard]] std::uint64_t plan_mtp_draft_probs(const ProgramOptions& options);
+// The GDN replay records of one W-column verification: every GDN layer, one record row. Their key
+// records hold one key head per value head (the copy route), or with gdn_head_map the model's key
+// heads read through the tiled map (spec.head_map Tiled).
+[[nodiscard]] GdnReplayRecordSpec gdn_records_spec(const TextConfig& config, std::int32_t width, bool gdn_head_map);
+// The GDN replay records' share of ProgramDevicePlan::speculation: the records of the widest
+// verification (1 + mtp_draft_tokens columns, gdn_records_spec), 256-byte aligned; 0 without MTP.
+[[nodiscard]] std::uint64_t plan_gdn_record_bytes(const ProgramOptions& options, const TextConfig& config);
 
 class Program {
 public:
@@ -409,6 +630,13 @@ public:
         std::uint32_t frames = 0;
     };
     [[nodiscard]] ExpertCacheCounters expert_cache_counters() const noexcept;
+    // --gdn-async-commit: the GDN replay folds every Program in this process has run on its fold
+    // stream (a test's proof that the option's route ran).
+    [[nodiscard]] static std::uint64_t process_async_gdn_folds() noexcept;
+    // --ngram-flag-wait: the plain rounds, and the MTP verifications, every Program in this process
+    // has run as one graph waiting for their n-gram rows (a test's proof that the option's route ran).
+    [[nodiscard]] static std::uint64_t process_ngram_flag_rounds() noexcept;
+    [[nodiscard]] static std::uint64_t process_ngram_flag_verifications() noexcept;
 
     [[nodiscard]] RequestBasePlan plan_request(PreparedPrompt&& prompt,
                                                const runtime::ResolvedExecutionOptions& options);
