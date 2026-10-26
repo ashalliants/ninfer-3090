@@ -489,10 +489,15 @@ public:
             while (!store_queue_idle() && std::chrono::steady_clock::now() < deadline) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
-            report.uploaded = store->upload_unpublished(deadline);
-            if (store_queue_idle() || std::chrono::steady_clock::now() >= deadline) {
-                // A write still queued or in progress at the deadline has not reached the bucket.
-                report.uploaded = report.uploaded && store_queue_idle();
+            // Writes the store has completed: one that lands during the pass (queued and written
+            // after the scan, so the writer looks idle again) shows as a change here.
+            const auto puts_before = store->stats().puts;
+            report.uploaded        = store->upload_unpublished(deadline);
+            const bool settled = store_queue_idle() && store->stats().puts == puts_before;
+            if (settled || std::chrono::steady_clock::now() >= deadline) {
+                // A write still queued, in progress or landed since the scan has not reached the
+                // bucket.
+                report.uploaded = report.uploaded && settled;
                 break;
             }
         }
