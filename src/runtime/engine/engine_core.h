@@ -4277,15 +4277,18 @@ private:
         const bool reads = &queue == &hydration_queue_; // the other reader only looks the bucket up
         for (;;) {
             HydrationTask task;
-            std::vector<std::uint8_t> reuse;    // the buffer this read goes into
-            std::vector<std::uint8_t> released; // freed outside the lock
+            std::vector<std::uint8_t> reuse; // the buffer this read goes into
             {
                 std::unique_lock lock(hydration_mutex_);
                 const auto woken = [&] { return hydration_stop_ || !queue.empty(); };
-                // Idle with a spare read buffer: let it go once no read came for a while.
+                // Idle with a spare read buffer: let it go once no read came for a while, freed
+                // before waiting on, outside the lock.
                 while (reads && !woken() && !hydration_spare_.empty()) {
                     if (!hydration_cv_.wait_for(lock, kSpareReadBufferIdle, woken)) {
-                        released = std::exchange(hydration_spare_, {});
+                        std::vector<std::uint8_t> released = std::exchange(hydration_spare_, {});
+                        lock.unlock();
+                        released = {};
+                        lock.lock();
                     }
                 }
                 hydration_cv_.wait(lock, woken);
