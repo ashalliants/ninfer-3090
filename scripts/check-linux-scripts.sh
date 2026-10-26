@@ -137,8 +137,8 @@ expand() { python3 -I "$tmp/expand.py" "$@"; }
 
 # Every profile file keeps the layout both launchers read their banner values from: one
 # "key": value pair per line, exactly as json.dumps(..., indent=2) writes it, with scalar values
-# that are not empty and hold no space, comma, colon or quote. Integers stay integers: the server's integer options
-# refuse 1024.0.
+# that are not empty and hold no space, comma, colon or quote. Integers stay integers: the server
+# reads 1024.0 as 1024, but the banner would show "1024.0".
 for profile in "$root"/profiles/*.json; do
   python3 -I - "$profile" <<'LAYOUT' || exit 1
 import json, sys

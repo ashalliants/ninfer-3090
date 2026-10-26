@@ -392,7 +392,11 @@ async function tick() {
     const results = [metrics, load, slots];
     const failed = results.find((r) => r.status !== 200);
     $('keybox').classList.toggle('needed', results.some((r) => r.status === 401));
-    if (results.some((r) => r.status === 0)) {
+    // A poll still in flight when the tab was hidden must not overwrite "Paused".
+    const paused = timer === null && document.hidden;
+    if (paused) {
+      // stop() has said why the page is not updating.
+    } else if (results.some((r) => r.status === 0)) {
       setStatus('critical', 'Cannot reach the server');
     } else if (results.some((r) => r.status === 401)) {
       setStatus('critical', apiKey ? 'The API key was refused' : 'This server needs its API key');
@@ -420,8 +424,7 @@ function start() {
 }
 
 function stop() {
-  if (timer === null) return;
-  clearInterval(timer);
+  if (timer !== null) clearInterval(timer);
   timer = null;
   setStatus('', 'Paused while the tab is hidden');
 }

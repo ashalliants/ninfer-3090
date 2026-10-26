@@ -1,7 +1,8 @@
 // ninfer-serve --config FILE, the reader alone (serve/serve_config_file.h), host only:
-//   - config_strings_numbers_bools_arrays: strings and numbers become "--key value", true the bare
-//     flag, false no word (but a false key), an array the flag once per element; the file's order
-//     is kept and every word knows its key and whether it is a value;
+//   - config_strings_numbers_bools_arrays: strings and numbers become "--key value" (a float with
+//     an integral value as the integer), true the bare flag, false no word (but a false key), an
+//     array the flag once per element; the file's order is kept and every word knows its key and
+//     whether it is a value;
 //   - config_refuses_api_key: an api-key entry is refused, naming the file and the key;
 //   - config_refuses_shapes: config inside a config, a nested object, a null, leading dashes, an
 //     empty key, an array of objects, an array for an option that keeps its last value, a file
@@ -70,6 +71,16 @@ void config_strings_numbers_bools_arrays() {
                                    true,  false, false, true, false, true};
     check(config.values == values, "a word is marked as a value wrongly");
     check(config.false_keys == std::vector<std::string>{"cors"}, "a false key was not reported");
+
+    // A float with an integral value is the integer (the integer options refuse "1024.0"); other
+    // floats keep JSON's spelling.
+    const ConfigWords floats = read_serve_config(write_file(
+        "floats.json", R"({"prefill-chunk": 1024.0, "max-context": 1e3, "seed": -0.0,
+                           "min-p": 1e-2, "top-p": 0.5, "kv-capacity": 65536})"));
+    const std::vector<std::string> float_words{"--prefill-chunk", "1024", "--max-context", "1000",
+                                               "--seed",          "0",    "--min-p",       "0.01",
+                                               "--top-p",         "0.5",  "--kv-capacity", "65536"};
+    check(floats.words == float_words, "integral floats are not written as integers");
 }
 
 void config_refuses_api_key() {
