@@ -49,6 +49,7 @@ struct Settings {
     std::uint32_t layer_slices = 0;
     bool admission_fit_check = false;
     std::uint32_t pending_timeout_ms = 60'000;
+    std::uint32_t max_pending        = 8;
 };
 
 class Rig {
@@ -66,7 +67,7 @@ public:
         EngineOptions options;
         options.max_context           = 1U << 20;
         options.max_concurrency       = settings.lanes;
-        options.max_pending_requests  = 8;
+        options.max_pending_requests  = settings.max_pending;
         options.pending_timeout_ms    = settings.pending_timeout_ms;
         options.prefill_chunk         = settings.chunk;
         options.context_cache.enabled = false;
@@ -615,6 +616,46 @@ void test_lanes_report_prefill_then_decode() {
             "the lane and the queue did not empty once both requests finished");
 }
 
+void test_a_long_queue_lists_its_oldest_waiters() {
+    // 70 requests wait behind the only lane: the snapshot lists the oldest 64, in order, and counts
+    // all 70.
+    constexpr std::uint32_t kWaiters = 70;
+    Rig rig({.chunk = 1024, .lanes = 1, .max_pending = kWaiters + 1});
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool all_submitted = false;
+    std::optional<RuntimeStats> sample;
+    rig.program().before_unit = [&](const Event& event) {
+        if (event.request != 1 || event.kind != Event::Kind::Prefill) { return; }
+        std::unique_lock lock(mutex);
+        if (event.position == 0) {
+            cv.wait(lock, [&] { return all_submitted; });
+        } else if (!sample) {
+            sample = rig.core().runtime_stats();
+        }
+    };
+    std::vector<Result> results;
+    results.push_back(rig.run(1, 2048, 1));
+    for (std::uint64_t id = 2; id <= kWaiters + 1; ++id) { results.push_back(rig.run(id, 16, 1)); }
+    {
+        std::lock_guard lock(mutex);
+        all_submitted = true;
+    }
+    cv.notify_all();
+    for (const Result& result : results) {
+        require(finished(result), "a request did not finish\n" + rig.dump());
+    }
+    std::lock_guard lock(mutex);
+    require(sample.has_value(), "the second prefill step was not sampled");
+    require(sample->waiting_requests == kWaiters, "the waiting count is not every waiter");
+    require(sample->waiting.size() == kMaximumReportedWaitingRequests,
+            "the listed waiters are not capped at kMaximumReportedWaitingRequests");
+    for (std::size_t i = 0; i < sample->waiting.size(); ++i) {
+        require(sample->waiting[i].request_id == i + 2 && sample->waiting[i].prompt_tokens == 16,
+                "the listed waiters are not the oldest, oldest first");
+    }
+}
+
 void test_idle_lanes() {
     Rig rig({.chunk = 1024, .lanes = 2});
     const auto idle = [](const RuntimeStats& stats) {
@@ -1057,6 +1098,7 @@ int main() {
     run("backlog gauge tracks queued and resident prefill",
         test_backlog_gauge_tracks_queued_and_resident_prefill);
     run("lanes report prefill then decode", test_lanes_report_prefill_then_decode);
+    run("a long queue lists its oldest waiters", test_a_long_queue_lists_its_oldest_waiters);
     run("idle lanes", test_idle_lanes);
     run("layer slices run a neighbour between slices",
         test_layer_slices_run_a_neighbour_between_slices);

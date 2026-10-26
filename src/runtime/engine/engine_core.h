@@ -2150,6 +2150,7 @@ private:
             return false;
         }
         call.finish(call.failed_timing());
+        request->paused_while_replaying = request->is_replaying();
         if (!request->is_replaying()) { request->resume_phase = request->model_state; }
         request->model_state = EngineRequestState::Pausing;
         request->paused_at   = pause_started;

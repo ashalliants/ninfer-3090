@@ -802,8 +802,9 @@ and the design are in `docs/maintainer/pipeline-parallel-plan.md`.
 ## Release history
 
 **v0.14.2:** `--host-cache-max-mib` caps the RAM cache on shared machines. This release also
-added `--max-prefill-lanes` and `GET /slots`, which the current engine no longer provides
-(see [docs/serving.md](docs/serving.md)). See the [v0.14.2 release notes](RELEASE_NOTES_0.14.2.md).
+added `--max-prefill-lanes` and a `GET /slots` with session-file fields. The current `GET /slots`
+is read-only and reports each lane's progress (see [docs/serving.md](docs/serving.md#slots)). See
+the [v0.14.2 release notes](RELEASE_NOTES_0.14.2.md).
 
 **v0.14.1:** a stability fix for `ninfer-serve`. A large or unplannable request no longer fails
 every running request (`internal error generation`) or clears the context cache; only that request

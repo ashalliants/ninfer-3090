@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
-#include <utility>
 
 namespace ninfer::serve {
 
@@ -31,7 +30,7 @@ const char* state_name(ninfer::RuntimeLaneStats::State state) noexcept {
 
 } // namespace
 
-std::string render_slots_json(const ninfer::RuntimeStats& stats) {
+std::string render_slots_json(const ninfer::RuntimeStats& stats, std::uint32_t max_context) {
     Json slots          = Json::array();
     const std::size_t n = std::min<std::size_t>(stats.lane_count, stats.lanes.size());
     for (std::size_t id = 0; id < n; ++id) {
@@ -39,8 +38,10 @@ std::string render_slots_json(const ninfer::RuntimeStats& stats) {
         const bool idle = lane.state == ninfer::RuntimeLaneStats::State::Idle;
         slots.push_back(Json{
             {"id", id},
+            {"is_processing", !idle},
             {"state", state_name(lane.state)},
             {"request_id", idle ? Json(nullptr) : Json(lane.request_id)},
+            {"n_ctx", max_context},
             {"prompt_tokens", lane.prompt_tokens},
             // Prompt tokens in the lane's context so far, reused prefix included: equal to
             // prompt_tokens once prefill is done, like streamed prompt progress.
@@ -54,16 +55,7 @@ std::string render_slots_json(const ninfer::RuntimeStats& stats) {
             {"relaxed_kept", lane.relaxed_kept},
         });
     }
-    Json queue = Json::array();
-    for (const ninfer::RuntimeWaitingStats& waiting : stats.waiting) {
-        queue.push_back(Json{{"id", waiting.request_id},
-                             {"prompt_tokens", waiting.prompt_tokens},
-                             {"waited_s", finite_or_zero(waiting.waited_seconds)}});
-    }
-    return Json{{"slots", std::move(slots)},
-                {"queue", std::move(queue)},
-                {"queue_total", stats.waiting_requests}}
-        .dump();
+    return slots.dump();
 }
 
 } // namespace ninfer::serve

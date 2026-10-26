@@ -234,11 +234,14 @@ void EngineCore<Instance>::publish_runtime_stats() {
 template <class Instance>
 RuntimeLaneStats EngineCore<Instance>::lane_stats(const Request& request,
                                                   Clock::time_point now) noexcept {
-    // A pausing lane reports the phase it will resume in.
-    const EngineRequestState phase = request.model_state == EngineRequestState::Pausing ||
-                                             request.model_state == EngineRequestState::Paused
-                                         ? request.resume_phase
-                                         : request.model_state;
+    // A pausing lane reports the phase it was in: a replay it interrupted, or else the phase it
+    // resumes in.
+    const bool pausing = request.model_state == EngineRequestState::Pausing ||
+                         request.model_state == EngineRequestState::Paused;
+    EngineRequestState phase = request.model_state;
+    if (pausing) {
+        phase = request.paused_while_replaying ? EngineRequestState::Replay : request.resume_phase;
+    }
     const bool prompt_phase = phase == EngineRequestState::Waiting ||
                               phase == EngineRequestState::Materializing ||
                               phase == EngineRequestState::Prefill ||

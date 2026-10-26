@@ -551,9 +551,10 @@ void HttpServer::register_routes() {
         handle_props(req, res);
     });
     server_.Get("/slots", [this](const httplib::Request&, httplib::Response& res) {
-        // The Engine's last published lanes and queue: never waits on the executor.
+        // The Engine's last published lanes: never waits on the executor.
         res.set_header("Cache-Control", "no-store");
-        res.set_content(render_slots_json(service_->runtime_stats()), "application/json");
+        res.set_content(render_slots_json(service_->runtime_stats(), options_.max_context),
+                        "application/json");
     });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);

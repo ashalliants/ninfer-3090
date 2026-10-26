@@ -201,6 +201,9 @@ struct RequestRecord {
     std::uint64_t device_to_host_bytes        = 0;
     std::uint64_t host_to_device_bytes        = 0;
     EngineRequestState resume_phase           = EngineRequestState::Prefill;
+    // The last pause interrupted a replay (resume_phase is then still the phase from before the
+    // replay's own pause), so RuntimeStats::lanes reports the pausing lane as prefilling.
+    bool paused_while_replaying               = false;
     std::uint32_t admission_bypasses          = 0;
     std::uint64_t admission_generation        = 0;
     bool admission_observed                   = false;
