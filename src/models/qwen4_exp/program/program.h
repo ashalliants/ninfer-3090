@@ -437,8 +437,9 @@ struct ProgramOptions {
     std::uint64_t context_nvme_bytes = 0;
     std::filesystem::path context_nvme_path;
     std::uint64_t context_bounce_bytes = 128ULL << 20;
-    // Each MoE block's shared expert on a high-priority side stream beside the routed experts
-    // (execution::ForwardOptions::shared_expert_stream); the same outputs, bit for bit.
+    // Each MoE block's shared expert on a side stream beside the routed experts (high priority in
+    // eager calls; graph replays ignore it) (execution::ForwardOptions::shared_expert_stream).
+    // Designed to give the same outputs, bit for bit; not yet checked on a GPU.
     bool shared_expert_stream = false;
     // FlashNextOptions::hot_embedding_rows: the model loaded its token embedding into the pinned
     // block (plan_load with hot_embedding), and the Program copies its first rows to the device; the

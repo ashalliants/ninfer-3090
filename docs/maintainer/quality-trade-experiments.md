@@ -447,6 +447,8 @@ That limited the head to the [248320, 5120] shape. None of this was run on a GPU
 
 **Worth revisiting only if** a bound much tighter than per-group norms can be proven, or if the
 real 27B's columns turn out to separate far more than these heads. The second case would need a
-measured rescored-row count well under the vocabulary, with greedy identity checked
-(`tools/bench/greedy_identity.py --b-args=...`). The code (codec, kernels, companion object, gathered
-route, tests) is on the local branch `basalt-two-stage-head-attempt`.
+measured rescored-row count well under the vocabulary, with greedy identity checked by an Engine
+harness built on that branch, option off against on: the `ninfer` CLI does not parse the branch's
+head option, so `tools/bench/greedy_identity.py` cannot drive it. The code (codec, kernels, companion object,
+gathered route, tests) is on the branch `basalt-two-stage-head-attempt` on origin, at commit
+`5a834731`.

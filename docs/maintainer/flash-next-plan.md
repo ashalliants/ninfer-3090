@@ -174,11 +174,12 @@ The forward harness has the same gate instead, with the same scoring code (`scor
 `summarize`). Use it to judge a numerics change to the Flash-Next forward. Each such change adds
 its own option to this mode as a harness flag.
 
-The base is a llama.cpp KL-divergence file from a reference model of the same weights. Basalt
-uses a Q8_0 GGUF of Qwen3.8-Flash-Next, the sibling of the GSQ-RCO IQ2_XS GGUF the artifact is
-converted from, with wikitext-2 in 512-token chunks. The llama.cpp build must know the `qwen4exp`
-architecture; Basalt's quality doc names the commit it used (436f6f89e). The base fixes the tokens,
-so the artifact's tokenizer is not involved:
+The base is a llama.cpp KL-divergence file from a higher-precision reference model of the same
+weights, such as a Q8_0 GGUF of Qwen3.8-Flash-Next, with wikitext-2 in 512-token chunks. Basalt's
+gate appears to use such a base, but which Q8_0 file it used, and whether it comes from the same
+checkpoint as the IQ2_XS GGUF the artifact is converted from, was not checked here. The llama.cpp
+build must load the GGUF's architecture; Basalt's notes mention a commit (436f6f89e) that was not
+verified either. The base fixes the tokens, so the artifact's tokenizer is not involved:
 
 ```bash
 llama-perplexity -m qwen3.8-flash-next-q8_0.gguf -f wiki.test.raw -c 512 \
@@ -790,8 +791,8 @@ None has been measured on the RTX 3090 yet.
   kernel; here the staging pass (misses copied to slots before the expert kernels) needs the
   dispatch before gate/up in every decode call, so the narrower change fuses the two launches that
   precede the experts: `ops::moe_route_dispatch` runs, for a call of at most 8 columns
-  (`kMoeRouteDispatchColumns`: decode, MTP drafting and verification), one CTA of 1,024 threads in
-  which warp t routes column t with `route_kernel`'s own code (`route_column`: the top 10 of 512 in
+  (`kMoeRouteDispatchColumns`: decode, MTP drafting and verification), one CTA of 512 threads
+  (`kRouteDispatchThreads`) in which warp t routes column t with `route_kernel`'s own code (`route_column`: the top 10 of 512 in
   FP32 with the lower id on ties, their weights as the renormalised softmax, and the shared gate)
   and the CTA then dispatches the k*T entries as `dispatch_small_kernel` does (counts, the shared
   scan, the route log), except that an entry's place in its expert is its rank among that expert's
@@ -802,8 +803,10 @@ None has been measured on the RTX 3090 yet.
   - The routing is the same code on the same values, so ids, weights and the shared gate are
     designed to equal `moe_route`'s bit for bit (the PTX of the route's floating-point operations is
     the same sequence in both kernels; NVVM has already made every contraction, so ptxas has none
-    to choose). Under the 1,024-thread CTA's 64-register cap the route spills 48 bytes per thread to
-    local memory (L1); `route_kernel` keeps its 72. The counts, offsets, jobs and route log equal
+    to choose). At 512 threads the kernel takes 120 registers and spills nothing
+    (`cuobjdump -res-usage`: REG 120, STACK 0); a first version at 1,024 threads hit the
+    64-register cap and spilled 48 bytes per thread. The dispatch scan's `warp_totals[16..31]` are zeroed, so the scan
+    written for 32 warps is unchanged. The counts, offsets, jobs and route log equal
     `moe_dispatch`'s, and the entries equal `offloaded_moe::plan_dispatch`
     (`src/ops/offloaded_sparse_moe/dispatch_plan.h`, `ninfer_moe_dispatch_plan_test`, cpu and
     host-only). Consumers do not depend on the order within an expert (each column's expert output
@@ -859,21 +862,21 @@ None has been measured on the RTX 3090 yet.
     round is committed and the lane's state is reset. The round is not retried. Later requests use
     the CPU leg again unless the service thread itself has died (`failure()` set): it never answers
     again, so the Program then stops speculating (plain rounds, the same output) and says so once.
-  - Memory: the service's 4-byte device counter is `ProgramDevicePlan::cpu_misses`; its
-    mapped channel (request, x for 1 + drafts columns, y for 4 jobs of 8 columns, the done line)
-    and the error word (220 KiB at 7 drafts) are pinned and charged to the RAM ledger
-    (`plan_cpu_misses`; with `--prefill-cpu-share` too the one channel is sized for that, below). On Windows a pinned allocation is mapped into the GPU's address
-    space too.
+  - Memory: the service's 4-byte device counter is `ProgramDevicePlan::cpu_misses`; its mapped
+    channel (request, x for 1 + drafts columns, y for 4 jobs of 8 columns, the done line) and the
+    error word (220 KiB at 7 drafts) are pinned and charged to the RAM ledger (`plan_cpu_misses`;
+    with `--prefill-cpu-share` too the one channel is sized for that, below). On Windows a pinned
+    allocation is mapped into the GPU's address space too.
   - GPU-session checks: the GPU spins on a mapped host flag inside the verification graph. With a
     display attached (WDDM) a kernel that spins past TdrDelay (2 s) resets the driver; a healthy
-    wait is tens of microseconds, but check that a stalled CPU (heartbeat timeout 1 s) does not
-    trip it, and that 6 spinning CPU threads do not slow the rest of the round. The service
-    thread spins while requests arrive and, after 20 ms without one, sleeps `sleep_for(50 µs)`
-    between polls. On Windows that sleep typically lasts 1-15.6 ms unless the timer resolution is
-    raised, so the first layer of a round after an idle gap (a new request, a slow host step) can
-    wait that long: check on Windows how often a round's first wait is that late. Measure tok/s on vs off at 6, 12 and 16 workers, and the
-    share of layers whose wait finds the answer ready. Works with two lanes and vision. Not
-    measured.
+    wait is tens of microseconds, but check that a stalled CPU (heartbeat timeout 1 s) does not trip
+    it, and that 6 spinning CPU threads do not slow the rest of the round. The service thread spins
+    while requests arrive and, after 20 ms without one, sleeps `sleep_for(50 µs)` between polls. On
+    Windows that sleep typically lasts 1-15.6 ms unless the timer resolution is raised, so the first
+    layer of a round after an idle gap (a new request, a slow host step) can wait that long: check
+    on Windows how often a round's first wait is that late. Measure tok/s on vs off at 6, 12 and 16
+    workers, and the share of layers whose wait finds the answer ready. Works with two lanes and
+    vision. Not measured.
 - **GDN commit on a side stream** (`--gdn-async-commit`, needs `--spec mtp`; F10c of the Basalt
   learnings). `commit_verified` folds the accepted columns into the recurrent state
   (`GdnReplayFoldPlan`, eager, not captured) on the device stream ahead of the QSA tail and PLE
@@ -937,14 +940,16 @@ None has been measured on the RTX 3090 yet.
     the arithmetic reads, before any activation, as the BF16 kernels do; nothing is staged in
     shared memory but `m`. 80 CTAs of 8 warps. A column's result does not depend on T within
     1..16, and the FP16 split represents each `m[k]` within `max(2^-22 |m[k]|, 2^-25)` (for
-    `|m[k]| < 65520`). The int8 form serves only calls of up to 16 columns: wider calls (prefill)
-    keep the BF16 weights and route, bit for bit as off, since the BF16 copies stay loaded. A
+    `|m[k]| < 65520`). The int8 form serves every call of up to 16 columns, a short prefill call
+    (a prompt's tail, say) included; calls of more than 16 columns keep the BF16 weights and route,
+    bit for bit as off, since the BF16 copies stay loaded. A
     composed int8 route (the copies rounded to BF16 in the workspace) returns with the later step
     that drops the BF16 weights. The BF16 kernels compile to the same SASS as before.
   - Memory: the copies are `ProgramDevicePlan::hc_int8_bytes` (`plan_hc_int8`: 97 mixers, 648 MiB;
     100 with the drafter, 668 MiB, plus a 256-byte status word), checked against the mixers the
-    Program binds at construction. No workspace beyond the BF16 route's. The BF16 weights stay loaded in this change (about 0.68 GB more
-    VRAM, about 450 fewer expert frames); dropping them is a later step once the gate passes.
+    Program binds at construction. No workspace beyond the BF16 route's. The BF16 weights stay
+    loaded in this change (about 0.68 GB more VRAM, about 450 fewer expert frames); dropping them is
+    a later step once the gate passes.
   - Qualification: `ninfer_hc_int8_codec_test` (host only: bounds, zero groups, subnormal scales
     and refusals, 1,000 groups against an independent FP64 re-implementation of Basalt's rule);
     `ninfer_qwen4_exp_program_plan_test` (the plan term against the bound mixers);
@@ -954,8 +959,8 @@ None has been measured on the RTX 3090 yet.
     `ninfer_qwen4_exp_forward_real_test --hc-int8-prefill TOKENS` (GPU, not run: a prompt call of
     more than 16 columns gives bitwise the logits of off, and the decode call after it differs).
   - GPU-session checks: `--hc-int8-prefill`; the KLD gate on vs off; the mixer's time at T = 1, 2,
-    4, 8, 16 against the BF16 route (target: the bytes' 0.53); tok/s on vs off. Works with two lanes, MTP and vision.
-    Not measured.
+    4, 8, 16 against the BF16 route (target: the bytes' 0.53); tok/s on vs off. Works with two
+    lanes, MTP and vision. Not measured.
 - **One fused hyper-connection read per routed-expert block** (`--hc-fused-read`, requires
   `--hc-int8`; F10d of the Basalt learnings, Basalt's `hc_fused_kernel` in `hc_fused.cu`). Basalt
   reads a block's input in one persistent kernel: the previous half's inject applied as the residual
@@ -997,8 +1002,8 @@ None has been measured on the RTX 3090 yet.
     `ProgramDevicePlan::workspace` through `plan_hc_fused_read_workspace`. The Op's workspace (the
     mixer's partials and the tickets) is a carve held for the layer, not a scope the Op releases:
     the routing kernel still uses it after the side stream forks at the event the Op records, and
-    the shared expert's allocations must not reuse it before the join. Works with two lanes, MTP (the drafter's MoE block too) and
-    vision; prefill (more than 16 columns) runs as off.
+    the shared expert's allocations must not reuse it before the join. Works with two lanes, MTP
+    (the drafter's MoE block too) and vision; prefill (more than 16 columns) runs as off.
   - GPU-session checks: the identity mode above; nsys of a decode step on vs off (three kernels per
     MLP side, the routing kernel against `projection_fp32`'s 10.2 us at T = 1); tok/s on vs off.
     Not measured.
@@ -1091,7 +1096,7 @@ None has been measured on the RTX 3090 yet.
     buffers sized for the larger use (`plan_cpu_misses`). `MoeCpuChannel` gains `share_num` /
     `share_den` beside `pcie_divisor`, as two 16-bit words in its tail padding, so the struct size and
     every kernel's parameter offsets are unchanged; `share_den > 0` selects the share rule in
-    `cpu_plan_kernel`, otherwise the divisor rule, so verification keeps Task 17's divisor.
+    `cpu_plan_kernel`, otherwise the divisor rule, so verification keeps `--cpu-verify-misses`' divisor.
     `ForwardExperts::prefill_cpu` holds the prefill channels (512 jobs, calls up to the wider of the
     static chunk and the 4,096-column streamed call, at most `kMaxCpuCallColumns` and the context),
     narrowed from the same service channel as the verification's. Layer calls run in stream order and
@@ -1123,8 +1128,9 @@ None has been measured on the RTX 3090 yet.
     MiB over PCIe per layer from one CTA, and thread 0 compacts the columns serially); whether
     leaving experts out of the stream costs more staging (on the SMs, inside the layer) than the CPU
     saves (the share of routed cold experts with more than 8 columns), and whether the cold-set size
-    F is right for streamed calls (it sets how much the CPU takes there); and the WDDM/TDR check of `--cpu-verify-misses` (a layer's wait
-    here is milliseconds). Works with two lanes, MTP and vision. Not measured.
+    F is right for streamed calls (it sets how much the CPU takes there); and the WDDM/TDR check of
+    `--cpu-verify-misses` (a layer's wait here is milliseconds). Works with two lanes, MTP and
+    vision. Not measured.
 - **Relaxed drafting** (`--relaxed-drafting [P]` and the request key `relaxed_drafting`, cross-model;
   X-C of the Basalt learnings, [serving.md](../serving.md#relaxed-drafting)). **A numerics change:
   it changes the output distribution**, which is why it is opt-in and why the KLD gate cannot see
@@ -1149,7 +1155,8 @@ None has been measured on the RTX 3090 yet.
     the bound of `canonical_ggml.h` is now |P_s| <= 32 * 32 * 127^2 = 16,516,096 < 2^24 (tight,
     pinned by `extreme_magnitude_records` in `ninfer_offloaded_moe_cpu_test` on both ISAs); MMA and
     dp4a sums stay below 2^22 and AVX2's byte pairs below 2^15. The existing formats' kernels
-    compile to the base commit's SASS (all 50 narrow kernels and the 5 wide kernels).
+    compile to the base commit's SASS (all 50 narrow kernels and the 6 wide ones: the plan, the
+    input cast, IQ2_XXS/IQ2_S/IQ1_M gate/up and the Q2_0 down).
   - Memory: frames are sized by the largest record stride of the artifact (`frame_stride`), so the
     same frame budget holds fewer frames: 2,662,400 bytes for the IQ3_S pack (its one IQ4_XS layer)
     and 2,329,600 for the IQ3_XXS pack, against 1,510,400 for the IQ2_XS pack.
@@ -1160,7 +1167,7 @@ None has been measured on the RTX 3090 yet.
     route stages them as before (IQ4_XS gate/up: 67,584 bytes of shared memory at 8 columns, one
     CTA per SM).
   - Not yet loadable: the dense, head and embedding formats are the next item; the larger expert
-    banks still need partial residency to fit host RAM (Task 36).
+    banks still need partial residency to fit host RAM (`--partial-ram-residency`).
   - GPU-session checks: `ninfer_offloaded_moe_layer_test` and `ninfer_offloaded_moe_wide_test`
     (every record format bitwise against the CPU engine; compiled, not run), the bench rows of the
     new formats (`ninfer_offloaded_moe_bench`), and whether the wide route's unstaged IQ3/IQ4 slices
@@ -1188,7 +1195,7 @@ None has been measured on the RTX 3090 yet.
     build in one translation unit per first format (the slowest 60 s, the old single unit 105 s).
   - `--hot-embedding-rows` stays IQ4_XS only (`embedding_split`) and is refused at startup for
     the IQ3_XXS pack's IQ3_S embedding.
-  - Loading an IQ3 pack now needs only Task 36's partial expert residency on a 64 GB box (its
+  - Loading an IQ3 pack now needs only `--partial-ram-residency` on a 64 GB box (its
     banks do not fit host RAM whole).
   - GPU-session checks: `ninfer_linear_ggml_test` (new formats, shapes and pairs, Q4_K/Q5_K bit for
     bit against the emulation), `ninfer_linear_ggml_device_decode_test`,
@@ -1204,18 +1211,18 @@ None has been measured on the RTX 3090 yet.
     layer's stride: layer l has min(E, E - N_l + 16) slots, so (E_total - vram_frames + spares) *
     stride with one stride. The Program refuses when its cache comes out smaller than the plan.
   - Runtime (`program/ram_slots.h`, `ExpertResidency::PartialSetup`): every expert has a valid copy
-    in a published frame, a RAM slot or both. A promotion copies from the slot and keeps it (the pool
-    is fixed, so the copy costs no RAM and a later eviction needs no copy). The LFRU's eviction gate
-    lets an expert held only in VRAM leave only when its layer has a slot for it: a free one, else
-    one reclaimed from the layer's best-scoring VRAM resident with a copy (which then lives only in
-    VRAM). The victim is the lowest-scoring resident the gate approves (refused ones are skipped for
-    the step), so a layer whose slots are spent does not stop admissions elsewhere; the gate makes
-    admission the budgeted one-victim loop even when the budget covers every miss. The controller emits `kWriteBack` and holds
-    the frame (`complete_writeback` frees it); the device table keeps the frame until the
-    device-to-host copy lands, then names the slot. Loads read slots on the same copy stream after any
-    write-back into them; a landed load of a key whose write-back event was read not ready publishes
-    the write-backs again first. `plan_swap` checks each round's write-backs against the evictions
-    and refuses an admission without a RAM copy.
+    in a published frame, a RAM slot or both. A promotion copies from the slot and keeps it (the
+    pool is fixed, so the copy costs no RAM and a later eviction needs no copy). The LFRU's eviction
+    gate lets an expert held only in VRAM leave only when its layer has a slot for it: a free one,
+    else one reclaimed from the layer's best-scoring VRAM resident with a copy (which then lives
+    only in VRAM). The victim is the lowest-scoring resident the gate approves (refused ones are
+    skipped for the step), so a layer whose slots are spent does not stop admissions elsewhere; the
+    gate makes admission the budgeted one-victim loop even when the budget covers every miss. The
+    controller emits `kWriteBack` and holds the frame (`complete_writeback` frees it); the device
+    table keeps the frame until the device-to-host copy lands, then names the slot. Loads read slots
+    on the same copy stream after any write-back into them; a landed load of a key whose write-back
+    event was read not ready publishes the write-backs again first. `plan_swap` checks each round's
+    write-backs against the evictions and refuses an admission without a RAM copy.
   - The Op: `MoeExpertSource::host_slots` makes `host_records` a device table of per-expert
     addresses, read by the stage kernel only (a call with host slots must stage), so the expert
     kernels keep the base commit's SASS (88 of 89 narrow-route kernels and all 11 wide ones
@@ -1284,64 +1291,68 @@ None has been measured on the RTX 3090 yet.
 
 ### Verification status
 
-Every item below is compiled for sm_86 and covered by the CPU tests, and none has run on a GPU:
-each is **compiled, CPU-tested, GPU-unverified**. `tools/bench/basalt_gpu_verify.ps1` (Windows,
-under the GPU lock) or `.sh` (the Linux box) runs every GPU check in one go from
-`tools/bench/basalt_options.json`; [tools/bench/README.md](../../tools/bench/README.md#verifying-the-basalt-options-on-a-gpu)
-says how. Kinds: identity = designed bit for bit unchanged, quality = numerics or the output
-distribution change, speed = timing or scheduling only, serving = a server feature. The checks
-named are the script's step ids; every option also has its targeted GPU tests (`tests:<model>`)
-and, where it has a workload, an ABBA A/B at n = 12 (`ab:<flag>`). For an identity option the
-Flash-Next A/B also compares outputs across all 24 processes, on and off: each job's FNV hash of
-its greedy ids (the warm-up job and the measured one) and, with MTP, each job's line of MTP rounds,
-plain steps, drafts and accepted drafts (`print_speculation`) must be the same in every run. The
-27B A/B with greedy sampling compares the answers' text, off against on, per repetition.
+Every item below is compiled for sm_86 and covered by the CPU tests, and none has run on a GPU: each
+is **compiled, CPU-tested, GPU-unverified**. `tools/bench/basalt_gpu_verify.ps1` (Windows, under the
+GPU lock) or `.sh` (the Linux box) runs every GPU check in one go from
+`tools/bench/basalt_options.json`;
+[tools/bench/README.md](../../tools/bench/README.md#verifying-the-basalt-options-on-a-gpu) says how.
+Kinds: identity = designed bit for bit unchanged, quality = numerics or the output distribution
+change, speed = timing or scheduling only, serving = a server feature. The checks named are the
+script's step ids, and the Item column is the issue #383 item (`F<n>`: Flash-Next item n, with the
+issue's sub-items lettered in order; `X-<letter>`: the cross-model items; `S<n>`: the serving and
+process items in the issue's order, S1 the soak harness to S8 the process checks); every option also
+has its targeted GPU tests (`tests:<model>`) and, where it has a workload, an ABBA A/B at n = 12
+(`ab:<flag>`). For an identity option the Flash-Next A/B also compares outputs across all 24
+processes, on and off: each job's FNV hash of its greedy ids (the warm-up job and the measured one)
+and, with MTP, each job's line of MTP rounds, plain steps, drafts and accepted drafts
+(`print_speculation`) must be the same in every run. The 27B A/B with greedy sampling compares the
+answers' text, off against on, per repetition.
 
 Flash-Next options (Qwen3.8-Flash-Next):
 
-| Option | Task | Kind | Checks besides its GPU tests and A/B |
+| Option | Item | Kind | Checks besides its GPU tests and A/B |
 |---|---|---|---|
-| `--ngram-keepalive-ms N` (default 40, was a fixed 100) | 5 | speed | none scripted: TTFT after an idle pause |
-| `--shared-expert-stream` | 7 | identity | `identity:` forward harness, eager and in graphs |
-| `--mtp-constrained` | 8 | identity | `ninfer_qwen4_exp_mtp_constrained_test`; no speed workload |
-| `--mtp-joint-acceptance` | 9 | identity | `identity:` engine `--mtp-exact 3 --mtp-joint-acceptance` |
-| `--ngram-prefetch` | 10 | identity | the A/B: every job's greedy-id hash and MTP rounds, drafts and acceptances equal in all 24 runs |
-| `--default-expert-state FILE` | 11 | speed | `default-expert-state`: export, then a fresh start from it |
-| `--hot-embedding-rows N` | 12 | identity | `ninfer_qwen4_exp_hot_embedding_test` |
-| `--gdn-head-map` | 13 | identity | `identity:` forward harness; `ninfer_qwen4_exp_gdn_head_map_test` |
-| `--moe-precast-input` | 14 | identity | `identity:` forward harness; `ninfer_qwen4_exp_moe_precast_test` |
-| `--moe-gate-up-registers` | 15 | identity | `identity:` forward harness; its engine test (capture-safe occupancy query) |
-| `--moe-fused-route` | 16 | identity | `identity:` forward harness; `ninfer_qwen4_exp_moe_fused_route_test` |
-| `--cpu-verify-misses` | 17 | identity | `ninfer_qwen4_exp_cpu_verify_misses_test` |
-| `--cpu-verify-workers N` | 17 | speed | A/B 6 against 12 workers |
-| `--prefill-cpu-share F` | 22 | identity | `ninfer_qwen4_exp_prefill_cpu_share_test`; A/B sweep F = 0.2, 0.4, 0.6 on a 2K prompt |
-| `--gdn-async-commit` | 18 | identity | `ninfer_qwen4_exp_gdn_async_commit_test` |
-| `--hc-int8` | 19 | quality | `kld:hc-int8-20`, `-100` against `kld:off-*`; `identity:` prefill bit-exact |
-| `--hc-fused-read` | 20 | identity | `identity:` forward harness, plain and side stream (against `--hc-int8`) |
-| `--ngram-flag-wait` | 21 | identity | `ninfer_qwen4_exp_ngram_flag_wait_test` and `_mtp_test` |
-| `--partial-ram-residency` | 36 | identity | both engine gates; `partial-start` (Windows page-lock warning, pinning) |
-| `--ggml-decode-mma` | 37 | quality | `kld:ggml-decode-mma-*`; `ggml-mma:timing` per shape; `ggml-mma:policy` (nsys) |
+| `--ngram-keepalive-ms N` (default 40, was a fixed 100) | F7a | speed | none scripted: TTFT after an idle pause |
+| `--shared-expert-stream` | F4a | identity | `identity:` forward harness, eager and in graphs |
+| `--mtp-constrained` | F2 | identity | `ninfer_qwen4_exp_mtp_constrained_test`; no speed workload |
+| `--mtp-joint-acceptance` | F3 | identity | `identity:` engine `--mtp-exact 3 --mtp-joint-acceptance` |
+| `--ngram-prefetch` | F7b | identity | the A/B: every job's greedy-id hash and MTP rounds, drafts and acceptances equal in all 24 runs |
+| `--default-expert-state FILE` | F10a | speed | `default-expert-state`: export, then a fresh start from it |
+| `--hot-embedding-rows N` | F10b | identity | `ninfer_qwen4_exp_hot_embedding_test` |
+| `--gdn-head-map` | F5 | identity | `identity:` forward harness; `ninfer_qwen4_exp_gdn_head_map_test` |
+| `--moe-precast-input` | F4b | identity | `identity:` forward harness; `ninfer_qwen4_exp_moe_precast_test` |
+| `--moe-gate-up-registers` | F4c | identity | `identity:` forward harness; its engine test (capture-safe occupancy query) |
+| `--moe-fused-route` | F4d | identity | `identity:` forward harness; `ninfer_qwen4_exp_moe_fused_route_test` |
+| `--cpu-verify-misses` | F4e | identity | `ninfer_qwen4_exp_cpu_verify_misses_test` |
+| `--cpu-verify-workers N` | F4e | speed | A/B 6 against 12 workers |
+| `--prefill-cpu-share F` | F9 | identity | `ninfer_qwen4_exp_prefill_cpu_share_test`; A/B sweep F = 0.2, 0.4, 0.6 on a 2K prompt |
+| `--gdn-async-commit` | F10c | identity | `ninfer_qwen4_exp_gdn_async_commit_test` |
+| `--hc-int8` | F1 | quality | `kld:hc-int8-20`, `-100` against `kld:off-*`; `identity:` prefill bit-exact |
+| `--hc-fused-read` | F10d | identity | `identity:` forward harness, plain and side stream (against `--hc-int8`) |
+| `--ngram-flag-wait` | F7c | identity | `ninfer_qwen4_exp_ngram_flag_wait_test` and `_mtp_test` |
+| `--partial-ram-residency` | F8 | identity | both engine gates; `partial-start` (Windows page-lock warning, pinning) |
+| `--ggml-decode-mma` | F6 | quality | `kld:ggml-decode-mma-*`; `ggml-mma:timing` per shape; `ggml-mma:policy` (nsys) |
 
 Qwen3.8-27B (and Qwen3.6-35B-A3B) and cross-model options:
 
-| Option | Task | Kind | Checks besides its GPU tests and A/B |
+| Option | Item | Kind | Checks besides its GPU tests and A/B |
 |---|---|---|---|
-| `--relaxed-drafting [P]` (and the `relaxed_drafting` request key) | 23 | quality | `relaxed-startup:` every model (added ids contiguous); A/B at temperature 0.7 reports acceptance; `greedy-master:` for the 64-byte `SamplingConfig` |
-| `--draft-context-rows N` | 24 | identity | `ninfer_qwen3_5_context_rows_real_test` on the 27B (MTP, DFlash2) and the 35B (MTP); the A/B's greedy answer texts equal, off against on, in every repetition |
-| `--admission-affinity` | 30 | speed | `serve-soak`: overtakes under 4 requests on one lane |
-| `--allowed-host NAME` (Host, Origin and Sec-Fetch-Site checks) | 25 | serving | `serve-smoke` |
-| `--config FILE` | 28 | serving | `serve-smoke`; `launchers:` (the profiles are config files, Task 29) |
+| `--relaxed-drafting [P]` (and the `relaxed_drafting` request key) | X-C | quality | `relaxed-startup:` every model (added ids contiguous); A/B at temperature 0.7 reports acceptance; `greedy-master:` for the 64-byte `SamplingConfig` |
+| `--draft-context-rows N` | X-D | identity | `ninfer_qwen3_5_context_rows_real_test` on the 27B (MTP, DFlash2) and the 35B (MTP); the A/B's greedy answer texts equal, off against on, in every repetition |
+| `--admission-affinity` | S7 | speed | `serve-soak`: overtakes under 4 requests on one lane |
+| `--allowed-host NAME` (Host, Origin and Sec-Fetch-Site checks) | S3 | serving | `serve-smoke` |
+| `--config FILE` | S6 | serving | `serve-smoke`; `launchers:` (the profiles are config files) |
 
-Other branch items: the decode-path KLD gate (`ninfer-perplexity --kld-base`, Task 2:
-`kld-qwen35:w1`/`w3`; the forward harness's, Task 3: `kld:off-20-w1` must equal window 3's rows);
-unpinned CPU expert workers (Task 6: no option, covered by the Flash-Next tests and A/Bs);
-`GET /slots` and `GET /dashboard` (Tasks 26, 27: `serve-smoke`, and the dashboard still needs a
-look in a browser at desktop and phone width); the GPU power limit in bench rows and the
-community preset (Task 31: `community-preset`); the soak harness (Task 32: `serve-soak`, its first
-real run); the stderr ratchet and the greedy-identity tool (Task 33: CPU-only, run by ctest; the
-tool's two-build mode is `greedy-master:`); the IQ2_XS/IQ3_XXS/IQ3_S formats and the IQ3 packs
-(Tasks 34, 35: `iq3:`, and `converter-pytests`, which needs torch). The two-stage head (Task 38)
-was tried and dropped; it is not on the branch.
+Other items: the decode-path KLD gate (X-A: `ninfer-perplexity --kld-base` is
+`kld-qwen35:w1`/`w3`, and the forward harness's `kld:off-20-w1` must equal window 3's rows);
+unpinned CPU expert workers (F10e: no option, covered by the Flash-Next tests and A/Bs);
+`GET /slots` and `GET /dashboard` (S4, S5: `serve-smoke`, and the dashboard still needs a look in a
+browser at desktop and phone width); the GPU power limit in bench rows and the community preset
+(S2: `community-preset`); the soak harness (S1: `serve-soak`, its first real run); the stderr
+ratchet and the greedy-identity tool (S8: CPU-only, run by ctest; the tool's two-build mode is
+`greedy-master:`); the IQ2_XS/IQ3_XXS/IQ3_S formats and the IQ3 packs (F8: `iq3:`, and
+`converter-pytests`, which needs torch). The two-stage head (X-B) was tried and dropped; see
+[quality-trade experiments](quality-trade-experiments.md).
 
 ## Artifact decisions
 

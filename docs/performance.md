@@ -522,9 +522,13 @@ against a 22.3 ms step, 1.15x.
 The 40,960-row row shows how much acceptance the rarer rows carry, and the full-head row bounds what
 the rows past 131,072 can add at this prompt mix (+2%). `--draft-context-rows` (opt-in,
 [serving](serving.md#draft-head-context-rows)) adds only the ones a request actually holds: up to
-2048 rows of the full head chosen by id (about 10 MB of Q8 reads per draft call at the 27B's hidden
-size, against the full head's 1.27 GB), aimed at names and identifiers that a prompt introduces and
-the output repeats. Not measured on the RTX 3090 yet; `ninfer_qwen3_5_context_rows_real_test`
+2048 rows of the full head chosen by id, aimed at names and identifiers that a prompt introduces and
+the output repeats. Each draft call reads those rows from the full head (Q8: about 5 KB a row at the
+27B's hidden size, so about 10 MB for 2048 rows, against the full head's 1.27 GB). With a full set
+each row is read once per call, whatever the draft width; with fewer rows the kernel splits the
+draft columns across block rows to fill the card and re-reads each row once per block row, so a
+call reads at most about 2048 + `C` rows' worth for `C` rows (never more than twice the full-set
+read). Not measured on the RTX 3090 yet; `ninfer_qwen3_5_context_rows_real_test`
 reports both acceptance rates.
 
 What is left at C1 is mostly ramp-up and drain at the ~500 kernel boundaries of a round (the

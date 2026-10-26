@@ -409,9 +409,10 @@ struct FlashNextOptions {
     // and the output are unchanged; only when the host reads them moves. Off: verification reads
     // them all.
     bool ngram_prefetch = false;
-    // Run each MoE block's shared expert on a high-priority CUDA stream beside the routed experts,
-    // joined before they are combined (--shared-expert-stream). The same outputs, bit for bit;
-    // the workspace grows by the shared expert's Linear scratch at its widest call.
+    // Run each MoE block's shared expert on a second CUDA stream beside the routed experts (high
+    // priority in eager calls; graph replays ignore it), joined before they are combined
+    // (--shared-expert-stream). Designed to give the same outputs, bit for bit (not yet checked on
+    // a GPU); the workspace grows by the shared expert's Linear scratch at its widest call.
     bool shared_expert_stream = false;
     // Keep only the token embedding's first N rows (the lowest ids, the most frequent tokens) in VRAM
     // (--hot-embedding-rows N; Basalt keeps 8192): the whole table moves to the pinned host block,

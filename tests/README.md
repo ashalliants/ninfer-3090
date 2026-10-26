@@ -279,6 +279,7 @@ several token lists it scores them teacher-forced in Strata's `--dump-logits` la
 With `--kld-base FILE [--chunks N] [--window T]` it is the decode-path KLD gate against a llama.cpp
 base (see "Decode-path KLD gate" in `docs/maintainer/flash-next-plan.md`); `--hc-int8` and
 `--ggml-decode-mma` run it with those numerics options on.
+
 `tests/fixtures/qwen4_exp/` holds the PR 0 token sets (`ppl_tokens`, `infernix_texts`; JSON and
 `strata_compare`'s `.ids`). The FP64 reference that checks it is `tools/flash_next`:
 
@@ -292,6 +293,17 @@ build-ninja\tests\ninfer_tests.exe ninfer_qwen4_exp_forward_real_test "@DIR\code
   --dump-logits DIR\ninfer-code.bin "@DIR\doc.ids" --dump-logits DIR\ninfer-doc.bin
 python -m tools.flash_next.strata_compare --texts DIR
 ```
+
+The side-stream identity gates (the forward harness's `--shared-expert-stream` and
+`--hc-fused-read-side-stream` modes, `ninfer_qwen4_exp_mtp_real_test`'s shared-expert check and
+the engine's `--gdn-async-commit-exact`) compare an option that forks work onto a second stream
+with the serial route. A short branch finishes before the main stream reaches the join anyway, so
+a missing join would still pass; the gates therefore delay the start of every side-stream branch
+by 2 ms (`GateSideStreamDelay`, `src/core/side_stream_delay.h`), and a missing join then reads
+unfinished results and diverges. `NINFER_TEST_SIDE_STREAM_DELAY_US` (whole microseconds, 0 to
+100,000) sets the delay for a whole process instead, including the gates' (0 turns their delay
+off); unset or 0 elsewhere launches nothing. It is a test hook: timing runs must leave it unset,
+and `tools/bench/basalt_gpu_verify.py` passes it to none of its children.
 
 The Program and Engine integration adds two host-only tests and one Engine-level real test.
 `ninfer_qwen4_exp_expert_cache_test` (lifted from Infernix with the expert cache) checks the LFRU
