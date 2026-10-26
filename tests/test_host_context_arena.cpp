@@ -5,6 +5,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -151,37 +152,38 @@ void test_placement_scope_counts_once() {
            "outside a placement every miss counts again");
 }
 
-// --host-pause-reserve-mib: the tail of the backing is for pause snapshots only (#332).
+// --host-pause-reserve-mib: a byte budget only pause snapshots may go past (#332).
 void test_snapshot_reserve() {
     constexpr std::size_t unit = ninfer::HostContextArena::alignment;
     ninfer::HostContextArena arena(4 * unit, unit);
     arena.reserve_for_snapshots(unit + 1); // rounds up to two units
     expect(arena.snapshot_reserve_bytes() == 2 * unit && arena.general_capacity_bytes() == 2 * unit,
-           "the reserve is whole alignment units at the end of the backing");
+           "the reserve is whole alignment units taken from the general budget");
     auto a = arena.allocate(unit);
     auto b = arena.allocate(unit);
     expect(a && b && !arena.allocate(unit) && !arena.can_allocate(unit),
-           "cached history cannot allocate into the reserve");
+           "cached history cannot allocate past its budget into the reserve");
     expect(arena.shortage_failures() == 1 && arena.geometry_failures() == 0,
-           "a full general part is a shortage, whatever the reserve holds");
-    expect(arena.general_occupied_bytes() == 2 * unit && arena.occupied_bytes() == 2 * unit,
-           "the general part is full");
+           "a full general budget is a shortage, whatever the reserve holds");
+    std::optional<ninfer::HostContextAllocation> kept;
     {
         ninfer::HostContextArena::SnapshotScope snapshot(arena);
-        expect(arena.can_allocate(2 * unit), "a snapshot sees the reserve");
-        auto paused = arena.allocate(2 * unit);
-        expect(paused && arena.occupied_bytes() == 4 * unit &&
+        expect(arena.can_allocate(2 * unit) && arena.placeable_bytes(unit) == 2 * unit,
+               "a snapshot sees the reserve");
+        kept = arena.allocate(unit);
+        expect(kept && arena.occupied_bytes() == 3 * unit &&
                    arena.general_occupied_bytes() == 2 * unit,
-               "a snapshot in the reserve does not count against the general part");
-        (void)paused->release();
+               "a snapshot past the budget is counted in the reserve, not against the budget");
     }
     (void)a->release();
-    {
-        ninfer::HostContextArena::SnapshotScope snapshot(arena);
-        auto paused = arena.allocate(unit);
-        expect(paused && arena.general_occupied_bytes() == 2 * unit,
-               "a snapshot takes the general part first and keeps the reserve for the next one");
-    }
+    expect(arena.occupied_bytes() == 2 * unit && arena.general_occupied_bytes() == 2 * unit &&
+               !arena.allocate(unit),
+           "a snapshot's copy left behind counts against the budget like cached history");
+    (void)kept->release();
+    expect(arena.allocate(unit).has_value(),
+           "evicting the left-behind copy returns the room to the budget");
+    expect(arena.placeable_bytes(3 * unit) == 0 && arena.placeable_bytes(2 * unit) == 2 * unit,
+           "a free run holds only whole units");
     bool twice = false;
     try {
         arena.reserve_for_snapshots(unit);

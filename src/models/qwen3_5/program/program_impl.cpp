@@ -387,6 +387,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             "--host-pause-reserve-mib must be smaller than the Host context capacity "
             "(--host-context-mib or --auto-host-cache), and needs one");
     }
+    // A reserve that cannot hold one state image can never take a snapshot.
+    if (pause_reserve && pause_reserve < state_images->host_layout().image_bytes) {
+        throw std::invalid_argument(
+            "--host-pause-reserve-mib must hold at least one state image (" +
+            std::to_string((state_images->host_layout().image_bytes + (1U << 20) - 1) >> 20) +
+            " MiB for this model)");
+    }
     if (host_bytes) {
         StartupPhaseScope phase(startup_observer, StartupPhase::HostContextPin,
                                 StartupProgressUnit::Bytes, host_bytes);

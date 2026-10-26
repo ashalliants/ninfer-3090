@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -85,23 +86,32 @@ public:
     // How many separate free runs there are. Many small runs mean the backing is fragmented.
     [[nodiscard]] std::size_t free_extent_count() const noexcept { return free_extents_.size(); }
 
-    // Keeps the last `bytes` of the backing (rounded up to whole alignment units) for allocations
-    // made inside a SnapshotScope: the Host copy of a paused request's progress. Other allocations,
-    // and the general_* figures the context cache plans with, see only the rest, so cached history
-    // can never fill it and a pause or a yield finds room without evicting anything. Snapshot
-    // allocations take the general part first and the reserve only when nothing there fits. Call
-    // once, before the first allocation.
+    // Keeps `bytes` of the backing (rounded up to whole alignment units) for allocations made inside
+    // a SnapshotScope: the Host copy of a paused request's progress. Every other allocation is
+    // refused once the bytes occupied would exceed the rest (the general budget), so cached history
+    // can never take the reserve and a pause or a yield finds room without evicting anything. The
+    // reserve is a byte budget, not a region: a snapshot's copy that stays behind after its request
+    // resumes is ordinary cached history, counts against the general budget, and is evicted like
+    // any other once the cache needs room, which frees the reserve again. Call once, before the
+    // first allocation.
     void reserve_for_snapshots(std::size_t bytes);
 
     [[nodiscard]] std::size_t snapshot_reserve_bytes() const noexcept {
-        return capacity_bytes_ - general_limit_;
+        return capacity_bytes_ - general_budget_;
     }
 
-    // The backing below the snapshot reserve, and the bytes occupied there. Without a reserve they
-    // are capacity_bytes and occupied_bytes.
-    [[nodiscard]] std::size_t general_capacity_bytes() const noexcept { return general_limit_; }
+    // What the context cache plans with: the general budget, and the bytes occupied counted against
+    // it (all of them, at most the budget; anything above it is in the reserve). Without a reserve
+    // they are capacity_bytes and occupied_bytes.
+    [[nodiscard]] std::size_t general_capacity_bytes() const noexcept { return general_budget_; }
 
-    [[nodiscard]] std::size_t general_occupied_bytes() const noexcept;
+    [[nodiscard]] std::size_t general_occupied_bytes() const noexcept {
+        return std::min(occupied_bytes_, general_budget_);
+    }
+
+    // Bytes that allocations of whole `unit`s could take from the free runs now: a run shorter
+    // than one unit holds none. A snapshot's KV pages are placed in runs of whole pages.
+    [[nodiscard]] std::size_t placeable_bytes(std::size_t unit) const noexcept;
 
     // Lets allocate and can_allocate use the snapshot reserve while it lives. A const arena can be
     // asked whether a snapshot would fit, so the scope only marks the query.
@@ -160,9 +170,10 @@ private:
 
     [[nodiscard]] std::size_t allocation_bytes(std::size_t bytes) const noexcept;
     [[nodiscard]] std::optional<std::size_t> find_free_extent(std::size_t bytes) const noexcept;
-    // Where the current caller may allocate up to: the whole backing inside a SnapshotScope.
-    [[nodiscard]] std::size_t allocation_limit() const noexcept {
-        return snapshot_depth_ != 0 ? capacity_bytes_ : general_limit_;
+    // Whether `rounded` more bytes would take the current caller past what it may occupy: the
+    // general budget, or the whole backing inside a SnapshotScope.
+    [[nodiscard]] bool over_budget(std::size_t rounded) const noexcept {
+        return snapshot_depth_ == 0 && rounded > general_budget_ - general_occupied_bytes();
     }
     void insert_free_extent(FreeExtent extent) noexcept;
     void release(std::size_t offset, std::size_t bytes, bool reserved) noexcept;
@@ -178,7 +189,7 @@ private:
     std::uint64_t geometry_failures_ = 0;
     std::uint64_t shortage_failures_ = 0;
     std::size_t placement_depth_     = 0;
-    std::size_t general_limit_       = 0;
+    std::size_t general_budget_      = 0;
     mutable std::size_t snapshot_depth_ = 0;
     std::vector<FreeExtent> free_extents_;
 };

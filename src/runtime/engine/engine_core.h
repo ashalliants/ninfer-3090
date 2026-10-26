@@ -2486,16 +2486,19 @@ private:
             save_snapshot = true;
         } else if (require_snapshot) {
             // A pause that only serves the queue is not worth evicting other requests' history, so
-            // it saves a snapshot only where it fits: nothing is revoked or marked for replay before
-            // the answer is known. Host copies of pages still on the Device are redundant and are
-            // dropped first; that loses nothing, and a restored request leaves such copies in the
-            // snapshot reserve, where nothing else would clear them.
-            (void)instance_.program->release_redundant_host({}, request->sequence);
-            save_snapshot = instance_.program->pause_snapshot_fits(*request->sequence);
+            // it is made only where the snapshot already fits (above): nothing is released, revoked
+            // or marked for replay before the answer is known.
+            return false;
         } else if (const auto bytes = instance_.program->pause_host_bytes(*request->sequence)) {
-            const auto usage = instance_.program->physical_usage();
-            if (*bytes <= usage.capacity.host_bytes &&
-                *bytes > usage.capacity.host_bytes - usage.occupied.host_bytes) {
+            // `usage` is the context cache's view: its budget, without the pause snapshot reserve.
+            // A snapshot may also use what is free in the reserve, so eviction only has to make up
+            // the rest.
+            const auto usage        = instance_.program->physical_usage();
+            const auto reserve_free = usage.host_pause_reserve_bytes -
+                                      std::min(usage.host_pause_reserve_bytes,
+                                               usage.host_pause_reserve_occupied_bytes);
+            if (*bytes <= usage.capacity.host_bytes + reserve_free &&
+                *bytes > usage.capacity.host_bytes - usage.occupied.host_bytes + reserve_free) {
                 (void)instance_.program->release_redundant_host({}, request->sequence);
             }
             std::vector<Checkpoint> later;
@@ -2507,7 +2510,7 @@ private:
             }
             // The victim search counts free bytes, but the state image needs one contiguous run:
             // when the freed bytes do not form one, ask for another image's worth and try again.
-            std::size_t target = *bytes;
+            std::size_t target = *bytes > reserve_free ? *bytes - reserve_free : *bytes;
             for (std::size_t round = 0; round < kMaxPauseHostRounds; ++round) {
                 const auto victims =
                     resources_.host_victims(*instance_.program, target, std::nullopt, later);

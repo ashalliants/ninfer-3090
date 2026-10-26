@@ -149,8 +149,8 @@ PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
     out.host_state_slots = state_store ? state_store->host_occupied() : 0;
     out.host_kv_bytes    = host_kv_arena ? host_kv_arena->occupied_bytes() : 0;
     if (host_context_arena) {
-        // The context cache plans with the part below the pause snapshot reserve: it can never
-        // fill the reserve, so it must not count on it either.
+        // The context cache plans with its budget, the backing less the pause snapshot reserve: it
+        // can never fill the reserve, so it must not count on it either.
         out.occupied.host_bytes      = host_context_arena->general_occupied_bytes();
         out.capacity.host_bytes      = host_context_arena->general_capacity_bytes();
         out.host_pause_reserve_bytes = host_context_arena->snapshot_reserve_bytes();
@@ -431,9 +431,11 @@ std::size_t ProgramImpl::pause_state_image_unplaced(SequenceHandle handle) const
 bool ProgramImpl::pause_snapshot_fits(SequenceHandle handle) const {
     if (!host_context_arena) { return false; }
     const auto bytes = pause_host_bytes(handle);
-    // The KV pages can be split over runs, so the free bytes (the reserve included) bound them; the
-    // state image needs a run of its own.
-    return bytes && *bytes <= host_context_arena->free_bytes() &&
+    // The KV pages can be split over runs, but each run holds whole pages, so what the free runs
+    // can take in units of the larger page stride bounds them (the image is counted in `bytes`
+    // too, which only makes this stricter); the state image needs a run of its own.
+    const std::size_t unit = std::max(text_host_kv_page_stride, backend_host_kv_page_stride);
+    return bytes && *bytes <= host_context_arena->placeable_bytes(unit) &&
            pause_state_image_unplaced(handle) == 0;
 }
 
