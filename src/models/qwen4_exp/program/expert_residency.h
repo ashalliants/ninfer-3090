@@ -181,6 +181,8 @@ public:
     [[nodiscard]] std::uint64_t ram_pool_bytes() const noexcept;
     // Write-backs every residency of this process has issued (tests that cannot reach it).
     [[nodiscard]] static std::uint64_t process_write_backs() noexcept;
+    // Promotions this process has copied from slots that a write-back filled.
+    [[nodiscard]] static std::uint64_t process_written_back_promotions() noexcept;
 
 private:
     // After the controller took a run back (commands_ holds the loads that gave back queued): reloads
@@ -255,6 +257,7 @@ private:
     PinnedHostBuffer slots_upload_{1};         // device addresses [keys], uploaded to slots_device_
     DeviceBuffer slots_device_;
     std::vector<const std::uint8_t*> slots_cpu_; // host addresses [keys]
+    std::vector<std::uint8_t> written_back_;     // per key: its slot was filled by a write-back
     bool slots_dirty_ = false;
     struct WriteBack {
         cudaEvent_t done = nullptr;

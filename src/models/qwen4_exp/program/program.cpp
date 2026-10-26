@@ -4856,14 +4856,17 @@ private:
     void place_partial_experts() {
         const auto keys = c_.num_hidden_layers * c_.moe.experts;
         std::optional<expert_cache::WarmStartLoad> warm;
-        if (!options_.expert_state.empty()) {
+        if (!options_.expert_state.empty() && !options_.partial_state) {
             warm.emplace(expert_cache::load_warm_start({options_.expert_state, options_.expert_state_identity,
                                                         options_.default_expert_state,
                                                         options_.default_expert_state_identity},
                                                        keys));
             expert_state_saved_ = Clock::now();
         }
-        const auto* state = warm && warm->load.state ? &*warm->load.state : nullptr;
+        if (options_.partial_state) { expert_state_saved_ = Clock::now(); }
+        const auto* state = options_.partial_state ? options_.partial_state.get()
+                            : warm && warm->load.state ? &*warm->load.state
+                                                       : nullptr;
         const auto start  = Clock::now();
         const std::uint32_t loaded =
             residency_->place_partial(options_.partial_vram_keys, state, kSeedCountCap, device_.stream);

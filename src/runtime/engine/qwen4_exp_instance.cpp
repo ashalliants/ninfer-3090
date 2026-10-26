@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -357,15 +358,16 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // The VRAM check, before the weights are read: the dense weights, the Program's fixed
     // allocations, the reserve for graph executables and the display headroom must leave room for
     // the expert cache. With --partial-ram-residency it runs before the RAM ledger, whose expert
-    // slots depend on how many experts the frames hold.
-    const auto device_plan = models::qwen4_exp::Program::plan_device(program_options, config,
-                                                                     plan.resources().public_token_count,
-                                                                     plan.expert_record_strides());
+    // slots depend on how many experts the frames hold; otherwise after it, as before.
+    models::qwen4_exp::ProgramDevicePlan device_plan;
     const std::uint64_t dense = plan.device_bytes();
-    auto vram                 = open_vram_budget_source(device.device);
+    std::unique_ptr<VramBudgetSource> vram;
     std::optional<VramSnapshot> before;
     models::qwen4_exp::VramSizing check;
     const auto check_vram = [&] {
+        device_plan = models::qwen4_exp::Program::plan_device(program_options, config,
+                                                              plan.resources().public_token_count,
+                                                              plan.expert_record_strides());
         if (hot_embedding.table != 0) {
             report("token embedding: " + std::to_string(next.hot_embedding_rows) + " of " +
                    std::to_string(config.vocab_size) + " rows in VRAM (" + std::to_string(mib(hot_embedding.hot)) +
@@ -373,6 +375,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                    " MiB pinned): " + std::to_string(mib(hot_embedding.table - hot_embedding.hot)) +
                    " MiB more VRAM for the expert cache");
         }
+        vram   = open_vram_budget_source(device.device);
         before = vram->query();
         models::qwen4_exp::VramDemand check_demand;
         check_demand.headroom    = next.vram_headroom_bytes;
@@ -446,9 +449,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // The context cache's Host tier (prefix reuse) is pinned beside the experts: it gets what the
     // ledger can spare above the reserve, up to the requested size, and is off below a minimum.
     const auto snapshot = host_memory_snapshot();
+    std::optional<models::qwen4_exp::PartialRamDemand> partial_need;
     if (partial) {
-        // --partial-ram-residency: RAM holds the experts the frames do not, plus spares, hottest
-        // experts (the warm start's ranking) in VRAM; on Windows within WDDM's page-lock cap.
+        // --partial-ram-residency: RAM holds the experts the frames do not, plus spares, the hottest
+        // experts (the warm start's ranking) in VRAM. The state is read here once and handed to the
+        // Program, which seeds its counts from it.
         const std::uint32_t keys = config.num_hidden_layers * config.moe.experts;
         models::qwen4_exp::PartialRamDemand need;
         need.experts     = config.moe.experts;
@@ -456,41 +461,46 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         need.frame_bytes = device_plan.expert_record_stride;
         need.frames      = check.frames;
         if (next.expert_cache_bytes) {
-            const auto limit = static_cast<std::uint32_t>(
-                std::min<std::uint64_t>(*next.expert_cache_bytes / need.frame_bytes, need.frames));
-            need.cache_limited = *next.expert_cache_bytes / need.frame_bytes <= need.frames; // the option bounds it
-            need.frames        = limit;
+            const std::uint64_t allowed = *next.expert_cache_bytes / need.frame_bytes;
+            need.cache_limited          = allowed <= need.frames; // the option bounds the cache
+            need.frames = static_cast<std::uint32_t>(std::min<std::uint64_t>(allowed, need.frames));
         }
-        const auto warm = models::qwen4_exp::expert_cache::load_warm_start(
-            {program_options.expert_state, program_options.expert_state_identity, program_options.default_expert_state,
-             program_options.default_expert_state_identity},
-            keys);
-        if (warm.load.state) {
-            const auto& state = *warm.load.state;
-            need.ranked       = state.ranked;
-            std::vector<std::uint32_t> used;
-            for (std::uint32_t key = 0; key < state.counts.size(); ++key) {
-                if (state.counts[key] > 0) { used.push_back(key); }
+        std::string state_note = "no saved expert state (--no-expert-state): every layer alike";
+        if (!program_options.expert_state.empty()) {
+            const auto warm = models::qwen4_exp::expert_cache::load_warm_start(
+                {program_options.expert_state, program_options.expert_state_identity,
+                 program_options.default_expert_state, program_options.default_expert_state_identity},
+                keys);
+            if (warm.load.state) {
+                const auto& state = *warm.load.state;
+                need.ranked       = state.ranked;
+                std::vector<std::uint32_t> used;
+                for (std::uint32_t key = 0; key < state.counts.size(); ++key) {
+                    if (state.counts[key] > 0) { used.push_back(key); }
+                }
+                std::stable_sort(used.begin(), used.end(),
+                                 [&](std::uint32_t a, std::uint32_t b) { return state.counts[a] > state.counts[b]; });
+                need.ranked.insert(need.ranked.end(), used.begin(), used.end());
+                program_options.partial_state =
+                    std::make_shared<const models::qwen4_exp::expert_cache::SavedState>(state);
+                state_note = warm.from_fallback ? "the hottest by the default expert state"
+                                                : "the hottest by the saved expert state";
+            } else {
+                state_note = "expert state: " + warm.load.message + "; every layer alike";
             }
-            std::stable_sort(used.begin(), used.end(),
-                             [&](std::uint32_t a, std::uint32_t b) { return state.counts[a] > state.counts[b]; });
-            need.ranked.insert(need.ranked.end(), used.begin(), used.end());
         }
-        need.other_pinned = demand.other_pinned + std::max(demand.later_pinned, demand.load_staging);
-        need.headroom     = check.headroom;
-#ifdef _WIN32
-        need.pin_cap   = models::qwen4_exp::wddm_pin_cap(snapshot.total_physical);
-        demand.pin_cap = need.pin_cap;
-#endif
+        // place_partial's bounce buffer, pinned while the Program reads the experts in.
+        demand.later_pinned += models::qwen4_exp::partial_place_bounce_bytes(need.frame_bytes);
+        need.headroom = check.headroom;
         const auto partial_plan = models::qwen4_exp::plan_partial_ram(need);
-        if (!partial_plan.refusal.empty()) { throw std::runtime_error(partial_plan.refusal); }
         demand.expert_banks               = partial_plan.bytes;
         program_options.partial_slots     = partial_plan.slots;
         program_options.partial_vram_keys = partial_plan.vram_keys;
         report("partial RAM residency: " + std::to_string(partial_plan.vram_keys.size()) + " of " +
                std::to_string(keys) + " experts held only in VRAM (" + std::to_string(need.frames) +
-               " frames), the rest in " + std::to_string(mib(partial_plan.bytes)) + " MiB of RAM slots" +
-               (warm.load.state ? " (the hottest by the saved expert state)" : " (no saved expert state: every layer alike)"));
+               " frames), the rest in " + std::to_string(mib(partial_plan.bytes)) + " MiB of RAM slots (" +
+               state_note + ")");
+        partial_need = std::move(need);
     }
     std::uint64_t requested_cache =
         options.context_cache.enabled ? options.context_cache.host_capacity_bytes.value_or(kDefaultHostContextBytes) : 0;
@@ -506,6 +516,17 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     report(ledger.summary());
     report(ledger.describe());
     if (!ledger.fits) { throw std::runtime_error("Qwen3.8-Flash-Next cannot start: " + ledger.summary()); }
+#ifdef _WIN32
+    if (partial_need) {
+        // Basalt reports WDDM capping page-lock registration near RAM/2 - 8 GiB; cudaHostAlloc may
+        // still succeed above it, so this warns (a failed pin then names the flags to change).
+        auto capped         = *partial_need;
+        capped.pin_cap      = models::qwen4_exp::wddm_pin_cap(snapshot.total_physical);
+        capped.other_pinned = demand.other_pinned + demand.context_cache + std::max(demand.later_pinned, demand.load_staging);
+        const auto warning  = models::qwen4_exp::plan_partial_ram(capped).cap_warning;
+        if (!warning.empty()) { report("warning: " + warning); }
+    }
+#endif
     if (requested_cache == 0 && nvme_bytes != 0) {
         report("context cache: on NVMe only (no RAM cache: --host-context-mib 0)");
     } else if (requested_cache == 0) {

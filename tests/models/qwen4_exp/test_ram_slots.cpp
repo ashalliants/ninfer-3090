@@ -4,6 +4,7 @@
 // sequences, with write-backs and promotions landing late, every expert keeps at least one valid copy
 // and no frame is reused while a write-back still reads it.
 
+#include "models/qwen4_exp/program/expert_cache/expert_cache.h"
 #include "models/qwen4_exp/program/ram_slots.h"
 
 #include <algorithm>
@@ -145,6 +146,7 @@ void swap_plan_invariant() {
     const std::vector<std::uint32_t> slots{12, 11, 14};
     const std::vector<std::uint64_t> strides{256, 512, 768};
     std::mt19937 rng(20261026);
+    std::uint64_t early_loads = 0;
     for (int trial = 0; trial < 20; ++trial) {
         Residency r(kExperts, slots, strides);
         std::vector<std::uint32_t> free_frames;
@@ -186,9 +188,19 @@ void swap_plan_invariant() {
                 }
             }
             for (auto it = loads.begin(); it != loads.end();) {
-                // A load of a key being written back reads its slot after the write-back on the
-                // same copy stream, so it never lands first.
-                if (--it->rounds <= 0 && !r.writing_back(it->key)) {
+                if (--it->rounds <= 0) {
+                    // A load of a key being written back was issued after that write-back on the same
+                    // copy stream: its landing means the write-back landed, even if that event was
+                    // read before it (ExpertResidency::publish_landed publishes the write-backs again).
+                    if (r.writing_back(it->key)) {
+                        const auto wb = std::find_if(writebacks.begin(), writebacks.end(),
+                                                     [&](const Pending& p) { return p.key == it->key; });
+                        r.complete_writeback(wb->key);
+                        held.erase(wb->frame);
+                        free_frames.push_back(wb->frame);
+                        writebacks.erase(wb);
+                        ++early_loads;
+                    }
                     r.publish(it->key, it->frame);
                     it = loads.erase(it);
                 } else {
@@ -202,7 +214,7 @@ void swap_plan_invariant() {
                 if (rng() % 5 != 0) { continue; }
                 const bool loading =
                     std::any_of(loads.begin(), loads.end(), [&](const Pending& p) { return p.key == key; });
-                if (loading) { continue; } // keep the simulation's landing simple
+                if (loading) { continue; } // its frame is not published yet
                 if (r.reserve_eviction(key)) { evict.push_back(key); }
             }
             // Admissions: RAM experts into free frames.
@@ -248,6 +260,87 @@ void swap_plan_invariant() {
         }
         check(ok, "every key keeps a valid copy, write-backs are the VRAM-only victims, held frames stay held");
     }
+    check(early_loads > 0, "some loads landed before their write-back's event was seen, and were published after it");
+}
+
+// The real CacheController with the residency's gate over many rounds, layer 0 cold: victims come
+// from any layer the gate approves, so admissions keep going long after layer 0's few spare slots are
+// spent (a gate that ended the round at its first refusal froze the whole cache there).
+void gate_keeps_admitting() {
+    using ninfer::models::qwen4_exp::expert_cache::CacheController;
+    using ninfer::models::qwen4_exp::expert_cache::LfruPolicy;
+    using ninfer::models::qwen4_exp::expert_cache::ResidencyEntry;
+    using ninfer::models::qwen4_exp::expert_cache::ResidencyState;
+    constexpr std::uint32_t kLayers = 4, kExperts = 32, kFrames = 48, kSpares = 2;
+    // 12 VRAM-only experts per layer (the first ones), the rest in RAM with 2 spare slots per layer.
+    const std::vector<std::uint32_t> slots(kLayers, kExperts - 12 + kSpares);
+    const std::vector<std::uint64_t> strides(kLayers, 256);
+    Residency r(kExperts, slots, strides);
+    CacheController cache(kLayers * kExperts, kFrames, 0, 1);
+    cache.set_writeback([&](std::uint32_t key) { return r.frame(key) >= 0 && !r.in_ram(key) && !r.writing_back(key); });
+    std::vector<CacheController::Command> cmds;
+    std::vector<std::uint32_t> placed;
+    for (std::uint32_t l = 0; l < kLayers; ++l) {
+        for (std::uint32_t e = 0; e < 12; ++e) { placed.push_back(l * kExperts + e); }
+    }
+    cache.seed(placed, {}, cmds);
+    for (const auto& c : cmds) {
+        if (c.kind == CacheController::Command::Kind::kCopy) { r.place_vram(c.key, c.frame); }
+    }
+    for (ExpertKey key = 0; key < kLayers * kExperts; ++key) {
+        if (r.frame(key) < 0) { r.place_ram(key); }
+    }
+    std::mt19937 rng(7);
+    std::uint64_t round = 0, write_backs = 0, admitted = 0, admitted_late = 0;
+    std::vector<std::pair<ExpertKey, std::uint32_t>> pending; // write-backs landing next round
+    constexpr int kRounds = 600;
+    for (int i = 0; i < kRounds; ++i) {
+        cmds.clear();
+        for (const auto& [key, frame] : pending) {
+            r.complete_writeback(key);
+            cache.complete_writeback(frame, cmds);
+        }
+        pending.clear();
+        // Layer 0 is never routed: its VRAM-only experts keep the lowest scores, so they are the first
+        // victims of every round, and its 2 spare slots are spent at once with no copy to reclaim.
+        for (std::uint32_t l = 1; l < kLayers; ++l) {
+            std::vector<std::uint32_t> group;
+            for (int k = 0; k < 4; ++k) {
+                const std::uint32_t key = l * kExperts + static_cast<std::uint32_t>(rng() % kExperts);
+                if (std::find(group.begin(), group.end(), key) == group.end()) { group.push_back(key); }
+            }
+            const Residency::Score score = [&](std::uint32_t key) { return cache.policy().score(key); };
+            const LfruPolicy::Admissible gate = [&](std::uint32_t key) { return r.reserve_eviction(key, &score); };
+            cache.on_route(group, ++round, cmds, 1, nullptr, &gate);
+        }
+        r.clear_reservations();
+        cache.on_quiescent(cmds);
+        for (const auto& c : cmds) {
+            if (c.kind == CacheController::Command::Kind::kWriteEntry &&
+                ResidencyEntry::decode(c.word).state == ResidencyState::kAbsent && r.frame(c.key) >= 0 &&
+                !r.writing_back(c.key)) {
+                if (r.evict(c.key)) {
+                    pending.emplace_back(c.key, c.frame);
+                    ++write_backs;
+                }
+            }
+        }
+        for (const auto& c : cmds) {
+            // A copy lands at once; one whose key this round evicted again is not published (as
+            // ExpertResidency's complete_load check).
+            if (c.kind == CacheController::Command::Kind::kCopy && cache.complete_load(c.key, c.frame, c.serial)) {
+                r.publish(c.key, c.frame);
+                ++admitted;
+                if (i >= kRounds - 100) { ++admitted_late; }
+            }
+        }
+        r.check();
+    }
+    std::printf("gate_keeps_admitting: %llu write-backs, %llu promotions (%llu in the last 100 rounds)\n",
+                static_cast<unsigned long long>(write_backs), static_cast<unsigned long long>(admitted),
+                static_cast<unsigned long long>(admitted_late));
+    check(write_backs > kSpares * kLayers, "write-backs continue past every layer's spare slots");
+    check(admitted_late > 0, "promotions continue to the end, past the spare slots' write-backs");
 }
 
 } // namespace
@@ -259,6 +352,7 @@ int main() {
     swap_plan_names_writebacks();
     writeback_and_reclaim();
     swap_plan_invariant();
+    gate_keeps_admitting();
     if (g_failures) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;

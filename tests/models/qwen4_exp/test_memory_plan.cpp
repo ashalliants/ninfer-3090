@@ -503,7 +503,7 @@ void partial_plan_bytes() {
     const std::uint64_t spares = std::uint64_t(kLayers) * kPartialSparesPerLayer;
     require(p.bytes == (std::uint64_t(kLayers) * kExperts - vram + spares) * kStride,
             "host = (E_total - vram_frames + spares) * stride");
-    require(p.refusal.empty() && p.slots.size() == kLayers, "no cap: the plan fits");
+    require(p.cap_warning.empty() && p.slots.size() == kLayers, "no cap: the plan fits");
     std::set<std::uint32_t> unique(p.vram_keys.begin(), p.vram_keys.end());
     require(unique.size() == p.vram_keys.size() && *unique.rbegin() < kLayers * kExperts, "VRAM keys are distinct");
     // Without a ranking every layer takes its turn: the first 48 keys are expert 0 of each layer.
@@ -533,13 +533,16 @@ void partial_plan_bytes() {
         expect += std::uint64_t(kExperts - 100 + kPartialSparesPerLayer) * mixed.strides[l];
     }
     require(m.vram_keys.size() == 4'800 && m.bytes == expect, "100 VRAM-only experts per layer, each at its stride");
+    require(partial_place_bounce_bytes(kStride) == 2 * kPartialPlaceRecords * kStride,
+            "the placement's bounce is two halves of 16 records, a named later pin");
     require(wddm_pin_cap(64 * kGiB) == 24 * kGiB && wddm_pin_cap(12 * kGiB) == 0, "the WDDM cap is RAM/2 - 8 GiB");
 }
 
-// Over the WDDM page-lock cap the plan refuses with what would fit: the fewest frames whose slot pool
-// fits, as the largest --vram-headroom-mib that gives them, or the --expert-cache-mib that does when
-// that option bounded the cache, or no fit at all; within the cap it does not refuse.
-void partial_plan_wddm_cap_refusal() {
+// Over the WDDM page-lock cap (cudaHostRegister's, as Basalt reports it) the plan warns with what
+// would fit: the fewest frames whose slot pool fits, as the largest --vram-headroom-mib that gives
+// them, or the --expert-cache-mib that does when that option bounded the cache, or no fit at all;
+// within the cap, or with no cap, it does not warn. The cap never changes the plan itself.
+void partial_plan_wddm_cap_warning() {
     constexpr std::uint32_t kLayers = 48, kExperts = 512;
     constexpr std::uint64_t kStride = 2'329'600;
     PartialRamDemand d;
@@ -550,51 +553,42 @@ void partial_plan_wddm_cap_refusal() {
     d.other_pinned = 300 * kMiB;
     d.headroom     = 4 * kGiB;
     const PartialRamPlan open = plan_partial_ram(d);
-    require(open.refusal.empty(), "no cap: no refusal");
+    require(open.cap_warning.empty(), "no cap: no warning");
     d.pin_cap = open.bytes + d.other_pinned;
-    require(plan_partial_ram(d).refusal.empty(), "exactly at the cap fits");
+    require(plan_partial_ram(d).cap_warning.empty(), "exactly at the cap fits");
     d.pin_cap = open.bytes + d.other_pinned - 100 * kStride;
     const PartialRamPlan over = plan_partial_ram(d);
-    require(!over.refusal.empty() && over.frames_needed == d.frames + 100, "100 more frames would fit the cap");
+    require(!over.cap_warning.empty() && over.frames_needed == d.frames + 100, "100 more frames would fit the cap");
     const std::uint64_t headroom = d.headroom - 100 * kStride;
-    require(over.refusal.find("--vram-headroom-mib " + std::to_string(headroom / kMiB)) != std::string::npos &&
-                over.refusal.find("--partial-ram-residency") != std::string::npos,
-            "the refusal names the largest headroom that fits: " + over.refusal);
+    require(over.cap_warning.find("--vram-headroom-mib " + std::to_string(headroom / kMiB)) != std::string::npos &&
+                over.cap_warning.find("--partial-ram-residency") != std::string::npos,
+            "the warning names the largest headroom that fits: " + over.cap_warning);
     // Fits at the needed frame count, and not one frame fewer.
     PartialRamDemand at = d;
     at.frames = over.frames_needed;
-    require(plan_partial_ram(at).refusal.empty(), "the named frame count fits");
+    require(plan_partial_ram(at).cap_warning.empty(), "the named frame count fits");
     at.frames = over.frames_needed - 1;
-    require(!plan_partial_ram(at).refusal.empty(), "one frame fewer does not");
+    require(!plan_partial_ram(at).cap_warning.empty(), "one frame fewer does not");
     // --expert-cache-mib bounded the cache: the advice is the cache size.
     PartialRamDemand limited = d;
     limited.cache_limited = true;
     const std::uint64_t cache_mib = (std::uint64_t(over.frames_needed) * kStride + kMiB - 1) / kMiB;
-    require(plan_partial_ram(limited).refusal.find("--expert-cache-mib " + std::to_string(cache_mib)) != std::string::npos,
+    require(plan_partial_ram(limited).cap_warning.find("--expert-cache-mib " + std::to_string(cache_mib)) != std::string::npos,
             "a bounded cache is told the size that fits");
     // More frames than the headroom can give: no headroom fits.
     PartialRamDemand short_headroom = d;
     short_headroom.headroom = 50 * kStride;
-    require(plan_partial_ram(short_headroom).refusal.find("--vram-headroom-mib") == std::string::npos,
+    require(plan_partial_ram(short_headroom).cap_warning.find("--vram-headroom-mib") == std::string::npos,
             "a headroom that cannot give the frames is not offered");
     // A cap below the pins that never fit.
     PartialRamDemand hopeless = d;
     hopeless.pin_cap = d.other_pinned / 2;
     const PartialRamPlan never = plan_partial_ram(hopeless);
-    require(!never.refusal.empty() && never.frames_needed == 0, "no frame count fits a cap below the other pins");
-    // The ledger applies the same cap to every pin (the context cache's Host tier included).
-    HostMemoryDemand ledger = flash_next();
-    ledger.expert_banks = 20 * kGiB;
-    ledger.pin_cap      = 20 * kGiB;
-    const HostMemoryLedger capped = plan_host_memory(snapshot(60 * kGiB, 200 * kGiB), ledger);
-    require(!capped.fits && capped.pin_limited && capped.summary().find("page-lock") != std::string::npos,
-            "the ledger refuses pins above the cap");
-    ledger.pin_cap = 22 * kGiB;
-    require(plan_host_memory(snapshot(60 * kGiB, 200 * kGiB), ledger).fits, "pins within the cap fit");
-    const ContextCacheFit cache = fit_context_cache(snapshot(60 * kGiB, 200 * kGiB), ledger, 4 * kGiB, 512 * kMiB, 64 * kMiB);
-    require(cache.bytes != 0 && cache.bytes < 2 * kGiB && cache.shrunk, "the context cache gets what the cap leaves");
-    ledger.context_cache = cache.bytes;
-    require(plan_host_memory(snapshot(60 * kGiB, 200 * kGiB), ledger).fits, "and the ledger with it fits");
+    require(!never.cap_warning.empty() && never.frames_needed == 0, "no frame count fits a cap below the other pins");
+    require(over.bytes == open.bytes && over.vram_keys == open.vram_keys, "the cap only warns: the plan is unchanged");
+    require(over.cap_warning.find("cudaHostRegister") != std::string::npos &&
+                over.cap_warning.find("cudaHostAlloc") != std::string::npos,
+            "the warning says the cap is cudaHostRegister's and cudaHostAlloc may still succeed");
 }
 
 } // namespace
@@ -616,7 +610,7 @@ int main() {
         test_kv_growth();
         test_hot_embedding_ledgers();
         partial_plan_bytes();
-        partial_plan_wddm_cap_refusal();
+        partial_plan_wddm_cap_warning();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

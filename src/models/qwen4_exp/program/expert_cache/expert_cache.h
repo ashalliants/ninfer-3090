@@ -66,8 +66,10 @@ public:
     // the highest-score misses are admitted first, and only if they outrank the victim they
     // replace. An unlimited budget reproduces the replay tool's on-demand LFRU exactly. With
     // `admissible`, misses it rejects stay non-resident (out.misses still lists them). With
-    // `evictable` (the SSD tier's eviction gate) admission is always the budgeted one-victim loop,
-    // and it stops at the first victim the gate refuses.
+    // `evictable` (an eviction gate: the SSD tier's, or partial RAM residency's write-back slots)
+    // admission is always the budgeted one-victim loop, whose victim is the lowest (score, key)
+    // resident outside the group that the gate approves: residents it refuses are skipped for the
+    // rest of the step, and admission stops when no approved resident scores below the newcomer.
     void step(std::span<const std::uint32_t> group, Step& out,
               std::size_t admission_budget = static_cast<std::size_t>(-1), const Admissible* admissible = nullptr,
               const Admissible* evictable = nullptr);
@@ -100,6 +102,10 @@ private:
     void erase(std::uint32_t key);
     void select_victims(std::size_t need, std::span<const std::uint32_t> protect,
                         std::vector<std::uint32_t>& out);
+    // The lowest (score, key) resident outside `protect` that `gate` approves and that `newcomer`
+    // outranks; refused residents are remembered in refused_ until the step ends.
+    std::optional<std::uint32_t> evictable_victim(std::span<const std::uint32_t> protect, std::uint32_t newcomer,
+                                                  const Admissible& gate);
 
     std::uint32_t capacity_;
     std::uint32_t halving_period_;
@@ -119,6 +125,8 @@ private:
     std::vector<std::uint32_t> candidates_;
     std::vector<std::uint32_t> ranked_; // scratch: budgeted admission's candidates, best first
     std::vector<std::uint32_t> victim_; // scratch: one victim at a time
+    std::vector<std::uint8_t> refused_; // per key: refused by the eviction gate this step
+    std::vector<std::uint32_t> refused_keys_;
 };
 
 // What a warm start needs (design §19.3.5 S4b): every key's LFRU count, and the resident keys,

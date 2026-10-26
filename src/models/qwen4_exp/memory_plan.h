@@ -47,9 +47,6 @@ struct HostMemoryDemand {
     double lock_overhead = 0.0025;
     // Beyond the banks, so the system is not run at the reserve's edge.
     std::uint64_t full_margin = kLedgerGiB;
-    // Every pinned byte at most this (Windows WDDM's page-lock cap, wddm_pin_cap; partial RAM
-    // residency only). Empty: no cap.
-    std::optional<std::uint64_t> pin_cap;
 };
 
 struct HostMemoryLedger {
@@ -69,8 +66,6 @@ struct HostMemoryLedger {
     std::uint64_t pinned_total = 0;
     // The Linux RLIMIT_MEMLOCK is below pinned_total, so pinning would fail whatever is free.
     bool lock_limited = false;
-    // demand.pin_cap is below pinned_total.
-    bool pin_limited = false;
     // Every expert fits in RAM. Without the SSD tier (not ported) startup refuses otherwise.
     bool fits = false;
 
@@ -135,6 +130,12 @@ inline constexpr std::uint32_t kPartialSparesPerLayer = 16;
 // and a cache smaller than the startup check predicted must still hold every VRAM-only expert. The
 // unfilled frames serve as cache frames whose experts keep RAM copies.
 inline constexpr std::uint64_t kPartialFrameMarginBytes = 512ULL << 20;
+// The experts read into frames at startup go through a pinned bounce of two halves of this many
+// records (ExpertResidency::place_partial), planned as a later pin.
+inline constexpr std::uint32_t kPartialPlaceRecords = 16;
+[[nodiscard]] constexpr std::uint64_t partial_place_bounce_bytes(std::uint64_t frame_bytes) noexcept {
+    return 2ULL * kPartialPlaceRecords * frame_bytes;
+}
 
 struct PartialRamDemand {
     std::uint32_t experts = 0;          // per layer
@@ -146,11 +147,13 @@ struct PartialRamDemand {
     // Keys (layer * experts + expert) hottest first, the warm start's; the others follow expert by
     // expert, every layer in turn. Repeats and keys out of range are skipped.
     std::vector<std::uint32_t> ranked;
-    // Windows WDDM: page-locked memory is capped near RAM/2 - 8 GiB (wddm_pin_cap): the slot pool
-    // and `other_pinned` (every other pin made at startup) must fit. Empty: no cap.
+    // Windows WDDM: Basalt reports page-lock registration (cudaHostRegister) capped near RAM/2 -
+    // 8 GiB (wddm_pin_cap). NInfer pins with cudaHostAlloc, which may still succeed above it, so the
+    // cap only produces a warning: the slot pool and `other_pinned` (every other pin made at startup)
+    // above it. Empty: no cap.
     std::optional<std::uint64_t> pin_cap;
     std::uint64_t other_pinned = 0;
-    // For the refusal's advice: the VRAM headroom the sizing kept, and whether --expert-cache-mib
+    // For the warning's advice: the VRAM headroom the sizing kept, and whether --expert-cache-mib
     // bounded the frames.
     std::uint64_t headroom = 0;
     bool cache_limited     = false;
@@ -161,15 +164,16 @@ struct PartialRamPlan {
     std::vector<std::uint32_t> vram_keys;
     std::vector<std::uint32_t> slots; // per layer
     std::uint64_t bytes = 0;          // the pinned slot pool: the sum of slots * stride
-    // Over the cap: the fewest frames whose plan fits it (0: no frame count does), and why startup
-    // must refuse (naming the flag to change). Empty: the plan fits.
+    // Over the cap: the fewest frames whose plan fits it (0: no frame count does), and the startup
+    // warning naming the flag that would bring the pins under it. Empty: within the cap, or no cap.
     std::uint32_t frames_needed = 0;
-    std::string refusal;
+    std::string cap_warning;
 };
 
 [[nodiscard]] PartialRamPlan plan_partial_ram(const PartialRamDemand& demand);
-// Windows WDDM's page-lock cap for one process: half the physical memory less 8 GiB (Basalt's
-// docs/platforms.md); 0 when that is negative.
+// Windows WDDM's page-lock registration cap for one process as Basalt reports it for
+// cudaHostRegister: half the physical memory less 8 GiB (Basalt's docs/platforms.md); 0 when that is
+// negative.
 [[nodiscard]] std::uint64_t wddm_pin_cap(std::uint64_t total_physical) noexcept;
 
 // ---------------------------------------------------------------- device memory

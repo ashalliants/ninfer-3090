@@ -49,8 +49,8 @@
 // and at least one VRAM-only expert was written back. --expert-cache-mib N (both Engines) makes the
 // evictions common; --mtp K compares the MTP statistics too.
 //
-//   ninfer_qwen4_exp_engine_real_test --partial-ram-exact [--expert-cache-mib N] [--mtp K]
-//       [--max-context N] [--generate N] [TOKENS...]
+//   ninfer_qwen4_exp_engine_real_test --partial-ram-exact [--expert-cache-mib N] [--mtp K
+//       [--cpu-verify-misses]] [--max-context N] [--generate N] [TOKENS...]
 //
 // GDN head map (gdn_head_map_matches_copies below, --gdn-head-map): greedy ids with the GDN reading
 // its key heads through the tiled head map equal those of an Engine with the q/k copies. --mtp K runs
@@ -723,6 +723,8 @@ struct BitwiseOption {
     // Optional: the same for the option's streamed-call route, required when a prompt is at least
     // 512 tokens (one streamed call when the cache lends the stream its ring).
     std::uint64_t (*exercised_streamed)() = nullptr;
+    // Optional: a second count of the option's own work, required like `exercised`.
+    std::uint64_t (*exercised_too)() = nullptr;
 };
 
 int option_matches_off(const std::string& artifact, const std::vector<std::string>& args,
@@ -801,6 +803,7 @@ int option_matches_off(const std::string& artifact, const std::vector<std::strin
     bool ok = true;
     const std::uint64_t exercised_before = option.exercised != nullptr ? option.exercised() : 0;
     const std::uint64_t streamed_before  = option.exercised_streamed != nullptr ? option.exercised_streamed() : 0;
+    const std::uint64_t too_before       = option.exercised_too != nullptr ? option.exercised_too() : 0;
     Engine engine(engine_options(true));
     for (std::size_t j = 0; j < prompts.size(); ++j) {
         const Run run           = generate(engine, prompts[j], tokens);
@@ -828,6 +831,14 @@ int option_matches_off(const std::string& artifact, const std::vector<std::strin
         std::printf("%s: %llu units of the option's own work\n", option.on, static_cast<unsigned long long>(done));
         if (done == 0) {
             std::printf("FAIL: %s never ran its own route, so the identity says nothing about it\n", option.on);
+            ok = false;
+        }
+    }
+    if (option.exercised_too != nullptr) {
+        const std::uint64_t done = option.exercised_too() - too_before;
+        std::printf("%s: %llu units of the option's second route\n", option.on, static_cast<unsigned long long>(done));
+        if (done == 0) {
+            std::printf("FAIL: %s never ran its second route, so the identity says nothing about it\n", option.on);
             ok = false;
         }
     }
@@ -954,12 +965,30 @@ int ngram_flag_wait_matches_split(const std::string& artifact, const std::vector
 // with only the experts the VRAM cache does not hold in RAM (the hottest read straight into frames,
 // held only there; promotions from RAM slots; an evicted VRAM-only expert written back first) the
 // greedy ids (and with --mtp the rounds, drafts and acceptances) equal those of the whole pinned
-// banks, and at least one write-back ran. --expert-cache-mib N (both Engines) makes evictions common.
-int partial_ram_residency_matches_full(const std::string& artifact, const std::vector<std::string>& args) {
+// banks, and at least one promotion copied a slot that a write-back had filled (bytes that came from
+// a frame, not the artifact: a wrong write-back would change the ids). --expert-cache-mib N (both
+// Engines) makes evictions common. With --cpu-verify-misses (needs --mtp) the partial Engine also
+// hands verification misses to the CPU, which reads them from the RAM slots.
+int partial_ram_residency_matches_full(const std::string& artifact, std::vector<std::string> args) {
+    const auto cpu = std::find(args.begin(), args.end(), "--cpu-verify-misses");
+    const bool cpu_leg = cpu != args.end();
+    if (cpu_leg) { args.erase(cpu); }
+    if (cpu_leg) {
+        return option_matches_off(artifact, args,
+                                  {"whole pinned banks", "partial RAM residency + CPU verification misses",
+                                   "partial ram residency with cpu verify misses",
+                                   [](EngineOptions& o) {
+                                       o.flash_next.partial_ram_residency = true;
+                                       o.flash_next.cpu_verify_misses     = true;
+                                   },
+                                   [] { return models::qwen4_exp::ExpertResidency::process_written_back_promotions(); },
+                                   nullptr,
+                                   [] { return ops::offloaded_moe::CpuMissService::process_served_experts(); }});
+    }
     return option_matches_off(artifact, args,
                               {"whole pinned banks", "partial RAM residency", "partial ram residency",
                                [](EngineOptions& o) { o.flash_next.partial_ram_residency = true; },
-                               [] { return models::qwen4_exp::ExpertResidency::process_write_backs(); }});
+                               [] { return models::qwen4_exp::ExpertResidency::process_written_back_promotions(); }});
 }
 
 // mtp_constrained_matches_plain (--mtp-constrained, FlashNextOptions::mtp_constrained): a greedy

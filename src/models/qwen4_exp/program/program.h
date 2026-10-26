@@ -26,6 +26,7 @@
 #include "models/qwen3_5/program/program.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/memory_plan.h"
+#include "models/qwen4_exp/program/expert_cache/expert_cache.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/request.h"
@@ -512,6 +513,9 @@ struct ProgramOptions {
     std::vector<std::uint32_t> partial_slots;
     std::vector<std::uint32_t> partial_vram_keys;
     std::filesystem::path artifact_path;
+    // The saved expert state the startup already read for the placement (its counts seed the LFRU);
+    // empty: the Program reads `expert_state` itself.
+    std::shared_ptr<const expert_cache::SavedState> partial_state;
 };
 
 // --ngram-flag-wait: whether a round runs as one graph that waits for its n-gram rows (true) or in

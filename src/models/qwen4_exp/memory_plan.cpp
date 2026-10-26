@@ -53,10 +53,6 @@ HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const Host
         out.lock_limited = true;
         out.fits         = false;
     }
-    if (demand.pin_cap && out.pinned_total > *demand.pin_cap) {
-        out.pin_limited = true;
-        out.fits        = false;
-    }
     return out;
 }
 
@@ -124,12 +120,13 @@ PartialRamPlan plan_partial_ram(const PartialRamDemand& d) {
         }
         out.frames_needed = static_cast<std::uint32_t>(high);
     }
-    char line[640];
+    char line[800];
     const int used = std::snprintf(
         line, sizeof(line),
-        "Qwen3.8-Flash-Next with --partial-ram-residency pins %.1f GiB (%.1f GiB of expert slots for %u VRAM "
-        "frames, %.1f GiB of other pins), above the %.1f GiB Windows lets one process page-lock (half the RAM "
-        "less 8 GiB): ",
+        "--partial-ram-residency pins %.1f GiB (%.1f GiB of expert slots for %u VRAM frames, %.1f GiB of "
+        "other pins), above the %.1f GiB (half the RAM less 8 GiB) that Windows lets one process register "
+        "with cudaHostRegister; NInfer pins with cudaHostAlloc, which may still succeed. If startup fails to "
+        "pin: ",
         gib(out.bytes + d.other_pinned), gib(out.bytes), d.frames, gib(d.other_pinned), gib(*d.pin_cap));
     std::string advice;
     if (out.frames_needed == 0) {
@@ -151,7 +148,7 @@ PartialRamPlan plan_partial_ram(const PartialRamDemand& d) {
         }
     }
     const std::size_t prefix = used > 0 ? std::min<std::size_t>(static_cast<std::size_t>(used), sizeof(line) - 1) : 0;
-    out.refusal              = std::string(line, prefix) + advice;
+    out.cap_warning          = std::string(line, prefix) + advice;
     return out;
 }
 
@@ -205,7 +202,6 @@ ContextCacheFit fit_context_cache(const HostMemorySnapshot& snapshot, HostMemory
     // The cache's own lock bookkeeping comes out of the same room.
     spare = static_cast<std::uint64_t>(static_cast<double>(spare) / (1.0 + demand.lock_overhead));
     if (snapshot.lock_limit) { spare = std::min(spare, saturating_sub(*snapshot.lock_limit, without.pinned_total)); }
-    if (demand.pin_cap) { spare = std::min(spare, saturating_sub(*demand.pin_cap, without.pinned_total)); }
     std::uint64_t bytes = std::min(requested, spare);
     bytes               = bytes / granule * granule;
     if (bytes < minimum) { bytes = 0; }
@@ -233,7 +229,6 @@ std::string HostMemoryLedger::describe() const {
                   gib(demand.load_staging), gib(demand.process_growth), gib(expert_ram), gib(full_need),
                   gib(demand.expert_banks), gib(demand.full_margin), commit_limited ? ", limited by the page file" : "",
                   lock_limited ? "the memory-lock limit is below the pinned total"
-                  : pin_limited ? "the page-lock cap is below the pinned total"
                   : fits        ? "every expert fits in RAM"
                                 : "the experts do not fit");
     return line;
@@ -247,12 +242,6 @@ std::string HostMemoryLedger::summary() const {
                       "weights. Raise it (ulimit -l unlimited, or LimitMEMLOCK=infinity for a service) and start "
                       "again",
                       gib(*snapshot.lock_limit), gib(pinned_total));
-    } else if (pin_limited) {
-        std::snprintf(line, sizeof(line),
-                      "RAM: Windows lets one process page-lock about %.1f GiB (half the RAM less 8 GiB) but "
-                      "Qwen3.8-Flash-Next pins %.1f GiB of experts and weights with --partial-ram-residency. Give "
-                      "the expert cache more VRAM (a lower --vram-headroom-mib) or lower --host-context-mib",
-                      gib(*demand.pin_cap), gib(pinned_total));
     } else if (fits) {
         std::snprintf(line, sizeof(line), "RAM: %.1f of %.1f GiB free; every expert fits in RAM (%.1f GiB pinned)",
                       gib(snapshot.available_physical), gib(snapshot.total_physical),
