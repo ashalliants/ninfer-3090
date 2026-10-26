@@ -1156,13 +1156,41 @@ None has been measured on the RTX 3090 yet.
     L2 for a device frame or staging slot, over PCIe for a zero-copy host record). The narrow
     route stages them as before (IQ4_XS gate/up: 67,584 bytes of shared memory at 8 columns, one
     CTA per SM).
-  - Not yet loadable: an IQ3 pack also needs dense Q4_K and Q5_K linears, the new (format, shape)
-    combinations of its dense tensors, a Q5_K or Q6_K output head and an IQ3_S token embedding
-    (Task 35b), and its larger expert banks need partial residency to fit host RAM (Task 36).
+  - Not yet loadable: the dense, head and embedding formats are the next item; the larger expert
+    banks still need partial residency to fit host RAM (Task 36).
   - GPU-session checks: `ninfer_offloaded_moe_layer_test` and `ninfer_offloaded_moe_wide_test`
     (every record format bitwise against the CPU engine; compiled, not run), the bench rows of the
     new formats (`ninfer_offloaded_moe_bench`), and whether the wide route's unstaged IQ3/IQ4 slices
     want a split staging scheme.
+- **Dense, head and embedding formats of the GSQ-RCO IQ3_XXS and IQ3_S packs** (F8, part 2b; no
+  option: new formats and new registered problems only). From the packs' published tensor
+  allocations: their dense projections are IQ4_XS, IQ3_S, Q6_K, Q5_K or Q4_K per layer (the
+  shared-expert down IQ4_NL, Q8_0 or Q2_0), the output head Q6_K (IQ3_S pack) or Q5_K (IQ3_XXS
+  pack) and the token embedding IQ4_XS or IQ3_S. New block formats `ggml_q4_k` and `ggml_q5_k`
+  ([tensor formats](tensor-formats.md) Section 3.5, ggml's goldens); the GGML linear registry
+  (`ggml_shapes.h`) takes every (format, shape) of the three packs, `linear_pair` every ordered
+  pair of IQ4_XS, IQ3_S, Q6_K, Q5_K and Q4_K, projection_fp32's GGML head IQ4_XS, Q6_K and Q5_K,
+  and `ops::embedding` IQ3_S rows. `ninfer_ggml_linear_registry_test` mirrors the packs' tables.
+  - Numerics: Q4_K and Q5_K are affine (d sc q - dmin m per 32 values). Both routes add the
+    sub-block's offset term -dmin m * xm with xm = xd * float(sum of the group's Q8_1 codes) after
+    its scale term (llama.cpp's `vec_dot_q4_K_q8_1` form), so the result is still the contract's
+    dequantized weight times the cast activation, under the same FP64 criterion; the wide route
+    applies a K tile's four offset terms after its four scale terms. A bit-exact host emulation
+    (`tests/ops/ggml_linear_emulation.h`) meets the criterion and the FP32 accumulation bound at
+    every registered Q4_K/Q5_K problem, also on rows built to cancel; the GPU suite compares the
+    device with it bit for bit (compiled, not run).
+  - Kernels: 212 new linear, pair and head instances (Q4_K and Q5_K 34 each, 128 pair kernels, 16
+    head kernels) and one embedding kernel; the existing 356 kernels of these objects (and the
+    expert routes') compile to the base commit's SASS, encodings included. The pair instances
+    build in one translation unit per first format (the slowest 60 s, the old single unit 105 s).
+  - `--hot-embedding-rows` stays IQ4_XS only (`embedding_split`) and is refused at startup for
+    the IQ3_XXS pack's IQ3_S embedding.
+  - Loading an IQ3 pack now needs only Task 36's partial expert residency on a 64 GB box (its
+    banks do not fit host RAM whole).
+  - GPU-session checks: `ninfer_linear_ggml_test` (new formats, shapes and pairs, Q4_K/Q5_K bit for
+    bit against the emulation), `ninfer_linear_ggml_device_decode_test`,
+    `ninfer_projection_fp32_test` (Q6_K and Q5_K heads) and `ninfer_embedding_test` (IQ3_S); the
+    decode and prefill speed of the K-quant projections is unmeasured.
 
 ## Artifact decisions
 

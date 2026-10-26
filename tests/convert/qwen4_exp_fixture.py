@@ -15,6 +15,7 @@ from .gguf_writer import tensor_bytes, write_gguf
 H, F, E, HC, LOW = 256, 128, 4, 2, 8
 F32, F16, Q8_0, IQ2_XXS, IQ4_NL, IQ2_S, IQ1_M, BF16, Q2_0 = 0, 1, 8, 16, 20, 22, 29, 30, 42
 IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS = 17, 18, 21, 23
+Q4_K, Q5_K = 12, 13
 # (gate/up, down) types of each layer's experts: the IQ2_XS pack's three record formats. The
 # GSQ-RCO IQ3 packs mix other pairs, and downs, across layers (``write(experts=...)``).
 EXPERT_TYPES = ((IQ2_S, Q2_0), (IQ2_XXS, Q2_0), (IQ1_M, Q2_0), (IQ2_S, Q2_0))

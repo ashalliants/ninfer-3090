@@ -328,6 +328,31 @@ def test_unregistered_record_pair_is_refused(tmp_path):
         qwen4_exp.build_model(gguf)
 
 
+def test_iq3_pack_dense_formats_are_copied(tmp_path):
+    # The GSQ-RCO IQ3 packs' dense K-quants, Q5_K output head and IQ3_S token embedding: each is
+    # imported as its own GGML block format, byte for byte (verify).
+    retyped = {
+        "token_embd.weight": (fixture.IQ3_S, (fixture.H, 16), "text/token_embedding", "ggml_iq3_s"),
+        "output.weight": (fixture.Q5_K, (fixture.H, 16), "text/output_head", "ggml_q5_k"),
+        "blk.0.attn_qkv.weight": (fixture.Q4_K, (fixture.H, 128), "text/layers/0/gdn/qkv", "ggml_q4_k"),
+        "blk.1.ffn_gate_shexp.weight": (
+            fixture.Q5_K, (fixture.H, fixture.F), "text/layers/1/moe/shared/gate", "ggml_q5_k"
+        ),
+        "blk.3.attn_q.weight": (
+            fixture.Q4_K, (fixture.H, 128), "text/layers/3/attention/query_gate", "ggml_q4_k"
+        ),
+    }
+    extra = tuple((name, kind, ne) for name, (kind, ne, _, _) in retyped.items())
+    path = fixture.write(tmp_path / "dense.gguf", drop=tuple(retyped), extra=extra)
+    out = tmp_path / "dense.ninfer"
+    with GgufModel(path) as gguf:
+        report = _convert(gguf, out)
+        verify(out, gguf, volume=str(out) + ".ngram")
+    formats = {item["parameters"][0]: item["format"] for item in report["methods"]}
+    for _, _, parameter, name in retyped.values():
+        assert formats[parameter] == name
+
+
 def test_mtp_drafter_is_stored_exactly(tmp_path):
     from tools.artifact.reader import Artifact
 

@@ -960,6 +960,61 @@ int test_ggml_iq4_xs() {
     return failures;
 }
 
+// GGML IQ3_S ggml_blocks_v1 table (the GSQ-RCO IQ3_XXS pack's token embedding, D = 2560): every
+// output is exactly the BF16 rounding of the host decoder's value (dequantize_row_iq3_s). Random
+// bytes cover the grid indices, signs and scale nibbles; the scale is finite.
+int test_ggml_iq3_s() {
+    constexpr std::int32_t kVocab = 1000, kD = 2560, kBlock = 110;
+    std::vector<std::uint8_t> table_bytes(static_cast<std::size_t>(kVocab) * (kD / 256) * kBlock);
+    std::uint32_t state = 0x2468ACEU;
+    const auto next = [&] {
+        state = state * 1664525U + 1013904223U;
+        return state >> 8;
+    };
+    for (auto& b : table_bytes) { b = static_cast<std::uint8_t>(next() & 0xFF); }
+    for (std::size_t block = 0; block < table_bytes.size() / kBlock; ++block) {
+        const std::uint16_t bits = static_cast<std::uint16_t>((next() & 0x83FF) | ((next() % 31) << 10));
+        table_bytes[block * kBlock]     = static_cast<std::uint8_t>(bits & 0xFF);
+        table_bytes[block * kBlock + 1] = static_cast<std::uint8_t>(bits >> 8);
+    }
+    const std::vector<std::int32_t> ids = {0, kVocab - 1, 17, 17, 523, 2, 999, 400, 401};
+    const std::size_t row_bytes         = static_cast<std::size_t>(kD / 256) * kBlock;
+    std::vector<std::uint16_t> expected(static_cast<std::size_t>(kD) * ids.size());
+    for (std::size_t t = 0; t < ids.size(); ++t) {
+        const auto row = std::as_bytes(std::span<const std::uint8_t>(table_bytes))
+                             .subspan(static_cast<std::size_t>(ids[t]) * row_bytes, row_bytes);
+        const std::vector<float> values = ninfer::test::ggml::decode_blocks(QType::GGML_IQ3_S, row);
+        for (std::int32_t v = 0; v < kD; ++v) { expected[t * kD + v] = f32_to_bf16(values[v]); }
+    }
+    GuardedDeviceBuffer device_table(table_bytes.size());
+    device_table.copy_from_host(table_bytes.data(), table_bytes.size());
+    GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
+    device_ids.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer output(expected.size() * sizeof(std::uint16_t));
+    output.fill(0xff);
+    Weight weight         = iq4_xs_weight(device_table.data(), kVocab, kD);
+    weight.qtype          = QType::GGML_IQ3_S;
+    weight.payload_bytes  = table_bytes.size();
+    Tensor input(device_ids.data(), DType::I32, {static_cast<std::int32_t>(ids.size())});
+    Tensor result(output.data(), DType::BF16, {kD, static_cast<std::int32_t>(ids.size())});
+    ops::embedding(input, weight, result, nullptr);
+    cuda_synchronize();
+    int failures = verify_exact("embedding GGML IQ3_S [1000,2560]",
+                                guarded_to_host<std::uint16_t>(output, expected.size()), expected);
+    failures += output.verify_guards("embedding GGML IQ3_S output");
+    failures += device_table.verify_guards("embedding GGML IQ3_S table");
+    // embedding_split takes IQ4_XS planes only.
+    bool refused = false;
+    try {
+        ops::embedding_split(input, weight, weight, 1, result, nullptr);
+    } catch (const std::invalid_argument&) { refused = true; }
+    if (!refused) {
+        std::cerr << "embedding_split accepted IQ3_S planes\n";
+        ++failures;
+    }
+    return failures;
+}
+
 // embedding_split_matches_embedding: the Flash-Next table (D = 2560) with its first hot_rows rows in
 // a device plane and the whole table in mapped page-locked host memory, read through its device
 // pointer (--hot-embedding-rows). Ids across the boundary (0, N - 1, N, V - 1, repeated ids) give
@@ -1061,6 +1116,7 @@ int main() {
         failures += test_q8();
         failures += test_fp8();
         failures += test_ggml_iq4_xs();
+        failures += test_ggml_iq3_s();
         failures += test_embedding_split_matches_embedding();
     } catch (const std::exception& error) {
         std::cerr << "embedding test exception: " << error.what() << '\n';
