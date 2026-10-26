@@ -1191,6 +1191,44 @@ None has been measured on the RTX 3090 yet.
     bit against the emulation), `ninfer_linear_ggml_device_decode_test`,
     `ninfer_projection_fp32_test` (Q6_K and Q5_K heads) and `ninfer_embedding_test` (IQ3_S); the
     decode and prefill speed of the K-quant projections is unmeasured.
+- **Partial RAM residency** (`--partial-ram-residency`, F8 part 3; Basalt's resident RAM mode,
+  `expert_source.hpp`). Host RAM holds only the routed experts the VRAM cache does not, plus
+  spares, instead of every bank pinned whole.
+  - Load: the text banks are bound `Residency::File` (not materialized). The startup VRAM check
+    runs before the RAM ledger; `plan_partial_ram` takes its frame count, less a 512 MiB margin, as
+    the experts read straight from the file into frames (the saved state's ranking, else every
+    layer in turn), which then live only in VRAM. Every other expert gets a pinned RAM slot of its
+    layer's stride: layer l has min(E, E - N_l + 16) slots, so (E_total - vram_frames + spares) *
+    stride with one stride. The Program refuses when its cache comes out smaller than the plan.
+  - Runtime (`program/ram_slots.h`, `ExpertResidency::PartialSetup`): every expert has a valid copy
+    in a published frame, a RAM slot or both. A promotion copies from the slot and keeps it (the pool
+    is fixed, so the copy costs no RAM and a later eviction needs no copy). The LFRU's eviction gate
+    lets an expert held only in VRAM leave only when its layer has a slot for it: a free one, else
+    one reclaimed from the layer's best-scoring VRAM resident with a copy (which then lives only in
+    VRAM); otherwise that round admits no further expert. The controller emits `kWriteBack` and holds
+    the frame (`complete_writeback` frees it); the device table keeps the frame until the
+    device-to-host copy lands, then names the slot. Loads read slots on the same copy stream after any
+    write-back into them.
+  - The Op: `MoeExpertSource::host_slots` makes `host_records` a device table of per-expert
+    addresses, read by the stage kernel only (a call with host slots must stage), so the expert
+    kernels keep the base commit's SASS (88 of 89 narrow-route kernels and all 11 wide ones
+    identical; `stage_kernel` differs). The CPU miss service reads `CpuMissService::Layer::slots`.
+    The GPU hands the CPU only experts whose frame is -1, and each of those has a RAM copy, so
+    `--cpu-verify-misses` and `--prefill-cpu-share` work unchanged (static prefill calls only).
+  - Refused or off: `--vision` (images use lent frames), a KV base (`kv_base_tokens`: the whole KV
+    is mapped at startup, so the elastic KV never takes frames), the VRAM monitor's resizing, frame
+    lending and so the expert stream (wide prefill calls fall back to static calls). Each of these
+    would evict without a round in which to write VRAM-only experts back; supporting lending needs
+    RAM homes for the lent run (Basalt keeps the lent slots' experts in RAM).
+  - Windows: the plan and the RAM ledger keep every pinned byte within RAM/2 - 8 GiB (WDDM's
+    page-lock cap as Basalt's `docs/platforms.md` reports it, for `cudaHostRegister`) and refuse
+    with the largest `--vram-headroom-mib` or the `--expert-cache-mib` that fits. Full mode is not
+    capped, and it pins about 35 GiB on the 64 GB Windows box with `cudaHostAlloc` (the README's
+    preview), above that cap: whether the cap applies to `cudaHostAlloc` needs a check on Windows.
+  - GPU-session checks: `ninfer_qwen4_exp_partial_ram_residency_test` (greedy ids and MTP
+    statistics against full mode on a 4 GiB cache, at least one write-back), the host-slot
+    placements of `ninfer_offloaded_moe_layer_test` and `ninfer_offloaded_moe_wide_test`; a Windows
+    start of the IQ3_XXS pack on 64 GB. Not measured: decode with write-backs, startup time.
 
 ## Artifact decisions
 
@@ -1279,7 +1317,7 @@ Infernix is Apache-2.0; each adapted file carries the notice the spec's licensin
 | `src/core/{vmm_arena.{h,cu},cuda_vmm.h,vram_budget.{h,cpp},copy_batch.{h,cpp},link_probe.{h,cpp},power_throttling.{h,cpp}}` | same paths | Namespace; `CopyBatch` takes CUDA 12.8's `cudaMemcpyBatchAsync` form and falls back to single copies; a `cuMemSetAccess` that WDDM cannot make resident (`CUDA_ERROR_NOT_READY`) is a refusal, like an out-of-memory `cuMemCreate` (PR 12) |
 | `src/core/host_memory.{h,cpp}` | same path | The snapshot and working-set reserve only |
 | `src/core/pinned_upload.{h,cu}` | `src/core/device.{h,cu}` (`upload_pinned`) | Own translation unit |
-| `src/models/qwen4_exp/memory_plan.{h,cpp}` | same path | Full RAM mode only (fits or refuses; no SSD tier, no `--expert-ram-mib`); the VRAM sizing and control law unchanged; `kv_growth_frames` is `grow_kv`'s arithmetic as a pure function (PR 12) |
+| `src/models/qwen4_exp/memory_plan.{h,cpp}` | same path | Full RAM mode (fits or refuses; no SSD tier, no `--expert-ram-mib`), or NInfer's partial RAM residency (`plan_partial_ram`); the VRAM sizing and control law unchanged; `kv_growth_frames` is `grow_kv`'s arithmetic as a pure function (PR 12) |
 | `src/models/qwen4_exp/program/expert_cache/expert_{cache,state}.{h,cpp}` | same paths | Verbatim but for `lend` reporting the keys it evicts (PR 12) |
 | `src/models/qwen4_exp/program/expert_residency.{h,cpp}` | same path | Per-layer record strides in one frame size; no SSD tier or landing; frame lending (PR 10) whose give-back restores the displaced experts first (PR 12); a grow refills its new frames by score |
 | `src/models/qwen4_exp/program/vram_monitor.{h,cpp}` | same path | Verbatim |

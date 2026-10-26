@@ -56,6 +56,9 @@ struct ForwardExperts {
     const std::uint8_t* frame_base = nullptr;
     std::uint64_t frame_stride     = 0;      // bytes between frames (0: each layer's record stride)
     std::vector<const std::int32_t*> frames; // per layer, device I32 [E]: frame or -1
+    // Optional, per layer (partial RAM residency): the device table of each expert's RAM slot
+    // address (ops::MoeExpertSource::host_slots), read in place of the bank for experts with no frame.
+    std::vector<const std::uint8_t* const*> host_slots;
     // Optional route log (the expert cache's): layer l's routed ids [top k, T] are copied to
     // route_log + l * route_stride every call.
     std::int32_t* route_log  = nullptr;

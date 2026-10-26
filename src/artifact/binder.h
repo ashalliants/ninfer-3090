@@ -11,8 +11,10 @@
 namespace ninfer::artifact {
 
 // Pinned: the object lives only in one page-locked Host block laid out by the plan (for weights
-// streamed to the device on demand); it never receives a device placement.
-enum class Residency { Device, Host, Values, Pinned };
+// streamed to the device on demand); it never receives a device placement. File: the object is not
+// materialized at all; the caller reads it from the artifact itself (Qwen4Exp partial RAM residency
+// reads its expert records into VRAM frames and RAM slots), so it has no parent backing.
+enum class Residency { Device, Host, Values, Pinned, File };
 
 struct ParameterReference {
     std::string name;

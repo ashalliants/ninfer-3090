@@ -377,6 +377,14 @@ struct FlashNextOptions {
     // Physical Host memory left free for Windows and other programs once every expert is pinned;
     // startup refuses when it cannot be kept.
     std::uint64_t ram_headroom_bytes = 2ULL << 30;
+    // Keep only the routed experts the VRAM expert cache does not hold in host RAM, plus spare slots
+    // (--partial-ram-residency), instead of pinning every expert: the hottest are read from the
+    // artifact straight into VRAM and live only there, and an expert evicted from VRAM is first
+    // copied back into a RAM slot. Lets packs whose experts exceed RAM load (the IQ3 packs on 64 GB).
+    // The same outputs, bit for bit. The expert cache keeps its startup size (no VRAM monitor), the
+    // whole KV is mapped at startup, and prefill runs without the expert stream (slower long
+    // prompts). Off: every expert is pinned, or startup refuses.
+    bool partial_ram_residency = false;
     // Tokens of KV backed at startup; requests needing more borrow it from the expert cache (0:
     // 32,768). Measurement and tests.
     std::uint32_t kv_base_tokens = 0;

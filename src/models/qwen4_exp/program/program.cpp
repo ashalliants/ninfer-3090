@@ -28,6 +28,8 @@
 
 #include "models/qwen4_exp/program/program.h"
 
+#include "artifact/reader.h"
+
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -546,6 +548,14 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
                                     "makes: add --hc-int8 or remove --hc-fused-read");
     }
     (void)plan_hot_embedding(c.vocab_size, c.hidden_size, o.hot_embedding_rows); // refuses N above the vocabulary
+    if (o.partial_ram_residency && o.vision) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: --partial-ram-residency lends no expert frames, and images are "
+                                    "encoded in lent frames: remove --vision or --partial-ram-residency");
+    }
+    if (o.partial_ram_residency && o.kv_base_tokens != 0) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: --partial-ram-residency maps the whole KV at startup (it "
+                                    "takes no expert frames): leave kv_base_tokens at 0");
+    }
     Layout d;
     d.drafts       = static_cast<std::int32_t>(o.mtp_draft_tokens);
     d.max_width    = 1 + d.drafts;
@@ -562,6 +572,9 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     d.pool_pages   = d.pages * d.lanes;
     const std::uint32_t base_tokens = o.kv_base_tokens != 0 ? o.kv_base_tokens : kKvBaseTokens;
     d.base_pages = std::min(d.pool_pages, std::max(1U, base_tokens / kPagedKVPageSize));
+    // Partial RAM residency backs the whole pool at startup: a growth would take frames whose
+    // experts may live only in VRAM.
+    if (o.partial_ram_residency) { d.base_pages = d.pool_pages; }
     // The drafter's KV is one more attention layer through the same block table.
     d.kv         = KvLayout::plan(c, d.pool_pages, c.attention_layers + (d.drafts > 0 ? 1U : 0U),
                                   static_cast<std::size_t>(d.pages) * d.lanes);
@@ -653,7 +666,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.io        = d.io.bytes + (sizeof(float) + 2ULL) * c.vocab_size * logit_columns + 2ULL * c.vocab_size * d.lanes +
                   256 * 4 +
                   (sizeof(ops::SamplingConfig) + 4ULL * public_tokens + 4ULL * d.mask_words + 256) * d.lanes + 4096;
-    b.residency            = ExpertResidency::table_bytes(c, d.columns);
+    b.residency            = ExpertResidency::table_bytes(c, d.columns, o.partial_ram_residency);
     b.speculation          = d.drafts > 0 ? d.spec.bytes : 0;
     b.expert_record_stride = d.frame_stride;
     b.max_frames           = ExpertResidency::max_frames(c);
@@ -860,7 +873,7 @@ public:
             if (options_.gdn_async_commit) { fold_stream_ = std::make_unique<GdnFoldStream>(); }
         }
 
-        if (plan_.bytes.cpu_misses != 0) { start_cpu_misses(); }
+        if (plan_.bytes.cpu_misses != 0 && !options_.partial_ram_residency) { start_cpu_misses(); }
         allocated += plan_.bytes.cpu_misses;
         if (plan_.bytes.ngram_flag_wait != 0) { start_ngram_flag(); }
         allocated += plan_.bytes.ngram_flag_wait;
@@ -881,8 +894,10 @@ public:
             bank_strides.push_back(bank.record_stride);
         }
         residency_ = std::make_unique<ExpertResidency>(c_, std::move(banks), std::move(bank_strides), plan_.columns,
-                                                       device_.device);
+                                                       device_.device, partial_setup());
         allocated += plan_.bytes.residency;
+        // Partial RAM residency: the CPU miss service reads the residency's host slot tables.
+        if (options_.partial_ram_residency && plan_.bytes.cpu_misses != 0) { start_cpu_misses(); }
         if (allocated != plan_.bytes.fixed_bytes()) {
             throw std::logic_error("Qwen3.8-Flash-Next: the Program's device allocations differ from its plan");
         }
@@ -898,7 +913,9 @@ public:
         if (options_.expert_cache) {
             VramDemand demand;
             demand.headroom    = options_.vram_headroom;
-            demand.elastic     = residency_->elastic() && options_.vram_monitor;
+            // Partial RAM residency keeps the pool's startup size: a shrink would evict experts held
+            // only in VRAM without a round to write them back in.
+            demand.elastic     = residency_->elastic() && options_.vram_monitor && !options_.partial_ram_residency;
             demand.graphs      = plan_.bytes.graph_bound;
             demand.frame_bytes = plan_.frame_stride;
             demand.max_frames  = residency_->frame_limit();
@@ -1024,6 +1041,11 @@ public:
         experts.staging_slots = kStagingSlots;
         experts.zero_copy_misses = kZeroCopyMisses;
         for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) { experts.frames.push_back(residency_->table(l)); }
+        if (residency_->partial()) {
+            for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
+                experts.host_slots.push_back(residency_->host_slot_table(l));
+            }
+        }
         if (cpu_misses_) {
             // --cpu-verify-misses: verification calls hand misses to the service; --prefill-cpu-share:
             // prefill and forced-token calls hand it their share. A timed-out wait reports to the
@@ -1052,7 +1074,8 @@ public:
                 }
             }
         }
-        if (residency_->frames() > 0 && plan_.wide_work > 0) {
+        // No stream with partial RAM residency: its ring is lent frames, and the pool lends none.
+        if (residency_->frames() > 0 && plan_.wide_work > 0 && !residency_->partial()) {
             std::vector<execution::ExpertStream::Bank> stream_banks;
             for (const auto& bank : parameters_.model.expert_banks()) {
                 stream_banks.push_back({bank.host_records, bank.record_stride});
@@ -1098,6 +1121,12 @@ public:
             try {
                 diagnostic("cpu miss service: " + std::to_string(cpu_misses_->served_requests()) + " requests, " +
                            std::to_string(cpu_misses_->served_experts()) + " experts served on the CPU");
+            } catch (...) {}
+        }
+        if (residency_ && residency_->partial()) {
+            try {
+                diagnostic("partial RAM residency: " + std::to_string(residency_->stats().write_backs) +
+                           " experts held only in VRAM were written back to RAM");
             } catch (...) {}
         }
         save_expert_state();
@@ -1146,6 +1175,13 @@ public:
         const CpuMissPlan p = plan_cpu_misses(options_);
         std::vector<ops::offloaded_moe::CpuMissService::Layer> layers;
         for (const auto& bank : parameters_.model.expert_banks()) {
+            if (residency_ && residency_->partial()) {
+                // Partial RAM residency: the experts without a frame each have a RAM slot, and the
+                // GPU hands the CPU only those (frame -1), so every CPU job finds its record.
+                const auto layer = static_cast<std::uint32_t>(layers.size());
+                layers.push_back({nullptr, bank.record_stride, bank.format, residency_->cpu_slot_table(layer)});
+                continue;
+            }
             if (bank.host_records == nullptr) {
                 throw std::logic_error("Qwen3.8-Flash-Next: the CPU miss service (--cpu-verify-misses, "
                                        "--prefill-cpu-share) needs every expert bank in host memory");
@@ -4747,7 +4783,9 @@ private:
         if (rate <= 0.0 && !banks.empty() && staging_.p != nullptr) {
             // An idle GPU parks its PCIe link at a low rate: enough repetitions (~0.1-0.3 s) wake it
             // before the best one is taken.
-            rate = measure_h2d_bytes_per_second(banks.front().host_records, staging_.p, plan_.staging, 32);
+            const std::uint8_t* source = banks.front().host_records;
+            if (residency_->partial() && residency_->ram_pool_bytes() >= plan_.staging) { source = residency_->ram_pool(); }
+            if (source != nullptr) { rate = measure_h2d_bytes_per_second(source, staging_.p, plan_.staging, 32); }
         }
         if (rate > 0.0) { link_ = rate; }
         char text[160];
@@ -4782,7 +4820,70 @@ private:
         }
     }
 
+    // --partial-ram-residency: the residency's RAM slots and a reader of the records left in the
+    // artifact (plan_load with partial), through a Reader of its own, kept until the experts are placed.
+    std::optional<ExpertResidency::PartialSetup> partial_setup() {
+        if (!options_.partial_ram_residency) { return std::nullopt; }
+        const auto banks = parameters_.model.expert_banks();
+        if (options_.partial_slots.size() != banks.size()) {
+            throw std::invalid_argument("Qwen3.8-Flash-Next: --partial-ram-residency needs one RAM slot count per layer");
+        }
+        for (const auto& bank : banks) {
+            if (bank.host_records != nullptr) {
+                throw std::logic_error("Qwen3.8-Flash-Next: --partial-ram-residency needs banks left in the artifact");
+            }
+        }
+        partial_reader_ = std::make_unique<artifact::Reader>(options_.artifact_path);
+        if (artifact::artifact_id_hex(partial_reader_->artifact_id()) !=
+            artifact::artifact_id_hex(parameters_.model.info().artifact_id)) {
+            throw std::invalid_argument("Qwen3.8-Flash-Next: --partial-ram-residency reads its experts from another "
+                                        "artifact than the one loaded");
+        }
+        ExpertResidency::PartialSetup setup;
+        setup.slots = options_.partial_slots;
+        setup.read  = [this](std::uint32_t layer, std::uint32_t first, std::uint32_t count, std::span<std::byte> out) {
+            const auto& bank = parameters_.model.expert_banks()[layer];
+            if (out.size() != static_cast<std::uint64_t>(count) * bank.record_stride || first + count > bank.experts) {
+                throw std::logic_error("Qwen3.8-Flash-Next: an expert record read outside its bank");
+            }
+            partial_reader_->read_into(bank.artifact_offset + static_cast<std::uint64_t>(first) * bank.record_stride, out);
+        };
+        return setup;
+    }
+
+    // --partial-ram-residency: every expert into its frame or RAM slot, before the first request,
+    // with the warm start's counts (when a state loads) seeded into the LFRU.
+    void place_partial_experts() {
+        const auto keys = c_.num_hidden_layers * c_.moe.experts;
+        std::optional<expert_cache::WarmStartLoad> warm;
+        if (!options_.expert_state.empty()) {
+            warm.emplace(expert_cache::load_warm_start({options_.expert_state, options_.expert_state_identity,
+                                                        options_.default_expert_state,
+                                                        options_.default_expert_state_identity},
+                                                       keys));
+            expert_state_saved_ = Clock::now();
+        }
+        const auto* state = warm && warm->load.state ? &*warm->load.state : nullptr;
+        const auto start  = Clock::now();
+        const std::uint32_t loaded =
+            residency_->place_partial(options_.partial_vram_keys, state, kSeedCountCap, device_.stream);
+        partial_reader_.reset();
+        char line[320];
+        std::snprintf(line, sizeof(line),
+                      "partial RAM residency: %u experts read into VRAM frames (held only there), %u of %u frames; "
+                      "the other %u in %.1f GiB of pinned RAM slots (%.2f s)",
+                      loaded, loaded, residency_->frames(), keys - loaded,
+                      static_cast<double>(residency_->ram_pool_bytes()) / (1ULL << 30),
+                      std::chrono::duration<double>(Clock::now() - start).count());
+        diagnostic(line);
+        expert_state_routed_ = residency_->stats().routed;
+    }
+
     void warm_start_experts() {
+        if (options_.partial_ram_residency) {
+            place_partial_experts();
+            return;
+        }
         if (options_.expert_state.empty() || !options_.expert_cache || residency_->frames() == 0) { return; }
         const auto keys = c_.num_hidden_layers * c_.moe.experts;
         const auto warm = expert_cache::load_warm_start(
@@ -5093,6 +5194,7 @@ private:
     VramDemand demand_; // as sized at startup: the frames' and the KV's one device ledger
     std::optional<VramControl> control_;
     std::unique_ptr<VramMonitor> monitor_;
+    std::unique_ptr<artifact::Reader> partial_reader_; // --partial-ram-residency, until the experts are placed
     Clock::time_point vram_epoch_{};
     std::uint32_t frames_now_ = 0, startup_frames_ = 0;
     std::uint64_t pool_now_ = 0;

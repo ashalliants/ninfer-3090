@@ -44,6 +44,14 @@
 //   ninfer_qwen4_exp_engine_real_test --hot-embedding-exact N [--mtp K] [--max-context N] [--generate N]
 //       [TOKENS...]
 //
+// Partial RAM residency (partial_ram_residency_matches_full below, --partial-ram-residency): greedy
+// ids with only the experts the VRAM cache does not hold in RAM equal those with every bank pinned,
+// and at least one VRAM-only expert was written back. --expert-cache-mib N (both Engines) makes the
+// evictions common; --mtp K compares the MTP statistics too.
+//
+//   ninfer_qwen4_exp_engine_real_test --partial-ram-exact [--expert-cache-mib N] [--mtp K]
+//       [--max-context N] [--generate N] [TOKENS...]
+//
 // GDN head map (gdn_head_map_matches_copies below, --gdn-head-map): greedy ids with the GDN reading
 // its key heads through the tiled head map equal those of an Engine with the q/k copies. --mtp K runs
 // both Engines with MTP, so the verification's replay records (16 key heads) and their fold run too.
@@ -128,6 +136,7 @@
 
 #include "core/vram_budget.h"
 #include "models/qwen4_exp/execution/expert_stream.h"
+#include "models/qwen4_exp/program/expert_residency.h"
 #include "models/qwen4_exp/program/program.h"
 #include "ninfer/engine.h"
 #include "ninfer/ops/offloaded_sparse_moe.h"
@@ -941,6 +950,18 @@ int ngram_flag_wait_matches_split(const std::string& artifact, const std::vector
                                [] { return Program::process_ngram_flag_rounds(); }});
 }
 
+// partial_ram_residency_matches_full (--partial-ram-exact, FlashNextOptions::partial_ram_residency):
+// with only the experts the VRAM cache does not hold in RAM (the hottest read straight into frames,
+// held only there; promotions from RAM slots; an evicted VRAM-only expert written back first) the
+// greedy ids (and with --mtp the rounds, drafts and acceptances) equal those of the whole pinned
+// banks, and at least one write-back ran. --expert-cache-mib N (both Engines) makes evictions common.
+int partial_ram_residency_matches_full(const std::string& artifact, const std::vector<std::string>& args) {
+    return option_matches_off(artifact, args,
+                              {"whole pinned banks", "partial RAM residency", "partial ram residency",
+                               [](EngineOptions& o) { o.flash_next.partial_ram_residency = true; },
+                               [] { return models::qwen4_exp::ExpertResidency::process_write_backs(); }});
+}
+
 // mtp_constrained_matches_plain (--mtp-constrained, FlashNextOptions::mtp_constrained): a greedy
 // JSON-schema request on an MTP Engine with the option gives the ids of plain constrained decoding.
 // The reference is an MTP Engine without the option, where the constrained row runs plain rounds
@@ -1409,6 +1430,9 @@ int main(int argc, char** argv) {
         }
         if (!args.empty() && args.front() == "--ngram-flag-wait-exact") {
             return ngram_flag_wait_matches_split(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
+        }
+        if (!args.empty() && args.front() == "--partial-ram-exact") {
+            return partial_ram_residency_matches_full(artifact, std::vector<std::string>(args.begin() + 1, args.end()));
         }
         if (!args.empty() && args.front() == "--mtp-constrained") {
             return mtp_constrained_matches_plain(artifact, std::vector<std::string>(args.begin() + 1, args.end()));

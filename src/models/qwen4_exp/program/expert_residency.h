@@ -4,7 +4,8 @@
 // Modified for NInfer-3090: frames hold ggml_expert_record_v1 records of each layer's bank (the
 // stride is the largest bank's); no SSD tier or landing frames (their Op and Program paths are not
 // ported); frame lending for prefill, whose give-back restores the displaced experts; a grow
-// refills its new frames by score; uploads use core/pinned_upload.h.
+// refills its new frames by score; uploads use core/pinned_upload.h; partial RAM residency
+// (PartialSetup: RAM slots for the experts no frame holds, write-backs before a frame is reused).
 //
 // The VRAM expert cache of the Qwen4Exp Program: a pool of device frames, each holding one routed
 // expert's record, the per-layer frame tables the MoE kernels read (frame or -1: stage the record
@@ -29,12 +30,15 @@
 #include "core/vram_budget.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/program/expert_cache/expert_cache.h"
+#include "models/qwen4_exp/program/ram_slots.h"
 
 #include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -47,6 +51,20 @@ public:
         std::uint64_t hits       = 0; // of those, resident in a frame at the round's start
         std::uint64_t promotions = 0; // expert copies issued
         std::uint64_t seeded     = 0; // experts loaded by the warm start
+        std::uint64_t write_backs = 0; // partial RAM residency: VRAM-only experts copied to RAM
+    };
+
+    // Partial RAM residency (--partial-ram-residency, program/ram_slots.h): the banks are not in
+    // host memory. One pinned, mapped pool holds `slots[l]` RAM slots of layer l's record stride,
+    // place_partial fills the frames and the slots from the artifact through `read` (`count`
+    // consecutive records of `layer` from expert `first` into `out`), promotions copy from the slots
+    // and keep the RAM copy, and evicting an expert held only in VRAM writes it back into a slot
+    // before its frame is reused (it reads from its frame until then). The pool never shrinks or
+    // lends (resize below its size and lend are refused; lendable() is 0).
+    struct PartialSetup {
+        std::vector<std::uint32_t> slots;
+        std::function<void(std::uint32_t layer, std::uint32_t first, std::uint32_t count, std::span<std::byte> out)>
+            read;
     };
 
     using SavedState = expert_cache::SavedState;
@@ -60,17 +78,20 @@ public:
     std::uint32_t warm_start(const SavedState& state, std::uint32_t count_cap, std::uint32_t max_keys,
                              cudaStream_t compute);
 
-    // banks[l]: layer l's pinned host records (`strides[l]` bytes apart); a frame holds the largest.
-    // max_columns: the most columns one round routes. The cache starts with no frames: resize()
-    // backs them.
+    // banks[l]: layer l's pinned host records (`strides[l]` bytes apart; null with `partial`); a
+    // frame holds the largest. max_columns: the most columns one round routes. The cache starts with
+    // no frames: resize() backs them.
     ExpertResidency(const TextConfig& config, std::vector<const std::uint8_t*> banks,
-                    std::vector<std::uint64_t> strides, std::int32_t max_columns, int device);
+                    std::vector<std::uint64_t> strides, std::int32_t max_columns, int device,
+                    std::optional<PartialSetup> partial = std::nullopt);
     ~ExpertResidency();
     ExpertResidency(const ExpertResidency&)            = delete;
     ExpertResidency& operator=(const ExpertResidency&) = delete;
 
-    // Device bytes besides the frames: the frame tables and the route log.
-    [[nodiscard]] static std::uint64_t table_bytes(const TextConfig& config, std::int32_t max_columns) noexcept;
+    // Device bytes besides the frames: the frame tables and the route log, and with partial RAM
+    // residency the host slot table (one 8-byte address per expert).
+    [[nodiscard]] static std::uint64_t table_bytes(const TextConfig& config, std::int32_t max_columns,
+                                                   bool partial = false) noexcept;
     // Frames the cache uses at most: every routed expert but one.
     [[nodiscard]] static std::uint32_t max_frames(const TextConfig& config) noexcept;
     // Bytes the frames are mapped in (whole chunks); a grow or shrink moves in these steps.
@@ -143,6 +164,24 @@ public:
 
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
+    // ---------------------------------------------------------------- partial RAM residency
+    [[nodiscard]] bool partial() const noexcept { return homes_ != nullptr; }
+    // Before the first round, with the frames backed: loads `vram_keys` into frames (they live only
+    // in VRAM) and every other expert into its RAM slot, from the artifact, seeding the LFRU counts
+    // from `state` (each capped at `count_cap`; nullptr: none). Refused when the frames cannot hold
+    // every VRAM key. Returns the number loaded into frames.
+    std::uint32_t place_partial(std::span<const std::uint32_t> vram_keys, const SavedState* state,
+                                std::uint32_t count_cap, cudaStream_t compute);
+    // Layer l's host slot table: device [E] mapped addresses (ops::MoeExpertSource::host_slots), and
+    // the same addresses for the CPU miss service (host [E]); null for an expert without a RAM copy.
+    [[nodiscard]] const std::uint8_t* const* host_slot_table(std::uint32_t layer) const noexcept;
+    [[nodiscard]] const std::uint8_t* const* cpu_slot_table(std::uint32_t layer) const noexcept;
+    // The pinned slot pool (host address) and its size.
+    [[nodiscard]] const std::uint8_t* ram_pool() const noexcept;
+    [[nodiscard]] std::uint64_t ram_pool_bytes() const noexcept;
+    // Write-backs every residency of this process has issued (tests that cannot reach it).
+    [[nodiscard]] static std::uint64_t process_write_backs() noexcept;
+
 private:
     // After the controller took a run back (commands_ holds the loads that gave back queued): reloads
     // displaced_[displaced_from..] and issues every queued load. The frames are already returned when
@@ -156,6 +195,16 @@ private:
     // Loads non-resident experts into the free frames: those of `first`, then the others with
     // uses, each group highest LFRU score first. Returns the number loaded.
     std::uint32_t refill(cudaStream_t compute, std::span<const std::uint32_t> first);
+    void issue_loads(cudaStream_t compute, const std::vector<expert_cache::CacheController::Command>& commands);
+    // Partial RAM residency: applies a round's evictions (a RAM copy leaves at once, a VRAM-only
+    // expert starts its write-back), publishes landed write-backs (their frames return to the
+    // controller, whose queued loads go to landed_commands_), and refreshes the slot tables.
+    void apply_partial_evictions();
+    void publish_write_backs();
+    void refresh_slot_tables();
+    void upload_slot_table(cudaStream_t compute);
+    // Uploads the tables and issues landed_commands_' loads.
+    void settle_partial(cudaStream_t compute);
 
     const TextConfig& c_;
     std::vector<const std::uint8_t*> banks_;
@@ -197,6 +246,22 @@ private:
     // steps.
     static constexpr std::size_t kLoadsPerEvent = 64;
     Stats stats_;
+
+    // Partial RAM residency (null/empty otherwise).
+    std::unique_ptr<partial::Residency> homes_;
+    std::function<void(std::uint32_t, std::uint32_t, std::uint32_t, std::span<std::byte>)> read_;
+    PinnedHostBuffer ram_pool_{1};
+    const std::uint8_t* ram_device_ = nullptr; // the pool's device address
+    PinnedHostBuffer slots_upload_{1};         // device addresses [keys], uploaded to slots_device_
+    DeviceBuffer slots_device_;
+    std::vector<const std::uint8_t*> slots_cpu_; // host addresses [keys]
+    bool slots_dirty_ = false;
+    struct WriteBack {
+        cudaEvent_t done = nullptr;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> moves; // (key, frame)
+    };
+    std::vector<WriteBack> write_backs_;
+    std::vector<expert_cache::CacheController::Command> landed_commands_;
 };
 
 } // namespace ninfer::models::qwen4_exp

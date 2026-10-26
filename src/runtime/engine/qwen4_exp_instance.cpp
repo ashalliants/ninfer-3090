@@ -22,13 +22,16 @@
 #include "models/registry.h"
 #include "runtime/engine/validate_options.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #ifdef _WIN32
 #    include <process.h>
@@ -291,11 +294,111 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     }
     // --hot-embedding-rows: the token embedding is pinned whole (beside the banks) and only its first
     // rows get a device copy.
-    auto plan      = models::qwen4_exp::plan_load(reader, mtp, vision, next.hot_embedding_rows != 0);
+    // --partial-ram-residency: the text banks stay in the artifact; the Program reads them into its
+    // frames and RAM slots.
+    const bool partial = next.partial_ram_residency;
+    auto plan      = models::qwen4_exp::plan_load(reader, mtp, vision, next.hot_embedding_rows != 0, partial);
     binding.complete();
     const auto& config = plan.config();
     const auto hot_embedding =
         models::qwen4_exp::plan_hot_embedding(config.vocab_size, config.hidden_size, next.hot_embedding_rows);
+
+    // The Program's options (the context cache's Host tier is set once the RAM ledger sized it).
+    models::qwen4_exp::ProgramOptions program_options;
+    program_options.device          = device.device;
+    program_options.max_context     = options.max_context;
+    program_options.max_concurrency = options.max_concurrency;
+    program_options.prefill_chunk   = options.prefill_chunk;
+    program_options.use_cuda_graph  = options.use_cuda_graph;
+    program_options.vram_headroom   = next.vram_headroom_bytes;
+    program_options.expert_cache_bytes = next.expert_cache_bytes;
+    program_options.kv_base_tokens  = next.kv_base_tokens;
+    program_options.mtp_draft_tokens = mtp ? options.speculative.draft_tokens : 0;
+    program_options.mtp_width_cost   = next.mtp_width_cost;
+    program_options.mtp_fixed_drafts = next.mtp_fixed_drafts;
+    program_options.mtp_constrained  = next.mtp_constrained;
+    program_options.mtp_joint_acceptance = next.mtp_joint_acceptance;
+    program_options.relaxed_drafting     = options.relaxed_drafting.has_value();
+    program_options.ngram_prefetch       = next.ngram_prefetch;
+    program_options.vision           = vision;
+    program_options.context_bounce_bytes = kNvmeBounceBytes;
+    program_options.ngram_keepalive_ms = next.ngram_keepalive_ms;
+    program_options.shared_expert_stream = next.shared_expert_stream;
+    program_options.hot_embedding_rows   = next.hot_embedding_rows;
+    program_options.gdn_head_map         = next.gdn_head_map;
+    program_options.moe_precast_input    = next.moe_precast_input;
+    program_options.moe_gate_up_registers = next.moe_gate_up_registers;
+    program_options.moe_fused_route       = next.moe_fused_route;
+    program_options.cpu_verify_misses     = next.cpu_verify_misses;
+    program_options.cpu_verify_workers    = next.cpu_verify_workers;
+    program_options.prefill_cpu_share_num = next.prefill_cpu_share.num;
+    program_options.prefill_cpu_share_den = next.prefill_cpu_share.den;
+    program_options.gdn_async_commit      = next.gdn_async_commit;
+    program_options.hc_int8               = next.hc_int8;
+    program_options.hc_fused_read         = next.hc_fused_read;
+    program_options.ngram_flag_wait       = next.ngram_flag_wait;
+    program_options.partial_ram_residency = partial;
+    program_options.artifact_path         = options.artifact_path;
+    program_options.ngram_volume    = next.ngram_volume_path.empty()
+                                          ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
+                                          : next.ngram_volume_path;
+    {
+        // The state belongs to the artifact: its experts and their records. --no-expert-state
+        // leaves every path empty, the shipped default included.
+        const auto files = models::qwen4_exp::expert_cache::resolve_expert_state_files(
+            next.save_expert_state, options.artifact_path, next.expert_state_path, next.default_expert_state_path,
+            artifact::artifact_id_hex(reader.artifact_id()));
+        program_options.expert_state                   = files.primary;
+        program_options.expert_state_identity          = files.primary_identity;
+        program_options.default_expert_state           = files.fallback;
+        program_options.default_expert_state_identity  = files.fallback_identity;
+    }
+
+    // The VRAM check, before the weights are read: the dense weights, the Program's fixed
+    // allocations, the reserve for graph executables and the display headroom must leave room for
+    // the expert cache. With --partial-ram-residency it runs before the RAM ledger, whose expert
+    // slots depend on how many experts the frames hold.
+    const auto device_plan = models::qwen4_exp::Program::plan_device(program_options, config,
+                                                                     plan.resources().public_token_count,
+                                                                     plan.expert_record_strides());
+    const std::uint64_t dense = plan.device_bytes();
+    auto vram                 = open_vram_budget_source(device.device);
+    std::optional<VramSnapshot> before;
+    models::qwen4_exp::VramSizing check;
+    const auto check_vram = [&] {
+        if (hot_embedding.table != 0) {
+            report("token embedding: " + std::to_string(next.hot_embedding_rows) + " of " +
+                   std::to_string(config.vocab_size) + " rows in VRAM (" + std::to_string(mib(hot_embedding.hot)) +
+                   " MiB), the rest read from pinned RAM (" + std::to_string(mib(hot_embedding.table)) +
+                   " MiB pinned): " + std::to_string(mib(hot_embedding.table - hot_embedding.hot)) +
+                   " MiB more VRAM for the expert cache");
+        }
+        before = vram->query();
+        models::qwen4_exp::VramDemand check_demand;
+        check_demand.headroom    = next.vram_headroom_bytes;
+        // The same condition the Program sizes with (program.cpp: residency_->elastic() && vram_monitor
+        // && !partial_ram_residency; the expert arena exists exactly when the VMM path is supported),
+        // so the display headroom here is the 512 MiB elastic default and not the 1 GiB fixed one.
+        check_demand.elastic     = VmmArena::supported(device.device) && program_options.vram_monitor && !partial;
+        check_demand.graphs      = device_plan.graph_bound;
+        check_demand.fixed       = dense + device_plan.fixed_bytes();
+        check_demand.frame_bytes = device_plan.expert_record_stride;
+        check_demand.max_frames  = device_plan.max_frames;
+        check                    = models::qwen4_exp::size_expert_frames(*before, check_demand);
+        if (check.frame_bytes < 0) {
+            throw std::runtime_error(
+                "Qwen3.8-Flash-Next does not fit in device memory: " + std::to_string(mib(before->device_free)) +
+                " MiB free; dense weights " + std::to_string(mib(dense)) + " MiB, KV " + std::to_string(mib(device_plan.kv)) +
+                ", workspace " + std::to_string(mib(device_plan.workspace)) + ", expert staging " +
+                std::to_string(mib(device_plan.staging)) + " (" + check.describe() +
+                "). Lower --max-context or --prefill-chunk, or free VRAM");
+        }
+        if (check.frames < kFewFrames) {
+            report("decode will be slow: only " + std::to_string(check.frames) + " expert frames fit in VRAM (" +
+                   std::to_string(kFewFrames) + " or more recommended); lower --max-context, or free VRAM");
+        }
+    };
+    if (partial) { check_vram(); }
 
     // The RAM ledger: every expert (and the vision tower) is pinned, beside a reserve for Windows and
     // every other planned allocation, before anything is pinned or read.
@@ -343,6 +446,52 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // The context cache's Host tier (prefix reuse) is pinned beside the experts: it gets what the
     // ledger can spare above the reserve, up to the requested size, and is off below a minimum.
     const auto snapshot = host_memory_snapshot();
+    if (partial) {
+        // --partial-ram-residency: RAM holds the experts the frames do not, plus spares, hottest
+        // experts (the warm start's ranking) in VRAM; on Windows within WDDM's page-lock cap.
+        const std::uint32_t keys = config.num_hidden_layers * config.moe.experts;
+        models::qwen4_exp::PartialRamDemand need;
+        need.experts     = config.moe.experts;
+        need.strides     = plan.expert_record_strides();
+        need.frame_bytes = device_plan.expert_record_stride;
+        need.frames      = check.frames;
+        if (next.expert_cache_bytes) {
+            const auto limit = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(*next.expert_cache_bytes / need.frame_bytes, need.frames));
+            need.cache_limited = *next.expert_cache_bytes / need.frame_bytes <= need.frames; // the option bounds it
+            need.frames        = limit;
+        }
+        const auto warm = models::qwen4_exp::expert_cache::load_warm_start(
+            {program_options.expert_state, program_options.expert_state_identity, program_options.default_expert_state,
+             program_options.default_expert_state_identity},
+            keys);
+        if (warm.load.state) {
+            const auto& state = *warm.load.state;
+            need.ranked       = state.ranked;
+            std::vector<std::uint32_t> used;
+            for (std::uint32_t key = 0; key < state.counts.size(); ++key) {
+                if (state.counts[key] > 0) { used.push_back(key); }
+            }
+            std::stable_sort(used.begin(), used.end(),
+                             [&](std::uint32_t a, std::uint32_t b) { return state.counts[a] > state.counts[b]; });
+            need.ranked.insert(need.ranked.end(), used.begin(), used.end());
+        }
+        need.other_pinned = demand.other_pinned + std::max(demand.later_pinned, demand.load_staging);
+        need.headroom     = check.headroom;
+#ifdef _WIN32
+        need.pin_cap   = models::qwen4_exp::wddm_pin_cap(snapshot.total_physical);
+        demand.pin_cap = need.pin_cap;
+#endif
+        const auto partial_plan = models::qwen4_exp::plan_partial_ram(need);
+        if (!partial_plan.refusal.empty()) { throw std::runtime_error(partial_plan.refusal); }
+        demand.expert_banks               = partial_plan.bytes;
+        program_options.partial_slots     = partial_plan.slots;
+        program_options.partial_vram_keys = partial_plan.vram_keys;
+        report("partial RAM residency: " + std::to_string(partial_plan.vram_keys.size()) + " of " +
+               std::to_string(keys) + " experts held only in VRAM (" + std::to_string(need.frames) +
+               " frames), the rest in " + std::to_string(mib(partial_plan.bytes)) + " MiB of RAM slots" +
+               (warm.load.state ? " (the hottest by the saved expert state)" : " (no saved expert state: every layer alike)"));
+    }
     std::uint64_t requested_cache =
         options.context_cache.enabled ? options.context_cache.host_capacity_bytes.value_or(kDefaultHostContextBytes) : 0;
     // The tier's RAM frames address only the file's slabs: RAM beyond the NVMe size would be pinned for nothing.
@@ -351,6 +500,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                                                                 kHostContextGranule);
     demand.context_cache = cache_fit.bytes;
     const auto ledger    = models::qwen4_exp::plan_host_memory(snapshot, demand);
+    program_options.context_cache_bytes = cache_fit.bytes;
+    program_options.context_nvme_bytes  = nvme_bytes;
+    program_options.context_nvme_path   = nvme_path;
     report(ledger.summary());
     report(ledger.describe());
     if (!ledger.fits) { throw std::runtime_error("Qwen3.8-Flash-Next cannot start: " + ledger.summary()); }
@@ -376,98 +528,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                " MiB of resident working memory (" + refused + "); if RAM runs short, responses may slow down");
     }
 
-    models::qwen4_exp::ProgramOptions program_options;
-    program_options.device          = device.device;
-    program_options.max_context     = options.max_context;
-    program_options.max_concurrency = options.max_concurrency;
-    program_options.prefill_chunk   = options.prefill_chunk;
-    program_options.use_cuda_graph  = options.use_cuda_graph;
-    program_options.vram_headroom   = next.vram_headroom_bytes;
-    program_options.expert_cache_bytes = next.expert_cache_bytes;
-    program_options.kv_base_tokens  = next.kv_base_tokens;
-    program_options.mtp_draft_tokens = mtp ? options.speculative.draft_tokens : 0;
-    program_options.mtp_width_cost   = next.mtp_width_cost;
-    program_options.mtp_fixed_drafts = next.mtp_fixed_drafts;
-    program_options.mtp_constrained  = next.mtp_constrained;
-    program_options.mtp_joint_acceptance = next.mtp_joint_acceptance;
-    program_options.relaxed_drafting     = options.relaxed_drafting.has_value();
-    program_options.ngram_prefetch       = next.ngram_prefetch;
-    program_options.vision           = vision;
-    program_options.context_cache_bytes  = cache_fit.bytes;
-    program_options.context_nvme_bytes   = nvme_bytes;
-    program_options.context_nvme_path    = nvme_path;
-    program_options.context_bounce_bytes = kNvmeBounceBytes;
-    program_options.ngram_keepalive_ms = next.ngram_keepalive_ms;
-    program_options.shared_expert_stream = next.shared_expert_stream;
-    program_options.hot_embedding_rows   = next.hot_embedding_rows;
-    program_options.gdn_head_map         = next.gdn_head_map;
-    program_options.moe_precast_input    = next.moe_precast_input;
-    program_options.moe_gate_up_registers = next.moe_gate_up_registers;
-    program_options.moe_fused_route       = next.moe_fused_route;
-    program_options.cpu_verify_misses     = next.cpu_verify_misses;
-    program_options.cpu_verify_workers    = next.cpu_verify_workers;
-    program_options.prefill_cpu_share_num = next.prefill_cpu_share.num;
-    program_options.prefill_cpu_share_den = next.prefill_cpu_share.den;
-    program_options.gdn_async_commit      = next.gdn_async_commit;
-    program_options.hc_int8               = next.hc_int8;
-    program_options.hc_fused_read         = next.hc_fused_read;
-    program_options.ngram_flag_wait       = next.ngram_flag_wait;
-    program_options.ngram_volume    = next.ngram_volume_path.empty()
-                                          ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
-                                          : next.ngram_volume_path;
-    {
-        // The state belongs to the artifact: its experts and their records. --no-expert-state
-        // leaves every path empty, the shipped default included.
-        const auto files = models::qwen4_exp::expert_cache::resolve_expert_state_files(
-            next.save_expert_state, options.artifact_path, next.expert_state_path, next.default_expert_state_path,
-            artifact::artifact_id_hex(reader.artifact_id()));
-        program_options.expert_state                   = files.primary;
-        program_options.expert_state_identity          = files.primary_identity;
-        program_options.default_expert_state           = files.fallback;
-        program_options.default_expert_state_identity  = files.fallback_identity;
-    }
-
-    // The VRAM check, before the weights are read: the dense weights, the Program's fixed
-    // allocations, the reserve for graph executables and the display headroom must leave room for
-    // the expert cache.
-    const auto device_plan = models::qwen4_exp::Program::plan_device(program_options, config,
-                                                                     plan.resources().public_token_count,
-                                                                     plan.expert_record_strides());
-    const std::uint64_t dense = plan.device_bytes();
-    if (hot_embedding.table != 0) {
-        report("token embedding: " + std::to_string(next.hot_embedding_rows) + " of " +
-               std::to_string(config.vocab_size) + " rows in VRAM (" + std::to_string(mib(hot_embedding.hot)) +
-               " MiB), the rest read from pinned RAM (" + std::to_string(mib(hot_embedding.table)) +
-               " MiB pinned): " + std::to_string(mib(hot_embedding.table - hot_embedding.hot)) +
-               " MiB more VRAM for the expert cache");
-    }
-    auto vram                 = open_vram_budget_source(device.device);
-    const VramSnapshot before = vram->query();
-    {
-        models::qwen4_exp::VramDemand check_demand;
-        check_demand.headroom    = next.vram_headroom_bytes;
-        // The same condition the Program sizes with (program.cpp: residency_->elastic() && vram_monitor;
-        // the expert arena exists exactly when the VMM path is supported), so the display headroom
-        // here is the 512 MiB elastic default and not the 1 GiB fixed one.
-        check_demand.elastic     = VmmArena::supported(device.device) && program_options.vram_monitor;
-        check_demand.graphs      = device_plan.graph_bound;
-        check_demand.fixed       = dense + device_plan.fixed_bytes();
-        check_demand.frame_bytes = device_plan.expert_record_stride;
-        check_demand.max_frames  = device_plan.max_frames;
-        const auto check         = models::qwen4_exp::size_expert_frames(before, check_demand);
-        if (check.frame_bytes < 0) {
-            throw std::runtime_error(
-                "Qwen3.8-Flash-Next does not fit in device memory: " + std::to_string(mib(before.device_free)) +
-                " MiB free; dense weights " + std::to_string(mib(dense)) + " MiB, KV " + std::to_string(mib(device_plan.kv)) +
-                ", workspace " + std::to_string(mib(device_plan.workspace)) + ", expert staging " +
-                std::to_string(mib(device_plan.staging)) + " (" + check.describe() +
-                "). Lower --max-context or --prefill-chunk, or free VRAM");
-        }
-        if (check.frames < kFewFrames) {
-            report("decode will be slow: only " + std::to_string(check.frames) + " expert frames fit in VRAM (" +
-                   std::to_string(kFewFrames) + " or more recommended); lower --max-context, or free VRAM");
-        }
-    }
+    if (!partial) { check_vram(); }
 
     // The dense arena must land in device memory (WDDM can place it in system memory silently).
     // Device memory is allocated before the expert banks are pinned.
@@ -499,7 +560,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         std::snprintf(line, sizeof(line),
                       "VRAM: %llu MiB in use before loading; model %.2f GiB, KV %.2f GiB (up to %.2f), workspace "
                       "%.2f GiB, expert cache %u experts (%.1f GiB); %llu MiB free after startup",
-                      mib(before.device_total - before.device_free), static_cast<double>(dense) / gib,
+                      mib(before->device_total - before->device_free), static_cast<double>(dense) / gib,
                       static_cast<double>(device_plan.kv) / gib, static_cast<double>(device_plan.kv_max) / gib,
                       static_cast<double>(device_plan.workspace) / gib, sizing.frames,
                       static_cast<double>(frames_bytes) / gib, mib(after_startup));

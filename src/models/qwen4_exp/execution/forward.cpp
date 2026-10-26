@@ -829,6 +829,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
                                 .zero_copy_misses = experts_.zero_copy_misses};
     source.precast_input   = moe_precast_input_;
     source.gate_up_variant = gate_up_variant(moe_gate_up_registers_);
+    if (!experts_.host_slots.empty()) { ops::set_host_slots(source, experts_.host_slots.at(layer)); }
     // A verification call's misses (ForwardExperts::cpu) or a prefill call's CPU share (prefill_cpu)
     // may go to the CPU miss service: the experts return before placing the CPU's outputs, and the
     // wait below places them once the shared expert is enqueued, so the host computes them beside the

@@ -7,6 +7,9 @@ WeightView bind_view(const ParameterReference& reference,
     if (reference.residency == Residency::Values) {
         throw ArtifactError(reference.name + ": owning values do not have parent backing");
     }
+    if (reference.residency == Residency::File) {
+        throw ArtifactError(reference.name + ": a parameter read from the file has no parent backing");
+    }
     WeightView out;
     out.shape             = reference.shape;
     std::uint64_t covered = 0;

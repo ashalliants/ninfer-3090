@@ -2,7 +2,7 @@
 // Modified for NInfer-3090: per-layer record strides in one frame size; no SSD tier or landing
 // frames; frame lending without the SSD tier's holds, whose give-back restores the displaced experts
 // and fills the rest by score, as does a grow; table uploads through core/pinned_upload.h; drain()
-// for the warm start and shutdown.
+// for the warm start and shutdown; partial RAM residency (RAM slots instead of banks, write-backs).
 
 #include "models/qwen4_exp/program/expert_residency.h"
 
@@ -10,6 +10,7 @@
 #include "core/pinned_upload.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <exception>
@@ -35,13 +36,23 @@ constexpr std::uint32_t kSlackFrames = 0;
 constexpr int kSpillRetries = 3;
 constexpr std::chrono::milliseconds kSpillRetryWait{100};
 
+// Partial RAM residency: records read from the artifact per batch while place_partial fills the
+// frames, through a pinned bounce of two halves.
+constexpr std::size_t kPlaceBatch = 16;
+
+std::atomic<std::uint64_t> g_process_write_backs{0};
+
 } // namespace
 
-std::uint64_t ExpertResidency::table_bytes(const TextConfig& config, std::int32_t max_columns) noexcept {
+std::uint64_t ExpertResidency::table_bytes(const TextConfig& config, std::int32_t max_columns, bool partial) noexcept {
     const std::uint64_t keys = static_cast<std::uint64_t>(config.num_hidden_layers) * config.moe.experts;
     const std::uint64_t route =
         static_cast<std::uint64_t>(config.moe.top_k) * static_cast<std::uint64_t>(max_columns) * config.num_hidden_layers;
-    return (keys + route) * sizeof(std::int32_t);
+    return (keys + route) * sizeof(std::int32_t) + (partial ? keys * sizeof(void*) : 0);
+}
+
+std::uint64_t ExpertResidency::process_write_backs() noexcept {
+    return g_process_write_backs.load(std::memory_order_relaxed);
 }
 
 std::uint32_t ExpertResidency::max_frames(const TextConfig& config) noexcept {
@@ -49,7 +60,8 @@ std::uint32_t ExpertResidency::max_frames(const TextConfig& config) noexcept {
 }
 
 ExpertResidency::ExpertResidency(const TextConfig& config, std::vector<const std::uint8_t*> banks,
-                                 std::vector<std::uint64_t> strides, std::int32_t max_columns, int device)
+                                 std::vector<std::uint64_t> strides, std::int32_t max_columns, int device,
+                                 std::optional<PartialSetup> partial)
     : c_(config), banks_(std::move(banks)), strides_(std::move(strides)) {
     experts_ = config.moe.experts;
     layers_  = config.num_hidden_layers;
@@ -83,11 +95,32 @@ ExpertResidency::ExpertResidency(const TextConfig& config, std::vector<const std
     CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
     CUDA_CHECK(cudaEventCreateWithFlags(&table_ready_, cudaEventDisableTiming));
     table_dirty_ = false;
+    if (partial) {
+        if (partial->slots.size() != layers_ || !partial->read) {
+            throw std::invalid_argument("expert residency: partial RAM residency needs one slot count per layer and a reader");
+        }
+        homes_ = std::make_unique<partial::Residency>(experts_, partial->slots, strides_);
+        read_  = std::move(partial->read);
+        ram_pool_ = PinnedHostBuffer(std::max<std::size_t>(1, homes_->pool_bytes()));
+        void* mapped = nullptr;
+        CUDA_CHECK(cudaHostGetDevicePointer(&mapped, ram_pool_.data(), 0));
+        ram_device_   = static_cast<const std::uint8_t*>(mapped);
+        slots_upload_ = PinnedHostBuffer(keys * sizeof(void*));
+        std::memset(slots_upload_.data(), 0, keys * sizeof(void*));
+        slots_device_ = DeviceBuffer(keys * sizeof(void*));
+        slots_device_.copy_from_host(slots_upload_.data(), keys * sizeof(void*));
+        slots_cpu_.assign(keys, nullptr);
+        // A victim held only in VRAM is written back before its frame is reused.
+        controller_->set_writeback([this](std::uint32_t key) {
+            return homes_->frame(key) >= 0 && !homes_->in_ram(key) && !homes_->writing_back(key);
+        });
+    }
 }
 
 ExpertResidency::~ExpertResidency() {
     if (copy_stream_ != nullptr) { (void)cudaStreamSynchronize(copy_stream_); }
     for (auto& batch : in_flight_) { (void)cudaEventDestroy(batch.done); }
+    for (auto& batch : write_backs_) { (void)cudaEventDestroy(batch.done); }
     for (auto event : spare_events_) { (void)cudaEventDestroy(event); }
     if (table_ready_ != nullptr) { (void)cudaEventDestroy(table_ready_); }
     if (copy_stream_ != nullptr) { (void)cudaStreamDestroy(copy_stream_); }
@@ -104,6 +137,10 @@ std::uint64_t ExpertResidency::pool_bytes() const noexcept {
 ExpertResidency::Resize ExpertResidency::resize(std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram) {
     Resize out;
     frames = std::min(frames, limit_);
+    if (homes_ && frames < frames_) {
+        // A shrink evicts without a round to write VRAM-only experts back in.
+        throw std::logic_error("expert residency: the partial RAM residency's frame pool does not shrink");
+    }
     CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
     publish_landed();
     commands_.clear();
@@ -213,17 +250,33 @@ void ExpertResidency::upload_table(cudaStream_t compute) {
 
 void ExpertResidency::before_round(cudaStream_t compute) {
     publish_landed();
+    if (homes_) {
+        settle_partial(compute);
+        return;
+    }
     if (table_dirty_) { upload_table(compute); }
 }
 
 void ExpertResidency::drain(cudaStream_t compute) {
     CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
     publish_landed();
+    if (homes_) {
+        // Landed write-backs free frames whose queued loads are issued now: wait for them too.
+        settle_partial(compute);
+        while (!in_flight_.empty() || !write_backs_.empty()) {
+            CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+            publish_landed();
+            settle_partial(compute);
+        }
+        return;
+    }
     if (table_dirty_) { upload_table(compute); }
 }
 
 void ExpertResidency::publish_landed() {
     auto* table = static_cast<std::int32_t*>(table_host_.data());
+    // Write-backs first: a load reading a slot being written back was issued after it on the copy stream.
+    if (homes_) { publish_write_backs(); }
     for (auto it = in_flight_.begin(); it != in_flight_.end();) {
         const cudaError_t status = cudaEventQuery(it->done);
         if (status == cudaErrorNotReady) {
@@ -237,6 +290,7 @@ void ExpertResidency::publish_landed() {
             if (controller_->complete_load(load.key, load.frame, load.serial)) {
                 table[load.key] = static_cast<std::int32_t>(load.frame);
                 table_dirty_    = true;
+                if (homes_) { homes_->publish(load.key, load.frame); }
             }
         }
         spare_events_.push_back(it->done);
@@ -273,10 +327,26 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
             ++stats_.routed;
             if (table[key] >= 0) { ++stats_.hits; }
         }
-        controller_->on_route(group_, round_, commands_, per_layer_budget);
+        if (homes_) {
+            // An expert held only in VRAM may leave only when its layer has a slot for its write-back.
+            const partial::Residency::Score score = [this](std::uint32_t key) { return controller_->policy().score(key); };
+            const expert_cache::LfruPolicy::Admissible gate = [&](std::uint32_t key) {
+                return homes_->reserve_eviction(key, &score);
+            };
+            controller_->on_route(group_, round_, commands_, per_layer_budget, nullptr, &gate);
+        } else {
+            controller_->on_route(group_, round_, commands_, per_layer_budget);
+        }
     }
+    if (homes_) { homes_->clear_reservations(); }
     if (frames_ == 0) { return; }
     controller_->on_quiescent(commands_);
+    if (homes_) {
+        apply_partial_evictions();
+        settle_partial(compute);
+        issue_loads(compute);
+        return;
+    }
 
     // Evictions take effect on the compute stream before the next round; promotions copy on the
     // copy stream once that table is in place.
@@ -332,7 +402,9 @@ std::uint32_t ExpertResidency::warm_start(const SavedState& state, std::uint32_t
 }
 
 std::uint32_t ExpertResidency::lendable() const noexcept {
-    if (!controller_) { return 0; }
+    // Partial RAM residency lends nothing: a lent run evicts without a round to write VRAM-only
+    // experts back in.
+    if (!controller_ || homes_) { return 0; }
     const std::uint32_t lent = controller_->loaned_frames(), floor = frames_ / 4;
     return frames_ > lent + floor ? frames_ - lent - floor : 0;
 }
@@ -446,9 +518,11 @@ std::uint32_t ExpertResidency::refill(cudaStream_t compute, std::span<const std:
     return loaded;
 }
 
-void ExpertResidency::issue_loads(cudaStream_t compute) {
+void ExpertResidency::issue_loads(cudaStream_t compute) { issue_loads(compute, commands_); }
+
+void ExpertResidency::issue_loads(cudaStream_t compute, const std::vector<CacheController::Command>& commands) {
     std::vector<Batch::Load> loads;
-    for (const auto& command : commands_) {
+    for (const auto& command : commands) {
         if (command.kind == CacheController::Command::Kind::kCopy) {
             loads.push_back({command.key, command.frame, command.serial});
         }
@@ -467,7 +541,11 @@ void ExpertResidency::issue_loads(cudaStream_t compute) {
         for (const auto& load : batch.loads) {
             const std::uint32_t layer  = load.key / experts_;
             const std::uint32_t expert = load.key % experts_;
-            const std::uint8_t* source = banks_[layer] + static_cast<std::size_t>(expert) * strides_[layer];
+            // Partial RAM residency: the expert's slot (a valid copy, or one a write-back issued
+            // earlier on this stream fills first).
+            const std::uint8_t* source =
+                homes_ ? static_cast<const std::uint8_t*>(ram_pool_.data()) + homes_->ram_offset(load.key)
+                       : banks_[layer] + static_cast<std::size_t>(expert) * strides_[layer];
             copies.add(base + static_cast<std::size_t>(load.frame) * stride_, source, strides_[layer]);
         }
         copies.flush();
@@ -482,6 +560,221 @@ void ExpertResidency::issue_loads(cudaStream_t compute) {
         CUDA_CHECK(cudaEventRecord(batch.done, copy_stream_));
         in_flight_.push_back(std::move(batch));
     }
+}
+
+// ---------------------------------------------------------------- partial RAM residency
+
+const std::uint8_t* const* ExpertResidency::host_slot_table(std::uint32_t layer) const noexcept {
+    if (!homes_) { return nullptr; }
+    return static_cast<const std::uint8_t* const*>(slots_device_.p) + static_cast<std::size_t>(layer) * experts_;
+}
+
+const std::uint8_t* const* ExpertResidency::cpu_slot_table(std::uint32_t layer) const noexcept {
+    if (!homes_) { return nullptr; }
+    return slots_cpu_.data() + static_cast<std::size_t>(layer) * experts_;
+}
+
+const std::uint8_t* ExpertResidency::ram_pool() const noexcept {
+    return homes_ ? static_cast<const std::uint8_t*>(ram_pool_.data()) : nullptr;
+}
+
+std::uint64_t ExpertResidency::ram_pool_bytes() const noexcept { return homes_ ? homes_->pool_bytes() : 0; }
+
+void ExpertResidency::refresh_slot_tables() {
+    auto* device = static_cast<const std::uint8_t**>(slots_upload_.data());
+    for (const std::uint32_t key : homes_->take_changed()) {
+        // Only a valid copy: a slot being written back or reclaimed is never read (its expert reads
+        // from its frame).
+        const bool valid = homes_->in_ram(key);
+        const std::uint64_t at = valid ? homes_->ram_offset(key) : 0;
+        slots_cpu_[key] = valid ? static_cast<const std::uint8_t*>(ram_pool_.data()) + at : nullptr;
+        device[key]     = valid ? ram_device_ + at : nullptr;
+        slots_dirty_    = true;
+    }
+}
+
+void ExpertResidency::upload_slot_table(cudaStream_t compute) {
+    upload_pinned(slots_device_.p, slots_upload_.data(), slots_device_.bytes, compute);
+    slots_dirty_ = false;
+}
+
+void ExpertResidency::apply_partial_evictions() {
+    auto* table = static_cast<std::int32_t*>(table_host_.data());
+    auto* base  = frame_base();
+    WriteBack batch;
+    for (const auto& command : commands_) {
+        if (command.kind != CacheController::Command::Kind::kWriteEntry ||
+            ResidencyEntry::decode(command.word).state != ResidencyState::kAbsent) {
+            continue;
+        }
+        const std::uint32_t key = command.key;
+        if (homes_->frame(key) < 0 || homes_->writing_back(key)) { continue; } // never published, or leaving
+        const auto offset = homes_->evict(key);
+        if (!offset) {
+            // A RAM copy exists: the expert reads from it from the next round on.
+            if (table[key] >= 0) {
+                table[key]   = -1;
+                table_dirty_ = true;
+            }
+            continue;
+        }
+        // Held only in VRAM: copy its frame to its slot. The table keeps the frame until the copy
+        // lands, and the controller holds the frame until complete_writeback.
+        if (!controller_->writing_back(command.frame)) {
+            throw std::logic_error("expert residency: a write-back's frame is not held");
+        }
+        const std::uint32_t layer = key / experts_;
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(ram_pool_.data()) + *offset,
+                                   base + static_cast<std::size_t>(command.frame) * stride_, strides_[layer],
+                                   cudaMemcpyDeviceToHost, copy_stream_));
+        batch.moves.emplace_back(key, command.frame);
+    }
+    refresh_slot_tables();
+    if (batch.moves.empty()) { return; }
+    if (spare_events_.empty()) {
+        cudaEvent_t event = nullptr;
+        CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+        spare_events_.push_back(event);
+    }
+    batch.done = spare_events_.back();
+    spare_events_.pop_back();
+    CUDA_CHECK(cudaEventRecord(batch.done, copy_stream_));
+    stats_.write_backs += batch.moves.size();
+    g_process_write_backs.fetch_add(batch.moves.size(), std::memory_order_relaxed);
+    write_backs_.push_back(std::move(batch));
+}
+
+void ExpertResidency::publish_write_backs() {
+    auto* table = static_cast<std::int32_t*>(table_host_.data());
+    for (auto it = write_backs_.begin(); it != write_backs_.end();) {
+        const cudaError_t status = cudaEventQuery(it->done);
+        if (status == cudaErrorNotReady) {
+            ++it;
+            continue;
+        }
+        CUDA_CHECK(status);
+        for (const auto& [key, frame] : it->moves) {
+            homes_->complete_writeback(key);
+            // The expert reads its RAM copy from the next round on (unless it was promoted again).
+            if (table[key] == static_cast<std::int32_t>(frame)) {
+                table[key]   = -1;
+                table_dirty_ = true;
+            }
+            controller_->complete_writeback(frame, landed_commands_);
+        }
+        spare_events_.push_back(it->done);
+        it = write_backs_.erase(it);
+    }
+    refresh_slot_tables();
+}
+
+void ExpertResidency::settle_partial(cudaStream_t compute) {
+    // The slot table first: an expert whose frame entry turns -1 reads the slot it names.
+    if (slots_dirty_) { upload_slot_table(compute); }
+    if (table_dirty_) { upload_table(compute); }
+    if (!landed_commands_.empty()) {
+        issue_loads(compute, landed_commands_);
+        landed_commands_.clear();
+    }
+}
+
+std::uint32_t ExpertResidency::place_partial(std::span<const std::uint32_t> vram_keys, const SavedState* state,
+                                             std::uint32_t count_cap, cudaStream_t compute) {
+    if (!homes_) { throw std::logic_error("expert residency: not in partial RAM residency"); }
+    std::vector<std::uint32_t> counts;
+    if (state != nullptr && !state->counts.empty()) {
+        if (state->counts.size() != static_cast<std::size_t>(layers_) * experts_) {
+            throw std::invalid_argument("expert residency: the saved state has another key count");
+        }
+        counts = state->counts;
+        for (auto& count : counts) { count = std::min(count, count_cap); }
+    }
+    commands_.clear();
+    const std::uint32_t loaded = controller_->seed(vram_keys, counts, commands_);
+    if (loaded != vram_keys.size()) {
+        throw std::runtime_error("Qwen3.8-Flash-Next: --partial-ram-residency planned " + std::to_string(vram_keys.size()) +
+                                 " experts in VRAM but the expert cache holds " + std::to_string(loaded) +
+                                 "; free VRAM or lower --vram-headroom-mib");
+    }
+    // The VRAM keys: read into a pinned bounce, copied into their frames.
+    auto* table = static_cast<std::int32_t*>(table_host_.data());
+    std::vector<CacheController::Command> copies;
+    for (const auto& command : commands_) {
+        if (command.kind == CacheController::Command::Kind::kCopy) { copies.push_back(command); }
+    }
+    {
+        PinnedHostBuffer bounce(2 * kPlaceBatch * stride_);
+        cudaEvent_t half_done[2] = {nullptr, nullptr};
+        CUDA_CHECK(cudaEventCreateWithFlags(&half_done[0], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&half_done[1], cudaEventDisableTiming));
+        std::exception_ptr failure;
+        try {
+            auto* base = const_cast<std::uint8_t*>(frame_base());
+            for (std::size_t first = 0, batch = 0; first < copies.size(); first += kPlaceBatch, ++batch) {
+                const std::size_t half = batch % 2;
+                if (batch >= 2) { CUDA_CHECK(cudaEventSynchronize(half_done[half])); }
+                auto* slots = static_cast<std::byte*>(bounce.data()) + half * kPlaceBatch * stride_;
+                for (std::size_t i = first; i < std::min(copies.size(), first + kPlaceBatch); ++i) {
+                    const std::uint32_t layer = copies[i].key / experts_, expert = copies[i].key % experts_;
+                    std::byte* slot = slots + (i - first) * stride_;
+                    read_(layer, expert, 1, std::span<std::byte>(slot, strides_[layer]));
+                    CUDA_CHECK(cudaMemcpyAsync(base + static_cast<std::size_t>(copies[i].frame) * stride_, slot,
+                                               strides_[layer], cudaMemcpyHostToDevice, copy_stream_));
+                }
+                CUDA_CHECK(cudaEventRecord(half_done[half], copy_stream_));
+            }
+            CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+        } catch (...) {
+            failure = std::current_exception();
+            (void)cudaStreamSynchronize(copy_stream_);
+        }
+        (void)cudaEventDestroy(half_done[0]);
+        (void)cudaEventDestroy(half_done[1]);
+        if (failure) { std::rethrow_exception(failure); }
+    }
+    for (const auto& command : copies) {
+        if (!controller_->complete_load(command.key, command.frame, command.serial)) {
+            throw std::logic_error("expert residency: a placed expert's load is not current");
+        }
+        table[command.key] = static_cast<std::int32_t>(command.frame);
+        homes_->place_vram(command.key, command.frame);
+    }
+    table_dirty_ = true;
+    // Every other expert into its layer's RAM slots, runs of consecutive experts in one read (slots
+    // are handed out lowest first, so they are adjacent in the pool).
+    auto* pool = static_cast<std::byte*>(ram_pool_.data());
+    for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+        std::uint32_t run_first = 0, run_count = 0;
+        std::uint64_t run_at = 0;
+        const auto flush = [&] {
+            if (run_count != 0) {
+                read_(layer, run_first, run_count,
+                      std::span<std::byte>(pool + run_at, static_cast<std::size_t>(run_count) * strides_[layer]));
+            }
+            run_count = 0;
+        };
+        for (std::uint32_t expert = 0; expert < experts_; ++expert) {
+            const std::uint32_t key = layer * experts_ + expert;
+            if (homes_->frame(key) >= 0) {
+                flush();
+                continue;
+            }
+            const std::uint64_t at = homes_->place_ram(key);
+            if (run_count != 0 && at != run_at + static_cast<std::uint64_t>(run_count) * strides_[layer]) { flush(); }
+            if (run_count == 0) {
+                run_first = expert;
+                run_at    = at;
+            }
+            ++run_count;
+        }
+        flush();
+    }
+    homes_->check();
+    refresh_slot_tables();
+    settle_partial(compute);
+    CUDA_CHECK(cudaStreamSynchronize(compute));
+    stats_.seeded += loaded;
+    return loaded;
 }
 
 } // namespace ninfer::models::qwen4_exp

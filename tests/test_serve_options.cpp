@@ -523,6 +523,12 @@ int main() {
                       "--ngram-flag-wait with MTP and two lanes does not reach the Engine");
     failures += check(serve_usage_text("ninfer-serve").find("--ngram-flag-wait") != std::string::npos,
                       "the usage text does not name --ngram-flag-wait");
+    failures += check(!defaults.flash_next.partial_ram_residency, "partial RAM residency is on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--partial-ram-residency"}))
+                          .flash_next.partial_ram_residency,
+                      "--partial-ram-residency does not reach the Engine");
+    failures += check(serve_usage_text("ninfer-serve").find("--partial-ram-residency") != std::string::npos,
+                      "the usage text does not name --partial-ram-residency");
     failures += check(!defaults.flash_next.gdn_async_commit, "the GDN commit on a side stream is on by default");
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
                                                  "--gdn-async-commit"}))

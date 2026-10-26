@@ -500,6 +500,18 @@ struct ProgramOptions {
     // the round: its request ends with an error and nothing of it is committed. Memory:
     // plan_ngram_flag_wait.
     bool ngram_flag_wait = false;
+    // FlashNextOptions::partial_ram_residency: the model's text banks were left in the artifact
+    // (plan_load with partial). The Program reads `partial_vram_keys` (hottest first) into frames,
+    // where they live only in VRAM, and every other expert into `partial_slots[l]` pinned RAM slots of
+    // layer l (plan_partial_ram), from `artifact_path`. Promotions keep their RAM copy; evicting an
+    // expert held only in VRAM writes it back first (ExpertResidency::PartialSetup). The frame pool
+    // keeps its startup size (no VRAM monitor), the whole KV is mapped at startup (no frames taken
+    // for it) and no frames are lent (prefill runs static calls, no expert stream). The same outputs,
+    // bit for bit. Refused when the frames cannot hold every VRAM key.
+    bool partial_ram_residency = false;
+    std::vector<std::uint32_t> partial_slots;
+    std::vector<std::uint32_t> partial_vram_keys;
+    std::filesystem::path artifact_path;
 };
 
 // --ngram-flag-wait: whether a round runs as one graph that waits for its n-gram rows (true) or in
