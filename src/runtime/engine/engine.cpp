@@ -318,6 +318,10 @@ public:
         out.context_store_bytes_reused    = s.bytes_reused;
         out.context_store_evicted         = s.evicted_for_space + s.expired + s.superseded;
         out.context_store_corrupt         = s.corrupt_removed;
+        out.context_store_corrupt_startup  = s.corrupt_startup;
+        out.context_store_corrupt_manifest = s.corrupt_manifest;
+        out.context_store_corrupt_chunk    = s.corrupt_chunk;
+        out.context_store_corrupt_remote   = s.corrupt_remote;
         out.context_store_restored        = restored_sessions;
         out.context_store_restored_bytes  = restored_bytes;
         out.context_store_foreign         = foreign_images;
@@ -329,6 +333,11 @@ public:
         out.context_store_remote_downloads         = s.remote_downloads;
         out.context_store_remote_download_bytes    = s.remote_download_bytes;
         out.context_store_remote_download_failures = s.remote_download_failures;
+        out.context_store_remote_download_failures_transfer = s.remote_download_failures_transfer;
+        out.context_store_remote_download_failures_missing  = s.remote_download_failures_missing;
+        out.context_store_remote_download_failures_damaged  = s.remote_download_failures_damaged;
+        out.context_store_remote_download_failures_install  = s.remote_download_failures_install;
+        out.context_store_remote_download_failures_listing  = s.remote_download_failures_listing;
         out.context_store_remote_manifest_downloads      = s.remote_manifest_downloads;
         out.context_store_remote_manifest_download_bytes = s.remote_manifest_download_bytes;
         out.context_store_remote_retired                 = s.remote_retired;
@@ -519,6 +528,7 @@ private:
             .hydration_budget =
                 std::chrono::duration_cast<std::chrono::milliseconds>(options.context_store.restore_budget),
             .remote = options.context_store.remote != nullptr,
+            .hydration_listener = options.context_store.hydration_listener,
         });
     }
 
@@ -579,10 +589,10 @@ private:
         return text;
     }
 
-    // The image's endpoint key (ContextStore::image_id): an image of the same endpoint replaces it.
+    // The image's endpoint key (runtime/engine/context_store/image_id.h).
     static std::string image_id(const CheckpointImage& image, bool shared) {
         const auto& key = image.keys.front();
-        return runtime::ContextStore::image_id(key.digests, key.frontier, shared);
+        return runtime::context_store_image_id(key.digests, key.frontier, shared);
     }
 
     // Writes one image to the store. On the writer thread, or at shutdown.

@@ -14,6 +14,7 @@
 #include "runtime/engine/request_record.h"
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/context_store/context_store.h"
+#include "runtime/engine/context_store/image_id.h"
 #include "runtime/engine/pause_policy.h"
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/effective_thinking_budget.h"
@@ -552,6 +553,8 @@ public:
         // refreshed once before it prefills, and a session only the bucket holds is downloaded
         // when the download fits in the request's wait.
         bool remote = false;
+        // Told about each failed hydration, on the worker; must return promptly.
+        std::function<void(const ContextStoreHydrationEvent&)> hydration_listener;
     };
 
     void set_context_store(ContextStoreHooks hooks) {
@@ -3989,21 +3992,21 @@ private:
         return shared;
     }
 
-    // The size of a shared image in the store with this prefix's exact key, if there is one.
+    // The size of a shared image in the store with this prefix's exact key, if there is one. Such
+    // an image is stored under the id of that key, so one lookup finds it.
     template <class Program>
     [[nodiscard]] std::optional<std::uint64_t> stored_shared_image(Program& program,
                                                                    Checkpoint handle) const {
         const auto frontier = program.checkpoint_metadata(handle).frontier;
         const auto key      = program.checkpoint_key(handle, frontier);
-        for (const ContextStore::Info& info : store_.store->list()) {
-            if (!info.shared || info.binding != store_.binding || info.checkpoints.empty()) {
-                continue;
-            }
-            const auto& stored = info.checkpoints.front();
-            if (stored.frontier == frontier && stored.digests == key.digests &&
-                stored.identity_tag == key.identity_tag) {
-                return info.image_bytes;
-            }
+        const auto info = store_.store->find(context_store_image_id(key.digests, frontier, true));
+        if (!info || !info->shared || info->binding != store_.binding || info->checkpoints.empty()) {
+            return std::nullopt;
+        }
+        const auto& stored = info->checkpoints.front();
+        if (stored.frontier == frontier && stored.digests == key.digests &&
+            stored.identity_tag == key.identity_tag) {
+            return info->image_bytes;
         }
         return std::nullopt;
     }
@@ -4097,8 +4100,20 @@ private:
         std::uint64_t read_ns = 0;
         // What the read downloaded from the bucket first, and how long the download alone took.
         ContextStore::LoadReport fetch;
-        // Not a read: refresh the store's listing of the bucket, then consult the store again.
+        // The request's wait ends here: the read (or lookup) gives up at it.
+        Clock::time_point deadline{};
+        // Not run: it was still queued at its deadline.
+        bool expired = false;
+        // Not a read: look the bucket up for images ending on the request's prompt, then consult
+        // the store again. Copied from the plan on the worker, which owns it: the prompt's prefix
+        // digest at each frontier from lookup_from + 1 on (nullopt where it has none), and when the
+        // request asked.
         bool lookup = false;
+        std::uint32_t lookup_from = 0;
+        std::vector<std::optional<std::array<std::uint64_t, 2>>> lookup_digests;
+        Clock::time_point lookup_asked{};
+        // Wanted images the index held after the lookup.
+        std::size_t lookup_found = 0;
     };
 
     // A request that would prefill for less than this does not wait for a bucket listing.
@@ -4150,7 +4165,9 @@ private:
         const auto wait_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(wait).count());
         std::string best_id;
-        std::uint32_t best_frontier = resident;
+        std::uint32_t best_frontier   = resident;
+        std::uint64_t best_bytes      = 0;
+        std::uint64_t best_fetch      = 0;
         try {
             // The binding does not include the context length: an image deeper than this Engine's
             // context could never be restored, and reading it would only cost time
@@ -4166,6 +4183,8 @@ private:
                 if (cost >= best_cost) { return; }
                 best_id       = info.id;
                 best_frontier = key.frontier;
+                best_bytes    = info.image_bytes;
+                best_fetch    = info.fetch_bytes;
                 best_cost     = cost;
             });
         } catch (...) { return false; }
@@ -4178,16 +4197,27 @@ private:
                                    std::chrono::nanoseconds(kStoreLookupMinimumPrefill).count())) {
                 return false;
             }
+            HydrationTask task;
+            task.request      = request;
+            task.lookup       = true;
+            task.lookup_asked = now;
+            task.deadline     = std::min(request->deadline, now + kStoreLookupBudget);
+            // What would be worth reading: an image ending past what is resident, on this prompt.
+            task.lookup_from  = resident;
+            try {
+                task.lookup_digests.reserve(prompt_tokens > resident ? prompt_tokens - resident : 0);
+                for (std::uint32_t frontier = resident + 1; frontier <= prompt_tokens; ++frontier) {
+                    const auto key = base.prefix_shortlist_key(frontier);
+                    task.lookup_digests.push_back(key ? std::optional(key->digests) : std::nullopt);
+                }
+            } catch (...) { return false; }
             request->store_looked_up    = true;
             request->store_lookup       = true;
             request->hydrating          = true;
             request->hydration_started  = now;
-            request->hydration_deadline = std::min(request->deadline, now + kStoreLookupBudget);
+            request->hydration_deadline = task.deadline;
             {
                 std::lock_guard lock(hydration_mutex_);
-                HydrationTask task;
-                task.request = request;
-                task.lookup  = true;
                 lookup_queue_.push_back(std::move(task));
             }
             // Two threads wait on this condition variable, each for its own queue.
@@ -4199,11 +4229,15 @@ private:
         request->hydration_reuse_before  = resident;
         request->hydration_started       = now;
         request->hydration_deadline      = std::min(request->deadline, now + store_.hydration_budget);
+        request->hydration_id            = best_id;
+        request->hydration_bytes         = best_bytes;
+        request->hydration_fetch_bytes   = best_fetch;
         {
             std::lock_guard lock(hydration_mutex_);
             HydrationTask task;
-            task.request = request;
-            task.id      = std::move(best_id);
+            task.request  = request;
+            task.id       = std::move(best_id);
+            task.deadline = request->hydration_deadline;
             hydration_queue_.push_back(std::move(task));
         }
         hydration_cv_.notify_all();
@@ -4211,14 +4245,16 @@ private:
     }
 
     // A bucket lookup settled (or ran out of time): the request consults the store again, now
-    // with whatever the listing found, and is offered for admission as usual.
-    void finish_store_lookup(const std::shared_ptr<Request>& request) {
+    // with whatever the listing found, and is offered for admission as usual. `found`: the store
+    // now holds an image ending on the request's prompt.
+    void finish_store_lookup(const std::shared_ptr<Request>& request, bool found) {
         request->store_lookup = false;
         request->hydrating    = false;
         request->store_probed = false;
         cumulative_stats_.context_store_lookup_seconds +=
             std::chrono::duration<double>(Clock::now() - request->hydration_started).count();
         ++cumulative_stats_.context_store_lookups;
+        if (found) { ++cumulative_stats_.context_store_lookup_hits; }
         request->admission_generation = 0;
         request_admission_check();
     }
@@ -4236,21 +4272,35 @@ private:
                 task = std::move(queue.front());
                 queue.pop_front();
             }
-            if (const auto started = Clock::now(); started < task.request->hydration_deadline) {
+            if (const auto started = Clock::now(); started < task.deadline) {
                 try {
                     if (task.lookup) {
                         // The bucket as of when the request looked: a listing taken since (for
-                        // another request) serves it too.
-                        (void)store_.store->refresh_remote_since(task.request->hydration_started,
-                                                                 task.request->hydration_deadline);
+                        // another request, or the background refresh) serves it too. Only the
+                        // manifests of images ending on this prompt are read.
+                        const auto wanted = [&task](const std::string& id) {
+                            const auto parsed = parse_context_store_image_id(id);
+                            if (!parsed || parsed->frontier <= task.lookup_from ||
+                                parsed->frontier - task.lookup_from > task.lookup_digests.size()) {
+                                return false;
+                            }
+                            const auto& mine =
+                                task.lookup_digests[parsed->frontier - task.lookup_from - 1];
+                            return mine && *mine == parsed->digests;
+                        };
+                        task.lookup_found =
+                            store_.store->lookup_remote(task.lookup_asked, task.deadline, wanted).held;
                     } else {
-                        task.bytes = store_.store->load(task.id, false, &task.fetch);
+                        task.bytes = store_.store->load(task.id, false, &task.fetch, task.deadline);
                     }
                 } catch (...) { task.bytes.reset(); }
                 task.read_ns = static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started)
                         .count());
+            } else {
+                task.expired = true;
             }
+            task.lookup_digests = {}; // not needed past the lookup
             {
                 std::lock_guard lock(hydration_mutex_);
                 hydration_done_.push_back(std::move(task));
@@ -4288,24 +4338,48 @@ private:
             cumulative_stats_.context_store_read_bytes_per_second;
     }
 
-    void finish_hydration(const std::shared_ptr<Request>& request, bool failed) {
+    // `failure`: why the request will not resume from the image (nullopt: it was imported, or the
+    // cache already covers it).
+    void finish_hydration(const std::shared_ptr<Request>& request,
+                          std::optional<ContextStoreHydrationFailure> failure) {
         request->hydrating = false;
-        cumulative_stats_.context_store_hydration_seconds +=
+        request->hydration_wait_seconds =
             std::chrono::duration<double>(Clock::now() - request->hydration_started).count();
-        if (failed) { ++cumulative_stats_.context_store_hydration_failures; }
+        cumulative_stats_.context_store_hydration_seconds += request->hydration_wait_seconds;
+        if (failure) { count_hydration_failure(*request, *failure); }
         request->admission_generation = 0;
         request_admission_check();
     }
 
+    // Counts a failed hydration under its reason and reports it (the serve layer logs it).
+    void count_hydration_failure(const Request& request, ContextStoreHydrationFailure reason) noexcept {
+        ++cumulative_stats_.context_store_hydration_failures;
+        ++cumulative_stats_.context_store_hydration_failures_by_reason[static_cast<std::size_t>(reason)];
+        if (!store_.hydration_listener) { return; }
+        try {
+            ContextStoreHydrationEvent event;
+            event.id           = request.hydration_id;
+            event.reason       = reason;
+            event.bytes        = request.hydration_bytes;
+            event.fetch_bytes  = request.hydration_fetch_bytes;
+            event.frontier     = request.hydration_frontier;
+            event.wait_seconds = request.hydration_wait_seconds;
+            store_.hydration_listener(event);
+        } catch (...) {}
+    }
+
     // Imports a read-back image for a waiting request as Host-resident checkpoints, making room in
     // the Host tier under optional-write rights (never revoking another request's waiting source),
-    // and protects the restored source for the request until it is admitted.
-    bool import_for_request(const std::shared_ptr<Request>& request,
-                            std::span<const std::uint8_t> image, const std::string& id) {
+    // and protects the restored source for the request until it is admitted. Nullopt on success,
+    // otherwise why it did not.
+    std::optional<ContextStoreHydrationFailure>
+    import_for_request(const std::shared_ptr<Request>& request,
+                       std::span<const std::uint8_t> image, const std::string& id) {
+        using Failure     = ContextStoreHydrationFailure;
         auto& program     = *instance_.program;
         const auto needed = program.checkpoint_image_host_bytes(image, store_.binding);
         auto usage        = program.physical_usage();
-        if (needed > usage.capacity.host_bytes) { return false; }
+        if (needed > usage.capacity.host_bytes) { return Failure::HostCapacity; }
         if (needed > usage.capacity.host_bytes - usage.occupied.host_bytes) {
             (void)program.release_redundant_host({});
             usage = program.physical_usage();
@@ -4315,7 +4389,7 @@ private:
         if (needed > usage.capacity.host_bytes - usage.occupied.host_bytes) {
             const auto victims = resources_.host_victims(program, needed, std::nullopt, {}, {},
                                                          std::nullopt, &cursor);
-            if (!victims) { return false; }
+            if (!victims) { return Failure::HostCapacity; }
             resources_.commit_host_victims(program, *victims, cursor);
             if (!victims->empty()) { scheduler_.capacity_released(); }
         }
@@ -4332,7 +4406,8 @@ private:
             scheduler_.capacity_released();
             imported = program.import_checkpoints(image, store_.binding);
         }
-        if (!imported || !adopt_imported(*imported, image.size())) { return false; }
+        if (!imported) { return Failure::HostGeometry; }
+        if (!adopt_imported(*imported, image.size())) { return Failure::Adopt; }
         auto sources = resources_.candidates(program, *request->base_plan, UINT32_MAX, std::nullopt,
                                              request->id, request->publication_order);
         const auto restored = std::find_if(sources.begin(), sources.end(), [&](const auto& choice) {
@@ -4340,13 +4415,13 @@ private:
                    std::find(imported->points.begin(), imported->points.end(),
                              *choice.source.checkpoint) != imported->points.end();
         });
-        if (restored == sources.end()) { return false; }
+        if (restored == sources.end()) { return Failure::NotCandidate; }
         retain_admission_source(request, *restored, false);
         request->hydrated = true;
         try {
             store_.store->touch(id);
         } catch (...) {}
-        return true;
+        return std::nullopt;
     }
 
     // True when the cache now offers this request a source at least as deep as the stored image it
@@ -4401,22 +4476,36 @@ private:
                 continue;
             }
             if (task.lookup) {
-                finish_store_lookup(request);
+                finish_store_lookup(request, task.lookup_found > 0);
+                continue;
+            }
+            // A read that finished after the request's wait ended (the worker was busy when the
+            // deadline passed, so the expiry scan below has not run yet) is not imported: the
+            // import would spend worker time past the budget the request was given.
+            if (Clock::now() >= request->hydration_deadline) {
+                finish_hydration(request, ContextStoreHydrationFailure::Deadline);
                 continue;
             }
             if (task.bytes && cache_covers_hydration(request)) {
                 // Another waiter's read-back of the same image (or anything else) has already
                 // brought this prefix in: importing it again would catalogue a second copy.
-                finish_hydration(request, false);
+                finish_hydration(request, std::nullopt);
                 continue;
             }
-            bool imported = false;
+            using Failure = ContextStoreHydrationFailure;
+            // A read that ran out of time (queued past the deadline, or the download stopped at
+            // it) is not the image's fault: the same image may be read in time later.
+            std::optional<Failure> failure =
+                task.expired || task.fetch.expired ? Failure::Deadline : Failure::LoadMiss;
             if (task.bytes) {
                 const auto started = Clock::now();
+                // An import that throws gives up only this hydration: the request prefills.
                 try {
-                    imported = import_for_request(request, *task.bytes, task.id);
-                } catch (const std::invalid_argument&) { imported = false; }
-                if (imported) {
+                    failure = import_for_request(request, *task.bytes, task.id);
+                } catch (const std::invalid_argument&) {
+                    failure = Failure::InvalidImage;
+                } catch (...) { failure = Failure::Exception; }
+                if (!failure) {
                     // The fetch taught the fetch rate above; the rest of the read (the local
                     // files read, verified and reassembled) and the import teach the disk's.
                     observe_store_read(task.bytes->size(),
@@ -4427,7 +4516,7 @@ private:
                                                    .count()));
                 }
             }
-            finish_hydration(request, !imported);
+            finish_hydration(request, failure);
         }
         const auto now = Clock::now();
         std::vector<std::shared_ptr<Request>> expired;
@@ -4441,9 +4530,9 @@ private:
         }
         for (const auto& request : expired) {
             if (request->store_lookup) {
-                finish_store_lookup(request);
+                finish_store_lookup(request, false);
             } else {
-                finish_hydration(request, true);
+                finish_hydration(request, ContextStoreHydrationFailure::Deadline);
             }
         }
     }
@@ -4467,7 +4556,7 @@ private:
             cumulative_stats_.context_store_hydrated_tokens +=
                 reused - request->hydration_reuse_before;
         } else {
-            ++cumulative_stats_.context_store_hydration_failures;
+            count_hydration_failure(*request, ContextStoreHydrationFailure::UnusedAtAdmission);
         }
     }
 
@@ -4576,19 +4665,21 @@ private:
     // restore (at most max_context) and whose prefix the plan's prompt starts with, as admission's
     // hydration compares them (prefix shortlist key and identity tag). Images only the bucket holds
     // are included once a listing has registered them.
+    // Runs per request on the worker against an index of thousands of images, so the store visits
+    // its entries in place; `visit` runs under the store's lock and must not call it.
     template <class Visit>
     void for_each_stored_match(const BasePlan& base, Visit&& visit) {
         const auto prompt_tokens = base.summary().prompt_tokens;
-        for (const ContextStore::Info& info : store_.store->list()) {
-            if (info.binding != store_.binding || info.tokens > max_context_) { continue; }
-            for (const ContextStore::CheckpointKey& key : info.checkpoints) {
-                if (key.frontier > prompt_tokens) { continue; }
+        store_.store->for_each_checkpoint(
+            [&](const ContextStore::Info& info, const ContextStore::CheckpointKey& key) {
+                if (key.frontier > prompt_tokens || info.tokens > max_context_) { return false; }
                 const auto mine = base.prefix_shortlist_key(key.frontier);
-                if (mine && mine->digests == key.digests && mine->identity_tag == key.identity_tag) {
-                    visit(info, key);
-                }
-            }
-        }
+                return mine && mine->digests == key.digests &&
+                       mine->identity_tag == key.identity_tag && info.binding == store_.binding;
+            },
+            [&](const ContextStore::Info& info, const ContextStore::CheckpointKey& key) {
+                visit(info, key);
+            });
     }
 
     // On the worker, under the execution lock: the probe's answer (true: warm).

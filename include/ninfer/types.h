@@ -171,6 +171,56 @@ struct ContextStoreWriteEvent {
     std::string error;
 };
 
+// Why a request that waited for a stored session did not resume from it.
+enum class ContextStoreHydrationFailure : std::uint8_t {
+    LoadMiss,          // the store could not read it back: gone, damaged, or the bucket failed
+    Deadline,          // the read (or the download before it) did not finish within the wait
+    HostCapacity,      // the Host tier could not make room for the image
+    HostGeometry,      // room was made, but the image's states found no contiguous Host extents
+    Adopt,             // imported, but the cache could not take ownership of the checkpoints
+    NotCandidate,      // imported, but the cache did not offer it to the request as a source
+    UnusedAtAdmission, // offered, but the request was admitted from something shallower
+    InvalidImage,      // the image does not belong to this model or configuration
+    Exception,         // anything else that failed while importing it
+};
+inline constexpr std::size_t kContextStoreHydrationFailureReasons = 9;
+
+[[nodiscard]] inline constexpr const char*
+context_store_hydration_failure_name(ContextStoreHydrationFailure reason) noexcept {
+    switch (reason) {
+    case ContextStoreHydrationFailure::LoadMiss:
+        return "load_miss";
+    case ContextStoreHydrationFailure::Deadline:
+        return "deadline";
+    case ContextStoreHydrationFailure::HostCapacity:
+        return "host_capacity";
+    case ContextStoreHydrationFailure::HostGeometry:
+        return "host_geometry";
+    case ContextStoreHydrationFailure::Adopt:
+        return "adopt";
+    case ContextStoreHydrationFailure::NotCandidate:
+        return "not_candidate";
+    case ContextStoreHydrationFailure::UnusedAtAdmission:
+        return "unused_at_admission";
+    case ContextStoreHydrationFailure::InvalidImage:
+        return "invalid_image";
+    case ContextStoreHydrationFailure::Exception:
+        return "exception";
+    }
+    return "unknown";
+}
+
+// One failed hydration (a stored session a request waited for and did not resume from), reported
+// from the Engine worker.
+struct ContextStoreHydrationEvent {
+    std::string id;
+    ContextStoreHydrationFailure reason = ContextStoreHydrationFailure::LoadMiss;
+    std::uint64_t bytes                 = 0; // the image's size
+    std::uint64_t fetch_bytes           = 0; // what had to come from the bucket first
+    std::uint32_t frontier              = 0; // the prompt position it would have resumed from
+    double wait_seconds                 = 0.0;
+};
+
 // A durable store for retained sessions, so the context cache survives a restart or a crash.
 // Disabled unless a directory is given; requires the context cache and a nonzero Host context
 // budget. A retained session is written there when it has been idle for `idle_persist` and (all of
@@ -215,6 +265,9 @@ struct ContextStoreOptions {
     std::chrono::milliseconds peer_poll{250};
     // Called on the writer thread after each session is written. Exceptions are ignored.
     std::function<void(const ContextStoreWriteEvent& event)> listener;
+    // Called on the Engine worker for each failed hydration; must return promptly. Exceptions are
+    // ignored.
+    std::function<void(const ContextStoreHydrationEvent& event)> hydration_listener;
 
     [[nodiscard]] bool enabled() const noexcept { return !directory.empty(); }
 };
@@ -1702,6 +1755,13 @@ struct RuntimeStats {
     std::uint64_t context_store_bytes_reused   = 0; // chunk bytes already held, not rewritten
     std::uint64_t context_store_evicted        = 0; // removed for space, age or supersession
     std::uint64_t context_store_corrupt        = 0; // removed because they could not be read
+    // context_store_corrupt by what was found: a chunk missing at start-up, a manifest that does
+    // not parse or describe its image, a chunk whose bytes do not match (no bucket to repair it),
+    // or the bucket's copy missing or damaged too.
+    std::uint64_t context_store_corrupt_startup  = 0;
+    std::uint64_t context_store_corrupt_manifest = 0;
+    std::uint64_t context_store_corrupt_chunk    = 0;
+    std::uint64_t context_store_corrupt_remote   = 0;
     std::uint64_t context_store_restored       = 0; // sessions restored into the cache at start-up
     std::uint64_t context_store_restored_bytes = 0;
     // Sessions found at start-up that were written under another model, configuration (KV,
@@ -1714,11 +1774,16 @@ struct RuntimeStats {
     std::uint64_t context_store_hydrations         = 0;
     std::uint64_t context_store_hydrated_tokens    = 0;
     std::uint64_t context_store_hydration_failures = 0;
+    // context_store_hydration_failures by reason, indexed by ContextStoreHydrationFailure.
+    std::array<std::uint64_t, kContextStoreHydrationFailureReasons>
+        context_store_hydration_failures_by_reason{};
     double context_store_hydration_seconds         = 0.0;
-    // With a bucket: listings refreshed for a request that found nothing stored (and the time
-    // requests spent waiting for them), and the rate the store assumes for fetching missing
-    // chunks (downloaded, verified and installed: the wait a fetch adds to a request).
+    // With a bucket: lookups of the bucket for a request that found nothing stored (and the time
+    // requests spent waiting for them), those after which the store held a session ending on the
+    // request's prompt, and the rate the store assumes for fetching missing chunks (downloaded,
+    // verified and installed: the wait a fetch adds to a request).
     std::uint64_t context_store_lookups                = 0;
+    std::uint64_t context_store_lookup_hits            = 0;
     double context_store_lookup_seconds                = 0.0;
     double context_store_remote_fetch_bytes_per_second = 0.0;
     // The rate the cost model currently assumes for reading a stored image back into the Host tier
@@ -1744,6 +1809,14 @@ struct RuntimeStats {
     std::uint64_t context_store_remote_downloads         = 0;
     std::uint64_t context_store_remote_download_bytes    = 0;
     std::uint64_t context_store_remote_download_failures = 0;
+    // context_store_remote_download_failures by cause: a transfer that failed, an object the
+    // bucket did not have, one whose bytes did not match, a chunk that could not be installed in
+    // the directory, or a listing (or the manifest reads of one) that failed.
+    std::uint64_t context_store_remote_download_failures_transfer = 0;
+    std::uint64_t context_store_remote_download_failures_missing  = 0;
+    std::uint64_t context_store_remote_download_failures_damaged  = 0;
+    std::uint64_t context_store_remote_download_failures_install  = 0;
+    std::uint64_t context_store_remote_download_failures_listing  = 0;
     // Manifests a bucket refresh downloaded (not in remote_downloads), superseded sessions deleted
     // from the bucket, and queued uploads a newer write of the conversation made unnecessary.
     std::uint64_t context_store_remote_manifest_downloads      = 0;

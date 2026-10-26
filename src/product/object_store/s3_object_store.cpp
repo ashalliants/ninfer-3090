@@ -19,15 +19,73 @@ void ensure_curl_initialized() {
     std::call_once(once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
 }
 
-struct CurlHandle {
-    CURL* handle = nullptr;
-    curl_slist* headers = nullptr;
-    CurlHandle() : handle(curl_easy_init()) {
-        if (handle == nullptr) { throw std::runtime_error("cannot create a curl handle"); }
+// Easy handles kept between requests. A handle keeps its connections open after a transfer, so the
+// next request to the bucket on it skips the TCP and TLS handshakes (several round trips each, on
+// every listing page, manifest and chunk otherwise). Each request takes a handle of its own, so
+// any number of threads use the store at once; a handle goes back only after a transfer that
+// the server answered (below 500), so a retry starts on a new connection, as before.
+class CurlPool {
+public:
+    CurlPool() = default;
+    ~CurlPool() {
+        for (CURL* handle : idle_) { curl_easy_cleanup(handle); }
     }
+    CurlPool(const CurlPool&)            = delete;
+    CurlPool& operator=(const CurlPool&) = delete;
+
+    // A handle with every option reset (its connections and caches kept).
+    [[nodiscard]] CURL* take() {
+        {
+            std::scoped_lock lock(mutex_);
+            if (!idle_.empty()) {
+                CURL* handle = idle_.back();
+                idle_.pop_back();
+                curl_easy_reset(handle);
+                return handle;
+            }
+        }
+        CURL* handle = curl_easy_init();
+        if (handle == nullptr) { throw std::runtime_error("cannot create a curl handle"); }
+        return handle;
+    }
+    void give_back(CURL* handle) noexcept {
+        {
+            std::scoped_lock lock(mutex_);
+            // About as many as threads use the store at once (the fetchers, the remote worker and
+            // the lookup thread); one beyond that is closed rather than kept idle.
+            if (idle_.size() < kMaximumIdle) {
+                try {
+                    idle_.push_back(handle);
+                    return;
+                } catch (...) {}
+            }
+        }
+        curl_easy_cleanup(handle);
+    }
+
+private:
+    static constexpr std::size_t kMaximumIdle = 16;
+    std::mutex mutex_;
+    std::vector<CURL*> idle_;
+};
+
+// One request's handle and header list. The handle returns to the pool only when `reusable` was
+// set (the server answered); otherwise it is closed with its connections.
+struct CurlHandle {
+    CurlPool& pool;
+    CURL* handle        = nullptr;
+    curl_slist* headers = nullptr;
+    bool reusable       = false;
+    explicit CurlHandle(CurlPool& from) : pool(from), handle(from.take()) {}
     ~CurlHandle() {
         if (headers != nullptr) { curl_slist_free_all(headers); }
-        curl_easy_cleanup(handle);
+        if (reusable) {
+            // Nothing the next request does not set again may stay attached to the handle.
+            curl_easy_setopt(handle, CURLOPT_HTTPHEADER, nullptr);
+            pool.give_back(handle);
+        } else {
+            curl_easy_cleanup(handle);
+        }
     }
     CurlHandle(const CurlHandle&)            = delete;
     CurlHandle& operator=(const CurlHandle&) = delete;
@@ -246,7 +304,7 @@ private:
             if (attempt != 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(250 << attempt));
             }
-            CurlHandle curl;
+            CurlHandle curl(pool_);
             Response response;
             UploadSource source{upload, 0};
             CURL* h = curl.handle;
@@ -299,6 +357,8 @@ private:
                 last_error = "HTTP " + std::to_string(response.status);
                 continue;
             }
+            // The server answered: the connection is good for the next request.
+            curl.reusable = true;
             return response;
         }
         throw std::runtime_error("S3 request failed: " + last_error);
@@ -306,6 +366,7 @@ private:
 
     S3Config config_;
     std::atomic<bool> interrupted_{false};
+    CurlPool pool_;
 };
 
 } // namespace

@@ -1034,10 +1034,13 @@ public:
     [[nodiscard]] double lossy_scout_share() const noexcept { return lossy_supported_ ? 0.25 : 0.0; }
 
     // ---- checkpoint images ----
-    // An image of one point: a 16-byte header (group, frontier) and `image_payload_bytes` of bytes
+    // An image of one point: a header (marker, group, frontier) and `image_payload_bytes` of bytes
     // that differ between groups, so two images share no chunk. Only continuations restored here
     // export a key; the store tests that write images use those.
-    static constexpr std::size_t kImageHeaderBytes = 16;
+    // An image of one point: a marker, then (group, frontier), then the payload. Only images with
+    // the marker are imported; any other (a test's opaque bytes) finds no room, as a full cache.
+    static constexpr std::uint64_t kImageMarker   = 0x31474d494b414646ULL; // "FFAKIMG1"
+    static constexpr std::size_t kImageHeaderBytes = 24;
     std::size_t image_payload_bytes                = 64 * 1024;
     [[nodiscard]] CheckpointImage export_checkpoints(std::span<const CheckpointHandle> points,
                                                      const std::optional<CacheSessionKey>&,
@@ -1050,8 +1053,9 @@ public:
     [[nodiscard]] CheckpointImage image_of(std::uint64_t group, std::uint32_t frontier) const {
         CheckpointImage image;
         image.bytes.resize(kImageHeaderBytes + image_payload_bytes);
-        std::memcpy(image.bytes.data(), &group, sizeof group);
-        std::memcpy(image.bytes.data() + 8, &frontier, sizeof frontier);
+        std::memcpy(image.bytes.data(), &kImageMarker, sizeof kImageMarker);
+        std::memcpy(image.bytes.data() + 8, &group, sizeof group);
+        std::memcpy(image.bytes.data() + 16, &frontier, sizeof frontier);
         std::uint64_t state = group * 0x9e3779b97f4a7c15ULL + 1;
         for (std::size_t i = kImageHeaderBytes; i < image.bytes.size(); ++i) {
             state          = state * 6364136223846793005ULL + 1442695040888963407ULL;
@@ -1072,14 +1076,20 @@ public:
     // Rebuilds an image_of() image as one restored continuation point.
     [[nodiscard]] std::optional<ImportedCheckpoints>
     import_checkpoints(std::span<const std::uint8_t> image, std::string_view) {
+        if (import_throws) { throw std::runtime_error("the fake import failed"); }
+        std::uint64_t marker = 0;
         if (image.size() < kImageHeaderBytes) { return std::nullopt; }
+        std::memcpy(&marker, image.data(), sizeof marker);
+        if (marker != kImageMarker) { return std::nullopt; }
         RestoredPoint point;
-        std::memcpy(&point.group, image.data(), sizeof point.group);
-        std::memcpy(&point.frontier, image.data() + 8, sizeof point.frontier);
+        std::memcpy(&point.group, image.data() + 8, sizeof point.group);
+        std::memcpy(&point.frontier, image.data() + 16, sizeof point.frontier);
         const CheckpointHandle handle{kRestoredBase + static_cast<std::uint32_t>(restored_.size()), 1};
         restored_.push_back(point);
         return ImportedCheckpoints{.points = {handle}, .session = std::nullopt};
     }
+    // Set by a test: import_checkpoints throws, as a failure the Engine did not foresee would.
+    std::atomic<bool> import_throws{false};
 
 private:
     static constexpr std::uint32_t kSharedBase = 1'000'000;
