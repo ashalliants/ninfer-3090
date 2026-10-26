@@ -121,7 +121,11 @@ std::optional<HostContextAllocation> HostContextArena::allocate(std::size_t byte
     if (rounded == 0) { return std::nullopt; }
     const auto free_index = over_budget(rounded) ? std::nullopt : find_free_extent(rounded);
     if (!free_index) {
-        if (placement_depth_ == 0) { count_failure(rounded); }
+        if (placement_depth_ == 0) {
+            count_failure(rounded);
+        } else {
+            placement_last_miss_ = rounded;
+        }
         return std::nullopt;
     }
     FreeExtent& free         = free_extents_[*free_index];

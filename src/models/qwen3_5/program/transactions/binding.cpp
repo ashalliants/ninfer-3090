@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <optional>
 #include <span>
 #include <stdexcept>
 #include <unordered_set>
@@ -85,29 +84,30 @@ bool ProgramImpl::prompt_fits_beside_residents(const RequestBasePlan& base,
             pin(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend, pinned_backend);
         }
         // A resident part-way through its prompt (or its replay) holds only the chunks it has
-        // reached; the rest of its prompt is as certain to need pages as the newcomer's.
-        const auto& control = requests[lane];
-        std::optional<UnitDemand> end;
-        if (control.lifecycle == Lifecycle::Replaying) {
-            end.emplace(UnitDemand{.kind = ExecutionUnitKind::Replay});
-            end->main_frontier    = control.replay_target;
-            end->backend_frontier = backend_kv_cache() ? control.replay_target : 0;
-        } else if (control.prefill) {
-            const auto& staged = *control.prefill;
-            end                = prefill_unit(staged.prompt_tokens,
-                                              staged.prompt_tokens > prefill_chunk
-                                                  ? staged.prompt_tokens - prefill_chunk
-                                                  : 0,
-                                              staged.initial_mtp_extent);
+        // reached; the rest of its prompt is as certain to need pages as the newcomer's. A request
+        // paused part-way through its prompt replays to where it paused and then goes on with its
+        // prefill, so the larger of the two ends counts.
+        const auto& control        = requests[lane];
+        std::uint32_t main_end     = 0;
+        std::uint32_t backend_end  = 0;
+        if (control.prefill) {
+            const auto end = prompt_end_unit(control.prefill->prompt_tokens,
+                                             control.prefill->initial_mtp_extent);
+            main_end       = end.main_frontier;
+            backend_end    = end.backend_frontier;
         }
-        if (!end) { continue; }
+        if (control.lifecycle == Lifecycle::Replaying) {
+            main_end = std::max(main_end, control.replay_target);
+            if (backend_kv_cache()) { backend_end = std::max(backend_end, control.replay_target); }
+        }
+        if (main_end == 0 && backend_end == 0) { continue; }
         to_come_main += runtime::resident_pages_to_prompt_end(
-            kv_pages_for_frontier(end->main_frontier),
+            kv_pages_for_frontier(main_end),
             text_kv_addresses->mapped_pages(sequence.kv->text),
             text_kv_addresses->reserved_growth_pages(sequence.kv->text));
         if (sequence.kv->backend) {
             to_come_backend += runtime::resident_pages_to_prompt_end(
-                kv_pages_for_frontier(end->backend_frontier),
+                kv_pages_for_frontier(backend_end),
                 backend_kv_addresses->mapped_pages(*sequence.kv->backend),
                 backend_kv_addresses->reserved_growth_pages(*sequence.kv->backend));
         }
@@ -123,9 +123,7 @@ bool ProgramImpl::prompt_fits_beside_residents(const RequestBasePlan& base,
         }
     }
     const auto prompt = base.summary().prompt_tokens;
-    // The last chunk's frontiers are the whole prompt's, including the draft's extra rows.
-    const auto whole = prefill_unit(prompt, prompt > prefill_chunk ? prompt - prefill_chunk : 0,
-                                    initial_mtp_extent(*base.impl_));
+    const auto whole  = prompt_end_unit(prompt, initial_mtp_extent(*base.impl_));
     std::uint64_t need_main    = kv_pages_for_frontier(whole.main_frontier);
     std::uint64_t need_backend = kv_pages_for_frontier(whole.backend_frontier);
     if (source) {
