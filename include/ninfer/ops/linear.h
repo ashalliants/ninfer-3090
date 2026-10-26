@@ -124,11 +124,11 @@ inline constexpr std::int32_t kCublasPrefillMinTokens = 129;
  * represent a text token. FP32 is unsupported.
  *
  * GGML block formats in layout `ggml_blocks_v1` (tensor-formats.md Section 3.5) register the dense
- * projections of Qwen3.8-Flash-Next at every positive T: GGML_IQ4_XS and GGML_IQ3_S at `[N,K]` in
- * `{[10240,2560], [6144,2560], [12288,2560], [512,2560], [2560,6144], [640,2560]}`, GGML_Q6_K at
- * `{[6144,2560], [512,2560], [2560,6144], [640,2560]}`, and GGML_IQ4_NL, GGML_Q8_0 and GGML_Q2_0
- * at `[2560,640]`. The weight view is the codes-only native form (no scale or high plane); IQ4_XS
- * rows are 8-byte aligned, the others 2-byte aligned.
+ * projections of Qwen3.8-Flash-Next's GGUF packs at every positive T: GGML_IQ4_XS, GGML_IQ3_S,
+ * GGML_Q6_K, GGML_Q5_K and GGML_Q4_K at `[N,K]` in `{[10240,2560], [6144,2560], [12288,2560],
+ * [512,2560], [2560,6144], [640,2560]}`, and GGML_IQ4_NL, GGML_Q8_0 and GGML_Q2_0 at `[2560,640]`.
+ * The weight view is the codes-only native form (no scale or high plane); IQ4_XS rows are 8-byte
+ * aligned, Q4_K and Q5_K rows 16-byte aligned, the others 2-byte aligned.
  *
  * @par Numerical contract
  * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.

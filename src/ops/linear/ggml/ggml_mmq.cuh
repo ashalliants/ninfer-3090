@@ -3,7 +3,9 @@
 // Wide route of the GGML linears (T > 8): an int8 tensor-core GEMM over the Q8_1 activation. Each
 // k tile decodes the weight's 32-value sub-blocks (ggml_blocks.cuh) into int8 rows plus FP32 scales
 // in shared memory, as llama.cpp's MMQ load_tiles does, and accumulates every 32-value (Q6_K:
-// 16-value) slice's exact int32 product scaled by weight and activation scales in FP32. Written for
+// 16-value) slice's exact int32 product scaled by weight and activation scales in FP32; an affine
+// format (Q4_K, Q5_K) then adds -offset times the slice's activation sum xm = d * float(sum of its
+// codes), from per-row offsets and per-token sums staged beside the scales. Written for
 // NInfer after llama.cpp's mmq.cuh design (MIT, third_party/ggml/LICENSE); no source is copied
 // from it beyond the decoders in ggml_blocks.cuh.
 
@@ -39,7 +41,8 @@ constexpr std::size_t mmq_shared_bytes() {
                              static_cast<std::size_t>(kMmqRows) * mmq_scales_per_row<F>() * 4 +
                              static_cast<std::size_t>(kMmqTokens) * kMmqStride +
                              static_cast<std::size_t>(kMmqTokens) * (kMmqK / kSubValues) * 4 +
-                             (kNeedsIq3sGrid<F> ? 512 * 4 : 0);
+                             (kNeedsIq3sGrid<F> ? 512 * 4 : 0) +
+                             (kAffine<F> ? static_cast<std::size_t>(kMmqRows + kMmqTokens) * (kMmqK / kSubValues) * 4 : 0);
     const std::size_t epilogue = static_cast<std::size_t>(kMmqTokens) * kMmqOutStride * 4;
     return main > epilogue ? main : epilogue;
 }
@@ -65,6 +68,9 @@ __global__ void __launch_bounds__(kMmqThreads, 2)
     auto* xd_s   = reinterpret_cast<float*>(xq_s + kMmqTokens * kMmqStride);
     auto* grid_s = reinterpret_cast<std::uint32_t*>(xd_s + kMmqTokens * kSubTile);
     auto* c_s    = reinterpret_cast<float*>(smem);
+    // Affine formats only: offsets [row][sub] and activation sums [token][sub], after the grid.
+    auto* wo_s = reinterpret_cast<float*>(grid_s + (kNeedsIq3sGrid<F> ? 512 : 0));
+    auto* xm_s = wo_s + kMmqRows * kSubTile;
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int lane = tid & 31;
@@ -95,7 +101,7 @@ __global__ void __launch_bounds__(kMmqThreads, 2)
             const int item = tid + kMmqThreads * j;
             const int row  = item >> 2;
             const int sub  = item & 3;
-            SubBlock sb;
+            SubBlockOf<F> sb;
             Fmt::decode(w + static_cast<std::size_t>(n0 + row) * row_bytes, kt * kSubTile + sub,
                         tables, sb);
             auto* dst = reinterpret_cast<int4*>(wq_s + row * kMmqStride + kSubValues * sub);
@@ -107,6 +113,7 @@ __global__ void __launch_bounds__(kMmqThreads, 2)
             } else {
                 ws_s[row * kScales + sub] = sb.scale[0];
             }
+            if constexpr (kAffine<F>) wo_s[row * kSubTile + sub] = sb.offset;
         }
         // Activation tile: 64 tokens x 128 bytes; columns past T repeat the last one and are
         // never stored.
@@ -124,7 +131,25 @@ __global__ void __launch_bounds__(kMmqThreads, 2)
             const int tok = tid >> 2;
             const int sub = tid & 3;
             const int tt  = min(t0 + tok, t_count - 1);
-            xd_s[tok * kSubTile + sub] = xd[static_cast<std::size_t>(tt) * x_subs + kt * kSubTile + sub];
+            if constexpr (kAffine<F>) {
+                const float d = xd[static_cast<std::size_t>(tt) * x_subs + kt * kSubTile + sub];
+                xd_s[tok * kSubTile + sub] = d;
+                const auto* q = reinterpret_cast<const int4*>(xq + static_cast<std::size_t>(tt) * k + kt * kMmqK +
+                                                              kSubValues * sub);
+                const int4 q0 = q[0];
+                const int4 q1 = q[1];
+                int sum       = __dp4a(q0.x, 0x01010101, 0);
+                sum           = __dp4a(q0.y, 0x01010101, sum);
+                sum           = __dp4a(q0.z, 0x01010101, sum);
+                sum           = __dp4a(q0.w, 0x01010101, sum);
+                sum           = __dp4a(q1.x, 0x01010101, sum);
+                sum           = __dp4a(q1.y, 0x01010101, sum);
+                sum           = __dp4a(q1.z, 0x01010101, sum);
+                sum           = __dp4a(q1.w, 0x01010101, sum);
+                xm_s[tok * kSubTile + sub] = d * static_cast<float>(sum);
+            } else {
+                xd_s[tok * kSubTile + sub] = xd[static_cast<std::size_t>(tt) * x_subs + kt * kSubTile + sub];
+            }
         }
         __syncthreads();
 
@@ -196,6 +221,31 @@ __global__ void __launch_bounds__(kMmqThreads, 2)
                             acc[mt][nt][e] = fmaf(small_int_to_float(c[e]),
                                                   ws[mt][e >> 1] * xs[nt][e & 1], acc[mt][nt][e]);
                     }
+            }
+        }
+        // Affine formats: the tile's four offset terms, after its scale terms (apart from the MMA
+        // operands, so the offsets and sums do not spill).
+        if constexpr (kAffine<F>) {
+#pragma unroll
+            for (int sub = 0; sub < kSubTile; ++sub) {
+                float wo[2][2];
+                float xm[4][2];
+#pragma unroll
+                for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+                    for (int i = 0; i < 2; ++i)
+                        wo[mt][i] = wo_s[(wm * 32 + mt * 16 + (lane >> 2) + 8 * i) * kSubTile + sub];
+#pragma unroll
+                for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+                    for (int j = 0; j < 2; ++j) xm[nt][j] = xm_s[(wn * 32 + nt * 8 + 2 * (lane & 3) + j) * kSubTile + sub];
+#pragma unroll
+                for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+                    for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+                        for (int e = 0; e < 4; ++e)
+                            acc[mt][nt][e] = fmaf(-wo[mt][e >> 1], xm[nt][e & 1], acc[mt][nt][e]);
             }
         }
         __syncthreads();

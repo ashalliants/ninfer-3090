@@ -42,9 +42,9 @@ namespace ninfer::ops {
  *   [2048,4096], [2048,6144], [5120,6144] or [5120,17408], NVFP4
  *   BlockScaleK16M128x4 [5120,6144] or [5120,17408], row-scaled
  *   FP8_E4M3FN_ROW_BF16 [5120,6144] or [5120,17408], BF16 Contiguous [5120,6144], GGML_IQ4_XS,
- *   GGML_IQ3_S or GGML_Q6_K ggml_blocks_v1 [2560,6144], or GGML_IQ4_NL, GGML_Q8_0 or GGML_Q2_0
- *   ggml_blocks_v1 [2560,640] (the codes-only native view of linear.h). T may be any positive
- *   value.
+ *   GGML_IQ3_S, GGML_Q6_K, GGML_Q5_K or GGML_Q4_K ggml_blocks_v1 [2560,6144], or GGML_IQ4_NL,
+ *   GGML_Q8_0 or GGML_Q2_0 ggml_blocks_v1 [2560,640] (the codes-only native view of linear.h).
+ *   T may be any positive value.
  *
  * Numeric:
  *   The oracle reads a registered BF16 weight directly or exact-decodes a registered packed

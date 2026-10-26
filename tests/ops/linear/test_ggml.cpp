@@ -1,5 +1,6 @@
 // Linear and LinearAdd over GGML block-format weights (ggml_iq4_xs, ggml_iq3_s, ggml_q6_k,
-// ggml_iq4_nl, ggml_q8_0, ggml_q2_0) at every registered Qwen3.8-Flash-Next problem.
+// ggml_q5_k, ggml_q4_k, ggml_iq4_nl, ggml_q8_0, ggml_q2_0) at every registered Qwen3.8-Flash-Next
+// problem.
 //
 // Oracle: the weight is decoded by the exact host decoder (ops/ggml_blocks_decode.h, itself
 // qualified bit-for-bit against ggml b11316), the activation passes through an independent host
@@ -9,11 +10,15 @@
 // (the private wide-route cast, byte for byte) and through the public Op on both routes (a one-hot
 // Q8_0 probe that reads every q * d back out).
 //
+// The affine K-quants (Q5_K, Q4_K) are also compared bit for bit against the host emulation of
+// both routes' arithmetic (ops/ggml_linear_emulation.h, qualified against FP64 on the host by
+// ninfer_ggml_linear_affine_test): the decode route at T = 1..8 and the wide route beyond.
+//
 // T covers both routes and their seams: 1..8 (decode), 9 (first wide), 63/64/65 (one wide column
 // tile and its edges) and 300 (interior, partial last tile).
 //
-// linear_pair over GGML weights (its decode route, T = 1..8): every ordered pair of IQ4_XS, IQ3_S
-// and Q6_K at both registered pair shapes, each output against the same FP64 oracle and bit for
+// linear_pair over GGML weights (its decode route, T = 1..8): every ordered pair of IQ4_XS, IQ3_S,
+// Q6_K, Q5_K and Q4_K at both registered pair shapes, each output against the same FP64 oracle and bit for
 // bit against linear() on its own weight; and its admission.
 //
 // Usage: ninfer_linear_ggml_test [--format NAME] [--shape N K]
@@ -25,6 +30,7 @@
 #include "core/arena.h"
 #include "core/weight.h"
 #include "ops/ggml_blocks_decode.h"
+#include "ops/ggml_linear_emulation.h"
 #include "ops/linear/ggml/ggml_launch.h"
 #include "ops/linear/ggml/ggml_shapes.h"
 #include "ops/op_check.h"
@@ -70,6 +76,8 @@ const char* format_name(QType format) {
     case QType::GGML_IQ4_XS: return "ggml_iq4_xs";
     case QType::GGML_IQ3_S: return "ggml_iq3_s";
     case QType::GGML_Q6_K: return "ggml_q6_k";
+    case QType::GGML_Q5_K: return "ggml_q5_k";
+    case QType::GGML_Q4_K: return "ggml_q4_k";
     case QType::GGML_IQ4_NL: return "ggml_iq4_nl";
     case QType::GGML_Q8_0: return "ggml_q8_0";
     case QType::GGML_Q2_0: return "ggml_q2_0";
@@ -77,31 +85,12 @@ const char* format_name(QType format) {
     }
 }
 
-// --- the contract's Q8_1 cast, host side ---------------------------------------------------------
+// --- the contract's Q8_1 cast, host side (ops/ggml_linear_emulation.h) ---------------------------
 
-struct Q81 {
-    std::vector<std::int8_t> q; // [T][K]
-    std::vector<float> d;       // [T][K / 32]
-};
+using test::ggml_linear::Q81;
 
 Q81 cast_q81(const std::vector<std::uint16_t>& x, std::int32_t k, std::int32_t t) {
-    Q81 out;
-    out.q.resize(static_cast<std::size_t>(k) * t);
-    out.d.resize(static_cast<std::size_t>(k / 32) * t);
-    for (std::size_t g = 0; g < out.d.size(); ++g) {
-        float amax = 0.0F;
-        for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(bf16_to_f32(x[32 * g + i])));
-        // Pre-scaled by a power of two when 127 / amax would overflow (BF16 subnormals).
-        const float scale   = amax < 0x1p-100F ? 0x1p+100F : 1.0F;
-        const float inverse = amax == 0.0F ? 0.0F : 127.0F / (amax * scale);
-        for (int i = 0; i < 32; ++i) {
-            // Default rounding mode: nearest, ties to even.
-            out.q[32 * g + i] = static_cast<std::int8_t>(
-                std::nearbyint((bf16_to_f32(x[32 * g + i]) * scale) * inverse));
-        }
-        out.d[g] = amax / 127.0F;
-    }
-    return out;
+    return test::ggml_linear::cast_q81(x, k, t);
 }
 
 // --- fixtures --------------------------------------------------------------------------------------
@@ -121,12 +110,16 @@ std::vector<std::uint8_t> make_blocks(QType format, std::int32_t n, std::int32_t
     std::mt19937 rng(seed);
     for (auto& b : bytes) b = static_cast<std::uint8_t>(rng());
     const std::size_t d_offset = format == QType::GGML_Q6_K ? 208 : 0;
-    // IQ4_XS and IQ3_S scale codes multiply d by up to ~32; Q6_K by up to 128 and every code by 32.
+    // IQ4_XS and IQ3_S scale codes multiply d by up to ~32; Q6_K by up to 128 and every code by 32;
+    // Q4_K and Q5_K by up to 63 and every code by up to 31, and their dmin (after d) by up to 63.
     const int base = format == QType::GGML_Q8_0 || format == QType::GGML_IQ4_NL ? -12 : -14;
+    const bool affine = test::ggml_linear::is_affine(format);
     for (std::size_t i = 0; i < blocks; ++i) {
-        const auto h = fp16_bits(rng() & 1, base + static_cast<int>(rng() % 4),
-                                 static_cast<int>(rng() & 0x3FF));
-        std::memcpy(&bytes[i * block.bytes + d_offset], &h, 2);
+        for (int field = 0; field < (affine ? 2 : 1); ++field) {
+            const auto h = fp16_bits(rng() & 1, base + static_cast<int>(rng() % 4),
+                                     static_cast<int>(rng() & 0x3FF));
+            std::memcpy(&bytes[i * block.bytes + d_offset + 2 * field], &h, 2);
+        }
     }
     return bytes;
 }
@@ -202,6 +195,38 @@ std::vector<std::uint16_t> download_bf16(const void* device, std::size_t count) 
     return out;
 }
 
+// Q5_K and Q4_K: the BF16 outputs [t][n] of both routes' arithmetic for every column, by the host
+// emulation (a column's bits depend on neither T nor its position): [0] the decode route, [1] the
+// wide route. Empty for the other formats.
+std::vector<std::vector<std::uint16_t>> emulate(QType format, const std::vector<std::uint8_t>& blocks,
+                                                std::int32_t n, std::int32_t k, const Q81& x,
+                                                const std::vector<std::uint16_t>* residual) {
+    namespace em = test::ggml_linear;
+    if (!em::is_affine(format)) { return {}; }
+    const auto xm = em::activation_sums(x);
+    const std::size_t row_bytes = static_cast<std::size_t>(k) / 256 * ggml_block(format).bytes;
+    std::vector<std::vector<std::uint16_t>> out(2, std::vector<std::uint16_t>(static_cast<std::size_t>(n) * kMaxTokens));
+    const unsigned workers = std::max(1U, std::min(16U, std::thread::hardware_concurrency()));
+    std::vector<std::thread> pool;
+    for (unsigned id = 0; id < workers; ++id) {
+        pool.emplace_back([&, id] {
+            for (std::int32_t row = static_cast<std::int32_t>(id); row < n; row += static_cast<std::int32_t>(workers)) {
+                const auto subs = em::affine_row(format, blocks.data() + row * row_bytes, k);
+                for (std::int32_t col = 0; col < kMaxTokens; ++col) {
+                    const std::size_t o   = static_cast<std::size_t>(col) * n + row;
+                    const std::uint16_t* r = residual ? &(*residual)[o] : nullptr;
+                    if (col < ops::detail::kGgmlDecodeMaxTokens) {
+                        out[0][o] = em::store(em::row_dot(em::Route::Decode, subs, x, xm, k, col), r);
+                    }
+                    out[1][o] = em::store(em::row_dot(em::Route::Wide, subs, x, xm, k, col), r);
+                }
+            }
+        });
+    }
+    for (auto& worker : pool) worker.join();
+    return out;
+}
+
 // Runs every T on one (format, shape, op) and compares against the FP64 oracle.
 int run_problem(QType format, std::int32_t n, std::int32_t k, bool add) {
     const std::uint32_t seed = static_cast<std::uint32_t>(n * 131 + k * 7 + static_cast<int>(format));
@@ -218,6 +243,7 @@ int run_problem(QType format, std::int32_t n, std::int32_t k, bool add) {
         for (auto& r : residual) r = f32_to_bf16(unit(rng));
     }
     const auto expected = oracle(w, xq, n, k, kMaxTokens, add ? &residual : nullptr);
+    const auto emulated = emulate(format, blocks, n, k, xq, add ? &residual : nullptr);
 
     DeviceBuffer d_w(blocks.size());
     d_w.copy_from_host(blocks.data(), blocks.size());
@@ -256,6 +282,15 @@ int run_problem(QType format, std::int32_t n, std::int32_t k, bool add) {
         const std::span<const double> ref(expected.data(), got.size());
         failures += test::verify_reduction(label + " T=" + std::to_string(t), got, ref,
                                            kGgmlQ81Criterion);
+        if (!emulated.empty()) {
+            const auto& route = emulated[t <= ops::detail::kGgmlDecodeMaxTokens ? 0 : 1];
+            std::size_t differ = 0;
+            for (std::size_t i = 0; i < got_bits.size(); ++i) differ += got_bits[i] != route[i];
+            if (differ != 0) {
+                std::cerr << label << " T=" << t << ": " << differ << " outputs differ from the host emulation\n";
+                ++failures;
+            }
+        }
     }
     return failures;
 }
@@ -502,8 +537,8 @@ int pair_admission() {
 }
 
 QType parse_format(std::string_view name) {
-    for (const QType f : {QType::GGML_IQ4_XS, QType::GGML_IQ3_S, QType::GGML_Q6_K,
-                          QType::GGML_IQ4_NL, QType::GGML_Q8_0, QType::GGML_Q2_0}) {
+    for (const QType f : {QType::GGML_IQ4_XS, QType::GGML_IQ3_S, QType::GGML_Q6_K, QType::GGML_Q5_K,
+                          QType::GGML_Q4_K, QType::GGML_IQ4_NL, QType::GGML_Q8_0, QType::GGML_Q2_0}) {
         if (name == format_name(f)) return f;
     }
     throw std::invalid_argument("unknown --format " + std::string(name));

@@ -5,8 +5,9 @@
 // of ninfer_ggml_blocks_decode_test) and writes value i as binary32(int8 v_i * scale[i / 16]), the
 // weight the linears' dp4a and int8 MMA products stand for. For each format that product is the
 // reference's own last FP32 operation, so every output equals ggml's bit pattern; a NaN output only
-// has to be a NaN (the device's NaN payload and sign are its own). IQ2_XS and IQ3_XXS have a
-// decoder but no registered linear problem yet, so this is their only device check.
+// has to be a NaN (the device's NaN payload and sign are its own). The affine K-quants (Q4_K,
+// Q5_K) write binary32(binary32(v_i * scale) - offset), ggml's own last two operations. IQ2_XS and
+// IQ3_XXS have a decoder but no registered linear problem yet, so this is their only device check.
 
 #include "core/weight.h"
 #include "ops/linear/ggml/ggml_blocks.cuh"
@@ -47,12 +48,14 @@ __global__ void decode_sub_blocks(const std::uint8_t* blocks, int sub_blocks, fl
     __syncthreads();
     for (int s = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); s < sub_blocks;
          s += static_cast<int>(gridDim.x * blockDim.x)) {
-        g::SubBlock sb;
+        g::SubBlockOf<F> sb;
         g::Format<F>::decode(blocks, s, tables, sb);
         for (int i = 0; i < g::kSubValues; ++i) {
             const auto word = static_cast<std::uint32_t>(sb.v[i / 4]);
             const auto v    = static_cast<std::int8_t>(word >> (8 * (i % 4)));
-            out[g::kSubValues * s + i] = __fmul_rn(static_cast<float>(v), sb.scale[i / 16]);
+            float value     = __fmul_rn(static_cast<float>(v), sb.scale[i / 16]);
+            if constexpr (g::kAffine<F>) value = __fsub_rn(value, sb.offset);
+            out[g::kSubValues * s + i] = value;
         }
     }
 }
@@ -120,6 +123,8 @@ int main() {
         failures += check<QType::GGML_Q6_K>("ggml_q6_k");
         failures += check<QType::GGML_IQ2_XS>("ggml_iq2_xs");
         failures += check<QType::GGML_IQ3_XXS>("ggml_iq3_xxs");
+        failures += check<QType::GGML_Q4_K>("ggml_q4_k");
+        failures += check<QType::GGML_Q5_K>("ggml_q5_k");
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::printf("%s\n", error.what());

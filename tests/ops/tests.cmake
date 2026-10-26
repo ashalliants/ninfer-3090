@@ -41,6 +41,18 @@ ninfer_add_op_test(ninfer_ggml_blocks_decode_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_blocks_decode.cpp"
   LIBRARIES ninfer_core)
 
+# Host-only: the GGML linear registry against the dense tensors, heads and two-projection pairs of
+# the Qwen3.8-Flash-Next GGUF packs (a table in the test mirrors their tensor allocations).
+ninfer_add_op_test(ninfer_ggml_linear_registry_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_linear_registry.cpp"
+  LIBRARIES ninfer_core)
+
+# Host-only: the GGML linears' affine Q4_K/Q5_K arithmetic (ggml_linear_emulation.h, both routes)
+# against ggml's decode and an FP64 oracle at every registered Q4_K/Q5_K problem.
+ninfer_add_op_test(ninfer_ggml_linear_affine_test NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_linear_affine.cpp"
+  LIBRARIES ninfer_core)
+
 # Host-only: the GatedDeltaNet head map in the FP64 oracle. The tiled map (value head h reads key
 # head h % Hqk, Qwen3.8-Flash-Next) on 16 q/k heads equals, bit for bit, the blocked map on q/k
 # tiled to one head per value head.

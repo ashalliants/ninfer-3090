@@ -34,12 +34,13 @@ __host__ __device__ constexpr int mmvq_lanes_per_row(int sub_blocks) {
 template <QType F, int K, int T>
 constexpr std::size_t mmvq_shared_bytes() {
     return static_cast<std::size_t>(T) * K + static_cast<std::size_t>(T) * (K / 32) * 4 +
-           (kNeedsIq3sGrid<F> ? 512 * 4 : 0);
+           (kNeedsIq3sGrid<F> ? 512 * 4 : 0) + (kAffine<F> ? static_cast<std::size_t>(T) * (K / 32) * 4 : 0);
 }
 
 // x is BF16 [K,T] (column t at x + t K); out is BF16 [N,T]. The cast stores sub-block s of column
 // t as two 16-byte halves at t K + 16 s and t K + K / 2 + 16 s, so the lanes of a row, which read
-// consecutive sub-blocks, hit distinct banks.
+// consecutive sub-blocks, hit distinct banks. An affine format (Q4_K, Q5_K) also keeps each group's
+// xm = d * float(sum of its codes) for the offset term, after the grid.
 // Out is BF16 (Linear, LinearAdd) or FP32 (projection_fp32's GGML head); Residual needs BF16.
 //
 // The body runs as CTA `cta` of `ctas` persistent CTAs over one matrix: ggml_mmvq_kernel gives it
@@ -75,7 +76,7 @@ __device__ __forceinline__ void mmvq_body(const std::uint8_t* __restrict__ w, co
 
     // The first row group's weight loads go out before the cast, so the cast's reads of x overlap
     // them instead of delaying every CTA's first DRAM request.
-    SubBlock sb[kSubsLane];
+    SubBlockOf<F> sb[kSubsLane];
     const auto decode = [&](int group) {
         const std::uint8_t* wrow =
             w + static_cast<std::size_t>(group * kRowsWarp + lane / kLanes) * kRowBytes;
@@ -88,7 +89,17 @@ __device__ __forceinline__ void mmvq_body(const std::uint8_t* __restrict__ w, co
         const int t  = g / kSubs;
         const int gi = g - t * kSubs;
         int words[8];
-        xd_s[g] = quantize_q8_1_group(x + static_cast<std::size_t>(t) * K + kSubValues * gi, words);
+        if constexpr (kAffine<F>) {
+            const float xd = quantize_q8_1_group(x + static_cast<std::size_t>(t) * K + kSubValues * gi, words);
+            xd_s[g]        = xd;
+            int sum        = 0;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) sum = __dp4a(words[w], 0x01010101, sum);
+            auto* xm_s = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(grid_s) + (kNeedsIq3sGrid<F> ? 512 * 4 : 0));
+            xm_s[g]    = xd * static_cast<float>(sum);
+        } else {
+            xd_s[g] = quantize_q8_1_group(x + static_cast<std::size_t>(t) * K + kSubValues * gi, words);
+        }
         *reinterpret_cast<int4*>(xq_s + t * K + 16 * gi) =
             make_int4(words[0], words[1], words[2], words[3]);
         *reinterpret_cast<int4*>(xq_s + t * K + K / 2 + 16 * gi) =
@@ -124,6 +135,11 @@ __device__ __forceinline__ void mmvq_body(const std::uint8_t* __restrict__ w, co
                                   acc[t]);
                 } else {
                     acc[t] = fmaf(static_cast<float>(lo + hi), sb[i].scale[0] * xd, acc[t]);
+                    if constexpr (kAffine<F>) {
+                        const auto* xm_s = reinterpret_cast<const float*>(
+                            reinterpret_cast<const unsigned char*>(grid_s) + (kNeedsIq3sGrid<F> ? 512 * 4 : 0));
+                        acc[t] = fmaf(-sb[i].offset, xm_s[t * kSubs + s], acc[t]);
+                    }
                 }
             }
         }

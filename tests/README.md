@@ -189,7 +189,7 @@ Optional environment variables extend the Python GGML and GGUF checks:
 
 `python -m tools.artifact.gen_ggml_fixtures --dll PATH` regenerates the fixtures.
 
-`ninfer_linear_ggml_test` qualifies Linear and LinearAdd over the six GGML formats they register,
+`ninfer_linear_ggml_test` qualifies Linear and LinearAdd over the eight GGML formats they register,
 at every registered problem and T in {1..8, 9, 63, 64, 65, 300}: the weight is decoded by that host
 oracle, the activation passes through an independent host copy of the contract's Q8_1 cast, and
 the output is compared with the FP64 product. It also checks the cast exactly, byte for byte against
@@ -198,7 +198,16 @@ the wide route's cast kernel and through the public Op on both routes, and the a
 host oracle. `ninfer_linear_ggml_device_decode_test` checks the linears' device sub-block decoders on
 their own, each value (the int8 code times its FP32 scale) bit for bit against the golden fixtures;
 it is the only device check of IQ2_XS and IQ3_XXS in the linears, which have a decoder but no
-registered problem (the expert routes check them through their records, below).
+registered problem (the expert routes check them through their records, below). For the affine
+Q4_K and Q5_K the GPU test also requires every output bit for bit equal to the host emulation of
+both routes' arithmetic (`tests/ops/ggml_linear_emulation.h`), which the host-only
+`ninfer_ggml_linear_affine_test` qualifies: the emulated sub-block decomposition reproduces ggml's
+values exactly, and at every registered Q4_K/Q5_K problem the emulated outputs meet the GPU
+suite's FP64 criterion and the FP32 accumulation bound, including rows built to cancel. The
+host-only `ninfer_ggml_linear_registry_test` checks the registry against a table of the packs'
+dense tensors: every (family, format) is a registered Linear (LinearAdd) problem, every format pair
+of the two-projection families a linear_pair problem, every output head a projection_fp32 head
+format, and no registered problem unused.
 
 `ninfer_offloaded_moe_cpu_test` (host only) and `ninfer_offloaded_moe_layer_test` qualify
 offloaded_sparse_moe over the twelve GGML text expert record formats (the IQ2_XS pack's three and
