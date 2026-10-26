@@ -544,6 +544,9 @@ public:
         std::function<bool(const std::string&)> queued;
         std::function<std::uint64_t()> failures;
         std::function<FailedStoreWrites()> failed_writes;
+        // A buffer for the next image's bytes: the writer hands back the last written image's,
+        // whose pages are already mapped, so copying an image out does not fault them in again.
+        std::function<std::vector<std::uint8_t>()> export_buffer;
         // A retained continuation unused this long is written in the background; zero disables it.
         std::chrono::milliseconds idle_persist{0};
         // The longest a request waits for its stored session to be read back.
@@ -683,7 +686,7 @@ public:
             if (Clock::now() >= deadline) { break; }
             try {
                 auto image       = program.export_checkpoints({&handle, 1}, std::nullopt,
-                                                              store_.binding);
+                                                              store_.binding, export_buffer());
                 const auto bytes = image.bytes.size();
                 if (write(std::move(image), true)) {
                     shared_stored_.emplace_back(handle, bytes);
@@ -708,7 +711,7 @@ public:
             if (owner.active || settled(mark(owner.token), owner.points)) { continue; }
             try {
                 auto image        = program.export_checkpoints(owner.points, owner.session,
-                                                               store_.binding);
+                                                               store_.binding, export_buffer());
                 const auto bytes  = image.bytes.size();
                 if (write(std::move(image), false)) {
                     record_stored(owner.token, owner.points, bytes);
@@ -3802,6 +3805,14 @@ private:
         return true;
     }
 
+    // The buffer to export the next image into (empty when the writer has none to hand back).
+    [[nodiscard]] std::vector<std::uint8_t> export_buffer() noexcept {
+        try {
+            if (store_.export_buffer) { return store_.export_buffer(); }
+        } catch (...) {}
+        return {};
+    }
+
     // Whether the store holds the image `id` for this Engine's model and configuration, or the
     // Engine's writer still has it to write. A store that cannot answer is taken to hold it, so a
     // failing lookup never sets off rewrites.
@@ -3927,7 +3938,7 @@ private:
             if (!chosen) { return; }
             const auto started = Clock::now();
             auto image       = program.export_checkpoints(chosen->points, chosen->session,
-                                                              store_.binding);
+                                                              store_.binding, export_buffer());
             cumulative_stats_.context_store_idle_export_seconds +=
                 std::chrono::duration<double>(Clock::now() - started).count();
             const auto bytes = image.bytes.size();
@@ -4035,7 +4046,7 @@ private:
                 try {
                     const auto started = Clock::now();
                     image.emplace(program.export_checkpoints({&handle, 1}, std::nullopt,
-                                                             store_.binding));
+                                                             store_.binding, export_buffer()));
                     cumulative_stats_.context_store_shared_export_seconds +=
                         std::chrono::duration<double>(Clock::now() - started).count();
                 } catch (...) {
@@ -4077,7 +4088,7 @@ private:
             try {
                 if (settled(mark(owner.token), owner.points)) { continue; }
                 const auto started = Clock::now();
-                auto image = program.export_checkpoints(owner.points, owner.session, store_.binding);
+                auto image = program.export_checkpoints(owner.points, owner.session, store_.binding, export_buffer());
                 const auto bytes = image.bytes.size();
                 cumulative_stats_.context_store_eviction_export_seconds +=
                     std::chrono::duration<double>(Clock::now() - started).count();
