@@ -165,6 +165,7 @@ int main() {
     fork.lossy_prefill_summaries_new      = baseline.lossy_prefill_summaries_new + 5;
     fork.lossy_prefill_summaries_reused   = baseline.lossy_prefill_summaries_reused + 6;
     fork.lossy_prefill_summary_probe_timeouts = baseline.lossy_prefill_summary_probe_timeouts + 7;
+    fork.admission_overtakes              = 3;
     fork.context_store_images             = 5;
     fork.context_store_used_bytes         = 123456789;
     fork.context_store_logical_bytes      = 223456789;
@@ -209,7 +210,8 @@ int main() {
               has_line(series, "ninfer_deferred_prefill_turns_total 31") &&
               has_line(series, "ninfer_sliced_prefill_steps_total 8") &&
               has_line(series, "ninfer_prefill_slice_boundaries_total 56") &&
-              has_line(series, "ninfer_engine_recoveries_total 1"),
+              has_line(series, "ninfer_engine_recoveries_total 1") &&
+              has_line(series, "ninfer_admission_overtakes_total 3"),
           "abandoned, cancelled, recovery and phase-time series must be reported");
     check(has_line(series, "ninfer_lossy_prefill_total{outcome=\"completed\"} 2") &&
               has_line(series, "ninfer_lossy_prefill_total{outcome=\"skipped\"} 1") &&
