@@ -8,7 +8,7 @@ import ssl
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Mapping
+from typing import Callable, Iterable, Mapping
 from urllib.parse import urlsplit
 
 
@@ -66,7 +66,7 @@ class PreparedExchange:
         connection: http.client.HTTPConnection,
         method: str,
         path: str,
-        body: bytes,
+        body: bytes | Iterable[bytes],
         headers: Mapping[str, str],
     ) -> None:
         self._connection = connection
@@ -75,6 +75,14 @@ class PreparedExchange:
         if self._transport is None:
             raise HttpClientError("prepared HTTP exchange has no connected transport")
         self._body = body
+        if isinstance(body, (bytes, bytearray, memoryview)):
+            self._body_bytes = len(body)
+        else:
+            # A body streamed from an iterable cannot be measured; the caller states its length.
+            declared = {name.lower(): value for name, value in headers.items()}.get("content-length")
+            if declared is None or not declared.isdigit():
+                raise HttpClientError("an iterable body needs an explicit Content-Length header")
+            self._body_bytes = int(declared)
         self._lock = threading.Lock()
         self._cancel_requested = False
         self._cancel_ns: int | None = None
@@ -91,7 +99,7 @@ class PreparedExchange:
 
     @property
     def body_bytes(self) -> int:
-        return len(self._body)
+        return self._body_bytes
 
     @property
     def cancel_ns(self) -> int | None:
@@ -245,7 +253,7 @@ class StreamingHttpClient:
         self,
         method: str,
         path: str,
-        body: bytes = b"",
+        body: bytes | Iterable[bytes] = b"",
         headers: Mapping[str, str] | None = None,
     ) -> PreparedExchange:
         if not path.startswith("/"):
@@ -253,6 +261,8 @@ class StreamingHttpClient:
         request_headers = dict(headers or {})
         lower = {name.lower() for name in request_headers}
         if "content-length" not in lower:
+            if not isinstance(body, (bytes, bytearray, memoryview)):
+                raise HttpClientError("an iterable body needs an explicit Content-Length header")
             request_headers["Content-Length"] = str(len(body))
         if "connection" not in lower:
             request_headers["Connection"] = "close"

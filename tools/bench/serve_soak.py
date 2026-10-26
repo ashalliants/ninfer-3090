@@ -15,17 +15,22 @@ The traffic is a seeded random mix of
   image     base64 data-URL images from --images DIR (a server without --vision answers 400
             vision_disabled, which stops the image requests and is not a failure)
 
-with 1..--max-concurrency requests in flight. Every --sample-seconds it reads /v1/load, /metrics and /slots
+with 1..--max-concurrency requests in flight (default: one per lane the server reports in /slots). Every --sample-seconds it reads /v1/load, /metrics and /slots
 and the server's resident memory (--pid) and keeps them in the report.
 
 It exits non-zero when any of these happened (exit codes: 0 clean, 1 findings, 2 could not start):
 
   - a response status or body that the request kind does not expect, a stream that ended without its
     terminator, an error event inside a stream, or a transport error;
-  - a stream with no SSE event for --stall-seconds (counted from the send until the first event, then from
-    the last event); the stalled request is cancelled so the run can finish;
+  - a stream with no SSE event for --stall-seconds (counted from the end of the upload until the first event,
+    then from the last event; time the server reports the request as queued in /v1/load does not count); the
+    stalled request is cancelled so the run can finish;
+  - a server queue (/v1/load requests.queue_total > 0) that sits behind an idle lane (/slots) for
+    --stall-seconds;
   - resident memory that grew by more than --rss-growth-mib over the last half of the run;
-  - a server that stopped answering its sampling endpoints (3 rounds in a row).
+  - a server that stopped answering its sampling endpoints (3 rounds in a row), or a bug in the sampler.
+
+Ctrl-C cancels what is in flight and writes a partial report (exit 2 unless it already holds findings).
 
 The soak sends a normal Host header, no Origin and no Sec-Fetch-*, and the key (if any) as a Bearer token, so
 it passes the server's Host/Origin checks. The card is busy for the whole run: hold the GPU lock for the
@@ -45,9 +50,10 @@ import statistics
 import sys
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -256,6 +262,12 @@ class Soak:
         self.sample_failures = 0
         self.server_lost = False
         self.t0 = time.monotonic()
+        self.lanes = 1
+        self.queue_idle_since: float | None = None   # when "queued work, an idle lane" began
+        self.queue_idle_ticks = 0
+        self.queue_flagged = False
+        self.harness_errors: list[str] = []
+        self.interrupted = False
 
     # -- plain GETs --------------------------------------------------------------------------
 
@@ -297,6 +309,11 @@ class Soak:
         except (ValueError, KeyError, IndexError, TypeError):
             pass  # keep the default; the first request will say if it is wrong
         slots = self.get_json("/slots")
+        if isinstance(slots, list) and slots:
+            self.lanes = len(slots)
+        if not self.args.max_concurrency:
+            # One request per lane keeps every queued request out of the stall clock by construction.
+            self.args.max_concurrency = self.lanes
         if not self.args.context and isinstance(slots, list):
             contexts = [slot.get("n_ctx") for slot in slots if isinstance(slot, dict)]
             contexts = [value for value in contexts if isinstance(value, int) and value > 0]
@@ -339,8 +356,8 @@ class Soak:
 
     # -- requests -----------------------------------------------------------------------------
 
-    def build(self, req: Request) -> tuple[str, bytes, bool]:
-        """(path, body, wants_stream) for the request, drawing its randomness from the soak's RNG."""
+    def build(self, req: Request) -> tuple[str, bytes | Iterable[bytes], int]:
+        """(path, body, content length) for the request, drawing its randomness from the soak's RNG."""
         rng = self.rng
         kind = req.kind
         text = rng.choice(TOPICS)
@@ -367,32 +384,49 @@ class Soak:
             text = "Describe this image in a few sentences."
             max_tokens = 200
         if kind == "oversize":
-            padding = (self.args.max_request_mib + 1) << 20
-            head = json.dumps({"model": self.model, "max_tokens": 1, "stream": True,
-                               "messages": [{"role": "user", "content": ""}]}).encode()
-            cut = head.rindex(b'""') + 1
-            return "/v1/chat/completions", head[:cut] + b"a" * padding + head[cut:], True
+            chunks, length = self.oversize_body()
+            return "/v1/chat/completions", chunks, length
         if req.protocol == "openai":
             body = {"model": self.model, "messages": chat_messages("openai", text, image),
                     "max_tokens": max_tokens, "temperature": 0.7, "stream": True,
                     "stream_options": {"include_usage": True}}
-            return "/v1/chat/completions", json.dumps(body).encode(), True
+            encoded = json.dumps(body).encode()
+            return "/v1/chat/completions", encoded, len(encoded)
         body = {"model": self.model, "messages": chat_messages("anthropic", text, image),
                 "max_tokens": max_tokens, "temperature": 0.7, "stream": True}
-        return "/v1/messages", json.dumps(body).encode(), True
+        encoded = json.dumps(body).encode()
+        return "/v1/messages", encoded, len(encoded)
+
+    def oversize_body(self) -> tuple[Iterable[bytes], int]:
+        """(chunks, length) of a chat body one MiB above --max-request-mib, streamed from one reused 1 MiB
+        chunk so the client holds about 1 MiB however large the limit is."""
+        head = json.dumps({"model": self.model, "max_tokens": 1, "stream": True,
+                           "messages": [{"role": "user", "content": ""}]}).encode()
+        cut = head.rindex(b'""') + 1
+        mib = self.args.max_request_mib + 1
+        block = b"a" * (1 << 20)
+
+        def chunks() -> Iterator[bytes]:
+            yield head[:cut]
+            for _ in range(mib):
+                yield block
+            yield head[cut:]
+        return chunks(), len(head) + (mib << 20)
 
     def run_request(self, req: Request) -> None:
         started = time.monotonic()
         req.started_s = started - self.t0
         result = None
         try:
-            path, body, _ = self.build(req)
+            path, body, length = self.build(req)
             headers = self.headers(req.protocol, "text/event-stream")
             headers["Content-Type"] = "application/json"
+            headers["Content-Length"] = str(length)
             req.exchange = self.client.prepare("POST", path, body, headers)
             decoder = SseDecoder()
 
-            def on_sent(ns: int) -> None:
+            def on_body_sent(ns: int) -> None:
+                # The stall clock starts once the whole body is out, so a slow upload is not silence.
                 req.sent_ns = req.last_event_ns = ns
 
             def on_headers(head: Any) -> None:
@@ -410,7 +444,7 @@ class Soak:
 
             if req.cancelled_by_us:  # the timer fired before the exchange existed
                 req.exchange.cancel()
-            result = req.exchange.execute(on_sent=on_sent, on_headers=on_headers, on_chunk=on_chunk)
+            result = req.exchange.execute(on_body_sent=on_body_sent, on_headers=on_headers, on_chunk=on_chunk)
             if req.streaming and result.error is None and not req.cancelled_by_us:
                 for event in decoder.finish(time.perf_counter_ns()):
                     req.on_event(event)
@@ -428,7 +462,9 @@ class Soak:
         code, error_type, message = parse_error(body) if req.status not in (None, 200) else (None, None, "")
         req.code = code
         outcome, failure = "ok", None
-        if req.stalled:
+        if self.interrupted and req.cancelled_by_us and not req.stalled:
+            outcome = "cancelled"   # cut by the operator's Ctrl-C, not by the server
+        elif req.stalled:
             outcome, failure = "failed", "stalled"
         elif req.cancelled_by_us and req.kind == "cancel":
             outcome = "cancelled"
@@ -444,8 +480,11 @@ class Soak:
             else:
                 outcome, failure = "failed", f"expected HTTP 413, got {req.status} {code or ''} {message}".strip()
         elif req.kind == "over":
-            right_code = code == "context_length_exceeded" if req.protocol == "openai" \
-                else error_type == "invalid_request_error"
+            if req.protocol == "openai":
+                right_code = code == "context_length_exceeded"
+            else:   # an Anthropic error body has no code: its type and a message about the prompt length
+                right_code = (error_type == "invalid_request_error"
+                              and any(word in message.lower() for word in ("prompt", "context", "token")))
             if req.status == 400 and right_code:
                 outcome = "ok"
             else:
@@ -518,14 +557,25 @@ class Soak:
 
     # -- sampling and stall detection -----------------------------------------------------------
 
-    def check_stalls(self) -> None:
+    def check_stalls(self, queue_total: Any) -> None:
+        """Flag streams quiet for --stall-seconds; time spent in the server's queue is not quiet time.
+
+        The server queues in arrival order, so of the requests still awaiting their first event the newest
+        `queue_total` are the queued ones and the older ones hold lanes (prefilling). Each tick the queued
+        ones have their clock reset; a request that holds a lane and says nothing for the limit is a stall.
+        """
         now = time.perf_counter_ns()
         limit_ns = int(self.args.stall_seconds * NS)
         with self.lock:
-            live = [r for r in self.requests if not r.done and not r.stalled and not r.cancelled_by_us
-                    and r.last_event_ns is not None]
-        for req in live:
-            quiet = now - req.last_event_ns
+            pending = [r for r in self.requests if not r.done and r.events == 0 and r.sent_ns is not None]
+            pending.sort(key=lambda r: r.sent_ns or 0)
+            queued = int(queue_total) if isinstance(queue_total, int) and queue_total > 0 else 0
+            for req in pending[len(pending) - min(len(pending), queued):]:
+                req.last_event_ns = now
+            live = [(r, r.last_event_ns) for r in self.requests
+                    if not r.done and not r.stalled and not r.cancelled_by_us and r.last_event_ns is not None]
+        for req, last_ns in live:
+            quiet = now - (last_ns or now)
             if quiet > limit_ns:
                 req.stalled = True
                 entry = {"id": req.id, "kind": req.kind, "protocol": req.protocol,
@@ -537,7 +587,40 @@ class Soak:
                       f"{entry['quiet_seconds']} s, {entry['phase']}; cancelling", flush=True)
                 req.cancel()
 
-    def sample_once(self) -> None:
+    def check_queue(self, sample: dict[str, Any]) -> None:
+        """Flag a server that queues work while one of its lanes sits idle.
+
+        Either the queue has been non-empty with an idle lane for --stall-seconds, or the head of the queue
+        has waited longer than that and an idle lane was seen on two samples in a row (one sample can fall in
+        the gap between a lane finishing and the next admission). Reported once per episode.
+        """
+        queue_total, lanes, busy = sample.get("queue_total"), sample.get("slots"), sample.get("slots_busy")
+        if not (isinstance(queue_total, int) and isinstance(lanes, int) and isinstance(busy, int)):
+            return
+        now = time.monotonic()
+        if queue_total > 0 and busy < lanes:
+            if self.queue_idle_since is None:
+                self.queue_idle_since = now
+                self.queue_idle_ticks = 0
+            self.queue_idle_ticks += 1
+            head_wait = sample.get("queue_head_waited_s")
+            long_idle = now - self.queue_idle_since > self.args.stall_seconds
+            head_stuck = (isinstance(head_wait, (int, float)) and head_wait > self.args.stall_seconds
+                          and self.queue_idle_ticks >= 2)
+            if (long_idle or head_stuck) and not self.queue_flagged:
+                self.queue_flagged = True
+                entry = {"id": None, "kind": "queue", "protocol": None,
+                         "phase": "server queue with an idle lane", "events": 0,
+                         "quiet_seconds": round(now - self.queue_idle_since, 2), "queue_total": queue_total,
+                         "lanes": lanes, "busy": busy, "head_waited_s": head_wait}
+                with self.lock:
+                    self.stalls.append(entry)
+                print(f"STALL server queue: {queue_total} queued, {busy}/{lanes} lanes busy, for "
+                      f"{entry['quiet_seconds']} s (head waited {head_wait})", flush=True)
+        else:
+            self.queue_idle_since, self.queue_idle_ticks, self.queue_flagged = None, 0, False
+
+    def sample_once(self) -> dict[str, Any]:
         sample: dict[str, Any] = {"t": round(time.monotonic() - self.t0, 2)}
         reached = 0
         load = self.get_json("/v1/load")
@@ -546,6 +629,9 @@ class Soak:
             requests = load.get("requests") or {}
             sample["queue"] = len(requests.get("queue") or [])
             sample["queue_total"] = requests.get("queue_total")
+            head = (requests.get("queue") or [None])[0]
+            if isinstance(head, dict):
+                sample["queue_head_waited_s"] = head.get("waited_s")
         status, body = self.get("/metrics")
         if status == 200:
             reached += 1
@@ -570,11 +656,27 @@ class Soak:
             print("server stopped answering /v1/load, /metrics and /slots; ending the run", flush=True)
             self.stop.set()
         print(json.dumps({k: v for k, v in sample.items() if k != "metrics"}), flush=True)
+        return sample
+
+    def guarded(self, step: Callable[[], Any]) -> Any:
+        """Run one sampler step; a bug or odd server answer becomes a recorded harness error, not a dead thread."""
+        try:
+            return step()
+        except Exception as error:  # noqa: BLE001
+            message = f"{type(error).__name__}: {error}"
+            self.harness_errors.append(message)
+            print(f"harness error in the sampler: {message}", flush=True)
+            return None
+
+    def tick(self) -> None:
+        sample = self.guarded(self.sample_once)
+        if sample is not None:
+            self.guarded(lambda: self.check_queue(sample))
+        self.guarded(lambda: self.check_stalls(None if sample is None else sample.get("queue_total")))
 
     def sampler(self) -> None:
         while not self.stop.wait(self.args.sample_seconds):
-            self.check_stalls()
-            self.sample_once()
+            self.tick()
 
     # -- the run ------------------------------------------------------------------------------
 
@@ -584,18 +686,23 @@ class Soak:
         started_wall = time.time()
         sampler = threading.Thread(target=self.sampler, daemon=True)
         sampler.start()
-        self.traffic()
-        # Drain: no new requests; the rest finish, or are cut after the grace period.
-        deadline = time.monotonic() + args.drain_seconds
-        while time.monotonic() < deadline and not self.server_lost:
-            with self.lock:
-                if all(r.done for r in self.requests):
-                    break
-            time.sleep(0.05)
+        try:
+            self.traffic()
+            # Drain: no new requests; the rest finish, or are cut after the grace period.
+            deadline = time.monotonic() + args.drain_seconds
+            while time.monotonic() < deadline and not self.server_lost and not self.queue_flagged:
+                with self.lock:
+                    if all(r.done for r in self.requests):
+                        break
+                time.sleep(0.05)
+        except KeyboardInterrupt:
+            self.interrupted = True
+            print("interrupted: cancelling what is in flight and writing a partial report", flush=True)
+        self.stop.set()
         with self.lock:
             leftover = [r for r in self.requests if not r.done]
         for req in leftover:
-            if not req.stalled:
+            if not req.stalled and not self.interrupted:
                 req.stalled = True
                 with self.lock:
                     self.stalls.append({"id": req.id, "kind": req.kind, "protocol": req.protocol,
@@ -607,9 +714,8 @@ class Soak:
                 if all(r.done for r in self.requests):
                     break
             time.sleep(0.05)
-        self.stop.set()
         sampler.join(timeout=args.sample_seconds + 5)
-        self.sample_once()
+        self.guarded(self.sample_once)
         return self.report(started_wall)
 
     def report(self, started_wall: float) -> dict[str, Any]:
@@ -645,19 +751,23 @@ class Soak:
                             f"(limit {args.rss_growth_mib})")
         if self.server_lost:
             findings.append("the server stopped answering")
+        if self.harness_errors:
+            findings.append(f"{len(self.harness_errors)} harness error(s) while sampling")
+        exit_code = EXIT_FINDINGS if findings else (EXIT_USAGE if self.interrupted else EXIT_CLEAN)
         return {
             "schema_version": SCHEMA_VERSION,
             "url": args.url, "model": self.model, "context": self.context, "seed": args.seed,
             "minutes": args.minutes, "started_unix": round(started_wall, 1),
             "duration_seconds": round(time.monotonic() - self.t0, 1),
-            "settings": {"kinds": list(args.kinds), "max_concurrency": args.max_concurrency,
+            "settings": {"kinds": list(args.kinds), "max_concurrency": args.max_concurrency, "lanes": self.lanes,
                          "stall_seconds": args.stall_seconds, "rss_growth_mib": args.rss_growth_mib,
                          "sample_seconds": args.sample_seconds, "max_request_mib": args.max_request_mib,
                          "images": len(self.images)},
             "requests": {"total": len(self.requests), "by_kind": by_kind},
             "failures": failures, "stalls": self.stalls, "rss": rss,
             "samples": self.samples,
-            "findings": findings, "exit_code": EXIT_FINDINGS if findings else EXIT_CLEAN,
+            "interrupted": self.interrupted, "harness_errors": self.harness_errors,
+            "findings": findings, "exit_code": exit_code,
         }
 
 
@@ -675,7 +785,7 @@ def load_images(directory: str) -> list[tuple[str, bytes]]:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
+    p = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0],
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--url", required=True, help="server base URL, e.g. http://127.0.0.1:8080")
     p.add_argument("--minutes", type=float, required=True, help="how long to send new requests")
@@ -688,7 +798,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                    help="fail when RSS grows by more than this over the last half of the run")
     p.add_argument("--stall-seconds", type=float, default=60.0, help="a stream with no event this long is stalled")
     p.add_argument("--sample-seconds", type=float, default=2.0)
-    p.add_argument("--max-concurrency", type=int, default=4, help="most requests in flight at once")
+    p.add_argument("--max-concurrency", type=int, default=None,
+                   help="most requests in flight at once (default: the server's lane count, from /slots)")
     p.add_argument("--max-request-mib", type=int, default=384,
                    help="the server's --max-request-mib; an 'oversize' body is one MiB above it")
     p.add_argument("--context", type=int, default=0, help="context tokens (default: n_ctx from /slots)")
@@ -705,7 +816,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if unknown or not kinds:
         p.error(f"--kinds: unknown {unknown or 'empty list'}; choose from {', '.join(KINDS)}")
     args.kinds = kinds
-    if args.minutes < 0 or args.stall_seconds <= 0 or args.sample_seconds <= 0 or args.max_concurrency < 1:
+    if args.minutes < 0 or args.stall_seconds <= 0 or args.sample_seconds <= 0 \
+            or (args.max_concurrency is not None and args.max_concurrency < 1):
         p.error("--minutes must be >= 0 and --stall-seconds, --sample-seconds, --max-concurrency positive")
     if args.drain_seconds is None:
         args.drain_seconds = args.stall_seconds + 30.0
@@ -717,8 +829,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None,
          rss_reader: Callable[[], float | None] | None = None) -> int:
-    """Run the soak; `rss_reader` replaces the --pid reader (the self-test injects a growing one)."""
+    """Run the soak and return its exit code; any unexpected exception is exit 2, never 1 (findings)."""
+    try:
+        return run_main(argv, rss_reader)
+    except KeyboardInterrupt:
+        print("interrupted before the soak had a report to write", file=sys.stderr)
+        return EXIT_USAGE
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        print("error: the soak harness itself failed; no verdict (exit 2)", file=sys.stderr)
+        return EXIT_USAGE
+
+
+def run_main(argv: Sequence[str] | None, rss_reader: Callable[[], float | None] | None) -> int:
     args = parse_args(argv)
+    try:   # fail now, not after the soak: the report is the point of the run
+        with open(args.out, "a"):
+            pass
+    except OSError as error:
+        print(f"error: --out {args.out} is not writable: {error}", file=sys.stderr)
+        return EXIT_USAGE
     note = ""
     if rss_reader is None:
         rss_reader, note = make_rss_reader(args.pid)
@@ -738,10 +868,15 @@ def main(argv: Sequence[str] | None = None,
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_USAGE
-    print(f"soaking {args.url} model={soak.model} context={soak.context} for {args.minutes} min "
-          f"seed={args.seed} kinds={','.join(args.kinds)}", flush=True)
+    print(f"soaking {args.url} model={soak.model} context={soak.context} lanes={soak.lanes} "
+          f"concurrency={args.max_concurrency} for {args.minutes} min seed={args.seed} "
+          f"kinds={','.join(args.kinds)}", flush=True)
     report = soak.run()
-    Path(args.out).write_text(json.dumps(report, indent=1) + "\n")
+    try:
+        Path(args.out).write_text(json.dumps(report, indent=1) + "\n")
+    except OSError as error:
+        print(f"error: cannot write {args.out}: {error}", file=sys.stderr)
+        return EXIT_USAGE
     print("== requests by kind and outcome:")
     for kind, outcomes in sorted(report["requests"]["by_kind"].items()):
         print(f"   {kind:9s} {outcomes}")
@@ -752,6 +887,8 @@ def main(argv: Sequence[str] | None = None,
           f"(limit {rss['limit_mib']})")
     if report["findings"]:
         print("SOAK FAILED: " + "; ".join(report["findings"]))
+    elif report["interrupted"]:
+        print("soak interrupted: the report is partial")
     else:
         print("soak clean")
     print(f"report: {args.out}")

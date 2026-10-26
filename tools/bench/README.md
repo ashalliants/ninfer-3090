@@ -528,13 +528,14 @@ that stops answering, and error paths that only break after hours. It is adapted
 | `cancel` | a stream dropped after 1 to 40 events, or 50 ms to 1.5 s after the send (often mid-prefill) | no error status; nothing else is asserted |
 | `near` | a prompt of context minus the reply and 256 tokens, sized with `/v1/messages/count_tokens` | 200 |
 | `over` | a prompt 2000 tokens beyond the context | 400 `context_length_exceeded` (Anthropic: 400 `invalid_request_error`) |
-| `oversize` | a body one MiB above `--max-request-mib` | 413; a reset while uploading is also accepted and counted as `ok_reset`, since the server answers before it reads the body |
+| `oversize` | a body one MiB above `--max-request-mib` | 413; a reset while uploading is also accepted and counted as `ok_reset`, since the server answers before it reads the body. `ok_reset` can mask a server that dies on the upload: watch for it in `by_kind` and in the sampler's `server_lost` finding |
 | `image` | base64 data-URL images from `--images DIR` in OpenAI `image_url` / Anthropic `image` parts | 200, or 400 `vision_disabled` from a server without `--vision`, which skips images for the rest of the run |
 
-The first requests are one of every enabled kind, then random picks with 1 to `--max-concurrency` (4) in
-flight. `near`, `over` and `oversize` are rationed (a few per ten minutes) because each costs a context-sized
-prefill or a body of hundreds of MiB (an `oversize` request holds about twice the limit in client memory
-for a moment). `--kinds chat,cancel` narrows the mix. The context is read from `/slots` (`n_ctx`); pass
+The first requests are one of every enabled kind, then random picks with 1 to `--max-concurrency` in
+flight; the default is the server's lane count (`len` of `/slots`), so nothing waits in the server's queue
+unless you raise it. `near`, `over` and `oversize` are rationed (a few per ten minutes) because each costs a context-sized
+prefill or a body of hundreds of MiB (the `oversize` body is streamed from one reused 1 MiB chunk, so the
+client holds about 1 MiB however large the limit). `--kinds chat,cancel` narrows the mix. The context is read from `/slots` (`n_ctx`); pass
 `--context` to override it.
 
 Every `--sample-seconds` (2) it reads `/v1/load` (queue depth), `/metrics` (the unlabelled `ninfer_*`
@@ -568,17 +569,45 @@ could not start (unreachable server, `/v1/models` refused, `--images` with no us
 
 - **Unexpected result:** a status or error code other than the table's, a stream that ends without its
   terminator, an error event inside a stream, or a transport error.
-- **Stall:** no SSE event for `--stall-seconds` (60), counted from the send until the first event and
-  after that from the previous one (a keep-alive comment does not count). The report gives the phase
-  (before the first event or mid-stream); the stalled request is cancelled so the run can end. A request
-  that is still running when the `--drain-seconds` grace period (stall plus 30 s) after the last launch
-  ends is reported the same way. A server with more concurrent long prefills than lanes can queue a
-  request past 60 s, so raise `--stall-seconds` or lower `--max-concurrency` rather than ignoring it.
+- **Stall:** no SSE event for `--stall-seconds` (60), counted from the end of the upload until the first event
+  and after that from the previous one (a keep-alive comment does not count). Time the server reports as
+  queued does not count: each sampler tick, of the requests still waiting for a first event, the newest
+  `requests.queue_total` from `/v1/load` (the server queues in arrival order, so the older ones hold lanes)
+  have their clock reset. A request that holds a lane and sends nothing for the limit is flagged with its
+  phase (before the first event or mid-stream) and cancelled so the run can end. A request still running
+  when the `--drain-seconds` grace period (stall plus 30 s) after the last launch ends is reported the same
+  way. With `--max-concurrency` above the lane count the extra requests queue; the queue credit covers them
+  only while `/v1/load` reports the queue.
+- **Idle lane with a queue:** `queue_total > 0` while some lane in `/slots` has `is_processing` false, for
+  `--stall-seconds`, or the queue head's `waited_s` is past that on two samples in a row with an idle lane
+  (one sample can fall between a lane finishing and the next admission). Reported once per episode as a
+  `stalls` entry with `kind: "queue"`.
 - **Memory growth:** the median of the last fifth of the second half of the run minus the median of its
   first fifth is above `--rss-growth-mib` (512). Fewer than 4 samples gives no verdict (the report says so).
 - **Server gone:** `/v1/load`, `/metrics` and `/slots` all fail 3 sampling rounds in a row.
+- **Harness error:** an exception in a sampler step is recorded in `harness_errors` and fails the run instead of
+  silently ending the sampling.
+
+Ctrl-C cancels what is in flight and writes a partial report (`"interrupted": true`, exit 2 unless it already
+holds findings). An unexpected exception in the harness exits 2, never 1. `--out` is checked for
+writability before the run starts.
 
 `python -I tools/bench/test_serve_soak.py` checks the tool against a fake server (a clean run, a stall, an
 unexpected 400 and 500, growing and flat memory, a vanished server) and runs as `ninfer_serve_soak_test`
 without a GPU. It says nothing about the real server: the first run against one is the check that the
 expected statuses above match what that build returns.
+
+
+The report (`--out`, `schema_version` 1) holds:
+
+| Field | Content |
+|---|---|
+| `url`, `model`, `context`, `seed`, `minutes`, `started_unix`, `duration_seconds` | what was run, and for how long |
+| `settings` | `kinds`, `max_concurrency`, `lanes`, `stall_seconds`, `rss_growth_mib`, `sample_seconds`, `max_request_mib`, `images` |
+| `requests` | `total`, and `by_kind`: for each kind a count per outcome (`ok`, `ok_reset`, `cancelled`, `skipped_no_vision`, `failed`) |
+| `failures` | one entry per failed request: `id`, `kind`, `protocol`, `status`, `code`, `events`, `expected`, `at_seconds`, `reason` |
+| `stalls` | stalled streams (`id`, `kind`, `protocol`, `phase`, `events`, `quiet_seconds`) and `kind: "queue"` entries (`queue_total`, `lanes`, `busy`, `head_waited_s`) |
+| `rss` | `sampled`, `samples`, `first_mib`, `last_mib`, `max_mib`, `growth_last_half_mib`, `limit_mib`, `flagged`, and a `note` when memory was not sampled |
+| `samples` | every tick: `t`, `queue`, `queue_total`, `queue_head_waited_s`, `slots`, `slots_busy`, `ctx_used`, `metrics` (unlabelled `ninfer_*`), `rss_mib`, `in_flight`, `requests`, `failed` |
+| `interrupted`, `harness_errors` | Ctrl-C and sampler bugs |
+| `findings`, `exit_code` | the reasons the run failed (empty when clean), and the process exit code |
