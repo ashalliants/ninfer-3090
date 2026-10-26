@@ -27,7 +27,8 @@ string (a log message that says "stderr") does not count. Known blind spot: a ra
 which nothing in src/ uses.
 
 Files: the C and C++ sources and headers (.c .cc .cpp .cxx .cu .cuh .h .hpp .hxx .inl) that git
-tracks under src/ (os.walk of src/ when the root is not a git checkout). Paths are repo-relative with
+tracks under src/ (os.walk of src/ when the root is not a git checkout, or when git cannot list
+it, with a note). Paths are repo-relative with
 forward slashes, sorted, so the result is the same on every platform. apps/, tests/ and bench/ print
 their results to stderr by design and are not checked.
 
@@ -35,7 +36,9 @@ usage:
   python tools/check_stderr_logging.py              check against tools/stderr_logging.allow
   python tools/check_stderr_logging.py --update     lower the allowlist to the current counts
   python tools/check_stderr_logging.py --counts     print the current counts in allowlist format
-Exit 0 when the ratchet holds, 1 when it is broken (or --update found a rise), 2 on bad input.
+Exit 0 when the ratchet holds, 1 when it is broken (or --update found a rise), 2 on bad input (no
+src/, a missing or malformed allowlist). A failure names each offending file with the lines of its
+uses.
 """
 
 from __future__ import annotations
@@ -135,13 +138,24 @@ def blank_comments_and_literals(text: str) -> str:
     return "".join(out)
 
 
+class BadInput(Exception):
+    """The allowlist or the tree cannot be read: exit 2, nothing was checked."""
+
+
+def use_lines(text: str) -> list[int]:
+    """The 1-based line of each use, in order."""
+    blanked = blank_comments_and_literals(text)
+    return [blanked.count("\n", 0, match.start()) + 1 for match in USE.finditer(blanked)]
+
+
 def count_uses(text: str) -> int:
-    return len(USE.findall(blank_comments_and_literals(text)))
+    return len(use_lines(text))
 
 
 def list_sources(root: Path) -> list[str]:
     """Repo-relative, forward-slash, sorted paths of the source files under src/."""
     paths: list[str] = []
+    listed = None
     if (root / ".git").exists():
         try:
             listed = subprocess.run(
@@ -149,7 +163,11 @@ def list_sources(root: Path) -> list[str]:
                 check=True, capture_output=True,
             ).stdout.decode("utf-8")
         except (OSError, subprocess.CalledProcessError) as error:
-            sys.exit(f"check_stderr_logging: git ls-files failed: {error}")
+            # No git on PATH, or a checkout git refuses (another owner): walk the tree instead,
+            # which also counts untracked files under src/.
+            print(f"check_stderr_logging: git ls-files failed ({error}); walking {SOURCE_DIR}/ instead",
+                  file=sys.stderr)
+    if listed is not None:
         paths = [p for p in listed.split("\0") if p]
     else:
         base = root / SOURCE_DIR
@@ -160,14 +178,15 @@ def list_sources(root: Path) -> list[str]:
     return sorted(p for p in paths if p.endswith(SUFFIXES) and (root / p).is_file())
 
 
-def count_tree(root: Path) -> dict[str, int]:
-    counts: dict[str, int] = {}
+def count_tree(root: Path) -> dict[str, list[int]]:
+    """{path: the lines of its uses} for every source file with at least one."""
+    uses: dict[str, list[int]] = {}
     for path in list_sources(root):
         text = (root / path).read_text(encoding="utf-8", errors="replace")
-        count = count_uses(text)
-        if count:
-            counts[path] = count
-    return counts
+        lines = use_lines(text)
+        if lines:
+            uses[path] = lines
+    return uses
 
 
 def read_allowlist(path: Path) -> tuple[list[str], dict[str, int]]:
@@ -175,7 +194,7 @@ def read_allowlist(path: Path) -> tuple[list[str], dict[str, int]]:
     header: list[str] = []
     entries: dict[str, int] = {}
     if not path.is_file():
-        sys.exit(f"check_stderr_logging: allowlist {path} is missing")
+        raise BadInput(f"allowlist {path} is missing")
     seen_entry = False
     for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.strip()
@@ -185,9 +204,9 @@ def read_allowlist(path: Path) -> tuple[list[str], dict[str, int]]:
             continue
         parts = line.split(None, 1)
         if len(parts) != 2 or not parts[0].isdigit() or int(parts[0]) < 1:
-            sys.exit(f"{path}:{number}: expected '<count> <path>' with a positive count, got {raw!r}")
+            raise BadInput(f"{path}:{number}: expected '<count> <path>' with a positive count, got {raw!r}")
         if parts[1] in entries:
-            sys.exit(f"{path}:{number}: {parts[1]} is listed twice")
+            raise BadInput(f"{path}:{number}: {parts[1]} is listed twice")
         seen_entry = True
         entries[parts[1]] = int(parts[0])
     return header, entries
@@ -197,16 +216,18 @@ def format_entries(counts: dict[str, int]) -> str:
     return "".join(f"{counts[path]} {path}\n" for path in sorted(counts))
 
 
-def compare(counts: dict[str, int], allowed: dict[str, int]) -> tuple[list[str], list[str]]:
-    """(failures, notes): a rise or a new file fails; a drop is only worth a note."""
+def compare(uses: dict[str, list[int]], allowed: dict[str, int]) -> tuple[list[str], list[str]]:
+    """(failures, notes): a rise or a new file fails, naming the lines; a drop is only worth a note."""
     failures: list[str] = []
     notes: list[str] = []
+    counts = {path: len(lines) for path, lines in uses.items()}
     for path in sorted(counts):
         have, count = allowed.get(path), counts[path]
+        where = "lines " + ", ".join(map(str, uses[path]))
         if have is None:
-            failures.append(f"{path}: names stderr {count} time(s) and is not in the allowlist")
+            failures.append(f"{path}: names stderr {count} time(s) and is not in the allowlist ({where})")
         elif count > have:
-            failures.append(f"{path}: names stderr {count} times, allowed {have}")
+            failures.append(f"{path}: names stderr {count} times, allowed {have} ({where})")
         elif count < have:
             notes.append(f"{path}: down to {count} (allowlist says {have})")
     for path in sorted(set(allowed) - set(counts)):
@@ -230,13 +251,18 @@ def main() -> int:
         return 2
     allow_path = args.allow if args.allow else root / "tools" / "stderr_logging.allow"
 
-    counts = count_tree(root)
+    uses = count_tree(root)
+    counts = {path: len(lines) for path, lines in uses.items()}
     if args.counts:
         sys.stdout.write(format_entries(counts))
         return 0
 
-    header, allowed = read_allowlist(allow_path)
-    failures, notes = compare(counts, allowed)
+    try:
+        header, allowed = read_allowlist(allow_path)
+    except BadInput as bad:
+        print(f"check_stderr_logging: {bad}", file=sys.stderr)
+        return 2
+    failures, notes = compare(uses, allowed)
     for failure in failures:
         print(f"stderr logging: {failure}", file=sys.stderr)
     if failures:

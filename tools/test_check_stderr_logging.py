@@ -1,8 +1,9 @@
 """Self-test of check_stderr_logging.py. Run: python -I tools/test_check_stderr_logging.py
 
 Builds temporary source trees (no git, so the tool walks src/) and checks the ratchet: a count that
-rises or a new file fails, a lower count passes and --update lowers the allowlist, and comments and
-string literals are not counted. Pure Python, no GPU.
+rises or a new file fails (naming the lines), a lower count passes and --update lowers the allowlist,
+comments and string literals are not counted, a bad allowlist exits 2, and a tree git cannot list is
+walked instead. Pure Python, no GPU.
 """
 import os
 import subprocess
@@ -88,7 +89,8 @@ with tempfile.TemporaryDirectory() as tmp:
     write(root, "src/core/b.cu", TWO)
     result = run(root)
     check("a rise fails", result.returncode == 1, result.stdout + result.stderr)
-    check("the rise is named", "src/core/b.cu: names stderr 2 times, allowed 1" in result.stderr, result.stderr)
+    check("the rise is named", "src/core/b.cu: names stderr 2 times, allowed 1 (lines 1, 1)" in result.stderr,
+          result.stderr)
     before = (root / "tools/stderr_logging.allow").read_text()
     result = run(root, "--update")
     check("--update refuses a rise", result.returncode == 1, result.stdout + result.stderr)
@@ -100,8 +102,8 @@ with tempfile.TemporaryDirectory() as tmp:
     write(root, "src/serve/new.cpp", ONE)
     result = run(root)
     check("a new file fails", result.returncode == 1, result.stdout + result.stderr)
-    check("the new file is named", "src/serve/new.cpp" in result.stderr and "not in the allowlist" in result.stderr,
-          result.stderr)
+    check("the new file is named", "src/serve/new.cpp: names stderr 1 time(s) and is not in the allowlist (lines 1)"
+          in result.stderr, result.stderr)
     (root / "src/serve/new.cpp").unlink()
     result = run(root)
     check("back to passing", result.returncode == 0, result.stdout + result.stderr)
@@ -128,7 +130,24 @@ with tempfile.TemporaryDirectory() as tmp:
     # An allowlist line that is not "<count> <path>" is refused.
     allow(root, "two src/core/a.cpp\n")
     result = run(root)
-    check("a malformed allowlist is refused", result.returncode == 1 and "expected '<count> <path>'" in result.stderr,
+    check("a malformed allowlist is refused with exit 2",
+          result.returncode == 2 and "expected '<count> <path>'" in result.stderr, result.stdout + result.stderr)
+    (root / "tools/stderr_logging.allow").unlink()
+    result = run(root)
+    check("a missing allowlist is refused with exit 2", result.returncode == 2 and "is missing" in result.stderr,
+          result.stdout + result.stderr)
+    allow(root, "1 src/core/a.cpp\n1 src/core/a.cpp\n")
+    check("a doubled entry is refused with exit 2", run(root).returncode == 2)
+
+# 3. Line numbers, and the walk when git cannot list the tree.
+check("use lines", tool.use_lines("int a;\nstd::cerr << 1; // stderr\n/* cerr */ perror(\"x\");\n") == [2, 3])
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    write(root, "src/a.cpp", ONE)
+    (root / ".git").write_text("gitdir: /nonexistent/elsewhere\n", encoding="utf-8")  # git refuses this
+    allow(root, "1 src/a.cpp\n")
+    result = run(root)
+    check("a failing git ls-files falls back to the walk", result.returncode == 0 and "walking src/" in result.stderr,
           result.stdout + result.stderr)
 
 if failures:

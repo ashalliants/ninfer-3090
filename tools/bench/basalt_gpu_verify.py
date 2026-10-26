@@ -97,7 +97,7 @@ def validate_config(config: dict, known_flags: set[str] | None = None) -> list[s
         seen.add(flag)
         if known_flags is not None and flag not in known_flags:
             problems.append(f"{where}: ninfer-serve does not parse this flag")
-        for key in ("task", "model", "kind", "summary", "tests"):
+        for key in ("item", "model", "kind", "summary", "tests"):
             if key not in option:
                 problems.append(f"{where}: missing {key!r}")
         if option.get("model") not in models:
@@ -206,6 +206,19 @@ def missing_inputs(ctx: Ctx, step: Step) -> list[str]:
 
 # --- running commands -------------------------------------------------------------------------------
 
+# The test-only side-stream delay (src/core/side_stream_delay.h). The identity gates set their own
+# (2 ms) when it is unset; a value inherited from the shell would replace it (0 turns the gates'
+# missing-join check off), and in a timing A/B any delay slows the arms. So no child inherits it.
+SIDE_STREAM_DELAY = "NINFER_TEST_SIDE_STREAM_DELAY_US"
+
+
+def child_env(env: dict[str, str] | None) -> dict[str, str]:
+    """os.environ with env on top, without the side-stream delay variable."""
+    merged = {**os.environ, **(env or {})}
+    merged.pop(SIDE_STREAM_DELAY, None)
+    return merged
+
+
 def run_logged(argv: list[str], log: Path, env: dict[str, str] | None = None, timeout: float | None = None,
                cwd: Path | None = None) -> tuple[int, str]:
     """Run argv to completion, keep its combined output in log, return (exit code, output)."""
@@ -214,7 +227,7 @@ def run_logged(argv: list[str], log: Path, env: dict[str, str] | None = None, ti
     started = time.monotonic()
     try:
         done = subprocess.run([str(a) for a in argv], capture_output=True, text=True, errors="replace",
-                              env={**os.environ, **(env or {})}, timeout=timeout, cwd=cwd)
+                              env=child_env(env), timeout=timeout, cwd=cwd)
         code, output = done.returncode, (done.stdout or "") + (done.stderr or "")
     except subprocess.TimeoutExpired as expired:
         code = -1
@@ -264,7 +277,7 @@ class Server:
         self.handle = open(log, "w", encoding="utf-8", errors="replace")
         print(f"    $ {quote(argv)}  (server, log {log})", flush=True)
         command = argv if isinstance(argv, str) else [str(a) for a in argv]
-        full_env = {**os.environ, **(env or {})}
+        full_env = child_env(env)
         if self.windows:
             self.proc = subprocess.Popen(command, stdout=self.handle, stderr=subprocess.STDOUT,
                                          stdin=subprocess.DEVNULL, env=full_env,
@@ -551,7 +564,7 @@ def run_kld_qwen35_step(ctx: Ctx, step: Step) -> dict:
     rows = compare_rows(other, out / "rows.tsv")
     detail = "rows identical at T = 1 and T = 3" if rows["identical"] else \
         f"{rows['differing']} of {rows['rows']} rows differ, max |dnll| {rows['max_abs_dnll']:.3g}, max |dkld| " \
-        f"{rows['max_abs_dkld']:.3g} (a different route per width; Task 2's provisional bound is mean " \
+        f"{rows['max_abs_dkld']:.3g} (a different route per width; X-A's provisional bound is mean " \
         "|dlogprob| <= 0.05)"
     return result("MEASURED", detail, report=report, rows=rows)
 
@@ -601,8 +614,9 @@ def engine_metric(workload: dict) -> str:
     return label + r"prefill [0-9.]+ s \(([0-9.]+) tok/s\)"
 
 
-JOB_LINE = re.compile(r"^(\S+?): \d+ prompt tokens, [^\n]*ids ([0-9a-f]{16})$", re.MULTILINE)
-SPEC_LINE = re.compile(r"^(\S+?): (mtp rounds [^\n]*)$", re.MULTILINE)
+# A job's label is its token file as given (@path), which may hold spaces.
+JOB_LINE = re.compile(r"^(.+?): \d+ prompt tokens, [^\n]*ids ([0-9a-f]{16})$", re.MULTILINE)
+SPEC_LINE = re.compile(r"^(.+?): (mtp rounds [^\n]*)$", re.MULTILINE)
 
 
 def job_name(label: str) -> str:
@@ -641,6 +655,9 @@ def run_ab_step(ctx: Ctx, step: Step) -> dict:
     workload = ctx.config["workloads"][d["workload"]]
     logs = log_dir(ctx, step)
     same_spec: bool | None = None
+    # The identity verdicts read every log under runs/: a rerun of the step (--resume after a
+    # failure) must not mix in the logs of an earlier attempt.
+    shutil.rmtree(logs / "runs", ignore_errors=True)
     if workload["tool"] == "engine-bench":
         ensure_inputs(ctx)
         command = ["{exe}", "ninfer_qwen4_exp_engine_real_test", *workload["args"],
@@ -788,7 +805,7 @@ def chat_prompt_lines() -> list[str]:
 
 
 def run_greedy_master_step(ctx: Ctx, step: Step) -> dict:
-    """One prompt of one configuration, so each lock hold is two CLI runs (Task 33's ledger note)."""
+    """One prompt of one configuration, so each GPU-lock hold is two CLI runs, not a whole prompt set."""
     d = step.data
     prompts = ctx.out / "inputs" / f"prompt-{d['prompt']}.jsonl"
     prompts.parent.mkdir(parents=True, exist_ok=True)
@@ -1138,7 +1155,7 @@ def build_steps(ctx: Ctx) -> list[Step]:
                           needs=["flash-next", "--kld-base-flash-next"], show=[kld_cmd(chunks, 3, [])],
                           run=run_kld_step, data={"name": base, "chunks": chunks, "window": 3, **gate}))
         if chunks == 20:
-            steps.append(Step("kld:off-20-w1", "hold", "the window check (Task 3): window 1 must give window 3's rows",
+            steps.append(Step("kld:off-20-w1", "hold", "the window check: window 1 must give window 3's rows",
                               needs=["flash-next", "--kld-base-flash-next"], show=[kld_cmd(20, 1, [])],
                               run=run_kld_step, data={"name": "off-20-w1", "chunks": 20, "window": 1,
                                                       "against": base, "expect": "identical"}))
@@ -1402,8 +1419,8 @@ def input_problems(ctx: Ctx) -> list[str]:
 
 def print_plan(ctx: Ctx, steps: list[Step]) -> int:
     config = ctx.config
-    print(f"Basalt GPU verification plan: {config['branch']} against {config['base']}, "
-          f"{len(config['options'])} options, {len(steps)} steps, results to {ctx.out}")
+    print(f"Basalt GPU verification plan (issue #383): {len(config['options'])} options, {len(steps)} steps, "
+          f"results to {ctx.out}")
     print(f"platform {'windows' if ctx.windows else 'linux'}, build dir {ctx.build}, A/B reps {ctx.args.reps}")
     problems = validate_config(config, serve_flags()) + input_problems(ctx)
     try:
@@ -1421,7 +1438,7 @@ def print_plan(ctx: Ctx, steps: list[Step]) -> int:
                 problems.append(f"{option['flag']}: identity harness {command[0]} is not a ctest name")
         ab = "; ".join(f"{v['workload']} A+[{shlex.join(v['a'])}] B+[{shlex.join(v['b'])}]"
                        for v in option.get("ab", []))
-        print(f"  {option['flag']:<24} T{option['task']:<3} {option['model']:<11} {option['kind']:<8} "
+        print(f"  {option['flag']:<24} {option['item']:<4} {option['model']:<11} {option['kind']:<8} "
               f"tests {len(matched)} ({len([n for n in matched if n in gpu])} gpu): {option['tests']}")
         print(f"  {'':<24} " + ("A/B: " + ab if ab else "no A/B: " + option["ab_reason"]))
         if option.get("kld"):
@@ -1439,7 +1456,7 @@ def print_plan(ctx: Ctx, steps: list[Step]) -> int:
             print(f"         {line}")
     print("\nThe ledger's checks:")
     for check in config["checks"]:
-        print(f"  {check['id']:<22} {('T' + str(check['task'])) if 'task' in check else '':<4} {check['about']}")
+        print(f"  {check['id']:<22} {check.get('item', ''):<4} {check['about']}")
     print()
     if problems:
         print(f"{len(problems)} problem(s):")
@@ -1482,7 +1499,7 @@ def write_summary(ctx: Ctx, steps: list[Step]) -> Path:
             kld = " / ".join(detail_of(f"kld:{name}-{c}") or status_of(f"kld:{name}-{c}") for c in (20, 100))
         ab = "; ".join(f"{status_of(ab_id(option, i))}: {detail_of(ab_id(option, i))}".rstrip(": ")
                        for i in range(len(option.get("ab", [])))) or f"none ({option['ab_reason'].split(';')[0]})"
-        lines.append(f"| `{option['flag']}` (T{option['task']}) | {option['kind']} | {tests} | {identity} | "
+        lines.append(f"| `{option['flag']}` ({option['item']}) | {option['kind']} | {tests} | {identity} | "
                      f"{kld} | {ab} |")
     lines += ["", "| Step | Status | Detail |", "|---|---|---|"]
     greedy: dict[str, list[tuple[int, dict | None]]] = {}

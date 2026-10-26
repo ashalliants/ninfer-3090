@@ -136,6 +136,20 @@ with tempfile.TemporaryDirectory() as tmp:
     check("no ids line exits 2", result.returncode == 2 and "build A" in result.stderr
           and "generated ids" in result.stderr, result.stdout + result.stderr)
 
+    # 4b. Both builds generating no token for a prompt compares nothing: exit 2, not identical.
+    a, b = pair("empty", {"beta": "short0"}, {"beta": "short0"})
+    result = run(a, b, prompts)
+    check("zero tokens on both sides exits 2", result.returncode == 2 and "neither build generated" in result.stderr
+          and "GREEDY IDENTICAL" not in result.stdout, result.stdout + result.stderr)
+
+    # 4c. A prompts file with a BOM (Windows PowerShell 5's Set-Content -Encoding utf8) is read.
+    bom = root / "bom.jsonl"
+    bom.write_text(json.dumps({"prompt": "alpha"}) + "\n", encoding="utf-8-sig")
+    a, b = pair("bom", {}, {})
+    result = run(a, b, bom)
+    check("a BOM prompts file is read", result.returncode == 0 and "(1 prompts, 7 tokens)" in result.stdout,
+          result.stdout + result.stderr)
+
     # 5. The flags reach both builds (the fakes exit 3 without them), so a missing --extra-args fails loudly.
     a, b = pair("flags", {}, {})
     result = subprocess.run([sys.executable, "-I", str(TOOL), "--a", str(a), "--b", str(b), "--model", "m.ninfer",

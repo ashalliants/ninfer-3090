@@ -274,6 +274,11 @@ with tempfile.TemporaryDirectory() as scratch:
           and r["ids_differ"] == ["ppl_tokens-chat.ids"], str(r))
     bench_log(same[2], ("4444444444444444", "2222222222222222"))
     check("the first (warm-up) job is hashed too", not v.engine_identity(same)["same_ids"])
+    spaced = root / "spaced.log"
+    spaced.write_text("@C:\\my fixtures\\warm up.ids: 1024 prompt tokens, 256 generated; wall 4.20 s, ids "
+                      "5555555555555555\n@C:\\my fixtures\\warm up.ids: mtp rounds 10, plain 0\n", encoding="utf-8")
+    r = v.engine_identity([spaced])
+    check("a job path with spaces is read", r["jobs"] == ["warm up.ids"] and r["same_ids"] and r["same_spec"], str(r))
     bench_log(same[2], ("1111111111111111", "2222222222222222"), accepted=(30, 29))
     r = v.engine_identity(same)
     check("a drafter that diverged with equal ids is caught", r["same_ids"] and r["same_spec"] is False, str(r))
@@ -327,6 +332,37 @@ with tempfile.TemporaryDirectory() as scratch:
     check("the combined step runs one A/B with the winners on", captured.get("a") == [] and
           captured.get("b") == ["--moe-fused-route"] and "1 option(s) on" in r["detail"], f"{captured} {r}")
     check("no winner, no combined run", v.combined_choice(ctx, by_id["combined:qwen38-27b"]) == ([], []))
+
+# No child inherits the side-stream delay (the gates set their own; timing A/Bs must run undelayed).
+saved_delay = os.environ.get(v.SIDE_STREAM_DELAY)
+os.environ[v.SIDE_STREAM_DELAY] = "0"
+try:
+    env = v.child_env({"NINFER_TEST_ARTIFACT": "m"})
+    check("the side-stream delay is not passed on", v.SIDE_STREAM_DELAY not in env
+          and env.get("NINFER_TEST_ARTIFACT") == "m", str(sorted(env)))
+    check("nor when a step sets it", v.SIDE_STREAM_DELAY not in v.child_env({v.SIDE_STREAM_DELAY: "5"}))
+finally:
+    if saved_delay is None:
+        os.environ.pop(v.SIDE_STREAM_DELAY, None)
+    else:
+        os.environ[v.SIDE_STREAM_DELAY] = saved_delay
+
+# An A/B rerun starts from an empty runs/ directory, so its identity verdict reads only its own logs.
+with tempfile.TemporaryDirectory() as scratch:
+    ctx = make_ctx(scratch, flash_next=str(Path(scratch) / "fn.ninfer"))
+    step = next(s for s in v.build_steps(ctx) if s.id.startswith("ab:--moe-fused-route"))
+    stale = v.log_dir(ctx, step) / "runs" / "old.log"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("stale\n", encoding="utf-8")
+    seen = {}
+    real_logged = v.run_logged
+    v.run_logged = lambda argv, log, **kw: (seen.update(stale=stale.exists()), (1, "stubbed"))[1]
+    try:
+        r = v.run_ab_step(ctx, step)
+    finally:
+        v.run_logged = real_logged
+    check("a rerun clears the previous attempt's run logs", seen.get("stale") is False and r["status"] == "FAIL",
+          f"{seen} {r}")
 
 # The partial-residency start: the cap warning is not a pin failure.
 warning = ("warning: --partial-ram-residency pins 30.1 GiB (...), above the 24.0 GiB (half the RAM less 8 GiB) "
