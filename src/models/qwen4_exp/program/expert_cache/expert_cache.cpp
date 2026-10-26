@@ -108,6 +108,7 @@ void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size
     out.misses.clear();
     out.admitted.clear();
     out.victims.clear();
+    gate_heap_built_ = false;
     ++now_;
     if (halving_period_ != 0 && now_ % halving_period_ == 0) {
         for (auto& c : count_) { c /= 2; }
@@ -173,36 +174,67 @@ void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size
         insert(k);
         out.admitted.push_back(k);
     }
-    for (const std::uint32_t key : refused_keys_) { refused_[key] = 0; }
-    refused_keys_.clear();
+    gate_heap_built_ = false;
+}
+
+void LfruPolicy::set_gate_classes(Classifier classify, std::uint32_t count) {
+    if (count == 0) { throw std::invalid_argument("LFRU: no gate classes"); }
+    classify_        = std::move(classify);
+    classes_         = classify_ ? count : 1;
+    gate_heap_built_ = false;
 }
 
 std::optional<std::uint32_t> LfruPolicy::evictable_victim(std::span<const std::uint32_t> protect, std::uint32_t newcomer,
                                                           const Admissible& gate) {
-    if (refused_.size() != count_.size()) { refused_.assign(count_.size(), 0); }
-    // Every resident's score as select_victims computes it (score()'s value), protected ones +infinity.
-    const std::size_t n = residents_.size();
-    scores_.resize(n);
-    const double next = static_cast<double>(now_) + 1.0;
-    for (std::size_t i = 0; i < n; ++i) { scores_[i] = resident_count_[i] / (next - resident_last_[i]); }
-    constexpr double kProtected = std::numeric_limits<double>::infinity();
-    for (std::uint32_t k : protect) {
-        if (slot_[k] != kNone) { scores_[slot_[k]] = kProtected; }
+    using Candidate = std::pair<double, std::uint32_t>;
+    const auto by_class = [&](std::uint32_t key) {
+        if (!classify_) { return 0U; }
+        const std::uint32_t c = classify_(key);
+        if (c >= classes_) { throw std::logic_error("LFRU: a gate class out of range"); }
+        return c;
+    };
+    if (!gate_heap_built_) {
+        // Every resident outside `protect` with score()'s value; the step's only score changes are
+        // the group's, which is protected, so one set of heaps serves the whole step.
+        mark_.resize(count_.size(), 0);
+        for (std::uint32_t k : protect) { mark_[k] = 1; }
+        gate_heaps_by_class_.resize(classes_);
+        for (auto& heap : gate_heaps_by_class_) { heap.clear(); }
+        class_refused_.assign(classes_, 0);
+        const double next = static_cast<double>(now_) + 1.0;
+        for (std::size_t i = 0; i < residents_.size(); ++i) {
+            const std::uint32_t key = residents_[i];
+            if (mark_[key]) { continue; }
+            gate_heaps_by_class_[by_class(key)].emplace_back(resident_count_[i] / (next - resident_last_[i]), key);
+        }
+        for (std::uint32_t k : protect) { mark_[k] = 0; }
+        for (auto& heap : gate_heaps_by_class_) { std::make_heap(heap.begin(), heap.end(), std::greater<Candidate>()); }
+        gate_heap_built_ = true;
+        ++gate_heaps_;
     }
     const double bar = score(newcomer);
     for (;;) {
-        double best          = kProtected;
-        std::uint32_t victim = kNone;
-        for (std::size_t i = 0; i < n; ++i) {
-            const std::uint32_t key = residents_[i];
-            if (refused_[key] || scores_[i] > best || (scores_[i] == best && key > victim)) { continue; }
-            best   = scores_[i];
-            victim = key;
+        // The lowest (score, key) top of the classes not refused (tops evicted this step dropped).
+        std::vector<Candidate>* best = nullptr;
+        for (std::uint32_t c = 0; c < classes_; ++c) {
+            auto& heap = gate_heaps_by_class_[c];
+            if (class_refused_[c]) { continue; }
+            while (!heap.empty() && !resident(heap.front().second)) {
+                std::pop_heap(heap.begin(), heap.end(), std::greater<Candidate>());
+                heap.pop_back();
+            }
+            if (!heap.empty() && (best == nullptr || heap.front() < best->front())) { best = &heap; }
         }
-        if (victim == kNone || best == kProtected || !(bar > best)) { return std::nullopt; }
-        if (gate(victim)) { return victim; }
-        refused_[victim] = 1;
-        refused_keys_.push_back(victim);
+        if (best == nullptr || !(bar > best->front().first)) { return std::nullopt; }
+        const std::uint32_t key = best->front().second;
+        std::pop_heap(best->begin(), best->end(), std::greater<Candidate>());
+        best->pop_back();
+        const std::uint32_t now_class = by_class(key); // it may have changed (a reclaimed copy)
+        if (class_refused_[now_class]) { continue; }
+        ++gate_calls_;
+        if (gate(key)) { return key; }
+        // Refused: with classes its whole class is refused for the step; without, only this key.
+        if (classify_) { class_refused_[now_class] = 1; }
     }
 }
 

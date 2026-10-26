@@ -278,6 +278,7 @@ void gate_keeps_admitting() {
     Residency r(kExperts, slots, strides);
     CacheController cache(kLayers * kExperts, kFrames, 0, 1);
     cache.set_writeback([&](std::uint32_t key) { return r.frame(key) >= 0 && !r.in_ram(key) && !r.writing_back(key); });
+    cache.set_gate_classes([&](std::uint32_t key) { return r.gate_class(key); }, r.gate_classes());
     std::vector<CacheController::Command> cmds;
     std::vector<std::uint32_t> placed;
     for (std::uint32_t l = 0; l < kLayers; ++l) {
@@ -343,6 +344,102 @@ void gate_keeps_admitting() {
     check(admitted_late > 0, "promotions continue to the end, past the spare slots' write-backs");
 }
 
+// The gated victim search at full size (48 layers x 512 experts, 10,000 frames, layer 0 cold, as after
+// a cold start): each step builds its candidate heaps once; a refusal refuses its whole gate class
+// (a layer's VRAM-only experts), so a step calls the gate at most `classes + victims` times and
+// searches a layer for a copy to reclaim at most `layers + victims` times, however many of a
+// blocked layer's VRAM-only experts outrank the others.
+void gate_work_bounded() {
+    using ninfer::models::qwen4_exp::expert_cache::CacheController;
+    using ninfer::models::qwen4_exp::expert_cache::LfruPolicy;
+    using ninfer::models::qwen4_exp::expert_cache::ResidencyEntry;
+    using ninfer::models::qwen4_exp::expert_cache::ResidencyState;
+    constexpr std::uint32_t kLayers = 48, kExperts = 512, kFrames = 10'000, kVram = 9'800, kSpares = 16;
+    std::vector<std::uint32_t> vram_per_layer(kLayers, 0), placed;
+    for (std::uint32_t e = 0; e < kExperts && placed.size() < kVram; ++e) {
+        for (std::uint32_t l = 0; l < kLayers && placed.size() < kVram; ++l) {
+            placed.push_back(l * kExperts + e);
+            ++vram_per_layer[l];
+        }
+    }
+    std::vector<std::uint32_t> slots(kLayers);
+    for (std::uint32_t l = 0; l < kLayers; ++l) { slots[l] = std::min(kExperts, kExperts - vram_per_layer[l] + kSpares); }
+    const std::vector<std::uint64_t> strides(kLayers, 256);
+    Residency r(kExperts, slots, strides);
+    CacheController cache(kLayers * kExperts, kFrames, 0, 1);
+    cache.set_writeback([&](std::uint32_t key) { return r.frame(key) >= 0 && !r.in_ram(key) && !r.writing_back(key); });
+    cache.set_gate_classes([&](std::uint32_t key) { return r.gate_class(key); }, r.gate_classes());
+    std::vector<CacheController::Command> cmds;
+    cache.seed(placed, {}, cmds);
+    for (const auto& c : cmds) {
+        if (c.kind == CacheController::Command::Kind::kCopy) { r.place_vram(c.key, c.frame); }
+    }
+    for (ExpertKey key = 0; key < kLayers * kExperts; ++key) {
+        if (r.frame(key) < 0) { r.place_ram(key); }
+    }
+    std::mt19937 rng(11);
+    std::uint64_t round = 0, steps = 0, victims_total = 0, max_gate_calls = 0, max_searches = 0;
+    bool searches_bounded = true, heaps_bounded = true, gate_calls_bounded = true;
+    std::vector<std::pair<ExpertKey, std::uint32_t>> pending;
+    for (int i = 0; i < 60; ++i) {
+        cmds.clear();
+        for (const auto& [key, frame] : pending) {
+            r.complete_writeback(key);
+            cache.complete_writeback(frame, cmds);
+        }
+        pending.clear();
+        for (std::uint32_t l = 1; l < kLayers; ++l) { // layer 0 is never routed (cold)
+            std::vector<std::uint32_t> group;
+            while (group.size() < 10) {
+                const std::uint32_t key = l * kExperts + static_cast<std::uint32_t>(rng() % kExperts);
+                if (std::find(group.begin(), group.end(), key) == group.end()) { group.push_back(key); }
+            }
+            const Residency::Score score = [&](std::uint32_t key) { return cache.policy().score(key); };
+            const LfruPolicy::Admissible gate = [&](std::uint32_t key) { return r.reserve_eviction(key, &score); };
+            const std::uint64_t calls = cache.policy().gate_calls(), heaps = cache.policy().gate_heaps();
+            const std::uint64_t searches = r.reclaim_searches();
+            const std::size_t first = cmds.size();
+            cache.on_route(group, ++round, cmds, 1, nullptr, &gate);
+            std::uint64_t victims = 0;
+            for (std::size_t c = first; c < cmds.size(); ++c) {
+                victims += cmds[c].kind == CacheController::Command::Kind::kWriteEntry &&
+                           ResidencyEntry::decode(cmds[c].word).state == ResidencyState::kAbsent;
+            }
+            const std::uint64_t step_searches = r.reclaim_searches() - searches;
+            searches_bounded &= step_searches <= kLayers + victims;
+            heaps_bounded &= cache.policy().gate_heaps() - heaps <= 1;
+            const std::uint64_t step_calls = cache.policy().gate_calls() - calls;
+            gate_calls_bounded &= step_calls <= r.gate_classes() + victims;
+            max_gate_calls = std::max(max_gate_calls, step_calls);
+            max_searches   = std::max(max_searches, step_searches);
+            victims_total += victims;
+            ++steps;
+        }
+        r.clear_reservations();
+        cache.on_quiescent(cmds);
+        for (const auto& c : cmds) {
+            if (c.kind == CacheController::Command::Kind::kWriteEntry &&
+                ResidencyEntry::decode(c.word).state == ResidencyState::kAbsent && r.frame(c.key) >= 0 &&
+                !r.writing_back(c.key)) {
+                if (r.evict(c.key)) { pending.emplace_back(c.key, c.frame); }
+            }
+        }
+        for (const auto& c : cmds) {
+            if (c.kind == CacheController::Command::Kind::kCopy && cache.complete_load(c.key, c.frame, c.serial)) {
+                r.publish(c.key, c.frame);
+            }
+        }
+    }
+    r.check();
+    std::printf("gate_work_bounded: %llu steps, %llu victims, at most %llu gate calls and %llu reclaim searches a step\n",
+                static_cast<unsigned long long>(steps), static_cast<unsigned long long>(victims_total),
+                static_cast<unsigned long long>(max_gate_calls), static_cast<unsigned long long>(max_searches));
+    check(victims_total > 0, "the full-size cache evicts");
+    check(searches_bounded, "a step searches layers for copies at most layers + victims times");
+    check(heaps_bounded, "a step builds its candidate heap at most once");
+    check(gate_calls_bounded, "a step calls the gate at most classes + victims times");
+}
+
 } // namespace
 
 int main() {
@@ -353,6 +450,7 @@ int main() {
     writeback_and_reclaim();
     swap_plan_invariant();
     gate_keeps_admitting();
+    gate_work_bounded();
     if (g_failures) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;
