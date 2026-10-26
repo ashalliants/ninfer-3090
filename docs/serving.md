@@ -87,6 +87,8 @@ leading dashes, so a setup can be kept in a file and started the same way each t
 - `api-key` is refused in the file: a secret belongs on the command line or in the launcher's
   environment, not in a file that is copied and shared. A file cannot name another (`config`), and
   one `--config` is accepted per command line.
+- The launchers' profiles are such files: `scripts/profiles/` (`profiles/` in a release archive);
+  [launcher profiles](maintainer/launcher-profiles.md) says what each holds.
 - A switch the file turns on can be turned off from the command line only where its `no-` flag
   exists (`--no-models-autoload` against `"models-autoload": true`). Where none exists, the attempt
   fails rather than leaving the switch on: `--no-vision` against `"vision": true` stops startup with

@@ -1,0 +1,6 @@
+{
+  "kv-dtype": "int8",
+  "prefill-chunk": 1024,
+  "max-pending-requests": 16,
+  "pending-timeout-ms": 600000
+}

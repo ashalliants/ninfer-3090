@@ -21,6 +21,9 @@
 *.bat text eol=crlf
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
+# The launcher profiles are read by run.sh and run.bat alike: LF on every checkout, so run.sh's line
+# reader never sees a stray CR (run.bat's for /f reads either).
+/scripts/profiles/*.json text eol=lf
 artifacts/grafts/*.bin filter=lfs diff=lfs merge=lfs -text
 # Golden GGML decoder fixtures are raw little-endian bytes; never convert line endings.
 /tests/fixtures/ggml/** binary
