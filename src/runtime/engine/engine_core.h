@@ -4282,16 +4282,22 @@ private:
                 std::unique_lock lock(hydration_mutex_);
                 const auto woken = [&] { return hydration_stop_ || !queue.empty(); };
                 // Idle with a spare read buffer: let it go once no read came for a while, freed
-                // before waiting on, outside the lock.
-                while (reads && !woken() && !hydration_spare_.empty()) {
-                    if (!hydration_cv_.wait_for(lock, kSpareReadBufferIdle, woken)) {
-                        std::vector<std::uint8_t> released = std::exchange(hydration_spare_, {});
-                        lock.unlock();
-                        released = {};
-                        lock.lock();
+                // before waiting on, outside the lock. A spare the worker hands back while this
+                // waits wakes it to start that timer.
+                for (;;) {
+                    while (reads && !woken() && !hydration_spare_.empty()) {
+                        if (!hydration_cv_.wait_for(lock, kSpareReadBufferIdle, woken)) {
+                            std::vector<std::uint8_t> released = std::exchange(hydration_spare_, {});
+                            lock.unlock();
+                            released = {};
+                            lock.lock();
+                        }
                     }
+                    if (woken()) { break; }
+                    hydration_cv_.wait(lock, [&] {
+                        return woken() || (reads && !hydration_spare_.empty());
+                    });
                 }
-                hydration_cv_.wait(lock, woken);
                 if (hydration_stop_) { return; }
                 task = std::move(queue.front());
                 queue.pop_front();
@@ -4472,6 +4478,7 @@ private:
         if (store_.store == nullptr) { return; }
         auto& program = *instance_.program;
         std::deque<HydrationTask> done;
+        bool recycled = false; // a buffer became the reader's spare: wake it (idle timer)
         {
             std::lock_guard lock(hydration_mutex_);
             if (program.has_context_transaction()) {
@@ -4482,6 +4489,7 @@ private:
                         if (it->bytes && it->bytes->capacity() <= kMaximumSpareReadBytes &&
                             it->bytes->capacity() > hydration_spare_.capacity()) {
                             std::swap(hydration_spare_, *it->bytes);
+                            recycled = true;
                         }
                         it = hydration_done_.erase(it);
                     } else {
@@ -4492,6 +4500,7 @@ private:
                 done.swap(hydration_done_);
             }
         }
+        if (recycled) { hydration_cv_.notify_all(); }
         // Whatever became of the reads, the largest buffer goes back to the reader for the next one:
         // a fresh one of a session's size is mostly page faults on the request's wait.
         struct Recycle {
@@ -4506,10 +4515,13 @@ private:
                     }
                 }
                 if (largest == nullptr) { return; }
-                std::lock_guard lock(core.hydration_mutex_);
-                if (largest->capacity() > core.hydration_spare_.capacity()) {
+                {
+                    std::lock_guard lock(core.hydration_mutex_);
+                    if (largest->capacity() <= core.hydration_spare_.capacity()) { return; }
                     std::swap(core.hydration_spare_, *largest);
                 }
+                // The reader may be waiting with no spare: wake it to start the idle timer.
+                core.hydration_cv_.notify_all();
             }
         } const recycle{*this, done};
         for (auto& task : done) {
