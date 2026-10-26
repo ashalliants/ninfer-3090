@@ -7,7 +7,9 @@
 //     64 or 3 slots (passes of 3 jobs), mixed, and staged under the zero-copy rule (a pass with at
 //     most 2 misses reads them from the host bank, the decode setting). Logits make a few experts hot, so each call holds
 //     wide experts at the route's boundaries (9 columns, exactly one 64-column tile, 65 = two tiles)
-//     beside narrow ones; at 2048 and 4096 nearly every expert is wide.
+//     beside narrow ones; at 2048 and 4096 nearly every expert is wide. Two staged placements read
+//     the non-resident records through a host slot table (MoeExpertSource::host_slots, partial RAM
+//     residency) from a reordered, poisoned pool.
 //   - FP64: a sample of entries per (format, T) against the expert oracle over the independently
 //     decoded record and the A8-cast activations (the narrow route's criterion).
 //   - With NINFER_TEST_ARTIFACT: 32 real experts of each expert bank at T in {64, 2048}.
@@ -182,14 +184,18 @@ struct Placement {
     int resident_every = 0; // 0: none resident; 1: all; n: every n-th
     int staging_slots  = 0;
     int zero_copy      = 0; // ops::MoeExpertSource::zero_copy_misses
+    // ops::MoeExpertSource::host_slots (partial RAM residency): the non-resident records in another,
+    // poisoned pool in reverse expert order, read through a device table of their addresses.
+    bool host_slots = false;
 };
 
 std::vector<Placement> placements(int columns) {
     std::vector<Placement> p = {{"device", 1, 0},         {"zero-copy", 0, 0},          {"staged-64", 0, 64},
                                 {"staged-3", 0, 3},        {"mixed-staged-4", 3, 4},     {"staged-3-zc-2", 0, 3, 2},
-                                {"mixed-staged-4-zc-2", 3, 4, 2}};
-    if (g_small) { return {p[0], p[3]}; }
-    if (columns >= 2048) { return {p[0], p[2], p[3], p[5]}; }
+                                {"mixed-staged-4-zc-2", 3, 4, 2}, {"slots-staged-3", 0, 3, 0, true},
+                                {"slots-mixed-staged-4-zc-2", 3, 4, 2, true}};
+    if (g_small) { return {p[0], p[3], p[8]}; }
+    if (columns >= 2048) { return {p[0], p[2], p[3], p[5], p[7]}; }
     return p;
 }
 
@@ -223,6 +229,23 @@ Run run_experts(const Bank& bank, const Placement& placement, const DeviceRoutin
     source.staging_base  = staging ? static_cast<std::uint8_t*>(staging->p) : nullptr;
     source.staging_slots = placement.staging_slots;
     source.zero_copy_misses = placement.zero_copy;
+    std::unique_ptr<Pinned> pool;
+    std::unique_ptr<DeviceBuffer> slot_table;
+    if (placement.host_slots) {
+        const std::size_t bytes = static_cast<std::size_t>(bank.experts) * bank.stride;
+        pool                    = std::make_unique<Pinned>(bytes);
+        std::memset(pool->host, 0xA5, bytes);
+        std::vector<const std::uint8_t*> slots(bank.experts, nullptr);
+        for (int e = 0; e < bank.experts; ++e) {
+            if (frames[e] >= 0) { continue; }
+            const std::size_t at = static_cast<std::size_t>(bank.experts - 1 - e) * bank.stride;
+            std::memcpy(pool->host + at, bank.pinned->host + static_cast<std::size_t>(e) * bank.stride, bank.stride);
+            slots[e] = pool->device + at;
+        }
+        slot_table = std::make_unique<DeviceBuffer>(slots.size() * sizeof(void*));
+        slot_table->copy_from_host(slots.data(), slots.size() * sizeof(void*));
+        ops::set_host_slots(source, static_cast<const std::uint8_t* const*>(slot_table->p));
+    }
     const Tensor x(x_dev.p, DType::BF16, {om::kHidden, columns});
     Tensor out(outputs.p, DType::BF16, {om::kHidden, k * columns});
     cudaEvent_t start = nullptr, stop = nullptr;

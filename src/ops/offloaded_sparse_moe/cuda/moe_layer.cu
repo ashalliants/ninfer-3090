@@ -59,7 +59,7 @@ constexpr int kXGroups    = moe::kHidden / canon::kA8Values;       // 80
 constexpr int kHGroups    = moe::kIntermediate / canon::kA8Values; // 20
 constexpr int kMaxDynamicSmem = 99 * 1024;
 
-// MoeExpertSource::precast_input and gate_up_variant lie in the padding after `format`: the kernels
+// MoeExpertSource::precast_input, gate_up_variant and host_slots lie in the padding after `format`: the kernels
 // taking the source by value keep their parameter layout.
 static_assert(offsetof(MoeExpertSource, frame_base) == sizeof(void*), "MoeExpertSource's layout changed");
 
@@ -127,6 +127,15 @@ __device__ __forceinline__ std::uint64_t frame_stride(const MoeExpertSource& sou
     return source.frame_stride != 0 ? source.frame_stride : source.record_stride;
 }
 
+// A non-resident expert's host record: its entry in the host slot table (MoeExpertSource::host_slots),
+// else its place in the mapped host bank. Only the stage kernel reads the table: a call with host
+// slots always stages (moe_experts refuses one without staging slots), so the expert kernels take
+// every record from job_records and are unchanged.
+__device__ __forceinline__ const std::uint8_t* host_record(const MoeExpertSource& source, int expert) {
+    return source.host_slots ? reinterpret_cast<const std::uint8_t* const*>(source.host_records)[expert]
+                             : source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride;
+}
+
 // A job's record: resolved by the stage kernel (job_records) when the call stages its misses, else
 // read where it lives, a device frame or the mapped host bank.
 __device__ __forceinline__ const std::uint8_t* job_record(const MoeExpertSource& source,
@@ -173,7 +182,7 @@ __global__ void __launch_bounds__(kThreads)
             } else if (source.staging_slots > 0) {
                 miss = true;
             } else {
-                record = source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride;
+                record = host_record(source, expert);
             }
         }
         const unsigned ballot = __ballot_sync(0xFFFFFFFFU, miss);
@@ -198,7 +207,7 @@ __global__ void __launch_bounds__(kThreads)
         if (blockIdx.x == 0) {
             for (int m = threadIdx.x; m < misses; m += blockDim.x) {
                 const int job    = miss_jobs[m];
-                job_records[job] = source.host_records + static_cast<std::uint64_t>(dispatch.jobs[job]) * source.record_stride;
+                job_records[job] = host_record(source, dispatch.jobs[job]);
             }
         }
         return;
@@ -210,7 +219,7 @@ __global__ void __launch_bounds__(kThreads)
         const int m = c / chunks, offset = (c % chunks) * kStageChunk;
         const int bytes  = min(kStageChunk, static_cast<int>(record_bytes) - offset);
         const int expert = dispatch.jobs[miss_jobs[m]];
-        const std::uint8_t* record = source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride;
+        const std::uint8_t* record = host_record(source, expert);
         const auto* src = reinterpret_cast<const uint4*>(record + offset);
         auto* dst = reinterpret_cast<uint4*>(source.staging_base + static_cast<std::uint64_t>(m) * source.record_stride + offset);
         const int vectors = bytes / 16;
@@ -1425,9 +1434,10 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                 source.record_stride >= geometry.bytes && source.record_stride % 16 == 0 &&
                 (source.frame_stride == 0 ||
                  (source.frame_stride >= source.record_stride && source.frame_stride % 16 == 0)) &&
-                reinterpret_cast<std::uintptr_t>(source.host_records) % 16 == 0 &&
+                reinterpret_cast<std::uintptr_t>(source.host_records) % (source.host_slots ? 8 : 16) == 0 &&
                 (source.frame_base == nullptr || reinterpret_cast<std::uintptr_t>(source.frame_base) % 16 == 0) &&
                 source.staging_slots >= 0 && (source.staging_slots == 0 || source.staging_base != nullptr) &&
+                (!source.host_slots || source.staging_slots > 0) &&
                 workspace != nullptr,
             "experts source is incomplete");
     // A caller's cast (`input`) takes the place of the precast planes.
