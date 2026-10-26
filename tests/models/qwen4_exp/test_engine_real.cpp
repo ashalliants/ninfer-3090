@@ -25,6 +25,15 @@
 //
 // --vision loads the artifact's vision tower (an Engine started with --vision; the jobs stay text).
 //
+// Flash-Next options, in their ninfer-serve spelling, so one build can be timed with an option off
+// and on (tools/bench/basalt_gpu_verify.py runs these A/Bs): --shared-expert-stream,
+// --mtp-constrained, --ngram-prefetch, --gdn-head-map, --moe-precast-input, --moe-gate-up-registers,
+// --moe-fused-route, --cpu-verify-misses, --gdn-async-commit, --hc-int8, --hc-fused-read,
+// --ngram-flag-wait, --partial-ram-residency, --ggml-decode-mma, and the valued --hot-embedding-rows N,
+// --cpu-verify-workers N, --prefill-cpu-share F (two decimals at most), --ngram-keepalive-ms N,
+// --expert-state FILE and --default-expert-state FILE. The Engine refuses a combination it cannot run,
+// as ninfer-serve does.
+//
 // --mtp K decodes with MTP speculation (the artifact must hold the drafter), verifying up to K
 // drafts per round (--mtp-fixed: always K; --mtp-joint-acceptance: Basalt's joint-acceptance window
 // over K drafts); each job also prints its acceptance.
@@ -153,6 +162,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -492,19 +502,81 @@ bool same(const char* label, const std::vector<TokenId>& reference, const std::v
     return false;
 }
 
+// The bench's on/off Flash-Next options (see the file comment), set on the Engine's options as
+// ninfer-serve sets them.
+struct BenchFlag {
+    const char* name;
+    void (*set)(EngineOptions&);
+};
+constexpr BenchFlag kBenchFlags[] = {
+    {"--shared-expert-stream", [](EngineOptions& o) { o.flash_next.shared_expert_stream = true; }},
+    {"--mtp-constrained", [](EngineOptions& o) { o.flash_next.mtp_constrained = true; }},
+    {"--ngram-prefetch", [](EngineOptions& o) { o.flash_next.ngram_prefetch = true; }},
+    {"--gdn-head-map", [](EngineOptions& o) { o.flash_next.gdn_head_map = true; }},
+    {"--moe-precast-input", [](EngineOptions& o) { o.flash_next.moe_precast_input = true; }},
+    {"--moe-gate-up-registers", [](EngineOptions& o) { o.flash_next.moe_gate_up_registers = true; }},
+    {"--moe-fused-route", [](EngineOptions& o) { o.flash_next.moe_fused_route = true; }},
+    {"--cpu-verify-misses", [](EngineOptions& o) { o.flash_next.cpu_verify_misses = true; }},
+    {"--gdn-async-commit", [](EngineOptions& o) { o.flash_next.gdn_async_commit = true; }},
+    {"--hc-int8", [](EngineOptions& o) { o.flash_next.hc_int8 = true; }},
+    {"--hc-fused-read", [](EngineOptions& o) { o.flash_next.hc_fused_read = true; }},
+    {"--ngram-flag-wait", [](EngineOptions& o) { o.flash_next.ngram_flag_wait = true; }},
+    {"--partial-ram-residency", [](EngineOptions& o) { o.flash_next.partial_ram_residency = true; }},
+    {"--ggml-decode-mma", [](EngineOptions& o) { o.flash_next.ggml_decode_mma = true; }},
+};
+
+// --prefill-cpu-share F: F in [0, 1] with at most two decimals, as the serve flag takes it.
+FlashNextOptions::Fraction parse_bench_share(const std::string& text) {
+    const std::size_t point = text.find('.');
+    const std::string whole = text.substr(0, point);
+    const std::string part  = point == std::string::npos ? std::string() : text.substr(point + 1);
+    const auto digits = [](const std::string& d) { return d.find_first_not_of("0123456789") == std::string::npos; };
+    if ((whole.empty() && part.empty()) || whole.size() > 1 || part.size() > 2 || !digits(whole) || !digits(part)) {
+        throw std::invalid_argument("--prefill-cpu-share takes a value in [0, 1] with at most two decimals: " + text);
+    }
+    const auto hundredths = static_cast<std::uint32_t>(std::stoul((whole.empty() ? "0" : whole) + (part + "00").substr(0, 2)));
+    if (hundredths > 100) { throw std::invalid_argument("--prefill-cpu-share must be at most 1: " + text); }
+    const std::uint32_t common = std::gcd(hundredths, 100U);
+    return {hundredths / common, 100 / common};
+}
+
 int bench(const std::string& artifact, const std::vector<std::string>& args) {
     std::uint32_t max_context = 33'792, tokens = 512, split = 0, mtp = 0, prefill_chunk = 1024;
     bool graph = true, state = true, print_ids = false, mtp_fixed = false, vision = false, joint = false;
     double width_cost = -1.0;
     std::optional<std::uint64_t> cache;
     std::vector<std::string> jobs;
+    std::vector<void (*)(EngineOptions&)> flags; // kBenchFlags given, applied after the defaults below
+    std::optional<std::uint32_t> hot_rows, workers, keepalive_ms;
+    std::optional<FlashNextOptions::Fraction> share;
+    std::optional<std::filesystem::path> state_path, default_state_path;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
         const auto value     = [&] {
             if (i + 1 >= args.size()) { throw std::invalid_argument(a + " needs a value"); }
             return std::stoull(args[++i]);
         };
-        if (a == "--max-context") {
+        const auto text = [&] {
+            if (i + 1 >= args.size()) { throw std::invalid_argument(a + " needs a value"); }
+            return args[++i];
+        };
+        const auto flag = std::find_if(std::begin(kBenchFlags), std::end(kBenchFlags),
+                                       [&](const BenchFlag& f) { return a == f.name; });
+        if (flag != std::end(kBenchFlags)) {
+            flags.push_back(flag->set);
+        } else if (a == "--hot-embedding-rows") {
+            hot_rows = static_cast<std::uint32_t>(value());
+        } else if (a == "--cpu-verify-workers") {
+            workers = static_cast<std::uint32_t>(value());
+        } else if (a == "--prefill-cpu-share") {
+            share = parse_bench_share(text());
+        } else if (a == "--ngram-keepalive-ms") {
+            keepalive_ms = static_cast<std::uint32_t>(value());
+        } else if (a == "--expert-state") {
+            state_path = text();
+        } else if (a == "--default-expert-state") {
+            default_state_path = text();
+        } else if (a == "--max-context") {
             max_context = static_cast<std::uint32_t>(value());
         } else if (a == "--generate") {
             tokens = static_cast<std::uint32_t>(value());
@@ -548,6 +620,13 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
         options.flash_next.mtp_joint_acceptance = joint;
         if (width_cost >= 0.0) { options.flash_next.mtp_width_cost = width_cost; }
     }
+    for (const auto set : flags) { set(options); }
+    if (hot_rows) { options.flash_next.hot_embedding_rows = *hot_rows; }
+    if (workers) { options.flash_next.cpu_verify_workers = *workers; }
+    if (share) { options.flash_next.prefill_cpu_share = *share; }
+    if (keepalive_ms) { options.flash_next.ngram_keepalive_ms = *keepalive_ms; }
+    if (state_path) { options.flash_next.expert_state_path = *state_path; }
+    if (default_state_path) { options.flash_next.default_expert_state_path = *default_state_path; }
     const auto load = std::chrono::steady_clock::now();
     Engine engine(options);
     std::printf("engine loaded in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - load).count());

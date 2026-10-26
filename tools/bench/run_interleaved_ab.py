@@ -39,11 +39,25 @@ Usage -- {exe} is substituted with each arm's executable in turn:
 Each --config and --control is 'label:command'. The label may not contain a colon; everything after
 the first colon is the command, split with shlex in POSIX mode so quoting behaves the same on both
 platforms.
+
+Same-build mode, for an option rather than a second build: leave out --arm-b and give --a-args and
+--b-args, which must differ. Arm A runs every command with --a-args appended, arm B with --b-args;
+the one executable stands in for {exe} in both. The interleaving, the order swap and the paired
+statistics are unchanged:
+
+    python tools/bench/run_interleaved_ab.py --arm-a build-ninja/tests/ninfer_tests.exe --reps 12 \\
+        --b-args="--moe-fused-route" \\
+        --config 'decode:{exe} ninfer_qwen4_exp_engine_real_test --bench --generate 256 @prompt.ids' \\
+        --metric-regex 'decode [0-9.]+ s \\(([0-9.]+) tok/s\\)'
+
+--log-dir DIR keeps each run's output as DIR/<label>-<arm>-rep<N>.log, and --json FILE writes the
+per-configuration result (pairs, median, min, max, positive pairs, every sample) for a script.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -138,8 +152,9 @@ def preflight(arm_a: Path, arm_b: Path) -> None:
 
 
 def run_once(config: Config, arm: str, exe: Path, rep: int, metric: re.Pattern[str],
-             timeout: float, echo: bool) -> Sample:
-    argv = [token.replace("{exe}", str(exe)) for token in config.argv_template]
+             timeout: float, echo: bool, extra: list[str] | None = None,
+             log_dir: Path | None = None) -> Sample:
+    argv = [token.replace("{exe}", str(exe)) for token in config.argv_template] + (extra or [])
     started = time.monotonic()
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
@@ -148,6 +163,10 @@ def run_once(config: Config, arm: str, exe: Path, rep: int, metric: re.Pattern[s
         return Sample(config.label, arm, rep, None, time.monotonic() - started, -1, "timeout")
     elapsed = time.monotonic() - started
     blob = (proc.stdout or "") + (proc.stderr or "")
+    if log_dir is not None:
+        log = log_dir / f"{config.label}-{arm}-rep{rep}.log"
+        log.write_text(f"$ {shlex.join(argv)}\n# exit {proc.returncode}, {elapsed:.1f} s\n{blob}",
+                       encoding="utf-8")
 
     if proc.returncode != 0:
         detail = f"exit {proc.returncode}"
@@ -182,6 +201,19 @@ def paired_ratios(config: Config) -> list[tuple[int, float]]:
         if "A" in pair and "B" in pair and pair["A"] > 0:
             ratios.append((rep, pair["B"] / pair["A"]))
     return ratios
+
+
+def summarize(config: Config) -> dict:
+    """The paired result of one configuration, for --json."""
+    values = [r for _, r in paired_ratios(config)]
+    result: dict = {"label": config.label, "control": config.is_control, "pairs": len(values),
+                    "samples": [{"arm": s.arm, "rep": s.rep, "value": s.value, "seconds": s.seconds,
+                                 "exit_code": s.exit_code, "detail": s.detail}
+                                for s in config.samples]}
+    if values:
+        result.update(median=statistics.median(values), min=min(values), max=max(values),
+                      positive=sum(1 for v in values if v > 1.0))
+    return result
 
 
 def report(configs: list[Config], control: Config | None) -> None:
@@ -233,7 +265,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--arm-a", type=Path, required=True, help="baseline executable")
-    parser.add_argument("--arm-b", type=Path, required=True, help="candidate executable")
+    parser.add_argument("--arm-b", type=Path, default=None,
+                        help="candidate executable; omitted, --arm-a runs as both arms (same-build "
+                             "mode, with --a-args and --b-args)")
+    parser.add_argument("--a-args", default="",
+                        help="arguments appended to every command of arm A, as one string "
+                             "(write --a-args=\"...\")")
+    parser.add_argument("--b-args", default="",
+                        help="arguments appended to every command of arm B, as one string")
+    parser.add_argument("--log-dir", type=Path, default=None,
+                        help="keep each run's output as DIR/<label>-<arm>-rep<N>.log")
+    parser.add_argument("--json", type=Path, default=None, help="write the results as JSON here")
     parser.add_argument("--reps", type=int, default=6,
                         help="repetitions; each one runs both arms of every configuration")
     parser.add_argument("--config", action="append", default=[], metavar="LABEL:COMMAND",
@@ -253,8 +295,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.reps < 2:
         parser.error("--reps must be at least 2; a single pair has no spread to report")
 
-    preflight(args.arm_a, args.arm_b)
+    a_extra = split_command(args.a_args) if args.a_args.strip() else []
+    b_extra = split_command(args.b_args) if args.b_args.strip() else []
+    if args.arm_b is None:
+        if not args.arm_a.is_file():
+            sys.exit(f"missing executable: {args.arm_a}")
+        if a_extra == b_extra:
+            parser.error("same-build mode (no --arm-b) needs --a-args and --b-args that differ")
+        arm_b = args.arm_a
+    else:
+        preflight(args.arm_a, args.arm_b)
+        arm_b = args.arm_b
     metric = re.compile(args.metric_regex)
+    if args.log_dir is not None:
+        args.log_dir.mkdir(parents=True, exist_ok=True)
 
     # parse_config raises ArgumentTypeError, which argparse only renders nicely when it is used as
     # a `type=`. These are parsed after the fact so a bad spec would otherwise land as a traceback.
@@ -265,8 +319,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(error))
     measured = configs + ([control] if control else [])
 
-    print(f"A = {args.arm_a}")
-    print(f"B = {args.arm_b}")
+    print(f"A = {args.arm_a}" + (f" + {shlex.join(a_extra)}" if a_extra else ""))
+    print(f"B = {arm_b}" + (f" + {shlex.join(b_extra)}" if b_extra else ""))
     print(f"{len(measured)} configuration(s) x {args.reps} repetitions x 2 arms = "
           f"{len(measured) * args.reps * 2} runs")
 
@@ -278,11 +332,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  rep {rep}/{args.reps} (order {order[0]}{order[1]})", flush=True)
         for config in measured:
             for arm in order:
-                exe = args.arm_a if arm == "A" else args.arm_b
+                exe = args.arm_a if arm == "A" else arm_b
                 config.samples.append(
-                    run_once(config, arm, exe, rep, metric, args.timeout, not args.quiet))
+                    run_once(config, arm, exe, rep, metric, args.timeout, not args.quiet,
+                             a_extra if arm == "A" else b_extra, args.log_dir))
 
     report(configs, control)
+    if args.json is not None:
+        args.json.write_text(json.dumps({"arm_a": str(args.arm_a), "arm_b": str(arm_b),
+                                         "a_args": a_extra, "b_args": b_extra, "reps": args.reps,
+                                         "configs": [summarize(c) for c in measured]}, indent=2),
+                             encoding="utf-8")
     # A comparison in which some run produced no number is not a comparison; make that an exit
     # code so a script driving this notices.
     return 1 if any(s.value is None for c in measured for s in c.samples) else 0

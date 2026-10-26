@@ -50,7 +50,7 @@
 // KLD mode (the decode-path quality gate against a llama.cpp base; docs/maintainer/flash-next-plan.md):
 //
 //   ninfer_qwen4_exp_forward_real_test --kld-base FILE [--chunks N] [--window T] [--tsv OUT.tsv]
-//       [--staging SLOTS] [--hc-int8]
+//       [--staging SLOTS] [--hc-int8] [--ggml-decode-mma]
 //
 // FILE is a `llama-perplexity --kl-divergence-base` file; its n_ctx-token chunks hold the tokens.
 // Each chunk (the first N, default all) is a fresh sequence: positions [0, n_ctx/2) are prefilled as
@@ -62,7 +62,9 @@
 // the rows go to OUT.tsv (default kld-rows.tsv) and the summary to stdout. Numerics options run
 // under the gate as flags: --hc-int8 makes the mixers' int8 copies once (ex::HcInt8Copies) and every
 // chunk's forward reads them (ForwardOptions::hc_int8) in its decode and verification calls; the
-// prompt half (more than 16 columns) reads the BF16 weights.
+// prompt half (more than 16 columns) reads the BF16 weights. --ggml-decode-mma runs the dense GGML
+// linears of the decode and verification calls (at most 8 columns) on the int8 tensor-core route
+// (ForwardOptions::ggml_decode_mma); the prompt half keeps the wide route either way.
 //
 // --hc-int8 prefill mode (ForwardOptions::hc_int8 leaves calls of more than 16 columns bit-exact):
 //
@@ -1137,10 +1139,15 @@ int kld_mode(int argc, char** argv, const char* artifact_env) {
     std::int32_t window = ppl::kDefaultDecodeWindow, staging_slots = 64;
     std::string tsv_path = "kld-rows.tsv";
     bool hc_int8         = false;
+    bool ggml_decode_mma = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--hc-int8") {
             hc_int8 = true;
+            continue;
+        }
+        if (arg == "--ggml-decode-mma") {
+            ggml_decode_mma = true;
             continue;
         }
         if (i + 1 >= argc) { throw std::invalid_argument(arg + " needs a value"); }
@@ -1170,7 +1177,7 @@ int kld_mode(int argc, char** argv, const char* artifact_env) {
     const std::int32_t first = static_cast<std::int32_t>(base.n_ctx / 2U) + 1; // the first target
     std::printf("KLD base %s: n_ctx %d, n_vocab %d, %d of %d chunks; window T = %d, staging slots %d%s\n",
                 base.path.string().c_str(), n_ctx, base.n_vocab, chunk_count, base.n_chunk, window, staging_slots,
-                hc_int8 ? "; --hc-int8" : "");
+                (std::string(hc_int8 ? "; --hc-int8" : "") + (ggml_decode_mma ? "; --ggml-decode-mma" : "")).c_str());
 
     print_memory("start");
     DeviceContext device(0);
@@ -1194,6 +1201,7 @@ int kld_mode(int argc, char** argv, const char* artifact_env) {
     // --hc-int8: the mixers' int8 copies, made once from the BF16 weights for every chunk's forward.
     std::unique_ptr<ex::HcInt8Copies> hc_int8_copies;
     ex::ForwardOptions options;
+    options.ggml_decode_mma = ggml_decode_mma;
     if (hc_int8) {
         auto mixers = ex::HcInt8Copies::mixers(parameters.layers, parameters.final_mixer,
                                                parameters.mtp ? &*parameters.mtp : nullptr);
