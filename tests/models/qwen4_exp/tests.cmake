@@ -130,6 +130,14 @@ add_test(NAME ninfer_qwen4_exp_mtp_constrained_test
   COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --mtp-constrained)
 set_tests_properties(ninfer_qwen4_exp_mtp_constrained_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# GPU, real artifact (skips otherwise): partial_ram_residency_matches_full, the engine test's
+# --partial-ram-exact mode. Greedy ids with --partial-ram-residency (RAM slots for the experts the
+# VRAM cache does not hold, write-backs before a frame is reused) on a small expert cache equal those
+# with every bank pinned, and at least one write-back ran.
+add_test(NAME ninfer_qwen4_exp_partial_ram_residency_test
+  COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --partial-ram-exact --expert-cache-mib 4096 --generate 256)
+set_tests_properties(ninfer_qwen4_exp_partial_ram_residency_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # GPU, real artifact (skips otherwise): hot_embedding_matches_plain, the engine test's
 # --hot-embedding-exact mode. Greedy ids with --hot-embedding-rows 8192 (the embedding's first rows in
 # VRAM, the rest read from pinned RAM) equal those with the whole table in VRAM.

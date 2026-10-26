@@ -30,13 +30,16 @@ using FrontendResources = qwen3_5::FrontendResources;
 
 // The routed experts of one MoE layer: the pinned host bank of ggml_expert_record_v1 records, read
 // by the GPU through `device_records` (the same memory, device-addressable) and by the CPU through
-// `host_records`. The MTP drafter's bank lives in device memory: `host_records` is null.
+// `host_records`. The MTP drafter's bank lives in device memory: `host_records` is null. With partial
+// RAM residency (plan_load with partial) the text banks are not loaded at all: both pointers are null
+// and the Program reads each record from the artifact at `artifact_offset` + e * record_stride.
 struct ExpertBank {
     QType format                        = QType::BF16; // a ggml_rec_*_q2_0 record format
     std::uint32_t experts               = 0;
     std::uint64_t record_stride         = 0;
     const std::uint8_t* host_records    = nullptr;
     const std::uint8_t* device_records  = nullptr;
+    std::uint64_t artifact_offset       = 0; // partial RAM residency: record 0's logical artifact offset
 };
 
 struct InstanceInfo {
@@ -64,7 +67,7 @@ public:
 private:
     explicit LoadPlan(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
-    friend LoadPlan plan_load(const artifact::Reader&, bool, bool, bool);
+    friend LoadPlan plan_load(const artifact::Reader&, bool, bool, bool, bool);
     friend class Model;
     friend std::unique_ptr<class Model> materialize_model(LoadPlan&&, DeviceContext&, const StartupObserver*);
 };
@@ -131,9 +134,12 @@ private:
 // binds the vision tower in the pinned block after the expert banks and the frontend's vision
 // resources (the artifact must hold the tower). With `hot_embedding` (--hot-embedding-rows) the token
 // embedding is bound in the pinned block (before the banks) instead of device memory; the Program
-// copies its hot rows to the device and the forward reads the rest through the mapped block.
+// copies its hot rows to the device and the forward reads the rest through the mapped block. With
+// `partial` (--partial-ram-residency) the text model's expert banks are neither pinned nor read: each
+// ExpertBank names its records' place in the artifact, and the Program reads them into its VRAM frames
+// and RAM slots.
 [[nodiscard]] LoadPlan plan_load(const artifact::Reader& reader, bool mtp = false, bool vision = false,
-                                 bool hot_embedding = false);
+                                 bool hot_embedding = false, bool partial = false);
 
 // Materializes a plan. Device memory is allocated before the pinned block.
 [[nodiscard]] std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,

@@ -19,8 +19,11 @@
 // binds (97, or 100 with the drafter), zero when off.
 // --ngram-flag-wait: the round graphs' wait counter is a named term (the flag and error word a
 // pinned one), zero when off; ngram_rows_in_graph's rule.
+// --partial-ram-residency: the residency term grows by the host slot table (8 bytes per expert),
+// zero when off; --vision and a KV base are refused naming the flag.
 
 #include "models/qwen4_exp/execution/forward.h"
+#include "models/qwen4_exp/program/expert_residency.h"
 #include "models/qwen4_exp/program/program.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/offloaded_sparse_moe.h"
@@ -550,6 +553,39 @@ int main() {
             with_flag.io              = 500;
             with_flag.ngram_flag_wait = 4;
             check(with_flag.fixed_bytes() == 504, "fixed_bytes counts the flag waits' counter");
+        }
+
+        {
+            q4::TextConfig moe = config();
+            moe.num_hidden_layers = 48;
+            moe.moe.experts       = 512;
+            moe.moe.top_k         = 10;
+            const std::uint64_t off_bytes = q4::ExpertResidency::table_bytes(moe, 4096);
+            check(q4::ExpertResidency::table_bytes(moe, 4096, true) - off_bytes == 48ULL * 512 * 8,
+                  "partial RAM residency's host slot table is 8 bytes per expert in the residency term");
+            check(off_bytes == (48ULL * 512 + 10ULL * 4096 * 48) * 4, "off, the residency term is unchanged");
+            q4::TextConfig shapes          = config();
+            shapes.vocab_size              = 248320;
+            shapes.max_position_embeddings = 262144;
+            q4::ProgramOptions partial;
+            partial.max_context           = 32768;
+            partial.partial_ram_residency = true;
+            const auto refuses = [&](const q4::ProgramOptions& o, const char* flag) {
+                try {
+                    (void)q4::Program::plan_device(o, shapes, 248077, {});
+                } catch (const std::invalid_argument& error) {
+                    return std::string(error.what()).find(flag) != std::string::npos;
+                } catch (const std::exception&) {
+                }
+                return false;
+            };
+            q4::ProgramOptions images = partial;
+            images.vision             = true;
+            check(refuses(images, "--partial-ram-residency") && refuses(images, "--vision"),
+                  "--partial-ram-residency with --vision is refused naming both");
+            q4::ProgramOptions base = partial;
+            base.kv_base_tokens     = 4096;
+            check(refuses(base, "--partial-ram-residency"), "--partial-ram-residency with a KV base is refused");
         }
 
         hc_int8_plan_bytes();
