@@ -153,6 +153,13 @@ public:
         std::uint64_t loads             = 0;
         std::uint64_t load_misses       = 0;
         std::uint64_t corrupt_removed   = 0;
+        // corrupt_removed by what was found: a chunk missing at start-up (no bucket to fetch it
+        // from), a manifest that does not parse or does not describe its image, a chunk whose bytes
+        // do not match (no bucket to repair it), or the bucket's copy missing or damaged too.
+        std::uint64_t corrupt_startup   = 0;
+        std::uint64_t corrupt_manifest  = 0;
+        std::uint64_t corrupt_chunk     = 0;
+        std::uint64_t corrupt_remote    = 0;
         std::uint64_t evicted_for_space = 0;
         std::uint64_t expired           = 0;
         std::uint64_t superseded        = 0;
@@ -165,6 +172,14 @@ public:
         std::uint64_t remote_downloads       = 0;
         std::uint64_t remote_download_bytes  = 0;
         std::uint64_t remote_download_failures = 0;
+        // remote_download_failures by cause: a transfer that threw, an object the bucket did not
+        // have, one whose bytes did not match, a chunk that could not be installed here (a full
+        // disk), and a listing, or a manifest read of one, that failed.
+        std::uint64_t remote_download_failures_transfer = 0;
+        std::uint64_t remote_download_failures_missing  = 0;
+        std::uint64_t remote_download_failures_damaged  = 0;
+        std::uint64_t remote_download_failures_install  = 0;
+        std::uint64_t remote_download_failures_listing  = 0;
         std::uint64_t remote_refreshes       = 0;
         // Manifests a refresh downloaded to register images (not counted in remote_downloads).
         std::uint64_t remote_manifest_downloads      = 0;
@@ -202,16 +217,28 @@ public:
     // downloaded, verified and installed (what a waiting request waits for), not the local read
     // and reassembly that follow. Bytes are the chunks' raw length (as Info::fetch_bytes), not
     // what crossed the network, which is smaller for compressed chunks.
+    // `expired`: the fetch stopped at `deadline` (a miss, but the image is not damaged: the chunks
+    // fetched so far stay, and a later load fetches the rest).
     struct LoadReport {
         std::uint64_t fetched_bytes = 0;
         std::uint64_t fetch_ns      = 0;
+        bool expired                = false;
     };
-    [[nodiscard]] std::optional<std::vector<std::uint8_t>> load(const std::string& id,
-                                                                bool touch          = true,
-                                                                LoadReport* report = nullptr);
+    // `deadline` bounds the download from the bucket: no chunk is started after it.
+    [[nodiscard]] std::optional<std::vector<std::uint8_t>>
+    load(const std::string& id, bool touch = true, LoadReport* report = nullptr,
+         std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max());
 
     [[nodiscard]] std::vector<Info> list() const;
     [[nodiscard]] std::optional<Info> find(const std::string& id) const;
+    // For lookups that run often against a large index (one per request): calls `visit` for every
+    // checkpoint key that `match` accepts, with its image's Info as list() reports it, without
+    // copying or sorting the index. `match` sees the Info without `local` and `fetch_bytes`, which
+    // are worked out only for the images it accepts. Both run under the index lock, so they must
+    // be quick and must not call the store.
+    using CheckpointMatch = std::function<bool(const Info&, const CheckpointKey&)>;
+    using CheckpointVisit = std::function<void(const Info&, const CheckpointKey&)>;
+    void for_each_checkpoint(const CheckpointMatch& match, const CheckpointVisit& visit) const;
     bool erase(const std::string& id);
     void touch(const std::string& id);
 
@@ -230,11 +257,19 @@ public:
     // incomplete listing never removes anything from the index.
     std::size_t refresh_remote(std::chrono::steady_clock::time_point deadline =
                                    std::chrono::steady_clock::time_point::max());
-    // The same, for a caller that needs the bucket as of `asked` (a request that found nothing):
-    // skipped when a complete listing taken at or after `asked` exists, as when one ran while this
-    // waited, so requests arriving together list the bucket once. Refreshes never run two at a time.
-    std::size_t refresh_remote_since(std::chrono::steady_clock::time_point asked,
-                                     std::chrono::steady_clock::time_point deadline);
+    // For a request that found nothing: registers only the images the bucket lists, as of `asked`
+    // or later, whose ids `wanted` accepts, and leaves every other new image to the background
+    // refresh, so a lookup costs a listing and the manifests it is after, not every manifest
+    // uploaded since the last refresh. The listing is shared: one taken (or started) at or after
+    // `asked` serves it, so requests arriving together, and a refresh running meanwhile, list the
+    // bucket once. Gives up at `deadline`. Never removes anything from the index.
+    struct LookupResult {
+        std::size_t registered = 0; // wanted images this lookup added to the index
+        std::size_t held       = 0; // wanted images listed that the index holds now
+    };
+    LookupResult lookup_remote(std::chrono::steady_clock::time_point asked,
+                               std::chrono::steady_clock::time_point deadline,
+                               const std::function<bool(const std::string& id)>& wanted);
     // With a remote: fetches the image's missing chunks in the background so a later load() is
     // local. False when there is nothing to do.
     bool prefetch(const std::string& id);
@@ -417,11 +452,13 @@ private:
     // Drops confirmations, touches and quarantines older than remote_touch_interval: none is
     // trusted any longer, so keeping them would only grow with every chunk ever uploaded.
     void prune_remote_state();
-    enum class FetchStatus : std::uint8_t { Complete, Transient, Corrupt };
+    // Expired: stopped at the deadline, a miss like Transient.
+    enum class FetchStatus : std::uint8_t { Complete, Transient, Corrupt, Expired };
     // `generation` receives the generation of the entry the fetch worked from.
-    // `fetched` (optional) accumulates the bytes downloaded.
-    [[nodiscard]] FetchStatus fetch_image_chunks(const std::string& id, std::uint64_t& generation,
-                                                 std::uint64_t* fetched = nullptr);
+    // `fetched` (optional) accumulates the bytes downloaded. No chunk is started after `deadline`.
+    [[nodiscard]] FetchStatus fetch_image_chunks(
+        const std::string& id, std::uint64_t& generation, std::uint64_t* fetched = nullptr,
+        std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max());
     // A fetch of `generation` found the image damaged or gone in the bucket: drop it and do not
     // offer it again, unless the entry has been replaced since.
     void settle_failed_fetch(const std::string& id, std::uint64_t generation);
@@ -464,11 +501,33 @@ private:
     std::unordered_map<std::string, RemoteFailure> remote_failed_;
     // Superseded manifests whose deletion from the bucket failed: retried after the next upload.
     std::vector<std::string> retire_backlog_;
-    // Serializes refreshes; `last_refresh_` is when the last complete one took its listing. Timed, so a
-    // request waiting for a listing gives up at its deadline rather than behind a slow refresh.
+    // Serializes refreshes. Timed, so a caller with a deadline gives up at it rather than behind a
+    // slow refresh.
     std::timed_mutex refresh_mutex_;
-    std::chrono::steady_clock::time_point last_refresh_{};
     std::size_t refresh_remote_locked(std::chrono::steady_clock::time_point deadline);
+    // The manifests the bucket listed, and when the listing was asked for (it shows the bucket as
+    // it was then, not when it ended).
+    struct Listing {
+        std::chrono::steady_clock::time_point listed_at{};
+        std::vector<ObjectInfo> objects;
+    };
+    // A listing asked for at or after `asked`: the newest one taken, one in progress that started
+    // after `asked` (waited for), or a new one. Nullptr when none is ready by `deadline`; throws
+    // what the bucket throws.
+    [[nodiscard]] std::shared_ptr<const Listing>
+    listing_since(std::chrono::steady_clock::time_point asked,
+                  std::chrono::steady_clock::time_point deadline);
+    std::mutex listing_mutex_;
+    std::condition_variable listing_cv_;
+    std::shared_ptr<const Listing> latest_listing_;
+    // When the newest listing in progress was asked for (nullopt: none is).
+    std::optional<std::chrono::steady_clock::time_point> listing_started_;
+    // The image id a listed manifest key names (empty when it names none).
+    [[nodiscard]] std::string listed_id(const std::string& key) const;
+    // Downloads a manifest that a listing asked for at `listed_at` showed and adds its image to the
+    // index, unless the index holds it or the id is given up on. True when it was added.
+    bool register_remote_image(const ObjectInfo& object, const std::string& id,
+                               std::chrono::steady_clock::time_point listed_at);
     std::int64_t last_prune_ms_ = 0; // remote worker thread only
 
     // Peer import. `owner_` holds the exclusive lock on options_.directory for the store's life.

@@ -1030,8 +1030,11 @@ public:
     }
     [[nodiscard]] std::optional<ImportedCheckpoints>
     import_checkpoints(std::span<const std::uint8_t>, std::string_view) {
+        if (import_throws) { throw std::runtime_error("the fake import failed"); }
         return std::nullopt;
     }
+    // Set by a test: import_checkpoints throws, as a failure the Engine did not foresee would.
+    std::atomic<bool> import_throws{false};
 
 private:
     static constexpr std::uint32_t kSharedBase = 1'000'000;

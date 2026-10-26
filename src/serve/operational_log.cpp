@@ -454,6 +454,20 @@ void OperationalLog::context_store_write(const ninfer::ContextStoreWriteEvent& e
     write({.severity = OperationalSeverity::Info, .message = out.str()});
 }
 
+void OperationalLog::context_store_hydration_failure(
+    const ninfer::ContextStoreHydrationEvent& event) const {
+    std::ostringstream out;
+    out << "context store hydration failed | " << event.id << " | "
+        << ninfer::context_store_hydration_failure_name(event.reason) << " | "
+        << product::format_pretty_bytes(event.bytes);
+    if (event.fetch_bytes != 0) {
+        out << " (" << product::format_pretty_bytes(event.fetch_bytes) << " from the bucket)";
+    }
+    out << " | resume at " << event.frontier << " tokens | waited " << std::fixed
+        << std::setprecision(0) << event.wait_seconds * 1000.0 << " ms";
+    write({.severity = OperationalSeverity::Warning, .message = out.str()});
+}
+
 void OperationalLog::request_start(const RequestLogContext& context) const {
     write(render_request_start(context));
 }

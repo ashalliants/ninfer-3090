@@ -192,15 +192,26 @@ void test_corruption_is_a_miss_and_removed() {
         check(!store.load("c0ffee").has_value(), "a damaged chunk was served");
         check(!store.find("c0ffee").has_value(), "a damaged image stayed listed");
         check(store.stats().corrupt_removed == 1, "a damaged image was not counted");
+        check(store.stats().corrupt_chunk == 1 && store.stats().corrupt_manifest == 0,
+              "a damaged chunk was not counted as one");
 
         // A truncated manifest is dropped at start-up and its chunks are swept.
         (void)store.put(describe("beef"), image, std::array{ContextStore::Region{64, 3000}});
         const fs::path manifest = directory.path() / "manifests" / "beef.manifest";
         fs::resize_file(manifest, fs::file_size(manifest) / 2);
     } // the first store is closed: a directory has one owner
-    ContextStore reopened(options_for(directory.path()));
-    check(reopened.list().empty() && chunk_files(directory.path()).empty(),
-          "a truncated manifest was kept or left chunks behind");
+    {
+        ContextStore reopened(options_for(directory.path()));
+        check(reopened.list().empty() && chunk_files(directory.path()).empty(),
+              "a truncated manifest was kept or left chunks behind");
+        (void)reopened.put(describe("cafe"), image, std::array{ContextStore::Region{64, 3000}});
+    }
+    // A chunk lost while the store was closed: without a bucket the image can never be read.
+    fs::remove(chunk_files(directory.path()).front());
+    ContextStore restarted(options_for(directory.path()));
+    check(!restarted.find("cafe") && restarted.stats().corrupt_removed == 1 &&
+              restarted.stats().corrupt_startup == 1,
+          "an image missing a chunk at start-up was not removed as such");
 }
 
 void test_space_limit_evicts_least_recently_used() {
@@ -438,12 +449,16 @@ public:
     int chunk_gets     = 0;
     int manifest_gets  = 0;
     std::atomic<int> lists{0};
+    // Calls waiting while `hold` is set.
+    std::atomic<int> waiting{0};
 
 private:
     void gate() {
         std::unique_lock lock(gate_mutex);
         const std::uint64_t epoch = interrupt_epoch;
+        ++waiting;
         gate_cv.wait(lock, [&] { return !hold || interrupt_epoch != epoch; });
+        --waiting;
         if (interrupt_epoch != epoch) { throw std::runtime_error("interrupted"); }
     }
     std::mutex gate_mutex;
@@ -627,9 +642,59 @@ void test_regions_are_chunked_from_their_own_start() {
           "states that moved were written again");
 }
 
-// An image only the bucket holds reports the bytes a load would download; a refresh asked for
-// by a request lists the bucket once however many ask together.
-void test_fetch_bytes_and_refresh_on_demand() {
+// An image only the bucket holds reports the bytes a load would download. A lookup asked for by a
+// request reads the manifests it wants and leaves the rest to the background refresh, and requests
+// asking together share one listing.
+void test_fetch_bytes_and_lookup_on_demand() {
+    TempDirectory directory;
+    TempDirectory other_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other), "the start-up refresh did not finish");
+    {
+        ContextStore store(remote_options(directory.path(), remote));
+        (void)store.put(describe("0a"), concat({pseudo_random(30, 1), pseudo_random(3000, 2)}),
+                        std::array{ContextStore::Region{30, 3000}});
+        for (const char* unrelated : {"0b", "0c", "0d"}) {
+            (void)store.put(describe(unrelated), concat({pseudo_random(30, 3), pseudo_random(3000, 4)}),
+                            std::array{ContextStore::Region{30, 3000}});
+        }
+        check(drained(store), "upload");
+    }
+    const auto deadline   = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    const auto asked      = std::chrono::steady_clock::now();
+    const auto only_0a    = [](const std::string& id) { return id == "0a"; };
+    const int lists       = remote->lists;
+    const int manifests   = remote->manifest_gets;
+    const auto found      = other.lookup_remote(asked, deadline, only_0a);
+    check(found.registered == 1 && found.held == 1 && other.find("0a"),
+          "a lookup did not register the image it wanted");
+    check(remote->manifest_gets == manifests + 1 && !other.find("0b") && !other.find("0c"),
+          "a lookup read the manifests of images it did not want");
+    // Asked before that listing was taken: it already shows the bucket as of then.
+    const auto again = other.lookup_remote(asked, deadline, only_0a);
+    check(again.registered == 0 && again.held == 1 && remote->lists == lists + 1,
+          "a request asking before a listing listed the bucket again");
+    // Asked after it: a listing taken earlier may miss what was uploaded since, so it lists again.
+    (void)other.lookup_remote(std::chrono::steady_clock::now(), deadline, only_0a);
+    check(remote->lists == lists + 2, "a request asking after the last listing was not given a new one");
+    // Nothing wanted is listed: nothing is read, and the request learns it at once.
+    const auto none = other.lookup_remote(std::chrono::steady_clock::now(), deadline,
+                                          [](const std::string& id) { return id == "ff"; });
+    check(none.registered == 0 && none.held == 0 && remote->manifest_gets == manifests + 1,
+          "a lookup that wanted nothing listed read a manifest");
+    // The refresh registers what the lookups left.
+    check(other.refresh_remote() == 3 && other.list().size() == 4, "the refresh did not register the rest");
+    const auto info = other.find("0a");
+    check(info && !info->local && info->fetch_bytes == 3000, "the bytes to fetch were not reported");
+    (void)other.load("0a");
+    check(other.find("0a")->fetch_bytes == 0 && other.find("0a")->local, "a fetched image still has bytes to fetch");
+}
+
+// A lookup that arrives while a listing it can use is in progress (a refresh's, or another
+// request's) waits for that listing instead of listing the bucket a second time, and does not wait
+// for the manifests the refresh then reads.
+void test_a_lookup_shares_a_listing_in_progress() {
     TempDirectory directory;
     TempDirectory other_directory;
     auto remote = std::make_shared<MemoryObjectStore>();
@@ -641,22 +706,90 @@ void test_fetch_bytes_and_refresh_on_demand() {
                         std::array{ContextStore::Region{30, 3000}});
         check(drained(store), "upload");
     }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    const auto asked    = std::chrono::steady_clock::now();
-    const int lists     = remote->lists;
-    check(other.refresh_remote_since(asked, deadline) == 1,
-          "a refresh on demand did not register the image");
-    // Asked before that listing was taken: it already shows the bucket as of then.
-    check(other.refresh_remote_since(asked, deadline) == 0 && remote->lists == lists + 1,
-          "a request asking before a complete listing listed the bucket again");
-    // Asked after it: a listing taken earlier may miss what was uploaded since, so it lists again.
-    check(other.refresh_remote_since(std::chrono::steady_clock::now(), deadline) == 0 &&
-              remote->lists == lists + 2,
-          "a request asking after the last listing was not given a new one");
-    const auto info = other.find("0a");
-    check(info && !info->local && info->fetch_bytes == 3000, "the bytes to fetch were not reported");
-    (void)other.load("0a");
-    check(other.find("0a")->fetch_bytes == 0 && other.find("0a")->local, "a fetched image still has bytes to fetch");
+    const auto asked = std::chrono::steady_clock::now();
+    const int lists  = remote->lists;
+    remote->set_hold(true);
+    std::thread refresh([&] { (void)other.refresh_remote(); });
+    const auto waited_for = [&](int calls) {
+        for (int i = 0; i < 5000 && remote->waiting < calls; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return remote->waiting >= calls;
+    };
+    check(waited_for(1), "the refresh did not start its listing");
+    ContextStore::LookupResult found;
+    std::thread lookup([&] {
+        found = other.lookup_remote(asked, std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                                    [](const std::string& id) { return id == "0a"; });
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    check(remote->waiting == 1, "the lookup listed the bucket beside the refresh's listing");
+    remote->set_hold(false);
+    lookup.join();
+    refresh.join();
+    check(remote->lists == lists + 1 && found.held == 1 && other.find("0a"),
+          "the lookup did not take the refresh's listing");
+}
+
+// A fetch that cannot finish by its deadline stops there: a miss, not damage. The image stays
+// offered with the chunks fetched so far, and a later load fetches the rest.
+void test_a_fetch_stops_at_its_deadline() {
+    TempDirectory directory;
+    TempDirectory other_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    const auto image = concat({pseudo_random(30, 1), pseudo_random(6000, 2)}); // several chunks
+    {
+        ContextStore store(remote_options(directory.path(), remote));
+        (void)store.put(describe("0a"), image, std::array{ContextStore::Region{30, 6000}});
+        check(drained(store), "upload");
+    }
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other) && other.find("0a"), "the image was not registered");
+    ContextStore::LoadReport report;
+    const auto late = other.load("0a", false, &report,
+                                 std::chrono::steady_clock::now() - std::chrono::milliseconds(1));
+    check(!late && report.expired && other.stats().remote_downloads == 0,
+          "a fetch past its deadline downloaded chunks or was not reported as expired");
+    check(other.find("0a") && other.stats().corrupt_removed == 0 &&
+              other.stats().remote_download_failures == 0,
+          "a fetch stopped at its deadline was treated as damage or a failure");
+    ContextStore::LoadReport on_time;
+    const auto loaded = other.load("0a", false, &on_time);
+    check(loaded && *loaded == image && !on_time.expired, "the image did not load in time afterwards");
+}
+
+// The visitor sees the keys it accepts with the Info list() reports, and nothing else.
+void test_checkpoint_visitor_matches_list() {
+    TempDirectory directory;
+    TempDirectory other_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    {
+        ContextStore store(remote_options(directory.path(), remote));
+        (void)store.put(describe("0a"), concat({pseudo_random(30, 1), pseudo_random(3000, 2)}),
+                        std::array{ContextStore::Region{30, 3000}});
+        check(drained(store), "upload");
+    }
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other), "the start-up refresh did not finish");
+    auto local = describe("0b", 50);
+    local.checkpoints.push_back({.frontier = 20, .digests = {0x3333, 0x4444}, .identity_tag = 7});
+    (void)other.put(local, concat({pseudo_random(30, 5), pseudo_random(2000, 6)}),
+                    std::array{ContextStore::Region{30, 2000}});
+    std::vector<std::pair<ContextStore::Info, ContextStore::CheckpointKey>> seen;
+    other.for_each_checkpoint(
+        [](const ContextStore::Info&, const ContextStore::CheckpointKey& key) {
+            return key.digests[0] == 0x1111 || key.frontier == 20;
+        },
+        [&](const ContextStore::Info& info, const ContextStore::CheckpointKey& key) {
+            seen.emplace_back(info, key);
+        });
+    check(seen.size() == 3, "the visitor did not see exactly the accepted keys");
+    for (const auto& [info, key] : seen) {
+        const auto listed = other.find(info.id);
+        check(listed && listed->local == info.local && listed->fetch_bytes == info.fetch_bytes &&
+                  listed->image_bytes == info.image_bytes,
+              "the visitor's Info differs from what the index reports");
+    }
 }
 
 // Many different conversations on one shared prefix (an agent's system and tools prompt): the
@@ -756,8 +889,9 @@ void test_conversation_moves_between_engines_on_a_shared_prefix() {
 
     // The conversation moves: B's lookup finds nothing, lists the bucket once, and finds turn 3.
     check(!b.find("c3"), "B knew the conversation before listing");
-    (void)b.refresh_remote_since(std::chrono::steady_clock::now(),
-                                 std::chrono::steady_clock::now() + std::chrono::seconds(10));
+    (void)b.lookup_remote(std::chrono::steady_clock::now(),
+                          std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                          [](const std::string& id) { return id.front() == 'c'; });
     const auto offered = b.find("c3");
     check(offered && !offered->local, "B's lookup did not find the conversation in the bucket");
     check(!b.find("c1") && !b.find("c2"), "B registered turns A had superseded");
@@ -947,7 +1081,9 @@ void test_fetch_install_failure_is_a_miss() {
     for (const auto& shard : fs::directory_iterator(chunks)) { fs::remove_all(shard.path()); }
     fs::permissions(chunks, fs::perms::owner_read | fs::perms::owner_exec);
     check(!other.load("0a").has_value(), "a chunk that could not be installed was served");
-    check(other.stats().remote_download_failures >= 1, "the install failure was not counted");
+    check(other.stats().remote_download_failures >= 1 &&
+              other.stats().remote_download_failures_install == other.stats().remote_download_failures,
+          "the install failure was not counted as one");
     fs::permissions(chunks, fs::perms::owner_all);
     const auto loaded = other.load("0a");
     check(loaded && *loaded == image, "the load did not succeed once the directory took writes");
@@ -1078,6 +1214,9 @@ void test_remote_damage_and_outage_are_misses() {
     check(other.list().size() == 1, "the image was not listed before the damage was found");
     check(!other.load("0a").has_value(), "a damaged remote chunk produced an image");
     check(other.list().empty(), "a damaged remote image is still offered");
+    check(other.stats().remote_download_failures_damaged == 1 &&
+              other.stats().corrupt_remote == 1 && other.stats().remote_download_failures == 1,
+          "a damaged remote chunk was not counted as damaged");
     check(other.refresh_remote() == 0, "a damaged remote image was imported again");
 
     // An unreachable bucket costs the upload, never the local write.
@@ -2373,7 +2512,10 @@ int main() {
     test_header_is_stored_as_a_delta();
     test_regions_are_chunked_from_their_own_start();
     test_content_cuts_resynchronise_after_an_insertion();
-    test_fetch_bytes_and_refresh_on_demand();
+    test_fetch_bytes_and_lookup_on_demand();
+    test_a_lookup_shares_a_listing_in_progress();
+    test_a_fetch_stops_at_its_deadline();
+    test_checkpoint_visitor_matches_list();
     test_shared_prefix_outlives_the_conversations_on_it();
     test_conversation_moves_between_engines_on_a_shared_prefix();
     test_a_listing_without_the_manifest_withdraws_publication();

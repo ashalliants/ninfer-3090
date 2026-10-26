@@ -145,12 +145,21 @@ public:
         return result;
     }
 
-    // Gives the Engine a context store backed by a bucket. The store must outlive the Rig.
+    // Gives the Engine a context store backed by a bucket. The store must outlive the Rig. Each
+    // failed hydration is recorded in hydration_events().
     void attach_store(ContextStore& store, std::chrono::milliseconds hydration_budget) {
-        core_->set_context_store({.store            = &store,
-                                  .binding          = "fake-binding",
-                                  .hydration_budget = hydration_budget,
-                                  .remote           = true});
+        core_->set_context_store({.store              = &store,
+                                  .binding            = "fake-binding",
+                                  .hydration_budget   = hydration_budget,
+                                  .remote             = true,
+                                  .hydration_listener = [this](const ContextStoreHydrationEvent& event) {
+                                      std::lock_guard lock(events_mutex_);
+                                      hydration_events_.push_back(event);
+                                  }});
+    }
+    [[nodiscard]] std::vector<ContextStoreHydrationEvent> hydration_events() const {
+        std::lock_guard lock(events_mutex_);
+        return hydration_events_;
     }
 
     fake::Program& program() { return *instance_.program; }
@@ -231,6 +240,8 @@ private:
     };
 
     Settings settings_;
+    mutable std::mutex events_mutex_;
+    std::vector<ContextStoreHydrationEvent> hydration_events_;
     std::vector<std::thread> waiters_;
     fake::Instance instance_;
     fake::Device device_;
@@ -718,6 +729,11 @@ public:
     }
     std::optional<std::vector<std::uint8_t>> get(const std::string& key) override {
         gate();
+        if (key.find("/chunks/") != std::string::npos) {
+            std::this_thread::sleep_for(chunk_delay.load());
+        } else if (key.find("/manifests/") != std::string::npos) {
+            ++manifest_gets;
+        }
         std::scoped_lock lock(mutex_);
         const auto found = objects_.find(key);
         if (found == objects_.end()) { return std::nullopt; }
@@ -758,6 +774,9 @@ public:
     [[nodiscard]] std::int64_t clock() const noexcept { return clock_; }
 
     std::atomic<int> lists{0};
+    std::atomic<int> manifest_gets{0};
+    // How long each chunk download takes, as on a slow link.
+    std::atomic<std::chrono::milliseconds> chunk_delay{std::chrono::milliseconds(0)};
 
 private:
     void gate() {
@@ -807,14 +826,20 @@ bool store_drained(ContextStore& store) {
     return store.flush_remote(Clock::now() + std::chrono::seconds(10));
 }
 
-// Another engine stores a session of prompt `id` (the fake's shortlist key is {id, 0} at every
-// frontier) up to `frontier`, with `bytes` of state, and uploads it.
+// The id the Engine stores a session of prompt `id` up to `frontier` under (the fake's shortlist key
+// is {id, 0} at every frontier).
+std::string session_id(std::uint64_t id, std::uint32_t frontier) {
+    return context_store_image_id({id, 0}, frontier, false);
+}
+
+// Another engine stores a session of prompt `id` up to `frontier`, with `bytes` of state, and
+// uploads it.
 void store_session_elsewhere(const std::shared_ptr<MemoryBucket>& bucket, std::uint64_t id,
                              std::uint32_t frontier, std::size_t bytes) {
     StoreDirectory directory;
     ContextStore other(bucket_store_options(directory.path(), bucket));
     ContextStore::Description description;
-    description.id      = "5e55" + std::to_string(id);
+    description.id      = session_id(id, frontier);
     description.binding = "fake-binding";
     description.tokens  = frontier;
     description.checkpoints.push_back({.frontier = frontier, .digests = {id, 0}, .identity_tag = 0});
@@ -857,9 +882,20 @@ void test_a_request_that_finds_nothing_lists_the_bucket_once_and_fetches() {
                     return rig.core().runtime_stats().context_store_remote_fetch_bytes_per_second > 0;
                 }),
                 "the fetch did not teach the fetch rate");
+        require(stats.context_store_lookup_hits == 1, "the lookup that found the session was not a hit");
         // The fake imports nothing: the fetched session is a failed hydration, and it prefilled.
         require(rig.core().runtime_stats().context_store_hydration_failures == 1,
                 "the fetched session was not offered for import");
+        // Said why, once, with the session it was.
+        const auto failed = rig.core().runtime_stats().context_store_hydration_failures_by_reason;
+        require(failed[static_cast<std::size_t>(ContextStoreHydrationFailure::HostGeometry)] == 1,
+                "the failed import was not counted under its reason");
+        const auto events = rig.hydration_events();
+        require(events.size() == 1 && events[0].id == session_id(7, 30'000) &&
+                    events[0].reason == ContextStoreHydrationFailure::HostGeometry &&
+                    events[0].bytes == 64 + 64 * 1024 && events[0].fetch_bytes == 64 * 1024 &&
+                    events[0].frontier == 30'000,
+                "the failed hydration was not reported with its session");
         // A second request for the same prompt finds the session without a listing.
         auto again = rig.run(7, kLongPrompt, 1);
         require(finished(again), "the second request did not finish\n" + rig.dump());
@@ -897,7 +933,7 @@ void test_a_fetch_that_cannot_fit_the_wait_is_not_started() {
         auto result = rig.run(9, kLongPrompt, 1);
         require(finished(result), "the request did not finish\n" + rig.dump());
         require(rig.core().runtime_stats().context_store_lookups == 1, "the request did not look");
-        const auto info = store.find("5e559");
+        const auto info = store.find(session_id(9, 30'000));
         require(info && !info->local, "the lookup did not register the session");
         require(store.stats().remote_downloads == 0,
                 "a fetch that could not fit the request's wait was started");
@@ -945,6 +981,110 @@ void test_a_stalled_listing_releases_the_request_at_its_budget() {
                     std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(waited).count()) +
                     " ms");
         require(rig.core().runtime_stats().context_store_lookups == 1, "the lookup was not counted");
+        require(rig.core().runtime_stats().context_store_lookup_hits == 0,
+                "a lookup that found nothing was counted as a hit");
+    }
+}
+
+// A lookup reads only the manifests of sessions ending on the request's own prompt: sessions other
+// engines uploaded for other conversations are left to the background refresh, and a request whose
+// session is not there is released as soon as the listing shows it.
+void test_a_lookup_reads_only_the_requests_own_manifests() {
+    auto bucket = std::make_shared<MemoryBucket>();
+    StoreDirectory directory;
+    ContextStore store(bucket_store_options(directory.path(), bucket));
+    require(store_drained(store), "the start-up refresh did not finish");
+    store_session_elsewhere(bucket, 12, 30'000, 4096);
+    for (std::uint64_t other = 20; other < 26; ++other) {
+        store_session_elsewhere(bucket, other, 30'000, 4096);
+    }
+    // Another conversation's session on a frontier this prompt also reaches.
+    store_session_elsewhere(bucket, 26, 1'000, 4096);
+    const int manifests = bucket->manifest_gets;
+    {
+        Rig rig({.chunk = 1024, .lanes = 1});
+        rig.attach_store(store, std::chrono::seconds(2));
+        auto result = rig.run(12, kLongPrompt, 1);
+        require(finished(result), "the request did not finish\n" + rig.dump());
+        const auto stats = rig.core().runtime_stats();
+        require(stats.context_store_lookups == 1 && stats.context_store_lookup_hits == 1,
+                "the lookup did not find the request's session");
+        require(bucket->manifest_gets == manifests + 1 && store.find(session_id(12, 30'000)),
+                "the lookup read manifests of other conversations: " +
+                    std::to_string(bucket->manifest_gets - manifests));
+        require(!store.find(session_id(20, 30'000)) && !store.find(session_id(26, 1'000)),
+                "the lookup registered sessions of other conversations");
+
+        // Nothing of this prompt is in the bucket: no manifest is read.
+        auto missing = rig.run(13, kLongPrompt, 1);
+        require(finished(missing), "the second request did not finish\n" + rig.dump());
+        const auto after = rig.core().runtime_stats();
+        require(after.context_store_lookups == 2 && after.context_store_lookup_hits == 1 &&
+                    bucket->manifest_gets == manifests + 1,
+                "a lookup that matched nothing read manifests or counted a hit");
+    }
+    // The background refresh still registers everything else.
+    require(store.refresh_remote() == 7, "the refresh did not register what the lookups left");
+}
+
+// A download that cannot finish in the request's wait stops at its deadline (a miss, not damage):
+// the request prefills, and the reader is free for the next request instead of downloading the
+// rest of a session nobody waits for.
+void test_a_slow_download_stops_at_the_requests_deadline() {
+    auto bucket = std::make_shared<MemoryBucket>();
+    StoreDirectory directory;
+    ContextStore store(bucket_store_options(directory.path(), bucket));
+    require(store_drained(store), "the start-up refresh did not finish");
+    // 64 chunks of 4 KiB; each takes 100 ms, eight at a time: 0.8 s, past a 200 ms wait (the
+    // assumed rate prices it at a few ms, so the read is started).
+    store_session_elsewhere(bucket, 14, 30'000, 64 * 4096);
+    (void)store.refresh_remote(); // registered: no lookup
+    bucket->chunk_delay = std::chrono::milliseconds(100);
+    {
+        Rig rig({.chunk = 1024, .lanes = 1});
+        rig.attach_store(store, std::chrono::milliseconds(200));
+        auto result = rig.run(14, kLongPrompt, 1);
+        require(finished(result), "the request did not finish\n" + rig.dump());
+        const auto stats = rig.core().runtime_stats();
+        require(stats.context_store_hydration_failures == 1 &&
+                    stats.context_store_hydration_failures_by_reason[static_cast<std::size_t>(
+                        ContextStoreHydrationFailure::Deadline)] == 1,
+                "the expired read was not a deadline failure");
+        // Long enough for the whole download, had it gone on.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        require(store.stats().remote_downloads < 64,
+                "the download went on past the request's deadline: " +
+                    std::to_string(store.stats().remote_downloads) + " chunks");
+        const auto info = store.find(session_id(14, 30'000));
+        require(info && !info->local && store.stats().corrupt_removed == 0,
+                "a download stopped at its deadline was treated as damage");
+    }
+}
+
+// A failure the import did not foresee fails only the hydration: the request prefills, and the
+// Engine does not treat it as a worker fault.
+void test_an_import_that_throws_fails_only_the_hydration() {
+    auto bucket = std::make_shared<MemoryBucket>();
+    StoreDirectory directory;
+    ContextStore store(bucket_store_options(directory.path(), bucket));
+    require(store_drained(store), "the start-up refresh did not finish");
+    store_session_elsewhere(bucket, 15, 30'000, 4096);
+    (void)store.refresh_remote();
+    {
+        Rig rig({.chunk = 1024, .lanes = 1});
+        rig.attach_store(store, std::chrono::seconds(2));
+        rig.program().import_throws = true;
+        auto result = rig.run(15, kLongPrompt, 1);
+        require(finished(result), "the request did not finish\n" + rig.dump());
+        const auto stats = rig.core().runtime_stats();
+        require(stats.engine_recoveries == 0, "a failed import was handled as a worker fault");
+        require(stats.context_store_hydration_failures == 1 &&
+                    stats.context_store_hydration_failures_by_reason[static_cast<std::size_t>(
+                        ContextStoreHydrationFailure::Exception)] == 1,
+                "the failed import was not counted as an exception");
+        const auto events = rig.hydration_events();
+        require(events.size() == 1 && events[0].reason == ContextStoreHydrationFailure::Exception,
+                "the failed import was not reported");
     }
 }
 
@@ -1679,6 +1819,12 @@ int main() {
         test_a_fetch_must_fit_the_requests_remaining_deadline);
     run("a stalled listing releases the request at its budget",
         test_a_stalled_listing_releases_the_request_at_its_budget);
+    run("a lookup reads only the request's own manifests",
+        test_a_lookup_reads_only_the_requests_own_manifests);
+    run("a slow download stops at the request's deadline",
+        test_a_slow_download_stops_at_the_requests_deadline);
+    run("an import that throws fails only the hydration",
+        test_an_import_that_throws_fails_only_the_hydration);
     run("LossyTriggersOnlyWhenCold", test_lossy_triggers_only_when_cold);
     run("LossyPromptLengthChangeAccepted", test_lossy_prompt_length_change_accepted);
     run("LossyCancelDuringScout", test_lossy_cancel_during_scout);
