@@ -521,8 +521,8 @@ public:
     // The durable context store (owned by the Engine, which outlives this core). `sink` queues one
     // image for the Engine's writer and must not block; it returns whether the image was accepted.
     // `ready` reports an idle writer; `queued` whether an image id is still waiting for (or in) the
-    // writer; `failures` counts queued writes that later failed, and when it grows a continuation
-    // whose image the store does not hold is treated as not stored, so it is written again.
+    // writer; `failures` counts queued writes that later failed, and `failed_ids` hands over the ids
+    // of those not yet taken: each such continuation the store does not hold is written again.
     struct ContextStoreHooks {
         ContextStore* store = nullptr;
         std::string binding;
@@ -536,6 +536,7 @@ public:
         std::function<bool()> ready;
         std::function<bool(const std::string&)> queued;
         std::function<std::uint64_t()> failures;
+        std::function<std::vector<std::string>()> failed_ids;
         // A retained continuation unused this long is written in the background; zero disables it.
         std::chrono::milliseconds idle_persist{0};
         // The longest a request waits for its stored session to be read back.
@@ -3769,38 +3770,45 @@ private:
         const auto removed = store_removal_count();
         if (removed == store_removals_seen_) { return; }
         store_removals_seen_ = removed;
-        revalidate_store_marks(false);
+        drop_removed_store_marks();
     }
 
-    // A write that was accepted into the queue and then failed left its continuation marked.
+    // A write that was accepted into the queue and then failed left its continuation marked. The
+    // writer names the images that failed: each is written again unless the store holds it after
+    // all, even if a removal scan meanwhile took it for an image the store let go.
     bool forget_failed_store_writes() noexcept {
         if (!store_.failures) { return false; }
         const auto failed = store_.failures();
-        if (failed == store_failures_seen_) { return false; }
+        std::vector<std::string> ids;
+        try {
+            if (store_.failed_ids) { ids = store_.failed_ids(); }
+        } catch (...) {}
+        if (failed == store_failures_seen_ && ids.empty()) { return false; }
         store_failures_seen_ = failed;
-        revalidate_store_marks(true);
+        retry_failed_store_writes(ids);
         return true;
     }
 
-    // Whether the store holds the image `id`, or the Engine's writer still has it to write. A store
-    // that cannot answer is taken to hold it, so a failing lookup never sets off rewrites.
+    // Whether the store holds the image `id` for this Engine's model and configuration, or the
+    // Engine's writer still has it to write. A store that cannot answer is taken to hold it, so a
+    // failing lookup never sets off rewrites.
     [[nodiscard]] bool store_has_image(const std::string& id) const noexcept {
         if (id.empty()) { return false; }
         try {
             if (store_.queued && store_.queued(id)) { return true; }
-            return store_.store->find(id).has_value();
+            const auto info = store_.store->find(id);
+            return info && info->binding == store_.binding;
         } catch (...) { return true; }
     }
 
-    // Clears the marks of images the store no longer holds and keeps the rest. `failed`: a queued
-    // write failed, so its continuation is written again; otherwise the store removed the image on
-    // its own and the continuation is written again only once it has changed (OwnerMark::dropped).
-    void revalidate_store_marks(bool failed) noexcept {
+    // After the store removed images on its own: a mark whose image is gone is dropped (written
+    // again only once its continuation has changed, OwnerMark::dropped); the others stand.
+    void drop_removed_store_marks() noexcept {
         try {
             auto& program = *instance_.program;
             for (auto& [token, entry] : owner_marks_) {
                 if (entry.stored.empty() || store_has_image(entry.image_id)) { continue; }
-                if (!failed) { entry.dropped = entry.stored; }
+                entry.dropped = std::move(entry.stored);
                 entry.stored.clear();
                 entry.stored_bytes = 0;
             }
@@ -3808,10 +3816,35 @@ private:
                 if (!program.valid_checkpoint(stored.first)) { return true; }
                 const Checkpoint handle = stored.first;
                 if (store_has_image(store_image_id(program, {&handle, 1}, true))) { return false; }
-                if (!failed) { shared_dropped_.push_back(handle); }
+                shared_dropped_.push_back(handle);
                 return true;
             });
         } catch (...) {} // marks not yet checked stand: a stale one costs a hit, never an answer
+    }
+
+    // After queued writes of `ids` failed: their continuations are no longer stored, and not
+    // dropped either, so the next scan writes them again.
+    void retry_failed_store_writes(const std::vector<std::string>& ids) noexcept {
+        try {
+            const auto failed = [&](const std::string& id) {
+                return !id.empty() && std::find(ids.begin(), ids.end(), id) != ids.end() &&
+                       !store_has_image(id);
+            };
+            auto& program = *instance_.program;
+            for (auto& [token, entry] : owner_marks_) {
+                if (!failed(entry.image_id)) { continue; }
+                entry.stored.clear();
+                entry.stored_bytes = 0;
+                entry.dropped.clear();
+            }
+            const auto shared_failed = [&](Checkpoint handle) {
+                return program.valid_checkpoint(handle) &&
+                       failed(store_image_id(program, {&handle, 1}, true));
+            };
+            std::erase_if(shared_stored_,
+                          [&](const auto& stored) { return shared_failed(stored.first); });
+            std::erase_if(shared_dropped_, shared_failed);
+        } catch (...) {}
     }
 
     // Writes at most one idle retained continuation to the store. Called by the worker between

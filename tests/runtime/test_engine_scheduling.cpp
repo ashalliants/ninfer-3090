@@ -155,11 +155,17 @@ public:
 
     // Gives the Engine a context store it writes idle conversations to, through `write` (which
     // stores the image and returns whether it took it). The store must outlive the Rig.
+    // `failures` and `failed_ids`, when given, stand for the writer's failure count and the ids of
+    // the writes that failed.
     void attach_store_writer(ContextStore& store, std::function<bool(fake::CheckpointImage&&)> write,
-                             std::chrono::milliseconds idle) {
+                             std::chrono::milliseconds idle,
+                             std::function<std::uint64_t()> failures             = {},
+                             std::function<std::vector<std::string>()> failed_ids = {}) {
         core_->set_context_store({.store        = &store,
                                   .binding      = "fake-binding",
                                   .sink         = std::move(write),
+                                  .failures     = std::move(failures),
+                                  .failed_ids   = std::move(failed_ids),
                                   .idle_persist = idle});
     }
 
@@ -1072,6 +1078,114 @@ void test_a_session_the_store_evicted_is_not_written_back() {
     require(finished(busy), "the request did not finish\n" + rig.dump());
 }
 
+// The writer's failure reports, as the Engine's writer thread makes them.
+struct FailedWrites {
+    std::mutex mutex;
+    std::uint64_t count = 0;
+    std::vector<std::string> ids;
+    void fail(const std::string& id) {
+        std::lock_guard lock(mutex);
+        ++count;
+        ids.push_back(id);
+    }
+    std::uint64_t failures() {
+        std::lock_guard lock(mutex);
+        return count;
+    }
+    std::vector<std::string> take() {
+        std::lock_guard lock(mutex);
+        return std::exchange(ids, {});
+    }
+};
+
+// A queued write that failed is written again, even when a removal scan saw its image missing first
+// and took it for one the store let go (the failure report lands after the scan).
+void test_a_failed_write_is_retried_after_a_removal_scan_dropped_it() {
+    StoreDirectory directory;
+    ContextStore::Options options;
+    options.directory   = directory.path();
+    options.chunk_bytes = 4096;
+    ContextStore store(options);
+    Rig rig({.chunk = 1024, .lanes = 1, .context_cache = true});
+    std::atomic<int> writes{0};
+    FailedWrites failed;
+    rig.attach_store_writer(
+        store,
+        [&](fake::CheckpointImage&& image) {
+            put_image(store, image);
+            ++writes;
+            return true;
+        },
+        std::chrono::milliseconds(50), [&] { return failed.failures(); },
+        [&] { return failed.take(); });
+    const auto image = rig.program().image_of(1, 4096);
+    const auto id    = ContextStore::image_id(image.keys.front().digests, 4096, false);
+    put_image(store, image);
+    restore_stored(rig, store, 1);
+    // The write "failed": its image is not in the store. A removal elsewhere is scanned first.
+    require(store.erase(id), "the image could not be erased");
+    supersede_elsewhere(store);
+    // The shutdown flush writes whatever is not settled, with no idle wait or failure back-off.
+    int flushed = 0;
+    const auto flush = [&] {
+        return rig.core().persist_all(
+            [&](fake::CheckpointImage&& written, bool) {
+                put_image(store, written);
+                ++flushed;
+                return true;
+            },
+            Clock::now() + std::chrono::seconds(5));
+    };
+    (void)flush();
+    require(flushed == 0, "a session taken for one the store let go was written");
+    failed.fail(id);
+    (void)flush();
+    require(flushed == 1, "the failed write was not written again: " + std::to_string(flushed) +
+                              " writes");
+    require(store.find(id).has_value(), "the retried write did not store the session");
+}
+
+// An image of the same id written under another model or configuration does not count as this
+// conversation stored: when this Engine's write of it fails, it is written again.
+void test_a_foreign_image_of_the_same_id_does_not_count_as_stored() {
+    StoreDirectory directory;
+    ContextStore::Options options;
+    options.directory   = directory.path();
+    options.chunk_bytes = 4096;
+    ContextStore store(options);
+    Rig rig({.chunk = 1024, .lanes = 1, .context_cache = true});
+    std::atomic<int> writes{0};
+    FailedWrites failed;
+    rig.attach_store_writer(
+        store,
+        [&](fake::CheckpointImage&& image) {
+            put_image(store, image);
+            ++writes;
+            return true;
+        },
+        std::chrono::milliseconds(50), [&] { return failed.failures(); },
+        [&] { return failed.take(); });
+    const auto image = rig.program().image_of(1, 4096);
+    const auto id    = ContextStore::image_id(image.keys.front().digests, 4096, false);
+    put_image(store, image);
+    restore_stored(rig, store, 1);
+    // Another configuration's image now holds the id, and this Engine's write of it failed.
+    ContextStore::Description foreign;
+    foreign.id      = id;
+    foreign.binding = "another-binding";
+    foreign.tokens  = 4096;
+    foreign.checkpoints.push_back({.frontier = 4096, .digests = image.keys.front().digests});
+    (void)store.put(foreign, image.bytes, std::array{ContextStore::Region{16, 64 * 1024}});
+    failed.fail(id);
+    auto busy = rig.run(9, 64, 4000);
+    require(rig.wait_for([&] { return writes.load() == 1; }, std::chrono::seconds(3)),
+            "a foreign image of the same id counted as the conversation stored: " +
+                std::to_string(writes.load()) + " writes");
+    require(store.find(id) && store.find(id)->binding == "fake-binding",
+            "the retried write did not replace the foreign image");
+    require(finished(busy), "the request did not finish\n" + rig.dump());
+}
+
 // ---- lossy prefill (docs/maintainer/lossy-long-prefill.md) ----------------------------------
 
 static_assert(EngineCore<fake::Instance>::kLossyCapable,
@@ -1806,6 +1920,10 @@ int main() {
         test_an_unrelated_removal_does_not_rewrite_stored_sessions);
     run("a session the store evicted is not written back",
         test_a_session_the_store_evicted_is_not_written_back);
+    run("a failed write is retried after a removal scan dropped it",
+        test_a_failed_write_is_retried_after_a_removal_scan_dropped_it);
+    run("a foreign image of the same id does not count as stored",
+        test_a_foreign_image_of_the_same_id_does_not_count_as_stored);
     run("LossyTriggersOnlyWhenCold", test_lossy_triggers_only_when_cold);
     run("LossyPromptLengthChangeAccepted", test_lossy_prompt_length_change_accepted);
     run("LossyCancelDuringScout", test_lossy_cancel_during_scout);
