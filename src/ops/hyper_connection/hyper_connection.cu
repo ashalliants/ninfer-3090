@@ -234,7 +234,8 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
     }
     require(eps > 0, "mix epsilon must be positive");
     // Checked before the route choice: the fused route never reaches linear()'s own check.
-    require(valid_linear_policy(policy), "mix requires a valid LinearPolicy");
+    require(valid_dense_linear_policy(policy),
+            "mix requires a valid LinearPolicy (not AllowA8GgmlDecodeMma, which is for GGML weights)");
     auto scope = workspace.scope();
     if (detail::hc_mix_fused_supported(down, up, hidden, streams, rank, T)) {
         const DeviceSpan partials =
@@ -260,7 +261,8 @@ std::size_t hyper_connection_mix_workspace_capacity_bytes(const Weight& down, co
                                                           std::int32_t max_tokens) {
     require(max_tokens > 0 && streams > 0 && rank > 0,
             "mix workspace needs positive T, streams and rank");
-    require(valid_linear_policy(policy), "mix requires a valid LinearPolicy");
+    require(valid_dense_linear_policy(policy),
+            "mix requires a valid LinearPolicy (not AllowA8GgmlDecodeMma, which is for GGML weights)");
     std::size_t bytes = composed_bytes(down, up, policy, rank, max_tokens);
     for (std::int32_t T = 1; T <= std::min(max_tokens, detail::kHcMixFusedMaxColumns); ++T) {
         bytes = std::max(bytes, detail::hc_mix_fused_workspace_bytes(down.n, streams, T));

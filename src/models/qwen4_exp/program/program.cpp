@@ -544,6 +544,13 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
         throw std::invalid_argument("Qwen3.8-Flash-Next: --gdn-async-commit folds MTP verification commits on a side "
                                     "stream and needs --spec mtp: add --spec mtp or remove --gdn-async-commit");
     }
+    // Refused here too, not only by the serve parser and Qwen4ExpInstance: a Program built without
+    // them would otherwise throw at its first MoE call, possibly inside a graph capture.
+    if (o.moe_gate_up_registers && !o.moe_precast_input) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: --moe-gate-up-registers reads the input that "
+                                    "--moe-precast-input casts once per call: add --moe-precast-input or remove "
+                                    "--moe-gate-up-registers");
+    }
     if (o.hc_fused_read && !o.hc_int8) {
         throw std::invalid_argument("Qwen3.8-Flash-Next: --hc-fused-read reads the int8 mixer copies that --hc-int8 "
                                     "makes: add --hc-int8 or remove --hc-fused-read");

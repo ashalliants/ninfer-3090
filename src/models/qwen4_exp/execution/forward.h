@@ -410,6 +410,13 @@ public:
     // The largest shared_expert_scratch_bytes over the text model's layers at calls of 1 to
     // `columns` columns (the drafter's shared expert is BF16 rows projected in FP32: no scratch).
     [[nodiscard]] std::size_t max_shared_expert_scratch_bytes(std::int32_t columns) const;
+    // ForwardOptions::ggml_decode_mma: whether projection `p` can run as it would under the option.
+    // The int8 tensor-core decode route stages a GGML weight from the 16-byte unit holding its first
+    // byte, so a projection the option moves to it (a GGML weight whose policy admits A8) must start
+    // on a 16-byte boundary; every other projection is unaffected. The constructors check every
+    // projection the forward runs with this and refuse a misaligned one, naming --ggml-decode-mma,
+    // so the artifact is refused at startup instead of at its first decode call.
+    [[nodiscard]] static bool ggml_decode_mma_aligned(const LinearParameters& p) noexcept;
 
 private:
     void layers(std::uint32_t begin, std::uint32_t end, const ForwardBatch& batch, const ForwardTap* tap);

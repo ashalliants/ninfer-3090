@@ -22,7 +22,7 @@ enum class Nvfp4LinearSwiGluRoute {
 
 Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 linear_swiglu: T must be positive"); }
-    if (!valid_linear_policy(policy)) {
+    if (!valid_dense_linear_policy(policy)) {
         throw std::invalid_argument("nvfp4 linear_swiglu: invalid compute policy");
     }
     if (!allows_a4(policy)) { // A16Only, AllowA8 and the integer-A8 policies
