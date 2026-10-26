@@ -141,7 +141,7 @@ std::string usage_text(const char* argv0) {
            "       [--device N] [--devices N,M,...] [--stage-layers A,B,...]\n"
            "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N]\n"
            "       [--ngram-draft-tokens 0|15] [--ngram-min-match N]\n"
-           "       [--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4]\n"
+           "       [--lm-head-draft] [--lm-head-q4|--lm-head-q6|--lm-head-two-stage] [--embedding-q4|--embedding-q6] [--mtp-experts-q4]\n"
            "       [--gdn-state-fp16] [--mlp-a8-decode] [--no-prefill-a8]\n"
            "       [--prefill-cublas [--no-prefill-cublas-projections]]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
@@ -178,6 +178,9 @@ std::string usage_text(const char* argv0) {
            "speed- or memory-for-quality trades, off by "
            "default; see "
            "docs/maintainer/quality-trade-experiments.md for the measured cost of each.\n"
+           "--lm-head-two-stage scores the output head from a 2-bit copy first and computes every "
+           "row that could reach the top 64 with the dense head's kernels; designed to keep the "
+           "output bit for bit (see docs/serving.md).\n"
            "--no-prefill-a8 returns full prefill tiles to their A16 routes, which is how the "
            "integer routes are measured on a whole request.\n"
            "--prefill-cublas hands wide prefill GEMMs to cuBLAS: a large prefill speedup for a small "
@@ -264,6 +267,8 @@ Options parse_options(int argc, char** argv) {
             options.lm_head_q4 = true;
         } else if (arg == "--lm-head-q6") {
             options.lm_head_q6 = true;
+        } else if (arg == "--lm-head-two-stage") {
+            options.lm_head_two_stage = true;
         } else if (arg == "--embedding-q4") {
             options.embedding_q4 = true;
         } else if (arg == "--embedding-q6") {

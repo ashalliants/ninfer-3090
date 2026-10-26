@@ -36,6 +36,10 @@ int main() {
                                "--choice", "a|b", "--choice", "你好"});
     failures += check(choice.choices == std::vector<std::string>{"", "a|b", "你好"},
                       "choice flags changed literal text or order");
+    failures += check(!choice.lm_head_two_stage, "--lm-head-two-stage is on by default");
+    failures += check(parse({"ninfer", "model.ninfer", "--prompt", "hello", "--lm-head-two-stage"})
+                          .lm_head_two_stage,
+                      "--lm-head-two-stage was not parsed");
     failures +=
         check(parse({"ninfer", "model.ninfer", "--prompt", "hello", "--regex", ""}).regex == "",
               "empty regex must be distinct from no regex");

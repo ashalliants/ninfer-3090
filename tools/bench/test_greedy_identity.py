@@ -50,6 +50,8 @@ if kind.startswith("flip"):
     ids[at] += 1
 if kind.startswith("short"):
     ids = ids[:int(kind[5:])]
+if "--flip-me" in rest:
+    ids[2] += 1
 print("the answer text goes to stdout")
 print("phase       detail                      elapsed/progress", file=sys.stderr)
 if kind != "silent":
@@ -167,7 +169,34 @@ with tempfile.TemporaryDirectory() as tmp:
     check("a prompt line without \"prompt\" refused", result.returncode == 2 and "bad.jsonl:1" in result.stderr,
           result.stderr)
 
-# 8. The default prompts file is the committed one.
+    # 8. Same-build mode: one executable, per-side arguments.
+    same = root / "single"
+    same.mkdir()
+    exe = make_fake(same, "ninfer", {})
+
+    def run_same(*flags):
+        return subprocess.run([sys.executable, "-I", str(TOOL), "--a", str(exe), "--model", "m.ninfer",
+                               "--prompts", str(prompts), "--tokens", "7", "--extra-args=--foo bar", *flags],
+                              capture_output=True, text=True, timeout=120)
+
+    result = run_same("--b-args=--harmless")
+    check("same-build identical exits 0", result.returncode == 0 and "GREEDY IDENTICAL" in result.stdout,
+          result.stdout + result.stderr)
+    result = run_same("--b-args=--flip-me")
+    check("same-build B args reach B only",
+          result.returncode == 1 and "token index 2" in result.stdout, result.stdout + result.stderr)
+    result = run_same("--a-args=--flip-me", "--b-args=--flip-me")
+    check("same-build equal args refused", result.returncode == 2 and "nothing to compare" in result.stderr,
+          result.stdout + result.stderr)
+    result = run_same()
+    check("same-build without per-side args refused", result.returncode == 2 and "nothing to compare" in result.stderr,
+          result.stdout + result.stderr)
+    a, b = pair("sided", {}, {})
+    result = run(a, b, prompts, "--a-args=--flip-me")
+    check("--a-args reaches A only with two builds", result.returncode == 1 and "token index 2" in result.stdout,
+          result.stdout + result.stderr)
+
+# 9. The default prompts file is the committed one.
 check("default prompts exist", gi.DEFAULT_PROMPTS.is_file(), str(gi.DEFAULT_PROMPTS))
 if gi.DEFAULT_PROMPTS.is_file():
     check("default prompts load", len(gi.load_prompts(gi.DEFAULT_PROMPTS, None)) == 24)

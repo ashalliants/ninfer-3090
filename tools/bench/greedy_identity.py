@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Do two ninfer CLI builds produce the same greedy tokens?
+"""Do two ninfer CLI builds, or one build with two sets of options, produce the same greedy tokens?
 
 For every prompt in a prompts file, run each build as
 
@@ -23,6 +23,15 @@ near-tie), but the index shows how deep into the answer the paths agree.
                  `=` as above, so a value that starts with `--` is not read as another option. Use it
                  for the option under test (the same flag on both builds) and to pin anything that
                  would otherwise differ (`--kv-dtype`, `--max-context`).
+  --a-args, --b-args
+                 one string each, appended to that side only, after --extra-args. Same-build mode:
+                 leave out --b and the one build runs as both sides, A with --a-args and B with
+                 --b-args, which must differ; that is how to check that an option meant to keep the
+                 output, such as --lm-head-two-stage, does:
+
+    python tools/bench/greedy_identity.py --a build-ninja/apps/ninfer.exe \\
+        --model models/qwen3_8_27b.ninfer --b-args="--lm-head-two-stage"
+
   --limit N      only the first N prompts (a quick check before the full set).
 
 The prompts file is JSONL with a "prompt" string per line, as for run_chat_decode.py; the default is
@@ -131,11 +140,13 @@ def window(ids: list[int], index: int) -> str:
     return "[" + " ".join(map(str, shown)) + (" ...]" if index + 5 < len(ids) else "]")
 
 
-def compare_builds(args: argparse.Namespace, extra: list[str], prompts: list[str]) -> int:
+def compare_builds(args: argparse.Namespace, extra_a: list[str], extra_b: list[str],
+                   prompts: list[str]) -> int:
     total = 0
+    exe_b = args.b if args.b is not None else args.a
     for number, prompt in enumerate(prompts, 1):
-        ids_a = generate("A", args.a, args.model, prompt, args.tokens, extra, args.timeout)
-        ids_b = generate("B", args.b, args.model, prompt, args.tokens, extra, args.timeout)
+        ids_a = generate("A", args.a, args.model, prompt, args.tokens, extra_a, args.timeout)
+        ids_b = generate("B", exe_b, args.model, prompt, args.tokens, extra_b, args.timeout)
         total += len(ids_a)
         index = first_difference(ids_a, ids_b)
         label = prompt if len(prompt) <= 60 else prompt[:57] + "..."
@@ -153,7 +164,8 @@ def compare_builds(args: argparse.Namespace, extra: list[str], prompts: list[str
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--a", type=Path, required=True, help="first ninfer CLI executable")
-    parser.add_argument("--b", type=Path, required=True, help="second ninfer CLI executable")
+    parser.add_argument("--b", type=Path, default=None,
+                        help="second ninfer CLI executable; omitted, --a runs as both sides (same-build mode)")
     parser.add_argument("--model", required=True, help="model artifact, the first argument of the CLI")
     parser.add_argument("--prompts", type=Path, default=DEFAULT_PROMPTS,
                         help="JSONL file with a \"prompt\" per line (default: bench/fixtures/chat_prompts.jsonl)")
@@ -161,6 +173,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=None, help="only the first N prompts")
     parser.add_argument("--extra-args", default="",
                         help="extra CLI arguments for both builds, as one string (write --extra-args=\"...\")")
+    parser.add_argument("--a-args", default="", help="extra CLI arguments for A only (write --a-args=\"...\")")
+    parser.add_argument("--b-args", default="", help="extra CLI arguments for B only (write --b-args=\"...\")")
     parser.add_argument("--timeout", type=float, default=1800.0, help="seconds allowed per run (default 1800)")
     args = parser.parse_args(argv)
 
@@ -169,13 +183,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
     try:
-        extra = ab.split_command(args.extra_args) if args.extra_args.strip() else []
-        try:
-            ab.preflight(args.a, args.b)
-        except SystemExit as stop:
-            raise Failure(str(stop.code))
+        split = lambda text: ab.split_command(text) if text.strip() else []  # noqa: E731
+        extra = split(args.extra_args)
+        extra_a, extra_b = extra + split(args.a_args), extra + split(args.b_args)
+        if args.b is None:
+            if not args.a.is_file():
+                raise Failure(f"missing executable: {args.a}")
+            if extra_a == extra_b:
+                raise Failure("same-build mode (no --b) needs --a-args and --b-args that differ; "
+                              "nothing to compare")
+        else:
+            try:
+                ab.preflight(args.a, args.b)
+            except SystemExit as stop:
+                raise Failure(str(stop.code))
         prompts = load_prompts(args.prompts, args.limit)
-        return compare_builds(args, extra, prompts)
+        return compare_builds(args, extra_a, extra_b, prompts)
     except (Failure, ValueError) as failure:
         print(f"greedy_identity: {failure}", file=sys.stderr)
         return 2

@@ -340,6 +340,7 @@ int main(int argc, char** argv) {
         engine_options.use_cuda_graph           = cli.use_cuda_graph;
         engine_options.lm_head_q4               = cli.lm_head_q4;
         engine_options.lm_head_q6               = cli.lm_head_q6;
+        engine_options.lm_head_two_stage        = cli.lm_head_two_stage;
         engine_options.embedding_q4             = cli.embedding_q4;
         engine_options.embedding_q6             = cli.embedding_q6;
         engine_options.mtp_experts_q4           = cli.mtp_experts_q4;
