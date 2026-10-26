@@ -8,7 +8,7 @@ separately.
 
 ## 1. Registered formats
 
-NInfer has exactly thirty-four persistent numeric tensor formats in six categories.
+NInfer has exactly thirty-six persistent numeric tensor formats in six categories.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -45,6 +45,8 @@ The GGML block formats store blocks of ggml's quantization types unchanged (Sect
 | Canonical name | ggml type (id) | Values/block | Bytes/block | Bits/weight |
 |---|---|---:|---:|---:|
 | `ggml_q8_0` | `Q8_0` (8) | 32 | 34 | 8.5 |
+| `ggml_q4_k` | `Q4_K` (12) | 256 | 144 | 4.5 |
+| `ggml_q5_k` | `Q5_K` (13) | 256 | 176 | 5.5 |
 | `ggml_q6_k` | `Q6_K` (14) | 256 | 210 | 6.5625 |
 | `ggml_iq2_xxs` | `IQ2_XXS` (16) | 256 | 66 | 2.0625 |
 | `ggml_iq2_xs` | `IQ2_XS` (17) | 256 | 74 | 2.3125 |
@@ -377,6 +379,13 @@ reference build does for NaN.
 `ggml_q2_0` is the newest of these types: one binary16 `d` followed by 16 bytes of 2-bit codes per
 64 values. Value `j` uses code `q = (qs[j / 4] >> (2 * (j % 4))) & 3`, least significant pair
 first, and reconstructs as `binary32((q - 1) * d)`, so the codes mean −1, 0, +1 and +2.
+
+`ggml_q4_k` and `ggml_q5_k` are the affine K-quants, the only formats here with an offset. A block
+is `{fp16 d; fp16 dmin; u8 scales[12]; ...}` over eight sub-blocks of 32 values; `get_scale_min_k4`
+unpacks sub-block `j`'s 6-bit scale `sc_j` and 6-bit min `m_j` from the 12 bytes. Value `l` of
+sub-block `j` reconstructs as `binary32(binary32(d * sc_j) * q - binary32(dmin * m_j))`, two FP32
+operations after the two products, with `q` in `[0, 15]` (Q4_K: a nibble of `qs[32 (j / 2) + l]`,
+low for even `j`) or `[0, 31]` (Q5_K: that nibble plus 16 times bit `j` of `qh[l]`).
 
 The Python decoders are
 [`tools/artifact/codecs/ggml_blocks.py`](../../tools/artifact/codecs/ggml_blocks.py), and the C++

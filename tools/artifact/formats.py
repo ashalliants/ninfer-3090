@@ -94,6 +94,8 @@ NVFP4 = Nvfp4Format("nvfp4", 16)
 FP8_E4M3FN_ROW_BF16 = Fp8RowFormat("fp8_e4m3fn_row_bf16")
 
 GGML_Q8_0 = GgmlBlockFormat("ggml_q8_0", 8, 32, 34)
+GGML_Q4_K = GgmlBlockFormat("ggml_q4_k", 12, 256, 144)
+GGML_Q5_K = GgmlBlockFormat("ggml_q5_k", 13, 256, 176)
 GGML_Q6_K = GgmlBlockFormat("ggml_q6_k", 14, 256, 210)
 GGML_IQ2_XXS = GgmlBlockFormat("ggml_iq2_xxs", 16, 256, 66)
 GGML_IQ2_XS = GgmlBlockFormat("ggml_iq2_xs", 17, 256, 74)
@@ -145,6 +147,8 @@ GGML_BLOCK_FORMATS = MappingProxyType(
         item.name: item
         for item in (
             GGML_Q8_0,
+            GGML_Q4_K,
+            GGML_Q5_K,
             GGML_Q6_K,
             GGML_IQ2_XXS,
             GGML_IQ2_XS,
@@ -278,6 +282,8 @@ __all__ = [
     "NVFP4",
     "FP8_E4M3FN_ROW_BF16",
     "GGML_Q8_0",
+    "GGML_Q4_K",
+    "GGML_Q5_K",
     "GGML_Q6_K",
     "GGML_IQ2_XXS",
     "GGML_IQ2_XS",

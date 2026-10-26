@@ -120,6 +120,18 @@ def test_fixtures_cover_every_grid_index_and_sign_pattern():
     scales = blocks[:, 192:208].view(np.int8)
     assert scales.min() == -128 and scales.max() == 127
 
+    for name in ("ggml_q4_k", "ggml_q5_k"):
+        blocks, _ = _fixture(name)
+        q = blocks[:, 4:16].astype(np.int32)  # get_scale_min_k4's 12 packed bytes
+        sc = np.concatenate((q[:, 0:4] & 63, (q[:, 8:12] & 0xF) | ((q[:, 0:4] >> 6) << 4)), 1)
+        m = np.concatenate((q[:, 4:8] & 63, (q[:, 8:12] >> 4) | ((q[:, 4:8] >> 6) << 4)), 1)
+        for j in range(8):  # every 6-bit scale and min in every sub-block
+            assert set(np.unique(sc[:, j])) == set(np.unique(m[:, j])) == set(range(64))
+        d = blocks[:, 0].astype(np.uint16) | blocks[:, 1].astype(np.uint16) << 8
+        dmin = blocks[:, 2].astype(np.uint16) | blocks[:, 3].astype(np.uint16) << 8
+        special = {0x0000, 0x8000, 0x0001, 0x03FF, 0x7BFF, 0x7C00, 0xFC00, 0x7E00, 0xFE01}
+        assert special <= set(d.tolist()) and special <= set(dmin.tolist())
+
 
 @pytest.mark.skipif(not ORACLE, reason="set NINFER_GGML_BASE_DLL to ggml-base of llama.cpp b11316")
 @pytest.mark.parametrize("name", FORMATS)
@@ -141,13 +153,21 @@ def test_block_geometry_and_rejections():
     assert ggml_blocks_geometry("ggml_q2_0", (512, 2560, 640)).row_bytes == 180
     assert encoded_size("ggml_blocks_v1", "ggml_iq4_xs", (248_320, 2560)) == 337_715_200
     assert encoded_size("ggml_blocks_v1", "ggml_q8_0", (64,)) == 68
-    for name, geometry in (("ggml_iq2_xs", (17, 256, 74)), ("ggml_iq3_xxs", (18, 256, 98))):
+    for name, geometry in (
+        ("ggml_iq2_xs", (17, 256, 74)),
+        ("ggml_iq3_xxs", (18, 256, 98)),
+        ("ggml_q4_k", (12, 256, 144)),
+        ("ggml_q5_k", (13, 256, 176)),
+    ):
         spec = get_format(name)
         assert (spec.ggml_type, spec.block_elems, spec.block_bytes) == geometry
     # The IQ3 packs' gate/up banks [512, 640, 2560]: ten blocks of 74 and 98 bytes per row.
     assert ggml_blocks_geometry("ggml_iq2_xs", (512, 640, 2560)).payload_bytes == 242_483_200
     assert ggml_blocks_geometry("ggml_iq3_xxs", (512, 640, 2560)).row_bytes == 980
     assert encoded_size("ggml_blocks_v1", "ggml_iq3_xxs", (512, 640, 2560)) == 321_126_400
+    # The IQ3 packs' dense K-quants: GDN qkv [10240, 2560] and the Q5_K output head [248320, 2560].
+    assert ggml_blocks_geometry("ggml_q4_k", (10240, 2560)).row_bytes == 1440
+    assert encoded_size("ggml_blocks_v1", "ggml_q5_k", (248_320, 2560)) == 437_043_200
     with pytest.raises(ValueError, match="divisible by 256"):
         encoded_size("ggml_blocks_v1", "ggml_iq1_m", (4, 640))
     with pytest.raises(ValueError, match="does not accept"):

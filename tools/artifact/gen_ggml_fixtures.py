@@ -27,6 +27,8 @@ DEFAULT_OUT = ROOT / "tests" / "fixtures" / "ggml"
 # ggml's C names for the dequantizers.
 GGML_NAMES = {
     "ggml_q8_0": "q8_0",
+    "ggml_q4_k": "q4_K",
+    "ggml_q5_k": "q5_K",
     "ggml_q6_k": "q6_K",
     "ggml_iq2_xxs": "iq2_xxs",
     "ggml_iq2_xs": "iq2_xs",
@@ -99,7 +101,17 @@ def structured_blocks(spec: GgmlBlockFormat, count: int, seed: int = 0) -> np.nd
         b[1, 192:208] = 0x7F  # int8 127 scales
     elif name != "ggml_iq1_m":
         _put_u16(b, 0, d)
-    if name == "ggml_iq4_xs":
+    if name in ("ggml_q4_k", "ggml_q5_k"):
+        # dmin takes every special scale too, in other blocks than d.
+        _put_u16(b, 2, np.roll(d, 21))
+        j = np.arange(8)
+        sc = (n[:, None] + 7 * j) % 64  # every 6-bit scale and min in every sub-block j
+        m = (3 * n[:, None] + 5 * j + 11) % 64
+        for i in range(4):  # get_scale_min_k4's packing: j < 4 in bytes 0..7, j >= 4 split
+            b[:, 4 + i] = sc[:, i] | ((sc[:, i + 4] >> 4) << 6)
+            b[:, 8 + i] = m[:, i] | ((m[:, i + 4] >> 4) << 6)
+            b[:, 12 + i] = (sc[:, i + 4] & 0xF) | ((m[:, i + 4] & 0xF) << 4)
+    elif name == "ggml_iq4_xs":
         ls = (8 * n[:, None] + np.arange(8)) % 64  # every 6-bit sub-block scale
         low, high = ls & 0xF, ls >> 4
         b[:, 4:8] = low[:, 0::2] | (low[:, 1::2] << 4)

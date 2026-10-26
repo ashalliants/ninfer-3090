@@ -108,6 +108,44 @@ def _q6_k(b: np.ndarray) -> np.ndarray:
     return ((d[..., None] * scale) * q).reshape(-1, 256)
 
 
+def _scale_min_k4(scales: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """ggml's get_scale_min_k4 for j = 0..7: the 6-bit scales and mins packed in 12 bytes."""
+    q = scales.astype(np.int32)
+    sc = np.concatenate(
+        (q[:, 0:4] & 63, (q[:, 8:12] & 0xF) | ((q[:, 0:4] >> 6) << 4)), axis=1
+    )
+    m = np.concatenate(
+        (q[:, 4:8] & 63, (q[:, 8:12] >> 4) | ((q[:, 4:8] >> 6) << 4)), axis=1
+    )
+    return sc, m
+
+
+def _affine_k(b: np.ndarray, q: np.ndarray) -> np.ndarray:
+    """``d1 * q - m1`` per 32-value sub-block j, with d1 = d * sc_j and m1 = dmin * m_j."""
+    d = _fp16(b[:, 0:2])
+    dmin = _fp16(b[:, 2:4])
+    sc, m = _scale_min_k4(b[:, 4:16])
+    d1 = (d[:, None] * sc.astype(_F32))[:, :, None]
+    m1 = (dmin[:, None] * m.astype(_F32))[:, :, None]
+    return (d1 * q.astype(_F32) - m1).reshape(-1, 256)
+
+
+def _q4_k(b: np.ndarray) -> np.ndarray:
+    qs = b[:, 16:144].reshape(-1, 4, 32)
+    # Chunk c of 64 values: the low nibbles of qs[32c..32c+31], then their high nibbles.
+    q = np.stack((qs & 0xF, qs >> 4), axis=2).reshape(-1, 8, 32)
+    return _affine_k(b, q)
+
+
+def _q5_k(b: np.ndarray) -> np.ndarray:
+    qh = b[:, 16:48].astype(np.int32)
+    qs = b[:, 48:176].reshape(-1, 4, 32).astype(np.int32)
+    low = np.stack((qs & 0xF, qs >> 4), axis=2).reshape(-1, 8, 32)
+    # Sub-block j takes bit j of qh[l] as its fifth bit (ggml's u1, u2 masks).
+    high = ((qh[:, None, :] >> np.arange(8)[None, :, None]) & 1) << 4
+    return _affine_k(b, low + high)
+
+
 def _iq2_xxs(b: np.ndarray) -> np.ndarray:
     d = _fp16(b[:, 0:2])
     q = b[:, 2:66].reshape(-1, 8, 8)
@@ -228,6 +266,8 @@ _DECODERS = {
     "ggml_q2_0": _q2_0,
     "ggml_iq4_nl": _iq4_nl,
     "ggml_iq4_xs": _iq4_xs,
+    "ggml_q4_k": _q4_k,
+    "ggml_q5_k": _q5_k,
     "ggml_q6_k": _q6_k,
     "ggml_iq2_xxs": _iq2_xxs,
     "ggml_iq2_xs": _iq2_xs,
