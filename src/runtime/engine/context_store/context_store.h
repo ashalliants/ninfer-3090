@@ -241,10 +241,13 @@ public:
         std::uint64_t fetch_ns      = 0;
         bool expired                = false;
     };
-    // `deadline` bounds the download from the bucket: no chunk is started after it.
+    // `deadline` bounds the download from the bucket: no chunk is started after it. `reuse`, when
+    // given, holds the image (an earlier image's buffer: its pages are mapped already, so the
+    // read does not fault them in); its old bytes are all overwritten.
     [[nodiscard]] std::optional<std::vector<std::uint8_t>>
     load(const std::string& id, bool touch = true, LoadReport* report = nullptr,
-         std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max());
+         std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max(),
+         std::vector<std::uint8_t> reuse = {});
 
     [[nodiscard]] std::vector<Info> list() const;
     [[nodiscard]] std::optional<Info> find(const std::string& id) const;

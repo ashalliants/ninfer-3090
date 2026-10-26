@@ -1461,7 +1461,7 @@ void ContextStore::make_room_on_volume_locked(const std::string& id, std::uint64
 
 std::optional<std::vector<std::uint8_t>> ContextStore::load(
     const std::string& id, bool touch, LoadReport* report,
-    std::chrono::steady_clock::time_point deadline) {
+    std::chrono::steady_clock::time_point deadline, std::vector<std::uint8_t> reuse) {
     if (!valid_id(id)) { return std::nullopt; }
     // From here until it returns, the image is not evicted or expired and its chunk files are
     // pinned: a put meanwhile (no lock is held while chunks download) would otherwise remove what
@@ -1566,7 +1566,10 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(
             };
             if (!read_manifest(manifest_path(id), entry, &segments)) { return fail(); }
             const auto image_bytes = static_cast<std::size_t>(entry.info.image_bytes);
-            std::vector<std::uint8_t> image(image_bytes);
+            // Into the caller's buffer when it gives one (an earlier image's, already mapped, so
+            // the reads do not fault fresh pages in); every byte is written below.
+            std::vector<std::uint8_t> image = pass == 0 ? std::move(reuse) : std::vector<std::uint8_t>{};
+            image.resize(image_bytes);
             std::uint8_t* const buffer = image.data();
             struct Piece {
                 const ChunkRef* chunk;
