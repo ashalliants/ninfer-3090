@@ -128,6 +128,51 @@ inline void q6_k(const std::byte* b, float* y) {
     }
 }
 
+// ggml's get_scale_min_k4: the 6-bit scale and min of sub-block j from the 12 packed bytes at 4.
+inline void scale_min_k4(const std::byte* b, int j, int& sc, int& m) {
+    const auto q = [&](int i) { return static_cast<int>(u8(b, 4 + static_cast<std::size_t>(i))); };
+    if (j < 4) {
+        sc = q(j) & 63;
+        m  = q(j + 4) & 63;
+    } else {
+        sc = (q(j + 4) & 0xF) | ((q(j - 4) >> 6) << 4);
+        m  = (q(j + 4) >> 4) | ((q(j) >> 6) << 4);
+    }
+}
+
+// Q4_K {fp16 d; fp16 dmin; u8 scales[12]; u8 qs[128]} and Q5_K (qh[32] before qs): sub-block j
+// is d1 * q - m1 with d1 = d * sc_j and m1 = dmin * m_j, two FP32 operations.
+inline void q4_k(const std::byte* b, float* y) {
+    const float d    = fp16(u16(b, 0));
+    const float dmin = fp16(u16(b, 2));
+    for (int j = 0; j < 8; ++j) {
+        int sc = 0, m = 0;
+        scale_min_k4(b, j, sc, m);
+        const float d1 = d * static_cast<float>(sc);
+        const float m1 = dmin * static_cast<float>(m);
+        for (int l = 0; l < 32; ++l) {
+            const auto q = u8(b, 16 + 32 * static_cast<std::size_t>(j / 2) + l);
+            y[32 * j + l] = d1 * static_cast<float>(j % 2 ? q >> 4 : q & 0xF) - m1;
+        }
+    }
+}
+
+inline void q5_k(const std::byte* b, float* y) {
+    const float d    = fp16(u16(b, 0));
+    const float dmin = fp16(u16(b, 2));
+    for (int j = 0; j < 8; ++j) {
+        int sc = 0, m = 0;
+        scale_min_k4(b, j, sc, m);
+        const float d1 = d * static_cast<float>(sc);
+        const float m1 = dmin * static_cast<float>(m);
+        for (int l = 0; l < 32; ++l) {
+            const auto ql = u8(b, 48 + 32 * static_cast<std::size_t>(j / 2) + l);
+            const int q   = (j % 2 ? ql >> 4 : ql & 0xF) + (((u8(b, 16 + l) >> j) & 1) << 4);
+            y[32 * j + l] = d1 * static_cast<float>(q) - m1;
+        }
+    }
+}
+
 inline void iq2_xxs(const std::byte* b, float* y) {
     const float d = fp16(u16(b, 0));
     for (int ib32 = 0; ib32 < 8; ++ib32) {
@@ -272,6 +317,10 @@ inline void decode_blocks(QType format, std::span<const std::byte> blocks, std::
         switch (format) {
         case QType::GGML_Q8_0:
             return detail::q8_0;
+        case QType::GGML_Q4_K:
+            return detail::q4_k;
+        case QType::GGML_Q5_K:
+            return detail::q5_k;
         case QType::GGML_Q6_K:
             return detail::q6_k;
         case QType::GGML_IQ2_XXS:

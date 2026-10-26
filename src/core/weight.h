@@ -50,6 +50,10 @@ enum class QType : std::uint16_t {
     GGML_REC_IQ3_S_Q2_0     = 31,
     GGML_REC_IQ3_S_IQ4_NL   = 32,
     GGML_REC_IQ4_XS_IQ4_NL  = 33,
+    // ggml's affine K-quants (tensor-formats.md Section 3.5): the dense projections and output head
+    // of the GSQ-RCO IQ3 packs.
+    GGML_Q4_K = 34,
+    GGML_Q5_K = 35,
 };
 
 // One GGML block: `values` consecutive K values encoded in `bytes` bytes, scales included.
@@ -83,6 +87,10 @@ struct GgmlBlock {
         return {256, 74};
     case QType::GGML_IQ3_XXS:
         return {256, 98};
+    case QType::GGML_Q4_K:
+        return {256, 144};
+    case QType::GGML_Q5_K:
+        return {256, 176};
     default:
         return {};
     }

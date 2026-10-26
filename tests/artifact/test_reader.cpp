@@ -137,7 +137,8 @@ void geometry_and_views() {
 void ggml_geometry() {
     constexpr std::array names = {"ggml_q8_0",   "ggml_q6_k",   "ggml_iq2_xxs", "ggml_iq4_nl",
                                   "ggml_iq3_s",  "ggml_iq2_s",  "ggml_iq4_xs",  "ggml_iq1_m",
-                                  "ggml_q2_0",   "ggml_iq2_xs", "ggml_iq3_xxs"};
+                                  "ggml_q2_0",   "ggml_iq2_xs", "ggml_iq3_xxs", "ggml_q4_k",
+                                  "ggml_q5_k"};
     for (const auto* name : names) {
         const auto format = parse_format(name);
         require(is_ggml_block(format) && !is_ggml_record(format) && format_name(format) == name,
