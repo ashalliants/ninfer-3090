@@ -116,6 +116,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_scheduler_test
   ninfer_shared_prefix_scan_test
   ninfer_model_registry_test
+  ninfer_serve_config_file_test
   ninfer_serve_options_test
   ninfer_slots_report_test
   ninfer_tensor_test
