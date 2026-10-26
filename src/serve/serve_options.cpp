@@ -228,7 +228,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--ngram-prefetch] "
            "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
            "[--moe-fused-route] [--cpu-verify-misses] [--prefill-cpu-share F] [--cpu-verify-workers N] [--gdn-async-commit] [--hc-int8 [--hc-fused-read]] "
-           "[--ngram-flag-wait] [--partial-ram-residency] "
+           "[--ngram-flag-wait] [--partial-ram-residency] [--ggml-decode-mma] "
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
@@ -357,7 +357,10 @@ std::string serve_usage_text(const char* argv0) {
            "read (the same output, bit for bit; off by default); --partial-ram-residency keeps only the "
            "experts the VRAM cache does not hold in RAM (the hottest are read straight into VRAM), so packs "
            "larger than RAM load; the same output, bit for bit; the cache keeps its startup size and long "
-           "prompts prefill without the expert stream (off by default); "
+           "prompts prefill without the expert stream (off by default); --ggml-decode-mma runs the dense "
+           "GGML layers of decode steps, MTP drafts and verification on the int8 tensor cores (16 rows by 8 "
+           "columns per instruction) instead of the dp4a GEMV (the same A8 cast and integer products, summed "
+           "in another fixed order: changes the numerics slightly; prefill unchanged; off by default); "
            "--vision takes "
            "images when "
            "the model was converted with "
@@ -865,6 +868,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.flash_next.ngram_flag_wait = true;
         } else if (arg == "--partial-ram-residency") {
             options.flash_next.partial_ram_residency = true;
+        } else if (arg == "--ggml-decode-mma") {
+            options.flash_next.ggml_decode_mma = true;
         } else if (arg == "--prefill-cpu-share") {
             options.flash_next.prefill_cpu_share = parse_share(require_value("--prefill-cpu-share"));
         } else if (arg == "--cpu-verify-workers") {

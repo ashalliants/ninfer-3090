@@ -501,6 +501,10 @@ struct ProgramOptions {
     // the round: its request ends with an error and nothing of it is committed. Memory:
     // plan_ngram_flag_wait.
     bool ngram_flag_wait = false;
+    // FlashNextOptions::ggml_decode_mma: the forward's GGML dense Linears of at most 8 columns run
+    // the int8 tensor-core decode route (execution::ForwardOptions::ggml_decode_mma). Changes the
+    // numerics (summation order); no memory, no workspace.
+    bool ggml_decode_mma = false;
     // FlashNextOptions::partial_ram_residency: the model's text banks were left in the artifact
     // (plan_load with partial). The Program reads `partial_vram_keys` (hottest first) into frames,
     // where they live only in VRAM, and every other expert into `partial_slots[l]` pinned RAM slots of

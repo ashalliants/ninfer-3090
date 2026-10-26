@@ -523,6 +523,17 @@ int main() {
                       "--ngram-flag-wait with MTP and two lanes does not reach the Engine");
     failures += check(serve_usage_text("ninfer-serve").find("--ngram-flag-wait") != std::string::npos,
                       "the usage text does not name --ngram-flag-wait");
+    failures += check(!defaults.flash_next.ggml_decode_mma, "the GGML int8 tensor-core decode route is on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--ggml-decode-mma"}))
+                          .flash_next.ggml_decode_mma,
+                      "--ggml-decode-mma does not reach the Engine");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                                                 "--max-concurrency", "2", "--partial-ram-residency",
+                                                 "--ggml-decode-mma"}))
+                          .flash_next.ggml_decode_mma,
+                      "--ggml-decode-mma with MTP, two lanes and partial RAM residency does not reach the Engine");
+    failures += check(serve_usage_text("ninfer-serve").find("--ggml-decode-mma") != std::string::npos,
+                      "the usage text does not name --ggml-decode-mma");
     failures += check(!defaults.flash_next.partial_ram_residency, "partial RAM residency is on by default");
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--partial-ram-residency"}))
                           .flash_next.partial_ram_residency,

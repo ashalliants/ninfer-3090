@@ -46,36 +46,46 @@ ops::GateUpVariant gate_up_variant(bool registers) {
     return registers ? ops::GateUpVariant::Registers : ops::GateUpVariant::Staged;
 }
 
-void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work, cudaStream_t s) {
-    ops::linear(x, p.weight, out, p.policy, work, s);
+// The policy a projection runs under: its own, or under ForwardOptions::ggml_decode_mma, for a GGML
+// weight whose policy admits A8, the int8 tensor-core decode route's.
+ops::LinearPolicy linear_policy(const LinearParameters& p, bool ggml_decode_mma) {
+    return ggml_decode_mma && p.weight.layout == QuantLayout::GgmlBlocks && ops::allows_a8(p.policy)
+               ? ops::LinearPolicy::AllowA8GgmlDecodeMma
+               : p.policy;
+}
+
+void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work, cudaStream_t s,
+             bool ggml_decode_mma) {
+    ops::linear(x, p.weight, out, linear_policy(p, ggml_decode_mma), work, s);
 }
 
 // Two projections of one input: one linear_pair launch for decode-width calls over GGML weights
 // (the same outputs as two linears, bit for bit) when both policies admit A8 (the only GGML profile;
-// linear() rejects A16Only for them, so the pair must not bypass that), else two linears.
+// linear() rejects A16Only for them, so the pair must not bypass that), else two linears. Under
+// ForwardOptions::ggml_decode_mma always two linears: linear_pair is the dp4a route's.
 void project_pair(const Tensor& x, const LinearParameters& a, const LinearParameters& b, Tensor& out_a, Tensor& out_b,
-                  WorkspaceArena& work, cudaStream_t s) {
-    if (x.ne[1] <= 8 && a.weight.layout == QuantLayout::GgmlBlocks && b.weight.layout == QuantLayout::GgmlBlocks &&
-        ops::allows_a8(a.policy) && ops::allows_a8(b.policy)) {
+                  WorkspaceArena& work, cudaStream_t s, bool ggml_decode_mma) {
+    if (!ggml_decode_mma && x.ne[1] <= 8 && a.weight.layout == QuantLayout::GgmlBlocks &&
+        b.weight.layout == QuantLayout::GgmlBlocks && ops::allows_a8(a.policy) && ops::allows_a8(b.policy)) {
         ops::linear_pair(x, a.weight, b.weight, out_a, out_b, s);
         return;
     }
-    project(x, a, out_a, work, s);
-    project(x, b, out_b, work, s);
+    project(x, a, out_a, work, s, ggml_decode_mma);
+    project(x, b, out_b, work, s, ggml_decode_mma);
 }
 
 // A MoE block's shared expert: gate/up, SiLU-mul, down on `s`. Its tensors come from `tensors`, its
 // Linears' scratch from `scratch` (the same arena, or the side stream's carve of it).
 Tensor shared_expert(const MoeParameters& p, const Tensor& x, std::int32_t I, std::int32_t H, WorkspaceArena& tensors,
-                     WorkspaceArena& scratch, cudaStream_t s) {
+                     WorkspaceArena& scratch, cudaStream_t s, bool ggml_decode_mma) {
     const std::int32_t T = x.ne[1];
     Tensor g = tensors.alloc(DType::BF16, {I, T});
     Tensor u = tensors.alloc(DType::BF16, {I, T});
-    project_pair(x, p.shared_gate, p.shared_up, g, u, scratch, s);
+    project_pair(x, p.shared_gate, p.shared_up, g, u, scratch, s, ggml_decode_mma);
     Tensor product = tensors.alloc(DType::BF16, {I, T});
     ops::silu_mul(g, u, product, s);
     Tensor shared = tensors.alloc(DType::BF16, {H, T});
-    project(product, p.shared_down, shared, scratch, s);
+    project(product, p.shared_down, shared, scratch, s, ggml_decode_mma);
     return shared;
 }
 
@@ -183,7 +193,8 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
       hot_embedding_rows_(options.hot_embedding_rows), hot_embedding_(options.hot_embedding),
       cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map),
       moe_precast_input_(options.moe_precast_input), moe_gate_up_registers_(options.moe_gate_up_registers),
-      moe_fused_route_(options.moe_fused_route), hc_int8_(options.hc_int8), hc_fused_read_(options.hc_fused_read) {
+      moe_fused_route_(options.moe_fused_route), hc_int8_(options.hc_int8), hc_fused_read_(options.hc_fused_read),
+      ggml_decode_mma_(options.ggml_decode_mma) {
     require_hc_int8(parameters_, hc_int8_, hc_fused_read_);
     if (state_.gdn_conv.size() != config_.gdn_layers || state_.gdn_recurrent.size() != config_.gdn_layers ||
         state_.ple_slot.dtype != DType::I32 || state_.ple_slot.numel() != 1 ||
@@ -213,7 +224,8 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
       hot_embedding_rows_(options.hot_embedding_rows), hot_embedding_(options.hot_embedding),
       cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map),
       moe_precast_input_(options.moe_precast_input), moe_gate_up_registers_(options.moe_gate_up_registers),
-      moe_fused_route_(options.moe_fused_route), hc_int8_(options.hc_int8), hc_fused_read_(options.hc_fused_read) {
+      moe_fused_route_(options.moe_fused_route), hc_int8_(options.hc_int8), hc_fused_read_(options.hc_fused_read),
+      ggml_decode_mma_(options.ggml_decode_mma) {
     require_hc_int8(parameters_, hc_int8_, hc_fused_read_);
     if (mtp.has_value() != parameters_.mtp.has_value()) {
         throw std::invalid_argument("Qwen4Exp forward: the MTP drafter's parameters and state go together");
@@ -608,12 +620,12 @@ void Forward::ple_inject(const PleParameters& p, Tensor& residual, const Tensor&
 void Forward::project_verify(const Tensor& x, const LinearParameters& p, Tensor& out, bool columnwise) {
     const cudaStream_t s = device_.stream;
     if (!columnwise || x.ne[1] == 1) {
-        project(x, p, out, *work_, s);
+        project(x, p, out, *work_, s, ggml_decode_mma_);
         return;
     }
     for (std::int32_t t = 0; t < x.ne[1]; ++t) {
         Tensor column = out.slice(1, t, 1);
-        project(x.slice(1, t, 1), p, column, *work_, s);
+        project(x.slice(1, t, 1), p, column, *work_, s, ggml_decode_mma_);
     }
 }
 
@@ -628,9 +640,9 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     GdnReplayRecordLayer records;
     if (batch.verify != nullptr) { records = batch.verify->gdn.layer(static_cast<std::int32_t>(index), 1); }
     Tensor qkv = batch.verify != nullptr ? records.conv.view({C, T}) : work_->alloc(DType::BF16, {C, T});
-    project(x, p.qkv, qkv, *work_, s);
+    project(x, p.qkv, qkv, *work_, s, ggml_decode_mma_);
     Tensor z = work_->alloc(DType::BF16, {VW, T});
-    project(x, p.z, z, *work_, s);
+    project(x, p.z, z, *work_, s, ggml_decode_mma_);
     Tensor ab = work_->alloc(DType::BF16, {2 * NV, T});
     project_verify(x, p.control, ab, batch.verify != nullptr);
     Tensor a = work_->alloc(DType::BF16, {NV, T});
@@ -674,7 +686,7 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
                        g.output_gate == GateActivation::Sigmoid ? ops::RmsGate::Sigmoid : ops::RmsGate::Silu,
                        config_.rms_norm_eps, normed, device_.execution_view());
     Tensor y = work_->alloc(DType::BF16, {H, T});
-    project(normed.view({VW, T}), p.output, y, *work_, s);
+    project(normed.view({VW, T}), p.output, y, *work_, s, ggml_decode_mma_);
     return y;
 }
 
@@ -687,7 +699,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
     const std::int32_t IH = dim(config_.qsa.index_heads), ID = dim(config_.qsa.index_head_dim);
     // Query and gate rows interleave per head: [D query rows, D gate rows] for each of NH heads.
     Tensor qg = work_->alloc(DType::BF16, {2 * QW, T});
-    project(x, p.query_gate, qg, *work_, s);
+    project(x, p.query_gate, qg, *work_, s, ggml_decode_mma_);
     Tensor q    = work_->alloc(DType::BF16, {D, NH, T});
     Tensor gate = work_->alloc(DType::BF16, {D, NH, T});
     {
@@ -699,7 +711,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
     Tensor v = work_->alloc(DType::BF16, {D, KVH, T});
     {
         Tensor kf = k.view({D * KVH, T}), vf = v.view({D * KVH, T});
-        project_pair(x, p.key, p.value, kf, vf, *work_, s);
+        project_pair(x, p.key, p.value, kf, vf, *work_, s, ggml_decode_mma_);
     }
     // The indexer's BF16 rows in FP32, then rounded once to BF16 (Linear's BF16 output boundary).
     Tensor indexed = work_->alloc(DType::FP32, {IH * ID + ID, T});
@@ -751,7 +763,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
     // Output gate: out * sigmoid(gate), then o_proj.
     ops::sigmoid_mul(gate, out, s);
     Tensor y = work_->alloc(DType::BF16, {H, T});
-    project(out.view({QW, T}), p.output, y, *work_, s);
+    project(out.view({QW, T}), p.output, y, *work_, s, ggml_decode_mma_);
     return y;
 }
 
@@ -777,7 +789,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         // After the fused read the side stream waits for x alone (the fork event the read recorded).
         fork.emplace(*side_, s, read != nullptr && read->forked);
         WorkspaceArena scratch(work_->alloc_bytes(shared_expert_scratch_bytes(p, T, T)));
-        shared = shared_expert(p, x, I, H, *work_, scratch, side_->stream);
+        shared = shared_expert(p, x, I, H, *work_, scratch, side_->stream, ggml_decode_mma_);
     }
     ops::MoeRouting routing;
     ops::MoeDispatch dispatch;
@@ -860,7 +872,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     if (fork) {
         fork->join();
     } else {
-        shared = shared_expert(p, x, I, H, *work_, *work_, s);
+        shared = shared_expert(p, x, I, H, *work_, *work_, s, ggml_decode_mma_);
     }
     // The CPU's outputs, before the combine reads them (the experts' workspace is still reserved: it
     // was allocated before the shared expert's tensors and the scope ends with the layer).
@@ -983,9 +995,9 @@ Tensor Forward::gdn_rows(const GdnParameters& p, const Tensor& x, std::uint32_t 
     const std::int32_t NV = dim(g.value_heads), NK = dim(g.key_heads), DK = dim(g.key_head_dim),
                        DV = dim(g.value_head_dim);
     Tensor qkv = work_->alloc(DType::BF16, {C, B});
-    project(x, p.qkv, qkv, *work_, s);
+    project(x, p.qkv, qkv, *work_, s, ggml_decode_mma_);
     Tensor z = work_->alloc(DType::BF16, {VW, B});
-    project(x, p.z, z, *work_, s);
+    project(x, p.z, z, *work_, s, ggml_decode_mma_);
     Tensor ab = work_->alloc(DType::BF16, {2 * NV, B});
     project_verify(x, p.control, ab, /*columnwise=*/true);
     Tensor a = work_->alloc(DType::BF16, {NV, B});
@@ -1026,7 +1038,7 @@ Tensor Forward::gdn_rows(const GdnParameters& p, const Tensor& x, std::uint32_t 
                        g.output_gate == GateActivation::Sigmoid ? ops::RmsGate::Sigmoid : ops::RmsGate::Silu,
                        config_.rms_norm_eps, normed, device_.execution_view());
     Tensor y = work_->alloc(DType::BF16, {H, B});
-    project(normed.view({VW, B}), p.output, y, *work_, s);
+    project(normed.view({VW, B}), p.output, y, *work_, s, ggml_decode_mma_);
     return y;
 }
 
@@ -1038,7 +1050,7 @@ Tensor Forward::attention_rows(const AttentionParameters& p, const Tensor& x, st
     const std::int32_t D = dim(a.head_dim), NH = dim(a.heads), KVH = dim(a.kv_heads), QW = dim(a.query_width());
     const std::int32_t IH = dim(config_.qsa.index_heads), ID = dim(config_.qsa.index_head_dim);
     Tensor qg = work_->alloc(DType::BF16, {2 * QW, B});
-    project(x, p.query_gate, qg, *work_, s);
+    project(x, p.query_gate, qg, *work_, s, ggml_decode_mma_);
     Tensor q    = work_->alloc(DType::BF16, {D, NH, B});
     Tensor gate = work_->alloc(DType::BF16, {D, NH, B});
     {
@@ -1050,7 +1062,7 @@ Tensor Forward::attention_rows(const AttentionParameters& p, const Tensor& x, st
     Tensor v = work_->alloc(DType::BF16, {D, KVH, B});
     {
         Tensor kf = k.view({D * KVH, B}), vf = v.view({D * KVH, B});
-        project_pair(x, p.key, p.value, kf, vf, *work_, s);
+        project_pair(x, p.key, p.value, kf, vf, *work_, s, ggml_decode_mma_);
     }
     Tensor indexed = work_->alloc(DType::FP32, {IH * ID + ID, B});
     {
@@ -1102,7 +1114,7 @@ Tensor Forward::attention_rows(const AttentionParameters& p, const Tensor& x, st
     }
     ops::sigmoid_mul(gate, out, s);
     Tensor y = work_->alloc(DType::BF16, {H, B});
-    project(out.view({QW, B}), p.output, y, *work_, s);
+    project(out.view({QW, B}), p.output, y, *work_, s, ggml_decode_mma_);
     return y;
 }
 
@@ -1194,7 +1206,7 @@ Tensor Forward::mtp_attention(const MtpParameters& p, const Tensor& x, const Mtp
                        device_.execution_view());
     ops::sigmoid_mul(gate, out, s);
     Tensor y = work_->alloc(DType::BF16, {H, T});
-    project(out.view({QW, T}), p.output, y, *work_, s);
+    project(out.view({QW, T}), p.output, y, *work_, s, ggml_decode_mma_);
     return y;
 }
 
@@ -1272,13 +1284,13 @@ void Forward::mtp_block(const MtpCall& call) {
         Tensor e = work_->alloc(DType::BF16, {H, T});
         ops::rmsnorm(x0, p.embedding_norm, config_.rms_norm_eps, true, e, s);
         Tensor ep = work_->alloc(DType::BF16, {H, T});
-        project(e, p.embedding_projection, ep, *work_, s);
+        project(e, p.embedding_projection, ep, *work_, s, ggml_decode_mma_);
         Tensor hn = work_->alloc(DType::BF16, {W, T});
         ops::rmsnorm(call.residuals, p.hidden_norm, config_.rms_norm_eps, true, hn, s);
         Tensor residual = work_->alloc(DType::BF16, {W, T});
         {
             Tensor per_stream = residual.view({H, S * T});
-            project(hn.view({H, S * T}), p.hidden_projection, per_stream, *work_, s);
+            project(hn.view({H, S * T}), p.hidden_projection, per_stream, *work_, s, ggml_decode_mma_);
         }
         ops::hyper_connection_inject(ep, mtp_->ones.slice(1, 0, T), residual, s);
         const auto tap = [&](const Tensor& target, const Tensor& source) {

@@ -1238,6 +1238,44 @@ None has been measured on the RTX 3090 yet.
     `--cpu-verify-misses`, which must serve an expert), the host-slot
     placements of `ninfer_offloaded_moe_layer_test` and `ninfer_offloaded_moe_wide_test`; a Windows
     start of the IQ3_XXS pack on 64 GB. Not measured: decode with write-backs, startup time.
+- **Int8 tensor-core GEMV for the dense GGML linears** (`--ggml-decode-mma`; F6 of the Basalt
+  learnings, Basalt's `dense_tc`). Issue #383 put the dp4a decode route's IQ3_S at about 42% of
+  bandwidth (about nine sub-word global loads per 32 values), with T = 8 at 30.9 us against 20.2 us
+  at T = 1.
+  With the option the Forward runs every GGML dense Linear whose policy admits A8 under
+  `ops::LinearPolicy::AllowA8GgmlDecodeMma` (the text model's and the drafter's), and calls of at
+  most 8 columns take `src/ops/linear/ggml/ggml_mma_decode.cuh`: persistent CTAs of 8 warps over
+  16-row tiles; each tile's 256-value chunks (16 rows) stream through a ring of 3 shared-memory slots
+  by 16-byte `cp.async`, issued two chunks ahead across tiles; the activation's Q8_1 cast is made
+  in shared memory by the same canonical cast as the dp4a route; warp w takes sub-block w of each
+  chunk and runs one `mma.sync.m16n8k32.s8` for its 16 rows by 8 columns (two `m16n8k16` for Q6_K's
+  16-value scales); IQ3_S is decoded from shared memory (grid and codes). Every dense format of the
+  packs: IQ4_XS, IQ3_S, Q6_K, Q5_K, Q4_K, IQ4_NL, Q8_0, Q2_0 (Basalt's Q3_K has no registered
+  problem here). The output heads (`projection_fp32`), `linear_pair` and the wide route are
+  unchanged; under the option the two-projection pairs (shared-expert gate/up, attention key/value)
+  run as two Linears.
+  - **Numerics change (order only).** The same A8 cast and the same exact integer products per 32
+    values; each sub-block's term is `fma(c * d, float(P), partial[s % 32])` (plus the affine
+    K-quants' offset term `fma(c_min * d, float(-m_min A), ...)`), the 32 lane partials reduced by a
+    fixed butterfly (`ggml_mma_emulation.h`, canonical_ggml.h's order), so the FP32 rounding differs
+    from the dp4a route's while a column's bits still do not depend on T or its position (verify
+    and two-lane columns stay those of a one-column call). Judge it with the decode-path KLD gate
+    (on vs off); there is no identity gate.
+  - Off: every existing GGML kernel compiles to the same SASS as before (the new instances live in
+    their own translation unit, `ggml_mma_decode.cu`), and the dispatch picks the dp4a route as before.
+  - Qualification: `ninfer_ggml_mma_emulation_test` (host only: the exact sub-block decode against
+    ggml's values on the golden fixtures and random blocks, every registered problem against FP64
+    within the GGML suite's criterion, the kernel's tile order equal to the row order bit for bit at
+    T = 1..8 in every column position, and the int32 range of the MMA sums on extreme blocks);
+    `ninfer_linear_ggml_test` (GPU, not run: every registered Linear and LinearAdd problem at
+    T = 1..8 bit for bit against the emulation and within FP64, T = 9 equal to AllowA8's wide route,
+    the policy's admission).
+  - Memory: none (no workspace; up to about 74 KiB of shared memory per CTA, Q5_K at K = 6144 and
+    T = 8).
+  - GPU-session checks: `ninfer_linear_ggml_test`; the KLD gate on vs off; each dense shape's time at
+    T = 1, 2, 4, 8 against the dp4a route (IQ3_S above all); tok/s on vs off with and without MTP.
+    Basalt estimates 0.3-0.5 ms per token plus a flatter verify. Designed to work with two lanes,
+    MTP and `--partial-ram-residency`. Not measured.
 
 ## Artifact decisions
 

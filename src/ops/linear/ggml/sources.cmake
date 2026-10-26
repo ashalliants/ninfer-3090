@@ -9,6 +9,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/ggml_iq4_nl.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_q8_0.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_q2_0.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/ggml_mma_decode.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_pair.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_pair_iq4_xs.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_pair_iq3_s.cu"

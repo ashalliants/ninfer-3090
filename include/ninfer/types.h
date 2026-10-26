@@ -481,6 +481,13 @@ struct FlashNextOptions {
     // data, so the same output bit for bit. A host that does not raise the flag within 1 s ends the
     // request with an error. Two-lane rounds and runs without CUDA graphs keep the two parts.
     bool ngram_flag_wait = false;
+    // The dense GGML linears' int8 tensor-core decode route (--ggml-decode-mma): calls of at most 8
+    // columns (decode, MTP drafts and verification, two-lane rows) compute 16 rows by 8 columns per
+    // mma.sync instruction from weights staged in shared memory, instead of the dp4a GEMV. The same
+    // A8 cast and the same exact integer products; the scale terms are summed in another fixed order,
+    // so CHANGES THE NUMERICS slightly (FP32 rounding only; still independent of the batch width).
+    // Prefill is unchanged. No memory. Off: the dp4a route.
+    bool ggml_decode_mma = false;
     // The context cache's NVMe tier: a scratch file of up to this many bytes holds the checkpoints,
     // with the Host context budget as its RAM cache (a zero Host budget then reuses prefixes from
     // disk alone); 0: none. The file is created in `context_nvme_dir` (empty: beside the artifact),

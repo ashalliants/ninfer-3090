@@ -34,6 +34,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_ggml_blocks_decode_test
   ninfer_ggml_linear_affine_test
   ninfer_ggml_linear_registry_test
+  ninfer_ggml_mma_emulation_test
   ninfer_grammar_test
   ninfer_greedy_identity_test
   ninfer_hadamard_overlap_test

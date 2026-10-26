@@ -338,6 +338,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.hc_int8               = next.hc_int8;
     program_options.hc_fused_read         = next.hc_fused_read;
     program_options.ngram_flag_wait       = next.ngram_flag_wait;
+    program_options.ggml_decode_mma       = next.ggml_decode_mma;
     program_options.partial_ram_residency = partial;
     program_options.artifact_path         = options.artifact_path;
     program_options.ngram_volume    = next.ngram_volume_path.empty()

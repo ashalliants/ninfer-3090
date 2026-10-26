@@ -53,6 +53,13 @@ ninfer_add_op_test(ninfer_ggml_linear_affine_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_linear_affine.cpp"
   LIBRARIES ninfer_core)
 
+# Host-only: the GGML linears' int8 tensor-core decode route (LinearPolicy::AllowA8GgmlDecodeMma,
+# ggml_mma_emulation.h) against ggml's decode and an FP64 oracle at every registered problem, its
+# tile order against the row order at T = 1..8, and the int32 range of its MMA sums.
+ninfer_add_op_test(ninfer_ggml_mma_emulation_test NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_mma_emulation.cpp"
+  LIBRARIES ninfer_core)
+
 # Host-only: the GatedDeltaNet head map in the FP64 oracle. The tiled map (value head h reads key
 # head h % Hqk, Qwen3.8-Flash-Next) on 16 q/k heads equals, bit for bit, the blocked map on q/k
 # tiled to one head per value head.

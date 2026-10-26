@@ -17,6 +17,14 @@
 // T covers both routes and their seams: 1..8 (decode), 9 (first wide), 63/64/65 (one wide column
 // tile and its edges) and 300 (interior, partial last tile).
 //
+// The int8 tensor-core decode route (LinearPolicy::AllowA8GgmlDecodeMma, every format, Linear and
+// LinearAdd) at T = 1..9: T <= 8 bit for bit against its host emulation
+// (ops/linear/ggml/ggml_mma_emulation.h, qualified against FP64 on the host by
+// ninfer_ggml_mma_emulation_test) and within the FP64 criterion; T = 9 bit for bit the AllowA8 wide
+// route. linear_pair takes no policy and keeps the dp4a route: its outputs stay linear()'s under
+// AllowA8 bit for bit (the Forward runs two linears instead under --ggml-decode-mma). The policy's
+// admission: GGML formats only, and a 16-byte aligned weight for the route.
+//
 // linear_pair over GGML weights (its decode route, T = 1..8): every ordered pair of IQ4_XS, IQ3_S,
 // Q6_K, Q5_K and Q4_K at both registered pair shapes, each output against the same FP64 oracle and bit for
 // bit against linear() on its own weight; and its admission.
@@ -32,6 +40,7 @@
 #include "ops/ggml_blocks_decode.h"
 #include "ops/ggml_linear_emulation.h"
 #include "ops/linear/ggml/ggml_launch.h"
+#include "ops/linear/ggml/ggml_mma_emulation.h"
 #include "ops/linear/ggml/ggml_shapes.h"
 #include "ops/op_check.h"
 #include "ops/op_tester.h"
@@ -227,6 +236,34 @@ std::vector<std::vector<std::uint16_t>> emulate(QType format, const std::vector<
     return out;
 }
 
+// The int8 tensor-core decode route's BF16 outputs [t][n] for the first kGgmlDecodeMaxTokens columns,
+// by its host emulation (a column's bits depend on neither T nor its position).
+std::vector<std::uint16_t> emulate_mma(QType format, const std::vector<std::uint8_t>& blocks, std::int32_t n,
+                                       std::int32_t k, const Q81& x, const std::vector<std::uint16_t>* residual) {
+    namespace em                = test::ggml_linear;
+    constexpr std::int32_t kCols = ops::detail::kGgmlDecodeMaxTokens;
+    const std::size_t row_bytes = ops::ggml_mma::row_bytes(format, k);
+    std::vector<std::uint16_t> out(static_cast<std::size_t>(n) * kCols);
+    const unsigned workers = std::max(1U, std::min(16U, std::thread::hardware_concurrency()));
+    std::vector<std::thread> pool;
+    for (unsigned id = 0; id < workers; ++id) {
+        pool.emplace_back([&, id] {
+            for (std::int32_t row = static_cast<std::int32_t>(id); row < n; row += static_cast<std::int32_t>(workers)) {
+                const auto* bytes = reinterpret_cast<const std::byte*>(blocks.data() + row * row_bytes);
+                for (std::int32_t col = 0; col < kCols; ++col) {
+                    float acc = 0.0F;
+                    ops::ggml_mma_emulate(format, bytes, x.q.data() + static_cast<std::size_t>(col) * k,
+                                          x.d.data() + static_cast<std::size_t>(col) * (k / 32), k, &acc);
+                    const std::size_t o = static_cast<std::size_t>(col) * n + row;
+                    out[o]              = em::store(acc, residual ? &(*residual)[o] : nullptr);
+                }
+            }
+        });
+    }
+    for (auto& worker : pool) worker.join();
+    return out;
+}
+
 // Runs every T on one (format, shape, op) and compares against the FP64 oracle.
 int run_problem(QType format, std::int32_t n, std::int32_t k, bool add) {
     const std::uint32_t seed = static_cast<std::uint32_t>(n * 131 + k * 7 + static_cast<int>(format));
@@ -292,7 +329,49 @@ int run_problem(QType format, std::int32_t n, std::int32_t k, bool add) {
             }
         }
     }
-    return failures;
+
+    // The int8 tensor-core decode route: T = 1..8 against its emulation, T = 9 the AllowA8 wide route.
+    const auto mma_emulated = emulate_mma(format, blocks, n, k, xq, add ? &residual : nullptr);
+    const auto run          = [&](LinearPolicy policy, std::int32_t t) {
+        const std::size_t capacity = add ? ops::linear_add_workspace_capacity_bytes(format, n, k, policy, t, t)
+                                         : ops::linear_workspace_capacity_bytes(format, n, k, policy, t, t);
+        DeviceArena workspace(std::max<std::size_t>(capacity, 256));
+        Tensor x(d_x.p, DType::BF16, {k, t});
+        Tensor out(d_out.p, DType::BF16, {n, t});
+        if (add) {
+            d_out.copy_from_host(residual.data(), static_cast<std::size_t>(n) * t * 2);
+            ops::linear_add(x, weight, out, policy, workspace, nullptr);
+        } else {
+            cuda_check(cudaMemset(d_out.p, 0xFF, static_cast<std::size_t>(n) * t * 2), "poison");
+            ops::linear(x, weight, out, policy, workspace, nullptr);
+        }
+        cuda_check(cudaDeviceSynchronize(), "linear");
+        return download_bf16(d_out.p, static_cast<std::size_t>(n) * t);
+    };
+    int mma_failures = 0;
+    for (std::int32_t t = 1; t <= ops::detail::kGgmlDecodeMaxTokens + 1; ++t) {
+        const std::string what = label + " AllowA8GgmlDecodeMma T=" + std::to_string(t);
+        const auto bits        = run(LinearPolicy::AllowA8GgmlDecodeMma, t);
+        std::vector<double> got(bits.size());
+        for (std::size_t i = 0; i < got.size(); ++i) got[i] = bf16_to_f32(bits[i]);
+        mma_failures += test::verify_reduction(what, got, std::span<const double>(expected.data(), got.size()),
+                                               kGgmlQ81Criterion);
+        std::size_t differ = 0;
+        if (t <= ops::detail::kGgmlDecodeMaxTokens) {
+            for (std::size_t i = 0; i < bits.size(); ++i) differ += bits[i] != mma_emulated[i];
+            if (differ != 0) { std::cerr << what << ": " << differ << " outputs differ from the host emulation\n"; }
+        } else {
+            const auto wide = run(LinearPolicy::AllowA8, t);
+            for (std::size_t i = 0; i < bits.size(); ++i) differ += bits[i] != wide[i];
+            if (differ != 0) { std::cerr << what << ": " << differ << " outputs differ from AllowA8's wide route\n"; }
+        }
+        mma_failures += differ != 0;
+    }
+    if (mma_failures == 0) {
+        std::cout << label << " AllowA8GgmlDecodeMma: T=1..8 equal to the emulation bit for bit, T=9 to AllowA8, "
+                  << "within the FP64 criterion\n";
+    }
+    return failures + mma_failures;
 }
 
 // linear_pair on (first, second) at [n, k], T = 1..8: both outputs against the FP64 oracle and bit
@@ -510,6 +589,42 @@ int admission() {
     failures += expect_throw("IQ2_S has no linear", [&] {
         (void)ops::linear_workspace_capacity_bytes(QType::GGML_IQ2_S, 640, 2560, policy, 1, 1);
     });
+    // AllowA8GgmlDecodeMma: the GGML formats' policy only, and the route needs a 16-byte aligned weight.
+    failures += expect_throw("AllowA8GgmlDecodeMma on a BF16 linear", [] {
+        (void)ops::linear_workspace_capacity_bytes(QType::BF16, 2560, 2560, LinearPolicy::AllowA8GgmlDecodeMma, 1, 1);
+    });
+    failures += expect_throw("AllowA8GgmlDecodeMma on an FP8 linear_add", [] {
+        (void)ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16, 5120, 6144,
+                                                       LinearPolicy::AllowA8GgmlDecodeMma, 1, 1);
+    });
+    if (ops::linear_workspace_capacity_bytes(QType::GGML_Q8_0, 2560, 640, LinearPolicy::AllowA8GgmlDecodeMma, 1, 8) !=
+            0 ||
+        ops::linear_workspace_capacity_bytes(QType::GGML_Q8_0, 2560, 640, LinearPolicy::AllowA8GgmlDecodeMma, 1, 9) !=
+            ops::linear_workspace_capacity_bytes(QType::GGML_Q8_0, 2560, 640, policy, 1, 9)) {
+        std::cerr << "admission: AllowA8GgmlDecodeMma workspace differs from AllowA8's\n";
+        ++failures;
+    }
+    {
+        // A Q8_0 matrix two bytes past a 16-byte boundary: admitted by AllowA8 (2-byte rows), refused
+        // by the tensor-core route at T <= 8.
+        constexpr std::int32_t n = 2560, k = 640;
+        const std::size_t bytes  = static_cast<std::size_t>(n) * (k / 32) * 34;
+        DeviceBuffer storage(bytes + 16);
+        cuda_check(cudaMemset(storage.p, 0, bytes + 16), "zero");
+        Weight weight      = device_weight(QType::GGML_Q8_0, n, k, storage);
+        weight.payload     = static_cast<std::byte*>(storage.p) + 2;
+        weight.qdata       = weight.payload;
+        DeviceBuffer d_x(static_cast<std::size_t>(k) * 2 * 2), d_out(static_cast<std::size_t>(n) * 2 * 2);
+        cuda_check(cudaMemset(d_x.p, 0, d_x.bytes), "zero x");
+        DeviceArena workspace(256);
+        Tensor x(d_x.p, DType::BF16, {k, 1});
+        Tensor out(d_out.p, DType::BF16, {n, 1});
+        ops::linear(x, weight, out, policy, workspace, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "misaligned AllowA8");
+        failures += expect_throw("AllowA8GgmlDecodeMma with a misaligned weight", [&] {
+            ops::linear(x, weight, out, LinearPolicy::AllowA8GgmlDecodeMma, workspace, nullptr);
+        });
+    }
     // An interval reserves for its widest point.
     const auto wide = ops::linear_workspace_capacity_bytes(QType::GGML_IQ4_XS, 10240, 2560, policy,
                                                            1, 4096);

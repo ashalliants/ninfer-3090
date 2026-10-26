@@ -209,6 +209,16 @@ dense tensors: every (family, format) is a registered Linear (LinearAdd) problem
 of the two-projection families a linear_pair problem, every output head a projection_fp32 head
 format, and no registered problem unused.
 
+The host-only `ninfer_ggml_mma_emulation_test` qualifies the opt-in int8 tensor-core decode route
+(`LinearPolicy::AllowA8GgmlDecodeMma`, `--ggml-decode-mma`) through its host emulation
+(`src/ops/linear/ggml/ggml_mma_emulation.h`): the exact sub-block decode reproduces ggml's values
+on the golden fixtures and random blocks of all eight formats, every registered problem meets the
+GPU suite's FP64 criterion and the FP32 accumulation bound, the kernel's tile order equals the
+canonical row order bit for bit at T = 1..8 wherever a column sits, and the MMA's int32 sums stay
+below 2^22 (their scaled products below 2^24) on extreme blocks. `ninfer_linear_ggml_test` then
+requires the device route bit for bit equal to that emulation at T = 1..8 and T = 9 equal to the
+AllowA8 wide route.
+
 `ninfer_offloaded_moe_cpu_test` (host only) and `ninfer_offloaded_moe_layer_test` qualify
 offloaded_sparse_moe over the twelve GGML text expert record formats (the IQ2_XS pack's three and
 the further nine of the GSQ-RCO IQ3 packs). The CPU test checks the canonical A8 cast bit for bit

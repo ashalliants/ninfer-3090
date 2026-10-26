@@ -58,13 +58,23 @@ void validate_weight(const Weight& w) {
 }
 
 template <QType F>
-void run(const Tensor& x, const Weight& w, Tensor& out, bool residual, WorkspaceArena* workspace,
+void run(const Tensor& x, const Weight& w, Tensor& out, bool residual, bool decode_mma, WorkspaceArena* workspace,
          cudaStream_t stream) {
     const auto* codes = static_cast<const std::uint8_t*>(w.qdata);
     const auto* xb    = static_cast<const __nv_bfloat16*>(x.data);
     auto* ob          = static_cast<__nv_bfloat16*>(out.data);
     const std::int32_t t = x.ne[1];
     if (t <= kGgmlDecodeMaxTokens) {
+        if (decode_mma) {
+            // The ring stages each row's chunks from the 16-byte unit holding their first byte, so the
+            // matrix must start on one (it then ends on one too: every registered N is a multiple of 16).
+            if (!aligned(w.qdata, 16)) {
+                throw std::invalid_argument(
+                    "ggml linear: the int8 tensor-core decode route (AllowA8GgmlDecodeMma) needs a 16-byte aligned weight");
+            }
+            ggml_mma_decode_launch<F>(codes, xb, ob, w.n, w.k, t, residual, stream);
+            return;
+        }
         ggml_mmvq_launch<F>(codes, xb, ob, w.n, w.k, t, residual, stream);
         return;
     }
@@ -107,26 +117,26 @@ std::size_t ggml_linear_workspace_capacity_bytes(QType format, std::int32_t n, s
     return layout.peak_bytes(1);
 }
 
-void ggml_linear_dispatch(const Tensor& x, const Weight& w, Tensor& out, bool residual,
+void ggml_linear_dispatch(const Tensor& x, const Weight& w, Tensor& out, bool residual, bool decode_mma,
                           WorkspaceArena* workspace, cudaStream_t stream) {
     validate_weight(w);
     switch (w.qtype) {
     case QType::GGML_IQ4_XS:
-        return run<QType::GGML_IQ4_XS>(x, w, out, residual, workspace, stream);
+        return run<QType::GGML_IQ4_XS>(x, w, out, residual, decode_mma, workspace, stream);
     case QType::GGML_IQ3_S:
-        return run<QType::GGML_IQ3_S>(x, w, out, residual, workspace, stream);
+        return run<QType::GGML_IQ3_S>(x, w, out, residual, decode_mma, workspace, stream);
     case QType::GGML_Q6_K:
-        return run<QType::GGML_Q6_K>(x, w, out, residual, workspace, stream);
+        return run<QType::GGML_Q6_K>(x, w, out, residual, decode_mma, workspace, stream);
     case QType::GGML_Q5_K:
-        return run<QType::GGML_Q5_K>(x, w, out, residual, workspace, stream);
+        return run<QType::GGML_Q5_K>(x, w, out, residual, decode_mma, workspace, stream);
     case QType::GGML_Q4_K:
-        return run<QType::GGML_Q4_K>(x, w, out, residual, workspace, stream);
+        return run<QType::GGML_Q4_K>(x, w, out, residual, decode_mma, workspace, stream);
     case QType::GGML_IQ4_NL:
-        return run<QType::GGML_IQ4_NL>(x, w, out, residual, workspace, stream);
+        return run<QType::GGML_IQ4_NL>(x, w, out, residual, decode_mma, workspace, stream);
     case QType::GGML_Q8_0:
-        return run<QType::GGML_Q8_0>(x, w, out, residual, workspace, stream);
+        return run<QType::GGML_Q8_0>(x, w, out, residual, decode_mma, workspace, stream);
     case QType::GGML_Q2_0:
-        return run<QType::GGML_Q2_0>(x, w, out, residual, workspace, stream);
+        return run<QType::GGML_Q2_0>(x, w, out, residual, decode_mma, workspace, stream);
     default:
         break;
     }

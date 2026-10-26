@@ -24,6 +24,7 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_ggml_blocks_decode_test
   ninfer_ggml_linear_affine_test
   ninfer_ggml_linear_registry_test
+  ninfer_ggml_mma_emulation_test
   ninfer_gpu_telemetry_test
   ninfer_greedy_identity_test
   ninfer_hc_int8_codec_test
