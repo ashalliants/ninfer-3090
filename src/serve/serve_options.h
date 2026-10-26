@@ -29,6 +29,9 @@ struct ServeOptions {
     std::vector<std::string> allowed_hosts;
     std::optional<std::string> model_id_override; // unset => artifact metadata.name
     std::string request_log_jsonl;                // empty => structured request logging disabled
+    // --request-log-lossy-detail: request_done records add lossy_prefill.kept_runs (the kept offsets
+    // of the filtered part), which the lossy sweep's kept-block overlap reads. Off by default.
+    bool request_log_lossy_detail = false;
     std::uint32_t max_context          = 8192;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
     // --fit-context MIN: --max-context becomes a ceiling the Engine lowers to what fits, never
@@ -68,6 +71,7 @@ struct ServeOptions {
     std::uint32_t draft_context_rows = 0;
     ContextCacheOptions context_cache;
     PrefillScheduleOptions prefill_schedule;
+    LossyPrefillOptions lossy_prefill;
     bool enable_vision      = false;
     VisionResidency vision_residency       = VisionResidency::Resident;
     std::uint32_t vision_max_merged_tokens = 16384;

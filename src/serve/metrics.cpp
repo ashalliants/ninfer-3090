@@ -5,6 +5,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
+#include <tuple>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -385,6 +387,42 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
             "Prefill steps run in layer slices because another lane was decoding.");
     COUNTER(prefill_slice_boundaries, "prefill_slice_boundaries_total",
             "Boundaries between the layer slices of those steps, where the other lane's decode ran.");
+    header("lossy_prefill_total", "counter",
+           "Requests that took the lossy long-prompt prefill path, by outcome: the selection "
+           "dropped tokens and the kept ones were prefilled (completed), nothing was dropped or "
+           "another request held the scout (skipped), or the request was cancelled or its scout "
+           "ended for memory pressure first (aborted).");
+    for (const auto& [outcome, current, baseline] :
+         std::array{std::tuple{"completed", stats.lossy_prefills_completed,
+                               baseline_.lossy_prefills_completed},
+                    std::tuple{"skipped", stats.lossy_prefills_skipped,
+                               baseline_.lossy_prefills_skipped},
+                    std::tuple{"aborted", stats.lossy_prefills_aborted,
+                               baseline_.lossy_prefills_aborted}}) {
+        out << "ninfer_lossy_prefill_total{outcome=\"" << outcome << "\"} " << current - baseline
+            << '\n';
+    }
+    COUNTER(lossy_prefill_scouted_tokens, "lossy_prefill_scouted_tokens_total",
+            "Prompt tokens the lossy prefill scouts scored.");
+    COUNTER(lossy_prefill_kept_tokens, "lossy_prefill_kept_tokens_total",
+            "Scored tokens the selections kept; the rest never entered the KV cache.");
+    COUNTER(lossy_prefill_alias_hits, "lossy_prefill_alias_hits_total",
+            "Prompts rewritten onto a lossy-prefilled lineage, so a follow-up turn reuses it.");
+    header("lossy_prefill_summaries_total", "counter",
+           "Admitted prompts the summary strategy (--lossy-prefill-strategy summary) rewrote: the "
+           "middle of a cold long conversation summarised by this request (new), or a summary "
+           "recorded for an earlier turn substituted (reused).");
+    for (const auto& [kind, current, baseline] :
+         std::array{std::tuple{"new", stats.lossy_prefill_summaries_new,
+                               baseline_.lossy_prefill_summaries_new},
+                    std::tuple{"reused", stats.lossy_prefill_summaries_reused,
+                               baseline_.lossy_prefill_summaries_reused}}) {
+        out << "ninfer_lossy_prefill_summaries_total{kind=\"" << kind << "\"} " << current - baseline
+            << '\n';
+    }
+    COUNTER(lossy_prefill_summary_probe_timeouts, "lossy_prefill_summary_probe_timeouts_total",
+            "Summary-strategy coldness probes the worker did not answer in time; the prompt was "
+            "treated as warm and not summarised.");
     COUNTER(engine_recoveries, "engine_recoveries_total",
             "Host-side worker failures survived by failing in-flight requests and clearing the "
             "context cache.");
@@ -431,6 +469,10 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
           "Rate at which missing chunks are fetched from the bucket and installed in the store "
           "directory (download, verification and write together, the time a request waits), "
           "learned from fetches.");
+    COUNTER(context_store_idle_writes, "context_store_idle_writes_total",
+            "Conversations written to the store once idle (--context-store-idle-seconds).");
+    COUNTER(context_store_idle_export_seconds, "context_store_idle_export_seconds_total",
+            "Engine worker time spent copying idle conversations out for the store.");
     COUNTER(context_store_eviction_writes, "context_store_eviction_writes_total",
             "Conversations written to the store as the cache evicted them (write-on-evict).");
     COUNTER(context_store_eviction_export_seconds, "context_store_eviction_export_seconds_total",

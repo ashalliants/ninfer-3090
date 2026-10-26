@@ -1,0 +1,143 @@
+// The lossy-prefill phase rules of one Program lane (CPU only, links no kernel).
+#include "models/qwen3_5/program/lossy/lossy_flow.h"
+
+#include <cstdint>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+namespace q = ninfer::models::qwen3_5;
+using ninfer::PromptCacheMarkerKind;
+using ninfer::TokenId;
+using q::PreparedCacheOpportunity;
+using q::detail::lossy_exact_end;
+using q::detail::lossy_forced_tokens;
+using q::detail::lossy_holds_captures;
+using q::detail::lossy_planned_exact_end;
+using q::detail::lossy_refuses_pause;
+using q::detail::lossy_step;
+using q::detail::lossy_step_limit;
+using q::detail::LossyPhase;
+using q::detail::LossyStep;
+
+void require(bool ok, const std::string& what) {
+    if (!ok) { throw std::runtime_error("FAILED: " + what); }
+}
+
+void test_phase_steps() {
+    // Exact runs ordinary steps up to M, then the next step opens the scout.
+    require(lossy_step(LossyPhase::Exact, 0, 4096) == LossyStep::Ordinary, "exact before M");
+    require(lossy_step(LossyPhase::Exact, 4095, 4096) == LossyStep::Ordinary, "exact just before M");
+    require(lossy_step(LossyPhase::Exact, 4096, 4096) == LossyStep::EnterScout, "exact at M");
+    // M equal to the reuse frontier: the first step scouts.
+    require(lossy_step(LossyPhase::Exact, 0, 0) == LossyStep::EnterScout, "M at the root");
+    require(lossy_step(LossyPhase::Scout, 4096, 4096) == LossyStep::Scout, "scout continues");
+    require(lossy_step(LossyPhase::Main, 4096, 4096) == LossyStep::Ordinary, "main is ordinary");
+    require(lossy_step(LossyPhase::Main, 9000, 4096) == LossyStep::Ordinary, "main past M");
+    // One scout per Program: a second lossy lane reaching M while another scouts declines.
+    require(lossy_step(LossyPhase::Exact, 4096, 4096, true) == LossyStep::Decline,
+            "M with the scout busy declines");
+    require(lossy_step(LossyPhase::Exact, 100, 4096, true) == LossyStep::Ordinary,
+            "before M a busy scout does not matter");
+    require(lossy_step(LossyPhase::Scout, 4096, 4096, true) == LossyStep::Scout,
+            "the scouting lane itself continues");
+    require(lossy_step(LossyPhase::Main, 4096, 4096, true) == LossyStep::Ordinary,
+            "main ignores the scout");
+}
+
+void test_step_limit() {
+    require(lossy_step_limit(LossyPhase::Exact, 1000, 4096) == 3096, "exact stops at M");
+    require(lossy_step_limit(LossyPhase::Exact, 4096, 4096) == 0, "exact at M has no room");
+    constexpr auto unlimited = std::numeric_limits<std::uint32_t>::max();
+    require(lossy_step_limit(LossyPhase::Main, 4096, 4096) == unlimited, "main is unlimited");
+    require(lossy_step_limit(LossyPhase::Scout, 4096, 4096) == unlimited, "scout has its own cap");
+}
+
+void test_pause_and_capture_window() {
+    require(!lossy_refuses_pause(LossyPhase::Exact), "exact pauses");
+    require(lossy_refuses_pause(LossyPhase::Scout), "scout refuses pause");
+    require(!lossy_refuses_pause(LossyPhase::Main), "main pauses");
+    require(!lossy_holds_captures(LossyPhase::Exact, 100, 4096), "exact captures before M");
+    require(lossy_holds_captures(LossyPhase::Exact, 4096, 4096), "no capture past M before scout");
+    require(lossy_holds_captures(LossyPhase::Scout, 4096, 4096), "no capture during the scout");
+    require(!lossy_holds_captures(LossyPhase::Main, 4096, 4096), "main captures");
+}
+
+void test_exact_end() {
+    using ninfer::SharedCandidateEvidence;
+    using ninfer::models::qwen3_5::PreparedContextCache;
+    require(lossy_planned_exact_end(PreparedContextCache{}) == 0, "no product prompt: M is 0");
+    // Message-level markers past the product prompt never count, whatever their evidence: an
+    // explicit boundary (Anthropic cache_control on the latest message) or an OpenAI automatic one.
+    PreparedContextCache cache;
+    cache.product_prompt_end = 1500;
+    cache.opportunities      = {
+        {.kind = PromptCacheMarkerKind::SharedStablePrefix,
+              .evidence = SharedCandidateEvidence::ExplicitBoundary, .frontier = 1500},
+        {.kind = PromptCacheMarkerKind::SharedStablePrefix,
+              .evidence = SharedCandidateEvidence::RequestedAutomatic, .frontier = 6000},
+        {.kind = PromptCacheMarkerKind::SharedStablePrefix,
+              .evidence = SharedCandidateEvidence::DefaultAutomatic, .frontier = 7000},
+        {.kind = PromptCacheMarkerKind::SharedStablePrefix,
+              .evidence = SharedCandidateEvidence::ExplicitBoundary, .frontier = 9000},
+        {.kind = PromptCacheMarkerKind::PrivateLongAnchor, .frontier = 20000},
+    };
+    require(lossy_planned_exact_end(cache) == 1500, "message markers past the product prompt ignored");
+    // An engine-structural opportunity (tools, leading instructions, graft) always counts.
+    cache.opportunities.push_back({.kind     = PromptCacheMarkerKind::SharedStablePrefix,
+                                   .evidence = SharedCandidateEvidence::EngineStructural |
+                                               SharedCandidateEvidence::DefaultAutomatic,
+                                   .frontier = 2200});
+    require(lossy_planned_exact_end(cache) == 2200, "engine-structural opportunity counts");
+    // The reuse frontier decides when it is deeper than the product prompt.
+    require(lossy_exact_end(6000, 0) == 6000, "cold: M is the marker");
+    require(lossy_exact_end(6000, 1500) == 6000, "shared reuse below the marker");
+    require(lossy_exact_end(6000, 6000) == 6000, "shared reuse at the marker");
+    require(lossy_exact_end(6000, 8192) == 8192, "reuse past the marker");
+    require(lossy_exact_end(0, 0) == 0, "no marker, no reuse");
+}
+
+void test_forced_tokens() {
+    const std::vector<TokenId> specials{151643, 151644, 151645, 151657, 151658}; // sorted
+    const std::vector<TokenId> span{100, 151644, 872, 198, 151645, 151657, 7, 151658, 151643};
+    const auto forced = lossy_forced_tokens(span, specials);
+    require((forced == std::vector<std::uint8_t>{0, 1, 0, 0, 1, 1, 0, 1, 1}),
+            "special ids are forced, text is not");
+    require(lossy_forced_tokens(span, {}) == std::vector<std::uint8_t>(span.size(), 0),
+            "no special set: nothing forced");
+    require(lossy_forced_tokens({}, specials).empty(), "empty span");
+
+    // With the turn start known, the role name and newline after each <|im_start|> are forced:
+    // "<|im_start|>assistant\n..." and "<|im_start|>user\n<tool_response>..." keep their headers.
+    const TokenId im_start = 151644;
+    const std::vector<TokenId> turns{9, 151644, 77091, 198, 5, 6, 151645, 198, 151644, 872, 198,
+                                     151657, 8, 151644};
+    const auto headers = lossy_forced_tokens(turns, specials, im_start);
+    require((headers == std::vector<std::uint8_t>{0, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1, 1, 0, 1}),
+            "role name and newline after each turn start are forced; a trailing turn start clips");
+    const std::vector<TokenId> short_tail{151644, 77091};
+    require((lossy_forced_tokens(short_tail, specials, im_start) ==
+             std::vector<std::uint8_t>{1, 1}),
+            "a turn start near the end of U forces only what is there");
+}
+
+} // namespace
+
+int main() {
+    try {
+        test_phase_steps();
+        test_step_limit();
+        test_pause_and_capture_window();
+        test_exact_end();
+        test_forced_tokens();
+        std::cout << "OK lossy flow\n";
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+    return 0;
+}

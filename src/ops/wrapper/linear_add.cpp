@@ -2,6 +2,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
+#include "ninfer/ops/q4_a4_linear.h"
 #include "ninfer/ops/residual_add.h"
 
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
@@ -10,6 +11,7 @@
 #include "ops/linear/ggml/ggml_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_layout.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/q4/q4_scout_a4.h"
 #include "ops/linear/t2/t2_a8.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
@@ -92,9 +94,21 @@ void validate_policy(LinearPolicy policy) {
     case LinearPolicy::AllowPrefillCublas:
     // The GGML block formats' policy only (require_policy_format).
     case LinearPolicy::AllowA8GgmlDecodeMma:
+    // The scout's int4 route: AllowA8Int, with int4 activations for Q4 wherever the A8 route runs.
+    case LinearPolicy::ScoutA4Int:
         return;
     }
     throw std::invalid_argument("linear_add: invalid compute policy");
+}
+
+// The scout's int4 route has no fused residual epilogue: the A4 activation planes, then the
+// projection, which residual_add folds in.
+std::size_t scout_a4_add_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
+                                         std::int32_t tokens) {
+    WorkspaceLayoutBuilder layout;
+    detail::scout_a4_activation_layout(layout, input_rows, tokens);
+    (void)layout.alloc(DType::BF16, {output_rows, tokens});
+    return layout.peak_bytes(1);
 }
 
 // Q4 and Q5 share the integer and cuBLAS prefill routes at the two registered shapes; a16 is the
@@ -165,6 +179,20 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
     if (qtype == QType::Q4_G64_FP16) {
         (void)detail::select_q4_linear_add(output_rows, input_rows, min_tokens);
         (void)detail::select_q4_linear_add(output_rows, input_rows, max_tokens);
+        const bool integer_shape =
+            output_rows == 5120 && (input_rows == 17408 || input_rows == 6144);
+        if (allows_scout_a4(policy) && integer_shape) {
+            // The int4 route takes exactly the widths the A8 route would; the rest are AllowA8Int's.
+            const std::size_t integer = grouped_integer_workspace_bytes(
+                0, output_rows, input_rows, LinearPolicy::AllowA8Int, min_tokens, max_tokens);
+            if (min_tokens == max_tokens) {
+                return detail::a8_add_tokens_supported(min_tokens)
+                           ? scout_a4_add_workspace_bytes(output_rows, input_rows, min_tokens)
+                           : integer;
+            }
+            return std::max(integer,
+                            scout_a4_add_workspace_bytes(output_rows, input_rows, max_tokens));
+        }
         return grouped_integer_workspace_bytes(0, output_rows, input_rows, policy, min_tokens,
                                                max_tokens);
     }
@@ -262,6 +290,16 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             !aligned_to(w.qdata, 16) || !aligned_to(w.scales, 16)) {
             throw std::invalid_argument(
                 "linear_add: Q4 requires 16-byte x/residual/code/scale alignment");
+        }
+        // The lossy scout's int4 route (LinearPolicy::ScoutA4Int), at the widths the A8 route
+        // serves. Q5 has no int4 form and keeps the A8 route below.
+        if (allows_scout_a4(policy) && detail::a8_add_supported(w, t)) {
+            auto scope        = ws.scope();
+            const auto codes  = detail::scout_a4_quantize(x, ws, stream);
+            Tensor projected  = ws.alloc(DType::BF16, {w.n, t});
+            q4_a4_linear(codes.codes, codes.scales, w, projected, stream);
+            residual_add(projected, residual_out, stream);
+            return;
         }
         // The same prefill routes as Q5 below, in the same order.
         if (allows_cublas_prefill(policy) && t >= kCublasPrefillMinTokens &&

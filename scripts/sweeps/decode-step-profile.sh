@@ -16,7 +16,7 @@
 #   35b-prefill       -pg 4096,128
 #
 # The bench corpus is a tiled bank with 98.4% repeated bigrams, so MTP acceptance there is ~100%
-# and says nothing about text (RELEASE_NOTES_0.9.1.md). That does not matter here: a round's
+# and says nothing about text (docs/release-notes/RELEASE_NOTES_0.9.1.md). That does not matter here: a round's
 # kernel work is fixed by the draft count, not by what gets accepted, and this script reports
 # per-kernel time and launch counts, from which ms per round follows.
 #

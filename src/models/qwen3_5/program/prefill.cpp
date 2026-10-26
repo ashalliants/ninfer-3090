@@ -70,7 +70,8 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
 PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const TokenId> ids,
                                       std::uint32_t nominal_length,
                                       std::optional<std::uint32_t> split_frontier,
-                                      bool finalize_at_end, PrefillSliceState* slice) {
+                                      bool finalize_at_end, PrefillSliceState* slice,
+                                      std::span<const std::int32_t> rope_positions) {
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
@@ -88,9 +89,10 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
-                                  sink);
+                                  sink, rope_positions);
     }
-    return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
+    return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
+                              rope_positions);
 }
 
 PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
@@ -205,6 +207,29 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
     if (!valid_sequence(handle)) { throw std::logic_error("prefill has a stale lane"); }
     const auto lane = ContractAccess::lane(handle).value;
     require_unit(lane, ExecutionUnitKind::Prefill);
+    std::optional<LossyOutcome> declined;
+    if (auto& lossy = requests[lane].lossy; lossy && requests[lane].prefill) {
+        const auto& staged    = *requests[lane].prefill;
+        const bool scout_busy = scout_session && scout_session->lane != lane;
+        const LossyStep step  = lossy_step(lossy->phase, staged.cursor, lossy->exact_end, scout_busy);
+        if (step == LossyStep::Decline) {
+            // The one scout is taken: this request prefills all of U as an ordinary request.
+            lossy->phase = LossyPhase::Main;
+            declined     = LossyOutcome{.exact_end       = lossy->exact_end,
+                                        .uncached_tokens = staged.prompt_tokens - lossy->exact_end,
+                                        .kept_tokens     = staged.prompt_tokens - lossy->exact_end,
+                                        .skipped         = true,
+                                        .declined        = true};
+        } else if (step != LossyStep::Ordinary) {
+            // A scout step maps its own pages past the committed frontier and keeps them between
+            // steps; settle_unit leaves them mapped while the scout runs.
+            auto progress = advance_lossy_scout(lane, timing, max_tokens);
+            settle_unit(lane);
+            return progress;
+        }
+    }
+    const std::uint32_t declined_prompt_tokens =
+        declined ? requests[lane].prefill->prompt_tokens : 0U;
     auto& state = sequences[lane];
     prepare_capture_boundary(lane);
     const auto permit = *requests[lane].permit;
@@ -231,6 +256,10 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
     // earlier layers never wrote (or that a sibling took in between). Reserving the same unit again
     // while the permit is held is a no-op, so the lane simply continues.
     if (!progress.complete && !progress.partial) { settle_unit(lane); }
+    if (declined) {
+        progress.compacted_prompt_tokens = declined_prompt_tokens;
+        progress.lossy                   = declined;
+    }
     return progress;
 }
 
@@ -605,6 +634,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
 
         if (staged.cursor < staged.prompt_tokens) {
             std::uint32_t nominal = std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            // A lossy request's Exact phase stops at M, where its scout begins.
+            if (request.lossy) {
+                nominal = std::min(nominal, lossy_step_limit(request.lossy->phase, staged.cursor,
+                                                             request.lossy->exact_end));
+                if (nominal == 0) { throw std::logic_error("lossy prefill step at M is a scout step"); }
+            }
             // A cap shortens the step only; the planned chunk and its reservation stay as they
             // were. A media item's span decides its own step, so a prompt with media keeps the plan.
             const std::uint32_t uncapped_nominal = nominal;
@@ -672,10 +707,16 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                                                  *staged.vision, remaining,
                                                                  split_frontier, final_candidate);
                 } else {
+                    // Axis 0 of the prompt's positions; empty when slot + rope_delta gives them.
+                    const auto rope_positions =
+                        staged.regular_text_positions
+                            ? std::span<const std::int32_t>{}
+                            : std::span<const std::int32_t>(staged.prompt.positions.data(),
+                                                            staged.prompt.token_ids.size());
                     result = execution::prefill_text_chunk(
                         schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
                         remaining, split_frontier, final_candidate,
-                        sliced_call ? &staged.slice : nullptr);
+                        sliced_call ? &staged.slice : nullptr, rope_positions);
                 }
                 timing.include(result.timing);
                 timing.resume_post();

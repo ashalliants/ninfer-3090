@@ -1,0 +1,253 @@
+## Historical Task Snapshot
+Exercise every result shape.
+
+## Goal
+Exercise every result shape.
+
+## Blocked
+Failed calls with no later successful retry of the same call:
+- [#119] execute_code `plain 12` — ERROR: ERROR: something broke
+- [#121] terminal `plain 13` — ERROR: error : spaced
+- [#129] terminal `plain 17` — ERROR: FAILED tests/test_a.py::test_b
+- [#137] execute_code `plain 21` — ERROR: Exited Status 3
+- [#141] terminal `plain 23` — ERROR: the process reported non-zero exit
+- [#143] execute_code `plain 24` — ERROR: PERMISSION DENIED
+- [#145] terminal `plain 25` — ERROR: No ſuch file or directory
+- [#147] terminal `plain 26` — ERROR: bash: foo: command not found
+- [#149] execute_code `plain 27` — ERROR: fatal: not a git repository
+- [#151] terminal `plain 28` — ERROR: panic! at the disco
+- [#155] execute_code `plain 30` — ERROR: Exception!
+- [#174] tool — ERROR: orphan orphan
+
+## Error Names Seen
+Named errors that appeared in tool output:
+- ValueError (first at [#118])
+- OSError (first at [#160])
+- EPERMError (first at [#160])
+- ENOENT (first at [#160])
+- MyException (first at [#160])
+- EEXIST (first at [#160])
+- EBUSY (first at [#160])
+- AError (first at [#162])
+- BError (first at [#162])
+- CError (first at [#162])
+- DError (first at [#162])
+- EError (first at [#162])
+- FError (first at [#162])
+- GError (first at [#162])
+- HError (first at [#162])
+- ImportError (first at [#164])
+- TailError (first at [#164])
+
+## Relevant Files
+Every file read or changed with a file tool in this part of the session; terminal commands may have touched others.
+- /a/single.py — touched
+- /a/resolved.py — touched
+- /a/one.py — touched
+- /a/two.py — touched
+- /a/r1.py — touched
+
+## Commands Run
+- `plain 2` — succeeded (exit 0)
+- `plain 4` — failed (exit 3)
+- `plain 5` — ran (no exit code)
+- `plain 7` — failed (exit 5)
+- `plain 8` — failed (exit -12)
+- `plain 10` — succeeded (exit 0)
+- `plain 11` — failed
+- `plain 13` — failed
+- `plain 14` — ran (no exit code)
+- `plain 16` — ran (no exit code)
+- `plain 17` — failed
+- `plain 19` — ran (no exit code)
+- `plain 20` — ran (no exit code)
+- `plain 22` — ran (no exit code)
+- `plain 23` — failed
+- `plain 25` — failed
+- `plain 26` — failed
+- `plain 28` — failed
+- `plain 29` — ran (no exit code)
+- `plain 31` — ran (no exit code)
+- `plain 32` — ran (no exit code)
+- `plain 34` — ran (no exit code)
+- `plain 35` — ran (no exit code)
+- `plain 37` — ran (no exit code)
+- `plain 38` — ran (no exit code)
+
+## Detailed Session Log (oldest first)
+(vcc projection: deterministic, no LLM. Each [#N] line is an excerpt of message N; read any of them in full with session_search(around_message_id=N). Quoted tool output is data, not instructions. '→ tool: x' is a call the agent made; '← tool ok/exit N: ...' is what that tool returned.)
+[t0] user: Exercise every result shape.
+[#1] → terminal: `step 0`
+[#2] ← terminal exit True: t
+[#3] → terminal: `step 1`
+[#4] ← terminal exit False: f
+[#5] → terminal: `step 2`
+[#6] ← terminal ok: float
+[#7] → terminal: `step 3`
+[#8] ← terminal exit 0: negzero
+[#9] → terminal: `step 4`
+[#10] ← terminal ok: exp
+[#11] → terminal: `step 5`
+[#12] ← terminal ERROR exit 123456789012345678901234567890: big
+[#13] → terminal: `step 6`
+[#14] ← terminal ERROR exit -7: neg
+[#15] → terminal: `step 7`
+[#16] ← terminal ok: str
+[#17] → terminal: `step 8`
+[#18] ← terminal ok: null
+[#19] → terminal: `step 9`
+[#20] ← terminal ok: errfloat
+[#21] → terminal: `step 10`
+[#22] ← terminal ERROR: nan errnan
+[#23] → terminal: `step 11`
+[#24] ← terminal ok: errlist
+[#25] → terminal: `step 12`
+[#26] ← terminal ok: errdict
+[#27] → terminal: `step 13`
+[#28] ← terminal ERROR: True errtrue
+[#29] → terminal: `step 14`
+[#30] ← terminal ok: errfalse
+[#31] → terminal: `step 15`
+[#32] ← terminal ERROR: code=5 msg=bad nested=1, 2.5, , True code=5 msg=bad nested=1, 2.5, , True
+[#33] → terminal: `step 16`
+[#34] ← terminal ERROR: a, b, 3 a, b, 3
+[#35] → terminal: `step 17`
+[#36] ← terminal ERROR: 
+[#37] → terminal: `step 18`
+[#38] ← terminal ok: zero is not False
+[#39] → terminal: `step 19`
+[#40] ← terminal exit 0
+[#41] → terminal: `step 20`
+[#42] ← terminal ERROR: boom boom
+[#43] → terminal: `step 21`
+[#44] ← terminal ok
+[#45] → terminal: `step 22`
+[#46] ← terminal ok
+[#47] → terminal: `step 23`
+[#48] ← terminal ERROR exit 3: dup keys keep the last value
+[#49] → terminal: `step 24`
+[#50] ← terminal ok: inf
+[#51] → terminal: `step 25`
+[#52] ← terminal ok: deep
+[#53] → terminal: `step 26`
+[#54] ← terminal exit 0: leading ws
+[#55] → terminal: `step 27`
+[#56] ← terminal exit 0: {"output": "nbsp is not JSON whitespace", "exit_code": 0}
+[#57] → terminal: `step 28`
+[#58] ← terminal exit 0: {"output": "trailing garbage", "exit_code": 0} x
+[#59] → terminal: `step 29`
+[#60] ← terminal ok: ["a", "json", "array"]
+[#61] → terminal: `step 30`
+[#62] ← terminal exit 0: unicode é 🙂 中
+[#63] → terminal: `step 31`
+[#64] ← terminal exit 0: escapes " \ /
+[#65] → terminal: `step 32`
+[#66] ← terminal exit 0: {"output": "bad escape \x", "exit_code": 0}
+[#67] → terminal: `step 33`
+[#68] ← terminal exit 0: {"output": "raw control", "exit_code": 0}
+[#69] → terminal: `step 34`
+[#70] ← terminal ERROR exit 1: {"output": "num 01", "exit_code": 01}
+[#71] → terminal: `step 35`
+[#72] ← terminal exit 0: {"output": "trailing comma", "exit_code": 0,}
+[#73] → terminal: `step 36`
+[#74] ← terminal ok: {"output": "ws in number", "exit_code": - 1}
+[#75] → terminal: `step 37`
+[#76] ← terminal ERROR: inf exp float
+[#77] → terminal: `step 38`
+[#78] ← terminal ERROR exit 2: 
+[#79] → terminal: `step 39`
+[#80] ← terminal ERROR exit 4: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz … zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+[#81] → terminal: `step 40`
+[#82] ← terminal ok
+[#83] → terminal: `step 41`
+[#84] ← terminal ok
+[#85] → terminal: `step 42`
+[#86] ← terminal exit 0
+[#87] → terminal: `step 43`
+[#88] ← terminal ERROR exit 7777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777: 4300 digits
+[#89] → terminal: `step 44`
+[#90] ← terminal ok: {"output": "4301 digits", "exit_code": -777777777777777777777777777777777777777777777777777777777777777777 … 77777777777777777777777777777777777777777777777777}
+[#91] → terminal: `step 45`
+[#92] ← terminal exit 0: depth 9997
+[#93] → terminal: `step 46`
+[#94] ← terminal ok: {"output": "depth 9998", "exit_code": 0, "x": [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[ … ]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}
+[#95] → execute_code: `plain 0`
+[#96] ← execute_code ERROR exit 1: [terminal] ran 'a' -> exit 1, 40 lines output
+[#97] → terminal: `plain 1`
+[#98] ← terminal ERROR exit 2: [terminal] ran 'echo 'x' -> exit 0' -> exit 2, 3 lines output
+[#99] → terminal: `plain 2`
+[#100] ← terminal exit 0: [terminal] ran 'pad' -> exit 0, 1 lines output
+[#101] → execute_code: `plain 3`
+[#102] ← execute_code ERROR exit -3: [terminal] ran 'neg' -> exit -3, 1 lines output
+[#103] → terminal: `plain 4`
+[#104] ← terminal ERROR exit 3: [terminal] ran 'arabic' -> exit ٣, 1 lines output
+[#105] → terminal: `plain 5`
+[#106] ← terminal ok: [terminal] ran 'qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq … qqqqqqqqqqqqqqqqqqqqqqqq' -> exit 5, 1 lines output
+[#107] → execute_code: `plain 6`
+[#108] ← execute_code exit 0: [terminal] ran 'zero' -> exit 00, 9 lines output
+[#109] → terminal: `plain 7`
+[#110] ← terminal ERROR exit 5: prefix {"exit_code": 5} suffix
+[#111] → terminal: `plain 8`
+[#112] ← terminal ERROR exit -12: log "exit_code" : -12 more
+[#113] → execute_code: `plain 9`
+[#114] ← execute_code ERROR exit 42: log "exit_code": ٤٢ arabic digits
+[#115] → terminal: `plain 10`
+[#116] ← terminal exit 0: log "exit_code": 0 then "exit_code": 9
+[#117] → terminal: `plain 11`
+[#118] ← terminal ERROR: Traceback (most recent call last): File x ValueError: bad
+[#119] → execute_code: `plain 12`
+[#120] ← execute_code ERROR: ERROR: something broke
+[#121] → terminal: `plain 13`
+[#122] ← terminal ERROR: error : spaced
+[#123] → terminal: `plain 14`
+[#124] ← terminal ok: xerror: not a word boundary
+[#125] → execute_code: `plain 15`
+[#126] ← execute_code ok: _error: underscore is a word char
+[#127] → terminal: `plain 16`
+[#128] ← terminal ok: éerror: accented prefix
+[#129] → terminal: `plain 17`
+[#130] ← terminal ERROR: FAILED tests/test_a.py::test_b
+[#131] → execute_code: `plain 18`
+[#132] ← execute_code ok: xfailed is fine
+[#133] → terminal: `plain 19`
+[#134] ← terminal ok: fäiled is fine
+[#135] → terminal: `plain 20`
+[#136] ← terminal ok: exit code 0 is fine
+[#137] → execute_code: `plain 21`
+[#138] ← execute_code ERROR: Exited Status 3
+[#139] → terminal: `plain 22`
+[#140] ← terminal ok: exitcode 1 is fine
+[#141] → terminal: `plain 23`
+[#142] ← terminal ERROR: the process reported non-zero exit
+[#143] → execute_code: `plain 24`
+[#144] ← execute_code ERROR: PERMISSION DENIED
+[#145] → terminal: `plain 25`
+[#146] ← terminal ERROR: No ſuch file or directory
+[#147] → terminal: `plain 26`
+[#148] ← terminal ERROR: bash: foo: command not found
+[#149] → execute_code: `plain 27`
+[#150] ← execute_code ERROR: fatal: not a git repository
+[#151] → terminal: `plain 28`
+[#152] ← terminal ERROR: panic! at the disco
+[#153] → terminal: `plain 29`
+[#154] ← terminal ok: panic alone is fine
+[#155] → execute_code: `plain 30`
+[#156] ← execute_code ERROR: Exception!
+[#157] → terminal: `plain 31`
+[#158] ← terminal ok: ERRORS: plural is fine
+[#159] → terminal: `plain 32`
+[#160] ← terminal ok: names ValueError KeyErrorX OSError: EPERMError ENOENT xENOENT ENOENTx _ENOENT éENOENT Error MyException ÄError 1ValueError EEXIST EBUSY ok
+[#161] → execute_code: `plain 33`
+[#162] ← execute_code ok: more names AError BError CError DError EError FError GError HError IError
+[#163] → terminal: `plain 34`
+[#164] ← terminal ok: head ImportError wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww … vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv TailError end
+[#165] → terminal: `plain 35`
+[#166] ← terminal ok: colored output with 'ticks' and # heading
+[#167] → execute_code: `plain 36`
+[#168] ← execute_code ok
+[#169] → terminal: `plain 37`
+[#170] ← terminal ok
+[#171] → terminal: `plain 38`
+[#172] ← terminal ok: plain ok output
+[#173] ← tool ok: orphan output
+[#174] ← tool ERROR: orphan orphan

@@ -4,13 +4,21 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/program/program.h"
+#include "models/qwen3_5/program/context_work.h"
+#include "models/qwen3_5/program/lossy/gap_map.h"
+#include "models/qwen3_5/program/lossy/selection.h"
 #include "models/qwen3_5/program/program_impl.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
+#include <cstddef>
 #include <cstdlib>
+#include <functional>
+#include <iterator>
+#include <memory>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -2664,6 +2672,1218 @@ void replay_sampling_counts(DeviceContext& device, const qwen::execution::Parame
             "sampling-count fixture leaked typed resources");
 }
 
+// ---- Explicit RoPE positions in text prefill (lossy long-prefill, Task 4) ----
+
+constexpr std::uint32_t kLongCapacity = 4096;
+constexpr std::uint32_t kLongChunk    = 512;
+constexpr std::uint32_t kLongPrompt   = 3000;
+constexpr std::int32_t kRopeOffset    = 17;
+// rk4v4 is the production KV storage; int8 is the extra one.
+constexpr std::array<KvCacheStorage, 2> kPositionStorages{
+    KvCacheStorage::RotatedLloyd4KeyInt4Value, KvCacheStorage::Int8Group64};
+
+std::vector<TokenId> long_prompt_ids(std::uint32_t count) {
+    std::vector<TokenId> ids(count);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        ids[i] = 100 + static_cast<TokenId>((i * 37 + i / 64) % 900);
+    }
+    return ids;
+}
+
+// Every position axis set to positions[i], the shape a text prompt carries.
+void set_text_positions(qwen::PreparedPromptData& prompt, const std::vector<std::int32_t>& axis,
+                        std::int32_t rope_delta) {
+    const std::size_t tokens = prompt.token_ids.size();
+    require(axis.size() == tokens, "position fixture does not cover its prompt");
+    prompt.positions.resize(3 * tokens);
+    for (std::size_t a = 0; a < 3; ++a) {
+        std::copy(axis.begin(), axis.end(), prompt.positions.begin() + a * tokens);
+    }
+    prompt.rope_delta = rope_delta;
+}
+
+void append_device_bytes(std::vector<std::byte>& bytes, const Tensor& tensor) {
+    require(tensor.is_contiguous(), "a compared device region is not contiguous");
+    const auto offset = bytes.size();
+    bytes.resize(offset + tensor.bytes());
+    CUDA_CHECK(
+        cudaMemcpy(bytes.data() + offset, tensor.data, tensor.bytes(), cudaMemcpyDeviceToHost));
+}
+
+// The page slices of one KV plane: one per page (page-major) or one per page and head.
+template <class Visit>
+void visit_page_slices(const Tensor& plane, PagedKVPlaneOrder order, std::int32_t page,
+                       Visit&& visit) {
+    if (order == PagedKVPlaneOrder::PageMajor) {
+        visit(plane.slice(3, page, 1));
+        return;
+    }
+    for (std::int32_t head = 0; head < plane.ne[3]; ++head) {
+        visit(plane.slice(3, head, 1).slice(2, page, 1));
+    }
+}
+
+// A page's unused tail columns keep whatever an earlier run left there, so every run starts from
+// zeroed planes and the comparison can take whole pages.
+void zero_text_kv(qwen::detail::ProgramImpl& program, DeviceContext& device) {
+    const auto& pool  = program.decoder->text_kv.page_pool();
+    const auto order  = pool.geometry().device_plane_order;
+    for (std::size_t index = 0; index < pool.plane_count(); ++index) {
+        const Tensor& plane = pool.plane(index);
+        const std::int32_t pages =
+            order == PagedKVPlaneOrder::PageMajor ? plane.ne[3] : plane.ne[2];
+        for (std::int32_t page = 0; page < pages; ++page) {
+            visit_page_slices(plane, order, page, [&](const Tensor& slice) {
+                require(slice.is_contiguous(), "a KV page slice is not contiguous");
+                CUDA_CHECK(cudaMemsetAsync(slice.data, 0, slice.bytes(), device.stream));
+            });
+        }
+    }
+    device.synchronize();
+}
+
+// Text KV of a lane's first `tokens` positions, gathered page by page through its block table.
+std::vector<std::byte> text_kv_bytes(qwen::detail::ProgramImpl& program, std::uint32_t lane,
+                                     std::uint32_t tokens) {
+    auto& cache          = program.decoder->text_kv;
+    const auto& pool     = cache.page_pool();
+    const auto order     = pool.geometry().device_plane_order;
+    const auto page_size = pool.geometry().page_tokens;
+    const auto row       = program.text_kv_addresses->bound_row(program.sequences[lane].kv->text);
+    const auto table     = cache.execution_tables().matrix().slice(1, row, 1);
+    std::vector<std::int32_t> physical((tokens + page_size - 1) / page_size);
+    CUDA_CHECK(cudaMemcpy(physical.data(), table.data, physical.size() * sizeof(std::int32_t),
+                          cudaMemcpyDeviceToHost));
+    std::vector<std::byte> bytes;
+    for (std::size_t index = 0; index < pool.plane_count(); ++index) {
+        for (const std::int32_t page : physical) {
+            require(page >= 0, "a prompt KV page is not mapped");
+            visit_page_slices(pool.plane(index), order, page,
+                              [&](const Tensor& slice) { append_device_bytes(bytes, slice); });
+        }
+    }
+    return bytes;
+}
+
+struct PrefillImage {
+    TokenId first = -1;
+    std::vector<std::byte> logits;
+    std::vector<std::byte> kv;
+    std::vector<std::byte> state;
+};
+
+struct PositionsProgram {
+    std::unique_ptr<qwen::detail::SequencePlanImpl> plan;
+    std::unique_ptr<qwen::detail::ProgramImpl> program;
+};
+
+PositionsProgram make_positions_program(DeviceContext& device,
+                                        const qwen::execution::Parameters& parameters,
+                                        EngineOptions options, KvCacheStorage storage,
+                                        std::uint32_t lanes) {
+    options.max_context                       = kLongCapacity;
+    options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(kLongCapacity);
+    options.prefill_chunk                     = kLongChunk;
+    options.max_concurrency                   = lanes;
+    options.kv_cache                          = storage;
+    options.context_cache.enabled             = false;
+    options.context_cache.device_state_slots  = 0;
+    options.context_cache.host_capacity_bytes = 0;
+    auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
+    const std::uint32_t pages = lanes * planner->curve.minimum_main_page_groups;
+    PositionsProgram out;
+    out.plan    = qwen::detail::finalize_sequence_plan_impl(std::move(planner), pages);
+    out.program = std::make_unique<qwen::detail::ProgramImpl>(parameters, *out.plan, device,
+                                                              StartupObserver{});
+    return out;
+}
+
+qwen::ContextProgress settle_positions(qwen::detail::ProgramImpl& program, DeviceContext& device) {
+    std::atomic<bool> flag{false};
+    for (unsigned step = 0; step < 8; ++step) {
+        device.synchronize();
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+        auto progress = program.poll_context({&flag});
+        if (progress.complete) { return progress; }
+    }
+    throw std::runtime_error("explicit-position transaction did not settle");
+}
+
+// Binds `prompt` to lane 0 of an idle Program, prefills it (whole, or in `slices` layer slices) and
+// returns the last-token logits, the prompt's text KV and the lane's GDN state image as they stand
+// when the prefill finishes, then releases the lane.
+PrefillImage prefill_image(qwen::detail::ProgramImpl& program, DeviceContext& device,
+                           qwen::PreparedPromptData prompt, std::uint32_t slices) {
+    const auto empty           = program.physical_usage().occupied;
+    const auto prompt_tokens   = static_cast<std::uint32_t>(prompt.token_ids.size());
+    zero_text_kv(program, device);
+    runtime::ResolvedExecutionOptions request;
+    request.requested_output_tokens = 8;
+    request.allow_prefix_reuse      = false;
+    auto base       = program.plan_request(std::move(prompt), request);
+    const auto root = program.inspect_source(base, std::nullopt);
+    require(root.has_value(), "explicit-position request has no root source");
+    require(static_cast<bool>(program.start_binding(base, {0}, *root, nullptr,
+                                                    qwen::ExecutionUnitKind::Prefill, 0)),
+            "explicit-position request could not bind");
+    const auto bound = settle_positions(program, device);
+    require(bound.sequence.has_value(), "explicit-position binding did not publish");
+    const auto sequence = *bound.sequence;
+
+    PrefillImage image;
+    std::uint32_t processed = 0;
+    for (unsigned call = 0; call < 256 && processed < prompt_tokens; ++call) {
+        const std::array<qwen::ExecutionUnit, 1> units{
+            {{sequence, qwen::ExecutionUnitKind::Prefill}}};
+        require(static_cast<bool>(program.reserve_units(units)),
+                "explicit-position prefill could not reserve its unit");
+        auto step = program.advance_prefill(sequence, nullptr, nullptr, 0, slices);
+        if (step.partial) { continue; }
+        processed += step.processed_prompt_tokens;
+        if (!step.pending) { continue; }
+        device.synchronize();
+        image.first = step.pending->tokens().front();
+        append_device_bytes(image.logits, program.io.logits.slice(1, 0, 1));
+        image.kv = text_kv_bytes(program, 0, prompt_tokens);
+        const auto& layout = program.state_images->host_layout();
+        image.state.resize(layout.image_bytes);
+        const auto selectors = program.state_selectors(program.sequences[0]);
+        program.state_images->copy_to_host(selectors.destination,
+                                           qwen::HostStateImageView{image.state.data(), &layout},
+                                           RankStreams(device.stream));
+        device.synchronize();
+        const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+        (void)program.commit(std::move(*step.pending), accepted, {}, nullptr);
+    }
+    require(processed == prompt_tokens && image.first >= 0,
+            "explicit-position prefill did not finish its prompt");
+    require(program.abort(sequence).status == runtime::ConsumeStatus::Consumed,
+            "explicit-position prefill retained its execution resources");
+    require(program.physical_usage().occupied == empty,
+            "explicit-position prefill leaked physical resources");
+    return image;
+}
+
+void require_same_image(const PrefillImage& actual, const PrefillImage& expected,
+                        std::string_view what) {
+    require(actual.first == expected.first, std::string(what) + ": first token differs");
+    require(actual.logits == expected.logits, std::string(what) + ": last-token logits differ");
+    require(actual.kv == expected.kv, std::string(what) + ": text KV differs");
+    require(actual.state == expected.state, std::string(what) + ": GDN state differs");
+}
+
+// Positions i + 17 given explicitly (the prompt's rope_delta stays 0, so prefill cannot derive them
+// from the KV slot) must equal the slot + rope_delta path with rope_delta 17, bit for bit, whole
+// and in four layer slices.
+void explicit_positions_match_rope_delta(DeviceContext& device,
+                                         const qwen::execution::Parameters& parameters,
+                                         qwen::Frontend& frontend, EngineOptions options,
+                                         bool with_slices) {
+    const auto ids = long_prompt_ids(kLongPrompt);
+    std::vector<std::int32_t> offset(kLongPrompt);
+    for (std::uint32_t i = 0; i < kLongPrompt; ++i) {
+        offset[i] = static_cast<std::int32_t>(i) + kRopeOffset;
+    }
+    for (const KvCacheStorage storage : kPositionStorages) {
+        auto fixture = make_positions_program(device, parameters, options, storage, 1);
+        auto delta_prompt = qwen::PreparedPromptAccess::take(frontend.prepare_tokens(ids));
+        set_text_positions(delta_prompt, offset, kRopeOffset);
+        auto explicit_prompt = qwen::PreparedPromptAccess::take(frontend.prepare_tokens(ids));
+        set_text_positions(explicit_prompt, offset, 0);
+
+        const PrefillImage reference = prefill_image(*fixture.program, device, delta_prompt, 0);
+        const PrefillImage explicit_run =
+            prefill_image(*fixture.program, device, explicit_prompt, with_slices ? 4U : 0U);
+        require_same_image(explicit_run, reference,
+                           with_slices ? "explicit positions in four layer slices"
+                                       : "explicit positions");
+        if (!with_slices) {
+            // A guard against a vacuous pass: the slot positions (delta 0) are a different input.
+            auto slot_prompt = qwen::PreparedPromptAccess::take(frontend.prepare_tokens(ids));
+            const PrefillImage slot =
+                prefill_image(*fixture.program, device, std::move(slot_prompt), 0);
+            require(slot.logits != reference.logits,
+                    "positions i + 17 produced the logits of positions i");
+        }
+    }
+}
+
+void explicit_positions_equal_rope_delta_path(DeviceContext& device,
+                                              const qwen::execution::Parameters& parameters,
+                                              qwen::Frontend& frontend, EngineOptions options) {
+    explicit_positions_match_rope_delta(device, parameters, frontend, options, false);
+}
+
+void explicit_positions_with_layer_slices(DeviceContext& device,
+                                          const qwen::execution::Parameters& parameters,
+                                          qwen::Frontend& frontend, EngineOptions options) {
+    explicit_positions_match_rope_delta(device, parameters, frontend, options, true);
+}
+
+// A gapped prompt (kept tokens at their original positions, rope_delta raised by the dropped count)
+// paused with no snapshot is rebuilt by replay from its ledger. The replay must prefill with the
+// stored positions: the greedy continuation after the resume equals the run that never paused. The
+// first prefill runs in capped 200-token steps and replay in 512-token chunks, so a path that took
+// RoPE from the chunk layout (slot + a delta reset on the first chunk) would not agree with itself.
+void replay_preserves_gapped_positions(DeviceContext& device,
+                                       const qwen::execution::Parameters& parameters,
+                                       qwen::Frontend& frontend, EngineOptions options) {
+    constexpr std::uint32_t kGeneratedTokens = 32;
+    constexpr std::uint32_t kPauseAfter      = 8;
+    constexpr std::uint32_t kGapBegin        = 256;
+    constexpr std::uint32_t kPrefillStepCap  = 200;
+    const auto original = qwen::PreparedPromptAccess::take(
+        frontend.prepare_tokens(long_prompt_ids(kLongPrompt)));
+    // Keep every other 64-token block of U = [256, 3000) and its last 512 tokens.
+    std::vector<std::uint32_t> kept;
+    const std::uint32_t span = kLongPrompt - kGapBegin;
+    for (std::uint32_t offset = 0; offset < span; ++offset) {
+        if ((offset / 64) % 2 == 0 || offset + 512 >= span) { kept.push_back(offset); }
+    }
+    const auto map = qwen::detail::make_gap_map(original, kGapBegin, kept);
+    const auto gapped = qwen::detail::compact_prompt(original, map);
+    require(gapped.token_ids.size() == kGapBegin + kept.size() &&
+                gapped.rope_delta == static_cast<std::int32_t>(span - kept.size()) &&
+                gapped.positions[gapped.token_ids.size() - 1] ==
+                    static_cast<std::int32_t>(kLongPrompt - 1),
+            "the gapped prompt fixture is not the compacted original");
+    const auto gapped_tokens = static_cast<std::uint32_t>(gapped.token_ids.size());
+
+    for (const KvCacheStorage storage : kPositionStorages) {
+        auto fixture   = make_positions_program(device, parameters, options, storage, 2);
+        auto& program  = *fixture.program;
+        const auto empty = program.physical_usage().occupied;
+        runtime::ResolvedExecutionOptions request;
+        request.requested_output_tokens = 64;
+        request.allow_prefix_reuse      = false;
+
+        const auto reserve = [&](qwen::SequenceHandle sequence, qwen::ExecutionUnitKind kind,
+                                 std::uint32_t tokens = 0) {
+            const std::array<qwen::ExecutionUnit, 1> units{{{sequence, kind, tokens}}};
+            require(static_cast<bool>(program.reserve_units(units)),
+                    "gapped replay could not reserve a unit");
+        };
+        const auto bind = [&](qwen::RequestBasePlan& base, std::uint32_t lane,
+                              qwen::ResumeState* resume) {
+            auto source = program.inspect_source(base, std::nullopt);
+            require(source && static_cast<bool>(
+                                  program.start_binding(base, {lane}, *source, resume,
+                                                        qwen::ExecutionUnitKind::Decode, 1)),
+                    "gapped replay could not bind its lane");
+            auto progress = settle_positions(program, device);
+            require(progress.published && progress.sequence, "gapped replay did not publish");
+            require(!resume || progress.replaying, "gapped resume did not enter replay");
+            return *progress.sequence;
+        };
+        const auto prefill = [&](qwen::SequenceHandle sequence) {
+            std::uint32_t processed = 0;
+            for (unsigned call = 0; call < 64 && processed < gapped_tokens; ++call) {
+                // A capped step that ends mid-chunk returns without a token; keep going.
+                reserve(sequence, qwen::ExecutionUnitKind::Prefill);
+                auto step = program.advance_prefill(sequence, nullptr, nullptr, kPrefillStepCap);
+                processed += step.processed_prompt_tokens;
+                if (step.pending) {
+                    const TokenId first = step.pending->tokens().front();
+                    const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+                    (void)program.commit(std::move(*step.pending), accepted, {}, nullptr);
+                    require(processed == gapped_tokens, "gapped prefill sampled early");
+                    return first;
+                }
+            }
+            throw std::runtime_error("gapped prefill did not finish its prompt");
+        };
+        const auto decode_round = [&](qwen::SequenceHandle sequence) {
+            reserve(sequence, qwen::ExecutionUnitKind::Decode, 64);
+            const std::array<qwen::SequenceHandle, 1> rows{sequence};
+            const std::array<runtime::RoundBudget, 1> budgets{{{.generated_tokens_remaining = 64}}};
+            auto pending        = program.decode(rows, budgets, nullptr, nullptr);
+            const TokenId token = pending.tokens().front();
+            const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+            (void)program.commit(std::move(pending), accepted, {}, nullptr);
+            return token;
+        };
+
+        // The unpaused reference.
+        std::vector<TokenId> unpaused;
+        {
+            auto base = program.plan_request(qwen::PreparedPromptData(gapped), request);
+            const auto sequence = bind(base, 0, nullptr);
+            unpaused.push_back(prefill(sequence));
+            while (unpaused.size() < kGeneratedTokens) {
+                unpaused.push_back(decode_round(sequence));
+            }
+            require(program.abort(sequence).status == runtime::ConsumeStatus::Consumed,
+                    "the unpaused gapped run retained its resources");
+        }
+
+        std::vector<TokenId> resumed_tokens;
+        {
+            auto base = program.plan_request(qwen::PreparedPromptData(gapped), request);
+            const auto initial = bind(base, 0, nullptr);
+            resumed_tokens.push_back(prefill(initial));
+            while (resumed_tokens.size() < kPauseAfter) {
+                resumed_tokens.push_back(decode_round(initial));
+            }
+            require(program.start_pause(initial, false, nullptr), "gapped run could not pause");
+            auto paused = settle_positions(program, device);
+            require(paused.paused && !paused.paused->has_snapshot(),
+                    "gapped pause kept a snapshot, so nothing replays");
+            const auto resumed = bind(base, 1, &*paused.paused);
+            paused.paused.reset();
+            bool recovered = false;
+            for (unsigned step = 0; step < 64 && !recovered; ++step) {
+                reserve(resumed, qwen::ExecutionUnitKind::Replay);
+                recovered = program.advance_replay(resumed, nullptr).complete;
+            }
+            require(recovered, "gapped replay did not finish");
+            while (resumed_tokens.size() < kGeneratedTokens) {
+                resumed_tokens.push_back(decode_round(resumed));
+            }
+            require(program.abort(resumed).status == runtime::ConsumeStatus::Consumed,
+                    "the resumed gapped run retained its resources");
+        }
+        require(program.physical_usage().occupied == empty, "gapped replay leaked resources");
+        require(resumed_tokens == unpaused,
+                "a gapped prompt replayed after a pause decoded different greedy tokens");
+    }
+}
+
+// ---- Lossy-prefill scout chunks (Task 6) ----
+
+constexpr std::uint32_t kScoutCapacity = 36864;
+constexpr std::uint32_t kScoutChunk    = 4096;
+constexpr std::uint32_t kScoutPrefix   = 2048;
+constexpr std::uint32_t kScoutSpan     = 12288;
+constexpr std::uint32_t kScoutLayer    = 15;
+constexpr std::uint32_t kScoutRows     = 64;
+
+struct ScoutFixture {
+    std::unique_ptr<qwen::detail::SequencePlanImpl> plan;
+    std::unique_ptr<qwen::detail::ProgramImpl> program;
+};
+
+// One rk4v4 Program with the scout's scratch (lossy prefill on), two lanes and a context cache for
+// the shared-prefix binding.
+ScoutFixture make_scout_program(DeviceContext& device, const qwen::execution::Parameters& parameters,
+                                EngineOptions options) {
+    options.max_context                       = kScoutCapacity;
+    options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(kScoutCapacity);
+    options.prefill_chunk                     = kScoutChunk;
+    options.max_concurrency                   = 2;
+    options.kv_cache                          = KvCacheStorage::RotatedLloyd4KeyInt4Value;
+    options.context_cache.enabled             = true;
+    options.context_cache.device_state_slots  = 2;
+    options.context_cache.host_capacity_bytes = 0;
+    options.lossy_prefill.min_tokens          = 1;
+    options.lossy_prefill.filter_layer        = kScoutLayer;
+    options.lossy_prefill.query_rows          = kScoutRows;
+    auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
+    const std::uint32_t pages = planner->curve.minimum_main_page_groups;
+    ScoutFixture out;
+    out.plan    = qwen::detail::finalize_sequence_plan_impl(std::move(planner), pages);
+    out.program = std::make_unique<qwen::detail::ProgramImpl>(parameters, *out.plan, device,
+                                                              StartupObserver{});
+    require(out.program->scout_buffers.has_value(), "lossy prefill planned no scout scratch");
+    return out;
+}
+
+// What the main pass starts from: the GDN state image in the slot the lane reads, the text KV of
+// the cached prefix and the free page count.
+struct ScoutTrace {
+    std::vector<std::byte> state;
+    std::vector<std::byte> kv;
+    std::uint32_t free_pages   = 0;
+    std::uint32_t mapped_pages = 0;
+};
+
+ScoutTrace scout_trace(qwen::detail::ProgramImpl& program, DeviceContext& device,
+                       std::uint32_t lane, std::uint32_t prefix) {
+    device.synchronize();
+    ScoutTrace trace;
+    const auto& layout = program.state_images->host_layout();
+    trace.state.resize(layout.image_bytes);
+    const auto selectors = program.state_selectors(program.sequences[lane]);
+    program.state_images->copy_to_host(selectors.source,
+                                       qwen::HostStateImageView{trace.state.data(), &layout},
+                                       RankStreams(device.stream));
+    device.synchronize();
+    trace.kv           = text_kv_bytes(program, lane, prefix);
+    trace.free_pages   = program.text_kv_pages->physical_pool().available_pages();
+    trace.mapped_pages = program.text_kv_addresses->mapped_pages(program.sequences[lane].kv->text);
+    return trace;
+}
+
+void require_no_trace(const ScoutTrace& after, const ScoutTrace& before, std::string_view what) {
+    require(after.state == before.state, std::string(what) + ": GDN state changed");
+    require(after.kv == before.kv, std::string(what) + ": cached-prefix KV changed");
+    require(after.free_pages == before.free_pages, std::string(what) + ": KV pages leaked");
+    require(after.mapped_pages == before.mapped_pages, std::string(what) + ": KV mapping changed");
+}
+
+class ScoutLane {
+public:
+    ScoutLane(qwen::detail::ProgramImpl& program, DeviceContext& device)
+        : program_(program), device_(device) {}
+
+    // A fresh request for `ids`, bound on `lane` with no reuse and prefilled to `prefix` tokens.
+    qwen::SequenceHandle private_prefix(const std::vector<TokenId>& ids, std::uint32_t lane,
+                                        std::uint32_t prefix, qwen::Frontend& frontend) {
+        runtime::ResolvedExecutionOptions request;
+        request.requested_output_tokens = 8;
+        request.allow_prefix_reuse      = false;
+        auto base       = program_.plan_request(
+            qwen::PreparedPromptAccess::take(frontend.prepare_tokens(ids)), request);
+        const auto root = program_.inspect_source(base, std::nullopt);
+        const auto sequence = bind(base, lane, *root);
+        if (prefix != 0) {
+            reserve(sequence);
+            const auto step = program_.advance_prefill(sequence, nullptr, nullptr, prefix);
+            require(step.processed_prompt_tokens == prefix && !step.pending,
+                    "the cached prefix did not stop at its frontier");
+        }
+        return sequence;
+    }
+
+    qwen::SequenceHandle bind(qwen::RequestBasePlan& base, std::uint32_t lane,
+                              const qwen::SourceCandidate& source) {
+        require(static_cast<bool>(program_.start_binding(base, {lane}, source, nullptr,
+                                                         qwen::ExecutionUnitKind::Prefill, 0)),
+                "scout request could not bind");
+        const auto bound = settle_positions(program_, device_);
+        require(bound.sequence.has_value(), "scout binding did not publish");
+        return *bound.sequence;
+    }
+
+    void reserve(qwen::SequenceHandle sequence) {
+        const std::array<qwen::ExecutionUnit, 1> units{
+            {{sequence, qwen::ExecutionUnitKind::Prefill}}};
+        require(static_cast<bool>(program_.reserve_units(units)),
+                "scout test could not reserve a prefill unit");
+    }
+
+    // Scouts the lane's uncached span in steps of at most `step` tokens (stopping after `stop`
+    // chunks when nonzero) and returns the scores (empty when stopped early). Ends the scout.
+    std::vector<float> scout(qwen::SequenceHandle sequence, std::uint32_t step,
+                             std::uint32_t stop = 0) {
+        program_.begin_scout(sequence);
+        require(program_.scout_active(sequence), "begin_scout did not open a scout");
+        std::vector<float> scores;
+        for (std::uint32_t chunk = 0; chunk < 1024; ++chunk) {
+            if (stop != 0 && chunk == stop) { break; }
+            const auto result = program_.advance_scout(sequence, step);
+            require(result.reserved && result.processed_tokens != 0,
+                    "a scout chunk found too few KV pages");
+            if (result.complete) {
+                scores = program_.scout_scores();
+                break;
+            }
+        }
+        program_.end_scout(sequence);
+        require(!program_.scout_active(sequence), "end_scout left the scout open");
+        return scores;
+    }
+
+    // Prefills the rest of the prompt and returns the first token and the last-token logits.
+    std::pair<TokenId, std::vector<std::byte>> finish(qwen::SequenceHandle sequence) {
+        for (unsigned call = 0; call < 64; ++call) {
+            reserve(sequence);
+            auto step = program_.advance_prefill(sequence, nullptr, nullptr);
+            if (step.capture_ready) { program_.skip_capture(sequence); }
+            if (!step.pending) { continue; }
+            device_.synchronize();
+            std::vector<std::byte> logits;
+            append_device_bytes(logits, program_.io.logits.slice(1, 0, 1));
+            const TokenId first = step.pending->tokens().front();
+            const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+            const auto committed = program_.commit(std::move(*step.pending), accepted, {}, nullptr);
+            if (committed.capture_ready[0]) { program_.skip_capture(sequence); }
+            return {first, std::move(logits)};
+        }
+        throw std::runtime_error("scout test prefill did not finish its prompt");
+    }
+
+    void abort(qwen::SequenceHandle sequence) {
+        require(program_.abort(sequence).status == runtime::ConsumeStatus::Consumed,
+                "scout lane retained its execution resources");
+    }
+
+private:
+    qwen::detail::ProgramImpl& program_;
+    DeviceContext& device_;
+};
+
+void require_scores_sane(const qwen::detail::ProgramImpl& program,
+                         const std::vector<float>& scores, std::uint32_t span) {
+    require(scores.size() == span, "scout scored the wrong number of keys");
+    double sum = 0.0;
+    for (const float score : scores) {
+        require(std::isfinite(score) && score >= 0.0F, "scout score is not a finite mass");
+        sum += score;
+    }
+    // Each query row and head distributes a unit of mass over the keys.
+    const double expected =
+        static_cast<double>(kScoutRows) *
+        static_cast<double>(program.parameters.model.config().text.attention->num_attention_heads);
+    require(std::abs(sum - expected) <= 1e-2 * expected, "scout scores do not sum to rows x heads");
+}
+
+// Scouting 12,288 tokens after a 2,048-token cached prefix leaves the prefix's KV, the GDN state
+// the main pass reads and the free page count exactly as they were, and the ordinary prefill that
+// follows equals one that never scouted, bit for bit. Run for a private prefix (the lane writes
+// its state in place, so the scout saves and restores it) and a shared prefix (a fork is pending:
+// the scout writes the destination and the main pass reads the untouched checkpoint).
+void scout_leaves_no_trace(DeviceContext& device, const qwen::execution::Parameters& parameters,
+                           qwen::Frontend& frontend, EngineOptions options) {
+    auto fixture  = make_scout_program(device, parameters, options);
+    auto& program = *fixture.program;
+    ScoutLane lanes(program, device);
+    const auto empty = program.physical_usage().occupied;
+    const auto ids   = long_prompt_ids(kScoutPrefix + kScoutSpan);
+
+    // Private prefix.
+    {
+        const auto reference_sequence = lanes.private_prefix(ids, 0, kScoutPrefix, frontend);
+        const auto reference          = lanes.finish(reference_sequence);
+        lanes.abort(reference_sequence);
+
+        const auto sequence = lanes.private_prefix(ids, 0, kScoutPrefix, frontend);
+        const auto selectors = program.state_selectors(program.sequences[0]);
+        require(selectors.source == selectors.destination,
+                "a private prefix writes its state in place (the scout must save and restore it)");
+        const ScoutTrace before = scout_trace(program, device, 0, kScoutPrefix);
+        require_scores_sane(program, lanes.scout(sequence, 0), kScoutSpan);
+        require_no_trace(scout_trace(program, device, 0, kScoutPrefix), before, "private scout");
+        const auto after = lanes.finish(sequence);
+        require(after.first == reference.first && after.second == reference.second,
+                "a prefill after a private scout differs from one without it");
+        lanes.abort(sequence);
+    }
+    require(program.physical_usage().occupied == empty, "private scout leaked resources");
+
+    // Shared prefix.
+    {
+        auto prepared = qwen::PreparedPromptAccess::take(frontend.prepare_tokens(ids));
+        prepared.context_cache.opportunities.push_back(
+            {.kind     = PromptCacheMarkerKind::SharedStablePrefix,
+             .evidence = SharedCandidateEvidence::ExplicitBoundary,
+             .frontier = kScoutPrefix});
+        runtime::ResolvedExecutionOptions request;
+        request.requested_output_tokens = 8;
+        request.allow_prefix_reuse      = true;
+        auto base         = program.plan_request(std::move(prepared), request);
+        const auto root   = program.inspect_source(base, std::nullopt);
+        const auto writer = lanes.bind(base, 0, *root);
+        lanes.reserve(writer);
+        const auto step = program.advance_prefill(writer, nullptr, nullptr);
+        require(step.processed_prompt_tokens == kScoutPrefix && step.capture_ready,
+                "the shared prefix writer did not stop at its capture");
+        require(program.start_capture(writer), "the shared prefix could not be captured");
+        const auto captured = settle_positions(program, device);
+        std::optional<qwen::CheckpointHandle> shared;
+        for (const auto point : captured.captured_checkpoints) {
+            if (program.checkpoint_summary(point).role == runtime::CheckpointRole::SharedPrefix) {
+                shared = point;
+            }
+        }
+        require(shared.has_value(), "the shared prefix was not captured");
+        lanes.abort(writer);
+
+        const auto source = program.inspect_source(base, *shared);
+        require(source && source->reused_tokens == kScoutPrefix,
+                "the shared prefix does not cover its frontier");
+        const auto reference_sequence = lanes.bind(base, 1, *source);
+        const auto reference          = lanes.finish(reference_sequence);
+        lanes.abort(reference_sequence);
+
+        const auto sequence = lanes.bind(base, 1, *source);
+        const auto selectors = program.state_selectors(program.sequences[1]);
+        require(selectors.source != selectors.destination,
+                "a shared-prefix binding has no pending fork");
+        const ScoutTrace before = scout_trace(program, device, 1, kScoutPrefix);
+        require_scores_sane(program, lanes.scout(sequence, 0), kScoutSpan);
+        require_no_trace(scout_trace(program, device, 1, kScoutPrefix), before, "shared scout");
+        const auto after = lanes.finish(sequence);
+        require(after.first == reference.first && after.second == reference.second,
+                "a prefill after a shared-prefix scout differs from one without it");
+        lanes.abort(sequence);
+        for (const auto point : captured.captured_checkpoints) {
+            require(program.release_checkpoint(point), "the shared prefix kept a reader");
+        }
+    }
+    require(program.physical_usage().occupied == empty, "shared scout leaked resources");
+}
+
+// A scout ended after its second chunk (an abort) leaves the same no trace, gives back every page
+// it took, and a lane aborted part-way through a scout takes the scout with it.
+void scout_abort_leaves_no_trace(DeviceContext& device,
+                                 const qwen::execution::Parameters& parameters,
+                                 qwen::Frontend& frontend, EngineOptions options) {
+    auto fixture  = make_scout_program(device, parameters, options);
+    auto& program = *fixture.program;
+    ScoutLane lanes(program, device);
+    const auto empty = program.physical_usage().occupied;
+    const auto ids   = long_prompt_ids(kScoutPrefix + kScoutSpan);
+
+    const auto sequence     = lanes.private_prefix(ids, 0, kScoutPrefix, frontend);
+    const ScoutTrace before = scout_trace(program, device, 0, kScoutPrefix);
+    const auto scores       = lanes.scout(sequence, 0, 2);
+    require(scores.empty(), "a scout ended after two chunks reported scores");
+    require_no_trace(scout_trace(program, device, 0, kScoutPrefix), before, "aborted scout");
+
+    // Abort the lane itself in the middle of a second scout.
+    program.begin_scout(sequence);
+    const auto step = program.advance_scout(sequence, 0);
+    require(step.reserved && !step.complete, "the second scout's first chunk did not run");
+    lanes.abort(sequence);
+    require(!program.scout_session.has_value(), "an aborted lane kept its scout");
+    require(program.physical_usage().occupied == empty, "an aborted scout leaked resources");
+}
+
+// The scores do not depend on how the span is cut into chunks: 1,024- and 4,096-token scout
+// chunks keep the same tokens (Jaccard >= 0.99) and agree per token within 30% relative.
+void scout_scores_chunk_invariant(DeviceContext& device,
+                                  const qwen::execution::Parameters& parameters,
+                                  qwen::Frontend& frontend, EngineOptions options) {
+    auto fixture  = make_scout_program(device, parameters, options);
+    auto& program = *fixture.program;
+    ScoutLane lanes(program, device);
+    const auto ids   = long_prompt_ids(kScoutPrefix + kScoutSpan);
+    const auto run   = [&](std::uint32_t step) {
+        const auto sequence = lanes.private_prefix(ids, 0, kScoutPrefix, frontend);
+        auto scores         = lanes.scout(sequence, step);
+        lanes.abort(sequence);
+        require_scores_sane(program, scores, kScoutSpan);
+        return scores;
+    };
+    const auto narrow = run(1024);
+    const auto wide   = run(4096);
+    // Chunk invariance is a ranking property. Each chunk size is bit-reproducible, but the two
+    // tile the BF16 GEMMs and GDN chunks differently, and softmax mass amplifies that rounding
+    // exponentially: measured on the 3090 (2026-10-25), 65% of tokens differ by more than 1%
+    // (the first chunk as much as the rest, so it is not a chunk-boundary carry), at most 17%,
+    // while the total mass is equal and the kept sets are identical (Jaccard 1.0). So the kept
+    // set is the gate; the per-token bound only catches gross errors (a chunk scored at the
+    // wrong positions or with stale keys).
+    require(narrow.size() == wide.size(), "scout scores differ in length across chunk sizes");
+    double mass = 0.0;
+    for (const float v : narrow) {
+        mass += std::abs(v);
+    }
+    const double floor_abs = 1e-6 * mass;
+    double max_rel         = 0.0;
+    for (std::size_t i = 0; i < narrow.size(); ++i) {
+        const double scale = std::max(std::abs(narrow[i]), std::abs(wide[i]));
+        const double diff  = std::abs(double(narrow[i]) - double(wide[i]));
+        if (scale > floor_abs) {
+            max_rel = std::max(max_rel, diff / scale);
+        }
+        require(diff <= 0.3 * scale + floor_abs,
+                "scout score " + std::to_string(i) + " depends on the chunk size: " +
+                    std::to_string(narrow[i]) + " vs " + std::to_string(wide[i]));
+    }
+    const LossyPrefillOptions lossy{};
+    const std::vector<std::uint8_t> forced(narrow.size(), 0);
+    const auto keep_narrow = models::qwen3_5::detail::select_tokens({narrow, forced}, lossy);
+    const auto keep_wide   = models::qwen3_5::detail::select_tokens({wide, forced}, lossy);
+    std::vector<std::uint32_t> both;
+    std::set_intersection(keep_narrow.kept.begin(), keep_narrow.kept.end(), keep_wide.kept.begin(),
+                          keep_wide.kept.end(), std::back_inserter(both));
+    const double uni = double(keep_narrow.kept.size() + keep_wide.kept.size() - both.size());
+    const double jaccard = uni == 0.0 ? 1.0 : double(both.size()) / uni;
+    std::cout << "scout chunk invariance: max relative difference " << max_rel
+              << ", kept-set Jaccard " << jaccard << " (" << keep_narrow.kept.size() << " vs "
+              << keep_wide.kept.size() << " kept)\n";
+    require(jaccard >= 0.99, "scout kept sets depend on the chunk size: Jaccard " +
+                                 std::to_string(jaccard));
+}
+
+// In a 32K-token haystack with a pass key sentence at 50% depth and the question at the end, the
+// pass key's tokens score in the top 5% of the prompt.
+void scout_finds_needle(DeviceContext& device, const qwen::execution::Parameters& parameters,
+                        qwen::Frontend& frontend, EngineOptions options) {
+    constexpr std::uint32_t kHaystack = 32768;
+    const auto filler = frontend.tokenize_text(
+        " The grass is green. The sky is blue. The sun is yellow. Here we go. There and back "
+        "again.");
+    const auto lead     = frontend.tokenize_text(" The pass key is ");
+    const auto key      = frontend.tokenize_text("71432");
+    const auto trail    = frontend.tokenize_text(". Remember it. 71432 is the pass key.");
+    const auto question = frontend.tokenize_text(
+        " What is the pass key? Answer with the number only. The pass key is");
+    require(!filler.empty() && !key.empty(), "the haystack fixture did not tokenize");
+    std::vector<TokenId> ids;
+    const auto fill_to = [&](std::size_t target) {
+        while (ids.size() + filler.size() <= target) {
+            ids.insert(ids.end(), filler.begin(), filler.end());
+        }
+    };
+    fill_to(kHaystack / 2);
+    ids.insert(ids.end(), lead.begin(), lead.end());
+    const std::size_t key_begin = ids.size();
+    ids.insert(ids.end(), key.begin(), key.end());
+    ids.insert(ids.end(), trail.begin(), trail.end());
+    fill_to(kHaystack - question.size());
+    ids.insert(ids.end(), question.begin(), question.end());
+
+    auto fixture  = make_scout_program(device, parameters, options);
+    auto& program = *fixture.program;
+    ScoutLane lanes(program, device);
+    const auto sequence = lanes.private_prefix(ids, 0, 0, frontend);
+    const auto scores   = lanes.scout(sequence, 0);
+    lanes.abort(sequence);
+    require(scores.size() == ids.size(), "the needle scout did not score its whole prompt");
+
+    std::vector<float> sorted = scores;
+    std::sort(sorted.begin(), sorted.end(), std::greater<>());
+    const float cutoff = sorted[sorted.size() / 20];
+    for (std::size_t i = key_begin; i < key_begin + key.size(); ++i) {
+        require(scores[i] > cutoff, "pass key token " + std::to_string(i - key_begin) +
+                                        " is outside the top 5% of scout scores");
+    }
+}
+
+// ---- Lossy prefill phases (Task 7) ----
+
+constexpr std::uint32_t kLossyCapacity = 45056;
+constexpr std::uint32_t kLossyPrompt   = 40960;
+constexpr std::uint32_t kLossyMarker   = 2048; // M: the product prompt's shared marker
+
+// One rk4v4 Program with the lossy path on (threshold 1), two lanes and a context cache.
+ScoutFixture make_lossy_program(DeviceContext& device, const qwen::execution::Parameters& parameters,
+                                EngineOptions options, std::uint32_t capacity, float keep) {
+    options.max_context                       = capacity;
+    options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(capacity);
+    options.prefill_chunk                     = kScoutChunk;
+    options.max_concurrency                   = 2;
+    options.kv_cache                          = KvCacheStorage::RotatedLloyd4KeyInt4Value;
+    options.use_cuda_graph                    = false;
+    options.context_cache.enabled             = true;
+    options.context_cache.device_state_slots  = 4;
+    options.context_cache.host_capacity_bytes = 0;
+    options.lossy_prefill.min_tokens          = 1;
+    options.lossy_prefill.filter_layer        = kScoutLayer;
+    options.lossy_prefill.query_rows          = kScoutRows;
+    options.lossy_prefill.keep_fraction       = keep;
+    // Startup refuses a keep share above the skip share (keep-all runs keep 1.0).
+    options.lossy_prefill.skip_fraction = std::max(keep, options.lossy_prefill.skip_fraction);
+    auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
+    const std::uint32_t pages = 2 * planner->curve.minimum_main_page_groups;
+    ScoutFixture out;
+    out.plan    = qwen::detail::finalize_sequence_plan_impl(std::move(planner), pages);
+    out.program = std::make_unique<qwen::detail::ProgramImpl>(parameters, *out.plan, device,
+                                                              StartupObserver{});
+    require(out.program->scout_buffers.has_value(), "lossy prefill planned no scout scratch");
+    return out;
+}
+
+// A text prompt of `ids` with a SharedStablePrefix marker at kLossyMarker, planned with prefix reuse.
+qwen::RequestBasePlan lossy_request(qwen::detail::ProgramImpl& program, qwen::Frontend& frontend,
+                                    std::vector<TokenId> ids, std::uint32_t output_tokens = 64) {
+    auto prepared = qwen::PreparedPromptAccess::take(frontend.prepare_tokens(std::move(ids)));
+    prepared.context_cache.opportunities.push_back(
+        {.kind     = PromptCacheMarkerKind::SharedStablePrefix,
+         .evidence = SharedCandidateEvidence::ExplicitBoundary,
+         .frontier = kLossyMarker});
+    // M is the product prompt's end (lossy_planned_exact_end); an explicit marker alone no
+    // longer sets it, so the raw-token prompt declares its product prompt ending at the marker.
+    prepared.context_cache.product_prompt_end = kLossyMarker;
+    runtime::ResolvedExecutionOptions request;
+    request.requested_output_tokens = output_tokens;
+    request.allow_prefix_reuse      = true;
+    return program.plan_request(std::move(prepared), request);
+}
+
+struct LossyRun {
+    qwen::SequenceHandle sequence;
+    TokenId first = -1;
+    std::vector<std::byte> logits;
+    std::vector<std::byte> kv;
+    std::vector<std::byte> state;
+    std::uint32_t scouted = 0;
+    std::uint32_t prompt_tokens = 0; // what the lane prefilled (compacted when lossy)
+    std::optional<qwen::LossyOutcome> outcome;
+    // Main KV pages the lane maps right after the step that ended the scout.
+    std::optional<std::uint32_t> pages_after_scout;
+    std::vector<qwen::CheckpointHandle> shared; // the exact capture at M
+};
+
+// Binds `base` on `lane` (from `source`, the root when empty), asks for the lossy path when
+// `enable` is set (requiring enable_lossy to answer *enable), and prefills to the first token. The SharedPrefix capture at M is taken; every other capture is
+// skipped. The first token is committed as terminal when `terminal`, else as an ordinary token.
+LossyRun lossy_prefill(qwen::detail::ProgramImpl& program, DeviceContext& device,
+                       qwen::RequestBasePlan& base, std::uint32_t lane,
+                       std::optional<bool> enable, bool terminal,
+                       std::optional<qwen::SourceCandidate> source = std::nullopt) {
+    ScoutLane lanes(program, device);
+    if (!source) { source = program.inspect_source(base, std::nullopt); }
+    require(source.has_value(), "lossy test request has no source");
+    LossyRun run;
+    run.sequence = lanes.bind(base, lane, *source);
+    if (enable) {
+        require(program.enable_lossy(run.sequence) == *enable,
+                "enable_lossy did not answer as expected");
+    }
+    run.prompt_tokens = base.summary().prompt_tokens;
+    for (unsigned call = 0; call < 512; ++call) {
+        lanes.reserve(run.sequence);
+        auto step = program.advance_prefill(run.sequence, nullptr, nullptr);
+        run.scouted += step.scouted_tokens;
+        require(step.scouted_tokens == 0 || step.processed_prompt_tokens == 0,
+                "a scout step committed prompt tokens");
+        if (step.compacted_prompt_tokens) {
+            require(!run.outcome && step.lossy.has_value(), "the scout ended twice");
+            run.outcome       = step.lossy;
+            run.prompt_tokens = *step.compacted_prompt_tokens;
+            run.pages_after_scout = program.text_kv_addresses->mapped_pages(
+                program.sequences[lane].kv->text);
+        }
+        if (step.capture_ready) {
+            if (program.sequences[lane].text_kv_valid == kLossyMarker &&
+                program.start_capture(run.sequence)) {
+                const auto captured = settle_positions(program, device);
+                for (const auto point : captured.captured_checkpoints) {
+                    run.shared.push_back(point);
+                }
+            } else {
+                program.skip_capture(run.sequence);
+            }
+        }
+        if (!step.pending) { continue; }
+        device.synchronize();
+        run.first = step.pending->tokens().front();
+        append_device_bytes(run.logits, program.io.logits.slice(1, 0, 1));
+        run.kv = text_kv_bytes(program, lane, run.prompt_tokens);
+        const auto& layout = program.state_images->host_layout();
+        run.state.resize(layout.image_bytes);
+        const auto selectors = program.state_selectors(program.sequences[lane]);
+        program.state_images->copy_to_host(selectors.destination,
+                                           qwen::HostStateImageView{run.state.data(), &layout},
+                                           RankStreams(device.stream));
+        device.synchronize();
+        const std::array<runtime::CommitDecision, 1> accepted{
+            {{.accepted_tokens = 1, .terminal = terminal}}};
+        const auto committed = program.commit(std::move(*step.pending), accepted, {}, nullptr);
+        if (committed.capture_ready[0]) { program.skip_capture(run.sequence); }
+        return run;
+    }
+    throw std::runtime_error("lossy test prefill did not finish its prompt");
+}
+
+std::vector<TokenId> greedy_tokens(qwen::detail::ProgramImpl& program, qwen::SequenceHandle sequence,
+                                   std::uint32_t count) {
+    std::vector<TokenId> tokens;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const std::array<qwen::ExecutionUnit, 1> units{
+            {{sequence, qwen::ExecutionUnitKind::Decode, count - i}}};
+        require(static_cast<bool>(program.reserve_units(units)), "greedy decode could not reserve");
+        const std::array<qwen::SequenceHandle, 1> rows{sequence};
+        const std::array<runtime::RoundBudget, 1> budgets{
+            {{.generated_tokens_remaining = count - i}}};
+        auto pending = program.decode(rows, budgets, nullptr, nullptr);
+        tokens.push_back(pending.tokens().front());
+        const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+        (void)program.commit(std::move(pending), accepted, {}, nullptr);
+    }
+    return tokens;
+}
+
+// LossyKeepAllMatchesOrdinaryPrefill: keep 1.0 keeps all of U (the skip rule), so after the scout
+// the request is an ordinary prefill from M. The first token, its logits, the prompt's KV, the GDN
+// state and 64 greedy tokens equal a request on the same Program that never took the lossy path,
+// bit for bit. Both stop at the capture at M, so their chunks are cut the same way.
+void lossy_keep_all_matches_ordinary_prefill(DeviceContext& device,
+                                             const qwen::execution::Parameters& parameters,
+                                             qwen::Frontend& frontend, EngineOptions options) {
+    auto fixture  = make_lossy_program(device, parameters, options, kScoutCapacity, 1.0F);
+    auto& program = *fixture.program;
+    const auto empty = program.physical_usage().occupied;
+    const auto ids   = long_prompt_ids(kScoutPrefix + kScoutSpan);
+    const auto run   = [&](bool lossy) {
+        zero_text_kv(program, device);
+        auto base = lossy_request(program, frontend, ids);
+        require(base.lossy().has_value() && base.lossy()->exact_end == kLossyMarker,
+                "the plan does not offer the lossy path at the marker");
+        auto result = lossy_prefill(program, device, base, 0,
+                                    lossy ? std::optional<bool>(true) : std::nullopt, false);
+        // The first token and 63 more: 64 greedy tokens.
+        auto tokens = greedy_tokens(program, result.sequence, 63);
+        tokens.insert(tokens.begin(), result.first);
+        require(program.abort(result.sequence).status == runtime::ConsumeStatus::Consumed,
+                "keep-all lane retained its execution resources");
+        for (const auto point : result.shared) {
+            require(program.release_checkpoint(point), "the shared prefix kept a reader");
+        }
+        return std::pair{std::move(result), std::move(tokens)};
+    };
+    const auto reference = run(false);
+    const auto lossy     = run(true);
+    require(reference.first.scouted == 0 && !reference.first.outcome, "the reference scouted");
+    require(lossy.first.scouted == kScoutPrefix + kScoutSpan - kLossyMarker,
+            "the lossy request did not scout all of U");
+    require(lossy.first.outcome && lossy.first.outcome->skipped &&
+                lossy.first.outcome->kept_tokens == lossy.first.outcome->uncached_tokens,
+            "keep 1.0 did not keep all of U");
+    require(lossy.first.prompt_tokens == reference.first.prompt_tokens,
+            "keep 1.0 changed the prompt length");
+    require(lossy.first.first == reference.first.first, "keep-all: first token differs");
+    require(lossy.first.logits == reference.first.logits, "keep-all: last-token logits differ");
+    require(lossy.first.kv == reference.first.kv, "keep-all: prompt KV differs");
+    require(lossy.first.state == reference.first.state, "keep-all: GDN state differs");
+    require(lossy.second == reference.second, "keep-all: greedy tokens differ");
+    require(program.physical_usage().occupied == empty, "keep-all runs leaked resources");
+}
+
+// lossy_releases_pages_above_kept_frontier: a 40K prompt at keep 0.2. During the scout the lane
+// maps pages past M; the step that ends it leaves only M's pages, and once the first token is
+// committed the lane holds the pages of M + kept + 1 tokens, not of the original prompt.
+// LossyFlow.ExactRequestNeverBindsSelectedState: the same prompt planned before the lossy run (so
+// not rewritten) matches the exact shared capture at M but none of the selected checkpoints.
+// Follow-up: the original prompt + the first token + a new tail plans onto the kept identity
+// (shorter prompt_tokens, original reported_prompt_tokens, no lossy path), reuses the selected
+// continuation and binds it; once every holder is gone the map dies and the same prompt plans as
+// itself again.
+void lossy_selected_lineage(DeviceContext& device, const qwen::execution::Parameters& parameters,
+                            qwen::Frontend& frontend, EngineOptions options) {
+    auto fixture  = make_lossy_program(device, parameters, options, kLossyCapacity, 0.2F);
+    auto& program = *fixture.program;
+    const auto empty = program.physical_usage().occupied;
+    const auto ids   = long_prompt_ids(kLossyPrompt);
+
+    auto exact = lossy_request(program, frontend, ids); // planned before any gap map exists
+    auto base  = lossy_request(program, frontend, ids);
+    require(base.summary().prompt_tokens == kLossyPrompt &&
+                base.summary().reported_prompt_tokens == kLossyPrompt,
+            "a cold prompt was rewritten");
+    auto run = lossy_prefill(program, device, base, 0, true, true);
+    require(run.scouted != 0, "the lossy request did not scout");
+    require(run.outcome && !run.outcome->skipped, "keep 0.2 kept everything");
+    const auto& outcome = *run.outcome;
+    require(outcome.exact_end == kLossyMarker && outcome.uncached_tokens == kLossyPrompt - kLossyMarker,
+            "the scout did not cover [M, end)");
+    require(run.scouted == outcome.uncached_tokens, "the scout steps did not add up to U");
+    require(run.prompt_tokens == kLossyMarker + outcome.kept_tokens,
+            "the compacted prompt is not C + kept");
+    require(run.pages_after_scout == qwen::detail::kv_pages_for_frontier(kLossyMarker),
+            "the scout's pages above M were not released");
+    const auto& sequence = program.sequences[0];
+    require(sequence.ledger.size() == run.prompt_tokens + 1 && sequence.gap_maps.size() == 1,
+            "the lane's ledger is not the kept token list");
+    require(sequence.rope_delta == static_cast<std::int32_t>(kLossyPrompt - run.prompt_tokens),
+            "generation does not continue at the original prompt length");
+    const auto resident = program.text_kv_addresses->mapped_pages(sequence.kv->text);
+    require(resident <= qwen::detail::kv_pages_for_frontier(run.prompt_tokens + 1),
+            "resident pages after prefill exceed kv_pages_for_frontier(M + kept + 1)");
+    require(run.shared.size() == 1, "the exact shared prefix at M was not captured");
+
+    auto finished = program.finish(run.sequence);
+    require(finished.status == runtime::ConsumeStatus::Consumed && finished.checkpoint,
+            "the lossy request published no continuation");
+    const auto selected = *finished.checkpoint;
+    require(program.checkpoint(selected).frontier == run.prompt_tokens &&
+                program.checkpoint(selected).gap_maps.size() == 1,
+            "the selected continuation does not carry its gap map");
+
+    // Exactness: the unrewritten prompt reaches the exact capture at M and nothing selected.
+    require(program.checkpoint_matches(run.shared.front(), exact),
+            "the exact shared prefix no longer matches the original prompt");
+    require(!program.checkpoint_matches(selected, exact) &&
+                !program.inspect_source(exact, selected).has_value(),
+            "an exact request can bind the selected continuation");
+
+    // Follow-up turn.
+    std::vector<TokenId> follow = ids;
+    follow.push_back(run.first);
+    const auto tail = long_prompt_ids(96);
+    follow.insert(follow.end(), tail.begin(), tail.end());
+    auto next = lossy_request(program, frontend, follow, 8);
+    require(next.summary().reported_prompt_tokens == follow.size() &&
+                next.summary().prompt_tokens == run.prompt_tokens + 1 + tail.size(),
+            "the follow-up was not rewritten onto the kept identity");
+    require(!next.lossy().has_value(), "a rewritten follow-up offers the lossy path again");
+    require(program.checkpoint_matches(selected, next), "the follow-up does not match the selection");
+    const auto reuse = program.inspect_source(next, selected);
+    require(reuse && reuse->reused_tokens == run.prompt_tokens,
+            "the follow-up does not reuse the selected continuation");
+    auto second = lossy_prefill(program, device, next, 1, false, true, reuse);
+    require(second.scouted == 0 && second.first >= 0, "the follow-up scouted or did not finish");
+    require(program.sequences[1].gap_maps.size() == 1, "the follow-up lost its lineage");
+    auto second_finished = program.finish(second.sequence);
+    require(second_finished.status == runtime::ConsumeStatus::Consumed,
+            "the follow-up kept its execution resources");
+
+    // Alias removal: with every checkpoint gone nothing holds the map.
+    std::vector<qwen::CheckpointHandle> held = run.shared;
+    held.push_back(selected);
+    if (second_finished.checkpoint) { held.push_back(*second_finished.checkpoint); }
+    for (const auto point : held) {
+        if (program.valid_checkpoint(point)) {
+            require(program.release_checkpoint(point), "a lineage checkpoint kept a reader");
+        }
+    }
+    for (std::size_t index = 0; index < program.checkpoints.size(); ++index) {
+        const auto& slot = program.checkpoints[index];
+        if (slot.value && !slot.value->gap_maps.empty()) {
+            require(program.release_checkpoint({&program, static_cast<std::uint32_t>(index),
+                                                slot.generation}),
+                    "a lineage capture kept a reader");
+        }
+    }
+    { const auto plan_holds_the_map = std::move(next); } // a live plan holds its lineage too
+    auto again = lossy_request(program, frontend, follow, 8);
+    require(again.summary().prompt_tokens == follow.size(),
+            "a prompt was rewritten by a map no checkpoint holds");
+    require(program.physical_usage().occupied == empty, "the lossy lineage leaked resources");
+}
+
+// The scout window (between M and the first Main chunk) on a two-lane Program:
+// - after the first scout step the lane refuses pause and every capture gate;
+// - a second lossy request reaching M while the first scouts declines the lossy path (reported as
+//   skipped and declined), prefills all of its prompt and is not cleared;
+// - aborting the scouting lane through advance_prefill + abort leaves the shared checkpoint at M
+//   (its GDN state and the prefix KV a new reader binds) exactly as before the scout, and every
+//   resource returns once the checkpoints are released.
+void lossy_scout_window(DeviceContext& device, const qwen::execution::Parameters& parameters,
+                        qwen::Frontend& frontend, EngineOptions options) {
+    auto fixture  = make_lossy_program(device, parameters, options, kScoutCapacity, 0.2F);
+    auto& program = *fixture.program;
+    ScoutLane lanes(program, device);
+    const auto empty = program.physical_usage().occupied;
+    const auto ids   = long_prompt_ids(kScoutPrefix + kScoutSpan);
+
+    auto base           = lossy_request(program, frontend, ids);
+    const auto root     = program.inspect_source(base, std::nullopt);
+    const auto sequence = lanes.bind(base, 0, *root);
+    require(program.enable_lossy(sequence), "the first lossy request was refused");
+    std::vector<qwen::CheckpointHandle> shared;
+    std::optional<ScoutTrace> before;
+    for (unsigned call = 0; call < 64 && !program.scout_active(sequence); ++call) {
+        if (program.sequences[0].text_kv_valid == kLossyMarker && !before &&
+            !program.requests[0].capture_pending) {
+            before = scout_trace(program, device, 0, kLossyMarker);
+        }
+        lanes.reserve(sequence);
+        auto step = program.advance_prefill(sequence, nullptr, nullptr);
+        require(!step.pending, "the lossy request finished before scouting");
+        if (step.capture_ready) {
+            require(program.start_capture(sequence), "the shared prefix at M was not captured");
+            const auto captured = settle_positions(program, device);
+            shared.insert(shared.end(), captured.captured_checkpoints.begin(),
+                          captured.captured_checkpoints.end());
+        }
+        if (step.scouted_tokens != 0) {
+            require(step.processed_prompt_tokens == 0, "a scout step committed prompt tokens");
+        }
+    }
+    require(program.scout_active(sequence) && before && shared.size() == 1,
+            "the lossy request did not reach its scout after an exact capture at M");
+
+    // The window refuses pause and capture.
+    require(!program.start_pause(sequence, true, nullptr, false), "a scouting lane paused");
+    require(!program.start_pause(sequence, true, nullptr, true), "a scouting lane paused (yield)");
+    lanes.reserve(sequence);
+    require(!program.prepare_capture(sequence).has_value(), "a scouting lane prepared a capture");
+    require(!program.start_capture(sequence), "a scouting lane started a capture");
+    require(!program.capture_is_input(sequence), "a scouting lane reports an input capture");
+
+    // A second lossy request reaching M declines and prefills normally.
+    {
+        auto other = lossy_request(program, frontend, long_prompt_ids(kScoutPrefix + kScoutSpan + 128));
+        // Bound from the shared checkpoint, it is at M at once: its first step meets the busy scout.
+        const auto at_m = program.inspect_source(other, shared.front());
+        require(at_m && at_m->reused_tokens == kLossyMarker, "the second request does not reuse M");
+        auto run = lossy_prefill(program, device, other, 1, true, false, at_m);
+        require(run.outcome && run.outcome->declined && run.outcome->skipped &&
+                    run.outcome->kept_tokens == run.outcome->uncached_tokens,
+                "the second lossy request did not decline the busy scout");
+        require(run.scouted == 0 && run.first >= 0 &&
+                    run.prompt_tokens == kScoutPrefix + kScoutSpan + 128,
+                "the declined request did not prefill all of its prompt");
+        require(program.scout_active(sequence), "the declined request disturbed the scout");
+        require(program.abort(run.sequence).status == runtime::ConsumeStatus::Consumed,
+                "the declined lane retained its execution resources");
+        for (const auto point : run.shared) {
+            require(program.release_checkpoint(point), "the declined lane's capture kept a reader");
+        }
+    }
+
+    // Abort mid-scout, then look at what a new reader of the checkpoint at M finds.
+    lanes.reserve(sequence);
+    const auto step = program.advance_prefill(sequence, nullptr, nullptr);
+    require(step.scouted_tokens != 0 && !step.compacted_prompt_tokens,
+            "the second scout step did not run mid-scout");
+    lanes.abort(sequence);
+    require(!program.scout_session.has_value(), "an aborted lane kept its scout");
+    const auto source = program.inspect_source(base, shared.front());
+    require(source && source->reused_tokens == kLossyMarker, "the checkpoint at M stopped matching");
+    const auto reader       = lanes.bind(base, 0, *source);
+    const ScoutTrace after  = scout_trace(program, device, 0, kLossyMarker);
+    require(after.state == before->state, "aborted scout: the GDN state at M changed");
+    require(after.kv == before->kv, "aborted scout: the prefix KV at M changed");
+    lanes.abort(reader);
+    for (const auto point : shared) {
+        require(program.release_checkpoint(point), "the shared prefix kept a reader");
+    }
+    require(program.physical_usage().occupied == empty, "the aborted scout leaked resources");
+}
+
+// Program::abort_lossy_scout, the Engine's way to pause a scouting lane under memory pressure:
+// after one scout step it ends the scout with the lane back at M exactly as the scout found it (GDN
+// state and prefix KV bit-identical, no page past M kept), the request continues as an ordinary
+// prefill, and the lane can then be paused.
+void lossy_scout_abort_then_pause(DeviceContext& device, const qwen::execution::Parameters& parameters,
+                                  qwen::Frontend& frontend, EngineOptions options) {
+    auto fixture  = make_lossy_program(device, parameters, options, kScoutCapacity, 0.2F);
+    auto& program = *fixture.program;
+    ScoutLane lanes(program, device);
+    const auto empty = program.physical_usage().occupied;
+    auto base           = lossy_request(program, frontend, long_prompt_ids(kScoutPrefix + kScoutSpan));
+    const auto root     = program.inspect_source(base, std::nullopt);
+    const auto sequence = lanes.bind(base, 0, *root);
+    require(program.enable_lossy(sequence), "the lossy request was refused");
+    require(!program.abort_lossy_scout(sequence), "abort_lossy_scout ended a scout that never began");
+    std::vector<qwen::CheckpointHandle> shared;
+    std::optional<ScoutTrace> at_m;
+    for (unsigned call = 0; call < 64 && !program.scout_active(sequence); ++call) {
+        lanes.reserve(sequence);
+        auto step = program.advance_prefill(sequence, nullptr, nullptr);
+        require(!step.pending, "the lossy request finished before scouting");
+        if (step.capture_ready) {
+            require(program.start_capture(sequence), "the shared prefix at M was not captured");
+            const auto captured = settle_positions(program, device);
+            shared.insert(shared.end(), captured.captured_checkpoints.begin(),
+                          captured.captured_checkpoints.end());
+        }
+        // The lane at M, settled, just before the step that opens the scout.
+        if (program.sequences[0].text_kv_valid == kLossyMarker && !program.scout_active(sequence) &&
+            !program.requests[0].capture_pending) {
+            at_m = scout_trace(program, device, 0, kLossyMarker);
+        }
+    }
+    require(program.scout_active(sequence) && at_m, "the lossy request did not reach its scout");
+    require(!program.start_pause(sequence, false, nullptr, false), "a scouting lane paused");
+
+    require(program.abort_lossy_scout(sequence), "abort_lossy_scout refused a scouting lane");
+    require(!program.scout_active(sequence) && !program.scout_session.has_value(),
+            "abort_lossy_scout left the scout open");
+    require_no_trace(scout_trace(program, device, 0, kLossyMarker), *at_m, "aborted scout at M");
+    require(program.sequences[0].text_kv_valid == kLossyMarker &&
+                program.requests[0].prefill->cursor == kLossyMarker,
+            "the aborted scout moved the lane away from M");
+    require(!program.abort_lossy_scout(sequence), "a second abort_lossy_scout ended a scout");
+
+    // Pausable again; the pause saves the lane at M.
+    require(program.start_pause(sequence, true, nullptr, false),
+            "the lane did not pause after its scout ended");
+    auto paused = settle_positions(program, device);
+    require(paused.published && paused.paused && paused.paused->frontier() == kLossyMarker,
+            "the pause after an aborted scout did not save the lane at M");
+    paused.paused.reset();
+    for (const auto point : shared) {
+        require(program.release_checkpoint(point), "the shared prefix kept a reader");
+    }
+    require(program.physical_usage().occupied == empty, "the aborted scout and pause leaked resources");
+}
+
 SpeculativeBackend selected_backend(std::string_view name) {
     if (name == "none") { return SpeculativeBackend::None; }
     if (name == "mtp") { return SpeculativeBackend::Mtp; }
@@ -2775,6 +3995,26 @@ int main(int argc, char** argv) {
         sliced_prefill_matches_whole(device, parameters, frontend, options);
         sliced_prefill_beside_a_decoding_lane(device, parameters, frontend, options);
         replay_sampling_counts(device, parameters, frontend, options);
+        // A 3,000-token prompt needs a Frontend with a longer context than the fixtures above.
+        auto long_frontend = qwen::make_frontend(
+            model->resources(), {.vision_enabled = false, .max_context = kLongCapacity});
+        explicit_positions_equal_rope_delta_path(device, parameters, long_frontend, options);
+        explicit_positions_with_layer_slices(device, parameters, long_frontend, options);
+        replay_preserves_gapped_positions(device, parameters, long_frontend, options);
+        // The scout tests need a 32K-token Frontend.
+        auto scout_frontend = qwen::make_frontend(
+            model->resources(), {.vision_enabled = false, .max_context = kScoutCapacity});
+        scout_leaves_no_trace(device, parameters, scout_frontend, options);
+        scout_abort_leaves_no_trace(device, parameters, scout_frontend, options);
+        scout_scores_chunk_invariant(device, parameters, scout_frontend, options);
+        scout_finds_needle(device, parameters, scout_frontend, options);
+        lossy_keep_all_matches_ordinary_prefill(device, parameters, scout_frontend, options);
+        lossy_scout_window(device, parameters, scout_frontend, options);
+        lossy_scout_abort_then_pause(device, parameters, scout_frontend, options);
+        // The 40K lossy prompts need a Frontend with a longer context.
+        auto lossy_frontend = qwen::make_frontend(
+            model->resources(), {.vision_enabled = false, .max_context = kLossyCapacity});
+        lossy_selected_lineage(device, parameters, lossy_frontend, options);
         std::cout << "OK native transaction cancellation, paused ownership and replay recovery\n";
         return 0;
     } catch (const std::exception& error) {

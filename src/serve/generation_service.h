@@ -7,6 +7,7 @@
 #include "serve/request.h"
 #include "serve/serve_options.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -65,6 +66,8 @@ struct GenerationMetrics {
     std::uint64_t speculative_ngram_accepted_tokens = 0;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;
+    // Set when the request took the lossy prefill path (the request log's lossy_prefill).
+    std::optional<ninfer::LossyPrefillReport> lossy_prefill;
 };
 
 struct GenerationOutcome {
@@ -222,6 +225,8 @@ private:
     void idle_sleep_loop();
 
     ServeOptions options_;
+    // The lossy-prefill warning for a prompt whose product prompt cannot be bounded: once.
+    mutable std::atomic<bool> warned_unbounded_product_prompt_{false};
     std::unique_ptr<ninfer::Engine> engine_;
     std::shared_ptr<RequestCapacity> request_capacity_;
     // --sleep-idle-seconds: the thread that suspends an idle model.

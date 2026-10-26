@@ -45,8 +45,19 @@ enum class LinearPolicy : std::uint8_t {
     /// engine. Only GGML block-format weights admit it: Linear and LinearAdd reject it for every
     /// other format, and wider calls (T > 8) take AllowA8's route.
     AllowA8GgmlDecodeMma,
+    /// The lossy-prefill scout's int4 route (docs/maintainer/lossy-long-prefill.md, "Int4 scout
+    /// GEMMs"): AllowA8Int, except that wherever the integer-A8 prefill route would run on a
+    /// Q4_G64_FP16 matrix, the activations are quantised to int4 per 64-wide group instead
+    /// (quantize_a4_g64 + q4_a4_linear). Q5 matrices keep the integer-A8 route. Only
+    /// linear_swiglu, linear_add and the split attn_input_proj / gdn_input_proj forms admit it;
+    /// every other Op rejects it. It never comes from an artifact or an engine option: the Qwen3.5
+    /// Program writes it only into the scout's own copy of the layer parameters, because its
+    /// rounding is acceptable only where the result is a ranking, never a model output.
+    ScoutA4Int,
 };
 
+/// The policies every Linear-family Op accepts. ScoutA4Int is deliberately absent: only the four
+/// Ops named on it admit it, and each lists it explicitly.
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
            policy == LinearPolicy::AllowA4 || policy == LinearPolicy::AllowA8Int ||
@@ -65,7 +76,12 @@ enum class LinearPolicy : std::uint8_t {
 /// Integer-A8 (s8 activation, groupwise-int weight) profiles. Never implies the FP8 A8 path.
 [[nodiscard]] constexpr bool allows_a8_int(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::AllowA8Int || policy == LinearPolicy::AllowA8IntDecode ||
-           policy == LinearPolicy::AllowPrefillCublas;
+           policy == LinearPolicy::AllowPrefillCublas || policy == LinearPolicy::ScoutA4Int;
+}
+
+/// The scout's int4-activation route for Q4_G64_FP16 matrices (LinearPolicy::ScoutA4Int).
+[[nodiscard]] constexpr bool allows_scout_a4(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::ScoutA4Int;
 }
 
 /// The GGML block formats' int8 tensor-core decode route (GGML weights only).

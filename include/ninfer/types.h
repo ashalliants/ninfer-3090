@@ -290,6 +290,58 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> host_cache_percent;
 };
 
+// How a lossy prefill shortens a long cold prompt (docs/maintainer/lossy-long-prefill.md).
+enum class LossyStrategy : std::uint8_t {
+    // A scout pass scores blocks of the prompt and only the kept blocks are prefilled.
+    Select,
+    // Opt-in alternative: the middle of the conversation is replaced by one deterministic summary
+    // message (the rule-based projector of hermes-vcc-engine) and the result is prefilled as an
+    // ordinary exact prompt. Ignores the selection knobs below.
+    Summary,
+};
+
+// The summary strategy's coldness probe for one long prompt: no private conversation record would
+// serve it (cold: summarised), one would (warm), or the worker did not answer in time (timeout,
+// treated as warm).
+enum class LossySummaryProbe : std::uint8_t { Cold, Warm, Timeout };
+
+// Lossy long-prompt prefill: past a threshold, a cheap scout pass scores blocks of the prompt and
+// only the kept blocks are prefilled (the rest never enter the KV cache). Off by default. The
+// selection defaults (filter layer 7, keep 0.3, block 64) are the fastest point that passed every
+// gate of the 2026-10-25 sweep (docs/maintainer/lossy-long-prefill.md, "Results").
+struct LossyPrefillOptions {
+    // Prompts whose part after the product prompt (the leading System/Developer messages and tools)
+    // has more than this many tokens are filtered. 0 (the default) is off.
+    std::uint32_t min_tokens = 0;
+    // Share of the filtered part's blocks to keep, in (0, 1].
+    float keep_fraction = 0.3F;
+    // Full-attention layer whose scores pick the blocks (checked against the model at startup).
+    std::uint32_t filter_layer = 7;
+    // Block size in tokens: a multiple of 16, at least 16.
+    std::uint32_t block_tokens = 64;
+    // Tokens at the end and at the start of the filtered part that are always kept.
+    std::uint32_t recent_tokens = 4096;
+    std::uint32_t head_tokens   = 256;
+    // Trailing query rows that score the blocks, 1..256.
+    std::uint32_t query_rows = 64;
+    // Score pooling: each token's score becomes the max over a centred window of this many tokens
+    // (odd; clamped at the ends) before blocks are summed, so a block next to a high-scoring token
+    // ranks higher. 1 is no pooling.
+    std::uint32_t pool_window = 33;
+    // Skip rule: when the kept tokens (the forced and always-kept ones, or the keep budget if
+    // larger) would exceed this share of the filtered part, keep everything (an ordinary full
+    // prefill after the scout). In (0, 1], at least keep_fraction.
+    float skip_fraction = 0.8F;
+    // Run the scout GEMMs with int4 activations.
+    bool scout_a4 = false;
+    LossyStrategy strategy = LossyStrategy::Select;
+    // Summary strategy: the summary's budget in tokens, min(0.06 x max_context, this), at least
+    // 1,500.
+    std::uint32_t summary_max_tokens = 8000;
+
+    [[nodiscard]] bool enabled() const noexcept { return min_tokens > 0; }
+};
+
 // How a long prefill shares the GPU with lanes that are already generating. Off by default.
 struct PrefillScheduleOptions {
     // The Engine runs one prefill step per worker cycle, so a stream that decodes next to a prefill
@@ -656,6 +708,7 @@ struct EngineOptions {
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     PrefillScheduleOptions prefill_schedule;
+    LossyPrefillOptions lossy_prefill;
     // Prompt grafts a request may select by name through PromptOptions::graft. Each is loaded and
     // validated against the resident model at construction.
     std::vector<GraftSource> grafts;
@@ -1122,6 +1175,10 @@ struct PromptSummary {
     // Vision work the prompt will cost, for predicting its prefill time while it waits.
     std::uint32_t vision_items   = 0;
     std::uint64_t vision_patches = 0;
+    // The prompt declares tools, but neither a leading system message nor the end of the tool
+    // declarations could be located, so the end of the product prompt is unknown. Lossy prefill
+    // does not take such a prompt (it would otherwise expose the tool schemas to selection).
+    bool product_prompt_unbounded = false;
 };
 
 struct PromptPreparationStats {
@@ -1463,6 +1520,40 @@ struct GenerationAdmissionStats {
     AdmissionFallbackReason fallback_reason = AdmissionFallbackReason::None;
 };
 
+enum class LossyPrefillOutcome : std::uint8_t {
+    Completed, // the selection dropped tokens and the kept ones were prefilled
+    Skipped,   // the selection kept everything: the whole uncached part was prefilled
+    Declined,  // another request held the one scout: prefilled in full, no scout ran
+    Aborted,   // cancelled, or the scout ended for memory pressure, before the outcome
+};
+
+// A request that took the lossy prefill path (docs/maintainer/lossy-long-prefill.md,
+// "Observability"). Token counts are of the uncached part U after the exact prefix.
+struct LossyPrefillReport {
+    LossyPrefillOutcome outcome   = LossyPrefillOutcome::Completed;
+    std::uint32_t uncached_tokens = 0;
+    std::uint32_t kept_tokens     = 0;
+    std::uint32_t filter_layer    = 0;
+    double scout_ms               = 0.0;
+    // Prefill after the selection: the kept tokens (or all of U when nothing was dropped).
+    double main_ms                = 0.0;
+    // The kept offsets of the filtered part as [begin, end) runs, ascending: all of it when
+    // skipped, none when declined or aborted. Serve logs them only under
+    // --request-log-lossy-detail (the int4 scout's kept-block overlap gate reads them).
+    std::vector<std::array<std::uint32_t, 2>> kept_runs;
+    // Summary strategy: the token counts are of the whole prompt (uncached_tokens the client's
+    // rendered prompt, kept_tokens the prompt as prefilled), filter_layer and the times are 0,
+    // `summarized_messages` is the newest summarised range [first, last) in the client's message
+    // indices, and `summary_reused` says a recorded summary was substituted (a later turn of a
+    // summarised conversation) rather than written by this request. A long prompt the probe found
+    // warm (or that timed out), and so left whole, is reported as skipped with both counts the
+    // prompt's length. `summary_probe` is the probe's answer, unset when the prompt was not probed.
+    LossyStrategy strategy = LossyStrategy::Select;
+    std::optional<std::array<std::uint32_t, 2>> summarized_messages;
+    bool summary_reused = false;
+    std::optional<LossySummaryProbe> summary_probe;
+};
+
 struct GenerationResult {
     // Unique within this Engine instance; diagnostic correlation only.
     std::uint64_t engine_request_id = 0;
@@ -1487,6 +1578,9 @@ struct GenerationResult {
     SpeculativeStats speculative;
     ThinkingBudgetStats thinking;
     std::optional<ConstraintObservation> constraint;
+    // Set when the request took the lossy prefill path. prompt_tokens and reused_prompt_tokens
+    // keep counting the client's prompt; the kept count is only here.
+    std::optional<LossyPrefillReport> lossy_prefill;
 };
 
 enum class ModelResidency : std::uint8_t {
@@ -1733,6 +1827,25 @@ struct RuntimeStats {
     // (PrefillScheduleOptions::layer_slices): each boundary is a point where a neighbour decoded.
     std::uint64_t sliced_prefill_steps              = 0;
     std::uint64_t prefill_slice_boundaries          = 0;
+    // Lossy long-prompt prefill (LossyPrefillOptions), one outcome per request that took the path:
+    // its selection dropped tokens and the kept ones were prefilled (completed); the selection
+    // kept everything, or the request found the one scout taken and prefilled in full (skipped);
+    // it was cancelled, or its scout was ended for memory pressure, before that (aborted). Also
+    // the prompt tokens the scouts scored, the tokens their selections kept, and follow-up prompts
+    // rewritten onto a selected lineage (alias hits).
+    std::uint64_t lossy_prefills_completed          = 0;
+    std::uint64_t lossy_prefills_skipped            = 0;
+    std::uint64_t lossy_prefills_aborted            = 0;
+    std::uint64_t lossy_prefill_scouted_tokens      = 0;
+    std::uint64_t lossy_prefill_kept_tokens         = 0;
+    std::uint64_t lossy_prefill_alias_hits          = 0;
+    // Summary strategy: admitted prompts whose middle this request summarised (new), and ones
+    // that substituted a recorded summary (reused, a later turn of a summarised conversation).
+    std::uint64_t lossy_prefill_summaries_new    = 0;
+    std::uint64_t lossy_prefill_summaries_reused = 0;
+    // Summary-strategy coldness probes the worker did not answer in time (the prompt was then
+    // treated as warm and not summarised).
+    std::uint64_t lossy_prefill_summary_probe_timeouts = 0;
 
     std::uint64_t root_selections               = 0;
     std::uint64_t checkpoint_selections         = 0;
@@ -1827,6 +1940,10 @@ struct RuntimeStats {
     // The rate the cost model currently assumes for reading a stored image back into the Host tier
     // (store read and import), learned from the reads observed so far; prices every hydration.
     double context_store_read_bytes_per_second = 0.0;
+    // Idle writes: retained continuations queued for the store once unused for
+    // ContextStoreOptions::idle_persist, and the Engine worker time spent copying their images out.
+    std::uint64_t context_store_idle_writes            = 0;
+    double context_store_idle_export_seconds           = 0.0;
     // Write-on-evict: continuations the cache was about to lose that were queued for the store
     // first, and the Engine worker time spent copying their images out.
     std::uint64_t context_store_eviction_writes        = 0;

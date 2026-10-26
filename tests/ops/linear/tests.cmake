@@ -58,3 +58,13 @@ ninfer_add_op_test(ninfer_linear_ggml_test
 ninfer_add_op_test(ninfer_linear_ggml_device_decode_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_device_decode.cu"
   LIBRARIES ninfer_core)
+
+# A4G64 activations and the W4A4 Q4 GEMM (ninfer/ops/q4_a4_linear.h). The host test checks the
+# reference quantiser, packer and exact product the GPU test uses as its oracle; it needs no GPU.
+ninfer_add_op_test(ninfer_a4_g64_reference_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_a4_g64_reference.cpp"
+  LIBRARIES ninfer_core)
+
+ninfer_add_op_test(ninfer_q4_a4_linear_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q4_a4_linear.cpp"
+  LIBRARIES ninfer_ops)

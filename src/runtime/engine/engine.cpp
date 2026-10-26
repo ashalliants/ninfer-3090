@@ -3,9 +3,11 @@
 #include "core/device.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
+#include "models/qwen3_5/program/lossy/lossy_flow.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
+#include "runtime/engine/compaction/summary_strategy.h"
 #include "runtime/engine/context_store_binding.h"
 #include "runtime/engine/engine_core.h"
 #include "runtime/engine/model_instance.h"
@@ -81,6 +83,12 @@ std::string context_capacity_error(std::size_t prompt_tokens, std::uint32_t max_
            " tokens, exceeding Engine max_context " + std::to_string(max_context);
 }
 
+// The summary strategy's reuse probe waits at most this long for the worker to answer it between
+// cycles: a decode cycle is far shorter, a prefill step (about 1.5 s at chunk 4096) longer. An
+// unanswered probe counts as warm and as a timeout (docs/maintainer/lossy-long-prefill.md,
+// "Alternative strategy").
+constexpr std::chrono::milliseconds kSummaryProbeWait{250};
+
 // Images queued for the writer thread. Each holds a whole continuation, several GB for a deep one;
 // beyond the bound an idle continuation is simply written later.
 constexpr std::size_t kMaximumPendingStoreWrites = 2;
@@ -121,6 +129,9 @@ public:
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
     models::qwen3_5::PreparedPrompt value;
+    // Summary strategy: what it did for this prompt (summary_strategy.h); unset when it did not
+    // look at it (off, or too short to probe).
+    std::optional<runtime::compaction::SummaryRecord> summary_record;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
@@ -223,6 +234,12 @@ public:
     using ScoringCore    = runtime::CausalScoreCore<runtime::ModelInstance>;
     // Qwen3.8-Flash-Next: the common core over its own Program.
     using Qwen4ExpCore = runtime::EngineCore<runtime::Qwen4ExpInstance>;
+    // Lossy long-prompt prefill: the Qwen3.5 Program runs it; qwen4_exp refuses the option at
+    // startup. Usage counts prompt_tokens from the client's prepared prompt (PromptSummary) and
+    // cached tokens in its terms (RequestBasePlan::reported_frontier), whatever the Program kept.
+    static_assert(GenerationCore::kLossyCapable,
+                  "the Qwen3.5 Program must provide the lossy prefill contract the Engine uses");
+    static_assert(!Qwen4ExpCore::kLossyCapable);
     using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
                               std::unique_ptr<ScoringCore>, std::unique_ptr<Qwen4ExpCore>>;
 
@@ -333,6 +350,68 @@ public:
         return qwen4 != nullptr ? qwen4->capacity : active->capacity;
     }
 
+    // ---- lossy prefill, summary strategy (runtime/engine/compaction/summary_strategy.h) ----
+
+    // The prepare operations the strategy runs on: the Frontend, and the reuse probe.
+    struct SummaryOps {
+        const Impl& impl;
+        const PreparationControl& control;
+        using Prepared = models::qwen3_5::PreparedPrompt;
+
+        Prepared prepare(PromptInput input) const {
+            return impl.frontend().prepare(std::move(input), control);
+        }
+        static std::uint32_t tokens(const Prepared& prompt) { return prompt.summary().prompt_tokens; }
+        static std::uint32_t exact_end(const Prepared& prompt) {
+            return models::qwen3_5::detail::lossy_planned_exact_end(
+                models::qwen3_5::PreparedPromptAccess::view(prompt).context_cache);
+        }
+        static bool eligible(const Prepared& prompt) {
+            const auto& data = models::qwen3_5::PreparedPromptAccess::view(prompt);
+            return !data.has_media() && data.external_prefix_tokens == 0 &&
+                   !data.context_cache.product_prompt_unbounded;
+        }
+        LossySummaryProbe probe_reuse(const Prepared& prompt) const {
+            return impl.has_private_reuse(prompt, exact_end(prompt));
+        }
+        static std::span<const TokenId> token_ids(const Prepared& prompt) {
+            return models::qwen3_5::PreparedPromptAccess::view(prompt).token_ids;
+        }
+    };
+
+    // The options the strategy decision reads: the configured ones for a Qwen3.5 generation core,
+    // off for anything else (Flash-Next refuses lossy prefill at startup; scoring never generates).
+    [[nodiscard]] LossyPrefillOptions summary_lossy_options() const {
+        const auto* generation = std::get_if<std::unique_ptr<GenerationCore>>(&core);
+        return generation != nullptr && *generation != nullptr ? options.lossy_prefill
+                                                               : LossyPrefillOptions{};
+    }
+
+    [[nodiscard]] runtime::compaction::SummaryStrategyConfig summary_config() const {
+        return {.min_tokens   = options.lossy_prefill.min_tokens,
+                .budget_chars = runtime::compaction::summary_budget_chars(
+                    options.max_context, options.lossy_prefill.summary_max_tokens)};
+    }
+
+    // Warm when a private (conversation) record, in the cache or the context store, would be
+    // reused by this prompt, so it is not summarised. Thread-safe (Engine::prepare runs on caller
+    // threads): the probe is posted to the worker and waits at most kSummaryProbeWait; Timeout,
+    // or any doubt, is treated as warm.
+    [[nodiscard]] LossySummaryProbe has_private_reuse(const models::qwen3_5::PreparedPrompt& prompt,
+                                                      std::uint32_t exact_end) const {
+        const auto* generation = std::get_if<std::unique_ptr<GenerationCore>>(&core);
+        if (generation == nullptr || *generation == nullptr) { return LossySummaryProbe::Warm; }
+        try {
+            auto execution = resolve_request_options(sampling_defaults, SamplingMode::Thinking, {},
+                                                     std::nullopt)
+                                 .execution;
+            execution.requested_output_tokens = 1;
+            return (*generation)
+                ->has_private_reuse(models::qwen3_5::PreparedPromptAccess::copy(prompt), execution,
+                                    exact_end, kSummaryProbeWait);
+        } catch (...) { return LossySummaryProbe::Warm; }
+    }
+
     EngineOptions options;
     DeviceContext device;
     std::unique_ptr<runtime::ModelInstance> active;
@@ -356,12 +435,22 @@ public:
     struct PendingWrite {
         CheckpointImage image;
         bool shared = false;
+        std::string id; // the store id the image is written under
     };
     std::deque<PendingWrite> pending_writes;
     bool writer_active = false;
+    std::string active_write_id; // the write in progress, while writer_active
+    // Ids of queued writes that failed since the core last took them. Bounded: beyond it the
+    // oldest go and `failed_write_ids_lost` says so, and the core then retries every continuation
+    // whose image the store does not hold.
+    std::deque<std::string> failed_write_ids;
+    bool failed_write_ids_lost = false;
+    static constexpr std::size_t kMaximumFailedWriteIds = 4096;
     bool writer_stop   = false;
     std::optional<std::chrono::steady_clock::time_point> drain_deadline;
     std::thread writer;
+    // The summaries the summary strategy wrote, so later turns render the same ones.
+    mutable runtime::compaction::SummaryRegistry summary_registry;
     Core core;
 
 private:
@@ -419,7 +508,14 @@ private:
                 return enqueue_store_write(std::move(image), StoreWrite::SharedPrefix);
             },
             .ready   =[this] { return store_queue_idle(); },
+            .queued  = [this](const std::string& id) { return store_write_queued(id); },
             .failures = [this] { return store_write_failures.load(std::memory_order_relaxed); },
+            .failed_writes =
+                [this] {
+                    typename GenerationCoreT::FailedStoreWrites reported;
+                    take_failed_writes(reported.ids, reported.lost);
+                    return reported;
+                },
             .idle_persist =
                 std::chrono::duration_cast<std::chrono::milliseconds>(options.context_store.idle_persist),
             .hydration_budget =
@@ -485,17 +581,10 @@ private:
         return text;
     }
 
-    // Lowercase hex of the image's endpoint key: an image of the same endpoint replaces it. A
-    // shared prefix's id ends in an extra digit, so it never replaces a conversation image whose
-    // endpoint happens to fall at the same position.
+    // The image's endpoint key (ContextStore::image_id): an image of the same endpoint replaces it.
     static std::string image_id(const CheckpointImage& image, bool shared) {
         const auto& key = image.keys.front();
-        char text[42];
-        std::snprintf(text, sizeof(text), "%016llx%016llx%08x%s",
-                      static_cast<unsigned long long>(key.digests[0]),
-                      static_cast<unsigned long long>(key.digests[1]),
-                      static_cast<unsigned>(key.frontier), shared ? "5" : "");
-        return text;
+        return runtime::ContextStore::image_id(key.digests, key.frontier, shared);
     }
 
     // Writes one image to the store. On the writer thread, or at shutdown.
@@ -606,6 +695,31 @@ private:
         return pending_writes.empty() && !writer_active;
     }
 
+    // Whether the image `id` is queued for the writer or being written now.
+    [[nodiscard]] bool store_write_queued(const std::string& id) {
+        std::scoped_lock lock(writer_mutex);
+        if (writer_active && active_write_id == id) { return true; }
+        return std::any_of(pending_writes.begin(), pending_writes.end(),
+                           [&](const PendingWrite& pending) { return pending.id == id; });
+    }
+
+    // The ids of writes that failed since the last call. Under writer_mutex.
+    void record_failed_write_locked(std::string id) {
+        if (failed_write_ids.size() >= kMaximumFailedWriteIds) {
+            failed_write_ids.pop_front();
+            failed_write_ids_lost = true;
+        }
+        failed_write_ids.push_back(std::move(id));
+    }
+
+    // Hands over the failed writes not yet taken, and whether some were lost.
+    void take_failed_writes(std::vector<std::string>& ids, bool& lost) {
+        std::scoped_lock lock(writer_mutex);
+        ids.assign(failed_write_ids.begin(), failed_write_ids.end());
+        lost = std::exchange(failed_write_ids_lost, false);
+        failed_write_ids.clear();
+    }
+
     // Queues an image for the writer thread. Never blocks: when the queue is full the image is
     // not written now; an idle continuation is tried again later, an evicted one is lost to the
     // store as it would be without write-on-evict.
@@ -624,7 +738,9 @@ private:
             return false;
         }
         if (!writer.joinable()) { writer = std::thread([this] { writer_loop(); }); }
-        pending_writes.push_back({std::move(image), kind == StoreWrite::SharedPrefix});
+        const bool shared = kind == StoreWrite::SharedPrefix;
+        std::string id    = image_id(image, shared);
+        pending_writes.push_back({std::move(image), shared, std::move(id)});
         lock.unlock();
         writer_cv.notify_one();
         return true;
@@ -643,10 +759,11 @@ private:
                 }
                 write = std::move(pending_writes.front());
                 pending_writes.pop_front();
-                writer_active = true;
+                writer_active   = true;
+                active_write_id = write.id;
             }
             ContextStoreWriteEvent event;
-            event.id           = image_id(write.image, write.shared);
+            event.id           = write.id;
             event.tokens       = write.image.tokens;
             event.bytes        = write.image.bytes.size();
             const auto started = std::chrono::steady_clock::now();
@@ -655,17 +772,21 @@ private:
             } catch (const std::exception& error) {
                 event.error = error.what();
             } catch (...) { event.error = "unknown context store write failure"; }
-            if (!event.error.empty()) {
-                // The continuation was counted as stored when it was queued; have it written again.
-                store_write_failures.fetch_add(1, std::memory_order_relaxed);
+            {
+                std::scoped_lock lock(writer_mutex);
+                writer_active = false;
+                active_write_id.clear();
+                // The continuation was counted as stored when it was queued; have it written
+                // again. The id goes with the failure, so the core retries exactly this image
+                // whatever it concluded about it meanwhile.
+                if (!event.error.empty()) {
+                    record_failed_write_locked(write.id);
+                    store_write_failures.fetch_add(1, std::memory_order_relaxed);
+                }
             }
             event.seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             notify(event);
-            {
-                std::scoped_lock lock(writer_mutex);
-                writer_active = false;
-            }
         }
     }
 
@@ -690,6 +811,9 @@ private:
         // Images abandoned at the deadline were marked stored when they were queued; count them
         // as failed writes so the final flush clears those marks and writes them again.
         if (!pending_writes.empty()) {
+            for (PendingWrite& pending : pending_writes) {
+                record_failed_write_locked(std::move(pending.id));
+            }
             store_write_failures.fetch_add(pending_writes.size(), std::memory_order_relaxed);
         }
         pending_writes.clear();
@@ -710,16 +834,31 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    auto prepared      = impl_->frontend().prepare(std::move(input), control);
+    // Lossy prefill's summary strategy may replace the middle of a cold long conversation with a
+    // summary (or substitute one recorded for an earlier turn); otherwise one ordinary prepare.
+    Impl::SummaryOps ops{*impl_, control};
+    auto strategy = runtime::compaction::prepare_for_strategy(
+        std::move(input), impl_->summary_lossy_options(), impl_->summary_config(),
+        impl_->summary_registry, ops);
+    auto prepared      = std::move(strategy.prepared);
     PromptSummary info = prepared.summary();
     const SamplingMode sampling_mode =
         info.starts_in_reasoning ? SamplingMode::Thinking : SamplingMode::NonThinking;
     if (info.prompt_tokens > impl_->capacity()) {
         throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
     }
+    // Usage and max_context count the client's prompt; the Program runs the submitted one.
+    if (strategy.rewrite) { info.prompt_tokens = strategy.rewrite->original_tokens; }
     const PromptPreparationStats preparation = prepared.preparation_stats();
-    return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(info, preparation, sampling_mode,
-                                                                 std::move(prepared)));
+    auto impl = std::make_unique<PreparedPrompt::Impl>(info, preparation, sampling_mode,
+                                                       std::move(prepared));
+    if (strategy.probe || strategy.rewrite) {
+        impl->summary_record = runtime::compaction::SummaryRecord{
+            .probe         = strategy.probe,
+            .rewrite       = strategy.rewrite,
+            .prompt_tokens = impl->value.summary().prompt_tokens};
+    }
+    return PreparedPrompt(std::move(impl));
 }
 
 PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
@@ -884,7 +1023,7 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                 auto submission =
                     core->submit(std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
                                  std::move(resolved_options), consumer_mode, std::move(observation),
-                                 pending_deadline);
+                                 pending_deadline, prompt.impl_->summary_record);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
                     impl_, std::move(submission), resolved_sampling));
             }

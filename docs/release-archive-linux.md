@@ -7,7 +7,7 @@ under `scripts/`, and
 is the guide to building from source. Links here are absolute on purpose: the archive ships no
 `docs/` directory.
 
-Check `VERSION` for the release this archive was cut from, and `RELEASE_NOTES_*.md` for what
+Check `VERSION` for the release this archive was cut from, and `RELEASE_NOTES_*.md` in the archive root for what
 changed.
 
 ## Requirements
@@ -72,6 +72,8 @@ API key blank.
 | `download-model.sh` | pinned, resumable artifact downloads with verification |
 | `run.sh` | serving profiles: `run.sh <model> [profile]` |
 | `profiles/` | each profile's fixed flags, as `ninfer-serve --config` files that `run.sh` passes |
+| `LICENSE` | NInfer's licence (Apache-2.0) |
+| `THIRD_PARTY_NOTICES.txt` | the notice for the ported conversation projector (hermes-vcc-engine, Apache-2.0) |
 | `SHA256SUMS.txt` | checksums for every file in this directory and in `profiles/` |
 
 ## Overrides

@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "models/qwen3_5/execution/linear.h"
+#include "models/qwen3_5/frontend/tokenizer.h"
 #include "core/startup.h"
 #include "core/device.h"
 #include <cuda_runtime.h>
@@ -470,6 +471,43 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         throw std::logic_error("DFlash decode frame does not match the sequence plan");
     }
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
+    if (plan.persistent.scout) {
+        const ScoutLayout& layout = *plan.persistent.scout;
+        ScoutBuffers& buffers     = scout_buffers.emplace();
+        buffers.scratch           = {.filter_keys  = layout.filter_keys.bind(backing),
+                                     .last_queries = layout.last_queries.bind(backing),
+                                     .scores       = layout.scores.bind(backing)};
+        if (layout.gdn_state) {
+            buffers.gdn_saved = std::make_unique<LinearAttentionStatePool>(backing, *layout.gdn_state);
+        }
+        buffers.filter_layer = layout.filter_layer;
+        if (plan.lossy_prefill.scout_a4) {
+            buffers.a4_layers         = execution::scout_a4_layers(parameters.text, layout.filter_layer);
+            buffers.scratch.a4_layers = buffers.a4_layers;
+        }
+        lossy_options        = plan.lossy_prefill;
+        // Selection always keeps the chat structure: role markers, tool-call delimiters and every
+        // other added token of the tokenizer, special or not, and each turn header's role name.
+        if (const auto& tokenizer = parameters.model.resources().tokenizer) {
+            for (const auto& token : tokenizer->added_tokens()) {
+                lossy_special_tokens.push_back(static_cast<TokenId>(token.id));
+                if (token.content == "<|im_start|>") {
+                    lossy_turn_start = static_cast<TokenId>(token.id);
+                } else if (token.content == "<|im_end|>") {
+                    lossy_turn_end = static_cast<TokenId>(token.id);
+                }
+            }
+            std::sort(lossy_special_tokens.begin(), lossy_special_tokens.end());
+            lossy_special_tokens.erase(
+                std::unique(lossy_special_tokens.begin(), lossy_special_tokens.end()),
+                lossy_special_tokens.end());
+        }
+        // Without them selection would drop role markers and tool-call delimiters.
+        if (lossy_special_tokens.empty()) {
+            throw std::invalid_argument(
+                "lossy prefill needs the model tokenizer's added tokens (chat structure)");
+        }
+    }
     if (plan.persistent.score_hidden) {
         score_hidden = plan.persistent.score_hidden->bind(backing);
     }

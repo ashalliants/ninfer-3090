@@ -56,7 +56,8 @@ std::optional<CheckpointHandle> ProgramImpl::detach_checkpoint(SequenceState& st
                         .frontier          = frontier,
                         .backend_frontier  = backend_kv_valid(state),
                         .rope_delta        = state.rope_delta,
-                        .tail_hidden_valid = state.tail_hidden_valid};
+                        .tail_hidden_valid = state.tail_hidden_valid,
+                        .gap_maps          = gap_maps_through(state.gap_maps, frontier)};
     checkpoints[handle->index].reserved = false;
     state.kv.reset();
     state.state       = {};
@@ -135,6 +136,8 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
     // A chunk run in slices has advanced some layers' state in place: until its remaining slices
     // run there is no consistent frontier to save, so the lane cannot pause yet.
     if (control.prefill && control.prefill->slice.index != 0) { return false; }
+    // A lossy scout keeps uncommitted pages and a half-advanced state slot: no consistent frontier.
+    if (lane_refuses_pause(lane)) { return false; }
     if (control.lifecycle != Lifecycle::Active && control.lifecycle != Lifecycle::Prefilling &&
         control.lifecycle != Lifecycle::Replaying) {
         throw std::logic_error("pause requires a committed boundary");

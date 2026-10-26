@@ -235,6 +235,9 @@ void validate(const EngineOptions& options) {
     if (options.prefill_schedule.stall_budget_ms != 0) {
         refuse("sizes its own prefill calls and ignores a stall budget: remove --prefill-stall-budget-ms");
     }
+    if (options.lossy_prefill.enabled()) {
+        refuse("has no lossy long-prompt prefill: remove --lossy-prefill-min-tokens");
+    }
     if (options.context_cache.auto_host_cache) {
         refuse("sizes its context cache's Host tier from its own RAM ledger: remove --auto-host-cache (set the size with "
                "--host-context-mib, or 0 to turn prefix reuse off)");

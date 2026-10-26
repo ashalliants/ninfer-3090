@@ -113,6 +113,8 @@ void ProgramImpl::release_sequence_kv(SequenceState& sequence) noexcept {
 void ProgramImpl::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     // The caller settles real GPU readers before reaching this destruction boundary.
     const auto lane = sequence.lane;
+    // A scout's pages are the lane's own and go with them; its saved state is only scratch.
+    if (scout_session && scout_session->lane == lane) { scout_session.reset(); }
     request.prefill.reset();
     release_sequence_kv(sequence);
     release_sequence_state(sequence);

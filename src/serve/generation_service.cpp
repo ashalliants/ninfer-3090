@@ -354,6 +354,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.draft_context_rows       = options.draft_context_rows;
     engine_options.context_cache            = options.context_cache;
     engine_options.prefill_schedule         = options.prefill_schedule;
+    engine_options.lossy_prefill            = options.lossy_prefill;
     engine_options.context_store.directory  = options.context_store_path;
     engine_options.context_store.max_bytes =
         options.context_store_max_gib ? *options.context_store_max_gib << 30U : 0U;
@@ -605,6 +606,14 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         };
         ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
+        if (options_.lossy_prefill.enabled() && prompt.summary().product_prompt_unbounded &&
+            !warned_unbounded_product_prompt_.exchange(true, std::memory_order_relaxed)) {
+            write_console_log(ConsoleLogLevel::Warning,
+                              "lossy prefill: a prompt declares tools but neither a system message "
+                              "nor the end of its tool declarations could be located in the chat "
+                              "template's output, so the product prompt's end is unknown; such "
+                              "prompts prefill in full (shown once)");
+        }
         prepared.enable_thinking = prompt.summary().starts_in_reasoning;
         if (!prepared.enable_thinking) {
             request_options.execution.thinking.budget.reset();
@@ -744,6 +753,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.computed_prefill_tokens     = result.computed_prefill_tokens;
     outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
     outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
+    outcome.metrics.lossy_prefill               = result.lossy_prefill;
     outcome.metrics.speculative_backend         = result.speculative.backend;
     outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
     outcome.metrics.speculative_rounds          = result.speculative.rounds;

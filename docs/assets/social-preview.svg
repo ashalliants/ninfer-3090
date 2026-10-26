@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640">
+  <style>text{font-family:"Helvetica Neue",Helvetica,Arial,sans-serif}</style>
+  <rect width="1280" height="640" fill="#14161a"/>
+  <rect x="0" y="0" width="1280" height="8" fill="#2a78d6"/>
+  <text x="80" y="120" font-size="34" font-weight="600" fill="#8ab4f0">NInfer-3090</text>
+  <text x="1200" y="120" font-size="30" font-weight="600" fill="#c3c2b7" text-anchor="end">github.com/ashalliants/ninfer-3090</text>
+  <text x="80" y="250" font-size="150" font-weight="800" fill="#ffffff">140 tok/s</text>
+  <text x="80" y="320" font-size="44" font-weight="600" fill="#ffffff">Qwen3.8-27B on one RTX 3090</text>
+  <text x="80" y="378" font-size="32" fill="#c3c2b7">Up to 2.1× llama.cpp · OpenAI &amp; Anthropic-compatible API</text>
+  <text x="80" y="424" font-size="32" fill="#c3c2b7">256K context · native Windows and Linux</text>
+  <text x="80" y="508" font-size="24" fill="#898781">llama.cpp</text>
+  <rect x="230" y="486" width="288" height="30" rx="6" fill="#5a5a55"/>
+  <text x="534" y="510" font-size="24" fill="#c3c2b7">63</text>
+  <text x="80" y="562" font-size="24" fill="#ffffff" font-weight="600">NInfer-3090</text>
+  <rect x="230" y="540" width="610" height="30" rx="6" fill="#2a78d6"/>
+  <text x="856" y="564" font-size="24" fill="#ffffff" font-weight="600">133</text>
+  <text x="80" y="612" font-size="18" fill="#898781">Decode tok/s, one stream, DFlash2. The llama.cpp figure is a third party's, on a different machine, so indicative.</text>
+</svg>

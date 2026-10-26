@@ -8,6 +8,9 @@
 #include "models/qwen3_5/program/context_rows.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/program/lossy/scout_plan.h"
+#include "models/qwen3_5/lossy_options.h"
+#include "ninfer/ops/attention_key_mass.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
@@ -27,9 +30,11 @@
 #include <algorithm>
 #include <initializer_list>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::detail {
@@ -99,6 +104,14 @@ std::size_t graph_topology_allowance(const std::vector<GraphExecutionProfile>& p
 TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
                         std::initializer_list<std::int32_t> shape, const char* label) {
     return builder.add_tensor(dtype, shape, kArenaAlign, label);
+}
+
+// The scout scratch exists only where the scout can run: lossy prefill on with the select
+// strategy (the summary strategy rewrites the prompt before the Program sees it), one device, a
+// generating (not scoring) Program.
+bool scout_planned(const SequencePlanImpl& plan) {
+    return plan.lossy_prefill.enabled() && plan.lossy_prefill.strategy == LossyStrategy::Select &&
+           !plan.parameters->text.split_execution() && !plan.causal_scoring;
 }
 
 PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
@@ -320,6 +333,31 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
             "sampling config");
     }
+    if (scout_planned(plan)) {
+        // Keys and scores for every token the Program can hold: an uncached span is at most the
+        // whole context (2 KB/token of keys at 27B, so 256 MiB at 128K).
+        ScoutLayout& scout = out.scout.emplace();
+        scout.filter_layer = plan.lossy_prefill.filter_layer;
+        scout.gdn_layers   = scout_gdn_layers(config.layer_types, scout.filter_layer);
+        const auto capacity = checked_i32(plan.capacity, "scout key capacity exceeds int32");
+        scout.filter_keys   = add_tensor(builder, DType::BF16,
+                                         {dimension(config.attention->head_dim),
+                                          dimension(config.attention->num_key_value_heads), capacity},
+                                         "lossy scout filter-layer keys");
+        scout.last_queries  = add_tensor(
+            builder, DType::BF16,
+            {dimension(config.attention->head_dim),
+             dimension(config.attention->num_attention_heads),
+             checked_i32(plan.lossy_prefill.query_rows, "scout query rows exceed int32")},
+            "lossy scout query rows");
+        scout.scores = add_tensor(builder, DType::FP32, {capacity}, "lossy scout key scores");
+        if (scout.gdn_layers != 0) {
+            LinearAttentionStatePoolSpec saved = state_image_spec.linear;
+            saved.layers                       = scout.gdn_layers;
+            saved.slot_count                   = 1;
+            scout.gdn_state = plan_linear_attention_state_pool(builder, saved);
+        }
+    }
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     for (std::size_t rank = 1; rank < ranks; ++rank) {
         out.extra_rank_bytes.push_back(builders[rank].finish(
@@ -365,7 +403,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto finish = [](const WorkspaceLayoutBuilder& layout) { return layout.peak_bytes(1); };
 
     const auto text_common_root = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
-        (void)workspace::text_prefill_roots(layout, config, tokens, plan.features.vision ? 3 : 0,
+        // Vision takes three RoPE axes. Text prefill takes one only when its positions are explicit
+        // or offset by rope_delta, which without Vision only a compacted lossy prompt (gapped
+        // positions, or a follow-up rewritten onto its gap map) has; text prompts otherwise carry
+        // rope_delta 0. So the axis is planned only where the scout is.
+        const std::int32_t rope_axes = plan.features.vision ? 3 : (scout_planned(plan) ? 1 : 0);
+        (void)workspace::text_prefill_roots(layout, config, tokens, rope_axes,
                                             plan.features.vision ? tokens : 0,
                                             plan.features.overlay_vision());
     };
@@ -383,12 +426,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                             ops::linear_add_workspace_capacity_bytes(
                                 p.weight.qtype, p.weight.n, p.weight.k, p.policy, first, last)));
     };
-    const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
-                                 std::int32_t last, TextPhase phase, GdnWorkspacePath path,
-                                 std::int32_t batch_size, std::int32_t min_width,
-                                 std::int32_t max_width,
-                                 ops::CausalAttentionExecutionEnvelope envelope) {
-        for (const auto& block : parameters.text.layers) {
+    // `layers` is the model's own parameters everywhere but the int4 scout (scout_a4_layers).
+    const auto target_layers = [&](WorkspaceLayoutBuilder& layout,
+                                   std::span<const execution::BlockParameters> layers,
+                                   std::int32_t first, std::int32_t last, TextPhase phase,
+                                   GdnWorkspacePath path, std::int32_t batch_size,
+                                   std::int32_t min_width, std::int32_t max_width,
+                                   ops::CausalAttentionExecutionEnvelope envelope) {
+        for (const auto& block : layers) {
             {
                 auto stage = layout.scope();
                 if (const auto* attention =
@@ -441,6 +486,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         if (!plan.causal_scoring) {
             linear_scratch(layout, parameters.text.output_head, first, last);
         }
+    };
+    const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
+                                 std::int32_t last, TextPhase phase, GdnWorkspacePath path,
+                                 std::int32_t batch_size, std::int32_t min_width,
+                                 std::int32_t max_width,
+                                 ops::CausalAttentionExecutionEnvelope envelope) {
+        target_layers(layout, parameters.text.layers, first, last, phase, path, batch_size,
+                      min_width, max_width, envelope);
     };
     const auto mtp_post_mixer = [&](WorkspaceLayoutBuilder& layout, int first, int last) {
         linear_scratch(layout, parameters.mtp->output, first, last);
@@ -837,9 +890,47 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
     }
 
+    if (scout_planned(plan)) {
+        // A scout chunk: the prefill roots, the layers below the filter layer, then the filter
+        // layer's attention input and the key-mass reduction over every key the Program can hold.
+        // The int4 scout (--lossy-prefill-scout-a4) runs its own copies of layers
+        // [0, filter_layer], whose Q4 projections stage int4 activations (and gate_up its whole
+        // gate/up plane for the separate SwiGLU); they are planned only when it is on.
+        const std::vector<execution::BlockParameters> a4_layers =
+            plan.lossy_prefill.scout_a4
+                ? execution::scout_a4_layers(parameters.text, plan.lossy_prefill.filter_layer)
+                : std::vector<execution::BlockParameters>{};
+        const auto scout_body = [&](std::span<const execution::BlockParameters> layers) {
+            const auto& filter_block = layers[plan.lossy_prefill.filter_layer];
+            const auto& filter_attention =
+                std::get<execution::AttentionParameters>(filter_block.mixer);
+            WorkspaceLayoutBuilder scout;
+            text_common_root(scout, chunk);
+            target_layers(scout, layers, 1, chunk, qwen3_5::TextPhase::Prefill,
+                          GdnWorkspacePath::Prefill, 1, 1, chunk, text_envelope);
+            {
+                auto filter = scout.scope();
+                (void)workspace::text_attention_projection(scout, config, chunk);
+                scratch(scout,
+                        execution::attention_projection_workspace_bytes(filter_attention, 1, chunk));
+                (void)workspace::text_attention_results(scout, config, chunk);
+                scratch(scout, ops::attention_key_mass_workspace_capacity_bytes(
+                                   dimension(config.attention->num_attention_heads),
+                                   static_cast<std::int32_t>(plan.lossy_prefill.query_rows),
+                                   static_cast<std::int32_t>(plan.capacity)));
+            }
+            return finish(scout);
+        };
+        out.scout_prefill = scout_body(parameters.text.layers);
+        if (!a4_layers.empty()) {
+            out.scout_prefill = std::max(out.scout_prefill, scout_body(a4_layers));
+        }
+    }
+
     out.general_capacity =
         std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
-                  out.dflash_context, out.dflash_round, out.causal_score, out.score_decode});
+                  out.dflash_context, out.dflash_round, out.causal_score, out.score_decode,
+                  out.scout_prefill});
     if (parameters.text.split_execution()) {
         // Around its layers a stage holds the residual it received and its copy of the control
         // block (rank 0 holds the packed block instead, which is smaller), alive for the whole pass
@@ -897,6 +988,32 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (parameters.model.options() != models::load_options(options)) {
         throw std::invalid_argument(
             "loaded components do not match the requested execution options");
+    }
+    if (options.lossy_prefill.enabled()) {
+        // Dense, single-device Qwen3.5 only (docs/maintainer/lossy-long-prefill.md, "Non-goals"):
+        // refused here, before any scout scratch is planned.
+        if (std::holds_alternative<MoeConfig>(parameters.model.config().text.ffn)) {
+            throw std::invalid_argument("lossy prefill supports only the dense Qwen3.5 models");
+        }
+        if (parameters.text.split_execution()) {
+            throw std::invalid_argument("lossy prefill does not support a pipeline-split model");
+        }
+        // Throws unless the filter layer is one of the model's full-attention layers.
+        (void)scout_gdn_layers(parameters.model.config().text.layer_types,
+                               options.lossy_prefill.filter_layer);
+        // The model-independent contract, also checked by the CLI and Engine normalization; here
+        // too so a bad option fails at startup rather than at the end of a request's scout.
+        models::qwen3_5::validate_lossy_prefill_options(options.lossy_prefill);
+        // The int4 scout replaces the integer-A8 prefill route of the Q4 matrices; with none on
+        // that route (no --prefill-a8, or a build without the sm86 integer routes) it would
+        // silently be the int8 scout.
+        if (options.lossy_prefill.scout_a4) {
+            if (!execution::scout_a4_promotes(parameters.text, options.lossy_prefill.filter_layer)) {
+                throw std::invalid_argument(
+                    "--lossy-prefill-scout-a4 needs Q4 projections on the integer-A8 prefill "
+                    "route (--prefill-a8 on an sm86 build)");
+            }
+        }
     }
     if (parameters.draft &&
         options.max_context > parameters.model.config().draft->max_position_embeddings) {
@@ -1052,6 +1169,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->multiprocessor_count = inputs.multiprocessor_count;
     impl->context_cache        = inputs.context_cache;
     impl->kv_storage           = inputs.kv_storage;
+    impl->lossy_prefill        = inputs.lossy_prefill;
     impl->round_shapes = speculative_round_shapes(inputs.speculative_backend, inputs.draft_window,
                                                   inputs.ngram_draft_tokens);
     impl->persistent   = persistent_layout(*impl);
@@ -1224,6 +1342,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .device               = options.device,
         .multiprocessor_count = device.multiprocessor_count(),
         .context_cache        = options.context_cache,
+        .lossy_prefill        = options.lossy_prefill,
     };
     // Installed direct grafts keep their Main KV pages for the Engine's life. They are added on
     // top of the request range, so every request can still use the capacity it was planned for.

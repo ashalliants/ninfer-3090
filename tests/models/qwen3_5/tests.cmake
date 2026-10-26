@@ -157,6 +157,45 @@ add_test(NAME ninfer_qwen3_5_agent_continuation_real_test
   COMMAND ${ninfer_qwen3_5_prefix_real_command})
 set_tests_properties(ninfer_qwen3_5_agent_continuation_real_test PROPERTIES
   ENVIRONMENT "NINFER_PREFIX_REAL_SCENARIO=agent-continuation")
+add_test(NAME ninfer_qwen3_5_lossy_prefill_real_test
+  COMMAND ${ninfer_qwen3_5_prefix_real_command})
+set_tests_properties(ninfer_qwen3_5_lossy_prefill_real_test PROPERTIES
+  ENVIRONMENT "NINFER_PREFIX_REAL_SCENARIO=lossy")
+# The summary strategy (--lossy-prefill-strategy summary): a cold 40K agent session is summarised
+# and its follow-up turn reuses the summarised prompt (lossy_summary_follow_up_turn_reuses).
+add_test(NAME ninfer_qwen3_5_lossy_summary_real_test
+  COMMAND ${ninfer_qwen3_5_prefix_real_command})
+set_tests_properties(ninfer_qwen3_5_lossy_summary_real_test PROPERTIES
+  ENVIRONMENT "NINFER_PREFIX_REAL_SCENARIO=lossy-summary")
+
+# Speculative decoding after a lossy long-prompt prefill (40K prompt, rk4v4, keep 0.2): 128 greedy
+# tokens with MTP or DFlash2 must equal the same lossy prefill decoded without speculation.
+# The program is bundled without a ctest of its own: only the two named tests below run it.
+# A host-only tree (no CUDA compiler) cannot link it, like ninfer_add_test's exclusion; the two tests
+# below still exist there and are labelled gpu.
+if(NOT NINFER_HOST_ONLY)
+  ninfer_bundle_program(ninfer_tests ninfer_qwen3_5_lossy_spec_real_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_lossy_spec_real.cpp"
+    LIBRARIES ninfer_engine)
+  ninfer_test_includes(ninfer_qwen3_5_lossy_spec_real_test)
+endif()
+ninfer_bundle_command(ninfer_qwen3_5_lossy_spec_real_command ninfer_tests
+  ninfer_qwen3_5_lossy_spec_real_test)
+add_test(NAME ninfer_qwen3_5_dflash2_after_lossy_real_test
+  COMMAND ${ninfer_qwen3_5_lossy_spec_real_command})
+set_tests_properties(ninfer_qwen3_5_dflash2_after_lossy_real_test PROPERTIES
+  ENVIRONMENT "NINFER_LOSSY_SPEC_REAL=dflash2")
+add_test(NAME ninfer_qwen3_5_mtp_after_lossy_real_test
+  COMMAND ${ninfer_qwen3_5_lossy_spec_real_command})
+set_tests_properties(ninfer_qwen3_5_mtp_after_lossy_real_test PROPERTIES
+  ENVIRONMENT "NINFER_LOSSY_SPEC_REAL=mtp")
+
+# scout_a4_kept_overlap: the int4 lossy scout (--lossy-prefill-scout-a4) against the int8 one on 32K
+# and 100K haystack prompts (rk4v4, max_context 110592): kept-block Jaccard over the score-chosen
+# blocks >= 0.9, and both keep the pass key.
+ninfer_add_test(ninfer_qwen3_5_scout_a4_kept_overlap_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_scout_a4_real.cpp"
+  LIBRARIES ninfer_engine)
 
 # A real-model test owns the single GPU while its artifact is resident.
 set(ninfer_qwen3_5_real_tests
@@ -164,6 +203,11 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_native_transactions_test
   ninfer_qwen3_5_prefix_real_test
   ninfer_qwen3_5_agent_continuation_real_test
+  ninfer_qwen3_5_lossy_prefill_real_test
+  ninfer_qwen3_5_lossy_summary_real_test
+  ninfer_qwen3_5_dflash2_after_lossy_real_test
+  ninfer_qwen3_5_mtp_after_lossy_real_test
+  ninfer_qwen3_5_scout_a4_kept_overlap_real_test
   ninfer_qwen3_5_context_store_real_test
   ninfer_qwen3_5_context_store_dflash2_real_test
   ninfer_qwen3_5_context_store_ngram_real_test
@@ -204,6 +248,49 @@ ninfer_add_test(ninfer_qwen3_5_speculative_round_shapes_test
 ninfer_add_test(ninfer_qwen3_5_mlp_a8_decode_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mlp_a8_decode_wiring.cpp"
   LIBRARIES ninfer_model_runtime ninfer_ops)
+
+# The int4 lossy scout's host-side wiring: which matrices go int4, its scratch planning, and every
+# other Op refusing the policy.
+ninfer_add_test(ninfer_qwen3_5_scout_a4_wiring_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_scout_a4_wiring.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_ops)
+
+# Token selection for lossy long-prefill. selection.cpp is compiled into the test directly, so it
+# links no kernel library and runs in a host-only tree.
+ninfer_add_test(ninfer_qwen3_5_lossy_selection_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossy_selection.cpp"
+          "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/program/lossy/selection.cpp"
+  LIBRARIES ninfer_core)
+
+# Prompt compaction and gap maps for lossy long-prefill. gap_map.cpp and the prefix digests it
+# reuses live in ninfer_model_runtime, so this links that library (and through it the kernels); it is
+# cpu-labelled but not host-only.
+ninfer_add_test(ninfer_qwen3_5_lossy_gap_map_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossy_gap_map.cpp"
+  LIBRARIES ninfer_model_runtime)
+
+# Lossy-prefill scout arithmetic: GDN layers below the filter layer, scratch sizes, query rows per
+# chunk and state slots (header only, links no kernel).
+ninfer_add_test(ninfer_qwen3_5_lossy_scout_plan_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossy_scout_plan.cpp"
+  LIBRARIES ninfer_core)
+
+# The lossy-prefill phase rules of one lane: steps, the pause/capture window, M and forced
+# tokens (header only, links no kernel).
+ninfer_add_test(ninfer_qwen3_5_lossy_flow_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossy_flow.cpp"
+  LIBRARIES ninfer_core)
+
+# Lossy prefill's M for real OpenAI and Anthropic traffic: translator, Frontend, the M rule.
+ninfer_add_test(ninfer_qwen3_5_lossy_exact_end_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lossy_exact_end.cpp"
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_serve ninfer_engine ninfer_core ninfer::json)
+
+# Whether a text prompt's RoPE positions are slot + rope_delta (header only, links no kernel).
+ninfer_add_test(ninfer_qwen3_5_text_positions_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_text_positions.cpp"
+  LIBRARIES ninfer_core)
 
 ninfer_add_test(ninfer_qwen3_5_ngram_proposer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_proposer.cpp"

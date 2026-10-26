@@ -371,6 +371,67 @@ Json scheduling_json(const ninfer::GenerationSchedulingStats& stats) {
                 {"host_to_device_bytes", stats.host_to_device_bytes}};
 }
 
+const char* lossy_prefill_outcome_name(ninfer::LossyPrefillOutcome outcome) {
+    switch (outcome) {
+    case ninfer::LossyPrefillOutcome::Completed:
+        return "completed";
+    case ninfer::LossyPrefillOutcome::Skipped:
+        return "skipped";
+    case ninfer::LossyPrefillOutcome::Declined:
+        return "declined";
+    case ninfer::LossyPrefillOutcome::Aborted:
+        return "aborted";
+    }
+    return "unknown";
+}
+
+// docs/maintainer/lossy-long-prefill.md, "Observability": the record carries the object only when
+// the request took or considered the path; otherwise the key is absent (the default schema).
+// `detail` (--request-log-lossy-detail) adds kept_runs: the kept offsets of the filtered part as
+// [begin, end) pairs, which the sweep's kept-block overlap (Jaccard) reads. `strategy` is "select"
+// or "summary"; a summary adds summarized_messages, summary_reused and summary_probe.
+Json lossy_prefill_json(const ninfer::LossyPrefillReport& report, bool detail) {
+    const bool summary = report.strategy == ninfer::LossyStrategy::Summary;
+    Json out{{"outcome", lossy_prefill_outcome_name(report.outcome)},
+             {"strategy", summary ? "summary" : "select"},
+             {"uncached_tokens", report.uncached_tokens},
+             {"kept_tokens", report.kept_tokens},
+             {"filter_layer", report.filter_layer},
+             {"scout_ms", report.scout_ms},
+             {"main_ms", report.main_ms}};
+    if (summary) {
+        // The newest summarised messages, [first, last) in the client's indices, and whether a
+        // summary recorded for an earlier turn was substituted rather than written now.
+        out["summarized_messages"] =
+            report.summarized_messages
+                ? Json::array({(*report.summarized_messages)[0], (*report.summarized_messages)[1]})
+                : Json(nullptr);
+        out["summary_reused"] = report.summary_reused;
+        // The coldness probe's answer; null when the prompt was too short to be probed.
+        const char* probe = nullptr;
+        if (report.summary_probe) {
+            switch (*report.summary_probe) {
+            case ninfer::LossySummaryProbe::Cold:
+                probe = "cold";
+                break;
+            case ninfer::LossySummaryProbe::Warm:
+                probe = "warm";
+                break;
+            case ninfer::LossySummaryProbe::Timeout:
+                probe = "timeout";
+                break;
+            }
+        }
+        out["summary_probe"] = probe != nullptr ? Json(probe) : Json(nullptr);
+    }
+    if (detail) {
+        Json runs = Json::array();
+        for (const auto& run : report.kept_runs) { runs.push_back(Json::array({run[0], run[1]})); }
+        out["kept_runs"] = std::move(runs);
+    }
+    return out;
+}
+
 Json admission_json(const ninfer::GenerationAdmissionStats& stats) {
     const char* reason = nullptr;
     switch (stats.fallback_reason) {
@@ -921,7 +982,7 @@ std::string format_request_rejected_json(const std::string& server_instance_id,
 
 std::string format_request_done_json(const std::string& server_instance_id, std::uint64_t timestamp,
                                      const RequestLogContext& context,
-                                     const GenerationOutcome& outcome) {
+                                     const GenerationOutcome& outcome, bool lossy_detail) {
     Json record       = event_base(server_instance_id, timestamp, "request_done");
     record["request"] = request_json(context);
     record["result"] =
@@ -965,7 +1026,10 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         outcome.metrics.first_output_timing
             ? first_output_timing_json(*outcome.metrics.first_output_timing)
             : Json(nullptr);
-    record["speculative"] = speculative_json(outcome.metrics);
+    record["speculative"]   = speculative_json(outcome.metrics);
+    if (outcome.metrics.lossy_prefill) {
+        record["lossy_prefill"] = lossy_prefill_json(*outcome.metrics.lossy_prefill, lossy_detail);
+    }
     record["generation"]  = Json{{"engine_request_id", outcome.metrics.engine_request_id},
                                  {"scheduling", scheduling_json(outcome.metrics.scheduling)},
                                  {"admission", admission_json(outcome.metrics.admission)}};
@@ -1182,8 +1246,8 @@ ServerLogEnvironment query_server_log_environment(int device) {
 
 JsonlRequestLog::JsonlRequestLog(const std::string& path,
                                  const std::string& protected_artifact_path,
-                                 std::shared_ptr<spdlog::logger> logger)
-    : path_(path), logger_(std::move(logger)) {
+                                 std::shared_ptr<spdlog::logger> logger, bool lossy_detail)
+    : path_(path), logger_(std::move(logger)), lossy_detail_(lossy_detail) {
     if (path_.empty()) { return; }
     if (!protected_artifact_path.empty() &&
         normalized_absolute_path(path_) == normalized_absolute_path(protected_artifact_path)) {
@@ -1233,7 +1297,8 @@ void JsonlRequestLog::write_request_rejected(const RequestRejectionLogContext& c
 void JsonlRequestLog::write_request_done(const RequestLogContext& context,
                                          const GenerationOutcome& outcome) {
     if (!enabled()) { return; }
-    append(format_request_done_json(server_instance_id_, unix_time_ms(), context, outcome));
+    append(format_request_done_json(server_instance_id_, unix_time_ms(), context, outcome,
+                                    lossy_detail_));
 }
 
 void JsonlRequestLog::write_request_error(const RequestLogContext& context,

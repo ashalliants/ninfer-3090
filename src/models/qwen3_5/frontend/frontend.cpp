@@ -589,6 +589,40 @@ prepare_context_cache(ContextCacheHints hints, std::size_t message_count,
         add_opportunity(marker.kind, marker.evidence, *resolved, static_cast<std::uint32_t>(index));
     }
 
+    // The product prompt: graft, leading System/Developer messages and tools, and any marker
+    // inside them. Message boundaries past the leading messages never extend it.
+    const std::uint32_t leading_messages = leading_boundary.value_or(0U);
+    std::uint32_t product_end            = graft_frontier;
+    const auto extend_product            = [&](std::optional<std::uint32_t> frontier) {
+        if (frontier && exact_vision_frontier(*frontier, vision_items)) {
+            product_end = std::max(product_end, *frontier);
+        }
+    };
+    const bool tools_located = engine_tool_marker_index &&
+                               *engine_tool_marker_index < cache_boundaries.size() &&
+                               cache_boundaries[*engine_tool_marker_index].has_value();
+    const bool leading_located = leading_boundary && *leading_boundary < message_boundaries.size() &&
+                                 message_boundaries[*leading_boundary].has_value();
+    if (tools_located) { extend_product(cache_boundaries[*engine_tool_marker_index]); }
+    if (leading_located) { extend_product(message_boundaries[*leading_boundary]); }
+    out.product_prompt_unbounded = engine_tool_marker_index && !tools_located && !leading_located;
+    for (std::size_t index = 0; index < hints.markers.size(); ++index) {
+        const PromptCacheMarker marker = hints.markers[index];
+        bool inside                    = false;
+        switch (marker.location) {
+        case PromptCacheMarkerLocation::LeadingInstructionBoundary:
+        case PromptCacheMarkerLocation::ToolBoundary:
+            inside = true;
+            break;
+        case PromptCacheMarkerLocation::MessageBoundary:
+        case PromptCacheMarkerLocation::MessagePartBoundary:
+            inside = marker.after_message_count <= leading_messages;
+            break;
+        }
+        if (inside) { extend_product(cache_boundaries[index]); }
+    }
+    out.product_prompt_end = product_end;
+
     std::uint32_t engine_order = static_cast<std::uint32_t>(hints.markers.size());
     // Every request selecting a graft starts with the same tokens, so the end of the graft is a
     // prefix other requests will match whatever the protocol's own cache policy says. Publishing it
@@ -784,6 +818,7 @@ PromptSummary PreparedPrompt::summary() const {
     PromptSummary summary{.starts_in_reasoning = data_->starts_in_reasoning,
                           .prompt_tokens       = checked_token_count(data_->token_ids.size()),
                           .has_media           = data_->has_media()};
+    summary.product_prompt_unbounded = data_->context_cache.product_prompt_unbounded;
     summary.vision_items = static_cast<std::uint32_t>(data_->vision_items.size());
     for (const auto& item : data_->vision_items) { summary.vision_patches += item.patch_count; }
     return summary;
@@ -839,6 +874,10 @@ PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
     return std::move(*data);
 }
 
+PreparedPrompt PreparedPromptAccess::copy(const PreparedPrompt& prompt) {
+    return PreparedPrompt(std::make_unique<PreparedPromptData>(view(prompt)));
+}
+
 const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prompt) {
     return PreparedPromptAccess::view(prompt);
 }
@@ -868,7 +907,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         leading_instruction_boundary(message_roles);
     std::vector<PromptCacheMarker> rendered_markers = cache_hints.markers;
     std::optional<std::size_t> engine_tool_marker_index;
-    if (cache_hints.allow_engine_automatic_shared_prefixes && !options.tool_jsons.empty()) {
+    // The tool boundary is always resolved: it bounds the product prompt (lossy prefill's M) even
+    // when the protocol's own cache policy keeps it from becoming a shared opportunity. A resolved
+    // boundary only records a token frontier; it does not change tokenization.
+    if (!options.tool_jsons.empty()) {
         engine_tool_marker_index = rendered_markers.size();
         rendered_markers.push_back(PromptCacheMarker{
             .kind             = PromptCacheMarkerKind::SharedStablePrefix,

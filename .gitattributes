@@ -33,3 +33,5 @@ artifacts/grafts/*.bin filter=lfs diff=lfs merge=lfs -text
 # The Flash-Next model card's LICENSE is Qwen's text byte for byte (CRLF), the same bytes as the copy
 # in the Hugging Face repository.
 /model-cards/Qwen3.8-Flash-Next-NInfer-3090/LICENSE -text
+# Projector golden files compare byte for byte (trailing spaces included); never convert line endings.
+/tests/fixtures/vcc/** -text -whitespace

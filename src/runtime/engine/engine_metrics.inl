@@ -177,11 +177,16 @@ void EngineCore<Instance>::publish_runtime_stats() {
         snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
         snapshot.waiting.reserve(std::min(pending_.size(), kMaximumReportedWaitingRequests));
         for (const auto& request : pending_) {
-            add_backlog(queued_prefill_ns(request->prompt_summary));
+            // A prompt the summary strategy shortened prefills its submitted length.
+            PromptSummary submitted = request->prompt_summary;
+            if (request->summary && request->summary->rewrite) {
+                submitted.prompt_tokens = request->summary->rewrite->prompt_tokens;
+            }
+            add_backlog(queued_prefill_ns(submitted));
             if (snapshot.waiting.size() < kMaximumReportedWaitingRequests) {
                 snapshot.waiting.push_back(RuntimeWaitingStats{
                     .request_id     = request->id,
-                    .prompt_tokens  = request->prompt_summary.prompt_tokens,
+                    .prompt_tokens  = submitted.prompt_tokens,
                     .waited_seconds =
                         std::chrono::duration<double>(detail_started - request->submitted).count(),
                 });

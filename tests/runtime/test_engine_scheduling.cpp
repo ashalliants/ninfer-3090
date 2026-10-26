@@ -51,6 +51,12 @@ struct Settings {
     bool admission_affinity  = false;
     std::uint32_t pending_timeout_ms = 60'000;
     std::uint32_t max_pending        = 8;
+    // Lossy prefill: LossyPrefillOptions::min_tokens (0: off).
+    std::uint32_t lossy_min_tokens = 0;
+    LossyStrategy lossy_strategy   = LossyStrategy::Select;
+    bool context_cache             = false;
+    // Shared prefixes installed before the Engine starts: (group, frontier).
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> shared_prefixes;
 };
 
 class Rig {
@@ -71,9 +77,18 @@ public:
         options.max_pending_requests  = settings.max_pending;
         options.pending_timeout_ms    = settings.pending_timeout_ms;
         options.prefill_chunk         = settings.chunk;
-        options.context_cache.enabled = false;
+        options.context_cache.enabled = settings.context_cache;
         options.admission_fit_check   = settings.admission_fit_check;
         options.admission_affinity    = settings.admission_affinity;
+        options.lossy_prefill.min_tokens = settings.lossy_min_tokens;
+        options.lossy_prefill.strategy   = settings.lossy_strategy;
+        // The fake Program keeps 0.2 of U (fake::Program::set_lossy_keep); the Engine prices the
+        // main pass with the same share, so the backlog checks stay independent of the default.
+        options.lossy_prefill.keep_fraction = 0.2F;
+        for (const auto& [group, frontier] : settings.shared_prefixes) {
+            instance_.external_checkpoints.push_back(
+                instance_.program->add_shared_prefix(group, frontier));
+        }
         options.prefill_schedule      = {.stall_budget_ms      = settings.stall_budget,
                                          .yield_remaining_ms   = settings.yield_ms,
                                          .decode_share_percent = settings.decode_share,
@@ -99,24 +114,38 @@ public:
     // Starts a request and returns its result future. `id` names it in the event log.
     Result run(std::uint64_t id, std::uint32_t prompt_tokens, std::uint32_t output_tokens,
                std::shared_ptr<std::atomic<bool>> cancel = nullptr) {
+        return run_prompt(fake::PreparedPrompt{prompt_tokens, id}, output_tokens, std::move(cancel));
+    }
+
+    // `sink`, when given, streams the request (with prompt progress); it must outlive the Rig.
+    // `record`: what the summary strategy did for the prompt (Engine::prepare reports the client's
+    // length in the summary when it rewrote it, as here).
+    Result run_prompt(fake::PreparedPrompt prompt, std::uint32_t output_tokens,
+                      std::shared_ptr<std::atomic<bool>> cancel = nullptr,
+                      OutputSink* sink                         = nullptr,
+                      std::optional<compaction::SummaryRecord> record = std::nullopt) {
         ResolvedRequestOptions request;
         request.execution.requested_output_tokens = output_tokens;
         PromptSummary summary;
-        summary.prompt_tokens = prompt_tokens;
+        summary.prompt_tokens =
+            record && record->rewrite ? record->rewrite->original_tokens : prompt.tokens;
+        GenerationObservationOptions observation;
+        observation.prompt_progress = sink != nullptr;
         auto submission = std::make_shared<EngineCore<fake::Instance>::Submission>(core_->submit(
-            fake::PreparedPrompt{prompt_tokens, id}, summary, 0.0, std::move(request),
-            OutputConsumerMode::Aggregate, GenerationObservationOptions{}));
+            prompt, summary, 0.0, std::move(request),
+            sink != nullptr ? OutputConsumerMode::Streaming : OutputConsumerMode::Aggregate,
+            observation, {}, record));
         // A promise, not std::async: a future from async blocks in its destructor, which would
         // deadlock a failing test that still holds the worker.
         auto promise = std::make_shared<std::promise<GenerationResult>>();
         Result result = promise->get_future().share();
-        waiters_.emplace_back([submission, promise, cancel] {
+        waiters_.emplace_back([submission, promise, cancel, sink] {
             try {
                 CancellationView view;
                 if (cancel) {
                     view = CancellationView([cancel] { return cancel->load(std::memory_order_acquire); });
                 }
-                promise->set_value(submission->wait(nullptr, view));
+                promise->set_value(submission->wait(sink, view));
             } catch (...) { promise->set_exception(std::current_exception()); }
         });
         return result;
@@ -128,6 +157,22 @@ public:
                                   .binding          = "fake-binding",
                                   .hydration_budget = hydration_budget,
                                   .remote           = true});
+    }
+
+    // Gives the Engine a context store it writes idle conversations to, through `write` (which
+    // stores the image and returns whether it took it). The store must outlive the Rig.
+    // `failures` and `failed_writes`, when given, stand for the writer's failure count and its
+    // reports of the writes that failed.
+    void attach_store_writer(ContextStore& store, std::function<bool(fake::CheckpointImage&&)> write,
+                             std::chrono::milliseconds idle,
+                             std::function<std::uint64_t()> failures             = {},
+                             std::function<EngineCore<fake::Instance>::FailedStoreWrites()> failed_writes = {}) {
+        core_->set_context_store({.store        = &store,
+                                  .binding      = "fake-binding",
+                                  .sink         = std::move(write),
+                                  .failures     = std::move(failures),
+                                  .failed_writes = std::move(failed_writes),
+                                  .idle_persist = idle});
     }
 
     fake::Program& program() { return *instance_.program; }
@@ -187,8 +232,9 @@ public:
 
     [[nodiscard]] std::string dump() const {
         std::ostringstream out;
-        const char* names[] = {"Bind", "Restore", "Prefill", "Decode", "PauseStart", "PauseDone",
-                               "Finish", "Abort"};
+        const char* names[] = {"Bind",   "Restore",     "Prefill", "Decode",  "PauseStart",
+                               "PauseDone", "Finish",   "Abort",   "EnableLossy", "Scout",
+                               "ScoutEnd"};
         for (const Event& event : events()) {
             out << "  " << names[static_cast<int>(event.kind)] << " lane=" << event.lane
                 << " req=" << event.request << " tokens=" << event.tokens << " cap=" << event.cap
@@ -1085,6 +1131,943 @@ void test_a_stalled_listing_releases_the_request_at_its_budget() {
     }
 }
 
+
+// ---- idle writes ---------------------------------------------------------------------------
+
+// Stores a fake image as the Engine's writer does, under the id the Engine expects.
+void put_image(ContextStore& store, const fake::CheckpointImage& image) {
+    ContextStore::Description description;
+    const auto& key     = image.keys.front();
+    description.id      = ContextStore::image_id(key.digests, key.frontier, false);
+    description.binding = "fake-binding";
+    description.tokens  = image.tokens;
+    description.checkpoints.push_back(
+        {.frontier = key.frontier, .digests = key.digests, .identity_tag = key.identity_tag});
+    std::vector<ContextStore::Region> regions;
+    for (const auto& region : image.regions) { regions.push_back({region.offset, region.length}); }
+    (void)store.put(description, image.bytes, regions);
+}
+
+// Another conversation's second turn, whose image supersedes its first: a removal from the store
+// that has nothing to do with the sessions the Engine holds.
+void supersede_elsewhere(ContextStore& store) {
+    ContextStore::Description first;
+    first.id      = "e1";
+    first.binding = "fake-binding";
+    first.tokens  = 100;
+    first.checkpoints.push_back({.frontier = 100, .digests = {77, 7}, .identity_tag = 0});
+    const std::vector<std::uint8_t> image(64 + 4096, 1);
+    (void)store.put(first, image, std::array{ContextStore::Region{64, 4096}});
+    std::vector<std::array<std::uint64_t, 2>> digests(201, {77, 0});
+    digests[100] = {77, 7};
+    ContextStore::Description second = first;
+    second.id                         = "e2";
+    second.tokens                     = 200;
+    second.checkpoints                = {{.frontier = 200, .digests = {77, 8}, .identity_tag = 0}};
+    second.prefix_digests             = digests;
+    (void)store.put(second, image, std::array{ContextStore::Region{64, 4096}});
+    require(!store.find("e1") && store.stats().superseded == 1, "the second turn did not supersede");
+}
+
+// Restores the image of conversation `group` from the store into the Engine's cache, where it is a
+// retained continuation the store holds as it is.
+void restore_stored(Rig& rig, ContextStore& store, std::uint64_t group) {
+    const auto image = rig.program().image_of(group, 4096);
+    const auto id    = ContextStore::image_id(image.keys.front().digests, 4096, false);
+    const auto bytes = store.load(id);
+    require(bytes.has_value(), "the stored session could not be read");
+    require(rig.core().restore_image(*bytes), "the stored session was not restored");
+}
+
+// The store removing an image of another conversation (here superseded by its next turn, which
+// happens on every turn of every conversation) does not make the Engine write the sessions it
+// holds again: they are unchanged, and the store still holds them.
+void test_an_unrelated_removal_does_not_rewrite_stored_sessions() {
+    StoreDirectory directory;
+    ContextStore::Options options;
+    options.directory   = directory.path();
+    options.chunk_bytes = 4096;
+    ContextStore store(options);
+    Rig rig({.chunk = 1024, .lanes = 1, .context_cache = true});
+    std::atomic<int> writes{0};
+    rig.attach_store_writer(
+        store,
+        [&](fake::CheckpointImage&& image) {
+            put_image(store, image);
+            ++writes;
+            return true;
+        },
+        std::chrono::milliseconds(50));
+    for (const std::uint64_t group : {1, 2}) {
+        put_image(store, rig.program().image_of(group, 4096));
+        restore_stored(rig, store, group);
+    }
+    auto busy = rig.run(9, 64, 3000); // keeps the worker cycling for about 3 s
+    supersede_elsewhere(store);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500)); // two idle scans or more
+    require(writes == 0 && rig.program().exports() == 0,
+            "an unrelated removal had unchanged stored sessions written again: " +
+                std::to_string(writes.load()) + " writes, " +
+                std::to_string(rig.program().exports()) + " exports");
+    require(finished(busy), "the request did not finish\n" + rig.dump());
+}
+
+// A store with room for one of two sessions keeps the newer and evicts the older. The older one is
+// not written back: that would evict the newer, which would then be written back, and so on.
+void test_a_session_the_store_evicted_is_not_written_back() {
+    StoreDirectory directory;
+    ContextStore::Options options;
+    options.directory   = directory.path();
+    options.chunk_bytes = 4096;
+    options.max_bytes   = 96 * 1024; // one 64 KiB image and its manifest, not two
+    ContextStore store(options);
+    Rig rig({.chunk = 1024, .lanes = 1, .context_cache = true});
+    std::atomic<int> writes{0};
+    rig.attach_store_writer(
+        store,
+        [&](fake::CheckpointImage&& image) {
+            put_image(store, image);
+            ++writes;
+            return true;
+        },
+        std::chrono::milliseconds(50));
+    put_image(store, rig.program().image_of(1, 4096));
+    restore_stored(rig, store, 1);
+    put_image(store, rig.program().image_of(2, 4096));
+    require(store.stats().evicted_for_space == 1 && store.stats().images == 1,
+            "the second session did not evict the first");
+    restore_stored(rig, store, 2);
+    auto busy = rig.run(9, 64, 3000);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+    require(writes == 0,
+            "a session the store evicted was written back: " + std::to_string(writes.load()) +
+                " writes, " + std::to_string(store.stats().evicted_for_space) + " evictions");
+    require(finished(busy), "the request did not finish\n" + rig.dump());
+}
+
+// The writer's failure reports, as the Engine's writer thread makes them.
+struct FailedWrites {
+    std::mutex mutex;
+    std::uint64_t count = 0;
+    std::vector<std::string> ids;
+    void fail(const std::string& id) {
+        std::lock_guard lock(mutex);
+        ++count;
+        ids.push_back(id);
+    }
+    std::uint64_t failures() {
+        std::lock_guard lock(mutex);
+        return count;
+    }
+    bool lost = false;
+    void lose() {
+        std::lock_guard lock(mutex);
+        ++count;
+        lost = true;
+    }
+    EngineCore<fake::Instance>::FailedStoreWrites take() {
+        std::lock_guard lock(mutex);
+        return {std::exchange(ids, {}), std::exchange(lost, false)};
+    }
+};
+
+// A queued write that failed is written again, even when a removal scan saw its image missing first
+// and took it for one the store let go (the failure report lands after the scan).
+void test_a_failed_write_is_retried_after_a_removal_scan_dropped_it() {
+    StoreDirectory directory;
+    ContextStore::Options options;
+    options.directory   = directory.path();
+    options.chunk_bytes = 4096;
+    ContextStore store(options);
+    Rig rig({.chunk = 1024, .lanes = 1, .context_cache = true});
+    std::atomic<int> writes{0};
+    FailedWrites failed;
+    rig.attach_store_writer(
+        store,
+        [&](fake::CheckpointImage&& image) {
+            put_image(store, image);
+            ++writes;
+            return true;
+        },
+        std::chrono::milliseconds(50), [&] { return failed.failures(); },
+        [&] { return failed.take(); });
+    const auto image = rig.program().image_of(1, 4096);
+    const auto id    = ContextStore::image_id(image.keys.front().digests, 4096, false);
+    put_image(store, image);
+    restore_stored(rig, store, 1);
+    // The write "failed": its image is not in the store. A removal elsewhere is scanned first.
+    require(store.erase(id), "the image could not be erased");
+    supersede_elsewhere(store);
+    // The shutdown flush writes whatever is not settled, with no idle wait or failure back-off.
+    int flushed = 0;
+    const auto flush = [&] {
+        return rig.core().persist_all(
+            [&](fake::CheckpointImage&& written, bool) {
+                put_image(store, written);
+                ++flushed;
+                return true;
+            },
+            Clock::now() + std::chrono::seconds(5));
+    };
+    (void)flush();
+    require(flushed == 0, "a session taken for one the store let go was written");
+    failed.fail(id);
+    (void)flush();
+    require(flushed == 1, "the failed write was not written again: " + std::to_string(flushed) +
+                              " writes");
+    require(store.find(id).has_value(), "the retried write did not store the session");
+}
+
+// When the writer lost some failure reports (more failed than it keeps), every continuation whose
+// image the store does not hold is written again, not trusted as stored.
+void test_lost_failure_reports_retry_every_missing_session() {
+    StoreDirectory directory;
+    ContextStore::Options options;
+    options.directory   = directory.path();
+    options.chunk_bytes = 4096;
+    ContextStore store(options);
+    Rig rig({.chunk = 1024, .lanes = 1, .context_cache = true});
+    FailedWrites failed;
+    rig.attach_store_writer(
+        store, [&](fake::CheckpointImage&& image) { put_image(store, image); return true; },
+        std::chrono::milliseconds(50), [&] { return failed.failures(); },
+        [&] { return failed.take(); });
+    for (const std::uint64_t group : {1, 2}) {
+        put_image(store, rig.program().image_of(group, 4096));
+        restore_stored(rig, store, group);
+    }
+    // Session 1's write "failed" and its report was lost; session 2 is still stored.
+    const auto lost_id =
+        ContextStore::image_id(rig.program().image_of(1, 4096).keys.front().digests, 4096, false);
+    require(store.erase(lost_id), "the image could not be erased");
+    failed.lose();
+    std::vector<std::string> flushed;
+    (void)rig.core().persist_all(
+        [&](fake::CheckpointImage&& written, bool) {
+            flushed.push_back(ContextStore::image_id(written.keys.front().digests,
+                                                     written.keys.front().frontier, false));
+            put_image(store, written);
+            return true;
+        },
+        Clock::now() + std::chrono::seconds(5));
+    require(flushed == std::vector<std::string>{lost_id},
+            "lost failure reports did not have exactly the missing session written again: " +
+                std::to_string(flushed.size()) + " writes");
+}
+
+// An image of the same id written under another model or configuration does not count as this
+// conversation stored: when this Engine's write of it fails, it is written again.
+void test_a_foreign_image_of_the_same_id_does_not_count_as_stored() {
+    StoreDirectory directory;
+    ContextStore::Options options;
+    options.directory   = directory.path();
+    options.chunk_bytes = 4096;
+    ContextStore store(options);
+    Rig rig({.chunk = 1024, .lanes = 1, .context_cache = true});
+    std::atomic<int> writes{0};
+    FailedWrites failed;
+    rig.attach_store_writer(
+        store,
+        [&](fake::CheckpointImage&& image) {
+            put_image(store, image);
+            ++writes;
+            return true;
+        },
+        std::chrono::milliseconds(50), [&] { return failed.failures(); },
+        [&] { return failed.take(); });
+    const auto image = rig.program().image_of(1, 4096);
+    const auto id    = ContextStore::image_id(image.keys.front().digests, 4096, false);
+    put_image(store, image);
+    restore_stored(rig, store, 1);
+    // Another configuration's image now holds the id, and this Engine's write of it failed.
+    ContextStore::Description foreign;
+    foreign.id      = id;
+    foreign.binding = "another-binding";
+    foreign.tokens  = 4096;
+    foreign.checkpoints.push_back({.frontier = 4096, .digests = image.keys.front().digests});
+    (void)store.put(foreign, image.bytes, std::array{ContextStore::Region{16, 64 * 1024}});
+    failed.fail(id);
+    auto busy = rig.run(9, 64, 4000);
+    require(rig.wait_for([&] { return writes.load() == 1; }, std::chrono::seconds(3)),
+            "a foreign image of the same id counted as the conversation stored: " +
+                std::to_string(writes.load()) + " writes");
+    require(store.find(id) && store.find(id)->binding == "fake-binding",
+            "the retried write did not replace the foreign image");
+    require(finished(busy), "the request did not finish\n" + rig.dump());
+}
+
+// ---- lossy prefill (docs/maintainer/lossy-long-prefill.md) ----------------------------------
+
+static_assert(EngineCore<fake::Instance>::kLossyCapable,
+              "the fake must model the lossy Program contract the Engine uses");
+
+constexpr std::uint32_t kLossyChunk  = 4096;
+constexpr std::uint32_t kMarker      = 2048;  // the product prompt: a shared marker
+constexpr std::uint32_t kLossyPrompt = 40000; // U = 37,952 after the marker
+constexpr std::uint32_t kLossyKept   = 7591;  // ceil(0.2 * 37,952)
+
+fake::PreparedPrompt lossy_prompt(std::uint64_t id, std::uint32_t tokens = kLossyPrompt,
+                                  std::uint64_t shared_group = 0) {
+    fake::PreparedPrompt prompt{tokens, id};
+    prompt.lossy_exact_end = kMarker;
+    if (shared_group != 0) {
+        prompt.shared_group  = shared_group;
+        prompt.shared_tokens = kMarker;
+    }
+    return prompt;
+}
+
+std::uint32_t total_tokens(const std::vector<Event>& events) {
+    std::uint32_t total = 0;
+    for (const Event& event : events) { total += event.tokens; }
+    return total;
+}
+
+std::optional<std::size_t> last_index(const std::vector<Event>& events, Event::Kind kind,
+                                      std::uint64_t id) {
+    std::optional<std::size_t> found;
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        if (events[i].kind == kind && events[i].request == id) { found = i; }
+    }
+    return found;
+}
+
+std::optional<std::size_t> first_index(const std::vector<Event>& events, Event::Kind kind,
+                                       std::uint64_t id) {
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        if (events[i].kind == kind && events[i].request == id) { return i; }
+    }
+    return std::nullopt;
+}
+
+// The trigger itself: never for a private conversation record, the threshold on what follows M.
+void test_lossy_trigger_rule() {
+    const LossyTriggerInput cold{.min_tokens    = 30000,
+                                 .exact_end     = kMarker,
+                                 .prompt_tokens = kMarker + 31000};
+    require(lossy_prefill_trigger(cold) == kMarker, "a cold prompt past the threshold did not trigger");
+    auto shared          = cold;
+    shared.source_role   = CheckpointRole::SharedPrefix;
+    shared.reused_tokens = kMarker;
+    require(lossy_prefill_trigger(shared) == kMarker, "a shared-prefix source did not trigger");
+    for (const auto role : {CheckpointRole::Continuation, CheckpointRole::InputReplay,
+                            CheckpointRole::LongAnchor}) {
+        auto warm          = shared;
+        warm.source_role   = role;
+        warm.reused_tokens = kMarker + 1000;
+        require(!lossy_prefill_trigger(warm), "a private conversation record triggered the path");
+    }
+    auto short_rest          = cold;
+    short_rest.prompt_tokens = kMarker + 29000;
+    require(!lossy_prefill_trigger(short_rest), "29K after the marker triggered a 30K threshold");
+    auto exact          = cold;
+    exact.prompt_tokens = kMarker + 30000;
+    require(!lossy_prefill_trigger(exact), "the threshold is exclusive");
+    // A shared checkpoint past the product prompt is the conversation (an earlier turn's
+    // automatic or cache_control boundary): cached, so no lossy path however long the new turn.
+    auto deeper          = shared;
+    deeper.reused_tokens = kMarker + 1;
+    deeper.prompt_tokens = kMarker + 1 + 60000;
+    require(!lossy_prefill_trigger(deeper), "a shared source past the product prompt triggered");
+    auto below_marker          = shared;
+    below_marker.reused_tokens = kMarker / 2; // a shallower shared prefix: still cold
+    require(lossy_prefill_trigger(below_marker) == kMarker,
+            "a shared source inside the product prompt did not trigger at the product end");
+    auto off       = cold;
+    off.min_tokens = 0;
+    require(!lossy_prefill_trigger(off), "min_tokens 0 is not off");
+    auto media      = cold;
+    media.has_media = true;
+    require(!lossy_prefill_trigger(media), "a prompt with media triggered the path");
+    auto unplanned      = cold;
+    unplanned.exact_end = std::nullopt;
+    require(!lossy_prefill_trigger(unplanned), "a plan without lossy() triggered the path");
+}
+
+// LossyTriggersOnlyWhenCold on the worker loop: a shared product-prompt source with 31K after
+// the marker takes the path, 29K does not, and a plan without lossy() never does.
+void test_lossy_triggers_only_when_cold() {
+    test_lossy_trigger_rule();
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000, .context_cache = true,
+             .shared_prefixes = {{7, kMarker}}});
+    auto taken = rig.run_prompt(lossy_prompt(1, kMarker + 31000, 7), 1);
+    require(finished(taken), "the 31K request did not finish\n" + rig.dump());
+    require(taken.get().reused_prompt_tokens == kMarker,
+            "the request did not bind the shared prefix\n" + rig.dump());
+    const auto enabled = rig.events_of(1, Event::Kind::EnableLossy);
+    require(enabled.size() == 1 && enabled[0].position == kMarker,
+            "a shared source with 31K after the marker did not take the path at M\n" + rig.dump());
+
+    auto below = rig.run_prompt(lossy_prompt(2, kMarker + 29000, 7), 1);
+    require(finished(below), "the 29K request did not finish\n" + rig.dump());
+    require(rig.events_of(2, Event::Kind::EnableLossy).empty() &&
+                rig.events_of(2, Event::Kind::Scout).empty(),
+            "29K after the marker took the path\n" + rig.dump());
+
+    auto unplanned = rig.run_prompt(fake::PreparedPrompt{kMarker + 31000, 3}, 1);
+    require(finished(unplanned), "the unplanned request did not finish\n" + rig.dump());
+    require(rig.events_of(3, Event::Kind::EnableLossy).empty(),
+            "a plan without lossy() took the path\n" + rig.dump());
+    const auto stats = rig.core().runtime_stats();
+    require(stats.lossy_prefills_completed == 1 && stats.lossy_prefills_skipped == 0,
+            "only the 31K request should have been counted");
+
+    Rig off({.chunk = kLossyChunk, .lanes = 1});
+    auto plain = off.run_prompt(lossy_prompt(4), 1);
+    require(finished(plain), "the request with the option off did not finish\n" + off.dump());
+    require(off.events_of(4, Event::Kind::EnableLossy).empty(),
+            "the path ran with --lossy-prefill-min-tokens 0\n" + off.dump());
+}
+
+// LossySharedSourcePastProductPrompt: turn N published a shared checkpoint at the end of its own
+// last message (OpenAI's automatic boundary, Anthropic cache_control). Turn N+1 binding it is a warm
+// conversation: a large new turn prefills in full. The same prompt bound only at the product end
+// takes the path. The summary strategy's probe answers warm for the deeper shared match.
+void test_lossy_shared_source_past_product_prompt() {
+    constexpr std::uint32_t kTurn = kMarker + 10000; // turn N's shared boundary
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000, .context_cache = true,
+             .shared_prefixes = {{7, kMarker}, {8, kTurn}}});
+    fake::PreparedPrompt warm = lossy_prompt(1, kTurn + 31000, 8);
+    warm.shared_tokens        = kTurn;
+    auto warm_result          = rig.run_prompt(std::move(warm), 1);
+    require(finished(warm_result), "the warm request did not finish\n" + rig.dump());
+    require(warm_result.get().reused_prompt_tokens == kTurn,
+            "the request did not bind turn N's shared checkpoint\n" + rig.dump());
+    require(rig.events_of(1, Event::Kind::EnableLossy).empty() &&
+                rig.events_of(1, Event::Kind::Scout).empty() && !warm_result.get().lossy_prefill,
+            "a shared source past the product prompt took the lossy path\n" + rig.dump());
+    require(total_tokens(rig.events_of(1, Event::Kind::Prefill)) == 31000,
+            "the new turn was not prefilled in full\n" + rig.dump());
+
+    auto cold = rig.run_prompt(lossy_prompt(2, kTurn + 31000, 7), 1);
+    require(finished(cold), "the cold request did not finish\n" + rig.dump());
+    const auto enabled = rig.events_of(2, Event::Kind::EnableLossy);
+    require(cold.get().reused_prompt_tokens == kMarker && enabled.size() == 1 &&
+                enabled[0].position == kMarker,
+            "a shared source at the product end did not take the path at M\n" + rig.dump());
+
+    Rig summary({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000,
+                 .lossy_strategy = LossyStrategy::Summary, .context_cache = true,
+                 .shared_prefixes = {{7, kMarker}, {8, kTurn}}});
+    ResolvedExecutionOptions execution;
+    execution.requested_output_tokens = 1;
+    fake::PreparedPrompt deep = lossy_prompt(3, kTurn + 31000, 8);
+    deep.shared_tokens        = kTurn;
+    require(summary.core().has_private_reuse(deep, execution, kMarker,
+                                             std::chrono::milliseconds(250)) ==
+                LossySummaryProbe::Warm,
+            "a shared match past the product prompt was not probed warm");
+    require(summary.core().has_private_reuse(lossy_prompt(4, kTurn + 31000, 7), execution, kMarker,
+                                             std::chrono::milliseconds(250)) ==
+                LossySummaryProbe::Cold,
+            "a shared match at the product end was not probed cold");
+}
+
+// LossyPromptLengthChangeAccepted: the step that ends the scout shrinks the prompt; the Engine
+// takes the new length and plan, and the prefill finishes on it without a frontier check firing.
+void test_lossy_prompt_length_change_accepted() {
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000});
+    auto result = rig.run_prompt(lossy_prompt(1), 2);
+    require(finished(result), "the lossy request did not finish\n" + rig.dump());
+    const auto& generation = result.get();
+    const auto prefill     = rig.events_of(1, Event::Kind::Prefill);
+    const auto scout       = rig.events_of(1, Event::Kind::Scout);
+    require(total_tokens(scout) == kLossyPrompt - kMarker && scout.front().position == kMarker,
+            "the scout did not cover U from M\n" + rig.dump());
+    require(total_tokens(prefill) == kMarker + kLossyKept,
+            "the prefill did not cover the exact part and the kept tokens\n" + rig.dump());
+    require(prefill.front().tokens == kMarker && prefill.back().position + prefill.back().tokens ==
+                                                     kMarker + kLossyKept,
+            "the exact part did not stop at M or the main pass overran\n" + rig.dump());
+    require(generation.computed_prefill_tokens == kMarker + kLossyKept,
+            "computed prefill tokens are not the kept count");
+    require(generation.prompt.prompt_tokens == kLossyPrompt, "the prompt length reported changed");
+}
+
+// LossyCancelDuringScout: the request finishes cancelled, the scout ends with its lane and no page
+// is left behind.
+void test_lossy_cancel_during_scout() {
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000});
+    rig.hold_at([](const Event& e) {
+        return e.kind == Event::Kind::Scout && e.request == 1 && e.position == kMarker + kLossyChunk;
+    });
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    auto result = rig.run_prompt(lossy_prompt(1), 4, cancel);
+    require(rig.wait_held(), "the scout never reached its second step\n" + rig.dump());
+    cancel->store(true, std::memory_order_release);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // the waiter forwards the flag
+    rig.release();
+    require(finished(result), "the cancelled request did not finish\n" + rig.dump());
+    require(result.get().finish_reason == FinishReason::Cancelled, "the request was not cancelled");
+    const auto events = rig.events();
+    const auto ended  = first_index(events, Event::Kind::ScoutEnd, 1);
+    const auto abort  = first_index(events, Event::Kind::Abort, 1);
+    require(ended && abort && *ended < *abort, "the fake did not report the scout restored\n" + rig.dump());
+    require(rig.events_of(1, Event::Kind::Scout).size() < 10, "the scout ran to its end\n" + rig.dump());
+    require(rig.wait_for([&] {
+                const auto stats = rig.core().runtime_stats();
+                return stats.device_main_kv_occupied_pages == 0 &&
+                       stats.device_state_occupied_slots == 0;
+            }),
+            "pages or a state slot leaked after the cancelled scout");
+    const auto stats = rig.core().runtime_stats();
+    require(stats.lossy_prefills_aborted == 1 && stats.lossy_prefills_completed == 0,
+            "the cancelled scout was not counted aborted");
+    const auto& report = result.get().lossy_prefill;
+    require(report && report->outcome == LossyPrefillOutcome::Aborted &&
+                report->uncached_tokens == kLossyPrompt - kMarker,
+            "the cancelled request's lossy report is wrong");
+}
+
+// LossyYieldRefusedDuringScout: a short request at the head cannot pause a scouting lane (the
+// Engine does not even ask); it waits until the main pass starts and then yields as today.
+void test_lossy_yield_refused_during_scout() {
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .yield_ms = 100, .lossy_min_tokens = 30000});
+    rig.hold_at([](const Event& e) {
+        return e.kind == Event::Kind::Scout && e.request == 1 && e.position == kMarker;
+    });
+    auto long_result = rig.run_prompt(lossy_prompt(1), 1);
+    require(rig.wait_held(), "the scout never started\n" + rig.dump());
+    auto short_result = rig.run(2, 100, 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    rig.release();
+    require(finished(short_result) && finished(long_result), "a request did not finish\n" + rig.dump());
+    const auto events      = rig.events();
+    const auto last_scout  = last_index(events, Event::Kind::Scout, 1);
+    const auto pause_start = first_index(events, Event::Kind::PauseStart, 1);
+    const auto short_bind  = first_index(events, Event::Kind::Bind, 2);
+    const auto long_end    = first_index(events, Event::Kind::Finish, 1);
+    require(rig.program().scout_pause_refusals() == 0,
+            "the Engine asked to pause a scouting lane\n" + rig.dump());
+    require(last_scout && pause_start && *pause_start > *last_scout,
+            "the head did not yield once the main pass started\n" + rig.dump());
+    require(short_bind && long_end && *short_bind < *long_end,
+            "the short request waited for the whole lossy prefill\n" + rig.dump());
+    require(rig.core().runtime_stats().prefill_yields == 1, "the yield was not counted");
+    // Restored on its compacted plan: the main pass resumed where it stopped and ended at M + kept.
+    const auto prefill = rig.events_of(1, Event::Kind::Prefill);
+    require(total_tokens(prefill) == kMarker + kLossyKept,
+            "the restored main pass did not continue on the compacted prompt\n" + rig.dump());
+}
+
+// LossyResumesAfterExactPause: a short request at the head yields the long one while it is still
+// prefilling the product prompt (Exact, before M). Restored, it finishes Exact at M, scouts U and
+// prefills the kept tokens: the pause does not drop the lossy path. The Program carries the path
+// in its saved control, so the Engine enables it once, at the first binding.
+void test_lossy_resumes_after_exact_pause() {
+    constexpr std::uint32_t kDeepMarker = 3 * kLossyChunk; // Exact takes three chunks
+    constexpr std::uint32_t kPrompt     = kDeepMarker + 31000;
+    constexpr std::uint32_t kKept       = 6200;            // ceil(0.2 * 31,000)
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .yield_ms = 100, .lossy_min_tokens = 30000});
+    rig.hold_at([](const Event& e) {
+        return e.kind == Event::Kind::Prefill && e.request == 1 && e.position == kLossyChunk;
+    });
+    fake::PreparedPrompt prompt = lossy_prompt(1, kPrompt);
+    prompt.lossy_exact_end      = kDeepMarker;
+    auto long_result = rig.run_prompt(std::move(prompt), 1);
+    require(rig.wait_held(), "the exact phase never reached its second chunk\n" + rig.dump());
+    auto short_result = rig.run(2, 100, 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    rig.release();
+    require(finished(short_result) && finished(long_result), "a request did not finish\n" + rig.dump());
+    const auto events      = rig.events();
+    const auto pause_start = first_index(events, Event::Kind::PauseStart, 1);
+    const auto restore     = first_index(events, Event::Kind::Restore, 1);
+    const auto first_scout = first_index(events, Event::Kind::Scout, 1);
+    require(pause_start && restore && first_scout && *pause_start < *restore &&
+                *restore < *first_scout,
+            "the long request was not paused in Exact and restored before its scout\n" + rig.dump());
+    require(events[*pause_start].position < kDeepMarker, "the pause was not before M\n" + rig.dump());
+    require(rig.events_of(1, Event::Kind::EnableLossy).size() == 1,
+            "the path was not enabled exactly once\n" + rig.dump());
+    const auto scout = rig.events_of(1, Event::Kind::Scout);
+    require(total_tokens(scout) == kPrompt - kDeepMarker && scout.front().position == kDeepMarker,
+            "the restored request did not scout U from M\n" + rig.dump());
+    require(total_tokens(rig.events_of(1, Event::Kind::Prefill)) == kDeepMarker + kKept,
+            "the restored request did not prefill M plus the kept tokens\n" + rig.dump());
+    const auto& report = long_result.get().lossy_prefill;
+    require(report && report->outcome == LossyPrefillOutcome::Completed &&
+                report->uncached_tokens == kPrompt - kDeepMarker && report->kept_tokens == kKept,
+            "the resumed lossy prefill was not reported completed");
+    const auto stats = rig.core().runtime_stats();
+    require(stats.lossy_prefills_completed == 1 && stats.lossy_prefills_aborted == 0 &&
+                stats.prefill_yields == 1,
+            "the resumed lossy prefill was not counted completed");
+}
+
+// LossyPreemptionDuringScout: memory pressure needs the scouting lane's pages. The pause is never
+// refused into a deadlock: the scout ends at M, the request is paused, restored, and prefills U in
+// full.
+void test_lossy_preemption_during_scout() {
+    Rig rig({.chunk = kLossyChunk, .lanes = 2, .lossy_min_tokens = 30000});
+    rig.program().set_decode_shortage_while_scouting(true);
+    auto stream = rig.run(1, 64, kLongOutput);
+    require(decoding(rig, 3), "the neighbour never started decoding\n" + rig.dump());
+    auto lossy = rig.run_prompt(lossy_prompt(2), 1);
+    require(finished(lossy) && finished(stream), "a request did not finish\n" + rig.dump());
+    const auto events = rig.events();
+    const auto ended  = first_index(events, Event::Kind::ScoutEnd, 2);
+    const auto pause  = first_index(events, Event::Kind::PauseStart, 2);
+    const auto back   = first_index(events, Event::Kind::Restore, 2);
+    require(ended && pause && back && *ended < *pause && *pause < *back,
+            "the scout did not end before the pause, or the request was not restored\n" + rig.dump());
+    require(rig.program().scout_pause_refusals() == 0,
+            "the Engine asked to pause a scouting lane\n" + rig.dump());
+    require(total_tokens(rig.events_of(2, Event::Kind::Prefill)) == kLossyPrompt,
+            "after the aborted scout the prompt was not prefilled in full\n" + rig.dump());
+    const auto stats = rig.core().runtime_stats();
+    require(stats.lossy_prefills_aborted == 1 && stats.lossy_prefills_completed == 0 &&
+                stats.preemptions >= 1,
+            "the aborted scout was not counted");
+}
+
+class ProgressSink final : public OutputSink {
+public:
+    void start(GenerationStart start) override {
+        std::lock_guard lock(mutex);
+        starts.push_back(start);
+    }
+    void progress(PromptProgress progress) override {
+        std::lock_guard lock(mutex);
+        updates.push_back(progress);
+    }
+    void timing(GenerationTimingObservation) override {}
+    void publish(OutputDelta) override {}
+
+    std::mutex mutex;
+    std::vector<GenerationStart> starts;
+    std::vector<PromptProgress> updates;
+};
+
+// LossyUsageReportsOriginal: usage and prompt progress count the client's prompt, not the kept
+// one; the cached tokens are the exact reused prefix.
+void test_lossy_usage_reports_original() {
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000, .context_cache = true,
+             .shared_prefixes = {{7, kMarker}}});
+    ProgressSink sink;
+    auto result = rig.run_prompt(lossy_prompt(1, kLossyPrompt, 7), 2, nullptr, &sink);
+    require(finished(result), "the lossy request did not finish\n" + rig.dump());
+    const auto& generation = result.get();
+    require(generation.prompt.prompt_tokens == kLossyPrompt,
+            "usage prompt_tokens is not the original length");
+    require(generation.reused_prompt_tokens == kMarker, "cached tokens are not the exact prefix");
+    require(generation.computed_prefill_tokens == kLossyKept, "the kept tokens were not computed");
+    std::lock_guard lock(sink.mutex);
+    require(sink.starts.size() == 1 && sink.starts[0].reused_prompt_tokens == kMarker &&
+                sink.starts[0].prompt.prompt_tokens == kLossyPrompt,
+            "the stream start does not count the client's prompt");
+    require(!sink.updates.empty(), "no prompt progress was streamed");
+    std::uint32_t last = 0;
+    for (const auto& update : sink.updates) {
+        require(update.total_prompt_tokens == kLossyPrompt && update.reused_prompt_tokens == kMarker &&
+                    update.processed_prompt_tokens >= last &&
+                    update.processed_prompt_tokens <= kLossyPrompt,
+                "prompt progress left the client's prompt: total " +
+                    std::to_string(update.total_prompt_tokens) + ", processed " +
+                    std::to_string(update.processed_prompt_tokens));
+        last = update.processed_prompt_tokens;
+    }
+    require(last == kLossyPrompt, "prompt progress did not reach the original length: " +
+                                      std::to_string(last));
+}
+
+// SummaryRewriteReportsOriginal: a prompt the summary strategy rewrote runs as an ordinary prompt
+// (no scout), and usage, prompt progress, the request log and the counters count the client's.
+void test_summary_rewrite_reports_original() {
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000,
+             .lossy_strategy = LossyStrategy::Summary});
+    const compaction::SummaryRewrite rewrite{.original_tokens = 40000,
+                                             .prompt_tokens   = 9000,
+                                             .common_prefix   = 2000,
+                                             .common_suffix   = 6000,
+                                             .messages        = {4, 180},
+                                             .fresh           = true};
+    const auto record = [](compaction::SummaryRewrite r) {
+        return compaction::SummaryRecord{.probe = LossySummaryProbe::Cold, .rewrite = r,
+                                         .prompt_tokens = r.prompt_tokens};
+    };
+    ProgressSink sink;
+    auto result = rig.run_prompt(lossy_prompt(1, 9000), 2, nullptr, &sink, record(rewrite));
+    require(finished(result), "the summarised request did not finish\n" + rig.dump());
+    const auto& generation = result.get();
+    require(generation.prompt.prompt_tokens == 40000, "usage prompt_tokens is not the client's");
+    require(generation.computed_prefill_tokens == 9000, "the submitted prompt was not prefilled");
+    require(rig.events_of(1, Event::Kind::Scout).empty() &&
+                rig.events_of(1, Event::Kind::EnableLossy).empty(),
+            "a summarised prompt took the token path\n" + rig.dump());
+    const auto& report = generation.lossy_prefill;
+    require(report && report->strategy == LossyStrategy::Summary &&
+                report->outcome == LossyPrefillOutcome::Completed &&
+                report->uncached_tokens == 40000 && report->kept_tokens == 9000 &&
+                report->summarized_messages ==
+                    std::optional(std::array<std::uint32_t, 2>{4, 180}) &&
+                !report->summary_reused && report->summary_probe == LossySummaryProbe::Cold,
+            "the summary report is wrong");
+    {
+        std::lock_guard lock(sink.mutex);
+        require(sink.starts.size() == 1 && sink.starts[0].prompt.prompt_tokens == 40000,
+                "the stream start does not count the client's prompt");
+        std::uint32_t last = 0;
+        for (const auto& update : sink.updates) {
+            require(update.total_prompt_tokens == 40000 && update.processed_prompt_tokens >= last &&
+                        update.processed_prompt_tokens <= 40000,
+                    "prompt progress left the client's prompt");
+            last = update.processed_prompt_tokens;
+        }
+        require(last == 40000, "prompt progress did not reach the client's length: " +
+                                   std::to_string(last));
+    }
+    auto reused       = rewrite;
+    reused.fresh      = false;
+    auto second       = rig.run_prompt(lossy_prompt(2, 9000), 1, nullptr, nullptr, record(reused));
+    require(finished(second), "the reused-summary request did not finish\n" + rig.dump());
+    require(second.get().lossy_prefill && second.get().lossy_prefill->summary_reused,
+            "a substituted summary was not reported as reused");
+    // A long prompt the probe could not settle is left whole: skipped, with the probe's answer.
+    auto timed = rig.run_prompt(lossy_prompt(3, kLossyPrompt), 1, nullptr, nullptr,
+                                compaction::SummaryRecord{.probe         = LossySummaryProbe::Timeout,
+                                                          .prompt_tokens = kLossyPrompt});
+    require(finished(timed), "the probed request did not finish\n" + rig.dump());
+    const auto& skipped = timed.get().lossy_prefill;
+    require(skipped && skipped->strategy == LossyStrategy::Summary &&
+                skipped->outcome == LossyPrefillOutcome::Skipped &&
+                skipped->summary_probe == LossySummaryProbe::Timeout &&
+                skipped->uncached_tokens == kLossyPrompt && skipped->kept_tokens == kLossyPrompt &&
+                !skipped->summarized_messages && timed.get().prompt.prompt_tokens == kLossyPrompt,
+            "a probed, unsummarised prompt's report is wrong");
+    const auto stats = rig.core().runtime_stats();
+    require(stats.lossy_prefill_summaries_new == 1 && stats.lossy_prefill_summaries_reused == 1 &&
+                stats.lossy_prefills_completed == 2 && stats.lossy_prefills_skipped == 1 &&
+                stats.lossy_prefill_scouted_tokens == 0 && stats.prompt_tokens == 80000 + kLossyPrompt,
+            "the summary counters must match the logged outcomes");
+}
+
+// SummaryOutputCappedByOriginal: a shortened prompt may not generate past where the client's own
+// prompt would reach max_context.
+void test_summary_output_capped_by_original() {
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000,
+             .lossy_strategy = LossyStrategy::Summary});
+    const std::uint32_t max_context = 1U << 20; // the Rig's
+    const auto rewrite_with = [](std::uint32_t original) {
+        return compaction::SummaryRewrite{.original_tokens = original,
+                                          .prompt_tokens   = 9000,
+                                          .messages        = {4, 180},
+                                          .fresh           = true};
+    };
+    const compaction::SummaryRewrite rewrite = rewrite_with(max_context - 3);
+    auto result = rig.run_prompt(lossy_prompt(1, 9000), 64, nullptr, nullptr,
+                                 compaction::SummaryRecord{.probe = LossySummaryProbe::Cold,
+                                                           .rewrite = rewrite,
+                                                           .prompt_tokens = 9000});
+    require(finished(result), "the request did not finish\n" + rig.dump());
+    require(result.get().generated_token_ids.size() == 4,
+            "the output was not capped at max_context - original + 1: " +
+                std::to_string(result.get().generated_token_ids.size()));
+    require(result.get().finish_reason == FinishReason::ContextCapacity,
+            "a request stopped by the summary's context cap must end for context capacity");
+    // A cap that does not bind leaves the request's own output limit.
+    auto roomy = rig.run_prompt(lossy_prompt(2, 9000), 8, nullptr, nullptr,
+                                compaction::SummaryRecord{.probe = LossySummaryProbe::Cold,
+                                                          .rewrite = rewrite_with(40000),
+                                                          .prompt_tokens = 9000});
+    require(finished(roomy), "the request did not finish\n" + rig.dump());
+    require(roomy.get().generated_token_ids.size() == 8 &&
+                roomy.get().finish_reason == FinishReason::OutputLimit,
+            "a non-binding summary cap changed the finish reason");
+}
+
+// SummaryStrategyDisablesTokenPath: under --lossy-prefill-strategy summary the core never scouts,
+// even for a cold long prompt the summary did not rewrite (a busy probe counts as warm).
+void test_summary_strategy_disables_token_path() {
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000,
+             .lossy_strategy = LossyStrategy::Summary});
+    auto result = rig.run_prompt(lossy_prompt(1), 1);
+    require(finished(result), "the request did not finish\n" + rig.dump());
+    require(rig.events_of(1, Event::Kind::EnableLossy).empty() &&
+                rig.events_of(1, Event::Kind::Scout).empty() && !result.get().lossy_prefill,
+            "the summary strategy ran the token path\n" + rig.dump());
+    require(total_tokens(rig.events_of(1, Event::Kind::Prefill)) == kLossyPrompt,
+            "the prompt was not prefilled in full");
+}
+
+// PrivateReuseProbe: the summary strategy's probe from a caller thread. An idle Engine with only a
+// shared product prompt cached answers cold; a worker busy past the wait answers warm, in bounded
+// time.
+void test_private_reuse_probe() {
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000,
+             .lossy_strategy = LossyStrategy::Summary, .context_cache = true,
+             .shared_prefixes = {{7, kMarker}}});
+    ResolvedExecutionOptions execution;
+    execution.requested_output_tokens = 1;
+    require(rig.core().has_private_reuse(lossy_prompt(1, kLossyPrompt, 7), execution, kMarker,
+                                         std::chrono::milliseconds(250)) == LossySummaryProbe::Cold,
+            "a prompt only the shared prefix serves was not probed cold");
+    rig.hold_at([](const Event& e) { return e.kind == Event::Kind::Prefill && e.request == 2; });
+    auto busy = rig.run_prompt(lossy_prompt(2, 8192), 1);
+    require(rig.wait_held(), "the worker was not held\n" + rig.dump());
+    const auto started = Clock::now();
+    const auto answer  = rig.core().has_private_reuse(lossy_prompt(3, kLossyPrompt, 7), execution,
+                                                      kMarker, std::chrono::milliseconds(50));
+    const auto waited  = Clock::now() - started;
+    rig.release();
+    require(answer == LossySummaryProbe::Timeout,
+            "a probe the busy worker could not answer was not a timeout");
+    require(waited >= std::chrono::milliseconds(45) && waited < std::chrono::seconds(2),
+            "the probe did not wait its bound");
+    require(rig.core().runtime_stats().lossy_prefill_summary_probe_timeouts == 1,
+            "the timeout was not counted");
+    require(finished(busy), "the held request did not finish\n" + rig.dump());
+    // Between cycles of a running request, the worker answers: a long decode leaves gaps.
+    auto decoding = rig.run_prompt(lossy_prompt(4, 2048), 200);
+    require(rig.wait_for([&] { return !rig.events_of(4, Event::Kind::Decode).empty(); }),
+            "the decode did not start\n" + rig.dump());
+    require(rig.core().has_private_reuse(lossy_prompt(5, kLossyPrompt, 7), execution, kMarker,
+                                         std::chrono::milliseconds(250)) == LossySummaryProbe::Cold,
+            "a decoding worker did not answer the probe between cycles");
+    require(finished(decoding), "the decoding request did not finish\n" + rig.dump());
+}
+
+// StoredSessionProbedWarm: a conversation only the context store holds (admission would hydrate
+// it) is warm, so it is not summarised; one the store does not hold, or holds only within the
+// product prompt, is cold.
+void test_stored_session_probed_warm() {
+    auto bucket = std::make_shared<MemoryBucket>();
+    StoreDirectory directory;
+    ContextStore store(bucket_store_options(directory.path(), bucket));
+    require(store_drained(store), "the start-up refresh did not finish");
+    const auto put = [&](std::uint64_t id, std::uint32_t frontier) {
+        ContextStore::Description description;
+        description.id      = "5e57" + std::to_string(id);
+        description.binding = "fake-binding";
+        description.tokens  = frontier;
+        description.checkpoints.push_back({.frontier = frontier, .digests = {id, 0}, .identity_tag = 0});
+        std::vector<std::uint8_t> image(64 + 4096, static_cast<std::uint8_t>(id));
+        (void)store.put(description, image, std::array{ContextStore::Region{64, 4096}});
+        require(store.find(description.id).has_value(), "the session was not stored");
+    };
+    put(7, 30'000);
+    put(9, 1'000);
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000,
+             .lossy_strategy = LossyStrategy::Summary});
+    rig.attach_store(store, std::chrono::seconds(2));
+    ResolvedExecutionOptions execution;
+    execution.requested_output_tokens = 1;
+    const auto probe = [&](std::uint64_t id) {
+        return rig.core().has_private_reuse(fake::PreparedPrompt{kLossyPrompt, id}, execution, kMarker,
+                                            std::chrono::milliseconds(250));
+    };
+    require(probe(7) == LossySummaryProbe::Warm, "a session the store holds was probed cold");
+    require(probe(8) == LossySummaryProbe::Cold, "a session the store does not hold was probed warm");
+    require(probe(9) == LossySummaryProbe::Cold,
+            "a stored prefix within the product prompt made the prompt warm");
+}
+
+// LossyCountersAndRequestLog: one completed, one skipped (the selection kept everything) and one
+// declined (the scout was taken), with their tokens and the request's report.
+void test_lossy_counters_and_request_log() {
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000});
+    auto completed = rig.run_prompt(lossy_prompt(1), 1);
+    require(finished(completed), "the lossy request did not finish\n" + rig.dump());
+    const auto report = completed.get().lossy_prefill;
+    require(report && report->outcome == LossyPrefillOutcome::Completed &&
+                report->uncached_tokens == kLossyPrompt - kMarker &&
+                report->kept_tokens == kLossyKept && report->filter_layer == 7 &&
+                report->scout_ms > 0.0 && report->main_ms > 0.0,
+            "the completed request's lossy report is wrong");
+    rig.program().set_lossy_keep(1.0);
+    auto skipped = rig.run_prompt(lossy_prompt(2), 1);
+    require(finished(skipped), "the skipped request did not finish\n" + rig.dump());
+    const auto skipped_report = skipped.get().lossy_prefill;
+    require(skipped_report && skipped_report->outcome == LossyPrefillOutcome::Skipped &&
+                skipped_report->kept_tokens == kLossyPrompt - kMarker,
+            "the skipped request's lossy report is wrong");
+    require(total_tokens(rig.events_of(2, Event::Kind::Prefill)) == kLossyPrompt,
+            "a selection that kept everything did not prefill in full");
+    auto stats = rig.core().runtime_stats();
+    require(stats.lossy_prefills_completed == 1 && stats.lossy_prefills_skipped == 1 &&
+                stats.lossy_prefills_aborted == 0,
+            "the outcomes were not counted");
+    require(stats.lossy_prefill_scouted_tokens == 2ULL * (kLossyPrompt - kMarker) &&
+                stats.lossy_prefill_kept_tokens == kLossyKept + (kLossyPrompt - kMarker),
+            "scouted or kept tokens were not counted: " +
+                std::to_string(stats.lossy_prefill_scouted_tokens) + " / " +
+                std::to_string(stats.lossy_prefill_kept_tokens));
+    require(stats.lossy_prefill_alias_hits == 0, "an alias hit was counted without a rewrite");
+
+    // Two lanes, one scout: the second request reaches M while the first scouts and declines.
+    Rig two({.chunk = kLossyChunk, .lanes = 2, .lossy_min_tokens = 30000});
+    two.hold_at([](const Event& e) {
+        return e.kind == Event::Kind::Scout && e.request == 1 && e.position == kMarker + kLossyChunk;
+    });
+    auto first = two.run_prompt(lossy_prompt(1), 1);
+    require(two.wait_held(), "the first scout never reached its second step\n" + two.dump());
+    auto second = two.run_prompt(lossy_prompt(2), 1);
+    // Let the second request bind (one binding a cycle) while the first scout is held.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    two.release();
+    require(finished(first) && finished(second), "a request did not finish\n" + two.dump());
+    const auto declined = second.get().lossy_prefill;
+    require(declined && declined->outcome == LossyPrefillOutcome::Declined &&
+                declined->kept_tokens == kLossyPrompt - kMarker,
+            "the second request did not decline the busy scout\n" + two.dump());
+    require(two.events_of(2, Event::Kind::Scout).empty() &&
+                total_tokens(two.events_of(2, Event::Kind::Prefill)) == kLossyPrompt,
+            "a declined request scouted or did not prefill in full\n" + two.dump());
+    const auto two_stats = two.core().runtime_stats();
+    require(two_stats.lossy_prefills_completed == 1 && two_stats.lossy_prefills_skipped == 1 &&
+                two_stats.lossy_prefill_scouted_tokens == kLossyPrompt - kMarker &&
+                two_stats.lossy_prefill_kept_tokens == kLossyKept,
+            "a declined request was not counted skipped, or its tokens were counted as scouted");
+}
+
+// A request on the lossy path that fails before its outcome is counted aborted, so the outcomes
+// add up to the requests that took the path.
+void test_lossy_failure_counts_aborted() {
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000});
+    rig.hold_at([](const Event& e) {
+        return e.kind == Event::Kind::Scout && e.request == 1 && e.position == kMarker + kLossyChunk;
+    });
+    auto result = rig.run_prompt(lossy_prompt(1), 1);
+    require(rig.wait_held(), "the scout never reached its second step\n" + rig.dump());
+    arm_worker_failures(1); // the held scout step throws once it has run
+    rig.release();
+    bool failed = false;
+    try {
+        (void)finished(result);
+    } catch (const std::exception&) { failed = true; }
+    arm_worker_failures(0);
+    require(failed, "the injected failure did not fail the request\n" + rig.dump());
+    const auto stats = rig.core().runtime_stats();
+    require(stats.lossy_prefills_aborted == 1 && stats.lossy_prefills_completed == 0 &&
+                stats.lossy_prefills_skipped == 0,
+            "a lossy request that failed was not counted aborted");
+    // The Engine recovered: the next lossy request runs to its outcome.
+    auto next = rig.run_prompt(lossy_prompt(2), 1);
+    require(finished(next), "the Engine did not serve after the failure\n" + rig.dump());
+    require(rig.core().runtime_stats().lossy_prefills_completed == 1,
+            "the request after the failure was not counted");
+}
+
+// The backlog prices a lossy prefill as its scout and the main pass over the kept share.
+void test_lossy_backlog_predicts_scout_and_main() {
+    Rig rig({.chunk = kLossyChunk, .lanes = 1, .lossy_min_tokens = 30000});
+    std::optional<double> at_scout;
+    std::mutex sample_mutex;
+    rig.program().before_unit = [&](const Event& event) {
+        if (event.kind != Event::Kind::Scout || event.position != kMarker) { return; }
+        std::lock_guard lock(sample_mutex);
+        if (!at_scout) { at_scout = rig.core().runtime_stats().prefill_backlog_seconds; }
+    };
+    auto result = rig.run_prompt(lossy_prompt(1), 1);
+    require(finished(result), "the lossy request did not finish\n" + rig.dump());
+    // At M: the scout over U at its quarter share, (10 x 10 ms + 37,952 x 0.1 ms) / 4 = 974 ms, and
+    // the main pass over 7,591 kept tokens, 2 x 10 ms + 759 ms. A full prefill of U would be 3.9 s.
+    std::lock_guard lock(sample_mutex);
+    require(at_scout.has_value(), "the backlog was not sampled at the scout");
+    require(*at_scout > 1.6 && *at_scout < 1.9,
+            "the backlog at M predicted " + std::to_string(*at_scout) + " s");
+}
+
 } // namespace
 
 int main() {
@@ -1148,5 +2131,31 @@ int main() {
         test_a_fetch_must_fit_the_requests_remaining_deadline);
     run("a stalled listing releases the request at its budget",
         test_a_stalled_listing_releases_the_request_at_its_budget);
+    run("an unrelated removal does not rewrite stored sessions",
+        test_an_unrelated_removal_does_not_rewrite_stored_sessions);
+    run("a session the store evicted is not written back",
+        test_a_session_the_store_evicted_is_not_written_back);
+    run("a failed write is retried after a removal scan dropped it",
+        test_a_failed_write_is_retried_after_a_removal_scan_dropped_it);
+    run("lost failure reports retry every missing session",
+        test_lost_failure_reports_retry_every_missing_session);
+    run("a foreign image of the same id does not count as stored",
+        test_a_foreign_image_of_the_same_id_does_not_count_as_stored);
+    run("LossyTriggersOnlyWhenCold", test_lossy_triggers_only_when_cold);
+    run("LossyPromptLengthChangeAccepted", test_lossy_prompt_length_change_accepted);
+    run("LossyCancelDuringScout", test_lossy_cancel_during_scout);
+    run("LossyYieldRefusedDuringScout", test_lossy_yield_refused_during_scout);
+    run("LossyResumesAfterExactPause", test_lossy_resumes_after_exact_pause);
+    run("LossySharedSourcePastProductPrompt", test_lossy_shared_source_past_product_prompt);
+    run("LossyPreemptionDuringScout", test_lossy_preemption_during_scout);
+    run("LossyUsageReportsOriginal", test_lossy_usage_reports_original);
+    run("LossyCountersAndRequestLog", test_lossy_counters_and_request_log);
+    run("LossyBacklogPredictsScoutAndMain", test_lossy_backlog_predicts_scout_and_main);
+    run("LossyFailureCountsAborted", test_lossy_failure_counts_aborted);
+    run("SummaryRewriteReportsOriginal", test_summary_rewrite_reports_original);
+    run("SummaryStrategyDisablesTokenPath", test_summary_strategy_disables_token_path);
+    run("PrivateReuseProbe", test_private_reuse_probe);
+    run("StoredSessionProbedWarm", test_stored_session_probed_warm);
+    run("SummaryOutputCappedByOriginal", test_summary_output_capped_by_original);
     return failures == 0 ? 0 : 1;
 }

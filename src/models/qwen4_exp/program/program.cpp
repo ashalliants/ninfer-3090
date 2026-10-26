@@ -1414,6 +1414,7 @@ public:
             }
         }
         base->summary.prompt_tokens          = static_cast<std::uint32_t>(data.token_ids.size());
+        base->summary.reported_prompt_tokens = base->summary.prompt_tokens;
         base->summary.requested_output_tokens = options.requested_output_tokens;
         const std::uint32_t capacity_output  = options_.max_context - base->summary.prompt_tokens + 1U;
         base->summary.effective_output_tokens = std::min(options.requested_output_tokens, capacity_output);

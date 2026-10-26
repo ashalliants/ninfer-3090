@@ -1,7 +1,7 @@
 # RTX 3090 release bundles
 
 Run the Windows packaging script from the repository root after the verified native build exists.
-It reads the release from `VERSION` and needs the matching `RELEASE_NOTES_<version>.md`:
+It reads the release from `VERSION` and needs the matching `docs/release-notes/RELEASE_NOTES_<version>.md`:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1
