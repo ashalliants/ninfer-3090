@@ -110,6 +110,8 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::GGML_IQ4_XS:
     case QType::GGML_IQ3_S:
     case QType::GGML_Q6_K:
+    case QType::GGML_Q5_K:
+    case QType::GGML_Q4_K:
     case QType::GGML_IQ4_NL:
     case QType::GGML_Q8_0:
     case QType::GGML_Q2_0:
@@ -166,6 +168,8 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::GGML_IQ4_XS:
     case QType::GGML_IQ3_S:
     case QType::GGML_Q6_K:
+    case QType::GGML_Q5_K:
+    case QType::GGML_Q4_K:
     case QType::GGML_IQ4_NL:
     case QType::GGML_Q8_0:
     case QType::GGML_Q2_0:

@@ -12,8 +12,9 @@
 // Modified for NInfer: each format is split into a decoder that turns one 32-value sub-block into
 // eight words of four signed int8 values plus its FP32 scale(s), so the dp4a GEMV and the int8 MMA
 // GEMM share one decode; the Q8_1 cast keeps its scale in FP32, multiplies by the reciprocal of
-// the scale and rounds ties to even (ggml divides and rounds ties away), and carries no sum term,
-// because none of the formats here has an offset that needs it.
+// the scale and rounds ties to even (ggml divides and rounds ties away), and carries no sum term;
+// the affine K-quants (Q4_K, Q5_K), whose sub-blocks have an offset, take the sum of each group's
+// codes from the routes instead (AffineSubBlock below).
 //
 // MIT License
 // Copyright (c) 2023-2026 The ggml authors
@@ -44,6 +45,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <type_traits>
 
 // The device copy of ggml's lookup tables (third_party/ggml/ggml-common-tables.h is the one table
 // set; tests read the same header as host arrays). Static per translation unit.
@@ -311,6 +313,77 @@ struct Format<QType::GGML_Q6_K> {
             const int vl = (load_i32_b2(ql + 4 * w) >> low_shift) & 0x0F0F0F0F;
             const int vh = ((load_i32_b2(qh + 4 * w) >> high_shift) & 0x03030303) << 4;
             out.v[w]     = static_cast<int>(__vsubss4(vl | vh, 0x20202020));
+        }
+    }
+};
+
+// The affine K-quants: value l of a sub-block is scale[0] * v_l - offset (v unsigned, at most 31),
+// so its dot product with Q8_1 codes a (scale xd) is xd * (scale[0] * sum(v a) - offset * sum(a)).
+// The routes add -offset * xm with xm = xd * float(sum(a)) after the scale term; the other formats
+// decode to a plain SubBlock and their instances are unchanged.
+struct AffineSubBlock : SubBlock {
+    float offset;
+};
+
+template <QType F>
+inline constexpr bool kAffine = F == QType::GGML_Q4_K || F == QType::GGML_Q5_K;
+
+template <QType F>
+using SubBlockOf = std::conditional_t<kAffine<F>, AffineSubBlock, SubBlock>;
+
+// The scale d * sc and offset dmin * m of sub-block ib of a Q4_K/Q5_K block (ggml's d1 and m1):
+// get_scale_min_k4 over the 12 scale bytes at b + 4, without a branch on ib.
+__device__ __forceinline__ void k_quant_scales(const std::uint8_t* b, int ib, AffineSubBlock& out) {
+    const int i   = ib & 3;
+    const int a0  = b[4 + i];
+    const int a1  = b[8 + i];
+    const int a2  = b[12 + i];
+    const int sc  = ib < 4 ? (a0 & 63) : ((a2 & 0x0F) | ((a0 >> 6) << 4));
+    const int m   = ib < 4 ? (a1 & 63) : ((a2 >> 4) | ((a1 >> 6) << 4));
+    out.scale[0]  = out.scale[1] = load_half(b) * static_cast<float>(sc);
+    out.offset    = load_half(b + 2) * static_cast<float>(m);
+}
+
+// Q4_K: {fp16 d; fp16 dmin; u8 scales[12]; u8 qs[128]} per 256 values. Sub-block ib takes the low
+// (even ib) or high (odd ib) nibbles of qs[32 (ib / 2)..+31]. Rows are 16-byte aligned
+// (ggml_dispatch.cpp) and blocks 144 bytes, so the codes are 16-byte aligned.
+template <>
+struct Format<QType::GGML_Q4_K> {
+    static constexpr int kBlockValues = 256, kBlockBytes = 144;
+    static constexpr bool kSplitScale = false;
+    __device__ static void decode(const std::uint8_t* row, int s, const Tables&, AffineSubBlock& out) {
+        const std::uint8_t* b = row + (s >> 3) * kBlockBytes;
+        const int ib          = s & 7;
+        k_quant_scales(b, ib, out);
+        const auto* qs     = reinterpret_cast<const uint4*>(b + 16 + 32 * (ib >> 1));
+        const uint4 q0     = qs[0];
+        const uint4 q1     = qs[1];
+        const std::uint32_t words[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+        const int shift    = 4 * (ib & 1);
+#pragma unroll
+        for (int w = 0; w < 8; ++w) out.v[w] = static_cast<int>((words[w] >> shift) & 0x0F0F0F0FU);
+    }
+};
+
+// Q5_K: {fp16 d; fp16 dmin; u8 scales[12]; u8 qh[32]; u8 qs[128]} per 256 values: Q4_K's nibble
+// plus 16 times bit ib of qh[l]. 176-byte blocks keep qh and qs 16-byte aligned in an aligned row.
+template <>
+struct Format<QType::GGML_Q5_K> {
+    static constexpr int kBlockValues = 256, kBlockBytes = 176;
+    static constexpr bool kSplitScale = false;
+    __device__ static void decode(const std::uint8_t* row, int s, const Tables&, AffineSubBlock& out) {
+        const std::uint8_t* b = row + (s >> 3) * kBlockBytes;
+        const int ib          = s & 7;
+        k_quant_scales(b, ib, out);
+        const auto* qh     = reinterpret_cast<const uint4*>(b + 16);
+        const auto* qs     = reinterpret_cast<const uint4*>(b + 48 + 32 * (ib >> 1));
+        const uint4 h0 = qh[0], h1 = qh[1], q0 = qs[0], q1 = qs[1];
+        const std::uint32_t high[8]  = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
+        const std::uint32_t words[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+        const int shift = 4 * (ib & 1);
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            out.v[w] = static_cast<int>(((words[w] >> shift) & 0x0F0F0F0FU) | (((high[w] >> ib) & 0x01010101U) << 4));
         }
     }
 };

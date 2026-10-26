@@ -83,9 +83,12 @@ rows).
 
 The C++ registry accepts the GGML block and expert record formats and materializes them to Device,
 Host or Pinned memory unchanged. Linear and LinearAdd consume `ggml_iq4_xs`, `ggml_iq3_s`, `ggml_q6_k`,
-`ggml_iq4_nl`, `ggml_q8_0` and `ggml_q2_0` at the registered problems in
+`ggml_q5_k`, `ggml_q4_k`, `ggml_iq4_nl`, `ggml_q8_0` and `ggml_q2_0` at the registered problems in
 [`linear.h`](../../include/ninfer/ops/linear.h) and
-[`linear_add.h`](../../include/ninfer/ops/linear_add.h), through their Q8_1 activation profile.
+[`linear_add.h`](../../include/ninfer/ops/linear_add.h), through their Q8_1 activation profile
+(for the affine `ggml_q4_k` and `ggml_q5_k`, each 32-value sub-block's min term is formed from the
+sum of its Q8_1 codes, as llama.cpp's `vec_dot_q4_K_q8_1` does), and projection_fp32's GGML head
+form consumes `ggml_iq4_xs`, `ggml_q6_k` and `ggml_q5_k`.
 `ggml_iq2_xs` and `ggml_iq3_xxs` have a device sub-block decoder in the GGML linears
 (`src/ops/linear/ggml/ggml_blocks.cuh`) but no registered problem, so no Op consumes them yet.
 offloaded_sparse_moe consumes the twelve text expert record formats through its canonical A8

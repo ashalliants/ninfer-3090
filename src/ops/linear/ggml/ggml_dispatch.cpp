@@ -47,8 +47,11 @@ void validate_weight(const Weight& w) {
         throw std::invalid_argument("ggml linear: weight must be a ggml_blocks_v1 matrix");
     }
     // IQ4_XS reads its codes as 8-byte words (136-byte blocks keep them 8-byte aligned in an
-    // aligned row); every other format reads two-byte words.
-    const std::uintptr_t alignment = w.qtype == QType::GGML_IQ4_XS ? 8 : 2;
+    // aligned row), Q4_K and Q5_K as 16-byte words (144- and 176-byte blocks); every other format
+    // reads two-byte words.
+    const std::uintptr_t alignment = w.qtype == QType::GGML_IQ4_XS                                 ? 8
+                                     : w.qtype == QType::GGML_Q4_K || w.qtype == QType::GGML_Q5_K ? 16
+                                                                                                   : 2;
     if (!aligned(w.qdata, alignment)) {
         throw std::invalid_argument("ggml linear: weight rows are misaligned for their format");
     }
@@ -114,6 +117,10 @@ void ggml_linear_dispatch(const Tensor& x, const Weight& w, Tensor& out, bool re
         return run<QType::GGML_IQ3_S>(x, w, out, residual, workspace, stream);
     case QType::GGML_Q6_K:
         return run<QType::GGML_Q6_K>(x, w, out, residual, workspace, stream);
+    case QType::GGML_Q5_K:
+        return run<QType::GGML_Q5_K>(x, w, out, residual, workspace, stream);
+    case QType::GGML_Q4_K:
+        return run<QType::GGML_Q4_K>(x, w, out, residual, workspace, stream);
     case QType::GGML_IQ4_NL:
         return run<QType::GGML_IQ4_NL>(x, w, out, residual, workspace, stream);
     case QType::GGML_Q8_0:

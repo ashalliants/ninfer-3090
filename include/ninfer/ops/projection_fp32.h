@@ -1,7 +1,7 @@
 #pragma once
 
 // Adapted from Infernix a3edb450 include/infernix/ops/projection_fp32.h (Apache-2.0).
-// Modified for NInfer-3090: the BF16 form plus a GGML IQ4_XS head form (Infernix's
+// Modified for NInfer-3090: the BF16 form plus a GGML IQ4_XS, Q6_K or Q5_K head form (Infernix's
 // q8_g32_fp16/q4_g64_fp16 heads and its BF16 vocabulary-head tall and tensor-core mappings are not
 // ported), and the contract follows op-development §3.
 
@@ -44,7 +44,7 @@ void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Te
                      cudaStream_t stream);
 
 /**
- * Op: projection_fp32, GGML block-format weight (an LM head stored as GGUF IQ4_XS)
+ * Op: projection_fp32, GGML block-format weight (an LM head stored as GGUF IQ4_XS, Q6_K or Q5_K)
  *
  * For vocabulary logits: BF16 logits quantize token probabilities by up to 2^-8 of the logit.
  *
@@ -58,12 +58,15 @@ void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Te
  *   x BF16 [K, T]; weight [N, K]; out FP32 [N, T]. T >= 1.
  *
  * Supported domain:
- *   QType::GGML_IQ4_XS in the ggml_blocks_v1 layout (8-byte aligned rows) with K = 2560 and N even;
+ *   QType::GGML_IQ4_XS (8-byte aligned rows), GGML_Q6_K or GGML_Q5_K (16-byte aligned rows) in the
+ *   ggml_blocks_v1 layout with K = 2560 and N even;
  *   x and out contiguous, x 16-byte aligned.
  *
  * Numeric:
  *   Integer products per 32 values are exact; scaling and the sum over K are FP32, within
- *   sum_k |w xq| * K * 2^-24 of the FP64 dot product of w and xq. A column's results do not depend
+ *   sum_k |w xq| * K * 2^-24 of the FP64 dot product of w and xq. Q5_K is affine (w = d sc q -
+ *   dmin m per 32 values, the min term formed from the sum of the group's Q8_1 codes), and its
+ *   bound sums (|d sc q| + |dmin m|) |xq| instead of |w xq|. A column's results do not depend
  *   on T or on the column's position.
  *
  * Effects: writes out; it must not overlap x or the weight.
