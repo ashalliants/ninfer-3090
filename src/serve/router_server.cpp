@@ -391,8 +391,7 @@ RouterServer::RouterServer(ServeOptions options, ModelRegistry& registry,
                            std::shared_ptr<RoutedPorts> ports,
                            std::shared_ptr<spdlog::logger> logger)
     : options_(std::move(options)),
-      host_policy_(make_host_policy(options_.host, options_.port, options_.allowed_hosts,
-                                    local_machine_name())),
+      host_policy_(make_server_host_policy(options_.host, options_.port, options_.allowed_hosts)),
       registry_(registry), ports_(std::move(ports)), logger_(std::move(logger)),
       response_owners_([this](const std::string& model) {
           // A model the registry does not know cannot come from a lease; the router-wide option is

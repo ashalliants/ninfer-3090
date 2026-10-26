@@ -543,8 +543,8 @@ struct FakeModelServer {
     }
 };
 
-// The router's pre-routing handler runs the Host, Origin and Sec-Fetch-Site checks on its public
-// address, ahead of the key, over real HTTP; what a key or --cors lets in also gets through the
+// The router's pre-routing handler runs the Host (keyless only), Origin and Sec-Fetch-Site checks
+// on its public address, ahead of the key, over real HTTP; what a key or --cors lets in also gets through the
 // keyless, CORS-less model behind it (the relay drops Origin and Sec-Fetch-*).
 void router_checks_host_and_origin() {
     enum class Access { Open, Keyed, Cors };
@@ -584,10 +584,13 @@ void router_checks_host_and_origin() {
                                  : access == Access::Keyed ? " (with a key)"
                                                            : " (with --cors)";
         expect(get("/health", {}).first == 200, "a plain request reaches the router" + with);
+        // A keyed router skips the Host check (a rebound page cannot send the key).
         const auto rebound = get("/health", {{"Host", "evil.example:8080"}});
-        expect(rebound.first == 403 &&
-                   rebound.second.find("host_not_allowed") != std::string::npos,
-               "a rebinding Host gets 403 from the router" + with);
+        expect(access == Access::Keyed
+                   ? rebound.first == 200
+                   : rebound.first == 403 &&
+                         rebound.second.find("host_not_allowed") != std::string::npos,
+               "a rebinding Host gets 403 from a keyless router, 200 from a keyed one" + with);
         expect(get("/health", {{"Host", "192.168.1.5:8080"}}).first == 200,
                "an address Host passes the router" + with);
         // The router serves the dashboard page itself, without the key, behind the Host check.
@@ -600,14 +603,18 @@ void router_checks_host_and_origin() {
                    page->body.rfind("<!doctype html>", 0) == 0,
                "the router did not serve the dashboard without a key" + with);
         const auto rebound_page = client.Get("/dashboard", httplib::Headers{{"Host", "evil.example:8080"}});
-        expect(rebound_page && rebound_page->status == 403,
-               "the dashboard skipped the router's Host check" + with);
+        expect(rebound_page && rebound_page->status == (access == Access::Keyed ? 200 : 403),
+               "the dashboard and the router's Host check disagree" + with);
         if (access == Access::Keyed) {
             const auto keyless_status = client.Get("/metrics");
             const auto keyless_post   = client.Post("/dashboard", "", "text/plain");
             expect(keyless_status && keyless_status->status == 401 && keyless_post &&
                        keyless_post->status == 401,
                    "only GET /dashboard skips the router's key");
+            // Any name reaches a keyed router, and the relay (which sends its own Host) gets the
+            // request past the loopback model's Host check.
+            expect(get("/v1/echo?model=a", {{"Host", "gpubox.tailnet.example:8080"}}).first == 200,
+                   "a keyed router did not relay a request under another Host name");
         }
         const auto foreign = get("/v1/models", {{"Origin", "http://evil.example"}});
         const auto cross   = get("/v1/models", {{"Sec-Fetch-Site", "cross-site"}});

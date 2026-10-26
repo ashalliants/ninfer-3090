@@ -5,13 +5,14 @@
 //   - host_rebind_rejected: a name the server does not answer to (evil.example:8080) is refused,
 //     also when it merely ends in or contains an allowed name, carries userinfo or a space;
 //   - host_lan_ip_ok_when_bound: bound to 192.168.1.5, Host 192.168.1.5:8080 passes;
-//   - host_wildcard_machine_name: bound to 0.0.0.0 or ::, the machine name passes, and so does a
-//     LAN address the server cannot know in advance; bound to one address, the machine name does
-//     not;
+//   - host_wildcard_machine_name: bound to 0.0.0.0 or ::, the machine name, its .local name, its
+//     fully qualified name and host.docker.internal pass, and so does a LAN address the server
+//     cannot know in advance; bound to one address, none of those names does;
 //   - host_allowed_flag: each --allowed-host passes, with any port;
-//   - origin_cases: a key or --cors allows any origin; without either, a missing origin and the
-//     server's own origins pass, and a foreign origin, another port, "null" and other schemes
-//     are refused;
+//   - origin_cases: a key or --cors allows any origin; without either, a missing origin, the
+//     server's own origins, an origin equal to the request's accepted Host (an address or proxy
+//     name) and extension/app schemes pass, and a foreign http(s) origin, another port, "null"
+//     and file:// are refused;
 //   - fetch_site_cases: Sec-Fetch-Site: cross-site is refused without a key or --cors; the other
 //     values and its absence pass;
 //   - allowed_host_values: --allowed-host takes names and addresses the Host check can match, and
@@ -96,6 +97,8 @@ void host_lan_ip_ok_when_bound() {
     check(host_allowed(policy, "192.168.1.5"), "bound LAN address without port");
     check(host_allowed(policy, "localhost:8080"), "loopback still allowed");
     check(!host_allowed(policy, "gpubox:8080"), "machine name only when bound to a wildcard");
+    check(!host_allowed(policy, "gpubox.local"), ".local name only when bound to a wildcard");
+    check(!host_allowed(policy, "host.docker.internal"), "Docker's name only for a wildcard");
     check(!host_allowed(policy, "evil.example:8080"), "foreign name");
 
     // Bound to a name, the name passes in any case.
@@ -121,7 +124,26 @@ void host_wildcard_machine_name() {
         check(host_allowed(policy, "[fe80::5]:8080"), "IPv6 LAN address" + at);
         check(!host_allowed(policy, "evil.example:8080"), "foreign name" + at);
         check(!host_allowed(policy, "0.0.0.0.evil.example"), "wildcard text in a name" + at);
+        check(host_allowed(policy, "GpuBox.local:8080"), "mDNS name" + at);
+        check(host_allowed(policy, "host.docker.internal:8080"), "Docker host name" + at);
+        check(!host_allowed(policy, "gpubox.lan"), "a name the machine was not given" + at);
     }
+    // A host name that is already qualified, and the resolver's fully qualified name.
+    const HostPolicy qualified =
+        make_host_policy("0.0.0.0", 8080, kNone, "gpubox.corp.example", "gpubox.lan.example");
+    for (const char* name : {"gpubox.corp.example", "gpubox", "gpubox.local",
+                             "gpubox.lan.example:8080", "host.docker.internal"}) {
+        check(host_allowed(qualified, name), std::string("machine name refused: ") + name);
+    }
+    check(!host_allowed(qualified, "gpubox.corp.example.local"), "only the first label + .local");
+    // On this machine, the looked-up names: whatever they are, the wildcard policy holds them.
+    const std::string machine = ninfer::serve::local_machine_name();
+    const HostPolicy here     = ninfer::serve::make_server_host_policy("0.0.0.0", 8080, kNone);
+    if (!machine.empty()) { check(host_allowed(here, machine), "this machine's name: " + machine); }
+    const std::string fqdn = ninfer::serve::local_machine_fqdn();
+    if (!fqdn.empty()) { check(host_allowed(here, fqdn), "this machine's FQDN: " + fqdn); }
+    const HostPolicy bound = ninfer::serve::make_server_host_policy("127.0.0.1", 8080, kNone);
+    check(!host_allowed(bound, "host.docker.internal"), "a loopback bind adds no machine names");
     // No machine name (the system would not say): the wildcard adds nothing, loopback still works.
     const HostPolicy unnamed = make_host_policy("0.0.0.0", 8080, kNone, "");
     check(host_allowed(unnamed, "localhost:8080"), "loopback without a machine name");
@@ -141,42 +163,80 @@ void host_allowed_flag() {
 void origin_cases() {
     const HostPolicy policy = loopback_policy();
     const char* foreign     = "http://evil.example";
-    check(origin_allowed(policy, foreign, /*has_key=*/true, /*cors=*/false), "key set");
-    check(origin_allowed(policy, foreign, false, /*cors=*/true), "--cors set");
-    check(origin_allowed(policy, "null", true, false), "null origin with a key");
-    check(!origin_allowed(policy, foreign, false, false), "foreign origin without a key");
-    check(!origin_allowed(policy, "https://evil.example:8080", false, false),
+    const char* host        = "localhost:8080";
+    check(origin_allowed(policy, foreign, host, /*has_key=*/true, /*cors=*/false), "key set");
+    check(origin_allowed(policy, foreign, host, false, /*cors=*/true), "--cors set");
+    check(origin_allowed(policy, "null", host, true, false), "null origin with a key");
+    check(!origin_allowed(policy, foreign, host, false, false), "foreign origin without a key");
+    check(!origin_allowed(policy, "https://evil.example:8080", host, false, false),
           "foreign origin on the server's port");
-    check(origin_allowed(policy, "", false, false), "no Origin (non-browser client)");
+    check(origin_allowed(policy, "", host, false, false), "no Origin (non-browser client)");
     for (const char* own : {"http://localhost:8080", "http://127.0.0.1:8080", "http://[::1]:8080",
                             "HTTP://LOCALHOST:8080", "http://localhost.:8080"}) {
-        check(origin_allowed(policy, own, false, false), std::string("own origin refused: ") + own);
+        check(origin_allowed(policy, own, host, false, false),
+              std::string("own origin refused: ") + own);
     }
     for (const char* other :
          {"http://localhost:3000", "http://localhost", "https://localhost",
-          "http://localhost:8080/", "http://user@localhost:8080", "null", "file://",
-          "chrome-extension://abcdef", "localhost:8080", "http://", "http://:8080",
-          "http://localhost:80800", "http://localhost.evil.example:8080"}) {
-        check(!origin_allowed(policy, other, false, false),
+          "http://localhost:8080/", "http://user@localhost:8080", "null", "NULL", "file://",
+          "FILE:///home", "localhost:8080", "http://", "http://:8080", "http://localhost:80800",
+          "http://localhost.evil.example:8080", "://x", "1app://x", "chrome extension://x",
+          "chrome-extension://"}) {
+        check(!origin_allowed(policy, other, host, false, false),
               std::string("foreign origin accepted: ") + other);
+    }
+    // Extension and app-shell origins: a browser gives these only to installed code, never to a
+    // web page, so a page cannot claim one.
+    for (const char* app : {"chrome-extension://abcdefghijklmnop", "moz-extension://1234-abcd",
+                            "safari-web-extension://x", "app://obsidian.md", "tauri://localhost",
+                            "vscode-webview://0abc", "capacitor://localhost"}) {
+        check(origin_allowed(policy, app, host, false, false),
+              std::string("extension or app origin refused: ") + app);
     }
     // The default ports count: a server on 80 is reached from http://name, on 443 from https.
     const HostPolicy on_80 = make_host_policy("127.0.0.1", 80, kNone, "gpubox");
-    check(origin_allowed(on_80, "http://localhost", false, false), "http default port");
-    check(!origin_allowed(on_80, "https://localhost", false, false), "https is port 443");
+    check(origin_allowed(on_80, "http://localhost", "localhost", false, false),
+          "http default port");
+    check(!origin_allowed(on_80, "https://localhost", "localhost:80", false, false),
+          "https is port 443");
     const HostPolicy on_443 = make_host_policy("127.0.0.1", 443, kNone, "gpubox");
-    check(origin_allowed(on_443, "https://localhost", false, false), "https default port");
-    // Unlike the Host check, an address is not enough: the page must be this server's.
+    check(origin_allowed(on_443, "https://localhost", "localhost", false, false),
+          "https default port");
+    // Bound to a wildcard: the machine name is the server's own; a page from another LAN address
+    // is a different site.
     const HostPolicy wildcard = make_host_policy("0.0.0.0", 8080, kNone, "gpubox");
-    check(origin_allowed(wildcard, "http://gpubox:8080", false, false), "machine-name origin");
-    check(!origin_allowed(wildcard, "http://192.168.1.99:8080", false, false),
+    check(origin_allowed(wildcard, "http://gpubox:8080", "gpubox:8080", false, false),
+          "machine-name origin");
+    check(!origin_allowed(wildcard, "http://192.168.1.99:8080", "192.168.1.5:8080", false, false),
           "another LAN page is a different site");
+    // Same origin: the page names the address the request reached, so it came from this server.
+    check(origin_allowed(wildcard, "http://192.168.1.5:8080", "192.168.1.5:8080", false, false),
+          "origin equal to an IPv4 Host");
+    check(origin_allowed(wildcard, "http://[FE80::5]:8080", "[fe80::5]:8080", false, false),
+          "origin equal to an IPv6 Host");
+    check(!origin_allowed(wildcard, "http://192.168.1.5:9000", "192.168.1.5:8080", false, false),
+          "same address, another port");
+    check(origin_allowed(wildcard, "https://192.168.1.5", "192.168.1.5", false, false),
+          "a TLS proxy's page at the address the request reached (both port 443)");
+    check(!origin_allowed(wildcard, "https://192.168.1.5:8080", "192.168.1.5", false, false),
+          "https page on another port than the Host's (443)");
+    check(origin_allowed(on_80, "http://10.0.0.7", "10.0.0.7", false, false),
+          "same origin by default port");
     const std::vector<std::string> allowed{"ninfer.lan"};
     const HostPolicy flagged = make_host_policy("127.0.0.1", 8080, allowed, "gpubox");
-    check(origin_allowed(flagged, "http://ninfer.lan:8080", false, false),
+    check(origin_allowed(flagged, "http://ninfer.lan:8080", "ninfer.lan:8080", false, false),
           "--allowed-host origin on the server's port");
-    check(!origin_allowed(flagged, "http://ninfer.lan:9000", false, false),
+    check(!origin_allowed(flagged, "http://ninfer.lan:9000", "localhost:8080", false, false),
           "--allowed-host origin on another port");
+    // A proxy name in --allowed-host, reached on the proxy's port: Host and Origin agree.
+    check(origin_allowed(flagged, "https://ninfer.lan", "ninfer.lan", false, false),
+          "proxied page whose Origin equals the accepted Host");
+    // A Host the check refuses never makes its origin the server's own (DNS rebinding).
+    check(!origin_allowed(policy, foreign, "evil.example", false, false),
+          "origin equal to a refused Host");
+    check(!origin_allowed(policy, "http://evil.example:8080", "evil.example:8080", false, false),
+          "origin equal to a refused Host, with a port");
+    check(!origin_allowed(policy, "http://10.0.0.7", "", false, false), "no Host header");
 }
 
 void fetch_site_cases() {

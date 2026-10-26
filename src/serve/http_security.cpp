@@ -9,6 +9,8 @@
 #endif
 #include <windows.h>
 #else
+#include <netdb.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #endif
 
@@ -159,7 +161,8 @@ bool constant_time_equal(std::string_view lhs, std::string_view rhs) noexcept {
 }
 
 HostPolicy make_host_policy(std::string_view bind_host, int port,
-                            std::span<const std::string> allowed, std::string_view machine_name) {
+                            std::span<const std::string> allowed, std::string_view machine_name,
+                            std::string_view machine_fqdn) {
     HostPolicy policy;
     const std::string suffix = ":" + std::to_string(port);
     const auto add           = [&](std::string_view raw) {
@@ -173,12 +176,25 @@ HostPolicy make_host_policy(std::string_view bind_host, int port,
     add("127.0.0.1");
     add("[::1]");
     if (is_wildcard(bind_host)) {
+        // The names a LAN, a container or a mesh VPN reaches this machine by. Addresses pass the
+        // Host check anyway; names must be listed.
         add(machine_name);
+        const std::string_view label = machine_name.substr(0, machine_name.find('.'));
+        add(label);
+        if (!label.empty()) { add(std::string(label) + ".local"); }
+        add(machine_fqdn);
+        add("host.docker.internal");
     } else {
         add(bind_host);
     }
     for (const std::string& name : allowed) { add(name); }
     return policy;
+}
+
+HostPolicy make_server_host_policy(std::string_view bind_host, int port,
+                                   std::span<const std::string> allowed) {
+    if (!is_wildcard(bind_host)) { return make_host_policy(bind_host, port, allowed, {}, {}); }
+    return make_host_policy(bind_host, port, allowed, local_machine_name(), local_machine_fqdn());
 }
 
 bool host_allowed(const HostPolicy& policy, std::string_view host_header) {
@@ -192,27 +208,48 @@ bool host_allowed(const HostPolicy& policy, std::string_view host_header) {
     return contains(policy, authority->host);
 }
 
-bool origin_allowed(const HostPolicy& policy, std::string_view origin, bool has_key, bool cors) {
+bool origin_allowed(const HostPolicy& policy, std::string_view origin,
+                    std::string_view host_header, bool has_key, bool cors) {
     if (has_key || cors) { return true; }
     origin = trim(origin);
     if (origin.empty()) { return true; }
-    int default_port = 0;
-    std::string_view rest;
-    constexpr std::string_view http  = "http://";
-    constexpr std::string_view https = "https://";
-    if (origin.size() > http.size() && iequal(origin.substr(0, http.size()), http)) {
+    // scheme "://" authority, the scheme a letter then letters, digits, '+', '-' or '.'. "null"
+    // and anything without "://" fail here.
+    const std::size_t separator = origin.find("://");
+    if (separator == std::string_view::npos || separator == 0) { return false; }
+    const std::string_view scheme = origin.substr(0, separator);
+    const auto is_alpha           = [](char c) {
+        const char low = lower(c);
+        return low >= 'a' && low <= 'z';
+    };
+    if (!is_alpha(scheme.front()) ||
+        !std::all_of(scheme.begin(), scheme.end(), [&](char c) {
+            return is_alpha(c) || is_digit(c) || c == '+' || c == '-' || c == '.';
+        })) {
+        return false;
+    }
+    const std::string_view rest = origin.substr(separator + 3);
+    int default_port            = 0;
+    if (iequal(scheme, "http")) {
         default_port = 80;
-        rest         = origin.substr(http.size());
-    } else if (origin.size() > https.size() && iequal(origin.substr(0, https.size()), https)) {
+    } else if (iequal(scheme, "https")) {
         default_port = 443;
-        rest         = origin.substr(https.size());
     } else {
-        return false; // "null", file:, extension and other schemes
+        // A file page sends "null"; refuse a spelled-out file origin the same way. Any other
+        // scheme belongs to a browser extension or an app shell, which no web page can claim.
+        return !iequal(scheme, "file") && !rest.empty();
     }
     const std::optional<Authority> authority = parse_authority(rest);
     if (!authority) { return false; }
-    return contains(policy,
-                    authority->host + ":" + std::to_string(authority->port.value_or(default_port)));
+    const int port = authority->port.value_or(default_port);
+    if (contains(policy, authority->host + ":" + std::to_string(port))) { return true; }
+    // Same origin: the page names exactly the host and port the request reached, and that Host
+    // passed the Host check (an address, or a name this server answers to).
+    const std::string_view host = trim(host_header);
+    if (host.empty() || !host_allowed(policy, host)) { return false; }
+    const std::optional<Authority> requested = parse_authority(host);
+    return requested && requested->host == authority->host &&
+           requested->port.value_or(default_port) == port;
 }
 
 bool fetch_site_allowed(std::string_view sec_fetch_site, bool has_key, bool cors) {
@@ -249,6 +286,29 @@ std::string local_machine_name() {
     std::array<char, 256> buffer{};
     if (gethostname(buffer.data(), buffer.size() - 1) != 0) { return {}; }
     return std::string(buffer.data());
+#endif
+}
+
+std::string local_machine_fqdn() {
+#if defined(_WIN32)
+    std::array<char, 256> buffer{};
+    DWORD size = static_cast<DWORD>(buffer.size());
+    if (GetComputerNameExA(ComputerNameDnsFullyQualified, buffer.data(), &size) == 0) {
+        return {};
+    }
+    return std::string(buffer.data(), size);
+#else
+    const std::string name = local_machine_name();
+    if (name.empty()) { return {}; }
+    addrinfo hints{};
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags    = AI_CANONNAME;
+    addrinfo* found   = nullptr;
+    if (getaddrinfo(name.c_str(), nullptr, &hints, &found) != 0 || found == nullptr) { return {}; }
+    std::string canonical = found->ai_canonname != nullptr ? found->ai_canonname : "";
+    freeaddrinfo(found);
+    return canonical;
 #endif
 }
 

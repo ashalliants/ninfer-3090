@@ -23,8 +23,9 @@ It exits non-zero when any of these happened (exit codes: 0 clean, 1 findings, 2
   - a response status or body that the request kind does not expect, a stream that ended without its
     terminator, an error event inside a stream, or a transport error;
   - a stream with no SSE event for --stall-seconds (counted from the end of the upload until the first event,
-    then from the last event; time the server reports the request as queued in /v1/load does not count); the
-    stalled request is cancelled so the run can finish;
+    then from the last event; time the server reports the request as queued in /v1/load does not count,
+    assuming the server admits in arrival order, which --admission-affinity may break); the stalled request
+    is cancelled so the run can finish;
   - a server queue (/v1/load requests.queue_total > 0) that sits behind an idle lane (/slots) for
     --stall-seconds;
   - resident memory that grew by more than --rss-growth-mib over the last half of the run;
@@ -561,8 +562,12 @@ class Soak:
         """Flag streams quiet for --stall-seconds; time spent in the server's queue is not quiet time.
 
         The server queues in arrival order, so of the requests still awaiting their first event the newest
-        `queue_total` are the queued ones and the older ones hold lanes (prefilling). Each tick the queued
-        ones have their clock reset; a request that holds a lane and says nothing for the limit is a stall.
+        `queue_total` are taken to be the queued ones and the older ones to hold lanes (prefilling). Each
+        tick the queued ones have their clock reset; a request that holds a lane and says nothing for the
+        limit is a stall. The bypass allowance and --admission-affinity can admit a newer waiter first:
+        then a still-queued older request is not credited (a long wait can read as a stall) and the newer
+        one in a lane is (its silence counts only once the queue empties). /v1/load lists waiters but not
+        which of this run's requests they are, so the arrival-order guess stays.
         """
         now = time.perf_counter_ns()
         limit_ns = int(self.args.stall_seconds * NS)
