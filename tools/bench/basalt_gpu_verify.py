@@ -152,6 +152,13 @@ class Ctx:
         value = getattr(self.args, flag.lstrip("-").replace("-", "_"))
         return str(value) if value else None
 
+    def need_model(self, name: str) -> str:
+        """The artifact of a model a step needs (missing_inputs has already checked it is given)."""
+        path = self.model(name)
+        if path is None:
+            raise RuntimeError(f"{self.config['models'][name]['input']} is required here")
+        return path
+
     def model_env(self, name: str) -> dict[str, str]:
         path = self.model(name) or ""
         return {key: value.replace("{model}", path) for key, value in self.config["models"][name]["env"].items()}
@@ -171,7 +178,9 @@ class Step:
     data: dict = field(default_factory=dict)
 
 
-def quote(argv: list[str]) -> str:
+def quote(argv: list[str] | str) -> str:
+    if isinstance(argv, str):  # a command line already (cmd's own quoting)
+        return argv
     return " ".join(f'"{a}"' if (" " in a or not a) else a for a in map(str, argv))
 
 
@@ -241,16 +250,28 @@ def http(port: int, path: str, *, host: str | None = None, headers: dict | None 
 
 
 class Server:
-    """A ninfer-serve (or launcher) process this script started, stopped by its own PID only."""
+    """A ninfer-serve (or launcher) process this script started, stopped by its own PID only.
 
-    def __init__(self, argv: list[str], log: Path, env: dict[str, str] | None, port: int, windows: bool):
+    argv is a list, or on Windows a command line string (the launcher smoke hands cmd its own
+    quoting). Process groups follow the real OS, not --platform.
+    """
+
+    def __init__(self, argv: list[str] | str, log: Path, env: dict[str, str] | None, port: int,
+                 windows: bool):
         log.parent.mkdir(parents=True, exist_ok=True)
-        self.log, self.port, self.windows = log, port, windows
+        self.log, self.port = log, port
+        self.windows = os.name == "nt"
         self.handle = open(log, "w", encoding="utf-8", errors="replace")
         print(f"    $ {quote(argv)}  (server, log {log})", flush=True)
-        extra = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if windows else {"start_new_session": True}
-        self.proc = subprocess.Popen([str(a) for a in argv], stdout=self.handle, stderr=subprocess.STDOUT,
-                                     stdin=subprocess.DEVNULL, env={**os.environ, **(env or {})}, **extra)
+        command = argv if isinstance(argv, str) else [str(a) for a in argv]
+        full_env = {**os.environ, **(env or {})}
+        if self.windows:
+            self.proc = subprocess.Popen(command, stdout=self.handle, stderr=subprocess.STDOUT,
+                                         stdin=subprocess.DEVNULL, env=full_env,
+                                         creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        else:
+            self.proc = subprocess.Popen(command, stdout=self.handle, stderr=subprocess.STDOUT,
+                                         stdin=subprocess.DEVNULL, env=full_env, start_new_session=True)
 
     def wait_ready(self, timeout: float = 1800.0) -> bool:
         deadline = time.monotonic() + timeout
@@ -274,12 +295,12 @@ class Server:
             if self.windows:  # the launcher's cmd and the server it started: this tree only
                 subprocess.run(["taskkill", "/PID", str(self.proc.pid), "/T", "/F"], capture_output=True)
             else:
-                os.killpg(self.proc.pid, signal.SIGTERM)
+                getattr(os, "killpg")(self.proc.pid, signal.SIGTERM)
             try:
                 self.proc.wait(timeout=60)
             except subprocess.TimeoutExpired:
                 if not self.windows:
-                    os.killpg(self.proc.pid, signal.SIGKILL)
+                    getattr(os, "killpg")(self.proc.pid, getattr(signal, "SIGKILL"))
                 self.proc.wait(timeout=30)
         self.handle.close()
 
@@ -427,7 +448,14 @@ def run_tests_step(ctx: Ctx, step: Step) -> dict:
     detail = f"{len(passed)} passed, {len(skipped)} skipped, {len(failed)} failed"
     if skipped:
         detail += " (skipped: " + ", ".join(skipped) + ")"
-    status = "FAIL" if failed or code != 0 else ("PASS" if passed else "SKIP")
+    supplied = any((step.data.get("env") or {}).values())
+    if failed or code != 0:
+        status = "FAIL"
+    elif skipped and supplied:  # the model was given, so a skip means a test never reached it
+        status = "REVIEW"
+        detail += "; a model was given, so each skip needs a look (wrong artifact, missing drafter?)"
+    else:
+        status = "PASS" if passed else "SKIP"
     return result(status, detail, names=names, passed=passed, skipped=skipped, failed=failed, outcome=outcome)
 
 
@@ -454,9 +482,9 @@ def run_identity_step(ctx: Ctx, step: Step) -> dict:
     if any(o["exit"] not in (0, 77) for o in outcomes):
         bad = next(o for o in outcomes if o["exit"] not in (0, 77))
         return result("FAIL", f"{' '.join(bad['command'][:2])} exited {bad['exit']}: {bad['tail']}", runs=outcomes)
-    if any(o["exit"] == 77 for o in outcomes):
-        return result("SKIP", "a harness skipped (77): " + next(o["tail"] for o in outcomes if o["exit"] == 77),
-                      runs=outcomes)
+    if any(o["exit"] == 77 for o in outcomes):  # the model was given (the step needs it), so 77 is wrong
+        return result("FAIL", "a harness skipped (77) although the model was given: "
+                      + next(o["tail"] for o in outcomes if o["exit"] == 77), runs=outcomes)
     return result("PASS", f"{len(outcomes)} harness run(s) passed", runs=outcomes)
 
 
@@ -466,6 +494,12 @@ def kld_tsv(ctx: Ctx, name: str) -> Path:
 
 def run_kld_step(ctx: Ctx, step: Step) -> dict:
     d = step.data
+    gate = d.get("gate")
+    if gate:  # the 100-chunk run waits for its 20-chunk run
+        prior = load_result(ctx, gate)
+        if not prior or prior["status"] not in ("PASS", "MEASURED"):
+            state = prior["status"] if prior else "not run"
+            return result("SKIP", f"{gate} has not passed ({state}), so the 100-chunk run waits for it")
     tsv = kld_tsv(ctx, d["name"])
     tsv.parent.mkdir(parents=True, exist_ok=True)
     argv = [str(ctx.tests), "ninfer_qwen4_exp_forward_real_test", "--kld-base", str(ctx.args.kld_base_flash_next),
@@ -493,7 +527,8 @@ def run_kld_step(ctx: Ctx, step: Step) -> dict:
         detail = ("the rows equal the option-off run bit for bit: the option did not reach the forward"
                   if rows["identical"] else
                   f"KLD mean {summary['kld_mean']:.6f} ({delta.get('kld_mean', 0):+.6f} vs off), same top-1 "
-                  f"{summary.get('same_top1', 0):.2f}% ({delta.get('same_top1', 0):+.2f}), PPL {summary.get('ppl', 0):.4f}")
+                  f"{summary.get('same_top1', 0):.2f}% ({delta.get('same_top1', 0):+.2f}), "
+                  f"PPL {summary.get('ppl', 0):.4f}")
     return result(status, detail, summary=summary, delta=delta, rows=rows)
 
 
@@ -502,8 +537,8 @@ def run_kld_qwen35_step(ctx: Ctx, step: Step) -> dict:
     out = ctx.out / "kld" / f"qwen35-w{window}"
     if out.exists():
         shutil.rmtree(out)  # ninfer-perplexity refuses a non-empty output directory
-    argv = [str(ctx.exe("apps/ninfer-perplexity")), ctx.model("qwen38-27b"), "--kld-base", str(ctx.args.kld_base_27b),
-            "--chunks", "20", "--decode-window", str(window), "--output", str(out)]
+    argv = [str(ctx.exe("apps/ninfer-perplexity")), ctx.need_model("qwen38-27b"), "--kld-base",
+            str(ctx.args.kld_base_27b), "--chunks", "20", "--decode-window", str(window), "--output", str(out)]
     code, output = run_logged(argv, log_dir(ctx, step) / "perplexity.log")
     if code != 0:
         return result("FAIL", f"exit {code}: {tail(output, 3)}")
@@ -516,7 +551,8 @@ def run_kld_qwen35_step(ctx: Ctx, step: Step) -> dict:
     rows = compare_rows(other, out / "rows.tsv")
     detail = "rows identical at T = 1 and T = 3" if rows["identical"] else \
         f"{rows['differing']} of {rows['rows']} rows differ, max |dnll| {rows['max_abs_dnll']:.3g}, max |dkld| " \
-        f"{rows['max_abs_dkld']:.3g} (a different route per width; Task 2's provisional bound is mean |dlogprob| <= 0.05)"
+        f"{rows['max_abs_dkld']:.3g} (a different route per width; Task 2's provisional bound is mean " \
+        "|dlogprob| <= 0.05)"
     return result("MEASURED", detail, report=report, rows=rows)
 
 
@@ -542,7 +578,7 @@ def run_mma_policy_step(ctx: Ctx, step: Step) -> dict:
         report = log_dir(ctx, step) / f"engine-{arm}"
         argv = ["nsys", "profile", "--force-overwrite", "true", "--trace", "cuda", "-o", str(report), str(ctx.tests),
                 "ninfer_qwen4_exp_engine_real_test", "--bench", "--generate", "16", "--max-context", "8192",
-                *extra, "@" + str(FIXTURES / "qwen4_exp" / "ppl_tokens-chat.ids")]
+                "--no-expert-state", *extra, "@" + str(FIXTURES / "qwen4_exp" / "ppl_tokens-chat.ids")]
         code, output = run_logged(argv, log_dir(ctx, step) / f"profile-{arm}.log", env=ctx.model_env("flash-next"))
         if code != 0:
             return result("FAIL", f"nsys profile ({arm}) exited {code}: {tail(output, 3)}")
@@ -565,35 +601,78 @@ def engine_metric(workload: dict) -> str:
     return label + r"prefill [0-9.]+ s \(([0-9.]+) tok/s\)"
 
 
+JOB_LINE = re.compile(r"^(\S+?): \d+ prompt tokens, [^\n]*ids ([0-9a-f]{16})$", re.MULTILINE)
+SPEC_LINE = re.compile(r"^(\S+?): (mtp rounds [^\n]*)$", re.MULTILINE)
+
+
+def job_name(label: str) -> str:
+    return Path(label.lstrip("@").replace("\\", "/")).name
+
+
+def engine_identity(run_logs: list[Path]) -> dict:
+    """The engine bench's per-job results across every run of an A/B (both arms).
+
+    Each run prints, per job, an FNV hash of its greedy ids and, with MTP, a line of rounds, plain
+    steps, drafts and acceptances. An option designed to keep the output must leave every job's hash
+    and speculation line the same in every run, on and off (a drafter that diverged would change the
+    second while the ids still agree)."""
+    ids: dict[str, set[str]] = {}
+    spec: dict[str, set[str]] = {}
+    runs_seen = 0
+    for log in run_logs:
+        text = log.read_text(encoding="utf-8", errors="replace")
+        runs_seen += 1
+        for label, value in JOB_LINE.findall(text):
+            ids.setdefault(job_name(label), set()).add(value)
+        for label, value in SPEC_LINE.findall(text):
+            spec.setdefault(job_name(label), set()).add(value)
+    complete = runs_seen > 0 and bool(ids) and all(
+        len(re.findall(r"ids [0-9a-f]{16}", log.read_text(encoding="utf-8", errors="replace"))) == len(ids)
+        for log in run_logs)
+    return {"runs": runs_seen, "jobs": sorted(ids),
+            "same_ids": complete and all(len(v) == 1 for v in ids.values()),
+            "same_spec": (all(len(v) == 1 for v in spec.values()) and set(spec) == set(ids)) if spec else None,
+            "ids_differ": sorted(job for job, v in ids.items() if len(v) > 1),
+            "spec_differ": sorted(job for job, v in spec.items() if len(v) > 1)}
+
+
 def run_ab_step(ctx: Ctx, step: Step) -> dict:
     d = step.data
     workload = ctx.config["workloads"][d["workload"]]
     logs = log_dir(ctx, step)
+    same_spec: bool | None = None
     if workload["tool"] == "engine-bench":
         ensure_inputs(ctx)
         command = ["{exe}", "ninfer_qwen4_exp_engine_real_test", *workload["args"],
                    *("@" + ctx.subst(job) for job in workload["jobs"])]
+        # Each arm warm-starts from its own copy of the saved expert state and saves into that copy:
+        # the arms never share a state and the user's <model>.expert-state is only read.
+        states = logs / "state"
+        states.mkdir(parents=True, exist_ok=True)
+        saved = Path(ctx.need_model(workload["model"]) + ".expert-state")
+        a_args, b_args = list(d["a"]), list(d["b"])
+        for arm, extra in (("A", a_args), ("B", b_args)):
+            copy = states / f"{arm}.expert-state"
+            if saved.is_file() and not copy.is_file():
+                shutil.copy2(saved, copy)
+            extra += ["--expert-state", str(copy)]
         report = logs / "ab.json"
         argv = [sys.executable, str(HERE / "run_interleaved_ab.py"), "--arm-a", str(ctx.tests),
-                "--reps", str(ctx.args.reps), f"--a-args={shlex.join(d['a'])}", f"--b-args={shlex.join(d['b'])}",
+                "--reps", str(ctx.args.reps), f"--a-args={shlex.join(a_args)}", f"--b-args={shlex.join(b_args)}",
                 "--config", "run:" + quote(command), "--metric-regex", engine_metric(workload),
                 "--log-dir", str(logs / "runs"), "--json", str(report), "--timeout", "3600", "--quiet"]
         code, output = run_logged(argv, logs / "ab.log", env=ctx.model_env(workload["model"]))
         if not report.is_file():
             return result("FAIL", f"run_interleaved_ab.py exited {code}: {tail(output, 3)}")
         summary = json.loads(report.read_text(encoding="utf-8"))["configs"][0]
-        hashes = {}
-        for log in sorted((logs / "runs").glob("*.log")):
-            match = re.search(re.escape(Path(workload["jobs"][-1]).name) + r": [^\n]*ids ([0-9a-f]{16})",
-                              log.read_text(encoding="utf-8", errors="replace"))
-            hashes[log.stem] = match.group(1) if match else None
-        same_ids = len(set(hashes.values())) == 1 and None not in hashes.values()
+        identity = engine_identity(sorted((logs / "runs").glob("*.log")))
+        same_ids, same_spec = identity["same_ids"], identity["same_spec"]
         stats = {k: summary.get(k) for k in ("pairs", "median", "min", "max", "positive")}
     else:
         prompts = ensure_inputs(ctx)
         serve = str(ctx.serve)
         arm = lambda name, extra: f"{name}={serve}" + (f";add={' '.join(extra)}" if extra else "")  # noqa: E731
-        argv = [sys.executable, str(HERE / "run_chat_decode.py"), "--model", ctx.model(workload["model"]),
+        argv = [sys.executable, str(HERE / "run_chat_decode.py"), "--model", ctx.need_model(workload["model"]),
                 "--prompts", str(prompts), "--out", str(logs / "runs"), "--reps", str(ctx.args.reps),
                 "--arm", arm("off", d["a"]), "--arm", arm("on", d["b"]), "--port", str(free_port()),
                 *workload["args"]]
@@ -601,25 +680,39 @@ def run_ab_step(ctx: Ctx, step: Step) -> dict:
         stats = parse_chat_results(output)
         if code != 0 or not stats["pairs"]:
             return result("FAIL", f"run_chat_decode.py exited {code}: {tail(output, 3)}", **stats)
-        same_ids = chat_outputs_equal(logs / "runs") if "--temperature" in workload["args"] and \
-            workload["args"][workload["args"].index("--temperature") + 1] in ("0", "0.0") else None
-        hashes = {}
-    kind = d["kind"]
+        args = workload["args"]
+        greedy = "--temperature" in args and args[args.index("--temperature") + 1] in ("0", "0.0")
+        same_ids = chat_outputs_equal(logs / "runs") if greedy else None
+        identity = {}
+    return ab_verdict(d, stats, code, output, same_ids, same_spec, identity)
+
+
+def ab_verdict(d: dict, stats: dict, code: int, output: str, same_ids: bool | None, same_spec: bool | None,
+               identity: dict) -> dict:
+    """An A/B's result: the paired numbers, and for an identity option whether the outputs agreed."""
     status = "MEASURED"
-    detail = (f"B/A median {100 * (stats['median'] - 1):+.2f}%, positive {stats['positive']}/{stats['pairs']}, "
-              f"range {100 * (stats['min'] - 1):+.2f}%..{100 * (stats['max'] - 1):+.2f}%") if stats.get("pairs") else \
-        "no complete pairs"
+    if stats.get("pairs"):
+        detail = (f"B/A median {100 * (stats['median'] - 1):+.2f}%, positive {stats['positive']}/{stats['pairs']}, "
+                  f"range {100 * (stats['min'] - 1):+.2f}%..{100 * (stats['max'] - 1):+.2f}%")
+    else:
+        detail = "no complete pairs"
     if not stats.get("pairs") or code != 0:
         status = "FAIL"
         detail += f"; the A/B tool exited {code}: {tail(output, 2)}"
     if same_ids is not None:
-        detail += "; greedy output identical in every run" if same_ids else "; greedy output DIFFERS between runs"
-        if kind == "identity" and not same_ids:
-            status = "FAIL"
+        jobs = len(identity.get("jobs", [])) or None
+        detail += (f"; greedy ids of {'every job' if jobs is None else f'all {jobs} jobs'} identical in every run"
+                   if same_ids else "; greedy ids DIFFER between runs"
+                   + (f" ({', '.join(identity['ids_differ'])})" if identity.get("ids_differ") else ""))
+    if same_spec is not None:
+        detail += ("; MTP rounds, drafts and acceptances identical in every run" if same_spec else
+                   "; MTP rounds, drafts or acceptances DIFFER between runs")
+    if d["kind"] == "identity" and (same_ids is False or same_spec is False):
+        status = "FAIL"
     if "accept_off" in stats:
         detail += f"; acceptance {stats['accept_off']:.1f}% -> {stats['accept_on']:.1f}%"
-    return result(status, detail, wins=status == "MEASURED" and wins(stats), same_ids=same_ids, hashes=hashes,
-                  a=d["a"], b=d["b"], workload=d["workload"], **stats)
+    return result(status, detail, wins=status == "MEASURED" and wins(stats), same_ids=same_ids,
+                  same_spec=same_spec, identity=identity, a=d["a"], b=d["b"], workload=d["workload"], **stats)
 
 
 def chat_outputs_equal(runs: Path) -> bool:
@@ -650,15 +743,24 @@ def ensure_inputs(ctx: Ctx) -> Path:
     return chat
 
 
-def run_combined_step(ctx: Ctx, step: Step) -> dict:
-    include = step.data["include"]
+def combined_choice(ctx: Ctx, step: Step) -> tuple[list[str], list[str]]:
+    """The options a combined row turns on (each one's best winning variant) and their B arguments.
+
+    Options of the step's model and kinds, from variants on the step's source workloads. Without
+    "quality" in the kinds a variant whose B arguments carry a quality option's flag is left out
+    (--hc-fused-read's B holds --hc-int8), so that row stays free of numerics changes."""
+    d = step.data
+    options = ctx.config["options"]
+    quality_flags = {o["flag"] for o in options if o["kind"] == "quality"}
     chosen, args = [], []
-    for option in ctx.config["options"]:
-        if option["kind"] not in include:
+    for option in options:
+        if option["model"] != d["model"] or option["kind"] not in d["include"]:
             continue
         best = None
         for index, variant in enumerate(option.get("ab", [])):
-            if variant["workload"] != step.data["workload"]:
+            if variant["workload"] not in d["from"]:
+                continue
+            if "quality" not in d["include"] and quality_flags & set(variant["b"]):
                 continue
             r = load_result(ctx, ab_id(option, index))
             if r and r["data"].get("wins") and (best is None or r["data"]["median"] > best[1]["data"]["median"]):
@@ -666,30 +768,49 @@ def run_combined_step(ctx: Ctx, step: Step) -> dict:
         if best:
             chosen.append(option["flag"])
             args.append(best[0]["b"])
+    return chosen, union_args(args)
+
+
+def run_combined_step(ctx: Ctx, step: Step) -> dict:
+    chosen, b_args = combined_choice(ctx, step)
     if not chosen:
         return result("SKIP", "no option won its A/B (median >= +1%, 3/4 of pairs positive)", options=[])
-    step.data.update(a=[], b=union_args(args), kind="combined")
+    step.data.update(a=[], b=b_args, kind="combined")
     measured = run_ab_step(ctx, step)
     measured["data"]["options"] = chosen
-    measured["detail"] = f"{len(chosen)} option(s) on ({' '.join(union_args(args))}): " + measured["detail"]
+    measured["detail"] = f"{len(chosen)} option(s) on ({' '.join(b_args)}): " + measured["detail"]
     return measured
 
 
+def chat_prompt_lines() -> list[str]:
+    lines = (REPO / "bench" / "fixtures" / "chat_prompts.jsonl").read_text(encoding="utf-8").splitlines()
+    return [line for line in lines if line.strip()]
+
+
 def run_greedy_master_step(ctx: Ctx, step: Step) -> dict:
+    """One prompt of one configuration, so each lock hold is two CLI runs (Task 33's ledger note)."""
     d = step.data
+    prompts = ctx.out / "inputs" / f"prompt-{d['prompt']}.jsonl"
+    prompts.parent.mkdir(parents=True, exist_ok=True)
+    prompts.write_text(chat_prompt_lines()[d["prompt"] - 1] + "\n", encoding="utf-8")
     argv = [sys.executable, str(HERE / "greedy_identity.py"), "--a", str(ctx.args.master_cli),
-            "--b", str(ctx.exe("apps/ninfer")), "--model", ctx.model(d["model"]), "--tokens", "128",
-            f"--extra-args={d['extra']}"] + (["--limit", str(d["limit"])] if d.get("limit") else [])
+            "--b", str(ctx.exe("apps/ninfer")), "--model", ctx.need_model(d["model"]), "--tokens", "128",
+            "--prompts", str(prompts), f"--extra-args={d['extra']}"]
     code, output = run_logged(argv, log_dir(ctx, step) / "greedy.log")
     verdict = next((line for line in output.splitlines() if line.startswith("GREEDY")), tail(output, 2))
-    return result({0: "PASS", 1: "FAIL"}.get(code, "ERROR"), verdict)
+    return result({0: "PASS", 1: "FAIL"}.get(code, "ERROR"), verdict, config=d["config"], prompt=d["prompt"])
+
+
+def no_state(model: str) -> list[str]:
+    """Flash-Next servers save their expert state beside the model; a check must not touch it."""
+    return ["--no-expert-state"] if model == "flash-next" else []
 
 
 def run_relaxed_startup_step(ctx: Ctx, step: Step) -> dict:
     model = step.data["model"]
     port = free_port()
-    argv = [str(ctx.serve), ctx.model(model), "--host", "127.0.0.1", "--port", str(port), "--max-context", "8192",
-            "--spec", "mtp", "--draft-tokens", "3", "--relaxed-drafting", "0.5"]
+    argv = [str(ctx.serve), ctx.need_model(model), "--host", "127.0.0.1", "--port", str(port), "--max-context",
+            "8192", "--spec", "mtp", "--draft-tokens", "3", "--relaxed-drafting", "0.5", *no_state(model)]
     server = Server(argv, log_dir(ctx, step) / "serve.log", None, port, ctx.windows)
     try:
         if not server.wait_ready():
@@ -707,17 +828,24 @@ def run_relaxed_startup_step(ctx: Ctx, step: Step) -> dict:
         server.stop()
 
 
+def pin_failure_line(line: str) -> bool:
+    """A line reporting a failed pin, and not the page-lock cap warning (which says "fails to pin")."""
+    if "cudaHostRegister" in line or "warning" in line.lower():
+        return False
+    return bool(re.search(r"\bpin|cudaHostAlloc", line, re.I) and re.search(r"fail|error|out of memory", line, re.I))
+
+
 def run_partial_start_step(ctx: Ctx, step: Step) -> dict:
     port = free_port()
-    argv = [str(ctx.serve), ctx.model("flash-next"), "--host", "127.0.0.1", "--port", str(port),
-            "--partial-ram-residency"]
+    argv = [str(ctx.serve), ctx.need_model("flash-next"), "--host", "127.0.0.1", "--port", str(port),
+            "--partial-ram-residency", *no_state("flash-next")]
     server = Server(argv, log_dir(ctx, step) / "serve.log", None, port, ctx.windows)
     try:
         ready = server.wait_ready()
         text = server.output()
-        warning = next((line for line in text.splitlines() if "cudaHostRegister" in line), None)
-        pin_failure = next((line for line in text.splitlines() if re.search(r"pin|cudaHostAlloc", line, re.I)
-                            and re.search(r"fail|error|out of memory", line, re.I)), None)
+        lines = text.splitlines()
+        warning = next((line for line in lines if "cudaHostRegister" in line), None)
+        pin_failure = next((line for line in lines if pin_failure_line(line)), None)
         if ready:
             code, body, _ = http(port, "/v1/chat/completions", body={
                 "messages": [{"role": "user", "content": "Count to five."}], "max_tokens": 32, "temperature": 0})
@@ -732,23 +860,27 @@ def run_partial_start_step(ctx: Ctx, step: Step) -> dict:
 
 
 def run_default_state_step(ctx: Ctx, step: Step) -> dict:
-    model = ctx.model("flash-next")
-    saved = Path(model + ".expert-state")
-    if not saved.is_file():
-        return result("SKIP", f"no saved state {saved}: run a Flash-Next step first (the A/Bs save one)")
+    """A session saves a state of its own (not the user's), which is exported and started from."""
+    model = ctx.need_model("flash-next")
     inputs = ctx.out / "inputs"
     inputs.mkdir(parents=True, exist_ok=True)
-    default = inputs / "flash-next.expert-state.default"
-    code, output = run_logged([str(ctx.exe("tools/ninfer-qwen4-exp-expert-state-export")), str(saved), str(default),
-                               model], log_dir(ctx, step) / "export.log")
+    chat = "@" + str(FIXTURES / "qwen4_exp" / "ppl_tokens-chat.ids")
+    bench = [str(ctx.tests), "ninfer_qwen4_exp_engine_real_test", "--bench", "--generate", "64", "--max-context",
+             "8192"]
+    session, default, fresh = (inputs / name for name in ("session.expert-state", "flash-next.expert-state.default",
+                                                          "fresh-install.expert-state"))
+    for path in (session, fresh):
+        path.unlink(missing_ok=True)
+    code, output = run_logged([*bench, "--expert-state", str(session), chat], log_dir(ctx, step) / "session.log",
+                              env=ctx.model_env("flash-next"))
+    if code != 0 or not session.is_file():
+        return result("FAIL", f"the session run saved no state (exit {code}): {tail(output, 3)}")
+    code, output = run_logged([str(ctx.exe("tools/ninfer-qwen4-exp-expert-state-export")), str(session),
+                               str(default), model], log_dir(ctx, step) / "export.log")
     if code != 0:
         return result("FAIL", f"the exporter exited {code}: {tail(output, 3)}")
-    fresh = inputs / "fresh-install.expert-state"
-    fresh.unlink(missing_ok=True)
-    argv = [str(ctx.tests), "ninfer_qwen4_exp_engine_real_test", "--bench", "--generate", "32", "--max-context",
-            "8192", "--expert-state", str(fresh), "--default-expert-state", str(default),
-            "@" + str(FIXTURES / "qwen4_exp" / "ppl_tokens-chat.ids")]
-    code, output = run_logged(argv, log_dir(ctx, step) / "engine.log", env=ctx.model_env("flash-next"))
+    code, output = run_logged([*bench, "--expert-state", str(fresh), "--default-expert-state", str(default), chat],
+                              log_dir(ctx, step) / "engine.log", env=ctx.model_env("flash-next"))
     used = "default state shipped with the model" in output or "by the default expert state" in output
     if code != 0:
         return result("FAIL", f"the engine bench exited {code}: {tail(output, 3)}")
@@ -763,7 +895,7 @@ def run_serve_smoke_step(ctx: Ctx, step: Step) -> dict:
     config.write_text(json.dumps({"max-context": 8192, "kv-dtype": "int8", "allowed-host": ["gpubox.lan"]},
                                  indent=2) + "\n", encoding="utf-8")
     port = free_port()
-    argv = [str(ctx.serve), ctx.model("qwen38-27b"), "--config", str(config), "--host", "127.0.0.1",
+    argv = [str(ctx.serve), ctx.need_model("qwen38-27b"), "--config", str(config), "--host", "127.0.0.1",
             "--port", str(port), "--admission-affinity"]
     server = Server(argv, log_dir(ctx, step) / "serve.log", None, port, ctx.windows)
     checks: dict[str, bool] = {}
@@ -805,7 +937,7 @@ def run_serve_smoke_step(ctx: Ctx, step: Step) -> dict:
 
 def run_serve_soak_step(ctx: Ctx, step: Step) -> dict:
     port = free_port()
-    argv = [str(ctx.serve), ctx.model("qwen38-27b"), "--host", "127.0.0.1", "--port", str(port), "--max-context",
+    argv = [str(ctx.serve), ctx.need_model("qwen38-27b"), "--host", "127.0.0.1", "--port", str(port), "--max-context",
             "16384", "--max-concurrency", "1", "--admission-affinity"]
     server = Server(argv, log_dir(ctx, step) / "serve.log", None, port, ctx.windows)
     try:
@@ -827,7 +959,7 @@ def run_serve_soak_step(ctx: Ctx, step: Step) -> dict:
 
 
 def run_community_step(ctx: Ctx, step: Step) -> dict:
-    argv = [str(ctx.exe("bench/ninfer_bench")), "--preset", "community-1", "--weights", ctx.model("qwen38-27b"),
+    argv = [str(ctx.exe("bench/ninfer_bench")), "--preset", "community-1", "--weights", ctx.need_model("qwen38-27b"),
             "--submitter", "basalt-gpu-verify"]
     code, output = run_logged(argv, log_dir(ctx, step) / "bench.log")
     row = next((line for line in reversed(output.splitlines()) if line.startswith('{"submitter"')), None)
@@ -870,9 +1002,9 @@ def run_iq3_step(ctx: Ctx, step: Step) -> dict:
     runs = {
         "forward": [str(ctx.tests), "ninfer_qwen4_exp_forward_real_test", chat, "--decode", "4"],
         "engine": [str(ctx.tests), "ninfer_qwen4_exp_engine_real_test", "--bench", "--generate", "64",
-                   "--max-context", "8192", chat],
+                   "--max-context", "8192", "--no-expert-state", chat],
         "engine-partial": [str(ctx.tests), "ninfer_qwen4_exp_engine_real_test", "--bench", "--generate", "64",
-                           "--max-context", "8192", "--partial-ram-residency", chat],
+                           "--max-context", "8192", "--no-expert-state", "--partial-ram-residency", chat],
     }
     if ctx.args.kld_base_flash_next:
         runs["kld"] = [str(ctx.tests), "ninfer_qwen4_exp_forward_real_test", "--kld-base",
@@ -928,7 +1060,9 @@ def run_launcher_step(ctx: Ctx, step: Step) -> dict:
     if ctx.windows:
         if not (target / "run.bat").is_file():
             return result("FAIL", f"{target / 'run.bat'} is missing: the launchers:package step must pass first")
-        argv = ["cmd", "/c", str(target / "run.bat"), key, profile]
+        # One command line, as cmd parses it: /s strips the outer quotes and keeps the inner ones, so
+        # a path with spaces and parentheses survives (a list would be re-quoted by list2cmdline).
+        argv: list[str] | str = f'cmd /d /s /c ""{target / "run.bat"}" {key} {profile}"'
         extra = {}
     else:
         if not (target / "run.sh").is_file():
@@ -937,7 +1071,7 @@ def run_launcher_step(ctx: Ctx, step: Step) -> dict:
             shutil.copytree(REPO / "scripts" / "profiles", target / "profiles", dirs_exist_ok=True)
         argv = ["bash", str(target / "run.sh"), key, profile]
         extra = {"NINFER_SERVER": str(ctx.serve)}
-    full_env = {**env, **extra, "NINFER_MODEL": ctx.model(model), "NINFER_PORT": str(port)}
+    full_env = {**env, **extra, "NINFER_MODEL": ctx.need_model(model), "NINFER_PORT": str(port)}
     server = Server(argv, log_dir(ctx, step) / "launcher.log", full_env, port, ctx.windows)
     try:
         ready = server.wait_ready()
@@ -980,7 +1114,8 @@ def build_steps(ctx: Ctx) -> list[Step]:
         env = {**ctx.model_env(model), "NINFER_CONTEXT_ROWS_SPEC": spec}
         steps.append(Step(f"tests:context-rows-{model}-{spec}", "per-test",
                           f"draft-head context rows on the {model} with {spec}", needs=[model],
-                          show=[f"NINFER_CONTEXT_ROWS_SPEC={spec} " + quote(tests_command(ctx, context_rows["tests"], None))],
+                          show=[f"NINFER_CONTEXT_ROWS_SPEC={spec} "
+                                + quote(tests_command(ctx, context_rows["tests"], None))],
                           run=run_tests_step, data={"regex": context_rows["tests"], "env": env, "names": None}))
 
     # 2. identity runs, one lock hold per option.
@@ -998,9 +1133,10 @@ def build_steps(ctx: Ctx) -> list[Step]:
          "--window", str(window), "--tsv", "<out>/kld/<run>.tsv", *flags])
     for chunks in (20, 100):
         base = f"off-{chunks}"
+        gate = {"gate": "kld:off-20"} if chunks == 100 else {}
         steps.append(Step(f"kld:{base}", "hold", f"KLD gate, every option off, {chunks} chunks, window 3",
                           needs=["flash-next", "--kld-base-flash-next"], show=[kld_cmd(chunks, 3, [])],
-                          run=run_kld_step, data={"name": base, "chunks": chunks, "window": 3}))
+                          run=run_kld_step, data={"name": base, "chunks": chunks, "window": 3, **gate}))
         if chunks == 20:
             steps.append(Step("kld:off-20-w1", "hold", "the window check (Task 3): window 1 must give window 3's rows",
                               needs=["flash-next", "--kld-base-flash-next"], show=[kld_cmd(20, 1, [])],
@@ -1008,10 +1144,12 @@ def build_steps(ctx: Ctx) -> list[Step]:
                                                       "against": base, "expect": "identical"}))
         for option in kld_options:
             name = f"{option['flag'].lstrip('-')}-{chunks}"
-            steps.append(Step(f"kld:{name}", "hold", f"KLD gate with {option['flag']}, {chunks} chunks",
+            gate = {"gate": f"kld:{option['flag'].lstrip('-')}-20"} if chunks == 100 else {}
+            steps.append(Step(f"kld:{name}", "hold", f"KLD gate with {option['flag']}, {chunks} chunks"
+                              + (" (after its 20-chunk run passes)" if gate else ""),
                               needs=["flash-next", "--kld-base-flash-next"], show=[kld_cmd(chunks, 3, [option["kld"]])],
                               run=run_kld_step, data={"name": name, "chunks": chunks, "window": 3,
-                                                      "flags": [option["kld"]], "against": base}))
+                                                      "flags": [option["kld"]], "against": base, **gate}))
     for window in (1, 3):
         steps.append(Step(f"kld-qwen35:w{window}", "hold", f"ninfer-perplexity --kld-base on the 27B, window {window}",
                           needs=["qwen38-27b", "--kld-base-27b"],
@@ -1046,24 +1184,37 @@ def build_steps(ctx: Ctx) -> list[Step]:
                               needs=[workload["model"]], show=[show], run=run_ab_step,
                               data={**variant, "kind": option["kind"]}))
 
-    # 5. the combined rows.
-    for name, include in (("identity", ("identity", "speed")), ("all", ("identity", "speed", "quality"))):
+    # 5. the combined rows: each turns on every winning option of its model and kinds at once.
+    q27 = [name for name, w in config["workloads"].items() if w["model"] == "qwen38-27b"]
+    for name, model, workload, sources, include in (
+            ("identity", "flash-next", "fn-decode-mtp", ["fn-decode-mtp"], ("identity", "speed")),
+            ("all", "flash-next", "fn-decode-mtp", ["fn-decode-mtp"], ("identity", "speed", "quality")),
+            ("prefill", "flash-next", "fn-prefill-2k", ["fn-prefill-2k"], ("identity", "speed", "quality")),
+            ("qwen38-27b", "qwen38-27b", "q27-chat-sampled-dflash2", q27, ("identity", "speed", "quality"))):
         steps.append(Step(f"combined:{name}", "hold",
-                          f"every winning {'/'.join(include)} option on at once, on fn-decode-mtp",
-                          needs=["flash-next"], show=["run_interleaved_ab.py ... --b-args='<the winners' B arguments>'"],
-                          run=run_combined_step, data={"workload": "fn-decode-mtp", "include": include}))
+                          f"every winning {'/'.join(include)} {model} option on at once, on {workload}",
+                          needs=[model], show=[f"the {workload} A/B with B = the winners' B arguments"],
+                          run=run_combined_step, data={"workload": workload, "model": model, "from": sources,
+                                                       "include": include}))
 
-    # 6. the ledger's checks.
+    # 6. the ledger's checks. Every option off against master: one step per configuration and prompt,
+    #    so each lock hold is two CLI processes, not a whole prompt set.
+    prompt_count = len(chat_prompt_lines())
     for model, label, extra, limit in (("qwen38-27b", "dflash2", "--spec dflash2 --draft-tokens 6", None),
                                        ("qwen38-27b", "mtp", "--spec mtp --draft-tokens 3", None),
                                        ("qwen38-27b", "none", "", None),
                                        ("flash-next", "plain", "", 8),
                                        ("flash-next", "mtp", "--spec mtp --draft-tokens 3", 8)):
-        steps.append(Step(f"greedy-master:{model}-{label}", "hold", f"every option off: greedy ids equal master's "
-                          f"({model}, {label})", needs=[model, "--master-cli", "exe:apps/ninfer"],
-                          show=[f"greedy_identity.py --a <master ninfer> --b {ctx.exe('apps/ninfer')} --model <{model}> "
-                                f"--tokens 128 --extra-args='{extra}'" + (f" --limit {limit}" if limit else "")],
-                          run=run_greedy_master_step, data={"model": model, "extra": extra, "limit": limit}))
+        config_id = f"{model}-{label}"
+        for prompt in range(1, (limit or prompt_count) + 1):
+            steps.append(Step(f"greedy-master:{config_id}:{prompt}", "hold",
+                              f"every option off: greedy ids equal master's ({config_id}, prompt {prompt})",
+                              needs=[model, "--master-cli", "exe:apps/ninfer"],
+                              show=[f"greedy_identity.py --a <master ninfer> --b {ctx.exe('apps/ninfer')} "
+                                    f"--model <{model}> --tokens 128 --prompts <out>/inputs/prompt-{prompt}.jsonl "
+                                    f"--extra-args='{extra}'"] if prompt == 1 else [],
+                              run=run_greedy_master_step,
+                              data={"model": model, "extra": extra, "prompt": prompt, "config": config_id}))
     for model in ("qwen38-27b", "qwen36-35b", "flash-next"):
         steps.append(Step(f"relaxed-startup:{model}", "hold", f"ninfer-serve --relaxed-drafting starts on the {model}",
                           needs=[model], show=[f"{ctx.serve} <{model}> --spec mtp --relaxed-drafting 0.5"],
@@ -1071,9 +1222,10 @@ def build_steps(ctx: Ctx) -> list[Step]:
     steps.append(Step("partial-start", "hold", "a --partial-ram-residency start (page-lock warning, pinning)",
                       needs=["flash-next"], show=[f"{ctx.serve} <flash-next> --partial-ram-residency"],
                       run=run_partial_start_step))
-    steps.append(Step("default-expert-state", "hold", "export the saved expert state and start from it",
+    steps.append(Step("default-expert-state", "hold", "a session's saved state, exported, then started from",
                       needs=["flash-next", "exe:tools/ninfer-qwen4-exp-expert-state-export"],
-                      show=["ninfer-qwen4-exp-expert-state-export <model>.expert-state <default> <model>",
+                      show=["engine bench --expert-state <out>/inputs/session.expert-state",
+                            "ninfer-qwen4-exp-expert-state-export <session> <default> <model>",
                             "engine bench --expert-state <absent> --default-expert-state <default>"],
                       run=run_default_state_step))
     steps.append(Step("serve-smoke", "hold", "a real 27B server: Host/Origin checks, /slots, /dashboard, /metrics",
@@ -1140,19 +1292,112 @@ def run_preflight(ctx: Ctx, step: Step) -> dict:
     rev = subprocess.run(["git", "-C", str(REPO), "describe", "--always", "--dirty", "--abbrev=12"],
                          capture_output=True, text=True)
     info["commit"] = rev.stdout.strip()
-    smi = subprocess.run(["nvidia-smi", "--query-gpu=name,driver_version,power.limit,memory.total",
-                          "--format=csv,noheader"], capture_output=True, text=True) if shutil.which("nvidia-smi") else None
+    smi = None
+    if shutil.which("nvidia-smi"):
+        smi = subprocess.run(["nvidia-smi", "--query-gpu=name,driver_version,power.limit,memory.total",
+                              "--format=csv,noheader"], capture_output=True, text=True)
     info["gpu"] = smi.stdout.strip() if smi and smi.returncode == 0 else "nvidia-smi unavailable"
-    info["inputs"] = {name: ctx.model(name) for name in ctx.config["models"]}
+    inputs: dict[str, object] = {name: ctx.model(name) for name in ctx.config["models"]}
+    info["inputs"] = inputs
     for key in ("kld_base_flash_next", "kld_base_27b", "master_cli", "gguf", "iq3_pack"):
         value = getattr(ctx.args, key)
-        info["inputs"][key] = [str(v) for v in value] if isinstance(value, list) else (str(value) if value else None)
+        inputs[key] = [str(v) for v in value] if isinstance(value, list) else (str(value) if value else None)
     for relative in ("tests/ninfer_tests", "apps/ninfer-serve", "apps/ninfer", "apps/ninfer-perplexity",
                      "bench/ninfer_bench", "tools/ninfer-qwen4-exp-expert-state-export"):
         info.setdefault("executables", {})[relative] = ctx.exe(relative).is_file()
     ensure_inputs(ctx)
-    status = "PASS" if ctx.tests.is_file() and ctx.serve.is_file() else "FAIL"
-    return result(status, f"{info['commit']} on {info['gpu']}", **info)
+    problems = input_problems(ctx) + [f"{exe} is not built" for exe in (ctx.tests, ctx.serve) if not exe.is_file()]
+    if problems:
+        return result("FAIL", "; ".join(problems), **info)
+    return result("PASS", f"{info['commit']} on {info['gpu']}", **info)
+
+
+def split_alternation(pattern: str) -> list[str]:
+    """A regex split at its top-level `|` (not inside a group or a character class)."""
+    parts, depth, start, i, in_class = [], 0, 0, 0, False
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "\\":
+            i += 2
+            continue
+        if in_class:
+            in_class = c != "]"
+        elif c == "[":
+            in_class = True
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif c == "|" and depth == 0:
+            parts.append(pattern[start:i])
+            start = i + 1
+        i += 1
+    return parts + [pattern[start:]]
+
+
+def regex_alternatives(pattern: str) -> list[str]:
+    """Every alternative a regex spells out, with each group's alternation expanded: ^x_(a|b)_y$ gives
+    ^x_(?:a)_y$ and ^x_(?:b)_y$. A misspelt alternative then matches nothing on its own."""
+    out = []
+    for part in split_alternation(pattern):
+        depth, open_at, i, in_class, expanded = 0, -1, 0, False, False
+        while i < len(part):
+            c = part[i]
+            if c == "\\":
+                i += 2
+                continue
+            if in_class:
+                in_class = c != "]"
+            elif c == "[":
+                in_class = True
+            elif c == "(":
+                if depth == 0:
+                    open_at = i
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    inner = part[open_at + 1:i]
+                    inner = inner[2:] if inner.startswith("?:") else inner
+                    alternatives = split_alternation(inner)
+                    if len(alternatives) > 1:
+                        for alternative in alternatives:
+                            out += regex_alternatives(part[:open_at] + "(?:" + alternative + ")" + part[i + 1:])
+                        expanded = True
+                        break
+            i += 1
+        if not expanded:
+            out.append(part)
+    return out
+
+
+def regex_problems(label: str, pattern: str, names: list[str]) -> list[str]:
+    """Each alternative of the regex that matches no ctest name."""
+    if not names:
+        return []
+    if not any(re.search(pattern, n) for n in names):
+        return [f"{label}: tests regex {pattern!r} matches no ctest name"]
+    return [f"{label}: the alternative {alt!r} of its tests regex matches no ctest name (a typo?)"
+            for alt in regex_alternatives(pattern) if not any(re.search(alt, n) for n in names)]
+
+
+def input_problems(ctx: Ctx) -> list[str]:
+    """Given paths that do not exist: caught before any step waits for the GPU lock."""
+    problems = []
+    for name, model in ctx.config["models"].items():
+        path = ctx.model(name)
+        if path and not Path(path).is_file():
+            problems.append(f"{model['input']} {path}: no such file")
+    for key in ("kld_base_flash_next", "kld_base_27b", "master_cli", "gguf"):
+        value = getattr(ctx.args, key)
+        if value and not Path(value).is_file():
+            problems.append(f"--{key.replace('_', '-')} {value}: no such file")
+    for pack in ctx.args.iq3_pack or []:
+        if not Path(pack).is_file():
+            problems.append(f"--iq3-pack {pack}: no such file")
+    if not ctx.build.is_dir():
+        problems.append(f"--build-dir {ctx.build}: no such directory")
+    return problems
 
 
 def print_plan(ctx: Ctx, steps: list[Step]) -> int:
@@ -1160,7 +1405,7 @@ def print_plan(ctx: Ctx, steps: list[Step]) -> int:
     print(f"Basalt GPU verification plan: {config['branch']} against {config['base']}, "
           f"{len(config['options'])} options, {len(steps)} steps, results to {ctx.out}")
     print(f"platform {'windows' if ctx.windows else 'linux'}, build dir {ctx.build}, A/B reps {ctx.args.reps}")
-    problems = validate_config(config, serve_flags())
+    problems = validate_config(config, serve_flags()) + input_problems(ctx)
     try:
         names, gpu = ctest_names(ctx.build), set(ctest_names(ctx.build, "gpu"))
     except (RuntimeError, OSError) as error:
@@ -1170,20 +1415,20 @@ def print_plan(ctx: Ctx, steps: list[Step]) -> int:
     print("Options:")
     for option in config["options"]:
         matched = [n for n in names if re.search(option["tests"], n)]
-        if names and not matched:
-            problems.append(f"{option['flag']}: tests regex {option['tests']!r} matches no ctest name")
+        problems += regex_problems(option["flag"], option["tests"], names)
         for command in option.get("identity", []):
             if names and command[0] not in names:
                 problems.append(f"{option['flag']}: identity harness {command[0]} is not a ctest name")
-        ab = "; ".join(f"{v['workload']} A+[{shlex.join(v['a'])}] B+[{shlex.join(v['b'])}]" for v in option.get("ab", []))
+        ab = "; ".join(f"{v['workload']} A+[{shlex.join(v['a'])}] B+[{shlex.join(v['b'])}]"
+                       for v in option.get("ab", []))
         print(f"  {option['flag']:<24} T{option['task']:<3} {option['model']:<11} {option['kind']:<8} "
               f"tests {len(matched)} ({len([n for n in matched if n in gpu])} gpu): {option['tests']}")
         print(f"  {'':<24} " + ("A/B: " + ab if ab else "no A/B: " + option["ab_reason"]))
         if option.get("kld"):
             print(f"  {'':<24} KLD gate flag {option['kld']}")
     for check in config["checks"]:
-        if check.get("tests") and names and not any(re.search(check["tests"], n) for n in names):
-            problems.append(f"check {check['id']}: tests regex {check['tests']!r} matches no ctest name")
+        if check.get("tests"):
+            problems += regex_problems(f"check {check['id']}", check["tests"], names)
     print("\nSteps, in order (lock: hold = one GPU-lock hold for the step; per-test = the test runner locks each "
           "test; none = no GPU):")
     for number, step in enumerate(steps, 1):
@@ -1201,8 +1446,9 @@ def print_plan(ctx: Ctx, steps: list[Step]) -> int:
         for problem in problems:
             print(f"  - {problem}")
         return 1
-    print(f"Check passed: every option's test regex and identity harness matches a ctest name "
-          f"({len(config['options'])} options, {sum(1 for c in config['checks'] if c.get('tests'))} check regex).")
+    print(f"Check passed: every alternative of every option's test regex, and every identity harness, matches a "
+          f"ctest name ({len(config['options'])} options, {sum(1 for c in config['checks'] if c.get('tests'))} "
+          "check regex).")
     return 0
 
 
@@ -1236,11 +1482,26 @@ def write_summary(ctx: Ctx, steps: list[Step]) -> Path:
             kld = " / ".join(detail_of(f"kld:{name}-{c}") or status_of(f"kld:{name}-{c}") for c in (20, 100))
         ab = "; ".join(f"{status_of(ab_id(option, i))}: {detail_of(ab_id(option, i))}".rstrip(": ")
                        for i in range(len(option.get("ab", [])))) or f"none ({option['ab_reason'].split(';')[0]})"
-        lines.append(f"| `{option['flag']}` (T{option['task']}) | {option['kind']} | {tests} | {identity} | {kld} | {ab} |")
+        lines.append(f"| `{option['flag']}` (T{option['task']}) | {option['kind']} | {tests} | {identity} | "
+                     f"{kld} | {ab} |")
     lines += ["", "| Step | Status | Detail |", "|---|---|---|"]
+    greedy: dict[str, list[tuple[int, dict | None]]] = {}
     for step in steps:
-        if step.id.startswith(("identity:", "ab:")) or re.match(r"kld:[a-z]", step.id) and "off" not in step.id:
-            continue  # in the table above
+        if step.id.startswith("greedy-master:"):
+            greedy.setdefault(step.data["config"], []).append((step.data["prompt"], results.get(step.id)))
+    for config_id, runs in greedy.items():  # one row per configuration, over its prompts
+        counts: dict[str, int] = {}
+        for _, r in runs:
+            counts[r["status"] if r else "not run"] = counts.get(r["status"] if r else "not run", 0) + 1
+        differ = [f"prompt {n}: {r['detail']}" for n, r in runs if r and r["status"] != "PASS"]
+        status = "FAIL" if counts.get("FAIL") or counts.get("ERROR") else ("PASS" if counts.get("PASS") == len(runs)
+                                                                            else "incomplete")
+        lines.append(f"| greedy-master:{config_id} | {status} | " + ", ".join(f"{v} {k}" for k, v in counts.items())
+                     + f" of {len(runs)} prompts" + ("; " + "; ".join(differ[:3]) if differ else "") + " |")
+    for step in steps:
+        if step.id.startswith(("identity:", "ab:", "greedy-master:")) or (
+                re.match(r"kld:[a-z]", step.id) and "off" not in step.id):
+            continue  # in the tables above
         r = results.get(step.id)
         detail = r["detail"] if r else ("needs " + ", ".join(missing_inputs(ctx, step)) if missing_inputs(ctx, step)
                                         else "not run")
@@ -1252,12 +1513,32 @@ def write_summary(ctx: Ctx, steps: list[Step]) -> Path:
 
 # --- main ------------------------------------------------------------------------------------------
 
+RESULTS_ROOT = REPO / "profiles" / "bench"
+DONE = ("PASS", "MEASURED", "REVIEW")  # what --resume does not run again
+
+
+def default_out(resume: bool) -> Path:
+    """Today's directory; with --resume, the newest earlier run (its run.json manifest), so a rerun on
+    a later day continues it."""
+    if resume:
+        runs = sorted((p for p in RESULTS_ROOT.glob("basalt-*") if (p / "run.json").is_file()),
+                      key=lambda p: (p / "run.json").stat().st_mtime)
+        if runs:
+            return runs[-1]
+    return RESULTS_ROOT / f"basalt-{dt.date.today():%Y-%m-%d}"
+
+
 def make_ctx(args: argparse.Namespace) -> Ctx:
     windows = args.platform == "windows"
     default_build = REPO / ("build-ninja" if windows else "build")
     build = Path(args.build_dir).resolve() if args.build_dir else default_build
-    out = Path(args.out).resolve() if args.out else REPO / "profiles" / "bench" / f"basalt-{dt.date.today():%Y-%m-%d}"
+    out = Path(args.out).resolve() if args.out else default_out(getattr(args, "resume", False))
     return Ctx(args, load_config(Path(args.options)), out, windows, build)
+
+
+def finished(ctx: Ctx, step: Step) -> bool:
+    previous = load_result(ctx, step.id)
+    return previous is not None and previous["status"] in DONE
 
 
 def selected(steps: list[Step], only: str | None, skip: str | None) -> list[Step]:
@@ -1268,7 +1549,8 @@ def selected(steps: list[Step], only: str | None, skip: str | None) -> list[Step
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--action", choices=("plan", "steps", "run", "summary"), default="plan")
+    parser.add_argument("--action", choices=("plan", "out", "steps", "run", "summary"), default="plan",
+                        help="out prints the results directory, for the wrappers to pin it for every call")
     parser.add_argument("--dry-run", action="store_true", help="the same as --action plan")
     parser.add_argument("--step", help="with --action run: the step id")
     parser.add_argument("--platform", choices=("windows", "linux"), default="windows" if os.name == "nt" else "linux")
@@ -1286,16 +1568,36 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--iq3-pack", action="append", help="a converted IQ3_XXS or IQ3_S pack (repeatable)")
     parser.add_argument("--only", help="comma-separated step id prefixes to keep")
     parser.add_argument("--skip", help="comma-separated step id prefixes to leave out")
+    parser.add_argument("--resume", action="store_true",
+                        help=f"leave out steps whose result is {', '.join(DONE)}; without --out, continue the "
+                             "newest run")
     args = parser.parse_args(argv)
     if args.dry_run:
         args.action = "plan"
     ctx = make_ctx(args)
     steps = selected(build_steps(ctx), args.only, args.skip)
+    if args.resume:
+        steps = [step for step in steps if not finished(ctx, step)]
     if args.action == "plan":
         return print_plan(ctx, steps)
+    if args.action == "out":
+        print(ctx.out)
+        return 0
     if args.action == "steps":
+        problems = input_problems(ctx)
+        if problems:  # before any step waits for the lock
+            print("basalt_gpu_verify: " + "; ".join(problems), file=sys.stderr)
+            return 2
+        ctx.out.mkdir(parents=True, exist_ok=True)
+        manifest = ctx.out / "run.json"
+        if not manifest.is_file():
+            manifest.write_text(json.dumps({"started": dt.datetime.now().isoformat(timespec="seconds"),
+                                            "argv": sys.argv[1:]}, indent=2) + "\n", encoding="utf-8")
         for step in steps:
-            print(f"{step.id}\t{step.lock}\t{step.title}")
+            missing = missing_inputs(ctx, step)
+            # A step that will SKIP for a missing input needs no GPU, so it does not wait for the lock.
+            lock = "none" if missing else step.lock
+            print(f"{step.id}\t{lock}\t{step.title}" + (f" [SKIP: needs {', '.join(missing)}]" if missing else ""))
         return 0
     if args.action == "summary":
         path = write_summary(ctx, build_steps(ctx))
@@ -1307,8 +1609,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"unknown step {args.step!r} (see --action steps)")
     missing = missing_inputs(ctx, step)
     print(f"== {step.id}: {step.title}", flush=True)
+    if args.resume and finished(ctx, step):
+        previous = load_result(ctx, step.id) or {}
+        print(f"   already {previous.get('status')} (--resume): not run again", flush=True)
+        return 0
     if missing:
         outcome = result("SKIP", "needs " + ", ".join(missing))
+    elif step.run is None:
+        outcome = result("ERROR", "the step has no runner")
     else:
         try:
             outcome = step.run(ctx, step)

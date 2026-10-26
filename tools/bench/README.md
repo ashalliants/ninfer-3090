@@ -172,29 +172,52 @@ workload. The status of each is in
    the A/B pairs (12 by default); a step can be rerun alone with
    `python tools/bench/basalt_gpu_verify.py <the same arguments> --action run --step <id>`.
 
+5. Continue an interrupted run with the same arguments plus `--resume`. It leaves out every step
+   whose `results/<step>.json` says PASS, MEASURED or REVIEW and runs the rest (FAIL, ERROR, SKIP
+   and steps never run). Without `--out` it continues the newest run (the newest
+   `profiles/bench/basalt-*` with a `run.json` manifest), so a rerun on a later day lands in the
+   same directory. The wrappers resolve the directory once, before the first step, and pass it to
+   every call, so a run that crosses midnight stays in one directory too.
+
+A given path that does not exist (a misspelt model, a missing base) stops the run before the first
+step, and a step whose input was not given at all is skipped without waiting for the GPU lock.
+
 Order: the GPU tests of every touched area (`tools/run-tests.ps1 -GpuOnly -Regex`, grouped by the
 artifact their real tests read), the identity harness runs, the KLD gate (one option-off run at 20
 and at 100 chunks serves every option; the window check compares window 1 with window 3), the
-`--ggml-decode-mma` per-shape timing and nsys policy check, one ABBA A/B per option and variant
-(n = 12, the Engine bench through `run_interleaved_ab.py` in its same-build mode, the 27B options
-through `run_chat_decode.py`), two combined rows with every winning option on, the ledger's checks
-(every option off against master with `greedy_identity.py`, `--relaxed-drafting` starts, a
+`--ggml-decode-mma` per-shape timing and nsys policy check (100-chunk runs only after their
+20-chunk run passes), one ABBA A/B per option and variant (n = 12, the Engine bench through
+`run_interleaved_ab.py` in its same-build mode, the 27B options through `run_chat_decode.py`), four
+combined rows with every winning option on (Flash-Next decode without and with the quality options,
+Flash-Next prefill, the 27B), the ledger's checks (every option off against master with
+`greedy_identity.py`, one step per configuration and prompt, `--relaxed-drafting` starts, a
 `--partial-ram-residency` start, the default expert state, a real-server smoke and soak, the
 community preset, the converter suites, the IQ3 packs, the launchers from a path with spaces and
 `(x86)`, with `package-release.ps1` on Windows), and last the rest of the GPU suite without the slow
 tests (`softmax_attention|kv_materialize`, AGENTS.md).
 
+**What an A/B compares besides speed.** For an identity option each Flash-Next A/B run prints, for
+each of its two jobs, an FNV hash of the greedy ids and, with MTP, the job's MTP rounds, plain steps,
+drafts and accepted drafts; every job's hash and line must be the same in all 24 runs, on and off, or
+the step fails (a drafter that diverged changes the second even when the ids agree). Each arm
+warm-starts from its own copy of `<model>.expert-state` and saves into that copy, so the arms share
+no state and the user's file is only read; the checks that start servers pass `--no-expert-state`.
+The 27B greedy A/B compares the answers' text, off against on, in every repetition.
+
 **The GPU lock.** On Windows the script holds the shared lock (`tools/gpu-lock.ps1`) for each step
-marked `hold` (one ABBA set, one KLD run, one server start and its probes), releasing it between
-steps; test steps go through `tools/run-tests.ps1`, which takes it per test. The Linux script takes
-no lock: no Linux script here does, because the Linux box is a rented machine used by one session at
-a time. Do not run it on a shared Linux machine without one.
+marked `hold` (one ABBA set, one KLD run, one server start and its probes, one prompt of the master
+comparison), releasing it between steps; test steps go through `tools/run-tests.ps1`, which takes it
+per test. The Linux script takes no lock: no Linux script here does, because the Linux box is a
+rented machine used by one session at a time. Do not run it on a shared Linux machine without one.
+It refuses to run under WSL, where the card is the shared Windows 3090 whose lock only Windows can
+hold: use the .ps1 there (the dry run still works).
 
 **Results** go to `profiles/bench/basalt-<date>/` (`--out` to change): `results/<step>.json`,
 `logs/<step>/`, the KLD rows, the generated inputs, and `summary.md`, a table of every option (its
 GPU tests, identity run, KLD numbers and A/B) and every check, ready to paste into the pull request.
-A speed variant is marked a win at a paired median of at least +1% with three quarters of the pairs
-positive; that only decides what the combined rows turn on, not what ships. Two things stay manual:
+A GPU test that skips although its model was given, or a harness that exits 77, is REVIEW or FAIL,
+never PASS. A speed variant is marked a win at a paired median of at least +1% with three quarters of
+the pairs positive; that only decides what the combined rows turn on, not what ships. Two things stay manual:
 the dashboard (open `/dashboard` in a browser at desktop and phone width) and `--mtp-constrained`'s
 speed (it needs constrained requests through ninfer-serve).
 

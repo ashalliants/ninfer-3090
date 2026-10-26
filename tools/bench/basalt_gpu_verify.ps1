@@ -10,13 +10,17 @@ each step that uses the card, releasing it between steps so other sessions get a
       --kld-base-flash-next K:\kld\flash-next-q8_0-512.kld --master-cli build-ninja\apps\ninfer-master.exe
 
 Every argument goes to basalt_gpu_verify.py unchanged; `python tools/bench/basalt_gpu_verify.py --help`
-lists them. $env:NINFER_PYTHON picks the interpreter (default `python`).
+lists them. $env:NINFER_PYTHON picks the interpreter (default `python`). The results directory is
+resolved once, before the first step, and passed to every call, so a run that crosses midnight stays
+in one directory; add --resume to continue a run (it leaves out the steps already PASS, MEASURED or
+REVIEW, and without --out picks the newest run).
 
 Locking, per the step's lock column (`--action steps` prints it):
   hold      this script holds the lock for the whole step: one ABBA set, one KLD run, one server
             start and its probes. An A/B's two arms therefore never have another job between them.
   per-test  the step runs tools/run-tests.ps1, which takes the lock for each GPU test on its own.
-  none      no GPU (the packager, pytest, the summary).
+  none      no GPU (the packager, pytest, the summary), or a step that will SKIP for a missing input,
+            which therefore does not wait for the lock.
 A wait can take hours while another session benchmarks: start this with run_in_background rather
 than watching it. Results and summary.md go to --out (default profiles\bench\basalt-<date>\).
 #>
@@ -30,6 +34,10 @@ if ($pass -contains '--dry-run' -or $pass -contains '--help' -or $pass -contains
   & $python $core @pass
   exit $LASTEXITCODE
 }
+
+$out = & $python $core @pass --action out
+if ($LASTEXITCODE -ne 0 -or -not $out) { throw 'basalt_gpu_verify.py --action out failed; run it with --dry-run to see why.' }
+$pass += @('--out', "$out")
 
 $steps = @(& $python $core @pass --action steps)
 if ($LASTEXITCODE -ne 0) { throw 'basalt_gpu_verify.py --action steps failed; run it with --dry-run to see why.' }

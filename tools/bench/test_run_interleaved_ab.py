@@ -62,13 +62,13 @@ with tempfile.TemporaryDirectory() as scratch:
     check("same-build mode exits 0", done.returncode == 0, done.stdout + done.stderr)
     data = json.loads(report.read_text(encoding="utf-8")) if report.is_file() else {"configs": [{}]}
     result = data["configs"][0]
-    check("every repetition makes a pair", result.get("pairs") == 4, result)
+    check("every repetition makes a pair", result.get("pairs") == 4, str(result))
     check("B (--fast) is 10% ahead in every pair", abs(result.get("median", 0) - 1.1) < 1e-9
-          and result.get("positive") == 4, result)
-    check("the JSON names the arm arguments", data.get("a_args") == [] and data.get("b_args") == ["--fast"], data)
+          and result.get("positive") == 4, str(result))
+    check("the JSON names the arm arguments", data.get("a_args") == [] and data.get("b_args") == ["--fast"], str(data))
     log_b = logs / "decode-B-rep1.log"
     log_a = logs / "decode-A-rep2.log"
-    check("each run is logged", log_b.is_file() and log_a.is_file(), sorted(p.name for p in logs.glob("*")))
+    check("each run is logged", log_b.is_file() and log_a.is_file(), str(sorted(p.name for p in logs.glob("*"))))
     if log_b.is_file() and log_a.is_file():
         check("arm B ran with --b-args appended", "args --job x --fast" in log_b.read_text(encoding="utf-8"))
         check("arm A ran without them", "args --job x\n" in log_a.read_text(encoding="utf-8"))
