@@ -98,6 +98,15 @@ names (the same preflight as `run_interleaved_ab.py`). Equal ids say the builds 
 numerical path; unequal ids are not necessarily a bug (a different reduction order flips a near-tie), but
 the index says how far in they agree.
 
+`--a-args` and `--b-args` add arguments to one side only. Leave out `--b` and the one build runs as
+both sides, which is how to check that an option designed to keep the output does (the per-side
+arguments must differ):
+
+```bash
+python3 tools/bench/greedy_identity.py --a build-ninja/apps/ninfer.exe \
+    --model models/qwen3_8_27b.ninfer --b-args="--no-cuda-graph"
+```
+
 It runs the builds one after the other on the card, a process per prompt and build, so **hold the GPU
 lock around the whole run** (CLAUDE.md, "GPU lock"):
 
