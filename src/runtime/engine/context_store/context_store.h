@@ -509,6 +509,9 @@ private:
                                          std::int64_t stamp);
     void peer_loop();
     std::unique_ptr<OwnerLock> owner_;
+    // Serializes puts' free-space check and writes across the stores of one parent directory.
+    struct VolumeLock;
+    std::filesystem::path volume_lock_path_; // empty: no parent directory to share
     // (peer + id) -> modification time of the peer manifest that was skipped: not tried again until
     // the peer rewrites it. Guarded by mutex_.
     std::unordered_map<std::string, std::int64_t> peer_skipped_;

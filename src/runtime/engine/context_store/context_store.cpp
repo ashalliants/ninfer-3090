@@ -418,6 +418,55 @@ private:
 #endif
 };
 
+// An exclusive lock on the file stores of one parent directory share, held while one put checks the
+// volume's free space and writes its files, so two stores there (the boot script lays out two
+// engines' stores side by side) cannot both find room for one image and both write. It blocks
+// until the other store's put has written. If the file cannot be opened or locked the put carries
+// on without it: the lock only narrows a race on free space, it is never a reason to fail a write.
+// Stores elsewhere on the volume, and chunk downloads from the bucket, do not take it.
+struct ContextStore::VolumeLock {
+    explicit VolumeLock(const fs::path& path) {
+        if (path.empty()) { return; }
+#ifdef _WIN32
+        handle_ = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) { return; }
+        OVERLAPPED whole{};
+        if (!LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &whole)) {
+            CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+        }
+#else
+        fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (fd_ < 0) { return; }
+        int locked = -1;
+        do { locked = ::flock(fd_, LOCK_EX); } while (locked != 0 && errno == EINTR);
+        if (locked != 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+#endif
+    }
+    ~VolumeLock() {
+#ifdef _WIN32
+        // Closing the handle releases the lock.
+        if (handle_ != INVALID_HANDLE_VALUE) { CloseHandle(handle_); }
+#else
+        if (fd_ >= 0) { ::close(fd_); }
+#endif
+    }
+    VolumeLock(const VolumeLock&)            = delete;
+    VolumeLock& operator=(const VolumeLock&) = delete;
+
+private:
+#ifdef _WIN32
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    int fd_ = -1;
+#endif
+};
+
 ContextStore::ContextStore(Options options) : options_(std::move(options)) {
     if (options_.directory.empty()) {
         throw std::invalid_argument("context store directory is empty");
@@ -451,6 +500,15 @@ ContextStore::ContextStore(Options options) : options_(std::move(options)) {
         if (peer.empty() || fs::equivalent(peer, options_.directory, same_error)) {
             throw std::invalid_argument("a context store peer must be another store's directory");
         }
+    }
+    {
+        // The directory's parent, however the directory was spelled (a trailing separator).
+        fs::path directory = fs::absolute(options_.directory, error).lexically_normal();
+        if (!error && !directory.has_filename()) { directory = directory.parent_path(); }
+        if (!error && directory.has_parent_path() && directory.parent_path() != directory) {
+            volume_lock_path_ = directory.parent_path() / ".ninfer-context-store-volume.lock";
+        }
+        error.clear();
     }
     try {
         owner_ = std::make_unique<OwnerLock>(options_.directory / "owner.lock");
@@ -1221,18 +1279,21 @@ ContextStore::PutResult ContextStore::put(const Description& description,
         manifest.pod(checksum);
 
         {
+            // From the free-space check until the files are written, no other store of this parent
+            // directory checks or writes (see VolumeLock).
+            const VolumeLock volume(volume_lock_path_);
             // Raw bytes: a compressed chunk only takes less.
             std::uint64_t to_write = manifest.out.size();
             for (const NewChunk& chunk : new_chunks) { to_write += chunk.bytes.size(); }
             make_room_on_volume_locked(description.id, to_write, reused, pinned);
+            for (const NewChunk& chunk : new_chunks) {
+                const auto [path, stored] = write_chunk(chunk.chunk, chunk.bytes);
+                written.push_back(path);
+                if (chunk.known) { refilled.emplace_back(hex_key(chunk.chunk.hash), stored.bytes); }
+                stored_written += stored.bytes;
+            }
+            write_atomically(manifest_path(description.id), manifest.out);
         }
-        for (const NewChunk& chunk : new_chunks) {
-            const auto [path, stored] = write_chunk(chunk.chunk, chunk.bytes);
-            written.push_back(path);
-            if (chunk.known) { refilled.emplace_back(hex_key(chunk.chunk.hash), stored.bytes); }
-            stored_written += stored.bytes;
-        }
-        write_atomically(manifest_path(description.id), manifest.out);
 
         Entry entry;
         entry.info = Info{.id           = description.id,

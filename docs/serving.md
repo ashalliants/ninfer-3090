@@ -517,7 +517,10 @@ those waiting uploads to the bucket still need (see below). Because the volume i
 another engine, logs, the OS), the store also checks the volume itself: before a write it makes
 sure at least 1 GiB stays free after the new chunks, removing the least recently used sessions
 first if not, and refuses the write (a miss, as for any failed write) with `context store volume is
-full: ... (N short)` when even that cannot make the room. A file that cannot be written says why
+full: ... (N short)` when even that cannot make the room. Stores in the same parent directory, as
+the boot script lays out two engines' stores, check and write one at a time, so two engines cannot
+both find room for one session and both write it; stores elsewhere on the volume do not
+coordinate, and neither do downloads from the bucket. A file that cannot be written says why
 (`cannot write ...: No space left on device`). A store written by a different model, quantization, KV
 or recurrent-state configuration, speculative configuration, set of prompt grafts or an older
 engine's image format is ignored and ages out; the start-up log line `context store | N sessions

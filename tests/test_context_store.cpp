@@ -2429,6 +2429,61 @@ void test_put_budgets_against_free_disk_space() {
     check(!store.find("a5"), "a refused put left its image behind");
 }
 
+// Two engines' stores side by side on one volume, writing at the same moment, when the volume has
+// room for one of the images and the reserve: one put checks and writes while the other waits, so
+// exactly one is refused as "volume is full" and the volume never goes below the reserve.
+void test_sibling_stores_check_the_volume_one_at_a_time() {
+    TempDirectory root;
+    const fs::path first_directory  = root.path() / "context-store";
+    const fs::path second_directory = root.path() / "context-store-1";
+    constexpr std::uint64_t kCapacity = 30'000;
+    constexpr std::uint64_t kReserve  = 2000;
+    const auto volume_free = [&] {
+        std::uint64_t used = 0;
+        for (const fs::path& directory : {first_directory, second_directory}) {
+            std::error_code missing;
+            if (fs::exists(directory, missing)) { used += bytes_on_disk(directory); }
+        }
+        // Asking the volume takes a while, as the window between a check and the write would.
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        return used < kCapacity ? kCapacity - used : 0;
+    };
+    ContextStore::Options first_options = options_for(first_directory);
+    first_options.available_bytes       = volume_free;
+    first_options.reserve_bytes         = kReserve;
+    ContextStore::Options second_options = options_for(second_directory);
+    second_options.available_bytes       = volume_free;
+    second_options.reserve_bytes         = kReserve;
+    ContextStore first(first_options);
+    ContextStore second(second_options);
+    std::atomic<int> ready{0};
+    std::atomic<int> refused{0};
+    std::atomic<int> other_errors{0};
+    const auto write = [&](ContextStore& store, std::uint32_t seed) {
+        const auto image = concat({pseudo_random(30, seed), pseudo_random(20'000, seed + 1)});
+        ++ready;
+        while (ready.load() < 2) { std::this_thread::yield(); }
+        try {
+            (void)store.put(describe("0a"), image, std::array{ContextStore::Region{30, 20'000}});
+        } catch (const std::runtime_error& failure) {
+            if (std::string(failure.what()).find("volume is full") != std::string::npos) {
+                ++refused;
+            } else {
+                ++other_errors;
+            }
+        }
+    };
+    std::thread a([&] { write(first, 1); });
+    std::thread b([&] { write(second, 2); });
+    a.join();
+    b.join();
+    check(refused.load() == 1 && other_errors.load() == 0,
+          "two stores on one volume did not take turns at checking its free space");
+    check(bytes_on_disk(first_directory) + bytes_on_disk(second_directory) + kReserve <= kCapacity,
+          "two stores together left less than the reserve free on their volume");
+    check(first.list().size() + second.list().size() == 1, "not exactly one image was stored");
+}
+
 // A file that cannot be written says why (the OS's reason, such as a full disk).
 void test_write_failure_names_the_cause() {
     TempDirectory directory;
@@ -2658,6 +2713,7 @@ int main() {
     test_peer_image_skipped_for_budget_is_imported_after_room_is_made();
     test_put_budgets_against_free_disk_space();
     test_write_failure_names_the_cause();
+    test_sibling_stores_check_the_volume_one_at_a_time();
     test_load_keeps_what_it_fetched_until_it_has_read_it();
     test_a_chunk_lost_after_its_fetch_is_a_miss_not_damage();
     test_compressed_chunks_round_trip_and_account_for_disk_use();
