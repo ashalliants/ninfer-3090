@@ -98,7 +98,7 @@ fast, set `NINFER_SPEC=mtp`:
 That set was verified at **200,000 tokens** by loading it. The difference is a real trade rather than a
 free upgrade: DFlash2's draft weights and its refusal of `--lm-head-q6` cost about 65K tokens of
 context between them. Every flag is explained, with what it buys and what it costs, in
-[`docs/performance.md`](docs/performance.md#recommended-configurations-rtx-3090-qwen38-27b).
+[`docs/performance.md`](../performance.md#recommended-configurations-rtx-3090-qwen38-27b).
 
 The scripts themselves were consolidated: `scripts/` went from 47 files to 13. One
 `run.{bat,sh} <model> [profile]`, one `download-model.{bat,sh} <model>`, one `package-release`.

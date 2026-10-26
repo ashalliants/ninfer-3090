@@ -16,7 +16,7 @@ if (-not (Test-Path -LiteralPath $VersionFile)) { throw "Missing $VersionFile" }
 $ReleaseTag = (Get-Content -LiteralPath $VersionFile -Raw).Trim()
 if (-not $ReleaseTag) { throw "$VersionFile is empty" }
 $ReleaseVersion = $ReleaseTag.Split('-')[0]
-$ReleaseNotes = "RELEASE_NOTES_$ReleaseVersion.md"
+$ReleaseNotes = "docs/release-notes/RELEASE_NOTES_$ReleaseVersion.md"
 # Checked before anything is deleted or built into dist, so a forgotten release-notes file costs
 # nothing rather than a finished archive that has to be thrown away.
 if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot $ReleaseNotes))) {
