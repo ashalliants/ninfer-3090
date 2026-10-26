@@ -1,7 +1,8 @@
 #pragma once
 
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/memory_plan.h (Apache-2.0).
-// Modified for NInfer-3090: full mode only (every expert pinned in RAM); the SSD tier is not ported, so a ledger that cannot hold every expert refuses to start.
+// Modified for NInfer-3090: full mode (every expert pinned in RAM) by default; the SSD tier is not ported, so a ledger that cannot hold every expert refuses to start.
+// Partial RAM residency (--partial-ram-residency, plan_partial_ram) pins only the experts the VRAM cache does not hold, plus spares.
 
 // The startup memory plans of Qwen3.8-Flash-Next (docs/maintainer/qwen3_8-flash-next-design.md
 // §19.3.7). Host RAM: what the experts may take once a reserve stays free for the system and every
@@ -17,6 +18,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace ninfer::models::qwen4_exp {
 
@@ -45,6 +47,9 @@ struct HostMemoryDemand {
     double lock_overhead = 0.0025;
     // Beyond the banks, so the system is not run at the reserve's edge.
     std::uint64_t full_margin = kLedgerGiB;
+    // Every pinned byte at most this (Windows WDDM's page-lock cap, wddm_pin_cap; partial RAM
+    // residency only). Empty: no cap.
+    std::optional<std::uint64_t> pin_cap;
 };
 
 struct HostMemoryLedger {
@@ -64,6 +69,8 @@ struct HostMemoryLedger {
     std::uint64_t pinned_total = 0;
     // The Linux RLIMIT_MEMLOCK is below pinned_total, so pinning would fail whatever is free.
     bool lock_limited = false;
+    // demand.pin_cap is below pinned_total.
+    bool pin_limited = false;
     // Every expert fits in RAM. Without the SSD tier (not ported) startup refuses otherwise.
     bool fits = false;
 
@@ -110,6 +117,60 @@ struct ContextCacheFit {
 [[nodiscard]] ContextCacheFit fit_context_cache(const HostMemorySnapshot& snapshot, HostMemoryDemand demand,
                                                 std::uint64_t requested, std::uint64_t minimum,
                                                 std::uint64_t granule);
+
+// ---------------------------------------------------------------- partial RAM residency
+
+// --partial-ram-residency (FlashNextOptions::partial_ram_residency; program/ram_slots.h): host RAM
+// holds the routed experts the VRAM cache does not, plus spare slots, instead of every bank whole.
+// The hottest experts are read from the artifact straight into frames at load and live only in VRAM;
+// every other expert gets a RAM slot of its layer's record stride. Layer l's slots are
+// min(E, E - N_l + spares), N_l its VRAM-only experts: with one stride s the pool is
+// (E_total - vram_frames + spares) * s.
+//
+// Spares per layer: 2 x the most experts one round promotes in a layer (decode-width calls promote
+// one per column, at most 8). Correctness never depends on them: an eviction without a free slot
+// reclaims a copy, or waits for a later round.
+inline constexpr std::uint32_t kPartialSparesPerLayer = 16;
+// The frames the load leaves unfilled: the Program sizes the cache once the dense weights are loaded,
+// and a cache smaller than the startup check predicted must still hold every VRAM-only expert. The
+// unfilled frames serve as cache frames whose experts keep RAM copies.
+inline constexpr std::uint64_t kPartialFrameMarginBytes = 512ULL << 20;
+
+struct PartialRamDemand {
+    std::uint32_t experts = 0;          // per layer
+    std::vector<std::uint64_t> strides; // per layer: the bank's record stride
+    std::uint64_t frame_bytes = 0;      // one frame (the largest stride)
+    std::uint32_t frames      = 0;      // the frames the VRAM sizing gives the cache
+    std::uint32_t spares_per_layer = kPartialSparesPerLayer;
+    std::uint64_t margin_bytes     = kPartialFrameMarginBytes;
+    // Keys (layer * experts + expert) hottest first, the warm start's; the others follow expert by
+    // expert, every layer in turn. Repeats and keys out of range are skipped.
+    std::vector<std::uint32_t> ranked;
+    // Windows WDDM: page-locked memory is capped near RAM/2 - 8 GiB (wddm_pin_cap): the slot pool
+    // and `other_pinned` (every other pin made at startup) must fit. Empty: no cap.
+    std::optional<std::uint64_t> pin_cap;
+    std::uint64_t other_pinned = 0;
+    // For the refusal's advice: the VRAM headroom the sizing kept, and whether --expert-cache-mib
+    // bounded the frames.
+    std::uint64_t headroom = 0;
+    bool cache_limited     = false;
+};
+
+struct PartialRamPlan {
+    // Read into frames at load (they live only in VRAM), hottest first.
+    std::vector<std::uint32_t> vram_keys;
+    std::vector<std::uint32_t> slots; // per layer
+    std::uint64_t bytes = 0;          // the pinned slot pool: the sum of slots * stride
+    // Over the cap: the fewest frames whose plan fits it (0: no frame count does), and why startup
+    // must refuse (naming the flag to change). Empty: the plan fits.
+    std::uint32_t frames_needed = 0;
+    std::string refusal;
+};
+
+[[nodiscard]] PartialRamPlan plan_partial_ram(const PartialRamDemand& demand);
+// Windows WDDM's page-lock cap for one process: half the physical memory less 8 GiB (Basalt's
+// docs/platforms.md); 0 when that is negative.
+[[nodiscard]] std::uint64_t wddm_pin_cap(std::uint64_t total_physical) noexcept;
 
 // ---------------------------------------------------------------- device memory
 

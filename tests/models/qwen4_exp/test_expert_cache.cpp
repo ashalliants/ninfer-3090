@@ -752,7 +752,75 @@ void test_tier_gates() {
     }
 }
 
+// Partial RAM residency (--partial-ram-residency): an expert held only in VRAM is written back before
+// its frame is reused. Its eviction emits a WriteBack of its frame and holds the frame: quiescence
+// does not free it, no load targets it and the admitted expert waits in the queue until
+// complete_writeback, which then loads it there. A victim with a RAM copy frees its frame as before.
+void test_writeback_before_reuse() {
+    constexpr std::uint32_t kKeys = 16, kFrames = 2;
+    CacheController cache(kKeys, kFrames, 0, 1);
+    std::vector<CacheController::Command> cmds;
+    std::vector<std::uint8_t> vram_only(kKeys, 0);
+    cache.set_writeback([&](std::uint32_t key) { return vram_only[key] != 0; });
+    std::uint64_t round = 0;
+    const std::uint32_t fill[] = {0, 1};
+    cache.on_route(fill, ++round, cmds);
+    cache.on_quiescent(cmds);
+    check(cache.frame_key(0) && cache.frame_key(1), "two keys fill the two frames");
+    vram_only[0] = vram_only[1] = 1; // as if placed at load, with no RAM copy
+    cmds.clear();
+    const std::uint32_t hot[] = {5};
+    for (int use = 0; use < 4; ++use) { cache.on_route(hot, ++round, cmds, 1); } // key 5 outranks a resident
+    const auto writeback = std::find_if(cmds.begin(), cmds.end(), [](const CacheController::Command& c) {
+        return c.kind == CacheController::Command::Kind::kWriteBack;
+    });
+    check(writeback != cmds.end(), "evicting a VRAM-only expert emits a write-back");
+    if (writeback == cmds.end()) { return; }
+    const std::uint32_t frame = writeback->frame, victim = writeback->key;
+    check(cache.writing_back(frame) && !cache.frame_key(frame), "the victim's frame is held for its write-back");
+    cache.on_quiescent(cmds);
+    cache.on_round_done(round + 10, cmds);
+    const bool loaded_early = std::any_of(cmds.begin(), cmds.end(), [&](const CacheController::Command& c) {
+        return c.kind == CacheController::Command::Kind::kCopy && c.frame == frame;
+    });
+    check(!loaded_early && cache.free_frames() == 0, "no load targets a frame whose write-back is pending");
+    check(cache.queued_loads() == 1 && cache.entry(5).state == ResidencyState::kAbsent,
+          "the admitted expert waits for the frame");
+    check(cache.entry(victim).state == ResidencyState::kAbsent, "the victim is absent in the policy's table");
+    bool threw = false;
+    try {
+        std::vector<CacheController::Command> none;
+        cache.complete_writeback(frame == 0 ? 1 : 0, none);
+    } catch (const std::logic_error&) { threw = true; }
+    check(threw, "completing a write-back of a frame that has none is refused");
+    cmds.clear();
+    cache.complete_writeback(frame, cmds);
+    check(!cache.writing_back(frame) && cache.entry(5).state != ResidencyState::kAbsent &&
+              cache.entry(5).frame == frame,
+          "once the write-back landed the queued expert loads into the frame");
+    // A victim with a RAM copy (vram_only 0) needs no write-back: its frame is reused at quiescence.
+    std::fill(vram_only.begin(), vram_only.end(), 0);
+    cmds.clear();
+    const std::uint32_t other[] = {9};
+    for (int use = 0; use < 8; ++use) { cache.on_route(other, ++round, cmds, 1); }
+    cache.on_quiescent(cmds);
+    const bool any_writeback = std::any_of(cmds.begin(), cmds.end(), [](const CacheController::Command& c) {
+        return c.kind == CacheController::Command::Kind::kWriteBack;
+    });
+    check(!any_writeback && cache.entry(9).state != ResidencyState::kAbsent, "a victim with a RAM copy just leaves");
+    // Lending and shrinking evict without a round: an expert they would evict that lives only in VRAM
+    // is refused rather than lost.
+    vram_only.assign(kKeys, 1);
+    bool lend_refused = false;
+    try {
+        cmds.clear();
+        (void)cache.lend(0, 1, cmds);
+    } catch (const std::logic_error&) { lend_refused = true; }
+    check(lend_refused, "lending a frame whose expert lives only in VRAM is refused");
+}
+
 int main() {
+    test_writeback_before_reuse();
     test_residency_entries();
     test_tier_gates();
     test_lfru_conformance();

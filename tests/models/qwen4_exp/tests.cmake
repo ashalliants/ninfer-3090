@@ -71,6 +71,13 @@ ninfer_add_test(ninfer_qwen4_exp_expert_cache_test
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)
 
+# Host only: partial RAM residency's bookkeeping (--partial-ram-residency): a layer's RAM slots, the
+# swap plan's write-backs and admissions, and random evict/admit rounds in which every expert keeps a
+# valid copy and no frame is reused under a write-back.
+ninfer_add_test(ninfer_qwen4_exp_ram_slots_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ram_slots.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_core)
+
 ninfer_add_test(ninfer_qwen4_exp_memory_plan_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_memory_plan.cpp"
   LIBRARIES ninfer_model_loading ninfer_core)
