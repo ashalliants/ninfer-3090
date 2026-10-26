@@ -244,6 +244,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
            "[--gdn-state-fp16] [--numeric-tripwire [--numeric-tripwire-limit F|inf]] "
            "[--progress-anchor-tokens N [--progress-anchors-shared]] [--admission-fit-check] "
+           "[--admission-affinity] "
            "[--model-suspend [--suspend-snapshot pageable|pinned] "
            "[--suspend-weights artifact|host] [--no-auto-resume] [--sleep-idle-seconds N]] "
            "[--models-dir DIR] [--models-preset FILE] [--models-max N] [--no-models-autoload] "
@@ -1115,6 +1116,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.numeric_tripwire_limit = parse_tripwire_limit(require_value("--numeric-tripwire-limit"));
         } else if (arg == "--admission-fit-check") {
             options.admission_fit_check = true;
+        } else if (arg == "--admission-affinity") {
+            options.admission_affinity = true;
         } else if (arg == "--model-suspend") {
             options.suspend.enabled = true;
         } else if (arg == "--suspend-snapshot") {

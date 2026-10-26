@@ -93,6 +93,7 @@ struct ServeOptions {
     bool numeric_tripwire   = false;
     float numeric_tripwire_limit = 65504.0f;
     bool admission_fit_check = false;
+    bool admission_affinity  = false;
     bool mlp_a8_decode      = false;
     bool prefill_a8         = true;
     bool prefill_cublas     = false;

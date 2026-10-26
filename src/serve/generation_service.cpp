@@ -351,6 +351,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.numeric_tripwire.enabled   = options.numeric_tripwire;
     engine_options.numeric_tripwire.abs_limit = options.numeric_tripwire_limit;
     engine_options.admission_fit_check      = options.admission_fit_check;
+    engine_options.admission_affinity       = options.admission_affinity;
     engine_options.suspend                  = options.suspend;
     engine_options.mlp_a8_decode            = options.mlp_a8_decode;
     engine_options.prefill_a8               = options.prefill_a8;
