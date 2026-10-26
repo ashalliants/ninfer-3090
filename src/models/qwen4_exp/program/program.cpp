@@ -1145,7 +1145,8 @@ public:
                                       .moe_gate_up_registers = options_.moe_gate_up_registers,
                                       .moe_fused_route       = options_.moe_fused_route,
                                       .hc_int8               = hc_int8_.get(),
-                                      .hc_fused_read         = options_.hc_fused_read};
+                                      .hc_fused_read         = options_.hc_fused_read,
+                                      .ggml_decode_mma       = options_.ggml_decode_mma};
         if (plan_.bytes.hot_embedding == 0) { return out; }
         const Weight& table        = parameters_.token_embedding;
         const auto rows            = static_cast<std::int32_t>(options_.hot_embedding_rows);

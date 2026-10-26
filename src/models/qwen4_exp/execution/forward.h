@@ -319,6 +319,13 @@ struct ForwardOptions {
     // routing). Wider calls run as off. Workspace: hc_fused_read_workspace_bytes beyond
     // workspace_bytes.
     bool hc_fused_read = false;
+    // --ggml-decode-mma: every GGML dense Linear whose policy admits A8 (the text model's and the
+    // drafter's) runs under ops::LinearPolicy::AllowA8GgmlDecodeMma, so calls of at most 8 columns
+    // (decode, MTP drafts and verification, the rows of several sequences) take the int8
+    // tensor-core decode route; the two-projection pairs then run as two Linears instead of one
+    // linear_pair. NOT bitwise: the same A8 cast and integer products, summed in another fixed order
+    // (still column invariant). Wider calls (prefill) are unchanged. No workspace.
+    bool ggml_decode_mma = false;
 };
 
 class Forward {
@@ -506,6 +513,7 @@ private:
     bool moe_fused_route_ = false; // ForwardOptions::moe_fused_route
     const HcInt8Copies* hc_int8_ = nullptr; // ForwardOptions::hc_int8
     bool hc_fused_read_ = false; // ForwardOptions::hc_fused_read
+    bool ggml_decode_mma_ = false; // ForwardOptions::ggml_decode_mma
     Tensor mtp_frames_; // I32 [E]: every drafter expert resident at its own index
     DeviceBuffer mtp_frames_backing_;
     Tensor residual_; // the call's residual stream, in the workspace from run_front to run_back
