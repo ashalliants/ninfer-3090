@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -166,6 +167,12 @@ struct ServeOptions {
     // Exact process argv for the server-start record. Secret-bearing option values are redacted
     // while parsing; this is provenance only and never affects execution.
     std::vector<std::string> startup_argv;
+    // The words the options were parsed from: a --config file's, then the command line's without
+    // --config FILE. Redacted like startup_argv; provenance only.
+    std::vector<std::string> effective_argv;
+    // Where each option given came from, by flag ("--max-context"): "cli", the --config path as
+    // given, or "default" for a key the file set to false. An option missing here was not given.
+    std::map<std::string, std::string> setting_sources;
 };
 
 // Parse-time limits. A request that omits max_tokens / max_completion_tokens / max_output_tokens

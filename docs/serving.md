@@ -50,6 +50,61 @@ and prefill remain outside speculative acceleration. A later request cannot enab
 omitted at startup. The artifact need only contain the Text backbone and the optional components
 selected for this process.
 
+### Options from a file
+
+`--config FILE` reads serve options from a JSON object whose keys are the flag names without their
+leading dashes, so a setup can be kept in a file and started the same way each time:
+
+```json
+{
+  "max-context": 65536,
+  "kv-capacity": 65536,
+  "kv-dtype": "int8",
+  "spec": "mtp",
+  "draft-tokens": 3,
+  "lm-head-draft": true,
+  "preserve-thinking": true,
+  "cors": false,
+  "allowed-host": ["gpubox.lan"]
+}
+```
+
+```bash
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer --config serve.json --max-context 32768
+```
+
+- A string or a number is the flag's value. `true` is a bare flag (`"lm-head-draft": true` is
+  `--lm-head-draft`) and `false` leaves the option at its default. An array repeats the flag, and
+  only the options that collect their occurrences take one (`graft`, `allowed-host`,
+  `context-store-peer`).
+- The command line wins over the file wherever `--config` stands, and the file over the defaults.
+  A repeatable option given in both keeps the file's entries and adds the command line's.
+- The file is the command line written down: a relative path in it is read against the working
+  directory, as the same word on the command line would be, not against the file's own directory.
+- A key no option has fails at startup with `FILE: unknown key "KEY"`; so do a value an option
+  refuses (`FILE: "port": invalid port: eighty`), a value for a switch, `true` or `false` for an
+  option that takes a value, a nested object and `null`.
+- `api-key` is refused in the file: a secret belongs on the command line or in the launcher's
+  environment, not in a file that is copied and shared. A file cannot name another (`config`), and
+  one `--config` is accepted per command line.
+- A switch the file turns on can be turned off from the command line only where its `no-` flag
+  exists (`--no-models-autoload` against `"models-autoload": true`). Where none exists, the attempt
+  fails rather than leaving the switch on: `--no-vision` against `"vision": true` stops startup with
+  `FILE: "vision" is set and has no command-line override`. Edit the file, or use another one.
+- In router mode the file's options are part of the command line passed on to every model, so they
+  win over a preset's sections as the command line does, and the router's own options
+  (`models-dir`, `models-max`, ...) may be given in it too.
+
+At startup the server logs where each option came from, the defaults left out:
+
+```text
+INFO  settings | command line: --config, --max-context | serve.json: --allowed-host, --draft-tokens, --kv-capacity, --kv-dtype, --lm-head-draft, --preserve-thinking, --spec
+```
+
+The `server_start` record of `--request-log-jsonl` carries the same as `setting_sources` (each
+option given: `cli`, the file's path, or `default` for a key the file set to `false`) beside
+`effective_argv`, the words the options were parsed from.
+
 ### Qwen3.8-Flash-Next (preview)
 
 The one command:
@@ -885,8 +940,8 @@ max-context = 8192
 `[*]` holds defaults for every model; any other section is a model (`model` or `artifact` is its
 path, `alias` a comma-separated list, `load-on-startup` a boolean, every other key a serve option
 without its leading dashes). A section named after a model found in `--models-dir` needs no path.
-The command line wins over a preset where they repeat an option. Comments sit on lines of their own
-(`;` or `#` first). The router's own options (`models-max`, `models-autoload`, `sleep-idle-seconds`,
+The command line (a `--config` file included) wins over a preset where they repeat an option.
+Comments sit on lines of their own (`;` or `#` first). The router's own options (`models-max`, `models-autoload`, `sleep-idle-seconds`,
 `unload-idle-seconds`) are command-line only, as are the options the router overrides for every
 model (`api-key`, `allowed-host`, `host`, `port`, `model-id`): a preset that sets one is rejected
 at startup. A model id may not contain `/`, `?`, `#`, `%` or `\`. With
@@ -2297,7 +2352,7 @@ they do not infer request behavior from process-global counter deltas.
 
 | Event | Contents |
 |---|---|
-| `server_start` | build version, artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, unified Host context capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
+| `server_start` | build version, artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, unified Host context capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, redacted `argv`, `effective_argv` (a `--config` file's words, then the command line's) and `setting_sources` (each option given: `cli`, the config path, or `default`) |
 | `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, preemption/recovery counters, thinking-budget application counters, model thinking tokens, reasoning-loop guard firing, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
@@ -2390,7 +2445,8 @@ using transfer-event time and bytes. GPU intervals overlap Host submission and w
 separate evidence, not additional wall-time stages. Background reclamation remains Engine-wide.
 
 `result.generated_token_ids` records committed output token IDs for exact prefix analysis.
-The JSONL file never records an API-key value; `argv` replaces it with `<redacted>`.
+The JSONL file never records an API-key value; `argv` and `effective_argv` replace it with
+`<redacted>`.
 Operational stderr summaries are rounded and are not the
 aggregation source. OpenAI Responses, OpenAI Chat, and Anthropic generation requests receive a
 request ID when they enter synchronous preparation. Successful preparation produces

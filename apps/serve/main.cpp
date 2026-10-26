@@ -298,6 +298,7 @@ int main(int argc, char** argv) {
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
     ninfer::product::StartupLogRenderer startup_log(logging);
     ninfer::serve::OperationalLog operational_log(logger);
+    operational_log.setting_sources(options.setting_sources);
     bool serving = false;
     if (options.router()) {
         return run_router(argv[0], options, logger, startup_log, operational_log);

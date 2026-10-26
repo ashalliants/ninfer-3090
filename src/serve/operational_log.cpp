@@ -7,9 +7,11 @@
 
 #include <algorithm>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace ninfer::serve {
 namespace {
@@ -652,6 +654,38 @@ OperationalRecord render_engine_fault(const ninfer::EngineFaultEvent& event) {
 
 void OperationalLog::engine_fault(const ninfer::EngineFaultEvent& event) const {
     write(render_engine_fault(event));
+}
+
+std::optional<OperationalRecord>
+render_setting_sources(const std::map<std::string, std::string>& sources) {
+    // The command line first, then each file; flags in name order within a group.
+    std::vector<std::pair<std::string, std::vector<std::string>>> groups;
+    const auto group = [&](const std::string& source) -> std::vector<std::string>& {
+        for (auto& [name, flags] : groups) {
+            if (name == source) { return flags; }
+        }
+        return groups.emplace_back(source, std::vector<std::string>{}).second;
+    };
+    (void)group("cli");
+    for (const auto& [flag, source] : sources) {
+        if (source != "default") { group(source).push_back(flag); }
+    }
+    std::ostringstream out;
+    out << "settings";
+    for (const auto& [source, flags] : groups) {
+        if (flags.empty()) { continue; }
+        out << " | " << (source == "cli" ? "command line" : product::format_pretty_text(source))
+            << ':';
+        for (std::size_t i = 0; i < flags.size(); ++i) { out << (i == 0 ? " " : ", ") << flags[i]; }
+    }
+    if (out.str() == "settings") { return std::nullopt; }
+    return OperationalRecord{OperationalSeverity::Info, out.str()};
+}
+
+void OperationalLog::setting_sources(const std::map<std::string, std::string>& sources) const {
+    if (std::optional<OperationalRecord> record = render_setting_sources(sources)) {
+        write(std::move(*record));
+    }
 }
 
 void OperationalLog::engine_fatal_exit(double grace_seconds, bool will_exit) const {

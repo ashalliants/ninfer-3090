@@ -1,12 +1,19 @@
 #include "serve/generation_service.h"
+#include "serve/operational_log.h"
 #include "serve/props.h"
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,6 +33,215 @@ ServeOptions parse(std::vector<std::string> arguments) {
     argv.reserve(arguments.size());
     for (std::string& argument : arguments) { argv.push_back(argument.data()); }
     return parse_serve_options(static_cast<int>(argv.size()), argv.data());
+}
+
+// --config FILE through parse_serve_options. Each case returns its failures.
+std::filesystem::path config_directory() {
+    return std::filesystem::temp_directory_path() / "ninfer_serve_options_config_test";
+}
+
+std::string config_file(const std::string& name, const std::string& text) {
+    const std::filesystem::path path = config_directory() / name;
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream(path, std::ios::binary) << text;
+    return path.string();
+}
+
+// The message parse_serve_options throws for these arguments, or "" when it accepts them.
+std::string refusal(std::vector<std::string> arguments) {
+    try {
+        (void)parse(std::move(arguments));
+    } catch (const std::invalid_argument& error) { return error.what(); }
+    return "";
+}
+
+int config_strings_numbers_bools_arrays() {
+    const std::string path = config_file(
+        "shapes.json", R"({"max-context": 16384, "kv-dtype": "int8", "top-p": 0.9, "vision": true,
+                          "cors": false, "graft": ["a=a.safetensors", "b=b.safetensors"],
+                          "allowed-host": ["gpubox.lan"], "relaxed-drafting": 0.25,
+                          "spec": "mtp", "draft-tokens": 3})");
+    const ServeOptions options = parse({"ninfer-serve", "model.ninfer", "--config", path});
+    int failures = 0;
+    failures += check(options.max_context == 16384 && options.kv_capacity.explicit_tokens == 16384,
+                      "config: a number did not reach its option");
+    failures += check(options.kv_cache == ninfer::KvCacheStorage::Int8Group64,
+                      "config: a string did not reach its option");
+    failures += check(options.sampling_overrides.top_p == 0.9f && options.relaxed_drafting == 0.25f,
+                      "config: a decimal did not reach its option");
+    failures += check(options.enable_vision && !options.enable_cors,
+                      "config: true did not set a switch, or false did");
+    failures += check(options.grafts.size() == 2 && options.grafts[0].name == "a" &&
+                          options.grafts[1].name == "b" &&
+                          options.allowed_hosts == std::vector<std::string>{"gpubox.lan"},
+                      "config: an array did not repeat its flag");
+    // Every option that collects its occurrences takes an array (the reader's list matches).
+    const ServeOptions repeated = parse(
+        {"ninfer-serve", "model.ninfer", "--config",
+         config_file("repeated.json",
+                     R"({"allowed-host": ["a.lan", "b.lan"], "context-store": "store",
+                        "context-store-peer": ["peer-a", "peer-b"]})")});
+    failures += check(repeated.allowed_hosts.size() == 2 &&
+                          repeated.context_store_peers.size() == 2,
+                      "config: a repeatable option kept only one array element");
+    return failures;
+}
+
+int config_refuses_api_key() {
+    const std::string path = config_file("secret.json", R"({"api-key": "sk-secret"})");
+    const std::string message = refusal({"ninfer-serve", "model.ninfer", "--config", path});
+    int failures = 0;
+    failures += check(message.find(path) != std::string::npos &&
+                          message.find("\"api-key\"") != std::string::npos &&
+                          message.find("sk-secret") == std::string::npos,
+                      "config: an api-key in the file was not refused naming file and key");
+    // The key stays a command-line option beside a file, and stays redacted.
+    const std::string port = config_file("port.json", R"({"port": 9000})");
+    const ServeOptions keyed =
+        parse({"ninfer-serve", "model.ninfer", "--config", port, "--api-key", "sk-cli"});
+    failures += check(keyed.api_key == "sk-cli" && keyed.port == 9000,
+                      "config: --api-key on the command line beside a file was lost");
+    for (const auto* argv : {&keyed.startup_argv, &keyed.effective_argv}) {
+        failures += check(std::find(argv->begin(), argv->end(), "sk-cli") == argv->end() &&
+                              std::find(argv->begin(), argv->end(), "<redacted>") != argv->end(),
+                          "config: the API key was not redacted from the logged arguments");
+    }
+    return failures;
+}
+
+int config_unknown_key_names_file() {
+    int failures = 0;
+    const std::string typo = config_file("typo.json", R"({"max-contxt": 4096})");
+    failures += check(refusal({"ninfer-serve", "model.ninfer", "--config", typo}) ==
+                          typo + ": unknown key \"max-contxt\"",
+                      "config: an unknown key was not refused naming the file and key");
+    // A key set to false adds no word, but is still checked.
+    const std::string false_typo = config_file("false-typo.json", R"({"visoin": false})");
+    failures += check(refusal({"ninfer-serve", "model.ninfer", "--config", false_typo}) ==
+                          false_typo + ": unknown key \"visoin\"",
+                      "config: an unknown key set to false was accepted");
+    // The command line's own unknown flags keep their message.
+    const std::string empty = config_file("empty.json", "{}");
+    failures += check(refusal({"ninfer-serve", "model.ninfer", "--config", empty, "--max-contxt",
+                               "1"}) == "unknown argument: --max-contxt",
+                      "config: an unknown command-line flag was blamed on the file");
+    // Values of the wrong kind name the file and the key.
+    const auto refused = [&](const std::string& name, const std::string& text, const char* what) {
+        const std::string path    = config_file(name, text);
+        const std::string message = refusal({"ninfer-serve", "model.ninfer", "--config", path});
+        const std::string key     = text.substr(2, text.find('"', 2) - 2);
+        const std::string failure =
+            std::string("config: ") + what + " was not refused naming the file and key: " + message;
+        failures += check(message.rfind(path + ": \"" + key + "\"", 0) == 0, failure.c_str());
+    };
+    refused("switch-value.json", R"({"vision": "yes"})", "a value for a switch");
+    refused("missing-value.json", R"({"port": true, "host": "0.0.0.0"})",
+            "true for an option with a value");
+    refused("false-value.json", R"({"max-context": false})", "false for an option with a value");
+    refused("bad-value.json", R"({"port": "eighty"})", "an invalid value");
+    // One file per command line, and none inside a file.
+    failures += check(refusal({"ninfer-serve", "model.ninfer", "--config", typo, "--config",
+                               typo}) == "--config may be given once",
+                      "config: a second --config was accepted");
+    failures += check(refusal({"ninfer-serve", "model.ninfer", "--config"}) ==
+                          "--config needs a value",
+                      "config: --config without a file was accepted");
+    return failures;
+}
+
+int cli_overrides_file() {
+    const std::string path = config_file(
+        "override.json", R"({"max-context": 4096, "port": 9000, "graft": ["a=a.safetensors"]})");
+    // The command line wins wherever it stands, before --config or after it.
+    const ServeOptions options = parse({"ninfer-serve", "model.ninfer", "--max-context", "8192",
+                                        "--config", path, "--graft", "b=b.safetensors"});
+    int failures = 0;
+    failures += check(options.max_context == 8192, "config: the file overrode the command line");
+    failures += check(options.port == 9000, "config: the file did not override the default");
+    failures += check(options.host == "127.0.0.1", "config: a default changed");
+    failures += check(options.grafts.size() == 2 && options.grafts[0].name == "a" &&
+                          options.grafts[1].name == "b",
+                      "config: a repeatable option did not add the command line's to the file's");
+    return failures;
+}
+
+int bool_without_negation_errors() {
+    int failures = 0;
+    const std::string vision = config_file("vision.json", R"({"vision": true})");
+    failures += check(refusal({"ninfer-serve", "model.ninfer", "--config", vision,
+                               "--no-vision"}) ==
+                          vision + ": \"vision\" is set and has no command-line override",
+                      "config: a switch the command line cannot negate was not refused");
+    const std::string thinking = config_file("no-thinking.json", R"({"no-thinking": true})");
+    failures += check(refusal({"ninfer-serve", "model.ninfer", "--config", thinking,
+                               "--thinking"}) ==
+                          thinking + ": \"no-thinking\" is set and has no command-line override",
+                      "config: a negation the command line cannot undo was not refused");
+    // Without the file the same flag is an unknown argument.
+    failures += check(refusal({"ninfer-serve", "model.ninfer", "--no-vision"}) ==
+                          "unknown argument: --no-vision",
+                      "config: --no-vision changed meaning without a file");
+    // Where the negation exists, the command line resolves it.
+    const std::string autoload = config_file("autoload.json", R"({"models-autoload": true})");
+    failures += check(!parse({"ninfer-serve", "--models-dir", "models", "--config", autoload,
+                              "--no-models-autoload"})
+                           .models_autoload,
+                      "config: the command line's negation did not win over the file");
+    return failures;
+}
+
+int sources_recorded() {
+    const std::string path =
+        config_file("sources.json", R"({"max-context": 4096, "vision": true, "cors": false})");
+    const ServeOptions options = parse({"ninfer-serve", "model.ninfer", "--config", path,
+                                        "--max-context", "8192", "--port", "9000"});
+    const std::map<std::string, std::string> expected{{"--config", "cli"},
+                                                      {"--cors", "default"},
+                                                      {"--max-context", "cli"},
+                                                      {"--port", "cli"},
+                                                      {"--vision", path}};
+    int failures = 0;
+    failures += check(options.setting_sources == expected,
+                      "config: the setting sources are not the file's, the command line's and the "
+                      "defaults'");
+    failures += check(options.effective_argv ==
+                          std::vector<std::string>{"ninfer-serve", "model.ninfer", "--max-context",
+                                                   "4096", "--vision", "--max-context", "8192",
+                                                   "--port", "9000"},
+                      "config: the effective arguments are not the file's words then the command "
+                      "line's");
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).setting_sources.empty(),
+                      "config: a source was recorded for an option nobody set");
+    const std::optional<OperationalRecord> line = render_setting_sources(options.setting_sources);
+    failures += check(line && line->message == "settings | command line: --config, --max-context, "
+                                               "--port | " +
+                                                   path + ": --vision",
+                      "config: the startup line does not name each setting's source");
+    failures += check(!render_setting_sources({{"--cors", "default"}}),
+                      "config: a startup line was rendered with nothing set");
+    return failures;
+}
+
+// A path in the file is read as the same word on the command line would be: against the working
+// directory, not the file's own directory.
+int config_relative_paths_follow_cwd() {
+    const std::string path =
+        config_file("profiles/relative.json", R"({"chat-template": "templates/chat.jinja"})");
+    return check(parse({"ninfer-serve", "model.ninfer", "--config", path}).chat_template_path ==
+                     std::filesystem::path("templates/chat.jinja"),
+                 "config: a relative path was not kept as written");
+}
+
+// Router mode: the file is expanded before the per-model arguments are split off.
+int config_router_model_arguments() {
+    const std::string path =
+        config_file("router.json", R"({"models-dir": "models", "max-context": 4096})");
+    const ServeOptions options =
+        parse({"ninfer-serve", "--config", path, "--max-concurrency", "2"});
+    return check(options.router() && options.models_dir == std::filesystem::path("models") &&
+                     options.model_arguments == std::vector<std::string>{"--max-context", "4096",
+                                                                         "--max-concurrency", "2"},
+                 "config: router mode did not pass the file's options on to each model");
 }
 
 } // namespace
@@ -1524,6 +1740,16 @@ int main() {
                                        "4096"}) == 4096,
                           "/props did not report the effective --max-output-tokens cap");
     }
+
+    failures += config_strings_numbers_bools_arrays();
+    failures += config_refuses_api_key();
+    failures += config_unknown_key_names_file();
+    failures += cli_overrides_file();
+    failures += bool_without_negation_errors();
+    failures += sources_recorded();
+    failures += config_relative_paths_follow_cwd();
+    failures += config_router_model_arguments();
+    std::filesystem::remove_all(config_directory());
 
     return failures == 0 ? 0 : 1;
 }

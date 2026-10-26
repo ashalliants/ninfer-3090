@@ -1,6 +1,7 @@
 #include "serve/serve_options.h"
 
 #include "serve/http_security.h"
+#include "serve/serve_config_file.h"
 
 #include <algorithm>
 #include "product/reasoning_loop_options.h"
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -190,7 +192,8 @@ std::string serve_usage_text(const char* argv0) {
            "[options passed to every model]    (router mode: several models, no artifact path)\n"
            "   or: " +
            argv0 +
-           " <model.ninfer> [--host H] [--port N] [--api-key KEY] [--allowed-host NAME]... "
+           " <model.ninfer> [--config FILE] [--host H] [--port N] [--api-key KEY] "
+           "[--allowed-host NAME]... "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--fit-context MIN] "
            "[--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
@@ -243,6 +246,9 @@ std::string serve_usage_text(const char* argv0) {
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
+           "       --config FILE reads options from a JSON object of flag names without dashes "
+           "(\"max-context\": 65536, \"vision\": true; an array repeats a repeatable flag); the "
+           "command line wins over the file. Not --api-key\n"
            "       --default-max-tokens fixes the output budget of requests that omit a limit; "
            "unset, such a request may run to the end of its context\n"
            "       --max-output-tokens caps the output budget of every request, including ones "
@@ -496,19 +502,42 @@ std::vector<std::uint32_t> parse_stage_layers(std::string_view text) {
     return counts;
 }
 
-ServeOptions parse_serve_options(int argc, char** argv) {
-    ServeOptions options;
-    options.startup_argv.reserve(static_cast<std::size_t>(argc));
-    bool redact_next = false;
-    for (int i = 0; i < argc; ++i) {
-        if (redact_next) {
-            options.startup_argv.emplace_back("<redacted>");
-            redact_next = false;
-            continue;
-        }
-        options.startup_argv.emplace_back(argv[i] == nullptr ? "" : argv[i]);
-        redact_next = options.startup_argv.back() == "--api-key";
+namespace {
+
+// Where an argument word came from: the command line, or a --config file's key.
+struct WordOrigin {
+    std::string file;   // the --config path as given; empty for the command line
+    std::string key;    // the file's key (file words only)
+    bool value = false; // a file word that is its key's value, not the flag
+};
+
+// A word no flag matches; --config tells its own unknown keys apart from it.
+struct UnknownArgument : std::invalid_argument {
+    using std::invalid_argument::invalid_argument;
+};
+// A flag given last, with no value after it.
+struct MissingValue : std::invalid_argument {
+    using std::invalid_argument::invalid_argument;
+};
+// A refusal that already names the config file and its key.
+struct ConfigError : std::invalid_argument {
+    using std::invalid_argument::invalid_argument;
+};
+
+std::vector<std::string> redacted(const std::vector<std::string>& words) {
+    std::vector<std::string> out;
+    out.reserve(words.size());
+    for (const std::string& word : words) {
+        out.push_back(!out.empty() && out.back() == "--api-key" ? "<redacted>" : word);
     }
+    return out;
+}
+
+// The flag loop and the cross-checks, over the words --config expanded. `current` is the word the
+// loop is at, or npos once it is done, so a refusal can be blamed on a file's key.
+ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin>& origins,
+                             std::size_t& current) {
+    ServeOptions options;
     bool kv_capacity_explicit  = false;
     bool device_explicit       = false;
     bool context_store_tuning  = false;
@@ -546,11 +575,31 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         options.model_arguments.emplace_back(current);
     }
+    // A file's flag takes only its own value, never the next key or the command line's next word.
+    const auto value_follows = [&](int at) {
+        return at + 1 < argc && (origins[static_cast<std::size_t>(at)].file.empty() ||
+                                 origins[static_cast<std::size_t>(at) + 1].value);
+    };
     for (int i = artifact_given ? 2 : 1; i < argc; ++i) {
         const std::string arg    = argv[i];
+        const WordOrigin& origin = origins[static_cast<std::size_t>(i)];
+        current                  = static_cast<std::size_t>(i);
+        if (origin.value) {
+            // A file's value the flag before it did not take: that flag is a switch.
+            throw ConfigError(origin.file + ": \"" + origin.key + "\" does not take the value \"" +
+                              arg + "\"; set it to true or false");
+        }
+        if (arg.rfind("--", 0) == 0) {
+            options.setting_sources[arg] = origin.file.empty() ? "cli" : origin.file;
+        }
         const auto require_value = [&](const char* flag) -> const char* {
-            if (++i >= argc) { throw std::invalid_argument(std::string(flag) + " needs a value"); }
-            return argv[i];
+            if (!value_follows(i)) {
+                if (!origin.file.empty()) {
+                    throw ConfigError(origin.file + ": \"" + origin.key + "\" needs a value");
+                }
+                throw MissingValue(std::string(flag) + " needs a value");
+            }
+            return argv[++i];
         };
         if (arg == "--host") {
             options.host = require_value("--host");
@@ -730,7 +779,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--relaxed-drafting") {
             // The value is optional: a number in [0,1] when the next argument is one.
             options.relaxed_drafting = ninfer::kRelaxedDraftingDefault;
-            if (i + 1 < argc && looks_like_number(argv[i + 1])) {
+            if (value_follows(i) && looks_like_number(argv[i + 1])) {
                 options.relaxed_drafting =
                     parse_float_in(argv[++i], "relaxed-drafting", 0.0f, 1.0f);
             }
@@ -1037,10 +1086,24 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.greedy = true;
         } else if (arg == "--log-level") {
             options.log_level = product::parse_log_level(require_value("--log-level"));
+        } else if (!origin.file.empty()) {
+            throw ConfigError(origin.file + ": unknown key \"" + origin.key + "\"");
         } else {
-            throw std::invalid_argument("unknown argument: " + arg);
+            // The command line trying to undo a file's switch with a negation that does not exist
+            // (--no-vision against "vision": true, --thinking against "no-thinking": true).
+            const std::string undone = arg.rfind("--no-", 0) == 0 ? "--" + arg.substr(5)
+                                       : arg.rfind("--", 0) == 0  ? "--no-" + arg.substr(2)
+                                                                  : std::string();
+            for (std::size_t j = 0; !undone.empty() && j < origins.size(); ++j) {
+                if (!origins[j].file.empty() && !origins[j].value && argv[j] == undone) {
+                    throw ConfigError(origins[j].file + ": \"" + origins[j].key +
+                                      "\" is set and has no command-line override");
+                }
+            }
+            throw UnknownArgument("unknown argument: " + arg);
         }
     }
+    current = std::string::npos;
     if (!options.default_graft.empty() &&
         std::none_of(options.grafts.begin(), options.grafts.end(), [&](const GraftSource& source) {
             return source.name == options.default_graft;
@@ -1239,6 +1302,107 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.sleep_idle_seconds != 0 && !options.suspend.enabled && !options.router()) {
         throw std::invalid_argument("--sleep-idle-seconds requires --model-suspend");
+    }
+    return options;
+}
+
+enum class FlagKind : std::uint8_t { Unknown, Switch, Value };
+
+// What the flag loop makes of `flag` alone: the parser is the one list of flags, so a key a
+// config file sets to false (which adds no word) is checked against it.
+FlagKind flag_kind(const std::string& flag) {
+    std::vector<std::string> words{"ninfer-serve", "probe.ninfer", flag};
+    std::vector<char*> argv;
+    for (std::string& word : words) { argv.push_back(word.data()); }
+    std::size_t current = std::string::npos;
+    try {
+        (void)parse_arguments(static_cast<int>(argv.size()), argv.data(),
+                              std::vector<WordOrigin>(words.size()), current);
+    } catch (const UnknownArgument&) {
+        return FlagKind::Unknown;
+    } catch (const MissingValue&) {
+        return FlagKind::Value;
+    } catch (const std::exception&) {
+        // A switch the cross-checks want another option beside (--progress-anchors-shared).
+    }
+    return FlagKind::Switch;
+}
+
+} // namespace
+
+ServeOptions parse_serve_options(int argc, char** argv) {
+    std::vector<std::string> raw;
+    for (int i = 0; i < argc; ++i) { raw.emplace_back(argv[i] == nullptr ? "" : argv[i]); }
+    // --config FILE: the file's words go first, after the artifact path, and the command line's
+    // after them, so the command line's win wherever --config stands (the flag loop keeps the last
+    // value). --help reads no file.
+    std::vector<std::string> words;
+    std::vector<WordOrigin> origins;
+    const auto add = [&](std::string word, WordOrigin origin) {
+        words.push_back(std::move(word));
+        origins.push_back(std::move(origin));
+    };
+    const bool help        = raw.size() >= 2 && (raw[1] == "--help" || raw[1] == "-h");
+    const std::size_t rest = raw.size() >= 2 && raw[1].rfind("--", 0) != 0 ? 2 : 1;
+    for (std::size_t i = 0; i < std::min(rest, raw.size()); ++i) { add(raw[i], {}); }
+    std::optional<std::string> config;
+    for (std::size_t i = rest; i < raw.size() && !help; ++i) {
+        if (raw[i] != "--config") { continue; }
+        if (config) { throw std::invalid_argument("--config may be given once"); }
+        if (i + 1 >= raw.size()) { throw std::invalid_argument("--config needs a value"); }
+        config = raw[i + 1];
+    }
+    ConfigWords file;
+    if (config) {
+        file = read_serve_config(*config);
+        for (std::size_t i = 0; i < file.words.size(); ++i) {
+            add(file.words[i], {.file = *config, .key = file.keys[i], .value = file.values[i]});
+        }
+        for (const std::string& key : file.false_keys) {
+            const FlagKind kind = flag_kind("--" + key);
+            if (kind == FlagKind::Unknown) {
+                throw std::invalid_argument(*config + ": unknown key \"" + key + "\"");
+            }
+            if (kind == FlagKind::Value) {
+                throw std::invalid_argument(*config + ": \"" + key +
+                                            "\" takes a value, not false");
+            }
+        }
+    }
+    for (std::size_t i = rest; i < raw.size(); ++i) {
+        if (config && raw[i] == "--config") {
+            ++i;
+            continue;
+        }
+        add(raw[i], {});
+    }
+
+    std::vector<char*> pointers;
+    for (std::string& word : words) { pointers.push_back(word.data()); }
+    std::size_t current = std::string::npos;
+    ServeOptions options;
+    try {
+        options = parse_arguments(static_cast<int>(pointers.size()), pointers.data(), origins,
+                                  current);
+    } catch (const ConfigError&) {
+        throw;
+    } catch (const std::invalid_argument& error) {
+        // A value the file gave that its option refuses: name the file and the key.
+        if (current < origins.size() && !origins[current].file.empty()) {
+            throw std::invalid_argument(origins[current].file + ": \"" + origins[current].key +
+                                        "\": " + error.what());
+        }
+        throw;
+    }
+    // Secret-bearing values are redacted: these are provenance only.
+    options.startup_argv   = redacted(raw);
+    options.effective_argv = redacted(words);
+    if (config) {
+        options.setting_sources["--config"] = "cli";
+        for (const std::string& key : file.false_keys) {
+            // Unless the command line set it.
+            options.setting_sources.emplace("--" + key, "default");
+        }
     }
     return options;
 }
