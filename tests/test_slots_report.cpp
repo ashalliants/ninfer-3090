@@ -21,7 +21,7 @@ int expect_json(const std::string& actual, const std::string& expected, const ch
                  std::string(what) + "\n  expected: " + expected + "\n  actual:   " + actual);
 }
 
-// Three lanes, one per state, and two waiting requests, one more than were listed.
+// Three lanes, one per state. The waiting queue is /v1/load's, not part of /slots.
 RuntimeStats fixed_stats() {
     RuntimeStats stats;
     stats.lane_count = 3;
@@ -52,7 +52,7 @@ RuntimeStats fixed_stats() {
     stats.lanes[3].request_id = 99;
     stats.waiting             = {RuntimeWaitingStats{.request_id = 8, .prompt_tokens = 512,
                                                      .waited_seconds = 1.25}};
-    stats.waiting_requests    = 2;
+    stats.waiting_requests    = 1;
     return stats;
 }
 
@@ -61,36 +61,32 @@ RuntimeStats fixed_stats() {
 int main() {
     int failures = 0;
 
-    // render_slots_shape: the exact body for a fixed snapshot.
+    // render_slots_shape: the exact body for a fixed snapshot, llama.cpp's top-level array.
     failures += expect_json(
-        ninfer::serve::render_slots_json(fixed_stats()),
-        R"({"slots":[)"
-        R"({"id":0,"state":"prefill","request_id":7,"prompt_tokens":4096,"prompt_done":3072,)"
-        R"("reused":2048,"generated":0,"n_ctx_used":3072,"tokens_per_second":0.0,"drafted":0,)"
-        R"("accepted":0,"relaxed_kept":0},)"
-        R"({"id":1,"state":"decoding","request_id":5,"prompt_tokens":100,"prompt_done":100,)"
-        R"("reused":0,"generated":41,"n_ctx_used":141,"tokens_per_second":62.5,"drafted":48,)"
-        R"("accepted":30,"relaxed_kept":2},)"
-        R"({"id":2,"state":"idle","request_id":null,"prompt_tokens":0,"prompt_done":0,)"
-        R"("reused":0,"generated":0,"n_ctx_used":0,"tokens_per_second":0.0,"drafted":0,)"
-        R"("accepted":0,"relaxed_kept":0}],)"
-        R"("queue":[{"id":8,"prompt_tokens":512,"waited_s":1.25}],"queue_total":2})",
+        ninfer::serve::render_slots_json(fixed_stats(), 65536),
+        R"([)"
+        R"({"id":0,"is_processing":true,"state":"prefill","request_id":7,"n_ctx":65536,)"
+        R"("prompt_tokens":4096,"prompt_done":3072,"reused":2048,"generated":0,"n_ctx_used":3072,)"
+        R"("tokens_per_second":0.0,"drafted":0,"accepted":0,"relaxed_kept":0},)"
+        R"({"id":1,"is_processing":true,"state":"decoding","request_id":5,"n_ctx":65536,)"
+        R"("prompt_tokens":100,"prompt_done":100,"reused":0,"generated":41,"n_ctx_used":141,)"
+        R"("tokens_per_second":62.5,"drafted":48,"accepted":30,"relaxed_kept":2},)"
+        R"({"id":2,"is_processing":false,"state":"idle","request_id":null,"n_ctx":65536,)"
+        R"("prompt_tokens":0,"prompt_done":0,"reused":0,"generated":0,"n_ctx_used":0,)"
+        R"("tokens_per_second":0.0,"drafted":0,"accepted":0,"relaxed_kept":0}])",
         "render_slots_shape: the /slots body for a fixed snapshot");
 
     // An Engine that has not published yet (or a scoring Engine) has no lanes.
-    failures += expect_json(ninfer::serve::render_slots_json(RuntimeStats{}),
-                            R"({"slots":[],"queue":[],"queue_total":0})",
-                            "an empty snapshot renders empty lists");
+    failures += expect_json(ninfer::serve::render_slots_json(RuntimeStats{}, 65536), "[]",
+                            "an empty snapshot renders an empty array");
 
     // JSON has no NaN or infinity: a rate that is not finite is reported as 0.
     RuntimeStats odd = fixed_stats();
     odd.lane_count   = 2;
     odd.lanes[1].decode_tokens_per_second = std::numeric_limits<double>::infinity();
-    odd.waiting[0].waited_seconds         = std::numeric_limits<double>::quiet_NaN();
-    const std::string body                = ninfer::serve::render_slots_json(odd);
-    failures += check(body.find(R"("tokens_per_second":0.0,"drafted":48)") != std::string::npos &&
-                          body.find(R"("waited_s":0.0})") != std::string::npos,
-                      "a non-finite rate or wait was not rendered as 0: " + body);
+    const std::string body                = ninfer::serve::render_slots_json(odd, 65536);
+    failures += check(body.find(R"("tokens_per_second":0.0,"drafted":48)") != std::string::npos,
+                      "a non-finite rate was not rendered as 0: " + body);
 
     if (failures == 0) { std::cout << "slots report: ok\n"; }
     return failures == 0 ? 0 : 1;

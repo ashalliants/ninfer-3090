@@ -78,6 +78,18 @@ std::string make_load_report(const LoadCapacity& capacity, const LoadSample& sam
                        static_cast<double>(stats.host_work.device_wait_ns) / 1e9}}},
         {"last_request", nullptr},
     };
+    // The waiting requests, oldest first: the first kMaximumReportedWaitingRequests of
+    // queue_total.
+    Json queue = Json::array();
+    for (const ninfer::RuntimeWaitingStats& waiting : stats.waiting) {
+        queue.push_back(Json{{"id", waiting.request_id},
+                             {"prompt_tokens", waiting.prompt_tokens},
+                             {"waited_s", std::isfinite(waiting.waited_seconds)
+                                              ? waiting.waited_seconds
+                                              : 0.0}});
+    }
+    report["requests"]["queue"]       = std::move(queue);
+    report["requests"]["queue_total"] = stats.waiting_requests;
     if (const auto& pace = sample.last_generation) {
         report["last_request"] = Json{{"completion_tokens", pace->completion_tokens},
                                       {"generation_wall_seconds", pace->generation_wall_seconds},
