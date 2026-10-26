@@ -803,12 +803,12 @@ and the design are in `docs/maintainer/pipeline-parallel-plan.md`.
 
 **v0.14.2:** `--host-cache-max-mib` caps the RAM cache on shared machines. This release also
 added `--max-prefill-lanes` and `GET /slots`, which the current engine no longer provides
-(see [docs/serving.md](docs/serving.md)). See the [v0.14.2 release notes](RELEASE_NOTES_0.14.2.md).
+(see [docs/serving.md](docs/serving.md)). See the [v0.14.2 release notes](docs/release-notes/RELEASE_NOTES_0.14.2.md).
 
 **v0.14.1:** a stability fix for `ninfer-serve`. A large or unplannable request no longer fails
 every running request (`internal error generation`) or clears the context cache; only that request
 fails, and a latched engine now exits so a supervisor can restart it. See the
-[v0.14.1 release notes](RELEASE_NOTES_0.14.1.md).
+[v0.14.1 release notes](docs/release-notes/RELEASE_NOTES_0.14.1.md).
 
 **v0.14.0: `--auto-host-cache`.** One flag now sizes the RAM tier of the context cache from
 the machine, so a server that exists to serve long agent conversations keeps them cached after they
@@ -816,14 +816,14 @@ leave the GPU instead of re-reading them from scratch. It replaces four hand-tun
 a container's memory limit. Also: vision together with a multi-GPU `--devices` split, a
 `download-model` step that fetches the `godmode` graft when you have access, a repetition guard in
 the tuned launcher profiles, and a compiler cache that cuts a full rebuild from over ten minutes to
-about one and a half. 5 merged PRs — see the [v0.14.0 release notes](RELEASE_NOTES_0.14.0.md) for what
+about one and a half. 5 merged PRs — see the [v0.14.0 release notes](docs/release-notes/RELEASE_NOTES_0.14.0.md) for what
 each does and what was not verified.
 
-Previous: [v0.13.0](RELEASE_NOTES_0.13.0.md) (a smaller, closer-to-Q8 Qwen3.8-27B, per-request
-`thinking_budget`), [v0.12.0](RELEASE_NOTES_0.12.0.md) (real multi-GPU, structured JSON output, a
-self-healing engine), [v0.11.0](RELEASE_NOTES_0.11.0.md) (prefill roughly 2x faster, DFlash2 the recommended
-decode backend), [v0.10.0](RELEASE_NOTES_0.10.0.md) (tensor-core small-T kernels: MTP3 decode 1.5x
-at C1 and 1.7x at C8), [v0.9.1](RELEASE_NOTES_0.9.1.md), [v0.9.0](RELEASE_NOTES_0.9.0.md).
+Previous: [v0.13.0](docs/release-notes/RELEASE_NOTES_0.13.0.md) (a smaller, closer-to-Q8 Qwen3.8-27B, per-request
+`thinking_budget`), [v0.12.0](docs/release-notes/RELEASE_NOTES_0.12.0.md) (real multi-GPU, structured JSON output, a
+self-healing engine), [v0.11.0](docs/release-notes/RELEASE_NOTES_0.11.0.md) (prefill roughly 2x faster, DFlash2 the recommended
+decode backend), [v0.10.0](docs/release-notes/RELEASE_NOTES_0.10.0.md) (tensor-core small-T kernels: MTP3 decode 1.5x
+at C1 and 1.7x at C8), [v0.9.1](docs/release-notes/RELEASE_NOTES_0.9.1.md), [v0.9.0](docs/release-notes/RELEASE_NOTES_0.9.0.md).
 
 ## Upstream
 

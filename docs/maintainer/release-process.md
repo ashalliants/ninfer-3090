@@ -7,7 +7,7 @@ or very nearly shipped a broken archive.
 ## The flow
 
 1. **Prepare.** Branch `release/vX.Y.Z` from `master`. Set `VERSION` to the full tag (for example
-   `0.11.0-rtx3090`), write `RELEASE_NOTES_X.Y.Z.md`, refresh the README highlights, open a PR and
+   `0.11.0-rtx3090`), write `docs/release-notes/RELEASE_NOTES_X.Y.Z.md`, refresh the README highlights, open a PR and
    merge it. Everything version-specific is derived from `VERSION` by the packagers; there is nothing
    to copy and edit.
 2. **Build both platforms from the same commit, after `VERSION` is set.** The binaries embed
@@ -28,7 +28,7 @@ or very nearly shipped a broken archive.
 4. **Smoke-test on the real machine** (below), not just the unit tests.
 5. **Publish.** Merge the release PR, tag the merge commit (annotated), push the tag, then
    `gh release create vX.Y.Z-rtx3090 <zip> <tar.gz> <both SHA256SUMS files> -R ashalliants/ninfer-3090
-   --notes-file RELEASE_NOTES_X.Y.Z.md --title "..." --latest`.
+   --notes-file docs/release-notes/RELEASE_NOTES_X.Y.Z.md --title "..." --latest`.
 
 ## Gotchas
 
@@ -150,7 +150,7 @@ ccache, then 5 minutes for each repackage. Traps:
 - **Package twice.** The zip embeds the notes, so a notes edit changes its hash; rerunning the script is
   incremental and removes the old `dist/*<version>*` first.
 - The first run of `release-windows.ps1` without the notes in the checkout compiles everything and then
-  fails at packaging with "Missing RELEASE_NOTES_X.Y.Z.md": commit the notes before building, or just rerun.
+  fails at packaging with "Missing docs/release-notes/RELEASE_NOTES_X.Y.Z.md": commit the notes before building, or just rerun.
 
 ### Windows without a card: what the v0.16.1 run needed
 
