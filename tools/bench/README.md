@@ -76,6 +76,38 @@ Two things it refuses rather than lets you get wrong:
 line and needs changing for `ninfer_bench`, which prints CSV. A run where any sample produced no
 number exits 1, because a comparison with a hole in it is not a comparison.
 
+## Greedy identity between two builds (`greedy_identity.py`)
+
+Do two builds produce the same tokens? The tool runs each `ninfer` CLI on every prompt of a JSONL file
+(default `bench/fixtures/chat_prompts.jsonl`, 24 prompts) with `--greedy --print-token-ids --max-new N`,
+reads the generated ids the CLI prints on stderr, and prints `GREEDY IDENTICAL`, or `GREEDY DIFFERS`
+with the first differing prompt and token index (exit 1) and the ids around it. Exit 2 means a build
+crashed or printed no ids line, so nothing was compared.
+
+```bash
+python3 tools/bench/greedy_identity.py \
+    --a build-ninja/apps/ninfer.exe --b build-ninja/apps/ninfer-new.exe \
+    --model models/qwen3_8_27b.ninfer --tokens 128 --limit 6 \
+    --extra-args="--kv-dtype rk4v4 --max-context 8192"
+```
+
+`--extra-args` is one string given to **both** builds; use it for the option under test and to pin
+what would otherwise differ. Write it with `=` so a leading `--` is not read as another option.
+`--limit N` runs only the first N prompts. Both builds must sit in the same directory under different
+names (the same preflight as `run_interleaved_ab.py`). Equal ids say the builds take the same
+numerical path; unequal ids are not necessarily a bug (a different reduction order flips a near-tie), but
+the index says how far in they agree.
+
+It runs the builds one after the other on the card, a process per prompt and build, so **hold the GPU
+lock around the whole run** (CLAUDE.md, "GPU lock"):
+
+```powershell
+. tools/gpu-lock.ps1
+Invoke-WithGpuLock { python tools/bench/greedy_identity.py --a ... --b ... --model ... }
+```
+
+Its self-test, `ninfer_greedy_identity_test`, uses fake CLIs and needs no GPU.
+
 ## External Serve TTFT
 
 [`ttft/README.md`](ttft/README.md) defines the black-box latency benchmark. The measurement runner

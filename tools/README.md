@@ -20,6 +20,8 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Measure the card's sustained memory bandwidth | [`hbm_bandwidth_probe.cu`](hbm_bandwidth_probe.cu) |
 | One-time upgrade of official v2 artifacts | [`upgrade_ninfer_v2_to_v3.py`](upgrade_ninfer_v2_to_v3.py), with positional `INPUT OUTPUT` paths |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
+| Check two builds give the same greedy tokens | [`bench/greedy_identity.py`](bench/README.md#greedy-identity-between-two-builds-greedy_identitypy) |
+| Keep direct stderr writes under `src/` from growing | [`check_stderr_logging.py`](check_stderr_logging.py); [logging policy](../docs/maintainer/logging.md#direct-stderr-ratchet) |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |

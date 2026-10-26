@@ -164,6 +164,33 @@ only the stable fallback classification; generated markup and arguments remain e
 There is no dual spdlog/custom operational path. Product results, machine measurements, and the
 explicit emergency cases above remain direct outputs because they are different contracts.
 
+### Direct stderr ratchet
+
+Code under `src/` reaches stderr through the product logger, except for the emergency diagnostics of
+section 1 and the logging runtime's own sink. `tools/check_stderr_logging.py` keeps that list from
+growing: `tools/stderr_logging.allow` records, per file, how many times the code names stderr today,
+and the check fails when a file's count rises or a file that is not listed names stderr. A lower count
+passes with a note.
+
+A use is one match of `std::cerr`, `std::clog`, `cerr`, `clog`, `stderr` or `perror(` as a whole word,
+after comments and string and character literals are blanked out. So `fprintf(stderr, ...)`,
+`fflush(stderr)`, `fputs(..., stderr)` and `std::cerr <<` each count once, while a comment or a log
+message that merely says "stderr", `STDERR_FILENO` and spdlog's `stderr_color_sink_st` do not. The
+files are those git tracks under `src/` (`apps/`, `tests/` and `bench/` print results to stderr by
+design and are not checked). It runs as the host-only test `ninfer_stderr_logging_ratchet_test`, so CI
+enforces it, and by hand:
+
+```bash
+python3 tools/check_stderr_logging.py            # check
+python3 tools/check_stderr_logging.py --update   # after removing a direct write: lower the allowlist
+python3 tools/check_stderr_logging.py --counts   # print the current counts in allowlist format
+```
+
+When a change removes a direct write, run `--update` and commit the lower numbers; the ceiling then
+stays down. `--update` never raises a count. A new emergency diagnostic (a cleanup failure at a boundary
+that cannot reach a logger) is added to the allowlist by hand, in the same change, so the exception is
+visible to the reviewer; anything operational uses a logger instead.
+
 ## 7. Verification policy
 
 Logging tests protect NInfer-owned observable semantics, not private object shape. The request-log

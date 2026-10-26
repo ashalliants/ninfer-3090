@@ -23,6 +23,7 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_gdn_replay_records_test
   ninfer_ggml_blocks_decode_test
   ninfer_gpu_telemetry_test
+  ninfer_greedy_identity_test
   ninfer_hc_int8_codec_test
   ninfer_grammar_test
   ninfer_host_arena_replay_test
@@ -56,6 +57,8 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_scheduler_test
   ninfer_serve_config_file_test
   ninfer_serve_soak_test
+  ninfer_stderr_logging_check_test
+  ninfer_stderr_logging_ratchet_test
   ninfer_tensor_test
   ninfer_wide_math_test
   ninfer_worker_recovery_test

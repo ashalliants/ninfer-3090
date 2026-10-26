@@ -49,3 +49,18 @@ add_test(NAME ninfer_bench_rows_check_test
 # answers 400/500, grows its resident memory and goes away. Pure Python, no GPU, about 12 s.
 add_test(NAME ninfer_serve_soak_test
   COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/bench/test_serve_soak.py)
+
+# The stderr ratchet (tools/check_stderr_logging.py): its self-test on temporary trees (a rise or a new
+# file fails, a drop passes and --update lowers it, comments and strings are not counted), and the real
+# check of src/ against tools/stderr_logging.allow, which is what makes CI refuse a new direct write.
+# Pure Python, no GPU.
+add_test(NAME ninfer_stderr_logging_check_test
+  COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/test_check_stderr_logging.py)
+add_test(NAME ninfer_stderr_logging_ratchet_test
+  COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/check_stderr_logging.py
+          --root ${PROJECT_SOURCE_DIR})
+
+# The greedy identity tool's self-test (tools/bench/greedy_identity.py), against fake CLIs that agree,
+# diverge at a chosen token, stop early, crash or print no ids. Pure Python, no GPU.
+add_test(NAME ninfer_greedy_identity_test
+  COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/bench/test_greedy_identity.py)

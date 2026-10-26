@@ -33,6 +33,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_gdn_replay_records_test
   ninfer_ggml_blocks_decode_test
   ninfer_grammar_test
+  ninfer_greedy_identity_test
   ninfer_hadamard_overlap_test
   ninfer_hc_int8_codec_test
   ninfer_host_arena_replay_test
@@ -102,6 +103,8 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_serve_soak_test
   ninfer_serve_options_test
   ninfer_slots_report_test
+  ninfer_stderr_logging_check_test
+  ninfer_stderr_logging_ratchet_test
   ninfer_tensor_test
   ninfer_tool_call_parser_test
   ninfer_wide_math_test
