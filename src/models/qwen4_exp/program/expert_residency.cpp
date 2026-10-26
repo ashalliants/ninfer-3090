@@ -8,6 +8,7 @@
 
 #include "core/copy_batch.h"
 #include "core/pinned_upload.h"
+#include "models/qwen4_exp/memory_plan.h"
 
 #include <algorithm>
 #include <atomic>
@@ -37,10 +38,11 @@ constexpr int kSpillRetries = 3;
 constexpr std::chrono::milliseconds kSpillRetryWait{100};
 
 // Partial RAM residency: records read from the artifact per batch while place_partial fills the
-// frames, through a pinned bounce of two halves.
-constexpr std::size_t kPlaceBatch = 16;
+// frames, through a pinned bounce of two halves (partial_place_bounce_bytes, planned by the RAM ledger).
+constexpr std::size_t kPlaceBatch = kPartialPlaceRecords;
 
 std::atomic<std::uint64_t> g_process_write_backs{0};
+std::atomic<std::uint64_t> g_process_refilled_promotions{0};
 
 } // namespace
 
@@ -53,6 +55,10 @@ std::uint64_t ExpertResidency::table_bytes(const TextConfig& config, std::int32_
 
 std::uint64_t ExpertResidency::process_write_backs() noexcept {
     return g_process_write_backs.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ExpertResidency::process_written_back_promotions() noexcept {
+    return g_process_refilled_promotions.load(std::memory_order_relaxed);
 }
 
 std::uint32_t ExpertResidency::max_frames(const TextConfig& config) noexcept {
@@ -101,7 +107,17 @@ ExpertResidency::ExpertResidency(const TextConfig& config, std::vector<const std
         }
         homes_ = std::make_unique<partial::Residency>(experts_, partial->slots, strides_);
         read_  = std::move(partial->read);
-        ram_pool_ = PinnedHostBuffer(std::max<std::size_t>(1, homes_->pool_bytes()));
+        try {
+            ram_pool_ = PinnedHostBuffer(std::max<std::size_t>(1, homes_->pool_bytes()));
+        } catch (const std::exception& error) {
+            // Windows may refuse to page-lock this much in one process (WDDM): more VRAM frames make
+            // the pool smaller.
+            throw std::runtime_error(
+                "Qwen3.8-Flash-Next could not pin " + std::to_string(homes_->pool_bytes() >> 20) +
+                " MiB of RAM for --partial-ram-residency's expert slots (" + error.what() +
+                "): give the expert cache more VRAM with a lower --vram-headroom-mib, free RAM, or start without "
+                "--partial-ram-residency");
+        }
         void* mapped = nullptr;
         CUDA_CHECK(cudaHostGetDevicePointer(&mapped, ram_pool_.data(), 0));
         ram_device_   = static_cast<const std::uint8_t*>(mapped);
@@ -110,6 +126,7 @@ ExpertResidency::ExpertResidency(const TextConfig& config, std::vector<const std
         slots_device_ = DeviceBuffer(keys * sizeof(void*));
         slots_device_.copy_from_host(slots_upload_.data(), keys * sizeof(void*));
         slots_cpu_.assign(keys, nullptr);
+        written_back_.assign(keys, 0);
         // A victim held only in VRAM is written back before its frame is reused.
         controller_->set_writeback([this](std::uint32_t key) {
             return homes_->frame(key) >= 0 && !homes_->in_ram(key) && !homes_->writing_back(key);
@@ -284,6 +301,12 @@ void ExpertResidency::publish_landed() {
             continue;
         }
         CUDA_CHECK(status);
+        if (homes_ && std::any_of(it->loads.begin(), it->loads.end(),
+                                  [&](const Batch::Load& load) { return homes_->writing_back(load.key); })) {
+            // A load of a slot was issued after that slot's write-back on the copy stream, so its
+            // landing means the write-back landed too, though its event read not ready a moment ago.
+            publish_write_backs();
+        }
         for (const auto& load : it->loads) {
             // Publish only the load the policy still wants: the same key, frame and serial (a key
             // evicted and re-admitted into this frame meanwhile has a newer copy in flight).
@@ -546,6 +569,11 @@ void ExpertResidency::issue_loads(cudaStream_t compute, const std::vector<CacheC
             const std::uint8_t* source =
                 homes_ ? static_cast<const std::uint8_t*>(ram_pool_.data()) + homes_->ram_offset(load.key)
                        : banks_[layer] + static_cast<std::size_t>(expert) * strides_[layer];
+            // A promotion from a slot a write-back filled (the engine gate requires some: their bytes
+            // came from a frame, not from the artifact).
+            if (homes_ && (written_back_[load.key] || homes_->writing_back(load.key))) {
+                g_process_refilled_promotions.fetch_add(1, std::memory_order_relaxed);
+            }
             copies.add(base + static_cast<std::size_t>(load.frame) * stride_, source, strides_[layer]);
         }
         copies.flush();
@@ -601,15 +629,30 @@ void ExpertResidency::upload_slot_table(cudaStream_t compute) {
 void ExpertResidency::apply_partial_evictions() {
     auto* table = static_cast<std::int32_t*>(table_host_.data());
     auto* base  = frame_base();
-    WriteBack batch;
+    // The round's moves: the evicted experts (ABSENT entries of published ones) and the admitted ones
+    // (copies). plan_swap names the write-backs and refuses an admission without a RAM copy.
+    std::vector<std::uint32_t> evicted, admitted;
+    std::vector<const CacheController::Command*> absent;
     for (const auto& command : commands_) {
+        if (command.kind == CacheController::Command::Kind::kCopy) { admitted.push_back(command.key); }
         if (command.kind != CacheController::Command::Kind::kWriteEntry ||
             ResidencyEntry::decode(command.word).state != ResidencyState::kAbsent) {
             continue;
         }
+        if (homes_->frame(command.key) < 0 || homes_->writing_back(command.key)) { continue; } // never published, or leaving
+        evicted.push_back(command.key);
+        absent.push_back(&command);
+    }
+    const partial::SwapPlan plan = partial::plan_swap(*homes_, evicted, admitted);
+    WriteBack batch;
+    for (const CacheController::Command* entry : absent) {
+        const auto& command = *entry;
         const std::uint32_t key = command.key;
-        if (homes_->frame(key) < 0 || homes_->writing_back(key)) { continue; } // never published, or leaving
+        const bool to_ram   = std::find(plan.to_ram.begin(), plan.to_ram.end(), key) != plan.to_ram.end();
         const auto offset = homes_->evict(key);
+        if (offset.has_value() != to_ram) {
+            throw std::logic_error("expert residency: an eviction disagrees with the swap plan's write-backs");
+        }
         if (!offset) {
             // A RAM copy exists: the expert reads from it from the next round on.
             if (table[key] >= 0) {
@@ -655,6 +698,7 @@ void ExpertResidency::publish_write_backs() {
         CUDA_CHECK(status);
         for (const auto& [key, frame] : it->moves) {
             homes_->complete_writeback(key);
+            written_back_[key] = 1;
             // The expert reads its RAM copy from the next round on (unless it was promoted again).
             if (table[key] == static_cast<std::int32_t>(frame)) {
                 table[key]   = -1;
@@ -703,7 +747,7 @@ std::uint32_t ExpertResidency::place_partial(std::span<const std::uint32_t> vram
         if (command.kind == CacheController::Command::Kind::kCopy) { copies.push_back(command); }
     }
     {
-        PinnedHostBuffer bounce(2 * kPlaceBatch * stride_);
+        PinnedHostBuffer bounce(partial_place_bounce_bytes(stride_));
         cudaEvent_t half_done[2] = {nullptr, nullptr};
         CUDA_CHECK(cudaEventCreateWithFlags(&half_done[0], cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&half_done[1], cudaEventDisableTiming));

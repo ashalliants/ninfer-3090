@@ -372,21 +372,21 @@ std::vector<Config> configs() {
         {"mixed-staged-4-zc-2", 3, 4, 0, 0, 3, om::kMaxColumns, false, 2},
         {"cpu-6w-zc-1", 3, 4, 6, 4, 3, 2, false, 1},
     };
+    // The host slot table on staged placements: all staged, mixed with zero-copy misses, and with
+    // the CPU service reading its records through the host table (--small: the mixed one).
+    const std::vector<std::string> with_slots = g_small ? std::vector<std::string>{"mixed-staged-4-zc-2"}
+                                                        : std::vector<std::string>{"staged-64", "mixed-staged-4-zc-2",
+                                                                                   "cpu-6w-zc-1"};
+    std::vector<Config> slots;
+    for (const Config& config : c) {
+        if (std::find(with_slots.begin(), with_slots.end(), config.name) == with_slots.end()) { continue; }
+        Config s     = config;
+        s.name       = "slots-" + s.name;
+        s.host_slots = true;
+        slots.push_back(s);
+    }
     if (g_small) { c = {c[0], c[1], c[2], c[4], c[7], c[10], c[11]}; }
-    // The host slot table on the staged placements: all staged, mixed with zero-copy misses, and
-    // with the CPU service reading its records through the host table.
-    for (const std::size_t i : {std::size_t{3}, std::size_t{11}, std::size_t{12}}) {
-        if (i >= (g_small ? std::size_t{0} : c.size())) { continue; }
-        Config slots     = c[i];
-        slots.name       = "slots-" + slots.name;
-        slots.host_slots = true;
-        c.push_back(slots);
-    }
-    if (g_small) {
-        Config slots{"slots-mixed-staged-4-zc-2", 3, 4, 6, 4, 3, 2, false, 2};
-        slots.host_slots = true;
-        c.push_back(slots);
-    }
+    c.insert(c.end(), slots.begin(), slots.end());
     return c;
 }
 

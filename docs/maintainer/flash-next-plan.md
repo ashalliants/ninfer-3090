@@ -1205,10 +1205,14 @@ None has been measured on the RTX 3090 yet.
     is fixed, so the copy costs no RAM and a later eviction needs no copy). The LFRU's eviction gate
     lets an expert held only in VRAM leave only when its layer has a slot for it: a free one, else
     one reclaimed from the layer's best-scoring VRAM resident with a copy (which then lives only in
-    VRAM); otherwise that round admits no further expert. The controller emits `kWriteBack` and holds
+    VRAM). The victim is the lowest-scoring resident the gate approves (refused ones are skipped for
+    the step), so a layer whose slots are spent does not stop admissions elsewhere; the gate makes
+    admission the budgeted one-victim loop even when the budget covers every miss. The controller emits `kWriteBack` and holds
     the frame (`complete_writeback` frees it); the device table keeps the frame until the
     device-to-host copy lands, then names the slot. Loads read slots on the same copy stream after any
-    write-back into them.
+    write-back into them; a landed load of a key whose write-back event was read not ready publishes
+    the write-backs again first. `plan_swap` checks each round's write-backs against the evictions
+    and refuses an admission without a RAM copy.
   - The Op: `MoeExpertSource::host_slots` makes `host_records` a device table of per-expert
     addresses, read by the stage kernel only (a call with host slots must stage), so the expert
     kernels keep the base commit's SASS (88 of 89 narrow-route kernels and all 11 wide ones
@@ -1219,14 +1223,19 @@ None has been measured on the RTX 3090 yet.
     is mapped at startup, so the elastic KV never takes frames), the VRAM monitor's resizing, frame
     lending and so the expert stream (wide prefill calls fall back to static calls). Each of these
     would evict without a round in which to write VRAM-only experts back; supporting lending needs
-    RAM homes for the lent run (Basalt keeps the lent slots' experts in RAM).
-  - Windows: the plan and the RAM ledger keep every pinned byte within RAM/2 - 8 GiB (WDDM's
-    page-lock cap as Basalt's `docs/platforms.md` reports it, for `cudaHostRegister`) and refuse
-    with the largest `--vram-headroom-mib` or the `--expert-cache-mib` that fits. Full mode is not
-    capped, and it pins about 35 GiB on the 64 GB Windows box with `cudaHostAlloc` (the README's
-    preview), above that cap: whether the cap applies to `cudaHostAlloc` needs a check on Windows.
-  - GPU-session checks: `ninfer_qwen4_exp_partial_ram_residency_test` (greedy ids and MTP
-    statistics against full mode on a 4 GiB cache, at least one write-back), the host-slot
+    RAM homes for the lent run (Basalt keeps the lent slots' experts in RAM). `ExpertStream::Bank`
+    is left unchanged (a deliberate deviation from the task's plan): the stream never runs in this
+    mode, so a slot table there would be dead code until lending exists.
+  - Windows: Basalt's `docs/platforms.md` reports WDDM capping page-lock registration
+    (`cudaHostRegister`) at RAM/2 - 8 GiB. NInfer pins with `cudaHostAlloc`, and full mode pins
+    about 35 GiB on the 64 GB Windows box (the README's preview), above that cap; so the cap is a
+    startup warning naming the largest `--vram-headroom-mib` or the `--expert-cache-mib` that stays
+    under it, and a failed pin of the slot pool is a startup error naming `--vram-headroom-mib` and
+    `--partial-ram-residency`. The startup placement's bounce (2 x 16 records) is a planned later pin.
+  - GPU-session checks: `ninfer_qwen4_exp_partial_ram_residency_test` (greedy ids against full
+    mode on a 4 GiB cache, at least one promotion copied from a slot a write-back filled) and
+    `ninfer_qwen4_exp_partial_ram_residency_cpu_test` (the same with MTP statistics and
+    `--cpu-verify-misses`, which must serve an expert), the host-slot
     placements of `ninfer_offloaded_moe_layer_test` and `ninfer_offloaded_moe_wide_test`; a Windows
     start of the IQ3_XXS pack on 64 GB. Not measured: decode with write-backs, startup time.
 

@@ -156,15 +156,53 @@ void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size
     for (std::uint32_t k : ranked_) {
         if (out.admitted.size() >= admission_budget) { break; }
         if (residents_.size() >= capacity_) {
-            victim_.clear();
-            select_victims(1, group, victim_);
-            if (victim_.empty() || !(score(k) > score(victim_[0]))) { break; }
-            if (evictable != nullptr && !(*evictable)(victim_[0])) { break; } // the tier's demotion allowance is spent
-            erase(victim_[0]);
-            out.victims.push_back(victim_[0]);
+            std::uint32_t victim = kNone;
+            if (evictable != nullptr) {
+                const auto chosen = evictable_victim(group, k, *evictable);
+                if (!chosen) { break; } // no approved resident ranks below the newcomer
+                victim = *chosen;
+            } else {
+                victim_.clear();
+                select_victims(1, group, victim_);
+                if (victim_.empty() || !(score(k) > score(victim_[0]))) { break; }
+                victim = victim_[0];
+            }
+            erase(victim);
+            out.victims.push_back(victim);
         }
         insert(k);
         out.admitted.push_back(k);
+    }
+    for (const std::uint32_t key : refused_keys_) { refused_[key] = 0; }
+    refused_keys_.clear();
+}
+
+std::optional<std::uint32_t> LfruPolicy::evictable_victim(std::span<const std::uint32_t> protect, std::uint32_t newcomer,
+                                                          const Admissible& gate) {
+    if (refused_.size() != count_.size()) { refused_.assign(count_.size(), 0); }
+    // Every resident's score as select_victims computes it (score()'s value), protected ones +infinity.
+    const std::size_t n = residents_.size();
+    scores_.resize(n);
+    const double next = static_cast<double>(now_) + 1.0;
+    for (std::size_t i = 0; i < n; ++i) { scores_[i] = resident_count_[i] / (next - resident_last_[i]); }
+    constexpr double kProtected = std::numeric_limits<double>::infinity();
+    for (std::uint32_t k : protect) {
+        if (slot_[k] != kNone) { scores_[slot_[k]] = kProtected; }
+    }
+    const double bar = score(newcomer);
+    for (;;) {
+        double best          = kProtected;
+        std::uint32_t victim = kNone;
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::uint32_t key = residents_[i];
+            if (refused_[key] || scores_[i] > best || (scores_[i] == best && key > victim)) { continue; }
+            best   = scores_[i];
+            victim = key;
+        }
+        if (victim == kNone || best == kProtected || !(bar > best)) { return std::nullopt; }
+        if (gate(victim)) { return victim; }
+        refused_[victim] = 1;
+        refused_keys_.push_back(victim);
     }
 }
 
