@@ -374,7 +374,7 @@ bool CacheController::adopt(std::uint32_t key, std::uint32_t frame, std::span<co
                             std::uint64_t round_started, std::vector<Command>& out) {
     if (key >= table_.size() || table_[key].state != ResidencyState::kAbsent) { return false; }
     if (const auto victim = policy_.promote(key, protect)) {
-        if (table_[*victim].state != ResidencyState::kAbsent) { frames_.retire(make_absent(*victim, out), round_started); }
+        if (table_[*victim].state != ResidencyState::kAbsent) { retire_victim(*victim, round_started, out); }
     }
     // A queued load of the key is dropped by drain_queue (the key is no longer absent); a copy of
     // it still in flight never publishes (complete_load compares the serial).
@@ -415,7 +415,7 @@ void CacheController::on_route(std::span<const std::uint32_t> group, std::uint64
     policy_.step(group, step_, admission_budget, admissible, evictable);
     for (std::uint32_t v : step_.victims) {
         if (table_[v].state == ResidencyState::kAbsent) { continue; } // was still queued
-        frames_.retire(make_absent(v, out), round_started);
+        retire_victim(v, round_started, out);
     }
     for (std::uint32_t k : step_.admitted) {
         if (!is_queued_[k]) {
@@ -429,6 +429,32 @@ void CacheController::on_route(std::span<const std::uint32_t> group, std::uint64
 void CacheController::release_held(std::uint32_t frame, std::vector<Command>& out) {
     frames_.release_held(frame);
     drain_queue(out);
+}
+
+void CacheController::retire_victim(std::uint32_t key, std::uint64_t round_started, std::vector<Command>& out) {
+    const bool write_back = writeback_ && writeback_(key);
+    const std::uint32_t frame = make_absent(key, out);
+    frames_.retire(frame, round_started);
+    if (write_back) {
+        // Held until complete_writeback: the copy reads the frame, so nothing may load into it first.
+        frames_.hold(frame);
+        out.push_back({Command::Kind::kWriteBack, key, frame, table_[key].encode()});
+    }
+}
+
+void CacheController::complete_writeback(std::uint32_t frame, std::vector<Command>& out) {
+    if (!frames_.is_demoting(frame)) { throw std::logic_error("expert cache: no write-back is pending in that frame"); }
+    frames_.release_held(frame);
+    drain_queue(out);
+}
+
+void CacheController::refuse_writeback(std::span<const std::uint32_t> keys) const {
+    if (!writeback_) { return; }
+    for (const std::uint32_t key : keys) {
+        if (table_[key].state != ResidencyState::kAbsent && writeback_(key)) {
+            throw std::logic_error("expert cache: an expert held only in VRAM cannot be evicted without a write-back");
+        }
+    }
 }
 
 void CacheController::on_round_done(std::uint64_t round_done, std::vector<Command>& out) {
@@ -451,6 +477,10 @@ void CacheController::resize(std::uint32_t frames, std::vector<Command>& out) {
         policy_.set_capacity(capacity, none);
         drain_queue(out);
         return;
+    }
+    if (writeback_ && policy_.resident_count() > capacity) {
+        // The victims are known only once chosen; with write-backs none may be (nothing changed).
+        throw std::logic_error("expert cache: a shrink that evicts cannot write experts held only in VRAM back");
     }
     std::vector<std::uint32_t> victims;
     policy_.set_capacity(capacity, victims);
@@ -524,6 +554,19 @@ std::optional<std::uint32_t> CacheController::choose_run(std::uint32_t count, st
 std::uint32_t CacheController::lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out,
                                     std::vector<std::uint32_t>* evicted_keys) {
     if (frames_.pending_count() != 0) { throw std::logic_error("frames lent while some still retire"); }
+    if (writeback_) {
+        // Lending evicts the run's experts and, past the capacity left, others the policy picks: with
+        // write-backs, refuse a run holding an expert held only in VRAM or needing further victims.
+        std::vector<std::uint32_t> held;
+        for (std::uint32_t f = first; f < first + count && f < frame_key_.size(); ++f) {
+            if (frame_key_[f] != kNoKey) { held.push_back(frame_key_[f]); }
+        }
+        refuse_writeback(held);
+        const std::size_t left = policy_.resident_count() - held.size();
+        if (left > (policy_.capacity() > count ? policy_.capacity() - count : 0)) {
+            throw std::logic_error("expert cache: lending would evict experts beyond the run");
+        }
+    }
     std::uint32_t evicted = 0;
     for (std::uint32_t f = first; f < first + count; ++f) {
         if (frame_key_[f] == kNoKey) { continue; }

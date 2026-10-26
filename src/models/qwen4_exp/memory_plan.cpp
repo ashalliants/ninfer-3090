@@ -1,5 +1,6 @@
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/memory_plan.cpp (Apache-2.0).
-// Modified for NInfer-3090: full mode only (every expert pinned in RAM); the SSD tier is not ported, so a ledger that cannot hold every expert refuses to start.
+// Modified for NInfer-3090: full mode (every expert pinned in RAM) by default; the SSD tier is not ported, so a ledger that cannot hold every expert refuses to start.
+// Partial RAM residency's slot pool (plan_partial_ram) and the WDDM page-lock cap are NInfer-3090's.
 // kv_growth_frames is Infernix's grow_kv arithmetic (program_impl.h) as a pure function.
 
 #include "models/qwen4_exp/memory_plan.h"
@@ -7,8 +8,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ninfer::models::qwen4_exp {
 namespace {
@@ -50,6 +53,105 @@ HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const Host
         out.lock_limited = true;
         out.fits         = false;
     }
+    if (demand.pin_cap && out.pinned_total > *demand.pin_cap) {
+        out.pin_limited = true;
+        out.fits        = false;
+    }
+    return out;
+}
+
+namespace {
+
+// plan_partial_ram's slots and bytes for `vram` VRAM-only experts taken from `order`.
+void partial_slots(const PartialRamDemand& d, std::span<const std::uint32_t> order, std::uint32_t vram,
+                   PartialRamPlan& out) {
+    const std::uint32_t layers = static_cast<std::uint32_t>(d.strides.size());
+    std::vector<std::uint32_t> in_vram(layers, 0);
+    out.vram_keys.assign(order.begin(), order.begin() + vram);
+    for (const std::uint32_t key : out.vram_keys) { ++in_vram[key / d.experts]; }
+    out.slots.assign(layers, 0);
+    out.bytes = 0;
+    for (std::uint32_t l = 0; l < layers; ++l) {
+        out.slots[l] = std::min(d.experts, d.experts - in_vram[l] + d.spares_per_layer);
+        out.bytes += static_cast<std::uint64_t>(out.slots[l]) * d.strides[l];
+    }
+}
+
+} // namespace
+
+std::uint64_t wddm_pin_cap(std::uint64_t total_physical) noexcept {
+    return saturating_sub(total_physical / 2, 8 * kLedgerGiB);
+}
+
+PartialRamPlan plan_partial_ram(const PartialRamDemand& d) {
+    if (d.experts == 0 || d.strides.empty() || d.frame_bytes == 0) {
+        throw std::invalid_argument("partial RAM residency: no experts, banks or frames");
+    }
+    const std::uint32_t layers = static_cast<std::uint32_t>(d.strides.size());
+    const std::uint32_t keys   = layers * d.experts;
+    // The ranking, then every layer's experts in turn, each key once.
+    std::vector<std::uint32_t> order;
+    order.reserve(keys);
+    std::vector<std::uint8_t> taken(keys, 0);
+    const auto take = [&](std::uint32_t key) {
+        if (key < keys && !taken[key]) {
+            taken[key] = 1;
+            order.push_back(key);
+        }
+    };
+    for (const std::uint32_t key : d.ranked) { take(key); }
+    for (std::uint32_t e = 0; e < d.experts; ++e) {
+        for (std::uint32_t l = 0; l < layers; ++l) { take(l * d.experts + e); }
+    }
+    const auto margin = static_cast<std::uint32_t>((d.margin_bytes + d.frame_bytes - 1) / d.frame_bytes);
+    const auto vram_for = [&](std::uint64_t frames) {
+        return static_cast<std::uint32_t>(std::min<std::uint64_t>(keys, frames > margin ? frames - margin : 0));
+    };
+    PartialRamPlan out;
+    partial_slots(d, order, vram_for(d.frames), out);
+    if (!d.pin_cap || out.bytes + d.other_pinned <= *d.pin_cap) { return out; }
+    // The fewest frames whose pool fits the cap (the pool shrinks as frames grow), if any does.
+    const auto fits = [&](std::uint64_t frames) {
+        PartialRamPlan probe;
+        partial_slots(d, order, vram_for(frames), probe);
+        return probe.bytes + d.other_pinned <= *d.pin_cap;
+    };
+    std::uint64_t low = d.frames, high = static_cast<std::uint64_t>(keys) + margin;
+    if (fits(high)) {
+        while (high - low > 1) {
+            const std::uint64_t mid = low + (high - low) / 2;
+            (fits(mid) ? high : low) = mid;
+        }
+        out.frames_needed = static_cast<std::uint32_t>(high);
+    }
+    char line[640];
+    const int used = std::snprintf(
+        line, sizeof(line),
+        "Qwen3.8-Flash-Next with --partial-ram-residency pins %.1f GiB (%.1f GiB of expert slots for %u VRAM "
+        "frames, %.1f GiB of other pins), above the %.1f GiB Windows lets one process page-lock (half the RAM "
+        "less 8 GiB): ",
+        gib(out.bytes + d.other_pinned), gib(out.bytes), d.frames, gib(d.other_pinned), gib(*d.pin_cap));
+    std::string advice;
+    if (out.frames_needed == 0) {
+        advice = "no expert cache size fits; use a smaller pack or a machine with more RAM";
+    } else {
+        const std::uint64_t extra = (static_cast<std::uint64_t>(out.frames_needed) - d.frames) * d.frame_bytes;
+        const std::uint64_t cache_mib =
+            (static_cast<std::uint64_t>(out.frames_needed) * d.frame_bytes + kLedgerMiB - 1) / kLedgerMiB;
+        if (d.cache_limited) {
+            advice = "the expert cache needs " + std::to_string(out.frames_needed) +
+                     " frames: start with --expert-cache-mib " + std::to_string(cache_mib) + " or more";
+        } else if (extra <= d.headroom) {
+            advice = "the expert cache needs " + std::to_string(out.frames_needed) +
+                     " frames: start with --vram-headroom-mib " + std::to_string((d.headroom - extra) / kLedgerMiB) +
+                     " or less, or free VRAM";
+        } else {
+            advice = "the expert cache needs " + std::to_string(out.frames_needed) + " frames (" +
+                     std::to_string(cache_mib) + " MiB), more than this GPU has free; free VRAM or use a smaller pack";
+        }
+    }
+    const std::size_t prefix = used > 0 ? std::min<std::size_t>(static_cast<std::size_t>(used), sizeof(line) - 1) : 0;
+    out.refusal              = std::string(line, prefix) + advice;
     return out;
 }
 
@@ -103,6 +205,7 @@ ContextCacheFit fit_context_cache(const HostMemorySnapshot& snapshot, HostMemory
     // The cache's own lock bookkeeping comes out of the same room.
     spare = static_cast<std::uint64_t>(static_cast<double>(spare) / (1.0 + demand.lock_overhead));
     if (snapshot.lock_limit) { spare = std::min(spare, saturating_sub(*snapshot.lock_limit, without.pinned_total)); }
+    if (demand.pin_cap) { spare = std::min(spare, saturating_sub(*demand.pin_cap, without.pinned_total)); }
     std::uint64_t bytes = std::min(requested, spare);
     bytes               = bytes / granule * granule;
     if (bytes < minimum) { bytes = 0; }
@@ -130,7 +233,9 @@ std::string HostMemoryLedger::describe() const {
                   gib(demand.load_staging), gib(demand.process_growth), gib(expert_ram), gib(full_need),
                   gib(demand.expert_banks), gib(demand.full_margin), commit_limited ? ", limited by the page file" : "",
                   lock_limited ? "the memory-lock limit is below the pinned total"
-                                           : fits ? "every expert fits in RAM" : "the experts do not fit");
+                  : pin_limited ? "the page-lock cap is below the pinned total"
+                  : fits        ? "every expert fits in RAM"
+                                : "the experts do not fit");
     return line;
 }
 
@@ -142,6 +247,12 @@ std::string HostMemoryLedger::summary() const {
                       "weights. Raise it (ulimit -l unlimited, or LimitMEMLOCK=infinity for a service) and start "
                       "again",
                       gib(*snapshot.lock_limit), gib(pinned_total));
+    } else if (pin_limited) {
+        std::snprintf(line, sizeof(line),
+                      "RAM: Windows lets one process page-lock about %.1f GiB (half the RAM less 8 GiB) but "
+                      "Qwen3.8-Flash-Next pins %.1f GiB of experts and weights with --partial-ram-residency. Give "
+                      "the expert cache more VRAM (a lower --vram-headroom-mib) or lower --host-context-mib",
+                      gib(*demand.pin_cap), gib(pinned_total));
     } else if (fits) {
         std::snprintf(line, sizeof(line), "RAM: %.1f of %.1f GiB free; every expert fits in RAM (%.1f GiB pinned)",
                       gib(snapshot.available_physical), gib(snapshot.total_physical),

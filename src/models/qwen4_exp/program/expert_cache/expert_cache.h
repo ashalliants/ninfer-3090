@@ -1,7 +1,8 @@
 #pragma once
 
 // Adapted from Infernix a3edb450 src/models/qwen4_exp/program/expert_cache/expert_cache.h (Apache-2.0).
-// Modified for NInfer-3090: NInfer's namespace; lend() reports the keys it evicted.
+// Modified for NInfer-3090: NInfer's namespace; lend() reports the keys it evicted; partial RAM
+// residency's write-backs (Command::kWriteBack, set_writeback, complete_writeback).
 
 // Host side of the Qwen3.8-Flash-Next expert cache (docs/maintainer/qwen3_8-flash-next-design.md
 // §9): the LFRU policy, the device residency-entry encoding, and the frame pool with epoch-based
@@ -14,6 +15,7 @@
 #include <functional>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace ninfer::models::qwen4_exp::expert_cache {
@@ -160,6 +162,7 @@ public:
     [[nodiscard]] std::size_t pending_count() const { return pending_.size(); }
     [[nodiscard]] bool is_free(std::uint32_t frame) const { return state_[frame] == kFree; }
     [[nodiscard]] bool is_loaned(std::uint32_t frame) const { return state_[frame] == kLoaned; }
+    [[nodiscard]] bool is_demoting(std::uint32_t frame) const { return frame < state_.size() && state_[frame] == kDemoting; }
     [[nodiscard]] std::uint32_t loaned_count() const { return loaned_; }
     [[nodiscard]] std::uint32_t backed() const { return backed_; }
     [[nodiscard]] std::uint32_t max_frames() const { return static_cast<std::uint32_t>(state_.size()); }
@@ -187,6 +190,7 @@ public:
             kWriteEntry, // cuStreamWriteValue32(residency[key], word)
             kCopy,       // DMA host record of `key` into `frame`
             kRelocate,   // device copy of `key`'s record from frame `source` into `frame`
+            kWriteBack,  // copy `key`'s record from `frame` to its RAM slot before the frame is reused
         };
         Kind kind;
         std::uint32_t key;
@@ -209,6 +213,15 @@ public:
     // it once the copy completed and loads queued experts into free frames.
     void hold(std::uint32_t frame) { frames_.hold(frame); }
     void release_held(std::uint32_t frame, std::vector<Command>& out);
+    // Partial RAM residency (--partial-ram-residency): `needs` names the experts held only in VRAM.
+    // A round that evicts one (on_route, adopt) emits kWriteBack for its frame and holds the frame:
+    // neither quiescence nor a finished round frees it and no load targets it until
+    // complete_writeback, once the copy has landed, frees it and loads queued experts into it.
+    // Lending or shrinking over such an expert is refused (std::logic_error, nothing changed): they
+    // evict without a round to write it back in. Empty: every expert has a host copy (full mode).
+    void set_writeback(LfruPolicy::Admissible needs) { writeback_ = std::move(needs); }
+    void complete_writeback(std::uint32_t frame, std::vector<Command>& out);
+    [[nodiscard]] bool writing_back(std::uint32_t frame) const { return frames_.is_demoting(frame); }
     void on_round_done(std::uint64_t round_done, std::vector<Command>& out);
     void on_quiescent(std::vector<Command>& out);
     // Resizes the pool to `frames` while no round is in flight, every issued load has landed and no
@@ -268,6 +281,10 @@ private:
     void drain_queue(std::vector<Command>& out);
     // ABSENT write for a resident key; its frame no longer holds it.
     std::uint32_t make_absent(std::uint32_t key, std::vector<Command>& out);
+    // A round's victim: ABSENT, and its frame retires, or with a write-back (writeback_) is held.
+    void retire_victim(std::uint32_t key, std::uint64_t round_started, std::vector<Command>& out);
+    // Refuses a lend or shrink that would evict an expert held only in VRAM.
+    void refuse_writeback(std::span<const std::uint32_t> keys) const;
 
     static constexpr std::uint32_t kNoKey = 0xFFFFFFFFU;
 
@@ -281,6 +298,7 @@ private:
     std::vector<std::uint32_t> frame_key_;   // per frame: the key it holds, or kNoKey
     std::uint64_t next_serial_ = 0;
     LfruPolicy::Step step_;
+    LfruPolicy::Admissible writeback_;
 };
 
 } // namespace ninfer::models::qwen4_exp::expert_cache
