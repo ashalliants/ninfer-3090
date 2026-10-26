@@ -1691,7 +1691,9 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(
                 std::scoped_lock lock(mutex_);
                 ++stats_.load_misses;
             }
-            // Gone or damaged in the bucket too: nothing can repair it, so do not offer it again.
+            // Gone or damaged in the bucket too: nothing can repair it, so do not offer it again. A
+            // locally missing chunk is a miss that keeps the session only while the bucket may
+            // still hold it (a transfer failure); one the bucket lacks too is lost for good.
             if (status == FetchStatus::Corrupt) { settle_failed_fetch(id, generation); }
             return std::nullopt;
         }

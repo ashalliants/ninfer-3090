@@ -509,8 +509,10 @@ costs the newest pages and the endpoint state, not the whole session. Older imag
 are removed once a newer image of it is stored. Writes are atomic (a temporary name, then a rename),
 every chunk is verified when read, and a session that cannot be read back intact is removed and
 simply re-prefilled by the next request; a damaged store costs cache hits, never a wrong answer.
-(With a bucket, a chunk file that is missing rather than damaged is fetched again; if that fails
-too the read is a miss and the session stays offered.) A session being read is never evicted
+(With a bucket, a chunk file that is missing rather than damaged is fetched again. If the fetch
+fails because the bucket cannot be reached, the read is a miss and the session stays offered; if
+the bucket no longer has the chunk either, the session cannot be read from anywhere and is removed,
+counted as `remote` corruption.) A session being read is never evicted
 until the read ends, so a write that makes room meanwhile cannot take the chunks it just fetched.
 
 The store keeps at most `--context-store-max-gib` (default: half the free space of the volume when
