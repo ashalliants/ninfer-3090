@@ -116,11 +116,13 @@ std::pair<std::filesystem::path, std::uint64_t> plan_nvme_tier(const EngineOptio
     return {dir / (artifact.filename().string() + ".context-" + std::to_string(process_id()) + ".tier"), bytes};
 }
 
+} // namespace
+
 // What this release of the model serves: one request at a time by default, two lanes on request (text, or text and images with
 // --vision), plain or MTP decode, INT8 KV, prefix reuse from a Host and NVMe context cache that the
 // context store can persist. Every option
 // a user can set otherwise is refused with what to change.
-void validate(const EngineOptions& options) {
+void validate_qwen4_exp_options(const EngineOptions& options) {
     const auto refuse = [](const std::string& why) {
         throw std::invalid_argument("Qwen3.8-Flash-Next: " + why);
     };
@@ -252,8 +254,6 @@ void validate(const EngineOptions& options) {
     }
 }
 
-} // namespace
-
 bool artifact_is_qwen4_exp(const std::filesystem::path& artifact) noexcept {
     try {
         const artifact::Reader reader(artifact);
@@ -280,7 +280,7 @@ Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> sou
 Qwen4ExpInstance::~Qwen4ExpInstance() = default;
 
 ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device) {
-    validate(options);
+    validate_qwen4_exp_options(options);
     const auto start = std::chrono::steady_clock::now();
     const auto& next = options.flash_next;
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);

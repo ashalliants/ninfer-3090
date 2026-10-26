@@ -1,8 +1,10 @@
 #include "models/qwen3_5/load/bindings.h"
 
 #include "artifact/companion.h"
+#include "ops/two_stage_head/proxy_codec.h"
 
 #include <stdexcept>
+#include <string>
 #include <variant>
 
 namespace ninfer::models::qwen3_5::loading {
@@ -19,6 +21,12 @@ void apply_storage_trades(Bindings& bindings, const Config& config, const ModelW
     if (options.embedding_q4 && options.embedding_q6) {
         throw std::invalid_argument("--embedding-q4 and --embedding-q6 are mutually exclusive");
     }
+    // The two-stage head rescores rows from the stored Q8 head, which a narrower head replaces.
+    if (options.lm_head_two_stage && (options.lm_head_q4 || options.lm_head_q6)) {
+        throw std::invalid_argument(
+            "--lm-head-two-stage rescores rows from the Q8 output head, which --lm-head-q4 and "
+            "--lm-head-q6 replace: use one or the other");
+    }
     if (options.lm_head_q4 || options.lm_head_q6) {
         if (options.masked_draft()) {
             // DFlash's candidate top-k reads the Q8 output head through its own kernel.
@@ -32,14 +40,16 @@ void apply_storage_trades(Bindings& bindings, const Config& config, const ModelW
                                  options.lm_head_q4 ? "--lm-head-q4" : "--lm-head-q6");
     }
     if (options.lm_head_two_stage) {
-        // The two-stage head rescores rows from the stored Q8 head, which a narrower head replaces.
-        if (options.lm_head_q4 || options.lm_head_q6) {
-            throw std::invalid_argument(
-                "--lm-head-two-stage rescores rows from the Q8 output head, which --lm-head-q4 and "
-                "--lm-head-q6 replace: use one or the other");
-        }
         bindings.companion(weights.text.output_head, artifact::Companion::TwoBitHeadProxy,
                            "--lm-head-two-stage");
+        // Its exact stage runs the dense head's own kernels, registered for one vocabulary shape.
+        if (config.text.vocab_size != static_cast<std::uint64_t>(ops::proxy_head::kHeadRows) ||
+            config.text.hidden_size != static_cast<std::uint64_t>(ops::proxy_head::kHeadColumns)) {
+            throw std::invalid_argument(
+                "--lm-head-two-stage supports the Qwen3.8-27B output head ([248320, 5120]); this "
+                "model's head is [" + std::to_string(config.text.vocab_size) + ", " +
+                std::to_string(config.text.hidden_size) + "]");
+        }
     }
     if (options.embedding_q4 || options.embedding_q6) {
         (void)bindings.transcode(weights.text.token_embedding,

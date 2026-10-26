@@ -83,6 +83,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_qwen3_5_state_image_layout_test
   ninfer_qwen3_5_tool_constraints_test
   ninfer_qwen3_5_tool_schema_oracle_test
+  ninfer_qwen3_5_two_stage_head_plan_test
   ninfer_qwen4_exp_context_cache_test
   ninfer_qwen4_exp_constrained_window_test
   ninfer_qwen4_exp_draft_policy_test

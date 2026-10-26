@@ -147,6 +147,13 @@ std::uint64_t parameter_bytes(const artifact::Reader& reader, const loading::Bin
 
 } // namespace
 
+std::uint64_t head_stage_copy_bytes(const LoadOptions& options,
+                                    std::span<const std::uint64_t> head_shape) {
+    return options.lm_head_two_stage
+               ? artifact::companion_bytes(artifact::Companion::TwoBitHeadProxy, head_shape)
+               : 0;
+}
+
 std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
                                                 LoadOptions options, const StageSizing& sizing,
                                                 std::span<const std::uint64_t> free_bytes) {
@@ -197,10 +204,7 @@ std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
     std::uint64_t head_bytes = parameter_bytes(reader, bindings, weights.token_embedding) +
                                parameter_bytes(reader, bindings, weights.output_head) +
                                parameter_bytes(reader, bindings, weights.final_norm);
-    if (options.lm_head_two_stage) {
-        head_bytes += artifact::companion_bytes(artifact::Companion::TwoBitHeadProxy,
-                                                bindings.at(weights.output_head).reference.shape);
-    }
+    head_bytes += head_stage_copy_bytes(options, bindings.at(weights.output_head).reference.shape);
     if (config.mtp && options.speculative == SpeculativeBackend::Mtp) {
         head_bytes += layer_bytes_total / std::max<std::size_t>(layers.size(), 1);
     }

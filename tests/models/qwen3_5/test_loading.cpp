@@ -5,7 +5,10 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <iostream>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -252,6 +255,47 @@ void logical_data_and_instances() {
         "--stage-layers without a multi-device split was accepted");
 }
 
+// --lm-head-two-stage refuses, naming the flag, a head that is not row-split Q8 and a Q8 head that
+// is not the 27B's [248320, 5120] (the only shape its exact stage has a route for), and the head
+// stage counts the copy's bytes.
+void two_stage_head_refusals() {
+    const auto refused = [](const std::function<void()>& load, const std::string& want) {
+        try {
+            load();
+        } catch (const std::invalid_argument& error) {
+            const std::string what = error.what();
+            return what.find("--lm-head-two-stage") != std::string::npos && what.find(want) != std::string::npos;
+        }
+        return false;
+    };
+    {
+        ModelFixture fixture; // BF16 head, tied to the embedding
+        fixture.file.write();
+        artifact::Reader reader(fixture.file.entry);
+        require(refused([&] { (void)qwen::plan_load(reader, {.lm_head_two_stage = true}); }, "row-split Q8_G32"),
+                "--lm-head-two-stage accepted a BF16 output head");
+        require(refused([&] { (void)qwen::plan_load(reader, {.lm_head_q6 = true, .lm_head_two_stage = true}); },
+                        "--lm-head-q6"),
+                "--lm-head-two-stage was accepted beside --lm-head-q6");
+    }
+    {
+        ModelFixture fixture; // an untied row-split Q8 head of the fixture's [272, 128]
+        fixture.tensor("head-q8", {272, 128}, QType::Q8_G32_FP16, QuantLayout::RowSplit);
+        fixture.file.root["bindings"]["text/output_head"] = {{"object", "head-q8"}};
+        fixture.file.root["files"][0]["payload_bytes"]    = fixture.file.payload.size();
+        fixture.file.write();
+        artifact::Reader reader(fixture.file.entry);
+        (void)qwen::plan_load(reader); // the head itself loads
+        require(refused([&] { (void)qwen::plan_load(reader, {.lm_head_two_stage = true}); }, "[248320, 5120]"),
+                "--lm-head-two-stage accepted a Q8 head without an exact-stage route");
+    }
+    const std::vector<std::uint64_t> head{248320, 5120};
+    require(qwen::head_stage_copy_bytes({}, head) == 0, "the head stage counted a copy without the flag");
+    require(qwen::head_stage_copy_bytes({.lm_head_two_stage = true}, head) ==
+                248320ULL * 5120 / 4 + 2ULL * 248320 * 160 * 2,
+            "the head stage does not count the 2-bit copy's three planes");
+}
+
 void native_uses() {
     const std::array<std::uint64_t, 2> shape{128, 64};
     const auto geometry = weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4, shape);
@@ -345,6 +389,7 @@ int main() {
         logical_data_and_instances();
         native_uses();
         invalid_model_data();
+        two_stage_head_refusals();
         std::cout << "model config, binding, resources and Use checks passed\n";
         return 0;
     } catch (const std::exception& error) {

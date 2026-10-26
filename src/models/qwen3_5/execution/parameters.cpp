@@ -374,11 +374,13 @@ Parameters::Parameters(const Model& source) : model(source) {
             copy.bytes != ops::proxy_head::proxy_bytes(head.n, head.k)) {
             throw std::logic_error("the output head's 2-bit copy does not match the head");
         }
+        const auto* base       = static_cast<const std::byte*>(copy.data);
         text.output_head_proxy = ops::ProxyHead{
-            .codes  = copy.data,
-            .scales = static_cast<const std::byte*>(copy.data) + ops::proxy_head::proxy_code_bytes(head.n, head.k),
-            .n      = head.n,
-            .k      = head.k};
+            .codes     = base,
+            .scales    = base + ops::proxy_head::proxy_code_bytes(head.n, head.k),
+            .residuals = base + ops::proxy_head::proxy_residual_offset(head.n, head.k),
+            .n         = head.n,
+            .k         = head.k};
     }
     if (text.token_embedding.qtype == QType::T2_G128_FP16) {
         // A ternary checkpoint stores its token table rotated by the same hidden-width signs as

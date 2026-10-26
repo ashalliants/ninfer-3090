@@ -53,6 +53,10 @@ struct ConstructedQwen4Exp {
 // (the Qwen3.5 construction then reports it).
 [[nodiscard]] bool artifact_is_qwen4_exp(const std::filesystem::path& artifact) noexcept;
 
+// Refuses every EngineOptions field Qwen3.8-Flash-Next does not support, naming what to change.
+// construct_qwen4_exp calls it first; it needs no device or artifact.
+void validate_qwen4_exp_options(const EngineOptions& options);
+
 // Checks the options this model supports, plans the Host RAM and device memory before anything is
 // pinned or read, loads the model and starts its Program. `options` is the Engine's, normalized.
 [[nodiscard]] ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device);

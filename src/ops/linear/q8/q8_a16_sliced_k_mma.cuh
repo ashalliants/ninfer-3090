@@ -431,6 +431,10 @@ __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q8_a16_sliced_k_mma_kernel(
     Q8LinearOperands operands, Output output, Epilogue epilogue, RowPolicy row_policy,
     int token_begin) {
+    // See q8_a16_mma_kernel: only a gathering row policy has skip_cta.
+    if constexpr (requires { row_policy.skip_cta(0); }) {
+        if (row_policy.skip_cta(static_cast<int>(blockIdx.x) * RowPolicy::kOutputRowsPerCta)) return;
+    }
     q8_a16_sliced_k_mma<Schedule, FullWeights>(operands, output, epilogue, row_policy, token_begin);
 }
 } // namespace ninfer::ops::detail

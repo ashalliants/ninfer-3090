@@ -60,6 +60,10 @@ struct StageSizing {
                                                               LoadOptions options,
                                                               const StageSizing& sizing,
                                                               std::span<const std::uint64_t> free_bytes);
+// --lm-head-two-stage: the bytes of the output head's 2-bit copy, which the head stage (rank 0)
+// holds beside the head; 0 without the flag. default_stage_layers counts it.
+[[nodiscard]] std::uint64_t head_stage_copy_bytes(const LoadOptions& options,
+                                                  std::span<const std::uint64_t> head_shape);
 // `materialize` makes the weight arenas suspendable when asked (see Model::release_device_weights).
 [[nodiscard]] std::unique_ptr<Model>
 materialize_model(LoadPlan&& plan, DeviceContext& device, const StartupObserver* observer = nullptr,

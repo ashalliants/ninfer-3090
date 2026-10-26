@@ -621,12 +621,11 @@ struct EngineOptions {
     // transcode them to the text layers' formats (Q4 gate_up, Q6 down) at load. Drafts are
     // verified exactly, so this can change acceptance but never the output distribution.
     bool mtp_experts_q4                    = false;
-    // Two-stage output head (Qwen3.5 family): score every vocabulary row first from a 2-bit copy of
-    // the row-split Q8 output head (built at load, about 400 MB beside the 27B's head) and rescore
-    // from the Q8 head every row that could be among the top 64, on decode and verification
-    // rounds whose sampler reads only its top 20 rows (no penalties, no grammar mask); other rounds
-    // and every other head call stay exact. Greedy and sampled output are designed to stay those
-    // of the exact head (docs/serving.md, --lm-head-two-stage).
+    // Two-stage output head (Qwen3.8-27B): score every vocabulary row first from a 2-bit copy of the
+    // row-split Q8 output head (built at load, about 455 MiB) with a proven error bound, and compute
+    // every row that could reach a column's top 64 with the dense head's own kernels, on decode and
+    // verification rounds; a round with a penalty or grammar row runs the dense head. Output stays
+    // the exact head's bit for bit (docs/serving.md, --lm-head-two-stage).
     bool lm_head_two_stage                 = false;
     // Integer-activation MLP gate_up at decode and verify widths. Measured 4-6% off that Op from
     // sixteen columns up; see docs/maintainer/quality-trade-experiments.md.

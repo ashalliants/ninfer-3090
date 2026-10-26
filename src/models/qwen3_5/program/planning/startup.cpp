@@ -2,6 +2,7 @@
 #include "models/qwen3_5/execution/rotation.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/gdn.h"
+#include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/frontend/graft.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
@@ -442,12 +443,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         if (!plan.causal_scoring) {
             linear_scratch(layout, parameters.text.output_head, first, last);
             // --lm-head-two-stage: ordinary decode and target verify heads (TextPhase::Verify).
-            if (phase == TextPhase::Verify && parameters.text.output_head_proxy) {
-                const auto& head = parameters.text.output_head;
-                scratch(layout, execution::rotated_workspace_bytes(
-                                    head.hadamard_signs, head.weight.k, last,
-                                    ops::two_stage_head_workspace_capacity_bytes(
-                                        head.weight.n, head.weight.k, last)));
+            if (phase == TextPhase::Verify) {
+                scratch(layout, execution::output_head_two_stage_scratch_bytes(parameters.text, last));
             }
         }
     };

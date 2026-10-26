@@ -11,8 +11,8 @@ explain why the first two were the next levers: a decode round is bandwidth-boun
 of them buy bytes.
 
 An eighth flag, `--lm-head-two-stage`, buys head bytes the other way: it adds a 2-bit copy of the
-output head and is designed to keep the exact head's output. It is not yet measured; see
-[Two-stage output head](#two-stage-output-head).
+output head and keeps the exact head's output bit for bit. With a proven bound it currently selects
+every row, so it saves nothing yet; see [Two-stage output head](#two-stage-output-head).
 
 C8 was believed to be tensor-rate bound when `--mlp-a8-decode` was built, which is what motivated
 it. Counters since say otherwise -- tensor, L1 and DRAM all sit near 38% at 31% occupancy, so the
@@ -348,69 +348,78 @@ not worth it here; a single large channel otherwise starves every other channel 
 
 ## Two-stage output head
 
-`--lm-head-two-stage` (off by default; `EngineOptions::lm_head_two_stage`) is a speed trade that is
-designed **not** to trade quality. Basalt (8d73a39) scores its draft head's rows from a 2-bit copy
-and rescores a short list exactly (`src/kernels/cuda/head_proxy.cuh`); this is that idea applied to
-the 27B's Text output head on decode and verification rounds, with the short list chosen by a bound
-instead of Basalt's "within 5 of the best". **Not yet measured on a GPU**: the speed, the
-rescored-row counts and the greedy identity are Task 39's to check.
+`--lm-head-two-stage` (off by default; `EngineOptions::lm_head_two_stage`; honoured by `ninfer` and
+`ninfer-serve`; `ninfer-perplexity` has no such flag, and a scoring Engine ignores it) is a speed
+trade designed **not** to trade quality: every value a sampler can read is the dense head's, bit
+for bit. Basalt (8d73a39) scores its draft head's rows from a 2-bit copy and rescores a short list
+(`src/kernels/cuda/head_proxy.cuh`); this applies the idea to the 27B's Text output head on decode
+and verification rounds, with the short list chosen by a proven bound. **Not yet run on a GPU.**
 
 **What it stores.** While the weights load, the materializer builds a companion of the row-split
 Q8 head (`artifact::Companion::TwoBitHeadProxy`, `src/artifact/companion.cpp`) right after it in
-the weight arena: per 32 weights, 2-bit levels and one binary16 scale, laid out for the int8
-`mma.m16n8k32` (`src/ops/two_stage_head/proxy_codec.h`). On the 27B ([248320, 5120]) that is
-303.1 MiB of levels and 75.8 MiB of scales, 378.9 MiB in all, against the head's 1.27 GB. The fit
-is Basalt's: of six steps `amax / 1.5 x (1 - 0.1 t)`, the one whose levels leave the least squared
-error; then the stored scale takes the full least-squares correction `x |w|^2 / <w, w_hat>`, so
-`<w, w_hat'> = |w|^2` (Basalt applies the square root of that, to keep a softmax over the copy
-close; nothing here reads a probability from the copy). The artifact is unchanged; a resume after
-`--model-suspend` rebuilds the copy from it.
+the weight arena: per 32 weights, 2-bit levels, one binary16 scale and one binary16 residual norm
+`rho >= |w - w_hat|_2` (rounded up), laid out for the int8 `mma.m16n8k32`
+(`src/ops/two_stage_head/proxy_codec.h`). On the 27B ([248320, 5120]): 303.1 MiB of levels, 75.8 MiB
+of scales and 75.8 MiB of residuals, 454.7 MiB against the head's 1.27 GB. The fit is Basalt's six
+candidate steps, then the full least-squares scale correction `x |w|^2 / <w, w_hat>` (Basalt applies
+its square root). The artifact is unchanged; a resume after `--model-suspend` rebuilds the copy.
 
-**What a round does** (`ops::two_stage_head`, five launches, no host synchronization):
+**The bound.** `proxy_codec.h` derives, for every row and column, an interval that provably holds
+the dense head's BF16 value D: Cauchy-Schwarz per 32-column group for the weight residual
+(`rho_g |x_g|_2`), the activation cast's half step against `|w_hat_g|_1`, the copy's own FP32
+rounding, the dense head's (its weights rounded to BF16 once, FP32 sums within 4 ulp each over
+K + 64 additions, the one assumption about the tensor cores) and its BF16 output rounding, with a
+final 1 + 2^-10 for every FP32 rounding of the bound itself.
 
-1. cast each column of the (rotated) final hidden to int8 per 32 values;
-2. score all rows from the copy on the int8 tensor cores (about 0.4 GB read instead of 1.27 GB),
-   storing each score rounded up to BF16 and each 16-row block's largest score per column;
-3. per column, the threshold `theta` from the block maxima: binned at 8 per logit below the
-   largest, with `L` the edge of the bin where 64 blocks are reached, `theta = L - 2 x 4 - 3/8`
-   (`threshold_from_block_maxima`; with every row's error within the 4-logit margin, the 64th
-   best exact score is at least `theta + 4`);
-4. rescore from the Q8 head, in FP32 as `linear_rows` does, every row that reaches `theta` in any
-   column, and count the rescored scores at or above `theta + 4`;
-5. rescore every row of a column whose count is under 64. The count makes `theta + 4` a measured
-   lower bound on the 64th best exact score, so the one remaining assumption is that no row below
-   `theta` is under-estimated by more than 4 logits.
+**What a round does** (`ops::two_stage_head`, nine launches, no host synchronization):
+
+1. note whether any row of the round is excluded (below), and cast the activation to int8 per 32;
+2. score all rows from the copy on the int8 tensor cores with their intervals, storing each upper
+   bound rounded up to BF16 and each 16-row block's largest lower bound per column;
+3. per column, `theta` from the block maxima: the edge of the bin (8 per logit) where 64 blocks are
+   reached, less two bins for rounding (`threshold_from_block_maxima`) - a lower bound on the 64th
+   best D, since 64 distinct rows have lower bounds above it;
+4. list every valid row whose stored upper bound reaches `theta` in some column: it holds every row
+   whose D could reach the top 64; every other row's value is below `theta`, so below the 64th best;
+5. run the dense head's own route for this column count (`select_q8_n248320_k5120`, one route
+   table for both) over the listed rows only (`ops/linear/q8/q8_gathered.h`): a gathering row
+   policy and a scattering output; a row's result does not depend on which rows share its tile,
+   so each listed row gets the dense head's bits;
+6. as a check on the copy, count per column the listed rows with D at or above `theta`; a column
+   with fewer than 64 (impossible while the bound holds) runs the dense head over every row.
 
 **Which rounds take it.** A row whose sampling has a presence or frequency penalty, or a grammar
-mask, may read any vocabulary row, so its columns take the exact head (`theta = -inf`) on the
-device, from the round's own `SamplingConfig`s, inside the captured graph. Every other row's
-sampler reads only its top `kSamplerCandidateCap` = 20 rows: greedy reads the argmax, and a
-sampled row keeps at most 20 candidates before `top_p` and `min_p`, which then work within them
-(`sampling.h`); speculative acceptance builds its target distribution the same way. All of those
-are among the top 64 the head computes exactly, and every row it does not rescore stores a value
-below the 64th best, so the ordering and values the sampler reads are the exact head's.
-`static_assert(kSamplerCandidateCap <= 64)` keeps that true if the sampler grows. Prefill, scoring
-engines, MTP and DFlash proposals keep the exact head.
+mask, may read any vocabulary row; a round with such a row runs the dense head's route over every
+row (decided on the device from the round's `SamplingConfig`s, inside the captured graph). That
+costs the dense head plus the copy's small launches (the score pass exits at once); a graph
+variant per exclusion state would avoid even those, but doubles the round graphs. Every other row's
+sampler reads only its top `kSamplerCandidateCap` = 20 rows: greedy reads the argmax, a sampled row
+keeps at most 20 candidates before `top_p` and `min_p`, and speculative acceptance builds its
+target distribution the same way. `static_assert(kSamplerCandidateCap <= 64)` keeps that true. No
+logprob path binds the round's sampling, so prefill, scoring engines and the drafters' own heads
+keep the exact head.
 
-**What changes numerically.** Rescored rows are FP32 dot products, not the dense head's tensor-core
-bits: they meet the Q8 A16 Linear criterion, as the dense head does, so a near tie may resolve
-differently, as it already does between the head's T-dependent kernels. Rows outside the top hold
-the copy's approximate score; no sampler reads them.
+**What it saves: measured, nothing yet.** `ninfer_two_stage_head_codec_test` measures the bound's
+tightness on four synthetic heads (4096 x 1024, 4 columns each): Gaussian weights, a head with hot
+rows above a Gaussian bulk, activations with outlier channels, and heavy-tailed weights. On all
+four the interval holds every exact and simulated-dense score, and **every row is selected**: the
+widest bounds are 40, 61, 168 and 287 logits, while the largest real error is 12 to 18% of its
+bound. Cauchy-Schwarz over 32 weights is far looser than the copy's typical error, and no tighter
+proven bound is available from per-group norms alone, so on these heads the round does the dense
+head's work plus the copy's. `ninfer_two_stage_head_test` prints the rows selected per round on a
+27B-shaped head; Task 39's GPU run should record that count, the tokens per second with the flag
+on and off, and greedy identity (`tools/bench/greedy_identity.py --a ninfer --b-args=--lm-head-two-stage`).
+Unless the real model's columns separate far more than these, the flag is not worth enabling.
 
-**What it may save.** The synthetic check in `ninfer_two_stage_head_codec_test` (a Gaussian head
-whose scores have a standard deviation of 3) keeps 100% of the exact top 64, but rescored 4,786 of
-8,192 rows per column: with no clear top, the 8.4-logit window below the 64th best holds most of
-the vocabulary, and the head saves nothing. The largest copy error there was 4.9 logits, over the
-margin on 10 of 65,536 scores (none near the top). A real model's logits have a long upper tail
-above a dense bulk, which is where the window pays; how many rows it rescores, and how often a
-column falls back, must be measured on the 27B before this flag is recommended.
-
-**Tests.** `ninfer_two_stage_head_codec_test` (host only: the fit, the layout against an emulated
-int8 MMA, the cast, the score against FP64, the threshold on random and adversarial maxima, the
-recall report) and `ninfer_artifact_companion_plan_test` (host only: the copy is a planned term
-of the weight arena, its refusals and the startup advice); `ninfer_two_stage_head_test` (GPU, on the
-27B shape: argmax and top-16 agreement with the dense head at T = 1..16 by B = 1..8, rescored rows
-against FP64, the copy's bits, exclusion and the fallback).
+**Tests.** `ninfer_two_stage_head_codec_test` (host only: the fit, residuals as upper bounds, the
+layout against an emulated int8 MMA, the cast, `bound_holds`, `no_top_row_missed` with the tightness
+report, the threshold on random and adversarial intervals); `ninfer_artifact_companion_plan_test`
+(host only: the copy is a planned term of the weight arena, its refusals and the startup advice);
+`ninfer_qwen3_5_loading_test` (the non-Q8 and wrong-shape head refusals and the head-stage term);
+`ninfer_qwen3_5_two_stage_head_plan_test` (the startup workspace term, the Flash-Next refusal);
+`ninfer_two_stage_head_test` (GPU, the 27B shape: every row is the dense head's bits or an upper
+bound below the 64th best at T = 1..16 by B = 1..8, equal argmax and sampled tokens, the top-20 and
+top-64 sets against FP64, the copy's bits, exclusion and the fallback).
 
 ## Weight encoding and layout -- `grouped_search` and the 2026-10 27B layout
 

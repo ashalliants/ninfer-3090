@@ -210,6 +210,10 @@ ninfer_add_test(ninfer_qwen3_5_ngram_proposer_test
   LIBRARIES ninfer_core)
 # The draft head's context rows (--draft-context-rows): the per-round id set and the head formats
 # the option runs with (CPU only).
+# --lm-head-two-stage: the startup workspace term and the Flash-Next refusal, no device.
+ninfer_add_test(ninfer_qwen3_5_two_stage_head_plan_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_two_stage_head_plan.cpp"
+  LIBRARIES ninfer_engine ninfer_model_runtime ninfer_core)
 ninfer_add_test(ninfer_qwen3_5_context_rows_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_context_rows.cpp"
   LIBRARIES ninfer_model_runtime ninfer_core)

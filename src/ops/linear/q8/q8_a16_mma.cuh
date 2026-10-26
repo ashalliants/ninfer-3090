@@ -57,6 +57,11 @@ template <class Cfg, bool Full, bool FullK, class Output, class Epilogue, class 
 __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mma_kernel(
     Q8LinearOperands operands, Output output, Epilogue epilogue, RowPolicy row_policy,
     int token_begin, int token_count) {
+    // A row policy that gathers a device-sized row list (two_stage_head) retires the CTAs past
+    // it; every other policy has no such member and compiles to the kernel it always was.
+    if constexpr (requires { row_policy.skip_cta(0); }) {
+        if (row_policy.skip_cta(static_cast<int>(blockIdx.x) * RowPolicy::kOutputRowsPerCta)) return;
+    }
     const auto* __restrict__ x      = operands.x;
     const auto* __restrict__ codes  = operands.codes;
     const auto* __restrict__ scales = operands.scales;

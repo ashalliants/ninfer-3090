@@ -115,12 +115,28 @@ public:
     // --lm-head-two-stage: the device sampling configs of the round this card executes (column c
     // reads configs[c / columns_per_config]), which lets the ordinary decode and target verify
     // heads take the two-stage route when the Text head has a 2-bit copy. Null, the default, keeps
-    // the exact head; nothing else reads it.
+    // the exact head; nothing else reads it. Never bind a round whose logits feed logprobs
+    // (target_logprobs reads every row; the scoring paths do not bind).
     void bind_head_sampling(const ops::SamplingConfig* configs,
                             std::int32_t columns_per_config) noexcept {
         head_sampling_             = configs;
         head_columns_per_config_ = columns_per_config;
     }
+    // bind_head_sampling for one scope: unbinds when it ends, however it ends.
+    class ScopedHeadSampling {
+    public:
+        ScopedHeadSampling(TextContext& card, const ops::SamplingConfig* configs,
+                           std::int32_t columns_per_config) noexcept
+            : card_(card) {
+            card_.bind_head_sampling(configs, columns_per_config);
+        }
+        ~ScopedHeadSampling() { card_.bind_head_sampling(nullptr, 1); }
+        ScopedHeadSampling(const ScopedHeadSampling&)            = delete;
+        ScopedHeadSampling& operator=(const ScopedHeadSampling&) = delete;
+
+    private:
+        TextContext& card_;
+    };
 
     void set_prefill_gpu_timer(CudaEventTimer* timer) noexcept { prefill_gpu_timer_ = timer; }
 

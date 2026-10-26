@@ -83,7 +83,7 @@ void companion_is_planned() {
     binder.companion_device(head, Companion::TwoBitHeadProxy); // a repeat is accepted
     const auto plan        = std::move(binder).finish();
     const std::uint64_t copy = ops::proxy_head::proxy_bytes(kRows, kColumns);
-    require(copy == kRows * kColumns / 4 + kRows * kColumns / 32 * 2, "proxy size formula changed");
+    require(copy == kRows * kColumns / 4 + 2 * (kRows * kColumns / 32 * 2), "proxy size formula changed");
     require(companion_bytes(Companion::TwoBitHeadProxy, std::vector<std::uint64_t>{kRows, kColumns}) == copy,
             "companion_bytes differs from the codec");
     require(plan.device_objects.size() == 2, "the companion has no placement of its own");

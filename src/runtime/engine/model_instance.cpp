@@ -21,6 +21,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -546,6 +547,12 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     // --lm-head-two-stage plans its 2-bit head copy in the weight arena: refuse, naming the flag,
     // when that copy is what keeps the weights from fitting.
     const std::uint64_t head_copy_bytes = artifact::planned_companion_bytes(plan.materialization());
+    // The output head, and so its copy, always lives on the primary device (rank 0).
+    for (std::size_t rank = 1; rank < plan.materialization().device_rank_count(); ++rank) {
+        if (artifact::planned_companion_bytes(plan.materialization(), rank) != 0) {
+            throw std::logic_error("the output head's 2-bit copy was planned off the primary device");
+        }
+    }
     if (head_copy_bytes != 0) {
         const std::string why = artifact::companion_fit_refusal(
             "--lm-head-two-stage", plan.materialization().device_capacity(0), head_copy_bytes,
@@ -603,12 +610,18 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         options.context_cache.auto_host_cache = false;
     }
     const std::uint32_t requested_context = options.max_context;
-    // A start that runs out of device memory says how much the two-stage head's copy holds.
+    // A start that runs out of device memory says how much the two-stage head's copy holds. Only
+    // those refusals get the advice: the KV resolution's "... bytes are available ..." and the
+    // context fit's "not enough free GPU memory".
     const auto with_head_copy_advice = [&](auto&& step) {
         try {
             return step();
         } catch (const std::invalid_argument& error) {
-            if (head_copy_bytes == 0) { throw; }
+            const std::string_view what = error.what();
+            if (head_copy_bytes == 0 || (what.find("bytes are available") == std::string_view::npos &&
+                                         what.find("free GPU memory") == std::string_view::npos)) {
+                throw;
+            }
             throw std::invalid_argument(std::string(error.what()) + ". " +
                                         artifact::companion_memory_advice("--lm-head-two-stage",
                                                                           head_copy_bytes));
