@@ -524,7 +524,10 @@ memory, so its bytes outlive the Host copy the eviction releases until the write
 Taking the image itself (copying a conversation out of the GPU or the Host tier) is a single step of
 the Engine worker, so a request that arrives during it waits for that copy: at eviction it adds to
 the admission that needed the room (`ninfer_context_store_eviction_export_seconds_total` counts
-it). A conversation that could not be queued is tried again later if it is idle, or, if it was
+it). The copy goes into the memory of the last image the writer stored, kept for this (one
+buffer, released after 30 s without writes): a fresh buffer of a session's size is mostly page
+faults, 690 ms for 1.6 GB on a Linux RTX 3090 box against 90 ms into one already mapped. A
+conversation that could not be queued is tried again later if it is idle, or, if it was
 being evicted, is lost to the store and prefilled on its next turn as without one. The cache marks
 a conversation stored when its image is queued. When a write fails, or the store removes images on
 its own (for space or age, because they were damaged, or because a newer image superseded them),
