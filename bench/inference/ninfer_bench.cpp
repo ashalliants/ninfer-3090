@@ -352,18 +352,25 @@ int run_community(const ninfer::bench::BenchOptions& options) {
     const std::uint32_t max_context =
         nb::resolve_max_context(every, std::nullopt, options.speculative, options.use_cuda_graph);
 
+    // Before the model loads, so that a machine that cannot give a row is told so at once.
+    const auto nvml = open_nvml(options.device);
+    if (!power_limit_watts(nvml.get())) {
+        throw std::runtime_error("--preset community-1 records the GPU's power limit, and NVML "
+                                 "cannot read it here (no driver library, or a device it does "
+                                 "not see)");
+    }
+
     std::cerr << "[ninfer_bench] " << nb::kCommunityPreset << ": loading " << options.artifact_path
               << " (max_context=" << max_context << ")\n";
     ninfer::Engine engine(engine_options_for(options, max_context));
     nb::BenchEnvironment env = environment_for(options, max_context, corpus.size());
     fill_cuda_environment(env, options.device);
-    env.load                    = engine.load_summary();
-    const auto nvml             = open_nvml(options.device);
+    env.load = engine.load_summary();
+    nb::check_community_architecture(env.load.architecture);
+    // The stamp is read now, after the load, like every other run's.
     env.power_limit_watts_start = power_limit_watts(nvml.get());
     if (!env.power_limit_watts_start) {
-        throw std::runtime_error("--preset community-1 records the GPU's power limit, and NVML "
-                                 "cannot read it here (no driver library, or a device it does "
-                                 "not see)");
+        throw std::runtime_error("NVML stopped reporting the GPU's power limit during the load");
     }
     env.decode_graph_prime_output_tokens =
         nb::decode_graph_prime_output_tokens(options.speculative);
@@ -381,7 +388,6 @@ int run_community(const ninfer::bench::BenchOptions& options) {
               << prompts.size() << " chat prompts\n";
     const nb::TestResult decoded = run_chat_decode(engine, decode, prompts);
     env.power_limit_watts_end    = power_limit_watts(nvml.get());
-    warn_if_power_limit_changed(env);
 
     cudaDeviceProp properties{};
     require_cuda(cudaGetDeviceProperties(&properties, options.device), "cudaGetDeviceProperties");
@@ -394,7 +400,15 @@ int run_community(const ninfer::bench::BenchOptions& options) {
     row.prefill_64k_tps = single_prefill_rate(prefills.at(1));
     row.decode_tps      = nb::pooled_decode_tok_s(decoded);
     if (!(row.decode_tps > 0.0)) { throw std::runtime_error("the decode leg reported no time"); }
-    std::cout << nb::format_community_row(row) << '\n';
+    const std::string line = nb::format_community_row(row);
+    if (const auto warning = nb::power_limit_change_warning(env.power_limit_watts_start,
+                                                            env.power_limit_watts_end)) {
+        // Shown for diagnosis only: neither stdout nor exit 0, so no script takes it as a row.
+        std::cerr << "ninfer_bench: " << *warning << "\n[ninfer_bench] not a submittable row: "
+                  << line << '\n';
+        return 1;
+    }
+    std::cout << line << '\n';
     return 0;
 }
 

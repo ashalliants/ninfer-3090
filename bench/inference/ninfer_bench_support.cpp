@@ -215,8 +215,18 @@ std::optional<std::size_t> printable_utf8_length(std::string_view text) {
     return count;
 }
 
+// The text rules of tools/bench/check_bench_rows.py: valid UTF-8 without control characters, not
+// blank once U+0020 spaces are trimmed (nothing else is trimmed), and at most `limit` characters
+// counting every one, spaces included.
+bool row_text(std::string_view text, std::size_t limit) {
+    const auto length = printable_utf8_length(text);
+    return length && *length <= limit && text.find_first_not_of(' ') != std::string_view::npos;
+}
+
+constexpr std::size_t kRowTextMaxCharacters = 80;
+
 void validate_submitter(std::string_view submitter) {
-    const auto first = submitter.find_first_not_of(" \t");
+    const auto first = submitter.find_first_not_of(' ');
     if (first == std::string_view::npos) {
         throw std::invalid_argument(
             "--preset community-1 needs --submitter <name>, the name shown with the row");
@@ -229,7 +239,7 @@ void validate_submitter(std::string_view submitter) {
         throw std::invalid_argument("--submitter takes at most " +
                                     std::to_string(kSubmitterMaxCharacters) + " characters");
     }
-    std::string upper(submitter.substr(first, submitter.find_last_not_of(" \t") - first + 1));
+    std::string upper(submitter.substr(first, submitter.find_last_not_of(' ') - first + 1));
     for (char& c : upper) { c = static_cast<char>(std::toupper(static_cast<unsigned char>(c))); }
     if (upper == "YOUR_NAME") {
         throw std::invalid_argument("--submitter is still the placeholder YOUR_NAME; give the name "
@@ -1221,10 +1231,67 @@ std::string pcie_text(unsigned max_generation, unsigned width) {
     return std::to_string(max_generation) + ".0 x" + std::to_string(width);
 }
 
+void check_community_architecture(std::string_view architecture) {
+    if (architecture != "Qwen3_5ForCausalLM") {
+        const std::string actual = architecture.empty() ? std::string("of unknown architecture")
+                                                        : std::string(architecture);
+        throw std::invalid_argument(
+            "--preset community-1 is defined on the 27B dense models (Qwen3_5ForCausalLM): its "
+            "corpus is Qwen3.6 token ids and its rows compare those models only; this artifact "
+            "is " + actual);
+    }
+}
+
 std::string format_community_row(const CommunityRow& row) {
     constexpr double kGib = 1024.0 * 1024.0 * 1024.0;
     const auto whole = [](double value) { return static_cast<std::int64_t>(std::llround(value)); };
     const auto rate  = [](double value) { return std::round(value * 10.0) / 10.0; };
+    // Every rule tools/bench/check_bench_rows.py applies, so that a printed row always passes it.
+    const auto refuse = [](const std::string& what) {
+        throw std::invalid_argument("cannot write a community row: " + what);
+    };
+    const auto is_hex = [](std::string_view text) {
+        return text.size() >= 7 && text.size() <= 40 &&
+               text.find_first_not_of("0123456789abcdef") == std::string_view::npos;
+    };
+    const auto is_date = [](std::string_view text) {
+        if (text.size() != 10 || text[4] != '-' || text[7] != '-') { return false; }
+        for (const std::size_t i : {0, 1, 2, 3, 5, 6, 8, 9}) {
+            if (text[i] < '0' || text[i] > '9') { return false; }
+        }
+        return true;
+    };
+    if (!printable_utf8_length(row.submitter) ||
+        *printable_utf8_length(row.submitter) > kSubmitterMaxCharacters ||
+        row.submitter.find_first_not_of(' ') == std::string::npos) {
+        refuse("the submitter breaks the --submitter rules");
+    }
+    if (!is_date(row.date)) { refuse("the date must be YYYY-MM-DD"); }
+    if (!is_hex(row.commit)) { refuse("the commit must be 7-40 lowercase hex digits"); }
+    if (row.gpus.empty()) { refuse("it names no GPU"); }
+    for (const CommunityGpu& gpu : row.gpus) {
+        if (!row_text(gpu.name, kRowTextMaxCharacters)) {
+            refuse("the GPU name must be text of at most 80 characters");
+        }
+        if (whole(static_cast<double>(gpu.memory_bytes) / kGib) <= 0 ||
+            whole(gpu.power_limit_watts) <= 0) {
+            refuse("the GPU's memory and power limit must be at least 1 GiB and 1 W");
+        }
+    }
+    if (whole(static_cast<double>(row.ram_bytes) / kGib) <= 0) { refuse("host RAM is unknown"); }
+    if (!row.cpu.empty() && !row_text(row.cpu, kRowTextMaxCharacters)) {
+        refuse("the CPU must be text of at most 80 characters");
+    }
+    if (row.os != "Linux" && row.os != "Windows" && row.os != "WSL2") {
+        refuse("the OS must be Linux, Windows or WSL2");
+    }
+    if (!row_text(row.model, kRowTextMaxCharacters)) {
+        refuse("the model name must be text of at most 80 characters");
+    }
+    if (!(rate(row.prefill_16k_tps) > 0.0) || !(rate(row.prefill_64k_tps) > 0.0) ||
+        !(rate(row.decode_tps) > 0.0)) {
+        refuse("every rate must be at least 0.1 token/s");
+    }
     nlohmann::ordered_json gpus = nlohmann::ordered_json::array();
     for (const CommunityGpu& gpu : row.gpus) {
         nlohmann::ordered_json entry;

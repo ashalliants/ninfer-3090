@@ -214,7 +214,10 @@ double pooled_decode_tok_s(const TestResult& result);
 std::string community_commit(std::string_view commit, bool dirty);
 std::string os_name(bool windows, std::string_view kernel_release);
 std::string pcie_text(unsigned max_generation, unsigned width);
-// One line of JSON, no trailing newline, in the field order of the rows file.
+// Throws unless the artifact's architecture is the one the preset is defined on.
+void check_community_architecture(std::string_view architecture);
+// One line of JSON, no trailing newline, in the field order of the rows file. Throws
+// std::invalid_argument for a row tools/bench/check_bench_rows.py would reject.
 std::string format_community_row(const CommunityRow& row);
 
 std::string json_escape(std::string_view value);

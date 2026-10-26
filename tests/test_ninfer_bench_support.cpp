@@ -658,9 +658,19 @@ int test_community_preset_cli() {
                                            "model.ninfer", "--submitter", forty_accents})
                                    .submitter == forty_accents,
                        "a submitter of 40 characters is accepted, counted in characters");
+    // The same rules as tools/bench/check_bench_rows.py: only U+0020 is trimmed, and the length
+    // counts every character, spaces included.
+    for (const std::string& good : {std::string("  Ash  "), " " + std::string(39, 'a'),
+                                    std::string("\xE3\x80\x80")}) { // U+3000 is not a space here
+        failures += expect(parse_error({"ninfer_bench", "--preset", "community-1", "--weights",
+                                        "model.ninfer", "--submitter", good})
+                               .empty(),
+                           "the preset accepts the submitter `" + good + "`");
+    }
     for (const std::string& bad :
-         {std::string(""), std::string("   "), std::string(41, 'a'), std::string("YOUR_NAME"),
-          std::string("your_name"), std::string("tab\there"), std::string("\xC3")}) {
+         {std::string(""), std::string("   "), std::string(41, 'a'), " " + std::string(40, 'a'),
+          std::string("YOUR_NAME"), std::string("your_name"), std::string("  YOUR_NAME "),
+          std::string("tab\there"), std::string("\t"), std::string("\xC3")}) {
         failures += expect(!parse_error({"ninfer_bench", "--preset", "community-1", "--weights",
                                          "model.ninfer", "--submitter", bad})
                                 .empty(),
@@ -711,6 +721,19 @@ int test_community_preset_workload() {
     failures += expect_string(qb::os_name(false, "6.8.0-45-generic"), "Linux", "Linux kernel");
     failures += expect_string(qb::os_name(true, ""), "Windows", "Windows");
     failures += expect_string(qb::pcie_text(4, 16), "4.0 x16", "PCIe link text");
+
+    // The corpus is Qwen3.6 token ids and the preset is defined on the 27B dense models, the only
+    // ones of this architecture the project ships.
+    qb::check_community_architecture("Qwen3_5ForCausalLM");
+    for (const char* other : {"Qwen3_5MoeForCausalLM", "Qwen4ExpForCausalLM", ""}) {
+        std::string message;
+        try {
+            qb::check_community_architecture(other);
+        } catch (const std::invalid_argument& error) { message = error.what(); }
+        failures += expect(message.find("27B") != std::string::npos &&
+                               message.find("Qwen3_5ForCausalLM") != std::string::npos,
+                           std::string("the preset refuses the architecture `") + other + "`");
+    }
     return failures;
 }
 
@@ -784,6 +807,35 @@ int test_community_row() {
     const Json bare      = Json::parse(qb::format_community_row(unknown));
     failures += expect(!bare.contains("cpu") && !bare.at("gpus").at(0).contains("pcie"),
                        "a CPU or PCIe link that cannot be read is left out, not blank");
+
+    // A row the rows checker would reject is never printed; these mirror its rules.
+    const auto refused = [&](std::string_view label, auto&& change) {
+        auto bad = plain;
+        change(bad);
+        failures += expect_throws<std::invalid_argument>(
+            [&] { (void)qb::format_community_row(bad); }, label);
+    };
+    refused("a model of 81 characters",
+            [](qb::CommunityRow& r) { r.model = std::string(81, 'm'); });
+    refused("a blank model", [](qb::CommunityRow& r) { r.model = "  "; });
+    refused("a model with a newline", [](qb::CommunityRow& r) { r.model = "a\nb"; });
+    refused("a CPU of 81 characters", [](qb::CommunityRow& r) { r.cpu = std::string(81, 'c'); });
+    refused("a blank GPU name", [](qb::CommunityRow& r) { r.gpus[0].name = " "; });
+    refused("no GPU", [](qb::CommunityRow& r) { r.gpus.clear(); });
+    refused("a zero power limit", [](qb::CommunityRow& r) { r.gpus[0].power_limit_watts = 0.2; });
+    refused("no VRAM", [](qb::CommunityRow& r) { r.gpus[0].memory_bytes = 0; });
+    refused("no RAM", [](qb::CommunityRow& r) { r.ram_bytes = 0; });
+    refused("a rate that rounds to 0", [](qb::CommunityRow& r) { r.decode_tps = 0.04; });
+    refused("an unknown OS", [](qb::CommunityRow& r) { r.os = "macOS"; });
+    refused("a dirty commit", [](qb::CommunityRow& r) { r.commit = "61561d88a-dirty"; });
+    refused("a malformed date", [](qb::CommunityRow& r) { r.date = "26/10/2026"; });
+    auto long_ok  = plain;
+    long_ok.model = std::string(80, 'm');
+    long_ok.cpu   = std::string(80, 'c');
+    const Json long_row = Json::parse(qb::format_community_row(long_ok));
+    failures += expect(long_row.at("model").get<std::string>().size() == 80 &&
+                           long_row.at("cpu").get<std::string>().size() == 80,
+                       "a model and CPU of 80 characters are accepted");
     return failures;
 }
 
