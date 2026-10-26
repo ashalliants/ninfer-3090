@@ -266,6 +266,7 @@ and the JSON record carries `vision_overlay`, including `exclusive_windows` and 
 |---|---|
 | `GET /health` | process health and build version (see [Server version](#server-version)) |
 | `GET /v1/load` | serving capacity, current load, and monotonic token counters (see [Load](#load)) |
+| `GET /slots` | each execution lane's state and progress, and the waiting queue (see [Slots](#slots)) |
 | `GET /metrics` | Prometheus counters, gauges and latency histograms, plus llama.cpp-compatible series (see [Metrics](#metrics)) |
 | `GET /v1/models` | configured OpenAI model alias, effective context limit (`max_model_len`/`context_window`/`context_length`) and input modalities (see [Model discovery](#model-discovery)) |
 | `GET /v1/models/{id}` | lookup of the same model object by its alias |
@@ -333,7 +334,8 @@ for the default thinking mode (thinking unless `--no-thinking`) under the proces
 requests otherwise draw a fresh random seed. `model_alias` is the public model id and `model_path`
 the artifact path the server was started with. `build_info` is `ninfer <version>` (see
 [Server version](#server-version)). There is no `chat_template` or
-writable `POST /props`, and `/slots` and llama.cpp's non-`/v1` route aliases are not served.
+writable `POST /props`, and llama.cpp's non-`/v1` route aliases are not served. `GET /slots`
+is served in NInfer's own shape (see [Slots](#slots)).
 
 ### Server version
 
@@ -461,6 +463,49 @@ curl http://127.0.0.1:8080/v1/load -H 'Authorization: Bearer local-secret'
   gaps. A healthy Engine stays in milliseconds; an Engine that stalls for seconds right after every
   first token reports whole seconds even for a short answer while `/health` stays 200, so a
   supervisor can restart on, say, `inter_token_seconds > 0.25` for several consecutive polls.
+
+### Slots
+
+`GET /slots` shows what each execution lane is doing and who is waiting for one, for clients that
+probe a llama.cpp server's `/slots` and for watching a long prefill. Like `/v1/load` it requires the
+API key when one is configured, answers `503 model_loading` until warmup completes, and reads only
+the snapshot the Engine already publishes at every prefill step and decode round, so polling it
+never waits on the GPU executor. The body is NInfer's own shape, not llama.cpp's:
+
+```json
+{"slots": [
+   {"id": 0, "state": "prefill", "request_id": 7, "prompt_tokens": 4096, "prompt_done": 3072,
+    "reused": 2048, "generated": 0, "n_ctx_used": 3072, "tokens_per_second": 0.0,
+    "drafted": 0, "accepted": 0, "relaxed_kept": 0},
+   {"id": 1, "state": "decoding", "request_id": 5, "prompt_tokens": 100, "prompt_done": 100,
+    "reused": 0, "generated": 41, "n_ctx_used": 141, "tokens_per_second": 62.5,
+    "drafted": 48, "accepted": 30, "relaxed_kept": 2}],
+ "queue": [{"id": 8, "prompt_tokens": 512, "waited_s": 1.25}],
+ "queue_total": 1}
+```
+
+- `slots` has one entry per lane (`--max-concurrency`). `id` is the lane; `request_id` is the
+  Engine request id the [structured request log](#structured-request-log) records as
+  `engine_request_id`, or `null` on an idle lane, whose counts are all 0.
+- `state` is `idle`, `prefill` (the lane is prefilling its prompt, or rebuilding a paused request's
+  state) or `decoding` (the prompt is done and the lane is producing tokens). A lane being paused
+  reports the phase it will resume in.
+- `prompt_tokens` is the request's prompt. `prompt_done` is how much of it the lane holds so far,
+  `reused` (the prefix taken from the context cache) included, so `prompt_done / prompt_tokens` is
+  the prefill progress and the two are equal once prefill is done. `generated` counts committed
+  output tokens, the first included, and `n_ctx_used` is `prompt_done + generated`.
+- `tokens_per_second` is the lane's tokens after the first over the time since the first, so it
+  includes any pause; it is 0 until the second token.
+- `drafted`, `accepted` and `relaxed_kept` are the request's speculative-decoding counts so far:
+  draft tokens offered, drafts accepted, and the accepted drafts that
+  [relaxed drafting](#relaxed-drafting) kept (a subset of `accepted`). All are 0 without a draft
+  source.
+- `queue` lists the requests waiting for a lane, oldest first: the Engine request `id`, its
+  `prompt_tokens` and the seconds since it was submitted (`waited_s`). It lists at most the first 64;
+  `queue_total` counts them all (`requests.waiting` in `/v1/load`). Requests paused by resource
+  pressure hold no lane and are not in the queue (`requests.paused` in `/v1/load` counts them).
+- The snapshot can trail the poll by up to one prefill step or decode round, so a long decode round
+  or prefill chunk shows as a pause in the counts.
 
 ### Context store
 
@@ -829,7 +874,7 @@ The router answers llama.cpp's model API itself:
 | `GET /models/sse` | a stream of `{"model", "status"}` events |
 | `POST /v1/models/{id}/suspend`, `/resume`, `GET /v1/models/{id}/residency` | the [model suspend](#model-suspend) endpoints of one model |
 
-`GET /health` is 200 while the router runs. `GET /props`, `/metrics` and `/v1/load` answer for the
+`GET /health` is 200 while the router runs. `GET /props`, `/metrics`, `/v1/load` and `/slots` answer for the
 model that last served, without waking or loading it (a 503 while it is unloaded). Everything
 else (chat completions, Responses, Messages and the rest) is forwarded to the model it names: each model runs the ordinary
 single-model server on a loopback port of its own, so every endpoint, request log and metric works

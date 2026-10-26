@@ -405,7 +405,7 @@ void RouterServer::register_routes() {
         handle_model(req, res);
     });
     // Status endpoints read the model that last served without waking a sleeping one.
-    for (const char* path : {"/props", "/metrics", "/v1/load"}) {
+    for (const char* path : {"/props", "/metrics", "/v1/load", "/slots"}) {
         server_.Get(path, [this](const httplib::Request& req, httplib::Response& res) {
             route_status(req, res);
         });

@@ -97,6 +97,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_scheduler_test
   ninfer_model_registry_test
   ninfer_serve_options_test
+  ninfer_slots_report_test
   ninfer_tensor_test
   ninfer_tool_call_parser_test
   ninfer_wide_math_test

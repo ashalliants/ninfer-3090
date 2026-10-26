@@ -66,8 +66,8 @@ private:
     void handle_health(const httplib::Request& req, httplib::Response& res) const;
     // Routes a request to the model it names (waking or loading it first) and relays the response.
     void route(const httplib::Request& req, httplib::Response& res);
-    // Reads a status endpoint (/props, /metrics, /v1/load) from the most recently used model
-    // without waking it.
+    // Reads a status endpoint (/props, /metrics, /v1/load, /slots) from the most recently used
+    // model without waking it.
     void route_status(const httplib::Request& req, httplib::Response& res);
 
     // Relays `method target` with `body` to the server of the model `lease` holds, taking the lease

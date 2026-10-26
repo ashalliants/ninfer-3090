@@ -752,6 +752,9 @@ private:
     };
 
     void publish_runtime_stats();
+    // One occupied lane's row of RuntimeStats::lanes as of `now`.
+    [[nodiscard]] static RuntimeLaneStats lane_stats(const Request& request,
+                                                     Clock::time_point now) noexcept;
 
     GenerationResult wait_for_request(std::shared_ptr<Request> request, OutputSink* sink,
                                       const CancellationView& cancellation) {

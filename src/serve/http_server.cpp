@@ -6,6 +6,7 @@
 #include "serve/openai_common.h"
 #include "serve/props.h"
 #include "serve/request_log.h"
+#include "serve/slots_report.h"
 
 #include <nlohmann/json.hpp>
 
@@ -118,6 +119,7 @@ const char* endpoint_name(std::string_view path) noexcept {
     if (path == "/v1/messages") { return "anthropic_messages"; }
     if (path == "/v1/messages/count_tokens") { return "anthropic_count_tokens"; }
     if (path == "/v1/load") { return "load"; }
+    if (path == "/slots") { return "slots"; }
     return "http_route";
 }
 
@@ -547,6 +549,11 @@ void HttpServer::register_routes() {
     });
     server_.Get("/props", [this](const httplib::Request& req, httplib::Response& res) {
         handle_props(req, res);
+    });
+    server_.Get("/slots", [this](const httplib::Request&, httplib::Response& res) {
+        // The Engine's last published lanes and queue: never waits on the executor.
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(render_slots_json(service_->runtime_stats()), "application/json");
     });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);

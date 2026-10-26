@@ -26,6 +26,7 @@ add_library(ninfer_serve STATIC
   metrics.cpp
   http_server.cpp
   load_report.cpp
+  slots_report.cpp
   openai_responses_http.cpp
   serve_options.cpp
   model_catalog.cpp

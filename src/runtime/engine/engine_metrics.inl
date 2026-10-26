@@ -175,8 +175,17 @@ void EngineCore<Instance>::publish_runtime_stats() {
     {
         std::lock_guard lock(queue_mutex_);
         snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
+        snapshot.waiting.reserve(std::min(pending_.size(), kMaximumReportedWaitingRequests));
         for (const auto& request : pending_) {
             add_backlog(queued_prefill_ns(request->prompt_summary));
+            if (snapshot.waiting.size() < kMaximumReportedWaitingRequests) {
+                snapshot.waiting.push_back(RuntimeWaitingStats{
+                    .request_id     = request->id,
+                    .prompt_tokens  = request->prompt_summary.prompt_tokens,
+                    .waited_seconds =
+                        std::chrono::duration<double>(detail_started - request->submitted).count(),
+                });
+            }
         }
     }
     snapshot.prefilling_requests              = 0;
@@ -191,8 +200,10 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.host_context_geometry_failures   = physical.host_geometry_failures;
     snapshot.host_context_shortage_failures   = physical.host_shortage_failures;
     snapshot.materializing_requests           = materializing_.has_value() ? 1U : 0U;
+    snapshot.lane_count                       = static_cast<std::uint8_t>(max_concurrency_);
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         if (slots_[lane] == nullptr) { continue; }
+        snapshot.lanes[lane] = lane_stats(*slots_[lane], detail_started);
         ++snapshot.running_requests;
         if (slots_[lane]->is_prefilling()) {
             ++snapshot.prefilling_requests;
@@ -217,7 +228,43 @@ void EngineCore<Instance>::publish_runtime_stats() {
     finish_engine_phase(measurement, EngineHostPhase::Maintenance);
     snapshot.host_work = cumulative_stats_.host_work;
     std::lock_guard lock(stats_mutex_);
-    published_stats_ = snapshot;
+    published_stats_ = std::move(snapshot);
+}
+
+template <class Instance>
+RuntimeLaneStats EngineCore<Instance>::lane_stats(const Request& request,
+                                                  Clock::time_point now) noexcept {
+    // A pausing lane reports the phase it will resume in.
+    const EngineRequestState phase = request.model_state == EngineRequestState::Pausing ||
+                                             request.model_state == EngineRequestState::Paused
+                                         ? request.resume_phase
+                                         : request.model_state;
+    const bool prompt_phase = phase == EngineRequestState::Waiting ||
+                              phase == EngineRequestState::Materializing ||
+                              phase == EngineRequestState::Prefill ||
+                              phase == EngineRequestState::Replay;
+    const std::optional<BeginSummary>& begin = request.admitted_begin;
+    RuntimeLaneStats lane;
+    lane.state =
+        prompt_phase ? RuntimeLaneStats::State::Prefill : RuntimeLaneStats::State::Decoding;
+    lane.request_id    = request.id;
+    lane.prompt_tokens = begin ? begin->prompt_tokens : request.prompt_summary.prompt_tokens;
+    lane.reused_prompt_tokens   = begin ? begin->reused_prompt_tokens : 0;
+    lane.computed_prompt_tokens = request.computed_prompt_tokens;
+    lane.generated_tokens       = static_cast<std::int64_t>(request.generated.size());
+    lane.context_tokens =
+        lane.reused_prompt_tokens + lane.computed_prompt_tokens + lane.generated_tokens;
+    if (request.first_token && lane.generated_tokens > 1) {
+        const double seconds = std::chrono::duration<double>(now - *request.first_token).count();
+        if (seconds > 0.0) {
+            lane.decode_tokens_per_second =
+                static_cast<double>(lane.generated_tokens - 1) / seconds;
+        }
+    }
+    lane.drafted_tokens  = request.speculative_stats.drafted_tokens;
+    lane.accepted_tokens = request.speculative_stats.accepted_tokens;
+    lane.relaxed_kept    = request.speculative_stats.relaxed_kept;
+    return lane;
 }
 
 template <class Instance>

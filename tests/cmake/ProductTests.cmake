@@ -59,6 +59,10 @@ ninfer_add_test(ninfer_load_report_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_load_report.cpp"
   LIBRARIES ninfer_serve)
 
+ninfer_add_test(ninfer_slots_report_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_slots_report.cpp"
+  LIBRARIES ninfer_serve)
+
 ninfer_add_test(ninfer_metrics_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_metrics.cpp"
   LIBRARIES ninfer_serve)

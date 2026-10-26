@@ -1594,6 +1594,37 @@ struct RuntimeHostWorkStats {
     }
 };
 
+// One execution lane as of the last published snapshot (GET /slots).
+struct RuntimeLaneStats {
+    // Prefill covers a lane rebuilding or prefilling its prompt (replay included); Decoding a lane
+    // past its prompt, in or waiting for the decode batch.
+    enum class State : std::uint8_t { Idle, Prefill, Decoding } state = State::Idle;
+    std::uint64_t request_id = 0; // the Engine request id (the request log's engine_request_id)
+    std::int64_t prompt_tokens = 0;
+    // Prompt tokens prefill has evaluated, reused prefix tokens excluded.
+    std::int64_t computed_prompt_tokens = 0;
+    std::int64_t reused_prompt_tokens   = 0;
+    std::int64_t generated_tokens       = 0;
+    // Tokens the lane's sequence holds: reused + computed prompt tokens + generated tokens.
+    std::int64_t context_tokens = 0;
+    // Tokens after the first over the time since the first, 0 before the second token.
+    double decode_tokens_per_second = 0.0;
+    std::uint64_t drafted_tokens    = 0;
+    std::uint64_t accepted_tokens   = 0;
+    std::uint64_t relaxed_kept      = 0;
+};
+
+// One request waiting in the Engine FIFO for a lane.
+struct RuntimeWaitingStats {
+    std::uint64_t request_id   = 0;
+    std::int64_t prompt_tokens = 0;
+    double waited_seconds      = 0.0;
+};
+
+// RuntimeStats::waiting lists at most this many requests, oldest first, so publishing a snapshot
+// stays cheap with a long queue; RuntimeStats::waiting_requests is the full count.
+inline constexpr std::size_t kMaximumReportedWaitingRequests = 64;
+
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
@@ -1638,6 +1669,11 @@ struct RuntimeStats {
     std::uint32_t materializing_requests    = 0;
     std::uint32_t capture_pending_requests  = 0;
     std::uint32_t terminal_pending_requests = 0;
+    // Per lane, gauges like the counts above: lanes[0, lane_count) are the Engine's lanes.
+    std::array<RuntimeLaneStats, kMaximumConcurrency> lanes{};
+    std::uint8_t lane_count = 0;
+    // The first kMaximumReportedWaitingRequests waiting requests, oldest first.
+    std::vector<RuntimeWaitingStats> waiting;
     std::uint64_t active_captures_completed = 0;
     std::uint64_t active_captures_aborted   = 0;
     std::uint64_t preemptions               = 0;
