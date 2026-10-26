@@ -164,6 +164,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -178,7 +179,9 @@
 #include <optional>
 #include <span>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #ifdef _WIN32
@@ -195,6 +198,22 @@ namespace ex = ninfer::models::qwen4_exp::execution;
 namespace ppl = ninfer::perplexity;
 
 namespace {
+
+// An option's whole value as an integer: "12x", "", "1e3" and out-of-range values are refused,
+// naming the option (std::stoi would take "12x" as 12 and throw a bare "stoi" otherwise).
+template <typename Int>
+Int option_integer(const std::string& option, const std::string& value) {
+    Int out{};
+    const char* end           = value.data() + value.size();
+    const auto [stop, status] = std::from_chars(value.data(), end, out);
+    if (value.empty() || status != std::errc{} || stop != end) {
+        throw std::invalid_argument(option + " needs an integer, got '" + value + "'");
+    }
+    return out;
+}
+int option_int(const std::string& option, const std::string& value) {
+    return option_integer<int>(option, value);
+}
 
 std::vector<std::int32_t> parse_tokens(const std::string& argument) {
     std::string text = argument;
@@ -699,13 +718,13 @@ int rows_mode(int argc, char** argv, const char* artifact_env) {
         if (i + 1 >= argc) { throw std::invalid_argument(arg + " needs a value"); }
         const std::string value = argv[++i];
         if (arg == "--rows") {
-            steps = std::stoi(value);
+            steps = option_int(arg, value);
         } else if (arg == "--time") {
-            time_rounds = std::stoi(value);
+            time_rounds = option_int(arg, value);
         } else if (arg == "--frames-mib") {
-            frames_mib = std::stoll(value);
+            frames_mib = option_integer<std::int64_t>(arg, value);
         } else if (arg == "--staging") {
-            staging_slots = std::stoi(value);
+            staging_slots = option_int(arg, value);
         } else if (arg == "--configs") {
             configs = parse_tokens(value);
         } else {
@@ -1158,7 +1177,7 @@ int kld_mode(int argc, char** argv, const char* artifact_env) {
         } else if (arg == "--chunks") {
             chunks = ppl::parse_kld_chunks(value);
         } else if (arg == "--window") {
-            window = std::stoi(value);
+            window = option_int(arg, value);
             if (window < 1 || window > kMaxVerifyColumns) {
                 throw std::invalid_argument("--window must be 1 to " + std::to_string(kMaxVerifyColumns) +
                                             ": the Flash-Next verify forward is at most the anchor and 7 MTP drafts");
@@ -1166,7 +1185,7 @@ int kld_mode(int argc, char** argv, const char* artifact_env) {
         } else if (arg == "--tsv") {
             tsv_path = value;
         } else if (arg == "--staging") {
-            staging_slots = std::stoi(value);
+            staging_slots = option_int(arg, value);
         } else {
             throw std::invalid_argument("unknown option " + arg + " in --kld-base mode");
         }
@@ -1310,7 +1329,7 @@ int hc_int8_prefill_mode(int argc, char** argv, const char* artifact_env) {
         if (i + 1 >= argc) { throw std::invalid_argument(arg + " needs a value"); }
         const std::string value = argv[++i];
         if (arg == "--staging") {
-            staging_slots = std::stoi(value);
+            staging_slots = option_int(arg, value);
         } else {
             throw std::invalid_argument("unknown option " + arg + " in --hc-int8-prefill mode");
         }
@@ -1390,9 +1409,9 @@ int shared_expert_mode(int argc, char** argv, const char* artifact_env) {
         if (i + 1 >= argc) { throw std::invalid_argument(arg + " needs a value"); }
         const std::string value = argv[++i];
         if (arg == "--decode") {
-            decode = std::stoi(value);
+            decode = option_int(arg, value);
         } else if (arg == "--staging") {
-            staging_slots = std::stoi(value);
+            staging_slots = option_int(arg, value);
         } else {
             throw std::invalid_argument("unknown option " + arg + " in --shared-expert-stream mode");
         }
@@ -1489,11 +1508,11 @@ int identity_mode(int argc, char** argv, const char* artifact_env, const std::st
         if (i + 1 >= argc) { throw std::invalid_argument(arg + " needs a value"); }
         const std::string value = argv[++i];
         if (arg == "--window") {
-            window = std::stoi(value);
+            window = option_int(arg, value);
         } else if (arg == "--decode") {
-            decode = std::stoi(value);
+            decode = option_int(arg, value);
         } else if (arg == "--staging") {
-            staging_slots = std::stoi(value);
+            staging_slots = option_int(arg, value);
         } else {
             throw std::invalid_argument("unknown option " + arg + " in " + flag + " mode");
         }
@@ -1647,7 +1666,7 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { throw std::invalid_argument(arg + " needs a value"); }
             const std::string value = argv[++i];
             if (arg == "--staging") {
-                staging_slots = std::stoi(value);
+                staging_slots = option_int(arg, value);
                 continue;
             }
             if (jobs.empty()) { throw std::invalid_argument(arg + " needs a token list before it"); }
@@ -1663,10 +1682,10 @@ int main(int argc, char** argv) {
             } else if (arg == "--dump-logits") {
                 job.dump_path = value;
             } else if (arg == "--chunk") {
-                job.chunk = std::stoi(value);
+                job.chunk = option_int(arg, value);
                 if (job.chunk <= 0) { throw std::invalid_argument("--chunk must be positive"); }
             } else if (arg == "--decode") {
-                job.decode = std::stoi(value);
+                job.decode = option_int(arg, value);
             } else {
                 throw std::invalid_argument("unknown option " + arg);
             }

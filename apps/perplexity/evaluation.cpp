@@ -191,17 +191,25 @@ ScoredRow score_row(std::span<const float> test_logits, std::span<const double> 
     }
     const auto vocab = static_cast<std::size_t>(valid_vocab);
 
+    // A NaN anywhere, or no finite maximum (every logit -inf, or one +inf), has no log-softmax:
+    // refuse the row rather than let NaN reach the summary, where every comparison passes it.
+    const auto bad_row = [](const char* what) {
+        throw std::domain_error(std::string("score_row: ") + what);
+    };
     // Strict > keeps the lowest id on ties.
     std::size_t top = 0;
-    for (std::size_t i = 1; i < vocab; ++i) {
+    for (std::size_t i = 0; i < vocab; ++i) {
+        if (std::isnan(test_logits[i])) { bad_row("test logits contain NaN"); }
         if (test_logits[i] > test_logits[top]) { top = i; }
     }
     std::size_t top_base = 0;
-    for (std::size_t i = 1; i < vocab; ++i) {
+    for (std::size_t i = 0; i < vocab; ++i) {
+        if (std::isnan(base_logprobs[i])) { bad_row("base log-probs contain NaN"); }
         if (base_logprobs[i] > base_logprobs[top_base]) { top_base = i; }
     }
 
     const double max_logit = static_cast<double>(test_logits[top]);
+    if (!std::isfinite(max_logit)) { bad_row("test logits have no finite maximum (all -inf, or +inf)"); }
     double sum             = 0.0;
     for (std::size_t i = 0; i < vocab; ++i) { sum += std::exp(static_cast<double>(test_logits[i]) - max_logit); }
     const double lse = max_logit + std::log(sum);

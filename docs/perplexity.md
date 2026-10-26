@@ -102,8 +102,8 @@ decode kernels, the speculative verify forward, or the KV writes made while deco
 `--kld-base` scores through the decode path instead, against a llama.cpp KL-divergence base. Use it
 to judge a numerics change to any of those paths. The method follows Basalt's quality gate.
 
-Build the base once with llama.cpp from a reference model (Basalt uses a Q8_0 GGUF) and a text
-file. llama.cpp tokenizes the text, so the base fixes the exact tokens every run scores:
+Build the base once with llama.cpp from a higher-precision reference model (a Q8_0 GGUF, say) and
+a text file. llama.cpp tokenizes the text, so the base fixes the exact tokens every run scores:
 
 ```bash
 llama-perplexity -m qwen3_8_27b-q8_0.gguf -f wiki.test.raw -c 512 \

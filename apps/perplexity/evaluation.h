@@ -69,7 +69,8 @@ struct ScoredRow {
 };
 
 // FP64 log-softmax of the test logits over [0, valid_vocab), compared with the base log-probs.
-// KLD skips terms with base log-prob <= -16. Top-1 ties go to the lower id.
+// KLD skips terms with base log-prob <= -16. Top-1 ties go to the lower id. Throws
+// std::domain_error for a NaN logit or base log-prob, or test logits with no finite maximum.
 [[nodiscard]] ScoredRow score_row(std::span<const float> test_logits,
                                   std::span<const double> base_logprobs, std::int32_t target,
                                   std::int32_t valid_vocab);
