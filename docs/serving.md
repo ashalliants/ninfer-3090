@@ -427,7 +427,10 @@ image of its own, written as soon as the cache has captured one (at most one a s
 writer is idle, busy or not: it is a short copy of a few thousand tokens and one recurrent state,
 counted in `ninfer_context_store_shared_export_seconds_total`), so after a restart, or on a new
 box that shares the bucket, the first request of every tenant on that prompt starts warm. Prompt
-grafts are installed context and are never stored. A conversation is written to `DIR`
+grafts are installed context and are never stored, and neither are progress anchors
+(`--progress-anchors-shared`): an anchor insures one conversation's long prefill against a
+cancellation, its retry finds it in memory, and the conversation's own image holds the same pages
+once the request ends. A conversation is written to `DIR`
 
 - in the background once it has been unused for `--context-store-idle-seconds` (30 s) and has
   changed since it was last written, so a crash loses at most that much of a conversation,
@@ -523,8 +526,13 @@ the Engine worker, so a request that arrives during it waits for that copy: at e
 the admission that needed the room (`ninfer_context_store_eviction_export_seconds_total` counts
 it). A conversation that could not be queued is tried again later if it is idle, or, if it was
 being evicted, is lost to the store and prefilled on its next turn as without one. The cache marks
-a conversation stored when its image is queued; a write that then fails, or an image the store
-later removes for space or age, clears every mark, so everything is written again.
+a conversation stored when its image is queued. When a write fails, or the store removes images on
+its own (for space or age, because they were damaged, or because a newer image superseded them),
+each mark is checked against what the store still holds: a conversation whose write failed is
+written again, and one whose image the store removed is written again only once it has changed
+(its next turn). Writing back an image the store chose to let go would only evict another, which
+would then be written back in turn; an unchanged conversation is therefore written once per state,
+and `ninfer_context_store_idle_writes_total` counts the background writes.
 
 `--context-store-compress` (off by default) writes new chunks zstd-compressed (level 3), in the
 directory and in the bucket, when that makes the chunk at least 3 % smaller (otherwise it is kept
@@ -900,6 +908,7 @@ server restarts.
 | `ninfer_context_store_hydrations_total`, `_hydrated_tokens_total`, `_hydration_failures_total`, `_hydration_seconds_total` | stored sessions read back for a request, the prompt tokens that saved, failures (the request was prefilled, or its admission did not use what was read) and the time requests waited for the reads, failed ones included |
 | `ninfer_context_store_hydration_failures_by_reason_total{reason}` | `_hydration_failures_total` by reason: `load_miss` (the store could not read the session back: gone, damaged, or the bucket failed), `deadline` (the read, or the download before it, did not finish in the request's wait), `host_capacity` (the Host tier could not make room), `host_geometry` (room was made but the session's states found no contiguous Host extents), `adopt` and `not_candidate` (imported, but the cache could not take it or did not offer it to the request), `unused_at_admission` (the request was admitted from something shallower), `invalid_image` (written under another model or configuration), `exception` (anything else that failed during the import). Each failure is also logged as a warning: `context store hydration failed \| <id> \| <reason> \| <size> \| resume at <tokens> \| waited <ms>` |
 | `ninfer_context_store_shared_writes_total`, `_shared_export_seconds_total` | public shared prefixes written to the store, and the Engine worker time spent copying them out |
+| `ninfer_context_store_idle_writes_total`, `_idle_export_seconds_total` | conversations written in the background once idle (`--context-store-idle-seconds`), and the Engine worker time spent copying them out |
 | `ninfer_context_store_eviction_writes_total`, `_eviction_export_seconds_total` | conversations queued for the store as the cache evicted them, and the Engine worker time spent copying them out |
 | `ninfer_context_store_read_bytes_per_second` | gauge: the store read rate (read, verification and import into the Host tier) the cost model prices hydrations with, learned from the reads so far; 1 GB/s until the first read of at least 64 MiB |
 | `ninfer_context_store_remote_images` | gauge: with a bucket, sessions it holds that the directory does not hold in full |

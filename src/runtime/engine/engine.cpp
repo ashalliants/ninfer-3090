@@ -442,9 +442,17 @@ public:
     struct PendingWrite {
         CheckpointImage image;
         bool shared = false;
+        std::string id; // the store id the image is written under
     };
     std::deque<PendingWrite> pending_writes;
     bool writer_active = false;
+    std::string active_write_id; // the write in progress, while writer_active
+    // Ids of queued writes that failed since the core last took them. Bounded: beyond it the
+    // oldest go and `failed_write_ids_lost` says so, and the core then retries every continuation
+    // whose image the store does not hold.
+    std::deque<std::string> failed_write_ids;
+    bool failed_write_ids_lost = false;
+    static constexpr std::size_t kMaximumFailedWriteIds = 4096;
     bool writer_stop   = false;
     std::optional<std::chrono::steady_clock::time_point> drain_deadline;
     std::thread writer;
@@ -507,7 +515,14 @@ private:
                 return enqueue_store_write(std::move(image), StoreWrite::SharedPrefix);
             },
             .ready   =[this] { return store_queue_idle(); },
+            .queued  = [this](const std::string& id) { return store_write_queued(id); },
             .failures = [this] { return store_write_failures.load(std::memory_order_relaxed); },
+            .failed_writes =
+                [this] {
+                    typename GenerationCoreT::FailedStoreWrites reported;
+                    take_failed_writes(reported.ids, reported.lost);
+                    return reported;
+                },
             .idle_persist =
                 std::chrono::duration_cast<std::chrono::milliseconds>(options.context_store.idle_persist),
             .hydration_budget =
@@ -688,6 +703,31 @@ private:
         return pending_writes.empty() && !writer_active;
     }
 
+    // Whether the image `id` is queued for the writer or being written now.
+    [[nodiscard]] bool store_write_queued(const std::string& id) {
+        std::scoped_lock lock(writer_mutex);
+        if (writer_active && active_write_id == id) { return true; }
+        return std::any_of(pending_writes.begin(), pending_writes.end(),
+                           [&](const PendingWrite& pending) { return pending.id == id; });
+    }
+
+    // The ids of writes that failed since the last call. Under writer_mutex.
+    void record_failed_write_locked(std::string id) {
+        if (failed_write_ids.size() >= kMaximumFailedWriteIds) {
+            failed_write_ids.pop_front();
+            failed_write_ids_lost = true;
+        }
+        failed_write_ids.push_back(std::move(id));
+    }
+
+    // Hands over the failed writes not yet taken, and whether some were lost.
+    void take_failed_writes(std::vector<std::string>& ids, bool& lost) {
+        std::scoped_lock lock(writer_mutex);
+        ids.assign(failed_write_ids.begin(), failed_write_ids.end());
+        lost = std::exchange(failed_write_ids_lost, false);
+        failed_write_ids.clear();
+    }
+
     // Queues an image for the writer thread. Never blocks: when the queue is full the image is
     // not written now; an idle continuation is tried again later, an evicted one is lost to the
     // store as it would be without write-on-evict.
@@ -706,7 +746,9 @@ private:
             return false;
         }
         if (!writer.joinable()) { writer = std::thread([this] { writer_loop(); }); }
-        pending_writes.push_back({std::move(image), kind == StoreWrite::SharedPrefix});
+        const bool shared = kind == StoreWrite::SharedPrefix;
+        std::string id    = image_id(image, shared);
+        pending_writes.push_back({std::move(image), shared, std::move(id)});
         lock.unlock();
         writer_cv.notify_one();
         return true;
@@ -725,10 +767,11 @@ private:
                 }
                 write = std::move(pending_writes.front());
                 pending_writes.pop_front();
-                writer_active = true;
+                writer_active   = true;
+                active_write_id = write.id;
             }
             ContextStoreWriteEvent event;
-            event.id           = image_id(write.image, write.shared);
+            event.id           = write.id;
             event.tokens       = write.image.tokens;
             event.bytes        = write.image.bytes.size();
             const auto started = std::chrono::steady_clock::now();
@@ -737,17 +780,21 @@ private:
             } catch (const std::exception& error) {
                 event.error = error.what();
             } catch (...) { event.error = "unknown context store write failure"; }
-            if (!event.error.empty()) {
-                // The continuation was counted as stored when it was queued; have it written again.
-                store_write_failures.fetch_add(1, std::memory_order_relaxed);
+            {
+                std::scoped_lock lock(writer_mutex);
+                writer_active = false;
+                active_write_id.clear();
+                // The continuation was counted as stored when it was queued; have it written
+                // again. The id goes with the failure, so the core retries exactly this image
+                // whatever it concluded about it meanwhile.
+                if (!event.error.empty()) {
+                    record_failed_write_locked(write.id);
+                    store_write_failures.fetch_add(1, std::memory_order_relaxed);
+                }
             }
             event.seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             notify(event);
-            {
-                std::scoped_lock lock(writer_mutex);
-                writer_active = false;
-            }
         }
     }
 
@@ -772,6 +819,9 @@ private:
         // Images abandoned at the deadline were marked stored when they were queued; count them
         // as failed writes so the final flush clears those marks and writes them again.
         if (!pending_writes.empty()) {
+            for (PendingWrite& pending : pending_writes) {
+                record_failed_write_locked(std::move(pending.id));
+            }
             store_write_failures.fetch_add(pending_writes.size(), std::memory_order_relaxed);
         }
         pending_writes.clear();

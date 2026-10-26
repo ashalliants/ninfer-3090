@@ -5,7 +5,7 @@
 #
 #   scripts/release-windows-wsl.sh [repo-dir]       (default: the repository this script is in)
 #
-# Builds the COMMITTED HEAD of repo-dir (VERSION bumped and RELEASE_NOTES_X.Y.Z.md committed: the packager
+# Builds the COMMITTED HEAD of repo-dir (VERSION bumped and docs/release-notes/RELEASE_NOTES_X.Y.Z.md committed: the packager
 # refuses without them). The commit travels as a git bundle, so nothing needs to be pushed. The working copy
 # is C:\ninfer-release\src and is reused, so a second run is incremental. Git on that copy runs through
 # powershell.exe: git on /mnt/c from WSL takes minutes and reports phantom changes.
@@ -20,8 +20,8 @@ work=/mnt/c/ninfer-release
 commit="$(git -C "$repo" rev-parse HEAD)"
 version="$(tr -d '\r\n' < "$repo/VERSION")"
 # In the commit, not just on disk: an untracked file passes a filesystem test but is absent from the bundle.
-git -C "$repo" cat-file -e "$commit:RELEASE_NOTES_${version%%-*}.md" 2>/dev/null ||
-  { echo "RELEASE_NOTES_${version%%-*}.md is not committed in $commit: commit it first." >&2; exit 1; }
+git -C "$repo" cat-file -e "$commit:docs/release-notes/RELEASE_NOTES_${version%%-*}.md" 2>/dev/null ||
+  { echo "docs/release-notes/RELEASE_NOTES_${version%%-*}.md is not committed in $commit: commit it first." >&2; exit 1; }
 mkdir -p "$work"
 
 git -C "$repo" bundle create "$work/release.bundle" HEAD >/dev/null 2>&1

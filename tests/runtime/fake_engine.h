@@ -38,6 +38,8 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <set>
@@ -600,10 +602,14 @@ public:
         return source;
     }
 
-    // ---- checkpoints: only installed shared prefixes (add_shared_prefix) ----
+    // ---- checkpoints: installed shared prefixes (add_shared_prefix) and continuations restored
+    // from a checkpoint image (import_checkpoints) ----
     [[nodiscard]] Key checkpoint_key(CheckpointHandle handle, std::uint32_t frontier) const {
         if (const auto* shared = shared_prefix(handle)) {
             return Key{{shared->group, 1}, frontier, 0};
+        }
+        if (const auto* restored = restored_point(handle)) {
+            return Key{{restored->group, 2}, frontier, 0};
         }
         return {};
     }
@@ -616,11 +622,19 @@ public:
                     .frontier = shared->frontier,
                     .role     = CheckpointRole::SharedPrefix};
         }
+        if (const auto* restored = restored_point(handle)) {
+            return {.key      = checkpoint_key(handle, restored->frontier),
+                    .frontier = restored->frontier,
+                    .role     = CheckpointRole::Continuation};
+        }
         return {};
     }
     [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle handle) const {
         if (const auto* shared = shared_prefix(handle)) {
             return {.frontier = shared->frontier, .role = CheckpointRole::SharedPrefix};
+        }
+        if (const auto* restored = restored_point(handle)) {
+            return {.frontier = restored->frontier, .role = CheckpointRole::Continuation};
         }
         return {};
     }
@@ -639,7 +653,8 @@ public:
     }
     [[nodiscard]] bool valid_checkpoint(CheckpointHandle handle) const noexcept {
         return handle.generation != 0 &&
-               (snapshots_.count(handle.index) != 0 || shared_prefix(handle) != nullptr);
+               (snapshots_.count(handle.index) != 0 || shared_prefix(handle) != nullptr ||
+                restored_point(handle) != nullptr);
     }
     [[nodiscard]] bool release_checkpoint(CheckpointHandle) noexcept { return false; }
     [[nodiscard]] bool revoke_snapshot(ResumeState&) noexcept { return false; }
@@ -1018,20 +1033,60 @@ public:
     }
     [[nodiscard]] double lossy_scout_share() const noexcept { return lossy_supported_ ? 0.25 : 0.0; }
 
-    // ---- checkpoint images (the store is off in these tests) ----
-    [[nodiscard]] CheckpointImage export_checkpoints(std::span<const CheckpointHandle>,
+    // ---- checkpoint images ----
+    // An image of one point: a header (marker, group, frontier) and `image_payload_bytes` of bytes
+    // that differ between groups, so two images share no chunk. Only continuations restored here
+    // export a key; the store tests that write images use those.
+    // An image of one point: a marker, then (group, frontier), then the payload. Only images with
+    // the marker are imported; any other (a test's opaque bytes) finds no room, as a full cache.
+    static constexpr std::uint64_t kImageMarker   = 0x31474d494b414646ULL; // "FFAKIMG1"
+    static constexpr std::size_t kImageHeaderBytes = 24;
+    std::size_t image_payload_bytes                = 64 * 1024;
+    [[nodiscard]] CheckpointImage export_checkpoints(std::span<const CheckpointHandle> points,
                                                      const std::optional<CacheSessionKey>&,
                                                      std::string_view) const {
-        return {};
+        exports_.fetch_add(1, std::memory_order_relaxed);
+        const auto* restored = points.empty() ? nullptr : restored_point(points.front());
+        if (restored == nullptr) { return {}; }
+        return image_of(restored->group, restored->frontier);
+    }
+    [[nodiscard]] CheckpointImage image_of(std::uint64_t group, std::uint32_t frontier) const {
+        CheckpointImage image;
+        image.bytes.resize(kImageHeaderBytes + image_payload_bytes);
+        std::memcpy(image.bytes.data(), &kImageMarker, sizeof kImageMarker);
+        std::memcpy(image.bytes.data() + 8, &group, sizeof group);
+        std::memcpy(image.bytes.data() + 16, &frontier, sizeof frontier);
+        std::uint64_t state = group * 0x9e3779b97f4a7c15ULL + 1;
+        for (std::size_t i = kImageHeaderBytes; i < image.bytes.size(); ++i) {
+            state          = state * 6364136223846793005ULL + 1442695040888963407ULL;
+            image.bytes[i] = static_cast<std::uint8_t>(state >> 56U);
+        }
+        image.regions.push_back({kImageHeaderBytes, image_payload_bytes});
+        image.keys.push_back(Key{{group, 2}, frontier, 0});
+        image.tokens = frontier;
+        return image;
+    }
+    [[nodiscard]] std::size_t exports() const noexcept {
+        return exports_.load(std::memory_order_relaxed);
     }
     [[nodiscard]] std::size_t checkpoint_image_host_bytes(std::span<const std::uint8_t>,
                                                           std::string_view) const {
         return 0;
     }
+    // Rebuilds an image_of() image as one restored continuation point.
     [[nodiscard]] std::optional<ImportedCheckpoints>
-    import_checkpoints(std::span<const std::uint8_t>, std::string_view) {
+    import_checkpoints(std::span<const std::uint8_t> image, std::string_view) {
         if (import_throws) { throw std::runtime_error("the fake import failed"); }
-        return std::nullopt;
+        std::uint64_t marker = 0;
+        if (image.size() < kImageHeaderBytes) { return std::nullopt; }
+        std::memcpy(&marker, image.data(), sizeof marker);
+        if (marker != kImageMarker) { return std::nullopt; }
+        RestoredPoint point;
+        std::memcpy(&point.group, image.data() + 8, sizeof point.group);
+        std::memcpy(&point.frontier, image.data() + 16, sizeof point.frontier);
+        const CheckpointHandle handle{kRestoredBase + static_cast<std::uint32_t>(restored_.size()), 1};
+        restored_.push_back(point);
+        return ImportedCheckpoints{.points = {handle}, .session = std::nullopt};
     }
     // Set by a test: import_checkpoints throws, as a failure the Engine did not foresee would.
     std::atomic<bool> import_throws{false};
@@ -1045,6 +1100,11 @@ private:
         double scout_seconds    = 0.0;
     };
     struct SharedPrefix {
+        std::uint64_t group    = 0;
+        std::uint32_t frontier = 0;
+    };
+    static constexpr std::uint32_t kRestoredBase = 2'000'000;
+    struct RestoredPoint {
         std::uint64_t group    = 0;
         std::uint32_t frontier = 0;
     };
@@ -1081,6 +1141,13 @@ private:
         std::optional<CarriedLossy> lossy;
     };
 
+    [[nodiscard]] const RestoredPoint* restored_point(CheckpointHandle handle) const noexcept {
+        if (handle.generation != 1 || handle.index < kRestoredBase ||
+            handle.index - kRestoredBase >= restored_.size()) {
+            return nullptr;
+        }
+        return &restored_[handle.index - kRestoredBase];
+    }
     [[nodiscard]] const SharedPrefix* shared_prefix(CheckpointHandle handle) const noexcept {
         if (handle.generation != 1 || handle.index < kSharedBase ||
             handle.index - kSharedBase >= shared_.size()) {
@@ -1179,6 +1246,9 @@ private:
     std::uint32_t next_snapshot_ = 1;
     std::set<std::uint32_t> snapshots_;
     std::vector<SharedPrefix> shared_;
+    // A deque: a restore adds a point while the worker may be reading the others.
+    std::deque<RestoredPoint> restored_;
+    mutable std::atomic<std::size_t> exports_{0};
     std::optional<std::uint32_t> scout_lane_;
     double lossy_keep_                   = 0.2;
     bool lossy_supported_                = true;

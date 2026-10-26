@@ -1,4 +1,5 @@
 #include "runtime/engine/context_store/context_store.h"
+#include "runtime/engine/context_store/image_id.h"
 
 #include <algorithm>
 #include <atomic>
@@ -363,6 +364,11 @@ std::optional<std::uint64_t> compressed_content_size(const fs::path& path) {
 
 std::array<std::uint64_t, 2> ContextStore::hash(std::span<const std::uint8_t> bytes) {
     return {xxh64(bytes.data(), bytes.size(), 0), xxh64(bytes.data(), bytes.size(), 0x9e3779b97f4a7c15ULL)};
+}
+
+std::string ContextStore::image_id(const std::array<std::uint64_t, 2>& digests,
+                                   std::uint32_t frontier, bool shared) {
+    return context_store_image_id(digests, frontier, shared);
 }
 
 // An exclusive lock on one file of the directory, held for the store's life. The directory's logic

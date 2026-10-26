@@ -497,6 +497,10 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
           "Rate at which missing chunks are fetched from the bucket and installed in the store "
           "directory (download, verification and write together, the time a request waits), "
           "learned from fetches.");
+    COUNTER(context_store_idle_writes, "context_store_idle_writes_total",
+            "Conversations written to the store once idle (--context-store-idle-seconds).");
+    COUNTER(context_store_idle_export_seconds, "context_store_idle_export_seconds_total",
+            "Engine worker time spent copying idle conversations out for the store.");
     COUNTER(context_store_eviction_writes, "context_store_eviction_writes_total",
             "Conversations written to the store as the cache evicted them (write-on-evict).");
     COUNTER(context_store_eviction_export_seconds, "context_store_eviction_export_seconds_total",
