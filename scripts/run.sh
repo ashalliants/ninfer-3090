@@ -57,7 +57,9 @@
 # NINFER_AUTO_HOST_CACHE=on) the host retry, and NINFER_FALLBACK=off turns both off.
 #
 # OVERRIDES, from the environment. All profiles: NINFER_MODEL (artifact path), NINFER_MODEL_DIR,
-# NINFER_SERVER, NINFER_HOST, NINFER_PORT, NINFER_CHAT_TEMPLATE (path to a local Jinja file, passed
+# NINFER_SERVER, NINFER_HOST, NINFER_PORT, NINFER_ALLOWED_HOST (more names the server answers to
+# without a key, e.g. "gpubox.lan,ninfer.example", comma- or space-separated; each becomes
+# --allowed-host), NINFER_CHAT_TEMPLATE (path to a local Jinja file, passed
 # straight to --chat-template; overrides the artifact's built-in template). `tuned` also:
 # NINFER_CONTEXT, NINFER_CONCURRENCY,
 # NINFER_KV_CAPACITY, NINFER_KV_DTYPE, NINFER_SPEC, NINFER_DRAFT_TOKENS, NINFER_PREFILL_CHUNK,
@@ -369,6 +371,15 @@ fi
 if [[ -n "${NINFER_CHAT_TEMPLATE:-}" ]]; then
   profile_args+=(--chat-template "$NINFER_CHAT_TEMPLATE")
 fi
+# Names for the Host check (a DNS alias, a proxy's public name). ninfer-serve refuses a value that
+# is not a plain host name or address, naming it, so nothing is checked here.
+allowed_hosts=()
+if [[ -n "${NINFER_ALLOWED_HOST:-}" ]]; then
+  IFS=$', \t' read -r -a allowed_hosts <<< "$NINFER_ALLOWED_HOST"
+  for allowed_name in ${allowed_hosts[@]+"${allowed_hosts[@]}"}; do
+    [[ -z "$allowed_name" ]] || profile_args+=(--allowed-host "$allowed_name")
+  done
+fi
 
 if [[ ! -x "$server" ]]; then
   printf 'Missing ninfer-serve (looked for %s)\n' "$server" >&2
@@ -390,6 +401,7 @@ if [[ "$profile" == 'tuned' ]]; then
   [[ -z "$loop_note" ]] || printf '%s\n' "$loop_note"
 fi
 [[ -z "${NINFER_CHAT_TEMPLATE:-}" ]] || printf 'Chat template: %s\n' "$NINFER_CHAT_TEMPLATE"
+(( ${#allowed_hosts[@]} == 0 )) || printf 'Allowed host names: %s\n' "$NINFER_ALLOWED_HOST"
 [[ -z "${hint:-}" ]] || printf '%s\n' "$hint"
 printf 'API: http://%s:%s/v1\n\n' "$HOST" "$PORT"
 

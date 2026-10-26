@@ -77,8 +77,10 @@ API key blank.
 ## Overrides
 
 Nothing here needs editing. `NINFER_SERVER`, `NINFER_MODEL_DIR`, `NINFER_MODEL`, `NINFER_HOST`,
-`NINFER_PORT` and `NINFER_CHAT_TEMPLATE` (a local Jinja file, passed to `--chat-template`,
-overriding the artifact's built-in template) work for every profile.
+`NINFER_PORT`, `NINFER_CHAT_TEMPLATE` (a local Jinja file, passed to `--chat-template`,
+overriding the artifact's built-in template) and `NINFER_ALLOWED_HOST` (more names the server
+answers to, such as `gpubox.lan`, comma- or space-separated, each passed as `--allowed-host`) work
+for every profile.
 
 | profile | also reads |
 |---|---|

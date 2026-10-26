@@ -129,7 +129,8 @@ of paused requests share once they leave the card. It is host memory, not GPU me
 now pins all of it too (earlier releases clamped it there to about 4.6 GiB).
 
 **Overrides**, from the environment: `NINFER_HOST`, `NINFER_PORT`, `NINFER_MODEL`, `NINFER_SERVER`,
-`NINFER_CHAT_TEMPLATE` for every profile, plus `NINFER_CONTEXT`, `NINFER_CONCURRENCY`,
+`NINFER_CHAT_TEMPLATE`, `NINFER_ALLOWED_HOST` (more names the server answers to, such as
+`gpubox.lan`; see [Host and Origin checks](docs/serving.md#host-and-origin-checks)) for every profile, plus `NINFER_CONTEXT`, `NINFER_CONCURRENCY`,
 `NINFER_KV_CAPACITY`, `NINFER_KV_DTYPE`, `NINFER_SPEC`, `NINFER_DRAFT_TOKENS`, `NINFER_PREFILL_CHUNK`,
 `NINFER_VISION`, `NINFER_HOST_CONTEXT_MIB` (8192), `NINFER_MIN_P` (0.03) and `NINFER_PRESENCE_PENALTY` (0.5) for the
 default ones; the last two are the loop guard, and `default` leaves the registered sampling preset in force. Other serving flags are opt-in overrides too: `NINFER_AUTO_HOST_CACHE=on`, `NINFER_MAX_OUTPUT_TOKENS`, `NINFER_MLP_A8_DECODE=on`, `NINFER_CONTEXT_STORE` and `NINFER_REASONING_LOOP=stop|conclude` (listed with their caps at the top of `run.sh` / `run.bat`). The reasoning-loop guard stays off unless set: it has not yet fired on a real Qwen3.8 run, and its thresholds were measured on other models ([serving](docs/serving.md#openai-chat-completions), under `--reasoning-loop`). The launchers bind `127.0.0.1`;

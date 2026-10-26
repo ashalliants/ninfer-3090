@@ -103,7 +103,9 @@ The sections below record the measurements behind the earlier `rk8v4` defaults. 
 too, so one file serves all three.
 
 Overrides, from the environment, so a launcher never needs editing: `NINFER_MODEL` (artifact path),
-`NINFER_MODEL_DIR`, `NINFER_SERVER`, `NINFER_HOST`, `NINFER_PORT` for every profile; `tuned` also
+`NINFER_MODEL_DIR`, `NINFER_SERVER`, `NINFER_HOST`, `NINFER_PORT`, `NINFER_ALLOWED_HOST` (names
+for the [Host check](../serving.md#host-and-origin-checks), comma- or space-separated, one
+`--allowed-host` each) for every profile; `tuned` also
 reads `NINFER_CONTEXT`, `NINFER_CONCURRENCY`, `NINFER_KV_CAPACITY` (Linux), `NINFER_KV_DTYPE`,
 `NINFER_SPEC`, `NINFER_DRAFT_TOKENS`, `NINFER_PREFILL_CHUNK`, `NINFER_VISION`,
 `NINFER_VISION_RESIDENCY`, `NINFER_HOST_CONTEXT_MIB` (default 8192), `NINFER_FALLBACK`, `NINFER_MIN_P` (default 0.03) and
@@ -150,8 +152,11 @@ value.
 To change a profile, edit its file; both launchers pick it up. Keep to what the launchers rely on:
 
 - One `"key": value` pair per line, laid out as `json.dumps(..., indent=2)` writes it, with string
-  values free of spaces, commas, colons and quotes. The launchers read `draft-tokens`,
-  `prefill-chunk` and `kv-dtype` back for their banner with a line reader, not a JSON parser.
+  values that are not empty and hold no spaces, commas, colons or quotes. The launchers read
+  `draft-tokens`, `prefill-chunk` and `kv-dtype` back for their banner with a line reader, not a
+  JSON parser: it splits each line at the colon, commas and spaces and strips the quotes, so a
+  value breaking these rules shows wrong or blank in the banner while the server still reads the
+  file correctly. A `false` value is refused too: leave the key out.
 - Integers as integers: the server's integer options refuse `1024.0`.
 - No paths. A relative path in a file is read against the working directory, not the file's own;
   model, store and template paths stay in the launchers.

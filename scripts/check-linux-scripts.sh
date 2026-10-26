@@ -137,7 +137,7 @@ expand() { python3 -I "$tmp/expand.py" "$@"; }
 
 # Every profile file keeps the layout both launchers read their banner values from: one
 # "key": value pair per line, exactly as json.dumps(..., indent=2) writes it, with scalar values
-# that hold no space, comma, colon or quote. Integers stay integers: the server's integer options
+# that are not empty and hold no space, comma, colon or quote. Integers stay integers: the server's integer options
 # refuse 1024.0.
 for profile in "$root"/profiles/*.json; do
   python3 -I - "$profile" <<'LAYOUT' || exit 1
@@ -155,6 +155,9 @@ for key, value in profile.items():
         problems.append(f'"{key}" is false: leave the key out instead')
     elif isinstance(value, str) and any(c in value for c in ' ,:"'):
         problems.append(f'"{key}" holds a space, comma, colon or quote')
+    elif value == '':
+        # The banner's line readers would show an empty value as a blank.
+        problems.append(f'"{key}" is empty: leave the key out instead')
 for problem in problems:
     print(f'{path}: {problem}', file=sys.stderr)
 sys.exit(1 if problems else 0)
@@ -336,6 +339,20 @@ expect_flags '27B NINFER_SPEC=none' "$recorded" '--prefill-cublas --prefill-chun
 refuse_flag '27B NINFER_SPEC=none' "$recorded" '--embedding-q4'
 refuse_flag '27B NINFER_SPEC=none' "$recorded" '--spec'
 refuse_flag '27B NINFER_SPEC=none' "$recorded" '--lm-head-q6'
+
+# NINFER_ALLOWED_HOST: each comma- or space-separated name becomes one --allowed-host, in every
+# profile, and the banner shows them; unset, there is none.
+expect_flags '27B NINFER_ALLOWED_HOST' \
+  "$(record allowed NINFER_ALLOWED_HOST='gpubox.lan, ninfer.example,,box2' -- qwen38-27b)" \
+  '--allowed-host gpubox.lan' '--allowed-host ninfer.example' '--allowed-host box2'
+expect_flags '27B int8 NINFER_ALLOWED_HOST' \
+  "$(record allowed_int8 NINFER_ALLOWED_HOST=gpubox.lan -- qwen38-27b int8)" '--allowed-host gpubox.lan'
+refuse_flag '27B default' "$(record allowed_none -- qwen38-27b)" '--allowed-host'
+banner="$(banner_of NINFER_ALLOWED_HOST=gpubox.lan -- qwen38-27b)"
+[[ "$banner" == *'Allowed host names: gpubox.lan'* ]] || {
+  printf 'run.sh banner does not show NINFER_ALLOWED_HOST:\n%s\n' "$banner" >&2
+  exit 1
+}
 
 # An explicit override beats the profile's default; vision can be turned off.
 recorded="$(record override NINFER_CONTEXT=65536 NINFER_PREFILL_CHUNK=1024 NINFER_CONCURRENCY=2 \
