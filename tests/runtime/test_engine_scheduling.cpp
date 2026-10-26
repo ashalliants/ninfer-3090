@@ -461,17 +461,21 @@ void test_a_short_request_pauses_a_long_prefill_and_it_resumes() {
     require(rig.core().runtime_stats().prefill_yields == 1, "the yield was not counted");
 }
 
-// Index of the last (or first) Prefill event of `id`, in the whole event log.
-std::optional<std::size_t> prefill_index(const std::vector<Event>& events, std::uint64_t id,
-                                         bool last) {
+std::optional<std::size_t> last_index(const std::vector<Event>& events, Event::Kind kind,
+                                      std::uint64_t id) {
     std::optional<std::size_t> found;
     for (std::size_t i = 0; i < events.size(); ++i) {
-        if (events[i].kind == Event::Kind::Prefill && events[i].request == id) {
-            found = i;
-            if (!last) { break; }
-        }
+        if (events[i].kind == kind && events[i].request == id) { found = i; }
     }
     return found;
+}
+
+std::optional<std::size_t> first_index(const std::vector<Event>& events, Event::Kind kind,
+                                       std::uint64_t id) {
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        if (events[i].kind == kind && events[i].request == id) { return i; }
+    }
+    return std::nullopt;
 }
 
 // Two long prompts in two lanes: rotation interleaves their steps, so both finish late; shortest
@@ -484,7 +488,9 @@ void test_rotation_interleaves_two_long_prefills() {
     rig.release();
     require(finished(first) && finished(second), "a request did not finish\n" + rig.dump());
     const auto events = rig.events();
-    require(*prefill_index(events, 2, false) < *prefill_index(events, 1, true),
+    const auto second_first = first_index(events, Event::Kind::Prefill, 2);
+    const auto first_last   = last_index(events, Event::Kind::Prefill, 1);
+    require(second_first && first_last && *second_first < *first_last,
             "rotation did not interleave the two prefills\n" + rig.dump());
 }
 
@@ -496,7 +502,9 @@ void test_shortest_runs_one_long_prefill_at_a_time() {
     rig.release();
     require(finished(first) && finished(second), "a request did not finish\n" + rig.dump());
     const auto events = rig.events();
-    require(*prefill_index(events, 1, true) < *prefill_index(events, 2, false),
+    const auto first_last   = last_index(events, Event::Kind::Prefill, 1);
+    const auto second_first = first_index(events, Event::Kind::Prefill, 2);
+    require(first_last && second_first && *first_last < *second_first,
             "the later of two equal prompts prefilled before the earlier one finished\n" +
                 rig.dump());
 }
@@ -516,7 +524,8 @@ void test_shortest_lets_a_short_prompt_overtake_a_long_one() {
             long_third_step = i;
         }
     }
-    require(long_third_step && *prefill_index(events, 2, true) < *long_third_step,
+    const auto short_last = last_index(events, Event::Kind::Prefill, 2);
+    require(long_third_step && short_last && *short_last < *long_third_step,
             "the short prompt waited for the long prompt's next step\n" + rig.dump());
 }
 
@@ -1037,22 +1046,6 @@ std::uint32_t total_tokens(const std::vector<Event>& events) {
     return total;
 }
 
-std::optional<std::size_t> last_index(const std::vector<Event>& events, Event::Kind kind,
-                                      std::uint64_t id) {
-    std::optional<std::size_t> found;
-    for (std::size_t i = 0; i < events.size(); ++i) {
-        if (events[i].kind == kind && events[i].request == id) { found = i; }
-    }
-    return found;
-}
-
-std::optional<std::size_t> first_index(const std::vector<Event>& events, Event::Kind kind,
-                                       std::uint64_t id) {
-    for (std::size_t i = 0; i < events.size(); ++i) {
-        if (events[i].kind == kind && events[i].request == id) { return i; }
-    }
-    return std::nullopt;
-}
 
 // The trigger itself: never for a private conversation record, the threshold on what follows M.
 void test_lossy_trigger_rule() {

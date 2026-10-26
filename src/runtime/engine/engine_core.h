@@ -2661,18 +2661,23 @@ private:
                     frontier < best + kSiblingWaitMinimumTokens) {
                     continue;
                 }
-                // The sibling's remaining prefill to the checkpoint, doubled because other lanes'
-                // units interleave with it, bounds the wait. Compared against half the limit rather
-                // than doubled first: the cost model returns UINT64_MAX when it saturates, and
-                // doubling that would wrap into a short wait.
+                // The sibling's remaining prefill to the checkpoint, plus what runs before its next
+                // turns, bounds the wait. In rotation other lanes' units interleave with it, which
+                // doubles it; under --prefill-order shortest it runs alone, once every resident
+                // with an earlier deadline has finished. Each part is compared against half the
+                // limit rather than summed first: the cost model returns UINT64_MAX when it
+                // saturates, and adding that would wrap into a short wait.
                 const auto work              = instance_.program->prefill_work(other, *cursor, frontier);
                 const std::uint64_t cost     = resources_.prefill_ns(work);
+                const std::uint64_t ahead    = scheduler_.prefill_order() == PrefillOrder::Shortest
+                                                   ? prefill_ahead_ns(*sibling)
+                                                   : cost;
                 const std::uint64_t limit_ns = static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(pending_timeout_ / 2).count());
-                if (cost > limit_ns / 2) { continue; }
+                if (cost > limit_ns / 2 || ahead > limit_ns / 2) { continue; }
                 if (!chosen || frontier > chosen->frontier) {
                     chosen = SiblingWait{request, sibling->id, frontier,
-                                         Clock::now() + std::chrono::nanoseconds(2 * cost) +
+                                         Clock::now() + std::chrono::nanoseconds(cost + ahead) +
                                              std::chrono::seconds(1)};
                 }
                 break;
@@ -2767,6 +2772,37 @@ private:
         yield_hold_        = true;
         yield_hold_until_  = Clock::now() + kYieldHold;
         return true;
+    }
+
+    // --prefill-order shortest: when the request was submitted plus what its prefill from `begin`
+    // is predicted to cost alone (a lossy request's priced as filtered). Clamped to a day: the cost
+    // model saturates at UINT64_MAX, which as a signed duration would land before submission.
+    [[nodiscard]] Clock::time_point prefill_deadline_for(const Request& request,
+                                                     std::uint32_t begin) const {
+        constexpr std::uint64_t kDayNs = 86'400ULL * 1'000'000'000ULL;
+        const std::uint64_t cost       = std::min(prefill_remaining_ns(request, begin), kDayNs);
+        return request.submitted +
+               std::chrono::duration_cast<Clock::duration>(std::chrono::nanoseconds(cost));
+    }
+
+    // Under --prefill-order shortest, the predicted prefill still to run on every other resident
+    // whose deadline comes before `request`'s: what runs before it gets another turn.
+    [[nodiscard]] std::uint64_t prefill_ahead_ns(const Request& request) const {
+        std::uint64_t ahead = 0;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const auto& other = slots_[lane];
+            if (!other || other.get() == &request || !other->is_prefilling() || !other->base_plan ||
+                !(other->prefill_deadline < request.prefill_deadline)) {
+                continue;
+            }
+            if (const auto cursor = sibling_cursor(*other)) {
+                const auto rest = prefill_remaining_ns(*other, *cursor);
+                ahead = rest > std::numeric_limits<std::uint64_t>::max() - ahead
+                            ? std::numeric_limits<std::uint64_t>::max()
+                            : ahead + rest;
+            }
+        }
+        return ahead;
     }
 
     [[nodiscard]] std::uint64_t prefill_remaining_ns(const Request& request,
@@ -3041,10 +3077,7 @@ private:
                     request->admission.revoked_checkpoints =
                         resources_.source_revocations(request->id);
                     request->admitted_at = binding_started;
-                    request->prefill_deadline =
-                        request->submitted +
-                        std::chrono::duration_cast<Clock::duration>(std::chrono::nanoseconds(
-                            resources_.prefill_ns(source.remaining_work)));
+                    request->prefill_deadline = prefill_deadline_for(*request, source.reused_tokens);
                     request->host_timing.queue_wait_ns =
                         elapsed_ns(request->submitted, *request->admitted_at);
                     request->queue_wait_recorded = true;

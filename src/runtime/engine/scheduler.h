@@ -126,6 +126,8 @@ public:
 
     void set_prefill_order(PrefillOrder order) noexcept { prefill_order_ = order; }
 
+    [[nodiscard]] PrefillOrder prefill_order() const noexcept { return prefill_order_; }
+
     template <class Slots>
     [[nodiscard]] std::optional<std::uint32_t>
     next_prefill(const Slots& slots, std::uint32_t concurrency) const noexcept {

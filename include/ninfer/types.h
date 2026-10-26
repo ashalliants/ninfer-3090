@@ -326,19 +326,19 @@ struct LossyPrefillOptions {
     [[nodiscard]] bool enabled() const noexcept { return min_tokens > 0; }
 };
 
-// How a long prefill shares the GPU with lanes that are already generating. Off by default.
 // Which resident request's prefill takes the next prefill turn.
 enum class PrefillOrder : std::uint8_t {
     // Prefilling lanes take turns in rotation, one step each.
     Rotate,
     // Shortest first, with aging: the lane with the earliest prefill deadline goes first, a
-    // request's deadline being when it was submitted plus what its whole prefill costs alone (the
-    // cost model's prediction at admission). A short prompt gets an early deadline and overtakes a
+    // request's deadline being when it was submitted plus what its prefill costs alone (the cost
+    // model's prediction at admission, a lossy prompt's as filtered). A short prompt gets an early deadline and overtakes a
     // long one; time spent waiting ages a long one, so a prompt submitted later than a long one's
     // deadline never overtakes it, which bounds how long it can be passed over.
     Shortest,
 };
 
+// How a long prefill shares the GPU with lanes that are already generating. Off by default.
 struct PrefillScheduleOptions {
     // The Engine runs one prefill step per worker cycle, so a stream that decodes next to a prefill
     // is paused for a whole step (about 1.5 s at --prefill-chunk 4096 on a 3090). A nonzero budget
