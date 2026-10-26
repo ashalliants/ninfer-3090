@@ -3,9 +3,12 @@
 
 #include "ninfer/ops/linear_rows.h"
 
+#include "ninfer/types.h"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -19,7 +22,12 @@ constexpr int kRowsPerBlock    = 4;  // One warp per slot.
 constexpr int kColumnTile      = 8;  // Columns one warp accumulates at once.
 constexpr int kMergeThreads    = 256;
 constexpr int kTopK            = 16;
-constexpr int kMaximumTopKRows = 2048;
+// merge_row_topk's shared candidate list holds every context row the Programs keep.
+constexpr int kMaximumTopKRows = static_cast<int>(kMaximumDraftContextRows);
+// linear_rows' grid: enough blocks to fill the card. Each block row (gridDim.y) re-reads the
+// selected rows once, so the y extent is only as large as filling the card needs: with many rows
+// every warp loops over all of its slot's column tiles and reads its row once.
+constexpr int kLinearRowsTargetBlocks = 512;
 
 void require(bool condition, const char* op, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string(op) + ": " + message); }
@@ -322,9 +330,14 @@ void launch_linear_rows(const Tensor& hidden, const Weight& head, const Tensor& 
                         cudaStream_t stream) {
     const int C = ids.ne[0];
     const int T = hidden.ne[1];
-    const int tiles = (T + kColumnTile - 1) / kColumnTile;
-    const dim3 grid(static_cast<unsigned>((C + kRowsPerBlock - 1) / kRowsPerBlock),
-                    static_cast<unsigned>(tiles < 65535 ? tiles : 65535));
+    const int tiles  = (T + kColumnTile - 1) / kColumnTile;
+    const int blocks = (C + kRowsPerBlock - 1) / kRowsPerBlock;
+    // The column tiles a warp loops over stride by gridDim.y (each output is written by one warp,
+    // with the same arithmetic whatever gridDim.y is). The fewest block rows that still give about
+    // kLinearRowsTargetBlocks blocks, at most one per tile and 65,535.
+    const int wanted = (kLinearRowsTargetBlocks + blocks - 1) / blocks;
+    const int rows   = std::max(1, std::min({wanted, tiles, 65535}));
+    const dim3 grid(static_cast<unsigned>(blocks), static_cast<unsigned>(rows));
     linear_rows_kernel<Format><<<grid, kRowsPerBlock * 32, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(hidden.data), hidden.ne[0], T,
         static_cast<const std::uint8_t*>(head.qdata), static_cast<const std::uint8_t*>(head.qhigh),

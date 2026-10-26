@@ -143,6 +143,7 @@
 //
 // TOKENS is @FILE (ids separated by commas or whitespace) or a comma-separated id list.
 
+#include "core/side_stream_delay.h"
 #include "core/vram_budget.h"
 #include "models/qwen4_exp/execution/expert_stream.h"
 #include "models/qwen4_exp/program/expert_residency.h"
@@ -1013,6 +1014,9 @@ int prefill_cpu_share_matches_plain(const std::string& artifact, const std::vect
 // stream (a fold the front did not wait for would change the state the next round reads), and the
 // side stream ran at least one fold. Needs --mtp.
 int gdn_async_commit_matches_serial(const std::string& artifact, const std::vector<std::string>& args) {
+    // Every fold starts late on its stream, so a front that did not wait for it reads the state
+    // before the fold and diverges (core/side_stream_delay.h).
+    const ninfer::GateSideStreamDelay late_folds;
     return option_matches_off(artifact, args,
                               {"device-stream fold", "side-stream fold", "gdn async commit",
                                [](EngineOptions& o) { o.flash_next.gdn_async_commit = true; },

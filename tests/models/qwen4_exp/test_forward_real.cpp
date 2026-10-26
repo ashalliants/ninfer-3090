@@ -146,6 +146,7 @@
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
+#include "core/side_stream_delay.h"
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
@@ -1401,6 +1402,9 @@ int shared_expert_mode(int argc, char** argv, const char* artifact_env) {
         throw std::invalid_argument("--decode must be at least 1 and leave more than 8 prompt tokens (the prompt "
                                     "call must be wider than 8 columns to use the side stream's carve)");
     }
+    // Every shared expert branch starts late, so a join the device stream did not wait for reads
+    // unfinished outputs and the logits diverge (core/side_stream_delay.h).
+    const ninfer::GateSideStreamDelay late_branches;
 
     DeviceContext device(0);
     artifact::Reader reader(artifact_env);
@@ -1535,6 +1539,9 @@ int identity_mode(int argc, char** argv, const char* artifact_env, const std::st
     // --hc-fused-read: the int8 copies both runs read.
     std::unique_ptr<ex::HcInt8Copies> copies;
     const bool fused_read_mode = flag == "--hc-fused-read" || flag == "--hc-fused-read-side-stream";
+    // The side-stream form: every branch starts late, so a missing join shows (core/side_stream_delay.h).
+    std::optional<ninfer::GateSideStreamDelay> late_branches;
+    if (flag == "--hc-fused-read-side-stream") { late_branches.emplace(); }
     if (fused_read_mode) {
         auto mixers = ex::HcInt8Copies::mixers(parameters.layers, parameters.final_mixer,
                                                parameters.mtp ? &*parameters.mtp : nullptr);

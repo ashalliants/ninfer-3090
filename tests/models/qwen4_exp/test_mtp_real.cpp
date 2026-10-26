@@ -33,6 +33,7 @@
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
+#include "core/side_stream_delay.h"
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
@@ -809,6 +810,8 @@ void test_shared_expert_stream(const ex::Parameters& parameters, DeviceContext& 
         serial = run_drafter(h, device, volume, tokens, prompt);
     }
     {
+        // Every branch starts late, so a missing join diverges (core/side_stream_delay.h).
+        const ninfer::GateSideStreamDelay late_branches;
         Harness h(parameters, device, context, prompt, ex::ForwardOptions{.shared_expert_stream = true});
         side = run_drafter(h, device, volume, tokens, prompt);
     }

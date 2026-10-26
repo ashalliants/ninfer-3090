@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -153,6 +154,60 @@ int run_format(QType format, std::int32_t k) {
     failures += verify_exact("linear_rows preserves the head", payload_after, payload_before);
     failures += verify_exact("linear_rows preserves the ids",
                              from_device<std::int32_t>(device_ids.p, ids.size()), ids);
+    return failures;
+}
+
+// A wide call over many slots (2,048 context rows, 120 columns: DFlash's width) has fewer block rows
+// than column tiles, so each warp loops over several of its slot's tiles and reads its row once.
+// Every output must be bitwise the output of the call over that tile's eight columns alone (one
+// block row per tile), and meet the FP64 oracle.
+int run_tile_loop() {
+    constexpr std::int32_t k       = 5120;
+    constexpr std::int32_t slots   = 2048;
+    constexpr std::int32_t columns = 120;
+    const qw::PackedWeight head    = qw::make_patterned_weight(
+        QType::Q4_G64_FP16, kHeadRows, k, 0x3du,
+        {.row_split_scale = qw::RowSplitScalePattern::Small,
+         .row_split_codes = qw::RowSplitCodePattern::Hashed});
+    DeviceBuffer payload(head.payload.size());
+    payload.copy_from_host(head.payload.data(), head.payload.size());
+    const Weight weight = head.device_weight(payload.p);
+    const auto ids      = slot_ids(kHeadRows, slots, 0x77u);
+    DeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
+    device_ids.copy_from_host(ids.data(), device_ids.bytes);
+    Tensor ids_tensor(device_ids.p, DType::I32, {slots});
+    const auto hidden = make_hidden(k, columns, 0x91u);
+    DeviceBuffer device_hidden(hidden.size() * sizeof(std::uint16_t));
+    device_hidden.copy_from_host(hidden.data(), device_hidden.bytes);
+    DeviceBuffer device_out(static_cast<std::size_t>(slots) * columns * sizeof(float));
+    Tensor hidden_tensor(device_hidden.p, DType::BF16, {k, columns});
+    Tensor out_tensor(device_out.p, DType::FP32, {slots, columns});
+    ops::linear_rows(hidden_tensor, weight, ids_tensor, out_tensor, nullptr);
+    cuda_synchronize();
+    const auto wide = from_device<float>(device_out.p, static_cast<std::size_t>(slots) * columns);
+    int failures = compare("linear_rows tile loop C=2048 T=120", wide, oracle(head, hidden, k, columns, ids));
+
+    std::vector<std::uint32_t> wide_bits(wide.size()), tile_bits;
+    std::memcpy(wide_bits.data(), wide.data(), wide.size() * sizeof(float));
+    for (std::int32_t first = 0; first < columns; first += 8) {
+        const std::int32_t width = std::min<std::int32_t>(8, columns - first);
+        DeviceBuffer tile_out(static_cast<std::size_t>(slots) * width * sizeof(float));
+        Tensor tile_hidden(static_cast<std::uint16_t*>(device_hidden.p) + static_cast<std::size_t>(first) * k,
+                           DType::BF16, {k, width});
+        Tensor tile_tensor(tile_out.p, DType::FP32, {slots, width});
+        ops::linear_rows(tile_hidden, weight, ids_tensor, tile_tensor, nullptr);
+        cuda_synchronize();
+        const auto tile = from_device<float>(tile_out.p, static_cast<std::size_t>(slots) * width);
+        tile_bits.resize(tile.size());
+        std::memcpy(tile_bits.data(), tile.data(), tile.size() * sizeof(float));
+        const std::vector<std::uint32_t> slice(
+            wide_bits.begin() + static_cast<std::ptrdiff_t>(first) * slots,
+            wide_bits.begin() + static_cast<std::ptrdiff_t>(first + width) * slots);
+        failures += verify_exact(("linear_rows tile loop columns " + std::to_string(first) +
+                                  " bitwise the one-tile call")
+                                     .c_str(),
+                                 slice, tile_bits);
+    }
     return failures;
 }
 
@@ -429,6 +484,7 @@ int main() {
     for (const QType format : {QType::Q8_G32_FP16, QType::Q6_G64_FP16, QType::Q4_G64_FP16}) {
         for (const std::int32_t k : {5120, 2048}) { failures += run_format(format, k); }
     }
+    failures += run_tile_loop();
     failures += run_graph_replay();
     failures += run_merge_argmax(true);
     failures += run_merge_argmax(false);
