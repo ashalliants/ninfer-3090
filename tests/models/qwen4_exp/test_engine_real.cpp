@@ -21,7 +21,7 @@
 //
 //   ninfer_qwen4_exp_engine_real_test --bench [--max-context N] [--generate N] [--no-graph]
 //       [--expert-cache-mib N] [--no-expert-state] [--split N] [--print-ids] [--vision] [--prefill-chunk N]
-//       [--mtp K [--mtp-fixed] [--width-cost X] [--mtp-joint-acceptance]] TOKENS...
+//       [--mtp K [--mtp-fixed | --mtp-joint-acceptance] [--width-cost X]] TOKENS...
 //
 // --vision loads the artifact's vision tower (an Engine started with --vision; the jobs stay text).
 //
@@ -36,13 +36,13 @@
 //
 // --mtp K decodes with MTP speculation (the artifact must hold the drafter), verifying up to K
 // drafts per round (--mtp-fixed: always K; --mtp-joint-acceptance: Basalt's joint-acceptance window
-// over K drafts); each job also prints its acceptance.
+// over K drafts; the two are refused together); each job also prints its acceptance.
 //
 // MTP exactness mode: greedy output with MTP speculation must equal plain greedy output. One plain
 // Engine decodes every job, then one MTP Engine per depth K; the ids must be identical.
 //
 //   ninfer_qwen4_exp_engine_real_test --mtp-exact K[,K...] [--max-context N] [--generate N]
-//       [--mtp-fixed] [--mtp-joint-acceptance] TOKENS...
+//       [--mtp-fixed | --mtp-joint-acceptance] TOKENS...
 //   --mtp-joint-acceptance: the MTP Engines choose their windows by the joint-acceptance rule.
 //
 // Hot embedding rows (hot_embedding_matches_plain below, --hot-embedding-rows): greedy ids with only

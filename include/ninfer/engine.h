@@ -64,7 +64,8 @@ private:
 // values of the BF16 logits that predict it, over the public token domain [0, public tokens). Rows
 // arrive in position order, each exactly once, on the Engine's scoring thread while score_tokens
 // blocks; the span is valid only during the call. An exception from row() aborts the scoring
-// call and is rethrown by score_tokens.
+// call and is rethrown by score_tokens. row() must not call back into the Engine (score, submit,
+// cancel or anything else): it runs inside the scoring call, which holds the Engine's thread.
 class ScoreRowSink {
 public:
     virtual ~ScoreRowSink()                                                 = default;

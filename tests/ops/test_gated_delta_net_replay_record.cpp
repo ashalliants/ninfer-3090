@@ -13,6 +13,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace ninfer;
@@ -406,7 +407,12 @@ int tiled_rejects_masked_rows() {
     try {
         ops::gated_delta_net_replay_record(qt, kt, vt, gt, bt, 1.0F / std::sqrt(128.0F), st, validt, slott,
                                            keyt, valuet, gatet, outt, nullptr, GdnHeadMap::Tiled);
-    } catch (const std::invalid_argument&) { return 0; }
+    } catch (const std::invalid_argument& error) {
+        // The tiled-map refusal itself, not some other shape check that happens to throw.
+        if (std::string_view(error.what()).find("tiled head map") != std::string_view::npos) { return 0; }
+        std::cerr << "gated_delta_net_replay_record refused for another reason: " << error.what() << '\n';
+        return 1;
+    }
     cuda_synchronize();
     std::cerr << "gated_delta_net_replay_record accepted the tiled map with masked rows\n";
     return 1;

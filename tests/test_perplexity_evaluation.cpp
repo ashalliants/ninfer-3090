@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -253,6 +254,24 @@ int check_score_row_hand_case() {
         (void)ninfer::perplexity::score_row(logits, base, 4, 4);
     } catch (const std::out_of_range&) { threw = true; }
     failures += require(threw, "a target outside valid_vocab throws");
+
+    // A row with no log-softmax is refused, not scored as NaN. -inf entries (masked ids) are fine.
+    constexpr float kInf = std::numeric_limits<float>::infinity();
+    const auto refused   = [&](std::vector<float> test, std::vector<double> lp) {
+        try {
+            (void)ninfer::perplexity::score_row(test, lp, 0, static_cast<std::int32_t>(test.size()));
+        } catch (const std::domain_error&) { return true; }
+        return false;
+    };
+    const std::vector<double> flat{std::log(0.5), std::log(0.5)};
+    failures += require(refused({std::nanf(""), 1.0F}, flat), "a NaN logit throws");
+    failures += require(refused({1.0F, std::nanf("")}, flat), "a NaN logit after the max throws");
+    failures += require(refused({-kInf, -kInf}, flat), "all -inf logits throw");
+    failures += require(refused({kInf, 1.0F}, flat), "a +inf logit throws");
+    failures += require(refused({1.0F, 2.0F}, {std::nan(""), 0.0}), "a NaN base log-prob throws");
+    const auto masked = ninfer::perplexity::score_row(std::vector<float>{-kInf, 0.0F}, flat, 1, 2);
+    failures += require(std::isfinite(masked.nll) && std::abs(masked.nll) < 1e-12,
+                        "a masked -inf logit beside a finite one scores");
     return failures;
 }
 

@@ -17,6 +17,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -794,7 +795,10 @@ int contract_rejection_cases() {
                 ops::gated_delta_net(q3, k3, v3, g2, b2, scale, normalize, workspace, s3, o3,
                                      execution(), GdnHeadMap::Tiled);
             }
-        } catch (const std::invalid_argument&) { return true; }
+        } catch (const std::invalid_argument& error) {
+            // The tiled-map refusal itself, not some other shape check that happens to throw.
+            return std::string_view(error.what()).find("tiled head map") != std::string_view::npos;
+        }
         cuda_synchronize();
         return false;
     };
