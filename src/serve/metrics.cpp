@@ -299,6 +299,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
     COUNTER(preemptions, "preemptions_total", "Resource-pressure pauses.");
     COUNTER(admission_fit_deferrals, "admission_fit_deferrals_total",
             "Fresh requests queued because their whole prompt could not fit beside residents.");
+    COUNTER(admission_overtakes, "admission_overtakes_total",
+            "Fresh requests admitted ahead of older waiters by resuming a prefix held on the GPU.");
     COUNTER(snapshot_restores, "snapshot_restores_total",
             "Restores from complete paused snapshots.");
     COUNTER(replay_restores, "replay_restores_total", "Recovery operations that rebuild history.");

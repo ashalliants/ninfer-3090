@@ -399,7 +399,6 @@ void test_prompt_fit_beside_residents() {
             "only full pages of a reused prefix are shared with its donor");
 }
 
-
 // Cache-affinity overtake (EngineOptions::admission_affinity). `affine` names the waiters whose
 // prompt resumes a prefix held on the device; it counts how often the predicate was asked.
 struct Affinity {

@@ -1047,6 +1047,7 @@ server restarts.
 | `ninfer_root_selections_total`, `ninfer_checkpoint_selections_total` | admissions by the context-cache source they started from: root is a miss (full prefill), checkpoint a reuse. Hit rate is `checkpoint / (root + checkpoint)` |
 | `ninfer_{preemptions,snapshot_restores,replay_restores}_total` | resource-pressure pauses and recovery routes |
 | `ninfer_admission_fit_deferrals_total` | fresh requests queued by `--admission-fit-check` because their whole prompt could not fit in the KV pool beside the resident requests; zero when the flag is off |
+| `ninfer_admission_overtakes_total` | fresh requests `--admission-affinity` admitted ahead of older waiters because they resume a prefix held on the GPU; zero when the flag is off |
 | `ninfer_waiting_cancelled_requests_total`, `ninfer_waiting_expired_requests_total`, `ninfer_waiting_abandoned_seconds_total` | requests the client cancelled, or the pending timeout expired, before admission, and the total time they had waited (a client that gives up after 60 s shows up here) |
 | `ninfer_cancelled_prefills_total`, `ninfer_cancelled_prefill_computed_tokens_total` | requests cancelled while prefilling, and the prompt tokens they had computed |
 | `ninfer_paced_prefill_steps_total`, `ninfer_paced_prefill_deferred_tokens_total` | prefill steps cut short by `--prefill-stall-budget-ms` because another lane was decoding, and the prompt tokens they pushed to later steps |
@@ -2230,7 +2231,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-concurrency N` | resident execution lanes; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--admission-fit-check` | queue a fresh request whose whole prompt cannot fit in the KV pool beside the resident requests, instead of starting it, pausing it when the pool fills and recomputing its history; always admits when nothing is resident (counted by `ninfer_admission_fit_deferrals_total`) | off |
-| `--admission-affinity` | when a lane is free, let a waiting request whose prompt resumes a prefix already held on the GPU (a cached checkpoint it may take over, or one its own session left, with no copy from Host memory) start ahead of older waiters; each waiter can be passed this way at most four times, separately from the ordinary bypass allowance. Only the eight waiters behind the head are considered. Qwen3.5 and Flash-Next; no effect with `--no-prefix-reuse`. Not run on a GPU yet | off |
+| `--admission-affinity` | when a lane is free, let a waiting request whose prompt resumes a prefix already held on the GPU (a cached checkpoint it may take over, or one its own session left, with no copy from Host memory) start ahead of older waiters; each waiter can be passed this way at most four times, separately from the ordinary bypass allowance. Only the eight waiters behind the head are considered (counted by `ninfer_admission_overtakes_total`). Qwen3.5 and Flash-Next; no effect with `--no-prefix-reuse`. Not run on a GPU yet | off |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
 | `--progress-anchor-tokens N` | during a long prefill, keep a private checkpoint every N tokens (a multiple of `--prefill-chunk`; needs prefix reuse; each request keeps its newest four) so a paused request that loses its snapshot replays from the nearest checkpoint instead of from the start. Each checkpoint costs one State image; Qwen3.5-family models only | `0` (off) |
@@ -2509,11 +2510,12 @@ Once admitted, a request may pause for resource pressure without restarting this
 deadline. Fresh requests enter in FIFO order with a bounded bypass allowance when an earlier request
 cannot fit. With `--admission-affinity`, a request that resumes a prefix still held on the GPU may
 also start ahead of an older request that could have started, at most four times per older request.
-There is no admission ETA or unbounded overflow queue. A fresh request never preempts a resident one,
-so when every lane is busy a queued request waits out the generations ahead of it, and the deadline has to be scaled to the longest response the deployment allows rather than to a
-connection timeout: at C1 on an RTX 3090 a single 6,500-token response occupies the engine for about
-106 seconds. The 600,000 ms default admits a queued caller behind roughly ten such responses; lower
-it only to fail fast on purpose.
+There is no admission ETA or unbounded overflow queue. A fresh request never preempts a resident
+one, so when every lane is busy a queued request waits out the generations ahead of it, and the
+deadline has to be scaled to the longest response the deployment allows rather than to a connection
+timeout: at C1 on an RTX 3090 a single 6,500-token response occupies the engine for about 106
+seconds. The 600,000 ms default admits a queued caller behind roughly ten such responses; lower it
+only to fail fast on purpose.
 
 Each worker cycle runs the permitted control and decode work and then one prefill or replay chunk.
 Prefill chunks rotate among resident requests, so a short prompt that already holds a lane is not

@@ -1684,6 +1684,9 @@ struct RuntimeStats {
     std::uint64_t preemptions               = 0;
     // Fresh requests held back once because their whole prompt could not fit beside residents.
     std::uint64_t admission_fit_deferrals   = 0;
+    // Fresh requests admitted ahead of older waiters because they resume a prefix held on the
+    // device (EngineOptions::admission_affinity).
+    std::uint64_t admission_overtakes       = 0;
     std::uint64_t snapshot_restores         = 0;
     std::uint64_t replay_restores           = 0;
     std::uint64_t replayed_tokens           = 0;

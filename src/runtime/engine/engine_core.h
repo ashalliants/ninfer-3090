@@ -2403,9 +2403,19 @@ private:
         return true;
     }
 
+    // A source that resumes a prefix held on the device: it reuses tokens from a checkpoint the
+    // request may take over or that its session left, and needs no Host-to-device copy.
+    [[nodiscard]] static bool resumes_held_prefix(
+        const typename ResourceManagement::SourceChoice& choice) noexcept {
+        return choice.source.reused_tokens > 0 && (choice.take_over || choice.session_hint) &&
+               std::none_of(choice.source.transfers.begin(), choice.source.transfers.end(),
+                            [](const auto& transfer) {
+                                return transfer.direction == ContextTransferDirection::HostToDevice;
+                            });
+    }
+
     // Whether the source admission would try first for this waiter resumes a prefix held on the
-    // device: it reuses tokens from a checkpoint the request may take over or that its session left,
-    // and needs no Host-to-device copy. Asked once per admission generation; a waiter that is being
+    // device (resumes_held_prefix). Asked once per admission generation; a waiter that is being
     // hydrated, waits for a sibling or was already tried in this generation is not affine.
     [[nodiscard]] bool admission_affine(const std::shared_ptr<Request>& request) {
         if (request->hydrating || request->awaiting_sibling ||
@@ -2423,16 +2433,7 @@ private:
                 *instance_.program, *request->base_plan, UINT32_MAX, std::nullopt, request->id,
                 request->publication_order);
             admission_subject_.reset();
-            if (!sources.empty()) {
-                const auto& first = sources.front();
-                request->affine =
-                    first.source.reused_tokens > 0 && (first.take_over || first.session_hint) &&
-                    std::none_of(first.source.transfers.begin(), first.source.transfers.end(),
-                                 [](const auto& transfer) {
-                                     return transfer.direction ==
-                                            ContextTransferDirection::HostToDevice;
-                                 });
-            }
+            request->affine = !sources.empty() && resumes_held_prefix(sources.front());
         }
         return request->affine;
     }
@@ -2509,6 +2510,7 @@ private:
                                                  : ReclaimPurpose::FreshAdmission,
                                        request->id};
             if (!admission_decision_) {
+                const auto examined_generation = request->admission_generation;
                 if (!restoring) {
                     // The overtaker is outside the rotating pass; its ticket there is untouched.
                     if (request != overtaker) { scheduler_.admission_candidate_checked(request->id); }
@@ -2544,6 +2546,16 @@ private:
                                                         ? std::optional(request->continuation_owner)
                                                         : std::nullopt,
                                                     request->id, request->publication_order);
+                }
+                // The cached answer can be stale by now. A promoted waiter whose re-priced first source
+                // no longer resumes a held prefix returns to its own place in the ordinary pass (its
+                // scan ticket is untouched): it is neither charged as an overtake nor tried here as a
+                // bypass, which could pass a waiter whose bypass allowance is spent.
+                if (request == overtaker &&
+                    (sources.empty() || !resumes_held_prefix(sources.front()))) {
+                    request->admission_generation = examined_generation;
+                    request->affine               = false;
+                    continue;
                 }
                 if (!restoring && start_hydration(request, sources)) { continue; }
                 if (!restoring && await_sibling(request, sources)) { continue; }
@@ -2705,6 +2717,7 @@ private:
                     }
                     if (passed != 0) {
                         scheduler_.overtook(pending_, passed);
+                        ++cumulative_stats_.admission_overtakes;
                     } else {
                         scheduler_.admitted(pending_, *request, max_concurrency_);
                     }

@@ -271,8 +271,11 @@ Admission 检查由等待队列、容量释放、资源事务完成等事件启�
 `overtakes < 4`。只有成功 admission 才向每个被越过的等待者计 `overtakes += 1`；尝试失败则按普通
 顺序继续。该额度与资源绕过额度相互独立：超车不消耗 `admission_bypasses`，绕过也不消耗
 `overtakes`，任一障碍不限制另一方，因此一个等待者总共最多被越过 C + 4 次。亲和判断需要
-`ensure_base_plan` 与一次 source 报价，每个请求每个 admission generation 最多计算一次，且只在
-选项开启时进行。
+`ensure_base_plan` 与一次 source 报价：选项开启时，每个 admission generation 最多为 9 个等待者
+（队首及其后 8 个）提前生成 base plan 并报价，每个请求每个 generation 最多一次。缓存的答案可能
+过期，因此被提前的等待者在决定时按重新报价的首选来源再判断一次；不再亲和时它回到普通扫描中自己
+的位置，既不计超车，也不在此处作为绕过尝试。成功的超车计入 `admission_overtakes`
+（`ninfer_admission_overtakes_total`）。
 
 恢复失败不关闭 fresh admission；更老 resident 仍在时，paused 请求不会为试探恢复而盲目暂停年轻
 borrower。普通 active 请求不预留整个剩余生成长度。

@@ -530,6 +530,8 @@ void test_affinity_without_a_held_prefix_keeps_fifo() {
     }
     require(binds == std::vector<std::uint64_t>({1, 2, 3, 4, 5, 6}),
             "admission left FIFO order with no prefix held on the device\n" + rig.dump());
+    require(rig.core().runtime_stats().admission_overtakes == 0,
+            "an overtake was counted with no prefix held on the device");
 }
 
 void test_backlog_gauge_tracks_queued_and_resident_prefill() {
