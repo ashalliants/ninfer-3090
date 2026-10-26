@@ -52,7 +52,11 @@ void set_side_stream_delay_us(std::uint32_t microseconds);
 inline constexpr std::uint32_t kGateSideStreamDelayUs = 2'000;
 class GateSideStreamDelay {
 public:
-    GateSideStreamDelay() : set_(std::getenv(kSideStreamDelayVariable) == nullptr) {
+    GateSideStreamDelay() {
+        // An empty variable is off, the same as unset (parse_side_stream_delay_us), so the gate's
+        // delay still applies.
+        const char* text = std::getenv(kSideStreamDelayVariable);
+        set_             = text == nullptr || *text == '\0';
         if (set_) { set_side_stream_delay_us(kGateSideStreamDelayUs); }
     }
     ~GateSideStreamDelay() {
@@ -62,7 +66,7 @@ public:
     GateSideStreamDelay& operator=(const GateSideStreamDelay&) = delete;
 
 private:
-    bool set_;
+    bool set_ = false;
 };
 
 // Enqueues the delay on `side` (one single-thread kernel spinning that long on the GPU timer; graph
