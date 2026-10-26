@@ -182,7 +182,7 @@ public:
         std::uint64_t remote_retired          = 0;
         std::uint64_t remote_uploads_skipped  = 0;
         // Queued uploads given up to keep the files they hold within the limits (the queue's
-        // length and bytes, or max_bytes); their images are uploaded at their next write.
+        // length, or max_bytes); their images are uploaded at their next write.
         std::uint64_t remote_uploads_dropped  = 0;
         // With peers: images imported from them, the chunk bytes linked (not copied), images
         // skipped (damaged, expired, over budget, or gone mid-import) and links that failed.

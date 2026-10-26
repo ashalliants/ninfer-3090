@@ -880,9 +880,9 @@ void test_eviction_waits_for_an_upload_in_flight() {
 }
 
 // Uploads waiting out their delay pin their chunk files. Those files count against the size limit:
-// when evicting cannot bring the directory under it, the oldest waiting uploads are given up so
-// the files can go, and the queue holds at most half the limit (always the newest upload), so
-// the directory never holds more than the limit and the newest image.
+// when evicting cannot bring the directory under it, the oldest waiting uploads whose files nothing
+// else keeps are given up so the files can go, so the directory never holds more than the limit
+// and the newest image.
 void test_queued_uploads_cannot_hold_the_directory_over_its_limit() {
     TempDirectory directory;
     auto remote = std::make_shared<MemoryObjectStore>();
@@ -901,28 +901,15 @@ void test_queued_uploads_cannot_hold_the_directory_over_its_limit() {
         check(info && store.stats().used_bytes <= options.max_bytes + info->image_bytes + 1024,
               "queued uploads held the directory over its limit");
     }
-    check(store.stats().remote_uploads_dropped >= 4, "the given-up uploads were not counted");
-    check(drained(store), "the remaining upload did not run");
+    check(store.stats().remote_uploads_dropped >= 3, "the given-up uploads were not counted");
+    check(drained(store), "the remaining uploads did not run");
     check(store.stats().used_bytes <= options.max_bytes, "the directory stayed over its limit");
-    // Only the newest image's upload fitted in half the limit; it is whole in the bucket.
-    check(remote_manifests(*remote) == 1, "the queue held more than half the limit of uploads");
     TempDirectory reader_directory;
     ContextStore reader(remote_options(reader_directory.path(), remote));
     (void)reader.refresh_remote();
     check(reader.load("a6").value_or(std::vector<std::uint8_t>{}) == newest,
           "the newest image did not reach the bucket whole");
 
-    // One upload is always allowed, however large.
-    TempDirectory small_directory;
-    auto small_remote             = std::make_shared<MemoryObjectStore>();
-    ContextStore::Options small   = remote_options(small_directory.path(), small_remote);
-    small.max_bytes               = 8000; // half is less than the image
-    small.remote_upload_delay     = std::chrono::seconds(3600);
-    ContextStore one(small);
-    (void)one.put(describe("0a"), concat({pseudo_random(30, 1), pseudo_random(5000, 2)}),
-                  std::array{ContextStore::Region{30, 5000}});
-    check(drained(one) && remote_manifests(*small_remote) == 1,
-          "an upload larger than half the limit was not allowed alone");
 }
 
 // Publication survives a restart, for exactly the manifest published: an image uploaded before the

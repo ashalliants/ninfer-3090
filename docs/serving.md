@@ -666,12 +666,11 @@ The local directory becomes a cache of the bucket.
   per session), and an object the bucket has lost in the meantime is uploaded again from the directory,
   so something in use does not expire under it. A write is uploaded from a snapshot taken when it was
   written, with its chunk files kept on disk until the upload ends (each newer write of a session
-  replacing its queued upload). Those files count against `--context-store-max-gib`, so the waiting
-  uploads are bounded: at most 16, holding at most half the limit in chunk files (the newest upload
-  is always allowed). Beyond that, and whenever the directory is over its limit with nothing left to
-  evict, the oldest waiting uploads are given up (`ninfer_context_store_remote_uploads_dropped_total`)
-  and their sessions are uploaded at their next write; the upload in progress keeps its files until
-  it ends. The directory therefore holds at most the limit plus the newest session and the upload in
+  replacing its queued upload). At most 16 uploads wait, and their files count against
+  `--context-store-max-gib`: beyond 16, and whenever the directory is over its limit with nothing
+  left to evict, the oldest waiting uploads are given up
+  (`ninfer_context_store_remote_uploads_dropped_total`) and their sessions are uploaded at their
+  next write; the upload in progress keeps its files until it ends. The directory therefore holds at most the limit plus the newest session and the upload in
   progress. A chunk that is not intact on disk stops the upload instead of publishing a session
   whose data is damaged. A chunk found damaged on disk when a
   session is loaded is fetched again from the bucket.

@@ -1733,8 +1733,8 @@ void ContextStore::enqueue_remote(RemoteTask task) {
 
 // Called with io_mutex_ and mutex_ held, the chunks already pinned. One queued upload per image: a
 // newer write of the image replaces it. Each queued upload keeps its chunk files on disk, so the
-// queue is bounded, in uploads and (with a size limit) to half the limit in bytes, always allowing
-// this one; the oldest are given up beyond it (an image is uploaded again by its next write).
+// queue is bounded and the oldest is given up beyond it (its image is uploaded again by its next write).
+// The size limit bounds the files the queue holds too: see maintain_locked().
 void ContextStore::enqueue_upload(const std::string& id, std::uint64_t generation,
                                   std::vector<std::uint8_t> manifest, std::vector<ChunkRef> chunks,
                                   std::vector<std::string> superseded) {
@@ -1797,47 +1797,6 @@ void ContextStore::enqueue_upload(const std::string& id, std::uint64_t generatio
                                                    std::move(chunks), std::move(retire), ready,
                                                    generation});
                 queued = true;
-            }
-            if (options_.max_bytes != 0) {
-                // The bytes the queued uploads hold on disk, each chunk file once. Giving up an
-                // older upload takes off only the files no other queued upload holds.
-                std::unordered_map<std::string, std::uint32_t> holders;
-                const auto task_keys = [](const RemoteTask& task) {
-                    std::unordered_set<std::string> keys;
-                    for (const ChunkRef& chunk : task.chunks) { keys.insert(hex_key(chunk.hash)); }
-                    return keys;
-                };
-                const auto stored = [&](const std::string& key) -> std::uint64_t {
-                    const auto found = chunks_.find(key);
-                    return found != chunks_.end() && found->second.present ? found->second.stored : 0;
-                };
-                std::uint64_t held_bytes = 0;
-                for (const RemoteTask& task : remote_queue_) {
-                    if (task.kind != RemoteTask::Kind::Upload) { continue; }
-                    for (const std::string& key : task_keys(task)) {
-                        if (holders[key]++ == 0) { held_bytes += stored(key); }
-                    }
-                }
-                for (auto it = remote_queue_.begin();
-                     it != remote_queue_.end() && held_bytes > options_.max_bytes / 2;) {
-                    if (it->kind != RemoteTask::Kind::Upload || it->id == id) {
-                        ++it;
-                        continue;
-                    }
-                    const auto keys       = task_keys(*it);
-                    std::uint64_t own     = 0;
-                    for (const std::string& key : keys) { own += holders[key] == 1 ? stored(key) : 0; }
-                    if (own == 0) { // everything it holds another queued upload holds too
-                        ++it;
-                        continue;
-                    }
-                    for (const std::string& key : keys) { --holders[key]; }
-                    held_bytes -= own;
-                    unused.insert(unused.end(), it->chunks.begin(), it->chunks.end());
-                    release_retirements_locked(it->retire);
-                    it = remote_queue_.erase(it);
-                    ++stats_.remote_uploads_dropped;
-                }
             }
         }
     }
