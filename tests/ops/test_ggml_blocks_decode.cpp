@@ -42,7 +42,8 @@ constexpr std::array kFormats = {
     std::pair{QType::GGML_IQ2_XXS, "ggml_iq2_xxs"}, std::pair{QType::GGML_IQ4_NL, "ggml_iq4_nl"},
     std::pair{QType::GGML_IQ3_S, "ggml_iq3_s"},     std::pair{QType::GGML_IQ2_S, "ggml_iq2_s"},
     std::pair{QType::GGML_IQ4_XS, "ggml_iq4_xs"},   std::pair{QType::GGML_IQ1_M, "ggml_iq1_m"},
-    std::pair{QType::GGML_Q2_0, "ggml_q2_0"},
+    std::pair{QType::GGML_Q2_0, "ggml_q2_0"},       std::pair{QType::GGML_IQ2_XS, "ggml_iq2_xs"},
+    std::pair{QType::GGML_IQ3_XXS, "ggml_iq3_xxs"},
 };
 
 // Returns the fixture's blocks after checking every decoded bit pattern.

@@ -195,7 +195,9 @@ oracle, the activation passes through an independent host copy of the contract's
 the output is compared with the FP64 product. It also checks the cast exactly, byte for byte against
 the wide route's cast kernel and through the public Op on both routes, and the admission rules.
 `--format NAME` and `--shape N K` select problems; the full run takes about a minute, most of it the
-host oracle.
+host oracle. `ninfer_linear_ggml_device_decode_test` checks the linears' device sub-block decoders on
+their own, each value (the int8 code times its FP32 scale) bit for bit against the golden fixtures;
+it is the only device check of IQ2_XS and IQ3_XXS, which have a decoder but no registered problem.
 
 `ninfer_offloaded_moe_cpu_test` (host only) and `ninfer_offloaded_moe_layer_test` qualify
 offloaded_sparse_moe over the three GGML expert record formats. The CPU test checks the canonical A8

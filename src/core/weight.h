@@ -36,6 +36,9 @@ enum class QType : std::uint16_t {
     // Ternary codes {-1, 0, +1} as two-bit two's complement (0b10 unused), four per byte in
     // column order, one binary16 multiplier per 128 columns. Row-split only.
     T2_G128_FP16 = 22,
+    // More of ggml's block types (tensor-formats.md Section 3.5), numbered after the formats above.
+    GGML_IQ2_XS  = 23,
+    GGML_IQ3_XXS = 24,
 };
 
 // One GGML block: `values` consecutive K values encoded in `bytes` bytes, scales included.
@@ -65,6 +68,10 @@ struct GgmlBlock {
         return {256, 56};
     case QType::GGML_Q2_0:
         return {64, 18};
+    case QType::GGML_IQ2_XS:
+        return {256, 74};
+    case QType::GGML_IQ3_XXS:
+        return {256, 98};
     default:
         return {};
     }

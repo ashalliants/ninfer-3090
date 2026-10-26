@@ -53,3 +53,8 @@ ninfer_add_op_test(ninfer_linear_bf16_a16_test
 ninfer_add_op_test(ninfer_linear_ggml_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml.cpp"
   LIBRARIES ninfer_ops)
+# The GGML linears' device sub-block decoders against ggml's golden outputs, every format with one
+# (IQ2_XS and IQ3_XXS have no registered problem, so no linear test reaches theirs).
+ninfer_add_op_test(ninfer_linear_ggml_device_decode_test NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_device_decode.cu"
+  LIBRARIES ninfer_core)

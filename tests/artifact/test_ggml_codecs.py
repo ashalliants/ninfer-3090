@@ -93,6 +93,22 @@ def test_fixtures_cover_every_grid_index_and_sign_pattern():
     fields = np.stack([(words >> (3 * f)) & 7 for f in range(4)], -1)
     assert set(np.unique(fields)) == set(range(8))
 
+    blocks, _ = _fixture("ggml_iq2_xs")
+    qs = blocks[:, 2:66].reshape(-1, 32, 2).astype(np.int32)
+    qs = qs[..., 0] | qs[..., 1] << 8
+    assert set(np.unique(qs & 511)) == set(range(512))
+    assert set(np.unique(qs >> 9)) == set(range(128))
+    scales = blocks[:, 66:74]
+    assert set(np.unique(scales & 0xF)) == set(np.unique(scales >> 4)) == set(range(16))
+
+    blocks, _ = _fixture("ggml_iq3_xxs")
+    assert set(np.unique(blocks[:, 2:66])) == set(range(256))
+    aux = blocks[:, 66:98].reshape(-1, 8, 4).astype(np.uint32)
+    aux = aux[..., 0] | aux[..., 1] << 8 | aux[..., 2] << 16 | aux[..., 3] << 24
+    signs = np.stack([(aux >> (7 * l)) & 127 for l in range(4)], axis=-1)
+    assert set(np.unique(signs)) == set(range(128))
+    assert set(np.unique(aux >> 28)) == set(range(16))
+
     blocks, _ = _fixture("ggml_iq4_xs")
     scales_h = blocks[:, 2].astype(np.int32) | blocks[:, 3].astype(np.int32) << 8
     ib = np.arange(8)
@@ -125,6 +141,13 @@ def test_block_geometry_and_rejections():
     assert ggml_blocks_geometry("ggml_q2_0", (512, 2560, 640)).row_bytes == 180
     assert encoded_size("ggml_blocks_v1", "ggml_iq4_xs", (248_320, 2560)) == 337_715_200
     assert encoded_size("ggml_blocks_v1", "ggml_q8_0", (64,)) == 68
+    for name, geometry in (("ggml_iq2_xs", (17, 256, 74)), ("ggml_iq3_xxs", (18, 256, 98))):
+        spec = get_format(name)
+        assert (spec.ggml_type, spec.block_elems, spec.block_bytes) == geometry
+    # The IQ3 packs' gate/up banks [512, 640, 2560]: ten blocks of 74 and 98 bytes per row.
+    assert ggml_blocks_geometry("ggml_iq2_xs", (512, 640, 2560)).payload_bytes == 242_483_200
+    assert ggml_blocks_geometry("ggml_iq3_xxs", (512, 640, 2560)).row_bytes == 980
+    assert encoded_size("ggml_blocks_v1", "ggml_iq3_xxs", (512, 640, 2560)) == 321_126_400
     with pytest.raises(ValueError, match="divisible by 256"):
         encoded_size("ggml_blocks_v1", "ggml_iq1_m", (4, 640))
     with pytest.raises(ValueError, match="does not accept"):

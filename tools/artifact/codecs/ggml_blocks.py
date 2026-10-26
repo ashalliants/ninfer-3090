@@ -27,6 +27,8 @@ _KMASK = np.asarray(tables.KMASK_IQ2XS, dtype=np.uint8)
 _KSIGNS = np.asarray(tables.KSIGNS_IQ2XS, dtype=np.uint8)
 _KVALUES_IQ4NL = np.asarray(tables.KVALUES_IQ4NL, dtype=np.int8).astype(_F32)
 _IQ2XXS = np.asarray(tables.IQ2XXS_GRID, dtype="<u8").view(np.uint8).reshape(-1, 8)
+_IQ2XS = np.asarray(tables.IQ2XS_GRID, dtype="<u8").view(np.uint8).reshape(-1, 8)
+_IQ3XXS = np.asarray(tables.IQ3XXS_GRID, dtype="<u4").view(np.uint8).reshape(-1, 4)
 _IQ2S = np.asarray(tables.IQ2S_GRID, dtype="<u8").view(np.uint8).reshape(-1, 8)
 _IQ3S = np.asarray(tables.IQ3S_GRID, dtype="<u4").view(np.uint8).reshape(-1, 4)
 _IQ1S = np.asarray(tables.IQ1S_GRID, dtype="<u8").view(np.int8).reshape(-1, 8)
@@ -118,6 +120,35 @@ def _iq2_xxs(b: np.ndarray) -> np.ndarray:
     return _apply_signs(db[:, :, None, None] * grid, signs).reshape(-1, 256)
 
 
+def _iq2_xs(b: np.ndarray) -> np.ndarray:
+    d = _fp16(b[:, 0:2])
+    qs = b[:, 2:66].reshape(-1, 8, 4, 2).astype(np.int32)
+    qs = qs[..., 0] | (qs[..., 1] << 8)  # [block, ib32, l]: 9-bit grid index, 7-bit sign selector
+    scales = b[:, 66:74]
+    db = np.stack(
+        (
+            d[:, None] * (_F32(0.5) + (scales & 0xF).astype(_F32)) * _F32(0.25),
+            d[:, None] * (_F32(0.5) + (scales >> 4).astype(_F32)) * _F32(0.25),
+        ),
+        axis=2,
+    )  # [block, ib32, half]
+    dl = db[:, :, np.arange(4) // 2]
+    grid = _IQ2XS[qs & 511].astype(_F32)
+    return _apply_signs(dl[..., None] * grid, _KSIGNS[qs >> 9]).reshape(-1, 256)
+
+
+def _iq3_xxs(b: np.ndarray) -> np.ndarray:
+    d = _fp16(b[:, 0:2])
+    qs = b[:, 2:66].reshape(-1, 8, 4, 2)  # [block, ib32, l, pair]
+    aux = b[:, 66:98].reshape(-1, 8, 4).astype(np.uint32)
+    aux = aux[..., 0] | (aux[..., 1] << 8) | (aux[..., 2] << 16) | (aux[..., 3] << 24)
+    db = (d[:, None] * (_F32(0.5) + (aux >> 28).astype(_F32))) * _F32(0.5)
+    grid = np.concatenate((_IQ3XXS[qs[..., 0]], _IQ3XXS[qs[..., 1]]), axis=3).astype(_F32)
+    selectors = (aux[:, :, None] >> (7 * np.arange(4, dtype=np.uint32))) & 127
+    signs = _KSIGNS[selectors]
+    return _apply_signs(db[:, :, None, None] * grid, signs).reshape(-1, 256)
+
+
 def _iq2_s(b: np.ndarray) -> np.ndarray:
     d = _fp16(b[:, 0:2])
     qs = b[:, 2:34].reshape(-1, 8, 4).astype(np.int32)
@@ -199,6 +230,8 @@ _DECODERS = {
     "ggml_iq4_xs": _iq4_xs,
     "ggml_q6_k": _q6_k,
     "ggml_iq2_xxs": _iq2_xxs,
+    "ggml_iq2_xs": _iq2_xs,
+    "ggml_iq3_xxs": _iq3_xxs,
     "ggml_iq2_s": _iq2_s,
     "ggml_iq3_s": _iq3_s,
     "ggml_iq1_m": _iq1_m,

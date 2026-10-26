@@ -15,7 +15,7 @@ The storage registry contains exactly these identities:
 | `row_split_k128_v1` | tensor layout | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16`, `t2_g128_fp16` | rank 2 `[N,K]` | 256 bytes |
 | `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
-| `ggml_blocks_v1` | tensor layout | the nine `ggml_*` block formats | rank `1..16`, `K % values_per_block == 0` | 256 bytes |
+| `ggml_blocks_v1` | tensor layout | the eleven `ggml_*` block formats | rank `1..16`, `K % values_per_block == 0` | 256 bytes |
 | `ggml_expert_record_v1` | tensor layout | the three `ggml_rec_*` expert record formats | rank 3 `[E,H,I]`, `H` and `I` whole blocks of their parts | 256 bytes |
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 

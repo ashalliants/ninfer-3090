@@ -135,9 +135,9 @@ void geometry_and_views() {
 /// GGML block geometry, at the real shapes it must hold: the dense matrices, the 51.2 G-value
 // n-gram table (whose element count and byte offsets overflow 32 bits) and the expert records.
 void ggml_geometry() {
-    constexpr std::array names = {"ggml_q8_0",  "ggml_q6_k",   "ggml_iq2_xxs",
-                                  "ggml_iq4_nl", "ggml_iq3_s", "ggml_iq2_s",
-                                  "ggml_iq4_xs", "ggml_iq1_m", "ggml_q2_0"};
+    constexpr std::array names = {"ggml_q8_0",   "ggml_q6_k",   "ggml_iq2_xxs", "ggml_iq4_nl",
+                                  "ggml_iq3_s",  "ggml_iq2_s",  "ggml_iq4_xs",  "ggml_iq1_m",
+                                  "ggml_q2_0",   "ggml_iq2_xs", "ggml_iq3_xxs"};
     for (const auto* name : names) {
         const auto format = parse_format(name);
         require(is_ggml_block(format) && !is_ggml_record(format) && format_name(format) == name,
