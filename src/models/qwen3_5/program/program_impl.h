@@ -779,6 +779,8 @@ public:
     [[nodiscard]] std::uint32_t initial_mtp_extent(const RequestBasePlanImpl&) const;
     [[nodiscard]] UnitDemand prefill_unit(std::uint32_t prompt, std::uint32_t cursor,
                                           std::uint32_t mtp_extent) const;
+    // The demand of a prompt's last prefill chunk: its frontiers are the whole prompt's.
+    [[nodiscard]] UnitDemand prompt_end_unit(std::uint32_t prompt, std::uint32_t mtp_extent) const;
     [[nodiscard]] UnitDemand next_unit(const SequenceState&, const RequestControl&,
                                        ExecutionUnitKind, std::uint32_t tokens) const;
     void require_unit(std::uint32_t lane, ExecutionUnitKind, std::uint32_t tokens = 0) const;

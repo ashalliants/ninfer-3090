@@ -88,9 +88,7 @@ bool ProgramImpl::reserve_host_kv_transfers(ContextTransaction& tx, LogicalKVPag
             transfer.host_destination.emplace(std::move(destination));
             tx.kv_transfers.push_back(std::move(transfer));
         });
-    if (!placed) {
-        placement.failed(host_kv_extents->page_layout(pages).page_stride * logical.size());
-    }
+    if (!placed) { placement.failed(); }
     return placed;
 }
 

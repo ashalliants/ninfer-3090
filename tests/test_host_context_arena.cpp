@@ -5,6 +5,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -131,22 +132,29 @@ void test_placement_scope_counts_once() {
     auto fourth = arena.allocate(unit);
     (void)first->release();
     (void)third->release();
+    std::optional<ninfer::HostContextAllocation> a, b;
     {
         ninfer::HostContextArena::PlacementScope placement(arena);
         expect(!arena.allocate(2 * unit), "two separated free units cannot hold two units");
-        auto a = arena.allocate(unit);
-        auto b = arena.allocate(unit);
+        a = arena.allocate(unit);
+        b = arena.allocate(unit);
         expect(a && b, "the placement fits once split into single units");
     }
     expect(arena.geometry_failures() == 0 && arena.shortage_failures() == 0,
            "a placement made in pieces counts no failure for the sizes it tried");
     {
         ninfer::HostContextArena::PlacementScope placement(arena);
+        placement.failed();
+    }
+    expect(arena.geometry_failures() == 0 && arena.shortage_failures() == 0,
+           "a placement that failed without an arena miss counts nothing");
+    {
+        ninfer::HostContextArena::PlacementScope placement(arena);
         expect(!arena.allocate(2 * unit) && !arena.allocate(unit), "a full arena holds nothing");
-        placement.failed(2 * unit);
+        placement.failed();
     }
     expect(arena.shortage_failures() == 1 && arena.geometry_failures() == 0,
-           "a placement that cannot be made counts one failure, by its cause");
+           "a placement that cannot be made counts one failure, by its last miss");
     expect(!arena.allocate(unit) && arena.shortage_failures() == 2,
            "outside a placement every miss counts again");
 }

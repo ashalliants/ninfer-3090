@@ -714,7 +714,7 @@ ProgramImpl::import_checkpoints(std::span<const std::uint8_t> image, std::string
                 count /= 2;
             }
             if (!extent) {
-                placement.failed((columns.size() - offset) * stride);
+                placement.failed();
                 return false;
             }
             rollback.extents.push_back(extent->capability);
