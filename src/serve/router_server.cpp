@@ -291,8 +291,7 @@ RouterServer::RouterServer(ServeOptions options, ModelRegistry& registry,
                            std::shared_ptr<RoutedPorts> ports,
                            std::shared_ptr<spdlog::logger> logger)
     : options_(std::move(options)),
-      host_policy_(make_host_policy(options_.host, options_.port, options_.allowed_hosts,
-                                    local_machine_name())),
+      host_policy_(make_server_host_policy(options_.host, options_.port, options_.allowed_hosts)),
       registry_(registry), ports_(std::move(ports)), logger_(std::move(logger)) {
     // cpp-httplib is thread-per-connection, and a relayed request holds a router worker for as long
     // as its model holds the matching worker of its own server.

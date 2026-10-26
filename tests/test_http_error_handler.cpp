@@ -107,12 +107,21 @@ int main() {
                               messages_body.at("error").at("type") == "permission_error",
                           "a refused Host on /v1/messages did not get an Anthropic-shaped 403");
 
+        httplib::Response health_host;
+        failures += check(refused(local, "/health", "evil.example", "", health_host) &&
+                              health_host.status == 403,
+                          "the Host check did not apply on /health");
+
+        // With a key the Host check is skipped: any name a client uses (a Docker, mesh VPN or
+        // proxy name) reaches the server, and a rebound page still cannot send the key.
         httplib::Response keyed_host;
         ServeOptions keyed = local;
         keyed.api_key      = "secret";
-        failures += check(refused(keyed, "/health", "evil.example", "", keyed_host) &&
-                              keyed_host.status == 403,
-                          "the Host check did not apply with a key or on /health");
+        failures += check(!refused(keyed, "/health", "evil.example", "", keyed_host) &&
+                              !refused(keyed, "/v1/models", "gpubox.tailnet.ts.net", "",
+                                       keyed_host) &&
+                              keyed_host.status == -1,
+                          "the Host check applied on a server with a key");
 
         httplib::Response foreign;
         failures += check(refused(local, "/v1/responses", "127.0.0.1:8080",
@@ -133,6 +142,10 @@ int main() {
                               !refused(local, "/v1/responses", "localhost:8080",
                                        "http://localhost:8080", allowed) &&
                               !refused(local, "/v1/responses", "192.168.1.5:8080", "", allowed) &&
+                              !refused(local, "/v1/responses", "192.168.1.5:8080",
+                                       "http://192.168.1.5:8080", allowed) &&
+                              !refused(local, "/v1/responses", "localhost:8080",
+                                       "chrome-extension://abcdef", allowed) &&
                               !refused(local, "/v1/responses", "", "", allowed) &&
                               allowed.body.empty() && allowed.status == -1,
                           "an allowed request was refused or given a response");
@@ -237,9 +250,9 @@ int main() {
                       "non-413 response was changed by the payload-limit handler");
 
     // dashboard_while_loading: a keyed server still loading its model serves GET /dashboard
-    // without the key (the page holds no data) with its CSP and nosniff headers, keeps the Host
-    // check on it, and still answers every other route, POST /dashboard included, with the
-    // loading 503 -- and, once that is past, the key check.
+    // without the key (the page holds no data) with its CSP and nosniff headers, under any Host
+    // (a keyed server skips the Host check), and still answers every other route, POST /dashboard
+    // included, with the loading 503 -- and, once that is past, the key check.
     {
         ServeOptions keyed;
         keyed.host    = "127.0.0.1";
@@ -262,8 +275,8 @@ int main() {
                     page->body.rfind("<!doctype html>", 0) == 0,
                 "dashboard_while_loading: GET /dashboard was not served without the key");
             const auto rebound = client.Get("/dashboard", httplib::Headers{{"Host", "evil.example:8080"}});
-            failures += check(rebound && rebound->status == 403,
-                              "dashboard_while_loading: the Host check did not apply to it");
+            failures += check(rebound && rebound->status == 200,
+                              "dashboard_while_loading: a keyed server ran the Host check");
             const auto metrics = client.Get("/metrics");
             const auto posted  = client.Post("/dashboard", "", "text/plain");
             failures += check(metrics && metrics->status == 503 && posted && posted->status == 503,

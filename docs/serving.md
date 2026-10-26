@@ -511,7 +511,11 @@ curl http://127.0.0.1:8080/v1/load -H 'Authorization: Bearer local-secret'
 - `requests.queue` lists the waiting requests, oldest first: the Engine request `id` (the
   [structured request log](#structured-request-log)'s `engine_request_id`), its `prompt_tokens`
   and the seconds since it was submitted (`waited_s`). It lists at most the first 64;
-  `queue_total` counts them all and equals `waiting`. Paused requests are not in it.
+  `queue_total` counts them all and equals `waiting`. Paused requests are not in it. Oldest first
+  is arrival order, not necessarily the order they start: the bypass allowance and
+  `--admission-affinity` can admit a later waiter ahead of older ones.
+  `tools/bench/serve_soak.py` assumes arrival order when it takes queued time off its stall clock,
+  so with overtaking it may credit the wrong requests (its header explains how).
 - `capacity.host_context_bytes` is the one pinned Host budget (see
   [Automatic host cache](#automatic-host-cache)). `occupancy` reports current Main KV pages (and
   tokens), Device StateImage slots, and the Host context bytes in use, including destinations
@@ -2159,15 +2163,19 @@ right.
 ### Host and Origin checks
 
 These checks run before every route, `GET /health` and the loading `503` included. They stop a web
-page in a browser on this machine (or on the LAN) from using the server behind your back.
+page in a browser on this machine (or on the LAN) from using a server that has no key behind your
+back. A server started with `--api-key` needs none of them: a page cannot send the key, so the
+key alone decides access.
 
-- **Host**, always. A request whose `Host` header names something the server does not answer to is
-  refused. This is what defeats DNS rebinding, where an attacker's domain is made to resolve to
-  `127.0.0.1`. Accepted:
+- **Host**, only when the server has no `--api-key`. A request whose `Host` header names something
+  the server does not answer to is refused. This is what defeats DNS rebinding, where an
+  attacker's domain is made to resolve to `127.0.0.1`. Accepted:
   - `localhost`, `127.0.0.1` and `[::1]`;
   - the `--host` address or name, unless it is a wildcard (`0.0.0.0`, `::`);
-  - the machine's host name, when it is a wildcard;
-  - each `--allowed-host NAME` (repeatable);
+  - when it is a wildcard, the names other machines and containers use for this one: the machine's
+    host name, its first label plus `.local` (mDNS, for example `gpubox.local`), its fully
+    qualified DNS name, and `host.docker.internal` (a container reaching the host);
+  - each `--allowed-host NAME` (repeatable; the launchers pass `NINFER_ALLOWED_HOST`);
   - any IPv4 or bracketed IPv6 address, such as `192.168.1.5:8080` from another machine on the
     LAN, because a rebinding attack needs a name.
 
@@ -2175,16 +2183,31 @@ page in a browser on this machine (or on the LAN) from using the server behind y
   SSH tunnels and port forwards keep working. A request with no `Host` header at all (HTTP/1.0
   tools) is accepted.
 - **Origin**, only when the server has no `--api-key` and no `--cors`. A browser request from
-  another site carries that site's `Origin`, and is refused unless the origin is the server's own
-  (`scheme://name:port`, a name from the list above on the server's port). Clients that are not
-  browser pages (`curl`, the OpenAI and Anthropic SDKs, a chat UI's server-side backend) send no
-  `Origin` and are not affected. `Origin: null`, sent by `file://` pages and sandboxed frames, is
-  refused, as are browser-extension origins. Give such a client a key, or start the server with
+  another site carries that site's `Origin`, and is refused unless the origin is the server's own.
+  Clients that are not browser pages (`curl`, the OpenAI and Anthropic SDKs, a chat UI's
+  server-side backend) send no `Origin` and are not affected. Accepted:
+  - `http://name:port` or `https://name:port` with a name from the list above on the server's
+    port (80 and 443 when the origin names no port);
+  - an origin whose host and port are exactly those of the request's (accepted) `Host` header:
+    the page came from the address or proxy name the request reached, such as
+    `http://192.168.1.5:8080` for a request to `192.168.1.5:8080`;
+  - an origin of any scheme other than `http` and `https`: browser extensions
+    (`chrome-extension://`, `moz-extension://`) and app shells (`app://`, `tauri://`,
+    `vscode-webview://`). A browser gives these only to installed code, so no web page can send
+    one.
+
+  Refused: an `http(s)` origin of another site or another port, and `Origin: null` (sent by
+  `file://` pages and sandboxed frames). Give such a client a key, or start the server with
   `--cors`.
 - **Sec-Fetch-Site**, under the same condition. A request a browser marks `cross-site` (a link,
   an image or a `no-cors` fetch from another site, some of which carry no `Origin`) is refused,
   so a page elsewhere cannot make the router load, wake or evict a model. `same-origin`,
-  `same-site`, `none` (an address typed by the user) and no header at all pass.
+  `same-site`, `none` (an address typed by the user) and no header at all pass. `same-site` means
+  a page on another port or subdomain of the same site (`http://localhost:3000` calling
+  `http://localhost:8080`): a request it sends with an `Origin` is still refused by the Origin
+  check, but a `GET` with no `Origin` (a link or an image) passes. Such a request reaches only
+  `GET` routes and its response stays with the browser, so the risk is small; set `--api-key` to
+  close it.
 
 A refused request gets `403` in the error shape of the endpoint it called: the Anthropic shape (type
 `permission_error`) under `/v1/messages`, and the OpenAI shape (code `host_not_allowed`,
@@ -2195,8 +2218,8 @@ A refused request gets `403` in the error shape of the endpoint it called: the A
            "type": "invalid_request_error", "param": null, "code": "host_not_allowed"}}
 ```
 
-The router runs these checks on its public address and drops `Origin` (with the credentials) from
-the requests it relays to its models. Each model's own server listens on loopback with no key, no
+The router runs these checks on its public address and drops `Host`, `Origin` and every
+`Sec-Fetch-*` header (with the credentials) from the requests it relays to its models. Each model's own server listens on loopback with no key, no
 `--cors` and no `--allowed-host`, whatever the command line gives the router, so a browser page
 cannot reach it directly around the router's key.
 
@@ -2206,18 +2229,22 @@ cannot reach it directly around the router's key.
 ninfer-serve model.ninfer --host 0.0.0.0 --api-key "$(openssl rand -hex 24)"
 ```
 
-Clients reach it at `http://<lan-ip>:8080` or `http://<machine-name>:8080` with no extra setup. For
-any other name (a DNS alias, `gpubox.local`, a Docker Compose service name), add
-`--allowed-host gpubox.local`. The value is a host name or an address, with no scheme, port, path
-or wildcard; anything else is refused at startup. Without `--api-key`, a server listening beyond
-loopback logs a warning at startup: anyone who can reach the address can use the model.
+Clients reach it at `http://<lan-ip>:8080`, `http://<machine-name>:8080`,
+`http://<machine-name>.local:8080`, the machine's fully qualified name, or (from a container)
+`http://host.docker.internal:8080`. With `--api-key` any other name works too (a DNS alias, a
+mesh-VPN name, a Docker Compose service name). A server without a key accepts another name only
+when it is listed: `--allowed-host gpubox.lan`, or `NINFER_ALLOWED_HOST=gpubox.lan` for the
+launchers (several names comma- or space-separated). The value is a host name or an address, with
+no scheme, port, path or wildcard; anything else is refused at startup. Without `--api-key`, a
+server listening beyond loopback logs a warning at startup: anyone who can reach the address can
+use the model.
 
 **Behind a reverse proxy.** Caddy and nginx (with `proxy_set_header Host $host`, which most
-configurations use) pass on the Host the client used, so add each public name with
-`--allowed-host`. A web UI served from the proxy's own origin sends `Origin: https://name` (port
-443), which can never be the server's own origin, so a proxied server that browsers reach needs
-`--api-key` (the UI sends the key) or `--cors`; a keyless server without `--cors` refuses those
-requests.
+configurations use) pass on the Host the client used, so a keyless server needs each public name
+in `--allowed-host`. A web UI served from the proxy's own origin (`https://name`) then passes the
+Origin check, because its origin equals the Host the request reached (on a proxy port other than
+443, pass the port on too: nginx's `$http_host` keeps it, `$host` drops it). A UI on any other origin
+needs `--api-key` (the UI sends the key) or `--cors`.
 
 ## Server options
 
@@ -2228,7 +2255,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--host H` | listen address | `127.0.0.1` |
 | `--port N` | listen port | `8080` |
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
-| `--allowed-host NAME` | one more name the [Host check](#host-and-origin-checks) accepts; a host name or address without a scheme, port or wildcard; repeatable | none |
+| `--allowed-host NAME` | one more name the [Host check](#host-and-origin-checks) of a server without `--api-key` accepts; a host name or address without a scheme, port or wildcard; repeatable | none |
 | `--model-id ID` | override the public OpenAI model alias | artifact `metadata.name`, or architecture name |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |

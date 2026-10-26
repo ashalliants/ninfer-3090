@@ -44,7 +44,7 @@ void write_dashboard_page(httplib::Response& response);
 [[nodiscard]] bool matches_bearer_credential(std::string_view authorization,
                                              std::string_view api_key) noexcept;
 
-// The Host check (always), and without a key and without --cors the Origin and Sec-Fetch-Site
+// Without a key, the Host check; without a key and without --cors, the Origin and Sec-Fetch-Site
 // checks. A refused request gets a 403 in its endpoint's error shape and the result is true.
 [[nodiscard]] bool reject_untrusted_request(const HostPolicy& policy, const ServeOptions& options,
                                             const httplib::Request& request,

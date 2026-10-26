@@ -245,20 +245,22 @@ bool reject_untrusted_request(const HostPolicy& policy, const ServeOptions& opti
     ApiError error;
     error.status = 403;
     error.type   = "invalid_request_error";
-    if (!host_allowed(policy, host)) {
-        // A name this server was not told about: DNS rebinding, or a name to add.
+    const bool has_key = !options.api_key.empty();
+    if (!has_key && !host_allowed(policy, host)) {
+        // A name this server was not told about: DNS rebinding, or a name to add. With a key the
+        // check is skipped: a rebound page cannot send the key, and any name a client uses works.
         error.code    = "host_not_allowed";
         error.message = "Host " + quoted(host) +
                         " is not a name this server answers to; start it with --allowed-host "
-                        "NAME to accept another name";
-    } else if (!origin_allowed(policy, origin, !options.api_key.empty(), options.enable_cors)) {
+                        "NAME to accept another name (a server with --api-key accepts any)";
+    } else if (!origin_allowed(policy, origin, host, has_key, options.enable_cors)) {
         // A browser page from another site, and nothing else (a key, --cors) to decide access.
         error.code    = "origin_not_allowed";
         error.message = "Origin " + quoted(origin) +
                         " is another site; a server without --api-key accepts browser requests "
                         "only from its own origin (set --api-key or --cors to allow others)";
-    } else if (!fetch_site_allowed(request.get_header_value("Sec-Fetch-Site"),
-                                   !options.api_key.empty(), options.enable_cors)) {
+    } else if (!fetch_site_allowed(request.get_header_value("Sec-Fetch-Site"), has_key,
+                                   options.enable_cors)) {
         // A link, image or no-cors fetch from another site, which may carry no Origin.
         error.code    = "cross_site_request";
         error.message = "a request another site started is refused by a server without --api-key "
@@ -278,8 +280,7 @@ bool reject_untrusted_request(const HostPolicy& policy, const ServeOptions& opti
 HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger,
                        std::shared_ptr<OpenAIResponsesStore> responses_store)
     : options_(std::move(options)),
-      host_policy_(make_host_policy(options_.host, options_.port, options_.allowed_hosts,
-                                    local_machine_name())),
+      host_policy_(make_server_host_policy(options_.host, options_.port, options_.allowed_hosts)),
       responses_store_(responses_store ? std::move(responses_store)
                                        : std::make_shared<OpenAIResponsesStore>(
                                              options_.response_store_max_records,
@@ -807,8 +808,7 @@ int HttpServer::bind_any_port() {
     const int port = server_.bind_to_any_port(options_.host);
     if (port <= 0) { return 0; }
     // Origins name the port, so the policy follows the one the system chose.
-    host_policy_ = make_host_policy(options_.host, port, options_.allowed_hosts,
-                                    local_machine_name());
+    host_policy_ = make_server_host_policy(options_.host, port, options_.allowed_hosts);
     return port;
 }
 
