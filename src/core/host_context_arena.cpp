@@ -79,6 +79,11 @@ std::optional<std::size_t> HostContextArena::find_free_extent(std::size_t bytes)
     return std::nullopt;
 }
 
+void HostContextArena::count_failure(std::size_t rounded_bytes) noexcept {
+    // Enough bytes in total but no run that fits is a layout failure, not a capacity one.
+    ++(free_bytes() >= rounded_bytes ? geometry_failures_ : shortage_failures_);
+}
+
 bool HostContextArena::can_allocate(std::size_t bytes) const noexcept {
     const std::size_t rounded = allocation_bytes(bytes);
     return rounded != 0 && find_free_extent(rounded).has_value();
@@ -89,8 +94,7 @@ std::optional<HostContextAllocation> HostContextArena::allocate(std::size_t byte
     if (rounded == 0) { return std::nullopt; }
     const auto free_index = find_free_extent(rounded);
     if (!free_index) {
-        // Enough bytes in total but no run that fits is a layout failure, not a capacity one.
-        ++(free_bytes() >= rounded ? geometry_failures_ : shortage_failures_);
+        if (placement_depth_ == 0) { count_failure(rounded); }
         return std::nullopt;
     }
     FreeExtent& free         = free_extents_[*free_index];

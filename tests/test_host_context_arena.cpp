@@ -120,6 +120,37 @@ void test_failures_are_counted_by_cause() {
            "a successful allocation changes no counter");
 }
 
+// A placement that tries smaller sizes after a miss (reserve_in_chunks) counts one failure for the
+// whole placement, and none when it succeeds in pieces (#332: every probe used to count).
+void test_placement_scope_counts_once() {
+    constexpr std::size_t unit = ninfer::HostContextArena::alignment;
+    ninfer::HostContextArena arena(4 * unit, unit);
+    auto first  = arena.allocate(unit);
+    auto second = arena.allocate(unit);
+    auto third  = arena.allocate(unit);
+    auto fourth = arena.allocate(unit);
+    (void)first->release();
+    (void)third->release();
+    {
+        ninfer::HostContextArena::PlacementScope placement(arena);
+        expect(!arena.allocate(2 * unit), "two separated free units cannot hold two units");
+        auto a = arena.allocate(unit);
+        auto b = arena.allocate(unit);
+        expect(a && b, "the placement fits once split into single units");
+    }
+    expect(arena.geometry_failures() == 0 && arena.shortage_failures() == 0,
+           "a placement made in pieces counts no failure for the sizes it tried");
+    {
+        ninfer::HostContextArena::PlacementScope placement(arena);
+        expect(!arena.allocate(2 * unit) && !arena.allocate(unit), "a full arena holds nothing");
+        placement.failed(2 * unit);
+    }
+    expect(arena.shortage_failures() == 1 && arena.geometry_failures() == 0,
+           "a placement that cannot be made counts one failure, by its cause");
+    expect(!arena.allocate(unit) && arena.shortage_failures() == 2,
+           "outside a placement every miss counts again");
+}
+
 } // namespace
 
 int main() {
@@ -134,6 +165,7 @@ int main() {
         test_reserve_publish_and_rollback();
         test_fragmentation_and_split();
         test_failures_are_counted_by_cause();
+        test_placement_scope_counts_once();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

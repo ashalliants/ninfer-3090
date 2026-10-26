@@ -87,9 +87,30 @@ public:
 
     // Allocations that found no extent, split by why: `geometry` when enough bytes were free in
     // total but no single run fit, `shortage` when the bytes were simply not there. Monotonic.
+    // Inside a PlacementScope the misses are not counted; the scope counts one failure for the
+    // whole placement if it fails.
     [[nodiscard]] std::uint64_t geometry_failures() const noexcept { return geometry_failures_; }
 
     [[nodiscard]] std::uint64_t shortage_failures() const noexcept { return shortage_failures_; }
+
+    // A placement that tries several allocation sizes before it settles (reserve_in_chunks halves
+    // a run that does not fit) is one placement, not one per size it tried: its misses are
+    // expected and would otherwise swamp the failure counters. Call `failed` with the bytes the
+    // whole placement needed when it could not be made at all.
+    class [[nodiscard]] PlacementScope {
+    public:
+        explicit PlacementScope(HostContextArena& arena) noexcept : arena_(arena) {
+            ++arena_.placement_depth_;
+        }
+        ~PlacementScope() { --arena_.placement_depth_; }
+        PlacementScope(const PlacementScope&)            = delete;
+        PlacementScope& operator=(const PlacementScope&) = delete;
+
+        void failed(std::size_t bytes) noexcept { arena_.count_failure(bytes); }
+
+    private:
+        HostContextArena& arena_;
+    };
 
     [[nodiscard]] bool can_allocate(std::size_t bytes) const noexcept;
     [[nodiscard]] std::optional<HostContextAllocation> allocate(std::size_t bytes) noexcept;
@@ -108,6 +129,7 @@ private:
     [[nodiscard]] std::optional<std::size_t> find_free_extent(std::size_t bytes) const noexcept;
     void insert_free_extent(FreeExtent extent) noexcept;
     void release(std::size_t offset, std::size_t bytes, bool reserved) noexcept;
+    void count_failure(std::size_t rounded_bytes) noexcept;
 
     std::optional<PinnedHostBuffer> backing_;
     std::size_t capacity_bytes_      = 0;
@@ -118,6 +140,7 @@ private:
     std::size_t allocation_count_    = 0;
     std::uint64_t geometry_failures_ = 0;
     std::uint64_t shortage_failures_ = 0;
+    std::size_t placement_depth_     = 0;
     std::vector<FreeExtent> free_extents_;
 };
 

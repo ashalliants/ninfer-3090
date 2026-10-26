@@ -348,7 +348,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
           "Separate free runs in the shared Host backing; many small runs mean it is fragmented.");
     COUNTER(host_context_geometry_failures, "host_context_geometry_failures_total",
             "Host allocations that failed although enough bytes were free in total, because no "
-            "single run was large enough.");
+            "single run was large enough. A placement that may be split counts once, when it "
+            "cannot be made at all.");
     COUNTER(host_context_shortage_failures, "host_context_shortage_failures_total",
             "Host allocations that failed because too few bytes were free.");
     COUNTER(pressure_spill_pages, "context_pressure_spill_pages_total",
