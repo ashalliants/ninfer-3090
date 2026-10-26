@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -10,6 +11,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -28,8 +30,6 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <unistd.h>
-
-#include <cerrno>
 #endif
 
 namespace ninfer::runtime {
@@ -256,6 +256,14 @@ std::vector<std::uint8_t> read_whole_file(const fs::path& path) {
     return data;
 }
 
+// A failed write with the reason the OS gave (a full disk says so), read from errno, which the
+// caller cleared before writing.
+std::runtime_error write_failure(const fs::path& path, int code) {
+    return std::runtime_error("cannot write " + path.string() +
+                              (code != 0 ? ": " + std::error_code(code, std::generic_category()).message()
+                                         : std::string()));
+}
+
 void remove_quietly(const fs::path& path) noexcept {
     std::error_code ignored;
     fs::remove(path, ignored);
@@ -280,6 +288,7 @@ std::optional<std::uint64_t> compress_to_file(std::span<const std::uint8_t> byte
     if (!context) { throw std::runtime_error("cannot create a zstd compression context"); }
     ZSTD_CCtx_setParameter(context.get(), ZSTD_c_compressionLevel, level);
     ZSTD_CCtx_setPledgedSrcSize(context.get(), bytes.size());
+    errno = 0;
     std::ofstream file(staging, std::ios::binary | std::ios::trunc);
     std::vector<char> out(kStreamBytes);
     ZSTD_inBuffer input{bytes.data(), bytes.size(), 0};
@@ -297,7 +306,7 @@ std::optional<std::uint64_t> compress_to_file(std::span<const std::uint8_t> byte
         if (remaining == 0) { break; }
     }
     file.flush();
-    if (!file.good()) { throw std::runtime_error("cannot write " + staging.string()); }
+    if (!file.good()) { throw write_failure(staging, errno); }
     return total;
 }
 
@@ -415,6 +424,55 @@ private:
 #endif
 };
 
+// An exclusive lock on the file stores of one parent directory share, held while one put checks the
+// volume's free space and writes its files, so two stores there (the boot script lays out two
+// engines' stores side by side) cannot both find room for one image and both write. It blocks
+// until the other store's put has written. If the file cannot be opened or locked the put carries
+// on without it: the lock only narrows a race on free space, it is never a reason to fail a write.
+// Stores elsewhere on the volume, and chunk downloads from the bucket, do not take it.
+struct ContextStore::VolumeLock {
+    explicit VolumeLock(const fs::path& path) {
+        if (path.empty()) { return; }
+#ifdef _WIN32
+        handle_ = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) { return; }
+        OVERLAPPED whole{};
+        if (!LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &whole)) {
+            CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+        }
+#else
+        fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (fd_ < 0) { return; }
+        int locked = -1;
+        do { locked = ::flock(fd_, LOCK_EX); } while (locked != 0 && errno == EINTR);
+        if (locked != 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+#endif
+    }
+    ~VolumeLock() {
+#ifdef _WIN32
+        // Closing the handle releases the lock.
+        if (handle_ != INVALID_HANDLE_VALUE) { CloseHandle(handle_); }
+#else
+        if (fd_ >= 0) { ::close(fd_); }
+#endif
+    }
+    VolumeLock(const VolumeLock&)            = delete;
+    VolumeLock& operator=(const VolumeLock&) = delete;
+
+private:
+#ifdef _WIN32
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    int fd_ = -1;
+#endif
+};
+
 ContextStore::ContextStore(Options options) : options_(std::move(options)) {
     if (options_.directory.empty()) {
         throw std::invalid_argument("context store directory is empty");
@@ -424,6 +482,14 @@ ContextStore::ContextStore(Options options) : options_(std::move(options)) {
         throw std::invalid_argument("context store chunk size is out of range");
     }
     if (!options_.clock) { options_.clock = system_now_ms; }
+    if (!options_.available_bytes) {
+        options_.available_bytes = [directory = options_.directory] {
+            std::error_code error;
+            const fs::space_info space = fs::space(directory, error);
+            // A volume that cannot be asked is not taken to be full.
+            return error ? std::numeric_limits<std::uint64_t>::max() : space.available;
+        };
+    }
     std::error_code error;
     for (const char* sub : {"chunks", "manifests", "tmp"}) {
         fs::create_directories(options_.directory / sub, error);
@@ -440,6 +506,15 @@ ContextStore::ContextStore(Options options) : options_(std::move(options)) {
         if (peer.empty() || fs::equivalent(peer, options_.directory, same_error)) {
             throw std::invalid_argument("a context store peer must be another store's directory");
         }
+    }
+    {
+        // The directory's parent, however the directory was spelled (a trailing separator).
+        fs::path directory = fs::absolute(options_.directory, error).lexically_normal();
+        if (!error && !directory.has_filename()) { directory = directory.parent_path(); }
+        if (!error && directory.has_parent_path() && directory.parent_path() != directory) {
+            volume_lock_path_ = directory.parent_path() / ".ninfer-context-store-volume.lock";
+        }
+        error.clear();
     }
     try {
         owner_ = std::make_unique<OwnerLock>(options_.directory / "owner.lock");
@@ -600,14 +675,16 @@ void ContextStore::write_atomically(const fs::path& path, std::span<const std::u
     std::error_code error;
     fs::create_directories(path.parent_path(), error);
     {
+        errno = 0;
         std::ofstream file(staging, std::ios::binary | std::ios::trunc);
         file.write(reinterpret_cast<const char*>(bytes.data()),
                    static_cast<std::streamsize>(bytes.size()));
         file.flush();
         if (!file.good()) {
+            const int code = errno;
             file.close();
             remove_quietly(staging);
-            throw std::runtime_error("cannot write " + staging.string());
+            throw write_failure(staging, code);
         }
     }
     fs::rename(staging, path, error);
@@ -640,6 +717,7 @@ void ContextStore::release_references(const Entry& entry) {
             if (found->second.present) { chunk_total_bytes_ -= found->second.stored; }
             remove_chunk_files(chunk.hash);
             chunks_.erase(found);
+            ++local_changes_;
         }
     }
 }
@@ -652,6 +730,7 @@ void ContextStore::unpin_chunks_locked(const std::vector<ChunkRef>& chunks) {
             if (found->second.present) { chunk_total_bytes_ -= found->second.stored; }
             remove_chunk_files(chunk.hash);
             chunks_.erase(found);
+            ++local_changes_;
         }
     }
 }
@@ -663,6 +742,7 @@ void ContextStore::remove_entry_locked(const std::string& id, bool corrupt) {
         manifest_total_bytes_ -= found->second.manifest_bytes;
         entries_.erase(found);
         if (corrupt) { ++stats_.corrupt_removed; }
+        ++local_changes_;
     }
     remove_quietly(manifest_path(id));
     remove_quietly(used_path(id));
@@ -895,10 +975,14 @@ bool ContextStore::evict_oldest_locked(const std::string* protect) {
         if (a.info.shared != b.info.shared) { return !a.info.shared; }
         return a.info.last_used_ms < b.info.last_used_ms;
     };
+    // An image being loaded is not evicted: the load would lose what it has just fetched.
+    const auto spared = [&](const std::string& id) {
+        return (protect != nullptr && id == *protect) || loading_.count(id) != 0;
+    };
     if (!options_.remote) {
         const Entry* oldest = nullptr;
         for (const auto& [id, entry] : entries_) {
-            if (protect != nullptr && id == *protect) { continue; }
+            if (spared(id)) { continue; }
             if (oldest == nullptr || evict_before(entry, *oldest)) { oldest = &entry; }
         }
         if (oldest == nullptr) { return false; }
@@ -912,7 +996,7 @@ bool ContextStore::evict_oldest_locked(const std::string* protect) {
     // again only for files it can free now, so every eviction makes progress.
     std::vector<Entry*> order;
     for (auto& [id, entry] : entries_) {
-        if (protect == nullptr || id != *protect) { order.push_back(&entry); }
+        if (!spared(id)) { order.push_back(&entry); }
     }
     std::sort(order.begin(), order.end(),
               [&](const Entry* a, const Entry* b) { return evict_before(*a, *b); });
@@ -978,6 +1062,7 @@ ContextStore::EvictionYield ContextStore::evict_to_remote_locked(
         chunk_total_bytes_ -= found->second.stored;
         found->second.present = false;
         found->second.stored  = 0;
+        ++local_changes_;
     }
     if (apply) { entry.evicted = true; }
     return yield;
@@ -993,7 +1078,8 @@ void ContextStore::maintain_locked(const std::string* protect) {
             if (options_.remote && (entry.evicted || !entry_has_local_bytes_locked(entry))) {
                 continue;
             }
-            if ((protect == nullptr || id != *protect) && entry.info.last_used_ms < horizon) {
+            if ((protect == nullptr || id != *protect) && loading_.count(id) == 0 &&
+                entry.info.last_used_ms < horizon) {
                 expired.push_back(id);
             }
         }
@@ -1009,11 +1095,53 @@ void ContextStore::maintain_locked(const std::string* protect) {
         }
     }
     if (options_.max_bytes != 0) {
-        while (used_bytes_locked() > options_.max_bytes &&
-               entries_.size() > (protect != nullptr ? 1U : 0U)) {
-            if (!evict_oldest_locked(protect)) { break; }
+        // Files queued uploads pin count too: once nothing is left to evict, the oldest uploads
+        // are given up so their files can go. (An upload in flight keeps its files until it ends,
+        // and runs this again then.)
+        while (used_bytes_locked() > options_.max_bytes) {
+            if (evict_oldest_locked(protect)) { continue; }
+            if (drop_queued_upload_locked(protect)) { continue; }
+            break;
         }
     }
+}
+
+bool ContextStore::drop_queued_upload_locked(const std::string* protect) {
+    if (!options_.remote) { return false; }
+    const auto holders = whole_image_holders_locked();
+    // Giving up the upload frees its files only where it is their last pin and no image held
+    // whole uses them: those go at once, or with the next eviction of the image they belong to.
+    const auto frees_files = [&](const RemoteTask& task) {
+        std::unordered_map<std::string, std::uint32_t> own_pins;
+        for (const ChunkRef& chunk : task.chunks) { ++own_pins[hex_key(chunk.hash)]; }
+        for (const auto& [key, pins] : own_pins) {
+            const auto found = chunks_.find(key);
+            if (found != chunks_.end() && found->second.present && found->second.pins == pins &&
+                holders.count(key) == 0) {
+                return true;
+            }
+        }
+        return false;
+    };
+    std::vector<ChunkRef> unused;
+    {
+        std::scoped_lock lock(remote_mutex_);
+        for (auto it = remote_queue_.begin(); it != remote_queue_.end(); ++it) {
+            if (it->kind != RemoteTask::Kind::Upload || (protect != nullptr && it->id == *protect) ||
+                !frees_files(*it)) {
+                continue;
+            }
+            // As when the queue is full: the image is uploaded again by its next write.
+            unused = std::move(it->chunks);
+            release_retirements_locked(it->retire);
+            remote_queue_.erase(it);
+            ++stats_.remote_uploads_dropped;
+            break;
+        }
+    }
+    if (unused.empty()) { return false; }
+    unpin_chunks_locked(unused);
+    return true;
 }
 
 void ContextStore::maintain() {
@@ -1041,6 +1169,11 @@ ContextStore::PutResult ContextStore::put(const Description& description,
     std::scoped_lock io(io_mutex_);
     PutResult result;
     result.image_bytes = image.size();
+    std::uint64_t evictions_before = 0; // including those that made room on the volume
+    {
+        std::scoped_lock lock(mutex_);
+        evictions_before = stats_.evicted_for_space + stats_.expired;
+    }
     std::vector<Segment> segments;
     std::vector<ChunkRef> all_chunks;
     std::vector<fs::path> written;
@@ -1048,8 +1181,18 @@ ContextStore::PutResult ContextStore::put(const Description& description,
     std::vector<std::pair<std::string, std::uint64_t>> refilled;
     std::uint64_t stored_written = 0;
     std::unordered_set<std::string> seen_in_put;
+    // The chunks the directory lacks, written once the volume is known to have room for them.
+    struct NewChunk {
+        ChunkRef chunk;
+        std::span<const std::uint8_t> bytes;
+        bool known = false; // the index names it (an image registered from the bucket)
+    };
+    std::vector<NewChunk> new_chunks;
+    std::vector<ChunkRef> reused;
+    // Chunks this put reuses, pinned while room is made, so no eviction removes them.
+    std::vector<ChunkRef> pinned;
     try {
-        // Stores `bytes` as one chunk of `segment`, writing it only when the directory lacks it.
+        // Records `bytes` as one chunk of `segment`, to be written only when the directory lacks it.
         const auto add_chunk = [&](Segment& segment, std::span<const std::uint8_t> bytes) {
             ChunkRef chunk{.hash = hash(bytes), .length = static_cast<std::uint32_t>(bytes.size())};
             const std::string key = hex_key(chunk.hash);
@@ -1063,12 +1206,10 @@ ContextStore::PutResult ContextStore::put(const Description& description,
                 present = known && found->second.present;
             }
             if (!present && seen_in_put.find(key) == seen_in_put.end()) {
-                const auto [path, stored] = write_chunk(chunk, bytes);
-                written.push_back(path);
-                if (known) { refilled.emplace_back(key, stored.bytes); }
+                new_chunks.push_back({chunk, bytes, known});
                 result.chunk_bytes_written += bytes.size();
-                stored_written += stored.bytes;
             } else {
+                if (present) { reused.push_back(chunk); }
                 result.chunk_bytes_reused += bytes.size();
             }
             seen_in_put.insert(key);
@@ -1149,7 +1290,23 @@ ContextStore::PutResult ContextStore::put(const Description& description,
         const std::uint64_t checksum =
             xxh64(manifest.out.data(), manifest.out.size(), 0x4e43u);
         manifest.pod(checksum);
-        write_atomically(manifest_path(description.id), manifest.out);
+
+        {
+            // From the free-space check until the files are written, no other store of this parent
+            // directory checks or writes (see VolumeLock).
+            const VolumeLock volume(volume_lock_path_);
+            // Raw bytes: a compressed chunk only takes less.
+            std::uint64_t to_write = manifest.out.size();
+            for (const NewChunk& chunk : new_chunks) { to_write += chunk.bytes.size(); }
+            make_room_on_volume_locked(description.id, to_write, reused, pinned);
+            for (const NewChunk& chunk : new_chunks) {
+                const auto [path, stored] = write_chunk(chunk.chunk, chunk.bytes);
+                written.push_back(path);
+                if (chunk.known) { refilled.emplace_back(hex_key(chunk.chunk.hash), stored.bytes); }
+                stored_written += stored.bytes;
+            }
+            write_atomically(manifest_path(description.id), manifest.out);
+        }
 
         Entry entry;
         entry.info = Info{.id           = description.id,
@@ -1183,6 +1340,8 @@ ContextStore::PutResult ContextStore::put(const Description& description,
             }
         }
         add_references(entry);
+        unpin_chunks_locked(pinned); // referenced now
+        pinned.clear();
         // The upload works from this snapshot: the entry may be replaced or evicted before it runs.
         std::vector<ChunkRef> upload_chunks;
         if (options_.remote) {
@@ -1252,7 +1411,6 @@ ContextStore::PutResult ContextStore::put(const Description& description,
         stats_.bytes_written += result.chunk_bytes_written;
         stats_.bytes_stored += stored_written;
         stats_.bytes_reused += result.chunk_bytes_reused;
-        const std::uint64_t evictions_before = stats_.evicted_for_space + stats_.expired;
         maintain_locked(&description.id);
         result.evicted_images = stats_.evicted_for_space + stats_.expired - evictions_before;
         if (options_.remote) {
@@ -1264,16 +1422,79 @@ ContextStore::PutResult ContextStore::put(const Description& description,
     } catch (...) {
         for (const fs::path& path : written) { remove_quietly(path); }
         std::scoped_lock lock(mutex_);
+        unpin_chunks_locked(pinned);
         ++stats_.put_failures;
         throw;
     }
     return result;
 }
 
+void ContextStore::make_room_on_volume_locked(const std::string& id, std::uint64_t bytes,
+                                              const std::vector<ChunkRef>& keep,
+                                              std::vector<ChunkRef>& pinned) {
+    const std::uint64_t needed =
+        bytes + std::min(options_.reserve_bytes, std::numeric_limits<std::uint64_t>::max() - bytes);
+    std::uint64_t available = options_.available_bytes();
+    if (available >= needed) { return; }
+    std::scoped_lock lock(mutex_);
+    // Evicting helps only if what this store holds could cover the shortfall; otherwise (another
+    // engine or program filled the volume) its images are kept and the put is refused at once.
+    if (available + used_bytes_locked() >= needed) {
+        for (const ChunkRef& chunk : keep) {
+            const auto found = chunks_.find(hex_key(chunk.hash));
+            if (found == chunks_.end()) { continue; }
+            ++found->second.pins;
+            pinned.push_back(chunk);
+        }
+        while (available < needed && (evict_oldest_locked(&id) || drop_queued_upload_locked(&id))) {
+            available = options_.available_bytes();
+        }
+    }
+    if (available < needed) {
+        throw std::runtime_error(
+            "context store volume is full: " + std::to_string(bytes) + " bytes to write and " +
+            std::to_string(options_.reserve_bytes) + " to keep free need " + std::to_string(needed) +
+            ", " + std::to_string(available) + " are available (" +
+            std::to_string(needed - available) + " short) in " + options_.directory.string());
+    }
+}
+
 std::optional<std::vector<std::uint8_t>> ContextStore::load(
     const std::string& id, bool touch, LoadReport* report,
     std::chrono::steady_clock::time_point deadline) {
     if (!valid_id(id)) { return std::nullopt; }
+    // From here until it returns, the image is not evicted or expired and its chunk files are
+    // pinned: a put meanwhile (no lock is held while chunks download) would otherwise remove what
+    // this load has just fetched, and the load would take the gap for damage.
+    std::vector<ChunkRef> pinned;
+    bool loading = false;
+    {
+        std::scoped_lock lock(mutex_);
+        const auto found = entries_.find(id);
+        if (found != entries_.end()) {
+            for (const ChunkRef& chunk : found->second.chunks) {
+                const auto use = chunks_.find(hex_key(chunk.hash));
+                if (use == chunks_.end()) { continue; }
+                ++use->second.pins;
+                pinned.push_back(chunk);
+            }
+            ++loading_[id];
+            loading = true;
+        }
+    }
+    struct Release {
+        ContextStore& store;
+        const std::string& id;
+        const std::vector<ChunkRef>& pinned;
+        bool loading;
+        ~Release() {
+            if (!loading) { return; }
+            std::scoped_lock io(store.io_mutex_);
+            std::scoped_lock lock(store.mutex_);
+            store.unpin_chunks_locked(pinned);
+            if (--store.loading_[id] == 0) { store.loading_.erase(id); }
+        }
+    } release{*this, id, pinned, loading};
     // Downloads only, timed apart from reading and reassembling the local files.
     const auto fetch = [&](std::uint64_t& generation) {
         const auto started  = std::chrono::steady_clock::now();
@@ -1311,10 +1532,13 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(
             }
         }
     }
-    // One pass reads the local files. With a remote, a local chunk found damaged is discarded and
-    // fetched again, then the pass is repeated once.
+    // One pass reads the local files. With a remote, a local chunk found damaged or missing is
+    // discarded and fetched again, then the pass is repeated once.
     for (int pass = 0; pass < 2; ++pass) {
         std::vector<ChunkRef> damaged;
+        // Chunk files that are not there at all: not damage (nothing read back wrong), so with a
+        // remote they are fetched again, and failing that the load is a miss that keeps the image.
+        std::vector<ChunkRef> missing;
         {
             std::scoped_lock io(io_mutex_);
             Entry entry;
@@ -1380,8 +1604,11 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(
                                                              piece.chunk->length);
                         if (!read_chunk(*piece.chunk, target) ||
                             hash(target) != piece.chunk->hash) {
+                            std::error_code error;
+                            const bool gone = !fs::exists(chunk_path(piece.chunk->hash), error) &&
+                                              !fs::exists(compressed_chunk_path(piece.chunk->hash), error);
                             std::scoped_lock damage(damage_mutex);
-                            damaged.push_back(*piece.chunk);
+                            (gone ? missing : damaged).push_back(*piece.chunk);
                         }
                     }
                 } catch (...) {
@@ -1404,8 +1631,27 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(
             if (reader_failure) { std::rethrow_exception(reader_failure); }
             // Every damaged chunk is discarded and fetched again together (with a remote), so one
             // bad chunk does not leave the next to fail the retry.
-            const bool intact = damaged.empty();
-            if (!intact && !(options_.remote && pass == 0)) { return fail(&damaged); }
+            const bool intact = damaged.empty() && missing.empty();
+            // Without a remote a missing chunk can never come back: the image is as good as damaged.
+            if (!options_.remote) { damaged.insert(damaged.end(), missing.begin(), missing.end()); }
+            if (!damaged.empty() && !(options_.remote && pass == 0)) { return fail(&damaged); }
+            // The index's view of the missing files is corrected, so a later fetch brings them.
+            const auto forget_missing = [&] {
+                for (const ChunkRef& chunk : missing) {
+                    const auto found = chunks_.find(hex_key(chunk.hash));
+                    if (found != chunks_.end() && found->second.present) {
+                        found->second.present = false;
+                        chunk_total_bytes_ -= found->second.stored;
+                        found->second.stored = 0;
+                    }
+                }
+            };
+            if (!intact && pass == 1) {
+                std::scoped_lock lock(mutex_);
+                forget_missing();
+                ++stats_.load_misses;
+                return std::nullopt;
+            }
             if (intact) {
                 if (touch) {
                     std::scoped_lock lock(mutex_);
@@ -1423,8 +1669,11 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(
             // Discard the damaged local copies; the remote holds the good ones. A peer that linked
             // one of them is not linked from again, unchanged, while the fetch runs.
             std::scoped_lock lock(mutex_);
+            forget_missing();
             const auto held = entries_.find(id);
-            if (held != entries_.end()) { quarantine_peers_locked(held->second, &damaged); }
+            if (held != entries_.end() && !damaged.empty()) {
+                quarantine_peers_locked(held->second, &damaged);
+            }
             for (const ChunkRef& chunk : damaged) {
                 const auto found = chunks_.find(hex_key(chunk.hash));
                 if (found != chunks_.end() && found->second.present) {
@@ -1442,7 +1691,9 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(
                 std::scoped_lock lock(mutex_);
                 ++stats_.load_misses;
             }
-            // Gone or damaged in the bucket too: nothing can repair it, so do not offer it again.
+            // Gone or damaged in the bucket too: nothing can repair it, so do not offer it again. A
+            // locally missing chunk is a miss that keeps the session only while the bucket may
+            // still hold it (a transfer failure); one the bucket lacks too is lost for good.
             if (status == FetchStatus::Corrupt) { settle_failed_fetch(id, generation); }
             return std::nullopt;
         }
@@ -1581,6 +1832,7 @@ void ContextStore::enqueue_remote(RemoteTask task) {
 // Called with io_mutex_ and mutex_ held, the chunks already pinned. One queued upload per image: a
 // newer write of the image replaces it. Each queued upload keeps its chunk files on disk, so the
 // queue is bounded and the oldest is given up beyond it (its image is uploaded again by its next write).
+// The size limit bounds the files the queue holds too: see maintain_locked().
 void ContextStore::enqueue_upload(const std::string& id, std::uint64_t generation,
                                   std::vector<std::uint8_t> manifest, std::vector<ChunkRef> chunks,
                                   std::vector<std::string> superseded) {
@@ -1634,6 +1886,7 @@ void ContextStore::enqueue_upload(const std::string& id, std::uint64_t generatio
                             unused.insert(unused.end(), it->chunks.begin(), it->chunks.end());
                             release_retirements_locked(it->retire);
                             remote_queue_.erase(it);
+                            ++stats_.remote_uploads_dropped;
                             break;
                         }
                     }
@@ -1854,6 +2107,8 @@ void ContextStore::upload_image(RemoteTask& task) {
     stats_.remote_uploads += objects;
     stats_.remote_upload_bytes += bytes;
     if (!succeeded) { ++stats_.remote_upload_failures; }
+    // Files the upload kept past an eviction, and an image it published, can go now.
+    maintain_locked(nullptr);
 }
 
 void ContextStore::prune_remote_state() {
@@ -2362,47 +2617,135 @@ void ContextStore::peer_loop() {
 }
 
 std::size_t ContextStore::sync_peers() {
+    std::scoped_lock scanning(peer_scan_mutex_);
     std::size_t imported = 0;
-    std::unordered_set<std::string> listed;
     for (const fs::path& peer : options_.peers) {
+        const fs::path manifests = peer / "manifests";
+        // Taken before the listing, so a change made while it runs makes the next poll list again.
         std::error_code error;
-        fs::directory_iterator item(peer / "manifests", error);
+        const fs::file_time_type manifests_time = fs::last_write_time(manifests, error);
         if (error) { continue; } // the peer has not started yet, or has no store
+        const auto listed_at = fs::file_time_type::clock::now();
+        std::uint64_t local_changes = 0;
+        {
+            std::scoped_lock lock(mutex_);
+            local_changes = local_changes_;
+        }
+        // Nothing the last listing decided can have changed: the peer's directory (every manifest
+        // and use stamp is renamed into it) and this store's removals are where they were.
+        PeerScan& last = peer_scans_[peer.string()];
+        if (last.trusted && last.manifests_time == manifests_time &&
+            last.local_changes == local_changes) {
+            continue;
+        }
+        // The peer's own images have a `.used` stamp (written with the image, or when it is used).
+        // One it only registered from the bucket has none: the peer holds none of its chunks, so
+        // it would only fail to link.
+        std::unordered_set<std::string> manifest_ids;
+        std::unordered_set<std::string> used_ids;
+        bool complete = true;
+        fs::directory_iterator item(manifests, error);
+        if (error) {
+            last.trusted = false; // listed again next poll
+            continue;
+        }
         for (; item != fs::directory_iterator(); item.increment(error)) {
-            if (error) { break; }
-            const fs::path& path = item->path();
-            if (path.extension() != ".manifest") { continue; }
-            const std::string id = path.stem().string();
-            if (!valid_id(id)) { continue; }
-            const std::string memo_key = peer.string() + "|" + id;
-            listed.insert(memo_key);
-            std::error_code time_error;
-            const std::int64_t stamp = static_cast<std::int64_t>(
-                fs::last_write_time(path, time_error).time_since_epoch().count());
-            if (time_error) {
-                // The peer removed it since the listing: count it, so the skip metrics show the loss.
-                std::scoped_lock lock(mutex_);
-                ++stats_.peer_skipped;
-                continue;
+            if (error) {
+                complete = false;
+                break;
             }
-            {
-                std::scoped_lock lock(mutex_);
+            const fs::path& path = item->path();
+            std::string id       = path.stem().string();
+            if (!valid_id(id)) { continue; }
+            if (path.extension() == ".manifest") {
+                manifest_ids.insert(std::move(id));
+            } else if (path.extension() == ".used") {
+                used_ids.insert(std::move(id));
+            }
+        }
+        std::vector<std::string> candidates;
+        {
+            std::scoped_lock lock(mutex_);
+            ++stats_.peer_scans;
+            for (const std::string& id : manifest_ids) {
+                if (used_ids.count(id) == 0) { continue; }
                 // An image the bucket listing registered by name only is still worth the peer's
                 // copy: linking it spares load() the download.
                 const auto held = entries_.find(id);
                 if (held != entries_.end() && entry_local_locked(held->second)) { continue; }
-                const auto skipped = peer_skipped_.find(memo_key);
-                if (skipped != peer_skipped_.end() && skipped->second == stamp) { continue; }
+                candidates.push_back(id);
             }
+        }
+        std::vector<std::pair<std::string, std::int64_t>> stamped;
+        std::uint64_t gone = 0;
+        for (const std::string& id : candidates) {
+            std::error_code time_error;
+            const std::int64_t stamp = static_cast<std::int64_t>(
+                fs::last_write_time(manifests / (id + ".manifest"), time_error).time_since_epoch().count());
+            if (time_error) {
+                ++gone; // the peer removed it since the listing: counted, so the skip metrics show the loss
+                continue;
+            }
+            stamped.emplace_back(id, stamp);
+        }
+        // Images waiting for the peer's chunks, and the `.used` time each wait was recorded at.
+        std::vector<std::pair<std::string, std::int64_t>> absent;
+        {
+            std::scoped_lock lock(mutex_);
+            stats_.peer_skipped += gone;
+            std::erase_if(stamped, [&](const auto& candidate) {
+                const std::string memo_key = peer.string() + "|" + candidate.first;
+                const auto skipped = peer_skipped_.find(memo_key);
+                if (skipped != peer_skipped_.end() && skipped->second == candidate.second) {
+                    return true;
+                }
+                const auto wait = peer_waits_.find(memo_key);
+                if (wait == peer_waits_.end() || wait->second.stamp != candidate.second) { return false; }
+                if (wait->second.absent) {
+                    absent.emplace_back(candidate.first, wait->second.used_stamp);
+                    return true; // checked against the peer's `.used` below
+                }
+                // Over budget: tried again once this store has removed something.
+                return wait->second.local_changes == local_changes_;
+            });
+        }
+        for (const auto& [id, used_stamp] : absent) {
+            const auto stamp = peer_used_stamp(peer, id);
+            if (stamp && *stamp == used_stamp) { continue; } // the peer still lacks the chunks
+            std::error_code time_error;
+            const std::int64_t manifest_stamp = static_cast<std::int64_t>(
+                fs::last_write_time(manifests / (id + ".manifest"), time_error).time_since_epoch().count());
+            if (!time_error) { stamped.emplace_back(id, manifest_stamp); }
+        }
+        for (const auto& [id, stamp] : stamped) {
             if (import_peer_image(peer, id, stamp)) { ++imported; }
         }
-    }
-    // A skipped image the peers no longer list is forgotten, so the memo cannot outgrow them.
-    std::scoped_lock lock(mutex_);
-    for (auto it = peer_skipped_.begin(); it != peer_skipped_.end();) {
-        it = listed.count(it->first) != 0 ? std::next(it) : peer_skipped_.erase(it);
+        // A skipped image the peer no longer lists is forgotten, so the memo cannot outgrow it.
+        // An incomplete listing proves nothing gone.
+        if (complete) {
+            const std::string prefix = peer.string() + "|";
+            std::scoped_lock lock(mutex_);
+            const auto unlisted = [&](const auto& skipped) {
+                return skipped.first.compare(0, prefix.size(), prefix) == 0 &&
+                       manifest_ids.count(skipped.first.substr(prefix.size())) == 0;
+            };
+            std::erase_if(peer_skipped_, unlisted);
+            std::erase_if(peer_waits_, unlisted);
+        }
+        // A directory time well in the past is one a later change must move; one this recent
+        // could share its file system tick with a change made just after the listing.
+        last = {manifests_time, local_changes,
+                complete && manifests_time + std::chrono::seconds(1) < listed_at};
     }
     return imported;
+}
+
+std::optional<std::int64_t> ContextStore::peer_used_stamp(const fs::path& peer,
+                                                          const std::string& id) {
+    std::error_code error;
+    const auto time = fs::last_write_time(peer / "manifests" / (id + ".used"), error);
+    if (error) { return std::nullopt; }
+    return static_cast<std::int64_t>(time.time_since_epoch().count());
 }
 
 bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id,
@@ -2464,6 +2807,7 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
     std::vector<Source> needed;
     std::unordered_set<std::string> seen;
     std::uint64_t new_bytes = held != nullptr ? 0 : entry.manifest_bytes; // a held manifest is counted
+    bool lacking            = false; // a chunk this store needs that the peer does not hold intact
     for (const ChunkRef& chunk : wanted) {
         const std::string key = hex_key(chunk.hash);
         if (!seen.insert(key).second) { continue; }
@@ -2480,17 +2824,34 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
             size = fs::file_size(packed_source, error);
             const auto content = error ? std::nullopt : compressed_content_size(packed_source);
             if (error || !content || *content != chunk.length) {
-                ++stats_.peer_link_failures;
-                return skip_locked(); // the peer evicted it meanwhile, or it is damaged
+                lacking = true;
+                continue;
             }
             needed.push_back({&chunk, packed_source, true, size});
         }
         new_bytes += size;
     }
+    if (lacking) {
+        if (needed.empty()) {
+            // The peer holds none of what this store lacks: its copy is only an entry for the
+            // bucket's (registered from a listing, or evicted to the bucket). Not a failure;
+            // looked at again when the peer uses the image, as a fetch back to its disk does.
+            PeerWait& wait = peer_waits_[memo_key];
+            wait           = {stamp, peer_used_stamp(peer, id).value_or(0), 0, true};
+            return false;
+        }
+        ++stats_.peer_link_failures;
+        return skip_locked(); // the peer evicted part of it meanwhile, or it is damaged
+    }
     // Nothing is imported that would be evicted at once, or the store would link, evict and link
     // the same image again at every poll.
+    // The skip stands until the peer rewrites the image or this store removes something, and the
+    // same skip is counted once.
     if (options_.max_bytes != 0 && used_bytes_locked() + new_bytes > options_.max_bytes) {
-        return skip_locked();
+        PeerWait& wait = peer_waits_[memo_key];
+        if (wait.absent || wait.stamp != stamp) { ++stats_.peer_skipped; }
+        wait = {stamp, 0, local_changes_, false};
+        return false;
     }
 
     // Hard-link each chunk. A link is independent of the peer's file from then on: the peer
@@ -2536,6 +2897,7 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
         }
     }
     peer_skipped_.erase(memo_key);
+    peer_waits_.erase(memo_key);
     ++stats_.peer_images;
     stats_.peer_bytes_linked += linked_bytes;
     // Only the chunks linked here are the peer's: one this store already held is not.
