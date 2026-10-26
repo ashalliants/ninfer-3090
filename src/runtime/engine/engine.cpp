@@ -438,9 +438,11 @@ public:
     std::deque<PendingWrite> pending_writes;
     bool writer_active = false;
     std::string active_write_id; // the write in progress, while writer_active
-    // Ids of queued writes that failed since the core last took them (bounded: a core that never
-    // asks loses the oldest, and treats those continuations as stored until they change).
+    // Ids of queued writes that failed since the core last took them. Bounded: beyond it the
+    // oldest go and `failed_write_ids_lost` says so, and the core then retries every continuation
+    // whose image the store does not hold.
     std::deque<std::string> failed_write_ids;
+    bool failed_write_ids_lost = false;
     static constexpr std::size_t kMaximumFailedWriteIds = 4096;
     bool writer_stop   = false;
     std::optional<std::chrono::steady_clock::time_point> drain_deadline;
@@ -506,7 +508,12 @@ private:
             .ready   =[this] { return store_queue_idle(); },
             .queued  = [this](const std::string& id) { return store_write_queued(id); },
             .failures = [this] { return store_write_failures.load(std::memory_order_relaxed); },
-            .failed_ids = [this] { return take_failed_write_ids(); },
+            .failed_writes =
+                [this] {
+                    typename GenerationCoreT::FailedStoreWrites reported;
+                    take_failed_writes(reported.ids, reported.lost);
+                    return reported;
+                },
             .idle_persist =
                 std::chrono::duration_cast<std::chrono::milliseconds>(options.context_store.idle_persist),
             .hydration_budget =
@@ -696,15 +703,19 @@ private:
 
     // The ids of writes that failed since the last call. Under writer_mutex.
     void record_failed_write_locked(std::string id) {
-        if (failed_write_ids.size() >= kMaximumFailedWriteIds) { failed_write_ids.pop_front(); }
+        if (failed_write_ids.size() >= kMaximumFailedWriteIds) {
+            failed_write_ids.pop_front();
+            failed_write_ids_lost = true;
+        }
         failed_write_ids.push_back(std::move(id));
     }
 
-    [[nodiscard]] std::vector<std::string> take_failed_write_ids() {
+    // Hands over the failed writes not yet taken, and whether some were lost.
+    void take_failed_writes(std::vector<std::string>& ids, bool& lost) {
         std::scoped_lock lock(writer_mutex);
-        std::vector<std::string> out(failed_write_ids.begin(), failed_write_ids.end());
+        ids.assign(failed_write_ids.begin(), failed_write_ids.end());
+        lost = std::exchange(failed_write_ids_lost, false);
         failed_write_ids.clear();
-        return out;
     }
 
     // Queues an image for the writer thread. Never blocks: when the queue is full the image is

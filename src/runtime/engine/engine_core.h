@@ -521,8 +521,15 @@ public:
     // The durable context store (owned by the Engine, which outlives this core). `sink` queues one
     // image for the Engine's writer and must not block; it returns whether the image was accepted.
     // `ready` reports an idle writer; `queued` whether an image id is still waiting for (or in) the
-    // writer; `failures` counts queued writes that later failed, and `failed_ids` hands over the ids
-    // of those not yet taken: each such continuation the store does not hold is written again.
+    // writer; `failures` counts queued writes that later failed, and `failed_writes` hands over the
+    // ids of those not yet taken: each such continuation the store does not hold is written again.
+    // Failed writes the writer reports: their ids, and whether some were lost (then every
+    // continuation the store does not hold counts as failed).
+    struct FailedStoreWrites {
+        std::vector<std::string> ids;
+        bool lost = false;
+    };
+
     struct ContextStoreHooks {
         ContextStore* store = nullptr;
         std::string binding;
@@ -536,7 +543,7 @@ public:
         std::function<bool()> ready;
         std::function<bool(const std::string&)> queued;
         std::function<std::uint64_t()> failures;
-        std::function<std::vector<std::string>()> failed_ids;
+        std::function<FailedStoreWrites()> failed_writes;
         // A retained continuation unused this long is written in the background; zero disables it.
         std::chrono::milliseconds idle_persist{0};
         // The longest a request waits for its stored session to be read back.
@@ -3779,13 +3786,19 @@ private:
     bool forget_failed_store_writes() noexcept {
         if (!store_.failures) { return false; }
         const auto failed = store_.failures();
-        std::vector<std::string> ids;
+        FailedStoreWrites reported;
         try {
-            if (store_.failed_ids) { ids = store_.failed_ids(); }
-        } catch (...) {}
-        if (failed == store_failures_seen_ && ids.empty()) { return false; }
+            if (store_.failed_writes) {
+                reported = store_.failed_writes();
+            } else if (failed != store_failures_seen_) {
+                reported.lost = true; // no ids to go by
+            }
+        } catch (...) { reported.lost = failed != store_failures_seen_; }
+        if (failed == store_failures_seen_ && reported.ids.empty() && !reported.lost) {
+            return false;
+        }
         store_failures_seen_ = failed;
-        retry_failed_store_writes(ids);
+        retry_failed_store_writes(reported);
         return true;
     }
 
@@ -3822,12 +3835,15 @@ private:
         } catch (...) {} // marks not yet checked stand: a stale one costs a hit, never an answer
     }
 
-    // After queued writes of `ids` failed: their continuations are no longer stored, and not
-    // dropped either, so the next scan writes them again.
-    void retry_failed_store_writes(const std::vector<std::string>& ids) noexcept {
+    // After queued writes failed: their continuations are no longer stored, and not dropped
+    // either, so the next scan writes them again. With ids lost, every continuation whose image the
+    // store does not hold is treated so.
+    void retry_failed_store_writes(const FailedStoreWrites& reported) noexcept {
         try {
+            const auto& ids   = reported.ids;
             const auto failed = [&](const std::string& id) {
-                return !id.empty() && std::find(ids.begin(), ids.end(), id) != ids.end() &&
+                return !id.empty() &&
+                       (reported.lost || std::find(ids.begin(), ids.end(), id) != ids.end()) &&
                        !store_has_image(id);
             };
             auto& program = *instance_.program;
