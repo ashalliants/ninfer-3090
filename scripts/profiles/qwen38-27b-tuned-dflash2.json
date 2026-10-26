@@ -1,0 +1,11 @@
+{
+  "kv-dtype": "rk4v4",
+  "spec": "dflash2",
+  "draft-tokens": 7,
+  "lm-head-draft": true,
+  "gdn-state-fp16": true,
+  "prefill-cublas": true,
+  "prefill-chunk": 4096,
+  "max-pending-requests": 16,
+  "pending-timeout-ms": 600000
+}

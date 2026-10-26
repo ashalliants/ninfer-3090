@@ -92,30 +92,128 @@ while IFS= read -r name; do
 done < <(env | sed -n 's/^\(NINFER_[A-Za-z0-9_]*\)=.*/\1/p')
 clear_env() { env ${ninfer_clear[@]+"${ninfer_clear[@]}"} "$@"; }
 
+# The launcher passes each profile's fixed flags as a `--config` file (scripts/profiles/) and the
+# rest on the command line, so what ninfer-serve acts on is the two together. expand.py works that
+# out by the rules of src/serve/serve_config_file.h -- the file's words first, then the command
+# line's; the last value of an option wins, except for the options that collect -- with Python's own
+# JSON parser rather than the launcher's reader. It prints the model, then one option per line
+# ("--flag value" or "--flag"), sorted.
+cat > "$tmp/expand.py" <<'EXPAND'
+import json, sys
+model, words = sys.argv[1], sys.argv[2:]
+if '--config' in words:
+    at = words.index('--config')
+    with open(words[at + 1], encoding='utf-8') as file:
+        profile = json.load(file)
+    del words[at:at + 2]
+    expanded = []
+    for key, value in profile.items():
+        for item in value if isinstance(value, list) else [value]:
+            if item is True:
+                expanded.append('--' + key)
+            elif item is not False:
+                expanded += ['--' + key, str(item)]
+    words = expanded + words
+options = {}
+at = 0
+while at < len(words):
+    flag = words[at]
+    if not flag.startswith('--'):
+        sys.exit('expand.py: not an option: ' + flag)
+    unit = flag
+    if at + 1 < len(words) and not words[at + 1].startswith('--'):
+        unit += ' ' + words[at + 1]
+        at += 1
+    at += 1
+    if flag in ('--graft', '--allowed-host', '--context-store-peer'):
+        options.setdefault(flag, []).append(unit)
+    else:
+        options[flag] = [unit]
+print(model)
+for flag in sorted(options):
+    print('\n'.join(options[flag]))
+EXPAND
+expand() { python3 -I "$tmp/expand.py" "$@"; }
+
+# Every profile file keeps the layout both launchers read their banner values from: one
+# "key": value pair per line, exactly as json.dumps(..., indent=2) writes it, with scalar values
+# that hold no space, comma, colon or quote. Integers stay integers: the server's integer options
+# refuse 1024.0.
+for profile in "$root"/profiles/*.json; do
+  python3 -I - "$profile" <<'LAYOUT' || exit 1
+import json, sys
+path = sys.argv[1]
+text = open(path, encoding='utf-8').read()
+profile = json.loads(text)
+problems = []
+if text != json.dumps(profile, indent=2) + '\n':
+    problems.append('not laid out as json.dumps(..., indent=2) writes it, one pair per line')
+for key, value in profile.items():
+    if isinstance(value, (list, dict)) or value is None or isinstance(value, float):
+        problems.append(f'"{key}" is not a string, an integer or true')
+    elif value is False:
+        problems.append(f'"{key}" is false: leave the key out instead')
+    elif isinstance(value, str) and any(c in value for c in ' ,:"'):
+        problems.append(f'"{key}" holds a space, comma, colon or quote')
+for problem in problems:
+    print(f'{path}: {problem}', file=sys.stderr)
+sys.exit(1 if problems else 0)
+LAYOUT
+done
+
 # scripts/run.sh serves every shipped profile, chosen by `run.sh <model> [profile]`. The README and
 # the launcher's own header tell users which flag set to reach for, so pin each set as a whole: a
 # flag dropped from one -- or a load-time transcode the 27B artifact no longer needs (it stores the
 # embedding as Q4 and the head as Q6) -- fails here instead of at a user's first start.
-record() { # record <label> [NAME=value ...] -- <run.sh arguments>; prints the recorded server args
+record() { # record <label> [NAME=value ...] -- <run.sh arguments>; prints the file of options in force
   local label="$1"; shift
-  local recorded="$tmp/run.$label.args" assignments=()
+  local recorded="$tmp/run.$label.args" assignments=() raw
   while [[ "$1" != '--' ]]; do assignments+=("$1"); shift; done
   shift
-  clear_env NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$recorded" NINFER_MODEL_DIR="$tmp" \
+  clear_env NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$recorded.raw" NINFER_MODEL_DIR="$tmp" \
     ${assignments[@]+"${assignments[@]}"} "$root/run.sh" "$@" >/dev/null
+  mapfile -t raw < "$recorded.raw"
+  expand "${raw[@]}" > "$recorded"
   printf '%s' "$recorded"
 }
-expect_flags() { # expect_flags <label> <recorded> <flag sequence>...: each appears, in order, adjacent
-  local label="$1" recorded="$2" flat sequence; shift 2
-  flat=" $(tr '\n' ' ' < "$recorded")"
+units() { # units <words...>: one option per line, each flag with its value
+  local word unit=''
+  for word in "$@"; do
+    if [[ "$word" == --* && -n "$unit" ]]; then printf '%s\n' "$unit"; unit="$word"
+    elif [[ -n "$unit" ]]; then unit+=" $word"
+    else unit="$word"; fi
+  done
+  [[ -z "$unit" ]] || printf '%s\n' "$unit"
+}
+expect_flags() { # expect_flags <label> <recorded> <flag sequence>...: every option in each is in force
+  local label="$1" recorded="$2" sequence unit words; shift 2
   for sequence in "$@"; do
-    [[ "$flat" == *" $sequence "* ]] && continue
-    printf 'run.sh (%s) is missing "%s"\nargs:%s\n' "$label" "$sequence" "$flat" >&2
-    exit 1
+    read -ra words <<< "$sequence"
+    while IFS= read -r unit; do
+      grep -Fxq -- "$unit" "$recorded" && continue
+      printf 'run.sh (%s) is missing "%s"\noptions in force:\n%s\n' "$label" "$unit" "$(cat -- "$recorded")" >&2
+      exit 1
+    done < <(units "${words[@]}")
   done
 }
+expect_options() { # expect_options <label> <recorded> <words...>: exactly these options are in force
+  local label="$1" recorded="$2" want got; shift 2
+  want="$(units "$@" | LC_ALL=C sort)"
+  got="$(tail -n +2 -- "$recorded" | LC_ALL=C sort)"
+  [[ "$want" == "$got" ]] && return 0
+  printf 'run.sh (%s): the options in force differ from the profile (< expected, > got):\n%s\n' "$label" \
+    "$(diff <(printf '%s\n' "$want") <(printf '%s\n' "$got"))" >&2
+  exit 1
+}
+expect_config() { # expect_config <label> <recorded> <profile>: run.sh passed --config profiles/<profile>.json
+  local label="$1" recorded="$2" want="$root/profiles/$3.json"
+  if [[ "$(grep -A1 -Fx -- '--config' "$recorded.raw" | tail -n 1)" != "$want" ]]; then
+    printf 'run.sh (%s) did not pass --config %s\nargs: %s\n' "$label" "$want" "$(tr '\n' ' ' < "$recorded.raw")" >&2
+    exit 1
+  fi
+}
 refuse_flag() { # refuse_flag <label> <recorded> <flag>
-  if [[ " $(tr '\n' ' ' < "$2")" == *" $3 "* ]]; then
+  if awk -v flag="$3" '$1 == flag { found = 1 } END { exit !found }' "$2"; then
     printf 'run.sh (%s) must not pass %s\n' "$1" "$3" >&2
     exit 1
   fi
@@ -127,6 +225,80 @@ expect_exit() { # expect_exit <status> <label> <command...>: the command exits w
   printf 'run.sh (%s) exited %s, expected %s\n' "$label" "$got" "$want" >&2
   exit 1
 }
+
+# Every profile and variant, whole: the file it is served from and every option in force, as
+# measured (docs/maintainer/launcher-profiles.md). Moving a flag between a profile file and the
+# launcher must leave these exactly as they are.
+common_tuned=(--host 127.0.0.1 --port 8080 --kv-dtype rk4v4 --gdn-state-fp16 --prefill-cublas
+  --max-pending-requests 16 --pending-timeout-ms 600000 --vision --vision-residency overlay
+  --host-context-mib 8192 --min-p 0.03 --presence-penalty 0.5)
+recorded="$(record whole_dflash2 -- qwen38-27b)"
+expect_config '27B default' "$recorded" qwen38-27b-tuned-dflash2
+expect_options '27B default' "$recorded" "${common_tuned[@]}" --fit-context 32768 \
+  --max-concurrency 1 --max-context 262144 --kv-capacity 262144 \
+  --spec dflash2 --draft-tokens 7 --lm-head-draft --ngram-draft-tokens 15 --prefill-chunk 4096
+recorded="$(record whole_mtp NINFER_SPEC=mtp -- qwen38-27b)"
+expect_config '27B NINFER_SPEC=mtp' "$recorded" qwen38-27b-tuned-mtp
+expect_options '27B NINFER_SPEC=mtp' "$recorded" "${common_tuned[@]}" --fit-context 32768 \
+  --max-concurrency 2 --max-context 262144 --kv-capacity 262144 \
+  --spec mtp --draft-tokens 3 --lm-head-draft --prefill-chunk 2048
+recorded="$(record whole_none NINFER_SPEC=none -- qwen38-27b)"
+expect_config '27B NINFER_SPEC=none' "$recorded" qwen38-27b-tuned-none
+expect_options '27B NINFER_SPEC=none' "$recorded" "${common_tuned[@]}" --fit-context 32768 \
+  --max-concurrency 2 --max-context 262144 --kv-capacity 262144 --prefill-chunk 2048
+recorded="$(record whole_35b -- qwen36-35b-a3b)"
+expect_config '35B default' "$recorded" qwen36-35b-a3b-tuned-mtp
+expect_options '35B default' "$recorded" "${common_tuned[@]}" --fit-context 32768 \
+  --max-concurrency 3 --max-context 262144 --kv-capacity 262144 \
+  --spec mtp --draft-tokens 3 --lm-head-draft --mtp-experts-q4 --prefill-chunk 4096
+recorded="$(record whole_35b_none NINFER_SPEC=none -- qwen36-35b-a3b)"
+expect_config '35B NINFER_SPEC=none' "$recorded" qwen36-35b-a3b-tuned-none
+expect_options '35B NINFER_SPEC=none' "$recorded" "${common_tuned[@]}" --fit-context 32768 \
+  --max-concurrency 3 --max-context 262144 --kv-capacity 262144 --prefill-chunk 4096
+recorded="$(record whole_int8 -- qwen38-27b int8)"
+expect_config '27B int8' "$recorded" qwen38-27b-int8
+expect_options '27B int8' "$recorded" --host 127.0.0.1 --port 8080 \
+  --max-context 65536 --kv-capacity 65536 --max-concurrency 1 --max-pending-requests 16 \
+  --pending-timeout-ms 600000 --prefill-chunk 1024 --kv-dtype int8 --spec mtp --draft-tokens 3 --lm-head-draft
+recorded="$(record whole_c8 -- qwen38-27b c8)"
+expect_config '27B c8' "$recorded" qwen38-27b-c8
+expect_options '27B c8' "$recorded" --host 127.0.0.1 --port 8080 \
+  --max-context 8192 --kv-capacity 16384 --max-concurrency 8 --max-pending-requests 32 \
+  --pending-timeout-ms 600000 --prefill-chunk 512 --kv-dtype int8 --spec mtp --draft-tokens 3 --lm-head-draft \
+  --device-state-slots 8 --host-context-mib 8192
+# The environment's overrides go after --config and win over the file's values; the banner reports
+# the values in force, the file's where nothing overrides them.
+recorded="$(record whole_overrides NINFER_SPEC=mtp NINFER_DRAFT_TOKENS=11 NINFER_CONTEXT=131072 \
+  NINFER_KV_DTYPE=rk8v4 NINFER_PREFILL_CHUNK=1024 -- qwen38-27b)"
+expect_options '27B overrides over the file' "$recorded" --host 127.0.0.1 --port 8080 --gdn-state-fp16 \
+  --prefill-cublas --max-pending-requests 16 --pending-timeout-ms 600000 --vision --vision-residency overlay \
+  --host-context-mib 8192 --min-p 0.03 --presence-penalty 0.5 \
+  --max-concurrency 2 --max-context 131072 --kv-capacity 131072 \
+  --kv-dtype rk8v4 --spec mtp --draft-tokens 11 --lm-head-draft --prefill-chunk 1024
+refuse_flag '27B NINFER_SPEC=none NINFER_DRAFT_TOKENS=11' \
+  "$(record none_draft NINFER_SPEC=none NINFER_DRAFT_TOKENS=11 -- qwen38-27b)" '--draft-tokens'
+banner_of() { # banner_of [NAME=value ...] -- <run.sh arguments>
+  local assignments=()
+  while [[ "$1" != '--' ]]; do assignments+=("$1"); shift; done
+  shift
+  clear_env NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$tmp/unused.args" NINFER_MODEL_DIR="$tmp" \
+    ${assignments[@]+"${assignments[@]}"} "$root/run.sh" "$@"
+}
+for entry in \
+  '#qwen38-27b#rk4v4  |  DFlash2 K=7 + draft head + n-gram copies#chunk 4096' \
+  'NINFER_SPEC=mtp#qwen38-27b#rk4v4  |  MTP3 + draft head, two lanes#chunk 2048' \
+  'NINFER_DRAFT_TOKENS=11#qwen38-27b#DFlash2 K=11 + draft head#chunk 4096' \
+  'NINFER_PREFILL_CHUNK=1024#qwen38-27b#rk4v4  |  DFlash2 K=7#chunk 1024' \
+  'NINFER_KV_DTYPE=rk8v4#qwen36-35b-a3b#rk8v4  |  MTP3 + draft head  |  vision#' \
+  '#qwen36-35b-a3b#rk4v4  |  MTP3 + draft head  |  vision#'; do
+  IFS='#' read -r assignment model want_label want_prefill <<< "$entry"
+  banner="$(banner_of ${assignment:+"$assignment"} -- "$model")"
+  [[ "$banner" == *"$want_label"* && ( -z "$want_prefill" || "$banner" == *"$want_prefill"* ) ]] || {
+    printf 'run.sh banner (%s %s) does not show "%s" and "%s":\n%s\n' "$assignment" "$model" \
+      "$want_label" "$want_prefill" "$banner" >&2
+    exit 1
+  }
+done
 
 # Qwen3.8-27B `tuned`: the two measured flag sets and the speculation-free variant.
 recorded="$(record dflash2 -- qwen38-27b)"
@@ -284,11 +456,13 @@ banner="$(clear_env NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$tmp/unu
 # Host retry. A machine short of RAM can fail to pin the Host context budget; the tuned profile then
 # retries with half of it, down to none. The stub refuses (with the engine's own message) until the
 # requested budget fits, and logs every attempt it is given.
+# It reads the options in force (expand.py), so a budget from the profile file counts as well.
 cat > "$tmp/ninfer-serve-tight" <<'TIGHT'
 #!/usr/bin/env bash
+read -ra options <<< "$(python3 -I "$NINFER_TEST_EXPAND" "$@" | tr '\n' ' ')"
 host=''; previous=''
-for argument in "$@"; do [[ "$previous" == '--host-context-mib' ]] && host="$argument"; previous="$argument"; done
-printf '%s\n' "$*" >> "$NINFER_TEST_LOG"
+for argument in ${options[@]+"${options[@]}"}; do [[ "$previous" == '--host-context-mib' ]] && host="$argument"; previous="$argument"; done
+printf '%s\n' "${options[*]}" >> "$NINFER_TEST_LOG"
 if (( ${host:-0} > ${NINFER_TEST_FITS:-0} )); then
   echo "${NINFER_TEST_FAILURE:-FATAL server failed during startup | cudaMallocHost failed to pin 8589934592 bytes}"
   exit 1
@@ -300,7 +474,7 @@ attempts() { # attempts <fits> [NAME=value ...] -> log of every attempt; sets $l
   ladder_log="$tmp/ladder.$RANDOM.log"; : > "$ladder_log"
   ladder_status=0
   ladder_out="$(clear_env NINFER_SERVER="$tmp/ninfer-serve-tight" NINFER_MODEL_DIR="$tmp" \
-    NINFER_TEST_LOG="$ladder_log" NINFER_TEST_FITS="$fits" ${@+"$@"} "$root/run.sh" qwen38-27b 2>&1)" ||
+    NINFER_TEST_EXPAND="$tmp/expand.py" NINFER_TEST_LOG="$ladder_log" NINFER_TEST_FITS="$fits" ${@+"$@"} "$root/run.sh" qwen38-27b 2>&1)" ||
     ladder_status=$?
 }
 field() { # field <flag>: that flag's value on each logged attempt, space separated
@@ -353,7 +527,7 @@ expect_eq 'chat template rides every retry' "$(field --chat-template)" \
 # The reference profiles are fixed shapes and never retry.
 ladder_log="$tmp/ladder.fixed.log"; : > "$ladder_log"
 clear_env NINFER_SERVER="$tmp/ninfer-serve-tight" NINFER_MODEL_DIR="$tmp" NINFER_TEST_LOG="$ladder_log" \
-  NINFER_TEST_FITS=-1 "$root/run.sh" qwen38-27b c8 >/dev/null 2>&1 || true
+  NINFER_TEST_EXPAND="$tmp/expand.py" NINFER_TEST_FITS=-1 "$root/run.sh" qwen38-27b c8 >/dev/null 2>&1 || true
 expect_eq 'c8 profile has no retry' "$(field --host-context-mib)" '8192 '
 
 # run.sh ships *inside* the release archive as well as living here, and README calls it the Linux
@@ -369,6 +543,7 @@ archive="$tmp/archive"
 mkdir -- "$archive" "$archive/models"
 cp -- "$tmp/ninfer-serve" "$archive/ninfer-serve"
 cp -- "$root/run.sh" "$archive/run.sh"
+cp -R -- "$root/profiles" "$archive/profiles"
 for entry in 'qwen38-27b:qwen3_8_27b.ninfer' 'qwen36-35b-a3b:qwen3_6_35b_a3b.ninfer'; do
   IFS=: read -r key model <<< "$entry"
   : > "$archive/models/$model"
@@ -388,6 +563,7 @@ mkdir -p -- "$decoy/models" "$decoy/inner/models"
 cp -- "$tmp/ninfer-serve" "$decoy/inner/ninfer-serve"
 : > "$decoy/inner/models/qwen3_8_27b.ninfer"
 cp -- "$root/run.sh" "$decoy/inner/run.sh"
+cp -R -- "$root/profiles" "$decoy/inner/profiles"
 args="$tmp/run.decoy.args"
 ( cd -- "$decoy/inner" && clear_env NINFER_TEST_ARGS="$args" ./run.sh qwen38-27b >/dev/null )
 if ! grep -Fx -- "$decoy/inner/models/qwen3_8_27b.ninfer" "$args" >/dev/null; then
@@ -417,10 +593,31 @@ mkdir -p -- "$checkout/scripts" "$checkout/build-linux/apps" "$checkout/models"
 cp -- "$tmp/ninfer-serve" "$checkout/build-linux/apps/ninfer-serve"
 : > "$checkout/models/qwen3_8_27b.ninfer"
 cp -- "$root/run.sh" "$checkout/scripts/run.sh"
+cp -R -- "$root/profiles" "$checkout/scripts/profiles"
 args="$tmp/run.checkout.args"
 ( cd -- "$checkout" && clear_env NINFER_TEST_ARGS="$args" ./scripts/run.sh qwen38-27b >/dev/null )
 if ! grep -Fx -- "$checkout/models/qwen3_8_27b.ninfer" "$args" >/dev/null; then
   printf 'run.sh did not resolve the checkout artifact: %s\n' "$(head -1 -- "$args")" >&2
+  exit 1
+fi
+# Both layouts read the profile files beside the launcher: scripts/profiles/ here, profiles/ at the
+# archive root (package-release.sh ships them there).
+if ! grep -Fx -- "$checkout/scripts/profiles/qwen38-27b-tuned-dflash2.json" "$args" >/dev/null; then
+  printf 'run.sh did not read the checkout profile: %s\n' "$(tr '\n' ' ' < "$args")" >&2
+  exit 1
+fi
+if ! grep -Fx -- "$archive/profiles/qwen38-27b-tuned-dflash2.json" "$tmp/run.qwen38-27b.archive.args" >/dev/null; then
+  printf 'run.sh did not read the archive profile: %s\n' "$(tr '\n' ' ' < "$tmp/run.qwen38-27b.archive.args")" >&2
+  exit 1
+fi
+# A launcher without its profiles refuses to start, naming the file, rather than serving defaults.
+rm -r -- "$checkout/scripts/profiles"
+err="$tmp/no-profiles.err"
+status=0
+( cd -- "$checkout" && clear_env NINFER_TEST_ARGS="$tmp/unused.args" ./scripts/run.sh qwen38-27b int8 \
+    >/dev/null 2>"$err" ) || status=$?
+if [[ "$status" != 1 ]] || ! grep -Fq -- "$checkout/scripts/profiles/qwen38-27b-int8.json" "$err"; then
+  printf 'run.sh without profiles/ exited %s: %s\n' "$status" "$(cat -- "$err")" >&2
   exit 1
 fi
 

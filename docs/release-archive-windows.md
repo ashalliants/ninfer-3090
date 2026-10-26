@@ -67,9 +67,10 @@ API key blank.
 | `ninfer_bench.exe` | throughput benchmark against the public Engine route |
 | `download-model.bat` | pinned, resumable artifact downloads with verification |
 | `run.bat` | serving profiles: `run.bat <model> [profile]`, or double-click it to pick a model |
+| `profiles/` | each profile's fixed flags, as `ninfer-serve --config` files that `run.bat` passes |
 | `*.dll` | the FFmpeg and libcurl runtime dependencies, and NVIDIA's cuBLAS (`cublas64_12.dll`, `cublasLt64_12.dll`) |
 | `NVIDIA-CUDA-EULA.txt` | the licence under which the two cuBLAS DLLs are redistributed |
-| `SHA256SUMS.txt` | checksums for every file in this directory |
+| `SHA256SUMS.txt` | checksums for every file in this directory and in `profiles/` |
 
 ## Overrides
 

@@ -1,6 +1,7 @@
 #include "serve/generation_service.h"
 #include "serve/operational_log.h"
 #include "serve/props.h"
+#include "serve/serve_config_file.h"
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
@@ -242,6 +243,39 @@ int config_router_model_arguments() {
                      options.model_arguments == std::vector<std::string>{"--max-context", "4096",
                                                                          "--max-concurrency", "2"},
                  "config: router mode did not pass the file's options on to each model");
+}
+
+// The launchers' profiles (scripts/profiles/, shipped in both release archives): every file there
+// is a JSON profile with at least one option, and every key in it is a serve option this parser
+// takes, so a typo or a renamed flag fails here instead of at a user's first start.
+int shipped_profiles_parse() {
+    const std::filesystem::path directory =
+        std::filesystem::path(NINFER_SOURCE_DIR) / "scripts" / "profiles";
+    int failures = 0;
+    int profiles = 0;
+    if (std::filesystem::is_directory(directory)) {
+        for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+            const std::string name = entry.path().filename().string();
+            if (!entry.is_regular_file() || entry.path().extension() != ".json") {
+                std::cerr << "shipped profiles: " << name << " is not a .json file\n";
+                ++failures;
+                continue;
+            }
+            ++profiles;
+            try {
+                if (read_serve_config(entry.path()).words.empty()) {
+                    std::cerr << "shipped profiles: " << name << " sets no option\n";
+                    ++failures;
+                }
+                (void)parse({"ninfer-serve", "model.ninfer", "--config", entry.path().string()});
+            } catch (const std::invalid_argument& error) {
+                std::cerr << "shipped profiles: " << error.what() << '\n';
+                ++failures;
+            }
+        }
+    }
+    failures += check(profiles > 0, "shipped profiles: scripts/profiles/ holds no profile");
+    return failures;
 }
 
 } // namespace
@@ -1749,6 +1783,7 @@ int main() {
     failures += sources_recorded();
     failures += config_relative_paths_follow_cwd();
     failures += config_router_model_arguments();
+    failures += shipped_profiles_parse();
     std::filesystem::remove_all(config_directory());
 
     return failures == 0 ? 0 : 1;

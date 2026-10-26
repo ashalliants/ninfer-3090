@@ -71,7 +71,8 @@ API key blank.
 | `ninfer_bench` | throughput benchmark against the public Engine route |
 | `download-model.sh` | pinned, resumable artifact downloads with verification |
 | `run.sh` | serving profiles: `run.sh <model> [profile]` |
-| `SHA256SUMS.txt` | checksums for every file in this directory |
+| `profiles/` | each profile's fixed flags, as `ninfer-serve --config` files that `run.sh` passes |
+| `SHA256SUMS.txt` | checksums for every file in this directory and in `profiles/` |
 
 ## Overrides
 
