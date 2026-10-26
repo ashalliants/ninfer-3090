@@ -7,6 +7,8 @@
 
 #include "models/qwen4_exp/execution/forward.h"
 
+#include "core/side_stream_delay.h"
+
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/argmax_probability.h"
 #include "ninfer/ops/cast.h"
@@ -395,6 +397,7 @@ std::size_t Forward::max_shared_expert_scratch_bytes(std::int32_t columns) const
 Forward::SideFork::SideFork(const SideStream& side, cudaStream_t main, bool recorded) : side_(side), main_(main) {
     if (!recorded) { CUDA_CHECK(cudaEventRecord(side_.fork, main_)); }
     CUDA_CHECK(cudaStreamWaitEvent(side_.stream, side_.fork, 0));
+    delay_side_stream(side_.stream); // test-only (core/side_stream_delay.h); nothing by default
 }
 
 Forward::SideFork::~SideFork() {

@@ -27,6 +27,12 @@ ninfer_add_test(ninfer_host_flag_wait_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_flag_wait.cpp"
   LIBRARIES ninfer_core)
 
+# Host only: the test-only side-stream delay's variable (core/side_stream_delay.h), which the
+# side-stream identity gates use so a missing join diverges.
+ninfer_add_test(ninfer_side_stream_delay_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_side_stream_delay.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_device_buffer_visibility_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device_buffer_visibility.cu"
   LIBRARIES ninfer_core)

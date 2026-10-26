@@ -63,6 +63,7 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_scheduler_test
   ninfer_serve_config_file_test
   ninfer_serve_soak_test
+  ninfer_side_stream_delay_test
   ninfer_stderr_logging_check_test
   ninfer_stderr_logging_ratchet_test
   ninfer_tensor_test

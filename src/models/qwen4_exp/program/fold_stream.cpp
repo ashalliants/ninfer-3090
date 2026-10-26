@@ -1,6 +1,7 @@
 #include "models/qwen4_exp/program/fold_stream.h"
 
 #include "core/device.h"
+#include "core/side_stream_delay.h"
 
 namespace ninfer::models::qwen4_exp {
 
@@ -37,6 +38,7 @@ void GdnFoldStream::run(cudaStream_t main, const std::function<void(cudaStream_t
     // enqueue throws halfway.
     pending_ = true;
     try {
+        delay_side_stream(stream_); // test-only (core/side_stream_delay.h); nothing by default
         enqueue(stream_);
     } catch (...) {
         if (cudaEventRecord(done_, stream_) != cudaSuccess) { (void)cudaStreamSynchronize(stream_); }

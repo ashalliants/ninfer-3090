@@ -109,6 +109,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_serve_config_file_test
   ninfer_serve_soak_test
   ninfer_serve_options_test
+  ninfer_side_stream_delay_test
   ninfer_slots_report_test
   ninfer_stderr_logging_check_test
   ninfer_stderr_logging_ratchet_test

@@ -337,18 +337,29 @@ __global__ void __launch_bounds__(kDispatchThreads)
 // dispatch_small_kernel does, except that an entry's place within its expert is its rank among the
 // entries of that expert (the earlier entries routed to it), so each expert's entries are in
 // ascending entry index: offloaded_moe::plan_dispatch, independent of the order atomics resolve in.
+// 512 threads, not kDispatchThreads: at 1,024 the 64-register cap spilled route_column (48 bytes per
+// thread). 512 still gives every expert (the route serves at most 512) its scan thread, every entry
+// (at most 8 x 16) a thread and every column a warp. dispatch_scan reads all 32 warp totals, so the
+// 16 this CTA's warps never write are zeroed.
 constexpr int kRouteDispatchEntries = kMoeRouteDispatchColumns * 16; // top-16
+constexpr int kRouteDispatchThreads = 512;
+constexpr int kRouteDispatchWarps   = kRouteDispatchThreads / 32;
+static_assert(kRouteDispatchThreads >= 512 && kRouteDispatchEntries <= kRouteDispatchThreads &&
+                  kMoeRouteDispatchColumns <= kRouteDispatchWarps && kRouteDispatchWarps <= kDispatchThreads / 32,
+              "one CTA routes every column and dispatches every entry of up to 512 experts");
 
-__global__ void __launch_bounds__(kDispatchThreads)
+__global__ void __launch_bounds__(kRouteDispatchThreads)
     route_dispatch_kernel(const float* __restrict__ logits, int experts, int columns, int top_k, std::int32_t* ids,
                           float* __restrict__ weights, float* __restrict__ shared_gate, MoeDispatch dispatch,
                           std::int32_t* __restrict__ route_log) {
-    __shared__ std::int32_t count[kDispatchThreads];
-    __shared__ std::int32_t cursor[kDispatchThreads];
+    __shared__ std::int32_t count[kRouteDispatchThreads];
+    __shared__ std::int32_t cursor[kRouteDispatchThreads];
     __shared__ std::int32_t warp_totals[2][kDispatchThreads / 32];
     __shared__ std::int32_t routed[kRouteDispatchEntries];
     const int i = threadIdx.x, warp = i / 32;
     count[i]    = 0;
+    constexpr int kUnused = kDispatchThreads / 32 - kRouteDispatchWarps;
+    if (i < 2 * kUnused) { warp_totals[i / kUnused][kRouteDispatchWarps + i % kUnused] = 0; }
     if (warp < columns) { route_column(logits, experts, top_k, warp, i % 32, ids, weights, shared_gate); }
     // The barrier makes the CTA's global writes of the ids visible to every thread of the CTA.
     __syncthreads();
@@ -1395,9 +1406,7 @@ void moe_route_dispatch(const Tensor& logits, std::int32_t top_k, MoeRouting& ro
         moe_dispatch(routing, experts, dispatch, route_log, stream);
         return;
     }
-    static_assert(kRouteDispatchEntries <= kDispatchThreads && kMoeRouteDispatchColumns <= kDispatchThreads / 32,
-                  "one CTA routes every column and dispatches every entry");
-    route_dispatch_kernel<<<1, kDispatchThreads, 0, stream>>>(
+    route_dispatch_kernel<<<1, kRouteDispatchThreads, 0, stream>>>(
         static_cast<const float*>(logits.data), experts, columns, top_k, static_cast<std::int32_t*>(routing.ids.data),
         static_cast<float*>(routing.weights.data), static_cast<float*>(routing.shared_gate.data), dispatch, route_log);
     check_launch("route and dispatch");

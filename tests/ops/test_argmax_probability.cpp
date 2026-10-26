@@ -136,16 +136,19 @@ std::vector<float> make_logits(std::int32_t physical_rows, std::int32_t valid_ro
     return logits;
 }
 
-// Seven columns of non-finite logits over noise:
+// Eight columns of non-finite or extreme logits over noise:
 //   0: every valid row NaN (row 0, probability NaN);
 //   1: NaN at row 0, a finite peak elsewhere (row 0, as ops::argmax; NaN);
 //   2: NaN at a middle row, a finite peak elsewhere (the peak; NaN);
 //   3: a run of -inf rows covering whole tiles, a finite peak (the peak; finite);
 //   4: every valid row -inf (row 0; NaN);
 //   5: +inf at one row (that row; NaN);
-//   6: a finite logit whose BF16 rounding overflows to +inf (that row; the probability is 1).
+//   6: a finite logit whose BF16 rounding overflows to +inf (that row; the probability is 1);
+//   7: a finite maximum and a finite row so far below it that l - max overflows FP32 to -inf
+//      (the maximum's row; the probability is 1, not NaN: that row's term is 0).
+constexpr std::int32_t kNonfiniteColumns = 8;
 std::vector<float> make_nonfinite_logits(std::int32_t physical_rows, std::int32_t valid_rows) {
-    constexpr std::int32_t kColumns = 7;
+    constexpr std::int32_t kColumns = kNonfiniteColumns;
     std::vector<float> logits(static_cast<std::size_t>(physical_rows) * kColumns);
     for (std::int32_t t = 0; t < kColumns; ++t) {
         const std::size_t base = static_cast<std::size_t>(t) * physical_rows;
@@ -171,7 +174,11 @@ std::vector<float> make_nonfinite_logits(std::int32_t physical_rows, std::int32_
         }
         case 4: std::fill_n(logits.begin() + static_cast<std::ptrdiff_t>(base), valid_rows, -kInf); break;
         case 5: logits[base + middle] = kInf; break;
-        default: logits[base + middle] = 3.4e38f; break;
+        case 6: logits[base + middle] = 3.4e38f; break;
+        default:
+            logits[base + middle] = 3.0e38f;
+            logits[base + peak]   = -3.0e38f;
+            break;
         }
     }
     return logits;
@@ -274,7 +281,8 @@ int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t c
 int run_nonfinite_case(std::int32_t physical_rows, std::int32_t valid_rows) {
     const std::string label = "argmax_probability non-finite rows=" + std::to_string(physical_rows) +
                               " valid=" + std::to_string(valid_rows);
-    return run_logits(label, make_nonfinite_logits(physical_rows, valid_rows), physical_rows, valid_rows, 7, nullptr);
+    return run_logits(label, make_nonfinite_logits(physical_rows, valid_rows), physical_rows, valid_rows,
+                      kNonfiniteColumns, nullptr);
 }
 
 template <class Function>

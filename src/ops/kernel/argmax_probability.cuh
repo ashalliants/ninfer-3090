@@ -82,12 +82,14 @@ __device__ __forceinline__ void argmax_probability_block_winner(float& key, std:
 }
 
 // exp(logit - maximum) for logit <= maximum: expf of the FP32-rounded difference, corrected by the
-// difference's rounding residual (exp(d + r) ~ exp(d) (1 + r)). -inf contributes 0; NaN, and +inf
+// difference's rounding residual (exp(d + r) ~ exp(d) (1 + r)). -inf contributes 0, and so does a
+// finite logit whose difference overflows FP32 to -inf (its residual would be NaN); NaN, and +inf
 // (inf - inf), give NaN.
 __device__ __forceinline__ float argmax_probability_term(float logit, float maximum) {
     if (logit == -CUDART_INF_F) { return 0.0f; }
     const float negated  = -maximum;
     const float d        = logit + negated;
+    if (d == -CUDART_INF_F) { return 0.0f; }
     const float virtual_ = d - logit;
     const float residual = (logit - (d - virtual_)) + (negated - virtual_);
     const float e        = expf(d);
