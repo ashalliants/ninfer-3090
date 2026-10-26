@@ -11,6 +11,10 @@ if(NOT _version)
 endif()
 
 set(NINFER_BUILD_VERSION "${_version}")
+# The commit and dirty state on their own, for a record that must name its exact source even when
+# the version string is a bare release tag.
+set(NINFER_BUILD_COMMIT "")
+set(NINFER_BUILD_DIRTY "false")
 find_package(Git QUIET)
 # .git is a directory in a checkout and a file in a worktree; a git archive has neither.
 if(GIT_FOUND AND EXISTS "${SRC_DIR}/.git")
@@ -19,6 +23,7 @@ if(GIT_FOUND AND EXISTS "${SRC_DIR}/.git")
     OUTPUT_VARIABLE _commit OUTPUT_STRIP_TRAILING_WHITESPACE
     RESULT_VARIABLE _commit_status ERROR_QUIET)
   if(_commit_status EQUAL 0 AND _commit)
+    set(NINFER_BUILD_COMMIT "${_commit}")
     execute_process(
       COMMAND "${GIT_EXECUTABLE}" -C "${SRC_DIR}" describe --tags --exact-match HEAD
       OUTPUT_VARIABLE _tag OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -31,6 +36,7 @@ if(GIT_FOUND AND EXISTS "${SRC_DIR}/.git")
     endif()
     if(_dirty)
       string(APPEND NINFER_BUILD_VERSION "-dirty")
+      set(NINFER_BUILD_DIRTY "true")
     endif()
   endif()
 endif()

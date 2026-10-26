@@ -11,6 +11,7 @@
 set(NINFER_HOST_ONLY_TESTS
   ninfer_a4_g64_reference_test
   ninfer_artifact_reader_test
+  ninfer_bench_rows_check_test
   ninfer_chat_templates_test
   ninfer_chunked_reservation_test
   ninfer_cli_options_test

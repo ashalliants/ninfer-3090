@@ -53,6 +53,9 @@ struct Nvml::Impl {
         temperature  = reinterpret_cast<int (*)(void*, unsigned, unsigned*)>(symbol("nvmlDeviceGetTemperature"));
         power        = reinterpret_cast<int (*)(void*, unsigned*)>(symbol("nvmlDeviceGetPowerUsage"));
         energy       = reinterpret_cast<int (*)(void*, unsigned long long*)>(symbol("nvmlDeviceGetTotalEnergyConsumption"));
+        power_limit  = reinterpret_cast<int (*)(void*, unsigned*)>(symbol("nvmlDeviceGetEnforcedPowerLimit"));
+        pcie_max_gen = reinterpret_cast<int (*)(void*, unsigned*)>(symbol("nvmlDeviceGetMaxPcieLinkGeneration"));
+        pcie_width   = reinterpret_cast<int (*)(void*, unsigned*)>(symbol("nvmlDeviceGetCurrPcieLinkWidth"));
         if (init == nullptr || shutdown == nullptr || by_pci == nullptr || init() != 0) {
             release();
             return;
@@ -91,6 +94,9 @@ struct Nvml::Impl {
     int (*temperature)(void*, unsigned, unsigned*) = nullptr;
     int (*power)(void*, unsigned*)                 = nullptr;
     int (*energy)(void*, unsigned long long*)      = nullptr; // millijoules
+    int (*power_limit)(void*, unsigned*)           = nullptr; // milliwatts
+    int (*pcie_max_gen)(void*, unsigned*)          = nullptr;
+    int (*pcie_width)(void*, unsigned*)            = nullptr;
     void* device                                   = nullptr;
     bool initialized                               = false;
 };
@@ -150,7 +156,21 @@ GpuSample Nvml::sample() const {
         unsigned long long millijoules = 0;
         if (impl_->energy(device, &millijoules) == 0) { sample.energy_joules = static_cast<double>(millijoules) / 1000.0; }
     }
+    if (impl_->power_limit != nullptr) {
+        unsigned milliwatts = 0;
+        if (impl_->power_limit(device, &milliwatts) == 0) { sample.power_limit_watts = milliwatts / 1000.0; }
+    }
     return sample;
+}
+
+std::optional<PcieLink> Nvml::pcie_link() const {
+    if (!available() || impl_->pcie_max_gen == nullptr || impl_->pcie_width == nullptr) { return std::nullopt; }
+    PcieLink link;
+    if (impl_->pcie_max_gen(impl_->device, &link.max_generation) != 0 ||
+        impl_->pcie_width(impl_->device, &link.width) != 0) {
+        return std::nullopt;
+    }
+    return link;
 }
 
 } // namespace ninfer

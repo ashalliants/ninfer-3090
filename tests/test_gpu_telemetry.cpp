@@ -52,6 +52,18 @@ int fake_power(void*, unsigned* out) {
     *out = 312500; // milliwatts
     return 0;
 }
+int fake_power_limit(void*, unsigned* out) {
+    *out = 287500; // milliwatts: a card capped below its default
+    return 0;
+}
+int fake_pcie_generation(void*, unsigned* out) {
+    *out = 4;
+    return 0;
+}
+int fake_pcie_width(void*, unsigned* out) {
+    *out = 16;
+    return 0;
+}
 
 std::map<std::string, void*> full_table() {
     return {{"nvmlInit_v2", reinterpret_cast<void*>(&fake_init)},
@@ -60,7 +72,10 @@ std::map<std::string, void*> full_table() {
             {"nvmlDeviceGetUtilizationRates", reinterpret_cast<void*>(&fake_utilization)},
             {"nvmlDeviceGetMemoryInfo", reinterpret_cast<void*>(&fake_memory)},
             {"nvmlDeviceGetTemperature", reinterpret_cast<void*>(&fake_temperature)},
-            {"nvmlDeviceGetPowerUsage", reinterpret_cast<void*>(&fake_power)}};
+            {"nvmlDeviceGetPowerUsage", reinterpret_cast<void*>(&fake_power)},
+            {"nvmlDeviceGetEnforcedPowerLimit", reinterpret_cast<void*>(&fake_power_limit)},
+            {"nvmlDeviceGetMaxPcieLinkGeneration", reinterpret_cast<void*>(&fake_pcie_generation)},
+            {"nvmlDeviceGetCurrPcieLinkWidth", reinterpret_cast<void*>(&fake_pcie_width)}};
 }
 
 GpuSymbolLookup lookup_in(std::map<std::string, void*> table) {
@@ -101,6 +116,11 @@ int main() {
         check(sample.temperature_celsius == 71u, "temperature decoded wrongly");
         check(sample.power_watts && *sample.power_watts == 312.5,
               "power must convert milliwatts to watts");
+        check(sample.power_limit_watts && *sample.power_limit_watts == 287.5,
+              "the enforced power limit must convert milliwatts to watts");
+        const auto link = telemetry.pcie_link();
+        check(link && link->max_generation == 4u && link->width == 16u,
+              "the PCIe link must report the maximum generation and the current width");
     }
     check(g_shutdown_calls == 1, "destroying the sampler must call nvmlShutdown once");
 
@@ -118,11 +138,14 @@ int main() {
         auto table = full_table();
         table.erase("nvmlDeviceGetPowerUsage");
         table.erase("nvmlDeviceGetMemoryInfo");
+        table.erase("nvmlDeviceGetEnforcedPowerLimit");
+        table.erase("nvmlDeviceGetCurrPcieLinkWidth");
         Nvml telemetry("x", lookup_in(table));
         const GpuSample sample = telemetry.sample();
         check(telemetry.available() && !sample.power_watts && !sample.memory_used_bytes &&
-                  sample.utilization_percent,
+                  !sample.power_limit_watts && sample.utilization_percent,
               "missing optional symbols must only drop their fields");
+        check(!telemetry.pcie_link(), "a PCIe link missing either half must be unknown");
     }
 
     for (const char* required :
@@ -131,7 +154,8 @@ int main() {
         auto table = full_table();
         table.erase(required);
         Nvml telemetry("x", lookup_in(table));
-        check(!telemetry.available() && !telemetry.sample().utilization_percent,
+        check(!telemetry.available() && !telemetry.sample().utilization_percent &&
+                  !telemetry.sample().power_limit_watts && !telemetry.pcie_link(),
               "a missing required symbol must leave the sampler unavailable");
     }
 

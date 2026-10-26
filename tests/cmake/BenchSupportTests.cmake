@@ -1,4 +1,5 @@
-ninfer_add_test(ninfer_bench_support_test
+# NEEDS_SOURCE_DIR: the community preset's checks read the committed corpus and chat prompts.
+ninfer_add_test(ninfer_bench_support_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_ninfer_bench_support.cpp"
           ${PROJECT_SOURCE_DIR}/bench/inference/ninfer_bench_support.cpp
   LIBRARIES ninfer_engine ninfer::json)
@@ -69,3 +70,9 @@ if(UNIX)
   add_test(NAME ninfer_vast_up_test
     COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/scripts/vast/test_vast_up.py)
 endif()
+
+# The community rows checker's self-test (tools/bench/check_bench_rows.py): a good file passes, each
+# malformed row fails, --fix rewrites the house format, and the committed bench/community/rows.json
+# passes. Pure Python, no GPU.
+add_test(NAME ninfer_bench_rows_check_test
+  COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/bench/check_bench_rows.py --self-test)
