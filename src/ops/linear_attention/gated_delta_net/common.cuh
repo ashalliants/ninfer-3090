@@ -114,7 +114,8 @@ struct head_map {
 
     NINFER_KERNELS_HOST_DEVICE int qk_head(int h_v) const {
 #if defined(__CUDA_ARCH__)
-        const int quotient = static_cast<int>(fastdiv(static_cast<std::uint32_t>(h_v), group_magic));
+        const int quotient =
+            static_cast<int>(fastdiv(static_cast<std::uint32_t>(h_v), group_magic));
         if constexpr (Map == GdnHeadMap::Tiled) { return h_v - quotient * H_qk; }
         return quotient;
 #else

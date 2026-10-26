@@ -63,7 +63,8 @@ void projection_fp32(const Tensor& x, const Weight& weight, Tensor& out, cudaStr
                 weight.group == static_cast<std::int32_t>(block.values) &&
                 weight.padded_shape[0] == weight.n && weight.padded_shape[1] == weight.k &&
                 reinterpret_cast<std::uintptr_t>(weight.qdata) % head_alignment(weight.qtype) == 0,
-            "the weight must be a ggml_blocks_v1 IQ4_XS (8-byte aligned), Q6_K or Q5_K (16-byte aligned) matrix");
+            "the weight must be a ggml_blocks_v1 IQ4_XS (8-byte aligned), Q5_K (16-byte aligned) or Q6_K "
+            "(2-byte aligned) matrix");
     const std::int32_t k = x.ne[0], columns = x.ne[1], rows = weight.n;
     require(weight.k == kHeadK && k == kHeadK && rows > 0 && columns > 0, "the GGML head form serves K = 2560");
     // The decode kernel gives a warp whole groups of rows.

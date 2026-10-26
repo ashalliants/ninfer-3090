@@ -58,8 +58,8 @@ void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Te
  *   x BF16 [K, T]; weight [N, K]; out FP32 [N, T]. T >= 1.
  *
  * Supported domain:
- *   QType::GGML_IQ4_XS (8-byte aligned rows), GGML_Q6_K or GGML_Q5_K (16-byte aligned rows) in the
- *   ggml_blocks_v1 layout with K = 2560 and N even;
+ *   QType::GGML_IQ4_XS (8-byte aligned rows), GGML_Q5_K (16-byte aligned rows) or GGML_Q6_K
+ *   (2-byte aligned rows) in the ggml_blocks_v1 layout with K = 2560 and N even;
  *   x and out contiguous, x 16-byte aligned.
  *
  * Numeric:

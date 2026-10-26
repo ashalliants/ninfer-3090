@@ -155,7 +155,8 @@ void launch_prepare(const Arguments& args, QkChunk* qk, ControlChunk* control, b
                                                   chunk_count(args.tokens));
     if (map == GdnHeadMap::Tiled) {
         if (!normalize_qk) {
-            throw std::invalid_argument("GDN chunked prepare: the tiled head map needs normalized q/k");
+            throw std::invalid_argument(
+                "GDN chunked prepare: the tiled head map needs normalized q/k");
         }
         prepare_kernel<true, GdnHeadMap::Tiled><<<blocks, 256, 0, stream>>>(args, qk, control);
     } else if (normalize_qk)

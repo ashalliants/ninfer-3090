@@ -173,10 +173,11 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
             state[ni][mi][3] = args.state_in[state_base + (value + 1) * kStateDim + key + 8];
         }
     }
-    load_stage<DV, Map>(sm.stage[0], args, qk_workspace, control_workspace, head, value_start, 0, tid);
+    load_stage<DV, Map>(sm.stage[0], args, qk_workspace, control_workspace, head, value_start, 0,
+                        tid);
     if (chunks > 1)
-        load_stage<DV, Map>(sm.stage[1], args, qk_workspace, control_workspace, head, value_start, 1,
-                       tid);
+        load_stage<DV, Map>(sm.stage[1], args, qk_workspace, control_workspace, head, value_start,
+                            1, tid);
 
     for (int chunk = 0; chunk < chunks; ++chunk) {
         if (chunk + 1 < chunks)
@@ -405,7 +406,9 @@ void launch_mapped(const Arguments& args, const QkChunk* qk, const ControlChunk*
 
 void launch_recurrence(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
                        DeviceExecutionView execution, GdnHeadMap map) {
-    if (map == GdnHeadMap::Tiled) { return launch_mapped<GdnHeadMap::Tiled>(args, qk, control, execution); }
+    if (map == GdnHeadMap::Tiled) {
+        return launch_mapped<GdnHeadMap::Tiled>(args, qk, control, execution);
+    }
     launch_mapped<GdnHeadMap::Blocked>(args, qk, control, execution);
 }
 

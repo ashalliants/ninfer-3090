@@ -84,9 +84,12 @@ inline bool ledger_in_tool_call(std::span<const std::int32_t> ids, std::int32_t 
 }
 
 // The added-token floor from the tokenizer's added-token ids: the lowest of them, which every
-// drafted id is compared against. The comparison is only right when the added ids are one
-// contiguous run from the floor (no ordinary token sits between two added ones), so anything else
-// is refused: relaxed drafting would otherwise relax a control token or a tool tag.
+// drafted id is compared against. Every added id is at or above the floor, so no control token or
+// tool tag is ever relaxed, whatever the layout. The refusal is about the other side: the rule
+// treats every id from the floor on as an added token, which is exact only when the added ids are
+// one contiguous run (no ordinary token between two added ones). A gap would silently end
+// eligibility at ordinary tokens inside it, so such a tokenizer is refused rather than served by
+// a rule that does not say what it does.
 inline std::int32_t added_token_floor(std::span<const std::int32_t> added_ids) {
     std::vector<std::int32_t> ids(added_ids.begin(), added_ids.end());
     std::sort(ids.begin(), ids.end());

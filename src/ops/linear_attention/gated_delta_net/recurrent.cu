@@ -53,7 +53,8 @@ void launch_recurrent_direct_fixed(const Tensor& q, const Tensor& k, const Tenso
                 return;
             }
         }
-        throw std::invalid_argument("GDN recurrent: the tiled head map needs normalized q/k and an FP32 state");
+        throw std::invalid_argument(
+            "GDN recurrent: the tiled head map needs normalized q/k and an FP32 state");
     }
     if (state_read.dtype == DType::FP16) {
         launch_recurrent_direct_typed<NormalizeQK, __half, GdnHeadMap::Blocked>(
@@ -106,8 +107,8 @@ void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const
         if constexpr (NormalizeInputs) {
             if (ssm_states.dtype == DType::FP32) {
                 launch_recurrent_batch_update_typed<true, float, GdnHeadMap::Tiled>(
-                    q, k, v, g, beta, scale, ssm_states, source_state_slots, destination_state_slots,
-                    out, stream);
+                    q, k, v, g, beta, scale, ssm_states, source_state_slots,
+                    destination_state_slots, out, stream);
                 return;
             }
         }
@@ -298,7 +299,8 @@ void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAll
             records.spec.conv_channels == FoldGeometry16x48Tiled::kConvChannels) {
             // Instantiated for Qwen3.8-Flash-Next's FP32 state only.
             if (states.recurrent_layer0.dtype != DType::FP32) {
-                throw std::invalid_argument("GDN replay fold: the tiled head map needs an FP32 state");
+                throw std::invalid_argument(
+                    "GDN replay fold: the tiled head map needs an FP32 state");
             }
             launch_replay_fold_typed<FoldGeometry16x48Tiled, float>(records, states, rows,
                                                                     active_rows, stream);

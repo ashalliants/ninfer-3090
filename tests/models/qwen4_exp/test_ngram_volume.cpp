@@ -182,8 +182,23 @@ void check_window_rows() {
     check(anchor.size() == hash.heads() && std::equal(anchor.begin(), anchor.end(), whole.begin()),
           "the anchor column's rows are the window's first heads");
     check(whole.size() == 3U * hash.heads(), "a window has width * heads rows");
-    // Out of the sequence.
     bool threw = false;
+    // The output-span form (the Program's per-token path) writes the same ids, whatever its kept
+    // scratch held before, and refuses an output of the wrong size.
+    std::vector<std::int32_t> window{99, 98, 97, 96, 95, 94, 93};
+    std::vector<std::uint32_t> out(3U * hash.heads(), 0xFFFFFFFFU);
+    q4::ngram_window_rows(hash, head3, drafts, 2, 3, window, out);
+    check(out == whole, "the output-span form equals the vector form");
+    std::vector<std::uint32_t> one(hash.heads());
+    q4::ngram_window_rows(hash, history, none, 0, 1, window, one);
+    check(one == rows(history, none, 0, 1), "a reused scratch window starts afresh (EOS padding)");
+    threw = false;
+    try {
+        q4::ngram_window_rows(hash, history, none, 0, 2, window, one);
+    } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "an output of the wrong size throws");
+    // Out of the sequence.
+    threw = false;
     try { (void)rows(head3, drafts, 3, 3); } catch (const std::invalid_argument&) { threw = true; }
     check(threw, "columns past the sequence throw");
     threw = false;

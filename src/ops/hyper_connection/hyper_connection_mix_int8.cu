@@ -25,10 +25,10 @@
 // of x (one A8 group per column) to A8. The other instances are unchanged.
 
 #include "ops/common/canonical_ggml.h"
-#include "ops/linear/ggml/ggml_blocks.cuh"
 #include "ops/hyper_connection/hc_int8_codec.h"
 #include "ops/hyper_connection/hyper_connection_mix_fused.h"
 #include "ops/hyper_connection/hyper_connection_mix_kernels.cuh"
+#include "ops/linear/ggml/ggml_blocks.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

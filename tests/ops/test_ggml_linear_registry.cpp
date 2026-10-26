@@ -2,7 +2,8 @@
 // Qwen3.8-Flash-Next GGUF packs it serves: every (tensor family, format) of each pack is a
 // registered Linear problem (and LinearAdd for the residual projections), every ordered format
 // pair of the two-projection families is a registered linear_pair problem, every output head
-// format is a registered projection_fp32 head, and no registered linear problem is unused.
+// format is a registered projection_fp32 head, every token embedding format a registered embedding
+// table form, and no registered linear problem, head or embedding format is unused.
 //
 // The table mirrors the packs' published tensor allocations (ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-
 // RCO-GGUF tensor-allocation/*.rco-allocation.txt for the IQ3_S and IQ3_XXS packs; the IQ2_XS pack
@@ -12,10 +13,15 @@
 #include "core/weight.h"
 #include "ops/linear/ggml/ggml_shapes.h"
 
+#include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <initializer_list>
 #include <iostream>
+#include <iterator>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -150,6 +156,13 @@ int run() {
                      ": no projection_fp32 head");
             }
         }
+        if (pack.token_embedding.empty()) { fail(std::string(pack.name) + " lists no token embedding"); }
+        for (const QType format : pack.token_embedding) {
+            if (!d::ggml_embedding_registered(format)) {
+                fail(std::string(pack.name) + " token embedding format " +
+                     std::to_string(static_cast<int>(format)) + ": no embedding table form");
+            }
+        }
     }
     // Closed in the other direction: every registered problem is some pack's tensor.
     for (const auto& shape : d::kGgmlLinearShapes) {
@@ -178,9 +191,19 @@ int run() {
         }
         if (!used) { fail("head format " + std::to_string(static_cast<int>(format)) + " is no pack's head"); }
     }
+    for (const QType format : d::kGgmlEmbeddingFormats) {
+        bool used = false;
+        for (const auto& pack : kPacks) {
+            for (const QType f : pack.token_embedding) used = used || f == format;
+        }
+        if (!used) {
+            fail("embedding format " + std::to_string(static_cast<int>(format)) + " is no pack's embedding");
+        }
+    }
     // A format outside the registry is refused at a registered shape.
     if (d::ggml_linear_registered(QType::GGML_IQ2_XS, 640, 2560, false) ||
-        d::ggml_pair_registered(QType::GGML_Q8_0, QType::GGML_Q8_0, 640, 2560) || d::ggml_head_registered(Q80)) {
+        d::ggml_pair_registered(QType::GGML_Q8_0, QType::GGML_Q8_0, 640, 2560) || d::ggml_head_registered(Q80) ||
+        d::ggml_embedding_registered(Q6K)) {
         fail("an unregistered format is admitted");
     }
     if (failures == 0) {

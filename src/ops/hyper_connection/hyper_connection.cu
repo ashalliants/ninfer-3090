@@ -15,6 +15,11 @@
 #include <string>
 
 namespace ninfer::ops {
+
+// The int8 form exists only on the fused route: the public cap is that route's.
+static_assert(kHcInt8MaxColumns == detail::kHcMixFusedMaxColumns,
+              "--hc-int8 serves exactly the columns the fused route serves");
+
 namespace {
 
 using bf16 = __nv_bfloat16;

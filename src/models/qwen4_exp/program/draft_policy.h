@@ -42,8 +42,9 @@ inline int ema_draft_length(std::span<const double> accept, int limit, double wi
 }
 
 // Basalt draft_cum_acc: the observed acceptance rate of a draft whose probability falls in each bin.
+// A NaN probability (no ordering) maps to the floor, as a probability below 0.30 does.
 inline float joint_acceptance_table(float p) {
-    return p < 0.30f ? 0.12f
+    return !(p >= 0.30f) ? 0.12f
          : p < 0.50f ? 0.26f
          : p < 0.70f ? 0.43f
          : p < 0.80f ? 0.51f
@@ -81,10 +82,15 @@ inline int joint_acceptance_window(std::span<const float> probs, float threshold
 // when they are accepted less often. The observed and expected accepted counts decay by 0.97 per
 // window; their ratio sets the threshold along a linear ramp from 0.9 (at base) to 1.1 (at low).
 // The value for a window is read before its drafts are made.
+//
+// current() starts at the default `base` (0.35) and moves only in observe(): setting `base` or `low`
+// after construction does not move current() until the next observe() with evidence.
 class JointAcceptanceThreshold {
 public:
-    float base = 0.35f; // the threshold while nothing is known
-    float low  = 0.25f; // the threshold's floor
+    float base = 0.35f;     // the threshold while nothing is known
+    float low  = 0.25f;     // the threshold's floor
+    double observed = 0.0;  // decayed accepted drafts
+    double expected = 0.0;  // decayed accepted drafts the table predicts
 
     float current() const noexcept { return current_; }
 
@@ -98,18 +104,16 @@ public:
             chain *= static_cast<double>(joint_acceptance_table(p));
             expected_now += chain;
         }
-        obs = obs * kDecay + static_cast<double>(accepted);
-        exp = exp * kDecay + expected_now;
-        if (exp < 0.5) { return; }
-        const double t = std::fmin(std::fmax((obs / exp - kRampLow) / (kRampHigh - kRampLow), 0.0), 1.0);
-        current_       = base + static_cast<float>(t) * (std::fmin(low, base) - base);
+        observed = observed * kDecay + static_cast<double>(accepted);
+        expected = expected * kDecay + expected_now;
+        if (expected < 0.5) { return; }
+        const double ratio = observed / expected;
+        const double t     = std::fmin(std::fmax((ratio - kRampLow) / (kRampHigh - kRampLow), 0.0), 1.0);
+        current_           = base + static_cast<float>(t) * (std::fmin(low, base) - base);
     }
 
-    double obs = 0.0; // decayed accepted drafts
-    double exp = 0.0; // decayed accepted drafts the table predicts
-
 private:
-    float current_ = base; // moves only once observe has evidence (exp >= 0.5)
+    float current_ = base; // moves only once observe has evidence (expected >= 0.5)
 };
 
 } // namespace ninfer::models::qwen4_exp
