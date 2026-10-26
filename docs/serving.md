@@ -721,7 +721,10 @@ the budget is spent:
 ```
 
 `unsaved` counts conversations still not stored (one in use by a request is not counted until it
-ends) and `uploaded` is false when the uploads did not all finish. It answers 409
+ends) and `uploaded` is false when the uploads did not all finish. The answer describes the store
+as of when the flush finished: writes made while it ran (an eviction's, say) are uploaded by it,
+but a turn that ends after it answers is not, so stop routing new turns to the box first and call
+the flush again if `unsaved` is not zero. It answers 409
 `context_store_off` without `--context-store`. A gateway calls it when it starts draining a box it
 will destroy, or before it moves conversations elsewhere: the next box then finds them in the
 bucket. With that in place a fleet can trade freshness for traffic: a long

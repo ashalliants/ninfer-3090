@@ -479,11 +479,23 @@ public:
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         });
-        // A write still in progress at the deadline has not reached the bucket's queue: say so.
-        const bool written_out = store_queue_idle();
         // Every image the bucket may lack goes now: those still waiting out their delay, and any
-        // whose upload was given up when the queue was full.
-        report.uploaded = store->upload_unpublished(deadline) && written_out;
+        // whose upload was given up when the queue was full. Serving goes on meanwhile, and a write
+        // (an eviction's, say) can land while the uploads run: those are uploaded too, a pass at a
+        // time, until a pass ends with the writer idle. The answer describes the store as of that
+        // moment; a write that starts after it is not this flush's (the gateway stops routing to
+        // the box first).
+        for (;;) {
+            while (!store_queue_idle() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            report.uploaded = store->upload_unpublished(deadline);
+            if (store_queue_idle() || std::chrono::steady_clock::now() >= deadline) {
+                // A write still queued or in progress at the deadline has not reached the bucket.
+                report.uploaded = report.uploaded && store_queue_idle();
+                break;
+            }
+        }
         // As things stand now: a turn that ended while the uploads ran is not in this flush.
         with_generation([&](auto& generation) { report.unsaved = generation.unsaved_store_sessions(); });
         report.written  = store->stats().puts - puts;
