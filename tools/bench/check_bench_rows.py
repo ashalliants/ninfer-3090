@@ -56,8 +56,10 @@ def is_whole(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+# The same text rules as ninfer_bench's (format_community_row and --submitter): only U+0020 is
+# trimmed for the blank check, and the length counts every character, spaces included.
 def is_text(value, limit: int) -> bool:
-    return (isinstance(value, str) and value.strip() != "" and len(value) <= limit
+    return (isinstance(value, str) and value.strip(" ") != "" and len(value) <= limit
             and not CONTROL.search(value))
 
 
@@ -94,7 +96,7 @@ def check_row(row, where: str, problems: list[str]) -> None:
         if not is_text(submitter, SUBMITTER_MAX):
             problems.append(f"{where}submitter must be text of at most {SUBMITTER_MAX} characters,"
                             " without control characters")
-        elif submitter.strip().upper() == PLACEHOLDER:
+        elif submitter.strip(" ").isascii() and submitter.strip(" ").upper() == PLACEHOLDER:
             problems.append(f"{where}submitter is still the placeholder {PLACEHOLDER}")
     if "date" in row:
         date = row["date"]
@@ -178,6 +180,24 @@ def house_format(data) -> str:
     return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
 
+def reject_constant(name: str):
+    raise ValueError(f"{name} is not a JSON number")
+
+
+def reject_duplicates(pairs):
+    keys = [key for key, _ in pairs]
+    for key in keys:
+        if keys.count(key) > 1:
+            raise ValueError(f"duplicate key '{key}'")
+    return dict(pairs)
+
+
+# Strict JSON: Python's parser takes NaN and Infinity and keeps the last of two equal keys, and
+# --fix would then write a file whose values differ from the one it read.
+def parse(text: str):
+    return json.loads(text, parse_constant=reject_constant, object_pairs_hook=reject_duplicates)
+
+
 def main(argv: list[str]) -> int:
     args = list(argv)
     fix = "--fix" in args
@@ -189,7 +209,7 @@ def main(argv: list[str]) -> int:
     try:
         with open(path, encoding="utf-8", newline="") as handle:
             text = handle.read()
-        data = json.loads(text)
+        data = parse(text)
     except (OSError, ValueError) as error:
         print(f"{path}: {error}")
         return 1
@@ -291,6 +311,13 @@ def self_test() -> int:
             ("a boolean rate", lambda r: {**r, "decode_tps": True}, "decode_tps must be a number > 0"),
             ("two decimals", lambda r: {**r, "prefill_16k_tps": 2345.67}, "at most one decimal"),
             ("long notes", lambda r: {**r, "notes": "n" * 201}, "notes must be"),
+            ("a space-only submitter", lambda r: {**r, "submitter": "   "}, "submitter must be"),
+            ("a spaced placeholder", lambda r: {**r, "submitter": "  YOUR_NAME "}, "placeholder"),
+            ("a 41-character submitter with a space", lambda r: {**r, "submitter": " " + "a" * 40},
+             "at most 40 characters"),
+            ("an 81-character model", lambda r: {**r, "model": "m" * 81}, "model must be"),
+            ("an 81-character CPU", lambda r: {**r, "cpu": "c" * 81}, "cpu must be"),
+            ("a model with a newline", lambda r: {**r, "model": "a\nb"}, "model must be"),
         ]
         for name, mutate, expected in malformed:
             write(path, house_format({"preset": PRESET, "runs": [mutate(good_row())]}))
@@ -331,9 +358,30 @@ def self_test() -> int:
             code, out = run(path)
             check(code == 0, f"{name} must pass after --fix: {out}")
 
-        write(path, "{not json")
-        code, out = run(path, "--fix")
-        check(code == 1 and read(path) == "{not json", "--fix must leave a file that is not JSON alone")
+        # Accepted by the same rules ninfer_bench applies (tests/test_ninfer_bench_support.cpp).
+        for name, change in [
+            ("a padded submitter", {"submitter": "  Ash  "}),
+            ("a 40-character submitter with a space", {"submitter": " " + "a" * 39}),
+            ("a non-ASCII space submitter", {"submitter": "\u3000"}),
+            ("an 80-character model and CPU", {"model": "m" * 80, "cpu": "c" * 80}),
+        ]:
+            write(path, house_format({"preset": PRESET, "runs": [{**good_row(), **change}]}))
+            code, out = run(path)
+            check(code == 0, f"{name} must pass: {out}")
+
+        good_text = house_format(good)
+        for text in ["{not json",
+                     '{"preset": "community-1", "runs": [], "runs": []}\n',
+                     good_text.replace('"ram_gib": 64,', '"ram_gib": 64, "ram_gib": 32,'),
+                     good_text.replace('"decode_tps": 41.0', '"decode_tps": NaN', 1),
+                     good_text.replace('"decode_tps": 41.0', '"decode_tps": Infinity', 1),
+                     good_text.replace('"decode_tps": 41.0', '"decode_tps": -Infinity', 1)]:
+            write(path, text)
+            code, out = run(path, "--fix")
+            check(code == 1 and read(path) == text,
+                  f"--fix must leave a file that is not strict JSON alone: {out}")
+            check("duplicate key" in out or "not a JSON number" in out or "Expecting" in out,
+                  f"the reason must be given: {out}")
 
         check(run(os.path.join(directory, "missing.json"))[0] == 1, "a missing file must fail")
 
