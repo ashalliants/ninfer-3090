@@ -748,12 +748,13 @@ private:
     bool enqueue_store_write(CheckpointImage&& image, StoreWrite kind) {
         std::unique_lock lock(writer_mutex);
         if (writer_stop) { return false; } // shutting down: the final flush writes it instead
+        // The memory the queue holds: a reused export buffer can be larger than its image.
         std::size_t queued_bytes = 0;
-        for (const auto& pending : pending_writes) { queued_bytes += pending.image.bytes.size(); }
+        for (const auto& pending : pending_writes) { queued_bytes += pending.image.bytes.capacity(); }
         const bool full =
             kind == StoreWrite::Eviction
                 ? !pending_writes.empty() &&
-                      queued_bytes + image.bytes.size() > kMaximumPendingEvictionBytes
+                      queued_bytes + image.bytes.capacity() > kMaximumPendingEvictionBytes
                 : pending_writes.size() >= kMaximumPendingStoreWrites;
         if (full) {
             store_dropped.fetch_add(1, std::memory_order_relaxed);
