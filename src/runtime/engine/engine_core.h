@@ -8,6 +8,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
+#include "runtime/engine/lossy_prefill.h"
 #include "runtime/engine/prefill_pacing.h"
 #include "runtime/engine/prefill_yield.h"
 #include "runtime/engine/request_record.h"
@@ -76,6 +77,34 @@ public:
             instance.suspend(device, snapshot, &snapshot);
         };
 
+    // Lossy long-prompt prefill (lossy_prefill.h) needs a Program that runs it (the Qwen3.5 one);
+    // for any other, the option is refused at startup and the Engine never takes the path.
+    using ProgramType = typename ModelContract::Program;
+    using BasePlan    = typename ModelContract::RequestBasePlan;
+    static constexpr bool kLossyCapable =
+        requires(ProgramType& program, const ProgramType& view, const BasePlan& plan,
+                 SequenceHandle sequence, typename ModelContract::PrefillProgress& progress) {
+            plan.lossy();
+            program.enable_lossy(sequence);
+            program.abort_lossy_scout(sequence);
+            view.lossy_scout_share();
+            progress.scouted_tokens;
+            progress.compacted_prompt_tokens;
+            progress.compacted_plan;
+            progress.lossy;
+        };
+
+    // A frontier of the plan's prompt in the client's prompt tokens: what usage and prompt
+    // progress report. Only a Program that rewrites prompts (lossy prefill) can make them differ.
+    [[nodiscard]] static std::uint32_t reported_frontier(const BasePlan& plan,
+                                                         std::uint32_t frontier) noexcept {
+        if constexpr (requires { plan.reported_frontier(frontier); }) {
+            return plan.reported_frontier(frontier);
+        } else {
+            return frontier;
+        }
+    }
+
     class RoundMasks final : public TokenMaskProvider {
     public:
         std::array<decltype(&std::declval<Request&>().output), kMaximumConcurrency> outputs{};
@@ -109,6 +138,7 @@ public:
           yield_min_remaining_ns_(
               static_cast<std::uint64_t>(options.prefill_schedule.yield_remaining_ms) * 1'000'000ULL),
           layer_slices_(options.prefill_schedule.layer_slices),
+          lossy_options_(options.lossy_prefill),
           progress_anchor_tokens_(options.progress_anchors_shared ? options.progress_anchor_tokens : 0),
           fault_listener_(options.fault_listener),
           resources_(options.context_cache.enabled, std::move(context_cost)) {
@@ -245,7 +275,8 @@ public:
     Submission submit(PreparedPrompt prompt, PromptSummary prompt_summary, double prepare_seconds,
                       ResolvedRequestOptions options, OutputConsumerMode consumer_mode,
                       GenerationObservationOptions observation,
-                      Clock::time_point pending_deadline = {}) {
+                      Clock::time_point pending_deadline = {},
+                      std::optional<compaction::SummaryRecord> summary = std::nullopt) {
         const Clock::time_point submitted = Clock::now();
         if (pending_deadline == Clock::time_point{}) {
             pending_deadline = submitted + pending_timeout_;
@@ -305,7 +336,8 @@ public:
                                                 std::move(output), prompt_summary, prepare_seconds,
                                                 std::move(options), consumer_mode,
                                                 std::move(observation), pending_deadline, ready);
-            effective_budget = request->output.thinking_stats().effective_budget;
+            effective_budget         = request->output.thinking_stats().effective_budget;
+            request->summary         = std::move(summary);
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -346,8 +378,45 @@ public:
     }
 
     [[nodiscard]] RuntimeStats runtime_stats() const {
-        std::lock_guard lock(stats_mutex_);
-        return published_stats_;
+        RuntimeStats stats;
+        {
+            std::lock_guard lock(stats_mutex_);
+            stats = published_stats_;
+        }
+        stats.lossy_prefill_summary_probe_timeouts = probe_timeouts_.load(std::memory_order_relaxed);
+        return stats;
+    }
+
+    // The summary strategy's reuse probe, from a caller thread (Engine::prepare): Warm when a
+    // private (conversation) record, or a shared checkpoint deeper than `exact_end`, this prompt
+    // starts with would be reused, from the cache or from
+    // the context store (deeper than `exact_end`, the product prompt), Cold otherwise. `prompt` is
+    // a copy the probe plans and drops. The probe is posted to the worker, which answers it between
+    // cycles (serve_reuse_probes); an answer not given within `wait` is Timeout, counted in
+    // lossy_prefill_summary_probe_timeouts and treated as warm by the caller. A stopping or failed
+    // Engine answers Warm at once.
+    [[nodiscard]] LossySummaryProbe has_private_reuse(PreparedPrompt prompt,
+                                                      const ResolvedExecutionOptions& execution,
+                                                      std::uint32_t exact_end,
+                                                      std::chrono::milliseconds wait) {
+        auto probe       = std::make_shared<ReuseProbe>();
+        probe->prompt    = std::move(prompt);
+        probe->execution = execution;
+        probe->exact_end = exact_end;
+        {
+            std::lock_guard lock(queue_mutex_);
+            if (stopping_ || failed_) { return LossySummaryProbe::Warm; }
+            probes_.push_back(probe);
+            probes_pending_.store(true, std::memory_order_release);
+        }
+        queue_cv_.notify_all();
+        std::unique_lock lock(probe->mutex);
+        if (!probe->cv.wait_for(lock, wait, [&] { return probe->warm.has_value(); })) {
+            probe->abandoned = true;
+            probe_timeouts_.fetch_add(1, std::memory_order_relaxed);
+            return LossySummaryProbe::Timeout;
+        }
+        return *probe->warm ? LossySummaryProbe::Warm : LossySummaryProbe::Cold;
     }
 
     // An Engine-wide failure: every queued request failed, every new one is refused, and the
@@ -523,7 +592,19 @@ public:
 
     // Prefill time the cost model expects for a request still in the queue: every chunk the prompt
     // will run and the Vision work of its media, so the backlog is not lower than the work that runs.
+    // A long text prompt the lossy path would take (cold, so from the root) is priced as its scout
+    // and the main pass over the share of it a selection keeps.
     [[nodiscard]] std::uint64_t queued_prefill_ns(const PromptSummary& summary) const noexcept {
+        const double share = lossy_scout_share();
+        if (share > 0.0 && select_lossy() && !summary.has_media &&
+            summary.prompt_tokens > lossy_options_.min_tokens) {
+            const auto kept = lossy_expected_kept(summary.prompt_tokens, lossy_options_.keep_fraction);
+            return saturating_add(
+                scaled_ns(resources_.prefill_ns(
+                              make_prefill_work(0, summary.prompt_tokens, 0, 0, prefill_chunk_)),
+                          share),
+                resources_.prefill_ns(make_prefill_work(0, kept, 0, 0, prefill_chunk_)));
+        }
         return resources_.prefill_ns(make_prefill_work(0, summary.prompt_tokens, summary.vision_items,
                                                        summary.vision_patches, prefill_chunk_));
     }
@@ -958,11 +1039,18 @@ private:
             request->computed_prompt_tokens > begin.prompt_tokens - begin.reused_prompt_tokens) {
             throw std::logic_error("prompt progress exceeds the admitted prompt frontier");
         }
+        // In the client's prompt tokens: a lossy prompt's dropped tokens count as processed once the
+        // selection has skipped them, and a prompt rewritten onto a lossy lineage counts its
+        // original length (docs/maintainer/lossy-long-prefill.md, "Capacity and reporting").
+        const std::uint32_t total  = reported_prompt_tokens(*request);
+        const std::uint32_t reused = reported_frontier(*request, begin.reused_prompt_tokens);
         const PromptProgress progress{
-            .total_prompt_tokens     = begin.prompt_tokens,
-            .reused_prompt_tokens    = begin.reused_prompt_tokens,
-            .processed_prompt_tokens = begin.reused_prompt_tokens + request->computed_prompt_tokens,
-            .elapsed_ns              = elapsed_ns(*request->admitted_at, Clock::now()),
+            .total_prompt_tokens  = total,
+            .reused_prompt_tokens = reused,
+            .processed_prompt_tokens =
+                std::min(total, reported_frontier(*request, begin.reused_prompt_tokens +
+                                                                request->computed_prompt_tokens)),
+            .elapsed_ns = elapsed_ns(*request->admitted_at, Clock::now()),
         };
         {
             std::lock_guard lock(request->mutex);
@@ -991,7 +1079,7 @@ private:
             }
             request->stream_start = GenerationStart{
                 .prompt               = request->prompt_summary,
-                .reused_prompt_tokens = begin.reused_prompt_tokens,
+                .reused_prompt_tokens = reported_frontier(*request, begin.reused_prompt_tokens),
             };
         }
         request->cv.notify_one();
@@ -1052,6 +1140,9 @@ private:
     }
 
     void complete_error(const std::shared_ptr<Request>& request, std::exception_ptr error) {
+        // A request on the lossy path that fails before its outcome counts as aborted, so the
+        // outcome counters add up to the requests that took the path.
+        lossy_aborted(*request);
         if (request->preemption_count) {
             observe_scheduling(request, GenerationSchedulingTransition::Terminal);
         }
@@ -1074,6 +1165,11 @@ private:
 
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
         HostPhaseMeasurement completion = begin_host_phase();
+        // Read before release_planning_state drops the plan.
+        const std::optional<std::uint32_t> reported_reused =
+            request->begin && request->base_plan
+                ? std::optional(reported_frontier(*request, request->begin->reused_prompt_tokens))
+                : std::nullopt;
         if (request->preemption_count) {
             observe_scheduling(request, GenerationSchedulingTransition::Terminal);
         }
@@ -1122,8 +1218,14 @@ private:
         result.finish_reason                   = reason;
         result.matched_stop_string             = request->output.matched_stop_string();
         if (request->begin) {
-            result.reused_prompt_tokens = request->begin->reused_prompt_tokens;
-            result.prefix_reuse_path    = request->begin->prefix_reuse_path;
+            result.reused_prompt_tokens =
+                reported_reused.value_or(request->begin->reused_prompt_tokens);
+            result.prefix_reuse_path = request->begin->prefix_reuse_path;
+        }
+        if (request->lossy) {
+            result.lossy_prefill = request->lossy->report;
+        } else if (request->summary) {
+            result.lossy_prefill = summary_report(*request->summary);
         }
         result.timings                 = request->generation_timings;
         result.timings.prepare_seconds = request->prepare_seconds;
@@ -1260,6 +1362,8 @@ private:
                 cumulative_stats_.cancelled_prefill_computed_tokens +=
                     request->computed_prompt_tokens;
             }
+            // A scout ends with its lane: the Program drops it and its pages in abort.
+            lossy_aborted(*request);
             auto aborted                = instance_.program->abort(*request->sequence);
             request->generation_timings = aborted.timings;
             request->speculative_stats  = std::move(aborted.speculative);
@@ -1688,7 +1792,8 @@ private:
     void
     resolve_prefill_progress(const std::shared_ptr<Request>& request,
                              typename ModelContract::PrefillProgress&& progress,
-                             const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+                             const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start,
+                             std::uint64_t step_elapsed_ns = 0) {
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
         ++cumulative_stats_.host_work.prefill_units;
         ++request->host_timing.prefill_units;
@@ -1696,6 +1801,7 @@ private:
         if (!request->admitted_begin) {
             throw std::logic_error("prefill progress has no committed admission summary");
         }
+        observe_lossy_step(request, progress, step_elapsed_ns);
         const BeginSummary& begin = *request->admitted_begin;
         if (begin.reused_prompt_tokens > begin.prompt_tokens) {
             throw std::logic_error("admitted prefix exceeds its prompt");
@@ -1729,6 +1835,7 @@ private:
         if (!request->admitted_begin || progress.summary != *request->admitted_begin) {
             throw std::logic_error("runtime Begin summary differs from committed admission");
         }
+        finish_lossy_prefill(*request);
         const std::uint32_t lane = request->lane->value;
         request->begin           = progress.summary;
         const std::array<std::uint32_t, 1> lanes{lane};
@@ -1850,8 +1957,267 @@ private:
             record_execution_work(request->prefill_work, progress.timing);
         }
         consume_armed_worker_failure();
-        resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
+        resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start,
+                                 step_elapsed_ns);
         publish_runtime_stats();
+    }
+
+    // ---- lossy prefill (lossy_prefill.h, docs/maintainer/lossy-long-prefill.md) ----
+
+    [[nodiscard]] double lossy_scout_share() const noexcept {
+        if constexpr (kLossyCapable) {
+            return select_lossy() ? instance_.program->lossy_scout_share() : 0.0;
+        } else {
+            return 0.0;
+        }
+    }
+
+    // The token (select) strategy runs in the core; the summary strategy rewrote the prompt in
+    // Engine::prepare, so the core never scouts for it.
+    [[nodiscard]] bool select_lossy() const noexcept {
+        return lossy_options_.enabled() && lossy_options_.strategy == LossyStrategy::Select;
+    }
+
+    // The client's prompt length: what prompt progress counts to.
+    [[nodiscard]] static std::uint32_t reported_prompt_tokens(const Request& request) noexcept {
+        if (request.summary && request.summary->rewrite) {
+            return request.summary->rewrite->original_tokens;
+        }
+        const auto& summary = request.base_plan->summary();
+        return summary.reported_prompt_tokens != 0 ? summary.reported_prompt_tokens
+                                                   : summary.prompt_tokens;
+    }
+
+    // A frontier of the request's prompt in the client's tokens: through the plan's lossy lineage,
+    // then through a summary rewrite.
+    [[nodiscard]] static std::uint32_t reported_frontier(const Request& request,
+                                                         std::uint32_t frontier) noexcept {
+        const std::uint32_t planned =
+            request.base_plan ? reported_frontier(*request.base_plan, frontier) : frontier;
+        return request.summary && request.summary->rewrite
+                   ? request.summary->rewrite->original_frontier(planned)
+                   : planned;
+    }
+
+    // The request log's report for a prompt the summary strategy rewrote (completed) or probed
+    // and left whole (skipped); the outcome counters count the same outcomes.
+    [[nodiscard]] static LossyPrefillReport summary_report(const compaction::SummaryRecord& record) {
+        LossyPrefillReport report{.outcome         = LossyPrefillOutcome::Skipped,
+                                  .uncached_tokens = record.prompt_tokens,
+                                  .kept_tokens     = record.prompt_tokens,
+                                  .strategy        = LossyStrategy::Summary,
+                                  .summary_probe   = record.probe};
+        if (const auto& rewrite = record.rewrite) {
+            report.outcome             = LossyPrefillOutcome::Completed;
+            report.uncached_tokens     = rewrite->original_tokens;
+            report.kept_tokens         = rewrite->prompt_tokens;
+            report.summarized_messages = rewrite->messages;
+            report.summary_reused      = !rewrite->fresh;
+        }
+        return report;
+    }
+
+    // At admission, once the source is chosen: whether this request takes the lossy path
+    // (lossy_prefill_trigger). The Program is told once the binding publishes.
+    //
+    // Accepted v1 limitation: a plan is made once, when the request is first considered for
+    // admission (ensure_base_plan), and only a plan made after a lossy prefill finished is
+    // rewritten onto its kept lineage. A follow-up planned earlier (one already queued behind it)
+    // cannot match the selected continuation: it reuses at most the exact product prompt and,
+    // past the threshold, takes the lossy path (a scout) of its own.
+    void plan_lossy_prefill(const std::shared_ptr<Request>& request,
+                            const typename ModelContract::SourceCandidate& source) {
+        request->lossy.reset();
+        if constexpr (kLossyCapable) {
+            if (!select_lossy()) { return; }
+            const auto& plan  = *request->base_plan;
+            const auto lossy  = plan.lossy();
+            std::optional<CheckpointRole> role;
+            if (source.checkpoint) {
+                role = instance_.program->checkpoint_metadata(*source.checkpoint).role;
+            }
+            const auto exact_end = lossy_prefill_trigger({
+                .min_tokens    = lossy_options_.min_tokens,
+                .exact_end     = lossy ? std::optional(lossy->exact_end) : std::nullopt,
+                .prompt_tokens = plan.summary().prompt_tokens,
+                .has_media     = request->prompt_summary.has_media,
+                .source_role   = role,
+                .reused_tokens = source.reused_tokens,
+            });
+            if (exact_end) { request->lossy = LossyPrefillState{.exact_end = *exact_end}; }
+        } else {
+            (void)source;
+        }
+    }
+
+    // After the binding published and before any step.
+    void start_lossy_prefill(const std::shared_ptr<Request>& request) {
+        if (!request->lossy || request->lossy->phase != LossyPrefillState::Phase::Planned) {
+            return;
+        }
+        if constexpr (kLossyCapable) {
+            if (instance_.program->enable_lossy(*request->sequence)) {
+                request->lossy->phase = LossyPrefillState::Phase::Exact;
+                return;
+            }
+        }
+        request->lossy.reset();
+    }
+
+    [[nodiscard]] LossyPrefillReport lossy_report(const Request& request) const noexcept {
+        const auto& state = *request.lossy;
+        const std::uint32_t prompt = request.base_plan->summary().prompt_tokens;
+        return LossyPrefillReport{
+            .outcome         = LossyPrefillOutcome::Aborted,
+            .uncached_tokens = prompt > state.exact_end ? prompt - state.exact_end : 0U,
+            .filter_layer    = lossy_options_.filter_layer,
+        };
+    }
+
+    // A step's lossy reports: scout progress, and once, the outcome and the prompt's new length.
+    void observe_lossy_step(const std::shared_ptr<Request>& request,
+                            typename ModelContract::PrefillProgress& progress,
+                            std::uint64_t step_elapsed_ns) {
+        if constexpr (kLossyCapable) {
+            using Phase = LossyPrefillState::Phase;
+            if (progress.scouted_tokens != 0) {
+                if (!request->lossy || !request->lossy->before_outcome() ||
+                    progress.processed_prompt_tokens != 0) {
+                    throw std::logic_error("a scout step for a request not on the lossy path");
+                }
+                request->lossy->phase = Phase::Scout;
+                request->lossy->scouted += progress.scouted_tokens;
+                cumulative_stats_.lossy_prefill_scouted_tokens += progress.scouted_tokens;
+            }
+            if (progress.compacted_prompt_tokens) {
+                if (!request->lossy || !request->lossy->before_outcome() || !progress.lossy) {
+                    throw std::logic_error("a prompt-length change for a request not on the lossy path");
+                }
+                auto& state        = *request->lossy;
+                BeginSummary& begin = *request->admitted_begin;
+                const std::uint32_t length = *progress.compacted_prompt_tokens;
+                if (length < begin.reused_prompt_tokens + request->computed_prompt_tokens ||
+                    length > begin.prompt_tokens) {
+                    throw std::logic_error("a lossy prefill's prompt length is out of range");
+                }
+                LossyPrefillReport report = lossy_report(*request);
+                const auto& outcome       = *progress.lossy;
+                report.uncached_tokens    = outcome.uncached_tokens;
+                report.kept_tokens        = outcome.kept_tokens;
+                report.scout_ms           = outcome.scout_seconds * 1000.0;
+                report.kept_runs          = outcome.kept_runs;
+                report.outcome            = outcome.declined ? LossyPrefillOutcome::Declined
+                                            : outcome.skipped ? LossyPrefillOutcome::Skipped
+                                                              : LossyPrefillOutcome::Completed;
+                // The Program's plan describes the request from now on: a re-admission after a
+                // pause, checkpoint matching, captures and accounting all read the Engine's.
+                if (progress.compacted_plan) {
+                    *request->base_plan = std::move(*progress.compacted_plan);
+                    if (request->lane) { capture_decisions_[request->lane->value].reset(); }
+                }
+                if (request->base_plan->summary().prompt_tokens != length) {
+                    throw std::logic_error("a lossy prefill changed its length without its plan");
+                }
+                begin.prompt_tokens = length;
+                // Declined and skipped are counted now (both "skipped"); a compacted prompt once its
+                // kept tokens are prefilled.
+                if (report.outcome != LossyPrefillOutcome::Completed) {
+                    ++cumulative_stats_.lossy_prefills_skipped;
+                }
+                if (report.outcome != LossyPrefillOutcome::Declined) {
+                    cumulative_stats_.lossy_prefill_kept_tokens += report.kept_tokens;
+                }
+                state.report = report;
+                state.phase  = Phase::Main;
+                // A short request waiting to yield past this lane could not pause it while it
+                // scouted; it can now, and nothing else would look again.
+                request_admission_check();
+            }
+            if (progress.processed_prompt_tokens != 0 && request->lossy &&
+                request->lossy->phase == Phase::Main) {
+                request->lossy->main_ns += step_elapsed_ns;
+            }
+        } else {
+            (void)request;
+            (void)progress;
+            (void)step_elapsed_ns;
+        }
+    }
+
+    // The prompt is prefilled: a compacted request is counted completed.
+    void finish_lossy_prefill(Request& request) {
+        if (!request.lossy) { return; }
+        auto& state = *request.lossy;
+        using Phase = LossyPrefillState::Phase;
+        if (state.phase == Phase::Main && state.report) {
+            state.report->main_ms = static_cast<double>(state.main_ns) * 1e-6;
+            if (state.report->outcome == LossyPrefillOutcome::Completed) {
+                ++cumulative_stats_.lossy_prefills_completed;
+            }
+            state.phase = Phase::Ended;
+        } else if (state.before_outcome() && state.phase != Phase::Planned) {
+            // The path did not run to its outcome (the lane was rebuilt without it).
+            lossy_aborted(request);
+        }
+    }
+
+    // A request on the lossy path that ends, or leaves the path, before its outcome counts as
+    // aborted: cancelled, failed, or its scout ended for memory pressure. One already counted, or
+    // not yet bound, is left alone. noexcept: it only updates counters and the report.
+    void lossy_aborted(Request& request) noexcept {
+        if (!request.lossy) { return; }
+        auto& state = *request.lossy;
+        using Phase = LossyPrefillState::Phase;
+        const bool open = state.phase == Phase::Exact || state.phase == Phase::Scout ||
+                          (state.phase == Phase::Main && state.report &&
+                           state.report->outcome == LossyPrefillOutcome::Completed);
+        if (!open) { return; }
+        if (!state.report && request.base_plan) { state.report = lossy_report(request); }
+        if (!state.report) { state.report = LossyPrefillReport{.filter_layer = lossy_options_.filter_layer}; }
+        state.report->outcome = LossyPrefillOutcome::Aborted;
+        state.report->main_ms = static_cast<double>(state.main_ns) * 1e-6;
+        state.phase           = Phase::Ended;
+        ++cumulative_stats_.lossy_prefills_aborted;
+    }
+
+    // Where the Engine has to pause a scouting lane for memory (start_pause refuses while the scout
+    // runs, and waiting for it could wait on the very pages the scout holds): the scout ends at M,
+    // the request goes on as an ordinary full prefill from there, and the pause proceeds. Its
+    // restore resumes at M from the snapshot. False when the lane is not scouting.
+    bool end_lossy_scout_for_pause(const std::shared_ptr<Request>& request) {
+        if constexpr (kLossyCapable) {
+            if (!request->lossy || !request->lossy->scouting() ||
+                !instance_.program->abort_lossy_scout(*request->sequence)) {
+                return false;
+            }
+            lossy_aborted(*request);
+            // The scout's pages past M are free again.
+            scheduler_.capacity_released();
+            request_admission_check();
+            return true;
+        } else {
+            (void)request;
+            return false;
+        }
+    }
+
+    // What the lossy path still costs from `cursor`: the exact part to M, the scout over what is
+    // left of U at its share of a full prefill (the layers below the filter layer), and the main
+    // pass over the share of U a selection keeps.
+    [[nodiscard]] std::uint64_t lossy_remaining_ns(const BasePlan& plan, std::uint32_t cursor,
+                                                   const LossyPrefillState& state) const {
+        const std::uint32_t prompt = plan.summary().prompt_tokens;
+        const std::uint32_t m      = std::min(state.exact_end, prompt);
+        std::uint64_t total        = 0;
+        if (cursor < m) { total = resources_.prefill_ns(instance_.program->prefill_work(plan, cursor, m)); }
+        const std::uint32_t scouted = std::min(prompt - m, state.scouted);
+        total = saturating_add(
+            total, scaled_ns(resources_.prefill_ns(
+                                 instance_.program->prefill_work(plan, m + scouted, prompt)),
+                             lossy_scout_share()));
+        const std::uint32_t kept = lossy_expected_kept(prompt - m, lossy_options_.keep_fraction);
+        return saturating_add(
+            total, resources_.prefill_ns(instance_.program->prefill_work(plan, m, m + kept)));
     }
 
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
@@ -1859,8 +2225,21 @@ private:
             request->base_plan.emplace(instance_.program->plan_request(std::move(request->prompt),
                                                                        request->options.execution));
             const auto& summary = request->base_plan->summary();
-            request->budget.emplace(summary.effective_output_tokens,
-                                    summary.effective_limit_reason);
+            std::uint32_t output_tokens = summary.effective_output_tokens;
+            FinishReason limit_reason   = summary.effective_limit_reason;
+            // A prompt the summary strategy shortened may not generate past where the client's own
+            // prompt would reach max_context, as the Program's cap does for a prompt it rewrote;
+            // when that cap binds, the request ends for context capacity, not its output limit.
+            if (request->summary && request->summary->rewrite &&
+                request->summary->rewrite->original_tokens <= max_context_) {
+                const std::uint32_t capacity =
+                    max_context_ - request->summary->rewrite->original_tokens + 1U;
+                if (capacity < output_tokens) {
+                    output_tokens = capacity;
+                    limit_reason  = FinishReason::ContextCapacity;
+                }
+            }
+            request->budget.emplace(output_tokens, limit_reason);
             request->generated.reserve(summary.effective_output_tokens);
         }
     }
@@ -1942,6 +2321,11 @@ private:
                     request->paused_ns += elapsed_ns(*request->paused_at, Clock::now());
                 }
                 request->paused_at.reset();
+                // A request paused in Exact (before M) keeps its lossy path: the Program's saved
+                // control carries its phase and M to the restored lane (pause.cpp, install_binding),
+                // which goes on to M and scouts. Nothing is enabled again here; enable_lossy refuses
+                // a lane already on the path. A scout cannot pause, and Main runs on the compacted
+                // plan this rebinding used.
                 observe_scheduling(request, GenerationSchedulingTransition::Restored);
             } else {
                 request->initial_binding_ns = elapsed_ns(*request->admitted_at, Clock::now());
@@ -1950,11 +2334,22 @@ private:
                 } else {
                     ++cumulative_stats_.root_selections;
                 }
-                cumulative_stats_.reused_prompt_tokens += control.summary.reused_prompt_tokens;
-                cumulative_stats_.prompt_tokens += control.summary.prompt_tokens;
+                // In the client's tokens, as usage reports them; computed_prefill_tokens counts
+                // what the Program actually prefilled.
+                cumulative_stats_.reused_prompt_tokens +=
+                    reported_frontier(*request, control.summary.reused_prompt_tokens);
+                cumulative_stats_.prompt_tokens += reported_prompt_tokens(*request);
+                if (const auto& summary = request->summary; summary && summary->rewrite) {
+                    ++(summary->rewrite->fresh ? cumulative_stats_.lossy_prefill_summaries_new
+                                               : cumulative_stats_.lossy_prefill_summaries_reused);
+                    ++cumulative_stats_.lossy_prefills_completed;
+                } else if (summary) {
+                    ++cumulative_stats_.lossy_prefills_skipped;
+                }
                 cumulative_stats_.last_selected_frontier_tokens =
                     control.summary.reused_prompt_tokens;
                 // Generation start was published when the first binding obtained its resources.
+                start_lossy_prefill(request);
             }
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             slots_[control.destination.value] = request;
@@ -2079,6 +2474,11 @@ private:
         // on is no longer confined to the request being admitted.
         admission_subject_.reset();
         auto request       = slots_[lane];
+        if (request && request->lossy && request->lossy->scouting()) {
+            // start_pause refuses a scouting lane. A pause that only serves the queue waits for
+            // the main pass; one for memory ends the scout, and the request continues in full.
+            if (require_snapshot || !end_lossy_scout_for_pause(request)) { return false; }
+        }
         bool save_snapshot = false;
         if (require_snapshot) {
             // A pause that only serves the queue is not worth evicting other requests' history, so
@@ -2339,9 +2739,11 @@ private:
         std::size_t count = 0;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& resident = slots_[lane];
+            // A scouting lane cannot pause (its scout keeps uncommitted pages). The head waits
+            // until the main pass starts; the step that ends the scout looks again.
             if (!resident || !resident->is_prefilling() || resident->capture_pending ||
                 resident->slice_in_flight || resident->prompt_summary.has_media ||
-                !resident->base_plan) {
+                !resident->base_plan || (resident->lossy && resident->lossy->scouting())) {
                 continue;
             }
             if (const auto cursor = sibling_cursor(*resident)) {
@@ -2370,6 +2772,9 @@ private:
                                                      std::uint32_t cursor) const {
         const std::uint32_t prompt = request.base_plan->summary().prompt_tokens;
         if (cursor >= prompt) { return 0; }
+        if (request.lossy && request.lossy->before_outcome() && lossy_scout_share() > 0.0) {
+            return lossy_remaining_ns(*request.base_plan, cursor, *request.lossy);
+        }
         return resources_.prefill_ns(instance_.program->prefill_work(*request.base_plan, cursor, prompt));
     }
 
@@ -2603,6 +3008,14 @@ private:
                 resources_.binding_started(request->id, reservation.retired_points,
                                            reservation.consumed_source);
                 const auto& source = choice.source;
+                if (!restoring) {
+                    plan_lossy_prefill(request, source);
+                    const auto& planned = request->base_plan->summary();
+                    // A prompt rewritten onto a lossy-prefilled lineage (the selection alias).
+                    if (planned.reported_prompt_tokens > planned.prompt_tokens) {
+                        ++cumulative_stats_.lossy_prefill_alias_hits;
+                    }
+                }
                 const BeginSummary begin{
                     .prompt_tokens        = request->base_plan->summary().prompt_tokens,
                     .reused_prompt_tokens = source.reused_tokens,
@@ -3596,29 +4009,22 @@ private:
         std::string best_id;
         std::uint32_t best_frontier = resident;
         try {
-            for (const ContextStore::Info& info : store_.store->list()) {
-                // The binding does not include the context length: an image deeper than this
-                // Engine's context could never be restored, and reading it would only cost time.
-                if (info.binding != store_.binding || info.tokens > max_context_) { continue; }
-                if (info.fetch_bytes > 0 && remote_fetch_ns(info.fetch_bytes) >= wait_ns) { continue; }
+            // The binding does not include the context length: an image deeper than this Engine's
+            // context could never be restored, and reading it would only cost time
+            // (for_each_stored_match leaves it out).
+            for_each_stored_match(base, [&](const ContextStore::Info& info,
+                                            const ContextStore::CheckpointKey& key) {
+                if (info.fetch_bytes > 0 && remote_fetch_ns(info.fetch_bytes) >= wait_ns) { return; }
                 const auto restore = resources_.store_restore_ns(info.image_bytes);
-                if (restore >= best_cost) { continue; }
-                for (const ContextStore::CheckpointKey& key : info.checkpoints) {
-                    if (key.frontier <= resident || key.frontier > prompt_tokens) { continue; }
-                    const auto prefill = resources_.prefill_ns(
-                        instance_.program->prefill_work(base, key.frontier, prompt_tokens));
-                    const auto cost = prefill > UINT64_MAX - restore ? UINT64_MAX
-                                                                     : restore + prefill;
-                    if (cost >= best_cost) { continue; }
-                    const auto mine = base.prefix_shortlist_key(key.frontier);
-                    if (mine && mine->digests == key.digests &&
-                        mine->identity_tag == key.identity_tag) {
-                        best_id       = info.id;
-                        best_frontier = key.frontier;
-                        best_cost     = cost;
-                    }
-                }
-            }
+                if (restore >= best_cost || key.frontier <= resident) { return; }
+                const auto prefill = resources_.prefill_ns(
+                    instance_.program->prefill_work(base, key.frontier, prompt_tokens));
+                const auto cost = prefill > UINT64_MAX - restore ? UINT64_MAX : restore + prefill;
+                if (cost >= best_cost) { return; }
+                best_id       = info.id;
+                best_frontier = key.frontier;
+                best_cost     = cost;
+            });
         } catch (...) { return false; }
         if (best_id.empty()) {
             // Nothing here, but another engine may have stored this session since the bucket was
@@ -4011,23 +4417,102 @@ private:
         published_residency_ = std::move(status);
     }
 
+    // ---- the summary strategy's reuse probes (has_private_reuse) ----
+
+    struct ReuseProbe {
+        PreparedPrompt prompt{};
+        ResolvedExecutionOptions execution;
+        std::uint32_t exact_end = 0;
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::optional<bool> warm;
+        bool abandoned = false;
+    };
+
+    // Visits every checkpoint key of a context-store image on this binding that this Engine could
+    // restore (at most max_context) and whose prefix the plan's prompt starts with, as admission's
+    // hydration compares them (prefix shortlist key and identity tag). Images only the bucket holds
+    // are included once a listing has registered them.
+    template <class Visit>
+    void for_each_stored_match(const BasePlan& base, Visit&& visit) {
+        const auto prompt_tokens = base.summary().prompt_tokens;
+        for (const ContextStore::Info& info : store_.store->list()) {
+            if (info.binding != store_.binding || info.tokens > max_context_) { continue; }
+            for (const ContextStore::CheckpointKey& key : info.checkpoints) {
+                if (key.frontier > prompt_tokens) { continue; }
+                const auto mine = base.prefix_shortlist_key(key.frontier);
+                if (mine && mine->digests == key.digests && mine->identity_tag == key.identity_tag) {
+                    visit(info, key);
+                }
+            }
+        }
+    }
+
+    // On the worker, under the execution lock: the probe's answer (true: warm).
+    [[nodiscard]] bool private_reuse_locked(ReuseProbe& probe) {
+        const auto plan = instance_.program->plan_request(std::move(probe.prompt), probe.execution);
+        // Shared matches past the product prompt are the conversation too (lossy_prefill_trigger).
+        if (resources_.has_conversation_match(*instance_.program, plan, probe.exact_end)) {
+            return true;
+        }
+        if (store_.store == nullptr) { return false; }
+        bool stored = false;
+        for_each_stored_match(plan, [&](const ContextStore::Info&, const ContextStore::CheckpointKey& key) {
+            stored = stored || key.frontier > probe.exact_end;
+        });
+        return stored;
+    }
+
+    // Answers the queued probes; `warm_only` (suspended or stopping) answers warm without looking.
+    void serve_reuse_probes(bool warm_only) noexcept {
+        // Every worker cycle calls this; without a posted probe (always, unless the summary
+        // strategy is on) it returns without touching the queue lock. A probe posted after the
+        // exchange sets the flag again and is answered on the next cycle.
+        if (!probes_pending_.exchange(false, std::memory_order_acq_rel)) { return; }
+        std::deque<std::shared_ptr<ReuseProbe>> probes;
+        {
+            std::lock_guard lock(queue_mutex_);
+            probes.swap(probes_);
+        }
+        for (const auto& probe : probes) {
+            {
+                std::lock_guard lock(probe->mutex);
+                if (probe->abandoned) { continue; }
+            }
+            bool warm = true;
+            if (!warm_only) {
+                try {
+                    warm = private_reuse_locked(*probe);
+                } catch (...) { warm = true; }
+            }
+            {
+                std::lock_guard lock(probe->mutex);
+                probe->warm = warm;
+            }
+            probe->cv.notify_all();
+        }
+    }
+
     void worker_loop() noexcept {
         for (;;) {
             {
                 std::unique_lock lock(queue_mutex_);
-                if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
-                    !instance_.program->has_context_transaction()) {
+                if (!stopping_ && pending_.empty() && probes_.empty() && resident_empty() &&
+                    paused_.empty() && !instance_.program->has_context_transaction()) {
+                    const auto woken = [&] {
+                        return stopping_ || !pending_.empty() || !probes_.empty();
+                    };
                     if (store_.sink && store_.idle_persist.count() > 0) {
                         // Wake up now and then to write idle continuations to the store.
-                        queue_cv_.wait_for(lock, std::chrono::seconds(1),
-                                           [&] { return stopping_ || !pending_.empty(); });
+                        queue_cv_.wait_for(lock, std::chrono::seconds(1), woken);
                     } else {
-                        queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                        queue_cv_.wait(lock, woken);
                     }
                 }
                 if (stopping_) {
                     lock.unlock();
                     std::scoped_lock execution_lock(execution_mutex_);
+                    serve_reuse_probes(true);
                     const auto error = std::make_exception_ptr(RequestError(
                         RequestErrorKind::Unavailable, "inference engine is shutting down"));
                     if (suspended_.load(std::memory_order_acquire)) {
@@ -4038,19 +4523,25 @@ private:
                             failed_ = true;
                         }
                         fail_pending_locked(error);
+                        serve_reuse_probes(true);
                         return;
                     }
                     fail_all_locked(error);
+                    serve_reuse_probes(true);
                     return;
                 }
             }
             std::unique_lock execution_lock(execution_mutex_);
             if (suspended_.load(std::memory_order_acquire)) {
                 // Nothing executes while suspended. The wait above returned because work was
-                // queued: resume for it, or refuse it when the model is held suspended.
+                // queued: resume for it, or refuse it when the model is held suspended. A probe
+                // does not resume the model: it is answered warm.
+                serve_reuse_probes(true);
                 serve_suspended_queue_locked();
                 continue;
             }
+            // Between cycles: the summary strategy's probes, before this cycle changes the cache.
+            serve_reuse_probes(false);
             bool executed = false;
             // The execution unit in progress, for the fault event.
             const char* unit = "boundary";
@@ -4280,7 +4771,11 @@ private:
                 } catch (...) {}
                 // After the latch took effect, so is_available() (and /health) already report it.
                 notify_fault(fault);
-                if (!recovered) { return; }
+                if (!recovered) {
+                    // Probes queued before the latch: answered warm, not left to time out.
+                    serve_reuse_probes(true);
+                    return;
+                }
                 continue;
             }
             execution_lock.unlock();
@@ -4304,6 +4799,8 @@ private:
     const std::uint64_t yield_min_remaining_ns_;
     // Layer slices per prefill chunk while a neighbour decodes; 0 or 1: whole chunks.
     const std::uint32_t layer_slices_;
+    // Lossy long-prompt prefill; off unless min_tokens is set.
+    const LossyPrefillOptions lossy_options_;
     // The request a prefill was last paused for, so it cannot pause a second one for the same
     // newcomer, and the hold that keeps the paused prefill from being restored ahead of it.
     std::uint64_t yield_beneficiary_ = 0;
@@ -4314,6 +4811,11 @@ private:
     ResourceManagement resources_;
 
     mutable std::mutex execution_mutex_;
+    // Summary-strategy reuse probes waiting for the worker (guarded by queue_mutex_).
+    std::deque<std::shared_ptr<ReuseProbe>> probes_;
+    // Set (under queue_mutex_) with every posted probe; serve_reuse_probes clears it.
+    std::atomic<bool> probes_pending_{false};
+    std::atomic<std::uint64_t> probe_timeouts_{0};
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;

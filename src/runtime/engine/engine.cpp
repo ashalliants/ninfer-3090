@@ -3,9 +3,11 @@
 #include "core/device.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
+#include "models/qwen3_5/program/lossy/lossy_flow.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
+#include "runtime/engine/compaction/summary_strategy.h"
 #include "runtime/engine/context_store_binding.h"
 #include "runtime/engine/engine_core.h"
 #include "runtime/engine/model_instance.h"
@@ -80,6 +82,12 @@ std::string context_capacity_error(std::size_t prompt_tokens, std::uint32_t max_
            " tokens, exceeding Engine max_context " + std::to_string(max_context);
 }
 
+// The summary strategy's reuse probe waits at most this long for the worker to answer it between
+// cycles: a decode cycle is far shorter, a prefill step (about 1.5 s at chunk 4096) longer. An
+// unanswered probe counts as warm and as a timeout (docs/maintainer/lossy-long-prefill.md,
+// "Alternative strategy").
+constexpr std::chrono::milliseconds kSummaryProbeWait{250};
+
 // Images queued for the writer thread. Each holds a whole continuation, several GB for a deep one;
 // beyond the bound an idle continuation is simply written later.
 constexpr std::size_t kMaximumPendingStoreWrites = 2;
@@ -120,6 +128,9 @@ public:
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
     models::qwen3_5::PreparedPrompt value;
+    // Summary strategy: what it did for this prompt (summary_strategy.h); unset when it did not
+    // look at it (off, or too short to probe).
+    std::optional<runtime::compaction::SummaryRecord> summary_record;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
@@ -222,6 +233,12 @@ public:
     using ScoringCore    = runtime::CausalScoreCore<runtime::ModelInstance>;
     // Qwen3.8-Flash-Next: the common core over its own Program.
     using Qwen4ExpCore = runtime::EngineCore<runtime::Qwen4ExpInstance>;
+    // Lossy long-prompt prefill: the Qwen3.5 Program runs it; qwen4_exp refuses the option at
+    // startup. Usage counts prompt_tokens from the client's prepared prompt (PromptSummary) and
+    // cached tokens in its terms (RequestBasePlan::reported_frontier), whatever the Program kept.
+    static_assert(GenerationCore::kLossyCapable,
+                  "the Qwen3.5 Program must provide the lossy prefill contract the Engine uses");
+    static_assert(!Qwen4ExpCore::kLossyCapable);
     using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
                               std::unique_ptr<ScoringCore>, std::unique_ptr<Qwen4ExpCore>>;
 
@@ -332,6 +349,67 @@ public:
         return qwen4 != nullptr ? qwen4->capacity : active->capacity;
     }
 
+    // ---- lossy prefill, summary strategy (runtime/engine/compaction/summary_strategy.h) ----
+
+    // The prepare operations the strategy runs on: the Frontend, and the reuse probe.
+    struct SummaryOps {
+        const Impl& impl;
+        const PreparationControl& control;
+        using Prepared = models::qwen3_5::PreparedPrompt;
+
+        Prepared prepare(PromptInput input) const {
+            return impl.frontend().prepare(std::move(input), control);
+        }
+        static std::uint32_t tokens(const Prepared& prompt) { return prompt.summary().prompt_tokens; }
+        static std::uint32_t exact_end(const Prepared& prompt) {
+            return models::qwen3_5::detail::lossy_planned_exact_end(
+                models::qwen3_5::PreparedPromptAccess::view(prompt).context_cache);
+        }
+        static bool eligible(const Prepared& prompt) {
+            const auto& data = models::qwen3_5::PreparedPromptAccess::view(prompt);
+            return !data.has_media() && data.external_prefix_tokens == 0 &&
+                   !data.context_cache.product_prompt_unbounded;
+        }
+        LossySummaryProbe probe_reuse(const Prepared& prompt) const {
+            return impl.has_private_reuse(prompt, exact_end(prompt));
+        }
+        static std::span<const TokenId> token_ids(const Prepared& prompt) {
+            return models::qwen3_5::PreparedPromptAccess::view(prompt).token_ids;
+        }
+    };
+
+    // The options the strategy decision reads: the configured ones for a Qwen3.5 generation core,
+    // off for anything else (Flash-Next refuses lossy prefill at startup; scoring never generates).
+    [[nodiscard]] LossyPrefillOptions summary_lossy_options() const {
+        const auto* generation = std::get_if<std::unique_ptr<GenerationCore>>(&core);
+        return generation != nullptr && *generation != nullptr ? options.lossy_prefill
+                                                               : LossyPrefillOptions{};
+    }
+
+    [[nodiscard]] runtime::compaction::SummaryStrategyConfig summary_config() const {
+        return {.min_tokens   = options.lossy_prefill.min_tokens,
+                .budget_chars = runtime::compaction::summary_budget_chars(
+                    options.max_context, options.lossy_prefill.summary_max_tokens)};
+    }
+
+    // Warm when a private (conversation) record, in the cache or the context store, would be
+    // reused by this prompt, so it is not summarised. Thread-safe (Engine::prepare runs on caller
+    // threads): the probe is posted to the worker and waits at most kSummaryProbeWait; Timeout,
+    // or any doubt, is treated as warm.
+    [[nodiscard]] LossySummaryProbe has_private_reuse(const models::qwen3_5::PreparedPrompt& prompt,
+                                                      std::uint32_t exact_end) const {
+        const auto* generation = std::get_if<std::unique_ptr<GenerationCore>>(&core);
+        if (generation == nullptr || *generation == nullptr) { return LossySummaryProbe::Warm; }
+        try {
+            auto execution = resolve_request_options(sampling_defaults, SamplingMode::Thinking, {})
+                                 .execution;
+            execution.requested_output_tokens = 1;
+            return (*generation)
+                ->has_private_reuse(models::qwen3_5::PreparedPromptAccess::copy(prompt), execution,
+                                    exact_end, kSummaryProbeWait);
+        } catch (...) { return LossySummaryProbe::Warm; }
+    }
+
     EngineOptions options;
     DeviceContext device;
     std::unique_ptr<runtime::ModelInstance> active;
@@ -361,6 +439,8 @@ public:
     bool writer_stop   = false;
     std::optional<std::chrono::steady_clock::time_point> drain_deadline;
     std::thread writer;
+    // The summaries the summary strategy wrote, so later turns render the same ones.
+    mutable runtime::compaction::SummaryRegistry summary_registry;
     Core core;
 
 private:
@@ -709,16 +789,31 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    auto prepared      = impl_->frontend().prepare(std::move(input), control);
+    // Lossy prefill's summary strategy may replace the middle of a cold long conversation with a
+    // summary (or substitute one recorded for an earlier turn); otherwise one ordinary prepare.
+    Impl::SummaryOps ops{*impl_, control};
+    auto strategy = runtime::compaction::prepare_for_strategy(
+        std::move(input), impl_->summary_lossy_options(), impl_->summary_config(),
+        impl_->summary_registry, ops);
+    auto prepared      = std::move(strategy.prepared);
     PromptSummary info = prepared.summary();
     const SamplingMode sampling_mode =
         info.starts_in_reasoning ? SamplingMode::Thinking : SamplingMode::NonThinking;
     if (info.prompt_tokens > impl_->capacity()) {
         throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
     }
+    // Usage and max_context count the client's prompt; the Program runs the submitted one.
+    if (strategy.rewrite) { info.prompt_tokens = strategy.rewrite->original_tokens; }
     const PromptPreparationStats preparation = prepared.preparation_stats();
-    return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(info, preparation, sampling_mode,
-                                                                 std::move(prepared)));
+    auto impl = std::make_unique<PreparedPrompt::Impl>(info, preparation, sampling_mode,
+                                                       std::move(prepared));
+    if (strategy.probe || strategy.rewrite) {
+        impl->summary_record = runtime::compaction::SummaryRecord{
+            .probe         = strategy.probe,
+            .rewrite       = strategy.rewrite,
+            .prompt_tokens = impl->value.summary().prompt_tokens};
+    }
+    return PreparedPrompt(std::move(impl));
 }
 
 PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
@@ -865,7 +960,7 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                 auto submission =
                     core->submit(std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
                                  std::move(resolved_options), consumer_mode, std::move(observation),
-                                 pending_deadline);
+                                 pending_deadline, prompt.impl_->summary_record);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
                     impl_, std::move(submission), resolved_sampling));
             }

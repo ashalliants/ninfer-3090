@@ -176,7 +176,12 @@ void EngineCore<Instance>::publish_runtime_stats() {
         std::lock_guard lock(queue_mutex_);
         snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
         for (const auto& request : pending_) {
-            add_backlog(queued_prefill_ns(request->prompt_summary));
+            // A prompt the summary strategy shortened prefills its submitted length.
+            PromptSummary submitted = request->prompt_summary;
+            if (request->summary && request->summary->rewrite) {
+                submitted.prompt_tokens = request->summary->rewrite->prompt_tokens;
+            }
+            add_backlog(queued_prefill_ns(submitted));
         }
     }
     snapshot.prefilling_requests              = 0;

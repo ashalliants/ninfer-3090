@@ -71,6 +71,8 @@ API key blank.
 | `ninfer_bench` | throughput benchmark against the public Engine route |
 | `download-model.sh` | pinned, resumable artifact downloads with verification |
 | `run.sh` | serving profiles: `run.sh <model> [profile]` |
+| `LICENSE` | NInfer's licence (Apache-2.0) |
+| `THIRD_PARTY_NOTICES.txt` | the notice for the ported conversation projector (hermes-vcc-engine, Apache-2.0) |
 | `SHA256SUMS.txt` | checksums for every file in this directory |
 
 ## Overrides

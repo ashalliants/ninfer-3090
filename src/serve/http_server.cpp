@@ -225,7 +225,8 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
                                              options_.response_store_max_bytes)),
       openai_responses_store_(*responses_store_),
       operational_log_(logger),
-      request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
+      request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger),
+                     options_.request_log_lossy_detail) {
     // cpp-httplib is thread-per-connection: a worker is held for a connection's whole
     // life, including the idle keep-alive window between requests. Sizing the pool to the
     // request-lifetime capacity alone lets idle pooled connections occupy every worker, at

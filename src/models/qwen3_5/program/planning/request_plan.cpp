@@ -108,12 +108,12 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
             "a direct prompt graft needs prefix reuse and at least one token after the graft");
     }
 
-    auto base                             = std::make_shared<RequestBasePlanImpl>();
-    base->context_cache                   = prompt.context_cache;
-    base->summary.prompt_tokens           = static_cast<std::uint32_t>(prompt.token_ids.size());
+    auto base = std::make_shared<RequestBasePlanImpl>();
+    // Limits tied to positions apply to the prompt the client sent, before any rewrite.
+    const auto original_tokens            = static_cast<std::uint32_t>(prompt.token_ids.size());
+    base->summary.reported_prompt_tokens  = original_tokens;
     base->summary.requested_output_tokens = options.requested_output_tokens;
-    const std::uint32_t capacity_output =
-        capacity - base->summary.prompt_tokens + static_cast<std::uint32_t>(1);
+    const std::uint32_t capacity_output   = capacity - original_tokens + static_cast<std::uint32_t>(1);
     base->summary.effective_output_tokens =
         std::min(options.requested_output_tokens, capacity_output);
     base->summary.effective_limit_reason = options.requested_output_tokens <= capacity_output
@@ -123,6 +123,26 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
     base->allow_prefix_reuse             = options.allow_prefix_reuse && prompt.identity.reusable;
     base->summary.publish_continuation =
         options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
+    // The index already holds the proposal-only sources; the shared prompt keeps neither. It is
+    // taken before any rewrite, which would drop it, and indexes the client's prompt.
+    base->ngram_index = std::move(prompt.ngram_index.index);
+    std::vector<std::vector<TokenId>>().swap(prompt.ngram_sources);
+    // Selection alias (docs/maintainer/lossy-long-prefill.md): a prompt that starts with the
+    // original tokens of a live lossy lineage is rewritten onto its kept identity, so ordinary
+    // prefix matching then finds the selected checkpoints. Only an exact match rewrites; a prompt
+    // that never was selected keeps its own identity and cannot match a selected state.
+    if (base->summary.publish_continuation && !gap_map_registry.empty()) {
+        const GapMapSet live = live_gap_maps();
+        auto rewrite         = rewrite_with_gap_maps(std::move(prompt), live);
+        prompt               = std::move(rewrite.prompt);
+        base->gap_maps       = std::move(rewrite.applied);
+    }
+    base->context_cache         = prompt.context_cache;
+    base->summary.prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
+    if (scout_buffers && lossy_options.enabled() && base->gap_maps.empty() && !prompt.has_media() &&
+        prompt.external_prefix_tokens == 0 && !prompt.context_cache.product_prompt_unbounded) {
+        base->lossy = LossyPlan{.exact_end = lossy_planned_exact_end(prompt.context_cache)};
+    }
     if (prompt.has_media()) {
         if (!workspace_plan.vision) {
             throw std::logic_error("Vision prompt has no startup workspace plan");
@@ -152,6 +172,24 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
     }
 
 
+    finish_request_plan(*base, std::move(prompt));
+    return RequestBasePlan(std::move(base));
+}
+
+GapMapSet ProgramImpl::live_gap_maps() {
+    GapMapSet live;
+    live.reserve(gap_map_registry.size());
+    std::erase_if(gap_map_registry, [&](const std::weak_ptr<const GapMap>& entry) {
+        auto map = entry.lock();
+        if (!map) { return true; }
+        live.push_back(std::move(map));
+        return false;
+    });
+    return live;
+}
+
+void ProgramImpl::finish_request_plan(RequestBasePlanImpl& plan, PreparedPromptData&& prompt) const {
+    auto* const base = &plan;
     base->prefix_digests.assign(prompt);
     base->prefix_identity_tag = prefix_identity_tag();
     std::uint32_t previous = 0;
@@ -162,9 +200,8 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
         }
         previous = frontier;
     }
-    // The index already holds the proposal-only sources; the shared prompt keeps neither.
-    base->ngram_index = std::move(prompt.ngram_index.index);
-    std::vector<std::vector<TokenId>>().swap(prompt.ngram_sources);
+    base->capture_backing.reset();
+    base->capture_groups.clear();
     base->prompt = std::make_shared<const PreparedPromptData>(std::move(prompt));
     if (base->summary.publish_continuation) {
         const auto& prepared = *base->prompt;
@@ -207,7 +244,6 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
         std::sort(base->capture_groups.begin(), base->capture_groups.end(),
                   [](const auto& a, const auto& b) { return a.frontier < b.frontier; });
     }
-    return RequestBasePlan(std::move(base));
 }
 
 std::uint32_t ProgramImpl::initial_mtp_extent(const RequestBasePlanImpl& base) const {
@@ -243,6 +279,13 @@ UnitDemand ProgramImpl::next_unit(const SequenceState& sequence, const RequestCo
             throw std::logic_error("prefill demand requires a prefill cursor");
         }
         const auto& staged = *request.prefill;
+        if (scout_session && scout_session->lane == sequence.lane) {
+            // A scout chunk grows the lane's Main KV past the committed frontier from where the
+            // scout stands; it writes no draft KV.
+            auto scout = prefill_unit(staged.prompt_tokens, scout_session->cursor, 0);
+            scout.backend_frontier = 0;
+            return scout;
+        }
         return prefill_unit(staged.prompt_tokens, staged.cursor, staged.initial_mtp_extent);
     }
     case ExecutionUnitKind::Replay:
@@ -390,6 +433,18 @@ void ProgramImpl::require_unit(std::uint32_t lane, ExecutionUnitKind kind,
 void ProgramImpl::settle_unit(std::uint32_t lane) noexcept {
     auto& state   = sequences[lane];
     auto& request = requests[lane];
+    if (scout_session && scout_session->lane == lane && state.kv) {
+        // A running scout's pages past the committed frontier hold the KV its later chunks attend
+        // to: keep them mapped and drop only the unmapped growth. end_scout releases them.
+        try {
+            text_kv_addresses->reserve_growth(state.kv->text, 0);
+            if (state.kv->backend) {
+                backend_kv_addresses->settle_growth(*state.kv->backend, backend_kv_valid(state), 0);
+            }
+        } catch (...) { std::terminate(); }
+        request.permit.reset();
+        return;
+    }
     if (request.recovery && request.lifecycle != Lifecycle::Replaying &&
         request.lifecycle != Lifecycle::Pending &&
         (request.lifecycle == Lifecycle::Finishable ||

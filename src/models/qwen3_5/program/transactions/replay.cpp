@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/execution_context.h"
+#include "models/qwen3_5/program/text_positions.h"
 #include "core/device.h"
 #include "ninfer/ops/sampling.h"
 
@@ -9,6 +10,7 @@
 #include <limits>
 #include <span>
 #include <stdexcept>
+#include <vector>
 
 namespace ninfer::models::qwen3_5::detail {
 namespace {
@@ -310,7 +312,15 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
         } else {
             // Pass the complete ledger: MTP alignment consumes the next already committed token
             // after the replayed frontier, rather than io.token from another request's round.
-            result = execution::prefill_text_chunk(context, sequence.ledger, count, split, false);
+            // RoPE comes from the identity's stored positions, which a compacted lossy prompt keeps
+            // gapped; slot + rope_delta serves when they are regular from the cursor on.
+            const std::vector<std::int32_t>& stored = sequence.prefix_identity.position_axis(0);
+            const auto rope_positions =
+                regular_text_positions(stored, cursor, sequence.rope_delta)
+                    ? std::span<const std::int32_t>{}
+                    : std::span<const std::int32_t>(stored);
+            result = execution::prefill_text_chunk(context, sequence.ledger, count, split, false,
+                                                   nullptr, rope_positions);
         }
         timing.include(result.timing);
         timing.resume_post();

@@ -1,6 +1,7 @@
 #include "serve/serve_options.h"
 
 #include <algorithm>
+#include "models/qwen3_5/lossy_options.h"
 #include "product/reasoning_loop_options.h"
 #include "product/speculative_options.h"
 
@@ -150,6 +151,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--prefill-stall-budget-ms N] [--yield-long-prefill-ms N] "
            "[--prefill-decode-share P] [--prefill-layer-slices N] "
+           "[--lossy-prefill-min-tokens N] [--lossy-prefill-strategy select|summary] "
            "[--log-stats-interval-ms N] "
            "[--device N] "
            "[--context-cost-presets FILE] "
@@ -157,7 +159,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--media-preprocess-threads N] "
            "[--device-state-slots N] [--host-context-mib N | --auto-host-cache "
            "[--host-cache-reserve-mib N] [--host-cache-max-mib N] [--host-cache-percent N]] "
-           "[--request-log-jsonl FILE] "
+           "[--request-log-jsonl FILE] [--request-log-lossy-detail] "
            "[--context-store DIR [--context-store-max-gib N] [--context-store-ttl-hours N] "
            "[--context-store-idle-seconds N] [--context-store-restore-seconds N] "
            "[--context-store-flush-seconds N] [--context-store-compress] "
@@ -201,6 +203,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
+           "       --request-log-lossy-detail adds lossy_prefill.kept_runs (the kept offsets of the "
+           "filtered part) to request_done records, for the lossy sweep's kept-block overlap\n"
            "       --model-id overrides the artifact metadata.name reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
@@ -240,6 +244,27 @@ std::string serve_usage_text(const char* argv0) {
            "gap shrinks to a slice while the chunk keeps its size (so the prompt is not slowed "
            "the way a smaller --prefill-chunk or a stall budget slows it). Not for media, DFlash "
            "or a pipeline split; 0 or 1 is off, at most 16. Off by default\n"
+           "       --lossy-prefill-min-tokens N filters a prompt whose part after the product prompt "
+           "(leading system/developer messages and tools) has more than N tokens: a scout pass "
+           "scores blocks and only the kept ones are "
+           "prefilled (lossy: the dropped text is not seen by the model). Text-only Qwen3.5 dense, "
+           "not for private conversation reuse. 0 (the default) is off. Tuning: "
+           "--lossy-prefill-keep F (share of blocks kept, (0,1], default 0.3), "
+           "--lossy-prefill-filter-layer N (full-attention layer, default 7), "
+           "--lossy-prefill-block N (tokens, multiple of 16, default 64), "
+           "--lossy-prefill-recent N (always-kept tail tokens, default 4096), "
+           "--lossy-prefill-head N (always-kept head tokens, default 256), "
+           "--lossy-prefill-query-rows N (1-256, default 64), "
+           "--lossy-prefill-pool-window N (per-token max-pooling width, odd, default 33), "
+           "--lossy-prefill-skip F (keep everything when the kept share would exceed F, (0,1], at least "
+           "the keep share, default 0.8), "
+           "--lossy-prefill-scout-a4 (int4 scout GEMMs)\n"
+           "       --lossy-prefill-strategy select|summary picks how such a prompt is shortened: "
+           "select (the default) is the scout and block selection above; summary replaces the "
+           "middle of the conversation with one deterministic summary message (no model call) and "
+           "prefills that as an ordinary prompt, ignoring the selection knobs. Opt-in, for "
+           "comparison. --lossy-prefill-summary-max-tokens N bounds the summary at "
+           "min(0.06 x max_context, N) tokens, at least 1500 (default 8000)\n"
            "       --prefill-cublas hands wide prefill GEMMs to cuBLAS: a large prefill speedup for a "
            "small perplexity cost (docs/performance.md), off by default, and it wants a larger "
            "--prefill-chunk to pay; --no-prefill-cublas-projections keeps the attention and GDN "
@@ -487,6 +512,52 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.prefill_schedule.stall_budget_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-stall-budget-ms"),
                                       "prefill-stall-budget-ms"));
+        } else if (arg == "--lossy-prefill-min-tokens") {
+            options.lossy_prefill.min_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--lossy-prefill-min-tokens"),
+                                      "lossy-prefill-min-tokens"));
+        } else if (arg == "--lossy-prefill-keep") {
+            options.lossy_prefill.keep_fraction = parse_float_in(
+                require_value("--lossy-prefill-keep"), "lossy-prefill-keep", 0.0F, 1000.0F);
+        } else if (arg == "--lossy-prefill-filter-layer") {
+            options.lossy_prefill.filter_layer = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--lossy-prefill-filter-layer"),
+                                      "lossy-prefill-filter-layer"));
+        } else if (arg == "--lossy-prefill-block") {
+            options.lossy_prefill.block_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--lossy-prefill-block"), "lossy-prefill-block"));
+        } else if (arg == "--lossy-prefill-recent") {
+            options.lossy_prefill.recent_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--lossy-prefill-recent"), "lossy-prefill-recent"));
+        } else if (arg == "--lossy-prefill-head") {
+            options.lossy_prefill.head_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--lossy-prefill-head"), "lossy-prefill-head"));
+        } else if (arg == "--lossy-prefill-query-rows") {
+            options.lossy_prefill.query_rows = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--lossy-prefill-query-rows"), "lossy-prefill-query-rows"));
+        } else if (arg == "--lossy-prefill-pool-window") {
+            options.lossy_prefill.pool_window = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--lossy-prefill-pool-window"), "lossy-prefill-pool-window"));
+        } else if (arg == "--lossy-prefill-skip") {
+            options.lossy_prefill.skip_fraction = parse_float_in(
+                require_value("--lossy-prefill-skip"), "lossy-prefill-skip", 0.0F, 1000.0F);
+        } else if (arg == "--lossy-prefill-scout-a4") {
+            options.lossy_prefill.scout_a4 = true;
+        } else if (arg == "--lossy-prefill-strategy") {
+            const std::string value = require_value("--lossy-prefill-strategy");
+            if (value == "select") {
+                options.lossy_prefill.strategy = LossyStrategy::Select;
+            } else if (value == "summary") {
+                options.lossy_prefill.strategy = LossyStrategy::Summary;
+            } else {
+                throw std::invalid_argument("--lossy-prefill-strategy must be select or summary");
+            }
+        } else if (arg == "--lossy-prefill-summary-max-tokens") {
+            options.lossy_prefill.summary_max_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--lossy-prefill-summary-max-tokens"),
+                                      "lossy-prefill-summary-max-tokens"));
+        } else if (arg == "--request-log-lossy-detail") {
+            options.request_log_lossy_detail = true;
         } else if (arg == "--yield-long-prefill-ms") {
             options.prefill_schedule.yield_remaining_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--yield-long-prefill-ms"),
@@ -994,6 +1065,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.prefill_schedule.layer_slices > kMaximumPrefillLayerSlices) {
         throw std::invalid_argument("--prefill-layer-slices must be at most 16");
     }
+    models::qwen3_5::validate_lossy_prefill_options(options.lossy_prefill);
     product::apply_speculative_defaults(options.speculative);
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_residency == VisionResidency::Overlay && !options.enable_vision) {

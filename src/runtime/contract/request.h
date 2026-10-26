@@ -52,7 +52,12 @@ struct CancellationFlagView {
 };
 
 struct RequestPlanSummary {
+    // The tokens the Program prefills and holds as the request's identity.
     std::uint32_t prompt_tokens           = 0;
+    // The prompt the client sent, the length usage reports and capacity limits apply to. Equals
+    // prompt_tokens unless the Program rewrote the prompt onto a lossy-prefilled lineage
+    // (docs/maintainer/lossy-long-prefill.md, "Selection alias"), which makes it longer.
+    std::uint32_t reported_prompt_tokens  = 0;
     std::uint32_t requested_output_tokens = 0;
     std::uint32_t effective_output_tokens = 0;
     FinishReason effective_limit_reason   = FinishReason::None;

@@ -1,0 +1,16 @@
+{
+ "upstream": "https://github.com/danbiocchi/hermes-vcc-engine",
+ "commit": "31ee4fe7ef3e3f6c67dadfd45ebc1a3cb9773f95",
+ "projector_sha256": "313f3c736f65f6bd3fa866feeb8ce389cc2bb31c2efe062e78d170d4d281f36a",
+ "python": "3.12.3",
+ "unicode": "15.0.0",
+ "fixture": "upstream_unresolved_error.json",
+ "fixture_sha256": "08192f806eef9797676904c14a546dbbb56c96bfc8760c51344d54d3620e1cb3",
+ "case": {
+  "id": "b4000",
+  "first": 0,
+  "last": 3,
+  "budget_chars": 4000
+ },
+ "call": "project(turns, budget_chars=budget_chars)"
+}

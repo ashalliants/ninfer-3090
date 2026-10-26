@@ -117,6 +117,16 @@ struct PreparedCacheOpportunity {
 struct PreparedContextCache {
     std::optional<PreparedSessionKey> session_key;
     std::vector<PreparedCacheOpportunity> opportunities;
+    // The end of the product prompt: the deepest exact frontier among the graft, the end of the
+    // leading System/Developer messages, the end of the tool declarations, and markers that lie
+    // inside those (leading-instruction, tool, or message boundaries within the leading messages).
+    // 0 when the prompt has none. Independent of the protocol's cache policy, so a request whose
+    // only shared marker sits at the end of its own last message still reports where the shared
+    // part ends. Lossy prefill uses it as M (docs/maintainer/lossy-long-prefill.md).
+    std::uint32_t product_prompt_end = 0;
+    // Tools are declared but neither their end nor a leading System/Developer message could be
+    // located: product_prompt_end does not cover them, so lossy prefill refuses the prompt.
+    bool product_prompt_unbounded = false;
     // Controls replacement of a named SessionIndex entry, not anonymous source ownership.
     bool update_session_index = true;
 };
@@ -199,6 +209,9 @@ class PreparedPromptAccess {
 public:
     [[nodiscard]] static const PreparedPromptData& view(const PreparedPrompt& prompt);
     [[nodiscard]] static PreparedPromptData take(PreparedPrompt&& prompt);
+    // An independent copy (its n-gram index is not copied), for planning without consuming the
+    // prompt: the summary strategy's reuse probe.
+    [[nodiscard]] static PreparedPrompt copy(const PreparedPrompt& prompt);
 };
 
 } // namespace ninfer::models::qwen3_5

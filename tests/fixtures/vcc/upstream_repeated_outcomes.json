@@ -1,0 +1,84 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "run it"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r0",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"make test\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r0",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"ok\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r1",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"make test\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r1",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"ok\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r2",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"make test\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r2",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"ok\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  }
+ ],
+ "cases": [
+  {
+   "id": "b4000",
+   "first": 0,
+   "last": 7,
+   "budget_chars": 4000
+  }
+ ]
+}

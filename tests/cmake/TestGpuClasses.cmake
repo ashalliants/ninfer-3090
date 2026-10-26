@@ -14,6 +14,7 @@
 #
 # A cpu test that links no kernel also belongs on HostOnlyTests.cmake, which CI builds without nvcc.
 set(NINFER_CPU_ONLY_TESTS
+  ninfer_a4_g64_reference_test
   ninfer_anthropic_schema_test
   ninfer_artifact_reader_test
   ninfer_bench_support_test
@@ -53,6 +54,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_prefill_stall_probe_test
   ninfer_prefill_pacing_test
   ninfer_prefill_yield_test
+  ninfer_lossy_prefill_sweep_test
   ninfer_prefill_depth_sweep_test
   ninfer_prefill_time_model_test
   ninfer_pretty_logging_test
@@ -61,13 +63,20 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_qwen3_5_frontend_test
   ninfer_qwen3_5_graft_loader_test
   ninfer_qwen3_5_loading_test
+  ninfer_qwen3_5_lossy_exact_end_test
+  ninfer_qwen3_5_lossy_flow_test
+  ninfer_qwen3_5_lossy_gap_map_test
+  ninfer_qwen3_5_lossy_scout_plan_test
+  ninfer_qwen3_5_lossy_selection_test
   ninfer_qwen3_5_mlp_a8_decode_test
+  ninfer_qwen3_5_scout_a4_wiring_test
   ninfer_qwen3_5_mtp_graph_profiles_test
   ninfer_qwen3_5_ngram_proposer_test
   ninfer_qwen3_5_reasoning_loop_test
   ninfer_qwen3_5_runtime_mechanisms_test
   ninfer_qwen3_5_speculative_round_shapes_test
   ninfer_qwen3_5_state_image_layout_test
+  ninfer_qwen3_5_text_positions_test
   ninfer_qwen3_5_tool_constraints_test
   ninfer_qwen3_5_tool_schema_oracle_test
   ninfer_qwen4_exp_context_cache_test
@@ -89,6 +98,8 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_serve_options_test
   ninfer_tensor_test
   ninfer_tool_call_parser_test
+  ninfer_vcc_projector_test
+  ninfer_summary_strategy_test
   ninfer_wide_math_test
   ninfer_worker_recovery_test
 )

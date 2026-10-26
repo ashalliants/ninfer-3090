@@ -9,6 +9,7 @@
 # The other cpu tests link the kernels, so they still need the full build (tools/run-tests.ps1
 # -CpuOnly runs all of them).
 set(NINFER_HOST_ONLY_TESTS
+  ninfer_a4_g64_reference_test
   ninfer_artifact_reader_test
   ninfer_chat_templates_test
   ninfer_chunked_reservation_test
@@ -29,6 +30,7 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_kv_capacity_test
   ninfer_media_decode_test
   ninfer_perplexity_evaluation_test
+  ninfer_lossy_prefill_sweep_test
   ninfer_prefill_depth_sweep_test
   ninfer_prefill_pacing_test
   ninfer_prefill_stall_probe_test
@@ -37,7 +39,11 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_pretty_logging_test
   ninfer_prompt_input_test
   ninfer_public_api_test
+  ninfer_qwen3_5_lossy_flow_test
+  ninfer_qwen3_5_lossy_scout_plan_test
+  ninfer_qwen3_5_lossy_selection_test
   ninfer_qwen3_5_ngram_proposer_test
+  ninfer_qwen3_5_text_positions_test
   ninfer_read_only_file_test
   ninfer_regex_choice_oracle_test
   ninfer_regex_choice_test
@@ -45,6 +51,8 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_s3_object_store_test
   ninfer_scheduler_test
   ninfer_tensor_test
+  ninfer_vcc_projector_test
+  ninfer_summary_strategy_test
   ninfer_wide_math_test
   ninfer_worker_recovery_test
 )
