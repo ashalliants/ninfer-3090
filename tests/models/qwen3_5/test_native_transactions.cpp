@@ -2487,8 +2487,10 @@ void prompt_fits_beside_residents_on_real_pools(DeviceContext& device,
         return program.plan_request(qwen::PreparedPromptAccess::take(frontend.prepare_tokens(ids)),
                                     request);
     };
-    // Binds `ids` on `lane` and prefills it completely, so it holds its pages as a resident.
-    const auto make_resident = [&](const std::vector<TokenId>& ids, std::uint32_t lane) {
+    // Binds `ids` on `lane` and prefills at most `calls` chunks of it (by default all of them), so
+    // it holds its pages as a resident.
+    const auto make_resident = [&](const std::vector<TokenId>& ids, std::uint32_t lane,
+                                   unsigned calls = 64) {
         auto base       = plan_request(ids);
         const auto root = program.inspect_source(base, std::nullopt);
         require(root.has_value(), "resident request has no root source");
@@ -2499,7 +2501,7 @@ void prompt_fits_beside_residents_on_real_pools(DeviceContext& device,
         require(bound.sequence.has_value(), "resident binding did not publish");
         const auto sequence = *bound.sequence;
         std::uint32_t processed = 0;
-        for (unsigned call = 0; call < 64 && processed < ids.size(); ++call) {
+        for (unsigned call = 0; call < calls && processed < ids.size(); ++call) {
             const std::array<qwen::ExecutionUnit, 1> units{
                 {{sequence, qwen::ExecutionUnitKind::Prefill}}};
             require(static_cast<bool>(program.reserve_units(units)),
@@ -2511,7 +2513,8 @@ void prompt_fits_beside_residents_on_real_pools(DeviceContext& device,
                 (void)program.commit(std::move(*step.pending), accepted, {}, nullptr);
             }
         }
-        require(processed == ids.size(), "resident prefill did not finish");
+        require(processed == std::min<std::size_t>(ids.size(), std::size_t{calls} * kChunk),
+                "resident prefill did not reach its chunk");
         return sequence;
     };
     const auto fits = [&](const std::vector<TokenId>& ids) {
@@ -2538,6 +2541,14 @@ void prompt_fits_beside_residents_on_real_pools(DeviceContext& device,
     require(program.abort(large).status == runtime::ConsumeStatus::Consumed,
             "the large resident retained its resources");
     require(fits(newcomer), "a prompt was still deferred after the resident released its pages");
+
+    // A large resident one chunk into its prefill holds 2 pages but will need 8 (#332): the rest
+    // of its prompt counts, so the newcomer is still deferred.
+    const auto starting = make_resident(make_ids(500, 5), 0, 1);
+    require(!fits(newcomer),
+            "a prompt was admitted beside a resident that has not yet reached its prompt end");
+    require(program.abort(starting).status == runtime::ConsumeStatus::Consumed,
+            "the starting resident retained its resources");
     require(program.physical_usage().occupied == empty, "the fit check leaked physical resources");
 }
 

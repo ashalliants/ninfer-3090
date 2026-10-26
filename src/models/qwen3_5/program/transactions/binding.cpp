@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <unordered_set>
@@ -67,6 +68,7 @@ bool ProgramImpl::prompt_fits_beside_residents(const RequestBasePlan& base,
     const auto source = candidate.checkpoint;
     if (source && !valid_checkpoint(*source)) { return true; } // start_binding reports it
     std::unordered_set<std::uint32_t> pinned_main, pinned_backend;
+    std::uint64_t to_come_main = 0, to_come_backend = 0;
     bool residents = false;
     const auto pin = [](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
                         KVAddressSpaceHandle address, auto& seen) {
@@ -81,6 +83,33 @@ bool ProgramImpl::prompt_fits_beside_residents(const RequestBasePlan& base,
         pin(*text_kv_addresses, *text_kv_pages, sequence.kv->text, pinned_main);
         if (sequence.kv->backend) {
             pin(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend, pinned_backend);
+        }
+        // A resident part-way through its prompt (or its replay) holds only the chunks it has
+        // reached; the rest of its prompt is as certain to need pages as the newcomer's.
+        const auto& control = requests[lane];
+        std::optional<UnitDemand> end;
+        if (control.lifecycle == Lifecycle::Replaying) {
+            end.emplace(UnitDemand{.kind = ExecutionUnitKind::Replay});
+            end->main_frontier    = control.replay_target;
+            end->backend_frontier = backend_kv_cache() ? control.replay_target : 0;
+        } else if (control.prefill) {
+            const auto& staged = *control.prefill;
+            end                = prefill_unit(staged.prompt_tokens,
+                                              staged.prompt_tokens > prefill_chunk
+                                                  ? staged.prompt_tokens - prefill_chunk
+                                                  : 0,
+                                              staged.initial_mtp_extent);
+        }
+        if (!end) { continue; }
+        to_come_main += runtime::resident_pages_to_prompt_end(
+            kv_pages_for_frontier(end->main_frontier),
+            text_kv_addresses->mapped_pages(sequence.kv->text),
+            text_kv_addresses->reserved_growth_pages(sequence.kv->text));
+        if (sequence.kv->backend) {
+            to_come_backend += runtime::resident_pages_to_prompt_end(
+                kv_pages_for_frontier(end->backend_frontier),
+                backend_kv_addresses->mapped_pages(*sequence.kv->backend),
+                backend_kv_addresses->reserved_growth_pages(*sequence.kv->backend));
         }
     }
     // Installed external context (a prompt graft) is pinned for good: its device pages are held
@@ -145,7 +174,8 @@ bool ProgramImpl::prompt_fits_beside_residents(const RequestBasePlan& base,
                 : 0U;
     return runtime::prompt_fits_beside_residents(
         {need_main, need_backend},
-        {pinned_main.size() + live_main, pinned_backend.size() + live_backend},
+        {pinned_main.size() + live_main + to_come_main,
+         pinned_backend.size() + live_backend + to_come_backend},
         {main_pool.usable_pages(), backend ? backend->usable_pages() : 0U}, residents);
 }
 
