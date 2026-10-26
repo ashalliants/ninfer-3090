@@ -73,6 +73,14 @@ enum class LinearPolicy : std::uint8_t {
     return policy == LinearPolicy::AllowA8GgmlDecodeMma;
 }
 
+/// valid_linear_policy for the Ops whose weights are never GGML block formats (the
+/// hyper-connection mix, the FP8 and NVFP4 GDN plans, the NVFP4 SwiGLU): AllowA8GgmlDecodeMma
+/// names a GGML-only route, so they refuse it at their own check instead of a later Linear doing
+/// so mid-call.
+[[nodiscard]] constexpr bool valid_dense_linear_policy(LinearPolicy policy) noexcept {
+    return valid_linear_policy(policy) && !allows_ggml_decode_mma(policy);
+}
+
 /// The cuBLAS prefill route. Only ever admitted above `kCublasPrefillMinTokens`, because its
 /// dequantise pass is weight-sized and has to be amortised over the tokens in the call.
 [[nodiscard]] constexpr bool allows_cublas_prefill(LinearPolicy policy) noexcept {

@@ -152,7 +152,53 @@ void require_hc_int8(const Parameters& parameters, const HcInt8Copies* copies, b
     }
 }
 
+// ForwardOptions::ggml_decode_mma: every projection the forward runs must suit the int8 tensor-core
+// decode route (Forward::ggml_decode_mma_aligned), checked once here rather than at a decode call.
+void require_ggml_decode_mma(const Parameters& parameters, bool on) {
+    if (!on) { return; }
+    const auto require = [](const LinearParameters& p, const char* what) {
+        if (!Forward::ggml_decode_mma_aligned(p)) {
+            throw std::invalid_argument(std::string("Qwen4Exp forward: --ggml-decode-mma needs every GGML projection "
+                                                    "16-byte aligned, and a ") +
+                                        what + " weight is not: start without --ggml-decode-mma");
+        }
+    };
+    const auto mixer = [&](const HyperConnectionParameters& hc) {
+        require(hc.down, "hyper-connection");
+        require(hc.up, "hyper-connection");
+    };
+    mixer(parameters.final_mixer);
+    for (const auto& block : parameters.layers) {
+        mixer(block.attn_hc);
+        mixer(block.mlp_hc);
+        if (const auto* attention = std::get_if<AttentionParameters>(&block.mixer)) {
+            for (const auto* p : {&attention->query_gate, &attention->key, &attention->value, &attention->output}) {
+                require(*p, "attention");
+            }
+        } else {
+            const auto& gdn = std::get<GdnParameters>(block.mixer);
+            for (const auto* p : {&gdn.qkv, &gdn.z, &gdn.control, &gdn.output}) { require(*p, "GDN"); }
+        }
+        for (const auto* p : {&block.moe.shared_gate, &block.moe.shared_up, &block.moe.shared_down}) {
+            require(*p, "shared expert");
+        }
+        if (block.ple) { require(block.ple->projection, "PLE"); }
+    }
+    if (parameters.mtp) {
+        const MtpParameters& m = *parameters.mtp;
+        mixer(m.attn_hc);
+        mixer(m.mlp_hc);
+        mixer(m.final_mixer);
+        for (const auto* p : {&m.embedding_projection, &m.hidden_projection, &m.output}) { require(*p, "drafter"); }
+    }
+}
+
 } // namespace
+
+bool Forward::ggml_decode_mma_aligned(const LinearParameters& p) noexcept {
+    return linear_policy(p, true) != ops::LinearPolicy::AllowA8GgmlDecodeMma ||
+           reinterpret_cast<std::uintptr_t>(p.weight.qdata) % 16 == 0;
+}
 
 ops::QsaIndexerGeometry qsa_geometry(const TextConfig& c) {
     return {.index_heads      = dim(c.qsa.index_heads),
@@ -198,6 +244,7 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
       moe_fused_route_(options.moe_fused_route), hc_int8_(options.hc_int8), hc_fused_read_(options.hc_fused_read),
       ggml_decode_mma_(options.ggml_decode_mma) {
     require_hc_int8(parameters_, hc_int8_, hc_fused_read_);
+    require_ggml_decode_mma(parameters_, ggml_decode_mma_);
     if (state_.gdn_conv.size() != config_.gdn_layers || state_.gdn_recurrent.size() != config_.gdn_layers ||
         state_.ple_slot.dtype != DType::I32 || state_.ple_slot.numel() != 1 ||
         state_.qsa_tails.size() != config_.attention_layers || kv_.layers.size() != config_.attention_layers ||
@@ -229,6 +276,7 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
       moe_fused_route_(options.moe_fused_route), hc_int8_(options.hc_int8), hc_fused_read_(options.hc_fused_read),
       ggml_decode_mma_(options.ggml_decode_mma) {
     require_hc_int8(parameters_, hc_int8_, hc_fused_read_);
+    require_ggml_decode_mma(parameters_, ggml_decode_mma_);
     if (mtp.has_value() != parameters_.mtp.has_value()) {
         throw std::invalid_argument("Qwen4Exp forward: the MTP drafter's parameters and state go together");
     }

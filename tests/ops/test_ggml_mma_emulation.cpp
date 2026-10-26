@@ -24,6 +24,7 @@
 //    exact and float(P) is exact. The same bounds hold analytically for every format.
 
 #include "core/weight.h"
+#include "ninfer/ops/linear.h"
 #include "ops/ggml_blocks_decode.h"
 #include "ops/ggml_linear_emulation.h"
 #include "ops/linear/ggml/ggml_mma_emulation.h"
@@ -404,8 +405,25 @@ void int32_range_safe() {
 
 } // namespace
 
+// The policy is the GGML linears' alone: the Ops whose weights are never GGML (the hyper-connection
+// mix, the FP8/NVFP4 GDN plans, the NVFP4 SwiGLU) check valid_dense_linear_policy, which refuses it
+// and admits every other valid policy.
+void dense_policies_refuse_the_route() {
+    using ninfer::ops::LinearPolicy;
+    check(ninfer::ops::valid_linear_policy(LinearPolicy::AllowA8GgmlDecodeMma) &&
+              !ninfer::ops::valid_dense_linear_policy(LinearPolicy::AllowA8GgmlDecodeMma),
+          "AllowA8GgmlDecodeMma is a Linear policy that the dense Ops refuse");
+    for (const LinearPolicy policy :
+         {LinearPolicy::A16Only, LinearPolicy::AllowA8, LinearPolicy::AllowA4, LinearPolicy::AllowA8Int,
+          LinearPolicy::AllowA8IntDecode, LinearPolicy::AllowPrefillCublas}) {
+        check(ninfer::ops::valid_dense_linear_policy(policy), "the dense Ops keep every other policy");
+    }
+    check(!ninfer::ops::valid_dense_linear_policy(static_cast<LinearPolicy>(0xFF)), "an invalid policy stays refused");
+}
+
 int main() {
     try {
+        dense_policies_refuse_the_route();
         for (const QType format : kFormats) decomposition(format);
         emulation_within_fp64();
         emulation_column_invariant();

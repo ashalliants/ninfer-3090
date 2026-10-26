@@ -369,6 +369,27 @@ int main() {
         // --moe-fused-route allocates nothing either: the one launch writes the same routing and
         // dispatch arrays the two Ops write, in the same carve.
         check(!q4::ProgramOptions{}.moe_fused_route, "the one-launch MoE route and dispatch is off by default");
+        // --ggml-decode-mma: the Forward refuses, at construction, a GGML projection the option
+        // would move to the int8 tensor-core route unless its weight starts on 16 bytes; a
+        // projection the option leaves alone (A16 policy, BF16 weight) is not its concern.
+        {
+            ex::LinearParameters ggml;
+            ggml.weight.layout = ninfer::QuantLayout::GgmlBlocks;
+            ggml.policy        = ops::LinearPolicy::AllowA8;
+            alignas(16) static const std::uint8_t bytes[32] = {};
+            ggml.weight.qdata = bytes;
+            check(ex::Forward::ggml_decode_mma_aligned(ggml), "an aligned GGML projection suits the mma route");
+            ggml.weight.qdata = bytes + 8;
+            check(!ex::Forward::ggml_decode_mma_aligned(ggml), "a GGML projection off 16 bytes is refused");
+            ex::LinearParameters a16 = ggml;
+            a16.policy               = ops::LinearPolicy::A16Only;
+            check(ex::Forward::ggml_decode_mma_aligned(a16), "a projection the option does not move is not checked");
+            ex::LinearParameters dense;
+            dense.weight.layout = ninfer::QuantLayout::RowSplit;
+            dense.policy        = ops::LinearPolicy::AllowA8;
+            dense.weight.qdata  = bytes + 8;
+            check(ex::Forward::ggml_decode_mma_aligned(dense), "a non-GGML weight is not checked");
+        }
 
         // --cpu-verify-misses: the CPU miss service's device counter is a term of fixed_bytes and its
         // mapped channel (with the calls' error word) is pinned host memory for the RAM ledger, both
@@ -530,6 +551,16 @@ int main() {
             read.hc_int8 = false;
             check(refuses(read, "--hc-fused-read") && refuses(read, "--hc-int8"),
                   "--hc-fused-read without --hc-int8 is refused naming both flags");
+        }
+        {
+            // --moe-gate-up-registers without --moe-precast-input: refused by the plan (so by
+            // every Program, before any call), naming both flags. (The pair with the precast input
+            // plans on a real configuration only; this test's would stop the plan elsewhere.)
+            q4::ProgramOptions registers;
+            registers.max_context           = 32768;
+            registers.moe_gate_up_registers = true;
+            check(refuses(registers, "--moe-gate-up-registers") && refuses(registers, "--moe-precast-input"),
+                  "--moe-gate-up-registers without --moe-precast-input is refused naming both flags");
         }
 
         // --ngram-flag-wait: the round graphs' wait counter is a 4-byte term of fixed_bytes and the

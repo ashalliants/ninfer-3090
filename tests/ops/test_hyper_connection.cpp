@@ -961,6 +961,21 @@ int main() {
                                                                                  kS, kRank, 1);
             } catch (const std::invalid_argument&) { threw = true; }
             check(threw, "an invalid LinearPolicy is refused by the capacity query");
+            // AllowA8GgmlDecodeMma is for GGML weights: the mix refuses it up front (its composed
+            // route's Linears would refuse it only mid-call).
+            const auto ggml_policy = ninfer::ops::LinearPolicy::AllowA8GgmlDecodeMma;
+            threw = false;
+            try {
+                ninfer::ops::hyper_connection_mix(R, w, p.down_w, p.up_w, ggml_policy, kS, kRank, kEps, x,
+                                                  &inject, ws, stream);
+            } catch (const std::invalid_argument&) { threw = true; }
+            check(threw, "AllowA8GgmlDecodeMma is refused by the mix");
+            threw = false;
+            try {
+                (void)ninfer::ops::hyper_connection_mix_workspace_capacity_bytes(p.down_w, p.up_w, ggml_policy,
+                                                                                 kS, kRank, 1);
+            } catch (const std::invalid_argument&) { threw = true; }
+            check(threw, "AllowA8GgmlDecodeMma is refused by the capacity query");
         }
         // A residual view off the 16-byte grid is refused (the fused route reads it with uint4).
         {
