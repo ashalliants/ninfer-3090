@@ -198,6 +198,9 @@ struct RequestRecord {
     Clock::time_point deadline;
     Clock::time_point submitted;
     std::optional<Clock::time_point> admitted_at;
+    // --prefill-order shortest: submitted plus the predicted cost of the prefill left at admission
+    // (PrefillOrder::Shortest). Kept across pauses, so a restored request keeps its place.
+    Clock::time_point prefill_deadline{};
     std::optional<Clock::time_point> first_token;
     std::optional<Clock::time_point> last_token;
     bool queue_wait_recorded = false;

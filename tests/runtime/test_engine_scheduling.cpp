@@ -44,6 +44,7 @@ struct Settings {
     // Real time a prefill step takes, for a test that must submit while one runs.
     std::chrono::microseconds prefill_sleep{0};
     std::uint32_t layer_slices = 0;
+    PrefillOrder prefill_order = PrefillOrder::Rotate;
     bool admission_fit_check = false;
     std::uint32_t pending_timeout_ms = 60'000;
     // Lossy prefill: LossyPrefillOptions::min_tokens (0: off).
@@ -86,7 +87,8 @@ public:
         options.prefill_schedule      = {.stall_budget_ms      = settings.stall_budget,
                                          .yield_remaining_ms   = settings.yield_ms,
                                          .decode_share_percent = settings.decode_share,
-                                         .layer_slices         = settings.layer_slices};
+                                         .layer_slices         = settings.layer_slices,
+                                         .order                = settings.prefill_order};
         ContextMachineCostModel costs;
         costs.prefill.chunk_ns     = kFixedNs;
         costs.prefill.token_ns_q32 = kPerTokenNs << 32U;
@@ -484,6 +486,74 @@ void test_a_short_request_pauses_a_long_prefill_and_it_resumes() {
     }
     require(expected == 8192, "the long prompt was not computed in full\n" + rig.dump());
     require(rig.core().runtime_stats().prefill_yields == 1, "the yield was not counted");
+}
+
+std::optional<std::size_t> last_index(const std::vector<Event>& events, Event::Kind kind,
+                                      std::uint64_t id) {
+    std::optional<std::size_t> found;
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        if (events[i].kind == kind && events[i].request == id) { found = i; }
+    }
+    return found;
+}
+
+std::optional<std::size_t> first_index(const std::vector<Event>& events, Event::Kind kind,
+                                       std::uint64_t id) {
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        if (events[i].kind == kind && events[i].request == id) { return i; }
+    }
+    return std::nullopt;
+}
+
+// Two long prompts in two lanes: rotation interleaves their steps, so both finish late; shortest
+// runs the earlier one (the earlier deadline, same cost) to the end before the later one starts.
+void test_rotation_interleaves_two_long_prefills() {
+    Rig rig({.chunk = 1024, .lanes = 2});
+    Result first;
+    start_long_prompt(rig, first);
+    auto second = rig.run(2, 8192, 1);
+    rig.release();
+    require(finished(first) && finished(second), "a request did not finish\n" + rig.dump());
+    const auto events = rig.events();
+    const auto second_first = first_index(events, Event::Kind::Prefill, 2);
+    const auto first_last   = last_index(events, Event::Kind::Prefill, 1);
+    require(second_first && first_last && *second_first < *first_last,
+            "rotation did not interleave the two prefills\n" + rig.dump());
+}
+
+void test_shortest_runs_one_long_prefill_at_a_time() {
+    Rig rig({.chunk = 1024, .lanes = 2, .prefill_order = PrefillOrder::Shortest});
+    Result first;
+    start_long_prompt(rig, first);
+    auto second = rig.run(2, 8192, 1);
+    rig.release();
+    require(finished(first) && finished(second), "a request did not finish\n" + rig.dump());
+    const auto events = rig.events();
+    const auto first_last   = last_index(events, Event::Kind::Prefill, 1);
+    const auto second_first = first_index(events, Event::Kind::Prefill, 2);
+    require(first_last && second_first && *first_last < *second_first,
+            "the later of two equal prompts prefilled before the earlier one finished\n" +
+                rig.dump());
+}
+
+void test_shortest_lets_a_short_prompt_overtake_a_long_one() {
+    Rig rig({.chunk = 1024, .lanes = 2, .prefill_order = PrefillOrder::Shortest});
+    Result long_result;
+    start_long_prompt(rig, long_result);
+    auto short_result = rig.run(2, 100, 1);
+    rig.release();
+    require(finished(long_result) && finished(short_result), "a request did not finish\n" + rig.dump());
+    const auto events = rig.events();
+    std::optional<std::size_t> long_third_step;
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        if (events[i].kind == Event::Kind::Prefill && events[i].request == 1 &&
+            events[i].position == 2048) {
+            long_third_step = i;
+        }
+    }
+    const auto short_last = last_index(events, Event::Kind::Prefill, 2);
+    require(long_third_step && short_last && *short_last < *long_third_step,
+            "the short prompt waited for the long prompt's next step\n" + rig.dump());
 }
 
 void test_a_long_newcomer_does_not_displace_a_long_prefill() {
@@ -1509,22 +1579,6 @@ std::uint32_t total_tokens(const std::vector<Event>& events) {
     return total;
 }
 
-std::optional<std::size_t> last_index(const std::vector<Event>& events, Event::Kind kind,
-                                      std::uint64_t id) {
-    std::optional<std::size_t> found;
-    for (std::size_t i = 0; i < events.size(); ++i) {
-        if (events[i].kind == kind && events[i].request == id) { found = i; }
-    }
-    return found;
-}
-
-std::optional<std::size_t> first_index(const std::vector<Event>& events, Event::Kind kind,
-                                       std::uint64_t id) {
-    for (std::size_t i = 0; i < events.size(); ++i) {
-        if (events[i].kind == kind && events[i].request == id) { return i; }
-    }
-    return std::nullopt;
-}
 
 // The trigger itself: never for a private conversation record, the threshold on what follows M.
 void test_lossy_trigger_rule() {
@@ -2186,6 +2240,10 @@ int main() {
         test_a_prompt_that_fits_beside_a_resident_starts_at_once);
     run("the fit answer is not asked without the flag",
         test_the_fit_answer_is_not_asked_without_the_flag);
+    run("rotation interleaves two long prefills", test_rotation_interleaves_two_long_prefills);
+    run("shortest runs one long prefill at a time", test_shortest_runs_one_long_prefill_at_a_time);
+    run("shortest lets a short prompt overtake a long one",
+        test_shortest_lets_a_short_prompt_overtake_a_long_one);
     run("a long newcomer does not displace a long prefill",
         test_a_long_newcomer_does_not_displace_a_long_prefill);
     run("a prefill with little left is not paused", test_a_prefill_with_little_left_is_not_paused);

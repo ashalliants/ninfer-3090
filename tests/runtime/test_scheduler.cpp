@@ -57,6 +57,7 @@ struct Request {
     bool capture_pending             = false;
     bool slice_in_flight             = false;
     bool recovery_pending            = false;
+    std::uint64_t prefill_deadline   = 0;
     std::optional<Budget> budget     = Budget{};
     std::optional<SequenceHandle> sequence;
     Output output;
@@ -310,6 +311,38 @@ void test_prefill_replay_round_robin() {
             "completed capture did not restore replay eligibility");
 }
 
+// --prefill-order shortest: the earliest deadline goes first, whatever the rotation says; a tie
+// keeps the rotation's order, and a chunk part-way through its slices still goes first.
+void test_prefill_shortest_first() {
+    Scheduler scheduler;
+    scheduler.set_prefill_order(ninfer::PrefillOrder::Shortest);
+    Slots slots{};
+    slots[0] = request(1, Request::Phase::Prefill);
+    slots[1] = request(2, Request::Phase::Replay);
+    slots[2] = request(3, Request::Phase::Prefill);
+    slots[3] = request(4, Request::Phase::Decode);
+    slots[0]->prefill_deadline = 900; // long, submitted first
+    slots[1]->prefill_deadline = 500; // a restored request keeps its deadline
+    slots[2]->prefill_deadline = 300; // short, submitted later
+    slots[3]->prefill_deadline = 100; // decoding: not a prefill candidate
+    for (int turn = 0; turn < 3; ++turn) {
+        const auto lane = scheduler.next_prefill(slots, 4);
+        require(lane == 2U, "the earliest prefill deadline did not keep the turn");
+        scheduler.prefill_executed(*lane, 4);
+    }
+    slots[2]->phase = Request::Phase::Decode;
+    require(scheduler.next_prefill(slots, 4) == 1U, "the next deadline did not take over");
+    slots[1]->phase = Request::Phase::Decode;
+    require(scheduler.next_prefill(slots, 4) == 0U,
+            "a long prefill was not run once nothing earlier was left");
+    slots[2]->phase            = Request::Phase::Prefill;
+    slots[2]->prefill_deadline = 900;
+    scheduler.prefill_executed(0, 4);
+    require(scheduler.next_prefill(slots, 4) == 2U, "a tie did not follow the rotation");
+    slots[0]->slice_in_flight = true;
+    require(scheduler.next_prefill(slots, 4) == 0U, "a part-sliced chunk did not go first");
+}
+
 void test_decode_and_control_membership() {
     Scheduler scheduler;
     Slots slots{};
@@ -419,6 +452,7 @@ int main() {
         test_pressure_victims_and_first_unit();
         test_restore_events();
         test_prefill_replay_round_robin();
+        test_prefill_shortest_first();
         test_decode_and_control_membership();
         test_progress_anchor_frontiers();
         test_pause_host_target();
