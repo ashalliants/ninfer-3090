@@ -114,8 +114,20 @@ and record them here.
 
   The instance image is Ubuntu 24.04 with CUDA 12.8.1, the baseline `docs/release-archive-linux.md`
   documents. v0.16.2 was cut this way by hand (same steps, before these helpers existed): cold build 5 min
-  on 24 effective cores, `nproc` there reports 192, so the build caps `-j` at 32. The helpers have not been
-  run end to end yet; expect a snag and record it here.
+  on 24 effective cores, `nproc` there reports 192, so the build caps `-j` at 32. v0.17.0 ran the helpers
+  end to end (a Quebec host, $0.26/h, 22 cores: cold build about 15 minutes, a rerun about 5 with ccache).
+  What it hit:
+  - **The smoke test's server outlived the script** until the fix in v0.17.0: `run.sh` runs `ninfer-serve`
+    in a pipeline, so it is a grandchild of the launcher, and a second `vast-release-linux.sh` on the same
+    box failed with "not enough free GPU memory". The script now starts the launcher under `setsid` and
+    stops its process group. If a run still leaves a `ninfer-serve` on the card, stop it by PID before rerunning.
+  - **Another model for the smoke test:** copy the scripts elsewhere, change `download-model.sh qwen38-27b`
+    in `vast-up.sh`, and put `NINFER_MODEL=/root/models/<artifact>` before `./run.sh` in
+    `vast-release-linux.sh`. Bonsai 2 27B (8.9 GiB) serves under the `qwen38-27b` profile.
+    `NINFER_VAST_STATE=<dir>` keeps the copy's state file apart. To avoid a region, filter the offers on
+    `geolocation` in `vast-up.sh`.
+  - Every commit after the build needs a rebuild on the box (the script refuses a remote HEAD that differs).
+    A rerun is about 5 minutes on ccache, so fix first, then rerun, rather than waiting for the first run.
 - **Windows archive: any x64 Windows machine, no NVIDIA GPU needed.** `scripts/release-windows.ps1`
   installs the toolchain (VS 2022 Build Tools, CMake, Ninja, CUDA 12.8.1 without the driver, vcpkg at the
   manifest baseline, ccache), builds the three products and runs the packager.
@@ -151,6 +163,13 @@ ccache, then 5 minutes for each repackage. Traps:
   incremental and removes the old `dist/*<version>*` first.
 - The first run of `release-windows.ps1` without the notes in the checkout compiles everything and then
   fails at packaging with "Missing docs/release-notes/RELEASE_NOTES_X.Y.Z.md": commit the notes before building, or just rerun.
+- **This build is the only MSVC compile of `master`.** CI builds Linux only, so a Windows-only compile
+  error surfaces here first. v0.17.0 found `src/serve/serve_options.cpp` failing with `C1061: blocks nested
+  too deeply`: MSVC limits an if/else-if chain to about 128 levels, and the option parser had passed it.
+  New flags with a shared prefix go in their own chain ahead of the main one, as `--context-store*` and
+  `--lossy-prefill-*` do.
+- A `-SkipBootstrap` run needs 20 GB free on C: (the full bootstrap needs 50 GB). The GMKtec box had 29 GB
+  in 2026-10; old releases' zips in `C:\ninfer-release\src\dist` take about 1.6 GB each once published.
 
 ### Windows without a card: what the v0.16.1 run needed
 

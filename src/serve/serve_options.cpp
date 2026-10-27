@@ -480,6 +480,126 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (++i >= argc) { throw std::invalid_argument(std::string(flag) + " needs a value"); }
             return argv[i];
         };
+        // The context store and lossy prefill options are parsed in chains of their own: MSVC
+        // refuses an if/else-if chain nested past its limit (C1061), and the one below is long.
+        if (arg.rfind("--context-store", 0) == 0) {
+            if (arg == "--context-store") {
+                options.context_store_path = require_value("--context-store");
+                if (options.context_store_path.empty()) {
+                    throw std::invalid_argument("--context-store must not be empty");
+                }
+            } else if (arg == "--context-store-max-gib") {
+                const std::uint64_t gib =
+                    parse_u64(require_value("--context-store-max-gib"), "context-store-max-gib");
+                if (gib == 0 || gib > (std::numeric_limits<std::uint64_t>::max() >> 30)) {
+                    throw std::invalid_argument("--context-store-max-gib is out of range");
+                }
+                options.context_store_max_gib = gib;
+            } else if (arg == "--context-store-ttl-hours") {
+                options.context_store_ttl_hours = static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--context-store-ttl-hours"), "context-store-ttl-hours"));
+                context_store_tuning = true;
+            } else if (arg == "--context-store-idle-seconds") {
+                options.context_store_idle_seconds = static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--context-store-idle-seconds"), "context-store-idle-seconds"));
+                context_store_tuning = true;
+            } else if (arg == "--context-store-restore-seconds") {
+                options.context_store_restore_seconds = static_cast<std::uint32_t>(
+                    parse_nonnegative_int(require_value("--context-store-restore-seconds"),
+                                          "context-store-restore-seconds"));
+                context_store_tuning = true;
+            } else if (arg == "--context-store-flush-seconds") {
+                options.context_store_flush_seconds = static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--context-store-flush-seconds"), "context-store-flush-seconds"));
+                context_store_tuning = true;
+            } else if (arg == "--context-store-peer") {
+                const std::string directory = require_value("--context-store-peer");
+                if (directory.empty()) { throw std::invalid_argument("--context-store-peer needs a directory"); }
+                options.context_store_peers.emplace_back(directory);
+                context_store_tuning = true;
+            } else if (arg == "--context-store-peer-poll-ms") {
+                options.context_store_peer_poll_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--context-store-peer-poll-ms"), "context-store-peer-poll-ms"));
+                if (options.context_store_peer_poll_ms == 0) {
+                    throw std::invalid_argument("--context-store-peer-poll-ms must be at least 1");
+                }
+                context_store_tuning = true;
+            } else if (arg == "--context-store-compress") {
+                options.context_store_compress = true;
+                context_store_tuning           = true;
+            } else if (arg == "--context-store-s3-endpoint") {
+                options.context_store_s3_endpoint = require_value("--context-store-s3-endpoint");
+                context_store_tuning              = true;
+            } else if (arg == "--context-store-s3-bucket") {
+                options.context_store_s3_bucket = require_value("--context-store-s3-bucket");
+                context_store_tuning            = true;
+            } else if (arg == "--context-store-s3-prefix") {
+                options.context_store_s3_prefix = require_value("--context-store-s3-prefix");
+                context_store_tuning            = true;
+            } else if (arg == "--context-store-s3-region") {
+                options.context_store_s3_region = require_value("--context-store-s3-region");
+                context_store_tuning            = true;
+            } else if (arg == "--context-store-s3-upload-delay-seconds") {
+                options.context_store_s3_upload_delay_seconds =
+                    static_cast<std::uint32_t>(parse_nonnegative_int(
+                        require_value("--context-store-s3-upload-delay-seconds"),
+                        "context-store-s3-upload-delay-seconds"));
+                context_store_tuning = true;
+            } else {
+                throw std::invalid_argument("unknown argument: " + arg);
+            }
+            continue;
+        }
+        if (arg.rfind("--lossy-prefill-", 0) == 0) {
+            if (arg == "--lossy-prefill-min-tokens") {
+                options.lossy_prefill.min_tokens = static_cast<std::uint32_t>(
+                    parse_nonnegative_int(require_value("--lossy-prefill-min-tokens"),
+                                          "lossy-prefill-min-tokens"));
+            } else if (arg == "--lossy-prefill-keep") {
+                options.lossy_prefill.keep_fraction = parse_float_in(
+                    require_value("--lossy-prefill-keep"), "lossy-prefill-keep", 0.0F, 1000.0F);
+            } else if (arg == "--lossy-prefill-filter-layer") {
+                options.lossy_prefill.filter_layer = static_cast<std::uint32_t>(
+                    parse_nonnegative_int(require_value("--lossy-prefill-filter-layer"),
+                                          "lossy-prefill-filter-layer"));
+            } else if (arg == "--lossy-prefill-block") {
+                options.lossy_prefill.block_tokens = static_cast<std::uint32_t>(
+                    parse_nonnegative_int(require_value("--lossy-prefill-block"), "lossy-prefill-block"));
+            } else if (arg == "--lossy-prefill-recent") {
+                options.lossy_prefill.recent_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--lossy-prefill-recent"), "lossy-prefill-recent"));
+            } else if (arg == "--lossy-prefill-head") {
+                options.lossy_prefill.head_tokens = static_cast<std::uint32_t>(
+                    parse_nonnegative_int(require_value("--lossy-prefill-head"), "lossy-prefill-head"));
+            } else if (arg == "--lossy-prefill-query-rows") {
+                options.lossy_prefill.query_rows = static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--lossy-prefill-query-rows"), "lossy-prefill-query-rows"));
+            } else if (arg == "--lossy-prefill-pool-window") {
+                options.lossy_prefill.pool_window = static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--lossy-prefill-pool-window"), "lossy-prefill-pool-window"));
+            } else if (arg == "--lossy-prefill-skip") {
+                options.lossy_prefill.skip_fraction = parse_float_in(
+                    require_value("--lossy-prefill-skip"), "lossy-prefill-skip", 0.0F, 1000.0F);
+            } else if (arg == "--lossy-prefill-scout-a4") {
+                options.lossy_prefill.scout_a4 = true;
+            } else if (arg == "--lossy-prefill-strategy") {
+                const std::string value = require_value("--lossy-prefill-strategy");
+                if (value == "select") {
+                    options.lossy_prefill.strategy = LossyStrategy::Select;
+                } else if (value == "summary") {
+                    options.lossy_prefill.strategy = LossyStrategy::Summary;
+                } else {
+                    throw std::invalid_argument("--lossy-prefill-strategy must be select or summary");
+                }
+            } else if (arg == "--lossy-prefill-summary-max-tokens") {
+                options.lossy_prefill.summary_max_tokens = static_cast<std::uint32_t>(
+                    parse_nonnegative_int(require_value("--lossy-prefill-summary-max-tokens"),
+                                          "lossy-prefill-summary-max-tokens"));
+            } else {
+                throw std::invalid_argument("unknown argument: " + arg);
+            }
+            continue;
+        }
         if (arg == "--host") {
             options.host = require_value("--host");
         } else if (arg == "--port") {
@@ -522,50 +642,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.prefill_schedule.stall_budget_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-stall-budget-ms"),
                                       "prefill-stall-budget-ms"));
-        } else if (arg == "--lossy-prefill-min-tokens") {
-            options.lossy_prefill.min_tokens = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--lossy-prefill-min-tokens"),
-                                      "lossy-prefill-min-tokens"));
-        } else if (arg == "--lossy-prefill-keep") {
-            options.lossy_prefill.keep_fraction = parse_float_in(
-                require_value("--lossy-prefill-keep"), "lossy-prefill-keep", 0.0F, 1000.0F);
-        } else if (arg == "--lossy-prefill-filter-layer") {
-            options.lossy_prefill.filter_layer = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--lossy-prefill-filter-layer"),
-                                      "lossy-prefill-filter-layer"));
-        } else if (arg == "--lossy-prefill-block") {
-            options.lossy_prefill.block_tokens = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--lossy-prefill-block"), "lossy-prefill-block"));
-        } else if (arg == "--lossy-prefill-recent") {
-            options.lossy_prefill.recent_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(
-                require_value("--lossy-prefill-recent"), "lossy-prefill-recent"));
-        } else if (arg == "--lossy-prefill-head") {
-            options.lossy_prefill.head_tokens = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--lossy-prefill-head"), "lossy-prefill-head"));
-        } else if (arg == "--lossy-prefill-query-rows") {
-            options.lossy_prefill.query_rows = static_cast<std::uint32_t>(parse_nonnegative_int(
-                require_value("--lossy-prefill-query-rows"), "lossy-prefill-query-rows"));
-        } else if (arg == "--lossy-prefill-pool-window") {
-            options.lossy_prefill.pool_window = static_cast<std::uint32_t>(parse_nonnegative_int(
-                require_value("--lossy-prefill-pool-window"), "lossy-prefill-pool-window"));
-        } else if (arg == "--lossy-prefill-skip") {
-            options.lossy_prefill.skip_fraction = parse_float_in(
-                require_value("--lossy-prefill-skip"), "lossy-prefill-skip", 0.0F, 1000.0F);
-        } else if (arg == "--lossy-prefill-scout-a4") {
-            options.lossy_prefill.scout_a4 = true;
-        } else if (arg == "--lossy-prefill-strategy") {
-            const std::string value = require_value("--lossy-prefill-strategy");
-            if (value == "select") {
-                options.lossy_prefill.strategy = LossyStrategy::Select;
-            } else if (value == "summary") {
-                options.lossy_prefill.strategy = LossyStrategy::Summary;
-            } else {
-                throw std::invalid_argument("--lossy-prefill-strategy must be select or summary");
-            }
-        } else if (arg == "--lossy-prefill-summary-max-tokens") {
-            options.lossy_prefill.summary_max_tokens = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--lossy-prefill-summary-max-tokens"),
-                                      "lossy-prefill-summary-max-tokens"));
         } else if (arg == "--request-log-lossy-detail") {
             options.request_log_lossy_detail = true;
         } else if (arg == "--yield-long-prefill-ms") {
@@ -770,68 +846,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
-        } else if (arg == "--context-store") {
-            options.context_store_path = require_value("--context-store");
-            if (options.context_store_path.empty()) {
-                throw std::invalid_argument("--context-store must not be empty");
-            }
-        } else if (arg == "--context-store-max-gib") {
-            const std::uint64_t gib =
-                parse_u64(require_value("--context-store-max-gib"), "context-store-max-gib");
-            if (gib == 0 || gib > (std::numeric_limits<std::uint64_t>::max() >> 30)) {
-                throw std::invalid_argument("--context-store-max-gib is out of range");
-            }
-            options.context_store_max_gib = gib;
-        } else if (arg == "--context-store-ttl-hours") {
-            options.context_store_ttl_hours = static_cast<std::uint32_t>(parse_nonnegative_int(
-                require_value("--context-store-ttl-hours"), "context-store-ttl-hours"));
-            context_store_tuning = true;
-        } else if (arg == "--context-store-idle-seconds") {
-            options.context_store_idle_seconds = static_cast<std::uint32_t>(parse_nonnegative_int(
-                require_value("--context-store-idle-seconds"), "context-store-idle-seconds"));
-            context_store_tuning = true;
-        } else if (arg == "--context-store-restore-seconds") {
-            options.context_store_restore_seconds = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--context-store-restore-seconds"),
-                                      "context-store-restore-seconds"));
-            context_store_tuning = true;
-        } else if (arg == "--context-store-flush-seconds") {
-            options.context_store_flush_seconds = static_cast<std::uint32_t>(parse_nonnegative_int(
-                require_value("--context-store-flush-seconds"), "context-store-flush-seconds"));
-            context_store_tuning = true;
-        } else if (arg == "--context-store-peer") {
-            const std::string directory = require_value("--context-store-peer");
-            if (directory.empty()) { throw std::invalid_argument("--context-store-peer needs a directory"); }
-            options.context_store_peers.emplace_back(directory);
-            context_store_tuning = true;
-        } else if (arg == "--context-store-peer-poll-ms") {
-            options.context_store_peer_poll_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
-                require_value("--context-store-peer-poll-ms"), "context-store-peer-poll-ms"));
-            if (options.context_store_peer_poll_ms == 0) {
-                throw std::invalid_argument("--context-store-peer-poll-ms must be at least 1");
-            }
-            context_store_tuning = true;
-        } else if (arg == "--context-store-compress") {
-            options.context_store_compress = true;
-            context_store_tuning           = true;
-        } else if (arg == "--context-store-s3-endpoint") {
-            options.context_store_s3_endpoint = require_value("--context-store-s3-endpoint");
-            context_store_tuning              = true;
-        } else if (arg == "--context-store-s3-bucket") {
-            options.context_store_s3_bucket = require_value("--context-store-s3-bucket");
-            context_store_tuning            = true;
-        } else if (arg == "--context-store-s3-prefix") {
-            options.context_store_s3_prefix = require_value("--context-store-s3-prefix");
-            context_store_tuning            = true;
-        } else if (arg == "--context-store-s3-region") {
-            options.context_store_s3_region = require_value("--context-store-s3-region");
-            context_store_tuning            = true;
-        } else if (arg == "--context-store-s3-upload-delay-seconds") {
-            options.context_store_s3_upload_delay_seconds =
-                static_cast<std::uint32_t>(parse_nonnegative_int(
-                    require_value("--context-store-s3-upload-delay-seconds"),
-                    "context-store-s3-upload-delay-seconds"));
-            context_store_tuning = true;
         } else if (arg == "--no-exit-on-engine-failure") {
             options.exit_on_engine_failure = false;
         } else if (arg == "--lm-head-draft") {

@@ -159,7 +159,11 @@ try {
 
     $freeGb = [math]::Round((Get-PSDrive -Name ($WorkDir.Substring(0, 1))).Free / 1GB)
     Write-Host "free disk on $($WorkDir.Substring(0, 2)): $freeGb GB"
-    if ($freeGb -lt 50) { throw 'Under 50 GB free: the CUDA toolkit, vcpkg ffmpeg build and the build tree need about that.' }
+    # The toolkit and vcpkg ffmpeg are installed once by the bootstrap; a -SkipBootstrap rebuild needs only room
+    # for the build tree and the packaged archive (about 10 GB with ccache hits).
+    if ($SkipBootstrap) {
+        if ($freeGb -lt 20) { throw 'Under 20 GB free: the build tree and the packaged archive need about that.' }
+    } elseif ($freeGb -lt 50) { throw 'Under 50 GB free: the CUDA toolkit, vcpkg ffmpeg build and the build tree need about that.' }
 
     if (-not $SkipBootstrap) {
         Write-Step 'bootstrapping the toolchain'
