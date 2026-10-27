@@ -454,6 +454,96 @@ public:
     std::deque<PendingWrite> pending_writes;
     bool writer_active = false;
     std::string active_write_id; // the write in progress, while writer_active
+    std::mutex store_flush_mutex; // one Engine::flush_context_store at a time
+    // Set by a flush for the moment between its final check and its count of unsaved sessions:
+    // an idle or shared-prefix write offered then is refused, so its session counts as unsaved;
+    // an eviction write (its session's last chance) is queued and noted in
+    // store_write_during_close, which makes the flush report the bucket incomplete. Under
+    // writer_mutex.
+    bool store_writes_closed      = false;
+    bool store_write_during_close = false;
+
+    // Engine::flush_context_store. One flush at a time: each turns the core's flush on and off.
+    ContextStoreFlushReport flush_store(std::chrono::milliseconds budget) {
+        if (!store) { throw std::invalid_argument("the context store is off (--context-store)"); }
+        std::scoped_lock flushing(store_flush_mutex);
+        const auto started  = std::chrono::steady_clock::now();
+        const auto deadline = started + budget;
+        const auto puts     = store->stats().puts;
+        // A write that fails during the flush may be an evicted session's, whose owner is gone
+        // already: nothing would count it as unsaved, so a failure makes the bucket incomplete.
+        const auto failures = store_write_failures.load(std::memory_order_acquire);
+        ContextStoreFlushReport report;
+        with_generation([&](auto& generation) {
+            generation.set_store_flush(true);
+            struct Off {
+                decltype(generation)& core;
+                ~Off() { core.set_store_flush(false); }
+            } const off{generation};
+            for (;;) {
+                report.unsaved = generation.unsaved_store_sessions();
+                if ((report.unsaved == 0 && store_queue_idle()) ||
+                    std::chrono::steady_clock::now() >= deadline) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+        // Every image the bucket may lack goes now: those still waiting out their delay, and any
+        // whose upload was given up when the queue was full. Serving goes on meanwhile, and a write
+        // (an eviction's, say) can land while the uploads run: those are uploaded too, a pass at a
+        // time, until a pass ends with the writer idle. The answer describes the store as of that
+        // moment; a write that starts after it is not this flush's (the gateway stops routing to
+        // the box first).
+        for (;;) {
+            while (!store_queue_idle() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            // Writes the store has completed: one that lands during the pass (queued and written
+            // after the scan, so the writer looks idle again) shows as a change here.
+            const auto puts_before = store->stats().puts;
+            report.uploaded        = store->upload_unpublished(store_binding, deadline);
+            bool settled           = false;
+            {
+                // The check and the close are one step: a write offered after it is refused
+                // until the count below, so it shows as unsaved instead of slipping between them.
+                std::scoped_lock lock(writer_mutex);
+                settled = pending_writes.empty() && !writer_active &&
+                          store->stats().puts == puts_before;
+                store_writes_closed = settled;
+            }
+            if (settled || std::chrono::steady_clock::now() >= deadline) {
+                // A write still queued, in progress or landed since the scan has not reached the
+                // bucket.
+                report.uploaded = report.uploaded && settled;
+                break;
+            }
+        }
+        struct Reopen {
+            Impl& impl;
+            bool written_during_close = false;
+            void now() {
+                std::scoped_lock lock(impl.writer_mutex);
+                written_during_close          = impl.store_write_during_close;
+                impl.store_writes_closed      = false;
+                impl.store_write_during_close = false;
+            }
+            ~Reopen() { now(); }
+        } reopen{*this};
+        // As things stand at the close: a session whose write was refused meanwhile counts here.
+        with_generation([&](auto& generation) { report.unsaved = generation.unsaved_store_sessions(); });
+        reopen.now();
+        // An eviction write queued during the close is on its way to the store, not in the bucket.
+        if (reopen.written_during_close) { report.uploaded = false; }
+        if (store_write_failures.load(std::memory_order_acquire) != failures) {
+            report.uploaded = false;
+        }
+        report.written  = store->stats().puts - puts;
+        report.seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        return report;
+    }
+
     std::vector<std::uint8_t> spare_export_buffer; // see kMaximumSpareExportBytes
     // Ids of queued writes that failed since the core last took them. Bounded: beyond it the
     // oldest go and `failed_write_ids_lost` says so, and the core then retries every continuation
@@ -764,6 +854,12 @@ private:
     bool enqueue_store_write(CheckpointImage&& image, StoreWrite kind) {
         std::unique_lock lock(writer_mutex);
         if (writer_stop) { return false; } // shutting down: the final flush writes it instead
+        // A flush is counting what is unsaved: this session counts, and is written after it. An
+        // evicted session has no later chance, so it is queued, and the flush told it missed one.
+        if (store_writes_closed) {
+            if (kind != StoreWrite::Eviction) { return false; }
+            store_write_during_close = true;
+        }
         // The memory the queue holds: a reused export buffer can be larger than its image.
         std::size_t queued_bytes = 0;
         for (const auto& pending : pending_writes) { queued_bytes += pending.image.bytes.capacity(); }
@@ -1132,6 +1228,11 @@ bool Engine::is_available() const {
             }
         },
         impl_->core);
+}
+
+ContextStoreFlushReport Engine::flush_context_store(std::chrono::milliseconds budget) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->flush_store(budget);
 }
 
 ResidencyStatus Engine::suspend(std::optional<bool> auto_resume) {

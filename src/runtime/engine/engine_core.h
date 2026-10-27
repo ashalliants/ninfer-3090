@@ -632,6 +632,31 @@ public:
         return usage.capacity.host_bytes - usage.occupied.host_bytes;
     }
 
+    // A flush of the context store, for a gateway about to drain the box or move conversations:
+    // while on, the worker writes every retained continuation the store does not hold as it is
+    // now, one between units a second apart as idle writes do, so serving carries on.
+    void set_store_flush(bool on) noexcept {
+        store_flush_.store(on, std::memory_order_release);
+        if (on) { queue_cv_.notify_all(); }
+    }
+
+    // Retained continuations, not in use by a request, that the store does not hold as they are
+    // now and has not let go of: what a flush still has to write.
+    [[nodiscard]] std::size_t unsaved_store_sessions() {
+        std::scoped_lock lock(execution_mutex_);
+        if (store_.store == nullptr) { return 0; }
+        (void)forget_failed_store_writes();
+        forget_removed_store_images();
+        std::size_t unsaved = 0;
+        for (const auto& owner : resources_.retained_owners(*instance_.program)) {
+            const auto found = owner_marks_.find(owner.token);
+            if (!owner.active && (found == owner_marks_.end() || !settled(found->second, owner.points))) {
+                ++unsaved;
+            }
+        }
+        return unsaved;
+    }
+
     // Restores one stored image into the empty cache at start-up as a Host-resident continuation.
     // Never evicts anything. False when it does not fit now or does not belong to this Engine.
     // `read_ns`, when known, is how long the store took to read it: with the import time it is one
@@ -3891,8 +3916,10 @@ private:
             const bool failing = forget_failed_store_writes();
             forget_removed_store_images();
             // With idle writes off the scan still runs to the pruning below: write-on-evict adds a
-            // mark for every owner it is offered, and nothing else ever erases them.
-            const bool idle_writes = store_.idle_persist.count() > 0;
+            // mark for every owner it is offered, and nothing else ever erases them. A flush
+            // (set_store_flush) writes every unsaved continuation, idle or not, the same way.
+            const bool flushing    = store_flush_.load(std::memory_order_acquire);
+            const bool idle_writes = store_.idle_persist.count() > 0 || flushing;
             if (idle_writes && failing) {
                 // A failing disk: do not export deep sessions over and over.
                 next_persist_scan_ = now + std::chrono::seconds(30);
@@ -3926,7 +3953,7 @@ private:
                 if (owner.active) { continue; }
                 auto& entry = mark(owner.token);
                 if (settled(entry, owner.points) ||
-                    now - entry.last_used < store_.idle_persist) {
+                    (!flushing && now - entry.last_used < store_.idle_persist)) {
                     continue;
                 }
                 std::uint32_t depth = 0;
@@ -4804,11 +4831,15 @@ private:
                     const auto woken = [&] {
                         return stopping_ || !pending_.empty() || !probes_.empty();
                     };
-                    if (store_.sink && store_.idle_persist.count() > 0) {
+                    if (store_.sink && (store_.idle_persist.count() > 0 ||
+                                        store_flush_.load(std::memory_order_acquire))) {
                         // Wake up now and then to write idle continuations to the store.
                         queue_cv_.wait_for(lock, std::chrono::seconds(1), woken);
                     } else {
-                        queue_cv_.wait(lock, woken);
+                        // A flush (set_store_flush) wakes it to write, then takes the branch above.
+                        queue_cv_.wait(lock, [&] {
+                            return woken() || store_flush_.load(std::memory_order_acquire);
+                        });
                     }
                 }
                 if (stopping_) {
@@ -5176,6 +5207,7 @@ private:
     std::uint64_t store_removals_seen_ = 0;
     std::uint64_t store_failures_seen_ = 0;
     Clock::time_point next_persist_scan_{};
+    std::atomic<bool> store_flush_{false};
     std::mutex hydration_mutex_;
     std::condition_variable hydration_cv_;
     std::deque<HydrationTask> hydration_queue_;

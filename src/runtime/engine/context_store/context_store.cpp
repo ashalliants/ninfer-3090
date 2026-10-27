@@ -1839,7 +1839,6 @@ void ContextStore::enqueue_remote(RemoteTask task) {
 void ContextStore::enqueue_upload(const std::string& id, std::uint64_t generation,
                                   std::vector<std::uint8_t> manifest, std::vector<ChunkRef> chunks,
                                   std::vector<std::string> superseded) {
-    constexpr std::size_t kMaximumQueuedUploads = 16;
     std::vector<ChunkRef> unused;
     bool queued = false;
     {
@@ -1984,6 +1983,48 @@ void ContextStore::remote_loop() {
     std::scoped_lock io(io_mutex_);
     std::scoped_lock state(mutex_);
     unpin_chunks_locked(pinned);
+}
+
+bool ContextStore::upload_unpublished(std::string_view binding,
+                                      std::chrono::steady_clock::time_point deadline) {
+    if (!options_.remote) { return true; }
+    for (;;) {
+        std::size_t unpublished = 0;
+        {
+            std::scoped_lock io(io_mutex_);
+            std::scoped_lock lock(mutex_);
+            std::unordered_set<std::string> queued;
+            {
+                std::scoped_lock remote_lock(remote_mutex_);
+                for (const RemoteTask& task : remote_queue_) {
+                    if (task.kind == RemoteTask::Kind::Upload) { queued.insert(task.id); }
+                }
+            }
+            std::size_t room = kMaximumQueuedUploads > queued.size()
+                                   ? kMaximumQueuedUploads - queued.size()
+                                   : 0;
+            for (const auto& [id, entry] : entries_) {
+                if (entry.published || entry.evicted || !entry.peer_memo_key.empty() ||
+                    entry.info.binding != binding || !entry_local_locked(entry)) {
+                    continue;
+                }
+                ++unpublished;
+                if (queued.count(id) != 0 || room == 0) { continue; }
+                std::vector<std::uint8_t> manifest;
+                try {
+                    manifest = read_whole_file(manifest_path(id));
+                } catch (...) { continue; }
+                std::vector<ChunkRef> chunks = entry.chunks;
+                for (const ChunkRef& chunk : chunks) { ++chunks_[hex_key(chunk.hash)].pins; }
+                enqueue_upload(id, entry.generation, std::move(manifest), std::move(chunks), {});
+                --room;
+            }
+        }
+        // Delayed uploads run now; then look again for what is still not in the bucket.
+        const bool drained = flush_remote(deadline);
+        if (unpublished == 0) { return drained; }
+        if (!drained || std::chrono::steady_clock::now() >= deadline) { return false; }
+    }
 }
 
 bool ContextStore::flush_remote(std::chrono::steady_clock::time_point deadline, bool final_flush) {

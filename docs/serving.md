@@ -696,8 +696,8 @@ The local directory becomes a cache of the bucket.
   per session), and an object the bucket has lost in the meantime is uploaded again from the directory,
   so something in use does not expire under it. A write is uploaded from a snapshot taken when it was
   written, with its chunk files kept on disk until the upload ends (each newer write of a session
-  replacing its queued upload). At most 16 uploads wait, and their files count against
-  `--context-store-max-gib`: beyond 16, and whenever the directory is over its limit with nothing
+  replacing its queued upload). At most 64 uploads wait, and their files count against
+  `--context-store-max-gib`: beyond 64, and whenever the directory is over its limit with nothing
   left to evict, the oldest waiting uploads are given up
   (`ninfer_context_store_remote_uploads_dropped_total`) and their sessions are uploaded at their
   next write; the upload in progress keeps its files until it ends. The directory therefore holds at most the limit plus the newest session and the upload in
@@ -707,6 +707,29 @@ The local directory becomes a cache of the bucket.
 - An unreachable bucket costs the uploads and the fetches, counted in `ninfer_context_store_remote_*`;
   the directory keeps working. Shutdown waits for queued uploads up to the remote flush budget (two
   minutes) and then interrupts the transfer in progress, so it never waits out a stalled connection.
+
+#### Flushing before a box goes
+
+`POST /v1/context-store/flush` (optional body `{"budget_seconds": N}`, 1-3600, default 600) writes
+every retained conversation the store does not hold as it is now, then uploads whatever waits for the
+bucket without its delay, while the server keeps serving. Conversations are written one a second
+between steps, as idle writes are, so requests carry on beside it. It answers once nothing is left or
+the budget is spent:
+
+```json
+{"written": 12, "unsaved": 0, "uploaded": true, "seconds": 14.2}
+```
+
+`unsaved` counts conversations still not stored (one in use by a request is not counted until it
+ends) and `uploaded` is false when the uploads did not all finish. The answer describes the store
+as of when the flush finished: writes made while it ran (an eviction's, say) are uploaded by it,
+but a turn that ends after it answers is not, so stop routing new turns to the box first and call
+the flush again if `unsaved` is not zero or `uploaded` is false. It answers 409
+`context_store_off` without `--context-store`. A gateway calls it when it starts draining a box it
+will destroy, or before it moves conversations elsewhere: the next box then finds them in the
+bucket. With that in place a fleet can trade freshness for traffic: a long
+`--context-store-s3-upload-delay-seconds` sends a busy conversation's state once per delay instead
+of after every turn, and the flush sends the rest before the box goes.
 
 
 ### Model suspend

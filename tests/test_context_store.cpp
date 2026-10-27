@@ -1139,6 +1139,50 @@ void test_queued_uploads_cannot_hold_the_directory_over_its_limit() {
 
 }
 
+// A flush before the box goes reaches the bucket with every image, even past the upload queue's
+// limit (which gives up the oldest waiting uploads) and before their delay.
+void test_upload_unpublished_sends_every_image_past_the_queue_limit() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    {
+        // A session another model or configuration left in the directory (an earlier run's): not
+        // this binding's to send.
+        ContextStore earlier(options_for(directory.path()));
+        auto foreign    = describe("f0");
+        foreign.binding = "model-b";
+        (void)earlier.put(foreign, concat({pseudo_random(30, 900), pseudo_random(2000, 901)}),
+                          std::array{ContextStore::Region{30, 2000}});
+    }
+    ContextStore::Options options = remote_options(directory.path(), remote);
+    options.remote_upload_delay   = std::chrono::seconds(3600);
+    ContextStore store(options);
+    check(drained(store), "the start-up refresh did not finish");
+    constexpr std::uint32_t kImages = ContextStore::kMaximumQueuedUploads + 4;
+    for (std::uint32_t i = 1; i <= kImages; ++i) {
+        (void)store.put(describe("f" + std::to_string(i)),
+                        concat({pseudo_random(30, i), pseudo_random(2000, 500 + i)}),
+                        std::array{ContextStore::Region{30, 2000}});
+    }
+    check(store.stats().remote_uploads_dropped >= 4, "the queue limit did not give uploads up");
+    check(store.upload_unpublished(describe("f1").binding,
+                                   std::chrono::steady_clock::now() + std::chrono::seconds(10)),
+          "upload_unpublished did not report every image in the bucket");
+    TempDirectory reader_directory;
+    ContextStore reader(remote_options(reader_directory.path(), remote));
+    (void)reader.refresh_remote();
+    for (std::uint32_t i = 1; i <= kImages; ++i) {
+        check(reader.find("f" + std::to_string(i)).has_value(),
+              "an image given up by the queue never reached the bucket");
+    }
+    const auto foreign_manifest = std::find_if(remote->objects.begin(), remote->objects.end(),
+                                               [](const auto& object) {
+                                                   return object.first.find("f0.manifest") !=
+                                                          std::string::npos;
+                                               });
+    check(foreign_manifest == remote->objects.end(),
+          "a flush sent another binding's session to the bucket");
+}
+
 // Publication survives a restart, for exactly the manifest published: an image uploaded before the
 // restart is evicted to the bucket after it (kept, fetched on demand); one whose upload never
 // happened is removed whole.
@@ -2978,6 +3022,7 @@ int main() {
     test_inline_only_image_is_not_remote_only();
     test_upload_survives_replacement_but_not_eviction();
     test_queued_uploads_cannot_hold_the_directory_over_its_limit();
+    test_upload_unpublished_sends_every_image_past_the_queue_limit();
     test_absent_chunks_are_not_reused();
     test_local_corruption_is_repaired_from_the_remote();
     test_corrupt_prefetch_is_dropped();
