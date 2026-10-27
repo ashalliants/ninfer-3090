@@ -141,19 +141,22 @@ public:
     // expected and would otherwise swamp the failure counters. Open the scope only around such a
     // placement. Call `failed` when the placement could not be made at all: it counts one failure,
     // classified by the last allocation that missed (the smallest size tried, against the bytes
-    // free at that moment), and none when no allocation missed, because the placement failed for
-    // something other than the arena (its caller ran out of descriptors, say).
+    // free at the moment it missed), and none when no allocation missed since the last one that
+    // succeeded, because the placement then failed for something other than the arena (its caller
+    // ran out of descriptors, say).
     class [[nodiscard]] PlacementScope {
     public:
         explicit PlacementScope(HostContextArena& arena) noexcept : arena_(arena) {
-            if (arena_.placement_depth_++ == 0) { arena_.placement_last_miss_ = 0; }
+            if (arena_.placement_depth_++ == 0) { arena_.placement_last_miss_ = Miss::none; }
         }
         ~PlacementScope() { --arena_.placement_depth_; }
         PlacementScope(const PlacementScope&)            = delete;
         PlacementScope& operator=(const PlacementScope&) = delete;
 
         void failed() noexcept {
-            if (arena_.placement_last_miss_ != 0) { arena_.count_failure(arena_.placement_last_miss_); }
+            if (arena_.placement_last_miss_ != Miss::none) {
+                arena_.count_failure(arena_.placement_last_miss_);
+            }
         }
 
     private:
@@ -182,7 +185,9 @@ private:
     }
     void insert_free_extent(FreeExtent extent) noexcept;
     void release(std::size_t offset, std::size_t bytes, bool reserved) noexcept;
-    void count_failure(std::size_t rounded_bytes) noexcept;
+    enum class Miss : std::uint8_t { none, geometry, shortage };
+    [[nodiscard]] Miss classify_miss(std::size_t rounded_bytes) const noexcept;
+    void count_failure(Miss miss) noexcept;
 
     std::optional<PinnedHostBuffer> backing_;
     std::size_t capacity_bytes_      = 0;
@@ -194,7 +199,7 @@ private:
     std::uint64_t geometry_failures_ = 0;
     std::uint64_t shortage_failures_ = 0;
     std::size_t placement_depth_     = 0;
-    std::size_t placement_last_miss_ = 0;
+    Miss placement_last_miss_        = Miss::none;
     std::size_t general_budget_      = 0;
     mutable std::size_t snapshot_depth_ = 0;
     std::vector<FreeExtent> free_extents_;
