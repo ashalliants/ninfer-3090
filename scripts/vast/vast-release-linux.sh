@@ -96,14 +96,19 @@ echo "==> [$(date -Is)] smoke test: default profile, one chat completion on the 
 port=$(( 20000 + RANDOM % 20000 ))
 while ss -ltn "sport = :$port" | grep -q LISTEN; do port=$(( 20000 + RANDOM % 20000 )); done
 echo "smoke test port: $port"
-(cd "$dir" && NINFER_PORT="$port" NINFER_MODEL_DIR=/root/models setsid nohup ./run.sh qwen38-27b > /root/smoke-serve.log 2>&1 & echo $! > /root/smoke-serve.pid)
+# setsid may fork, so $! is not the new process group: the session leader writes its own pid.
+rm -f /root/smoke-serve.pid
+(cd "$dir" && NINFER_PORT="$port" NINFER_MODEL_DIR=/root/models setsid bash -c 'echo $$ > /root/smoke-serve.pid; exec ./run.sh qwen38-27b' \
+  > /root/smoke-serve.log 2>&1 < /dev/null &)
+for _ in $(seq 1 50); do [[ -s /root/smoke-serve.pid ]] && break; sleep 0.1; done
 pid="$(cat /root/smoke-serve.pid)"
 # run.sh runs the server inside a pipeline (`| tee`), so it is a grandchild that `pkill -P` misses and
 # that would keep the card busy after the script ends. setsid made $pid a process group: stop all of it.
 stop_server() {
-  kill -TERM -- "-$pid" 2>/dev/null || return 0
+  kill -TERM -- "-$pid" 2>/dev/null || { echo "smoke server group $pid already gone"; return 0; }
   for _ in $(seq 1 60); do kill -0 -- "-$pid" 2>/dev/null || return 0; sleep 1; done
   kill -KILL -- "-$pid" 2>/dev/null || true
+  echo "smoke server group $pid killed after 60 s"
 }
 trap 'rc=$?; stop_server; if (( rc != 0 )); then echo FAILED >> "$status"; fi' EXIT
 ready=0
