@@ -6,7 +6,7 @@ under `scripts/`, and
 [docs/rtx-3090-windows.md](https://github.com/ashalliants/ninfer-3090/blob/master/docs/rtx-3090-windows.md)
 is the fuller guide. Links here are absolute on purpose: the archive ships no `docs/` directory.
 
-Check `VERSION` for the release this archive was cut from, and `RELEASE_NOTES_*.md` for what
+Check `VERSION` for the release this archive was cut from, and `RELEASE_NOTES_*.md` in the archive root for what
 changed.
 
 ## Requirements

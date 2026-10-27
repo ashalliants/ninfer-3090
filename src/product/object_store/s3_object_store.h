@@ -26,7 +26,9 @@ struct S3Config {
 };
 
 // An ObjectStore over the S3 REST API, signed with AWS Signature V4 by libcurl. Each call uses its
-// own connection handle, so the object is safe to share between threads.
+// own connection handle, so the object is safe to share between threads; handles are kept between
+// calls, so a call reuses an open connection to the bucket (keep-alive) instead of connecting and
+// negotiating TLS again.
 [[nodiscard]] std::shared_ptr<ObjectStore> make_s3_object_store(S3Config config);
 
 // Milliseconds since the Unix epoch of an S3 timestamp such as "2026-10-08T19:01:45.000Z"; -1 when

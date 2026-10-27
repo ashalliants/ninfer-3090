@@ -1940,12 +1940,13 @@ public:
 
     // ---------------------------------------------------------------- context store images
     CheckpointImage export_checkpoints(std::span<const CheckpointHandle> points,
-                                       const std::optional<PreparedSessionKey>& session, std::string_view binding) const {
+                                       const std::optional<PreparedSessionKey>& session, std::string_view binding,
+                                       std::vector<std::uint8_t> buffer) const {
         if (tx_ != Tx::None || pending_ != 0) {
             throw std::logic_error("checkpoints cannot be exported during a context transaction");
         }
         if (!cache_) { throw std::invalid_argument("Qwen3.8-Flash-Next: the context cache is off"); }
-        return export_checkpoint_image(*cache_, *tier_, layout_, points, session, binding);
+        return export_checkpoint_image(*cache_, *tier_, layout_, points, session, binding, std::move(buffer));
     }
 
     std::size_t checkpoint_image_host_bytes(std::span<const std::uint8_t> image, std::string_view binding) const {
@@ -4848,8 +4849,9 @@ PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->u
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory(); }
 
 CheckpointImage Program::export_checkpoints(std::span<const CheckpointHandle> points,
-                                            const std::optional<PreparedSessionKey>& session, std::string_view binding) const {
-    return impl_->export_checkpoints(points, session, binding);
+                                            const std::optional<PreparedSessionKey>& session, std::string_view binding,
+                                            std::vector<std::uint8_t> buffer) const {
+    return impl_->export_checkpoints(points, session, binding, std::move(buffer));
 }
 
 std::size_t Program::checkpoint_image_host_bytes(std::span<const std::uint8_t> image, std::string_view binding) const {

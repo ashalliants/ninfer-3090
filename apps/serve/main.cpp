@@ -111,6 +111,9 @@ int run_router(const char* argv0, const ninfer::serve::ServeOptions& options,
                         operational_log.engine_fault(event);
                         logger->flush();
                     } catch (...) {}
+                },
+                [operational_log](const ninfer::ContextStoreHydrationEvent& event) {
+                    operational_log.context_store_hydration_failure(event);
                 });
             startup_log.engine_ready(service->load_summary());
             operational_log.engine_capacity(*service);
@@ -319,6 +322,9 @@ int main(int argc, char** argv) {
             [operational_log, logger, exit_on_failure = options.exit_on_engine_failure](
                 const ninfer::EngineFaultEvent& event) {
                 handle_engine_fault(operational_log, logger, exit_on_failure, event);
+            },
+            [&operational_log](const ninfer::ContextStoreHydrationEvent& e) {
+                operational_log.context_store_hydration_failure(e);
             });
         startup_log.engine_ready(service.load_summary());
         operational_log.engine_capacity(service);

@@ -151,7 +151,8 @@ public:
     explicit GenerationService(
         ServeOptions options, StartupObserver startup_observer = {},
         std::function<void(const ninfer::ContextStoreWriteEvent&)> store_listener = {},
-        std::function<void(const ninfer::EngineFaultEvent&)> fault_listener      = {});
+        std::function<void(const ninfer::EngineFaultEvent&)> fault_listener      = {},
+        std::function<void(const ninfer::ContextStoreHydrationEvent&)> hydration_listener = {});
     ~GenerationService();
     GenerationService(const GenerationService&)            = delete;
     GenerationService& operator=(const GenerationService&) = delete;
@@ -177,6 +178,11 @@ public:
     ninfer::ResidencyStatus suspend(std::optional<bool> auto_resume = std::nullopt);
     ninfer::ResidencyStatus resume();
     [[nodiscard]] ninfer::ResidencyStatus residency() const;
+
+    // See Engine::flush_context_store. Counts as an admitted request while it runs, so the idle
+    // sleeper and /suspend leave the model resident; a suspended model is resumed first, since
+    // only a running worker writes the sessions.
+    ninfer::ContextStoreFlushReport flush_context_store(std::chrono::milliseconds budget);
 
     // Requests currently holding ingress capacity (max_concurrency + max_pending_requests).
     [[nodiscard]] std::size_t admitted_requests() const;

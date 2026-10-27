@@ -405,7 +405,8 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
 GenerationService::GenerationService(
     ServeOptions options, StartupObserver startup_observer,
     std::function<void(const ninfer::ContextStoreWriteEvent&)> store_listener,
-    std::function<void(const ninfer::EngineFaultEvent&)> fault_listener)
+    std::function<void(const ninfer::EngineFaultEvent&)> fault_listener,
+    std::function<void(const ninfer::ContextStoreHydrationEvent&)> hydration_listener)
     : options_(std::move(options)) {
     // Inline ECC on GDDR6X GeForce cards reserves ~6.25% of VRAM for checksums and taxes
     // memory bandwidth on every access. Decode is bandwidth-bound, so an ECC-enabled card
@@ -429,6 +430,7 @@ GenerationService::GenerationService(
     ninfer::EngineOptions engine_options = make_engine_options(options_);
     engine_options.startup_observer      = std::move(startup_observer);
     engine_options.context_store.listener = std::move(store_listener);
+    engine_options.context_store.hydration_listener = std::move(hydration_listener);
     engine_options.fault_listener         = std::move(fault_listener);
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
     // A context fit may have lowered the context; every request limit follows what was resolved.
@@ -473,6 +475,30 @@ ninfer::ResidencyStatus GenerationService::suspend(std::optional<bool> auto_resu
 }
 
 ninfer::ResidencyStatus GenerationService::resume() { return engine_->resume(); }
+
+ninfer::ContextStoreFlushReport
+GenerationService::flush_context_store(std::chrono::milliseconds budget) {
+    {
+        std::lock_guard admission(request_capacity_->mutex);
+        ++request_capacity_->active;
+    }
+    struct Release {
+        RequestCapacity& capacity;
+        ~Release() {
+            std::lock_guard admission(capacity.mutex);
+            --capacity.active;
+        }
+    } const release{*request_capacity_};
+    // Without a store there is nothing to flush: answer so before waking a suspended model.
+    if (!engine_->options().context_store.enabled()) {
+        throw std::invalid_argument("the context store is off (--context-store)");
+    }
+    const auto residency = engine_->residency();
+    if (residency.enabled && residency.state == ninfer::ModelResidency::Suspended) {
+        (void)engine_->resume();
+    }
+    return engine_->flush_context_store(budget);
+}
 
 ninfer::ResidencyStatus GenerationService::residency() const { return engine_->residency(); }
 

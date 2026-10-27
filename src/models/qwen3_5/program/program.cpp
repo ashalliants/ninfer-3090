@@ -399,8 +399,9 @@ void Program::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
 
 CheckpointImage Program::export_checkpoints(std::span<const CheckpointHandle> points,
                                             const std::optional<PreparedSessionKey>& session,
-                                            std::string_view binding) const {
-    return impl_->export_checkpoints(points, session, binding);
+                                            std::string_view binding,
+                                            std::vector<std::uint8_t> buffer) const {
+    return impl_->export_checkpoints(points, session, binding, std::move(buffer));
 }
 
 std::size_t Program::checkpoint_image_host_bytes(std::span<const std::uint8_t> image,

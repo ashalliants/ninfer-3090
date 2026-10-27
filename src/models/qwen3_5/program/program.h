@@ -676,11 +676,13 @@ public:
     // Writes the checkpoints' byte image. Device-only contents are copied through the caller's
     // memory, never by pinning more Host context. Requires no open context transaction. An image
     // holds either one conversation's private points or exactly one SharedPrefix point with no
-    // session; import rebuilds the points with the roles they were exported with.
+    // session; import rebuilds the points with the roles they were exported with. `buffer`, when
+    // given, is reused for the image's bytes (an earlier image's, so its pages are already
+    // mapped and the copy does not fault them in).
     [[nodiscard]] CheckpointImage
     export_checkpoints(std::span<const CheckpointHandle> points,
                        const std::optional<PreparedSessionKey>& session,
-                       std::string_view binding) const;
+                       std::string_view binding, std::vector<std::uint8_t> buffer = {}) const;
     // Host bytes importing `image` needs. Throws std::invalid_argument when the image was not
     // produced for this Program configuration and binding, or is damaged.
     [[nodiscard]] std::size_t checkpoint_image_host_bytes(std::span<const std::uint8_t> image,

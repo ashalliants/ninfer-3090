@@ -96,6 +96,12 @@ constexpr std::size_t kMaximumPendingStoreWrites = 2;
 // behind idle writes rather than being dropped, because a dropped eviction is a recompute. Host
 // RAM, not pinned memory; it drains at the store's write rate.
 constexpr std::size_t kMaximumPendingEvictionBytes = std::size_t{4} << 30U;
+// The writer keeps the buffer of the last image it wrote for the next export: a fresh one of a
+// session's size is several hundred ms of page faults on the Engine worker (690 ms for 1.6 GB on a
+// Linux RTX 3090 box, against 90 ms to copy into one already mapped). One buffer, at most this
+// large, released once the writer has been idle this long.
+constexpr std::size_t kMaximumSpareExportBytes = std::size_t{8} << 30U;
+constexpr auto kSpareExportBufferIdle          = std::chrono::seconds(30);
 
 // The store keeps up to this share of the volume's free space when no limit is configured.
 constexpr std::uint64_t kAutomaticStoreShareDivisor = 2;
@@ -318,6 +324,10 @@ public:
         out.context_store_bytes_reused    = s.bytes_reused;
         out.context_store_evicted         = s.evicted_for_space + s.expired + s.superseded;
         out.context_store_corrupt         = s.corrupt_removed;
+        out.context_store_corrupt_startup  = s.corrupt_startup;
+        out.context_store_corrupt_manifest = s.corrupt_manifest;
+        out.context_store_corrupt_chunk    = s.corrupt_chunk;
+        out.context_store_corrupt_remote   = s.corrupt_remote;
         out.context_store_restored        = restored_sessions;
         out.context_store_restored_bytes  = restored_bytes;
         out.context_store_foreign         = foreign_images;
@@ -329,10 +339,16 @@ public:
         out.context_store_remote_downloads         = s.remote_downloads;
         out.context_store_remote_download_bytes    = s.remote_download_bytes;
         out.context_store_remote_download_failures = s.remote_download_failures;
+        out.context_store_remote_download_failures_transfer = s.remote_download_failures_transfer;
+        out.context_store_remote_download_failures_missing  = s.remote_download_failures_missing;
+        out.context_store_remote_download_failures_damaged  = s.remote_download_failures_damaged;
+        out.context_store_remote_download_failures_install  = s.remote_download_failures_install;
+        out.context_store_remote_download_failures_listing  = s.remote_download_failures_listing;
         out.context_store_remote_manifest_downloads      = s.remote_manifest_downloads;
         out.context_store_remote_manifest_download_bytes = s.remote_manifest_download_bytes;
         out.context_store_remote_retired                 = s.remote_retired;
         out.context_store_remote_uploads_skipped         = s.remote_uploads_skipped;
+        out.context_store_remote_uploads_dropped         = s.remote_uploads_dropped;
         out.context_store_peer_images        = s.peer_images;
         out.context_store_peer_bytes_linked  = s.peer_bytes_linked;
         out.context_store_peer_skipped       = s.peer_skipped;
@@ -433,9 +449,108 @@ public:
     struct PendingWrite {
         CheckpointImage image;
         bool shared = false;
+        std::string id; // the store id the image is written under
     };
     std::deque<PendingWrite> pending_writes;
     bool writer_active = false;
+    std::string active_write_id; // the write in progress, while writer_active
+    std::mutex store_flush_mutex; // one Engine::flush_context_store at a time
+    // Set by a flush for the moment between its final check and its count of unsaved sessions:
+    // an idle or shared-prefix write offered then is refused, so its session counts as unsaved;
+    // an eviction write (its session's last chance) is queued and noted in
+    // store_write_during_close, which makes the flush report the bucket incomplete. Under
+    // writer_mutex.
+    bool store_writes_closed      = false;
+    bool store_write_during_close = false;
+
+    // Engine::flush_context_store. One flush at a time: each turns the core's flush on and off.
+    ContextStoreFlushReport flush_store(std::chrono::milliseconds budget) {
+        if (!store) { throw std::invalid_argument("the context store is off (--context-store)"); }
+        std::scoped_lock flushing(store_flush_mutex);
+        const auto started  = std::chrono::steady_clock::now();
+        const auto deadline = started + budget;
+        const auto puts     = store->stats().puts;
+        // A write that fails during the flush may be an evicted session's, whose owner is gone
+        // already: nothing would count it as unsaved, so a failure makes the bucket incomplete.
+        const auto failures = store_write_failures.load(std::memory_order_acquire);
+        ContextStoreFlushReport report;
+        with_generation([&](auto& generation) {
+            generation.set_store_flush(true);
+            struct Off {
+                decltype(generation)& core;
+                ~Off() { core.set_store_flush(false); }
+            } const off{generation};
+            for (;;) {
+                report.unsaved = generation.unsaved_store_sessions();
+                if ((report.unsaved == 0 && store_queue_idle()) ||
+                    std::chrono::steady_clock::now() >= deadline) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+        // Every image the bucket may lack goes now: those still waiting out their delay, and any
+        // whose upload was given up when the queue was full. Serving goes on meanwhile, and a write
+        // (an eviction's, say) can land while the uploads run: those are uploaded too, a pass at a
+        // time, until a pass ends with the writer idle. The answer describes the store as of that
+        // moment; a write that starts after it is not this flush's (the gateway stops routing to
+        // the box first).
+        for (;;) {
+            while (!store_queue_idle() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            // Writes the store has completed: one that lands during the pass (queued and written
+            // after the scan, so the writer looks idle again) shows as a change here.
+            const auto puts_before = store->stats().puts;
+            report.uploaded        = store->upload_unpublished(store_binding, deadline);
+            bool settled           = false;
+            {
+                // The check and the close are one step: a write offered after it is refused
+                // until the count below, so it shows as unsaved instead of slipping between them.
+                std::scoped_lock lock(writer_mutex);
+                settled = pending_writes.empty() && !writer_active &&
+                          store->stats().puts == puts_before;
+                store_writes_closed = settled;
+            }
+            if (settled || std::chrono::steady_clock::now() >= deadline) {
+                // A write still queued, in progress or landed since the scan has not reached the
+                // bucket.
+                report.uploaded = report.uploaded && settled;
+                break;
+            }
+        }
+        struct Reopen {
+            Impl& impl;
+            bool written_during_close = false;
+            void now() {
+                std::scoped_lock lock(impl.writer_mutex);
+                written_during_close          = impl.store_write_during_close;
+                impl.store_writes_closed      = false;
+                impl.store_write_during_close = false;
+            }
+            ~Reopen() { now(); }
+        } reopen{*this};
+        // As things stand at the close: a session whose write was refused meanwhile counts here.
+        with_generation([&](auto& generation) { report.unsaved = generation.unsaved_store_sessions(); });
+        reopen.now();
+        // An eviction write queued during the close is on its way to the store, not in the bucket.
+        if (reopen.written_during_close) { report.uploaded = false; }
+        if (store_write_failures.load(std::memory_order_acquire) != failures) {
+            report.uploaded = false;
+        }
+        report.written  = store->stats().puts - puts;
+        report.seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        return report;
+    }
+
+    std::vector<std::uint8_t> spare_export_buffer; // see kMaximumSpareExportBytes
+    // Ids of queued writes that failed since the core last took them. Bounded: beyond it the
+    // oldest go and `failed_write_ids_lost` says so, and the core then retries every continuation
+    // whose image the store does not hold.
+    std::deque<std::string> failed_write_ids;
+    bool failed_write_ids_lost = false;
+    static constexpr std::size_t kMaximumFailedWriteIds = 4096;
     bool writer_stop   = false;
     std::optional<std::chrono::steady_clock::time_point> drain_deadline;
     std::thread writer;
@@ -498,12 +613,21 @@ private:
                 return enqueue_store_write(std::move(image), StoreWrite::SharedPrefix);
             },
             .ready   =[this] { return store_queue_idle(); },
+            .queued  = [this](const std::string& id) { return store_write_queued(id); },
             .failures = [this] { return store_write_failures.load(std::memory_order_relaxed); },
+            .failed_writes =
+                [this] {
+                    typename GenerationCoreT::FailedStoreWrites reported;
+                    take_failed_writes(reported.ids, reported.lost);
+                    return reported;
+                },
+            .export_buffer = [this] { return take_export_buffer(); },
             .idle_persist =
                 std::chrono::duration_cast<std::chrono::milliseconds>(options.context_store.idle_persist),
             .hydration_budget =
                 std::chrono::duration_cast<std::chrono::milliseconds>(options.context_store.restore_budget),
             .remote = options.context_store.remote != nullptr,
+            .hydration_listener = options.context_store.hydration_listener,
         });
     }
 
@@ -564,17 +688,10 @@ private:
         return text;
     }
 
-    // Lowercase hex of the image's endpoint key: an image of the same endpoint replaces it. A
-    // shared prefix's id ends in an extra digit, so it never replaces a conversation image whose
-    // endpoint happens to fall at the same position.
+    // The image's endpoint key (runtime/engine/context_store/image_id.h).
     static std::string image_id(const CheckpointImage& image, bool shared) {
         const auto& key = image.keys.front();
-        char text[42];
-        std::snprintf(text, sizeof(text), "%016llx%016llx%08x%s",
-                      static_cast<unsigned long long>(key.digests[0]),
-                      static_cast<unsigned long long>(key.digests[1]),
-                      static_cast<unsigned>(key.frontier), shared ? "5" : "");
-        return text;
+        return runtime::context_store_image_id(key.digests, key.frontier, shared);
     }
 
     // Writes one image to the store. On the writer thread, or at shutdown.
@@ -633,6 +750,7 @@ private:
                 foreign_images = static_cast<std::uint64_t>(
                     std::count_if(images.begin(), images.end(),
                                   [&](const auto& info) { return info.binding != store_binding; }));
+                std::vector<std::uint8_t> spare;
                 for (const runtime::ContextStore::Info& info : images) {
                     if (std::chrono::steady_clock::now() >= deadline) { break; }
                     if (info.binding != store_binding || info.tokens > options.max_context) {
@@ -645,7 +763,10 @@ private:
                     // cannot fit, and reading it would only spend the budget.
                     if (info.image_bytes > generation.free_host_bytes()) { continue; }
                     const auto read_started = std::chrono::steady_clock::now();
-                    std::optional<std::vector<std::uint8_t>> bytes = store->load(info.id, false);
+                    // One buffer serves every image restored: each read reuses the last one's.
+                    std::optional<std::vector<std::uint8_t>> bytes = store->load(
+                        info.id, false, nullptr, std::chrono::steady_clock::time_point::max(),
+                        std::move(spare));
                     if (!bytes) { continue; }
                     const auto read_ns = static_cast<std::uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -656,6 +777,7 @@ private:
                         ++restored_sessions;
                         restored_bytes += bytes->size();
                     }
+                    spare = std::move(*bytes);
                 }
             });
         } catch (...) {}
@@ -685,25 +807,75 @@ private:
         return pending_writes.empty() && !writer_active;
     }
 
+    // Whether the image `id` is queued for the writer or being written now.
+    [[nodiscard]] bool store_write_queued(const std::string& id) {
+        std::scoped_lock lock(writer_mutex);
+        if (writer_active && active_write_id == id) { return true; }
+        return std::any_of(pending_writes.begin(), pending_writes.end(),
+                           [&](const PendingWrite& pending) { return pending.id == id; });
+    }
+
+    // The ids of writes that failed since the last call. Under writer_mutex.
+    void record_failed_write_locked(std::string id) {
+        if (failed_write_ids.size() >= kMaximumFailedWriteIds) {
+            failed_write_ids.pop_front();
+            failed_write_ids_lost = true;
+        }
+        failed_write_ids.push_back(std::move(id));
+    }
+
+    // The spare buffer for the next export, if the writer holds one.
+    [[nodiscard]] std::vector<std::uint8_t> take_export_buffer() {
+        std::scoped_lock lock(writer_mutex);
+        return std::exchange(spare_export_buffer, {});
+    }
+
+    // Keeps a written image's buffer for the next export when it is the larger of the two and not
+    // too large. Under writer_mutex; whatever it does not keep is freed by the caller's `bytes`.
+    void keep_export_buffer_locked(std::vector<std::uint8_t>& bytes) noexcept {
+        if (bytes.capacity() <= spare_export_buffer.capacity() ||
+            bytes.capacity() > kMaximumSpareExportBytes) {
+            return;
+        }
+        std::swap(spare_export_buffer, bytes);
+    }
+
+    // Hands over the failed writes not yet taken, and whether some were lost.
+    void take_failed_writes(std::vector<std::string>& ids, bool& lost) {
+        std::scoped_lock lock(writer_mutex);
+        ids.assign(failed_write_ids.begin(), failed_write_ids.end());
+        lost = std::exchange(failed_write_ids_lost, false);
+        failed_write_ids.clear();
+    }
+
     // Queues an image for the writer thread. Never blocks: when the queue is full the image is
     // not written now; an idle continuation is tried again later, an evicted one is lost to the
     // store as it would be without write-on-evict.
     bool enqueue_store_write(CheckpointImage&& image, StoreWrite kind) {
         std::unique_lock lock(writer_mutex);
         if (writer_stop) { return false; } // shutting down: the final flush writes it instead
+        // A flush is counting what is unsaved: this session counts, and is written after it. An
+        // evicted session has no later chance, so it is queued, and the flush told it missed one.
+        if (store_writes_closed) {
+            if (kind != StoreWrite::Eviction) { return false; }
+            store_write_during_close = true;
+        }
+        // The memory the queue holds: a reused export buffer can be larger than its image.
         std::size_t queued_bytes = 0;
-        for (const auto& pending : pending_writes) { queued_bytes += pending.image.bytes.size(); }
+        for (const auto& pending : pending_writes) { queued_bytes += pending.image.bytes.capacity(); }
         const bool full =
             kind == StoreWrite::Eviction
                 ? !pending_writes.empty() &&
-                      queued_bytes + image.bytes.size() > kMaximumPendingEvictionBytes
+                      queued_bytes + image.bytes.capacity() > kMaximumPendingEvictionBytes
                 : pending_writes.size() >= kMaximumPendingStoreWrites;
         if (full) {
             store_dropped.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         if (!writer.joinable()) { writer = std::thread([this] { writer_loop(); }); }
-        pending_writes.push_back({std::move(image), kind == StoreWrite::SharedPrefix});
+        const bool shared = kind == StoreWrite::SharedPrefix;
+        std::string id    = image_id(image, shared);
+        pending_writes.push_back({std::move(image), shared, std::move(id)});
         lock.unlock();
         writer_cv.notify_one();
         return true;
@@ -712,9 +884,23 @@ private:
     void writer_loop() noexcept {
         for (;;) {
             PendingWrite write;
+            std::vector<std::uint8_t> released; // freed outside the lock
             {
                 std::unique_lock lock(writer_mutex);
-                writer_cv.wait(lock, [&] { return writer_stop || !pending_writes.empty(); });
+                const auto woken = [&] { return writer_stop || !pending_writes.empty(); };
+                // Idle with a spare export buffer: let it go once nothing was written for a while,
+                // so an Engine that stopped writing does not keep a session's worth of memory.
+                while (!woken() && !spare_export_buffer.empty()) {
+                    if (!writer_cv.wait_for(lock, kSpareExportBufferIdle, woken)) {
+                        released = std::exchange(spare_export_buffer, {});
+                    }
+                }
+                if (!woken()) {
+                    lock.unlock();
+                    released = {};
+                    lock.lock();
+                    writer_cv.wait(lock, woken);
+                }
                 if (pending_writes.empty() ||
                     (writer_stop && drain_deadline &&
                      std::chrono::steady_clock::now() >= *drain_deadline)) {
@@ -722,10 +908,11 @@ private:
                 }
                 write = std::move(pending_writes.front());
                 pending_writes.pop_front();
-                writer_active = true;
+                writer_active   = true;
+                active_write_id = write.id;
             }
             ContextStoreWriteEvent event;
-            event.id           = image_id(write.image, write.shared);
+            event.id           = write.id;
             event.tokens       = write.image.tokens;
             event.bytes        = write.image.bytes.size();
             const auto started = std::chrono::steady_clock::now();
@@ -734,17 +921,22 @@ private:
             } catch (const std::exception& error) {
                 event.error = error.what();
             } catch (...) { event.error = "unknown context store write failure"; }
-            if (!event.error.empty()) {
-                // The continuation was counted as stored when it was queued; have it written again.
-                store_write_failures.fetch_add(1, std::memory_order_relaxed);
+            {
+                std::scoped_lock lock(writer_mutex);
+                writer_active = false;
+                active_write_id.clear();
+                // The continuation was counted as stored when it was queued; have it written
+                // again. The id goes with the failure, so the core retries exactly this image
+                // whatever it concluded about it meanwhile.
+                if (!event.error.empty()) {
+                    record_failed_write_locked(write.id);
+                    store_write_failures.fetch_add(1, std::memory_order_relaxed);
+                }
+                keep_export_buffer_locked(write.image.bytes);
             }
             event.seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             notify(event);
-            {
-                std::scoped_lock lock(writer_mutex);
-                writer_active = false;
-            }
         }
     }
 
@@ -769,6 +961,9 @@ private:
         // Images abandoned at the deadline were marked stored when they were queued; count them
         // as failed writes so the final flush clears those marks and writes them again.
         if (!pending_writes.empty()) {
+            for (PendingWrite& pending : pending_writes) {
+                record_failed_write_locked(std::move(pending.id));
+            }
             store_write_failures.fetch_add(pending_writes.size(), std::memory_order_relaxed);
         }
         pending_writes.clear();
@@ -1033,6 +1228,11 @@ bool Engine::is_available() const {
             }
         },
         impl_->core);
+}
+
+ContextStoreFlushReport Engine::flush_context_store(std::chrono::milliseconds budget) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->flush_store(budget);
 }
 
 ResidencyStatus Engine::suspend(std::optional<bool> auto_resume) {

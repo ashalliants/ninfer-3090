@@ -514,9 +514,11 @@ public:
     // no open context transaction or pending unit; an image binds to this Program's page and state
     // layout and to the caller's model binding, and import rejects any other with
     // std::invalid_argument. Import returns nullopt when the cache has no room for it now.
+    // `buffer`, when given, is reused for the image's bytes (see qwen3_5::Program).
     [[nodiscard]] CheckpointImage export_checkpoints(std::span<const CheckpointHandle> points,
                                                      const std::optional<PreparedSessionKey>& session,
-                                                     std::string_view binding) const;
+                                                     std::string_view binding,
+                                                     std::vector<std::uint8_t> buffer = {}) const;
     [[nodiscard]] std::size_t checkpoint_image_host_bytes(std::span<const std::uint8_t> image, std::string_view binding) const;
     [[nodiscard]] std::optional<ImportedCheckpoints> import_checkpoints(std::span<const std::uint8_t> image,
                                                                         std::string_view binding);

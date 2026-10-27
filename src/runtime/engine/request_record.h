@@ -198,6 +198,9 @@ struct RequestRecord {
     Clock::time_point deadline;
     Clock::time_point submitted;
     std::optional<Clock::time_point> admitted_at;
+    // --prefill-order shortest: submitted plus the predicted cost of the prefill left at admission
+    // (PrefillOrder::Shortest). Kept across pauses, so a restored request keeps its place.
+    Clock::time_point prefill_deadline{};
     std::optional<Clock::time_point> first_token;
     std::optional<Clock::time_point> last_token;
     bool queue_wait_recorded = false;
@@ -245,6 +248,12 @@ struct RequestRecord {
     std::uint32_t hydration_reuse_before = 0;
     Clock::time_point hydration_started{};
     Clock::time_point hydration_deadline{};
+    // The image being read back, for the failure report: its id, size, the bytes it had to fetch
+    // from the bucket, and how long the request waited for it.
+    std::string hydration_id;
+    std::uint64_t hydration_bytes       = 0;
+    std::uint64_t hydration_fetch_bytes = 0;
+    double hydration_wait_seconds       = 0.0;
 
     // Single flight: while set, a resident sibling is prefilling this request's prefix towards a
     // checkpoint it will publish, and the request is not offered for admission. One wait at most.

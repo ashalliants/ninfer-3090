@@ -150,7 +150,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--prefill-stall-budget-ms N] [--yield-long-prefill-ms N] "
-           "[--prefill-decode-share P] [--prefill-layer-slices N] "
+           "[--prefill-decode-share P] [--prefill-layer-slices N] [--prefill-order rotate|shortest] "
            "[--lossy-prefill-min-tokens N] [--lossy-prefill-strategy select|summary] "
            "[--log-stats-interval-ms N] "
            "[--device N] "
@@ -245,6 +245,11 @@ std::string serve_usage_text(const char* argv0) {
            "gap shrinks to a slice while the chunk keeps its size (so the prompt is not slowed "
            "the way a smaller --prefill-chunk or a stall budget slows it). Not for media, DFlash "
            "or a pipeline split; 0 or 1 is off, at most 16. Off by default\n"
+           "       --prefill-order rotate|shortest picks which resident prefill runs next. rotate "
+           "(the default) takes turns, so two long prompts both finish late; shortest runs the "
+           "earliest deadline first, a request's deadline being when it arrived plus its own "
+           "prefill time: short prompts overtake long ones, and waiting ages a long one so it is "
+           "never passed over for good\n"
            "       --lossy-prefill-min-tokens N filters a prompt whose part after the product prompt "
            "(leading system/developer messages and tools) has more than N tokens: a scout pass "
            "scores blocks and only the kept ones are "
@@ -571,6 +576,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.prefill_schedule.decode_share_percent = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-decode-share"),
                                       "prefill-decode-share"));
+        } else if (arg == "--prefill-order") {
+            const std::string_view order = require_value("--prefill-order");
+            if (order == "rotate") {
+                options.prefill_schedule.order = PrefillOrder::Rotate;
+            } else if (order == "shortest") {
+                options.prefill_schedule.order = PrefillOrder::Shortest;
+            } else {
+                throw std::invalid_argument("--prefill-order must be rotate or shortest");
+            }
         } else if (arg == "--prefill-layer-slices") {
             options.prefill_schedule.layer_slices = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-layer-slices"),

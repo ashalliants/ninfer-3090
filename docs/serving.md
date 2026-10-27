@@ -427,7 +427,10 @@ image of its own, written as soon as the cache has captured one (at most one a s
 writer is idle, busy or not: it is a short copy of a few thousand tokens and one recurrent state,
 counted in `ninfer_context_store_shared_export_seconds_total`), so after a restart, or on a new
 box that shares the bucket, the first request of every tenant on that prompt starts warm. Prompt
-grafts are installed context and are never stored. A conversation is written to `DIR`
+grafts are installed context and are never stored, and neither are progress anchors
+(`--progress-anchors-shared`): an anchor insures one conversation's long prefill against a
+cancellation, its retry finds it in memory, and the conversation's own image holds the same pages
+once the request ends. A conversation is written to `DIR`
 
 - in the background once it has been unused for `--context-store-idle-seconds` (30 s) and has
   changed since it was last written, so a crash loses at most that much of a conversation,
@@ -506,10 +509,24 @@ costs the newest pages and the endpoint state, not the whole session. Older imag
 are removed once a newer image of it is stored. Writes are atomic (a temporary name, then a rename),
 every chunk is verified when read, and a session that cannot be read back intact is removed and
 simply re-prefilled by the next request; a damaged store costs cache hits, never a wrong answer.
+(With a bucket, a chunk file that is missing rather than damaged is fetched again. If the fetch
+fails because the bucket cannot be reached, the read is a miss and the session stays offered; if
+the bucket no longer has the chunk either, the session cannot be read from anywhere and is removed,
+counted as `remote` corruption.) A session being read is never evicted
+until the read ends, so a write that makes room meanwhile cannot take the chunks it just fetched.
 
 The store keeps at most `--context-store-max-gib` (default: half the free space of the volume when
 the server starts), removing the least recently used sessions first, and removes sessions unused for
-`--context-store-ttl-hours` (default 168). A store written by a different model, quantization, KV
+`--context-store-ttl-hours` (default 168). The limit counts every file in the directory, including
+those waiting uploads to the bucket still need (see below). Because the volume is shared (with
+another engine, logs, the OS), the store also checks the volume itself: before a write it makes
+sure at least 1 GiB stays free after the new chunks, removing the least recently used sessions
+first if not, and refuses the write (a miss, as for any failed write) with `context store volume is
+full: ... (N short)` when even that cannot make the room. Stores in the same parent directory, as
+the boot script lays out two engines' stores, check and write one at a time, so two engines cannot
+both find room for one session and both write it; stores elsewhere on the volume do not
+coordinate, and neither do downloads from the bucket. A file that cannot be written says why
+(`cannot write ...: No space left on device`). A store written by a different model, quantization, KV
 or recurrent-state configuration, speculative configuration, set of prompt grafts or an older
 engine's image format is ignored and ages out; the start-up log line `context store | N sessions
 were written under another model, configuration or store format` says so. The `ninfer_context_store_*` series (see
@@ -521,10 +538,18 @@ memory, so its bytes outlive the Host copy the eviction releases until the write
 Taking the image itself (copying a conversation out of the GPU or the Host tier) is a single step of
 the Engine worker, so a request that arrives during it waits for that copy: at eviction it adds to
 the admission that needed the room (`ninfer_context_store_eviction_export_seconds_total` counts
-it). A conversation that could not be queued is tried again later if it is idle, or, if it was
+it). The copy goes into the memory of the last image the writer stored, kept for this (one
+buffer, released after 30 s without writes): a fresh buffer of a session's size is mostly page
+faults, 690 ms for 1.6 GB on a Linux RTX 3090 box against 90 ms into one already mapped. A
+conversation that could not be queued is tried again later if it is idle, or, if it was
 being evicted, is lost to the store and prefilled on its next turn as without one. The cache marks
-a conversation stored when its image is queued; a write that then fails, or an image the store
-later removes for space or age, clears every mark, so everything is written again.
+a conversation stored when its image is queued. When a write fails, or the store removes images on
+its own (for space or age, because they were damaged, or because a newer image superseded them),
+each mark is checked against what the store still holds: a conversation whose write failed is
+written again, and one whose image the store removed is written again only once it has changed
+(its next turn). Writing back an image the store chose to let go would only evict another, which
+would then be written back in turn; an unchanged conversation is therefore written once per state,
+and `ninfer_context_store_idle_writes_total` counts the background writes.
 
 `--context-store-compress` (off by default) writes new chunks zstd-compressed (level 3), in the
 directory and in the bucket, when that makes the chunk at least 3 % smaller (otherwise it is kept
@@ -564,7 +589,11 @@ ninfer-serve model.ninfer --port 8001 --devices 1 --context-store /data/store1 -
 - `--context-store-peer DIR` (repeatable) names another engine's directory. Every
   `--context-store-peer-poll-ms` (250) the engine lists the manifests there, and for each session it
   does not hold it **hard-links** the session's chunk files into its own directory (no bytes are
-  copied, the data is on disk once) and registers it like any stored session. A request that would
+  copied, the data is on disk once) and registers it like any stored session. Only sessions the
+  other engine holds the chunks of are considered: those it only registered from the bucket listing
+  or evicted to the bucket are passed over, without counting as failures, until it has fetched them
+  back. A poll that finds the other
+  directory and its own unchanged since the last listing does not list it again. A request that would
   resume from it finds it through the same lookup as its own sessions (see above), reads and
   verifies every chunk, and prices the read with the measured read rate. A peer that has not started
   yet is polled until it appears. Both directories must be on one volume: a link that fails (another
@@ -577,7 +606,8 @@ ninfer-serve model.ninfer --port 8001 --devices 1 --context-store /data/store1 -
   start-up scan cannot tell an imported session from its own, so from then on a use puts back what
   the bucket lacks, as for its own sessions. Sessions older than
   `--context-store-ttl-hours`, or that would not fit in `--context-store-max-gib`, are skipped, and a
-  skipped session is not looked at again until its owner rewrites it.
+  skipped session is not looked at again until its owner rewrites it (one that did not fit is also
+  tried again once this engine has removed something to make room).
 - **A session is visible to the other engine only after its owner has written it**, which is
   `--context-store-idle-seconds` (30 by default) after its last use, or when it is evicted, or at
   shutdown, and a background write is skipped while any request is waiting. With the default, the
@@ -623,18 +653,30 @@ The local directory becomes a cache of the bucket.
   exception is a configured prompt graft: it is matched by its file's size and modification time, so
   sessions that start from a graft pass between engines only when the graft file is the same copy.
 - A request that finds nothing usable, and has more than about two seconds of prefill ahead, has
-  the bucket listed once more before it prefills (waiting at most five seconds; requests that
-  arrive while a listing is taken share the next one), in case another engine stored the session
-  since the last listing: a conversation that just moved here is found.
+  the bucket looked up once more before it prefills (waiting at most five seconds), in case another
+  engine stored the session since the last listing: a conversation that just moved here is found.
+  A session's name in the bucket is its endpoint key, so the lookup lists the manifests and reads
+  only those of sessions ending on this request's own prompt; it registers nothing else (the
+  minute's background listing does) and releases the request as soon as the listing shows nothing
+  of its own. The bucket is listed once at a time: one listing serves every lookup asked for before
+  it was taken, and lookups that arrive while one is in progress (a request's or the background
+  listing's) wait for it to end and then share the one listing taken after it, which shows what
+  was uploaded just before they asked. A lookup finds only a session whose last state is on this prompt; a session
+  that continues past it (a regenerated turn) is found by the next background listing.
+  `ninfer_context_store_lookup_hits_total` counts the lookups that found something.
 - A request that would resume from a session only the bucket holds waits for it like any stored
   session (see above): the background reader downloads the missing chunks (several at a time, each
   verified; a damaged one makes the session a miss and it is not offered again), within the same
-  deadline, without holding up the Engine worker or other requests. The download is not weighed
+  deadline, without holding up the Engine worker or other requests. No chunk is started after the
+  request's deadline, so a download that cannot finish in time stops there (a miss, not damage:
+  the chunks fetched so far are kept) and the reader moves on to the next waiting request. The download is not weighed
   against the prefill it saves, since only this request waits for it while a prefill holds the
   GPU for everyone, but it must fit in the wait at the rate fetches (download, verification and
   write together) have achieved (`ninfer_context_store_remote_fetch_bytes_per_second`). Chunks the
   directory already holds, such as a shared prefix's, are not downloaded. Listings for requests
-  run on their own thread, so a slow bucket never holds up reading a stored session.
+  run on their own thread, so a slow bucket never holds up reading a stored session. Connections to
+  the bucket are kept open between requests, so a listing page, a manifest or a chunk does not pay
+  a new TCP and TLS handshake each.
 - A session evicted from the directory for space (or age) gives up its chunk files, except those an
   image still held whole shares, but stays in the index, since the bucket still holds it, and is
   fetched back the same way when it is needed. Its manifest is not downloaded again. Shared
@@ -653,13 +695,41 @@ The local directory becomes a cache of the bucket.
   age of its objects restarted (a server-side copy onto itself, no data transferred, at most once a day
   per session), and an object the bucket has lost in the meantime is uploaded again from the directory,
   so something in use does not expire under it. A write is uploaded from a snapshot taken when it was
-  written, with its chunk files kept on disk until the upload ends (at most 16 uploads wait, each
-  newer write of a session replacing its queued upload); a chunk that is not intact on disk stops the
-  upload instead of publishing a session whose data is damaged. A chunk found damaged on disk when a
+  written, with its chunk files kept on disk until the upload ends (each newer write of a session
+  replacing its queued upload). At most 64 uploads wait, and their files count against
+  `--context-store-max-gib`: beyond 64, and whenever the directory is over its limit with nothing
+  left to evict, the oldest waiting uploads are given up
+  (`ninfer_context_store_remote_uploads_dropped_total`) and their sessions are uploaded at their
+  next write; the upload in progress keeps its files until it ends. The directory therefore holds at most the limit plus the newest session and the upload in
+  progress. A chunk that is not intact on disk stops the upload instead of publishing a session
+  whose data is damaged. A chunk found damaged on disk when a
   session is loaded is fetched again from the bucket.
 - An unreachable bucket costs the uploads and the fetches, counted in `ninfer_context_store_remote_*`;
   the directory keeps working. Shutdown waits for queued uploads up to the remote flush budget (two
   minutes) and then interrupts the transfer in progress, so it never waits out a stalled connection.
+
+#### Flushing before a box goes
+
+`POST /v1/context-store/flush` (optional body `{"budget_seconds": N}`, 1-3600, default 600) writes
+every retained conversation the store does not hold as it is now, then uploads whatever waits for the
+bucket without its delay, while the server keeps serving. Conversations are written one a second
+between steps, as idle writes are, so requests carry on beside it. It answers once nothing is left or
+the budget is spent:
+
+```json
+{"written": 12, "unsaved": 0, "uploaded": true, "seconds": 14.2}
+```
+
+`unsaved` counts conversations still not stored (one in use by a request is not counted until it
+ends) and `uploaded` is false when the uploads did not all finish. The answer describes the store
+as of when the flush finished: writes made while it ran (an eviction's, say) are uploaded by it,
+but a turn that ends after it answers is not, so stop routing new turns to the box first and call
+the flush again if `unsaved` is not zero or `uploaded` is false. It answers 409
+`context_store_off` without `--context-store`. A gateway calls it when it starts draining a box it
+will destroy, or before it moves conversations elsewhere: the next box then finds them in the
+bucket. With that in place a fleet can trade freshness for traffic: a long
+`--context-store-s3-upload-delay-seconds` sends a busy conversation's state once per delay instead
+of after every turn, and the flush sends the rest before the box goes.
 
 
 ### Model suspend
@@ -883,18 +953,22 @@ server restarts.
 | `ninfer_context_store_bytes_written_total`, `_bytes_stored_total`, `_bytes_reused_total` | new chunk bytes written (raw size), what they took on disk after [compression](#context-store), and chunk bytes a write found already stored |
 | `ninfer_context_store_peer_images_total`, `_peer_bytes_linked_total`, `_peer_skipped_total`, `_peer_link_failures_total` | with `--context-store-peer`: sessions imported from peers, chunk bytes hard-linked (shared on disk, not copied), sessions not imported (damaged, expired, over budget, or gone mid-import) and chunks that could not be linked |
 | `ninfer_context_store_evicted_total`, `_corrupt_total` | sessions removed for space, age or supersession, and because they could not be read back intact |
+| `ninfer_context_store_corrupt_by_reason_total{reason}` | `_corrupt_total` by what was found: `startup` (a chunk missing when the store opened, with no bucket to fetch it from), `manifest` (a manifest that does not describe its session), `chunk` (a chunk whose bytes do not match, with no bucket to repair it), `remote` (the bucket's copy missing or damaged too) |
 | `ninfer_context_store_restored_sessions`, `_restored_bytes`, `_restore_seconds` | gauges: what start-up restored into the cache, and how long it took |
 | `ninfer_context_store_hydrations_total`, `_hydrated_tokens_total`, `_hydration_failures_total`, `_hydration_seconds_total` | stored sessions read back for a request, the prompt tokens that saved, failures (the request was prefilled, or its admission did not use what was read) and the time requests waited for the reads, failed ones included |
+| `ninfer_context_store_hydration_failures_by_reason_total{reason}` | `_hydration_failures_total` by reason: `load_miss` (the store could not read the session back: gone, damaged, or the bucket failed), `deadline` (the read, or the download before it, did not finish in the request's wait), `host_capacity` (the Host tier could not make room), `host_geometry` (room was made but the session's states found no contiguous Host extents), `adopt` and `not_candidate` (imported, but the cache could not take it or did not offer it to the request), `unused_at_admission` (the request was admitted from something shallower), `invalid_image` (written under another model or configuration), `exception` (anything else that failed during the import). Each failure is also logged as a warning: `context store hydration failed \| <id> \| <reason> \| <size> \| resume at <tokens> \| waited <ms>` |
 | `ninfer_context_store_shared_writes_total`, `_shared_export_seconds_total` | public shared prefixes written to the store, and the Engine worker time spent copying them out |
+| `ninfer_context_store_idle_writes_total`, `_idle_export_seconds_total` | conversations written in the background once idle (`--context-store-idle-seconds`), and the Engine worker time spent copying them out |
 | `ninfer_context_store_eviction_writes_total`, `_eviction_export_seconds_total` | conversations queued for the store as the cache evicted them, and the Engine worker time spent copying them out |
 | `ninfer_context_store_read_bytes_per_second` | gauge: the store read rate (read, verification and import into the Host tier) the cost model prices hydrations with, learned from the reads so far; 1 GB/s until the first read of at least 64 MiB |
 | `ninfer_context_store_remote_images` | gauge: with a bucket, sessions it holds that the directory does not hold in full |
 | `ninfer_context_store_remote_uploads_total`, `_remote_upload_bytes_total`, `_remote_upload_failures_total` | objects and bytes uploaded to the bucket, and uploads that failed |
 | `ninfer_context_store_remote_downloads_total`, `_remote_download_bytes_total`, `_remote_download_failures_total` | chunks and bytes fetched from the bucket, and listings or fetches that failed or returned damaged data |
+| `ninfer_context_store_remote_download_failures_by_reason_total{reason}` | `_remote_download_failures_total` by cause: `transfer` (the request to the bucket failed), `missing` (the bucket did not have the chunk), `damaged` (its bytes did not match), `install` (it could not be written to the directory, as on a full disk), `listing` (a listing, or a manifest read during one, failed). A download stopped at a request's deadline is not a failure here; it counts as a `deadline` hydration failure |
 | `ninfer_context_store_remote_manifest_downloads_total`, `_remote_manifest_download_bytes_total` | session manifests a bucket listing downloaded to register sessions other engines wrote (not in the chunk counters above) |
-| `ninfer_context_store_lookups_total`, `_lookup_seconds_total` | bucket listings refreshed for a request that found nothing stored, and the time requests waited for them |
+| `ninfer_context_store_lookups_total`, `_lookup_hits_total`, `_lookup_seconds_total` | bucket lookups for a request that found nothing stored, those after which the store held a session ending on the request's prompt, and the time requests waited for them |
 | `ninfer_context_store_remote_fetch_bytes_per_second` | the rate the store assumes for fetching a session's missing chunks (downloaded, verified and written to the directory together: the wait a fetch adds), learned from fetches; a session whose fetch would not fit in a request's wait is not chosen |
-| `ninfer_context_store_remote_retired_total`, `_remote_uploads_skipped_total` | earlier turns deleted from the bucket once a later one was uploaded, and queued uploads a later write made unnecessary |
+| `ninfer_context_store_remote_retired_total`, `_remote_uploads_skipped_total`, `_remote_uploads_dropped_total` | earlier turns deleted from the bucket once a later one was uploaded, queued uploads a later write made unnecessary, and queued uploads given up to keep the files they hold within the directory's limits (their sessions are uploaded at their next write) |
 
 Histograms expose `_bucket`, `_sum` and `_count`. Metrics have bounded labels; they do not retain
 request IDs or request text. Rates are calculated by the consumer, for example:
@@ -2005,6 +2079,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--yield-long-prefill-ms N` | let the request at the head of the queue pause a prefill with at least N ms of work left, when its own prefill costs at most a quarter of that; see [execution behavior](#execution-behavior) | off |
 | `--prefill-decode-share P` | after each prefill step, while another lane decodes, run decode rounds for P percent (0-90) of the step's time before the next step; see [execution behavior](#execution-behavior) | off |
 | `--prefill-layer-slices N` | while another lane decodes, run each text prefill chunk as N slices of layers with that lane's decode round between slices (2-16); see [execution behavior](#execution-behavior) | off |
+| `--prefill-order rotate\|shortest` | which resident prefill runs next: `rotate` takes turns; `shortest` runs the earliest deadline first, a request's deadline being when it was submitted plus its own predicted prefill time, so short prompts overtake long ones and two long ones run one after the other instead of both finishing late; see [execution behavior](#execution-behavior). | `rotate` |
 | `--lossy-prefill-min-tokens N` | **experimental, opt-in, lossy.** Filter a cold prompt whose part after the product prompt (leading system/developer messages and tools) has more than N tokens: a scout scores it and only the kept blocks are prefilled, so the model never sees the dropped text. Text-only Qwen3.5 dense on one device; never when the conversation itself is cached. See [lossy long-prompt prefill](#lossy-long-prompt-prefill-experimental) | `0` (off) |
 | `--lossy-prefill-keep F` | share of the filtered part kept, (0, 1], at most `--lossy-prefill-skip` | `0.3` |
 | `--lossy-prefill-filter-layer N` | full-attention layer whose attention mass scores the tokens | `7` |
@@ -2318,6 +2393,24 @@ while the prompt took 61 s instead of 56 s (a 500 ms stall budget gets 528 ms at
 a sliced prefill matched the unsliced run token for token in the engine test
 (`sliced_prefill_matches_whole`) and in a served 56K-token prompt with a stream and a short request
 beside it.
+
+`--prefill-order shortest` changes which resident prefill takes each turn. In rotation, two prompts
+prefilling side by side share the card step by step, and since one prefill step already uses the whole
+card, neither finishes sooner than if they had run one after the other: rotation only makes the first
+one late. In the #332 report, two 44K-token prompts sent 10 s apart took 40.1 s and 43.4 s end to end in
+rotation, and 27.6 s and 42.7 s when the second was queued behind the first (by
+`--admission-fit-check`): the first finished 12.5 s sooner and the second no later. With `shortest`,
+each request gets a prefill deadline when it is admitted: the time it was submitted plus what the cost
+model predicts its prefill takes alone. The prefilling lane with the earliest deadline runs; the others
+wait, holding their lanes and the pages they have. A short prompt has an early deadline and overtakes a
+long one at the next step. Waiting is what ages a long prompt: a request submitted after the long one's
+deadline has a later deadline however short it is, so a long prompt waits only for work submitted before
+its deadline and is never passed over for good. That work is not capped, though: a busy stream of short
+requests arriving in the meantime can delay it by more than its own prefill time. A paused and restored
+request keeps its deadline. Decode rounds are
+unaffected. It orders only the prefills already holding a lane: with every lane busy (always, at
+`--max-concurrency 1`) a short request still waits in the queue, which is what `--yield-long-prefill-ms`
+is for. Off by default (`rotate`).
 
 `--yield-long-prefill-ms N` is for the queue rather than the other streams. A fresh request never
 preempts a resident one, so with every lane busy it waits for the lane's request to finish, which behind
