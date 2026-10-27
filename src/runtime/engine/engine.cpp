@@ -456,8 +456,12 @@ public:
     std::string active_write_id; // the write in progress, while writer_active
     std::mutex store_flush_mutex; // one Engine::flush_context_store at a time
     // Set by a flush for the moment between its final check and its count of unsaved sessions:
-    // a write offered then is refused, so its session counts as unsaved. Under writer_mutex.
-    bool store_writes_closed = false;
+    // an idle or shared-prefix write offered then is refused, so its session counts as unsaved;
+    // an eviction write (its session's last chance) is queued and noted in
+    // store_write_during_close, which makes the flush report the bucket incomplete. Under
+    // writer_mutex.
+    bool store_writes_closed      = false;
+    bool store_write_during_close = false;
 
     // Engine::flush_context_store. One flush at a time: each turns the core's flush on and off.
     ContextStoreFlushReport flush_store(std::chrono::milliseconds budget) {
@@ -514,13 +518,20 @@ public:
         }
         struct Reopen {
             Impl& impl;
-            ~Reopen() {
+            bool written_during_close = false;
+            void now() {
                 std::scoped_lock lock(impl.writer_mutex);
-                impl.store_writes_closed = false;
+                written_during_close          = impl.store_write_during_close;
+                impl.store_writes_closed      = false;
+                impl.store_write_during_close = false;
             }
-        } const reopen{*this};
+            ~Reopen() { now(); }
+        } reopen{*this};
         // As things stand at the close: a session whose write was refused meanwhile counts here.
         with_generation([&](auto& generation) { report.unsaved = generation.unsaved_store_sessions(); });
+        reopen.now();
+        // An eviction write queued during the close is on its way to the store, not in the bucket.
+        if (reopen.written_during_close) { report.uploaded = false; }
         report.written  = store->stats().puts - puts;
         report.seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
@@ -832,8 +843,12 @@ private:
     bool enqueue_store_write(CheckpointImage&& image, StoreWrite kind) {
         std::unique_lock lock(writer_mutex);
         if (writer_stop) { return false; } // shutting down: the final flush writes it instead
-        // A flush is counting what is unsaved: this session counts, and is written after it.
-        if (store_writes_closed) { return false; }
+        // A flush is counting what is unsaved: this session counts, and is written after it. An
+        // evicted session has no later chance, so it is queued, and the flush told it missed one.
+        if (store_writes_closed) {
+            if (kind != StoreWrite::Eviction) { return false; }
+            store_write_during_close = true;
+        }
         // The memory the queue holds: a reused export buffer can be larger than its image.
         std::size_t queued_bytes = 0;
         for (const auto& pending : pending_writes) { queued_bytes += pending.image.bytes.capacity(); }
