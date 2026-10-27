@@ -435,7 +435,7 @@ bool ProgramImpl::pause_snapshot_fits(SequenceHandle handle) const {
     // can take in units of the larger page stride bounds them (the image is counted in `bytes`
     // too, which only makes this stricter); the state image needs a run of its own.
     const std::size_t unit = std::max(text_host_kv_page_stride, backend_host_kv_page_stride);
-    return bytes && *bytes <= host_context_arena->placeable_bytes(unit) &&
+    return bytes.has_value() && *bytes <= host_context_arena->placeable_bytes(unit) &&
            pause_state_image_unplaced(handle) == 0;
 }
 

@@ -2510,7 +2510,9 @@ private:
             }
             // The victim search counts free bytes, but the state image needs one contiguous run:
             // when the freed bytes do not form one, ask for another image's worth and try again.
-            std::size_t target = *bytes > reserve_free ? *bytes - reserve_free : *bytes;
+            // What the reserve holds needs no eviction, so a snapshot the reserve can take starts
+            // from nothing to free and only the image's run can make the rounds ask for more.
+            std::size_t target = *bytes > reserve_free ? *bytes - reserve_free : 0;
             for (std::size_t round = 0; round < kMaxPauseHostRounds; ++round) {
                 const auto victims =
                     resources_.host_victims(*instance_.program, target, std::nullopt, later);
