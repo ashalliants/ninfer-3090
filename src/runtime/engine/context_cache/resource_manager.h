@@ -1977,7 +1977,12 @@ private:
             // Shared physical objects still count once in the whole protected set.
             const auto usage       = amounts(program.checkpoint_footprint(reused));
             ProtectedEntry* demote = nullptr;
-            for (std::size_t resource = 0; resource < usage.size() && !demote; ++resource) {
+            // Only Host bytes have a soft target. Protection matters where losing a checkpoint
+            // loses its work, which is the Host tier. Device KV pages and state slots are the
+            // working set: moving a protected checkpoint from them to the Host loses nothing, and
+            // one long dialogue can hold most of the Device pool by itself (#397).
+            constexpr std::size_t kHostBytes = 3;
+            for (const std::size_t resource : {kHostBytes}) {
                 if (usage[resource] <= capacities[resource] * 3ULL / 4ULL) { continue; }
                 ProtectedEntry* newest = nullptr;
                 ProtectedEntry* oldest = nullptr;
