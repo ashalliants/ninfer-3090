@@ -56,6 +56,7 @@ HostContextArena::HostContextArena(std::size_t capacity_bytes, std::size_t minim
         throw std::invalid_argument("Host context minimum allocation is invalid");
     }
     minimum_bytes_ = (minimum_allocation_bytes + alignment - 1) & ~(alignment - 1);
+    general_budget_ = capacity_bytes_;
     if (capacity_bytes_ == 0) { return; }
     // At most N allocated extents separate N+1 free runs; releases and splits never allocate
     // metadata. The unused trailing bytes remain part of the charged physical backing.
@@ -72,6 +73,29 @@ std::size_t HostContextArena::allocation_bytes(std::size_t bytes) const noexcept
     return rounded < minimum_bytes_ ? 0 : rounded;
 }
 
+void HostContextArena::reserve_for_snapshots(std::size_t bytes) {
+    if (bytes == 0) { return; }
+    if (allocation_count_ != 0 || general_budget_ != capacity_bytes_) {
+        throw std::logic_error("the Host snapshot reserve is set once, before any allocation");
+    }
+    const std::size_t rounded = bytes > std::numeric_limits<std::size_t>::max() - (alignment - 1)
+                                    ? std::numeric_limits<std::size_t>::max()
+                                    : (bytes + alignment - 1) & ~(alignment - 1);
+    if (rounded < minimum_bytes_ || rounded >= capacity_bytes_ ||
+        capacity_bytes_ - rounded < minimum_bytes_) {
+        throw std::invalid_argument("the Host snapshot reserve must leave room on both sides of it "
+                                    "for one complete allocation");
+    }
+    general_budget_ = capacity_bytes_ - rounded;
+}
+
+std::size_t HostContextArena::placeable_bytes(std::size_t unit) const noexcept {
+    if (unit == 0) { return free_bytes(); }
+    std::size_t bytes = 0;
+    for (const FreeExtent& extent : free_extents_) { bytes += extent.bytes / unit * unit; }
+    return bytes;
+}
+
 std::optional<std::size_t> HostContextArena::find_free_extent(std::size_t bytes) const noexcept {
     for (std::size_t index = 0; index < free_extents_.size(); ++index) {
         if (free_extents_[index].bytes >= bytes) { return index; }
@@ -80,8 +104,11 @@ std::optional<std::size_t> HostContextArena::find_free_extent(std::size_t bytes)
 }
 
 HostContextArena::Miss HostContextArena::classify_miss(std::size_t rounded_bytes) const noexcept {
-    // Enough bytes in total but no run that fits is a layout failure, not a capacity one.
-    return free_bytes() >= rounded_bytes ? Miss::geometry : Miss::shortage;
+    // Enough bytes in total but no run that fits is a layout failure, not a capacity one. Outside
+    // a SnapshotScope only the general budget's free bytes count.
+    const std::size_t free = snapshot_depth_ != 0 ? free_bytes()
+                                                  : general_budget_ - general_occupied_bytes();
+    return free >= rounded_bytes ? Miss::geometry : Miss::shortage;
 }
 
 void HostContextArena::count_failure(Miss miss) noexcept {
@@ -90,13 +117,13 @@ void HostContextArena::count_failure(Miss miss) noexcept {
 
 bool HostContextArena::can_allocate(std::size_t bytes) const noexcept {
     const std::size_t rounded = allocation_bytes(bytes);
-    return rounded != 0 && find_free_extent(rounded).has_value();
+    return rounded != 0 && !over_budget(rounded) && find_free_extent(rounded).has_value();
 }
 
 std::optional<HostContextAllocation> HostContextArena::allocate(std::size_t bytes) noexcept {
     const std::size_t rounded = allocation_bytes(bytes);
     if (rounded == 0) { return std::nullopt; }
-    const auto free_index = find_free_extent(rounded);
+    const auto free_index = over_budget(rounded) ? std::nullopt : find_free_extent(rounded);
     if (!free_index) {
         // Classified now, against the bytes free now: by the time the placement gives up, other
         // sizes it tried may have taken or returned space.

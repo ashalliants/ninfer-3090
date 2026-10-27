@@ -381,6 +381,19 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     // exact-hit endpoint. Alias descriptors are bounded separately from physical state slots.
     checkpoints.resize(checked_count(4ULL * logical_states + 2ULL * max_concurrency));
     const auto address_capacity = checked_count(checkpoints.size() + max_concurrency + 2U);
+    const std::size_t pause_reserve = plan.context_cache.host_pause_reserve_bytes;
+    if (pause_reserve && pause_reserve >= host_bytes) {
+        throw std::invalid_argument(
+            "--host-pause-reserve-mib must be smaller than the Host context capacity "
+            "(--host-context-mib or --auto-host-cache), and needs one");
+    }
+    // A reserve that cannot hold one state image can never take a snapshot.
+    if (pause_reserve && pause_reserve < state_images->host_layout().image_bytes) {
+        throw std::invalid_argument(
+            "--host-pause-reserve-mib must hold at least one state image (" +
+            std::to_string((state_images->host_layout().image_bytes + (1U << 20) - 1) >> 20) +
+            " MiB for this model)");
+    }
     if (host_bytes) {
         StartupPhaseScope phase(startup_observer, StartupPhase::HostContextPin,
                                 StartupProgressUnit::Bytes, host_bytes);
@@ -391,6 +404,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                 std::string("failed to pin the Host context cache: ") + error.what() +
                 "\nLower the Host context capacity (--host-context-mib) or free system RAM.");
         }
+        host_context_arena->reserve_for_snapshots(pause_reserve);
         host_state_images =
             std::make_unique<HostStatePool>(*host_context_arena, state_images->host_layout());
         host_kv_arena      = std::make_unique<HostKVArena>(*host_context_arena, layouts);

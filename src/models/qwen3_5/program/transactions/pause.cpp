@@ -3,6 +3,7 @@
 #include "core/device.h"
 
 #include <array>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -158,6 +159,9 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
                 if (item.token_begin < frontier && frontier < item.token_end) { return false; }
             }
         }
+        // Nor is a snapshot whose Host copy would not fit: the backup below would fail, the
+        // snapshot would be dropped and the request would recompute everything it had done.
+        if (!pause_snapshot_fits(handle)) { return false; }
     }
     timing.begin_wait();
     device.synchronize();
@@ -231,6 +235,9 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
     tx.paused.emplace(ResumeState(std::move(saved)));
     if (tx.paused->has_snapshot()) {
         auto& snapshot = checkpoint(*tx.paused->impl_->snapshot);
+        // A paused request's copy may use the pause snapshot reserve; cached history may not.
+        std::optional<HostContextArena::SnapshotScope> reserve;
+        if (host_context_arena) { reserve.emplace(*host_context_arena); }
         if (!prepare_backup(tx, snapshot, true)) {
             tx.state_transfer.reset();
             tx.kv_transfers.clear();

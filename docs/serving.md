@@ -930,7 +930,7 @@ server restarts.
 | `ninfer_lossy_prefill_summaries_total{kind="new\|reused"}`, `ninfer_lossy_prefill_summary_probe_timeouts_total` | summary strategy: prompts it rewrote with a summary made now or recorded for an earlier turn, and coldness probes not answered in time (the prompt was treated as warm and left whole) |
 | `ninfer_engine_recoveries_total` | host-side worker failures the server survived by failing the in-flight requests and clearing the context cache |
 | `ninfer_device_kv_{used,capacity}_pages`, `ninfer_device_backend_kv_used_pages`, `ninfer_device_state_{used,capacity}_slots` | physical Main KV, speculative backend KV and StateImage occupancy; retained history also occupies these pools |
-| `ninfer_host_context_{used,reserved,capacity,peak}_bytes`, `ninfer_host_state_images`, `ninfer_host_kv_used_bytes` | unified Host backing; reserved bytes, StateImages and KV bytes are breakdowns already included in used bytes |
+| `ninfer_host_context_{used,reserved,capacity,peak}_bytes`, `ninfer_host_state_images`, `ninfer_host_kv_used_bytes`, `ninfer_host_pause_reserve_used_bytes` | unified Host backing; reserved bytes, StateImages, KV bytes and the snapshots in the pause reserve (`--host-pause-reserve-mib`) are breakdowns already included in used bytes |
 | `ninfer_host_context_free_extents`, `ninfer_host_context_{geometry,shortage}_failures_total` | Host backing health: separate free runs now (many small ones mean fragmentation), and allocations that failed. A geometry failure had enough free bytes in total but no run large enough; a shortage failure had too few bytes. Non-zero geometry failures mean a demotion, pause or restore was refused for layout, not capacity. Pages that may be split over several runs (demotion, a pause snapshot, an imported context) count one failure only when they cannot be placed at all, not one per run size tried |
 | `ninfer_context_transfer_bytes_total{resource,direction}`, `ninfer_context_transfer_seconds_total` | actual `state`/`main_kv`/`backend_kv` payload transfers, `d2h`, `h2d` or `d2d`, and their time |
 | `ninfer_context_pressure_spill_pages_total` | KV pages moved from Device to Host to relieve pressure |
@@ -2105,6 +2105,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--host-cache-reserve-mib N` | with `--auto-host-cache`, host memory left unpinned beneath what is available | `3072` |
 | `--host-cache-max-mib N` | with `--auto-host-cache`, the most it may pin, applied after the reserve; for machines whose memory other tenants share | no cap |
 | `--host-cache-percent N` | with `--auto-host-cache`, the most it may pin as a percentage (1-100) of the machine's total memory (or its container's limit), however much is free at startup; the smallest of this, the cap and the free memory less the reserve applies | no limit |
+| `--host-pause-reserve-mib N` | keep N MiB of the Host budget for pause snapshots (a request paused for memory, or a prefill yielding to the queue): cached history never fills it, so a pause saves its progress without evicting anything and `--yield-long-prefill-ms` still finds room when the cache is full. Size it for one paused request: its share of the KV pool (the startup `capacity` line gives the pool's tokens and size) plus one state image. The cache plans with the rest; `ninfer_host_pause_reserve_used_bytes` shows what the reserve holds. Qwen3.5-family models only | `0` (off) |
 | `--context-store DIR` | keep retained sessions on disk so a restart or crash does not lose the context cache; see [Context store](#context-store). Needs a nonzero Host context budget or a disk tier (`--context-nvme-mib`) | off |
 | `--context-store-max-gib N` | bound the store; the least recently used sessions are removed beyond it. Requires `--context-store` | half the volume's free space |
 | `--context-store-ttl-hours N` | remove sessions unused this long; `0` keeps them until space is needed | `168` |
@@ -2421,8 +2422,10 @@ it is restored behind the newcomer, once that request has been admitted (or afte
 Several limits keep it from doing harm: a pause that cannot save the prefill's progress is not made (the
 alternative would recompute it all), a prompt with media is never paused, a request is paused at most
 four times, and the same newcomer never pauses a second prefill. `ninfer_prefill_yields_total` counts the
-pauses. It needs a free state slot and Host room for the snapshot (the same capacity as a pause for
-resource pressure), and it does nothing when a lane is free. Off by default; Qwen3.8-Flash-Next refuses
+pauses. It needs a free state slot and Host room for the snapshot's KV and state (the same capacity as a
+pause for resource pressure). A yield evicts no cached history to make that room, so once the cache has
+filled the Host it stops firing; `--host-pause-reserve-mib` keeps room that the cache cannot fill. It
+does nothing when a lane is free. Off by default; Qwen3.8-Flash-Next refuses
 the flag.
 
 `--prefill-decode-share P` (0-90) is the other half. After each prefill step, while a lane is decoding,

@@ -313,6 +313,11 @@ struct ContextCacheOptions {
     // refuses an explicit host_capacity_bytes. Engine::options() returns the resolved capacity
     // with this flag cleared.
     bool auto_host_cache = false;
+    // Bytes of host_capacity_bytes that only pause snapshots may use (a pause for memory, or a
+    // prefill yielding to the queue). Cached history never fills them, so a pause finds room
+    // without evicting it. Zero (default): snapshots compete with cached history for the whole
+    // budget. Must be smaller than host_capacity_bytes. Qwen3.5-family models only.
+    std::size_t host_pause_reserve_bytes = 0;
     // Memory left unpinned beneath whatever is available when auto_host_cache sizes the tier.
     std::size_t host_cache_reserve_bytes = kDefaultHostCacheReserveBytes;
     // An upper bound on what auto_host_cache pins, applied after the reserve. Empty: no bound, so a
@@ -1756,6 +1761,8 @@ struct RuntimeStats {
     std::size_t host_context_free_extents          = 0;
     std::uint64_t host_context_geometry_failures   = 0;
     std::uint64_t host_context_shortage_failures   = 0;
+    // Bytes in the pause snapshot reserve now (--host-pause-reserve-mib), a subset of occupied.
+    std::size_t host_pause_reserve_occupied_bytes = 0;
     double actual_context_transfer_seconds       = 0.0;
     // Host-side failures the worker survived by failing the in-flight requests and clearing the
     // context cache instead of latching the Engine unavailable.

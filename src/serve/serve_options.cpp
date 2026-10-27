@@ -159,6 +159,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--media-preprocess-threads N] "
            "[--device-state-slots N] [--host-context-mib N | --auto-host-cache "
            "[--host-cache-reserve-mib N] [--host-cache-max-mib N] [--host-cache-percent N]] "
+           "[--host-pause-reserve-mib N] "
            "[--request-log-jsonl FILE] [--request-log-lossy-detail] "
            "[--context-store DIR [--context-store-max-gib N] [--context-store-ttl-hours N] "
            "[--context-store-idle-seconds N] [--context-store-restore-seconds N] "
@@ -343,6 +344,10 @@ std::string serve_usage_text(const char* argv0) {
            "its container's limit) whatever is free at startup; the smallest of this, the cap and "
            "the free memory less the reserve applies. With vision on, the reserve also covers "
            "--media-cache-mib and --media-live-mib\n"
+           "       --host-pause-reserve-mib N keeps N MiB of the Host context budget for pause "
+           "snapshots (a request paused for memory, or a prefill yielding to the queue): cached "
+           "history never fills it, so a pause saves its progress without evicting anything. Off "
+           "by default\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --reasoning-loop off (default), stop or conclude: every 512 thinking tokens, "
@@ -638,6 +643,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.context_cache.host_cache_reserve_bytes = static_cast<std::size_t>(mib << 20);
             host_reserve_explicit                          = true;
+        } else if (arg == "--host-pause-reserve-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--host-pause-reserve-mib"), "host-pause-reserve-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--host-pause-reserve-mib is out of range");
+            }
+            options.context_cache.host_pause_reserve_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--host-cache-max-mib") {
             const std::uint64_t mib =
                 parse_u64(require_value("--host-cache-max-mib"), "host-cache-max-mib");
@@ -959,6 +971,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (host_reserve_explicit && !options.context_cache.auto_host_cache) {
         throw std::invalid_argument("--host-cache-reserve-mib requires --auto-host-cache");
+    }
+    if (options.context_cache.host_pause_reserve_bytes &&
+        options.context_cache.host_capacity_bytes &&
+        options.context_cache.host_pause_reserve_bytes >= *options.context_cache.host_capacity_bytes) {
+        throw std::invalid_argument("--host-pause-reserve-mib must be smaller than --host-context-mib");
     }
     if (host_max_explicit && !options.context_cache.auto_host_cache) {
         throw std::invalid_argument("--host-cache-max-mib requires --auto-host-cache");

@@ -565,9 +565,10 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     instance->install_external_checkpoints();
     device.synchronize();
     program.complete();
-    // What the Program actually pinned.
+    // What the Program actually pinned: the cache's budget plus the pause snapshot reserve.
+    const auto pinned = instance->program->physical_usage();
     options.context_cache.host_capacity_bytes =
-        instance->program->physical_usage().capacity.host_bytes;
+        pinned.capacity.host_bytes + pinned.host_pause_reserve_bytes;
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
     const auto& stats = instance->model->storage_stats();
     LoadSummary summary;

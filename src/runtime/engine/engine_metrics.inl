@@ -187,7 +187,11 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.prefilling_requests              = 0;
     snapshot.paused_requests                  = static_cast<std::uint32_t>(paused_.size());
     snapshot.replaying_requests               = 0;
-    snapshot.host_context_occupied_bytes      = physical.occupied.host_bytes;
+    // occupied.host_bytes leaves out the pause snapshot reserve (the context cache cannot use it);
+    // the gauge reports the whole backing.
+    snapshot.host_context_occupied_bytes =
+        physical.occupied.host_bytes + physical.host_pause_reserve_occupied_bytes;
+    snapshot.host_pause_reserve_occupied_bytes = physical.host_pause_reserve_occupied_bytes;
     snapshot.host_state_occupied_slots        = physical.host_state_slots;
     snapshot.host_kv_occupied_bytes           = physical.host_kv_bytes;
     snapshot.host_context_reserved_bytes      = physical.host_reserved_bytes;

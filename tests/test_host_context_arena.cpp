@@ -159,6 +159,51 @@ void test_placement_scope_counts_once() {
            "outside a placement every miss counts again");
 }
 
+// --host-pause-reserve-mib: a byte budget only pause snapshots may go past (#332).
+void test_snapshot_reserve() {
+    constexpr std::size_t unit = ninfer::HostContextArena::alignment;
+    ninfer::HostContextArena arena(4 * unit, unit);
+    arena.reserve_for_snapshots(unit + 1); // rounds up to two units
+    expect(arena.snapshot_reserve_bytes() == 2 * unit && arena.general_capacity_bytes() == 2 * unit,
+           "the reserve is whole alignment units taken from the general budget");
+    auto a = arena.allocate(unit);
+    auto b = arena.allocate(unit);
+    expect(a && b && !arena.allocate(unit) && !arena.can_allocate(unit),
+           "cached history cannot allocate past its budget into the reserve");
+    expect(arena.shortage_failures() == 1 && arena.geometry_failures() == 0,
+           "a full general budget is a shortage, whatever the reserve holds");
+    std::optional<ninfer::HostContextAllocation> kept;
+    {
+        ninfer::HostContextArena::SnapshotScope snapshot(arena);
+        expect(arena.can_allocate(2 * unit) && arena.placeable_bytes(unit) == 2 * unit,
+               "a snapshot sees the reserve");
+        kept = arena.allocate(unit);
+        expect(kept && arena.occupied_bytes() == 3 * unit &&
+                   arena.general_occupied_bytes() == 2 * unit,
+               "a snapshot past the budget is counted in the reserve, not against the budget");
+    }
+    (void)a->release();
+    expect(arena.occupied_bytes() == 2 * unit && arena.general_occupied_bytes() == 2 * unit &&
+               !arena.allocate(unit),
+           "a snapshot's copy left behind counts against the budget like cached history");
+    (void)kept->release();
+    expect(arena.allocate(unit).has_value(),
+           "evicting the left-behind copy returns the room to the budget");
+    expect(arena.placeable_bytes(3 * unit) == 0 && arena.placeable_bytes(2 * unit) == 2 * unit,
+           "a free run holds only whole units");
+    bool twice = false;
+    try {
+        arena.reserve_for_snapshots(unit);
+    } catch (const std::logic_error&) { twice = true; }
+    expect(twice, "the reserve is set once, before any allocation");
+    bool whole = false;
+    try {
+        ninfer::HostContextArena other(4 * unit, unit);
+        other.reserve_for_snapshots(4 * unit);
+    } catch (const std::invalid_argument&) { whole = true; }
+    expect(whole, "a reserve cannot take the whole backing");
+}
+
 // A placement's failure is classified by its last miss as it was when it missed, and a miss that a
 // later allocation got past does not count when the placement then fails for another reason.
 void test_placement_scope_classifies_at_the_miss() {
@@ -209,6 +254,7 @@ int main() {
         test_fragmentation_and_split();
         test_failures_are_counted_by_cause();
         test_placement_scope_counts_once();
+        test_snapshot_reserve();
         test_placement_scope_classifies_at_the_miss();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

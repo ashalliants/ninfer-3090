@@ -2528,16 +2528,27 @@ private:
             if (require_snapshot || !end_lossy_scout_for_pause(request)) { return false; }
         }
         bool save_snapshot = false;
-        if (require_snapshot) {
+        if (instance_.program->pause_snapshot_fits(*request->sequence)) {
+            // The snapshot fits the free Host bytes as they are (the pause snapshot reserve
+            // included), so nothing needs evicting.
+            save_snapshot = true;
+        } else if (require_snapshot) {
             // A pause that only serves the queue is not worth evicting other requests' history, so
-            // it saves a snapshot only where the image already fits: nothing is released, revoked or
-            // marked for replay before the answer is known.
-            save_snapshot = instance_.program->pause_host_bytes(*request->sequence).has_value() &&
-                            instance_.program->pause_state_image_unplaced(*request->sequence) == 0;
+            // it is made only where the snapshot already fits (above): nothing is released, revoked
+            // or marked for replay before the answer is known.
+            return false;
         } else if (const auto bytes = instance_.program->pause_host_bytes(*request->sequence)) {
-            const auto usage = instance_.program->physical_usage();
-            if (*bytes <= usage.capacity.host_bytes &&
-                *bytes > usage.capacity.host_bytes - usage.occupied.host_bytes) {
+            // `usage` is the context cache's view: its budget, without the pause snapshot reserve.
+            // A snapshot may also use what is free in the reserve, so eviction only has to make up
+            // the rest.
+            const auto reserve_free_in = [](const auto& seen) {
+                return seen.host_pause_reserve_bytes -
+                       std::min(seen.host_pause_reserve_bytes, seen.host_pause_reserve_occupied_bytes);
+            };
+            const auto usage        = instance_.program->physical_usage();
+            std::size_t reserve_free = reserve_free_in(usage);
+            if (*bytes <= usage.capacity.host_bytes + reserve_free &&
+                *bytes > usage.capacity.host_bytes - usage.occupied.host_bytes + reserve_free) {
                 (void)instance_.program->release_redundant_host({}, request->sequence);
             }
             std::vector<Checkpoint> later;
@@ -2549,14 +2560,22 @@ private:
             }
             // The victim search counts free bytes, but the state image needs one contiguous run:
             // when the freed bytes do not form one, ask for another image's worth and try again.
-            std::size_t target = *bytes;
+            // What the reserve holds needs no eviction, so a snapshot the reserve can take starts
+            // from nothing to free and only the image's run can make the rounds ask for more.
+            std::size_t target = *bytes > reserve_free ? *bytes - reserve_free : 0;
+            // Releasing a later paused snapshot can free bytes in the reserve rather than the
+            // budget; those count toward the target too, so eviction stops as soon as they cover it.
+            const auto reached = [&](const auto& seen) {
+                const std::size_t now    = reserve_free_in(seen);
+                const std::size_t gained = now > reserve_free ? now - reserve_free : 0;
+                return seen.capacity.host_bytes - seen.occupied.host_bytes + gained >= target;
+            };
             for (std::size_t round = 0; round < kMaxPauseHostRounds; ++round) {
                 const auto victims =
                     resources_.host_victims(*instance_.program, target, std::nullopt, later);
                 if (!victims) { break; }
                 for (const auto handle : *victims) {
-                    const auto usage = instance_.program->physical_usage();
-                    if (usage.capacity.host_bytes - usage.occupied.host_bytes >= target) { break; }
+                    if (reached(instance_.program->physical_usage())) { break; }
                     if (resources_.release_victim(*instance_.program, handle)) { continue; }
                     const auto owner =
                         std::find_if(paused_.begin(), paused_.end(), [&](const auto& other) {
@@ -2581,7 +2600,8 @@ private:
                     usage.capacity.host_bytes - usage.occupied.host_bytes, unplaced,
                     usage.capacity.host_bytes);
                 if (!next) { break; }
-                target = *next;
+                target       = *next;
+                reserve_free = reserve_free_in(usage);
             }
         }
         if (require_snapshot && !save_snapshot) { return false; }

@@ -48,6 +48,7 @@ int main() {
     running.host_context_occupied_bytes = 4096;
     running.host_context_reserved_bytes = 1024;
     running.host_context_free_extents        = 5;
+    running.host_pause_reserve_occupied_bytes = 4096;
     running.host_context_geometry_failures   = 7;
     running.host_context_shortage_failures   = 2;
     metrics.first_token({.prepare_seconds = 0.05, .elapsed_since_submit_seconds = 0.2});
@@ -75,6 +76,8 @@ int main() {
               live.find("ninfer_host_context_geometry_failures_total 7\n") != std::string::npos &&
               live.find("ninfer_host_context_shortage_failures_total 2\n") != std::string::npos,
           "Host allocator failures must be exported, split by geometry and shortage");
+    check(live.find("ninfer_host_pause_reserve_used_bytes 4096\n") != std::string::npos,
+          "the bytes in the pause snapshot reserve must be exported");
 
     GenerationOutcome outcome;
     outcome.finish_reason                            = FinishReason::OutputLimit;

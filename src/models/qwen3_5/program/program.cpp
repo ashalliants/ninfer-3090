@@ -237,6 +237,10 @@ std::size_t Program::pause_state_image_unplaced(SequenceHandle sequence) const {
     return impl_->pause_state_image_unplaced(sequence);
 }
 
+bool Program::pause_snapshot_fits(SequenceHandle sequence) const {
+    return impl_->pause_snapshot_fits(sequence);
+}
+
 std::size_t Program::release_redundant_host(std::span<const CheckpointHandle> excluded,
                                             std::optional<SequenceHandle> pending_backup) {
     return impl_->release_redundant_host(excluded, pending_backup);
