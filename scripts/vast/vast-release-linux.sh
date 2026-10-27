@@ -96,9 +96,15 @@ echo "==> [$(date -Is)] smoke test: default profile, one chat completion on the 
 port=$(( 20000 + RANDOM % 20000 ))
 while ss -ltn "sport = :$port" | grep -q LISTEN; do port=$(( 20000 + RANDOM % 20000 )); done
 echo "smoke test port: $port"
-(cd "$dir" && NINFER_PORT="$port" NINFER_MODEL_DIR=/root/models nohup ./run.sh qwen38-27b > /root/smoke-serve.log 2>&1 & echo $! > /root/smoke-serve.pid)
+(cd "$dir" && NINFER_PORT="$port" NINFER_MODEL_DIR=/root/models setsid nohup ./run.sh qwen38-27b > /root/smoke-serve.log 2>&1 & echo $! > /root/smoke-serve.pid)
 pid="$(cat /root/smoke-serve.pid)"
-stop_server() { pkill -P "$pid" 2>/dev/null || true; kill "$pid" 2>/dev/null || true; }
+# run.sh runs the server inside a pipeline (`| tee`), so it is a grandchild that `pkill -P` misses and
+# that would keep the card busy after the script ends. setsid made $pid a process group: stop all of it.
+stop_server() {
+  kill -TERM -- "-$pid" 2>/dev/null || return 0
+  for _ in $(seq 1 60); do kill -0 -- "-$pid" 2>/dev/null || return 0; sleep 1; done
+  kill -KILL -- "-$pid" 2>/dev/null || true
+}
 trap 'rc=$?; stop_server; if (( rc != 0 )); then echo FAILED >> "$status"; fi' EXIT
 ready=0
 for _ in $(seq 1 120); do
