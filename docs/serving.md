@@ -2329,8 +2329,10 @@ each request gets a prefill deadline when it is admitted: the time it was submit
 model predicts its prefill takes alone. The prefilling lane with the earliest deadline runs; the others
 wait, holding their lanes and the pages they have. A short prompt has an early deadline and overtakes a
 long one at the next step. Waiting is what ages a long prompt: a request submitted after the long one's
-deadline has a later deadline however short it is, so a stream of short requests delays a long one by at
-most about its own prefill time. A paused and restored request keeps its deadline. Decode rounds are
+deadline has a later deadline however short it is, so a long prompt waits only for work submitted before
+its deadline and is never passed over for good. That work is not capped, though: a busy stream of short
+requests arriving in the meantime can delay it by more than its own prefill time. A paused and restored
+request keeps its deadline. Decode rounds are
 unaffected. It orders only the prefills already holding a lane: with every lane busy (always, at
 `--max-concurrency 1`) a short request still waits in the queue, which is what `--yield-long-prefill-ms`
 is for. Off by default (`rotate`).

@@ -332,9 +332,10 @@ enum class PrefillOrder : std::uint8_t {
     Rotate,
     // Shortest first, with aging: the lane with the earliest prefill deadline goes first, a
     // request's deadline being when it was submitted plus what its prefill costs alone (the cost
-    // model's prediction at admission, a lossy prompt's as filtered). A short prompt gets an early deadline and overtakes a
-    // long one; time spent waiting ages a long one, so a prompt submitted later than a long one's
-    // deadline never overtakes it, which bounds how long it can be passed over.
+    // model's prediction at admission, a lossy prompt's as filtered). A short prompt gets an early
+    // deadline and overtakes a long one; time spent waiting ages a long one, so a prompt submitted
+    // later than a long one's deadline never overtakes it. The long one is never passed over for
+    // good, but it waits for all the work submitted before its deadline, which is not capped.
     Shortest,
 };
 

@@ -2786,15 +2786,20 @@ private:
     }
 
     // Under --prefill-order shortest, the predicted prefill still to run on every other resident
-    // whose deadline comes before `request`'s: what runs before it gets another turn.
+    // that Scheduler::next_prefill can pick before `request`: a fresh prefill or a replay whose
+    // deadline is earlier, or the same (a tie keeps the rotation's order, which may put it first).
+    // A replay's remaining work is not known here, so one ahead makes the answer unknown, as the
+    // saturated UINT64_MAX the cost model also uses: too long to wait for.
     [[nodiscard]] std::uint64_t prefill_ahead_ns(const Request& request) const {
         std::uint64_t ahead = 0;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& other = slots_[lane];
-            if (!other || other.get() == &request || !other->is_prefilling() || !other->base_plan ||
-                !(other->prefill_deadline < request.prefill_deadline)) {
+            if (!other || other.get() == &request ||
+                !(other->is_prefilling() || other->is_replaying()) || !other->base_plan ||
+                other->prefill_deadline > request.prefill_deadline) {
                 continue;
             }
+            if (other->is_replaying()) { return std::numeric_limits<std::uint64_t>::max(); }
             if (const auto cursor = sibling_cursor(*other)) {
                 const auto rest = prefill_remaining_ns(*other, *cursor);
                 ahead = rest > std::numeric_limits<std::uint64_t>::max() - ahead
