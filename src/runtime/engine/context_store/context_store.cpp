@@ -1982,7 +1982,8 @@ void ContextStore::remote_loop() {
     unpin_chunks_locked(pinned);
 }
 
-bool ContextStore::upload_unpublished(std::chrono::steady_clock::time_point deadline) {
+bool ContextStore::upload_unpublished(std::string_view binding,
+                                      std::chrono::steady_clock::time_point deadline) {
     if (!options_.remote) { return true; }
     for (;;) {
         std::size_t unpublished = 0;
@@ -2001,7 +2002,7 @@ bool ContextStore::upload_unpublished(std::chrono::steady_clock::time_point dead
                                    : 0;
             for (const auto& [id, entry] : entries_) {
                 if (entry.published || entry.evicted || !entry.peer_memo_key.empty() ||
-                    !entry_local_locked(entry)) {
+                    entry.info.binding != binding || !entry_local_locked(entry)) {
                     continue;
                 }
                 ++unpublished;

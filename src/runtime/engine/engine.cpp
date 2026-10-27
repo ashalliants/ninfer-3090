@@ -499,7 +499,7 @@ public:
             // Writes the store has completed: one that lands during the pass (queued and written
             // after the scan, so the writer looks idle again) shows as a change here.
             const auto puts_before = store->stats().puts;
-            report.uploaded        = store->upload_unpublished(deadline);
+            report.uploaded        = store->upload_unpublished(store_binding, deadline);
             bool settled           = false;
             {
                 // The check and the close are one step: a write offered after it is refused

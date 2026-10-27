@@ -271,8 +271,10 @@ public:
     // With a remote: uploads every image the directory holds whole that the bucket may lack (one
     // whose upload is still queued, or was given up when the queue was full), the queue's room at a
     // time, until none is left or `deadline`. True when the bucket holds them all. Images imported
-    // from a peer are the peer's to upload. For a flush before the box goes.
-    bool upload_unpublished(std::chrono::steady_clock::time_point deadline);
+    // from a peer are the peer's to upload, and only images of `binding` (the caller's model and
+    // configuration, whose bucket scope this store writes to) are sent. For a flush before the
+    // box goes.
+    bool upload_unpublished(std::string_view binding, std::chrono::steady_clock::time_point deadline);
     // Uploads that may wait at once; beyond it the oldest is given up (each pins its chunk files,
     // which count against max_bytes, so the size limit bounds them too). Room for a busy box's
     // conversations to wait out a long upload delay (--context-store-s3-upload-delay-seconds).
