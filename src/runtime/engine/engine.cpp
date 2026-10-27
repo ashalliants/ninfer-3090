@@ -470,6 +470,9 @@ public:
         const auto started  = std::chrono::steady_clock::now();
         const auto deadline = started + budget;
         const auto puts     = store->stats().puts;
+        // A write that fails during the flush may be an evicted session's, whose owner is gone
+        // already: nothing would count it as unsaved, so a failure makes the bucket incomplete.
+        const auto failures = store_write_failures.load(std::memory_order_acquire);
         ContextStoreFlushReport report;
         with_generation([&](auto& generation) {
             generation.set_store_flush(true);
@@ -532,6 +535,9 @@ public:
         reopen.now();
         // An eviction write queued during the close is on its way to the store, not in the bucket.
         if (reopen.written_during_close) { report.uploaded = false; }
+        if (store_write_failures.load(std::memory_order_acquire) != failures) {
+            report.uploaded = false;
+        }
         report.written  = store->stats().puts - puts;
         report.seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();

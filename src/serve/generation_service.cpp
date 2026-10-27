@@ -489,6 +489,10 @@ GenerationService::flush_context_store(std::chrono::milliseconds budget) {
             --capacity.active;
         }
     } const release{*request_capacity_};
+    // Without a store there is nothing to flush: answer so before waking a suspended model.
+    if (!engine_->options().context_store.enabled()) {
+        throw std::invalid_argument("the context store is off (--context-store)");
+    }
     const auto residency = engine_->residency();
     if (residency.enabled && residency.state == ninfer::ModelResidency::Suspended) {
         (void)engine_->resume();
