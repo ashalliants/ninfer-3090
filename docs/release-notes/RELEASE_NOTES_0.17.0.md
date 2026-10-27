@@ -43,7 +43,14 @@ All found on one production box running v0.16.2 (two engines on a 36 GB disk, a 
 
 ## Long prompts and short ones (#385 to #387, from issue #332)
 
-- **`--prefill-order shortest`** (default `rotate`, unchanged). Reading a prompt (prefill) already uses the whole card, so two prompts read in turns finish no sooner than one after the other; taking turns only makes the first one late. In the #332 runs (two 44K-token prompts, the second sent 10 s after the first) taking turns gave 40.1 s and 43.4 s; running them one after the other gave 27.6 s and 42.7 s. With `shortest` each request gets a deadline (when it arrived plus its predicted reading time) and the earliest deadline goes first, so short prompts overtake and a long prompt is never passed over for good. It orders only requests that already have a lane: at `--max-concurrency 1` a short request still waits in the queue. The `shortest` timings themselves come from CPU tests with a simulated model; they were not measured on a card.
+- **`--prefill-order shortest`** (default `rotate`, unchanged). Reading a prompt (prefill) already uses the whole card, so two prompts read in turns finish no sooner than one after the other; taking turns only makes the first one late. In the #332 runs (two 44K-token prompts, the second sent 10 s after the first) taking turns gave 40.1 s and 43.4 s; running them one after the other gave 27.6 s and 42.7 s. With `shortest` each request gets a deadline (when it arrived plus its predicted reading time) and the earliest deadline goes first, so short prompts overtake and a long prompt is never passed over for good. It orders only requests that already have a lane: at `--max-concurrency 1` a short request still waits in the queue. Measured for this release on a rented RTX 3090 with Bonsai 2 27B (two lanes, MTP, each arm run twice, ABBA):
+
+  | two 32K-token prompts, the second sent 3 s after the first | first word, first prompt | first word, second prompt |
+  |---|---:|---:|
+  | `rotate` (default) | 25.6 s, 26.9 s | 26.6 s, 26.9 s |
+  | `shortest` | **15.6 s, 15.7 s** | 26.8 s, 26.9 s |
+
+  With one long prompt and one short one, the two settings gave the same times (the short one's first word in 1.6 s either way), because taking turns already lets a short prompt in at the next step. While a long prompt is being read, the other lane's reply is still slowed: a 32-token answer took about 9-15 s beside a 52K-token prefill under either setting.
 - **`--host-pause-reserve-mib N`** (default 0, off). Keeps N MiB of the Host budget that cached history can never fill, so pausing a request saves its progress without evicting anything, and `--yield-long-prefill-ms` keeps working when the cache is full (on #332 it fired 0 times with 11.7 of 12.8 GB of the Host holding history). Size it for one paused request: its share of the KV pool (the startup `capacity` line) plus one saved state. It takes that room away from cached history, which can lower cache hits. `ninfer_host_pause_reserve_used_bytes` shows what it holds. Qwen3.5-family models only; Flash-Next refuses it.
 - **Fixed:** a yield could lose its snapshot when the Host had room for the saved state but not for the KV, and then re-read the whole prompt from the start. A yield that does not fit is no longer started.
 
@@ -58,6 +65,8 @@ Measured 2026-10-25 on one RTX 3090 with Qwen3.8-27B (`--kv-dtype rk4v4 --max-co
 | full prefill | 70.2 s | all | 22/22 each | 25 of 26 |
 | lossy, defaults | **21.8 s** | about 30% | 22/22 each | 26 of 26 |
 
+Checked again for this release on a rented RTX 3090 with Bonsai 2 27B (`--kv-dtype rk4v4 --max-context 65536 --prefill-cublas`, `--lossy-prefill-min-tokens 8000`): a 49,844-token cold prompt with a code hidden in its middle got its first word in **9.0 s against 25.2 s** with the path off, kept 14,986 of 49,802 scored tokens, and both runs answered with the hidden code. The next turn reused 49,841 cached tokens.
+
 Caveats: the quality checks are small. One `Edit` turn is 3.8 points, the needle test scores 22/22 everywhere so it does not tell settings apart, and a larger run is advised before you depend on it. When on, it reserves about 2 KB of VRAM per token of `--max-context`. It works on text-only Qwen3.5-family dense models on one GPU; the server refuses to start with it on MoE or pipeline-split models. The alternative `--lossy-prefill-strategy summary` (replace the middle of a long conversation with a deterministic summary) lost one `Edit` turn on the same set. The int4 scout (`--lossy-prefill-scout-a4`) failed its quality gate and stays opt-in. Watch it with `ninfer_lossy_prefill_total{outcome}` and the request log's `lossy_prefill` object. The design and full sweep are in `docs/maintainer/lossy-long-prefill.md`.
 
 ## Also changed
@@ -66,13 +75,33 @@ Caveats: the quality checks are small. One `Edit` turn is 3.8 points, the needle
 - **Fixed:** `ninfer_host_context_geometry_failures_total` climbed by tens to hundreds per request while every placement succeeded (#385).
 - **Docs:** the fit calculator and headline figures were re-measured on a stock RTX 3090, and Bonsai 2 27B and Qwen3.6-27B were added to the calculator (#378). The README opens with a plain-language summary (#390). Release notes moved to `docs/release-notes/` (#388); archives still carry them at their root.
 
+- **Fixed before release:** the Windows build failed to compile the server's option parser (`C1061: blocks nested too deeply`, MSVC's limit on a long `else if` chain, which the new flags passed). The parser now reads the `--context-store*` and `--lossy-prefill-*` flags in chains of their own; behaviour is unchanged, and a mistyped flag still stops the server with `unknown argument`.
+
 ## Not verified in this release
 
-VERIFICATION-PENDING
+- **Windows:** built and dependency-checked only; nothing was started or served on Windows.
+- **Qwen3.8-27B (the recommended model) was not served for this release.** Every check on the card used Ternary Bonsai 2 27B, a ternary build of the same architecture, through the archive's `qwen38-27b` profile. The lossy-prefill quality and speed table above is the Qwen3.8-27B measurement from #384.
+- **No GPU tests were run on the release commit.** #385, #386 and #387 merged without their GPU tests (`test_host_context_arena`, `test_native_transactions` and the real-model scheduling tests). For this release they were checked only by serving: the server starts and serves with `--admission-fit-check`, `--host-pause-reserve-mib 3072` and `--prefill-order shortest` together, and `ninfer_host_context_geometry_failures_total` stayed at 0. No request was paused or yielded during the checks, so the pause reserve's main path (a pause landing in the reserve) was not exercised on a card.
+- **Context store with a bucket:** no S3 or R2 bucket was used. The bucket-side changes (#391 to #393, #395's upload step) are covered by CPU tests with an in-memory bucket; their latency and bandwidth gains on a real bucket have not been measured. The flush answered `"uploaded": true` with no bucket configured, which only means nothing was waiting.
+- The production-box figures in "Context store fixes" (the rewrite loop, decode slowdown, disk use) were measured on v0.16.2 and in replays of its logs; the fixed version has not yet run on that box.
+- The full GPU test suite.
 
 ## Verification
 
-VERIFICATION-PENDING
+Checked on 2026-10-27 on a rented RTX 3090 (24 GB, Ubuntu 24.04, CUDA 12.8.1, GCC 13), against the release commit's code, before publishing:
+
+- **Build (Linux):** a clean `git archive` of the release commit, `-DCMAKE_CUDA_ARCHITECTURES=86 -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON`, targets `ninfer`, `ninfer-serve`, `ninfer_bench`; `/health` reports `0.17.0-rtx3090`.
+- **Linux archive:** the outer and inner checksums match; a fresh unpack runs `./ninfer-serve --version`, `--help` and `./run.sh --help`; `scripts/check-linux-scripts.sh` passes; `ldd` reports no unresolved library, and the library list of all three executables is the same as v0.16.2's (diffed).
+- **Launcher smoke test:** the unpacked archive's own `./run.sh qwen38-27b` with `NINFER_MODEL` pointing at Bonsai 2 27B started at the profile's full 262,144-token context with DFlash2 and answered a chat completion ("Hello, how are you, friend").
+- **Serving checks, all 28 passed**, from the unpacked archive's `ninfer-serve` with Bonsai 2 27B at two lanes, MTP, `rk4v4`, 65,536 tokens, `--prefill-order shortest --host-context-mib 12288 --host-pause-reserve-mib 3072 --admission-fit-check --yield-long-prefill-ms 2000 --context-store <dir> --context-store-idle-seconds 1 --request-log-jsonl <file>`:
+  - chat completion, streaming (ends with `[DONE]`), a tool call (`get_weather` with `{"city":"Oslo"}`), `json_schema` output with a `maxLength` string, and the Anthropic `/v1/messages` endpoint;
+  - a follow-up turn reused 5,108 of 5,158 prompt tokens; three requests at once on two lanes all completed; the 52K-token and short-prompt pair above;
+  - every new `/metrics` series listed in these notes is present; the request log is written;
+  - context store: 6 conversations were written in the background; `POST /v1/context-store/flush` answered `{"written":6,"unsaved":0,"uploaded":true}` in 12 s, `{"budget_seconds":0}` got 400, and a server without `--context-store` got 409 `context_store_off`;
+  - **restart:** a new server on the same store answered the conversation's next turn with 5,151 of 5,202 tokens restored from disk, in 0.7 s;
+  - lossy prefill: the run above, the follow-up's reuse (`ninfer_lossy_prefill_alias_hits_total` 1) and `lossy_prefill` in the request log;
+  - option parsing: `--context-store-bogus`, `--lossy-prefill-bogus` and `--bogus-flag` each stop the server with `unknown argument`, and `--context-store-max-gib 0` is still refused.
+- **Tests:** no test suite was run on the release commit; it builds the three products only. The pull requests carry their own CPU tests, and #384, #395 and #396 also ran their GPU tests on a rented 3090 (see their descriptions).
 
 ## Windows archive: built, not run
 
