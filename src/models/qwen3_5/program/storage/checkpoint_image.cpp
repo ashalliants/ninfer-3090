@@ -703,6 +703,8 @@ ProgramImpl::import_checkpoints(std::span<const std::uint8_t> image, std::string
                                   std::span<const std::uint8_t> payload,
                                   std::vector<LogicalKVPageHandle>& out) {
         const std::size_t stride = host_kv_extents->page_layout(pages).page_stride;
+        // Halving a run that does not fit is the placement working, not failing.
+        HostContextArena::PlacementScope placement(*host_context_arena);
         std::size_t offset       = 0;
         while (offset < columns.size()) {
             std::size_t count = columns.size() - offset;
@@ -714,7 +716,10 @@ ProgramImpl::import_checkpoints(std::span<const std::uint8_t> image, std::string
                 if (extent) { break; }
                 count /= 2;
             }
-            if (!extent) { return false; }
+            if (!extent) {
+                placement.failed();
+                return false;
+            }
             rollback.extents.push_back(extent->capability);
             out.insert(out.end(), extent->pages.begin(), extent->pages.end());
             offset += count;

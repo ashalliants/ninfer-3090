@@ -5,6 +5,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -120,6 +121,79 @@ void test_failures_are_counted_by_cause() {
            "a successful allocation changes no counter");
 }
 
+// A placement that tries smaller sizes after a miss (reserve_in_chunks) counts one failure for the
+// whole placement, and none when it succeeds in pieces (#332: every probe used to count).
+void test_placement_scope_counts_once() {
+    constexpr std::size_t unit = ninfer::HostContextArena::alignment;
+    ninfer::HostContextArena arena(4 * unit, unit);
+    auto first  = arena.allocate(unit);
+    auto second = arena.allocate(unit);
+    auto third  = arena.allocate(unit);
+    auto fourth = arena.allocate(unit);
+    (void)first->release();
+    (void)third->release();
+    std::optional<ninfer::HostContextAllocation> a, b;
+    {
+        ninfer::HostContextArena::PlacementScope placement(arena);
+        expect(!arena.allocate(2 * unit), "two separated free units cannot hold two units");
+        a = arena.allocate(unit);
+        b = arena.allocate(unit);
+        expect(a && b, "the placement fits once split into single units");
+    }
+    expect(arena.geometry_failures() == 0 && arena.shortage_failures() == 0,
+           "a placement made in pieces counts no failure for the sizes it tried");
+    {
+        ninfer::HostContextArena::PlacementScope placement(arena);
+        placement.failed();
+    }
+    expect(arena.geometry_failures() == 0 && arena.shortage_failures() == 0,
+           "a placement that failed without an arena miss counts nothing");
+    {
+        ninfer::HostContextArena::PlacementScope placement(arena);
+        expect(!arena.allocate(2 * unit) && !arena.allocate(unit), "a full arena holds nothing");
+        placement.failed();
+    }
+    expect(arena.shortage_failures() == 1 && arena.geometry_failures() == 0,
+           "a placement that cannot be made counts one failure, by its last miss");
+    expect(!arena.allocate(unit) && arena.shortage_failures() == 2,
+           "outside a placement every miss counts again");
+}
+
+// A placement's failure is classified by its last miss as it was when it missed, and a miss that a
+// later allocation got past does not count when the placement then fails for another reason.
+void test_placement_scope_classifies_at_the_miss() {
+    constexpr std::size_t unit = ninfer::HostContextArena::alignment;
+    ninfer::HostContextArena arena(4 * unit, unit);
+    auto first  = arena.allocate(unit);
+    auto second = arena.allocate(unit);
+    auto third  = arena.allocate(unit);
+    auto fourth = arena.allocate(unit);
+    (void)first->release();
+    (void)third->release();
+    {
+        ninfer::HostContextArena::PlacementScope placement(arena);
+        expect(!arena.allocate(2 * unit), "two separated free units cannot hold two units");
+        auto piece = arena.allocate(unit);
+        expect(piece.has_value(), "a single unit fits");
+        placement.failed();
+    }
+    expect(arena.geometry_failures() == 0 && arena.shortage_failures() == 0,
+           "a miss a smaller run got past is not why the placement failed");
+    {
+        ninfer::HostContextArena::PlacementScope placement(arena);
+        expect(!arena.allocate(2 * unit), "the layout miss is recorded");
+        auto a = arena.allocate(unit);
+        auto b = arena.allocate(unit);
+        expect(a && b, "both free units fit");
+        expect(!arena.allocate(2 * unit), "a full arena misses again");
+        (void)a->release();
+        (void)b->release();
+        placement.failed();
+    }
+    expect(arena.shortage_failures() == 1 && arena.geometry_failures() == 0,
+           "the failure is classified against the bytes free when it missed, not when counted");
+}
+
 } // namespace
 
 int main() {
@@ -134,6 +208,8 @@ int main() {
         test_reserve_publish_and_rollback();
         test_fragmentation_and_split();
         test_failures_are_counted_by_cause();
+        test_placement_scope_counts_once();
+        test_placement_scope_classifies_at_the_miss();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

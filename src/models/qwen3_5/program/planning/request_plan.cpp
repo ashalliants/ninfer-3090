@@ -269,6 +269,11 @@ UnitDemand ProgramImpl::prefill_unit(std::uint32_t prompt, std::uint32_t cursor,
     return demand;
 }
 
+UnitDemand ProgramImpl::prompt_end_unit(std::uint32_t prompt, std::uint32_t mtp_extent) const {
+    // The last chunk's frontiers are the whole prompt's, including the draft's extra rows.
+    return prefill_unit(prompt, prompt > prefill_chunk ? prompt - prefill_chunk : 0, mtp_extent);
+}
+
 UnitDemand ProgramImpl::next_unit(const SequenceState& sequence, const RequestControl& request,
                                   ExecutionUnitKind kind, std::uint32_t tokens) const {
     UnitDemand demand{.kind = kind, .tokens = tokens};

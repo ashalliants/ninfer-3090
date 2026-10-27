@@ -79,6 +79,15 @@ std::optional<std::size_t> HostContextArena::find_free_extent(std::size_t bytes)
     return std::nullopt;
 }
 
+HostContextArena::Miss HostContextArena::classify_miss(std::size_t rounded_bytes) const noexcept {
+    // Enough bytes in total but no run that fits is a layout failure, not a capacity one.
+    return free_bytes() >= rounded_bytes ? Miss::geometry : Miss::shortage;
+}
+
+void HostContextArena::count_failure(Miss miss) noexcept {
+    ++(miss == Miss::geometry ? geometry_failures_ : shortage_failures_);
+}
+
 bool HostContextArena::can_allocate(std::size_t bytes) const noexcept {
     const std::size_t rounded = allocation_bytes(bytes);
     return rounded != 0 && find_free_extent(rounded).has_value();
@@ -89,10 +98,18 @@ std::optional<HostContextAllocation> HostContextArena::allocate(std::size_t byte
     if (rounded == 0) { return std::nullopt; }
     const auto free_index = find_free_extent(rounded);
     if (!free_index) {
-        // Enough bytes in total but no run that fits is a layout failure, not a capacity one.
-        ++(free_bytes() >= rounded ? geometry_failures_ : shortage_failures_);
+        // Classified now, against the bytes free now: by the time the placement gives up, other
+        // sizes it tried may have taken or returned space.
+        const Miss miss = classify_miss(rounded);
+        if (placement_depth_ == 0) {
+            count_failure(miss);
+        } else {
+            placement_last_miss_ = miss;
+        }
         return std::nullopt;
     }
+    // A miss that a smaller run then got past is not why the placement might still fail.
+    placement_last_miss_ = Miss::none;
     FreeExtent& free         = free_extents_[*free_index];
     const std::size_t offset = free.offset;
     free.offset += rounded;

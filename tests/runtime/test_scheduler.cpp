@@ -391,6 +391,17 @@ void test_prompt_fit_beside_residents() {
             "pages promised to residents are not free for a new prompt");
     require(!prompt_fits_beside_residents({10, 0}, {40, 0}, KvPageCounts{49, 0}, true),
             "pages lent away are not free for a new prompt");
+    // A resident early in a long prefill holds one chunk but will need its whole prompt (#332).
+    using ninfer::runtime::resident_pages_to_prompt_end;
+    require(resident_pages_to_prompt_end(683, 16, 16) == 651,
+            "a resident's unreached prompt pages count beside what it maps and has reserved");
+    require(resident_pages_to_prompt_end(683, 683, 0) == 0 &&
+                resident_pages_to_prompt_end(683, 690, 4) == 0,
+            "a resident past its prompt end (decoding) has nothing more to come");
+    require(!prompt_fits_beside_residents(
+                {683, 0}, {16 + 16 + resident_pages_to_prompt_end(683, 16, 16), 0},
+                KvPageCounts{1094, 0}, true),
+            "two 43.7K prompts are not let into a 70K pool together");
     // An unaligned reused prefix shares only its full pages: 130 tokens = 2 full + a copied tail.
     require(ninfer::runtime::shareable_prefix_pages(130, 64) == 2 &&
                 ninfer::runtime::shareable_prefix_pages(128, 64) == 2 &&

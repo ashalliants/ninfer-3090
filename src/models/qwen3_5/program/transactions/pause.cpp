@@ -71,7 +71,9 @@ bool ProgramImpl::reserve_host_kv_transfers(ContextTransaction& tx, LogicalKVPag
     if (!host_kv_extents) { return false; }
     // One Host extent is a single contiguous arena run. A busy arena can hold enough bytes in
     // total yet no run big enough for every page, so the pages are placed in as few extents as fit.
-    return reserve_in_chunks(
+    // The sizes tried on the way are not failures; only a placement that cannot be made counts.
+    HostContextArena::PlacementScope placement(*host_context_arena);
+    const bool placed = reserve_in_chunks(
         logical,
         [&](std::span<const LogicalKVPageHandle> chunk) {
             return host_kv_extents->prepare(pages, chunk);
@@ -86,6 +88,8 @@ bool ProgramImpl::reserve_host_kv_transfers(ContextTransaction& tx, LogicalKVPag
             transfer.host_destination.emplace(std::move(destination));
             tx.kv_transfers.push_back(std::move(transfer));
         });
+    if (!placed) { placement.failed(); }
+    return placed;
 }
 
 bool ProgramImpl::prepare_backup(ContextTransaction& tx, CheckpointState& record,
