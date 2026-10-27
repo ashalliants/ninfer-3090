@@ -159,6 +159,41 @@ void test_placement_scope_counts_once() {
            "outside a placement every miss counts again");
 }
 
+// A placement's failure is classified by its last miss as it was when it missed, and a miss that a
+// later allocation got past does not count when the placement then fails for another reason.
+void test_placement_scope_classifies_at_the_miss() {
+    constexpr std::size_t unit = ninfer::HostContextArena::alignment;
+    ninfer::HostContextArena arena(4 * unit, unit);
+    auto first  = arena.allocate(unit);
+    auto second = arena.allocate(unit);
+    auto third  = arena.allocate(unit);
+    auto fourth = arena.allocate(unit);
+    (void)first->release();
+    (void)third->release();
+    {
+        ninfer::HostContextArena::PlacementScope placement(arena);
+        expect(!arena.allocate(2 * unit), "two separated free units cannot hold two units");
+        auto piece = arena.allocate(unit);
+        expect(piece.has_value(), "a single unit fits");
+        placement.failed();
+    }
+    expect(arena.geometry_failures() == 0 && arena.shortage_failures() == 0,
+           "a miss a smaller run got past is not why the placement failed");
+    {
+        ninfer::HostContextArena::PlacementScope placement(arena);
+        expect(!arena.allocate(2 * unit), "the layout miss is recorded");
+        auto a = arena.allocate(unit);
+        auto b = arena.allocate(unit);
+        expect(a && b, "both free units fit");
+        expect(!arena.allocate(2 * unit), "a full arena misses again");
+        (void)a->release();
+        (void)b->release();
+        placement.failed();
+    }
+    expect(arena.shortage_failures() == 1 && arena.geometry_failures() == 0,
+           "the failure is classified against the bytes free when it missed, not when counted");
+}
+
 } // namespace
 
 int main() {
@@ -174,6 +209,7 @@ int main() {
         test_fragmentation_and_split();
         test_failures_are_counted_by_cause();
         test_placement_scope_counts_once();
+        test_placement_scope_classifies_at_the_miss();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
