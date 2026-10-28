@@ -682,6 +682,7 @@ public:
     struct Demotion {
         CheckpointHandle handle;
         std::size_t host_bytes = 0;
+        std::size_t host_placeable = 0;
         std::vector<CheckpointHandle> sources;
         ContextResourceUsage released;
     };
