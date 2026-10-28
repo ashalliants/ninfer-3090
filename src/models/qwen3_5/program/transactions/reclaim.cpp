@@ -680,7 +680,8 @@ ProgramImpl::checkpoint_recovery_loss(std::span<const CheckpointHandle> removed,
 std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
                                               const PhysicalOwners& owners,
                                               std::span<const CheckpointHandle> excluded,
-                                              runtime::ContextResourceUsage shortage) {
+                                              runtime::ContextResourceUsage shortage,
+                                              std::optional<std::size_t>& placeable) {
     if (shortage.host_bytes ||
         (!shortage.state_slots && !shortage.main_kv_pages && !shortage.backend_kv_pages)) {
         return std::nullopt;
@@ -707,7 +708,8 @@ std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
             candidate.released.state_slots = 1;
             const auto image               = program.state_images->host_layout().image_bytes;
             candidate.host_bytes           = host ? 0 : image;
-            candidate.host_placeable       = program.host_placeable_bytes(image);
+            if (!placeable) { placeable = program.host_placeable_bytes(image); }
+            candidate.host_placeable       = *placeable;
             break;
         }
         if (!plan->state) { return std::nullopt; }
@@ -737,7 +739,10 @@ std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
             if (plan->pages.size() == needed) { break; }
         }
         if (plan->pages.empty()) { return std::nullopt; }
-        candidate.host_placeable = program.host_placeable_bytes(stride);
+        // One shortage names one resource, so every group shares this unit and the free runs do not
+        // change while the groups are quoted: the scan of the free extents runs once per reclaim.
+        if (!placeable) { placeable = program.host_placeable_bytes(stride); }
+        candidate.host_placeable = *placeable;
         (resource == runtime::ContextResourceClass::MainKV ? candidate.released.main_kv_pages
                                                            : candidate.released.backend_kv_pages) =
             static_cast<std::uint32_t>(plan->pages.size());
@@ -804,8 +809,9 @@ ContextReclaimPlan ProgramImpl::plan_reclaim(std::span<const CheckpointHandle> a
     const auto owners =
         physical_owner_sets(*this, result.impl_->facts, allowed, excluded, shortage);
     ReleaseScratch scratch;
+    std::optional<std::size_t> placeable;
     for (const auto& group : owners) {
-        if (auto quote = quote_demotion(*this, group, excluded, shortage)) {
+        if (auto quote = quote_demotion(*this, group, excluded, shortage, placeable)) {
             result.demotions.push_back(std::move(*quote));
         }
         if (auto quote = quote_release(result.impl_, group.sources, scratch)) {
