@@ -115,6 +115,7 @@ struct Program {
     std::vector<Handle> demoted;
     std::vector<std::vector<Handle>> demotion_submissions;
     std::uint32_t main_capacity    = 1024;
+    std::uint32_t state_capacity   = 64;
     bool transfer_in_progress      = false;
     bool combined_demotion_blocked = false;
     // Calls into the operations whose cost grows with the number of checkpoints. The real Program
@@ -184,7 +185,7 @@ struct Program {
     }
 
     [[nodiscard]] PhysicalUsage physical_usage() const {
-        PhysicalUsage result{.capacity = {.state_slots      = 64,
+        PhysicalUsage result{.capacity = {.state_slots      = state_capacity,
                                           .main_kv_pages    = main_capacity,
                                           .backend_kv_pages = 1024,
                                           .host_bytes       = host_capacity}};
@@ -1160,25 +1161,67 @@ void test_explicit_anchor_updates_remain_bounded_across_requests() {
             "leased oldest anchor caused a request failure or a search for a different victim");
 }
 
+// #397: a long dialogue may hold most of the Device KV pool by itself. A short request that reuses the
+// shared system prompt makes that prompt the newest protected entry; the dialogue must stay protected,
+// because the soft target applies to Host bytes only.
+void test_device_pools_do_not_unprotect_a_long_dialogue() {
+    Fixture f(1024);
+    f.program.main_capacity = 100;
+    const auto system = f.program.add({1, 2}, {f.program.host_block(8)});
+    f.program.contents[system.index].main_pages = 4;
+    f.publish(system);
+    const auto dialogue = f.program.add({1, 2, 3}, {f.program.host_block(16)}, Role::Continuation);
+    f.program.contents[dialogue.index].main_pages = 86;
+    const auto owner = f.publish(dialogue);
+    const Base next{.tokens = {1, 2, 3, 4}};
+    require(f.begin(next, dialogue) == owner, "dialogue continuation unexpectedly forked its owner");
+    const auto turn = f.program.add(next.tokens, {f.program.host_block(16)}, Role::Continuation);
+    f.program.contents[turn.index].main_pages = 88;
+    f.cache.publish(f.program, owner, turn);
+    f.cache.finish(f.program, owner, next, f.next_order);
+    require(f.cache.retention(owner).reused, "a continued dialogue was not protected");
+    f.use_shared(system);
+    require(f.cache.retention(owner).reused,
+            "a request reusing the shared system prompt unprotected a dialogue for its Device KV pages");
+}
+
+// #397: two Device state slots give a 3/4 target of one slot, so two dialogues could never both stay
+// protected. Device state is the working set, not retained work: both stay protected.
+void test_two_dialogues_on_a_two_slot_device_both_stay_protected() {
+    Fixture f(1024);
+    const auto continued = [&](Key tokens) {
+        const auto first = f.program.add(tokens, {f.program.host_block(16)}, Role::Continuation);
+        const auto owner = f.publish(first);
+        Base next{.tokens = tokens};
+        next.tokens.push_back(99);
+        require(f.begin(next, first) == owner, "dialogue continuation unexpectedly forked its owner");
+        const auto turn = f.program.add(next.tokens, {f.program.host_block(16)}, Role::Continuation);
+        f.cache.publish(f.program, owner, turn);
+        f.cache.finish(f.program, owner, next, f.next_order);
+        return owner;
+    };
+    f.program.state_capacity = 2;
+    const auto a = continued({1, 2, 3});
+    const auto b = continued({5, 6, 7});
+    require(f.cache.retention(a).reused && f.cache.retention(b).reused,
+            "two dialogues on a two-slot device could not both stay protected");
+}
+
 void test_forked_hot_records_do_not_bypass_the_soft_capacity_target() {
     Fixture f(64);
-    f.program.main_capacity = 100;
-    (void)f.program.host_block(32, true);
-    const auto parent = f.program.add({1, 2}, {f.program.host_block(16)}, Role::Continuation);
-    f.program.contents[parent.index].main_pages = 40;
+    const auto parent = f.program.add({1, 2}, {f.program.host_block(28)}, Role::Continuation);
     f.publish(parent, 42);
     const Base branch{.tokens = {1, 2, 3},
                       .advice = {.update_session_index = false, .session_key = 42}};
     const auto owner = f.begin(branch, parent);
-    const auto child = f.program.add({1, 2, 3}, {f.program.host_block(16)}, Role::Continuation);
-    f.program.contents[child.index].main_pages = 40;
+    const auto child = f.program.add({1, 2, 3}, {f.program.host_block(28)}, Role::Continuation);
     f.cache.publish(f.program, owner, child);
     f.cache.finish(f.program, owner, branch, 2);
     const auto entrant = f.program.add({9, 8, 7});
     f.publish(entrant);
     const auto victims = f.cache.host_victims(f.program, 16, entrant);
     require(victims && *victims == std::vector<Handle>{parent},
-            "equal-adoption parent and child bypassed the per-resource protection soft target");
+            "equal-adoption parent and child bypassed the Host protection soft target");
 }
 
 void test_large_hotspot_is_preserved_per_resource_pool() {
@@ -2443,6 +2486,8 @@ void test_direct_victim_release_offers_the_continuation_first() {
 int main() {
     try {
         test_direct_victim_release_offers_the_continuation_first();
+        test_device_pools_do_not_unprotect_a_long_dialogue();
+        test_two_dialogues_on_a_two_slot_device_both_stay_protected();
         test_progress_anchor_retirement_keeps_whatever_was_used();
         test_held_progress_anchor_is_retired_when_the_hold_ends();
         test_candidate_memo_cuts_victim_selection_work();
