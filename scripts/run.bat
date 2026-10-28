@@ -846,7 +846,9 @@ call :read_env %~1
 if not defined PASS_VAL exit /b 0
 if /i "%PASS_VAL%"=="on" goto :pass_switch_on
 if /i "%PASS_VAL%"=="off" exit /b 0
-echo NINFER_%~1 must be on or off, got %PASS_VAL% 1>&2
+rem The value is deliberately not echoed: an unquoted expansion on a command line would run
+rem anything after an ampersand or pipe in it.
+echo NINFER_%~1 must be on or off 1>&2
 set "EXTRA_FAIL=1"
 exit /b 0
 :pass_switch_on
