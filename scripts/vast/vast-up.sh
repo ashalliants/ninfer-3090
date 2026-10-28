@@ -3,8 +3,18 @@
 # switch, and fetch the 27B model the smoke test serves. Returns when the instance is ready.
 #   ./vast-up.sh [repo-dir] [kill-after-hours]   (repo-dir defaults to this repository; the box destroys
 #                                                itself after the hours, default 3, whatever happens)
-# Needs the `vastai` CLI logged in. Cost is about $0.4/hour; a release takes about an hour. Destroy it
-# with ./vast-destroy.sh as soon as the archive is back.
+# Needs the `vastai` CLI logged in. A release takes about an hour; destroy the box with ./vast-destroy.sh
+# as soon as the archive is back.
+#
+# The offer is chosen by its estimated total for the job, not its hourly rate: hosts bill bandwidth per GB,
+# and on the v0.17.0 release box (a $0.25/h host at $0.039/GB) downloads cost more than the GPU time
+# ($0.43 for 11 GB against $0.27 for 1.1 h, $0.85 in all). The estimate's inputs, with what one release
+# with the default qwen38-27b smoke test uses:
+#   NINFER_VAST_EST_HOURS  hours the box is up                                  (default 1)
+#   NINFER_VAST_DOWN_GB    GB downloaded: the 17.7 GiB model, apt packages,      (default 21)
+#                          the previous release's archive if you diff its ldd
+#   NINFER_VAST_UP_GB      GB uploaded: about 1 GB per Linux archive pulled back (default 2)
+# A Bonsai 2 27B smoke test downloads about 11 GB instead.
 set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$root/vast-common.sh"
@@ -15,16 +25,31 @@ if [[ -s "$state_file" ]]; then
   echo "Instance $(cat "$state_file") is already tracked; destroy it first (vast-destroy.sh)." >&2; exit 1
 fi
 
-# Cheapest verified single-3090 offer with a fast link, CUDA 12.8-capable drivers and >=16 effective cores
-# (a release build is 15 min on 24 cores, an hour on 6). Spain hosts were the reliable ones in 2026-10.
+disk_gb=80
+# Verified single-3090 offers with a fast link, CUDA 12.8-capable drivers and >=16 effective cores (a release
+# build is 15 min on 24 cores, an hour on 6), ranked by estimated total. Spain hosts were the reliable ones in
+# 2026-10.
 offer="$(vastai search offers 'gpu_name=RTX_3090 num_gpus=1 reliability>0.98 disk_space>=100 cuda_max_good>=12.8 rentable=true inet_down>=1000' -o dph --raw |
-  python3 -I -c '
-import json, sys
-offers = [o for o in json.load(sys.stdin) if o["cpu_cores_effective"] >= 16]
+  NINFER_VAST_DISK_GB="$disk_gb" python3 -I -c '
+import json, os, sys
+hours = float(os.environ.get("NINFER_VAST_EST_HOURS", "1"))
+down = float(os.environ.get("NINFER_VAST_DOWN_GB", "21"))
+up = float(os.environ.get("NINFER_VAST_UP_GB", "2"))
+disk = float(os.environ["NINFER_VAST_DISK_GB"])
+def cost(o):
+    gpu = o["dph_base"] * hours
+    storage = o["storage_cost"] * disk / 730 * hours   # storage_cost is per GB-month
+    net = o["inet_down_cost"] * down + o["inet_up_cost"] * up
+    return gpu + storage + net, gpu, storage, net
+offers = sorted((o for o in json.load(sys.stdin) if o["cpu_cores_effective"] >= 16), key=lambda o: cost(o)[0])
 if not offers: sys.exit("no suitable offer")
-o = offers[0]
-print(o["id"], file=sys.stdout)
-print("offer %s: machine %s, %s, $%.3f/h, %d cores, %d Mbps down, $%.4f/GB down" % (o["id"], o["machine_id"], o["geolocation"], o["dph_total"], o["cpu_cores_effective"], o["inet_down"], o["inet_down_cost"]), file=sys.stderr)')"
+print("estimate for %.1f h, %.0f GB down, %.0f GB up:" % (hours, down, up), file=sys.stderr)
+for o in offers[:3]:
+    total, gpu, storage, net = cost(o)
+    print("  offer %s: %s, $%.2f (GPU $%.2f + disk $%.2f + bandwidth $%.2f; $%.3f/h, $%.4f/GB down, $%.4f/GB up), %d cores, %d Mbps down"
+          % (o["id"], o["geolocation"], total, gpu, storage, net, o["dph_base"], o["inet_down_cost"], o["inet_up_cost"], o["cpu_cores_effective"], o["inet_down"]), file=sys.stderr)
+print(offers[0]["id"])')"
+echo "Renting the first one."
 
 onstart="$(mktemp)"
 cat > "$onstart" <<ONSTART
@@ -51,7 +76,7 @@ apt-get install -y -qq git cmake ninja-build build-essential pkg-config gcc-13 g
 touch /root/deps.done
 ONSTART
 
-new="$(vastai create instance "$offer" --image vastai/base-image:cuda-12.8.1-auto --disk 80 --ssh --direct \
+new="$(vastai create instance "$offer" --image vastai/base-image:cuda-12.8.1-auto --disk "$disk_gb" --ssh --direct \
   --onstart "$onstart" --label ninfer-release --raw | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["new_contract"])')"
 rm -f "$onstart"
 echo "$new" > "$state_file"
