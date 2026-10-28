@@ -109,7 +109,7 @@
 #           NO_AUTO_RESUME LM_HEAD_Q4 LM_HEAD_Q6 EMBEDDING_Q4 EMBEDDING_Q6 LOSSY_PREFILL_SCOUT_A4
 #           REQUEST_LOG_LOSSY_DETAIL
 # Not here: the repeatable --graft and --context-store-peer, router mode (--models-*), and the
-# Flash-Next-only flags (run.bat). The S3 store reads its credentials from the environment
+# Flash-Next-only flags (run.bat; setting one of their variables here stops with exit 2). The S3 store reads its credentials from the environment
 # (NINFER_S3_ACCESS_KEY_ID, NINFER_S3_SECRET_ACCESS_KEY), never from a flag.
 #
 # Each spec's defaults (context, lanes, chunk) are the ones that fit a headless card; beside a
@@ -132,13 +132,18 @@ case "$model_key" in
   '') usage >&2; exit 2 ;;
   *) printf 'Unknown model: %s\n' "$model_key" >&2; usage >&2; exit 2 ;;
 esac
-# NINFER_NGRAM_VOLUME is the Qwen3.8-Flash-Next n-gram volume override in run.bat. Flash-Next runs on
-# Windows only, so none of these models has a volume: refuse rather than ignore the variable.
-if [[ -n "${NINFER_NGRAM_VOLUME:-}" ]]; then
-  printf 'NINFER_NGRAM_VOLUME is for qwen38-flash-next only (run.bat, Windows); clear it to serve %s\n' \
-    "$model_key" >&2
-  exit 2
-fi
+# These are the Qwen3.8-Flash-Next overrides in run.bat (its n-gram volume, expert cache and state,
+# pipeline split, disk tier). Flash-Next runs on Windows only, so none of these models has them:
+# refuse rather than silently ignore a variable that was set.
+for flash_next_var in NINFER_NGRAM_VOLUME NINFER_DEVICES NINFER_STAGE_LAYERS NINFER_EXPERT_STATE \
+    NINFER_NO_EXPERT_STATE NINFER_VRAM_HEADROOM_MIB NINFER_RAM_HEADROOM_MIB NINFER_EXPERT_CACHE_MIB \
+    NINFER_CONTEXT_NVME_MIB NINFER_CONTEXT_NVME_DIR; do
+  if [[ -n "${!flash_next_var:-}" ]]; then
+    printf '%s is for qwen38-flash-next only (run.bat, Windows); clear it to serve %s\n' \
+      "$flash_next_var" "$model_key" >&2
+    exit 2
+  fi
+done
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd -- "$script_dir/.." && pwd)"
