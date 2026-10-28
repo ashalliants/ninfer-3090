@@ -111,12 +111,17 @@ rem           PROGRESS_ANCHOR_TOKENS SLEEP_IDLE_SECONDS SUSPEND_SNAPSHOT SUSPEND
 rem           CONTEXT_STORE_TTL_HOURS CONTEXT_STORE_IDLE_SECONDS CONTEXT_STORE_RESTORE_SECONDS
 rem           CONTEXT_STORE_FLUSH_SECONDS CONTEXT_STORE_PEER_POLL_MS CONTEXT_STORE_S3_ENDPOINT
 rem           CONTEXT_STORE_S3_BUCKET CONTEXT_STORE_S3_PREFIX CONTEXT_STORE_S3_REGION
+rem           CONTEXT_STORE_S3_UPLOAD_DELAY_SECONDS PREFILL_ORDER HOST_PAUSE_RESERVE_MIB
+rem           LOSSY_PREFILL_MIN_TOKENS (experimental; the model does not see part of a long cold
+rem           prompt) and its tuning: LOSSY_PREFILL_KEEP _FILTER_LAYER _BLOCK _RECENT _HEAD
+rem           _QUERY_ROWS _POOL_WINDOW _SKIP _STRATEGY _SUMMARY_MAX_TOKENS
 rem           and for Qwen3.8-Flash-Next: DEVICES STAGE_LAYERS EXPERT_STATE VRAM_HEADROOM_MIB
 rem           RAM_HEADROOM_MIB EXPERT_CACHE_MIB CONTEXT_NVME_DIR
 rem   on^|off: CORS GREEDY NO_THINKING PRESERVE_THINKING TOLERANT_TOOL_CALLS NO_CUDA_GRAPH
 rem           NO_PREFIX_REUSE NO_PREFILL_A8 NO_PREFILL_CUBLAS_PROJECTIONS CONTEXT_STORE_COMPRESS
 rem           NO_EXIT_ON_ENGINE_FAILURE ADMISSION_FIT_CHECK PROGRESS_ANCHORS_SHARED MODEL_SUSPEND
-rem           NO_AUTO_RESUME LM_HEAD_Q4 LM_HEAD_Q6 EMBEDDING_Q4 EMBEDDING_Q6 NO_EXPERT_STATE
+rem           NO_AUTO_RESUME LM_HEAD_Q4 LM_HEAD_Q6 EMBEDDING_Q4 EMBEDDING_Q6 NO_EXPERT_STATE LOSSY_PREFILL_SCOUT_A4
+rem           REQUEST_LOG_LOSSY_DETAIL
 rem Not here: the repeatable --graft (see NINFER_GRAFTS) and --context-store-peer, and router mode
 rem (--models-*). The S3 store reads its credentials from the environment
 rem (NINFER_S3_ACCESS_KEY_ID, NINFER_S3_SECRET_ACCESS_KEY), never from a flag.
@@ -670,6 +675,20 @@ call :pass_value CONTEXT_STORE_S3_ENDPOINT --context-store-s3-endpoint
 call :pass_value CONTEXT_STORE_S3_BUCKET --context-store-s3-bucket
 call :pass_value CONTEXT_STORE_S3_PREFIX --context-store-s3-prefix
 call :pass_value CONTEXT_STORE_S3_REGION --context-store-s3-region
+call :pass_value PREFILL_ORDER --prefill-order
+call :pass_value HOST_PAUSE_RESERVE_MIB --host-pause-reserve-mib
+call :pass_value CONTEXT_STORE_S3_UPLOAD_DELAY_SECONDS --context-store-s3-upload-delay-seconds
+call :pass_value LOSSY_PREFILL_MIN_TOKENS --lossy-prefill-min-tokens
+call :pass_value LOSSY_PREFILL_KEEP --lossy-prefill-keep
+call :pass_value LOSSY_PREFILL_FILTER_LAYER --lossy-prefill-filter-layer
+call :pass_value LOSSY_PREFILL_BLOCK --lossy-prefill-block
+call :pass_value LOSSY_PREFILL_RECENT --lossy-prefill-recent
+call :pass_value LOSSY_PREFILL_HEAD --lossy-prefill-head
+call :pass_value LOSSY_PREFILL_QUERY_ROWS --lossy-prefill-query-rows
+call :pass_value LOSSY_PREFILL_POOL_WINDOW --lossy-prefill-pool-window
+call :pass_value LOSSY_PREFILL_SKIP --lossy-prefill-skip
+call :pass_value LOSSY_PREFILL_STRATEGY --lossy-prefill-strategy
+call :pass_value LOSSY_PREFILL_SUMMARY_MAX_TOKENS --lossy-prefill-summary-max-tokens
 call :pass_value DEVICES --devices
 call :pass_value STAGE_LAYERS --stage-layers
 call :pass_value EXPERT_STATE --expert-state
@@ -697,6 +716,8 @@ call :pass_switch LM_HEAD_Q6 --lm-head-q6
 call :pass_switch EMBEDDING_Q4 --embedding-q4
 call :pass_switch EMBEDDING_Q6 --embedding-q6
 call :pass_switch NO_EXPERT_STATE --no-expert-state
+call :pass_switch LOSSY_PREFILL_SCOUT_A4 --lossy-prefill-scout-a4
+call :pass_switch REQUEST_LOG_LOSSY_DETAIL --request-log-lossy-detail
 if defined EXTRA_FAIL exit /b 2
 set "GRAFT_ARGS="
 if /i "%NINFER_GRAFTS%"=="off" goto :graft_done
