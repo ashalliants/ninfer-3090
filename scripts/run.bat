@@ -127,6 +127,8 @@ rem           REQUEST_LOG_LOSSY_DETAIL
 rem Not here: the repeatable --graft (see NINFER_GRAFTS) and --context-store-peer, and router mode
 rem (--models-*). The S3 store reads its credentials from the environment
 rem (NINFER_S3_ACCESS_KEY_ID, NINFER_S3_SECRET_ACCESS_KEY), never from a flag.
+rem Values are passed literally (percent signs, carets, ampersands and parentheses are safe); a value may
+rem not contain a double quote.
 rem
 rem Each spec's defaults (context, lanes, chunk) are the ones measured to fit beside a desktop, which
 rem holds roughly 1-1.5 GiB of the card.
@@ -833,16 +835,14 @@ exit /b 0
 rem call :pass_value NAME --flag -- appends --flag "<NINFER_NAME>" to EXTRA_ARGS when the variable is set.
 rem The unquoted `set NAME=value` form keeps the expanded text inside its own quotes, so a path or key
 rem with "&", "|" or ")" stays inert (see CHAT_TEMPLATE_ARGS above).
-set "PASS_VAL="
-call set "PASS_VAL=%%NINFER_%~1%%"
+call :read_env %~1
 if not defined PASS_VAL exit /b 0
 set EXTRA_ARGS=%EXTRA_ARGS% %~2 "%PASS_VAL%"
 exit /b 0
 
 :pass_switch
 rem call :pass_switch NAME --flag -- appends --flag when NINFER_NAME is on; off or unset passes nothing.
-set "PASS_VAL="
-call set "PASS_VAL=%%NINFER_%~1%%"
+call :read_env %~1
 if not defined PASS_VAL exit /b 0
 if /i "%PASS_VAL%"=="on" goto :pass_switch_on
 if /i "%PASS_VAL%"=="off" exit /b 0
@@ -851,4 +851,19 @@ set "EXTRA_FAIL=1"
 exit /b 0
 :pass_switch_on
 set EXTRA_ARGS=%EXTRA_ARGS% %~2
+exit /b 0
+
+:read_env
+rem call :read_env NAME -- sets PASS_VAL to the value of NINFER_NAME, empty when unset. The value is read
+rem through a FOR variable, which cmd substitutes after parsing, so percent signs, carets, ampersands
+rem and pipes reach PASS_VAL literally; CALL SET would parse the value a second time. A double quote
+rem cannot be carried inside the quoted argument built from it, so it is refused, not passed on mangled.
+set "PASS_VAL="
+set NINFER_%~1 2>nul | findstr /b /c:"NINFER_%~1=" | findstr /c:"\"" >nul
+if not errorlevel 1 goto :read_env_quote
+for /f "tokens=1* delims==" %%A in ('set NINFER_%~1 2^>nul') do if /i "%%A"=="NINFER_%~1" set "PASS_VAL=%%B"
+exit /b 0
+:read_env_quote
+echo NINFER_%~1 must not contain a double quote character 1>&2
+set "EXTRA_FAIL=1"
 exit /b 0
