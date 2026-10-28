@@ -87,7 +87,9 @@
 # NINFER_PREFILL_STALL_BUDGET_MS). Each is passed only when set, so unset keeps the profile as
 # measured; `ninfer-serve --help` says what each one does. A flag the profile itself sets
 # (--max-concurrency, --kv-capacity, --gdn-state-fp16, ...) has its own variable above or none.
-#   value:  API_KEY MODEL_ID LOG_LEVEL LOG_STATS_INTERVAL_MS REQUEST_LOG_JSONL DEVICE
+# A variable here is appended after the profile's own arguments, so it wins over a value the profile
+# sets (the c8 profile's --device-state-slots).
+#   value:  DEVICE_STATE_SLOTS API_KEY MODEL_ID LOG_LEVEL LOG_STATS_INTERVAL_MS REQUEST_LOG_JSONL DEVICE
 #           DEFAULT_MAX_TOKENS DEFAULT_THINKING_BUDGET REASONING_EFFORT
 #           TEMPERATURE TOP_P TOP_K FREQUENCY_PENALTY SEED NGRAM_MIN_MATCH
 #           MAX_REQUEST_MIB MEDIA_CACHE_MIB MEDIA_LIVE_MIB MEDIA_PREPROCESS_THREADS VISION_MAX_MERGED
@@ -386,7 +388,7 @@ fi
 # Flags with no launcher variable of their own: NINFER_<FLAG> is passed straight through when set
 # (see "EVERY OTHER ninfer-serve FLAG" above). A name the server does not know fails there, loudly.
 passthrough_value_flags=(
-  api-key model-id log-level log-stats-interval-ms request-log-jsonl device
+  device-state-slots api-key model-id log-level log-stats-interval-ms request-log-jsonl device
   default-max-tokens default-thinking-budget reasoning-effort
   temperature top-p top-k frequency-penalty seed ngram-min-match
   max-request-mib media-cache-mib media-live-mib media-preprocess-threads vision-max-merged

@@ -101,7 +101,9 @@ rem from NINFER_^<FLAG^>: the flag name upper-cased, dashes to underscores (--pr
 rem is NINFER_PREFILL_STALL_BUDGET_MS). Each is passed only when set, so unset keeps the profile as
 rem measured; `ninfer-serve --help` says what each one does. A flag the profile itself sets
 rem (--max-concurrency, --kv-capacity, --gdn-state-fp16, ...) has its own variable above or none.
-rem   value:  API_KEY MODEL_ID LOG_LEVEL LOG_STATS_INTERVAL_MS REQUEST_LOG_JSONL DEVICE
+rem A variable here is appended after the profile's own arguments, so it wins over a value the profile
+rem sets (the c8 profile's --device-state-slots).
+rem   value:  DEVICE_STATE_SLOTS API_KEY MODEL_ID LOG_LEVEL LOG_STATS_INTERVAL_MS REQUEST_LOG_JSONL DEVICE
 rem           DEFAULT_MAX_TOKENS DEFAULT_THINKING_BUDGET REASONING_EFFORT
 rem           TEMPERATURE TOP_P TOP_K FREQUENCY_PENALTY SEED NGRAM_MIN_MATCH
 rem           MAX_REQUEST_MIB MEDIA_CACHE_MIB MEDIA_LIVE_MIB MEDIA_PREPROCESS_THREADS VISION_MAX_MERGED
@@ -635,6 +637,7 @@ rem Flags with no launcher variable of their own: NINFER_^<FLAG^> is passed stra
 rem (see "EVERY OTHER ninfer-serve FLAG" above). A name the server does not know fails there, loudly.
 set "EXTRA_ARGS="
 set "EXTRA_FAIL="
+call :pass_value DEVICE_STATE_SLOTS --device-state-slots
 call :pass_value API_KEY --api-key
 call :pass_value MODEL_ID --model-id
 call :pass_value LOG_LEVEL --log-level
