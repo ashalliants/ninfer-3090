@@ -641,7 +641,8 @@ ProgramImpl::checkpoint_recovery_loss(std::span<const CheckpointHandle> removed,
 std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
                                               const PhysicalOwners& owners,
                                               std::span<const CheckpointHandle> excluded,
-                                              runtime::ContextResourceUsage shortage) {
+                                              runtime::ContextResourceUsage shortage,
+                                              std::optional<std::size_t>& placeable) {
     if (shortage.host_bytes ||
         (!shortage.state_slots && !shortage.main_kv_pages && !shortage.backend_kv_pages)) {
         return std::nullopt;
@@ -666,7 +667,10 @@ std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
             plan->state     = StateDemotion{state, program.state_store->content_epoch(state), host,
                                         owners.sources};
             candidate.released.state_slots = 1;
-            candidate.host_bytes = host ? 0 : program.state_images->host_layout().image_bytes;
+            const auto image               = program.state_images->host_layout().image_bytes;
+            candidate.host_bytes           = host ? 0 : image;
+            if (!placeable) { placeable = program.host_placeable_bytes(image); }
+            candidate.host_placeable       = *placeable;
             break;
         }
         if (!plan->state) { return std::nullopt; }
@@ -696,6 +700,10 @@ std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
             if (plan->pages.size() == needed) { break; }
         }
         if (plan->pages.empty()) { return std::nullopt; }
+        // One shortage names one resource, so every group shares this unit and the free runs do not
+        // change while the groups are quoted: the scan of the free extents runs once per reclaim.
+        if (!placeable) { placeable = program.host_placeable_bytes(stride); }
+        candidate.host_placeable = *placeable;
         (resource == runtime::ContextResourceClass::MainKV ? candidate.released.main_kv_pages
                                                            : candidate.released.backend_kv_pages) =
             static_cast<std::uint32_t>(plan->pages.size());
@@ -762,8 +770,9 @@ ContextReclaimPlan ProgramImpl::plan_reclaim(std::span<const CheckpointHandle> a
     const auto owners =
         physical_owner_sets(*this, result.impl_->facts, allowed, excluded, shortage);
     ReleaseScratch scratch;
+    std::optional<std::size_t> placeable;
     for (const auto& group : owners) {
-        if (auto quote = quote_demotion(*this, group, excluded, shortage)) {
+        if (auto quote = quote_demotion(*this, group, excluded, shortage, placeable)) {
             result.demotions.push_back(std::move(*quote));
         }
         if (auto quote = quote_release(result.impl_, group.sources, scratch)) {
@@ -917,8 +926,8 @@ struct DemotionBatch {
         const auto stride    = resource == runtime::ContextResourceClass::MainKV
                                    ? program.text_host_kv_page_stride
                                    : program.backend_host_kv_page_stride;
-        const auto usage     = program.physical_usage();
-        const auto available = usage.capacity.host_bytes - usage.occupied.host_bytes;
+        // Free bytes in runs shorter than a page cannot take one; the batch stops before them.
+        const auto available = program.host_placeable_bytes(stride);
         auto plan            = std::make_shared<DemotionPlan>();
         plan->owner          = &program;
         plan->resource       = resource;
@@ -942,7 +951,8 @@ struct DemotionBatch {
                   [](auto a, auto b) { return a.index < b.index; });
         plan->allowed.erase(std::unique(plan->allowed.begin(), plan->allowed.end()),
                             plan->allowed.end());
-        result.sources = plan->allowed;
+        result.sources        = plan->allowed;
+        result.host_placeable = available;
         (resource == runtime::ContextResourceClass::MainKV ? result.released.main_kv_pages
                                                            : result.released.backend_kv_pages) =
             count;

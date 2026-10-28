@@ -356,6 +356,8 @@ public:
     [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle sequence) const;
     [[nodiscard]] std::size_t pause_state_image_unplaced(SequenceHandle sequence) const;
     [[nodiscard]] bool pause_snapshot_fits(SequenceHandle sequence) const;
+    // General-budget Host bytes that allocations of whole `unit`s could take now.
+    [[nodiscard]] std::size_t host_placeable_bytes(std::size_t unit) const noexcept;
     [[nodiscard]] std::size_t
     release_redundant_host(std::span<const CheckpointHandle> excluded,
                            std::optional<SequenceHandle> pending_backup = std::nullopt);
