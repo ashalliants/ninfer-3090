@@ -118,7 +118,8 @@ using ExecutionUnitKind  = qwen3_5::ExecutionUnitKind;
 
 struct ContextDemotion {
     std::vector<CheckpointHandle> sources;
-    std::size_t host_bytes = 0;
+    std::size_t host_bytes     = 0;
+    std::size_t host_placeable = 0;
     runtime::ContextResourceUsage released;
 };
 

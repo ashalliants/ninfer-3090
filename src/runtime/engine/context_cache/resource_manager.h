@@ -706,8 +706,9 @@ public:
         const auto usage     = program.physical_usage();
         const auto free_host = usage.capacity.host_bytes - usage.occupied.host_bytes;
         const bool needs_host_cleanup =
-            std::any_of(plans.demotions.begin(), plans.demotions.end(),
-                        [&](const auto& plan) { return plan.host_bytes > free_host; });
+            std::any_of(plans.demotions.begin(), plans.demotions.end(), [&](const auto& plan) {
+                return plan.host_bytes > std::min(free_host, plan.host_placeable);
+            });
         const bool existing_host_destination =
             std::any_of(plans.demotions.begin(), plans.demotions.end(),
                         [](const auto& plan) { return plan.host_bytes == 0; });
@@ -727,14 +728,10 @@ public:
             if (!admits(program, plan.sources, facts, cursor.admission, cursor, evaluation, true)) {
                 continue;
             }
-            auto protected_sources = std::vector<Handle>(excluded.begin(), excluded.end());
-            protected_sources.insert(protected_sources.end(), plan.sources.begin(),
-                                     plan.sources.end());
             auto preservation =
                 preservation_admission(program, plan.sources, cursor, facts.priority);
             auto victims =
-                host_victims_in_order(program, plan.host_bytes, preservation.checkpoint, {},
-                                      protected_sources, preservation, cursor, evaluation);
+                demotion_host_victims(program, plan, excluded, preservation, cursor, evaluation);
             if (!victims) { continue; }
             auto rank       = rank_action(program, plan.sources, facts, units, evaluation, true);
             auto host_facts = action_facts(program, *victims, cursor, evaluation);
@@ -812,9 +809,8 @@ public:
                 auto protected_sources = std::vector<Handle>(excluded.begin(), excluded.end());
                 protected_sources.insert(protected_sources.end(), plan.sources.begin(),
                                          plan.sources.end());
-                const auto current = host_victims_in_order(
-                    program, plan.host_bytes, action.preservation->checkpoint, {},
-                    protected_sources, action.preservation, cursor, evaluation);
+                const auto current = demotion_host_victims(program, plan, excluded,
+                                                           *action.preservation, cursor, evaluation);
                 if (!current || *current != action.host_victims) { continue; }
                 commit_release(program, action.host_victims, cursor, action.rank.loss);
                 if (program.start_demote(plan)) {
@@ -1791,13 +1787,31 @@ private:
             loss > UINT64_MAX - cursor.sacrificed ? UINT64_MAX : cursor.sacrificed + loss;
     }
 
+    // The Host history a demotion displaces to make room for its destination. Room is what the
+    // quote can place, not the free byte total: a fragmented backing can hold enough bytes in runs
+    // too short for one page or state image, and a quote that counted them would fail to allocate
+    // and be quoted again on every pass (#402).
+    template <class Demotion>
+    [[nodiscard]] std::optional<std::vector<Handle>>
+    demotion_host_victims(Program& program, const Demotion& plan, std::span<const Handle> excluded,
+                          const Admission& preservation, const ReclaimCursor& cursor,
+                          Evaluation& evaluation) const {
+        auto protected_sources = std::vector<Handle>(excluded.begin(), excluded.end());
+        protected_sources.insert(protected_sources.end(), plan.sources.begin(), plan.sources.end());
+        return host_victims_in_order(program, plan.host_bytes, preservation.checkpoint, {},
+                                     protected_sources, preservation, cursor, evaluation, false,
+                                     plan.host_placeable);
+    }
+
     [[nodiscard]] std::optional<std::vector<Handle>>
     host_victims_in_order(Program& program, std::size_t bytes, std::optional<Handle> incoming,
                           std::span<const Handle> later_snapshots, std::span<const Handle> excluded,
                           std::optional<Admission> admission, const ReclaimCursor& cursor,
-                          Evaluation& evaluation, bool bytes_are_shortage = false) const {
-        const auto usage    = program.physical_usage();
-        const auto free     = usage.capacity.host_bytes - usage.occupied.host_bytes;
+                          Evaluation& evaluation, bool bytes_are_shortage = false,
+                          std::size_t placeable = SIZE_MAX) const {
+        const auto usage = program.physical_usage();
+        const auto free =
+            std::min<std::size_t>(usage.capacity.host_bytes - usage.occupied.host_bytes, placeable);
         const auto required = bytes_are_shortage ? bytes : (bytes > free ? bytes - free : 0);
         if (!required) { return std::vector<Handle>{}; }
         if (!bytes_are_shortage && bytes > usage.capacity.host_bytes) { return std::nullopt; }

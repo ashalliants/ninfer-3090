@@ -210,6 +210,9 @@ struct BindingReservation {
 struct ContextDemotion {
     std::vector<CheckpointHandle> sources;
     std::size_t host_bytes = 0;
+    // Host bytes this quote's allocations could take from the free runs now: whole KV pages, or
+    // one contiguous state image. Free bytes in runs too short for one are not counted (#402).
+    std::size_t host_placeable = 0;
     runtime::ContextResourceUsage released;
     std::shared_ptr<const detail::DemotionPlan> impl;
 };

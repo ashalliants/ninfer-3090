@@ -118,6 +118,10 @@ struct Program {
     std::uint32_t state_capacity   = 64;
     bool transfer_in_progress      = false;
     bool combined_demotion_blocked = false;
+    // Free Host bytes stranded in runs too short to place a page or state image: counted free,
+    // never placeable. A demotion that needs them fails to allocate.
+    std::size_t host_fragment_bytes  = 0;
+    std::uint64_t placement_failures = 0;
     // Calls into the operations whose cost grows with the number of checkpoints. The real Program
     // pays O(checkpoints) for each, so a drop in these counts is a drop in Engine-thread time.
     mutable std::uint64_t host_bytes_released_calls = 0;
@@ -274,7 +278,14 @@ struct Program {
         std::vector<Handle> sources;
         Usage released;
         std::vector<std::pair<Handle, std::uint32_t>> main_parts;
+        std::size_t host_placeable = 0;
     };
+
+    [[nodiscard]] std::size_t host_placeable() const {
+        const auto usage = physical_usage();
+        const auto free  = usage.capacity.host_bytes - usage.occupied.host_bytes;
+        return free - std::min(free, host_fragment_bytes);
+    }
 
     struct Release {
         std::vector<Handle> sources;
@@ -347,7 +358,8 @@ struct Program {
                  released.main_kv_pages
                      ? std::vector<std::pair<Handle, std::uint32_t>>{{handle,
                                                                       released.main_kv_pages}}
-                     : std::vector<std::pair<Handle, std::uint32_t>>{}});
+                     : std::vector<std::pair<Handle, std::uint32_t>>{},
+                 host_placeable()});
         }
         return result;
     }
@@ -358,9 +370,9 @@ struct Program {
             return std::nullopt;
         }
         Demotion combined{ordered.front().handle, 0, {}, {}};
-        auto remaining   = shortage.main_kv_pages;
-        const auto usage = physical_usage();
-        auto host_left   = usage.capacity.host_bytes - usage.occupied.host_bytes;
+        auto remaining          = shortage.main_kv_pages;
+        auto host_left          = host_placeable();
+        combined.host_placeable = host_left;
         // The fixture supplies disjoint, explicit page quantities. Physical aliases,
         // reservations and transfer leases belong to the Native contract tests.
         for (const auto& plan : ordered) {
@@ -506,8 +518,8 @@ struct Program {
                         [&](auto handle) { return contents.at(handle.index).demotion_blocked; })) {
             return false;
         }
-        const auto usage = physical_usage();
-        if (plan.host_bytes > usage.capacity.host_bytes - usage.occupied.host_bytes) {
+        if (plan.host_bytes > host_placeable()) {
+            ++placement_failures;
             return false;
         }
         if (!plan.main_parts.empty()) {
@@ -2098,6 +2110,42 @@ void test_rewritten_dialogue_outlives_its_abandoned_branch() {
             "Host pressure evicted the live branch before the abandoned one");
 }
 
+void test_demotion_quotes_only_placeable_host_bytes() {
+    // 32 bytes are free, but 16 of them are stranded in runs too short for the destination.
+    Fixture f(64);
+    (void)f.program.host_block(16, true);
+    const auto incoming                               = f.program.add(tokens(1000));
+    f.program.contents[incoming.index].demotion_bytes = 32;
+    const auto donor = f.program.add(tokens(10, 5000), {f.program.host_block(16)});
+    f.program.contents[donor.index].device_state = false;
+    f.publish(incoming);
+    f.publish(donor);
+    f.program.host_fragment_bytes = 16;
+    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                f.program.demoted == std::vector<Handle>{incoming} &&
+                f.program.released == std::vector<Handle>{donor} &&
+                f.program.placement_failures == 0,
+            "a demotion counted free bytes it could not place instead of displacing Host history");
+
+    // 48 bytes free, 32 of them stranded, and no Host history to displace: the demotion is not
+    // attempted, pass after pass (#402).
+    Fixture stuck(64);
+    (void)stuck.program.host_block(16, true);
+    const auto source = stuck.program.add(tokens(1000));
+    stuck.program.contents[source.index].demotion_bytes = 32;
+    stuck.publish(source);
+    stuck.program.contents[source.index].release_blocked = true;
+    stuck.program.host_fragment_bytes                    = 32;
+    for (int pass = 0; pass < 3; ++pass) {
+        require(stuck.cache.reclaim(stuck.program, {.state_slots = 1}) ==
+                    ninfer::runtime::ReclaimProgress::Blocked,
+                "an unplaceable demotion reported progress");
+    }
+    require(stuck.program.placement_failures == 0 && stuck.program.contents[source.index].alive,
+            "an unplaceable demotion was attempted on every reclaim pass");
+}
+
 void test_failed_demotion_releases_superseded_history_before_the_live_branch() {
     // Host: the abandoned endpoint and two external 16-byte residents; 16 bytes stay free.
     Fixture f(64);
@@ -2508,6 +2556,7 @@ int main() {
         test_rewritten_dialogue_outlives_its_abandoned_branch();
         test_delayed_older_rewrite_does_not_supersede_a_newer_owner();
         test_failed_demotion_releases_superseded_history_before_the_live_branch();
+        test_demotion_quotes_only_placeable_host_bytes();
         test_inherited_owner_heat_cannot_spend_a_full_other_continuation();
         test_exact_repeated_candidate_can_replace_a_long_hotspot_with_common_fallback();
         test_old_candidate_demand_cannot_borrow_a_new_owner_epoch();

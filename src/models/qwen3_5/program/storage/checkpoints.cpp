@@ -439,6 +439,13 @@ bool ProgramImpl::pause_snapshot_fits(SequenceHandle handle) const {
            pause_state_image_unplaced(handle) == 0;
 }
 
+std::size_t ProgramImpl::host_placeable_bytes(std::size_t unit) const noexcept {
+    if (!host_context_arena) { return 0; }
+    const auto& arena = *host_context_arena;
+    return std::min(arena.placeable_bytes(unit),
+                    arena.general_capacity_bytes() - arena.general_occupied_bytes());
+}
+
 std::size_t ProgramImpl::release_redundant_host(std::span<const CheckpointHandle> excluded,
                                                 std::optional<SequenceHandle> pending_backup) {
     if (!host_context_arena) { return 0; }
