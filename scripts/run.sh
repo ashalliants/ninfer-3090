@@ -82,6 +82,36 @@
 #                                                                      and crashes (dflash2, mtp, none)
 #     NINFER_CONTEXT_STORE_MAX_GIB      --context-store-max-gib N      disk budget for the store
 #
+# EVERY OTHER ninfer-serve FLAG, all profiles. A flag with no launcher variable of its own is read
+# from NINFER_<FLAG>: the flag name upper-cased, dashes to underscores (--prefill-stall-budget-ms is
+# NINFER_PREFILL_STALL_BUDGET_MS). Each is passed only when set, so unset keeps the profile as
+# measured; `ninfer-serve --help` says what each one does. A flag the profile itself sets
+# (--max-concurrency, --kv-capacity, --gdn-state-fp16, ...) has its own variable above or none.
+# A variable here is appended after the profile's own arguments, so it wins over a value the profile
+# sets (the c8 profile's --device-state-slots).
+#   value:  DEVICE_STATE_SLOTS API_KEY MODEL_ID LOG_LEVEL LOG_STATS_INTERVAL_MS REQUEST_LOG_JSONL DEVICE
+#           DEFAULT_MAX_TOKENS DEFAULT_THINKING_BUDGET REASONING_EFFORT
+#           TEMPERATURE TOP_P TOP_K FREQUENCY_PENALTY SEED NGRAM_MIN_MATCH
+#           MAX_REQUEST_MIB MEDIA_CACHE_MIB MEDIA_LIVE_MIB MEDIA_PREPROCESS_THREADS VISION_MAX_MERGED
+#           RESPONSE_STORE_MAX_RECORDS RESPONSE_STORE_MAX_MIB CONTEXT_COST_PRESETS
+#           PREFILL_STALL_BUDGET_MS YIELD_LONG_PREFILL_MS PREFILL_DECODE_SHARE PREFILL_LAYER_SLICES
+#           PROGRESS_ANCHOR_TOKENS SLEEP_IDLE_SECONDS SUSPEND_SNAPSHOT SUSPEND_WEIGHTS
+#           CONTEXT_STORE_TTL_HOURS CONTEXT_STORE_IDLE_SECONDS CONTEXT_STORE_RESTORE_SECONDS
+#           CONTEXT_STORE_FLUSH_SECONDS CONTEXT_STORE_PEER_POLL_MS CONTEXT_STORE_S3_ENDPOINT
+#           CONTEXT_STORE_S3_BUCKET CONTEXT_STORE_S3_PREFIX CONTEXT_STORE_S3_REGION
+#           CONTEXT_STORE_S3_UPLOAD_DELAY_SECONDS PREFILL_ORDER HOST_PAUSE_RESERVE_MIB
+#           LOSSY_PREFILL_MIN_TOKENS (experimental; the model does not see part of a long cold
+#           prompt) and its tuning: LOSSY_PREFILL_KEEP _FILTER_LAYER _BLOCK _RECENT _HEAD
+#           _QUERY_ROWS _POOL_WINDOW _SKIP _STRATEGY _SUMMARY_MAX_TOKENS
+#   on|off: CORS GREEDY NO_THINKING PRESERVE_THINKING TOLERANT_TOOL_CALLS NO_CUDA_GRAPH
+#           NO_PREFIX_REUSE NO_PREFILL_A8 NO_PREFILL_CUBLAS_PROJECTIONS CONTEXT_STORE_COMPRESS
+#           NO_EXIT_ON_ENGINE_FAILURE ADMISSION_FIT_CHECK PROGRESS_ANCHORS_SHARED MODEL_SUSPEND
+#           NO_AUTO_RESUME LM_HEAD_Q4 LM_HEAD_Q6 EMBEDDING_Q4 EMBEDDING_Q6 LOSSY_PREFILL_SCOUT_A4
+#           REQUEST_LOG_LOSSY_DETAIL
+# Not here: the repeatable --graft and --context-store-peer, router mode (--models-*), and the
+# Flash-Next-only flags (run.bat; setting one of their variables here stops with exit 2). The S3 store reads its credentials from the environment
+# (NINFER_S3_ACCESS_KEY_ID, NINFER_S3_SECRET_ACCESS_KEY), never from a flag.
+#
 # Each spec's defaults (context, lanes, chunk) are the ones that fit a headless card; beside a
 # desktop the server fits the context to what is free (see IF THE CARD IS BUSY above).
 # ------------------------------------------------------------------------------------------------
@@ -102,13 +132,18 @@ case "$model_key" in
   '') usage >&2; exit 2 ;;
   *) printf 'Unknown model: %s\n' "$model_key" >&2; usage >&2; exit 2 ;;
 esac
-# NINFER_NGRAM_VOLUME is the Qwen3.8-Flash-Next n-gram volume override in run.bat. Flash-Next runs on
-# Windows only, so none of these models has a volume: refuse rather than ignore the variable.
-if [[ -n "${NINFER_NGRAM_VOLUME:-}" ]]; then
-  printf 'NINFER_NGRAM_VOLUME is for qwen38-flash-next only (run.bat, Windows); clear it to serve %s\n' \
-    "$model_key" >&2
-  exit 2
-fi
+# These are the Qwen3.8-Flash-Next overrides in run.bat (its n-gram volume, expert cache and state,
+# pipeline split, disk tier). Flash-Next runs on Windows only, so none of these models has them:
+# refuse rather than silently ignore a variable that was set.
+for flash_next_var in NINFER_NGRAM_VOLUME NINFER_DEVICES NINFER_STAGE_LAYERS NINFER_EXPERT_STATE \
+    NINFER_NO_EXPERT_STATE NINFER_VRAM_HEADROOM_MIB NINFER_RAM_HEADROOM_MIB NINFER_EXPERT_CACHE_MIB \
+    NINFER_CONTEXT_NVME_MIB NINFER_CONTEXT_NVME_DIR; do
+  if [[ -n "${!flash_next_var:-}" ]]; then
+    printf '%s is for qwen38-flash-next only (run.bat, Windows); clear it to serve %s\n' \
+      "$flash_next_var" "$model_key" >&2
+    exit 2
+  fi
+done
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd -- "$script_dir/.." && pwd)"
@@ -354,6 +389,44 @@ if [[ "$profile" == 'tuned' ]]; then
     label="${label/context $CONTEXT/context up to $CONTEXT}"
   fi
 fi
+
+# Flags with no launcher variable of their own: NINFER_<FLAG> is passed straight through when set
+# (see "EVERY OTHER ninfer-serve FLAG" above). A name the server does not know fails there, loudly.
+passthrough_value_flags=(
+  device-state-slots api-key model-id log-level log-stats-interval-ms request-log-jsonl device
+  default-max-tokens default-thinking-budget reasoning-effort
+  temperature top-p top-k frequency-penalty seed ngram-min-match
+  max-request-mib media-cache-mib media-live-mib media-preprocess-threads vision-max-merged
+  response-store-max-records response-store-max-mib context-cost-presets
+  prefill-stall-budget-ms yield-long-prefill-ms prefill-decode-share prefill-layer-slices
+  progress-anchor-tokens sleep-idle-seconds suspend-snapshot suspend-weights
+  context-store-ttl-hours context-store-idle-seconds context-store-restore-seconds
+  context-store-flush-seconds context-store-peer-poll-ms context-store-s3-endpoint
+  context-store-s3-bucket context-store-s3-prefix context-store-s3-region
+  context-store-s3-upload-delay-seconds prefill-order host-pause-reserve-mib
+  lossy-prefill-min-tokens lossy-prefill-keep lossy-prefill-filter-layer lossy-prefill-block
+  lossy-prefill-recent lossy-prefill-head lossy-prefill-query-rows lossy-prefill-pool-window
+  lossy-prefill-skip lossy-prefill-strategy lossy-prefill-summary-max-tokens
+)
+passthrough_switch_flags=(
+  cors greedy no-thinking preserve-thinking tolerant-tool-calls no-cuda-graph no-prefix-reuse
+  no-prefill-a8 no-prefill-cublas-projections context-store-compress no-exit-on-engine-failure
+  admission-fit-check progress-anchors-shared model-suspend no-auto-resume
+  lm-head-q4 lm-head-q6 embedding-q4 embedding-q6 lossy-prefill-scout-a4 request-log-lossy-detail
+)
+env_name_for_flag() { printf 'NINFER_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; }
+for flag in "${passthrough_value_flags[@]}"; do
+  var="$(env_name_for_flag "$flag")"
+  [[ -z "${!var:-}" ]] || profile_args+=("--$flag" "${!var}")
+done
+for flag in "${passthrough_switch_flags[@]}"; do
+  var="$(env_name_for_flag "$flag")"
+  case "${!var:-off}" in
+    on) profile_args+=("--$flag") ;;
+    off) ;;
+    *) printf '%s must be on or off, got %s\n' "$var" "${!var}" >&2; exit 2 ;;
+  esac
+done
 
 if [[ -n "${NINFER_CHAT_TEMPLATE:-}" ]]; then
   profile_args+=(--chat-template "$NINFER_CHAT_TEMPLATE")

@@ -96,6 +96,40 @@ rem   NINFER_CONTEXT_STORE               --context-store DIR            keep the
 rem                                                                      and crashes (dflash2, mtp, none)
 rem     NINFER_CONTEXT_STORE_MAX_GIB      --context-store-max-gib N      disk budget for the store
 rem
+rem EVERY OTHER ninfer-serve FLAG, all profiles. A flag with no launcher variable of its own is read
+rem from NINFER_^<FLAG^>: the flag name upper-cased, dashes to underscores (--prefill-stall-budget-ms
+rem is NINFER_PREFILL_STALL_BUDGET_MS). Each is passed only when set, so unset keeps the profile as
+rem measured; `ninfer-serve --help` says what each one does. A flag the profile itself sets
+rem (--max-concurrency, --kv-capacity, --gdn-state-fp16, ...) has its own variable above or none.
+rem A variable here is appended after the profile's own arguments, so it wins over a value the profile
+rem sets (the c8 profile's --device-state-slots).
+rem   value:  DEVICE_STATE_SLOTS API_KEY MODEL_ID LOG_LEVEL LOG_STATS_INTERVAL_MS REQUEST_LOG_JSONL DEVICE
+rem           DEFAULT_MAX_TOKENS DEFAULT_THINKING_BUDGET REASONING_EFFORT
+rem           TEMPERATURE TOP_P TOP_K FREQUENCY_PENALTY SEED NGRAM_MIN_MATCH
+rem           MAX_REQUEST_MIB MEDIA_CACHE_MIB MEDIA_LIVE_MIB MEDIA_PREPROCESS_THREADS VISION_MAX_MERGED
+rem           RESPONSE_STORE_MAX_RECORDS RESPONSE_STORE_MAX_MIB CONTEXT_COST_PRESETS
+rem           PREFILL_STALL_BUDGET_MS YIELD_LONG_PREFILL_MS PREFILL_DECODE_SHARE PREFILL_LAYER_SLICES
+rem           PROGRESS_ANCHOR_TOKENS SLEEP_IDLE_SECONDS SUSPEND_SNAPSHOT SUSPEND_WEIGHTS
+rem           CONTEXT_STORE_TTL_HOURS CONTEXT_STORE_IDLE_SECONDS CONTEXT_STORE_RESTORE_SECONDS
+rem           CONTEXT_STORE_FLUSH_SECONDS CONTEXT_STORE_PEER_POLL_MS CONTEXT_STORE_S3_ENDPOINT
+rem           CONTEXT_STORE_S3_BUCKET CONTEXT_STORE_S3_PREFIX CONTEXT_STORE_S3_REGION
+rem           CONTEXT_STORE_S3_UPLOAD_DELAY_SECONDS PREFILL_ORDER HOST_PAUSE_RESERVE_MIB
+rem           LOSSY_PREFILL_MIN_TOKENS (experimental; the model does not see part of a long cold
+rem           prompt) and its tuning: LOSSY_PREFILL_KEEP _FILTER_LAYER _BLOCK _RECENT _HEAD
+rem           _QUERY_ROWS _POOL_WINDOW _SKIP _STRATEGY _SUMMARY_MAX_TOKENS
+rem           and for Qwen3.8-Flash-Next: DEVICES STAGE_LAYERS EXPERT_STATE VRAM_HEADROOM_MIB
+rem           RAM_HEADROOM_MIB EXPERT_CACHE_MIB CONTEXT_NVME_DIR
+rem   on^|off: CORS GREEDY NO_THINKING PRESERVE_THINKING TOLERANT_TOOL_CALLS NO_CUDA_GRAPH
+rem           NO_PREFIX_REUSE NO_PREFILL_A8 NO_PREFILL_CUBLAS_PROJECTIONS CONTEXT_STORE_COMPRESS
+rem           NO_EXIT_ON_ENGINE_FAILURE ADMISSION_FIT_CHECK PROGRESS_ANCHORS_SHARED MODEL_SUSPEND
+rem           NO_AUTO_RESUME LM_HEAD_Q4 LM_HEAD_Q6 EMBEDDING_Q4 EMBEDDING_Q6 NO_EXPERT_STATE LOSSY_PREFILL_SCOUT_A4
+rem           REQUEST_LOG_LOSSY_DETAIL
+rem Not here: the repeatable --graft (see NINFER_GRAFTS) and --context-store-peer, and router mode
+rem (--models-*). The S3 store reads its credentials from the environment
+rem (NINFER_S3_ACCESS_KEY_ID, NINFER_S3_SECRET_ACCESS_KEY), never from a flag.
+rem Values are passed literally (percent signs, carets, ampersands and parentheses are safe); a value may
+rem not contain a double quote.
+rem
 rem Each spec's defaults (context, lanes, chunk) are the ones measured to fit beside a desktop, which
 rem holds roughly 1-1.5 GiB of the card.
 rem
@@ -601,6 +635,95 @@ if "%FIT%"=="1" set "FIT_ARGS= --fit-context %FIT_FLOOR%"
 set "PROFILE_ARGS=%PROFILE_ARGS% --max-pending-requests 16 --pending-timeout-ms 600000 %VISION_ARGS% %CACHE_ARGS%%KNOB_ARGS%%FIT_ARGS% %SAMPLING_ARGS%"
 
 :launch
+rem Flags with no launcher variable of their own: NINFER_^<FLAG^> is passed straight through when set
+rem (see "EVERY OTHER ninfer-serve FLAG" above). A name the server does not know fails there, loudly.
+set "EXTRA_ARGS="
+set "EXTRA_FAIL="
+call :pass_value DEVICE_STATE_SLOTS --device-state-slots
+call :pass_value API_KEY --api-key
+call :pass_value MODEL_ID --model-id
+call :pass_value LOG_LEVEL --log-level
+call :pass_value LOG_STATS_INTERVAL_MS --log-stats-interval-ms
+call :pass_value REQUEST_LOG_JSONL --request-log-jsonl
+call :pass_value DEVICE --device
+call :pass_value DEFAULT_MAX_TOKENS --default-max-tokens
+call :pass_value DEFAULT_THINKING_BUDGET --default-thinking-budget
+call :pass_value REASONING_EFFORT --reasoning-effort
+call :pass_value TEMPERATURE --temperature
+call :pass_value TOP_P --top-p
+call :pass_value TOP_K --top-k
+call :pass_value FREQUENCY_PENALTY --frequency-penalty
+call :pass_value SEED --seed
+call :pass_value NGRAM_MIN_MATCH --ngram-min-match
+call :pass_value MAX_REQUEST_MIB --max-request-mib
+call :pass_value MEDIA_CACHE_MIB --media-cache-mib
+call :pass_value MEDIA_LIVE_MIB --media-live-mib
+call :pass_value MEDIA_PREPROCESS_THREADS --media-preprocess-threads
+call :pass_value VISION_MAX_MERGED --vision-max-merged
+call :pass_value RESPONSE_STORE_MAX_RECORDS --response-store-max-records
+call :pass_value RESPONSE_STORE_MAX_MIB --response-store-max-mib
+call :pass_value CONTEXT_COST_PRESETS --context-cost-presets
+call :pass_value PREFILL_STALL_BUDGET_MS --prefill-stall-budget-ms
+call :pass_value YIELD_LONG_PREFILL_MS --yield-long-prefill-ms
+call :pass_value PREFILL_DECODE_SHARE --prefill-decode-share
+call :pass_value PREFILL_LAYER_SLICES --prefill-layer-slices
+call :pass_value PROGRESS_ANCHOR_TOKENS --progress-anchor-tokens
+call :pass_value SLEEP_IDLE_SECONDS --sleep-idle-seconds
+call :pass_value SUSPEND_SNAPSHOT --suspend-snapshot
+call :pass_value SUSPEND_WEIGHTS --suspend-weights
+call :pass_value CONTEXT_STORE_TTL_HOURS --context-store-ttl-hours
+call :pass_value CONTEXT_STORE_IDLE_SECONDS --context-store-idle-seconds
+call :pass_value CONTEXT_STORE_RESTORE_SECONDS --context-store-restore-seconds
+call :pass_value CONTEXT_STORE_FLUSH_SECONDS --context-store-flush-seconds
+call :pass_value CONTEXT_STORE_PEER_POLL_MS --context-store-peer-poll-ms
+call :pass_value CONTEXT_STORE_S3_ENDPOINT --context-store-s3-endpoint
+call :pass_value CONTEXT_STORE_S3_BUCKET --context-store-s3-bucket
+call :pass_value CONTEXT_STORE_S3_PREFIX --context-store-s3-prefix
+call :pass_value CONTEXT_STORE_S3_REGION --context-store-s3-region
+call :pass_value PREFILL_ORDER --prefill-order
+call :pass_value HOST_PAUSE_RESERVE_MIB --host-pause-reserve-mib
+call :pass_value CONTEXT_STORE_S3_UPLOAD_DELAY_SECONDS --context-store-s3-upload-delay-seconds
+call :pass_value LOSSY_PREFILL_MIN_TOKENS --lossy-prefill-min-tokens
+call :pass_value LOSSY_PREFILL_KEEP --lossy-prefill-keep
+call :pass_value LOSSY_PREFILL_FILTER_LAYER --lossy-prefill-filter-layer
+call :pass_value LOSSY_PREFILL_BLOCK --lossy-prefill-block
+call :pass_value LOSSY_PREFILL_RECENT --lossy-prefill-recent
+call :pass_value LOSSY_PREFILL_HEAD --lossy-prefill-head
+call :pass_value LOSSY_PREFILL_QUERY_ROWS --lossy-prefill-query-rows
+call :pass_value LOSSY_PREFILL_POOL_WINDOW --lossy-prefill-pool-window
+call :pass_value LOSSY_PREFILL_SKIP --lossy-prefill-skip
+call :pass_value LOSSY_PREFILL_STRATEGY --lossy-prefill-strategy
+call :pass_value LOSSY_PREFILL_SUMMARY_MAX_TOKENS --lossy-prefill-summary-max-tokens
+call :pass_value DEVICES --devices
+call :pass_value STAGE_LAYERS --stage-layers
+call :pass_value EXPERT_STATE --expert-state
+call :pass_value VRAM_HEADROOM_MIB --vram-headroom-mib
+call :pass_value RAM_HEADROOM_MIB --ram-headroom-mib
+call :pass_value EXPERT_CACHE_MIB --expert-cache-mib
+call :pass_value CONTEXT_NVME_DIR --context-nvme-dir
+call :pass_switch CORS --cors
+call :pass_switch GREEDY --greedy
+call :pass_switch NO_THINKING --no-thinking
+call :pass_switch PRESERVE_THINKING --preserve-thinking
+call :pass_switch TOLERANT_TOOL_CALLS --tolerant-tool-calls
+call :pass_switch NO_CUDA_GRAPH --no-cuda-graph
+call :pass_switch NO_PREFIX_REUSE --no-prefix-reuse
+call :pass_switch NO_PREFILL_A8 --no-prefill-a8
+call :pass_switch NO_PREFILL_CUBLAS_PROJECTIONS --no-prefill-cublas-projections
+call :pass_switch CONTEXT_STORE_COMPRESS --context-store-compress
+call :pass_switch NO_EXIT_ON_ENGINE_FAILURE --no-exit-on-engine-failure
+call :pass_switch ADMISSION_FIT_CHECK --admission-fit-check
+call :pass_switch PROGRESS_ANCHORS_SHARED --progress-anchors-shared
+call :pass_switch MODEL_SUSPEND --model-suspend
+call :pass_switch NO_AUTO_RESUME --no-auto-resume
+call :pass_switch LM_HEAD_Q4 --lm-head-q4
+call :pass_switch LM_HEAD_Q6 --lm-head-q6
+call :pass_switch EMBEDDING_Q4 --embedding-q4
+call :pass_switch EMBEDDING_Q6 --embedding-q6
+call :pass_switch NO_EXPERT_STATE --no-expert-state
+call :pass_switch LOSSY_PREFILL_SCOUT_A4 --lossy-prefill-scout-a4
+call :pass_switch REQUEST_LOG_LOSSY_DETAIL --request-log-lossy-detail
+if defined EXTRA_FAIL exit /b 2
 set "GRAFT_ARGS="
 if /i "%NINFER_GRAFTS%"=="off" goto :graft_done
 if "%GRAFT_FILE%"=="" goto :graft_done
@@ -661,7 +784,7 @@ rem "( ... )" command group, that character can be taken as the group's own clos
 rem break the batch parse, quoting notwithstanding -- so this invocation runs unparenthesised, with
 rem goto standing in for the logged/unlogged branch instead.
 if /i "%PROFILE%"=="tuned" goto :launch_logged
-"%SERVER%" "%MODEL%" --host %HOST% --port %PORT% %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %CHAT_TEMPLATE_ARGS%
+"%SERVER%" "%MODEL%" --host %HOST% --port %PORT% %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %CHAT_TEMPLATE_ARGS% %EXTRA_ARGS%
 endlocal
 exit /b %ERRORLEVEL%
 
@@ -670,7 +793,7 @@ rem Run the server with its output shown and kept, so a failure the launcher can
 rem told apart from any other. Only a failed host pin retries; a crash or a bad artifact does not.
 rem The log is written as ASCII on purpose: Tee-Object writes UTF-16, which findstr cannot search.
 set "SERVER_LOG=%TEMP%\ninfer-run-%RANDOM%%RANDOM%.log"
-"%SERVER%" "%MODEL%" --host %HOST% --port %PORT% %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %CHAT_TEMPLATE_ARGS% 2>&1 | powershell -NoProfile -Command "$input | ForEach-Object { $_; Add-Content -LiteralPath '%SERVER_LOG%' -Value $_ -Encoding Ascii }"
+"%SERVER%" "%MODEL%" --host %HOST% --port %PORT% %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %CHAT_TEMPLATE_ARGS% %EXTRA_ARGS% 2>&1 | powershell -NoProfile -Command "$input | ForEach-Object { $_; Add-Content -LiteralPath '%SERVER_LOG%' -Value $_ -Encoding Ascii }"
 findstr /c:"not enough free GPU memory" "%SERVER_LOG%" >nul 2>&1
 if not errorlevel 1 goto :memory_advice
 if not "%HOST_RETRY%"=="1" goto :server_done
@@ -706,4 +829,43 @@ echo usage: run.bat ^<model^> [profile]
 echo   qwen38-27b       tuned (default), int8, c8   (recommended)
 echo   qwen36-35b-a3b   tuned (default)
 echo   qwen38-flash-next tuned (default)   (preview)
+exit /b 0
+
+:pass_value
+rem call :pass_value NAME --flag -- appends --flag "<NINFER_NAME>" to EXTRA_ARGS when the variable is set.
+rem The unquoted `set NAME=value` form keeps the expanded text inside its own quotes, so a path or key
+rem with "&", "|" or ")" stays inert (see CHAT_TEMPLATE_ARGS above).
+call :read_env %~1
+if not defined PASS_VAL exit /b 0
+set EXTRA_ARGS=%EXTRA_ARGS% %~2 "%PASS_VAL%"
+exit /b 0
+
+:pass_switch
+rem call :pass_switch NAME --flag -- appends --flag when NINFER_NAME is on; off or unset passes nothing.
+call :read_env %~1
+if not defined PASS_VAL exit /b 0
+if /i "%PASS_VAL%"=="on" goto :pass_switch_on
+if /i "%PASS_VAL%"=="off" exit /b 0
+rem The value is deliberately not echoed: an unquoted expansion on a command line would run
+rem anything after an ampersand or pipe in it.
+echo NINFER_%~1 must be on or off 1>&2
+set "EXTRA_FAIL=1"
+exit /b 0
+:pass_switch_on
+set EXTRA_ARGS=%EXTRA_ARGS% %~2
+exit /b 0
+
+:read_env
+rem call :read_env NAME -- sets PASS_VAL to the value of NINFER_NAME, empty when unset. The value is read
+rem through a FOR variable, which cmd substitutes after parsing, so percent signs, carets, ampersands
+rem and pipes reach PASS_VAL literally; CALL SET would parse the value a second time. A double quote
+rem cannot be carried inside the quoted argument built from it, so it is refused, not passed on mangled.
+set "PASS_VAL="
+set NINFER_%~1 2>nul | findstr /b /c:"NINFER_%~1=" | findstr /c:"\"" >nul
+if not errorlevel 1 goto :read_env_quote
+for /f "tokens=1* delims==" %%A in ('set NINFER_%~1 2^>nul') do if /i "%%A"=="NINFER_%~1" set "PASS_VAL=%%B"
+exit /b 0
+:read_env_quote
+echo NINFER_%~1 must not contain a double quote character 1>&2
+set "EXTRA_FAIL=1"
 exit /b 0
