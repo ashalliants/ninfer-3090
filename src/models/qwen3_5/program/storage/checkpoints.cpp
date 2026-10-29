@@ -278,7 +278,8 @@ runtime::ContextResourceUsage ProgramImpl::snapshot_resources(const ResumeState&
     return checkpoint_summary(*paused.impl_->snapshot).evictable_resources;
 }
 
-std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> handles) const {
+std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> handles,
+                                             bool state_images_only) const {
     struct StateReferences {
         StateImageHandle state;
         std::uint32_t references = 0;
@@ -344,6 +345,7 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
             bytes += state_images->host_layout().image_bytes;
         }
     }
+    const auto state_bytes = bytes;
     const auto count = [&](const LogicalKVPageStore& pages, const auto& references) {
         for (const auto& [index, entry] : references) {
             if (entry.references != pages.address_references(entry.page)) { continue; }
@@ -362,7 +364,7 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
     if (!count(*text_kv_pages, main) || (backend_kv_pages && !count(*backend_kv_pages, backend))) {
         return 0;
     }
-    return bytes;
+    return state_images_only ? state_bytes : bytes;
 }
 
 std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle) const {
