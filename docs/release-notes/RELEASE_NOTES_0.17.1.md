@@ -48,13 +48,19 @@ The 3/4 limit now applies to Host bytes only, because only the Host tier loses w
 ## Not verified in this release
 
 - **Windows:** built and dependency-checked only; nothing was started or served on Windows. In particular the `NINFER_<FLAG>` handling in `run.bat` (#403) has **not been run**; it was written without a Windows machine.
-- **Qwen3.8-27B (the recommended model) was not served for this release** (see Verification for the model that was).
-- **The cache fixes (#401, #404, #405) were not exercised under the conditions they fix:** no full Host tier, no 130K-token dialogue and no fragmented Host was reproduced on the card. Their CPU tests ran in their pull requests; their GPU tests (`native_transactions`, `qwen4_exp_context_cache`, `host_context_arena`) were not run on the release commit.
-- The full GPU test suite.
+- **The cache fixes (#401, #404, #405) were not exercised under the conditions they fix:** no full Host tier, no 130K-token dialogue and no fragmented Host was reproduced on the card. Their tests passed (see Verification), but the 10-27 minute stall and the cold re-reads were not replayed, so the real-traffic effect is unmeasured.
+- Only five test programs were run on the release commit, not the full CPU or GPU suite.
+- The Linux library list was not diffed against v0.17.0's. No CMake or dependency file changed since v0.17.0, and `ldd` reports nothing unresolved.
 
 ## Verification
 
-(To be filled in after the checks on the release commit.)
+Checked on 2026-10-29 on a rented RTX 3090 (24 GB, Ubuntu 24.04, CUDA 12.8.1, GCC 13), against the release commit's code, before publishing:
+
+- **Build (Linux):** a clean `git archive` of the release commit, `-DCMAKE_CUDA_ARCHITECTURES=86 -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON`, targets `ninfer`, `ninfer-serve`, `ninfer_bench`; `ninfer-serve --version` reports `0.17.1-rtx3090`.
+- **Linux archive:** the outer and inner checksums match; the packaged `ninfer-serve --version` and `--help` run, and `./run.sh --help` runs from a fresh unpack; `scripts/check-linux-scripts.sh` passes; `ldd` reports no unresolved library.
+- **Launcher smoke test:** the unpacked archive's own `./run.sh qwen38-27b` served Qwen3.8-27B with the default profile and answered a chat completion ("Hello there, how are you?").
+- **Tests that exercise the changed code, on the card:** `ninfer_recovery_loss_test`, `ninfer_resource_manager_test`, `ninfer_host_context_arena_test` and `ninfer_qwen4_exp_context_cache_test` pass. `ninfer_qwen3_5_native_transactions_test` passes with the Qwen3.8-27B artifact (without one it skips).
+- **Not run:** the rest of the test suite, and any serving check beyond the one chat completion (streaming, tools, the context store, lossy prefill and the new flags were checked for v0.17.0 and were not repeated).
 
 ## Windows archive: built, not run
 
