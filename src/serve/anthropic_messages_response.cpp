@@ -187,13 +187,14 @@ std::string make_anthropic_sse_error(const ApiError& error, const std::string& r
 }
 
 std::string make_anthropic_messages_response(const AnthropicResponseIdentity& identity,
-                                             const GenerationOutcome& outcome) {
+                                             const GenerationOutcome& outcome,
+                                             bool hide_thinking) {
     OrderedJson content = OrderedJson::array();
     if (!outcome.reasoning.empty()) {
         // Claude clients expect a non-empty opaque value. The response identity already has the
         // required lifetime, so Thinking introduces no independent state or credential.
         content.push_back(OrderedJson{{"type", "thinking"},
-                                      {"thinking", outcome.reasoning},
+                                      {"thinking", hide_thinking ? std::string() : outcome.reasoning},
                                       {"signature", identity.message_id}});
     }
     if (!outcome.text.empty()) {
@@ -224,8 +225,8 @@ std::string make_anthropic_count_tokens_response(int input_tokens) {
 }
 
 AnthropicMessagesStream::AnthropicMessagesStream(AnthropicResponseIdentity identity,
-                                                 int input_tokens)
-    : identity_(std::move(identity)), input_tokens_(input_tokens) {}
+                                                 int input_tokens, bool hide_thinking)
+    : identity_(std::move(identity)), hide_thinking_(hide_thinking), input_tokens_(input_tokens) {}
 
 std::string AnthropicMessagesStream::start() { return start_with_cache(std::nullopt); }
 
@@ -266,7 +267,7 @@ std::vector<std::string> AnthropicMessagesStream::reasoning_delta(const std::str
                         Json{{"type", "thinking"}, {"thinking", ""}, {"signature", ""}}}}));
     }
     reasoning_ += text;
-    if (!text.empty()) {
+    if (!text.empty() && !hide_thinking_) {
         events.push_back(
             event("content_block_delta",
                   Json{{"type", "content_block_delta"},

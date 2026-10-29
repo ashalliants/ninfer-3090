@@ -14,11 +14,22 @@
 
 namespace ninfer::serve {
 
+ReasoningRestore HttpServer::reasoning_restore() {
+    return [this](const std::string& signature) { return anthropic_reasoning_store_.get(signature); };
+}
+
+void HttpServer::stash_hidden_reasoning(const AnthropicResponseIdentity& identity,
+                                        const GenerationOutcome& outcome, bool hidden) {
+    if (hidden && !outcome.reasoning.empty()) {
+        anthropic_reasoning_store_.put(identity.message_id, outcome.reasoning);
+    }
+}
+
 void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Response& res) {
     const std::string request_id = res.get_header_value("request-id");
     try {
         const AnthropicCountTokensRequest request =
-            parse_anthropic_count_tokens_request(parse_json_body(req));
+            parse_anthropic_count_tokens_request(parse_json_body(req), reasoning_restore());
         const int input_tokens = service_->count_prompt_tokens(
             request.generation, [&req] { return client_disconnected(req); });
         res.set_content(make_anthropic_count_tokens_response(input_tokens), "application/json");
@@ -41,7 +52,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     AnthropicMessagesRequest request;
     try {
         const RequestLimits limits = request_limits(options_);
-        request                   = parse_anthropic_messages_request(parse_json_body(req), limits);
+        request = parse_anthropic_messages_request(parse_json_body(req), limits,
+                                                   reasoning_restore());
     } catch (const ApiException& exception) {
         write_anthropic_error(res, exception.error(), request_id);
         return;
@@ -122,8 +134,12 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             return;
         }
         try {
-            set_owned_json_content(res, make_anthropic_messages_response(identity, outcome),
-                                   prepared.lifetime);
+            stash_hidden_reasoning(identity, outcome, request.thinking_display_omitted);
+            set_owned_json_content(
+                res,
+                make_anthropic_messages_response(identity, outcome,
+                                                 request.thinking_display_omitted),
+                prepared.lifetime);
         } catch (const ApiException& exception) {
             const ApiError error = normalize_anthropic_error(exception.error());
             lifecycle->response_failure(
@@ -142,12 +158,15 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
     try {
         auto stream  = std::make_shared<HttpGenerationStream>(std::move(prepared));
-        auto encoder = std::make_shared<AnthropicMessagesStream>(identity, input_tokens);
+        auto encoder = std::make_shared<AnthropicMessagesStream>(
+            identity, input_tokens, request.thinking_display_omitted);
 
         prepare_sse_response(res);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, stream, encoder, lifecycle](std::size_t, httplib::DataSink& sink) -> bool {
+            [this, stream, encoder, lifecycle, identity,
+             hide_thinking = request.thinking_display_omitted](std::size_t,
+                                                               httplib::DataSink& sink) -> bool {
                 if (stream->started.exchange(true, std::memory_order_acq_rel)) {
                     sink.done();
                     return true;
@@ -222,6 +241,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 }
                 std::vector<std::string> terminal;
                 try {
+                    stash_hidden_reasoning(identity, outcome, hide_thinking);
                     terminal = encoder->finish(outcome);
                 } catch (const std::exception& exception) {
                     lifecycle->response_failure(make_internal_request_failure(

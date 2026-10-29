@@ -1,4 +1,5 @@
 #include "serve/anthropic_messages.h"
+#include "serve/anthropic_reasoning_store.h"
 
 #include "serve/generation_service.h"
 #include "serve/translate.h"
@@ -570,9 +571,16 @@ int test_thinking_and_count_tokens() {
     body["thinking"] = Json{{"type", "between_tools"}};
     failures += check(api_code([&] { (void)parse(body); }) == "thinking_type_not_supported",
                       "between_tools Thinking has an explicit capability rejection");
+    body["thinking"] = Json{{"type", "disabled"}, {"display", "omitted"}};
+    failures += check(api_param([&] { (void)parse(body); }) == "thinking",
+                      "thinking.display was accepted with thinking disabled");
     body["thinking"] = Json{{"type", "adaptive"}, {"display", "omitted"}};
-    failures += check(api_code([&] { (void)parse(body); }) == "thinking_display_not_supported",
-                      "hidden Thinking was accepted without restore semantics");
+    failures += check(api_code([&] { (void)parse(body); }).empty() &&
+                          parse(body).thinking_display_omitted,
+                      "thinking.display='omitted' was rejected or not recorded");
+    body["thinking"] = Json{{"type", "adaptive"}, {"display", "summarized"}};
+    failures += check(!parse(body).thinking_display_omitted,
+                      "thinking.display='summarized' was treated as omitted");
 
     body["max_tokens"]                        = 0;
     body["temperature"]                       = "ignored for counting";
@@ -690,6 +698,103 @@ GenerationOutcome sample_outcome() {
     outcome.matched_stop_string             = "STOP";
     outcome.metrics.prefix_cache_hit_tokens = 60;
     return outcome;
+}
+
+int test_omitted_thinking_restore() {
+    const std::string signature = "msg_omitted";
+    Json body                   = base_request();
+    body["messages"] =
+        Json::array({Json{{"role", "user"}, {"content", "before"}},
+                     Json{{"role", "assistant"},
+                          {"content", Json::array({Json{{"type", "thinking"},
+                                                        {"thinking", ""},
+                                                        {"signature", signature}},
+                                                   Json{{"type", "text"}, {"text", "answer"}}})}},
+                     Json{{"role", "user"}, {"content", "after"}}});
+
+    int failures = check(parse(body).generation.messages[1].reasoning_content.empty(),
+                         "empty Thinking without a restore invented reasoning");
+
+    ninfer::serve::AnthropicReasoningStore store(8, 1 << 20);
+    store.put(signature, "hidden thought");
+    const ReasoningRestore restore = [&](const std::string& value) { return store.get(value); };
+    failures += check(parse_anthropic_messages_request(body, limits(), restore)
+                              .generation.messages[1]
+                              .reasoning_content == "hidden thought",
+                      "empty Thinking did not restore the stored reasoning");
+    failures += check(parse_anthropic_count_tokens_request(body, restore)
+                              .generation.messages[1]
+                              .reasoning_content == "hidden thought",
+                      "Count Tokens did not restore the stored reasoning");
+
+    Json unknown                                      = body;
+    unknown["messages"][1]["content"][0]["signature"] = "msg_unknown";
+    failures += check(parse_anthropic_messages_request(unknown, limits(), restore)
+                          .generation.messages[1]
+                          .reasoning_content.empty(),
+                      "unknown signature restored reasoning");
+
+    Json visible                                     = body;
+    visible["messages"][1]["content"][0]["thinking"] = "client text";
+    failures += check(parse_anthropic_messages_request(visible, limits(), restore)
+                              .generation.messages[1]
+                              .reasoning_content == "client text",
+                      "visible Thinking text was replaced by the stored reasoning");
+
+    const AnthropicResponseIdentity identity =
+        make_anthropic_response_identity("req_hidden", "claude-local");
+    const GenerationOutcome outcome = sample_outcome();
+    const Json hidden =
+        Json::parse(make_anthropic_messages_response(identity, outcome, /*hide_thinking=*/true));
+    failures += check(hidden["content"][0]["type"] == "thinking" &&
+                          hidden["content"][0]["thinking"] == "" &&
+                          hidden["content"][0]["signature"] == identity.message_id,
+                      "omitted aggregate response leaked Thinking text or lost its signature");
+    failures += check(hidden["usage"]["output_tokens_details"]["thinking_tokens"] == 5,
+                      "omitted Thinking dropped reasoning usage");
+
+    AnthropicMessagesStream stream(identity, 100, /*hide_thinking=*/true);
+    std::vector<std::string> events{stream.start()};
+    auto append_events = [&](std::vector<std::string> values) {
+        events.insert(events.end(), std::make_move_iterator(values.begin()),
+                      std::make_move_iterator(values.end()));
+    };
+    append_events(stream.reasoning_delta("thought"));
+    append_events(stream.content_delta("answer"));
+    append_events(stream.finish(outcome));
+    bool saw_thinking_delta = false;
+    bool saw_signature      = false;
+    for (const std::string& value : events) {
+        const Json parsed = parse_event(value);
+        if (parsed.at("type") != "content_block_delta") { continue; }
+        saw_thinking_delta = saw_thinking_delta || parsed["delta"]["type"] == "thinking_delta";
+        saw_signature      = saw_signature || parsed["delta"]["type"] == "signature_delta";
+    }
+    failures += check(!saw_thinking_delta && saw_signature,
+                      "omitted stream sent Thinking text or no signature");
+    return failures;
+}
+
+int test_reasoning_store() {
+    ninfer::serve::AnthropicReasoningStore store(2, 1 << 20);
+    store.put("a", "one");
+    store.put("b", "two");
+    int failures = check(store.get("a") == "one", "store lost a fresh entry");
+    store.put("c", "three"); // evicts b: a was just refreshed
+    failures += check(!store.get("b") && store.get("a") && store.get("c") && store.size() == 2,
+                      "store did not evict the least recently used entry");
+    store.put("a", "replaced");
+    failures += check(store.get("a") == "replaced" && store.size() == 2,
+                      "store did not replace an entry in place");
+
+    ninfer::serve::AnthropicReasoningStore tiny(8, 200);
+    tiny.put("big", std::string(10'000, 'x'));
+    failures += check(tiny.size() == 0 && tiny.bytes() == 0,
+                      "store kept text larger than its whole byte budget");
+    tiny.put("s1", std::string(60, 'x'));
+    tiny.put("s2", std::string(60, 'y'));
+    failures += check(tiny.bytes() <= 200, "store exceeded its byte budget");
+    return failures;
 }
 
 int test_aggregate_and_errors() {
@@ -966,6 +1071,8 @@ int main() {
     failures += test_prompt_object_order();
     failures += test_thinking_and_count_tokens();
     failures += test_thinking_history_transport_metadata();
+    failures += test_omitted_thinking_restore();
+    failures += test_reasoning_store();
     failures += test_content_and_cache_hints();
     failures += test_aggregate_and_errors();
     failures += test_tool_call_presentation();

@@ -299,7 +299,7 @@ std::vector<ParsedUserBlock> parse_user_blocks(const Json& content) {
     return result;
 }
 
-ChatTurn parse_assistant_blocks(const Json& content) {
+ChatTurn parse_assistant_blocks(const Json& content, const ReasoningRestore& restore) {
     ChatTurn assistant;
     assistant.role = ChatRole::Assistant;
     for (std::size_t index = 0; index < content.size(); ++index) {
@@ -316,9 +316,17 @@ ChatTurn parse_assistant_blocks(const Json& content) {
             }
             const std::string thinking =
                 require_string(block, "thinking", "messages", "thinking block");
-            // NInfer has no encrypted reasoning state to restore. The wire signature is therefore
-            // intentionally outside the lowered request; only visible Thinking reaches the model.
-            assistant.reasoning_content += thinking;
+            // Visible Thinking is the prompt; the wire signature is otherwise metadata. An empty
+            // block from a display="omitted" response instead restores the reasoning NInfer kept
+            // for its signature. Unknown signatures drop it, as a closed turn would be.
+            if (thinking.empty() && restore && block.contains("signature") &&
+                block.at("signature").is_string()) {
+                if (auto hidden = restore(block.at("signature").get<std::string>())) {
+                    assistant.reasoning_content += *hidden;
+                }
+            } else {
+                assistant.reasoning_content += thinking;
+            }
         } else if (type == "redacted_thinking") {
             if (cache_boundary(block, "messages")) {
                 bad_request("cache_control is not valid on redacted_thinking blocks", "messages",
@@ -551,7 +559,8 @@ void lower_messages(std::vector<ParsedMessage> messages, GenerationRequest& requ
     }
 }
 
-void parse_messages(const Json& body, GenerationRequest& request) {
+void parse_messages(const Json& body, GenerationRequest& request,
+                    const ReasoningRestore& restore) {
     if (!body.contains("messages")) { bad_request("missing required field: messages", "messages"); }
     const Json& messages = body.at("messages");
     if (!messages.is_array() || messages.empty()) {
@@ -610,7 +619,7 @@ void parse_messages(const Json& body, GenerationRequest& request) {
             bad_request("message content must be a string or an array", "messages");
         }
         if (role == ChatRole::Assistant) {
-            message.turn = parse_assistant_blocks(content);
+            message.turn = parse_assistant_blocks(content, restore);
         } else {
             message.user_blocks = parse_user_blocks(content);
         }
@@ -829,9 +838,10 @@ void lower_tools(const Json& body, GenerationRequest& request) {
     }
 }
 
-void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose purpose,
+// Returns whether the request asked for thinking.display="omitted".
+bool parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose purpose,
                     int effective_max_tokens) {
-    if (!body.contains("thinking") || body.at("thinking").is_null()) { return; }
+    if (!body.contains("thinking") || body.at("thinking").is_null()) { return false; }
     const Json& thinking = body.at("thinking");
     if (!thinking.is_object() || !thinking.contains("type") || !thinking.at("type").is_string()) {
         bad_request("thinking must be an object with a string type", "thinking");
@@ -872,12 +882,9 @@ void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose p
             bad_request("thinking.display is valid only when thinking is adaptive or enabled",
                         "thinking");
         }
-        if (purpose == ParsePurpose::Messages && display == "omitted") {
-            bad_request("thinking.display='omitted' requires encrypted hidden-reasoning restore "
-                        "semantics that NInfer does not provide",
-                        "thinking", "thinking_display_not_supported");
-        }
+        return display == "omitted";
     }
+    return false;
 }
 
 void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose purpose) {
@@ -1002,12 +1009,12 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
                       .ttl      = *automatic_ttl};
 }
 
-void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurpose purpose,
-                         int effective_max_tokens) {
+bool parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurpose purpose,
+                         int effective_max_tokens, const ReasoningRestore& restore) {
     lower_tools(body, request);
     parse_system(body, request);
-    parse_messages(body, request);
-    parse_thinking(body, request, purpose, effective_max_tokens);
+    parse_messages(body, request, restore);
+    const bool display_omitted = parse_thinking(body, request, purpose, effective_max_tokens);
     parse_effort(body, request, purpose);
     apply_anthropic_prompt_cache_policy(body, request);
     if (body.contains("container") && !body.at("container").is_null()) {
@@ -1027,12 +1034,14 @@ void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurp
         request.preserve_thinking = body.at("preserve_thinking").get<bool>();
     }
     request.graft = parse_graft_field(body);
+    return display_omitted;
 }
 
 } // namespace
 
 AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
-                                                          const RequestLimits& limits) {
+                                                          const RequestLimits& limits,
+                                                          const ReasoningRestore& restore) {
     require_object(body);
     AnthropicMessagesRequest result;
     result.model                           = parse_model(body);
@@ -1053,20 +1062,21 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
         apply_default_output_limit(result.generation, limits);
     }
 
-    parse_common_prompt(body, result.generation, ParsePurpose::Messages,
-                        result.generation.max_tokens);
+    result.thinking_display_omitted = parse_common_prompt(
+        body, result.generation, ParsePurpose::Messages, result.generation.max_tokens, restore);
     parse_generation_fields(body, result.generation);
     parse_structured_outputs(body, result.generation);
     return result;
 }
 
-AnthropicCountTokensRequest parse_anthropic_count_tokens_request(const Json& body) {
+AnthropicCountTokensRequest parse_anthropic_count_tokens_request(const Json& body,
+                                                                 const ReasoningRestore& restore) {
     require_object(body);
     AnthropicCountTokensRequest result;
     result.model                           = parse_model(body);
     result.generation.tool_name_max_length = kMaxToolNameLength;
     parse_common_prompt(body, result.generation, ParsePurpose::CountTokens,
-                        std::numeric_limits<int>::max());
+                        std::numeric_limits<int>::max(), restore);
     return result;
 }
 

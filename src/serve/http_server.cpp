@@ -224,6 +224,8 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
                                              options_.response_store_max_records,
                                              options_.response_store_max_bytes)),
       openai_responses_store_(*responses_store_),
+      anthropic_reasoning_store_(options_.response_store_max_records,
+                                 options_.response_store_max_bytes),
       operational_log_(logger),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
     // cpp-httplib is thread-per-connection: a worker is held for a connection's whole

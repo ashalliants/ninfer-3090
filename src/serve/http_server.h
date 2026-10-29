@@ -1,5 +1,7 @@
 #pragma once
 
+#include "serve/anthropic_messages.h"
+#include "serve/anthropic_reasoning_store.h"
 #include "serve/generation_service.h"
 #include "serve/load_report.h"
 #include "serve/metrics.h"
@@ -114,6 +116,10 @@ private:
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
+    // Restores reasoning hidden by thinking.display="omitted" from the signature a client echoes.
+    ReasoningRestore reasoning_restore();
+    void stash_hidden_reasoning(const AnthropicResponseIdentity& identity,
+                                const GenerationOutcome& outcome, bool hidden);
     void handle_responses(const httplib::Request& req, httplib::Response& res);
     void handle_response_input_tokens(const httplib::Request& req, httplib::Response& res);
     void handle_response_get(const httplib::Request& req, httplib::Response& res);
@@ -157,6 +163,7 @@ private:
     std::chrono::steady_clock::time_point attached_at_;
     std::shared_ptr<OpenAIResponsesStore> responses_store_;
     OpenAIResponsesStore& openai_responses_store_;
+    AnthropicReasoningStore anthropic_reasoning_store_;
     OperationalLog operational_log_;
     JsonlRequestLog request_jsonl_;
     Metrics metrics_;
