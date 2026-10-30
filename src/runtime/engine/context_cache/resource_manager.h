@@ -821,7 +821,8 @@ public:
                 // The Host destination can fail on allocation geometry although the byte
                 // quote fit. Superseded Host history goes before a live source is deleted;
                 // the demotion is quoted again on the next pass.
-                if (release_superseded_host(program, plan.host_bytes, protected_sources, cursor)) {
+                if (release_superseded_host(program, plan.host_bytes, protected_sources, cursor,
+                                            needs_state_run(plan))) {
                     return ReclaimProgress::Changed;
                 }
                 continue;
@@ -1175,7 +1176,12 @@ private:
 
     // Releases superseded-only checkpoints, in reclaim order, until `bytes` of Host are free.
     bool release_superseded_host(Program& program, std::size_t bytes,
-                                 std::span<const Handle> excluded, ReclaimCursor& cursor) {
+                                 std::span<const Handle> excluded, ReclaimCursor& cursor,
+                                 bool state_run = false) {
+        const auto host_bytes_released = [&](std::span<const Handle> handles) {
+            return state_run ? state_bytes_released(program, handles)
+                             : program.host_bytes_released(handles);
+        };
         std::vector<Handle> chosen;
         for (const auto& victim : cursor.victims) {
             const auto handle = victim.handle;
@@ -1185,15 +1191,15 @@ private:
                 continue;
             }
             chosen.push_back(handle);
-            if (program.host_bytes_released(chosen) >= bytes) { break; }
+            if (host_bytes_released(chosen) >= bytes) { break; }
         }
         // Drop victims that add no Host release (keeps aliased blocks released as a union), so
         // Device/KV-only superseded history is not erased for a Host allocation it cannot help.
-        auto released = program.host_bytes_released(chosen);
+        auto released = host_bytes_released(chosen);
         for (std::size_t i = chosen.size(); i-- > 0;) {
             auto without = chosen;
             without.erase(without.begin() + static_cast<std::ptrdiff_t>(i));
-            if (!without.empty() && program.host_bytes_released(without) >= released) {
+            if (!without.empty() && host_bytes_released(without) >= released) {
                 chosen = std::move(without);
             }
         }
@@ -1451,6 +1457,7 @@ private:
     struct CandidateMemo {
         std::vector<Handle> sources;
         std::optional<std::size_t> host_bytes;
+        std::optional<std::size_t> state_bytes{}; // whole state images only, for a state run
         std::optional<ActionFacts> facts;
     };
 
@@ -1800,7 +1807,25 @@ private:
         protected_sources.insert(protected_sources.end(), plan.sources.begin(), plan.sources.end());
         return host_victims_in_order(program, plan.host_bytes, preservation.checkpoint, {},
                                      protected_sources, preservation, cursor, evaluation, false,
-                                     plan.host_placeable);
+                                     plan.host_placeable, needs_state_run(plan));
+    }
+
+    // A Host state image takes one contiguous run. When the quote can place none, freeing bytes is
+    // not enough: KV pages released from scattered runs may leave no run an image fits (#304).
+    template <class Demotion>
+    [[nodiscard]] static bool needs_state_run(const Demotion& plan) {
+        return plan.released.state_slots && plan.host_bytes > plan.host_placeable;
+    }
+
+    // Host bytes of the whole state images releasing `handles` frees: each leaves a run that fits
+    // any other image. Programs without separate image runs count every released byte.
+    [[nodiscard]] static std::size_t state_bytes_released(Program& program,
+                                                          std::span<const Handle> handles) {
+        if constexpr (requires { program.host_state_bytes_released(handles); }) {
+            return program.host_state_bytes_released(handles);
+        } else {
+            return program.host_bytes_released(handles);
+        }
     }
 
     [[nodiscard]] std::optional<std::vector<Handle>>
@@ -1808,7 +1833,7 @@ private:
                           std::span<const Handle> later_snapshots, std::span<const Handle> excluded,
                           std::optional<Admission> admission, const ReclaimCursor& cursor,
                           Evaluation& evaluation, bool bytes_are_shortage = false,
-                          std::size_t placeable = SIZE_MAX) const {
+                          std::size_t placeable = SIZE_MAX, bool state_run = false) const {
         const auto usage = program.physical_usage();
         const auto free =
             std::min<std::size_t>(usage.capacity.host_bytes - usage.occupied.host_bytes, placeable);
@@ -1858,12 +1883,17 @@ private:
                 // the checkpoint count.
                 CandidateMemo* const memo =
                     candidate_memo_ ? candidate_memo(evaluation, combined) : nullptr;
+                const auto released_by = [&] {
+                    return state_run ? state_bytes_released(program, combined)
+                                     : program.host_bytes_released(combined);
+                };
                 std::size_t amount;
                 if (memo) {
-                    if (!memo->host_bytes) { memo->host_bytes = program.host_bytes_released(combined); }
-                    amount = *memo->host_bytes;
+                    auto& cached = state_run ? memo->state_bytes : memo->host_bytes;
+                    if (!cached) { cached = released_by(); }
+                    amount = *cached;
                 } else {
-                    amount = program.host_bytes_released(combined);
+                    amount = released_by();
                 }
                 if (amount <= released) { continue; }
                 ActionFacts uncached;
