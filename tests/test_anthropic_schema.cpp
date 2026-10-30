@@ -717,7 +717,11 @@ int test_omitted_thinking_restore() {
 
     ninfer::serve::AnthropicReasoningStore store(8, 1 << 20);
     store.put(signature, "hidden thought");
-    const ReasoningRestore restore = [&](const std::string& value) { return store.get(value); };
+    const ReasoningRestore restore = [&](const std::string& value) -> std::optional<std::string> {
+        const auto found = store.get(value);
+        if (!found) { return std::nullopt; }
+        return *found;
+    };
     failures += check(parse_anthropic_messages_request(body, limits(), restore)
                               .generation.messages[1]
                               .reasoning_content == "hidden thought",
@@ -779,12 +783,12 @@ int test_reasoning_store() {
     ninfer::serve::AnthropicReasoningStore store(2, 1 << 20);
     store.put("a", "one");
     store.put("b", "two");
-    int failures = check(store.get("a") == "one", "store lost a fresh entry");
+    int failures = check(store.get("a") && *store.get("a") == "one", "store lost a fresh entry");
     store.put("c", "three"); // evicts b: a was just refreshed
     failures += check(!store.get("b") && store.get("a") && store.get("c") && store.size() == 2,
                       "store did not evict the least recently used entry");
     store.put("a", "replaced");
-    failures += check(store.get("a") == "replaced" && store.size() == 2,
+    failures += check(store.get("a") && *store.get("a") == "replaced" && store.size() == 2,
                       "store did not replace an entry in place");
 
     ninfer::serve::AnthropicReasoningStore tiny(8, 200);

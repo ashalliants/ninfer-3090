@@ -46,8 +46,10 @@ class HttpServer {
 public:
     // `responses_store` lets the owner keep stored Responses across this server's lifetime (the
     // router reloads a model into a fresh server); by default the server owns a store of its own.
+    // `reasoning_store` does the same for reasoning hidden by Anthropic thinking.display="omitted".
     HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger,
-               std::shared_ptr<OpenAIResponsesStore> responses_store = nullptr);
+               std::shared_ptr<OpenAIResponsesStore> responses_store = nullptr,
+               std::shared_ptr<AnthropicReasoningStore> reasoning_store = nullptr);
     // Stops and joins the startup listener if it is still running. Without this, a failure between
     // start_serving_during_startup() and listen() -- the Engine throwing while loading weights, the
     // most likely failure there is -- would destroy a joinable std::thread and call std::terminate,
@@ -163,7 +165,7 @@ private:
     std::chrono::steady_clock::time_point attached_at_;
     std::shared_ptr<OpenAIResponsesStore> responses_store_;
     OpenAIResponsesStore& openai_responses_store_;
-    AnthropicReasoningStore anthropic_reasoning_store_;
+    std::shared_ptr<AnthropicReasoningStore> anthropic_reasoning_store_;
     OperationalLog operational_log_;
     JsonlRequestLog request_jsonl_;
     Metrics metrics_;

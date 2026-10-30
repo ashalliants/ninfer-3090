@@ -12,10 +12,10 @@ std::size_t AnthropicReasoningStore::entry_bytes(const std::string& signature,
     return sizeof(Entry) + signature.size() * 2U + reasoning.size();
 }
 
-std::optional<std::string> AnthropicReasoningStore::get(const std::string& signature) {
+std::shared_ptr<const std::string> AnthropicReasoningStore::get(const std::string& signature) {
     const std::lock_guard lock(mutex_);
     const auto found = records_.find(signature);
-    if (found == records_.end()) { return std::nullopt; }
+    if (found == records_.end()) { return nullptr; }
     lru_.splice(lru_.begin(), lru_, found->second.lru);
     return found->second.reasoning;
 }
@@ -32,7 +32,8 @@ void AnthropicReasoningStore::put(const std::string& signature, std::string reas
     }
     lru_.push_front(signature);
     current_bytes_ += bytes;
-    records_.emplace(signature, Entry{std::move(reasoning), lru_.begin()});
+    records_.emplace(signature,
+                     Entry{std::make_shared<const std::string>(std::move(reasoning)), lru_.begin()});
 }
 
 std::size_t AnthropicReasoningStore::size() const {
@@ -47,7 +48,7 @@ std::size_t AnthropicReasoningStore::bytes() const {
 
 void AnthropicReasoningStore::erase_locked(
     std::unordered_map<std::string, Entry>::iterator entry) {
-    current_bytes_ -= entry_bytes(entry->first, entry->second.reasoning);
+    current_bytes_ -= entry_bytes(entry->first, *entry->second.reasoning);
     lru_.erase(entry->second.lru);
     records_.erase(entry);
 }

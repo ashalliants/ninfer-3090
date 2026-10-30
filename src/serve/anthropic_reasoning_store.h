@@ -4,12 +4,13 @@
 // thinking.display="omitted". The block's signature is the response message id, so a client that
 // replays the empty block lets the next prompt restore the exact reasoning text. Restoring it keeps
 // the rendered prompt byte-identical to the tokens the Engine already cached. A miss (restart,
-// eviction, foreign signature) only costs that cache reuse.
+// eviction, foreign signature) only costs that cache reuse. The router owns one store per model so
+// it survives an unload or rebuild of that model's server.
 
 #include <cstddef>
 #include <list>
+#include <memory>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -19,8 +20,9 @@ class AnthropicReasoningStore {
 public:
     AnthropicReasoningStore(std::size_t max_records, std::size_t max_bytes);
 
-    // get() refreshes LRU recency.
-    [[nodiscard]] std::optional<std::string> get(const std::string& signature);
+    // get() refreshes LRU recency. The text is shared and immutable, so it stays valid after
+    // eviction and callers copy it outside the store's lock. Null on a miss.
+    [[nodiscard]] std::shared_ptr<const std::string> get(const std::string& signature);
     // Replaces an existing entry. Text larger than the whole byte budget is not stored.
     void put(const std::string& signature, std::string reasoning);
 
@@ -29,7 +31,7 @@ public:
 
 private:
     struct Entry {
-        std::string reasoning;
+        std::shared_ptr<const std::string> reasoning;
         std::list<std::string>::iterator lru;
     };
 

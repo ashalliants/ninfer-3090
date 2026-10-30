@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -15,13 +16,17 @@
 namespace ninfer::serve {
 
 ReasoningRestore HttpServer::reasoning_restore() {
-    return [this](const std::string& signature) { return anthropic_reasoning_store_.get(signature); };
+    return [this](const std::string& signature) -> std::optional<std::string> {
+        const std::shared_ptr<const std::string> found = anthropic_reasoning_store_->get(signature);
+        if (!found) { return std::nullopt; }
+        return *found;
+    };
 }
 
 void HttpServer::stash_hidden_reasoning(const AnthropicResponseIdentity& identity,
                                         const GenerationOutcome& outcome, bool hidden) {
     if (hidden && !outcome.reasoning.empty()) {
-        anthropic_reasoning_store_.put(identity.message_id, outcome.reasoning);
+        anthropic_reasoning_store_->put(identity.message_id, outcome.reasoning);
     }
 }
 
