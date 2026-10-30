@@ -17,6 +17,12 @@ inline constexpr std::size_t kDefaultMaxRequestBytes      = 384ULL << 20;
 inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
 inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 
+// Hidden reasoning is plain text, small next to the Responses store's envelopes and contexts, so
+// its byte budget is a fraction of the response store's rather than a second full copy of it.
+constexpr std::size_t reasoning_store_max_bytes(std::size_t response_store_max_bytes) noexcept {
+    return response_store_max_bytes / 16U;
+}
+
 struct ServeOptions {
     bool help_requested = false;
     std::string artifact_path;

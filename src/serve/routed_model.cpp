@@ -25,7 +25,8 @@ std::optional<int> RoutedPorts::get(const std::string& model) const {
 RoutedModelService::RoutedModelService(std::string id, std::unique_ptr<GenerationService> service,
                                        std::shared_ptr<spdlog::logger> logger,
                                        std::shared_ptr<RoutedPorts> ports,
-                                       std::shared_ptr<OpenAIResponsesStore> responses_store)
+                                       std::shared_ptr<OpenAIResponsesStore> responses_store,
+                                       std::shared_ptr<AnthropicReasoningStore> reasoning_store)
     : id_(std::move(id)), service_(std::move(service)), ports_(std::move(ports)) {
     // The router owns the public address and the API key; a model answers on loopback to the router
     // alone, so it needs neither.
@@ -35,7 +36,7 @@ RoutedModelService::RoutedModelService(std::string id, std::unique_ptr<Generatio
     options.api_key.clear();
     options.model_id_override = id_;
     server_                   = std::make_unique<HttpServer>(std::move(options), std::move(logger),
-                                                 std::move(responses_store));
+                                                 std::move(responses_store), std::move(reasoning_store));
     port_                     = server_->bind_any_port();
     if (port_ == 0) { throw std::runtime_error("cannot bind a loopback port for model " + id_); }
     server_->start_serving_during_startup();

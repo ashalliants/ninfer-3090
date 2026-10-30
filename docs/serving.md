@@ -1899,8 +1899,13 @@ Thinking supports `disabled`, `adaptive`, and `enabled`; `between_tools` returns
 Thinking is returned with an opaque local signature; SSE emits its `signature_delta` before
 closing the block. Assistant Thinking blocks must be passed back unmodified with that signature;
 signatures belong to the current serve process and are invalid after it restarts.
-`display:"omitted"` is rejected because NInfer cannot provide Anthropic's
-encrypted hidden-reasoning restore semantics. `preserve_thinking` remains a NInfer extension for
+`display:"omitted"` returns Thinking blocks with empty text and the signature; the
+reasoning stays in a bounded process-local store (one sixteenth of the response store byte limit, same record limit) keyed by that
+signature. A client that replays the empty block gets the exact reasoning back in the prompt, so
+the rendered prompt matches the cached tokens and prefix reuse survives tool loops. After a restart,
+an eviction or a foreign signature the reasoning is dropped like a closed turn: output stays
+correct, but reuse is lost from that turn. Reasoning tokens still count in `output_tokens`.
+`preserve_thinking` remains a NInfer extension for
 closed-turn reasoning history, and `graft` selects a [prompt graft](#prompt-grafts). `output_config.effort` passes its protocol-validated value to the
 selected template. `output_config.format` accepts JSON Schema output as described in
 [Output constraints](#output-constraints).

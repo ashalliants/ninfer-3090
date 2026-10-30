@@ -188,11 +188,19 @@ int run_router(const char* argv0, const ninfer::serve::ServeOptions& options,
         const auto ports = std::make_shared<ninfer::serve::RoutedPorts>();
         // Stored Responses outlive an unload: the store holds no Engine state, so a reloaded model
         // still answers previous_response_id and response lookups.
+        // Hidden Anthropic reasoning is kept the same way, so a replay after an unload still hits.
         std::map<std::string, std::shared_ptr<ninfer::serve::OpenAIResponsesStore>> response_stores;
+        std::map<std::string, std::shared_ptr<ninfer::serve::AnthropicReasoningStore>>
+            reasoning_stores;
         for (const auto& definition : definitions) {
             response_stores[definition.id] = std::make_shared<ninfer::serve::OpenAIResponsesStore>(
                 definition.options.response_store_max_records,
                 definition.options.response_store_max_bytes);
+            reasoning_stores[definition.id] =
+                std::make_shared<ninfer::serve::AnthropicReasoningStore>(
+                    definition.options.response_store_max_records,
+                    ninfer::serve::reasoning_store_max_bytes(
+                        definition.options.response_store_max_bytes));
         }
         ninfer::serve::ModelRegistry registry(
             std::move(definitions),
@@ -206,7 +214,7 @@ int run_router(const char* argv0, const ninfer::serve::ServeOptions& options,
                 try {
                     return std::make_unique<ninfer::serve::RoutedModelService>(
                         definition.id, make_service(definition.options), logger, ports,
-                        response_stores.at(definition.id));
+                        response_stores.at(definition.id), reasoning_stores.at(definition.id));
                 } catch (const std::exception& exception) {
                     logger->error("model '{}' failed to load: {}", definition.id,
                                   exception.what());
