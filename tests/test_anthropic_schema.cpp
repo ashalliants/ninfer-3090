@@ -733,7 +733,7 @@ int test_omitted_thinking_restore() {
 
     Json prefill = body;
     prefill["messages"].erase(prefill["messages"].size() - 1U);
-    failures += check(parse_anthropic_messages_request(prefill, limits(), restore).continuation ==
+    failures += check(parse_anthropic_messages_request(prefill, limits(), restore).generation.continuation ==
                           ninfer::PromptContinuationMode::ContinueFinalAssistant,
                       "a stored signature turned a final assistant prefill into a 400");
 
