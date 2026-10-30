@@ -31,9 +31,14 @@ void AnthropicReasoningStore::put(const std::string& signature, std::string reas
         erase_locked(records_.find(lru_.back()));
     }
     lru_.push_front(signature);
+    try {
+        records_.emplace(
+            signature, Entry{std::make_shared<const std::string>(std::move(reasoning)), lru_.begin()});
+    } catch (...) {
+        lru_.pop_front();
+        throw;
+    }
     current_bytes_ += bytes;
-    records_.emplace(signature,
-                     Entry{std::make_shared<const std::string>(std::move(reasoning)), lru_.begin()});
 }
 
 std::size_t AnthropicReasoningStore::size() const {

@@ -228,7 +228,8 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
       anthropic_reasoning_store_(reasoning_store ? std::move(reasoning_store)
                                                  : std::make_shared<AnthropicReasoningStore>(
                                                        options_.response_store_max_records,
-                                                       options_.response_store_max_bytes)),
+                                                       reasoning_store_max_bytes(
+                                                           options_.response_store_max_bytes))),
       operational_log_(logger),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
     // cpp-httplib is thread-per-connection: a worker is held for a connection's whole

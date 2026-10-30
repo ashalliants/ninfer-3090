@@ -196,7 +196,8 @@ int run_router(const char* argv0, const ninfer::serve::ServeOptions& options,
             reasoning_stores[definition.id] =
                 std::make_shared<ninfer::serve::AnthropicReasoningStore>(
                     definition.options.response_store_max_records,
-                    definition.options.response_store_max_bytes);
+                    ninfer::serve::reasoning_store_max_bytes(
+                        definition.options.response_store_max_bytes));
         }
         ninfer::serve::ModelRegistry registry(
             std::move(definitions),

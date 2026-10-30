@@ -1787,7 +1787,7 @@ Thinking is returned with an opaque local signature; SSE emits its `signature_de
 closing the block. Assistant Thinking blocks must be passed back unmodified with that signature;
 signatures belong to the current serve process and are invalid after it restarts.
 `display:"omitted"` returns Thinking blocks with empty text and the signature; the
-reasoning stays in a bounded process-local store (sized by the response store limits) keyed by that
+reasoning stays in a bounded process-local store (one sixteenth of the response store byte limit, same record limit) keyed by that
 signature. A client that replays the empty block gets the exact reasoning back in the prompt, so
 the rendered prompt matches the cached tokens and prefix reuse survives tool loops. After a restart,
 an eviction or a foreign signature the reasoning is dropped like a closed turn: output stays

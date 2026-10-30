@@ -731,6 +731,12 @@ int test_omitted_thinking_restore() {
                               .reasoning_content == "hidden thought",
                       "Count Tokens did not restore the stored reasoning");
 
+    Json prefill = body;
+    prefill["messages"].erase(prefill["messages"].size() - 1U);
+    failures += check(parse_anthropic_messages_request(prefill, limits(), restore).continuation ==
+                          ninfer::PromptContinuationMode::ContinueFinalAssistant,
+                      "a stored signature turned a final assistant prefill into a 400");
+
     Json unknown                                      = body;
     unknown["messages"][1]["content"][0]["signature"] = "msg_unknown";
     failures += check(parse_anthropic_messages_request(unknown, limits(), restore)

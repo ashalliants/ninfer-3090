@@ -619,7 +619,10 @@ void parse_messages(const Json& body, GenerationRequest& request,
             bad_request("message content must be a string or an array", "messages");
         }
         if (role == ChatRole::Assistant) {
-            message.turn = parse_assistant_blocks(content, restore);
+            // A trailing assistant turn is a prefill, which must be text only: restoring hidden
+            // reasoning into it would make the request fail only while the store still has it.
+            const bool prefill = index + 1U == messages.size();
+            message.turn       = parse_assistant_blocks(content, prefill ? ReasoningRestore{} : restore);
         } else {
             message.user_blocks = parse_user_blocks(content);
         }
