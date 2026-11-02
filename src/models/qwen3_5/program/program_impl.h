@@ -350,9 +350,11 @@ public:
     void refresh_history_requirements(const std::shared_ptr<KVHistory>&, bool trim_unused = false);
     [[nodiscard]] bool revoke_snapshot(ResumeState&) noexcept;
     [[nodiscard]] runtime::ContextResourceUsage snapshot_resources(const ResumeState& paused) const;
-    // Exact Host bytes freed by deleting this fixed set, with physical sharing counted once.
+    // Exact Host bytes freed by deleting this fixed set, with physical sharing counted once; with
+    // state_images_only, only those of the whole Host state images it frees.
     [[nodiscard]] std::size_t
-    host_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
+    host_bytes_released(std::span<const CheckpointHandle> checkpoints,
+                        bool state_images_only = false) const;
     [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle sequence) const;
     [[nodiscard]] std::size_t pause_state_image_unplaced(SequenceHandle sequence) const;
     [[nodiscard]] bool pause_snapshot_fits(SequenceHandle sequence) const;

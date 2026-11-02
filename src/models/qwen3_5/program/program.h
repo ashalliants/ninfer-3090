@@ -536,6 +536,10 @@ public:
     // Exact Host bytes freed by deleting this fixed set, with physical sharing counted once.
     [[nodiscard]] std::size_t
     host_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
+    // Host bytes of the whole state images releasing these checkpoints frees. Each such image
+    // leaves a run that fits any other, which scattered KV bytes do not.
+    [[nodiscard]] std::size_t
+    host_state_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
     [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle sequence) const;
     // Bytes of state image a pause could not place in one contiguous Host run right now; 0 when it
     // is already on the Host or a run exists.

@@ -86,6 +86,7 @@ struct Program {
     struct HostBlock {
         std::size_t bytes;
         bool external_reference;
+        bool image = false;
     };
 
     struct Metadata {
@@ -127,9 +128,47 @@ struct Program {
     mutable std::uint64_t host_bytes_released_calls = 0;
     mutable std::uint64_t recovery_loss_calls       = 0;
 
-    std::size_t host_block(std::size_t bytes, bool external_reference = false) {
-        blocks.push_back({bytes, external_reference});
+    // Host state images of image_bytes each take one contiguous run (0: no such model). Free runs
+    // that fit one are image_runs plus those released images leave, less images placed since.
+    std::size_t image_bytes   = 0;
+    std::size_t image_runs    = 0;
+    std::size_t placed_images = 0;
+
+    std::size_t host_block(std::size_t bytes, bool external_reference = false, bool image = false) {
+        blocks.push_back({bytes, external_reference, image});
         return blocks.size() - 1;
+    }
+
+    [[nodiscard]] std::size_t free_image_runs() const {
+        std::size_t freed = 0;
+        for (std::size_t block = 0; block < blocks.size(); ++block) {
+            if (blocks[block].image && !blocks[block].external_reference &&
+                std::none_of(contents.begin(), contents.end(),
+                             [&](const auto& content) { return references(content, block); })) {
+                ++freed;
+            }
+        }
+        return image_runs + freed - std::min(image_runs + freed, placed_images);
+    }
+
+    [[nodiscard]] std::size_t host_state_bytes_released(std::span<const Handle> victims) const {
+        if (!image_bytes) { return host_bytes_released(victims); } // no image runs modelled
+        std::size_t bytes = 0;
+        for (std::size_t block = 0; block < blocks.size(); ++block) {
+            if (!blocks[block].image || blocks[block].external_reference) { continue; }
+            bool referenced = false;
+            bool survives   = false;
+            for (std::uint32_t index = 0; index < contents.size(); ++index) {
+                if (!references(contents[index], block)) { continue; }
+                referenced = true;
+                if (!contents[index].evictable ||
+                    std::find(victims.begin(), victims.end(), Handle{index}) == victims.end()) {
+                    survives = true;
+                }
+            }
+            if (referenced && !survives) { bytes += blocks[block].bytes; }
+        }
+        return bytes;
     }
 
     Handle add(Key tokens, std::vector<std::size_t> host_blocks = {},
@@ -359,7 +398,9 @@ struct Program {
                      ? std::vector<std::pair<Handle, std::uint32_t>>{{handle,
                                                                       released.main_kv_pages}}
                      : std::vector<std::pair<Handle, std::uint32_t>>{},
-                 host_placeable()});
+                 released.state_slots && image_bytes
+                     ? std::min(host_placeable(), free_image_runs() * image_bytes)
+                     : host_placeable()});
         }
         return result;
     }
@@ -518,7 +559,8 @@ struct Program {
                         [&](auto handle) { return contents.at(handle.index).demotion_blocked; })) {
             return false;
         }
-        if (plan.host_bytes > host_placeable()) {
+        const bool image = image_bytes && plan.released.state_slots && plan.host_bytes;
+        if (plan.host_bytes > host_placeable() || (image && !free_image_runs())) {
             ++placement_failures;
             return false;
         }
@@ -532,7 +574,10 @@ struct Program {
             }
         } else {
             auto& content = contents.at(plan.handle.index);
-            if (plan.host_bytes) { content.host_blocks.push_back(host_block(plan.host_bytes)); }
+            if (plan.host_bytes) {
+                content.host_blocks.push_back(host_block(plan.host_bytes, false, image));
+            }
+            if (image) { ++placed_images; }
             if (plan.released.state_slots) { content.device_state = false; }
             demoted.push_back(plan.handle);
         }
@@ -2146,6 +2191,55 @@ void test_demotion_quotes_only_placeable_host_bytes() {
             "an unplaceable demotion was attempted on every reclaim pass");
 }
 
+// A Host state image takes one contiguous run (#304). Free Host bytes can all sit in runs shorter
+// than an image while the quote's placeable bytes are 0, so the demotion must displace Host
+// history. Releasing scattered KV pages frees enough bytes but no run, and the image still fails
+// to place; only a whole released image leaves a run another image fits, even when KV history
+// ranks first.
+void test_state_demotion_releases_a_whole_image_when_no_run_fits() {
+    Fixture f(64);
+    f.program.image_bytes = 16;
+    const auto kv =
+        f.program.add(tokens(4, 6000), {f.program.host_block(8), f.program.host_block(8)});
+    const auto image = f.program.add(tokens(8, 7000), {f.program.host_block(16, false, true)});
+    for (const auto handle : {kv, image}) {
+        f.program.contents[handle.index].device_state = false;
+        f.program.contents[handle.index].main_pages   = 0;
+        f.publish(handle);
+    }
+    const auto live                               = f.program.add(tokens(1000));
+    f.program.contents[live.index].demotion_bytes = 16;
+    f.publish(live);
+    const auto usage = f.program.physical_usage();
+    require(usage.capacity.host_bytes - usage.occupied.host_bytes >= 16 &&
+                f.program.free_image_runs() == 0,
+            "fixture must have free bytes but no run for an image");
+    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                f.program.demoted == std::vector<Handle>{live} &&
+                f.program.released == std::vector<Handle>{image} &&
+                f.program.contents[kv.index].alive && f.program.placement_failures == 0,
+            "a state demotion released scattered KV bytes that leave no run for its image");
+
+    // With a free image run the demotion displaces nothing, as before.
+    Fixture fits(64);
+    fits.program.image_bytes = 16;
+    fits.program.image_runs  = 1;
+    const auto resident =
+        fits.program.add(tokens(8, 7000), {fits.program.host_block(16, false, true)});
+    fits.program.contents[resident.index].device_state = false;
+    fits.program.contents[resident.index].main_pages   = 0;
+    fits.publish(resident);
+    const auto incoming                                  = fits.program.add(tokens(1000));
+    fits.program.contents[incoming.index].demotion_bytes = 16;
+    fits.publish(incoming);
+    require(fits.cache.reclaim(fits.program, {.state_slots = 1}) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                fits.program.demoted == std::vector<Handle>{incoming} &&
+                fits.program.released.empty() && fits.program.placement_failures == 0,
+            "a state demotion with a free image run displaced Host history");
+}
+
 void test_failed_demotion_releases_superseded_history_before_the_live_branch() {
     // Host: the abandoned endpoint and two external 16-byte residents; 16 bytes stay free.
     Fixture f(64);
@@ -2557,6 +2651,7 @@ int main() {
         test_delayed_older_rewrite_does_not_supersede_a_newer_owner();
         test_failed_demotion_releases_superseded_history_before_the_live_branch();
         test_demotion_quotes_only_placeable_host_bytes();
+        test_state_demotion_releases_a_whole_image_when_no_run_fits();
         test_inherited_owner_heat_cannot_spend_a_full_other_continuation();
         test_exact_repeated_candidate_can_replace_a_long_hotspot_with_common_fallback();
         test_old_candidate_demand_cannot_borrow_a_new_owner_epoch();
