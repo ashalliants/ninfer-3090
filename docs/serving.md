@@ -645,7 +645,13 @@ The local directory becomes a cache of the bucket.
   never sent, so a burst of turns (a short `--context-store-idle-seconds` writes several per
   request) costs one upload. A conversation that keeps going is still uploaded at least that often.
   Once a session is in the bucket, the earlier turns it superseded are deleted from it, so the
-  bucket holds one session per conversation and a new engine lists only those.
+  bucket holds one session per conversation and a new engine lists only those. Before the later
+  turn's manifest is published, an empty marker `tombstones/<id>.<created>` is written for each
+  version it retires (the version is the id plus the creation time inside its manifest). No engine
+  registers a marked version, puts it back when it repairs a manifest the bucket lost, or uploads it
+  from a queue, so another engine that still holds an older turn cannot bring it back, and a delete
+  lost to a crash is not undone by the next start. A session saved again under the same id later is a
+  new version and is not affected. The markers are tiny and expire under the same lifecycle rule.
 - The bucket's keys sit under a folder named by a hash of the model, configuration and artifact
   (the store's binding), so an engine lists only sessions it could use.
 - At start-up, and every minute after, the engine lists the bucket and registers sessions it does

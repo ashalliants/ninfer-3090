@@ -200,6 +200,9 @@ public:
         // Superseded images whose manifests were deleted from the bucket, and queued uploads that
         // a newer write of the same conversation made unnecessary.
         std::uint64_t remote_retired          = 0;
+        // Manifests that were not registered, republished or uploaded because a tombstone in the
+        // bucket says that version was retired by a newer write of its conversation.
+        std::uint64_t remote_fenced           = 0;
         std::uint64_t remote_uploads_skipped  = 0;
         // Queued uploads given up to keep the files they hold within the limits (the queue's
         // length, or max_bytes); their images are uploaded at their next write.
@@ -390,6 +393,12 @@ private:
         bool compressed     = false;
         std::uint64_t bytes = 0; // file size
     };
+    // A manifest version a write superseded: its id and the created_ms inside it, which together
+    // name the tombstone `tombstones/<id>.<created_ms>`.
+    struct Retirement {
+        std::string id;
+        std::int64_t created_ms = 0;
+    };
     struct RemoteTask {
         enum class Kind : std::uint8_t { Upload, Refresh, Prefetch, Touch } kind;
         std::string id;
@@ -399,12 +408,14 @@ private:
         std::vector<ChunkRef> chunks;
         // Upload: images this one superseded, whose manifests are deleted from the bucket once
         // this one's manifest is there.
-        std::vector<std::string> retire;
+        std::vector<Retirement> retire;
         // Upload: not started before this, unless a flush is waiting.
         std::chrono::steady_clock::time_point ready{};
         // Upload: the entry generation the manifest describes; that entry is marked published when
         // the upload succeeds.
         std::uint64_t generation = 0;
+        // Upload: the created_ms inside the manifest (names its tombstone).
+        std::int64_t created_ms = 0;
     };
 
     [[nodiscard]] std::filesystem::path manifest_path(const std::string& id) const;
@@ -500,12 +511,18 @@ private:
     void enqueue_remote(RemoteTask task);
     // `superseded`: images this write superseded. Their queued uploads are dropped and their
     // manifests are deleted from the bucket after this upload.
-    void enqueue_upload(const std::string& id, std::uint64_t generation,
+    void enqueue_upload(const std::string& id, std::uint64_t generation, std::int64_t created_ms,
                         std::vector<std::uint8_t> manifest, std::vector<ChunkRef> chunks,
-                        std::vector<std::string> superseded);
+                        std::vector<Retirement> superseded);
     // A replacement that will not be published (its upload failed or was dropped): the images it
     // was to retire may be registered from the bucket again. Called with remote_mutex_ held.
-    void release_retirements_locked(const std::vector<std::string>& ids);
+    void release_retirements_locked(const std::vector<Retirement>& retirements);
+    // The tombstone that says the manifest version (`id`, `created_ms`) was retired. An engine
+    // that still holds a retired version must not put it back in the bucket, and none registers
+    // it from there. A version is named by the id and the created_ms inside the manifest, so an
+    // id written again later (a new version) is not fenced.
+    [[nodiscard]] std::string remote_tombstone_key(const std::string& id, std::int64_t created_ms) const;
+    [[nodiscard]] bool remote_fenced(const std::string& id, std::int64_t created_ms);
     void unpin_chunks_locked(const std::vector<ChunkRef>& chunks);
     void remote_loop();
     void upload_image(RemoteTask& task);

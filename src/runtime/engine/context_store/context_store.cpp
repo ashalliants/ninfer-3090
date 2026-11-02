@@ -1389,7 +1389,7 @@ ContextStore::PutResult ContextStore::put(const Description& description,
         }
         if (had_previous) { release_references(replaced); }
         write_used(description.id, now);
-        std::vector<std::string> superseded;
+        std::vector<Retirement> superseded;
         std::vector<std::string> prefixes_used;
         if (!description.prefix_digests.empty()) {
             for (auto& [other_id, other] : entries_) {
@@ -1418,7 +1418,7 @@ ContextStore::PutResult ContextStore::put(const Description& description,
                     prefixes_used.push_back(other_id);
                     continue;
                 }
-                superseded.push_back(other_id);
+                superseded.push_back({other_id, other.info.created_ms});
             }
             if (options_.remote) {
                 // Restarts the bucket copy's age (at most once a day per image).
@@ -1426,16 +1426,16 @@ ContextStore::PutResult ContextStore::put(const Description& description,
                     enqueue_remote({RemoteTask::Kind::Touch, prefix, {}, {}, {}, {}});
                 }
             }
-            for (const std::string& other_id : superseded) {
-                remove_entry_locked(other_id, false);
+            for (const Retirement& other : superseded) {
+                remove_entry_locked(other.id, false);
                 ++stats_.superseded;
             }
             if (options_.remote && !superseded.empty()) {
                 // Until this image's upload deletes their manifests from the bucket, a refresh
                 // must not register them again.
                 std::scoped_lock remote_lock(remote_mutex_);
-                for (const std::string& other_id : superseded) {
-                    remote_failed_[other_id] = {std::numeric_limits<std::int64_t>::max(), now};
+                for (const Retirement& other : superseded) {
+                    remote_failed_[other.id] = {std::numeric_limits<std::int64_t>::max(), now};
                 }
             }
         }
@@ -1447,7 +1447,8 @@ ContextStore::PutResult ContextStore::put(const Description& description,
         result.evicted_images = stats_.evicted_for_space + stats_.expired - evictions_before;
         if (options_.remote) {
             // The new entry is protected from the maintenance above, so it is still there.
-            enqueue_upload(description.id, entries_.at(description.id).generation,
+            const Entry& written = entries_.at(description.id);
+            enqueue_upload(description.id, written.generation, written.info.created_ms,
                            std::vector<std::uint8_t>(manifest.out.begin(), manifest.out.end()),
                            std::move(upload_chunks), std::move(superseded));
         }
@@ -1834,6 +1835,14 @@ std::string ContextStore::remote_manifest_key(const std::string& id) const {
     return options_.remote_prefix + "manifests/" + id + ".manifest";
 }
 
+std::string ContextStore::remote_tombstone_key(const std::string& id, std::int64_t created_ms) const {
+    return options_.remote_prefix + "tombstones/" + id + "." + std::to_string(created_ms);
+}
+
+bool ContextStore::remote_fenced(const std::string& id, std::int64_t created_ms) {
+    return options_.remote->exists(remote_tombstone_key(id, created_ms));
+}
+
 std::string ContextStore::remote_chunk_key(const std::array<std::uint64_t, 2>& hash,
                                            bool compressed) const {
     const std::string key = hex_key(hash);
@@ -1876,8 +1885,8 @@ void ContextStore::enqueue_remote(RemoteTask task) {
 // queue is bounded and the oldest is given up beyond it (its image is uploaded again by its next write).
 // The size limit bounds the files the queue holds too: see maintain_locked().
 void ContextStore::enqueue_upload(const std::string& id, std::uint64_t generation,
-                                  std::vector<std::uint8_t> manifest, std::vector<ChunkRef> chunks,
-                                  std::vector<std::string> superseded) {
+                                  std::int64_t created_ms, std::vector<std::uint8_t> manifest,
+                                  std::vector<ChunkRef> chunks, std::vector<Retirement> superseded) {
     std::vector<ChunkRef> unused;
     bool queued = false;
     {
@@ -1889,11 +1898,12 @@ void ContextStore::enqueue_upload(const std::string& id, std::uint64_t generatio
             auto ready = std::chrono::steady_clock::now() + options_.remote_upload_delay;
             // A queued upload of an image this write superseded is not needed: this one has
             // everything it has. Its wait and the manifests it was to delete pass to this one.
-            std::vector<std::string> retire;
+            std::vector<Retirement> retire;
             for (auto it = remote_queue_.begin(); it != remote_queue_.end();) {
-                const bool replaced = it->kind == RemoteTask::Kind::Upload &&
-                                      std::find(superseded.begin(), superseded.end(), it->id) !=
-                                          superseded.end();
+                const bool replaced =
+                    it->kind == RemoteTask::Kind::Upload &&
+                    std::any_of(superseded.begin(), superseded.end(),
+                                [&](const Retirement& other) { return other.id == it->id; });
                 if (!replaced) {
                     ++it;
                     continue;
@@ -1916,6 +1926,7 @@ void ContextStore::enqueue_upload(const std::string& id, std::uint64_t generatio
                     task.retire.insert(task.retire.end(), retire.begin(), retire.end());
                     task.ready      = std::min(task.ready, ready);
                     task.generation = generation;
+                    task.created_ms = created_ms;
                     queued          = true;
                     break;
                 }
@@ -1934,7 +1945,7 @@ void ContextStore::enqueue_upload(const std::string& id, std::uint64_t generatio
                 }
                 remote_queue_.push_back(RemoteTask{RemoteTask::Kind::Upload, id, std::move(manifest),
                                                    std::move(chunks), std::move(retire), ready,
-                                                   generation});
+                                                   generation, created_ms});
                 queued = true;
             }
         }
@@ -1943,9 +1954,9 @@ void ContextStore::enqueue_upload(const std::string& id, std::uint64_t generatio
     if (queued) { remote_cv_.notify_one(); }
 }
 
-void ContextStore::release_retirements_locked(const std::vector<std::string>& ids) {
-    for (const std::string& id : ids) {
-        const auto found = remote_failed_.find(id);
+void ContextStore::release_retirements_locked(const std::vector<Retirement>& retirements) {
+    for (const Retirement& retirement : retirements) {
+        const auto found = remote_failed_.find(retirement.id);
         // Only the block put() placed (no bucket time can pass it), not a failure of its own.
         if (found != remote_failed_.end() &&
             found->second.remote_modified_ms == std::numeric_limits<std::int64_t>::max()) {
@@ -2055,7 +2066,8 @@ bool ContextStore::upload_unpublished(std::string_view binding,
                 } catch (...) { continue; }
                 std::vector<ChunkRef> chunks = entry.chunks;
                 for (const ChunkRef& chunk : chunks) { ++chunks_[hex_key(chunk.hash)].pins; }
-                enqueue_upload(id, entry.generation, std::move(manifest), std::move(chunks), {});
+                enqueue_upload(id, entry.generation, entry.info.created_ms, std::move(manifest),
+                               std::move(chunks), {});
                 --room;
             }
         }
@@ -2099,46 +2111,81 @@ void ContextStore::upload_image(RemoteTask& task) {
     std::uint64_t objects = 0;
     std::uint64_t bytes   = 0;
     bool succeeded        = false;
+    bool fenced_out       = false;
     try {
         const std::int64_t now   = now_ms();
         const std::int64_t trust = options_.remote_touch_interval.count() * 1000;
-        std::unordered_set<std::string> seen;
-        for (const ChunkRef& chunk : task.chunks) {
-            // Confirmations are tracked by content hash: the bucket may hold either form.
-            const std::string key = hex_key(chunk.hash);
-            if (!seen.insert(key).second) { continue; }
+        // Retired by a newer write since (another engine's): putting this version back would only
+        // make every engine register it again.
+        const bool fenced = remote_fenced(task.id, task.created_ms);
+        if (fenced) {
             {
-                // A bucket's lifecycle rule can expire an object, so a confirmation is trusted for a
-                // while, not for good.
+                std::scoped_lock lock(mutex_);
+                ++stats_.remote_fenced;
+            }
+            // It is still the newer of what it superseded: those versions stay retired.
+            for (const Retirement& retired : task.retire) {
+                options_.remote->put(remote_tombstone_key(retired.id, retired.created_ms), {});
+            }
+        } else {
+            std::unordered_set<std::string> seen;
+            for (const ChunkRef& chunk : task.chunks) {
+                // Confirmations are tracked by content hash: the bucket may hold either form.
+                const std::string key = hex_key(chunk.hash);
+                if (!seen.insert(key).second) { continue; }
+                {
+                    // A bucket's lifecycle rule can expire an object, so a confirmation is trusted for a
+                    // while, not for good.
+                    std::scoped_lock lock(remote_mutex_);
+                    const auto known = uploaded_.find(key);
+                    if (known != uploaded_.end() && now - known->second < trust) { continue; }
+                }
+                if (!find_remote_chunk(chunk.hash)) {
+                    // The file is pinned, so it is there; if it is not intact the image is not published.
+                    // A compressed chunk goes up as it is on disk.
+                    bool compressed = false;
+                    const std::vector<std::uint8_t> data = verified_chunk_file(chunk, compressed);
+                    options_.remote->put(remote_chunk_key(chunk.hash, compressed), data);
+                    ++objects;
+                    bytes += data.size();
+                }
                 std::scoped_lock lock(remote_mutex_);
-                const auto known = uploaded_.find(key);
-                if (known != uploaded_.end() && now - known->second < trust) { continue; }
+                uploaded_[key] = now;
             }
-            if (!find_remote_chunk(chunk.hash)) {
-                // The file is pinned, so it is there; if it is not intact the image is not published.
-                // A compressed chunk goes up as it is on disk.
-                bool compressed = false;
-                const std::vector<std::uint8_t> data = verified_chunk_file(chunk, compressed);
-                options_.remote->put(remote_chunk_key(chunk.hash, compressed), data);
-                ++objects;
-                bytes += data.size();
+            // The versions this write retires are fenced before its manifest is published: from then
+            // on no engine puts them back or registers them, even if the deletes below never
+            // happen (a crash, the bucket failing). If the manifest then fails to go up, the fences
+            // are lifted again, since nothing replaces the versions they cover.
+            std::vector<std::string> fences;
+            for (const Retirement& retired : task.retire) {
+                fences.push_back(remote_tombstone_key(retired.id, retired.created_ms));
             }
-            std::scoped_lock lock(remote_mutex_);
-            uploaded_[key] = now;
+            try {
+                for (const std::string& fence : fences) { options_.remote->put(fence, {}); }
+                // The manifest goes last: an image another engine sees always has its chunks.
+                options_.remote->put(remote_manifest_key(task.id), task.manifest);
+            } catch (const std::exception&) {
+                for (const std::string& fence : fences) {
+                    try {
+                        options_.remote->remove(fence);
+                    } catch (const std::exception&) {}
+                }
+                throw;
+            }
+            ++objects;
+            bytes += task.manifest.size();
         }
-        // The manifest goes last: an image another engine sees always has its chunks.
-        options_.remote->put(remote_manifest_key(task.id), task.manifest);
-        ++objects;
-        bytes += task.manifest.size();
         succeeded = true;
+        fenced_out = fenced;
     } catch (const std::exception&) {}
     if (succeeded) {
         {
-            // Only now may the directory give this image's chunks up to the bucket.
+            // Only now may the directory give this image's chunks up to the bucket. (A fenced
+            // version is not in the bucket, so it stays something eviction removes whole.)
             std::scoped_lock io(io_mutex_);
             std::scoped_lock lock(mutex_);
             const auto found = entries_.find(task.id);
-            if (found != entries_.end() && found->second.generation == task.generation) {
+            if (!fenced_out && found != entries_.end() && found->second.generation == task.generation) {
                 found->second.published    = true;
                 found->second.published_at = std::chrono::steady_clock::now();
                 write_published_locked(task.id, task.manifest);
@@ -2148,7 +2195,9 @@ void ContextStore::upload_image(RemoteTask& task) {
         // them and a new one downloads every turn of every conversation at start-up. Their
         // chunks are mostly this image's too; the rest expire under the bucket's lifecycle rule.
         // Deletions that failed before are retried here.
-        std::vector<std::string> retire = std::move(task.retire);
+        std::vector<std::string> retire;
+        for (const Retirement& retired : task.retire) { retire.push_back(retired.id); }
+        task.retire.clear();
         {
             std::scoped_lock lock(remote_mutex_);
             retire.insert(retire.end(), retire_backlog_.begin(), retire_backlog_.end());
@@ -2214,6 +2263,7 @@ void ContextStore::prune_remote_state() {
 void ContextStore::touch_remote_image(const std::string& id) {
     std::vector<ChunkRef> chunks;
     std::uint64_t generation = 0;
+    std::int64_t created_ms  = 0;
     // An image imported whole from a peer is the peer's to upload: its age in the bucket is
     // restarted, but what the bucket lacks is not put there from here.
     bool peer_image = false;
@@ -2223,6 +2273,7 @@ void ContextStore::touch_remote_image(const std::string& id) {
         if (found == entries_.end()) { return; }
         chunks     = found->second.chunks;
         generation = found->second.generation;
+        created_ms = found->second.info.created_ms;
         peer_image = !found->second.peer_memo_key.empty();
     }
     const std::int64_t now = now_ms();
@@ -2296,6 +2347,13 @@ void ContextStore::touch_remote_image(const std::string& id) {
                 }
             }
             if (replaced) { return; }
+            // A lost manifest is lifecycle expiry, but also what a newer write of the conversation
+            // deletes: a retired version is not put back.
+            if (remote_fenced(id, created_ms)) {
+                std::scoped_lock lock(mutex_);
+                ++stats_.remote_fenced;
+                return;
+            }
             if (read) {
                 options_.remote->put(remote_manifest_key(id), manifest);
             } else {
@@ -2576,6 +2634,18 @@ bool ContextStore::register_remote_image(const ObjectInfo& object, const std::st
             std::scoped_lock lock(mutex_);
             ++stats_.remote_download_failures;
             ++stats_.remote_download_failures_damaged;
+        }
+        std::scoped_lock lock(remote_mutex_);
+        remote_failed_[id] = {object.modified_ms, now_ms()};
+        return false;
+    }
+    if (remote_fenced(id, entry.info.created_ms)) {
+        // A newer write of the conversation retired this version, and something put it back (an
+        // engine's repair, or an upload that was queued): skipped until the bucket lists the
+        // manifest as written again.
+        {
+            std::scoped_lock lock(mutex_);
+            ++stats_.remote_fenced;
         }
         std::scoped_lock lock(remote_mutex_);
         remote_failed_[id] = {object.modified_ms, now_ms()};
