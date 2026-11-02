@@ -920,7 +920,16 @@ void ContextStore::scan() {
         if (path.extension() != ".manifest") { continue; }
         Entry entry;
         const std::string id = path.stem().string();
-        if (!valid_id(id) || !read_manifest(path, entry, nullptr) || entry.info.id != id) {
+        // Read once: the same bytes are parsed and, for a peer-marked image, checksummed below.
+        std::vector<std::uint8_t> body;
+        bool parsed = false;
+        if (valid_id(id)) {
+            try {
+                body   = read_whole_file(path);
+                parsed = parse_manifest(body, entry, nullptr);
+            } catch (const std::exception&) {}
+        }
+        if (!parsed || entry.info.id != id) {
             // A manifest of this store's own naming that does not describe its image is a damaged
             // session; a file under another name was never one.
             if (valid_id(id)) {
@@ -946,7 +955,6 @@ void ContextStore::scan() {
             } else if (marked) {
                 try {
                     const std::vector<std::uint8_t> mark = read_whole_file(peer_origin_path(id));
-                    const std::vector<std::uint8_t> body = read_whole_file(path);
                     const auto tail                      = manifest_checksum(body);
                     entry.peer_origin = std::equal(mark.begin(), mark.end(), tail.begin(), tail.end());
                 } catch (const std::exception&) {
