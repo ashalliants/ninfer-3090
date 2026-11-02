@@ -1,0 +1,15 @@
+
+Dump of file C:\ninfer\dist\ninfer-rtx3090-windows-x64-0.0.0\ninfer-serve.exe
+
+File Type: EXECUTABLE IMAGE
+
+  Image has the following dependencies:
+
+    cublas64_12.dll
+    AVCODEC-62.dll
+
+  Summary
+
+        1000 .data
+        2000 .nvFatBi.dll
+        3000 .text

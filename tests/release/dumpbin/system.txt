@@ -1,0 +1,14 @@
+
+Dump of file C:\ninfer\dist\ninfer-rtx3090-windows-x64-0.0.0\avcodec-62.dll
+
+File Type: DLL
+
+  Image has the following dependencies:
+
+    KERNEL32.dll
+    bcrypt.dll
+    USER32.dll
+
+  Summary
+
+        1000 .data
