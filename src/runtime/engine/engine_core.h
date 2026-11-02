@@ -1493,6 +1493,7 @@ private:
         std::array<std::size_t, kMaximumConcurrency> generated_sizes{};
         std::array<bool, kMaximumConcurrency> cancelled{};
         std::array<bool, kMaximumConcurrency> failed{};
+        std::array<bool, kMaximumConcurrency> token_domain_failed{};
         bool generated_staged = false;
         std::array<std::shared_ptr<Request>, kMaximumConcurrency> terminal_requests{};
         std::array<std::uint32_t, kMaximumConcurrency> terminal_lanes{};
@@ -1519,7 +1520,8 @@ private:
                 }
                 if (decode_round) { ++request->host_timing.decode_rounds; }
                 cancelled[row] = cancelled_at_unit_start[lane];
-                failed[row]    = !cancelled[row] && pending.constraint_failed(row);
+                token_domain_failed[row] = !cancelled[row] && pending.token_domain_failed(row);
+                failed[row] = !cancelled[row] && (token_domain_failed[row] || pending.constraint_failed(row));
                 const std::int32_t raw_count =
                     pending.row_counts().empty() ? 1 : pending.row_counts()[row];
                 if (raw_count <= 0 || raw_count > static_cast<std::int32_t>(pending.row_stride())) {
@@ -1676,9 +1678,19 @@ private:
                 const auto& request          = slots_[lane];
                 const std::uint32_t accepted = decisions[row].accepted_tokens;
                 if (failed[row]) {
-                    complete_error(request, std::make_exception_ptr(
-                                                RequestError(RequestErrorKind::ConstraintDeadEnd,
-                                                             "grammar has no valid next token")));
+                    const std::size_t generated = generated_sizes[row];
+                    complete_error(
+                        request,
+                        std::make_exception_ptr(
+                            token_domain_failed[row]
+                                ? RequestError(RequestErrorKind::NumericalFailure,
+                                               "the model selected a token outside its vocabulary " +
+                                                   (generated == 0
+                                                        ? std::string("at the end of the prompt")
+                                                        : "after " + std::to_string(generated) +
+                                                              " generated tokens"))
+                                : RequestError(RequestErrorKind::ConstraintDeadEnd,
+                                               "grammar has no valid next token")));
                     remove_completed_slot(lane);
                     continue;
                 }

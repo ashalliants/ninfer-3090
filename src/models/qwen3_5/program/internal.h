@@ -18,6 +18,10 @@ struct ContractAccess {
         pending.constraint_failed_.at(row) = failed;
     }
 
+    static void token_domain_failed(PendingBatch& pending, std::size_t row, bool failed) {
+        pending.token_domain_failed_.at(row) = failed;
+    }
+
     static SequenceHandle make_sequence(const void* owner, runtime::LaneId lane,
                                         std::uint64_t epoch) noexcept {
         SequenceHandle out;

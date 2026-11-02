@@ -1048,6 +1048,7 @@ enum class RequestErrorKind : std::uint8_t {
     QueueTimeout,
     Cancelled,
     Unavailable,
+    NumericalFailure,
 };
 
 enum class RequestErrorSource : std::uint8_t { OutputConstraint, Tools };

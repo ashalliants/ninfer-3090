@@ -240,6 +240,7 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
                        backend_kv_addresses->bound_row(*state.kv->backend));
     }
     grammar_dead_positions[0] = 0;
+    token_domain_faults[0]    = false;
     if (requests[lane].prefill && permit.main_frontier >= requests[lane].prefill->prompt_tokens &&
         masks && masks->constrained(0)) {
         auto& config       = static_cast<qwen3_5::PrefillRoundHost*>(round_host->data())->sampling;
@@ -839,7 +840,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                       (staged.vision ? staged.vision->elapsed_seconds() : 0.0);
         const std::uint32_t prompt_tokens = staged.prompt_tokens;
 
-        validate_licensed_tokens(std::span<const TokenId>(host_tokens, 1));
+        if (!license_tokens(std::span<TokenId>(host_tokens, 1))) { token_domain_faults[0] = true; }
         if (sequence.ledger.size() != prompt_tokens) {
             throw std::logic_error("candidate token ledger does not match prompt length");
         }

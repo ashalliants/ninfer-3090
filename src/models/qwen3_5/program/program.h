@@ -293,7 +293,8 @@ public:
           transaction_(std::exchange(other.transaction_, 0)), rows_(other.rows_),
           row_count_(std::exchange(other.row_count_, 0)), tokens_(other.tokens_),
           row_counts_(other.row_counts_), row_stride_(other.row_stride_), timing_(other.timing_),
-          constraint_failed_(other.constraint_failed_) {
+          constraint_failed_(other.constraint_failed_),
+          token_domain_failed_(other.token_domain_failed_) {
         other.tokens_     = {};
         other.row_counts_ = {};
         other.row_stride_ = 0;
@@ -316,6 +317,12 @@ public:
         return constraint_failed_.at(row);
     }
 
+    // The row's sampled or licensed token left the public vocabulary: its request ends with a
+    // numerical failure, the Engine and the other rows go on.
+    [[nodiscard]] bool token_domain_failed(std::size_t row) const {
+        return token_domain_failed_.at(row);
+    }
+
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
 
 private:
@@ -328,6 +335,7 @@ private:
     std::uint32_t row_stride_ = 0;
     runtime::ExecutionTiming timing_;
     std::array<bool, kMaximumConcurrency> constraint_failed_{};
+    std::array<bool, kMaximumConcurrency> token_domain_failed_{};
 
     friend struct detail::ContractAccess;
 };

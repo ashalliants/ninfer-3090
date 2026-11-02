@@ -278,6 +278,7 @@ public:
     [[nodiscard]] std::span<const std::int32_t> row_counts() const noexcept { return {}; }
     [[nodiscard]] std::uint32_t row_stride() const noexcept { return 1; }
     [[nodiscard]] bool constraint_failed(std::size_t) const { return false; }
+    [[nodiscard]] bool token_domain_failed(std::size_t) const { return false; }
     [[nodiscard]] ExecutionTiming execution_timing() const noexcept { return timing_; }
 
     std::vector<SequenceHandle> rows_;
