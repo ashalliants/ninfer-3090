@@ -2103,6 +2103,122 @@ std::vector<std::uint8_t> peer_image(std::uint32_t seed, std::size_t region = 50
     return concat({pseudo_random(30, seed), pseudo_random(region, seed + 1000), pseudo_random(8, seed)});
 }
 
+// The bytes the directories really occupy: each file is split between the directories linking it.
+std::uint64_t physical_bytes(const std::vector<fs::path>& directories) {
+    std::uint64_t total = 0;
+    for (const fs::path& directory : directories) {
+        for (const char* part : {"chunks", "manifests"}) {
+            for (const auto& item : fs::recursive_directory_iterator(directory / part)) {
+                if (!item.is_regular_file() || item.path().extension() == ".used") { continue; }
+                const std::uint64_t links = fs::hard_link_count(item.path());
+                total += (fs::file_size(item.path()) + links - 1) / links;
+            }
+        }
+    }
+    return total;
+}
+
+void test_peer_shared_chunks_are_charged_once_across_engines() {
+    const std::array regions{ContextStore::Region{30, 5000}};
+    constexpr int kImages = 6;
+    const auto id         = [](int i) { return "0" + std::to_string(i); };
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    std::uint64_t logical = 0;
+    std::uint64_t share   = 0;
+    {
+        ContextStore a(peer_options(a_directory.path(), b_directory.path()));
+        ContextStore b(peer_options(b_directory.path(), a_directory.path()));
+        for (int i = 0; i < kImages; ++i) { (void)a.put(describe(id(i)), peer_image(20 + i), regions); }
+        check(b.sync_peers() == kImages, "the peer did not import every image");
+        const auto sa = a.stats();
+        const auto sb = b.stats();
+        logical       = sa.logical_bytes;
+        share         = sa.used_bytes;
+        check(sa.shared_bytes > 0 && sa.logical_bytes == sb.logical_bytes &&
+                  sa.shared_bytes == sb.shared_bytes,
+              "both engines should see the same shared chunk bytes");
+        check(sa.used_bytes < sa.logical_bytes && sb.used_bytes < sb.logical_bytes,
+              "shared chunks were charged in full to both engines");
+        // The two charges add up to the disk (up to one byte of rounding per file).
+        const std::uint64_t physical = physical_bytes({a_directory.path(), b_directory.path()});
+        const std::uint64_t files    = 2 * (chunk_files(a_directory.path()).size() + kImages);
+        check(sa.used_bytes + sb.used_bytes >= physical &&
+                  sa.used_bytes + sb.used_bytes <= physical + files,
+              "the engines' charges do not add up to the physical bytes");
+    }
+    // Without peers nothing changes: the charge is the directory's size.
+    TempDirectory c_directory;
+    {
+        ContextStore c(options_for(c_directory.path()));
+        (void)c.put(describe("0a"), peer_image(30), regions);
+        const auto sc = c.stats();
+        check(sc.used_bytes == sc.logical_bytes && sc.shared_bytes == 0,
+              "a store without peers charged something other than its size");
+    }
+
+    // A cap between the share and the logical size evicts nothing with the peers named...
+    const std::uint64_t cap = (share + logical) / 2;
+    {
+        ContextStore::Options options = peer_options(a_directory.path(), b_directory.path());
+        options.max_bytes             = cap;
+        ContextStore a(options);
+        a.maintain();
+        check(a.list().size() == kImages && a.stats().used_bytes <= cap,
+              "an engine evicted images that fit once the peer's copy is counted");
+    }
+    // ...and the same store without them (a lone engine) does.
+    {
+        ContextStore::Options options = options_for(a_directory.path());
+        options.max_bytes             = cap;
+        ContextStore a(options);
+        a.maintain();
+        check(a.list().size() < kImages && a.stats().used_bytes <= cap,
+              "a lone engine did not evict down to its cap");
+    }
+    // Refill A from B, then cap below the share: eviction stops as soon as the charge fits.
+    {
+        ContextStore a(peer_options(a_directory.path(), b_directory.path()));
+        (void)a.sync_peers();
+        check(a.list().size() == kImages, "the evicted images were not imported back");
+    }
+    const std::uint64_t physical_before = physical_bytes({a_directory.path(), b_directory.path()});
+    const std::uint64_t tight           = share * 2 / 3;
+    ContextStore::Options options       = peer_options(a_directory.path(), b_directory.path());
+    options.max_bytes                   = tight;
+    ContextStore::Stats after;
+    {
+        ContextStore a(options);
+        a.maintain();
+        after = a.stats();
+        check(after.used_bytes <= tight, "eviction stopped above the cap");
+        check(after.used_bytes + share / kImages + kImages > tight && !a.list().empty(),
+              "eviction went further than the cap needed");
+    }
+    // The peer still holds every image: its manifests and chunks are intact, and evicting freed
+    // none of the disk, only A's share of it.
+    ContextStore b(peer_options(b_directory.path(), a_directory.path()));
+    for (int i = 0; i < kImages; ++i) {
+        const auto loaded = b.load(id(i));
+        check(loaded && *loaded == peer_image(20 + i), "an image the peer evicted broke the other engine");
+    }
+    check(b.list().size() == kImages, "the engine that did not evict lost images");
+    check(physical_bytes({a_directory.path(), b_directory.path()}) <= physical_before,
+          "evicting grew the disk");
+    // B now carries what A let go of: its charge rose by the evicted share.
+    const auto sb = b.stats();
+    check(sb.used_bytes + after.used_bytes >= physical_bytes({a_directory.path(), b_directory.path()}),
+          "the charges after an eviction under-count the disk");
+    // Restart with the populated stores: the same figures, read from disk.
+    {
+        ContextStore restarted(options);
+        const auto sr = restarted.stats();
+        check(sr.used_bytes == after.used_bytes && sr.logical_bytes == after.logical_bytes &&
+                  sr.shared_bytes == after.shared_bytes,
+              "a restart changed the store's accounting");
+    }
+}
+
 void test_owner_lock_refuses_a_second_store_on_one_directory() {
     TempDirectory directory;
     {
@@ -2381,7 +2497,7 @@ void test_peer_import_links_compressed_chunks() {
           "the importer did not link the compressed chunk files");
     check(b.load("0a").value_or(std::vector<std::uint8_t>{}) == image,
           "an image of compressed chunks differs after import");
-    check(b.stats().used_bytes == a.stats().used_bytes,
+    check(b.stats().logical_bytes == a.stats().logical_bytes,
           "the importer counts compressed chunks by another size than the peer");
 }
 
@@ -2479,7 +2595,7 @@ void test_peer_fills_an_image_the_remote_registered() {
     check(b->list().size() == 1 && b->list()[0].local, "the linked image does not report itself local");
     check(b->stats().peer_images == 1 && b->stats().peer_bytes_linked == 5000,
           "the fill was not counted as a peer import");
-    check(b->stats().used_bytes == setup.a->stats().used_bytes,
+    check(b->stats().logical_bytes == setup.a->stats().logical_bytes,
           "the filled image is counted by other sizes than the peer's");
     setup.remote->chunk_gets = 0;
     check(b->load("0a").value_or(std::vector<std::uint8_t>{}) == setup.image,
@@ -2966,6 +3082,7 @@ void test_non_positive_peer_poll_is_refused() {
 int main() {
     test_owner_lock_refuses_a_second_store_on_one_directory();
     test_peer_import_links_chunks_and_survives_the_owner();
+    test_peer_shared_chunks_are_charged_once_across_engines();
     test_peer_import_survives_restarts_of_either_store();
     test_both_stores_write_the_same_image();
     test_background_poll_imports_without_being_asked();

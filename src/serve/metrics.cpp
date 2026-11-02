@@ -428,7 +428,14 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
     // The durable context store (--context-store); all zero when it is off.
     GAUGE(context_store_images, "context_store_images", "Sessions held by the context store.");
     GAUGE(context_store_used_bytes, "context_store_used_bytes",
-          "Bytes of chunks and manifests held by the context store.");
+          "Bytes of chunks and manifests the context store is capped on: a chunk hard-linked "
+          "from a peer engine's store (--context-store-peer) counts as its size divided by the "
+          "engines holding it. Summed over the engines of a box this is the physical size on disk.");
+    GAUGE(context_store_logical_bytes, "context_store_logical_bytes",
+          "Bytes in the context store directory, chunks shared with a peer engine counted in "
+          "full (what du reports for this directory alone).");
+    GAUGE(context_store_shared_bytes, "context_store_shared_bytes",
+          "Bytes of chunks in this store that a peer engine's store also holds by hard link.");
     COUNTER(context_store_writes, "context_store_writes_total",
             "Sessions written to the context store.");
     COUNTER(context_store_write_failures, "context_store_write_failures_total",

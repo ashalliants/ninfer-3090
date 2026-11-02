@@ -777,8 +777,35 @@ void ContextStore::write_used(const std::string& id, std::int64_t last_used_ms) 
     }
 }
 
-std::uint64_t ContextStore::used_bytes_locked() const {
+std::uint64_t ContextStore::logical_bytes_locked() const {
     return chunk_total_bytes_ + manifest_total_bytes_;
+}
+
+std::uint64_t ContextStore::used_bytes_locked() const {
+    if (options_.peers.empty()) { return logical_bytes_locked(); }
+    std::uint64_t total = manifest_total_bytes_;
+    for (const auto& [key, use] : chunks_) {
+        if (!use.present) { continue; }
+        const std::uint64_t links = std::max<std::uint32_t>(use.links, 1U);
+        total += (use.stored + links - 1U) / links;
+    }
+    return total;
+}
+
+void ContextStore::refresh_links_locked() const {
+    for (const auto& [key, use] : chunks_) {
+        use.links = 1;
+        if (!use.present) { continue; }
+        for (const char* suffix : {".chunk", ".chunk.zst"}) {
+            std::error_code error;
+            const std::uintmax_t count = fs::hard_link_count(
+                options_.directory / "chunks" / key.substr(0, 2) / (key + suffix), error);
+            if (!error) {
+                use.links = static_cast<std::uint32_t>(std::max<std::uintmax_t>(count, 1U));
+                break;
+            }
+        }
+    }
 }
 
 bool ContextStore::read_manifest(const fs::path& path, Entry& entry,
@@ -1095,6 +1122,11 @@ void ContextStore::maintain_locked(const std::string* protect) {
         }
     }
     if (options_.max_bytes != 0) {
+        // The share is never above the logical size, so the link counts are read only when the
+        // logical size is over the cap.
+        if (!options_.peers.empty() && logical_bytes_locked() > options_.max_bytes) {
+            refresh_links_locked();
+        }
         // Files queued uploads pin count too: once nothing is left to evict, the oldest uploads
         // are given up so their files can go. (An upload in flight keeps its files until it ends,
         // and runs this again then.)
@@ -1439,7 +1471,9 @@ void ContextStore::make_room_on_volume_locked(const std::string& id, std::uint64
     std::scoped_lock lock(mutex_);
     // Evicting helps only if what this store holds could cover the shortfall; otherwise (another
     // engine or program filled the volume) its images are kept and the put is refused at once.
-    if (available + used_bytes_locked() >= needed) {
+    // The directory's logical size bounds what eviction could free (the peer-share charge is a
+    // cached estimate that can under-state it after a peer dropped its link).
+    if (available + logical_bytes_locked() >= needed) {
         for (const ChunkRef& chunk : keep) {
             const auto found = chunks_.find(hex_key(chunk.hash));
             if (found == chunks_.end()) { continue; }
@@ -1781,7 +1815,12 @@ void ContextStore::touch(const std::string& id) {
 ContextStore::Stats ContextStore::stats() const {
     std::scoped_lock lock(mutex_);
     Stats out        = stats_;
-    out.used_bytes   = used_bytes_locked();
+    if (!options_.peers.empty()) { refresh_links_locked(); }
+    out.used_bytes    = used_bytes_locked();
+    out.logical_bytes = logical_bytes_locked();
+    for (const auto& [key, use] : chunks_) {
+        if (use.present && use.links > 1) { out.shared_bytes += use.stored; }
+    }
     out.images       = entries_.size();
     if (options_.remote) {
         for (const auto& [id, entry] : entries_) {
@@ -2889,6 +2928,11 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
     }
     // Nothing is imported that would be evicted at once, or the store would link, evict and link
     // the same image again at every poll.
+    // A chunk linked in is charged in full here, though its share will be smaller once both
+    // stores count it: the check is on the safe side. A peer may have dropped its copy of chunks
+    // this store counts as shared, so the link counts are read before the first check (a stale
+    // count could pass an import that leaves the store over its cap).
+    if (options_.max_bytes != 0 && !options_.peers.empty()) { refresh_links_locked(); }
     // The skip stands until the peer rewrites the image or this store removes something, and the
     // same skip is counted once.
     if (options_.max_bytes != 0 && used_bytes_locked() + new_bytes > options_.max_bytes) {

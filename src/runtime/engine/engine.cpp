@@ -316,6 +316,8 @@ public:
         const runtime::ContextStore::Stats s = store->stats();
         out.context_store_images          = s.images;
         out.context_store_used_bytes      = s.used_bytes;
+        out.context_store_logical_bytes   = s.logical_bytes;
+        out.context_store_shared_bytes    = s.shared_bytes;
         out.context_store_writes          = s.puts;
         out.context_store_write_failures  = s.put_failures;
         out.context_store_dropped         = store_dropped.load(std::memory_order_relaxed);
