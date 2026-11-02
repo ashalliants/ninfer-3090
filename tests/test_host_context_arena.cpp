@@ -1,4 +1,5 @@
 #include "core/host_context_arena.h"
+#include "runtime/contract/host_placement.h"
 
 #include <cuda_runtime_api.h>
 
@@ -90,6 +91,54 @@ void test_fragmentation_and_split() {
     ninfer::HostContextArena disabled(0, 256);
     expect(!disabled.allocate(256) && disabled.capacity_bytes() == 0,
            "Host zero has no backing or allocations");
+}
+
+// The runs host_runs_after_release() predicts for a release, built the way
+// ProgramImpl::host_free_runs_after_release() builds them (free_extents(), offset_of(), the
+// allocation's rounded bytes), must be the runs the arena has once the release really happens.
+void test_predicted_runs_match_real_release() {
+    using ninfer::runtime::HostFreeRuns;
+    using ninfer::runtime::HostRun;
+    constexpr std::size_t unit = ninfer::HostContextArena::alignment;
+    ninfer::HostContextArena arena(10 * unit, unit);
+    // An unaligned request (a state image) rounds up; a larger block is split into pages, as the
+    // KV extents are, and neighbours are released together with a block that is not adjacent.
+    auto image = arena.allocate(unit + 1);
+    auto block = arena.allocate(4 * unit);
+    auto other = arena.allocate(unit);
+    auto tail  = arena.allocate(2 * unit);
+    expect(image && block && other && tail, "the arena fixture places every allocation");
+    image->publish();
+    block->publish();
+    other->publish();
+    tail->publish();
+    auto split = arena.split(std::move(*block), 3 * unit);
+    std::vector<ninfer::HostContextAllocation> pieces;
+    pieces.push_back(std::move(split.first));
+    pieces.push_back(std::move(split.second));
+
+    HostFreeRuns before;
+    before.general_capacity = arena.general_capacity_bytes();
+    before.occupied         = arena.occupied_bytes();
+    for (const auto& extent : arena.free_extents()) {
+        before.runs.push_back({extent.offset, extent.bytes});
+    }
+    // Release the image, both split pieces (which touch the image) and the tail: the pieces and
+    // the image must merge into one run, the tail into the free run beyond it.
+    std::vector<HostRun> freed;
+    for (auto* allocation : {&*image, &pieces[0], &pieces[1], &*tail}) {
+        freed.push_back({arena.offset_of(allocation->data()), allocation->bytes()});
+    }
+    const auto predicted = ninfer::runtime::host_runs_after_release(before, freed);
+    (void)image->release();
+    (void)pieces[0].release();
+    (void)pieces[1].release();
+    (void)tail->release();
+    std::vector<HostRun> actual;
+    for (const auto& extent : arena.free_extents()) { actual.push_back({extent.offset, extent.bytes}); }
+    expect(predicted.runs == actual && predicted.occupied == arena.occupied_bytes(),
+           "predicted free runs equal the arena's runs after the real release");
+    expect(freed[0].bytes == 2 * unit, "an unaligned image is charged its rounded bytes");
 }
 
 void test_failures_are_counted_by_cause() {
@@ -252,6 +301,7 @@ int main() {
     try {
         test_reserve_publish_and_rollback();
         test_fragmentation_and_split();
+        test_predicted_runs_match_real_release();
         test_failures_are_counted_by_cause();
         test_placement_scope_counts_once();
         test_snapshot_reserve();
