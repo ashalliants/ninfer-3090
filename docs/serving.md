@@ -518,7 +518,11 @@ until the read ends, so a write that makes room meanwhile cannot take the chunks
 The store keeps at most `--context-store-max-gib` (default: half the free space of the volume when
 the server starts), removing the least recently used sessions first, and removes sessions unused for
 `--context-store-ttl-hours` (default 168). The limit counts every file in the directory, including
-those waiting uploads to the bucket still need (see below). Because the volume is shared (with
+those waiting uploads to the bucket still need (see below). With `--context-store-peer`, a chunk the
+engines share by hard link is charged to each engine as its size divided by the number of
+directories linking it (rounded up), so the caps of the engines on a box add up to the physical
+bytes on disk and a shared chunk is paid for once; without peers the charge is the directory's
+size. Because the volume is shared (with
 another engine, logs, the OS), the store also checks the volume itself: before a write it makes
 sure at least 1 GiB stays free after the new chunks, removing the least recently used sessions
 first if not, and refuses the write (a miss, as for any failed write) with `context store volume is
@@ -948,7 +952,8 @@ server restarts.
 | `ninfer_gpu_memory_used_bytes`, `ninfer_gpu_memory_total_bytes` | gauges: device memory in use by every process on the card (not only this server), and installed |
 | `ninfer_gpu_temperature_celsius`, `ninfer_gpu_power_watts` | gauges: GPU core temperature and board power draw. All six `ninfer_gpu_*` series are omitted, not reported as 0, when NVML or the device cannot be opened (no driver library, a container without it); a single reading NVML cannot give is omitted on its own |
 | `ninfer_gpu_energy_joules_total` | counter: board energy used since the server attached to the GPU, from NVML's lifetime energy counter. The rate over any window is the mean power over it (`rate(ninfer_gpu_energy_joules_total[5m])` is watts), which the instantaneous `ninfer_gpu_power_watts` cannot give. It starts at 0 at attachment, not at driver load, and keeps counting through an NVML counter reset. Omitted, like the other `ninfer_gpu_*` series, when NVML cannot supply it (older drivers, a card without an energy counter) |
-| `ninfer_context_store_images`, `ninfer_context_store_used_bytes` | gauges: sessions and bytes held by the [context store](#context-store) (zero when it is off) |
+| `ninfer_context_store_images`, `ninfer_context_store_used_bytes` | gauges: sessions and bytes held by the [context store](#context-store) (zero when it is off). `used_bytes` is what `--context-store-max-gib` is enforced against: with `--context-store-peer` this engine's share of the physical size, so summed over a box's engines it is what the disk holds |
+| `ninfer_context_store_logical_bytes`, `ninfer_context_store_shared_bytes` | gauges: the directory's size with shared chunks counted in full (what `du` on it alone shows), and the part of it that a peer engine's directory also holds by hard link |
 | `ninfer_context_store_writes_total`, `_write_failures_total`, `_dropped_total` | sessions written, writes that failed, sessions not queued because the write queue was full |
 | `ninfer_context_store_bytes_written_total`, `_bytes_stored_total`, `_bytes_reused_total` | new chunk bytes written (raw size), what they took on disk after [compression](#context-store), and chunk bytes a write found already stored |
 | `ninfer_context_store_peer_images_total`, `_peer_bytes_linked_total`, `_peer_skipped_total`, `_peer_link_failures_total` | with `--context-store-peer`: sessions imported from peers, chunk bytes hard-linked (shared on disk, not copied), sessions not imported (damaged, expired, over budget, or gone mid-import) and chunks that could not be linked |

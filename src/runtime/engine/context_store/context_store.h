@@ -48,7 +48,10 @@ public:
         std::filesystem::path directory;
         // Bytes of chunks and manifests kept; the least recently used images are evicted beyond it.
         // 0 means no limit. Files queued uploads still need count too: when evicting cannot free
-        // enough, the oldest queued uploads are given up so their files can go.
+        // enough, the oldest queued uploads are given up so their files can go. A chunk
+        // hard-linked into other stores (peer imports) is charged as its size divided by its link
+        // count, rounded up, so the engines sharing it pay for it once between them and the caps
+        // of the engines sum to the physical bytes on disk.
         std::uint64_t max_bytes = 0;
         // The volume is shared (another engine, the OS), so the limit above does not keep it from
         // filling. Before a put writes new chunk files it checks that the volume keeps this much
@@ -151,7 +154,9 @@ public:
     };
 
     struct Stats {
-        std::uint64_t used_bytes        = 0;
+        std::uint64_t used_bytes        = 0; // what max_bytes is enforced against (this store's share)
+        std::uint64_t logical_bytes     = 0; // everything in the directory, shared chunks in full
+        std::uint64_t shared_bytes      = 0; // chunks also linked from another directory, in full
         std::uint64_t images            = 0;
         std::uint64_t puts              = 0;
         std::uint64_t put_failures      = 0;
@@ -375,6 +380,9 @@ private:
         std::uint32_t pins       = 0;
         std::uint32_t length     = 0; // raw length
         std::uint64_t stored     = 0; // bytes the chunk file takes on disk (raw or compressed)
+        // Hard links to the file, this directory's included, as of the last refresh_links_locked():
+        // above 1 a peer store holds the same bytes, and the charge is shared with it.
+        mutable std::uint32_t links = 1; // a cache, so the const stats() can refresh it
         bool present             = false; // the chunk file is in the directory
     };
     // Which form of a chunk the directory holds.
@@ -446,7 +454,13 @@ private:
     // blames the peer it came from.
     void quarantine_peers_locked(Entry& entry, const std::vector<ChunkRef>* damaged);
     void write_used(const std::string& id, std::int64_t last_used_ms) const;
+    // The bytes the cap is enforced against: logical bytes, less the part of each shared chunk
+    // that the peers holding a link pay for. Equal to logical_bytes_locked() without peers.
     [[nodiscard]] std::uint64_t used_bytes_locked() const;
+    [[nodiscard]] std::uint64_t logical_bytes_locked() const;
+    // Re-reads the link count of every present chunk file (a peer may have linked or dropped
+    // its copy since). An unreadable file counts as unshared, which only over-charges.
+    void refresh_links_locked() const;
     void maintain_locked(const std::string* protect);
     bool evict_oldest_locked(const std::string* protect);
     // Nothing is left to evict, and queued uploads hold the files: gives up the oldest upload whose

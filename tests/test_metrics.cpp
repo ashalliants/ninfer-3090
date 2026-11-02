@@ -164,6 +164,8 @@ int main() {
     fork.lossy_prefill_summary_probe_timeouts = baseline.lossy_prefill_summary_probe_timeouts + 7;
     fork.context_store_images             = 5;
     fork.context_store_used_bytes         = 123456789;
+    fork.context_store_logical_bytes      = 223456789;
+    fork.context_store_shared_bytes       = 99000;
     fork.context_store_writes             = 9;
     fork.context_store_bytes_reused       = 4000;
     fork.context_store_restored           = 3;
@@ -217,6 +219,8 @@ int main() {
           "lossy prefill series must be reported by outcome");
     check(has_line(series, "ninfer_context_store_images 5") &&
               has_line(series, "ninfer_context_store_used_bytes 123456789") &&
+              has_line(series, "ninfer_context_store_logical_bytes 223456789") &&
+              has_line(series, "ninfer_context_store_shared_bytes 99000") &&
               has_line(series, "ninfer_context_store_writes_total 9") &&
               has_line(series, "ninfer_context_store_bytes_reused_total 4000") &&
               has_line(series, "ninfer_context_store_restored_sessions 3") &&

@@ -1770,7 +1770,9 @@ struct RuntimeStats {
 
     // The durable context store (zero throughout when it is disabled).
     std::uint64_t context_store_images         = 0;
-    std::uint64_t context_store_used_bytes     = 0;
+    std::uint64_t context_store_used_bytes     = 0; // what the cap is enforced against
+    std::uint64_t context_store_logical_bytes  = 0; // directory size, hard-linked peer chunks in full
+    std::uint64_t context_store_shared_bytes   = 0; // chunks also linked from a peer's directory
     std::uint64_t context_store_writes         = 0; // sessions written
     std::uint64_t context_store_write_failures = 0;
     std::uint64_t context_store_dropped        = 0; // sessions not written: write queue full
