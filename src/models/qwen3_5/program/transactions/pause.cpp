@@ -73,6 +73,8 @@ bool ProgramImpl::reserve_host_kv_transfers(ContextTransaction& tx, LogicalKVPag
     // One Host extent is a single contiguous arena run. A busy arena can hold enough bytes in
     // total yet no run big enough for every page, so the pages are placed in as few extents as fit.
     // The sizes tried on the way are not failures; only a placement that cannot be made counts.
+    // pause_snapshot_places (core/host_arena_model.h) replays this chunking to answer whether a
+    // pause snapshot fits before anything is evicted: change them together.
     HostContextArena::PlacementScope placement(*host_context_arena);
     const bool placed = reserve_in_chunks(
         logical,

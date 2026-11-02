@@ -2554,11 +2554,12 @@ private:
             // A snapshot may also use what is free in the reserve, so eviction only has to make up
             // the rest.
             const auto reserve_free_in = [](const auto& seen) {
-                return seen.host_pause_reserve_bytes -
-                       std::min(seen.host_pause_reserve_bytes, seen.host_pause_reserve_occupied_bytes);
+                return pause_reserve_free(seen.host_pause_reserve_bytes,
+                                          seen.host_pause_reserve_occupied_bytes);
             };
             const auto usage        = instance_.program->physical_usage();
             std::size_t reserve_free = reserve_free_in(usage);
+            const std::size_t reserve_total = usage.host_pause_reserve_bytes;
             if (*bytes <= usage.capacity.host_bytes + reserve_free &&
                 *bytes > usage.capacity.host_bytes - usage.occupied.host_bytes + reserve_free) {
                 (void)instance_.program->release_redundant_host({}, request->sequence);
@@ -2574,17 +2575,20 @@ private:
             // when the freed bytes do not form one, ask for another image's worth and try again.
             // What the reserve holds needs no eviction, so a snapshot the reserve can take starts
             // from nothing to free and only the image's run can make the rounds ask for more.
-            std::size_t target = *bytes > reserve_free ? *bytes - reserve_free : 0;
+            std::size_t target = pause_eviction_target(*bytes, reserve_free);
             // Releasing a later paused snapshot can free bytes in the reserve rather than the
             // budget; those count toward the target too, so eviction stops as soon as they cover it.
             const auto reached = [&](const auto& seen) {
-                const std::size_t now    = reserve_free_in(seen);
-                const std::size_t gained = now > reserve_free ? now - reserve_free : 0;
-                return seen.capacity.host_bytes - seen.occupied.host_bytes + gained >= target;
+                return pause_target_reached(seen.capacity.host_bytes - seen.occupied.host_bytes,
+                                            reserve_free, reserve_free_in(seen), target);
             };
             for (std::size_t round = 0; round < kMaxPauseHostRounds; ++round) {
-                const auto victims =
-                    resources_.host_victims(*instance_.program, target, std::nullopt, later);
+                // The target is measured against the whole backing: with the budget full and later
+                // snapshots in the reserve it exceeds the budget, and those snapshots are victims
+                // that reach it.
+                const auto victims = resources_.host_victims(
+                    *instance_.program, target, std::nullopt, later, {}, std::nullopt, nullptr, {},
+                    reserve_total);
                 if (!victims) { break; }
                 for (const auto handle : *victims) {
                     if (reached(instance_.program->physical_usage())) { break; }

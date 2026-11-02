@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -85,6 +86,23 @@ public:
 
     // How many separate free runs there are. Many small runs mean the backing is fragmented.
     [[nodiscard]] std::size_t free_extent_count() const noexcept { return free_extents_.size(); }
+
+    // A free run of the backing: where it starts and how long it is. Sorted by offset, never
+    // touching another run.
+    struct FreeExtent {
+        std::size_t offset = 0;
+        std::size_t bytes  = 0;
+    };
+
+    [[nodiscard]] std::span<const FreeExtent> free_extents() const noexcept {
+        return free_extents_;
+    }
+
+    // Where `address`, a pointer into an allocation of this arena, sits in the backing.
+    [[nodiscard]] std::size_t offset_of(const void* address) const noexcept {
+        return static_cast<std::size_t>(static_cast<const std::byte*>(address) -
+                                        static_cast<const std::byte*>(backing_->data()));
+    }
 
     // Keeps `bytes` of the backing (rounded up to whole alignment units) for allocations made inside
     // a SnapshotScope: the Host copy of a paused request's progress. Every other allocation is
@@ -170,11 +188,6 @@ public:
 
 private:
     friend class HostContextAllocation;
-
-    struct FreeExtent {
-        std::size_t offset = 0;
-        std::size_t bytes  = 0;
-    };
 
     [[nodiscard]] std::size_t allocation_bytes(std::size_t bytes) const noexcept;
     [[nodiscard]] std::optional<std::size_t> find_free_extent(std::size_t bytes) const noexcept;

@@ -367,7 +367,8 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
     return state_images_only ? state_bytes : bytes;
 }
 
-std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle) const {
+std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle,
+                                                       PauseHostNeed* need) const {
     if (context_transaction_ || pending_transaction_ || !valid_sequence(handle) ||
         !host_context_arena) {
         return std::nullopt;
@@ -390,22 +391,29 @@ std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle) 
     std::size_t bytes = state_store->host_resident(sequence.state.read)
                             ? 0
                             : state_images->host_layout().image_bytes;
+    if (need) { need->image_bytes = bytes; }
     const auto count  = [&](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
                            KVAddressSpaceHandle address, std::uint32_t target) {
         const auto mapped   = addresses.mapped_pages(address);
         const auto required = kv_pages_for_frontier(target);
         const auto stride   = (&pages == text_kv_pages.get() ? text_host_kv_page_stride
                                                               : backend_host_kv_page_stride);
+        std::size_t missing = 0;
         for (std::uint32_t i = 0; i < std::min<std::uint32_t>(mapped, required); ++i) {
             const auto page = addresses.logical_page(address, i);
             // Deactivation removes this request's active reference. Other resident readers
             // keep their Device replica, so those pages need no new Host allocation.
             if (!pages.host_resident(page) && pages.active_address_references(page) <= 1) {
-                bytes += stride;
+                ++missing;
             }
         }
         // Masked-draft normalization can append accepted features before snapshot capture.
-        if (required > mapped) { bytes += static_cast<std::size_t>(required - mapped) * stride; }
+        if (required > mapped) { missing += static_cast<std::size_t>(required - mapped); }
+        bytes += missing * stride;
+        if (need) {
+            auto& pool = &pages == text_kv_pages.get() ? need->text : need->backend;
+            pool       = {.pages = missing, .stride = stride};
+        }
     };
     count(*text_kv_addresses, *text_kv_pages, sequence.kv->text, sequence.text_kv_valid);
     if (sequence.kv->backend) {
@@ -432,13 +440,13 @@ std::size_t ProgramImpl::pause_state_image_unplaced(SequenceHandle handle) const
 
 bool ProgramImpl::pause_snapshot_fits(SequenceHandle handle) const {
     if (!host_context_arena) { return false; }
-    const auto bytes = pause_host_bytes(handle);
-    // The KV pages can be split over runs, but each run holds whole pages, so what the free runs
-    // can take in units of the larger page stride bounds them (the image is counted in `bytes`
-    // too, which only makes this stricter); the state image needs a run of its own.
-    const std::size_t unit = std::max(text_host_kv_page_stride, backend_host_kv_page_stride);
-    return bytes.has_value() && *bytes <= host_context_arena->placeable_bytes(unit) &&
-           pause_state_image_unplaced(handle) == 0;
+    PauseHostNeed need;
+    if (!pause_host_bytes(handle, &need)) { return false; }
+    // Replays the placement the pause makes, on a copy of the arena's free runs: the state image
+    // takes a run of its own, then each pool's pages are split over the runs in whole pages of
+    // that pool's stride. A run too short for the larger stride can still hold the smaller
+    // pool's pages, which a bound in units of the larger stride loses.
+    return pause_snapshot_places(HostArenaModel(*host_context_arena), need);
 }
 
 std::size_t ProgramImpl::host_placeable_bytes(std::size_t unit) const noexcept {

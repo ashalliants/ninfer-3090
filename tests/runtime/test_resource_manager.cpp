@@ -110,6 +110,8 @@ struct Program {
     };
 
     std::size_t host_capacity;
+    // The pause snapshot reserve beyond `host_capacity` (the budget): blocks may fill it.
+    std::size_t host_reserve_bytes = 0;
     std::vector<Content> contents;
     std::vector<HostBlock> blocks;
     std::vector<Handle> released;
@@ -238,6 +240,11 @@ struct Program {
                             [&](const auto& content) { return references(content, block); })) {
                 result.occupied.host_bytes += blocks[block].bytes;
             }
+        }
+        // Bytes above the budget sit in the pause snapshot reserve, which the cache does not plan
+        // with: only the budget's share is reported occupied.
+        if (host_reserve_bytes) {
+            result.occupied.host_bytes = std::min(result.occupied.host_bytes, host_capacity);
         }
         return result;
     }
@@ -2155,6 +2162,41 @@ void test_rewritten_dialogue_outlives_its_abandoned_branch() {
             "Host pressure evicted the live branch before the abandoned one");
 }
 
+// A pause snapshot may also use the reserve, so its target (the snapshot's bytes less the free
+// reserve) can exceed the budget when later paused snapshots fill the reserve; releasing them is
+// part of reaching it (#398). Budget 100 full of history, reserve 40 full of one later snapshot.
+void test_pause_victims_reach_into_the_snapshot_reserve() {
+    Fixture f(100);
+    f.program.host_reserve_bytes = 40;
+    const auto older             = f.program.add(tokens(10, 5000), {f.program.host_block(60)});
+    const auto newer             = f.program.add(tokens(10, 6000), {f.program.host_block(40)});
+    const auto snapshot          = f.program.add(tokens(10, 7000), {f.program.host_block(40)});
+    for (const auto handle : {older, newer, snapshot}) {
+        f.program.contents[handle.index].device_state = false;
+        f.program.contents[handle.index].main_pages   = 0;
+    }
+    f.publish(older);
+    f.publish(newer);
+    const std::array<Handle, 1> later{snapshot};
+    const auto usage = f.program.physical_usage();
+    require(usage.occupied.host_bytes == usage.capacity.host_bytes,
+            "fixture budget must be full with the snapshot in the reserve");
+
+    // Without the reserve the target is refused, as every other caller still expects.
+    require(!f.cache.host_victims(f.program, 110, std::nullopt, later),
+            "a target above the budget was accepted without a reserve");
+    const auto victims =
+        f.cache.host_victims(f.program, 110, std::nullopt, later, {}, std::nullopt, nullptr, {}, 40);
+    require(victims && victims->size() == 3 &&
+                std::find(victims->begin(), victims->end(), snapshot) != victims->end() &&
+                victims->back() == snapshot,
+            "the later snapshot in the reserve was not offered after ordinary history");
+    // Beyond the budget and the reserve together nothing can reach it.
+    require(!f.cache.host_victims(f.program, 141, std::nullopt, later, {}, std::nullopt, nullptr,
+                                  {}, 40),
+            "a target above the whole backing was accepted");
+}
+
 void test_demotion_quotes_only_placeable_host_bytes() {
     // 32 bytes are free, but 16 of them are stranded in runs too short for the destination.
     Fixture f(64);
@@ -2663,6 +2705,7 @@ int main() {
         test_delayed_older_rewrite_does_not_supersede_a_newer_owner();
         test_failed_demotion_releases_superseded_history_before_the_live_branch();
         test_demotion_quotes_only_placeable_host_bytes();
+        test_pause_victims_reach_into_the_snapshot_reserve();
         test_state_demotion_releases_a_whole_image_when_no_run_fits();
         test_inherited_owner_heat_cannot_spend_a_full_other_continuation();
         test_exact_repeated_candidate_can_replace_a_long_hotspot_with_common_fallback();

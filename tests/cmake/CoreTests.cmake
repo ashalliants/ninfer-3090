@@ -97,6 +97,10 @@ ninfer_add_test(ninfer_host_context_arena_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_context_arena.cpp"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_host_arena_model_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_arena_model.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_chunked_reservation_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_chunked_reservation.cpp"
   LIBRARIES ninfer_core)
@@ -115,6 +119,7 @@ set_tests_properties(
   ninfer_arena_test
   ninfer_kv_cache_test
   ninfer_host_context_arena_test
+  ninfer_host_arena_model_test
   ninfer_state_store_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
