@@ -1811,7 +1811,7 @@ private:
         if constexpr (requires { plan.host_unit; }) { unit = plan.host_unit; }
         return host_victims_in_order(program, plan.host_bytes, preservation.checkpoint, {},
                                      protected_sources, preservation, cursor, evaluation, false,
-                                     plan.host_placeable, needs_state_run(plan), unit,
+                                     plan.host_placeable, needs_state_run(plan), 0, unit,
                                      plan.released.state_slots != 0);
     }
 
@@ -1897,84 +1897,104 @@ private:
                 return true;
             }
         };
-        std::vector<Handle> selected;
-        std::size_t released = 0;
-        // The shortage is the bytes beyond the placeable ones; freeing bytes next to a stranded
-        // hole can place the destination with fewer, so only the simulation ends a placing search.
-        while (placing ? !placed(selected) : released < required) {
-            std::optional<std::size_t> best;
-            std::vector<Handle> best_union;
-            std::size_t best_bytes = 0;
-            ActionRank best_rank;
-            std::size_t best_snapshot_order = 0;
-            for (std::size_t i = 0; i < actions.size(); ++i) {
-                auto combined = selected;
-                for (const auto handle : actions[i].sources) {
-                    if (!contains(combined, handle)) { combined.push_back(handle); }
-                }
-                // The same candidate comes up for every plan of one reclaim: what it frees and its
-                // facts are computed once per evaluation. Only the cheap facts stay cached (the
-                // survivor list is rebuilt per use), so the cache does not grow with the square of
-                // the checkpoint count.
-                CandidateMemo* const memo =
-                    candidate_memo_ ? candidate_memo(evaluation, combined) : nullptr;
-                const auto released_by = [&] {
-                    return state_run ? state_bytes_released(program, combined)
-                                     : program.host_bytes_released(combined);
-                };
-                std::size_t amount;
-                if (memo) {
-                    auto& cached = state_run ? memo->state_bytes : memo->host_bytes;
-                    if (!cached) { cached = released_by(); }
-                    amount = *cached;
-                } else {
-                    amount = released_by();
-                }
-                if (amount <= released) { continue; }
-                ActionFacts uncached;
-                if (memo) {
-                    if (!memo->facts) { memo->facts = action_facts(program, combined, cursor, evaluation); }
-                } else {
-                    uncached = action_facts(program, combined, cursor, evaluation);
-                }
-                ActionFacts& facts        = memo ? *memo->facts : uncached;
-                const auto drop_survivors = [&] {
-                    if (memo) { memo->facts->kept.reset(); }
-                };
-                // A migration must satisfy both its own preservation rights and the
-                // optional capture that requested space. Source heat cannot grant the
-                // outer capture permission to erase unrelated hot Host history.
-                if (!admits(program, combined, facts, admission, cursor, evaluation) ||
-                    !admits(program, combined, facts, cursor.admission, cursor, evaluation)) {
+        // One greedy search over the actions, optionally forced to start from action `first`.
+        const auto grow = [&](std::optional<std::size_t> first)
+                -> std::optional<std::vector<Handle>> {
+            auto remaining = actions;
+            std::vector<Handle> selected;
+            std::size_t released = 0;
+            bool opening         = true;
+            // The shortage is the bytes beyond the placeable ones; freeing bytes next to a stranded
+            // hole can place the destination with fewer, so only the simulation ends a placing search.
+            while (placing ? !placed(selected) : released < required) {
+                std::optional<std::size_t> best;
+                std::vector<Handle> best_union;
+                std::size_t best_bytes = 0;
+                ActionRank best_rank;
+                std::size_t best_snapshot_order = 0;
+                for (std::size_t i = 0; i < remaining.size(); ++i) {
+                    if (opening && first && i != *first) { continue; }
+                    auto combined = selected;
+                    for (const auto handle : remaining[i].sources) {
+                        if (!contains(combined, handle)) { combined.push_back(handle); }
+                    }
+                    // The same candidate comes up for every plan of one reclaim: what it frees and its
+                    // facts are computed once per evaluation. Only the cheap facts stay cached (the
+                    // survivor list is rebuilt per use), so the cache does not grow with the square of
+                    // the checkpoint count.
+                    CandidateMemo* const memo =
+                        candidate_memo_ ? candidate_memo(evaluation, combined) : nullptr;
+                    const auto released_by = [&] {
+                        return state_run ? state_bytes_released(program, combined)
+                                         : program.host_bytes_released(combined);
+                    };
+                    std::size_t amount;
+                    if (memo) {
+                        auto& cached = state_run ? memo->state_bytes : memo->host_bytes;
+                        if (!cached) { cached = released_by(); }
+                        amount = *cached;
+                    } else {
+                        amount = released_by();
+                    }
+                    if (amount <= released) { continue; }
+                    ActionFacts uncached;
+                    if (memo) {
+                        if (!memo->facts) { memo->facts = action_facts(program, combined, cursor, evaluation); }
+                    } else {
+                        uncached = action_facts(program, combined, cursor, evaluation);
+                    }
+                    ActionFacts& facts        = memo ? *memo->facts : uncached;
+                    const auto drop_survivors = [&] {
+                        if (memo) { memo->facts->kept.reset(); }
+                    };
+                    // A migration must satisfy both its own preservation rights and the
+                    // optional capture that requested space. Source heat cannot grant the
+                    // outer capture permission to erase unrelated hot Host history.
+                    if (!admits(program, combined, facts, admission, cursor, evaluation) ||
+                        !admits(program, combined, facts, cursor.admission, cursor, evaluation)) {
+                        drop_survivors();
+                        continue;
+                    }
+                    const auto rank            = rank_action(program, combined, facts,
+                                                             std::min<std::size_t>(amount, required), evaluation);
                     drop_survivors();
-                    continue;
-                }
-                const auto rank            = rank_action(program, combined, facts,
-                                                         std::min<std::size_t>(amount, required), evaluation);
-                drop_survivors();
-                std::size_t snapshot_order = 0;
-                for (std::size_t snapshot = 0; snapshot < later_snapshots.size(); ++snapshot) {
-                    if (contains(combined, later_snapshots[snapshot])) {
-                        snapshot_order = snapshot + 1;
+                    std::size_t snapshot_order = 0;
+                    for (std::size_t snapshot = 0; snapshot < later_snapshots.size(); ++snapshot) {
+                        if (contains(combined, later_snapshots[snapshot])) {
+                            snapshot_order = snapshot + 1;
+                        }
+                    }
+                    // Ordinary history is exhausted before Engine-owned paused snapshots.
+                    // Snapshot candidates retain the Engine's explicit youngest-first order.
+                    if (!best || snapshot_order < best_snapshot_order ||
+                        (snapshot_order == best_snapshot_order && less_rank(rank, best_rank))) {
+                        best                = i;
+                        best_union          = std::move(combined);
+                        best_bytes          = amount;
+                        best_rank           = rank;
+                        best_snapshot_order = snapshot_order;
                     }
                 }
-                // Ordinary history is exhausted before Engine-owned paused snapshots.
-                // Snapshot candidates retain the Engine's explicit youngest-first order.
-                if (!best || snapshot_order < best_snapshot_order ||
-                    (snapshot_order == best_snapshot_order && less_rank(rank, best_rank))) {
-                    best                = i;
-                    best_union          = std::move(combined);
-                    best_bytes          = amount;
-                    best_rank           = rank;
-                    best_snapshot_order = snapshot_order;
-                }
+                if (!best) { return std::nullopt; }
+                selected = std::move(best_union);
+                released = best_bytes;
+                remaining.erase(remaining.begin() + *best);
+                opening = false;
             }
-            if (!best) { return std::nullopt; }
-            selected = std::move(best_union);
-            released = best_bytes;
-            actions.erase(actions.begin() + *best);
+            return selected;
+        };
+        auto found = grow(std::nullopt);
+        // The greedy order can dead-end: its first pick frees an extent that joins no run, and the
+        // union with any later action is then refused by admission (the recovery loss reaches the
+        // gain limit), although a later action alone is admissible and would place. Retry from
+        // each action as the opening pick; this only runs when the search would otherwise report
+        // the demotion blocked.
+        if (!found && placing) {
+            for (std::size_t first = 0; first < actions.size() && !found; ++first) {
+                found = grow(first);
+            }
         }
-        return selected;
+        return found;
     }
 
     // Write-on-evict: the inactive, live continuations about to lose a point, while every point is

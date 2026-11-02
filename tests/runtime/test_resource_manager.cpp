@@ -2262,14 +2262,15 @@ struct FragmentedHost {
     Handle incoming{};
     std::array<Handle, 3> history{};
 
-    explicit FragmentedHost(bool last_evictable) {
+    explicit FragmentedHost(bool last_evictable,
+                            std::array<std::uint32_t, 3> lengths = {10, 10, 10}) {
         f.program.run_unit = 100;
         (void)f.program.host_block(150, true); // [50,200)
         (void)f.program.host_block(50, true);  // [250,300)
         f.program.base_free_runs = {{350, 50}};
         const std::array<std::size_t, 3> offsets{0, 200, 300};
         for (std::size_t i = 0; i < history.size(); ++i) {
-            history[i] = f.program.add(tokens(10, 5000 + 100 * static_cast<std::uint32_t>(i)),
+            history[i] = f.program.add(tokens(lengths[i], 5000 + 100 * static_cast<std::uint32_t>(i)),
                                        {f.program.host_block_at(offsets[i], 50)});
             f.program.contents[history[i].index].device_state = false;
             f.program.contents[history[i].index].main_pages   = 0;
@@ -2340,6 +2341,20 @@ void test_demotion_victims_account_for_post_release_extents() {
     require(stuck.f.program.released.empty() && stuck.f.program.placement_failures == 0 &&
                 stuck.f.program.demoted.empty(),
             "an unplaceable demotion displaced Host history it could not use");
+}
+
+// The cheapest history ranks first but frees an extent that joins no run. Taking the joining history
+// on top of it would cost more than the demotion may sacrifice, yet the joining history alone is
+// affordable and places the page: the search must not give up after its first pick.
+void test_placement_search_recovers_from_an_unaffordable_union() {
+    FragmentedHost fragmented(true, {{400, 400, 600}});
+    auto& program = fragmented.f.program;
+    require(fragmented.f.cache.reclaim(program, {.main_kv_pages = 1}) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                program.demoted == std::vector<Handle>{fragmented.incoming} &&
+                program.placement_failures == 0 &&
+                program.released == std::vector<Handle>{fragmented.history[2]},
+            "a legal victim set was missed after the first pick could not join a run");
 }
 
 void test_demotion_quotes_only_placeable_host_bytes() {
@@ -2853,6 +2868,7 @@ int main() {
         test_pause_victims_reach_into_the_snapshot_reserve();
         test_host_placement_arithmetic();
         test_demotion_victims_account_for_post_release_extents();
+        test_placement_search_recovers_from_an_unaffordable_union();
         test_state_demotion_releases_a_whole_image_when_no_run_fits();
         test_inherited_owner_heat_cannot_spend_a_full_other_continuation();
         test_exact_repeated_candidate_can_replace_a_long_hotspot_with_common_fallback();
