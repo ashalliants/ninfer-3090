@@ -67,6 +67,8 @@ public:
     // What the test turns: requests in flight, and the failures the next call raises.
     std::atomic<std::size_t> admitted{0};
     std::atomic<bool> resume_fails{false};
+    // The configured --model-suspend auto-resume default (EngineOptions::suspend.auto_resume).
+    bool default_auto_resume = true;
     std::atomic<bool> suspend_unavailable{false};
     std::atomic<bool> suspend_crashes{false};
     std::atomic<int> suspend_refusals{0}; // the next N suspends refuse as busy
@@ -109,7 +111,9 @@ public:
             ++status_.suspend_count;
             status_.last_suspend = ninfer::ResidencyTransition{.seconds = 0.5, .state_bytes = 1024};
         }
-        if (auto_resume) { status_.auto_resume = *auto_resume; }
+        // As Engine::suspend: every successful call, including one on an already suspended model,
+        // sets auto_resume to the request's value or, when none is given, to the configured default.
+        status_.auto_resume = auto_resume.value_or(default_auto_resume);
         return status_;
     }
 
@@ -129,7 +133,7 @@ public:
             ++status_.resume_count;
             status_.last_resume = ninfer::ResidencyTransition{.seconds = 0.25, .weight_bytes = 2048};
         }
-        status_.auto_resume = true;
+        // As Engine::resume: auto_resume is left as the last suspend set it.
         return status_;
     }
 
@@ -196,6 +200,9 @@ struct Rig {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         while (std::chrono::steady_clock::now() < deadline) {
             auto probe = client();
+            // Short timeouts keep a stalled probe from outlasting the deadline.
+            probe.set_connection_timeout(0, 200000);
+            probe.set_read_timeout(0, 200000);
             if (probe.Get("/__ready_probe")) { return; }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
@@ -319,6 +326,18 @@ void suspend_and_resume() {
     reply = post(rig, kSuspend, R"({"auto_resume":true})");
     expect(reply.status == 200 && reply.json["auto_resume"] == true && reply.json["suspend_count"] == 3,
            "suspending a suspended model only updates auto_resume");
+    reply = post(rig, kSuspend);
+    expect(reply.status == 200 && reply.json["auto_resume"] == true &&
+               reply.json["suspend_count"] == 3,
+           "a repeat suspend without a value resets auto_resume to the default");
+    rig.service.default_auto_resume = false;
+    reply                           = post(rig, kSuspend);
+    expect(reply.status == 200 && reply.json["auto_resume"] == false,
+           "and the default is the configured one, not always true");
+    reply = post(rig, kResume);
+    expect(reply.status == 200 && reply.json["state"] == "resident" &&
+               reply.json["auto_resume"] == false,
+           "resume leaves auto_resume as the last suspend set it");
 }
 
 void resume_body_validation() {
