@@ -419,6 +419,7 @@ public:
         gate(deadline);
         // Runs what the test wants to happen while a chunk is on its way, as another request would.
         if (on_chunk_get && key.find("chunks/") != std::string::npos) { on_chunk_get(); }
+        if (on_manifest_get && key.find("manifests/") != std::string::npos) { on_manifest_get(); }
         std::scoped_lock lock(mutex);
         if (down) { throw std::runtime_error("the bucket is unreachable"); }
         if (key.find("chunks/") != std::string::npos) { ++chunk_gets; }
@@ -1634,23 +1635,36 @@ void test_remote_only_manifests_are_bounded_by_max_bytes() {
     TempDirectory reader_directory;
     auto remote = std::make_shared<MemoryObjectStore>();
     const auto put_session = [&](ContextStore& store, int index) {
+
+// Twelve sessions ("10" to "1b", oldest first) written to the bucket by another engine; returns the
+// size of a manifest there.
+std::uint64_t fill_bucket_with_sessions(const std::shared_ptr<MemoryObjectStore>& remote,
+                                        const fs::path& writer_directory) {
+    ContextStore store(remote_options(writer_directory, remote));
+    for (int index = 0; index < 12; ++index) {
         const std::string id = std::string("1") + "0123456789abcdef"[index];
-        (void)store.put(describe(id),
-                        concat({pseudo_random(30, 10 + index), pseudo_random(3000, 40 + index)}),
-                        std::array{ContextStore::Region{30, 3000}});
+        (void)store.put(describe(id), concat({pseudo_random(30, 10 + index), pseudo_random(300, 40 + index)}),
+                        std::array{ContextStore::Region{30, 300}});
         remote->clock += 10;
         check(drained(store), "an upload did not drain");
-    };
-    {
-        ContextStore store(remote_options(writer_directory.path(), remote));
-        for (int index = 0; index < 12; ++index) { put_session(store, index); }
     }
     std::uint64_t manifest_bytes = 0;
     for (const auto& [key, object] : remote->objects) {
         if (key.find("manifests/") != std::string::npos) { manifest_bytes = object.first.size(); }
     }
     check(manifest_bytes > 0, "no manifest in the bucket");
-    ContextStore::Options options = remote_options(reader_directory.path(), remote);
+    return manifest_bytes;
+}
+
+// A bucket with very many sessions must not grow the directory through manifests alone: the
+// manifests of images the directory holds no chunk of take a quarter of max_bytes, filled with the
+// newest in the bucket, and a refresh that finds the rest again downloads nothing more.
+void test_remote_only_manifests_are_bounded_by_max_bytes() {
+    TempDirectory writer_directory;
+    TempDirectory reader_directory;
+    auto remote                        = std::make_shared<MemoryObjectStore>();
+    const std::uint64_t manifest_bytes = fill_bucket_with_sessions(remote, writer_directory.path());
+    ContextStore::Options options      = remote_options(reader_directory.path(), remote);
     options.max_bytes = 4 * (3 * manifest_bytes + manifest_bytes / 2); // the share holds three
     ContextStore reader(options);
     check(reader.refresh_remote() == 3 && reader.list().size() == 3,
@@ -1668,8 +1682,8 @@ void test_remote_only_manifests_are_bounded_by_max_bytes() {
     // A newer session takes the room of the oldest one registered.
     {
         ContextStore store(remote_options(writer_directory.path(), remote));
-        (void)store.put(describe("1f"), concat({pseudo_random(30, 99), pseudo_random(3000, 98)}),
-                        std::array{ContextStore::Region{30, 3000}});
+        (void)store.put(describe("1f"), concat({pseudo_random(30, 99), pseudo_random(300, 98)}),
+                        std::array{ContextStore::Region{30, 300}});
         remote->clock += 10;
         check(drained(store), "the new session did not upload");
     }
@@ -1678,7 +1692,62 @@ void test_remote_only_manifests_are_bounded_by_max_bytes() {
           "a newer session did not replace the oldest registered one");
     // A registered session can still be fetched on demand.
     const auto loaded = reader.load("1f");
-    check(loaded && loaded->size() == 3030, "a registered session could not be loaded");
+    check(loaded && loaded->size() == 330, "a registered session could not be loaded");
+}
+
+// A lookup may register a manifest while a refresh is between its room check and its insertion
+// (the bucket read in between runs without the locks): the refresh must count it, or the two
+// together pass the share.
+void test_remote_only_share_holds_when_a_lookup_registers_during_a_refresh() {
+    TempDirectory writer_directory;
+    TempDirectory reader_directory;
+    auto remote                        = std::make_shared<MemoryObjectStore>();
+    const std::uint64_t manifest_bytes = fill_bucket_with_sessions(remote, writer_directory.path());
+    ContextStore::Options options      = remote_options(reader_directory.path(), remote);
+    options.max_bytes = 4 * (3 * manifest_bytes + manifest_bytes / 2); // the share holds three
+    ContextStore reader(options);
+    bool lookup_done = false;
+    remote->on_manifest_get = [&] {
+        if (lookup_done) { return; }
+        lookup_done = true; // once: at the refresh's first manifest, register an older session
+        const auto now = std::chrono::steady_clock::now();
+        (void)reader.lookup_remote(now, now + std::chrono::seconds(5),
+                                   [](const std::string& id) { return id == "17"; });
+    };
+    (void)reader.refresh_remote();
+    remote->on_manifest_get = nullptr;
+    check(lookup_done, "the lookup did not run during the refresh");
+    check(reader.list().size() == 3, "the lookup and the refresh together passed the remote-only share");
+    check(reader.stats().used_bytes <= options.max_bytes, "manifests alone exceeded max_bytes");
+    for (int index = 9; index < 12; ++index) {
+        check(reader.find(std::string("1") + "0123456789abcdef"[index]).has_value(),
+              "the newest sessions were not the ones kept");
+    }
+}
+
+// Manifests of images the directory holds a chunk of are not remote-only: they are not counted
+// against the share, so they do not keep out newer ones that are.
+void test_remote_only_share_ignores_manifests_with_local_chunks() {
+    TempDirectory writer_directory;
+    TempDirectory reader_directory;
+    auto remote                        = std::make_shared<MemoryObjectStore>();
+    const std::uint64_t manifest_bytes = fill_bucket_with_sessions(remote, writer_directory.path());
+    ContextStore::Options options      = remote_options(reader_directory.path(), remote);
+    options.max_bytes = 4 * (3 * manifest_bytes + manifest_bytes / 2);
+    // The bucket is out of reach while the store starts, so its first refresh registers nothing.
+    remote->down = true;
+    ContextStore reader(options);
+    check(drained(reader), "the first refresh did not finish");
+    remote->down = false;
+    // Session "1b" is in the bucket; this store holds its chunk under another id.
+    (void)reader.put(describe("2a"), concat({pseudo_random(30, 10 + 11), pseudo_random(300, 40 + 11)}),
+                     std::array{ContextStore::Region{30, 300}});
+    check(drained(reader), "an upload did not drain");
+    check(reader.find("2a").has_value(), "the local session was not kept");
+    // "1b" and "2a" hold local bytes (not counted); the share (three) then holds three more.
+    check(reader.refresh_remote() == 4 && reader.find("1b").has_value() && reader.find("19").has_value() &&
+              reader.find("18").has_value(),
+          "a manifest with a local chunk was counted against the remote-only share");
 }
 
 void test_remote_survives_local_eviction() {
@@ -3454,6 +3523,8 @@ int main() {
     test_queued_upload_of_a_retired_version_is_dropped();
     test_remote_requests_are_abandoned_at_the_deadline();
     test_remote_only_manifests_are_bounded_by_max_bytes();
+    test_remote_only_share_holds_when_a_lookup_registers_during_a_refresh();
+    test_remote_only_share_ignores_manifests_with_local_chunks();
     test_remote_damage_and_outage_are_misses();
     test_remote_use_restarts_the_remote_age();
     test_remote_refresh_respects_its_deadline();

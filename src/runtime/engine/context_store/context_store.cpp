@@ -1139,9 +1139,10 @@ void ContextStore::maintain_locked(const std::string* protect) {
         // registers one each: the ones nothing else holds may take only their share of the limit.
         // (The cheap test first: the manifests altogether are under it, so these are.)
         if (options_.remote && manifest_total_bytes_ > remote_only_budget_locked()) {
-            std::uint64_t remote_only = remote_only_bytes_locked();
-            (void)make_room_for_remote_only_locked(0, std::numeric_limits<std::int64_t>::max(),
-                                                   remote_only, protect);
+            RemoteOnlyShare share;
+            share.bytes = remote_only_bytes_locked();
+            (void)make_room_for_remote_only_locked(0, std::numeric_limits<std::int64_t>::max(), share,
+                                                   protect);
         }
     }
 }
@@ -2643,26 +2644,35 @@ std::uint64_t ContextStore::remote_only_bytes_locked() const {
 }
 
 bool ContextStore::make_room_for_remote_only_locked(std::uint64_t incoming, std::int64_t newer_than,
-                                                    std::uint64_t& total, const std::string* protect) {
+                                                    RemoteOnlyShare& share, const std::string* protect) {
     const std::uint64_t budget = remote_only_budget_locked();
     if (incoming > budget) { return false; }
-    while (total + incoming > budget) {
-        const Entry* oldest = nullptr;
-        std::int64_t oldest_ms = 0;
-        for (const auto& [id, entry] : entries_) {
-            if (!entry.published || loading_.count(id) != 0 || (protect != nullptr && id == *protect) ||
-                entry_has_local_bytes_locked(entry)) {
-                continue;
+    const auto eligible = [&](const std::string& id, const Entry& entry) {
+        return entry.published && loading_.count(id) == 0 && (protect == nullptr || id != *protect) &&
+               !entry_has_local_bytes_locked(entry);
+    };
+    while (share.bytes + incoming > budget) {
+        if (!share.built) {
+            for (const auto& [id, entry] : entries_) {
+                if (eligible(id, entry)) {
+                    share.oldest_first.emplace_back(recency_ms(entry.info.last_used_ms, entry.remote_modified_ms),
+                                                    id);
+                }
             }
-            const std::int64_t ms = recency_ms(entry.info.last_used_ms, entry.remote_modified_ms);
-            if (ms < newer_than && (oldest == nullptr || ms < oldest_ms)) {
-                oldest    = &entry;
-                oldest_ms = ms;
-            }
+            std::sort(share.oldest_first.begin(), share.oldest_first.end());
+            share.built = true;
         }
-        if (oldest == nullptr) { return false; }
-        const std::string id = oldest->info.id; // the entry goes with the removal
-        total -= std::min(total, oldest->manifest_bytes);
+        if (share.next >= share.oldest_first.size() || share.oldest_first[share.next].first >= newer_than) {
+            return false; // sorted: nothing further is older either
+        }
+        const std::string id = share.oldest_first[share.next++].second;
+        const auto it        = entries_.find(id);
+        // Gone, or changed since the order was made (used again, or chunks arrived): not dropped.
+        if (it == entries_.end() || !eligible(id, it->second) ||
+            recency_ms(it->second.info.last_used_ms, it->second.remote_modified_ms) >= newer_than) {
+            continue;
+        }
+        share.bytes -= std::min(share.bytes, it->second.manifest_bytes);
         remove_entry_locked(id, false);
         ++stats_.remote_only_dropped;
     }
@@ -2671,7 +2681,7 @@ bool ContextStore::make_room_for_remote_only_locked(std::uint64_t incoming, std:
 
 bool ContextStore::register_remote_image(const ObjectInfo& object, const std::string& id,
                                          std::chrono::steady_clock::time_point listed_at,
-                                         std::uint64_t* remote_only, bool* declined,
+                                         RemoteOnlyShare* share, bool* declined,
                                          std::chrono::steady_clock::time_point deadline) {
     {
         std::scoped_lock lock(mutex_);
@@ -2687,19 +2697,23 @@ bool ContextStore::register_remote_image(const ObjectInfo& object, const std::st
             remote_failed_.erase(failed);
         }
     }
+    RemoteOnlyShare local_share;
+    std::uint64_t generation_at_check = 0;
     if (options_.max_bytes != 0) {
         // The manifest must fit the remote-only share, decided from the listing alone (before
         // anything is downloaded), by making room from the older remote-only entries only.
         std::scoped_lock io(io_mutex_);
         std::scoped_lock lock(mutex_);
-        std::uint64_t counted = remote_only != nullptr ? *remote_only : remote_only_bytes_locked();
-        const bool fits = make_room_for_remote_only_locked(object.size, object.modified_ms, counted, nullptr);
-        if (remote_only != nullptr) { *remote_only = counted; }
-        if (!fits) {
+        if (share == nullptr) {
+            local_share.bytes = remote_only_bytes_locked();
+            share             = &local_share;
+        }
+        if (!make_room_for_remote_only_locked(object.size, object.modified_ms, *share, nullptr)) {
             ++stats_.remote_only_dropped;
             if (declined != nullptr) { *declined = true; }
             return false;
         }
+        generation_at_check = next_generation_;
     }
     const std::optional<std::vector<std::uint8_t>> data = 
         options_.remote->get_before(object.key, deadline);
@@ -2750,16 +2764,32 @@ bool ContextStore::register_remote_image(const ObjectInfo& object, const std::st
     std::scoped_lock lock(mutex_);
     // A refresh and a lookup may register the same image at once: the first one wins.
     if (entries_.find(id) != entries_.end()) { return false; }
+    // The room made before the download was made without the lock held since: a refresh and a
+    // lookup may each have passed it against the same total. Revalidate, now that the manifest's
+    // own size and chunks are known, before anything is published.
+    add_references(entry);
+    const bool remote_only_entry = !entry_has_local_bytes_locked(entry);
+    if (share != nullptr && remote_only_entry) {
+        if (next_generation_ != generation_at_check) { // someone registered meanwhile: recount
+            *share       = RemoteOnlyShare{};
+            share->bytes = remote_only_bytes_locked();
+        }
+        if (!make_room_for_remote_only_locked(entry.manifest_bytes, object.modified_ms, *share, nullptr)) {
+            ++stats_.remote_only_dropped;
+            if (declined != nullptr) { *declined = true; }
+            release_references(entry);
+            return false;
+        }
+    }
     write_atomically(manifest_path(id), *data);
     write_published_locked(id, *data);
     manifest_total_bytes_ += entry.manifest_bytes;
-    add_references(entry);
     // The listing shows the manifest, not its chunks (a lifecycle rule or a person may have
     // removed one): their bucket presence stays unknown, so a write that shares them checks
     // before it skips the upload.
     entry.generation         = ++next_generation_;
     entry.remote_modified_ms = object.modified_ms;
-    if (remote_only != nullptr) { *remote_only += entry.manifest_bytes; }
+    if (share != nullptr && remote_only_entry) { share->bytes += entry.manifest_bytes; }
     entries_.emplace(id, std::move(entry));
     return true;
 }
@@ -2809,13 +2839,13 @@ std::size_t ContextStore::refresh_remote_locked(std::chrono::steady_clock::time_
         std::vector<const ObjectInfo*> order;
         order.reserve(listing->objects.size());
         for (const ObjectInfo& object : listing->objects) { order.push_back(&object); }
-        std::uint64_t remote_only = 0;
+        RemoteOnlyShare share;
         if (options_.max_bytes != 0) {
             std::stable_sort(order.begin(), order.end(), [](const ObjectInfo* a, const ObjectInfo* b) {
                 return a->modified_ms > b->modified_ms;
             });
             std::scoped_lock lock(mutex_);
-            remote_only = remote_only_bytes_locked();
+            share.bytes = remote_only_bytes_locked();
         }
         bool share_full = false;
         for (const ObjectInfo* listed_object : order) {
@@ -2831,7 +2861,7 @@ std::size_t ContextStore::refresh_remote_locked(std::chrono::steady_clock::time_
             listed.insert(id);
             if (share_full) { continue; }
             bool declined = false;
-            if (register_remote_image(object, id, listing->listed_at, &remote_only, &declined,
+            if (register_remote_image(object, id, listing->listed_at, &share, &declined,
                                      deadline)) {
                 ++added;
             }
