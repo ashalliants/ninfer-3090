@@ -626,9 +626,10 @@ private:
     // Downloads a manifest that a listing asked for at `listed_at` showed and adds its image to the
     // index, unless the index holds it or the id is given up on. True when it was added.
     // With max_bytes set, registering keeps the directory within its limits: the manifest of an
-    // image that does not stay within the remote-only share is not registered (`declined`, when
-    // given, is set then; a listing shows that before anything is downloaded), and afterwards the
-    // whole limit is enforced as a write does. The download of the manifest stops at `deadline`
+    // image that does not stay within the remote-only share is not kept (`declined`, when given, is
+    // set then; judged once the manifest is downloaded and its chunks are known, since an image
+    // with a chunk on disk, or held inline, is not remote-only), and afterwards the whole limit is
+    // enforced as a write does. The download of the manifest stops at `deadline`
     // (DeadlineExceeded).
     bool register_remote_image(const ObjectInfo& object, const std::string& id,
                                std::chrono::steady_clock::time_point listed_at, bool* declined = nullptr,
@@ -641,9 +642,6 @@ private:
     // Drops the oldest remote-only manifests (by last use or bucket time) until they are within
     // their share. Works from the entries as they are, keeping no total or order between calls.
     void enforce_remote_only_share_locked(const std::string* protect);
-    // Whether a manifest listed as `object` would stay within the share, were it registered:
-    // true when the newer remote-only manifests leave room for it.
-    [[nodiscard]] bool remote_only_fits_locked(const ObjectInfo& object, const std::string& id) const;
     std::int64_t last_prune_ms_ = 0; // remote worker thread only
 
     // Peer import. `owner_` holds the exclusive lock on options_.directory for the store's life.

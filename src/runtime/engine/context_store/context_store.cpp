@@ -2660,18 +2660,6 @@ void ContextStore::enforce_remote_only_share_locked(const std::string* protect) 
     }
 }
 
-bool ContextStore::remote_only_fits_locked(const ObjectInfo& object, const std::string& id) const {
-    const RemoteOnlyRank mine = remote_only_rank(id, object.modified_ms, object.modified_ms);
-    std::uint64_t kept        = object.size; // what the share holds if it is registered
-    for (const auto& [other, entry] : entries_) {
-        if (remote_only_locked(entry) &&
-            mine < remote_only_rank(other, entry.info.last_used_ms, entry.remote_modified_ms)) {
-            kept += entry.manifest_bytes;
-        }
-    }
-    return kept <= remote_only_budget_locked();
-}
-
 bool ContextStore::register_remote_image(const ObjectInfo& object, const std::string& id,
                                          std::chrono::steady_clock::time_point listed_at,
                                          bool* declined,
@@ -2690,16 +2678,12 @@ bool ContextStore::register_remote_image(const ObjectInfo& object, const std::st
             remote_failed_.erase(failed);
         }
     }
-    if (options_.max_bytes != 0) {
-        // Not downloaded when the listing alone shows it would not stay: newer remote-only
-        // manifests already fill the share. Only a saving; the check after insertion decides.
-        std::scoped_lock lock(mutex_);
-        if (!remote_only_fits_locked(object, id)) {
-            ++stats_.remote_only_dropped;
-            if (declined != nullptr) { *declined = true; }
-            return false;
-        }
-    }
+    // No check against the remote-only share before the download: the listing shows only the
+    // manifest's size, not whether the image is remote-only. An image held inline, or sharing a
+    // chunk already on disk (chunks are content-addressed and shared across images), is local and
+    // does not count against the share, however old it is. The share is enforced after insertion,
+    // when the manifest's chunks are known. A refresh stops at the first image so declined, so a
+    // full share costs at most one manifest download more per refresh.
     const std::optional<std::vector<std::uint8_t>> data =
         options_.remote->get_before(object.key, deadline);
     if (!data) {
