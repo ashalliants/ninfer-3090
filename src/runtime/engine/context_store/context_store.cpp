@@ -567,11 +567,15 @@ void ContextStore::write_published_locked(const std::string& id,
     // The manifest's own checksum, its last 8 bytes, names exactly the manifest published.
     if (manifest.size() < sizeof(std::uint64_t)) { return; }
     try {
-        write_atomically(published_path(id), manifest.subspan(manifest.size() - sizeof(std::uint64_t)));
+        write_atomically(published_path(id), manifest_checksum(manifest));
     } catch (const std::exception&) {
         // Without the marker a restart only treats the image as unpublished: removed whole on
         // eviction instead of kept for the bucket.
     }
+}
+
+std::span<const std::uint8_t> ContextStore::manifest_checksum(std::span<const std::uint8_t> manifest) {
+    return manifest.last(std::min(manifest.size(), sizeof(std::uint64_t)));
 }
 
 fs::path ContextStore::peer_origin_path(const std::string& id) const {
@@ -930,9 +934,26 @@ void ContextStore::scan() {
             continue;
         }
         entry.info.last_used_ms = entry.info.created_ms;
+        // The marker names the peer manifest it was written for, so a marker left by an earlier
+        // image of the id (or one that could not be removed) matches nothing and changes nothing.
+        // One that exists but cannot be read is not trusted to be stale: the image stays the
+        // peer's, which only withholds an upload.
         {
             std::error_code marker_error;
-            entry.peer_origin = fs::exists(peer_origin_path(id), marker_error);
+            const bool marked = fs::exists(peer_origin_path(id), marker_error);
+            if (marker_error) {
+                entry.peer_origin = true;
+            } else if (marked) {
+                try {
+                    const std::vector<std::uint8_t> mark = read_whole_file(peer_origin_path(id));
+                    const std::vector<std::uint8_t> body = read_whole_file(path);
+                    const auto tail                      = manifest_checksum(body);
+                    entry.peer_origin = std::equal(mark.begin(), mark.end(), tail.begin(), tail.end());
+                } catch (const std::exception&) {
+                    entry.peer_origin = true;
+                }
+                if (!entry.peer_origin) { remove_quietly(peer_origin_path(id)); }
+            }
         }
         if (options_.remote) {
             // Published before the restart, and this manifest is the one published (not a newer
@@ -1356,15 +1377,6 @@ ContextStore::PutResult ContextStore::put(const Description& description,
                 written.push_back(path);
                 if (chunk.known) { refilled.emplace_back(hex_key(chunk.chunk.hash), stored.bytes); }
                 stored_written += stored.bytes;
-            }
-            // Written here: this store's own to upload, whatever a peer wrote under the id before.
-            // The marker goes first, and a marker that cannot be removed fails the write: a stale
-            // one would make a restart withhold this image from the bucket.
-            std::error_code marker_error;
-            fs::remove(peer_origin_path(description.id), marker_error);
-            if (fs::exists(peer_origin_path(description.id), marker_error)) {
-                throw std::runtime_error("context store: cannot clear the peer marker of " +
-                                         description.id);
             }
             write_atomically(manifest_path(description.id), manifest.out);
         }
@@ -3078,11 +3090,11 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
         linked_bytes += source.size;
     }
     if (held == nullptr) {
-        // The marker comes before the manifest: a crash or failure between the two leaves a
-        // marker with no manifest (swept at the next scan or overwritten), never a peer's image
-        // that a restart takes for this store's own and uploads.
+        // The marker names this manifest and comes before it: a crash or failure between the two
+        // leaves a marker that matches no manifest, never a peer's image that a restart takes for
+        // this store's own and uploads.
         try {
-            write_atomically(peer_origin_path(id), {});
+            write_atomically(peer_origin_path(id), manifest_checksum(data));
             write_atomically(manifest_path(id), data);
         } catch (const std::exception&) {
             remove_quietly(peer_origin_path(id));

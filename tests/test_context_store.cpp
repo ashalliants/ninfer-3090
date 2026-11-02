@@ -2270,7 +2270,8 @@ std::uint64_t physical_bytes(const std::vector<fs::path>& directories) {
     for (const fs::path& directory : directories) {
         for (const char* part : {"chunks", "manifests"}) {
             for (const auto& item : fs::recursive_directory_iterator(directory / part)) {
-                if (!item.is_regular_file() || item.path().extension() == ".used") { continue; }
+                const std::string extension = item.path().extension().string();
+                if (!item.is_regular_file() || extension == ".used" || extension == ".peer") { continue; }
                 const std::uint64_t links = fs::hard_link_count(item.path());
                 total += (fs::file_size(item.path()) + links - 1) / links;
             }
@@ -2991,7 +2992,9 @@ void test_chunk_provenance_ends_when_the_peer_file_is_replaced() {
 }
 
 // The `.peer` marker is part of the import: an import that cannot record it does not happen, a
-// discarded manifest takes its marker, and a put that cannot clear it fails.
+// discarded manifest takes its marker. A marker names the manifest it was written for, so a stale
+// one (an earlier image of the id) changes nothing, and one that cannot be read keeps the image
+// the peer's.
 void test_peer_marker_follows_the_manifest() {
     TempDirectory a_directory;
     TempDirectory b_directory;
@@ -3010,14 +3013,6 @@ void test_peer_marker_follows_the_manifest() {
               "an image was imported without its origin marker");
         check(!fs::exists(b_directory.path() / "manifests" / "0a.manifest"),
               "a failed import left a manifest behind");
-        // A put cannot clear an unremovable marker either.
-        bool threw = false;
-        try {
-            (void)b.put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
-        } catch (const std::exception&) {
-            threw = true;
-        }
-        check(threw, "a put went ahead with a peer marker it could not clear");
         fs::remove_all(marker);
     }
     {
@@ -3037,6 +3032,38 @@ void test_peer_marker_follows_the_manifest() {
     {
         ContextStore b(options);
         check(!fs::exists(marker), "an orphan peer marker was kept");
+    }
+    // Markers beside this store's own images: a stale one (another manifest's checksum) leaves the
+    // image this store's to upload; one that exists but cannot be read withholds the upload.
+    {
+        TempDirectory c_directory;
+        const auto remote             = std::make_shared<MemoryObjectStore>();
+        ContextStore::Options own     = remote_options(c_directory.path(), remote);
+        const std::vector<std::uint8_t> stale(8, 0x42);
+        {
+            ContextStore c(own);
+            (void)c.put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
+            (void)c.put(describe("0b"), peer_image(16), std::array{ContextStore::Region{30, 5000}});
+            // Stopped before the queue runs: the restart decides what is uploaded.
+        }
+        remote->objects.clear();
+        for (const char* id : {"0a", "0b"}) {
+            fs::remove(c_directory.path() / "manifests" / (std::string(id) + ".published"));
+        }
+        { std::ofstream(c_directory.path() / "manifests" / "0a.peer", std::ios::binary).write("BBBBBBBB", 8); }
+        fs::create_directories(c_directory.path() / "manifests" / "0b.peer" / "unreadable");
+        ContextStore c(own);
+        check(c.upload_unpublished("model-a", std::chrono::steady_clock::now() + std::chrono::seconds(10)),
+              "the flush did not finish");
+        check(!fs::exists(c_directory.path() / "manifests" / "0a.peer"), "a stale marker was kept");
+        bool a_uploaded = false;
+        bool b_uploaded = false;
+        for (const auto& object : remote->objects) {
+            a_uploaded = a_uploaded || object.first.find("0a") != std::string::npos;
+            b_uploaded = b_uploaded || object.first.find("0b") != std::string::npos;
+        }
+        check(a_uploaded, "a stale marker withheld an image this store wrote");
+        check(!b_uploaded, "an unreadable marker let a possibly peer-owned image be uploaded");
     }
 }
 

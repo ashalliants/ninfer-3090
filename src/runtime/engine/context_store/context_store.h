@@ -370,7 +370,7 @@ private:
         std::int64_t peer_stamp = 0;
         // The image came from a peer, now or before a restart (a `.peer` marker beside the
         // manifest says so). Such an image is the peer's to upload, so a use here, and the flush
-        // before shutdown, never put it in the bucket. Writing the id here clears it.
+        // before shutdown, never put it in the bucket. A write of the id here is a different manifest, so it is no longer the peer's.
         bool peer_origin = false;
     };
     struct ChunkUse {
@@ -423,7 +423,10 @@ private:
 
     [[nodiscard]] std::filesystem::path manifest_path(const std::string& id) const;
     [[nodiscard]] std::filesystem::path used_path(const std::string& id) const;
-    // Present when the image was imported from a peer (see Entry::peer_origin).
+    // The trailing checksum of a manifest: names that manifest and no other.
+    [[nodiscard]] static std::span<const std::uint8_t> manifest_checksum(std::span<const std::uint8_t> manifest);
+    // Present when the image was imported from a peer (see Entry::peer_origin); holds the checksum
+    // of the peer manifest it was written for, so it says nothing about any later manifest of the id.
     [[nodiscard]] std::filesystem::path peer_origin_path(const std::string& id) const;
     // Holds the checksum of the manifest last published to the bucket: a restart marks the entry
     // published only when its manifest on disk is that one (not a newer write still to upload).
