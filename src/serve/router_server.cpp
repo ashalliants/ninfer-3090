@@ -286,11 +286,84 @@ bool is_json_content_type(std::string_view content_type) {
     return lower_ascii(std::string(content_type)).find("json") != std::string::npos;
 }
 
+void ResponseOwners::record(const std::string& id, const std::string& model) {
+    std::lock_guard lock(mutex_);
+    if (const auto found = index_.find(id); found != index_.end()) {
+        found->second->second = model;
+        recent_.splice(recent_.begin(), recent_, found->second);
+        return;
+    }
+    recent_.emplace_front(id, model);
+    index_[id] = recent_.begin();
+    while (recent_.size() > capacity_) {
+        index_.erase(recent_.back().first);
+        recent_.pop_back();
+    }
+}
+
+std::optional<std::string> ResponseOwners::owner(const std::string& id) {
+    std::lock_guard lock(mutex_);
+    const auto found = index_.find(id);
+    if (found == index_.end()) { return std::nullopt; }
+    recent_.splice(recent_.begin(), recent_, found->second);
+    return found->second->second;
+}
+
+void ResponseOwners::forget(const std::string& id) {
+    std::lock_guard lock(mutex_);
+    const auto found = index_.find(id);
+    if (found == index_.end()) { return; }
+    recent_.erase(found->second);
+    index_.erase(found);
+}
+
+std::size_t ResponseOwners::size() const {
+    std::lock_guard lock(mutex_);
+    return recent_.size();
+}
+
+void ResponseIdScanner::feed(std::string_view data) {
+    // The id is among the first keys of the response object (the server writes them sorted), so a
+    // bounded prefix is enough; a reply that gives none in it is left unrecorded.
+    constexpr std::size_t kScanBytes = 64 * 1024;
+    constexpr std::string_view key   = "\"id\":\"resp_";
+    if (id_ || seen_.size() >= kScanBytes) { return; }
+    seen_.append(data.substr(0, kScanBytes - seen_.size()));
+    const std::size_t at = seen_.find(key, resume_);
+    if (at == std::string::npos) {
+        // The key may begin in these bytes and end in the next piece.
+        resume_ = seen_.size() < key.size() ? 0 : seen_.size() - key.size() + 1;
+        return;
+    }
+    const std::size_t begin = at + key.size() - 5; // the id starts at "resp_"
+    std::size_t end         = begin;
+    while (end < seen_.size() && seen_[end] != '"') { ++end; }
+    if (end == seen_.size()) {
+        resume_ = at; // the id is cut off; the next piece completes it
+        return;
+    }
+    id_ = seen_.substr(begin, end - begin);
+}
+
+std::optional<std::string> response_id_from_path(std::string_view path) {
+    constexpr std::string_view prefix = "/v1/responses/";
+    if (path.substr(0, prefix.size()) != prefix) { return std::nullopt; }
+    std::string_view rest = path.substr(prefix.size());
+    const std::size_t slash = rest.find('/');
+    const std::string_view id = rest.substr(0, slash);
+    const std::string_view tail = slash == std::string_view::npos ? std::string_view()
+                                                                  : rest.substr(slash);
+    if (id.empty() || id == "input_tokens" || id == "compact") { return std::nullopt; }
+    if (!tail.empty() && tail != "/input_items" && tail != "/cancel") { return std::nullopt; }
+    return std::string(id);
+}
+
 RouterServer::RouterServer(ServeOptions options, ModelRegistry& registry,
                            std::shared_ptr<RoutedPorts> ports,
                            std::shared_ptr<spdlog::logger> logger)
     : options_(std::move(options)), registry_(registry), ports_(std::move(ports)),
-      logger_(std::move(logger)) {
+      logger_(std::move(logger)),
+      response_owners_(options_.response_store_max_records * std::max<std::size_t>(1, registry.size())) {
     // cpp-httplib is thread-per-connection, and a relayed request holds a router worker for as long
     // as its model holds the matching worker of its own server.
     constexpr std::size_t kBaseWorkers = 32;
@@ -640,6 +713,21 @@ void RouterServer::route(const httplib::Request& req, httplib::Response& res) {
         write_error(req, res, 400, "invalid_request", error.what());
         return;
     }
+    // Responses live in the store of the model that made them: a follow-up that names no model goes
+    // to that one, not to whichever served last. A model the client names is the client's choice.
+    const std::optional<std::string> response_id = response_id_from_path(req.path);
+    if (name.empty()) {
+        std::optional<std::string> owner;
+        if (response_id) {
+            owner = response_owners_.owner(*response_id);
+        } else if (body && req.method == "POST" && req.path == "/v1/responses") {
+            const auto previous = body->find("previous_response_id");
+            if (previous != body->end() && previous->is_string()) {
+                owner = response_owners_.owner(previous->get<std::string>());
+            }
+        }
+        if (owner) { name = std::move(*owner); }
+    }
     // A client that hangs up while the model loads or waits for room stops the wait; the model
     // being loaded for it is not abandoned half-built (see ModelRegistry::acquire).
     std::optional<ModelRegistry::Lease> acquired;
@@ -666,8 +754,22 @@ void RouterServer::route(const httplib::Request& req, httplib::Response& res) {
             }
         }
     }
+    // A create's reply tells which model made the response; the follow-ups need it.
+    Tap tap;
+    if (req.method == "POST" && req.path == "/v1/responses") {
+        tap = [this, model = lease.model(), scanner = std::make_shared<ResponseIdScanner>()](
+                  std::string_view data) {
+            if (scanner->id()) { return; }
+            scanner->feed(data);
+            if (scanner->id()) { response_owners_.record(*scanner->id(), model); }
+        };
+    }
     relay(req, res, std::move(lease), req.method, without_model_param(req.target),
-          std::move(payload));
+          std::move(payload), std::move(tap));
+    // Gone from the model's store, so no longer anyone's.
+    if (response_id && req.method == "DELETE" && res.status / 100 == 2) {
+        response_owners_.forget(*response_id);
+    }
 }
 
 void RouterServer::route_status(const httplib::Request& req, httplib::Response& res) {
@@ -681,7 +783,7 @@ void RouterServer::route_status(const httplib::Request& req, httplib::Response& 
 
 void RouterServer::relay(const httplib::Request& req, httplib::Response& res,
                          ModelRegistry::Lease lease, const std::string& method,
-                         const std::string& target, std::string body) {
+                         const std::string& target, std::string body, Tap tap) {
     const auto port = ports_->get(lease.model());
     if (!port) {
         write_error(req, res, 503, "model_not_loaded",
@@ -721,7 +823,8 @@ void RouterServer::relay(const httplib::Request& req, httplib::Response& res,
         relayed->changed.notify_all();
         return true;
     };
-    upstream.content_receiver = [relayed](const char* data, size_t length, size_t, size_t) {
+    upstream.content_receiver = [relayed, tap = std::move(tap)](const char* data, size_t length,
+                                                                size_t, size_t) {
         std::unique_lock lock(relayed->mutex);
         // Backpressure: a client that reads slowly makes the upstream read wait here, so the
         // router holds a bounded backlog rather than the whole response. Closing the relay (the
@@ -730,6 +833,8 @@ void RouterServer::relay(const httplib::Request& req, httplib::Response& res,
             return relayed->done || relayed->chunks.size() < kMaxQueuedChunks;
         });
         if (relayed->done) { return false; }
+        // Before the client can see the bytes, so a follow-up it sends at once finds the owner.
+        if (tap && relayed->status / 100 == 2) { tap(std::string_view(data, length)); }
         relayed->chunks.emplace_back(data, length);
         relayed->changed.notify_all();
         return true;
