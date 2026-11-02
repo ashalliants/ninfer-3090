@@ -587,17 +587,19 @@ public:
                  std::span<const Handle> later_snapshots = {},
                  std::span<const Handle> excluded        = {},
                  std::optional<Admission> admission      = std::nullopt,
-                 const ReclaimCursor* decision = nullptr, ReclaimRights rights = {}) {
+                 const ReclaimCursor* decision = nullptr, ReclaimRights rights = {},
+                 std::size_t reserve_bytes = 0) {
         prune(program);
         Evaluation evaluation;
         if (decision) {
             return host_victims_in_order(program, bytes, incoming, later_snapshots, excluded,
-                                         decision->admission, *decision, evaluation);
+                                         decision->admission, *decision, evaluation, false,
+                                         SIZE_MAX, false, reserve_bytes);
         }
         auto cursor   = reclaim_order(program);
         cursor.rights = admission ? ReclaimRights{ReclaimPurpose::OptionalWrite} : rights;
         return host_victims_in_order(program, bytes, incoming, later_snapshots, excluded, admission,
-                                     cursor, evaluation);
+                                     cursor, evaluation, false, SIZE_MAX, false, reserve_bytes);
     }
 
     void commit_host_victims(Program& program, std::span<const Handle> handles,
@@ -1829,13 +1831,19 @@ private:
                           std::span<const Handle> later_snapshots, std::span<const Handle> excluded,
                           std::optional<Admission> admission, const ReclaimCursor& cursor,
                           Evaluation& evaluation, bool bytes_are_shortage = false,
-                          std::size_t placeable = SIZE_MAX, bool state_run = false) const {
+                          std::size_t placeable = SIZE_MAX, bool state_run = false,
+                          std::size_t reserve_bytes = 0) const {
         const auto usage = program.physical_usage();
         const auto free =
             std::min<std::size_t>(usage.capacity.host_bytes - usage.occupied.host_bytes, placeable);
         const auto required = bytes_are_shortage ? bytes : (bytes > free ? bytes - free : 0);
         if (!required) { return std::vector<Handle>{}; }
-        if (!bytes_are_shortage && bytes > usage.capacity.host_bytes) { return std::nullopt; }
+        // A target above the cache's budget can never be met by evicting cached history. A caller
+        // measuring against the whole backing (a pause snapshot, which may also use the reserve
+        // that paused snapshots sit in) says how far above the budget the backing reaches.
+        if (!bytes_are_shortage && bytes > usage.capacity.host_bytes + reserve_bytes) {
+            return std::nullopt;
+        }
         if (!admission && incoming) {
             admission = preservation_admission(
                 program, {&*incoming, 1}, cursor,

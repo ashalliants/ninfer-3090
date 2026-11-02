@@ -403,6 +403,25 @@ void test_pause_host_target() {
             "a target that exactly fills the budget is still reachable");
 }
 
+void test_pause_reserve_target() {
+    using ninfer::runtime::pause_eviction_target;
+    using ninfer::runtime::pause_reserve_free;
+    using ninfer::runtime::pause_target_reached;
+    require(pause_reserve_free(200, 50) == 150 && pause_reserve_free(200, 200) == 0 &&
+                pause_reserve_free(200, 900) == 0,
+            "the free reserve is what the snapshots there leave, never negative");
+    require(pause_eviction_target(500, 150) == 350 && pause_eviction_target(100, 150) == 0,
+            "eviction makes up only what the free reserve cannot take");
+    // Budget 1000 full, reserve 200 full of later snapshots: a 1100-byte snapshot has a 1100
+    // target, above the budget; the reserve snapshots released count toward it.
+    require(pause_eviction_target(1100, 0) == 1100 &&
+                !pause_target_reached(0, 0, 0, 1100) && !pause_target_reached(900, 0, 100, 1100) &&
+                pause_target_reached(900, 0, 200, 1100),
+            "reserve bytes freed since the target was set count toward it");
+    require(pause_target_reached(1100, 50, 50, 1100) && !pause_target_reached(1099, 50, 50, 1100),
+            "free budget bytes alone reach an exact target");
+}
+
 void test_prompt_fit_beside_residents() {
     using ninfer::runtime::KvPageCounts;
     using ninfer::runtime::prompt_fits_beside_residents;
@@ -456,6 +475,7 @@ int main() {
         test_decode_and_control_membership();
         test_progress_anchor_frontiers();
         test_pause_host_target();
+        test_pause_reserve_target();
         test_prompt_fit_beside_residents();
         std::cout << "ok\n";
         return 0;

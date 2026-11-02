@@ -5,6 +5,7 @@
 #include "core/chunked_reservation.h"
 #include "core/gdn_replay_records.h"
 #include "core/device_snapshot.h"
+#include "core/host_arena_model.h"
 #include "core/host_kv_arena.h"
 #include "core/vmm_region.h"
 #include "ninfer/ops/gdn_replay.h"
@@ -355,7 +356,9 @@ public:
     [[nodiscard]] std::size_t
     host_bytes_released(std::span<const CheckpointHandle> checkpoints,
                         bool state_images_only = false) const;
-    [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle sequence) const;
+    // Host bytes a pause snapshot places; with `need`, also what it places in each allocation.
+    [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle sequence,
+                                                              PauseHostNeed* need = nullptr) const;
     [[nodiscard]] std::size_t pause_state_image_unplaced(SequenceHandle sequence) const;
     [[nodiscard]] bool pause_snapshot_fits(SequenceHandle sequence) const;
     // General-budget Host bytes that allocations of whole `unit`s could take now.

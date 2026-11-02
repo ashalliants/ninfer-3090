@@ -554,7 +554,8 @@ public:
     [[nodiscard]] std::size_t pause_state_image_unplaced(SequenceHandle sequence) const;
     // Whether a pause of `sequence` would save its snapshot to the Host as things stand, without
     // evicting or releasing anything: its bytes fit the free Host bytes (the pause snapshot reserve
-    // included) and its state image has a run.
+    // included) and its state image has a run. Exact for mixed KV strides: the placement the pause
+    // makes is replayed on a copy of the arena's free runs.
     [[nodiscard]] bool pause_snapshot_fits(SequenceHandle sequence) const;
     [[nodiscard]] std::size_t
     release_redundant_host(std::span<const CheckpointHandle> excluded,
