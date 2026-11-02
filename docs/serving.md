@@ -881,16 +881,43 @@ Streamed responses stream, and a client that disconnects cancels the generation,
 model is still loading or working on the prompt. The router rewrites only the `"model"` member of a
 body it forwards (to the model's id), so every other value reaches the model as you wrote it.
 
-Each model keeps its own Responses store, and a response ID does not say which model made it. A
-request that names no model goes to the model that last served, so `GET` or `DELETE
-/v1/responses/{id}`, `.../input_items` and a `previous_response_id` follow-up must name the model
-that created the response (`?model=ID` on the request, or `"model"` in the body). Routing these by
-the response ID alone is tracked in [#336](https://github.com/ashalliants/ninfer-3090/issues/336).
+Each model keeps its own Responses store, and a response ID does not say which model made it, so the
+router remembers it. When a `POST /v1/responses` succeeds, the router reads the new response's ID
+from the first bytes of the reply (the JSON body, or the first event of a stream) and records which
+model made it. A request that names no model (no `"model"` in the body, no `?model=`) then goes to
+that owner instead of the model that last served, so these need no model name:
+
+- `GET` or `DELETE /v1/responses/{id}`, `POST .../cancel` and `GET .../input_items`;
+- `POST /v1/responses` and `POST /v1/responses/input_tokens` with a `previous_response_id`.
+
+If you do name a model, the router honours it, even a wrong one: that model answers not-found. An ID
+the router does not know (made before a router restart, a `store: false` create, a stream that ended in
+`response.failed`, or one forgotten because the map is full) is routed as any request without an ID
+is, to the model that last served; if that is not the owner, it answers not-found. The router reads
+the JSON body of a request whatever `Content-Type` it carries, as the model does, for `"model"`,
+`previous_response_id`, `"store"` and `"stream"` alike.
+
+The rule for a create that breaks off is deliberate, and is this: **the router forgets an ID only when
+the model positively did not store the response** (the create asked for `store: false`, the reply was
+an error status, or the stream ended in a `response.failed` event). Any other interruption, a client
+that leaves or a connection that drops, keeps the ID. The router cannot see the moment the model
+stores a response. A non-streamed reply is written after the response is stored. A stream stores it
+just before its last events, so only a stream cut off earlier was not stored. Keeping an ID the model
+did not store costs a map slot and a not-found from the owner, which is what an unknown ID gets
+anyway. Forgetting one it did store would send the follow-ups to the wrong model. Neither is worse than
+before the map existed, and the first is bounded.
+
+The map keeps each model's IDs within that model's own `--response-store-max-records` (a preset
+section can set its own), forgetting that model's least recently used first, so one model's
+creates never push out another model's IDs. A successful `DELETE` forgets the ID at
+once. The map lasts as long as the router process, and does not depend on whether the owner is
+loaded: a follow-up for a model that was unloaded or put to sleep loads or wakes it first.
 
 A model's Responses store survives both sleep and unload (eviction, idle unload, an explicit unload, or
 a rebuild after an Engine failure): after the model loads again, `previous_response_id` follow-ups and
-`GET`/`DELETE /v1/responses/{id}` still find responses made before. The store lives in memory, so it
-is still lost when the router process restarts.
+`GET`/`DELETE /v1/responses/{id}` still find responses made before, and the router still knows the
+owner. Both live in memory, so they are lost when the router process restarts; after that, name the
+model on follow-ups.
 
 On an RTX 3090 with two copies of the Qwen3.8-27B artifact under `--models-max 1 --model-suspend`: a
 cold request loaded its model and answered in 6.0 s (the file was in the operating system's cache),

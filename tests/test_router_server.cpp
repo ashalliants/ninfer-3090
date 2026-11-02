@@ -4,7 +4,8 @@
 // the query and body rewrite that reaches the model, the /models lifecycle endpoints, suspend, resume
 // and residency, the status routes with nothing loaded, header relay, streamed relay with a slow
 // client, a client that disconnects (before and after the headers), upstream failure (unreachable,
-// not serving, dropped mid-stream), and a model whose listener dies being rebuilt on the next request.
+// not serving, dropped mid-stream), a model whose listener dies being rebuilt on the next request, and
+// Responses follow-ups going to the model that made the response (ResponseOwners).
 
 #include "serve/model_registry.h"
 #include "serve/routed_model.h"
@@ -191,6 +192,8 @@ struct Rig {
         std::vector<std::string> aliases = {};
         bool suspendable                 = true;
         std::vector<std::string> arguments = {};
+        // This model's --response-store-max-records; 0 takes the rig's `store_records`.
+        std::size_t store_records = 0;
     };
 
     Journal journal;
@@ -205,7 +208,7 @@ struct Rig {
     // it, as the fallback.
     Rig(const std::vector<ModelSpec>& specs, std::string api_key = {}, bool cors = false,
         const std::function<void(const std::string&, Upstream&)>& customize = {},
-        std::uint32_t models_max = 2) {
+        std::uint32_t models_max = 2, std::size_t store_records = kDefaultResponseStoreRecords) {
         std::vector<ModelDefinition> definitions;
         std::map<std::string, bool> suspendable;
         for (const ModelSpec& spec : specs) {
@@ -213,6 +216,8 @@ struct Rig {
             definition.id        = spec.id;
             definition.aliases   = spec.aliases;
             definition.arguments = spec.arguments;
+            definition.options.response_store_max_records =
+                spec.store_records != 0 ? spec.store_records : store_records;
             definitions.push_back(std::move(definition));
             suspendable[spec.id] = spec.suspendable;
             auto upstream        = std::make_unique<Upstream>(spec.id);
@@ -240,6 +245,32 @@ struct Rig {
         router = std::make_unique<RouterServer>(options, *registry, ports, nullptr);
         if (!router->bind()) { throw std::runtime_error("router could not bind"); }
         listener = std::thread([this] { router->listen(); });
+        // A throw from a constructor skips ~Rig, and destroying a joinable std::thread
+        // terminates, so stop and join the listener here before rethrowing.
+        try {
+            wait_until_accepting();
+        } catch (...) {
+            router->stop();
+            listener.join();
+            throw;
+        }
+    }
+
+    // bind() only reserves the socket; the accept loop starts on `listener` a moment later, and a
+    // request sent before then is refused. Probe /health (answered by the router itself, so it
+    // loads nothing) until the loop answers, with any status, so the first request cannot race
+    // listener startup.
+    void wait_until_accepting() const {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto probe = client();
+            // Short timeouts keep a stalled probe from outlasting the deadline.
+            probe.set_connection_timeout(0, 200000);
+            probe.set_read_timeout(0, 200000);
+            if (probe.Get("/health")) { return; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        throw std::runtime_error("router did not start accepting connections");
     }
 
     ~Rig() {
@@ -879,6 +910,505 @@ void dead_listener_is_rebuilt() {
            "which is loaded and no longer marked failed");
 }
 
+
+// The Responses stores of the fake models: each id belongs to the model that made it, and only that
+// model finds it again.
+struct FakeResponses {
+    std::mutex mutex;
+    std::map<std::string, std::string> owner; // id -> model
+    std::atomic<int> next{0};
+    std::string last; // the id of the latest create, stored or not
+
+    void note_created(const std::string& id) {
+        std::lock_guard lock(mutex);
+        last = id;
+    }
+
+    [[nodiscard]] std::string last_created() {
+        std::lock_guard lock(mutex);
+        return last;
+    }
+
+    void add(const std::string& id, const std::string& model) {
+        std::lock_guard lock(mutex);
+        owner[id] = model;
+    }
+
+    [[nodiscard]] bool owned(const std::string& id, const std::string& model) {
+        std::lock_guard lock(mutex);
+        const auto found = owner.find(id);
+        return found != owner.end() && found->second == model;
+    }
+
+    void erase(const std::string& id) {
+        std::lock_guard lock(mutex);
+        owner.erase(id);
+    }
+};
+
+void respond_not_found(httplib::Response& res) {
+    res.status = 404;
+    res.set_content(R"({"error":{"code":"not_found"}})", "application/json");
+}
+
+void install_responses(const std::string& model, Upstream& upstream, FakeResponses& store) {
+    upstream.server.Post("/v1/responses", [&upstream, &store, model](const httplib::Request& req,
+                                                                     httplib::Response& res) {
+        upstream.note(req);
+        const Json body = Json::parse(req.body, nullptr, /*allow_exceptions=*/false);
+        if (body.is_object() && body.contains("previous_response_id") &&
+            !store.owned(body["previous_response_id"].get<std::string>(), model)) {
+            respond_not_found(res);
+            return;
+        }
+        if (body.is_object() && body.value("fail", false)) {
+            // An error that still mentions an id: it must not be taken for a stored response.
+            res.status = 400;
+            res.set_content(Json{{"id", "resp_failed"}, {"error", "rejected"}}.dump(),
+                            "application/json");
+            return;
+        }
+        const std::string id = "resp_" + model + std::to_string(store.next++);
+        // A create with store:false, or a stream that fails or is cut off, keeps nothing.
+        store.note_created(id);
+        const bool streamed = body.is_object() && body.value("stream", false);
+        // abort_stream: cut off while generating, nothing stored. abort_committed: the model had
+        // committed the response (it does so just before the last event) when the connection broke.
+        const bool broken   = body.is_object() && (body.value("fail_stream", false) ||
+                                                 body.value("abort_stream", false));
+        const bool committed_abort = body.is_object() && body.value("abort_committed", false);
+        if (!(body.is_object() && body.value("store", true) == false) && !broken) {
+            store.add(id, model);
+        }
+        if (streamed && (broken || committed_abort)) {
+            const std::string created = "event: response.created\ndata: {\"response\":{\"id\":\"" +
+                                        id + "\"},\"type\":\"response.created\"}\n\n";
+            const bool abort = !body.value("fail_stream", false);
+            res.set_chunked_content_provider(
+                "text/event-stream", [created, abort, step = 0](size_t, httplib::DataSink& sink) mutable {
+                    if (step++ == 0) { return sink.write(created.data(), created.size()); }
+                    if (abort) { return false; } // the connection drops mid-stream
+                    const std::string failed = "event: response.failed\ndata: {}\n\n";
+                    if (step == 2) { return sink.write(failed.data(), failed.size()); }
+                    sink.done();
+                    return true;
+                });
+            return;
+        }
+        if (!streamed && body.is_object() && body.value("abort_body", false)) {
+            // Stored, then the reply is cut off after its first bytes: the real server commits the
+            // response before it writes anything.
+            const std::string head = "{\"id\":\"" + id + "\",\"object\":\"resp";
+            res.set_chunked_content_provider(
+                "application/json", [head, step = 0](size_t, httplib::DataSink& sink) mutable {
+                    if (step++ == 0) { return sink.write(head.data(), head.size()); }
+                    return false; // the connection drops mid-body
+                });
+            return;
+        }
+        if (streamed) {
+            // The id is split across two writes.
+            const std::string first = "event: response.created\ndata: {\"response\":{\"id\":\"" +
+                                      id.substr(0, 7);
+            const std::string second = id.substr(7) + "\",\"object\":\"response\"},\"type\":" +
+                                       "\"response.created\"}\n\n";
+            res.set_chunked_content_provider(
+                "text/event-stream", [first, second, step = 0](size_t, httplib::DataSink& sink) mutable {
+                    if (step == 0) {
+                        ++step;
+                        return sink.write(first.data(), first.size());
+                    }
+                    if (step == 1) {
+                        ++step;
+                        std::this_thread::sleep_for(50ms);
+                        return sink.write(second.data(), second.size());
+                    }
+                    sink.done();
+                    return true;
+                });
+            return;
+        }
+        res.set_content(Json{{"id", id}, {"object", "response"}, {"served_by", model}}.dump(),
+                        "application/json");
+    });
+    upstream.server.Post("/v1/responses/input_tokens", [&upstream, &store, model](
+                                                           const httplib::Request& req,
+                                                           httplib::Response& res) {
+        upstream.note(req);
+        const Json body = Json::parse(req.body, nullptr, /*allow_exceptions=*/false);
+        if (body.is_object() && body.contains("previous_response_id") &&
+            !store.owned(body["previous_response_id"].get<std::string>(), model)) {
+            respond_not_found(res);
+            return;
+        }
+        res.set_content(Json{{"object", "response.input_tokens"}, {"served_by", model}}.dump(),
+                        "application/json");
+    });
+    const auto lookup = [&upstream, &store, model](const httplib::Request& req,
+                                                   httplib::Response& res) {
+        upstream.note(req);
+        const std::string id = req.matches[1].str();
+        if (!store.owned(id, model)) {
+            respond_not_found(res);
+            return;
+        }
+        if (req.method == "DELETE") { store.erase(id); }
+        res.set_content(Json{{"id", id}, {"served_by", model}, {"method", req.method},
+                             {"target", req.target}}
+                            .dump(),
+                        "application/json");
+    };
+    upstream.server.Get(R"(/v1/responses/([^/]+)/input_items)", lookup);
+    upstream.server.Post(R"(/v1/responses/([^/]+)/cancel)", lookup);
+    upstream.server.Get(R"(/v1/responses/([^/]+))", lookup);
+    upstream.server.Delete(R"(/v1/responses/([^/]+))", lookup);
+}
+
+void response_owner_bookkeeping() {
+    // "a" keeps 2 ids, "b" keeps 1.
+    ResponseOwners owners([](const std::string& model) { return model == "a" ? 2u : 1u; });
+    owners.record("r1", "a");
+    owners.record("r2", "b");
+    owners.record("r3", "a");
+    expect(owners.owner("r2") == "b" && owners.owner("r1") == "a", "an owner is looked up by id");
+    expect(!owners.owner("nope"), "an unknown id has none");
+    // r1 was used after r3 was made: r3 is now a's least recently used.
+    owners.record("r4", "a");
+    expect(owners.size() == 3 && !owners.owner("r3") && owners.owner("r1") == "a" &&
+               owners.owner("r4") == "a" && owners.owner("r2") == "b",
+           "a model's least recently used id is forgotten at its own limit");
+    owners.record("r5", "b");
+    expect(owners.size() == 3 && !owners.owner("r2") && owners.owner("r5") == "b" &&
+               owners.owner("r1") && owners.owner("r4"),
+           "a model at its limit forgets only its own ids");
+    owners.record("r1", "b");
+    expect(owners.owner("r1") == "b" && !owners.owner("r5") && owners.size() == 2,
+           "recording an id again moves it to its new owner, within that owner's limit");
+    owners.forget("r1");
+    owners.forget("r1");
+    expect(!owners.owner("r1") && owners.size() == 1, "forgetting is idempotent");
+    ResponseOwners tiny([](const std::string&) { return std::size_t{0}; });
+    tiny.record("x", "a");
+    tiny.record("y", "a");
+    expect(tiny.size() == 1 && tiny.owner("y"), "a limit of zero still keeps one");
+
+    const std::string body = R"({"access_programs":null,"id":"resp_0123abcd","object":"response"})";
+    ResponseIdScanner whole;
+    whole.feed(body);
+    expect(whole.id() == "resp_0123abcd", "a JSON reply's id is found");
+    for (std::size_t piece = 1; piece < body.size(); ++piece) {
+        ResponseIdScanner scanner;
+        for (std::size_t at = 0; at < body.size(); at += piece) {
+            scanner.feed(std::string_view(body).substr(at, piece));
+        }
+        expect(scanner.id() == "resp_0123abcd",
+               "the id is found across pieces of " + std::to_string(piece));
+    }
+    const std::string stream =
+        "event: response.created\ndata: {\"response\":{\"id\":\"resp_1\"}}\n\nevent: response.failed\n";
+    for (std::size_t piece = 1; piece < stream.size(); ++piece) {
+        ResponseIdScanner scanner;
+        for (std::size_t at = 0; at < stream.size(); at += piece) {
+            scanner.feed(std::string_view(stream).substr(at, piece));
+        }
+        expect(scanner.failed() && scanner.id() == "resp_1",
+               "a failure event is found across pieces of " + std::to_string(piece));
+    }
+    ResponseIdScanner quoted;
+    quoted.feed(R"({"id":"resp_2","output":"event: response.failed\nevent: response.failed"})");
+    expect(!quoted.failed(), "text quoted in a JSON body is not a failure event");
+    ResponseIdScanner completed;
+    completed.feed("event: response.created\ndata: {}\n\nevent: response.completed\n");
+    expect(!completed.failed(), "a completed stream has not failed");
+    ResponseIdScanner sse;
+    sse.feed("event: response.created\ndata: {\"response\":{\"id\":\"resp_ff\",\"object\":\"re");
+    expect(sse.id() == "resp_ff", "an SSE event's response id is found");
+    sse.feed(R"({"id":"resp_other"})");
+    expect(sse.id() == "resp_ff", "and the first one stays");
+    ResponseIdScanner none;
+    none.feed(R"({"previous_response_id":"resp_x","id":"msg_1","items":[{"id":"rs_1"}]})");
+    expect(!none.id(), "only a response id counts, not a previous_response_id or an item id");
+    ResponseIdScanner late;
+    late.feed(std::string(70 * 1024, ' '));
+    late.feed(R"({"id":"resp_late"})");
+    expect(!late.id(), "an id beyond the scanned prefix is left unrecorded");
+
+    expect(response_id_from_path("/v1/responses/resp_1") == "resp_1", "GET/DELETE path");
+    expect(response_id_from_path("/v1/responses/resp_1/input_items") == "resp_1", "input_items path");
+    expect(response_id_from_path("/v1/responses/resp_1/cancel") == "resp_1", "cancel path");
+    for (const char* path : {"/v1/responses", "/v1/responses/", "/v1/responses/input_tokens",
+                             "/v1/responses/compact", "/v1/responses/resp_1/other",
+                             "/v1/chat/completions", "/v1/responsesx/resp_1"}) {
+        expect(!response_id_from_path(path), std::string("no id in ") + path);
+    }
+}
+
+std::string sse_response_id(const std::string& body) {
+    ResponseIdScanner scanner;
+    scanner.feed(body);
+    return scanner.id().value_or(std::string());
+}
+
+void responses_follow_up_the_owning_model() {
+    FakeResponses store;
+    Rig rig(kTwoModels, {}, false, [&](const std::string& id, Upstream& upstream) {
+        install_responses(id, upstream, store);
+    });
+    const auto served_by = [](const Reply& reply) { return reply.json.value("served_by", ""); };
+
+    const std::string id_a = post(rig, "/v1/responses", R"({"model":"a","input":"hi"})")
+                                 .json.value("id", "");
+    const std::string id_b = post(rig, "/v1/responses", R"({"model":"b","input":"hi"})")
+                                 .json.value("id", "");
+    expect(!id_a.empty() && !id_b.empty() && id_a != id_b, "both models made a response");
+
+    // b served last: without the owner map every one of these went to b and missed.
+    Reply reply = get(rig, "/v1/responses/" + id_a);
+    expect(reply.status == 200 && served_by(reply) == "a", "GET goes to the model that made it");
+    reply = get(rig, "/v1/responses/" + id_b);
+    expect(reply.status == 200 && served_by(reply) == "b", "and the other one's goes to the other");
+    reply = get(rig, "/v1/responses/" + id_a + "/input_items?limit=5");
+    expect(reply.status == 200 && served_by(reply) == "a" &&
+               reply.json["target"] == "/v1/responses/" + id_a + "/input_items?limit=5",
+           "input_items too, with its query kept");
+    get(rig, "/v1/responses/" + id_b);
+    reply = post(rig, "/v1/responses/" + id_a + "/cancel", "");
+    expect(reply.status == 200 && served_by(reply) == "a", "so does cancel");
+
+    // A model the client names is the client's choice, even a wrong one.
+    const std::size_t a_before = rig.up("a").count();
+    reply                      = get(rig, "/v1/responses/" + id_a + "?model=b");
+    expect(reply.status == 404 && rig.up("a").count() == a_before,
+           "an explicit ?model= is honoured");
+
+    // previous_response_id chains in the model that holds the response.
+    reply = post(rig, "/v1/responses", R"({"input":"more","previous_response_id":")" + id_a + R"("})");
+    expect(reply.status == 200 && served_by(reply) == "a", "a follow-up create with no model");
+    expect(upstream_body(rig, "a")["model"] == "a" &&
+               upstream_body(rig, "a")["previous_response_id"] == id_a,
+           "is given that model's name and keeps its body");
+    reply = post(rig, "/v1/responses",
+                 R"({"model":"b","input":"more","previous_response_id":")" + id_a + R"("})");
+    expect(reply.status == 404 && rig.up("b").last().target == "/v1/responses",
+           "one that names another model goes there, and is refused by it");
+    const std::string id_chain =
+        post(rig, "/v1/responses", R"({"input":"x","previous_response_id":")" + id_a + R"("})")
+            .json.value("id", "");
+    get(rig, "/v1/responses/" + id_b);
+    expect(served_by(get(rig, "/v1/responses/" + id_chain)) == "a",
+           "and a response made by a follow-up is owned too");
+
+    // A streamed create is learnt from its first event, though the id arrives in two pieces.
+    auto client      = rig.client();
+    const auto event = client.Post("/v1/responses?model=b", R"({"stream":true,"input":"hi"})",
+                                   "application/json");
+    const std::string id_stream = event ? sse_response_id(event->body) : std::string();
+    expect(!id_stream.empty(), "a streamed create returns its id");
+    post(rig, "/v1/responses", R"({"model":"a","input":"hi"})");
+    reply = get(rig, "/v1/responses/" + id_stream);
+    expect(reply.status == 200 && served_by(reply) == "b", "which routes its follow-ups too");
+
+    // Counting the tokens of a follow-up reads the same stored response.
+    get(rig, "/v1/responses/" + id_b); // b served last
+    reply = post(rig, "/v1/responses/input_tokens",
+                 R"({"input":"more","previous_response_id":")" + id_a + R"("})");
+    expect(reply.status == 200 && served_by(reply) == "a" &&
+               upstream_body(rig, "a")["model"] == "a",
+           "input_tokens with previous_response_id goes to the owner");
+    get(rig, "/v1/responses/" + id_b); // b served last
+    reply = post(rig, "/v1/responses/input_tokens", R"({"input":"more"})");
+    expect(reply.status == 200 && served_by(reply) == "b", "and without it, by default");
+
+    // A create that is not stored, or whose stream ends in response.failed, has no owner. The model
+    // is learnt from the id in the first event, so these are forgotten once the stream has ended.
+    // A stream that is only cut off keeps its owner: the router cannot see whether the model had
+    // committed it (it does so just before the last event), and keeping is never worse than master.
+    const auto owner_forgotten = [&](const std::string& id) {
+        return eventually([&] {
+            get(rig, "/v1/responses/" + id_b); // b served last
+            const std::size_t a_calls = rig.up("a").count();
+            return get(rig, "/v1/responses/" + id + "?x=1").status == 404 &&
+                   rig.up("a").count() == a_calls;
+        });
+    };
+    const auto create_id = [&](const std::string& body) {
+        auto stream_client = rig.client();
+        stream_client.Post("/v1/responses?model=a", body, "application/json"); // may be cut off
+        return store.last_created();
+    };
+    const auto json_id = [&](const std::string& body) {
+        return post(rig, "/v1/responses", body).json.value("id", "");
+    };
+    std::string id = json_id(R"({"model":"a","store":false,"input":"x"})");
+    expect(!id.empty() && owner_forgotten(id), "a create with store:false is not remembered");
+    id = create_id(R"({"stream":true,"store":false,"input":"x"})");
+    expect(!id.empty() && owner_forgotten(id), "nor is a streamed one");
+    id = create_id(R"({"stream":true,"fail_stream":true,"input":"x"})");
+    expect(!id.empty() && owner_forgotten(id), "a stream that ends in response.failed is forgotten");
+    const auto owner_kept = [&](const std::string& id) {
+        get(rig, "/v1/responses/" + id_b); // b served last
+        const std::size_t a_calls = rig.up("a").count();
+        get(rig, "/v1/responses/" + id);
+        return rig.up("a").count() == a_calls + 1;
+    };
+    id = create_id(R"({"stream":true,"abort_stream":true,"input":"x"})");
+    expect(!id.empty() && eventually([&] { return rig.leases("a") == 0; }) && owner_kept(id),
+           "a stream cut off before its end keeps its owner (nothing says it was not stored)");
+    id = create_id(R"({"stream":true,"abort_committed":true,"input":"x"})");
+    expect(!id.empty() && eventually([&] { return rig.leases("a") == 0; }) &&
+               served_by(get(rig, "/v1/responses/" + id)) == "a",
+           "and one cut off after the model stored it is still found at its owner");
+
+    // The model reads the body whatever the Content-Type says, so a store:false create without a
+    // JSON header is just as unstored, streamed or not.
+    const auto create_as = [&](const std::string& content_type, const std::string& body) {
+        auto plain_client = rig.client();
+        plain_client.Post("/v1/responses?model=a", body, content_type);
+        return store.last_created();
+    };
+    id = create_as("text/plain", R"({"store":false,"input":"x"})");
+    expect(!id.empty() && owner_forgotten(id), "store:false is honoured without a JSON Content-Type");
+    id = create_as("text/plain", R"({"stream":true,"store":false,"input":"x"})");
+    expect(!id.empty() && owner_forgotten(id), "also when streamed");
+    {
+        auto bare = rig.client();
+        const auto sent = bare.Post("/v1/responses?model=a", httplib::Headers{}, R"({"store":false})",
+                                    "");
+        id = store.last_created();
+        expect(sent && !id.empty() && owner_forgotten(id), "or with no Content-Type at all");
+    }
+    // ... while a stored one without the header is still remembered.
+    id = create_as("text/plain", R"({"input":"x"})");
+    get(rig, "/v1/responses/" + id_b);
+    expect(!id.empty() && served_by(get(rig, "/v1/responses/" + id)) == "a",
+           "and a stored create without the header is remembered");
+
+    // Routing reads the body the same way: a body with no JSON Content-Type names its model, has it
+    // rewritten to the model's id, and a previous_response_id in it finds the owner.
+    {
+        auto plain = rig.client();
+        get(rig, "/v1/responses/" + id_b); // b served last
+        const std::size_t b_before = rig.up("b").count();
+        plain.Post("/v1/responses", R"({"model":"a","input":"x"})", "text/plain");
+        expect(rig.up("b").count() == b_before && upstream_body(rig, "a")["model"] == "a",
+               "a header-less body's \"model\" selects the model");
+        plain.Post("/v1/responses", R"({"model":"alpha","input":"x"})", "text/plain");
+        expect(upstream_body(rig, "a")["model"] == "a", "and its alias is rewritten to the id");
+        get(rig, "/v1/responses/" + id_b); // b served last
+        plain.Post("/v1/responses", R"({"input":"x","previous_response_id":")" + id_a + R"("})",
+                   "text/plain");
+        expect(upstream_body(rig, "a")["previous_response_id"] == id_a &&
+                   upstream_body(rig, "a")["model"] == "a",
+               "a header-less previous_response_id goes to the owner, with the selector filled in");
+        reply = to_reply(plain.Post("/v1/responses", R"({"model":"","input":"x"})", "text/plain"));
+        expect(reply.status == 400, "an empty selector is refused whatever the Content-Type");
+    }
+
+    // A reply that is not streamed is written after the model stored the response, so one cut off
+    // after its id was seen keeps its owner (as does a cut-off stream: see above).
+    id = create_id(R"({"abort_body":true,"input":"x"})");
+    // The relay has ended (its lease is back) before the owner is looked up, so a late forget
+    // cannot be missed.
+    expect(eventually([&] { return rig.leases("a") == 0; }), "the cut-off relay ends");
+    get(rig, "/v1/responses/" + id_b); // b served last
+    expect(!id.empty() && served_by(get(rig, "/v1/responses/" + id)) == "a",
+           "a non-streamed reply cut off after its id keeps its owner");
+
+    // A failed create names no response.
+    post(rig, "/v1/responses", R"({"model":"a","fail":true})");
+    get(rig, "/v1/responses/" + id_b); // b served last
+    const std::size_t a_calls = rig.up("a").count();
+    reply                     = get(rig, "/v1/responses/resp_failed");
+    expect(reply.status == 404 && rig.up("a").count() == a_calls,
+           "an error reply's id is not recorded");
+
+    // Delete: the response is gone, and no longer anyone's.
+    reply = del(rig, "/v1/responses/" + id_a);
+    expect(reply.status == 200 && served_by(reply) == "a", "DELETE goes to the owner");
+    get(rig, "/v1/responses/" + id_b);
+    const std::size_t a_after_delete = rig.up("a").count();
+    reply                            = get(rig, "/v1/responses/" + id_a);
+    expect(reply.status == 404 && rig.up("a").count() == a_after_delete,
+           "after it, the id routes by default again");
+    // A delete the model refuses leaves the owner in place.
+    reply = del(rig, "/v1/responses/" + id_stream + "?model=a");
+    expect(reply.status == 404, "a delete sent to the wrong model is refused");
+    expect(served_by(get(rig, "/v1/responses/" + id_stream)) == "b",
+           "and the owner is remembered");
+
+    // The model unloads and comes back for the follow-up (its store outlives it).
+    post(rig, "/models/unload", R"({"model":"b"})");
+    expect(rig.state("b") == ModelState::Unloaded, "b is unloaded");
+    reply = get(rig, "/v1/responses/" + id_stream);
+    expect(reply.status == 200 && served_by(reply) == "b" && rig.state("b") == ModelState::Loaded,
+           "a follow-up to an unloaded owner loads it");
+}
+
+void owner_map_is_bounded() {
+    FakeResponses store;
+    // Two models of one record each: the map holds two ids, the oldest goes first.
+    Rig rig(kTwoModels, {}, false,
+            [&](const std::string& id, Upstream& upstream) { install_responses(id, upstream, store); },
+            2, /*store_records=*/1);
+    const auto make = [&](const std::string& model) {
+        return post(rig, "/v1/responses", R"({"model":")" + model + R"(","input":"x"})")
+            .json.value("id", "");
+    };
+    const std::string first  = make("a");
+    const std::string second = make("a");
+    const std::string third  = make("a");
+    // b last, so a forgotten id would be tried there.
+    post(rig, "/v1/chat/completions", R"({"model":"b"})");
+    const std::size_t a_calls = rig.up("a").count();
+    expect(get(rig, "/v1/responses/" + third).status == 200 && rig.up("a").count() == a_calls + 1,
+           "a recent id still routes to its owner");
+    post(rig, "/v1/chat/completions", R"({"model":"b"})");
+    const std::size_t b_calls = rig.up("b").count();
+    expect(get(rig, "/v1/responses/" + first).status == 404 && rig.up("b").count() == b_calls + 1,
+           "an id forgotten at capacity routes by default");
+    (void)second;
+}
+
+void owner_map_keeps_each_models_quota() {
+    // Each model has its own bound, so a busy model cannot push out another model's ids: a keeps 2,
+    // b keeps 3, and b creating many leaves a's alone.
+    FakeResponses store;
+    Rig rig({{.id = "a", .store_records = 2}, {.id = "b", .store_records = 3}}, {}, false,
+            [&](const std::string& id, Upstream& upstream) { install_responses(id, upstream, store); });
+    expect(rig.registry->response_store_records("a") == 2u &&
+               rig.registry->response_store_records("b") == 3u &&
+               !rig.registry->response_store_records("nope"),
+           "each model has its own bound");
+    const auto make = [&](const std::string& model) {
+        return post(rig, "/v1/responses", R"({"model":")" + model + R"(","input":"x"})")
+            .json.value("id", "");
+    };
+    std::vector<std::string> a_ids;
+    for (int i = 0; i < 2; ++i) { a_ids.push_back(make("a")); }
+    std::vector<std::string> b_ids;
+    for (int i = 0; i < 8; ++i) { b_ids.push_back(make("b")); }
+    // "a" served last, so a forgotten b id would be tried there, and a forgotten a id on b.
+    const auto owned_by = [&](const std::string& id, const std::string& expected,
+                              const std::string& other) {
+        post(rig, "/v1/chat/completions", R"({"model":")" + other + R"("})");
+        const std::size_t calls = rig.up(expected).count();
+        return !id.empty() && get(rig, "/v1/responses/" + id).status == 200 &&
+               rig.up(expected).count() == calls + 1;
+    };
+    for (const std::string& id : a_ids) {
+        expect(owned_by(id, "a", "b"), "another model's creates leave an id routable");
+    }
+    for (std::size_t i = b_ids.size() - 3; i < b_ids.size(); ++i) {
+        expect(owned_by(b_ids[i], "b", "a"), "a model keeps its latest ids up to its own limit");
+    }
+    for (std::size_t i = 0; i + 3 < b_ids.size(); ++i) {
+        post(rig, "/v1/chat/completions", R"({"model":"a"})");
+        const std::size_t b_calls = rig.up("b").count();
+        expect(get(rig, "/v1/responses/" + b_ids[i]).status == 404 && rig.up("b").count() == b_calls,
+               "a model forgets its older ids beyond its limit (routed by default to a)");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -896,6 +1426,10 @@ int main() {
         client_disconnects();
         upstream_failures();
         dead_listener_is_rebuilt();
+        response_owner_bookkeeping();
+        responses_follow_up_the_owning_model();
+        owner_map_is_bounded();
+        owner_map_keeps_each_models_quota();
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
         return 1;
