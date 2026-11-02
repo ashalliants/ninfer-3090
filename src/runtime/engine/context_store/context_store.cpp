@@ -574,6 +574,10 @@ void ContextStore::write_published_locked(const std::string& id,
     }
 }
 
+fs::path ContextStore::peer_origin_path(const std::string& id) const {
+    return options_.directory / "manifests" / (id + ".peer");
+}
+
 fs::path ContextStore::used_path(const std::string& id) const {
     return options_.directory / "manifests" / (id + ".used");
 }
@@ -747,6 +751,7 @@ void ContextStore::remove_entry_locked(const std::string& id, bool corrupt) {
     remove_quietly(manifest_path(id));
     remove_quietly(used_path(id));
     remove_quietly(published_path(id));
+    remove_quietly(peer_origin_path(id));
 }
 
 void ContextStore::quarantine_peers_locked(Entry& entry, const std::vector<ChunkRef>* damaged) {
@@ -754,15 +759,16 @@ void ContextStore::quarantine_peers_locked(Entry& entry, const std::vector<Chunk
         if (!entry.peer_memo_key.empty()) { peer_skipped_[entry.peer_memo_key] = entry.peer_stamp; }
         return;
     }
-    // A damaged chunk this store wrote, fetched or shared with another image says nothing about a
-    // peer: that peer is asked again, and its intact copy can still complete the image. The damaged
-    // files are discarded, so whatever replaces them is no longer the peer's.
-    for (auto& [memo_key, fill] : entry.peer_fills) {
-        for (const ChunkRef& chunk : *damaged) {
-            if (fill.chunk_keys.erase(hex_key(chunk.hash)) != 0) {
-                peer_skipped_[memo_key] = fill.stamp;
-            }
-        }
+    // A damaged chunk this store wrote or fetched says nothing about a peer: that peer is asked
+    // again, and its intact copy can still complete the image. Only a file that is still the
+    // peer's link blames the peer; the damaged files are discarded, so whatever replaces them is
+    // no longer the peer's.
+    (void)entry;
+    for (const ChunkRef& chunk : *damaged) {
+        const auto found = chunks_.find(hex_key(chunk.hash));
+        if (found == chunks_.end() || found->second.peer_key.empty()) { continue; }
+        peer_skipped_[found->second.peer_key] = found->second.peer_stamp;
+        found->second.peer_key.clear();
     }
 }
 
@@ -915,6 +921,10 @@ void ContextStore::scan() {
             continue;
         }
         entry.info.last_used_ms = entry.info.created_ms;
+        {
+            std::error_code marker_error;
+            entry.peer_origin = fs::exists(peer_origin_path(id), marker_error);
+        }
         if (options_.remote) {
             // Published before the restart, and this manifest is the one published (not a newer
             // write of the id whose upload never ran).
@@ -1089,6 +1099,7 @@ ContextStore::EvictionYield ContextStore::evict_to_remote_locked(
         chunk_total_bytes_ -= found->second.stored;
         found->second.present = false;
         found->second.stored  = 0;
+        found->second.peer_key.clear();
         ++local_changes_;
     }
     if (apply) { entry.evicted = true; }
@@ -1338,6 +1349,8 @@ ContextStore::PutResult ContextStore::put(const Description& description,
                 stored_written += stored.bytes;
             }
             write_atomically(manifest_path(description.id), manifest.out);
+            // Written here: this store's own to upload, whatever a peer wrote under the id before.
+            remove_quietly(peer_origin_path(description.id));
         }
 
         Entry entry;
@@ -1368,6 +1381,7 @@ ContextStore::PutResult ContextStore::put(const Description& description,
             if (found != chunks_.end() && !found->second.present) {
                 found->second.present = true;
                 found->second.stored  = stored;
+                found->second.peer_key.clear();
                 chunk_total_bytes_ += stored;
             }
         }
@@ -1681,6 +1695,7 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(
                         found->second.present = false;
                         chunk_total_bytes_ -= found->second.stored;
                         found->second.stored = 0;
+                        found->second.peer_key.clear();
                     }
                 }
             };
@@ -1718,6 +1733,7 @@ std::optional<std::vector<std::uint8_t>> ContextStore::load(
                     found->second.present = false;
                     chunk_total_bytes_ -= found->second.stored;
                     found->second.stored = 0;
+                    found->second.peer_key.clear();
                 }
                 remove_chunk_files(chunk.hash);
             }
@@ -2054,7 +2070,7 @@ bool ContextStore::upload_unpublished(std::string_view binding,
                                    ? kMaximumQueuedUploads - queued.size()
                                    : 0;
             for (const auto& [id, entry] : entries_) {
-                if (entry.published || entry.evicted || !entry.peer_memo_key.empty() ||
+                if (entry.published || entry.evicted || entry.peer_origin ||
                     entry.info.binding != binding || !entry_local_locked(entry)) {
                     continue;
                 }
@@ -2274,7 +2290,7 @@ void ContextStore::touch_remote_image(const std::string& id) {
         chunks     = found->second.chunks;
         generation = found->second.generation;
         created_ms = found->second.info.created_ms;
-        peer_image = !found->second.peer_memo_key.empty();
+        peer_image = found->second.peer_origin;
     }
     const std::int64_t now = now_ms();
     {
@@ -2523,6 +2539,7 @@ bool ContextStore::install_chunk(const ChunkRef& chunk, bool compressed,
     install_chunk_file(chunk, compressed, file_bytes);
     found->second.present = true;
     found->second.stored  = file_bytes.size();
+    found->second.peer_key.clear(); // fetched here: not a peer's file
     chunk_total_bytes_ += found->second.stored;
     return true;
 }
@@ -3067,17 +3084,19 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
     ++stats_.peer_images;
     stats_.peer_bytes_linked += linked_bytes;
     // Only the chunks linked here are the peer's: one this store already held is not.
-    const auto record_fill = [&](Entry& target) {
-        Entry::PeerFill& fill = target.peer_fills[memo_key];
-        fill.stamp            = stamp;
-        for (const auto& [chunk, stored] : linked) { fill.chunk_keys.insert(hex_key(chunk->hash)); }
+    const auto record_fill = [&] {
+        for (const auto& [chunk, stored] : linked) {
+            ChunkUse& use  = chunks_[hex_key(chunk->hash)];
+            use.peer_key   = memo_key;
+            use.peer_stamp = stamp;
+        }
     };
     if (held != nullptr) {
         // Same references, manifest and generation: a fetch of this entry in flight finds the
         // chunks present and skips them. The manifest stays the bucket's, so the image is still
         // this store's to repair in the bucket. The use time is the later of the bucket's and the
         // peer's.
-        record_fill(*held);
+        record_fill();
         if (entry.info.last_used_ms > held->info.last_used_ms) {
             held->info.last_used_ms = entry.info.last_used_ms;
             write_used(id, held->info.last_used_ms);
@@ -3086,9 +3105,15 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
     }
     entry.peer_memo_key     = memo_key;
     entry.peer_stamp        = stamp;
-    record_fill(entry);
+    entry.peer_origin       = true;
+    try {
+        write_atomically(peer_origin_path(id), {});
+    } catch (const std::exception&) {
+        // Without the marker a restart only forgets where the image came from.
+    }
     manifest_total_bytes_ += entry.manifest_bytes;
     add_references(entry);
+    record_fill(); // after the references: the chunks are described then
     entry.generation = ++next_generation_;
     entries_.emplace(id, std::move(entry));
     write_used(id, entries_.find(id)->second.info.last_used_ms); // our own sidecar, so a restart keeps it

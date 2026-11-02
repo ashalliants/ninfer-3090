@@ -2915,6 +2915,81 @@ void test_peer_images_are_not_uploaded_by_the_importer() {
     }
 }
 
+// The importer's restart must not turn a peer's image into one it wrote: it is still the peer's
+// to upload, so neither a use nor the flush before the box goes puts it in the bucket.
+void test_peer_images_are_still_the_peers_to_upload_after_a_restart() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    const auto remote = std::make_shared<MemoryObjectStore>();
+    const auto image  = peer_image(14);
+    ContextStore a(options_for(a_directory.path())); // the peer has not uploaded it (yet)
+    (void)a.put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
+    ContextStore::Options options = remote_options(b_directory.path(), remote);
+    options.peers                 = {a_directory.path()};
+    options.peer_poll             = std::chrono::hours(1);
+    {
+        ContextStore b(options);
+        check(b.sync_peers() == 1, "the peer image was not imported");
+    }
+    {
+    ContextStore b(options);
+    check(drained(b), "the restarted importer's queue did not drain");
+    check(b.find("0a").has_value(), "the imported image did not survive the restart");
+    check(b.load("0a").value_or(std::vector<std::uint8_t>{}) == image,
+          "the imported image did not load after the restart");
+    check(drained(b), "the importer's remote queue did not drain");
+    check(b.upload_unpublished("model-a", std::chrono::steady_clock::now() + std::chrono::seconds(10)),
+          "the flush before shutdown did not finish");
+    check(remote->puts == 0 && remote->objects.empty() && b.stats().remote_uploads == 0,
+          "the restarted importer uploaded an image a peer wrote");
+    // Writing the image here makes it this store's own to upload again.
+    (void)b.put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
+    check(drained(b), "the rewrite did not upload");
+    check(remote->puts > 0, "an image written here after a peer's was not uploaded");
+    }
+    {
+        ContextStore again(options);
+        check(drained(again) && again.find("0a").has_value(), "the rewritten image was lost on restart");
+        again.touch("0a");
+        check(drained(again), "the restarted store's queue did not drain");
+    }
+}
+
+// A chunk is blamed on the peer only while the file in the directory is the peer's link: a chunk
+// evicted to the bucket and fetched back, or replaced, is this store's own.
+void test_chunk_provenance_ends_when_the_peer_file_is_replaced() {
+    PeerAndRemote setup;
+    ContextStore::Options options = remote_options(setup.b_directory.path(), setup.remote);
+    options.peers                 = {setup.a_directory.path()};
+    options.peer_poll             = std::chrono::hours(1);
+    options.max_bytes             = 8000; // room for one image
+    ContextStore b(options);
+    (void)b.refresh_remote();
+    check(b.sync_peers() == 1, "the peer's copy of a bucket-registered image was not linked");
+    // Another image makes room: the filled one is evicted to the bucket and fetched back.
+    (void)b.put(describe("0b"), concat({pseudo_random(30, 31), pseudo_random(5000, 32)}),
+                std::array{ContextStore::Region{30, 5000}});
+    check(drained(b), "the second image did not upload");
+    check(!b.find("0a")->local, "the first image was not evicted to the bucket");
+    check(b.load("0a").value_or(std::vector<std::uint8_t>{}) == setup.image,
+          "the evicted image was not fetched back");
+    // The fetched-back files are damaged now; the peer did not supply them.
+    for (const fs::path& file : chunk_files(setup.b_directory.path())) {
+        if (fs::hard_link_count(file) != 1) { continue; }
+        std::fstream stream(file, std::ios::in | std::ios::out | std::ios::binary);
+        char byte = 0;
+        stream.get(byte);
+        stream.seekp(0);
+        stream.put(static_cast<char>(byte ^ 0x5a));
+    }
+    check(b.load("0a").value_or(std::vector<std::uint8_t>{}) == setup.image,
+          "the damaged files were not repaired from the bucket");
+    check(b.stats().corrupt_chunk == 0 && b.stats().remote_downloads > 0, "no damage was found and repaired");
+    // The peer is still polled: nothing it linked is damaged.
+    check(b.erase("0a") && b.erase("0b"), "the images could not be removed");
+    check(b.sync_peers() == 1, "a peer was blamed for a file it did not supply");
+}
+
 // Every byte in the store's directory, as a volume of fixed size sees it.
 std::uint64_t bytes_on_disk(const fs::path& directory) {
     std::uint64_t total = 0;
@@ -3260,6 +3335,8 @@ int main() {
     test_damaged_peer_chunk_falls_back_to_the_remote_once();
     test_damaged_chunk_blames_the_peer_only_when_the_peer_supplied_it();
     test_peer_images_are_not_uploaded_by_the_importer();
+    test_peer_images_are_still_the_peers_to_upload_after_a_restart();
+    test_chunk_provenance_ends_when_the_peer_file_is_replaced();
     test_peer_poll_passes_over_images_the_peer_only_registered();
     test_peer_poll_lists_an_unchanged_peer_once();
     test_peer_fit_skip_is_counted_once_when_only_the_use_changes();

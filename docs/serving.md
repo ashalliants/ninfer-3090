@@ -606,9 +606,11 @@ ninfer-serve model.ninfer --port 8001 --devices 1 --context-store /data/store1 -
   takes the peer's chunks the same way, so loading it reads the disk instead of the bucket.
 - An imported session is the importer's own from then on: the peer deleting, evicting or replacing
   its copy does not affect it, and removing it here does not affect the peer. It is not uploaded to
-  the bucket by the importer (the engine that wrote it uploads it), until the importer restarts: its
-  start-up scan cannot tell an imported session from its own, so from then on a use puts back what
-  the bucket lacks, as for its own sessions. Sessions older than
+  the bucket by the importer (the engine that wrote it uploads it), including after the importer
+  restarts (a small `.peer` marker beside the manifest records where it came from) and in the flush
+  before the box goes; writing the same id here makes it the importer's own. A damaged chunk file
+  blames only the peer whose link it is: a chunk evicted to the bucket and fetched back, or written
+  here, is this engine's. Sessions older than
   `--context-store-ttl-hours`, or that would not fit in `--context-store-max-gib`, are skipped, and a
   skipped session is not looked at again until its owner rewrites it (one that did not fit is also
   tried again once this engine has removed something to make room).
