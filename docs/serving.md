@@ -893,7 +893,13 @@ that owner instead of the model that last served, so these need no model name:
 If you do name a model, the router honours it, even a wrong one: that model answers not-found. An ID
 the router does not know (made before a router restart, a `store: false` create, a stream that failed
 or was cut off, or one forgotten because the map is full) is routed as any request without an ID is,
-to the model that last served; if that is not the owner, it answers not-found. The router keeps
+to the model that last served; if that is not the owner, it answers not-found. The router reads
+`"store"` and `"stream"` from the JSON body whatever `Content-Type` the request carries, as the model
+does. A streamed create that fails or is cut off before its end is forgotten, because the model stores
+a response only after generating all of it. A reply that is not streamed is written after the model
+has stored the response, so one that breaks after its ID was seen keeps its owner. When the router
+cannot tell whether the model stored the response, it keeps the entry: that costs a map slot and, at
+worst, a not-found from the owner, which is what an unknown ID gets anyway. The router keeps
 `--response-store-max-records` IDs for each model and forgets the least recently used first. A
 successful `DELETE` forgets the ID at once. The map lasts as long as the router process, and does not
 depend on whether the owner is loaded: a follow-up for a model that was unloaded or put to sleep loads

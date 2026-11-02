@@ -963,6 +963,17 @@ void install_responses(const std::string& model, Upstream& upstream, FakeRespons
                 });
             return;
         }
+        if (!streamed && body.is_object() && body.value("abort_body", false)) {
+            // Stored, then the reply is cut off after its first bytes: the real server commits the
+            // response before it writes anything.
+            const std::string head = "{\"id\":\"" + id + "\",\"object\":\"resp";
+            res.set_chunked_content_provider(
+                "application/json", [head, step = 0](size_t, httplib::DataSink& sink) mutable {
+                    if (step++ == 0) { return sink.write(head.data(), head.size()); }
+                    return false; // the connection drops mid-body
+                });
+            return;
+        }
         if (streamed) {
             // The id is split across two writes.
             const std::string first = "event: response.created\ndata: {\"response\":{\"id\":\"" +
@@ -1195,6 +1206,40 @@ void responses_follow_up_the_owning_model() {
     expect(!id.empty() && owner_forgotten(id), "a stream that ends in response.failed is forgotten");
     id = create_id(R"({"stream":true,"abort_stream":true,"input":"x"})");
     expect(!id.empty() && owner_forgotten(id), "and so is one that is cut off");
+
+    // The model reads the body whatever the Content-Type says, so a store:false create without a
+    // JSON header is just as unstored, streamed or not.
+    const auto create_as = [&](const std::string& content_type, const std::string& body) {
+        auto plain_client = rig.client();
+        plain_client.Post("/v1/responses?model=a", body, content_type);
+        return store.last_created();
+    };
+    id = create_as("text/plain", R"({"store":false,"input":"x"})");
+    expect(!id.empty() && owner_forgotten(id), "store:false is honoured without a JSON Content-Type");
+    id = create_as("text/plain", R"({"stream":true,"store":false,"input":"x"})");
+    expect(!id.empty() && owner_forgotten(id), "also when streamed");
+    {
+        auto bare = rig.client();
+        const auto sent = bare.Post("/v1/responses?model=a", httplib::Headers{}, R"({"store":false})",
+                                    "");
+        id = store.last_created();
+        expect(sent && !id.empty() && owner_forgotten(id), "or with no Content-Type at all");
+    }
+    // ... while a stored one without the header is still remembered.
+    id = create_as("text/plain", R"({"input":"x"})");
+    get(rig, "/v1/responses/" + id_b);
+    expect(!id.empty() && served_by(get(rig, "/v1/responses/" + id)) == "a",
+           "and a stored create without the header is remembered");
+
+    // A reply that is not streamed is written after the model stored the response, so one cut off
+    // after its id was seen keeps its owner (a stream cut off before its end does not: see above).
+    id = create_id(R"({"abort_body":true,"input":"x"})");
+    // The relay has ended (its lease is back) before the owner is looked up, so a late forget
+    // cannot be missed.
+    expect(eventually([&] { return rig.leases("a") == 0; }), "the cut-off relay ends");
+    get(rig, "/v1/responses/" + id_b); // b served last
+    expect(!id.empty() && served_by(get(rig, "/v1/responses/" + id)) == "a",
+           "a non-streamed reply cut off after its id keeps its owner");
 
     // A failed create names no response.
     post(rig, "/v1/responses", R"({"model":"a","fail":true})");

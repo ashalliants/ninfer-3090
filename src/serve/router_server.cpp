@@ -287,10 +287,25 @@ bool is_json_content_type(std::string_view content_type) {
 }
 
 namespace {
-// Whether a Responses create asks for "store": false, so no model keeps the response.
-bool stores_nothing(const Json& body) {
-    const auto store = body.find("store");
-    return store != body.end() && store->is_boolean() && !store->get<bool>();
+// What a Responses create asks for. The model reads its JSON body whatever Content-Type the client
+// sent (parse_json_body ignores the header), so the router must too: a create without the header
+// still stores or streams. A body that is not a JSON object is refused by the model, which keeps
+// nothing, so it counts as storing nothing.
+struct CreateIntent {
+    bool stores  = false;
+    bool streams = false;
+};
+
+CreateIntent create_intent(const std::optional<Json>& parsed, const std::string& raw) {
+    Json fresh;
+    if (!parsed) { fresh = Json::parse(raw, nullptr, /*allow_exceptions=*/false); }
+    const Json& body = parsed ? *parsed : fresh;
+    if (!body.is_object()) { return {}; }
+    const auto flag = [&body](const char* key, bool otherwise) {
+        const auto found = body.find(key);
+        return found != body.end() && found->is_boolean() ? found->get<bool>() : otherwise;
+    };
+    return {.stores = flag("store", true), .streams = flag("stream", false)};
 }
 } // namespace
 
@@ -779,7 +794,9 @@ void RouterServer::route(const httplib::Request& req, httplib::Response& res) {
     // A create with "store": false is kept nowhere, so it has no owner to remember.
     Tap tap;
     Done done;
-    if (req.method == "POST" && req.path == "/v1/responses" && !(body && stores_nothing(*body))) {
+    const bool is_create = req.method == "POST" && req.path == "/v1/responses";
+    const CreateIntent intent = is_create ? create_intent(body, req.body) : CreateIntent{};
+    if (is_create && intent.stores) {
         auto scanner = std::make_shared<ResponseIdScanner>();
         tap          = [this, model = lease.model(), scanner](std::string_view data) {
             const bool known = scanner->id().has_value();
@@ -787,9 +804,12 @@ void RouterServer::route(const httplib::Request& req, httplib::Response& res) {
             if (!known && scanner->id()) { response_owners_.record(*scanner->id(), model); }
         };
         // The id of a stream is out in its first event, before the model has stored anything: one
-        // that fails or is cut off was never stored, so its provisional owner goes again.
-        done = [this, scanner](bool finished) {
-            if (scanner->id() && (!finished || scanner->failed())) {
+        // that fails or is cut off was never stored, so its provisional owner goes again. A reply
+        // that is not streamed is written only after the model has stored the response, so an id
+        // seen in it is kept even if the connection then breaks: an extra entry costs a map slot,
+        // while forgetting a stored response would send its follow-ups to the wrong model.
+        done = [this, scanner, streams = intent.streams](bool finished) {
+            if (streams && scanner->id() && (!finished || scanner->failed())) {
                 response_owners_.forget(*scanner->id());
             }
         };
