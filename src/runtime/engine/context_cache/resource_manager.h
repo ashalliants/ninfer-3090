@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/wide_math.h"
+#include "runtime/contract/host_placement.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/context_cache/prefix_index.h"
@@ -8,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <concepts>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -1803,9 +1805,14 @@ private:
                           Evaluation& evaluation) const {
         auto protected_sources = std::vector<Handle>(excluded.begin(), excluded.end());
         protected_sources.insert(protected_sources.end(), plan.sources.begin(), plan.sources.end());
+        // A Program that places by allocator extents gets the destination's unit, so the victims
+        // are judged by the runs they leave and not by the bytes they free (#406).
+        std::size_t unit = 0;
+        if constexpr (requires { plan.host_unit; }) { unit = plan.host_unit; }
         return host_victims_in_order(program, plan.host_bytes, preservation.checkpoint, {},
                                      protected_sources, preservation, cursor, evaluation, false,
-                                     plan.host_placeable, needs_state_run(plan));
+                                     plan.host_placeable, needs_state_run(plan), unit,
+                                     plan.released.state_slots != 0);
     }
 
     // A Host state image takes one contiguous run. When the quote can place none, freeing bytes is
@@ -1832,7 +1839,8 @@ private:
                           std::optional<Admission> admission, const ReclaimCursor& cursor,
                           Evaluation& evaluation, bool bytes_are_shortage = false,
                           std::size_t placeable = SIZE_MAX, bool state_run = false,
-                          std::size_t reserve_bytes = 0) const {
+                          std::size_t reserve_bytes = 0, std::size_t unit = 0,
+                          bool image_destination = false) const {
         const auto usage = program.physical_usage();
         const auto free =
             std::min<std::size_t>(usage.capacity.host_bytes - usage.occupied.host_bytes, placeable);
@@ -1868,9 +1876,32 @@ private:
             }
         }
         auto actions = program.plan_releases(allowed, excluded, {.host_bytes = required});
+        // Placeable bytes describe the current free runs and are not additive with the bytes of
+        // arbitrary Host allocations: victims can free enough bytes yet leave every run shorter
+        // than the destination needs. A Program that can simulate its allocator says whether the
+        // runs left by a victim set place the destination; that, not the byte total, ends the
+        // search (#406). Such a destination's progress is every byte a candidate frees, since a
+        // run can grow from pages or images alike.
+        bool placing = false;
+        if constexpr (requires(std::span<const Handle> set) {
+                          { program.host_free_runs_after_release(set) } -> std::convertible_to<HostFreeRuns>;
+                      }) {
+            placing = unit != 0 && !bytes_are_shortage;
+        }
+        if (placing) { state_run = false; }
+        const auto placed = [&](std::span<const Handle> set) {
+            if constexpr (requires { program.host_free_runs_after_release(set); }) {
+                return host_places(program.host_free_runs_after_release(set), bytes, unit,
+                                   image_destination);
+            } else {
+                return true;
+            }
+        };
         std::vector<Handle> selected;
         std::size_t released = 0;
-        while (released < required) {
+        // The shortage is the bytes beyond the placeable ones; freeing bytes next to a stranded
+        // hole can place the destination with fewer, so only the simulation ends a placing search.
+        while (placing ? !placed(selected) : released < required) {
             std::optional<std::size_t> best;
             std::vector<Handle> best_union;
             std::size_t best_bytes = 0;

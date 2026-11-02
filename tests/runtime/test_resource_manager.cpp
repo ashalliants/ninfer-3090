@@ -87,6 +87,8 @@ struct Program {
         std::size_t bytes;
         bool external_reference;
         bool image = false;
+        // Where the block sits in the Host backing, when the fixture models free runs.
+        std::optional<std::size_t> offset;
     };
 
     struct Metadata {
@@ -137,8 +139,55 @@ struct Program {
     std::size_t placed_images = 0;
 
     std::size_t host_block(std::size_t bytes, bool external_reference = false, bool image = false) {
-        blocks.push_back({bytes, external_reference, image});
+        blocks.push_back({bytes, external_reference, image, std::nullopt});
         return blocks.size() - 1;
+    }
+
+    // Allocator extents (#406). With `run_unit` set, the Host backing is modelled by byte ranges:
+    // `base_free_runs` plus the ranges of blocks nothing references, and a destination of whole
+    // `run_unit` pages places only into runs that hold one. Blocks without an offset are
+    // not placed anywhere.
+    std::size_t run_unit = 0;
+    std::vector<ninfer::runtime::HostRun> base_free_runs;
+
+    std::size_t host_block_at(std::size_t offset, std::size_t bytes) {
+        blocks.push_back({bytes, false, false, offset});
+        return blocks.size() - 1;
+    }
+
+    [[nodiscard]] ninfer::runtime::HostFreeRuns free_runs() const {
+        ninfer::runtime::HostFreeRuns result{.runs             = base_free_runs,
+                                             .general_capacity = host_capacity,
+                                             .occupied         = physical_usage().occupied.host_bytes};
+        for (std::size_t block = 0; block < blocks.size(); ++block) {
+            if (blocks[block].offset && !blocks[block].external_reference &&
+                std::none_of(contents.begin(), contents.end(),
+                             [&](const auto& content) { return references(content, block); })) {
+                result.runs.push_back({*blocks[block].offset, blocks[block].bytes});
+            }
+        }
+        ninfer::runtime::coalesce_host_runs(result.runs);
+        return result;
+    }
+
+    [[nodiscard]] ninfer::runtime::HostFreeRuns
+    host_free_runs_after_release(std::span<const Handle> victims) const {
+        std::vector<ninfer::runtime::HostRun> freed;
+        for (std::size_t block = 0; block < blocks.size(); ++block) {
+            if (!blocks[block].offset || blocks[block].external_reference) { continue; }
+            bool referenced = false;
+            bool survives   = false;
+            for (std::uint32_t index = 0; index < contents.size(); ++index) {
+                if (!references(contents[index], block)) { continue; }
+                referenced = true;
+                if (!contents[index].evictable ||
+                    std::find(victims.begin(), victims.end(), Handle{index}) == victims.end()) {
+                    survives = true;
+                }
+            }
+            if (referenced && !survives) { freed.push_back({*blocks[block].offset, blocks[block].bytes}); }
+        }
+        return ninfer::runtime::host_runs_after_release(free_runs(), freed);
     }
 
     [[nodiscard]] std::size_t free_image_runs() const {
@@ -325,9 +374,15 @@ struct Program {
         Usage released;
         std::vector<std::pair<Handle, std::uint32_t>> main_parts;
         std::size_t host_placeable = 0;
+        std::size_t host_unit      = 0; // the page size the destination is placed in (#406)
     };
 
     [[nodiscard]] std::size_t host_placeable() const {
+        if (run_unit) {
+            const auto runs = free_runs();
+            return std::min(ninfer::runtime::host_placeable_bytes(runs.runs, run_unit),
+                            runs.budget_free());
+        }
         const auto usage = physical_usage();
         const auto free  = usage.capacity.host_bytes - usage.occupied.host_bytes;
         return free - std::min(free, host_fragment_bytes);
@@ -407,7 +462,8 @@ struct Program {
                      : std::vector<std::pair<Handle, std::uint32_t>>{},
                  released.state_slots && image_bytes
                      ? std::min(host_placeable(), free_image_runs() * image_bytes)
-                     : host_placeable()});
+                     : host_placeable(),
+                 run_unit});
         }
         return result;
     }
@@ -2197,6 +2253,95 @@ void test_pause_victims_reach_into_the_snapshot_reserve() {
             "a target above the whole backing was accepted");
 }
 
+// Placeable bytes are not additive with the bytes freed from arbitrary Host allocations (#406).
+// Host (400 bytes, one page = 100): evictable history at [0,50), [200,250) and [300,350), pinned
+// residents between them, and a free hole at [350,400). Releasing the first two frees the 100 bytes
+// the quote is short of but leaves every run under one page; only the third joins the hole.
+struct FragmentedHost {
+    Fixture f{400};
+    Handle incoming{};
+    std::array<Handle, 3> history{};
+
+    explicit FragmentedHost(bool last_evictable) {
+        f.program.run_unit = 100;
+        (void)f.program.host_block(150, true); // [50,200)
+        (void)f.program.host_block(50, true);  // [250,300)
+        f.program.base_free_runs = {{350, 50}};
+        const std::array<std::size_t, 3> offsets{0, 200, 300};
+        for (std::size_t i = 0; i < history.size(); ++i) {
+            history[i] = f.program.add(tokens(10, 5000 + 100 * static_cast<std::uint32_t>(i)),
+                                       {f.program.host_block_at(offsets[i], 50)});
+            f.program.contents[history[i].index].device_state = false;
+            f.program.contents[history[i].index].main_pages   = 0;
+            f.publish(history[i]);
+        }
+        f.program.contents[history[2].index].evictable = last_evictable;
+        incoming                                       = f.program.add(tokens(1000));
+        f.program.contents[incoming.index].demotion_bytes = 100;
+        f.publish(incoming);
+    }
+};
+
+void test_host_placement_arithmetic() {
+    using ninfer::runtime::HostFreeRuns;
+    using ninfer::runtime::HostRun;
+    // Touching ranges merge; ranges with a gap or in another order do not or sort first.
+    const HostFreeRuns free{.runs = {{350, 50}}, .general_capacity = 400, .occupied = 350};
+    const std::array<HostRun, 2> apart{HostRun{200, 50}, HostRun{0, 50}};
+    const auto scattered = ninfer::runtime::host_runs_after_release(free, apart);
+    require(scattered.runs == std::vector<HostRun>{{0, 50}, {200, 50}, {350, 50}} &&
+                scattered.occupied == 250 &&
+                !ninfer::runtime::host_places(scattered, 100, 100, false),
+            "scattered bytes were counted as a run");
+    const std::array<HostRun, 1> adjacent{HostRun{300, 50}};
+    const auto joined = ninfer::runtime::host_runs_after_release(free, adjacent);
+    require(joined.runs == std::vector<HostRun>{{300, 100}} &&
+                ninfer::runtime::host_places(joined, 100, 100, false) &&
+                ninfer::runtime::host_places(joined, 100, 100, true) &&
+                !ninfer::runtime::host_places(joined, 200, 100, false),
+            "adjacent bytes did not join the free run");
+    // Pages need whole units per run; an image needs one run; the budget caps both.
+    const HostFreeRuns pages{.runs = {{0, 150}, {300, 150}}, .general_capacity = 400, .occupied = 100};
+    require(ninfer::runtime::host_placeable_bytes(pages.runs, 100) == 200 &&
+                ninfer::runtime::host_places(pages, 200, 100, false) &&
+                !ninfer::runtime::host_places(pages, 200, 100, true) &&
+                !ninfer::runtime::host_places(pages, 300, 100, false),
+            "page and image placement differ from the runs");
+    const HostFreeRuns reserve{.runs = {{0, 400}}, .general_capacity = 300, .occupied = 250};
+    require(reserve.budget_free() == 50 && !ninfer::runtime::host_places(reserve, 100, 100, false),
+            "the snapshot reserve was offered to the cache");
+}
+
+void test_demotion_victims_account_for_post_release_extents() {
+    FragmentedHost fragmented(true);
+    auto& program = fragmented.f.program;
+    const auto usage = program.physical_usage();
+    require(usage.capacity.host_bytes - usage.occupied.host_bytes == 50 &&
+                program.host_placeable() == 0,
+            "fixture must have free bytes but no run for one page");
+    require(fragmented.f.cache.reclaim(program, {.main_kv_pages = 1}) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                program.demoted == std::vector<Handle>{fragmented.incoming} &&
+                program.placement_failures == 0 &&
+                std::find(program.released.begin(), program.released.end(),
+                          fragmented.history[2]) != program.released.end(),
+            "victims that free enough bytes but no run were chosen for a page demotion");
+
+    // The only history that joins the hole is pinned: raw bytes still reach the shortage, but no
+    // victim set leaves a run. The demotion is reported unplaceable, pass after pass, without
+    // displacing anything (the bytes the other two free are not worth evicting).
+    FragmentedHost stuck(false);
+    stuck.f.program.contents[stuck.incoming.index].release_blocked = true;
+    for (int pass = 0; pass < 3; ++pass) {
+        require(stuck.f.cache.reclaim(stuck.f.program, {.main_kv_pages = 1}) ==
+                    ninfer::runtime::ReclaimProgress::Blocked,
+                "an unplaceable demotion reported progress");
+    }
+    require(stuck.f.program.released.empty() && stuck.f.program.placement_failures == 0 &&
+                stuck.f.program.demoted.empty(),
+            "an unplaceable demotion displaced Host history it could not use");
+}
+
 void test_demotion_quotes_only_placeable_host_bytes() {
     // 32 bytes are free, but 16 of them are stranded in runs too short for the destination.
     Fixture f(64);
@@ -2706,6 +2851,8 @@ int main() {
         test_failed_demotion_releases_superseded_history_before_the_live_branch();
         test_demotion_quotes_only_placeable_host_bytes();
         test_pause_victims_reach_into_the_snapshot_reserve();
+        test_host_placement_arithmetic();
+        test_demotion_victims_account_for_post_release_extents();
         test_state_demotion_releases_a_whole_image_when_no_run_fits();
         test_inherited_owner_heat_cannot_spend_a_full_other_continuation();
         test_exact_repeated_candidate_can_replace_a_long_hotspot_with_common_fallback();

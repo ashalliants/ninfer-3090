@@ -12,6 +12,7 @@
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "runtime/contract/host_placement.h"
 
 #include "models/qwen3_5/program/lossy/gap_map.h"
 #include "models/qwen3_5/program/lossy/lossy_flow.h"
@@ -353,9 +354,17 @@ public:
     [[nodiscard]] runtime::ContextResourceUsage snapshot_resources(const ResumeState& paused) const;
     // Exact Host bytes freed by deleting this fixed set, with physical sharing counted once; with
     // state_images_only, only those of the whole Host state images it frees.
-    [[nodiscard]] std::size_t
-    host_bytes_released(std::span<const CheckpointHandle> checkpoints,
-                        bool state_images_only = false) const;
+    // The Host replicas a release frees, by identity, for the allocator simulation.
+    struct HostReleaseSet {
+        std::vector<StateImageHandle> states;
+        std::vector<LogicalKVPageHandle> main, backend;
+    };
+    [[nodiscard]] std::size_t host_bytes_released(std::span<const CheckpointHandle> checkpoints,
+                                                  bool state_images_only         = false,
+                                                  HostReleaseSet* released_set = nullptr) const;
+    // The Host arena's free runs after releasing these checkpoints (#406).
+    [[nodiscard]] runtime::HostFreeRuns
+    host_free_runs_after_release(std::span<const CheckpointHandle> checkpoints) const;
     // Host bytes a pause snapshot places; with `need`, also what it places in each allocation.
     [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle sequence,
                                                               PauseHostNeed* need = nullptr) const;
