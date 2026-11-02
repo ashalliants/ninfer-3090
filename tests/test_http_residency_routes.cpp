@@ -59,9 +59,17 @@ public:
         engine_options_.suspend.enabled = suspend_enabled;
         status_.enabled                 = suspend_enabled;
         load_.model_name                = kModel;
+    }
+
+    // Starts the idle sleeper. Tests call it after setting their controls (admitted, suspend_refusals,
+    // suspend_crashes), so the sleeper cannot act on a half-configured fake. Safe to call twice.
+    void start() {
+        if (started_) { return; }
+        started_ = true;
         start_idle_sleeper();
     }
 
+    // stop_idle_sleeper() is a no-op when the sleeper never started.
     ~FakeService() override { stop_idle_sleeper(); }
 
     // What the test turns: requests in flight, and the failures the next call raises.
@@ -153,6 +161,7 @@ public:
     }
 
 private:
+    bool started_ = false;
     ninfer::EngineOptions engine_options_;
     ninfer::LoadSummary load_;
     mutable std::mutex mutex_;
@@ -446,6 +455,7 @@ void idle_sleeper() {
     // --sleep-idle-seconds 1: the sleeper polls every 250 ms and suspends after a quiet second.
     FakeService service(make_options(/*sleep_idle_seconds=*/1));
     service.admitted = 1;
+    service.start();
     std::this_thread::sleep_for(2500ms);
     expect(service.suspend_calls == 0, "the sleeper leaves a model alone while a request is admitted");
 
@@ -462,6 +472,7 @@ void idle_sleeper() {
 void idle_sleeper_retries_after_a_refusal() {
     FakeService service(make_options(/*sleep_idle_seconds=*/1));
     service.suspend_refusals = 1; // a request slipped in between the sample and the suspend
+    service.start();
     expect(eventually([&] { return service.suspend_calls >= 1; }, 5s), "the sleeper tries");
     expect(service.residency().state == ninfer::ModelResidency::Resident,
            "a refused suspend leaves the model resident");
@@ -474,12 +485,14 @@ void idle_sleeper_retries_after_a_refusal() {
 
     FakeService crashing(make_options(/*sleep_idle_seconds=*/1));
     crashing.suspend_crashes = true;
+    crashing.start();
     expect(eventually([&] { return crashing.suspend_calls >= 2; }, 8s),
            "a suspend that throws does not stop the sleeper");
 }
 
 void sleeper_is_off_by_default() {
     FakeService service(make_options(/*sleep_idle_seconds=*/0));
+    service.start();
     std::this_thread::sleep_for(1500ms);
     expect(service.suspend_calls == 0, "without --sleep-idle-seconds nothing suspends the model");
 }
