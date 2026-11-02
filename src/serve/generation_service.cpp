@@ -444,12 +444,19 @@ GenerationService::GenerationService(
     options_.kv_capacity = engine_->options().kv_capacity;
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
+    start_idle_sleeper();
+}
+
+GenerationService::GenerationService(ServeOptions options, NoEngine)
+    : options_(std::move(options)) {}
+
+void GenerationService::start_idle_sleeper() {
     if (options_.sleep_idle_seconds != 0) {
         idle_sleeper_ = std::thread([this] { idle_sleep_loop(); });
     }
 }
 
-GenerationService::~GenerationService() {
+void GenerationService::stop_idle_sleeper() {
     {
         std::lock_guard lock(idle_mutex_);
         idle_stop_ = true;
@@ -457,6 +464,8 @@ GenerationService::~GenerationService() {
     idle_cv_.notify_all();
     if (idle_sleeper_.joinable()) { idle_sleeper_.join(); }
 }
+
+GenerationService::~GenerationService() { stop_idle_sleeper(); }
 
 // The one gate for every suspend (the /suspend route and the idle sleeper). A request counts in
 // `request_capacity_->active` from acquire_request_lifetime, before it reaches the Engine (media and
@@ -525,7 +534,7 @@ void GenerationService::idle_sleep_loop() {
         if (Clock::now() - idle_since < idle_for) { continue; }
         lock.unlock();
         try {
-            if (engine_->residency().state != ninfer::ModelResidency::Suspended) {
+            if (residency().state != ninfer::ModelResidency::Suspended) {
                 (void)suspend(std::nullopt);
             }
         } catch (const ninfer::RequestError&) {
