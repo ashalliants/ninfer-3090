@@ -439,9 +439,10 @@ public:
     // so they must outlive it.
     std::unique_ptr<runtime::ContextStore> store;
     std::string store_binding;
-    // The part of the start-up restore budget the bucket refresh in open_context_store() used, so
-    // the restore gets the rest: one budget covers both.
-    std::chrono::steady_clock::duration refresh_spent{};
+    // The moment the start-up restore budget runs out, fixed when open_context_store() begins the
+    // bucket refresh: one absolute cutoff covers the refresh and the restore, however long the gap
+    // between them is.
+    std::chrono::steady_clock::time_point startup_deadline{};
     std::uint64_t restored_sessions = 0;
     std::uint64_t restored_bytes    = 0;
     std::uint64_t foreign_images    = 0;
@@ -678,9 +679,8 @@ private:
         if (config.remote) {
             // Images other engines left in the bucket are known before the first request, which
             // can then find its session there. Only the manifests are read, not the sessions.
-            const auto refresh_started = std::chrono::steady_clock::now();
-            (void)store->refresh_remote(refresh_started + config.restore_budget);
-            refresh_spent = std::chrono::steady_clock::now() - refresh_started;
+            startup_deadline = std::chrono::steady_clock::now() + config.restore_budget;
+            (void)store->refresh_remote(startup_deadline);
         }
     }
 
@@ -728,7 +728,10 @@ private:
         const auto started = std::chrono::steady_clock::now();
         try {
             with_generation([&](auto& generation) {
-                const auto deadline = started + options.context_store.restore_budget - refresh_spent;
+                // Without a bucket there was no refresh, and the budget starts here.
+                const auto deadline = options.context_store.remote
+                                          ? startup_deadline
+                                          : started + options.context_store.restore_budget;
                 auto images         = store->list();
                 // By value when not everything fits: shared prefixes first (each serves every
                 // conversation that starts with it), then conversations by recomputation time
