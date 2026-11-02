@@ -178,7 +178,15 @@ struct Rig {
         if (port <= 0) { throw std::runtime_error("HTTP server could not bind"); }
         server.attach(service);
         listener = std::thread([this] { server.listen(); });
-        wait_until_accepting();
+        // A throw from a constructor skips ~Rig, and destroying a joinable std::thread
+        // terminates, so stop and join the listener here before rethrowing.
+        try {
+            wait_until_accepting();
+        } catch (...) {
+            server.stop();
+            listener.join();
+            throw;
+        }
     }
 
     // bind_any_port() only reserves the socket; the accept loop starts on `listener` a moment
