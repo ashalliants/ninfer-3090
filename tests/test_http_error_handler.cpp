@@ -45,6 +45,12 @@ int main() {
     const ninfer::serve::ApiError cancelled =
         ninfer::serve::request_error_to_api_error(ninfer::RequestError(
             ninfer::RequestErrorKind::Cancelled, "request cancelled during preparation"));
+    const ninfer::serve::ApiError numerical = ninfer::serve::request_error_to_api_error(
+        ninfer::RequestError(ninfer::RequestErrorKind::NumericalFailure,
+                             "the model selected a token outside its vocabulary"));
+    failures += check(numerical.status == 500 && numerical.code == "numerical_failure" &&
+                          numerical.type == "server_error" && numerical.param.empty(),
+                      "a numerical failure did not map to HTTP 500 numerical_failure");
     failures += check(cancelled.status == 499 && cancelled.code == "client_disconnected" &&
                           cancelled.param.empty(),
                       "preparation cancellation did not retain its HTTP classification");

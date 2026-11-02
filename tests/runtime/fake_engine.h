@@ -278,11 +278,14 @@ public:
     [[nodiscard]] std::span<const std::int32_t> row_counts() const noexcept { return {}; }
     [[nodiscard]] std::uint32_t row_stride() const noexcept { return 1; }
     [[nodiscard]] bool constraint_failed(std::size_t) const { return false; }
-    [[nodiscard]] bool token_domain_failed(std::size_t) const { return false; }
+    [[nodiscard]] bool token_domain_failed(std::size_t row) const {
+        return row < domain_failed_.size() && domain_failed_[row];
+    }
     [[nodiscard]] ExecutionTiming execution_timing() const noexcept { return timing_; }
 
     std::vector<SequenceHandle> rows_;
     std::vector<TokenId> tokens_;
+    std::vector<bool> domain_failed_; // a row whose sampled token left the vocabulary
     ExecutionTiming timing_;
 };
 
@@ -545,6 +548,9 @@ public:
     // ---- test control ----
     // Runs on the worker thread before an execution unit; a test blocks in it to hold the Engine.
     std::function<void(const Event&)> before_unit;
+    // The request (plan id) whose next decode row reports a token outside the vocabulary, as a
+    // faulty sampler or draft would; 0 for none. Persistent until reset.
+    std::atomic<std::uint64_t> token_domain_fault_request{0};
 
     [[nodiscard]] std::vector<Event> events() const {
         std::lock_guard lock(log_mutex_);
@@ -956,6 +962,8 @@ public:
             checked(sequence).pending = true;
             batch.rows_.push_back(sequence);
             batch.tokens_.push_back(7);
+            const std::uint64_t faulted = token_domain_fault_request.load();
+            batch.domain_failed_.push_back(faulted != 0 && lanes_[sequence.lane].plan == faulted);
         }
         record(event);
         return batch;
