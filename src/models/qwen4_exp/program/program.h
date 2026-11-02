@@ -202,6 +202,7 @@ public:
     }
     [[nodiscard]] std::uint32_t row_stride() const noexcept { return stride_; }
     [[nodiscard]] bool constraint_failed(std::size_t row) const { return constraint_failed_.at(row); }
+    [[nodiscard]] bool token_domain_failed(std::size_t) const noexcept { return false; }
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
 
 private:

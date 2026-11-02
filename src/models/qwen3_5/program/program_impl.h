@@ -620,6 +620,10 @@ public:
     std::optional<PinnedHostBuffer> grammar_masks_host;
     std::optional<DFlashDraftHandoff> dflash_draft_handoff;
     std::array<std::uint32_t, kMaximumConcurrency> grammar_dead_positions{};
+    // Rows of the round whose sampled or licensed tokens left the public domain (set by the
+    // collect_* paths, row order of the round). wrap_pending reports them; the request fails, the
+    // Engine and the other rows go on.
+    std::array<bool, kMaximumConcurrency> token_domain_faults{};
     ops::SamplingMask bind_grammar_mask(runtime::TokenMaskProvider*, std::size_t row);
     ops::SamplingMask fill_grammar_mask(runtime::TokenMaskProvider*, std::size_t row,
                                         std::span<const TokenId> drafts);
@@ -889,6 +893,9 @@ public:
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
+    // Whether every token is inside the public domain. A token outside it is replaced with 0, so
+    // nothing downstream sees an out-of-range id; the caller marks the row in token_domain_faults.
+    [[nodiscard]] bool license_tokens(std::span<TokenId> tokens) const noexcept;
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;
     [[nodiscard]] runtime::BatchedGeneratedRound decode_ordinary_batch(
         std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,

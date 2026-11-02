@@ -45,6 +45,7 @@ PendingBatch ProgramImpl::wrap_pending(std::span<const std::uint32_t> lanes,
         const auto count = round.row_counts.empty() ? 1 : round.row_counts[row];
         ContractAccess::constraint_failed(pending, row,
                                           (grammar_dead_positions[row] & ((1u << count) - 1)) != 0);
+        ContractAccess::token_domain_failed(pending, row, token_domain_faults[row]);
     }
     return pending;
 }
@@ -358,9 +359,10 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
     const auto input_rows       = ContractAccess::rows(pending);
     const std::size_t row_count = input_rows.size();
     for (std::size_t row = 0; row < row_count; ++row) { members[row] = input_rows[row]; }
+    // A request is released as failed for either reason; the Engine told them apart by its error.
     std::array<bool, kMaximumConcurrency> constraint_failed{};
     for (std::size_t row = 0; row < row_count; ++row) {
-        constraint_failed[row] = pending.constraint_failed(row);
+        constraint_failed[row] = pending.constraint_failed(row) || pending.token_domain_failed(row);
     }
     const bool valid = valid_pending(pending);
     ContractAccess::consume(pending);

@@ -2226,6 +2226,32 @@ void test_lossy_backlog_predicts_scout_and_main() {
 
 } // namespace
 
+// A sampled token outside the vocabulary ends that request with a numerical failure; the request
+// beside it and the Engine go on.
+void test_a_token_outside_the_vocabulary_ends_only_its_request() {
+    Rig rig({.chunk = 256, .lanes = 2});
+    rig.program().token_domain_fault_request = 1;
+    auto faulted = rig.run(1, 64, kLongOutput);
+    auto sibling = rig.run(2, 64, 5);
+    require(finished(sibling), "the healthy request did not finish\n" + rig.dump());
+    (void)sibling.get();
+    require(faulted.wait_for(std::chrono::seconds(30)) == std::future_status::ready,
+            "the faulted request never ended\n" + rig.dump());
+    bool numerical = false;
+    try {
+        (void)faulted.get();
+    } catch (const RequestError& error) {
+        numerical = error.kind() == RequestErrorKind::NumericalFailure &&
+                    std::string(error.what()).find("outside its vocabulary") != std::string::npos;
+    } catch (...) {}
+    require(numerical, "the faulted request did not fail with a NumericalFailure\n" + rig.dump());
+    // The Engine is not latched: a later request is served.
+    rig.program().token_domain_fault_request = 0;
+    auto later = rig.run(3, 64, 3);
+    require(finished(later), "the Engine stopped serving after one request faulted\n" + rig.dump());
+    (void)later.get();
+}
+
 int main() {
     int failures = 0;
     const auto run = [&](const char* name, void (*test)()) {
@@ -2324,5 +2350,7 @@ int main() {
     run("PrivateReuseProbe", test_private_reuse_probe);
     run("StoredSessionProbedWarm", test_stored_session_probed_warm);
     run("SummaryOutputCappedByOriginal", test_summary_output_capped_by_original);
+    run("a token outside the vocabulary ends only its request",
+        test_a_token_outside_the_vocabulary_ends_only_its_request);
     return failures == 0 ? 0 : 1;
 }
