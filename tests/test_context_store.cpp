@@ -1725,6 +1725,67 @@ void test_remote_only_share_holds_when_a_lookup_registers_during_a_refresh() {
     }
 }
 
+// An entry holding the share's room may turn remote-only (here its TTL runs out and it is evicted
+// to the bucket, which changes no counter) while a manifest is on its way: the registration must
+// count the entry as it is when it publishes, or the remote-only manifests pass their cap.
+void test_remote_only_share_holds_when_an_entry_is_evicted_during_a_refresh() {
+    TempDirectory writer_directory;
+    TempDirectory reader_directory;
+    auto remote                        = std::make_shared<MemoryObjectStore>();
+    const std::uint64_t manifest_bytes = fill_bucket_with_sessions(remote, writer_directory.path());
+    ContextStore::Options options      = remote_options(reader_directory.path(), remote);
+    options.max_bytes = 4 * (3 * manifest_bytes + manifest_bytes / 2); // the share holds three
+    options.ttl       = std::chrono::seconds(1000);
+    remote->down      = true; // the first refresh registers nothing
+    ContextStore reader(options);
+    check(drained(reader), "the first refresh did not finish");
+    remote->down = false;
+    // A session older than everything in the bucket, held here with its chunks.
+    remote->clock -= 100'000;
+    (void)reader.put(describe("2a"), concat({pseudo_random(30, 7), pseudo_random(300, 8)}),
+                     std::array{ContextStore::Region{30, 300}});
+    check(drained(reader), "the local session did not upload");
+    remote->clock += 100'000;
+    bool expired = false;
+    remote->on_manifest_get = [&] {
+        if (expired) { return; }
+        expired = true; // once: the local session's TTL runs out and it goes to the bucket
+        remote->clock += 2'000'000;
+        reader.maintain();
+    };
+    (void)reader.refresh_remote();
+    remote->on_manifest_get = nullptr;
+    check(expired, "the session was not evicted during the refresh");
+    int remote_only = 0;
+    for (const auto& info : reader.list()) { remote_only += info.local ? 0 : 1; }
+    check(remote_only <= 3, "an entry evicted during the refresh was not counted against the share");
+    check(reader.stats().used_bytes <= options.max_bytes, "manifests alone exceeded max_bytes");
+}
+
+// A manifest that cannot be written (the directory failed) is not indexed, and the chunk files the
+// directory already holds for it are not counted for an entry that does not exist.
+void test_failed_registration_does_not_keep_chunk_references() {
+    TempDirectory writer_directory;
+    TempDirectory reader_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    (void)fill_bucket_with_sessions(remote, writer_directory.path());
+    ContextStore::Options options = remote_options(reader_directory.path(), remote);
+    options.max_bytes             = 1'000'000;
+    remote->down                  = true;
+    ContextStore reader(options);
+    check(drained(reader), "the first refresh did not finish");
+    remote->down = false;
+    // The chunks of the bucket's sessions are already on disk here, under no manifest.
+    fs::copy(writer_directory.path() / "chunks", reader_directory.path() / "chunks",
+             fs::copy_options::recursive | fs::copy_options::overwrite_existing);
+    // Publishing a manifest fails.
+    fs::remove_all(reader_directory.path() / "manifests");
+    { std::ofstream blocker(reader_directory.path() / "manifests"); }
+    (void)reader.refresh_remote();
+    check(reader.list().empty(), "an image whose manifest could not be written was indexed");
+    check(reader.stats().used_bytes == 0, "a failed registration kept its chunks counted");
+}
+
 // Manifests of images the directory holds a chunk of are not remote-only: they are not counted
 // against the share, so they do not keep out newer ones that are.
 void test_remote_only_share_ignores_manifests_with_local_chunks() {
@@ -3525,6 +3586,8 @@ int main() {
     test_remote_only_manifests_are_bounded_by_max_bytes();
     test_remote_only_share_holds_when_a_lookup_registers_during_a_refresh();
     test_remote_only_share_ignores_manifests_with_local_chunks();
+    test_remote_only_share_holds_when_an_entry_is_evicted_during_a_refresh();
+    test_failed_registration_does_not_keep_chunk_references();
     test_remote_damage_and_outage_are_misses();
     test_remote_use_restarts_the_remote_age();
     test_remote_refresh_respects_its_deadline();

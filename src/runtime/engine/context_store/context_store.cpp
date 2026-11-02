@@ -2698,7 +2698,6 @@ bool ContextStore::register_remote_image(const ObjectInfo& object, const std::st
         }
     }
     RemoteOnlyShare local_share;
-    std::uint64_t generation_at_check = 0;
     if (options_.max_bytes != 0) {
         // The manifest must fit the remote-only share, decided from the listing alone (before
         // anything is downloaded), by making room from the older remote-only entries only.
@@ -2713,7 +2712,6 @@ bool ContextStore::register_remote_image(const ObjectInfo& object, const std::st
             if (declined != nullptr) { *declined = true; }
             return false;
         }
-        generation_at_check = next_generation_;
     }
     const std::optional<std::vector<std::uint8_t>> data = 
         options_.remote->get_before(object.key, deadline);
@@ -2770,9 +2768,13 @@ bool ContextStore::register_remote_image(const ObjectInfo& object, const std::st
     add_references(entry);
     const bool remote_only_entry = !entry_has_local_bytes_locked(entry);
     if (share != nullptr && remote_only_entry) {
-        if (next_generation_ != generation_at_check) { // someone registered meanwhile: recount
+        // Recounted every time: the room made before the download is out of date by whatever
+        // registered, expired or was evicted to the bucket meanwhile (an entry turning remote-only
+        // changes no counter), and a cached total would let the share pass its cap.
+        const std::uint64_t actual = remote_only_bytes_locked();
+        if (actual != share->bytes) {
             *share       = RemoteOnlyShare{};
-            share->bytes = remote_only_bytes_locked();
+            share->bytes = actual;
         }
         if (!make_room_for_remote_only_locked(entry.manifest_bytes, object.modified_ms, *share, nullptr)) {
             ++stats_.remote_only_dropped;
@@ -2781,8 +2783,13 @@ bool ContextStore::register_remote_image(const ObjectInfo& object, const std::st
             return false;
         }
     }
-    write_atomically(manifest_path(id), *data);
-    write_published_locked(id, *data);
+    try {
+        write_atomically(manifest_path(id), *data);
+        write_published_locked(id, *data);
+    } catch (...) {
+        release_references(entry); // never indexed, so nothing else would release them
+        throw;
+    }
     manifest_total_bytes_ += entry.manifest_bytes;
     // The listing shows the manifest, not its chunks (a lifecycle rule or a person may have
     // removed one): their bucket presence stays unknown, so a write that shares them checks
