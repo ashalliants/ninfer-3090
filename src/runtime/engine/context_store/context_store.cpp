@@ -1184,6 +1184,9 @@ void ContextStore::maintain_locked(const std::string* protect) {
             if (drop_queued_upload_locked(protect)) { continue; }
             break;
         }
+        // Evicting to the bucket leaves manifests behind, and a bucket with very many images
+        // registers one each: the ones nothing else holds may take only their share of the limit.
+        if (options_.remote) { enforce_remote_only_share_locked(protect); }
     }
 }
 
@@ -2665,8 +2668,54 @@ std::string ContextStore::listed_id(const std::string& key) const {
     return valid_id(id) ? id : std::string();
 }
 
+std::uint64_t ContextStore::remote_only_budget_locked() const {
+    if (!options_.remote || options_.max_bytes == 0) { return std::numeric_limits<std::uint64_t>::max(); }
+    return options_.max_bytes / kRemoteOnlyShareDivisor;
+}
+
+namespace {
+// How recent a remote-only entry is: its last use here or its manifest's time in the bucket,
+// whichever is later. Entries are ranked by (recency, id), the id only to make the order total.
+using RemoteOnlyRank = std::pair<std::int64_t, std::string>;
+RemoteOnlyRank remote_only_rank(const std::string& id, std::int64_t last_used_ms,
+                                std::int64_t remote_modified_ms) {
+    return {std::max(last_used_ms, remote_modified_ms), id};
+}
+} // namespace
+
+bool ContextStore::remote_only_locked(const Entry& entry) const {
+    return entry.published && !entry_has_local_bytes_locked(entry);
+}
+
+// Everything here is read from entries_ at the moment of the call, with the lock held throughout:
+// no total or order is kept between calls, so none can go out of date.
+void ContextStore::enforce_remote_only_share_locked(const std::string* protect) {
+    if (!options_.remote || options_.max_bytes == 0) { return; }
+    const std::uint64_t budget = remote_only_budget_locked();
+    // The cheap test first (this runs after every write): the manifests altogether are under it.
+    if (manifest_total_bytes_ <= budget) { return; }
+    std::uint64_t total = 0;
+    std::vector<RemoteOnlyRank> droppable;
+    for (const auto& [id, entry] : entries_) {
+        if (!remote_only_locked(entry)) { continue; }
+        total += entry.manifest_bytes;
+        if (loading_.count(id) == 0 && (protect == nullptr || id != *protect)) {
+            droppable.push_back(remote_only_rank(id, entry.info.last_used_ms, entry.remote_modified_ms));
+        }
+    }
+    if (total <= budget) { return; }
+    std::sort(droppable.begin(), droppable.end()); // oldest first
+    for (const RemoteOnlyRank& rank : droppable) {
+        if (total <= budget) { break; }
+        total -= entries_.at(rank.second).manifest_bytes;
+        remove_entry_locked(rank.second, false);
+        ++stats_.remote_only_dropped;
+    }
+}
+
 bool ContextStore::register_remote_image(const ObjectInfo& object, const std::string& id,
                                          std::chrono::steady_clock::time_point listed_at,
+                                         bool* declined,
                                          std::chrono::steady_clock::time_point deadline) {
     {
         std::scoped_lock lock(mutex_);
@@ -2682,6 +2731,12 @@ bool ContextStore::register_remote_image(const ObjectInfo& object, const std::st
             remote_failed_.erase(failed);
         }
     }
+    // No check against the remote-only share before the download: the listing shows only the
+    // manifest's size, not whether the image is remote-only. An image held inline, or sharing a
+    // chunk already on disk (chunks are content-addressed and shared across images), is local and
+    // does not count against the share, however old it is. The share is enforced after insertion,
+    // when the manifest's chunks are known. A refresh stops at the first image so declined, so a
+    // full share costs at most one manifest download more per refresh.
     const std::optional<std::vector<std::uint8_t>> data =
         options_.remote->get_before(object.key, deadline);
     if (!data) {
@@ -2741,6 +2796,19 @@ bool ContextStore::register_remote_image(const ObjectInfo& object, const std::st
     entry.generation         = ++next_generation_;
     entry.remote_modified_ms = object.modified_ms;
     entries_.emplace(id, std::move(entry));
+    if (options_.max_bytes != 0) {
+        // Registering adds bytes the directory's limits must still hold. Judged on the index as
+        // it is now (a refresh and a lookup, or an eviction, may have changed it since the
+        // listing): first the remote-only share, which drops the oldest remote-only manifests
+        // and so this one if it is the oldest; then the whole limit, evicting local chunks as a
+        // write does, never this image.
+        enforce_remote_only_share_locked(nullptr);
+        if (entries_.find(id) == entries_.end()) {
+            if (declined != nullptr) { *declined = true; }
+            return false;
+        }
+        maintain_locked(&id);
+    }
     return true;
 }
 
@@ -2757,7 +2825,7 @@ ContextStore::lookup_remote(std::chrono::steady_clock::time_point asked,
             const std::string id = listed_id(object.key);
             if (id.empty() || !wanted(id)) { continue; }
             if (std::chrono::steady_clock::now() < deadline &&
-                register_remote_image(object, id, listing->listed_at, deadline)) {
+                register_remote_image(object, id, listing->listed_at, nullptr, deadline)) {
                 ++result.registered;
             }
             std::scoped_lock lock(mutex_);
@@ -2783,7 +2851,20 @@ std::size_t ContextStore::refresh_remote_locked(std::chrono::steady_clock::time_
             listing_since(std::chrono::steady_clock::now(), deadline);
         if (!listing) { return 0; }
         std::unordered_set<std::string> listed;
-        for (const ObjectInfo& object : listing->objects) {
+        // With a size limit the newest manifests are registered first: the share remote-only
+        // manifests may take is filled with the newest in the bucket, and once one does not fit
+        // every older one is passed over without a look (nothing older can displace anything).
+        std::vector<const ObjectInfo*> order;
+        order.reserve(listing->objects.size());
+        for (const ObjectInfo& object : listing->objects) { order.push_back(&object); }
+        if (options_.max_bytes != 0) {
+            std::stable_sort(order.begin(), order.end(), [](const ObjectInfo* a, const ObjectInfo* b) {
+                return a->modified_ms > b->modified_ms;
+            });
+        }
+        bool share_full = false;
+        for (const ObjectInfo* listed_object : order) {
+            const ObjectInfo& object = *listed_object;
             if (std::chrono::steady_clock::now() >= deadline) {
                 truncated = true;
                 break;
@@ -2793,7 +2874,13 @@ std::size_t ContextStore::refresh_remote_locked(std::chrono::steady_clock::time_
             const std::string id = listed_id(object.key);
             if (id.empty()) { continue; }
             listed.insert(id);
-            if (register_remote_image(object, id, listing->listed_at, deadline)) { ++added; }
+            if (share_full) { continue; }
+            bool declined = false;
+            if (register_remote_image(object, id, listing->listed_at, &declined,
+                                     deadline)) {
+                ++added;
+            }
+            share_full = declined;
         }
         // An image the bucket no longer lists (expired, or removed by someone) is not offered
         // from the index any more, unless the directory still holds some of it.

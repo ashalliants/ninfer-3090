@@ -1852,6 +1852,8 @@ struct RuntimeStats {
     std::uint64_t context_store_remote_retired                 = 0;
     std::uint64_t context_store_remote_uploads_skipped         = 0;
     std::uint64_t context_store_remote_uploads_dropped         = 0;
+    // Remote-only manifests given up to keep them within their share of the directory's budget.
+    std::uint64_t context_store_remote_only_dropped            = 0;
     // With peers: images imported from another engine's directory, the chunk bytes hard-linked
     // (not copied), images skipped, and links that failed.
     std::uint64_t context_store_peer_images        = 0;

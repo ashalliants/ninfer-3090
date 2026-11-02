@@ -48,7 +48,11 @@ public:
         std::filesystem::path directory;
         // Bytes of chunks and manifests kept; the least recently used images are evicted beyond it.
         // 0 means no limit. Files queued uploads still need count too: when evicting cannot free
-        // enough, the oldest queued uploads are given up so their files can go. A chunk
+        // enough, the oldest queued uploads are given up so their files can go. With a remote,
+        // the manifests of images this directory holds no chunk of (registered from the bucket,
+        // or evicted to it) take at most a quarter of this (see kRemoteOnlyShareDivisor): the
+        // newest in the bucket are kept and the rest stay unregistered there, still fetchable
+        // by an engine that holds them or a restart with more room. A chunk
         // hard-linked into other stores (peer imports) is charged as its size divided by its link
         // count, rounded up, so the engines sharing it pay for it once between them and the caps
         // of the engines sum to the physical bytes on disk.
@@ -177,6 +181,9 @@ public:
         std::uint64_t expired           = 0;
         std::uint64_t superseded        = 0;
         std::uint64_t remote_removed    = 0; // images a remote refresh found gone
+        // Remote-only manifests given up to keep them within their share of max_bytes: dropped
+        // from the index, or not registered from a listing, because newer ones took the room.
+        std::uint64_t remote_only_dropped = 0;
         // With a remote: images only the remote holds, and the traffic to it.
         std::uint64_t remote_images          = 0;
         std::uint64_t remote_uploads         = 0; // objects uploaded (chunks and manifests)
@@ -291,6 +298,8 @@ public:
     // which count against max_bytes, so the size limit bounds them too). Room for a busy box's
     // conversations to wait out a long upload delay (--context-store-s3-upload-delay-seconds).
     static constexpr std::size_t kMaximumQueuedUploads = 64;
+    // max_bytes / this is what the manifests of images the directory holds no chunk of may take.
+    static constexpr std::uint64_t kRemoteOnlyShareDivisor = 4;
     // With a remote: lists the bucket and registers images other engines left there that this
     // store does not hold. Also done in the background every remote_refresh. Returns the number of
     // images added. Stops reading manifests at `deadline`, waiting for another refresh counted; an
@@ -624,11 +633,23 @@ private:
     [[nodiscard]] std::string listed_id(const std::string& key) const;
     // Downloads a manifest that a listing asked for at `listed_at` showed and adds its image to the
     // index, unless the index holds it or the id is given up on. True when it was added.
-    // The download of the manifest stops at `deadline` (DeadlineExceeded).
+    // With max_bytes set, registering keeps the directory within its limits: the manifest of an
+    // image that does not stay within the remote-only share is not kept (`declined`, when given, is
+    // set then; judged once the manifest is downloaded and its chunks are known, since an image
+    // with a chunk on disk, or held inline, is not remote-only), and afterwards the whole limit is
+    // enforced as a write does. The download of the manifest stops at `deadline`
+    // (DeadlineExceeded).
     bool register_remote_image(const ObjectInfo& object, const std::string& id,
-                               std::chrono::steady_clock::time_point listed_at,
+                               std::chrono::steady_clock::time_point listed_at, bool* declined = nullptr,
                                std::chrono::steady_clock::time_point deadline =
                                    std::chrono::steady_clock::time_point::max());
+    // Remote-only manifests: published entries the directory holds no chunk of. Their share of
+    // max_bytes (0: no limit).
+    [[nodiscard]] std::uint64_t remote_only_budget_locked() const;
+    [[nodiscard]] bool remote_only_locked(const Entry& entry) const;
+    // Drops the oldest remote-only manifests (by last use or bucket time) until they are within
+    // their share. Works from the entries as they are, keeping no total or order between calls.
+    void enforce_remote_only_share_locked(const std::string* protect);
     std::int64_t last_prune_ms_ = 0; // remote worker thread only
 
     // Peer import. `owner_` holds the exclusive lock on options_.directory for the store's life.
