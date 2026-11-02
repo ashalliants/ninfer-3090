@@ -5,7 +5,7 @@
 #
 # Exits non-zero on the first failed assertion.
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot '..\..\scripts\package-release-imports.ps1')
+. (Join-Path $PSScriptRoot '../../scripts/lib/package-release-imports.ps1')
 
 $Fixtures = Join-Path $PSScriptRoot 'dumpbin'
 function Read-Fixture([string]$Name) { Get-Content -LiteralPath (Join-Path $Fixtures "$Name.txt") }
@@ -75,7 +75,7 @@ try {
     New-Item -ItemType File -Path (Join-Path $root 'ninfer-bench.exe') | Out-Null
     $reader = { param($path) Read-Fixture $images[(Split-Path -Leaf $path)] }.GetNewClosure()
     New-Item -ItemType Directory -Path (Join-Path $root 'lib') | Out-Null
-    New-Item -ItemType File -Path (Join-Path $root 'lib\cublasLt64_12.dll') | Out-Null
+    New-Item -ItemType File -Path (Join-Path (Join-Path $root 'lib') 'cublasLt64_12.dll') | Out-Null
     Assert-Throws { Assert-ArchiveDependenciesSatisfied $root $reader $Windows 6>$null } 'ninfer-bench\.exe imports cublaslt64_12\.dll\s+ninfer-bench\.exe imports cudart64_12\.dll$' 'a DLL in a subfolder does not satisfy an import, and each missing DLL is named with its image'
 
     # Shipping it flat fixes that one, and only that one.

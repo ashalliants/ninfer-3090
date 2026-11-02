@@ -118,7 +118,7 @@ foreach ($script in @('run.bat', 'download-model.bat')) {
 # that does have a driver. Where a driver is present the real start-up check still runs.
 # The check itself is in package-release-imports.ps1 so tests\release can run it on dumpbin output
 # captured in fixtures, with no Windows machine or dumpbin.exe.
-. (Join-Path $PSScriptRoot 'package-release-imports.ps1')
+. (Join-Path $PSScriptRoot 'lib/package-release-imports.ps1')
 
 $HaveDriver = Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\nvcuda.dll')
 if ($HaveDriver -and $env:NINFER_PACKAGE_STATIC_DEPENDENCY_CHECK -ne '1') {
