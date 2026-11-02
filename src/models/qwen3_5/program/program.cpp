@@ -234,6 +234,11 @@ Program::host_state_bytes_released(std::span<const CheckpointHandle> checkpoints
     return impl_->host_bytes_released(checkpoints, true);
 }
 
+runtime::HostFreeRuns
+Program::host_free_runs_after_release(std::span<const CheckpointHandle> checkpoints) const {
+    return impl_->host_free_runs_after_release(checkpoints);
+}
+
 std::optional<std::size_t> Program::pause_host_bytes(SequenceHandle sequence) const {
     return impl_->pause_host_bytes(sequence);
 }

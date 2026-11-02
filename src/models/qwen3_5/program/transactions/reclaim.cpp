@@ -671,6 +671,7 @@ std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
             candidate.host_bytes           = host ? 0 : image;
             if (!placeable) { placeable = program.host_placeable_bytes(image); }
             candidate.host_placeable       = *placeable;
+            candidate.host_unit            = image;
             break;
         }
         if (!plan->state) { return std::nullopt; }
@@ -704,6 +705,7 @@ std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
         // change while the groups are quoted: the scan of the free extents runs once per reclaim.
         if (!placeable) { placeable = program.host_placeable_bytes(stride); }
         candidate.host_placeable = *placeable;
+        candidate.host_unit      = stride;
         (resource == runtime::ContextResourceClass::MainKV ? candidate.released.main_kv_pages
                                                            : candidate.released.backend_kv_pages) =
             static_cast<std::uint32_t>(plan->pages.size());
@@ -953,6 +955,7 @@ struct DemotionBatch {
                             plan->allowed.end());
         result.sources        = plan->allowed;
         result.host_placeable = available;
+        result.host_unit      = stride;
         (resource == runtime::ContextResourceClass::MainKV ? result.released.main_kv_pages
                                                            : result.released.backend_kv_pages) =
             count;

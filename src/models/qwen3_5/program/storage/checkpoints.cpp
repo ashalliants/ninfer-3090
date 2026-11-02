@@ -279,7 +279,8 @@ runtime::ContextResourceUsage ProgramImpl::snapshot_resources(const ResumeState&
 }
 
 std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> handles,
-                                             bool state_images_only) const {
+                                             bool state_images_only,
+                                             HostReleaseSet* released_set) const {
     struct StateReferences {
         StateImageHandle state;
         std::uint32_t references = 0;
@@ -343,10 +344,12 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
             state_store->can_release_after_checkpoint_references(entry.state, entry.references) &&
             state_store->host_resident(entry.state)) {
             bytes += state_images->host_layout().image_bytes;
+            if (released_set) { released_set->states.push_back(entry.state); }
         }
     }
     const auto state_bytes = bytes;
-    const auto count = [&](const LogicalKVPageStore& pages, const auto& references) {
+    const auto count = [&](const LogicalKVPageStore& pages, const auto& references,
+                           std::vector<LogicalKVPageHandle>* recorded) {
         for (const auto& [index, entry] : references) {
             if (entry.references != pages.address_references(entry.page)) { continue; }
             // A nonlast reference may retire during a copy; the complete set cannot release
@@ -357,11 +360,14 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
             if (pages.host_resident(entry.page)) {
                 bytes += (&pages == text_kv_pages.get() ? text_host_kv_page_stride
                                                         : backend_host_kv_page_stride);
+                if (recorded) { recorded->push_back(entry.page); }
             }
         }
         return true;
     };
-    if (!count(*text_kv_pages, main) || (backend_kv_pages && !count(*backend_kv_pages, backend))) {
+    if (!count(*text_kv_pages, main, released_set ? &released_set->main : nullptr) ||
+        (backend_kv_pages &&
+         !count(*backend_kv_pages, backend, released_set ? &released_set->backend : nullptr))) {
         return 0;
     }
     return state_images_only ? state_bytes : bytes;
@@ -454,6 +460,43 @@ std::size_t ProgramImpl::host_placeable_bytes(std::size_t unit) const noexcept {
     const auto& arena = *host_context_arena;
     return std::min(arena.placeable_bytes(unit),
                     arena.general_capacity_bytes() - arena.general_occupied_bytes());
+}
+
+runtime::HostFreeRuns
+ProgramImpl::host_free_runs_after_release(std::span<const CheckpointHandle> handles) const {
+    runtime::HostFreeRuns result;
+    if (!host_context_arena) { return result; }
+    const auto& arena      = *host_context_arena;
+    result.general_capacity = arena.general_capacity_bytes();
+    result.occupied         = arena.occupied_bytes();
+    for (const auto& extent : arena.free_extents()) {
+        result.runs.push_back({extent.offset, extent.bytes});
+    }
+    HostReleaseSet released;
+    // Zero when the set is not releasable (or frees nothing): the runs then stay as they are.
+    if (host_bytes_released(handles, false, &released) == 0) { return result; }
+    std::vector<runtime::HostRun> freed;
+    // A state image is its own arena allocation, rounded up to the arena alignment.
+    constexpr std::size_t alignment = HostContextArena::alignment;
+    const std::size_t image_bytes   = (state_images->host_layout().image_bytes + alignment - 1) /
+                                      alignment * alignment;
+    for (const auto state : released.states) {
+        freed.push_back({arena.offset_of(state_store->host_view(state).data), image_bytes});
+    }
+    // A page is one stride of the extent that holds it; neighbouring pages released together, and
+    // free runs beside them, merge below as the allocator merges them.
+    const auto add_pages = [&](const LogicalKVPageStore& pages,
+                               const std::vector<LogicalKVPageHandle>& released_pages) {
+        for (const auto page : released_pages) {
+            const auto replica = pages.host_replica(page);
+            const auto view    = host_kv_extents->view(replica.extent);
+            const std::size_t stride = view.layout().page_stride;
+            freed.push_back({arena.offset_of(view.data()) + replica.page_offset * stride, stride});
+        }
+    };
+    add_pages(*text_kv_pages, released.main);
+    if (backend_kv_pages) { add_pages(*backend_kv_pages, released.backend); }
+    return runtime::host_runs_after_release(result, freed);
 }
 
 std::size_t ProgramImpl::release_redundant_host(std::span<const CheckpointHandle> excluded,

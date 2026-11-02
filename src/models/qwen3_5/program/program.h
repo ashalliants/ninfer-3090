@@ -2,6 +2,7 @@
 #include "core/device_snapshot.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
+#include "runtime/contract/host_placement.h"
 #include "runtime/contract/resources.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include <array>
@@ -213,6 +214,9 @@ struct ContextDemotion {
     // Host bytes this quote's allocations could take from the free runs now: whole KV pages, or
     // one contiguous state image. Free bytes in runs too short for one are not counted (#402).
     std::size_t host_placeable = 0;
+    // The size the destination is placed in: one KV page, or the state image. Victim selection
+    // asks whether the free runs left by a release still hold `host_bytes` of whole units (#406).
+    std::size_t host_unit = 0;
     runtime::ContextResourceUsage released;
     std::shared_ptr<const detail::DemotionPlan> impl;
 };
@@ -548,6 +552,10 @@ public:
     // leaves a run that fits any other, which scattered KV bytes do not.
     [[nodiscard]] std::size_t
     host_state_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
+    // The Host allocator's free runs as they would stand after deleting this fixed set (#406).
+    // Freed bytes only add up to a run when they sit next to each other or next to free ones.
+    [[nodiscard]] runtime::HostFreeRuns
+    host_free_runs_after_release(std::span<const CheckpointHandle> checkpoints) const;
     [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle sequence) const;
     // Bytes of state image a pause could not place in one contiguous Host run right now; 0 when it
     // is already on the Host or a run exists.

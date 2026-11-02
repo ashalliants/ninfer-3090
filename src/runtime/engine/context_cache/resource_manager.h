@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/wide_math.h"
+#include "runtime/contract/host_placement.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/context_cache/prefix_index.h"
@@ -8,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <concepts>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -1471,6 +1473,8 @@ private:
     // plan at every step, so the set count is capped: once it is full a candidate is simply
     // evaluated without the memo (nullptr), which is what the unmemoised path already does.
     static constexpr std::size_t kMaxCandidateMemos = 1024;
+    // Opening picks a blocked placement search retries from (see host_victims_in_order).
+    static constexpr std::size_t kMaxOpeningRetries = 4;
 
     [[nodiscard]] static CandidateMemo* candidate_memo(Evaluation& evaluation,
                                                        std::span<const Handle> sources) {
@@ -1803,9 +1807,14 @@ private:
                           Evaluation& evaluation) const {
         auto protected_sources = std::vector<Handle>(excluded.begin(), excluded.end());
         protected_sources.insert(protected_sources.end(), plan.sources.begin(), plan.sources.end());
+        // A Program that places by allocator extents gets the destination's unit, so the victims
+        // are judged by the runs they leave and not by the bytes they free (#406).
+        std::size_t unit = 0;
+        if constexpr (requires { plan.host_unit; }) { unit = plan.host_unit; }
         return host_victims_in_order(program, plan.host_bytes, preservation.checkpoint, {},
                                      protected_sources, preservation, cursor, evaluation, false,
-                                     plan.host_placeable, needs_state_run(plan));
+                                     plan.host_placeable, needs_state_run(plan), 0, unit,
+                                     plan.released.state_slots != 0);
     }
 
     // A Host state image takes one contiguous run. When the quote can place none, freeing bytes is
@@ -1832,7 +1841,8 @@ private:
                           std::optional<Admission> admission, const ReclaimCursor& cursor,
                           Evaluation& evaluation, bool bytes_are_shortage = false,
                           std::size_t placeable = SIZE_MAX, bool state_run = false,
-                          std::size_t reserve_bytes = 0) const {
+                          std::size_t reserve_bytes = 0, std::size_t unit = 0,
+                          bool image_destination = false) const {
         const auto usage = program.physical_usage();
         const auto free =
             std::min<std::size_t>(usage.capacity.host_bytes - usage.occupied.host_bytes, placeable);
@@ -1868,82 +1878,139 @@ private:
             }
         }
         auto actions = program.plan_releases(allowed, excluded, {.host_bytes = required});
-        std::vector<Handle> selected;
-        std::size_t released = 0;
-        while (released < required) {
-            std::optional<std::size_t> best;
-            std::vector<Handle> best_union;
-            std::size_t best_bytes = 0;
-            ActionRank best_rank;
-            std::size_t best_snapshot_order = 0;
-            for (std::size_t i = 0; i < actions.size(); ++i) {
-                auto combined = selected;
-                for (const auto handle : actions[i].sources) {
-                    if (!contains(combined, handle)) { combined.push_back(handle); }
-                }
-                // The same candidate comes up for every plan of one reclaim: what it frees and its
-                // facts are computed once per evaluation. Only the cheap facts stay cached (the
-                // survivor list is rebuilt per use), so the cache does not grow with the square of
-                // the checkpoint count.
-                CandidateMemo* const memo =
-                    candidate_memo_ ? candidate_memo(evaluation, combined) : nullptr;
-                const auto released_by = [&] {
-                    return state_run ? state_bytes_released(program, combined)
-                                     : program.host_bytes_released(combined);
-                };
-                std::size_t amount;
-                if (memo) {
-                    auto& cached = state_run ? memo->state_bytes : memo->host_bytes;
-                    if (!cached) { cached = released_by(); }
-                    amount = *cached;
-                } else {
-                    amount = released_by();
-                }
-                if (amount <= released) { continue; }
-                ActionFacts uncached;
-                if (memo) {
-                    if (!memo->facts) { memo->facts = action_facts(program, combined, cursor, evaluation); }
-                } else {
-                    uncached = action_facts(program, combined, cursor, evaluation);
-                }
-                ActionFacts& facts        = memo ? *memo->facts : uncached;
-                const auto drop_survivors = [&] {
-                    if (memo) { memo->facts->kept.reset(); }
-                };
-                // A migration must satisfy both its own preservation rights and the
-                // optional capture that requested space. Source heat cannot grant the
-                // outer capture permission to erase unrelated hot Host history.
-                if (!admits(program, combined, facts, admission, cursor, evaluation) ||
-                    !admits(program, combined, facts, cursor.admission, cursor, evaluation)) {
+        // Placeable bytes describe the current free runs and are not additive with the bytes of
+        // arbitrary Host allocations: victims can free enough bytes yet leave every run shorter
+        // than the destination needs. A Program that can simulate its allocator says whether the
+        // runs left by a victim set place the destination; that, not the byte total, ends the
+        // search (#406). Such a destination's progress is every byte a candidate frees, since a
+        // run can grow from pages or images alike.
+        bool placing = false;
+        if constexpr (requires(std::span<const Handle> set) {
+                          { program.host_free_runs_after_release(set) } -> std::convertible_to<HostFreeRuns>;
+                      }) {
+            placing = unit != 0 && !bytes_are_shortage;
+        }
+        if (placing) { state_run = false; }
+        const auto placed = [&](std::span<const Handle> set) {
+            if constexpr (requires { program.host_free_runs_after_release(set); }) {
+                return host_places(program.host_free_runs_after_release(set), bytes, unit,
+                                   image_destination);
+            } else {
+                return true;
+            }
+        };
+        // One greedy search over the actions, optionally forced to start from action `first`.
+        const auto grow = [&](std::optional<std::size_t> first)
+                -> std::optional<std::vector<Handle>> {
+            auto remaining = actions;
+            std::vector<Handle> selected;
+            std::size_t released = 0;
+            bool opening         = true;
+            // The shortage is the bytes beyond the placeable ones; freeing bytes next to a stranded
+            // hole can place the destination with fewer, so only the simulation ends a placing search.
+            while (placing ? !placed(selected) : released < required) {
+                std::optional<std::size_t> best;
+                std::vector<Handle> best_union;
+                std::size_t best_bytes = 0;
+                ActionRank best_rank;
+                std::size_t best_snapshot_order = 0;
+                for (std::size_t i = 0; i < remaining.size(); ++i) {
+                    if (opening && first && i != *first) { continue; }
+                    auto combined = selected;
+                    for (const auto handle : remaining[i].sources) {
+                        if (!contains(combined, handle)) { combined.push_back(handle); }
+                    }
+                    // The same candidate comes up for every plan of one reclaim: what it frees and its
+                    // facts are computed once per evaluation. Only the cheap facts stay cached (the
+                    // survivor list is rebuilt per use), so the cache does not grow with the square of
+                    // the checkpoint count.
+                    CandidateMemo* const memo =
+                        candidate_memo_ ? candidate_memo(evaluation, combined) : nullptr;
+                    const auto released_by = [&] {
+                        return state_run ? state_bytes_released(program, combined)
+                                         : program.host_bytes_released(combined);
+                    };
+                    std::size_t amount;
+                    if (memo) {
+                        auto& cached = state_run ? memo->state_bytes : memo->host_bytes;
+                        if (!cached) { cached = released_by(); }
+                        amount = *cached;
+                    } else {
+                        amount = released_by();
+                    }
+                    if (amount <= released) { continue; }
+                    ActionFacts uncached;
+                    if (memo) {
+                        if (!memo->facts) { memo->facts = action_facts(program, combined, cursor, evaluation); }
+                    } else {
+                        uncached = action_facts(program, combined, cursor, evaluation);
+                    }
+                    ActionFacts& facts        = memo ? *memo->facts : uncached;
+                    const auto drop_survivors = [&] {
+                        if (memo) { memo->facts->kept.reset(); }
+                    };
+                    // A migration must satisfy both its own preservation rights and the
+                    // optional capture that requested space. Source heat cannot grant the
+                    // outer capture permission to erase unrelated hot Host history.
+                    if (!admits(program, combined, facts, admission, cursor, evaluation) ||
+                        !admits(program, combined, facts, cursor.admission, cursor, evaluation)) {
+                        drop_survivors();
+                        continue;
+                    }
+                    const auto rank            = rank_action(program, combined, facts,
+                                                             std::min<std::size_t>(amount, required), evaluation);
                     drop_survivors();
-                    continue;
-                }
-                const auto rank            = rank_action(program, combined, facts,
-                                                         std::min<std::size_t>(amount, required), evaluation);
-                drop_survivors();
-                std::size_t snapshot_order = 0;
-                for (std::size_t snapshot = 0; snapshot < later_snapshots.size(); ++snapshot) {
-                    if (contains(combined, later_snapshots[snapshot])) {
-                        snapshot_order = snapshot + 1;
+                    std::size_t snapshot_order = 0;
+                    for (std::size_t snapshot = 0; snapshot < later_snapshots.size(); ++snapshot) {
+                        if (contains(combined, later_snapshots[snapshot])) {
+                            snapshot_order = snapshot + 1;
+                        }
+                    }
+                    // Ordinary history is exhausted before Engine-owned paused snapshots.
+                    // Snapshot candidates retain the Engine's explicit youngest-first order.
+                    if (!best || snapshot_order < best_snapshot_order ||
+                        (snapshot_order == best_snapshot_order && less_rank(rank, best_rank))) {
+                        best                = i;
+                        best_union          = std::move(combined);
+                        best_bytes          = amount;
+                        best_rank           = rank;
+                        best_snapshot_order = snapshot_order;
                     }
                 }
-                // Ordinary history is exhausted before Engine-owned paused snapshots.
-                // Snapshot candidates retain the Engine's explicit youngest-first order.
-                if (!best || snapshot_order < best_snapshot_order ||
-                    (snapshot_order == best_snapshot_order && less_rank(rank, best_rank))) {
-                    best                = i;
-                    best_union          = std::move(combined);
-                    best_bytes          = amount;
-                    best_rank           = rank;
-                    best_snapshot_order = snapshot_order;
-                }
+                if (!best) { return std::nullopt; }
+                selected = std::move(best_union);
+                released = best_bytes;
+                remaining.erase(remaining.begin() + *best);
+                opening = false;
             }
-            if (!best) { return std::nullopt; }
-            selected = std::move(best_union);
-            released = best_bytes;
-            actions.erase(actions.begin() + *best);
+            return selected;
+        };
+        auto found = grow(std::nullopt);
+        // The greedy order can dead-end: its first pick frees an extent that joins no run, and the
+        // union with any later action is then refused by admission (the recovery loss reaches the
+        // gain limit), although a later action alone is admissible and would place. Retry from
+        // each action as the opening pick; this only runs when the search would otherwise report
+        // the demotion blocked. A search costs at most one extent simulation per round and one
+        // candidate scan per action in a round, so N actions cost O(N^2) per search. Retrying
+        // every opening would make a blocked demotion O(N^3), on a path every reclaim pass can
+        // take again. The retries are therefore capped at kMaxOpeningRetries, and the total is
+        // (1 + kMaxOpeningRetries) searches. Per-union facts are already shared through the
+        // candidate memo, so a retry mostly re-ranks cached data.
+        //
+        // The cap is a deliberate trade of completeness for bounded cost. Choosing a victim set
+        // whose freed extents join into a run of a page is a subset-selection problem, and the
+        // Program contract exposes only the runs left by a candidate set, not where each
+        // candidate sits, so no complete polynomial search is available here. What a miss costs:
+        // the demotion is reported blocked, nothing is released or demoted, and the caller
+        // releases the incoming checkpoint instead of demoting it. That loses a cache entry and
+        // never returns wrong data (test_placement_search_cap_misses_safely pins the miss).
+        if (!found && placing) {
+            const auto retries = std::min<std::size_t>(actions.size(), kMaxOpeningRetries);
+            for (std::size_t first = 0; first < retries && !found; ++first) {
+                found = grow(first);
+            }
         }
-        return selected;
+        return found;
     }
 
     // Write-on-evict: the inactive, live continuations about to lose a point, while every point is
