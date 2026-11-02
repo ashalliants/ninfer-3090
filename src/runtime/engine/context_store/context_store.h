@@ -625,32 +625,25 @@ private:
     [[nodiscard]] std::string listed_id(const std::string& key) const;
     // Downloads a manifest that a listing asked for at `listed_at` showed and adds its image to the
     // index, unless the index holds it or the id is given up on. True when it was added.
-    // With max_bytes set, an image that does not fit the remote-only share is registered only by
-    // dropping older remote-only ones, else not at all (`declined`, when given, is set then).
-    // `share` (optional) is kept by a refresh across its images, so it does not recount or rescan.
-    // The download of the manifest stops at `deadline` (DeadlineExceeded).
-    struct RemoteOnlyShare {
-        std::uint64_t bytes = 0; // remote_only_bytes_locked(), kept up to date
-        bool built          = false;
-        // The remote-only entries at the first drop, oldest first (recency, id), and how far
-        // dropping has got. Each is checked again when reached.
-        std::vector<std::pair<std::int64_t, std::string>> oldest_first;
-        std::size_t next = 0;
-    };
+    // With max_bytes set, registering keeps the directory within its limits: the manifest of an
+    // image that does not stay within the remote-only share is not registered (`declined`, when
+    // given, is set then; a listing shows that before anything is downloaded), and afterwards the
+    // whole limit is enforced as a write does. The download of the manifest stops at `deadline`
+    // (DeadlineExceeded).
     bool register_remote_image(const ObjectInfo& object, const std::string& id,
-                               std::chrono::steady_clock::time_point listed_at,
-                               RemoteOnlyShare* share = nullptr, bool* declined = nullptr,
+                               std::chrono::steady_clock::time_point listed_at, bool* declined = nullptr,
                                std::chrono::steady_clock::time_point deadline =
                                    std::chrono::steady_clock::time_point::max());
     // Remote-only manifests: published entries the directory holds no chunk of. Their share of
     // max_bytes (0: no limit).
     [[nodiscard]] std::uint64_t remote_only_budget_locked() const;
-    [[nodiscard]] std::uint64_t remote_only_bytes_locked() const;
-    // Drops the oldest remote-only entries (by last use or bucket time) older than `newer_than`
-    // until `incoming` more bytes fit the share; false when they cannot be made to fit. The order
-    // to drop them in is worked out once per `share` (not once per drop).
-    bool make_room_for_remote_only_locked(std::uint64_t incoming, std::int64_t newer_than,
-                                          RemoteOnlyShare& share, const std::string* protect);
+    [[nodiscard]] bool remote_only_locked(const Entry& entry) const;
+    // Drops the oldest remote-only manifests (by last use or bucket time) until they are within
+    // their share. Works from the entries as they are, keeping no total or order between calls.
+    void enforce_remote_only_share_locked(const std::string* protect);
+    // Whether a manifest listed as `object` would stay within the share, were it registered:
+    // true when the newer remote-only manifests leave room for it.
+    [[nodiscard]] bool remote_only_fits_locked(const ObjectInfo& object, const std::string& id) const;
     std::int64_t last_prune_ms_ = 0; // remote worker thread only
 
     // Peer import. `owner_` holds the exclusive lock on options_.directory for the store's life.
