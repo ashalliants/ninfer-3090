@@ -53,12 +53,15 @@ Assert-Equal (Get-UnsatisfiedDependents (Read-Fixture 'driver') @{} $NoSystemDll
 Assert-Equal (Get-UnsatisfiedDependents (Read-Fixture 'missing') @{} $Windows) @('cublaslt64_12.dll', 'cudart64_12.dll') 'missing DLLs are reported; system and driver imports in the same report are not'
 
 # --- the whole check on a flat archive folder ---------------------------------------------------
+# Read eagerly: a closure made by GetNewClosure() does not see this script's functions on every host.
+$fixtureText = @{}
+foreach ($f in 'shipped', 'system', 'driver', 'missing') { $fixtureText[$f] = Read-Fixture $f }
 $images = @{
     'ninfer-serve.exe' = 'shipped'    # cublas64_12.dll, avcodec-62.dll
     'avcodec-62.dll'   = 'system'
     'cublas64_12.dll'  = 'driver'
 }
-$reader = { param($path) Read-Fixture $images[(Split-Path -Leaf $path)] }.GetNewClosure()
+$reader = { param($path) $fixtureText[$images[(Split-Path -Leaf $path)]] }.GetNewClosure()
 
 $root = Join-Path ([IO.Path]::GetTempPath()) "ninfer-imports-test-$([guid]::NewGuid())"
 New-Item -ItemType Directory -Path $root | Out-Null
@@ -73,7 +76,7 @@ try {
     # A DLL in a subfolder is not on the loader's path for the executables beside it.
     $images['ninfer-bench.exe'] = 'missing'
     New-Item -ItemType File -Path (Join-Path $root 'ninfer-bench.exe') | Out-Null
-    $reader = { param($path) Read-Fixture $images[(Split-Path -Leaf $path)] }.GetNewClosure()
+    $reader = { param($path) $fixtureText[$images[(Split-Path -Leaf $path)]] }.GetNewClosure()
     New-Item -ItemType Directory -Path (Join-Path $root 'lib') | Out-Null
     New-Item -ItemType File -Path (Join-Path (Join-Path $root 'lib') 'cublasLt64_12.dll') | Out-Null
     Assert-Throws { Assert-ArchiveDependenciesSatisfied $root $reader $Windows 6>$null } 'ninfer-bench\.exe imports cublaslt64_12\.dll\s+ninfer-bench\.exe imports cudart64_12\.dll$' 'a DLL in a subfolder does not satisfy an import, and each missing DLL is named with its image'
@@ -81,7 +84,7 @@ try {
     # Shipping it flat fixes that one, and only that one.
     New-Item -ItemType File -Path (Join-Path $root 'cublasLt64_12.dll') | Out-Null
     $images['cublasLt64_12.dll'] = 'driver'
-    $reader = { param($path) Read-Fixture $images[(Split-Path -Leaf $path)] }.GetNewClosure()
+    $reader = { param($path) $fixtureText[$images[(Split-Path -Leaf $path)]] }.GetNewClosure()
     Assert-Throws { Assert-ArchiveDependenciesSatisfied $root $reader $Windows 6>$null } 'ninfer-bench\.exe imports cudart64_12\.dll$' 'only the DLL still missing is reported'
 
     # A failure to read an image (dumpbin exiting non-zero) must stop the release, not be skipped.
