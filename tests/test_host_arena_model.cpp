@@ -1,5 +1,7 @@
 #include "core/host_arena_model.h"
 
+#include <cuda_runtime_api.h>
+
 #include <cstdint>
 #include <iostream>
 #include <optional>
@@ -166,6 +168,14 @@ void test_model_agrees_with_the_arena() {
 } // namespace
 
 int main() {
+    // The arena's backing store is a PinnedHostBuffer, which needs a CUDA runtime and a device.
+    int count               = 0;
+    const cudaError_t error = cudaGetDeviceCount(&count);
+    if (error == cudaErrorNoDevice || error == cudaErrorInsufficientDriver ||
+        (error == cudaSuccess && count == 0)) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
     test_mixed_strides_fit_where_the_larger_stride_bound_refuses();
     test_state_image_and_pages_contend_for_the_same_run();
     test_a_model_is_a_copy_and_leaves_the_arena_alone();

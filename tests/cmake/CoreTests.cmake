@@ -119,6 +119,7 @@ set_tests_properties(
   ninfer_arena_test
   ninfer_kv_cache_test
   ninfer_host_context_arena_test
+  ninfer_host_arena_model_test
   ninfer_state_store_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
