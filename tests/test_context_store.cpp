@@ -3067,6 +3067,46 @@ void test_peer_marker_follows_the_manifest() {
     }
 }
 
+// An id imported from a peer and then rewritten by a local put: `put` leaves the old marker in
+// place on purpose (removing it there would be a second, crash-ordered step after the new
+// manifest). The marker names the peer manifest's checksum, and the local manifest carries its own
+// creation time, size and chunk list, so after a restart the stale marker matches nothing: the
+// image is this store's to upload, and the marker is swept.
+void test_local_put_after_peer_import_is_uploaded_after_restart() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    const auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore a(options_for(a_directory.path()));
+    (void)a.put(describe("0a"), peer_image(15), std::array{ContextStore::Region{30, 5000}});
+    ContextStore::Options options = remote_options(b_directory.path(), remote);
+    options.peers                 = {a_directory.path()};
+    options.peer_poll             = std::chrono::hours(1);
+    const fs::path marker         = b_directory.path() / "manifests" / "0a.peer";
+    const auto uploaded           = [&] {
+        for (const auto& object : remote->objects) {
+            if (object.first.find("0a") != std::string::npos) { return true; }
+        }
+        return false;
+    };
+    {
+        ContextStore b(options);
+        check(b.sync_peers() == 1 && fs::exists(marker), "the peer image was not imported with a marker");
+        remote->clock += 1000;
+        (void)b.put(describe("0a"), peer_image(16), std::array{ContextStore::Region{30, 5000}});
+        check(fs::exists(marker), "the test expects put to leave the marker for the restart to judge");
+        // Stopped before the upload queue runs: the restart decides what is uploaded.
+    }
+    remote->objects.clear();
+    fs::remove(b_directory.path() / "manifests" / "0a.published");
+    {
+        ContextStore b(options);
+        check(!fs::exists(marker), "a marker that matches no manifest survived the restart");
+        check(b.upload_unpublished("model-a", std::chrono::steady_clock::now() + std::chrono::seconds(10)),
+              "the flush did not finish");
+        check(uploaded(), "a locally rewritten image stayed the peer's after a restart");
+    }
+}
+
 // Every byte in the store's directory, as a volume of fixed size sees it.
 std::uint64_t bytes_on_disk(const fs::path& directory) {
     std::uint64_t total = 0;
@@ -3415,6 +3455,7 @@ int main() {
     test_peer_images_are_still_the_peers_to_upload_after_a_restart();
     test_chunk_provenance_ends_when_the_peer_file_is_replaced();
     test_peer_marker_follows_the_manifest();
+    test_local_put_after_peer_import_is_uploaded_after_restart();
     test_peer_poll_passes_over_images_the_peer_only_registered();
     test_peer_poll_lists_an_unchanged_peer_once();
     test_peer_fit_skip_is_counted_once_when_only_the_use_changes();
