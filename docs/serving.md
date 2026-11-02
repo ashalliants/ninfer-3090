@@ -697,6 +697,13 @@ The local directory becomes a cache of the bucket.
   prefixes are evicted last, and every conversation written that starts with one counts as a use
   of it (here and in the bucket), so a prefix many conversations rely on is not evicted or expired
   as unused while they reuse it from memory.
+- The manifests of sessions the directory holds no chunk of (registered from the bucket, or evicted
+  to it) are kept within a quarter of `--context-store-max-gib`, so a bucket with very many
+  sessions cannot fill the directory with manifests alone. The newest in the bucket, by the time it
+  lists for them, are kept; an older one is not registered (and not downloaded) while newer ones fill
+  that share, and drops out of the index when newer ones displace it. A session dropped this way is
+  still in the bucket and is registered again once there is room, for example after the newer ones
+  expire.
 - Credentials come from the environment, never the command line: `NINFER_S3_ACCESS_KEY_ID` and
   `NINFER_S3_SECRET_ACCESS_KEY` (or `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; an
   `AWS_SESSION_TOKEN` is honoured). `--context-store-s3-region` (default `us-east-1`) names the

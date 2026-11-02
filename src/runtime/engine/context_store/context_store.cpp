@@ -1135,6 +1135,14 @@ void ContextStore::maintain_locked(const std::string* protect) {
             if (drop_queued_upload_locked(protect)) { continue; }
             break;
         }
+        // Evicting to the bucket leaves manifests behind, and a bucket with very many images
+        // registers one each: the ones nothing else holds may take only their share of the limit.
+        // (The cheap test first: the manifests altogether are under it, so these are.)
+        if (options_.remote && manifest_total_bytes_ > remote_only_budget_locked()) {
+            std::uint64_t remote_only = remote_only_bytes_locked();
+            (void)make_room_for_remote_only_locked(0, std::numeric_limits<std::int64_t>::max(),
+                                                   remote_only, protect);
+        }
     }
 }
 
@@ -2612,8 +2620,58 @@ std::string ContextStore::listed_id(const std::string& key) const {
     return valid_id(id) ? id : std::string();
 }
 
+std::uint64_t ContextStore::remote_only_budget_locked() const {
+    if (!options_.remote || options_.max_bytes == 0) { return std::numeric_limits<std::uint64_t>::max(); }
+    return options_.max_bytes / kRemoteOnlyShareDivisor;
+}
+
+namespace {
+// How recent a remote-only entry is: its last use here or its manifest's time in the bucket,
+// whichever is later. A candidate from a listing is compared by the bucket time alone, so an
+// entry dropped for newer ones is also older than anything the listing then offers in its place.
+std::int64_t recency_ms(std::int64_t last_used_ms, std::int64_t remote_modified_ms) {
+    return std::max(last_used_ms, remote_modified_ms);
+}
+} // namespace
+
+std::uint64_t ContextStore::remote_only_bytes_locked() const {
+    std::uint64_t total = 0;
+    for (const auto& [id, entry] : entries_) {
+        if (entry.published && !entry_has_local_bytes_locked(entry)) { total += entry.manifest_bytes; }
+    }
+    return total;
+}
+
+bool ContextStore::make_room_for_remote_only_locked(std::uint64_t incoming, std::int64_t newer_than,
+                                                    std::uint64_t& total, const std::string* protect) {
+    const std::uint64_t budget = remote_only_budget_locked();
+    if (incoming > budget) { return false; }
+    while (total + incoming > budget) {
+        const Entry* oldest = nullptr;
+        std::int64_t oldest_ms = 0;
+        for (const auto& [id, entry] : entries_) {
+            if (!entry.published || loading_.count(id) != 0 || (protect != nullptr && id == *protect) ||
+                entry_has_local_bytes_locked(entry)) {
+                continue;
+            }
+            const std::int64_t ms = recency_ms(entry.info.last_used_ms, entry.remote_modified_ms);
+            if (ms < newer_than && (oldest == nullptr || ms < oldest_ms)) {
+                oldest    = &entry;
+                oldest_ms = ms;
+            }
+        }
+        if (oldest == nullptr) { return false; }
+        const std::string id = oldest->info.id; // the entry goes with the removal
+        total -= std::min(total, oldest->manifest_bytes);
+        remove_entry_locked(id, false);
+        ++stats_.remote_only_dropped;
+    }
+    return true;
+}
+
 bool ContextStore::register_remote_image(const ObjectInfo& object, const std::string& id,
                                          std::chrono::steady_clock::time_point listed_at,
+                                         std::uint64_t* remote_only, bool* declined,
                                          std::chrono::steady_clock::time_point deadline) {
     {
         std::scoped_lock lock(mutex_);
@@ -2629,7 +2687,21 @@ bool ContextStore::register_remote_image(const ObjectInfo& object, const std::st
             remote_failed_.erase(failed);
         }
     }
-    const std::optional<std::vector<std::uint8_t>> data =
+    if (options_.max_bytes != 0) {
+        // The manifest must fit the remote-only share, decided from the listing alone (before
+        // anything is downloaded), by making room from the older remote-only entries only.
+        std::scoped_lock io(io_mutex_);
+        std::scoped_lock lock(mutex_);
+        std::uint64_t counted = remote_only != nullptr ? *remote_only : remote_only_bytes_locked();
+        const bool fits = make_room_for_remote_only_locked(object.size, object.modified_ms, counted, nullptr);
+        if (remote_only != nullptr) { *remote_only = counted; }
+        if (!fits) {
+            ++stats_.remote_only_dropped;
+            if (declined != nullptr) { *declined = true; }
+            return false;
+        }
+    }
+    const std::optional<std::vector<std::uint8_t>> data = 
         options_.remote->get_before(object.key, deadline);
     if (!data) {
         // Listed but gone by the time it was read (deleted, or expired, since the listing).
@@ -2687,6 +2759,7 @@ bool ContextStore::register_remote_image(const ObjectInfo& object, const std::st
     // before it skips the upload.
     entry.generation         = ++next_generation_;
     entry.remote_modified_ms = object.modified_ms;
+    if (remote_only != nullptr) { *remote_only += entry.manifest_bytes; }
     entries_.emplace(id, std::move(entry));
     return true;
 }
@@ -2730,7 +2803,23 @@ std::size_t ContextStore::refresh_remote_locked(std::chrono::steady_clock::time_
             listing_since(std::chrono::steady_clock::now(), deadline);
         if (!listing) { return 0; }
         std::unordered_set<std::string> listed;
-        for (const ObjectInfo& object : listing->objects) {
+        // With a size limit the newest manifests are registered first: the share remote-only
+        // manifests may take is filled with the newest in the bucket, and once one does not fit
+        // every older one is passed over without a look (nothing older can displace anything).
+        std::vector<const ObjectInfo*> order;
+        order.reserve(listing->objects.size());
+        for (const ObjectInfo& object : listing->objects) { order.push_back(&object); }
+        std::uint64_t remote_only = 0;
+        if (options_.max_bytes != 0) {
+            std::stable_sort(order.begin(), order.end(), [](const ObjectInfo* a, const ObjectInfo* b) {
+                return a->modified_ms > b->modified_ms;
+            });
+            std::scoped_lock lock(mutex_);
+            remote_only = remote_only_bytes_locked();
+        }
+        bool share_full = false;
+        for (const ObjectInfo* listed_object : order) {
+            const ObjectInfo& object = *listed_object;
             if (std::chrono::steady_clock::now() >= deadline) {
                 truncated = true;
                 break;
@@ -2740,7 +2829,13 @@ std::size_t ContextStore::refresh_remote_locked(std::chrono::steady_clock::time_
             const std::string id = listed_id(object.key);
             if (id.empty()) { continue; }
             listed.insert(id);
-            if (register_remote_image(object, id, listing->listed_at, deadline)) { ++added; }
+            if (share_full) { continue; }
+            bool declined = false;
+            if (register_remote_image(object, id, listing->listed_at, &remote_only, &declined,
+                                     deadline)) {
+                ++added;
+            }
+            share_full = declined;
         }
         // An image the bucket no longer lists (expired, or removed by someone) is not offered
         // from the index any more, unless the directory still holds some of it.
