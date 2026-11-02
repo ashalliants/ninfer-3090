@@ -700,9 +700,9 @@ The local directory becomes a cache of the bucket.
 - The manifests of sessions the directory holds no chunk of (registered from the bucket, or evicted
   to it) are kept within a quarter of `--context-store-max-gib`, so a bucket with very many
   sessions cannot fill the directory with manifests alone. The newest in the bucket, by the time it
-  lists for them, are kept; an older one is not registered (and not downloaded) while newer ones fill
-  that share, and drops out of the index when newer ones displace it. A session dropped this way is
-  still in the bucket and is registered again once there is room, for example after the newer ones
+  lists for them, are kept; an older one is not registered while newer ones fill that share (its
+  manifest may still be downloaded once per refresh to find that out), and drops out of the index
+  when newer ones displace it. A session dropped this way is still in the bucket and is registered again once there is room, for example after the newer ones
   expire.
 - Credentials come from the environment, never the command line: `NINFER_S3_ACCESS_KEY_ID` and
   `NINFER_S3_SECRET_ACCESS_KEY` (or `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; an
@@ -991,6 +991,7 @@ server restarts.
 | `ninfer_context_store_lookups_total`, `_lookup_hits_total`, `_lookup_seconds_total` | bucket lookups for a request that found nothing stored, those after which the store held a session ending on the request's prompt, and the time requests waited for them |
 | `ninfer_context_store_remote_fetch_bytes_per_second` | the rate the store assumes for fetching a session's missing chunks (downloaded, verified and written to the directory together: the wait a fetch adds), learned from fetches; a session whose fetch would not fit in a request's wait is not chosen |
 | `ninfer_context_store_remote_retired_total`, `_remote_uploads_skipped_total`, `_remote_uploads_dropped_total` | earlier turns deleted from the bucket once a later one was uploaded, queued uploads a later write made unnecessary, and queued uploads given up to keep the files they hold within the directory's limits (their sessions are uploaded at their next write) |
+| `ninfer_context_store_remote_only_dropped_total` | sessions only the bucket holds whose manifest was dropped from the index, or not registered from a listing, because newer ones filled the manifests' share (a quarter) of `--context-store-max-gib`; they are registered again when there is room |
 
 Histograms expose `_bucket`, `_sum` and `_count`. Metrics have bounded labels; they do not retain
 request IDs or request text. Rates are calculated by the consumer, for example:

@@ -184,6 +184,7 @@ int main() {
     fork.context_store_corrupt                         = 2;
     fork.context_store_corrupt_remote                  = 2;
     fork.context_store_remote_download_failures        = 5;
+    fork.context_store_remote_only_dropped             = 6;
     fork.context_store_remote_download_failures_damaged = 2;
     fork.context_store_remote_download_failures_listing = 3;
     fork.main_kv_h2d_bytes                = 123456;
@@ -243,6 +244,7 @@ int main() {
               has_line(series, "ninfer_context_store_corrupt_by_reason_total{reason=\"remote\"} 2") &&
               has_line(series, "ninfer_context_store_corrupt_by_reason_total{reason=\"startup\"} 0") &&
               has_line(series, "ninfer_context_store_remote_download_failures_total 5") &&
+              has_line(series, "ninfer_context_store_remote_only_dropped_total 6") &&
               has_line(series, "ninfer_context_store_remote_download_failures_by_reason_total"
                                "{reason=\"damaged\"} 2") &&
               has_line(series, "ninfer_context_store_remote_download_failures_by_reason_total"
