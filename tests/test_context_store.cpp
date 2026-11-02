@@ -1361,6 +1361,167 @@ void test_remote_upload_and_second_engine() {
           "the refresh did not count the manifest it downloaded");
 }
 
+std::size_t remote_objects_matching(MemoryObjectStore& remote, const std::string& part) {
+    std::scoped_lock lock(remote.mutex);
+    std::size_t found = 0;
+    for (const auto& [key, value] : remote.objects) {
+        if (key.find(part) != std::string::npos) { ++found; }
+    }
+    return found;
+}
+
+// A newer write of a conversation retires the older manifest by deleting it, and fences that
+// version with a tombstone written before the new manifest is published. Anything that would put
+// the version back (a stale copy planted again, a repair by an engine that still holds it, an
+// upload that was still queued) finds the fence; a version written later under the same id (the
+// same conversation state, saved again) is a new version and is not fenced.
+void test_retired_manifests_are_fenced_against_republish() {
+    TempDirectory a_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    std::vector<std::uint8_t> stale;
+    std::string stale_key;
+    {
+        ContextStore a(remote_options(a_directory.path(), remote));
+        put_turn(a, 1);
+        check(drained(a), "turn 1 did not upload");
+        {
+            std::scoped_lock lock(remote->mutex);
+            for (const auto& [key, value] : remote->objects) {
+                if (key.find("manifests/a.manifest") != std::string::npos) {
+                    stale     = value.first;
+                    stale_key = key;
+                }
+            }
+        }
+        check(!stale.empty(), "turn 1's manifest is not in the bucket");
+        remote->clock += 10;
+        put_turn(a, 2);
+        check(drained(a), "turn 2 did not upload");
+        check(remote_manifests(*remote) == 1 && remote_objects_matching(*remote, "tombstones/a.") == 1,
+              "the superseded version was not deleted and fenced");
+    }
+
+    // The deleted manifest is put back (an engine's repair, an upload that landed late): a
+    // refresh does not register it, and does not download it again while it stays as it is.
+    {
+        std::scoped_lock lock(remote->mutex);
+        remote->objects[stale_key] = {stale, ++remote->clock};
+    }
+    TempDirectory d_directory;
+    ContextStore d(remote_options(d_directory.path(), remote));
+    check(drained(d), "the start-up refresh did not finish");
+    (void)d.refresh_remote();
+    check(d.list().size() == 1 && d.list()[0].id == "b" && !d.find("a").has_value(),
+          "a retired version was registered from the bucket");
+    check(d.stats().remote_fenced >= 1, "the fence was not counted");
+    const int manifest_gets = remote->manifest_gets;
+    (void)d.refresh_remote();
+    check(remote->manifest_gets == manifest_gets, "a fenced manifest was downloaded again");
+
+    // The same id written again later is a new version: not fenced.
+    TempDirectory w_directory;
+    {
+        remote->clock += 10;
+        ContextStore w(remote_options(w_directory.path(), remote));
+        check(drained(w), "the start-up refresh did not finish"); // it meets the planted stale copy
+        const auto fenced_before = w.stats().remote_fenced;
+        put_turn(w, 1);
+        check(drained(w), "the rewrite did not upload");
+        check(w.stats().remote_fenced == fenced_before, "a rewritten id was fenced");
+    }
+    (void)d.refresh_remote();
+    check(d.find("a").has_value(), "a legitimately rewritten id was not registered");
+}
+
+// An engine that still holds a retired image and uses it republishes a manifest that went missing
+// from the bucket (lifecycle expiry); that must not bring back one a newer write deleted.
+void test_repair_does_not_republish_a_retired_manifest() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore a(remote_options(a_directory.path(), remote));
+    ContextStore::Options b_options = remote_options(b_directory.path(), remote);
+    b_options.remote_touch_interval = std::chrono::seconds(0); // every use repairs
+    ContextStore b(b_options);
+    put_turn(a, 1);
+    check(drained(a), "turn 1 did not upload");
+    (void)b.refresh_remote();
+    check(b.load("a").has_value(), "B could not fetch turn 1");
+    check(drained(b), "B's touch did not finish");
+    remote->clock += 10;
+    put_turn(a, 2);
+    check(drained(a), "turn 2 did not upload");
+    check(remote_manifests(*remote) == 1, "the superseded manifest stayed in the bucket");
+    // B still holds turn 1 and uses it again.
+    check(b.load("a").has_value(), "B lost turn 1");
+    check(drained(b), "B's repair did not finish");
+    check(remote_manifests(*remote) == 1 && b.stats().remote_fenced == 1,
+          "an engine's repair put a retired manifest back");
+}
+
+// A retired manifest that is still in the bucket (its delete was lost) is not kept alive by an
+// engine that holds it: using the image touches nothing, so it ages out with its tombstone.
+void test_touch_does_not_refresh_a_present_retired_manifest() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore a(remote_options(a_directory.path(), remote));
+    ContextStore::Options b_options = remote_options(b_directory.path(), remote);
+    b_options.remote_touch_interval = std::chrono::seconds(0); // every use touches
+    ContextStore b(b_options);
+    put_turn(a, 1);
+    check(drained(a), "turn 1 did not upload");
+    std::vector<std::uint8_t> stale;
+    std::string stale_key;
+    {
+        std::scoped_lock lock(remote->mutex);
+        for (const auto& [key, value] : remote->objects) {
+            if (key.find("manifests/a.manifest") != std::string::npos) {
+                stale     = value.first;
+                stale_key = key;
+            }
+        }
+    }
+    check(!stale.empty(), "turn 1's manifest is not in the bucket");
+    (void)b.refresh_remote();
+    check(b.load("a").has_value(), "B could not fetch turn 1");
+    check(drained(b), "B's touch did not finish");
+    remote->clock += 10;
+    put_turn(a, 2);
+    check(drained(a), "turn 2 did not upload");
+    {
+        // The delete of turn 1's manifest was lost.
+        std::scoped_lock lock(remote->mutex);
+        remote->objects[stale_key] = {stale, ++remote->clock};
+    }
+    const int touches = remote->touches;
+    check(b.load("a").has_value(), "B lost turn 1");
+    check(drained(b), "B's touch did not finish");
+    check(remote->touches == touches && b.stats().remote_fenced >= 1,
+          "using a retired image refreshed its manifest or chunks in the bucket");
+}
+
+// An upload still queued for a version that was retired meanwhile does not publish it.
+void test_queued_upload_of_a_retired_version_is_dropped() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options options = remote_options(directory.path(), remote);
+    options.remote_upload_delay   = std::chrono::seconds(3600);
+    ContextStore store(options);
+    check(drained(store), "the start-up refresh did not finish");
+    const std::int64_t created = remote->clock;
+    put_turn(store, 1);
+    // Another engine's newer write retired this version while the upload waited.
+    {
+        std::scoped_lock lock(remote->mutex);
+        remote->objects["ninfer/tombstones/a." + std::to_string(created)] = {{}, ++remote->clock};
+    }
+    check(drained(store), "the flush did not finish");
+    check(remote_manifests(*remote) == 0 && store.stats().remote_fenced == 1,
+          "a queued upload published a retired version");
+    check(store.find("a").has_value(), "the local copy of a fenced version was lost");
+}
+
 void test_remote_survives_local_eviction() {
     TempDirectory directory;
     auto remote = std::make_shared<MemoryObjectStore>();
@@ -3128,6 +3289,10 @@ int main() {
     test_invalid_input_and_failed_put();
     test_remote_upload_and_second_engine();
     test_remote_survives_local_eviction();
+    test_retired_manifests_are_fenced_against_republish();
+    test_repair_does_not_republish_a_retired_manifest();
+    test_touch_does_not_refresh_a_present_retired_manifest();
+    test_queued_upload_of_a_retired_version_is_dropped();
     test_remote_damage_and_outage_are_misses();
     test_remote_use_restarts_the_remote_age();
     test_remote_refresh_respects_its_deadline();
