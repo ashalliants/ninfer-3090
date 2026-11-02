@@ -148,6 +148,7 @@ struct Program {
     // `run_unit` pages places only into runs that hold one. Blocks without an offset are
     // not placed anywhere.
     std::size_t run_unit = 0;
+    mutable std::size_t run_simulations = 0; // calls to host_free_runs_after_release
     std::vector<ninfer::runtime::HostRun> base_free_runs;
 
     std::size_t host_block_at(std::size_t offset, std::size_t bytes) {
@@ -172,6 +173,7 @@ struct Program {
 
     [[nodiscard]] ninfer::runtime::HostFreeRuns
     host_free_runs_after_release(std::span<const Handle> victims) const {
+        ++run_simulations;
         std::vector<ninfer::runtime::HostRun> freed;
         for (std::size_t block = 0; block < blocks.size(); ++block) {
             if (!blocks[block].offset || blocks[block].external_reference) { continue; }
@@ -2357,6 +2359,33 @@ void test_placement_search_recovers_from_an_unaffordable_union() {
             "a legal victim set was missed after the first pick could not join a run");
 }
 
+// A demotion no victim set can place runs the greedy search and then the capped retries. With N
+// history entries a search simulates at most N release sets, so the total stays near
+// (1 + kMaxOpeningRetries) * N instead of growing with N * N.
+void test_blocked_placement_search_work_is_bounded() {
+    constexpr std::size_t history = 40;
+    Fixture f(history * 50 + 50);
+    auto& program    = f.program;
+    program.run_unit = 100;
+    for (std::size_t i = 0; i < history; ++i) {
+        // 50-byte extents 100 bytes apart: releasing any number of them never forms a 100-byte run.
+        const auto handle = program.add(tokens(10, 5000 + 100 * static_cast<std::uint32_t>(i)),
+                                        {program.host_block_at(100 * i, 50)});
+        program.contents[handle.index].device_state = false;
+        program.contents[handle.index].main_pages   = 0;
+        f.publish(handle);
+    }
+    const auto incoming = program.add(tokens(1000));
+    program.contents[incoming.index].demotion_bytes = 100;
+    f.publish(incoming);
+    program.run_simulations = 0;
+    (void)f.cache.reclaim(program, {.main_kv_pages = 1});
+    require(program.demoted.empty() && program.placement_failures == 0,
+            "an unplaceable demotion was attempted");
+    require(program.run_simulations > 0 && program.run_simulations <= 6 * (history + 1),
+            "a blocked placement search did unbounded extent simulations");
+}
+
 void test_demotion_quotes_only_placeable_host_bytes() {
     // 32 bytes are free, but 16 of them are stranded in runs too short for the destination.
     Fixture f(64);
@@ -2869,6 +2898,7 @@ int main() {
         test_host_placement_arithmetic();
         test_demotion_victims_account_for_post_release_extents();
         test_placement_search_recovers_from_an_unaffordable_union();
+        test_blocked_placement_search_work_is_bounded();
         test_state_demotion_releases_a_whole_image_when_no_run_fits();
         test_inherited_owner_heat_cannot_spend_a_full_other_continuation();
         test_exact_repeated_candidate_can_replace_a_long_hotspot_with_common_fallback();

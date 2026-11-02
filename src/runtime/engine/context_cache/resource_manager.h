@@ -1473,6 +1473,8 @@ private:
     // plan at every step, so the set count is capped: once it is full a candidate is simply
     // evaluated without the memo (nullptr), which is what the unmemoised path already does.
     static constexpr std::size_t kMaxCandidateMemos = 1024;
+    // Opening picks a blocked placement search retries from (see host_victims_in_order).
+    static constexpr std::size_t kMaxOpeningRetries = 4;
 
     [[nodiscard]] static CandidateMemo* candidate_memo(Evaluation& evaluation,
                                                        std::span<const Handle> sources) {
@@ -1988,9 +1990,15 @@ private:
         // union with any later action is then refused by admission (the recovery loss reaches the
         // gain limit), although a later action alone is admissible and would place. Retry from
         // each action as the opening pick; this only runs when the search would otherwise report
-        // the demotion blocked.
+        // the demotion blocked. A search costs at most one extent simulation per round and one
+        // candidate scan per action in a round, so N actions cost O(N^2) per search. Retrying
+        // every opening would make a blocked demotion O(N^3), on a path every reclaim pass can
+        // take again. The retries are therefore capped at kMaxOpeningRetries, and the total is
+        // (1 + kMaxOpeningRetries) searches. Per-union facts are already shared through the
+        // candidate memo, so a retry mostly re-ranks cached data.
         if (!found && placing) {
-            for (std::size_t first = 0; first < actions.size() && !found; ++first) {
+            const auto retries = std::min<std::size_t>(actions.size(), kMaxOpeningRetries);
+            for (std::size_t first = 0; first < retries && !found; ++first) {
                 found = grow(first);
             }
         }
