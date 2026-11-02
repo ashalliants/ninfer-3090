@@ -178,6 +178,20 @@ struct Rig {
         if (port <= 0) { throw std::runtime_error("HTTP server could not bind"); }
         server.attach(service);
         listener = std::thread([this] { server.listen(); });
+        wait_until_accepting();
+    }
+
+    // bind_any_port() only reserves the socket; the accept loop starts on `listener` a moment
+    // later, and a request sent before then is refused. Probe until the loop answers (any status
+    // will do) so the first route request cannot race listener startup.
+    void wait_until_accepting() const {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto probe = client();
+            if (probe.Get("/__ready_probe")) { return; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        throw std::runtime_error("HTTP server did not start accepting connections");
     }
 
     ~Rig() {
