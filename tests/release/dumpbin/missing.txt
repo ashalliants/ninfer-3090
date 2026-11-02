@@ -1,0 +1,15 @@
+
+Dump of file C:\ninfer\dist\ninfer-rtx3090-windows-x64-0.0.0\ninfer-bench.exe
+
+File Type: EXECUTABLE IMAGE
+
+  Image has the following dependencies:
+
+    KERNEL32.dll
+    cublasLt64_12.dll
+    cudart64_12.dll
+    nvcuda.dll
+
+  Summary
+
+        1000 .data

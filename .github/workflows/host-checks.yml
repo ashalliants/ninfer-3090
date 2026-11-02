@@ -70,6 +70,18 @@ jobs:
           done < <(git ls-files '*.sh')
           exit $status
 
+  # The static import check scripts/package-release.ps1 falls back to on a build box with no
+  # NVIDIA driver. It runs on dumpbin output kept in tests/release/dumpbin, so it needs no
+  # Windows machine; the GitHub-hosted Ubuntu runner ships PowerShell.
+  package-release-imports:
+    name: Release packager import check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests/release/test-package-release-imports.ps1
+        shell: pwsh
+        run: ./tests/release/test-package-release-imports.ps1
+
   model-cards:
     name: Model card charts match docs/assets
     runs-on: ubuntu-latest
