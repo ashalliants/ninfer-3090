@@ -2375,7 +2375,8 @@ std::uint64_t physical_bytes(const std::vector<fs::path>& directories) {
     for (const fs::path& directory : directories) {
         for (const char* part : {"chunks", "manifests"}) {
             for (const auto& item : fs::recursive_directory_iterator(directory / part)) {
-                if (!item.is_regular_file() || item.path().extension() == ".used") { continue; }
+                const std::string extension = item.path().extension().string();
+                if (!item.is_regular_file() || extension == ".used" || extension == ".peer") { continue; }
                 const std::uint64_t links = fs::hard_link_count(item.path());
                 total += (fs::file_size(item.path()) + links - 1) / links;
             }
@@ -3020,6 +3021,197 @@ void test_peer_images_are_not_uploaded_by_the_importer() {
     }
 }
 
+// The importer's restart must not turn a peer's image into one it wrote: it is still the peer's
+// to upload, so neither a use nor the flush before the box goes puts it in the bucket.
+void test_peer_images_are_still_the_peers_to_upload_after_a_restart() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    const auto remote = std::make_shared<MemoryObjectStore>();
+    const auto image  = peer_image(14);
+    ContextStore a(options_for(a_directory.path())); // the peer has not uploaded it (yet)
+    (void)a.put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
+    ContextStore::Options options = remote_options(b_directory.path(), remote);
+    options.peers                 = {a_directory.path()};
+    options.peer_poll             = std::chrono::hours(1);
+    {
+        ContextStore b(options);
+        check(b.sync_peers() == 1, "the peer image was not imported");
+    }
+    {
+    ContextStore b(options);
+    check(drained(b), "the restarted importer's queue did not drain");
+    check(b.find("0a").has_value(), "the imported image did not survive the restart");
+    check(b.load("0a").value_or(std::vector<std::uint8_t>{}) == image,
+          "the imported image did not load after the restart");
+    check(drained(b), "the importer's remote queue did not drain");
+    check(b.upload_unpublished("model-a", std::chrono::steady_clock::now() + std::chrono::seconds(10)),
+          "the flush before shutdown did not finish");
+    check(remote->puts == 0 && remote->objects.empty() && b.stats().remote_uploads == 0,
+          "the restarted importer uploaded an image a peer wrote");
+    // Writing the image here makes it this store's own to upload again.
+    (void)b.put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
+    check(drained(b), "the rewrite did not upload");
+    check(remote->puts > 0, "an image written here after a peer's was not uploaded");
+    }
+    {
+        ContextStore again(options);
+        check(drained(again) && again.find("0a").has_value(), "the rewritten image was lost on restart");
+        again.touch("0a");
+        check(drained(again), "the restarted store's queue did not drain");
+    }
+}
+
+// A chunk is blamed on the peer only while the file in the directory is the peer's link: a chunk
+// evicted to the bucket and fetched back, or replaced, is this store's own.
+void test_chunk_provenance_ends_when_the_peer_file_is_replaced() {
+    PeerAndRemote setup;
+    ContextStore::Options options = remote_options(setup.b_directory.path(), setup.remote);
+    options.peers                 = {setup.a_directory.path()};
+    options.peer_poll             = std::chrono::hours(1);
+    options.max_bytes             = 8000; // room for one image
+    ContextStore b(options);
+    (void)b.refresh_remote();
+    check(b.sync_peers() == 1, "the peer's copy of a bucket-registered image was not linked");
+    // Another image makes room: the filled one is evicted to the bucket and fetched back.
+    (void)b.put(describe("0b"), concat({pseudo_random(30, 31), pseudo_random(5000, 32)}),
+                std::array{ContextStore::Region{30, 5000}});
+    check(drained(b), "the second image did not upload");
+    check(!b.find("0a")->local, "the first image was not evicted to the bucket");
+    check(b.load("0a").value_or(std::vector<std::uint8_t>{}) == setup.image,
+          "the evicted image was not fetched back");
+    // The fetched-back files are damaged now; the peer did not supply them.
+    for (const fs::path& file : chunk_files(setup.b_directory.path())) {
+        if (fs::hard_link_count(file) != 1) { continue; }
+        std::fstream stream(file, std::ios::in | std::ios::out | std::ios::binary);
+        char byte = 0;
+        stream.get(byte);
+        stream.seekp(0);
+        stream.put(static_cast<char>(byte ^ 0x5a));
+    }
+    check(b.load("0a").value_or(std::vector<std::uint8_t>{}) == setup.image,
+          "the damaged files were not repaired from the bucket");
+    check(b.stats().corrupt_chunk == 0 && b.stats().remote_downloads > 0, "no damage was found and repaired");
+    // The peer is still polled: nothing it linked is damaged.
+    check(b.erase("0a") && b.erase("0b"), "the images could not be removed");
+    check(b.sync_peers() == 1, "a peer was blamed for a file it did not supply");
+}
+
+// The `.peer` marker is part of the import: an import that cannot record it does not happen, a
+// discarded manifest takes its marker. A marker names the manifest it was written for, so a stale
+// one (an earlier image of the id) changes nothing, and one that cannot be read keeps the image
+// the peer's.
+void test_peer_marker_follows_the_manifest() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    const auto image = peer_image(15);
+    ContextStore a(options_for(a_directory.path()));
+    (void)a.put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
+    ContextStore::Options options = options_for(b_directory.path());
+    options.peers                 = {a_directory.path()};
+    options.peer_poll             = std::chrono::hours(1);
+    const fs::path marker         = b_directory.path() / "manifests" / "0a.peer";
+    {
+        // A marker that cannot be written: the image is not imported as the importer's own.
+        ContextStore b(options);
+        fs::create_directories(marker / "blocker");
+        check(b.sync_peers() == 0 && !b.find("0a").has_value(),
+              "an image was imported without its origin marker");
+        check(!fs::exists(b_directory.path() / "manifests" / "0a.manifest"),
+              "a failed import left a manifest behind");
+        fs::remove_all(marker);
+    }
+    {
+        ContextStore b(options);
+        check(b.sync_peers() == 1 && fs::exists(marker), "the peer image was not imported with a marker");
+    }
+    // The manifest is damaged: it is discarded with its marker.
+    const fs::path manifest = b_directory.path() / "manifests" / "0a.manifest";
+    fs::resize_file(manifest, fs::file_size(manifest) / 2);
+    {
+        ContextStore b(options);
+        check(b.stats().corrupt_manifest == 1, "the damaged manifest was not discarded");
+        check(!fs::exists(marker), "a discarded manifest left its peer marker behind");
+    }
+    // An orphan marker (no manifest) is swept at start-up.
+    { std::ofstream(marker).put('x'); }
+    {
+        ContextStore b(options);
+        check(!fs::exists(marker), "an orphan peer marker was kept");
+    }
+    // Markers beside this store's own images: a stale one (another manifest's checksum) leaves the
+    // image this store's to upload; one that exists but cannot be read withholds the upload.
+    {
+        TempDirectory c_directory;
+        const auto remote             = std::make_shared<MemoryObjectStore>();
+        ContextStore::Options own     = remote_options(c_directory.path(), remote);
+        const std::vector<std::uint8_t> stale(8, 0x42);
+        {
+            ContextStore c(own);
+            (void)c.put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
+            (void)c.put(describe("0b"), peer_image(16), std::array{ContextStore::Region{30, 5000}});
+            // Stopped before the queue runs: the restart decides what is uploaded.
+        }
+        remote->objects.clear();
+        for (const char* id : {"0a", "0b"}) {
+            fs::remove(c_directory.path() / "manifests" / (std::string(id) + ".published"));
+        }
+        { std::ofstream(c_directory.path() / "manifests" / "0a.peer", std::ios::binary).write("BBBBBBBB", 8); }
+        fs::create_directories(c_directory.path() / "manifests" / "0b.peer" / "unreadable");
+        ContextStore c(own);
+        check(c.upload_unpublished("model-a", std::chrono::steady_clock::now() + std::chrono::seconds(10)),
+              "the flush did not finish");
+        check(!fs::exists(c_directory.path() / "manifests" / "0a.peer"), "a stale marker was kept");
+        bool a_uploaded = false;
+        bool b_uploaded = false;
+        for (const auto& object : remote->objects) {
+            a_uploaded = a_uploaded || object.first.find("0a") != std::string::npos;
+            b_uploaded = b_uploaded || object.first.find("0b") != std::string::npos;
+        }
+        check(a_uploaded, "a stale marker withheld an image this store wrote");
+        check(!b_uploaded, "an unreadable marker let a possibly peer-owned image be uploaded");
+    }
+}
+
+// An id imported from a peer and then rewritten by a local put: `put` leaves the old marker in
+// place on purpose (removing it there would be a second, crash-ordered step after the new
+// manifest). The marker names the peer manifest's checksum, and the local manifest carries its own
+// creation time, size and chunk list, so after a restart the stale marker matches nothing: the
+// image is this store's to upload, and the marker is swept.
+void test_local_put_after_peer_import_is_uploaded_after_restart() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    const auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore a(options_for(a_directory.path()));
+    (void)a.put(describe("0a"), peer_image(15), std::array{ContextStore::Region{30, 5000}});
+    ContextStore::Options options = remote_options(b_directory.path(), remote);
+    options.peers                 = {a_directory.path()};
+    options.peer_poll             = std::chrono::hours(1);
+    const fs::path marker         = b_directory.path() / "manifests" / "0a.peer";
+    const auto uploaded           = [&] {
+        for (const auto& object : remote->objects) {
+            if (object.first.find("0a") != std::string::npos) { return true; }
+        }
+        return false;
+    };
+    {
+        ContextStore b(options);
+        check(b.sync_peers() == 1 && fs::exists(marker), "the peer image was not imported with a marker");
+        remote->clock += 1000;
+        (void)b.put(describe("0a"), peer_image(16), std::array{ContextStore::Region{30, 5000}});
+        check(fs::exists(marker), "the test expects put to leave the marker for the restart to judge");
+        // Stopped before the upload queue runs: the restart decides what is uploaded.
+    }
+    remote->objects.clear();
+    fs::remove(b_directory.path() / "manifests" / "0a.published");
+    {
+        ContextStore b(options);
+        check(!fs::exists(marker), "a marker that matches no manifest survived the restart");
+        check(b.upload_unpublished("model-a", std::chrono::steady_clock::now() + std::chrono::seconds(10)),
+              "the flush did not finish");
+        check(uploaded(), "a locally rewritten image stayed the peer's after a restart");
+    }
+}
+
 // Every byte in the store's directory, as a volume of fixed size sees it.
 std::uint64_t bytes_on_disk(const fs::path& directory) {
     std::uint64_t total = 0;
@@ -3365,6 +3557,10 @@ int main() {
     test_damaged_peer_chunk_falls_back_to_the_remote_once();
     test_damaged_chunk_blames_the_peer_only_when_the_peer_supplied_it();
     test_peer_images_are_not_uploaded_by_the_importer();
+    test_peer_images_are_still_the_peers_to_upload_after_a_restart();
+    test_chunk_provenance_ends_when_the_peer_file_is_replaced();
+    test_peer_marker_follows_the_manifest();
+    test_local_put_after_peer_import_is_uploaded_after_restart();
     test_peer_poll_passes_over_images_the_peer_only_registered();
     test_peer_poll_lists_an_unchanged_peer_once();
     test_peer_fit_skip_is_counted_once_when_only_the_use_changes();

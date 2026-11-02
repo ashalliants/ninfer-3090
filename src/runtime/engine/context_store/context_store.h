@@ -366,17 +366,14 @@ private:
         // complete listing taken after it that omits the manifest proves the bucket lost it.
         std::chrono::steady_clock::time_point published_at{};
         // Set on an image whose manifest was imported from a peer: the peer_skipped_ key and
-        // manifest time to restore if the manifest proves damaged. Such an image is the peer's to
-        // upload, so a use here never puts it in the bucket.
+        // manifest time to restore if the manifest proves damaged (empty after a restart, which
+        // forgets which peer it was).
         std::string peer_memo_key;
         std::int64_t peer_stamp = 0;
-        // The chunks each peer linked into this entry (peer_skipped_ key -> manifest time and the
-        // chunks' hex keys): a damaged chunk quarantines only the peer that supplied it.
-        struct PeerFill {
-            std::int64_t stamp = 0;
-            std::unordered_set<std::string> chunk_keys;
-        };
-        std::unordered_map<std::string, PeerFill> peer_fills;
+        // The image came from a peer, now or before a restart (a `.peer` marker beside the
+        // manifest says so). Such an image is the peer's to upload, so a use here, and the flush
+        // before shutdown, never put it in the bucket. A write of the id here is a different manifest, so it is no longer the peer's.
+        bool peer_origin = false;
     };
     struct ChunkUse {
         std::uint32_t references = 0;
@@ -389,6 +386,12 @@ private:
         // above 1 a peer store holds the same bytes, and the charge is shared with it.
         mutable std::uint32_t links = 1; // a cache, so the const stats() can refresh it
         bool present             = false; // the chunk file is in the directory
+        // The file is a hard link a peer supplied (the peer_skipped_ key and the manifest time to
+        // restore if the file proves damaged); empty for a file this store wrote or fetched. Per
+        // chunk, so a damaged file blames only the peer that supplied it, and cleared whenever
+        // the file goes or is replaced.
+        std::string peer_key;
+        std::int64_t peer_stamp = 0;
     };
     // Which form of a chunk the directory holds.
     struct StoredChunk {
@@ -422,6 +425,11 @@ private:
 
     [[nodiscard]] std::filesystem::path manifest_path(const std::string& id) const;
     [[nodiscard]] std::filesystem::path used_path(const std::string& id) const;
+    // The trailing checksum of a manifest: names that manifest and no other.
+    [[nodiscard]] static std::span<const std::uint8_t> manifest_checksum(std::span<const std::uint8_t> manifest);
+    // Present when the image was imported from a peer (see Entry::peer_origin); holds the checksum
+    // of the peer manifest it was written for, so it says nothing about any later manifest of the id.
+    [[nodiscard]] std::filesystem::path peer_origin_path(const std::string& id) const;
     // Holds the checksum of the manifest last published to the bucket: a restart marks the entry
     // published only when its manifest on disk is that one (not a newer write still to upload).
     [[nodiscard]] std::filesystem::path published_path(const std::string& id) const;
