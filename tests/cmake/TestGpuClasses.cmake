@@ -92,6 +92,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_request_log_test
   ninfer_resource_manager_test
   ninfer_route_coverage_test
+  ninfer_router_server_test
   ninfer_s3_object_store_test
   ninfer_sampling_defaults_test
   ninfer_scheduler_test

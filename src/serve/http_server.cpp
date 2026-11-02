@@ -154,6 +154,9 @@ void write_anthropic_error(httplib::Response& response, const ApiError& api_erro
 // Stamped on every response, including the loading 503, auth failures and malformed requests that
 // never reach the pre-routing handler, so a caller can tell which build answered.
 void set_version_header(httplib::Response& response) {
+    // Replace, not add: the pre-routing handler has usually stamped it already, and a response may
+    // pass through here again (an error status with an empty body), which must not repeat it.
+    response.headers.erase("X-NInfer-Version");
     response.set_header("X-NInfer-Version", std::string(ninfer::product::build_version()));
 }
 
