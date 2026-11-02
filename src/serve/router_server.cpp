@@ -117,8 +117,10 @@ struct EmptySelector : std::invalid_argument {
 // The model a request names: a JSON body's "model" on any method (GET and DELETE follow-ups may carry one), else a `model` query parameter, else
 // empty when omitted (the most recently used loaded model). A present but empty one throws.
 std::string requested_model(const httplib::Request& req, std::optional<Json>& body) {
-    if (!req.body.empty() &&
-        is_json_content_type(req.get_header_value("Content-Type"))) {
+    // Whatever Content-Type the client sent: the model parses its JSON body without looking at the
+    // header (parse_json_body), so a body it would accept is also read here, for the selector, the
+    // rewrite and the Responses routing alike.
+    if (!req.body.empty()) {
         try {
             Json parsed = Json::parse(req.body);
             if (parsed.is_object()) {
@@ -287,25 +289,13 @@ bool is_json_content_type(std::string_view content_type) {
 }
 
 namespace {
-// What a Responses create asks for. The model reads its JSON body whatever Content-Type the client
-// sent (parse_json_body ignores the header), so the router must too: a create without the header
-// still stores or streams. A body that is not a JSON object is refused by the model, which keeps
-// nothing, so it counts as storing nothing.
-struct CreateIntent {
-    bool stores  = false;
-    bool streams = false;
-};
-
-CreateIntent create_intent(const std::optional<Json>& parsed, const std::string& raw) {
-    Json fresh;
-    if (!parsed) { fresh = Json::parse(raw, nullptr, /*allow_exceptions=*/false); }
-    const Json& body = parsed ? *parsed : fresh;
-    if (!body.is_object()) { return {}; }
-    const auto flag = [&body](const char* key, bool otherwise) {
-        const auto found = body.find(key);
-        return found != body.end() && found->is_boolean() ? found->get<bool>() : otherwise;
-    };
-    return {.stores = flag("store", true), .streams = flag("stream", false)};
+// Whether a Responses create asks to be stored, from the body route() already parsed (whatever the
+// Content-Type, as the model reads it). A body that is not a JSON object is refused by the model,
+// which keeps nothing, so it counts as storing nothing.
+bool create_stores(const std::optional<Json>& body) {
+    if (!body) { return false; }
+    const auto found = body->find("store");
+    return found != body->end() && found->is_boolean() ? found->get<bool>() : true;
 }
 } // namespace
 
@@ -398,7 +388,7 @@ RouterServer::RouterServer(ServeOptions options, ModelRegistry& registry,
                            std::shared_ptr<spdlog::logger> logger)
     : options_(std::move(options)), registry_(registry), ports_(std::move(ports)),
       logger_(std::move(logger)),
-      response_owners_(options_.response_store_max_records * std::max<std::size_t>(1, registry.size())) {
+      response_owners_(registry.response_store_records()) {
     // cpp-httplib is thread-per-connection, and a relayed request holds a router worker for as long
     // as its model holds the matching worker of its own server.
     constexpr std::size_t kBaseWorkers = 32;
@@ -795,23 +785,21 @@ void RouterServer::route(const httplib::Request& req, httplib::Response& res) {
     Tap tap;
     Done done;
     const bool is_create = req.method == "POST" && req.path == "/v1/responses";
-    const CreateIntent intent = is_create ? create_intent(body, req.body) : CreateIntent{};
-    if (is_create && intent.stores) {
+    if (is_create && create_stores(body)) {
         auto scanner = std::make_shared<ResponseIdScanner>();
         tap          = [this, model = lease.model(), scanner](std::string_view data) {
             const bool known = scanner->id().has_value();
             scanner->feed(data);
             if (!known && scanner->id()) { response_owners_.record(*scanner->id(), model); }
         };
-        // The id of a stream is out in its first event, before the model has stored anything: one
-        // that fails or is cut off was never stored, so its provisional owner goes again. A reply
-        // that is not streamed is written only after the model has stored the response, so an id
-        // seen in it is kept even if the connection then breaks: an extra entry costs a map slot,
-        // while forgetting a stored response would send its follow-ups to the wrong model.
-        done = [this, scanner, streams = intent.streams](bool finished) {
-            if (streams && scanner->id() && (!finished || scanner->failed())) {
-                response_owners_.forget(*scanner->id());
-            }
+        // The router cannot see the moment the model commits a response, so an interrupted reply
+        // keeps its owner. A non-streamed reply is written after the commit. A stream commits just
+        // before its last event, so only one cut off earlier was not stored; keeping that owner
+        // costs a map slot and a not-found from the owner, which is what an unknown id gets anyway,
+        // while forgetting a stored one would misroute its follow-ups. The one positive sign that
+        // nothing was stored is a response.failed event, and that forgets the id.
+        done = [this, scanner] {
+            if (scanner->id() && scanner->failed()) { response_owners_.forget(*scanner->id()); }
         };
     }
     relay(req, res, std::move(lease), req.method, without_model_param(req.target),
@@ -894,7 +882,7 @@ void RouterServer::relay(const httplib::Request& req, httplib::Response& res,
         httplib::Response response;
         httplib::Error error = httplib::Error::Success;
         const bool ok        = relayed->client->send(request, response, error);
-        if (done) { done(ok); }
+        if (done) { done(); }
         std::lock_guard lock(relayed->mutex);
         // The client calls response_handler only while processing a body, so a HEAD response (and
         // any other without one) reaches here with its status and headers still unrecorded.

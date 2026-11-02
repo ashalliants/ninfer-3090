@@ -127,9 +127,8 @@ private:
     // along until the response has been delivered.
     // `tap`, when given, sees the bytes of a 2xx reply before they are queued for the client.
     using Tap = std::function<void(std::string_view)>;
-    // `done(finished)`, when given, runs once the model's reply has ended: `finished` is false if
-    // the connection broke or the client left before the end.
-    using Done = std::function<void(bool)>;
+    // `done`, when given, runs once the model's reply has ended, however it ended.
+    using Done = std::function<void()>;
     void relay(const httplib::Request& req, httplib::Response& res, ModelRegistry::Lease lease,
                const std::string& method, const std::string& target, std::string body,
                Tap tap = {}, Done done = {});

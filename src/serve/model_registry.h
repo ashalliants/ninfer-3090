@@ -215,6 +215,16 @@ public:
         return largest;
     }
 
+    // The most Responses the models can store between them: the sum of each model's configured
+    // --response-store-max-records (a section of a preset can set its own), at least one.
+    [[nodiscard]] std::size_t response_store_records() const noexcept {
+        std::size_t total = 0;
+        for (const Slot& slot : models_) {
+            total += slot.definition.options.response_store_max_records;
+        }
+        return std::max<std::size_t>(total, 1);
+    }
+
     [[nodiscard]] bool router() const noexcept { return router_; }
 
     [[nodiscard]] const RegistryPolicy& policy() const noexcept { return policy_; }

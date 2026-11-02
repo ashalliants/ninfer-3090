@@ -192,6 +192,8 @@ struct Rig {
         std::vector<std::string> aliases = {};
         bool suspendable                 = true;
         std::vector<std::string> arguments = {};
+        // This model's --response-store-max-records; 0 takes the rig's `store_records`.
+        std::size_t store_records = 0;
     };
 
     Journal journal;
@@ -214,6 +216,8 @@ struct Rig {
             definition.id        = spec.id;
             definition.aliases   = spec.aliases;
             definition.arguments = spec.arguments;
+            definition.options.response_store_max_records =
+                spec.store_records != 0 ? spec.store_records : store_records;
             definitions.push_back(std::move(definition));
             suspendable[spec.id] = spec.suspendable;
             auto upstream        = std::make_unique<Upstream>(spec.id);
@@ -237,7 +241,6 @@ struct Rig {
         options.port        = free_port();
         options.api_key     = std::move(api_key);
         options.enable_cors = cors;
-        options.response_store_max_records = store_records;
         port                = options.port;
         router = std::make_unique<RouterServer>(options, *registry, ports, nullptr);
         if (!router->bind()) { throw std::runtime_error("router could not bind"); }
@@ -943,15 +946,18 @@ void install_responses(const std::string& model, Upstream& upstream, FakeRespons
         // A create with store:false, or a stream that fails or is cut off, keeps nothing.
         store.note_created(id);
         const bool streamed = body.is_object() && body.value("stream", false);
+        // abort_stream: cut off while generating, nothing stored. abort_committed: the model had
+        // committed the response (it does so just before the last event) when the connection broke.
         const bool broken   = body.is_object() && (body.value("fail_stream", false) ||
                                                  body.value("abort_stream", false));
+        const bool committed_abort = body.is_object() && body.value("abort_committed", false);
         if (!(body.is_object() && body.value("store", true) == false) && !broken) {
             store.add(id, model);
         }
-        if (streamed && broken) {
+        if (streamed && (broken || committed_abort)) {
             const std::string created = "event: response.created\ndata: {\"response\":{\"id\":\"" +
                                         id + "\"},\"type\":\"response.created\"}\n\n";
-            const bool abort = body.value("abort_stream", false);
+            const bool abort = !body.value("fail_stream", false);
             res.set_chunked_content_provider(
                 "text/event-stream", [created, abort, step = 0](size_t, httplib::DataSink& sink) mutable {
                     if (step++ == 0) { return sink.write(created.data(), created.size()); }
@@ -1180,8 +1186,10 @@ void responses_follow_up_the_owning_model() {
     reply = post(rig, "/v1/responses/input_tokens", R"({"input":"more"})");
     expect(reply.status == 200 && served_by(reply) == "b", "and without it, by default");
 
-    // A create that is not stored, or whose stream fails or is cut off, has no owner. The model
+    // A create that is not stored, or whose stream ends in response.failed, has no owner. The model
     // is learnt from the id in the first event, so these are forgotten once the stream has ended.
+    // A stream that is only cut off keeps its owner: the router cannot see whether the model had
+    // committed it (it does so just before the last event), and keeping is never worse than master.
     const auto owner_forgotten = [&](const std::string& id) {
         return eventually([&] {
             get(rig, "/v1/responses/" + id_b); // b served last
@@ -1204,8 +1212,19 @@ void responses_follow_up_the_owning_model() {
     expect(!id.empty() && owner_forgotten(id), "nor is a streamed one");
     id = create_id(R"({"stream":true,"fail_stream":true,"input":"x"})");
     expect(!id.empty() && owner_forgotten(id), "a stream that ends in response.failed is forgotten");
+    const auto owner_kept = [&](const std::string& id) {
+        get(rig, "/v1/responses/" + id_b); // b served last
+        const std::size_t a_calls = rig.up("a").count();
+        get(rig, "/v1/responses/" + id);
+        return rig.up("a").count() == a_calls + 1;
+    };
     id = create_id(R"({"stream":true,"abort_stream":true,"input":"x"})");
-    expect(!id.empty() && owner_forgotten(id), "and so is one that is cut off");
+    expect(!id.empty() && eventually([&] { return rig.leases("a") == 0; }) && owner_kept(id),
+           "a stream cut off before its end keeps its owner (nothing says it was not stored)");
+    id = create_id(R"({"stream":true,"abort_committed":true,"input":"x"})");
+    expect(!id.empty() && eventually([&] { return rig.leases("a") == 0; }) &&
+               served_by(get(rig, "/v1/responses/" + id)) == "a",
+           "and one cut off after the model stored it is still found at its owner");
 
     // The model reads the body whatever the Content-Type says, so a store:false create without a
     // JSON header is just as unstored, streamed or not.
@@ -1231,8 +1250,29 @@ void responses_follow_up_the_owning_model() {
     expect(!id.empty() && served_by(get(rig, "/v1/responses/" + id)) == "a",
            "and a stored create without the header is remembered");
 
+    // Routing reads the body the same way: a body with no JSON Content-Type names its model, has it
+    // rewritten to the model's id, and a previous_response_id in it finds the owner.
+    {
+        auto plain = rig.client();
+        get(rig, "/v1/responses/" + id_b); // b served last
+        const std::size_t b_before = rig.up("b").count();
+        plain.Post("/v1/responses", R"({"model":"a","input":"x"})", "text/plain");
+        expect(rig.up("b").count() == b_before && upstream_body(rig, "a")["model"] == "a",
+               "a header-less body's \"model\" selects the model");
+        plain.Post("/v1/responses", R"({"model":"alpha","input":"x"})", "text/plain");
+        expect(upstream_body(rig, "a")["model"] == "a", "and its alias is rewritten to the id");
+        get(rig, "/v1/responses/" + id_b); // b served last
+        plain.Post("/v1/responses", R"({"input":"x","previous_response_id":")" + id_a + R"("})",
+                   "text/plain");
+        expect(upstream_body(rig, "a")["previous_response_id"] == id_a &&
+                   upstream_body(rig, "a")["model"] == "a",
+               "a header-less previous_response_id goes to the owner, with the selector filled in");
+        reply = to_reply(plain.Post("/v1/responses", R"({"model":"","input":"x"})", "text/plain"));
+        expect(reply.status == 400, "an empty selector is refused whatever the Content-Type");
+    }
+
     // A reply that is not streamed is written after the model stored the response, so one cut off
-    // after its id was seen keeps its owner (a stream cut off before its end does not: see above).
+    // after its id was seen keeps its owner (as does a cut-off stream: see above).
     id = create_id(R"({"abort_body":true,"input":"x"})");
     // The relay has ended (its lease is back) before the owner is looked up, so a late forget
     // cannot be missed.
@@ -1296,6 +1336,27 @@ void owner_map_is_bounded() {
     (void)second;
 }
 
+void owner_map_covers_every_models_store() {
+    // The map is sized from what each model is configured to store, not from a single option: a
+    // model with a larger store must not have its owners pushed out by a smaller one's bound.
+    FakeResponses store;
+    Rig rig({{.id = "a", .store_records = 3}, {.id = "b", .store_records = 1}}, {}, false,
+            [&](const std::string& id, Upstream& upstream) { install_responses(id, upstream, store); });
+    expect(rig.registry->response_store_records() == 4, "the bound is the sum of the stores");
+    std::vector<std::string> ids;
+    for (int i = 0; i < 3; ++i) {
+        ids.push_back(post(rig, "/v1/responses", R"({"model":"a","input":"x"})").json.value("id", ""));
+    }
+    post(rig, "/v1/chat/completions", R"({"model":"b"})");
+    for (const std::string& id : ids) {
+        const std::size_t a_calls = rig.up("a").count();
+        expect(!id.empty() && get(rig, "/v1/responses/" + id).status == 200 &&
+                   rig.up("a").count() == a_calls + 1,
+               "all of a larger store's ids still have their owner");
+        post(rig, "/v1/chat/completions", R"({"model":"b"})");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1316,6 +1377,7 @@ int main() {
         response_owner_bookkeeping();
         responses_follow_up_the_owning_model();
         owner_map_is_bounded();
+        owner_map_covers_every_models_store();
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
         return 1;
