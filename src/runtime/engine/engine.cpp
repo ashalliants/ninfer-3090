@@ -439,6 +439,10 @@ public:
     // so they must outlive it.
     std::unique_ptr<runtime::ContextStore> store;
     std::string store_binding;
+    // The moment the start-up restore budget runs out, fixed when open_context_store() begins the
+    // bucket refresh: one absolute cutoff covers the refresh and the restore, however long the gap
+    // between them is.
+    std::chrono::steady_clock::time_point startup_deadline{};
     std::uint64_t restored_sessions = 0;
     std::uint64_t restored_bytes    = 0;
     std::uint64_t foreign_images    = 0;
@@ -675,7 +679,8 @@ private:
         if (config.remote) {
             // Images other engines left in the bucket are known before the first request, which
             // can then find its session there. Only the manifests are read, not the sessions.
-            (void)store->refresh_remote(std::chrono::steady_clock::now() + config.restore_budget);
+            startup_deadline = std::chrono::steady_clock::now() + config.restore_budget;
+            (void)store->refresh_remote(startup_deadline);
         }
     }
 
@@ -723,7 +728,10 @@ private:
         const auto started = std::chrono::steady_clock::now();
         try {
             with_generation([&](auto& generation) {
-                const auto deadline = started + options.context_store.restore_budget;
+                // Without a bucket there was no refresh, and the budget starts here.
+                const auto deadline = options.context_store.remote
+                                          ? startup_deadline
+                                          : started + options.context_store.restore_budget;
                 auto images         = store->list();
                 // By value when not everything fits: shared prefixes first (each serves every
                 // conversation that starts with it), then conversations by recomputation time
@@ -766,9 +774,10 @@ private:
                     if (info.image_bytes > generation.free_host_bytes()) { continue; }
                     const auto read_started = std::chrono::steady_clock::now();
                     // One buffer serves every image restored: each read reuses the last one's.
-                    std::optional<std::vector<std::uint8_t>> bytes = store->load(
-                        info.id, false, nullptr, std::chrono::steady_clock::time_point::max(),
-                        std::move(spare));
+                    // The deadline reaches the bucket too: a chunk the directory lacks (a repair)
+                    // is abandoned at the end of the budget, not waited for.
+                    std::optional<std::vector<std::uint8_t>> bytes =
+                        store->load(info.id, false, nullptr, deadline, std::move(spare));
                     if (!bytes) { continue; }
                     const auto read_ns = static_cast<std::uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
