@@ -2440,12 +2440,16 @@ ContextStore::FetchStatus ContextStore::fetch_image_chunks(
             try {
                 // Whichever form an engine uploaded; the form this store writes is tried first.
                 for (const bool form : {options_.compress_chunks, !options_.compress_chunks}) {
-                    data = options_.remote->get(remote_chunk_key(chunk.hash, form));
+                    data = options_.remote->get_before(remote_chunk_key(chunk.hash, form), deadline);
                     if (data) {
                         compressed = form;
                         break;
                     }
                 }
+            } catch (const DeadlineExceeded&) {
+                // The transfer was abandoned at the deadline: a miss, not a failed bucket.
+                expired = true;
+                return;
             } catch (const std::exception&) {
                 std::scoped_lock lock(mutex_);
                 ++stats_.remote_download_failures;
@@ -2590,7 +2594,7 @@ ContextStore::listing_since(std::chrono::steady_clock::time_point asked,
     } finish{*this, started};
     auto listing       = std::make_shared<Listing>();
     listing->listed_at = started;
-    listing->objects   = options_.remote->list(options_.remote_prefix + "manifests/");
+    listing->objects   = options_.remote->list_before(options_.remote_prefix + "manifests/", deadline);
     std::scoped_lock published(listing_mutex_);
     latest_listing_ = listing; // one listing at a time: this is the newest
     return listing;
@@ -2608,7 +2612,8 @@ std::string ContextStore::listed_id(const std::string& key) const {
 }
 
 bool ContextStore::register_remote_image(const ObjectInfo& object, const std::string& id,
-                                         std::chrono::steady_clock::time_point listed_at) {
+                                         std::chrono::steady_clock::time_point listed_at,
+                                         std::chrono::steady_clock::time_point deadline) {
     {
         std::scoped_lock lock(mutex_);
         if (entries_.find(id) != entries_.end()) { return false; }
@@ -2623,7 +2628,8 @@ bool ContextStore::register_remote_image(const ObjectInfo& object, const std::st
             remote_failed_.erase(failed);
         }
     }
-    const std::optional<std::vector<std::uint8_t>> data = options_.remote->get(object.key);
+    const std::optional<std::vector<std::uint8_t>> data =
+        options_.remote->get_before(object.key, deadline);
     if (!data) {
         // Listed but gone by the time it was read (deleted, or expired, since the listing).
         std::scoped_lock lock(mutex_);
@@ -2694,12 +2700,14 @@ ContextStore::lookup_remote(std::chrono::steady_clock::time_point asked,
             const std::string id = listed_id(object.key);
             if (id.empty() || !wanted(id)) { continue; }
             if (std::chrono::steady_clock::now() < deadline &&
-                register_remote_image(object, id, listing->listed_at)) {
+                register_remote_image(object, id, listing->listed_at, deadline)) {
                 ++result.registered;
             }
             std::scoped_lock lock(mutex_);
             if (entries_.find(id) != entries_.end()) { ++result.held; }
         }
+    } catch (const DeadlineExceeded&) {
+        // Out of time, not a bucket failure: the lookup returns what it found.
     } catch (const std::exception&) {
         std::scoped_lock lock(mutex_);
         ++stats_.remote_download_failures;
@@ -2728,7 +2736,7 @@ std::size_t ContextStore::refresh_remote_locked(std::chrono::steady_clock::time_
             const std::string id = listed_id(object.key);
             if (id.empty()) { continue; }
             listed.insert(id);
-            if (register_remote_image(object, id, listing->listed_at)) { ++added; }
+            if (register_remote_image(object, id, listing->listed_at, deadline)) { ++added; }
         }
         // An image the bucket no longer lists (expired, or removed by someone) is not offered
         // from the index any more, unless the directory still holds some of it.
@@ -2756,6 +2764,9 @@ std::size_t ContextStore::refresh_remote_locked(std::chrono::steady_clock::time_
         for (const std::string& id : gone) { remove_entry_locked(id, false); }
         stats_.remote_removed += gone.size();
         ++stats_.remote_refreshes;
+    } catch (const DeadlineExceeded&) {
+        // Out of time in the middle of the listing or a manifest: incomplete, so nothing was
+        // proved gone (that step is after this), and the next refresh does the rest.
     } catch (const std::exception&) {
         std::scoped_lock lock(mutex_);
         ++stats_.remote_download_failures;

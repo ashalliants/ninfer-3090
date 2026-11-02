@@ -7,6 +7,7 @@
 #include "product/object_store/s3_object_store.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -98,6 +99,22 @@ private:
             }
             buffer.erase(0, end + 4 + body);
             ++requests;
+            if (head.find("stall") != std::string::npos) {
+                // Accepts the request and never answers, until the client gives up.
+                while (::recv(socket, data, sizeof(data), 0) > 0) {}
+                return;
+            }
+            if (head.find("trickle") != std::string::npos) {
+                // Answers forever at 20 KB/s: far above the stall limit of 1 KiB/s, so only a
+                // total time limit ends it.
+                const std::string start = "HTTP/1.1 200 OK\r\nContent-Length: 100000000\r\n\r\n";
+                if (::send(socket, start.data(), start.size(), MSG_NOSIGNAL) < 0) { return; }
+                const std::string piece(2000, 'x');
+                for (;;) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    if (::send(socket, piece.data(), piece.size(), MSG_NOSIGNAL) < 0) { return; }
+                }
+            }
             const bool flaky = head.find("flaky") != std::string::npos && !flaked_.exchange(true);
             const bool is_head = head.rfind("HEAD ", 0) == 0;
             const std::string reply =
@@ -113,6 +130,44 @@ private:
     std::thread acceptor_;
     std::vector<std::pair<int, std::thread>> connections_; // acceptor thread only, until join
 };
+
+// A call with a deadline ends at it, whether the server never answers or answers too slowly to
+// trip the stall limit, and is not retried past it; a call without one is not limited.
+void test_calls_end_at_their_deadline() {
+    LocalServer server;
+    S3Config config;
+    config.endpoint   = server.endpoint();
+    config.bucket     = "bucket";
+    config.access_key = "test";
+    config.secret_key = "test";
+    auto store        = ninfer::product::make_s3_object_store(config);
+    const auto timed = [](auto&& call) {
+        const auto started = std::chrono::steady_clock::now();
+        bool exceeded      = false;
+        try {
+            call();
+        } catch (const ninfer::DeadlineExceeded&) { exceeded = true; }
+        const double seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        return std::make_pair(exceeded, seconds);
+    };
+    const auto soon = [] { return std::chrono::steady_clock::now() + std::chrono::milliseconds(400); };
+    for (const char* key : {"probe/stall", "probe/trickle"}) {
+        const auto [get_exceeded, get_seconds] = timed([&] { (void)store->get_before(key, soon()); });
+        check(get_exceeded && get_seconds < 5.0, "a get did not end at its deadline");
+        const auto [list_exceeded, list_seconds] = timed([&] { (void)store->list_before(key, soon()); });
+        check(list_exceeded && list_seconds < 5.0, "a listing did not end at its deadline");
+    }
+    // A deadline already past fails without a request.
+    const int requests = server.requests;
+    const auto [past_exceeded, past_seconds] = timed([&] {
+        (void)store->get_before("probe/x", std::chrono::steady_clock::now() - std::chrono::seconds(1));
+    });
+    check(past_exceeded && server.requests == requests, "a deadline already past still sent a request");
+    // Room to finish: the call completes normally.
+    const auto got = store->get_before("probe/ok", std::chrono::steady_clock::now() + std::chrono::seconds(30));
+    check(got && got->size() == 5, "a get with time to spare failed");
+}
 
 // Calls on one thread reuse one connection; a retry after a 5xx answer starts on a new one, as each
 // attempt did before handles were kept.
@@ -161,6 +216,7 @@ int main(int, char**) {
     check(ninfer::product::parse_s3_timestamp_ms("not a time") == -1, "S3 timestamp garbage");
 #ifndef _WIN32
     test_connections_are_reused();
+    test_calls_end_at_their_deadline();
 #endif
     const char* endpoint = std::getenv("NINFER_TEST_S3_ENDPOINT");
     const char* bucket   = std::getenv("NINFER_TEST_S3_BUCKET");

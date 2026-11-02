@@ -19,8 +19,10 @@ struct S3Config {
     std::string secret_key;
     std::string session_token; // optional, for temporary credentials
     std::chrono::seconds connect_timeout{10};
-    // A transfer that moves less than 1 KiB/s for this long is abandoned; there is no total timeout,
-    // so a large chunk on a slow link still finishes.
+    // A transfer that moves less than 1 KiB/s for this long is abandoned. There is no total timeout
+    // of the store's own, so a large chunk on a slow link still finishes; a caller that must be
+    // done by a time passes it as the deadline of get_before()/list_before(), which bounds the
+    // whole request (every page of a listing, and the retries).
     std::chrono::seconds stall_timeout{60};
     int attempts = 3; // per call, for connection errors and 5xx responses
 };

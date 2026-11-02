@@ -409,7 +409,12 @@ public:
         ++puts;
     }
     std::optional<std::vector<std::uint8_t>> get(const std::string& key) override {
-        gate();
+        return get_before(key, Deadline::max());
+    }
+    // A held transfer is abandoned at the deadline, as a real store's would be.
+    std::optional<std::vector<std::uint8_t>> get_before(const std::string& key,
+                                                        Deadline deadline) override {
+        gate(deadline);
         // Runs what the test wants to happen while a chunk is on its way, as another request would.
         if (on_chunk_get && key.find("chunks/") != std::string::npos) { on_chunk_get(); }
         std::scoped_lock lock(mutex);
@@ -427,7 +432,10 @@ public:
         return objects.find(key) != objects.end();
     }
     std::vector<ninfer::ObjectInfo> list(const std::string& prefix) override {
-        gate();
+        return list_before(prefix, Deadline::max());
+    }
+    std::vector<ninfer::ObjectInfo> list_before(const std::string& prefix, Deadline deadline) override {
+        gate(deadline);
         std::scoped_lock lock(mutex);
         if (down) { throw std::runtime_error("the bucket is unreachable"); }
         ++lists;
@@ -487,12 +495,14 @@ public:
     std::atomic<int> held{0};
 
 private:
-    void gate() {
+    void gate(Deadline deadline = Deadline::max()) {
         std::unique_lock lock(gate_mutex);
         const std::uint64_t epoch = interrupt_epoch;
         ++held;
-        gate_cv.wait(lock, [&] { return !hold || interrupt_epoch != epoch; });
+        const bool released =
+            gate_cv.wait_until(lock, deadline, [&] { return !hold || interrupt_epoch != epoch; });
         --held;
+        if (!released) { throw ninfer::DeadlineExceeded(); }
         if (interrupt_epoch != epoch) { throw std::runtime_error("interrupted"); }
     }
     std::mutex gate_mutex;
@@ -1520,6 +1530,55 @@ void test_queued_upload_of_a_retired_version_is_dropped() {
     check(remote_manifests(*remote) == 0 && store.stats().remote_fenced == 1,
           "a queued upload published a retired version");
     check(store.find("a").has_value(), "the local copy of a fenced version was lost");
+}
+
+// A request to the bucket that is still going at the deadline is abandoned there, for the
+// listing, the manifests it registers and the chunks a load fetches, and is not counted as a
+// failed bucket.
+void test_remote_requests_are_abandoned_at_the_deadline() {
+    TempDirectory writer_directory;
+    TempDirectory reader_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    const auto image = concat({pseudo_random(30, 1), pseudo_random(5000, 2)});
+    {
+        ContextStore store(remote_options(writer_directory.path(), remote));
+        (void)store.put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
+        check(drained(store), "the upload did not drain");
+    }
+    const auto within = [](int milliseconds) {
+        return std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+    };
+    const auto seconds_since = [](std::chrono::steady_clock::time_point since) {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
+    };
+    ContextStore reader(remote_options(reader_directory.path(), remote));
+    // The listing hangs: the refresh returns at its deadline instead of waiting for the bucket.
+    remote->set_hold(true);
+    auto started = std::chrono::steady_clock::now();
+    check(reader.refresh_remote(within(200)) == 0, "a refresh against a hung bucket registered something");
+    check(seconds_since(started) < 5.0, "the refresh waited for a listing that never ended");
+    check(reader.stats().remote_download_failures == 0,
+          "running out of time was counted as a bucket failure");
+    remote->set_hold(false);
+    check(reader.refresh_remote(within(10'000)) == 1, "the next refresh did not register the image");
+    // A chunk hangs: the load is a miss at its deadline, the image stays offered.
+    remote->set_hold(true);
+    ContextStore::LoadReport report;
+    started = std::chrono::steady_clock::now();
+    const auto missed = reader.load("0a", true, &report, within(200));
+    check(!missed && report.expired && seconds_since(started) < 5.0,
+          "a load did not stop at its deadline with a chunk in flight");
+    check(reader.stats().remote_download_failures == 0 && reader.find("0a").has_value(),
+          "an expired load counted a failure or dropped the image");
+    remote->set_hold(false);
+    const auto loaded = reader.load("0a");
+    check(loaded && *loaded == image, "the image could not be loaded after an expired attempt");
+    // A lookup that is out of time returns what it has.
+    remote->set_hold(true);
+    started = std::chrono::steady_clock::now();
+    const auto lookup = reader.lookup_remote(started, within(200), [](const std::string&) { return true; });
+    check(lookup.registered == 0 && seconds_since(started) < 5.0, "a lookup waited past its deadline");
+    remote->set_hold(false);
 }
 
 void test_remote_survives_local_eviction() {
@@ -3293,6 +3352,7 @@ int main() {
     test_repair_does_not_republish_a_retired_manifest();
     test_touch_does_not_refresh_a_present_retired_manifest();
     test_queued_upload_of_a_retired_version_is_dropped();
+    test_remote_requests_are_abandoned_at_the_deadline();
     test_remote_damage_and_outage_are_misses();
     test_remote_use_restarts_the_remote_age();
     test_remote_refresh_respects_its_deadline();

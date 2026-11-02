@@ -766,9 +766,10 @@ private:
                     if (info.image_bytes > generation.free_host_bytes()) { continue; }
                     const auto read_started = std::chrono::steady_clock::now();
                     // One buffer serves every image restored: each read reuses the last one's.
-                    std::optional<std::vector<std::uint8_t>> bytes = store->load(
-                        info.id, false, nullptr, std::chrono::steady_clock::time_point::max(),
-                        std::move(spare));
+                    // The deadline reaches the bucket too: a chunk the directory lacks (a repair)
+                    // is abandoned at the end of the budget, not waited for.
+                    std::optional<std::vector<std::uint8_t>> bytes =
+                        store->load(info.id, false, nullptr, deadline, std::move(spare));
                     if (!bytes) { continue; }
                     const auto read_ns = static_cast<std::uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(

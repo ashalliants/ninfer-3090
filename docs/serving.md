@@ -454,6 +454,10 @@ the most recently used first among equals. A deep conversation therefore goes be
 that would fill the same room, and what does not fit stays in the store for hydration. Nothing is evicted for them. A request then reuses a restored
 conversation exactly as it would have before the restart, restoring it from the Host tier to the
 GPU like any other Host-resident checkpoint. There is nothing for a supervisor or gateway to call.
+With a bucket the same budget bounds the requests to it: the listing, each manifest read and each
+chunk repair are abandoned when it runs out (the whole request, not only a stalled one), so a slow
+bucket cannot hold start-up past `--context-store-restore-seconds`. Running out of time is not
+counted as a bucket failure; the next refresh reads what was left.
 
 The store is also read while the server runs. When a request is about to be admitted and the store
 holds a checkpoint of that very prompt deeper than the deepest checkpoint the cache offers it (the

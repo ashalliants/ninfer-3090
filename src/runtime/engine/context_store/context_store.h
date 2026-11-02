@@ -249,7 +249,8 @@ public:
         std::uint64_t fetch_ns      = 0;
         bool expired                = false;
     };
-    // `deadline` bounds the download from the bucket: no chunk is started after it. `reuse`, when
+    // `deadline` bounds the download from the bucket: no chunk is started after it, and a chunk
+    // in flight is abandoned at it. `reuse`, when
     // given, holds the image (an earlier image's buffer: its pages are mapped already, so the
     // read does not fault them in); its old bytes are all overwritten.
     [[nodiscard]] std::optional<std::vector<std::uint8_t>>
@@ -293,7 +294,8 @@ public:
     // With a remote: lists the bucket and registers images other engines left there that this
     // store does not hold. Also done in the background every remote_refresh. Returns the number of
     // images added. Stops reading manifests at `deadline`, waiting for another refresh counted; an
-    // incomplete listing never removes anything from the index.
+    // incomplete listing never removes anything from the index. A listing or manifest read that
+    // is still going at `deadline` is abandoned, not waited for, and is not a bucket failure.
     std::size_t refresh_remote(std::chrono::steady_clock::time_point deadline =
                                    std::chrono::steady_clock::time_point::max());
     // For a request that found nothing: registers only the images the bucket lists, as of `asked`
@@ -610,8 +612,11 @@ private:
     [[nodiscard]] std::string listed_id(const std::string& key) const;
     // Downloads a manifest that a listing asked for at `listed_at` showed and adds its image to the
     // index, unless the index holds it or the id is given up on. True when it was added.
+    // The download of the manifest stops at `deadline` (DeadlineExceeded).
     bool register_remote_image(const ObjectInfo& object, const std::string& id,
-                               std::chrono::steady_clock::time_point listed_at);
+                               std::chrono::steady_clock::time_point listed_at,
+                               std::chrono::steady_clock::time_point deadline =
+                                   std::chrono::steady_clock::time_point::max());
     std::int64_t last_prune_ms_ = 0; // remote worker thread only
 
     // Peer import. `owner_` holds the exclusive lock on options_.directory for the store's life.
