@@ -45,13 +45,16 @@ namespace ninfer::serve {
 
 // Which model owns each stored Responses id. Every model keeps a private Responses store and an id
 // says nothing about where it was made, so the router remembers it from the create reply and sends
-// the follow-ups (GET, DELETE, cancel, input_items, previous_response_id) to that model. Bounded: the
-// least recently used id is forgotten first, and a forgotten id is routed as before (the model
-// answers not-found if it is not the one that made it). Entries outlive the model's load, as the
-// model's store does.
+// the follow-ups (GET, DELETE, cancel, input_items, previous_response_id) to that model. Bounded per
+// model, as the stores are: a model keeps at most its own limit of ids (`limit_of`, at least one) and
+// forgets its least recently used first, so one model's creates can never displace another's ids. A
+// forgotten id is routed as before (the model answers not-found if it is not the one that made it).
+// Entries outlive the model's load, as the model's store does.
 class ResponseOwners {
 public:
-    explicit ResponseOwners(std::size_t capacity) : capacity_(capacity == 0 ? 1 : capacity) {}
+    using LimitOf = std::function<std::size_t(const std::string& model)>;
+
+    explicit ResponseOwners(LimitOf limit_of) : limit_of_(std::move(limit_of)) {}
 
     void record(const std::string& id, const std::string& model);
     // The owner of `id`, counting the lookup as use.
@@ -60,12 +63,16 @@ public:
     [[nodiscard]] std::size_t size() const;
 
 private:
-    using Entry = std::pair<std::string, std::string>; // id, model
+    using Recent = std::list<std::string>; // ids of one model, most recently used first
+    struct Entry {
+        std::string model;
+        Recent::iterator position; // in recent_[model]
+    };
 
     mutable std::mutex mutex_;
-    std::size_t capacity_;
-    std::list<Entry> recent_; // most recently used first
-    std::unordered_map<std::string, std::list<Entry>::iterator> index_;
+    LimitOf limit_of_;
+    std::unordered_map<std::string, Recent> recent_;
+    std::unordered_map<std::string, Entry> index_;
 };
 
 // Finds the id of the response a Responses create reply makes, in its first bytes: the JSON body's

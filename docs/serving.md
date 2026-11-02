@@ -907,9 +907,9 @@ did not store costs a map slot and a not-found from the owner, which is what an 
 anyway. Forgetting one it did store would send the follow-ups to the wrong model. Neither is worse than
 before the map existed, and the first is bounded.
 
-The map holds as many IDs as the models can store between them: the sum of each model's
-`--response-store-max-records` (a preset section can set its own), so one model's IDs do not push out
-another's, and it forgets the least recently used first. A successful `DELETE` forgets the ID at
+The map keeps each model's IDs within that model's own `--response-store-max-records` (a preset
+section can set its own), forgetting that model's least recently used first, so one model's
+creates never push out another model's IDs. A successful `DELETE` forgets the ID at
 once. The map lasts as long as the router process, and does not depend on whether the owner is
 loaded: a follow-up for a model that was unloaded or put to sleep loads or wakes it first.
 

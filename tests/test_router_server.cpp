@@ -245,6 +245,32 @@ struct Rig {
         router = std::make_unique<RouterServer>(options, *registry, ports, nullptr);
         if (!router->bind()) { throw std::runtime_error("router could not bind"); }
         listener = std::thread([this] { router->listen(); });
+        // A throw from a constructor skips ~Rig, and destroying a joinable std::thread
+        // terminates, so stop and join the listener here before rethrowing.
+        try {
+            wait_until_accepting();
+        } catch (...) {
+            router->stop();
+            listener.join();
+            throw;
+        }
+    }
+
+    // bind() only reserves the socket; the accept loop starts on `listener` a moment later, and a
+    // request sent before then is refused. Probe /health (answered by the router itself, so it
+    // loads nothing) until the loop answers, with any status, so the first request cannot race
+    // listener startup.
+    void wait_until_accepting() const {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto probe = client();
+            // Short timeouts keep a stalled probe from outlasting the deadline.
+            probe.set_connection_timeout(0, 200000);
+            probe.set_read_timeout(0, 200000);
+            if (probe.Get("/health")) { return; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        throw std::runtime_error("router did not start accepting connections");
     }
 
     ~Rig() {
@@ -1039,25 +1065,32 @@ void install_responses(const std::string& model, Upstream& upstream, FakeRespons
 }
 
 void response_owner_bookkeeping() {
-    ResponseOwners owners(3);
+    // "a" keeps 2 ids, "b" keeps 1.
+    ResponseOwners owners([](const std::string& model) { return model == "a" ? 2u : 1u; });
     owners.record("r1", "a");
     owners.record("r2", "b");
     owners.record("r3", "a");
     expect(owners.owner("r2") == "b" && owners.owner("r1") == "a", "an owner is looked up by id");
     expect(!owners.owner("nope"), "an unknown id has none");
-    // r2 was used before r1 and r3 was never looked up: r3 is now the least recently used.
-    owners.record("r4", "b");
-    expect(owners.size() == 3 && !owners.owner("r3") && owners.owner("r1") && owners.owner("r2"),
-           "the least recently used id is forgotten at capacity");
+    // r1 was used after r3 was made: r3 is now a's least recently used.
+    owners.record("r4", "a");
+    expect(owners.size() == 3 && !owners.owner("r3") && owners.owner("r1") == "a" &&
+               owners.owner("r4") == "a" && owners.owner("r2") == "b",
+           "a model's least recently used id is forgotten at its own limit");
+    owners.record("r5", "b");
+    expect(owners.size() == 3 && !owners.owner("r2") && owners.owner("r5") == "b" &&
+               owners.owner("r1") && owners.owner("r4"),
+           "a model at its limit forgets only its own ids");
     owners.record("r1", "b");
-    expect(owners.owner("r1") == "b" && owners.size() == 3, "recording an id again updates it");
+    expect(owners.owner("r1") == "b" && !owners.owner("r5") && owners.size() == 2,
+           "recording an id again moves it to its new owner, within that owner's limit");
     owners.forget("r1");
     owners.forget("r1");
-    expect(!owners.owner("r1") && owners.size() == 2, "forgetting is idempotent");
-    ResponseOwners tiny(0);
+    expect(!owners.owner("r1") && owners.size() == 1, "forgetting is idempotent");
+    ResponseOwners tiny([](const std::string&) { return std::size_t{0}; });
     tiny.record("x", "a");
     tiny.record("y", "a");
-    expect(tiny.size() == 1 && tiny.owner("y"), "a capacity of zero still keeps one");
+    expect(tiny.size() == 1 && tiny.owner("y"), "a limit of zero still keeps one");
 
     const std::string body = R"({"access_programs":null,"id":"resp_0123abcd","object":"response"})";
     ResponseIdScanner whole;
@@ -1336,24 +1369,43 @@ void owner_map_is_bounded() {
     (void)second;
 }
 
-void owner_map_covers_every_models_store() {
-    // The map is sized from what each model is configured to store, not from a single option: a
-    // model with a larger store must not have its owners pushed out by a smaller one's bound.
+void owner_map_keeps_each_models_quota() {
+    // Each model has its own bound, so a busy model cannot push out another model's ids: a keeps 2,
+    // b keeps 3, and b creating many leaves a's alone.
     FakeResponses store;
-    Rig rig({{.id = "a", .store_records = 3}, {.id = "b", .store_records = 1}}, {}, false,
+    Rig rig({{.id = "a", .store_records = 2}, {.id = "b", .store_records = 3}}, {}, false,
             [&](const std::string& id, Upstream& upstream) { install_responses(id, upstream, store); });
-    expect(rig.registry->response_store_records() == 4, "the bound is the sum of the stores");
-    std::vector<std::string> ids;
-    for (int i = 0; i < 3; ++i) {
-        ids.push_back(post(rig, "/v1/responses", R"({"model":"a","input":"x"})").json.value("id", ""));
+    expect(rig.registry->response_store_records("a") == 2u &&
+               rig.registry->response_store_records("b") == 3u &&
+               !rig.registry->response_store_records("nope"),
+           "each model has its own bound");
+    const auto make = [&](const std::string& model) {
+        return post(rig, "/v1/responses", R"({"model":")" + model + R"(","input":"x"})")
+            .json.value("id", "");
+    };
+    std::vector<std::string> a_ids;
+    for (int i = 0; i < 2; ++i) { a_ids.push_back(make("a")); }
+    std::vector<std::string> b_ids;
+    for (int i = 0; i < 8; ++i) { b_ids.push_back(make("b")); }
+    // "a" served last, so a forgotten b id would be tried there, and a forgotten a id on b.
+    const auto owned_by = [&](const std::string& id, const std::string& expected,
+                              const std::string& other) {
+        post(rig, "/v1/chat/completions", R"({"model":")" + other + R"("})");
+        const std::size_t calls = rig.up(expected).count();
+        return !id.empty() && get(rig, "/v1/responses/" + id).status == 200 &&
+               rig.up(expected).count() == calls + 1;
+    };
+    for (const std::string& id : a_ids) {
+        expect(owned_by(id, "a", "b"), "another model's creates leave an id routable");
     }
-    post(rig, "/v1/chat/completions", R"({"model":"b"})");
-    for (const std::string& id : ids) {
-        const std::size_t a_calls = rig.up("a").count();
-        expect(!id.empty() && get(rig, "/v1/responses/" + id).status == 200 &&
-                   rig.up("a").count() == a_calls + 1,
-               "all of a larger store's ids still have their owner");
-        post(rig, "/v1/chat/completions", R"({"model":"b"})");
+    for (std::size_t i = b_ids.size() - 3; i < b_ids.size(); ++i) {
+        expect(owned_by(b_ids[i], "b", "a"), "a model keeps its latest ids up to its own limit");
+    }
+    for (std::size_t i = 0; i + 3 < b_ids.size(); ++i) {
+        post(rig, "/v1/chat/completions", R"({"model":"a"})");
+        const std::size_t b_calls = rig.up("b").count();
+        expect(get(rig, "/v1/responses/" + b_ids[i]).status == 404 && rig.up("b").count() == b_calls,
+               "a model forgets its older ids beyond its limit (routed by default to a)");
     }
 }
 
@@ -1377,7 +1429,7 @@ int main() {
         response_owner_bookkeeping();
         responses_follow_up_the_owning_model();
         owner_map_is_bounded();
-        owner_map_covers_every_models_store();
+        owner_map_keeps_each_models_quota();
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
         return 1;

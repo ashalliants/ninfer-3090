@@ -302,15 +302,17 @@ bool create_stores(const std::optional<Json>& body) {
 void ResponseOwners::record(const std::string& id, const std::string& model) {
     std::lock_guard lock(mutex_);
     if (const auto found = index_.find(id); found != index_.end()) {
-        found->second->second = model;
-        recent_.splice(recent_.begin(), recent_, found->second);
-        return;
+        // Made again (by this or another model): it moves to the front of its new owner's list.
+        recent_[found->second.model].erase(found->second.position);
+        index_.erase(found);
     }
-    recent_.emplace_front(id, model);
-    index_[id] = recent_.begin();
-    while (recent_.size() > capacity_) {
-        index_.erase(recent_.back().first);
-        recent_.pop_back();
+    Recent& mine = recent_[model];
+    mine.push_front(id);
+    index_[id]              = Entry{model, mine.begin()};
+    const std::size_t limit = std::max<std::size_t>(limit_of_(model), 1);
+    while (mine.size() > limit) {
+        index_.erase(mine.back());
+        mine.pop_back();
     }
 }
 
@@ -318,21 +320,22 @@ std::optional<std::string> ResponseOwners::owner(const std::string& id) {
     std::lock_guard lock(mutex_);
     const auto found = index_.find(id);
     if (found == index_.end()) { return std::nullopt; }
-    recent_.splice(recent_.begin(), recent_, found->second);
-    return found->second->second;
+    Recent& mine = recent_[found->second.model];
+    mine.splice(mine.begin(), mine, found->second.position);
+    return found->second.model;
 }
 
 void ResponseOwners::forget(const std::string& id) {
     std::lock_guard lock(mutex_);
     const auto found = index_.find(id);
     if (found == index_.end()) { return; }
-    recent_.erase(found->second);
+    recent_[found->second.model].erase(found->second.position);
     index_.erase(found);
 }
 
 std::size_t ResponseOwners::size() const {
     std::lock_guard lock(mutex_);
-    return recent_.size();
+    return index_.size();
 }
 
 void ResponseIdScanner::feed(std::string_view data) {
@@ -388,7 +391,12 @@ RouterServer::RouterServer(ServeOptions options, ModelRegistry& registry,
                            std::shared_ptr<spdlog::logger> logger)
     : options_(std::move(options)), registry_(registry), ports_(std::move(ports)),
       logger_(std::move(logger)),
-      response_owners_(registry.response_store_records()) {
+      response_owners_([this](const std::string& model) {
+          // A model the registry does not know cannot come from a lease; the router-wide option is
+          // the safe answer.
+          return registry_.response_store_records(model)
+              .value_or(options_.response_store_max_records);
+      }) {
     // cpp-httplib is thread-per-connection, and a relayed request holds a router worker for as long
     // as its model holds the matching worker of its own server.
     constexpr std::size_t kBaseWorkers = 32;
