@@ -524,7 +524,11 @@ private:
     // it from there. A version is named by the id and the created_ms inside the manifest, so an
     // id written again later (a new version) is not fenced.
     [[nodiscard]] std::string remote_tombstone_key(const std::string& id, std::int64_t created_ms) const;
-    [[nodiscard]] bool remote_fenced(const std::string& id, std::int64_t created_ms);
+    // A check against the bucket: with a deadline it throws DeadlineExceeded when the bucket does
+    // not answer by then, which is not an answer (the caller must not treat it as "not fenced").
+    [[nodiscard]] bool remote_fenced(
+        const std::string& id, std::int64_t created_ms,
+        std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max());
     void unpin_chunks_locked(const std::vector<ChunkRef>& chunks);
     void remote_loop();
     void upload_image(RemoteTask& task);

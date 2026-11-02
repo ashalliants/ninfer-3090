@@ -428,7 +428,12 @@ public:
         return found->second.first;
     }
     bool exists(const std::string& key) override {
-        gate();
+        return exists_before(key, Deadline::max());
+    }
+    bool exists_before(const std::string& key, Deadline deadline) override {
+        // Lets a test hold a tombstone check after the manifest has been read.
+        if (on_exists && key.find("tombstones/") != std::string::npos) { on_exists(); }
+        gate(deadline);
         std::scoped_lock lock(mutex);
         if (down) { throw std::runtime_error("the bucket is unreachable"); }
         return objects.find(key) != objects.end();
@@ -494,6 +499,7 @@ public:
     // Set while the store is idle; called on the store's fetch threads.
     std::function<void()> on_chunk_get;
     std::function<void()> on_manifest_get;
+    std::function<void()> on_exists;
     // Transfers waiting at the gate now (set_hold).
     std::atomic<int> held{0};
 
@@ -1583,6 +1589,23 @@ void test_remote_requests_are_abandoned_at_the_deadline() {
     remote->set_hold(false);
     check(reader.stats().remote_download_failures == 0 && !reader.find("0a").has_value(),
           "an expired manifest read counted a failure or registered the image");
+    // The manifest arrives and the tombstone check hangs: out of time, the image is not registered
+    // (it may be retired) and not given up on, so the next refresh registers it.
+    remote->on_exists = [&] { remote->set_hold(true); };
+    started = std::chrono::steady_clock::now();
+    check(reader.refresh_remote(within(200)) == 0, "a refresh registered an image whose fence check never came");
+    check(seconds_since(started) < 5.0, "the refresh waited for a tombstone check past its deadline");
+    remote->set_hold(false);
+    started = std::chrono::steady_clock::now();
+    const auto fence_lookup =
+        reader.lookup_remote(started, within(200), [](const std::string&) { return true; });
+    check(fence_lookup.registered == 0 && seconds_since(started) < 5.0,
+          "a lookup waited for a tombstone check past its deadline");
+    remote->on_exists = nullptr;
+    remote->set_hold(false);
+    check(reader.stats().remote_download_failures == 0 && reader.stats().remote_fenced == 0 &&
+              !reader.find("0a").has_value(),
+          "an expired tombstone check counted a failure or fence, or registered the image");
     check(reader.refresh_remote(within(10'000)) == 1, "the next refresh did not register the image");
     // A chunk hangs: the load is a miss at its deadline, the image stays offered.
     remote->set_hold(true);

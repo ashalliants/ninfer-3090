@@ -158,6 +158,9 @@ void test_calls_end_at_their_deadline() {
         const auto [list_exceeded, list_seconds] = timed([&] { (void)store->list_before(key, soon()); });
         check(list_exceeded && list_seconds < 5.0, "a listing did not end at its deadline");
     }
+    // A HEAD has no body to trickle, so only a server that never answers can hold it.
+    const auto [head_exceeded, head_seconds] = timed([&] { (void)store->exists_before("probe/stall", soon()); });
+    check(head_exceeded && head_seconds < 5.0, "an existence check did not end at its deadline");
     // A deadline already past fails without a request.
     const int requests = server.requests;
     const auto [past_exceeded, past_seconds] = timed([&] {

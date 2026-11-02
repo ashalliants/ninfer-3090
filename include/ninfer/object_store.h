@@ -44,6 +44,12 @@ public:
         return get(key);
     }
     [[nodiscard]] virtual bool exists(const std::string& key) = 0;
+    // As exists(), but gives up with DeadlineExceeded when the request is not over by `deadline`
+    // (a store that cannot abandon one may only check before it starts, like get_before()).
+    [[nodiscard]] virtual bool exists_before(const std::string& key, Deadline deadline) {
+        if (std::chrono::steady_clock::now() >= deadline) { throw DeadlineExceeded(); }
+        return exists(key);
+    }
     // Every object whose key starts with `prefix`, in no particular order.
     [[nodiscard]] virtual std::vector<ObjectInfo> list(const std::string& prefix) = 0;
     // As list(), with `deadline` for the whole listing (every page); never a partial result.

@@ -196,7 +196,11 @@ public:
     }
 
     bool exists(const std::string& key) override {
-        Response response = send("HEAD", object_url(key), {}, {}, false);
+        return exists_before(key, Deadline::max());
+    }
+
+    bool exists_before(const std::string& key, Deadline deadline) override {
+        Response response = send("HEAD", object_url(key), {}, {}, false, deadline);
         if (response.status == 404) { return false; }
         require_success(response, "head " + key);
         return true;

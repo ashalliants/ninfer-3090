@@ -1839,8 +1839,9 @@ std::string ContextStore::remote_tombstone_key(const std::string& id, std::int64
     return options_.remote_prefix + "tombstones/" + id + "." + std::to_string(created_ms);
 }
 
-bool ContextStore::remote_fenced(const std::string& id, std::int64_t created_ms) {
-    return options_.remote->exists(remote_tombstone_key(id, created_ms));
+bool ContextStore::remote_fenced(const std::string& id, std::int64_t created_ms,
+                                 std::chrono::steady_clock::time_point deadline) {
+    return options_.remote->exists_before(remote_tombstone_key(id, created_ms), deadline);
 }
 
 std::string ContextStore::remote_chunk_key(const std::array<std::uint64_t, 2>& hash,
@@ -2653,7 +2654,10 @@ bool ContextStore::register_remote_image(const ObjectInfo& object, const std::st
         remote_failed_[id] = {object.modified_ms, now_ms()};
         return false;
     }
-    if (remote_fenced(id, entry.info.created_ms)) {
+    // Out of time here (DeadlineExceeded) registers nothing and marks nothing failed, so the next
+    // lookup or refresh checks again: failing closed, never registering a version that may be
+    // retired.
+    if (remote_fenced(id, entry.info.created_ms, deadline)) {
         // A newer write of the conversation retired this version, and something put it back (an
         // engine's repair, or an upload that was queued): skipped until the bucket lists the
         // manifest as written again.
