@@ -286,6 +286,14 @@ bool is_json_content_type(std::string_view content_type) {
     return lower_ascii(std::string(content_type)).find("json") != std::string::npos;
 }
 
+namespace {
+// Whether a Responses create asks for "store": false, so no model keeps the response.
+bool stores_nothing(const Json& body) {
+    const auto store = body.find("store");
+    return store != body.end() && store->is_boolean() && !store->get<bool>();
+}
+} // namespace
+
 void ResponseOwners::record(const std::string& id, const std::string& model) {
     std::lock_guard lock(mutex_);
     if (const auto found = index_.find(id); found != index_.end()) {
@@ -327,6 +335,7 @@ void ResponseIdScanner::feed(std::string_view data) {
     // bounded prefix is enough; a reply that gives none in it is left unrecorded.
     constexpr std::size_t kScanBytes = 64 * 1024;
     constexpr std::string_view key   = "\"id\":\"resp_";
+    note_failure(data);
     if (id_ || seen_.size() >= kScanBytes) { return; }
     seen_.append(data.substr(0, kScanBytes - seen_.size()));
     const std::size_t at = seen_.find(key, resume_);
@@ -343,6 +352,17 @@ void ResponseIdScanner::feed(std::string_view data) {
         return;
     }
     id_ = seen_.substr(begin, end - begin);
+}
+
+void ResponseIdScanner::note_failure(std::string_view data) {
+    // An SSE stream that ends in a failure event was not stored, whatever id it announced first.
+    // At the start of a line: in a JSON body, newlines inside strings are escaped, so quoted text
+    // cannot pass for the event.
+    constexpr std::string_view event = "\nevent: response.failed";
+    if (failed_) { return; }
+    tail_.append(data);
+    failed_ = tail_.find(event) != std::string::npos;
+    if (tail_.size() >= event.size()) { tail_.erase(0, tail_.size() - (event.size() - 1)); }
 }
 
 std::optional<std::string> response_id_from_path(std::string_view path) {
@@ -720,7 +740,8 @@ void RouterServer::route(const httplib::Request& req, httplib::Response& res) {
         std::optional<std::string> owner;
         if (response_id) {
             owner = response_owners_.owner(*response_id);
-        } else if (body && req.method == "POST" && req.path == "/v1/responses") {
+        } else if (body && req.method == "POST" &&
+                   (req.path == "/v1/responses" || req.path == "/v1/responses/input_tokens")) {
             const auto previous = body->find("previous_response_id");
             if (previous != body->end() && previous->is_string()) {
                 owner = response_owners_.owner(previous->get<std::string>());
@@ -755,17 +776,26 @@ void RouterServer::route(const httplib::Request& req, httplib::Response& res) {
         }
     }
     // A create's reply tells which model made the response; the follow-ups need it.
+    // A create with "store": false is kept nowhere, so it has no owner to remember.
     Tap tap;
-    if (req.method == "POST" && req.path == "/v1/responses") {
-        tap = [this, model = lease.model(), scanner = std::make_shared<ResponseIdScanner>()](
-                  std::string_view data) {
-            if (scanner->id()) { return; }
+    Done done;
+    if (req.method == "POST" && req.path == "/v1/responses" && !(body && stores_nothing(*body))) {
+        auto scanner = std::make_shared<ResponseIdScanner>();
+        tap          = [this, model = lease.model(), scanner](std::string_view data) {
+            const bool known = scanner->id().has_value();
             scanner->feed(data);
-            if (scanner->id()) { response_owners_.record(*scanner->id(), model); }
+            if (!known && scanner->id()) { response_owners_.record(*scanner->id(), model); }
+        };
+        // The id of a stream is out in its first event, before the model has stored anything: one
+        // that fails or is cut off was never stored, so its provisional owner goes again.
+        done = [this, scanner](bool finished) {
+            if (scanner->id() && (!finished || scanner->failed())) {
+                response_owners_.forget(*scanner->id());
+            }
         };
     }
     relay(req, res, std::move(lease), req.method, without_model_param(req.target),
-          std::move(payload), std::move(tap));
+          std::move(payload), std::move(tap), std::move(done));
     // Gone from the model's store, so no longer anyone's.
     if (response_id && req.method == "DELETE" && res.status / 100 == 2) {
         response_owners_.forget(*response_id);
@@ -783,7 +813,7 @@ void RouterServer::route_status(const httplib::Request& req, httplib::Response& 
 
 void RouterServer::relay(const httplib::Request& req, httplib::Response& res,
                          ModelRegistry::Lease lease, const std::string& method,
-                         const std::string& target, std::string body, Tap tap) {
+                         const std::string& target, std::string body, Tap tap, Done done) {
     const auto port = ports_->get(lease.model());
     if (!port) {
         write_error(req, res, 503, "model_not_loaded",
@@ -839,10 +869,12 @@ void RouterServer::relay(const httplib::Request& req, httplib::Response& res,
         relayed->changed.notify_all();
         return true;
     };
-    relayed->worker = std::thread([relayed, request = std::move(upstream)]() mutable {
+    relayed->worker = std::thread([relayed, done = std::move(done),
+                                   request = std::move(upstream)]() mutable {
         httplib::Response response;
         httplib::Error error = httplib::Error::Success;
         const bool ok        = relayed->client->send(request, response, error);
+        if (done) { done(ok); }
         std::lock_guard lock(relayed->mutex);
         // The client calls response_handler only while processing a body, so a HEAD response (and
         // any other without one) reaches here with its status and headers still unrecorded.

@@ -888,6 +888,17 @@ struct FakeResponses {
     std::mutex mutex;
     std::map<std::string, std::string> owner; // id -> model
     std::atomic<int> next{0};
+    std::string last; // the id of the latest create, stored or not
+
+    void note_created(const std::string& id) {
+        std::lock_guard lock(mutex);
+        last = id;
+    }
+
+    [[nodiscard]] std::string last_created() {
+        std::lock_guard lock(mutex);
+        return last;
+    }
 
     void add(const std::string& id, const std::string& model) {
         std::lock_guard lock(mutex);
@@ -929,8 +940,30 @@ void install_responses(const std::string& model, Upstream& upstream, FakeRespons
             return;
         }
         const std::string id = "resp_" + model + std::to_string(store.next++);
-        store.add(id, model);
-        if (body.is_object() && body.value("stream", false)) {
+        // A create with store:false, or a stream that fails or is cut off, keeps nothing.
+        store.note_created(id);
+        const bool streamed = body.is_object() && body.value("stream", false);
+        const bool broken   = body.is_object() && (body.value("fail_stream", false) ||
+                                                 body.value("abort_stream", false));
+        if (!(body.is_object() && body.value("store", true) == false) && !broken) {
+            store.add(id, model);
+        }
+        if (streamed && broken) {
+            const std::string created = "event: response.created\ndata: {\"response\":{\"id\":\"" +
+                                        id + "\"},\"type\":\"response.created\"}\n\n";
+            const bool abort = body.value("abort_stream", false);
+            res.set_chunked_content_provider(
+                "text/event-stream", [created, abort, step = 0](size_t, httplib::DataSink& sink) mutable {
+                    if (step++ == 0) { return sink.write(created.data(), created.size()); }
+                    if (abort) { return false; } // the connection drops mid-stream
+                    const std::string failed = "event: response.failed\ndata: {}\n\n";
+                    if (step == 2) { return sink.write(failed.data(), failed.size()); }
+                    sink.done();
+                    return true;
+                });
+            return;
+        }
+        if (streamed) {
             // The id is split across two writes.
             const std::string first = "event: response.created\ndata: {\"response\":{\"id\":\"" +
                                       id.substr(0, 7);
@@ -953,6 +986,19 @@ void install_responses(const std::string& model, Upstream& upstream, FakeRespons
             return;
         }
         res.set_content(Json{{"id", id}, {"object", "response"}, {"served_by", model}}.dump(),
+                        "application/json");
+    });
+    upstream.server.Post("/v1/responses/input_tokens", [&upstream, &store, model](
+                                                           const httplib::Request& req,
+                                                           httplib::Response& res) {
+        upstream.note(req);
+        const Json body = Json::parse(req.body, nullptr, /*allow_exceptions=*/false);
+        if (body.is_object() && body.contains("previous_response_id") &&
+            !store.owned(body["previous_response_id"].get<std::string>(), model)) {
+            respond_not_found(res);
+            return;
+        }
+        res.set_content(Json{{"object", "response.input_tokens"}, {"served_by", model}}.dump(),
                         "application/json");
     });
     const auto lookup = [&upstream, &store, model](const httplib::Request& req,
@@ -1008,6 +1054,22 @@ void response_owner_bookkeeping() {
         expect(scanner.id() == "resp_0123abcd",
                "the id is found across pieces of " + std::to_string(piece));
     }
+    const std::string stream =
+        "event: response.created\ndata: {\"response\":{\"id\":\"resp_1\"}}\n\nevent: response.failed\n";
+    for (std::size_t piece = 1; piece < stream.size(); ++piece) {
+        ResponseIdScanner scanner;
+        for (std::size_t at = 0; at < stream.size(); at += piece) {
+            scanner.feed(std::string_view(stream).substr(at, piece));
+        }
+        expect(scanner.failed() && scanner.id() == "resp_1",
+               "a failure event is found across pieces of " + std::to_string(piece));
+    }
+    ResponseIdScanner quoted;
+    quoted.feed(R"({"id":"resp_2","output":"event: response.failed\nevent: response.failed"})");
+    expect(!quoted.failed(), "text quoted in a JSON body is not a failure event");
+    ResponseIdScanner completed;
+    completed.feed("event: response.created\ndata: {}\n\nevent: response.completed\n");
+    expect(!completed.failed(), "a completed stream has not failed");
     ResponseIdScanner sse;
     sse.feed("event: response.created\ndata: {\"response\":{\"id\":\"resp_ff\",\"object\":\"re");
     expect(sse.id() == "resp_ff", "an SSE event's response id is found");
@@ -1095,6 +1157,44 @@ void responses_follow_up_the_owning_model() {
     post(rig, "/v1/responses", R"({"model":"a","input":"hi"})");
     reply = get(rig, "/v1/responses/" + id_stream);
     expect(reply.status == 200 && served_by(reply) == "b", "which routes its follow-ups too");
+
+    // Counting the tokens of a follow-up reads the same stored response.
+    get(rig, "/v1/responses/" + id_b); // b served last
+    reply = post(rig, "/v1/responses/input_tokens",
+                 R"({"input":"more","previous_response_id":")" + id_a + R"("})");
+    expect(reply.status == 200 && served_by(reply) == "a" &&
+               upstream_body(rig, "a")["model"] == "a",
+           "input_tokens with previous_response_id goes to the owner");
+    get(rig, "/v1/responses/" + id_b); // b served last
+    reply = post(rig, "/v1/responses/input_tokens", R"({"input":"more"})");
+    expect(reply.status == 200 && served_by(reply) == "b", "and without it, by default");
+
+    // A create that is not stored, or whose stream fails or is cut off, has no owner. The model
+    // is learnt from the id in the first event, so these are forgotten once the stream has ended.
+    const auto owner_forgotten = [&](const std::string& id) {
+        return eventually([&] {
+            get(rig, "/v1/responses/" + id_b); // b served last
+            const std::size_t a_calls = rig.up("a").count();
+            return get(rig, "/v1/responses/" + id + "?x=1").status == 404 &&
+                   rig.up("a").count() == a_calls;
+        });
+    };
+    const auto create_id = [&](const std::string& body) {
+        auto stream_client = rig.client();
+        stream_client.Post("/v1/responses?model=a", body, "application/json"); // may be cut off
+        return store.last_created();
+    };
+    const auto json_id = [&](const std::string& body) {
+        return post(rig, "/v1/responses", body).json.value("id", "");
+    };
+    std::string id = json_id(R"({"model":"a","store":false,"input":"x"})");
+    expect(!id.empty() && owner_forgotten(id), "a create with store:false is not remembered");
+    id = create_id(R"({"stream":true,"store":false,"input":"x"})");
+    expect(!id.empty() && owner_forgotten(id), "nor is a streamed one");
+    id = create_id(R"({"stream":true,"fail_stream":true,"input":"x"})");
+    expect(!id.empty() && owner_forgotten(id), "a stream that ends in response.failed is forgotten");
+    id = create_id(R"({"stream":true,"abort_stream":true,"input":"x"})");
+    expect(!id.empty() && owner_forgotten(id), "and so is one that is cut off");
 
     // A failed create names no response.
     post(rig, "/v1/responses", R"({"model":"a","fail":true})");

@@ -74,9 +74,15 @@ class ResponseIdScanner {
 public:
     void feed(std::string_view data);
     [[nodiscard]] const std::optional<std::string>& id() const noexcept { return id_; }
+    // Whether the reply is an SSE stream that carried a response.failed event (seen so far).
+    [[nodiscard]] bool failed() const noexcept { return failed_; }
 
 private:
+    void note_failure(std::string_view data);
+
     std::string seen_;
+    std::string tail_;
+    bool failed_ = false;
     std::size_t resume_ = 0; // where the next search starts
     std::optional<std::string> id_;
 };
@@ -121,9 +127,12 @@ private:
     // along until the response has been delivered.
     // `tap`, when given, sees the bytes of a 2xx reply before they are queued for the client.
     using Tap = std::function<void(std::string_view)>;
+    // `done(finished)`, when given, runs once the model's reply has ended: `finished` is false if
+    // the connection broke or the client left before the end.
+    using Done = std::function<void(bool)>;
     void relay(const httplib::Request& req, httplib::Response& res, ModelRegistry::Lease lease,
                const std::string& method, const std::string& target, std::string body,
-               Tap tap = {});
+               Tap tap = {}, Done done = {});
 
     ServeOptions options_;
     ModelRegistry& registry_;
