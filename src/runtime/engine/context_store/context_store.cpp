@@ -2285,6 +2285,21 @@ void ContextStore::touch_remote_image(const std::string& id) {
             return;
         }
     }
+    // A retired version (a newer write of the conversation deleted its manifest, or meant to) is
+    // neither put back nor kept alive: touching it would restart its age in the bucket past its
+    // tombstone's. Checked first, before any chunk or the manifest is touched, with one HEAD per
+    // touch interval.
+    try {
+        if (remote_fenced(id, created_ms)) {
+            {
+                std::scoped_lock lock(mutex_);
+                ++stats_.remote_fenced;
+            }
+            std::scoped_lock lock(remote_mutex_);
+            remote_touched_[id] = now;
+            return;
+        }
+    } catch (const std::exception&) { return; }
     // Touched only counts once every object is confirmed or put back; otherwise the next request
     // tries again instead of trusting a repair that did not happen.
     bool complete = true;
@@ -2347,13 +2362,6 @@ void ContextStore::touch_remote_image(const std::string& id) {
                 }
             }
             if (replaced) { return; }
-            // A lost manifest is lifecycle expiry, but also what a newer write of the conversation
-            // deletes: a retired version is not put back.
-            if (remote_fenced(id, created_ms)) {
-                std::scoped_lock lock(mutex_);
-                ++stats_.remote_fenced;
-                return;
-            }
             if (read) {
                 options_.remote->put(remote_manifest_key(id), manifest);
             } else {

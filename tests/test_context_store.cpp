@@ -1459,6 +1459,48 @@ void test_repair_does_not_republish_a_retired_manifest() {
           "an engine's repair put a retired manifest back");
 }
 
+// A retired manifest that is still in the bucket (its delete was lost) is not kept alive by an
+// engine that holds it: using the image touches nothing, so it ages out with its tombstone.
+void test_touch_does_not_refresh_a_present_retired_manifest() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore a(remote_options(a_directory.path(), remote));
+    ContextStore::Options b_options = remote_options(b_directory.path(), remote);
+    b_options.remote_touch_interval = std::chrono::seconds(0); // every use touches
+    ContextStore b(b_options);
+    put_turn(a, 1);
+    check(drained(a), "turn 1 did not upload");
+    std::vector<std::uint8_t> stale;
+    std::string stale_key;
+    {
+        std::scoped_lock lock(remote->mutex);
+        for (const auto& [key, value] : remote->objects) {
+            if (key.find("manifests/a.manifest") != std::string::npos) {
+                stale     = value.first;
+                stale_key = key;
+            }
+        }
+    }
+    check(!stale.empty(), "turn 1's manifest is not in the bucket");
+    (void)b.refresh_remote();
+    check(b.load("a").has_value(), "B could not fetch turn 1");
+    check(drained(b), "B's touch did not finish");
+    remote->clock += 10;
+    put_turn(a, 2);
+    check(drained(a), "turn 2 did not upload");
+    {
+        // The delete of turn 1's manifest was lost.
+        std::scoped_lock lock(remote->mutex);
+        remote->objects[stale_key] = {stale, ++remote->clock};
+    }
+    const int touches = remote->touches;
+    check(b.load("a").has_value(), "B lost turn 1");
+    check(drained(b), "B's touch did not finish");
+    check(remote->touches == touches && b.stats().remote_fenced >= 1,
+          "using a retired image refreshed its manifest or chunks in the bucket");
+}
+
 // An upload still queued for a version that was retired meanwhile does not publish it.
 void test_queued_upload_of_a_retired_version_is_dropped() {
     TempDirectory directory;
@@ -3249,6 +3291,7 @@ int main() {
     test_remote_survives_local_eviction();
     test_retired_manifests_are_fenced_against_republish();
     test_repair_does_not_republish_a_retired_manifest();
+    test_touch_does_not_refresh_a_present_retired_manifest();
     test_queued_upload_of_a_retired_version_is_dropped();
     test_remote_damage_and_outage_are_misses();
     test_remote_use_restarts_the_remote_age();
