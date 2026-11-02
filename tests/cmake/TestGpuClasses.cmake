@@ -36,6 +36,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_host_cache_test
   ninfer_host_timing_test
   ninfer_http_error_handler_test
+  ninfer_http_residency_routes_test
   ninfer_http_transport_test
   ninfer_jinja_test
   ninfer_json_schema_oracle_test
