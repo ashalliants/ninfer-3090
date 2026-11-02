@@ -821,8 +821,9 @@ public:
                 // The Host destination can fail on allocation geometry although the byte
                 // quote fit. Superseded Host history goes before a live source is deleted;
                 // the demotion is quoted again on the next pass.
-                if (release_superseded_host(program, plan.host_bytes, protected_sources, cursor,
-                                            needs_state_run(plan))) {
+                // Reached only when the quote needed no victims, so it saw a run that fits: the
+                // state-run pricing (`needs_state_run`) never applies here.
+                if (release_superseded_host(program, plan.host_bytes, protected_sources, cursor)) {
                     return ReclaimProgress::Changed;
                 }
                 continue;
@@ -1176,12 +1177,7 @@ private:
 
     // Releases superseded-only checkpoints, in reclaim order, until `bytes` of Host are free.
     bool release_superseded_host(Program& program, std::size_t bytes,
-                                 std::span<const Handle> excluded, ReclaimCursor& cursor,
-                                 bool state_run = false) {
-        const auto host_bytes_released = [&](std::span<const Handle> handles) {
-            return state_run ? state_bytes_released(program, handles)
-                             : program.host_bytes_released(handles);
-        };
+                                 std::span<const Handle> excluded, ReclaimCursor& cursor) {
         std::vector<Handle> chosen;
         for (const auto& victim : cursor.victims) {
             const auto handle = victim.handle;
@@ -1191,15 +1187,15 @@ private:
                 continue;
             }
             chosen.push_back(handle);
-            if (host_bytes_released(chosen) >= bytes) { break; }
+            if (program.host_bytes_released(chosen) >= bytes) { break; }
         }
         // Drop victims that add no Host release (keeps aliased blocks released as a union), so
         // Device/KV-only superseded history is not erased for a Host allocation it cannot help.
-        auto released = host_bytes_released(chosen);
+        auto released = program.host_bytes_released(chosen);
         for (std::size_t i = chosen.size(); i-- > 0;) {
             auto without = chosen;
             without.erase(without.begin() + static_cast<std::ptrdiff_t>(i));
-            if (!without.empty() && host_bytes_released(without) >= released) {
+            if (!without.empty() && program.host_bytes_released(without) >= released) {
                 chosen = std::move(without);
             }
         }

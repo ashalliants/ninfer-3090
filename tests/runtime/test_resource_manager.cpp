@@ -2381,8 +2381,10 @@ struct Decisions {
 };
 
 // A reproducible random cache: contents that share prefixes and Host blocks (aliases), some not
-// evictable, some Device-only and demotable, some hot from reuse. `seed` fixes everything.
-Decisions decide(std::uint32_t seed, bool memoize) {
+// evictable, some Device-only and demotable, some hot from reuse. `seed` fixes everything. With
+// `images`, a third of the blocks are 16-byte Host state images that take one run each, so state
+// demotions are priced by whole images (the candidate memo's `state_bytes`).
+Decisions decide(std::uint32_t seed, bool memoize, bool images = false) {
     std::mt19937 rng(seed);
     const auto pick = [&](std::uint32_t low, std::uint32_t high) {
         return std::uniform_int_distribution<std::uint32_t>(low, high)(rng);
@@ -2411,11 +2413,11 @@ Decisions decide(std::uint32_t seed, bool memoize) {
             if (!block_bytes.empty() && pick(0, 4) == 0) {
                 spec.block = pick(0, static_cast<std::uint32_t>(block_bytes.size() - 1)); // alias
             } else {
-                block_bytes.push_back(pick(8, 40));
+                block_bytes.push_back(images && pick(0, 2) == 0 ? 16 : pick(8, 40));
                 spec.block = block_bytes.size() - 1;
             }
         }
-        if (pick(0, 9) < 4) { spec.demotion_bytes = pick(8, 40); }
+        if (pick(0, 9) < 4) { spec.demotion_bytes = images ? 16 : pick(8, 40); }
         specs.push_back(std::move(spec));
     }
     std::size_t total = 0;
@@ -2423,8 +2425,14 @@ Decisions decide(std::uint32_t seed, bool memoize) {
     const std::size_t slack = pick(0, 24);
     Fixture f(total + slack);
     f.cache.set_candidate_memo(memoize);
+    if (images) {
+        f.program.image_bytes = 16;
+        f.program.image_runs  = pick(0, 1);
+    }
     std::vector<std::size_t> block_ids;
-    for (const auto bytes : block_bytes) { block_ids.push_back(f.program.host_block(bytes)); }
+    for (const auto bytes : block_bytes) {
+        block_ids.push_back(f.program.host_block(bytes, false, images && bytes == 16));
+    }
     std::vector<Handle> handles;
     for (const auto& spec : specs) {
         std::vector<std::size_t> blocks;
@@ -2474,22 +2482,26 @@ Decisions decide(std::uint32_t seed, bool memoize) {
 }
 
 void test_candidate_memo_changes_no_decision() {
-    std::size_t reclaimed = 0, demoted = 0, with_victims = 0;
-    for (std::uint32_t seed = 1; seed <= 600; ++seed) {
-        const auto plain = decide(seed, false);
-        const auto memo  = decide(seed, true);
+    std::size_t reclaimed = 0, demoted = 0, with_victims = 0, image_victims = 0;
+    for (std::uint32_t seed = 1; seed <= 900; ++seed) {
+        const bool images = seed > 600; // the last 300 price state demotions by whole images
+        const auto plain  = decide(seed, false, images);
+        const auto memo   = decide(seed, true, images);
         if (!(plain == memo)) {
             std::cerr << "decisions differ for seed " << seed << '\n';
             throw std::runtime_error("the candidate memo changed a cache decision");
         }
         reclaimed += plain.released.size();
         demoted += plain.demoted.size();
-        for (const auto& victims : plain.victims) { with_victims += victims && !victims->empty(); }
+        for (const auto& victims : plain.victims) {
+            with_victims += victims && !victims->empty();
+            image_victims += images && victims && !victims->empty();
+        }
     }
     // The comparison is only worth anything if the scenarios actually exercise the code.
-    std::cout << "memo equivalence: 600 seeds, " << reclaimed << " releases, " << demoted
+    std::cout << "memo equivalence: 900 seeds, " << reclaimed << " releases, " << demoted
               << " demotions, " << with_victims << " non-empty victim sets\n";
-    require(reclaimed > 200 && demoted > 100 && with_victims > 100,
+    require(reclaimed > 200 && demoted > 100 && with_victims > 100 && image_victims > 20,
             "randomized scenarios did not exercise release, demotion and Host victims");
 }
 
