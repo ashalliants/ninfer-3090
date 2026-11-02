@@ -1996,6 +1996,14 @@ private:
         // take again. The retries are therefore capped at kMaxOpeningRetries, and the total is
         // (1 + kMaxOpeningRetries) searches. Per-union facts are already shared through the
         // candidate memo, so a retry mostly re-ranks cached data.
+        //
+        // The cap is a deliberate trade of completeness for bounded cost. Choosing a victim set
+        // whose freed extents join into a run of a page is a subset-selection problem, and the
+        // Program contract exposes only the runs left by a candidate set, not where each
+        // candidate sits, so no complete polynomial search is available here. What a miss costs:
+        // the demotion is reported blocked, nothing is released or demoted, and the caller
+        // releases the incoming checkpoint instead of demoting it. That loses a cache entry and
+        // never returns wrong data (test_placement_search_cap_misses_safely pins the miss).
         if (!found && placing) {
             const auto retries = std::min<std::size_t>(actions.size(), kMaxOpeningRetries);
             for (std::size_t first = 0; first < retries && !found; ++first) {

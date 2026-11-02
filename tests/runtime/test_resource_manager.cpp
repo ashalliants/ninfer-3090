@@ -2386,6 +2386,57 @@ void test_blocked_placement_search_work_is_bounded() {
             "a blocked placement search did unbounded extent simulations");
 }
 
+// The capped retries trade completeness for bounded cost, and this is the known miss. Only the
+// last of seven history entries joins the free hole into a page, and it is the dearest: every
+// cheaper opening dead-ends (its union with the joiner is refused by admission), and the retries
+// stop before the joiner is tried as the opening pick. The demotion is then reported blocked,
+// which is safe: nothing is released or demoted, and the caller releases the incoming checkpoint
+// instead of demoting it. Without the cap the same layout would place (see the recovery test).
+void test_placement_search_cap_misses_safely() {
+    // `decoys` cheap entries that never join a run, then the dear one that does.
+    const auto run = [](std::size_t decoys) {
+        struct Result {
+            ninfer::runtime::ReclaimProgress progress;
+            std::vector<Handle> demoted;
+            std::vector<Handle> released;
+            std::size_t placement_failures;
+        };
+        Fixture f(100 * decoys + 100);
+        auto& program    = f.program;
+        program.run_unit = 100;
+        std::vector<Handle> history;
+        for (std::size_t i = 0; i < decoys; ++i) {
+            // 50-byte extents with no free neighbour: releasing them never joins a run.
+            history.push_back(program.add(tokens(400, 5000 + 100 * static_cast<std::uint32_t>(i)),
+                                          {program.host_block_at(100 * i, 50)}));
+        }
+        const std::size_t joiner_at = 100 * decoys;
+        program.base_free_runs      = {{joiner_at + 50, 50}};
+        history.push_back(program.add(tokens(600, 9000), {program.host_block_at(joiner_at, 50)}));
+        for (const auto handle : history) {
+            program.contents[handle.index].device_state = false;
+            program.contents[handle.index].main_pages   = 0;
+            f.publish(handle);
+        }
+        const auto incoming = program.add(tokens(1000));
+        program.contents[incoming.index].demotion_bytes  = 100;
+        f.publish(incoming);
+        program.contents[incoming.index].release_blocked = true;
+        const auto progress = f.cache.reclaim(program, {.main_kv_pages = 1});
+        return Result{progress, program.demoted, program.released, program.placement_failures};
+    };
+    // Within the cap the joiner is reached and the page is placed.
+    const auto within = run(3);
+    require(within.progress == ninfer::runtime::ReclaimProgress::Changed &&
+                within.placement_failures == 0 && !within.demoted.empty(),
+            "a placement inside the retry cap was missed");
+    // Past the cap the placement is missed, and reported blocked without side effects.
+    const auto past = run(6);
+    require(past.progress == ninfer::runtime::ReclaimProgress::Blocked && past.demoted.empty() &&
+                past.released.empty() && past.placement_failures == 0,
+            "a placement past the retry cap was not reported blocked safely");
+}
+
 void test_demotion_quotes_only_placeable_host_bytes() {
     // 32 bytes are free, but 16 of them are stranded in runs too short for the destination.
     Fixture f(64);
@@ -2899,6 +2950,7 @@ int main() {
         test_demotion_victims_account_for_post_release_extents();
         test_placement_search_recovers_from_an_unaffordable_union();
         test_blocked_placement_search_work_is_bounded();
+        test_placement_search_cap_misses_safely();
         test_state_demotion_releases_a_whole_image_when_no_run_fits();
         test_inherited_owner_heat_cannot_spend_a_full_other_continuation();
         test_exact_repeated_candidate_can_replace_a_long_hotspot_with_common_fallback();
