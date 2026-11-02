@@ -414,6 +414,8 @@ public:
     // A held transfer is abandoned at the deadline, as a real store's would be.
     std::optional<std::vector<std::uint8_t>> get_before(const std::string& key,
                                                         Deadline deadline) override {
+        // Lets a test hold a manifest read after the listing before it has completed.
+        if (on_manifest_get && key.find("manifests/") != std::string::npos) { on_manifest_get(); }
         gate(deadline);
         // Runs what the test wants to happen while a chunk is on its way, as another request would.
         if (on_chunk_get && key.find("chunks/") != std::string::npos) { on_chunk_get(); }
@@ -491,6 +493,7 @@ public:
     std::atomic<int> lists{0};
     // Set while the store is idle; called on the store's fetch threads.
     std::function<void()> on_chunk_get;
+    std::function<void()> on_manifest_get;
     // Transfers waiting at the gate now (set_hold).
     std::atomic<int> held{0};
 
@@ -1539,6 +1542,10 @@ void test_remote_requests_are_abandoned_at_the_deadline() {
     TempDirectory writer_directory;
     TempDirectory reader_directory;
     auto remote = std::make_shared<MemoryObjectStore>();
+    // Opened (and its first refresh over) before the image exists, so the refreshes below are the
+    // only ones that could register it.
+    ContextStore reader(remote_options(reader_directory.path(), remote));
+    check(drained(reader), "the reader's first refresh did not finish");
     const auto image = concat({pseudo_random(30, 1), pseudo_random(5000, 2)});
     {
         ContextStore store(remote_options(writer_directory.path(), remote));
@@ -1551,7 +1558,6 @@ void test_remote_requests_are_abandoned_at_the_deadline() {
     const auto seconds_since = [](std::chrono::steady_clock::time_point since) {
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
     };
-    ContextStore reader(remote_options(reader_directory.path(), remote));
     // The listing hangs: the refresh returns at its deadline instead of waiting for the bucket.
     remote->set_hold(true);
     auto started = std::chrono::steady_clock::now();
@@ -1560,6 +1566,23 @@ void test_remote_requests_are_abandoned_at_the_deadline() {
     check(reader.stats().remote_download_failures == 0,
           "running out of time was counted as a bucket failure");
     remote->set_hold(false);
+    // The listing completes and the manifest read hangs: the refresh and the lookup both return at
+    // their deadline, register nothing and count no failure.
+    remote->on_manifest_get = [&] { remote->set_hold(true); };
+    started = std::chrono::steady_clock::now();
+    check(reader.refresh_remote(within(200)) == 0, "a refresh registered an image whose manifest never came");
+    check(seconds_since(started) < 5.0, "the refresh waited for a manifest past its deadline");
+    remote->set_hold(false);
+    started = std::chrono::steady_clock::now();
+    remote->on_manifest_get = [&] { remote->set_hold(true); };
+    const auto manifest_lookup =
+        reader.lookup_remote(started, within(200), [](const std::string&) { return true; });
+    check(manifest_lookup.registered == 0 && seconds_since(started) < 5.0,
+          "a lookup waited for a manifest past its deadline");
+    remote->on_manifest_get = nullptr;
+    remote->set_hold(false);
+    check(reader.stats().remote_download_failures == 0 && !reader.find("0a").has_value(),
+          "an expired manifest read counted a failure or registered the image");
     check(reader.refresh_remote(within(10'000)) == 1, "the next refresh did not register the image");
     // A chunk hangs: the load is a miss at its deadline, the image stays offered.
     remote->set_hold(true);
