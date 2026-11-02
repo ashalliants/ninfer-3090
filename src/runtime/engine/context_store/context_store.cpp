@@ -905,6 +905,14 @@ void ContextStore::scan() {
     }
     for (const auto& item : fs::directory_iterator(options_.directory / "manifests", error)) {
         const fs::path& path = item.path();
+        if (path.extension() == ".peer") {
+            // An origin marker whose manifest is gone (a failed import) belongs to no image.
+            std::error_code ignored;
+            if (!fs::exists(fs::path(path).replace_extension(".manifest"), ignored)) {
+                remove_quietly(path);
+            }
+            continue;
+        }
         if (path.extension() != ".manifest") { continue; }
         Entry entry;
         const std::string id = path.stem().string();
@@ -918,6 +926,7 @@ void ContextStore::scan() {
             remove_quietly(path);
             remove_quietly(used_path(id));
             remove_quietly(published_path(id));
+            remove_quietly(peer_origin_path(id)); // a later image of the id is not the peer's
             continue;
         }
         entry.info.last_used_ms = entry.info.created_ms;
@@ -1348,9 +1357,16 @@ ContextStore::PutResult ContextStore::put(const Description& description,
                 if (chunk.known) { refilled.emplace_back(hex_key(chunk.chunk.hash), stored.bytes); }
                 stored_written += stored.bytes;
             }
-            write_atomically(manifest_path(description.id), manifest.out);
             // Written here: this store's own to upload, whatever a peer wrote under the id before.
-            remove_quietly(peer_origin_path(description.id));
+            // The marker goes first, and a marker that cannot be removed fails the write: a stale
+            // one would make a restart withhold this image from the bucket.
+            std::error_code marker_error;
+            fs::remove(peer_origin_path(description.id), marker_error);
+            if (fs::exists(peer_origin_path(description.id), marker_error)) {
+                throw std::runtime_error("context store: cannot clear the peer marker of " +
+                                         description.id);
+            }
+            write_atomically(manifest_path(description.id), manifest.out);
         }
 
         Entry entry;
@@ -3062,9 +3078,14 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
         linked_bytes += source.size;
     }
     if (held == nullptr) {
+        // The marker comes before the manifest: a crash or failure between the two leaves a
+        // marker with no manifest (swept at the next scan or overwritten), never a peer's image
+        // that a restart takes for this store's own and uploads.
         try {
+            write_atomically(peer_origin_path(id), {});
             write_atomically(manifest_path(id), data);
         } catch (const std::exception&) {
+            remove_quietly(peer_origin_path(id));
             roll_back();
             return skip_locked();
         }
@@ -3106,11 +3127,6 @@ bool ContextStore::import_peer_image(const fs::path& peer, const std::string& id
     entry.peer_memo_key     = memo_key;
     entry.peer_stamp        = stamp;
     entry.peer_origin       = true;
-    try {
-        write_atomically(peer_origin_path(id), {});
-    } catch (const std::exception&) {
-        // Without the marker a restart only forgets where the image came from.
-    }
     manifest_total_bytes_ += entry.manifest_bytes;
     add_references(entry);
     record_fill(); // after the references: the chunks are described then

@@ -2990,6 +2990,56 @@ void test_chunk_provenance_ends_when_the_peer_file_is_replaced() {
     check(b.sync_peers() == 1, "a peer was blamed for a file it did not supply");
 }
 
+// The `.peer` marker is part of the import: an import that cannot record it does not happen, a
+// discarded manifest takes its marker, and a put that cannot clear it fails.
+void test_peer_marker_follows_the_manifest() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    const auto image = peer_image(15);
+    ContextStore a(options_for(a_directory.path()));
+    (void)a.put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
+    ContextStore::Options options = options_for(b_directory.path());
+    options.peers                 = {a_directory.path()};
+    options.peer_poll             = std::chrono::hours(1);
+    const fs::path marker         = b_directory.path() / "manifests" / "0a.peer";
+    {
+        // A marker that cannot be written: the image is not imported as the importer's own.
+        ContextStore b(options);
+        fs::create_directories(marker / "blocker");
+        check(b.sync_peers() == 0 && !b.find("0a").has_value(),
+              "an image was imported without its origin marker");
+        check(!fs::exists(b_directory.path() / "manifests" / "0a.manifest"),
+              "a failed import left a manifest behind");
+        // A put cannot clear an unremovable marker either.
+        bool threw = false;
+        try {
+            (void)b.put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        check(threw, "a put went ahead with a peer marker it could not clear");
+        fs::remove_all(marker);
+    }
+    {
+        ContextStore b(options);
+        check(b.sync_peers() == 1 && fs::exists(marker), "the peer image was not imported with a marker");
+    }
+    // The manifest is damaged: it is discarded with its marker.
+    const fs::path manifest = b_directory.path() / "manifests" / "0a.manifest";
+    fs::resize_file(manifest, fs::file_size(manifest) / 2);
+    {
+        ContextStore b(options);
+        check(b.stats().corrupt_manifest == 1, "the damaged manifest was not discarded");
+        check(!fs::exists(marker), "a discarded manifest left its peer marker behind");
+    }
+    // An orphan marker (no manifest) is swept at start-up.
+    { std::ofstream(marker).put('x'); }
+    {
+        ContextStore b(options);
+        check(!fs::exists(marker), "an orphan peer marker was kept");
+    }
+}
+
 // Every byte in the store's directory, as a volume of fixed size sees it.
 std::uint64_t bytes_on_disk(const fs::path& directory) {
     std::uint64_t total = 0;
@@ -3337,6 +3387,7 @@ int main() {
     test_peer_images_are_not_uploaded_by_the_importer();
     test_peer_images_are_still_the_peers_to_upload_after_a_restart();
     test_chunk_provenance_ends_when_the_peer_file_is_replaced();
+    test_peer_marker_follows_the_manifest();
     test_peer_poll_passes_over_images_the_peer_only_registered();
     test_peer_poll_lists_an_unchanged_peer_once();
     test_peer_fit_skip_is_counted_once_when_only_the_use_changes();
