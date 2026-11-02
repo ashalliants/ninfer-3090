@@ -17,6 +17,7 @@
 #include "runtime/engine/context_store/image_id.h"
 #include "runtime/engine/pause_policy.h"
 #include "runtime/engine/scheduler.h"
+#include "runtime/engine/shared_prefix_scan.h"
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/worker_fault.h"
@@ -4132,48 +4133,36 @@ private:
         if (!store_.shared_sink) { return; }
         const auto now = Clock::now();
         if (now < next_shared_scan_) { return; }
-        next_shared_scan_ = now + std::chrono::seconds(1);
+        next_shared_scan_ = now + kSharedPrefixRescan;
         try {
             auto& program = *instance_.program;
             if (program.has_context_transaction() || (store_.ready && !store_.ready())) { return; }
-            bool failed = false;
-            for (const auto handle : unstored_shared(program)) {
-                // A prefix captured again after an eviction has the key of the image the store
-                // already holds: that image serves it, so it is not exported a second time.
-                if (const auto bytes = stored_shared_image(program, handle)) {
-                    shared_stored_.emplace_back(handle, *bytes);
-                    continue;
-                }
-                // One prefix that cannot be exported (the Program refuses it, or a transient
-                // failure) must not keep the others from being tried: each candidate is isolated,
-                // as in the shutdown flush. One export per scan.
-                std::optional<CheckpointImage> image;
-                try {
+            // The fault isolation lives in scan_shared_prefixes (shared_prefix_scan.h), which is
+            // tested without a device.
+            next_shared_scan_ = now + scan_shared_prefixes(
+                unstored_shared(program),
+                [&](const Checkpoint handle) {
+                    // A prefix captured again after an eviction has the key of the image the
+                    // store already holds: that image serves it, so it is not exported a second
+                    // time.
+                    const auto bytes = stored_shared_image(program, handle);
+                    if (bytes) { shared_stored_.emplace_back(handle, *bytes); }
+                    return bytes.has_value();
+                },
+                [&](const Checkpoint handle) {
                     const auto started = Clock::now();
-                    image.emplace(program.export_checkpoints({&handle, 1}, std::nullopt,
-                                                             store_.binding, export_buffer()));
+                    auto image = program.export_checkpoints({&handle, 1}, std::nullopt,
+                                                            store_.binding, export_buffer());
                     cumulative_stats_.context_store_shared_export_seconds +=
                         std::chrono::duration<double>(Clock::now() - started).count();
-                } catch (...) {
-                    failed = true;
-                    continue;
-                }
-                // The sink ends the scan whatever it answers: a rejection (full queue, shutdown)
-                // or a throw backs off like a failed scan instead of exporting another prefix.
-                const auto bytes = image->bytes.size();
-                bool accepted    = false;
-                try { accepted = store_.shared_sink(std::move(*image)); } catch (...) {}
-                if (accepted) {
+                    return image;
+                },
+                [&](CheckpointImage&& image) { return store_.shared_sink(std::move(image)); },
+                [&](const Checkpoint handle, const std::size_t bytes) {
                     shared_stored_.emplace_back(handle, bytes);
                     ++cumulative_stats_.context_store_shared_writes;
-                } else {
-                    next_shared_scan_ = now + std::chrono::seconds(4);
-                }
-                return;
-            }
-            // Every candidate failed: back off instead of retrying them each second.
-            if (failed) { next_shared_scan_ = now + std::chrono::seconds(4); }
-        } catch (...) { next_shared_scan_ = now + std::chrono::seconds(4); }
+                });
+        } catch (...) { next_shared_scan_ = now + kSharedPrefixBackoff; }
     }
 
     // Write-on-evict: a retained continuation the cache is about to lose a point of, and that the
