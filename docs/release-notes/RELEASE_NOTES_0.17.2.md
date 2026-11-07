@@ -73,12 +73,17 @@ The Host arena never compacts, so total free bytes is not the same as room for a
 
 - **Windows:** built and dependency-checked only; nothing was started or served on Windows. The `run.bat` fix (#435) has not been run by us.
 - **None of the fixes above was exercised on a card under the conditions it addresses** (no out-of-vocabulary token, no fragmented Host, no router with several loaded models, no real bucket). Their PR tests passed, mostly on a Mac.
-- Only a few test programs were run on the release commit, not the full CPU or GPU suite.
+- No test program was run on the release commit, neither the CPU nor the GPU suite; the release only builds the three products.
 - The Linux library list was not diffed against v0.17.1's; no CMake or dependency file changed.
 
 ## Verification
 
-To be filled in after the checks.
+Checked on 2026-11-07 on a rented RTX 3090 (Ubuntu 24.04, CUDA 12.8.1), against the release commit's code, before publishing:
+
+- **Build (Linux):** a clean `git archive` of the release commit, `-DCMAKE_CUDA_ARCHITECTURES=86 -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON`, targets `ninfer`, `ninfer-serve`, `ninfer_bench`.
+- **Linux archive:** the inner and outer checksums match (re-checked after the download); the packaged `ninfer-serve --version` and `--help` run; `./run.sh --help` runs; `scripts/check-linux-scripts.sh` passes; `ldd` reports no unresolved library.
+- **Launcher smoke test:** the packaged `./run.sh qwen38-27b` served Qwen3.8-27B with the default profile and answered a chat completion.
+- **Not run:** the test suite (no test program was run on the release commit), and any serving check beyond that one chat completion: streaming, tools, the router, `thinking.display`, the context store and the Host-memory changes were not exercised.
 
 ## Windows archive: built, not run
 
