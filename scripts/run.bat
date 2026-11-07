@@ -860,8 +860,11 @@ rem call :read_env NAME -- sets PASS_VAL to the value of NINFER_NAME, empty when
 rem through a FOR variable, which cmd substitutes after parsing, so percent signs, carets, ampersands
 rem and pipes reach PASS_VAL literally; CALL SET would parse the value a second time. A double quote
 rem cannot be carried inside the quoted argument built from it, so it is refused, not passed on mangled.
+rem The redirects sit at the front of each command on purpose: after a \" cmd treats the rest of the line as
+rem quoted, so a trailing >nul would reach findstr as a file name. There is no space before the first pipe,
+rem because cmd rebuilds the left side with it and SET would then look for a name ending in a space.
 set "PASS_VAL="
-set NINFER_%~1 2>nul | findstr /b /c:"NINFER_%~1=" | findstr /c:"\"" >nul
+2>nul set NINFER_%~1| findstr /b /c:"NINFER_%~1=" | >nul findstr /c:"\""
 if not errorlevel 1 goto :read_env_quote
 for /f "tokens=1* delims==" %%A in ('set NINFER_%~1 2^>nul') do if /i "%%A"=="NINFER_%~1" set "PASS_VAL=%%B"
 exit /b 0
