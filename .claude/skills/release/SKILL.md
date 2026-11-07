@@ -281,3 +281,14 @@ un.bat" qwen38-27b'
 - **The Windows zip hash changes when the notes change**: write the Windows checks in the notes without the
   hash (it is in `SHA256SUMS-*-windows.txt`), so the zip need not be rebuilt for a notes edit.
 - Merging the release PR with `--merge` gives the merge commit to tag; `gh release create ... --verify-tag`.
+
+
+## Traps hit in v0.17.2
+
+- **A notes edit after the Linux archive exists does not need a new Vast box:** patch the tarball locally
+  (recipe in `docs/maintainer/release-process.md`, under the Vast helpers). The Windows zip is rerun with
+  `release-windows-wsl.sh` (incremental, about 5 minutes).
+- **Use absolute paths for every background command.** The shell drifted into `dist/` and the Windows rerun
+  died with exit 127 in a second.
+- **The Windows zip's embedded notes are CRLF:** compare with `diff --strip-trailing-cr`.
+- The release PR merged with some checks still pending (none required); look at `gh pr checks` afterwards.

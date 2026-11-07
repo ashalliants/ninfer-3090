@@ -128,6 +128,16 @@ and record them here.
     `geolocation` in `vast-up.sh`.
   - Every commit after the build needs a rebuild on the box (the script refuses a remote HEAD that differs).
     A rerun is about 5 minutes on ccache, so fix first, then rerun, rather than waiting for the first run.
+  - **v0.17.2 ran the helpers cleanly** (an Ontario host, 16 cores, about $0.29 estimated): `vast-up.sh` about 5
+    minutes, then `vast-release-linux.sh` about 15 minutes to a pulled-back archive. Run `vast-destroy.sh` the
+    moment the archive is in `dist/` and delete any `send_later` backstop.
+  - **Editing the notes after the Linux archive exists does not need another box.** The tarball embeds
+    `RELEASE_NOTES_X.Y.Z.md` and an inner `SHA256SUMS.txt`. Extract it to a scratch directory, copy the final
+    notes in, regenerate the inner sums exactly as `package-release.sh` does (`find . -maxdepth 1 -type f !
+    -name SHA256SUMS.txt -print0 | LC_ALL=C sort -z`, then `sha256sum`), re-pack with
+    `tar --owner=root --group=root -czf` (the original entries are root-owned) and rewrite
+    `SHA256SUMS-vX.Y.Z-linux.txt`. Check the inner sums, the outer sum and `diff` the embedded notes. Re-packing
+    1 GB takes a couple of minutes, so run it in the background.
 - **Windows archive: any x64 Windows machine, no NVIDIA GPU needed.** `scripts/release-windows.ps1`
   installs the toolchain (VS 2022 Build Tools, CMake, Ninja, CUDA 12.8.1 without the driver, vcpkg at the
   manifest baseline, ccache), builds the three products and runs the packager.
@@ -168,6 +178,11 @@ ccache, then 5 minutes for each repackage. Traps:
   too deeply`: MSVC limits an if/else-if chain to about 128 levels, and the option parser had passed it.
   New flags with a shared prefix go in their own chain ahead of the main one, as `--context-store*` and
   `--lossy-prefill-*` do.
+- **Run the script by absolute path from the repository root.** A background shell that drifted into `dist/`
+  failed instantly with `scripts/release-windows-wsl.sh: No such file or directory` (exit 127), which looks
+  like a completed task.
+- **The notes inside the Windows zip have CRLF line endings** (the checkout on `C:` converts them). When
+  comparing them with the committed file use `diff --strip-trailing-cr`; the Linux copy matches byte for byte.
 - A `-SkipBootstrap` run needs 20 GB free on C: (the full bootstrap needs 50 GB). The GMKtec box had 29 GB
   in 2026-10; old releases' zips in `C:\ninfer-release\src\dist` take about 1.6 GB each once published.
 
