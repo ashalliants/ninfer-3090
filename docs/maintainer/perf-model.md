@@ -70,7 +70,11 @@ minutes after a six-minute build (`ninfer_bench` only, `-j8`).
 container), so under decode load the SM clock sits at 675-750 MHz of a 2100 MHz maximum with "SW Power
 Cap" active, and its read bandwidth measured 777 GB/s against the 854 the model assumes. Plain decode
 ran at 27.6 tok/s against 49.0 on a 315 W card. Use such a host for structure and ratios, not for
-absolute speed, and check `nvidia-smi -q -d PERFORMANCE` during a run before trusting a rented box.
+absolute speed. `vast-up.sh` now refuses such a host: right after a box boots it reads the power limit
+(`nvidia-smi --query-gpu=power.limit,power.default_limit`, which the container can read but not change)
+and, below `NINFER_VAST_MIN_POWER_PCT` of the default (100 unless you set it; 80 is the lowest worth
+timing on), destroys the host and tries the next offer. Even so, glance at `nvidia-smi -q -d PERFORMANCE`
+during a run: a card at its full limit can still throttle on temperature.
 
 | Plain decode, per step | ms | launches | GB read | GB/s | % of 777 |
 |---|---:|---:|---:|---:|---:|
@@ -120,7 +124,7 @@ The tools shrink the number of runs; they do not remove them.
 
 So the loop is: rank candidates here, spend one short box session per promising candidate, not per idea.
 `scripts/vast/vast-up.sh` plus `vast-dev-sync.sh` is the whole recipe; the box self-destructs after
-three hours.
+three hours, and `vast-up.sh` only keeps a host whose card is not power-capped (see above).
 
 ## Qwen3.5 model: how it works and how well it matches
 

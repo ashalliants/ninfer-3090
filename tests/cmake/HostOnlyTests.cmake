@@ -56,8 +56,12 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_scheduler_test
   ninfer_shared_prefix_scan_test
   ninfer_tensor_test
+  ninfer_vast_power_guard_test
   ninfer_vcc_projector_test
   ninfer_summary_strategy_test
   ninfer_wide_math_test
   ninfer_worker_recovery_test
 )
+if(UNIX)
+  list(APPEND NINFER_HOST_ONLY_TESTS ninfer_vast_up_test)
+endif()

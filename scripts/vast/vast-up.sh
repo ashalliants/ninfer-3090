@@ -15,6 +15,16 @@
 #                          the previous release's archive if you diff its ldd
 #   NINFER_VAST_UP_GB      GB uploaded: about 1 GB per Linux archive pulled back (default 2)
 # A Bonsai 2 27B smoke test downloads about 11 GB instead.
+#
+# A host can lower the card's power limit and the offer listing does not say so: the v0.17 box was a 3090
+# limited to 220 W of its 350 W default and ran its weight kernels at 54-57% of the card's read bandwidth
+# (docs/maintainer/perf-model.md). So once a box is running, power_guard.py reads its limit, and a card
+# below the floor is destroyed and the next-cheapest offer tried:
+#   NINFER_VAST_MIN_POWER_PCT  lowest acceptable power limit, as a percent of the card's default limit
+#                              (default 100, a full-power card; 80 is the lowest worth measuring on; 0 is off,
+#                              for a build that does not care how fast the card is)
+#   NINFER_VAST_MAX_HOSTS      how many offers to try before giving up (default 4); each rejected host
+#                              bills for the minutes it took to boot
 set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$root/vast-common.sh"
@@ -26,11 +36,23 @@ if [[ -s "$state_file" ]]; then
 fi
 
 disk_gb=80
+min_power_pct="${NINFER_VAST_MIN_POWER_PCT:-100}"
+max_hosts="${NINFER_VAST_MAX_HOSTS:-4}"
+[[ "$min_power_pct" =~ ^[0-9]{1,3}$ ]] || { echo "NINFER_VAST_MIN_POWER_PCT must be 0-100, got '$min_power_pct'." >&2; exit 1; }
+min_power_pct=$((10#$min_power_pct))   # base 10: Bash would read "080" as an invalid octal number
+(( min_power_pct <= 100 )) || { echo "NINFER_VAST_MIN_POWER_PCT must be 0-100, got '$min_power_pct'." >&2; exit 1; }
+[[ "$max_hosts" =~ ^[1-9][0-9]{0,2}$ ]] || { echo "NINFER_VAST_MAX_HOSTS must be a number from 1 to 999, got '$max_hosts'." >&2; exit 1; }
 # Verified single-3090 offers with a fast link, CUDA 12.8-capable drivers and >=16 effective cores (a release
 # build is 15 min on 24 cores, an hour on 6), ranked by estimated total. Spain hosts were the reliable ones in
-# 2026-10.
-offer="$(vastai search offers 'gpu_name=RTX_3090 num_gpus=1 reliability>0.98 disk_space>=100 cuda_max_good>=12.8 rentable=true inet_down>=1000' -o dph --raw |
-  NINFER_VAST_DISK_GB="$disk_gb" python3 -I -c '
+# 2026-10. The cheapest max_hosts are the candidates, in order.
+# Vast lists a gpu_max_power (watts) per offer. Its docs call it the "GPU power limit" without saying whether
+# that is the enforced limit or the card's rating, so it only narrows the search (a 3090's default is
+# 350 W); the check after boot is the one that decides. Each candidate prints its value, so the first real
+# run shows which it is.
+power_filter=""
+if (( min_power_pct > 0 )); then power_filter=" gpu_max_power>=$(( 350 * min_power_pct / 100 ))"; fi
+offers="$(vastai search offers "gpu_name=RTX_3090 num_gpus=1 reliability>0.98 disk_space>=100 cuda_max_good>=12.8 rentable=true inet_down>=1000${power_filter}" -o dph --raw |
+  NINFER_VAST_DISK_GB="$disk_gb" NINFER_VAST_MAX_HOSTS="$max_hosts" python3 -I -c '
 import json, os, sys
 hours = float(os.environ.get("NINFER_VAST_EST_HOURS", "1"))
 down = float(os.environ.get("NINFER_VAST_DOWN_GB", "21"))
@@ -44,14 +66,22 @@ def cost(o):
 offers = sorted((o for o in json.load(sys.stdin) if o["cpu_cores_effective"] >= 16), key=lambda o: cost(o)[0])
 if not offers: sys.exit("no suitable offer")
 print("estimate for %.1f h, %.0f GB down, %.0f GB up:" % (hours, down, up), file=sys.stderr)
-for o in offers[:3]:
+candidates = offers[:int(os.environ["NINFER_VAST_MAX_HOSTS"])]
+for o in candidates:
     total, gpu, storage, net = cost(o)
-    print("  offer %s: %s, $%.2f (GPU $%.2f + disk $%.2f + bandwidth $%.2f; $%.3f/h, $%.4f/GB down, $%.4f/GB up), %d cores, %d Mbps down"
-          % (o["id"], o["geolocation"], total, gpu, storage, net, o["dph_base"], o["inet_down_cost"], o["inet_up_cost"], o["cpu_cores_effective"], o["inet_down"]), file=sys.stderr)
-print(offers[0]["id"])')"
-echo "Renting the first one."
+    print("  offer %s: %s, $%.2f (GPU $%.2f + disk $%.2f + bandwidth $%.2f; $%.3f/h, $%.4f/GB down, $%.4f/GB up), %d cores, %d Mbps down, listed power %s W"
+          % (o["id"], o["geolocation"], total, gpu, storage, net, o["dph_base"], o["inet_down_cost"], o["inet_up_cost"], o["cpu_cores_effective"], o["inet_down"], o.get("gpu_max_power", "?")), file=sys.stderr)
+for o in candidates:
+    print(o["id"])')" || { echo "No suitable offer. The search required gpu_max_power >= $(( 350 * min_power_pct / 100 )) W; if that emptied it, lower NINFER_VAST_MIN_POWER_PCT (0 drops the filter and the check)." >&2; exit 1; }
+[[ -n "$offers" ]] || { echo "No suitable offer." >&2; exit 1; }
+if (( min_power_pct > 0 )); then
+  echo "Renting the first one that boots with a power limit of at least ${min_power_pct}% of the card's default."
+else
+  echo "Renting the first one (power-limit check off)."
+fi
 
-onstart="$(mktemp)"
+onstart="$(mktemp "${TMPDIR:-/tmp}/ninfer-vast-onstart.XXXXXX")"   # a template: BSD mktemp ignores TMPDIR without one
+trap 'rm -f "$onstart"' EXIT   # replaced below by one that also destroys a rented instance
 cat > "$onstart" <<ONSTART
 #!/bin/bash
 # Dead-man switch first, before anything can fail.
@@ -76,22 +106,55 @@ apt-get install -y -qq git cmake ninja-build build-essential pkg-config gcc-13 g
 touch /root/deps.done
 ONSTART
 
-new="$(vastai create instance "$offer" --image vastai/base-image:cuda-12.8.1-auto --disk "$disk_gb" --ssh --direct \
-  --onstart "$onstart" --label ninfer-release --raw | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["new_contract"])')"
-rm -f "$onstart"
-echo "$new" > "$state_file"
-# From here on any failure destroys the instance: it bills. The state file goes only once the destroy is
+# Any failure destroys the instance being tried: it bills. The state file goes only once the destroy is
 # confirmed; if it fails the file stays, so vast-destroy.sh can retry and a new vast-up.sh refuses to rent.
-trap 'rc=$?; if (( rc != 0 )); then echo "vast-up failed: destroying instance $new" >&2; if echo y | vastai destroy instance "$new" >&2; then rm -f "$state_file"; else echo "Destroy FAILED: instance $new is still billing. Run vast-destroy.sh until it succeeds." >&2; fi; fi' EXIT
-echo "Rented instance $new. Kill switch: ${hours} h. Waiting for it to boot..."
+new=""
+destroy_instance() {
+  if echo y | vastai destroy instance "$1" >&2; then rm -f "$state_file"; return 0; fi
+  echo "Destroy FAILED: instance $1 is still billing. Run vast-destroy.sh until it succeeds." >&2
+  return 1
+}
+trap 'rc=$?; rm -f "$onstart"; if (( rc != 0 )) && [[ -n "$new" ]]; then echo "vast-up failed: destroying instance $new" >&2; destroy_instance "$new" || true; fi' EXIT
 
-# A host that never leaves "loading" burns money: give up after 8 minutes (destroy and re-run).
-for i in $(seq 1 32); do
-  status="$(vastai show instance "$new" --raw | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("actual_status"))')"
-  [[ "$status" == running ]] && break
-  sleep 15
+# Try the candidates cheapest first. A host is kept only if it boots within 8 minutes and its card may draw
+# enough power; otherwise it is destroyed and the next one tried.
+chosen=""
+tried=0
+for offer in $offers; do
+  tried=$((tried + 1))
+  new="$(vastai create instance "$offer" --image vastai/base-image:cuda-12.8.1-auto --disk "$disk_gb" --ssh --direct \
+    --onstart "$onstart" --label ninfer-release --raw | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["new_contract"])')"
+  echo "$new" > "$state_file"
+  echo "Rented instance $new (offer $offer). Kill switch: ${hours} h. Waiting for it to boot..."
+
+  status=""
+  for i in $(seq 1 32); do
+    status="$(vastai show instance "$new" --raw | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("actual_status"))')"
+    [[ "$status" == running ]] && break
+    sleep 15
+  done
+  if [[ "$status" != running ]]; then
+    echo "Offer $offer: still '$status' after 8 minutes; destroying it and trying the next host." >&2
+    destroy_instance "$new" || exit 1
+    new=""; continue
+  fi
+
+  # The offer cannot tell us the card's power limit; the box can. sshd may need a moment after "running".
+  smi=""
+  for i in $(seq 1 18); do
+    if smi="$("$root/vast-dev-ssh.sh" 'nvidia-smi --query-gpu=power.limit,power.default_limit --format=csv,noheader,nounits' </dev/null 2>/dev/null)"; then break; fi
+    smi=""; sleep 10
+  done
+  power_rc=0
+  verdict="$(printf '%s\n' "$smi" | python3 -I "$root/power_guard.py" --min-pct "$min_power_pct")" || power_rc=$?
+  if (( power_rc == 0 )); then echo "Offer $offer: $verdict."; chosen="$new"; break; fi
+  echo "Offer $offer rejected: $verdict. Destroying it and trying the next host." >&2
+  destroy_instance "$new" || exit 1
+  new=""
 done
-[[ "$status" == running ]] || { echo "Instance still '$status' after 8 minutes; destroying it. Run vast-up.sh again (the host is the problem)." >&2; exit 1; }
+rm -f "$onstart"
+[[ -n "$chosen" ]] || { echo "None of the $tried offers tried booted with a power limit of at least ${min_power_pct}% of the card's default. Run again (new offers appear all the time), raise NINFER_VAST_MAX_HOSTS, or accept a capped card with NINFER_VAST_MIN_POWER_PCT=80 (0 for a build that does not time anything)." >&2; exit 1; }
+
 for i in $(seq 1 60); do "$root/vast-dev-ssh.sh" 'test -f /root/deps.done' 2>/dev/null && break; sleep 10; done
 "$root/vast-dev-ssh.sh" 'test -f /root/deps.done' || { echo "Dependencies did not install (see /root/onstart log)." >&2; exit 1; }
 "$root/vast-dev-ssh.sh" 'nvidia-smi -L; nproc'
