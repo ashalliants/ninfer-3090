@@ -120,7 +120,9 @@ class Calibration:
     # Attention in prefill, from the Engine's fitted 27B pair cost (4.54 ns/pair, context_cost_defaults).
     prefill_attention_eff: float = 0.274
     # Speculative round time over the plain step at the same bytes: 22.3 ms step, 1.15x
-    # (docs/performance.md, "MTP round/plain step ratio"). Measured on the 27B only.
+    # (docs/performance.md, "MTP round/plain step ratio"). Measured on the 27B only. A 220 W-capped
+    # host measured 1.22 (tests/fixtures/perf_model/): the drafter's q8 weights and the recurrence
+    # records are not in the byte model, and cost more when the SM clock is low.
     spec_round_ratio: float = 1.15
 
 
