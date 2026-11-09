@@ -83,6 +83,11 @@ public:
         std::shared_ptr<ObjectStore> remote;
         std::string remote_prefix; // prepended to every key, e.g. "ninfer/"
         std::chrono::seconds remote_refresh{60};
+        // Queue one refresh on the background thread as the store starts, so images other engines
+        // left in the bucket are available at once. A test that calls refresh_remote() itself sets
+        // this false: the start-up refresh would race its call and take the images it expects it to
+        // register.
+        bool refresh_on_start = true;
         std::chrono::seconds remote_touch_interval{24 * 3600};
         // How long a written image waits before it is uploaded. A conversation is written after
         // every turn, and each write supersedes the one before: a write superseded while it waits
