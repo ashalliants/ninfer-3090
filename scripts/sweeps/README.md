@@ -121,6 +121,10 @@ round's extra 13.4 ms in one kernel: the Q4 SwiGLU small-T MMA at T=4, 228 us ag
 113 us. The bench corpus inflates acceptance, which does not matter here -- a round's kernel work is
 fixed by the draft count, not by what is accepted.
 
+To turn the `..._cuda_gpu_kern_sum.csv` it writes into "which kernel families run well below the card's
+bandwidth, and what would fixing them save", run `python tools/kernel_bandwidth.py <csv> --steps 128`
+(`--columns 4` for the MTP3 round); see [the performance model guide](../../docs/maintainer/perf-model.md).
+
 ## Things these got wrong, so you do not repeat them
 
 **Decode must be measured at depth.** A `tg128` run seeds one token, so the cache is ~128 deep and
