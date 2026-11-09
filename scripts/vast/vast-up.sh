@@ -43,7 +43,13 @@ max_hosts="${NINFER_VAST_MAX_HOSTS:-4}"
 # Verified single-3090 offers with a fast link, CUDA 12.8-capable drivers and >=16 effective cores (a release
 # build is 15 min on 24 cores, an hour on 6), ranked by estimated total. Spain hosts were the reliable ones in
 # 2026-10. The cheapest max_hosts are the candidates, in order.
-offers="$(vastai search offers 'gpu_name=RTX_3090 num_gpus=1 reliability>0.98 disk_space>=100 cuda_max_good>=12.8 rentable=true inet_down>=1000' -o dph --raw |
+# Vast lists a gpu_max_power (watts) per offer. Its docs call it the "GPU power limit" without saying whether
+# that is the enforced limit or the card's rating, so it only narrows the search (a 3090's default is
+# 350 W); the check after boot is the one that decides. Each candidate prints its value, so the first real
+# run shows which it is.
+power_filter=""
+if (( min_power_pct > 0 )); then power_filter=" gpu_max_power>=$(( 350 * min_power_pct / 100 ))"; fi
+offers="$(vastai search offers "gpu_name=RTX_3090 num_gpus=1 reliability>0.98 disk_space>=100 cuda_max_good>=12.8 rentable=true inet_down>=1000${power_filter}" -o dph --raw |
   NINFER_VAST_DISK_GB="$disk_gb" NINFER_VAST_MAX_HOSTS="$max_hosts" python3 -I -c '
 import json, os, sys
 hours = float(os.environ.get("NINFER_VAST_EST_HOURS", "1"))
@@ -61,10 +67,10 @@ print("estimate for %.1f h, %.0f GB down, %.0f GB up:" % (hours, down, up), file
 candidates = offers[:int(os.environ["NINFER_VAST_MAX_HOSTS"])]
 for o in candidates:
     total, gpu, storage, net = cost(o)
-    print("  offer %s: %s, $%.2f (GPU $%.2f + disk $%.2f + bandwidth $%.2f; $%.3f/h, $%.4f/GB down, $%.4f/GB up), %d cores, %d Mbps down"
-          % (o["id"], o["geolocation"], total, gpu, storage, net, o["dph_base"], o["inet_down_cost"], o["inet_up_cost"], o["cpu_cores_effective"], o["inet_down"]), file=sys.stderr)
+    print("  offer %s: %s, $%.2f (GPU $%.2f + disk $%.2f + bandwidth $%.2f; $%.3f/h, $%.4f/GB down, $%.4f/GB up), %d cores, %d Mbps down, listed power %s W"
+          % (o["id"], o["geolocation"], total, gpu, storage, net, o["dph_base"], o["inet_down_cost"], o["inet_up_cost"], o["cpu_cores_effective"], o["inet_down"], o.get("gpu_max_power", "?")), file=sys.stderr)
 for o in candidates:
-    print(o["id"])')"
+    print(o["id"])')" || { echo "No suitable offer. The search required gpu_max_power >= $(( 350 * min_power_pct / 100 )) W; if that emptied it, lower NINFER_VAST_MIN_POWER_PCT (0 drops the filter and the check)." >&2; exit 1; }
 [[ -n "$offers" ]] || { echo "No suitable offer." >&2; exit 1; }
 if (( min_power_pct > 0 )); then
   echo "Renting the first one that boots with a power limit of at least ${min_power_pct}% of the card's default."
