@@ -17,6 +17,7 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
 | Regenerate the GGML lookup tables or golden decoder fixtures from ggml b11316 | [`artifact/gen_ggml_tables.py`](artifact/gen_ggml_tables.py), [`artifact/gen_ggml_fixtures.py`](artifact/gen_ggml_fixtures.py) |
 | Count the bytes one decoded token reads (roofline denominator) | [`decode_byte_accounting.py`](decode_byte_accounting.py) |
+| Predict decode and prefill speed from a model's shape, with no GPU (where do the bytes go, what is a what-if worth) | [`perf_model.py`](perf_model.py); [guide](../docs/maintainer/perf-model.md) |
 | Measure the card's sustained memory bandwidth | [`hbm_bandwidth_probe.cu`](hbm_bandwidth_probe.cu) |
 | One-time upgrade of official v2 artifacts | [`upgrade_ninfer_v2_to_v3.py`](upgrade_ninfer_v2_to_v3.py), with positional `INPUT OUTPUT` paths |
 | Run benchmark matrices | [`bench/`](bench/README.md) |

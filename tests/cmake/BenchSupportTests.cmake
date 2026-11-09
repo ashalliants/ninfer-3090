@@ -37,3 +37,9 @@ add_test(NAME ninfer_prefill_depth_sweep_test
 # replay of a known allocator run must reproduce it exactly, or the tool's predictions mean nothing.
 add_test(NAME ninfer_host_arena_replay_test
   COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/bench/test_replay_host_arena.py)
+
+# The first-principles performance model (tools/perf_model.py): checked against the byte counts of
+# decode_byte_accounting.py, the RTX 3090 rows of docs/performance.md and the Engine's fitted prefill
+# cost table. Pure Python, no GPU.
+add_test(NAME ninfer_perf_model_test
+  COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/test_perf_model.py)

@@ -1,0 +1,608 @@
+#!/usr/bin/env python3
+"""A first-principles performance model of NInfer on a card you do not have, for a Mac.
+
+It answers "where do the bytes and the operations go, and how fast should this be?" from nothing but
+a model's shape and the recipe that quantises it. Pure Python standard library: no GPU, no CUDA, no
+torch, no artifact file.
+
+    python tools/perf_model.py --model 27b --recipe qwen3_8_27b --depth 0 --depth 32768
+    python tools/perf_model.py --model 35b-a3b --recipe qwen3_6_35b_a3b --spec-k 3 --acceptance 0.6
+    python tools/perf_model.py --model 27b --recipe qwen3_8_27b --format output_head=q4
+    python tools/perf_model.py --config /path/to/config.json --recipe qwen3_8_27b --tok-s 49.0
+
+What it models, and how far to trust each part:
+
+  * **Decode bytes** (exact arithmetic). One decoded token streams every dense weight, one embedding
+    row, 8 of 256 routed experts per layer, the recurrent GDN state in and out, and the KV cache up to
+    the current depth. The weight arithmetic reproduces the artifact-header count of
+    `decode_byte_accounting.py` to within 0.02% (27B with the Q8 head that artifact had, and the
+    35B-A3B), without the artifact. `test_perf_model.py` pins both.
+  * **Decode speed** (a fitted model). `bytes / sustained read bandwidth + layers x a fixed cost per
+    layer`. The per-layer cost is the one fitted constant: it is chosen so the 27B (49.0 tok/s) and
+    the 35B-A3B (204.5 tok/s) measured on the RTX 3090 both come out within a few percent. Two points
+    and one constant make it consistent with those runs, not proven for a third model.
+  * **Speculative decode** (a model of a model). `tokens per round = 1 + acceptance x k`, `round time
+    = step time at k+1 tokens x the round-cost ratio`. Acceptance is accepted drafts over drafted
+    tokens, the definition `docs/performance/methodology.md` publishes. It is an input: no CPU-side
+    model predicts it, a real draft model on real text does.
+  * **Prefill** (a calibrated ceiling). `2 x active parameters` operations per token against the INT8
+    tensor peak, times an efficiency measured per family (dense 27B, MoE 35B-A3B), plus attention.
+    Cross-checked against the Engine's own fitted cost table in `prefill_time_model.py`.
+
+What it can NOT tell you: anything that needs the hardware to run. Bank conflicts, occupancy,
+register spills, how well memory and compute overlap, launch gaps and L2 behaviour all show up only
+as the gap between this model and a measurement. That gap is the point: pass `--tok-s` and the tool
+prints it in milliseconds, which says how much a kernel-level win could still be worth before you
+rent a card. Whenever the model disagrees with a measurement, the measurement is right.
+
+The recipes below mirror `tools/convert/official_recipes.py`; keep them in step when it changes.
+Norm weights and biases are ignored (well under 0.1% of the bytes).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Sequence
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from decode_byte_accounting import (  # noqa: E402  (shared constants: one source for the card)
+    ACHIEVABLE_READ_GB_S,
+    ADVERTISED_GB_S,
+    SPARSE_MOE_EXPERTS,
+    SPARSE_MOE_TOP_K,
+)
+
+# ---------------------------------------------------------------------------------------------
+# Formats. Bits per weight include the scale, from docs/maintainer/tensor-formats.md.
+# ---------------------------------------------------------------------------------------------
+FORMAT_BITS = {
+    "q4": 4.25,  # q4_g64_fp16
+    "q5": 5.25,  # q5_g64_fp16
+    "q6": 6.25,  # q6_g64_fp16
+    "q8": 8.5,  # q8_g32_fp16
+    "t2": 2.125,  # t2_g128_fp16
+    "nvfp4": 4.5,  # E2M1 plus one E4M3 scale per 16 (the FP32 divisor is per tensor)
+    "fp8": 8.0,  # fp8_e4m3fn_row_bf16 (one BF16 per row, negligible)
+    "bf16": 16.0,
+    "fp32": 32.0,
+}
+
+# Bytes per KV element, including the scale. 33/32 reproduces the 10,560 B/token that the 35B-A3B
+# roofline run passed to decode_byte_accounting.py (10 attention layers x 2 x 2 heads x 256).
+KV_BYTES_PER_ELEMENT = {"bf16": 2.0, "int8": 33 / 32}
+
+
+@dataclass(frozen=True)
+class Hardware:
+    name: str
+    read_gb_s: float  # sustained read, the ceiling decode streams against
+    advertised_gb_s: float
+    int8_tops: float  # dense INT8 tensor peak, the prefill matmul ceiling
+
+
+# Measured on this fork's card: tools/hbm_bandwidth_probe.cu and tools/tensor_core_rate_probe.cu
+# (docs/performance/bonsai2-27b-rtx3090.md: "int8 m16n8k32 peak at 316 TOPS (1,695 MHz)").
+RTX_3090 = Hardware("RTX 3090", ACHIEVABLE_READ_GB_S, ADVERTISED_GB_S, 316.0)
+
+
+@dataclass(frozen=True)
+class Calibration:
+    """Constants fitted to measurements. Each says where it came from; change them with a new run."""
+
+    # Fixed cost per transformer block per decoded step: norms, small kernels, tails of waves.
+    # Fitted so the 27B (64 layers, 49.0 tok/s) and the 35B-A3B (40 layers, 204.5 tok/s) plain
+    # decodes of docs/performance.md ("ninfer_bench, Engine route") both land within 2%.
+    per_layer_ms: float = 0.0425
+    # Prefill = steps x a fixed cost per step + matmul ops / (INT8 peak x efficiency) + attention.
+    # Both constants, per family, are solved from the 512- and 16,384-token rows of
+    # docs/performance.md (ninfer_bench, chunk 4096): 27B 2,057 and 2,893 tok/s, 35B-A3B 5,479 and
+    # 7,749. The 4,096-token rows (3,143 and 8,468) are held out and come out within 1%. The 27B fixed
+    # cost, 103 ms, agrees with the 107.8 ms the Engine fitted independently (context_cost_defaults).
+    # The MoE's efficiency is low because grouped expert GEMMs of a few hundred rows each cannot fill
+    # the tensor cores.
+    prefill_eff_dense: float = 0.544
+    prefill_eff_moe: float = 0.149
+    prefill_step_ms_dense: float = 103.3
+    prefill_step_ms_moe: float = 40.1
+    # Attention in prefill, from the Engine's fitted 27B pair cost (4.54 ns/pair, context_cost_defaults).
+    prefill_attention_eff: float = 0.274
+    # Speculative round time over the plain step at the same bytes: 22.3 ms step, 1.15x
+    # (docs/performance.md, "MTP round/plain step ratio"). Measured on the 27B only.
+    spec_round_ratio: float = 1.15
+
+
+CALIBRATION = Calibration()
+
+# ---------------------------------------------------------------------------------------------
+# Geometry: the fields of a Qwen3.5 text config (src/models/qwen3_5/config.cpp).
+# ---------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Geometry:
+    hidden: int
+    layer_full: tuple[bool, ...]  # True = gated full attention, False = GDN
+    q_heads: int
+    kv_heads: int
+    head_dim: int
+    gdn_key_heads: int
+    gdn_value_heads: int
+    gdn_key_dim: int
+    gdn_value_dim: int
+    conv_width: int
+    dense_ffn: int  # 0 for an MoE
+    experts: int  # 0 for a dense model
+    top_k: int
+    moe_ffn: int
+    shared_ffn: int
+    vocab: int
+
+    @property
+    def layers(self) -> int:
+        return len(self.layer_full)
+
+    @property
+    def is_moe(self) -> bool:
+        return self.experts > 0
+
+    @property
+    def full_layers(self) -> int:
+        return sum(self.layer_full)
+
+    @classmethod
+    def from_config(cls, config: dict) -> "Geometry":
+        """Reads a HuggingFace-style config.json (the text part, possibly under `text_config`)."""
+        cfg = config.get("text_config", config)
+        layers = int(cfg["num_hidden_layers"])
+        if "layer_types" in cfg:
+            full = tuple(t == "full_attention" for t in cfg["layer_types"])
+        else:
+            interval = int(cfg.get("full_attention_interval", 4))
+            full = tuple(i % interval == interval - 1 for i in range(layers))
+        if len(full) != layers:
+            raise SystemExit("layer_types does not have num_hidden_layers entries")
+        return cls(
+            hidden=int(cfg["hidden_size"]),
+            layer_full=full,
+            q_heads=int(cfg["num_attention_heads"]),
+            kv_heads=int(cfg["num_key_value_heads"]),
+            head_dim=int(cfg["head_dim"]),
+            gdn_key_heads=int(cfg["linear_num_key_heads"]),
+            gdn_value_heads=int(cfg["linear_num_value_heads"]),
+            gdn_key_dim=int(cfg["linear_key_head_dim"]),
+            gdn_value_dim=int(cfg["linear_value_head_dim"]),
+            conv_width=int(cfg["linear_conv_kernel_dim"]),
+            dense_ffn=int(cfg.get("intermediate_size", 0)) if "num_experts" not in cfg else 0,
+            experts=int(cfg.get("num_experts", 0)),
+            top_k=int(cfg.get("num_experts_per_tok", 0)),
+            moe_ffn=int(cfg.get("moe_intermediate_size", 0)),
+            shared_ffn=int(cfg.get("shared_expert_intermediate_size", 0)),
+            vocab=int(cfg["vocab_size"]),
+        )
+
+
+# The two official geometries, from docs/maintainer/qwen3_5-model.md "Current official geometries".
+PRESETS = {
+    "27b": {
+        "hidden_size": 5120, "num_hidden_layers": 64, "num_attention_heads": 24,
+        "num_key_value_heads": 4, "head_dim": 256, "linear_num_key_heads": 16,
+        "linear_num_value_heads": 48, "linear_key_head_dim": 128, "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4, "intermediate_size": 17408, "vocab_size": 248320,
+    },
+    "35b-a3b": {
+        "hidden_size": 2048, "num_hidden_layers": 40, "num_attention_heads": 16,
+        "num_key_value_heads": 2, "head_dim": 256, "linear_num_key_heads": 16,
+        "linear_num_value_heads": 32, "linear_key_head_dim": 128, "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4, "num_experts": SPARSE_MOE_EXPERTS,
+        "num_experts_per_tok": SPARSE_MOE_TOP_K,
+        "moe_intermediate_size": 512, "shared_expert_intermediate_size": 512,
+        "vocab_size": 248320,
+    },
+}
+
+# ---------------------------------------------------------------------------------------------
+# Weights: every matrix the decode or prefill path touches, by role.
+# ---------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Weight:
+    role: str
+    layer: int | None
+    rows: int  # for experts: rows of the whole bank (experts x per-expert rows)
+    cols: int
+    fmt: str
+    experts: int = 0  # routed bank: selection scales the bytes read
+    embedding: bool = False  # a lookup table: one row per token
+
+    @property
+    def params(self) -> int:
+        return self.rows * self.cols
+
+    @property
+    def resident_bytes(self) -> float:
+        return self.params * FORMAT_BITS[self.fmt] / 8
+
+    def read_bytes(self, geo: Geometry, tokens: int) -> float:
+        """Bytes streamed for one step over `tokens` columns, assuming uniform expert choice."""
+        if self.embedding:
+            return self.resident_bytes * tokens / geo.vocab
+        if self.experts:
+            return self.resident_bytes * expert_fraction(geo.experts, geo.top_k, tokens)
+        return self.resident_bytes
+
+    def active_params(self, geo: Geometry) -> float:
+        """Parameters that multiply each token: the matmul work in prefill."""
+        if self.embedding:
+            return 0.0
+        if self.experts:
+            return self.params * geo.top_k / geo.experts
+        return float(self.params)
+
+
+def expert_fraction(experts: int, top_k: int, tokens: int) -> float:
+    """Share of a routed bank one step touches. Uniform routing is an upper bound for T > 1: real
+    routing repeats experts across neighbouring tokens, so the true union is smaller."""
+    return 1.0 - (1.0 - top_k / experts) ** tokens
+
+
+# A recipe maps (role, layer) to a format. Mirrors tools/convert/official_recipes.py.
+Recipe = Callable[[str, int | None], str]
+ALWAYS_BF16 = {"gdn.a", "gdn.b", "gdn.convolution", "moe.router", "moe.shared_score"}
+
+
+def _dense_groupwise(embedding: str, head: str, q4_tail: bool) -> Recipe:
+    q4_roles = {"attention.query", "attention.key", "gdn.query", "gdn.key", "mlp.gate", "mlp.up"}
+    tail_roles = {"attention.output", "gdn.output", "mlp.down"}
+
+    def fmt(role: str, layer: int | None) -> str:
+        if role == "embedding":
+            return embedding
+        if role == "output_head":
+            return head
+        if role in ALWAYS_BF16:
+            return "bf16"
+        if role in q4_roles or (q4_tail and role in tail_roles and (layer or 0) >= 36):
+            return "q4"
+        return "q5"
+
+    return fmt
+
+
+def _moe_35b(role: str, layer: int | None) -> str:
+    if role == "embedding":
+        return "q8"
+    if role == "output_head":
+        return "q6"
+    if role in ALWAYS_BF16:
+        return "bf16"
+    if role == "experts.down":
+        return "q6" if layer in (34, 38, 39) else "q5"
+    if role in ("experts.gate", "experts.up"):
+        return "q4"
+    return "q8"
+
+
+RECIPES: dict[str, Recipe] = {
+    "qwen3_6_27b": _dense_groupwise("q6", "q6", q4_tail=False),
+    "qwen3_8_27b": _dense_groupwise("q4", "q6", q4_tail=True),
+    "qwen3_6_35b_a3b": _moe_35b,
+}
+
+
+def build_weights(geo: Geometry, recipe: Recipe, overrides: dict[str, str] | None = None) -> list[Weight]:
+    overrides = overrides or {}
+    out: list[Weight] = []
+
+    def add(role: str, layer: int | None, rows: int, cols: int, *, experts: int = 0,
+            embedding: bool = False) -> None:
+        fmt = overrides.get(role) or recipe(role, layer)
+        out.append(Weight(role, layer, rows, cols, fmt, experts, embedding))
+
+    h = geo.hidden
+    add("embedding", None, geo.vocab, h, embedding=True)
+    q_width = geo.q_heads * geo.head_dim
+    kv_width = geo.kv_heads * geo.head_dim
+    gk = geo.gdn_key_heads * geo.gdn_key_dim
+    gv = geo.gdn_value_heads * geo.gdn_value_dim
+    for i, full in enumerate(geo.layer_full):
+        if full:
+            add("attention.query", i, q_width, h)
+            add("attention.gate", i, q_width, h)
+            add("attention.key", i, kv_width, h)
+            add("attention.value", i, kv_width, h)
+            add("attention.output", i, h, q_width)
+        else:
+            add("gdn.query", i, gk, h)
+            add("gdn.key", i, gk, h)
+            add("gdn.value", i, gv, h)
+            add("gdn.z", i, gv, h)
+            add("gdn.a", i, geo.gdn_value_heads, h)
+            add("gdn.b", i, geo.gdn_value_heads, h)
+            add("gdn.convolution", i, 2 * gk + gv, geo.conv_width)
+            add("gdn.output", i, h, gv)
+        if geo.is_moe:
+            add("moe.router", i, geo.experts, h)
+            add("moe.shared_score", i, 1, h)
+            add("moe.shared.gate", i, geo.shared_ffn, h)
+            add("moe.shared.up", i, geo.shared_ffn, h)
+            add("moe.shared.down", i, h, geo.shared_ffn)
+            add("experts.gate", i, geo.experts * geo.moe_ffn, h, experts=geo.experts)
+            add("experts.up", i, geo.experts * geo.moe_ffn, h, experts=geo.experts)
+            add("experts.down", i, geo.experts * h, geo.moe_ffn, experts=geo.experts)
+        else:
+            add("mlp.gate", i, geo.dense_ffn, h)
+            add("mlp.up", i, geo.dense_ffn, h)
+            add("mlp.down", i, h, geo.dense_ffn)
+    add("output_head", None, geo.vocab, h)
+
+    unknown = set(overrides) - {w.role for w in out}
+    if unknown:
+        raise SystemExit(f"--format names roles this model does not have: {sorted(unknown)}; "
+                         f"valid roles: {sorted({w.role for w in out})}")
+    return out
+
+
+# ---------------------------------------------------------------------------------------------
+# Decode
+# ---------------------------------------------------------------------------------------------
+
+
+def kv_bytes_per_token(geo: Geometry, kv: str) -> float:
+    return geo.full_layers * 2 * geo.kv_heads * geo.head_dim * KV_BYTES_PER_ELEMENT[kv]
+
+
+def gdn_state_bytes(geo: Geometry, state_bytes: int) -> float:
+    """The recurrent state S[Dv, Dk] per value head, per GDN layer, FP32 unless --gdn-state-fp16."""
+    gdn_layers = geo.layers - geo.full_layers
+    return gdn_layers * geo.gdn_value_heads * geo.gdn_value_dim * geo.gdn_key_dim * state_bytes
+
+
+@dataclass
+class DecodeStep:
+    tokens: int
+    depth: int
+    by_role: dict[str, float]  # bytes per role, weights only
+    weights: float
+    state_rw: float  # read plus write of the recurrent state, once per step
+    kv: float
+    layers: int
+    hardware: Hardware
+    cal: Calibration
+
+    @property
+    def total_bytes(self) -> float:
+        return self.weights + self.state_rw + self.kv
+
+    @property
+    def floor_ms(self) -> float:
+        return self.total_bytes / (self.hardware.read_gb_s * 1e9) * 1e3
+
+    @property
+    def overhead_ms(self) -> float:
+        return self.layers * self.cal.per_layer_ms
+
+    @property
+    def step_ms(self) -> float:
+        return self.floor_ms + self.overhead_ms
+
+    def ms_for(self, nbytes: float) -> float:
+        return nbytes / (self.hardware.read_gb_s * 1e9) * 1e3
+
+
+def decode_step(geo: Geometry, weights: Sequence[Weight], *, tokens: int = 1, depth: int = 0,
+                kv: str = "int8", kv_bpt: float | None = None, gdn_state_bytes_per: int = 4,
+                hardware: Hardware = RTX_3090, cal: Calibration = CALIBRATION) -> DecodeStep:
+    by_role: dict[str, float] = {}
+    for w in weights:
+        by_role[w.role] = by_role.get(w.role, 0.0) + w.read_bytes(geo, tokens)
+    per_token_kv = kv_bytes_per_token(geo, kv) if kv_bpt is None else kv_bpt
+    return DecodeStep(
+        tokens=tokens, depth=depth, by_role=by_role, weights=sum(by_role.values()),
+        state_rw=2 * gdn_state_bytes(geo, gdn_state_bytes_per), kv=per_token_kv * depth,
+        layers=geo.layers, hardware=hardware, cal=cal)
+
+
+def speculative(plain_bytes_step: DecodeStep, verify_step: DecodeStep, k: int, acceptance: float,
+                cal: Calibration = CALIBRATION) -> dict[str, float]:
+    """One verify round of k drafts. `acceptance` is accepted drafts / drafted tokens."""
+    tokens_per_round = 1.0 + acceptance * k
+    round_ms = verify_step.step_ms * cal.spec_round_ratio
+    tok_s = tokens_per_round / round_ms * 1e3
+    plain_tok_s = 1e3 / plain_bytes_step.step_ms
+    return {"k": k, "acceptance": acceptance, "tokens_per_round": tokens_per_round,
+            "round_ms": round_ms, "round_over_plain": round_ms / plain_bytes_step.step_ms,
+            "tok_s": tok_s, "speedup": tok_s / plain_tok_s}
+
+
+# ---------------------------------------------------------------------------------------------
+# Prefill
+# ---------------------------------------------------------------------------------------------
+
+
+def prefill(geo: Geometry, weights: Sequence[Weight], prompt: int, hardware: Hardware = RTX_3090,
+            cal: Calibration = CALIBRATION, chunk: int = 4096) -> dict[str, float]:
+    """A prompt processed in chunks. The fixed cost is paid once per chunk, so it dominates short
+    prompts; the constants were measured at chunk 4096, and other chunk sizes are an extrapolation."""
+    active = sum(w.active_params(geo) for w in weights if w.role != "output_head")
+    ops_per_token = 2.0 * active
+    matmul_ops = ops_per_token * prompt
+    pairs = prompt * (prompt + 1) / 2
+    attention_ops = pairs * 4 * geo.q_heads * geo.head_dim * geo.full_layers
+    eff = cal.prefill_eff_moe if geo.is_moe else cal.prefill_eff_dense
+    step_ms = cal.prefill_step_ms_moe if geo.is_moe else cal.prefill_step_ms_dense
+    steps = -(-prompt // chunk)
+    peak = hardware.int8_tops * 1e12
+    fixed_s = steps * step_ms / 1e3
+    matmul_s = matmul_ops / (peak * eff)
+    attention_s = attention_ops / (peak * cal.prefill_attention_eff)
+    total_s = fixed_s + matmul_s + attention_s
+    ceiling_s = (matmul_ops + attention_ops) / peak
+    return {"prompt": prompt, "chunk": chunk, "steps": steps, "ops_per_token": ops_per_token,
+            "fixed_s": fixed_s, "matmul_s": matmul_s, "attention_s": attention_s,
+            "total_s": total_s, "tok_s": prompt / total_s, "ceiling_tok_s": prompt / ceiling_s,
+            "matmul_efficiency": eff}
+
+
+# ---------------------------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------------------------
+
+
+def _decode_table(step: DecodeStep, top: int) -> list[dict]:
+    rows = sorted(step.by_role.items(), key=lambda kv: -kv[1])
+    shown, rest = rows[:top], rows[top:]
+    table = [{"role": r, "bytes": b} for r, b in shown]
+    if rest:
+        table.append({"role": f"({len(rest)} smaller roles)", "bytes": sum(b for _, b in rest)})
+    table.append({"role": "gdn state (read + write)", "bytes": step.state_rw})
+    if step.kv:
+        table.append({"role": f"kv cache @ {step.depth:,} tokens", "bytes": step.kv})
+    for row in table:
+        row["share"] = row["bytes"] / step.total_bytes
+        row["ms"] = step.ms_for(row["bytes"])
+        # tok/s if this cost no bytes at all: the ceiling on what optimising it can buy.
+        row["tok_s_if_free"] = 1e3 / (step.step_ms - row["ms"])
+    return table
+
+
+def build_report(args: argparse.Namespace) -> dict:
+    if args.config:
+        geo = Geometry.from_config(json.loads(Path(args.config).read_text()))
+        label = Path(args.config).name
+    else:
+        geo = Geometry.from_config(PRESETS[args.model])
+        label = args.model
+    overrides = dict(parse_format(item) for item in args.format)
+    weights = build_weights(geo, RECIPES[args.recipe], overrides)
+    hardware = Hardware(RTX_3090.name, args.bandwidth_gb_s or RTX_3090.read_gb_s,
+                        RTX_3090.advertised_gb_s, args.int8_tops or RTX_3090.int8_tops)
+    state_bytes = 2 if args.gdn_state_fp16 else 4
+    depths = args.depth or [0]
+
+    report: dict = {
+        "model": label, "recipe": args.recipe, "overrides": overrides, "hardware": hardware.name,
+        "read_gb_s": hardware.read_gb_s, "int8_tops": hardware.int8_tops,
+        "layers": geo.layers, "moe": geo.is_moe,
+        "resident_gb": sum(w.resident_bytes for w in weights) / 1e9,
+        "decode": [],
+    }
+    for depth in depths:
+        step = decode_step(geo, weights, depth=depth, kv=args.kv, kv_bpt=args.kv_bytes_per_token,
+                           gdn_state_bytes_per=state_bytes, hardware=hardware)
+        entry = {"depth": depth, "table": _decode_table(step, args.top),
+                 "total_gb": step.total_bytes / 1e9, "floor_ms": step.floor_ms,
+                 "floor_tok_s": 1e3 / step.floor_ms, "overhead_ms": step.overhead_ms,
+                 "step_ms": step.step_ms, "tok_s": 1e3 / step.step_ms}
+        if args.spec_k:
+            verify = decode_step(geo, weights, tokens=args.spec_k + 1, depth=depth, kv=args.kv,
+                                 kv_bpt=args.kv_bytes_per_token, gdn_state_bytes_per=state_bytes,
+                                 hardware=hardware)
+            entry["speculative"] = speculative(step, verify, args.spec_k, args.acceptance)
+        report["decode"].append(entry)
+    if args.tok_s is not None:
+        first = report["decode"][0]
+        measured_ms = 1e3 / args.tok_s
+        report["measured"] = {"tok_s": args.tok_s, "ms": measured_ms,
+                              "model_error_pct": 100 * (first["tok_s"] / args.tok_s - 1),
+                              "gap_over_floor_ms": measured_ms - first["floor_ms"],
+                              "pct_of_floor": 100 * first["floor_ms"] / measured_ms}
+    report["prefill"] = [prefill(geo, weights, n, hardware, chunk=args.chunk)
+                         for n in (args.prompt or [4096])]
+    return report
+
+
+def parse_format(item: str) -> tuple[str, str]:
+    role, sep, fmt = item.partition("=")
+    if not sep or fmt not in FORMAT_BITS:
+        raise SystemExit(f"--format wants ROLE=FORMAT with FORMAT one of {sorted(FORMAT_BITS)}; got {item!r}")
+    return role, fmt
+
+
+def print_report(r: dict, spec_k: int) -> None:
+    print(f"{r['model']} / recipe {r['recipe']}"
+          + (f" / overrides {r['overrides']}" if r["overrides"] else "")
+          + f"   on {r['hardware']}: {r['read_gb_s']:.1f} GB/s read, {r['int8_tops']:.0f} INT8 TOPS")
+    print(f"resident weights {r['resident_gb']:.2f} GB, {r['layers']} layers"
+          f"{', MoE' if r['moe'] else ', dense'}")
+    for d in r["decode"]:
+        print(f"\nDECODE one token, depth {d['depth']:,}")
+        print(f"  {'bytes read':<30}{'GB':>8}{'share':>8}{'ms':>7}{'tok/s if free':>15}")
+        for row in d["table"]:
+            print(f"  {row['role']:<30}{row['bytes'] / 1e9:>8.3f}{100 * row['share']:>7.1f}%"
+                  f"{row['ms']:>7.2f}{row['tok_s_if_free']:>15.1f}")
+        print(f"  {'total':<30}{d['total_gb']:>8.3f}")
+        print(f"  bandwidth floor        {d['floor_ms']:6.2f} ms  = {d['floor_tok_s']:7.1f} tok/s")
+        print(f"  + per-layer overhead   {d['overhead_ms']:6.2f} ms")
+        print(f"  predicted              {d['step_ms']:6.2f} ms  = {d['tok_s']:7.1f} tok/s")
+        spec = d.get("speculative")
+        if spec:
+            print(f"  speculative k={spec['k']}, acceptance {spec['acceptance']:.0%}: "
+                  f"{spec['tokens_per_round']:.2f} tokens/round, round {spec['round_ms']:.2f} ms "
+                  f"({spec['round_over_plain']:.2f}x a plain step) = {spec['tok_s']:.1f} tok/s, "
+                  f"{spec['speedup']:.2f}x plain")
+    if "measured" in r:
+        m = r["measured"]
+        print(f"\nMEASURED {m['tok_s']:.1f} tok/s ({m['ms']:.2f} ms/token) at depth "
+              f"{r['decode'][0]['depth']:,}")
+        print(f"  model is {m['model_error_pct']:+.1f}% off; the measurement runs at "
+              f"{m['pct_of_floor']:.0f}% of the bandwidth floor,")
+        print(f"  leaving {m['gap_over_floor_ms']:.2f} ms/token that bytes do not explain: that is "
+              f"what kernel work can still win.")
+    for p in r["prefill"]:
+        print(f"\nPREFILL {p['prompt']:,}-token prompt: {p['tok_s']:,.0f} tok/s predicted "
+              f"({p['total_s']:.2f} s = {p['steps']} x fixed {p['fixed_s'] / p['steps']:.3f} s + "
+              f"matmul {p['matmul_s']:.2f} s at {100 * p['matmul_efficiency']:.0f}% of peak + "
+              f"attention {p['attention_s']:.2f} s)")
+        print(f"  {p['ops_per_token'] / 1e9:.1f} GOP/token; the INT8 peak alone would give "
+              f"{p['ceiling_tok_s']:,.0f} tok/s")
+    print("\nA model, not a measurement. Disagreement with a real run is the finding.")
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--model", choices=sorted(PRESETS), default="27b")
+    source.add_argument("--config", help="a model's config.json instead of a preset")
+    parser.add_argument("--recipe", choices=sorted(RECIPES), default="qwen3_8_27b")
+    parser.add_argument("--format", action="append", default=[], metavar="ROLE=FORMAT",
+                        help="what-if: store ROLE (e.g. output_head, mlp.down) in FORMAT "
+                             f"({', '.join(sorted(FORMAT_BITS))}); repeatable")
+    parser.add_argument("--depth", type=int, action="append", help="KV depth in tokens; repeatable")
+    parser.add_argument("--kv", choices=sorted(KV_BYTES_PER_ELEMENT), default="int8")
+    parser.add_argument("--kv-bytes-per-token", type=float,
+                        help="exact value from ninfer_bench; overrides --kv (needed for rk4v4)")
+    parser.add_argument("--gdn-state-fp16", action="store_true")
+    parser.add_argument("--spec-k", type=int, default=0, help="drafts per round; 0 = no speculation")
+    parser.add_argument("--acceptance", type=float, default=0.6,
+                        help="accepted drafts / drafted tokens, from a real run")
+    parser.add_argument("--tok-s", type=float, help="measured plain-decode tok/s at the first depth")
+    parser.add_argument("--prompt", type=int, action="append", help="prompt tokens; repeatable")
+    parser.add_argument("--chunk", type=int, default=4096, help="prefill chunk size in tokens")
+    parser.add_argument("--bandwidth-gb-s", type=float, help="sustained read rate of another card")
+    parser.add_argument("--int8-tops", type=float, help="INT8 tensor peak of another card")
+    parser.add_argument("--top", type=int, default=8, help="roles to list individually")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    if args.spec_k < 0 or not 0.0 <= args.acceptance <= 1.0:
+        parser.error("--spec-k must be >= 0 and --acceptance within [0, 1]")
+    return args
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    report = build_report(args)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print_report(report, args.spec_k)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
