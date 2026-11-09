@@ -530,7 +530,9 @@ ContextStore::ContextStore(Options options) : options_(std::move(options)) {
     }
     if (options_.remote) {
         remote_thread_ = std::thread([this] { remote_loop(); });
-        enqueue_remote({RemoteTask::Kind::Refresh, std::string(), {}, {}, {}, {}});
+        if (options_.refresh_on_start) {
+            enqueue_remote({RemoteTask::Kind::Refresh, std::string(), {}, {}, {}, {}});
+        }
     }
     if (!options_.peers.empty()) { peer_thread_ = std::thread([this] { peer_loop(); }); }
 }

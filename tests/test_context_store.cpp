@@ -526,8 +526,22 @@ ContextStore::Options remote_options(const fs::path& directory,
     ContextStore::Options options = options_for(directory);
     options.remote                = remote;
     options.remote_prefix         = "ninfer/";
-    options.remote_refresh        = std::chrono::seconds(3600); // tests refresh explicitly
+    // Turns off the periodic refresh only. A store with a remote still queues one refresh as it
+    // starts: a test that waits for it uses drained(); a test that calls refresh_remote() and
+    // counts what it did must use remote_options_refreshing_explicitly() so the two cannot race.
+    options.remote_refresh        = std::chrono::seconds(3600);
     options.clock                 = [remote] { return remote->clock; };
+    return options;
+}
+
+// For a store whose test calls refresh_remote() and checks how many images or manifest downloads it
+// accounts for. remote_options() leaves the refresh a store queues as it starts on, and that
+// background refresh races the explicit one: whichever runs second finds nothing to do, or the two
+// overlap and a download is counted twice.
+ContextStore::Options remote_options_refreshing_explicitly(const fs::path& directory,
+                                                           const std::shared_ptr<MemoryObjectStore>& remote) {
+    ContextStore::Options options = remote_options(directory, remote);
+    options.refresh_on_start      = false;
     return options;
 }
 
@@ -703,7 +717,7 @@ void test_fetch_bytes_and_lookup_on_demand() {
     TempDirectory directory;
     TempDirectory other_directory;
     auto remote = std::make_shared<MemoryObjectStore>();
-    ContextStore other(remote_options(other_directory.path(), remote));
+    ContextStore other(remote_options_refreshing_explicitly(other_directory.path(), remote));
     check(drained(other), "the start-up refresh did not finish");
     {
         ContextStore store(remote_options(directory.path(), remote));
@@ -1311,7 +1325,7 @@ void test_fetch_install_failure_is_a_miss() {
 void test_failed_upload_keeps_the_local_copy_and_releases_superseded() {
     TempDirectory directory;
     auto remote = std::make_shared<MemoryObjectStore>();
-    ContextStore::Options options = remote_options(directory.path(), remote);
+    ContextStore::Options options = remote_options_refreshing_explicitly(directory.path(), remote);
     ContextStore store(options);
     put_turn(store, 1);
     check(drained(store), "the first turn did not upload");
@@ -1364,7 +1378,7 @@ void test_remote_upload_and_second_engine() {
         check(remote->puts - before == 3, "a rewritten image uploaded chunks the bucket already had");
     }
     // A second engine with an empty directory sees the image and fetches it when asked.
-    ContextStore other(remote_options(second_directory.path(), remote));
+    ContextStore other(remote_options_refreshing_explicitly(second_directory.path(), remote));
     check(other.refresh_remote() == 1 && other.list().size() == 1, "the remote image was not listed");
     check(!other.list()[0].local, "an image not fetched yet reports itself local");
     check(other.stats().remote_images == 1, "the remote-only image was not counted");
@@ -1648,6 +1662,33 @@ std::uint64_t fill_bucket_with_sessions(const std::shared_ptr<MemoryObjectStore>
     return manifest_bytes;
 }
 
+// A store with a remote queues one refresh as it starts, so an image another engine left in the bucket
+// is there at once; refresh_on_start = false leaves the first refresh to the caller. The tests that
+// call refresh_remote() and count what it did rely on that: a refresh of the store's own, racing
+// theirs, made them fail one run in several.
+void test_the_refresh_queued_at_start_can_be_turned_off() {
+    TempDirectory writer_directory;
+    TempDirectory started_directory;
+    TempDirectory explicit_directory;
+    auto remote      = std::make_shared<MemoryObjectStore>();
+    const auto image = concat({pseudo_random(30, 1), pseudo_random(3000, 2)});
+    {
+        ContextStore writer(remote_options(writer_directory.path(), remote));
+        (void)writer.put(describe("0a"), image, std::array{ContextStore::Region{30, 3000}});
+        check(drained(writer), "upload");
+    }
+    ContextStore started(remote_options(started_directory.path(), remote));
+    check(drained(started) && started.find("0a"), "a store did not refresh as it started");
+
+    const int gets_before = remote->manifest_gets;
+    ContextStore explicit_store(remote_options_refreshing_explicitly(explicit_directory.path(), remote));
+    check(drained(explicit_store), "a store with nothing queued did not report drained");
+    check(!explicit_store.find("0a") && remote->manifest_gets == gets_before,
+          "a store told not to refresh as it started read the bucket anyway");
+    check(explicit_store.refresh_remote() == 1 && explicit_store.find("0a"),
+          "the explicit refresh did not register the image: nothing else should have taken it");
+}
+
 // A bucket with very many sessions must not grow the directory through manifests alone: the
 // manifests of images the directory holds no chunk of take a quarter of max_bytes, filled with the
 // newest in the bucket. Whether an older manifest stays is known only once it is downloaded (it may
@@ -1657,7 +1698,7 @@ void test_remote_only_manifests_are_bounded_by_max_bytes() {
     TempDirectory reader_directory;
     auto remote                        = std::make_shared<MemoryObjectStore>();
     const std::uint64_t manifest_bytes = fill_bucket_with_sessions(remote, writer_directory.path());
-    ContextStore::Options options      = remote_options(reader_directory.path(), remote);
+    ContextStore::Options options      = remote_options_refreshing_explicitly(reader_directory.path(), remote);
     options.max_bytes = 4 * (3 * manifest_bytes + manifest_bytes / 2); // the share holds three
     ContextStore reader(options);
     check(reader.refresh_remote() == 3 && reader.list().size() == 3,
@@ -1805,7 +1846,7 @@ void test_remote_only_drop_follows_entries_swapped_during_registration() {
     TempDirectory reader_directory;
     auto remote                        = std::make_shared<MemoryObjectStore>();
     const std::uint64_t manifest_bytes = fill_bucket_with_sessions(remote, writer_directory.path());
-    ContextStore::Options options      = remote_options(reader_directory.path(), remote);
+    ContextStore::Options options      = remote_options_refreshing_explicitly(reader_directory.path(), remote);
     options.max_bytes = 4 * (3 * manifest_bytes + manifest_bytes / 2); // the share holds three
     options.ttl       = std::chrono::seconds(1000);
     remote->down      = true;
@@ -1880,7 +1921,7 @@ void test_remote_only_share_ignores_manifests_with_local_chunks() {
     TempDirectory reader_directory;
     auto remote                        = std::make_shared<MemoryObjectStore>();
     const std::uint64_t manifest_bytes = fill_bucket_with_sessions(remote, writer_directory.path());
-    ContextStore::Options options      = remote_options(reader_directory.path(), remote);
+    ContextStore::Options options      = remote_options_refreshing_explicitly(reader_directory.path(), remote);
     options.max_bytes = 4 * (3 * manifest_bytes + manifest_bytes / 2);
     // The bucket is out of reach while the store starts, so its first refresh registers nothing.
     remote->down = true;
@@ -1906,7 +1947,7 @@ void test_full_share_does_not_decline_images_with_local_chunks() {
     TempDirectory reader_directory;
     auto remote                        = std::make_shared<MemoryObjectStore>();
     const std::uint64_t manifest_bytes = fill_bucket_with_sessions(remote, writer_directory.path());
-    ContextStore::Options options      = remote_options(reader_directory.path(), remote);
+    ContextStore::Options options      = remote_options_refreshing_explicitly(reader_directory.path(), remote);
     options.max_bytes = 4 * (3 * manifest_bytes + manifest_bytes / 2); // the share holds three
     remote->down = true;
     ContextStore reader(options);
@@ -1975,7 +2016,7 @@ void test_remote_damage_and_outage_are_misses() {
             break;
         }
     }
-    ContextStore other(remote_options(other_directory.path(), remote));
+    ContextStore other(remote_options_refreshing_explicitly(other_directory.path(), remote));
     (void)other.refresh_remote();
     check(other.list().size() == 1, "the image was not listed before the damage was found");
     check(!other.load("0a").has_value(), "a damaged remote chunk produced an image");
@@ -2011,7 +2052,7 @@ void test_remote_refresh_respects_its_deadline() {
     auto remote = std::make_shared<MemoryObjectStore>();
     // Opened first, so the refresh every store queues at start-up finds the bucket empty and cannot
     // register the images before the refreshes under test do.
-    ContextStore other(remote_options(other_directory.path(), remote));
+    ContextStore other(remote_options_refreshing_explicitly(other_directory.path(), remote));
     check(drained(other), "the start-up refresh did not finish");
     {
         ContextStore store(remote_options(directory.path(), remote));
@@ -2087,7 +2128,7 @@ void test_remote_rewrite_lifts_the_quarantine() {
             break;
         }
     }
-    ContextStore other(remote_options(other_directory.path(), remote));
+    ContextStore other(remote_options_refreshing_explicitly(other_directory.path(), remote));
     (void)other.refresh_remote();
     check(!other.load("0a").has_value() && other.list().empty(), "the damaged image was not quarantined");
     check(other.refresh_remote() == 0, "a quarantined image was imported again");
@@ -2156,7 +2197,7 @@ void test_remote_quarantine_ends_when_the_manifest_is_rewritten() {
             break;
         }
     }
-    ContextStore other(remote_options(other_directory.path(), remote));
+    ContextStore other(remote_options_refreshing_explicitly(other_directory.path(), remote));
     (void)other.refresh_remote();
     check(!other.load("0a").has_value() && other.list().empty(), "the damaged image was not quarantined");
     check(other.refresh_remote() == 0, "a quarantined image was imported again");
@@ -2200,7 +2241,7 @@ void test_remote_listing_does_not_confirm_chunks() {
     auto remote = std::make_shared<MemoryObjectStore>();
     const std::vector<std::uint8_t> shared = pseudo_random(3000, 2);
     // Opened first, so its start-up refresh finds the bucket empty and the one below registers.
-    ContextStore other(remote_options(other_directory.path(), remote));
+    ContextStore other(remote_options_refreshing_explicitly(other_directory.path(), remote));
     check(drained(other), "the start-up refresh did not finish");
     {
         ContextStore store(remote_options(directory.path(), remote));
@@ -2276,7 +2317,7 @@ void test_absent_chunks_are_not_reused() {
                         std::array{ContextStore::Region{30, 4096}});
         check(drained(store), "upload a");
     }
-    ContextStore store(remote_options(second.path(), remote));
+    ContextStore store(remote_options_refreshing_explicitly(second.path(), remote));
     check(store.refresh_remote() == 1 && !store.list()[0].local, "the image was not registered");
     const auto result = store.put(describe("0c"), concat({pseudo_random(30, 2), shared}),
                                   std::array{ContextStore::Region{30, 4096}});
@@ -2386,7 +2427,7 @@ void test_local_ttl_does_not_hide_remote_images() {
         check(drained(store), "upload");
     }
     remote->clock += 3 * 24 * 3600 * 1000LL;
-    ContextStore::Options options = remote_options(second.path(), remote);
+    ContextStore::Options options = remote_options_refreshing_explicitly(second.path(), remote);
     options.ttl                   = std::chrono::hours(1);
     ContextStore store(options);
     check(store.refresh_remote() == 1, "an image older than the local TTL was not registered");
@@ -2395,7 +2436,7 @@ void test_local_ttl_does_not_hide_remote_images() {
     check(loaded && *loaded == image, "an image older than the local TTL could not be used");
     // The bucket drops it (lifecycle): a refresh drops it from the index too, once nothing local backs it.
     TempDirectory third;
-    ContextStore other(remote_options(third.path(), remote));
+    ContextStore other(remote_options_refreshing_explicitly(third.path(), remote));
     check(other.refresh_remote() == 1, "register");
     {
         std::scoped_lock lock(remote->mutex);
@@ -2626,7 +2667,7 @@ void test_remote_holds_compressed_objects_and_other_forms_interoperate() {
     check(packed_objects == 3 && raw_objects == 1, "the bucket does not hold compressed objects");
     // An engine that does not compress fetches them, and finds them when deciding what to upload.
     {
-        ContextStore b(remote_options(b_directory.path(), remote));
+        ContextStore b(remote_options_refreshing_explicitly(b_directory.path(), remote));
         check(b.refresh_remote() == 1, "the compressed image was not listed");
         const auto loaded = b.load("0b");
         check(loaded && *loaded == image, "an image fetched in compressed form differs");
@@ -2643,7 +2684,7 @@ void test_remote_holds_compressed_objects_and_other_forms_interoperate() {
         check(drained(d), "the raw upload did not drain");
     }
     TempDirectory e_directory;
-    ContextStore::Options e_options = remote_options(e_directory.path(), raw_remote);
+    ContextStore::Options e_options = remote_options_refreshing_explicitly(e_directory.path(), raw_remote);
     e_options.compress_chunks       = true;
     ContextStore e(e_options);
     check(e.refresh_remote() == 1, "the raw image was not listed");
@@ -3143,7 +3184,7 @@ struct PeerAndRemote {
     std::unique_ptr<ContextStore> a;
 
     PeerAndRemote() {
-        a = std::make_unique<ContextStore>(remote_options(a_directory.path(), remote));
+        a = std::make_unique<ContextStore>(remote_options_refreshing_explicitly(a_directory.path(), remote));
         (void)a->put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
         check(drained(*a), "the peer's upload did not drain");
     }
@@ -3899,6 +3940,7 @@ int main() {
     test_touch_does_not_refresh_a_present_retired_manifest();
     test_queued_upload_of_a_retired_version_is_dropped();
     test_remote_requests_are_abandoned_at_the_deadline();
+    test_the_refresh_queued_at_start_can_be_turned_off();
     test_remote_only_manifests_are_bounded_by_max_bytes();
     test_remote_only_share_holds_when_a_lookup_registers_during_a_refresh();
     test_remote_only_share_ignores_manifests_with_local_chunks();
