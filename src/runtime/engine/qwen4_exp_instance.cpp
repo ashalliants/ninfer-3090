@@ -434,6 +434,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         cpu.prefill_cpu_share_den = next.prefill_cpu_share.den;
         cpu.prefill_chunk         = options.prefill_chunk;
         cpu.max_context           = options.max_context;
+        cpu.partial_ram_residency = partial; // partial mode has no expert stream, so narrower calls
         const auto service  = models::qwen4_exp::plan_cpu_misses(cpu);
         cpu_misses_pageable = service.pageable; // the worker team's buffers
         demand.later_pinned += service.pinned;

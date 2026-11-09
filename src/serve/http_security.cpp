@@ -261,9 +261,10 @@ bool fetch_site_allowed(std::string_view sec_fetch_site, bool has_key, bool cors
 
 bool valid_allowed_host(std::string_view name) {
     const std::optional<Authority> authority = parse_authority(name);
-    // parse_authority accepts "name:" (an empty port); a value for the flag has no colon at all
-    // outside an IPv6 address's brackets.
-    const bool colon_outside = !name.starts_with('[') && name.find(':') != std::string_view::npos;
+    // parse_authority accepts "name:" and "[v6]:" (an empty port); a value for the flag has no colon
+    // at all outside an IPv6 address's brackets, so a bracketed one ends at its "]".
+    const bool colon_outside = name.starts_with('[') ? !name.ends_with(']')
+                                                     : name.find(':') != std::string_view::npos;
     return authority && !authority->port && !colon_outside;
 }
 

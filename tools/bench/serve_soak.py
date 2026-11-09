@@ -821,9 +821,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if unknown or not kinds:
         p.error(f"--kinds: unknown {unknown or 'empty list'}; choose from {', '.join(KINDS)}")
     args.kinds = kinds
-    if args.minutes < 0 or args.stall_seconds <= 0 or args.sample_seconds <= 0 \
+    if args.minutes < 0 or args.max_requests < 0 or args.stall_seconds <= 0 or args.sample_seconds <= 0 \
             or (args.max_concurrency is not None and args.max_concurrency < 1):
-        p.error("--minutes must be >= 0 and --stall-seconds, --sample-seconds, --max-concurrency positive")
+        p.error("--minutes and --max-requests must be >= 0 and --stall-seconds, --sample-seconds, "
+                "--max-concurrency positive")
     if args.drain_seconds is None:
         args.drain_seconds = args.stall_seconds + 30.0
     if args.timeout_seconds is None:

@@ -1059,15 +1059,17 @@ def smoke_dir(ctx: Ctx) -> Path:
 def run_package_step(ctx: Ctx, step: Step) -> dict:
     code, output = run_logged(["pwsh", "-NoProfile", "-File", str(REPO / "scripts" / "package-release.ps1")],
                               log_dir(ctx, step) / "package.log", env={"NINFER_BUILD_ROOT": str(ctx.build)}, cwd=REPO)
-    products = sorted((p for p in (REPO / "dist").glob("ninfer-rtx3090-windows-x64-*") if p.is_dir()),
-                      key=lambda p: p.stat().st_mtime)
-    if code != 0 or not products:
-        return result("FAIL", f"package-release.ps1 exited {code}: {tail(output, 3)}")
+    # The exact directory package-release.ps1 names from VERSION, never the newest-looking one in dist:
+    # older releases sit beside it.
+    product = REPO / "dist" / f"ninfer-rtx3090-windows-x64-{(REPO / 'VERSION').read_text().strip()}"
+    if code != 0 or not product.is_dir():
+        return result("FAIL", f"package-release.ps1 exited {code}, {product.name} "
+                              f"{'exists' if product.is_dir() else 'is missing'}: {tail(output, 3)}")
     target = smoke_dir(ctx)
     if target.exists():
         shutil.rmtree(target)
-    shutil.copytree(products[-1], target)
-    return result("PASS", f"packaged {products[-1].name}; copied to {target}", product=str(products[-1]))
+    shutil.copytree(product, target)
+    return result("PASS", f"packaged {product.name}; copied to {target}", product=str(product))
 
 
 def run_launcher_step(ctx: Ctx, step: Step) -> dict:
@@ -1082,10 +1084,13 @@ def run_launcher_step(ctx: Ctx, step: Step) -> dict:
         argv: list[str] | str = f'cmd /d /s /c ""{target / "run.bat"}" {key} {profile}"'
         extra = {}
     else:
-        if not (target / "run.sh").is_file():
-            target.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(REPO / "scripts" / "run.sh", target / "run.sh")
-            shutil.copytree(REPO / "scripts" / "profiles", target / "profiles", dirs_exist_ok=True)
+        # No package step on Linux: refresh the launcher and profiles from this checkout every time,
+        # so a tree an earlier run left behind is never what gets checked.
+        if target.exists():
+            shutil.rmtree(target)
+        target.mkdir(parents=True)
+        shutil.copy2(REPO / "scripts" / "run.sh", target / "run.sh")
+        shutil.copytree(REPO / "scripts" / "profiles", target / "profiles")
         argv = ["bash", str(target / "run.sh"), key, profile]
         extra = {"NINFER_SERVER": str(ctx.serve)}
     full_env = {**env, **extra, "NINFER_MODEL": ctx.need_model(model), "NINFER_PORT": str(port)}

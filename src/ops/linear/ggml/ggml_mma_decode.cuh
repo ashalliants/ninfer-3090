@@ -305,6 +305,11 @@ __global__ void __launch_bounds__(kMmaThreads)
             const std::size_t offset = static_cast<std::size_t>(tile * kMmaRows + r) * G::kRowBytes +
                                        static_cast<std::size_t>(c) * G::kChunkBytes;
             const int lead           = static_cast<int>(offset & 15);
+            // Every copy is a whole aligned 16-byte unit holding at least one of the chunk's bytes, so
+            // it can run up to 15 bytes past the row's end: into the next row (staged past the chunk,
+            // never read: kStride leaves room for lead + chunk_bytes rounded up), or, on the last row,
+            // up to the matrix's end and no further, since w is 16-byte aligned (checked in
+            // ggml_dispatch.cpp) and N % 16 == 0 (checked at launch) makes N * kRowBytes a multiple of 16.
             if (16 * k < lead + chunk_bytes) {
                 mma_cp_async16(slot + r * G::kStride + 16 * k, w + (offset - lead) + 16 * k);
             }

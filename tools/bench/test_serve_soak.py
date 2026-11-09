@@ -341,9 +341,11 @@ def test_growing_rss_is_flagged_and_flat_rss_is_not():
         server, _ = fake_server("clean")
         reading = {"n": 0}
 
+        # 200 MiB a sample: even the fewest samples the check below allows (6, so a 3-sample last
+        # half) measure 400 MiB, well over the 100 MiB limit however many the run's timing gives.
         def reader(growing=growing, reading=reading):
             reading["n"] += 1
-            return 1000.0 + (reading["n"] * 40.0 if growing else (reading["n"] % 2))
+            return 1000.0 + (reading["n"] * 200.0 if growing else (reading["n"] % 2))
         try:
             code, report, output = run_soak(server, ["--kinds", "chat", "--rss-growth-mib", "100"],
                                             rss_reader=reader)
@@ -453,7 +455,7 @@ def test_a_sampler_bug_is_recorded_and_fails_the_run():
 
 
 def test_argument_checks():
-    for bad in (["--kinds", "chat,bogus"], ["--minutes", "-1"]):
+    for bad in (["--kinds", "chat,bogus"], ["--minutes", "-1"], ["--max-requests", "-1"]):
         sink = StringIO()
         with redirect_stderr(sink):
             try:

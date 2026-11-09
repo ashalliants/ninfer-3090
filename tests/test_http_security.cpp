@@ -256,7 +256,7 @@ void allowed_host_values() {
     }
     for (const char* bad : {"", "*", "*.lan", "gpu%box", "gpubox?", "gpu box", "user@gpubox",
                             "http://gpubox", "gpubox:8080", "gpubox:", "gpubox/v1", "fe80::5",
-                            "[fe80::5]:8080", "[gpubox]", ".", "gpu\tbox"}) {
+                            "[fe80::5]:8080", "[fe80::5]:", "[gpubox]", ".", "gpu\tbox"}) {
         check(!valid_allowed_host(bad), std::string("invalid --allowed-host accepted: ") + bad);
     }
 }
