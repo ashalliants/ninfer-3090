@@ -1,0 +1,60 @@
+{
+  "what": "First real captures for tools/kernel_bandwidth.py and a host-calibration check of tools/perf_model.py. One rented RTX 3090 on Vast.ai, one session, 2026-11-09. The CSVs next to this file are `nsys stats --report cuda_gpu_kern_sum --format csv` from scripts/sweeps/decode-step-profile.sh.",
+  "commit": "b44e640698148e614ffb82c7567d2d90207d5355",
+  "model": "qwen3_8_27b.ninfer (Qwen3.8-27B groupwise-int, the 3090 recipe), int8 KV, max context 8192, tg128 from a one-token seed on the bundled corpus",
+  "host": {
+    "gpu": "NVIDIA GeForce RTX 3090",
+    "driver": "595.99.02",
+    "cuda_runtime": "12.8",
+    "os": "Linux, container, Ubuntu 24.04 / CUDA 12.8.1 base image",
+    "cpu_cores": 32,
+    "ram_gb": 62,
+    "power_limit_w": 220,
+    "default_power_limit_w": 350,
+    "power_limit_settable": false,
+    "under_load": {
+      "sm_clock_mhz": [675, 750],
+      "max_sm_clock_mhz": 2100,
+      "mem_clock_mhz": 9501,
+      "max_mem_clock_mhz": 9751,
+      "power_w": [219.5, 219.8],
+      "temp_c": [47, 50],
+      "clocks_event_reason": "SW Power Cap active; no thermal or HW slowdown"
+    },
+    "note": "The host caps this card at 220 W, so under decode load the SM clock sits near 700 MHz, a third of its maximum. Absolute numbers here are NOT comparable to a 315-350 W card; ratios and structure are."
+  },
+  "bandwidth_probe_gb_s": {
+    "tool": "tools/hbm_bandwidth_probe.cu, 4 GiB working set, 5 trials",
+    "kernel_uint4_read_best": 777.2,
+    "kernel_uint4_read_median": 724.7,
+    "cudaMemsetAsync_write_best": 887.1,
+    "advertised": 936.1
+  },
+  "ninfer_bench": {
+    "plain_decode_tok_s": 27.60,
+    "plain_decode_tok_s_stddev": 0.09,
+    "mtp3_decode_tok_s": 60.76,
+    "mtp3_decode_tok_s_stddev": 0.08,
+    "mtp3_acceptance": 0.5555555556,
+    "repetitions": 3,
+    "warmup": 1
+  },
+  "captures": {
+    "prof_27b-decode_cuda_gpu_kern_sum.csv": {
+      "args": "-n 128",
+      "steps": 128,
+      "columns": 1,
+      "depth": 64,
+      "tok_s_in_capture": 27.60
+    },
+    "prof_27b-decode-mtp3_cuda_gpu_kern_sum.csv": {
+      "args": "-n 128 --spec mtp --draft-tokens 3 --lm-head-draft",
+      "steps": 48,
+      "columns": 4,
+      "depth": 64,
+      "tokens_generated": 128,
+      "tok_s_in_capture": 59.93,
+      "acceptance": 0.5555555556
+    }
+  }
+}

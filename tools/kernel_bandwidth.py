@@ -45,6 +45,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import perf_model as pm  # noqa: E402
 
 WEIGHT_PREFIXES = ("q4", "q5", "q6", "q8", "t2", "nvfp4", "fp8", "bf16")
+# A family whose bytes would take under this share of its time at the target rate is latency-bound.
+LATENCY_BOUND_SHARE = 0.10
+# Families that are not stored weights.
+NOT_WEIGHTS = ("attention", "gdn", "other")
 # Streams no weights, even when its name starts with a format: the activation quantise before a
 # GEMV, a split-K reduction, a tile-preparation pass.
 NOT_STREAMING = ("quantize", "reduce", "prepare", "merge")
@@ -128,12 +132,18 @@ def join(rows: Sequence[dict], steps: int, group_bytes: dict[str, float], bandwi
         nbytes = group_bytes.get(family)
         line = {"family": family, "ms": entry["ms"], "launches": entry["launches"],
                 "bytes": nbytes, "gb_s": None, "pct": None, "recoverable_ms": None,
-                "top_kernel": max(entry["kernels"], key=entry["kernels"].get)}
+                "latency_bound": False, "top_kernel": max(entry["kernels"], key=entry["kernels"].get)}
         if nbytes:
-            line["gb_s"] = nbytes / (entry["ms"] / 1e3) / 1e9
-            line["pct"] = 100 * line["gb_s"] / bandwidth_gb_s
             good_ms = nbytes / (bandwidth_gb_s * 1e9 * target_pct / 100) * 1e3
-            line["recoverable_ms"] = max(0.0, entry["ms"] - good_ms)
+            if good_ms < LATENCY_BOUND_SHARE * entry["ms"]:
+                # The bytes would take under a tenth of the time even at the target rate (attention
+                # at a shallow depth reads a few KB): comparing it with the card's bandwidth would
+                # print "1% of peak" and claim the whole kernel as recoverable. It is latency-bound.
+                line["latency_bound"] = True
+            else:
+                line["gb_s"] = nbytes / (entry["ms"] / 1e3) / 1e9
+                line["pct"] = 100 * line["gb_s"] / bandwidth_gb_s
+                line["recoverable_ms"] = max(0.0, entry["ms"] - good_ms)
         table.append(line)
     table.sort(key=lambda r: -r["ms"])
     # A kernel fused over two stored formats (q4_q5_...) reads weights that the q4 and q5 rows count
@@ -143,8 +153,14 @@ def join(rows: Sequence[dict], steps: int, group_bytes: dict[str, float], bandwi
     caveats = [f"{family} kernels read more than one stored format: their time is listed on their own "
                f"row, so the {' and '.join(family.split('_'))} rows count their bytes but not their "
                f"time and read HIGH in GB/s" for family in fused]
+    # What the weight-streaming kernels achieve together. This, not the probe's peak, is the rate that
+    # makes perf_model.py reproduce THIS host's decode: pass it as --bandwidth-gb-s.
+    weight_rows = [r for r in table if r["gb_s"] is not None and r["family"] not in NOT_WEIGHTS]
+    weight_ms = sum(r["ms"] for r in weight_rows)
+    weight_bytes = sum(r["bytes"] for r in weight_rows)
     return {"families": table, "kernel_ms": sum(r["ms"] for r in table),
-            "launches": sum(r["launches"] for r in table), "caveats": caveats}
+            "launches": sum(r["launches"] for r in table), "caveats": caveats,
+            "weights_gb_s": weight_bytes / (weight_ms / 1e3) / 1e9 if weight_ms else None}
 
 
 def build(args: argparse.Namespace) -> dict:
@@ -177,6 +193,8 @@ def print_report(r: dict) -> None:
         saves = f"{row['recoverable_ms']:10.2f}" if row["recoverable_ms"] is not None else f"{'-':>10}"
         flag = ("  <- above the card's read rate: check --steps, --model and --recipe"
                 if row["pct"] and row["pct"] > 105 else "")
+        if row["latency_bound"]:
+            flag = "  (latency-bound: its bytes are under 10% of its time, so not compared with bandwidth)"
         print(f"  {row['family']:<10}{row['ms']:9.2f}{row['launches']:10.0f}{gb}{rate}{saves}   "
               f"{row['top_kernel'][:46]}{flag}")
     print(f"  {'total':<10}{r['kernel_ms']:9.2f}{r['launches']:10.0f}{r['bytes_gb']:8.3f}")
@@ -185,6 +203,10 @@ def print_report(r: dict) -> None:
     print(f"Bringing every family with bytes to {r['target_pct']:.0f}% of the sustained rate would "
           f"save about {r['recoverable_ms']:.2f} ms/step ({100 * r['recoverable_ms'] / r['kernel_ms']:.0f}%"
           f" of kernel time).")
+    if r.get("weights_gb_s"):
+        print(f"Weight-streaming kernels together run at {r['weights_gb_s']:.0f} GB/s "
+              f"({100 * r['weights_gb_s'] / r['read_gb_s']:.0f}% of the read rate given). To make "
+              f"perf_model.py reproduce THIS host's decode, pass --bandwidth-gb-s {r['weights_gb_s']:.0f}.")
     for caveat in r.get("caveats", []):
         print(f"CAVEAT: {caveat}")
     print("Times are the profiler's (about 5% long). Concurrent kernels double-count, so a family can "

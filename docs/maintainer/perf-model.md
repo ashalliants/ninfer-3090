@@ -48,13 +48,79 @@ The three tests are ctest `ninfer_perf_model_test`, `ninfer_kernel_bandwidth_tes
    the KV bytes) and GDN recurrence (against the state traffic) are their own families. A family
    reading *faster* than the card can is flagged: it means a wrong `--steps`, model or recipe. A
    kernel fused over two stored formats (`q4_q5_...`) gets its own row with no bytes, and a printed
-   caveat says the q4 and q5 rows then read high. Pass
-   `--columns K+1` for a speculative round. **This tool has only been run on synthetic CSVs in nsys's
-   layout, never on a real capture** (none is in the repository): the first real run may show kernels
-   the rules put in `other`, and the biggest are printed so `classify` can be extended.
+   caveat says the q4 and q5 rows then read high. A family whose bytes would take under a tenth of
+   its time (attention at a shallow depth) is marked latency-bound instead of printed as "1% of peak".
+   Pass `--columns K+1` for a speculative round. It also prints the weight kernels' combined streaming
+   rate, the number that calibrates the model to a host (below). It has been validated on one real
+   capture pair, [below](#the-first-real-capture-and-calibrating-to-a-host); an MoE or prefill capture
+   has not been seen, and the biggest `other` kernels are printed so `classify` can be extended.
 
 For Flash-Next, `flash_next_perf_model.py --levers` ranks cache, kernel and model levers for the mode
 you name (plain, `--mtp-k`, `--lanes`).
+
+## The first real capture, and calibrating to a host
+
+On 2026-11-09 one rented RTX 3090 produced the first real `nsys` captures
+([`tests/fixtures/perf_model/`](../../tests/fixtures/perf_model/), host facts in the JSON beside them):
+Qwen3.8-27B, INT8 KV, plain decode and MTP3, from commit `b44e6406`. The box was up for under an hour
+and the account's credit fell by $0.34 over that time; the measurements themselves took under three
+minutes after a six-minute build (`ninfer_bench` only, `-j8`).
+
+**This host is not a typical 3090.** Its power limit is 220 W (default 350, not settable from the
+container), so under decode load the SM clock sits at 675-750 MHz of a 2100 MHz maximum with "SW Power
+Cap" active, and its read bandwidth measured 777 GB/s against the 854 the model assumes. Plain decode
+ran at 27.6 tok/s against 49.0 on a 315 W card. Use such a host for structure and ratios, not for
+absolute speed, and check `nvidia-smi -q -d PERFORMANCE` during a run before trusting a rented box.
+
+| Plain decode, per step | ms | launches | GB read | GB/s | % of 777 |
+|---|---:|---:|---:|---:|---:|
+| q4 weights | 19.50 | 185 | 8.70 | 446 | 57% |
+| q5 weights | 12.42 | 137 | 5.22 | 420 | 54% |
+| q6 (the head) | 2.33 | 1 | 0.99 | 427 | 55% |
+| GDN recurrence | 1.03 | 145 | 0.30 | 293 | 38% |
+| attention (depth 64) | 0.36 | 16 | 0.002 | latency-bound | |
+| rmsnorm, rope, glue | 0.94 | 215 | | | |
+| **total** | **36.57** | | 15.27 | | |
+
+What the data showed, each pinned by `test_kernel_bandwidth.py`:
+
+- **The join works on real names.** Every kernel landed in a known family; `other` is 2.6% of the time.
+  The LM head launches once per step (129 times for 128 steps: the seed needs one more), and attention
+  launches 16 times, which proves `--steps` is the right divisor. Kernel time (36.57 ms) matches the
+  measured throughput (36.23 ms per token).
+- **Time shares follow byte shares.** q4 is 57% of the bytes and 53% of the time, q5 34% and 34%, the
+  head 6.5% and 6.4%. At a power cap every weight kernel runs at about the same fraction of the card's
+  bandwidth, so the byte budget still ranks what matters on a host the model was never fitted on.
+- **Absolute speed does not transfer; one number recalibrates it.** The stock model predicts 48.6 tok/s
+  (+76%), and the probe's own read rate still predicts 44.7 (+62%), because the probe is a short, light
+  kernel. Passing the weight kernels' achieved rate that `kernel_bandwidth.py` prints,
+  `--bandwidth-gb-s 435`, predicts 26.4 (-4%). **To use the model on a new host, profile one plain decode,
+  take that number, and pass it.**
+- **Speculation scales the same everywhere.** MTP3 at 55.6% acceptance gave 60.76 tok/s, 2.20x plain
+  (107.1 / 49.0 = 2.19x on the 315 W card); the model says 2.32x on both. A round produced exactly
+  2.667 tokens (128 tokens in 48 rounds), the `1 + acceptance x k` the model uses.
+- **A round costs more than the modelled 1.15x here: 1.22x** (44.46 against 36.57 ms). 2.2 ms is the
+  drafter's q8 weights, which the byte model does not include, and the recurrence records cost 2.3 ms
+  against 1.0 ms for a plain update.
+
+Not yet seen on a real capture: an MoE model, prefill, a host at 315-350 W (the one place the fitted
+constants should be re-checked), and `ncu` counters (not permitted in the container).
+
+## When you need a GPU
+
+The tools shrink the number of runs; they do not remove them.
+
+| You want to know | Needs a GPU? |
+|---|---|
+| Where the bytes go, what a quantisation or format change is worth, how levers rank | No |
+| Whether a lane, MTP or cache-size idea can pay (Flash-Next), what hit rate buys | No |
+| Which kernel families run far below bandwidth | **Once per model and host**: one `decode-step-profile.sh` capture, kept as a fixture |
+| Whether a kernel or scheduling change is actually faster | **Yes, every time**: an A/B on the card |
+| Absolute tok/s on a particular card | **Yes**, or a recalibration (above) from one capture |
+
+So the loop is: rank candidates here, spend one short box session per promising candidate, not per idea.
+`scripts/vast/vast-up.sh` plus `vast-dev-sync.sh` is the whole recipe; the box self-destructs after
+three hours.
 
 ## Qwen3.5 model: how it works and how well it matches
 

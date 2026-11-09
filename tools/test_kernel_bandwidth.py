@@ -1,11 +1,12 @@
 """Self-test of kernel_bandwidth.py. Run: python -I tools/test_kernel_bandwidth.py
 
-There is no real nsys capture in the repository, so the inputs are synthetic CSVs in the layout
-`nsys stats --report cuda_gpu_kern_sum --format csv` writes (the columns
-scripts/sweeps/decode-step-profile.sh reads), with kernel names taken from src/ops. Each family's time
-is chosen so it should come out at a known GB/s: that checks the units, the grouping and the
-arithmetic. It cannot check that the rules recognise every kernel a real capture contains; the
-tool prints the biggest `other` kernels so a gap shows.
+Two kinds of input. Synthetic CSVs in the layout `nsys stats --report cuda_gpu_kern_sum --format csv`
+writes, with kernel names taken from src/ops, where each family's time is chosen to come out at a known
+GB/s: that checks the units, the grouping and the arithmetic. And the first REAL captures
+(tests/fixtures/perf_model/, one power-capped RTX 3090, Qwen3.8-27B plain decode and MTP3), which check
+what synthetic data cannot: that the classification holds on the kernels a real run contains, that
+--steps is the right divisor, that kernel time matches the measured throughput, and how the byte
+model behaves on a host it was never fitted on. They cover a dense 27B only: no MoE, no prefill.
 """
 import contextlib
 import csv
@@ -175,6 +176,137 @@ def test_numeric_options_and_recipe_choice_follow_perf_model():
         report = json.loads(run_cli(path, "--steps", str(STEPS), "--model", "35b-a3b", "--json"))
         check(report["recipe"] == "qwen3_6_35b_a3b", "an MoE profile uses the MoE recipe by default")
         check("moe" in {r["family"] for r in report["families"]}, "and joins its expert kernels")
+
+
+# ---------------------------------------------------------------------------------------------------
+# Real captures: tests/fixtures/perf_model/. One rented RTX 3090 (power-capped at 220 W, so its absolute
+# speed is far below a 315-350 W card), Qwen3.8-27B, `scripts/sweeps/decode-step-profile.sh` output.
+# ---------------------------------------------------------------------------------------------------
+FIXTURES = os.path.join(HERE, "..", "tests", "fixtures", "perf_model")
+with open(os.path.join(FIXTURES, "rtx3090-vast-220w.json"), encoding="utf-8") as _handle:
+    FACTS = json.load(_handle)
+PROBE_READ_GB_S = FACTS["bandwidth_probe_gb_s"]["kernel_uint4_read_best"]
+
+
+def real_join(csv_name):
+    capture = FACTS["captures"][csv_name]
+    geo = pm.Geometry.from_config(pm.PRESETS["27b"])
+    weights = pm.build_weights(geo, pm.RECIPES["qwen3_8_27b"])
+    step = pm.decode_step(geo, weights, tokens=capture["columns"], depth=capture["depth"])
+    groups = pm.bytes_by_group(weights, geo, capture["columns"])
+    groups["attention"] = step.kv
+    groups["gdn"] = step.state_rw
+    rows = kb.read_kernel_summary(pathlib.Path(FIXTURES, csv_name))
+    return kb.join(rows, capture["steps"], groups, PROBE_READ_GB_S, 90.0), capture
+
+
+PLAIN_CSV = "prof_27b-decode_cuda_gpu_kern_sum.csv"
+MTP_CSV = "prof_27b-decode-mtp3_cuda_gpu_kern_sum.csv"
+
+
+def test_real_kernel_names_all_land_in_known_families():
+    for name in (PLAIN_CSV, MTP_CSV):
+        joined, _ = real_join(name)
+        by = {r["family"]: r for r in joined["families"]}
+        check(set(by) <= {"q4", "q5", "q6", "q8", "gdn", "attention", "other"},
+              f"{name}: unexpected families {set(by)}")
+        for family in ("q4", "q5", "q6", "gdn", "attention"):
+            check(family in by, f"{name}: no {family} kernels found")
+        check(by["other"]["ms"] < 0.05 * joined["kernel_ms"],
+              f"{name}: `other` is {100 * by['other']['ms'] / joined['kernel_ms']:.1f}% of kernel time; "
+              f"biggest: {by['other']['top_kernel']}")
+        check(joined["caveats"] == [], f"{name}: no fused-format kernel is expected in this capture")
+
+
+def test_real_launch_counts_per_step_match_the_run():
+    joined, _ = real_join(PLAIN_CSV)
+    by = {r["family"]: r for r in joined["families"]}
+    # The LM head runs once per step and the 16 full-attention layers once each: the proof that
+    # --steps (128 for `-n 128`) is the right divisor. The one-token seed needs one extra head pass
+    # (129 launches for 128 steps), hence a 1.5% tolerance rather than exactly 1.
+    check(near(by["q6"]["launches"], 1.0, 0.015), f"head launches per step {by['q6']['launches']}")
+    check(near(by["attention"]["launches"], 16.0, 0.015), f"attention launches {by['attention']['launches']}")
+    joined, capture = real_join(MTP_CSV)
+    by = {r["family"]: r for r in joined["families"]}
+    check(near(by["q6"]["launches"], 1.0, 0.03), f"head launches per round {by['q6']['launches']}")
+    check(capture["steps"] * pm.tokens_per_round(3, capture["acceptance"]) > 127.9,
+          "48 rounds at 55.6% acceptance with 3 drafts produce the 128 tokens generated")
+
+
+def test_real_kernel_time_matches_the_measured_throughput():
+    joined, capture = real_join(PLAIN_CSV)
+    check(near(joined["kernel_ms"], 1e3 / capture["tok_s_in_capture"], 0.03),
+          f"plain: {joined['kernel_ms']:.2f} ms of kernels against {1e3 / capture['tok_s_in_capture']:.2f} ms/token")
+    joined, capture = real_join(MTP_CSV)
+    round_ms = capture["tokens_generated"] / capture["steps"] / capture["tok_s_in_capture"] * 1e3
+    check(near(joined["kernel_ms"], round_ms, 0.03),
+          f"MTP3: {joined['kernel_ms']:.2f} ms of kernels against a {round_ms:.2f} ms round")
+
+
+def test_real_time_shares_track_byte_shares():
+    # At a power cap the weight kernels all run at about the same fraction of the card's bandwidth
+    # (here 54-57%), so a family's share of time follows its share of bytes. That is the model's
+    # byte budget holding on a host it was never fitted on.
+    joined, _ = real_join(PLAIN_CSV)
+    by = {r["family"]: r for r in joined["families"]}
+    total_bytes = sum(r["bytes"] for r in joined["families"] if r["bytes"])
+    for family in ("q4", "q5", "q6"):
+        time_share = by[family]["ms"] / joined["kernel_ms"]
+        byte_share = by[family]["bytes"] / total_bytes
+        check(abs(time_share - byte_share) < 0.06,
+              f"{family}: {100 * time_share:.1f}% of time against {100 * byte_share:.1f}% of bytes")
+    rates = [by[f]["pct"] for f in ("q4", "q5", "q6")]
+    check(max(rates) - min(rates) < 6, f"the weight families should run at similar fractions: {rates}")
+
+
+def test_calibrating_bandwidth_to_the_hosts_streaming_rate_reproduces_its_decode():
+    joined, capture = real_join(PLAIN_CSV)
+    measured = capture["tok_s_in_capture"]
+    geo = pm.Geometry.from_config(pm.PRESETS["27b"])
+    weights = pm.build_weights(geo, pm.RECIPES["qwen3_8_27b"])
+
+    def predicted(bandwidth):
+        hardware = pm.Hardware("test", bandwidth, 936.1, 316.0)
+        return 1e3 / pm.decode_step(geo, weights, depth=capture["depth"], hardware=hardware).step_ms
+
+    # The constants are fitted on a 315-350 W card, so the stock prediction is far too fast here ...
+    check(predicted(pm.ACHIEVABLE_READ_GB_S) > 1.5 * measured, "stock model should overpredict a 220 W host")
+    # ... and even the probe's own read rate does not help: it is a short, light kernel.
+    check(predicted(PROBE_READ_GB_S) > 1.4 * measured, "the probe rate does not explain the decode either")
+    # The weight kernels' achieved streaming rate, which the tool prints, does.
+    got = predicted(joined["weights_gb_s"])
+    check(near(got, measured, 0.06), f"calibrated prediction {got:.1f} against measured {measured}")
+
+
+def test_speculation_speedup_is_the_same_on_a_slow_host():
+    # tok/s with MTP3 over plain, measured here (60.76 / 27.60 = 2.20) and in docs/performance.md on a
+    # 315 W card (107.1 / 49.0 = 2.19). The model says 2.32 on both, so +5-6% each time.
+    geo = pm.Geometry.from_config(pm.PRESETS["27b"])
+    weights = pm.build_weights(geo, pm.RECIPES["qwen3_8_27b"])
+    plain = pm.decode_step(geo, weights)
+    verify = pm.decode_step(geo, weights, tokens=4)
+    bench = FACTS["ninfer_bench"]
+    spec = pm.speculative(plain, verify, 3, bench["mtp3_acceptance"])
+    measured = bench["mtp3_decode_tok_s"] / bench["plain_decode_tok_s"]
+    check(near(spec["speedup"], measured, 0.08), f"model {spec['speedup']:.2f}x against measured {measured:.2f}x")
+
+
+def test_a_round_costs_more_than_the_modelled_ratio_on_this_host():
+    plain, _ = real_join(PLAIN_CSV)
+    mtp, _ = real_join(MTP_CSV)
+    ratio = mtp["kernel_ms"] / plain["kernel_ms"]
+    # The model assumes 1.15x (measured on a 315 W card). Here 2.2 ms of a round is the drafter's q8
+    # weights, which the byte model does not include, and the recurrence records cost more.
+    check(1.15 < ratio < 1.30, f"round / plain step = {ratio:.3f}")
+    q8 = {r["family"]: r for r in mtp["families"]}["q8"]
+    check(q8["bytes"] is None and q8["ms"] > 1.5, "the drafter's q8 weights are visible as time with no bytes")
+
+
+def test_shallow_attention_is_latency_bound_not_a_bandwidth_failure():
+    joined, _ = real_join(PLAIN_CSV)
+    attention = {r["family"]: r for r in joined["families"]}["attention"]
+    check(attention["latency_bound"] and attention["pct"] is None and attention["recoverable_ms"] is None,
+          "a few KB of KV in 0.36 ms must not print as '1% of peak' with the whole kernel recoverable")
 
 
 def run_cli(*argv):
