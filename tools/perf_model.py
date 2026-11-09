@@ -436,13 +436,20 @@ class DecodeStep:
 def decode_step(geo: Geometry, weights: Sequence[Weight], *, tokens: int = 1, depth: int = 0,
                 kv: str = "int8", kv_bpt: float | None = None, gdn_state_bytes_per: int = 4,
                 hardware: Hardware = RTX_3090, cal: Calibration = CALIBRATION) -> DecodeStep:
+    """One decode round over `tokens` columns with `depth` tokens already in the cache.
+
+    The round first appends its own `tokens` K/V entries, then attends over all `depth + tokens` of
+    them, so a speculative verification reads a few more entries than a plain step at the same depth.
+    The columns of one round do NOT each re-read the cache: the small-T attention kernel takes them
+    together and loads each K/V tile once per layer (a real 4-column MTP3 capture launches attention
+    19 times over 16 layers, not 64), so KV traffic is not `tokens * depth`."""
     by_role: dict[str, float] = {}
     for w in weights:
         by_role[w.role] = by_role.get(w.role, 0.0) + w.read_bytes(geo, tokens)
     per_token_kv = kv_bytes_per_token(geo, kv) if kv_bpt is None else kv_bpt
     return DecodeStep(
         tokens=tokens, depth=depth, by_role=by_role, weights=sum(by_role.values()),
-        state_rw=2 * gdn_state_bytes(geo, gdn_state_bytes_per), kv=per_token_kv * depth,
+        state_rw=2 * gdn_state_bytes(geo, gdn_state_bytes_per), kv=per_token_kv * (depth + tokens),
         layers=geo.layers, hardware=hardware, cal=cal)
 
 
@@ -603,7 +610,7 @@ def _decode_table(step: DecodeStep, top: int) -> list[dict]:
         table.append({"role": f"({len(rest)} smaller roles)", "bytes": sum(b for _, b in rest)})
     table.append({"role": "gdn state (read + write)", "bytes": step.state_rw})
     if step.kv:
-        table.append({"role": f"kv cache @ {step.depth:,} tokens", "bytes": step.kv})
+        table.append({"role": f"kv cache @ {step.depth:,} tokens + step", "bytes": step.kv})
     for row in table:
         row["share"] = row["bytes"] / step.total_bytes
         row["ms"] = step.ms_for(row["bytes"])

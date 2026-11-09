@@ -76,12 +76,33 @@ def test_decode_slows_with_depth_by_the_kv_bytes():
     geo, weights = model("27b", "qwen3_8_27b")
     shallow = m.decode_step(geo, weights, depth=0)
     deep = m.decode_step(geo, weights, depth=32768)
-    check(deep.kv == 32768 * m.kv_bytes_per_token(geo, "int8"), "KV bytes should be depth x per-token")
+    check(deep.kv == (32768 + 1) * m.kv_bytes_per_token(geo, "int8"),
+          "a plain step attends over the cache plus its own entry")
     check(deep.step_ms > shallow.step_ms, "a deeper cache must cost time")
     bf16 = m.decode_step(geo, weights, depth=32768, kv="bf16")
     check(near(bf16.kv / deep.kv, 2 / (33 / 32), 1e-9), "BF16 KV is 2 bytes per element")
     fp16_state = m.decode_step(geo, weights, gdn_state_bytes_per=2)
     check(near(fp16_state.state_rw, shallow.state_rw / 2, 1e-9), "FP16 GDN state halves the traffic")
+
+
+def test_a_verification_reads_its_own_entries_but_not_one_pass_per_column():
+    # Review finding (codepulse, PR #438): the byte model ignored the K/V entries a round appends before
+    # it attends. The reviewer's proposed fix, scaling by every column's own context, would be wrong:
+    # the small-T attention kernel loads each K/V tile once for all columns (a real 4-column MTP3
+    # capture launches attention 19 times over 16 layers, not 64). The right count is depth + columns.
+    geo, weights = model("27b", "qwen3_8_27b")
+    per_token = m.kv_bytes_per_token(geo, "int8")
+    depth = 8192
+    plain = m.decode_step(geo, weights, depth=depth)
+    verify = m.decode_step(geo, weights, tokens=4, depth=depth)
+    check(plain.kv == (depth + 1) * per_token, "plain: the cache plus its own entry")
+    check(verify.kv == (depth + 4) * per_token, "a 4-column round attends over depth + 4 entries")
+    check(verify.kv - plain.kv == 3 * per_token, "three entries more than a plain step, and no more")
+    check(verify.kv < 1.01 * plain.kv, "the columns share each K/V read: not four passes over the cache")
+    check(m.decode_step(geo, weights).kv == per_token, "even at depth 0 a step reads its own entry")
+    # And the table still accounts for every byte, kv row included.
+    report = json.loads(run_cli("--depth", "0", "--json"))
+    check(near(sum(r["share"] for r in report["decode"][0]["table"]), 1.0, 1e-9), "shares sum to 1 at depth 0")
 
 
 def test_speculation_matches_the_3090_mtp3_measurement():

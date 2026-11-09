@@ -60,7 +60,7 @@ you name (plain, `--mtp-k`, `--lanes`).
 
 | Part | Method | Trust |
 |---|---|---|
-| Decode bytes per token | Every dense matrix, one embedding row, 8 of 256 routed experts per layer, GDN state in and out, KV to the current depth. Formats come from the recipe. | Exact arithmetic. Matches [`decode_byte_accounting.py`](../../tools/decode_byte_accounting.py)'s artifact-header count within 0.02%. |
+| Decode bytes per token | Every dense matrix, one embedding row, 8 of 256 routed experts per layer, GDN state in and out, KV for the cached depth plus the step's own entries (the columns of a verification share each K/V read; they do not each re-read the cache). Formats come from the recipe. | Exact arithmetic. Matches [`decode_byte_accounting.py`](../../tools/decode_byte_accounting.py)'s artifact-header count within 0.02%. |
 | Decode speed | `bytes / 854.2 GB/s + layers x 0.0425 ms` | One fitted constant, two points. Consistent with the runs below, not proven for a third model. |
 | Speculative decode | `tokens per round = 1 + acceptance x k`; round = step at `k+1` columns x 1.15 | Acceptance is an input. MoE verify uses the expected expert union under independent uniform routing: right for unrelated sequences, an overestimate for the columns of one sequence (Flash-Next measured 47% new experts per column, uniform predicts 98%). |
 | Prefill | `steps x fixed cost + 2 x active parameters x tokens / (316 INT8 TOPS x efficiency) + attention` | Two constants per family, fitted on two prompt lengths each. |
