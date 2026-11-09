@@ -2277,6 +2277,11 @@ void test_upload_survives_replacement_but_not_eviction() {
     auto remote                   = std::make_shared<MemoryObjectStore>();
     ContextStore::Options options = remote_options(directory.path(), remote);
     options.max_bytes             = 8000; // room for one image
+    // Uploads must still be queued, not started, when the limit evicts and a rewrite replaces. With no
+    // delay the first upload starts at once and blocks in flight, where it can no longer be dropped; the
+    // test only passed when the refresh queued at start happened to be holding the background thread.
+    // A long delay keeps them queued whatever the thread does, and drained() below runs them.
+    options.remote_upload_delay   = std::chrono::seconds(3600);
     const auto a                  = concat({pseudo_random(30, 1), pseudo_random(5000, 2)});
     const auto b                  = concat({pseudo_random(30, 3), pseudo_random(5000, 4)});
     const auto a2                 = concat({pseudo_random(30, 5), pseudo_random(5000, 6)});
@@ -2477,9 +2482,14 @@ void test_final_flush_drops_best_effort_tasks() {
     (void)store.put(describe("0b"), concat({pseudo_random(30, 3), pseudo_random(3000, 4)}),
                     std::array{ContextStore::Region{30, 3000}});
     store.touch("0a"); // queued behind the blocked upload
+    // The final flush drops the queued touch the moment it starts, so call it while the upload is
+    // still blocked. Releasing the link first lets the background thread finish the upload and take
+    // the touch before the flush can erase it, which made this test fail under load. The flush cannot
+    // drain a blocked upload, so it reports that; the upload completes once the link is back.
+    check(!store.flush_remote(std::chrono::steady_clock::now() + std::chrono::milliseconds(200), true),
+          "a blocked upload reported a drained queue");
     remote->set_hold(false);
-    check(store.flush_remote(std::chrono::steady_clock::now() + std::chrono::seconds(10), true),
-          "the final flush did not drain");
+    check(drained(store), "the upload did not complete once the link was back");
     check(remote->touches == 0, "a best-effort touch ran during the final flush");
     bool uploaded = false;
     {
