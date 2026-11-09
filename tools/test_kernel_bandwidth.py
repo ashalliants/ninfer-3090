@@ -159,6 +159,25 @@ def test_a_fused_format_kernel_gets_its_own_row_and_a_caveat():
     check(clean["caveats"] == [], "no fused kernel, no caveat")
 
 
+def test_the_calibration_rate_counts_a_fused_kernels_time():
+    # Review finding: a fused kernel's bytes are inside the q4 and q5 rows, but its time was left out of
+    # the combined weight rate, which then read high and made a calibrated model underpredict decode.
+    _, _, groups = model_bytes()
+    t4, t5 = ms_for_rate(groups["q4"], 800), ms_for_rate(groups["q5"], 800)
+    fused_ms = 3.0
+    rows = [{"name": "q4_a16_gemv_kernel", "total_ns": t4 * 1e6 * STEPS, "instances": STEPS},
+            {"name": "q5_small_t_mma_kernel", "total_ns": t5 * 1e6 * STEPS, "instances": STEPS},
+            {"name": "q4_q5_attn_input_small_t_kernel", "total_ns": fused_ms * 1e6 * STEPS,
+             "instances": STEPS}]
+    joined = kb.join(rows, STEPS, groups, pm.ACHIEVABLE_READ_GB_S, 90.0)
+    expected = (groups["q4"] + groups["q5"]) / ((t4 + t5 + fused_ms) / 1e3) / 1e9
+    check(near(joined["weights_gb_s"], expected, 1e-9),
+          f"combined rate {joined['weights_gb_s']:.1f}, expected {expected:.1f} with the fused time counted")
+    check(joined["weights_gb_s"] < 800, "counting the fused time must lower the rate below the clean 800")
+    clean = kb.join(rows[:2], STEPS, groups, pm.ACHIEVABLE_READ_GB_S, 90.0)
+    check(near(clean["weights_gb_s"], 800, 1e-9), "with no fused kernel the rate is the families' own 800")
+
+
 def test_numeric_options_and_recipe_choice_follow_perf_model():
     import io
     for argv in (["--steps", "0"], ["--steps", "-1"], ["--columns", "0"], ["--depth", "-1"],

@@ -152,11 +152,14 @@ def join(rows: Sequence[dict], steps: int, group_bytes: dict[str, float], bandwi
     fused = sorted(r["family"] for r in table if "_" in r["family"])
     caveats = [f"{family} kernels read more than one stored format: their time is listed on their own "
                f"row, so the {' and '.join(family.split('_'))} rows count their bytes but not their "
-               f"time and read HIGH in GB/s" for family in fused]
+               f"time and read HIGH in GB/s (the combined weight rate printed below includes it)"
+               for family in fused]
     # What the weight-streaming kernels achieve together. This, not the probe's peak, is the rate that
-    # makes perf_model.py reproduce THIS host's decode: pass it as --bandwidth-gb-s.
+    # makes perf_model.py reproduce THIS host's decode: pass it as --bandwidth-gb-s. A fused-format
+    # kernel's bytes are already in the q4 / q5 rows' bytes (above), so its time belongs in the
+    # denominator too; leaving it out reads the rate high and the calibrated model then underpredicts.
     weight_rows = [r for r in table if r["gb_s"] is not None and r["family"] not in NOT_WEIGHTS]
-    weight_ms = sum(r["ms"] for r in weight_rows)
+    weight_ms = sum(r["ms"] for r in weight_rows) + sum(r["ms"] for r in table if r["family"] in fused)
     weight_bytes = sum(r["bytes"] for r in weight_rows)
     return {"families": table, "kernel_ms": sum(r["ms"] for r in table),
             "launches": sum(r["launches"] for r in table), "caveats": caveats,
