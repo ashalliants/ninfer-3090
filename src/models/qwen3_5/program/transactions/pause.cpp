@@ -3,6 +3,7 @@
 #include "core/device.h"
 
 #include <array>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -56,7 +57,8 @@ std::optional<CheckpointHandle> ProgramImpl::detach_checkpoint(SequenceState& st
                         .frontier          = frontier,
                         .backend_frontier  = backend_kv_valid(state),
                         .rope_delta        = state.rope_delta,
-                        .tail_hidden_valid = state.tail_hidden_valid};
+                        .tail_hidden_valid = state.tail_hidden_valid,
+                        .gap_maps          = gap_maps_through(state.gap_maps, frontier)};
     checkpoints[handle->index].reserved = false;
     state.kv.reset();
     state.state       = {};
@@ -70,7 +72,11 @@ bool ProgramImpl::reserve_host_kv_transfers(ContextTransaction& tx, LogicalKVPag
     if (!host_kv_extents) { return false; }
     // One Host extent is a single contiguous arena run. A busy arena can hold enough bytes in
     // total yet no run big enough for every page, so the pages are placed in as few extents as fit.
-    return reserve_in_chunks(
+    // The sizes tried on the way are not failures; only a placement that cannot be made counts.
+    // pause_snapshot_places (core/host_arena_model.h) replays this chunking to answer whether a
+    // pause snapshot fits before anything is evicted: change them together.
+    HostContextArena::PlacementScope placement(*host_context_arena);
+    const bool placed = reserve_in_chunks(
         logical,
         [&](std::span<const LogicalKVPageHandle> chunk) {
             return host_kv_extents->prepare(pages, chunk);
@@ -85,6 +91,8 @@ bool ProgramImpl::reserve_host_kv_transfers(ContextTransaction& tx, LogicalKVPag
             transfer.host_destination.emplace(std::move(destination));
             tx.kv_transfers.push_back(std::move(transfer));
         });
+    if (!placed) { placement.failed(); }
+    return placed;
 }
 
 bool ProgramImpl::prepare_backup(ContextTransaction& tx, CheckpointState& record,
@@ -135,6 +143,8 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
     // A chunk run in slices has advanced some layers' state in place: until its remaining slices
     // run there is no consistent frontier to save, so the lane cannot pause yet.
     if (control.prefill && control.prefill->slice.index != 0) { return false; }
+    // A lossy scout keeps uncommitted pages and a half-advanced state slot: no consistent frontier.
+    if (lane_refuses_pause(lane)) { return false; }
     if (control.lifecycle != Lifecycle::Active && control.lifecycle != Lifecycle::Prefilling &&
         control.lifecycle != Lifecycle::Replaying) {
         throw std::logic_error("pause requires a committed boundary");
@@ -151,6 +161,9 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
                 if (item.token_begin < frontier && frontier < item.token_end) { return false; }
             }
         }
+        // Nor is a snapshot whose Host copy would not fit: the backup below would fail, the
+        // snapshot would be dropped and the request would recompute everything it had done.
+        if (!pause_snapshot_fits(handle)) { return false; }
     }
     timing.begin_wait();
     device.synchronize();
@@ -224,6 +237,9 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
     tx.paused.emplace(ResumeState(std::move(saved)));
     if (tx.paused->has_snapshot()) {
         auto& snapshot = checkpoint(*tx.paused->impl_->snapshot);
+        // A paused request's copy may use the pause snapshot reserve; cached history may not.
+        std::optional<HostContextArena::SnapshotScope> reserve;
+        if (host_context_arena) { reserve.emplace(*host_context_arena); }
         if (!prepare_backup(tx, snapshot, true)) {
             tx.state_transfer.reset();
             tx.kv_transfers.clear();

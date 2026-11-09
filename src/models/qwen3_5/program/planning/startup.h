@@ -5,6 +5,7 @@
 #include "core/dtype.h"
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
+#include "core/linear_attention_state.h"
 #include "core/tensor.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
@@ -35,6 +36,18 @@ struct DFlashPersistentLayout {
     }
 };
 
+// The lossy-prefill scout's scratch (TextContext::scout_chunk), planned only when lossy prefill is
+// enabled on a single device. The keys and scores hold every token of the Program's capacity; the
+// GDN state is one slot of the layers below the filter layer.
+struct ScoutLayout {
+    std::uint32_t filter_layer = 0;
+    std::uint32_t gdn_layers   = 0;
+    TensorLayout filter_keys;
+    TensorLayout last_queries;
+    TensorLayout scores;
+    std::optional<LinearAttentionStatePoolLayout> gdn_state;
+};
+
 struct PersistentLayout {
     qwen3_5::DecoderStateLayout decoder;
     qwen3_5::StateImageDeviceLayout state_images;
@@ -48,6 +61,7 @@ struct PersistentLayout {
     std::optional<TensorLayout> token_counts;
     std::optional<TensorLayout> sampling_config;
     std::optional<TensorLayout> grammar_masks;
+    std::optional<ScoutLayout> scout;
     std::size_t bytes            = 0;
     // Persistent bytes on each further device (device 1 first): the KV planes, block-table copy and
     // recurrent state of the layers that stage owns. Empty on one device.
@@ -76,6 +90,8 @@ struct WorkspacePlan {
     std::size_t dflash_context   = 0;
     std::size_t dflash_round     = 0;
     std::size_t causal_score     = 0;
+    // A lossy-prefill scout chunk (0 unless the scout scratch is planned).
+    std::size_t scout_prefill    = 0;
     std::size_t general_capacity = 0;
     // Resident: the encode workspace, folded into capacity after the general region. Overlay: the
     // per-window encode plan, borrowed per item; only the MTP bridge column lives in this workspace.
@@ -107,6 +123,7 @@ struct SequencePlanningInputs {
     int device                        = 0;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
+    LossyPrefillOptions lossy_prefill;
 };
 
 struct SequencePlanImpl {
@@ -131,6 +148,7 @@ struct SequencePlanImpl {
     int device                        = 0;
     std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
+    LossyPrefillOptions lossy_prefill;
     std::vector<SpeculativeRoundShape> round_shapes;
     PersistentLayout persistent;
     WorkspacePlan workspace;

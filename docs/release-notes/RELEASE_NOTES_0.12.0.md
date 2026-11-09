@@ -135,7 +135,7 @@ Two of the three known triggers for that latch are separately fixed at the root:
   greedy output to a never-evicted control. A 39-token session saves to 295 MiB (two
   ~150 MB recurrent-state images) in about 0.3 s each way. *(Superseded: the `POST /slots` actions and
   the `--slot-save-path` / `--auto-save-evicted` flags were retired in a later release; use
-  `--context-store DIR`, see [docs/serving.md](docs/serving.md#context-store).)*
+  `--context-store DIR`, see [docs/serving.md](../serving.md#context-store).)*
 - **`best_reuse_prompt_tokens` in `request_done.materialization` (#124).** Distinguishes "no
   candidate offered any reuse" (a prefix-matching problem) from "a candidate did, and the planner
   priced it out" (a policy question) — previously both looked identical from the log.

@@ -215,6 +215,17 @@ public:
         return largest;
     }
 
+    // How many Responses `model` (an id or an alias) stores: its configured
+    // --response-store-max-records (a section of a preset can set its own), at least one. nullopt
+    // for a model that is not registered.
+    [[nodiscard]] std::optional<std::size_t> response_store_records(std::string_view model) const {
+        std::lock_guard lock(mutex_);
+        const auto index = find_locked(model);
+        if (!index) { return std::nullopt; }
+        return std::max<std::size_t>(models_[*index].definition.options.response_store_max_records,
+                                     1);
+    }
+
     [[nodiscard]] bool router() const noexcept { return router_; }
 
     [[nodiscard]] const RegistryPolicy& policy() const noexcept { return policy_; }

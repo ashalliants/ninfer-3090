@@ -1,0 +1,19 @@
+
+Dump of file C:\ninfer\dist\ninfer-rtx3090-windows-x64-0.0.0\ninfer-serve.exe
+
+File Type: EXECUTABLE IMAGE
+
+  Image has the following dependencies:
+
+    nvcuda.dll
+    nvml.dll
+    nvapi64.dll
+    nvcuvid.dll
+
+  Image has the following delay load dependencies:
+
+    nvencodeapi64.dll
+
+  Summary
+
+        1000 .data

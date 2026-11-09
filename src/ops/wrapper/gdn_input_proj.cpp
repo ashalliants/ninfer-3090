@@ -298,9 +298,19 @@ void validate_policy(LinearPolicy policy) {
     // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
     // one engine-wide setting does not have to be threaded per Op.
     case LinearPolicy::AllowPrefillCublas:
+    // The lossy scout's int4 route, registered for the split Q4/Q5 pair's prefill form only.
+    case LinearPolicy::ScoutA4Int:
         return;
     }
     throw std::invalid_argument("gdn_input_proj: invalid compute policy");
+}
+
+// Only the split Q4/Q5 pair's prefill projection has a ScoutA4Int route; every other form (the
+// single parents, the T2 pair, the snapshot and record forms) refuses the policy.
+void reject_scout_a4(LinearPolicy policy) {
+    if (allows_scout_a4(policy)) {
+        throw std::invalid_argument("gdn_input_proj: ScoutA4Int needs the split Q4/Q5 prefill form");
+    }
 }
 
 // No single-parent qtype registers an integer-activation route, and their resolvers reject a
@@ -312,6 +322,7 @@ LinearPolicy without_integer(LinearPolicy policy) {
 void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                             LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
     validate_policy(policy);
+    reject_scout_a4(policy);
     policy = without_integer(policy);
     const std::int32_t cols = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
@@ -450,6 +461,7 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                                      Tensor& value, Tensor& z, LinearPolicy policy,
                                      WorkspaceArena& workspace, cudaStream_t stream) {
     validate_policy(policy);
+    reject_scout_a4(policy);
 
     if (weight.qtype == QType::NVFP4) {
         constexpr std::int32_t kHidden     = 5120;
@@ -596,6 +608,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                    LinearPolicy policy, WorkspaceArena& workspace,
                                    cudaStream_t stream) {
     validate_policy(policy);
+    reject_scout_a4(policy);
 
     if (weight.qtype == QType::NVFP4) {
         constexpr std::int32_t kHidden     = 5120;
@@ -826,11 +839,19 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
                     cudaStream_t stream) {
     validate_policy(policy);
     if (t2_two_parent(qk_weight, value_z_weight)) {
+        reject_scout_a4(policy);
         if (x.ne[1] <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
         t2_two_parent_project(x, qk_weight, value_z_weight, qkv, z, policy, workspace, stream);
         return;
     }
     require_split_profile(x, qk_weight, value_z_weight, qkv, z);
+    // The lossy scout's int4 route replaces the integer route where that one would run.
+    if (allows_scout_a4(policy) &&
+        detail::q4_q5_gdn_input_a8_supported(qk_weight, value_z_weight, x.ne[1])) {
+        detail::q4_q5_gdn_input_scout_a4_launch(x, qk_weight, value_z_weight, qkv, z, workspace,
+                                                stream);
+        return;
+    }
     // qk fills the head of `qkv`; value_z fills its tail and, from its own second row range, `z`.
     // Both parents read the same activations, so one quantisation serves all three destinations.
     if (allows_cublas_prefill(policy) && x.ne[1] >= kCublasPrefillMinTokens) {
@@ -871,6 +892,7 @@ std::size_t gdn_input_proj_split_workspace_capacity_bytes(
             input_rows != 5120) {
             throw std::invalid_argument("gdn_input_proj workspace: unregistered T2 pair");
         }
+        reject_scout_a4(policy);
         return t2_two_parent_projection_bytes(min_tokens, max_tokens, policy);
     }
     const bool registered = qk_qtype == QType::Q4_G64_FP16 && qk_rows == 4096 &&
@@ -879,6 +901,11 @@ std::size_t gdn_input_proj_split_workspace_capacity_bytes(
     if (!allows_a8_int(policy) || !registered) { return 0; }
     const std::size_t a8 =
         detail::q4_q5_gdn_input_a8_workspace_capacity_bytes(min_tokens, max_tokens);
+    if (allows_scout_a4(policy)) {
+        // Both routes decline the same widths, and the int4 one holds the s8 planes too.
+        return std::max(a8, detail::q4_q5_gdn_input_scout_a4_workspace_capacity_bytes(
+                                min_tokens, max_tokens));
+    }
     if (allows_cublas_prefill(policy) && max_tokens >= kCublasPrefillMinTokens) {
         return std::max(a8, detail::w4_cublas_projection_workspace_capacity_bytes(
                                 std::max(qk_rows, value_z_rows), input_rows,
@@ -914,6 +941,7 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
                                                     std::int32_t min_tokens,
                                                     std::int32_t max_tokens) {
     validate_policy(policy);
+    reject_scout_a4(policy);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("gdn_input_proj workspace: invalid token interval");
     }
@@ -993,6 +1021,7 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy);
+    reject_scout_a4(policy);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16 &&
         parent_rows == detail::Fp8N16384K5120::kOutputRows &&
@@ -1031,6 +1060,7 @@ std::size_t gdn_input_proj_split_conv_snapshot_workspace_capacity_bytes(QType qk
 std::size_t gdn_input_proj_split_conv_snapshot_workspace_capacity_bytes(
     QType qk_qtype, QType value_z_qtype, LinearPolicy policy, std::int32_t batch_size,
     std::int32_t min_width, std::int32_t max_width) {
+    reject_scout_a4(policy);
     if (qk_qtype == QType::T2_G128_FP16 && value_z_qtype == QType::T2_G128_FP16) {
         require_snapshot_capacity_domain(batch_size, min_width, max_width);
         const std::int32_t columns = std::max(batch_size, 1) * max_width;
@@ -1057,6 +1087,7 @@ std::size_t gdn_input_proj_split_conv_record_workspace_capacity_bytes(QType qk_q
 std::size_t gdn_input_proj_split_conv_record_workspace_capacity_bytes(
     QType qk_qtype, QType value_z_qtype, LinearPolicy policy, std::int32_t batch_size,
     std::int32_t min_width, std::int32_t max_width) {
+    reject_scout_a4(policy);
     if (qk_qtype == QType::T2_G128_FP16 && value_z_qtype == QType::T2_G128_FP16) {
         require_record_capacity_domain(batch_size, min_width, max_width);
         return t2_two_parent_projection_bytes(std::max(batch_size, 1) * min_width,
@@ -1092,6 +1123,7 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy);
+    reject_scout_a4(policy);
     require_record_capacity_domain(batch_size, min_width, max_width);
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16 &&
         parent_rows == detail::Fp8N16384K5120::kOutputRows &&
@@ -1140,6 +1172,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                   Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
                                   cudaStream_t stream) {
     validate_policy(policy);
+    reject_scout_a4(policy);
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQueryRows  = 2048;
     constexpr std::int32_t kKeyRows    = 2048;
@@ -1212,6 +1245,7 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                                 LinearPolicy policy, WorkspaceArena& workspace,
                                 cudaStream_t stream) {
     validate_policy(policy);
+    reject_scout_a4(policy);
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQueryRows  = 2048;
     constexpr std::int32_t kKeyRows    = 2048;

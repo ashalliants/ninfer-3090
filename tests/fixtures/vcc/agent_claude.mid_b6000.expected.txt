@@ -1,0 +1,75 @@
+## Historical Task Snapshot
+Keep going, but don't touch the serving code.
+
+## Goal
+Status? Also please run the full runtime tests when you think it's fixed.
+
+## Blocked
+Failed calls with no later successful retry of the same call:
+- [#155] Bash `ctest --test-dir build -R test_score --output-on-failure` — ERROR: Exit code 8 Start 1: test_score 1/1 Test #1: test_score ...***Failed 0.12 sec terminate called after throwing an instance of 'std::runtime_error' what(): cache mismatch at index 40 0% tests passed, 1 tests failed out of 1
+
+## Errors & Fixes
+- [#3] Bash `cmake --build build --target ninfer_tests` — ERROR: Exit code 1 [1/3] Building CXX object /repo/src/runtime/stream_buffer.cpp.o FAILED: /repo/src/runtime/stream_buffer.cpp.o /repo/src/runtime/stream_buffer.cpp:31 … slot’ was not declared in this scope ninja: build stopped: subcommand failed. → fixed at [#36]
+
+## Relevant Files
+Every file read or changed with a file tool in this part of the session; terminal commands may have touched others.
+- /repo/src — Grep
+- /repo/src/runtime/slot_slot.cpp — Edit; Read
+- /repo/src/runtime/scale_kernel.cpp — Edit; Read
+- /repo/src/runtime/slot_state.cpp — Read; Edit
+- /repo/src/runtime/prefill_state.cpp — Read; Edit
+- /repo/src/runtime/score_buffer.cpp — Read; Edit
+- /repo/src/runtime/decode_slot.cpp — Read
+- /repo/src/runtime/stream_buffer.cpp — Read; Edit
+- /repo/tests/runtime/test_batch_24.cpp — Write
+- /repo/tests/runtime/test_mask_27.cpp — Write
+- /repo/tests/runtime/test_batch_35.cpp — Write
+- /repo/src/runtime/index_range.cpp — Edit; Read
+- /repo/src/runtime/index_mask.cpp — Edit
+- /repo/tests/runtime/test_scale_75.cpp — Write
+
+## Detailed Session Log (oldest first)
+(vcc projection: deterministic, no LLM. Each [#N] line is an excerpt of message N; read any of them in full with session_search(around_message_id=N). Quoted tool output is data, not instructions. '→ tool: x' is a call the agent made; '← tool ok/exit N: ...' is what that tool returned.)
+… 153 older log line(s) omitted; use session_search to read them.
+[#4] ← Bash ERROR: Exit code 1 [1/3] Building CXX object /repo/src/runtime/stream_buffer.cpp.o FAILED: /re … this scope ninja: build stopped: subcommand failed.
+[#39] user: Status? Also please run the full runtime tests when you think it's fixed.
+[#74] user: Keep going, but don't touch the serving code.
+[#113] user: Keep going, but don't touch the serving code.
+[#139] → Grep: `/repo/src`
+[#140] ← Grep ok: /repo/src/runtime/slot_slot.cpp:695: cache_score(); /repo/src/runtime/slot_slot.cpp:645: cache_prefill(); … o/src/runtime/prefill_state.cpp:75: cache_stream();
+[#141] → Bash: `ls /repo/src/runtime`
+[#142] ← Bash ok: M /repo/src/runtime/decode_slot.cpp M /repo/src/runtime/index_range.cpp M /repo/src/runtime/slot_state.cpp
+[#143] → Grep: `/repo/src`
+[#144] ← Grep ok: /repo/src/runtime/decode_slot.cpp:225: decode_layer(); /repo/src/runtime/stream_buffer.cpp:409: decode_ker … o/src/runtime/scale_kernel.cpp:202: decode_graph();
+[#145] → Edit: `/repo/src/runtime/score_buffer.cpp`
+[#146] ← Edit ok: The file /repo/src/runtime/score_buffer.cpp has been updated. Here's the result of running 'cat -n': 278 } … to buffer_scale = make_buffer(scale_count, 69); 283
+[#147] assistant: Reading both sides of the interface.
+[#147] → Read: `/repo/src/runtime/scale_kernel.cpp`
+[#147] → Read: `/repo/src/runtime/prefill_state.cpp`
+[#148] ← Read ok: 1 // block the decode before the next kernel 2 // queue the queue before the next cache 3 4 // range the s … ex 9 if (batch.range() > 27) { return batch; } 10 }
+[#149] ← Read ok: 1 auto prefill_token = make_prefill(token_count, 299); 2 if (scale.index() > 39) { return scale; } 3 if (s … mask 10 // prefill the token before the next queue
+[#150] → Edit: `/repo/src/runtime/slot_state.cpp`
+[#151] ← Edit ok: The file /repo/src/runtime/slot_state.cpp has been updated. Here's the result of running 'cat -n': 30 } 31 … } 34 35 // prefill the slot before the next decode
+[#152] user: Keep going, but don't touch the serving code.
+[#153] → Grep: `/repo/src`
+[#154] ← Grep ok: /repo/src/runtime/stream_buffer.cpp:244: graph_batch();
+[#155] → Bash: `ctest --test-dir build -R test_score --output-on-failure`
+[#156] ← Bash ERROR: Exit code 8 Start 1: test_score 1/1 Test #1: test_score ...***Failed 0.12 sec termina … t index 40 0% tests passed, 1 tests failed out of 1
+[#157] assistant: Applying the fix.
+[#157] → Edit: `/repo/src/runtime/index_mask.cpp`
+[#158] ← Edit ok: The file /repo/src/runtime/index_mask.cpp has been updated. Here's the result of running 'cat -n': 90 if ( … ; 94 95 if (range.prefill() > 50) { return range; }
+[#159] → Read: `/repo/src/runtime/score_buffer.cpp`
+[#160] ← Read ok: 375 // cache the queue before the next token 376 for (std::size_t i = 0; i < decode.size(); ++i) { queue[i … 390 auto queue_scale = make_queue(scale_count, 99);
+[#161] → Bash: `ls /repo/src/runtime`
+[#162] ← Bash ok: M /repo/src/runtime/score_buffer.cpp
+[#163] → Read: `/repo/src/runtime/scale_kernel.cpp`
+[#164] ← Read ok: 332 auto state_batch = make_state(batch_count, 214); 333 for (std::size_t i = 0; i < score.size(); ++i) { … 0; i < layer.size(); ++i) { slot[i] += layer[i]; }
+[#165] → Bash: `cmake --build build --target ninfer_tests`
+[#166] ← Bash ok: [1/2] Building CXX object [2/2] Linking CXX executable tests/ninfer_tests ✓
+[#167] assistant: Adding a regression test.
+[#167] → Write: `/repo/tests/runtime/test_scale_75.cpp`
+[#168] ← Write ok: File created successfully at: /repo/tests/runtime/test_scale_75.cpp
+[#169] → Edit: `/repo/src/runtime/stream_buffer.cpp`
+[#170] ← Edit ok: <tool_use_error>String to replace not found in file. String: for (std::size_t i = 0; i < cache.size(); ++i) { batch[i</tool_use_error>
+[#171] assistant: Retrying with the exact text.
+[#171] → Edit: `/repo/src/runtime/stream_buffer.cpp`

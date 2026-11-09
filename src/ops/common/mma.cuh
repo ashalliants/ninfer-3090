@@ -77,6 +77,24 @@ __device__ __forceinline__ void mma_s8_k16(int& c0, int& c1, int& c2, int& c3, u
                  : "r"(a0), "r"(a1), "r"(b0));
 }
 
+// D = A * B + C on s4 operands, sm_80+. Each operand register holds eight consecutive k as 4-bit
+// two's-complement nibbles, lowest k in the lowest nibble. With g = lane / 4 and t = lane % 4:
+//   A (16x64, row): a0 = row g,   k 8t..8t+7;      a1 = row g+8, k 8t..8t+7;
+//                   a2 = row g,   k 32+8t..32+8t+7; a3 = row g+8, k 32+8t..32+8t+7.
+//   B (64x8, col):  b0 = col g,   k 8t..8t+7;      b1 = col g,   k 32+8t..32+8t+7.
+//   C/D (16x8):     d0,d1 = row g, cols 2t,2t+1;   d2,d3 = row g+8, cols 2t,2t+1.
+// C is separate from D so a caller can seed every product with one constant register; pass the
+// outputs back in to accumulate.
+__device__ __forceinline__ void mma_s4_m16n8k64(int& d0, int& d1, int& d2, int& d3, unsigned a0,
+                                                unsigned a1, unsigned a2, unsigned a3, unsigned b0,
+                                                unsigned b1, int c0, int c1, int c2, int c3) {
+    asm volatile("mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+                 : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(c0), "r"(c1),
+                   "r"(c2), "r"(c3));
+}
+
 // On RTX 5090, block-scaled FP8 avoids the plain form's half-rate FP32 accumulation.
 // UE8M0 0x7f is exactly 1: preserve the raw E4M3 dot product and keep the callers'
 // existing row scales in FP32 after the MMA. No operand repacking is needed.

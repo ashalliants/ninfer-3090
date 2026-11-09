@@ -17,8 +17,11 @@
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 
 #include "core/device.h"
+#include "core/layout.h"
 #include "core/weight_view.h"
+#include "ninfer/ops/q4_a4_linear.h"
 #include "ops/common/rowsplit_a8_mma.cuh"
+#include "ops/linear/q4/q4_scout_a4.h"
 
 #include <cuda_bf16.h>
 
@@ -82,6 +85,22 @@ void launch_all(const Tensor& x, const Weight& qk, const Weight& value_z, std::i
                                   a8::StoreEpilogue{z, kZRows, 0}, stream);
 }
 
+// The lossy scout's int4 route: the two Q5 ranges exactly as above, from their own s8 activations;
+// the Q4 query/key rows are handled by the caller.
+template <int NT>
+void launch_value_z(const Tensor& x, const Weight& value_z, std::int32_t tokens,
+                    std::int8_t* codes, __half* scales, __nv_bfloat16* qkv, __nv_bfloat16* z,
+                    cudaStream_t stream) {
+    constexpr int BN = a8::kWarpsN * NT * 8;
+    a8::quantize_activations<kHidden, BN><<<tokens, 128, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data), tokens, codes, scales);
+    CUDA_CHECK(cudaGetLastError());
+    launch_range<a8::Q5Codec, NT>(value_z, codes, scales, tokens, 0, kValueRows,
+                                  a8::StoreEpilogue{qkv, kQkvRows, kQkRows}, stream);
+    launch_range<a8::Q5Codec, NT>(value_z, codes, scales, tokens, kValueRows, kZRows,
+                                  a8::StoreEpilogue{z, kZRows, 0}, stream);
+}
+
 } // namespace
 
 bool q4_q5_gdn_input_a8_supported(const Weight& qk, const Weight& value_z, std::int32_t tokens) {
@@ -130,6 +149,60 @@ void q4_q5_gdn_input_a8_launch(const Tensor& x, const Weight& qk, const Weight& 
         launch_all<4>(x, qk, value_z, tokens, code_data, scale_data, qkv_data, z_data, stream);
         return;
     }
+}
+
+std::size_t q4_q5_gdn_input_scout_a4_workspace_capacity_bytes(std::int32_t min_tokens,
+                                                              std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("q4_q5 gdn_input scout a4 workspace: invalid token interval");
+    }
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc_bytes(static_cast<std::size_t>(max_tokens) * kHidden);
+    (void)layout.alloc_bytes(static_cast<std::size_t>(max_tokens) * (kHidden / a8::kGroup) *
+                             sizeof(__half));
+    scout_a4_activation_layout(layout, kHidden, max_tokens);
+    (void)layout.alloc(DType::BF16, {kQkRows, max_tokens});
+    return layout.peak_bytes(1);
+}
+
+void q4_q5_gdn_input_scout_a4_launch(const Tensor& x, const Weight& qk, const Weight& value_z,
+                                     Tensor& qkv, Tensor& z, WorkspaceArena& workspace,
+                                     cudaStream_t stream) {
+    const std::int32_t tokens = x.ne[1];
+    if (!q4_q5_gdn_input_a8_supported(qk, value_z, tokens)) {
+        throw std::invalid_argument("q4_q5 gdn_input scout a4: unsupported profile");
+    }
+
+    auto scope = workspace.scope();
+    const DeviceSpan codes =
+        workspace.alloc_bytes(static_cast<std::size_t>(tokens) * kHidden);
+    const DeviceSpan scales = workspace.alloc_bytes(
+        static_cast<std::size_t>(tokens) * (kHidden / a8::kGroup) * sizeof(__half));
+    auto* code_data  = reinterpret_cast<std::int8_t*>(codes.data);
+    auto* scale_data = reinterpret_cast<__half*>(scales.data);
+    auto* qkv_data   = static_cast<__nv_bfloat16*>(qkv.data);
+    auto* z_data     = static_cast<__nv_bfloat16*>(z.data);
+    switch (a8::token_tile(tokens, 512)) {
+    case 512:
+        launch_value_z<16>(x, value_z, tokens, code_data, scale_data, qkv_data, z_data, stream);
+        break;
+    case 256:
+        launch_value_z<8>(x, value_z, tokens, code_data, scale_data, qkv_data, z_data, stream);
+        break;
+    default:
+        launch_value_z<4>(x, value_z, tokens, code_data, scale_data, qkv_data, z_data, stream);
+        break;
+    }
+
+    // The int4 GEMM writes a contiguous [4096,T] plane, and qkv interleaves those rows with the
+    // value rows per token, so the plane is staged and copied into rows [0, 4096) of each column.
+    const ScoutA4Activations a4 = scout_a4_quantize(x, workspace, stream);
+    Tensor staged               = workspace.alloc(DType::BF16, {kQkRows, tokens});
+    q4_a4_linear(a4.codes, a4.scales, qk, staged, stream);
+    constexpr std::size_t kWord = sizeof(__nv_bfloat16);
+    CUDA_CHECK(cudaMemcpy2DAsync(qkv.data, kQkvRows * kWord, staged.data, kQkRows * kWord,
+                                 kQkRows * kWord, static_cast<std::size_t>(tokens),
+                                 cudaMemcpyDeviceToDevice, stream));
 }
 
 } // namespace ninfer::ops::detail

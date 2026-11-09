@@ -156,6 +156,12 @@ machine terminal: `request_done` immediately after `GenerationService::run()` re
 transport happen after that transaction; their failures are operational `response` records and do
 not create a second request JSONL terminal.
 
+Optional request-log objects are omitted, not written as `null`, when the request never used the
+feature: `request_done.lossy_prefill` (experimental lossy long-prompt prefill,
+`docs/serving.md` "Structured request log") appears only for a request that took or considered the
+path, so a server with the feature off writes the default schema. `--request-log-lossy-detail` adds
+its `kept_runs` array.
+
 Tool-call parameter normalization remains a successful request outcome. Empty-argument omissions
 and schema mismatches are machine-only counters. If a complete tool marker must be returned to text
 because its structure or declared identity cannot be represented, Serve emits one warning carrying

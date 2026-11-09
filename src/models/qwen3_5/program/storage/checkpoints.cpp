@@ -149,8 +149,13 @@ PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
     out.host_state_slots = state_store ? state_store->host_occupied() : 0;
     out.host_kv_bytes    = host_kv_arena ? host_kv_arena->occupied_bytes() : 0;
     if (host_context_arena) {
-        out.occupied.host_bytes      = host_context_arena->occupied_bytes();
-        out.capacity.host_bytes      = host_context_arena->capacity_bytes();
+        // The context cache plans with its budget, the backing less the pause snapshot reserve: it
+        // can never fill the reserve, so it must not count on it either.
+        out.occupied.host_bytes      = host_context_arena->general_occupied_bytes();
+        out.capacity.host_bytes      = host_context_arena->general_capacity_bytes();
+        out.host_pause_reserve_bytes = host_context_arena->snapshot_reserve_bytes();
+        out.host_pause_reserve_occupied_bytes =
+            host_context_arena->occupied_bytes() - out.occupied.host_bytes;
         out.host_reserved_bytes      = host_context_arena->reserved_bytes();
         out.host_peak_occupied_bytes = host_context_arena->peak_occupied_bytes();
         out.host_free_extents        = host_context_arena->free_extent_count();
@@ -273,7 +278,9 @@ runtime::ContextResourceUsage ProgramImpl::snapshot_resources(const ResumeState&
     return checkpoint_summary(*paused.impl_->snapshot).evictable_resources;
 }
 
-std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> handles) const {
+std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> handles,
+                                             bool state_images_only,
+                                             HostReleaseSet* released_set) const {
     struct StateReferences {
         StateImageHandle state;
         std::uint32_t references = 0;
@@ -337,9 +344,12 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
             state_store->can_release_after_checkpoint_references(entry.state, entry.references) &&
             state_store->host_resident(entry.state)) {
             bytes += state_images->host_layout().image_bytes;
+            if (released_set) { released_set->states.push_back(entry.state); }
         }
     }
-    const auto count = [&](const LogicalKVPageStore& pages, const auto& references) {
+    const auto state_bytes = bytes;
+    const auto count = [&](const LogicalKVPageStore& pages, const auto& references,
+                           std::vector<LogicalKVPageHandle>* recorded) {
         for (const auto& [index, entry] : references) {
             if (entry.references != pages.address_references(entry.page)) { continue; }
             // A nonlast reference may retire during a copy; the complete set cannot release
@@ -350,17 +360,21 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
             if (pages.host_resident(entry.page)) {
                 bytes += (&pages == text_kv_pages.get() ? text_host_kv_page_stride
                                                         : backend_host_kv_page_stride);
+                if (recorded) { recorded->push_back(entry.page); }
             }
         }
         return true;
     };
-    if (!count(*text_kv_pages, main) || (backend_kv_pages && !count(*backend_kv_pages, backend))) {
+    if (!count(*text_kv_pages, main, released_set ? &released_set->main : nullptr) ||
+        (backend_kv_pages &&
+         !count(*backend_kv_pages, backend, released_set ? &released_set->backend : nullptr))) {
         return 0;
     }
-    return bytes;
+    return state_images_only ? state_bytes : bytes;
 }
 
-std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle) const {
+std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle,
+                                                       PauseHostNeed* need) const {
     if (context_transaction_ || pending_transaction_ || !valid_sequence(handle) ||
         !host_context_arena) {
         return std::nullopt;
@@ -383,22 +397,29 @@ std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle) 
     std::size_t bytes = state_store->host_resident(sequence.state.read)
                             ? 0
                             : state_images->host_layout().image_bytes;
+    if (need) { need->image_bytes = bytes; }
     const auto count  = [&](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
                            KVAddressSpaceHandle address, std::uint32_t target) {
         const auto mapped   = addresses.mapped_pages(address);
         const auto required = kv_pages_for_frontier(target);
         const auto stride   = (&pages == text_kv_pages.get() ? text_host_kv_page_stride
                                                               : backend_host_kv_page_stride);
+        std::size_t missing = 0;
         for (std::uint32_t i = 0; i < std::min<std::uint32_t>(mapped, required); ++i) {
             const auto page = addresses.logical_page(address, i);
             // Deactivation removes this request's active reference. Other resident readers
             // keep their Device replica, so those pages need no new Host allocation.
             if (!pages.host_resident(page) && pages.active_address_references(page) <= 1) {
-                bytes += stride;
+                ++missing;
             }
         }
         // Masked-draft normalization can append accepted features before snapshot capture.
-        if (required > mapped) { bytes += static_cast<std::size_t>(required - mapped) * stride; }
+        if (required > mapped) { missing += static_cast<std::size_t>(required - mapped); }
+        bytes += missing * stride;
+        if (need) {
+            auto& pool = &pages == text_kv_pages.get() ? need->text : need->backend;
+            pool       = {.pages = missing, .stride = stride};
+        }
     };
     count(*text_kv_addresses, *text_kv_pages, sequence.kv->text, sequence.text_kv_valid);
     if (sequence.kv->backend) {
@@ -416,9 +437,66 @@ std::size_t ProgramImpl::pause_state_image_unplaced(SequenceHandle handle) const
     if (!state_store->valid(sequence.state.read) || state_store->host_resident(sequence.state.read)) {
         return 0;
     }
-    // The image is one contiguous arena run, unlike the KV pages, which can be split.
+    // The image is one contiguous arena run, unlike the KV pages, which can be split. A pause may
+    // use the snapshot reserve.
     const auto bytes = state_images->host_layout().image_bytes;
+    HostContextArena::SnapshotScope snapshot(*host_context_arena);
     return host_context_arena->can_allocate(bytes) ? 0 : bytes;
+}
+
+bool ProgramImpl::pause_snapshot_fits(SequenceHandle handle) const {
+    if (!host_context_arena) { return false; }
+    PauseHostNeed need;
+    if (!pause_host_bytes(handle, &need)) { return false; }
+    // Replays the placement the pause makes, on a copy of the arena's free runs: the state image
+    // takes a run of its own, then each pool's pages are split over the runs in whole pages of
+    // that pool's stride. A run too short for the larger stride can still hold the smaller
+    // pool's pages, which a bound in units of the larger stride loses.
+    return pause_snapshot_places(HostArenaModel(*host_context_arena), need);
+}
+
+std::size_t ProgramImpl::host_placeable_bytes(std::size_t unit) const noexcept {
+    if (!host_context_arena) { return 0; }
+    const auto& arena = *host_context_arena;
+    return std::min(arena.placeable_bytes(unit),
+                    arena.general_capacity_bytes() - arena.general_occupied_bytes());
+}
+
+runtime::HostFreeRuns
+ProgramImpl::host_free_runs_after_release(std::span<const CheckpointHandle> handles) const {
+    runtime::HostFreeRuns result;
+    if (!host_context_arena) { return result; }
+    const auto& arena      = *host_context_arena;
+    result.general_capacity = arena.general_capacity_bytes();
+    result.occupied         = arena.occupied_bytes();
+    for (const auto& extent : arena.free_extents()) {
+        result.runs.push_back({extent.offset, extent.bytes});
+    }
+    HostReleaseSet released;
+    // Zero when the set is not releasable (or frees nothing): the runs then stay as they are.
+    if (host_bytes_released(handles, false, &released) == 0) { return result; }
+    std::vector<runtime::HostRun> freed;
+    // A state image is its own arena allocation, rounded up to the arena alignment.
+    constexpr std::size_t alignment = HostContextArena::alignment;
+    const std::size_t image_bytes   = (state_images->host_layout().image_bytes + alignment - 1) /
+                                      alignment * alignment;
+    for (const auto state : released.states) {
+        freed.push_back({arena.offset_of(state_store->host_view(state).data), image_bytes});
+    }
+    // A page is one stride of the extent that holds it; neighbouring pages released together, and
+    // free runs beside them, merge below as the allocator merges them.
+    const auto add_pages = [&](const LogicalKVPageStore& pages,
+                               const std::vector<LogicalKVPageHandle>& released_pages) {
+        for (const auto page : released_pages) {
+            const auto replica = pages.host_replica(page);
+            const auto view    = host_kv_extents->view(replica.extent);
+            const std::size_t stride = view.layout().page_stride;
+            freed.push_back({arena.offset_of(view.data()) + replica.page_offset * stride, stride});
+        }
+    };
+    add_pages(*text_kv_pages, released.main);
+    if (backend_kv_pages) { add_pages(*backend_kv_pages, released.backend); }
+    return runtime::host_runs_after_release(result, freed);
 }
 
 std::size_t ProgramImpl::release_redundant_host(std::span<const CheckpointHandle> excluded,

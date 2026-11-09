@@ -33,6 +33,11 @@ add_test(NAME ninfer_prefill_time_model_test
 add_test(NAME ninfer_prefill_depth_sweep_test
   COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/bench/test_prefill_depth_sweep.py)
 
+# The lossy prefill quality/speed sweep (tools/bench/run_lossy_prefill_sweep.py): its summariser against
+# fixture results (the acceptance numbers' edges), grid expansion and command construction. No server, no GPU.
+add_test(NAME ninfer_lossy_prefill_sweep_test
+  COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/bench/test_lossy_prefill_sweep.py)
+
 # The Host arena replay tool's self-test (tools/bench/replay_host_arena.py). Pure Python, no GPU: the
 # replay of a known allocator run must reproduce it exactly, or the tool's predictions mean nothing.
 add_test(NAME ninfer_host_arena_replay_test

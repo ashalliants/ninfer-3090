@@ -58,6 +58,14 @@ private:
     friend class Engine;
 };
 
+// What Engine::flush_context_store did.
+struct ContextStoreFlushReport {
+    std::uint64_t written = 0;  // conversations written to the store during the flush
+    std::uint64_t unsaved = 0;  // retained conversations still not stored when it ended
+    bool uploaded         = true; // the bucket's upload queue drained (true without a bucket)
+    double seconds        = 0.0;
+};
+
 class Engine {
 public:
     explicit Engine(EngineOptions options);
@@ -121,6 +129,13 @@ public:
     ResidencyStatus suspend(std::optional<bool> auto_resume = std::nullopt);
     ResidencyStatus resume();
     [[nodiscard]] ResidencyStatus residency() const;
+
+    // Writes every retained conversation the context store does not hold as it is now, then
+    // uploads whatever waits for the bucket, within `budget`, while the Engine keeps serving: for
+    // a gateway about to drain the box or move conversations to another. Conversations are
+    // written one a second between units, as idle writes are. Throws std::invalid_argument
+    // without a context store.
+    ContextStoreFlushReport flush_context_store(std::chrono::milliseconds budget);
 
     void reset_memory_peaks() noexcept;
 

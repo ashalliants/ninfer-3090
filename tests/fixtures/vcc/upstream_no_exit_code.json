@@ -1,0 +1,42 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Start the server."
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t1",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"./serve\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t1",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "[terminal] ran `./serve` -> exit ?, 2 lines output"
+    }
+   ]
+  }
+ ],
+ "cases": [
+  {
+   "id": "b8000",
+   "first": 0,
+   "last": 3,
+   "budget_chars": 8000
+  }
+ ]
+}

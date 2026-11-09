@@ -8,13 +8,16 @@
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
+#include "runtime/engine/lossy_prefill.h"
 #include "runtime/engine/prefill_pacing.h"
 #include "runtime/engine/prefill_yield.h"
 #include "runtime/engine/request_record.h"
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/context_store/context_store.h"
+#include "runtime/engine/context_store/image_id.h"
 #include "runtime/engine/pause_policy.h"
 #include "runtime/engine/scheduler.h"
+#include "runtime/engine/shared_prefix_scan.h"
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/worker_fault.h"
@@ -76,6 +79,34 @@ public:
             instance.suspend(device, snapshot, &snapshot);
         };
 
+    // Lossy long-prompt prefill (lossy_prefill.h) needs a Program that runs it (the Qwen3.5 one);
+    // for any other, the option is refused at startup and the Engine never takes the path.
+    using ProgramType = typename ModelContract::Program;
+    using BasePlan    = typename ModelContract::RequestBasePlan;
+    static constexpr bool kLossyCapable =
+        requires(ProgramType& program, const ProgramType& view, const BasePlan& plan,
+                 SequenceHandle sequence, typename ModelContract::PrefillProgress& progress) {
+            plan.lossy();
+            program.enable_lossy(sequence);
+            program.abort_lossy_scout(sequence);
+            view.lossy_scout_share();
+            progress.scouted_tokens;
+            progress.compacted_prompt_tokens;
+            progress.compacted_plan;
+            progress.lossy;
+        };
+
+    // A frontier of the plan's prompt in the client's prompt tokens: what usage and prompt
+    // progress report. Only a Program that rewrites prompts (lossy prefill) can make them differ.
+    [[nodiscard]] static std::uint32_t reported_frontier(const BasePlan& plan,
+                                                         std::uint32_t frontier) noexcept {
+        if constexpr (requires { plan.reported_frontier(frontier); }) {
+            return plan.reported_frontier(frontier);
+        } else {
+            return frontier;
+        }
+    }
+
     class RoundMasks final : public TokenMaskProvider {
     public:
         std::array<decltype(&std::declval<Request&>().output), kMaximumConcurrency> outputs{};
@@ -109,6 +140,7 @@ public:
           yield_min_remaining_ns_(
               static_cast<std::uint64_t>(options.prefill_schedule.yield_remaining_ms) * 1'000'000ULL),
           layer_slices_(options.prefill_schedule.layer_slices),
+          lossy_options_(options.lossy_prefill),
           progress_anchor_tokens_(options.progress_anchors_shared ? options.progress_anchor_tokens : 0),
           fault_listener_(options.fault_listener),
           resources_(options.context_cache.enabled, std::move(context_cost)) {
@@ -116,6 +148,7 @@ public:
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
         }
+        scheduler_.set_prefill_order(options.prefill_schedule.order);
         suspend_options_ = options.suspend;
         if (options.suspend.enabled) {
             if constexpr (kInstanceSuspendable) {
@@ -245,7 +278,8 @@ public:
     Submission submit(PreparedPrompt prompt, PromptSummary prompt_summary, double prepare_seconds,
                       ResolvedRequestOptions options, OutputConsumerMode consumer_mode,
                       GenerationObservationOptions observation,
-                      Clock::time_point pending_deadline = {}) {
+                      Clock::time_point pending_deadline = {},
+                      std::optional<compaction::SummaryRecord> summary = std::nullopt) {
         const Clock::time_point submitted = Clock::now();
         if (pending_deadline == Clock::time_point{}) {
             pending_deadline = submitted + pending_timeout_;
@@ -305,7 +339,8 @@ public:
                                                 std::move(output), prompt_summary, prepare_seconds,
                                                 std::move(options), consumer_mode,
                                                 std::move(observation), pending_deadline, ready);
-            effective_budget = request->output.thinking_stats().effective_budget;
+            effective_budget         = request->output.thinking_stats().effective_budget;
+            request->summary         = std::move(summary);
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -346,8 +381,45 @@ public:
     }
 
     [[nodiscard]] RuntimeStats runtime_stats() const {
-        std::lock_guard lock(stats_mutex_);
-        return published_stats_;
+        RuntimeStats stats;
+        {
+            std::lock_guard lock(stats_mutex_);
+            stats = published_stats_;
+        }
+        stats.lossy_prefill_summary_probe_timeouts = probe_timeouts_.load(std::memory_order_relaxed);
+        return stats;
+    }
+
+    // The summary strategy's reuse probe, from a caller thread (Engine::prepare): Warm when a
+    // private (conversation) record, or a shared checkpoint deeper than `exact_end`, this prompt
+    // starts with would be reused, from the cache or from
+    // the context store (deeper than `exact_end`, the product prompt), Cold otherwise. `prompt` is
+    // a copy the probe plans and drops. The probe is posted to the worker, which answers it between
+    // cycles (serve_reuse_probes); an answer not given within `wait` is Timeout, counted in
+    // lossy_prefill_summary_probe_timeouts and treated as warm by the caller. A stopping or failed
+    // Engine answers Warm at once.
+    [[nodiscard]] LossySummaryProbe has_private_reuse(PreparedPrompt prompt,
+                                                      const ResolvedExecutionOptions& execution,
+                                                      std::uint32_t exact_end,
+                                                      std::chrono::milliseconds wait) {
+        auto probe       = std::make_shared<ReuseProbe>();
+        probe->prompt    = std::move(prompt);
+        probe->execution = execution;
+        probe->exact_end = exact_end;
+        {
+            std::lock_guard lock(queue_mutex_);
+            if (stopping_ || failed_) { return LossySummaryProbe::Warm; }
+            probes_.push_back(probe);
+            probes_pending_.store(true, std::memory_order_release);
+        }
+        queue_cv_.notify_all();
+        std::unique_lock lock(probe->mutex);
+        if (!probe->cv.wait_for(lock, wait, [&] { return probe->warm.has_value(); })) {
+            probe->abandoned = true;
+            probe_timeouts_.fetch_add(1, std::memory_order_relaxed);
+            return LossySummaryProbe::Timeout;
+        }
+        return *probe->warm ? LossySummaryProbe::Warm : LossySummaryProbe::Cold;
     }
 
     // An Engine-wide failure: every queued request failed, every new one is refused, and the
@@ -451,8 +523,16 @@ public:
 
     // The durable context store (owned by the Engine, which outlives this core). `sink` queues one
     // image for the Engine's writer and must not block; it returns whether the image was accepted.
-    // `ready` reports an idle writer; `failures` counts queued writes that later failed, and when it
-    // grows every continuation is treated as not stored, so it is written again.
+    // `ready` reports an idle writer; `queued` whether an image id is still waiting for (or in) the
+    // writer; `failures` counts queued writes that later failed, and `failed_writes` hands over the
+    // ids of those not yet taken: each such continuation the store does not hold is written again.
+    // Failed writes the writer reports: their ids, and whether some were lost (then every
+    // continuation the store does not hold counts as failed).
+    struct FailedStoreWrites {
+        std::vector<std::string> ids;
+        bool lost = false;
+    };
+
     struct ContextStoreHooks {
         ContextStore* store = nullptr;
         std::string binding;
@@ -464,11 +544,22 @@ public:
         // shared image. Must not block.
         std::function<bool(CheckpointImage&&)> shared_sink;
         std::function<bool()> ready;
+        std::function<bool(const std::string&)> queued;
         std::function<std::uint64_t()> failures;
+        std::function<FailedStoreWrites()> failed_writes;
+        // A buffer for the next image's bytes: the writer hands back the last written image's,
+        // whose pages are already mapped, so copying an image out does not fault them in again.
+        std::function<std::vector<std::uint8_t>()> export_buffer;
         // A retained continuation unused this long is written in the background; zero disables it.
         std::chrono::milliseconds idle_persist{0};
         // The longest a request waits for its stored session to be read back.
         std::chrono::milliseconds hydration_budget{0};
+        // The store keeps a copy in a bucket: a request that finds nothing has the listing
+        // refreshed once before it prefills, and a session only the bucket holds is downloaded
+        // when the download fits in the request's wait.
+        bool remote = false;
+        // Told about each failed hydration, on the worker; must return promptly.
+        std::function<void(const ContextStoreHydrationEvent&)> hydration_listener;
     };
 
     void set_context_store(ContextStoreHooks hooks) {
@@ -477,7 +568,10 @@ public:
         store_removals_seen_  = store_removal_count();
         store_failures_seen_  = store_.failures ? store_.failures() : 0;
         if (store_.store && !hydration_reader_.joinable()) {
-            hydration_reader_ = std::thread([this] { hydration_reader_loop(); });
+            hydration_reader_ = std::thread([this] { hydration_reader_loop(hydration_queue_); });
+        }
+        if (store_.store && store_.remote && !lookup_reader_.joinable()) {
+            lookup_reader_ = std::thread([this] { hydration_reader_loop(lookup_queue_); });
         }
         typename ResourceManagement::Durability durability;
         if (store_.store) {
@@ -516,7 +610,19 @@ public:
 
     // Prefill time the cost model expects for a request still in the queue: every chunk the prompt
     // will run and the Vision work of its media, so the backlog is not lower than the work that runs.
+    // A long text prompt the lossy path would take (cold, so from the root) is priced as its scout
+    // and the main pass over the share of it a selection keeps.
     [[nodiscard]] std::uint64_t queued_prefill_ns(const PromptSummary& summary) const noexcept {
+        const double share = lossy_scout_share();
+        if (share > 0.0 && select_lossy() && !summary.has_media &&
+            summary.prompt_tokens > lossy_options_.min_tokens) {
+            const auto kept = lossy_expected_kept(summary.prompt_tokens, lossy_options_.keep_fraction);
+            return saturating_add(
+                scaled_ns(resources_.prefill_ns(
+                              make_prefill_work(0, summary.prompt_tokens, 0, 0, prefill_chunk_)),
+                          share),
+                resources_.prefill_ns(make_prefill_work(0, kept, 0, 0, prefill_chunk_)));
+        }
         return resources_.prefill_ns(make_prefill_work(0, summary.prompt_tokens, summary.vision_items,
                                                        summary.vision_patches, prefill_chunk_));
     }
@@ -526,6 +632,31 @@ public:
         std::scoped_lock lock(execution_mutex_);
         const auto usage = instance_.program->physical_usage();
         return usage.capacity.host_bytes - usage.occupied.host_bytes;
+    }
+
+    // A flush of the context store, for a gateway about to drain the box or move conversations:
+    // while on, the worker writes every retained continuation the store does not hold as it is
+    // now, one between units a second apart as idle writes do, so serving carries on.
+    void set_store_flush(bool on) noexcept {
+        store_flush_.store(on, std::memory_order_release);
+        if (on) { queue_cv_.notify_all(); }
+    }
+
+    // Retained continuations, not in use by a request, that the store does not hold as they are
+    // now and has not let go of: what a flush still has to write.
+    [[nodiscard]] std::size_t unsaved_store_sessions() {
+        std::scoped_lock lock(execution_mutex_);
+        if (store_.store == nullptr) { return 0; }
+        (void)forget_failed_store_writes();
+        forget_removed_store_images();
+        std::size_t unsaved = 0;
+        for (const auto& owner : resources_.retained_owners(*instance_.program)) {
+            const auto found = owner_marks_.find(owner.token);
+            if (!owner.active && (found == owner_marks_.end() || !settled(found->second, owner.points))) {
+                ++unsaved;
+            }
+        }
+        return unsaved;
     }
 
     // Restores one stored image into the empty cache at start-up as a Host-resident continuation.
@@ -585,7 +716,7 @@ public:
             if (Clock::now() >= deadline) { break; }
             try {
                 auto image       = program.export_checkpoints({&handle, 1}, std::nullopt,
-                                                              store_.binding);
+                                                              store_.binding, export_buffer());
                 const auto bytes = image.bytes.size();
                 if (write(std::move(image), true)) {
                     shared_stored_.emplace_back(handle, bytes);
@@ -593,8 +724,8 @@ public:
                 }
             } catch (...) {}
         }
-        // A shared write can make the store evict older images: forget their marks so the owners
-        // pass writes those conversations again instead of trusting them.
+        // A shared write can make the store evict older images: check their marks again so the
+        // owners pass does not count them as durable.
         forget_failed_store_writes();
         forget_removed_store_images();
         auto owners = resources_.retained_owners(program);
@@ -604,13 +735,13 @@ public:
         for (const auto& owner : owners) {
             if (Clock::now() >= deadline) { break; }
             // The write before this one ran synchronously and can have made the store evict this
-            // owner's image; with the worker stopped nothing else would repair its mark.
+            // owner's image; with the worker stopped nothing else would check its mark.
             forget_failed_store_writes();
             forget_removed_store_images();
-            if (owner.active || holds(mark(owner.token), owner.points)) { continue; }
+            if (owner.active || settled(mark(owner.token), owner.points)) { continue; }
             try {
                 auto image        = program.export_checkpoints(owner.points, owner.session,
-                                                               store_.binding);
+                                                               store_.binding, export_buffer());
                 const auto bytes  = image.bytes.size();
                 if (write(std::move(image), false)) {
                     record_stored(owner.token, owner.points, bytes);
@@ -951,11 +1082,18 @@ private:
             request->computed_prompt_tokens > begin.prompt_tokens - begin.reused_prompt_tokens) {
             throw std::logic_error("prompt progress exceeds the admitted prompt frontier");
         }
+        // In the client's prompt tokens: a lossy prompt's dropped tokens count as processed once the
+        // selection has skipped them, and a prompt rewritten onto a lossy lineage counts its
+        // original length (docs/maintainer/lossy-long-prefill.md, "Capacity and reporting").
+        const std::uint32_t total  = reported_prompt_tokens(*request);
+        const std::uint32_t reused = reported_frontier(*request, begin.reused_prompt_tokens);
         const PromptProgress progress{
-            .total_prompt_tokens     = begin.prompt_tokens,
-            .reused_prompt_tokens    = begin.reused_prompt_tokens,
-            .processed_prompt_tokens = begin.reused_prompt_tokens + request->computed_prompt_tokens,
-            .elapsed_ns              = elapsed_ns(*request->admitted_at, Clock::now()),
+            .total_prompt_tokens  = total,
+            .reused_prompt_tokens = reused,
+            .processed_prompt_tokens =
+                std::min(total, reported_frontier(*request, begin.reused_prompt_tokens +
+                                                                request->computed_prompt_tokens)),
+            .elapsed_ns = elapsed_ns(*request->admitted_at, Clock::now()),
         };
         {
             std::lock_guard lock(request->mutex);
@@ -984,7 +1122,7 @@ private:
             }
             request->stream_start = GenerationStart{
                 .prompt               = request->prompt_summary,
-                .reused_prompt_tokens = begin.reused_prompt_tokens,
+                .reused_prompt_tokens = reported_frontier(*request, begin.reused_prompt_tokens),
             };
         }
         request->cv.notify_one();
@@ -1045,6 +1183,9 @@ private:
     }
 
     void complete_error(const std::shared_ptr<Request>& request, std::exception_ptr error) {
+        // A request on the lossy path that fails before its outcome counts as aborted, so the
+        // outcome counters add up to the requests that took the path.
+        lossy_aborted(*request);
         if (request->preemption_count) {
             observe_scheduling(request, GenerationSchedulingTransition::Terminal);
         }
@@ -1067,6 +1208,11 @@ private:
 
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
         HostPhaseMeasurement completion = begin_host_phase();
+        // Read before release_planning_state drops the plan.
+        const std::optional<std::uint32_t> reported_reused =
+            request->begin && request->base_plan
+                ? std::optional(reported_frontier(*request, request->begin->reused_prompt_tokens))
+                : std::nullopt;
         if (request->preemption_count) {
             observe_scheduling(request, GenerationSchedulingTransition::Terminal);
         }
@@ -1115,8 +1261,14 @@ private:
         result.finish_reason                   = reason;
         result.matched_stop_string             = request->output.matched_stop_string();
         if (request->begin) {
-            result.reused_prompt_tokens = request->begin->reused_prompt_tokens;
-            result.prefix_reuse_path    = request->begin->prefix_reuse_path;
+            result.reused_prompt_tokens =
+                reported_reused.value_or(request->begin->reused_prompt_tokens);
+            result.prefix_reuse_path = request->begin->prefix_reuse_path;
+        }
+        if (request->lossy) {
+            result.lossy_prefill = request->lossy->report;
+        } else if (request->summary) {
+            result.lossy_prefill = summary_report(*request->summary);
         }
         result.timings                 = request->generation_timings;
         result.timings.prepare_seconds = request->prepare_seconds;
@@ -1253,6 +1405,8 @@ private:
                 cumulative_stats_.cancelled_prefill_computed_tokens +=
                     request->computed_prompt_tokens;
             }
+            // A scout ends with its lane: the Program drops it and its pages in abort.
+            lossy_aborted(*request);
             auto aborted                = instance_.program->abort(*request->sequence);
             request->generation_timings = aborted.timings;
             request->speculative_stats  = std::move(aborted.speculative);
@@ -1340,6 +1494,7 @@ private:
         std::array<std::size_t, kMaximumConcurrency> generated_sizes{};
         std::array<bool, kMaximumConcurrency> cancelled{};
         std::array<bool, kMaximumConcurrency> failed{};
+        std::array<bool, kMaximumConcurrency> token_domain_failed{};
         bool generated_staged = false;
         std::array<std::shared_ptr<Request>, kMaximumConcurrency> terminal_requests{};
         std::array<std::uint32_t, kMaximumConcurrency> terminal_lanes{};
@@ -1366,7 +1521,8 @@ private:
                 }
                 if (decode_round) { ++request->host_timing.decode_rounds; }
                 cancelled[row] = cancelled_at_unit_start[lane];
-                failed[row]    = !cancelled[row] && pending.constraint_failed(row);
+                token_domain_failed[row] = !cancelled[row] && pending.token_domain_failed(row);
+                failed[row] = !cancelled[row] && (token_domain_failed[row] || pending.constraint_failed(row));
                 const std::int32_t raw_count =
                     pending.row_counts().empty() ? 1 : pending.row_counts()[row];
                 if (raw_count <= 0 || raw_count > static_cast<std::int32_t>(pending.row_stride())) {
@@ -1523,9 +1679,19 @@ private:
                 const auto& request          = slots_[lane];
                 const std::uint32_t accepted = decisions[row].accepted_tokens;
                 if (failed[row]) {
-                    complete_error(request, std::make_exception_ptr(
-                                                RequestError(RequestErrorKind::ConstraintDeadEnd,
-                                                             "grammar has no valid next token")));
+                    const std::size_t generated = generated_sizes[row];
+                    complete_error(
+                        request,
+                        std::make_exception_ptr(
+                            token_domain_failed[row]
+                                ? RequestError(RequestErrorKind::NumericalFailure,
+                                               "the model selected a token outside its vocabulary " +
+                                                   (generated == 0
+                                                        ? std::string("at the end of the prompt")
+                                                        : "after " + std::to_string(generated) +
+                                                              " generated tokens"))
+                                : RequestError(RequestErrorKind::ConstraintDeadEnd,
+                                               "grammar has no valid next token")));
                     remove_completed_slot(lane);
                     continue;
                 }
@@ -1602,6 +1768,12 @@ private:
             if (summary.role == CheckpointRole::SharedPrefix && summary.frontier < prompt_tokens &&
                 summary.frontier % progress_anchor_tokens_ == 0) {
                 request->progress_anchors.push_back(point);
+                if (store_.shared_sink) {
+                    std::erase_if(progress_anchor_points_, [&](const auto handle) {
+                        return !instance_.program->valid_checkpoint(handle);
+                    });
+                    progress_anchor_points_.push_back(point);
+                }
             }
         }
         while (request->progress_anchors.size() > kAnchorsKept) {
@@ -1681,7 +1853,8 @@ private:
     void
     resolve_prefill_progress(const std::shared_ptr<Request>& request,
                              typename ModelContract::PrefillProgress&& progress,
-                             const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+                             const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start,
+                             std::uint64_t step_elapsed_ns = 0) {
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
         ++cumulative_stats_.host_work.prefill_units;
         ++request->host_timing.prefill_units;
@@ -1689,6 +1862,7 @@ private:
         if (!request->admitted_begin) {
             throw std::logic_error("prefill progress has no committed admission summary");
         }
+        observe_lossy_step(request, progress, step_elapsed_ns);
         const BeginSummary& begin = *request->admitted_begin;
         if (begin.reused_prompt_tokens > begin.prompt_tokens) {
             throw std::logic_error("admitted prefix exceeds its prompt");
@@ -1722,6 +1896,7 @@ private:
         if (!request->admitted_begin || progress.summary != *request->admitted_begin) {
             throw std::logic_error("runtime Begin summary differs from committed admission");
         }
+        finish_lossy_prefill(*request);
         const std::uint32_t lane = request->lane->value;
         request->begin           = progress.summary;
         const std::array<std::uint32_t, 1> lanes{lane};
@@ -1843,8 +2018,267 @@ private:
             record_execution_work(request->prefill_work, progress.timing);
         }
         consume_armed_worker_failure();
-        resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
+        resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start,
+                                 step_elapsed_ns);
         publish_runtime_stats();
+    }
+
+    // ---- lossy prefill (lossy_prefill.h, docs/maintainer/lossy-long-prefill.md) ----
+
+    [[nodiscard]] double lossy_scout_share() const noexcept {
+        if constexpr (kLossyCapable) {
+            return select_lossy() ? instance_.program->lossy_scout_share() : 0.0;
+        } else {
+            return 0.0;
+        }
+    }
+
+    // The token (select) strategy runs in the core; the summary strategy rewrote the prompt in
+    // Engine::prepare, so the core never scouts for it.
+    [[nodiscard]] bool select_lossy() const noexcept {
+        return lossy_options_.enabled() && lossy_options_.strategy == LossyStrategy::Select;
+    }
+
+    // The client's prompt length: what prompt progress counts to.
+    [[nodiscard]] static std::uint32_t reported_prompt_tokens(const Request& request) noexcept {
+        if (request.summary && request.summary->rewrite) {
+            return request.summary->rewrite->original_tokens;
+        }
+        const auto& summary = request.base_plan->summary();
+        return summary.reported_prompt_tokens != 0 ? summary.reported_prompt_tokens
+                                                   : summary.prompt_tokens;
+    }
+
+    // A frontier of the request's prompt in the client's tokens: through the plan's lossy lineage,
+    // then through a summary rewrite.
+    [[nodiscard]] static std::uint32_t reported_frontier(const Request& request,
+                                                         std::uint32_t frontier) noexcept {
+        const std::uint32_t planned =
+            request.base_plan ? reported_frontier(*request.base_plan, frontier) : frontier;
+        return request.summary && request.summary->rewrite
+                   ? request.summary->rewrite->original_frontier(planned)
+                   : planned;
+    }
+
+    // The request log's report for a prompt the summary strategy rewrote (completed) or probed
+    // and left whole (skipped); the outcome counters count the same outcomes.
+    [[nodiscard]] static LossyPrefillReport summary_report(const compaction::SummaryRecord& record) {
+        LossyPrefillReport report{.outcome         = LossyPrefillOutcome::Skipped,
+                                  .uncached_tokens = record.prompt_tokens,
+                                  .kept_tokens     = record.prompt_tokens,
+                                  .strategy        = LossyStrategy::Summary,
+                                  .summary_probe   = record.probe};
+        if (const auto& rewrite = record.rewrite) {
+            report.outcome             = LossyPrefillOutcome::Completed;
+            report.uncached_tokens     = rewrite->original_tokens;
+            report.kept_tokens         = rewrite->prompt_tokens;
+            report.summarized_messages = rewrite->messages;
+            report.summary_reused      = !rewrite->fresh;
+        }
+        return report;
+    }
+
+    // At admission, once the source is chosen: whether this request takes the lossy path
+    // (lossy_prefill_trigger). The Program is told once the binding publishes.
+    //
+    // Accepted v1 limitation: a plan is made once, when the request is first considered for
+    // admission (ensure_base_plan), and only a plan made after a lossy prefill finished is
+    // rewritten onto its kept lineage. A follow-up planned earlier (one already queued behind it)
+    // cannot match the selected continuation: it reuses at most the exact product prompt and,
+    // past the threshold, takes the lossy path (a scout) of its own.
+    void plan_lossy_prefill(const std::shared_ptr<Request>& request,
+                            const typename ModelContract::SourceCandidate& source) {
+        request->lossy.reset();
+        if constexpr (kLossyCapable) {
+            if (!select_lossy()) { return; }
+            const auto& plan  = *request->base_plan;
+            const auto lossy  = plan.lossy();
+            std::optional<CheckpointRole> role;
+            if (source.checkpoint) {
+                role = instance_.program->checkpoint_metadata(*source.checkpoint).role;
+            }
+            const auto exact_end = lossy_prefill_trigger({
+                .min_tokens    = lossy_options_.min_tokens,
+                .exact_end     = lossy ? std::optional(lossy->exact_end) : std::nullopt,
+                .prompt_tokens = plan.summary().prompt_tokens,
+                .has_media     = request->prompt_summary.has_media,
+                .source_role   = role,
+                .reused_tokens = source.reused_tokens,
+            });
+            if (exact_end) { request->lossy = LossyPrefillState{.exact_end = *exact_end}; }
+        } else {
+            (void)source;
+        }
+    }
+
+    // After the binding published and before any step.
+    void start_lossy_prefill(const std::shared_ptr<Request>& request) {
+        if (!request->lossy || request->lossy->phase != LossyPrefillState::Phase::Planned) {
+            return;
+        }
+        if constexpr (kLossyCapable) {
+            if (instance_.program->enable_lossy(*request->sequence)) {
+                request->lossy->phase = LossyPrefillState::Phase::Exact;
+                return;
+            }
+        }
+        request->lossy.reset();
+    }
+
+    [[nodiscard]] LossyPrefillReport lossy_report(const Request& request) const noexcept {
+        const auto& state = *request.lossy;
+        const std::uint32_t prompt = request.base_plan->summary().prompt_tokens;
+        return LossyPrefillReport{
+            .outcome         = LossyPrefillOutcome::Aborted,
+            .uncached_tokens = prompt > state.exact_end ? prompt - state.exact_end : 0U,
+            .filter_layer    = lossy_options_.filter_layer,
+        };
+    }
+
+    // A step's lossy reports: scout progress, and once, the outcome and the prompt's new length.
+    void observe_lossy_step(const std::shared_ptr<Request>& request,
+                            typename ModelContract::PrefillProgress& progress,
+                            std::uint64_t step_elapsed_ns) {
+        if constexpr (kLossyCapable) {
+            using Phase = LossyPrefillState::Phase;
+            if (progress.scouted_tokens != 0) {
+                if (!request->lossy || !request->lossy->before_outcome() ||
+                    progress.processed_prompt_tokens != 0) {
+                    throw std::logic_error("a scout step for a request not on the lossy path");
+                }
+                request->lossy->phase = Phase::Scout;
+                request->lossy->scouted += progress.scouted_tokens;
+                cumulative_stats_.lossy_prefill_scouted_tokens += progress.scouted_tokens;
+            }
+            if (progress.compacted_prompt_tokens) {
+                if (!request->lossy || !request->lossy->before_outcome() || !progress.lossy) {
+                    throw std::logic_error("a prompt-length change for a request not on the lossy path");
+                }
+                auto& state        = *request->lossy;
+                BeginSummary& begin = *request->admitted_begin;
+                const std::uint32_t length = *progress.compacted_prompt_tokens;
+                if (length < begin.reused_prompt_tokens + request->computed_prompt_tokens ||
+                    length > begin.prompt_tokens) {
+                    throw std::logic_error("a lossy prefill's prompt length is out of range");
+                }
+                LossyPrefillReport report = lossy_report(*request);
+                const auto& outcome       = *progress.lossy;
+                report.uncached_tokens    = outcome.uncached_tokens;
+                report.kept_tokens        = outcome.kept_tokens;
+                report.scout_ms           = outcome.scout_seconds * 1000.0;
+                report.kept_runs          = outcome.kept_runs;
+                report.outcome            = outcome.declined ? LossyPrefillOutcome::Declined
+                                            : outcome.skipped ? LossyPrefillOutcome::Skipped
+                                                              : LossyPrefillOutcome::Completed;
+                // The Program's plan describes the request from now on: a re-admission after a
+                // pause, checkpoint matching, captures and accounting all read the Engine's.
+                if (progress.compacted_plan) {
+                    *request->base_plan = std::move(*progress.compacted_plan);
+                    if (request->lane) { capture_decisions_[request->lane->value].reset(); }
+                }
+                if (request->base_plan->summary().prompt_tokens != length) {
+                    throw std::logic_error("a lossy prefill changed its length without its plan");
+                }
+                begin.prompt_tokens = length;
+                // Declined and skipped are counted now (both "skipped"); a compacted prompt once its
+                // kept tokens are prefilled.
+                if (report.outcome != LossyPrefillOutcome::Completed) {
+                    ++cumulative_stats_.lossy_prefills_skipped;
+                }
+                if (report.outcome != LossyPrefillOutcome::Declined) {
+                    cumulative_stats_.lossy_prefill_kept_tokens += report.kept_tokens;
+                }
+                state.report = report;
+                state.phase  = Phase::Main;
+                // A short request waiting to yield past this lane could not pause it while it
+                // scouted; it can now, and nothing else would look again.
+                request_admission_check();
+            }
+            if (progress.processed_prompt_tokens != 0 && request->lossy &&
+                request->lossy->phase == Phase::Main) {
+                request->lossy->main_ns += step_elapsed_ns;
+            }
+        } else {
+            (void)request;
+            (void)progress;
+            (void)step_elapsed_ns;
+        }
+    }
+
+    // The prompt is prefilled: a compacted request is counted completed.
+    void finish_lossy_prefill(Request& request) {
+        if (!request.lossy) { return; }
+        auto& state = *request.lossy;
+        using Phase = LossyPrefillState::Phase;
+        if (state.phase == Phase::Main && state.report) {
+            state.report->main_ms = static_cast<double>(state.main_ns) * 1e-6;
+            if (state.report->outcome == LossyPrefillOutcome::Completed) {
+                ++cumulative_stats_.lossy_prefills_completed;
+            }
+            state.phase = Phase::Ended;
+        } else if (state.before_outcome() && state.phase != Phase::Planned) {
+            // The path did not run to its outcome (the lane was rebuilt without it).
+            lossy_aborted(request);
+        }
+    }
+
+    // A request on the lossy path that ends, or leaves the path, before its outcome counts as
+    // aborted: cancelled, failed, or its scout ended for memory pressure. One already counted, or
+    // not yet bound, is left alone. noexcept: it only updates counters and the report.
+    void lossy_aborted(Request& request) noexcept {
+        if (!request.lossy) { return; }
+        auto& state = *request.lossy;
+        using Phase = LossyPrefillState::Phase;
+        const bool open = state.phase == Phase::Exact || state.phase == Phase::Scout ||
+                          (state.phase == Phase::Main && state.report &&
+                           state.report->outcome == LossyPrefillOutcome::Completed);
+        if (!open) { return; }
+        if (!state.report && request.base_plan) { state.report = lossy_report(request); }
+        if (!state.report) { state.report = LossyPrefillReport{.filter_layer = lossy_options_.filter_layer}; }
+        state.report->outcome = LossyPrefillOutcome::Aborted;
+        state.report->main_ms = static_cast<double>(state.main_ns) * 1e-6;
+        state.phase           = Phase::Ended;
+        ++cumulative_stats_.lossy_prefills_aborted;
+    }
+
+    // Where the Engine has to pause a scouting lane for memory (start_pause refuses while the scout
+    // runs, and waiting for it could wait on the very pages the scout holds): the scout ends at M,
+    // the request goes on as an ordinary full prefill from there, and the pause proceeds. Its
+    // restore resumes at M from the snapshot. False when the lane is not scouting.
+    bool end_lossy_scout_for_pause(const std::shared_ptr<Request>& request) {
+        if constexpr (kLossyCapable) {
+            if (!request->lossy || !request->lossy->scouting() ||
+                !instance_.program->abort_lossy_scout(*request->sequence)) {
+                return false;
+            }
+            lossy_aborted(*request);
+            // The scout's pages past M are free again.
+            scheduler_.capacity_released();
+            request_admission_check();
+            return true;
+        } else {
+            (void)request;
+            return false;
+        }
+    }
+
+    // What the lossy path still costs from `cursor`: the exact part to M, the scout over what is
+    // left of U at its share of a full prefill (the layers below the filter layer), and the main
+    // pass over the share of U a selection keeps.
+    [[nodiscard]] std::uint64_t lossy_remaining_ns(const BasePlan& plan, std::uint32_t cursor,
+                                                   const LossyPrefillState& state) const {
+        const std::uint32_t prompt = plan.summary().prompt_tokens;
+        const std::uint32_t m      = std::min(state.exact_end, prompt);
+        std::uint64_t total        = 0;
+        if (cursor < m) { total = resources_.prefill_ns(instance_.program->prefill_work(plan, cursor, m)); }
+        const std::uint32_t scouted = std::min(prompt - m, state.scouted);
+        total = saturating_add(
+            total, scaled_ns(resources_.prefill_ns(
+                                 instance_.program->prefill_work(plan, m + scouted, prompt)),
+                             lossy_scout_share()));
+        const std::uint32_t kept = lossy_expected_kept(prompt - m, lossy_options_.keep_fraction);
+        return saturating_add(
+            total, resources_.prefill_ns(instance_.program->prefill_work(plan, m, m + kept)));
     }
 
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
@@ -1852,8 +2286,21 @@ private:
             request->base_plan.emplace(instance_.program->plan_request(std::move(request->prompt),
                                                                        request->options.execution));
             const auto& summary = request->base_plan->summary();
-            request->budget.emplace(summary.effective_output_tokens,
-                                    summary.effective_limit_reason);
+            std::uint32_t output_tokens = summary.effective_output_tokens;
+            FinishReason limit_reason   = summary.effective_limit_reason;
+            // A prompt the summary strategy shortened may not generate past where the client's own
+            // prompt would reach max_context, as the Program's cap does for a prompt it rewrote;
+            // when that cap binds, the request ends for context capacity, not its output limit.
+            if (request->summary && request->summary->rewrite &&
+                request->summary->rewrite->original_tokens <= max_context_) {
+                const std::uint32_t capacity =
+                    max_context_ - request->summary->rewrite->original_tokens + 1U;
+                if (capacity < output_tokens) {
+                    output_tokens = capacity;
+                    limit_reason  = FinishReason::ContextCapacity;
+                }
+            }
+            request->budget.emplace(output_tokens, limit_reason);
             request->generated.reserve(summary.effective_output_tokens);
         }
     }
@@ -1935,6 +2382,11 @@ private:
                     request->paused_ns += elapsed_ns(*request->paused_at, Clock::now());
                 }
                 request->paused_at.reset();
+                // A request paused in Exact (before M) keeps its lossy path: the Program's saved
+                // control carries its phase and M to the restored lane (pause.cpp, install_binding),
+                // which goes on to M and scouts. Nothing is enabled again here; enable_lossy refuses
+                // a lane already on the path. A scout cannot pause, and Main runs on the compacted
+                // plan this rebinding used.
                 observe_scheduling(request, GenerationSchedulingTransition::Restored);
             } else {
                 request->initial_binding_ns = elapsed_ns(*request->admitted_at, Clock::now());
@@ -1943,11 +2395,22 @@ private:
                 } else {
                     ++cumulative_stats_.root_selections;
                 }
-                cumulative_stats_.reused_prompt_tokens += control.summary.reused_prompt_tokens;
-                cumulative_stats_.prompt_tokens += control.summary.prompt_tokens;
+                // In the client's tokens, as usage reports them; computed_prefill_tokens counts
+                // what the Program actually prefilled.
+                cumulative_stats_.reused_prompt_tokens +=
+                    reported_frontier(*request, control.summary.reused_prompt_tokens);
+                cumulative_stats_.prompt_tokens += reported_prompt_tokens(*request);
+                if (const auto& summary = request->summary; summary && summary->rewrite) {
+                    ++(summary->rewrite->fresh ? cumulative_stats_.lossy_prefill_summaries_new
+                                               : cumulative_stats_.lossy_prefill_summaries_reused);
+                    ++cumulative_stats_.lossy_prefills_completed;
+                } else if (summary) {
+                    ++cumulative_stats_.lossy_prefills_skipped;
+                }
                 cumulative_stats_.last_selected_frontier_tokens =
                     control.summary.reused_prompt_tokens;
                 // Generation start was published when the first binding obtained its resources.
+                start_lossy_prefill(request);
             }
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             slots_[control.destination.value] = request;
@@ -2072,17 +2535,34 @@ private:
         // on is no longer confined to the request being admitted.
         admission_subject_.reset();
         auto request       = slots_[lane];
+        if (request && request->lossy && request->lossy->scouting()) {
+            // start_pause refuses a scouting lane. A pause that only serves the queue waits for
+            // the main pass; one for memory ends the scout, and the request continues in full.
+            if (require_snapshot || !end_lossy_scout_for_pause(request)) { return false; }
+        }
         bool save_snapshot = false;
-        if (require_snapshot) {
+        if (instance_.program->pause_snapshot_fits(*request->sequence)) {
+            // The snapshot fits the free Host bytes as they are (the pause snapshot reserve
+            // included), so nothing needs evicting.
+            save_snapshot = true;
+        } else if (require_snapshot) {
             // A pause that only serves the queue is not worth evicting other requests' history, so
-            // it saves a snapshot only where the image already fits: nothing is released, revoked or
-            // marked for replay before the answer is known.
-            save_snapshot = instance_.program->pause_host_bytes(*request->sequence).has_value() &&
-                            instance_.program->pause_state_image_unplaced(*request->sequence) == 0;
+            // it is made only where the snapshot already fits (above): nothing is released, revoked
+            // or marked for replay before the answer is known.
+            return false;
         } else if (const auto bytes = instance_.program->pause_host_bytes(*request->sequence)) {
-            const auto usage = instance_.program->physical_usage();
-            if (*bytes <= usage.capacity.host_bytes &&
-                *bytes > usage.capacity.host_bytes - usage.occupied.host_bytes) {
+            // `usage` is the context cache's view: its budget, without the pause snapshot reserve.
+            // A snapshot may also use what is free in the reserve, so eviction only has to make up
+            // the rest.
+            const auto reserve_free_in = [](const auto& seen) {
+                return pause_reserve_free(seen.host_pause_reserve_bytes,
+                                          seen.host_pause_reserve_occupied_bytes);
+            };
+            const auto usage        = instance_.program->physical_usage();
+            std::size_t reserve_free = reserve_free_in(usage);
+            const std::size_t reserve_total = usage.host_pause_reserve_bytes;
+            if (*bytes <= usage.capacity.host_bytes + reserve_free &&
+                *bytes > usage.capacity.host_bytes - usage.occupied.host_bytes + reserve_free) {
                 (void)instance_.program->release_redundant_host({}, request->sequence);
             }
             std::vector<Checkpoint> later;
@@ -2094,14 +2574,25 @@ private:
             }
             // The victim search counts free bytes, but the state image needs one contiguous run:
             // when the freed bytes do not form one, ask for another image's worth and try again.
-            std::size_t target = *bytes;
+            // What the reserve holds needs no eviction, so a snapshot the reserve can take starts
+            // from nothing to free and only the image's run can make the rounds ask for more.
+            std::size_t target = pause_eviction_target(*bytes, reserve_free);
+            // Releasing a later paused snapshot can free bytes in the reserve rather than the
+            // budget; those count toward the target too, so eviction stops as soon as they cover it.
+            const auto reached = [&](const auto& seen) {
+                return pause_target_reached(seen.capacity.host_bytes - seen.occupied.host_bytes,
+                                            reserve_free, reserve_free_in(seen), target);
+            };
             for (std::size_t round = 0; round < kMaxPauseHostRounds; ++round) {
-                const auto victims =
-                    resources_.host_victims(*instance_.program, target, std::nullopt, later);
+                // The target is measured against the whole backing: with the budget full and later
+                // snapshots in the reserve it exceeds the budget, and those snapshots are victims
+                // that reach it.
+                const auto victims = resources_.host_victims(
+                    *instance_.program, target, std::nullopt, later, {}, std::nullopt, nullptr, {},
+                    reserve_total);
                 if (!victims) { break; }
                 for (const auto handle : *victims) {
-                    const auto usage = instance_.program->physical_usage();
-                    if (usage.capacity.host_bytes - usage.occupied.host_bytes >= target) { break; }
+                    if (reached(instance_.program->physical_usage())) { break; }
                     if (resources_.release_victim(*instance_.program, handle)) { continue; }
                     const auto owner =
                         std::find_if(paused_.begin(), paused_.end(), [&](const auto& other) {
@@ -2126,7 +2617,8 @@ private:
                     usage.capacity.host_bytes - usage.occupied.host_bytes, unplaced,
                     usage.capacity.host_bytes);
                 if (!next) { break; }
-                target = *next;
+                target       = *next;
+                reserve_free = reserve_free_in(usage);
             }
         }
         if (require_snapshot && !save_snapshot) { return false; }
@@ -2253,18 +2745,23 @@ private:
                     frontier < best + kSiblingWaitMinimumTokens) {
                     continue;
                 }
-                // The sibling's remaining prefill to the checkpoint, doubled because other lanes'
-                // units interleave with it, bounds the wait. Compared against half the limit rather
-                // than doubled first: the cost model returns UINT64_MAX when it saturates, and
-                // doubling that would wrap into a short wait.
+                // The sibling's remaining prefill to the checkpoint, plus what runs before its next
+                // turns, bounds the wait. In rotation other lanes' units interleave with it, which
+                // doubles it; under --prefill-order shortest it runs alone, once every resident
+                // with an earlier deadline has finished. Each part is compared against half the
+                // limit rather than summed first: the cost model returns UINT64_MAX when it
+                // saturates, and adding that would wrap into a short wait.
                 const auto work              = instance_.program->prefill_work(other, *cursor, frontier);
                 const std::uint64_t cost     = resources_.prefill_ns(work);
+                const std::uint64_t ahead    = scheduler_.prefill_order() == PrefillOrder::Shortest
+                                                   ? prefill_ahead_ns(*sibling)
+                                                   : cost;
                 const std::uint64_t limit_ns = static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(pending_timeout_ / 2).count());
-                if (cost > limit_ns / 2) { continue; }
+                if (cost > limit_ns / 2 || ahead > limit_ns / 2) { continue; }
                 if (!chosen || frontier > chosen->frontier) {
                     chosen = SiblingWait{request, sibling->id, frontier,
-                                         Clock::now() + std::chrono::nanoseconds(2 * cost) +
+                                         Clock::now() + std::chrono::nanoseconds(cost + ahead) +
                                              std::chrono::seconds(1)};
                 }
                 break;
@@ -2332,9 +2829,11 @@ private:
         std::size_t count = 0;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& resident = slots_[lane];
+            // A scouting lane cannot pause (its scout keeps uncommitted pages). The head waits
+            // until the main pass starts; the step that ends the scout looks again.
             if (!resident || !resident->is_prefilling() || resident->capture_pending ||
                 resident->slice_in_flight || resident->prompt_summary.has_media ||
-                !resident->base_plan) {
+                !resident->base_plan || (resident->lossy && resident->lossy->scouting())) {
                 continue;
             }
             if (const auto cursor = sibling_cursor(*resident)) {
@@ -2359,10 +2858,49 @@ private:
         return true;
     }
 
+    // --prefill-order shortest: when the request was submitted plus what its prefill from `begin`
+    // is predicted to cost alone (a lossy request's priced as filtered). Clamped to a day: the cost
+    // model saturates at UINT64_MAX, which as a signed duration would land before submission.
+    [[nodiscard]] Clock::time_point prefill_deadline_for(const Request& request,
+                                                     std::uint32_t begin) const {
+        constexpr std::uint64_t kDayNs = 86'400ULL * 1'000'000'000ULL;
+        const std::uint64_t cost       = std::min(prefill_remaining_ns(request, begin), kDayNs);
+        return request.submitted +
+               std::chrono::duration_cast<Clock::duration>(std::chrono::nanoseconds(cost));
+    }
+
+    // Under --prefill-order shortest, the predicted prefill still to run on every other resident
+    // that Scheduler::next_prefill can pick before `request`: a fresh prefill or a replay whose
+    // deadline is earlier, or the same (a tie keeps the rotation's order, which may put it first).
+    // A replay's remaining work is not known here, so one ahead makes the answer unknown, as the
+    // saturated UINT64_MAX the cost model also uses: too long to wait for.
+    [[nodiscard]] std::uint64_t prefill_ahead_ns(const Request& request) const {
+        std::uint64_t ahead = 0;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const auto& other = slots_[lane];
+            if (!other || other.get() == &request ||
+                !(other->is_prefilling() || other->is_replaying()) || !other->base_plan ||
+                other->prefill_deadline > request.prefill_deadline) {
+                continue;
+            }
+            if (other->is_replaying()) { return std::numeric_limits<std::uint64_t>::max(); }
+            if (const auto cursor = sibling_cursor(*other)) {
+                const auto rest = prefill_remaining_ns(*other, *cursor);
+                ahead = rest > std::numeric_limits<std::uint64_t>::max() - ahead
+                            ? std::numeric_limits<std::uint64_t>::max()
+                            : ahead + rest;
+            }
+        }
+        return ahead;
+    }
+
     [[nodiscard]] std::uint64_t prefill_remaining_ns(const Request& request,
                                                      std::uint32_t cursor) const {
         const std::uint32_t prompt = request.base_plan->summary().prompt_tokens;
         if (cursor >= prompt) { return 0; }
+        if (request.lossy && request.lossy->before_outcome() && lossy_scout_share() > 0.0) {
+            return lossy_remaining_ns(*request.base_plan, cursor, *request.lossy);
+        }
         return resources_.prefill_ns(instance_.program->prefill_work(*request.base_plan, cursor, prompt));
     }
 
@@ -2596,6 +3134,14 @@ private:
                 resources_.binding_started(request->id, reservation.retired_points,
                                            reservation.consumed_source);
                 const auto& source = choice.source;
+                if (!restoring) {
+                    plan_lossy_prefill(request, source);
+                    const auto& planned = request->base_plan->summary();
+                    // A prompt rewritten onto a lossy-prefilled lineage (the selection alias).
+                    if (planned.reported_prompt_tokens > planned.prompt_tokens) {
+                        ++cumulative_stats_.lossy_prefill_alias_hits;
+                    }
+                }
                 const BeginSummary begin{
                     .prompt_tokens        = request->base_plan->summary().prompt_tokens,
                     .reused_prompt_tokens = source.reused_tokens,
@@ -2620,6 +3166,7 @@ private:
                     request->admission.revoked_checkpoints =
                         resources_.source_revocations(request->id);
                     request->admitted_at = binding_started;
+                    request->prefill_deadline = prefill_deadline_for(*request, source.reused_tokens);
                     request->host_timing.queue_wait_ns =
                         elapsed_ns(request->submitted, *request->admitted_at);
                     request->queue_wait_recorded = true;
@@ -3257,15 +3804,54 @@ private:
         // continuation whose current points are all among them is held by the store as it is now.
         std::vector<Checkpoint> stored;
         std::uint64_t stored_bytes = 0;
+        // The store id of that image.
+        std::string image_id;
+        // The points of an image the store removed on its own (space, age, damage, or superseded).
+        // A continuation still at exactly these points is not written again: the store chose to
+        // let it go, and writing it back would only evict another image, which would then be
+        // written back in turn.
+        std::vector<Checkpoint> dropped;
         Clock::time_point last_used{};
     };
 
-    [[nodiscard]] static bool holds(const OwnerMark& entry, std::span<const Checkpoint> points) {
-        return !entry.stored.empty() && !points.empty() &&
+    [[nodiscard]] static bool covers(const std::vector<Checkpoint>& set,
+                                     std::span<const Checkpoint> points) {
+        return !set.empty() && !points.empty() &&
                std::all_of(points.begin(), points.end(), [&](const auto point) {
-                   return std::find(entry.stored.begin(), entry.stored.end(), point) !=
-                          entry.stored.end();
+                   return std::find(set.begin(), set.end(), point) != set.end();
                });
+    }
+
+    [[nodiscard]] static bool holds(const OwnerMark& entry, std::span<const Checkpoint> points) {
+        return covers(entry.stored, points);
+    }
+
+    // Not to be written: the store holds the continuation as it is now, or let it go as it is now.
+    [[nodiscard]] static bool settled(const OwnerMark& entry, std::span<const Checkpoint> points) {
+        return holds(entry, points) || covers(entry.dropped, points);
+    }
+
+    // The store id of the image of `points`, as ContextStore::image_id names it: the deepest point's
+    // key (an image lists its points deepest first). Empty when there is no such key; a mark with
+    // no id is found missing at the next check and treated like an image the store let go.
+    template <class Program>
+    [[nodiscard]] static std::string store_image_id(const Program& program,
+                                                    std::span<const Checkpoint> points,
+                                                    bool shared) noexcept {
+        try {
+            if (points.empty()) { return {}; }
+            Checkpoint deepest     = points.front();
+            std::uint32_t frontier = program.checkpoint_metadata(deepest).frontier;
+            for (const auto point : points) {
+                const auto depth = program.checkpoint_metadata(point).frontier;
+                if (depth > frontier) {
+                    deepest  = point;
+                    frontier = depth;
+                }
+            }
+            return ContextStore::image_id(program.checkpoint_key(deepest, frontier).digests,
+                                          frontier, shared);
+        } catch (...) { return {}; }
     }
 
     void record_stored(ContinuationOwnerToken token, std::span<const Checkpoint> points,
@@ -3273,6 +3859,8 @@ private:
         auto& entry        = mark(token);
         entry.stored       = std::vector<Checkpoint>(points.begin(), points.end());
         entry.stored_bytes = bytes;
+        entry.image_id     = store_image_id(*instance_.program, points, false);
+        entry.dropped.clear();
     }
 
     OwnerMark& mark(ContinuationOwnerToken token) {
@@ -3282,10 +3870,11 @@ private:
     }
 
 
-    // Images the store removed on its own (space, age, damage, or superseded by a longer image of
-    // another conversation). A continuation marked as stored whose image is gone would never be
-    // written again, so every mark is cleared when it grows. A superseding image covers the old
-    // one's prefix, but only down to its own checkpoints: it may not hold the old resume point.
+    // Images the store removed on its own (space, age, damage, or superseded by a longer image).
+    // When it grows, each mark is checked against the store: a mark whose image is gone is
+    // dropped, and the others stand. Clearing every mark instead had every idle conversation
+    // written again after any turn of any other (each write supersedes the conversation's previous
+    // image), and each rewrite evicted another image from a full store, which cleared them again.
     [[nodiscard]] std::uint64_t store_removal_count() const noexcept {
         if (store_.store == nullptr) { return 0; }
         try {
@@ -3299,19 +3888,98 @@ private:
         const auto removed = store_removal_count();
         if (removed == store_removals_seen_) { return; }
         store_removals_seen_ = removed;
-        for (auto& [token, entry] : owner_marks_) { entry.stored.clear(); }
-        shared_stored_.clear();
+        drop_removed_store_marks();
     }
 
-    // A write that was accepted into the queue and then failed left its continuation marked.
+    // A write that was accepted into the queue and then failed left its continuation marked. The
+    // writer names the images that failed: each is written again unless the store holds it after
+    // all, even if a removal scan meanwhile took it for an image the store let go.
     bool forget_failed_store_writes() noexcept {
         if (!store_.failures) { return false; }
         const auto failed = store_.failures();
-        if (failed == store_failures_seen_) { return false; }
+        FailedStoreWrites reported;
+        try {
+            if (store_.failed_writes) {
+                reported = store_.failed_writes();
+            } else if (failed != store_failures_seen_) {
+                reported.lost = true; // no ids to go by
+            }
+        } catch (...) { reported.lost = failed != store_failures_seen_; }
+        if (failed == store_failures_seen_ && reported.ids.empty() && !reported.lost) {
+            return false;
+        }
         store_failures_seen_ = failed;
-        for (auto& [token, entry] : owner_marks_) { entry.stored.clear(); }
-        shared_stored_.clear();
+        retry_failed_store_writes(reported);
         return true;
+    }
+
+    // The buffer to export the next image into (empty when the writer has none to hand back).
+    [[nodiscard]] std::vector<std::uint8_t> export_buffer() noexcept {
+        try {
+            if (store_.export_buffer) { return store_.export_buffer(); }
+        } catch (...) {}
+        return {};
+    }
+
+    // Whether the store holds the image `id` for this Engine's model and configuration, or the
+    // Engine's writer still has it to write. A store that cannot answer is taken to hold it, so a
+    // failing lookup never sets off rewrites.
+    [[nodiscard]] bool store_has_image(const std::string& id) const noexcept {
+        if (id.empty()) { return false; }
+        try {
+            if (store_.queued && store_.queued(id)) { return true; }
+            const auto info = store_.store->find(id);
+            return info && info->binding == store_.binding;
+        } catch (...) { return true; }
+    }
+
+    // After the store removed images on its own: a mark whose image is gone is dropped (written
+    // again only once its continuation has changed, OwnerMark::dropped); the others stand.
+    void drop_removed_store_marks() noexcept {
+        try {
+            auto& program = *instance_.program;
+            for (auto& [token, entry] : owner_marks_) {
+                if (entry.stored.empty() || store_has_image(entry.image_id)) { continue; }
+                entry.dropped = std::move(entry.stored);
+                entry.stored.clear();
+                entry.stored_bytes = 0;
+            }
+            std::erase_if(shared_stored_, [&](const auto& stored) {
+                if (!program.valid_checkpoint(stored.first)) { return true; }
+                const Checkpoint handle = stored.first;
+                if (store_has_image(store_image_id(program, {&handle, 1}, true))) { return false; }
+                shared_dropped_.push_back(handle);
+                return true;
+            });
+        } catch (...) {} // marks not yet checked stand: a stale one costs a hit, never an answer
+    }
+
+    // After queued writes failed: their continuations are no longer stored, and not dropped
+    // either, so the next scan writes them again. With ids lost, every continuation whose image the
+    // store does not hold is treated so.
+    void retry_failed_store_writes(const FailedStoreWrites& reported) noexcept {
+        try {
+            const auto& ids   = reported.ids;
+            const auto failed = [&](const std::string& id) {
+                return !id.empty() &&
+                       (reported.lost || std::find(ids.begin(), ids.end(), id) != ids.end()) &&
+                       !store_has_image(id);
+            };
+            auto& program = *instance_.program;
+            for (auto& [token, entry] : owner_marks_) {
+                if (!failed(entry.image_id)) { continue; }
+                entry.stored.clear();
+                entry.stored_bytes = 0;
+                entry.dropped.clear();
+            }
+            const auto shared_failed = [&](Checkpoint handle) {
+                return program.valid_checkpoint(handle) &&
+                       failed(store_image_id(program, {&handle, 1}, true));
+            };
+            std::erase_if(shared_stored_,
+                          [&](const auto& stored) { return shared_failed(stored.first); });
+            std::erase_if(shared_dropped_, shared_failed);
+        } catch (...) {}
     }
 
     // Writes at most one idle retained continuation to the store. Called by the worker between
@@ -3328,8 +3996,10 @@ private:
             const bool failing = forget_failed_store_writes();
             forget_removed_store_images();
             // With idle writes off the scan still runs to the pruning below: write-on-evict adds a
-            // mark for every owner it is offered, and nothing else ever erases them.
-            const bool idle_writes = store_.idle_persist.count() > 0;
+            // mark for every owner it is offered, and nothing else ever erases them. A flush
+            // (set_store_flush) writes every unsaved continuation, idle or not, the same way.
+            const bool flushing    = store_flush_.load(std::memory_order_acquire);
+            const bool idle_writes = store_.idle_persist.count() > 0 || flushing;
             if (idle_writes && failing) {
                 // A failing disk: do not export deep sessions over and over.
                 next_persist_scan_ = now + std::chrono::seconds(30);
@@ -3362,8 +4032,8 @@ private:
             for (const auto& owner : owners) {
                 if (owner.active) { continue; }
                 auto& entry = mark(owner.token);
-                if (holds(entry, owner.points) ||
-                    now - entry.last_used < store_.idle_persist) {
+                if (settled(entry, owner.points) ||
+                    (!flushing && now - entry.last_used < store_.idle_persist)) {
                     continue;
                 }
                 std::uint32_t depth = 0;
@@ -3376,11 +4046,15 @@ private:
                 chosen_depth = depth;
             }
             if (!chosen) { return; }
+            const auto started = Clock::now();
             auto image       = program.export_checkpoints(chosen->points, chosen->session,
-                                                              store_.binding);
+                                                              store_.binding, export_buffer());
+            cumulative_stats_.context_store_idle_export_seconds +=
+                std::chrono::duration<double>(Clock::now() - started).count();
             const auto bytes = image.bytes.size();
             if (store_.sink(std::move(image))) {
                 record_stored(chosen->token, chosen->points, bytes);
+                ++cumulative_stats_.context_store_idle_writes;
             } else {
                 // The write queue is full: try again later, not on every unit.
                 next_persist_scan_ = now + std::chrono::seconds(4);
@@ -3413,34 +4087,44 @@ private:
         return true;
     }
 
-    // Public shared prefixes the store does not hold yet; drops marks of released ones.
+    // Public shared prefixes the store does not hold yet; drops marks of released ones. Not those
+    // the store let go (written once, then removed on its own) nor progress anchors: an anchor
+    // insures one conversation's long prefill against a cancellation, and its retry finds it in
+    // memory; the conversation's own image holds the same pages once the request ends.
     template <class Program>
     [[nodiscard]] std::vector<Checkpoint> unstored_shared(Program& program) {
         std::erase_if(shared_stored_,
                       [&](const auto& entry) { return !program.valid_checkpoint(entry.first); });
+        const auto released = [&](const auto handle) { return !program.valid_checkpoint(handle); };
+        std::erase_if(shared_dropped_, released);
+        std::erase_if(progress_anchor_points_, released);
         auto shared = resources_.retained_shared(program);
         std::erase_if(shared, [&](const auto handle) {
+            const auto among = [&](const auto& set) {
+                return std::find(set.begin(), set.end(), handle) != set.end();
+            };
             return std::any_of(shared_stored_.begin(), shared_stored_.end(),
-                               [&](const auto& entry) { return entry.first == handle; });
+                               [&](const auto& entry) { return entry.first == handle; }) ||
+                   among(shared_dropped_) || among(progress_anchor_points_);
         });
         return shared;
     }
 
-    // The size of a shared image in the store with this prefix's exact key, if there is one.
+    // The size of a shared image in the store with this prefix's exact key, if there is one. Such
+    // an image is stored under the id of that key, so one lookup finds it.
     template <class Program>
     [[nodiscard]] std::optional<std::uint64_t> stored_shared_image(Program& program,
                                                                    Checkpoint handle) const {
         const auto frontier = program.checkpoint_metadata(handle).frontier;
         const auto key      = program.checkpoint_key(handle, frontier);
-        for (const ContextStore::Info& info : store_.store->list()) {
-            if (!info.shared || info.binding != store_.binding || info.checkpoints.empty()) {
-                continue;
-            }
-            const auto& stored = info.checkpoints.front();
-            if (stored.frontier == frontier && stored.digests == key.digests &&
-                stored.identity_tag == key.identity_tag) {
-                return info.image_bytes;
-            }
+        const auto info = store_.store->find(context_store_image_id(key.digests, frontier, true));
+        if (!info || !info->shared || info->binding != store_.binding || info->checkpoints.empty()) {
+            return std::nullopt;
+        }
+        const auto& stored = info->checkpoints.front();
+        if (stored.frontier == frontier && stored.digests == key.digests &&
+            stored.identity_tag == key.identity_tag) {
+            return info->image_bytes;
         }
         return std::nullopt;
     }
@@ -3453,48 +4137,36 @@ private:
         if (!store_.shared_sink) { return; }
         const auto now = Clock::now();
         if (now < next_shared_scan_) { return; }
-        next_shared_scan_ = now + std::chrono::seconds(1);
+        next_shared_scan_ = now + kSharedPrefixRescan;
         try {
             auto& program = *instance_.program;
             if (program.has_context_transaction() || (store_.ready && !store_.ready())) { return; }
-            bool failed = false;
-            for (const auto handle : unstored_shared(program)) {
-                // A prefix captured again after an eviction has the key of the image the store
-                // already holds: that image serves it, so it is not exported a second time.
-                if (const auto bytes = stored_shared_image(program, handle)) {
-                    shared_stored_.emplace_back(handle, *bytes);
-                    continue;
-                }
-                // One prefix that cannot be exported (the Program refuses it, or a transient
-                // failure) must not keep the others from being tried: each candidate is isolated,
-                // as in the shutdown flush. One export per scan.
-                std::optional<CheckpointImage> image;
-                try {
+            // The fault isolation lives in scan_shared_prefixes (shared_prefix_scan.h), which is
+            // tested without a device.
+            next_shared_scan_ = now + scan_shared_prefixes(
+                unstored_shared(program),
+                [&](const Checkpoint handle) {
+                    // A prefix captured again after an eviction has the key of the image the
+                    // store already holds: that image serves it, so it is not exported a second
+                    // time.
+                    const auto bytes = stored_shared_image(program, handle);
+                    if (bytes) { shared_stored_.emplace_back(handle, *bytes); }
+                    return bytes.has_value();
+                },
+                [&](const Checkpoint handle) {
                     const auto started = Clock::now();
-                    image.emplace(program.export_checkpoints({&handle, 1}, std::nullopt,
-                                                             store_.binding));
+                    auto image = program.export_checkpoints({&handle, 1}, std::nullopt,
+                                                            store_.binding, export_buffer());
                     cumulative_stats_.context_store_shared_export_seconds +=
                         std::chrono::duration<double>(Clock::now() - started).count();
-                } catch (...) {
-                    failed = true;
-                    continue;
-                }
-                // The sink ends the scan whatever it answers: a rejection (full queue, shutdown)
-                // or a throw backs off like a failed scan instead of exporting another prefix.
-                const auto bytes = image->bytes.size();
-                bool accepted    = false;
-                try { accepted = store_.shared_sink(std::move(*image)); } catch (...) {}
-                if (accepted) {
+                    return image;
+                },
+                [&](CheckpointImage&& image) { return store_.shared_sink(std::move(image)); },
+                [&](const Checkpoint handle, const std::size_t bytes) {
                     shared_stored_.emplace_back(handle, bytes);
                     ++cumulative_stats_.context_store_shared_writes;
-                } else {
-                    next_shared_scan_ = now + std::chrono::seconds(4);
-                }
-                return;
-            }
-            // Every candidate failed: back off instead of retrying them each second.
-            if (failed) { next_shared_scan_ = now + std::chrono::seconds(4); }
-        } catch (...) { next_shared_scan_ = now + std::chrono::seconds(4); }
+                });
+        } catch (...) { next_shared_scan_ = now + kSharedPrefixBackoff; }
     }
 
     // Write-on-evict: a retained continuation the cache is about to lose a point of, and that the
@@ -3512,9 +4184,9 @@ private:
         forget_removed_store_images();
         for (const auto& owner : owners) {
             try {
-                if (holds(mark(owner.token), owner.points)) { continue; }
+                if (settled(mark(owner.token), owner.points)) { continue; }
                 const auto started = Clock::now();
-                auto image = program.export_checkpoints(owner.points, owner.session, store_.binding);
+                auto image = program.export_checkpoints(owner.points, owner.session, store_.binding, export_buffer());
                 const auto bytes = image.bytes.size();
                 cumulative_stats_.context_store_eviction_export_seconds +=
                     std::chrono::duration<double>(Clock::now() - started).count();
@@ -3532,7 +4204,36 @@ private:
         std::optional<std::vector<std::uint8_t>> bytes;
         // Wall time of the store read, for the cost model's read rate.
         std::uint64_t read_ns = 0;
+        // What the read downloaded from the bucket first, and how long the download alone took.
+        ContextStore::LoadReport fetch;
+        // The request's wait ends here: the read (or lookup) gives up at it.
+        Clock::time_point deadline{};
+        // Not run: it was still queued at its deadline.
+        bool expired = false;
+        // Not a read: look the bucket up for images ending on the request's prompt, then consult
+        // the store again. Copied from the plan on the worker, which owns it: the prompt's prefix
+        // digest at each frontier from lookup_from + 1 on (nullopt where it has none), and when the
+        // request asked.
+        bool lookup = false;
+        std::uint32_t lookup_from = 0;
+        std::vector<std::optional<std::array<std::uint64_t, 2>>> lookup_digests;
+        Clock::time_point lookup_asked{};
+        // Wanted images the index held after the lookup.
+        std::size_t lookup_found = 0;
     };
+
+    // A request that would prefill for less than this does not wait for a bucket listing.
+    static constexpr auto kStoreLookupMinimumPrefill = std::chrono::seconds(2);
+    // The longest a request waits for the listing.
+    static constexpr auto kStoreLookupBudget = std::chrono::seconds(5);
+
+    // Time to fetch `bytes` of missing chunks from the bucket, at the rate the last fetches
+    // achieved. A fetch is download, verification and installation together (what a waiting
+    // request waits for), so that is what the rate measures, not the network alone.
+    [[nodiscard]] std::uint64_t remote_fetch_ns(std::uint64_t bytes) const noexcept {
+        const double ns = static_cast<double>(bytes) * remote_ns_per_byte_;
+        return ns >= static_cast<double>(UINT64_MAX) ? UINT64_MAX : static_cast<std::uint64_t>(ns);
+    }
 
     // Before admission: when the store holds a checkpoint of this very prompt deeper than anything
     // the cache offers, and reading it back, copying it to the device and prefilling the rest is
@@ -3556,66 +4257,182 @@ private:
         }
         const auto& base         = *request->base_plan;
         const auto prompt_tokens = base.summary().prompt_tokens;
+        // The prefill this request faces from what is resident.
+        const auto full_prefill =
+            resources_.prefill_ns(instance_.program->prefill_work(base, resident, prompt_tokens));
+        // A download from the bucket is not weighed against the prefill it saves: it only makes
+        // this request wait, while a prefill holds the GPU every other lane shares. It has to fit
+        // in the wait, though (at the rate downloads have achieved), or it would time out anyway.
+        // The wait is the read's deadline below: the budget, or less when the request has less
+        // left before its own deadline.
+        const auto now     = Clock::now();
+        const auto left    = std::max<Clock::duration>(request->deadline - now, Clock::duration::zero());
+        const auto wait    = std::min<Clock::duration>(store_.hydration_budget, left);
+        const auto wait_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(wait).count());
         std::string best_id;
-        std::uint32_t best_frontier = resident;
+        std::uint32_t best_frontier   = resident;
+        std::uint64_t best_bytes      = 0;
+        std::uint64_t best_fetch      = 0;
         try {
-            for (const ContextStore::Info& info : store_.store->list()) {
-                // The binding does not include the context length: an image deeper than this
-                // Engine's context could never be restored, and reading it would only cost time.
-                if (info.binding != store_.binding || info.tokens > max_context_) { continue; }
+            // The binding does not include the context length: an image deeper than this Engine's
+            // context could never be restored, and reading it would only cost time
+            // (for_each_stored_match leaves it out).
+            for_each_stored_match(base, [&](const ContextStore::Info& info,
+                                            const ContextStore::CheckpointKey& key) {
+                if (info.fetch_bytes > 0 && remote_fetch_ns(info.fetch_bytes) >= wait_ns) { return; }
                 const auto restore = resources_.store_restore_ns(info.image_bytes);
-                if (restore >= best_cost) { continue; }
-                for (const ContextStore::CheckpointKey& key : info.checkpoints) {
-                    if (key.frontier <= resident || key.frontier > prompt_tokens) { continue; }
-                    const auto prefill = resources_.prefill_ns(
-                        instance_.program->prefill_work(base, key.frontier, prompt_tokens));
-                    const auto cost = prefill > UINT64_MAX - restore ? UINT64_MAX
-                                                                     : restore + prefill;
-                    if (cost >= best_cost) { continue; }
-                    const auto mine = base.prefix_shortlist_key(key.frontier);
-                    if (mine && mine->digests == key.digests &&
-                        mine->identity_tag == key.identity_tag) {
-                        best_id       = info.id;
-                        best_frontier = key.frontier;
-                        best_cost     = cost;
-                    }
-                }
-            }
+                if (restore >= best_cost || key.frontier <= resident) { return; }
+                const auto prefill = resources_.prefill_ns(
+                    instance_.program->prefill_work(base, key.frontier, prompt_tokens));
+                const auto cost = prefill > UINT64_MAX - restore ? UINT64_MAX : restore + prefill;
+                if (cost >= best_cost) { return; }
+                best_id       = info.id;
+                best_frontier = key.frontier;
+                best_bytes    = info.image_bytes;
+                best_fetch    = info.fetch_bytes;
+                best_cost     = cost;
+            });
         } catch (...) { return false; }
-        if (best_id.empty()) { return false; }
-        const auto now                   = Clock::now();
+        if (best_id.empty()) {
+            // Nothing here, but another engine may have stored this session since the bucket was
+            // last listed (the conversation moved here a moment ago). A request with a long
+            // prefill ahead lists it once and looks again; a short one is not worth the wait.
+            if (!store_.remote || request->store_looked_up ||
+                full_prefill < static_cast<std::uint64_t>(
+                                   std::chrono::nanoseconds(kStoreLookupMinimumPrefill).count())) {
+                return false;
+            }
+            HydrationTask task;
+            task.request      = request;
+            task.lookup       = true;
+            task.lookup_asked = now;
+            task.deadline     = std::min(request->deadline, now + kStoreLookupBudget);
+            // What would be worth reading: an image ending past what is resident, on this prompt.
+            task.lookup_from  = resident;
+            try {
+                task.lookup_digests.reserve(prompt_tokens > resident ? prompt_tokens - resident : 0);
+                for (std::uint32_t frontier = resident + 1; frontier <= prompt_tokens; ++frontier) {
+                    const auto key = base.prefix_shortlist_key(frontier);
+                    task.lookup_digests.push_back(key ? std::optional(key->digests) : std::nullopt);
+                }
+            } catch (...) { return false; }
+            request->store_looked_up    = true;
+            request->store_lookup       = true;
+            request->hydrating          = true;
+            request->hydration_started  = now;
+            request->hydration_deadline = task.deadline;
+            {
+                std::lock_guard lock(hydration_mutex_);
+                lookup_queue_.push_back(std::move(task));
+            }
+            // Two threads wait on this condition variable, each for its own queue.
+            hydration_cv_.notify_all();
+            return true;
+        }
         request->hydrating               = true;
         request->hydration_frontier      = best_frontier;
         request->hydration_reuse_before  = resident;
         request->hydration_started       = now;
         request->hydration_deadline      = std::min(request->deadline, now + store_.hydration_budget);
+        request->hydration_id            = best_id;
+        request->hydration_bytes         = best_bytes;
+        request->hydration_fetch_bytes   = best_fetch;
         {
             std::lock_guard lock(hydration_mutex_);
-            hydration_queue_.push_back({request, std::move(best_id), std::nullopt});
+            HydrationTask task;
+            task.request  = request;
+            task.id       = std::move(best_id);
+            task.deadline = request->hydration_deadline;
+            hydration_queue_.push_back(std::move(task));
         }
-        hydration_cv_.notify_one();
+        hydration_cv_.notify_all();
         return true;
     }
 
-    void hydration_reader_loop() noexcept {
+    // A bucket lookup settled (or ran out of time): the request consults the store again, now
+    // with whatever the listing found, and is offered for admission as usual. `found`: the store
+    // now holds an image ending on the request's prompt.
+    void finish_store_lookup(const std::shared_ptr<Request>& request, bool found) {
+        request->store_lookup = false;
+        request->hydrating    = false;
+        request->store_probed = false;
+        cumulative_stats_.context_store_lookup_seconds +=
+            std::chrono::duration<double>(Clock::now() - request->hydration_started).count();
+        ++cumulative_stats_.context_store_lookups;
+        if (found) { ++cumulative_stats_.context_store_lookup_hits; }
+        request->admission_generation = 0;
+        request_admission_check();
+    }
+
+    // Runs the tasks of one queue: reads on the hydration reader, bucket lookups on their own
+    // thread, so a lookup stalled on the network never holds up a read (or the reverse). The
+    // waiting request is released at its deadline either way (process_hydrations).
+    void hydration_reader_loop(std::deque<HydrationTask>& queue) noexcept {
+        const bool reads = &queue == &hydration_queue_; // the other reader only looks the bucket up
         for (;;) {
             HydrationTask task;
+            std::vector<std::uint8_t> reuse; // the buffer this read goes into
             {
                 std::unique_lock lock(hydration_mutex_);
-                hydration_cv_.wait(lock,
-                                   [&] { return hydration_stop_ || !hydration_queue_.empty(); });
+                const auto woken = [&] { return hydration_stop_ || !queue.empty(); };
+                // Idle with a spare read buffer: let it go once no read came for a while, freed
+                // before waiting on, outside the lock. A spare the worker hands back while this
+                // waits wakes it to start that timer.
+                for (;;) {
+                    while (reads && !woken() && !hydration_spare_.empty()) {
+                        if (!hydration_cv_.wait_for(lock, kSpareReadBufferIdle, woken)) {
+                            std::vector<std::uint8_t> released = std::exchange(hydration_spare_, {});
+                            lock.unlock();
+                            released = {};
+                            lock.lock();
+                        }
+                    }
+                    if (woken()) { break; }
+                    hydration_cv_.wait(lock, [&] {
+                        return woken() || (reads && !hydration_spare_.empty());
+                    });
+                }
                 if (hydration_stop_) { return; }
-                task = std::move(hydration_queue_.front());
-                hydration_queue_.pop_front();
+                task = std::move(queue.front());
+                queue.pop_front();
             }
-            if (const auto started = Clock::now(); started < task.request->hydration_deadline) {
+            if (const auto started = Clock::now(); started < task.deadline) {
                 try {
-                    task.bytes = store_.store->load(task.id, false);
+                    if (task.lookup) {
+                        // The bucket as of when the request looked: a listing taken since (for
+                        // another request, or the background refresh) serves it too. Only the
+                        // manifests of images ending on this prompt are read.
+                        const auto wanted = [&task](const std::string& id) {
+                            const auto parsed = parse_context_store_image_id(id);
+                            if (!parsed || parsed->frontier <= task.lookup_from ||
+                                parsed->frontier - task.lookup_from > task.lookup_digests.size()) {
+                                return false;
+                            }
+                            const auto& mine =
+                                task.lookup_digests[parsed->frontier - task.lookup_from - 1];
+                            return mine && *mine == parsed->digests;
+                        };
+                        task.lookup_found =
+                            store_.store->lookup_remote(task.lookup_asked, task.deadline, wanted).held;
+                    } else {
+                        // The spare is taken only for a read that runs: one queued past its
+                        // deadline leaves it for the next.
+                        {
+                            std::lock_guard lock(hydration_mutex_);
+                            reuse = std::exchange(hydration_spare_, {});
+                        }
+                        task.bytes = store_.store->load(task.id, false, &task.fetch, task.deadline,
+                                                        std::move(reuse));
+                    }
                 } catch (...) { task.bytes.reset(); }
                 task.read_ns = static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started)
                         .count());
+            } else {
+                task.expired = true;
             }
+            task.lookup_digests = {}; // not needed past the lookup
             {
                 std::lock_guard lock(hydration_mutex_);
                 hydration_done_.push_back(std::move(task));
@@ -3631,6 +4448,7 @@ private:
         }
         hydration_cv_.notify_all();
         if (hydration_reader_.joinable()) { hydration_reader_.join(); }
+        if (lookup_reader_.joinable()) { lookup_reader_.join(); }
     }
 
     void observe_store_read(std::uint64_t image_bytes, std::uint64_t nanoseconds) noexcept {
@@ -3652,24 +4470,48 @@ private:
             cumulative_stats_.context_store_read_bytes_per_second;
     }
 
-    void finish_hydration(const std::shared_ptr<Request>& request, bool failed) {
+    // `failure`: why the request will not resume from the image (nullopt: it was imported, or the
+    // cache already covers it).
+    void finish_hydration(const std::shared_ptr<Request>& request,
+                          std::optional<ContextStoreHydrationFailure> failure) {
         request->hydrating = false;
-        cumulative_stats_.context_store_hydration_seconds +=
+        request->hydration_wait_seconds =
             std::chrono::duration<double>(Clock::now() - request->hydration_started).count();
-        if (failed) { ++cumulative_stats_.context_store_hydration_failures; }
+        cumulative_stats_.context_store_hydration_seconds += request->hydration_wait_seconds;
+        if (failure) { count_hydration_failure(*request, *failure); }
         request->admission_generation = 0;
         request_admission_check();
     }
 
+    // Counts a failed hydration under its reason and reports it (the serve layer logs it).
+    void count_hydration_failure(const Request& request, ContextStoreHydrationFailure reason) noexcept {
+        ++cumulative_stats_.context_store_hydration_failures;
+        ++cumulative_stats_.context_store_hydration_failures_by_reason[static_cast<std::size_t>(reason)];
+        if (!store_.hydration_listener) { return; }
+        try {
+            ContextStoreHydrationEvent event;
+            event.id           = request.hydration_id;
+            event.reason       = reason;
+            event.bytes        = request.hydration_bytes;
+            event.fetch_bytes  = request.hydration_fetch_bytes;
+            event.frontier     = request.hydration_frontier;
+            event.wait_seconds = request.hydration_wait_seconds;
+            store_.hydration_listener(event);
+        } catch (...) {}
+    }
+
     // Imports a read-back image for a waiting request as Host-resident checkpoints, making room in
     // the Host tier under optional-write rights (never revoking another request's waiting source),
-    // and protects the restored source for the request until it is admitted.
-    bool import_for_request(const std::shared_ptr<Request>& request,
-                            std::span<const std::uint8_t> image, const std::string& id) {
+    // and protects the restored source for the request until it is admitted. Nullopt on success,
+    // otherwise why it did not.
+    std::optional<ContextStoreHydrationFailure>
+    import_for_request(const std::shared_ptr<Request>& request,
+                       std::span<const std::uint8_t> image, const std::string& id) {
+        using Failure     = ContextStoreHydrationFailure;
         auto& program     = *instance_.program;
         const auto needed = program.checkpoint_image_host_bytes(image, store_.binding);
         auto usage        = program.physical_usage();
-        if (needed > usage.capacity.host_bytes) { return false; }
+        if (needed > usage.capacity.host_bytes) { return Failure::HostCapacity; }
         if (needed > usage.capacity.host_bytes - usage.occupied.host_bytes) {
             (void)program.release_redundant_host({});
             usage = program.physical_usage();
@@ -3679,7 +4521,7 @@ private:
         if (needed > usage.capacity.host_bytes - usage.occupied.host_bytes) {
             const auto victims = resources_.host_victims(program, needed, std::nullopt, {}, {},
                                                          std::nullopt, &cursor);
-            if (!victims) { return false; }
+            if (!victims) { return Failure::HostCapacity; }
             resources_.commit_host_victims(program, *victims, cursor);
             if (!victims->empty()) { scheduler_.capacity_released(); }
         }
@@ -3696,7 +4538,8 @@ private:
             scheduler_.capacity_released();
             imported = program.import_checkpoints(image, store_.binding);
         }
-        if (!imported || !adopt_imported(*imported, image.size())) { return false; }
+        if (!imported) { return Failure::HostGeometry; }
+        if (!adopt_imported(*imported, image.size())) { return Failure::Adopt; }
         auto sources = resources_.candidates(program, *request->base_plan, UINT32_MAX, std::nullopt,
                                              request->id, request->publication_order);
         const auto restored = std::find_if(sources.begin(), sources.end(), [&](const auto& choice) {
@@ -3704,13 +4547,13 @@ private:
                    std::find(imported->points.begin(), imported->points.end(),
                              *choice.source.checkpoint) != imported->points.end();
         });
-        if (restored == sources.end()) { return false; }
+        if (restored == sources.end()) { return Failure::NotCandidate; }
         retain_admission_source(request, *restored, false);
         request->hydrated = true;
         try {
             store_.store->touch(id);
         } catch (...) {}
-        return true;
+        return std::nullopt;
     }
 
     // True when the cache now offers this request a source at least as deep as the stored image it
@@ -3730,12 +4573,19 @@ private:
         if (store_.store == nullptr) { return; }
         auto& program = *instance_.program;
         std::deque<HydrationTask> done;
+        bool recycled = false; // a buffer became the reader's spare: wake it (idle timer)
         {
             std::lock_guard lock(hydration_mutex_);
             if (program.has_context_transaction()) {
                 // Settle only the reads nobody waits for any longer.
                 for (auto it = hydration_done_.begin(); it != hydration_done_.end();) {
                     if (!it->request->hydrating) {
+                        // Its buffer is kept for the next read, as after any other read.
+                        if (it->bytes && it->bytes->capacity() <= kMaximumSpareReadBytes &&
+                            it->bytes->capacity() > hydration_spare_.capacity()) {
+                            std::swap(hydration_spare_, *it->bytes);
+                            recycled = true;
+                        }
                         it = hydration_done_.erase(it);
                     } else {
                         ++it;
@@ -3745,8 +4595,37 @@ private:
                 done.swap(hydration_done_);
             }
         }
+        if (recycled) { hydration_cv_.notify_all(); }
+        // Whatever became of the reads, the largest buffer goes back to the reader for the next one:
+        // a fresh one of a session's size is mostly page faults on the request's wait.
+        struct Recycle {
+            EngineCore& core;
+            std::deque<HydrationTask>& tasks;
+            ~Recycle() {
+                std::vector<std::uint8_t>* largest = nullptr;
+                for (auto& task : tasks) {
+                    if (task.bytes && task.bytes->capacity() <= kMaximumSpareReadBytes &&
+                        (largest == nullptr || task.bytes->capacity() > largest->capacity())) {
+                        largest = &*task.bytes;
+                    }
+                }
+                if (largest == nullptr) { return; }
+                {
+                    std::lock_guard lock(core.hydration_mutex_);
+                    if (largest->capacity() <= core.hydration_spare_.capacity()) { return; }
+                    std::swap(core.hydration_spare_, *largest);
+                }
+                // The reader may be waiting with no spare: wake it to start the idle timer.
+                core.hydration_cv_.notify_all();
+            }
+        } const recycle{*this, done};
         for (auto& task : done) {
             const auto& request = task.request;
+            // A completed fetch measures the fetch rate whatever then becomes of the request
+            // (gone, already covered, or an import without room).
+            if (task.bytes && task.fetch.fetched_bytes > 0) {
+                observe_remote_fetch(task.fetch.fetched_bytes, task.fetch.fetch_ns);
+            }
             if (!request->hydrating) { continue; } // gave up at its deadline
             bool waiting = false;
             {
@@ -3754,31 +4633,53 @@ private:
                 waiting = std::find(pending_.begin(), pending_.end(), request) != pending_.end();
             }
             if (!waiting) {
-                request->hydrating = false;
+                // Cancelled or failed meanwhile: settle nothing for it, lookup or read.
+                request->hydrating    = false;
+                request->store_lookup = false;
+                continue;
+            }
+            if (task.lookup) {
+                finish_store_lookup(request, task.lookup_found > 0);
+                continue;
+            }
+            // A read that finished after the request's wait ended (the worker was busy when the
+            // deadline passed, so the expiry scan below has not run yet) is not imported: the
+            // import would spend worker time past the budget the request was given.
+            if (Clock::now() >= request->hydration_deadline) {
+                finish_hydration(request, ContextStoreHydrationFailure::Deadline);
                 continue;
             }
             if (task.bytes && cache_covers_hydration(request)) {
                 // Another waiter's read-back of the same image (or anything else) has already
                 // brought this prefix in: importing it again would catalogue a second copy.
-                finish_hydration(request, false);
+                finish_hydration(request, std::nullopt);
                 continue;
             }
-            bool imported = false;
+            using Failure = ContextStoreHydrationFailure;
+            // A read that ran out of time (queued past the deadline, or the download stopped at
+            // it) is not the image's fault: the same image may be read in time later.
+            std::optional<Failure> failure =
+                task.expired || task.fetch.expired ? Failure::Deadline : Failure::LoadMiss;
             if (task.bytes) {
                 const auto started = Clock::now();
+                // An import that throws gives up only this hydration: the request prefills.
                 try {
-                    imported = import_for_request(request, *task.bytes, task.id);
-                } catch (const std::invalid_argument&) { imported = false; }
-                if (imported) {
+                    failure = import_for_request(request, *task.bytes, task.id);
+                } catch (const std::invalid_argument&) {
+                    failure = Failure::InvalidImage;
+                } catch (...) { failure = Failure::Exception; }
+                if (!failure) {
+                    // The fetch taught the fetch rate above; the rest of the read (the local
+                    // files read, verified and reassembled) and the import teach the disk's.
                     observe_store_read(task.bytes->size(),
-                                       task.read_ns +
+                                       task.read_ns - std::min(task.read_ns, task.fetch.fetch_ns) +
                                            static_cast<std::uint64_t>(
                                                std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                    Clock::now() - started)
                                                    .count()));
                 }
             }
-            finish_hydration(request, !imported);
+            finish_hydration(request, failure);
         }
         const auto now = Clock::now();
         std::vector<std::shared_ptr<Request>> expired;
@@ -3790,7 +4691,22 @@ private:
                 }
             }
         }
-        for (const auto& request : expired) { finish_hydration(request, true); }
+        for (const auto& request : expired) {
+            if (request->store_lookup) {
+                finish_store_lookup(request, false);
+            } else {
+                finish_hydration(request, ContextStoreHydrationFailure::Deadline);
+            }
+        }
+    }
+
+    // Moves the download rate towards what one download achieved (half the way: it follows a
+    // changed link within a few downloads without swinging on one slow one).
+    void observe_remote_fetch(std::uint64_t bytes, std::uint64_t nanoseconds) noexcept {
+        if (bytes == 0 || nanoseconds == 0) { return; }
+        const double observed = static_cast<double>(nanoseconds) / static_cast<double>(bytes);
+        remote_ns_per_byte_   = 0.5 * remote_ns_per_byte_ + 0.5 * observed;
+        cumulative_stats_.context_store_remote_fetch_bytes_per_second = 1e9 / remote_ns_per_byte_;
     }
 
     // Counts a read-back once its request is admitted: only if the admission resumes from (at
@@ -3803,7 +4719,7 @@ private:
             cumulative_stats_.context_store_hydrated_tokens +=
                 reused - request->hydration_reuse_before;
         } else {
-            ++cumulative_stats_.context_store_hydration_failures;
+            count_hydration_failure(*request, ContextStoreHydrationFailure::UnusedAtAdmission);
         }
     }
 
@@ -3896,23 +4812,108 @@ private:
         published_residency_ = std::move(status);
     }
 
+    // ---- the summary strategy's reuse probes (has_private_reuse) ----
+
+    struct ReuseProbe {
+        PreparedPrompt prompt{};
+        ResolvedExecutionOptions execution;
+        std::uint32_t exact_end = 0;
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::optional<bool> warm;
+        bool abandoned = false;
+    };
+
+    // Visits every checkpoint key of a context-store image on this binding that this Engine could
+    // restore (at most max_context) and whose prefix the plan's prompt starts with, as admission's
+    // hydration compares them (prefix shortlist key and identity tag). Images only the bucket holds
+    // are included once a listing has registered them.
+    // Runs per request on the worker against an index of thousands of images, so the store visits
+    // its entries in place; `visit` runs under the store's lock and must not call it.
+    template <class Visit>
+    void for_each_stored_match(const BasePlan& base, Visit&& visit) {
+        const auto prompt_tokens = base.summary().prompt_tokens;
+        store_.store->for_each_checkpoint(
+            [&](const ContextStore::Info& info, const ContextStore::CheckpointKey& key) {
+                if (key.frontier > prompt_tokens || info.tokens > max_context_) { return false; }
+                const auto mine = base.prefix_shortlist_key(key.frontier);
+                return mine && mine->digests == key.digests &&
+                       mine->identity_tag == key.identity_tag && info.binding == store_.binding;
+            },
+            [&](const ContextStore::Info& info, const ContextStore::CheckpointKey& key) {
+                visit(info, key);
+            });
+    }
+
+    // On the worker, under the execution lock: the probe's answer (true: warm).
+    [[nodiscard]] bool private_reuse_locked(ReuseProbe& probe) {
+        const auto plan = instance_.program->plan_request(std::move(probe.prompt), probe.execution);
+        // Shared matches past the product prompt are the conversation too (lossy_prefill_trigger).
+        if (resources_.has_conversation_match(*instance_.program, plan, probe.exact_end)) {
+            return true;
+        }
+        if (store_.store == nullptr) { return false; }
+        bool stored = false;
+        for_each_stored_match(plan, [&](const ContextStore::Info&, const ContextStore::CheckpointKey& key) {
+            stored = stored || key.frontier > probe.exact_end;
+        });
+        return stored;
+    }
+
+    // Answers the queued probes; `warm_only` (suspended or stopping) answers warm without looking.
+    void serve_reuse_probes(bool warm_only) noexcept {
+        // Every worker cycle calls this; without a posted probe (always, unless the summary
+        // strategy is on) it returns without touching the queue lock. A probe posted after the
+        // exchange sets the flag again and is answered on the next cycle.
+        if (!probes_pending_.exchange(false, std::memory_order_acq_rel)) { return; }
+        std::deque<std::shared_ptr<ReuseProbe>> probes;
+        {
+            std::lock_guard lock(queue_mutex_);
+            probes.swap(probes_);
+        }
+        for (const auto& probe : probes) {
+            {
+                std::lock_guard lock(probe->mutex);
+                if (probe->abandoned) { continue; }
+            }
+            bool warm = true;
+            if (!warm_only) {
+                try {
+                    warm = private_reuse_locked(*probe);
+                } catch (...) { warm = true; }
+            }
+            {
+                std::lock_guard lock(probe->mutex);
+                probe->warm = warm;
+            }
+            probe->cv.notify_all();
+        }
+    }
+
     void worker_loop() noexcept {
         for (;;) {
             {
                 std::unique_lock lock(queue_mutex_);
-                if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
-                    !instance_.program->has_context_transaction()) {
-                    if (store_.sink && store_.idle_persist.count() > 0) {
+                if (!stopping_ && pending_.empty() && probes_.empty() && resident_empty() &&
+                    paused_.empty() && !instance_.program->has_context_transaction()) {
+                    const auto woken = [&] {
+                        return stopping_ || !pending_.empty() || !probes_.empty();
+                    };
+                    if (store_.sink && (store_.idle_persist.count() > 0 ||
+                                        store_flush_.load(std::memory_order_acquire))) {
                         // Wake up now and then to write idle continuations to the store.
-                        queue_cv_.wait_for(lock, std::chrono::seconds(1),
-                                           [&] { return stopping_ || !pending_.empty(); });
+                        queue_cv_.wait_for(lock, std::chrono::seconds(1), woken);
                     } else {
-                        queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                        // A flush (set_store_flush) wakes it to write, then takes the branch above.
+                        queue_cv_.wait(lock, [&] {
+                            return woken() || store_flush_.load(std::memory_order_acquire);
+                        });
                     }
                 }
                 if (stopping_) {
                     lock.unlock();
                     std::scoped_lock execution_lock(execution_mutex_);
+                    serve_reuse_probes(true);
                     const auto error = std::make_exception_ptr(RequestError(
                         RequestErrorKind::Unavailable, "inference engine is shutting down"));
                     if (suspended_.load(std::memory_order_acquire)) {
@@ -3923,19 +4924,25 @@ private:
                             failed_ = true;
                         }
                         fail_pending_locked(error);
+                        serve_reuse_probes(true);
                         return;
                     }
                     fail_all_locked(error);
+                    serve_reuse_probes(true);
                     return;
                 }
             }
             std::unique_lock execution_lock(execution_mutex_);
             if (suspended_.load(std::memory_order_acquire)) {
                 // Nothing executes while suspended. The wait above returned because work was
-                // queued: resume for it, or refuse it when the model is held suspended.
+                // queued: resume for it, or refuse it when the model is held suspended. A probe
+                // does not resume the model: it is answered warm.
+                serve_reuse_probes(true);
                 serve_suspended_queue_locked();
                 continue;
             }
+            // Between cycles: the summary strategy's probes, before this cycle changes the cache.
+            serve_reuse_probes(false);
             bool executed = false;
             // The execution unit in progress, for the fault event.
             const char* unit = "boundary";
@@ -4165,7 +5172,11 @@ private:
                 } catch (...) {}
                 // After the latch took effect, so is_available() (and /health) already report it.
                 notify_fault(fault);
-                if (!recovered) { return; }
+                if (!recovered) {
+                    // Probes queued before the latch: answered warm, not left to time out.
+                    serve_reuse_probes(true);
+                    return;
+                }
                 continue;
             }
             execution_lock.unlock();
@@ -4189,6 +5200,8 @@ private:
     const std::uint64_t yield_min_remaining_ns_;
     // Layer slices per prefill chunk while a neighbour decodes; 0 or 1: whole chunks.
     const std::uint32_t layer_slices_;
+    // Lossy long-prompt prefill; off unless min_tokens is set.
+    const LossyPrefillOptions lossy_options_;
     // The request a prefill was last paused for, so it cannot pause a second one for the same
     // newcomer, and the hold that keeps the paused prefill from being restored ahead of it.
     std::uint64_t yield_beneficiary_ = 0;
@@ -4199,6 +5212,11 @@ private:
     ResourceManagement resources_;
 
     mutable std::mutex execution_mutex_;
+    // Summary-strategy reuse probes waiting for the worker (guarded by queue_mutex_).
+    std::deque<std::shared_ptr<ReuseProbe>> probes_;
+    // Set (under queue_mutex_) with every posted probe; serve_reuse_probes clears it.
+    std::atomic<bool> probes_pending_{false};
+    std::atomic<std::uint64_t> probe_timeouts_{0};
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
@@ -4249,16 +5267,31 @@ private:
     std::unordered_map<ContinuationOwnerToken, OwnerMark> owner_marks_;
     // Public shared prefixes written (or queued) to the store, with their image sizes.
     std::vector<std::pair<Checkpoint, std::uint64_t>> shared_stored_;
+    // Shared prefixes whose image the store removed on its own: not written again.
+    std::vector<Checkpoint> shared_dropped_;
+    // Shared progress anchors (trim_progress_anchors): never written to the store.
+    std::vector<Checkpoint> progress_anchor_points_;
     Clock::time_point next_shared_scan_{};
     std::uint64_t store_removals_seen_ = 0;
     std::uint64_t store_failures_seen_ = 0;
     Clock::time_point next_persist_scan_{};
+    std::atomic<bool> store_flush_{false};
     std::mutex hydration_mutex_;
     std::condition_variable hydration_cv_;
     std::deque<HydrationTask> hydration_queue_;
+    std::deque<HydrationTask> lookup_queue_; // bucket lookups, run on lookup_reader_
     std::deque<HydrationTask> hydration_done_;
+    // The buffer of a read the worker has finished with, for the reader's next read (see
+    // kMaximumSpareReadBytes). Under hydration_mutex_.
+    std::vector<std::uint8_t> hydration_spare_;
+    static constexpr std::size_t kMaximumSpareReadBytes = std::size_t{8} << 30U;
+    static constexpr auto kSpareReadBufferIdle          = std::chrono::seconds(30);
+    // Nanoseconds per byte downloaded from the bucket: assumed 100 MB/s until a download says
+    // otherwise. Engine worker only.
+    double remote_ns_per_byte_ = 10.0;
     bool hydration_stop_ = false;
     std::thread hydration_reader_;
+    std::thread lookup_reader_;
 
     // Model residency. The snapshots exist only when suspend is enabled and are touched under the
     // execution mutex; the flags are also read by submit and is_available without it.

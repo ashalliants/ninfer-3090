@@ -16,7 +16,7 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 release_tag="$(tr -d '[:space:]' < "$repo_root/VERSION")"
 [[ -n "$release_tag" ]] || { printf '%s is empty\n' "$repo_root/VERSION" >&2; exit 1; }
 release_version="${release_tag%%-*}"
-release_notes="RELEASE_NOTES_$release_version.md"
+release_notes="docs/release-notes/RELEASE_NOTES_$release_version.md"
 # Checked before anything is deleted or built into dist, so a forgotten release-notes file costs
 # nothing rather than a finished archive that has to be thrown away.
 [[ -f "$repo_root/$release_notes" ]] || {
@@ -50,6 +50,10 @@ for product in 'apps/ninfer:ninfer' 'apps/ninfer-serve:ninfer-serve' 'bench/ninf
   cp -- "$source_path" "$destination"
 done
 cp -- "$repo_root/VERSION" "$repo_root/LICENSE" "$repo_root/$release_notes" "$product_root/"
+# Apache-2.0 section 4(d): the conversation projector (lossy prefill's summary strategy) is a port of
+# hermes-vcc-engine, so its NOTICE ships with every binary that contains it. LICENSE above is the
+# Apache-2.0 text it refers to.
+cp -- "$repo_root/src/runtime/engine/compaction/NOTICE" "$product_root/THIRD_PARTY_NOTICES.txt"
 # The archive README must describe the archive. docs/rtx-3090-linux.md is a guide to *building* from
 # source and points at ./scripts/download-model.sh; the packager copies that to the archive root, so
 # a user following it from inside the archive got a missing-file error.

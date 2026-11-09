@@ -6,6 +6,10 @@ ninfer_add_test(ninfer_prefill_pacing_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_prefill_pacing.cpp"
   LIBRARIES ninfer_runtime_support)
 
+ninfer_add_test(ninfer_shared_prefix_scan_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_shared_prefix_scan.cpp"
+  LIBRARIES ninfer_runtime_support)
+
 ninfer_add_test(ninfer_prefill_yield_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_prefill_yield.cpp"
   LIBRARIES ninfer_runtime_support)
@@ -26,11 +30,28 @@ ninfer_add_test(ninfer_resource_manager_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_resource_manager.cpp"
   LIBRARIES ninfer_runtime_support)
 
+ninfer_add_test(ninfer_recovery_loss_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_recovery_loss.cpp"
+  LIBRARIES ninfer_runtime_support)
+
 ninfer_add_test(ninfer_context_store_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_context_store.cpp"
   LIBRARIES ninfer_runtime_support)
 
+ninfer_add_test(ninfer_context_store_binding_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_context_store_binding.cpp"
+  LIBRARIES ninfer_engine ninfer_core)
+
 ninfer_add_test(ninfer_kv_capacity_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_kv_capacity.cpp"
+  LIBRARIES ninfer_runtime_support)
+
+ninfer_add_test(ninfer_vcc_projector_test
+  NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_vcc_projector.cpp"
+  LIBRARIES ninfer_runtime_support ninfer::json)
+
+ninfer_add_test(ninfer_summary_strategy_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_summary_strategy.cpp"
   LIBRARIES ninfer_runtime_support)
 
 ninfer_add_test(ninfer_host_cache_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_cache.cpp"

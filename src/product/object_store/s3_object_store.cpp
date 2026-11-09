@@ -19,15 +19,73 @@ void ensure_curl_initialized() {
     std::call_once(once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
 }
 
-struct CurlHandle {
-    CURL* handle = nullptr;
-    curl_slist* headers = nullptr;
-    CurlHandle() : handle(curl_easy_init()) {
-        if (handle == nullptr) { throw std::runtime_error("cannot create a curl handle"); }
+// Easy handles kept between requests. A handle keeps its connections open after a transfer, so the
+// next request to the bucket on it skips the TCP and TLS handshakes (several round trips each, on
+// every listing page, manifest and chunk otherwise). Each request takes a handle of its own, so
+// any number of threads use the store at once; a handle goes back only after a transfer that
+// the server answered (below 500), so a retry starts on a new connection, as before.
+class CurlPool {
+public:
+    CurlPool() = default;
+    ~CurlPool() {
+        for (CURL* handle : idle_) { curl_easy_cleanup(handle); }
     }
+    CurlPool(const CurlPool&)            = delete;
+    CurlPool& operator=(const CurlPool&) = delete;
+
+    // A handle with every option reset (its connections and caches kept).
+    [[nodiscard]] CURL* take() {
+        {
+            std::scoped_lock lock(mutex_);
+            if (!idle_.empty()) {
+                CURL* handle = idle_.back();
+                idle_.pop_back();
+                curl_easy_reset(handle);
+                return handle;
+            }
+        }
+        CURL* handle = curl_easy_init();
+        if (handle == nullptr) { throw std::runtime_error("cannot create a curl handle"); }
+        return handle;
+    }
+    void give_back(CURL* handle) noexcept {
+        {
+            std::scoped_lock lock(mutex_);
+            // About as many as threads use the store at once (the fetchers, the remote worker and
+            // the lookup thread); one beyond that is closed rather than kept idle.
+            if (idle_.size() < kMaximumIdle) {
+                try {
+                    idle_.push_back(handle);
+                    return;
+                } catch (...) {}
+            }
+        }
+        curl_easy_cleanup(handle);
+    }
+
+private:
+    static constexpr std::size_t kMaximumIdle = 16;
+    std::mutex mutex_;
+    std::vector<CURL*> idle_;
+};
+
+// One request's handle and header list. The handle returns to the pool only when `reusable` was
+// set (the server answered); otherwise it is closed with its connections.
+struct CurlHandle {
+    CurlPool& pool;
+    CURL* handle        = nullptr;
+    curl_slist* headers = nullptr;
+    bool reusable       = false;
+    explicit CurlHandle(CurlPool& from) : pool(from), handle(from.take()) {}
     ~CurlHandle() {
         if (headers != nullptr) { curl_slist_free_all(headers); }
-        curl_easy_cleanup(handle);
+        if (reusable) {
+            // Nothing the next request does not set again may stay attached to the handle.
+            curl_easy_setopt(handle, CURLOPT_HTTPHEADER, nullptr);
+            pool.give_back(handle);
+        } else {
+            curl_easy_cleanup(handle);
+        }
     }
     CurlHandle(const CurlHandle&)            = delete;
     CurlHandle& operator=(const CurlHandle&) = delete;
@@ -126,20 +184,33 @@ public:
     }
 
     std::optional<std::vector<std::uint8_t>> get(const std::string& key) override {
-        Response response = send("GET", object_url(key), {}, {}, false);
+        return get_before(key, Deadline::max());
+    }
+
+    std::optional<std::vector<std::uint8_t>> get_before(const std::string& key,
+                                                        Deadline deadline) override {
+        Response response = send("GET", object_url(key), {}, {}, false, deadline);
         if (response.status == 404) { return std::nullopt; }
         require_success(response, "get " + key);
         return std::move(response.body);
     }
 
     bool exists(const std::string& key) override {
-        Response response = send("HEAD", object_url(key), {}, {}, false);
+        return exists_before(key, Deadline::max());
+    }
+
+    bool exists_before(const std::string& key, Deadline deadline) override {
+        Response response = send("HEAD", object_url(key), {}, {}, false, deadline);
         if (response.status == 404) { return false; }
         require_success(response, "head " + key);
         return true;
     }
 
     std::vector<ObjectInfo> list(const std::string& prefix) override {
+        return list_before(prefix, Deadline::max());
+    }
+
+    std::vector<ObjectInfo> list_before(const std::string& prefix, Deadline deadline) override {
         std::vector<ObjectInfo> out;
         std::string token;
         for (;;) {
@@ -147,7 +218,7 @@ public:
             std::string query = "?";
             if (!token.empty()) { query += "continuation-token=" + url_encode(token, false) + "&"; }
             query += "list-type=2&prefix=" + url_encode(prefix, false);
-            Response response = send("GET", bucket_url() + query, {}, {}, false);
+            Response response = send("GET", bucket_url() + query, {}, {}, false, deadline);
             require_success(response, "list " + prefix);
             const std::string xml(response.body.begin(), response.body.end());
             std::size_t cursor = 0;
@@ -237,16 +308,23 @@ private:
 
     Response send(const char* method, const std::string& url,
                   const std::vector<std::string>& extra_headers,
-                  std::span<const std::uint8_t> upload, bool is_upload) {
+                  std::span<const std::uint8_t> upload, bool is_upload,
+                  Deadline deadline = Deadline::max()) {
+        const bool bounded = deadline != Deadline::max();
         std::string last_error;
         for (int attempt = 0; attempt < config_.attempts; ++attempt) {
             if (interrupted_.load(std::memory_order_acquire)) {
                 throw std::runtime_error("S3 request interrupted");
             }
             if (attempt != 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(250 << attempt));
+                const auto pause = std::chrono::milliseconds(250 << attempt);
+                // Not worth waiting for a retry that would start past the deadline.
+                if (bounded && std::chrono::steady_clock::now() + pause >= deadline) {
+                    throw DeadlineExceeded();
+                }
+                std::this_thread::sleep_for(pause);
             }
-            CurlHandle curl;
+            CurlHandle curl(pool_);
             Response response;
             UploadSource source{upload, 0};
             CURL* h = curl.handle;
@@ -255,6 +333,14 @@ private:
             curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 0L);
             curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
             curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, static_cast<long>(config_.connect_timeout.count()));
+            if (bounded) {
+                // The whole transfer, not only a stall: a bucket that trickles still ends at the
+                // caller's deadline.
+                const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now());
+                if (left.count() <= 0) { throw DeadlineExceeded(); }
+                curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, static_cast<long>(left.count()));
+            }
             curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1024L);
             curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, static_cast<long>(config_.stall_timeout.count()));
             curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 1L);
@@ -291,6 +377,10 @@ private:
 
             const CURLcode code = curl_easy_perform(h);
             if (code != CURLE_OK) {
+                if (bounded && code == CURLE_OPERATION_TIMEDOUT &&
+                    std::chrono::steady_clock::now() >= deadline - std::chrono::milliseconds(50)) {
+                    throw DeadlineExceeded();
+                }
                 last_error = curl_easy_strerror(code);
                 continue;
             }
@@ -299,6 +389,8 @@ private:
                 last_error = "HTTP " + std::to_string(response.status);
                 continue;
             }
+            // The server answered: the connection is good for the next request.
+            curl.reusable = true;
             return response;
         }
         throw std::runtime_error("S3 request failed: " + last_error);
@@ -306,6 +398,7 @@ private:
 
     S3Config config_;
     std::atomic<bool> interrupted_{false};
+    CurlPool pool_;
 };
 
 } // namespace

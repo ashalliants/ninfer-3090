@@ -17,6 +17,12 @@ inline constexpr std::size_t kDefaultMaxRequestBytes      = 384ULL << 20;
 inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
 inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 
+// Hidden reasoning is plain text, small next to the Responses store's envelopes and contexts, so
+// its byte budget is a fraction of the response store's rather than a second full copy of it.
+constexpr std::size_t reasoning_store_max_bytes(std::size_t response_store_max_bytes) noexcept {
+    return response_store_max_bytes / 16U;
+}
+
 struct ServeOptions {
     bool help_requested = false;
     std::string artifact_path;
@@ -26,6 +32,9 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact metadata.name
     std::string request_log_jsonl;                // empty => structured request logging disabled
+    // --request-log-lossy-detail: request_done records add lossy_prefill.kept_runs (the kept offsets
+    // of the filtered part), which the lossy sweep's kept-block overlap reads. Off by default.
+    bool request_log_lossy_detail = false;
     std::uint32_t max_context          = 8192;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
     // --fit-context MIN: --max-context becomes a ceiling the Engine lowers to what fits, never
@@ -61,6 +70,7 @@ struct ServeOptions {
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;
     PrefillScheduleOptions prefill_schedule;
+    LossyPrefillOptions lossy_prefill;
     bool enable_vision      = false;
     VisionResidency vision_residency       = VisionResidency::Resident;
     std::uint32_t vision_max_merged_tokens = 16384;
@@ -123,6 +133,8 @@ struct ServeOptions {
     std::string context_store_s3_bucket;
     std::string context_store_s3_prefix; // "" or ending in '/'
     std::string context_store_s3_region = "us-east-1";
+    // --context-store-s3-upload-delay-seconds N: how long a written session waits before upload.
+    std::uint32_t context_store_s3_upload_delay_seconds = 30;
     // Exit non-zero shortly after the Engine latches unavailable after a worker failure, so a
     // supervisor restarts the process instead of leaving it holding VRAM and answering 503.
     bool exit_on_engine_failure = true;

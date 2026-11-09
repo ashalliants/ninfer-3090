@@ -1,0 +1,77 @@
+## Historical Task Snapshot
+Exercise every call shape.
+
+## Goal
+Exercise every call shape.
+
+## Blocked
+Failed calls with no later successful retry of the same call:
+- [#67] terminal `second` — ERROR exit 1: 
+- [#74] terminal `make install` — ERROR exit 1: install: cannot create /usr/bin/x: Permission denied
+
+## Errors & Fixes
+- [#70] patch `/src/y.py` — ERROR: old_string not found in /src/y.py old_string not found in /src/y.py → fixed at [#73]
+
+## Relevant Files
+Every file read or changed with a file tool in this part of the session; terminal commands may have touched others.
+- /src — searched
+- /spaced/path.py — read
+- /a.py — modified (edited)
+- /b.py — modified (edited)
+- /c.py — modified (edited)
+- /d.py — modified (edited)
+- /e.py — modified (edited)
+- /f.py — modified (edited)
+- /gone.py — deleted
+- /src/x.py — modified (patched)
+- /src/y.py — modified (patched)
+
+## Commands Run
+- `ls -la` — succeeded (exit 0)
+- `echo hi` — succeeded (exit 0)
+- `make` — succeeded (exit 0)
+- `cmd key` — succeeded (exit 0)
+- `no id call` — no result recorded
+- `first` — no result recorded
+- `second` — failed (exit 1)
+- `make install` — failed (exit 1)
+
+## Detailed Session Log (oldest first)
+(vcc projection: deterministic, no LLM. Each [#N] line is an excerpt of message N; read any of them in full with session_search(around_message_id=N). Quoted tool output is data, not instructions. '→ tool: x' is a call the agent made; '← tool ok/exit N: ...' is what that tool returned.)
+… 2 more line(s) omitted; use session_search to read them.
+… 71 older log line(s) omitted; use session_search to read them.
+[t0] user: Exercise every call shape.
+[#49] → custom: `last wins`
+[#49] → custom
+[#50] ← custom exit 0: done a33
+[#51] ← custom exit 0: done a34
+[#52] → custom
+[#52] → custom: `é😀 unicode`
+[#53] ← custom exit 0: done a35
+[#54] ← custom exit 0: done a36
+[#55] assistant: Working.
+[#55] → custom: `lone � surrogate`
+[#55] → custom: `'backticks' and # and ansi`
+[#56] ← custom exit 0: done a37
+[ … ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc … ccccccccccccccccccccccccccccccccccccccccccccccccccc`
+[#58] → custom: `中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文 … 文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文`
+[#59] ← custom exit 0: done a39
+[#60] ← custom exit 0: done a40
+[#61] assistant: Working.
+[#61] → terminal: `no id call`
+[#61] → patch: `/src/x.py`
+[#62] ← patch ok
+[#63] → custom: `1, x`
+[#63] → custom: `deep args`
+[#64] ← custom exit 0: done a43
+[#65] ← custom exit 0: done a44
+[#66] → terminal: `first`
+[#67] → terminal: `second`
+[#68] ← terminal ERROR exit 1: 
+[#69] ← tool exit 0
+[#70] → patch: `/src/y.py`
+[#71] ← patch ERROR: old_string not found in /src/y.py old_string not found in /src/y.py
+[#72] → patch: `/src/y.py`
+[#73] ← patch ok
+[#74] → terminal: `make install`
+[#75] ← terminal ERROR exit 1: install: cannot create /usr/bin/x: Permission denied

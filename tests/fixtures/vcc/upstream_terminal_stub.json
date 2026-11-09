@@ -1,0 +1,63 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Run the tests."
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t1",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"pytest -q\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t1",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "[terminal] ran `pytest -q` -> exit 1, 40 lines output"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t2",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"ls\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t2",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "[terminal] ran `ls` -> exit 0, 3 lines output"
+    }
+   ]
+  }
+ ],
+ "cases": [
+  {
+   "id": "b8000",
+   "first": 0,
+   "last": 5,
+   "budget_chars": 8000
+  }
+ ]
+}

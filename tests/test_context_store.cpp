@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <thread>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <condition_variable>
 #include <iostream>
 #include <map>
@@ -14,6 +16,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace {
@@ -101,6 +104,31 @@ void test_hash() {
     check(ContextStore::hash(a) != ContextStore::hash(b), "a one-bit change did not change the hash");
     const auto short_input = pseudo_random(3, 2);
     check(ContextStore::hash(short_input) != ContextStore::hash({}), "short input hashes alike");
+}
+
+// Stores on disk and in buckets are keyed by these ids: the format must not change.
+void test_image_id() {
+    check(ContextStore::image_id({0x0123456789abcdefULL, 0xfedcba9876543210ULL}, 0x1ad2d, false) ==
+              "0123456789abcdeffedcba98765432100001ad2d",
+          "conversation image id");
+    check(ContextStore::image_id({1, 2}, 16384, true) == "0000000000000001000000000000000200004000" "5",
+          "shared prefix image id");
+}
+
+// A load into a reused buffer (larger than the image, full of another image's bytes) gives the
+// same image, in that buffer's memory.
+void test_load_into_a_reused_buffer() {
+    TempDirectory directory;
+    ContextStore store(options_for(directory.path()));
+    const auto image = concat({pseudo_random(300, 11), pseudo_random(6500, 12), pseudo_random(8, 13)});
+    (void)store.put(describe("ab12"), image, std::array{ContextStore::Region{300, 6500}});
+    std::vector<std::uint8_t> reuse(image.size() * 2, 0xa5);
+    reuse.resize(image.size() / 3); // shorter than the image, its capacity larger
+    const std::uint8_t* const memory = reuse.data();
+    const auto loaded = store.load("ab12", true, nullptr, std::chrono::steady_clock::time_point::max(),
+                                   std::move(reuse));
+    check(loaded && *loaded == image, "a load into a reused buffer changed the image");
+    check(loaded && loaded->data() == memory, "the load did not use the buffer it was given");
 }
 
 void test_round_trip() {
@@ -192,15 +220,28 @@ void test_corruption_is_a_miss_and_removed() {
         check(!store.load("c0ffee").has_value(), "a damaged chunk was served");
         check(!store.find("c0ffee").has_value(), "a damaged image stayed listed");
         check(store.stats().corrupt_removed == 1, "a damaged image was not counted");
+        check(store.stats().corrupt_chunk == 1 && store.stats().corrupt_manifest == 0,
+              "a damaged chunk was not counted as one");
 
         // A truncated manifest is dropped at start-up and its chunks are swept.
         (void)store.put(describe("beef"), image, std::array{ContextStore::Region{64, 3000}});
         const fs::path manifest = directory.path() / "manifests" / "beef.manifest";
         fs::resize_file(manifest, fs::file_size(manifest) / 2);
     } // the first store is closed: a directory has one owner
-    ContextStore reopened(options_for(directory.path()));
-    check(reopened.list().empty() && chunk_files(directory.path()).empty(),
-          "a truncated manifest was kept or left chunks behind");
+    {
+        ContextStore reopened(options_for(directory.path()));
+        check(reopened.list().empty() && chunk_files(directory.path()).empty(),
+              "a truncated manifest was kept or left chunks behind");
+        check(reopened.stats().corrupt_removed == 1 && reopened.stats().corrupt_manifest == 1,
+              "a truncated manifest removed at start-up was not counted as damaged");
+        (void)reopened.put(describe("cafe"), image, std::array{ContextStore::Region{64, 3000}});
+    }
+    // A chunk lost while the store was closed: without a bucket the image can never be read.
+    fs::remove(chunk_files(directory.path()).front());
+    ContextStore restarted(options_for(directory.path()));
+    check(!restarted.find("cafe") && restarted.stats().corrupt_removed == 1 &&
+              restarted.stats().corrupt_startup == 1,
+          "an image missing a chunk at start-up was not removed as such");
 }
 
 void test_space_limit_evicts_least_recently_used() {
@@ -368,24 +409,44 @@ public:
         ++puts;
     }
     std::optional<std::vector<std::uint8_t>> get(const std::string& key) override {
-        gate();
+        return get_before(key, Deadline::max());
+    }
+    // A held transfer is abandoned at the deadline, as a real store's would be.
+    std::optional<std::vector<std::uint8_t>> get_before(const std::string& key,
+                                                        Deadline deadline) override {
+        // Lets a test hold a manifest read after the listing before it has completed.
+        if (on_manifest_get && key.find("manifests/") != std::string::npos) { on_manifest_get(); }
+        gate(deadline);
+        // Runs what the test wants to happen while a chunk is on its way, as another request would.
+        if (on_chunk_get && key.find("chunks/") != std::string::npos) { on_chunk_get(); }
+        if (on_manifest_get && key.find("manifests/") != std::string::npos) { on_manifest_get(); }
         std::scoped_lock lock(mutex);
         if (down) { throw std::runtime_error("the bucket is unreachable"); }
         if (key.find("chunks/") != std::string::npos) { ++chunk_gets; }
+        if (key.find("manifests/") != std::string::npos) { ++manifest_gets; }
         const auto found = objects.find(key);
         if (found == objects.end()) { return std::nullopt; }
         return found->second.first;
     }
     bool exists(const std::string& key) override {
-        gate();
+        return exists_before(key, Deadline::max());
+    }
+    bool exists_before(const std::string& key, Deadline deadline) override {
+        // Lets a test hold a tombstone check after the manifest has been read.
+        if (on_exists && key.find("tombstones/") != std::string::npos) { on_exists(); }
+        gate(deadline);
         std::scoped_lock lock(mutex);
         if (down) { throw std::runtime_error("the bucket is unreachable"); }
         return objects.find(key) != objects.end();
     }
     std::vector<ninfer::ObjectInfo> list(const std::string& prefix) override {
-        gate();
+        return list_before(prefix, Deadline::max());
+    }
+    std::vector<ninfer::ObjectInfo> list_before(const std::string& prefix, Deadline deadline) override {
+        gate(deadline);
         std::scoped_lock lock(mutex);
         if (down) { throw std::runtime_error("the bucket is unreachable"); }
+        ++lists;
         std::vector<ninfer::ObjectInfo> out;
         for (const auto& [key, value] : objects) {
             if (key.rfind(prefix, 0) == 0) {
@@ -429,16 +490,29 @@ public:
     std::mutex mutex;
     std::map<std::string, std::pair<std::vector<std::uint8_t>, std::int64_t>> objects;
     std::int64_t clock = 1'000'000'000'000;
-    bool down          = false;
+    // Set and read by tests while the store's threads use the bucket.
+    std::atomic<bool> down{false};
     int puts           = 0;
     int touches        = 0;
     int chunk_gets     = 0;
+    int manifest_gets  = 0;
+    std::atomic<int> lists{0};
+    // Set while the store is idle; called on the store's fetch threads.
+    std::function<void()> on_chunk_get;
+    std::function<void()> on_manifest_get;
+    std::function<void()> on_exists;
+    // Transfers waiting at the gate now (set_hold).
+    std::atomic<int> held{0};
 
 private:
-    void gate() {
+    void gate(Deadline deadline = Deadline::max()) {
         std::unique_lock lock(gate_mutex);
         const std::uint64_t epoch = interrupt_epoch;
-        gate_cv.wait(lock, [&] { return !hold || interrupt_epoch != epoch; });
+        ++held;
+        const bool released =
+            gate_cv.wait_until(lock, deadline, [&] { return !hold || interrupt_epoch != epoch; });
+        --held;
+        if (!released) { throw ninfer::DeadlineExceeded(); }
         if (interrupt_epoch != epoch) { throw std::runtime_error("interrupted"); }
     }
     std::mutex gate_mutex;
@@ -459,6 +533,814 @@ ContextStore::Options remote_options(const fs::path& directory,
 
 bool drained(ContextStore& store) {
     return store.flush_remote(std::chrono::steady_clock::now() + std::chrono::seconds(10));
+}
+
+// Turn `turn` (1-based) of one conversation: image id "a", "b", ... of 10 * turn tokens whose prefix
+// digests reproduce every earlier turn's endpoint key, so it supersedes them.
+void put_turn(ContextStore& store, std::uint32_t turn) {
+    static const auto kv = pseudo_random(8000, 1);
+    std::vector<std::array<std::uint64_t, 2>> digests;
+    const std::uint32_t tokens = 10 * turn;
+    for (std::uint64_t frontier = 0; frontier <= tokens; ++frontier) {
+        digests.push_back({frontier, 0x5eed});
+    }
+    auto description           = describe(std::string(1, static_cast<char>('a' + turn - 1)), tokens);
+    description.checkpoints[0] = {.frontier = tokens, .digests = digests[tokens], .identity_tag = 7};
+    description.prefix_digests = digests;
+    (void)store.put(description,
+                    concat({pseudo_random(30, turn),
+                            std::vector<std::uint8_t>(kv.begin(), kv.begin() + 1000 * turn)}),
+                    std::array{ContextStore::Region{30, 1000ULL * turn}});
+}
+
+std::size_t remote_manifests(MemoryObjectStore& remote) {
+    std::scoped_lock lock(remote.mutex);
+    std::size_t manifests = 0;
+    for (const auto& [key, value] : remote.objects) {
+        if (key.find("manifests/") != std::string::npos) { ++manifests; }
+    }
+    return manifests;
+}
+
+// A conversation saved turn after turn: each image supersedes the one before. The superseded
+// manifests must leave the bucket and must not be fetched back by the next refresh, or every refresh
+// downloads the whole history of every conversation again.
+void test_superseded_images_leave_the_bucket() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore store(remote_options(directory.path(), remote));
+    for (std::uint32_t turn = 1; turn <= 6; ++turn) {
+        put_turn(store, turn);
+        check(drained(store), "the upload did not drain");
+        (void)store.refresh_remote();
+    }
+    check(store.list().size() == 1, "superseded images came back from the bucket");
+    check(remote->manifest_gets == 0, "a refresh downloaded manifests this store wrote or superseded");
+    check(remote_manifests(*remote) == 1, "superseded manifests stayed in the bucket");
+    check(store.stats().remote_retired == 5, "the deleted manifests were not counted");
+    // A new engine sees only the latest state of the conversation.
+    TempDirectory other_directory;
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other) && other.list().size() == 1 && other.list()[0].id == "f",
+          "a new engine did not see exactly the latest image");
+}
+
+// With an upload delay, turns written in quick succession are uploaded once: each write supersedes
+// the queued one before it. A flush uploads at once.
+void test_upload_delay_uploads_a_burst_of_turns_once() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options options = remote_options(directory.path(), remote);
+    options.remote_upload_delay   = std::chrono::seconds(3600);
+    ContextStore store(options);
+    check(drained(store), "the start-up refresh did not finish");
+    for (std::uint32_t turn = 1; turn <= 4; ++turn) { put_turn(store, turn); }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    check(remote->puts == 0, "an upload ran before its delay");
+    check(drained(store), "a flush did not upload the delayed image");
+    check(store.stats().remote_uploads_skipped == 3, "superseded queued uploads were not skipped");
+    check(remote_manifests(*remote) == 1 && store.list().size() == 1 && store.list()[0].id == "d",
+          "the bucket does not hold exactly the latest turn");
+    TempDirectory other_directory;
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other) && other.list().size() == 1, "a new engine did not see the latest turn");
+    const auto loaded = other.load("d");
+    check(loaded && *loaded == store.load("d").value_or(std::vector<std::uint8_t>{}),
+          "the coalesced upload is incomplete");
+}
+
+// A session header as the models write one: per-token tables one after another (token ids, types,
+// three position axes, rewrite frontiers, digests), each `tokens` long, so a later turn grows every
+// table at its end and moves every table after the first.
+std::vector<std::uint8_t> session_header(std::uint32_t tokens) {
+    std::vector<std::uint8_t> out;
+    const auto table = [&](std::size_t bytes_per_token, std::uint32_t seed) {
+        const auto all = pseudo_random(200'000 * bytes_per_token, seed); // the same stream every turn
+        out.insert(out.end(), all.begin(), all.begin() + static_cast<std::ptrdiff_t>(tokens * bytes_per_token));
+    };
+    table(4, 11);
+    table(1, 12);
+    table(4, 13);
+    table(4, 14);
+    table(4, 15);
+    table(4, 16);
+    table(16, 17);
+    return out;
+}
+
+// The header between the regions is cut by content: a turn that adds 1 % of tokens writes a few
+// chunks of it, not all of it, and the manifest stays a few KB however long the session is.
+void test_header_is_stored_as_a_delta() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore store(remote_options(directory.path(), remote));
+    const auto kv     = pseudo_random(6000, 3);
+    const auto first  = session_header(50'000); // 1.85 MB
+    const auto second = session_header(50'500);
+    const auto put    = [&](const std::string& id, const std::vector<std::uint8_t>& header) {
+        return store.put(describe(id), concat({header, kv}),
+                         std::array{ContextStore::Region{header.size(), kv.size()}});
+    };
+    (void)put("0a", first);
+    check(drained(store), "the first turn did not upload");
+    const auto uploaded_before = store.stats().remote_upload_bytes;
+    // About two chunks around the end of each of the seven tables (~0.5 MB a turn whatever the
+    // header's size; here, at 50k tokens, about a quarter of it).
+    const auto written = put("0b", second);
+    check(written.chunk_bytes_written < second.size() / 3,
+          "a turn that grew the header by 1 % rewrote most of it");
+    check(drained(store), "the second turn did not upload");
+    check(store.stats().remote_upload_bytes - uploaded_before < second.size() / 3,
+          "a turn that grew the header by 1 % uploaded most of it");
+    std::size_t manifest_bytes = 0;
+    for (const auto& [key, value] : remote->objects) {
+        if (key.find("0b.manifest") != std::string::npos) { manifest_bytes = value.first.size(); }
+    }
+    check(manifest_bytes > 0 && manifest_bytes < 4096, "the manifest carries the header");
+    const auto loaded = store.load("0b");
+    check(loaded && *loaded == concat({second, kv}), "a content-chunked header did not round-trip");
+}
+
+// Content-defined cuts resynchronise: bytes inserted at the front of the header shift everything
+// after them, yet the cuts after the insertion land where they did before and the rest is reused.
+void test_content_cuts_resynchronise_after_an_insertion() {
+    TempDirectory directory;
+    ContextStore store(options_for(directory.path()));
+    const auto header   = pseudo_random(1U << 20U, 21);
+    const auto inserted = concat({pseudo_random(100, 22), header});
+    const auto tail     = pseudo_random(2000, 23);
+    (void)store.put(describe("0a"), concat({header, tail}),
+                    std::array{ContextStore::Region{header.size(), tail.size()}});
+    const auto result = store.put(describe("0b"), concat({inserted, tail}),
+                                  std::array{ContextStore::Region{inserted.size(), tail.size()}});
+    // Only the chunk or two around the insertion are new (cuts are 16-256 KiB apart).
+    check(result.chunk_bytes_reused >= header.size() - (512U << 10U),
+          "the bytes after an insertion were not reused: the cuts did not resynchronise");
+}
+
+// Each state its own region: a state put again behind a newer one, at another offset, is reused
+// whole, although its size is no multiple of the chunk size.
+void test_regions_are_chunked_from_their_own_start() {
+    TempDirectory directory;
+    ContextStore store(options_for(directory.path())); // 1 KiB chunks
+    const auto a = pseudo_random(2500, 1);
+    const auto b = pseudo_random(2500, 2);
+    const auto c = pseudo_random(2500, 3);
+    (void)store.put(describe("0a"), concat({pseudo_random(30, 9), a, b}),
+                    std::array{ContextStore::Region{30, 2500}, ContextStore::Region{2530, 2500}});
+    const auto result =
+        store.put(describe("0b"), concat({pseudo_random(30, 9), c, a, b}),
+                  std::array{ContextStore::Region{30, 2500}, ContextStore::Region{2530, 2500},
+                             ContextStore::Region{5030, 2500}});
+    check(result.chunk_bytes_written == 2500 && result.chunk_bytes_reused == 5000,
+          "states that moved were written again");
+}
+
+// An image only the bucket holds reports the bytes a load would download. A lookup asked for by a
+// request reads the manifests it wants and leaves the rest to the background refresh, and requests
+// asking together share one listing.
+void test_fetch_bytes_and_lookup_on_demand() {
+    TempDirectory directory;
+    TempDirectory other_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other), "the start-up refresh did not finish");
+    {
+        ContextStore store(remote_options(directory.path(), remote));
+        (void)store.put(describe("0a"), concat({pseudo_random(30, 1), pseudo_random(3000, 2)}),
+                        std::array{ContextStore::Region{30, 3000}});
+        for (const char* unrelated : {"0b", "0c", "0d"}) {
+            (void)store.put(describe(unrelated), concat({pseudo_random(30, 3), pseudo_random(3000, 4)}),
+                            std::array{ContextStore::Region{30, 3000}});
+        }
+        check(drained(store), "upload");
+    }
+    const auto deadline   = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    const auto asked      = std::chrono::steady_clock::now();
+    const auto only_0a    = [](const std::string& id) { return id == "0a"; };
+    const int lists       = remote->lists;
+    const int manifests   = remote->manifest_gets;
+    const auto found      = other.lookup_remote(asked, deadline, only_0a);
+    check(found.registered == 1 && found.held == 1 && other.find("0a"),
+          "a lookup did not register the image it wanted");
+    check(remote->manifest_gets == manifests + 1 && !other.find("0b") && !other.find("0c"),
+          "a lookup read the manifests of images it did not want");
+    // Asked before that listing was taken: it already shows the bucket as of then.
+    const auto again = other.lookup_remote(asked, deadline, only_0a);
+    check(again.registered == 0 && again.held == 1 && remote->lists == lists + 1,
+          "a request asking before a listing listed the bucket again");
+    // Asked after it: a listing taken earlier may miss what was uploaded since, so it lists again.
+    (void)other.lookup_remote(std::chrono::steady_clock::now(), deadline, only_0a);
+    check(remote->lists == lists + 2, "a request asking after the last listing was not given a new one");
+    // Nothing wanted is listed: nothing is read, and the request learns it at once.
+    const auto none = other.lookup_remote(std::chrono::steady_clock::now(), deadline,
+                                          [](const std::string& id) { return id == "ff"; });
+    check(none.registered == 0 && none.held == 0 && remote->manifest_gets == manifests + 1,
+          "a lookup that wanted nothing listed read a manifest");
+    // The refresh registers what the lookups left.
+    check(other.refresh_remote() == 3 && other.list().size() == 4, "the refresh did not register the rest");
+    const auto info = other.find("0a");
+    check(info && !info->local && info->fetch_bytes == 3000, "the bytes to fetch were not reported");
+    (void)other.load("0a");
+    check(other.find("0a")->fetch_bytes == 0 && other.find("0a")->local, "a fetched image still has bytes to fetch");
+}
+
+// A lookup that arrives while a listing it can use is in progress (a refresh's, or another
+// request's) waits for that listing instead of listing the bucket a second time, and does not wait
+// for the manifests the refresh then reads.
+void test_a_lookup_shares_a_listing_in_progress() {
+    TempDirectory directory;
+    TempDirectory other_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other), "the start-up refresh did not finish");
+    {
+        ContextStore store(remote_options(directory.path(), remote));
+        (void)store.put(describe("0a"), concat({pseudo_random(30, 1), pseudo_random(3000, 2)}),
+                        std::array{ContextStore::Region{30, 3000}});
+        check(drained(store), "upload");
+    }
+    const auto asked = std::chrono::steady_clock::now();
+    const int lists  = remote->lists;
+    remote->set_hold(true);
+    std::thread refresh([&] { (void)other.refresh_remote(); });
+    const auto waited_for = [&](int calls) {
+        for (int i = 0; i < 5000 && remote->held < calls; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return remote->held >= calls;
+    };
+    check(waited_for(1), "the refresh did not start its listing");
+    ContextStore::LookupResult found;
+    std::thread lookup([&] {
+        found = other.lookup_remote(asked, std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                                    [](const std::string& id) { return id == "0a"; });
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    check(remote->held == 1, "the lookup listed the bucket beside the refresh's listing");
+    remote->set_hold(false);
+    lookup.join();
+    refresh.join();
+    check(remote->lists == lists + 1 && found.held == 1 && other.find("0a"),
+          "the lookup did not take the refresh's listing");
+
+    // Lookups asked after a listing started cannot use it (it may miss what was uploaded just
+    // before they asked): they wait for it to end and share one listing after it, instead of
+    // listing the bucket each.
+    const int before = remote->lists;
+    remote->set_hold(true);
+    std::thread late_refresh([&] { (void)other.refresh_remote(); });
+    check(waited_for(1), "the refresh did not start its listing");
+    std::vector<std::thread> lookups;
+    std::atomic<int> held{0};
+    for (int i = 0; i < 4; ++i) {
+        lookups.emplace_back([&] {
+            const auto result = other.lookup_remote(
+                std::chrono::steady_clock::now(),
+                std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                [](const std::string& id) { return id == "0a"; });
+            held += static_cast<int>(result.held);
+        });
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    check(remote->held == 1, "a lookup listed the bucket beside the listing in progress");
+    remote->set_hold(false);
+    for (auto& thread : lookups) { thread.join(); }
+    late_refresh.join();
+    check(remote->lists == before + 2 && held == 4,
+          "lookups arriving during a listing did not share one listing after it");
+}
+
+// A manifest the listing shows that is gone by the time it is read, or does not parse, is a failed
+// download (missing, damaged), for a lookup and for a refresh alike.
+void test_listed_manifests_that_cannot_be_read_are_counted() {
+    TempDirectory directory;
+    TempDirectory other_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other), "the start-up refresh did not finish");
+    {
+        ContextStore store(remote_options(directory.path(), remote));
+        for (const char* id : {"0a", "0b", "0c"}) {
+            (void)store.put(describe(id), concat({pseudo_random(30, 1), pseudo_random(3000, 2)}),
+                            std::array{ContextStore::Region{30, 3000}});
+        }
+        check(drained(store), "upload");
+    }
+    const auto manifest = [&](const std::string& id) {
+        for (auto& [key, value] : remote->objects) {
+            if (key.find("manifests/" + id + ".manifest") != std::string::npos) { return &value; }
+        }
+        return static_cast<std::pair<std::vector<std::uint8_t>, std::int64_t>*>(nullptr);
+    };
+    const auto asked    = std::chrono::steady_clock::now();
+    const auto deadline = asked + std::chrono::seconds(10);
+    (void)other.lookup_remote(asked, deadline, [](const std::string& id) { return id == "0a"; });
+    // Gone after the listing the next lookup reuses was taken.
+    {
+        std::scoped_lock lock(remote->mutex);
+        for (auto it = remote->objects.begin(); it != remote->objects.end();) {
+            it = it->first.find("0b.manifest") != std::string::npos ? remote->objects.erase(it)
+                                                                    : std::next(it);
+        }
+    }
+    const auto gone = other.lookup_remote(asked, deadline, [](const std::string& id) { return id == "0b"; });
+    check(gone.registered == 0 && other.stats().remote_download_failures == 1 &&
+              other.stats().remote_download_failures_missing == 1,
+          "a listed manifest that was gone was not counted as missing");
+    manifest("0c")->first[5] ^= 0xff;
+    (void)other.refresh_remote();
+    check(!other.find("0c") && other.stats().remote_download_failures == 2 &&
+              other.stats().remote_download_failures_damaged == 1,
+          "a listed manifest that does not parse was not counted as damaged");
+}
+
+// A fetch that cannot finish by its deadline stops there: a miss, not damage. The image stays
+// offered with the chunks fetched so far, and a later load fetches the rest.
+void test_a_fetch_stops_at_its_deadline() {
+    TempDirectory directory;
+    TempDirectory other_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    const auto image = concat({pseudo_random(30, 1), pseudo_random(6000, 2)}); // several chunks
+    {
+        ContextStore store(remote_options(directory.path(), remote));
+        (void)store.put(describe("0a"), image, std::array{ContextStore::Region{30, 6000}});
+        check(drained(store), "upload");
+    }
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other) && other.find("0a"), "the image was not registered");
+    ContextStore::LoadReport report;
+    const auto late = other.load("0a", false, &report,
+                                 std::chrono::steady_clock::now() - std::chrono::milliseconds(1));
+    check(!late && report.expired && other.stats().remote_downloads == 0,
+          "a fetch past its deadline downloaded chunks or was not reported as expired");
+    check(other.find("0a") && other.stats().corrupt_removed == 0 &&
+              other.stats().remote_download_failures == 0,
+          "a fetch stopped at its deadline was treated as damage or a failure");
+    ContextStore::LoadReport on_time;
+    const auto loaded = other.load("0a", false, &on_time);
+    check(loaded && *loaded == image && !on_time.expired, "the image did not load in time afterwards");
+}
+
+// The visitor sees the keys it accepts with the Info list() reports, and nothing else.
+void test_checkpoint_visitor_matches_list() {
+    TempDirectory directory;
+    TempDirectory other_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    {
+        ContextStore store(remote_options(directory.path(), remote));
+        (void)store.put(describe("0a"), concat({pseudo_random(30, 1), pseudo_random(3000, 2)}),
+                        std::array{ContextStore::Region{30, 3000}});
+        check(drained(store), "upload");
+    }
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other), "the start-up refresh did not finish");
+    auto local = describe("0b", 50);
+    local.checkpoints.push_back({.frontier = 20, .digests = {0x3333, 0x4444}, .identity_tag = 7});
+    (void)other.put(local, concat({pseudo_random(30, 5), pseudo_random(2000, 6)}),
+                    std::array{ContextStore::Region{30, 2000}});
+    std::vector<std::pair<ContextStore::Info, ContextStore::CheckpointKey>> seen;
+    other.for_each_checkpoint(
+        [](const ContextStore::Info&, const ContextStore::CheckpointKey& key) {
+            return key.digests[0] == 0x1111 || key.frontier == 20;
+        },
+        [&](const ContextStore::Info& info, const ContextStore::CheckpointKey& key) {
+            seen.emplace_back(info, key);
+        });
+    check(seen.size() == 3, "the visitor did not see exactly the accepted keys");
+    for (const auto& [info, key] : seen) {
+        const auto listed = other.find(info.id);
+        check(listed && listed->local == info.local && listed->fetch_bytes == info.fetch_bytes &&
+                  listed->image_bytes == info.image_bytes,
+              "the visitor's Info differs from what the index reports");
+    }
+}
+
+// Many different conversations on one shared prefix (an agent's system and tools prompt): the
+// prefix's chunks are stored once, every conversation written counts as a use of the prefix, and
+// when the directory is too small for all of them the conversations go first, oldest first, while
+// the prefix stays whole for the next conversation to start from.
+void test_shared_prefix_outlives_the_conversations_on_it() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options options = remote_options(directory.path(), remote);
+    options.max_bytes             = 14'000; // the prefix and about two conversations
+    ContextStore store(options);
+    const auto prefix = pseudo_random(5 * 1024, 1); // five whole chunks
+    std::vector<std::array<std::uint64_t, 2>> digests;
+    for (std::uint64_t frontier = 0; frontier <= 400; ++frontier) { digests.push_back({frontier, 0xc0de}); }
+    auto shared            = describe("5a", 100);
+    shared.shared          = true;
+    shared.checkpoints[0]  = {.frontier = 100, .digests = digests[100], .identity_tag = 7};
+    (void)store.put(shared, concat({pseudo_random(30, 9), prefix}),
+                    std::array{ContextStore::Region{30, prefix.size()}});
+    std::int64_t last_write_ms = 0;
+    for (std::uint32_t user = 0; user < 4; ++user) {
+        remote->clock += 10;
+        last_write_ms = remote->clock; // the store's clock; uploads advance it after the put
+        auto conversation           = describe(std::string("c") + static_cast<char>('0' + user), 300);
+        conversation.checkpoints[0] = {.frontier = 300, .digests = {user + 1U, 0xfeed}, .identity_tag = 7};
+        conversation.prefix_digests = digests; // starts with the shared prefix, then its own
+        const auto own    = pseudo_random(3 * 1024, 100 + user);
+        const auto result = store.put(conversation, concat({pseudo_random(30, 9), prefix, own}),
+                                      std::array{ContextStore::Region{30, prefix.size() + own.size()}});
+        check(result.chunk_bytes_reused >= prefix.size(), "a conversation stored the shared prefix again");
+        check(drained(store), "upload");
+    }
+    const auto kept = store.find("5a");
+    check(kept && kept->local, "the shared prefix was evicted before the conversations on it");
+    check(kept && kept->last_used_ms == last_write_ms,
+          "a conversation written did not count as a use of its prefix");
+    check(store.find("c3") && store.find("c3")->local, "the newest conversation was evicted");
+    check(store.find("c0") && !store.find("c0")->local, "the oldest conversation kept its files over budget");
+    check(store.find("c0")->fetch_bytes == 3 * 1024, "an evicted conversation would download its shared prefix again");
+}
+
+// A conversation on a shared prefix moves from engine A to engine B (sticky routing changed), the
+// two sharing a bucket and a binding. B already holds the prefix, finds the conversation with one
+// listing on demand, sees only its latest turn, and downloads only the conversation's own bytes.
+// B's next write supersedes A's image and deletes its manifest, so the fleet keeps one image of
+// the conversation. A manifest whose deletion was lost (an engine killed before it ran) is
+// registered again, and the conversation's next write supersedes and deletes it again.
+void test_conversation_moves_between_engines_on_a_shared_prefix() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore a(remote_options(a_directory.path(), remote));
+    ContextStore b(remote_options(b_directory.path(), remote));
+    check(drained(a) && drained(b), "the start-up refreshes did not finish");
+
+    const auto header = pseudo_random(30, 9);
+    const auto prefix = pseudo_random(5 * 1024, 1); // five whole chunks
+    const auto own    = pseudo_random(8 * 1024, 2); // turn k holds the first k * 1024 bytes
+    std::vector<std::array<std::uint64_t, 2>> digests;
+    for (std::uint64_t frontier = 0; frontier <= 1000; ++frontier) { digests.push_back({frontier, 0xc0de}); }
+    auto shared           = describe("5a", 100);
+    shared.shared         = true;
+    shared.checkpoints[0] = {.frontier = 100, .digests = digests[100], .identity_tag = 7};
+    (void)a.put(shared, concat({header, prefix}), std::array{ContextStore::Region{30, prefix.size()}});
+    check(drained(a), "the prefix upload");
+    // B serves other conversations on the same prefix, so it holds the prefix already.
+    (void)b.refresh_remote();
+    check(b.load("5a").has_value(), "B could not fetch the shared prefix");
+
+    const auto put_turn_on = [&](ContextStore& store, std::uint32_t turn) {
+        remote->clock += 10;
+        const std::uint32_t tokens = 100 + 100 * turn;
+        auto conversation           = describe(std::string("c") + static_cast<char>('0' + turn), tokens);
+        conversation.checkpoints[0] = {.frontier = tokens, .digests = digests[tokens], .identity_tag = 7};
+        // A span: the digests it views must outlive the put.
+        const std::vector<std::array<std::uint64_t, 2>> prefix_digests(digests.begin(),
+                                                                       digests.begin() + tokens + 1);
+        conversation.prefix_digests = prefix_digests;
+        const std::vector<std::uint8_t> mine(own.begin(), own.begin() + 1024 * turn);
+        (void)store.put(conversation, concat({header, prefix, mine}),
+                        std::array{ContextStore::Region{30, prefix.size() + mine.size()}});
+        check(drained(store), "a turn's upload");
+    };
+    const auto manifest_ids = [&] {
+        std::scoped_lock lock(remote->mutex);
+        std::vector<std::string> ids;
+        for (const auto& [key, value] : remote->objects) {
+            const auto at = key.find("manifests/");
+            if (at != std::string::npos) { ids.push_back(key.substr(at + 10, key.find('.', at) - at - 10)); }
+        }
+        return ids;
+    };
+
+    for (std::uint32_t turn = 1; turn <= 3; ++turn) { put_turn_on(a, turn); }
+    check(manifest_ids() == std::vector<std::string>{"5a", "c3"}, "A's superseded turns stayed in the bucket");
+
+    // The conversation moves: B's lookup finds nothing, lists the bucket once, and finds turn 3.
+    check(!b.find("c3"), "B knew the conversation before listing");
+    (void)b.lookup_remote(std::chrono::steady_clock::now(),
+                          std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                          [](const std::string& id) { return id.front() == 'c'; });
+    const auto offered = b.find("c3");
+    check(offered && !offered->local, "B's lookup did not find the conversation in the bucket");
+    check(!b.find("c1") && !b.find("c2"), "B registered turns A had superseded");
+    check(offered && offered->fetch_bytes == 3 * 1024,
+          "B would download the shared prefix it holds, not only the conversation's own bytes");
+    const auto before = b.stats();
+    const auto loaded = b.load("c3");
+    const std::vector<std::uint8_t> mine3(own.begin(), own.begin() + 3 * 1024);
+    check(loaded && *loaded == concat({header, prefix, mine3}), "B fetched a different conversation");
+    check(b.stats().remote_download_bytes - before.remote_download_bytes == 3 * 1024,
+          "B downloaded more than the conversation's unique bytes");
+
+    // B continues the conversation: its write supersedes A's image and deletes A's manifest.
+    put_turn_on(b, 4);
+    check(manifest_ids() == std::vector<std::string>{"5a", "c4"},
+          "B's write did not delete the manifest A wrote");
+    check(b.stats().remote_retired >= 1, "the deletion was not counted");
+
+    // A deletion lost to a crash leaves turn 3's manifest in the bucket. A third engine puts it
+    // back the same way: it writes turn 3 exactly as A did (a shorter image supersedes nothing).
+    TempDirectory c_directory;
+    {
+        ContextStore c(remote_options(c_directory.path(), remote));
+        check(drained(c), "C's start-up refresh");
+        (void)c.load("5a");
+        put_turn_on(c, 3);
+    }
+    check(manifest_ids() == std::vector<std::string>{"5a", "c3", "c4"}, "the stale manifest was not planted");
+    (void)b.refresh_remote();
+    check(b.find("c3").has_value(), "B did not register the stale manifest");
+    // The conversation's next write supersedes the stale entry along with B's own last turn.
+    put_turn_on(b, 5);
+    check(manifest_ids() == std::vector<std::string>{"5a", "c5"},
+          "the next write did not delete a manifest whose deletion was lost");
+}
+
+// A complete listing that no longer shows a published image's manifest (removed by another engine
+// or a person) keeps the entry for its local bytes but withdraws its publication: eviction then
+// removes it whole instead of keeping an entry whose chunks exist nowhere, and a restart does not
+// bring the publication back.
+void test_a_listing_without_the_manifest_withdraws_publication() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options options = remote_options(directory.path(), remote);
+    {
+        ContextStore store(options);
+        check(drained(store), "the start-up refresh did not finish");
+        (void)store.put(describe("0a"), concat({pseudo_random(30, 1), pseudo_random(5000, 2)}),
+                        std::array{ContextStore::Region{30, 5000}});
+        check(drained(store), "upload");
+        {
+            std::scoped_lock lock(remote->mutex);
+            remote->objects.erase("ninfer/manifests/0a.manifest");
+        }
+        (void)store.refresh_remote();
+        const auto kept = store.find("0a");
+        check(kept && kept->local, "an image with local bytes was dropped by the listing");
+    }
+    options.max_bytes = 8000; // room for one image
+    ContextStore store(options);
+    check(drained(store), "the start-up refresh after the restart did not finish");
+    remote->clock += 10;
+    (void)store.put(describe("0b"), concat({pseudo_random(30, 3), pseudo_random(5000, 4)}),
+                    std::array{ContextStore::Region{30, 5000}});
+    check(!store.find("0a"), "an image the bucket lost was kept as fetchable after eviction");
+}
+
+// Waits (at most 10 s) until a transfer is blocked at the bucket's gate.
+bool wait_for_held_transfer(MemoryObjectStore& remote) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (remote.held.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return remote.held.load() != 0;
+}
+
+// An upload in flight keeps the files it reads, even past the size limit; once it is done the
+// directory comes back within the limit by itself, without waiting for the next put.
+void test_eviction_waits_for_an_upload_in_flight() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options options = remote_options(directory.path(), remote);
+    options.max_bytes             = 8000; // room for one image
+    ContextStore store(options);
+    check(drained(store), "the start-up refresh did not finish");
+    const auto kv = pseudo_random(5000, 2);
+    (void)store.put(describe("0a"), concat({pseudo_random(30, 1), kv}),
+                    std::array{ContextStore::Region{30, 5000}});
+    check(drained(store), "upload a");
+    // 0b shares 0a's chunks, and its upload is in flight behind a slow link when 0c arrives.
+    remote->set_hold(true);
+    remote->clock += 10;
+    const auto b = concat({pseudo_random(30, 3), kv});
+    (void)store.put(describe("0b"), b, std::array{ContextStore::Region{30, 5000}});
+    check(wait_for_held_transfer(*remote), "the upload of 0b did not start");
+    remote->clock += 10;
+    (void)store.put(describe("0c"), concat({pseudo_random(30, 5), pseudo_random(5000, 6)}),
+                    std::array{ContextStore::Region{30, 5000}});
+    check(store.stats().used_bytes > options.max_bytes,
+          "files an upload in flight reads were removed");
+    remote->set_hold(false);
+    check(drained(store), "the uploads did not run");
+    check(store.stats().used_bytes <= options.max_bytes,
+          "the files an upload held stayed after it finished");
+    // Uploaded from the files it kept: the next listing offers it again.
+    (void)store.refresh_remote();
+    const auto back = store.load("0b");
+    check(back && *back == b, "the image evicted during its upload could not be fetched back");
+}
+
+// Uploads waiting out their delay pin their chunk files. Those files count against the size limit:
+// when evicting cannot bring the directory under it, the oldest waiting uploads whose files nothing
+// else keeps are given up so the files can go, so the directory never holds more than the limit
+// and the newest image.
+void test_queued_uploads_cannot_hold_the_directory_over_its_limit() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options options = remote_options(directory.path(), remote);
+    options.max_bytes             = 12'000; // two images
+    options.remote_upload_delay   = std::chrono::seconds(3600);
+    ContextStore store(options);
+    check(drained(store), "the start-up refresh did not finish");
+    std::vector<std::uint8_t> newest;
+    for (std::uint32_t i = 1; i <= 6; ++i) {
+        remote->clock += 10;
+        newest = concat({pseudo_random(30, i), pseudo_random(5000, 100 + i)});
+        (void)store.put(describe("a" + std::to_string(i)), newest,
+                        std::array{ContextStore::Region{30, 5000}});
+        const auto info = store.find("a" + std::to_string(i));
+        check(info && store.stats().used_bytes <= options.max_bytes + info->image_bytes + 1024,
+              "queued uploads held the directory over its limit");
+    }
+    check(store.stats().remote_uploads_dropped >= 3, "the given-up uploads were not counted");
+    check(drained(store), "the remaining uploads did not run");
+    check(store.stats().used_bytes <= options.max_bytes, "the directory stayed over its limit");
+    TempDirectory reader_directory;
+    ContextStore reader(remote_options(reader_directory.path(), remote));
+    (void)reader.refresh_remote();
+    check(reader.load("a6").value_or(std::vector<std::uint8_t>{}) == newest,
+          "the newest image did not reach the bucket whole");
+
+}
+
+// A flush before the box goes reaches the bucket with every image, even past the upload queue's
+// limit (which gives up the oldest waiting uploads) and before their delay.
+void test_upload_unpublished_sends_every_image_past_the_queue_limit() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    {
+        // A session another model or configuration left in the directory (an earlier run's): not
+        // this binding's to send.
+        ContextStore earlier(options_for(directory.path()));
+        auto foreign    = describe("f0");
+        foreign.binding = "model-b";
+        (void)earlier.put(foreign, concat({pseudo_random(30, 900), pseudo_random(2000, 901)}),
+                          std::array{ContextStore::Region{30, 2000}});
+    }
+    ContextStore::Options options = remote_options(directory.path(), remote);
+    options.remote_upload_delay   = std::chrono::seconds(3600);
+    ContextStore store(options);
+    check(drained(store), "the start-up refresh did not finish");
+    constexpr std::uint32_t kImages = ContextStore::kMaximumQueuedUploads + 4;
+    for (std::uint32_t i = 1; i <= kImages; ++i) {
+        (void)store.put(describe("f" + std::to_string(i)),
+                        concat({pseudo_random(30, i), pseudo_random(2000, 500 + i)}),
+                        std::array{ContextStore::Region{30, 2000}});
+    }
+    check(store.stats().remote_uploads_dropped >= 4, "the queue limit did not give uploads up");
+    check(store.upload_unpublished(describe("f1").binding,
+                                   std::chrono::steady_clock::now() + std::chrono::seconds(10)),
+          "upload_unpublished did not report every image in the bucket");
+    TempDirectory reader_directory;
+    ContextStore reader(remote_options(reader_directory.path(), remote));
+    (void)reader.refresh_remote();
+    for (std::uint32_t i = 1; i <= kImages; ++i) {
+        check(reader.find("f" + std::to_string(i)).has_value(),
+              "an image given up by the queue never reached the bucket");
+    }
+    const auto foreign_manifest = std::find_if(remote->objects.begin(), remote->objects.end(),
+                                               [](const auto& object) {
+                                                   return object.first.find("f0.manifest") !=
+                                                          std::string::npos;
+                                               });
+    check(foreign_manifest == remote->objects.end(),
+          "a flush sent another binding's session to the bucket");
+}
+
+// Publication survives a restart, for exactly the manifest published: an image uploaded before the
+// restart is evicted to the bucket after it (kept, fetched on demand); one whose upload never
+// happened is removed whole.
+void test_publication_survives_restart() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options options = remote_options(directory.path(), remote);
+    {
+        ContextStore store(options);
+        (void)store.put(describe("0a"), concat({pseudo_random(30, 1), pseudo_random(5000, 2)}),
+                        std::array{ContextStore::Region{30, 5000}});
+        check(drained(store), "upload before the restart");
+        remote->down = true;
+        (void)store.put(describe("0c"), concat({pseudo_random(30, 5), pseudo_random(5000, 6)}),
+                        std::array{ContextStore::Region{30, 5000}});
+        check(drained(store), "the failed upload did not settle");
+        remote->down = false;
+    }
+    options.max_bytes = 8000; // room for one image
+    ContextStore store(options);
+    check(drained(store), "the start-up refresh did not finish");
+    remote->clock += 10;
+    (void)store.put(describe("0b"), concat({pseudo_random(30, 3), pseudo_random(5000, 4)}),
+                    std::array{ContextStore::Region{30, 5000}});
+    const auto published = store.find("0a");
+    check(published && !published->local, "an image published before the restart was not kept for the bucket");
+    const auto unpublished = store.find("0c");
+    check(!unpublished || unpublished->local, "an image never uploaded was evicted to the bucket after a restart");
+}
+
+// A load reports the download alone: its bytes and time, not the local read that follows.
+void test_load_reports_its_download() {
+    TempDirectory directory;
+    TempDirectory other_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    {
+        ContextStore store(remote_options(directory.path(), remote));
+        (void)store.put(describe("0a"), concat({pseudo_random(30, 1), pseudo_random(3000, 2)}),
+                        std::array{ContextStore::Region{30, 3000}});
+        check(drained(store), "upload");
+    }
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other) && other.find("0a"), "the image was not registered");
+    ContextStore::LoadReport report;
+    check(other.load("0a", false, &report).has_value(), "the remote image did not load");
+    check(report.fetched_bytes == 3000 && report.fetch_ns > 0, "the download was not reported");
+    ContextStore::LoadReport again;
+    check(other.load("0a", false, &again).has_value() && again.fetched_bytes == 0 && again.fetch_ns == 0,
+          "a local load reported a download");
+
+    // Compressed chunks: the report gives raw bytes, the unit fetch_bytes prices fetches in,
+    // though fewer bytes crossed the network.
+    TempDirectory packed_directory;
+    TempDirectory reader_directory;
+    auto packed = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options compressing = remote_options(packed_directory.path(), packed);
+    compressing.compress_chunks       = true;
+    // Two bits of entropy a byte: compresses well, and no two chunks are alike.
+    std::vector<std::uint8_t> compressible = pseudo_random(3000, 3);
+    for (auto& byte : compressible) { byte &= 0x03; }
+    {
+        ContextStore store(compressing);
+        (void)store.put(describe("0b"), concat({pseudo_random(30, 1), compressible}),
+                        std::array{ContextStore::Region{30, 3000}});
+        check(drained(store), "upload");
+    }
+    ContextStore reader(remote_options(reader_directory.path(), packed));
+    check(drained(reader) && reader.find("0b") && reader.find("0b")->fetch_bytes == 3000,
+          "the compressed image was not registered with its raw size");
+    ContextStore::LoadReport compressed;
+    check(reader.load("0b", false, &compressed).has_value(), "the compressed image did not load");
+    check(compressed.fetched_bytes == 3000 && reader.stats().remote_download_bytes < 3000,
+          "the report did not give raw bytes for compressed chunks");
+}
+
+// A chunk that downloads but cannot be installed (the directory refuses the write, as on a full
+// disk) fails the load, it does not escape a fetch thread and end the process; a later load
+// succeeds once the directory takes writes again.
+void test_fetch_install_failure_is_a_miss() {
+    TempDirectory directory;
+    TempDirectory other_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    const auto image = concat({pseudo_random(30, 1), pseudo_random(6000, 2)}); // several chunks
+    {
+        ContextStore store(remote_options(directory.path(), remote));
+        (void)store.put(describe("0a"), image, std::array{ContextStore::Region{30, 6000}});
+        check(drained(store), "upload");
+    }
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other) && other.find("0a"), "the image was not registered");
+    const fs::path chunks = other_directory.path() / "chunks";
+    for (const auto& shard : fs::directory_iterator(chunks)) { fs::remove_all(shard.path()); }
+    fs::permissions(chunks, fs::perms::owner_read | fs::perms::owner_exec);
+    check(!other.load("0a").has_value(), "a chunk that could not be installed was served");
+    check(other.stats().remote_download_failures >= 1 &&
+              other.stats().remote_download_failures_install == other.stats().remote_download_failures,
+          "the install failure was not counted as one");
+    fs::permissions(chunks, fs::perms::owner_all);
+    const auto loaded = other.load("0a");
+    check(loaded && *loaded == image, "the load did not succeed once the directory took writes");
+}
+
+// An image whose upload failed is never evicted to the remote: the bucket does not hold it, so
+// keeping its manifest while deleting its chunks would lose the only copy. And the images it
+// superseded may be registered from the bucket again, since no replacement was published.
+void test_failed_upload_keeps_the_local_copy_and_releases_superseded() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options options = remote_options(directory.path(), remote);
+    ContextStore store(options);
+    put_turn(store, 1);
+    check(drained(store), "the first turn did not upload");
+    remote->down = true;
+    put_turn(store, 2); // supersedes turn 1 ("a"); its upload fails
+    check(drained(store), "the failed upload did not settle");
+    check(store.stats().remote_upload_failures >= 1, "the upload did not fail");
+    remote->down = false;
+    // Turn 1's manifest is still the bucket's latest: a refresh may register it again.
+    check(store.refresh_remote() == 1 && store.find("a"), "a superseded image stayed blocked after its replacement failed");
+    check(store.find("b") && store.find("b")->local, "the unpublished image lost files");
+
+    // Under space pressure an image whose upload failed is removed whole, as without a remote,
+    // never kept as a manifest pointing at a bucket copy that does not exist.
+    TempDirectory tight_directory;
+    auto down = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options tight = remote_options(tight_directory.path(), down);
+    tight.max_bytes             = 8000; // room for one image
+    ContextStore squeezed(tight);
+    down->down = true;
+    (void)squeezed.put(describe("0a"), concat({pseudo_random(30, 1), pseudo_random(5000, 2)}),
+                       std::array{ContextStore::Region{30, 5000}});
+    check(drained(squeezed), "the failed upload did not settle");
+    down->clock += 10;
+    (void)squeezed.put(describe("0b"), concat({pseudo_random(30, 3), pseudo_random(5000, 4)}),
+                       std::array{ContextStore::Region{30, 5000}});
+    const auto evicted = squeezed.find("0a");
+    check(!evicted || evicted->local, "an image the bucket lacks was evicted to it");
+    check(squeezed.stats().evicted_for_space >= 1, "the limit evicted nothing");
 }
 
 void test_remote_upload_and_second_engine() {
@@ -493,6 +1375,560 @@ void test_remote_upload_and_second_engine() {
           "an image fetched from the remote differs from what was stored");
     check(other.list()[0].local && other.stats().remote_images == 0, "a fetched image is still remote");
     check(other.stats().remote_downloads == 6, "the fetch did not count its chunks");
+    // At least once: the refresh every store queues at start-up may read it too.
+    check(other.stats().remote_manifest_downloads >= 1 &&
+              other.stats().remote_manifest_download_bytes > 0,
+          "the refresh did not count the manifest it downloaded");
+}
+
+std::size_t remote_objects_matching(MemoryObjectStore& remote, const std::string& part) {
+    std::scoped_lock lock(remote.mutex);
+    std::size_t found = 0;
+    for (const auto& [key, value] : remote.objects) {
+        if (key.find(part) != std::string::npos) { ++found; }
+    }
+    return found;
+}
+
+// A newer write of a conversation retires the older manifest by deleting it, and fences that
+// version with a tombstone written before the new manifest is published. Anything that would put
+// the version back (a stale copy planted again, a repair by an engine that still holds it, an
+// upload that was still queued) finds the fence; a version written later under the same id (the
+// same conversation state, saved again) is a new version and is not fenced.
+void test_retired_manifests_are_fenced_against_republish() {
+    TempDirectory a_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    std::vector<std::uint8_t> stale;
+    std::string stale_key;
+    {
+        ContextStore a(remote_options(a_directory.path(), remote));
+        put_turn(a, 1);
+        check(drained(a), "turn 1 did not upload");
+        {
+            std::scoped_lock lock(remote->mutex);
+            for (const auto& [key, value] : remote->objects) {
+                if (key.find("manifests/a.manifest") != std::string::npos) {
+                    stale     = value.first;
+                    stale_key = key;
+                }
+            }
+        }
+        check(!stale.empty(), "turn 1's manifest is not in the bucket");
+        remote->clock += 10;
+        put_turn(a, 2);
+        check(drained(a), "turn 2 did not upload");
+        check(remote_manifests(*remote) == 1 && remote_objects_matching(*remote, "tombstones/a.") == 1,
+              "the superseded version was not deleted and fenced");
+    }
+
+    // The deleted manifest is put back (an engine's repair, an upload that landed late): a
+    // refresh does not register it, and does not download it again while it stays as it is.
+    {
+        std::scoped_lock lock(remote->mutex);
+        remote->objects[stale_key] = {stale, ++remote->clock};
+    }
+    TempDirectory d_directory;
+    ContextStore d(remote_options(d_directory.path(), remote));
+    check(drained(d), "the start-up refresh did not finish");
+    (void)d.refresh_remote();
+    check(d.list().size() == 1 && d.list()[0].id == "b" && !d.find("a").has_value(),
+          "a retired version was registered from the bucket");
+    check(d.stats().remote_fenced >= 1, "the fence was not counted");
+    const int manifest_gets = remote->manifest_gets;
+    (void)d.refresh_remote();
+    check(remote->manifest_gets == manifest_gets, "a fenced manifest was downloaded again");
+
+    // The same id written again later is a new version: not fenced.
+    TempDirectory w_directory;
+    {
+        remote->clock += 10;
+        ContextStore w(remote_options(w_directory.path(), remote));
+        check(drained(w), "the start-up refresh did not finish"); // it meets the planted stale copy
+        const auto fenced_before = w.stats().remote_fenced;
+        put_turn(w, 1);
+        check(drained(w), "the rewrite did not upload");
+        check(w.stats().remote_fenced == fenced_before, "a rewritten id was fenced");
+    }
+    (void)d.refresh_remote();
+    check(d.find("a").has_value(), "a legitimately rewritten id was not registered");
+}
+
+// An engine that still holds a retired image and uses it republishes a manifest that went missing
+// from the bucket (lifecycle expiry); that must not bring back one a newer write deleted.
+void test_repair_does_not_republish_a_retired_manifest() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore a(remote_options(a_directory.path(), remote));
+    ContextStore::Options b_options = remote_options(b_directory.path(), remote);
+    b_options.remote_touch_interval = std::chrono::seconds(0); // every use repairs
+    ContextStore b(b_options);
+    put_turn(a, 1);
+    check(drained(a), "turn 1 did not upload");
+    (void)b.refresh_remote();
+    check(b.load("a").has_value(), "B could not fetch turn 1");
+    check(drained(b), "B's touch did not finish");
+    remote->clock += 10;
+    put_turn(a, 2);
+    check(drained(a), "turn 2 did not upload");
+    check(remote_manifests(*remote) == 1, "the superseded manifest stayed in the bucket");
+    // B still holds turn 1 and uses it again.
+    check(b.load("a").has_value(), "B lost turn 1");
+    check(drained(b), "B's repair did not finish");
+    check(remote_manifests(*remote) == 1 && b.stats().remote_fenced == 1,
+          "an engine's repair put a retired manifest back");
+}
+
+// A retired manifest that is still in the bucket (its delete was lost) is not kept alive by an
+// engine that holds it: using the image touches nothing, so it ages out with its tombstone.
+void test_touch_does_not_refresh_a_present_retired_manifest() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore a(remote_options(a_directory.path(), remote));
+    ContextStore::Options b_options = remote_options(b_directory.path(), remote);
+    b_options.remote_touch_interval = std::chrono::seconds(0); // every use touches
+    ContextStore b(b_options);
+    put_turn(a, 1);
+    check(drained(a), "turn 1 did not upload");
+    std::vector<std::uint8_t> stale;
+    std::string stale_key;
+    {
+        std::scoped_lock lock(remote->mutex);
+        for (const auto& [key, value] : remote->objects) {
+            if (key.find("manifests/a.manifest") != std::string::npos) {
+                stale     = value.first;
+                stale_key = key;
+            }
+        }
+    }
+    check(!stale.empty(), "turn 1's manifest is not in the bucket");
+    (void)b.refresh_remote();
+    check(b.load("a").has_value(), "B could not fetch turn 1");
+    check(drained(b), "B's touch did not finish");
+    remote->clock += 10;
+    put_turn(a, 2);
+    check(drained(a), "turn 2 did not upload");
+    {
+        // The delete of turn 1's manifest was lost.
+        std::scoped_lock lock(remote->mutex);
+        remote->objects[stale_key] = {stale, ++remote->clock};
+    }
+    const int touches = remote->touches;
+    check(b.load("a").has_value(), "B lost turn 1");
+    check(drained(b), "B's touch did not finish");
+    check(remote->touches == touches && b.stats().remote_fenced >= 1,
+          "using a retired image refreshed its manifest or chunks in the bucket");
+}
+
+// An upload still queued for a version that was retired meanwhile does not publish it.
+void test_queued_upload_of_a_retired_version_is_dropped() {
+    TempDirectory directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options options = remote_options(directory.path(), remote);
+    options.remote_upload_delay   = std::chrono::seconds(3600);
+    ContextStore store(options);
+    check(drained(store), "the start-up refresh did not finish");
+    const std::int64_t created = remote->clock;
+    put_turn(store, 1);
+    // Another engine's newer write retired this version while the upload waited.
+    {
+        std::scoped_lock lock(remote->mutex);
+        remote->objects["ninfer/tombstones/a." + std::to_string(created)] = {{}, ++remote->clock};
+    }
+    check(drained(store), "the flush did not finish");
+    check(remote_manifests(*remote) == 0 && store.stats().remote_fenced == 1,
+          "a queued upload published a retired version");
+    check(store.find("a").has_value(), "the local copy of a fenced version was lost");
+}
+
+// A request to the bucket that is still going at the deadline is abandoned there, for the
+// listing, the manifests it registers and the chunks a load fetches, and is not counted as a
+// failed bucket.
+void test_remote_requests_are_abandoned_at_the_deadline() {
+    TempDirectory writer_directory;
+    TempDirectory reader_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    // Opened (and its first refresh over) before the image exists, so the refreshes below are the
+    // only ones that could register it.
+    ContextStore reader(remote_options(reader_directory.path(), remote));
+    check(drained(reader), "the reader's first refresh did not finish");
+    const auto image = concat({pseudo_random(30, 1), pseudo_random(5000, 2)});
+    {
+        ContextStore store(remote_options(writer_directory.path(), remote));
+        (void)store.put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
+        check(drained(store), "the upload did not drain");
+    }
+    const auto within = [](int milliseconds) {
+        return std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+    };
+    const auto seconds_since = [](std::chrono::steady_clock::time_point since) {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
+    };
+    // The listing hangs: the refresh returns at its deadline instead of waiting for the bucket.
+    remote->set_hold(true);
+    auto started = std::chrono::steady_clock::now();
+    check(reader.refresh_remote(within(200)) == 0, "a refresh against a hung bucket registered something");
+    check(seconds_since(started) < 5.0, "the refresh waited for a listing that never ended");
+    check(reader.stats().remote_download_failures == 0,
+          "running out of time was counted as a bucket failure");
+    remote->set_hold(false);
+    // The listing completes and the manifest read hangs: the refresh and the lookup both return at
+    // their deadline, register nothing and count no failure.
+    remote->on_manifest_get = [&] { remote->set_hold(true); };
+    started = std::chrono::steady_clock::now();
+    check(reader.refresh_remote(within(200)) == 0, "a refresh registered an image whose manifest never came");
+    check(seconds_since(started) < 5.0, "the refresh waited for a manifest past its deadline");
+    remote->set_hold(false);
+    started = std::chrono::steady_clock::now();
+    remote->on_manifest_get = [&] { remote->set_hold(true); };
+    const auto manifest_lookup =
+        reader.lookup_remote(started, within(200), [](const std::string&) { return true; });
+    check(manifest_lookup.registered == 0 && seconds_since(started) < 5.0,
+          "a lookup waited for a manifest past its deadline");
+    remote->on_manifest_get = nullptr;
+    remote->set_hold(false);
+    check(reader.stats().remote_download_failures == 0 && !reader.find("0a").has_value(),
+          "an expired manifest read counted a failure or registered the image");
+    // The manifest arrives and the tombstone check hangs: out of time, the image is not registered
+    // (it may be retired) and not given up on, so the next refresh registers it.
+    remote->on_exists = [&] { remote->set_hold(true); };
+    started = std::chrono::steady_clock::now();
+    check(reader.refresh_remote(within(200)) == 0, "a refresh registered an image whose fence check never came");
+    check(seconds_since(started) < 5.0, "the refresh waited for a tombstone check past its deadline");
+    remote->set_hold(false);
+    started = std::chrono::steady_clock::now();
+    const auto fence_lookup =
+        reader.lookup_remote(started, within(200), [](const std::string&) { return true; });
+    check(fence_lookup.registered == 0 && seconds_since(started) < 5.0,
+          "a lookup waited for a tombstone check past its deadline");
+    remote->on_exists = nullptr;
+    remote->set_hold(false);
+    check(reader.stats().remote_download_failures == 0 && reader.stats().remote_fenced == 0 &&
+              !reader.find("0a").has_value(),
+          "an expired tombstone check counted a failure or fence, or registered the image");
+    check(reader.refresh_remote(within(10'000)) == 1, "the next refresh did not register the image");
+    // A chunk hangs: the load is a miss at its deadline, the image stays offered.
+    remote->set_hold(true);
+    ContextStore::LoadReport report;
+    started = std::chrono::steady_clock::now();
+    const auto missed = reader.load("0a", true, &report, within(200));
+    check(!missed && report.expired && seconds_since(started) < 5.0,
+          "a load did not stop at its deadline with a chunk in flight");
+    check(reader.stats().remote_download_failures == 0 && reader.find("0a").has_value(),
+          "an expired load counted a failure or dropped the image");
+    remote->set_hold(false);
+    const auto loaded = reader.load("0a");
+    check(loaded && *loaded == image, "the image could not be loaded after an expired attempt");
+    // A lookup that is out of time returns what it has.
+    remote->set_hold(true);
+    started = std::chrono::steady_clock::now();
+    const auto lookup = reader.lookup_remote(started, within(200), [](const std::string&) { return true; });
+    check(lookup.registered == 0 && seconds_since(started) < 5.0, "a lookup waited past its deadline");
+    remote->set_hold(false);
+}
+
+// Twelve sessions ("10" to "1b", oldest first) written to the bucket by another engine; returns the
+// size of a manifest there.
+std::uint64_t fill_bucket_with_sessions(const std::shared_ptr<MemoryObjectStore>& remote,
+                                        const fs::path& writer_directory) {
+    ContextStore store(remote_options(writer_directory, remote));
+    for (int index = 0; index < 12; ++index) {
+        const std::string id = std::string("1") + "0123456789abcdef"[index];
+        (void)store.put(describe(id), concat({pseudo_random(30, 10 + index), pseudo_random(300, 40 + index)}),
+                        std::array{ContextStore::Region{30, 300}});
+        remote->clock += 10;
+        check(drained(store), "an upload did not drain");
+    }
+    std::uint64_t manifest_bytes = 0;
+    for (const auto& [key, object] : remote->objects) {
+        if (key.find("manifests/") != std::string::npos) { manifest_bytes = object.first.size(); }
+    }
+    check(manifest_bytes > 0, "no manifest in the bucket");
+    return manifest_bytes;
+}
+
+// A bucket with very many sessions must not grow the directory through manifests alone: the
+// manifests of images the directory holds no chunk of take a quarter of max_bytes, filled with the
+// newest in the bucket. Whether an older manifest stays is known only once it is downloaded (it may
+// hold its chunks on disk), so a refresh that finds the rest again downloads one more and stops.
+void test_remote_only_manifests_are_bounded_by_max_bytes() {
+    TempDirectory writer_directory;
+    TempDirectory reader_directory;
+    auto remote                        = std::make_shared<MemoryObjectStore>();
+    const std::uint64_t manifest_bytes = fill_bucket_with_sessions(remote, writer_directory.path());
+    ContextStore::Options options      = remote_options(reader_directory.path(), remote);
+    options.max_bytes = 4 * (3 * manifest_bytes + manifest_bytes / 2); // the share holds three
+    ContextStore reader(options);
+    check(reader.refresh_remote() == 3 && reader.list().size() == 3,
+          "the remote-only manifests were not limited to their share");
+    for (int index = 9; index < 12; ++index) {
+        check(reader.find(std::string("1") + "0123456789abcdef"[index]).has_value(),
+              "the newest sessions in the bucket were not the ones registered");
+    }
+    check(reader.stats().used_bytes <= options.max_bytes, "manifests alone exceeded max_bytes");
+    // The older sessions are listed again by every refresh. The listing cannot show whether one is
+    // remote-only, so the newest of them is downloaded, found not to fit and dropped; the refresh
+    // then stops, leaving the nine older ones alone: at most one download, not one per session.
+    const int manifest_gets = remote->manifest_gets;
+    check(reader.refresh_remote() == 0 && remote->manifest_gets == manifest_gets + 1 &&
+              reader.list().size() == 3,
+          "a refresh downloaded more than one manifest it would decline");
+    // A newer session takes the room of the oldest one registered.
+    {
+        ContextStore store(remote_options(writer_directory.path(), remote));
+        (void)store.put(describe("1f"), concat({pseudo_random(30, 99), pseudo_random(300, 98)}),
+                        std::array{ContextStore::Region{30, 300}});
+        remote->clock += 10;
+        check(drained(store), "the new session did not upload");
+    }
+    check(reader.refresh_remote() == 1 && reader.list().size() == 3 && reader.find("1f").has_value() &&
+              !reader.find("19").has_value(),
+          "a newer session did not replace the oldest registered one");
+    // A registered session can still be fetched on demand.
+    const auto loaded = reader.load("1f");
+    check(loaded && loaded->size() == 330, "a registered session could not be loaded");
+}
+
+// A lookup may register a manifest while a refresh is between its room check and its insertion
+// (the bucket read in between runs without the locks): the refresh must count it, or the two
+// together pass the share.
+void test_remote_only_share_holds_when_a_lookup_registers_during_a_refresh() {
+    TempDirectory writer_directory;
+    TempDirectory reader_directory;
+    auto remote                        = std::make_shared<MemoryObjectStore>();
+    const std::uint64_t manifest_bytes = fill_bucket_with_sessions(remote, writer_directory.path());
+    ContextStore::Options options      = remote_options(reader_directory.path(), remote);
+    options.max_bytes = 4 * (3 * manifest_bytes + manifest_bytes / 2); // the share holds three
+    ContextStore reader(options);
+    bool lookup_done = false;
+    remote->on_manifest_get = [&] {
+        if (lookup_done) { return; }
+        lookup_done = true; // once: at the refresh's first manifest, register an older session
+        const auto now = std::chrono::steady_clock::now();
+        (void)reader.lookup_remote(now, now + std::chrono::seconds(5),
+                                   [](const std::string& id) { return id == "17"; });
+    };
+    (void)reader.refresh_remote();
+    remote->on_manifest_get = nullptr;
+    check(lookup_done, "the lookup did not run during the refresh");
+    check(reader.list().size() == 3, "the lookup and the refresh together passed the remote-only share");
+    check(reader.stats().used_bytes <= options.max_bytes, "manifests alone exceeded max_bytes");
+    for (int index = 9; index < 12; ++index) {
+        check(reader.find(std::string("1") + "0123456789abcdef"[index]).has_value(),
+              "the newest sessions were not the ones kept");
+    }
+}
+
+// An entry holding the share's room may turn remote-only (here its TTL runs out and it is evicted
+// to the bucket, which changes no counter) while a manifest is on its way: the registration must
+// count the entry as it is when it publishes, or the remote-only manifests pass their cap.
+void test_remote_only_share_holds_when_an_entry_is_evicted_during_a_refresh() {
+    TempDirectory writer_directory;
+    TempDirectory reader_directory;
+    auto remote                        = std::make_shared<MemoryObjectStore>();
+    const std::uint64_t manifest_bytes = fill_bucket_with_sessions(remote, writer_directory.path());
+    ContextStore::Options options      = remote_options(reader_directory.path(), remote);
+    options.max_bytes = 4 * (3 * manifest_bytes + manifest_bytes / 2); // the share holds three
+    options.ttl       = std::chrono::seconds(1000);
+    remote->down      = true; // the first refresh registers nothing
+    ContextStore reader(options);
+    check(drained(reader), "the first refresh did not finish");
+    remote->down = false;
+    // A session older than everything in the bucket, held here with its chunks.
+    remote->clock -= 100'000;
+    (void)reader.put(describe("2a"), concat({pseudo_random(30, 7), pseudo_random(300, 8)}),
+                     std::array{ContextStore::Region{30, 300}});
+    check(drained(reader), "the local session did not upload");
+    remote->clock += 100'000;
+    bool expired = false;
+    remote->on_manifest_get = [&] {
+        if (expired) { return; }
+        expired = true; // once: the local session's TTL runs out and it goes to the bucket
+        remote->clock += 2'000'000;
+        reader.maintain();
+    };
+    (void)reader.refresh_remote();
+    remote->on_manifest_get = nullptr;
+    check(expired, "the session was not evicted during the refresh");
+    int remote_only = 0;
+    for (const auto& info : reader.list()) { remote_only += info.local ? 0 : 1; }
+    check(remote_only <= 3, "an entry evicted during the refresh was not counted against the share");
+    check(reader.stats().used_bytes <= options.max_bytes, "manifests alone exceeded max_bytes");
+}
+
+// Registering manifests adds bytes: with local chunks already filling max_bytes, the total limit
+// must still hold afterwards (the local chunks give way, never the registered image).
+void test_registering_manifests_keeps_the_directory_within_max_bytes() {
+    TempDirectory writer_directory;
+    TempDirectory reader_directory;
+    auto remote                        = std::make_shared<MemoryObjectStore>();
+    const std::uint64_t manifest_bytes = fill_bucket_with_sessions(remote, writer_directory.path());
+    std::uint64_t full                 = 0;
+    {
+        // Three local sessions, no limit: how much they take.
+        ContextStore::Options unlimited = remote_options(reader_directory.path(), remote);
+        remote->down                    = true;
+        ContextStore store(unlimited);
+        for (int index = 0; index < 3; ++index) {
+            (void)store.put(describe(std::string("2") + "abc"[index]),
+                            concat({pseudo_random(30, 70 + index), pseudo_random(300, 80 + index)}),
+                            std::array{ContextStore::Region{30, 300}});
+        }
+        full = store.stats().used_bytes;
+    }
+    // Reopened with a limit the local sessions nearly fill; the bucket is reachable again.
+    ContextStore::Options options = remote_options(reader_directory.path(), remote);
+    options.max_bytes             = full + manifest_bytes / 2;
+    check(options.max_bytes / ContextStore::kRemoteOnlyShareDivisor >= 2 * manifest_bytes,
+          "the test's share is too small to hold two manifests");
+    remote->down = true;
+    ContextStore reader(options);
+    check(drained(reader), "the first refresh did not finish");
+    remote->down = false;
+    check(reader.stats().used_bytes <= options.max_bytes, "the reopened directory started over its limit");
+    (void)reader.refresh_remote();
+    check(reader.stats().used_bytes <= options.max_bytes,
+          "registering manifests took the directory over max_bytes");
+    for (int index = 10; index < 12; ++index) {
+        check(reader.find(std::string("1") + "0123456789abcdef"[index]).has_value(),
+              "a newest session was not registered");
+    }
+}
+
+// Which remote-only manifest goes is decided from the entries as they are when a manifest is
+// registered, not from a picture taken earlier: while the manifest is on its way one entry turns
+// remote-only (its TTL runs out) and another stops being (it is loaded), which leaves the count and
+// the bytes of remote-only manifests unchanged.
+void test_remote_only_drop_follows_entries_swapped_during_registration() {
+    TempDirectory writer_directory;
+    TempDirectory reader_directory;
+    auto remote                        = std::make_shared<MemoryObjectStore>();
+    const std::uint64_t manifest_bytes = fill_bucket_with_sessions(remote, writer_directory.path());
+    ContextStore::Options options      = remote_options(reader_directory.path(), remote);
+    options.max_bytes = 4 * (3 * manifest_bytes + manifest_bytes / 2); // the share holds three
+    options.ttl       = std::chrono::seconds(1000);
+    remote->down      = true;
+    ContextStore reader(options);
+    check(drained(reader), "the first refresh did not finish");
+    remote->down = false;
+    // A session older than everything in the bucket, held here with its chunks.
+    remote->clock -= 100'000;
+    (void)reader.put(describe("2a"), concat({pseudo_random(30, 7), pseudo_random(300, 8)}),
+                     std::array{ContextStore::Region{30, 300}});
+    check(drained(reader), "the local session did not upload");
+    remote->clock += 100'000;
+    check(reader.refresh_remote() == 3, "the three newest sessions were not registered");
+    {
+        ContextStore store(remote_options(writer_directory.path(), remote));
+        (void)store.put(describe("1f"), concat({pseudo_random(30, 99), pseudo_random(300, 98)}),
+                        std::array{ContextStore::Region{30, 300}});
+        remote->clock += 10;
+        check(drained(store), "the new session did not upload");
+    }
+    bool swapped = false;
+    remote->on_manifest_get = [&] {
+        if (swapped) { return; }
+        swapped = true; // once, as the new manifest is read
+        remote->clock += 2'000'000;
+        check(reader.load("19").has_value(), "a registered session could not be loaded");
+        reader.maintain(); // the old local session's TTL has run out: it goes to the bucket
+    };
+    (void)reader.refresh_remote();
+    remote->on_manifest_get = nullptr;
+    check(swapped, "the sessions were not swapped during the refresh");
+    // The oldest remote-only manifest went ("2a"); the two newer ones and the new one stayed.
+    check(reader.find("1f").has_value() && reader.find("1a").has_value() && reader.find("1b").has_value() &&
+              !reader.find("2a").has_value(),
+          "a manifest other than the oldest remote-only one was dropped");
+    const auto loaded = reader.find("19");
+    check(loaded && loaded->local, "the session loaded meanwhile was dropped or lost its chunks");
+    int remote_only = 0;
+    for (const auto& info : reader.list()) { remote_only += info.local ? 0 : 1; }
+    check(remote_only == 3, "the remote-only manifests were not kept to their share");
+    check(reader.stats().used_bytes <= options.max_bytes, "manifests alone exceeded max_bytes");
+}
+
+// A manifest that cannot be written (the directory failed) is not indexed, and the chunk files the
+// directory already holds for it are not counted for an entry that does not exist.
+void test_failed_registration_does_not_keep_chunk_references() {
+    TempDirectory writer_directory;
+    TempDirectory reader_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    (void)fill_bucket_with_sessions(remote, writer_directory.path());
+    ContextStore::Options options = remote_options(reader_directory.path(), remote);
+    options.max_bytes             = 1'000'000;
+    remote->down                  = true;
+    ContextStore reader(options);
+    check(drained(reader), "the first refresh did not finish");
+    remote->down = false;
+    // The chunks of the bucket's sessions are already on disk here, under no manifest.
+    fs::copy(writer_directory.path() / "chunks", reader_directory.path() / "chunks",
+             fs::copy_options::recursive | fs::copy_options::overwrite_existing);
+    // Publishing a manifest fails.
+    fs::remove_all(reader_directory.path() / "manifests");
+    { std::ofstream blocker(reader_directory.path() / "manifests"); }
+    (void)reader.refresh_remote();
+    check(reader.list().empty(), "an image whose manifest could not be written was indexed");
+    check(reader.stats().used_bytes == 0, "a failed registration kept its chunks counted");
+}
+
+// Manifests of images the directory holds a chunk of are not remote-only: they are not counted
+// against the share, so they do not keep out newer ones that are.
+void test_remote_only_share_ignores_manifests_with_local_chunks() {
+    TempDirectory writer_directory;
+    TempDirectory reader_directory;
+    auto remote                        = std::make_shared<MemoryObjectStore>();
+    const std::uint64_t manifest_bytes = fill_bucket_with_sessions(remote, writer_directory.path());
+    ContextStore::Options options      = remote_options(reader_directory.path(), remote);
+    options.max_bytes = 4 * (3 * manifest_bytes + manifest_bytes / 2);
+    // The bucket is out of reach while the store starts, so its first refresh registers nothing.
+    remote->down = true;
+    ContextStore reader(options);
+    check(drained(reader), "the first refresh did not finish");
+    remote->down = false;
+    // Session "1b" is in the bucket; this store holds its chunk under another id.
+    (void)reader.put(describe("2a"), concat({pseudo_random(30, 10 + 11), pseudo_random(300, 40 + 11)}),
+                     std::array{ContextStore::Region{30, 300}});
+    check(drained(reader), "an upload did not drain");
+    check(reader.find("2a").has_value(), "the local session was not kept");
+    // "1b" and "2a" hold local bytes (not counted); the share (three) then holds three more.
+    check(reader.refresh_remote() == 4 && reader.find("1b").has_value() && reader.find("19").has_value() &&
+              reader.find("18").has_value(),
+          "a manifest with a local chunk was counted against the remote-only share");
+}
+
+// The listing shows a manifest's size, not whether its image is remote-only: a new id may reference
+// chunks already on disk (chunks are shared across images). Such an image is registered however old
+// it is while the share is full, by a refresh and by a lookup alike.
+void test_full_share_does_not_decline_images_with_local_chunks() {
+    TempDirectory writer_directory;
+    TempDirectory reader_directory;
+    auto remote                        = std::make_shared<MemoryObjectStore>();
+    const std::uint64_t manifest_bytes = fill_bucket_with_sessions(remote, writer_directory.path());
+    ContextStore::Options options      = remote_options(reader_directory.path(), remote);
+    options.max_bytes = 4 * (3 * manifest_bytes + manifest_bytes / 2); // the share holds three
+    remote->down = true;
+    ContextStore reader(options);
+    check(drained(reader), "the first refresh did not finish");
+    remote->down = false;
+    // This store holds the chunks of "18" and "10" under other ids.
+    (void)reader.put(describe("2a"), concat({pseudo_random(30, 10 + 8), pseudo_random(300, 40 + 8)}),
+                     std::array{ContextStore::Region{30, 300}});
+    (void)reader.put(describe("2b"), concat({pseudo_random(30, 10), pseudo_random(300, 40)}),
+                     std::array{ContextStore::Region{30, 300}});
+    check(drained(reader), "an upload did not drain");
+    // "1b", "1a", "19" fill the share; "18", the next newest, is local-backed, so it is registered,
+    // and the refresh goes on to "17", which is remote-only and does not fit.
+    check(reader.refresh_remote() == 4 && reader.find("18").has_value(),
+          "an older image with a chunk on disk was declined because the share was full");
+    // "10", far older, is local-backed too: a lookup for it registers it.
+    const auto started = std::chrono::steady_clock::now();
+    const auto lookup  = reader.lookup_remote(started, started + std::chrono::seconds(10),
+                                              [](const std::string& id) { return id == "10"; });
+    check(lookup.registered == 1 && reader.find("10").has_value(),
+          "a lookup declined an old image with a chunk on disk while the share was full");
+    check(!reader.find("17").has_value(), "a remote-only image beyond the share was kept");
 }
 
 void test_remote_survives_local_eviction() {
@@ -509,13 +1945,14 @@ void test_remote_survives_local_eviction() {
     (void)store.put(describe("0b"), b, std::array{ContextStore::Region{30, 5000}});
     check(drained(store), "upload b");
     check(!store.list().empty() && store.stats().evicted_for_space >= 1, "the local limit evicted nothing");
-    // 0a was evicted locally; the remote still holds it and a refresh brings it back.
+    // 0a's chunk files went; the remote still holds it, so it is still offered, without a refresh
+    // having to download its manifest again.
+    const auto evicted = store.find("0a");
+    check(evicted && !evicted->local, "an image evicted locally is no longer offered through the remote");
+    check(store.stats().used_bytes <= options.max_bytes, "the eviction freed too little");
     (void)store.refresh_remote();
-    bool found = false;
-    for (const auto& info : store.list()) {
-        if (info.id == "0a") { found = true; }
-    }
-    check(found, "an image evicted locally was not found again through the remote");
+    check(remote->manifest_gets == 0 && store.stats().remote_manifest_downloads == 0,
+          "a refresh downloaded the manifest of an image evicted here");
     const auto back = store.load("0a");
     check(back && *back == a, "an image evicted locally could not be fetched back");
     check(store.stats().remote_downloads > 0, "the evicted image was not fetched from the remote");
@@ -543,6 +1980,9 @@ void test_remote_damage_and_outage_are_misses() {
     check(other.list().size() == 1, "the image was not listed before the damage was found");
     check(!other.load("0a").has_value(), "a damaged remote chunk produced an image");
     check(other.list().empty(), "a damaged remote image is still offered");
+    check(other.stats().remote_download_failures_damaged == 1 &&
+              other.stats().corrupt_remote == 1 && other.stats().remote_download_failures == 1,
+          "a damaged remote chunk was not counted as damaged");
     check(other.refresh_remote() == 0, "a damaged remote image was imported again");
 
     // An unreachable bucket costs the upload, never the local write.
@@ -569,6 +2009,10 @@ void test_remote_refresh_respects_its_deadline() {
     TempDirectory directory;
     TempDirectory other_directory;
     auto remote = std::make_shared<MemoryObjectStore>();
+    // Opened first, so the refresh every store queues at start-up finds the bucket empty and cannot
+    // register the images before the refreshes under test do.
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other), "the start-up refresh did not finish");
     {
         ContextStore store(remote_options(directory.path(), remote));
         (void)store.put(describe("0a"), concat({pseudo_random(30, 1), pseudo_random(3000, 2)}),
@@ -577,7 +2021,6 @@ void test_remote_refresh_respects_its_deadline() {
                         std::array{ContextStore::Region{30, 3000}});
         check(drained(store), "upload before the deadline test");
     }
-    ContextStore other(remote_options(other_directory.path(), remote));
     const auto expired = std::chrono::steady_clock::now() - std::chrono::seconds(1);
     check(other.refresh_remote(expired) == 0 && other.list().empty(),
           "a refresh past its deadline still read manifests");
@@ -756,6 +2199,9 @@ void test_remote_listing_does_not_confirm_chunks() {
     TempDirectory other_directory;
     auto remote = std::make_shared<MemoryObjectStore>();
     const std::vector<std::uint8_t> shared = pseudo_random(3000, 2);
+    // Opened first, so its start-up refresh finds the bucket empty and the one below registers.
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other), "the start-up refresh did not finish");
     {
         ContextStore store(remote_options(directory.path(), remote));
         (void)store.put(describe("0a"), concat({pseudo_random(30, 1), shared}),
@@ -763,7 +2209,6 @@ void test_remote_listing_does_not_confirm_chunks() {
         check(drained(store), "upload before the listing test");
     }
     const std::size_t complete = chunk_objects(*remote);
-    ContextStore other(remote_options(other_directory.path(), remote));
     check(other.refresh_remote() == 1, "the image was not registered from the listing");
     {
         std::scoped_lock lock(remote->mutex);
@@ -782,8 +2227,10 @@ void test_remote_listing_does_not_confirm_chunks() {
           "a write sharing a chunk the bucket lost skipped putting it back");
 }
 
-// An image written, then evicted or replaced before its upload ran, still reaches the bucket whole.
-void test_upload_survives_eviction_and_replacement() {
+// An image replaced before its upload ran reaches the bucket as its latest write. One evicted
+// before its upload ran is given up with its upload: its files must not keep the directory over
+// its limit.
+void test_upload_survives_replacement_but_not_eviction() {
     TempDirectory directory;
     TempDirectory reader_directory;
     auto remote                   = std::make_shared<MemoryObjectStore>();
@@ -802,15 +2249,17 @@ void test_upload_survives_eviction_and_replacement() {
         // A newer write of an image replaces its queued upload.
         remote->clock += 10;
         (void)store.put(describe("0b", 120), a2, std::array{ContextStore::Region{30, 5000}});
+        check(store.stats().used_bytes <= options.max_bytes &&
+                  store.stats().remote_uploads_dropped == 1,
+              "the upload of the evicted image kept its files over the limit");
         remote->set_hold(false);
         check(drained(store), "uploads did not drain");
         check(store.stats().remote_upload_failures == 0, "an upload failed");
     }
     ContextStore reader(remote_options(reader_directory.path(), remote));
     (void)reader.refresh_remote();
-    const auto got_a  = reader.load("0a");
     const auto got_b  = reader.load("0b");
-    check(got_a && *got_a == a, "an image evicted before its upload ran never reached the bucket");
+    check(!reader.find("0a"), "the upload of an image evicted before it ran was not given up");
     check(got_b && *got_b == a2, "the replacing write's image is not what the bucket holds");
 }
 
@@ -1224,6 +2673,123 @@ std::vector<std::uint8_t> peer_image(std::uint32_t seed, std::size_t region = 50
     return concat({pseudo_random(30, seed), pseudo_random(region, seed + 1000), pseudo_random(8, seed)});
 }
 
+// The bytes the directories really occupy: each file is split between the directories linking it.
+std::uint64_t physical_bytes(const std::vector<fs::path>& directories) {
+    std::uint64_t total = 0;
+    for (const fs::path& directory : directories) {
+        for (const char* part : {"chunks", "manifests"}) {
+            for (const auto& item : fs::recursive_directory_iterator(directory / part)) {
+                const std::string extension = item.path().extension().string();
+                if (!item.is_regular_file() || extension == ".used" || extension == ".peer") { continue; }
+                const std::uint64_t links = fs::hard_link_count(item.path());
+                total += (fs::file_size(item.path()) + links - 1) / links;
+            }
+        }
+    }
+    return total;
+}
+
+void test_peer_shared_chunks_are_charged_once_across_engines() {
+    const std::array regions{ContextStore::Region{30, 5000}};
+    constexpr int kImages = 6;
+    const auto id         = [](int i) { return "0" + std::to_string(i); };
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    std::uint64_t logical = 0;
+    std::uint64_t share   = 0;
+    {
+        ContextStore a(peer_options(a_directory.path(), b_directory.path()));
+        ContextStore b(peer_options(b_directory.path(), a_directory.path()));
+        for (int i = 0; i < kImages; ++i) { (void)a.put(describe(id(i)), peer_image(20 + i), regions); }
+        check(b.sync_peers() == kImages, "the peer did not import every image");
+        const auto sa = a.stats();
+        const auto sb = b.stats();
+        logical       = sa.logical_bytes;
+        share         = sa.used_bytes;
+        check(sa.shared_bytes > 0 && sa.logical_bytes == sb.logical_bytes &&
+                  sa.shared_bytes == sb.shared_bytes,
+              "both engines should see the same shared chunk bytes");
+        check(sa.used_bytes < sa.logical_bytes && sb.used_bytes < sb.logical_bytes,
+              "shared chunks were charged in full to both engines");
+        // The two charges add up to the disk (up to one byte of rounding per file).
+        const std::uint64_t physical = physical_bytes({a_directory.path(), b_directory.path()});
+        const std::uint64_t files    = 2 * (chunk_files(a_directory.path()).size() + kImages);
+        check(sa.used_bytes + sb.used_bytes >= physical &&
+                  sa.used_bytes + sb.used_bytes <= physical + files,
+              "the engines' charges do not add up to the physical bytes");
+    }
+    // Without peers nothing changes: the charge is the directory's size.
+    TempDirectory c_directory;
+    {
+        ContextStore c(options_for(c_directory.path()));
+        (void)c.put(describe("0a"), peer_image(30), regions);
+        const auto sc = c.stats();
+        check(sc.used_bytes == sc.logical_bytes && sc.shared_bytes == 0,
+              "a store without peers charged something other than its size");
+    }
+
+    // A cap between the share and the logical size evicts nothing with the peers named...
+    const std::uint64_t cap = (share + logical) / 2;
+    {
+        ContextStore::Options options = peer_options(a_directory.path(), b_directory.path());
+        options.max_bytes             = cap;
+        ContextStore a(options);
+        a.maintain();
+        check(a.list().size() == kImages && a.stats().used_bytes <= cap,
+              "an engine evicted images that fit once the peer's copy is counted");
+    }
+    // ...and the same store without them (a lone engine) does.
+    {
+        ContextStore::Options options = options_for(a_directory.path());
+        options.max_bytes             = cap;
+        ContextStore a(options);
+        a.maintain();
+        check(a.list().size() < kImages && a.stats().used_bytes <= cap,
+              "a lone engine did not evict down to its cap");
+    }
+    // Refill A from B, then cap below the share: eviction stops as soon as the charge fits.
+    {
+        ContextStore a(peer_options(a_directory.path(), b_directory.path()));
+        (void)a.sync_peers();
+        check(a.list().size() == kImages, "the evicted images were not imported back");
+    }
+    const std::uint64_t physical_before = physical_bytes({a_directory.path(), b_directory.path()});
+    const std::uint64_t tight           = share * 2 / 3;
+    ContextStore::Options options       = peer_options(a_directory.path(), b_directory.path());
+    options.max_bytes                   = tight;
+    ContextStore::Stats after;
+    {
+        ContextStore a(options);
+        a.maintain();
+        after = a.stats();
+        check(after.used_bytes <= tight, "eviction stopped above the cap");
+        check(after.used_bytes + share / kImages + kImages > tight && !a.list().empty(),
+              "eviction went further than the cap needed");
+    }
+    // The peer still holds every image: its manifests and chunks are intact, and evicting freed
+    // none of the disk, only A's share of it.
+    ContextStore b(peer_options(b_directory.path(), a_directory.path()));
+    for (int i = 0; i < kImages; ++i) {
+        const auto loaded = b.load(id(i));
+        check(loaded && *loaded == peer_image(20 + i), "an image the peer evicted broke the other engine");
+    }
+    check(b.list().size() == kImages, "the engine that did not evict lost images");
+    check(physical_bytes({a_directory.path(), b_directory.path()}) <= physical_before,
+          "evicting grew the disk");
+    // B now carries what A let go of: its charge rose by the evicted share.
+    const auto sb = b.stats();
+    check(sb.used_bytes + after.used_bytes >= physical_bytes({a_directory.path(), b_directory.path()}),
+          "the charges after an eviction under-count the disk");
+    // Restart with the populated stores: the same figures, read from disk.
+    {
+        ContextStore restarted(options);
+        const auto sr = restarted.stats();
+        check(sr.used_bytes == after.used_bytes && sr.logical_bytes == after.logical_bytes &&
+                  sr.shared_bytes == after.shared_bytes,
+              "a restart changed the store's accounting");
+    }
+}
+
 void test_owner_lock_refuses_a_second_store_on_one_directory() {
     TempDirectory directory;
     {
@@ -1502,7 +3068,7 @@ void test_peer_import_links_compressed_chunks() {
           "the importer did not link the compressed chunk files");
     check(b.load("0a").value_or(std::vector<std::uint8_t>{}) == image,
           "an image of compressed chunks differs after import");
-    check(b.stats().used_bytes == a.stats().used_bytes,
+    check(b.stats().logical_bytes == a.stats().logical_bytes,
           "the importer counts compressed chunks by another size than the peer");
 }
 
@@ -1600,7 +3166,7 @@ void test_peer_fills_an_image_the_remote_registered() {
     check(b->list().size() == 1 && b->list()[0].local, "the linked image does not report itself local");
     check(b->stats().peer_images == 1 && b->stats().peer_bytes_linked == 5000,
           "the fill was not counted as a peer import");
-    check(b->stats().used_bytes == setup.a->stats().used_bytes,
+    check(b->stats().logical_bytes == setup.a->stats().logical_bytes,
           "the filled image is counted by other sizes than the peer's");
     setup.remote->chunk_gets = 0;
     check(b->load("0a").value_or(std::vector<std::uint8_t>{}) == setup.image,
@@ -1759,6 +3325,507 @@ void test_peer_images_are_not_uploaded_by_the_importer() {
     }
 }
 
+// The importer's restart must not turn a peer's image into one it wrote: it is still the peer's
+// to upload, so neither a use nor the flush before the box goes puts it in the bucket.
+void test_peer_images_are_still_the_peers_to_upload_after_a_restart() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    const auto remote = std::make_shared<MemoryObjectStore>();
+    const auto image  = peer_image(14);
+    ContextStore a(options_for(a_directory.path())); // the peer has not uploaded it (yet)
+    (void)a.put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
+    ContextStore::Options options = remote_options(b_directory.path(), remote);
+    options.peers                 = {a_directory.path()};
+    options.peer_poll             = std::chrono::hours(1);
+    {
+        ContextStore b(options);
+        check(b.sync_peers() == 1, "the peer image was not imported");
+    }
+    {
+    ContextStore b(options);
+    check(drained(b), "the restarted importer's queue did not drain");
+    check(b.find("0a").has_value(), "the imported image did not survive the restart");
+    check(b.load("0a").value_or(std::vector<std::uint8_t>{}) == image,
+          "the imported image did not load after the restart");
+    check(drained(b), "the importer's remote queue did not drain");
+    check(b.upload_unpublished("model-a", std::chrono::steady_clock::now() + std::chrono::seconds(10)),
+          "the flush before shutdown did not finish");
+    check(remote->puts == 0 && remote->objects.empty() && b.stats().remote_uploads == 0,
+          "the restarted importer uploaded an image a peer wrote");
+    // Writing the image here makes it this store's own to upload again.
+    (void)b.put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
+    check(drained(b), "the rewrite did not upload");
+    check(remote->puts > 0, "an image written here after a peer's was not uploaded");
+    }
+    {
+        ContextStore again(options);
+        check(drained(again) && again.find("0a").has_value(), "the rewritten image was lost on restart");
+        again.touch("0a");
+        check(drained(again), "the restarted store's queue did not drain");
+    }
+}
+
+// A chunk is blamed on the peer only while the file in the directory is the peer's link: a chunk
+// evicted to the bucket and fetched back, or replaced, is this store's own.
+void test_chunk_provenance_ends_when_the_peer_file_is_replaced() {
+    PeerAndRemote setup;
+    ContextStore::Options options = remote_options(setup.b_directory.path(), setup.remote);
+    options.peers                 = {setup.a_directory.path()};
+    options.peer_poll             = std::chrono::hours(1);
+    options.max_bytes             = 8000; // room for one image
+    ContextStore b(options);
+    (void)b.refresh_remote();
+    check(b.sync_peers() == 1, "the peer's copy of a bucket-registered image was not linked");
+    // Another image makes room: the filled one is evicted to the bucket and fetched back.
+    (void)b.put(describe("0b"), concat({pseudo_random(30, 31), pseudo_random(5000, 32)}),
+                std::array{ContextStore::Region{30, 5000}});
+    check(drained(b), "the second image did not upload");
+    check(!b.find("0a")->local, "the first image was not evicted to the bucket");
+    check(b.load("0a").value_or(std::vector<std::uint8_t>{}) == setup.image,
+          "the evicted image was not fetched back");
+    // The fetched-back files are damaged now; the peer did not supply them.
+    for (const fs::path& file : chunk_files(setup.b_directory.path())) {
+        if (fs::hard_link_count(file) != 1) { continue; }
+        std::fstream stream(file, std::ios::in | std::ios::out | std::ios::binary);
+        char byte = 0;
+        stream.get(byte);
+        stream.seekp(0);
+        stream.put(static_cast<char>(byte ^ 0x5a));
+    }
+    check(b.load("0a").value_or(std::vector<std::uint8_t>{}) == setup.image,
+          "the damaged files were not repaired from the bucket");
+    check(b.stats().corrupt_chunk == 0 && b.stats().remote_downloads > 0, "no damage was found and repaired");
+    // The peer is still polled: nothing it linked is damaged.
+    check(b.erase("0a") && b.erase("0b"), "the images could not be removed");
+    check(b.sync_peers() == 1, "a peer was blamed for a file it did not supply");
+}
+
+// The `.peer` marker is part of the import: an import that cannot record it does not happen, a
+// discarded manifest takes its marker. A marker names the manifest it was written for, so a stale
+// one (an earlier image of the id) changes nothing, and one that cannot be read keeps the image
+// the peer's.
+void test_peer_marker_follows_the_manifest() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    const auto image = peer_image(15);
+    ContextStore a(options_for(a_directory.path()));
+    (void)a.put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
+    ContextStore::Options options = options_for(b_directory.path());
+    options.peers                 = {a_directory.path()};
+    options.peer_poll             = std::chrono::hours(1);
+    const fs::path marker         = b_directory.path() / "manifests" / "0a.peer";
+    {
+        // A marker that cannot be written: the image is not imported as the importer's own.
+        ContextStore b(options);
+        fs::create_directories(marker / "blocker");
+        check(b.sync_peers() == 0 && !b.find("0a").has_value(),
+              "an image was imported without its origin marker");
+        check(!fs::exists(b_directory.path() / "manifests" / "0a.manifest"),
+              "a failed import left a manifest behind");
+        fs::remove_all(marker);
+    }
+    {
+        ContextStore b(options);
+        check(b.sync_peers() == 1 && fs::exists(marker), "the peer image was not imported with a marker");
+    }
+    // The manifest is damaged: it is discarded with its marker.
+    const fs::path manifest = b_directory.path() / "manifests" / "0a.manifest";
+    fs::resize_file(manifest, fs::file_size(manifest) / 2);
+    {
+        ContextStore b(options);
+        check(b.stats().corrupt_manifest == 1, "the damaged manifest was not discarded");
+        check(!fs::exists(marker), "a discarded manifest left its peer marker behind");
+    }
+    // An orphan marker (no manifest) is swept at start-up.
+    { std::ofstream(marker).put('x'); }
+    {
+        ContextStore b(options);
+        check(!fs::exists(marker), "an orphan peer marker was kept");
+    }
+    // Markers beside this store's own images: a stale one (another manifest's checksum) leaves the
+    // image this store's to upload; one that exists but cannot be read withholds the upload.
+    {
+        TempDirectory c_directory;
+        const auto remote             = std::make_shared<MemoryObjectStore>();
+        ContextStore::Options own     = remote_options(c_directory.path(), remote);
+        const std::vector<std::uint8_t> stale(8, 0x42);
+        {
+            ContextStore c(own);
+            (void)c.put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
+            (void)c.put(describe("0b"), peer_image(16), std::array{ContextStore::Region{30, 5000}});
+            // Stopped before the queue runs: the restart decides what is uploaded.
+        }
+        remote->objects.clear();
+        for (const char* id : {"0a", "0b"}) {
+            fs::remove(c_directory.path() / "manifests" / (std::string(id) + ".published"));
+        }
+        { std::ofstream(c_directory.path() / "manifests" / "0a.peer", std::ios::binary).write("BBBBBBBB", 8); }
+        fs::create_directories(c_directory.path() / "manifests" / "0b.peer" / "unreadable");
+        ContextStore c(own);
+        check(c.upload_unpublished("model-a", std::chrono::steady_clock::now() + std::chrono::seconds(10)),
+              "the flush did not finish");
+        check(!fs::exists(c_directory.path() / "manifests" / "0a.peer"), "a stale marker was kept");
+        bool a_uploaded = false;
+        bool b_uploaded = false;
+        for (const auto& object : remote->objects) {
+            a_uploaded = a_uploaded || object.first.find("0a") != std::string::npos;
+            b_uploaded = b_uploaded || object.first.find("0b") != std::string::npos;
+        }
+        check(a_uploaded, "a stale marker withheld an image this store wrote");
+        check(!b_uploaded, "an unreadable marker let a possibly peer-owned image be uploaded");
+    }
+}
+
+// An id imported from a peer and then rewritten by a local put: `put` leaves the old marker in
+// place on purpose (removing it there would be a second, crash-ordered step after the new
+// manifest). The marker names the peer manifest's checksum, and the local manifest carries its own
+// creation time, size and chunk list, so after a restart the stale marker matches nothing: the
+// image is this store's to upload, and the marker is swept.
+void test_local_put_after_peer_import_is_uploaded_after_restart() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    const auto remote = std::make_shared<MemoryObjectStore>();
+    ContextStore a(options_for(a_directory.path()));
+    (void)a.put(describe("0a"), peer_image(15), std::array{ContextStore::Region{30, 5000}});
+    ContextStore::Options options = remote_options(b_directory.path(), remote);
+    options.peers                 = {a_directory.path()};
+    options.peer_poll             = std::chrono::hours(1);
+    const fs::path marker         = b_directory.path() / "manifests" / "0a.peer";
+    const auto uploaded           = [&] {
+        for (const auto& object : remote->objects) {
+            if (object.first.find("0a") != std::string::npos) { return true; }
+        }
+        return false;
+    };
+    {
+        ContextStore b(options);
+        check(b.sync_peers() == 1 && fs::exists(marker), "the peer image was not imported with a marker");
+        remote->clock += 1000;
+        (void)b.put(describe("0a"), peer_image(16), std::array{ContextStore::Region{30, 5000}});
+        check(fs::exists(marker), "the test expects put to leave the marker for the restart to judge");
+        // Stopped before the upload queue runs: the restart decides what is uploaded.
+    }
+    remote->objects.clear();
+    fs::remove(b_directory.path() / "manifests" / "0a.published");
+    {
+        ContextStore b(options);
+        check(!fs::exists(marker), "a marker that matches no manifest survived the restart");
+        check(b.upload_unpublished("model-a", std::chrono::steady_clock::now() + std::chrono::seconds(10)),
+              "the flush did not finish");
+        check(uploaded(), "a locally rewritten image stayed the peer's after a restart");
+    }
+}
+
+// Every byte in the store's directory, as a volume of fixed size sees it.
+std::uint64_t bytes_on_disk(const fs::path& directory) {
+    std::uint64_t total = 0;
+    for (const auto& item : fs::recursive_directory_iterator(directory)) {
+        if (item.is_regular_file()) { total += item.file_size(); }
+    }
+    return total;
+}
+
+// The volume is shared, so the size limit does not keep it from filling: before a put writes new
+// chunks it checks the volume's free space against them plus a reserve, evicts the least recently
+// used images while that falls short, and refuses the put, saying the volume is full, when even
+// that is not enough. Nothing of a refused put remains.
+void test_put_budgets_against_free_disk_space() {
+    TempDirectory directory;
+    ContextStore::Options options = options_for(directory.path());
+    std::int64_t now_ms            = 1'000'000;
+    options.clock                  = [&] { return now_ms; };
+    // A 16 000-byte volume holding nothing but this store; no size limit of the store's own.
+    std::uint64_t volume           = 16'000;
+    options.available_bytes        = [&] {
+        const std::uint64_t used = bytes_on_disk(directory.path());
+        return used < volume ? volume - used : 0;
+    };
+    options.reserve_bytes          = 2000;
+    ContextStore store(options);
+    const auto image = [](std::uint32_t seed) {
+        return concat({pseudo_random(30, seed), pseudo_random(5000, 100 + seed)});
+    };
+    for (std::uint32_t i = 1; i <= 2; ++i) {
+        now_ms += 1000;
+        (void)store.put(describe("a" + std::to_string(i)), image(i),
+                        std::array{ContextStore::Region{30, 5000}});
+    }
+    // Two images take about 10 400 bytes: the third would leave less than the reserve free.
+    now_ms += 1000;
+    const auto put = store.put(describe("a3"), image(3), std::array{ContextStore::Region{30, 5000}});
+    check(put.evicted_images == 1 && !store.find("a1") && store.find("a2") && store.find("a3"),
+          "a put that would fill the volume did not evict the least recently used image first");
+    check(bytes_on_disk(directory.path()) + options.reserve_bytes <= volume,
+          "a put left less than the reserve free on the volume");
+    check(store.load("a3").value_or(std::vector<std::uint8_t>{}) == image(3),
+          "the image written after making room differs");
+
+    // A chunk the put reuses is kept however much is evicted for the new ones.
+    now_ms += 1000;
+    const auto grown = concat({pseudo_random(30, 9), pseudo_random(5000, 102), pseudo_random(3000, 9)});
+    (void)store.put(describe("a4"), grown, std::array{ContextStore::Region{30, 8000}});
+    check(store.load("a4").value_or(std::vector<std::uint8_t>{}) == grown,
+          "an image that reuses chunks of an image evicted for its room lost them");
+
+    // Too large for the volume whatever the store gives up (another engine filled it): refused
+    // at once, with a clear error, and the store keeps what it holds.
+    volume = bytes_on_disk(directory.path()) + 100;
+    const auto before = store.list().size();
+    std::string error;
+    try {
+        (void)store.put(describe("a5"), concat({pseudo_random(30, 5), pseudo_random(20'000, 105)}),
+                        std::array{ContextStore::Region{30, 20'000}});
+    } catch (const std::runtime_error& failure) { error = failure.what(); }
+    check(error.find("volume is full") != std::string::npos && error.find("short") != std::string::npos,
+          "a put that cannot fit on the volume was not refused with a clear error");
+    check(store.list().size() == before && store.stats().put_failures == 1,
+          "a refused put evicted images that could not make enough room, or was not counted");
+    check(!store.find("a5"), "a refused put left its image behind");
+}
+
+// Two engines' stores side by side on one volume, writing at the same moment, when the volume has
+// room for one of the images and the reserve: one put checks and writes while the other waits, so
+// exactly one is refused as "volume is full" and the volume never goes below the reserve.
+void test_sibling_stores_check_the_volume_one_at_a_time() {
+    TempDirectory root;
+    const fs::path first_directory  = root.path() / "context-store";
+    const fs::path second_directory = root.path() / "context-store-1";
+    constexpr std::uint64_t kCapacity = 30'000;
+    constexpr std::uint64_t kReserve  = 2000;
+    const auto volume_free = [&] {
+        std::uint64_t used = 0;
+        for (const fs::path& directory : {first_directory, second_directory}) {
+            std::error_code missing;
+            if (fs::exists(directory, missing)) { used += bytes_on_disk(directory); }
+        }
+        // Asking the volume takes a while, as the window between a check and the write would.
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        return used < kCapacity ? kCapacity - used : 0;
+    };
+    ContextStore::Options first_options = options_for(first_directory);
+    first_options.available_bytes       = volume_free;
+    first_options.reserve_bytes         = kReserve;
+    ContextStore::Options second_options = options_for(second_directory);
+    second_options.available_bytes       = volume_free;
+    second_options.reserve_bytes         = kReserve;
+    ContextStore first(first_options);
+    ContextStore second(second_options);
+    std::atomic<int> ready{0};
+    std::atomic<int> refused{0};
+    std::atomic<int> other_errors{0};
+    const auto write = [&](ContextStore& store, std::uint32_t seed) {
+        const auto image = concat({pseudo_random(30, seed), pseudo_random(20'000, seed + 1)});
+        ++ready;
+        while (ready.load() < 2) { std::this_thread::yield(); }
+        try {
+            (void)store.put(describe("0a"), image, std::array{ContextStore::Region{30, 20'000}});
+        } catch (const std::runtime_error& failure) {
+            if (std::string(failure.what()).find("volume is full") != std::string::npos) {
+                ++refused;
+            } else {
+                ++other_errors;
+            }
+        }
+    };
+    std::thread a([&] { write(first, 1); });
+    std::thread b([&] { write(second, 2); });
+    a.join();
+    b.join();
+    check(refused.load() == 1 && other_errors.load() == 0,
+          "two stores on one volume did not take turns at checking its free space");
+    check(bytes_on_disk(first_directory) + bytes_on_disk(second_directory) + kReserve <= kCapacity,
+          "two stores together left less than the reserve free on their volume");
+    check(first.list().size() + second.list().size() == 1, "not exactly one image was stored");
+}
+
+// A file that cannot be written says why (the OS's reason, such as a full disk).
+void test_write_failure_names_the_cause() {
+    TempDirectory directory;
+    ContextStore store(options_for(directory.path()));
+    const fs::path staging = directory.path() / "tmp";
+    fs::permissions(staging, fs::perms::owner_read | fs::perms::owner_exec);
+    std::string error;
+    try {
+        (void)store.put(describe("ab"), pseudo_random(3000, 1), std::array{ContextStore::Region{0, 3000}});
+    } catch (const std::runtime_error& failure) { error = failure.what(); }
+    fs::permissions(staging, fs::perms::owner_all);
+    if (error.empty()) { return; } // the user can write anywhere (root): nothing to check
+    check(error.find("cannot write") != std::string::npos &&
+              error.find(std::error_code(EACCES, std::generic_category()).message()) != std::string::npos,
+          "a failed write did not say why it failed");
+}
+
+// A request loads an image only the bucket holds while other requests write theirs and the store
+// applies its size limit. Nothing may remove the chunks the load has just fetched before it reads
+// them: that turned good images into "damaged" ones, deleted from the index.
+void test_load_keeps_what_it_fetched_until_it_has_read_it() {
+    TempDirectory directory;
+    TempDirectory other_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    // More chunks than a fetch runs at once: each fetch thread asks for its next chunk after it has
+    // installed the one before, so the hook below always finds installed chunks to act on.
+    const auto image = concat({pseudo_random(30, 1), pseudo_random(24 * 1024, 2)});
+    {
+        ContextStore store(remote_options(directory.path(), remote));
+        (void)store.put(describe("0a"), image, std::array{ContextStore::Region{30, 24 * 1024}});
+        check(drained(store), "upload");
+    }
+    ContextStore::Options options = remote_options(other_directory.path(), remote);
+    options.max_bytes             = 3000; // anything that maintains the store evicts the image
+    ContextStore other(options);
+    check(drained(other) && other.find("0a") && !other.find("0a")->local, "the image was not registered");
+    remote->on_chunk_get = [&] { other.maintain(); };
+    const auto loaded = other.load("0a");
+    remote->on_chunk_get = nullptr;
+    check(loaded && *loaded == image, "chunks fetched for a load were removed before it read them");
+    check(other.stats().corrupt_removed == 0 && other.find("0a"),
+          "a good image was removed as damaged");
+}
+
+// A chunk that vanished between its fetch and the read (not one that reads back wrong) is a miss:
+// the image is not removed as damaged, and the next load fetches it again.
+void test_a_chunk_lost_after_its_fetch_is_a_miss_not_damage() {
+    TempDirectory directory;
+    TempDirectory other_directory;
+    auto remote = std::make_shared<MemoryObjectStore>();
+    const auto image = concat({pseudo_random(30, 1), pseudo_random(24 * 1024, 2)}); // as above
+    {
+        ContextStore store(remote_options(directory.path(), remote));
+        (void)store.put(describe("0a"), image, std::array{ContextStore::Region{30, 24 * 1024}});
+        check(drained(store), "upload");
+    }
+    ContextStore other(remote_options(other_directory.path(), remote));
+    check(drained(other) && other.find("0a"), "the image was not registered");
+    // Something outside the store deletes every chunk file as the next one arrives.
+    remote->on_chunk_get = [&] {
+        for (const auto& file : chunk_files(other_directory.path())) {
+            std::error_code ignored;
+            fs::remove(file, ignored);
+        }
+    };
+    check(!other.load("0a").has_value(), "an image whose chunks were deleted was served");
+    remote->on_chunk_get = nullptr;
+    check(other.stats().corrupt_removed == 0 && other.find("0a"),
+          "an image whose chunks went missing was removed as damaged");
+    check(other.load("0a").value_or(std::vector<std::uint8_t>{}) == image,
+          "the next load did not fetch the missing chunks again");
+}
+
+// Sets the peer's manifests directory's time well into the past, so a listing of it is trusted
+// to stand until the directory changes.
+void age_manifests_directory(const fs::path& store_directory) {
+    const fs::path manifests = store_directory / "manifests";
+    fs::last_write_time(manifests, fs::last_write_time(manifests) - std::chrono::hours(1));
+}
+
+// A peer's manifests directory also holds the images the peer only registered from the bucket,
+// whose chunks it does not hold (thousands, on a busy bucket). They are not imported, so no link
+// is tried and nothing counts as a failure; once the peer has the chunks, the image is imported.
+void test_peer_poll_passes_over_images_the_peer_only_registered() {
+    PeerAndRemote setup; // A wrote 0a and uploaded it
+    TempDirectory c_directory;
+    {
+        // Another engine leaves 0c in the bucket; A registers it by name only.
+        ContextStore c(remote_options(c_directory.path(), setup.remote));
+        (void)c.put(describe("0c"), peer_image(14), std::array{ContextStore::Region{30, 5000}});
+        check(drained(c), "upload of 0c");
+    }
+    check(setup.a->refresh_remote() == 1 && !setup.a->find("0c")->local, "A did not register 0c");
+    TempDirectory b_directory;
+    ContextStore b(peer_options(b_directory.path(), setup.a_directory.path()));
+    check(b.sync_peers() == 1 && b.find("0a") && !b.find("0c"), "B did not import exactly A's own image");
+    check(b.stats().peer_link_failures == 0 && b.stats().peer_skipped == 0,
+          "an image the peer holds no chunks of counted as a failed import");
+    check(setup.a->load("0c").has_value(), "A could not fetch 0c");
+    check(b.sync_peers() == 1 && b.find("0c"), "an image the peer has since fetched was not imported");
+}
+
+// A peer poll that finds the peer's directory and this store unchanged since its last listing
+// does not list the peer again (thousands of manifests every 250 ms). Either changing lists it.
+void test_peer_poll_lists_an_unchanged_peer_once() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    ContextStore a(options_for(a_directory.path()));
+    (void)a.put(describe("0a"), peer_image(15), std::array{ContextStore::Region{30, 5000}});
+    age_manifests_directory(a_directory.path());
+    ContextStore b(peer_options(b_directory.path(), a_directory.path()));
+    check(b.sync_peers() == 1, "the image was not imported");
+    const auto scans = b.stats().peer_scans;
+    check(b.sync_peers() == 0 && b.sync_peers() == 0 && b.stats().peer_scans == scans,
+          "an unchanged peer was listed again");
+    // This store gave the image up: the peer's copy is wanted again.
+    check(b.erase("0a") && b.sync_peers() == 1 && b.stats().peer_scans == scans + 1,
+          "an image erased here was not imported again from an unchanged peer");
+    // The peer wrote another image.
+    (void)a.put(describe("0b"), peer_image(16), std::array{ContextStore::Region{30, 5000}});
+    check(b.sync_peers() == 1 && b.find("0b"), "a new peer image was not imported");
+}
+
+// An image skipped because it does not fit is skipped once: the peer using it (which rewrites
+// only its last-use stamp) does not make it count again.
+void test_peer_fit_skip_is_counted_once_when_only_the_use_changes() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    ContextStore a(options_for(a_directory.path()));
+    (void)a.put(describe("0a"), peer_image(17), std::array{ContextStore::Region{30, 5000}});
+    ContextStore::Options options = peer_options(b_directory.path(), a_directory.path());
+    options.max_bytes             = 3000;
+    ContextStore b(options);
+    check(b.sync_peers() == 0 && b.stats().peer_skipped == 1, "the over-budget image was not skipped");
+    for (int i = 0; i < 3; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        check(a.load("0a").has_value(), "the peer could not use its image");
+        check(b.sync_peers() == 0, "an over-budget image was imported");
+    }
+    check(b.stats().peer_skipped == 1, "a skip was counted again when only the peer's use changed");
+}
+
+// A peer image evicted to the bucket keeps its manifest and use stamp but none of its own chunk
+// files. It is not linked (that could only fail) and is no failure; once the peer has fetched it
+// back, which stamps its use, it is imported.
+void test_peer_image_evicted_to_the_bucket_is_not_attempted() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    auto remote                   = std::make_shared<MemoryObjectStore>();
+    ContextStore::Options options = remote_options(a_directory.path(), remote);
+    options.max_bytes             = 8000; // room for one image
+    ContextStore a(options);
+    check(drained(a), "the start-up refresh did not finish");
+    const auto image = peer_image(18);
+    (void)a.put(describe("0a"), image, std::array{ContextStore::Region{30, 5000}});
+    check(drained(a), "upload of 0a");
+    remote->clock += 10;
+    (void)a.put(describe("0b"), peer_image(19), std::array{ContextStore::Region{30, 5000}});
+    check(drained(a), "upload of 0b");
+    check(a.find("0a") && !a.find("0a")->local, "the peer did not evict 0a to the bucket");
+    ContextStore b(peer_options(b_directory.path(), a_directory.path()));
+    check(b.sync_peers() == 1 && b.find("0b") && !b.find("0a"), "B did not import exactly 0b");
+    check(b.stats().peer_link_failures == 0 && b.stats().peer_skipped == 0,
+          "an image the peer evicted to the bucket was tried or counted as a failure");
+    check(b.sync_peers() == 0 && b.stats().peer_link_failures == 0, "it was tried on the next poll");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    check(a.load("0a").value_or(std::vector<std::uint8_t>{}) == image, "the peer could not fetch 0a back");
+    check(b.sync_peers() == 1 && b.load("0a").value_or(std::vector<std::uint8_t>{}) == image,
+          "an image the peer fetched back was not imported");
+}
+
+// An image skipped because it did not fit is imported once this store has made room, though the
+// peer has not rewritten it.
+void test_peer_image_skipped_for_budget_is_imported_after_room_is_made() {
+    TempDirectory a_directory;
+    TempDirectory b_directory;
+    ContextStore a(options_for(a_directory.path()));
+    (void)a.put(describe("0a"), peer_image(20), std::array{ContextStore::Region{30, 5000}});
+    ContextStore::Options options = peer_options(b_directory.path(), a_directory.path());
+    options.max_bytes             = 8000; // room for one image
+    ContextStore b(options);
+    (void)b.put(describe("0c"), peer_image(21), std::array{ContextStore::Region{30, 5000}});
+    check(b.sync_peers() == 0 && b.stats().peer_skipped == 1, "the image that does not fit was not skipped");
+    check(b.sync_peers() == 0 && b.stats().peer_skipped == 1, "the skip was counted again");
+    check(b.erase("0c") && b.sync_peers() == 1 && b.find("0a"),
+          "an image skipped for budget was not imported after the store made room");
+}
+
 void test_non_positive_peer_poll_is_refused() {
     TempDirectory a_directory;
     TempDirectory b_directory;
@@ -1777,6 +3844,7 @@ void test_non_positive_peer_poll_is_refused() {
 int main() {
     test_owner_lock_refuses_a_second_store_on_one_directory();
     test_peer_import_links_chunks_and_survives_the_owner();
+    test_peer_shared_chunks_are_charged_once_across_engines();
     test_peer_import_survives_restarts_of_either_store();
     test_both_stores_write_the_same_image();
     test_background_poll_imports_without_being_asked();
@@ -1793,12 +3861,28 @@ int main() {
     test_damaged_peer_chunk_falls_back_to_the_remote_once();
     test_damaged_chunk_blames_the_peer_only_when_the_peer_supplied_it();
     test_peer_images_are_not_uploaded_by_the_importer();
+    test_peer_images_are_still_the_peers_to_upload_after_a_restart();
+    test_chunk_provenance_ends_when_the_peer_file_is_replaced();
+    test_peer_marker_follows_the_manifest();
+    test_local_put_after_peer_import_is_uploaded_after_restart();
+    test_peer_poll_passes_over_images_the_peer_only_registered();
+    test_peer_poll_lists_an_unchanged_peer_once();
+    test_peer_fit_skip_is_counted_once_when_only_the_use_changes();
+    test_peer_image_evicted_to_the_bucket_is_not_attempted();
+    test_peer_image_skipped_for_budget_is_imported_after_room_is_made();
+    test_put_budgets_against_free_disk_space();
+    test_write_failure_names_the_cause();
+    test_sibling_stores_check_the_volume_one_at_a_time();
+    test_load_keeps_what_it_fetched_until_it_has_read_it();
+    test_a_chunk_lost_after_its_fetch_is_a_miss_not_damage();
     test_compressed_chunks_round_trip_and_account_for_disk_use();
     test_compressed_chunks_survive_restart_and_either_setting();
     test_compressed_chunk_damage_is_a_miss();
     test_chunks_of_both_forms_share_a_store();
     test_remote_holds_compressed_objects_and_other_forms_interoperate();
     test_hash();
+    test_image_id();
+    test_load_into_a_reused_buffer();
     test_round_trip();
     test_incremental_put_writes_only_new_chunks();
     test_restart_recovers_images();
@@ -1810,6 +3894,19 @@ int main() {
     test_invalid_input_and_failed_put();
     test_remote_upload_and_second_engine();
     test_remote_survives_local_eviction();
+    test_retired_manifests_are_fenced_against_republish();
+    test_repair_does_not_republish_a_retired_manifest();
+    test_touch_does_not_refresh_a_present_retired_manifest();
+    test_queued_upload_of_a_retired_version_is_dropped();
+    test_remote_requests_are_abandoned_at_the_deadline();
+    test_remote_only_manifests_are_bounded_by_max_bytes();
+    test_remote_only_share_holds_when_a_lookup_registers_during_a_refresh();
+    test_remote_only_share_ignores_manifests_with_local_chunks();
+    test_full_share_does_not_decline_images_with_local_chunks();
+    test_registering_manifests_keeps_the_directory_within_max_bytes();
+    test_remote_only_drop_follows_entries_swapped_during_registration();
+    test_remote_only_share_holds_when_an_entry_is_evicted_during_a_refresh();
+    test_failed_registration_does_not_keep_chunk_references();
     test_remote_damage_and_outage_are_misses();
     test_remote_use_restarts_the_remote_age();
     test_remote_refresh_respects_its_deadline();
@@ -1819,7 +3916,9 @@ int main() {
     test_remote_age_restarts_only_on_use();
     test_remote_quarantine_ends_when_the_manifest_is_rewritten();
     test_inline_only_image_is_not_remote_only();
-    test_upload_survives_eviction_and_replacement();
+    test_upload_survives_replacement_but_not_eviction();
+    test_queued_uploads_cannot_hold_the_directory_over_its_limit();
+    test_upload_unpublished_sends_every_image_past_the_queue_limit();
     test_absent_chunks_are_not_reused();
     test_local_corruption_is_repaired_from_the_remote();
     test_corrupt_prefetch_is_dropped();
@@ -1827,6 +3926,24 @@ int main() {
     test_local_ttl_does_not_hide_remote_images();
     test_shutdown_interrupts_a_blocked_transfer();
     test_final_flush_drops_best_effort_tasks();
+    test_superseded_images_leave_the_bucket();
+    test_upload_delay_uploads_a_burst_of_turns_once();
+    test_eviction_waits_for_an_upload_in_flight();
+    test_header_is_stored_as_a_delta();
+    test_regions_are_chunked_from_their_own_start();
+    test_content_cuts_resynchronise_after_an_insertion();
+    test_fetch_bytes_and_lookup_on_demand();
+    test_a_lookup_shares_a_listing_in_progress();
+    test_a_fetch_stops_at_its_deadline();
+    test_listed_manifests_that_cannot_be_read_are_counted();
+    test_checkpoint_visitor_matches_list();
+    test_shared_prefix_outlives_the_conversations_on_it();
+    test_conversation_moves_between_engines_on_a_shared_prefix();
+    test_a_listing_without_the_manifest_withdraws_publication();
+    test_failed_upload_keeps_the_local_copy_and_releases_superseded();
+    test_publication_survives_restart();
+    test_load_reports_its_download();
+    test_fetch_install_failure_is_a_miss();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

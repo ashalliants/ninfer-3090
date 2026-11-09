@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "models/qwen3_5/program/context_work.h"
+#include "runtime/engine/context_cache/recovery_loss.h"
 
 #include <algorithm>
 #include <iterator>
@@ -623,50 +624,10 @@ struct ReleasePlan {
 template <typename Prefix>
 std::uint64_t recovery_loss(const ProgramImpl& program, std::span<const CheckpointHandle> removed,
                             std::span<const CheckpointHandle> surviving, Prefix&& prefix) {
-    std::vector<CheckpointHandle> ordered;
-    for (const auto handle : removed) {
-        if (program.valid_checkpoint(handle) &&
-            std::find(ordered.begin(), ordered.end(), handle) == ordered.end()) {
-            ordered.push_back(handle);
-        }
-    }
-    std::sort(ordered.begin(), ordered.end(), [&](auto left, auto right) {
-        const auto l = program.checkpoint(left).frontier, r = program.checkpoint(right).frontier;
-        return l != r ? l > r : left.index < right.index;
-    });
-
-    struct LineageLoss {
-        CheckpointHandle deepest;
-        std::uint32_t tokens;
-    };
-
-    std::vector<LineageLoss> lineages;
-    for (const auto handle : ordered) {
-        const auto& record     = program.checkpoint(handle);
-        std::uint32_t fallback = 0;
-        for (const auto retained : surviving) {
-            if (!program.valid_checkpoint(retained) ||
-                std::find(ordered.begin(), ordered.end(), retained) != ordered.end()) {
-                continue;
-            }
-            const auto& candidate = program.checkpoint(retained);
-            if (candidate.frontier > fallback && prefix(retained, handle)) {
-                fallback = candidate.frontier;
-            }
-        }
-        const auto lost    = record.frontier - fallback;
-        const auto lineage = std::find_if(lineages.begin(), lineages.end(), [&](const auto& item) {
-            return prefix(handle, item.deepest);
-        });
-        if (lineage == lineages.end()) {
-            lineages.push_back({handle, lost});
-        } else {
-            lineage->tokens = std::max(lineage->tokens, lost);
-        }
-    }
-    std::uint64_t result = 0;
-    for (const auto& lineage : lineages) { result += lineage.tokens; }
-    return result;
+    return runtime::checkpoint_recovery_loss(
+        removed, surviving, [&](auto handle) { return program.valid_checkpoint(handle); },
+        [&](auto handle) { return program.checkpoint(handle).frontier; },
+        std::forward<Prefix>(prefix));
 }
 
 std::uint64_t
@@ -680,7 +641,8 @@ ProgramImpl::checkpoint_recovery_loss(std::span<const CheckpointHandle> removed,
 std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
                                               const PhysicalOwners& owners,
                                               std::span<const CheckpointHandle> excluded,
-                                              runtime::ContextResourceUsage shortage) {
+                                              runtime::ContextResourceUsage shortage,
+                                              std::optional<std::size_t>& placeable) {
     if (shortage.host_bytes ||
         (!shortage.state_slots && !shortage.main_kv_pages && !shortage.backend_kv_pages)) {
         return std::nullopt;
@@ -705,7 +667,11 @@ std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
             plan->state     = StateDemotion{state, program.state_store->content_epoch(state), host,
                                         owners.sources};
             candidate.released.state_slots = 1;
-            candidate.host_bytes = host ? 0 : program.state_images->host_layout().image_bytes;
+            const auto image               = program.state_images->host_layout().image_bytes;
+            candidate.host_bytes           = host ? 0 : image;
+            if (!placeable) { placeable = program.host_placeable_bytes(image); }
+            candidate.host_placeable       = *placeable;
+            candidate.host_unit            = image;
             break;
         }
         if (!plan->state) { return std::nullopt; }
@@ -735,6 +701,11 @@ std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
             if (plan->pages.size() == needed) { break; }
         }
         if (plan->pages.empty()) { return std::nullopt; }
+        // One shortage names one resource, so every group shares this unit and the free runs do not
+        // change while the groups are quoted: the scan of the free extents runs once per reclaim.
+        if (!placeable) { placeable = program.host_placeable_bytes(stride); }
+        candidate.host_placeable = *placeable;
+        candidate.host_unit      = stride;
         (resource == runtime::ContextResourceClass::MainKV ? candidate.released.main_kv_pages
                                                            : candidate.released.backend_kv_pages) =
             static_cast<std::uint32_t>(plan->pages.size());
@@ -801,8 +772,9 @@ ContextReclaimPlan ProgramImpl::plan_reclaim(std::span<const CheckpointHandle> a
     const auto owners =
         physical_owner_sets(*this, result.impl_->facts, allowed, excluded, shortage);
     ReleaseScratch scratch;
+    std::optional<std::size_t> placeable;
     for (const auto& group : owners) {
-        if (auto quote = quote_demotion(*this, group, excluded, shortage)) {
+        if (auto quote = quote_demotion(*this, group, excluded, shortage, placeable)) {
             result.demotions.push_back(std::move(*quote));
         }
         if (auto quote = quote_release(result.impl_, group.sources, scratch)) {
@@ -956,8 +928,8 @@ struct DemotionBatch {
         const auto stride    = resource == runtime::ContextResourceClass::MainKV
                                    ? program.text_host_kv_page_stride
                                    : program.backend_host_kv_page_stride;
-        const auto usage     = program.physical_usage();
-        const auto available = usage.capacity.host_bytes - usage.occupied.host_bytes;
+        // Free bytes in runs shorter than a page cannot take one; the batch stops before them.
+        const auto available = program.host_placeable_bytes(stride);
         auto plan            = std::make_shared<DemotionPlan>();
         plan->owner          = &program;
         plan->resource       = resource;
@@ -981,7 +953,9 @@ struct DemotionBatch {
                   [](auto a, auto b) { return a.index < b.index; });
         plan->allowed.erase(std::unique(plan->allowed.begin(), plan->allowed.end()),
                             plan->allowed.end());
-        result.sources = plan->allowed;
+        result.sources        = plan->allowed;
+        result.host_placeable = available;
+        result.host_unit      = stride;
         (resource == runtime::ContextResourceClass::MainKV ? result.released.main_kv_pages
                                                            : result.released.backend_kv_pages) =
             count;

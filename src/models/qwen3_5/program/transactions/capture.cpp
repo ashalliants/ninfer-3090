@@ -99,6 +99,9 @@ std::optional<CapturePreparation> ProgramImpl::prepare_capture(SequenceHandle ha
     const auto lane = ContractAccess::lane(handle).value;
     auto& request   = requests[lane];
     if (!request.base->capture_backing || !request.permit) { return std::nullopt; }
+    // Past M a lossy request's capture groups describe the uncompacted prompt until the scout
+    // ends; they are replaced then (install_compacted_prompt).
+    if (lane_holds_captures(lane)) { return std::nullopt; }
     if (request.recovery) {
         // Recovery owns enough resources to regain old progress and execute new work.
         // Optional saves cannot add a State/COW requirement to that finite guarantee.
@@ -182,8 +185,11 @@ void ProgramImpl::skip_capture(SequenceHandle handle) {
 
 bool ProgramImpl::capture_is_input(SequenceHandle handle) const {
     if (!valid_sequence(handle)) { throw std::logic_error("capture has a stale lane"); }
-    const auto& request = requests[ContractAccess::lane(handle).value];
-    if (request.next_capture >= request.capture_groups.size()) { return false; }
+    const auto lane     = ContractAccess::lane(handle).value;
+    const auto& request = requests[lane];
+    if (request.next_capture >= request.capture_groups.size() || lane_holds_captures(lane)) {
+        return false;
+    }
     const auto& group = request.capture_groups[request.next_capture];
     return has_role(group, runtime::CheckpointRole::InputReplay) &&
            (request.capture_pending ||
@@ -196,7 +202,8 @@ bool ProgramImpl::start_capture(SequenceHandle handle) {
     const auto lane = ContractAccess::lane(handle).value;
     auto& request   = requests[lane];
     auto& state     = sequences[lane];
-    if (!request.capture_pending || request.next_capture >= request.capture_groups.size()) {
+    if (!request.capture_pending || request.next_capture >= request.capture_groups.size() ||
+        lane_refuses_pause(lane)) {
         return false;
     }
     if (state.state.fork_pending || state.state.read != state.state.write) { return false; }
@@ -316,7 +323,8 @@ void ProgramImpl::publish_capture(ContextTransaction& tx) {
             .frontier          = tx.reuse_frontier,
             .backend_frontier  = tx.backend_frontier,
             .rope_delta        = state.rope_delta,
-            .tail_hidden_valid = true};
+            .tail_hidden_valid = true,
+            .gap_maps          = gap_maps_through(state.gap_maps, tx.reuse_frontier)};
         checkpoints[handle.index].reserved = false;
     }
     if (state_store->residency(*tx.reserved_state) == StateReplicaResidency::None) {

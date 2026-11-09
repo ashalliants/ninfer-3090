@@ -11,7 +11,10 @@
 # a skip. Exit code 0 is not enough: ninfer_multi_gpu_test prints "SKIP: no usable CUDA device"
 # and still exits 0, and ninfer_vocabulary_transcode_test skips only its GPU half. Also check the
 # test's sources for CUDA calls (cuda*, DeviceBuffer, PinnedHostBuffer, kernel launches).
+#
+# A cpu test that links no kernel also belongs on HostOnlyTests.cmake, which CI builds without nvcc.
 set(NINFER_CPU_ONLY_TESTS
+  ninfer_a4_g64_reference_test
   ninfer_anthropic_schema_test
   ninfer_artifact_reader_test
   ninfer_bench_support_test
@@ -20,6 +23,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_cli_options_test
   ninfer_context_cost_measure_test
   ninfer_context_cost_test
+  ninfer_context_store_binding_test
   ninfer_context_store_test
   ninfer_device_sync_invalid_test
   ninfer_effective_thinking_budget_test
@@ -33,6 +37,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_host_cache_test
   ninfer_host_timing_test
   ninfer_http_error_handler_test
+  ninfer_http_residency_routes_test
   ninfer_http_transport_test
   ninfer_jinja_test
   ninfer_json_schema_oracle_test
@@ -53,6 +58,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_prefill_stall_probe_test
   ninfer_prefill_pacing_test
   ninfer_prefill_yield_test
+  ninfer_lossy_prefill_sweep_test
   ninfer_prefill_depth_sweep_test
   ninfer_prefill_time_model_test
   ninfer_pretty_logging_test
@@ -61,13 +67,20 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_qwen3_5_frontend_test
   ninfer_qwen3_5_graft_loader_test
   ninfer_qwen3_5_loading_test
+  ninfer_qwen3_5_lossy_exact_end_test
+  ninfer_qwen3_5_lossy_flow_test
+  ninfer_qwen3_5_lossy_gap_map_test
+  ninfer_qwen3_5_lossy_scout_plan_test
+  ninfer_qwen3_5_lossy_selection_test
   ninfer_qwen3_5_mlp_a8_decode_test
+  ninfer_qwen3_5_scout_a4_wiring_test
   ninfer_qwen3_5_mtp_graph_profiles_test
   ninfer_qwen3_5_ngram_proposer_test
   ninfer_qwen3_5_reasoning_loop_test
   ninfer_qwen3_5_runtime_mechanisms_test
   ninfer_qwen3_5_speculative_round_shapes_test
   ninfer_qwen3_5_state_image_layout_test
+  ninfer_qwen3_5_text_positions_test
   ninfer_qwen3_5_tool_constraints_test
   ninfer_qwen3_5_tool_schema_oracle_test
   ninfer_qwen4_exp_context_cache_test
@@ -77,18 +90,23 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_qwen4_exp_ngram_volume_test
   ninfer_qwen4_exp_rope_positions_test
   ninfer_read_only_file_test
+  ninfer_recovery_loss_test
   ninfer_regex_choice_oracle_test
   ninfer_regex_choice_test
   ninfer_request_log_test
   ninfer_resource_manager_test
   ninfer_route_coverage_test
+  ninfer_router_server_test
   ninfer_s3_object_store_test
   ninfer_sampling_defaults_test
   ninfer_scheduler_test
+  ninfer_shared_prefix_scan_test
   ninfer_model_registry_test
   ninfer_serve_options_test
   ninfer_tensor_test
   ninfer_tool_call_parser_test
+  ninfer_vcc_projector_test
+  ninfer_summary_strategy_test
   ninfer_wide_math_test
   ninfer_worker_recovery_test
 )
@@ -100,9 +118,15 @@ foreach(test IN LISTS NINFER_CPU_ONLY_TESTS)
     message(FATAL_ERROR "NINFER_CPU_ONLY_TESTS names ${test}, which is not a registered test")
   endif()
 endforeach()
+foreach(test IN LISTS NINFER_HOST_ONLY_TESTS)
+  if(NOT test IN_LIST NINFER_CPU_ONLY_TESTS)
+    message(FATAL_ERROR "NINFER_HOST_ONLY_TESTS names ${test}, which is not on the cpu list")
+  endif()
+endforeach()
 
 foreach(test IN LISTS ninfer_all_tests)
-  if(test IN_LIST NINFER_CPU_ONLY_TESTS)
+  # A host-only tree registers every test but builds only its own: only those are cpu there.
+  if(test IN_LIST NINFER_CPU_ONLY_TESTS AND (NOT NINFER_HOST_ONLY OR test IN_LIST NINFER_HOST_ONLY_TESTS))
     set_property(TEST ${test} APPEND PROPERTY LABELS cpu)
     set_property(TEST ${test} APPEND PROPERTY ENVIRONMENT CUDA_VISIBLE_DEVICES=-1)
   else()

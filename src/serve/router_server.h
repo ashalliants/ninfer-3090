@@ -6,7 +6,9 @@
 // /models/sleep, GET /models/sse) and the per-model suspend, resume and residency routes, checks the
 // API key, and forwards every other request to the HTTP server of the model it names. The model
 // comes from the request body's "model" (an id or an alias), or a `model` query parameter; a request
-// that names none goes to the most recently used loaded model. The registry loads or wakes the
+// that names none goes to the most recently used loaded model, except a Responses follow-up
+// (GET/DELETE/cancel/input_items of an id, or previous_response_id), which goes to the model that made
+// the response (ResponseOwners). The registry loads or wakes the
 // model first when autoload allows, making room as its limits require, and a request holds a lease
 // on its model until its response has been delivered, so a model in use is never put to sleep.
 //
@@ -21,10 +23,14 @@
 #include <spdlog/logger.h>
 
 #include <atomic>
+#include <functional>
+#include <list>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 namespace ninfer::serve {
 
@@ -36,6 +42,61 @@ namespace ninfer::serve {
 
 // Whether a Content-Type header value names a JSON media type (the token is case-insensitive).
 [[nodiscard]] bool is_json_content_type(std::string_view content_type);
+
+// Which model owns each stored Responses id. Every model keeps a private Responses store and an id
+// says nothing about where it was made, so the router remembers it from the create reply and sends
+// the follow-ups (GET, DELETE, cancel, input_items, previous_response_id) to that model. Bounded per
+// model, as the stores are: a model keeps at most its own limit of ids (`limit_of`, at least one) and
+// forgets its least recently used first, so one model's creates can never displace another's ids. A
+// forgotten id is routed as before (the model answers not-found if it is not the one that made it).
+// Entries outlive the model's load, as the model's store does.
+class ResponseOwners {
+public:
+    using LimitOf = std::function<std::size_t(const std::string& model)>;
+
+    explicit ResponseOwners(LimitOf limit_of) : limit_of_(std::move(limit_of)) {}
+
+    void record(const std::string& id, const std::string& model);
+    // The owner of `id`, counting the lookup as use.
+    [[nodiscard]] std::optional<std::string> owner(const std::string& id);
+    void forget(const std::string& id);
+    [[nodiscard]] std::size_t size() const;
+
+private:
+    using Recent = std::list<std::string>; // ids of one model, most recently used first
+    struct Entry {
+        std::string model;
+        Recent::iterator position; // in recent_[model]
+    };
+
+    mutable std::mutex mutex_;
+    LimitOf limit_of_;
+    std::unordered_map<std::string, Recent> recent_;
+    std::unordered_map<std::string, Entry> index_;
+};
+
+// Finds the id of the response a Responses create reply makes, in its first bytes: the JSON body's
+// "id", or the first SSE event's response.id. Fed the reply as it arrives, in pieces of any size.
+class ResponseIdScanner {
+public:
+    void feed(std::string_view data);
+    [[nodiscard]] const std::optional<std::string>& id() const noexcept { return id_; }
+    // Whether the reply is an SSE stream that carried a response.failed event (seen so far).
+    [[nodiscard]] bool failed() const noexcept { return failed_; }
+
+private:
+    void note_failure(std::string_view data);
+
+    std::string seen_;
+    std::string tail_;
+    bool failed_ = false;
+    std::size_t resume_ = 0; // where the next search starts
+    std::optional<std::string> id_;
+};
+
+// The response id a Responses follow-up path names (/v1/responses/{id}, .../input_items,
+// .../cancel); nullopt for any other path, including the create-style ones that take no id.
+[[nodiscard]] std::optional<std::string> response_id_from_path(std::string_view path);
 
 class RouterServer {
 public:
@@ -71,13 +132,19 @@ private:
 
     // Relays `method target` with `body` to the server of the model `lease` holds, taking the lease
     // along until the response has been delivered.
+    // `tap`, when given, sees the bytes of a 2xx reply before they are queued for the client.
+    using Tap = std::function<void(std::string_view)>;
+    // `done`, when given, runs once the model's reply has ended, however it ended.
+    using Done = std::function<void()>;
     void relay(const httplib::Request& req, httplib::Response& res, ModelRegistry::Lease lease,
-               const std::string& method, const std::string& target, std::string body);
+               const std::string& method, const std::string& target, std::string body,
+               Tap tap = {}, Done done = {});
 
     ServeOptions options_;
     ModelRegistry& registry_;
     std::shared_ptr<RoutedPorts> ports_;
     std::shared_ptr<spdlog::logger> logger_;
+    ResponseOwners response_owners_;
     httplib::Server server_;
 };
 

@@ -171,6 +171,56 @@ struct ContextStoreWriteEvent {
     std::string error;
 };
 
+// Why a request that waited for a stored session did not resume from it.
+enum class ContextStoreHydrationFailure : std::uint8_t {
+    LoadMiss,          // the store could not read it back: gone, damaged, or the bucket failed
+    Deadline,          // the read (or the download before it) did not finish within the wait
+    HostCapacity,      // the Host tier could not make room for the image
+    HostGeometry,      // room was made, but the image's states found no contiguous Host extents
+    Adopt,             // imported, but the cache could not take ownership of the checkpoints
+    NotCandidate,      // imported, but the cache did not offer it to the request as a source
+    UnusedAtAdmission, // offered, but the request was admitted from something shallower
+    InvalidImage,      // the image does not belong to this model or configuration
+    Exception,         // anything else that failed while importing it
+};
+inline constexpr std::size_t kContextStoreHydrationFailureReasons = 9;
+
+[[nodiscard]] inline constexpr const char*
+context_store_hydration_failure_name(ContextStoreHydrationFailure reason) noexcept {
+    switch (reason) {
+    case ContextStoreHydrationFailure::LoadMiss:
+        return "load_miss";
+    case ContextStoreHydrationFailure::Deadline:
+        return "deadline";
+    case ContextStoreHydrationFailure::HostCapacity:
+        return "host_capacity";
+    case ContextStoreHydrationFailure::HostGeometry:
+        return "host_geometry";
+    case ContextStoreHydrationFailure::Adopt:
+        return "adopt";
+    case ContextStoreHydrationFailure::NotCandidate:
+        return "not_candidate";
+    case ContextStoreHydrationFailure::UnusedAtAdmission:
+        return "unused_at_admission";
+    case ContextStoreHydrationFailure::InvalidImage:
+        return "invalid_image";
+    case ContextStoreHydrationFailure::Exception:
+        return "exception";
+    }
+    return "unknown";
+}
+
+// One failed hydration (a stored session a request waited for and did not resume from), reported
+// from the Engine worker.
+struct ContextStoreHydrationEvent {
+    std::string id;
+    ContextStoreHydrationFailure reason = ContextStoreHydrationFailure::LoadMiss;
+    std::uint64_t bytes                 = 0; // the image's size
+    std::uint64_t fetch_bytes           = 0; // what had to come from the bucket first
+    std::uint32_t frontier              = 0; // the prompt position it would have resumed from
+    double wait_seconds                 = 0.0;
+};
+
 // A durable store for retained sessions, so the context cache survives a restart or a crash.
 // Disabled unless a directory is given; requires the context cache and a nonzero Host context
 // budget. A retained session is written there when it has been idle for `idle_persist` and (all of
@@ -204,6 +254,10 @@ struct ContextStoreOptions {
     std::string remote_prefix;
     // How long shutdown waits for the uploads still queued.
     std::chrono::seconds remote_flush_budget{120};
+    // How long a written session waits before it is uploaded. A conversation is written after every
+    // turn and each write supersedes the last, so a burst of turns within this costs one upload.
+    // A conversation that keeps going is still uploaded this often, and shutdown uploads at once.
+    std::chrono::seconds remote_upload_delay{30};
     // Other engines' store directories on the same volume (read, never written): their sessions
     // are imported by hard link within `peer_poll`, so an engine on another GPU of the same box
     // resumes a conversation this one finished without a bucket round trip. See ContextStore.
@@ -211,6 +265,9 @@ struct ContextStoreOptions {
     std::chrono::milliseconds peer_poll{250};
     // Called on the writer thread after each session is written. Exceptions are ignored.
     std::function<void(const ContextStoreWriteEvent& event)> listener;
+    // Called on the Engine worker for each failed hydration; must return promptly. Exceptions are
+    // ignored.
+    std::function<void(const ContextStoreHydrationEvent& event)> hydration_listener;
 
     [[nodiscard]] bool enabled() const noexcept { return !directory.empty(); }
 };
@@ -256,6 +313,11 @@ struct ContextCacheOptions {
     // refuses an explicit host_capacity_bytes. Engine::options() returns the resolved capacity
     // with this flag cleared.
     bool auto_host_cache = false;
+    // Bytes of host_capacity_bytes that only pause snapshots may use (a pause for memory, or a
+    // prefill yielding to the queue). Cached history never fills them, so a pause finds room
+    // without evicting it. Zero (default): snapshots compete with cached history for the whole
+    // budget. Must be smaller than host_capacity_bytes. Qwen3.5-family models only.
+    std::size_t host_pause_reserve_bytes = 0;
     // Memory left unpinned beneath whatever is available when auto_host_cache sizes the tier.
     std::size_t host_cache_reserve_bytes = kDefaultHostCacheReserveBytes;
     // An upper bound on what auto_host_cache pins, applied after the reserve. Empty: no bound, so a
@@ -268,6 +330,71 @@ struct ContextCacheOptions {
     // cap it does not depend on what happens to be free at startup, so it is the predictable way to
     // share a box. It only lowers the budget: the reserve and the available memory still apply.
     std::optional<std::uint32_t> host_cache_percent;
+};
+
+// How a lossy prefill shortens a long cold prompt (docs/maintainer/lossy-long-prefill.md).
+enum class LossyStrategy : std::uint8_t {
+    // A scout pass scores blocks of the prompt and only the kept blocks are prefilled.
+    Select,
+    // Opt-in alternative: the middle of the conversation is replaced by one deterministic summary
+    // message (the rule-based projector of hermes-vcc-engine) and the result is prefilled as an
+    // ordinary exact prompt. Ignores the selection knobs below.
+    Summary,
+};
+
+// The summary strategy's coldness probe for one long prompt: no private conversation record would
+// serve it (cold: summarised), one would (warm), or the worker did not answer in time (timeout,
+// treated as warm).
+enum class LossySummaryProbe : std::uint8_t { Cold, Warm, Timeout };
+
+// Lossy long-prompt prefill: past a threshold, a cheap scout pass scores blocks of the prompt and
+// only the kept blocks are prefilled (the rest never enter the KV cache). Off by default. The
+// selection defaults (filter layer 7, keep 0.3, block 64) are the fastest point that passed every
+// gate of the 2026-10-25 sweep (docs/maintainer/lossy-long-prefill.md, "Results").
+struct LossyPrefillOptions {
+    // Prompts whose part after the product prompt (the leading System/Developer messages and tools)
+    // has more than this many tokens are filtered. 0 (the default) is off.
+    std::uint32_t min_tokens = 0;
+    // Share of the filtered part's blocks to keep, in (0, 1].
+    float keep_fraction = 0.3F;
+    // Full-attention layer whose scores pick the blocks (checked against the model at startup).
+    std::uint32_t filter_layer = 7;
+    // Block size in tokens: a multiple of 16, at least 16.
+    std::uint32_t block_tokens = 64;
+    // Tokens at the end and at the start of the filtered part that are always kept.
+    std::uint32_t recent_tokens = 4096;
+    std::uint32_t head_tokens   = 256;
+    // Trailing query rows that score the blocks, 1..256.
+    std::uint32_t query_rows = 64;
+    // Score pooling: each token's score becomes the max over a centred window of this many tokens
+    // (odd; clamped at the ends) before blocks are summed, so a block next to a high-scoring token
+    // ranks higher. 1 is no pooling.
+    std::uint32_t pool_window = 33;
+    // Skip rule: when the kept tokens (the forced and always-kept ones, or the keep budget if
+    // larger) would exceed this share of the filtered part, keep everything (an ordinary full
+    // prefill after the scout). In (0, 1], at least keep_fraction.
+    float skip_fraction = 0.8F;
+    // Run the scout GEMMs with int4 activations.
+    bool scout_a4 = false;
+    LossyStrategy strategy = LossyStrategy::Select;
+    // Summary strategy: the summary's budget in tokens, min(0.06 x max_context, this), at least
+    // 1,500.
+    std::uint32_t summary_max_tokens = 8000;
+
+    [[nodiscard]] bool enabled() const noexcept { return min_tokens > 0; }
+};
+
+// Which resident request's prefill takes the next prefill turn.
+enum class PrefillOrder : std::uint8_t {
+    // Prefilling lanes take turns in rotation, one step each.
+    Rotate,
+    // Shortest first, with aging: the lane with the earliest prefill deadline goes first, a
+    // request's deadline being when it was submitted plus what its prefill costs alone (the cost
+    // model's prediction at admission, a lossy prompt's as filtered). A short prompt gets an early
+    // deadline and overtakes a long one; time spent waiting ages a long one, so a prompt submitted
+    // later than a long one's deadline never overtakes it. The long one is never passed over for
+    // good, but it waits for all the work submitted before its deadline, which is not capped.
+    Shortest,
 };
 
 // How a long prefill shares the GPU with lanes that are already generating. Off by default.
@@ -308,6 +435,10 @@ struct PrefillScheduleOptions {
     // while the neighbour lasts. A chunk with media, a DFlash backend or a pipeline split runs
     // whole. 0 or 1 (the default) never slices; at most 16.
     std::uint32_t layer_slices = 0;
+    // Two prefills in rotation on one GPU finish no sooner than one after the other (a prefill
+    // step already uses the whole card), so rotation only delays the first to finish. Shortest
+    // runs them one at a time, shortest deadline first; see PrefillOrder. Rotate by default.
+    PrefillOrder order = PrefillOrder::Rotate;
 };
 
 struct ContextCostOptions {
@@ -492,6 +623,7 @@ struct EngineOptions {
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     PrefillScheduleOptions prefill_schedule;
+    LossyPrefillOptions lossy_prefill;
     // Prompt grafts a request may select by name through PromptOptions::graft. Each is loaded and
     // validated against the resident model at construction.
     std::vector<GraftSource> grafts;
@@ -916,6 +1048,7 @@ enum class RequestErrorKind : std::uint8_t {
     QueueTimeout,
     Cancelled,
     Unavailable,
+    NumericalFailure,
 };
 
 enum class RequestErrorSource : std::uint8_t { OutputConstraint, Tools };
@@ -946,6 +1079,10 @@ struct PromptSummary {
     // Vision work the prompt will cost, for predicting its prefill time while it waits.
     std::uint32_t vision_items   = 0;
     std::uint64_t vision_patches = 0;
+    // The prompt declares tools, but neither a leading system message nor the end of the tool
+    // declarations could be located, so the end of the product prompt is unknown. Lossy prefill
+    // does not take such a prompt (it would otherwise expose the tool schemas to selection).
+    bool product_prompt_unbounded = false;
 };
 
 struct PromptPreparationStats {
@@ -1284,6 +1421,40 @@ struct GenerationAdmissionStats {
     AdmissionFallbackReason fallback_reason = AdmissionFallbackReason::None;
 };
 
+enum class LossyPrefillOutcome : std::uint8_t {
+    Completed, // the selection dropped tokens and the kept ones were prefilled
+    Skipped,   // the selection kept everything: the whole uncached part was prefilled
+    Declined,  // another request held the one scout: prefilled in full, no scout ran
+    Aborted,   // cancelled, or the scout ended for memory pressure, before the outcome
+};
+
+// A request that took the lossy prefill path (docs/maintainer/lossy-long-prefill.md,
+// "Observability"). Token counts are of the uncached part U after the exact prefix.
+struct LossyPrefillReport {
+    LossyPrefillOutcome outcome   = LossyPrefillOutcome::Completed;
+    std::uint32_t uncached_tokens = 0;
+    std::uint32_t kept_tokens     = 0;
+    std::uint32_t filter_layer    = 0;
+    double scout_ms               = 0.0;
+    // Prefill after the selection: the kept tokens (or all of U when nothing was dropped).
+    double main_ms                = 0.0;
+    // The kept offsets of the filtered part as [begin, end) runs, ascending: all of it when
+    // skipped, none when declined or aborted. Serve logs them only under
+    // --request-log-lossy-detail (the int4 scout's kept-block overlap gate reads them).
+    std::vector<std::array<std::uint32_t, 2>> kept_runs;
+    // Summary strategy: the token counts are of the whole prompt (uncached_tokens the client's
+    // rendered prompt, kept_tokens the prompt as prefilled), filter_layer and the times are 0,
+    // `summarized_messages` is the newest summarised range [first, last) in the client's message
+    // indices, and `summary_reused` says a recorded summary was substituted (a later turn of a
+    // summarised conversation) rather than written by this request. A long prompt the probe found
+    // warm (or that timed out), and so left whole, is reported as skipped with both counts the
+    // prompt's length. `summary_probe` is the probe's answer, unset when the prompt was not probed.
+    LossyStrategy strategy = LossyStrategy::Select;
+    std::optional<std::array<std::uint32_t, 2>> summarized_messages;
+    bool summary_reused = false;
+    std::optional<LossySummaryProbe> summary_probe;
+};
+
 struct GenerationResult {
     // Unique within this Engine instance; diagnostic correlation only.
     std::uint64_t engine_request_id = 0;
@@ -1308,6 +1479,9 @@ struct GenerationResult {
     SpeculativeStats speculative;
     ThinkingBudgetStats thinking;
     std::optional<ConstraintObservation> constraint;
+    // Set when the request took the lossy prefill path. prompt_tokens and reused_prompt_tokens
+    // keep counting the client's prompt; the kept count is only here.
+    std::optional<LossyPrefillReport> lossy_prefill;
 };
 
 enum class ModelResidency : std::uint8_t {
@@ -1513,6 +1687,25 @@ struct RuntimeStats {
     // (PrefillScheduleOptions::layer_slices): each boundary is a point where a neighbour decoded.
     std::uint64_t sliced_prefill_steps              = 0;
     std::uint64_t prefill_slice_boundaries          = 0;
+    // Lossy long-prompt prefill (LossyPrefillOptions), one outcome per request that took the path:
+    // its selection dropped tokens and the kept ones were prefilled (completed); the selection
+    // kept everything, or the request found the one scout taken and prefilled in full (skipped);
+    // it was cancelled, or its scout was ended for memory pressure, before that (aborted). Also
+    // the prompt tokens the scouts scored, the tokens their selections kept, and follow-up prompts
+    // rewritten onto a selected lineage (alias hits).
+    std::uint64_t lossy_prefills_completed          = 0;
+    std::uint64_t lossy_prefills_skipped            = 0;
+    std::uint64_t lossy_prefills_aborted            = 0;
+    std::uint64_t lossy_prefill_scouted_tokens      = 0;
+    std::uint64_t lossy_prefill_kept_tokens         = 0;
+    std::uint64_t lossy_prefill_alias_hits          = 0;
+    // Summary strategy: admitted prompts whose middle this request summarised (new), and ones
+    // that substituted a recorded summary (reused, a later turn of a summarised conversation).
+    std::uint64_t lossy_prefill_summaries_new    = 0;
+    std::uint64_t lossy_prefill_summaries_reused = 0;
+    // Summary-strategy coldness probes the worker did not answer in time (the prompt was then
+    // treated as warm and not summarised).
+    std::uint64_t lossy_prefill_summary_probe_timeouts = 0;
 
     std::uint64_t root_selections               = 0;
     std::uint64_t checkpoint_selections         = 0;
@@ -1569,6 +1762,8 @@ struct RuntimeStats {
     std::size_t host_context_free_extents          = 0;
     std::uint64_t host_context_geometry_failures   = 0;
     std::uint64_t host_context_shortage_failures   = 0;
+    // Bytes in the pause snapshot reserve now (--host-pause-reserve-mib), a subset of occupied.
+    std::size_t host_pause_reserve_occupied_bytes = 0;
     double actual_context_transfer_seconds       = 0.0;
     // Host-side failures the worker survived by failing the in-flight requests and clearing the
     // context cache instead of latching the Engine unavailable.
@@ -1576,7 +1771,9 @@ struct RuntimeStats {
 
     // The durable context store (zero throughout when it is disabled).
     std::uint64_t context_store_images         = 0;
-    std::uint64_t context_store_used_bytes     = 0;
+    std::uint64_t context_store_used_bytes     = 0; // what the cap is enforced against
+    std::uint64_t context_store_logical_bytes  = 0; // directory size, hard-linked peer chunks in full
+    std::uint64_t context_store_shared_bytes   = 0; // chunks also linked from a peer's directory
     std::uint64_t context_store_writes         = 0; // sessions written
     std::uint64_t context_store_write_failures = 0;
     std::uint64_t context_store_dropped        = 0; // sessions not written: write queue full
@@ -1585,6 +1782,13 @@ struct RuntimeStats {
     std::uint64_t context_store_bytes_reused   = 0; // chunk bytes already held, not rewritten
     std::uint64_t context_store_evicted        = 0; // removed for space, age or supersession
     std::uint64_t context_store_corrupt        = 0; // removed because they could not be read
+    // context_store_corrupt by what was found: a chunk missing at start-up, a manifest that does
+    // not parse or describe its image, a chunk whose bytes do not match (no bucket to repair it),
+    // or the bucket's copy missing or damaged too.
+    std::uint64_t context_store_corrupt_startup  = 0;
+    std::uint64_t context_store_corrupt_manifest = 0;
+    std::uint64_t context_store_corrupt_chunk    = 0;
+    std::uint64_t context_store_corrupt_remote   = 0;
     std::uint64_t context_store_restored       = 0; // sessions restored into the cache at start-up
     std::uint64_t context_store_restored_bytes = 0;
     // Sessions found at start-up that were written under another model, configuration (KV,
@@ -1597,10 +1801,25 @@ struct RuntimeStats {
     std::uint64_t context_store_hydrations         = 0;
     std::uint64_t context_store_hydrated_tokens    = 0;
     std::uint64_t context_store_hydration_failures = 0;
+    // context_store_hydration_failures by reason, indexed by ContextStoreHydrationFailure.
+    std::array<std::uint64_t, kContextStoreHydrationFailureReasons>
+        context_store_hydration_failures_by_reason{};
     double context_store_hydration_seconds         = 0.0;
+    // With a bucket: lookups of the bucket for a request that found nothing stored (and the time
+    // requests spent waiting for them), those after which the store held a session ending on the
+    // request's prompt, and the rate the store assumes for fetching missing chunks (downloaded,
+    // verified and installed: the wait a fetch adds to a request).
+    std::uint64_t context_store_lookups                = 0;
+    std::uint64_t context_store_lookup_hits            = 0;
+    double context_store_lookup_seconds                = 0.0;
+    double context_store_remote_fetch_bytes_per_second = 0.0;
     // The rate the cost model currently assumes for reading a stored image back into the Host tier
     // (store read and import), learned from the reads observed so far; prices every hydration.
     double context_store_read_bytes_per_second = 0.0;
+    // Idle writes: retained continuations queued for the store once unused for
+    // ContextStoreOptions::idle_persist, and the Engine worker time spent copying their images out.
+    std::uint64_t context_store_idle_writes            = 0;
+    double context_store_idle_export_seconds           = 0.0;
     // Write-on-evict: continuations the cache was about to lose that were queued for the store
     // first, and the Engine worker time spent copying their images out.
     std::uint64_t context_store_eviction_writes        = 0;
@@ -1617,6 +1836,24 @@ struct RuntimeStats {
     std::uint64_t context_store_remote_downloads         = 0;
     std::uint64_t context_store_remote_download_bytes    = 0;
     std::uint64_t context_store_remote_download_failures = 0;
+    // context_store_remote_download_failures by cause: a transfer that failed, an object the
+    // bucket did not have, one whose bytes did not match, a chunk that could not be installed in
+    // the directory, or a listing (or the manifest reads of one) that failed.
+    std::uint64_t context_store_remote_download_failures_transfer = 0;
+    std::uint64_t context_store_remote_download_failures_missing  = 0;
+    std::uint64_t context_store_remote_download_failures_damaged  = 0;
+    std::uint64_t context_store_remote_download_failures_install  = 0;
+    std::uint64_t context_store_remote_download_failures_listing  = 0;
+    // Manifests a bucket refresh downloaded (not in remote_downloads), superseded sessions deleted
+    // from the bucket, queued uploads a newer write of the conversation made unnecessary, and queued
+    // uploads given up so their chunk files could leave a full directory.
+    std::uint64_t context_store_remote_manifest_downloads      = 0;
+    std::uint64_t context_store_remote_manifest_download_bytes = 0;
+    std::uint64_t context_store_remote_retired                 = 0;
+    std::uint64_t context_store_remote_uploads_skipped         = 0;
+    std::uint64_t context_store_remote_uploads_dropped         = 0;
+    // Remote-only manifests given up to keep them within their share of the directory's budget.
+    std::uint64_t context_store_remote_only_dropped            = 0;
     // With peers: images imported from another engine's directory, the chunk bytes hard-linked
     // (not copied), images skipped, and links that failed.
     std::uint64_t context_store_peer_images        = 0;
@@ -1655,6 +1892,8 @@ struct ContextCostSummary {
 struct LoadSummary {
     std::string architecture;
     std::string model_name;
+    // The artifact's id (artifact::artifact_id_hex): the same for every copy of one conversion.
+    std::string artifact_id;
     std::string cuda_sync_mode;
     std::vector<std::string> weight_formats;
     std::string prefill_signature;

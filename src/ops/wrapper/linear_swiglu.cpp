@@ -2,10 +2,12 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/q4_a4_linear.h"
 #include "ninfer/ops/silu_mul.h"
 
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/q4/q4_scout_a4.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
@@ -36,9 +38,21 @@ void validate_policy(LinearPolicy policy) {
     // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
     // one engine-wide setting does not have to be threaded per Op.
     case LinearPolicy::AllowPrefillCublas:
+    // The scout's int4 route: AllowA8Int, with int4 activations wherever the q4a8 route would run.
+    case LinearPolicy::ScoutA4Int:
         return;
     }
     throw std::invalid_argument("linear_swiglu: invalid compute policy");
+}
+
+// The scout's int4 route stages the A4 activation planes and the whole gate/up plane, which a
+// separate SwiGLU then reads; the q4a8 route fuses SwiGLU and writes only half the rows.
+std::size_t scout_a4_swiglu_workspace_bytes(std::int32_t gate_up_rows, std::int32_t input_rows,
+                                            std::int32_t tokens) {
+    WorkspaceLayoutBuilder layout;
+    detail::scout_a4_activation_layout(layout, input_rows, tokens);
+    (void)layout.alloc(DType::BF16, {gate_up_rows, tokens});
+    return layout.peak_bytes(1);
 }
 
 } // namespace
@@ -72,6 +86,18 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
             gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens, max_tokens);
         const bool integer_a8 = allows_a8_int(policy);
         if (!integer_a8 || gate_up_rows != 34816 || input_rows != 5120) { return a16; }
+        // The int4 route takes exactly the widths the q4a8 route would; the rest are AllowA8Int's.
+        if (allows_scout_a4(policy)) {
+            const std::size_t integer = linear_swiglu_workspace_capacity_bytes(
+                qtype, gate_up_rows, input_rows, LinearPolicy::AllowA8Int, min_tokens, max_tokens);
+            if (min_tokens == max_tokens) {
+                return detail::q4a8_tokens_supported(min_tokens)
+                           ? scout_a4_swiglu_workspace_bytes(gate_up_rows, input_rows, min_tokens)
+                           : integer;
+            }
+            return std::max(integer,
+                            scout_a4_swiglu_workspace_bytes(gate_up_rows, input_rows, max_tokens));
+        }
         // The cuBLAS route holds a materialised int8 weight and an int32 output tile, so it is far
         // and away the widest claimant wherever it is admitted. Any interval reaching its width
         // gate has to reserve for it, because the resolver will pick it at that T.
@@ -204,6 +230,18 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     }
 
     const bool integer_a8 = allows_a8_int(policy);
+    // The lossy scout's int4 route (LinearPolicy::ScoutA4Int), at the widths the q4a8 route
+    // serves: one int4 GEMM over all gate/up rows, then SwiGLU over its two halves.
+    if (allows_scout_a4(policy) && q4_weight && detail::q4a8_swiglu_supported(gate_up_weight, t)) {
+        auto scope        = ws.scope();
+        const auto codes  = detail::scout_a4_quantize(x, ws, stream);
+        Tensor gate_up    = ws.alloc(DType::BF16, {gate_up_weight.n, t});
+        q4_a4_linear(codes.codes, codes.scales, gate_up_weight, gate_up, stream);
+        const Tensor gate = gate_up.slice(0, 0, out.ne[0]);
+        const Tensor up   = gate_up.slice(0, out.ne[0], out.ne[0]);
+        silu_mul(gate, up, out, stream);
+        return;
+    }
     if (integer_a8 && q4_weight && detail::q4a8_swiglu_supported(gate_up_weight, t)) {
         detail::q4a8_swiglu_launch(x, gate_up_weight, out, ws, stream);
         return;

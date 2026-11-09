@@ -1,10 +1,12 @@
 #include "core/host_context_arena.h"
+#include "runtime/contract/host_placement.h"
 
 #include <cuda_runtime_api.h>
 
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -91,6 +93,54 @@ void test_fragmentation_and_split() {
            "Host zero has no backing or allocations");
 }
 
+// The runs host_runs_after_release() predicts for a release, built the way
+// ProgramImpl::host_free_runs_after_release() builds them (free_extents(), offset_of(), the
+// allocation's rounded bytes), must be the runs the arena has once the release really happens.
+void test_predicted_runs_match_real_release() {
+    using ninfer::runtime::HostFreeRuns;
+    using ninfer::runtime::HostRun;
+    constexpr std::size_t unit = ninfer::HostContextArena::alignment;
+    ninfer::HostContextArena arena(10 * unit, unit);
+    // An unaligned request (a state image) rounds up; a larger block is split into pages, as the
+    // KV extents are, and neighbours are released together with a block that is not adjacent.
+    auto image = arena.allocate(unit + 1);
+    auto block = arena.allocate(4 * unit);
+    auto other = arena.allocate(unit);
+    auto tail  = arena.allocate(2 * unit);
+    expect(image && block && other && tail, "the arena fixture places every allocation");
+    image->publish();
+    block->publish();
+    other->publish();
+    tail->publish();
+    auto split = arena.split(std::move(*block), 3 * unit);
+    std::vector<ninfer::HostContextAllocation> pieces;
+    pieces.push_back(std::move(split.first));
+    pieces.push_back(std::move(split.second));
+
+    HostFreeRuns before;
+    before.general_capacity = arena.general_capacity_bytes();
+    before.occupied         = arena.occupied_bytes();
+    for (const auto& extent : arena.free_extents()) {
+        before.runs.push_back({extent.offset, extent.bytes});
+    }
+    // Release the image, both split pieces (which touch the image) and the tail: the pieces and
+    // the image must merge into one run, the tail into the free run beyond it.
+    std::vector<HostRun> freed;
+    for (auto* allocation : {&*image, &pieces[0], &pieces[1], &*tail}) {
+        freed.push_back({arena.offset_of(allocation->data()), allocation->bytes()});
+    }
+    const auto predicted = ninfer::runtime::host_runs_after_release(before, freed);
+    (void)image->release();
+    (void)pieces[0].release();
+    (void)pieces[1].release();
+    (void)tail->release();
+    std::vector<HostRun> actual;
+    for (const auto& extent : arena.free_extents()) { actual.push_back({extent.offset, extent.bytes}); }
+    expect(predicted.runs == actual && predicted.occupied == arena.occupied_bytes(),
+           "predicted free runs equal the arena's runs after the real release");
+    expect(freed[0].bytes == 2 * unit, "an unaligned image is charged its rounded bytes");
+}
+
 void test_failures_are_counted_by_cause() {
     constexpr std::size_t unit = ninfer::HostContextArena::alignment;
     ninfer::HostContextArena arena(4 * unit, unit);
@@ -120,6 +170,124 @@ void test_failures_are_counted_by_cause() {
            "a successful allocation changes no counter");
 }
 
+// A placement that tries smaller sizes after a miss (reserve_in_chunks) counts one failure for the
+// whole placement, and none when it succeeds in pieces (#332: every probe used to count).
+void test_placement_scope_counts_once() {
+    constexpr std::size_t unit = ninfer::HostContextArena::alignment;
+    ninfer::HostContextArena arena(4 * unit, unit);
+    auto first  = arena.allocate(unit);
+    auto second = arena.allocate(unit);
+    auto third  = arena.allocate(unit);
+    auto fourth = arena.allocate(unit);
+    (void)first->release();
+    (void)third->release();
+    std::optional<ninfer::HostContextAllocation> a, b;
+    {
+        ninfer::HostContextArena::PlacementScope placement(arena);
+        expect(!arena.allocate(2 * unit), "two separated free units cannot hold two units");
+        a = arena.allocate(unit);
+        b = arena.allocate(unit);
+        expect(a && b, "the placement fits once split into single units");
+    }
+    expect(arena.geometry_failures() == 0 && arena.shortage_failures() == 0,
+           "a placement made in pieces counts no failure for the sizes it tried");
+    {
+        ninfer::HostContextArena::PlacementScope placement(arena);
+        placement.failed();
+    }
+    expect(arena.geometry_failures() == 0 && arena.shortage_failures() == 0,
+           "a placement that failed without an arena miss counts nothing");
+    {
+        ninfer::HostContextArena::PlacementScope placement(arena);
+        expect(!arena.allocate(2 * unit) && !arena.allocate(unit), "a full arena holds nothing");
+        placement.failed();
+    }
+    expect(arena.shortage_failures() == 1 && arena.geometry_failures() == 0,
+           "a placement that cannot be made counts one failure, by its last miss");
+    expect(!arena.allocate(unit) && arena.shortage_failures() == 2,
+           "outside a placement every miss counts again");
+}
+
+// --host-pause-reserve-mib: a byte budget only pause snapshots may go past (#332).
+void test_snapshot_reserve() {
+    constexpr std::size_t unit = ninfer::HostContextArena::alignment;
+    ninfer::HostContextArena arena(4 * unit, unit);
+    arena.reserve_for_snapshots(unit + 1); // rounds up to two units
+    expect(arena.snapshot_reserve_bytes() == 2 * unit && arena.general_capacity_bytes() == 2 * unit,
+           "the reserve is whole alignment units taken from the general budget");
+    auto a = arena.allocate(unit);
+    auto b = arena.allocate(unit);
+    expect(a && b && !arena.allocate(unit) && !arena.can_allocate(unit),
+           "cached history cannot allocate past its budget into the reserve");
+    expect(arena.shortage_failures() == 1 && arena.geometry_failures() == 0,
+           "a full general budget is a shortage, whatever the reserve holds");
+    std::optional<ninfer::HostContextAllocation> kept;
+    {
+        ninfer::HostContextArena::SnapshotScope snapshot(arena);
+        expect(arena.can_allocate(2 * unit) && arena.placeable_bytes(unit) == 2 * unit,
+               "a snapshot sees the reserve");
+        kept = arena.allocate(unit);
+        expect(kept && arena.occupied_bytes() == 3 * unit &&
+                   arena.general_occupied_bytes() == 2 * unit,
+               "a snapshot past the budget is counted in the reserve, not against the budget");
+    }
+    (void)a->release();
+    expect(arena.occupied_bytes() == 2 * unit && arena.general_occupied_bytes() == 2 * unit &&
+               !arena.allocate(unit),
+           "a snapshot's copy left behind counts against the budget like cached history");
+    (void)kept->release();
+    expect(arena.allocate(unit).has_value(),
+           "evicting the left-behind copy returns the room to the budget");
+    expect(arena.placeable_bytes(3 * unit) == 0 && arena.placeable_bytes(2 * unit) == 2 * unit,
+           "a free run holds only whole units");
+    bool twice = false;
+    try {
+        arena.reserve_for_snapshots(unit);
+    } catch (const std::logic_error&) { twice = true; }
+    expect(twice, "the reserve is set once, before any allocation");
+    bool whole = false;
+    try {
+        ninfer::HostContextArena other(4 * unit, unit);
+        other.reserve_for_snapshots(4 * unit);
+    } catch (const std::invalid_argument&) { whole = true; }
+    expect(whole, "a reserve cannot take the whole backing");
+}
+
+// A placement's failure is classified by its last miss as it was when it missed, and a miss that a
+// later allocation got past does not count when the placement then fails for another reason.
+void test_placement_scope_classifies_at_the_miss() {
+    constexpr std::size_t unit = ninfer::HostContextArena::alignment;
+    ninfer::HostContextArena arena(4 * unit, unit);
+    auto first  = arena.allocate(unit);
+    auto second = arena.allocate(unit);
+    auto third  = arena.allocate(unit);
+    auto fourth = arena.allocate(unit);
+    (void)first->release();
+    (void)third->release();
+    {
+        ninfer::HostContextArena::PlacementScope placement(arena);
+        expect(!arena.allocate(2 * unit), "two separated free units cannot hold two units");
+        auto piece = arena.allocate(unit);
+        expect(piece.has_value(), "a single unit fits");
+        placement.failed();
+    }
+    expect(arena.geometry_failures() == 0 && arena.shortage_failures() == 0,
+           "a miss a smaller run got past is not why the placement failed");
+    {
+        ninfer::HostContextArena::PlacementScope placement(arena);
+        expect(!arena.allocate(2 * unit), "the layout miss is recorded");
+        auto a = arena.allocate(unit);
+        auto b = arena.allocate(unit);
+        expect(a && b, "both free units fit");
+        expect(!arena.allocate(2 * unit), "a full arena misses again");
+        (void)a->release();
+        (void)b->release();
+        placement.failed();
+    }
+    expect(arena.shortage_failures() == 1 && arena.geometry_failures() == 0,
+           "the failure is classified against the bytes free when it missed, not when counted");
+}
+
 } // namespace
 
 int main() {
@@ -133,7 +301,11 @@ int main() {
     try {
         test_reserve_publish_and_rollback();
         test_fragmentation_and_split();
+        test_predicted_runs_match_real_release();
         test_failures_are_counted_by_cause();
+        test_placement_scope_counts_once();
+        test_snapshot_reserve();
+        test_placement_scope_classifies_at_the_miss();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

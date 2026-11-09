@@ -1,0 +1,42 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "deploy it"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "d1",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"make deploy\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "d1",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"permission denied: /srv\", \"exit_code\": 2, \"error\": null}"
+    }
+   ]
+  }
+ ],
+ "cases": [
+  {
+   "id": "b4000",
+   "first": 0,
+   "last": 3,
+   "budget_chars": 4000
+  }
+ ]
+}
