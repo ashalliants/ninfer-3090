@@ -234,7 +234,8 @@ def test_config_json_matches_the_preset():
 
 def test_recipes_still_exist_in_the_converter():
     # The recipes here mirror tools/convert/official_recipes.py. A rename there should fail loudly.
-    source = open(os.path.join(HERE, "convert", "official_recipes.py"), encoding="utf-8").read()
+    with open(os.path.join(HERE, "convert", "official_recipes.py"), encoding="utf-8") as handle:
+        source = handle.read()
     for name in m.RECIPES:
         check(re.search(rf"^def {name}\(", source, re.MULTILINE), f"{name} is gone from official_recipes.py")
 

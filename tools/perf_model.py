@@ -6,6 +6,7 @@ a model's shape and the recipe that quantises it. Pure Python standard library: 
 torch, no artifact file.
 
     python tools/perf_model.py --model 27b --recipe qwen3_8_27b --depth 0 --depth 32768
+    python tools/perf_model.py --model 27b --recipe qwen3_8_27b --levers
     python tools/perf_model.py --model 35b-a3b --recipe qwen3_6_35b_a3b --spec-k 3 --acceptance 0.6
     python tools/perf_model.py --model 27b --recipe qwen3_8_27b --format output_head=q4
     python tools/perf_model.py --config /path/to/config.json --recipe qwen3_8_27b --tok-s 49.0
@@ -35,6 +36,12 @@ as the gap between this model and a measurement. That gap is the point: pass `--
 prints it in milliseconds, which says how much a kernel-level win could still be worth before you
 rent a card. Whenever the model disagrees with a measurement, the measurement is right.
 
+`--levers` ranks a fixed menu of what-ifs (narrower formats, FP16 GDN state, less kernel overhead) by
+predicted gain. Two tools build on this one: `kernel_bandwidth.py` joins an `nsys` capture to these
+byte counts to find the kernel families that run well below the card's bandwidth, and
+`flash_next_perf_model.py` models Qwen3.8-Flash-Next, which is not bandwidth-bound. The guide is
+`docs/maintainer/perf-model.md`.
+
 The recipes below mirror `tools/convert/official_recipes.py`; keep them in step when it changes.
 Norm weights and biases are ignored (well under 0.1% of the bytes).
 """
@@ -47,7 +54,7 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Optional, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from decode_byte_accounting import (  # noqa: E402  (shared constants: one source for the card)
@@ -252,7 +259,7 @@ def expert_fraction(experts: int, top_k: int, tokens: int) -> float:
 
 
 # A recipe maps (role, layer) to a format. Mirrors tools/convert/official_recipes.py.
-Recipe = Callable[[str, int | None], str]
+Recipe = Callable[[str, Optional[int]], str]
 ALWAYS_BF16 = {"gdn.a", "gdn.b", "gdn.convolution", "moe.router", "moe.shared_score"}
 
 

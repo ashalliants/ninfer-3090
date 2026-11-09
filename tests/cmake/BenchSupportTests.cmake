@@ -43,3 +43,11 @@ add_test(NAME ninfer_host_arena_replay_test
 # cost table. Pure Python, no GPU.
 add_test(NAME ninfer_perf_model_test
   COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/test_perf_model.py)
+
+# The tools built on it: the nsys kernel-time join (tools/kernel_bandwidth.py, against synthetic CSVs in
+# nsys's layout) and the Flash-Next component model (tools/flash_next_perf_model.py, against the
+# measurements in docs/maintainer/flash-next-plan.md and the lanes spike). Pure Python, no GPU.
+add_test(NAME ninfer_kernel_bandwidth_test
+  COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/test_kernel_bandwidth.py)
+add_test(NAME ninfer_flash_next_perf_model_test
+  COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/test_flash_next_perf_model.py)

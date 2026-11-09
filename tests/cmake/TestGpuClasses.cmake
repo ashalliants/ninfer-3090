@@ -24,6 +24,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_device_sync_invalid_test
   ninfer_effective_thinking_budget_test
   ninfer_engine_scheduling_test
+  ninfer_flash_next_perf_model_test
   ninfer_gdn_replay_records_test
   ninfer_ggml_blocks_decode_test
   ninfer_grammar_test
@@ -36,6 +37,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_jinja_test
   ninfer_json_schema_oracle_test
   ninfer_json_schema_test
+  ninfer_kernel_bandwidth_test
   ninfer_kv_capacity_test
   ninfer_gpu_telemetry_test
   ninfer_kv_plane_types_test
