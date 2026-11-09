@@ -105,6 +105,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_serve_options_test
   ninfer_tensor_test
   ninfer_tool_call_parser_test
+  ninfer_vast_power_guard_test
   ninfer_vcc_projector_test
   ninfer_summary_strategy_test
   ninfer_wide_math_test

@@ -56,3 +56,8 @@ add_test(NAME ninfer_kernel_bandwidth_test
   COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/test_kernel_bandwidth.py)
 add_test(NAME ninfer_flash_next_perf_model_test
   COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/test_flash_next_perf_model.py)
+
+# The rental script's power-limit guard (scripts/vast/power_guard.py): a Vast host can cap the card well
+# below its default and the offer listing does not say so. Pure Python, no GPU and no Vast account.
+add_test(NAME ninfer_vast_power_guard_test
+  COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/scripts/vast/test_power_guard.py)
