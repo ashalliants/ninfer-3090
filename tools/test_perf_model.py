@@ -232,6 +232,103 @@ def test_config_json_matches_the_preset():
         check(False, "a short layer_types array must be refused")
 
 
+def test_single_family_configs_load_without_the_other_familys_fields():
+    # Review finding: both mixer families' keys were read unconditionally. src/models/qwen3_5/config.cpp
+    # requires a family's fields only when a layer uses it.
+    full_only = dict(m.PRESETS["27b"])
+    for key in ("linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim",
+                "linear_value_head_dim", "linear_conv_kernel_dim"):
+        del full_only[key]
+    full_only["layer_types"] = ["full_attention"] * full_only["num_hidden_layers"]
+    geo = m.Geometry.from_config(full_only)
+    check(geo.full_layers == geo.layers and geo.gdn_value_heads == 0, "an all-attention model")
+    weights = m.build_weights(geo, m.RECIPES["qwen3_8_27b"])
+    check(not any(w.role.startswith("gdn.") for w in weights), "no GDN tensors without GDN layers")
+    check(m.decode_step(geo, weights).state_rw == 0, "no recurrent state without GDN layers")
+
+    linear_only = dict(m.PRESETS["27b"])
+    for key in ("num_attention_heads", "num_key_value_heads", "head_dim"):
+        del linear_only[key]
+    linear_only["layer_types"] = ["linear_attention"] * linear_only["num_hidden_layers"]
+    geo = m.Geometry.from_config(linear_only)
+    check(geo.full_layers == 0 and m.kv_bytes_per_token(geo, "int8") == 0, "an all-GDN model has no KV")
+    check(m.prefill(geo, m.build_weights(geo, m.RECIPES["qwen3_8_27b"]), 1024)["attention_s"] == 0.0,
+          "and no attention work in prefill")
+
+    # A family that is used must still define its fields, and the error must say which.
+    missing = dict(m.PRESETS["27b"])
+    del missing["linear_conv_kernel_dim"]
+    try:
+        m.Geometry.from_config(missing)
+    except SystemExit as error:
+        check("linear_conv_kernel_dim" in str(error), "the error should name the missing field")
+    else:
+        check(False, "a used family with missing fields must be refused")
+
+
+def test_unknown_layer_labels_are_refused_not_reclassified():
+    typo = dict(m.PRESETS["27b"])
+    typo["layer_types"] = ["full_atention"] * typo["num_hidden_layers"]
+    try:
+        m.Geometry.from_config(typo)
+    except SystemExit as error:
+        check("full_atention" in str(error), "the error should name the bad label")
+    else:
+        check(False, "a mistyped layer type must not silently become a GDN layer")
+
+
+def test_the_default_recipe_follows_the_model_and_a_mismatch_is_refused():
+    # Review finding: --model 35b-a3b with the dense default succeeded with wrong weights.
+    dense = m.Geometry.from_config(m.PRESETS["27b"])
+    moe = m.Geometry.from_config(m.PRESETS["35b-a3b"])
+    check(m.choose_recipe(dense, None) == "qwen3_8_27b", "dense default")
+    check(m.choose_recipe(moe, None) == "qwen3_6_35b_a3b", "MoE default")
+    check(m.choose_recipe(moe, "qwen3_6_35b_a3b") == "qwen3_6_35b_a3b", "a matching explicit recipe")
+    for geo, recipe in ((moe, "qwen3_8_27b"), (dense, "qwen3_6_35b_a3b")):
+        try:
+            m.choose_recipe(geo, recipe)
+        except SystemExit as error:
+            check(recipe in str(error), "the error should name the recipe")
+        else:
+            check(False, f"{recipe} on the wrong family must be refused")
+    # End to end: no --recipe on the MoE preset gives the MoE's bytes, not a dense recipe's fallback.
+    report = json.loads(run_cli("--model", "35b-a3b", "--json"))
+    check(report["recipe"] == "qwen3_6_35b_a3b", "the report names the recipe it used")
+    check(near(report["decode"][0]["total_gb"], 2.648, 1e-3), "and the MoE token is 2.648 GB")
+
+
+def test_numeric_options_are_validated_at_the_command_line():
+    import io
+    # Review finding: --tok-s 0, --chunk 0 and --prompt 0 divided by zero; --depth -5 was accepted;
+    # --bandwidth-gb-s 0 silently fell back to the default card.
+    bad = (["--tok-s", "0"], ["--tok-s", "-1"], ["--tok-s", "nan"], ["--chunk", "0"], ["--chunk", "-4"],
+           ["--prompt", "0"], ["--depth", "-5"], ["--bandwidth-gb-s", "0"], ["--bandwidth-gb-s", "inf"],
+           ["--int8-tops", "-3"], ["--spec-k", "-1"], ["--acceptance", "1.5"], ["--top", "0"],
+           ["--kv-bytes-per-token", "-1"], ["--depth", "1.5"])
+    for argv in bad:
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                m.parse_args(argv)
+        except SystemExit:
+            continue
+        check(False, f"{argv} must be refused by the parser")
+    ok = m.parse_args(["--depth", "0", "--acceptance", "0", "--spec-k", "0", "--kv-bytes-per-token", "0"])
+    check(ok.depth == [0] and ok.acceptance == 0.0, "zero is a valid depth, acceptance and draft count")
+    # A zero depth is honoured, not replaced by a default.
+    report = json.loads(run_cli("--depth", "0", "--json"))
+    check(report["decode"][0]["depth"] == 0, "depth 0 stays 0")
+
+
+def test_overridden_hardware_is_not_reported_as_the_default_card():
+    stock = json.loads(run_cli("--json"))
+    check(stock["hardware"] == "RTX 3090", "the default card keeps its name")
+    custom = json.loads(run_cli("--json", "--bandwidth-gb-s", "1008"))
+    check("custom" in custom["hardware"] and custom["read_gb_s"] == 1008.0,
+          f"overridden rates must say so: {custom['hardware']!r}")
+    check(custom["int8_tops"] == stock["int8_tops"], "the other rate keeps its default")
+    check("custom" in json.loads(run_cli("--json", "--int8-tops", "500"))["hardware"], "either flag")
+
+
 def test_recipes_still_exist_in_the_converter():
     # The recipes here mirror tools/convert/official_recipes.py. A rename there should fail loudly.
     with open(os.path.join(HERE, "convert", "official_recipes.py"), encoding="utf-8") as handle:

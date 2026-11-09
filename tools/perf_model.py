@@ -51,10 +51,11 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Callable, NamedTuple, Optional, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from decode_byte_accounting import (  # noqa: E402  (shared constants: one source for the card)
@@ -167,23 +168,45 @@ class Geometry:
         cfg = config.get("text_config", config)
         layers = int(cfg["num_hidden_layers"])
         if "layer_types" in cfg:
-            full = tuple(t == "full_attention" for t in cfg["layer_types"])
+            labels = list(cfg["layer_types"])
+            unknown = sorted({str(t) for t in labels} - {"full_attention", "linear_attention"})
+            if unknown:
+                # src/models/qwen3_5/config.cpp: "unknown text layer_type".
+                raise SystemExit(f"unknown layer_types {unknown}; a Qwen3.5 layer is full_attention "
+                                 f"or linear_attention")
+            full = tuple(t == "full_attention" for t in labels)
         else:
             interval = int(cfg.get("full_attention_interval", 4))
             full = tuple(i % interval == interval - 1 for i in range(layers))
         if len(full) != layers:
             raise SystemExit("layer_types does not have num_hidden_layers entries")
+
+        # Each mixer family's fields are required only when a layer uses it, as in config.cpp: a
+        # model with no GDN layers need not carry linear_* keys, nor an all-GDN one the attention keys.
+        def family(present: bool, *keys: str) -> list[int]:
+            if present:
+                missing = [k for k in keys if k not in cfg]
+                if missing:
+                    raise SystemExit(f"config has layers that need {missing} but does not define them")
+                return [int(cfg[k]) for k in keys]
+            return [int(cfg.get(k, 0)) for k in keys]
+
+        q_heads, kv_heads, head_dim = family(
+            any(full), "num_attention_heads", "num_key_value_heads", "head_dim")
+        gdn_key_heads, gdn_value_heads, gdn_key_dim, gdn_value_dim, conv_width = family(
+            not all(full), "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim",
+            "linear_value_head_dim", "linear_conv_kernel_dim")
         return cls(
             hidden=int(cfg["hidden_size"]),
             layer_full=full,
-            q_heads=int(cfg["num_attention_heads"]),
-            kv_heads=int(cfg["num_key_value_heads"]),
-            head_dim=int(cfg["head_dim"]),
-            gdn_key_heads=int(cfg["linear_num_key_heads"]),
-            gdn_value_heads=int(cfg["linear_num_value_heads"]),
-            gdn_key_dim=int(cfg["linear_key_head_dim"]),
-            gdn_value_dim=int(cfg["linear_value_head_dim"]),
-            conv_width=int(cfg["linear_conv_kernel_dim"]),
+            q_heads=q_heads,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            gdn_key_heads=gdn_key_heads,
+            gdn_value_heads=gdn_value_heads,
+            gdn_key_dim=gdn_key_dim,
+            gdn_value_dim=gdn_value_dim,
+            conv_width=conv_width,
             dense_ffn=int(cfg.get("intermediate_size", 0)) if "num_experts" not in cfg else 0,
             experts=int(cfg.get("num_experts", 0)),
             top_k=int(cfg.get("num_experts_per_tok", 0)),
@@ -253,8 +276,12 @@ class Weight:
 
 
 def expert_fraction(experts: int, top_k: int, tokens: int) -> float:
-    """Share of a routed bank one step touches. Uniform routing is an upper bound for T > 1: real
-    routing repeats experts across neighbouring tokens, so the true union is smaller."""
+    """Expected share of a routed bank one step touches, if every token picks its `top_k` experts
+    independently and uniformly. This is an estimate, not a bound: with no route data it is the
+    natural prior. Evidence says which way it errs. Unrelated sequences land on it (the lanes spike
+    measured 19.6 distinct experts per layer at two lanes against 19.8 here). Columns of ONE sequence
+    overlap more, so it overstates their union (flash-next-plan.md: a verification column brings 47%
+    new experts, uniform predicts 98%). Routes that deliberately diverge could exceed it."""
     return 1.0 - (1.0 - top_k / experts) ** tokens
 
 
@@ -300,6 +327,10 @@ RECIPES: dict[str, Recipe] = {
     "qwen3_8_27b": _dense_groupwise("q4", "q6", q4_tail=True),
     "qwen3_6_35b_a3b": _moe_35b,
 }
+# Each official recipe requires one family, as official_recipes.py checks ("requires Qwen3.5 Dense
+# mathematics" / "...MoE mathematics"). The default for a model is its family's current recipe.
+RECIPE_FAMILY = {"qwen3_6_27b": "dense", "qwen3_8_27b": "dense", "qwen3_6_35b_a3b": "moe"}
+DEFAULT_RECIPE = {"dense": "qwen3_8_27b", "moe": "qwen3_6_35b_a3b"}
 
 
 def build_weights(geo: Geometry, recipe: Recipe, overrides: dict[str, str] | None = None) -> list[Weight]:
@@ -581,8 +612,66 @@ def _decode_table(step: DecodeStep, top: int) -> list[dict]:
     return table
 
 
-def resolve(args: argparse.Namespace) -> tuple[Geometry, str, list[Weight], Hardware, dict[str, str]]:
-    """The model, recipe overrides and card an invocation names. Shared by every tool built on this
+def _number(text: str, *, minimum: float, inclusive: bool, integer: bool, what: str) -> float:
+    try:
+        value = int(text) if integer else float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not {'an integer' if integer else 'a number'}") from None
+    if not math.isfinite(value) or value < minimum or (value == minimum and not inclusive):
+        raise argparse.ArgumentTypeError(f"{text} is not {what}")
+    return value
+
+
+# argparse types shared by every tool built on this one: a zero, negative or non-finite value is
+# refused at the command line instead of dividing by zero later or silently changing the what-if.
+def positive_float(text: str) -> float:
+    return _number(text, minimum=0.0, inclusive=False, integer=False, what="a positive number")
+
+
+def non_negative_float(text: str) -> float:
+    return _number(text, minimum=0.0, inclusive=True, integer=False, what="zero or more")
+
+
+def positive_int(text: str) -> int:
+    return _number(text, minimum=0, inclusive=False, integer=True, what="a positive integer")
+
+
+def non_negative_int(text: str) -> int:
+    return _number(text, minimum=0, inclusive=True, integer=True, what="zero or more")
+
+
+def probability(text: str) -> float:
+    value = _number(text, minimum=0.0, inclusive=True, integer=False, what="a fraction in [0, 1]")
+    if value > 1.0:
+        raise argparse.ArgumentTypeError(f"{text} is not a fraction in [0, 1]")
+    return value
+
+
+def choose_recipe(geo: Geometry, name: Optional[str]) -> str:
+    """The recipe for `geo`: the family's default if none is named, and an error if the one named is
+    for the other family. A dense recipe applied to an MoE has no rules for the expert and shared
+    tensors, so it would fall through to arbitrary formats and still print a credible-looking report."""
+    family = "moe" if geo.is_moe else "dense"
+    if name is None:
+        return DEFAULT_RECIPE[family]
+    if RECIPE_FAMILY[name] != family:
+        raise SystemExit(f"recipe {name} is for {RECIPE_FAMILY[name]} models but this model is {family}; "
+                         f"use {', '.join(r for r, f in sorted(RECIPE_FAMILY.items()) if f == family)}")
+    return name
+
+
+class Resolved(NamedTuple):
+    geo: Geometry
+    label: str
+    recipe: str
+    weights: list
+    hardware: Hardware
+    overrides: dict
+
+
+def resolve(args: argparse.Namespace) -> Resolved:
+    """The model, recipe, overrides and card an invocation names. Shared by every tool built on this
     one, so `--model`, `--config`, `--format` and the card flags mean the same thing everywhere."""
     if args.config:
         geo = Geometry.from_config(json.loads(Path(args.config).read_text()))
@@ -590,11 +679,17 @@ def resolve(args: argparse.Namespace) -> tuple[Geometry, str, list[Weight], Hard
     else:
         geo = Geometry.from_config(PRESETS[args.model])
         label = args.model
+    recipe = choose_recipe(geo, args.recipe)
     overrides = dict(parse_format(item) for item in args.format)
-    weights = build_weights(geo, RECIPES[args.recipe], overrides)
-    hardware = Hardware(RTX_3090.name, args.bandwidth_gb_s or RTX_3090.read_gb_s,
-                        RTX_3090.advertised_gb_s, args.int8_tops or RTX_3090.int8_tops)
-    return geo, label, weights, hardware, overrides
+    weights = build_weights(geo, RECIPES[recipe], overrides)
+    custom = args.bandwidth_gb_s is not None or args.int8_tops is not None
+    hardware = Hardware(
+        f"custom card (rates overridden; fitted constants are the {RTX_3090.name}'s)" if custom
+        else RTX_3090.name,
+        RTX_3090.read_gb_s if args.bandwidth_gb_s is None else args.bandwidth_gb_s,
+        RTX_3090.advertised_gb_s,
+        RTX_3090.int8_tops if args.int8_tops is None else args.int8_tops)
+    return Resolved(geo, label, recipe, weights, hardware, overrides)
 
 
 def add_model_arguments(parser: argparse.ArgumentParser) -> None:
@@ -602,25 +697,27 @@ def add_model_arguments(parser: argparse.ArgumentParser) -> None:
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--model", choices=sorted(PRESETS), default="27b")
     source.add_argument("--config", help="a model's config.json instead of a preset")
-    parser.add_argument("--recipe", choices=sorted(RECIPES), default="qwen3_8_27b")
+    parser.add_argument("--recipe", choices=sorted(RECIPES),
+                        help="default: qwen3_8_27b for a dense model, qwen3_6_35b_a3b for an MoE")
     parser.add_argument("--format", action="append", default=[], metavar="ROLE=FORMAT",
                         help="what-if: store ROLE (e.g. output_head, mlp.down) in FORMAT "
                              f"({', '.join(sorted(FORMAT_BITS))}); repeatable")
     parser.add_argument("--kv", choices=sorted(KV_BYTES_PER_ELEMENT), default="int8")
-    parser.add_argument("--kv-bytes-per-token", type=float,
+    parser.add_argument("--kv-bytes-per-token", type=non_negative_float,
                         help="exact value from ninfer_bench; overrides --kv (needed for rk4v4)")
     parser.add_argument("--gdn-state-fp16", action="store_true")
-    parser.add_argument("--bandwidth-gb-s", type=float, help="sustained read rate of another card")
-    parser.add_argument("--int8-tops", type=float, help="INT8 tensor peak of another card")
+    parser.add_argument("--bandwidth-gb-s", type=positive_float,
+                        help="sustained read rate of another card")
+    parser.add_argument("--int8-tops", type=positive_float, help="INT8 tensor peak of another card")
 
 
 def build_report(args: argparse.Namespace) -> dict:
-    geo, label, weights, hardware, overrides = resolve(args)
+    geo, label, recipe, weights, hardware, overrides = resolve(args)
     state_bytes = 2 if args.gdn_state_fp16 else 4
-    depths = args.depth or [0]
+    depths = [0] if args.depth is None else args.depth
 
     report: dict = {
-        "model": label, "recipe": args.recipe, "overrides": overrides, "hardware": hardware.name,
+        "model": label, "recipe": recipe, "overrides": overrides, "hardware": hardware.name,
         "read_gb_s": hardware.read_gb_s, "int8_tops": hardware.int8_tops,
         "layers": geo.layers, "moe": geo.is_moe,
         "resident_gb": sum(w.resident_bytes for w in weights) / 1e9,
@@ -647,9 +744,9 @@ def build_report(args: argparse.Namespace) -> dict:
                               "gap_over_floor_ms": measured_ms - first["floor_ms"],
                               "pct_of_floor": 100 * first["floor_ms"] / measured_ms}
     report["prefill"] = [prefill(geo, weights, n, hardware, chunk=args.chunk)
-                         for n in (args.prompt or [4096])]
+                         for n in ([4096] if args.prompt is None else args.prompt)]
     if args.levers:
-        report["levers"] = rank_levers(geo, RECIPES[args.recipe], overrides, depth=depths[0],
+        report["levers"] = rank_levers(geo, RECIPES[recipe], overrides, depth=depths[0],
                                        kv=args.kv, kv_bpt=args.kv_bytes_per_token,
                                        gdn_state_bytes_per=state_bytes, hardware=hardware)
     return report
@@ -713,21 +810,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     add_model_arguments(parser)
-    parser.add_argument("--depth", type=int, action="append", help="KV depth in tokens; repeatable")
+    parser.add_argument("--depth", type=non_negative_int, action="append",
+                        help="KV depth in tokens; repeatable")
     parser.add_argument("--levers", action="store_true",
                         help="rank a fixed menu of what-ifs by predicted plain-decode gain")
-    parser.add_argument("--spec-k", type=int, default=0, help="drafts per round; 0 = no speculation")
-    parser.add_argument("--acceptance", type=float, default=0.6,
+    parser.add_argument("--spec-k", type=non_negative_int, default=0,
+                        help="drafts per round; 0 = no speculation")
+    parser.add_argument("--acceptance", type=probability, default=0.6,
                         help="accepted drafts / drafted tokens, from a real run")
-    parser.add_argument("--tok-s", type=float, help="measured plain-decode tok/s at the first depth")
-    parser.add_argument("--prompt", type=int, action="append", help="prompt tokens; repeatable")
-    parser.add_argument("--chunk", type=int, default=4096, help="prefill chunk size in tokens")
-    parser.add_argument("--top", type=int, default=8, help="roles to list individually")
+    parser.add_argument("--tok-s", type=positive_float,
+                        help="measured plain-decode tok/s at the first depth")
+    parser.add_argument("--prompt", type=positive_int, action="append",
+                        help="prompt tokens; repeatable")
+    parser.add_argument("--chunk", type=positive_int, default=4096,
+                        help="prefill chunk size in tokens")
+    parser.add_argument("--top", type=positive_int, default=8, help="roles to list individually")
     parser.add_argument("--json", action="store_true")
-    args = parser.parse_args(argv)
-    if args.spec_k < 0 or not 0.0 <= args.acceptance <= 1.0:
-        parser.error("--spec-k must be >= 0 and --acceptance within [0, 1]")
-    return args
+    return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

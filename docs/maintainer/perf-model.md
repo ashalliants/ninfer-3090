@@ -46,7 +46,9 @@ The three tests are ctest `ninfer_perf_model_test`, `ninfer_kernel_bandwidth_tes
    the family to 90% would save. Kernel names carry the weight *format* (`q4_`, `q5_`...) but not the
    role, and fused ops read several roles, so the join is by format; routed experts, attention (against
    the KV bytes) and GDN recurrence (against the state traffic) are their own families. A family
-   reading *faster* than the card can is flagged: it means a wrong `--steps`, model or recipe. Pass
+   reading *faster* than the card can is flagged: it means a wrong `--steps`, model or recipe. A
+   kernel fused over two stored formats (`q4_q5_...`) gets its own row with no bytes, and a printed
+   caveat says the q4 and q5 rows then read high. Pass
    `--columns K+1` for a speculative round. **This tool has only been run on synthetic CSVs in nsys's
    layout, never on a real capture** (none is in the repository): the first real run may show kernels
    the rules put in `other`, and the biggest are printed so `classify` can be extended.
@@ -60,7 +62,7 @@ you name (plain, `--mtp-k`, `--lanes`).
 |---|---|---|
 | Decode bytes per token | Every dense matrix, one embedding row, 8 of 256 routed experts per layer, GDN state in and out, KV to the current depth. Formats come from the recipe. | Exact arithmetic. Matches [`decode_byte_accounting.py`](../../tools/decode_byte_accounting.py)'s artifact-header count within 0.02%. |
 | Decode speed | `bytes / 854.2 GB/s + layers x 0.0425 ms` | One fitted constant, two points. Consistent with the runs below, not proven for a third model. |
-| Speculative decode | `tokens per round = 1 + acceptance x k`; round = step at `k+1` columns x 1.15 | Acceptance is an input. MoE verify assumes uniform expert routing, an upper bound. |
+| Speculative decode | `tokens per round = 1 + acceptance x k`; round = step at `k+1` columns x 1.15 | Acceptance is an input. MoE verify uses the expected expert union under independent uniform routing: right for unrelated sequences, an overestimate for the columns of one sequence (Flash-Next measured 47% new experts per column, uniform predicts 98%). |
 | Prefill | `steps x fixed cost + 2 x active parameters x tokens / (316 INT8 TOPS x efficiency) + attention` | Two constants per family, fitted on two prompt lengths each. |
 
 Acceptance is accepted drafts over drafted tokens, the definition in
@@ -138,7 +140,11 @@ spike measured a hit-rate collapse there that this model does not reproduce).
 ## Keeping it honest
 
 - The Qwen3.5 recipes mirror `tools/convert/official_recipes.py`. Change them together; the test
-  fails if a recipe name disappears but cannot see a changed format.
+  fails if a recipe name disappears but cannot see a changed format. `--recipe` defaults to the
+  model's family (`qwen3_8_27b` for dense, `qwen3_6_35b_a3b` for an MoE) and a recipe for the other
+  family is refused, as `official_recipes.py` does.
+- Numeric flags are validated at the command line (positive and finite where a zero would divide or
+  silently fall back); `--bandwidth-gb-s` or `--int8-tops` mark the report as a custom card.
 - Calibration constants sit in one dataclass per tool, each with the measurement it came from. After a
   new campaign refit them and update the tables above in the same change.
 - KV format: `--kv int8` is 33/32 bytes per element (it reproduces the 10,560 B/token the 35B-A3B

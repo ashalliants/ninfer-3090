@@ -24,6 +24,11 @@ Limits. Times are the profiler's, which run about 5% long. The summed kernel tim
 kernels that overlap on different streams, so a family can look slower than it was. A quantize
 kernel is counted as `other`, not with its GEMV, even though it is launched for it. Kernels the rules
 do not recognise land in `other`; the biggest are printed so you can extend `classify`.
+
+Cache and recurrence kernels are named after the format they store (`bf16_kv_grouped_mma_kernel`,
+`nvfp4_gdn_conv_post_kernel`), so `classify` recognises them before the weight-format prefix rule. A
+kernel fused over two stored formats (`q4_q5_...`) gets its own row with no byte claim, and the report
+says the q4 and q5 rows then read high: a name cannot say which roles it streams.
 """
 
 from __future__ import annotations
@@ -61,19 +66,36 @@ def short_name(raw: str) -> str:
     return name.rsplit("::", 1)[-1].strip()
 
 
+def leading_formats(name: str) -> list[str]:
+    """The weight formats a kernel name opens with: `q4_q5_attn_input_x` -> [q4, q5]."""
+    found = []
+    for token in name.split("_"):
+        if token not in WEIGHT_PREFIXES:
+            break
+        found.append(token)
+    return found
+
+
 def classify(raw: str) -> str:
-    """The kernel family a launch belongs to: a weight format, `moe`, `attention`, `gdn` or `other`."""
+    """The kernel family a launch belongs to: a weight format (`q4`), a fused pair of formats
+    (`q4_q5`), `moe`, `attention`, `gdn` or `other`.
+
+    Order matters. Cache and recurrence kernels are named after the format they store
+    (`bf16_kv_grouped_mma_kernel`, `nvfp4_kv_tiled_mma_kernel`, `nvfp4_gdn_conv_post_kernel`), so they
+    are recognised BEFORE the format prefix rule, or their time would be joined to weight bytes."""
     name = short_name(raw)
     if any(word in name for word in NOT_STREAMING):
         return "other"
     if name.startswith("sparse_moe"):
         return "moe"
-    for prefix in WEIGHT_PREFIXES:
-        if name.startswith(prefix + "_"):
-            return prefix
-    if re.search(r"kv_tiled|attention|kv_cache", name):
+    if re.search(r"kv_(tiled|grouped)|kv_cache|attention", name):
         return "attention"
-    if re.search(r"recurren|gdn|chunk_recurrence", name):
+    if re.search(r"recurren|chunk_recurrence|gdn_conv|conv_post|gdn_projected|gdn_norm", name):
+        return "gdn"
+    formats = leading_formats(name)
+    if formats:
+        return "_".join(formats)
+    if "gdn" in name:
         return "gdn"
     return "other"
 
@@ -114,12 +136,19 @@ def join(rows: Sequence[dict], steps: int, group_bytes: dict[str, float], bandwi
             line["recoverable_ms"] = max(0.0, entry["ms"] - good_ms)
         table.append(line)
     table.sort(key=lambda r: -r["ms"])
+    # A kernel fused over two stored formats (q4_q5_...) reads weights that the q4 and q5 rows count
+    # as bytes, but its time is in its own row. Which roles it reads cannot be told from a name, so
+    # say that those rows read low instead of guessing a split.
+    fused = sorted(r["family"] for r in table if "_" in r["family"])
+    caveats = [f"{family} kernels read more than one stored format: their time is listed on their own "
+               f"row, so the {' and '.join(family.split('_'))} rows count their bytes but not their "
+               f"time and read HIGH in GB/s" for family in fused]
     return {"families": table, "kernel_ms": sum(r["ms"] for r in table),
-            "launches": sum(r["launches"] for r in table)}
+            "launches": sum(r["launches"] for r in table), "caveats": caveats}
 
 
 def build(args: argparse.Namespace) -> dict:
-    geo, label, weights, hardware, _ = pm.resolve(args)
+    geo, label, recipe, weights, hardware, _ = pm.resolve(args)
     state_bytes = 2 if args.gdn_state_fp16 else 4
     step = pm.decode_step(geo, weights, tokens=args.columns, depth=args.depth, kv=args.kv,
                           kv_bpt=args.kv_bytes_per_token, gdn_state_bytes_per=state_bytes,
@@ -129,7 +158,7 @@ def build(args: argparse.Namespace) -> dict:
     group_bytes["gdn"] = step.state_rw
     joined = join(read_kernel_summary(args.csv), args.steps, group_bytes, hardware.read_gb_s,
                   args.target_pct)
-    joined.update({"model": label, "recipe": args.recipe, "depth": args.depth, "steps": args.steps,
+    joined.update({"model": label, "recipe": recipe, "depth": args.depth, "steps": args.steps,
                    "columns": args.columns, "read_gb_s": hardware.read_gb_s,
                    "target_pct": args.target_pct, "floor_ms": step.floor_ms,
                    "predicted_ms": step.step_ms, "bytes_gb": step.total_bytes / 1e9})
@@ -156,27 +185,34 @@ def print_report(r: dict) -> None:
     print(f"Bringing every family with bytes to {r['target_pct']:.0f}% of the sustained rate would "
           f"save about {r['recoverable_ms']:.2f} ms/step ({100 * r['recoverable_ms'] / r['kernel_ms']:.0f}%"
           f" of kernel time).")
+    for caveat in r.get("caveats", []):
+        print(f"CAVEAT: {caveat}")
     print("Times are the profiler's (about 5% long). Concurrent kernels double-count, so a family can "
           "look slower than it ran.")
+
+
+def percent(text: str) -> float:
+    value = pm.positive_float(text)
+    if value > 100.0:
+        raise argparse.ArgumentTypeError(f"{text} is not a percentage in (0, 100]")
+    return value
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("csv", type=Path, help="nsys stats cuda_gpu_kern_sum CSV")
-    parser.add_argument("--steps", type=int, required=True,
+    parser.add_argument("--steps", type=pm.positive_int, required=True,
                         help="decode steps (or rounds) in the capture: 128 for `ninfer_bench -n 128`")
-    parser.add_argument("--columns", type=int, default=1,
+    parser.add_argument("--columns", type=pm.positive_int, default=1,
                         help="tokens per step: 1 for plain decode, K+1 for a speculative round")
-    parser.add_argument("--depth", type=int, default=0, help="KV depth the capture ran at")
-    parser.add_argument("--target-pct", type=float, default=90.0,
+    parser.add_argument("--depth", type=pm.non_negative_int, default=0,
+                        help="KV depth the capture ran at")
+    parser.add_argument("--target-pct", type=percent, default=90.0,
                         help="what counts as a good kernel, in percent of the sustained read rate")
     pm.add_model_arguments(parser)
     parser.add_argument("--json", action="store_true")
-    args = parser.parse_args(argv)
-    if args.steps < 1 or args.columns < 1 or not 0 < args.target_pct <= 100:
-        parser.error("--steps and --columns must be >= 1 and --target-pct within (0, 100]")
-    return args
+    return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

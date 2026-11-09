@@ -62,6 +62,17 @@ def test_classification_follows_the_kernel_names_in_src_ops():
         "recurrent_direct_kernel": "gdn",
         "gdn_projected_conv_kernel": "gdn",
         "chunk_recurrence_kernel": "gdn",
+        # Review finding: cache and recurrence kernels are named after the format they store, and
+        # were claimed by the weight-format prefix rule. Real names from src/ops:
+        "bf16_kv_grouped_mma_kernel": "attention",
+        "fp8_kv_grouped_mma_kernel": "attention",
+        "int8_kv_grouped_mma_kernel": "attention",
+        "k8v4_kv_grouped_mma_kernel": "attention",
+        "nvfp4_kv_tiled_mma_kernel": "attention",
+        "mxfp8_kv_tiled_mma_kernel": "attention",
+        "nvfp4_gdn_conv_post_kernel": "gdn",
+        # A fused pair of stored formats is its own family, not whichever format comes first.
+        "q4_q5_attn_input_small_t_kernel": "q4_q5",
         # Streams no weights, whatever its name starts with.
         "q4_small_t_quantize_activations_kernel": "other",
         "fp8_a8_tma_split_k_reduce": "other",
@@ -122,6 +133,48 @@ def test_join_recovers_the_rate_each_family_was_built_to_run_at():
     check(by["other"]["bytes"] is None and by["other"]["gb_s"] is None, "`other` streams no bytes")
     check(joined["families"][0]["ms"] >= joined["families"][-1]["ms"], "families are sorted by time")
     check(near(joined["kernel_ms"], sum(r["ms"] for r in joined["families"]), 1e-12), "total")
+
+
+def test_kv_kernels_are_joined_to_the_kv_bytes_not_to_weights():
+    _, _, groups = model_bytes(depth=8192)
+    ms = ms_for_rate(groups["attention"], 400)
+    rows = [{"name": "void ninfer::ops::bf16_kv_grouped_mma_kernel<8>(int)", "total_ns": ms * 1e6 * STEPS,
+             "instances": 16 * STEPS}]
+    by = {r["family"]: r for r in kb.join(rows, STEPS, groups, pm.ACHIEVABLE_READ_GB_S, 90.0)["families"]}
+    check(set(by) == {"attention"}, f"a bf16 KV kernel must not land in the bf16 weight bucket: {set(by)}")
+    check(near(by["attention"]["gb_s"], 400, 1e-6), "and is compared with the KV bytes")
+
+
+def test_a_fused_format_kernel_gets_its_own_row_and_a_caveat():
+    _, _, groups = model_bytes()
+    rows = [{"name": "q4_q5_attn_input_small_t_kernel", "total_ns": 1e6 * STEPS, "instances": STEPS},
+            {"name": "q4_a16_gemv_kernel", "total_ns": 2e6 * STEPS, "instances": STEPS}]
+    joined = kb.join(rows, STEPS, groups, pm.ACHIEVABLE_READ_GB_S, 90.0)
+    by = {r["family"]: r for r in joined["families"]}
+    check(by["q4_q5"]["bytes"] is None and by["q4_q5"]["gb_s"] is None, "no byte claim for a fused kernel")
+    check(joined["caveats"] and "q4_q5" in joined["caveats"][0] and "HIGH" in joined["caveats"][0],
+          "the rows it distorts are named, with the direction")
+    clean = kb.join(rows[1:], STEPS, groups, pm.ACHIEVABLE_READ_GB_S, 90.0)
+    check(clean["caveats"] == [], "no fused kernel, no caveat")
+
+
+def test_numeric_options_and_recipe_choice_follow_perf_model():
+    import io
+    for argv in (["--steps", "0"], ["--steps", "-1"], ["--columns", "0"], ["--depth", "-1"],
+                 ["--target-pct", "0"], ["--target-pct", "101"], ["--target-pct", "nan"],
+                 ["--bandwidth-gb-s", "0"]):
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                kb.parse_args(["x.csv", "--steps", "128", *argv])
+        except SystemExit:
+            continue
+        check(False, f"{argv} must be refused by the parser")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "k.csv")
+        write_csv(path, [("sparse_moe_d3_nine_warp_kernel", 1e6 * STEPS, STEPS)])
+        report = json.loads(run_cli(path, "--steps", str(STEPS), "--model", "35b-a3b", "--json"))
+        check(report["recipe"] == "qwen3_6_35b_a3b", "an MoE profile uses the MoE recipe by default")
+        check("moe" in {r["family"] for r in report["families"]}, "and joins its expert kernels")
 
 
 def run_cli(*argv):

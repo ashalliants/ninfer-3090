@@ -184,13 +184,14 @@ def _shifted(cal: Calibration, saved_ms: float) -> Calibration:
 
 
 def rank_levers(mode: str, hit_rate: float, k: int, acceptance: float,
-                cal: Calibration = CAL) -> list[dict]:
-    """What-ifs ranked by their effect on `mode`'s throughput (plain, mtp or lanes)."""
+                cal: Calibration = CAL, rows: int = 2) -> list[dict]:
+    """What-ifs ranked by their effect on `mode`'s throughput (plain, mtp or lanes). In lanes mode
+    `rows` is the lane count the report describes, so the gains are relative to that baseline."""
     def rate(c: Calibration, hit: float, accept: float) -> float:
         if mode == "mtp":
             return mtp(k, accept, hit, c)["tok_s"]
         if mode == "lanes":
-            return lanes(2, hit, c)["tok_s"]
+            return lanes(rows, hit, c)["tok_s"]
         return plain(hit, c)["tok_s"]
 
     base = rate(cal, hit_rate, acceptance)
@@ -202,7 +203,7 @@ def rank_levers(mode: str, hit_rate: float, k: int, acceptance: float,
         ("expert cache hit rate +1 point", "cache", rate(cal, min(1.0, hit_rate + 0.01), acceptance),
          "a bigger or smarter expert cache; the cache grows to ~16.8 GiB already"),
         ("expert cache hit rate +2 points", "cache", rate(cal, min(1.0, hit_rate + 0.02), acceptance),
-         "as above"),
+         "the same lever at twice the improvement"),
         ("each miss costs half (prefetch, overlap)", "cache",
          rate(_miss_cost_scaled(cal, 0.5), hit_rate, acceptance),
          "PR 11 tried a forked copy stream (slower) and a CPU leg (not wired)"),
@@ -259,8 +260,9 @@ def build_report(args: argparse.Namespace) -> dict:
         mode = "mtp" if args.mtp_k else ("lanes" if args.lanes > 1 else "plain")
         acceptance = (args.acceptance if args.acceptance is not None
                       else ACCEPTANCE_8K.get(args.mtp_k, 0.6))
-        report["levers"] = {"mode": mode,
-                            "rows": rank_levers(mode, args.hit_rate, args.mtp_k or 3, acceptance)}
+        report["levers"] = {"mode": mode, "lanes": args.lanes if mode == "lanes" else None,
+                            "rows": rank_levers(mode, args.hit_rate, args.mtp_k or 3, acceptance,
+                                                rows=args.lanes)}
     return report
 
 
@@ -296,32 +298,37 @@ def print_report(r: dict) -> None:
                           f"acceptance is above {c:.0%}; below that the lanes win decode throughput"
                           if c is not None else "even perfect acceptance does not reach these lanes"))
     if "levers" in r:
-        print(f"\nLEVERS for {r['levers']['mode']} decode, ranked")
+        mode = (f"{r['levers']['lanes']}-lane" if r["levers"]["lanes"] else r["levers"]["mode"])
+        print(f"\nLEVERS for {mode} decode, ranked")
         for row in r["levers"]["rows"]:
             print(f"  {row['gain_pct']:+6.1f}%  {row['tok_s']:7.1f} tok/s  [{row['kind']:<6}] {row['name']}")
             print(f"{'':>34}{row['note']}")
     print("\nA model, not a measurement. Disagreement with a run on the card is the finding.")
 
 
+def hit_rate(text: str) -> float:
+    value = pm.positive_float(text)
+    if not 0.5 <= value <= 1.0:
+        raise argparse.ArgumentTypeError(f"{text} is not a fraction between 0.5 and 1")
+    return value
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--hit-rate", type=float, default=CAL.ref_hit_rate,
+    parser.add_argument("--hit-rate", type=hit_rate, default=CAL.ref_hit_rate,
                         help="expert-cache decode hit rate; 97.2%% is a warm 8K run, 93%% a cold session")
-    parser.add_argument("--mtp-k", type=int, default=0, help="MTP drafts per round; 0 = none")
-    parser.add_argument("--acceptance", type=float,
+    parser.add_argument("--mtp-k", type=pm.non_negative_int, default=0,
+                        help="MTP drafts per round; 0 = none")
+    parser.add_argument("--acceptance", type=pm.probability,
                         help="accepted drafts / drafted tokens (default: the measured 8K value for K)")
-    parser.add_argument("--lanes", type=int, default=1, help="plain lanes decoding together (the model "
-                        "is validated at 2)")
-    parser.add_argument("--tok-s", type=float, help="measured plain-decode tok/s at --hit-rate")
+    parser.add_argument("--lanes", type=pm.positive_int, default=1,
+                        help="plain lanes decoding together (the model is validated at 2)")
+    parser.add_argument("--tok-s", type=pm.positive_float,
+                        help="measured plain-decode tok/s at --hit-rate")
     parser.add_argument("--levers", action="store_true", help="rank what-ifs for the mode chosen")
     parser.add_argument("--json", action="store_true")
-    args = parser.parse_args(argv)
-    if not 0.5 <= args.hit_rate <= 1.0:
-        parser.error("--hit-rate is a fraction between 0.5 and 1")
-    if args.mtp_k < 0 or args.lanes < 1 or (args.acceptance is not None and not 0 <= args.acceptance <= 1):
-        parser.error("--mtp-k >= 0, --lanes >= 1, --acceptance within [0, 1]")
-    return args
+    return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

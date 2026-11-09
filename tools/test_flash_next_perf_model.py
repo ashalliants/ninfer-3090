@@ -122,6 +122,39 @@ def test_levers_are_ranked_and_scale_with_the_cache():
     check(near(plain_by["expert cache hit rate +1 point"], 2.4, 0.15), "1 point of hit rate ~ 2.4%")
 
 
+def test_lane_levers_are_relative_to_the_requested_lane_count():
+    # Review finding: --lanes 3 --levers ranked gains against a two-lane baseline.
+    two = {r["name"]: r for r in fn.rank_levers("lanes", 0.972, 3, 0.65, rows=2)}
+    three = {r["name"]: r for r in fn.rank_levers("lanes", 0.972, 3, 0.65, rows=3)}
+    name = "expert cache hit rate +1 point"
+    check(three[name]["tok_s"] > fn.lanes(3)["tok_s"] > fn.lanes(2)["tok_s"], "three lanes baseline")
+    check(near(three[name]["tok_s"], fn.lanes(3, 0.982)["tok_s"], 1e-9),
+          "the lever's rate must be the three-lane rate at the better hit rate")
+    check(three[name]["tok_s"] != two[name]["tok_s"], "the lane count must change the ranking inputs")
+    # The default is the validated two lanes, as before.
+    default = {r["name"]: r for r in fn.rank_levers("lanes", 0.972, 3, 0.65)}
+    check(near(default[name]["tok_s"], two[name]["tok_s"], 1e-12), "default rows is two")
+
+
+def test_numeric_options_are_validated_at_the_command_line():
+    import contextlib
+    import io
+    # Review finding: --tok-s 0 divided by zero; negatives gave nonsense rather than an error.
+    bad = (["--tok-s", "0"], ["--tok-s", "-5"], ["--tok-s", "nan"], ["--tok-s", "inf"],
+           ["--lanes", "0"], ["--mtp-k", "-1"], ["--acceptance", "1.5"], ["--acceptance", "-0.1"],
+           ["--hit-rate", "0"], ["--hit-rate", "nan"], ["--hit-rate", "0.2"], ["--hit-rate", "1.2"])
+    for argv in bad:
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                fn.parse_args(argv)
+        except SystemExit:
+            continue
+        check(False, f"{argv} must be refused by the parser")
+    ok = fn.parse_args(["--tok-s", "79.9", "--lanes", "2", "--mtp-k", "0", "--acceptance", "0",
+                        "--hit-rate", "1.0"])
+    check(ok.acceptance == 0.0 and ok.mtp_k == 0, "zero acceptance and zero drafts are valid values")
+
+
 def test_miss_cost_scaling_is_consistent():
     cal = fn._miss_cost_scaled(fn.CAL, 0.5)
     check(near(cal.miss_ms, fn.CAL.miss_ms / 2, 1e-12), "halving the cost halves a miss")
