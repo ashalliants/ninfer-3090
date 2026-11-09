@@ -135,7 +135,11 @@ and record them here.
     `RELEASE_NOTES_X.Y.Z.md` and an inner `SHA256SUMS.txt`. Extract it to a scratch directory, copy the final
     notes in, regenerate the inner sums exactly as `package-release.sh` does (`find . -maxdepth 1 -type f !
     -name SHA256SUMS.txt -print0 | LC_ALL=C sort -z`, then `sha256sum`), re-pack with
-    `tar --owner=root --group=root -czf` (the original entries are root-owned) and rewrite
+    `tar -C "$scratch" --owner=root --group=root -czf "$archive" "$product_name"` (the original entries are
+    root-owned; `$scratch` is the directory you extracted into, `$product_name` the single top-level
+    directory it contains, `ninfer-rtx3090-linux-x64-<tag>`, and `$archive` the tarball to replace, in
+    `dist/`, which is where the checksum step looks; this mirrors the `tar -C "$dist_root"` line in
+    `package-release.sh`) and rewrite
     `SHA256SUMS-vX.Y.Z-linux.txt`. Check the inner sums, the outer sum and `diff` the embedded notes. Re-packing
     1 GB takes a couple of minutes, so run it in the background.
 - **Windows archive: any x64 Windows machine, no NVIDIA GPU needed.** `scripts/release-windows.ps1`
