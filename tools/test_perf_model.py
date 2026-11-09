@@ -172,6 +172,46 @@ def test_format_what_if_changes_exactly_the_bytes_it_should():
         check(False, "an unknown format must be refused")
 
 
+def levers(preset, recipe, overrides=None, **kwargs):
+    geo = m.Geometry.from_config(m.PRESETS[preset])
+    return {row["name"]: row for row in m.rank_levers(geo, m.RECIPES[recipe], overrides or {}, **kwargs)}
+
+
+def test_levers_agree_with_the_measured_quality_trades():
+    # docs/maintainer/quality-trade-experiments.md: with the head at q4, plain decode moved +1.4% and
+    # +2.9% in two interleaved reps, "close to the naive bandwidth-share prediction". The FP16 GDN state
+    # was inside the C1 noise and +2.0% at C8.
+    found = levers("27b", "qwen3_6_27b")
+    head = found["output head -> q4"]["gain_pct"]
+    check(1.0 < head < 3.5, f"q4 head predicted {head:+.2f}%, measured +1.4% to +2.9%")
+    state = found["GDN state in FP16"]["gain_pct"]
+    check(0.0 < state < head, f"FP16 state should help less than the head here, got {state:+.2f}%")
+    check("perplexity" in found["output head -> q4"]["evidence"], "measured levers cite their evidence")
+
+
+def test_levers_are_ranked_and_the_kernel_ones_nest():
+    found = m.rank_levers(m.Geometry.from_config(m.PRESETS["27b"]), m.RECIPES["qwen3_8_27b"], {})
+    gains = [row["gain_pct"] for row in found]
+    check(gains == sorted(gains, reverse=True), "levers must be ranked best first")
+    by = {row["name"]: row["gain_pct"] for row in found}
+    check(by["kernels: 25% less per-layer overhead"] < by["kernels: 50% less per-layer overhead"]
+          < by["kernels: bandwidth floor (no overhead)"], "more kernel work must be worth more")
+    check(by["every matrix -> q4"] > by["MLP weights -> q4"] > 0, "narrower sets save less")
+    # The 3090 recipe keeps mlp.down at q5 in layers 0-35 only; the lever must still see it.
+    check("MLP weights -> q4" in by, "a role with mixed formats across layers still has bytes to save")
+
+
+def test_a_lever_with_nothing_left_to_save_is_left_out():
+    already = levers("27b", "qwen3_8_27b", {"output_head": "q4"})
+    check("output head -> q4" not in already, "a head already at q4 has nothing to gain")
+    check("kernels: bandwidth floor (no overhead)" in already, "kernel levers always apply")
+    fp16 = levers("27b", "qwen3_8_27b", gdn_state_bytes_per=2)
+    check("GDN state in FP16" not in fp16, "state already FP16")
+    moe = levers("35b-a3b", "qwen3_6_35b_a3b")
+    check("routed experts -> q4" in moe and "MLP weights -> q4" not in moe,
+          "an MoE has experts to shrink and no dense MLP")
+
+
 def test_config_json_matches_the_preset():
     preset = m.PRESETS["27b"]
     nested = {"architectures": ["Qwen3_5ForCausalLM"], "text_config": dict(preset)}
@@ -207,8 +247,9 @@ def run_cli(*argv):
 
 
 def test_cli_text_and_json():
-    text = run_cli("--model", "27b", "--spec-k", "3", "--tok-s", "49.0", "--depth", "4096")
-    for needle in ("DECODE one token", "bandwidth floor", "speculative k=3", "MEASURED 49.0", "PREFILL"):
+    text = run_cli("--model", "27b", "--spec-k", "3", "--tok-s", "49.0", "--depth", "4096", "--levers")
+    for needle in ("DECODE one token", "bandwidth floor", "speculative k=3", "MEASURED 49.0", "PREFILL",
+                   "LEVERS ranked", "output head -> q4"):
         check(needle in text, f"report is missing {needle!r}")
     report = json.loads(run_cli("--model", "35b-a3b", "--recipe", "qwen3_6_35b_a3b", "--json",
                                 "--tok-s", "204.5", "--prompt", "512", "--prompt", "4096"))

@@ -42,6 +42,7 @@ Norm weights and biases are ignored (well under 0.1% of the bytes).
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 from dataclasses import dataclass
@@ -407,14 +408,32 @@ def decode_step(geo: Geometry, weights: Sequence[Weight], *, tokens: int = 1, de
         layers=geo.layers, hardware=hardware, cal=cal)
 
 
+def tokens_per_round(k: int, acceptance: float) -> float:
+    """Tokens one speculative round yields: the verified token plus the accepted drafts.
+    `acceptance` is accepted drafts / drafted tokens (docs/performance/methodology.md). Holds for the
+    Flash-Next MTP table too: 82 / 76 / 65% at 1 / 2 / 3 drafts give its measured 1.82 / 2.51 / 2.94."""
+    return 1.0 + acceptance * k
+
+
+def bytes_by_group(weights: Sequence[Weight], geo: Geometry, tokens: int = 1) -> dict[str, float]:
+    """Bytes one step streams, grouped by the kernel family that streams them: the stored weight
+    format (`q4`, `q5`, ...), or `moe` for routed experts. Kernel names carry the format, not the
+    role, which is why `kernel_bandwidth.py` joins on this grouping."""
+    groups: dict[str, float] = {}
+    for w in weights:
+        group = "moe" if w.experts else w.fmt
+        groups[group] = groups.get(group, 0.0) + w.read_bytes(geo, tokens)
+    return groups
+
+
 def speculative(plain_bytes_step: DecodeStep, verify_step: DecodeStep, k: int, acceptance: float,
                 cal: Calibration = CALIBRATION) -> dict[str, float]:
     """One verify round of k drafts. `acceptance` is accepted drafts / drafted tokens."""
-    tokens_per_round = 1.0 + acceptance * k
+    tokens_per_round_ = tokens_per_round(k, acceptance)
     round_ms = verify_step.step_ms * cal.spec_round_ratio
-    tok_s = tokens_per_round / round_ms * 1e3
+    tok_s = tokens_per_round_ / round_ms * 1e3
     plain_tok_s = 1e3 / plain_bytes_step.step_ms
-    return {"k": k, "acceptance": acceptance, "tokens_per_round": tokens_per_round,
+    return {"k": k, "acceptance": acceptance, "tokens_per_round": tokens_per_round_,
             "round_ms": round_ms, "round_over_plain": round_ms / plain_bytes_step.step_ms,
             "tok_s": tok_s, "speedup": tok_s / plain_tok_s}
 
@@ -453,6 +472,91 @@ def prefill(geo: Geometry, weights: Sequence[Weight], prompt: int, hardware: Har
 # ---------------------------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------------------------
+# Levers: a fixed menu of what-ifs, ranked
+# ---------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Lever:
+    name: str
+    kind: str  # "bytes": fewer bytes streamed (changes numerics); "kernel": less time per byte
+    roles: tuple[str, ...] = ()  # bytes levers: move these roles to `fmt` where it saves bytes
+    fmt: str = "q4"
+    gdn_state_fp16: bool = False
+    overhead_scale: float | None = None  # kernel levers: multiply the per-layer overhead by this
+    evidence: str = ""  # what the repository already knows, with where
+
+
+_ATTENTION_GDN = ("attention.query", "attention.gate", "attention.key", "attention.value",
+                  "attention.output", "gdn.query", "gdn.key", "gdn.value", "gdn.z", "gdn.output")
+_EVERY_MATRIX = _ATTENTION_GDN + ("mlp.gate", "mlp.up", "mlp.down", "experts.gate", "experts.up",
+                                  "experts.down", "moe.shared.gate", "moe.shared.up",
+                                  "moe.shared.down", "output_head")
+
+# Evidence strings cite docs/maintainer/quality-trade-experiments.md (measured 2026-09-12). A lever
+# with no evidence is an unmeasured quality cost: the byte saving is arithmetic, the damage is not.
+LEVERS = (
+    Lever("output head -> q4", "bytes", ("output_head",), "q4",
+          evidence="measured: perplexity +0.69%; plain decode +1.4% to +2.9%, C1 MTP3 within noise, C8 +3.2%"),
+    Lever("GDN state in FP16", "bytes", gdn_state_fp16=True,
+          evidence="measured: perplexity -0.003%; state drift 0.34% worst; C1 within noise, C8 +2.0%"),
+    Lever("MLP weights -> q4", "bytes", ("mlp.gate", "mlp.up", "mlp.down"), "q4",
+          evidence="quality not measured"),
+    Lever("routed experts -> q4", "bytes", ("experts.gate", "experts.up", "experts.down"), "q4",
+          evidence="quality not measured"),
+    Lever("attention + GDN projections -> q4", "bytes", _ATTENTION_GDN, "q4",
+          evidence="quality not measured"),
+    Lever("every matrix -> q4", "bytes", _EVERY_MATRIX, "q4",
+          evidence="an upper bound for weight quantisation; quality not measured"),
+    Lever("kernels: 25% less per-layer overhead", "kernel", overhead_scale=0.75,
+          evidence="no quality cost; needs kernel work (launch gaps, wave tails, fusion)"),
+    Lever("kernels: 50% less per-layer overhead", "kernel", overhead_scale=0.5,
+          evidence="no quality cost; needs kernel work"),
+    Lever("kernels: bandwidth floor (no overhead)", "kernel", overhead_scale=0.0,
+          evidence="the ceiling for any kernel work at these bytes; not reachable"),
+)
+
+
+def rank_levers(geo: Geometry, recipe: Recipe, overrides: dict[str, str], *, depth: int = 0,
+                kv: str = "int8", kv_bpt: float | None = None, gdn_state_bytes_per: int = 4,
+                hardware: Hardware = RTX_3090, cal: Calibration = CALIBRATION) -> list[dict]:
+    """Predicted plain-decode gain of each lever over the current configuration, best first. A
+    bytes lever that would not shrink anything here (the role is absent, or already at or below the
+    target) is left out rather than shown as a zero."""
+    def tok_s(weights: Sequence[Weight], state: int, calibration: Calibration) -> float:
+        return 1e3 / decode_step(geo, weights, depth=depth, kv=kv, kv_bpt=kv_bpt,
+                                 gdn_state_bytes_per=state, hardware=hardware,
+                                 cal=calibration).step_ms
+
+    base_weights = build_weights(geo, recipe, overrides)
+    base = tok_s(base_weights, gdn_state_bytes_per, cal)
+    rows = []
+    for lever in LEVERS:
+        weights, state, calibration = base_weights, gdn_state_bytes_per, cal
+        if lever.kind == "kernel":
+            calibration = dataclasses.replace(cal, per_layer_ms=cal.per_layer_ms * lever.overhead_scale)
+        else:
+            if lever.gdn_state_fp16:
+                if gdn_state_bytes_per <= 2:
+                    continue
+                state = 2
+            else:
+                # A role can mix formats across layers (the 3090 recipe keeps mlp.down at q5 in
+                # layers 0-35 and q4 after), so ask whether any layer would shrink.
+                shrinks = {w.role for w in base_weights
+                           if w.role in lever.roles and w.fmt not in ("bf16", "fp32")
+                           and FORMAT_BITS[w.fmt] > FORMAT_BITS[lever.fmt]}
+                changes = {role: lever.fmt for role in shrinks}
+                if not changes:
+                    continue
+                weights = build_weights(geo, recipe, {**overrides, **changes})
+        value = tok_s(weights, state, calibration)
+        rows.append({"name": lever.name, "kind": lever.kind, "tok_s": value,
+                     "gain_pct": 100 * (value / base - 1), "evidence": lever.evidence})
+    return sorted(rows, key=lambda r: -r["gain_pct"])
+
+
 def _decode_table(step: DecodeStep, top: int) -> list[dict]:
     rows = sorted(step.by_role.items(), key=lambda kv: -kv[1])
     shown, rest = rows[:top], rows[top:]
@@ -470,7 +574,9 @@ def _decode_table(step: DecodeStep, top: int) -> list[dict]:
     return table
 
 
-def build_report(args: argparse.Namespace) -> dict:
+def resolve(args: argparse.Namespace) -> tuple[Geometry, str, list[Weight], Hardware, dict[str, str]]:
+    """The model, recipe overrides and card an invocation names. Shared by every tool built on this
+    one, so `--model`, `--config`, `--format` and the card flags mean the same thing everywhere."""
     if args.config:
         geo = Geometry.from_config(json.loads(Path(args.config).read_text()))
         label = Path(args.config).name
@@ -481,6 +587,28 @@ def build_report(args: argparse.Namespace) -> dict:
     weights = build_weights(geo, RECIPES[args.recipe], overrides)
     hardware = Hardware(RTX_3090.name, args.bandwidth_gb_s or RTX_3090.read_gb_s,
                         RTX_3090.advertised_gb_s, args.int8_tops or RTX_3090.int8_tops)
+    return geo, label, weights, hardware, overrides
+
+
+def add_model_arguments(parser: argparse.ArgumentParser) -> None:
+    """The flags that choose a model, a recipe, a KV format and a card; see `resolve`."""
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--model", choices=sorted(PRESETS), default="27b")
+    source.add_argument("--config", help="a model's config.json instead of a preset")
+    parser.add_argument("--recipe", choices=sorted(RECIPES), default="qwen3_8_27b")
+    parser.add_argument("--format", action="append", default=[], metavar="ROLE=FORMAT",
+                        help="what-if: store ROLE (e.g. output_head, mlp.down) in FORMAT "
+                             f"({', '.join(sorted(FORMAT_BITS))}); repeatable")
+    parser.add_argument("--kv", choices=sorted(KV_BYTES_PER_ELEMENT), default="int8")
+    parser.add_argument("--kv-bytes-per-token", type=float,
+                        help="exact value from ninfer_bench; overrides --kv (needed for rk4v4)")
+    parser.add_argument("--gdn-state-fp16", action="store_true")
+    parser.add_argument("--bandwidth-gb-s", type=float, help="sustained read rate of another card")
+    parser.add_argument("--int8-tops", type=float, help="INT8 tensor peak of another card")
+
+
+def build_report(args: argparse.Namespace) -> dict:
+    geo, label, weights, hardware, overrides = resolve(args)
     state_bytes = 2 if args.gdn_state_fp16 else 4
     depths = args.depth or [0]
 
@@ -513,6 +641,10 @@ def build_report(args: argparse.Namespace) -> dict:
                               "pct_of_floor": 100 * first["floor_ms"] / measured_ms}
     report["prefill"] = [prefill(geo, weights, n, hardware, chunk=args.chunk)
                          for n in (args.prompt or [4096])]
+    if args.levers:
+        report["levers"] = rank_levers(geo, RECIPES[args.recipe], overrides, depth=depths[0],
+                                       kv=args.kv, kv_bpt=args.kv_bytes_per_token,
+                                       gdn_state_bytes_per=state_bytes, hardware=hardware)
     return report
 
 
@@ -560,32 +692,29 @@ def print_report(r: dict, spec_k: int) -> None:
               f"attention {p['attention_s']:.2f} s)")
         print(f"  {p['ops_per_token'] / 1e9:.1f} GOP/token; the INT8 peak alone would give "
               f"{p['ceiling_tok_s']:,.0f} tok/s")
+    if r.get("levers"):
+        print(f"\nLEVERS ranked by predicted plain-decode gain (depth {r['decode'][0]['depth']:,})")
+        for row in r["levers"]:
+            print(f"  {row['gain_pct']:+6.1f}%  {row['tok_s']:7.1f} tok/s  [{row['kind']:<6}] "
+                  f"{row['name']}")
+            print(f"{'':>34}{row['evidence']}")
+        print("  'bytes' levers change numerics: the saving is arithmetic, the quality cost is not.")
     print("\nA model, not a measurement. Disagreement with a real run is the finding.")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    source = parser.add_mutually_exclusive_group()
-    source.add_argument("--model", choices=sorted(PRESETS), default="27b")
-    source.add_argument("--config", help="a model's config.json instead of a preset")
-    parser.add_argument("--recipe", choices=sorted(RECIPES), default="qwen3_8_27b")
-    parser.add_argument("--format", action="append", default=[], metavar="ROLE=FORMAT",
-                        help="what-if: store ROLE (e.g. output_head, mlp.down) in FORMAT "
-                             f"({', '.join(sorted(FORMAT_BITS))}); repeatable")
+    add_model_arguments(parser)
     parser.add_argument("--depth", type=int, action="append", help="KV depth in tokens; repeatable")
-    parser.add_argument("--kv", choices=sorted(KV_BYTES_PER_ELEMENT), default="int8")
-    parser.add_argument("--kv-bytes-per-token", type=float,
-                        help="exact value from ninfer_bench; overrides --kv (needed for rk4v4)")
-    parser.add_argument("--gdn-state-fp16", action="store_true")
+    parser.add_argument("--levers", action="store_true",
+                        help="rank a fixed menu of what-ifs by predicted plain-decode gain")
     parser.add_argument("--spec-k", type=int, default=0, help="drafts per round; 0 = no speculation")
     parser.add_argument("--acceptance", type=float, default=0.6,
                         help="accepted drafts / drafted tokens, from a real run")
     parser.add_argument("--tok-s", type=float, help="measured plain-decode tok/s at the first depth")
     parser.add_argument("--prompt", type=int, action="append", help="prompt tokens; repeatable")
     parser.add_argument("--chunk", type=int, default=4096, help="prefill chunk size in tokens")
-    parser.add_argument("--bandwidth-gb-s", type=float, help="sustained read rate of another card")
-    parser.add_argument("--int8-tops", type=float, help="INT8 tensor peak of another card")
     parser.add_argument("--top", type=int, default=8, help="roles to list individually")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
