@@ -279,7 +279,8 @@ un.bat" qwen38-27b'
 - **Breaking-change audit:** the numbered output of `git grep | sort -u` can come back with line numbers
   from a shell hook; strip them (`sed -E 's/^ *[0-9]+[ \t]*//'`) before `comm`.
 - **The Windows zip hash changes when the notes change**: write the Windows checks in the notes without the
-  hash (it is in `SHA256SUMS-*-windows.txt`), so the zip need not be rebuilt for a notes edit.
+  hash (it is in `SHA256SUMS-*-windows.txt`), so the notes never hold a stale hash. The zip embeds the notes,
+  so any notes edit still means rerunning the Windows packager (see "Traps hit in v0.17.2").
 - Merging the release PR with `--merge` gives the merge commit to tag; `gh release create ... --verify-tag`.
 
 
