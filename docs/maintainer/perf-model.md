@@ -60,7 +60,7 @@ you name (plain, `--mtp-k`, `--lanes`).
 
 | Part | Method | Trust |
 |---|---|---|
-| Decode bytes per token | Every dense matrix, one embedding row, 8 of 256 routed experts per layer, GDN state in and out, KV for the cached depth plus the step's own entries (the columns of a verification share each K/V read; they do not each re-read the cache). Formats come from the recipe. | Exact arithmetic. Matches [`decode_byte_accounting.py`](../../tools/decode_byte_accounting.py)'s artifact-header count within 0.02%. |
+| Decode bytes per token | Every dense matrix, one embedding row, 8 of 256 routed experts per layer, GDN state in and out (the recurrent matrix, which `--gdn-state-fp16` halves, plus the BF16 convolution history, which it does not), KV for the cached depth plus the step's own entries (the columns of a verification share each K/V read; they do not each re-read the cache). Formats come from the recipe. | Exact arithmetic. Matches [`decode_byte_accounting.py`](../../tools/decode_byte_accounting.py)'s artifact-header count within 0.02%. |
 | Decode speed | `bytes / 854.2 GB/s + layers x 0.0425 ms` | One fitted constant, two points. Consistent with the runs below, not proven for a third model. |
 | Speculative decode | `tokens per round = 1 + acceptance x k`; round = step at `k+1` columns x 1.15 | Acceptance is an input. MoE verify uses the expected expert union under independent uniform routing: right for unrelated sequences, an overestimate for the columns of one sequence (Flash-Next measured 47% new experts per column, uniform predicts 98%). |
 | Prefill | `steps x fixed cost + 2 x active parameters x tokens / (316 INT8 TOPS x efficiency) + attention` | Two constants per family, fitted on two prompt lengths each. |
@@ -143,6 +143,9 @@ spike measured a hit-rate collapse there that this model does not reproduce).
   fails if a recipe name disappears but cannot see a changed format. `--recipe` defaults to the
   model's family (`qwen3_8_27b` for dense, `qwen3_6_35b_a3b` for an MoE) and a recipe for the other
   family is refused, as `official_recipes.py` does.
+- `tie_word_embeddings` is a property of the source checkpoint. The converter still stores
+  `text/token_embedding` and `text/output_head` as two objects, each in its recipe's own format (Q4 and
+  Q6 in the 3090 recipe), so both are counted whether or not the source is tied.
 - Numeric flags are validated at the command line (positive and finite where a zero would divide or
   silently fall back); `--bandwidth-gb-s` or `--int8-tops` mark the report as a custom card.
 - Calibration constants sit in one dataclass per tool, each with the measurement it came from. After a

@@ -82,7 +82,27 @@ def test_decode_slows_with_depth_by_the_kv_bytes():
     bf16 = m.decode_step(geo, weights, depth=32768, kv="bf16")
     check(near(bf16.kv / deep.kv, 2 / (33 / 32), 1e-9), "BF16 KV is 2 bytes per element")
     fp16_state = m.decode_step(geo, weights, gdn_state_bytes_per=2)
-    check(near(fp16_state.state_rw, shallow.state_rw / 2, 1e-9), "FP16 GDN state halves the traffic")
+    # --gdn-state-fp16 halves the recurrent matrix only; the convolution history stays BF16.
+    check(near(shallow.state_rw - fp16_state.state_rw, m.gdn_state_bytes(geo, 4), 1e-9),
+          "FP16 GDN state should save exactly half of the recurrent matrix's read and write")
+
+
+def test_gdn_state_traffic_includes_the_convolution_history():
+    # Review finding (codepulse, PR #438): only the recurrent [Dv, Dk] matrix was counted, but each GDN
+    # layer also keeps the preceding conv_width - 1 columns of its projected Q/K/V channels, always BF16
+    # (docs/maintainer/replayssm-gdn.md: Q = 2 L_g C_p (W - 1)), read and written every step.
+    geo, weights = model("27b", "qwen3_8_27b")
+    expected = 2 * 48 * (2 * 16 * 128 + 48 * 128) * 3  # 2 B x GDN layers x channels x (W - 1)
+    check(m.gdn_conv_bytes(geo) == expected, f"27B convolution history {m.gdn_conv_bytes(geo)} B, want {expected}")
+    step = m.decode_step(geo, weights)
+    check(step.state_rw == 2 * (m.gdn_state_bytes(geo, 4) + expected), "state traffic = 2 x (recurrent + conv)")
+    check(m.decode_step(geo, weights, gdn_state_bytes_per=2).state_rw
+          == 2 * (m.gdn_state_bytes(geo, 2) + expected), "the FP16 what-if must not shrink the conv history")
+    moe_geo = m.Geometry.from_config(m.PRESETS["35b-a3b"])
+    check(m.gdn_conv_bytes(moe_geo) == 2 * 30 * (2 * 16 * 128 + 32 * 128) * 3, "35B-A3B: 30 GDN layers")
+    all_full = dict(m.PRESETS["27b"])
+    all_full["layer_types"] = ["full_attention"] * all_full["num_hidden_layers"]
+    check(m.gdn_conv_bytes(m.Geometry.from_config(all_full)) == 0, "no GDN layers, no convolution history")
 
 
 def test_a_verification_reads_its_own_entries_but_not_one_pass_per_column():
@@ -315,7 +335,13 @@ def test_the_default_recipe_follows_the_model_and_a_mismatch_is_refused():
     # End to end: no --recipe on the MoE preset gives the MoE's bytes, not a dense recipe's fallback.
     report = json.loads(run_cli("--model", "35b-a3b", "--json"))
     check(report["recipe"] == "qwen3_6_35b_a3b", "the report names the recipe it used")
-    check(near(report["decode"][0]["total_gb"], 2.648, 1e-3), "and the MoE token is 2.648 GB")
+    # 2.522 GB of weights (decode_byte_accounting.py's artifact-header count) plus the GDN state read and
+    # write and the one-entry KV: pinned as its parts, so a change to the state definition shows up here.
+    moe_geo = m.Geometry.from_config(m.PRESETS["35b-a3b"])
+    state_gb = 2 * (m.gdn_state_bytes(moe_geo, 4) + m.gdn_conv_bytes(moe_geo)) / 1e9
+    kv_gb = m.kv_bytes_per_token(moe_geo, "int8") / 1e9
+    check(near(report["decode"][0]["total_gb"], 2.522 + state_gb + kv_gb, 1e-3),
+          f"the MoE token is {report['decode'][0]['total_gb']:.4f} GB, not 2.522 + {state_gb:.4f} + {kv_gb:.6f}")
 
 
 def test_numeric_options_are_validated_at_the_command_line():

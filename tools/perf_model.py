@@ -401,6 +401,15 @@ def gdn_state_bytes(geo: Geometry, state_bytes: int) -> float:
     return gdn_layers * geo.gdn_value_heads * geo.gdn_value_dim * geo.gdn_key_dim * state_bytes
 
 
+def gdn_conv_bytes(geo: Geometry) -> float:
+    """The convolution history every GDN layer also keeps: the preceding `conv_width - 1` columns of the
+    projected Q/K/V channels, always BF16 (docs/maintainer/replayssm-gdn.md: Q = 2 L_g C_p (W - 1)).
+    It is read and written every step like the recurrent matrix, but --gdn-state-fp16 does not shrink it."""
+    gdn_layers = geo.layers - geo.full_layers
+    channels = 2 * geo.gdn_key_heads * geo.gdn_key_dim + geo.gdn_value_heads * geo.gdn_value_dim
+    return gdn_layers * channels * max(geo.conv_width - 1, 0) * 2
+
+
 @dataclass
 class DecodeStep:
     tokens: int
@@ -449,7 +458,8 @@ def decode_step(geo: Geometry, weights: Sequence[Weight], *, tokens: int = 1, de
     per_token_kv = kv_bytes_per_token(geo, kv) if kv_bpt is None else kv_bpt
     return DecodeStep(
         tokens=tokens, depth=depth, by_role=by_role, weights=sum(by_role.values()),
-        state_rw=2 * gdn_state_bytes(geo, gdn_state_bytes_per), kv=per_token_kv * (depth + tokens),
+        state_rw=2 * (gdn_state_bytes(geo, gdn_state_bytes_per) + gdn_conv_bytes(geo)),
+        kv=per_token_kv * (depth + tokens),
         layers=geo.layers, hardware=hardware, cal=cal)
 
 
