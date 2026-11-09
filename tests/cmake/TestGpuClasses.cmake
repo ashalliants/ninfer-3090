@@ -111,6 +111,10 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_wide_math_test
   ninfer_worker_recovery_test
 )
+# Drives scripts/vast/vast-up.sh, a bash script, so it is registered on POSIX hosts only (BenchSupportTests.cmake).
+if(UNIX)
+  list(APPEND NINFER_CPU_ONLY_TESTS ninfer_vast_up_test)
+endif()
 
 get_property(ninfer_all_tests DIRECTORY PROPERTY TESTS)
 foreach(test IN LISTS NINFER_CPU_ONLY_TESTS)

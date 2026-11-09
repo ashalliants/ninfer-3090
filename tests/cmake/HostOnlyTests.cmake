@@ -62,3 +62,6 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_wide_math_test
   ninfer_worker_recovery_test
 )
+if(UNIX)
+  list(APPEND NINFER_HOST_ONLY_TESTS ninfer_vast_up_test)
+endif()

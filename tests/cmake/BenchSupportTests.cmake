@@ -61,3 +61,11 @@ add_test(NAME ninfer_flash_next_perf_model_test
 # below its default and the offer listing does not say so. Pure Python, no GPU and no Vast account.
 add_test(NAME ninfer_vast_power_guard_test
   COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/scripts/vast/test_power_guard.py)
+
+# The rental loop itself (scripts/vast/vast-up.sh) against a fake vastai and ssh: a rejected host is
+# destroyed and the next tried, a run with no good host leaves nothing billing, and a failed destroy keeps
+# the instance tracked. It runs the bash script, so it is registered where bash is the shell (not Windows).
+if(UNIX)
+  add_test(NAME ninfer_vast_up_test
+    COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/scripts/vast/test_vast_up.py)
+endif()

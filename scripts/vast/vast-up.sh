@@ -38,8 +38,10 @@ fi
 disk_gb=80
 min_power_pct="${NINFER_VAST_MIN_POWER_PCT:-100}"
 max_hosts="${NINFER_VAST_MAX_HOSTS:-4}"
-[[ "$min_power_pct" =~ ^[0-9]+$ ]] && (( min_power_pct <= 100 )) || { echo "NINFER_VAST_MIN_POWER_PCT must be 0-100, got '$min_power_pct'." >&2; exit 1; }
-[[ "$max_hosts" =~ ^[1-9][0-9]*$ ]] || { echo "NINFER_VAST_MAX_HOSTS must be a positive number, got '$max_hosts'." >&2; exit 1; }
+[[ "$min_power_pct" =~ ^[0-9]{1,3}$ ]] || { echo "NINFER_VAST_MIN_POWER_PCT must be 0-100, got '$min_power_pct'." >&2; exit 1; }
+min_power_pct=$((10#$min_power_pct))   # base 10: Bash would read "080" as an invalid octal number
+(( min_power_pct <= 100 )) || { echo "NINFER_VAST_MIN_POWER_PCT must be 0-100, got '$min_power_pct'." >&2; exit 1; }
+[[ "$max_hosts" =~ ^[1-9][0-9]{0,2}$ ]] || { echo "NINFER_VAST_MAX_HOSTS must be a number from 1 to 999, got '$max_hosts'." >&2; exit 1; }
 # Verified single-3090 offers with a fast link, CUDA 12.8-capable drivers and >=16 effective cores (a release
 # build is 15 min on 24 cores, an hour on 6), ranked by estimated total. Spain hosts were the reliable ones in
 # 2026-10. The cheapest max_hosts are the candidates, in order.
@@ -78,7 +80,8 @@ else
   echo "Renting the first one (power-limit check off)."
 fi
 
-onstart="$(mktemp)"
+onstart="$(mktemp "${TMPDIR:-/tmp}/ninfer-vast-onstart.XXXXXX")"   # a template: BSD mktemp ignores TMPDIR without one
+trap 'rm -f "$onstart"' EXIT   # replaced below by one that also destroys a rented instance
 cat > "$onstart" <<ONSTART
 #!/bin/bash
 # Dead-man switch first, before anything can fail.
@@ -111,7 +114,7 @@ destroy_instance() {
   echo "Destroy FAILED: instance $1 is still billing. Run vast-destroy.sh until it succeeds." >&2
   return 1
 }
-trap 'rc=$?; if (( rc != 0 )) && [[ -n "$new" ]]; then echo "vast-up failed: destroying instance $new" >&2; destroy_instance "$new" || true; fi' EXIT
+trap 'rc=$?; rm -f "$onstart"; if (( rc != 0 )) && [[ -n "$new" ]]; then echo "vast-up failed: destroying instance $new" >&2; destroy_instance "$new" || true; fi' EXIT
 
 # Try the candidates cheapest first. A host is kept only if it boots within 8 minutes and its card may draw
 # enough power; otherwise it is destroyed and the next one tried.
