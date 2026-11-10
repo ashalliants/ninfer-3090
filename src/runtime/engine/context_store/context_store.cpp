@@ -244,6 +244,18 @@ private:
 };
 
 std::vector<std::uint8_t> read_whole_file(const fs::path& path) {
+    // A directory (or other non-regular path) can open and report size 0 without the stream ever
+    // setting failbit: on this Linux/glibc combination lseek(SEEK_END) on a directory fd returns 0
+    // rather than failing, so the old size-only check silently returned an empty vector for one --
+    // observed for a manifest's peer marker replaced by a directory in test_context_store.cpp's
+    // "an unreadable marker..." case (Vast RTX 3090, 2026-11-10): the empty result compared unequal
+    // to the real checksum and was treated as a stale marker instead of an unreadable one. Checking
+    // the type explicitly is deterministic across platforms and filesystems, unlike inferring it
+    // from how open/seek/read happen to behave.
+    std::error_code type_error;
+    if (!fs::is_regular_file(path, type_error) || type_error) {
+        throw std::runtime_error("cannot open " + path.string());
+    }
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) { throw std::runtime_error("cannot open " + path.string()); }
     const std::streamsize size = file.tellg();
