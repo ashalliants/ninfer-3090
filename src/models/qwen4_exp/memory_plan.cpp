@@ -51,7 +51,11 @@ HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const Host
                        std::max(demand.later_pinned, demand.load_staging);
     if (snapshot.lock_limit && out.pinned_total > *snapshot.lock_limit) {
         out.lock_limited = true;
-        out.fits         = false;
+        // Advisory: cudaHostAlloc, not this estimate, is the real test, exactly as the Windows WDDM
+        // pin_cap already only warns (memory_plan.h's PartialRamDemand::pin_cap). A pin that
+        // genuinely cannot be made still fails loudly where it is made, never silently on unlocked
+        // memory: cudaHostAlloc has no partial-success return.
+        if (!demand.lock_limit_advisory) { out.fits = false; }
     }
     return out;
 }
@@ -201,7 +205,9 @@ ContextCacheFit fit_context_cache(const HostMemorySnapshot& snapshot, HostMemory
                                    saturating_sub(snapshot.available_commit, floor_bytes));
     // The cache's own lock bookkeeping comes out of the same room.
     spare = static_cast<std::uint64_t>(static_cast<double>(spare) / (1.0 + demand.lock_overhead));
-    if (snapshot.lock_limit) { spare = std::min(spare, saturating_sub(*snapshot.lock_limit, without.pinned_total)); }
+    if (snapshot.lock_limit && !demand.lock_limit_advisory) {
+        spare = std::min(spare, saturating_sub(*snapshot.lock_limit, without.pinned_total));
+    }
     std::uint64_t bytes = std::min(requested, spare);
     bytes               = bytes / granule * granule;
     if (bytes < minimum) { bytes = 0; }
@@ -236,11 +242,17 @@ std::string HostMemoryLedger::describe() const {
 
 std::string HostMemoryLedger::summary() const {
     char line[512];
-    if (lock_limited) {
+    if (lock_limited && !demand.lock_limit_advisory) {
         std::snprintf(line, sizeof(line),
                       "RAM: the memory-lock limit is %.1f GiB but Qwen3.8-Flash-Next pins %.1f GiB of experts and "
                       "weights. Raise it (ulimit -l unlimited, or LimitMEMLOCK=infinity for a service) and start "
                       "again",
+                      gib(*snapshot.lock_limit), gib(pinned_total));
+    } else if (lock_limited) {
+        std::snprintf(line, sizeof(line),
+                      "RAM: the memory-lock limit is %.1f GiB, below the %.1f GiB Qwen3.8-Flash-Next pins. "
+                      "Continuing anyway (--allow-unlocked-host-memory): a pin that genuinely cannot be made "
+                      "will still fail loudly when it is made, not silently",
                       gib(*snapshot.lock_limit), gib(pinned_total));
     } else if (fits) {
         std::snprintf(line, sizeof(line), "RAM: %.1f of %.1f GiB free; every expert fits in RAM (%.1f GiB pinned)",

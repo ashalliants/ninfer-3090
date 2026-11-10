@@ -134,6 +134,26 @@ void test_lock_limit() {
     require(plan_host_memory(s, staged).lock_limited, "a lock limit one byte under the staging peak refuses");
 }
 
+// --allow-unlocked-host-memory: the same limit is still reported, but no longer refuses -- the real
+// cudaHostAlloc calls are left to decide, as the Windows WDDM pin_cap already only warns.
+void test_lock_limit_advisory() {
+    const HostMemoryDemand d = flash_next();
+    const std::uint64_t need = need_for_full(d);
+    HostMemorySnapshot s     = snapshot(need + 10 * kGiB, need + 10 * kGiB);
+    s.lock_limit              = 8 * kGiB;
+    HostMemoryDemand advisory = d;
+    advisory.lock_limit_advisory = true;
+    const HostMemoryLedger ignored = plan_host_memory(s, advisory);
+    require(ignored.fits && ignored.lock_limited,
+            "an advisory lock limit below the pinned total still fits and still reports it");
+    require(ignored.summary().find("Continuing anyway") != std::string::npos,
+            "the advisory summary says it is continuing, not refusing");
+    require(ignored.summary().find("--allow-unlocked-host-memory") != std::string::npos,
+            "the advisory summary names the flag that produced it");
+    const HostMemoryLedger refused = plan_host_memory(s, d);
+    require(!refused.fits, "the same limit without the flag still refuses (no regression)");
+}
+
 void test_starved_and_describe() {
     const HostMemoryDemand d     = flash_next();
     const HostMemoryLedger empty = plan_host_memory(snapshot(kGiB, kGiB), d);
@@ -600,6 +620,7 @@ int main() {
         test_planned_terms();
         test_commit_limit();
         test_lock_limit();
+        test_lock_limit_advisory();
         test_starved_and_describe();
         test_graph_bound();
         test_display_headroom();

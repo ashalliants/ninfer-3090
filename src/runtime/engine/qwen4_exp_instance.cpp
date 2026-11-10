@@ -419,7 +419,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // The RAM ledger: every expert (and the vision tower) is pinned, beside a reserve for Windows and
     // every other planned allocation, before anything is pinned or read.
     models::qwen4_exp::HostMemoryDemand demand;
-    demand.reserve      = next.ram_headroom_bytes;
+    demand.reserve             = next.ram_headroom_bytes;
+    demand.lock_limit_advisory = next.allow_unlocked_host_memory;
     models::qwen4_exp::plan_pinned_weights(demand, plan.pinned_bytes(), hot_embedding);
     demand.later_pinned = kProgramPinnedAllowance;
     std::uint64_t cpu_misses_pageable = 0;

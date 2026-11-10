@@ -47,6 +47,10 @@ struct HostMemoryDemand {
     double lock_overhead = 0.0025;
     // Beyond the banks, so the system is not run at the reserve's edge.
     std::uint64_t full_margin = kLedgerGiB;
+    // --allow-unlocked-host-memory (EngineOptions::allow_unlocked_host_memory): the Linux
+    // RLIMIT_MEMLOCK check below becomes a warning, like the Windows WDDM pin_cap already is, rather
+    // than a startup refusal.
+    bool lock_limit_advisory = false;
 };
 
 struct HostMemoryLedger {

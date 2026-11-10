@@ -539,6 +539,18 @@ struct FlashNextOptions {
     // Physical Host memory left free for Windows and other programs once every expert is pinned;
     // startup refuses when it cannot be kept.
     std::uint64_t ram_headroom_bytes = 2ULL << 30;
+    // Linux only. Every expert and weight is pinned with cudaHostAlloc, which the Linux CUDA driver
+    // may refuse once the process's RLIMIT_MEMLOCK is below the total pinned (a Windows host has no
+    // such limit). Startup normally refuses up front with a clear message rather than a raw
+    // cudaHostAlloc failure part-way through loading. Some containers (confirmed on a Vast.ai
+    // rental, 2026-11-10) cap RLIMIT_MEMLOCK far below what any Flash-Next load needs and give no
+    // way to raise it, even to root, from inside the container. This flag skips that preflight
+    // refusal and lets the real cudaHostAlloc calls decide, the same way the Windows WDDM page-lock
+    // cap is already only a warning (memory_plan.h's pin_cap): if a pin genuinely fails, it still
+    // fails loudly there, with its own error, never by silently continuing on unlocked memory --
+    // cudaHostAlloc has no partial-success return. Off by default: a clear preflight refusal reads
+    // better than a raw allocator error on hosts where raising the limit is possible.
+    bool allow_unlocked_host_memory = false;
     // Keep only the routed experts the VRAM expert cache does not hold in host RAM, plus spare slots
     // (--partial-ram-residency), instead of pinning every expert: the hottest are read from the
     // artifact straight into VRAM and live only there, and an expert evicted from VRAM is first

@@ -239,7 +239,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
            "[--moe-fused-route] [--cpu-verify-misses] [--prefill-cpu-share F] [--cpu-verify-workers N] [--gdn-async-commit] [--hc-int8 [--hc-fused-read]] "
            "[--ngram-flag-wait] [--partial-ram-residency] [--ggml-decode-mma] "
-           "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
+           "[--ram-headroom-mib N] [--allow-unlocked-host-memory] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
            "[--gdn-state-fp16] [--numeric-tripwire [--numeric-tripwire-limit F|inf]] "
@@ -364,7 +364,12 @@ std::string serve_usage_text(const char* argv0) {
            "copy, damaged; default <model>.expert-state.default); --vram-headroom-mib N is the VRAM "
            "the expert cache leaves free for the desktop (default 512 with a display, 256 without); "
            "--ram-headroom-mib N is the RAM left free for Windows once every expert is pinned "
-           "(default 2048; startup refuses when it cannot be kept); --expert-cache-mib N caps the "
+           "(default 2048; startup refuses when it cannot be kept); --allow-unlocked-host-memory "
+           "(Linux) skips the preflight refusal when RLIMIT_MEMLOCK is below the pinned total, the "
+           "same way the Windows WDDM page-lock cap is already only a warning: the real cudaHostAlloc "
+           "calls decide, and a pin that genuinely cannot be made still fails loudly where it is made "
+           "(off by default; some containers cap RLIMIT_MEMLOCK with no way to raise it, even as root); "
+           "--expert-cache-mib N caps the "
            "expert cache (for measurement); --shared-expert-stream runs each MoE block's shared "
            "expert on a second CUDA stream beside the routed experts (high priority in eager calls "
            "only; CUDA graphs ignore stream priority; the same output, bit for bit; off by default); --mtp-constrained keeps MTP speculation (--spec mtp) on for "
@@ -1100,6 +1105,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
         } else if (arg == "--ram-headroom-mib") {
             options.flash_next.ram_headroom_bytes =
                 parse_mib_bytes(require_value("--ram-headroom-mib"), "ram-headroom-mib");
+        } else if (arg == "--allow-unlocked-host-memory") {
+            options.flash_next.allow_unlocked_host_memory = true;
         } else if (arg == "--expert-cache-mib") {
             options.flash_next.expert_cache_bytes =
                 parse_mib_bytes(require_value("--expert-cache-mib"), "expert-cache-mib");
