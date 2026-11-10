@@ -48,7 +48,7 @@ from .quantization.groupwise import search_quantize_matrix
 FORMATS = (Q4, Q5)
 # Roles with both a Q4 and a Q5 registered kernel for the 27B shapes, in the official recipe.
 FLEXIBLE_ROLES = ("/attention/output", "/gdn/output", "/mlp/down")
-METRICS = ("relative", "absolute")
+METRICS = ("relative", "absolute", "activation")
 REPORT_VERSION = 1
 
 
@@ -72,18 +72,25 @@ def payload_bytes(format: str, shape: Sequence[int]) -> int:
     return row_split_geometry(format, shape).payload_bytes
 
 
+def dequantize(
+    weight: torch.Tensor, format: str, importance: torch.Tensor | None, *, device: str
+) -> torch.Tensor:
+    """The weights the artifact would store for ``weight``: the search encoder's round trip, FP32."""
+
+    encoded = search_quantize_matrix(
+        weight, get_format(format), importance=importance, negative_scales=True, device=device
+    )
+    decoded = encoded.scales.to(torch.float32).unsqueeze(-1) * encoded.codes.to(torch.float32)
+    return decoded.reshape(weight.shape[0], -1)[:, : weight.shape[1]]
+
+
 def weighted_error(
     weight: torch.Tensor, format: str, importance: torch.Tensor | None, *, device: str
 ) -> tuple[float, float]:
     """(importance-weighted squared rounding error, importance-weighted energy) of one chunk."""
 
-    spec = get_format(format)
-    encoded = search_quantize_matrix(
-        weight, spec, importance=importance, negative_scales=True, device=device
-    )
+    decoded = dequantize(weight, format, importance, device=device)
     n, k = weight.shape
-    decoded = encoded.scales.to(torch.float32).unsqueeze(-1) * encoded.codes.to(torch.float32)
-    decoded = decoded.reshape(n, -1)[:, :k]
     values = weight.to(device=decoded.device, dtype=torch.float32)
     w = (
         torch.ones(k, dtype=torch.float32, device=decoded.device)
@@ -183,6 +190,13 @@ def allocate(options: Mapping[str, Sequence[Option]], budget_bytes: int) -> dict
 
 
 def cost(entry: Mapping, format: str, metric: str) -> float:
+    if metric == "activation":
+        # Measured on real activations by tools.convert.allocation_activations, merged in as
+        # entry["activation"]: output change relative to the layer's residual-stream energy.
+        if "activation" not in entry:
+            raise ValueError("metric 'activation' needs scores from --activations")
+        item = entry["activation"]
+        return item["output_error"][format] / item["residual_energy"]
     error = entry["error"][format]
     if metric == "absolute":
         return error
@@ -275,6 +289,10 @@ def main(argv=None) -> None:
     parser.add_argument("--emit-override", type=Path, help="write the proposed --override file here")
     parser.add_argument("--layers", help="score only these layers, e.g. 36-63 (default all)")
     parser.add_argument("--metric", choices=METRICS, default="relative")
+    parser.add_argument(
+        "--activations", type=Path,
+        help="JSON from tools.convert.allocation_activations (required for --metric activation)",
+    )
     parser.add_argument("--budget-bytes", type=int, help="default: bytes of the official rule")
     parser.add_argument("--late-layer", type=int, default=QWEN3_8_27B_LATE_LAYER)
     parser.add_argument("--device", default="cpu")
@@ -304,7 +322,16 @@ def main(argv=None) -> None:
                 )
                 args.out.write_text(json.dumps(report))
             print(f"[{index + 1}/{len(names)}] {name}", flush=True)
-    scores = {name: report["scores"][name] for name in names}
+    scores = {name: dict(report["scores"][name]) for name in names}
+    if args.activations:
+        measured = json.loads(args.activations.read_text())["scores"]
+        for name in names:
+            if name in measured:
+                scores[name]["activation"] = measured[name]
+    if args.metric == "activation":
+        missing = [name for name in names if "activation" not in scores[name]]
+        if missing:
+            raise ValueError(f"--activations has no scores for {len(missing)} projections, e.g. {missing[0]}")
     if not all(entry["weighted"] for entry in scores.values()):
         print("warning: some projections have no imatrix vector and were scored unweighted")
     report["plan"] = plan(

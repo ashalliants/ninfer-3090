@@ -231,6 +231,11 @@ bits. For the attention output, GDN output and MLP down projections (the roles w
 kernels) it scores the imatrix-weighted rounding error at each format and writes an `--override`
 file that re-spends the official recipe's bytes where the error drops most. The score is a proxy:
 confirm a proposed allocation with a KLD or perplexity run before adopting it.
+`python -m tools.convert.allocation_activations` gives a better proxy on CPU: it runs the
+checkpoint layer by layer on held-out text (needs `transformers`) and measures how much noise each
+format adds to the residual stream; pass its output to `allocation --metric activation`. A
+candidate made this way, not yet validated, is
+[`candidates/qwen3_8_27b_activation.py`](../tools/convert/candidates/qwen3_8_27b_activation.py).
 
 The exact numeric and packing rules are in [numeric formats](maintainer/tensor-formats.md) and
 [storage layouts](maintainer/storage-layouts.md). Source format names alone do not establish

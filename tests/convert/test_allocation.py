@@ -180,6 +180,31 @@ def test_flexible_parameters_select_the_three_roles_of_a_dense_model(tmp_path):
             flexible_parameters(build_model(source, components=("text",)))
 
 
+def test_committed_candidate_covers_the_27b_projections_and_keeps_the_official_byte_budget():
+    from pathlib import Path
+
+    from tools.convert.allocation import payload_bytes
+
+    path = Path(allocation.__file__).parent / "candidates" / "qwen3_8_27b_activation.py"
+    namespace = {}
+    exec(compile(path.read_text(), str(path), "exec"), namespace)
+    assignments = namespace["ASSIGNMENTS"]
+
+    # Qwen3.8-27B: 64 layers, full attention at every fourth layer, hidden 5120, MLP 17408,
+    # attention output K = 24 heads x 256, GDN output K = 48 value heads x 128.
+    shapes = {}
+    for layer in range(64):
+        mixer = "attention/output" if layer % 4 == 3 else "gdn/output"
+        shapes[f"text/layers/{layer}/{mixer}"] = (5120, 6144)
+        shapes[f"text/layers/{layer}/mlp/down"] = (5120, 17408)
+    assert set(assignments) == set(shapes)
+    assert set(assignments.values()) <= {Q4, Q5}
+
+    chosen = sum(payload_bytes(f, shapes[n]) for n, f in assignments.items())
+    official = sum(payload_bytes(qwen3_8_27b_text_format(n), shapes[n]) for n in shapes)
+    assert chosen <= official
+
+
 def test_emitted_override_assigns_the_proposed_formats_with_the_imatrix_search(tmp_path):
     values = {
         "text/layers/0/mlp/down": torch.zeros((2, 64), dtype=torch.bfloat16),
