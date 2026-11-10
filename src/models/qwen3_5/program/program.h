@@ -2,6 +2,7 @@
 #include "core/device_snapshot.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
+#include "runtime/contract/host_placement.h"
 #include "runtime/contract/resources.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include <array>
@@ -100,6 +101,15 @@ private:
                                                  const EngineOptions&);
 };
 
+// A request the lossy long-prompt prefill can take (docs/maintainer/lossy-long-prefill.md): the
+// Program has the scout scratch, and the prompt is text only, has no installed graft and was not
+// rewritten onto a lossy lineage. `exact_end` is the planned end of the product prompt, the deepest
+// SharedStablePrefix opportunity (0 without one); the request's M is
+// max(exact_end, reuse frontier), and the trigger compares prompt_tokens - M with the threshold.
+struct LossyPlan {
+    std::uint32_t exact_end = 0;
+};
+
 class RequestBasePlan {
 public:
     RequestBasePlan(RequestBasePlan&&) noexcept;
@@ -117,6 +127,12 @@ public:
     [[nodiscard]] std::vector<std::uint32_t> shared_prefix_frontiers() const;
     [[nodiscard]] std::optional<PrefixShortlistKey>
     prefix_shortlist_key(std::uint32_t frontier) const noexcept;
+    // Set when the request may take the lossy prefill path; see LossyPlan.
+    [[nodiscard]] std::optional<LossyPlan> lossy() const noexcept;
+    // `frontier` of this plan's prompt in the client's prompt tokens: unchanged unless the prompt
+    // was rewritten onto, or compacted into, a lossy lineage (gap maps), where dropped tokens count
+    // again. Usage and prompt progress report in these terms.
+    [[nodiscard]] std::uint32_t reported_frontier(std::uint32_t frontier) const noexcept;
 
 private:
     explicit RequestBasePlan(std::shared_ptr<detail::RequestBasePlanImpl> impl) noexcept;
@@ -195,6 +211,12 @@ struct BindingReservation {
 struct ContextDemotion {
     std::vector<CheckpointHandle> sources;
     std::size_t host_bytes = 0;
+    // Host bytes this quote's allocations could take from the free runs now: whole KV pages, or
+    // one contiguous state image. Free bytes in runs too short for one are not counted (#402).
+    std::size_t host_placeable = 0;
+    // The size the destination is placed in: one KV page, or the state image. Victim selection
+    // asks whether the free runs left by a release still hold `host_bytes` of whole units (#406).
+    std::size_t host_unit = 0;
     runtime::ContextResourceUsage released;
     std::shared_ptr<const detail::DemotionPlan> impl;
 };
@@ -275,7 +297,8 @@ public:
           transaction_(std::exchange(other.transaction_, 0)), rows_(other.rows_),
           row_count_(std::exchange(other.row_count_, 0)), tokens_(other.tokens_),
           row_counts_(other.row_counts_), row_stride_(other.row_stride_), timing_(other.timing_),
-          constraint_failed_(other.constraint_failed_) {
+          constraint_failed_(other.constraint_failed_),
+          token_domain_failed_(other.token_domain_failed_) {
         other.tokens_     = {};
         other.row_counts_ = {};
         other.row_stride_ = 0;
@@ -298,6 +321,12 @@ public:
         return constraint_failed_.at(row);
     }
 
+    // The row's sampled or licensed token left the public vocabulary: its request ends with a
+    // numerical failure, the Engine and the other rows go on.
+    [[nodiscard]] bool token_domain_failed(std::size_t row) const {
+        return token_domain_failed_.at(row);
+    }
+
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
 
 private:
@@ -310,13 +339,40 @@ private:
     std::uint32_t row_stride_ = 0;
     runtime::ExecutionTiming timing_;
     std::array<bool, kMaximumConcurrency> constraint_failed_{};
+    std::array<bool, kMaximumConcurrency> token_domain_failed_{};
 
     friend struct detail::ContractAccess;
+};
+
+// How a lossy prefill's selection came out, reported once, by the step that ends the scout.
+struct LossyOutcome {
+    std::uint32_t exact_end       = 0; // M
+    std::uint32_t uncached_tokens = 0; // |U| = original prompt tokens - M
+    std::uint32_t kept_tokens     = 0; // of U; equals uncached_tokens when skipped
+    bool skipped                  = false; // nothing dropped: Main prefills all of U, no gap map
+    double scout_seconds          = 0.0;
+    // The request reached M while another lane held the Program's one scout: it took no lossy path
+    // and prefilled all of U (skipped is set too, kept_tokens == uncached_tokens, no scout ran).
+    bool declined = false;
+    // The kept offsets of U as maximal [begin, end) runs: all of U when skipped, none when
+    // declined. The request log reports them under --request-log-lossy-detail.
+    std::vector<std::array<std::uint32_t, 2>> kept_runs;
 };
 
 struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
+    // Lossy prefill only: prompt tokens this step scouted (its processed_prompt_tokens is then 0;
+    // the cursor stays at M during the scout).
+    std::uint32_t scouted_tokens = 0;
+    // Lossy prefill only, on the step that ends the scout: the request's prompt_tokens from now on
+    // (the compacted length; unchanged when skipped), the selection's outcome and, when the prompt
+    // was compacted, the plan that now describes the request (summary, capture frontiers and
+    // identity). The caller replaces its own plan with it: binding a resumed request to one of its
+    // later checkpoints, for one, matches against the compacted identity.
+    std::optional<std::uint32_t> compacted_prompt_tokens;
+    std::optional<RequestBasePlan> compacted_plan;
+    std::optional<LossyOutcome> lossy;
     bool complete                         = false;
     // Some layers of the step's chunk ran and the rest wait for the next call (layer_slices).
     bool partial = false;
@@ -440,6 +496,10 @@ struct PhysicalUsageSnapshot {
     std::size_t host_free_extents          = 0;
     std::uint64_t host_geometry_failures   = 0;
     std::uint64_t host_shortage_failures   = 0;
+    // The pause snapshot reserve (ContextCacheOptions::host_pause_reserve_bytes) and the bytes in it
+    // now. `occupied`/`capacity` above cover only the rest, which is what the context cache plans with.
+    std::size_t host_pause_reserve_bytes          = 0;
+    std::size_t host_pause_reserve_occupied_bytes = 0;
 };
 
 class Program {
@@ -488,10 +548,23 @@ public:
     // Exact Host bytes freed by deleting this fixed set, with physical sharing counted once.
     [[nodiscard]] std::size_t
     host_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
+    // Host bytes of the whole state images releasing these checkpoints frees. Each such image
+    // leaves a run that fits any other, which scattered KV bytes do not.
+    [[nodiscard]] std::size_t
+    host_state_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
+    // The Host allocator's free runs as they would stand after deleting this fixed set (#406).
+    // Freed bytes only add up to a run when they sit next to each other or next to free ones.
+    [[nodiscard]] runtime::HostFreeRuns
+    host_free_runs_after_release(std::span<const CheckpointHandle> checkpoints) const;
     [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle sequence) const;
     // Bytes of state image a pause could not place in one contiguous Host run right now; 0 when it
     // is already on the Host or a run exists.
     [[nodiscard]] std::size_t pause_state_image_unplaced(SequenceHandle sequence) const;
+    // Whether a pause of `sequence` would save its snapshot to the Host as things stand, without
+    // evicting or releasing anything: its bytes fit the free Host bytes (the pause snapshot reserve
+    // included) and its state image has a run. Exact for mixed KV strides: the placement the pause
+    // makes is replayed on a copy of the arena's free runs.
+    [[nodiscard]] bool pause_snapshot_fits(SequenceHandle sequence) const;
     [[nodiscard]] std::size_t
     release_redundant_host(std::span<const CheckpointHandle> excluded,
                            std::optional<SequenceHandle> pending_backup = std::nullopt);
@@ -544,6 +617,32 @@ public:
     DeviceSnapshot::Stats suspend_device_state(DeviceSnapshot& snapshot);
     DeviceSnapshot::Stats resume_device_state(DeviceSnapshot& snapshot);
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
+    // Turns on the lossy prefill path for a freshly bound request whose plan has lossy() set, before
+    // its first prefill step (docs/maintainer/lossy-long-prefill.md). Its next steps then prefill
+    // exactly up to M = max(lossy()->exact_end, reuse frontier), scout [M, end), select and
+    // compact, and prefill the kept tokens; PrefillProgress reports scouted_tokens and, once,
+    // compacted_prompt_tokens. Scout steps are reserved as Prefill units, honour max_tokens and are
+    // never layer-sliced. While the scout runs the lane cannot be paused (start_pause returns
+    // false) or captured; abort is always allowed. Returns false, with nothing changed, for a
+    // request it cannot take: no scout scratch (lossy prefill off, MoE or split model), a plan
+    // without lossy(), a multimodal request, one already advanced or already on the path, or M at
+    // the prompt end. A request paused in Exact keeps the path: its saved control carries the phase
+    // and M, so its restore goes on to M and scouts without another call.
+    // The Program runs one scout at a time: a request that reaches M while another lane scouts
+    // declines (LossyOutcome::declined) and prefills normally. The trigger's other conditions --
+    // the threshold, and a reuse source that is none or a SharedPrefix checkpoint, never a private
+    // conversation record -- are the Engine's to check before calling this.
+    [[nodiscard]] bool enable_lossy(SequenceHandle sequence);
+    // Ends a running lossy scout part-way: the lane is restored to M exactly as the scout found
+    // it (end_scout) and the request goes on as an ordinary prefill of all of U, with no
+    // selection. It can then be paused. The Engine calls this where it must pause a scouting lane
+    // under memory pressure (start_pause refuses while the scout runs). False, with nothing
+    // changed, when the lane is not scouting.
+    [[nodiscard]] bool abort_lossy_scout(SequenceHandle sequence);
+    // What a scout costs as a share of an ordinary prefill of the same tokens: the layers below
+    // the filter layer and the filter layer itself out of all of them. 0 without lossy prefill.
+    // The Engine's backlog prediction uses it.
+    [[nodiscard]] double lossy_scout_share() const noexcept;
     // A resumed binding retains its complete recovery capacity until committed new progress.
     [[nodiscard]] bool recovery_pending(SequenceHandle sequence) const noexcept;
     // Overlay Vision residency; every call is a no-op for a resident or text-only Program.
@@ -601,11 +700,13 @@ public:
     // Writes the checkpoints' byte image. Device-only contents are copied through the caller's
     // memory, never by pinning more Host context. Requires no open context transaction. An image
     // holds either one conversation's private points or exactly one SharedPrefix point with no
-    // session; import rebuilds the points with the roles they were exported with.
+    // session; import rebuilds the points with the roles they were exported with. `buffer`, when
+    // given, is reused for the image's bytes (an earlier image's, so its pages are already
+    // mapped and the copy does not fault them in).
     [[nodiscard]] CheckpointImage
     export_checkpoints(std::span<const CheckpointHandle> points,
                        const std::optional<PreparedSessionKey>& session,
-                       std::string_view binding) const;
+                       std::string_view binding, std::vector<std::uint8_t> buffer = {}) const;
     // Host bytes importing `image` needs. Throws std::invalid_argument when the image was not
     // produced for this Program configuration and binding, or is damaged.
     [[nodiscard]] std::size_t checkpoint_image_host_bytes(std::span<const std::uint8_t> image,

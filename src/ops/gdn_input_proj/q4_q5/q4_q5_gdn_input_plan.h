@@ -78,4 +78,14 @@ void q4_q5_gdn_input_a8_launch(const Tensor& x, const Weight& qk, const Weight& 
                                Tensor& qkv, Tensor& z, WorkspaceArena& workspace,
                                cudaStream_t stream);
 
+// The lossy scout's int4 route (LinearPolicy::ScoutA4Int), at the widths the integer route takes
+// (q4_q5_gdn_input_a8_supported): the Q4 query/key rows with int4 activations (q4_a4_linear,
+// staged and copied into the head of qkv), value and z from the Q5 parent through the integer
+// route above.
+[[nodiscard]] std::size_t q4_q5_gdn_input_scout_a4_workspace_capacity_bytes(std::int32_t min_tokens,
+                                                                            std::int32_t max_tokens);
+void q4_q5_gdn_input_scout_a4_launch(const Tensor& x, const Weight& qk, const Weight& value_z,
+                                     Tensor& qkv, Tensor& z, WorkspaceArena& workspace,
+                                     cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

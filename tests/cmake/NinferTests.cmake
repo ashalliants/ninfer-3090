@@ -19,6 +19,15 @@ endfunction()
 function(ninfer_add_test name)
   cmake_parse_arguments(PARSE_ARGV 1 arg "NEEDS_SOURCE_DIR;STANDALONE" ""
     "SOURCES;LIBRARIES;TEST_ARGS")
+  if(NINFER_HOST_ONLY AND NOT name IN_LIST NINFER_HOST_ONLY_TESTS)
+    # A tree with no CUDA compiler cannot build this test. The target and the test still exist, so
+    # the calls that configure them afterwards (and $<TARGET_FILE:...> in other tests) keep
+    # working, but the target is never built and the test is labelled gpu (TestGpuClasses.cmake).
+    add_executable(${name} EXCLUDE_FROM_ALL ${arg_SOURCES})
+    target_link_libraries(${name} PRIVATE ${arg_LIBRARIES})
+    add_test(NAME ${name} COMMAND ${name} ${arg_TEST_ARGS})
+    return()
+  endif()
   if(arg_STANDALONE)
     add_executable(${name} ${arg_SOURCES})
     target_link_libraries(${name} PRIVATE ${arg_LIBRARIES})

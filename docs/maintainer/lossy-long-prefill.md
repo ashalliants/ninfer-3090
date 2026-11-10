@@ -1,0 +1,698 @@
+# Lossy long-prompt prefill: design
+
+Status: built and GPU-verified; the quality and speed sweep ran on 2026-10-25 and set the defaults
+(filter layer 7, keep 0.3, block 64; the feature stays off by default). The measured numbers are in
+["Results"](#results-measured-2026-10-25-rtx-3090-vast). What the build changed from this design is in
+["As built / deviations"](#as-built--deviations). A temporary plan in the sense of `AGENTS.md`: fold its stable facts into
+`docs/serving.md`, `docs/maintainer/engine-architecture.md` and
+`docs/maintainer/resource-scheduling-and-context-cache.md` when the work lands, then delete it.
+Numbers marked **(predicted)** come from the fitted prefill cost model (`tools/bench/prefill_time_model.py`,
+`docs/performance.md`) and were made before the sweep; the measured ones are dated.
+
+## Why
+
+The fleet serves Qwen3.5/3.8-27B (dense, 64 layers: 48 GDN + 16 full attention) from several RTX 3090
+boxes behind a router with sticky cache affinity. An uncached prompt of 100K+ tokens costs about 55 s of
+prefill and about 3 GB of int8 KV for that whole minute. The scheduling work (#340-#352: layer slices,
+yield, shared anchors, backlog gauge) keeps neighbouring streams moving, so the remaining damage is:
+
+- the box is effectively busy for a minute, the router overflows sticky traffic to a second box, and a
+  second cold prompt there does the same again;
+- the prompt holds a large share of the KV pool while it prefills, leaving the router less free capacity.
+
+Production runs `--kv-dtype rk4v4` (about 18 KB/token, so ~1.8 GB at 100K); the int8 figures elsewhere in
+this page are the benchmark configuration. Everything here must work, and be measured, with `rk4v4`.
+
+Lossless speedups on one card are nearly exhausted: the prefill GEMMs run at about two thirds of the
+3090's int8 tensor peak and prompt attention is already an int8 FlashAttention-2 kernel
+(`prompt_i8_fa2`). At 100K, GEMMs are about 60% of the time and attention about 40%
+(`long-prefill-handoff.md`, measured). A large gain therefore needs **less work**, not faster work.
+
+## What success looks like
+
+- A 100K-token uncached prompt on the 27B finishes prefill in **about 15-20 s instead of ~55 s**
+  **(predicted)**, and holds **about a fifth of the KV** afterwards. Measured 2026-10-25 at the
+  defaults: a 117K cold prompt in 21.8 s instead of 70.2 s, keeping 30% of its tokens.
+- Answers on long prompts stay close to full-prefill quality on the gates below.
+- The follow-up turns of the same conversation hit the cache like any other conversation does.
+
+## Goals
+
+1. **Token selection ("scout and select").** For a request whose *uncached* prompt suffix is longer than a
+   configurable threshold (the user's production value: 30,000 tokens), the 27B itself runs its first
+   `L` layers over that suffix ("scout pass"), scores each token by the attention the prompt's last
+   tokens pay it at layer `L`, keeps the best fraction, and then prefills only the kept tokens through the
+   whole model ("main pass"). The kept tokens keep their **original** RoPE positions; generation continues
+   at position = original prompt length. This is GemFilter's two-pass scheme
+   ([arXiv 2409.17422](https://arxiv.org/pdf/2409.17422)), chosen over FastKV's continue-from-layer-L
+   ([arXiv 2502.01068](https://arxiv.org/abs/2502.01068v4)) because the main pass is then an ordinary
+   prefill of a shorter sequence, the cache holds the same token set in every layer, and any error in the
+   scout can only change *which* tokens are kept.
+2. **Int4 scout arithmetic.** The scout pass's GEMMs run with int4 activations on Ampere int4 tensor cores
+   (`mma.sync.m16n8k64.s4`), roughly 2x int8's peak. Because the scout only produces a ranking, its
+   rounding never reaches the model's output; the main pass stays on today's exact int8 routes.
+3. **Conversation continuity.** The next turn (original prompt + reply + new message) reuses the
+   selected state instead of scouting the 100K again.
+4. **Observability.** Counters, request-log fields and the backlog gauge reflect the lossy path, so the
+   router and the operator can see it.
+
+Order of work: goal 1 with int8 scout (and goal 3, 4), then the quality sweep and a go/no-go, then goal 2.
+
+## Non-goals (v1)
+
+- Multimodal prompts (Vision items): the lossy path is skipped, the prompt prefills normally.
+- The 35B-A3B MoE and the Qwen4-exp/Flash-Next Program. The option is accepted only by the Qwen3.5 dense
+  Program; others refuse it at startup like other Qwen3.5-only flags (`qwen4_exp_instance.cpp:200`).
+- A per-request switch in the HTTP API. The behaviour is server policy; A/B is done by running a server with
+  and without the flag. (No external protocol contract changes in v1.)
+- Persisting the selection alias (goal 3) through the context store or to peer boxes. On another box the
+  conversation is scouted again.
+- Pipeline-split (multi-GPU) models.
+- Training anything (gist tokens, SwiftKV-style distillation).
+
+## Anti-goals (a failure even if it technically works)
+
+- **A lossy state served as an exact prefix.** A request whose prompt was never selected must never get a
+  selected state through ordinary prefix matching, and the reverse. Exactness is part of the cache's
+  identity.
+- **Quietly on by default for everyone.** Repo rule: risky features are opt-in. The engine flag defaults to
+  off; production turns it on through its launcher profile.
+- **Slower cold prompts in the bad case.** If the selection keeps most tokens (or the prompt is barely over
+  the threshold), the scout's cost must not make the request slower than plain prefill by more than the
+  scout pass itself (~25% at `L`≈16); see the "skip" rule below.
+- **Breaking agents' exact edits.** Coding agents reproduce exact text from files they read long ago
+  (`Edit` with an `old_string`). A selection that drops the middle of a file the agent then edits gives a
+  failed tool call. This is measured explicitly (agent replay gate) and is the most likely reason to
+  reject a setting.
+
+## Constraints from the code
+
+These were checked by reading the code (file:line at this tree's master, 0312a1d7).
+
+- **Ledger = KV rows.** Decode readiness requires `ledger.size() == ledger_frontier ==
+  execution_frontier + 1`, and `prefix_identity` / `prefix_digests` have one entry per KV row
+  (`program/decode.cpp:281-289, 975-980`, `commit.cpp:173`, `prefill.cpp:328-338, 802`). Checkpoint
+  frontiers are both KV row counts and ledger lengths (`program_impl.h:263-273`,
+  `planning/source.cpp:10-22`). **Decision:** the selected sequence's ledger *is* the kept token list, so
+  all of these invariants hold unchanged. The original prompt is not the sequence's identity; the alias in
+  goal 3 connects the two.
+- **Positions.** KV slot (`cache_positions`, contiguous, drives the causal mask) and RoPE position
+  (`rope_positions`) are already separate tensors in attention (`text.cpp:880-885`). Text prefill today
+  derives RoPE as slot + `rope_delta`; multimodal prefill passes explicit per-token 3-axis positions
+  (`text.cpp:1530-1546`). `ResidentPrefixIdentity` already stores a 3-axis position per token
+  (`prefix_identity.h:16-62`). Decode uses `execution_frontier + rope_delta`
+  (`decode.cpp:313-316`, MTP `:475`, DFlash `:771`). **Decision:** the main pass gives kept prompt tokens
+  explicit RoPE positions (their original indices, same value on all three axes); after the prompt the
+  sequence's `rope_delta = original_prompt_length - kept_length`, so generated tokens get the right
+  positions through the existing decode path.
+- **GDN layers** take no positions; the chunked scan and the short convolution depend only on token order
+  (`ops/gated_delta_net.h:59-70`, `chunked/prepare.cu:24`). A shorter, gapped token sequence is a valid
+  input. Whether the model's GDN layers still behave well on it is the main unknown (no published work
+  prunes tokens in a GDN hybrid) and is what the quality sweep measures.
+- **Layer ranges.** `TextContext::run_stage_layers(stage, x, ph, tap, first, last)` already runs a range of
+  layers (built for `--prefill-layer-slices`, `text.cpp:1131`).
+- **No int4-activation MMA exists** (`ops/common/mma.cuh` has s8 k32/k16 and sm120 e2m1 only). The
+  27B's large matrices are `Q4_G64_FP16` (gate_up, the Q4 halves of the input pairs) and Q4/Q5_G64 (down,
+  attention/GDN out) (`execution/parameters.cpp:139-202`). A 64-wide K group matches one `m16n8k64`
+  instruction.
+
+## How it works
+
+### Trigger
+
+At admission, after prefix reuse and hydration are resolved: let `C` be the reused (exact) prefix and `U`
+the uncached suffix. The lossy path runs when all hold:
+
+- `--lossy-prefill-min-tokens N` is set (`0`, the default, means off) and `|U| > N`;
+- the prompt has no Vision items, the model is the Qwen3.5 dense Program, and it is not pipeline-split;
+- no selection gap map (goal 3) already covers the prompt;
+- **the conversation itself is not cached**: the reuse source is nothing or only a shared (product-prompt)
+  checkpoint no deeper than the product prompt, never a private conversation record or a shared
+  checkpoint an earlier turn published past it. A large new turn inside a warm conversation (a 40K
+  file read, say) always prefills in full. (User's decision, 2026-10-25: such a turn counts as cached, and
+  is rare in real use; the case this is for is a cold start or a router overflow to a box without the
+  conversation.)
+
+Otherwise the prompt prefills exactly as today.
+
+**The product prompt is never selected (my call).** On a cold box the shared product prompt (system
+messages, tool definitions; 1.6-9K tokens per `cache-provider-baseline.md`) lies inside `U`. Before the
+scout, the engine prefills exactly up to the end of the product prompt as an ordinary prefill, publishing
+its shared checkpoint as today; that span becomes part of `C`, and only the rest is `U` (the threshold is
+checked on that rest). As built, M (the product-prompt end) is the end of the graft, the leading
+System/Developer messages and the tool declarations, or a shared marker inside them, never a message-level
+boundary past them, whatever its evidence: OpenAI chat's default policy places an automatic boundary at
+the end of the last message and Anthropic `cache_control` on a recent message becomes an explicit one, and
+taking the deepest marker would leave `U` a few tokens long (see "As built / deviations").
+This keeps tool schemas intact and keeps the box's shared-prefix reuse working for other conversations.
+
+**Capacity and reporting (my call).** Limits tied to positions (`max_context`, the 262,144 RoPE capacity)
+apply to the original prompt length. KV reservation for the main pass and decode is by kept length; the
+scout's scratch is reserved separately. Usage keeps its current meaning: `prompt_tokens` is the original
+prompt length the client sent, `cached_tokens` the exact reused prefix `C` (plus, on later turns, the
+rewritten reused span counted in original tokens). The kept count is reported only in the request log and
+counters, so the gateway's view of usage does not change.
+
+### Scout pass
+
+Runs layers `0 .. L-1` over `U` in prefill chunks, attending to `C`'s exact KV for the attention layers
+below `L` and starting from `C`'s GDN state. At the filter layer `L` (a full-attention layer; the 27B has
+them at 3, 7, 11, 15, ...) it computes only K for every token of `U` and Q for the last `q` tokens of the
+prompt, and accumulates per-key attention mass: softmax over the keys of `U` per query row and head,
+summed over the `q` rows and all heads. (`C` is always kept, so its keys are left out of the scoring; this
+also means the scoring never reads the cache's KV dtype. The layer-`L` keys of `U` go to a BF16 scratch
+buffer, 2 KB/token, ~200 MB at 100K. My call, made while planning.) Layers above `L`, the MLP of layer `L`, and the LM head do not run.
+
+- The scout must leave **no trace** in the sequence: `C`'s GDN state and KV are what the main pass starts
+  from. Its KV rows for layers `< L` and its GDN states go to scratch that is released when the pass ends.
+- **Peak KV during the scout** should be about the scouted layers' share (4 of 16 attention layers at
+  `L`=15, ~25% of a full prefill's KV), not a full prefill's. If the builder finds per-layer scratch
+  impractical, the fallback of reserving full pages for `U` during the scout is acceptable for the first
+  version only if it is recorded as a known gap.
+  **v1 takes the fallback (my call, made while planning):** a page group holds every Main layer
+  (`paged-kv-cache.md`, page-group IDs), so per-layer scratch needs a multi-plane KV view that does not
+  exist. The scout writes its attention layers' KV into the sequence's own pages; pages above the kept
+  frontier are released when the scout ends. Peak KV is today's, held for the ~15 s scout instead of
+  ~55 s, then ~20%. Only the GDN states of layers `< L` are copied to scratch (~40 MB) and restored.
+- Scout chunks are ordinary prefill steps for the scheduler (stall budget, yield, layer slices apply as
+  they do for any text prefill), and the backlog gauge predicts scout plus main pass.
+
+### Selection
+
+From the per-token scores over `U`:
+
+1. Smooth with a 1-D pooling window (as built: a centred per-token max over `pool_window` tokens, odd,
+   clamped at the ends), then score fixed blocks of `B` consecutive tokens (keeping whole spans
+   matters more for code than keeping isolated tokens; SpecPrefill also keeps chunks,
+   [arXiv 2502.02789](https://arxiv.org/pdf/2502.02789)).
+2. Always keep: the last `R` tokens of the prompt (the question and recent turns), the first `S` tokens of
+   `U`, and every special/template token (role markers, tool-call delimiters), so the chat structure the
+   model was trained on survives. As built this is every added token of the tokenizer, plus the two
+   tokens after each `<|im_start|>` (the role name and its newline).
+3. Fill up to `keep_ratio * |U|` with the highest-scoring blocks; output kept tokens in original order.
+4. **Skip rule:** if the kept count (as built: the larger of the forced keeps and the budget, against
+   `ceil(skip_ratio * |U|)`; `keep_ratio > skip_ratio` is refused at startup) is above `skip_ratio * |U|` (e.g. the forced keeps already cover most
+   of a prompt barely over the threshold), keep everything: the main pass is then an ordinary full prefill
+   and the request pays only the scout.
+
+All of `L, q, B, R, S, keep_ratio`, the pooling window and `skip_ratio` are server options with defaults
+chosen by the quality sweep. Starting points for the sweep: `L` ∈ {7, 11, 15, 23, 31}, `keep_ratio` ∈
+{0.1, 0.2, 0.3, 0.5}, `B` ∈ {32, 64, 128}, `q` = 64, `R` = 4,096, `S` = 256.
+
+### Main pass
+
+An ordinary text prefill of the kept token list after `C`, with explicit RoPE positions (original prompt
+indices) instead of slot + `rope_delta`. It must stay eligible for everything a text prefill gets today:
+layer slices, stall budget, yield, the DFlash2/MTP prefill taps, progress anchors on the *kept* ledger.
+(The multimodal positions path is the existing precedent for explicit positions, but routing text through
+it would lose layer slices, which refuse multimodal chunks; a text prefill with an optional explicit
+position list is the intended shape. Builder's call on the exact form.)
+
+After it, the sequence's ledger is `C + kept(U)`, its identity carries the original positions, and
+`rope_delta` is set as above. Everything downstream (decode, speculative decoding, checkpoints, pause
+replay) works on that ledger. **Pause replay must re-prefill with the stored positions**, not slot +
+`rope_delta` as it does today (`transactions/replay.cpp:17-43`).
+
+### Selection alias (goal 3)
+
+Follow-up turns do not reuse at the end of the previous prompt: they reuse at the typed rewrite points
+(`ResponseReplay`, `TurnClosure`) and `recovery_frontier` (`resource-scheduling-and-context-cache.md` §4.1),
+and the private record retires shallower points as the conversation goes deeper. So an alias pinned to
+one checkpoint would be gone within a turn or two. **Decision (my call):** the mapping is a property of the
+lineage, not of one checkpoint.
+
+- A lossy prefill produces a **gap map**: the original-prompt span `U` it covered (start, length, digest of
+  the original tokens up to the end of `U`) and the kept token positions inside it. It is small (a few
+  hundred KB at 100K tokens at most; run-length encoded over kept blocks it is far smaller).
+- `U` ends at the end of the last message, not at the prompt end: at max(last dropped token + 1, start
+  of the generation opener `<|im_start|>assistant\n<think>\n`), the last `<|im_start|>` with no
+  `<|im_end|>` after it. A follow-up reproduces every earlier message verbatim but replaces the opener
+  with its assistant turn, so a span through the opener would never match. It does not end at the
+  last dropped token either: the recent window is always kept, so a prompt that shares the original
+  only through the last gap (the same document with another question, a regenerated last message, a
+  parallel fork) would inherit a selection scored with another prompt's query rows and never be scouted
+  itself. The trimmed tail is kept, so the compacted prompt is the same. A prompt with no generation
+  opener (continuation of the final assistant message) keeps the span to the prompt end
+  (`end_at_last_message`, `lossy/gap_map.h`).
+- Every checkpoint descended from the selected sequence (captures at typed rewrite points, recovery
+  frontiers, anchors, generation endpoints, snapshots) carries a reference to its lineage's gap maps.
+  The gap map lives as long as any checkpoint referencing it.
+- At admission, a prompt whose original tokens up to the end of a gap map's `U` match that map's digest is
+  rewritten: that span is replaced by the kept tokens with their original positions, and the remainder
+  follows at slot + `rope_delta`. Ordinary prefix matching (including typed rewrite points) then runs on
+  the rewritten prompt, so later turns reuse as any conversation does.
+- A conversation may accumulate more than one gap map (a second large uncached turn later on, if the
+  trigger allows it, see open questions); rewriting applies them in order.
+- A prompt that only *partly* matches (diverges inside `U`) gets no rewrite; it is a cold prompt again and
+  may be scouted itself.
+- Selected checkpoints written to the context store are stored under their real (kept) identity; without
+  the alias nothing will match them, which is correct, only wasteful. Persisting aliases is out of scope
+  for v1.
+
+### Int4 scout GEMMs (goal 2, after the go/no-go)
+
+A W4A4 route for the scout pass only, sm86: activations quantized per token per 64-wide K group to signed
+int4 with an FP16 scale, weights taken from the existing `Q4_G64_FP16` objects (no new artefact),
+`mma.sync.m16n8k64.s4.s4.s32` per group, then group scales applied in FP32 on CUDA cores. Matrices stored
+as Q5 keep their existing int8 route in the scout (or a builder-chosen alternative). No rotation
+(QuaRot-style Hadamard) in the first version: it only matters if outliers spoil the *ranking*, which the
+gate below measures. Prior art for the 3090: QuaRot (CUTLASS int4, ~2x over FP16 at block level,
+[arXiv 2404.00456](https://arxiv.org/pdf/2404.00456)), APEX4 (W4A4 g128, 2.0-2.5x kernel speedup on the
+3090, [arXiv 2606.08761](https://arxiv.org/pdf/2606.08761)). Against our int8 route the expected gain on
+the scout's GEMMs is about 1.6x **(predicted)**.
+
+The Ops are `quantize_a4_g64` and `q4_a4_linear` (`include/ninfer/ops/q4_a4_linear.h`, qualified by
+`ninfer_q4_a4_linear_test`; the host oracle is checked by `ninfer_a4_g64_reference_test`). The activation
+codes are symmetric in [-7,7] and packed in the Q4 row-split nibble order, so both operands enter the MMA
+as stored, and Q4 codes are already two's complement, so there is no zero-point correction. Status
+**compiled, not run** on a GPU (2026-10-25). A host simulation of the test fixtures predicts the A4 cast
+costs about 7% relative L2 on outlier-free activations (cosine about 0.997 against the A8 route) but about
+20% (cosine about 0.98) when every 431st channel is 24x, because such a channel zeroes the other 63 of its
+group; whether that spoils the ranking is the Jaccard gate's question.
+
+As built (routing, 2026-10-25, **compiled, not run**): `--lossy-prefill-scout-a4` gives the scout its own
+copies of layers `[0, L]` (`execution::scout_a4_layers`, held by the Program's scout buffers) in which every
+Q4 matrix already on the integer-A8 prefill route carries `LinearPolicy::ScoutA4Int`; the model's own
+parameters never hold it (asserted when they are built, and `run_stage_layers` refuses the copies outside
+the scout's prefill pass). Under that policy, at exactly the widths the A8 route serves (full 128-token tiles):
+
+- `linear_swiglu` (gate_up, Q4): `quantize_a4_g64`, one `q4_a4_linear` over all 34816 gate/up rows into a
+  staged plane, then `silu_mul` over its halves (the A8 route fuses SwiGLU; this one cannot).
+- `linear_add` (down and the mixer outputs, where Q4): `quantize_a4_g64`, `q4_a4_linear`, `residual_add`.
+  Q5 matrices are not promoted and keep their own route (A8, or cuBLAS under `--prefill-cublas`).
+- split `attn_input_proj`: q and k from row slices of the Q4 parent through `q4_a4_linear` straight into
+  their tensors; gate and v from the Q5 parent through the A8 route (its own s8 activations), also
+  under `--prefill-cublas`, whose route takes the pair whole.
+- split `gdn_input_proj`: query/key rows through `q4_a4_linear` into a staged `[4096,T]` plane copied
+  into the head of each `qkv` column (`cudaMemcpy2DAsync`); value and z through the A8 route.
+
+Any other Op rejects the policy (`valid_linear_policy` excludes it). Unaligned final chunks take whatever
+the int8 scout takes there (A16). The scout's workspace plan adds the int4 planes only when the option is on,
+and startup refuses the option when no Q4 matrix is on the integer route (no `--prefill-a8`). Gate
+evidence: `ninfer_qwen3_5_scout_a4_kept_overlap_real_test` (32K and 100K haystacks: kept-block Jaccard
+over the score-chosen blocks >= 0.9, the forced head and recent blocks left out, which both scouts keep
+identically; the all-blocks Jaccard is printed for reference; pass key kept by both), the `PERF ... scout` lines of `ninfer_q4_a4_linear_test` (the Op under
+`ScoutA4Int` against the same Op under `AllowA8Int`, so gate_up's separate SwiGLU is counted), and the
+sweep's `--workloads jaccard`.
+
+### Alternative strategy: deterministic conversation summary (`--lossy-prefill-strategy summary`)
+
+Added 2026-10-25 at the user's request as a flagged option for comparison, not the production choice.
+It ports the rule-based projector of [hermes-vcc-engine](https://github.com/danbiocchi/hermes-vcc-engine)
+(Apache-2.0, commit `31ee4fe7`, after the VCC paper, arXiv 2603.29678) to C++. Instead of thinning tokens,
+it rewrites the *messages*: it keeps the head (system/developer messages, tool definitions and the first
+3 messages) and the tail (the last 20 messages, at least one real user message and everything after it, never
+splitting a tool call from its result), and replaces the middle with one User message holding the
+projector's sections (goal, errors and fixes, error names, relevant files, commands run with exit codes,
+and a session log with `[#N]` references to message indices). The output is deterministic and makes no model call.
+
+- **Trigger:** the same as the token strategy (enabled, cold, and more than `min_tokens` after the product
+  prompt). The rendered original is prepared first to count tokens; a thread-safe reuse probe decides
+  coldness; if it fires, the summarized `PromptInput` is prepared and admitted as an ordinary exact prompt
+  (regular positions, no scout, no gap map).
+- **Continuity:** a bounded in-memory registry maps the exact original message prefix that was summarized
+  (the head plus the middle, compared exactly, with a digest only as a shortlist) to the summary text. A later
+  request whose messages start with that prefix gets the same summary substituted, whatever its length, so
+  it renders the same tokens and hits the cache as an ordinary conversation.
+- **Budget:** the summary is at most `min(0.06 × max_context, 8000)` tokens and at least 1,500
+  (`--lossy-prefill-summary-max-tokens`), as in the original.
+- **Usage and log:** `prompt_tokens` is the original rendered length; the request log records
+  `lossy_prefill.strategy = "summary"` and the summarized message range.
+- **Correctness reference:** the C++ projector (`src/runtime/engine/compaction/vcc_projector.cpp`) must
+  reproduce the Python projector's output byte for byte on recorded transcripts: `tools/bench/vcc_golden.py`
+  writes the golden files in `tests/fixtures/vcc` from the pinned commit, `ninfer_vcc_projector_test`
+  checks them, and `vcc_golden.py --fuzz N --out DIR` with `NINFER_VCC_FIXTURE_DIR=DIR` runs a random
+  differential set.
+- **Tool names:** the projector knows Hermes-style tool names only (`terminal`/`shell`/`bash`/`run_command`
+  for commands; `read_file`, `patch`, `write_file`, `edit_file`, ... for file verbs), case-sensitively.
+  Claude-Code-style `Bash`/`Read`/`Edit` calls still appear in the log and file list (by their `file_path`),
+  but not under "Commands Run", and their files read with the tool's own name as the verb.
+- **Known weakness:** it drops file contents from the middle; Hermes relies on a `session_search` tool to recover
+  them, which our clients do not have. The agent-replay `Edit` metric is where the two strategies are compared.
+- **As built (2026-10-25):** `src/runtime/engine/compaction/summary_{split,registry,strategy}.{h,cpp}`, called from
+  `Engine::prepare`; `ninfer_summary_strategy_test` (cpu) and `ninfer_qwen3_5_lossy_summary_real_test` (GPU).
+  - Tool names are normalized on a copy before projecting, the projector itself untouched: `Bash`/`BashOutput`/
+    `exec_command` → `terminal`, `Read`/`read` → `read_file`, `Write`/`write` → `write_file`, `Edit`/`MultiEdit`/
+    `edit`/`NotebookEdit` → `edit_file`, `Grep`/`Glob`/`grep`/`glob` → `search_files`, `apply_patch` → `patch`;
+    `filePath` → `file_path` and `notebook_path` → `path` when the target key is absent.
+  - The projection's `session_search` instructions are replaced by plain statements that the originals were omitted.
+  - The registry (256 entries, 256 MiB, LRU) keys on the conversation as it stood when summarised. It is in memory
+    only: a restart loses the substitutions, so the next turn of a summarised conversation renders its originals
+    (and, if it is long and cold, is summarised afresh). Recorded summaries are substituted first (a chain, oldest
+    first), then the split runs; a summary message the Engine substituted is part of the head, so it is never
+    summarised again (a client message that only starts with the same header is an ordinary user turn). Reasoning
+    inside the summarised range is not compared (the summary ignores it).
+  - The coldness probe (`EngineCore::has_private_reuse`) is posted to the worker, which answers it between cycles: it
+    plans a copy of the prepared prompt and is warm when the prefix index holds a valid non-SharedPrefix checkpoint
+    the prompt starts with, or when the context store holds an image on this binding (local, or listed from the
+    bucket) whose checkpoint the prompt starts with deeper than the product prompt — the same keys admission's
+    hydration compares, without its cost gate. A bucket image no listing has registered yet stays cold. The caller
+    waits 250 ms (a decode cycle is far shorter, a prefill step longer); no answer is a timeout, treated as warm,
+    counted in `ninfer_lossy_prefill_summary_probe_timeouts_total` and logged as `lossy_prefill.summary_probe`
+    (`cold`, `warm`, `timeout`; null when the prompt was too short to probe). A suspended or stopping Engine answers
+    warm.
+  - Under `summary` the core never scouts (no scout scratch is allocated) and the selection knobs are ignored; the
+    Program's dense/single-device refusal still applies. Usage `prompt_tokens` and prompt progress count the client's
+    rendered prompt (which must fit `max_context`); cached tokens map through the shared head and tail
+    (`SummaryRewrite::original_frontier`). The output budget is capped at `max_context` − the client's prompt + 1
+    (a binding cap ends the request with `ContextCapacity`, as if the original had been prefilled); the backlog prices the submitted (summarised) length. `lossy_prefill` in
+    the request log has `strategy`, and for a summary `summarized_messages` ([first, last) in the client's indices,
+    the newest), `summary_reused` and `summary_probe`. A rewritten prompt (new or a substituted summary) is
+    `outcome: completed` and a long prompt the probe left whole is `skipped`; `ninfer_lossy_prefill_total` counts the
+    same outcomes, and `ninfer_lossy_prefill_summaries_total{kind="new|reused"}` splits the completed ones.
+
+## Expected numbers: predicted vs measured (27B, chunk 4096)
+
+The predicted columns (unchanged from before the sweep) were made for a 100K uncached prompt with the fitted cost model:
+baseline split GEMM ≈ 33 s, attention ≈ 22 s (55 s measured total, 40% attention measured, on the
+benchmark configuration); scout at `L` = 16 ≈ a quarter of a full prefill; main pass on 20% ≈
+0.2 × GEMM + 0.04 × attention. The measured column is the 2026-10-25 sweep (RTX 3090, Vast,
+`rk4v4`, `--prefill-cublas`, a **117K** cold prompt, so the baseline is longer than the predicted
+100K one); see [Results](#results-measured-2026-10-25-rtx-3090-vast). KV after is derived from the
+measured kept tokens at about 18 KB/token (`rk4v4`), not read from the pool.
+
+| setting | prefill (predicted, 100K) | prefill (measured 2026-10-25, 117K) | KV after, int8 / rk4v4 (predicted) | kept tokens (measured) |
+|---|---|---|---|---|
+| today | ~55 s | 70.2 s (repeat 77.1 s) | ~3 GB / ~1.8 GB | 116,865 (~2.1 GB rk4v4) |
+| int8 scout `L`=16, keep 20% | ~19-21 s | 24.5 s at `L`=15, keep 0.2 (scout 14.1 s, main 8.4 s; repeat 26.6 s) | ~0.6 GB / ~0.36 GB | 23,424 (~0.42 GB) |
+| int4 scout `L`=16, keep 20% | ~16-18 s | not on the production route: `scout_a4` promotes nothing under `--prefill-cublas`. On the A8 route, `L`=15 keep 0.2: 38.6 s (int8 scout there: 42.8 s) | ~0.6 GB / ~0.36 GB | as int8 |
+| int4 scout `L`=8, keep 20% (if the sweep allows a shallow filter) | ~11-13 s | not run; the int8 scout at `L`=7, keep 0.2 took 16.3 s (scout 5.9 s) | ~0.6 GB / ~0.36 GB | 23,425 (~0.42 GB) |
+| **default since 2026-10-25**: int8 scout `L`=7, keep 0.3 | not predicted | **21.8 s** = 0.31x (scout 5.9 s, main 13.5 s) | not predicted | 35,073 (~0.63 GB, 30%) |
+
+The scout at `L`=15 took 20% of the measured baseline (14.1 of 70.2 s), close to the predicted
+quarter, and more than the main pass at keep 0.2 (8.4 s). Measured scout time is linear in the filter
+layer, about 0.92 s per layer on this prompt, and independent of keep; the main pass is linear in the
+kept tokens (3.9 / 8.4 / 13.4 s at keep 0.1 / 0.2 / 0.3).
+
+## Results (measured 2026-10-25, RTX 3090, Vast)
+
+Every number in this section was measured on 2026-10-25; none is a prediction. The raw data is in
+`profiles/lossy-sweep/` (main sweep, cuBLAS route: `summary.md`, `results.jsonl`),
+`profiles/lossy-sweep-a8/` (int4 scout pair), `profiles/lossy-sweep-rep/` (speed repeat) and
+`profiles/lossy-sweep-box-logs/` (harness logs and box scripts). These directories are local
+artefacts, not checked in.
+
+### Setup
+
+- Qwen3.8-27B (`--model-id qwen3.8-27b`), one RTX 3090 (Vast), server
+  `--kv-dtype rk4v4 --max-context 131072 --prefill-cublas --prefill-chunk 4096` on every point (the
+  production prefill route); lossy points add `--lossy-prefill-min-tokens 30000` and the point's flags.
+  Speed servers add `--max-concurrency 2 --prefill-layer-slices 8` and a neighbour stream.
+- Speed prompt: 116,865 tokens, cold (no cached tokens). The sweep harness is
+  `tools/bench/run_lossy_prefill_sweep.py`; the corpus was pinned to commit 3c4c35fc, the server binary
+  built at 3c4c35fc.
+- Quality per point: needle in a haystack at 32K/64K/100K (22 samples each, English and Chinese
+  haystacks with the same English needle); `agent_edit` (the baseline replay's 26 `edit_function`
+  turns with at least 34K prompt tokens, each sent cold with `--no-prefix-reuse`, judged by whether
+  `old_string` occurs verbatim in the file); greedy agreement (first divergence of 96 greedy tokens
+  from the baseline, 10 prompts of 84.6K-118.0K tokens; reported, not gated).
+
+### GPU tests
+
+All 13 GPU tests for the feature pass (no skips) at 145e814c, and the lossy ones again at 3c4c35fc:
+(short names, as the box run reported them) `key_mass`, `q4_a4_linear`, `input_proj`, `native_transactions` (167 s), `prefix_real`,
+`agent_continuation`, `lossy_prefill_real`, `lossy_summary_real`, `dflash2_after_lossy`,
+`mtp_after_lossy`, `scout_a4_kept_overlap`, `recovery`, `preemption`. Key numbers:
+
+- Follow-up reuse after a select prefill: the follow-up turn of 39,993 tokens reused 39,964 and
+  computed 29 (first prompt 39,971 tokens, 7,936 kept, scout 5,927 ms, main 6,119 ms; filter layer 15,
+  keep 0.2).
+- Follow-up reuse after a summary: 39,332 of 39,360 reused, 28 computed.
+- Speculative decoding after a lossy prefill: DFlash2 matches plain decode over 128 tokens (93/233
+  accepted, FP16 GDN state on both engines); MTP matches over 128 (90/108 accepted).
+- Keep-all identity (`native_transactions`): first token, last-token logits, prompt KV, GDN state and
+  greedy tokens are bit-identical to an ordinary prefill. Scout chunk invariance: two chunk sizes keep
+  the same blocks (kept-set Jaccard 1.0, 4,352 vs 4,352) although per-token scores move by up to 17%
+  (softmax-amplified numerics; the same chunk size twice is bit-identical).
+- `scout_a4_kept_overlap` passes as a test and reports **GATE NOT MET**: score-chosen Jaccard 0.842
+  (32,785 tokens) and 0.835 (100,021 tokens), the pass key kept in both, scout int4 vs int8 1.29x and
+  1.22x.
+
+The GPU tests pin filter layer 15 and keep 0.2, the shape they were measured with, so these numbers
+stay valid after the defaults changed; they check bookkeeping, not the shipped selection.
+
+### Speed (stage 1, block 64)
+
+Baseline 70.2 s, neighbour worst gap 422 ms. Gate: ≤ 0.40x.
+
+| point | total s | x baseline | scout ms | main ms | kept / 116,865 | neighbour worst gap ms | speed gate |
+|---|---|---|---|---|---|---|---|
+| fl7_k0.1 | 11.39 | 0.16 | 5,922 | 3,940 | 11,713 | 288 | pass |
+| fl7_k0.2 | 16.30 | 0.23 | 5,925 | 8,376 | 23,425 | 288 | pass |
+| **fl7_k0.3** | **21.84** | **0.31** | 5,923 | 13,457 | 35,073 | 287 | pass |
+| fl11_k0.1 | 15.47 | 0.22 | 10,016 | 3,937 | 11,712 | 491 | pass |
+| fl11_k0.2 | 20.40 | 0.29 | 10,022 | 8,388 | 23,425 | 493 | pass |
+| fl11_k0.3 | 25.94 | 0.37 | 10,010 | 13,440 | 35,073 | 490 | pass |
+| fl15_k0.1 | 19.54 | 0.28 | 14,087 | 3,941 | 11,712 | 693 | pass |
+| fl15_k0.2 | 24.49 | 0.35 | 14,094 | 8,392 | 23,424 | 695 | pass |
+| fl15_k0.3 | 29.96 | 0.43 | 14,058 | 13,433 | 35,073 | 691 | FAIL |
+| fl23_k0.1 | 27.65 | 0.39 | 22,172 | 3,961 | 11,712 | 1,098 | pass |
+| fl23_k0.2 | 32.59 | 0.46 | 22,200 | 8,385 | 23,424 | 1,097 | FAIL |
+| fl23_k0.3 | 38.04 | 0.54 | 22,139 | 13,416 | 35,072 | 1,095 | FAIL |
+
+Block size at fl15_k0.2 (speed only): block 32 26.75 s (0.38x), block 64 24.49 s (0.35x), block 128
+26.59 s (0.38x); it barely matters. Speed repeat (fresh output directory): baseline 77.14 s,
+fl15_k0.2 26.62 s (0.35x of the repeat baseline), fl11_k0.3 28.30 s (0.37x of the repeat, 0.40x of
+the first baseline).
+
+### Quality
+
+Gates (fixed before the sweep): needle ≥ 0.95x baseline at every length; Edit within 2 points of
+baseline; 100K-class time ≤ 0.40x.
+
+| point | needle 32K / 64K / 100K | Edit, 26 cold turns | greedy first divergence, median (of 96) | time | verdict |
+|---|---|---|---|---|---|
+| baseline | 22/22, 22/22, 22/22 | 25/26 = 0.962 | - | 70.2 s | - |
+| **fl7_k0.3** | 22/22 each (1.00x) | 26/26 = 1.000 (+3.8) | 24 | 0.31x | **pass all three** |
+| fl11_k0.3 | 22/22 each (1.00x) | 26/26 = 1.000 (+3.8) | 26 | 0.37x | pass all three (time within noise of the gate) |
+| fl15_k0.2 (old default) | 22/22 each (1.00x) | 24/26 = 0.923 (−3.8) | 5 | 0.35x | Edit FAIL |
+| fl11_k0.2 | not run | 24/26 = 0.923 (−3.8) | not run | 0.29x | Edit FAIL |
+| summary strategy | 22/22 each, but all 66 skipped | 24/26 = 0.923 (−3.8) | 96 (skipped) | not measured (skipped) | Edit FAIL |
+
+Every lossy quality request of a select point completed on the lossy path (66/66 needle, 26/26
+Edit, 10/10 greedy). Every point misses the baseline's own miss (the 80,581-token turn); the failing
+points miss one more turn each (49,861 at fl15_k0.2, 78,016 at fl11_k0.2, 44,705 for summary).
+Tool-call validity was 1.000 everywhere it was measured. The greedy prompts ask for "the first three
+file names above", whose second and third headers sit in the filtered middle, so early divergence is
+expected for every select point.
+
+### Verdicts
+
+- **Defaults** (`include/ninfer/types.h`, 2026-10-25): filter layer 7, keep 0.3, block 64, the fastest
+  point that passed all three gates (0.31x, with margin to the 0.40x gate that fl11_k0.3 lacks).
+  Recent 4096, head 256, query rows 64, pool window 33 and skip 0.8 are unchanged (not swept). The
+  engine flag stays off by default (`--lossy-prefill-min-tokens 0`), and the production launcher
+  profile is not changed: [docs/serving.md](../serving.md#lossy-long-prompt-prefill-experimental)
+  documents `--lossy-prefill-min-tokens 30000` as the recommended opt-in.
+- keep 0.3 passed Edit at both filter layers tried; keep 0.2 failed by one turn at both (15 and 11).
+- **Int4 scout stays opt-in.** Measured on the integer-A8 route (no `--prefill-cublas`, both arms,
+  fl15_k0.2): score-chosen kept-block Jaccard min 0.865 over 6 prompts (0.882, 0.902, 0.886, 0.893,
+  0.865, 0.906; mean 0.889) < 0.9 FAIL (all-blocks reference min 0.897, mean 0.938); needle unchanged
+  (22/22 each, both arms); scout 23,615 → 19,519 ms = 1.21x end to end (1.19-1.24x on the Jaccard
+  prompts) < 1.4x, although the GEMMs alone are 2.05-2.2x (`ninfer_q4_a4_linear_test`); total 42.76 →
+  38.61 s; neighbour worst gap 1,046 → 896 ms. On the production cuBLAS route the int8 scout already
+  takes 14.1 s at this point, faster than the int4 scout on the A8 route (19.5 s), so `scout_a4` has no
+  production use as built: it would need a cuBLAS-route counterpart.
+- **Summary strategy fails** the Edit gate (24/26, −3.8 points; 26/26 summarised, to 14.4K-28.4K
+  tokens). Its needle and speed numbers do not measure it: the needle prompts and the speed prompt are
+  single user messages, which the summary leaves whole (`skipped`; 77.7 s, baseline-like).
+
+### Caveats
+
+- The Edit gate's resolution is one turn = 3.8 points at 26 turns: "pass" and "fail" above are one or
+  two turns apart. Only 26 turns of the 40 Edit turns in the 12 replayed sessions were long enough
+  (13 were below 30K); 30 or more did not fit the budget.
+- Baseline run-to-run noise: about ±10% in time (70.2 vs 77.1 s) and one Edit turn (the warm replay
+  and the cold `agent_edit` run of the same turns differ by one).
+- Needle saturates at 22/22 on every point measured, baseline included: it does not separate these
+  settings.
+- Agent sessions were cut to 12 (about 95 min of replay per 26 sessions did not fit).
+- Not run (budget): quality at block 32 and 128; needle and greedy at fl11_k0.2; `agent_edit` for the
+  int4 scout.
+
+### Neighbour stall
+
+The scout pass is not layer-sliced (see "As built"), so the neighbour stream's worst gap grows with the
+filter layer: 288 / 491 / 693 / 1,097 ms at `L` = 7 / 11 / 15 / 23 against 422 ms for the baseline
+(with `--prefill-layer-slices 8`). At `L` = 7, the new default, it is below the baseline; at
+`L` ≥ 11 a neighbour stalls longer than during a full prefill.
+
+### Harness bugs found and fixed during the sweep
+
+- 3e69bcef: the needle judge. evalscope's `judge_strategy: rule` exact-matches the whole needle
+  sentence, and the short answers scored 0.045-0.136 although every one was right; each sample is now
+  judged by its answer words (every needle word not in the question must appear), and earlier runs
+  were re-judged (`--rescore-needle`). Re-judged baseline: 22/22 at each length.
+- 328dc34d: `agent_replay` never exercised lossy prefill (every turn after the first reuses the
+  conversation's private record, which lossy prefill never filters). New `agent_edit` workload sends
+  the long Edit turns cold, and the Edit gate reads it.
+- 0e4e03dc: greedy prompts overshot the requested size (whole files appended past the limit; one
+  prompt reached 134,350 tokens > 131,072); the text is now cut at the requested size.
+- e7715825: a missed `agent_edit` turn keeps its reply, so misses can be inspected.
+
+## Verification
+
+### Correctness (must pass before any quality number means anything)
+
+- **Identity at keep-all:** with `keep_ratio = 1` (and forced keeps covering everything) the lossy path's
+  output, KV, GDN state and greedy tokens are bit-identical to an ordinary prefill. This tests that the
+  scout leaves no trace and that explicit positions equal the default ones.
+- **Gapped positions:** a GPU test that prefills a kept list with explicit positions and checks the KV and
+  logits against a reference computed by the existing per-token positions path (multimodal-style 3-axis
+  positions with all axes equal).
+- **Alias:** fake-engine tests (`tests/runtime/fake_engine.h`) for: the follow-up turn rewrites and hits
+  the cache; a diverging prompt does not; an exact (never-selected) request never receives a selected
+  checkpoint; alias removal with its checkpoint; cancel during scout and during main pass leaves nothing
+  behind; yield/pause during either pass resumes correctly (replay with stored positions).
+- Speculative decoding (DFlash2 one-lane default, MTP two-lane) after a lossy prefill produces the same
+  greedy tokens as non-speculative decoding after the same lossy prefill.
+- Usual suites per `CLAUDE.md`: `-CpuOnly`, then the `qwen3_5_*` and engine-scheduling GPU tests.
+
+### Quality sweep and gate (decides defaults and go/no-go)
+
+Workloads, each run with the flag off (baseline) and over the sweep grid:
+
+1. **Needle in a haystack** (`eval/configs/*needle_haystack*`, evalscope) at 32K, 64K, 100K. As built,
+   11 depths x English/Chinese = 22 samples per length (5 depths gave 5 samples, where one miss was
+   already 0.80x and the 0.95x gate had no resolution); a check with fewer than 20 samples on either side
+   is reported as not measured.
+2. **Agent replay** (`tools/bench/agent_replay`, 30K-120K contexts): tool-call validity, and for `Edit`
+   calls whether `old_string` occurs in the file (exact-copy fidelity), plus output divergence from
+   baseline.
+3. **Teacher-forced divergence:** per-token NLL and KL against the full-prefill model on the real next
+   tokens of long prompts, which is cheap, sensitive and needs no judge.
+4. A long-context QA set available through evalscope (LongBench-style) if it can be run locally.
+
+Acceptance targets (agreed with the user 2026-10-25; fixed before the sweep, not changed after seeing
+results; the final go/no-go is the user's, on the PR's measured numbers): needle accuracy ≥ 95% of baseline at every length; agent-replay `Edit` exact-match rate within
+2 points of baseline; prefill time on a 100K prompt ≤ 40% of baseline.
+
+Int4 scout gate: kept-block overlap with the int8 scout (Jaccard, over the score-chosen blocks: the forced
+head and recent blocks are left out, 2026-10-25) ≥ 0.9 on the sweep prompts, the quality
+gate above unchanged within run-to-run noise, scout GEMMs ≥ 1.4x faster than int8.
+
+### Speed
+
+`tools/bench/run_prefill_stall.py` and the depth sweep with the flag on: prompt total time, scout and main
+pass times separately, neighbour worst gap with layer slices on, peak KV pages during scout and after.
+
+## Observability
+
+- Counters: lossy prefills started/skipped/completed, tokens scouted, tokens kept, alias hits.
+- Request log (`--request-log-jsonl`): `lossy_prefill: {outcome, strategy, uncached_tokens, kept_tokens,
+  filter_layer, scout_ms, main_ms}` when used (a summary adds `summarized_messages`, `summary_reused`,
+  `summary_probe`). `--request-log-lossy-detail` adds `kept_runs`, the kept offsets of U as
+  `[begin, end)` pairs (all of U when skipped, none when declined), which the sweep's Jaccard reads.
+- `ninfer_prefill_backlog_seconds` / `/v1/load` predict the lossy cost for requests that will take the path.
+
+As built (engine): `ninfer_lossy_prefill_total{outcome="completed|skipped|aborted"}`, where
+`skipped` also counts a request that declined because another lane held the one scout (the
+request log tells them apart: `lossy_prefill.outcome` is `completed`, `skipped`, `declined` or
+`aborted`); `ninfer_lossy_prefill_scouted_tokens_total`, `ninfer_lossy_prefill_kept_tokens_total`
+(not for declined requests, which scout nothing) and `ninfer_lossy_prefill_alias_hits_total`
+(admitted prompts the Program rewrote onto a lossy lineage). Prompt progress and the cached-token
+count are reported in the client's tokens (`RequestBasePlan::reported_frontier`). The backlog
+prices a lossy request as the exact part to M, the scout over U at `Program::lossy_scout_share()`
+of a full prefill, and the main pass over `keep_fraction` of U; a queued request is priced that way
+when it is long enough and has no media.
+
+Pausing during the scout (as built): `start_pause` refuses while the scout runs, so the Engine
+never asks. A pause that only serves the queue (`--yield-long-prefill-ms`) skips a scouting lane
+and looks again on the step that ends the scout. A pause for memory ends the scout first
+(`Program::abort_lossy_scout`: the lane goes back to M exactly as the scout found it, and the
+request continues as an ordinary full prefill of U), then pauses as usual; it counts as `aborted`.
+Cancelling during the scout aborts the lane, which drops the scout and its pages.
+
+## As built / deviations
+
+What the build does differently from the design above, or adds to it. Each item is deliberate; the
+measured quality and speed are in ["Results"](#results-measured-2026-10-25-rtx-3090-vast).
+
+- **M is the end of the product prompt, not the deepest shared marker.** The Frontend records
+  `PreparedContextCache::product_prompt_end` (the graft, the leading System/Developer messages, the tool
+  declarations, and any marker inside them), resolved whatever the protocol's cache policy says;
+  `lossy_planned_exact_end` takes it, plus any engine-structural opportunity, for both strategies. Taking
+  the deepest SharedStablePrefix opportunity, as first built, meant the trigger could never fire for
+  ordinary OpenAI chat (default automatic boundary at the end of the last message) or Anthropic traffic
+  (`cache_control` on a recent message). A prompt with neither system message nor tools has M = 0.
+  Tested on real OpenAI and Anthropic translation (`ninfer_qwen3_5_lossy_exact_end_test`); the sweep
+  aborts a point whose preflight request does not log `outcome: "completed"`.
+- **A shared source past the product prompt counts as cached.** With M at the product-prompt end, the
+  shared checkpoints published at message boundaries (OpenAI's automatic boundary at the end of the
+  last message, Anthropic `cache_control` on a recent message, shared progress anchors) are an earlier
+  turn of the same conversation. `lossy_prefill_trigger` refuses a SharedPrefix source whose reused
+  tokens exceed M, and the summary probe answers warm for an in-memory shared match deeper than M (the
+  store branch already did), so a large new turn in a warm conversation prefills in full under both
+  strategies (fake-engine test `LossySharedSourcePastProductPrompt`).
+- **A prompt whose product prompt cannot be bounded is refused**: tools declared, but neither a leading
+  System/Developer message nor the end of the tool declarations found in the template's output. M would
+  be 0 and the tool schemas selectable, so `PromptSummary::product_prompt_unbounded` is set, neither
+  strategy takes the prompt, and `ninfer-serve` warns once when lossy prefill is on.
+- **The scout uses full KV pages** (the v1 fallback in "Scout pass"): peak KV during the scout is a full
+  prefill's for the scouted span.
+- **Scout steps are not layer-sliced** and cannot be paused (`start_pause` refuses while a scout runs).
+  Exact and Main steps keep layer slices, the stall budget and yield. A request yielded during Exact
+  keeps its lossy path: the Program's saved control carries the phase and M, and the restore goes on to
+  M and scouts (fake-engine test `LossyResumesAfterExactPause`).
+- **Teacher-forced KL is replaced by greedy agreement** (first divergence from the baseline's greedy
+  output) in the sweep. It is reported, not gated.
+- **Follow-ups planned before the lossy run finishes run cold**: the gap map exists only once the
+  selection is done, so a request admitted earlier with the same prefix is not rewritten.
+- **Once a gap map is live, any request whose prompt starts with that original prompt (through the end of
+  its `U`) is rewritten onto the lossy lineage**, also one that would not itself have triggered (another
+  client re-sending the same long prompt with a different question after it, say). It then sees the
+  kept tokens only, as the follow-up turns do.
+- **Key mass is not causal over the last query rows**: each of the `q` trailing query rows attends to
+  every key of `U`, including the few after it. Harmless: those rows and keys are inside the always-kept
+  recent window.
+- **Scout scratch is permanent VRAM when enabled**: the filter-layer keys (BF16, about 2 KB/token on the
+  27B) and scores (4 B/token) are sized for `max_context` at startup, about 256 MiB at 128K, plus the GDN
+  state copy of the layers below `L`. Nothing is reserved with lossy prefill off.
+- **The text-prefill RoPE axis** (one extra I32 row per chunk token) is planned only where the scout is.
+  Before this feature, text-only prompts always had `rope_delta` 0 without Vision, so no earlier path
+  needed it; this is not a latent fix.
+- **The summary registry is memory-only**: recorded summaries are lost on restart. A later turn of a
+  conversation summarised before the restart is then not rewritten with that summary, so it cannot match
+  checkpoints the context store kept for the summarised prompt; it is probed again and, if cold,
+  summarised again.
+- **The trigger is exclusive**: `|U| > min_tokens`.
+- **Request log**: `request_done.lossy_prefill` is omitted (not `null`) for a request that did not take or
+  consider the path, so the default schema is unchanged.
+
+## Options
+
+Defaults set from the 2026-10-25 sweep; the full flag list is in `docs/serving.md`.
+
+| option | default | meaning |
+|---|---|---|
+| `--lossy-prefill-min-tokens N` | `0` (off) | uncached suffix length above which the path runs; the recommended opt-in is 30000 |
+| `--lossy-prefill-keep F` | `0.3` | fraction of the uncached suffix kept |
+| `--lossy-prefill-filter-layer L` | `7` | full-attention layer used to score |
+| `--lossy-prefill-block B`, `--lossy-prefill-recent R`, `--lossy-prefill-head S` | `64`, `4096`, `256` | selection shape |
+| `--lossy-prefill-scout-a4` | off (its gate failed 2026-10-25) | int4 scout GEMMs |
+
+Startup refuses the option for non-Qwen3.5-dense Programs and pipeline-split models. The production
+launcher profile is not changed (decided 2026-10-25): lossy prefill stays an operator opt-in.
+
+## Left to the builder
+
+- The exact admission/transaction shape: whether the scout is a separate transaction or a phase of the
+  prefill transaction, and how `resolve_prefill_progress` and `BeginSummary` account for a prompt whose
+  length changes after the scout.
+- How scout scratch (GDN states for layers `< L`, KV rows for the scouted attention layers) is allocated.
+- The attention-mass kernel (a two-pass softmax over all keys for `q` query rows, reduced over rows and
+  heads), and whether it can reuse `prompt_i8_fa2` pieces.
+- Whether pooled block scores are computed on device or host (100K floats is small either way).
+- The int4 kernel's tiling, and how Q5 matrices are handled in the scout.
+
+## Risks
+
+- **GDN on gapped input** (the main unknown). Mitigations to try in the sweep: larger blocks, more recent
+  tokens kept, deeper filter layer.
+- **Exact-copy fidelity** for agents (anti-goal above).
+- **KV dtype.** The scoring at layer `L` uses the scout's own K for `U` (before KV quantization) and reads
+  `C`'s layer-`L` keys from the cache in its dtype (`rk4v4` in production). Main-pass and decode attention
+  already handle `rk4v4` (`prompt_i8_fa2`); the correctness and quality runs use `rk4v4`.
+- **Scout scratch memory** reintroduces the KV pressure this is meant to remove if done with full pages.
+- **Replay and anchors** assume slot + `rope_delta` positions today; every path that rebuilds a sequence
+  from its ledger must carry explicit positions.

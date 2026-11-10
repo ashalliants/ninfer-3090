@@ -201,7 +201,7 @@ qwen3_5::CheckpointImage export_checkpoint_image(const HostCheckpointStore& stor
                                                  const CheckpointLayout& layout,
                                                  std::span<const qwen3_5::CheckpointHandle> handles,
                                                  const std::optional<qwen3_5::PreparedSessionKey>& session,
-                                                 std::string_view binding) {
+                                                 std::string_view binding, std::vector<std::uint8_t> reuse) {
     std::vector<qwen3_5::CheckpointHandle> points;
     for (const auto handle : handles) {
         if (std::find(points.begin(), points.end(), handle) == points.end()) { points.push_back(handle); }
@@ -254,6 +254,8 @@ qwen3_5::CheckpointImage export_checkpoint_image(const HostCheckpointStore& stor
     }
 
     qwen3_5::CheckpointImage image;
+    image.bytes = std::move(reuse);
+    image.bytes.clear(); // keeps the capacity, and the pages behind it
     ImageWriter writer(image.bytes);
     codec::write_head(writer, kImageVersion, binding);
     write_config(writer, layout);
@@ -286,7 +288,11 @@ qwen3_5::CheckpointImage export_checkpoint_image(const HostCheckpointStore& stor
     const std::size_t image_offset = writer.reserve(images.size() * layout.image_bytes());
     const std::size_t checksum_at  = writer.reserve(sizeof(std::uint64_t));
     if (!page_slabs.empty()) { image.regions.push_back({pages_offset, page_slabs.size() * page_bytes}); }
-    image.regions.push_back({image_offset, images.size() * layout.image_bytes()});
+    // One region per state image: a store chunks each region from its own start, so an image that did
+    // not change hashes to the same chunks wherever it sits and is not stored or uploaded again.
+    for (std::size_t index = 0; index < images.size(); ++index) {
+        image.regions.push_back({image_offset + index * layout.image_bytes(), layout.image_bytes()});
+    }
 
     const std::size_t slab_bytes = layout.slab_bytes;
     std::vector<std::byte> buffer(std::max<std::size_t>(kSlabsPerTransfer, layout.image_slabs) * slab_bytes);

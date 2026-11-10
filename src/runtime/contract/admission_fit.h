@@ -17,14 +17,29 @@ struct KvPageCounts {
     return prefix_frontier / page_size;
 }
 
+// Pages a resident still has to map before its prompt (or the history it replays) is complete,
+// beyond the pages it has mapped and those the pool has already promised it. A resident reserves
+// one chunk at a time, so early in a long prefill it holds a few pages yet will need its whole
+// prompt: counting only what it holds lets a second long prompt in beside it, and one of the two is
+// paused when the first one's later chunks arrive (#332).
+[[nodiscard]] constexpr std::uint64_t resident_pages_to_prompt_end(std::uint64_t prompt_end_pages,
+                                                                   std::uint64_t mapped_pages,
+                                                                   std::uint64_t reserved_pages) noexcept {
+    const auto held = mapped_pages + reserved_pages;
+    return prompt_end_pages > held ? prompt_end_pages - held : 0;
+}
+
 // Whether a fresh prompt's whole KV need can ever be met next to the pages that resident requests
-// currently hold. Admission only reserves the first prefill chunk, so a prompt that fails this
-// starts, fills the pool, is paused and later recomputes its history. Pages held only by cached
-// checkpoints are not counted in `pinned`: reclaim can evict them.
+// hold or will hold by the end of their prompts. Admission only reserves the first prefill chunk,
+// so a prompt that fails this starts, fills the pool, is paused and later recomputes its history.
+// Pages held only by cached checkpoints are not counted in `pinned`: reclaim can evict them.
 //
 // `need` counts only pages not already pinned (a prefix shared with a resident is already in
-// `pinned`). `pinned` also includes pages the pool has promised to residents but not yet mapped, and
-// `capacity` is what the pool can still hand out (pages lent away are excluded). With no resident the prompt is always let in, which keeps the queue moving.
+// `pinned`). `pinned` also includes pages the pool has promised to residents but not yet mapped and
+// the pages residents still need to reach their prompt end (resident_pages_to_prompt_end), and
+// `capacity` is what the pool can still hand out (pages lent away are excluded). Output growth is
+// not counted: a request's output length is unknown until it ends. With no resident the prompt is
+// always let in, which keeps the queue moving.
 [[nodiscard]] constexpr bool prompt_fits_beside_residents(KvPageCounts need, KvPageCounts pinned,
                                                           KvPageCounts capacity,
                                                           bool residents_present) noexcept {

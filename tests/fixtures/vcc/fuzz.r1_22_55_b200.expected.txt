@@ -1,0 +1,6 @@
+## Historical Task Snapshot
+Audit the repo and clean up the logging module.
+
+## Goal
+The build in ~/proj is red, please fix it and ke … hem.
+[#48] user: Audit the repo and clean up the logging module.

@@ -1,0 +1,42 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "make a config"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "w1",
+     "name": "write_file",
+     "arguments_json": "{\"path\": \"/srv/app.ini\", \"content\": \"x=1\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "w1",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"success\": true}"
+    }
+   ]
+  }
+ ],
+ "cases": [
+  {
+   "id": "b4000",
+   "first": 0,
+   "last": 3,
+   "budget_chars": 4000
+  }
+ ]
+}

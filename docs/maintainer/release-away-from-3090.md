@@ -82,10 +82,10 @@ and to warm the caches (the first Windows run builds ffmpeg through vcpkg and co
 
 ```bash
 scripts/release-windows-remote.sh <ssh-alias> <commit>     # long; safe to re-run after a dropped connection
-~/empty/vast-ninfer/vast-release-linux.sh <repo-dir>       # needs VERSION and RELEASE_NOTES_X.Y.Z.md committed
+~/empty/vast-ninfer/vast-release-linux.sh <repo-dir>       # needs VERSION and docs/release-notes/RELEASE_NOTES_X.Y.Z.md committed
 ```
 
-The packagers refuse without `RELEASE_NOTES_<version>.md` for the `VERSION` file, so a dry run needs a
+The packagers refuse without `docs/release-notes/RELEASE_NOTES_<version>.md` for the `VERSION` file, so a dry run needs a
 throwaway release-notes file committed in the dry-run commit.
 
 ## Cutting the release

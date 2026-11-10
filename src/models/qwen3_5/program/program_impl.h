@@ -5,13 +5,17 @@
 #include "core/chunked_reservation.h"
 #include "core/gdn_replay_records.h"
 #include "core/device_snapshot.h"
+#include "core/host_arena_model.h"
 #include "core/host_kv_arena.h"
 #include "core/vmm_region.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "runtime/contract/host_placement.h"
 
+#include "models/qwen3_5/program/lossy/gap_map.h"
+#include "models/qwen3_5/program/lossy/lossy_flow.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/speculative/draft_window_policy.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
@@ -70,6 +74,10 @@ struct RequestBasePlanImpl {
     PrefixShortlistDigests prefix_digests;
     std::uint32_t prefix_identity_tag = 0;
     bool allow_prefix_reuse           = false;
+    // The lossy lineage planning rewrote the prompt with (empty: the prompt is the client's), and
+    // whether the request may take the lossy path (see LossyPlan).
+    GapMapSet gap_maps;
+    std::optional<LossyPlan> lossy;
     // The prepared n-gram copy index, moved out of the prompt at planning and into the request's
     // control by its one fresh binding; a resumed binding carries the control's own. Only the
     // Engine worker touches it after planning.
@@ -199,6 +207,9 @@ struct SequenceState {
     std::uint32_t mtp_draft_count = 0;
     bool tail_hidden_valid        = false;
     bool endpoint_valid           = false;
+    // The lossy lineage of the ledger (lineage order): the maps from the original prompts to it.
+    // Every checkpoint taken from the sequence past a map's begin carries that map.
+    GapMapSet gap_maps;
 };
 
 struct CaptureReservation {
@@ -251,6 +262,10 @@ struct RequestControl {
         double elapsed_seconds           = 0.0;
         double retired_vision_seconds    = 0.0;
         bool prepare_mtp                 = false;
+        // Whether every prompt position from base on is index + rope_delta, so text prefill derives
+        // RoPE from the KV slot. False for a compacted lossy prompt (gapped original positions),
+        // whose chunks pass the stored positions instead.
+        bool regular_text_positions      = true;
         PrefixReusePath reuse            = PrefixReusePath::Root;
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
         // A chunk run in slices (execution::PrefillSliceState): where it stands, and how many
@@ -263,6 +278,14 @@ struct RequestControl {
 
     std::optional<Prefill> prefill;
     std::optional<Prefill> replay;
+
+    // A request on the lossy prefill path (enable_lossy): its phase (lossy_flow.h) and M.
+    struct Lossy {
+        LossyPhase phase                     = LossyPhase::Exact;
+        std::uint32_t exact_end              = 0;
+        double scout_seconds                 = 0.0;
+    };
+    std::optional<Lossy> lossy;
 };
 
 struct CheckpointState {
@@ -275,6 +298,8 @@ struct CheckpointState {
     std::uint32_t backend_frontier = 0;
     std::int32_t rope_delta        = 0;
     bool tail_hidden_valid         = false;
+    // The lossy lineage of the identity: the maps whose kept tokens it holds (begin < frontier).
+    GapMapSet gap_maps;
 };
 
 struct CheckpointSlot {
@@ -331,11 +356,26 @@ public:
     void refresh_history_requirements(const std::shared_ptr<KVHistory>&, bool trim_unused = false);
     [[nodiscard]] bool revoke_snapshot(ResumeState&) noexcept;
     [[nodiscard]] runtime::ContextResourceUsage snapshot_resources(const ResumeState& paused) const;
-    // Exact Host bytes freed by deleting this fixed set, with physical sharing counted once.
-    [[nodiscard]] std::size_t
-    host_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
-    [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle sequence) const;
+    // Exact Host bytes freed by deleting this fixed set, with physical sharing counted once; with
+    // state_images_only, only those of the whole Host state images it frees.
+    // The Host replicas a release frees, by identity, for the allocator simulation.
+    struct HostReleaseSet {
+        std::vector<StateImageHandle> states;
+        std::vector<LogicalKVPageHandle> main, backend;
+    };
+    [[nodiscard]] std::size_t host_bytes_released(std::span<const CheckpointHandle> checkpoints,
+                                                  bool state_images_only         = false,
+                                                  HostReleaseSet* released_set = nullptr) const;
+    // The Host arena's free runs after releasing these checkpoints (#406).
+    [[nodiscard]] runtime::HostFreeRuns
+    host_free_runs_after_release(std::span<const CheckpointHandle> checkpoints) const;
+    // Host bytes a pause snapshot places; with `need`, also what it places in each allocation.
+    [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle sequence,
+                                                              PauseHostNeed* need = nullptr) const;
     [[nodiscard]] std::size_t pause_state_image_unplaced(SequenceHandle sequence) const;
+    [[nodiscard]] bool pause_snapshot_fits(SequenceHandle sequence) const;
+    // General-budget Host bytes that allocations of whole `unit`s could take now.
+    [[nodiscard]] std::size_t host_placeable_bytes(std::size_t unit) const noexcept;
     [[nodiscard]] std::size_t
     release_redundant_host(std::span<const CheckpointHandle> excluded,
                            std::optional<SequenceHandle> pending_backup = std::nullopt);
@@ -385,6 +425,54 @@ public:
     [[nodiscard]] std::unique_ptr<execution::VisionPrefillSession>
     make_vision_session(const PreparedPromptData& prompt, const VisionPrefillPlan& plan);
 
+    // ---- Lossy-prefill scout (docs/maintainer/lossy-long-prefill.md, "Scout pass") ----
+    // Present only when the plan has the scout scratch (lossy prefill on, one device).
+    //
+    // begin_scout opens a scout over U = [cursor, prompt end) of a Prefilling text lane whose
+    // cursor sits at the end of its cached prefix C. When the lane writes the state its main pass
+    // reads (no fork pending), the GDN conv and recurrent states of the layers below the filter
+    // layer are copied to the scout's saved slot. advance_scout runs the next scout chunk
+    // (TextContext::scout_chunk) at most `max_tokens` (0: the prefill chunk) wide: its KV goes to
+    // the lane's own pages past the committed frontier (mapped from the free pool; `reserved` is
+    // false and nothing runs when the pool is short), its GDN states advance in place, and the
+    // lane's cursor, ledger, frontier and fork are left alone. The chunk that ends the prompt
+    // scores U (scout_scores). end_scout, after the last chunk or to abort part-way, copies the
+    // saved states back, releases the scout's pages and restores the lane's growth reservation,
+    // so the lane is exactly as begin_scout found it. A lane cleared while scouting drops the
+    // scout. One scout at a time. The lane must not be settled (settle_unit truncates mapped
+    // pages) between begin_scout and end_scout.
+    struct ScoutStep {
+        std::uint32_t processed_tokens = 0;
+        bool complete                  = false; // U is scored
+        bool reserved                  = true;  // false: too few free KV pages, nothing ran
+        runtime::ExecutionTiming timing;
+    };
+    void begin_scout(SequenceHandle);
+    [[nodiscard]] ScoutStep advance_scout(SequenceHandle, std::uint32_t max_tokens = 0);
+    // Per-token key mass of U, in prompt order. Only after the scout's last chunk.
+    [[nodiscard]] std::vector<float> scout_scores() const;
+    void end_scout(SequenceHandle);
+    [[nodiscard]] bool scout_active(SequenceHandle) const noexcept;
+    // ---- Lossy prefill phases (lossy_flow.h; see Program::enable_lossy) ----
+    [[nodiscard]] bool enable_lossy(SequenceHandle);
+    [[nodiscard]] bool abort_lossy_scout(SequenceHandle);
+    [[nodiscard]] double lossy_scout_share() const noexcept;
+    // Whether the lane is a lossy request that may not pause or capture now (lossy_flow.h).
+    [[nodiscard]] bool lane_refuses_pause(std::uint32_t lane) const noexcept;
+    [[nodiscard]] bool lane_holds_captures(std::uint32_t lane) const noexcept;
+    // One Scout step (EnterScout or Scout in lossy_step); the step that scores U also selects,
+    // compacts and moves the request to Main.
+    [[nodiscard]] PrefillProgress advance_lossy_scout(std::uint32_t lane, runtime::ExecutionTiming*,
+                                                      std::uint32_t max_tokens);
+    void finish_lossy_scout(std::uint32_t lane, PrefillProgress& progress);
+    void install_compacted_prompt(std::uint32_t lane, PreparedPromptData&& compacted,
+                                  std::shared_ptr<const GapMap> map);
+    // The live maps of the registry, pruning expired ones.
+    [[nodiscard]] GapMapSet live_gap_maps();
+    // The tail of plan_request shared with a lossy compaction: the prompt's digests, identity and
+    // capture groups.
+    void finish_request_plan(RequestBasePlanImpl& base, PreparedPromptData&& prompt) const;
+
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle, runtime::ExecutionTiming*,
                                                   runtime::TokenMaskProvider*,
                                                   std::uint32_t max_tokens   = 0,
@@ -407,7 +495,8 @@ public:
     void reset_memory_peaks() noexcept;
     [[nodiscard]] CheckpointImage export_checkpoints(std::span<const CheckpointHandle>,
                                                      const std::optional<PreparedSessionKey>&,
-                                                     std::string_view binding) const;
+                                                     std::string_view binding,
+                                                     std::vector<std::uint8_t> buffer = {}) const;
     [[nodiscard]] std::size_t checkpoint_image_host_bytes(std::span<const std::uint8_t>,
                                                           std::string_view binding) const;
     [[nodiscard]] std::optional<ImportedCheckpoints>
@@ -506,12 +595,53 @@ public:
     std::optional<DFlashPersistentState> dflash;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
+    // The scout's scratch (see begin_scout), bound from the persistent layout's ScoutLayout.
+    struct ScoutBuffers {
+        execution::ScoutScratch scratch;
+        // The saved GDN states of the layers below the filter layer, one slot. Null when no GDN
+        // layer lies below it.
+        std::unique_ptr<LinearAttentionStatePool> gdn_saved;
+        std::uint32_t filter_layer = 0;
+        // --lossy-prefill-scout-a4: the int4 scout's layer parameters (execution::scout_a4_layers),
+        // which scratch.a4_layers views. Empty for the int8 scout.
+        std::vector<execution::BlockParameters> a4_layers;
+    };
+    std::optional<ScoutBuffers> scout_buffers;
+    struct ScoutSession {
+        std::uint32_t lane          = 0;
+        std::uint32_t u_begin       = 0;
+        std::uint32_t prompt_tokens = 0;
+        std::uint32_t cursor        = 0;
+        // The lane's GDN slots when the scout began; see scout_chunk_slots.
+        std::int32_t state_source      = 0;
+        std::int32_t state_destination = 0;
+        bool restore_state             = false;
+        // The lane's KV growth reservation when the scout began, put back by end_scout.
+        std::uint32_t growth_pages = 0;
+        std::uint32_t mapped_pages = 0;
+        bool scored                = false;
+    };
+    std::optional<ScoutSession> scout_session;
+    [[nodiscard]] std::uint32_t scout_lane(SequenceHandle) const;
+    // Lossy prefill: the options, the tokenizer's special and added token ids (sorted; always kept
+    // by selection) and every gap map some sequence or checkpoint still holds.
+    LossyPrefillOptions lossy_options;
+    std::vector<TokenId> lossy_special_tokens;
+    // <|im_start|>: the role name after it is forced too (lossy_forced_tokens).
+    std::optional<TokenId> lossy_turn_start;
+    // <|im_end|>: with lossy_turn_start, finds the generation opener a gap map ends before.
+    std::optional<TokenId> lossy_turn_end;
+    std::vector<std::weak_ptr<const GapMap>> gap_map_registry;
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     Tensor grammar_masks_device;
     std::optional<PinnedHostBuffer> grammar_masks_host;
     std::optional<DFlashDraftHandoff> dflash_draft_handoff;
     std::array<std::uint32_t, kMaximumConcurrency> grammar_dead_positions{};
+    // Rows of the round whose sampled or licensed tokens left the public domain (set by the
+    // collect_* paths, row order of the round). wrap_pending reports them; the request fails, the
+    // Engine and the other rows go on.
+    std::array<bool, kMaximumConcurrency> token_domain_faults{};
     ops::SamplingMask bind_grammar_mask(runtime::TokenMaskProvider*, std::size_t row);
     ops::SamplingMask fill_grammar_mask(runtime::TokenMaskProvider*, std::size_t row,
                                         std::span<const TokenId> drafts);
@@ -682,6 +812,8 @@ public:
     [[nodiscard]] std::uint32_t initial_mtp_extent(const RequestBasePlanImpl&) const;
     [[nodiscard]] UnitDemand prefill_unit(std::uint32_t prompt, std::uint32_t cursor,
                                           std::uint32_t mtp_extent) const;
+    // The demand of a prompt's last prefill chunk: its frontiers are the whole prompt's.
+    [[nodiscard]] UnitDemand prompt_end_unit(std::uint32_t prompt, std::uint32_t mtp_extent) const;
     [[nodiscard]] UnitDemand next_unit(const SequenceState&, const RequestControl&,
                                        ExecutionUnitKind, std::uint32_t tokens) const;
     void require_unit(std::uint32_t lane, ExecutionUnitKind, std::uint32_t tokens = 0) const;
@@ -784,6 +916,9 @@ public:
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
+    // Whether every token is inside the public domain. A token outside it is replaced with 0, so
+    // nothing downstream sees an out-of-range id; the caller marks the row in token_domain_faults.
+    [[nodiscard]] bool license_tokens(std::span<TokenId> tokens) const noexcept;
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;
     [[nodiscard]] runtime::BatchedGeneratedRound decode_ordinary_batch(
         std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,

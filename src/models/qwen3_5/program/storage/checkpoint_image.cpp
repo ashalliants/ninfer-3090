@@ -378,7 +378,8 @@ ParsedImage parse_image(const ProgramImpl& program, std::span<const std::uint8_t
 
 CheckpointImage ProgramImpl::export_checkpoints(std::span<const CheckpointHandle> handles,
                                                 const std::optional<PreparedSessionKey>& session,
-                                                std::string_view binding) const {
+                                                std::string_view binding,
+                                                std::vector<std::uint8_t> buffer) const {
     if (context_transaction_ || pending_transaction_) {
         throw std::logic_error("checkpoints cannot be exported during a context transaction");
     }
@@ -507,6 +508,8 @@ CheckpointImage ProgramImpl::export_checkpoints(std::span<const CheckpointHandle
     }
 
     CheckpointImage image;
+    image.bytes = std::move(buffer);
+    image.bytes.clear(); // keeps the capacity, and the pages behind it
     ImageWriter writer(image.bytes);
     image_codec::write_head(writer, kImageVersion, binding);
     write_config(writer, config);
@@ -562,7 +565,13 @@ CheckpointImage ProgramImpl::export_checkpoints(std::span<const CheckpointHandle
         image.regions.push_back(
             {backend_offset, backend_table.handles.size() * config.backend_page_stride});
     }
-    image.regions.push_back({state_offset, states.size() * state_layout.image_bytes});
+    // One region per state: a store chunks each region from its own start, so a state that did not
+    // change hashes to the same chunks wherever it sits, and is not stored or uploaded again when a
+    // newer state is put before it or an older one is dropped.
+    for (std::size_t index = 0; index < states.size(); ++index) {
+        image.regions.push_back(
+            {state_offset + index * state_layout.image_bytes, state_layout.image_bytes});
+    }
 
     // The pages and images are immutable and no transaction is open, but the unit that last wrote
     // them may still be in flight on the compute stream, which also orders these copies behind it.
@@ -694,6 +703,8 @@ ProgramImpl::import_checkpoints(std::span<const std::uint8_t> image, std::string
                                   std::span<const std::uint8_t> payload,
                                   std::vector<LogicalKVPageHandle>& out) {
         const std::size_t stride = host_kv_extents->page_layout(pages).page_stride;
+        // Halving a run that does not fit is the placement working, not failing.
+        HostContextArena::PlacementScope placement(*host_context_arena);
         std::size_t offset       = 0;
         while (offset < columns.size()) {
             std::size_t count = columns.size() - offset;
@@ -705,7 +716,10 @@ ProgramImpl::import_checkpoints(std::span<const std::uint8_t> image, std::string
                 if (extent) { break; }
                 count /= 2;
             }
-            if (!extent) { return false; }
+            if (!extent) {
+                placement.failed();
+                return false;
+            }
             rollback.extents.push_back(extent->capability);
             out.insert(out.end(), extent->pages.begin(), extent->pages.end());
             offset += count;

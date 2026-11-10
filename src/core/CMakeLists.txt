@@ -38,6 +38,13 @@ else()
   # nvml.cpp loads libnvidia-ml.so.1 via dlopen/dlsym/dlclose.
   target_link_libraries(ninfer_core PRIVATE ${CMAKE_DL_LIBS})
 endif()
+if(NINFER_HOST_ONLY)
+  # No CUDA compiler (see NINFER_HOST_ONLY): these .cu files hold host code only and compile as
+  # C++ against the CUDA headers. The two with kernels are left out; nothing the host-only tests
+  # link calls them.
+  ninfer_host_only_sources(ninfer_core
+    KERNELS host_gather.cu pinned_upload.cu)
+endif()
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3 Threads::Threads CUDA::cuda_driver)

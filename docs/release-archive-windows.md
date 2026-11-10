@@ -6,7 +6,7 @@ under `scripts/`, and
 [docs/rtx-3090-windows.md](https://github.com/ashalliants/ninfer-3090/blob/master/docs/rtx-3090-windows.md)
 is the fuller guide. Links here are absolute on purpose: the archive ships no `docs/` directory.
 
-Check `VERSION` for the release this archive was cut from, and `RELEASE_NOTES_*.md` for what
+Check `VERSION` for the release this archive was cut from, and `RELEASE_NOTES_*.md` in the archive root for what
 changed.
 
 ## Requirements
@@ -69,6 +69,8 @@ API key blank.
 | `run.bat` | serving profiles: `run.bat <model> [profile]`, or double-click it to pick a model |
 | `*.dll` | the FFmpeg and libcurl runtime dependencies, and NVIDIA's cuBLAS (`cublas64_12.dll`, `cublasLt64_12.dll`) |
 | `NVIDIA-CUDA-EULA.txt` | the licence under which the two cuBLAS DLLs are redistributed |
+| `LICENSE` | NInfer's licence (Apache-2.0) |
+| `THIRD_PARTY_NOTICES.txt` | the notice for the ported conversation projector (hermes-vcc-engine, Apache-2.0) |
 | `SHA256SUMS.txt` | checksums for every file in this directory |
 
 ## Overrides

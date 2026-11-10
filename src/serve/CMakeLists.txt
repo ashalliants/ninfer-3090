@@ -13,6 +13,7 @@ add_library(ninfer_serve STATIC
   anthropic_messages_request.cpp
   anthropic_messages_response.cpp
   anthropic_messages_http.cpp
+  anthropic_reasoning_store.cpp
   openai_responses_store.cpp
   translate.cpp
   generation_service.cpp

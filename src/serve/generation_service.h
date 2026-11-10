@@ -7,6 +7,7 @@
 #include "serve/request.h"
 #include "serve/serve_options.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -69,6 +70,8 @@ struct GenerationMetrics {
     std::uint64_t speculative_adaptive_low_rounds   = 0;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;
+    // Set when the request took the lossy prefill path (the request log's lossy_prefill).
+    std::optional<ninfer::LossyPrefillReport> lossy_prefill;
 };
 
 struct GenerationOutcome {
@@ -152,8 +155,9 @@ public:
     explicit GenerationService(
         ServeOptions options, StartupObserver startup_observer = {},
         std::function<void(const ninfer::ContextStoreWriteEvent&)> store_listener = {},
-        std::function<void(const ninfer::EngineFaultEvent&)> fault_listener      = {});
-    ~GenerationService();
+        std::function<void(const ninfer::EngineFaultEvent&)> fault_listener      = {},
+        std::function<void(const ninfer::ContextStoreHydrationEvent&)> hydration_listener = {});
+    virtual ~GenerationService();
     GenerationService(const GenerationService&)            = delete;
     GenerationService& operator=(const GenerationService&) = delete;
 
@@ -161,48 +165,73 @@ public:
 
     // Engine owns the once-normalized startup configuration. Serving diagnostics must use this
     // value instead of reinterpreting optional defaults from ServeOptions.
-    [[nodiscard]] const ninfer::EngineOptions& engine_options() const { return engine_->options(); }
+    [[nodiscard]] virtual const ninfer::EngineOptions& engine_options() const {
+        return engine_->options();
+    }
 
-    [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
+    [[nodiscard]] virtual ninfer::LoadSummary load_summary() const {
+        return engine_->load_summary();
+    }
 
-    [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
+    [[nodiscard]] virtual ninfer::MemorySummary memory_summary() const {
+        return engine_->memory_summary();
+    }
 
-    [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
+    [[nodiscard]] virtual ninfer::RuntimeStats runtime_stats() const {
+        return engine_->runtime_stats();
+    }
 
-    [[nodiscard]] bool is_available() const { return engine_->is_available(); }
+    [[nodiscard]] virtual bool is_available() const { return engine_->is_available(); }
     // The Engine failed Engine-wide and never recovers.
     [[nodiscard]] bool has_failed() const { return engine_->has_failed(); }
 
     // Model suspend (--model-suspend): see Engine::suspend. Throws std::invalid_argument when the
     // service was started without it.
-    ninfer::ResidencyStatus suspend(std::optional<bool> auto_resume = std::nullopt);
-    ninfer::ResidencyStatus resume();
-    [[nodiscard]] ninfer::ResidencyStatus residency() const;
+    virtual ninfer::ResidencyStatus suspend(std::optional<bool> auto_resume = std::nullopt);
+    virtual ninfer::ResidencyStatus resume();
+    [[nodiscard]] virtual ninfer::ResidencyStatus residency() const;
+
+    // See Engine::flush_context_store. Counts as an admitted request while it runs, so the idle
+    // sleeper and /suspend leave the model resident; a suspended model is resumed first, since
+    // only a running worker writes the sessions.
+    virtual ninfer::ContextStoreFlushReport flush_context_store(std::chrono::milliseconds budget);
 
     // Requests currently holding ingress capacity (max_concurrency + max_pending_requests).
-    [[nodiscard]] std::size_t admitted_requests() const;
+    [[nodiscard]] virtual std::size_t admitted_requests() const;
 
     [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {
         return engine_->media_cache_summary();
     }
 
-    [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
+    [[nodiscard]] virtual ninfer::ModelSamplingDefaults sampling_defaults() const {
         return engine_->sampling_defaults();
     }
 
-    [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
-                                          GenerationConsumerMode consumer_mode,
-                                          ninfer::GenerationObservationOptions observation = {},
-                                          std::function<bool()> is_cancelled               = {},
-                                          ContextCacheHints context_cache = {}) const;
-    [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
-                                          std::function<bool()> is_cancelled = {}) const;
+    [[nodiscard]] virtual PreparedRequest
+    prepare(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
+            ninfer::GenerationObservationOptions observation = {},
+            std::function<bool()> is_cancelled               = {},
+            ContextCacheHints context_cache                  = {}) const;
+    [[nodiscard]] virtual int count_prompt_tokens(const GenerationRequest& req,
+                                                  std::function<bool()> is_cancelled = {}) const;
 
     // Consumes prepared.generation. A PreparedRequest is single-use.
-    GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
-                          std::function<bool()> is_cancelled = {});
+    virtual GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
+                                  std::function<bool()> is_cancelled = {});
 
     void warmup();
+
+protected:
+    // A service with no Engine, for a test double that overrides what the server calls (the
+    // virtual members above): the HTTP routes and the idle sleeper can then run without a GPU.
+    // Nothing the double does not override may be reached.
+    struct NoEngine {};
+    GenerationService(ServeOptions options, NoEngine);
+    // Starts --sleep-idle-seconds' sleeper, which the Engine constructor starts itself. A double
+    // calls it once constructed (the sleeper calls its overrides) and must call stop_idle_sleeper()
+    // before it is destroyed.
+    void start_idle_sleeper();
+    void stop_idle_sleeper();
 
 private:
     enum class CacheParticipation : std::uint8_t {
@@ -226,6 +255,8 @@ private:
     void idle_sleep_loop();
 
     ServeOptions options_;
+    // The lossy-prefill warning for a prompt whose product prompt cannot be bounded: once.
+    mutable std::atomic<bool> warned_unbounded_product_prompt_{false};
     std::unique_ptr<ninfer::Engine> engine_;
     std::shared_ptr<RequestCapacity> request_capacity_;
     // --sleep-idle-seconds: the thread that suspends an idle model.

@@ -1,0 +1,10 @@
+## Historical Task Snapshot
+Final: please keep été and 中文 and 🙂 intact.
+
+## Goal
+ANSI: red osc:done osc2:link bad:unterminated [12 [ end single esc
+
+## Detailed Session Log (oldest first)
+(vcc projection: deterministic, no LLM. Each [#N] line is an excerpt of messag … read them.
+… 5 older log line(s) omitted; use session_search to read them.
+[#13] user: Final: please keep été and 中文 and 🙂 intact.

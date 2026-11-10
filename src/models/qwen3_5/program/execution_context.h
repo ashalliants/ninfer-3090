@@ -152,12 +152,13 @@ void target_verify_forward(ExecutionCore&, TextContext&, TargetVerifyFrameView,
                            ops::CausalAttentionExecutionEnvelope);
 void target_accept(ExecutionCore&, Tensor& continuation_hidden_store, TargetVerifyFrameView);
 
-[[nodiscard]] PrefillChunkResult prefill_text_chunk(PrefillContext& state,
-                                                    std::span<const TokenId> ids,
-                                                    std::uint32_t nominal_length,
-                                                    std::optional<std::uint32_t> split_frontier,
-                                                    bool finalize_at_end,
-                                                    PrefillSliceState* slice = nullptr);
+// `rope_positions`: the prompt's axis-0 RoPE positions, or empty for slot + rope_delta.
+[[nodiscard]] PrefillChunkResult
+prefill_text_chunk(PrefillContext& state, std::span<const TokenId> ids,
+                   std::uint32_t nominal_length, std::optional<std::uint32_t> split_frontier,
+                   bool finalize_at_end,
+                   PrefillSliceState* slice                     = nullptr,
+                   std::span<const std::int32_t> rope_positions = {});
 
 [[nodiscard]] PrefillChunkResult
 prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,

@@ -186,11 +186,17 @@ void validate(const EngineOptions& options) {
     if (options.prefill_schedule.yield_remaining_ms != 0) {
         refuse("does not pause a prefill for the queue: remove --yield-long-prefill-ms");
     }
+    if (options.context_cache.host_pause_reserve_bytes != 0) {
+        refuse("does not pause a request into the Host: remove --host-pause-reserve-mib");
+    }
     if (options.prefill_schedule.layer_slices > 1) {
         refuse("runs its layers in its own routed calls and does not slice them: remove --prefill-layer-slices");
     }
     if (options.prefill_schedule.stall_budget_ms != 0) {
         refuse("sizes its own prefill calls and ignores a stall budget: remove --prefill-stall-budget-ms");
+    }
+    if (options.lossy_prefill.enabled()) {
+        refuse("has no lossy long-prompt prefill: remove --lossy-prefill-min-tokens");
     }
     if (options.context_cache.auto_host_cache) {
         refuse("sizes its context cache's Host tier from its own RAM ledger: remove --auto-host-cache (set the size with "
@@ -438,6 +444,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     LoadSummary summary;
     summary.architecture         = std::string(models::architecture_name(models::Architecture::Qwen4Exp));
     summary.model_name           = instance->model->info().name;
+    summary.artifact_id          = artifact::artifact_id_hex(instance->model->info().artifact_id);
     summary.load_seconds         = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     summary.upload_seconds       = stats.upload_seconds;
     summary.artifact_bytes_read  = stats.read_bytes;

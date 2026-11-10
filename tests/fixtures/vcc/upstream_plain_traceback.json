@@ -1,0 +1,33 @@
+{
+ "messages": [
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "a",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"1/0\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "a",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Traceback (most recent call last):\n  ...\nZeroDivisionError: division by zero"
+    }
+   ]
+  }
+ ],
+ "cases": [
+  {
+   "id": "b4000",
+   "first": 0,
+   "last": 2,
+   "budget_chars": 4000
+  }
+ ]
+}

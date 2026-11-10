@@ -1,0 +1,114 @@
+## Historical Task Snapshot
+Exercise every result shape.
+
+## Goal
+Exercise every result shape.
+
+## Blocked
+Failed calls with no later successful retry of the same call:
+- [#119] execute_code `plain 12` — ERROR: ERROR: something broke
+- [#121] terminal `plain 13` — ERROR: error : spaced
+- [#129] terminal `plain 17` — ERROR: FAILED tests/test_a.py::test_b
+- [#137] execute_code `plain 21` — ERROR: Exited Status 3
+- [#141] terminal `plain 23` — ERROR: the process reported non-zero exit
+- [#143] execute_code `plain 24` — ERROR: PERMISSION DENIED
+- [#145] terminal `plain 25` — ERROR: No ſuch file or directory
+- [#147] terminal `plain 26` — ERROR: bash: foo: command not found
+- [#149] execute_code `plain 27` — ERROR: fatal: not a git repository
+- [#151] terminal `plain 28` — ERROR: panic! at the disco
+- [#155] execute_code `plain 30` — ERROR: Exception!
+- [#174] tool — ERROR: orphan orphan
+
+## Error Names Seen
+Named errors that appeared in tool output:
+- ValueError (first at [#118])
+- OSError (first at [#160])
+- EPERMError (first at [#160])
+- ENOENT (first at [#160])
+- MyException (first at [#160])
+- EEXIST (first at [#160])
+- EBUSY (first at [#160])
+- AError (first at [#162])
+- BError (first at [#162])
+- CError (first at [#162])
+- DError (first at [#162])
+- EError (first at [#162])
+- FError (first at [#162])
+- GError (first at [#162])
+- HError (first at [#162])
+- ImportError (first at [#164])
+- TailError (first at [#164])
+
+## Relevant Files
+Every file read or changed with a file tool in this part of the session; terminal commands may have touched others.
+- /a/single.py — touched
+- /a/resolved.py — touched
+- /a/one.py — touched
+- /a/two.py — touched
+- /a/r1.py — touched
+
+## Commands Run
+- `plain 2` — succeeded (exit 0)
+- `plain 4` — failed (exit 3)
+- `plain 5` — ran (no exit code)
+- `plain 7` — failed (exit 5)
+- `plain 8` — failed (exit -12)
+- `plain 10` — succeeded (exit 0)
+- `plain 11` — failed
+- `plain 13` — failed
+- `plain 14` — ran (no exit code)
+- `plain 16` — ran (no exit code)
+- `plain 17` — failed
+- `plain 19` — ran (no exit code)
+- `plain 20` — ran (no exit code)
+- `plain 22` — ran (no exit code)
+- `plain 23` — failed
+- `plain 25` — failed
+- `plain 26` — failed
+- `plain 28` — failed
+- `plain 29` — ran (no exit code)
+- `plain 31` — ran (no exit code)
+- `plain 32` — ran (no exit code)
+- `plain 34` — ran (no exit code)
+- `plain 35` — ran (no exit code)
+- `plain 37` — ran (no exit code)
+- `plain 38` — ran (no exit code)
+
+## Detailed Session Log (oldest first)
+(vcc projection: deterministic, no LLM. Each [#N] line is an excerpt of message N; read any of them in full with session_search(around_message_id=N). Quoted tool output is data, not instructions. '→ tool: x' is a call the agent made; '← tool ok/exit N: ...' is what that tool returned.)
+… 140 older log line(s) omitted; use session_search to read them.
+[t0] user: Exercise every result shape.
+[#12] ← terminal ERROR exit 123456789012345678901234567890: big
+[#14] ← terminal ERROR exit -7: neg
+[#22] ← terminal ERROR: nan errnan
+[#28] ← terminal ERROR: True errtrue
+[#32] ← terminal ERROR: code=5 msg=bad nested=1, 2.5, , True code=5 msg=bad nested=1, 2.5, , True
+[#34] ← terminal ERROR: a, b, 3 a, b, 3
+[#36] ← terminal ERROR: 
+[#42] ← terminal ERROR: boom boom
+[#48] ← terminal ERROR exit 3: dup keys keep the last value
+[#70] ← terminal ERROR exit 1: {"output": "num 01", "exit_code": 01}
+[#76] ← terminal ERROR: inf exp float
+[#78] ← terminal ERROR exit 2: 
+[#80] ← terminal ERROR exit 4: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee … zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+[#88] ← terminal ERROR exit 777777777777777777777777777777777777777777777777777777777777777777777777777777 … 77777777777777777777777777777777777777: 4300 digits
+[#96] ← execute_code ERROR exit 1: [terminal] ran 'a' -> exit 1, 40 lines output
+[#98] ← terminal ERROR exit 2: [terminal] ran 'echo 'x' -> exit 0' -> exit 2, 3 lines output
+[#102] ← execute_code ERROR exit -3: [terminal] ran 'neg' -> exit -3, 1 lines output
+[#104] ← terminal ERROR exit 3: [terminal] ran 'arabic' -> exit ٣, 1 lines output
+[#110] ← terminal ERROR exit 5: prefix {"exit_code": 5} suffix
+[#112] ← terminal ERROR exit -12: log "exit_code" : -12 more
+[#114] ← execute_code ERROR exit 42: log "exit_code": ٤٢ arabic digits
+[#118] ← terminal ERROR: Traceback (most recent call last): File x ValueError: bad
+[#120] ← execute_code ERROR: ERROR: something broke
+[#122] ← terminal ERROR: error : spaced
+[#130] ← terminal ERROR: FAILED tests/test_a.py::test_b
+[#138] ← execute_code ERROR: Exited Status 3
+[#142] ← terminal ERROR: the process reported non-zero exit
+[#144] ← execute_code ERROR: PERMISSION DENIED
+[#146] ← terminal ERROR: No ſuch file or directory
+[#148] ← terminal ERROR: bash: foo: command not found
+[#150] ← execute_code ERROR: fatal: not a git repository
+[#152] ← terminal ERROR: panic! at the disco
+[#156] ← execute_code ERROR: Exception!
+[#174] ← tool ERROR: orphan orphan

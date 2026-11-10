@@ -487,7 +487,8 @@ void test_image_round_trip() {
             "keys deepest first");
     require(image.keys[0].digests == reply->digests.at(330) && image.keys[0].identity_tag == layout.identity_tag,
             "the endpoint's key");
-    require(image.prefix_digests.size() == 331 && image.regions.size() == 2, "prefix digests and payload regions");
+    // Regions: the pages, then one per state image (two points, two images).
+    require(image.prefix_digests.size() == 331 && image.regions.size() == 3, "prefix digests and payload regions");
     // Pages once: P's four and E's three own; two images of two slabs.
     require(checkpoint_image_slab_bytes(layout, image.bytes, "binding-1") == (7 + 4) * kSlab, "slab bytes of the import");
 

@@ -1,10 +1,13 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
+#include "models/qwen3_5/program/text_positions.h"
 #include "core/device.h"
 #include "runtime/contract/admission_fit.h"
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -36,6 +39,10 @@ void ProgramImpl::initialize_prefill(std::uint32_t lane, std::uint32_t base) {
     staged.mtp_bridge           = !staged.prepare_mtp || !base   ? MtpBridgeMode::None
                                   : base == staged.prompt_tokens ? MtpBridgeMode::AfterExactHit
                                                                  : MtpBridgeMode::BeforeSuffix;
+    // Axis 0 decides: text positions are equal on all three axes.
+    const std::span<const std::int32_t> axis0(staged.prompt.positions.data(),
+                                              staged.prompt.token_ids.size());
+    staged.regular_text_positions = regular_text_positions(axis0, base, staged.prompt.rope_delta);
     initialize_captures(lane, base, plan.summary.prompt_tokens);
     if (plan.vision_control_plan) {
         auto& vision        = staged.vision_plan.emplace();
@@ -60,6 +67,7 @@ bool ProgramImpl::prompt_fits_beside_residents(const RequestBasePlan& base,
     const auto source = candidate.checkpoint;
     if (source && !valid_checkpoint(*source)) { return true; } // start_binding reports it
     std::unordered_set<std::uint32_t> pinned_main, pinned_backend;
+    std::uint64_t to_come_main = 0, to_come_backend = 0;
     bool residents = false;
     const auto pin = [](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
                         KVAddressSpaceHandle address, auto& seen) {
@@ -75,6 +83,34 @@ bool ProgramImpl::prompt_fits_beside_residents(const RequestBasePlan& base,
         if (sequence.kv->backend) {
             pin(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend, pinned_backend);
         }
+        // A resident part-way through its prompt (or its replay) holds only the chunks it has
+        // reached; the rest of its prompt is as certain to need pages as the newcomer's. A request
+        // paused part-way through its prompt replays to where it paused and then goes on with its
+        // prefill, so the larger of the two ends counts.
+        const auto& control        = requests[lane];
+        std::uint32_t main_end     = 0;
+        std::uint32_t backend_end  = 0;
+        if (control.prefill) {
+            const auto end = prompt_end_unit(control.prefill->prompt_tokens,
+                                             control.prefill->initial_mtp_extent);
+            main_end       = end.main_frontier;
+            backend_end    = end.backend_frontier;
+        }
+        if (control.lifecycle == Lifecycle::Replaying) {
+            main_end = std::max(main_end, control.replay_target);
+            if (backend_kv_cache()) { backend_end = std::max(backend_end, control.replay_target); }
+        }
+        if (main_end == 0 && backend_end == 0) { continue; }
+        to_come_main += runtime::resident_pages_to_prompt_end(
+            kv_pages_for_frontier(main_end),
+            text_kv_addresses->mapped_pages(sequence.kv->text),
+            text_kv_addresses->reserved_growth_pages(sequence.kv->text));
+        if (sequence.kv->backend) {
+            to_come_backend += runtime::resident_pages_to_prompt_end(
+                kv_pages_for_frontier(backend_end),
+                backend_kv_addresses->mapped_pages(*sequence.kv->backend),
+                backend_kv_addresses->reserved_growth_pages(*sequence.kv->backend));
+        }
     }
     // Installed external context (a prompt graft) is pinned for good: its device pages are held
     // whether or not any resident uses them, and nothing can reclaim them. A resident that shares
@@ -87,9 +123,7 @@ bool ProgramImpl::prompt_fits_beside_residents(const RequestBasePlan& base,
         }
     }
     const auto prompt = base.summary().prompt_tokens;
-    // The last chunk's frontiers are the whole prompt's, including the draft's extra rows.
-    const auto whole = prefill_unit(prompt, prompt > prefill_chunk ? prompt - prefill_chunk : 0,
-                                    initial_mtp_extent(*base.impl_));
+    const auto whole  = prompt_end_unit(prompt, initial_mtp_extent(*base.impl_));
     std::uint64_t need_main    = kv_pages_for_frontier(whole.main_frontier);
     std::uint64_t need_backend = kv_pages_for_frontier(whole.backend_frontier);
     if (source) {
@@ -138,7 +172,8 @@ bool ProgramImpl::prompt_fits_beside_residents(const RequestBasePlan& base,
                 : 0U;
     return runtime::prompt_fits_beside_residents(
         {need_main, need_backend},
-        {pinned_main.size() + live_main, pinned_backend.size() + live_backend},
+        {pinned_main.size() + live_main + to_come_main,
+         pinned_backend.size() + live_backend + to_come_backend},
         {main_pool.usable_pages(), backend ? backend->usable_pages() : 0U}, residents);
 }
 
@@ -494,6 +529,8 @@ void ProgramImpl::install_binding(ContextTransaction& tx) {
         state.prefix_identity.assign(*tx.base->prompt);
         state.prefix_digests          = tx.base->prefix_digests;
         state.rope_delta              = tx.base->prompt->rope_delta;
+        // The lineage is the plan's: a rewritten prompt is the kept identity whatever source binds.
+        state.gap_maps                = tx.base->gap_maps;
         state.text_kv_valid           = tx.reuse_frontier;
         state.mtp_kv_valid            = tx.backend_frontier;
         state.dflash_context_frontier = tx.reuse_frontier;
