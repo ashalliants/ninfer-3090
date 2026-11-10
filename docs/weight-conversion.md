@@ -226,6 +226,12 @@ rounds input values to BF16, then produces E4M3FN codes and one BF16 multiplier 
 `import_encoded` preserves compatible code and scale words, including NVFP4's matrix weight divisor.
 It does not dequantize and requantize them.
 
+`python -m tools.convert.allocation` measures, per layer, whether a Q5 projection earns its extra
+bits. For the attention output, GDN output and MLP down projections (the roles with both Q4 and Q5
+kernels) it scores the imatrix-weighted rounding error at each format and writes an `--override`
+file that re-spends the official recipe's bytes where the error drops most. The score is a proxy:
+confirm a proposed allocation with a KLD or perplexity run before adopting it.
+
 The exact numeric and packing rules are in [numeric formats](maintainer/tensor-formats.md) and
 [storage layouts](maintainer/storage-layouts.md). Source format names alone do not establish
 compatibility: scale direction, granularity, code meaning and axis order must also match.

@@ -92,6 +92,33 @@ def qwen3_6_27b(model, recipe, sources):
     _dense_groupwise(model, recipe, Q6)
 
 
+QWEN3_8_27B_LATE_LAYER = 36
+QWEN3_8_27B_Q4_ROLES = (
+    "/attention/query", "/attention/key", "/gdn/query", "/gdn/key", "/mlp/gate", "/mlp/up",
+)
+QWEN3_8_27B_LATE_Q4_ROLES = ("/attention/output", "/gdn/output", "/mlp/down")
+
+
+def qwen3_8_27b_text_format(name, late_layer=QWEN3_8_27B_LATE_LAYER):
+    """The format `qwen3_8_27b` gives one text-layer projection (``text/layers/N/...``)."""
+
+    layer = int(name.split("/")[2])
+    if name.endswith(QWEN3_8_27B_Q4_ROLES):
+        return Q4
+    if name.endswith(QWEN3_8_27B_LATE_Q4_ROLES) and layer >= late_layer:
+        return Q4
+    return Q5
+
+
+def imatrix_search(sources):
+    """Recipe choice for the importance-weighted search encoder with the ``imatrix`` source."""
+
+    return {
+        "method": "grouped_search",
+        "parameters": {"imatrix": str(sources["imatrix"].path), "negative_scales": True},
+    }
+
+
 def qwen3_8_27b(model, recipe, sources):
     """Qwen3.8-27B for one RTX 3090: the importance-weighted search encoder over every text matrix,
     a 4-bit embedding, a 6-bit head, and 4-bit mixer outputs and MLP down in layers 36-63.
@@ -105,10 +132,7 @@ def qwen3_8_27b(model, recipe, sources):
     if "num_experts" in model.config:
         raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
     _optional(model, recipe)
-    search = {
-        "method": "grouped_search",
-        "parameters": {"imatrix": str(sources["imatrix"].path), "negative_scales": True},
-    }
+    search = imatrix_search(sources)
     recipe.assign("text/token_embedding", format=Q4, **search)
     recipe.assign("text/output_head", format=Q6, **search)
     for name, parameter in model.parameters.items():
@@ -117,16 +141,7 @@ def qwen3_8_27b(model, recipe, sources):
         if name.endswith(("/gdn/a_projection", "/gdn/b_projection")):
             recipe.separate(name)
             continue
-        layer = int(name.split("/")[2])
-        if name.endswith(
-            ("/attention/query", "/attention/key", "/gdn/query", "/gdn/key", "/mlp/gate", "/mlp/up")
-        ):
-            format = Q4
-        elif name.endswith(("/attention/output", "/gdn/output", "/mlp/down")) and layer >= 36:
-            format = Q4
-        else:
-            format = Q5
-        recipe.assign(name, format=format, **search)
+        recipe.assign(name, format=qwen3_8_27b_text_format(name), **search)
 
 
 def qwen3_6_35b_a3b(model, recipe, sources):
