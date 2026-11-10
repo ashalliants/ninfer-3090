@@ -112,6 +112,9 @@ public:
             if (finding->element_index != expected_.best_index) { fail("not the lowest offending index"); }
             if (std::bit_cast<std::uint32_t>(finding->value) !=
                 std::bit_cast<std::uint32_t>(expected_.best_value)) {
+                std::cerr << label << ": recorded value bits 0x" << std::hex
+                          << std::bit_cast<std::uint32_t>(finding->value) << ", oracle 0x"
+                          << std::bit_cast<std::uint32_t>(expected_.best_value) << std::dec << '\n';
                 fail("wrong recorded value bits");
             }
         }
