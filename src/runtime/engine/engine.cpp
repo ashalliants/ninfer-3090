@@ -421,7 +421,8 @@ public:
         const auto* generation = std::get_if<std::unique_ptr<GenerationCore>>(&core);
         if (generation == nullptr || *generation == nullptr) { return LossySummaryProbe::Warm; }
         try {
-            auto execution = resolve_request_options(sampling_defaults, SamplingMode::Thinking, {})
+            auto execution = resolve_request_options(sampling_defaults, SamplingMode::Thinking, {},
+                                                     options.relaxed_drafting)
                                  .execution;
             execution.requested_output_tokens = 1;
             return (*generation)
