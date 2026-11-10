@@ -23,6 +23,7 @@ set(ninfer_op_tests
   sampling
   scalar
   cast
+  numeric_tripwire
   prepare_ragged_prefix
   scatter
   scatter_bf16_batch

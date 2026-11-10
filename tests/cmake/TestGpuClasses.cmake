@@ -42,6 +42,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_load_report_test
   ninfer_media_decode_test
   ninfer_metrics_test
+  ninfer_numeric_tripwire_host_test
   ninfer_offloaded_moe_cpu_test
   ninfer_openai_responses_store_test
   ninfer_openai_responses_test

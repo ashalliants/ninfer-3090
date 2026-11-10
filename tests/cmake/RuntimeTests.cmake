@@ -2,6 +2,11 @@ ninfer_add_test(ninfer_scheduler_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_scheduler.cpp"
   LIBRARIES ninfer_runtime_support)
 
+# Host half of the numeric tripwire: record codec, naive oracle, site names, log line, throttle.
+ninfer_add_test(ninfer_numeric_tripwire_host_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_numeric_tripwire.cpp"
+  LIBRARIES ninfer_runtime_support)
+
 ninfer_add_test(ninfer_prefill_pacing_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_prefill_pacing.cpp"
   LIBRARIES ninfer_runtime_support)
