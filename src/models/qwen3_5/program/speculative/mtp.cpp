@@ -3,6 +3,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "core/nvtx.h"
+#include "models/qwen3_5/execution/numeric_tripwire.h"
 #include "ninfer/ops/mtp_round.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
@@ -90,6 +91,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache, &state.mtp_cache);
         card.set_stage_runtime(state.execution.stages);
+        card.set_tripwire(state.execution.tripwire);
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers          = frame.base_frontiers.slice(0, 0, batch_size);
         Tensor budgets            = frame.remaining_budgets.slice(0, 0, batch_size);
@@ -201,6 +203,9 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_5::MtpDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
+        if (state.execution.tripwire != nullptr) {
+            state.execution.tripwire->drain(state.execution.device.stream);
+        }
     };
 }
 

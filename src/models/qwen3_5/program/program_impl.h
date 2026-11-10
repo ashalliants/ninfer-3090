@@ -19,12 +19,15 @@
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix_identity.h"
 #include "core/host_context_arena.h"
+#include "models/qwen3_5/execution/numeric_tripwire.h"
+#include "models/qwen3_5/execution/numeric_tripwire_report.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_prefill.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <array>
 #include <limits>
 #include <memory>
@@ -751,6 +754,8 @@ public:
                                                             runtime::ExecutionTiming*,
                                                             runtime::TokenMaskProvider*);
     void prepare_graphs();
+    // After a decode round's synchronisation: hands what the numeric tripwire saw to its listener.
+    void report_numeric_tripwire() noexcept;
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
     void set_device_i32(Tensor& tensor, std::int32_t value);
@@ -785,5 +790,11 @@ public:
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
                         runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks);
+
+    // Numeric tripwire (--numeric-tripwire): null unless asked for, in which case no probe is
+    // launched and no graph carries a node for it.
+    std::unique_ptr<execution::NumericTripwire> tripwire;
+    std::function<void(const NumericTripwireEvent&)> tripwire_listener;
+    execution::TripwireReportThrottle tripwire_throttle;
 };
 } // namespace ninfer::models::qwen3_5::detail

@@ -5,6 +5,8 @@
 #include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/mtp.h"
+#include "models/qwen3_5/execution/numeric_tripwire.h"
+#include "models/qwen3_5/execution/numeric_tripwire_report.h"
 #include "models/qwen3_5/execution/workspace.h"
 
 #include "core/nvtx.h"
@@ -705,6 +707,10 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         run_layers(x, Phase::Verify, tap);
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden, stream);
         project(hidden, *lm_head_, logits, work_, stream);
+        if (tripwire_ != nullptr) {
+            tripwire_->probe(hidden, tripwire_site(TripwireProbe::FinalHidden), stream);
+            tripwire_->probe(logits, tripwire_site(TripwireProbe::FinalLogits), stream);
+        }
     }
     work_.reset();
 }
@@ -765,6 +771,10 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, flat_hidden, stream);
         project(flat_hidden, *lm_head_, flat_logits, work_, stream);
+        if (tripwire_ != nullptr) {
+            tripwire_->probe(flat_hidden, tripwire_site(TripwireProbe::FinalHidden), stream);
+            tripwire_->probe(flat_logits, tripwire_site(TripwireProbe::FinalLogits), stream);
+        }
         ops::argmax(flat_logits, flat_tokens,
                     dimension(parameters_.model.resources().public_token_count), stream);
     }
@@ -1064,6 +1074,12 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                                std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
             /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out, o,
             ctx_.execution_view());
+    }
+    // The new state is not read here, so the layer's output (computed from it) stands in for it:
+    // a NaN or an FP16 overflow in the state reaches `o` in the same step.
+    if (tripwire_ != nullptr && tripwire_probes_gdn_layer(static_cast<std::uint32_t>(gidx))) {
+        tripwire_->probe(o, tripwire_site(TripwireProbe::GdnOutput, static_cast<std::uint32_t>(gidx)),
+                         s);
     }
 
     Tensor on = workspace::gdn_normalized_output(work_, config_, T)

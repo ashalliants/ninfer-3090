@@ -84,6 +84,7 @@ struct DFlashFeatureSink {
 };
 
 class VisionPrefillSession;
+class NumericTripwire;
 
 class TextContext {
 public:
@@ -112,6 +113,9 @@ public:
 
     // Present when the model is split over several devices; see StageRuntime.
     void set_stage_runtime(StageRuntime* runtime) noexcept { stage_runtime_ = runtime; }
+
+    // Debug probes for NaN/Inf/overflow (--numeric-tripwire). Null, the default, launches nothing.
+    void set_tripwire(NumericTripwire* tripwire) noexcept { tripwire_ = tripwire; }
 
     void set_prefill_gpu_timer(CudaEventTimer* timer) noexcept { prefill_gpu_timer_ = timer; }
 
@@ -308,6 +312,7 @@ private:
     const ops::SamplingConfig* sampling_config_ = nullptr;
     const MtpParameters* mtp_                   = nullptr;
     StageRuntime* stage_runtime_                = nullptr;
+    NumericTripwire* tripwire_                  = nullptr;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

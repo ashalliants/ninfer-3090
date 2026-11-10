@@ -1002,6 +1002,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->speculative_backend  = inputs.speculative_backend;
     impl->proposal_head        = inputs.proposal_head;
     impl->features             = inputs.features;
+    impl->numeric_tripwire     = inputs.numeric_tripwire;
     impl->use_cuda_graph       = inputs.use_cuda_graph;
     impl->causal_scoring       = inputs.causal_scoring;
     impl->device               = inputs.device;
@@ -1171,6 +1172,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .kv_storage           = options.kv_cache,
         .proposal_head        = options.speculative.proposal_head,
         .features             = models::load_options(options),
+        .numeric_tripwire     = options.numeric_tripwire,
         .use_cuda_graph       = options.use_cuda_graph,
         .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,
         .device               = options.device,

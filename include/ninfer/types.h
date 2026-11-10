@@ -241,6 +241,32 @@ struct EngineFaultEvent {
     std::uint32_t maximum_consecutive_failures = 0;
 };
 
+// One sighting of a NaN, an infinity or an out-of-range value by the numeric tripwire.
+struct NumericTripwireEvent {
+    // A finished, single-line, human-readable description; log this.
+    std::string message;
+    // Where the first bad value was found, e.g. "final logits (...)".
+    std::string site;
+    // Flat element index of the first bad value within the probed tensor, and the value itself.
+    std::uint32_t element_index = 0;
+    float value                 = 0.0F;
+    // Bad elements counted this round across every probe.
+    std::uint32_t offending_elements = 0;
+};
+
+// A debugging aid for the speed-for-quality trades: small probes at a few points of every decode
+// round look for NaN, infinity and |x| above `abs_limit`, and report the first sighting through
+// `listener`. Generation is never interrupted. Off by default; when off nothing is launched and
+// the CUDA Graphs are unchanged. Qwen3.5-family models on a single device only.
+struct NumericTripwireOptions {
+    bool enabled = false;
+    // FP16's largest finite value: a BF16 or FP32 activation beyond it would overflow an FP16 state.
+    float abs_limit = 65504.0F;
+    // Called on the worker thread, after the round's synchronisation, at most once per new site
+    // and then once per 256 flagged rounds. Must be quick; exceptions are ignored.
+    std::function<void(const NumericTripwireEvent& event)> listener;
+};
+
 struct ContextCacheOptions {
     // Controls cross-request history reads and writes. Request pause/replay resources remain
     // available when history is disabled.
@@ -504,6 +530,7 @@ struct EngineOptions {
     // Called on the worker thread for each host-side worker failure, after recovery or latch.
     // Must be quick; exceptions are ignored.
     std::function<void(const EngineFaultEvent& event)> fault_listener;
+    NumericTripwireOptions numeric_tripwire;
 };
 
 enum class SamplingMode : std::uint8_t {

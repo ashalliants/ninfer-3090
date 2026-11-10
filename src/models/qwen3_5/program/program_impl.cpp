@@ -285,6 +285,14 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (parameters.text.rank_count != device.size()) {
         throw std::invalid_argument("the model's pipeline stages do not match the attached devices");
     }
+    if (plan.numeric_tripwire.enabled) {
+        if (device.size() != 1) {
+            throw std::invalid_argument(
+                "--numeric-tripwire does not support a model split over several devices");
+        }
+        tripwire          = std::make_unique<execution::NumericTripwire>(plan.numeric_tripwire.abs_limit);
+        tripwire_listener = plan.numeric_tripwire.listener;
+    }
     // From here one workspace arena serves every rank: the layer loop switches it alongside the
     // device, and every workspace call site is unchanged.
     for (DeviceArena& rank_storage : workspace_storage_by_rank) {
