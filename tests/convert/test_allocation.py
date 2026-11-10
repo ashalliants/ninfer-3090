@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from itertools import product
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -180,29 +181,71 @@ def test_flexible_parameters_select_the_three_roles_of_a_dense_model(tmp_path):
             flexible_parameters(build_model(source, components=("text",)))
 
 
-def test_committed_candidate_covers_the_27b_projections_and_keeps_the_official_byte_budget():
+CANDIDATES = ("activation", "absolute")
+
+
+@pytest.mark.parametrize("candidate", CANDIDATES)
+def test_committed_candidate_covers_the_27b_projections_and_keeps_the_official_byte_budget(candidate):
     from pathlib import Path
 
-    from tools.convert.allocation import payload_bytes
-
-    path = Path(allocation.__file__).parent / "candidates" / "qwen3_8_27b_activation.py"
-    namespace = {}
-    exec(compile(path.read_text(), str(path), "exec"), namespace)
-    assignments = namespace["ASSIGNMENTS"]
+    from tools.convert.allocation import payload_bytes, qwen3_8_27b_flexible_names
 
     # Qwen3.8-27B: 64 layers, full attention at every fourth layer, hidden 5120, MLP 17408,
     # attention output K = 24 heads x 256, GDN output K = 48 value heads x 128.
-    shapes = {}
-    for layer in range(64):
-        mixer = "attention/output" if layer % 4 == 3 else "gdn/output"
-        shapes[f"text/layers/{layer}/{mixer}"] = (5120, 6144)
-        shapes[f"text/layers/{layer}/mlp/down"] = (5120, 17408)
-    assert set(assignments) == set(shapes)
+    path = Path(allocation.__file__).parent / "candidates" / f"qwen3_8_27b_{candidate}.py"
+    namespace = {}
+    exec(compile(path.read_text(), str(path), "exec"), namespace)
+    assignments = namespace["ASSIGNMENTS"]
+    names = qwen3_8_27b_flexible_names()
+    assert set(assignments) == set(names)
     assert set(assignments.values()) <= {Q4, Q5}
-
-    chosen = sum(payload_bytes(f, shapes[n]) for n, f in assignments.items())
-    official = sum(payload_bytes(qwen3_8_27b_text_format(n), shapes[n]) for n in shapes)
+    shape = lambda name: (5120, 17408) if name.endswith("/mlp/down") else (5120, 6144)  # noqa: E731
+    chosen = sum(payload_bytes(f, shape(n)) for n, f in assignments.items())
+    official = sum(payload_bytes(qwen3_8_27b_text_format(n), shape(n)) for n in names)
     assert chosen <= official
+
+
+def test_committed_gguf_plans_match_their_assignments_and_the_harness_baseline():
+    import importlib.util
+    from pathlib import Path
+
+    from tools.convert.allocation import gguf_plan, qwen3_8_27b_flexible_names
+
+    folder = Path(allocation.__file__).parent / "candidates"
+    spec = importlib.util.spec_from_file_location(
+        "gguf_eval", Path(allocation.__file__).parents[2] / "tools" / "eval" / "gguf_eval.py"
+    )
+    harness = importlib.util.module_from_spec(spec)
+    sys.modules["gguf_eval"] = harness  # its dataclasses look their module up by name
+    try:
+        spec.loader.exec_module(harness)
+    finally:
+        del sys.modules["gguf_eval"]
+
+    official = {n: qwen3_8_27b_text_format(n) for n in qwen3_8_27b_flexible_names()}
+    cases = [("qwen3_8_27b_official.gguf-plan.txt", official)]
+    for candidate in CANDIDATES:
+        namespace = {}
+        path = folder / f"qwen3_8_27b_{candidate}.py"
+        exec(compile(path.read_text(), str(path), "exec"), namespace)
+        cases.append((f"qwen3_8_27b_{candidate}.gguf-plan.txt", namespace["ASSIGNMENTS"]))
+    for file, assignments in cases:
+        text = (folder / file).read_text().strip()
+        assert text == gguf_plan(assignments), f"regenerate {file} (see candidates/README.md)"
+        # The harness resolves every flexible tensor to exactly the assigned format.
+        plan = harness.parse_plan(text)
+        for name, format in assignments.items():
+            _, _, layer, role = name.split("/", 3)
+            assert harness.role_format(plan, int(layer), role) == format
+        assert harness.role_format(plan, None, "text/token_embedding") == Q4
+        assert harness.role_format(plan, None, "text/output_head") == "q6_g64_fp16"
+
+    # Without a plan entry the harness uses its own role defaults: they must already be the
+    # official recipe's formats for every role this tool does not allocate.
+    allocated = {"attention/output", "gdn/output", "mlp/down", "text/token_embedding", "text/output_head"}
+    for role, format in harness.RECIPE.items():
+        if role not in allocated:
+            assert format == qwen3_8_27b_text_format(f"text/layers/0/{role}"), role
 
 
 def test_emitted_override_assigns_the_proposed_formats_with_the_imatrix_search(tmp_path):

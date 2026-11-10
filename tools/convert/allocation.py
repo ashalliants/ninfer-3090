@@ -52,6 +52,31 @@ METRICS = ("relative", "absolute", "activation")
 REPORT_VERSION = 1
 
 
+def qwen3_8_27b_flexible_names(layers: int = 64, full_attention_interval: int = 4) -> list[str]:
+    """`flexible_parameters` of the real Qwen3.8-27B without opening a checkpoint."""
+
+    names = []
+    for layer in range(layers):
+        mixer = "attention/output" if layer % full_attention_interval == full_attention_interval - 1 else "gdn/output"
+        names += [f"text/layers/{layer}/{mixer}", f"text/layers/{layer}/mlp/down"]
+    return names
+
+
+def gguf_plan(assignments: Mapping[str, str], *, embedding: str = "q4", head: str = "q6") -> str:
+    """The ``--plan`` text of ``tools/eval/gguf_eval.py`` for these assignments.
+
+    The harness's role defaults already match the official recipe for every role this tool does
+    not allocate (it only differs in the embedding and head, set here, and in these layers).
+    """
+
+    short = {Q4: "q4", Q5: "q5"}
+    entries = [f"text/token_embedding={embedding}", f"text/output_head={head}"]
+    for name, format in sorted(assignments.items(), key=lambda item: (int(item[0].split("/")[2]), item[0])):
+        _, _, layer, role = name.split("/", 3)
+        entries.append(f"{layer}:{role}={short[format]}")
+    return ",".join(entries)
+
+
 def flexible_parameters(model, layers: range | None = None) -> list[str]:
     """Names of the dense text projections this tool allocates, in model order."""
 
