@@ -88,6 +88,8 @@ rem     NINFER_HOST_CACHE_RESERVE_MIB     --host-cache-reserve-mib N     RAM to 
 rem     NINFER_HOST_CACHE_MAX_MIB         --host-cache-max-mib N         hard cap on pinned RAM
 rem   NINFER_MAX_OUTPUT_TOKENS            --max-output-tokens N          cap every request's output budget
 rem   NINFER_MLP_A8_DECODE=on             --mlp-a8-decode                INT8-activation MLP decode
+rem   NINFER_NUMERIC_TRIPWIRE=on          --numeric-tripwire             debug: log the first NaN/Inf/overflow
+rem                                                                      a decode round produces (off = free)
 rem   NINFER_REASONING_LOOP=stop^|conclude --reasoning-loop MODE         end (stop) or close the thinking
 rem                                                                      (conclude) when it keeps repeating
 rem                                                                      whole passages; off (the default)
@@ -558,6 +560,11 @@ if not "%NINFER_MAX_OUTPUT_TOKENS%"=="" set "KNOB_ARGS=%KNOB_ARGS% --max-output-
 if /i "%NINFER_MLP_A8_DECODE%"=="on" set "KNOB_ARGS=%KNOB_ARGS% --mlp-a8-decode"
 if not "%NINFER_MLP_A8_DECODE%"=="" if /i not "%NINFER_MLP_A8_DECODE%"=="on" if /i not "%NINFER_MLP_A8_DECODE%"=="off" (
   echo NINFER_MLP_A8_DECODE must be on or off, got %NINFER_MLP_A8_DECODE% 1>&2
+  exit /b 2
+)
+if /i "%NINFER_NUMERIC_TRIPWIRE%"=="on" set "KNOB_ARGS=%KNOB_ARGS% --numeric-tripwire"
+if not "%NINFER_NUMERIC_TRIPWIRE%"=="" if /i not "%NINFER_NUMERIC_TRIPWIRE%"=="on" if /i not "%NINFER_NUMERIC_TRIPWIRE%"=="off" (
+  echo NINFER_NUMERIC_TRIPWIRE must be on or off, got %NINFER_NUMERIC_TRIPWIRE% 1>&2
   exit /b 2
 )
 rem Reasoning-loop guard (--reasoning-loop): off unless asked for. It has never fired on the 27B in

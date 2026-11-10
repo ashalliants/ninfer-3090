@@ -5,6 +5,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -39,6 +40,24 @@ int main() {
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
     failures += check(!defaults.tolerant_tool_calls, "tolerant tool calls are on by default");
     failures += check(defaults.progress_anchor_tokens == 0, "progress anchors are on by default");
+    failures += check(!defaults.numeric_tripwire && !make_engine_options(defaults).numeric_tripwire.enabled,
+                      "the numeric tripwire is on by default");
+    {
+        const ServeOptions tripwire = parse({"ninfer-serve", "model.ninfer", "--numeric-tripwire"});
+        const ninfer::EngineOptions engine = make_engine_options(tripwire);
+        failures += check(engine.numeric_tripwire.enabled && engine.numeric_tripwire.abs_limit == 65504.0F,
+                          "--numeric-tripwire did not reach the Engine with the FP16 maximum limit");
+        const ServeOptions limited =
+            parse({"ninfer-serve", "model.ninfer", "--numeric-tripwire-limit", "inf"});
+        failures += check(make_engine_options(limited).numeric_tripwire.enabled &&
+                              std::isinf(make_engine_options(limited).numeric_tripwire.abs_limit),
+                          "--numeric-tripwire-limit inf did not reach the Engine");
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--numeric-tripwire-limit", "0"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "a zero tripwire limit was accepted");
+    }
     failures += check(parse({"ninfer-serve", "model.ninfer", "--progress-anchor-tokens", "16384"})
                               .progress_anchor_tokens == 16384,
                       "--progress-anchor-tokens did not reach serving options");

@@ -73,6 +73,8 @@ struct ServeOptions {
     bool embedding_q6       = false;
     bool mtp_experts_q4     = false;
     bool gdn_state_fp16     = false;
+    bool numeric_tripwire   = false;
+    float numeric_tripwire_limit = 65504.0f;
     bool admission_fit_check = false;
     bool mlp_a8_decode      = false;
     bool prefill_a8         = true;

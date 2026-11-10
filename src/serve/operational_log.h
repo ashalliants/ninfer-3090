@@ -63,6 +63,7 @@ public:
     void server_stopped() const;
     void server_failure(bool serving, std::string_view detail) const;
     void engine_fault(const ninfer::EngineFaultEvent& event) const;
+    void numeric_tripwire(const ninfer::NumericTripwireEvent& event) const;
     void engine_fatal_exit(double grace_seconds, bool will_exit) const;
 
 private:
