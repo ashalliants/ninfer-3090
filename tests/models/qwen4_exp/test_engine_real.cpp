@@ -236,6 +236,10 @@ EngineOptions base_options(const std::string& artifact, std::uint32_t max_contex
     options.kv_cache              = KvCacheStorage::Int8Group64;
     options.context_cache.enabled = false;
     options.pending_timeout_ms    = 3'600'000;
+    // Some hosts (confirmed: a Vast.ai container, 2026-11-10) cap RLIMIT_MEMLOCK far below any
+    // Flash-Next load with no way to raise it. Harmless where the real limit is high enough:
+    // cudaHostAlloc is the real test either way.
+    options.flash_next.allow_unlocked_host_memory = true;
     return options;
 }
 
