@@ -224,6 +224,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--mtp-experts-q4` | transcode the 35B-A3B's MTP draft-layer experts to Q4/Q6 at load; rejected on the dense 27B | off |
 | `--gdn-state-fp16` | FP16 recurrent GDN state, halving each state image | off |
 | `--mlp-a8-decode` | integer-activation MLP at decode | off |
+| `--numeric-tripwire [--numeric-tripwire-limit F\|inf]` | debugging aid: a few small probes in every decode round look for NaN, infinity and values beyond the limit (default `65504`, the FP16 maximum; `inf` reports only NaN and infinity) and log the first sighting as one warning line, naming where it was seen, without stopping generation. Single device, Qwen3.5 family; see [numeric tripwire](maintainer/quality-trade-experiments.md#numeric-tripwire----numeric-tripwire) | off, and then free |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--vision-residency resident\|overlay` | `overlay` keeps the Vision tower host-pinned and borrows device memory per image from free KV pages, or the evictable text weight tail when those fall short (no resident Vision cost; needs CUDA VMM) | `resident` |
 | `--vision-max-merged N` | merged-token budget of one media item; larger media downscales at preprocessing | 16384 |

@@ -40,6 +40,11 @@ collide at link time. The mechanism is `cmake/NinferBundles.cmake`.
 Concrete numerical criteria remain named by the semantic Op suite; there are no cross-Op tolerance
 presets.
 
+`ops/numeric_tripwire_oracle.h` is the standard-library-only oracle for the numeric tripwire Op; its
+own checks, with the record codec, site names, log wording and repeat throttle, are the CPU test
+`ninfer_numeric_tripwire_host_test` (`runtime/test_numeric_tripwire.cpp`), which also builds by hand
+without CUDA.
+
 `ops/quantized_weight.h` is the common packed-weight fixture for Q4/Q5/Q6/Q8, FP8 and NVFP4 Op tests. It
 owns deterministic payload generation, device `Weight` views, row views, and independent logical
 weight decoding.

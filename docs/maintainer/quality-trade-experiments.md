@@ -63,6 +63,39 @@ The recurrence still computes in FP32 — FP16 only rounds what is *stored* betw
 dispatch on the tensor's dtype; the chunked prefill kernels keep their FP32 interface and the
 wrapper stages FP16 through an FP32 workspace around them.
 
+## Numeric tripwire -- `--numeric-tripwire`
+
+Not a trade but a way to catch what one does silently: a NaN, an infinity or an overflow in an FP16
+state, a narrowed head or a quantised KV cache shows up only as worse text. With the flag on, a
+few small probes (`ops::numeric_tripwire_scan`, contract in `include/ninfer/ops/numeric_tripwire.h`)
+scan tensors for NaN, infinity and |x| above `--numeric-tripwire-limit` (default 65504, the FP16
+maximum; `inf` leaves only NaN and infinity) and write the first sighting into a 16-byte device
+record. The probes are plain kernels, so they sit inside the captured decode graphs; a bad value
+never aborts the process, unlike a device-side assert. The record rides the graph's existing result
+copy to the host (one extra 16-byte copy and one memset node, no new synchronisation); after the
+round's wait the host logs one warning line and decoding goes on:
+
+```text
+numeric tripwire | first bad value at final logits (the output head's score for every vocabulary token) | NaN in element 496,657 (token id 17, batch column 2) | 12,345 bad element(s) this round, counting every probe | generation continues, output may be damaged
+```
+
+Probes, all in the decode rounds (ordinary, MTP verify, DFlash verify):
+
+| Site | Tensor | Why there |
+|---|---|---|
+| `GDN layer output ... linear-attention layer N` | the recurrence's output, for every 16th linear-attention layer (0, 16, 32) | the new state is not read back; the output is computed from it, so a bad state shows in the same step |
+| `final hidden state` | the final-norm output | anything bad anywhere upstream |
+| `final logits` | the head's scores, which is where the int4/int6 head shows | the head's own failure |
+
+Not probed: prefill (a bad state reaches the first decode step), the MTP/draft heads, the stored KV
+quantisation scales (no natural spot: the append kernels own them) and a multi-device pipeline
+(rejected at start-up). A persistent NaN is logged again only for a new site or every 256 flagged
+rounds. To see it work, force a non-finite value, e.g. start with `--numeric-tripwire-limit 1` on
+any model: ordinary activations exceed 1, so the first round reports its earliest probe (GDN layer 0).
+
+Off by default and then costs nothing: no object is built, no probe is launched and the graphs carry
+no extra node.
+
 ## Measured 2026-09-12, this box
 
 Windows, RTX 3090, `sm_86`, 315 W cap, CUDA 12.8, int8 KV, Qwen3.8-27B, MTP3 with the optimized
