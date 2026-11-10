@@ -250,6 +250,12 @@ void print_generation_summary(const ninfer::GenerationResult& result,
             }
             print_metric(backend + " accepted by pos", positions.str());
         }
+        if (speculative.adaptive_draft_tokens != 0) {
+            print_metric("adaptive draft rounds at K=" +
+                             std::to_string(speculative.adaptive_draft_tokens),
+                         std::to_string(speculative.adaptive_low_rounds) + "/" +
+                             std::to_string(speculative.rounds - speculative.ngram_rounds));
+        }
         if (speculative.ngram_draft_tokens != 0) {
             print_metric("n-gram copy rounds", std::to_string(speculative.ngram_rounds));
             print_metric("n-gram accepted tokens",

@@ -41,6 +41,27 @@ inline void apply_speculative_defaults(SpeculativeOptions& options) noexcept {
 // verification Op supports today; 31 and 63 need those Ops extended first.
 inline constexpr std::uint32_t kProductNgramDraftTokens = 15;
 
+// The narrow window adaptive drafting captures beside the configured one. The cost of a round is
+// close to flat in the draft count, so two points take most of the spread (TODO.md, "Adaptive draft
+// window"); 3 is where the measured low-acceptance workload peaks.
+inline constexpr std::uint32_t kProductAdaptiveDraftTokens = 3;
+
+inline void validate_adaptive_cli_options(const SpeculativeOptions& options) {
+    if (options.adaptive_draft_tokens == 0) { return; }
+    if (options.adaptive_draft_tokens != kProductAdaptiveDraftTokens) {
+        throw std::invalid_argument("--adaptive-draft-tokens must be 0 (off) or 3");
+    }
+    if (options.backend != SpeculativeBackend::DFlash2) {
+        throw std::invalid_argument(
+            "--adaptive-draft-tokens switches DFlash2 draft windows and requires --spec dflash2");
+    }
+    if (options.draft_tokens <= options.adaptive_draft_tokens) {
+        throw std::invalid_argument(
+            "--adaptive-draft-tokens 3 needs --draft-tokens above 3 (the wide window it falls "
+            "back from)");
+    }
+}
+
 inline void validate_ngram_cli_options(const SpeculativeOptions& options) {
     if (options.ngram_min_match < 4 || options.ngram_min_match > 64) {
         throw std::invalid_argument("--ngram-min-match must be in [4,64]");
@@ -59,6 +80,7 @@ inline void validate_ngram_cli_options(const SpeculativeOptions& options) {
 
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
     validate_ngram_cli_options(options);
+    validate_adaptive_cli_options(options);
     switch (options.backend) {
     case SpeculativeBackend::None:
         if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full) {

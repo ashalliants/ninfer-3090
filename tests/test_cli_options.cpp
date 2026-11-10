@@ -204,6 +204,33 @@ int main() {
     failures += check(help.find("--ngram-draft-tokens") != std::string::npos &&
                           help.find("--ngram-min-match") != std::string::npos,
                       "CLI help omits the n-gram copy controls");
+    // Adaptive draft window: off by default, 3 is the only narrow window, and it rides DFlash2 above it.
+    failures += check(route_defaults.speculative.adaptive_draft_tokens == 0,
+                      "adaptive drafting is on by default");
+    const ninfer::cli::Options adaptive =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dflash2",
+               "--draft-tokens", "7", "--adaptive-draft-tokens", "3"});
+    failures += check(adaptive.speculative.adaptive_draft_tokens == 3,
+                      "CLI did not parse the adaptive draft window");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "dflash2", "--draft-tokens", "7", "--adaptive-draft-tokens",
+                                       "4"});
+                      }) && rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "mtp", "--draft-tokens", "3", "--adaptive-draft-tokens",
+                                       "3"});
+                      }) && rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "dflash2", "--draft-tokens", "3", "--adaptive-draft-tokens",
+                                       "3"});
+                      }) && rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--adaptive-draft-tokens", "3"});
+                      }),
+                      "CLI accepted adaptive drafting outside DFlash2 above the narrow window");
+    failures += check(help.find("--adaptive-draft-tokens") != std::string::npos,
+                      "CLI help omits the adaptive draft control");
     const ninfer::cli::Options logging =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--log-level", "debug"});
     failures += check(logging.log_level == ninfer::product::LogLevel::Debug,

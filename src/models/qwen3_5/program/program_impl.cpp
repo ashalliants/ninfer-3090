@@ -214,6 +214,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       draft_window(plan.draft_window),
       max_verify_drafts(detail::max_verify_drafts(plan.round_shapes)),
       ngram_draft_tokens(plan.ngram_draft_tokens), ngram_min_match(plan.ngram_min_match),
+      adaptive_draft_tokens(plan.adaptive_draft_tokens),
       speculative_backend(plan.speculative_backend),
       kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
@@ -332,6 +333,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     for (const SpeculativeRoundShape& shape : plan.round_shapes) {
         round_families.push_back(SpeculativeRoundFamily{.shape = shape});
     }
+    draft_window_selector = DraftWindowSelector(adaptive_draft_tokens, draft_window);
     if (parameters.text.split_execution()) {
         stage_runtime = make_stage_runtime(device, parameters, *state_images, plan);
         if (replay_records) {

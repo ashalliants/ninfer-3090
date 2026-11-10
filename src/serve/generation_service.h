@@ -63,6 +63,10 @@ struct GenerationMetrics {
     std::uint64_t speculative_ngram_rounds          = 0;
     std::uint64_t speculative_ngram_drafted_tokens  = 0;
     std::uint64_t speculative_ngram_accepted_tokens = 0;
+    // Adaptive draft window: the narrow window (0 when off) and how many of `speculative_rounds`
+    // ran at it; the other draft-model rounds ran at `speculative_draft_window`.
+    std::uint32_t speculative_adaptive_draft_tokens = 0;
+    std::uint64_t speculative_adaptive_low_rounds   = 0;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;
 };

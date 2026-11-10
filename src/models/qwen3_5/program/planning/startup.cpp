@@ -973,6 +973,16 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             throw std::invalid_argument("n-gram copy window must be in [draft_tokens,15]");
         }
     }
+    if (options.speculative.adaptive_draft_tokens != 0) {
+        // The narrow family is a second neural round, which only the masked draft backends run
+        // with a window of their own; its window must sit below the configured one.
+        if (options.speculative.backend != SpeculativeBackend::DFlash2) {
+            throw std::invalid_argument("adaptive draft window requires the DFlash2 backend");
+        }
+        if (options.speculative.adaptive_draft_tokens >= options.speculative.draft_tokens) {
+            throw std::invalid_argument("adaptive draft window must be below draft_tokens");
+        }
+    }
     if (device.compute_capability() != 80 && device.compute_capability() != 86 &&
         device.compute_capability() != 89) {
         throw std::invalid_argument(
@@ -1008,8 +1018,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->multiprocessor_count = inputs.multiprocessor_count;
     impl->context_cache        = inputs.context_cache;
     impl->kv_storage           = inputs.kv_storage;
+    impl->adaptive_draft_tokens = inputs.adaptive_draft_tokens;
     impl->round_shapes = speculative_round_shapes(inputs.speculative_backend, inputs.draft_window,
-                                                  inputs.ngram_draft_tokens);
+                                                  inputs.ngram_draft_tokens,
+                                                  inputs.adaptive_draft_tokens);
     impl->persistent   = persistent_layout(*impl);
     if (!impl->context_cache.host_capacity_bytes) {
         // Default Host capacity covers 8 GiB of KV bytes plus eight complete StateImages.
@@ -1082,7 +1094,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                             return (final_visible <= 4096 ? 16ULL : 32ULL) * kMiB;
                         }
                         // Long profiles also materialize driver execution storage; that shared
-                        // cost does not shrink with the number of graph executables.
+                        // cost does not shrink with the number of graph executables. The adaptive
+                        // narrow family is charged like the wide one: it likely shares driver
+                        // storage with it as the copy family does, but that has not been measured,
+                        // so the ledger errs toward refusing rather than failing during capture.
                         return (final_visible <= 4096 ? 64ULL : 192ULL) * kMiB;
                     },
                     "DFlash graph allowance");
@@ -1167,6 +1182,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .draft_window         = options.speculative.draft_tokens,
         .ngram_draft_tokens   = options.speculative.ngram_draft_tokens,
         .ngram_min_match      = options.speculative.ngram_min_match,
+        .adaptive_draft_tokens = options.speculative.adaptive_draft_tokens,
         .speculative_backend  = options.speculative.backend,
         .kv_storage           = options.kv_cache,
         .proposal_head        = options.speculative.proposal_head,

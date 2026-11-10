@@ -215,6 +215,15 @@ int main() {
     failures += check(kv_help.find("--ngram-draft-tokens") != std::string::npos &&
                           kv_help.find("--ngram-min-match") != std::string::npos,
                       "serve help omits the n-gram copy controls");
+    // Adaptive draft window: off unless asked, 3 beside DFlash2 K above it, carried into the Engine.
+    const ServeOptions adaptive =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
+               "--adaptive-draft-tokens", "3"});
+    failures += check(make_engine_options(adaptive).speculative.adaptive_draft_tokens == 3 &&
+                          default_engine.speculative.adaptive_draft_tokens == 0,
+                      "the adaptive draft window did not reach the Engine options");
+    failures += check(kv_help.find("--adaptive-draft-tokens") != std::string::npos,
+                      "serve help omits the adaptive draft control");
     const auto serve_rejects = [&](std::vector<std::string> arguments, const char* fragment) {
         try {
             (void)parse(std::move(arguments));
@@ -227,6 +236,10 @@ int main() {
                                      "--draft-tokens", "7", "--ngram-draft-tokens", "31"},
                                     "31, 63"),
                       "serve accepted a copy window other than 15, or did not name the wider ones");
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
+                                     "3", "--adaptive-draft-tokens", "3"},
+                                    "--spec dflash2"),
+                      "serve accepted adaptive drafting without DFlash2");
     // 2^44 MiB shifted by 20 bits wraps a uint64_t to 0; it must be refused, not wrapped.
     for (const char* flag : {"--vram-headroom-mib", "--ram-headroom-mib", "--expert-cache-mib"}) {
         failures += check(serve_rejects({"ninfer-serve", "model.ninfer", flag, "17592186044416"}, "out of range"),

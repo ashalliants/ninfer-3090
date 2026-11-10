@@ -98,6 +98,8 @@ struct SequencePlanningInputs {
     // N-gram copy drafting: the copy window (0 when off) and the tail match it requires.
     std::uint32_t ngram_draft_tokens        = 0;
     std::uint32_t ngram_min_match           = 0;
+    // The narrow neural window of the adaptive draft window (0 when off).
+    std::uint32_t adaptive_draft_tokens     = 0;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;
@@ -122,6 +124,8 @@ struct SequencePlanImpl {
     // N-gram copy drafting: the copy window (0 when off) and the tail match it requires.
     std::uint32_t ngram_draft_tokens        = 0;
     std::uint32_t ngram_min_match           = 0;
+    // The narrow neural window of the adaptive draft window (0 when off).
+    std::uint32_t adaptive_draft_tokens     = 0;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;

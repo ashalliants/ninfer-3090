@@ -24,11 +24,12 @@ struct SpeculativeRoundShape {
 };
 
 // The round families a Program runs: none without a speculative backend, otherwise one neural
-// family at the configured draft window and, with n-gram copy drafting, one copy family at its
-// window.
+// family at the configured draft window, with the adaptive draft window a second neural family at
+// the narrow `adaptive_draft_tokens` (the policy picks between the two per round), and with n-gram
+// copy drafting one copy family at its window.
 [[nodiscard]] std::vector<SpeculativeRoundShape>
 speculative_round_shapes(SpeculativeBackend backend, std::uint32_t draft_window,
-                         std::uint32_t ngram_draft_tokens);
+                         std::uint32_t ngram_draft_tokens, std::uint32_t adaptive_draft_tokens);
 // The widest family's verify_drafts, zero without families. Round frames, ReplaySSM records,
 // grammar-mask staging and DFlash pending features are allocated at this width and viewed at each
 // round's own.
