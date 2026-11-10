@@ -105,7 +105,7 @@ struct Case {
 
 std::vector<Case> cases() {
     const std::filesystem::path media = std::filesystem::path(NINFER_SOURCE_DIR) / "examples/cli/media";
-    return {
+    std::vector<Case> out{
         {"chart",
          {media / "visual_chart.png"},
          "Read the title of this image, count the red circles, and say whether the blue square is to the left or "
@@ -124,6 +124,10 @@ std::vector<Case> cases() {
          "appears only in the second image? Answer in one line as: first count; second count; shape.",
          {{"2", "two"}, {"3", "three"}, {"star"}},
          0},
+        // A real photographic image, not a synthetic fixture: a stock desktop wallpaper, present on
+        // a Windows host but not checked into the repo or present on Linux or CI. Added by name
+        // only below, after the checked-in fixtures, so no other case's index shifts when it is
+        // absent (see cases()[0] in this file).
         {"wallpaper",
          {"C:/Windows/Web/4K/Wallpaper/Windows/img0_1920x1200.jpg"},
          "Describe this image in one sentence.",
@@ -136,6 +140,11 @@ std::vector<Case> cases() {
          {{"house"}},
          40},
     };
+    std::erase_if(out, [](const Case& c) {
+        return std::any_of(c.images.begin(), c.images.end(),
+                           [](const std::filesystem::path& p) { return !std::filesystem::exists(p); });
+    });
+    return out;
 }
 
 PromptInput prompt_of(const Case& c) {
