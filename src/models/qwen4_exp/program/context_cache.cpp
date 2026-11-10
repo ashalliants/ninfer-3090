@@ -2,6 +2,7 @@
 
 #include "core/host_gather.h"
 #include "core/paged_kv_cache.h"
+#include "runtime/engine/context_cache/recovery_loss.h"
 
 #include <algorithm>
 #include <cstring>
@@ -444,42 +445,10 @@ bool HostCheckpointStore::prefix(Handle earlier, Handle later) const {
 
 std::uint64_t HostCheckpointStore::recovery_loss(std::span<const Handle> removed,
                                                  std::span<const Handle> surviving) const {
-    std::vector<Handle> ordered;
-    for (const Handle handle : removed) {
-        if (valid(handle) && std::find(ordered.begin(), ordered.end(), handle) == ordered.end()) {
-            ordered.push_back(handle);
-        }
-    }
-    std::sort(ordered.begin(), ordered.end(), [&](Handle left, Handle right) {
-        const auto l = at(left).frontier, r = at(right).frontier;
-        return l != r ? l > r : left.index < right.index;
-    });
-    struct Lineage {
-        Handle deepest;
-        std::uint32_t tokens;
-    };
-    std::vector<Lineage> lineages;
-    for (const Handle handle : ordered) {
-        std::uint32_t fallback = 0;
-        for (const Handle retained : surviving) {
-            if (!valid(retained) || std::find(ordered.begin(), ordered.end(), retained) != ordered.end()) {
-                continue;
-            }
-            const auto frontier = at(retained).frontier;
-            if (frontier > fallback && prefix(retained, handle)) { fallback = frontier; }
-        }
-        const std::uint32_t lost = at(handle).frontier - fallback;
-        const auto lineage = std::find_if(lineages.begin(), lineages.end(),
-                                          [&](const Lineage& item) { return prefix(handle, item.deepest); });
-        if (lineage == lineages.end()) {
-            lineages.push_back({handle, lost});
-        } else {
-            lineage->tokens = std::max(lineage->tokens, lost);
-        }
-    }
-    std::uint64_t total = 0;
-    for (const Lineage& lineage : lineages) { total += lineage.tokens; }
-    return total;
+    return runtime::checkpoint_recovery_loss(
+        removed, surviving, [&](Handle handle) { return valid(handle); },
+        [&](Handle handle) { return at(handle).frontier; },
+        [&](Handle earlier, Handle later) { return prefix(earlier, later); });
 }
 
 } // namespace ninfer::models::qwen4_exp

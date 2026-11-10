@@ -123,6 +123,14 @@ RequestBasePlan::prefix_shortlist_key(std::uint32_t frontier) const noexcept {
     };
 }
 
+std::optional<LossyPlan> RequestBasePlan::lossy() const noexcept {
+    return impl_ != nullptr ? impl_->lossy : std::nullopt;
+}
+
+std::uint32_t RequestBasePlan::reported_frontier(std::uint32_t frontier) const noexcept {
+    return impl_ != nullptr ? detail::original_frontier(impl_->gap_maps, frontier) : frontier;
+}
+
 ResumeState::ResumeState(std::unique_ptr<detail::ResumeStateImpl> impl) noexcept
     : impl_(std::move(impl)) {}
 
@@ -221,12 +229,26 @@ std::size_t Program::host_bytes_released(std::span<const CheckpointHandle> check
     return impl_->host_bytes_released(checkpoints);
 }
 
+std::size_t
+Program::host_state_bytes_released(std::span<const CheckpointHandle> checkpoints) const {
+    return impl_->host_bytes_released(checkpoints, true);
+}
+
+runtime::HostFreeRuns
+Program::host_free_runs_after_release(std::span<const CheckpointHandle> checkpoints) const {
+    return impl_->host_free_runs_after_release(checkpoints);
+}
+
 std::optional<std::size_t> Program::pause_host_bytes(SequenceHandle sequence) const {
     return impl_->pause_host_bytes(sequence);
 }
 
 std::size_t Program::pause_state_image_unplaced(SequenceHandle sequence) const {
     return impl_->pause_state_image_unplaced(sequence);
+}
+
+bool Program::pause_snapshot_fits(SequenceHandle sequence) const {
+    return impl_->pause_snapshot_fits(sequence);
 }
 
 std::size_t Program::release_redundant_host(std::span<const CheckpointHandle> excluded,
@@ -293,6 +315,14 @@ ContextProgress Program::poll_context(runtime::CancellationFlagView c) {
 bool Program::context_blocks(SequenceHandle sequence) const noexcept {
     return impl_->context_blocks(sequence);
 }
+
+bool Program::enable_lossy(SequenceHandle sequence) { return impl_->enable_lossy(sequence); }
+
+bool Program::abort_lossy_scout(SequenceHandle sequence) {
+    return impl_->abort_lossy_scout(sequence);
+}
+
+double Program::lossy_scout_share() const noexcept { return impl_->lossy_scout_share(); }
 
 bool Program::recovery_pending(SequenceHandle sequence) const noexcept {
     return impl_->recovery_pending(sequence);
@@ -379,8 +409,9 @@ void Program::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
 
 CheckpointImage Program::export_checkpoints(std::span<const CheckpointHandle> points,
                                             const std::optional<PreparedSessionKey>& session,
-                                            std::string_view binding) const {
-    return impl_->export_checkpoints(points, session, binding);
+                                            std::string_view binding,
+                                            std::vector<std::uint8_t> buffer) const {
+    return impl_->export_checkpoints(points, session, binding, std::move(buffer));
 }
 
 std::size_t Program::checkpoint_image_host_bytes(std::span<const std::uint8_t> image,

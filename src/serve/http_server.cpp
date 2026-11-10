@@ -154,6 +154,9 @@ void write_anthropic_error(httplib::Response& response, const ApiError& api_erro
 // Stamped on every response, including the loading 503, auth failures and malformed requests that
 // never reach the pre-routing handler, so a caller can tell which build answered.
 void set_version_header(httplib::Response& response) {
+    // Replace, not add: the pre-routing handler has usually stamped it already, and a response may
+    // pass through here again (an error status with an empty body), which must not repeat it.
+    response.headers.erase("X-NInfer-Version");
     response.set_header("X-NInfer-Version", std::string(ninfer::product::build_version()));
 }
 
@@ -217,15 +220,22 @@ bool matches_bearer_credential(std::string_view authorization, std::string_view 
 }
 
 HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger,
-                       std::shared_ptr<OpenAIResponsesStore> responses_store)
+                       std::shared_ptr<OpenAIResponsesStore> responses_store,
+                       std::shared_ptr<AnthropicReasoningStore> reasoning_store)
     : options_(std::move(options)),
       responses_store_(responses_store ? std::move(responses_store)
                                        : std::make_shared<OpenAIResponsesStore>(
                                              options_.response_store_max_records,
                                              options_.response_store_max_bytes)),
       openai_responses_store_(*responses_store_),
+      anthropic_reasoning_store_(reasoning_store ? std::move(reasoning_store)
+                                                 : std::make_shared<AnthropicReasoningStore>(
+                                                       options_.response_store_max_records,
+                                                       reasoning_store_max_bytes(
+                                                           options_.response_store_max_bytes))),
       operational_log_(logger),
-      request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
+      request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger),
+                     options_.request_log_lossy_detail) {
     // cpp-httplib is thread-per-connection: a worker is held for a connection's whole
     // life, including the idle keep-alive window between requests. Sizing the pool to the
     // request-lifetime capacity alone lets idle pooled connections occupy every worker, at
@@ -513,6 +523,9 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_model_suspend(req, res);
                  });
+    server_.Post("/v1/context-store/flush", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_context_store_flush(req, res);
+    });
     server_.Post(R"(/v1/models/([^/]+)/resume)",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_model_resume(req, res);
@@ -628,6 +641,53 @@ void fail_residency(httplib::Response& res, int status, std::string code, std::s
 }
 
 } // namespace
+
+std::optional<std::chrono::seconds> parse_context_store_flush_body(std::string_view body) {
+    constexpr std::int64_t kDefaultBudgetSeconds = 600;
+    constexpr std::int64_t kMaximumBudgetSeconds = 3600;
+    std::int64_t budget = kDefaultBudgetSeconds;
+    try {
+        const nlohmann::json parsed =
+            body.empty() ? nlohmann::json::object() : nlohmann::json::parse(body);
+        if (!parsed.is_object()) { return std::nullopt; }
+        for (const auto& [key, value] : parsed.items()) {
+            if (key != "budget_seconds" || !value.is_number_integer()) { return std::nullopt; }
+            budget = value.get<std::int64_t>();
+        }
+    } catch (const std::exception&) { return std::nullopt; }
+    if (budget < 1 || budget > kMaximumBudgetSeconds) { return std::nullopt; }
+    return std::chrono::seconds(budget);
+}
+
+std::string context_store_flush_json(const ninfer::ContextStoreFlushReport& report) {
+    return nlohmann::json{{"written", report.written},
+                          {"unsaved", report.unsaved},
+                          {"uploaded", report.uploaded},
+                          {"seconds", report.seconds}}
+        .dump();
+}
+
+// Writes every unsaved conversation to the context store and uploads what waits for the bucket,
+// while serving carries on (Engine::flush_context_store), for a gateway draining the box or moving
+// conversations elsewhere. Body: optional {"budget_seconds": 1-3600} (default 600). Answers once
+// it is done or the budget is spent; "unsaved" > 0 or "uploaded": false says what was left.
+void HttpServer::handle_context_store_flush(const httplib::Request& req, httplib::Response& res) {
+    const auto budget = parse_context_store_flush_body(req.body);
+    if (!budget) {
+        fail_residency(res, 400, "invalid_request",
+                       "request body must be a JSON object with at most an integer budget_seconds "
+                       "from 1 to 3600");
+        return;
+    }
+    try {
+        res.set_content(context_store_flush_json(service_->flush_context_store(*budget)),
+                        "application/json");
+    } catch (const std::invalid_argument& error) {
+        fail_residency(res, 409, "context_store_off", error.what());
+    } catch (const std::exception& error) {
+        fail_residency(res, 503, "context_store_unavailable", error.what());
+    }
+}
 
 void HttpServer::handle_model_residency(const httplib::Request& req,
                                         httplib::Response& res) const {

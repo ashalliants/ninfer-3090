@@ -1,0 +1,125 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "The build in ~/proj is red, please fix it and keep the public API unchanged."
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "<think>Start with the tests.</think>Running the suite first."
+    }
+   ],
+   "tool_calls": [
+    {
+     "id": "t1",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cd ~/proj && pytest -q\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t1",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"E   ImportError: cannot import name 'parse' from 'proj.core'\\n1 failed\", \"exit_code\": 1, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r1",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/home/u/proj/proj/core.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r1",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "[read_file] read /home/u/proj/proj/core.py from line 1 (3,660 chars)"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "p1",
+     "name": "patch",
+     "arguments_json": "{\"path\": \"/home/u/proj/proj/core.py\", \"old_string\": \"def _parse(\", \"new_string\": \"def parse(\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "p1",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"success\": true, \"diff\": \"-def _parse(\\n+def parse(\", \"files_modified\": [\"/home/u/proj/proj/core.py\"]}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t2",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cd ~/proj && pytest -q\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t2",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"48 passed in 1.2s\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Fixed: `parse` was renamed to `_parse` in core.py. All 48 tests pass."
+    }
+   ]
+  }
+ ],
+ "cases": [
+  {
+   "id": "b8000",
+   "first": 0,
+   "last": 10,
+   "budget_chars": 8000
+  },
+  {
+   "id": "b3000",
+   "first": 0,
+   "last": 10,
+   "budget_chars": 3000
+  }
+ ]
+}

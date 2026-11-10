@@ -86,6 +86,9 @@ struct Program {
     struct HostBlock {
         std::size_t bytes;
         bool external_reference;
+        bool image = false;
+        // Where the block sits in the Host backing, when the fixture models free runs.
+        std::optional<std::size_t> offset;
     };
 
     struct Metadata {
@@ -109,22 +112,116 @@ struct Program {
     };
 
     std::size_t host_capacity;
+    // The pause snapshot reserve beyond `host_capacity` (the budget): blocks may fill it.
+    std::size_t host_reserve_bytes = 0;
     std::vector<Content> contents;
     std::vector<HostBlock> blocks;
     std::vector<Handle> released;
     std::vector<Handle> demoted;
     std::vector<std::vector<Handle>> demotion_submissions;
     std::uint32_t main_capacity    = 1024;
+    std::uint32_t state_capacity   = 64;
     bool transfer_in_progress      = false;
     bool combined_demotion_blocked = false;
+    // Free Host bytes stranded in runs too short to place a page or state image: counted free,
+    // never placeable. A demotion that needs them fails to allocate.
+    std::size_t host_fragment_bytes  = 0;
+    std::uint64_t placement_failures = 0;
     // Calls into the operations whose cost grows with the number of checkpoints. The real Program
     // pays O(checkpoints) for each, so a drop in these counts is a drop in Engine-thread time.
     mutable std::uint64_t host_bytes_released_calls = 0;
     mutable std::uint64_t recovery_loss_calls       = 0;
 
-    std::size_t host_block(std::size_t bytes, bool external_reference = false) {
-        blocks.push_back({bytes, external_reference});
+    // Host state images of image_bytes each take one contiguous run (0: no such model). Free runs
+    // that fit one are image_runs plus those released images leave, less images placed since.
+    std::size_t image_bytes   = 0;
+    std::size_t image_runs    = 0;
+    std::size_t placed_images = 0;
+
+    std::size_t host_block(std::size_t bytes, bool external_reference = false, bool image = false) {
+        blocks.push_back({bytes, external_reference, image, std::nullopt});
         return blocks.size() - 1;
+    }
+
+    // Allocator extents (#406). With `run_unit` set, the Host backing is modelled by byte ranges:
+    // `base_free_runs` plus the ranges of blocks nothing references, and a destination of whole
+    // `run_unit` pages places only into runs that hold one. Blocks without an offset are
+    // not placed anywhere.
+    std::size_t run_unit = 0;
+    mutable std::size_t run_simulations = 0; // calls to host_free_runs_after_release
+    std::vector<ninfer::runtime::HostRun> base_free_runs;
+
+    std::size_t host_block_at(std::size_t offset, std::size_t bytes) {
+        blocks.push_back({bytes, false, false, offset});
+        return blocks.size() - 1;
+    }
+
+    [[nodiscard]] ninfer::runtime::HostFreeRuns free_runs() const {
+        ninfer::runtime::HostFreeRuns result{.runs             = base_free_runs,
+                                             .general_capacity = host_capacity,
+                                             .occupied         = physical_usage().occupied.host_bytes};
+        for (std::size_t block = 0; block < blocks.size(); ++block) {
+            if (blocks[block].offset && !blocks[block].external_reference &&
+                std::none_of(contents.begin(), contents.end(),
+                             [&](const auto& content) { return references(content, block); })) {
+                result.runs.push_back({*blocks[block].offset, blocks[block].bytes});
+            }
+        }
+        ninfer::runtime::coalesce_host_runs(result.runs);
+        return result;
+    }
+
+    [[nodiscard]] ninfer::runtime::HostFreeRuns
+    host_free_runs_after_release(std::span<const Handle> victims) const {
+        ++run_simulations;
+        std::vector<ninfer::runtime::HostRun> freed;
+        for (std::size_t block = 0; block < blocks.size(); ++block) {
+            if (!blocks[block].offset || blocks[block].external_reference) { continue; }
+            bool referenced = false;
+            bool survives   = false;
+            for (std::uint32_t index = 0; index < contents.size(); ++index) {
+                if (!references(contents[index], block)) { continue; }
+                referenced = true;
+                if (!contents[index].evictable ||
+                    std::find(victims.begin(), victims.end(), Handle{index}) == victims.end()) {
+                    survives = true;
+                }
+            }
+            if (referenced && !survives) { freed.push_back({*blocks[block].offset, blocks[block].bytes}); }
+        }
+        return ninfer::runtime::host_runs_after_release(free_runs(), freed);
+    }
+
+    [[nodiscard]] std::size_t free_image_runs() const {
+        std::size_t freed = 0;
+        for (std::size_t block = 0; block < blocks.size(); ++block) {
+            if (blocks[block].image && !blocks[block].external_reference &&
+                std::none_of(contents.begin(), contents.end(),
+                             [&](const auto& content) { return references(content, block); })) {
+                ++freed;
+            }
+        }
+        return image_runs + freed - std::min(image_runs + freed, placed_images);
+    }
+
+    [[nodiscard]] std::size_t host_state_bytes_released(std::span<const Handle> victims) const {
+        if (!image_bytes) { return host_bytes_released(victims); } // no image runs modelled
+        std::size_t bytes = 0;
+        for (std::size_t block = 0; block < blocks.size(); ++block) {
+            if (!blocks[block].image || blocks[block].external_reference) { continue; }
+            bool referenced = false;
+            bool survives   = false;
+            for (std::uint32_t index = 0; index < contents.size(); ++index) {
+                if (!references(contents[index], block)) { continue; }
+                referenced = true;
+                if (!contents[index].evictable ||
+                    std::find(victims.begin(), victims.end(), Handle{index}) == victims.end()) {
+                    survives = true;
+                }
+            }
+            if (referenced && !survives) { bytes += blocks[block].bytes; }
+        }
+        return bytes;
     }
 
     Handle add(Key tokens, std::vector<std::size_t> host_blocks = {},
@@ -184,7 +281,7 @@ struct Program {
     }
 
     [[nodiscard]] PhysicalUsage physical_usage() const {
-        PhysicalUsage result{.capacity = {.state_slots      = 64,
+        PhysicalUsage result{.capacity = {.state_slots      = state_capacity,
                                           .main_kv_pages    = main_capacity,
                                           .backend_kv_pages = 1024,
                                           .host_bytes       = host_capacity}};
@@ -194,6 +291,11 @@ struct Program {
                             [&](const auto& content) { return references(content, block); })) {
                 result.occupied.host_bytes += blocks[block].bytes;
             }
+        }
+        // Bytes above the budget sit in the pause snapshot reserve, which the cache does not plan
+        // with: only the budget's share is reported occupied.
+        if (host_reserve_bytes) {
+            result.occupied.host_bytes = std::min(result.occupied.host_bytes, host_capacity);
         }
         return result;
     }
@@ -273,7 +375,20 @@ struct Program {
         std::vector<Handle> sources;
         Usage released;
         std::vector<std::pair<Handle, std::uint32_t>> main_parts;
+        std::size_t host_placeable = 0;
+        std::size_t host_unit      = 0; // the page size the destination is placed in (#406)
     };
+
+    [[nodiscard]] std::size_t host_placeable() const {
+        if (run_unit) {
+            const auto runs = free_runs();
+            return std::min(ninfer::runtime::host_placeable_bytes(runs.runs, run_unit),
+                            runs.budget_free());
+        }
+        const auto usage = physical_usage();
+        const auto free  = usage.capacity.host_bytes - usage.occupied.host_bytes;
+        return free - std::min(free, host_fragment_bytes);
+    }
 
     struct Release {
         std::vector<Handle> sources;
@@ -346,7 +461,11 @@ struct Program {
                  released.main_kv_pages
                      ? std::vector<std::pair<Handle, std::uint32_t>>{{handle,
                                                                       released.main_kv_pages}}
-                     : std::vector<std::pair<Handle, std::uint32_t>>{}});
+                     : std::vector<std::pair<Handle, std::uint32_t>>{},
+                 released.state_slots && image_bytes
+                     ? std::min(host_placeable(), free_image_runs() * image_bytes)
+                     : host_placeable(),
+                 run_unit});
         }
         return result;
     }
@@ -357,9 +476,9 @@ struct Program {
             return std::nullopt;
         }
         Demotion combined{ordered.front().handle, 0, {}, {}};
-        auto remaining   = shortage.main_kv_pages;
-        const auto usage = physical_usage();
-        auto host_left   = usage.capacity.host_bytes - usage.occupied.host_bytes;
+        auto remaining          = shortage.main_kv_pages;
+        auto host_left          = host_placeable();
+        combined.host_placeable = host_left;
         // The fixture supplies disjoint, explicit page quantities. Physical aliases,
         // reservations and transfer leases belong to the Native contract tests.
         for (const auto& plan : ordered) {
@@ -505,8 +624,9 @@ struct Program {
                         [&](auto handle) { return contents.at(handle.index).demotion_blocked; })) {
             return false;
         }
-        const auto usage = physical_usage();
-        if (plan.host_bytes > usage.capacity.host_bytes - usage.occupied.host_bytes) {
+        const bool image = image_bytes && plan.released.state_slots && plan.host_bytes;
+        if (plan.host_bytes > host_placeable() || (image && !free_image_runs())) {
+            ++placement_failures;
             return false;
         }
         if (!plan.main_parts.empty()) {
@@ -519,7 +639,10 @@ struct Program {
             }
         } else {
             auto& content = contents.at(plan.handle.index);
-            if (plan.host_bytes) { content.host_blocks.push_back(host_block(plan.host_bytes)); }
+            if (plan.host_bytes) {
+                content.host_blocks.push_back(host_block(plan.host_bytes, false, image));
+            }
+            if (image) { ++placed_images; }
             if (plan.released.state_slots) { content.device_state = false; }
             demoted.push_back(plan.handle);
         }
@@ -1160,25 +1283,67 @@ void test_explicit_anchor_updates_remain_bounded_across_requests() {
             "leased oldest anchor caused a request failure or a search for a different victim");
 }
 
+// #397: a long dialogue may hold most of the Device KV pool by itself. A short request that reuses the
+// shared system prompt makes that prompt the newest protected entry; the dialogue must stay protected,
+// because the soft target applies to Host bytes only.
+void test_device_pools_do_not_unprotect_a_long_dialogue() {
+    Fixture f(1024);
+    f.program.main_capacity = 100;
+    const auto system = f.program.add({1, 2}, {f.program.host_block(8)});
+    f.program.contents[system.index].main_pages = 4;
+    f.publish(system);
+    const auto dialogue = f.program.add({1, 2, 3}, {f.program.host_block(16)}, Role::Continuation);
+    f.program.contents[dialogue.index].main_pages = 86;
+    const auto owner = f.publish(dialogue);
+    const Base next{.tokens = {1, 2, 3, 4}};
+    require(f.begin(next, dialogue) == owner, "dialogue continuation unexpectedly forked its owner");
+    const auto turn = f.program.add(next.tokens, {f.program.host_block(16)}, Role::Continuation);
+    f.program.contents[turn.index].main_pages = 88;
+    f.cache.publish(f.program, owner, turn);
+    f.cache.finish(f.program, owner, next, f.next_order);
+    require(f.cache.retention(owner).reused, "a continued dialogue was not protected");
+    f.use_shared(system);
+    require(f.cache.retention(owner).reused,
+            "a request reusing the shared system prompt unprotected a dialogue for its Device KV pages");
+}
+
+// #397: two Device state slots give a 3/4 target of one slot, so two dialogues could never both stay
+// protected. Device state is the working set, not retained work: both stay protected.
+void test_two_dialogues_on_a_two_slot_device_both_stay_protected() {
+    Fixture f(1024);
+    const auto continued = [&](Key tokens) {
+        const auto first = f.program.add(tokens, {f.program.host_block(16)}, Role::Continuation);
+        const auto owner = f.publish(first);
+        Base next{.tokens = tokens};
+        next.tokens.push_back(99);
+        require(f.begin(next, first) == owner, "dialogue continuation unexpectedly forked its owner");
+        const auto turn = f.program.add(next.tokens, {f.program.host_block(16)}, Role::Continuation);
+        f.cache.publish(f.program, owner, turn);
+        f.cache.finish(f.program, owner, next, f.next_order);
+        return owner;
+    };
+    f.program.state_capacity = 2;
+    const auto a = continued({1, 2, 3});
+    const auto b = continued({5, 6, 7});
+    require(f.cache.retention(a).reused && f.cache.retention(b).reused,
+            "two dialogues on a two-slot device could not both stay protected");
+}
+
 void test_forked_hot_records_do_not_bypass_the_soft_capacity_target() {
     Fixture f(64);
-    f.program.main_capacity = 100;
-    (void)f.program.host_block(32, true);
-    const auto parent = f.program.add({1, 2}, {f.program.host_block(16)}, Role::Continuation);
-    f.program.contents[parent.index].main_pages = 40;
+    const auto parent = f.program.add({1, 2}, {f.program.host_block(28)}, Role::Continuation);
     f.publish(parent, 42);
     const Base branch{.tokens = {1, 2, 3},
                       .advice = {.update_session_index = false, .session_key = 42}};
     const auto owner = f.begin(branch, parent);
-    const auto child = f.program.add({1, 2, 3}, {f.program.host_block(16)}, Role::Continuation);
-    f.program.contents[child.index].main_pages = 40;
+    const auto child = f.program.add({1, 2, 3}, {f.program.host_block(28)}, Role::Continuation);
     f.cache.publish(f.program, owner, child);
     f.cache.finish(f.program, owner, branch, 2);
     const auto entrant = f.program.add({9, 8, 7});
     f.publish(entrant);
     const auto victims = f.cache.host_victims(f.program, 16, entrant);
     require(victims && *victims == std::vector<Handle>{parent},
-            "equal-adoption parent and child bypassed the per-resource protection soft target");
+            "equal-adoption parent and child bypassed the Host protection soft target");
 }
 
 void test_large_hotspot_is_preserved_per_resource_pool() {
@@ -2055,6 +2220,308 @@ void test_rewritten_dialogue_outlives_its_abandoned_branch() {
             "Host pressure evicted the live branch before the abandoned one");
 }
 
+// A pause snapshot may also use the reserve, so its target (the snapshot's bytes less the free
+// reserve) can exceed the budget when later paused snapshots fill the reserve; releasing them is
+// part of reaching it (#398). Budget 100 full of history, reserve 40 full of one later snapshot.
+void test_pause_victims_reach_into_the_snapshot_reserve() {
+    Fixture f(100);
+    f.program.host_reserve_bytes = 40;
+    const auto older             = f.program.add(tokens(10, 5000), {f.program.host_block(60)});
+    const auto newer             = f.program.add(tokens(10, 6000), {f.program.host_block(40)});
+    const auto snapshot          = f.program.add(tokens(10, 7000), {f.program.host_block(40)});
+    for (const auto handle : {older, newer, snapshot}) {
+        f.program.contents[handle.index].device_state = false;
+        f.program.contents[handle.index].main_pages   = 0;
+    }
+    f.publish(older);
+    f.publish(newer);
+    const std::array<Handle, 1> later{snapshot};
+    const auto usage = f.program.physical_usage();
+    require(usage.occupied.host_bytes == usage.capacity.host_bytes,
+            "fixture budget must be full with the snapshot in the reserve");
+
+    // Without the reserve the target is refused, as every other caller still expects.
+    require(!f.cache.host_victims(f.program, 110, std::nullopt, later),
+            "a target above the budget was accepted without a reserve");
+    const auto victims =
+        f.cache.host_victims(f.program, 110, std::nullopt, later, {}, std::nullopt, nullptr, {}, 40);
+    require(victims && victims->size() == 3 &&
+                std::find(victims->begin(), victims->end(), snapshot) != victims->end() &&
+                victims->back() == snapshot,
+            "the later snapshot in the reserve was not offered after ordinary history");
+    // Beyond the budget and the reserve together nothing can reach it.
+    require(!f.cache.host_victims(f.program, 141, std::nullopt, later, {}, std::nullopt, nullptr,
+                                  {}, 40),
+            "a target above the whole backing was accepted");
+}
+
+// Placeable bytes are not additive with the bytes freed from arbitrary Host allocations (#406).
+// Host (400 bytes, one page = 100): evictable history at [0,50), [200,250) and [300,350), pinned
+// residents between them, and a free hole at [350,400). Releasing the first two frees the 100 bytes
+// the quote is short of but leaves every run under one page; only the third joins the hole.
+struct FragmentedHost {
+    Fixture f{400};
+    Handle incoming{};
+    std::array<Handle, 3> history{};
+
+    explicit FragmentedHost(bool last_evictable,
+                            std::array<std::uint32_t, 3> lengths = {10, 10, 10}) {
+        f.program.run_unit = 100;
+        (void)f.program.host_block(150, true); // [50,200)
+        (void)f.program.host_block(50, true);  // [250,300)
+        f.program.base_free_runs = {{350, 50}};
+        const std::array<std::size_t, 3> offsets{0, 200, 300};
+        for (std::size_t i = 0; i < history.size(); ++i) {
+            history[i] = f.program.add(tokens(lengths[i], 5000 + 100 * static_cast<std::uint32_t>(i)),
+                                       {f.program.host_block_at(offsets[i], 50)});
+            f.program.contents[history[i].index].device_state = false;
+            f.program.contents[history[i].index].main_pages   = 0;
+            f.publish(history[i]);
+        }
+        f.program.contents[history[2].index].evictable = last_evictable;
+        incoming                                       = f.program.add(tokens(1000));
+        f.program.contents[incoming.index].demotion_bytes = 100;
+        f.publish(incoming);
+    }
+};
+
+void test_host_placement_arithmetic() {
+    using ninfer::runtime::HostFreeRuns;
+    using ninfer::runtime::HostRun;
+    // Touching ranges merge; ranges with a gap or in another order do not or sort first.
+    const HostFreeRuns free{.runs = {{350, 50}}, .general_capacity = 400, .occupied = 350};
+    const std::array<HostRun, 2> apart{HostRun{200, 50}, HostRun{0, 50}};
+    const auto scattered = ninfer::runtime::host_runs_after_release(free, apart);
+    require(scattered.runs == std::vector<HostRun>{{0, 50}, {200, 50}, {350, 50}} &&
+                scattered.occupied == 250 &&
+                !ninfer::runtime::host_places(scattered, 100, 100, false),
+            "scattered bytes were counted as a run");
+    const std::array<HostRun, 1> adjacent{HostRun{300, 50}};
+    const auto joined = ninfer::runtime::host_runs_after_release(free, adjacent);
+    require(joined.runs == std::vector<HostRun>{{300, 100}} &&
+                ninfer::runtime::host_places(joined, 100, 100, false) &&
+                ninfer::runtime::host_places(joined, 100, 100, true) &&
+                !ninfer::runtime::host_places(joined, 200, 100, false),
+            "adjacent bytes did not join the free run");
+    // Pages need whole units per run; an image needs one run; the budget caps both.
+    const HostFreeRuns pages{.runs = {{0, 150}, {300, 150}}, .general_capacity = 400, .occupied = 100};
+    require(ninfer::runtime::host_placeable_bytes(pages.runs, 100) == 200 &&
+                ninfer::runtime::host_places(pages, 200, 100, false) &&
+                !ninfer::runtime::host_places(pages, 200, 100, true) &&
+                !ninfer::runtime::host_places(pages, 300, 100, false),
+            "page and image placement differ from the runs");
+    const HostFreeRuns reserve{.runs = {{0, 400}}, .general_capacity = 300, .occupied = 250};
+    require(reserve.budget_free() == 50 && !ninfer::runtime::host_places(reserve, 100, 100, false),
+            "the snapshot reserve was offered to the cache");
+}
+
+void test_demotion_victims_account_for_post_release_extents() {
+    FragmentedHost fragmented(true);
+    auto& program = fragmented.f.program;
+    const auto usage = program.physical_usage();
+    require(usage.capacity.host_bytes - usage.occupied.host_bytes == 50 &&
+                program.host_placeable() == 0,
+            "fixture must have free bytes but no run for one page");
+    require(fragmented.f.cache.reclaim(program, {.main_kv_pages = 1}) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                program.demoted == std::vector<Handle>{fragmented.incoming} &&
+                program.placement_failures == 0 &&
+                std::find(program.released.begin(), program.released.end(),
+                          fragmented.history[2]) != program.released.end(),
+            "victims that free enough bytes but no run were chosen for a page demotion");
+
+    // The only history that joins the hole is pinned: raw bytes still reach the shortage, but no
+    // victim set leaves a run. The demotion is reported unplaceable, pass after pass, without
+    // displacing anything (the bytes the other two free are not worth evicting).
+    FragmentedHost stuck(false);
+    stuck.f.program.contents[stuck.incoming.index].release_blocked = true;
+    for (int pass = 0; pass < 3; ++pass) {
+        require(stuck.f.cache.reclaim(stuck.f.program, {.main_kv_pages = 1}) ==
+                    ninfer::runtime::ReclaimProgress::Blocked,
+                "an unplaceable demotion reported progress");
+    }
+    require(stuck.f.program.released.empty() && stuck.f.program.placement_failures == 0 &&
+                stuck.f.program.demoted.empty(),
+            "an unplaceable demotion displaced Host history it could not use");
+}
+
+// The cheapest history ranks first but frees an extent that joins no run. Taking the joining history
+// on top of it would cost more than the demotion may sacrifice, yet the joining history alone is
+// affordable and places the page: the search must not give up after its first pick.
+void test_placement_search_recovers_from_an_unaffordable_union() {
+    FragmentedHost fragmented(true, {{400, 400, 600}});
+    auto& program = fragmented.f.program;
+    require(fragmented.f.cache.reclaim(program, {.main_kv_pages = 1}) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                program.demoted == std::vector<Handle>{fragmented.incoming} &&
+                program.placement_failures == 0 &&
+                program.released == std::vector<Handle>{fragmented.history[2]},
+            "a legal victim set was missed after the first pick could not join a run");
+}
+
+// A demotion no victim set can place runs the greedy search and then the capped retries. With N
+// history entries a search simulates at most N release sets, so the total stays near
+// (1 + kMaxOpeningRetries) * N instead of growing with N * N.
+void test_blocked_placement_search_work_is_bounded() {
+    constexpr std::size_t history = 40;
+    Fixture f(history * 50 + 50);
+    auto& program    = f.program;
+    program.run_unit = 100;
+    for (std::size_t i = 0; i < history; ++i) {
+        // 50-byte extents 100 bytes apart: releasing any number of them never forms a 100-byte run.
+        const auto handle = program.add(tokens(10, 5000 + 100 * static_cast<std::uint32_t>(i)),
+                                        {program.host_block_at(100 * i, 50)});
+        program.contents[handle.index].device_state = false;
+        program.contents[handle.index].main_pages   = 0;
+        f.publish(handle);
+    }
+    const auto incoming = program.add(tokens(1000));
+    program.contents[incoming.index].demotion_bytes = 100;
+    f.publish(incoming);
+    program.run_simulations = 0;
+    (void)f.cache.reclaim(program, {.main_kv_pages = 1});
+    require(program.demoted.empty() && program.placement_failures == 0,
+            "an unplaceable demotion was attempted");
+    require(program.run_simulations > 0 && program.run_simulations <= 6 * (history + 1),
+            "a blocked placement search did unbounded extent simulations");
+}
+
+// The capped retries trade completeness for bounded cost, and this is the known miss. Only the
+// last of seven history entries joins the free hole into a page, and it is the dearest: every
+// cheaper opening dead-ends (its union with the joiner is refused by admission), and the retries
+// stop before the joiner is tried as the opening pick. The demotion is then reported blocked,
+// which is safe: nothing is released or demoted, and the caller releases the incoming checkpoint
+// instead of demoting it. Without the cap the same layout would place (see the recovery test).
+void test_placement_search_cap_misses_safely() {
+    // `decoys` cheap entries that never join a run, then the dear one that does.
+    const auto run = [](std::size_t decoys) {
+        struct Result {
+            ninfer::runtime::ReclaimProgress progress;
+            std::vector<Handle> demoted;
+            std::vector<Handle> released;
+            std::size_t placement_failures;
+        };
+        Fixture f(100 * decoys + 100);
+        auto& program    = f.program;
+        program.run_unit = 100;
+        std::vector<Handle> history;
+        for (std::size_t i = 0; i < decoys; ++i) {
+            // 50-byte extents with no free neighbour: releasing them never joins a run.
+            history.push_back(program.add(tokens(400, 5000 + 100 * static_cast<std::uint32_t>(i)),
+                                          {program.host_block_at(100 * i, 50)}));
+        }
+        const std::size_t joiner_at = 100 * decoys;
+        program.base_free_runs      = {{joiner_at + 50, 50}};
+        history.push_back(program.add(tokens(600, 9000), {program.host_block_at(joiner_at, 50)}));
+        for (const auto handle : history) {
+            program.contents[handle.index].device_state = false;
+            program.contents[handle.index].main_pages   = 0;
+            f.publish(handle);
+        }
+        const auto incoming = program.add(tokens(1000));
+        program.contents[incoming.index].demotion_bytes  = 100;
+        f.publish(incoming);
+        program.contents[incoming.index].release_blocked = true;
+        const auto progress = f.cache.reclaim(program, {.main_kv_pages = 1});
+        return Result{progress, program.demoted, program.released, program.placement_failures};
+    };
+    // Within the cap the joiner is reached and the page is placed.
+    const auto within = run(3);
+    require(within.progress == ninfer::runtime::ReclaimProgress::Changed &&
+                within.placement_failures == 0 && !within.demoted.empty(),
+            "a placement inside the retry cap was missed");
+    // Past the cap the placement is missed, and reported blocked without side effects.
+    const auto past = run(6);
+    require(past.progress == ninfer::runtime::ReclaimProgress::Blocked && past.demoted.empty() &&
+                past.released.empty() && past.placement_failures == 0,
+            "a placement past the retry cap was not reported blocked safely");
+}
+
+void test_demotion_quotes_only_placeable_host_bytes() {
+    // 32 bytes are free, but 16 of them are stranded in runs too short for the destination.
+    Fixture f(64);
+    (void)f.program.host_block(16, true);
+    const auto incoming                               = f.program.add(tokens(1000));
+    f.program.contents[incoming.index].demotion_bytes = 32;
+    const auto donor = f.program.add(tokens(10, 5000), {f.program.host_block(16)});
+    f.program.contents[donor.index].device_state = false;
+    f.publish(incoming);
+    f.publish(donor);
+    f.program.host_fragment_bytes = 16;
+    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                f.program.demoted == std::vector<Handle>{incoming} &&
+                f.program.released == std::vector<Handle>{donor} &&
+                f.program.placement_failures == 0,
+            "a demotion counted free bytes it could not place instead of displacing Host history");
+
+    // 48 bytes free, 32 of them stranded, and no Host history to displace: the demotion is not
+    // attempted, pass after pass (#402).
+    Fixture stuck(64);
+    (void)stuck.program.host_block(16, true);
+    const auto source = stuck.program.add(tokens(1000));
+    stuck.program.contents[source.index].demotion_bytes = 32;
+    stuck.publish(source);
+    stuck.program.contents[source.index].release_blocked = true;
+    stuck.program.host_fragment_bytes                    = 32;
+    for (int pass = 0; pass < 3; ++pass) {
+        require(stuck.cache.reclaim(stuck.program, {.state_slots = 1}) ==
+                    ninfer::runtime::ReclaimProgress::Blocked,
+                "an unplaceable demotion reported progress");
+    }
+    require(stuck.program.placement_failures == 0 && stuck.program.contents[source.index].alive,
+            "an unplaceable demotion was attempted on every reclaim pass");
+}
+
+// A Host state image takes one contiguous run (#304). Free Host bytes can all sit in runs shorter
+// than an image while the quote's placeable bytes are 0, so the demotion must displace Host
+// history. Releasing scattered KV pages frees enough bytes but no run, and the image still fails
+// to place; only a whole released image leaves a run another image fits, even when KV history
+// ranks first.
+void test_state_demotion_releases_a_whole_image_when_no_run_fits() {
+    Fixture f(64);
+    f.program.image_bytes = 16;
+    const auto kv =
+        f.program.add(tokens(4, 6000), {f.program.host_block(8), f.program.host_block(8)});
+    const auto image = f.program.add(tokens(8, 7000), {f.program.host_block(16, false, true)});
+    for (const auto handle : {kv, image}) {
+        f.program.contents[handle.index].device_state = false;
+        f.program.contents[handle.index].main_pages   = 0;
+        f.publish(handle);
+    }
+    const auto live                               = f.program.add(tokens(1000));
+    f.program.contents[live.index].demotion_bytes = 16;
+    f.publish(live);
+    const auto usage = f.program.physical_usage();
+    require(usage.capacity.host_bytes - usage.occupied.host_bytes >= 16 &&
+                f.program.free_image_runs() == 0,
+            "fixture must have free bytes but no run for an image");
+    require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                f.program.demoted == std::vector<Handle>{live} &&
+                f.program.released == std::vector<Handle>{image} &&
+                f.program.contents[kv.index].alive && f.program.placement_failures == 0,
+            "a state demotion released scattered KV bytes that leave no run for its image");
+
+    // With a free image run the demotion displaces nothing, as before.
+    Fixture fits(64);
+    fits.program.image_bytes = 16;
+    fits.program.image_runs  = 1;
+    const auto resident =
+        fits.program.add(tokens(8, 7000), {fits.program.host_block(16, false, true)});
+    fits.program.contents[resident.index].device_state = false;
+    fits.program.contents[resident.index].main_pages   = 0;
+    fits.publish(resident);
+    const auto incoming                                  = fits.program.add(tokens(1000));
+    fits.program.contents[incoming.index].demotion_bytes = 16;
+    fits.publish(incoming);
+    require(fits.cache.reclaim(fits.program, {.state_slots = 1}) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                fits.program.demoted == std::vector<Handle>{incoming} &&
+                fits.program.released.empty() && fits.program.placement_failures == 0,
+            "a state demotion with a free image run displaced Host history");
+}
+
 void test_failed_demotion_releases_superseded_history_before_the_live_branch() {
     // Host: the abandoned endpoint and two external 16-byte residents; 16 bytes stay free.
     Fixture f(64);
@@ -2196,8 +2663,10 @@ struct Decisions {
 };
 
 // A reproducible random cache: contents that share prefixes and Host blocks (aliases), some not
-// evictable, some Device-only and demotable, some hot from reuse. `seed` fixes everything.
-Decisions decide(std::uint32_t seed, bool memoize) {
+// evictable, some Device-only and demotable, some hot from reuse. `seed` fixes everything. With
+// `images`, a third of the blocks are 16-byte Host state images that take one run each, so state
+// demotions are priced by whole images (the candidate memo's `state_bytes`).
+Decisions decide(std::uint32_t seed, bool memoize, bool images = false) {
     std::mt19937 rng(seed);
     const auto pick = [&](std::uint32_t low, std::uint32_t high) {
         return std::uniform_int_distribution<std::uint32_t>(low, high)(rng);
@@ -2226,11 +2695,11 @@ Decisions decide(std::uint32_t seed, bool memoize) {
             if (!block_bytes.empty() && pick(0, 4) == 0) {
                 spec.block = pick(0, static_cast<std::uint32_t>(block_bytes.size() - 1)); // alias
             } else {
-                block_bytes.push_back(pick(8, 40));
+                block_bytes.push_back(images && pick(0, 2) == 0 ? 16 : pick(8, 40));
                 spec.block = block_bytes.size() - 1;
             }
         }
-        if (pick(0, 9) < 4) { spec.demotion_bytes = pick(8, 40); }
+        if (pick(0, 9) < 4) { spec.demotion_bytes = images ? 16 : pick(8, 40); }
         specs.push_back(std::move(spec));
     }
     std::size_t total = 0;
@@ -2238,8 +2707,14 @@ Decisions decide(std::uint32_t seed, bool memoize) {
     const std::size_t slack = pick(0, 24);
     Fixture f(total + slack);
     f.cache.set_candidate_memo(memoize);
+    if (images) {
+        f.program.image_bytes = 16;
+        f.program.image_runs  = pick(0, 1);
+    }
     std::vector<std::size_t> block_ids;
-    for (const auto bytes : block_bytes) { block_ids.push_back(f.program.host_block(bytes)); }
+    for (const auto bytes : block_bytes) {
+        block_ids.push_back(f.program.host_block(bytes, false, images && bytes == 16));
+    }
     std::vector<Handle> handles;
     for (const auto& spec : specs) {
         std::vector<std::size_t> blocks;
@@ -2289,22 +2764,26 @@ Decisions decide(std::uint32_t seed, bool memoize) {
 }
 
 void test_candidate_memo_changes_no_decision() {
-    std::size_t reclaimed = 0, demoted = 0, with_victims = 0;
-    for (std::uint32_t seed = 1; seed <= 600; ++seed) {
-        const auto plain = decide(seed, false);
-        const auto memo  = decide(seed, true);
+    std::size_t reclaimed = 0, demoted = 0, with_victims = 0, image_victims = 0;
+    for (std::uint32_t seed = 1; seed <= 900; ++seed) {
+        const bool images = seed > 600; // the last 300 price state demotions by whole images
+        const auto plain  = decide(seed, false, images);
+        const auto memo   = decide(seed, true, images);
         if (!(plain == memo)) {
             std::cerr << "decisions differ for seed " << seed << '\n';
             throw std::runtime_error("the candidate memo changed a cache decision");
         }
         reclaimed += plain.released.size();
         demoted += plain.demoted.size();
-        for (const auto& victims : plain.victims) { with_victims += victims && !victims->empty(); }
+        for (const auto& victims : plain.victims) {
+            with_victims += victims && !victims->empty();
+            image_victims += images && victims && !victims->empty();
+        }
     }
     // The comparison is only worth anything if the scenarios actually exercise the code.
-    std::cout << "memo equivalence: 600 seeds, " << reclaimed << " releases, " << demoted
+    std::cout << "memo equivalence: 900 seeds, " << reclaimed << " releases, " << demoted
               << " demotions, " << with_victims << " non-empty victim sets\n";
-    require(reclaimed > 200 && demoted > 100 && with_victims > 100,
+    require(reclaimed > 200 && demoted > 100 && with_victims > 100 && image_victims > 20,
             "randomized scenarios did not exercise release, demotion and Host victims");
 }
 
@@ -2443,6 +2922,8 @@ void test_direct_victim_release_offers_the_continuation_first() {
 int main() {
     try {
         test_direct_victim_release_offers_the_continuation_first();
+        test_device_pools_do_not_unprotect_a_long_dialogue();
+        test_two_dialogues_on_a_two_slot_device_both_stay_protected();
         test_progress_anchor_retirement_keeps_whatever_was_used();
         test_held_progress_anchor_is_retired_when_the_hold_ends();
         test_candidate_memo_cuts_victim_selection_work();
@@ -2463,6 +2944,14 @@ int main() {
         test_rewritten_dialogue_outlives_its_abandoned_branch();
         test_delayed_older_rewrite_does_not_supersede_a_newer_owner();
         test_failed_demotion_releases_superseded_history_before_the_live_branch();
+        test_demotion_quotes_only_placeable_host_bytes();
+        test_pause_victims_reach_into_the_snapshot_reserve();
+        test_host_placement_arithmetic();
+        test_demotion_victims_account_for_post_release_extents();
+        test_placement_search_recovers_from_an_unaffordable_union();
+        test_blocked_placement_search_work_is_bounded();
+        test_placement_search_cap_misses_safely();
+        test_state_demotion_releases_a_whole_image_when_no_run_fits();
         test_inherited_owner_heat_cannot_spend_a_full_other_continuation();
         test_exact_repeated_candidate_can_replace_a_long_hotspot_with_common_fallback();
         test_old_candidate_demand_cannot_borrow_a_new_owner_epoch();

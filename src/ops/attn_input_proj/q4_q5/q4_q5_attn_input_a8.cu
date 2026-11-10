@@ -12,8 +12,11 @@
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 
 #include "core/device.h"
+#include "core/layout.h"
 #include "core/weight_view.h"
+#include "ninfer/ops/q4_a4_linear.h"
 #include "ops/common/rowsplit_a8_mma.cuh"
+#include "ops/linear/q4/q4_scout_a4.h"
 
 #include <cuda_bf16.h>
 
@@ -75,6 +78,27 @@ void launch_all(const Tensor& x, const Weight& query_key, const Weight& gate_val
                                   static_cast<__nv_bfloat16*>(v.data), kKvRows, stream);
 }
 
+// The lossy scout's int4 route: the Q5 gate/value parent exactly as above, from its own s8
+// activations; the Q4 query/key parent is handled by the caller.
+template <int NT>
+void launch_q5(const Tensor& x, const Weight& gate_value, std::int32_t tokens, std::int8_t* codes,
+               __half* scales, Tensor& gate, Tensor& v, cudaStream_t stream) {
+    constexpr int BN = a8::kWarpsN * NT * 8;
+    a8::quantize_activations<kHidden, BN><<<tokens, 128, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data), tokens, codes, scales);
+    CUDA_CHECK(cudaGetLastError());
+    launch_range<a8::Q5Codec, NT>(gate_value, codes, scales, tokens, 0, kQRows,
+                                  static_cast<__nv_bfloat16*>(gate.data), kQRows, stream);
+    launch_range<a8::Q5Codec, NT>(gate_value, codes, scales, tokens, kQRows, kKvRows,
+                                  static_cast<__nv_bfloat16*>(v.data), kKvRows, stream);
+}
+
+void a8_activation_layout(WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
+    (void)layout.alloc_bytes(static_cast<std::size_t>(tokens) * kHidden);
+    (void)layout.alloc_bytes(static_cast<std::size_t>(tokens) * (kHidden / a8::kGroup) *
+                             sizeof(__half));
+}
+
 } // namespace
 
 bool q4_q5_attn_input_a8_supported(const Weight& query_key, const Weight& gate_value,
@@ -127,6 +151,50 @@ void q4_q5_attn_input_a8_launch(const Tensor& x, const Weight& query_key, const 
                       stream);
         return;
     }
+}
+
+std::size_t q4_q5_attn_input_scout_a4_workspace_capacity_bytes(std::int32_t min_tokens,
+                                                               std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("q4_q5 attn_input scout a4 workspace: invalid token interval");
+    }
+    WorkspaceLayoutBuilder layout;
+    a8_activation_layout(layout, max_tokens);
+    scout_a4_activation_layout(layout, kHidden, max_tokens);
+    return layout.peak_bytes(1);
+}
+
+void q4_q5_attn_input_scout_a4_launch(const Tensor& x, const Weight& query_key,
+                                      const Weight& gate_value, Tensor& q, Tensor& gate, Tensor& k,
+                                      Tensor& v, WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = x.ne[1];
+    if (!q4_q5_attn_input_a8_supported(query_key, gate_value, tokens)) {
+        throw std::invalid_argument("q4_q5 attn_input scout a4: unsupported profile");
+    }
+
+    auto scope             = workspace.scope();
+    const DeviceSpan codes = workspace.alloc_bytes(static_cast<std::size_t>(tokens) * kHidden);
+    const DeviceSpan scales = workspace.alloc_bytes(
+        static_cast<std::size_t>(tokens) * (kHidden / a8::kGroup) * sizeof(__half));
+    auto* code_data  = reinterpret_cast<std::int8_t*>(codes.data);
+    auto* scale_data = reinterpret_cast<__half*>(scales.data);
+    switch (a8::token_tile(tokens, 512)) {
+    case 512:
+        launch_q5<16>(x, gate_value, tokens, code_data, scale_data, gate, v, stream);
+        break;
+    case 256:
+        launch_q5<8>(x, gate_value, tokens, code_data, scale_data, gate, v, stream);
+        break;
+    default:
+        launch_q5<4>(x, gate_value, tokens, code_data, scale_data, gate, v, stream);
+        break;
+    }
+
+    // q and k are separate contiguous allocations, so each takes its own row range of the Q4
+    // parent and the int4 GEMM writes it in place.
+    const ScoutA4Activations a4 = scout_a4_quantize(x, workspace, stream);
+    q4_a4_linear(a4.codes, a4.scales, scout_a4_row_slice(query_key, 0, kQRows), q, stream);
+    q4_a4_linear(a4.codes, a4.scales, scout_a4_row_slice(query_key, kQRows, kKvRows), k, stream);
 }
 
 } // namespace ninfer::ops::detail

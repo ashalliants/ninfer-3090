@@ -404,6 +404,93 @@ Parameters::Parameters(const Model& source) : model(source) {
             ProposalParameters{prepare.head(w.proposal->head), std::nullopt, w.proposal->rows};
         if (w.proposal->token_ids) { proposal->token_ids = prepare.tensor(*w.proposal->token_ids); }
     }
+    // The scout's int4 policy exists only in scout_a4_layers' copies; the model's own parameters,
+    // which the main pass, decode and verify read, must never hold it.
+    for (const auto& layer : text.layers) {
+        if (holds_scout_policy(layer)) {
+            throw std::logic_error("the model's own layer parameters hold the scout's int4 policy");
+        }
+    }
+}
+
+namespace {
+
+constexpr bool scout_policy(ops::LinearPolicy policy) noexcept {
+    return policy == ops::LinearPolicy::ScoutA4Int;
+}
+
+bool scout_policy(const ops::ProjectionWeights& projection) noexcept {
+    if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&projection)) {
+        return scout_policy(pair->policy);
+    }
+    return scout_policy(std::get<LinearParameters>(projection).policy);
+}
+
+// A Q4 matrix that already takes the integer-A8 prefill route takes the int4 one in the scout.
+void promote(LinearParameters& p) {
+    if (p.weight.qtype == QType::Q4_G64_FP16 && ops::allows_a8_int(p.policy)) {
+        p.policy = ops::LinearPolicy::ScoutA4Int;
+    }
+}
+
+// The split Q4/Q5 input projections: the Q4 half goes int4, the Q5 half keeps its integer-A8
+// route (the Ops split the pair that way under ScoutA4Int).
+void promote(ops::ProjectionWeights& projection) {
+    auto* pair = std::get_if<ops::PairedProjectionWeights>(&projection);
+    if (pair != nullptr && pair->first.qtype == QType::Q4_G64_FP16 &&
+        pair->second.qtype == QType::Q5_G64_FP16 && ops::allows_a8_int(pair->policy)) {
+        pair->policy = ops::LinearPolicy::ScoutA4Int;
+    }
+}
+
+} // namespace
+
+bool holds_scout_policy(const BlockParameters& block) noexcept {
+    if (const auto* dense = std::get_if<DenseParameters>(&block.ffn)) {
+        if (scout_policy(dense->gate_up.policy) || scout_policy(dense->down.policy) ||
+            scout_policy(dense->verify_gate_up_policy)) {
+            return true;
+        }
+    }
+    if (const auto* attention = std::get_if<AttentionParameters>(&block.mixer)) {
+        return scout_policy(attention->projection) || scout_policy(attention->output.policy);
+    }
+    const auto& gdn = std::get<GdnParameters>(block.mixer);
+    return scout_policy(gdn.projection) || scout_policy(gdn.control) ||
+           scout_policy(gdn.output.policy);
+}
+
+bool scout_a4_promotes(const TextParameters& text, std::uint32_t filter_layer) {
+    const auto layers = scout_a4_layers(text, filter_layer);
+    return std::any_of(layers.begin(), layers.end(), holds_scout_policy);
+}
+
+std::vector<BlockParameters> scout_a4_layers(const TextParameters& text,
+                                             std::uint32_t filter_layer) {
+    if (filter_layer >= text.layers.size()) {
+        throw std::invalid_argument("scout a4 layers: the filter layer is outside the model");
+    }
+    std::vector<BlockParameters> out(text.layers.begin(),
+                                     text.layers.begin() + filter_layer + 1);
+    for (auto& block : out) {
+        // A Hadamard-rotated FFN projects gate/up through Linear (ffn.cpp), which has no int4
+        // route, so it stays as it is.
+        if (auto* dense = std::get_if<DenseParameters>(&block.ffn);
+            dense != nullptr && !rotated(dense->gate_up.hadamard_signs) &&
+            !rotated(dense->down.hadamard_signs)) {
+            promote(dense->gate_up);
+            promote(dense->down);
+        }
+        if (auto* attention = std::get_if<AttentionParameters>(&block.mixer)) {
+            promote(attention->projection);
+            promote(attention->output);
+        } else {
+            auto& gdn = std::get<GdnParameters>(block.mixer);
+            promote(gdn.projection);
+            promote(gdn.output);
+        }
+    }
+    return out;
 }
 
 } // namespace ninfer::models::qwen3_5::execution

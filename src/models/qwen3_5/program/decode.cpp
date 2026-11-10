@@ -284,6 +284,18 @@ void ProgramImpl::validate_licensed_tokens(std::span<const TokenId> tokens) cons
     }
 }
 
+bool ProgramImpl::license_tokens(std::span<TokenId> tokens) const noexcept {
+    const std::int64_t limit = dimension(parameters.model.resources().public_token_count);
+    bool inside              = true;
+    for (TokenId& token : tokens) {
+        if (token < 0 || token >= limit) {
+            token  = 0;
+            inside = false;
+        }
+    }
+    return inside;
+}
+
 runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
     std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,
     runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks) {
@@ -382,8 +394,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             RequestControl& request    = requests[lanes[row]];
             const std::uint32_t base_E = sequence.execution_frontier;
             const std::uint32_t base_S = sequence.ledger_frontier;
-            const TokenId token        = ordinary_host_egress->sampled_tokens[row];
-            validate_licensed_tokens(std::span<const TokenId>(&token, 1));
+            TokenId& token             = ordinary_host_egress->sampled_tokens[row];
+            if (!license_tokens(std::span<TokenId>(&token, 1))) { token_domain_faults[row] = true; }
             sequence.text_kv_valid = base_E + 1;
             commit_sequence_kv(sequence, sequence.text_kv_valid, 0);
             sequence.tail_hidden_valid = true;
@@ -568,10 +580,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                     capacity) {
                 throw std::runtime_error("MTP batch returned invalid row metadata");
             }
-            const std::span<const TokenId> row_tokens(mtp_host_egress->licensed_tokens.data() +
-                                                          row * width,
-                                                      static_cast<std::size_t>(count_i));
-            validate_licensed_tokens(row_tokens);
+            const std::span<TokenId> row_tokens(mtp_host_egress->licensed_tokens.data() +
+                                                    row * width,
+                                                static_cast<std::size_t>(count_i));
+            if (!license_tokens(row_tokens)) { token_domain_faults[row] = true; }
             const std::uint32_t pcur =
                 static_cast<std::uint32_t>(mtp_host_ingress->current_extents[row]);
             if (pcur == 0) {
@@ -891,10 +903,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                     capacity) {
                 throw std::runtime_error("DFlash batch returned invalid row metadata");
             }
-            const std::span<const TokenId> row_tokens(dflash_host_egress->licensed_tokens.data() +
-                                                          row * width,
-                                                      static_cast<std::size_t>(count_i));
-            validate_licensed_tokens(row_tokens);
+            const std::span<TokenId> row_tokens(dflash_host_egress->licensed_tokens.data() +
+                                                    row * width,
+                                                static_cast<std::size_t>(count_i));
+            if (!license_tokens(row_tokens)) { token_domain_faults[row] = true; }
             if (extent == 0) {
                 request.speculative_stats.fallback_steps += 1;
             } else {
@@ -962,6 +974,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
 runtime::BatchedGeneratedRound ProgramImpl::decode_raw(
     std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,
     runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks) {
+    token_domain_faults.fill(false);
     if (speculative_backend == SpeculativeBackend::None) {
         return decode_ordinary_batch(lanes, budgets, failed_timing, masks);
     }

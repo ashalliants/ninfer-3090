@@ -6,6 +6,7 @@
 #include "models/qwen3_5/frontend/graft.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/load.h"
+#include "models/qwen3_5/lossy_options.h"
 #include "models/qwen3_5/measurement.h"
 #include "runtime/engine/host_cache.h"
 #include "runtime/engine/validate_options.h"
@@ -260,6 +261,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     if (options.prefill_schedule.layer_slices > kMaximumPrefillLayerSlices) {
         throw std::invalid_argument("prefill_schedule.layer_slices must be at most 16");
     }
+    // The CLI checks these too, but a caller building EngineOptions directly does not go through it.
+    models::qwen3_5::validate_lossy_prefill_options(options.lossy_prefill);
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
     // Each direct graft is installed as a pinned context-cache checkpoint that holds one StateImage
@@ -562,14 +565,16 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     instance->install_external_checkpoints();
     device.synchronize();
     program.complete();
-    // What the Program actually pinned.
+    // What the Program actually pinned: the cache's budget plus the pause snapshot reserve.
+    const auto pinned = instance->program->physical_usage();
     options.context_cache.host_capacity_bytes =
-        instance->program->physical_usage().capacity.host_bytes;
+        pinned.capacity.host_bytes + pinned.host_pause_reserve_bytes;
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
     const auto& stats = instance->model->storage_stats();
     LoadSummary summary;
     summary.architecture = models::architecture_name(instance->model->config().text.architecture);
     summary.model_name   = instance->model->info().name;
+    summary.artifact_id  = artifact::artifact_id_hex(instance->model->info().artifact_id);
     summary.prefill_signature = signature;
     std::set<std::string> formats;
     for (const auto& weight : instance->model->weight_data()) {

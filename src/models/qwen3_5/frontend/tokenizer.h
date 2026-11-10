@@ -149,6 +149,9 @@ public:
     [[nodiscard]] std::size_t vocab_size() const noexcept { return decoded_token_bytes_.size(); }
 
     [[nodiscard]] bool is_special_token(int id) const noexcept;
+    // Every added token (tokenizer.json added_tokens and added_tokens_decoder), special or not:
+    // role markers, tool-call delimiters, thinking tags.
+    [[nodiscard]] std::span<const AddedToken> added_tokens() const noexcept { return added_tokens_; }
     [[nodiscard]] bool is_valid_token(int id) const noexcept;
     [[nodiscard]] bool has_exact_token_domain(std::size_t size) const noexcept;
 

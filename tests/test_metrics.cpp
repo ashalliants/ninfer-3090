@@ -48,6 +48,7 @@ int main() {
     running.host_context_occupied_bytes = 4096;
     running.host_context_reserved_bytes = 1024;
     running.host_context_free_extents        = 5;
+    running.host_pause_reserve_occupied_bytes = 4096;
     running.host_context_geometry_failures   = 7;
     running.host_context_shortage_failures   = 2;
     metrics.first_token({.prepare_seconds = 0.05, .elapsed_since_submit_seconds = 0.2});
@@ -75,6 +76,8 @@ int main() {
               live.find("ninfer_host_context_geometry_failures_total 7\n") != std::string::npos &&
               live.find("ninfer_host_context_shortage_failures_total 2\n") != std::string::npos,
           "Host allocator failures must be exported, split by geometry and shortage");
+    check(live.find("ninfer_host_pause_reserve_used_bytes 4096\n") != std::string::npos,
+          "the bytes in the pause snapshot reserve must be exported");
 
     GenerationOutcome outcome;
     outcome.finish_reason                            = FinishReason::OutputLimit;
@@ -150,8 +153,19 @@ int main() {
     fork.sliced_prefill_steps             = 8;
     fork.prefill_slice_boundaries         = 56;
     fork.engine_recoveries                = 1;
+    fork.lossy_prefills_completed         = baseline.lossy_prefills_completed + 2;
+    fork.lossy_prefills_skipped           = baseline.lossy_prefills_skipped + 1;
+    fork.lossy_prefills_aborted           = baseline.lossy_prefills_aborted + 3;
+    fork.lossy_prefill_scouted_tokens     = baseline.lossy_prefill_scouted_tokens + 75904;
+    fork.lossy_prefill_kept_tokens        = baseline.lossy_prefill_kept_tokens + 15182;
+    fork.lossy_prefill_alias_hits         = baseline.lossy_prefill_alias_hits + 4;
+    fork.lossy_prefill_summaries_new      = baseline.lossy_prefill_summaries_new + 5;
+    fork.lossy_prefill_summaries_reused   = baseline.lossy_prefill_summaries_reused + 6;
+    fork.lossy_prefill_summary_probe_timeouts = baseline.lossy_prefill_summary_probe_timeouts + 7;
     fork.context_store_images             = 5;
     fork.context_store_used_bytes         = 123456789;
+    fork.context_store_logical_bytes      = 223456789;
+    fork.context_store_shared_bytes       = 99000;
     fork.context_store_writes             = 9;
     fork.context_store_bytes_reused       = 4000;
     fork.context_store_restored           = 3;
@@ -160,6 +174,19 @@ int main() {
     fork.context_store_remote_uploads     = 7;
     fork.context_store_remote_images      = 1;
     fork.context_store_read_bytes_per_second = 2.5e9;
+    fork.context_store_lookups            = 4;
+    fork.context_store_lookup_hits        = 1;
+    fork.context_store_hydration_failures = baseline.context_store_hydration_failures + 3;
+    fork.context_store_hydration_failures_by_reason[static_cast<std::size_t>(
+        ContextStoreHydrationFailure::Deadline)] += 2;
+    fork.context_store_hydration_failures_by_reason[static_cast<std::size_t>(
+        ContextStoreHydrationFailure::UnusedAtAdmission)] += 1;
+    fork.context_store_corrupt                         = 2;
+    fork.context_store_corrupt_remote                  = 2;
+    fork.context_store_remote_download_failures        = 5;
+    fork.context_store_remote_only_dropped             = 6;
+    fork.context_store_remote_download_failures_damaged = 2;
+    fork.context_store_remote_download_failures_listing = 3;
     fork.main_kv_h2d_bytes                = 123456;
     fork.root_selections                  = 7;
     fork.checkpoint_selections            = 31;
@@ -181,18 +208,48 @@ int main() {
               has_line(series, "ninfer_prefill_slice_boundaries_total 56") &&
               has_line(series, "ninfer_engine_recoveries_total 1"),
           "abandoned, cancelled, recovery and phase-time series must be reported");
+    check(has_line(series, "ninfer_lossy_prefill_total{outcome=\"completed\"} 2") &&
+              has_line(series, "ninfer_lossy_prefill_total{outcome=\"skipped\"} 1") &&
+              has_line(series, "ninfer_lossy_prefill_total{outcome=\"aborted\"} 3") &&
+              has_line(series, "ninfer_lossy_prefill_scouted_tokens_total 75904") &&
+              has_line(series, "ninfer_lossy_prefill_kept_tokens_total 15182") &&
+              has_line(series, "ninfer_lossy_prefill_alias_hits_total 4") &&
+              has_line(series, "ninfer_lossy_prefill_summaries_total{kind=\"new\"} 5") &&
+              has_line(series, "ninfer_lossy_prefill_summaries_total{kind=\"reused\"} 6") &&
+              has_line(series, "ninfer_lossy_prefill_summary_probe_timeouts_total 7"),
+          "lossy prefill series must be reported by outcome");
     check(has_line(series, "ninfer_context_store_images 5") &&
               has_line(series, "ninfer_context_store_used_bytes 123456789") &&
+              has_line(series, "ninfer_context_store_logical_bytes 223456789") &&
+              has_line(series, "ninfer_context_store_shared_bytes 99000") &&
               has_line(series, "ninfer_context_store_writes_total 9") &&
               has_line(series, "ninfer_context_store_bytes_reused_total 4000") &&
               has_line(series, "ninfer_context_store_restored_sessions 3") &&
               has_line(series, "ninfer_context_store_hydrations_total 2") &&
               has_line(series, "ninfer_context_store_hydrated_tokens_total 70000") &&
-              has_line(series, "ninfer_context_store_hydration_failures_total 0") &&
+              has_line(series, "ninfer_context_store_hydration_failures_total 3") &&
               has_line(series, "ninfer_context_store_remote_uploads_total 7") &&
               has_line(series, "ninfer_context_store_remote_images 1") &&
               has_line(series, "ninfer_context_store_read_bytes_per_second 2500000000"),
           "context store series must be reported");
+    check(has_line(series, "ninfer_context_store_lookups_total 4") &&
+              has_line(series, "ninfer_context_store_lookup_hits_total 1") &&
+              has_line(series,
+                       "ninfer_context_store_hydration_failures_by_reason_total{reason=\"deadline\"} 2") &&
+              has_line(series, "ninfer_context_store_hydration_failures_by_reason_total"
+                               "{reason=\"unused_at_admission\"} 1") &&
+              has_line(series,
+                       "ninfer_context_store_hydration_failures_by_reason_total{reason=\"load_miss\"} 0") &&
+              has_line(series, "ninfer_context_store_corrupt_total 2") &&
+              has_line(series, "ninfer_context_store_corrupt_by_reason_total{reason=\"remote\"} 2") &&
+              has_line(series, "ninfer_context_store_corrupt_by_reason_total{reason=\"startup\"} 0") &&
+              has_line(series, "ninfer_context_store_remote_download_failures_total 5") &&
+              has_line(series, "ninfer_context_store_remote_only_dropped_total 6") &&
+              has_line(series, "ninfer_context_store_remote_download_failures_by_reason_total"
+                               "{reason=\"damaged\"} 2") &&
+              has_line(series, "ninfer_context_store_remote_download_failures_by_reason_total"
+                               "{reason=\"listing\"} 3"),
+          "context store lookup hits and failure reasons must be reported");
     check(has_line(series,
                    "ninfer_context_transfer_bytes_total{resource=\"main_kv\",direction=\"h2d\"} "
                    "123456") &&

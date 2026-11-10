@@ -39,6 +39,37 @@ adds fields to every request. With `--max-concurrency 1` the long prompt queues 
 which is itself the head-of-line case. `python -I tools/bench/test_prefill_stall.py` checks the tool against a
 fake server that stalls its streams on a long request.
 
+## Lossy long-prompt prefill sweep (`run_lossy_prefill_sweep.py`)
+
+Quality and speed of `--lossy-prefill-*` over a grid of settings (`docs/maintainer/lossy-long-prefill.md`). For each
+grid point it starts a fresh `ninfer-serve` with the flags and a request log, runs the workloads, appends one row per
+workload to `results.jsonl`, and writes `summary.md`: every acceptance check marked pass or FAIL against the baseline
+point (the same server with lossy prefill off).
+
+| workload | what it runs | numbers |
+|---|---|---|
+| `needle` | `eval/` evalscope `needle_haystack`, 32K/64K/100K x 5 depths (config generated per run from `--needle-corpus`, `--tokenizer-path`, `--model`) | accuracy per length; gate: >= 0.95x baseline |
+| `agent_replay` | `python -m tools.bench.agent_replay run --min-context 30000 --max-context 120000` | tool-call validity; `Edit` rate (`old_string` occurs verbatim in the file at the corpus commit, over `edit_function` turns); gate: within 2 points of baseline |
+| `greedy_agreement` | 20 long prompts at temperature 0; first-divergence index against the baseline's output (token ids from the request log) | reported, no gate (replaces the spec's teacher-forced KL in v1) |
+| `speed` | `run_prefill_stall.py` with a 108K cold prompt on its own server (`--max-concurrency 2 --prefill-layer-slices 8`) | total, scout and main time (request log `lossy_prefill`), neighbour worst gap; gate: total <= 0.40x baseline |
+
+```bash
+python tools/bench/run_lossy_prefill_sweep.py \
+    --server-cmd "build/apps/ninfer-serve models/qwen3_5_27b.ninfer --kv-dtype rk4v4 --max-context 131072 --prefill-cublas" \
+    --model qwen3.5-27b --tokenizer-path /path/to/hf-tokenizer-dir --needle-corpus /path/to/Needle-in-a-Haystack-Corpus \
+    --grid filter_layer=7,11,15,23,31 keep=0.1,0.2,0.3,0.5 block=32,64,128 strategy=select,summary \
+    --workloads needle,agent_replay,greedy_agreement,speed --out profiles/lossy-sweep
+```
+
+Grid keys: `filter_layer keep block recent head query_rows pool_window skip scout_a4 strategy min_tokens`; a
+knob left out keeps the server default. `strategy=summary` ignores the selection knobs and runs once (it needs the
+`--lossy-prefill-strategy` flag; `select` passes no such flag). Run it in pieces: `--workloads` and `--only REGEX`
+(on point ids) pick a subset, `--resume` skips pairs already ok, `--skip-baseline --baseline-from earlier/results.jsonl`
+reuses a baseline, and `--from-json results.jsonl [more.jsonl]` only re-summarises. A server that fails to start
+is recorded (workload `server`) and the sweep goes on. The speed row fails unless the long request returned 200, was cold, and had 100K..`--max-context` tokens; agent_replay fails unless the replay reports `complete`; a quality row is INCOMPLETE unless the request log shows at least one `completed` lossy request (counts are in `summary.md`). `--agent-sessions` defaults to 26 (about 2 Edit turns per session; the gate's turns are the long cold `edit_function` turns of the baseline replay, as many as that replay has at >= 34K tokens, recorded per point as `edit_turns`), and the greedy prompts are about 100K tokens (`--greedy-chars`). The int4 scout's ranking gate is the opt-in `--workloads jaccard` on a `scout_a4=0,1` grid: both points send the same long prompts (cut from `--agent-repo`, `--jaccard-prompts` each of ~32K and ~100K tokens) to a server started with `--request-log-lossy-detail`, and `summary.md` gives each `scout_a4=1` point the kept-block Jaccard against its `scout_a4=0` twin (the gate is the minimum over prompts of the Jaccard over score-chosen blocks only, without the forced head and recent blocks, >= 0.9; the all-blocks Jaccard is shown next to it for reference). `agent_edit` (in the default list) replays the baseline agent_replay's `edit_function` turns whose prompt has at least 34K tokens, each one cold on a server started with `--no-prefix-reuse`, and judges the Edit the same way; the Edit gate uses only it (no fallback to agent_replay, whose Edit rate is shown as an ungated column; a missing agent_edit leaves the check not measured), and it is INCOMPLETE unless lossy prefill completed on every scored turn (`lossy_turns == edit_turns`). `summary.md` also shows, per point, the paired per-turn view against the baseline: turns the baseline hit and the point missed, and the reverse. agent_replay alone cannot gate lossy prefill: its sessions grow from a few thousand tokens and every later turn reuses the conversation's private record, which lossy prefill never filters. `--agent-source DIR` names another replay output (default OUT/baseline/agent-replay). Needle samples are judged by the harness, not by evalscope's `rule` judge (an exact match of the whole needle sentence, which scores a correct short answer 0): a sample is correct when its answer contains every needle word the question does not (`needle_answer_hit`); evalscope's score is kept as `rule_accuracy`. `--rescore-needle --out DIR` re-judges needle rows recorded before this rule and re-summarises. `python -I tools/bench/test_lossy_prefill_sweep.py` checks the
+summariser (0.96x passes, 0.94x fails, Edit -2.5 points fails, time 0.39x passes), the grid and the commands. It is
+stdlib-only; the needle workload needs the `eval/.venv` of eval/README.md. Hold the GPU lock for a sweep on a shared card.
+
 ## Interleaved A/B between two builds
 
 `run_interleaved_ab.py` compares two executables by alternating them **inside** each repetition.

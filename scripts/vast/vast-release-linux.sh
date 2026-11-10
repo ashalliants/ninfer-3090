@@ -4,7 +4,7 @@
 # pulls the archive and its checksum file back into <repo-dir>/dist/.
 #   ./vast-release-linux.sh [repo-dir]
 # Prerequisites: vast-dev-launch.sh has finished (instance ready, model fetched), and the release
-# commit is checked out and CLEAN in repo-dir -- VERSION bumped and RELEASE_NOTES_X.Y.Z.md committed,
+# commit is checked out and CLEAN in repo-dir -- VERSION bumped and docs/release-notes/RELEASE_NOTES_X.Y.Z.md committed,
 # because the archive is a `git archive` of that exact commit and the packager refuses without them.
 # The build runs detached on the instance and is polled, so a dropped SSH connection costs nothing.
 # Does not destroy the instance: pull everything you need, then ./vast-destroy.sh.
@@ -55,6 +55,7 @@ command -v jq >/dev/null || { apt-get update -qq && apt-get install --yes --no-i
 mem_gib=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1048576 ))
 jobs=$(( mem_gib / 4 ))
 (( jobs > $(nproc) )) && jobs=$(nproc)
+(( jobs > 32 )) && jobs=32   # nproc reports the host's cores, not the share this container gets
 (( jobs < 1 )) && jobs=1
 
 echo "==> [$(date -Is)] configuring (-j$jobs)"
@@ -95,9 +96,20 @@ echo "==> [$(date -Is)] smoke test: default profile, one chat completion on the 
 port=$(( 20000 + RANDOM % 20000 ))
 while ss -ltn "sport = :$port" | grep -q LISTEN; do port=$(( 20000 + RANDOM % 20000 )); done
 echo "smoke test port: $port"
-(cd "$dir" && NINFER_PORT="$port" NINFER_MODEL_DIR=/root/models nohup ./run.sh qwen38-27b > /root/smoke-serve.log 2>&1 & echo $! > /root/smoke-serve.pid)
+# setsid may fork, so $! is not the new process group: the session leader writes its own pid.
+rm -f /root/smoke-serve.pid
+(cd "$dir" && NINFER_PORT="$port" NINFER_MODEL_DIR=/root/models setsid bash -c 'echo $$ > /root/smoke-serve.pid; exec ./run.sh qwen38-27b' \
+  > /root/smoke-serve.log 2>&1 < /dev/null &)
+for _ in $(seq 1 50); do [[ -s /root/smoke-serve.pid ]] && break; sleep 0.1; done
 pid="$(cat /root/smoke-serve.pid)"
-stop_server() { pkill -P "$pid" 2>/dev/null || true; kill "$pid" 2>/dev/null || true; }
+# run.sh runs the server inside a pipeline (`| tee`), so it is a grandchild that `pkill -P` misses and
+# that would keep the card busy after the script ends. setsid made $pid a process group: stop all of it.
+stop_server() {
+  kill -TERM -- "-$pid" 2>/dev/null || { echo "smoke server group $pid already gone"; return 0; }
+  for _ in $(seq 1 60); do kill -0 -- "-$pid" 2>/dev/null || return 0; sleep 1; done
+  kill -KILL -- "-$pid" 2>/dev/null || true
+  echo "smoke server group $pid killed after 60 s"
+}
 trap 'rc=$?; stop_server; if (( rc != 0 )); then echo FAILED >> "$status"; fi' EXIT
 ready=0
 for _ in $(seq 1 120); do
@@ -145,7 +157,7 @@ for name in $names; do
 done
 "$root/vast-dev-ssh.sh" 'cat /root/release-ldd.txt' > "$repo/dist/release-ldd-linux.txt"
 # Only the pair just pulled: dist/ may hold older releases' files, whose archives are not there.
-( cd "$repo/dist" && for sums in $(printf '%s\n' $names | grep '^SHA256SUMS-'); do shasum -a 256 -c "$sums"; done )
+( cd "$repo/dist" && for sums in $(printf '%s\n' $names | grep '^SHA256SUMS-'); do { sha256sum -c "$sums" 2>/dev/null || shasum -a 256 -c "$sums"; }; done )
 ls -l "$repo/dist"
 echo "Release commit: $commit"
 echo "Linux archive built, checked and smoke-tested on the real card. Destroy the instance with ./vast-destroy.sh when you are done."

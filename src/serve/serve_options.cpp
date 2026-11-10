@@ -1,6 +1,7 @@
 #include "serve/serve_options.h"
 
 #include <algorithm>
+#include "models/qwen3_5/lossy_options.h"
 #include "product/reasoning_loop_options.h"
 #include "product/speculative_options.h"
 
@@ -156,7 +157,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--prefill-stall-budget-ms N] [--yield-long-prefill-ms N] "
-           "[--prefill-decode-share P] [--prefill-layer-slices N] "
+           "[--prefill-decode-share P] [--prefill-layer-slices N] [--prefill-order rotate|shortest] "
+           "[--lossy-prefill-min-tokens N] [--lossy-prefill-strategy select|summary] "
            "[--log-stats-interval-ms N] "
            "[--device N] "
            "[--context-cost-presets FILE] "
@@ -164,13 +166,15 @@ std::string serve_usage_text(const char* argv0) {
            "[--media-preprocess-threads N] "
            "[--device-state-slots N] [--host-context-mib N | --auto-host-cache "
            "[--host-cache-reserve-mib N] [--host-cache-max-mib N] [--host-cache-percent N]] "
-           "[--request-log-jsonl FILE] "
+           "[--host-pause-reserve-mib N] "
+           "[--request-log-jsonl FILE] [--request-log-lossy-detail] "
            "[--context-store DIR [--context-store-max-gib N] [--context-store-ttl-hours N] "
            "[--context-store-idle-seconds N] [--context-store-restore-seconds N] "
            "[--context-store-flush-seconds N] [--context-store-compress] "
            "[--context-store-peer DIR]... [--context-store-peer-poll-ms N] "
            "[--context-store-s3-endpoint URL --context-store-s3-bucket NAME "
-           "[--context-store-s3-prefix P] [--context-store-s3-region R]]] "
+           "[--context-store-s3-prefix P] [--context-store-s3-region R] "
+           "[--context-store-s3-upload-delay-seconds N]]] "
            "[--no-exit-on-engine-failure] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] "
@@ -208,6 +212,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
+           "       --request-log-lossy-detail adds lossy_prefill.kept_runs (the kept offsets of the "
+           "filtered part) to request_done records, for the lossy sweep's kept-block overlap\n"
            "       --model-id overrides the artifact metadata.name reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
@@ -247,6 +253,32 @@ std::string serve_usage_text(const char* argv0) {
            "gap shrinks to a slice while the chunk keeps its size (so the prompt is not slowed "
            "the way a smaller --prefill-chunk or a stall budget slows it). Not for media, DFlash "
            "or a pipeline split; 0 or 1 is off, at most 16. Off by default\n"
+           "       --prefill-order rotate|shortest picks which resident prefill runs next. rotate "
+           "(the default) takes turns, so two long prompts both finish late; shortest runs the "
+           "earliest deadline first, a request's deadline being when it arrived plus its own "
+           "prefill time: short prompts overtake long ones, and waiting ages a long one so it is "
+           "never passed over for good\n"
+           "       --lossy-prefill-min-tokens N filters a prompt whose part after the product prompt "
+           "(leading system/developer messages and tools) has more than N tokens: a scout pass "
+           "scores blocks and only the kept ones are "
+           "prefilled (lossy: the dropped text is not seen by the model). Text-only Qwen3.5 dense, "
+           "not for private conversation reuse. 0 (the default) is off. Tuning: "
+           "--lossy-prefill-keep F (share of blocks kept, (0,1], default 0.3), "
+           "--lossy-prefill-filter-layer N (full-attention layer, default 7), "
+           "--lossy-prefill-block N (tokens, multiple of 16, default 64), "
+           "--lossy-prefill-recent N (always-kept tail tokens, default 4096), "
+           "--lossy-prefill-head N (always-kept head tokens, default 256), "
+           "--lossy-prefill-query-rows N (1-256, default 64), "
+           "--lossy-prefill-pool-window N (per-token max-pooling width, odd, default 33), "
+           "--lossy-prefill-skip F (keep everything when the kept share would exceed F, (0,1], at least "
+           "the keep share, default 0.8), "
+           "--lossy-prefill-scout-a4 (int4 scout GEMMs)\n"
+           "       --lossy-prefill-strategy select|summary picks how such a prompt is shortened: "
+           "select (the default) is the scout and block selection above; summary replaces the "
+           "middle of the conversation with one deterministic summary message (no model call) and "
+           "prefills that as an ordinary prompt, ignoring the selection knobs. Opt-in, for "
+           "comparison. --lossy-prefill-summary-max-tokens N bounds the summary at "
+           "min(0.06 x max_context, N) tokens, at least 1500 (default 8000)\n"
            "       --prefill-cublas hands wide prefill GEMMs to cuBLAS: a large prefill speedup for a "
            "small perplexity cost (docs/performance.md), off by default, and it wants a larger "
            "--prefill-chunk to pay; --no-prefill-cublas-projections keeps the attention and GDN "
@@ -277,11 +309,14 @@ std::string serve_usage_text(const char* argv0) {
            "not lose the context cache; it needs a nonzero Host context budget (Qwen3.8-Flash-Next: "
            "or an NVMe tier). "
            "--context-store-max-gib N bounds the store (default: half the volume's free "
-           "space); --context-store-ttl-hours N removes sessions unused that long (default 168, "
+           "space; with --context-store-peer a chunk shared by hard link counts as its size "
+           "divided by the engines holding it, so N is this engine's share of the physical "
+           "disk); --context-store-ttl-hours N removes sessions unused that long (default 168, "
            "0 keeps them until space is needed); --context-store-idle-seconds N writes a session "
            "unused that long in the background (default 30, 0 writes only at shutdown); "
-           "--context-store-restore-seconds N bounds start-up restoring and a request's wait for "
-           "its stored session (default 120); "
+           "--context-store-restore-seconds N bounds start-up restoring (of sessions on disk; a "
+           "bucket's are downloaded when a request asks for one) and a request's wait for its "
+           "stored session, a download included (default 120); "
            "--context-store-flush-seconds N bounds the write at shutdown (default 60); "
            "--context-store-compress writes new chunks zstd-compressed (about 8% smaller; "
            "off by default), on disk and in the bucket; chunks of both kinds are always read; "
@@ -298,7 +333,10 @@ std::string serve_usage_text(const char* argv0) {
            "AWS_SECRET_ACCESS_KEY; AWS_SESSION_TOKEN is honoured), never from the command line. "
            "--context-store-s3-prefix P namespaces the keys (a shared bucket); "
            "--context-store-s3-region R defaults to us-east-1. Expiry is the bucket's lifecycle "
-           "rule: use a 7-day expiration on the prefix\n"
+           "rule: use a 7-day expiration on the prefix. "
+           "--context-store-s3-upload-delay-seconds N waits that long before uploading a written "
+           "session (default 30): each turn's write supersedes the last, so a burst of turns is "
+           "uploaded once, and earlier turns are deleted from the bucket; shutdown uploads at once\n"
            "       --no-exit-on-engine-failure keeps the process alive when the Engine latches "
            "unavailable after repeated worker failures; by default it logs FATAL and exits with "
            "status 3 after a short grace period so a supervisor can restart it\n"
@@ -316,6 +354,10 @@ std::string serve_usage_text(const char* argv0) {
            "its container's limit) whatever is free at startup; the smallest of this, the cap and "
            "the free memory less the reserve applies. With vision on, the reserve also covers "
            "--media-cache-mib and --media-live-mib\n"
+           "       --host-pause-reserve-mib N keeps N MiB of the Host context budget for pause "
+           "snapshots (a request paused for memory, or a prefill yielding to the queue): cached "
+           "history never fills it, so a pause saves its progress without evicting anything. Off "
+           "by default\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --reasoning-loop off (default), stop or conclude: every 512 thinking tokens, "
@@ -448,6 +490,126 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (++i >= argc) { throw std::invalid_argument(std::string(flag) + " needs a value"); }
             return argv[i];
         };
+        // The context store and lossy prefill options are parsed in chains of their own: MSVC
+        // refuses an if/else-if chain nested past its limit (C1061), and the one below is long.
+        if (arg.rfind("--context-store", 0) == 0) {
+            if (arg == "--context-store") {
+                options.context_store_path = require_value("--context-store");
+                if (options.context_store_path.empty()) {
+                    throw std::invalid_argument("--context-store must not be empty");
+                }
+            } else if (arg == "--context-store-max-gib") {
+                const std::uint64_t gib =
+                    parse_u64(require_value("--context-store-max-gib"), "context-store-max-gib");
+                if (gib == 0 || gib > (std::numeric_limits<std::uint64_t>::max() >> 30)) {
+                    throw std::invalid_argument("--context-store-max-gib is out of range");
+                }
+                options.context_store_max_gib = gib;
+            } else if (arg == "--context-store-ttl-hours") {
+                options.context_store_ttl_hours = static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--context-store-ttl-hours"), "context-store-ttl-hours"));
+                context_store_tuning = true;
+            } else if (arg == "--context-store-idle-seconds") {
+                options.context_store_idle_seconds = static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--context-store-idle-seconds"), "context-store-idle-seconds"));
+                context_store_tuning = true;
+            } else if (arg == "--context-store-restore-seconds") {
+                options.context_store_restore_seconds = static_cast<std::uint32_t>(
+                    parse_nonnegative_int(require_value("--context-store-restore-seconds"),
+                                          "context-store-restore-seconds"));
+                context_store_tuning = true;
+            } else if (arg == "--context-store-flush-seconds") {
+                options.context_store_flush_seconds = static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--context-store-flush-seconds"), "context-store-flush-seconds"));
+                context_store_tuning = true;
+            } else if (arg == "--context-store-peer") {
+                const std::string directory = require_value("--context-store-peer");
+                if (directory.empty()) { throw std::invalid_argument("--context-store-peer needs a directory"); }
+                options.context_store_peers.emplace_back(directory);
+                context_store_tuning = true;
+            } else if (arg == "--context-store-peer-poll-ms") {
+                options.context_store_peer_poll_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--context-store-peer-poll-ms"), "context-store-peer-poll-ms"));
+                if (options.context_store_peer_poll_ms == 0) {
+                    throw std::invalid_argument("--context-store-peer-poll-ms must be at least 1");
+                }
+                context_store_tuning = true;
+            } else if (arg == "--context-store-compress") {
+                options.context_store_compress = true;
+                context_store_tuning           = true;
+            } else if (arg == "--context-store-s3-endpoint") {
+                options.context_store_s3_endpoint = require_value("--context-store-s3-endpoint");
+                context_store_tuning              = true;
+            } else if (arg == "--context-store-s3-bucket") {
+                options.context_store_s3_bucket = require_value("--context-store-s3-bucket");
+                context_store_tuning            = true;
+            } else if (arg == "--context-store-s3-prefix") {
+                options.context_store_s3_prefix = require_value("--context-store-s3-prefix");
+                context_store_tuning            = true;
+            } else if (arg == "--context-store-s3-region") {
+                options.context_store_s3_region = require_value("--context-store-s3-region");
+                context_store_tuning            = true;
+            } else if (arg == "--context-store-s3-upload-delay-seconds") {
+                options.context_store_s3_upload_delay_seconds =
+                    static_cast<std::uint32_t>(parse_nonnegative_int(
+                        require_value("--context-store-s3-upload-delay-seconds"),
+                        "context-store-s3-upload-delay-seconds"));
+                context_store_tuning = true;
+            } else {
+                throw std::invalid_argument("unknown argument: " + arg);
+            }
+            continue;
+        }
+        if (arg.rfind("--lossy-prefill-", 0) == 0) {
+            if (arg == "--lossy-prefill-min-tokens") {
+                options.lossy_prefill.min_tokens = static_cast<std::uint32_t>(
+                    parse_nonnegative_int(require_value("--lossy-prefill-min-tokens"),
+                                          "lossy-prefill-min-tokens"));
+            } else if (arg == "--lossy-prefill-keep") {
+                options.lossy_prefill.keep_fraction = parse_float_in(
+                    require_value("--lossy-prefill-keep"), "lossy-prefill-keep", 0.0F, 1000.0F);
+            } else if (arg == "--lossy-prefill-filter-layer") {
+                options.lossy_prefill.filter_layer = static_cast<std::uint32_t>(
+                    parse_nonnegative_int(require_value("--lossy-prefill-filter-layer"),
+                                          "lossy-prefill-filter-layer"));
+            } else if (arg == "--lossy-prefill-block") {
+                options.lossy_prefill.block_tokens = static_cast<std::uint32_t>(
+                    parse_nonnegative_int(require_value("--lossy-prefill-block"), "lossy-prefill-block"));
+            } else if (arg == "--lossy-prefill-recent") {
+                options.lossy_prefill.recent_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--lossy-prefill-recent"), "lossy-prefill-recent"));
+            } else if (arg == "--lossy-prefill-head") {
+                options.lossy_prefill.head_tokens = static_cast<std::uint32_t>(
+                    parse_nonnegative_int(require_value("--lossy-prefill-head"), "lossy-prefill-head"));
+            } else if (arg == "--lossy-prefill-query-rows") {
+                options.lossy_prefill.query_rows = static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--lossy-prefill-query-rows"), "lossy-prefill-query-rows"));
+            } else if (arg == "--lossy-prefill-pool-window") {
+                options.lossy_prefill.pool_window = static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--lossy-prefill-pool-window"), "lossy-prefill-pool-window"));
+            } else if (arg == "--lossy-prefill-skip") {
+                options.lossy_prefill.skip_fraction = parse_float_in(
+                    require_value("--lossy-prefill-skip"), "lossy-prefill-skip", 0.0F, 1000.0F);
+            } else if (arg == "--lossy-prefill-scout-a4") {
+                options.lossy_prefill.scout_a4 = true;
+            } else if (arg == "--lossy-prefill-strategy") {
+                const std::string value = require_value("--lossy-prefill-strategy");
+                if (value == "select") {
+                    options.lossy_prefill.strategy = LossyStrategy::Select;
+                } else if (value == "summary") {
+                    options.lossy_prefill.strategy = LossyStrategy::Summary;
+                } else {
+                    throw std::invalid_argument("--lossy-prefill-strategy must be select or summary");
+                }
+            } else if (arg == "--lossy-prefill-summary-max-tokens") {
+                options.lossy_prefill.summary_max_tokens = static_cast<std::uint32_t>(
+                    parse_nonnegative_int(require_value("--lossy-prefill-summary-max-tokens"),
+                                          "lossy-prefill-summary-max-tokens"));
+            } else {
+                throw std::invalid_argument("unknown argument: " + arg);
+            }
+            continue;
+        }
         if (arg == "--host") {
             options.host = require_value("--host");
         } else if (arg == "--port") {
@@ -490,6 +652,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.prefill_schedule.stall_budget_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-stall-budget-ms"),
                                       "prefill-stall-budget-ms"));
+        } else if (arg == "--request-log-lossy-detail") {
+            options.request_log_lossy_detail = true;
         } else if (arg == "--yield-long-prefill-ms") {
             options.prefill_schedule.yield_remaining_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--yield-long-prefill-ms"),
@@ -498,6 +662,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.prefill_schedule.decode_share_percent = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-decode-share"),
                                       "prefill-decode-share"));
+        } else if (arg == "--prefill-order") {
+            const std::string_view order = require_value("--prefill-order");
+            if (order == "rotate") {
+                options.prefill_schedule.order = PrefillOrder::Rotate;
+            } else if (order == "shortest") {
+                options.prefill_schedule.order = PrefillOrder::Shortest;
+            } else {
+                throw std::invalid_argument("--prefill-order must be rotate or shortest");
+            }
         } else if (arg == "--prefill-layer-slices") {
             options.prefill_schedule.layer_slices = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-layer-slices"),
@@ -556,6 +729,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.context_cache.host_cache_reserve_bytes = static_cast<std::size_t>(mib << 20);
             host_reserve_explicit                          = true;
+        } else if (arg == "--host-pause-reserve-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--host-pause-reserve-mib"), "host-pause-reserve-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--host-pause-reserve-mib is out of range");
+            }
+            options.context_cache.host_pause_reserve_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--host-cache-max-mib") {
             const std::uint64_t mib =
                 parse_u64(require_value("--host-cache-max-mib"), "host-cache-max-mib");
@@ -676,62 +856,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
-        } else if (arg == "--context-store") {
-            options.context_store_path = require_value("--context-store");
-            if (options.context_store_path.empty()) {
-                throw std::invalid_argument("--context-store must not be empty");
-            }
-        } else if (arg == "--context-store-max-gib") {
-            const std::uint64_t gib =
-                parse_u64(require_value("--context-store-max-gib"), "context-store-max-gib");
-            if (gib == 0 || gib > (std::numeric_limits<std::uint64_t>::max() >> 30)) {
-                throw std::invalid_argument("--context-store-max-gib is out of range");
-            }
-            options.context_store_max_gib = gib;
-        } else if (arg == "--context-store-ttl-hours") {
-            options.context_store_ttl_hours = static_cast<std::uint32_t>(parse_nonnegative_int(
-                require_value("--context-store-ttl-hours"), "context-store-ttl-hours"));
-            context_store_tuning = true;
-        } else if (arg == "--context-store-idle-seconds") {
-            options.context_store_idle_seconds = static_cast<std::uint32_t>(parse_nonnegative_int(
-                require_value("--context-store-idle-seconds"), "context-store-idle-seconds"));
-            context_store_tuning = true;
-        } else if (arg == "--context-store-restore-seconds") {
-            options.context_store_restore_seconds = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--context-store-restore-seconds"),
-                                      "context-store-restore-seconds"));
-            context_store_tuning = true;
-        } else if (arg == "--context-store-flush-seconds") {
-            options.context_store_flush_seconds = static_cast<std::uint32_t>(parse_nonnegative_int(
-                require_value("--context-store-flush-seconds"), "context-store-flush-seconds"));
-            context_store_tuning = true;
-        } else if (arg == "--context-store-peer") {
-            const std::string directory = require_value("--context-store-peer");
-            if (directory.empty()) { throw std::invalid_argument("--context-store-peer needs a directory"); }
-            options.context_store_peers.emplace_back(directory);
-            context_store_tuning = true;
-        } else if (arg == "--context-store-peer-poll-ms") {
-            options.context_store_peer_poll_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
-                require_value("--context-store-peer-poll-ms"), "context-store-peer-poll-ms"));
-            if (options.context_store_peer_poll_ms == 0) {
-                throw std::invalid_argument("--context-store-peer-poll-ms must be at least 1");
-            }
-            context_store_tuning = true;
-        } else if (arg == "--context-store-compress") {
-            options.context_store_compress = true;
-            context_store_tuning           = true;
-        } else if (arg == "--context-store-s3-endpoint") {
-            options.context_store_s3_endpoint = require_value("--context-store-s3-endpoint");
-            context_store_tuning              = true;
-        } else if (arg == "--context-store-s3-bucket") {
-            options.context_store_s3_bucket = require_value("--context-store-s3-bucket");
-            context_store_tuning            = true;
-        } else if (arg == "--context-store-s3-prefix") {
-            options.context_store_s3_prefix = require_value("--context-store-s3-prefix");
-            context_store_tuning            = true;
-        } else if (arg == "--context-store-s3-region") {
-            options.context_store_s3_region = require_value("--context-store-s3-region");
-            context_store_tuning            = true;
         } else if (arg == "--no-exit-on-engine-failure") {
             options.exit_on_engine_failure = false;
         } else if (arg == "--lm-head-draft") {
@@ -877,6 +1001,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (host_reserve_explicit && !options.context_cache.auto_host_cache) {
         throw std::invalid_argument("--host-cache-reserve-mib requires --auto-host-cache");
     }
+    if (options.context_cache.host_pause_reserve_bytes &&
+        options.context_cache.host_capacity_bytes &&
+        options.context_cache.host_pause_reserve_bytes >= *options.context_cache.host_capacity_bytes) {
+        throw std::invalid_argument("--host-pause-reserve-mib must be smaller than --host-context-mib");
+    }
     if (host_max_explicit && !options.context_cache.auto_host_cache) {
         throw std::invalid_argument("--host-cache-max-mib requires --auto-host-cache");
     }
@@ -916,9 +1045,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.context_store_s3_endpoint.empty() &&
         (!options.context_store_s3_prefix.empty() ||
-         options.context_store_s3_region != "us-east-1")) {
-        throw std::invalid_argument("--context-store-s3-prefix and --context-store-s3-region "
-                                    "require --context-store-s3-endpoint");
+         options.context_store_s3_region != "us-east-1" ||
+         options.context_store_s3_upload_delay_seconds != 30)) {
+        throw std::invalid_argument("--context-store-s3-prefix, --context-store-s3-region and "
+                                    "--context-store-s3-upload-delay-seconds require "
+                                    "--context-store-s3-endpoint");
     }
     if (!options.context_store_s3_endpoint.empty()) {
         const std::string& endpoint = options.context_store_s3_endpoint;
@@ -994,6 +1125,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.prefill_schedule.layer_slices > kMaximumPrefillLayerSlices) {
         throw std::invalid_argument("--prefill-layer-slices must be at most 16");
     }
+    models::qwen3_5::validate_lossy_prefill_options(options.lossy_prefill);
     product::apply_speculative_defaults(options.speculative);
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_residency == VisionResidency::Overlay && !options.enable_vision) {

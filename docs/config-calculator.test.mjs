@@ -127,21 +127,21 @@ check("decodeAtDepth: past the deepest measured point extrapolates", () => {
   assert.equal(d.exact, false);
 });
 
-// --- the PR's own verified example --------------------------------------------------------------
-// From the PR description: requesting a 262,144-token INT8 context on the 27B with no speculation
-// is refused by the real engine with "minimum Engine runtime reservation requires 9197389568
-// bytes" -- an *incremental* reservation on top of already-resident weights, not the full device
-// footprint. The page's own terms (KV + fixed sequence state + per-token remainder + workspace +
+// --- the engine's own figure for the 27B ----------------------------------------------------------
+// A 262,144-token INT8 context on the 27B (this fork's 3090 conversion) with no speculation fits a
+// headless RTX 3090, and ninfer_bench reports its runtime reservation -- sequence + workspace + graph
+// allowance, an *incremental* reservation on top of the resident weights -- as 9,181,618,688 bytes
+// (2026-10-24; Qwen3.6-27B, same geometry, is refused for exactly the same figure). The page's own terms (KV + fixed sequence state + per-token remainder + workspace +
 // graph allowance, excluding weights) are stated to sum to exactly that. Reproducing it here pins
 // that agreement as a regression instead of a one-off manual check.
-check("golden: 262144-token int8, no speculation, 27B matches the engine's own refusal figure", () => {
+check("golden: 262144-token int8, no speculation, 27B matches the engine's reported reservation", () => {
   const model = model27b;
   const ctx = 262144;
   const none = model.spec.none;
   const kvBytes = (model.kv.int8 * none.kvRatio + none.kvExtraPerToken) * pageRoundUp(ctx);
   const ovhBytes = none.seqFixedBytes + none.seqPerToken * ctx;
   const reservation = kvBytes + ovhBytes + model.workspaceBytes + graphBytes(none, ctx);
-  assert.equal(reservation, 9197389568);
+  assert.equal(reservation, 9181618688);
 });
 
 // --- and the same cross-check for a *speculative* configuration ---------------------------------
@@ -150,9 +150,9 @@ check("golden: 262144-token int8, no speculation, 27B matches the engine's own r
 // scripts/sweeps/speculative-memory-terms.ps1, the engine can be asked the same question:
 //
 //   ninfer qwen3_8_27b.ninfer --max-context 262144 --kv-dtype int8 --spec mtp --draft-tokens 3 //       --lm-head-draft
-//   error: requested Engine runtime reservation requires 9838038272 bytes
+//   error: requested Engine runtime reservation requires 9822361600 bytes   (2026-10-24)
 //
-// The page's terms reproduce that to 0.044%. The remaining 4.3 MB on 9.84 GB is page-rounding in
+// The page's terms reproduce that to 0.021%. The remaining 2 MB on 9.82 GB is page-rounding in
 // the engine's own allocator, which this page models at KV-page granularity only.
 //
 // For scale, the model this page used before carrying per-mode terms came out 611 MiB *short* of
@@ -165,16 +165,48 @@ check("golden: 262144-token int8 with MTP3 + draft head is within 0.1% of the en
   const kvBytes = (model.kv.int8 * spec.kvRatio + spec.kvExtraPerToken) * pageRoundUp(ctx);
   const ovhBytes = spec.seqFixedBytes + spec.seqPerToken * ctx;
   const reservation = kvBytes + ovhBytes + model.workspaceBytes + graphBytes(spec, ctx);
-  const engine = 9838038272;
+  const engine = 9822361600;
   const error = Math.abs(reservation - engine) / engine;
   assert.ok(error < 0.001, `reservation ${reservation} vs engine ${engine} (${(error * 100).toFixed(3)}%)`);
 });
+
+// --- the same two cross-checks for Bonsai and Qwen3.6-27B ---------------------------------------
+// Both measured 2026-10-24 in the calculator's session. Qwen3.6-27B does not fit 262,144 int8
+// beside its weights, so its figures are the engine's refusals:
+//
+//   ninfer_bench --weights qwen3_6_27b.ninfer --kv-dtype int8 --max-ctx 262144 -n 1
+//   error: requested Engine runtime reservation requires 9181618688 bytes
+//   ... --spec mtp --draft-tokens 3 --lm-head-draft
+//   error: requested Engine runtime reservation requires 9822361600 bytes
+//
+// Bonsai's weights are 8.9 GiB lighter, so both configurations fit and the figures are its reported
+// reservation (sequence + workspace + graph allowance): 9,183,478,272 and 9,824,221,184 bytes.
+// No speculation reproduces to the byte; MTP3 + draft head is within the same 0.021% of allocator
+// page rounding as the 27B above.
+function reservationAt262k(model, specKey) {
+  const ctx = 262144;
+  const spec = model.spec[specKey];
+  const kvBytes = (model.kv.int8 * spec.kvRatio + spec.kvExtraPerToken) * pageRoundUp(ctx);
+  const ovhBytes = spec.seqFixedBytes + spec.seqPerToken * ctx;
+  return kvBytes + ovhBytes + model.workspaceBytes + graphBytes(spec, ctx);
+}
+for (const [key, none, mtp] of [["bonsai", 9183478272, 9824221184],
+                                ["q36-27b", 9181618688, 9822361600]]) {
+  check(`golden: 262144-token int8, no speculation, ${key} matches the engine exactly`, () => {
+    assert.equal(reservationAt262k(DATA.models[key], "none"), none);
+  });
+  check(`golden: 262144-token int8 with MTP3 + draft head, ${key} is within 0.1% of the engine`, () => {
+    const reservation = reservationAt262k(DATA.models[key], "mtp3+head");
+    const error = Math.abs(reservation - mtp) / mtp;
+    assert.ok(error < 0.001, `reservation ${reservation} vs engine ${mtp} (${(error * 100).toFixed(3)}%)`);
+  });
+}
 
 // --- DFlash v1 on the 35B, which the model reproduces exactly ----------------------------------
 // The strongest cross-check available, and the one that settles how DFlash should be modelled:
 //
 //   ninfer qwen3_6_35b_a3b.ninfer --max-context 262144 --kv-dtype int8 --spec dflash --draft-tokens 3
-//   error: requested Engine runtime reservation requires 4312377600 bytes
+//   error: requested Engine runtime reservation requires 4424237056 bytes   (2026-10-24)
 //
 // The page's terms reproduce that figure *to the byte*. They only do so because DFlash's extra KV
 // is modelled as a fixed 4,096 bytes per token rather than as a multiplier: measured, the extra is
@@ -192,7 +224,7 @@ check("golden: 262144-token int8 with DFlash-3 on the 35B matches the engine exa
   const kvBytes = (model.kv.int8 * spec.kvRatio + spec.kvExtraPerToken) * pageRoundUp(ctx);
   const ovhBytes = spec.seqFixedBytes + spec.seqPerToken * ctx;
   const reservation = kvBytes + ovhBytes + model.workspaceBytes + graphBytes(spec, ctx);
-  assert.equal(reservation, 4312377600);
+  assert.equal(reservation, 4424237056);
 });
 
 // --- DFlash's extra KV is per token, not per format --------------------------------------------
@@ -210,14 +242,14 @@ check("DFlash's extra KV is a fixed 4096 bytes per token across formats", () => 
 });
 
 // --- the DFlash2 graph allowance is a step in context -------------------------------------------
-// Measured 288 MiB at 8,192 and 384 MiB at 16,384 and 32,768. A flat value would understate the
-// deeper contexts by 96 MiB, and using the deeper value everywhere would overstate 8,192 by the
+// Measured 392 MiB at 8,192 and 584 MiB at 16,384 and 32,768. A flat value would understate the
+// deeper contexts by 192 MiB, and using the deeper value everywhere would overstate 8,192 by the
 // same. Pin both sides so a future edit cannot quietly flatten it.
 check("graphBytes: DFlash2's allowance steps with context, other modes are flat", () => {
-  const spec = model27b.spec["dflash2-7"];
-  assert.equal(graphBytes(spec, 8192), 288 * MIB);
-  assert.equal(graphBytes(spec, 16384), 384 * MIB);
-  assert.equal(graphBytes(spec, 262144), 384 * MIB);
+  const spec = model27b.spec["dflash2-7+head"];
+  assert.equal(graphBytes(spec, 8192), 392 * MIB);
+  assert.equal(graphBytes(spec, 16384), 584 * MIB);
+  assert.equal(graphBytes(spec, 262144), 584 * MIB);
   const mtp = model27b.spec["mtp3+head"];
   assert.equal(graphBytes(mtp, 8192), 86 * MIB);
   assert.equal(graphBytes(mtp, 262144), 86 * MIB);

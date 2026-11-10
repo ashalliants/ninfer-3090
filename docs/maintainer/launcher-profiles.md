@@ -118,6 +118,16 @@ defaults stay as measured: `NINFER_MAX_OUTPUT_TOKENS`, `NINFER_MLP_A8_DECODE=on`
 itself and refuses `--host-context-mib`, so with it on the launcher drops that flag and
 `NINFER_HOST_CONTEXT_MIB` (and the host retry's halving of it) is ignored.
 
+Every other `ninfer-serve` flag that needs no launcher logic of its own is a pass-through, in every profile:
+set `NINFER_<FLAG>` (the flag upper-cased, dashes to underscores: `--prefill-stall-budget-ms` is
+`NINFER_PREFILL_STALL_BUDGET_MS`) and `run.sh` / `run.bat` append `--flag value`. Switches such as `--cors`,
+`--tolerant-tool-calls` or `--no-cuda-graph` take `on` or `off` (`NINFER_CORS=on`); any other value stops the
+launcher with exit 2. Unset variables pass nothing, so the profiles stay as measured. A set variable is appended after the profile's
+own arguments, so it wins over a value the profile fixes (e.g. `NINFER_DEVICE_STATE_SLOTS` over the `c8` profile's). The full list is under
+"EVERY OTHER ninfer-serve FLAG" at the top of each script. Left out on purpose: flags a profile sets itself,
+the repeatable `--graft` and `--context-store-peer`, router mode (`--models-*`), and, in `run.sh`, the
+Flash-Next-only flags (the S3 store reads its credentials from `NINFER_S3_*` in the environment).
+
 `NINFER_REASONING_LOOP` maps to `--reasoning-loop`; any other value stops the launcher with exit 2,
 and a set value is echoed in the banner. Its default stays `off` (nothing passed, the server's own
 default) on the evidence in #217: across 21 thinking requests on the 27B, including one written to

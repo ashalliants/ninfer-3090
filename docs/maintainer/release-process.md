@@ -7,7 +7,7 @@ or very nearly shipped a broken archive.
 ## The flow
 
 1. **Prepare.** Branch `release/vX.Y.Z` from `master`. Set `VERSION` to the full tag (for example
-   `0.11.0-rtx3090`), write `RELEASE_NOTES_X.Y.Z.md`, refresh the README highlights, open a PR and
+   `0.11.0-rtx3090`), write `docs/release-notes/RELEASE_NOTES_X.Y.Z.md`, refresh the README highlights, open a PR and
    merge it. Everything version-specific is derived from `VERSION` by the packagers; there is nothing
    to copy and edit.
 2. **Build both platforms from the same commit, after `VERSION` is set.** The binaries embed
@@ -28,7 +28,7 @@ or very nearly shipped a broken archive.
 4. **Smoke-test on the real machine** (below), not just the unit tests.
 5. **Publish.** Merge the release PR, tag the merge commit (annotated), push the tag, then
    `gh release create vX.Y.Z-rtx3090 <zip> <tar.gz> <both SHA256SUMS files> -R ashalliants/ninfer-3090
-   --notes-file RELEASE_NOTES_X.Y.Z.md --title "..." --latest`.
+   --notes-file docs/release-notes/RELEASE_NOTES_X.Y.Z.md --title "..." --latest`.
 
 ## Gotchas
 
@@ -100,12 +100,48 @@ Compiling needs the CUDA toolkit, not a card, so a release can be cut with the 3
 for being away from it (a handoff for a fresh agent is in `release-away-from-3090.md`); the Windows half was run end to end for v0.16.1 (below); the Vast half has not been run yet, so expect a snag or two there
 and record them here.
 
-- **Linux archive: a rented Vast 3090.** `scripts/vast/vast-release-linux.sh <repo>` (copy it into the `vast-ninfer` scripts
-  directory, beside `vast-dev-launch.sh`) syncs the committed release commit to the dev instance,
-  builds `ninfer ninfer-serve ninfer_bench` from a `git archive` of it, runs `package-release.sh`,
-  checks `--version`, `ldd` and the checksums, serves one chat completion with the default profile on
-  the real card, and pulls the archive back into `dist/`. The instance image is Ubuntu 24.04 with CUDA
-  12.8.1, the baseline `docs/release-archive-linux.md` documents.
+- **Linux archive: a rented Vast 3090.** Run from `scripts/vast/` (all four scripts below use a state file,
+  `~/.cache/ninfer-release/instance_id`, so they can only touch the instance they rented, never another box
+  on the same account that may be serving traffic):
+  1. `./vast-up.sh [repo-dir] [hours]` rents the verified 3090 with at least 16 effective cores that costs least for the whole job (GPU hours plus the host's per-GB download and upload prices; `NINFER_VAST_EST_HOURS`, `NINFER_VAST_DOWN_GB` and `NINFER_VAST_UP_GB` set the estimate, and it prints the candidates it will try), narrows the search with Vast's `gpu_max_power` (350 W at the default 100%; its docs do not say whether that is the enforced limit, so each candidate prints it), checks the booted card's power limit and, if a host has capped it below `NINFER_VAST_MIN_POWER_PCT` of the card's default (100 by default; 0 turns the check off, which is fine for a build that times nothing), destroys that host and tries the next, up to `NINFER_VAST_MAX_HOSTS` (4), installs the
+     build dependencies, arms an on-box kill switch (default 3 h) and downloads the 27B model for the smoke
+     test. About 5 minutes. Bandwidth can cost more than the GPU: the v0.17.0 box was $0.85, of which $0.53 was 14 GB of transfer. A host stuck in "loading", or any failure after the rental, destroys the instance; run it again. The ssh key is `NINFER_VAST_KEY`, else `~/.ssh/id_rsa_ash`, else `~/.ssh/id_ed25519`, always with `IdentityAgent=none`. The model downloader sent to the box is the one in the release commit.
+  2. `./vast-release-linux.sh <repo>` (the release commit checked out and clean) syncs the commit, builds
+     `ninfer ninfer-serve ninfer_bench` from a `git archive` of it, runs `package-release.sh`, checks
+     `--version`, `ldd` and the checksums, serves one chat completion with the default profile on the real
+     card, and pulls the archive into `dist/`. The build is detached on the instance and polled.
+  3. `./vast-destroy.sh` when the archive is back. Do not leave it running.
+
+  The instance image is Ubuntu 24.04 with CUDA 12.8.1, the baseline `docs/release-archive-linux.md`
+  documents. v0.16.2 was cut this way by hand (same steps, before these helpers existed): cold build 5 min
+  on 24 effective cores, `nproc` there reports 192, so the build caps `-j` at 32. v0.17.0 ran the helpers
+  end to end (a Quebec host, $0.26/h, 22 cores: cold build about 15 minutes, a rerun about 5 with ccache).
+  What it hit:
+  - **The smoke test's server outlived the script** until the fix in v0.17.0: `run.sh` runs `ninfer-serve`
+    in a pipeline, so it is a grandchild of the launcher, and a second `vast-release-linux.sh` on the same
+    box failed with "not enough free GPU memory". The script now starts the launcher under `setsid` and
+    stops its process group. If a run still leaves a `ninfer-serve` on the card, stop it by PID before rerunning.
+  - **Another model for the smoke test:** copy the scripts elsewhere, change `download-model.sh qwen38-27b`
+    in `vast-up.sh`, and put `NINFER_MODEL=/root/models/<artifact>` before `./run.sh` in
+    `vast-release-linux.sh`. Bonsai 2 27B (8.9 GiB) serves under the `qwen38-27b` profile.
+    `NINFER_VAST_STATE=<dir>` keeps the copy's state file apart. To avoid a region, filter the offers on
+    `geolocation` in `vast-up.sh`.
+  - Every commit after the build needs a rebuild on the box (the script refuses a remote HEAD that differs).
+    A rerun is about 5 minutes on ccache, so fix first, then rerun, rather than waiting for the first run.
+  - **v0.17.2 ran the helpers cleanly** (an Ontario host, 16 cores, about $0.29 estimated): `vast-up.sh` about 5
+    minutes, then `vast-release-linux.sh` about 15 minutes to a pulled-back archive. Run `vast-destroy.sh` the
+    moment the archive is in `dist/` and delete any `send_later` backstop.
+  - **Editing the notes after the Linux archive exists does not need another box.** The tarball embeds
+    `RELEASE_NOTES_X.Y.Z.md` and an inner `SHA256SUMS.txt`. Extract it to a scratch directory, copy the final
+    notes in, regenerate the inner sums exactly as `package-release.sh` does (`find . -maxdepth 1 -type f !
+    -name SHA256SUMS.txt -print0 | LC_ALL=C sort -z`, then `sha256sum`), re-pack with
+    `tar -C "$scratch" --owner=root --group=root -czf "$archive" "$product_name"` (the original entries are
+    root-owned; `$scratch` is the directory you extracted into, `$product_name` the single top-level
+    directory it contains, `ninfer-rtx3090-linux-x64-<tag>`, and `$archive` the tarball to replace, in
+    `dist/`, which is where the checksum step looks; this mirrors the `tar -C "$dist_root"` line in
+    `package-release.sh`) and rewrite
+    `SHA256SUMS-vX.Y.Z-linux.txt`. Check the inner sums, the outer sum and `diff` the embedded notes. Re-packing
+    1 GB takes a couple of minutes, so run it in the background.
 - **Windows archive: any x64 Windows machine, no NVIDIA GPU needed.** `scripts/release-windows.ps1`
   installs the toolchain (VS 2022 Build Tools, CMake, Ninja, CUDA 12.8.1 without the driver, vcpkg at the
   manifest baseline, ccache), builds the three products and runs the packager.
@@ -123,6 +159,36 @@ and record them here.
   dependency-checked but not run, and the first chance to run it should be taken.
 - **Using CUDA 12.8.1 on both platforms** keeps one cuBLAS to reason about. Do not move the Windows build
   to a newer toolkit for speed without measuring it on the card.
+
+### Windows without a card, from WSL: `scripts/release-windows-wsl.sh`
+
+On the GPU-less Windows machine whose WSL you are in (the GMKtec box), with the toolchain installed once
+(below), one command builds, packages and verifies the zip and copies it to `dist/`:
+`scripts/release-windows-wsl.sh` (committed HEAD only). It sends the commit as a git bundle (nothing to
+push), checks it out in `C:\ninfer-release\src` through `powershell.exe`, and runs
+`release-windows.ps1 -SkipBootstrap`. v0.16.2 did the same steps by hand: about 25 minutes with a warm
+ccache, then 5 minutes for each repackage. Traps:
+- **Run git on `C:\ninfer-release\src` through `powershell.exe`, never from WSL.** From WSL over `/mnt/c`
+  `git status` took over two minutes (and hit the tool timeout) and listed files as modified that were
+  not.
+- **`powershell.exe` is not on the WSL `PATH`**; the script uses
+  `/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`.
+- **Package twice.** The zip embeds the notes, so a notes edit changes its hash; rerunning the script is
+  incremental and removes the old `dist/*<version>*` first.
+- The first run of `release-windows.ps1` without the notes in the checkout compiles everything and then
+  fails at packaging with "Missing docs/release-notes/RELEASE_NOTES_X.Y.Z.md": commit the notes before building, or just rerun.
+- **This build is the only MSVC compile of `master`.** CI builds Linux only, so a Windows-only compile
+  error surfaces here first. v0.17.0 found `src/serve/serve_options.cpp` failing with `C1061: blocks nested
+  too deeply`: MSVC limits an if/else-if chain to about 128 levels, and the option parser had passed it.
+  New flags with a shared prefix go in their own chain ahead of the main one, as `--context-store*` and
+  `--lossy-prefill-*` do.
+- **Run the script by absolute path from the repository root.** A background shell that drifted into `dist/`
+  failed instantly with `scripts/release-windows-wsl.sh: No such file or directory` (exit 127), which looks
+  like a completed task.
+- **The notes inside the Windows zip have CRLF line endings** (the checkout on `C:` converts them). When
+  comparing them with the committed file use `diff --strip-trailing-cr`; the Linux copy matches byte for byte.
+- A `-SkipBootstrap` run needs 20 GB free on C: (the full bootstrap needs 50 GB). The GMKtec box had 29 GB
+  in 2026-10; old releases' zips in `C:\ninfer-release\src\dist` take about 1.6 GB each once published.
 
 ### Windows without a card: what the v0.16.1 run needed
 

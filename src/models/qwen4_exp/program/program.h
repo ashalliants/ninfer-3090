@@ -118,7 +118,8 @@ using ExecutionUnitKind  = qwen3_5::ExecutionUnitKind;
 
 struct ContextDemotion {
     std::vector<CheckpointHandle> sources;
-    std::size_t host_bytes = 0;
+    std::size_t host_bytes     = 0;
+    std::size_t host_placeable = 0;
     runtime::ContextResourceUsage released;
 };
 
@@ -201,6 +202,7 @@ public:
     }
     [[nodiscard]] std::uint32_t row_stride() const noexcept { return stride_; }
     [[nodiscard]] bool constraint_failed(std::size_t row) const { return constraint_failed_.at(row); }
+    [[nodiscard]] bool token_domain_failed(std::size_t) const noexcept { return false; }
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
 
 private:
@@ -310,6 +312,10 @@ struct PhysicalUsageSnapshot {
     std::size_t host_free_extents          = 0;
     std::uint64_t host_geometry_failures   = 0;
     std::uint64_t host_shortage_failures   = 0;
+    // The pause snapshot reserve (ContextCacheOptions::host_pause_reserve_bytes) and the bytes in it
+    // now. `occupied`/`capacity` above cover only the rest, which is what the context cache plans with.
+    std::size_t host_pause_reserve_bytes          = 0;
+    std::size_t host_pause_reserve_occupied_bytes = 0;
 };
 
 // Device memory a Program allocates besides its expert frames, from the options and the model's
@@ -438,6 +444,7 @@ public:
     [[nodiscard]] std::size_t host_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
     [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle) const { return std::nullopt; }
     [[nodiscard]] std::size_t pause_state_image_unplaced(SequenceHandle) const { return 0; }
+    [[nodiscard]] bool pause_snapshot_fits(SequenceHandle) const { return false; }
     // Drops the lane's references to Host pages no checkpoint holds (a capture then copies them
     // again), except for `pending_backup`'s lane. Returns the bytes freed.
     [[nodiscard]] std::size_t release_redundant_host(std::span<const CheckpointHandle> excluded,
@@ -509,9 +516,11 @@ public:
     // no open context transaction or pending unit; an image binds to this Program's page and state
     // layout and to the caller's model binding, and import rejects any other with
     // std::invalid_argument. Import returns nullopt when the cache has no room for it now.
+    // `buffer`, when given, is reused for the image's bytes (see qwen3_5::Program).
     [[nodiscard]] CheckpointImage export_checkpoints(std::span<const CheckpointHandle> points,
                                                      const std::optional<PreparedSessionKey>& session,
-                                                     std::string_view binding) const;
+                                                     std::string_view binding,
+                                                     std::vector<std::uint8_t> buffer = {}) const;
     [[nodiscard]] std::size_t checkpoint_image_host_bytes(std::span<const std::uint8_t> image, std::string_view binding) const;
     [[nodiscard]] std::optional<ImportedCheckpoints> import_checkpoints(std::span<const std::uint8_t> image,
                                                                         std::string_view binding);

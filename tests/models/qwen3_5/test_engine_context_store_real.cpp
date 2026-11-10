@@ -509,8 +509,9 @@ int exercise_recovery(const char* artifact, const fs::path& root, const Control&
 }
 
 // With an S3-compatible bucket (NINFER_TEST_S3_ENDPOINT, NINFER_TEST_S3_BUCKET; credentials from
-// AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY): a second Engine with an empty directory starts warm
-// from what the first uploaded at shutdown.
+// AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY): a second Engine with an empty directory downloads
+// nothing at start-up, then fetches the session the first uploaded at shutdown when the next turn
+// asks for it, and continues exactly as the warm control.
 int exercise_bucket(const char* artifact, const fs::path& root, const Control& control) {
     const char* endpoint = std::getenv("NINFER_TEST_S3_ENDPOINT");
     const char* bucket   = std::getenv("NINFER_TEST_S3_BUCKET");
@@ -543,22 +544,35 @@ int exercise_bucket(const char* artifact, const fs::path& root, const Control& c
         uploaded = engine.runtime_stats().context_store_remote_uploads;
     }
     ninfer::Engine engine(options(root / "bucket-reader"));
-    const auto stats = engine.runtime_stats();
-    if (stats.context_store_restored != 1 || stats.context_store_remote_downloads == 0) {
-        std::cerr << "bucket: a fresh directory did not restore from the bucket: restored="
-                  << stats.context_store_restored
-                  << " downloads=" << stats.context_store_remote_downloads
-                  << " failures=" << stats.context_store_remote_download_failures << '\n';
+    const auto started = engine.runtime_stats();
+    if (started.context_store_restored != 0 || started.context_store_remote_downloads != 0) {
+        std::cerr << "bucket: start-up downloaded from the bucket: restored="
+                  << started.context_store_restored
+                  << " downloads=" << started.context_store_remote_downloads << '\n';
+        return 1;
+    }
+    // The start-up listing registers the session (a short turn does not wait for a listing).
+    if (!wait_for([&] { return engine.runtime_stats().context_store_remote_images >= 1; },
+                  std::chrono::seconds(60))) {
+        std::cerr << "bucket: the start-up listing did not register the uploaded session\n";
         return 1;
     }
     const auto next = engine.generate(
         engine.prepare(conversation(next_turn(kShortFirst, control.reply, kShortQuestion))),
         greedy(continuation_tokens()));
+    const auto stats = engine.runtime_stats();
+    if (stats.context_store_hydrations != 1 || stats.context_store_hydration_failures != 0 ||
+        stats.context_store_remote_download_bytes == 0) {
+        std::cerr << "bucket: the next turn did not fetch the session: hydrations="
+                  << stats.context_store_hydrations
+                  << " failures=" << stats.context_store_hydration_failures
+                  << " downloaded=" << stats.context_store_remote_download_bytes
+                  << " download failures=" << stats.context_store_remote_download_failures << '\n';
+        return 1;
+    }
     if (check_continuation(next, control, "bucket") != 0) { return 1; }
-    std::cout << "bucket: restored " << stats.context_store_restored_bytes << " bytes ("
-              << stats.context_store_remote_download_bytes << " downloaded) in "
-              << stats.context_store_restore_seconds << " s; writer uploads before shutdown "
-              << uploaded << '\n';
+    std::cout << "bucket: fetched " << stats.context_store_remote_download_bytes
+              << " bytes for the next turn; writer uploads before shutdown " << uploaded << '\n';
     return 0;
 }
 
@@ -617,6 +631,105 @@ int exercise_damaged(const char* artifact, const fs::path& root) {
                   << '\n';
         return 1;
     }
+    return 0;
+}
+
+// A conversation is written once per state, whatever the store does to other images:
+//   superseding  a second turn of B, whose image replaces B's first, rewrites nothing else
+//   space        in a store with room for one session, B evicts A, and A is not written back
+//                (which would evict B, and so on)
+// Before this held, any removal had every idle conversation written again, one a second, so a
+// busy store wrote the same sessions over and over.
+int exercise_rewrite(const char* artifact, const fs::path& root) {
+    const std::vector<std::string> first_a{"List three uses for a lathe in a small workshop, one line each."};
+    const std::vector<std::string> first_b{"List three uses for a drill press in a small workshop, one line each."};
+    // Waits for `writes` idle writes, then for six more idle scans, and checks none followed.
+    const auto settle = [](ninfer::Engine& engine, std::uint64_t writes,
+                           std::string_view label) -> int {
+        if (!wait_for([&] { return engine.runtime_stats().context_store_idle_writes >= writes; },
+                      std::chrono::seconds(60))) {
+            std::cerr << "rewrite " << label << ": " << writes << " idle writes did not happen: "
+                      << engine.runtime_stats().context_store_idle_writes << '\n';
+            return 1;
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(6));
+        const auto stats = engine.runtime_stats();
+        if (stats.context_store_idle_writes != writes) {
+            std::cerr << "rewrite " << label << ": " << stats.context_store_idle_writes
+                      << " idle writes where " << writes << " were due: an unchanged session was "
+                      << "written again\n";
+            return 1;
+        }
+        return 0;
+    };
+    std::uint64_t session_bytes = 0;
+    {
+        ninfer::Engine engine(
+            with_store(store_engine_options(artifact), root / "rewrite", std::chrono::seconds(1)));
+        (void)engine.generate(engine.prepare(conversation(first_a)), greedy());
+        if (settle(engine, 1, "superseding") != 0) { return 1; }
+        session_bytes = engine.runtime_stats().context_store_used_bytes;
+        const auto reply = engine.generate(engine.prepare(conversation(first_b)), greedy());
+        if (settle(engine, 2, "superseding") != 0) { return 1; }
+        (void)engine.generate(
+            engine.prepare(conversation(next_turn(first_b, reply.content, kShortQuestion))),
+            greedy());
+        if (settle(engine, 3, "superseding") != 0) { return 1; }
+        const auto stats = engine.runtime_stats();
+        std::cout << "rewrite superseding: 3 idle writes in "
+                  << stats.context_store_idle_export_seconds << " s of export, none repeated; "
+                  << stats.context_store_images << " images held, " << stats.context_store_evicted
+                  << " superseded\n";
+        if (stats.context_store_evicted == 0) {
+            std::cerr << "rewrite superseding: B's second turn did not supersede its first, so the "
+                         "removal this case is about never happened\n";
+            return 1;
+        }
+    }
+    {
+        auto options = with_store(store_engine_options(artifact), root / "rewrite-space",
+                                  std::chrono::seconds(1));
+        // Room for one of the two sessions, which are about the same size.
+        options.context_store.max_bytes = session_bytes + session_bytes / 2;
+        ninfer::Engine engine(std::move(options));
+        (void)engine.generate(engine.prepare(conversation(first_a)), greedy());
+        if (settle(engine, 1, "space") != 0) { return 1; }
+        (void)engine.generate(engine.prepare(conversation(first_b)), greedy());
+        if (settle(engine, 2, "space") != 0) { return 1; }
+        const auto stats = engine.runtime_stats();
+        if (stats.context_store_images != 1 || stats.context_store_evicted == 0) {
+            std::cerr << "rewrite space: the store did not keep one session and evict the other: "
+                      << "images=" << stats.context_store_images
+                      << " evicted=" << stats.context_store_evicted << '\n';
+            return 1;
+        }
+        std::cout << "rewrite space: B evicted A (" << session_bytes << "-byte sessions, "
+                  << stats.context_store_used_bytes << " bytes held); A was not written back\n";
+    }
+    return 0;
+}
+
+// A flush (Engine::flush_context_store) writes a conversation idle writes would not, while the
+// Engine keeps serving: with idle writes off, a finished turn is unsaved until the flush.
+int exercise_flush(const char* artifact, const fs::path& root) {
+    ninfer::Engine engine(
+        with_store(store_engine_options(artifact), root / "flush", std::chrono::seconds(0)));
+    (void)engine.generate(engine.prepare(conversation(kShortFirst)), greedy());
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    if (engine.runtime_stats().context_store_writes != 0) {
+        std::cerr << "flush: the session was written with idle writes off\n";
+        return 1;
+    }
+    const auto report = engine.flush_context_store(std::chrono::seconds(60));
+    const auto stats  = engine.runtime_stats();
+    if (report.written != 1 || report.unsaved != 0 || !report.uploaded ||
+        stats.context_store_images != 1) {
+        std::cerr << "flush: written=" << report.written << " unsaved=" << report.unsaved
+                  << " uploaded=" << report.uploaded << " images=" << stats.context_store_images
+                  << '\n';
+        return 1;
+    }
+    std::cout << "flush: wrote 1 session in " << report.seconds << " s\n";
     return 0;
 }
 
@@ -685,6 +798,12 @@ int main(int argc, char** argv) {
         }
         if (scenario == "all" || scenario == "bucket") {
             if (exercise_bucket(artifact, root, short_control) != 0) { return 1; }
+        }
+        if (scenario == "all" || scenario == "flush") {
+            if (exercise_flush(artifact, root) != 0) { return 1; }
+        }
+        if (scenario == "all" || scenario == "rewrite") {
+            if (exercise_rewrite(artifact, root) != 0) { return 1; }
         }
         if (scenario == "all" && exercise_foreign(artifact, root) != 0) { return 1; }
         if (scenario == "all" && exercise_damaged(artifact, root) != 0) { return 1; }

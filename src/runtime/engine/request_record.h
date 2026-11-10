@@ -4,6 +4,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/engine/generation_budget.h"
+#include "runtime/engine/compaction/summary_rewrite.h"
 #include "runtime/engine/context_cache/types.h"
 
 #include <atomic>
@@ -110,6 +111,28 @@ enum class EngineRequestState : std::uint8_t {
     ModelFinished,
 };
 
+// A request on the lossy prefill path, as the Engine follows it (EngineCore, lossy_prefill.h).
+struct LossyPrefillState {
+    enum class Phase : std::uint8_t {
+        Planned, // admission chose it; enable_lossy runs once the binding publishes
+        Exact,   // prefilling exactly up to M
+        Scout,   // the scout runs: the lane cannot pause
+        Main,    // the outcome is known; prefilling the kept tokens (or all of U)
+        Ended,   // counted: completed, or aborted before its outcome
+    };
+    Phase phase             = Phase::Planned;
+    std::uint32_t exact_end = 0; // M
+    std::uint32_t scouted   = 0; // tokens of U the scout has covered
+    std::optional<LossyPrefillReport> report;
+    std::uint64_t main_ns = 0;
+
+    [[nodiscard]] bool scouting() const noexcept { return phase == Phase::Scout; }
+    // Still ahead of its outcome: what the backlog predicts as a lossy prefill.
+    [[nodiscard]] bool before_outcome() const noexcept {
+        return phase == Phase::Planned || phase == Phase::Exact || phase == Phase::Scout;
+    }
+};
+
 template <class ModelContract>
 struct RequestRecord {
     using Clock          = std::chrono::steady_clock;
@@ -175,6 +198,9 @@ struct RequestRecord {
     Clock::time_point deadline;
     Clock::time_point submitted;
     std::optional<Clock::time_point> admitted_at;
+    // --prefill-order shortest: submitted plus the predicted cost of the prefill left at admission
+    // (PrefillOrder::Shortest). Kept across pauses, so a restored request keeps its place.
+    Clock::time_point prefill_deadline{};
     std::optional<Clock::time_point> first_token;
     std::optional<Clock::time_point> last_token;
     bool queue_wait_recorded = false;
@@ -193,6 +219,9 @@ struct RequestRecord {
     std::optional<FinishReason> terminal_reason;
 
     std::optional<BasePlan> base_plan;
+    std::optional<LossyPrefillState> lossy;
+    // Summary strategy: what it did for this prompt (probe, rewrite), set by submit.
+    std::optional<compaction::SummaryRecord> summary;
     std::optional<ResumeState> suspended;
     ContinuationOwnerToken continuation_owner = 0;
     // Shared checkpoints this request published at its progress anchors, oldest first. Only the
@@ -209,12 +238,22 @@ struct RequestRecord {
     // Context store hydration: the store is consulted once per request. While `hydrating`, a host
     // worker reads the stored image and the request is not offered for admission.
     bool store_probed                   = false;
+    // With a bucket: the store found nothing, so its listing is being refreshed (once per request)
+    // in case another engine stored this session since; the store is then consulted again.
+    bool store_lookup                   = false;
+    bool store_looked_up                = false;
     bool hydrating                      = false;
     bool hydrated                       = false;
     std::uint32_t hydration_frontier    = 0;
     std::uint32_t hydration_reuse_before = 0;
     Clock::time_point hydration_started{};
     Clock::time_point hydration_deadline{};
+    // The image being read back, for the failure report: its id, size, the bytes it had to fetch
+    // from the bucket, and how long the request waited for it.
+    std::string hydration_id;
+    std::uint64_t hydration_bytes       = 0;
+    std::uint64_t hydration_fetch_bytes = 0;
+    double hydration_wait_seconds       = 0.0;
 
     // Single flight: while set, a resident sibling is prefilling this request's prefix towards a
     // checkpoint it will publish, and the request is not offered for admission. One wait at most.

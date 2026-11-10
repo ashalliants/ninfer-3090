@@ -628,6 +628,84 @@ int main() {
                        {"revoked_checkpoints", 1},
                        {"fallback_reason", "source_revoked"}},
               "admission observation lost selected source, queue subset or revocation reason");
+    failures += check(!admission_done.contains("lossy_prefill"),
+                      "a request that took no lossy prefill logged the key");
+    observed.metrics.lossy_prefill = ninfer::LossyPrefillReport{
+        .outcome         = ninfer::LossyPrefillOutcome::Completed,
+        .uncached_tokens = 37952,
+        .kept_tokens     = 7591,
+        .filter_layer    = 15,
+        .scout_ms        = 12.5,
+        .main_ms         = 40.25};
+    const auto lossy_done =
+        Json::parse(format_request_done_json("serve-test", 3003, context, observed));
+    failures += check(lossy_done.at("lossy_prefill") == Json{{"outcome", "completed"},
+                                                             {"strategy", "select"},
+                                                             {"uncached_tokens", 37952},
+                                                             {"kept_tokens", 7591},
+                                                             {"filter_layer", 15},
+                                                             {"scout_ms", 12.5},
+                                                             {"main_ms", 40.25}},
+                      "the lossy prefill fields are missing from the request log");
+    // The summary strategy: the whole prompt's lengths and the summarised message range.
+    {
+        auto summarized                 = observed;
+        summarized.metrics.lossy_prefill = ninfer::LossyPrefillReport{
+            .outcome             = ninfer::LossyPrefillOutcome::Completed,
+            .uncached_tokens     = 40000,
+            .kept_tokens         = 9000,
+            .strategy            = ninfer::LossyStrategy::Summary,
+            .summarized_messages = std::array<std::uint32_t, 2>{4, 180},
+            .summary_reused      = true,
+            .summary_probe       = ninfer::LossySummaryProbe::Cold};
+        const auto summary_done =
+            Json::parse(format_request_done_json("serve-test", 3003, context, summarized));
+        failures += check(summary_done.at("lossy_prefill") == Json{{"outcome", "completed"},
+                                                                   {"strategy", "summary"},
+                                                                   {"uncached_tokens", 40000},
+                                                                   {"kept_tokens", 9000},
+                                                                   {"filter_layer", 0},
+                                                                   {"scout_ms", 0.0},
+                                                                   {"main_ms", 0.0},
+                                                                   {"summarized_messages",
+                                                                    Json::array({4, 180})},
+                                                                   {"summary_reused", true},
+                                                                   {"summary_probe", "cold"}},
+                          "the summary strategy's fields are missing from the request log");
+        summarized.metrics.lossy_prefill = ninfer::LossyPrefillReport{
+            .outcome         = ninfer::LossyPrefillOutcome::Skipped,
+            .uncached_tokens = 40000,
+            .kept_tokens     = 40000,
+            .strategy        = ninfer::LossyStrategy::Summary,
+            .summary_probe   = ninfer::LossySummaryProbe::Timeout};
+        const auto timed_out =
+            Json::parse(format_request_done_json("serve-test", 3003, context, summarized));
+        failures += check(timed_out.at("lossy_prefill").at("outcome") == "skipped" &&
+                              timed_out.at("lossy_prefill").at("summary_probe") == "timeout" &&
+                              timed_out.at("lossy_prefill").at("summarized_messages").is_null(),
+                          "a probe timeout must be logged");
+    }
+    // kept_runs appear only under --request-log-lossy-detail.
+    observed.metrics.lossy_prefill->kept_runs = {{0, 256}, {1024, 1088}, {33856, 37952}};
+    failures += check(
+        !Json::parse(format_request_done_json("serve-test", 3003, context, observed))
+             .at("lossy_prefill")
+             .contains("kept_runs"),
+        "kept_runs were logged without --request-log-lossy-detail");
+    const auto detailed_done =
+        Json::parse(format_request_done_json("serve-test", 3003, context, observed, true));
+    failures += check(detailed_done.at("lossy_prefill").at("kept_runs") ==
+                              Json::array({Json::array({0, 256}), Json::array({1024, 1088}),
+                                           Json::array({33856, 37952})}) &&
+                          detailed_done.at("lossy_prefill").at("kept_tokens") == 7591,
+                      "--request-log-lossy-detail did not log the kept runs");
+    observed.metrics.lossy_prefill->kept_runs.clear();
+    failures += check(Json::parse(format_request_done_json("serve-test", 3003, context, observed,
+                                                           true))
+                              .at("lossy_prefill")
+                              .at("kept_runs") == Json::array(),
+                      "an empty kept run list is not an empty array");
+    observed.metrics.lossy_prefill.reset();
 
     const ninfer::GenerationSchedulingObservation scheduling{
         .transition              = ninfer::GenerationSchedulingTransition::ReplayComplete,

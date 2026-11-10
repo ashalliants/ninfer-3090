@@ -133,6 +133,12 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception,
         error.type   = "server_error";
         error.code   = "service_unavailable";
         break;
+    case ninfer::RequestErrorKind::NumericalFailure:
+        error.param.clear();
+        error.status = 500;
+        error.type   = "server_error";
+        error.code   = "numerical_failure";
+        break;
     }
     return error;
 }
@@ -353,6 +359,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.speculative              = options.speculative;
     engine_options.context_cache            = options.context_cache;
     engine_options.prefill_schedule         = options.prefill_schedule;
+    engine_options.lossy_prefill            = options.lossy_prefill;
     engine_options.context_store.directory  = options.context_store_path;
     engine_options.context_store.max_bytes =
         options.context_store_max_gib ? *options.context_store_max_gib << 30U : 0U;
@@ -391,6 +398,8 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
         }
         engine_options.context_store.remote        = product::make_s3_object_store(std::move(s3));
         engine_options.context_store.remote_prefix = options.context_store_s3_prefix;
+        engine_options.context_store.remote_upload_delay =
+            std::chrono::seconds(options.context_store_s3_upload_delay_seconds);
     }
     engine_options.devices                  = options.devices;
     engine_options.stage_layers             = options.stage_layers;
@@ -405,6 +414,7 @@ GenerationService::GenerationService(
     ServeOptions options, StartupObserver startup_observer,
     std::function<void(const ninfer::ContextStoreWriteEvent&)> store_listener,
     std::function<void(const ninfer::EngineFaultEvent&)> fault_listener,
+    std::function<void(const ninfer::ContextStoreHydrationEvent&)> hydration_listener,
     std::function<void(const ninfer::NumericTripwireEvent&)> tripwire_listener)
     : options_(std::move(options)) {
     // Inline ECC on GDDR6X GeForce cards reserves ~6.25% of VRAM for checksums and taxes
@@ -429,6 +439,7 @@ GenerationService::GenerationService(
     ninfer::EngineOptions engine_options = make_engine_options(options_);
     engine_options.startup_observer      = std::move(startup_observer);
     engine_options.context_store.listener = std::move(store_listener);
+    engine_options.context_store.hydration_listener = std::move(hydration_listener);
     engine_options.fault_listener         = std::move(fault_listener);
     engine_options.numeric_tripwire.listener = std::move(tripwire_listener);
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
@@ -437,12 +448,19 @@ GenerationService::GenerationService(
     options_.kv_capacity = engine_->options().kv_capacity;
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
+    start_idle_sleeper();
+}
+
+GenerationService::GenerationService(ServeOptions options, NoEngine)
+    : options_(std::move(options)) {}
+
+void GenerationService::start_idle_sleeper() {
     if (options_.sleep_idle_seconds != 0) {
         idle_sleeper_ = std::thread([this] { idle_sleep_loop(); });
     }
 }
 
-GenerationService::~GenerationService() {
+void GenerationService::stop_idle_sleeper() {
     {
         std::lock_guard lock(idle_mutex_);
         idle_stop_ = true;
@@ -450,6 +468,8 @@ GenerationService::~GenerationService() {
     idle_cv_.notify_all();
     if (idle_sleeper_.joinable()) { idle_sleeper_.join(); }
 }
+
+GenerationService::~GenerationService() { stop_idle_sleeper(); }
 
 // The one gate for every suspend (the /suspend route and the idle sleeper). A request counts in
 // `request_capacity_->active` from acquire_request_lifetime, before it reaches the Engine (media and
@@ -475,6 +495,30 @@ ninfer::ResidencyStatus GenerationService::suspend(std::optional<bool> auto_resu
 
 ninfer::ResidencyStatus GenerationService::resume() { return engine_->resume(); }
 
+ninfer::ContextStoreFlushReport
+GenerationService::flush_context_store(std::chrono::milliseconds budget) {
+    {
+        std::lock_guard admission(request_capacity_->mutex);
+        ++request_capacity_->active;
+    }
+    struct Release {
+        RequestCapacity& capacity;
+        ~Release() {
+            std::lock_guard admission(capacity.mutex);
+            --capacity.active;
+        }
+    } const release{*request_capacity_};
+    // Without a store there is nothing to flush: answer so before waking a suspended model.
+    if (!engine_->options().context_store.enabled()) {
+        throw std::invalid_argument("the context store is off (--context-store)");
+    }
+    const auto residency = engine_->residency();
+    if (residency.enabled && residency.state == ninfer::ModelResidency::Suspended) {
+        (void)engine_->resume();
+    }
+    return engine_->flush_context_store(budget);
+}
+
 ninfer::ResidencyStatus GenerationService::residency() const { return engine_->residency(); }
 
 // --sleep-idle-seconds: gives the model's device memory back once no request has been admitted for
@@ -494,7 +538,7 @@ void GenerationService::idle_sleep_loop() {
         if (Clock::now() - idle_since < idle_for) { continue; }
         lock.unlock();
         try {
-            if (engine_->residency().state != ninfer::ModelResidency::Suspended) {
+            if (residency().state != ninfer::ModelResidency::Suspended) {
                 (void)suspend(std::nullopt);
             }
         } catch (const ninfer::RequestError&) {
@@ -604,6 +648,14 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         };
         ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
+        if (options_.lossy_prefill.enabled() && prompt.summary().product_prompt_unbounded &&
+            !warned_unbounded_product_prompt_.exchange(true, std::memory_order_relaxed)) {
+            write_console_log(ConsoleLogLevel::Warning,
+                              "lossy prefill: a prompt declares tools but neither a system message "
+                              "nor the end of its tool declarations could be located in the chat "
+                              "template's output, so the product prompt's end is unknown; such "
+                              "prompts prefill in full (shown once)");
+        }
         prepared.enable_thinking = prompt.summary().starts_in_reasoning;
         if (!prepared.enable_thinking) {
             request_options.execution.thinking.budget.reset();
@@ -743,6 +795,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.computed_prefill_tokens     = result.computed_prefill_tokens;
     outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
     outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
+    outcome.metrics.lossy_prefill               = result.lossy_prefill;
     outcome.metrics.speculative_backend         = result.speculative.backend;
     outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
     outcome.metrics.speculative_rounds          = result.speculative.rounds;

@@ -62,10 +62,11 @@ format_request_scheduling_json(const std::string& server_instance_id,
 std::string format_request_rejected_json(const std::string& server_instance_id,
                                          std::uint64_t timestamp_unix_ms,
                                          const RequestRejectionLogContext& context);
+// `lossy_detail` (--request-log-lossy-detail) adds lossy_prefill.kept_runs.
 std::string format_request_done_json(const std::string& server_instance_id,
                                      std::uint64_t timestamp_unix_ms,
                                      const RequestLogContext& context,
-                                     const GenerationOutcome& outcome);
+                                     const GenerationOutcome& outcome, bool lossy_detail = false);
 std::string format_request_error_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
                                       const RequestLogContext& context, const std::string& message);
@@ -80,7 +81,8 @@ class JsonlRequestLog {
 public:
     explicit JsonlRequestLog(const std::string& path,
                              const std::string& protected_artifact_path = {},
-                             std::shared_ptr<spdlog::logger> logger     = {});
+                             std::shared_ptr<spdlog::logger> logger     = {},
+                             bool lossy_detail                          = false);
 
     JsonlRequestLog(const JsonlRequestLog&)            = delete;
     JsonlRequestLog& operator=(const JsonlRequestLog&) = delete;
@@ -113,6 +115,8 @@ private:
     std::mutex mutex_;
     std::shared_ptr<spdlog::logger> logger_;
     bool failed_ = false;
+    // --request-log-lossy-detail: request_done records carry lossy_prefill.kept_runs.
+    bool lossy_detail_ = false;
 };
 
 } // namespace ninfer::serve

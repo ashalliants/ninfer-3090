@@ -3,9 +3,12 @@
 #include "core/device.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
+#include "models/qwen3_5/program/lossy/lossy_flow.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
+#include "runtime/engine/compaction/summary_strategy.h"
+#include "runtime/engine/context_store_binding.h"
 #include "runtime/engine/engine_core.h"
 #include "runtime/engine/model_instance.h"
 #include "runtime/engine/qwen4_exp_instance.h"
@@ -79,59 +82,11 @@ std::string context_capacity_error(std::size_t prompt_tokens, std::uint32_t max_
            " tokens, exceeding Engine max_context " + std::to_string(max_context);
 }
 
-// The image format every binding names: bump it together with kImageVersion in
-// models/qwen3_5/program/storage/checkpoint_image.cpp. Format 2 carries the StateImage geometry
-// (GDN state type, DFlash local rings) explicitly instead of only its total size.
-constexpr std::string_view kCheckpointImageFormat = "checkpoint-image-2";
-
-// What a stored checkpoint image binds to: the model, its weight formats and quantization, the
-// artifact file, the KV, recurrent-state and speculative settings its layout was built for, and the
-// image format. Images under any other binding are never read, so they age out of the store as
-// misses.
-//
-// The speculative part is the backend, draft window and proposal head. A DFlash or DFlash2 image
-// holds the draft model's own context (the local K/V rings in each StateImage, and DFlash's draft KV
-// pages), computed by the artifact's draft weights, so it is restored only into the same backend
-// and artifact. Restoring just the target part is not offered: the draft context could only be
-// rebuilt by prefilling the whole history again, which is what a miss does anyway. N-gram copy
-// drafting is deliberately absent: its index is rebuilt from each request's own tokens and no
-// checkpoint holds any of it.
-std::string context_store_binding(const EngineOptions& options, const LoadSummary& load) {
-    std::string binding = load.architecture + '\n' + load.model_name + '\n';
-    for (const std::string& format : load.weight_formats) { binding += format + ','; }
-    binding += '\n' + load.prefill_signature + '\n';
-    binding += std::to_string(static_cast<unsigned>(options.kv_cache)) + ',' +
-               std::to_string(static_cast<unsigned>(options.speculative.backend)) + ',' +
-               std::to_string(options.speculative.draft_tokens) + ',' +
-               std::to_string(static_cast<unsigned>(options.speculative.proposal_head)) + ',' +
-               (options.gdn_state_fp16 ? "gdn-fp16" : "gdn-fp32") + ',' +
-               (options.enable_vision ? "vision" : "text") + '\n';
-    std::error_code size_error;
-    const std::uintmax_t size = std::filesystem::file_size(options.artifact_path, size_error);
-    binding += size_error ? std::string("?") : std::to_string(size);
-    // A re-converted artifact can have the same size; its modification time tells it apart.
-    std::error_code time_error;
-    const auto written = std::filesystem::last_write_time(options.artifact_path, time_error);
-    binding += '\n';
-    binding += time_error ? std::string("?") : std::to_string(written.time_since_epoch().count());
-    // Prompt grafts: a stored session that starts from a graft holds that graft's installed K/V and
-    // state under its placeholder ids, so a changed graft file must not match it. Any change to
-    // the configured grafts makes the store's images misses.
-    for (const GraftSource& graft : options.grafts) {
-        std::error_code graft_size_error;
-        std::error_code graft_time_error;
-        const std::uintmax_t graft_size = std::filesystem::file_size(graft.path, graft_size_error);
-        const auto graft_written = std::filesystem::last_write_time(graft.path, graft_time_error);
-        binding += "\ngraft " + graft.name + ' ' +
-                   (graft_size_error ? std::string("?") : std::to_string(graft_size)) + ' ' +
-                   (graft_time_error ? std::string("?")
-                                     : std::to_string(graft_written.time_since_epoch().count()));
-    }
-    // The checkpoint image format; stores written by an older engine become misses.
-    binding += '\n';
-    binding += kCheckpointImageFormat;
-    return binding;
-}
+// The summary strategy's reuse probe waits at most this long for the worker to answer it between
+// cycles: a decode cycle is far shorter, a prefill step (about 1.5 s at chunk 4096) longer. An
+// unanswered probe counts as warm and as a timeout (docs/maintainer/lossy-long-prefill.md,
+// "Alternative strategy").
+constexpr std::chrono::milliseconds kSummaryProbeWait{250};
 
 // Images queued for the writer thread. Each holds a whole continuation, several GB for a deep one;
 // beyond the bound an idle continuation is simply written later.
@@ -141,6 +96,12 @@ constexpr std::size_t kMaximumPendingStoreWrites = 2;
 // behind idle writes rather than being dropped, because a dropped eviction is a recompute. Host
 // RAM, not pinned memory; it drains at the store's write rate.
 constexpr std::size_t kMaximumPendingEvictionBytes = std::size_t{4} << 30U;
+// The writer keeps the buffer of the last image it wrote for the next export: a fresh one of a
+// session's size is several hundred ms of page faults on the Engine worker (690 ms for 1.6 GB on a
+// Linux RTX 3090 box, against 90 ms to copy into one already mapped). One buffer, at most this
+// large, released once the writer has been idle this long.
+constexpr std::size_t kMaximumSpareExportBytes = std::size_t{8} << 30U;
+constexpr auto kSpareExportBufferIdle          = std::chrono::seconds(30);
 
 // The store keeps up to this share of the volume's free space when no limit is configured.
 constexpr std::uint64_t kAutomaticStoreShareDivisor = 2;
@@ -173,6 +134,9 @@ public:
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
     models::qwen3_5::PreparedPrompt value;
+    // Summary strategy: what it did for this prompt (summary_strategy.h); unset when it did not
+    // look at it (off, or too short to probe).
+    std::optional<runtime::compaction::SummaryRecord> summary_record;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
@@ -275,6 +239,12 @@ public:
     using ScoringCore    = runtime::CausalScoreCore<runtime::ModelInstance>;
     // Qwen3.8-Flash-Next: the common core over its own Program.
     using Qwen4ExpCore = runtime::EngineCore<runtime::Qwen4ExpInstance>;
+    // Lossy long-prompt prefill: the Qwen3.5 Program runs it; qwen4_exp refuses the option at
+    // startup. Usage counts prompt_tokens from the client's prepared prompt (PromptSummary) and
+    // cached tokens in its terms (RequestBasePlan::reported_frontier), whatever the Program kept.
+    static_assert(GenerationCore::kLossyCapable,
+                  "the Qwen3.5 Program must provide the lossy prefill contract the Engine uses");
+    static_assert(!Qwen4ExpCore::kLossyCapable);
     using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
                               std::unique_ptr<ScoringCore>, std::unique_ptr<Qwen4ExpCore>>;
 
@@ -324,14 +294,17 @@ public:
                 std::chrono::steady_clock::now() + options.context_store.flush_budget;
             stop_writer(deadline);
             flush_context_store(deadline);
-        }
-        core.emplace<std::monostate>();
-        // Everything written is queued for upload by now; give the uploads their budget.
-        if (store) {
+            // Everything written is queued for upload by now (the writer is stopped, so nothing
+            // else is written); give the uploads their budget.
             (void)store->flush_remote(std::chrono::steady_clock::now() +
                                           options.context_store.remote_flush_budget,
                                       true);
+            // Then cut the bucket off before the core goes: a request-time listing or fetch
+            // still running on its readers fails at once, so joining them does not wait out a
+            // stalled transfer. The store is not used for the bucket after this.
+            if (options.context_store.remote) { options.context_store.remote->interrupt(); }
         }
+        core.emplace<std::monostate>();
         try {
             device.synchronize();
         } catch (...) {}
@@ -343,6 +316,8 @@ public:
         const runtime::ContextStore::Stats s = store->stats();
         out.context_store_images          = s.images;
         out.context_store_used_bytes      = s.used_bytes;
+        out.context_store_logical_bytes   = s.logical_bytes;
+        out.context_store_shared_bytes    = s.shared_bytes;
         out.context_store_writes          = s.puts;
         out.context_store_write_failures  = s.put_failures;
         out.context_store_dropped         = store_dropped.load(std::memory_order_relaxed);
@@ -351,6 +326,10 @@ public:
         out.context_store_bytes_reused    = s.bytes_reused;
         out.context_store_evicted         = s.evicted_for_space + s.expired + s.superseded;
         out.context_store_corrupt         = s.corrupt_removed;
+        out.context_store_corrupt_startup  = s.corrupt_startup;
+        out.context_store_corrupt_manifest = s.corrupt_manifest;
+        out.context_store_corrupt_chunk    = s.corrupt_chunk;
+        out.context_store_corrupt_remote   = s.corrupt_remote;
         out.context_store_restored        = restored_sessions;
         out.context_store_restored_bytes  = restored_bytes;
         out.context_store_foreign         = foreign_images;
@@ -362,6 +341,17 @@ public:
         out.context_store_remote_downloads         = s.remote_downloads;
         out.context_store_remote_download_bytes    = s.remote_download_bytes;
         out.context_store_remote_download_failures = s.remote_download_failures;
+        out.context_store_remote_download_failures_transfer = s.remote_download_failures_transfer;
+        out.context_store_remote_download_failures_missing  = s.remote_download_failures_missing;
+        out.context_store_remote_download_failures_damaged  = s.remote_download_failures_damaged;
+        out.context_store_remote_download_failures_install  = s.remote_download_failures_install;
+        out.context_store_remote_download_failures_listing  = s.remote_download_failures_listing;
+        out.context_store_remote_manifest_downloads      = s.remote_manifest_downloads;
+        out.context_store_remote_manifest_download_bytes = s.remote_manifest_download_bytes;
+        out.context_store_remote_retired                 = s.remote_retired;
+        out.context_store_remote_uploads_skipped         = s.remote_uploads_skipped;
+        out.context_store_remote_uploads_dropped         = s.remote_uploads_dropped;
+        out.context_store_remote_only_dropped            = s.remote_only_dropped;
         out.context_store_peer_images        = s.peer_images;
         out.context_store_peer_bytes_linked  = s.peer_bytes_linked;
         out.context_store_peer_skipped       = s.peer_skipped;
@@ -378,6 +368,67 @@ public:
         return qwen4 != nullptr ? qwen4->capacity : active->capacity;
     }
 
+    // ---- lossy prefill, summary strategy (runtime/engine/compaction/summary_strategy.h) ----
+
+    // The prepare operations the strategy runs on: the Frontend, and the reuse probe.
+    struct SummaryOps {
+        const Impl& impl;
+        const PreparationControl& control;
+        using Prepared = models::qwen3_5::PreparedPrompt;
+
+        Prepared prepare(PromptInput input) const {
+            return impl.frontend().prepare(std::move(input), control);
+        }
+        static std::uint32_t tokens(const Prepared& prompt) { return prompt.summary().prompt_tokens; }
+        static std::uint32_t exact_end(const Prepared& prompt) {
+            return models::qwen3_5::detail::lossy_planned_exact_end(
+                models::qwen3_5::PreparedPromptAccess::view(prompt).context_cache);
+        }
+        static bool eligible(const Prepared& prompt) {
+            const auto& data = models::qwen3_5::PreparedPromptAccess::view(prompt);
+            return !data.has_media() && data.external_prefix_tokens == 0 &&
+                   !data.context_cache.product_prompt_unbounded;
+        }
+        LossySummaryProbe probe_reuse(const Prepared& prompt) const {
+            return impl.has_private_reuse(prompt, exact_end(prompt));
+        }
+        static std::span<const TokenId> token_ids(const Prepared& prompt) {
+            return models::qwen3_5::PreparedPromptAccess::view(prompt).token_ids;
+        }
+    };
+
+    // The options the strategy decision reads: the configured ones for a Qwen3.5 generation core,
+    // off for anything else (Flash-Next refuses lossy prefill at startup; scoring never generates).
+    [[nodiscard]] LossyPrefillOptions summary_lossy_options() const {
+        const auto* generation = std::get_if<std::unique_ptr<GenerationCore>>(&core);
+        return generation != nullptr && *generation != nullptr ? options.lossy_prefill
+                                                               : LossyPrefillOptions{};
+    }
+
+    [[nodiscard]] runtime::compaction::SummaryStrategyConfig summary_config() const {
+        return {.min_tokens   = options.lossy_prefill.min_tokens,
+                .budget_chars = runtime::compaction::summary_budget_chars(
+                    options.max_context, options.lossy_prefill.summary_max_tokens)};
+    }
+
+    // Warm when a private (conversation) record, in the cache or the context store, would be
+    // reused by this prompt, so it is not summarised. Thread-safe (Engine::prepare runs on caller
+    // threads): the probe is posted to the worker and waits at most kSummaryProbeWait; Timeout,
+    // or any doubt, is treated as warm.
+    [[nodiscard]] LossySummaryProbe has_private_reuse(const models::qwen3_5::PreparedPrompt& prompt,
+                                                      std::uint32_t exact_end) const {
+        const auto* generation = std::get_if<std::unique_ptr<GenerationCore>>(&core);
+        if (generation == nullptr || *generation == nullptr) { return LossySummaryProbe::Warm; }
+        try {
+            auto execution = resolve_request_options(sampling_defaults, SamplingMode::Thinking, {})
+                                 .execution;
+            execution.requested_output_tokens = 1;
+            return (*generation)
+                ->has_private_reuse(models::qwen3_5::PreparedPromptAccess::copy(prompt), execution,
+                                    exact_end, kSummaryProbeWait);
+        } catch (...) { return LossySummaryProbe::Warm; }
+    }
+
     EngineOptions options;
     DeviceContext device;
     std::unique_ptr<runtime::ModelInstance> active;
@@ -389,6 +440,10 @@ public:
     // so they must outlive it.
     std::unique_ptr<runtime::ContextStore> store;
     std::string store_binding;
+    // The moment the start-up restore budget runs out, fixed when open_context_store() begins the
+    // bucket refresh: one absolute cutoff covers the refresh and the restore, however long the gap
+    // between them is.
+    std::chrono::steady_clock::time_point startup_deadline{};
     std::uint64_t restored_sessions = 0;
     std::uint64_t restored_bytes    = 0;
     std::uint64_t foreign_images    = 0;
@@ -401,12 +456,113 @@ public:
     struct PendingWrite {
         CheckpointImage image;
         bool shared = false;
+        std::string id; // the store id the image is written under
     };
     std::deque<PendingWrite> pending_writes;
     bool writer_active = false;
+    std::string active_write_id; // the write in progress, while writer_active
+    std::mutex store_flush_mutex; // one Engine::flush_context_store at a time
+    // Set by a flush for the moment between its final check and its count of unsaved sessions:
+    // an idle or shared-prefix write offered then is refused, so its session counts as unsaved;
+    // an eviction write (its session's last chance) is queued and noted in
+    // store_write_during_close, which makes the flush report the bucket incomplete. Under
+    // writer_mutex.
+    bool store_writes_closed      = false;
+    bool store_write_during_close = false;
+
+    // Engine::flush_context_store. One flush at a time: each turns the core's flush on and off.
+    ContextStoreFlushReport flush_store(std::chrono::milliseconds budget) {
+        if (!store) { throw std::invalid_argument("the context store is off (--context-store)"); }
+        std::scoped_lock flushing(store_flush_mutex);
+        const auto started  = std::chrono::steady_clock::now();
+        const auto deadline = started + budget;
+        const auto puts     = store->stats().puts;
+        // A write that fails during the flush may be an evicted session's, whose owner is gone
+        // already: nothing would count it as unsaved, so a failure makes the bucket incomplete.
+        const auto failures = store_write_failures.load(std::memory_order_acquire);
+        ContextStoreFlushReport report;
+        with_generation([&](auto& generation) {
+            generation.set_store_flush(true);
+            struct Off {
+                decltype(generation)& core;
+                ~Off() { core.set_store_flush(false); }
+            } const off{generation};
+            for (;;) {
+                report.unsaved = generation.unsaved_store_sessions();
+                if ((report.unsaved == 0 && store_queue_idle()) ||
+                    std::chrono::steady_clock::now() >= deadline) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+        // Every image the bucket may lack goes now: those still waiting out their delay, and any
+        // whose upload was given up when the queue was full. Serving goes on meanwhile, and a write
+        // (an eviction's, say) can land while the uploads run: those are uploaded too, a pass at a
+        // time, until a pass ends with the writer idle. The answer describes the store as of that
+        // moment; a write that starts after it is not this flush's (the gateway stops routing to
+        // the box first).
+        for (;;) {
+            while (!store_queue_idle() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            // Writes the store has completed: one that lands during the pass (queued and written
+            // after the scan, so the writer looks idle again) shows as a change here.
+            const auto puts_before = store->stats().puts;
+            report.uploaded        = store->upload_unpublished(store_binding, deadline);
+            bool settled           = false;
+            {
+                // The check and the close are one step: a write offered after it is refused
+                // until the count below, so it shows as unsaved instead of slipping between them.
+                std::scoped_lock lock(writer_mutex);
+                settled = pending_writes.empty() && !writer_active &&
+                          store->stats().puts == puts_before;
+                store_writes_closed = settled;
+            }
+            if (settled || std::chrono::steady_clock::now() >= deadline) {
+                // A write still queued, in progress or landed since the scan has not reached the
+                // bucket.
+                report.uploaded = report.uploaded && settled;
+                break;
+            }
+        }
+        struct Reopen {
+            Impl& impl;
+            bool written_during_close = false;
+            void now() {
+                std::scoped_lock lock(impl.writer_mutex);
+                written_during_close          = impl.store_write_during_close;
+                impl.store_writes_closed      = false;
+                impl.store_write_during_close = false;
+            }
+            ~Reopen() { now(); }
+        } reopen{*this};
+        // As things stand at the close: a session whose write was refused meanwhile counts here.
+        with_generation([&](auto& generation) { report.unsaved = generation.unsaved_store_sessions(); });
+        reopen.now();
+        // An eviction write queued during the close is on its way to the store, not in the bucket.
+        if (reopen.written_during_close) { report.uploaded = false; }
+        if (store_write_failures.load(std::memory_order_acquire) != failures) {
+            report.uploaded = false;
+        }
+        report.written  = store->stats().puts - puts;
+        report.seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        return report;
+    }
+
+    std::vector<std::uint8_t> spare_export_buffer; // see kMaximumSpareExportBytes
+    // Ids of queued writes that failed since the core last took them. Bounded: beyond it the
+    // oldest go and `failed_write_ids_lost` says so, and the core then retries every continuation
+    // whose image the store does not hold.
+    std::deque<std::string> failed_write_ids;
+    bool failed_write_ids_lost = false;
+    static constexpr std::size_t kMaximumFailedWriteIds = 4096;
     bool writer_stop   = false;
     std::optional<std::chrono::steady_clock::time_point> drain_deadline;
     std::thread writer;
+    // The summaries the summary strategy wrote, so later turns render the same ones.
+    mutable runtime::compaction::SummaryRegistry summary_registry;
     Core core;
 
 private:
@@ -464,11 +620,21 @@ private:
                 return enqueue_store_write(std::move(image), StoreWrite::SharedPrefix);
             },
             .ready   =[this] { return store_queue_idle(); },
+            .queued  = [this](const std::string& id) { return store_write_queued(id); },
             .failures = [this] { return store_write_failures.load(std::memory_order_relaxed); },
+            .failed_writes =
+                [this] {
+                    typename GenerationCoreT::FailedStoreWrites reported;
+                    take_failed_writes(reported.ids, reported.lost);
+                    return reported;
+                },
+            .export_buffer = [this] { return take_export_buffer(); },
             .idle_persist =
                 std::chrono::duration_cast<std::chrono::milliseconds>(options.context_store.idle_persist),
             .hydration_budget =
                 std::chrono::duration_cast<std::chrono::milliseconds>(options.context_store.restore_budget),
+            .remote = options.context_store.remote != nullptr,
+            .hydration_listener = options.context_store.hydration_listener,
         });
     }
 
@@ -506,27 +672,34 @@ private:
         store_options.compress_chunks = config.compress_chunks;
         store_options.peers           = config.peers;
         store_options.peer_poll       = config.peer_poll;
+        store_binding = context_store_binding(options, load);
         store_options.remote        = config.remote;
-        store_options.remote_prefix = config.remote_prefix;
+        store_options.remote_prefix = config.remote_prefix + remote_binding_scope(store_binding);
+        store_options.remote_upload_delay = config.remote_upload_delay;
         store         = std::make_unique<runtime::ContextStore>(std::move(store_options));
         if (config.remote) {
-            // Images other engines left in the bucket become restorable before start-up restores.
-            (void)store->refresh_remote(std::chrono::steady_clock::now() + config.restore_budget);
+            // Images other engines left in the bucket are known before the first request, which
+            // can then find its session there. Only the manifests are read, not the sessions.
+            startup_deadline = std::chrono::steady_clock::now() + config.restore_budget;
+            (void)store->refresh_remote(startup_deadline);
         }
-        store_binding = context_store_binding(options, load);
     }
 
-    // Lowercase hex of the image's endpoint key: an image of the same endpoint replaces it. A
-    // shared prefix's id ends in an extra digit, so it never replaces a conversation image whose
-    // endpoint happens to fall at the same position.
+    // The bucket keys of one model and configuration sit under their own folder, named by a hash
+    // of the binding: an engine lists only sessions it could use, and sessions of another model,
+    // configuration or release are never listed, downloaded or offered.
+    static std::string remote_binding_scope(const std::string& binding) {
+        const auto digest = runtime::ContextStore::hash(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(binding.data()), binding.size()));
+        char text[24];
+        std::snprintf(text, sizeof(text), "b%016llx/", static_cast<unsigned long long>(digest[0]));
+        return text;
+    }
+
+    // The image's endpoint key (runtime/engine/context_store/image_id.h).
     static std::string image_id(const CheckpointImage& image, bool shared) {
         const auto& key = image.keys.front();
-        char text[42];
-        std::snprintf(text, sizeof(text), "%016llx%016llx%08x%s",
-                      static_cast<unsigned long long>(key.digests[0]),
-                      static_cast<unsigned long long>(key.digests[1]),
-                      static_cast<unsigned>(key.frontier), shared ? "5" : "");
-        return text;
+        return runtime::context_store_image_id(key.digests, key.frontier, shared);
     }
 
     // Writes one image to the store. On the writer thread, or at shutdown.
@@ -556,7 +729,10 @@ private:
         const auto started = std::chrono::steady_clock::now();
         try {
             with_generation([&](auto& generation) {
-                const auto deadline = started + options.context_store.restore_budget;
+                // Without a bucket there was no refresh, and the budget starts here.
+                const auto deadline = options.context_store.remote
+                                          ? startup_deadline
+                                          : started + options.context_store.restore_budget;
                 auto images         = store->list();
                 // By value when not everything fits: shared prefixes first (each serves every
                 // conversation that starts with it), then conversations by recomputation time
@@ -585,16 +761,24 @@ private:
                 foreign_images = static_cast<std::uint64_t>(
                     std::count_if(images.begin(), images.end(),
                                   [&](const auto& info) { return info.binding != store_binding; }));
+                std::vector<std::uint8_t> spare;
                 for (const runtime::ContextStore::Info& info : images) {
                     if (std::chrono::steady_clock::now() >= deadline) { break; }
                     if (info.binding != store_binding || info.tokens > options.max_context) {
                         continue;
                     }
+                    // Only what the directory holds: a session only the bucket has is fetched when
+                    // a request asks for it, not at start-up on the chance one might.
+                    if (!info.local) { continue; }
                     // The payload is nearly all of an image: one larger than the free Host space
                     // cannot fit, and reading it would only spend the budget.
                     if (info.image_bytes > generation.free_host_bytes()) { continue; }
                     const auto read_started = std::chrono::steady_clock::now();
-                    std::optional<std::vector<std::uint8_t>> bytes = store->load(info.id, false);
+                    // One buffer serves every image restored: each read reuses the last one's.
+                    // The deadline reaches the bucket too: a chunk the directory lacks (a repair)
+                    // is abandoned at the end of the budget, not waited for.
+                    std::optional<std::vector<std::uint8_t>> bytes =
+                        store->load(info.id, false, nullptr, deadline, std::move(spare));
                     if (!bytes) { continue; }
                     const auto read_ns = static_cast<std::uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -605,6 +789,7 @@ private:
                         ++restored_sessions;
                         restored_bytes += bytes->size();
                     }
+                    spare = std::move(*bytes);
                 }
             });
         } catch (...) {}
@@ -634,25 +819,75 @@ private:
         return pending_writes.empty() && !writer_active;
     }
 
+    // Whether the image `id` is queued for the writer or being written now.
+    [[nodiscard]] bool store_write_queued(const std::string& id) {
+        std::scoped_lock lock(writer_mutex);
+        if (writer_active && active_write_id == id) { return true; }
+        return std::any_of(pending_writes.begin(), pending_writes.end(),
+                           [&](const PendingWrite& pending) { return pending.id == id; });
+    }
+
+    // The ids of writes that failed since the last call. Under writer_mutex.
+    void record_failed_write_locked(std::string id) {
+        if (failed_write_ids.size() >= kMaximumFailedWriteIds) {
+            failed_write_ids.pop_front();
+            failed_write_ids_lost = true;
+        }
+        failed_write_ids.push_back(std::move(id));
+    }
+
+    // The spare buffer for the next export, if the writer holds one.
+    [[nodiscard]] std::vector<std::uint8_t> take_export_buffer() {
+        std::scoped_lock lock(writer_mutex);
+        return std::exchange(spare_export_buffer, {});
+    }
+
+    // Keeps a written image's buffer for the next export when it is the larger of the two and not
+    // too large. Under writer_mutex; whatever it does not keep is freed by the caller's `bytes`.
+    void keep_export_buffer_locked(std::vector<std::uint8_t>& bytes) noexcept {
+        if (bytes.capacity() <= spare_export_buffer.capacity() ||
+            bytes.capacity() > kMaximumSpareExportBytes) {
+            return;
+        }
+        std::swap(spare_export_buffer, bytes);
+    }
+
+    // Hands over the failed writes not yet taken, and whether some were lost.
+    void take_failed_writes(std::vector<std::string>& ids, bool& lost) {
+        std::scoped_lock lock(writer_mutex);
+        ids.assign(failed_write_ids.begin(), failed_write_ids.end());
+        lost = std::exchange(failed_write_ids_lost, false);
+        failed_write_ids.clear();
+    }
+
     // Queues an image for the writer thread. Never blocks: when the queue is full the image is
     // not written now; an idle continuation is tried again later, an evicted one is lost to the
     // store as it would be without write-on-evict.
     bool enqueue_store_write(CheckpointImage&& image, StoreWrite kind) {
         std::unique_lock lock(writer_mutex);
         if (writer_stop) { return false; } // shutting down: the final flush writes it instead
+        // A flush is counting what is unsaved: this session counts, and is written after it. An
+        // evicted session has no later chance, so it is queued, and the flush told it missed one.
+        if (store_writes_closed) {
+            if (kind != StoreWrite::Eviction) { return false; }
+            store_write_during_close = true;
+        }
+        // The memory the queue holds: a reused export buffer can be larger than its image.
         std::size_t queued_bytes = 0;
-        for (const auto& pending : pending_writes) { queued_bytes += pending.image.bytes.size(); }
+        for (const auto& pending : pending_writes) { queued_bytes += pending.image.bytes.capacity(); }
         const bool full =
             kind == StoreWrite::Eviction
                 ? !pending_writes.empty() &&
-                      queued_bytes + image.bytes.size() > kMaximumPendingEvictionBytes
+                      queued_bytes + image.bytes.capacity() > kMaximumPendingEvictionBytes
                 : pending_writes.size() >= kMaximumPendingStoreWrites;
         if (full) {
             store_dropped.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         if (!writer.joinable()) { writer = std::thread([this] { writer_loop(); }); }
-        pending_writes.push_back({std::move(image), kind == StoreWrite::SharedPrefix});
+        const bool shared = kind == StoreWrite::SharedPrefix;
+        std::string id    = image_id(image, shared);
+        pending_writes.push_back({std::move(image), shared, std::move(id)});
         lock.unlock();
         writer_cv.notify_one();
         return true;
@@ -661,9 +896,23 @@ private:
     void writer_loop() noexcept {
         for (;;) {
             PendingWrite write;
+            std::vector<std::uint8_t> released; // freed outside the lock
             {
                 std::unique_lock lock(writer_mutex);
-                writer_cv.wait(lock, [&] { return writer_stop || !pending_writes.empty(); });
+                const auto woken = [&] { return writer_stop || !pending_writes.empty(); };
+                // Idle with a spare export buffer: let it go once nothing was written for a while,
+                // so an Engine that stopped writing does not keep a session's worth of memory.
+                while (!woken() && !spare_export_buffer.empty()) {
+                    if (!writer_cv.wait_for(lock, kSpareExportBufferIdle, woken)) {
+                        released = std::exchange(spare_export_buffer, {});
+                    }
+                }
+                if (!woken()) {
+                    lock.unlock();
+                    released = {};
+                    lock.lock();
+                    writer_cv.wait(lock, woken);
+                }
                 if (pending_writes.empty() ||
                     (writer_stop && drain_deadline &&
                      std::chrono::steady_clock::now() >= *drain_deadline)) {
@@ -671,10 +920,11 @@ private:
                 }
                 write = std::move(pending_writes.front());
                 pending_writes.pop_front();
-                writer_active = true;
+                writer_active   = true;
+                active_write_id = write.id;
             }
             ContextStoreWriteEvent event;
-            event.id           = image_id(write.image, write.shared);
+            event.id           = write.id;
             event.tokens       = write.image.tokens;
             event.bytes        = write.image.bytes.size();
             const auto started = std::chrono::steady_clock::now();
@@ -683,17 +933,22 @@ private:
             } catch (const std::exception& error) {
                 event.error = error.what();
             } catch (...) { event.error = "unknown context store write failure"; }
-            if (!event.error.empty()) {
-                // The continuation was counted as stored when it was queued; have it written again.
-                store_write_failures.fetch_add(1, std::memory_order_relaxed);
+            {
+                std::scoped_lock lock(writer_mutex);
+                writer_active = false;
+                active_write_id.clear();
+                // The continuation was counted as stored when it was queued; have it written
+                // again. The id goes with the failure, so the core retries exactly this image
+                // whatever it concluded about it meanwhile.
+                if (!event.error.empty()) {
+                    record_failed_write_locked(write.id);
+                    store_write_failures.fetch_add(1, std::memory_order_relaxed);
+                }
+                keep_export_buffer_locked(write.image.bytes);
             }
             event.seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             notify(event);
-            {
-                std::scoped_lock lock(writer_mutex);
-                writer_active = false;
-            }
         }
     }
 
@@ -718,6 +973,9 @@ private:
         // Images abandoned at the deadline were marked stored when they were queued; count them
         // as failed writes so the final flush clears those marks and writes them again.
         if (!pending_writes.empty()) {
+            for (PendingWrite& pending : pending_writes) {
+                record_failed_write_locked(std::move(pending.id));
+            }
             store_write_failures.fetch_add(pending_writes.size(), std::memory_order_relaxed);
         }
         pending_writes.clear();
@@ -738,16 +996,31 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    auto prepared      = impl_->frontend().prepare(std::move(input), control);
+    // Lossy prefill's summary strategy may replace the middle of a cold long conversation with a
+    // summary (or substitute one recorded for an earlier turn); otherwise one ordinary prepare.
+    Impl::SummaryOps ops{*impl_, control};
+    auto strategy = runtime::compaction::prepare_for_strategy(
+        std::move(input), impl_->summary_lossy_options(), impl_->summary_config(),
+        impl_->summary_registry, ops);
+    auto prepared      = std::move(strategy.prepared);
     PromptSummary info = prepared.summary();
     const SamplingMode sampling_mode =
         info.starts_in_reasoning ? SamplingMode::Thinking : SamplingMode::NonThinking;
     if (info.prompt_tokens > impl_->capacity()) {
         throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
     }
+    // Usage and max_context count the client's prompt; the Program runs the submitted one.
+    if (strategy.rewrite) { info.prompt_tokens = strategy.rewrite->original_tokens; }
     const PromptPreparationStats preparation = prepared.preparation_stats();
-    return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(info, preparation, sampling_mode,
-                                                                 std::move(prepared)));
+    auto impl = std::make_unique<PreparedPrompt::Impl>(info, preparation, sampling_mode,
+                                                       std::move(prepared));
+    if (strategy.probe || strategy.rewrite) {
+        impl->summary_record = runtime::compaction::SummaryRecord{
+            .probe         = strategy.probe,
+            .rewrite       = strategy.rewrite,
+            .prompt_tokens = impl->value.summary().prompt_tokens};
+    }
+    return PreparedPrompt(std::move(impl));
 }
 
 PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
@@ -894,7 +1167,7 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                 auto submission =
                     core->submit(std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
                                  std::move(resolved_options), consumer_mode, std::move(observation),
-                                 pending_deadline);
+                                 pending_deadline, prompt.impl_->summary_record);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
                     impl_, std::move(submission), resolved_sampling));
             }
@@ -967,6 +1240,11 @@ bool Engine::is_available() const {
             }
         },
         impl_->core);
+}
+
+ContextStoreFlushReport Engine::flush_context_store(std::chrono::milliseconds budget) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->flush_store(budget);
 }
 
 ResidencyStatus Engine::suspend(std::optional<bool> auto_resume) {

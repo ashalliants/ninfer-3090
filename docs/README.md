@@ -61,6 +61,7 @@ other references own narrower contracts:
 | [ReplaySSM GDN](maintainer/replayssm-gdn.md) | raw transition records and faithful commitment of the verified state prefix |
 | [Op development](maintainer/op-development.md) | semantic boundaries, source ownership, numerical qualification and performance evidence |
 | [Operational logging](maintainer/logging.md) | log ownership, presentation, severity and data policy |
+| [Performance model](maintainer/perf-model.md) | predicting decode and prefill speed from a model's shape without a GPU, what it is calibrated on and what it cannot see |
 | [Linear benchmark](maintainer/linear-benchmark.md) | pure Linear measurement, metrics and suites |
 | [Linear tuning and reports](maintainer/linear-tuning.md) | tuning ranges, priority points, dispatch tradeoffs and final performance report format |
 | [Cutting a release](maintainer/release-process.md) | the release flow, the packagers, smoke tests, and the gotchas that nearly shipped a broken archive |

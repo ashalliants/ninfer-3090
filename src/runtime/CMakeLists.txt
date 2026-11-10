@@ -1,4 +1,8 @@
 add_library(ninfer_runtime_support STATIC
+  engine/compaction/summary_registry.cpp
+  engine/compaction/summary_split.cpp
+  engine/compaction/summary_strategy.cpp
+  engine/compaction/vcc_projector.cpp
   engine/context_cache/context_cost.cpp
   engine/context_cache/context_cost_defaults.cpp
   engine/context_store/context_store.cpp

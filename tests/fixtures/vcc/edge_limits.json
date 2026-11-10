@@ -1,0 +1,2961 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Touch lots of things."
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r0",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_00.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r0",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 0"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r1",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_01.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r1",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 1"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r2",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_02.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r2",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 2"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r3",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_03.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r3",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 3"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r4",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_04.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r4",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 4"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r5",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_05.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r5",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 5"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r6",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_06.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r6",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 6"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r7",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_07.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r7",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 7"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r8",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_08.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r8",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 8"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r9",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_09.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r9",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 9"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r10",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_10.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r10",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 10"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r11",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_11.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r11",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 11"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r12",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_12.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r12",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 12"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r13",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_13.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r13",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 13"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r14",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_14.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r14",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 14"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r15",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_15.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r15",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 15"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r16",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_16.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r16",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 16"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r17",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_17.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r17",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 17"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r18",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_18.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r18",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 18"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r19",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_19.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r19",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 19"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r20",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_20.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r20",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 20"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r21",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_21.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r21",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 21"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r22",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_22.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r22",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 22"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r23",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_23.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r23",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 23"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r24",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_24.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r24",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 24"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r25",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_25.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r25",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 25"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r26",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_26.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r26",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 26"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r27",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_27.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r27",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 27"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r28",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_28.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r28",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 28"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r29",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_29.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r29",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 29"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r30",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_30.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r30",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 30"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r31",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_31.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r31",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 31"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r32",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_32.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r32",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 32"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r33",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_33.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r33",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 33"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r34",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_34.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r34",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 34"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r35",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_35.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r35",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 35"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r36",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_36.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r36",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 36"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r37",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_37.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r37",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 37"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r38",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_38.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r38",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 38"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r39",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_39.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r39",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 39"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r40",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_40.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r40",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 40"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r41",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_41.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r41",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 41"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r42",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_42.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r42",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 42"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r43",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_43.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r43",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 43"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "r44",
+     "name": "read_file",
+     "arguments_json": "{\"path\": \"/proj/file_44.py\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "r44",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "contents 44"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t0",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-0\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t0",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 0\", \"exit_code\": 1, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t1",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-1\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t1",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 1\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t2",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-2\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t2",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 2\", \"exit_code\": 1, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t3",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-3\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t3",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 3\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t4",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-4\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t4",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 4\", \"exit_code\": 1, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t5",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-5\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t5",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 5\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t6",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-6\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t6",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 6\", \"exit_code\": 1, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t7",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-7\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t7",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 7\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t8",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-8\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t8",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 8\", \"exit_code\": 1, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t9",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-9\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t9",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 9\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t10",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-10\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t10",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 10\", \"exit_code\": 1, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t11",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-11\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t11",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 11\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t12",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-12\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t12",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 12\", \"exit_code\": 1, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t13",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-13\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t13",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 13\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t14",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-14\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t14",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 14\", \"exit_code\": 1, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t15",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-15\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t15",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 15\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t16",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-16\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t16",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 16\", \"exit_code\": 1, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t17",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-17\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t17",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 17\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t18",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-18\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t18",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 18\", \"exit_code\": 1, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t19",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-19\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t19",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 19\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t20",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-20\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t20",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 20\", \"exit_code\": 1, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t21",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-21\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t21",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 21\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t22",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-22\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t22",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 22\", \"exit_code\": 1, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t23",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-23\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t23",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 23\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t24",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-24\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t24",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 24\", \"exit_code\": 1, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t25",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-25\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t25",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 25\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t26",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-26\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t26",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 26\", \"exit_code\": 1, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t27",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-27\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t27",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 27\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t28",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-28\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t28",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 28\", \"exit_code\": 1, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "t29",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"cmd-29\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "t29",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"out 29\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "m0",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"make check\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "m0",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"run 0\", \"exit_code\": 1, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "m1",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"make check\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "m1",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"run 1\", \"exit_code\": 1, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "m2",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"make check\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "m2",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"run 2\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "m3",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"make check\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "m3",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"run 3\", \"exit_code\": 2, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "m4",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"make check\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "m4",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"run 4\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "m5",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"make check\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "m5",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"run 5\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "m6",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"make check\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "m6",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"run 6\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "m7",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"make check\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "m7",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"run 7\", \"exit_code\": 3, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "m8",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"make check\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "m8",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"run 8\", \"exit_code\": 0, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "m9",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"make check\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "m9",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"run 9\", \"exit_code\": 1, \"error\": null}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "b0",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q0\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b0",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"error\": \"Failure0Error happened\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "b1",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q1\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b1",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"error\": \"Failure1Error happened\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "b2",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q2\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b2",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"error\": \"Failure2Error happened\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "b3",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q3\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b3",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"error\": \"Failure3Error happened\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "b4",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q4\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b4",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"error\": \"Failure4Error happened\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "b5",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q5\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b5",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"error\": \"Failure5Error happened\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "b6",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q6\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b6",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"error\": \"Failure6Error happened\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "b7",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q7\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b7",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"error\": \"Failure7Error happened\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "b8",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q8\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b8",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"error\": \"Failure8Error happened\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "b9",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q9\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b9",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"error\": \"Failure9Error happened\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "b10",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q10\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b10",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"error\": \"Failure10Error happened\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "b11",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q11\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b11",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"error\": \"Failure11Error happened\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "b12",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q12\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b12",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"error\": \"Failure12Error happened\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "b13",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q13\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b13",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"error\": \"Failure13Error happened\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "b14",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q14\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b14",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"error\": \"Failure14Error happened\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "x0",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q0\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "x0",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"fine\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "x1",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q1\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "x1",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"fine\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "x2",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q2\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "x2",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"fine\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "x3",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q3\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "x3",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"fine\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "x4",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q4\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "x4",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"fine\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "x5",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q5\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "x5",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"fine\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "x6",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q6\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "x6",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"fine\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "x7",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q7\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "x7",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"fine\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "x8",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q8\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "x8",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"fine\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "x9",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q9\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "x9",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"fine\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "x10",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q10\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "x10",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"fine\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "x11",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q11\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "x11",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"fine\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "x12",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q12\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "x12",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"fine\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "x13",
+     "name": "custom_tool",
+     "arguments_json": "{\"query\": \"q13\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "x13",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"fine\"}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e0",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(0)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e0",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name0Error and Other0Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e1",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(1)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e1",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name1Error and Other1Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e2",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(2)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e2",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name2Error and Other2Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e3",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(3)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e3",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name3Error and Other3Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e4",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(4)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e4",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name4Error and Other4Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e5",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(5)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e5",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name5Error and Other5Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e6",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(6)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e6",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name6Error and Other6Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e7",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(7)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e7",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name7Error and Other7Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e8",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(8)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e8",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name8Error and Other8Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e9",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(9)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e9",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name9Error and Other9Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e10",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(10)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e10",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name10Error and Other10Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e11",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(11)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e11",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name11Error and Other11Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e12",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(12)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e12",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name12Error and Other12Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e13",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(13)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e13",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name13Error and Other13Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e14",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(14)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e14",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name14Error and Other14Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e15",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(15)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e15",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name15Error and Other15Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e16",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(16)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e16",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name16Error and Other16Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e17",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(17)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e17",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name17Error and Other17Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e18",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(18)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e18",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name18Error and Other18Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e19",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(19)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e19",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name19Error and Other19Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e20",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(20)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e20",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name20Error and Other20Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e21",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(21)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e21",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name21Error and Other21Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e22",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(22)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e22",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name22Error and Other22Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e23",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(23)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e23",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name23Error and Other23Exception"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [],
+   "tool_calls": [
+    {
+     "id": "e24",
+     "name": "execute_code",
+     "arguments_json": "{\"code\": \"run(24)\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e24",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Name24Error and Other24Exception"
+    }
+   ]
+  },
+  {
+   "role": "user",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Wrap up."
+    }
+   ]
+  }
+ ],
+ "cases": [
+  {
+   "id": "b60000",
+   "first": 0,
+   "last": 280,
+   "budget_chars": 60000
+  },
+  {
+   "id": "b5000",
+   "first": 0,
+   "last": 280,
+   "budget_chars": 5000
+  },
+  {
+   "id": "b700",
+   "first": 0,
+   "last": 280,
+   "budget_chars": 700
+  }
+ ]
+}

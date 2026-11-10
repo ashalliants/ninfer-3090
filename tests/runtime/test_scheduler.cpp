@@ -57,6 +57,7 @@ struct Request {
     bool capture_pending             = false;
     bool slice_in_flight             = false;
     bool recovery_pending            = false;
+    std::uint64_t prefill_deadline   = 0;
     std::optional<Budget> budget     = Budget{};
     std::optional<SequenceHandle> sequence;
     Output output;
@@ -310,6 +311,38 @@ void test_prefill_replay_round_robin() {
             "completed capture did not restore replay eligibility");
 }
 
+// --prefill-order shortest: the earliest deadline goes first, whatever the rotation says; a tie
+// keeps the rotation's order, and a chunk part-way through its slices still goes first.
+void test_prefill_shortest_first() {
+    Scheduler scheduler;
+    scheduler.set_prefill_order(ninfer::PrefillOrder::Shortest);
+    Slots slots{};
+    slots[0] = request(1, Request::Phase::Prefill);
+    slots[1] = request(2, Request::Phase::Replay);
+    slots[2] = request(3, Request::Phase::Prefill);
+    slots[3] = request(4, Request::Phase::Decode);
+    slots[0]->prefill_deadline = 900; // long, submitted first
+    slots[1]->prefill_deadline = 500; // a restored request keeps its deadline
+    slots[2]->prefill_deadline = 300; // short, submitted later
+    slots[3]->prefill_deadline = 100; // decoding: not a prefill candidate
+    for (int turn = 0; turn < 3; ++turn) {
+        const auto lane = scheduler.next_prefill(slots, 4);
+        require(lane == 2U, "the earliest prefill deadline did not keep the turn");
+        scheduler.prefill_executed(*lane, 4);
+    }
+    slots[2]->phase = Request::Phase::Decode;
+    require(scheduler.next_prefill(slots, 4) == 1U, "the next deadline did not take over");
+    slots[1]->phase = Request::Phase::Decode;
+    require(scheduler.next_prefill(slots, 4) == 0U,
+            "a long prefill was not run once nothing earlier was left");
+    slots[2]->phase            = Request::Phase::Prefill;
+    slots[2]->prefill_deadline = 900;
+    scheduler.prefill_executed(0, 4);
+    require(scheduler.next_prefill(slots, 4) == 2U, "a tie did not follow the rotation");
+    slots[0]->slice_in_flight = true;
+    require(scheduler.next_prefill(slots, 4) == 0U, "a part-sliced chunk did not go first");
+}
+
 void test_decode_and_control_membership() {
     Scheduler scheduler;
     Slots slots{};
@@ -370,6 +403,25 @@ void test_pause_host_target() {
             "a target that exactly fills the budget is still reachable");
 }
 
+void test_pause_reserve_target() {
+    using ninfer::runtime::pause_eviction_target;
+    using ninfer::runtime::pause_reserve_free;
+    using ninfer::runtime::pause_target_reached;
+    require(pause_reserve_free(200, 50) == 150 && pause_reserve_free(200, 200) == 0 &&
+                pause_reserve_free(200, 900) == 0,
+            "the free reserve is what the snapshots there leave, never negative");
+    require(pause_eviction_target(500, 150) == 350 && pause_eviction_target(100, 150) == 0,
+            "eviction makes up only what the free reserve cannot take");
+    // Budget 1000 full, reserve 200 full of later snapshots: a 1100-byte snapshot has a 1100
+    // target, above the budget; the reserve snapshots released count toward it.
+    require(pause_eviction_target(1100, 0) == 1100 &&
+                !pause_target_reached(0, 0, 0, 1100) && !pause_target_reached(900, 0, 100, 1100) &&
+                pause_target_reached(900, 0, 200, 1100),
+            "reserve bytes freed since the target was set count toward it");
+    require(pause_target_reached(1100, 50, 50, 1100) && !pause_target_reached(1099, 50, 50, 1100),
+            "free budget bytes alone reach an exact target");
+}
+
 void test_prompt_fit_beside_residents() {
     using ninfer::runtime::KvPageCounts;
     using ninfer::runtime::prompt_fits_beside_residents;
@@ -391,6 +443,17 @@ void test_prompt_fit_beside_residents() {
             "pages promised to residents are not free for a new prompt");
     require(!prompt_fits_beside_residents({10, 0}, {40, 0}, KvPageCounts{49, 0}, true),
             "pages lent away are not free for a new prompt");
+    // A resident early in a long prefill holds one chunk but will need its whole prompt (#332).
+    using ninfer::runtime::resident_pages_to_prompt_end;
+    require(resident_pages_to_prompt_end(683, 16, 16) == 651,
+            "a resident's unreached prompt pages count beside what it maps and has reserved");
+    require(resident_pages_to_prompt_end(683, 683, 0) == 0 &&
+                resident_pages_to_prompt_end(683, 690, 4) == 0,
+            "a resident past its prompt end (decoding) has nothing more to come");
+    require(!prompt_fits_beside_residents(
+                {683, 0}, {16 + 16 + resident_pages_to_prompt_end(683, 16, 16), 0},
+                KvPageCounts{1094, 0}, true),
+            "two 43.7K prompts are not let into a 70K pool together");
     // An unaligned reused prefix shares only its full pages: 130 tokens = 2 full + a copied tail.
     require(ninfer::runtime::shareable_prefix_pages(130, 64) == 2 &&
                 ninfer::runtime::shareable_prefix_pages(128, 64) == 2 &&
@@ -408,9 +471,11 @@ int main() {
         test_pressure_victims_and_first_unit();
         test_restore_events();
         test_prefill_replay_round_robin();
+        test_prefill_shortest_first();
         test_decode_and_control_membership();
         test_progress_anchor_frontiers();
         test_pause_host_target();
+        test_pause_reserve_target();
         test_prompt_fit_beside_residents();
         std::cout << "ok\n";
         return 0;

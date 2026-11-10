@@ -41,7 +41,8 @@ public:
     // is loaded and warmed up already.
     RoutedModelService(std::string id, std::unique_ptr<GenerationService> service,
                        std::shared_ptr<spdlog::logger> logger, std::shared_ptr<RoutedPorts> ports,
-                       std::shared_ptr<OpenAIResponsesStore> responses_store);
+                       std::shared_ptr<OpenAIResponsesStore> responses_store,
+                       std::shared_ptr<AnthropicReasoningStore> reasoning_store);
     ~RoutedModelService() override;
 
     RoutedModelService(const RoutedModelService&)            = delete;

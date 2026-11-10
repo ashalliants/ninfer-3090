@@ -1,0 +1,65 @@
+{
+ "messages": [
+  {
+   "role": "assistant",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "Resuming from the plan."
+    }
+   ],
+   "tool_calls": [
+    {
+     "id": "n1",
+     "name": "terminal",
+     "arguments_json": "{\"command\": \"git status\"}"
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "n1",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "{\"output\": \"clean\", \"exit_code\": 0}"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "All clean."
+    }
+   ]
+  },
+  {
+   "role": "user",
+   "parts": [
+    {
+     "kind": "text",
+     "text": ""
+    }
+   ]
+  },
+  {
+   "role": "user",
+   "parts": [
+    {
+     "kind": "text",
+     "text": "   \n\t "
+    }
+   ]
+  }
+ ],
+ "cases": [
+  {
+   "id": "b2000",
+   "first": 0,
+   "last": 5,
+   "budget_chars": 2000
+  }
+ ]
+}
