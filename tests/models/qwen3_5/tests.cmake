@@ -201,6 +201,10 @@ ninfer_add_test(ninfer_qwen3_5_mlp_a8_decode_test
 ninfer_add_test(ninfer_qwen3_5_ngram_proposer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_proposer.cpp"
   LIBRARIES ninfer_core)
+
+ninfer_add_test(ninfer_qwen3_5_draft_window_policy_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_draft_window_policy.cpp"
+  LIBRARIES ninfer_core)
 # STANDALONE: the Python schema oracle drives this probe by executable path.
 ninfer_add_test(ninfer_qwen3_5_tool_constraints_test
   STANDALONE
