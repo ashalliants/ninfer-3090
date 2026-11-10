@@ -85,6 +85,32 @@ the idea is obvious and the obstacle is not.
   one acceptance threshold. The curve is flat in the middle, so two points take most of the spread
   for one extra graph and one bit of per-sequence state.
 
+  **Status (branch `perf/adaptive-dflash-k`): implemented, opt-in, unmeasured.**
+  `--adaptive-draft-tokens 3` captures a second neural round family at K=3 beside `--draft-tokens`
+  (the round-family machinery the copy rounds use already keys graphs, replay records and workspace
+  by verify width, so the second profile is one more `SpeculativeRoundShape`). A pure policy
+  (`speculative/draft_window_policy.h`) picks the family per round from a decayed per-request
+  acceptance estimate (accepted drafts over accepted-plus-first-rejection, independent of the window
+  the round ran at), an expected-tokens-per-cost model, hysteresis (5% margin, 8-round dwell) and the
+  summed expectation of the lanes sharing the round. What differs from the plan above:
+  - It is not "one threshold": the crossover depends on the cost ratio. The prior (K=3 round at 0.90
+    of a K=7 round) is back-solved from the three-point sweep above at one lane on a low-acceptance
+    prompt; at that ratio the geometric model puts the crossover near 55% per-draft acceptance, with
+    the gain concentrated below 45% (about 10% at 30%). Online round-time means replace the prior
+    after 16 rounds of each family, and are noisy across context lengths.
+  - Costs are charged conservatively in the graph allowance (a second full neural family), not at the
+    copy family's 16-32 MiB marginal, because the sharing has not been measured.
+  - Acceptance is not geometric (DFlash2's per-position acceptance falls faster than `a^i`), so the
+    policy will, if anything, hold the high window longer than optimal.
+  - Nothing here has run on a GPU. Fixed in advance, before any measurement (server restarts for
+    A=fixed K=7 and B=`--adaptive-draft-tokens 3`, order ABBA x3 per concurrency 1/2/4, thinking
+    off, real prompts incl. one low-acceptance and one high-acceptance, decode time from the request
+    log): (1) no cell below 0.98x of A; (2) at least 1.05x on the low-acceptance prompt at C1, with
+    A-vs-A spread under 2%; (3) greedy outputs differ from A no more often than fixed K=3 differs
+    from fixed K=7; (4) B starts at the profile's context at C1 and C2 and the graph memory it adds
+    is reported; (5) with the flag off, decode matches master within 1%. Failing any of them leaves
+    it opt-in and out of every launcher profile, with the failure recorded here.
+
 **2. Copy drafting on the DFlash2 path -- done at one and two lanes; on in the one- and two-lane launchers.**
 `--ngram-draft-tokens 15` verifies n-gram copies in 16-column rounds beside DFlash2: +42% decode
 on the agent replay at one lane, up to +76% on turns that return a file; a copy-miss backoff fixed
