@@ -1140,6 +1140,19 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             head.qtype, head.layout, head.k,
             parameters.proposal.has_value() && parameters.proposal->token_ids.has_value());
         if (!why.empty()) { throw std::invalid_argument(why); }
+        // The row set is one union across every lane (context_rows.h: "one fixed-capacity set
+        // shared by every lane"), so a lane's drafts can be widened by another lane's own text.
+        // Drafts only, verification decides every token -- but ninfer_qwen3_5_context_rows_real_test
+        // found that a second concurrent request still changes the first's greedy output (RTX 3090,
+        // Vast, 2026-11-10): one request at a time stayed bit for bit identical, two at once did not.
+        // The real mechanism is not yet understood; refuse the one combination where it is live
+        // rather than ship a broken identity promise. TODO.md tracks reopening this once the shared
+        // table either becomes per-lane or the actual cause of the divergence is found.
+        if (options.max_concurrency > 1) {
+            throw std::invalid_argument(
+                "--draft-context-rows is not identity-preserving above one lane yet "
+                "(ninfer_qwen3_5_context_rows_real_test, 2026-11-10): use --max-concurrency 1");
+        }
     }
     if (device.compute_capability() != 80 && device.compute_capability() != 86 &&
         device.compute_capability() != 89) {

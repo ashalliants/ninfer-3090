@@ -1,7 +1,15 @@
 // Draft-head context rows (--draft-context-rows) on a real artifact: greedy output must be the
-// same ids with the option off and on, one request at a time and two at once (the set is a union
-// across lanes), and the run reports both acceptance rates. Drafts only, so a difference in output
-// is a bug; the acceptance change is the measurement, not a pass condition.
+// same ids with the option off and on, one request at a time, and the run reports both acceptance
+// rates. Drafts only, so a difference in output is a bug; the acceptance change is the
+// measurement, not a pass condition.
+//
+// The row set is one union across every lane (context_rows.h: "one fixed-capacity set shared by
+// every lane"). This test originally also compared two concurrent requests the same way, and found
+// (RTX 3090, Vast, 2026-11-10) that a second request still changes the first's greedy output even
+// though one request at a time stays bit for bit identical: the real mechanism is not yet
+// understood. Startup now refuses --draft-context-rows above one lane
+// (planning/startup.cpp:validate_target_options) until that is fixed or the table becomes
+// per-lane; this test instead confirms the refusal.
 //
 // NINFER_TEST_ARTIFACT names the Qwen3.8-27B or Qwen3.6-35B-A3B artifact; NINFER_CONTEXT_ROWS_SPEC
 // selects mtp (default), dflash or dflash2.
@@ -29,13 +37,14 @@ ninfer::SpeculativeBackend backend() {
     return ninfer::SpeculativeBackend::Mtp;
 }
 
-ninfer::EngineOptions engine_options(const char* artifact, std::uint32_t context_rows) {
+ninfer::EngineOptions engine_options(const char* artifact, std::uint32_t context_rows,
+                                     std::uint32_t max_concurrency) {
     ninfer::EngineOptions options;
     options.artifact_path             = artifact;
     options.max_context               = 4096;
     options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(8192);
     options.prefill_chunk             = 1024;
-    options.max_concurrency           = 2;
+    options.max_concurrency           = max_concurrency;
     options.kv_cache                  = ninfer::KvCacheStorage::Int8Group64;
     options.speculative.backend       = backend();
     options.speculative.draft_tokens  = backend() == ninfer::SpeculativeBackend::Mtp ? 3 : 7;
@@ -82,12 +91,12 @@ struct Totals {
 
 struct Run {
     std::vector<std::vector<ninfer::TokenId>> sequential;
-    std::vector<std::vector<ninfer::TokenId>> concurrent;
+    std::vector<std::vector<ninfer::TokenId>> concurrent; // empty when max_concurrency == 1
     Totals totals;
 };
 
-Run run(const char* artifact, std::uint32_t context_rows) {
-    ninfer::Engine engine(engine_options(artifact, context_rows));
+Run run(const char* artifact, std::uint32_t context_rows, std::uint32_t max_concurrency) {
+    ninfer::Engine engine(engine_options(artifact, context_rows, max_concurrency));
     Run out;
     for (const std::string& text : prompts()) {
         const auto result =
@@ -95,7 +104,9 @@ Run run(const char* artifact, std::uint32_t context_rows) {
         out.sequential.push_back(result.generated_token_ids);
         out.totals.add(result);
     }
-    // Both prompts at once: one lane's ids are context rows for the other's drafts too.
+    if (max_concurrency < 2) { return out; }
+    // Both prompts at once: one lane's ids are context rows for the other's drafts too. Only
+    // reachable with context_rows == 0: startup refuses this combination above one lane otherwise.
     auto first  = engine.submit(engine.prepare_tokens(engine.tokenize_text(prompts()[0])),
                                 greedy(192));
     auto second = engine.submit(engine.prepare_tokens(engine.tokenize_text(prompts()[1])),
@@ -123,15 +134,24 @@ int run_test() {
         std::cout << "skip: NINFER_TEST_ARTIFACT is not set\n";
         return 77;
     }
-    const Run off = run(artifact, 0);
-    const Run on  = run(artifact, 512);
-    int failures  = 0;
+    const Run off = run(artifact, 0, 2);
+    // --draft-context-rows is refused above one lane (planning/startup.cpp): only sequential
+    // generation is reachable for "on", so it is compared against off's sequential results only.
+    const Run on = run(artifact, 512, 1);
+    int failures = 0;
     if (on.sequential != off.sequential) {
         std::cerr << "greedy output changed with --draft-context-rows 512 (one request at a time)\n";
         ++failures;
     }
-    if (on.concurrent != off.concurrent || on.concurrent != off.sequential) {
-        std::cerr << "greedy output changed with --draft-context-rows 512 (two requests at once)\n";
+    bool refused = false;
+    try {
+        ninfer::Engine rejected(engine_options(artifact, 512, 2));
+        (void)rejected;
+    } catch (const std::invalid_argument& error) {
+        refused = std::string_view(error.what()).find("--draft-context-rows") != std::string_view::npos;
+    }
+    if (!refused) {
+        std::cerr << "--draft-context-rows above one lane was not refused at startup\n";
         ++failures;
     }
     std::cout << "acceptance: off " << off.totals.accepted << "/" << off.totals.drafted << " ("
