@@ -15,6 +15,25 @@ __device__ __forceinline__ float tripwire_to_float(__nv_bfloat16 value) {
     return __bfloat162float(value);
 }
 
+// The FP32 bits recorded for an offending element. The hardware half->float conversion turns every
+// NaN into the canonical 0x7fffffff (measured on an RTX 3090, 2026-11-10), but the record promises
+// the element widened with its NaN payload kept (numeric_tripwire.h), so FP16 NaNs are widened by
+// hand: sign, a quiet exponent, and the mantissa shifted into place. Every other value is exact
+// through the conversion, and BF16 and FP32 never lose a payload.
+__device__ __forceinline__ std::uint32_t tripwire_value_bits(float, float widened) {
+    return __float_as_uint(widened);
+}
+__device__ __forceinline__ std::uint32_t tripwire_value_bits(__nv_bfloat16, float widened) {
+    return __float_as_uint(widened);
+}
+__device__ __forceinline__ std::uint32_t tripwire_value_bits(__half raw, float widened) {
+    const std::uint32_t bits = __half_as_ushort(raw);
+    if ((bits & 0x7c00U) == 0x7c00U && (bits & 0x03ffU) != 0U) {
+        return ((bits & 0x8000U) << 16U) | 0x7fc00000U | ((bits & 0x03ffU) << 13U);
+    }
+    return __float_as_uint(widened);
+}
+
 // NaN fails the `<=` and so offends; an infinity offends through isinf even when the limit is
 // itself infinite.
 __device__ __forceinline__ bool tripwire_offends(float value, float abs_limit) {
@@ -39,7 +58,7 @@ __global__ void numeric_tripwire_scan_kernel(const T* values, std::int64_t count
             // Indices only grow along this thread's slice, so the first hit is its lowest.
             if (local_best == 0) {
                 local_best = numeric_tripwire_pack(static_cast<std::uint32_t>(i),
-                                                   __float_as_uint(value));
+                                                   tripwire_value_bits(values[i], value));
             }
         }
     }
