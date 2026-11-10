@@ -47,7 +47,8 @@ struct TripwireGeometry {
     const std::uint32_t index = site & 0xffffU;
     switch (static_cast<TripwireProbe>(site >> 16U)) {
     case TripwireProbe::GdnOutput:
-        return "GDN layer output (read from the recurrent state), linear-attention layer " +
+        return "GDN layer output (the state itself is not read back; a bad state shows here in "
+               "the same step), linear-attention layer " +
                std::to_string(index) + " counting from 0";
     case TripwireProbe::FinalHidden:
         return "final hidden state (after the last norm, before the output head)";
