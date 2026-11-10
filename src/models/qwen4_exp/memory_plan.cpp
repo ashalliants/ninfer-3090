@@ -248,7 +248,12 @@ std::string HostMemoryLedger::summary() const {
                       "weights. Raise it (ulimit -l unlimited, or LimitMEMLOCK=infinity for a service) and start "
                       "again",
                       gib(*snapshot.lock_limit), gib(pinned_total));
-    } else if (lock_limited) {
+    } else if (lock_limited && fits) {
+        // fits is required here: lock_limited is set whenever pinned_total exceeds the limit,
+        // whether or not that is the (or the only) reason for the outcome. Advisory mode only
+        // skips the memory-lock refusal specifically; a ledger that still does not fit for an
+        // unrelated reason (reserve, commit, the experts' own need) falls through to the branch
+        // below, which names that real reason instead of this one.
         std::snprintf(line, sizeof(line),
                       "RAM: the memory-lock limit is %.1f GiB, below the %.1f GiB Qwen3.8-Flash-Next pins. "
                       "Continuing anyway (--allow-unlocked-host-memory): a pin that genuinely cannot be made "
