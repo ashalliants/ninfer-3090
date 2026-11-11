@@ -299,6 +299,12 @@ ninfer_add_test(ninfer_qwen3_5_text_positions_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_text_positions.cpp"
   LIBRARIES ninfer_core)
 
+# Overlay Vision staging for MTP prefill chunks, including a chunk that ends right before an image
+# (header only, links no kernel).
+ninfer_add_test(ninfer_qwen3_5_overlay_staging_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_overlay_staging.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_qwen3_5_ngram_proposer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_proposer.cpp"
   LIBRARIES ninfer_core)

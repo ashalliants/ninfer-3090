@@ -46,6 +46,7 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_qwen3_5_lossy_scout_plan_test
   ninfer_qwen3_5_lossy_selection_test
   ninfer_qwen3_5_ngram_proposer_test
+  ninfer_qwen3_5_overlay_staging_test
   ninfer_qwen3_5_text_positions_test
   ninfer_read_only_file_test
   ninfer_recovery_loss_test

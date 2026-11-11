@@ -32,6 +32,11 @@ void scatter_shifted_visual_embeddings(Tensor& input_embeddings, const Tensor& v
     if (overlap.source_begin < source_column_base) {
         throw std::invalid_argument("shifted visual scatter source precedes the staged columns");
     }
+    // A default-constructed Tensor is [1,1,1,1] with no data, so slicing one succeeds and the
+    // failure surfaces much later as a scatter shape error. Name the real fault here.
+    if (visual_embeddings.data == nullptr || visual_embeddings.ne[0] != input_embeddings.ne[0]) {
+        throw std::logic_error("shifted visual scatter has no staged embedding columns");
+    }
     Tensor embeddings = visual_embeddings.slice(
         1, static_cast<std::int32_t>(overlap.source_begin - source_column_base), count);
     ops::scatter(embeddings, destination_indices, input_embeddings, stream);

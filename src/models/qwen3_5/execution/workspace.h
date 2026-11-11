@@ -4,6 +4,7 @@
 
 #include "core/arena.h"
 #include "core/layout.h"
+#include "models/qwen3_5/execution/overlay_staging.h"
 #include "models/qwen3_5/execution/parameters.h"
 
 #include <cstdint>
@@ -40,12 +41,13 @@ TextPrefillRoots text_prefill_roots(Allocator& allocator, const TextConfig& conf
     out.positions = vector(allocator, DType::I32, tokens);
     if (rope_axes != 0) { out.rope_positions = matrix(allocator, DType::I32, tokens, rope_axes); }
     out.residual = matrix(allocator, DType::BF16, dimension(config.hidden_size), tokens);
-    if (scatter_tokens != 0) {
-        out.scatter_indices = vector(allocator, DType::I32, scatter_tokens);
-        if (overlay_staging) {
-            out.visual_embeddings =
-                matrix(allocator, DType::BF16, dimension(config.hidden_size), scatter_tokens + 1);
-        }
+    if (scatter_tokens != 0) { out.scatter_indices = vector(allocator, DType::I32, scatter_tokens); }
+    // Overlay staging also serves a chunk with no visual token of its own: under MTP its shifted
+    // input can name the next item's first column.
+    if (const std::int32_t columns = qwen3_5::detail::overlay_root_columns(overlay_staging, scatter_tokens);
+        columns != 0) {
+        out.visual_embeddings =
+            matrix(allocator, DType::BF16, dimension(config.hidden_size), columns);
     }
     return out;
 }

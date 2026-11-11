@@ -78,6 +78,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_qwen3_5_scout_a4_wiring_test
   ninfer_qwen3_5_mtp_graph_profiles_test
   ninfer_qwen3_5_ngram_proposer_test
+  ninfer_qwen3_5_overlay_staging_test
   ninfer_qwen3_5_reasoning_loop_test
   ninfer_qwen3_5_runtime_mechanisms_test
   ninfer_qwen3_5_speculative_round_shapes_test

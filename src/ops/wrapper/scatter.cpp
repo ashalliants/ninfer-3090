@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops {
 
@@ -15,7 +16,14 @@ void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t
     if (src.ne[2] != 1 || src.ne[3] != 1 || dst.ne[2] != 1 || dst.ne[3] != 1 ||
         indices.ne[1] != 1 || indices.ne[2] != 1 || indices.ne[3] != 1 || src.ne[0] != dst.ne[0] ||
         indices.ne[0] != src.ne[1]) {
-        throw std::invalid_argument("scatter: expected src [D,V], indices [V], dst [D,T]");
+        // Print the shapes: one message used to cover six different faults.
+        const auto shape = [](const Tensor& t) {
+            return "[" + std::to_string(t.ne[0]) + "," + std::to_string(t.ne[1]) + "," +
+                   std::to_string(t.ne[2]) + "," + std::to_string(t.ne[3]) + "]";
+        };
+        throw std::invalid_argument("scatter: expected src [D,V], indices [V], dst [D,T]; got src " +
+                                    shape(src) + ", indices " + shape(indices) + ", dst " +
+                                    shape(dst));
     }
     if (src.ne[0] < 0 || src.ne[1] < 0 || dst.ne[1] < 0) {
         throw std::invalid_argument("scatter: negative dimension");
