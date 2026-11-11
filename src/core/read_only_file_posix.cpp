@@ -24,6 +24,47 @@
 
 namespace ninfer {
 
+#if defined(__linux__)
+namespace {
+
+// One Linux AIO context per thread, created on first use and kept for the thread's life instead of
+// a fresh io_setup/io_destroy per read_direct_blocks call: a 2026-11-11 session measured io_destroy
+// alone costing ~0.5 s a call on a rented box (TLB-shootdown IPI latency, most likely, under that
+// box's virtualization), which -- paid on every decode-time n-gram read batch -- was the real cause
+// of a measured decode collapse, not the reads themselves (io_submit/io_getevents stayed fast
+// throughout). A raw syscall wrapper's destructor runs at thread exit, where the same cost is paid
+// once per thread instead of once per call.
+struct ThreadAioContext {
+    aio_context_t handle = 0;
+    unsigned capacity    = 0;
+
+    ~ThreadAioContext() { reset(); }
+
+    void reset() {
+        if (capacity > 0) {
+            ::syscall(SYS_io_destroy, handle);
+            handle   = 0;
+            capacity = 0;
+        }
+    }
+};
+thread_local ThreadAioContext g_aio_context;
+
+// A context with at least `slots` capacity, reusing this thread's existing one when it already has
+// enough room; 0 if io_setup fails, so the caller can fall back to serial reads as before.
+aio_context_t acquire_aio_context(unsigned slots) {
+    if (g_aio_context.capacity >= slots) { return g_aio_context.handle; }
+    g_aio_context.reset();
+    aio_context_t context = 0;
+    if (::syscall(SYS_io_setup, slots, &context) != 0) { return 0; }
+    g_aio_context.handle   = context;
+    g_aio_context.capacity = slots;
+    return context;
+}
+
+} // namespace
+#endif
+
 struct ReadOnlyFile::Impl {
     int fd             = -1;
     std::uint64_t size = 0;
@@ -67,11 +108,11 @@ void ReadOnlyFile::read_direct_blocks(std::span<const std::uint64_t> offsets, st
     }
     if (offsets.empty()) { return; }
 #if defined(__linux__)
-    // Kernel AIO on the O_DIRECT descriptor keeps one read per ring block in flight.
-    const std::size_t slots = std::min(ring.size() / block_bytes, offsets.size());
-    aio_context_t context   = 0;
-    if (::syscall(SYS_io_setup, static_cast<unsigned>(slots), &context) == 0) {
-        const auto destroy = [&] { ::syscall(SYS_io_destroy, context); };
+    // Kernel AIO on the O_DIRECT descriptor keeps one read per ring block in flight, on this
+    // thread's persistent context (acquire_aio_context): see ThreadAioContext above.
+    const std::size_t slots      = std::min(ring.size() / block_bytes, offsets.size());
+    const aio_context_t context  = acquire_aio_context(static_cast<unsigned>(slots));
+    if (context != 0) {
         std::vector<iocb> blocks(slots);
         std::vector<io_event> events(slots);
         std::vector<std::size_t> idle;
@@ -124,7 +165,9 @@ void ReadOnlyFile::read_direct_blocks(std::span<const std::uint64_t> offsets, st
                         break;
                     }
                 }
-                destroy();
+                // This context's state after a failed io_getevents is not something to trust with
+                // the next call: drop it now so acquire_aio_context sets up a fresh one next time.
+                g_aio_context.reset();
                 throw std::system_error(error, std::generic_category(), "direct block read: io_getevents");
             }
             for (long e = 0; e < done; ++e) {
@@ -144,7 +187,7 @@ void ReadOnlyFile::read_direct_blocks(std::span<const std::uint64_t> offsets, st
                 --in_flight;
             }
         }
-        destroy();
+        // The context outlives this call (acquire_aio_context, reused by this thread's next one).
         if (consume_error) { std::rethrow_exception(consume_error); }
         if (failure != 0) { throw std::system_error(failure, std::generic_category(), "direct block read"); }
         if (short_read) { throw std::runtime_error("direct block read: a read did not complete in full"); }
