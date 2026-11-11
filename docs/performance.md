@@ -51,6 +51,47 @@ draft head, exact for DFlash-3 on the 35B) are in `docs/config-calculator.test.m
 has no top-k kernel); with the draft head, as the launchers run it, it works. Qwen3.6-27B's artifact
 has no DFlash2 bundle.
 
+### Basalt-learnings options, measured relative to off (RTX 3090, 2026-11-11)
+
+One Vast RTX 3090 session (Linux, driver 580.178.04, 285 W stock power), the `tools/bench/basalt_gpu_verify.sh`
+checklist from #383/the "Basalt learnings" PR: each option A/B against the same option off, ABBA,
+n = 12 reps, paired median. These are **per-option deltas against off, not absolute tok/s and not a
+stacked combined number** -- no single run measured every winning option on at once with a clean
+option set (see the PR's own Verification section for why `combined_choice()`'s own attempt at that
+is unreliable). Full detail, including identity/quality verdicts, is in `docs/serving.md`'s per-option
+table.
+
+| Option | Workload | B/A median | Positive | Verdict |
+|---|---|---:|---:|---|
+| `--prefill-cpu-share 0.4` | Flash-Next, 2K prefill | **+15.47%** | 12/12 | win, in the tuned profile |
+| `--moe-gate-up-registers` | Flash-Next, decode+MTP | **+2.49%** | 9/12 | win, in the tuned profile |
+| `--relaxed-drafting 0.5`, DFlash2 | 27B, sampled chat | **+2.32%** | 12/12 | win (changes output distribution; opt-in) |
+| `--relaxed-drafting 0.5`, MTP | 27B, sampled chat | **+3.78%** | 12/12 | win (changes output distribution; opt-in) |
+| `--gdn-head-map` | Flash-Next, decode+MTP | +0.83% | 9/12 | mild gain, in the tuned profile |
+| `--gdn-async-commit` | Flash-Next, decode+MTP | +0.63% | 8/12 | wash, in the tuned profile |
+| `--shared-expert-stream` | Flash-Next, decode+MTP | +0.37% | 7/12 | wash, in the tuned profile |
+| `--hot-embedding-rows 8192` | Flash-Next, decode+MTP | +0.46% | 7/12 | wash; VRAM/RAM tradeoff, not in the profile |
+| `--moe-precast-input` | Flash-Next, decode+MTP | +0.15% | 7/12 | wash, in the tuned profile (`--moe-gate-up-registers`'s prerequisite) |
+| `--ngram-flag-wait` | Flash-Next, decode+MTP | +1.53% | 7/12 | wash |
+| `--partial-ram-residency` | Flash-Next, decode+MTP | +1.44% | 6/12 | wash (one outlier rep to +35.86%) |
+| `--draft-context-rows 512` | 27B, greedy chat, 1 lane | +0.40% | 12/12 | small win, output unchanged; refused above 1 lane (a real bug found and fixed) |
+| `--moe-fused-route` | Flash-Next, decode+MTP | -0.38% | 6/12 | wash/slight negative, not in the profile |
+| `--hc-fused-read` | Flash-Next, decode+MTP | -1.00% | 3/12 | wash, not in the profile |
+| `--ngram-prefetch` | Flash-Next, decode+MTP | **-16.57%** | 0/12 | regression, avoid |
+| `--cpu-verify-misses` (default 6 workers) | Flash-Next, decode+MTP | **-16.70%** | 0/12 | regression, avoid |
+| `--ggml-decode-mma` | Flash-Next, decode+MTP | -5.46% | 1/12 | regression; also changes output (quality-kind), unverified without a KLD base |
+| `--hc-int8` | Flash-Next, decode+MTP | **-26.42%** | 0/12 | regression; also changes output (quality-kind), unverified without a KLD base |
+
+`scripts/profiles/qwen38-flash-next-tuned.json` enables every confirmed win and wash above except
+`--hot-embedding-rows` (a deliberate VRAM/RAM sizing tradeoff, not a speed call) and
+`--moe-fused-route` (slight negative, excluded conservatively).
+
+Basalt itself is only a design reference here, not a same-hardware comparison: its own published
+numbers for `--relaxed-drafting` (docs/serving.md, [Relaxed drafting](serving.md#relaxed-drafting))
+are from its own engine and model on an **RTX 5090**, a different, faster card -- +3 to +20% decode
+speed depending on threshold and temperature. This session's RTX 3090 numbers above are in that
+same rough direction and range, but the two were never run side by side on the same GPU.
+
 ### v0.16.0 release binaries, all three models (2026-10-14)
 
 Measured on the **published v0.16.0 Windows zip** (`ninfer-serve.exe` and `ninfer_bench.exe` from the

@@ -328,6 +328,16 @@ speculation pays off less on text that is harder to predict. Decode speed and it
 [the plan](docs/maintainer/flash-next-plan.md#pr-13-measurements); the server reference is
 [docs/serving.md](docs/serving.md#qwen38-flash-next-preview).
 
+A later session measured a batch of opt-in speed options from #383 ("Basalt learnings") against
+off, each on an RTX 3090, ABBA A/B, 12 repetitions: `--prefill-cpu-share 0.4` is the clear win on
+prefill (+15.47% median, every repetition faster); `--moe-gate-up-registers` the best decode-side
+gain (+2.49%). `scripts/profiles/qwen38-flash-next-tuned.json` turns on every option that measured
+as a confirmed win or wash; the full per-option table, including the regressions left off
+(`--ngram-prefetch`, `--cpu-verify-misses`, `--hc-int8`, `--ggml-decode-mma`), is in
+[docs/performance.md](docs/performance.md#basalt-learnings-options-measured-relative-to-off-rtx-3090-2026-11-11)
+and [docs/serving.md](docs/serving.md#qwen38-flash-next-preview). These are per-option deltas
+against off, not a combined number: no run measured every winning option stacked together.
+
 **Keep the n-gram volume on your fastest drive.** The 29 GB `.ngram` file is read on every prompt,
 the 40 GB model only once at load. If the model sits on a SATA SSD or a hard disk, copy just the
 `.ngram` file to an NVMe drive and point the launcher at it; the model can stay where it is:
@@ -526,6 +536,13 @@ conversations on both Flash-Next and the 27B: after a 1+2 conversation was conti
 forked as 1+2+4, each branch could be continued again and reused its whole shared prefix, so a
 14K-token branch step reached its first word in about 1.3-1.6 s against 5.7-6.5 s cold.
 [Details](docs/performance.md#v0160-release-binaries-all-three-models-2026-10-14).
+
+A batch of opt-in options from #383 ("Basalt learnings") were measured on an RTX 3090 (2026-11-11,
+each against the same option off, ABBA, 12 reps): **+15.47% prefill** with `--prefill-cpu-share 0.4`
+(the clear win, every repetition faster), **+2.49% decode** with `--moe-gate-up-registers` (the best
+decode-side gain). `scripts/profiles/qwen38-flash-next-tuned.json` turns on every option that
+measured as a win or a wash; two options measured as clear regressions and stayed off
+(`--ngram-prefetch`, `--cpu-verify-misses`). [Details](docs/performance.md#basalt-learnings-options-measured-relative-to-off-rtx-3090-2026-11-11).
 
 ![Qwen3.8-Flash-Next on one RTX 3090: NInfer-3090 against Strata 0.1.38 on the same GGUF](docs/assets/flash-next-speed.svg)
 
