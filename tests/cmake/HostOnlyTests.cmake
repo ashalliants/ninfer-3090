@@ -22,6 +22,7 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_dashboard_page_test
   ninfer_effective_thinking_budget_test
   ninfer_dsv4_perf_model_test
+  ninfer_expert_tier_plan_test
   ninfer_flash_next_perf_model_test
   ninfer_gdn_head_map_test
   ninfer_gdn_replay_records_test
