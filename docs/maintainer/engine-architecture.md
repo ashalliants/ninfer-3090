@@ -81,8 +81,9 @@ EngineCore 拥有 request record、等待队列、resident slots、paused queue�
 response event 和 Engine availability。它编排 admission、资源事务、有限执行单元和终态结算，
 保证模型提交、输出提交及用户可见事件的顺序。
 
-Scheduler 拥有执行成员与公平性规则：fresh admission 的有限绕过、prefill 轮转、紧凑 decode/control
-批次、抢占受害请求及恢复机会。它使用请求状态和提交顺序做决定，暂停请求局部等待容量事件。
+Scheduler 拥有执行成员与公平性规则：fresh admission 的有限绕过、可选的缓存亲和超车（每个等待者
+最多被越过 4 次）、prefill 轮转、紧凑 decode/control 批次、抢占受害请求及恢复机会。它使用请求状态
+和提交顺序做决定，暂停请求局部等待容量事件。
 
 Lane 是 resident 请求位置；StateImage slot、KV execution row 和 compact batch row 是独立身份。
 暂停释放 lane 后，请求仍由 EngineCore 拥有；恢复可以取得另一 lane。
@@ -246,8 +247,9 @@ transport 通过队列、原子 cancellation flag 和 response event 交互。
 
 一个 worker cycle 先推进资源事务、capture 与终态并处理取消，在容量事件上尝试最老 paused 请求
 的完整恢复。随后按恢复优先、原票号优先为 resident 逐行取得 unit 许可，用余量尝试 fresh admission，
-再执行可运行的 control、decode 和一个 prefill/Replay chunk。受保护恢复优先取得 chunk；其余 prefill
-在 resident 间轮转，decode 批次使用实际 `B`。
+再执行可运行的 control、decode 和一个 prefill/Replay chunk。Fresh admission 默认按 FIFO 票号并带
+有限绕过；开启 `admission_affinity` 时，复用设备上已持有前缀的等待者可以先于队首尝试（见下）。
+受保护恢复优先取得 chunk；其余 prefill 在 resident 间轮转，decode 批次使用实际 `B`。
 
 Program 的 `reserve_units` 原子取得一个调用集合的 typed 增量需求；Engine 逐行调用，组成可运行
 子集。一行缺资源不会阻止其他已许可行执行。普通 unit 结算释放未用 reservation 与 provisional
@@ -259,8 +261,24 @@ block table 和 transfer buffer 的依赖由 Program 冻结。任意时刻只有
 访问的 mapping 在完成前保持稳定。
 
 Admission 检查由等待队列、容量释放、资源事务完成等事件启动有界扫描。普通 decode 前进本身不重启
-失败的 admission 扫描。恢复失败不关闭 fresh admission；更老 resident 仍在时，paused 请求不会
-为试探恢复而盲目暂停年轻 borrower。普通 active 请求不预留整个剩余生成长度。
+失败的 admission 扫描。
+
+缓存亲和超车（`EngineOptions::admission_affinity`，`--admission-affinity`，默认关闭）：有空 lane、
+没有挂起的 admission 决定、队首在本 admission generation 尚未尝试且不在 hydration 或 sibling 等待中
+时，Engine 询问队首及其后最多 8 个等待者是否“亲和”：其首选来源复用 token（`reused_tokens > 0`）、
+来自可接管（`take_over`）或同 session（`session_hint`）的 checkpoint，且不需要 Host→Device 传输。
+队首本身亲和即普通 FIFO；否则最老的亲和等待者先于队首尝试，前提是比它更老的每个等待者
+`overtakes < 4`。只有成功 admission 才向每个被越过的等待者计 `overtakes += 1`；尝试失败则按普通
+顺序继续。该额度与资源绕过额度相互独立：超车不消耗 `admission_bypasses`，绕过也不消耗
+`overtakes`，任一障碍不限制另一方，因此一个等待者总共最多被越过 C + 4 次。亲和判断需要
+`ensure_base_plan` 与一次 source 报价：选项开启时，每个 admission generation 最多为 9 个等待者
+（队首及其后 8 个）提前生成 base plan 并报价，每个请求每个 generation 最多一次。缓存的答案可能
+过期，因此被提前的等待者在决定时按重新报价的首选来源再判断一次；不再亲和时它回到普通扫描中自己
+的位置，既不计超车，也不在此处作为绕过尝试。成功的超车计入 `admission_overtakes`
+（`ninfer_admission_overtakes_total`）。
+
+恢复失败不关闭 fresh admission；更老 resident 仍在时，paused 请求不会为试探恢复而盲目暂停年轻
+borrower。普通 active 请求不预留整个剩余生成长度。
 
 ## 5. 提交与发布
 

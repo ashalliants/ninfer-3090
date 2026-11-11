@@ -249,6 +249,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
                        "Device memory installed.");
         optional_gauge("gpu_temperature_celsius", gpu.temperature_celsius, "GPU core temperature.");
         optional_gauge("gpu_power_watts", gpu.power_watts, "Board power draw.");
+        optional_gauge("gpu_power_limit_watts", gpu.power_limit_watts,
+                       "Board power limit the driver enforces now.");
         // Needs a starting reading: NVML counts from driver load, so a reading first seen later
         // would otherwise report the whole uptime of the machine.
         if (gpu.energy_joules && gpu_energy_last_) {
@@ -301,6 +303,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
     COUNTER(preemptions, "preemptions_total", "Resource-pressure pauses.");
     COUNTER(admission_fit_deferrals, "admission_fit_deferrals_total",
             "Fresh requests queued because their whole prompt could not fit beside residents.");
+    COUNTER(admission_overtakes, "admission_overtakes_total",
+            "Fresh requests admitted ahead of older waiters by resuming a prefix held on the GPU.");
     COUNTER(snapshot_restores, "snapshot_restores_total",
             "Restores from complete paused snapshots.");
     COUNTER(replay_restores, "replay_restores_total", "Recovery operations that rebuild history.");
@@ -321,6 +325,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready,
             "N-gram copy tokens evaluated by native verification.");
     COUNTER(speculative_ngram_accepted_tokens, "spec_decode_ngram_accepted_tokens_total",
             "N-gram copy tokens accepted by native verification.");
+    COUNTER(speculative_relaxed_kept, "spec_decode_relaxed_kept_tokens_total",
+            "Accepted drafts that relaxed drafting kept and exact verification would have rejected.");
     GAUGE(device_state_occupied_slots, "device_state_used_slots",
           "Occupied device StateImage slots.");
     gauge("device_state_capacity_slots",

@@ -45,6 +45,11 @@ int main() {
     sample.stats.prefilling_requests           = 1;
     sample.stats.decode_ready_requests         = 3;
     sample.stats.waiting_requests              = 2;
+    constexpr double kForever = std::numeric_limits<double>::infinity();
+    sample.stats.waiting      = {
+        ninfer::RuntimeWaitingStats{.request_id = 11, .prompt_tokens = 4096, .waited_seconds = 2.5},
+        ninfer::RuntimeWaitingStats{
+            .request_id = 12, .prompt_tokens = 64, .waited_seconds = kForever}};
     sample.stats.paused_requests               = 1;
     sample.stats.replaying_requests            = 1;
     sample.stats.materializing_requests        = 0;
@@ -89,6 +94,11 @@ int main() {
                       "request gauges");
     failures += check(requests.at("prefill_backlog_seconds") == 61.25,
                       "the predicted prefill backlog");
+    failures += check(requests.at("queue") ==
+                              Json::parse(R"([{"id":11,"prompt_tokens":4096,"waited_s":2.5},)"
+                                          R"({"id":12,"prompt_tokens":64,"waited_s":0.0}])") &&
+                          requests.at("queue_total") == 2,
+                      "the waiting queue, oldest first, with a non-finite wait as 0");
 
     const Json& occupancy = report.at("occupancy");
     failures += check(occupancy.at("device_main_kv_pages") == 100 &&

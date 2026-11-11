@@ -83,9 +83,11 @@ ninfer_bench --weights <artifact.ninfer>
           [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
+ninfer_bench --preset community-1 --weights <artifact.ninfer> --submitter <name> [--device <id>]
 ```
 
-With no `-p`, `-n`, or `-pg`, the matrix is `pp512` and `tg128`.
+With no `-p`, `-n`, or `-pg`, the matrix is `pp512` and `tg128`. `--preset community-1` is the
+frozen community run; see [Community preset](#community-preset).
 
 Example:
 
@@ -123,6 +125,112 @@ time. Per-request phase rates remain separate from this aggregate throughput.
 The benchmark disables context retention because every repetition is an independent root request.
 Schema v16 records `speculative_backend`, `draft_tokens`, and the proposal head independently;
 JSON and CSV identify DFlash2 explicitly. MTP alone reserves its extra lookahead KV margin.
+
+Schema v20 stamps the GPU's power limit, the one NVML says the driver enforces after every limiter
+(`nvidia-smi -pl` included), because a capped card is slower: `environment.power_limit_watts_start`
+is read after the artifact loads and `power_limit_watts_end` after the last test. They are `null`
+when NVML cannot read them, and are also the table's `power limit` line and the CSV's last two
+columns. When they differ the benchmark prints a warning on stderr: that run's results compare
+with runs at neither limit.
+
+## Community preset
+
+`ninfer_bench --preset community-1 --weights <artifact> --submitter <name> [--device <id>]` runs
+one fixed workload and prints one line of JSON on stdout (progress goes to stderr): a row for
+[`community/rows.json`](community/rows.json). Every row under one preset name was measured the same
+way, so rows from different machines compare. A change to what the preset measures needs a new
+name. The preset is modelled on Basalt's `basalt-bench --community`.
+
+The workload, otherwise at the benchmark defaults (BF16 KV cache, 1024-token prefill chunks, CUDA
+Graph decode, no speculative decoding, prefix reuse and context retention off):
+
+- `prefill_16k_tps`: one prefill of the first 16,384 tokens of `fixtures/bench_corpus.ids`.
+- `prefill_64k_tps`: one prefill of the whole corpus. The corpus is exactly 65,536 tokens, so the
+  64K prompt is the committed file itself, with nothing padded or repeated.
+- `decode_tps`: each of the 24 prompts of `fixtures/chat_prompts.jsonl` as a fresh user turn with
+  thinking off, decoded greedily to exactly 256 tokens (model stops are ignored). The rate is all
+  24 x 256 decode tokens over their summed decode time.
+
+What a row measures, exactly:
+
+- One Engine load. As in every run with decode work, the decode CUDA Graphs are primed once after
+  it. Then the three tests run, always in the order above, each a single measured repetition with
+  no discarded warmup and no prefix reuse.
+- So `prefill_16k_tps` also absorbs the first-launch costs of the process (lazy kernel loading,
+  first-use allocations), and `decode_tps` runs right after both prefills, on a card that has been
+  under sustained load (the two prefills, on the order of a minute).
+- That is the same for every row, which is what makes rows compare. A row is not a best-case figure
+  for any one phase; use the ordinary benchmark (`-p`, `-n`, `-r`, `--warmup`) for that.
+
+The preset is defined on the 27B dense models: the corpus holds Qwen3.6 token ids, and the
+architecture must be `Qwen3_5ForCausalLM`, the architecture of the shipped Qwen3.6-27B and
+Qwen3.8-27B artifacts (and of other 27B conversions such as Bonsai-2-27B, which the preset accepts
+too; their rows compare only with their own). Any other artifact (the 35B-A3B MoE, Flash-Next) is
+refused after it loads, because its architecture is not known before then. Rows compare only within one model, which each row
+names.
+
+The preset takes no other flag, and the error names the one given: `-p`, `-n`, `-pg`, `-r`,
+`--warmup`, `--corpus`, `--concurrency`, the output constraints, `--max-ctx`, `--prefill-chunk`,
+`--kv-dtype`, `--spec` and the drafting flags, `--no-cuda-graph`, the prefill route flags,
+`--profile-measured`, `-o` and `--output-file` would each change what is measured or where the row
+goes. It also refuses to run:
+
+- from a build with uncommitted changes to tracked files, or without git metadata, since the row's
+  `commit` must be what ran. The check is of the tree at build time only: sources or fixtures
+  (`fixtures/bench_corpus.ids`, `fixtures/chat_prompts.jsonl`) edited after the build are not
+  detected, so run a build of the clean tree as it is. Equally, editing the rows file and then
+  rebuilding makes the build dirty, so build and run before you edit it;
+- when NVML cannot read the power limit (checked before the model loads);
+- without `--submitter`, or with one that is blank, longer than 40 characters, holds control
+  characters or is still `YOUR_NAME`. Only spaces count as blank, and the 40 characters include
+  them; the rows checker applies the same rules.
+
+If the power limit changed between the start and the end of the run, the preset exits 1 and prints
+the row on stderr with the warning, for diagnosis only: it is not a row to submit. Nothing is
+printed on stdout.
+
+| Field | Meaning |
+| --- | --- |
+| `submitter` | the `--submitter` text, up to 40 characters; not verified |
+| `date` | the day of the run, UTC, as `YYYY-MM-DD` |
+| `commit` | the commit the binary was built from, 9 hex digits |
+| `preset` | `community-1` |
+| `gpus` | the benchmarked device: `name` (as CUDA reports it), `vram_gib` (whole GiB), `power_limit_w` (the enforced limit at the start, whole watts), `pcie` (the highest generation and the current width, such as `4.0 x16`; left out when NVML cannot read it) |
+| `ram_gib` | host RAM, whole GiB. Under WSL2 this is the memory of the WSL VM (its `.wslconfig` limit), not the machine's |
+| `cpu` | the processor's brand string and its hardware thread count, at most 80 characters; left out off x86 |
+| `os` | `Linux`, `Windows` or `WSL2` |
+| `model` | the artifact's model name, at most 80 characters |
+| `prefill_16k_tps`, `prefill_64k_tps`, `decode_tps` | tokens per second, one decimal |
+
+A row may also carry `notes`, up to 200 characters, added by hand.
+
+### Submitting a run
+
+1. Build `ninfer_bench` from a clean checkout of the commit to measure, and leave the GPU to it
+   (stop any server or other GPU program first).
+2. Run the preset:
+
+   ```bash
+   ./build/bench/ninfer_bench --preset community-1 --weights out/qwen3_6_27b.ninfer \
+     --submitter "Your Name"
+   ```
+
+   If it reports that the power limit changed, it prints no row; run it again.
+3. Paste the printed line into the `runs` list of `community/rows.json`, then rewrite the file in
+   the house format and check it:
+
+   ```bash
+   python3 tools/bench/check_bench_rows.py --fix bench/community/rows.json
+   ```
+
+4. Commit the file and open a pull request.
+
+The house format is the one text the file may have: keys in the order of the table above, a
+two-space indent, UTF-8 without escapes, LF line ends and one trailing newline. Without `--fix` the
+checker fails on any other layout, and `--fix` changes only the layout, never a value, so a wrong
+value still fails. A file that is not strict JSON (a `NaN` or `Infinity`, or one key twice) is
+refused as it is, since rewriting it would change what it says. ctest runs the checker's self-test (`ninfer_bench_rows_check_test`, a `cpu`
+test), which also checks the committed rows file.
 
 ## Context-cost calibration
 
@@ -360,13 +468,18 @@ replayed from a CUDA graph (the reported rate) and launched eagerly. The rate co
 over 1-16 workers, rotating through 96 records so none is cache-resident. Records are random blocks
 with finite scales; medians of `--reps` (default 30).
 
-Options: `--mode gpu|cpu|all`, `--experts N` (1-16, default 10), `--reps N` (default 30) and
-`--misses N` (1-`--experts`, default 1).
+Options: `--mode gpu|cpu|all`, `--experts N` (1-16, default 10), `--reps N` (default 30),
+`--misses N` (1-`--experts`, default 1), `--precast 0|1` (default 0; 1 sets
+`MoeExpertSource::precast_input`, the input cast to A8 once per call, for an A/B of the GPU rows) and
+`--registers 0|1` (default 0; 1, which needs `--precast 1`, sets `MoeExpertSource::gate_up_variant`
+to `GateUpVariant::Registers`, the gate/up rows from registers in a co-resident grid).
 
 ```bash
 ./build/bench/ninfer_benches ninfer_offloaded_moe_bench
 ./build/bench/ninfer_benches ninfer_offloaded_moe_bench --mode cpu --reps 50
 ./build/bench/ninfer_benches ninfer_offloaded_moe_bench --mode gpu --misses 3
+./build/bench/ninfer_benches ninfer_offloaded_moe_bench --mode gpu --precast 1
+./build/bench/ninfer_benches ninfer_offloaded_moe_bench --mode gpu --precast 1 --registers 1
 ```
 
 ## QSA Op benchmark

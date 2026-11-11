@@ -9,9 +9,11 @@
 #include "models/qwen4_exp/model.h"
 
 #include "artifact/binder.h"
+#include "artifact/formats.h"
 #include "artifact/reader.h"
 #include "artifact/views.h"
 #include "models/qwen3_5/vision_config.h"
+#include "models/qwen4_exp/memory_plan.h"
 
 #include <cuda_runtime.h>
 
@@ -126,7 +128,8 @@ GdnWeights bind_gdn(Bindings& b, const TextConfig& c, const std::string& prefix)
     return out;
 }
 
-MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& prefix, bool drafter = false) {
+MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& prefix, bool drafter = false,
+                    bool partial = false) {
     const std::uint64_t h = c.hidden_size, e = c.moe.experts, s = c.moe.shared_intermediate;
     const std::string input = prefix + "ffn_input", p = prefix + "moe/";
     // The drafter's shared expert is BF16 (projected in FP32 rows); the text model's is GGML.
@@ -137,11 +140,11 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& prefix,
     out.shared_gate  = b.parameter(p + "shared/gate", {s, h}, input, shared);
     out.shared_up    = b.parameter(p + "shared/up", {s, h}, input, shared);
     out.shared_down  = b.parameter(p + "shared/down", {h, s}, p + "shared/product", shared);
-    // Text banks stay in pinned host memory (the expert cache stages them); the drafter's 512
-    // experts are device-resident.
+    // Text banks stay in pinned host memory (the expert cache stages them), or with partial RAM
+    // residency in the file (the Program reads them); the drafter's 512 experts are device-resident.
     out.experts = b.parameter(p + "experts", {e, h, c.moe.intermediate}, input,
                               drafter ? std::optional<QType>(QType::GGML_REC_Q2_0_Q2_0) : std::nullopt,
-                              drafter ? Residency::Device : Residency::Pinned);
+                              drafter ? Residency::Device : partial ? Residency::File : Residency::Pinned);
     return out;
 }
 
@@ -315,11 +318,14 @@ PleWeights bind_ple(Bindings& b, const TextConfig& c, const std::string& prefix)
     return out;
 }
 
-TextWeights bind_text(Bindings& b, const TextConfig& c) {
+TextWeights bind_text(Bindings& b, const TextConfig& c, bool hot_embedding, bool partial) {
     TextWeights out;
     const std::uint64_t h = c.hidden_size, v = c.vocab_size;
-    out.token_embedding = b.parameter("text/token_embedding", {v, h}, {}, QType::GGML_IQ4_XS);
-    out.output_head     = b.parameter("text/output_head", {v, h}, "text/final_hidden", QType::GGML_IQ4_XS);
+    // --hot-embedding-rows: the whole table in the pinned block (mapped), first, before the banks.
+    // Their formats are the GGUF's (require_text_formats).
+    out.token_embedding = b.parameter("text/token_embedding", {v, h}, {}, std::nullopt,
+                                      hot_embedding ? Residency::Pinned : Residency::Device);
+    out.output_head     = b.parameter("text/output_head", {v, h}, "text/final_hidden");
     out.final_mixer     = bind_hc(b, c, "text/final_mixer/", false);
     for (std::uint32_t i = 0; i < c.num_hidden_layers; ++i) {
         const std::string prefix = "text/layers/" + std::to_string(i) + "/";
@@ -332,10 +338,57 @@ TextWeights bind_text(Bindings& b, const TextConfig& c) {
             block.mixer = bind_gdn(b, c, prefix);
         }
         block.mlp_hc = bind_hc(b, c, prefix + "mlp_hc/", true);
-        block.moe    = bind_moe(b, c, prefix);
+        block.moe    = bind_moe(b, c, prefix, false, partial);
         out.layers.push_back(std::move(block));
     }
     return out;
+}
+
+// The stored format of a parameter bound as one parent.
+QType bound_format(const artifact::Reader& reader, const PendingWeight& weight) {
+    const auto& parts = weight.reference.binding.parts;
+    if (parts.size() != 1) { throw ArtifactError(weight.reference.name + ": must be one complete parent"); }
+    return reader.geometry(parts.front().object).format;
+}
+
+// The token embedding and output head formats the forward runs (ops::embedding and projection_fp32's
+// GGML head): the GGUF packs' IQ4_XS or IQ3_S embedding, and IQ4_XS, Q6_K or Q5_K head.
+void require_text_formats(const artifact::Reader& reader, const std::vector<PendingWeight>& pending,
+                          const TextWeights& text, bool hot_embedding) {
+    const QType embedding = bound_format(reader, pending.at(text.token_embedding.index));
+    if (embedding != QType::GGML_IQ4_XS && embedding != QType::GGML_IQ3_S) {
+        throw ArtifactError("text/token_embedding: expected ggml_iq4_xs or ggml_iq3_s rows, got " +
+                            std::string(artifact::format_name(embedding)));
+    }
+    require_hot_embedding_format(embedding, hot_embedding ? 1U : 0U);
+    const QType head = bound_format(reader, pending.at(text.output_head.index));
+    if (head != QType::GGML_IQ4_XS && head != QType::GGML_Q6_K && head != QType::GGML_Q5_K) {
+        throw ArtifactError("text/output_head: expected ggml_iq4_xs, ggml_q6_k or ggml_q5_k, got " +
+                            std::string(artifact::format_name(head)));
+    }
+}
+
+void require_bank_geometry(const WeightGeometry& g, const TextConfig& c, const std::string& name) {
+    if (g.layout != QuantLayout::GgmlExpertRecord || g.shape.size() != 3 || g.shape[0] != c.moe.experts ||
+        g.shape[1] != c.hidden_size || g.shape[2] != c.moe.intermediate) {
+        throw ArtifactError(name + ": expert bank geometry differs from the text config");
+    }
+}
+
+// Partial RAM residency: a bank left in the file, its records' place and format.
+ExpertBank file_bank(const artifact::Reader& reader, const PendingWeight& weight, const TextConfig& c) {
+    const auto& parts = weight.reference.binding.parts;
+    if (parts.size() != 1 || !weight.reference.binding.whole_object) {
+        throw ArtifactError(weight.reference.name + ": an expert bank must be one complete parent");
+    }
+    const auto& g = reader.geometry(parts.front().object);
+    require_bank_geometry(g, c, weight.reference.name);
+    ExpertBank bank;
+    bank.format          = g.format;
+    bank.experts         = c.moe.experts;
+    bank.record_stride   = g.record_stride;
+    bank.artifact_offset = artifact::object_offset(reader.directory().object(parts.front().object));
+    return bank;
 }
 
 ExpertBank expert_bank(const BoundWeight& weight, const TextConfig& c, bool on_device = false) {
@@ -345,10 +398,7 @@ ExpertBank expert_bank(const BoundWeight& weight, const TextConfig& c, bool on_d
     }
     const auto& parent = *view.parts.front().parent;
     const auto& g      = parent.geometry;
-    if (g.layout != QuantLayout::GgmlExpertRecord || g.shape.size() != 3 || g.shape[0] != c.moe.experts ||
-        g.shape[1] != c.hidden_size || g.shape[2] != c.moe.intermediate) {
-        throw ArtifactError(weight.name + ": expert bank geometry differs from the text config");
-    }
+    require_bank_geometry(g, c, weight.name);
     ExpertBank bank;
     bank.format        = g.format;
     bank.experts       = c.moe.experts;
@@ -404,6 +454,8 @@ struct LoadPlan::Impl {
     FrontendResources resources;
     InstanceInfo info;
     std::vector<std::uint64_t> strides;
+    // Partial RAM residency: the text banks, left in the file (empty otherwise).
+    std::vector<ExpertBank> file_banks;
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -435,7 +487,7 @@ bool has_mtp(const artifact::Reader& reader) { return has_mtp_component(reader.d
 
 bool has_vision(const artifact::Reader& reader) { return has_vision_component(reader.directory()); }
 
-LoadPlan plan_load(const artifact::Reader& reader, bool mtp, bool vision) {
+LoadPlan plan_load(const artifact::Reader& reader, bool mtp, bool vision, bool hot_embedding, bool partial) {
     auto out    = std::make_unique<LoadPlan::Impl>();
     out->config = parse_config(reader.directory());
     if (mtp && !has_mtp_component(reader.directory())) {
@@ -450,15 +502,17 @@ LoadPlan plan_load(const artifact::Reader& reader, bool mtp, bool vision) {
     artifact::Binder binder(reader);
     out->resources = bind_resources(binder, out->config, out->vision_config);
     Bindings bindings(binder);
-    out->weights         = bind_text(bindings, out->config);
+    out->weights         = bind_text(bindings, out->config, hot_embedding, partial);
     if (mtp) { out->mtp = bind_mtp(bindings, out->config); }
     // After the expert banks: the tower's groups follow them in the pinned block.
     if (vision) { out->vision = bind_vision(bindings, *out->vision_config, out->config); }
     out->pending         = std::move(bindings.weights);
+    require_text_formats(reader, out->pending, out->weights, hot_embedding);
     for (const auto& layer : out->weights.layers) {
         const auto& parts = out->pending.at(layer.moe.experts.index).reference.binding.parts;
         if (parts.size() != 1) { throw ArtifactError("an expert bank must be one complete parent"); }
         out->strides.push_back(reader.geometry(parts.front().object).record_stride);
+        if (partial) { out->file_banks.push_back(file_bank(reader, out->pending.at(layer.moe.experts.index), out->config)); }
     }
     out->materialization = std::move(binder).finish();
     out->info.name        = reader.directory().metadata.value("name", std::string("Qwen3.8-Flash-Next"));
@@ -472,10 +526,16 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     std::vector<BoundWeight> bound;
     bound.reserve(p.pending.size());
     for (auto& item : p.pending) {
-        bound.push_back({item.reference.name, artifact::bind_view(item.reference, backing), item.policy});
+        // A bank left in the file (partial RAM residency) has no view: the Program reads it.
+        bound.push_back({item.reference.name,
+                         item.reference.residency == Residency::File ? WeightView{}
+                                                                     : artifact::bind_view(item.reference, backing),
+                         item.policy});
     }
-    std::vector<ExpertBank> banks;
-    for (const auto& layer : p.weights.layers) { banks.push_back(expert_bank(bound.at(layer.moe.experts.index), p.config)); }
+    std::vector<ExpertBank> banks = std::move(p.file_banks);
+    if (banks.empty()) {
+        for (const auto& layer : p.weights.layers) { banks.push_back(expert_bank(bound.at(layer.moe.experts.index), p.config)); }
+    }
     std::optional<ExpertBank> mtp_bank;
     if (p.mtp) {
         mtp_bank = expert_bank(bound.at(p.mtp->moe.experts.index), p.config, /*device=*/true);
@@ -491,8 +551,9 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                             std::move(p.info), std::move(backing)));
 }
 
-std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext& device, bool mtp, bool vision) {
-    return materialize_model(plan_load(reader, mtp, vision), device);
+std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext& device, bool mtp, bool vision,
+                                  bool hot_embedding) {
+    return materialize_model(plan_load(reader, mtp, vision, hot_embedding), device);
 }
 
 } // namespace ninfer::models::qwen4_exp

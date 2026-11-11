@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -1539,6 +1540,48 @@ int test_thinking_budget_extension() {
     return failures;
 }
 
+// relaxed_drafting: a threshold in [0,1], `true` for 0.5 and `false` for 0, reaching the Engine
+// request options; anything else fails with invalid_relaxed_drafting.
+int test_relaxed_drafting_extension() {
+    Json body    = base_request();
+    int failures = check(!parse(body).generation.sampling.relaxed_drafting &&
+                             !options(parse(body).generation).execution.sampling.relaxed_drafting,
+                         "absent relaxed_drafting was not left to the server default");
+    body["relaxed_drafting"] = nullptr;
+    failures += check(!parse(body).generation.sampling.relaxed_drafting,
+                      "null relaxed_drafting was not left unset");
+    ServeOptions relaxed_server;
+    relaxed_server.relaxed_drafting = 0.5F;
+    for (const auto& [value, expected] :
+         {std::pair{Json(0.3), 0.3F}, std::pair{Json(false), 0.0F}, std::pair{Json(true), 0.5F},
+          std::pair{Json(0), 0.0F}, std::pair{Json(1), 1.0F}}) {
+        body["relaxed_drafting"]           = value;
+        const GenerationRequest request    = parse(body).generation;
+        const std::optional<float> translated =
+            to_request_options(request, relaxed_server, semantics(request), true)
+                .execution.sampling.relaxed_drafting;
+        failures += check(translated && *translated == expected,
+                          "relaxed_drafting did not reach the Engine: " + value.dump());
+    }
+    // A server without --relaxed-drafting refuses a request that asks, and passes an exact one.
+    body["relaxed_drafting"] = 0.3;
+    const ApiError disabled  = api_error([&] { (void)options(parse(body).generation); });
+    failures += check(disabled.param == "relaxed_drafting" &&
+                          disabled.code == "relaxed_drafting_not_enabled",
+                      "a server without relaxed drafting accepted a request asking for it");
+    body["relaxed_drafting"] = false;
+    failures += check(options(parse(body).generation).execution.sampling.relaxed_drafting == 0.0F,
+                      "a server without relaxed drafting refused an exact request");
+    for (const Json& invalid : {Json(-1), Json(2), Json("0.5"), Json(Json::array())}) {
+        body["relaxed_drafting"] = invalid;
+        const ApiError error     = api_error([&] { (void)parse(body); });
+        failures += check(error.param == "relaxed_drafting" &&
+                              error.code == "invalid_relaxed_drafting",
+                          "invalid relaxed_drafting was accepted: " + invalid.dump());
+    }
+    return failures;
+}
+
 int test_graft_extension() {
     Json body       = base_request();
     int failures    = check(!parse(body).generation.graft, "absent graft was not left unset");
@@ -1561,6 +1604,7 @@ int main() {
     int failures = 0;
     failures += test_graft_extension();
     failures += test_thinking_budget_extension();
+    failures += test_relaxed_drafting_extension();
     failures += test_request_envelope_and_sampling();
     failures += test_standard_field_policy();
     failures += test_ignore_eos_with_constraints();

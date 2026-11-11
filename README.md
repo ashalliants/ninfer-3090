@@ -134,7 +134,8 @@ of paused requests share once they leave the card. It is host memory, not GPU me
 now pins all of it too (earlier releases clamped it there to about 4.6 GiB).
 
 **Overrides**, from the environment: `NINFER_HOST`, `NINFER_PORT`, `NINFER_MODEL`, `NINFER_SERVER`,
-`NINFER_CHAT_TEMPLATE` for every profile, plus `NINFER_CONTEXT`, `NINFER_CONCURRENCY`,
+`NINFER_CHAT_TEMPLATE`, `NINFER_ALLOWED_HOST` (more names the server answers to, such as
+`gpubox.lan`; see [Host and Origin checks](docs/serving.md#host-and-origin-checks)) for every profile, plus `NINFER_CONTEXT`, `NINFER_CONCURRENCY`,
 `NINFER_KV_CAPACITY`, `NINFER_KV_DTYPE`, `NINFER_SPEC`, `NINFER_DRAFT_TOKENS`, `NINFER_PREFILL_CHUNK`,
 `NINFER_VISION`, `NINFER_HOST_CONTEXT_MIB` (8192), `NINFER_MIN_P` (0.03) and `NINFER_PRESENCE_PENALTY` (0.5) for the
 default ones; the last two are the loop guard, and `default` leaves the registered sampling preset in force. Other serving flags are opt-in overrides too: `NINFER_AUTO_HOST_CACHE=on`, `NINFER_MAX_OUTPUT_TOKENS`, `NINFER_MLP_A8_DECODE=on`, `NINFER_CONTEXT_STORE` and `NINFER_REASONING_LOOP=stop|conclude` (listed with their caps at the top of `run.sh` / `run.bat`). Any other `ninfer-serve` flag works the same way as `NINFER_<FLAG>` (`--cors` is `NINFER_CORS=on`, `--prefill-stall-budget-ms 40` is `NINFER_PREFILL_STALL_BUDGET_MS=40`). The reasoning-loop guard stays off unless set: it has not yet fired on a real Qwen3.8 run, and its thresholds were measured on other models ([serving](docs/serving.md#openai-chat-completions), under `--reasoning-loop`). The launchers bind `127.0.0.1`;
@@ -327,6 +328,16 @@ speculation pays off less on text that is harder to predict. Decode speed and it
 [the plan](docs/maintainer/flash-next-plan.md#pr-13-measurements); the server reference is
 [docs/serving.md](docs/serving.md#qwen38-flash-next-preview).
 
+A later session measured a batch of opt-in speed options from #383 ("Basalt learnings") against
+off, each on an RTX 3090, ABBA A/B, 12 repetitions: `--prefill-cpu-share 0.4` is the clear win on
+prefill (+15.47% median, every repetition faster); `--moe-gate-up-registers` the best decode-side
+gain (+2.49%). `scripts/profiles/qwen38-flash-next-tuned.json` turns on every option that measured
+as a confirmed win or wash; the full per-option table, including the regressions left off
+(`--ngram-prefetch`, `--cpu-verify-misses`, `--hc-int8`, `--ggml-decode-mma`), is in
+[docs/performance.md](docs/performance.md#basalt-learnings-options-measured-relative-to-off-rtx-3090-2026-11-11)
+and [docs/serving.md](docs/serving.md#qwen38-flash-next-preview). These are per-option deltas
+against off, not a combined number: no run measured every winning option stacked together.
+
 **Keep the n-gram volume on your fastest drive.** The 29 GB `.ngram` file is read on every prompt,
 the 40 GB model only once at load. If the model sits on a SATA SSD or a hard disk, copy just the
 `.ngram` file to an NVMe drive and point the launcher at it; the model can stay where it is:
@@ -403,6 +414,8 @@ The server supports:
 - retained conversations survive a restart in a local context store (`--context-store`),
   optionally copied to an S3-compatible bucket ([docs](docs/serving.md#context-store));
 - Prometheus metrics at `GET /metrics` ([docs](docs/serving.md#metrics)) and a read-only `GET /props`;
+- a live dashboard page at `GET /dashboard`: throughput, draft acceptance, lanes and GPU
+  readings ([docs](docs/serving.md#dashboard));
 - prompt-rendered function tools and parsed tool calls (returned to the client, not executed);
 - bounded pending-request admission and JSONL request logs.
 
@@ -523,6 +536,13 @@ conversations on both Flash-Next and the 27B: after a 1+2 conversation was conti
 forked as 1+2+4, each branch could be continued again and reused its whole shared prefix, so a
 14K-token branch step reached its first word in about 1.3-1.6 s against 5.7-6.5 s cold.
 [Details](docs/performance.md#v0160-release-binaries-all-three-models-2026-10-14).
+
+A batch of opt-in options from #383 ("Basalt learnings") were measured on an RTX 3090 (2026-11-11,
+each against the same option off, ABBA, 12 reps): **+15.47% prefill** with `--prefill-cpu-share 0.4`
+(the clear win, every repetition faster), **+2.49% decode** with `--moe-gate-up-registers` (the best
+decode-side gain). `scripts/profiles/qwen38-flash-next-tuned.json` turns on every option that
+measured as a win or a wash; two options measured as clear regressions and stayed off
+(`--ngram-prefetch`, `--cpu-verify-misses`). [Details](docs/performance.md#basalt-learnings-options-measured-relative-to-off-rtx-3090-2026-11-11).
 
 ![Qwen3.8-Flash-Next on one RTX 3090: NInfer-3090 against Strata 0.1.38 on the same GGUF](docs/assets/flash-next-speed.svg)
 
@@ -811,8 +831,9 @@ and the design are in `docs/maintainer/pipeline-parallel-plan.md`.
 ## Release history
 
 **v0.14.2:** `--host-cache-max-mib` caps the RAM cache on shared machines. This release also
-added `--max-prefill-lanes` and `GET /slots`, which the current engine no longer provides
-(see [docs/serving.md](docs/serving.md)). See the [v0.14.2 release notes](docs/release-notes/RELEASE_NOTES_0.14.2.md).
+added `--max-prefill-lanes` and a `GET /slots` with session-file fields. The current `GET /slots`
+is read-only and reports each lane's progress (see [docs/serving.md](docs/serving.md#slots)). See
+the [v0.14.2 release notes](docs/release-notes/RELEASE_NOTES_0.14.2.md).
 
 **v0.14.1:** a stability fix for `ninfer-serve`. A large or unplannable request no longer fails
 every running request (`internal error generation`) or clears the context cache; only that request

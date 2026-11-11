@@ -51,6 +51,13 @@ struct SamplingConfig {
     unsigned long long seed    = 0;
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
     SamplingMask mask;
+    // Relaxed drafting (speculative acceptance only; sample() ignores both). A positive threshold
+    // keeps a sampled draft whose final target probability is at least this, when the Op runs its
+    // relaxed instance (see speculative_round.h). 0 is the exact rule. Drafts at or above
+    // added_token_floor (the tokenizer's added tokens) never relax, nor any later draft of the
+    // round; a zero floor relaxes nothing.
+    float relaxed_threshold        = 0.0f;
+    std::int32_t added_token_floor = 0;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive

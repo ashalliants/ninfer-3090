@@ -27,6 +27,8 @@
 namespace ninfer::ops::offloaded_moe {
 namespace {
 
+std::atomic<std::uint64_t> g_process_experts{0}; // CpuMissService::process_served_experts
+
 void cuda_require(cudaError_t error, const char* what) {
     if (error != cudaSuccess) {
         throw std::runtime_error(std::string("CPU miss service ") + what + ": " + cudaGetErrorString(error));
@@ -81,12 +83,10 @@ struct CpuMissService::Impl {
 
     void serve() {
         try {
-            detail::pin_current_thread(options.cpus.empty() ? -1 : options.cpus[0]);
             beat();
             CpuExpertTeam team({.workers  = options.workers,
                                 .isa      = options.isa,
                                 .max_jobs = options.max_jobs,
-                                .cpus     = options.cpus,
                                 .progress = heartbeat});
             std::vector<CpuExpertJob> jobs(static_cast<std::size_t>(options.max_jobs));
             auto* volatile_sequence = reinterpret_cast<volatile std::uint32_t*>(&request->sequence);
@@ -117,7 +117,16 @@ struct CpuMissService::Impl {
                 if (count < 0 || count > options.max_jobs) { throw std::runtime_error("CPU miss request has too many jobs"); }
                 for (int j = 0; j < count; ++j) {
                     CpuExpertJob& job = jobs[static_cast<std::size_t>(j)];
-                    job.record = layer.records + static_cast<std::uint64_t>(r.expert[j]) * layer.record_stride;
+                    // A slot entry is an atomic the owner publishes with a release store (it
+                    // changes entries only between calls, and the device carries the order from
+                    // that store to this request, outside the C++ model); the acquire load makes
+                    // the exchange race-free.
+                    job.record = layer.slots != nullptr
+                                     ? std::atomic_ref<const std::uint8_t*>(
+                                           const_cast<const std::uint8_t*&>(layer.slots[r.expert[j]]))
+                                           .load(std::memory_order_acquire)
+                                     : layer.records + static_cast<std::uint64_t>(r.expert[j]) * layer.record_stride;
+                    if (job.record == nullptr) { throw std::runtime_error("CPU miss request names an expert with no RAM copy"); }
                     job.format = layer.format;
                     job.ncols  = r.ncols[j];
                     for (int c = 0; c < job.ncols; ++c) {
@@ -126,10 +135,13 @@ struct CpuMissService::Impl {
                     }
                 }
                 team.run(std::span<const CpuExpertJob>(jobs.data(), static_cast<std::size_t>(count)));
-                std::atomic_thread_fence(std::memory_order_release);
-                *volatile_done = current;
+                // Counted before the answer: a caller that has seen `done` (its call synchronized)
+                // reads counters that include this request.
                 served.fetch_add(1, std::memory_order_relaxed);
                 experts.fetch_add(static_cast<std::uint64_t>(count), std::memory_order_relaxed);
+                g_process_experts.fetch_add(static_cast<std::uint64_t>(count), std::memory_order_relaxed);
+                std::atomic_thread_fence(std::memory_order_release);
+                *volatile_done = current;
                 last  = std::chrono::steady_clock::now();
                 polls = 0;
             }
@@ -154,7 +166,7 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options) : imp
         throw std::invalid_argument("CPU miss service options are out of range");
     }
     for (const auto& layer : s.layers) {
-        if (layer.records == nullptr || layer.record_stride < record_geometry(layer.format).bytes) {
+        if ((layer.records == nullptr && layer.slots == nullptr) || layer.record_stride < record_geometry(layer.format).bytes) {
             throw std::invalid_argument("CPU miss service layer is incomplete");
         }
     }
@@ -196,6 +208,9 @@ MoeCpuChannel CpuMissService::channel(int layer) const {
 
 std::uint64_t CpuMissService::served_requests() const noexcept { return impl_->served.load(std::memory_order_relaxed); }
 std::uint64_t CpuMissService::served_experts() const noexcept { return impl_->experts.load(std::memory_order_relaxed); }
+std::uint64_t CpuMissService::process_served_experts() noexcept {
+    return g_process_experts.load(std::memory_order_relaxed);
+}
 
 std::string CpuMissService::failure() const {
     const std::lock_guard<std::mutex> lock(impl_->failure_mutex);

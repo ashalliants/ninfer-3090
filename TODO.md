@@ -1,5 +1,25 @@
 # TODO
 
+## `--draft-context-rows` above one lane changes committed output, 2026-11-10
+
+Refused at startup (`planning/startup.cpp:validate_target_options`) rather than shipped broken:
+`ninfer_qwen3_5_context_rows_real_test` found, on an RTX 3090 (Vast), that a second concurrent
+request changes the first's greedy output with `--draft-context-rows` on, even though one request
+at a time stays bit for bit identical. The row set is one union across every lane by design
+(`context_rows.h`: "one fixed-capacity set shared by every lane"), meant to widen only which
+tokens a lane's draft proposes, never the committed output ("drafts only" -- target verification
+decides every token). The test shows it reaches the committed output too; the real mechanism has
+not been found yet (candidates: the shared device buffer feeding something the target path reads,
+not only the draft's; or a round-shape change from the widened candidate pool tipping a near-tie
+argmax the way any two different verify widths already can elsewhere in this codebase -- the
+sequential case rules out the second explanation alone, since its acceptance rate also changes
+without changing output, but does not rule out a mix of both).
+
+Reopen once either: the table is reworked to be per-lane (the memory/kernel cost of that was
+presumably why it is shared in the first place), or the actual mechanism is found and shown to be
+the already-accepted near-tie class exactly, with evidence (not just absence of a better theory).
+Not on any launcher profile; no shipped configuration is affected by the refusal.
+
 ## Decode: two proven wins waiting on the attention work, 2026-09-19
 
 Both are measured, both are large, and both are deliberately parked until INT8 PV lands, because

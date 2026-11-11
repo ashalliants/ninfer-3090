@@ -2,13 +2,20 @@
 // registry asks of it. Covered: resolving ids and aliases, autoload, making room under models_max
 // by putting the least recently used idle model to sleep (or unloading it when it cannot sleep),
 // waking a sleeping model, leases holding a model in place, idle sleep, explicit load/unload/sleep,
-// the event stream, and the preset/models-directory catalog with its option precedence.
+// the event stream, the preset/models-directory catalog with its option precedence, the options a
+// routed model runs with, and the router's Host, Origin and Sec-Fetch-Site checks over HTTP.
 
 #include "serve/model_catalog.h"
 #include "serve/model_registry.h"
+#include "serve/routed_model.h"
 #include "serve/router_server.h"
 
+#include <httplib.h>
+#include <spdlog/logger.h>
+
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -329,9 +336,12 @@ void shared_state_files_are_refused() {
     expect(!refused({a, b}), "a model's default n-gram volume and expert state are distinct files");
     a.options.flash_next.ngram_volume_path = "/m/a.ninfer";
     expect(refused({a, b}), "a model's n-gram volume may not land on its own artifact");
+    a.options.flash_next.ngram_volume_path.clear();
+    a.options.flash_next.default_expert_state_path = "/m/b.ninfer";
+    expect(refused({a, b}), "a model's default expert state may not land on another model's artifact");
+    a.options.flash_next.default_expert_state_path.clear();
     a.options.flash_next.save_expert_state = false;
     a.options.flash_next.expert_state_path.clear();
-    a.options.flash_next.ngram_volume_path.clear();
     a.options.request_log_jsonl = "/m/b.ninfer";
     expect(refused({a, b}), "the request log may not land on a model's artifact");
     a.options.request_log_jsonl = "/m/requests.jsonl";
@@ -479,6 +489,166 @@ void single_model_mode() {
     expect(lease.model() == "only", "a request naming no model gets the one model");
 }
 
+// A routed model runs keyless on loopback; the public address's access settings stay with the
+// router, so --cors passed on to every model must not reach the model's own server.
+void routed_models_leave_access_to_the_router() {
+    ServeOptions started;
+    started.host        = "0.0.0.0";
+    started.port        = 9000;
+    started.api_key     = "secret";
+    started.enable_cors = true;
+    started.allowed_hosts.push_back("gpubox.lan");
+    started.max_context      = 4096;
+    const ServeOptions inner = routed_model_options(started, "small");
+    expect(inner.host == "127.0.0.1" && inner.port == 0 && inner.api_key.empty() &&
+               !inner.enable_cors && inner.allowed_hosts.empty() &&
+               inner.model_id_override == std::optional<std::string>("small") &&
+               inner.max_context == 4096,
+           "a routed model keeps its own options but none of the router's access settings");
+}
+
+// A stand-in for a routed model's server: the same pre-routing check a real one runs, with the
+// options routed_model_options() gives it, then 200 with the request headers it received.
+struct FakeModelServer {
+    httplib::Server server;
+    std::thread listener;
+    int port = 0;
+
+    FakeModelServer() {
+        port = server.bind_to_any_port("127.0.0.1");
+        const ServeOptions inner = routed_model_options(ServeOptions{}, "a");
+        const HostPolicy policy  = make_host_policy(inner.host, port, inner.allowed_hosts, "");
+        server.set_pre_routing_handler([inner, policy](const httplib::Request& req,
+                                                       httplib::Response& res) {
+            return reject_untrusted_request(policy, inner, req, res)
+                       ? httplib::Server::HandlerResponse::Handled
+                       : httplib::Server::HandlerResponse::Unhandled;
+        });
+        server.Get(R"(.*)", [](const httplib::Request& req, httplib::Response& res) {
+            std::string names;
+            for (const auto& [name, value] : req.headers) {
+                std::string lower = name;
+                std::transform(lower.begin(), lower.end(), lower.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                names += lower + "\n";
+            }
+            res.set_content(names, "text/plain");
+        });
+        listener = std::thread([this] { (void)server.listen_after_bind(); });
+    }
+
+    ~FakeModelServer() {
+        server.stop();
+        if (listener.joinable()) { listener.join(); }
+    }
+};
+
+// The router's pre-routing handler runs the Host (keyless only), Origin and Sec-Fetch-Site checks
+// on its public address, ahead of the key, over real HTTP; what a key or --cors lets in also gets
+// through the keyless, CORS-less model behind it (the relay drops Host, Origin and Sec-Fetch-*).
+void router_checks_host_and_origin() {
+    enum class Access { Open, Keyed, Cors };
+    for (const Access access : {Access::Open, Access::Keyed, Access::Cors}) {
+        Journal journal;
+        ModelRegistry registry({model("a")}, RegistryPolicy{}, factory(journal), true);
+        FakeModelServer model_server;
+        expect(model_server.port > 0, "the fake model could not bind a loopback port");
+        auto ports = std::make_shared<RoutedPorts>();
+        ports->set("a", model_server.port);
+        ServeOptions options;
+        options.host        = "127.0.0.1";
+        options.enable_cors = access == Access::Cors;
+        if (access == Access::Keyed) { options.api_key = "secret"; }
+        auto logger = std::make_shared<spdlog::logger>("router-test");
+        std::unique_ptr<RouterServer> router;
+        for (int port = 18480; port < 18580 && !router; ++port) {
+            options.port   = port;
+            auto candidate = std::make_unique<RouterServer>(options, registry, ports, logger);
+            if (candidate->bind()) { router = std::move(candidate); }
+        }
+        if (!router) {
+            expect(false, "the router test could not bind a loopback port");
+            return;
+        }
+        std::thread listener([&] { (void)router->listen(); });
+        httplib::Client client("127.0.0.1", options.port);
+        client.set_connection_timeout(5, 0);
+        client.set_read_timeout(5, 0);
+        const auto get = [&](const std::string& path, httplib::Headers headers) {
+            if (access == Access::Keyed) { headers.emplace("Authorization", "Bearer secret"); }
+            const auto result = client.Get(path, headers);
+            if (!result) { return std::pair<int, std::string>{-1, ""}; }
+            return std::pair<int, std::string>{result->status, result->body};
+        };
+        const std::string with = access == Access::Open    ? " (no key, no --cors)"
+                                 : access == Access::Keyed ? " (with a key)"
+                                                           : " (with --cors)";
+        expect(get("/health", {}).first == 200, "a plain request reaches the router" + with);
+        // A keyed router skips the Host check (a rebound page cannot send the key).
+        const auto rebound = get("/health", {{"Host", "evil.example:8080"}});
+        expect(access == Access::Keyed
+                   ? rebound.first == 200
+                   : rebound.first == 403 &&
+                         rebound.second.find("host_not_allowed") != std::string::npos,
+               "a rebinding Host gets 403 from a keyless router, 200 from a keyed one" + with);
+        expect(get("/health", {{"Host", "192.168.1.5:8080"}}).first == 200,
+               "an address Host passes the router" + with);
+        // The router serves the dashboard page itself, without the key, behind the Host check.
+        const auto page = client.Get("/dashboard");
+        expect(page && page->status == 200 &&
+                   page->get_header_value("Content-Type") == "text/html; charset=utf-8" &&
+                   page->get_header_value("Content-Security-Policy").find("default-src 'none'") !=
+                       std::string::npos &&
+                   page->get_header_value("X-Content-Type-Options") == "nosniff" &&
+                   page->body.rfind("<!doctype html>", 0) == 0,
+               "the router did not serve the dashboard without a key" + with);
+        const auto rebound_page =
+            client.Get("/dashboard", httplib::Headers{{"Host", "evil.example:8080"}});
+        expect(rebound_page && rebound_page->status == (access == Access::Keyed ? 200 : 403),
+               "the dashboard and the router's Host check disagree" + with);
+        if (access == Access::Keyed) {
+            const auto keyless_status = client.Get("/metrics");
+            const auto keyless_post   = client.Post("/dashboard", "", "text/plain");
+            expect(keyless_status && keyless_status->status == 401 && keyless_post &&
+                       keyless_post->status == 401,
+                   "only GET /dashboard skips the router's key");
+            // Any name reaches a keyed router, and the relay (which sends its own Host) gets the
+            // request past the loopback model's Host check.
+            expect(get("/v1/echo?model=a", {{"Host", "gpubox.tailnet.example:8080"}}).first == 200,
+                   "a keyed router did not relay a request under another Host name");
+        }
+        const auto foreign = get("/v1/models", {{"Origin", "http://evil.example"}});
+        const auto cross   = get("/v1/models", {{"Sec-Fetch-Site", "cross-site"}});
+        // A browser request from another site, relayed to the model.
+        const auto relayed = get("/v1/echo?model=a", {{"Origin", "http://evil.example"},
+                                                      {"Sec-Fetch-Site", "cross-site"},
+                                                      {"Sec-Fetch-Mode", "cors"}});
+        if (access == Access::Open) {
+            expect(foreign.first == 403 &&
+                       foreign.second.find("origin_not_allowed") != std::string::npos,
+                   "a foreign Origin gets 403 from a keyless router");
+            expect(cross.first == 403 &&
+                       cross.second.find("cross_site_request") != std::string::npos,
+                   "a cross-site request gets 403 from a keyless router");
+            expect(relayed.first == 403, "a keyless router relays no cross-site request");
+            expect(get("/v1/models", {{"Origin", "http://localhost:" +
+                                                     std::to_string(options.port)}})
+                           .first == 200,
+                   "the router's own origin passes");
+        } else {
+            expect(foreign.first == 200 && cross.first == 200,
+                   "a key or --cors decides browser access on its own" + with);
+            expect(relayed.first == 200, "the model refused a request the router let in" + with);
+            expect(relayed.second.find("origin\n") == std::string::npos &&
+                       relayed.second.find("sec-fetch-") == std::string::npos &&
+                       relayed.second.find("authorization\n") == std::string::npos,
+                   "the relay passed Origin, Sec-Fetch-* or credentials to the model" + with);
+        }
+        router->stop();
+        listener.join();
+    }
+}
+
 void catalog() {
     const auto preset = parse_preset_file(R"(
 version = 1
@@ -519,6 +689,15 @@ model-suspend = false
                             parse_preset_file("[a]\nmodel=/x.ninfer\nunload-idle-seconds=5\n"), {});
     } catch (const std::invalid_argument&) { router_key = true; }
     expect(router_key, "a preset may not set a router option per model");
+    // The router answers on the public address, so its Host check is the one that counts.
+    bool allowed_host_key = false;
+    try {
+        (void)build_catalog(std::nullopt,
+                            parse_preset_file("[a]\nmodel=/x.ninfer\nallowed-host=gpubox\n"), {});
+    } catch (const std::invalid_argument& error) {
+        allowed_host_key = std::string(error.what()).find("owned by the router") != std::string::npos;
+    }
+    expect(allowed_host_key, "a preset may not set allowed-host per model");
     bool empty_name = false;
     try {
         (void)parse_preset_file("[ ]\nmodel=/x.ninfer\n");
@@ -566,6 +745,8 @@ int main() {
         a_resumed_failed_service_is_rebuilt();
         selector_rewrite_changes_only_the_selector();
         single_model_mode();
+        routed_models_leave_access_to_the_router();
+        router_checks_host_and_origin();
         catalog();
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';

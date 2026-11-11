@@ -65,7 +65,12 @@ int main() {
     options.default_thinking_budget        = 512;
     options.reasoning_loop                 = ninfer::ReasoningLoopAction::Conclude;
     options.sampling_overrides.temperature = 0.6F;
-    options.startup_argv = {"ninfer-serve", options.artifact_path, "--api-key", "<redacted>"};
+    options.startup_argv = {"ninfer-serve", options.artifact_path, "--config", "serve.json",
+                            "--api-key", "<redacted>"};
+    options.effective_argv  = {"ninfer-serve", options.artifact_path, "--vision", "--api-key",
+                               "<redacted>"};
+    options.setting_sources = {
+        {"--api-key", "cli"}, {"--config", "cli"}, {"--vision", "serve.json"}};
 
     ninfer::EngineOptions engine_options;
     engine_options.artifact_path                     = options.artifact_path;
@@ -256,8 +261,13 @@ int main() {
                       "Host context-cache memory ledger missing");
     failures += check(server.dump().find("must-not-appear") == std::string::npos,
                       "server JSON leaked the API key");
-    failures += check(server.at("argv").at(3) == "<redacted>",
+    failures += check(server.at("argv").at(5) == "<redacted>",
                       "server argv did not retain the redaction marker");
+    failures += check(server.at("effective_argv").at(2) == "--vision" &&
+                          server.at("effective_argv").at(4) == "<redacted>" &&
+                          server.at("setting_sources").at("--vision") == "serve.json" &&
+                          server.at("setting_sources").at("--config") == "cli",
+                      "server record did not carry the --config words and setting sources");
 
     GenerationRequest request;
     // A derived budget: the parse-time context bound is replaced by what was actually submitted.

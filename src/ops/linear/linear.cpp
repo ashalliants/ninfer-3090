@@ -47,6 +47,16 @@ void validate_linear_policy(LinearPolicy policy) {
     }
 }
 
+// AllowA8GgmlDecodeMma is the GGML block formats' policy only.
+void require_policy_format(QType qtype, LinearPolicy policy) {
+    if (allows_ggml_decode_mma(policy) && !is_ggml_block(qtype)) {
+        throw std::invalid_argument("linear: AllowA8GgmlDecodeMma admits GGML block-format weights only");
+    }
+}
+
+// GGML formats register only the Q8_1 (A8) profile: AllowA8, AllowA4 and AllowA8GgmlDecodeMma admit it.
+bool ggml_a8_admitted(LinearPolicy policy) { return allows_a8(policy) || allows_ggml_decode_mma(policy); }
+
 void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& out,
                                LinearPolicy policy) {
     if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
@@ -110,11 +120,13 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::GGML_IQ4_XS:
     case QType::GGML_IQ3_S:
     case QType::GGML_Q6_K:
+    case QType::GGML_Q5_K:
+    case QType::GGML_Q4_K:
     case QType::GGML_IQ4_NL:
     case QType::GGML_Q8_0:
     case QType::GGML_Q2_0:
-        detail::ggml_require_registered(w.qtype, w.n, w.k, false, allows_a8(policy));
-        detail::ggml_linear_dispatch(x, w, out, false, workspace, stream);
+        detail::ggml_require_registered(w.qtype, w.n, w.k, false, ggml_a8_admitted(policy));
+        detail::ggml_linear_dispatch(x, w, out, false, allows_ggml_decode_mma(policy), workspace, stream);
         return;
     default:
         break;
@@ -128,6 +140,7 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
                                             std::int32_t input_rows, LinearPolicy policy,
                                             std::int32_t min_tokens, std::int32_t max_tokens) {
     validate_linear_policy(policy);
+    require_policy_format(qtype, policy);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("linear workspace: invalid token interval");
     }
@@ -166,10 +179,12 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::GGML_IQ4_XS:
     case QType::GGML_IQ3_S:
     case QType::GGML_Q6_K:
+    case QType::GGML_Q5_K:
+    case QType::GGML_Q4_K:
     case QType::GGML_IQ4_NL:
     case QType::GGML_Q8_0:
     case QType::GGML_Q2_0:
-        detail::ggml_require_registered(qtype, output_rows, input_rows, false, allows_a8(policy));
+        detail::ggml_require_registered(qtype, output_rows, input_rows, false, ggml_a8_admitted(policy));
         return detail::ggml_linear_workspace_capacity_bytes(qtype, output_rows, input_rows, false,
                                                             min_tokens, max_tokens);
     default:
@@ -181,6 +196,7 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
 void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
             WorkspaceArena& workspace, cudaStream_t stream) {
     validate_linear_semantics(x, w, out, policy);
+    require_policy_format(w.qtype, policy);
     dispatch_linear(x, w, out, policy, &workspace, stream);
 }
 

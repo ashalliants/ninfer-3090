@@ -8,7 +8,7 @@ separately.
 
 ## 1. Registered formats
 
-NInfer has exactly twenty-one persistent numeric tensor formats in six categories.
+NInfer has exactly thirty-six persistent numeric tensor formats in six categories.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -45,8 +45,12 @@ The GGML block formats store blocks of ggml's quantization types unchanged (Sect
 | Canonical name | ggml type (id) | Values/block | Bytes/block | Bits/weight |
 |---|---|---:|---:|---:|
 | `ggml_q8_0` | `Q8_0` (8) | 32 | 34 | 8.5 |
+| `ggml_q4_k` | `Q4_K` (12) | 256 | 144 | 4.5 |
+| `ggml_q5_k` | `Q5_K` (13) | 256 | 176 | 5.5 |
 | `ggml_q6_k` | `Q6_K` (14) | 256 | 210 | 6.5625 |
 | `ggml_iq2_xxs` | `IQ2_XXS` (16) | 256 | 66 | 2.0625 |
+| `ggml_iq2_xs` | `IQ2_XS` (17) | 256 | 74 | 2.3125 |
+| `ggml_iq3_xxs` | `IQ3_XXS` (18) | 256 | 98 | 3.0625 |
 | `ggml_iq4_nl` | `IQ4_NL` (20) | 32 | 18 | 4.5 |
 | `ggml_iq3_s` | `IQ3_S` (21) | 256 | 110 | 3.4375 |
 | `ggml_iq2_s` | `IQ2_S` (22) | 256 | 82 | 2.5625 |
@@ -63,6 +67,15 @@ formats (Section 3.6):
 | `ggml_rec_iq2_xxs_q2_0` | `ggml_iq2_xxs` | `ggml_q2_0` |
 | `ggml_rec_iq1_m_q2_0` | `ggml_iq1_m` | `ggml_q2_0` |
 | `ggml_rec_q2_0_q2_0` | `ggml_q2_0` | `ggml_q2_0` |
+| `ggml_rec_iq2_xs_q2_0` | `ggml_iq2_xs` | `ggml_q2_0` |
+| `ggml_rec_iq2_xs_iq4_nl` | `ggml_iq2_xs` | `ggml_iq4_nl` |
+| `ggml_rec_iq2_xxs_iq4_nl` | `ggml_iq2_xxs` | `ggml_iq4_nl` |
+| `ggml_rec_iq2_s_iq4_nl` | `ggml_iq2_s` | `ggml_iq4_nl` |
+| `ggml_rec_iq3_xxs_q2_0` | `ggml_iq3_xxs` | `ggml_q2_0` |
+| `ggml_rec_iq3_xxs_iq4_nl` | `ggml_iq3_xxs` | `ggml_iq4_nl` |
+| `ggml_rec_iq3_s_q2_0` | `ggml_iq3_s` | `ggml_q2_0` |
+| `ggml_rec_iq3_s_iq4_nl` | `ggml_iq3_s` | `ggml_iq4_nl` |
+| `ggml_rec_iq4_xs_iq4_nl` | `ggml_iq4_xs` | `ggml_iq4_nl` |
 
 `ggml_rec_q2_0_q2_0` holds the Qwen3.8-Flash-Next MTP drafter's experts (Strata's
 `mtp-q2_0.gguf`, whose fused `gate_up_proj` the converter splits into each record's gate and up
@@ -70,10 +83,15 @@ rows).
 
 The C++ registry accepts the GGML block and expert record formats and materializes them to Device,
 Host or Pinned memory unchanged. Linear and LinearAdd consume `ggml_iq4_xs`, `ggml_iq3_s`, `ggml_q6_k`,
-`ggml_iq4_nl`, `ggml_q8_0` and `ggml_q2_0` at the registered problems in
+`ggml_q5_k`, `ggml_q4_k`, `ggml_iq4_nl`, `ggml_q8_0` and `ggml_q2_0` at the registered problems in
 [`linear.h`](../../include/ninfer/ops/linear.h) and
-[`linear_add.h`](../../include/ninfer/ops/linear_add.h), through their Q8_1 activation profile.
-offloaded_sparse_moe consumes the three text expert record formats through its canonical A8
+[`linear_add.h`](../../include/ninfer/ops/linear_add.h), through their Q8_1 activation profile
+(for the affine `ggml_q4_k` and `ggml_q5_k`, each 32-value sub-block's min term is formed from the
+sum of its Q8_1 codes, as llama.cpp's `vec_dot_q4_K_q8_1` does), and projection_fp32's GGML head
+form consumes `ggml_iq4_xs`, `ggml_q6_k` and `ggml_q5_k`.
+`ggml_iq2_xs` and `ggml_iq3_xxs` have a device sub-block decoder in the GGML linears
+(`src/ops/linear/ggml/ggml_blocks.cuh`) but no registered problem, so no Op consumes them yet.
+offloaded_sparse_moe consumes the twelve text expert record formats through its canonical A8
 arithmetic, and `ggml_rec_q2_0_q2_0` on its narrow route only
 ([`offloaded_sparse_moe.h`](../../include/ninfer/ops/offloaded_sparse_moe.h)). An Op that consumes
 a format declares its own support.
@@ -352,18 +370,25 @@ consecutive blocks. Each block holds its own scales; no field lies outside the b
 string of the block size is a valid block: the binary16 scales may be zero, subnormal, infinite or
 NaN, and the format represents whatever they reconstruct to.
 
-The represented FP32 values of a block are exactly those of ggml's reference
-`dequantize_row_<type>` in `ggml-quants.c` of llama.cpp release b11316, with the block structs of
-`ggml-common.h` and its lookup tables (`iq2xxs_grid`, `iq2s_grid`, `iq3s_grid`, `iq1s_grid`,
+The represented FP32 values of a block are exactly those of ggml's reference `dequantize_row_<type>`
+in `ggml-quants.c` of llama.cpp release b11316, with the block structs of `ggml-common.h` and its
+lookup tables (`iq2xxs_grid`, `iq2xs_grid`, `iq2s_grid`, `iq3xxs_grid`, `iq3s_grid`, `iq1s_grid`,
 `ksigns_iq2xs`, `kmask_iq2xs`, `kvalues_iq4nl`). Each output is formed by that source's sequence of
 single FP32 operations, so the result is one FP32 bit pattern. One case is fixed beyond the C
-source: the sign factor `(bit ? -1.f : 1.f)` of IQ2_XXS, IQ2_S and IQ3_S negates its operand (flips
-the sign bit), which equals the product for every non-NaN value and is what the reference build
-does for NaN.
+source: the sign factor `(bit ? -1.f : 1.f)` of IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and IQ3_S negates
+its operand (flips the sign bit), which equals the product for every non-NaN value and is what the
+reference build does for NaN.
 
 `ggml_q2_0` is the newest of these types: one binary16 `d` followed by 16 bytes of 2-bit codes per
 64 values. Value `j` uses code `q = (qs[j / 4] >> (2 * (j % 4))) & 3`, least significant pair
 first, and reconstructs as `binary32((q - 1) * d)`, so the codes mean −1, 0, +1 and +2.
+
+`ggml_q4_k` and `ggml_q5_k` are the affine K-quants, the only formats here with an offset. A block
+is `{fp16 d; fp16 dmin; u8 scales[12]; ...}` over eight sub-blocks of 32 values; `get_scale_min_k4`
+unpacks sub-block `j`'s 6-bit scale `sc_j` and 6-bit min `m_j` from the 12 bytes. Value `l` of
+sub-block `j` reconstructs as `binary32(binary32(d * sc_j) * q - binary32(dmin * m_j))`, two FP32
+operations after the two products, with `q` in `[0, 15]` (Q4_K: a nibble of `qs[32 (j / 2) + l]`,
+low for even `j`) or `[0, 31]` (Q5_K: that nibble plus 16 times bit `j` of `qh[l]`).
 
 The Python decoders are
 [`tools/artifact/codecs/ggml_blocks.py`](../../tools/artifact/codecs/ggml_blocks.py), and the C++
@@ -387,9 +412,19 @@ holds. A record contains the expert's three matrices, each in a GGML block forma
 - down `[H, I]` in its down block format, K = I.
 
 The represented values of each matrix are those of its blocks under Section 3.5; the record adds
-no scale, offset or field of its own. The three registered formats are exactly the gate/up and down
-type pairs of the Qwen3.8-Flash-Next GGUF. Their only layout is `ggml_expert_record_v1`
-([storage layouts](storage-layouts.md) Section 7), which fixes where each part lies in a record.
+no scale, offset or field of its own. The twelve text formats are exactly the gate/up and down type
+pairs of the routed experts of three Qwen3.8-Flash-Next GGUFs; gate and up always share a type:
+
+- the IQ2_XS pack: IQ2_S, IQ2_XXS and IQ1_M gate/up, all with Q2_0 down;
+- ISTA-DASLab's GSQ-RCO IQ3_XXS and IQ3_S packs, which choose a pair per layer from IQ2_XXS,
+  IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S or IQ4_XS gate/up with Q2_0 or IQ4_NL down. Their published tensor
+  allocations add the nine pairs after `ggml_rec_q2_0_q2_0` in the table of Section 1.
+
+A record's bytes follow from its pair (at `[E, 2560, 640]`, 256-byte aligned parts): from 1.18 MB
+(`ggml_rec_iq1_m_q2_0`) to 2.66 MB (`ggml_rec_iq4_xs_iq4_nl`); IQ4_NL down rows are 360 bytes
+against Q2_0's 180. The fourth format, `ggml_rec_q2_0_q2_0`, is the MTP drafter's. Their only
+layout is `ggml_expert_record_v1` ([storage layouts](storage-layouts.md) Section 7), which fixes
+where each part lies in a record.
 
 ## 4. Grouped signed-integer tensor model
 

@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
 #include <random>
 #include <span>
 #include <string>
@@ -32,8 +33,14 @@ inline void check(bool ok, const std::string& what) {
     }
 }
 
-inline constexpr QType kRecordFormats[] = {QType::GGML_REC_IQ2_S_Q2_0, QType::GGML_REC_IQ2_XXS_Q2_0,
-                                           QType::GGML_REC_IQ1_M_Q2_0};
+// Every record format both routes serve (the MTP drafter's narrow-only Q2_0+Q2_0 is separate):
+// the IQ2_XS pack's three, then the further pairs of the GSQ-RCO IQ3_XXS and IQ3_S packs.
+inline constexpr QType kRecordFormats[] = {
+    QType::GGML_REC_IQ2_S_Q2_0,     QType::GGML_REC_IQ2_XXS_Q2_0,   QType::GGML_REC_IQ1_M_Q2_0,
+    QType::GGML_REC_IQ2_XS_Q2_0,    QType::GGML_REC_IQ2_XS_IQ4_NL,  QType::GGML_REC_IQ2_XXS_IQ4_NL,
+    QType::GGML_REC_IQ2_S_IQ4_NL,   QType::GGML_REC_IQ3_XXS_Q2_0,   QType::GGML_REC_IQ3_XXS_IQ4_NL,
+    QType::GGML_REC_IQ3_S_Q2_0,     QType::GGML_REC_IQ3_S_IQ4_NL,   QType::GGML_REC_IQ4_XS_IQ4_NL};
+inline constexpr int kRecordFormatCount = static_cast<int>(std::size(kRecordFormats));
 
 inline const char* format_name(QType format) {
     switch (format) {
@@ -41,6 +48,15 @@ inline const char* format_name(QType format) {
     case QType::GGML_REC_IQ2_XXS_Q2_0: return "iq2_xxs+q2_0";
     case QType::GGML_REC_IQ1_M_Q2_0: return "iq1_m+q2_0";
     case QType::GGML_REC_Q2_0_Q2_0: return "q2_0+q2_0";
+    case QType::GGML_REC_IQ2_XS_Q2_0: return "iq2_xs+q2_0";
+    case QType::GGML_REC_IQ2_XS_IQ4_NL: return "iq2_xs+iq4_nl";
+    case QType::GGML_REC_IQ2_XXS_IQ4_NL: return "iq2_xxs+iq4_nl";
+    case QType::GGML_REC_IQ2_S_IQ4_NL: return "iq2_s+iq4_nl";
+    case QType::GGML_REC_IQ3_XXS_Q2_0: return "iq3_xxs+q2_0";
+    case QType::GGML_REC_IQ3_XXS_IQ4_NL: return "iq3_xxs+iq4_nl";
+    case QType::GGML_REC_IQ3_S_Q2_0: return "iq3_s+q2_0";
+    case QType::GGML_REC_IQ3_S_IQ4_NL: return "iq3_s+iq4_nl";
+    case QType::GGML_REC_IQ4_XS_IQ4_NL: return "iq4_xs+iq4_nl";
     default: return "?";
     }
 }
@@ -88,6 +104,25 @@ inline void fill_blocks(QType format, std::uint8_t* out, std::size_t blocks, flo
     }
 }
 
+// The fp16 scale of random blocks of a record part, so that every format's weights have a realistic
+// size (and the scale times its factor in [0.5, 2) stays a normal binary16, >= 2^-14):
+//   - IQ2_XXS, IQ2_XS, IQ2_S: grid values up to 43 times (2 ls + 1) / 8 <= 3.9;
+//   - IQ1_M: up to 9/8 * 15;
+//   - IQ3_XXS: grid values up to 62 times (2 ls + 1) / 4 <= 7.75; IQ3_S: up to 15 times 31;
+//   - IQ4_XS: codebook values up to 127 times |ls - 32| <= 32; IQ4_NL: up to 127;
+//   - Q2_0 (down): codes in [-1, 2].
+inline float block_scale(QType format) {
+    switch (format) {
+    case QType::GGML_IQ1_M: return 2.0e-3F;
+    case QType::GGML_IQ3_XXS:
+    case QType::GGML_IQ3_S:
+    case QType::GGML_IQ4_XS:
+    case QType::GGML_IQ4_NL: return 1.25e-4F;
+    case QType::GGML_Q2_0: return 4.0e-3F;
+    default: return 3.0e-4F;
+    }
+}
+
 // One record of `format` with random blocks (and zero gaps), record_geometry(format).bytes long.
 inline std::vector<std::uint8_t> random_record(QType format, std::mt19937& rng) {
     const auto g = om::record_geometry(format);
@@ -95,12 +130,9 @@ inline std::vector<std::uint8_t> random_record(QType format, std::mt19937& rng) 
     const auto gu = ggml_block(g.gate_up), dn = ggml_block(g.down);
     const std::size_t gu_blocks = static_cast<std::size_t>(om::kIntermediate) * om::kHidden / gu.values;
     const std::size_t dn_blocks = static_cast<std::size_t>(om::kHidden) * om::kIntermediate / dn.values;
-    // Weight magnitudes: IQ2 grid values up to 43 times (2 ls + 1) / 8 <= 3.9; IQ1_M up to 9/8 * 15;
-    // Q2_0 codes in [-1, 2].
-    const float gu_scale = g.gate_up == QType::GGML_IQ1_M ? 2.0e-3F : 3.0e-4F;
-    fill_blocks(g.gate_up, r.data(), gu_blocks, gu_scale, rng);
-    fill_blocks(g.gate_up, r.data() + g.up_offset, gu_blocks, gu_scale, rng);
-    fill_blocks(g.down, r.data() + g.down_offset, dn_blocks, 4.0e-3F, rng);
+    fill_blocks(g.gate_up, r.data(), gu_blocks, block_scale(g.gate_up), rng);
+    fill_blocks(g.gate_up, r.data() + g.up_offset, gu_blocks, block_scale(g.gate_up), rng);
+    fill_blocks(g.down, r.data() + g.down_offset, dn_blocks, block_scale(g.down), rng);
     return r;
 }
 

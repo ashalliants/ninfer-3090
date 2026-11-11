@@ -118,6 +118,10 @@ EngineOptions base_options(const std::string& artifact, std::uint32_t max_contex
     options.context_cache.host_capacity_bytes = cache ? std::optional<std::size_t>(2ULL << 30) : std::optional<std::size_t>(0);
     options.pending_timeout_ms           = 3'600'000;
     options.flash_next.save_expert_state = false;
+    // Some hosts (confirmed: a Vast.ai container, 2026-11-10) cap RLIMIT_MEMLOCK far below any
+    // Flash-Next load with no way to raise it. Harmless where the real limit is high enough:
+    // cudaHostAlloc is the real test either way.
+    options.flash_next.allow_unlocked_host_memory = true;
     if (mtp > 0) {
         options.speculative.backend      = SpeculativeBackend::Mtp;
         options.speculative.draft_tokens = mtp;

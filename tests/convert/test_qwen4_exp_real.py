@@ -97,6 +97,8 @@ def test_sampled_real_blocks_decode_exactly(gguf, name):
 
     spec = GGML_BLOCK_FORMATS[name]
     tensors = [t for t in gguf.tensors.values() if t.type.format == name]
+    if not tensors:
+        pytest.skip(f"the GGUF has no {name} tensor")
     rng = np.random.default_rng(spec.ggml_type)
     blocks = []
     for _ in range(1000):

@@ -62,6 +62,8 @@ tools/freq_corpus/fixtures/*
 *.swp
 .DS_Store
 profiles/
+# ...but not the launchers' profile files (ninfer-serve --config), which ship in the release archives.
+!/scripts/profiles/
 .chatgpt/
 benchmark_results/
 

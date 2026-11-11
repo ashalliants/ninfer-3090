@@ -25,7 +25,10 @@ decoding).
 
 Per call of T consecutive positions of one sequence (`execution/forward.cpp`):
 
-1. `x0 = embed(ids)` (GGML IQ4_XS rows decoded to BF16); `R = expand(x0)` into S streams.
+1. `x0 = embed(ids)` (GGML IQ4_XS rows decoded to BF16); `R = expand(x0)` into S streams. With
+   `--hot-embedding-rows N` the table is in the pinned host block and only rows [0, N) have a device
+   copy; `ops::embedding_split` reads the other rows through the mapped block, with the same values.
+   The MTP drafter's embedding takes the same route.
 2. For each block: the PLE injection (its layer), `xa, inject = mix(attn_hc, R)`,
    `y = GDN(xa)` or `QSA(xa)`, `R += inject * y`, `xm, inject = mix(mlp_hc, R)`, `y = MoE(xm)`,
    `R += inject * y` (each update rounded once to BF16).
@@ -40,8 +43,10 @@ the experts are `offloaded_sparse_moe` (canonical A8 arithmetic).
 `g = decay * softplus(a + dt_bias)`, `beta = sigmoid(b)` (`gdn_gating_decay`; `decay` is the
 stored `-exp(A_log)`); the causal SiLU convolution splits into q [128, 16], k [128, 16], v
 [128, 48]; value head h reads key head `h mod 16` (tiled order), so q and k are tiled to 48 heads
-and the recurrence runs with one key head per value head; `o = GatedDeltaNet(...)` (normalized
-q/k, scale 1/sqrt(128)); `y = W_out (norm(o) * w * act(z))` per value head.
+and the recurrence runs with one key head per value head (with `--gdn-head-map` the recurrence
+reads the 16 key heads in place through `ops::GdnHeadMap::Tiled` instead);
+`o = GatedDeltaNet(...)` (normalized q/k, scale 1/sqrt(128)); `y = W_out (norm(o) * w * act(z))`
+per value head.
 
 **QSA.** `W_q` rows interleave per head: 256 query rows, then 256 gate rows. q and k are
 RMS-normalized with `1 + gamma`, rotated (64 of 256 dims), K/V appended to the INT8-G64 paged
@@ -117,8 +122,9 @@ unchanged. Per layer `L` under `text/layers/L/`:
 | `ple/{key,value}` (layer 1) | [S*H, 2560], [H, 2560] | one BF16 parent [12800, 2560] |
 | `ple/{key,query,conv}_norm`, `ple/convolution` | [S*H], [S*H, 4] | FP32 (the convolution is the GGUF's F16 widened, channel-major) |
 
-Globals: `text/token_embedding` and `text/output_head` [248320, H] (GGML IQ4_XS),
-`text/final_mixer/{norm,down,up}`. The n-gram table is the separate volume (`<artifact>.ngram`).
+Globals: `text/token_embedding` and `text/output_head` [248320, H] (GGML IQ4_XS; with
+`--hot-embedding-rows` the token embedding is pinned before the expert banks instead of in device
+memory), `text/final_mixer/{norm,down,up}`. The n-gram table is the separate volume (`<artifact>.ngram`).
 
 The drafter's parameters under `mtp/` mirror the text layer's names (`layers/0/attn_hc/...`,
 `layers/0/attention/...`, `layers/0/indexer/...`, `layers/0/moe/...`, `final_mixer/...`) plus

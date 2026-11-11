@@ -1,0 +1,248 @@
+{
+  "about": "Every option and check the Basalt learnings (issue #383) added, for tools/bench/basalt_gpu_verify.py. item: the issue's item (F<n>: Flash-Next item n, its sub-items lettered in the issue's order; X-<letter>: the cross-model items; S<n>: the serving and process items, numbered in the issue's order: S1 soak harness, S2 bench rows, S3 security, S4 /slots, S5 dashboard, S6 --config, S7 cache-affinity admission, S8 process checks). kind: identity = designed to leave the output bit for bit unchanged (its GPU tests and identity gates prove it); quality = changes numerics or the output distribution (judged by the KLD gate or by acceptance); speed = timing or scheduling only, nothing to compare bit for bit; serving = a server feature (request checks, configuration) checked against a real server. tests: a ctest regex run with tools/run-tests.ps1 -GpuOnly. identity: harness runs (ninfer_tests <test> <args>) that compare the option on against off in one process. kld: the forward harness flag for the decode-path KLD gate. ab: speed A/B variants (a and b are the arguments each arm adds to the workload); ab_reason says why an option has none.",
+  "schema": 1,
+  "models": {
+    "flash-next": {
+      "input": "--flash-next",
+      "about": "Qwen3.8-Flash-Next artifact with the MTP drafter (qwen4exp-iq2xs-mtp.ninfer), its n-gram volume beside it",
+      "env": {"NINFER_TEST_QWEN4EXP_ARTIFACT": "{model}", "NINFER_TEST_ARTIFACT": "{model}"}
+    },
+    "qwen38-27b": {
+      "input": "--qwen27b",
+      "about": "Qwen3.8-27B DFlash2 bundle (qwen3_8_27b.ninfer, carries the MTP weights too)",
+      "env": {"NINFER_TEST_ARTIFACT": "{model}"}
+    },
+    "qwen36-35b": {
+      "input": "--qwen35b",
+      "about": "Qwen3.6-35B-A3B artifact (optional)",
+      "env": {"NINFER_TEST_ARTIFACT": "{model}"}
+    }
+  },
+  "workloads": {
+    "fn-decode-mtp": {
+      "tool": "engine-bench",
+      "model": "flash-next",
+      "about": "Flash-Next as served from the -mtp artifact: one Engine, a warm-up prompt, then a 1,024-token chat prompt and 256 greedy tokens with MTP 3; decode tok/s of the second job",
+      "args": ["--bench", "--generate", "256", "--max-context", "8192", "--mtp", "3"],
+      "jobs": ["{fixtures}/qwen4_exp/infernix_texts-chat.ids", "{fixtures}/qwen4_exp/ppl_tokens-chat.ids"],
+      "metric": "decode"
+    },
+    "fn-prefill-2k": {
+      "tool": "engine-bench",
+      "model": "flash-next",
+      "about": "a 2,048-token prompt (the chat and doc fixtures) prefilled as one streamed call, 2 output tokens; prefill tok/s of the second job",
+      "args": ["--bench", "--generate", "2", "--max-context", "8192"],
+      "jobs": ["{fixtures}/qwen4_exp/infernix_texts-chat.ids", "{out}/inputs/prompt-2k.ids"],
+      "metric": "prefill"
+    },
+    "q27-chat-greedy-dflash2": {
+      "tool": "chat-decode",
+      "model": "qwen38-27b",
+      "about": "run_chat_decode.py: the 24 chat prompts, 512 greedy tokens each, DFlash2 with 6 drafts; decode rate from the server's own request log",
+      "args": ["--spec", "dflash2", "--draft-tokens", "6", "--temperature", "0", "--max-tokens", "512"]
+    },
+    "q27-chat-sampled-dflash2": {
+      "tool": "chat-decode",
+      "model": "qwen38-27b",
+      "about": "the same at temperature 0.7 (top-p 0.8, top-k 20), where relaxed drafting applies",
+      "args": ["--spec", "dflash2", "--draft-tokens", "6", "--temperature", "0.7", "--max-tokens", "512"]
+    },
+    "q27-chat-sampled-mtp": {
+      "tool": "chat-decode",
+      "model": "qwen38-27b",
+      "about": "sampled at temperature 0.7 with MTP 3",
+      "args": ["--spec", "mtp", "--draft-tokens", "3", "--temperature", "0.7", "--max-tokens", "512"]
+    }
+  },
+  "options": [
+    {
+      "flag": "--ngram-keepalive-ms", "item": "F7a", "model": "flash-next", "kind": "speed",
+      "summary": "read one n-gram volume block after N ms idle so the drive does not sleep; the default moved from a fixed 100 ms to 40 (the one default the Basalt learnings change, stated in its commit)",
+      "tests": "^ninfer_qwen4_exp_engine_real_test$",
+      "ab_reason": "the keep-alive only matters across idle gaps of more than ~100 ms on a drive that sleeps; the engine bench never idles, so it would measure nothing. Check by hand: TTFT of a request after a 1 s pause, 100 against 40."
+    },
+    {
+      "flag": "--shared-expert-stream", "item": "F4a", "model": "flash-next", "kind": "identity",
+      "summary": "each MoE block's shared expert on a second CUDA stream beside the routed experts",
+      "tests": "^ninfer_qwen4_exp_mtp_real_test$",
+      "identity": [["ninfer_qwen4_exp_forward_real_test", "--shared-expert-stream", "@{fixtures}/qwen4_exp/ppl_tokens-chat.ids"]],
+      "ab": [{"workload": "fn-decode-mtp", "a": [], "b": ["--shared-expert-stream"]}]
+    },
+    {
+      "flag": "--mtp-constrained", "item": "F2", "model": "flash-next", "kind": "identity",
+      "summary": "MTP speculation for constrained requests, one grammar mask per verified position",
+      "tests": "^ninfer_qwen4_exp_(mtp_constrained|constrained_window)_test$",
+      "ab_reason": "the engine bench sends unconstrained prompts, where the option does nothing; its speed needs JSON-schema or tool-call requests through ninfer-serve, which this script does not send."
+    },
+    {
+      "flag": "--mtp-joint-acceptance", "item": "F3", "model": "flash-next", "kind": "identity",
+      "summary": "Basalt's joint-acceptance rule chooses how many MTP drafts a round verifies",
+      "tests": "^ninfer_argmax_probability_test$",
+      "identity": [["ninfer_qwen4_exp_engine_real_test", "--mtp-exact", "3", "--mtp-joint-acceptance", "--generate", "256", "@{fixtures}/qwen4_exp/ppl_tokens-chat.ids", "@{fixtures}/qwen4_exp/ppl_tokens-doc.ids"]],
+      "ab": [{"workload": "fn-decode-mtp", "a": [], "b": ["--mtp-joint-acceptance"]}]
+    },
+    {
+      "flag": "--ngram-prefetch", "item": "F7b", "model": "flash-next", "kind": "identity",
+      "summary": "read the anchor column's n-gram rows into the host cache while the MTP draft graph runs",
+      "tests": "^ninfer_qwen4_exp_(ngram_volume|mtp_real)_test$",
+      "ab": [{"workload": "fn-decode-mtp", "a": [], "b": ["--ngram-prefetch"]}]
+    },
+    {
+      "flag": "--default-expert-state", "item": "F10a", "model": "flash-next", "kind": "speed",
+      "summary": "a default expert state shipped beside the model, read when the saved state is missing",
+      "tests": "^ninfer_qwen4_exp_(expert_cache|engine_real)_test$",
+      "ab_reason": "it changes only where a fresh install's expert cache starts; the check 'default-expert-state' exports a state and starts from it."
+    },
+    {
+      "flag": "--hot-embedding-rows", "item": "F10b", "model": "flash-next", "kind": "identity",
+      "summary": "only the embedding's first N rows in VRAM, the rest read from pinned RAM",
+      "tests": "^ninfer_(embedding|qwen4_exp_hot_embedding)_test$",
+      "ab": [{"workload": "fn-decode-mtp", "a": [], "b": ["--hot-embedding-rows", "8192"]}]
+    },
+    {
+      "flag": "--gdn-head-map", "item": "F5", "model": "flash-next", "kind": "identity",
+      "summary": "the GDN reads its 16 key heads in place through the tiled head map",
+      "tests": "^ninfer_(gated_delta_net|gated_delta_net_replay_record|gdn_replay_fold|qwen4_exp_gdn_head_map)_test$",
+      "identity": [["ninfer_qwen4_exp_forward_real_test", "--gdn-head-map", "@{fixtures}/qwen4_exp/ppl_tokens-chat.ids"]],
+      "ab": [{"workload": "fn-decode-mtp", "a": [], "b": ["--gdn-head-map"]}]
+    },
+    {
+      "flag": "--moe-precast-input", "item": "F4b", "model": "flash-next", "kind": "identity",
+      "summary": "cast each routed-expert call's input to A8 once instead of in every gate/up block",
+      "tests": "^ninfer_(offloaded_moe_layer|offloaded_moe_wide|qwen4_exp_moe_precast)_test$",
+      "identity": [["ninfer_qwen4_exp_forward_real_test", "--moe-precast-input", "@{fixtures}/qwen4_exp/ppl_tokens-chat.ids"]],
+      "ab": [{"workload": "fn-decode-mtp", "a": [], "b": ["--moe-precast-input"]}]
+    },
+    {
+      "flag": "--moe-gate-up-registers", "item": "F4c", "model": "flash-next", "kind": "identity",
+      "summary": "register-resident gate/up kernel with a balanced tail (needs --moe-precast-input)",
+      "tests": "^ninfer_(offloaded_moe_layer|qwen4_exp_moe_gate_up_registers)_test$",
+      "identity": [["ninfer_qwen4_exp_forward_real_test", "--moe-gate-up-registers", "@{fixtures}/qwen4_exp/ppl_tokens-chat.ids"]],
+      "ab": [{"workload": "fn-decode-mtp", "a": ["--moe-precast-input"], "b": ["--moe-precast-input", "--moe-gate-up-registers"]}]
+    },
+    {
+      "flag": "--moe-fused-route", "item": "F4d", "model": "flash-next", "kind": "identity",
+      "summary": "route and dispatch decode-width MoE calls in one launch",
+      "tests": "^ninfer_(offloaded_moe_layer|qwen4_exp_moe_fused_route)_test$",
+      "identity": [["ninfer_qwen4_exp_forward_real_test", "--moe-fused-route", "@{fixtures}/qwen4_exp/ppl_tokens-chat.ids"]],
+      "ab": [{"workload": "fn-decode-mtp", "a": [], "b": ["--moe-fused-route"]}]
+    },
+    {
+      "flag": "--cpu-verify-misses", "item": "F4e", "model": "flash-next", "kind": "identity",
+      "summary": "compute some of each verification round's expert misses on the CPU instead of over PCIe",
+      "tests": "^ninfer_(offloaded_moe_layer|qwen4_exp_cpu_verify_misses|qwen4_exp_partial_ram_residency_cpu)_test$",
+      "ab": [{"workload": "fn-decode-mtp", "a": [], "b": ["--cpu-verify-misses"]}]
+    },
+    {
+      "flag": "--cpu-verify-workers", "item": "F4e", "model": "flash-next", "kind": "speed",
+      "summary": "the CPU team size of --cpu-verify-misses and --prefill-cpu-share (default 6)",
+      "tests": "^ninfer_qwen4_exp_cpu_verify_misses_test$",
+      "ab": [{"workload": "fn-decode-mtp", "a": ["--cpu-verify-misses", "--cpu-verify-workers", "6"], "b": ["--cpu-verify-misses", "--cpu-verify-workers", "12"]}]
+    },
+    {
+      "flag": "--prefill-cpu-share", "item": "F9", "model": "flash-next", "kind": "identity",
+      "summary": "in prefill, the share F of each layer's cold experts is computed on the CPU while the GPU stages the rest",
+      "tests": "^ninfer_(offloaded_moe_wide|qwen4_exp_prefill_cpu_share)_test$",
+      "ab": [
+        {"workload": "fn-prefill-2k", "a": [], "b": ["--prefill-cpu-share", "0.2"]},
+        {"workload": "fn-prefill-2k", "a": [], "b": ["--prefill-cpu-share", "0.4"]},
+        {"workload": "fn-prefill-2k", "a": [], "b": ["--prefill-cpu-share", "0.6"]}
+      ]
+    },
+    {
+      "flag": "--gdn-async-commit", "item": "F10c", "model": "flash-next", "kind": "identity",
+      "summary": "fold each verification's GDN commit on a CUDA stream of its own",
+      "tests": "^ninfer_qwen4_exp_gdn_async_commit_test$",
+      "ab": [{"workload": "fn-decode-mtp", "a": [], "b": ["--gdn-async-commit"]}]
+    },
+    {
+      "flag": "--hc-int8", "item": "F1", "model": "flash-next", "kind": "quality",
+      "summary": "int8 copies (one scale per 32 weights) of the hyper-connection mixers for calls of at most 16 columns",
+      "tests": "^ninfer_(hyper_connection|qwen4_exp_mtp_real)_test$",
+      "identity": [["ninfer_qwen4_exp_forward_real_test", "--hc-int8-prefill", "@{fixtures}/qwen4_exp/ppl_tokens-chat.ids"]],
+      "kld": "--hc-int8",
+      "ab": [{"workload": "fn-decode-mtp", "a": [], "b": ["--hc-int8"]}]
+    },
+    {
+      "flag": "--hc-fused-read", "item": "F10d", "model": "flash-next", "kind": "identity",
+      "summary": "with --hc-int8: the MoE block's input read in one fused step (bitwise the outputs of --hc-int8 alone)",
+      "tests": "^ninfer_hyper_connection_test$",
+      "identity": [
+        ["ninfer_qwen4_exp_forward_real_test", "--hc-fused-read", "@{fixtures}/qwen4_exp/ppl_tokens-chat.ids"],
+        ["ninfer_qwen4_exp_forward_real_test", "--hc-fused-read-side-stream", "@{fixtures}/qwen4_exp/ppl_tokens-chat.ids"]
+      ],
+      "ab": [{"workload": "fn-decode-mtp", "a": ["--hc-int8"], "b": ["--hc-int8", "--hc-fused-read"]}]
+    },
+    {
+      "flag": "--ngram-flag-wait", "item": "F7c", "model": "flash-next", "kind": "identity",
+      "summary": "each decode round as one CUDA graph whose wait kernel holds the PLE layer until the host has read the n-gram rows",
+      "tests": "^ninfer_(host_flag_wait|qwen4_exp_ngram_flag_wait|qwen4_exp_ngram_flag_wait_mtp)_test$",
+      "ab": [{"workload": "fn-decode-mtp", "a": [], "b": ["--ngram-flag-wait"]}]
+    },
+    {
+      "flag": "--partial-ram-residency", "item": "F8", "model": "flash-next", "kind": "identity",
+      "summary": "keep in host RAM only the routed experts the VRAM cache does not hold, plus spare slots",
+      "tests": "^ninfer_(offloaded_moe_layer|qwen4_exp_partial_ram_residency|qwen4_exp_partial_ram_residency_cpu)_test$",
+      "ab": [{"workload": "fn-decode-mtp", "a": [], "b": ["--partial-ram-residency"]}]
+    },
+    {
+      "flag": "--ggml-decode-mma", "item": "F6", "model": "flash-next", "kind": "quality",
+      "summary": "dense GGML linears of calls of at most 8 columns on the int8 tensor cores (summation order changes)",
+      "tests": "^ninfer_(linear_ggml|linear_ggml_device_decode)_test$",
+      "kld": "--ggml-decode-mma",
+      "ab": [{"workload": "fn-decode-mtp", "a": [], "b": ["--ggml-decode-mma"]}]
+    },
+    {
+      "flag": "--relaxed-drafting", "item": "X-C", "model": "qwen38-27b", "kind": "quality",
+      "summary": "under sampling keep a draft the model gives probability P or more (CHANGES THE OUTPUT DISTRIBUTION); SamplingConfig grew from 56 to 64 bytes for it",
+      "tests": "^ninfer_(sampling|speculative_round|mtp_round|candidate_selector)_test$",
+      "kld_reason": "it changes which drafts are kept under sampling, not the logits, so the KLD gate cannot see it; its A/Bs report acceptance beside speed, and the check 'relaxed-startup' starts every model with it",
+      "ab": [
+        {"workload": "q27-chat-sampled-dflash2", "a": [], "b": ["--relaxed-drafting", "0.5"]},
+        {"workload": "q27-chat-sampled-mtp", "a": [], "b": ["--relaxed-drafting", "0.5"]}
+      ]
+    },
+    {
+      "flag": "--draft-context-rows", "item": "X-D", "model": "qwen38-27b", "kind": "identity",
+      "summary": "ids the requests hold that the reduced draft head lacks are scored from the full head and may be drafted (drafts only)",
+      "tests": "^ninfer_(linear_rows|qwen3_5_context_rows_real)_test$",
+      "ab": [{"workload": "q27-chat-greedy-dflash2", "a": [], "b": ["--draft-context-rows", "512"]}]
+    },
+    {
+      "flag": "--admission-affinity", "item": "S7", "model": "qwen38-27b", "kind": "speed",
+      "summary": "a waiting request that resumes a prefix held on the GPU may start ahead of older waiters",
+      "tests": "^ninfer_engine_scheduling_test$",
+      "ab_reason": "a scheduling change with no single-stream speed; the check 'serve-soak' runs it under a soak with more requests than lanes and reads ninfer_admission_overtakes_total."
+    },
+    {
+      "flag": "--allowed-host", "item": "S3", "model": "qwen38-27b", "kind": "serving",
+      "summary": "Host and Origin checks (with --allowed-host NAME), the exposure warning and the constant-time key compare",
+      "tests": "^ninfer_http_security_test$",
+      "ab_reason": "a request check, no speed effect; the check 'serve-smoke' sends allowed and refused Host and Origin headers to a real server."
+    },
+    {
+      "flag": "--config", "item": "S6", "model": "qwen38-27b", "kind": "serving",
+      "summary": "ninfer-serve --config FILE with each setting's source in the startup log; the launchers' profiles became such files (S6)",
+      "tests": "^ninfer_(serve_config_file|serve_options)_test$",
+      "ab_reason": "startup configuration only; the checks 'serve-smoke' and 'launchers' start real servers from config files."
+    }
+  ],
+  "checks": [
+    {"id": "kld-window", "item": "X-A", "about": "the Flash-Next decode-path KLD gate at --window 1 and --window 3 must give the same rows (rows.tsv compared); it is run by the KLD phase with --kld-base-flash-next"},
+    {"id": "kld-qwen35", "item": "X-A", "about": "ninfer-perplexity --kld-base on the 27B at --decode-window 1 and 3 (20 chunks), rows compared (a different route per width, so a small distance is expected)"},
+    {"id": "ggml-mma-timing", "item": "F6", "about": "--ggml-decode-mma per shape: ninfer_linear_ggml_test --time, the dp4a decode route against the tensor-core route at T = 1, 2, 4, 8"},
+    {"id": "ggml-mma-policy", "item": "F6", "about": "the served decode selects the policy: nsys over the engine bench must show ggml_mma_decode_kernel with --ggml-decode-mma and not without it"},
+    {"id": "context-rows", "item": "X-D", "about": "ninfer_qwen3_5_context_rows_real_test on the 27B with DFlash2 (the MTP run is in the 27B test group) and on the 35B with MTP", "tests": "^ninfer_qwen3_5_context_rows_real_test$"},
+    {"id": "greedy-master", "item": "S8", "about": "every option off: greedy ids of this build equal origin/master's (greedy_identity.py, two builds side by side), the 27B under DFlash2, MTP and no speculation and Flash-Next plain and MTP; SamplingConfig's 64-byte stride (X-C) changes every sampling kernel's SASS, so this is the check that it changed no output"},
+    {"id": "relaxed-startup", "item": "X-C", "about": "ninfer-serve starts with --relaxed-drafting on every real model: startup refuses when the tokenizer's added ids are not contiguous"},
+    {"id": "partial-start", "item": "F8", "about": "a ninfer-serve start of Flash-Next with --partial-ram-residency: whether the page-lock cap warning appears (Windows) and whether pinning succeeds"},
+    {"id": "default-expert-state", "item": "F10a", "about": "export the saved expert state with ninfer-qwen4-exp-expert-state-export, then start with no saved state and --default-expert-state: the Program must report the default state"},
+    {"id": "serve-smoke", "item": "S3", "about": "a real 27B server from a --config file with --allowed-host: /health, /slots (array shape), /dashboard (saved for a look in a browser at desktop and phone width), /metrics (the new gauges and counters), Host and Origin refusals, the settings line"},
+    {"id": "serve-soak", "item": "S1", "about": "serve_soak.py's first real run (5 minutes, 4 requests in flight on one lane) on a 27B server with --admission-affinity; the overtake counter is read from /metrics"},
+    {"id": "community-preset", "item": "S2", "about": "ninfer_bench --preset community-1 on the 27B: the row it prints passes check_bench_rows.py and carries the power limit"},
+    {"id": "converter-pytests", "item": "F8", "about": "the converter and codec pytest suites (tests/convert/test_qwen4_exp.py, tests/artifact/test_ggml_codecs.py, tests/convert/test_qwen4_exp_real.py with NINFER_TEST_GGUF); skipped with a message when torch is not installed"},
+    {"id": "iq3-packs", "item": "F8", "about": "each --iq3-pack artifact (the IQ3_XXS and IQ3_S packs): the offloaded MoE tests on its real expert banks, the forward harness on the chat fixture, an engine bench start, and the KLD gate at 20 chunks when a base is given"},
+    {"id": "launchers", "item": "S6", "about": "run.bat (Windows) or run.sh from a directory whose path has spaces and parentheses, every profile, checking the banner and the settings line; on Windows package-release.ps1 builds the archive the launcher runs from"},
+    {"id": "full-suite", "about": "the whole GPU suite once, after the targeted runs, without the slow tests AGENTS.md lists and without the tests the targeted runs already passed"}
+  ]
+}

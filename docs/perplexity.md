@@ -94,3 +94,62 @@ aggregate.
 
 The schema-v2 report identifies the artifact's architecture, public name, actual weight formats
 and prefill signature alongside the workload and numerical results.
+
+## Decode-path KL-divergence gate
+
+`--corpus` and `--text` score every target from one prefill pass, so they cannot see changes to
+decode kernels, the speculative verify forward, or the KV writes made while decoding.
+`--kld-base` scores through the decode path instead, against a llama.cpp KL-divergence base. Use it
+to judge a numerics change to any of those paths. The method follows Basalt's quality gate.
+
+Build the base once with llama.cpp from a higher-precision reference model (a Q8_0 GGUF, say) and
+a text file. llama.cpp tokenizes the text, so the base fixes the exact tokens every run scores:
+
+```bash
+llama-perplexity -m qwen3_8_27b-q8_0.gguf -f wiki.test.raw -c 512 \
+  --kl-divergence-base wiki-512.kld
+```
+
+Then score the same tokens with an artifact:
+
+```bash
+./build/apps/ninfer-perplexity models/qwen3_8_27b.ninfer \
+  --kld-base wiki-512.kld --chunks 20 --decode-window 3 --kv-dtype int8
+```
+
+Each chunk of `n_ctx` tokens is one scoring window, with `n_ctx` taken from the base:
+
+- Positions `[0, n_ctx/2)` are prefilled.
+- The rest is teacher-forced through the decode path, `T` tokens per forward
+  (`--decode-window T`, default 3, at most 16). Every target in `[n_ctx/2 + 1, n_ctx)` is
+  predicted by a decode forward. These are exactly the rows the base holds.
+- `T=1` is the ordinary decode step. A wider window is the speculative verify forward, with every
+  column committed through the ReplaySSM fold, so `T=3` runs the verify forward of an MTP round
+  with two drafts. The last window of a chunk may be partial: it runs at width `T` with the
+  remaining columns live, as a speculative round with fewer drafts does.
+- Verify-phase routes run in these windows once `T` is wide enough for them. `--mlp-a8-decode`,
+  for example, is admitted only at 16 to 32 columns, so a batch-one window reaches it only at
+  `T=16`. With `--corpus` and `--text` these routes are inert.
+
+`--chunks N` scores the first `N` chunks (default all). `--context` and `--stride` are refused:
+the base fixes the context. Decode scoring loads only the Text backbone, plans no MTP or drafter
+weights, and runs on one device. It runs eagerly, without CUDA graphs, but with the attention
+envelopes served graph decode captures (the ordinary step's for `T=1`, an MTP round's target verify
+with `T-1` drafts otherwise) for an Engine at the same context. The attention route is chosen from
+the envelope, so scoring selects the route served decode replays.
+
+Each row compares the model's logits over its public token domain with the base row. llama.cpp may
+pad the vocabulary beyond the public token count (to 248,320 rows, for example); those rows are
+left out. A row contributes its NLL, the base's NLL, `KL(base || model)` with base log-probabilities at
+or below -16 skipped, whether the top-1 tokens agree, and the log-probability gap at the base's
+top-1 token. stdout shows PPL with its standard error and the base's PPL, the KLD mean, median, p99
+and max, and the top-1 agreement. The output directory (`--output`, or one under
+`profiles/perplexity/`) holds `rows.tsv`, one line per row, and `report.json` with the summary.
+
+### Reading the result
+
+Basalt found about 0.01-0.02 KLD of noise in the reference itself, so the absolute KLD against the
+base is not a quality verdict on its own. Compare builds with each other: run the same base,
+chunks, window and KV format with the change off and on, and compare the two summaries (or
+`rows.tsv` row by row). Keep `--decode-window` fixed across a comparison, because different
+windows run different kernels.

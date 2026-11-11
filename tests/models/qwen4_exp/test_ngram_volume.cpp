@@ -8,7 +8,14 @@
 // rows of one cache slot both return their own bytes, a row past the table throws, and a volume of
 // the wrong size, version or row format is refused at open. A call of thousands of distinct blocks
 // (a prefill chunk) takes the multi-threaded route: the same oracle, counters and cache.
+//
+// ngram_window_rows (program/ngram_rows.h) against ids derived by hand: the EOS-padded window of
+// each column laid out here and handed to NgramHash::row_ids directly. And the prefetch
+// --ngram-prefetch does: the anchor column's rows read ahead are cached when verification reads
+// the whole window.
 
+#include "models/qwen4_exp/frontend/ngram_hash.h"
+#include "models/qwen4_exp/program/ngram_rows.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 
 #include <algorithm>
@@ -129,9 +136,80 @@ bool refused(const std::filesystem::path& path, const q4::NgramTableConfig& tabl
     return threw;
 }
 
+// A small hash: EOS 7, 3-grams, two heads per n-gram (four heads), every row id below kRows.
+q4::NgramHash make_hash() {
+    q4::NgramConfig config;
+    config.vocab_size                         = 1000;
+    config.eos_token_id                       = 7;
+    config.ngram_size                         = 3;
+    config.heads_per_ngram                    = 2;
+    config.ngram_vocab_size_base              = 100000;
+    config.make_ngram_vocab_size_divisible_by = 1;
+    return q4::NgramHash(config, 0);
+}
+
+// The ids of the last `count` tokens of `padded`, which holds the two tokens before them first.
+std::vector<std::uint32_t> ids_of(const q4::NgramHash& hash, const std::vector<std::int32_t>& padded, std::size_t count) {
+    std::vector<std::uint32_t> ids(count * hash.heads());
+    hash.row_ids(padded, count, ids.data());
+    return ids;
+}
+
+void check_window_rows() {
+    const q4::NgramHash hash = make_hash();
+    const std::vector<std::int32_t> history{10, 20, 30, 40, 50, 7, 60, 70};
+    const std::vector<std::int32_t> none;
+    using Span = std::span<const std::int32_t>;
+    const auto rows = [&](Span h, Span d, std::int64_t begin, int width) { return q4::ngram_window_rows(hash, h, d, begin, width); };
+
+    // The sequence start: the missing context is EOS (the window of position 0 is {EOS, EOS, 10}).
+    check(rows(history, none, 0, 2) == ids_of(hash, {7, 7, 10, 20}, 2), "window rows at position 0 are EOS-padded");
+    check(rows(history, none, 1, 1) == ids_of(hash, {7, 10, 20}, 1), "window rows at position 1 pad one EOS");
+    check(rows(history, none, 1, 3) == ids_of(hash, {7, 10, 20, 30, 40}, 3), "a window from position 1 pads one EOS");
+    // Mid-sequence.
+    check(rows(history, none, 2, 3) == ids_of(hash, {10, 20, 30, 40, 50}, 3), "window rows mid-sequence");
+    check(rows(history, none, 6, 2) == ids_of(hash, {50, 7, 60, 70}, 2), "window rows across an EOS in the history");
+    check(rows(history, none, 7, 1) == ids_of(hash, {7, 60, 70}, 1), "window rows of the last token");
+    // The drafts continue the history: any split of one sequence gives the same rows.
+    const std::vector<std::int32_t> head3{10, 20, 30}, drafts{40, 50};
+    check(rows(head3, drafts, 2, 3) == ids_of(hash, {10, 20, 30, 40, 50}, 3), "drafts continue the history");
+    check(rows(head3, drafts, 2, 3) == rows(std::vector<std::int32_t>{10, 20, 30, 40, 50}, none, 2, 3),
+          "a history split from its drafts gives the whole sequence's rows");
+    check(rows(head3, drafts, 4, 1) == ids_of(hash, {30, 40, 50}, 1), "a column wholly in the drafts");
+    // The anchor column's rows are the first column's: the prefix of the whole window.
+    const auto whole  = rows(head3, drafts, 2, 3);
+    const auto anchor = rows(head3, none, 2, 1);
+    check(anchor.size() == hash.heads() && std::equal(anchor.begin(), anchor.end(), whole.begin()),
+          "the anchor column's rows are the window's first heads");
+    check(whole.size() == 3U * hash.heads(), "a window has width * heads rows");
+    bool threw = false;
+    // The output-span form (the Program's per-token path) writes the same ids, whatever its kept
+    // scratch held before, and refuses an output of the wrong size.
+    std::vector<std::int32_t> window{99, 98, 97, 96, 95, 94, 93};
+    std::vector<std::uint32_t> out(3U * hash.heads(), 0xFFFFFFFFU);
+    q4::ngram_window_rows(hash, head3, drafts, 2, 3, window, out);
+    check(out == whole, "the output-span form equals the vector form");
+    std::vector<std::uint32_t> one(hash.heads());
+    q4::ngram_window_rows(hash, history, none, 0, 1, window, one);
+    check(one == rows(history, none, 0, 1), "a reused scratch window starts afresh (EOS padding)");
+    threw = false;
+    try {
+        q4::ngram_window_rows(hash, history, none, 0, 2, window, one);
+    } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "an output of the wrong size throws");
+    // Out of the sequence.
+    threw = false;
+    try { (void)rows(head3, drafts, 3, 3); } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "columns past the sequence throw");
+    threw = false;
+    try { (void)rows(head3, drafts, -1, 1); } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "a negative begin throws");
+}
+
 } // namespace
 
 int main() {
+    check_window_rows();
     const auto path = std::filesystem::temp_directory_path() / "ninfer_ngram_volume_test.ngram";
     try {
         const q4::NgramTableConfig table = make_volume(path);
@@ -218,6 +296,60 @@ int main() {
             check(volume.counters().keepalive_reads == settled, "no keep-alive reads after the window");
             check(rows_match(rows, read(volume, rows)), "rows equal the oracle with the keep-alive on");
             volume.set_keepalive(std::chrono::milliseconds(0), std::chrono::milliseconds(0));
+
+            // The default period, 40 ms (Basalt's, against an SSD that sleeps after about 100 ms
+            // idle). A loaded host delays the keep-alive thread by tens of milliseconds, so the
+            // upper bound is the best of five idle spells: at least one read within three periods;
+            // and in every spell none before half the period has passed.
+            volume.set_keepalive(std::chrono::milliseconds(40), std::chrono::milliseconds(2000));
+            using Clock = std::chrono::steady_clock;
+            auto best = Clock::duration::max();
+            bool early = false;
+            for (int attempt = 0; attempt < 5; ++attempt) {
+                (void)read(volume, rows);
+                const auto idle_from  = Clock::now();
+                const auto idle_start = volume.counters().keepalive_reads;
+                std::this_thread::sleep_for(std::chrono::milliseconds(15));
+                early = early || volume.counters().keepalive_reads != idle_start;
+                while (Clock::now() - idle_from < std::chrono::milliseconds(500)) {
+                    if (volume.counters().keepalive_reads > idle_start) {
+                        best = std::min(best, Clock::now() - idle_from);
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            check(!early, "no 40 ms keep-alive read before half the period");
+            check(best <= std::chrono::milliseconds(120),
+                  "a 40 ms keep-alive reads within three periods of idleness (best " +
+                      std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(best).count()) + " ms)");
+            volume.set_keepalive(std::chrono::milliseconds(0), std::chrono::milliseconds(0));
+        }
+
+        {
+            // The prefetch: the anchor column's rows read while the draft graph runs are cached
+            // when verification reads the whole window (anchor and drafts).
+            q4::NgramVolume volume(path, table);
+            const q4::NgramHash hash = make_hash();
+            const std::vector<std::int32_t> history{10, 20, 30, 40, 50}; // the anchor is the last token
+            const std::int64_t anchor_at = 4;
+            const auto anchor            = q4::ngram_window_rows(hash, history, {}, anchor_at, 1);
+            check(anchor.size() == hash.heads(), "the anchor column has one row per head");
+            check(!volume.cached(anchor), "the anchor's rows are not cached before the prefetch");
+            auto before = volume.counters();
+            check(rows_match(anchor, read(volume, anchor)), "the prefetched anchor rows equal the oracle");
+            check(volume.cached(anchor), "the anchor's rows are cached after the prefetch");
+            check(volume.counters().reads > before.reads, "the prefetch reads the volume");
+
+            // Verification: the anchor and three drafts, as upload_rows reads them.
+            const std::vector<std::int32_t> drafts{61, 62, 63};
+            const auto window = q4::ngram_window_rows(hash, history, drafts, anchor_at, 4);
+            check(std::equal(anchor.begin(), anchor.end(), window.begin()), "verification reads the prefetched rows first");
+            before = volume.counters();
+            check(rows_match(window, read(volume, window)), "the verification window equals the oracle");
+            const auto after = volume.counters();
+            check(after.hits - before.hits >= anchor.size(), "the anchor's rows are served from the cache");
+            check(after.rows - before.rows == window.size(), "verification asks for every row of the window");
         }
 
         q4::NgramTableConfig wrong = table;

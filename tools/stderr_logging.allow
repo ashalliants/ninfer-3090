@@ -1,0 +1,14 @@
+# Direct stderr uses under src/, per file: tools/check_stderr_logging.py fails when a count rises or a
+# file not listed here appears. Counts may only go down (python tools/check_stderr_logging.py --update).
+# Each remaining use is an emergency diagnostic (docs/maintainer/logging.md, section 1) or the logging
+# runtime's own sink; what counts is described at the top of the script. Format: <count> <path>
+2 src/core/arena.cu
+1 src/core/decode_graph.cpp
+2 src/core/device.cu
+4 src/core/evictable_kv_pool.cu
+2 src/core/evictable_weight_pool.cu
+2 src/models/qwen4_exp/program/program.cpp
+1 src/ops/linear_attention/gated_delta_net/common.cuh
+10 src/product/logging/logging.cpp
+2 src/runtime/engine/qwen4_exp_instance.cpp
+1 src/serve/console_log.cpp

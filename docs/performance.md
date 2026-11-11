@@ -51,6 +51,101 @@ draft head, exact for DFlash-3 on the 35B) are in `docs/config-calculator.test.m
 has no top-k kernel); with the draft head, as the launchers run it, it works. Qwen3.6-27B's artifact
 has no DFlash2 bundle.
 
+### Basalt-learnings options, measured relative to off (RTX 3090, 2026-11-11)
+
+One Vast RTX 3090 session (Linux, driver 580.178.04, 285 W stock power), the `tools/bench/basalt_gpu_verify.sh`
+checklist from #383/the "Basalt learnings" PR: each option A/B against the same option off, ABBA,
+n = 12 reps, paired median. These are **per-option deltas against off, not absolute tok/s and not a
+stacked combined number** -- no single run measured every winning option on at once with a clean
+option set (see the PR's own Verification section for why `combined_choice()`'s own attempt at that
+is unreliable). Full detail, including identity/quality verdicts, is in `docs/serving.md`'s per-option
+table.
+
+| Option | Workload | B/A median | Positive | Verdict |
+|---|---|---:|---:|---|
+| `--prefill-cpu-share 0.4` | Flash-Next, 2K prefill | **+15.47%** | 12/12 | win, in the tuned profile |
+| `--moe-gate-up-registers` | Flash-Next, decode+MTP | **+2.49%** | 9/12 | win, in the tuned profile |
+| `--relaxed-drafting 0.5`, DFlash2 | 27B, sampled chat | **+2.32%** | 12/12 | win (changes output distribution; opt-in) |
+| `--relaxed-drafting 0.5`, MTP | 27B, sampled chat | **+3.78%** | 12/12 | win (changes output distribution; opt-in) |
+| `--gdn-head-map` | Flash-Next, decode+MTP | +0.83% | 9/12 | mild gain, in the tuned profile |
+| `--gdn-async-commit` | Flash-Next, decode+MTP | +0.63% | 8/12 | wash, in the tuned profile |
+| `--shared-expert-stream` | Flash-Next, decode+MTP | +0.37% | 7/12 | wash, in the tuned profile |
+| `--hot-embedding-rows 8192` | Flash-Next, decode+MTP | +0.46% | 7/12 | wash; VRAM/RAM tradeoff, not in the profile |
+| `--moe-precast-input` | Flash-Next, decode+MTP | +0.15% | 7/12 | wash, in the tuned profile (`--moe-gate-up-registers`'s prerequisite) |
+| `--ngram-flag-wait` | Flash-Next, decode+MTP | +1.53% | 7/12 | wash |
+| `--partial-ram-residency` | Flash-Next, decode+MTP | +1.44% | 6/12 | wash (one outlier rep to +35.86%) |
+| `--draft-context-rows 512` | 27B, greedy chat, 1 lane | +0.40% | 12/12 | small win, output unchanged; refused above 1 lane (a real bug found and fixed) |
+| `--moe-fused-route` | Flash-Next, decode+MTP | -0.38% | 6/12 | wash/slight negative, not in the profile |
+| `--hc-fused-read` | Flash-Next, decode+MTP | -1.00% | 3/12 | wash, not in the profile |
+| `--ngram-prefetch` | Flash-Next, decode+MTP | **-16.57%** | 0/12 | regression, avoid |
+| `--cpu-verify-misses` (default 6 workers) | Flash-Next, decode+MTP | **-16.70%** | 0/12 | regression, avoid |
+| `--ggml-decode-mma` | Flash-Next, decode+MTP | -5.46% | 1/12 | regression; also changes output (quality-kind), unverified without a KLD base |
+| `--hc-int8` | Flash-Next, decode+MTP | **-26.42%** | 0/12 | regression; also changes output (quality-kind), unverified without a KLD base |
+
+`scripts/profiles/qwen38-flash-next-tuned.json` enables every confirmed win and wash above except
+`--hot-embedding-rows` (a deliberate VRAM/RAM sizing tradeoff, not a speed call) and
+`--moe-fused-route` (slight negative, excluded conservatively).
+
+Basalt itself is only a design reference here, not a same-hardware comparison: its own published
+numbers for `--relaxed-drafting` (docs/serving.md, [Relaxed drafting](serving.md#relaxed-drafting))
+are from its own engine and model on an **RTX 5090**, a different, faster card -- +3 to +20% decode
+speed depending on threshold and temperature. This session's RTX 3090 numbers above are in that
+same rough direction and range, but the two were never run side by side on the same GPU.
+
+### A Linux AIO bug found and fixed this session, and the tuned profile's absolute numbers (RTX 3090, 2026-11-11)
+
+A second Vast RTX 3090 session (Linux, driver 595.84, 420 W power limit, 64 vCPU, 125 GiB RAM) added
+Flash-Next support to `run.sh` (the Linux launcher had none before) and, while getting real numbers
+for it, found that `src/core/read_only_file_posix.cpp`'s n-gram volume reads created a fresh Linux
+AIO context (`io_setup`) and tore it down (`io_destroy`) on every single read batch. On this box,
+`io_destroy` alone averaged ~479 ms a call (most likely TLB-shootdown IPI latency under whatever this
+box's virtualization does to vCPU scheduling) and summed to 19.6 s of a 21.07 s decode window for one
+150-token request -- `io_setup`/`io_submit`/`io_getevents` together cost about 2.7 s across the same
+window. `fio --ioengine=libaio` against the same file never showed this, because it sets up one
+context for its whole run and never tears it down mid-benchmark.
+
+The fix (`ThreadAioContext` in `read_only_file_posix.cpp`): one Linux AIO context per thread, created
+once and kept for that thread's life, instead of a fresh one per call. Decode on this exact box, same
+model, same profile, went from 4.3-5.3 tok/s (n-gram reads alone costing 16.4-18.6 s of each ~19-21 s
+decode) to the numbers below (n-gram reads down to 0.05-0.09 s). This is Linux-only code -- Windows's
+overlapped I/O has no `io_setup`/`io_destroy` equivalent, so the numbers measured on Windows elsewhere
+in this file were never affected by it.
+
+**`qwen38-flash-next tuned` (the launcher default: every Basalt-learnings win above, MTP speculation,
+INT8 KV), via `run.sh`, HTTP route, warm (model and `.ngram` volume read once, expert cache warmed by
+prior requests), median of 3 reps, 150 generated tokens for decode:**
+
+| Prompt tokens | Prefill tok/s | Decode tok/s |
+|---:|---:|---:|
+| 845 (~1K) | 1,224 | 91.5 |
+| 3,177 (~4K) | 1,477 | -- |
+| 7,075 (~8K) | 1,940 | 91.6 |
+| 33,444 (~32K) | 1,883 | 102.3 |
+| 140,208 (~128K) | 2,069 | -- |
+
+Solo plain (no MTP) decode on the same box, same profile minus speculation, for comparison: ~86-88
+tok/s warm. MTP's own solo benefit here is therefore about 1.2x, in the same direction as (if smaller
+than) the 1.34x-1.42x this fork measured on Windows (see PR 13 in `docs/maintainer/flash-next-plan.md`).
+
+**Two-lane concurrency (`NINFER_CONCURRENCY=2`), same box, same profile, two concurrent equal-length
+requests, 4 reps:** aggregate decode 103-125 tok/s (median ~115) against the solo-MTP baseline above,
+about **1.1x** -- short of the project's own 1.15x gate for this mode (`docs/maintainer/flash-next-plan.md`,
+PR 16), and for a documented reason, not a mystery: `program.cpp`'s `decode()` runs MTP's speculative
+path only when exactly one row is in the round (`sequences.size() > 1` always takes the plain,
+multi-row path; see "MTP and lanes" below). Two synchronized, equal-length requests stay
+batched together for nearly the whole run, so MTP gets almost no single-row window to run in. Isolating
+the two effects on this box: GPU sharing between two *plain* lanes scales to about 1.38x (aggregate
+~120 tok/s against solo-plain's ~87), so the weak 1.1x headline is MTP's ~1.2x solo bonus being lost,
+not the GPU failing to share decode work across lanes.
+
+**MTP and lanes.** This is a known, documented design choice (`flash-next-plan.md` PR 16: "one
+decoding lane runs today's single-row round with MTP"), confirmed in `program.cpp`'s `decode()`:
+a round with more than one active row always takes the plain, non-speculative path --
+`try_speculate` is never called. A proper fix needs a genuinely batched draft-and-verify across
+rows (not just removing that fallback: a naive sequential per-row MTP round would cost roughly
+2 x ~20 ms for ~4.6 tokens against today's ~13.5 ms for 2 tokens -- worse, not better, by this
+session's own profiled per-round costs). That work is tracked separately, not in this branch.
+
 ### v0.16.0 release binaries, all three models (2026-10-14)
 
 Measured on the **published v0.16.0 Windows zip** (`ninfer-serve.exe` and `ninfer_bench.exe` from the
@@ -519,6 +614,18 @@ against a 22.3 ms step, 1.15x.
 | drafting with the full output head | +2% acceptance for 4 ms more per round |
 | programmatic dependent launch to hide kernel ramp | needs sm_90; compiled out on `sm_86` |
 
+The 40,960-row row shows how much acceptance the rarer rows carry, and the full-head row bounds what
+the rows past 131,072 can add at this prompt mix (+2%). `--draft-context-rows` (opt-in,
+[serving](serving.md#draft-head-context-rows)) adds only the ones a request actually holds: up to
+2048 rows of the full head chosen by id, aimed at names and identifiers that a prompt introduces and
+the output repeats. Each draft call reads those rows from the full head (Q8: about 5 KB a row at the
+27B's hidden size, so about 10 MB for 2048 rows, against the full head's 1.27 GB). With a full set
+each row is read once per call, whatever the draft width; with fewer rows the kernel splits the
+draft columns across block rows to fill the card and re-reads each row once per block row, so a
+call reads at most about 2048 + `C` rows' worth for `C` rows (never more than twice the full-set
+read). Not measured on the RTX 3090 yet; `ninfer_qwen3_5_context_rows_real_test`
+reports both acceptance rates.
+
 What is left at C1 is mostly ramp-up and drain at the ~500 kernel boundaries of a round (the
 Q5 residual kernels reach 68-82% of their streaming floor, gate_up 89%).
 
@@ -589,9 +696,11 @@ repetitions and tied the fourth, against a spread of about 1.7% within the unfla
 
 **What it costs.** Output changes -- this is a lossy trade, not a free one. Against an FP64 oracle
 the Op measures 0.0080 to 0.0371 relative L2 across 2..32 columns, inside the 0.04 allowance the
-integer-activation path is held to everywhere else in the tree. Perplexity cannot see this trade at
-all: the route is admitted only in the verify phase, and scoring runs the prefill phase, so
-`ninfer-perplexity` reports the same score with and without the flag. Judge it on the oracle bound
+integer-activation path is held to everywhere else in the tree. Corpus perplexity cannot see this
+trade at all: the route is admitted only in the verify phase, and `--corpus`/`--text` scoring runs the
+prefill phase, so `ninfer-perplexity` reports the same score with and without the flag. Its
+`--kld-base` gate decodes through the verify forward and can reach the route at a wide enough
+`--decode-window` ([`docs/perplexity.md`](perplexity.md)). Judge it on the oracle bound
 and on your own outputs. It does nothing for single-stream use, where one request decodes one
 column per step, far below the sixteen the route needs.
 

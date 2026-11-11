@@ -1,23 +1,33 @@
 // The CPU routes of offloaded_sparse_moe (host only):
 //   - the canonical A8 cast against an independent FP64 formulation, bit for bit, on random,
 //     tie, subnormal, zero, overflow and NaN groups;
-//   - the exact sub-block decode of IQ2_S, IQ2_XXS, IQ1_M and Q2_0: c * m * w equals ggml's
-//     reference value (tests/ops/ggml_blocks_decode.h) bit for bit;
+//   - the exact sub-block decode of every expert block format (gate/up IQ2_S, IQ2_XXS, IQ2_XS, IQ1_M,
+//     IQ3_XXS, IQ3_S, IQ4_XS; down Q2_0, IQ4_NL): c * m * w equals ggml's reference value
+//     (tests/ops/ggml_blocks_decode.h) bit for bit;
 //   - expert_forward_cpu (scalar) against the FP64 expert oracle over the decoded record and the
 //     A8-cast activations, for each record format at T in {1, 2, 7, 8};
 //   - AVX2 = scalar, and the worker team at 1, 2, 3, 8 and 16 workers = scalar, bit for bit;
+//   - extreme_magnitude_records: the largest |P_s| of the canonical arithmetic (IQ4_XS m = -32 and
+//     |w| = 127, IQ3_XXS grid 62, IQ4_NL |w| = 127, all against codes +-127) is exact on both ISAs,
+//     and AVX2's byte-pair sums do not saturate;
 //   - both entry points reject a job with a null record or a null active x/y column; the team's
-//     optional progress word advances during a round.
+//     optional progress word advances during a round;
+//   - coresident_blocks_values: the register gate/up kernel's co-resident grid leaves an eighth of
+//     the SMs to the side streams (offloaded_moe::coresident_blocks).
 
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "offloaded_moe_fixtures.h"
 #include "ops/common/canonical_ggml.h"
+#include "ops/offloaded_sparse_moe/coresident.h"
 #include "ops/offloaded_sparse_moe/cpu/expert_cpu.h"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
+#include <iterator>
 #include <limits>
 #include <random>
 #include <stdexcept>
@@ -72,7 +82,9 @@ void test_a8_cast() {
 
 void test_decode() {
     std::mt19937 rng(11);
-    for (QType format : {QType::GGML_IQ2_S, QType::GGML_IQ2_XXS, QType::GGML_IQ1_M, QType::GGML_Q2_0}) {
+    for (QType format : {QType::GGML_IQ2_S, QType::GGML_IQ2_XXS, QType::GGML_IQ1_M, QType::GGML_Q2_0,
+                         QType::GGML_IQ2_XS, QType::GGML_IQ3_XXS, QType::GGML_IQ3_S, QType::GGML_IQ4_XS,
+                         QType::GGML_IQ4_NL}) {
         const auto block   = ggml_block(format);
         const int blocks   = 4096;
         std::vector<std::uint8_t> bytes(static_cast<std::size_t>(blocks) * block.bytes);
@@ -134,7 +146,7 @@ void test_oracle_and_isa() {
                 worst_point     = std::max(worst_point, crit.worst);
                 check(accept(crit), std::string("scalar expert outside the A8 criterion: ") + format_name(format));
             }
-            std::printf("%-13s T=%d: scalar vs FP64 normwise %.3e, worst %.3e\n", format_name(format), t, worst_norm,
+            std::printf("%-14s T=%d: scalar vs FP64 normwise %.3e, worst %.3e\n", format_name(format), t, worst_norm,
                         worst_point);
             if (avx2) {
                 const auto vec = run_forward(CpuIsa::kAvx2, format, record.data(), x, t);
@@ -149,7 +161,7 @@ void test_oracle_and_isa() {
                           run_forward(CpuIsa::kScalar, format, record.data(), x, t),
                       "AVX2 differs from scalar at some column count");
             }
-            std::printf("%-13s AVX2 = scalar at T = 1..8\n", format_name(format));
+            std::printf("%-14s AVX2 = scalar at T = 1..8\n", format_name(format));
         }
     }
 }
@@ -157,11 +169,11 @@ void test_oracle_and_isa() {
 void test_team() {
     using ops::offloaded_moe::CpuIsa;
     std::mt19937 rng(31);
-    // Eight jobs: every format, column counts 1..8, two jobs sharing a record.
+    // One job per format plus one sharing the first job's record, column counts 1..8 in turn.
     std::vector<std::vector<std::uint8_t>> records;
     std::vector<QType> formats;
-    for (int j = 0; j < 7; ++j) {
-        formats.push_back(kRecordFormats[j % 3]);
+    for (int j = 0; j < kRecordFormatCount; ++j) {
+        formats.push_back(kRecordFormats[j]);
         records.push_back(random_record(formats.back(), rng));
     }
     formats.push_back(formats[0]);
@@ -174,7 +186,8 @@ void test_team() {
     for (CpuIsa isa : {CpuIsa::kScalar, CpuIsa::kAvx2}) {
         if (!ops::offloaded_moe::cpu_isa_supported(isa)) { continue; }
         for (int workers : {1, 2, 3, 8, 16}) {
-            ops::offloaded_moe::CpuExpertTeam team({.workers = workers, .isa = isa, .max_jobs = 8});
+            ops::offloaded_moe::CpuExpertTeam team(
+                {.workers = workers, .isa = isa, .max_jobs = static_cast<int>(records.size())});
             std::vector<std::vector<std::vector<std::uint16_t>>> got(records.size());
             std::vector<ops::offloaded_moe::CpuExpertJob> jobs(records.size());
             for (std::size_t j = 0; j < records.size(); ++j) {
@@ -193,8 +206,162 @@ void test_team() {
                 check(got[j] == want[j], "the worker team differs from expert_forward_cpu");
             }
         }
-        std::printf("team (%s): 1, 2, 3, 8, 16 workers = scalar on 8 jobs\n", ops::offloaded_moe::cpu_isa_name(isa));
+        std::printf("team (%s): 1, 2, 3, 8, 16 workers = scalar on %zu jobs\n", ops::offloaded_moe::cpu_isa_name(isa),
+                    records.size());
     }
+}
+
+// One row of `blocks` blocks of `format` with fp16 d = 1 whose every sub-block is at the largest |P_s|
+// the format can reach against codes +-127, with a few variants per row:
+//   - IQ4_XS: ls = 0 (m = -32) or ls = 63 (m = 31), codes 0 (w = -127) or 15 (w = 113);
+//   - IQ3_XXS: ls = 15 (m = 31), the grid entry of the largest magnitudes (it holds 62s), random signs;
+//   - IQ4_NL: codes 0 or 15.
+std::vector<std::uint8_t> extreme_row(QType format, int blocks, std::mt19937& rng) {
+    const auto block = ggml_block(format);
+    std::vector<std::uint8_t> row(static_cast<std::size_t>(blocks) * block.bytes, 0);
+    std::uniform_int_distribution<int> bit(0, 1);
+    std::uniform_int_distribution<int> byte(0, 255);
+    // IQ3_XXS: the grid entry of the largest magnitude sum (no entry holds four 62s; this one holds
+    // 62s, the largest value).
+    int grid62 = 0, best = 0;
+    for (int i = 0; i < 256; ++i) {
+        const std::uint32_t g = ninfer::ggml_tables::iq3xxs_grid[i];
+        const int sum = static_cast<int>((g & 0xFF) + ((g >> 8) & 0xFF) + ((g >> 16) & 0xFF) + (g >> 24));
+        if (sum > best) {
+            best   = sum;
+            grid62 = i;
+        }
+    }
+    const std::uint32_t g62 = ninfer::ggml_tables::iq3xxs_grid[grid62];
+    check((g62 & 0xFF) == 62 || ((g62 >> 8) & 0xFF) == 62 || ((g62 >> 16) & 0xFF) == 62 || (g62 >> 24) == 62,
+          "the largest iq3xxs_grid entry holds a 62");
+    for (int b = 0; b < blocks; ++b) {
+        std::uint8_t* p = row.data() + static_cast<std::size_t>(b) * block.bytes;
+        put_u16(p, 0x3C00); // d = 1
+        switch (format) {
+        case QType::GGML_IQ4_XS: {
+            // ls = 0 everywhere in the first block (every m = -32), mixed 0 / 63 after it.
+            const bool mixed = b > 0;
+            std::uint16_t high = 0;
+            for (int ib = 0; ib < 8; ++ib) {
+                const int ls = mixed && bit(rng) != 0 ? 63 : 0;
+                p[4 + ib / 2] |= static_cast<std::uint8_t>((ls & 15) << (4 * (ib % 2)));
+                high |= static_cast<std::uint16_t>((ls >> 4) << (2 * ib));
+            }
+            put_u16(p + 2, high);
+            for (int i = 0; i < 128; ++i) {
+                p[8 + i] = mixed ? static_cast<std::uint8_t>((bit(rng) ? 0x0F : 0x00) | (bit(rng) ? 0xF0 : 0x00)) : 0;
+            }
+            break;
+        }
+        case QType::GGML_IQ3_XXS:
+            for (int i = 0; i < 64; ++i) { p[2 + i] = static_cast<std::uint8_t>(grid62); }
+            for (int ib = 0; ib < 8; ++ib) {
+                const std::uint32_t signs = b == 0 ? 0U : static_cast<std::uint32_t>(byte(rng) | (byte(rng) << 8) |
+                                                                                    (byte(rng) << 16) | ((byte(rng) & 15) << 24));
+                const std::uint32_t word  = (15U << 28) | signs;
+                for (int k = 0; k < 4; ++k) { p[66 + 4 * ib + k] = static_cast<std::uint8_t>(word >> (8 * k)); }
+            }
+            break;
+        case QType::GGML_IQ4_NL:
+            for (int i = 0; i < 16; ++i) {
+                p[2 + i] = b == 0 ? 0 : static_cast<std::uint8_t>((bit(rng) ? 0x0F : 0x00) | (bit(rng) ? 0xF0 : 0x00));
+            }
+            break;
+        default: check(false, "extreme_row: no extreme pattern for this format");
+        }
+    }
+    return row;
+}
+
+void test_extreme_magnitude_records() {
+    using ops::offloaded_moe::CpuIsa;
+    const bool avx2 = ops::offloaded_moe::cpu_isa_supported(CpuIsa::kAvx2);
+    std::mt19937 rng(41);
+    struct Case {
+        QType format;
+        int k;
+        float c; // the canonical scale c of a sub-block with d = 1
+    };
+    for (const Case& item : {Case{QType::GGML_IQ4_XS, om::kHidden, 1.0F}, Case{QType::GGML_IQ3_XXS, om::kHidden, 0.25F},
+                             Case{QType::GGML_IQ4_NL, om::kIntermediate, 1.0F}}) {
+        const auto block   = ggml_block(item.format);
+        const int blocks   = item.k / static_cast<int>(block.values);
+        const auto row     = extreme_row(item.format, blocks, rng);
+        const auto ref     = ninfer::test::ggml::decode_blocks(
+            item.format, std::span(reinterpret_cast<const std::byte*>(row.data()), row.size()));
+        const int subs     = item.k / 32;
+        // Column 0: every code +127; column 1: random +-127. Every activation scale is 1.
+        std::vector<std::int8_t> q(2 * static_cast<std::size_t>(item.k));
+        std::uniform_int_distribution<int> bit(0, 1);
+        for (int j = 0; j < item.k; ++j) {
+            q[j]          = 127;
+            q[item.k + j] = static_cast<std::int8_t>(bit(rng) != 0 ? 127 : -127);
+        }
+        const std::vector<float> d(static_cast<std::size_t>(subs), 1.0F);
+        const detail::A8Act acts[2] = {{q.data(), d.data()}, {q.data() + item.k, d.data()}};
+        std::int64_t largest = 0;
+        for (int c = 0; c < 2; ++c) {
+            // The canonical row value from exact int64 sums over the reference decoder's values:
+            // W / c is an integer m w for these blocks.
+            float partial[canon::kLanes] = {};
+            for (int s = 0; s < subs; ++s) {
+                std::int64_t p = 0;
+                for (int j = 0; j < 32; ++j) {
+                    const float w = ref[static_cast<std::size_t>(32 * s + j)] / item.c;
+                    check(w == std::nearbyint(w), "the extreme block's W / c is an integer");
+                    p += static_cast<std::int64_t>(w) * q[static_cast<std::size_t>(c) * item.k + 32 * s + j];
+                }
+                largest = std::max(largest, p < 0 ? -p : p);
+                check(p > -(1LL << 24) && p < (1LL << 24), "|P_s| < 2^24");
+                partial[s % canon::kLanes] = canon::accumulate(partial[s % canon::kLanes], item.c, 1.0F,
+                                                               static_cast<std::int32_t>(p));
+            }
+            const float want = canon::reduce_lanes(partial);
+            for (CpuIsa isa : {CpuIsa::kScalar, CpuIsa::kAvx2}) {
+                if (!ops::offloaded_moe::cpu_isa_supported(isa)) { continue; }
+                float got = 0.0F;
+                detail::row_values(isa, item.format, row.data(), row.size(), item.k, 0, 1, &acts[c], 1, &got);
+                check(std::bit_cast<std::uint32_t>(got) == std::bit_cast<std::uint32_t>(want),
+                      std::string("extreme row value differs from the exact sum on ") + ops::offloaded_moe::cpu_isa_name(isa));
+            }
+        }
+        std::printf("extreme %-8s largest |P_s| %lld (< 2^24 = 16777216): exact on scalar%s\n",
+                    item.format == QType::GGML_IQ4_XS ? "iq4_xs" : item.format == QType::GGML_IQ3_XXS ? "iq3_xxs" : "iq4_nl",
+                    static_cast<long long>(largest), avx2 ? " and AVX2" : "");
+        if (item.format == QType::GGML_IQ4_XS) {
+            check(largest == 32LL * 32 * 127 * 127, "the IQ4_XS case reaches |P_s| = 32 * 32 * 127^2");
+        }
+    }
+    // A whole IQ4_XS+IQ4_NL expert of extreme blocks against saturating activations: AVX2 = scalar,
+    // every output finite.
+    const QType format = QType::GGML_REC_IQ4_XS_IQ4_NL;
+    const auto g       = om::record_geometry(format);
+    std::vector<std::uint8_t> record(g.bytes, 0);
+    for (int r = 0; r < om::kIntermediate; ++r) {
+        for (const std::uint64_t base : {std::uint64_t{0}, g.up_offset}) {
+            auto part = extreme_row(QType::GGML_IQ4_XS, om::kHidden / 256, rng);
+            put_u16(part.data(), fp16_bits(1.0e-4F)); // keep h finite: d = 1e-4 in the first block
+            for (std::size_t b = 1; b < part.size() / 136; ++b) { put_u16(part.data() + 136 * b, fp16_bits(1.0e-4F)); }
+            std::copy(part.begin(), part.end(), record.begin() + static_cast<std::ptrdiff_t>(base + r * g.gate_up_row_bytes));
+        }
+    }
+    for (int r = 0; r < om::kHidden; ++r) {
+        auto part = extreme_row(QType::GGML_IQ4_NL, om::kIntermediate / 32, rng);
+        for (std::size_t b = 0; b < part.size() / 18; ++b) { put_u16(part.data() + 18 * b, fp16_bits(1.0e-3F)); }
+        std::copy(part.begin(), part.end(), record.begin() + static_cast<std::ptrdiff_t>(g.down_offset + r * g.down_row_bytes));
+    }
+    std::vector<std::uint16_t> x(static_cast<std::size_t>(om::kMaxColumns) * om::kHidden);
+    for (std::size_t i = 0; i < x.size(); ++i) { x[i] = bf16_bits((i % 7 == 0 ? -1.0F : 1.0F) * (i % 3 == 0 ? 0.5F : 1.0F)); }
+    const auto scalar = run_forward(CpuIsa::kScalar, format, record.data(), x, om::kMaxColumns);
+    for (const auto& column : scalar) {
+        for (const std::uint16_t v : column) { check(std::isfinite(bf16_value(v)), "an extreme expert output is not finite"); }
+    }
+    if (avx2) {
+        check(run_forward(CpuIsa::kAvx2, format, record.data(), x, om::kMaxColumns) == scalar,
+              "AVX2 differs from scalar on the extreme IQ4_XS+IQ4_NL record");
+    }
+    std::printf("extreme iq4_xs+iq4_nl record: finite outputs%s\n", avx2 ? ", AVX2 = scalar" : "");
 }
 
 template <class F>
@@ -248,6 +415,16 @@ void test_rejects_missing_columns() {
     std::printf("rejects a null record and null active columns; the progress word advances\n");
 }
 
+// The grid of GateUpVariant::Registers: (SMs - SMs / 8) * blocks per SM, an eighth of the SMs (rounded
+// down) left to the side streams.
+void test_coresident_blocks_values() {
+    check(om::coresident_blocks(82, 2) == 144, "82 SMs (RTX 3090) at 2 blocks: 144");
+    check(om::coresident_blocks(1, 2) == 2, "1 SM at 2 blocks: 2");
+    check(om::coresident_blocks(8, 3) == 21, "8 SMs at 3 blocks: 21");
+    check(om::coresident_blocks(7, 1) == 7, "7 SMs keep every SM");
+    std::printf("coresident_blocks_values: 82 SMs x 2 -> 144, 1 x 2 -> 2\n");
+}
+
 } // namespace
 
 int main() {
@@ -255,7 +432,9 @@ int main() {
     test_decode();
     test_oracle_and_isa();
     test_team();
+    test_extreme_magnitude_records();
     test_rejects_missing_columns();
+    test_coresident_blocks_values();
     std::printf("offloaded_moe_cpu: passed\n");
     return 0;
 }

@@ -49,6 +49,9 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     if (request.frequency_penalty) {
         sampling.frequency_penalty = static_cast<float>(*request.frequency_penalty);
     }
+    if (request.relaxed_drafting) {
+        sampling.relaxed_drafting = static_cast<float>(*request.relaxed_drafting);
+    }
     if (request.seed) {
         sampling.seed = *request.seed;
     } else if (server.sampling_overrides.seed) {
@@ -83,6 +86,12 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     if (sampling.frequency_penalty &&
         (*sampling.frequency_penalty < -2.0F || *sampling.frequency_penalty > 2.0F)) {
         invalid_sampling("frequency_penalty must be in [-2,2]", "frequency_penalty");
+    }
+    // Only a server started with --relaxed-drafting runs the relaxed acceptance kernels.
+    if (sampling.relaxed_drafting && *sampling.relaxed_drafting > 0.0F && !server.relaxed_drafting) {
+        invalid_prompt_option("relaxed_drafting needs the server to be started with "
+                              "--relaxed-drafting",
+                              "relaxed_drafting", "relaxed_drafting_not_enabled");
     }
     if (server.greedy) { sampling.temperature = 0.0F; }
     return sampling;

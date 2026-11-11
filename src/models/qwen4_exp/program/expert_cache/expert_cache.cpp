@@ -108,6 +108,7 @@ void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size
     out.misses.clear();
     out.admitted.clear();
     out.victims.clear();
+    gate_heap_built_ = false;
     ++now_;
     if (halving_period_ != 0 && now_ % halving_period_ == 0) {
         for (auto& c : count_) { c /= 2; }
@@ -156,15 +157,84 @@ void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size
     for (std::uint32_t k : ranked_) {
         if (out.admitted.size() >= admission_budget) { break; }
         if (residents_.size() >= capacity_) {
-            victim_.clear();
-            select_victims(1, group, victim_);
-            if (victim_.empty() || !(score(k) > score(victim_[0]))) { break; }
-            if (evictable != nullptr && !(*evictable)(victim_[0])) { break; } // the tier's demotion allowance is spent
-            erase(victim_[0]);
-            out.victims.push_back(victim_[0]);
+            std::uint32_t victim = kNone;
+            if (evictable != nullptr) {
+                const auto chosen = evictable_victim(group, k, *evictable);
+                if (!chosen) { break; } // no approved resident ranks below the newcomer
+                victim = *chosen;
+            } else {
+                victim_.clear();
+                select_victims(1, group, victim_);
+                if (victim_.empty() || !(score(k) > score(victim_[0]))) { break; }
+                victim = victim_[0];
+            }
+            erase(victim);
+            out.victims.push_back(victim);
         }
         insert(k);
         out.admitted.push_back(k);
+    }
+    gate_heap_built_ = false;
+}
+
+void LfruPolicy::set_gate_classes(Classifier classify, std::uint32_t count) {
+    if (count == 0) { throw std::invalid_argument("LFRU: no gate classes"); }
+    classify_        = std::move(classify);
+    classes_         = classify_ ? count : 1;
+    gate_heap_built_ = false;
+}
+
+std::optional<std::uint32_t> LfruPolicy::evictable_victim(std::span<const std::uint32_t> protect, std::uint32_t newcomer,
+                                                          const Admissible& gate) {
+    using Candidate = std::pair<double, std::uint32_t>;
+    const auto by_class = [&](std::uint32_t key) {
+        if (!classify_) { return 0U; }
+        const std::uint32_t c = classify_(key);
+        if (c >= classes_) { throw std::logic_error("LFRU: a gate class out of range"); }
+        return c;
+    };
+    if (!gate_heap_built_) {
+        // Every resident outside `protect` with score()'s value; the step's only score changes are
+        // the group's, which is protected, so one set of heaps serves the whole step.
+        mark_.resize(count_.size(), 0);
+        for (std::uint32_t k : protect) { mark_[k] = 1; }
+        gate_heaps_by_class_.resize(classes_);
+        for (auto& heap : gate_heaps_by_class_) { heap.clear(); }
+        class_refused_.assign(classes_, 0);
+        const double next = static_cast<double>(now_) + 1.0;
+        for (std::size_t i = 0; i < residents_.size(); ++i) {
+            const std::uint32_t key = residents_[i];
+            if (mark_[key]) { continue; }
+            gate_heaps_by_class_[by_class(key)].emplace_back(resident_count_[i] / (next - resident_last_[i]), key);
+        }
+        for (std::uint32_t k : protect) { mark_[k] = 0; }
+        for (auto& heap : gate_heaps_by_class_) { std::make_heap(heap.begin(), heap.end(), std::greater<Candidate>()); }
+        gate_heap_built_ = true;
+        ++gate_heaps_;
+    }
+    const double bar = score(newcomer);
+    for (;;) {
+        // The lowest (score, key) top of the classes not refused (tops evicted this step dropped).
+        std::vector<Candidate>* best = nullptr;
+        for (std::uint32_t c = 0; c < classes_; ++c) {
+            auto& heap = gate_heaps_by_class_[c];
+            if (class_refused_[c]) { continue; }
+            while (!heap.empty() && !resident(heap.front().second)) {
+                std::pop_heap(heap.begin(), heap.end(), std::greater<Candidate>());
+                heap.pop_back();
+            }
+            if (!heap.empty() && (best == nullptr || heap.front() < best->front())) { best = &heap; }
+        }
+        if (best == nullptr || !(bar > best->front().first)) { return std::nullopt; }
+        const std::uint32_t key = best->front().second;
+        std::pop_heap(best->begin(), best->end(), std::greater<Candidate>());
+        best->pop_back();
+        const std::uint32_t now_class = by_class(key); // it may have changed (a reclaimed copy)
+        if (class_refused_[now_class]) { continue; }
+        ++gate_calls_;
+        if (gate(key)) { return key; }
+        // Refused: with classes its whole class is refused for the step; without, only this key.
+        if (classify_) { class_refused_[now_class] = 1; }
     }
 }
 
@@ -374,7 +444,7 @@ bool CacheController::adopt(std::uint32_t key, std::uint32_t frame, std::span<co
                             std::uint64_t round_started, std::vector<Command>& out) {
     if (key >= table_.size() || table_[key].state != ResidencyState::kAbsent) { return false; }
     if (const auto victim = policy_.promote(key, protect)) {
-        if (table_[*victim].state != ResidencyState::kAbsent) { frames_.retire(make_absent(*victim, out), round_started); }
+        if (table_[*victim].state != ResidencyState::kAbsent) { retire_victim(*victim, round_started, out); }
     }
     // A queued load of the key is dropped by drain_queue (the key is no longer absent); a copy of
     // it still in flight never publishes (complete_load compares the serial).
@@ -415,7 +485,7 @@ void CacheController::on_route(std::span<const std::uint32_t> group, std::uint64
     policy_.step(group, step_, admission_budget, admissible, evictable);
     for (std::uint32_t v : step_.victims) {
         if (table_[v].state == ResidencyState::kAbsent) { continue; } // was still queued
-        frames_.retire(make_absent(v, out), round_started);
+        retire_victim(v, round_started, out);
     }
     for (std::uint32_t k : step_.admitted) {
         if (!is_queued_[k]) {
@@ -429,6 +499,32 @@ void CacheController::on_route(std::span<const std::uint32_t> group, std::uint64
 void CacheController::release_held(std::uint32_t frame, std::vector<Command>& out) {
     frames_.release_held(frame);
     drain_queue(out);
+}
+
+void CacheController::retire_victim(std::uint32_t key, std::uint64_t round_started, std::vector<Command>& out) {
+    const bool write_back = writeback_ && writeback_(key);
+    const std::uint32_t frame = make_absent(key, out);
+    frames_.retire(frame, round_started);
+    if (write_back) {
+        // Held until complete_writeback: the copy reads the frame, so nothing may load into it first.
+        frames_.hold(frame);
+        out.push_back({Command::Kind::kWriteBack, key, frame, table_[key].encode()});
+    }
+}
+
+void CacheController::complete_writeback(std::uint32_t frame, std::vector<Command>& out) {
+    if (!frames_.is_demoting(frame)) { throw std::logic_error("expert cache: no write-back is pending in that frame"); }
+    frames_.release_held(frame);
+    drain_queue(out);
+}
+
+void CacheController::refuse_writeback(std::span<const std::uint32_t> keys) const {
+    if (!writeback_) { return; }
+    for (const std::uint32_t key : keys) {
+        if (table_[key].state != ResidencyState::kAbsent && writeback_(key)) {
+            throw std::logic_error("expert cache: an expert held only in VRAM cannot be evicted without a write-back");
+        }
+    }
 }
 
 void CacheController::on_round_done(std::uint64_t round_done, std::vector<Command>& out) {
@@ -451,6 +547,10 @@ void CacheController::resize(std::uint32_t frames, std::vector<Command>& out) {
         policy_.set_capacity(capacity, none);
         drain_queue(out);
         return;
+    }
+    if (writeback_ && policy_.resident_count() > capacity) {
+        // The victims are known only once chosen; with write-backs none may be (nothing changed).
+        throw std::logic_error("expert cache: a shrink that evicts cannot write experts held only in VRAM back");
     }
     std::vector<std::uint32_t> victims;
     policy_.set_capacity(capacity, victims);
@@ -524,6 +624,19 @@ std::optional<std::uint32_t> CacheController::choose_run(std::uint32_t count, st
 std::uint32_t CacheController::lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out,
                                     std::vector<std::uint32_t>* evicted_keys) {
     if (frames_.pending_count() != 0) { throw std::logic_error("frames lent while some still retire"); }
+    if (writeback_) {
+        // Lending evicts the run's experts and, past the capacity left, others the policy picks: with
+        // write-backs, refuse a run holding an expert held only in VRAM or needing further victims.
+        std::vector<std::uint32_t> held;
+        for (std::uint32_t f = first; f < first + count && f < frame_key_.size(); ++f) {
+            if (frame_key_[f] != kNoKey) { held.push_back(frame_key_[f]); }
+        }
+        refuse_writeback(held);
+        const std::size_t left = policy_.resident_count() - held.size();
+        if (left > (policy_.capacity() > count ? policy_.capacity() - count : 0)) {
+            throw std::logic_error("expert cache: lending would evict experts beyond the run");
+        }
+    }
     std::uint32_t evicted = 0;
     for (std::uint32_t f = first; f < first + count; ++f) {
         if (frame_key_[f] == kNoKey) { continue; }

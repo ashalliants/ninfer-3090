@@ -27,6 +27,11 @@ void validate_spec(const RoundStateSpec& spec) {
                                 spec.draft_window != 0 || spec.batch_capacity != 1)) {
         throw std::invalid_argument("scoring controls require one non-speculative sequence");
     }
+    if (spec.score_decode_width != 0 &&
+        (!spec.causal_scoring || spec.score_decode_width > kScoreDecodeMaximumWidth)) {
+        throw std::invalid_argument(
+            "a decode scoring frame requires causal scoring and a width in [1,16]");
+    }
     if (spec.hidden <= 0) { throw std::invalid_argument("RoundState hidden must be positive"); }
     if (spec.output_rows <= 0) {
         throw std::invalid_argument("RoundState output_rows must be positive");
@@ -47,6 +52,11 @@ void validate_spec(const RoundStateSpec& spec) {
     }
     (void)checked_i32(static_cast<std::uint64_t>(spec.draft_window) + 1ULL,
                       "RoundState draft window exceeds int32");
+    if (spec.draft_context_rows != 0 && (spec.backend == SpeculativeBackend::None ||
+                                         spec.draft_context_rows > kMaximumDraftContextRows)) {
+        throw std::invalid_argument(
+            "RoundState draft context rows need a speculative backend and at most 2048 slots");
+    }
 }
 
 } // namespace
@@ -79,6 +89,19 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
         layout.logits = add_tensor(builder, DType::BF16, {spec.output_rows, 1}, "step logits");
     }
     layout.text_kv_table_row = add_tensor(builder, DType::I32, {1}, "step Text KV table row");
+    if (spec.score_decode_width != 0) {
+        const auto width = static_cast<std::int32_t>(spec.score_decode_width);
+        ScoreDecodeStateLayout& decode = layout.score_decode.emplace();
+        decode.ingress =
+            builder.add(sizeof(ScoreDecodeIngress), kArenaAlign, "score decode ingress");
+        decode.logits = add_tensor(builder, DType::BF16, {spec.output_rows, width},
+                                   "score decode logits");
+        decode.hidden =
+            add_tensor(builder, DType::BF16, {spec.hidden, width}, "score decode hidden");
+        decode.target_tokens =
+            add_tensor(builder, DType::I32, {width}, "score decode target argmax");
+        decode.logprobs = add_tensor(builder, DType::FP32, {width}, "score decode logprobs");
+    }
     if (!spec.causal_scoring) {
         layout.backend_kv_table_row =
             add_tensor(builder, DType::I32, {1}, "step backend KV table row");
@@ -118,6 +141,31 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
                             DType::I32, {count});
     logits         = layout.logits.bind(backing);
     hidden         = layout.hidden.bind(backing);
+}
+
+ScoreDecodeState::ScoreDecodeState(DeviceSpan backing, const ScoreDecodeStateLayout& layout,
+                                   std::uint32_t width) {
+    if (width == 0 || width > kScoreDecodeMaximumWidth) {
+        throw std::invalid_argument("score decode width must be in [1,16]");
+    }
+    static_assert(std::is_standard_layout_v<ScoreDecodeIngress>);
+    ingress          = layout.ingress.bind(backing);
+    const auto count = static_cast<std::int32_t>(width);
+    const auto field = [&](std::size_t offset, std::int32_t elements) {
+        return Tensor(static_cast<unsigned char*>(ingress.data) + offset, DType::I32, {elements});
+    };
+    tokens                 = field(offsetof(ScoreDecodeIngress, tokens), count);
+    cache_positions        = field(offsetof(ScoreDecodeIngress, cache_positions), count);
+    rope_positions         = field(offsetof(ScoreDecodeIngress, rope_positions), count);
+    targets                = field(offsetof(ScoreDecodeIngress, targets), count);
+    valid_columns          = field(offsetof(ScoreDecodeIngress, valid_columns), 1);
+    text_kv_table_row      = field(offsetof(ScoreDecodeIngress, text_kv_table_row), 1);
+    state_source_slot      = field(offsetof(ScoreDecodeIngress, state_source_slot), 1);
+    state_destination_slot = field(offsetof(ScoreDecodeIngress, state_destination_slot), 1);
+    logits                 = layout.logits.bind(backing);
+    hidden                 = layout.hidden.bind(backing);
+    target_tokens          = layout.target_tokens.bind(backing);
+    logprobs               = layout.logprobs.bind(backing);
 }
 
 void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layout) {
@@ -222,6 +270,10 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         decode.target_continuation_hidden = add_tensor(
             builder, DType::BF16, {layout.spec.hidden, batch}, "DFlash target continuation hidden");
     }
+    if (layout.spec.draft_context_rows != 0) {
+        layout.draft_context_rows =
+            i32(static_cast<std::int32_t>(layout.spec.draft_context_rows), "draft context row ids");
+    }
     layout.complete = true;
 }
 
@@ -299,6 +351,7 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     next_drafts =
         egress_tensor(offsetof(MtpDecodeEgress, next_drafts), DType::I32, {batch, drafts});
     next_extents     = egress_tensor(offsetof(MtpDecodeEgress, next_extents), DType::I32, {batch});
+    relaxed_kept     = egress_tensor(offsetof(MtpDecodeEgress, relaxed_kept), DType::I32, {batch});
     verify_ids       = layout.verify_ids.bind(backing);
     target_positions = layout.target_positions.bind(backing);
     target_argmax    = layout.target_argmax.bind(backing);
@@ -376,6 +429,8 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
         egress_tensor(offsetof(DFlashDecodeEgress, licensed_counts), DType::I32, {batch});
     accepted_drafts =
         egress_tensor(offsetof(DFlashDecodeEgress, accepted_drafts), DType::I32, {batch});
+    relaxed_kept =
+        egress_tensor(offsetof(DFlashDecodeEgress, relaxed_kept), DType::I32, {batch});
     proposal_ids               = layout.proposal_ids.bind(backing);
     proposal_positions         = layout.proposal_positions.bind(backing);
     append_positions           = layout.append_positions.bind(backing);
@@ -422,6 +477,9 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     if (layout.ordinary) {
         ordinary.emplace(backing, *layout.ordinary, layout.spec.batch_capacity);
     }
+    if (layout.score_decode) {
+        score_decode.emplace(backing, *layout.score_decode, layout.spec.score_decode_width);
+    }
     rope_delta        = layout.rope_delta.bind(backing);
     text_kv_table_row = layout.text_kv_table_row.bind(backing);
     if (!layout.spec.causal_scoring) {
@@ -441,6 +499,7 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
         dflash_decode.emplace(backing, *layout.dflash_decode, layout.spec.batch_capacity,
                               layout.spec.draft_window);
     }
+    if (layout.draft_context_rows) { draft_context_rows = layout.draft_context_rows->bind(backing); }
 }
 
 } // namespace ninfer::models::qwen3_5

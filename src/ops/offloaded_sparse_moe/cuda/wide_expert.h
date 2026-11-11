@@ -21,7 +21,10 @@
 // a five-entry stack of subtree sums, one per tree level: the same additions on the same operands.
 // P_s comes from the MMA's exact int32 (one m16n8k32 when both halves of the sub-block share their
 // multiplier, else one m16n8k16 per half), read as a binary32 through the accumulator's bias
-// 0x4B400000 (|sum| < 2^22), and float(P_s) = m1 * B + m0 * A is exact below 2^24.
+// 0x4B400000, which needs |sum| < 2^22: a k32 sum is at most 32 * 127^2 = 516,128 (|w| <= 127, the
+// IQ4 codebooks; |q| <= 127). float(P_s) = m * A (one multiplier) or m1 * B + m0 * A is exact below
+// 2^24: |P_s| <= 32 * 32 * 127^2 = 16,516,096 for IQ4_XS (|m| <= 32, signed), less for every other
+// format (canonical_ggml.h step 2), so m * A, m0 * A and the fma are exact.
 
 #include "ninfer/ops/offloaded_sparse_moe.h"
 
@@ -66,9 +69,9 @@ void prepare(const std::uint16_t* x, std::int32_t columns, const MoeDispatch& di
 // The wide jobs of pass `pass` (jobs [pass * pass_jobs, ...)): gate/up with SwiGLU and the A8 cast of
 // h into the entries' h rows (codes and scales in place of the narrow route's FP32 h), then down into
 // `outputs`. job_records: the records the stage kernel resolved for the pass, or null (each record
-// read where it lives).
-void run_pass(QType gate_up_format, const MoeDispatch& dispatch, const MoeExpertSource& source, const Geometry& g,
-              std::int32_t top_k, std::int32_t max_jobs, std::int32_t pass_jobs, std::int32_t pass,
+// read where it lives). The formats are the record's parts (ggml_record_parts).
+void run_pass(QType gate_up_format, QType down_format, const MoeDispatch& dispatch, const MoeExpertSource& source,
+              const Geometry& g, std::int32_t top_k, std::int32_t max_jobs, std::int32_t pass_jobs, std::int32_t pass,
               const std::uint8_t* const* job_records, const Workspace& workspace, float* h_rows,
               std::uint16_t* outputs, cudaStream_t stream);
 

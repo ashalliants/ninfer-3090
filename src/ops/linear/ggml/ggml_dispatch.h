@@ -27,8 +27,10 @@ std::size_t ggml_linear_workspace_capacity_bytes(QType format, std::int32_t n, s
                                                  bool linear_add, std::int32_t min_tokens,
                                                  std::int32_t max_tokens);
 
-// Validates the weight view and runs out = W x (residual == false) or out += W x.
-void ggml_linear_dispatch(const Tensor& x, const Weight& w, Tensor& out, bool residual,
+// Validates the weight view and runs out = W x (residual == false) or out += W x. `decode_mma`
+// (LinearPolicy::AllowA8GgmlDecodeMma) takes T <= 8 to the int8 tensor-core decode route, which
+// also needs a 16-byte aligned weight; wider calls are unchanged.
+void ggml_linear_dispatch(const Tensor& x, const Weight& w, Tensor& out, bool residual, bool decode_mma,
                           WorkspaceArena* workspace, cudaStream_t stream);
 
 // linear_pair over GGML weights: validates both weights, the registered pair problem and

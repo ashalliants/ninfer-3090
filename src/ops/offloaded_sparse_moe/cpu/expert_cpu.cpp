@@ -1,9 +1,10 @@
 // Host routes of offloaded_sparse_moe: the record geometry, the exact sub-block decode, the scalar
 // rowdot (the CPU reference route) and the expert composition both ISAs share.
 //
-// The sub-block decoders transcribe ggml's reference dequantize_row_iq2_xxs / iq2_s / iq1_m / q2_0
-// (llama.cpp b11316 ggml/src/ggml-quants.c; MIT, notice in third_party/ggml/LICENSE) into integer
-// weights and multipliers, so that c * m * w is the reference value exactly.
+// The sub-block decoders transcribe ggml's reference dequantize_row_iq2_xxs / iq2_xs / iq2_s /
+// iq1_m / iq3_xxs / iq3_s / iq4_xs / iq4_nl / q2_0 (llama.cpp b11316 ggml/src/ggml-quants.c; MIT,
+// notice in third_party/ggml/LICENSE) into integer weights and multipliers, so that c * m * w is the
+// reference value exactly.
 
 #include "ops/offloaded_sparse_moe/cpu/expert_cpu.h"
 
@@ -32,8 +33,8 @@ RecordGeometry record_geometry(QType format) {
     const std::array<std::uint64_t, 3> shape = {1, kHidden, kIntermediate};
     const auto g     = weight_geometry(format, QuantLayout::GgmlExpertRecord, shape);
     const auto parts = ggml_record_parts(format);
-    if (parts.down != QType::GGML_Q2_0) {
-        throw std::invalid_argument("offloaded_sparse_moe: record down part must be Q2_0");
+    if (parts.down != QType::GGML_Q2_0 && parts.down != QType::GGML_IQ4_NL) {
+        throw std::invalid_argument("offloaded_sparse_moe: record down part must be Q2_0 or IQ4_NL");
     }
     RecordGeometry out;
     out.format            = format;
@@ -132,6 +133,95 @@ ExpertSub q2_0(const std::uint8_t* b, int half) {
     return out;
 }
 
+// IQ2_XS, 74 bytes per 256 values: fp16 d, u16 qs[32] (per eight values a 9-bit iq2xs_grid index and
+// a 7-bit sign selector), scales[8]; value = d (0.5 + ls) / 4 * grid * sign = (d / 8)(2 ls + 1) w,
+// with the two halves of 16 values on their own 4-bit scales, as IQ2_S.
+ExpertSub iq2_xs(const std::uint8_t* b, int ib) {
+    ExpertSub out{};
+    const int scale = b[66 + ib];
+    for (int l = 0; l < 4; ++l) {
+        const std::uint16_t code = load_u16(b + 2 + 2 * (4 * ib + l));
+        const std::uint64_t grid = iq2xs_grid[code & 511];
+        const std::uint8_t signs = ksigns_iq2xs[code >> 9];
+        for (int j = 0; j < 8; ++j) {
+            const int g      = static_cast<int>((grid >> (8 * j)) & 0xFF);
+            out.w[8 * l + j] = static_cast<std::int8_t>((signs & kmask_iq2xs[j]) != 0 ? -g : g);
+        }
+    }
+    out.m[0] = 2 * (scale & 0xF) + 1;
+    out.m[1] = 2 * (scale >> 4) + 1;
+    out.c    = canon::mul_rn(fp16_to_f32(load_u16(b)), 0.125F);
+    return out;
+}
+
+// IQ3_XXS, 98 bytes per 256 values: fp16 d, qs[64] (one iq3xxs_grid index per four values), then per
+// 32 values a word of 4 x 7-bit sign indices and a 4-bit scale ls:
+// value = d (0.5 + ls) / 2 * grid * sign = (d / 4)(2 ls + 1) w, |w| <= 62.
+ExpertSub iq3_xxs(const std::uint8_t* b, int ib) {
+    ExpertSub out{};
+    const std::uint8_t* q     = b + 2 + 8 * ib;
+    const std::uint32_t aux32 = load_u32(b + 66 + 4 * ib);
+    for (int l = 0; l < 4; ++l) {
+        const std::uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+        const std::uint32_t grid[2] = {iq3xxs_grid[q[2 * l]], iq3xxs_grid[q[2 * l + 1]]};
+        for (int j = 0; j < 8; ++j) {
+            const int g      = static_cast<int>((grid[j / 4] >> (8 * (j % 4))) & 0xFF);
+            out.w[8 * l + j] = static_cast<std::int8_t>((signs & kmask_iq2xs[j]) != 0 ? -g : g);
+        }
+    }
+    out.m[0] = out.m[1] = 2 * static_cast<int>(aux32 >> 28) + 1;
+    out.c               = canon::mul_rn(fp16_to_f32(load_u16(b)), 0.25F);
+    return out;
+}
+
+// IQ3_S, 110 bytes per 256 values: fp16 d, qs[64], qh[8], signs[32], scales[4]; sub-block ib takes
+// scale nibble ib: value = d (1 + 2 nibble) * grid * sign, |w| <= 15.
+ExpertSub iq3_s(const std::uint8_t* b, int ib) {
+    ExpertSub out{};
+    const int nibble = (b[106 + ib / 2] >> (4 * (ib % 2))) & 0xF;
+    const int qh     = b[66 + ib];
+    for (int l = 0; l < 4; ++l) {
+        const std::uint32_t grid[2] = {iq3s_grid[b[2 + 8 * ib + 2 * l] | ((qh << (8 - 2 * l)) & 256)],
+                                       iq3s_grid[b[3 + 8 * ib + 2 * l] | ((qh << (7 - 2 * l)) & 256)]};
+        const std::uint8_t signs    = b[74 + 4 * ib + l];
+        for (int j = 0; j < 8; ++j) {
+            const int g      = static_cast<int>((grid[j / 4] >> (8 * (j % 4))) & 0xFF);
+            out.w[8 * l + j] = static_cast<std::int8_t>((signs & kmask_iq2xs[j]) != 0 ? -g : g);
+        }
+    }
+    out.m[0] = out.m[1] = 1 + 2 * nibble;
+    out.c               = fp16_to_f32(load_u16(b));
+    return out;
+}
+
+// IQ4_XS, 136 bytes per 256 values: fp16 d, u16 scales_h, scales_l[4], qs[128]; sub-block ib has a
+// 6-bit ls split across scales_l and scales_h: value = d (ls - 32) kvalues_iq4nl[code], a signed
+// multiplier in [-32, 31] and |w| <= 127.
+ExpertSub iq4_xs(const std::uint8_t* b, int ib) {
+    ExpertSub out{};
+    const int ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) | (((load_u16(b + 2) >> (2 * ib)) & 3) << 4);
+    for (int j = 0; j < 16; ++j) {
+        const int q   = b[8 + 16 * ib + j];
+        out.w[j]      = kvalues_iq4nl[q & 0xF];
+        out.w[j + 16] = kvalues_iq4nl[q >> 4];
+    }
+    out.m[0] = out.m[1] = ls - 32;
+    out.c               = fp16_to_f32(load_u16(b));
+    return out;
+}
+
+// IQ4_NL, 18 bytes per 32 values: fp16 d, qs[16]; value = d kvalues_iq4nl[code].
+ExpertSub iq4_nl(const std::uint8_t* b) {
+    ExpertSub out{};
+    for (int j = 0; j < 16; ++j) {
+        out.w[j]      = kvalues_iq4nl[b[2 + j] & 0xF];
+        out.w[j + 16] = kvalues_iq4nl[b[2 + j] >> 4];
+    }
+    out.m[0] = out.m[1] = 1;
+    out.c               = fp16_to_f32(load_u16(b));
+    return out;
+}
+
 } // namespace
 
 ExpertSub decode_sub(QType format, const std::uint8_t* row, int s) {
@@ -140,6 +230,11 @@ ExpertSub decode_sub(QType format, const std::uint8_t* row, int s) {
     case QType::GGML_IQ2_S: return iq2_s(row + static_cast<std::size_t>(s / 8) * 82, s % 8);
     case QType::GGML_IQ1_M: return iq1_m(row + static_cast<std::size_t>(s / 8) * 56, s % 8);
     case QType::GGML_Q2_0: return q2_0(row + static_cast<std::size_t>(s / 2) * 18, s % 2);
+    case QType::GGML_IQ2_XS: return iq2_xs(row + static_cast<std::size_t>(s / 8) * 74, s % 8);
+    case QType::GGML_IQ3_XXS: return iq3_xxs(row + static_cast<std::size_t>(s / 8) * 98, s % 8);
+    case QType::GGML_IQ3_S: return iq3_s(row + static_cast<std::size_t>(s / 8) * 110, s % 8);
+    case QType::GGML_IQ4_XS: return iq4_xs(row + static_cast<std::size_t>(s / 8) * 136, s % 8);
+    case QType::GGML_IQ4_NL: return iq4_nl(row + static_cast<std::size_t>(s) * 18);
     default: throw std::invalid_argument("offloaded_sparse_moe: not an expert block format");
     }
 }

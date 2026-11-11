@@ -42,7 +42,9 @@ constexpr std::array kFormats = {
     std::pair{QType::GGML_IQ2_XXS, "ggml_iq2_xxs"}, std::pair{QType::GGML_IQ4_NL, "ggml_iq4_nl"},
     std::pair{QType::GGML_IQ3_S, "ggml_iq3_s"},     std::pair{QType::GGML_IQ2_S, "ggml_iq2_s"},
     std::pair{QType::GGML_IQ4_XS, "ggml_iq4_xs"},   std::pair{QType::GGML_IQ1_M, "ggml_iq1_m"},
-    std::pair{QType::GGML_Q2_0, "ggml_q2_0"},
+    std::pair{QType::GGML_Q2_0, "ggml_q2_0"},       std::pair{QType::GGML_IQ2_XS, "ggml_iq2_xs"},
+    std::pair{QType::GGML_IQ3_XXS, "ggml_iq3_xxs"}, std::pair{QType::GGML_Q4_K, "ggml_q4_k"},
+    std::pair{QType::GGML_Q5_K, "ggml_q5_k"},
 };
 
 // Returns the fixture's blocks after checking every decoded bit pattern.
@@ -78,17 +80,19 @@ std::vector<std::byte> golden(QType format, const char* name) {
 
 /// Each record part decodes to its own golden blocks' values (ggml's FP32 outputs, checked by
 // golden()), at the addresses the record geometry gives, and a non-zero gap is refused. Two
-// experts of [hidden 256, intermediate 64]: gate and up are 64 rows of one gate/up block, down
-// 256 rows of one Q2_0 block. Expert 1's parts take the fixture blocks in reverse order.
+// experts of [hidden 256, intermediate 64]: gate and up are 64 rows of 256 values (one block, or
+// four Q2_0 blocks), down 256 rows of one Q2_0 block or two IQ4_NL blocks. Expert 1's parts take the fixture blocks in
+// reverse order (a part longer than its fixture repeats it).
 void record_parts_decode_like_blocks(QType record, const std::vector<std::byte>& gate_up,
                                      const std::vector<std::byte>& down) {
     const auto parts = ggml_record_parts(record);
     const auto g     = weight_geometry(record, QuantLayout::GgmlExpertRecord,
                                        std::array<std::uint64_t, 3>{2, 256, 64});
     const auto gu = ggml_block(parts.gate_up), d = ggml_block(parts.down);
-    require(g.record_up_offset == (64 * gu.bytes + 255) / 256 * 256 &&
-                g.record_down_offset == (g.record_up_offset + 64 * gu.bytes + 255) / 256 * 256 &&
-                g.record_bytes == g.record_down_offset + 256 * d.bytes &&
+    const auto gate_bytes = 64 * (256 / gu.values) * gu.bytes;
+    require(g.record_up_offset == (gate_bytes + 255) / 256 * 256 &&
+                g.record_down_offset == (g.record_up_offset + gate_bytes + 255) / 256 * 256 &&
+                g.record_bytes == g.record_down_offset + 256 * (64 / d.values) * d.bytes &&
                 g.record_stride == (g.record_bytes + 255) / 256 * 256 &&
                 g.bytes == 2 * g.record_stride,
             "expert record geometry differs from 256-byte aligned parts");
@@ -96,8 +100,9 @@ void record_parts_decode_like_blocks(QType record, const std::vector<std::byte>&
     const auto blocks_of = [&](const std::vector<std::byte>& source, GgmlBlock block,
                                std::uint64_t count, bool reverse) {
         std::vector<std::byte> out(count * block.bytes);
+        const std::uint64_t available = source.size() / block.bytes;
         for (std::uint64_t i = 0; i < count; ++i) {
-            const auto from = reverse ? count - 1 - i : i;
+            const auto from = (reverse ? count - 1 - i : i) % available;
             std::memcpy(out.data() + i * block.bytes, source.data() + from * block.bytes,
                         block.bytes);
         }
@@ -108,7 +113,8 @@ void record_parts_decode_like_blocks(QType record, const std::vector<std::byte>&
     for (std::uint64_t expert = 0; expert < 2; ++expert) {
         for (const auto part : kParts) {
             const bool is_down = part == ExpertPart::Down;
-            auto bytes = blocks_of(is_down ? down : gate_up, is_down ? d : gu, is_down ? 256 : 64,
+            auto bytes = blocks_of(is_down ? down : gate_up, is_down ? d : gu,
+                                   is_down ? 256 * (64 / d.values) : 64 * (256 / gu.values),
                                    expert == 1 || part == ExpertPart::Up);
             const auto at = ggml_record_part(g, expert, part).offset;
             std::memcpy(payload.data() + at, bytes.data(), bytes.size());
@@ -127,7 +133,7 @@ void record_parts_decode_like_blocks(QType record, const std::vector<std::byte>&
         }
     }
     payload[g.record_stride + g.record_up_offset - 1] = std::byte{1};
-    bool refused = g.record_up_offset == 64 * gu.bytes; // no gap to dirty when parts align
+    bool refused = g.record_up_offset == gate_bytes; // no gap to dirty when parts align
     try {
         (void)ggml::decode_record_part(g, payload, 1, ExpertPart::Gate);
     } catch (const std::invalid_argument&) { refused = true; }
@@ -144,7 +150,11 @@ int run() {
         throw std::logic_error("no fixture");
     };
     for (const auto record :
-         {QType::GGML_REC_IQ2_S_Q2_0, QType::GGML_REC_IQ2_XXS_Q2_0, QType::GGML_REC_IQ1_M_Q2_0}) {
+         {QType::GGML_REC_IQ2_S_Q2_0, QType::GGML_REC_IQ2_XXS_Q2_0, QType::GGML_REC_IQ1_M_Q2_0,
+          QType::GGML_REC_Q2_0_Q2_0, QType::GGML_REC_IQ2_XS_Q2_0, QType::GGML_REC_IQ2_XS_IQ4_NL,
+          QType::GGML_REC_IQ2_XXS_IQ4_NL, QType::GGML_REC_IQ2_S_IQ4_NL, QType::GGML_REC_IQ3_XXS_Q2_0,
+          QType::GGML_REC_IQ3_XXS_IQ4_NL, QType::GGML_REC_IQ3_S_Q2_0, QType::GGML_REC_IQ3_S_IQ4_NL,
+          QType::GGML_REC_IQ4_XS_IQ4_NL}) {
         const auto parts = ggml_record_parts(record);
         require(of(QType::GGML_Q2_0).size() >= 256 * ggml_block(QType::GGML_Q2_0).bytes,
                 "the Q2_0 fixture has fewer than 256 blocks");

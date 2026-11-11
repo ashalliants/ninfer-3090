@@ -3,6 +3,7 @@
 // Gated DeltaNet head mapping and shared-memory layouts. Generic CUDA primitives
 // live under ops/common and are included only where this header uses them.
 
+#include "core/gdn_head_map.h"
 #include "ops/common/bf16_vector.cuh"
 #include "ops/common/math.h"
 #include "ops/linear_attention/gated_delta_net/common.h"
@@ -95,24 +96,38 @@ issue_load_bf16_to_float_vec4(View view, const __nv_bfloat16* __restrict__ gmem_
 
 #endif // __CUDACC__
 
+// Value head -> Q/K head (core/gdn_head_map.h), fixed at compile time: Blocked (Qwen3.5's grouped
+// heads, the default) divides by the group size G; Tiled (Qwen3.8-Flash-Next) takes the value head
+// modulo H_qk, with the same fast division computing the quotient by H_qk.
+template <GdnHeadMap Map = GdnHeadMap::Blocked>
 struct head_map {
     int H_qk;
     int H_v;
-    uint3 group_magic;
+    uint3 group_magic; // Blocked: division by G; Tiled: division by H_qk
 
     static head_map of(int H_qk_, int H_v_) {
-        const int G = H_v_ / H_qk_;
-        return head_map{H_qk_, H_v_, init_fastdiv_values(static_cast<std::uint64_t>(G))};
+        const int divisor = Map == GdnHeadMap::Tiled ? H_qk_ : H_v_ / H_qk_;
+        return head_map{H_qk_, H_v_, init_fastdiv_values(static_cast<std::uint64_t>(divisor))};
     }
 
     NINFER_KERNELS_HOST_DEVICE int group_size() const { return H_v / H_qk; }
 
     NINFER_KERNELS_HOST_DEVICE int qk_head(int h_v) const {
 #if defined(__CUDA_ARCH__)
-        return static_cast<int>(fastdiv(static_cast<std::uint32_t>(h_v), group_magic));
+        const int quotient =
+            static_cast<int>(fastdiv(static_cast<std::uint32_t>(h_v), group_magic));
+        if constexpr (Map == GdnHeadMap::Tiled) { return h_v - quotient * H_qk; }
+        return quotient;
 #else
+        if constexpr (Map == GdnHeadMap::Tiled) { return h_v % H_qk; }
         return h_v / group_size();
 #endif
+    }
+
+    // Whether h_v is the first value head that reads its Q/K head (the one that publishes it).
+    NINFER_KERNELS_HOST_DEVICE bool first_reader(int h_v) const {
+        if constexpr (Map == GdnHeadMap::Tiled) { return h_v < H_qk; }
+        return h_v % group_size() == 0;
     }
 };
 

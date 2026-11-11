@@ -288,9 +288,12 @@ std::vector<std::byte> parent_bytes(const WeightParent& parent, bool device) {
 void ggml_writer_residencies(DeviceContext& device, const std::filesystem::path& path) {
     Reader reader(path);
     const auto objects = ggml_objects(reader);
-    // writer_interop.py writes one object per GGML block format (9) and per record format (4, with the
-    // MTP drafter's ggml_rec_q2_0_q2_0).
-    require(objects.size() == 13, "writer fixture lost a GGML format or layout");
+    // writer_interop.py writes one object per GGML block format and per record format, from
+    // tools/artifact/formats.py's GGML_BLOCK_FORMATS and GGML_RECORD_FORMATS. 13 block formats
+    // (this PR's own IQ2_XS, IQ3_XXS, Q4_K and Q5_K additions grew it from 9) plus 13 record
+    // formats (this PR's GSQ-RCO IQ3_XXS/IQ3_S expert records grew it from 4) = 26. Update this
+    // alongside formats.py when a format is added or removed, or the two drift again.
+    require(objects.size() == 26, "writer fixture lost a GGML format or layout");
     for (const auto residency : {Residency::Pinned, Residency::Host}) {
         Binder binder(reader);
         for (const auto object : objects) {

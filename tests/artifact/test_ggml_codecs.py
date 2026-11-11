@@ -93,6 +93,22 @@ def test_fixtures_cover_every_grid_index_and_sign_pattern():
     fields = np.stack([(words >> (3 * f)) & 7 for f in range(4)], -1)
     assert set(np.unique(fields)) == set(range(8))
 
+    blocks, _ = _fixture("ggml_iq2_xs")
+    qs = blocks[:, 2:66].reshape(-1, 32, 2).astype(np.int32)
+    qs = qs[..., 0] | qs[..., 1] << 8
+    assert set(np.unique(qs & 511)) == set(range(512))
+    assert set(np.unique(qs >> 9)) == set(range(128))
+    scales = blocks[:, 66:74]
+    assert set(np.unique(scales & 0xF)) == set(np.unique(scales >> 4)) == set(range(16))
+
+    blocks, _ = _fixture("ggml_iq3_xxs")
+    assert set(np.unique(blocks[:, 2:66])) == set(range(256))
+    aux = blocks[:, 66:98].reshape(-1, 8, 4).astype(np.uint32)
+    aux = aux[..., 0] | aux[..., 1] << 8 | aux[..., 2] << 16 | aux[..., 3] << 24
+    signs = np.stack([(aux >> (7 * l)) & 127 for l in range(4)], axis=-1)
+    assert set(np.unique(signs)) == set(range(128))
+    assert set(np.unique(aux >> 28)) == set(range(16))
+
     blocks, _ = _fixture("ggml_iq4_xs")
     scales_h = blocks[:, 2].astype(np.int32) | blocks[:, 3].astype(np.int32) << 8
     ib = np.arange(8)
@@ -103,6 +119,18 @@ def test_fixtures_cover_every_grid_index_and_sign_pattern():
     blocks, _ = _fixture("ggml_q6_k")
     scales = blocks[:, 192:208].view(np.int8)
     assert scales.min() == -128 and scales.max() == 127
+
+    for name in ("ggml_q4_k", "ggml_q5_k"):
+        blocks, _ = _fixture(name)
+        q = blocks[:, 4:16].astype(np.int32)  # get_scale_min_k4's 12 packed bytes
+        sc = np.concatenate((q[:, 0:4] & 63, (q[:, 8:12] & 0xF) | ((q[:, 0:4] >> 6) << 4)), 1)
+        m = np.concatenate((q[:, 4:8] & 63, (q[:, 8:12] >> 4) | ((q[:, 4:8] >> 6) << 4)), 1)
+        for j in range(8):  # every 6-bit scale and min in every sub-block
+            assert set(np.unique(sc[:, j])) == set(np.unique(m[:, j])) == set(range(64))
+        d = blocks[:, 0].astype(np.uint16) | blocks[:, 1].astype(np.uint16) << 8
+        dmin = blocks[:, 2].astype(np.uint16) | blocks[:, 3].astype(np.uint16) << 8
+        special = {0x0000, 0x8000, 0x0001, 0x03FF, 0x7BFF, 0x7C00, 0xFC00, 0x7E00, 0xFE01}
+        assert special <= set(d.tolist()) and special <= set(dmin.tolist())
 
 
 @pytest.mark.skipif(not ORACLE, reason="set NINFER_GGML_BASE_DLL to ggml-base of llama.cpp b11316")
@@ -125,6 +153,21 @@ def test_block_geometry_and_rejections():
     assert ggml_blocks_geometry("ggml_q2_0", (512, 2560, 640)).row_bytes == 180
     assert encoded_size("ggml_blocks_v1", "ggml_iq4_xs", (248_320, 2560)) == 337_715_200
     assert encoded_size("ggml_blocks_v1", "ggml_q8_0", (64,)) == 68
+    for name, geometry in (
+        ("ggml_iq2_xs", (17, 256, 74)),
+        ("ggml_iq3_xxs", (18, 256, 98)),
+        ("ggml_q4_k", (12, 256, 144)),
+        ("ggml_q5_k", (13, 256, 176)),
+    ):
+        spec = get_format(name)
+        assert (spec.ggml_type, spec.block_elems, spec.block_bytes) == geometry
+    # The IQ3 packs' gate/up banks [512, 640, 2560]: ten blocks of 74 and 98 bytes per row.
+    assert ggml_blocks_geometry("ggml_iq2_xs", (512, 640, 2560)).payload_bytes == 242_483_200
+    assert ggml_blocks_geometry("ggml_iq3_xxs", (512, 640, 2560)).row_bytes == 980
+    assert encoded_size("ggml_blocks_v1", "ggml_iq3_xxs", (512, 640, 2560)) == 321_126_400
+    # The IQ3 packs' dense K-quants: GDN qkv [10240, 2560] and the Q5_K output head [248320, 2560].
+    assert ggml_blocks_geometry("ggml_q4_k", (10240, 2560)).row_bytes == 1440
+    assert encoded_size("ggml_blocks_v1", "ggml_q5_k", (248_320, 2560)) == 437_043_200
     with pytest.raises(ValueError, match="divisible by 256"):
         encoded_size("ggml_blocks_v1", "ggml_iq1_m", (4, 640))
     with pytest.raises(ValueError, match="does not accept"):
@@ -149,6 +192,16 @@ def test_expert_record_geometry_at_the_real_shapes():
         "ggml_rec_iq1_m_q2_0": (358_400, 1_177_600),
         # The MTP drafter's bank: 707,788,800 B, Strata's mtp-q2_0.gguf expert bytes.
         "ggml_rec_q2_0_q2_0": (460_800, 1_382_400),
+        # The further pairs of the GSQ-RCO IQ3_XXS and IQ3_S packs (IQ4_NL down rows: 360 B).
+        "ggml_rec_iq2_xs_q2_0": (473_600, 1_408_000),
+        "ggml_rec_iq2_xs_iq4_nl": (473_600, 1_868_800),
+        "ggml_rec_iq2_xxs_iq4_nl": (422_400, 1_766_400),
+        "ggml_rec_iq2_s_iq4_nl": (524_800, 1_971_200),
+        "ggml_rec_iq3_xxs_q2_0": (627_200, 1_715_200),
+        "ggml_rec_iq3_xxs_iq4_nl": (627_200, 2_176_000),
+        "ggml_rec_iq3_s_q2_0": (704_000, 1_868_800),
+        "ggml_rec_iq3_s_iq4_nl": (704_000, 2_329_600),
+        "ggml_rec_iq4_xs_iq4_nl": (870_400, 2_662_400),
     }
     assert set(expected) == set(GGML_RECORD_FORMATS)
     for name, (gate_bytes, record_bytes) in expected.items():
@@ -156,7 +209,8 @@ def test_expert_record_geometry_at_the_real_shapes():
         assert (g.gate_bytes, g.up_offset, g.down_offset) == (
             gate_bytes, gate_bytes, 2 * gate_bytes
         )
-        assert (g.down_bytes, g.down_row_bytes) == (460_800, 180)
+        down = (921_600, 360) if name.endswith("_iq4_nl") else (460_800, 180)
+        assert (g.down_bytes, g.down_row_bytes) == down
         assert g.record_bytes == g.record_stride == record_bytes
         assert encoded_size("ggml_expert_record_v1", name, shape) == 512 * record_bytes
     # 34 IQ2_S, 11 IQ2_XXS and 3 IQ1_M layers hold exactly the GGUF's routed-expert bytes: its
@@ -205,3 +259,22 @@ def test_expert_records_invert_exactly_with_zero_gaps():
         pack_expert_records(name, shape, gate, up, down[:, :-1])
     with pytest.raises(ValueError, match="expected"):
         unpack_expert_records(records.tobytes()[:-1], name, shape)
+
+
+def test_expert_records_with_iq4_nl_down_invert_exactly():
+    # IQ3_S rows of 110 B and IQ4_NL down rows of two 18 B blocks (K = 64): 64 gate rows are
+    # 7040 B, so up starts at 7168 and down at 14,336, and the record (14,336 + 256 rows of 36 B)
+    # is 23,552 B, a multiple of 256.
+    name, shape = "ggml_rec_iq3_s_iq4_nl", (2, 256, 64)
+    g = ggml_expert_record_geometry(name, shape)
+    assert (g.gate_bytes, g.up_offset, g.down_offset) == (7040, 7168, 14_336)
+    assert (g.down_row_bytes, g.record_bytes, g.record_stride) == (36, 23_552, 23_552)
+    rng = np.random.default_rng(6)
+    gate = rng.integers(0, 256, size=(2, 64, 110), dtype=np.uint8)
+    up = rng.integers(0, 256, size=(2, 64, 110), dtype=np.uint8)
+    down = rng.integers(0, 256, size=(2, 256, 36), dtype=np.uint8)
+    records = pack_expert_records(name, shape, gate, up, down)
+    assert records[1, g.down_offset :].tobytes() == down[1].tobytes()
+    unpacked = unpack_expert_records(records.tobytes(), name, shape)
+    for a, b in zip(unpacked, (gate, up, down)):
+        assert np.array_equal(a, b)

@@ -56,7 +56,7 @@ def main() -> int:
     matrix = _pattern(130 * 130 * 2)
     ggml_specs, ggml_data, ggml_bindings = _ggml_objects()
     with tempfile.TemporaryDirectory(prefix="ninfer-writer-interop-") as temporary:
-        for label, limit in (("single", 1_000_000), ("sharded", 12288)):
+        for label, limit in (("single", 1_000_000), ("sharded", 16384)):
             path = Path(temporary) / f"{label}.ninfer"
             with ArtifactWriter(
                 path,

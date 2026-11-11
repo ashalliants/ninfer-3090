@@ -1,0 +1,13 @@
+{
+  "kv-dtype": "int8",
+  "prefill-chunk": 1024,
+  "max-pending-requests": 16,
+  "pending-timeout-ms": 600000,
+  "shared-expert-stream": true,
+  "mtp-joint-acceptance": true,
+  "gdn-head-map": true,
+  "moe-precast-input": true,
+  "moe-gate-up-registers": true,
+  "gdn-async-commit": true,
+  "prefill-cpu-share": "0.4"
+}

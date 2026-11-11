@@ -20,6 +20,14 @@ void ggml_mmvq_launch(const std::uint8_t* w, const __nv_bfloat16* x, __nv_bfloat
                       std::int32_t n, std::int32_t k, std::int32_t t, bool residual,
                       cudaStream_t stream);
 
+// The opt-in int8 tensor-core decode route (ggml_mma_decode.cuh, LinearPolicy::AllowA8GgmlDecodeMma),
+// 1 <= t <= kGgmlDecodeMaxTokens: the same Q8_1 cast in shared memory, then mma.sync s8 tiles of 16
+// rows by 8 columns in ggml_mma_emulation.h's fixed order. w is 16-byte aligned and n % 16 == 0.
+template <QType F>
+void ggml_mma_decode_launch(const std::uint8_t* w, const __nv_bfloat16* x, __nv_bfloat16* out,
+                            std::int32_t n, std::int32_t k, std::int32_t t, bool residual,
+                            cudaStream_t stream);
+
 // linear_pair's decode route: out1 = W1 x and out2 = W2 x in one launch, each row computed as
 // ggml_mmvq_launch computes it. (first, second, n, k) must satisfy ggml_pair_registered.
 void ggml_mmvq_pair_launch(QType first, QType second, const std::uint8_t* w1, const std::uint8_t* w2,

@@ -16,8 +16,19 @@ struct GpuSample {
     std::optional<std::uint64_t> memory_total_bytes;
     std::optional<unsigned> temperature_celsius;
     std::optional<double> power_watts;
+    // The limit the board is held to now, after every limiter, `nvidia-smi -pl` included
+    // (nvmlDeviceGetEnforcedPowerLimit). A capped card is slower, so a throughput figure means
+    // little without it.
+    std::optional<double> power_limit_watts;
     // Cumulative since the driver loaded, so only differences are meaningful.
     std::optional<double> energy_joules;
+};
+
+// The device's PCIe link: the highest generation it can run (the current one drops at idle) and the
+// current width (the slot's lanes, which a slot shared between two cards halves).
+struct PcieLink {
+    unsigned max_generation = 0;
+    unsigned width          = 0;
 };
 
 using GpuSymbolLookup = std::function<void*(const char*)>;
@@ -46,6 +57,8 @@ public:
     // 1 active, 0 inactive, -1 unknown.
     [[nodiscard]] int display_active() const;
     [[nodiscard]] GpuSample sample() const;
+    // nullopt when either half cannot be read.
+    [[nodiscard]] std::optional<PcieLink> pcie_link() const;
 
 private:
     struct Impl;

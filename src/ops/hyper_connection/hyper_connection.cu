@@ -1,6 +1,7 @@
 // Adapted from Infernix a3edb450 src/ops/hyper_connection/hyper_connection.cu (Apache-2.0).
 // Modified for NInfer-3090: the composed route's norm multiplies by the stored FP32 norm weight
-// (no unit offset), and the namespaces and includes are NInfer's.
+// (no unit offset), the namespaces and includes are NInfer's, and the int8 form (--hc-int8) runs
+// the int8 fused route (T <= 16 only).
 
 #include "ninfer/ops/hyper_connection.h"
 
@@ -14,6 +15,11 @@
 #include <string>
 
 namespace ninfer::ops {
+
+// The int8 form exists only on the fused route: the public cap is that route's.
+static_assert(kHcInt8MaxColumns == detail::kHcMixFusedMaxColumns,
+              "--hc-int8 serves exactly the columns the fused route serves");
+
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -120,6 +126,10 @@ __global__ void collapse_kernel(const bf16* __restrict__ logits, const bf16* __r
         __float2bfloat16_rn(sum / static_cast<float>(streams));
 }
 
+// r + inject * v compiles to one FFMA (nvcc's default --fmad=true contraction; cuobjdump shows
+// FFMA). hc_fused_read's fold computes __fmaf_rn(inject, v, r) and its bitwise equality with this
+// kernel depends on that contraction; writing __fmaf_rn here changes this kernel's SASS, so it is
+// left as is (ninfer_hyper_connection_test compares the two bitwise).
 __global__ void inject_kernel(const bf16* __restrict__ y, const float* __restrict__ inject,
                               int hidden, int streams, int columns, bf16* __restrict__ residual) {
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
@@ -192,6 +202,14 @@ std::size_t composed_bytes(const Weight& down, const Weight& up, LinearPolicy po
                linear_workspace_capacity_bytes(up.qtype, up.n, up.k, policy, 1, max_tokens));
 }
 
+bool int8_weights(const HcInt8Weights& w) {
+    const auto aligned = [](const void* p) {
+        return reinterpret_cast<std::uintptr_t>(p) % 16 == 0;
+    };
+    return w.codes != nullptr && w.scales != nullptr && aligned(w.codes) && aligned(w.scales) &&
+           w.n > 0 && w.k > 0 && w.k % kHcInt8Group == 0;
+}
+
 } // namespace
 
 void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
@@ -221,7 +239,8 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
     }
     require(eps > 0, "mix epsilon must be positive");
     // Checked before the route choice: the fused route never reaches linear()'s own check.
-    require(valid_linear_policy(policy), "mix requires a valid LinearPolicy");
+    require(valid_dense_linear_policy(policy),
+            "mix requires a valid LinearPolicy (not AllowA8GgmlDecodeMma, which is for GGML weights)");
     auto scope = workspace.scope();
     if (detail::hc_mix_fused_supported(down, up, hidden, streams, rank, T)) {
         const DeviceSpan partials =
@@ -247,9 +266,58 @@ std::size_t hyper_connection_mix_workspace_capacity_bytes(const Weight& down, co
                                                           std::int32_t max_tokens) {
     require(max_tokens > 0 && streams > 0 && rank > 0,
             "mix workspace needs positive T, streams and rank");
-    require(valid_linear_policy(policy), "mix requires a valid LinearPolicy");
+    require(valid_dense_linear_policy(policy),
+            "mix requires a valid LinearPolicy (not AllowA8GgmlDecodeMma, which is for GGML weights)");
     std::size_t bytes = composed_bytes(down, up, policy, rank, max_tokens);
     for (std::int32_t T = 1; T <= std::min(max_tokens, detail::kHcMixFusedMaxColumns); ++T) {
+        bytes = std::max(bytes, detail::hc_mix_fused_workspace_bytes(down.n, streams, T));
+    }
+    return bytes;
+}
+
+void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight,
+                          const HcInt8Weights& down, const HcInt8Weights& up, std::int32_t streams,
+                          std::int32_t rank, float eps, Tensor& x, Tensor* inject,
+                          WorkspaceArena& workspace, cudaStream_t stream) {
+    require(contiguous_2d(residual, DType::BF16) && contiguous_2d(x, DType::BF16) &&
+                norm_weight.data != nullptr && norm_weight.dtype == DType::FP32 &&
+                norm_weight.is_contiguous() && streams > 0 && rank > 0,
+            "mix requires contiguous BF16 residual and x and an FP32 norm weight");
+    require(reinterpret_cast<std::uintptr_t>(residual.data) % 16 == 0,
+            "mix residual must be 16-byte aligned");
+    const std::int32_t T = residual.ne[1], hidden = x.ne[0];
+    require(T > 0 && x.ne[1] == T && residual.ne[0] == streams * hidden && hidden % 8 == 0 &&
+                norm_weight.numel() == residual.ne[0] && down.k == residual.ne[0] &&
+                up.n == residual.ne[0] && up.k == rank &&
+                down.n == rank + (inject != nullptr ? streams : 0),
+            "mix shapes disagree");
+    require(int8_weights(down) && int8_weights(up),
+            "mix int8 weights need 16-byte aligned codes and scales and K a multiple of 32");
+    if (inject != nullptr) {
+        require(contiguous_2d(*inject, DType::FP32) && inject->ne[0] == streams &&
+                    inject->ne[1] == T,
+                "mix inject output must be FP32 [S, T]");
+    }
+    require(eps > 0, "mix epsilon must be positive");
+    require(detail::hc_mix_int8_fused_supported(down, up, hidden, streams, rank, T),
+            "the int8 mix serves S = 4, H = 2560, rank a multiple of 32 up to 512 and 1..16 "
+            "columns (wider calls use the BF16 weights)");
+    auto scope                = workspace.scope();
+    const DeviceSpan partials =
+        workspace.alloc_bytes(detail::hc_mix_fused_workspace_bytes(down.n, streams, T));
+    detail::hc_mix_int8_fused(residual, norm_weight, down, up, streams, rank, eps, x, inject,
+                              partials.data, stream);
+}
+
+std::size_t hyper_connection_mix_workspace_capacity_bytes(const HcInt8Weights& down,
+                                                          const HcInt8Weights& up,
+                                                          std::int32_t streams, std::int32_t rank,
+                                                          std::int32_t max_tokens) {
+    require(max_tokens > 0 && max_tokens <= kHcInt8MaxColumns && streams > 0 && rank > 0 &&
+                down.n > 0 && up.n > 0,
+            "int8 mix workspace needs T in [1, 16] and positive streams and rank");
+    std::size_t bytes = 0;
+    for (std::int32_t T = 1; T <= max_tokens; ++T) {
         bytes = std::max(bytes, detail::hc_mix_fused_workspace_bytes(down.n, streams, T));
     }
     return bytes;

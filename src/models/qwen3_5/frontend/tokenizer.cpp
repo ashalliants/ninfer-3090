@@ -1,4 +1,5 @@
 #include "models/qwen3_5/frontend/tokenizer.h"
+#include "ops/common/relaxed_accept.h"
 
 #include "text/unicode.h"
 
@@ -995,6 +996,34 @@ bool Tokenizer::has_exact_token_domain(std::size_t size) const noexcept {
     return valid_token_ids_.size() == size &&
            std::find(valid_token_ids_.begin(), valid_token_ids_.end(), false) ==
                valid_token_ids_.end();
+}
+
+std::vector<int> Tokenizer::added_token_ids() const {
+    std::vector<int> ids;
+    ids.reserve(added_tokens_.size());
+    for (const AddedToken& token : added_tokens_) { ids.push_back(token.id); }
+    return ids;
+}
+
+RelaxedDraftingTokens relaxed_drafting_tokens(const Tokenizer& tokenizer) {
+    const std::vector<int> added = tokenizer.added_token_ids();
+    const std::vector<std::int32_t> ids(added.begin(), added.end());
+    RelaxedDraftingTokens out;
+    out.added_token_floor = ops::added_token_floor(ids);
+    const auto tag        = [&](std::string_view text) {
+        std::vector<int> encoded;
+        try {
+            encoded = tokenizer.encode(text);
+        } catch (const std::exception&) { encoded.clear(); }
+        if (encoded.size() != 1 || encoded.front() < out.added_token_floor) {
+            throw std::invalid_argument("--relaxed-drafting needs " + std::string(text) +
+                                        " to be a single added token of the tokenizer");
+        }
+        return static_cast<std::int32_t>(encoded.front());
+    };
+    out.tool_call_open  = tag("<tool_call>");
+    out.tool_call_close = tag("</tool_call>");
+    return out;
 }
 
 } // namespace ninfer::models::qwen3_5::frontend

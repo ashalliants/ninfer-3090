@@ -11,6 +11,12 @@
 #include <algorithm>
 #include <cstdint>
 
+// ggml's lookup tables in device memory, static to this translation unit (third_party/ggml); the
+// IQ3_S rows read iq3s_grid.
+#define NINFER_GGML_TABLE_BEGIN(type, name, size) static __device__ const type name[size] = {
+#define NINFER_GGML_TABLE_END() };
+#include "ggml-common-tables.h"
+
 namespace ninfer::ops::detail {
 namespace {
 
@@ -170,15 +176,24 @@ __constant__ std::int8_t kIq4nlValues[16] = {-127, -104, -83, -65, -49, -35, -22
 
 // IQ4_XS: {fp16 d; u16 scales_h; u8 scales_l[4]; u8 qs[128]} per 256 values. One thread per output
 // value, in ggml's operation order: dl = d * (ls - 32), then y = dl * kvalue, both FP32.
+// Split: rows below hot_rows come from `hot`, the rest from `table` (embedding_split); otherwise
+// every row comes from `table`.
 constexpr int kIq4XsBlockBytes = 136;
+template <bool Split>
 __global__ void embed_gather_iq4_xs_kernel(const std::int32_t* __restrict__ ids,
                                            const std::uint8_t* __restrict__ table,
+                                           const std::uint8_t* __restrict__ hot, std::int32_t hot_rows,
                                            std::int64_t row_bytes, int d,
                                            __nv_bfloat16* __restrict__ out) {
     const int v = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (v >= d) { return; }
-    const std::uint8_t* block = table + static_cast<std::int64_t>(ids[t]) * row_bytes +
+    const std::int32_t id      = ids[t];
+    const std::uint8_t* plane = table;
+    if constexpr (Split) {
+        if (id < hot_rows) { plane = hot; }
+    }
+    const std::uint8_t* block = plane + static_cast<std::int64_t>(id) * row_bytes +
                                 static_cast<std::int64_t>(v / 256) * kIq4XsBlockBytes;
     const int ib = (v % 256) / 32, j = v % 32;
     const auto d_bits = static_cast<unsigned short>(block[0] | (static_cast<unsigned>(block[1]) << 8));
@@ -190,15 +205,59 @@ __global__ void embed_gather_iq4_xs_kernel(const std::int32_t* __restrict__ ids,
     out[static_cast<std::size_t>(t) * d + v] = __float2bfloat16_rn(dl * static_cast<float>(kIq4nlValues[code]));
 }
 
+// IQ3_S: {fp16 d; u8 qs[64]; u8 qh[8]; u8 signs[32]; u8 scales[4]} per 256 values. One thread per
+// output value, in ggml's operation order: db = d * (1 + 2 nibble), then db * grid byte, both FP32,
+// negated (a sign-bit flip, as the reference build applies its sign factor) where the sign bit is
+// set. Value 32 g + 8 l + j of a block reads grid word qs[8 g + 2 l + j / 4] with bit 8 from qh[g].
+constexpr int kIq3sBlockBytes = 110;
+__global__ void embed_gather_iq3_s_kernel(const std::int32_t* __restrict__ ids, const std::uint8_t* __restrict__ table,
+                                          std::int64_t row_bytes, int d, __nv_bfloat16* __restrict__ out) {
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (v >= d) { return; }
+    const std::uint8_t* block = table + static_cast<std::int64_t>(ids[t]) * row_bytes +
+                                static_cast<std::int64_t>(v / 256) * kIq3sBlockBytes;
+    const int g = (v % 256) / 32, l = (v % 32) / 8, j = v % 8;
+    const auto d_bits = static_cast<unsigned short>(block[0] | (static_cast<unsigned>(block[1]) << 8));
+    const int nibble  = (block[106 + g / 2] >> (4 * (g % 2))) & 0xF;
+    const float db    = __fmul_rn(__half2float(__ushort_as_half(d_bits)), static_cast<float>(1 + 2 * nibble));
+    const int qh      = block[66 + g];
+    const int index   = j < 4 ? block[2 + 8 * g + 2 * l] | ((qh << (8 - 2 * l)) & 256)
+                              : block[3 + 8 * g + 2 * l] | ((qh << (7 - 2 * l)) & 256);
+    const std::uint32_t grid = ggml_tables::iq3s_grid[index];
+    float value              = __fmul_rn(db, static_cast<float>((grid >> (8 * (j % 4))) & 0xFFU));
+    if ((block[74 + 4 * g + l] >> j) & 1) { value = __int_as_float(__float_as_int(value) ^ static_cast<int>(0x80000000U)); }
+    out[static_cast<std::size_t>(t) * d + v] = __float2bfloat16_rn(value);
+}
+
 } // namespace
+
+void embed_gather_ggml_iq3_s_launch(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
+    const int d = out.ne[0];
+    const std::int64_t row_bytes = static_cast<std::int64_t>(d / 256) * kIq3sBlockBytes;
+    embed_gather_iq3_s_kernel<<<dim3((d + 255) / 256, ids.ne[0]), 256, 0, stream>>>(
+        static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(table.qdata), row_bytes, d,
+        static_cast<__nv_bfloat16*>(out.data));
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void embed_gather_ggml_iq4_xs_launch(const Tensor& ids, const Weight& table, Tensor& out,
                                      cudaStream_t stream) {
     const int d = out.ne[0];
     const std::int64_t row_bytes = static_cast<std::int64_t>(d / 256) * kIq4XsBlockBytes;
-    embed_gather_iq4_xs_kernel<<<dim3((d + 255) / 256, ids.ne[0]), 256, 0, stream>>>(
-        static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(table.qdata),
+    embed_gather_iq4_xs_kernel<false><<<dim3((d + 255) / 256, ids.ne[0]), 256, 0, stream>>>(
+        static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(table.qdata), nullptr, 0,
         row_bytes, d, static_cast<__nv_bfloat16*>(out.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void embed_gather_ggml_iq4_xs_split_launch(const Tensor& ids, const Weight& hot, const Weight& cold,
+                                           std::int32_t hot_rows, Tensor& out, cudaStream_t stream) {
+    const int d = out.ne[0];
+    const std::int64_t row_bytes = static_cast<std::int64_t>(d / 256) * kIq4XsBlockBytes;
+    embed_gather_iq4_xs_kernel<true><<<dim3((d + 255) / 256, ids.ne[0]), 256, 0, stream>>>(
+        static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(cold.qdata),
+        static_cast<const std::uint8_t*>(hot.qdata), hot_rows, row_bytes, d, static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

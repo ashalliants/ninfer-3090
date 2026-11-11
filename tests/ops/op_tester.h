@@ -263,7 +263,13 @@ inline int verify_exact(const char* label, const std::vector<T>& got,
         return 1;
     }
     for (std::size_t i = 0; i < got.size(); ++i) {
-        if (!(got[i] == expected[i])) {
+        bool equal = got[i] == expected[i];
+        if constexpr (std::is_floating_point_v<T>) {
+            // NaN != NaN under IEEE 754, but a position both sides leave as a NaN sentinel
+            // (e.g. "never takes part" in test_linear_rows.cpp) is exactly equal, not a mismatch.
+            equal = equal || (std::isnan(got[i]) && std::isnan(expected[i]));
+        }
+        if (!equal) {
             std::cerr << label << ": exact mismatch at index " << i << '\n';
             return 1;
         }

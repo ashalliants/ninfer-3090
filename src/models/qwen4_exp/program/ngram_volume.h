@@ -45,6 +45,11 @@ public:
     // Whether every row is in the host cache, so read_rows would read nothing from the volume.
     [[nodiscard]] bool cached(std::span<const std::uint32_t> rows) const noexcept;
 
+    // Whether any read_rows call so far had to fall back to reading its missing blocks one at a
+    // time (Linux: kernel AIO unavailable; forfeits the in-flight ring's overlap and leaves every
+    // call's full read latency serialized). A caller checks this once, not per call, to warn.
+    [[nodiscard]] bool used_serial_fallback() const noexcept { return file_.serial_fallback_calls() != 0; }
+
     // Keeps the drive awake while the volume is in use: as long as rows were asked for within the
     // last `window`, one 4 KiB block (a different one each time, so the device really reads) is read
     // whenever `period` has passed without a volume read. An idle SSD may enter a power state whose

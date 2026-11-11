@@ -6,6 +6,7 @@
 // registered full-vocabulary stochastic route uses the sampling partial/group
 // pipeline and caller-owned workspace. Sparse acceptance and emission use one warp per request.
 
+#include "ops/common/relaxed_accept.h"
 #include "ops/kernel/sampling_device.cuh"
 
 #include <cuda_bf16.h>
@@ -248,14 +249,28 @@ __global__ __launch_bounds__(256) void speculative_accept_sparse_warp_greedy_ker
                                    licensed_counts, accepted, row, extent, k, physical_rows);
 }
 
+// Relaxed (relaxed drafting) adds the threshold keep to the sampled rule and has lane 0 write
+// relaxed_kept[row]; the false instance ignores relaxed_kept.
+template <bool Relaxed>
 __device__ __forceinline__ void speculative_sparse_warp_accept(
     SamplingWorkspace workspace, const __nv_bfloat16* logits, const int* drafts,
     const int* candidate_ids, const float* proposal_q, const SamplingConfig& cfg, int k, int row,
     int extent, bool greedy, int* lengths, int* anchors, int* licensed_tokens, int* licensed_counts,
-    int* accepted, int physical_rows) {
+    int* accepted, int physical_rows, int* relaxed_kept) {
     const int lane       = threadIdx.x & 31;
     const int old_length = lengths[row];
     bool reject          = false;
+    // Relaxed only: lane i may relax when drafts[0..i] hold no added token (a ballot over the
+    // window, then the lanes up to and including this one), and records whether it did.
+    bool relax_eligible = false;
+    bool relaxed_lane   = false;
+    if constexpr (Relaxed) {
+        const bool special =
+            lane < extent && !relaxed_draft_ordinary(drafts[row * k + lane], cfg.added_token_floor);
+        const unsigned specials = __ballot_sync(0xffffffffU, special);
+        const unsigned through  = (2U << lane) - 1U; // lanes 0..lane (lane 31: every lane)
+        relax_eligible          = (specials & through) == 0U;
+    }
     if (lane < extent) {
         const int d = drafts[row * k + lane];
         if (greedy)
@@ -274,11 +289,20 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
             const float qd = speculative_sparse_probability(candidate_ids + at, proposal_q + at, d);
             const float u  = sampling_uniform(cfg.seed, old_length + lane + 1,
                                               kSamplePurposeSpeculativeAccept, 0);
-            reject         = !(pd >= qd || u * qd < pd);
+            if constexpr (Relaxed) {
+                const bool exact = exact_accept(pd, qd, u);
+                const bool keep  = relaxed_keep(pd, cfg.relaxed_threshold, relax_eligible);
+                reject           = !(exact || keep);
+                relaxed_lane     = !exact && keep;
+            } else {
+                reject = !(pd >= qd || u * qd < pd);
+            }
         }
     }
     const unsigned failures = __ballot_sync(0xffffffffU, reject);
     const int a             = failures ? __ffs(failures) - 1 : extent;
+    unsigned relaxed_lanes  = 0U;
+    if constexpr (Relaxed) { relaxed_lanes = __ballot_sync(0xffffffffU, relaxed_lane); }
     int terminal;
     // Whether the commit is backed by a finite selection. Tracked as a bool, not as the weight
     // itself, because the greedy branch has no weight to carry: its producer writes only
@@ -351,6 +375,13 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
     }
     speculative_sparse_warp_store(drafts, k, row, a, terminal, lengths, anchors, licensed_tokens,
                                   licensed_counts, accepted, terminal_is_finite);
+    if constexpr (Relaxed) {
+        // Only the accepted prefix counts: a <= extent <= 15, so the mask fits.
+        if (lane == 0) {
+            relaxed_kept[row] =
+                terminal_is_finite ? __popc(relaxed_lanes & ((1U << a) - 1U)) : 0;
+        }
+    }
 }
 
 // Commits the round's accepted tokens plus one correction/bonus token, then
@@ -366,12 +397,15 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
 // collapses to `u < p_i(drafts[i])`. Launch with a single block of kSamplerBlock
 // threads; only thread 0 performs the sequential accept/commit while the whole
 // block cooperates on the per-column truncated-distribution build.
+// Relaxed (relaxed drafting, see speculative_round.h) adds the threshold keep to the sampling
+// branch and writes relaxed_kept[row]; the false instance ignores relaxed_kept and is the exact Op.
+template <bool Relaxed>
 __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_drafts_kernel(
     const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
-    std::int32_t k) {
+    std::int32_t k, std::int32_t* relaxed_kept) {
     const int tid                   = threadIdx.x;
     const int row                   = static_cast<int>(blockIdx.x);
     const int cols                  = k + 1;
@@ -395,6 +429,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                 row_drafts, k, row, a, t_star, lengths, anchors, row_tokens, licensed_counts,
                 accepted, &cfg,
                 sampling_selected_logit_is_finite(row_logits, t_star_base, t_star));
+            if constexpr (Relaxed) { relaxed_kept[row] = 0; }
         }
         return;
     }
@@ -481,10 +516,15 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
             speculative_store_accept_result<true>(
                 row_drafts, k, row, a, tstar, lengths, anchors, row_tokens, licensed_counts,
                 accepted, &cfg, span_non_finite_sh == 0);
+            if constexpr (Relaxed) { relaxed_kept[row] = 0; }
         }
         return;
     }
 
+    // Relaxed only, thread 0's: whether the window so far holds no added token, and the drafts the
+    // threshold kept that the exact rule rejected.
+    bool relax_open = cfg.relaxed_threshold > 0.0f;
+    int relaxed     = 0;
     for (int i = 0; i <= extent; ++i) {
         // Column i is only reached when drafts[0..i-1] were all accepted, so the
         // round-local penalty overlay for this column is exactly those i drafts.
@@ -510,7 +550,15 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                 }
                 const float u =
                     sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeSpeculativeAccept, 0u);
-                if (u < pd) {
+                bool keep = u < pd;
+                if constexpr (Relaxed) {
+                    relax_open = relax_open && relaxed_draft_ordinary(d, cfg.added_token_floor);
+                    if (!keep && relaxed_keep(pd, cfg.relaxed_threshold, relax_open)) {
+                        keep = true;
+                        ++relaxed;
+                    }
+                }
+                if (keep) {
                     a_sh = i + 1; // accept drafts[i], keep verifying
                 } else {
                     const float ur = sampling_uniform(cfg.seed, L + i + 1,
@@ -534,9 +582,10 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
         const int a     = a_sh;
         const int tstar = tstar_sh;
         const std::int64_t tstar_base = static_cast<std::int64_t>(a) * physical_rows;
-        speculative_store_accept_result<true>(
-            row_drafts, k, row, a, tstar, lengths, anchors, row_tokens, licensed_counts, accepted,
-            &cfg, sampling_selected_logit_is_finite(row_logits, tstar_base, tstar));
+        const bool finite = sampling_selected_logit_is_finite(row_logits, tstar_base, tstar);
+        speculative_store_accept_result<true>(row_drafts, k, row, a, tstar, lengths, anchors,
+                                              row_tokens, licensed_counts, accepted, &cfg, finite);
+        if constexpr (Relaxed) { relaxed_kept[row] = finite ? relaxed : 0; }
     }
 }
 
@@ -614,7 +663,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     sampling_store_tile_topk(keys, cap, workspace, col, partial, topk_storage.fp32);
 }
 
-template <bool SparseProposal>
+// Relaxed (relaxed drafting, see speculative_round.h) adds the threshold keep to the sampled rule
+// and writes relaxed_kept[row]; the false instances ignore relaxed_kept and are the exact Op.
+template <bool SparseProposal, bool Relaxed>
 __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group_finalize_kernel(
     const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
     const std::int32_t* candidate_ids, const float* proposal_q, const std::int32_t* current_extents,
@@ -622,7 +673,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     std::int32_t* licensed_counts, std::int32_t* accepted, const SamplingConfig* configs,
     std::int32_t token_domain, std::int32_t cols, std::int32_t partial_blocks,
     std::int32_t group_count, std::int32_t physical_rows, SamplingWorkspace workspace,
-    std::size_t workspace_row_stride) {
+    std::size_t workspace_row_stride, std::int32_t* relaxed_kept) {
     const int row   = static_cast<int>(blockIdx.z);
     const int group = static_cast<int>(blockIdx.x);
     const int col   = static_cast<int>(blockIdx.y);
@@ -644,6 +695,9 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                 speculative_sparse_warp_greedy(target_tokens, logits, drafts, lengths, anchors,
                                                licensed_tokens, licensed_counts, accepted, row,
                                                extent, k, physical_rows);
+            if constexpr (Relaxed) {
+                if (tid == 0 && col == 0 && group == 0) { relaxed_kept[row] = 0; }
+            }
         } else {
 
             if (tid == 0 && col == 0 && group == 0) {
@@ -663,6 +717,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                     speculative_commit_span_is_finite(
                         row_logits, a, physical_rows,
                         [&](std::int32_t column) { return row_targets[column]; }));
+                if constexpr (Relaxed) { relaxed_kept[row] = 0; }
             }
         }
         return;
@@ -746,10 +801,10 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
             }
             __syncthreads();
             if (last_column && tid < 32)
-                speculative_sparse_warp_accept(workspace, logits, drafts, candidate_ids, proposal_q,
-                                               cfg, k, row, extent, true, lengths, anchors,
-                                               licensed_tokens, licensed_counts, accepted,
-                                               physical_rows);
+                speculative_sparse_warp_accept<Relaxed>(
+                    workspace, logits, drafts, candidate_ids, proposal_q, cfg, k, row, extent,
+                    true, lengths, anchors, licensed_tokens, licensed_counts, accepted,
+                    physical_rows, relaxed_kept);
             if (last_column && tid == 0) *workspace.speculative_finalize_count = 0;
             return;
         }
@@ -767,9 +822,10 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
         }
         __syncthreads();
         if (last_column && tid < 32)
-            speculative_sparse_warp_accept(workspace, logits, drafts, candidate_ids, proposal_q, cfg,
-                                           k, row, extent, false, lengths, anchors, licensed_tokens,
-                                           licensed_counts, accepted, physical_rows);
+            speculative_sparse_warp_accept<Relaxed>(workspace, logits, drafts, candidate_ids,
+                                                    proposal_q, cfg, k, row, extent, false, lengths,
+                                                    anchors, licensed_tokens, licensed_counts,
+                                                    accepted, physical_rows, relaxed_kept);
         if (last_column && tid == 0) *workspace.speculative_finalize_count = 0;
         return;
     } else {
@@ -814,6 +870,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                                 return workspace.dist_idx[sampling_dist_offset(column, 0)];
                             },
                             &cfg));
+                    if constexpr (Relaxed) { relaxed_kept[row] = 0; }
                     *workspace.speculative_finalize_count = 0;
                 }
             }
@@ -837,6 +894,10 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                 int a            = 0;
                 int tstar        = 0;
                 float tstar_prob = 0.0f;
+                // Relaxed only: whether the window so far holds no added token, and the drafts
+                // the threshold kept that the exact rule rejected.
+                bool relax_open = cfg.relaxed_threshold > 0.0f;
+                int relaxed     = 0;
                 for (int i = 0; i <= extent; ++i) {
                     const int n            = workspace.dist_support[i];
                     const int* dist_idx    = workspace.dist_idx + sampling_dist_offset(i, 0);
@@ -852,7 +913,16 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                         }
                         const float u           = sampling_uniform(cfg.seed, L + i + 1,
                                                                    kSamplePurposeSpeculativeAccept, 0u);
-                        const bool accept_draft = u < pd;
+                        bool accept_draft = u < pd;
+                        if constexpr (Relaxed) {
+                            relax_open =
+                                relax_open && relaxed_draft_ordinary(d, cfg.added_token_floor);
+                            if (!accept_draft &&
+                                relaxed_keep(pd, cfg.relaxed_threshold, relax_open)) {
+                                accept_draft = true;
+                                ++relaxed;
+                            }
+                        }
                         if (accept_draft) {
                             a = i + 1;
                             continue;
@@ -875,9 +945,11 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                 // Spelled `true` rather than `!SparseProposal` because the double negative
                 // reads as if it could disable the counts here, which it cannot.
                 static_assert(!SparseProposal, "dense finalize path only");
-                speculative_store_accept_result<true>(
-                    row_drafts, k, row, a, tstar, lengths, anchors, row_tokens, licensed_counts,
-                    accepted, &cfg, sampling_value_is_finite(tstar_prob));
+                const bool finite = sampling_value_is_finite(tstar_prob);
+                speculative_store_accept_result<true>(row_drafts, k, row, a, tstar, lengths,
+                                                      anchors, row_tokens, licensed_counts,
+                                                      accepted, &cfg, finite);
+                if constexpr (Relaxed) { relaxed_kept[row] = finite ? relaxed : 0; }
                 *workspace.speculative_finalize_count = 0;
             }
         }
