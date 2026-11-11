@@ -20,6 +20,7 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Predict decode and prefill speed from a model's shape, with no GPU (where do the bytes go, what is a what-if worth, which levers rank highest) | [`perf_model.py`](perf_model.py); [guide](../docs/maintainer/perf-model.md) |
 | Find the kernel families running well below the card's bandwidth, from an `nsys` capture | [`kernel_bandwidth.py`](kernel_bandwidth.py), after `scripts/sweeps/decode-step-profile.sh` |
 | Predict Flash-Next decode: expert-cache hit rate, MTP, and whether two lanes beat MTP | [`flash_next_perf_model.py`](flash_next_perf_model.py) |
+| Replay a recorded expert-routing trace through the VRAM expert cache's LFRU policy and a windowed-statistics alternative (hit rate, promotions per token, cold start). No real trace is committed; the file documents how to record one | [`expert_cache_sim.py`](expert_cache_sim.py), test `test_expert_cache_sim.py` |
 | Measure the card's sustained memory bandwidth | [`hbm_bandwidth_probe.cu`](hbm_bandwidth_probe.cu) |
 | One-time upgrade of official v2 artifacts | [`upgrade_ninfer_v2_to_v3.py`](upgrade_ninfer_v2_to_v3.py), with positional `INPUT OUTPUT` paths |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
