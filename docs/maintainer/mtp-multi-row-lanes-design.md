@@ -71,6 +71,37 @@ slicing each row's **W** columns instead of 1, and reusing the single-row *verif
 - `qsa_commit_tails`: single-sequence only, call it twice at commit time (once per row), exactly as
   the forward-pass attention loop above does for the forward side.
 
+## A non-obvious gap found while scoping the implementation (read this before writing `gdn_rows_verify`)
+
+`ops::causal_conv1d_silu_snapshot`'s `initial_state_slots` (read) and `snapshot_base_slots` (write)
+are **both indices into the same `conv_states` tensor's Slots dimension** -- not "a live slot to
+read, write anywhere disjoint." The real per-lane live state pool (`rows_->state.gdn_conv[l]`,
+shape `[C, K, slots]`) has exactly `slots = kMaximumLanes` (or however many lanes the server is
+configured for) -- there is no spare room in it for the non-destructive snapshot's write targets.
+Pointing `causal_conv1d_silu_snapshot` at that tensor directly, the way `gated_delta_net_replay_record`
+safely can at the GDN *recurrence* state (which has no analogous read/write-same-tensor
+constraint, confirmed from its own doc comment: separate `ssm_states` read-only input, separate
+`key_record`/`value_record`/`gate_record` writes), would either throw (if `snapshot_base_slots`
+validation catches an out-of-range index) or, worse, silently alias a *different* lane's real live
+window -- exactly the "silent memory corruption" risk flagged above, now with a concrete mechanism.
+
+The single-row verify path sidesteps this entirely by using a **different** Op,
+`causal_conv1d_silu_split` (the "distinct-state form"), whose `conv_state_in`/`conv_state_out` are
+simply two independent tensors with no shared slot-indexing scheme -- it reads the live state
+directly and writes the advanced (discarded) window to scratch, no staging needed. That path is
+not a template for the batched one; the Ops are different enough that copying its pattern naively
+would be wrong.
+
+The fix is an explicit staging step `gdn_rows_verify` must do and the single-row path never needs:
+copy each active row's live convolution window (`rows_->state.gdn_conv[l].slice(2, slot, 1)`) into
+a **dedicated scratch tensor the new code owns**, sized `[C, K, 2 * lanes]` (not `lanes`) -- the
+first `lanes` slots as `initial_state_slots` targets (the just-copied windows), the next `lanes` as
+`snapshot_base_slots` targets (the op's write destinations) -- and run
+`causal_conv1d_silu_snapshot` entirely within that scratch tensor, never passing
+`rows_->state.gdn_conv` to it directly. The copy itself is cheap (a handful of small
+device-to-device memcpys, same cost class as the single-row path's existing tail/conv scratch
+copies), but it is easy to miss, since nothing in the single-row code suggests it is needed.
+
 ## What's still open (where this document stops, and implementation starts)
 
 1. **New structs** (`forward.h`): `ForwardRowsVerify` (an N-row `ForwardVerify`: `GdnReplayRecords`
@@ -86,18 +117,32 @@ slicing each row's **W** columns instead of 1, and reusing the single-row *verif
    batching + `gated_delta_net_replay_record` + `causal_conv1d_silu_snapshot`, both called once
    with B=N) and `attention_rows_verify` (the per-row W-column loop described above, `for (b = 0;
    b < N; ++b)`).
-3. **Memory planning** (wherever `plan_.spec.*` and `spec_backing_` are sized today): a new region
-   for the N-row verify scratch above, sized by `kMaximumLanes` (not a literal row count) so it
-   already has headroom if that cap rises. This is the part this document could not finish safely:
-   the existing per-lane scratch (`spec_base() + cur_ * stride`-style addressing) is tempting to
-   alias into "lane i = row i" without a new allocation, but doing that without fully confirming
-   the lanes' private regions are laid out with a stride a combined `[.., N]` view can legally
-   assume is a real risk of silent memory aliasing/corruption. The safe path is a **new, dedicated
-   allocation**, planned like any other region in this codebase, not a reinterpret of existing
-   per-lane scratch.
-4. **New graphs** (`program.cpp`'s `Graphs`/`LaneGraphs` structs): graphs indexed by `(N, width)`
-   rather than `width` alone for this new path -- in practice today that's just `N=2`, since
-   `kMaximumLanes` caps it there, but the indexing itself should not assume N=2 specifically.
+3. **Memory planning: extend `SpecLayout::plan()` directly** (`program.cpp` ~line 426). This struct
+   already plans the single-row verify scratch (`out.ple`, `out.qsa_keys`, `out.tails`, `out.conv`,
+   `out.slot`, `out.gdn`/`out.gdn_bytes` via `gdn_records_spec(c, width, ...)` with
+   `record_capacity` hardcoded to `1`); confirmed NOT reusable for the rows case, both because it
+   is sized for exactly one active speculator and because of the conv-snapshot gap above. Add a
+   parallel set of fields (`rows_gdn`/`rows_gdn_bytes` via a second `gdn_records_spec`-style call
+   with `record_capacity = lanes`, `rows_ple`, `rows_qsa_keys`, `rows_tails`, `rows_conv_scratch`
+   sized `[C, K, 2 * lanes]` per the gap above, `rows_initial_slots`), all taken from the *same*
+   `take()` builder already in this function, sized by the `lanes` parameter `plan()` already
+   receives (not a literal row count -- this function is already called with the real lane count,
+   so it is N-general for free). One concrete, encouraging precedent already in this struct: `out.slot
+   = take(4 * lanes)` is **already sized by `lanes`**, even though `verify_view()` today only ever
+   reads word 0 of it -- i.e. this exact region was already over-provisioned for more than one
+   concurrent speculator, just never used that way.
+4. **New graphs: Program-level, not per-lane** (`program.cpp`'s `lane_graphs_`/`LaneGraphs` is the
+   wrong home for these). Resolved by reading `select_lane()` directly: the per-lane `LaneGraphs`
+   exist because the single-row verify scratch's *source* addresses (`tails_base_`, `ple_state_`,
+   `mtp_tail_`) are repointed by `select_lane()` to whichever *one* lane is currently speculating,
+   so a graph capturing them must be captured once per lane. In the batched design, row i maps to
+   lane i for the server's entire lifetime (not round to round), so both rows' source addresses are
+   fixed forever -- exactly the situation the existing plain-rows path is already in, and it
+   correctly uses a **single, Program-level graph pair** (`rows_front_graph_`, `rows_back_graph_`,
+   declared as plain members, not inside `lane_graphs_`). The new verify-rows graphs should follow
+   that precedent: new Program-level members (not per-lane), indexed by `width` alone (the row
+   count is fixed at `kMaximumLanes` within one running server, so there is nothing else to index
+   by at runtime, even though the *code* should not hardcode that number as a literal).
 5. **New program-level functions**: `try_speculate_rows(sequences, budgets, masks)` (the N-row
    sibling of `try_speculate`, taking `sequences.size()` as N rather than assuming 2, gated so it
    only attempts the batched path when *every* active row independently passes `try_speculate`'s
