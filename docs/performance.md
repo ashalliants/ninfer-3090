@@ -92,6 +92,60 @@ are from its own engine and model on an **RTX 5090**, a different, faster card -
 speed depending on threshold and temperature. This session's RTX 3090 numbers above are in that
 same rough direction and range, but the two were never run side by side on the same GPU.
 
+### A Linux AIO bug found and fixed this session, and the tuned profile's absolute numbers (RTX 3090, 2026-11-11)
+
+A second Vast RTX 3090 session (Linux, driver 595.84, 420 W power limit, 64 vCPU, 125 GiB RAM) added
+Flash-Next support to `run.sh` (the Linux launcher had none before) and, while getting real numbers
+for it, found that `src/core/read_only_file_posix.cpp`'s n-gram volume reads created a fresh Linux
+AIO context (`io_setup`) and tore it down (`io_destroy`) on every single read batch. On this box,
+`io_destroy` alone averaged ~479 ms a call (most likely TLB-shootdown IPI latency under whatever this
+box's virtualization does to vCPU scheduling) and summed to 19.6 s of a 21.07 s decode window for one
+150-token request -- `io_setup`/`io_submit`/`io_getevents` together cost about 2.7 s across the same
+window. `fio --ioengine=libaio` against the same file never showed this, because it sets up one
+context for its whole run and never tears it down mid-benchmark.
+
+The fix (`ThreadAioContext` in `read_only_file_posix.cpp`): one Linux AIO context per thread, created
+once and kept for that thread's life, instead of a fresh one per call. Decode on this exact box, same
+model, same profile, went from 4.3-5.3 tok/s (n-gram reads alone costing 16.4-18.6 s of each ~19-21 s
+decode) to the numbers below (n-gram reads down to 0.05-0.09 s). This is Linux-only code -- Windows's
+overlapped I/O has no `io_setup`/`io_destroy` equivalent, so the numbers measured on Windows elsewhere
+in this file were never affected by it.
+
+**`qwen38-flash-next tuned` (the launcher default: every Basalt-learnings win above, MTP speculation,
+INT8 KV), via `run.sh`, HTTP route, warm (model and `.ngram` volume read once, expert cache warmed by
+prior requests), median of 3 reps, 150 generated tokens for decode:**
+
+| Prompt tokens | Prefill tok/s | Decode tok/s |
+|---:|---:|---:|
+| 845 (~1K) | 1,224 | 91.5 |
+| 3,177 (~4K) | 1,477 | -- |
+| 7,075 (~8K) | 1,940 | 91.6 |
+| 33,444 (~32K) | 1,883 | 102.3 |
+| 140,208 (~128K) | 2,069 | -- |
+
+Solo plain (no MTP) decode on the same box, same profile minus speculation, for comparison: ~86-88
+tok/s warm. MTP's own solo benefit here is therefore about 1.2x, in the same direction as (if smaller
+than) the 1.34x-1.42x this fork measured on Windows (see PR 13 in `docs/maintainer/flash-next-plan.md`).
+
+**Two-lane concurrency (`NINFER_CONCURRENCY=2`), same box, same profile, two concurrent equal-length
+requests, 4 reps:** aggregate decode 103-125 tok/s (median ~115) against the solo-MTP baseline above,
+about **1.1x** -- short of the project's own 1.15x gate for this mode (`docs/maintainer/flash-next-plan.md`,
+PR 16), and for a documented reason, not a mystery: `program.cpp`'s `decode()` runs MTP's speculative
+path only when exactly one row is in the round (`sequences.size() > 1` always takes the plain,
+multi-row path; see "MTP and lanes" below). Two synchronized, equal-length requests stay
+batched together for nearly the whole run, so MTP gets almost no single-row window to run in. Isolating
+the two effects on this box: GPU sharing between two *plain* lanes scales to about 1.38x (aggregate
+~120 tok/s against solo-plain's ~87), so the weak 1.1x headline is MTP's ~1.2x solo bonus being lost,
+not the GPU failing to share decode work across lanes.
+
+**MTP and lanes.** This is a known, documented design choice (`flash-next-plan.md` PR 16: "one
+decoding lane runs today's single-row round with MTP"), confirmed in `program.cpp`'s `decode()`:
+a round with more than one active row always takes the plain, non-speculative path --
+`try_speculate` is never called. A proper fix needs a genuinely batched draft-and-verify across
+rows (not just removing that fallback: a naive sequential per-row MTP round would cost roughly
+2 x ~20 ms for ~4.6 tokens against today's ~13.5 ms for 2 tokens -- worse, not better, by this
+session's own profiled per-round costs). That work is tracked separately, not in this branch.
+
 ### v0.16.0 release binaries, all three models (2026-10-14)
 
 Measured on the **published v0.16.0 Windows zip** (`ninfer-serve.exe` and `ninfer_bench.exe` from the
