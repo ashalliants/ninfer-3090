@@ -992,8 +992,21 @@ public:
             } else if (decision.terminal) {
                 disposition = CommitDisposition::Finishable;
             }
-            lane.generated += decision.accepted_tokens;
-            lane.decoding = true;
+            // Like the real Program's commit() (commit.cpp: invalidate_lane()): FailedReleased and
+            // CancelledReleased mean the row's resources are released as part of this call, not by
+            // a later finish(). The Engine takes that disposition at face value and never calls
+            // anything else for this lane, so a fake that left it bound would deadlock the next
+            // request to want it -- which is exactly what an isolated request after a token-domain
+            // fault hit (#443 Vast run, 2026-11-10): start_binding kept finding the lane "bound"
+            // forever, reported a zero shortage because nothing further was requested of the
+            // program, and the Engine's own defensive check then threw.
+            if (disposition == CommitDisposition::FailedReleased ||
+                disposition == CommitDisposition::CancelledReleased) {
+                lane = Lane{};
+            } else {
+                lane.generated += decision.accepted_tokens;
+                lane.decoding = true;
+            }
             result.rows[row].disposition = disposition;
         }
         return result;

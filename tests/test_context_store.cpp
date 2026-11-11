@@ -1310,6 +1310,26 @@ void test_fetch_install_failure_is_a_miss() {
     const fs::path chunks = other_directory.path() / "chunks";
     for (const auto& shard : fs::directory_iterator(chunks)) { fs::remove_all(shard.path()); }
     fs::permissions(chunks, fs::perms::owner_read | fs::perms::owner_exec);
+    // A privileged account (root; also some Windows service accounts) bypasses this permission bit
+    // entirely, so the write below succeeds and the two checks that follow would fail for a reason
+    // that has nothing to do with install_chunk's correctness (confirmed on a root Vast container,
+    // 2026-11-10: strace showed the write go through despite the directory being read-only).
+    // Confirm enforcement actually holds here before relying on it, and skip rather than
+    // misreport either way if it does not.
+    std::error_code probe_error;
+    std::ofstream probe(chunks / "permission-probe.tmp", std::ios::binary);
+    const bool probe_wrote = probe.is_open() && (probe << 'x') && probe.flush() && probe.good();
+    probe.close();
+    fs::remove(chunks / "permission-probe.tmp", probe_error);
+    if (probe_wrote) {
+        std::cerr << "SKIP a chunk that could not be installed was served: this account's writes are "
+                     "not blocked by removing the directory's write permission (root or similar)\n";
+        std::cerr << "SKIP the install failure was not counted as one: same reason\n";
+        fs::permissions(chunks, fs::perms::owner_all);
+        const auto loaded_anyway = other.load("0a");
+        check(loaded_anyway && *loaded_anyway == image, "the load did not succeed with writes restored");
+        return;
+    }
     check(!other.load("0a").has_value(), "a chunk that could not be installed was served");
     check(other.stats().remote_download_failures >= 1 &&
               other.stats().remote_download_failures_install == other.stats().remote_download_failures,
