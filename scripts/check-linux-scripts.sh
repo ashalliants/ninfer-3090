@@ -137,11 +137,11 @@ expand() { python3 -I "$tmp/expand.py" "$@"; }
 
 # Every profile file keeps the layout both launchers read their banner values from: one
 # "key": value pair per line, exactly as json.dumps(..., indent=2) writes it, with scalar values
-# that are not empty and hold no space, comma, colon or quote. Integers stay integers: the server
-# reads 1024.0 as 1024, but the banner would show "1024.0".
+# that are not empty and hold no space, comma, colon or quote. Decimal fractions (0.4) are fine;
+# whole numbers stay integers: the server reads 1024.0 as 1024, but the banner would show "1024.0".
 for profile in "$root"/profiles/*.json; do
   python3 -I - "$profile" <<'LAYOUT' || exit 1
-import json, sys
+import json, math, sys
 path = sys.argv[1]
 text = open(path, encoding='utf-8').read()
 profile = json.loads(text)
@@ -149,8 +149,13 @@ problems = []
 if text != json.dumps(profile, indent=2) + '\n':
     problems.append('not laid out as json.dumps(..., indent=2) writes it, one pair per line')
 for key, value in profile.items():
-    if isinstance(value, (list, dict)) or value is None or isinstance(value, float):
-        problems.append(f'"{key}" is not a string, an integer or true')
+    if isinstance(value, float) and (not math.isfinite(value) or value == int(value)):
+        # A decimal fraction (prefill-cpu-share 0.4) is fine; 1024.0 or NaN is not.
+        problems.append(f'"{key}" is a float that is not a finite fraction: write whole numbers as integers')
+    elif isinstance(value, float):
+        pass
+    elif isinstance(value, (list, dict)) or value is None:
+        problems.append(f'"{key}" is not a string, a number or true')
     elif value is False:
         problems.append(f'"{key}" is false: leave the key out instead')
     elif isinstance(value, str) and any(c in value for c in ' ,:"'):
