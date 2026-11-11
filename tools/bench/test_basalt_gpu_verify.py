@@ -123,7 +123,7 @@ def make_ctx(out, **inputs):
              "iq3_pack")
     values = {k: inputs.get(k) for k in names}
     return v.make_ctx(v.argparse.Namespace(platform="windows", build_dir=out, out=out, reps=12, resume=False,
-                                           options=str(v.OPTIONS_FILE), **values))
+                                           shared_baseline=False, options=str(v.OPTIONS_FILE), **values))
 
 
 # Step ids, lock modes and the per-prompt greedy steps.
