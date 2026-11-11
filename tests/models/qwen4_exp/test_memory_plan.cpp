@@ -154,6 +154,30 @@ void test_lock_limit_advisory() {
     require(!refused.fits, "the same limit without the flag still refuses (no regression)");
 }
 
+// An extreme shortfall (a measured Vast container: 64 KiB of memory-lock limit against a ~33 GiB
+// pin, confirmed on 2026-11-11 to collapse decode speed) gets a sharper, explicit performance
+// warning beyond the plain "continuing anyway" -- a milder one (the existing advisory test's 8 GiB
+// against the same ~33 GiB, well above 1% of it) does not.
+void test_lock_limit_advisory_severe() {
+    const HostMemoryDemand d = flash_next();
+    const std::uint64_t need = need_for_full(d);
+    HostMemorySnapshot s     = snapshot(need + 10 * kGiB, need + 10 * kGiB);
+    HostMemoryDemand advisory = d;
+    advisory.lock_limit_advisory = true;
+
+    s.lock_limit                  = 64ULL << 10; // 64 KiB, the measured Vast container's own limit
+    const HostMemoryLedger severe = plan_host_memory(s, advisory);
+    require(severe.fits && severe.lock_limited, "a severe advisory shortfall still fits and still reports it");
+    require(severe.summary().find("extreme") != std::string::npos,
+            "a shortfall under 1% of the pin gets the explicit performance warning");
+
+    s.lock_limit               = 8 * kGiB;
+    const HostMemoryLedger mild = plan_host_memory(s, advisory);
+    require(mild.fits && mild.lock_limited, "a mild advisory shortfall still fits and still reports it");
+    require(mild.summary().find("extreme") == std::string::npos,
+            "a shortfall well above 1% of the pin does not get the extreme warning");
+}
+
 void test_starved_and_describe() {
     const HostMemoryDemand d     = flash_next();
     const HostMemoryLedger empty = plan_host_memory(snapshot(kGiB, kGiB), d);
@@ -621,6 +645,7 @@ int main() {
         test_commit_limit();
         test_lock_limit();
         test_lock_limit_advisory();
+        test_lock_limit_advisory_severe();
         test_starved_and_describe();
         test_graph_bound();
         test_display_headroom();

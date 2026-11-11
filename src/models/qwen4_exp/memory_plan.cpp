@@ -241,7 +241,7 @@ std::string HostMemoryLedger::describe() const {
 }
 
 std::string HostMemoryLedger::summary() const {
-    char line[512];
+    char line[960]; // the extreme-shortfall warning below is longer than the other branches
     if (lock_limited && !demand.lock_limit_advisory) {
         std::snprintf(line, sizeof(line),
                       "RAM: the memory-lock limit is %.1f GiB but Qwen3.8-Flash-Next pins %.1f GiB of experts and "
@@ -254,11 +254,24 @@ std::string HostMemoryLedger::summary() const {
         // skips the memory-lock refusal specifically; a ledger that still does not fit for an
         // unrelated reason (reserve, commit, the experts' own need) falls through to the branch
         // below, which names that real reason instead of this one.
+        //
+        // A limit this far under what is pinned (under 1% of it; a measured 64 KiB limit against a
+        // 33 GiB pin, ~500,000x, is the case this was written for) is not just "pin and hope": a
+        // 2026-11-11 RTX 3090 session measured decode collapsing to a small fraction of its normal
+        // speed under exactly this gap (kernel-side syscall and memory-accounting overhead, not the
+        // GPU or the disk -- both measured independently fast). A milder shortfall (the limit some
+        // way under the pin, not orders of magnitude) has not shown this; only the extreme case has.
+        const bool severe = *snapshot.lock_limit < pinned_total / 100;
         std::snprintf(line, sizeof(line),
                       "RAM: the memory-lock limit is %.1f GiB, below the %.1f GiB Qwen3.8-Flash-Next pins. "
                       "Continuing anyway (--allow-unlocked-host-memory): a pin that genuinely cannot be made "
-                      "will still fail loudly when it is made, not silently",
-                      gib(*snapshot.lock_limit), gib(pinned_total));
+                      "will still fail loudly when it is made, not silently.%s",
+                      gib(*snapshot.lock_limit), gib(pinned_total),
+                      severe ? " WARNING: this shortfall is extreme (under 1% of what is needed) -- a measured "
+                               "session saw decode collapse to a fraction of normal speed under exactly this gap. "
+                               "This is very likely to be unusably slow; fix the host's memory-lock limit (or move "
+                               "to one that has a sane limit) rather than rely on this flag here."
+                             : "");
     } else if (fits) {
         std::snprintf(line, sizeof(line), "RAM: %.1f of %.1f GiB free; every expert fits in RAM (%.1f GiB pinned)",
                       gib(snapshot.available_physical), gib(snapshot.total_physical),
