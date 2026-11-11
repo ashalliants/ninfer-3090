@@ -198,7 +198,7 @@ def capture_torch(work: Path, tokens_per_domain: int) -> None:
                 ("down_in", block.mlp.down_proj),
             ):
                 def hook(_module, args, key=key):
-                    store[(layer, key)] = args[0].reshape(-1, args[0].shape[-1]).half().numpy()
+                    store[(layer, key)] = args[0].reshape(-1, args[0].shape[-1]).float().numpy()
 
                 handles.append(module.register_forward_pre_hook(hook))
         hidden = block(
@@ -232,7 +232,7 @@ def capture(work: Path, tokens_per_domain: int) -> None:
         class Hooked(type(module)):
             def __call__(self, x, *args, **kwargs):
                 flat = np.array(x.astype(mx.float32)).reshape(-1, x.shape[-1])
-                store.setdefault(key, []).append(flat.astype(np.float16))
+                store.setdefault(key, []).append(flat  # FP32: FP16 would clip outliers above 65504)
                 return call(x, *args, **kwargs)
 
         module.__class__ = Hooked
