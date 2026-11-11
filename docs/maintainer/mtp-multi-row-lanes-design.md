@@ -14,6 +14,24 @@ picks it up, including a future session) does not have to re-derive the kernel s
 is the single most valuable and time-consuming part of this investigation: establishing that the
 feature needs **no new CUDA kernels**, only new host-side orchestration.
 
+**Scoped to N rows, not 2.** `kMaximumLanes = 2` is today's hard cap on Flash-Next concurrency, set
+independently in `qwen4_exp_instance.cpp`'s refusal ("three or more lanes lose to two on one RTX
+3090") and the `std::array<T, kMaximumLanes>` sizing throughout `program.cpp`/`program.h`. That cap
+is a *separate* piece of work (raising it is its own decision, re-measuring whether more lanes
+still wins on one card) from *this* feature, which is "however many lanes are active, MTP should
+speculate on all of them instead of falling back to plain the moment there is more than one." The
+new structs and functions below should take the active row count as a runtime size (a `std::span`
+or count, the same way `ForwardRowsBatch::slots` already does for the plain path, which already
+scales to `kMaxForwardRows = 8`), not a literal `2`, so that raising `kMaximumLanes` later needs no
+changes here -- only to the places that gate concurrency. The real ceiling on N is not
+`kMaximumLanes` but the dense Ops' column-invariance bound: `N * W <= kMaxForwardRows (8)`, where W
+is the draft-plus-anchor width (`plan_.drafts + 1`). At W=4 (3 drafts) that's N<=2 today; a smaller
+W (fewer drafts) admits a larger N before this bound bites. GDN's own kernels are more generous
+(`gated_delta_net_replay_record`/`causal_conv1d_silu_snapshot` independently support B up to 8), so
+they are never the limiting factor; attention's per-row loop (below) is O(N) in cost but not capped
+by any kernel limit at all. Worked numbers below use N=2 because that's what's measurable on this
+engine today, not because the design assumes it.
+
 ## The kernel survey (why no new CUDA math is needed)
 
 Every low-level primitive a batched 2-row x W-column MTP verification needs already exists,
@@ -55,39 +73,43 @@ slicing each row's **W** columns instead of 1, and reusing the single-row *verif
 
 ## What's still open (where this document stops, and implementation starts)
 
-1. **New structs** (`forward.h`): `ForwardRowsVerify` (a 2-row `ForwardVerify`: `GdnReplayRecords`
-   with `record_capacity=2`, `qsa_keys`/`qsa_tails` scratch doubled, `conv_scratch` doubled,
-   `initial_slots: I32[2]` holding the two lanes' real slot indices) and `ForwardRowsVerifyBatch`
-   (a 2-row, W-column-per-row version of `ForwardRowsBatch`: `ids`/`positions`/`rope_positions`/
-   `ngram_rows` etc. sized `[2*W]` instead of `[B]`, row-major with each row's W columns
-   contiguous).
+1. **New structs** (`forward.h`): `ForwardRowsVerify` (an N-row `ForwardVerify`: `GdnReplayRecords`
+   with `record_capacity` planned for `kMaximumLanes` (today 2, so this grows for free if that cap
+   rises later), `qsa_keys`/`qsa_tails` scratch and `conv_scratch` sized per lane,
+   `initial_slots: I32[N]` holding the active lanes' real slot indices) and
+   `ForwardRowsVerifyBatch` (an N-row, W-column-per-row version of `ForwardRowsBatch`:
+   `ids`/`positions`/`rope_positions`/`ngram_rows` etc. sized `[N*W]` instead of `[B]`, row-major
+   with each row's W columns contiguous, `slots`/`slot_ids` dynamically sized like
+   `ForwardRowsBatch::slots` already is).
 2. **New Forward methods** (`forward.cpp`): `run_rows_verify_front/back`, a new
    `layer_rows_verify(layer, batch)` parallel to `layer_rows`, with `gdn_rows_verify` (dense
    batching + `gated_delta_net_replay_record` + `causal_conv1d_silu_snapshot`, both called once
-   with B=2) and `attention_rows_verify` (the per-row W-column loop described above).
+   with B=N) and `attention_rows_verify` (the per-row W-column loop described above, `for (b = 0;
+   b < N; ++b)`).
 3. **Memory planning** (wherever `plan_.spec.*` and `spec_backing_` are sized today): a new region
-   for the 2-row verify scratch above. This is the part this document could not finish safely:
+   for the N-row verify scratch above, sized by `kMaximumLanes` (not a literal row count) so it
+   already has headroom if that cap rises. This is the part this document could not finish safely:
    the existing per-lane scratch (`spec_base() + cur_ * stride`-style addressing) is tempting to
-   alias into "lane 0 = row 0, lane 1 = row 1" without a new allocation, but doing that without
-   fully confirming the two lanes' private regions are laid out with a stride a combined `[.., 2]`
-   view can legally assume is a real risk of silent memory aliasing/corruption. The safe path is a
-   **new, dedicated allocation**, planned like any other region in this codebase, not a reinterpret
-   of existing per-lane scratch.
-4. **New graphs** (`program.cpp`'s `Graphs`/`LaneGraphs` structs): one new graph set for "2 rows,
-   width W" (W is small and fixed by `plan_.drafts + 1`, so this is one new graph pair, not a
-   combinatorial explosion -- `kMaximumLanes` is hard-capped at 2 throughout this codebase already,
-   so there is no general-N-row case to design for).
+   alias into "lane i = row i" without a new allocation, but doing that without fully confirming
+   the lanes' private regions are laid out with a stride a combined `[.., N]` view can legally
+   assume is a real risk of silent memory aliasing/corruption. The safe path is a **new, dedicated
+   allocation**, planned like any other region in this codebase, not a reinterpret of existing
+   per-lane scratch.
+4. **New graphs** (`program.cpp`'s `Graphs`/`LaneGraphs` structs): graphs indexed by `(N, width)`
+   rather than `width` alone for this new path -- in practice today that's just `N=2`, since
+   `kMaximumLanes` caps it there, but the indexing itself should not assume N=2 specifically.
 5. **New program-level functions**: `try_speculate_rows(sequences, budgets, masks)` (the N-row
-   sibling of `try_speculate`, gated so it only attempts the batched path when *every* active row
-   independently passes `try_speculate`'s existing eligibility checks -- budget, not constrained
-   without `--mtp-constrained`, not CPU-verify-failed -- falling back to today's plain
-   `decode_rows()` entirely, for all rows, otherwise, which is simple and conservative); a
-   `verify_rows()` building the combined batch, running the new Forward calls once, then calling
-   the unchanged single-row accept Op twice (once per row's W-column logits slice) and combining
-   the two results into one `PendingBatch` using its already-existing multi-row fields; a
-   `commit_speculative_rows()` (the N-row sibling of `commit_verified()`, using
-   `GdnReplayFoldPlan::execute()` with two `GdnReplayFoldRow` entries and calling
-   `qsa_commit_tails` twice).
+   sibling of `try_speculate`, taking `sequences.size()` as N rather than assuming 2, gated so it
+   only attempts the batched path when *every* active row independently passes `try_speculate`'s
+   existing eligibility checks -- budget, not constrained without `--mtp-constrained`, not
+   CPU-verify-failed -- falling back to today's plain `decode_rows()` entirely, for all rows,
+   otherwise, which is simple and conservative); a `verify_rows()` building the combined batch,
+   running the new Forward calls once, then calling the unchanged single-row accept Op N times
+   (once per row's W-column logits slice) and combining the N results into one `PendingBatch`
+   using its already-existing multi-row fields (themselves sized by `kMaximumLanes`, so already
+   N-general); a `commit_speculative_rows()` (the N-row sibling of `commit_verified()`, using
+   `GdnReplayFoldPlan::execute()` with N `GdnReplayFoldRow` entries and calling `qsa_commit_tails`
+   N times).
 6. **`decode()`'s dispatch**: replace the unconditional `if (sequences.size() > 1) return
    decode_rows(...)` with "try `try_speculate_rows`, fall back to `decode_rows` if it declines."
 7. **Testing**: a new exactness test mirroring the project's own convention
