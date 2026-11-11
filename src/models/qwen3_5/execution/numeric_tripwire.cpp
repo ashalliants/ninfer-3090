@@ -37,8 +37,8 @@ std::optional<ops::NumericTripwireFinding> NumericTripwire::collect() noexcept {
 }
 
 void NumericTripwire::clear(cudaStream_t stream) {
-    CUDA_CHECK(cudaMemsetAsync(device_.p, 0, ops::kNumericTripwireRecordBytes, stream));
     std::memset(host_.data(), 0, ops::kNumericTripwireRecordBytes);
+    CUDA_CHECK(cudaMemsetAsync(device_.p, 0, ops::kNumericTripwireRecordBytes, stream));
 }
 
 } // namespace ninfer::models::qwen3_5::execution

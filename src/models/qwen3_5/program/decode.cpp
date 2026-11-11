@@ -93,6 +93,14 @@ namespace ninfer::models::qwen3_5::detail {
 
 namespace {} // namespace
 
+void ProgramImpl::discard_numeric_tripwire() noexcept {
+    if (!tripwire) { return; }
+    try {
+        tripwire->clear(device.stream);
+        device.synchronize();
+    } catch (...) {}
+}
+
 void ProgramImpl::report_numeric_tripwire() noexcept {
     if (!tripwire) { return; }
     try {
@@ -423,6 +431,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         } catch (...) {}
+        discard_numeric_tripwire();
         timing.end_wait();
         clear_execution_failure_lanes(lanes);
         throw;
@@ -623,6 +632,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         } catch (...) {}
+        discard_numeric_tripwire();
         timing.end_wait();
         clear_execution_failure_lanes(lanes);
         throw;
@@ -965,6 +975,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         } catch (...) {}
+        discard_numeric_tripwire();
         timing.end_wait();
         clear_execution_failure_lanes(lanes);
         throw;
