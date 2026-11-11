@@ -575,6 +575,12 @@ struct FlashNextOptions {
     // whole, from each draft's probability, stays above a per-request adaptive threshold. Off: the
     // acceptance-estimate policy picks the count before drafting.
     bool mtp_joint_acceptance = false;
+    // Batches a genuine draft-and-verify across every eligible row when two or more lanes decode
+    // together (--mtp-rows-verify; needs --mtp-joint-acceptance), instead of always falling back to
+    // a plain round. Off by default: a known bug (docs/maintainer/mtp-multi-row-lanes-design.md)
+    // currently leaves one row's acceptance near zero once two rows speculate together, making
+    // 2-lane aggregate decode slower than the plain-round fallback; correctness is unaffected.
+    bool mtp_rows_verify = false;
     // Read the anchor column's n-gram rows into the volume's host cache while the draft graph runs
     // (--ngram-prefetch; needs --spec mtp), so verification's row read finds them cached. The rows
     // and the output are unchanged; only when the host reads them moves. Off: verification reads

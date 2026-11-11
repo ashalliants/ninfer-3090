@@ -422,6 +422,16 @@ struct ProgramOptions {
     // JointAcceptanceThreshold. It replaces the acceptance-estimate policy; with mtp_fixed_drafts
     // it is refused. Off: the drafter graphs, the drafts and the window are as before.
     bool mtp_joint_acceptance = false;
+    // FlashNextOptions::mtp_rows_verify: a round with more than one eligible row speculates
+    // genuinely in a single batched draft-and-verify (docs/maintainer/mtp-multi-row-lanes-design.md)
+    // instead of always falling back to a plain round. Requires mtp_joint_acceptance. Off by
+    // default: a reproducible bug (tracked in that doc) leaves one row's acceptance near zero every
+    // round once two rows speculate together, which currently makes 2-lane aggregate decode slower
+    // than the plain-round fallback it would replace -- correctness is unaffected (every draft is
+    // independently verified regardless), only that row's speed. Keep off in production profiles
+    // until the asymmetry is root-caused; this flag exists so the implementation and its own
+    // exactness tests can still exercise it deliberately.
+    bool mtp_rows_verify = false;
     // EngineOptions::relaxed_drafting is set: a sampled verification whose request has a threshold
     // runs the relaxed acceptance instance (relaxed drafting; changes the output distribution).
     // Off: every verification runs the exact instance, as before.

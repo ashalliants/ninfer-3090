@@ -147,6 +147,100 @@ exercises any of it yet; it is all reachable-but-uncalled code until the pieces 
    first round in the single-row case too). Graph capture for this path is a clean, separable
    follow-up once correctness is established, not a blocker for a first working version.
 
+## Finished, built, and tested -- but shipped off by default (2026-11-11, same session)
+
+Items 1-5 above landed: `try_speculate_rows`/`verify_rows`/`commit_speculative_rows`, the IO staging
+function, and `decode()`'s dispatch (try the batched path, fall back to `decode_rows()` if it
+declines). `ninfer_qwen4_exp_lanes_real_test --exact --mtp 3 --generate 96 --cache --max-context
+16384` passes bitwise-identical against the single-lane reference with this path genuinely
+exercised (the test now forces `mtp_joint_acceptance`/`mtp_rows_verify` on itself -- without both,
+a round with more than one row never reaches `try_speculate_rows` at all, so the test would prove
+nothing about this code; this was initially missed and the test silently validated only the plain
+fallback for several iterations of this session).
+
+Seven real bugs surfaced getting there, six found and fixed, the seventh found but not yet
+root-caused. All but the last were found by firing two real HTTP requests at a running server at
+the same moment (`scripts/run.sh ... NINFER_CONCURRENCY=2`, then two `curl`s backgrounded in one
+shell line) -- the standalone test's "pairs" can stagger two lanes across separate rounds without
+forcing them simultaneous, so it reliably missed every one of these:
+
+1. **Joint-acceptance trim applied before staging, not just at accept.** `verify_rows()` was
+   trimming each row's drafted tokens to the joint-acceptance window's `kept` count *before*
+   staging them into the round, but staging needs every row's *full* drafted width (`W = limit + 1`
+   uniformly) to build one shared batch -- a `kept < limit` row read past its own history.
+   Fix: stage the full draft, apply the trim only at accept time as a narrower span.
+2. **`ple_inputs` passed 3D to a function needing flat 2D.** `ple_gate`/`ple_conv_inject` want
+   `[C, T]` (T = B x W); the per-row commit fold wants `[C, W, B]`. Fix: a `.view()` at the forward
+   call site, not a new buffer.
+3. **A non-contiguous `rope_positions` slice for QSA's per-row calls.** `batch.rope_positions` is
+   axis-major (`[T, 3]`, 3 planes of T words); slicing the fast axis to a `W`-wide sub-range is not
+   itself a contiguous `[W, 3]` tensor (qsa's Ops require one). Fix: gather it into a small per-row
+   scratch tensor first (`attention_rows_verify`); `mtp_catch_up_row_rows` below sidesteps the same
+   hazard differently, by *restaging* its own RoPE words from the lane's `LaneRope` instead of
+   slicing the round's, matching how the single-row `commit_verified` already does it.
+4. **The accept step used the round's shared ceiling, not the row's own trimmed count.**
+   `speculative_accept_greedy_drafts` requires `target`/`logits` sized exactly `[K + 1, *]` for
+   *this* row's own `K`; a full-`W`-wide slice mismatched whenever a row's own count was smaller.
+5. **Missing `decode_ns` accumulation** (stats-only): `verify_rows()` never added to
+   `lane.decode_ns`, so a concurrent request reported an impossible decode rate. Not a correctness
+   bug, but it hid real throughput numbers during measurement.
+6. **No drafter catch-up after a rows-verify commit -- severe, not low-cost as scoped.** The first
+   version of `commit_speculative_rows()` deliberately skipped catching the drafter up (reasoning:
+   "a stale drafter only costs future acceptance, never correctness"). True in principle -- the
+   exactness test still passed -- but the *magnitude* was far worse than guessed: acceptance fell
+   to single digits almost immediately, because nothing ever re-synced `L().mtp_cells`/
+   `saved_residual()` to the real committed history, and the single-cell `mtp_write_pending()`
+   (built for being exactly one token behind) silently did the wrong thing when several rounds
+   behind instead of catching up properly. Fixed with `mtp_catch_up_row_rows(b, S, k, W)`, the
+   per-row generalization of the single-row `mtp_catch_up(S, k)`: it reads row `b`'s residuals from
+   the round's own `rows_residuals` export (a new `SpecLayout` field, `rows_verify_batch` wiring
+   `residual_out` into it) rather than the single-row `residuals` region, and restages its own RoPE
+   words for the same contiguity reason as bug 3. A second, genuine race surfaced inside this fix
+   itself: unlike `mtp_catch_up_row`'s single cell (one word at a *unique* per-row offset, so two
+   rows' host writes never overlap), the multi-cell version reuses one shared scratch window
+   (`w_mtp_ids`, `io.rope`) at a fixed offset for every row. `upload_pinned` is a GPU kernel that
+   reads that pinned host memory asynchronously (not a blocking `cudaMemcpyAsync`), so without an
+   explicit `device_.synchronize()` between rows, the second row's host writes could race ahead of
+   the first row's kernel actually reading them -- caught the same way, by the HTTP concurrent test
+   showing one of two simultaneous lanes' acceptance corrupted while the other (served first) was
+   fine. Fixed by synchronizing at the end of `mtp_catch_up_row_rows`, once per row per round.
+7. **Open: once two rows genuinely speculate together, one row's acceptance stays near zero,
+   every round, from the very first round on -- confirmed not caused by bug 6's fix.** Diagnosed
+   with temporary instrumentation (not kept) tracing drafts, the main model's own greedy target,
+   and the accept outcome per row per round: the *drafter's own* proposals for the affected row
+   look healthy early on (high self-reported confidence, matching baseline), but the round's
+   accept step only ever licenses 1 token for that row, repeatedly, which then starves that row's
+   `joint_threshold` of real observations (`L().joint_offered` only updates when `kept > 0`) and
+   the acceptance window it offers next round collapses too -- self-reinforcing, but the root cause
+   is upstream of the threshold, in whichever row consistently loses. It is *not* which physical
+   lane: re-running with no prior single-lane warm-up on either request still reproduces it, and
+   the row that loses is whichever one lands at a nonzero `b` in `verify_rows`'s own per-row loop,
+   not a property of the request's content (ruled out: identical asymmetry across different prompt
+   pairs, different physical lanes, with and without warm-up). Every addressing expression that
+   scales with `b` (`rows_residuals`/`io.positions`/`io.rows_block` offsets) was re-derived and
+   checked against the project's own "anchor" convention (`state_tokens` is the anchor's index;
+   `history.size() == state_tokens + 1` is the invariant `decode()` itself asserts) and matches the
+   single-row convention exactly -- so this is likely in the rows-batched *forward* (bugs 2/3's own
+   area: PLE flattening or the QSA RoPE gather) rather than in catch-up, in a way that skews a
+   nonzero row's verify logits without (so far) flipping the final *committed* token away from what
+   a single lane would have produced -- which is why it never showed up as an exactness failure.
+   **Correctness is unaffected** (every draft is independently verified against the real model
+   regardless of how it was proposed, and the exactness test keeps passing); the cost is entirely
+   in that row's speed. Measured end-to-end (production `tuned` profile's HTTP route, 4 paired
+   ~3.6-4.1k-token-prompt reps, 150-token completions, `--mtp-rows-verify` forced on for the
+   measurement): aggregate 2-lane decode of 52-62 tok/s per pair -- *worse* than the existing
+   plain-round fallback it would replace (~115-127 tok/s aggregate on the same box, same reps, flag
+   off). **Decision: ship the implementation, but gate it behind a new flag,
+   `--mtp-rows-verify` (`ProgramOptions::mtp_rows_verify`/`FlashNextOptions::mtp_rows_verify`,
+   needs `--mtp-joint-acceptance`), default **off**, not enabled in any shipped profile.** With the
+   flag off (today's behavior, unchanged), `try_speculate_rows` declines immediately and every
+   multi-row round takes the proven plain fallback -- solo and 2-lane-plain numbers in
+   `docs/performance.md` are unaffected by this branch. The flag exists so the already-landed
+   implementation and its own exactness coverage stay exercised and reviewable, and so a follow-up
+   session has a known, isolated place to pick this up (tracing the per-row forward call's own
+   logits against a single-row reference for the losing row specifically, column by column, is the
+   next step -- not yet done here) without re-deriving any of the above.
+
 ## What's still open (where this document stops, and implementation starts)
 
 Items equivalent to the original 1-4 here are now **done** -- see "Implementation progress" above

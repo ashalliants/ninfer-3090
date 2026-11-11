@@ -189,6 +189,11 @@ void validate(const EngineOptions& options) {
         refuse("--mtp-joint-acceptance chooses how many MTP drafts each round verifies and --mtp-fixed "
                "(mtp_fixed_drafts) always verifies --draft-tokens: use one of them");
     }
+    if (next.mtp_rows_verify && !next.mtp_joint_acceptance) {
+        refuse("--mtp-rows-verify batches draft-and-verify across lanes under the same joint-acceptance "
+               "window and needs --mtp-joint-acceptance: add --mtp-joint-acceptance or remove "
+               "--mtp-rows-verify");
+    }
     if (next.moe_gate_up_registers && !next.moe_precast_input) {
         refuse("--moe-gate-up-registers reads the input that --moe-precast-input casts once per call and needs it: "
                "add --moe-precast-input or remove --moe-gate-up-registers");
@@ -331,6 +336,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.mtp_fixed_drafts = next.mtp_fixed_drafts;
     program_options.mtp_constrained  = next.mtp_constrained;
     program_options.mtp_joint_acceptance = next.mtp_joint_acceptance;
+    program_options.mtp_rows_verify      = next.mtp_rows_verify;
     program_options.relaxed_drafting     = options.relaxed_drafting.has_value();
     program_options.ngram_prefetch       = next.ngram_prefetch;
     program_options.vision           = vision;

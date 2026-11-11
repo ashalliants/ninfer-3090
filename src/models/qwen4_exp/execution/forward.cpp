@@ -1253,10 +1253,15 @@ void Forward::layer_rows_verify(std::uint32_t layer, const ForwardRowsVerifyBatc
     const auto& block    = parameters_.layers[layer];
     auto scope           = work_->scope();
     if (block.ple) {
-        // The round's inputs are recorded for the commit fold (per row); the live PLE history is
-        // read but left unchanged (an empty destination), as the single-row verify path does.
-        ple_inject(*block.ple, residual_, batch.ngram_rows, /*columnwise=*/true, &batch.verify->ple_inputs,
-                  rows_->state.ple_conv, batch.slot_ids, Tensor{});
+        // The round's inputs are recorded for the commit fold (per row, [C, W, B] -- matching what
+        // ple_conv_commit wants later); the forward call here needs the same storage flattened to
+        // [C, T], since ple_gate/ple_conv_inject process every row's columns in one dense call. The
+        // live PLE history is read but left unchanged (an empty destination), as the single-row
+        // verify path does; source_slots is correctly one entry per row (ple_conv_inject takes
+        // I32[sequences], not one per column).
+        Tensor flat = batch.verify->ple_inputs.view({batch.verify->ple_inputs.ne[0], T});
+        ple_inject(*block.ple, residual_, batch.ngram_rows, /*columnwise=*/true, &flat, rows_->state.ple_conv,
+                  batch.slot_ids, Tensor{});
     }
     Tensor inject = work_->alloc(DType::FP32, {dim(config_.hc.streams), T});
     Tensor xa     = mix(block.attn_hc, residual_, &inject);
@@ -1389,7 +1394,15 @@ Tensor Forward::attention_rows_verify(const AttentionParameters& p, const Tensor
         const PagedKVLayerView& cache  = kv.layers.at(index);
         Tensor pooled          = kv.pooled.at(index);
         Tensor position        = batch.positions.slice(0, row * W, W);
-        Tensor rope             = batch.rope_positions.slice(0, row * W, W);
+        // batch.rope_positions is axis-major (3 planes of T consecutive words each, T = B*W): row
+        // b's W-wide sub-range of each plane is itself contiguous, but the 3 planes are T-strided,
+        // not W-strided, so a plain slice of the fast axis is not a contiguous [W, 3] tensor (qsa's
+        // Ops require one). Gather it into a small per-row scratch tensor instead.
+        Tensor rope = work_->alloc(DType::I32, {W, 3});
+        CUDA_CHECK(cudaMemcpy2DAsync(rope.data, static_cast<std::size_t>(W) * 4,
+                                     static_cast<const std::byte*>(batch.rope_positions.data) + 4ULL * row * W,
+                                     static_cast<std::size_t>(T) * 4, static_cast<std::size_t>(W) * 4, 3,
+                                     cudaMemcpyDeviceToDevice, s));
         Tensor block_start       = batch.block_start_rope.slice(1, row, 1).view({3});
         Tensor kn_row = kn.slice(2, row * W, W), v_row = v.slice(2, row * W, W);
         Tensor index_rows_row = index_rows.slice(1, row * W, W);

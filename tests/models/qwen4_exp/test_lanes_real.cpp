@@ -125,6 +125,12 @@ EngineOptions base_options(const std::string& artifact, std::uint32_t max_contex
     if (mtp > 0) {
         options.speculative.backend      = SpeculativeBackend::Mtp;
         options.speculative.draft_tokens = mtp;
+        // Exercise the batched N-row verify path (mtp-multi-row-lanes-design.md), not just the
+        // plain 2-lane fallback: without these two, a round with more than one active row never
+        // reaches try_speculate_rows at all, so this test's own exactness check would prove
+        // nothing about that code.
+        options.flash_next.mtp_joint_acceptance = true;
+        options.flash_next.mtp_rows_verify       = true;
     }
     return options;
 }
