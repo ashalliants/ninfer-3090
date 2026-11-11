@@ -9,6 +9,7 @@ time goes, and say whether a change is worth a rented card.
 | [`tools/perf_model.py`](../../tools/perf_model.py) | Where do a decoded token's bytes go, what is each what-if worth, how fast should this be? | Qwen3.5 Dense and MoE (27B, 35B-A3B, any `config.json`) |
 | [`tools/kernel_bandwidth.py`](../../tools/kernel_bandwidth.py) | Which kernel families run well below the card's bandwidth, and what would fixing them save? | the same, joined to an `nsys` capture |
 | [`tools/flash_next_perf_model.py`](../../tools/flash_next_perf_model.py) | What is the expert-cache hit rate worth, what should MTP give, do two lanes beat MTP? | Qwen3.8-Flash-Next (`qwen4exp`) |
+| [`tools/dsv4_perf_model.py`](../../tools/dsv4_perf_model.py) | How fast could V4.1-Flash decode and prefill with experts split across VRAM, RAM and SSD, and how do lanes scale? Built from bytes and Strata's measured routing curve, with no V4.1 run behind it (see [the plan](dsv4-flash-plan.md)) | DeepSeek V4.1-Flash |
 
 They cannot replace the card. Bank conflicts, occupancy, register spills, memory/compute overlap and
 launch gaps are invisible to them and only show up as the gap between a prediction and a run. **When

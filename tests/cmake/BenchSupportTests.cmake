@@ -58,6 +58,20 @@ add_test(NAME ninfer_kernel_bandwidth_test
 add_test(NAME ninfer_flash_next_perf_model_test
   COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/test_flash_next_perf_model.py)
 
+# DeepSeek V4.1-Flash scoping (docs/maintainer/dsv4-flash-plan.md). The perf model is standard library
+# only. The reference and layout tools use NumPy, so their test is registered only where NumPy is
+# importable (the cpu list below picks it up if it exists); the message says when it is left out.
+add_test(NAME ninfer_dsv4_perf_model_test
+  COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/test_dsv4_perf_model.py)
+execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
+  RESULT_VARIABLE ninfer_numpy_missing OUTPUT_QUIET ERROR_QUIET)
+if(ninfer_numpy_missing)
+  message(STATUS "ninfer_dsv4_tools_test not registered: ${Python3_EXECUTABLE} cannot import numpy")
+else()
+  add_test(NAME ninfer_dsv4_tools_test
+    COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/dsv4/test_dsv4.py)
+endif()
+
 # The rental script's power-limit guard (scripts/vast/power_guard.py): a Vast host can cap the card well
 # below its default and the offer listing does not say so. Pure Python, no GPU and no Vast account.
 add_test(NAME ninfer_vast_power_guard_test
