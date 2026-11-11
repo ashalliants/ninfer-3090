@@ -426,6 +426,19 @@ struct SpecLayout {
     std::size_t w_drafts = 0, w_target = 0, w_licensed = 0, w_counts = 0, w_accepted = 0, w_extents = 0,
                 w_lengths = 0, w_anchors = 0, w_commit = 0, w_mtp_ids = 0, w_relaxed = 0, w_count = 0;
 
+    // The N-row batched verify's own scratch (docs/maintainer/mtp-multi-row-lanes-design.md),
+    // appended after the single-row region above and never shared with it: the single-row scratch
+    // only ever serves one speculating lane at a time (verify_view), but several rows' scratch
+    // must coexist in the same round. Sized for `lanes` rows regardless of how many are active in
+    // any one round.
+    GdnReplayRecordLayout rows_gdn;
+    std::size_t rows_gdn_bytes = 0, rows_gdn_offset = 0;
+    std::size_t rows_ple = 0;              // BF16 [w, W, lanes]
+    std::size_t rows_qsa_keys = 0, rows_qsa_keys_stride = 0; // row b's [Di, W, layers] slab at
+                                                              // rows_qsa_keys + b * rows_qsa_keys_stride
+    std::size_t rows_tails = 0, rows_tails_layer_stride = 0; // layer l, row b's tail at
+                                                              // rows_tails + l * rows_tails_layer_stride + b * tail_bytes
+
     static SpecLayout plan(const TextConfig& c, std::int32_t drafts, std::size_t tail_bytes, std::size_t conv_bytes,
                            std::size_t lanes, const ProgramOptions& o) {
         SpecLayout out;
@@ -471,6 +484,22 @@ struct SpecLayout {
         out.w_relaxed  = out.w_mtp_ids + W;
         out.w_count    = out.w_relaxed + 1;
         out.words      = take(4 * out.w_count);
+        // The N-row batched verify's own region (see the struct comment): a second, independent
+        // GdnReplayRecords sized record_capacity = lanes, then the rest of its scratch, all appended
+        // after the single-row region above via the same `take()` builder.
+        {
+            GdnReplayRecordSpec rows_spec = gdn_records_spec(c, out.width, o.gdn_head_map);
+            rows_spec.record_capacity     = static_cast<std::int32_t>(lanes);
+            LayoutBuilder rows_builder;
+            out.rows_gdn       = plan_gdn_replay_records(rows_builder, rows_spec);
+            out.rows_gdn_bytes = align(out.rows_gdn.payload_bytes());
+        }
+        out.rows_gdn_offset      = take(out.rows_gdn_bytes);
+        out.rows_ple             = take(w * W * lanes * 2);
+        out.rows_qsa_keys_stride = align(di * W * c.attention_layers * 2);
+        out.rows_qsa_keys        = take(out.rows_qsa_keys_stride * lanes);
+        out.rows_tails_layer_stride = align(tail_bytes * lanes);
+        out.rows_tails              = take(out.rows_tails_layer_stride * c.attention_layers);
         out.bytes      = at;
         return out;
     }
