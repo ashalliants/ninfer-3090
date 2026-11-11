@@ -990,6 +990,11 @@ struct PromptOptions {
     std::string chat_template_kwargs_json;
     bool add_vision_id = false;
     std::vector<std::string> tool_jsons;
+    // Tools the model may call that are NOT rendered in the system-prompt tool block, because the
+    // conversation already carries their definition (tools loaded on demand, e.g. through
+    // tool_reference blocks). They join tool_jsons in the tool-call parser and grammar, after it
+    // and in this order, and never change the rendered prompt or the tool cache boundary.
+    std::vector<std::string> loaded_tool_jsons;
     // Name of an EngineOptions::grafts entry to place in front of the rendered prompt; empty for
     // none. The rendered prompt should carry no system turn of its own: the graft already holds one.
     std::string graft;

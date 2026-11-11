@@ -1137,6 +1137,30 @@ int test_custom_tools() {
         "tool_caller_not_supported", "custom tools must permit direct invocation");
     failures += rejected([](Json& v) { v["tools"][0]["parameters"] = Json::object(); },
                          "parameter_not_supported", "custom tools take no parameters schema");
+    // Tool search is rejected with a message that says what to do instead.
+    const auto says_tool_search = [&](Json value, const std::string& expect,
+                                      const std::string& message) {
+        const ApiError error =
+            api_error([&] { (void)parse_openai_responses_create_request(value, limits()); });
+        return check(error.status == 400 && error.code == expect &&
+                         error.message.find("Tool search") != std::string::npos &&
+                         error.message.find("not supported") != std::string::npos,
+                     message);
+    };
+    Json search_tool = body;
+    search_tool["tools"].push_back(Json{{"type", "tool_search"}, {"execution", "client"}});
+    failures += says_tool_search(search_tool, "tool_type_not_supported",
+                                 "a tool_search tool did not explain the rejection");
+    Json deferred = body;
+    deferred["tools"][0]["defer_loading"] = true;
+    failures += says_tool_search(deferred, "deferred_tools_not_supported",
+                                 "defer_loading did not explain that tool search is unsupported");
+    for (const char* item_type : {"tool_search_call", "tool_search_output"}) {
+        Json replay = history;
+        replay["input"].push_back(Json{{"type", item_type}, {"call_id", "call_search"}});
+        failures += says_tool_search(replay, "item_type_not_supported",
+                                     std::string(item_type) + " did not explain the rejection");
+    }
     const auto history_rejected = [&](const std::function<void(Json&)>& edit,
                                       const std::string& expect, const std::string& message) {
         Json value = history;

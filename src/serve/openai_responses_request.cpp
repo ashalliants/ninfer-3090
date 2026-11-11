@@ -17,6 +17,13 @@ namespace {
 
 using Json = RequestJson;
 
+// Said by every rejection of OpenAI tool search, so a client learns what to do instead of only
+// that something is unsupported. (The Anthropic Messages endpoint does support deferred tools; the
+// Responses wire format for them, tool_search_call / tool_search_output, is not implemented.)
+const std::string kToolSearchUnsupported =
+    "Tool search (tool_search tools, tool_search_call and tool_search_output items, "
+    "defer_loading) is not supported on the Responses API.";
+
 void require_object(const Json& value, std::string_view name = "request body") {
     if (!value.is_object()) { bad_request(std::string(name) + " must be a JSON object"); }
 }
@@ -726,6 +733,9 @@ void parse_input(const Json& input, OpenAIResponsesPromptRequest& out,
         } else if (type == "input_file") {
             bad_request("input_file requires a Files API, which NInfer does not provide", "input",
                         "file_inputs_not_supported");
+        } else if (type == "tool_search_call" || type == "tool_search_output") {
+            bad_request(kToolSearchUnsupported + " Replay the history without these items.",
+                        "input", "item_type_not_supported");
         } else {
             bad_request("unsupported input Item type: " + type, "input", "item_type_not_supported");
         }
@@ -774,8 +784,8 @@ void reject_deferred_loading(const Json& item, const std::string& kind) {
         bad_request(kind + " defer_loading must be a boolean", "tools");
     }
     if (item.at("defer_loading").get<bool>()) {
-        bad_request("deferred tool loading is not supported", "tools",
-                    "deferred_tools_not_supported");
+        bad_request(kToolSearchUnsupported + " Remove defer_loading and send the tool directly.",
+                    "tools", "deferred_tools_not_supported");
     }
 }
 
@@ -968,6 +978,11 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
                 item, std::nullopt, {}, out.tool_identities,
                 "tools/" + std::to_string(out.wire_tools.size()))));
             continue;
+        }
+        if (type == "tool_search") {
+            bad_request(kToolSearchUnsupported + " Declare the tools you want the model to use "
+                                                 "directly instead.",
+                        "tools", "tool_type_not_supported");
         }
         if (type != "namespace") {
             // Hosted tools are the server's to execute, and NInfer has no executor for any of

@@ -7,6 +7,7 @@
 #include "models/qwen3_5/frontend/processor.h"
 #include "models/qwen3_5/frontend/test_access.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
+#include "models/qwen3_5/frontend/tool_contract.h"
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
@@ -1652,6 +1653,46 @@ int test_explicit_leading_instruction_cache_boundary() {
                      explicit_marker->frontier < data.token_ids.size(),
                  "explicit leading-system cache boundary was lost or shadowed by the automatic "
                  "full-system marker");
+}
+
+// A tool loaded on demand is callable, but it must leave the rendered prompt, and so the cached
+// prefix, exactly as it was.
+int test_loaded_tools_stay_out_of_prompt() {
+    const Frontend frontend = make_frontend(resources(), false);
+    const auto make_input   = [](bool with_loaded) {
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = "question", .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(user));
+        input.options.tool_jsons.push_back(
+            R"({"type":"function","function":{"name":"inspect","parameters":{"type":"object"}}})");
+        if (with_loaded) {
+            input.options.loaded_tool_jsons.push_back(
+                R"({"type":"function","function":{"name":"fetch","parameters":{"type":"object"}}})");
+        }
+        return input;
+    };
+
+    const auto plain  = frontend.prepare(make_input(false));
+    const auto loaded = frontend.prepare(make_input(true));
+    const auto& plain_data  = FrontendFactory::inspect(plain);
+    const auto& loaded_data = FrontendFactory::inspect(loaded);
+    int failures =
+        check(plain_data.token_ids == loaded_data.token_ids,
+              "a loaded-on-demand tool changed the rendered prompt");
+    const auto names = [](const auto& data) {
+        std::vector<std::string> result;
+        if (data.tool_call_output) {
+            for (const auto& tool : data.tool_call_output->tools) { result.push_back(tool.name); }
+        }
+        return result;
+    };
+    failures += check(names(plain_data) == std::vector<std::string>{"inspect"} &&
+                          names(loaded_data) == std::vector<std::string>{"inspect", "fetch"},
+                      "a loaded-on-demand tool was not callable, or not after the prompt tools");
+    return failures;
 }
 
 int test_trimmed_source_cache_boundaries() {
@@ -3673,6 +3714,7 @@ int main() {
     failures += test_template_media_contract();
     failures += test_image_resize_rejection_policy();
     failures += test_explicit_leading_instruction_cache_boundary();
+    failures += test_loaded_tools_stay_out_of_prompt();
     failures += test_trimmed_source_cache_boundaries();
     failures += test_source_part_recovery_boundary();
     failures += test_input_recovery_requires_proven_closing();

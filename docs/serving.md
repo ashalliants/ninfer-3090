@@ -1782,7 +1782,10 @@ Referring to a custom tool as a function, or the reverse, fails (`duplicate_tool
 accepts custom tools in its own wire shape; see [Chat custom tools](#chat-custom-tools).
 
 Hosted tools, remote MCP tools, deferred loading, output schemas, and caller restrictions that
-exclude direct invocation remain unsupported.
+exclude direct invocation remain unsupported. That includes OpenAI tool search: a `tool_search`
+tool, `defer_loading`, and `tool_search_call` / `tool_search_output` items are rejected with an
+error that says tool search is unsupported and to send the tools directly. The Anthropic Messages
+endpoint does support deferred tools (see its section below).
 
 ### Response object and usage
 
@@ -1965,8 +1968,23 @@ selected template. `output_config.format` accepts JSON Schema output as describe
 User-defined tools support `name`, `description`, object `input_schema`, `input_examples`, and
 `strict`. `tool_choice` accepts `auto`, `none`, `any`, or named `tool`; `disable_parallel_tool_use`
 enforces a single-call limit. See the common tool contract above for schema and framing details.
-Deferred tools, tools that exclude direct model calls, Anthropic-provided/server tools, toolsets,
-MCP, and containers remain unsupported. `tool_result` preserves text/image order and marks
+Tools that exclude direct model calls, Anthropic-provided/server tools (including the built-in
+`tool_search_tool_*`), toolsets, MCP, and containers remain unsupported.
+
+Deferred loading works with a client-side tool search: declare the tools to hold back with
+`defer_loading: true`, and have your own search tool answer with
+`{"type":"tool_reference","tool_name":"..."}` blocks in its `tool_result` content. At least one tool
+must not be deferred (it carries the tool-call syntax and the search tool itself), and a deferred
+tool cannot set `cache_control`. A deferred tool stays out of the system prompt, so it costs no
+prompt tokens until it is found. When a `tool_reference` names it, its definition is written into
+that tool result as text and the model can call it from then on, in that request and every later one
+whose history still holds the reference. Because only the conversation grows, finding a tool never
+changes the system prompt or invalidates the cached prefix before it. A tool is written out in full
+at its first reference only. A reference to an unknown tool fails with `tool_reference_not_found`,
+and a `tool_choice` that names a tool no reference has loaded fails with `deferred_tool_not_loaded`.
+Keep resending the whole history, references included, so later turns can still call the tool.
+
+`tool_result` preserves text/image order and marks
 `is_error:true` explicitly in the model prompt. For a visible Assistant tool-use turn, the next
 User turn must provide exactly one leading result for every declared ID; valid results are matched
 by ID and normalized to call order. A history that begins with results remains valid as a truncated

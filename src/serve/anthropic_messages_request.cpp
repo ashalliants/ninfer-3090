@@ -1,5 +1,6 @@
 #include "serve/anthropic_messages.h"
 #include "serve/request_validation.h"
+#include "serve/translate.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -20,6 +21,9 @@ namespace {
 using Json = RequestJson;
 
 constexpr std::size_t kMaxToolNameLength = 128;
+
+// type_raw of the placeholder a tool_reference parses to, until its tool definition is rendered.
+constexpr std::string_view kToolReferenceType = "tool_reference";
 
 enum class ParsePurpose {
     Messages,
@@ -233,6 +237,19 @@ std::vector<ContentPart> parse_tool_result_content(const Json& block) {
                                        cache_boundary(part, "messages")));
         } else if (type == "image") {
             result.push_back(parse_image(part));
+        } else if (type == "tool_reference") {
+            // A client-side tool search names the tools it found. The definition is only known
+            // once the request's tools are parsed, so this placeholder is resolved by
+            // expand_tool_references().
+            std::string tool_name = require_string(part, "tool_name", "messages", "tool_reference");
+            if (tool_name.empty()) {
+                bad_request("tool_reference tool_name must be a non-empty string", "messages");
+            }
+            ContentPart reference;
+            reference.kind     = ContentKind::Text;
+            reference.type_raw = std::string(kToolReferenceType);
+            reference.text     = std::move(tool_name);
+            result.push_back(std::move(reference));
         } else {
             bad_request("unsupported tool_result content block: " + type, "messages",
                         "content_block_not_supported");
@@ -783,7 +800,10 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
     return result;
 }
 
-void lower_tools(const Json& body, GenerationRequest& request) {
+// Parses the request's tools into request.tools (the tools the model sees in its system prompt).
+// Tools declared with defer_loading stay out of the prompt and are returned instead: a later
+// tool_reference in the history loads one (see expand_tool_references).
+std::vector<ToolDefinition> lower_tools(const Json& body, GenerationRequest& request) {
     const ToolSelection selection       = parse_tool_choice(body);
     std::vector<ParsedTool> definitions = parse_tool_definitions(body);
     const auto named                    = [&](const ParsedTool& tool) {
@@ -805,39 +825,128 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                                        ? ToolChoiceMode::Auto
                                        : ToolChoiceMode::Required;
     request.tool_choice.parallel = !selection.disable_parallel;
-    if (selection.kind == ToolSelectionKind::None) {
-        for (ParsedTool& tool : definitions) {
-            if (tool.source == ToolSource::UserDefined) {
-                request.tools.push_back(std::move(tool.definition));
+    const bool tools_disabled    = selection.kind == ToolSelectionKind::None;
+
+    std::vector<ToolDefinition> deferred;
+    for (ParsedTool& tool : definitions) {
+        if (tools_disabled) {
+            // The tools stay declared in the prompt but are never called, so only the ones the
+            // prompt can carry are kept.
+            if (tool.source != ToolSource::UserDefined) { continue; }
+        } else {
+            if (tool.source == ToolSource::Toolset) {
+                bad_request("Anthropic toolsets require a tool loader that NInfer does not provide",
+                            "tools", "toolsets_not_supported");
+            }
+            if (tool.source == ToolSource::AnthropicProvided) {
+                bad_request("Anthropic-provided tool type '" + tool.source_type +
+                                "' requires its predefined prompt schema or server executor, which "
+                                "NInfer does not provide",
+                            "tools", "anthropic_tools_not_supported");
+            }
+            if (tool.allowed_callers &&
+                std::find(tool.allowed_callers->begin(), tool.allowed_callers->end(), "direct") ==
+                    tool.allowed_callers->end()) {
+                bad_request("tool allowed_callers excludes direct model calls, and NInfer "
+                            "provides no alternate caller",
+                            "tools", "tool_caller_not_supported");
             }
         }
-        return;
+        if (tool.defer_loading) {
+            if (tool.definition.cache_boundary_after) {
+                // Deferred definitions are not part of the cached prefix, so a breakpoint on one
+                // has nothing to mark. Anthropic rejects it too.
+                bad_request("a tool with defer_loading=true cannot also set cache_control; put "
+                            "the breakpoint on a tool that is not deferred",
+                            "tools", "deferred_tool_cache_control");
+            }
+            deferred.push_back(std::move(tool.definition));
+        } else {
+            request.tools.push_back(std::move(tool.definition));
+        }
+    }
+    if (!deferred.empty() && request.tools.empty()) {
+        // Without a tool in the prompt the model has no tool-call syntax to follow, and nothing
+        // could ever discover the deferred ones.
+        bad_request("At least one tool must have defer_loading=false. All tools cannot be "
+                    "deferred.",
+                    "tools", "all_tools_deferred");
+    }
+    return deferred;
+}
+
+// Resolves every tool_reference in the history. The model gets the referenced tool's definition
+// as text where the reference sits, and the tool becomes callable.
+//
+// Only the request's messages change, never its system prompt or tool block. A tool discovered
+// mid-conversation therefore appends to the prompt prefix the previous request already cached,
+// instead of rewriting it, which is why the definition goes inline and not into the tool block.
+// The result depends only on the request's own messages and tools, never on earlier requests, so
+// an unchanged history renders byte for byte the same every time.
+//
+// A tool is rendered in full at its first reference only; later references say it is already
+// available. Loaded tools join request.tools in order of first reference.
+void expand_tool_references(GenerationRequest& request, std::vector<ToolDefinition> deferred) {
+    const auto find_by_name = [](auto& tools, const std::string& name) {
+        return std::find_if(tools.begin(), tools.end(),
+                            [&](const ToolDefinition& tool) { return tool.name == name; });
+    };
+    const auto is_reference = [](const ContentPart& part) {
+        return part.type_raw == kToolReferenceType;
+    };
+
+    for (ChatTurn& turn : request.messages) {
+        std::vector<ContentPart> expanded;
+        expanded.reserve(turn.content.size());
+        for (std::size_t index = 0; index < turn.content.size();) {
+            if (!is_reference(turn.content[index])) {
+                expanded.push_back(std::move(turn.content[index++]));
+                continue;
+            }
+            // One text part per run of references, so the model reads one list of tools.
+            std::string definitions;
+            std::string available;
+            std::optional<CacheBoundary> boundary;
+            for (; index < turn.content.size() && is_reference(turn.content[index]); ++index) {
+                const std::string& name = turn.content[index].text;
+                boundary                = turn.content[index].cache_boundary_after;
+                const auto pending      = find_by_name(deferred, name);
+                if (pending != deferred.end()) {
+                    definitions +=
+                        (definitions.empty() ? "" : "\n") + render_tool_definition(*pending);
+                    pending->loaded_on_demand = true;
+                    request.tools.push_back(std::move(*pending));
+                    deferred.erase(pending);
+                } else if (find_by_name(request.tools, name) != request.tools.end()) {
+                    available += (available.empty() ? "" : ", ") + name;
+                } else {
+                    bad_request("Tool reference '" + name + "' not found in available tools",
+                                "messages", "tool_reference_not_found");
+                }
+            }
+            std::string text;
+            if (!definitions.empty()) {
+                text = "These tools are now available. Call them like any other tool.\n<tools>\n" +
+                       definitions + "\n</tools>";
+            }
+            if (!available.empty()) {
+                text += (text.empty() ? "" : "\n") + std::string("Already available: ") + available;
+            }
+            expanded.push_back(text_part(std::move(text)));
+            expanded.back().cache_boundary_after = boundary;
+        }
+        turn.content = std::move(expanded);
     }
 
-    for (ParsedTool& tool : definitions) {
-        if (tool.source == ToolSource::Toolset) {
-            bad_request("Anthropic toolsets require a tool loader that NInfer does not provide",
-                        "tools", "toolsets_not_supported");
+    // A named tool_choice can only force a tool the model can call.
+    if (request.tool_choice.allowed_names) {
+        for (const std::string& name : *request.tool_choice.allowed_names) {
+            if (find_by_name(request.tools, name) == request.tools.end()) {
+                bad_request("tool_choice references deferred tool '" + name +
+                                "' that no tool_reference has loaded",
+                            "tool_choice", "deferred_tool_not_loaded");
+            }
         }
-        if (tool.source == ToolSource::AnthropicProvided) {
-            bad_request("Anthropic-provided tool type '" + tool.source_type +
-                            "' requires its predefined prompt schema or server executor, which "
-                            "NInfer does not provide",
-                        "tools", "anthropic_tools_not_supported");
-        }
-        if (tool.defer_loading) {
-            bad_request("defer_loading=true requires a deferred tool loader that NInfer does not "
-                        "provide",
-                        "tools", "deferred_tools_not_supported");
-        }
-        if (tool.allowed_callers &&
-            std::find(tool.allowed_callers->begin(), tool.allowed_callers->end(), "direct") ==
-                tool.allowed_callers->end()) {
-            bad_request("tool allowed_callers excludes direct model calls, and NInfer provides no "
-                        "alternate caller",
-                        "tools", "tool_caller_not_supported");
-        }
-        request.tools.push_back(std::move(tool.definition));
     }
 }
 
@@ -987,7 +1096,8 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
             break;
         }
     }
-    if (automatic_target == nullptr && !request.tools.empty()) {
+    if (automatic_target == nullptr && !request.tools.empty() &&
+        !request.tools.back().loaded_on_demand) {
         automatic_target = &request.tools.back().cache_boundary_after;
     }
     if (automatic_target == nullptr) { return; }
@@ -1014,9 +1124,10 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
 
 bool parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurpose purpose,
                          int effective_max_tokens, const ReasoningRestore& restore) {
-    lower_tools(body, request);
+    std::vector<ToolDefinition> deferred = lower_tools(body, request);
     parse_system(body, request);
     parse_messages(body, request, restore);
+    expand_tool_references(request, std::move(deferred));
     const bool display_omitted = parse_thinking(body, request, purpose, effective_max_tokens);
     parse_effort(body, request, purpose);
     apply_anthropic_prompt_cache_policy(body, request);
