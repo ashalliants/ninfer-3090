@@ -119,6 +119,16 @@ void test_hysteresis() {
     }
     require(selector.choose(lanes, none, none) == kHigh, "and released once it has run");
 
+    // A new set of lanes starts over: the dwell of the previous one does not carry across.
+    lanes[0] = lane_with(30, kHigh, 0);
+    selector.reset();
+    require(selector.current() == kHigh, "a reset returns to the configured window");
+    require(selector.choose(lanes, none, none) == kLow, "and decides afresh, with no dwell held");
+    selector.reset();
+    lanes[0] = lane_with(60, kHigh, kHigh);
+    require(selector.choose(lanes, none, none) == kHigh,
+            "a reset window is not forced down by the dwell of a prior switch");
+
     // Acceptance sitting on the crossover must not flap. Alternate outcomes around the break-even
     // rate and bound the number of switches over a long run.
     DraftWindowSelector noisy(kLow, kHigh);

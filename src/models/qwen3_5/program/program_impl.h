@@ -803,6 +803,9 @@ public:
     // Chooses the neural family of each round (always the wide one when adaptation is off), with
     // the measured round time of each family by batch size, which refines its cost prior.
     DraftWindowSelector draft_window_selector;
+    // The lanes (one bit each) that shared the rounds the selector last chose for; it starts over
+    // when they change.
+    std::uint64_t draft_window_lane_set = 0;
     std::array<RoundCostEstimate, kMaximumConcurrency + 1> narrow_round_cost;
     std::array<RoundCostEstimate, kMaximumConcurrency + 1> wide_round_cost;
     // The narrowest family of `kind` that verifies at least `drafts`.

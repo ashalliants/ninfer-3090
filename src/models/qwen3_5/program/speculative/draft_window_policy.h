@@ -124,6 +124,14 @@ public:
     [[nodiscard]] std::uint32_t high() const noexcept { return high_; }
     [[nodiscard]] std::uint32_t current() const noexcept { return current_; }
 
+    // Back to the configured window with no dwell: the lanes sharing rounds changed, so what the
+    // previous set's acceptance chose says nothing about this one.
+    void reset() noexcept {
+        current_           = high_;
+        rounds_at_current_ = 0;
+        switched_          = false;
+    }
+
     // The window of the next round for the lanes that will share it. `low_cost` and `high_cost` are
     // the measured round times of the two families at this batch size.
     [[nodiscard]] std::uint32_t choose(std::span<const DraftAcceptanceEstimate> lanes,

@@ -85,7 +85,7 @@ the idea is obvious and the obstacle is not.
   one acceptance threshold. The curve is flat in the middle, so two points take most of the spread
   for one extra graph and one bit of per-sequence state.
 
-  **Status (branch `perf/adaptive-dflash-k`): implemented, opt-in, unmeasured.**
+  **Status (branch `perf/adaptive-dflash-k`): implemented, opt-in, measured: misses the 1.05x criterion (+2.94% best cell, -0.50% worst).**
   `--adaptive-draft-tokens 3` captures a second neural round family at K=3 beside `--draft-tokens`
   (the round-family machinery the copy rounds use already keys graphs, replay records and workspace
   by verify width, so the second profile is one more `SpeculativeRoundShape`). A pure policy
@@ -102,7 +102,7 @@ the idea is obvious and the obstacle is not.
     copy family's 16-32 MiB marginal, because the sharing has not been measured.
   - Acceptance is not geometric (DFlash2's per-position acceptance falls faster than `a^i`), so the
     policy will, if anything, hold the high window longer than optimal.
-  - Nothing here has run on a GPU. Fixed in advance, before any measurement (server restarts for
+  - Measured on an RTX 3090 (PR #444): (1) passes, worst cell -0.50%; (2) fails, +2.94% against 1.05x; (3) passes by that bar, but the flag changes greedy output at C1 on the low-acceptance prompt; the narrow window never ran at C2/C4. Criterion 5 (flag off against master) was confounded by thermal drift and the graph-memory charge of criterion 4 was not checked against the real capture. Fixed in advance, before any measurement (server restarts for
     A=fixed K=7 and B=`--adaptive-draft-tokens 3`, order ABBA x3 per concurrency 1/2/4, thinking
     off, real prompts incl. one low-acceptance and one high-acceptance, decode time from the request
     log): (1) no cell below 0.98x of A; (2) at least 1.05x on the low-acceptance prompt at C1, with

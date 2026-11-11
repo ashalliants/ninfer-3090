@@ -694,8 +694,19 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         std::uint32_t neural_window = draft_window;
         if (!copy_round && draft_window_selector.enabled()) {
             std::array<DraftAcceptanceEstimate, kMaximumConcurrency> estimates;
+            // The selector's dwell belongs to one set of lanes sharing rounds: a different set
+            // (another batch size, a lane's request finishing or being replaced) or a request
+            // that has not yet had a neural round starts again on the configured window.
+            std::uint64_t lane_set = 0;
+            bool fresh_request     = false;
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 estimates[row] = requests[lanes[row]].draft_acceptance;
+                lane_set |= std::uint64_t{1} << lanes[row];
+                fresh_request = fresh_request || estimates[row].rounds() == 0;
+            }
+            if (fresh_request || lane_set != draft_window_lane_set) {
+                draft_window_selector.reset();
+                draft_window_lane_set = lane_set;
             }
             neural_window = draft_window_selector.choose(
                 std::span<const DraftAcceptanceEstimate>(estimates.data(), lanes.size()),
