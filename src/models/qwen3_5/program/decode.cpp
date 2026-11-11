@@ -4,6 +4,8 @@
 #include "models/qwen3_5/program/graph_execution.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "core/nvtx.h"
+#include "models/qwen3_5/execution/numeric_tripwire.h"
+#include "models/qwen3_5/execution/numeric_tripwire_report.h"
 #include "core/device.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/sampling.h"
@@ -40,6 +42,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
         card.set_stage_runtime(state.execution.stages);
+        card.set_tripwire(state.execution.tripwire);
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);
@@ -62,6 +65,9 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
                                    sizeof(qwen3_5::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
+        if (state.execution.tripwire != nullptr) {
+            state.execution.tripwire->drain(state.execution.device.stream);
+        }
     };
 }
 
@@ -86,6 +92,37 @@ void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
 namespace ninfer::models::qwen3_5::detail {
 
 namespace {} // namespace
+
+void ProgramImpl::discard_numeric_tripwire() noexcept {
+    if (!tripwire) { return; }
+    try {
+        tripwire->clear(device.stream);
+        device.synchronize();
+    } catch (...) {}
+}
+
+void ProgramImpl::report_numeric_tripwire() noexcept {
+    if (!tripwire) { return; }
+    try {
+        const std::optional<ops::NumericTripwireFinding> finding = tripwire->collect();
+        if (!finding) { return; }
+        const std::optional<std::uint32_t> suppressed = tripwire_throttle.admit(finding->site);
+        if (!suppressed || !tripwire_listener) { return; }
+        const execution::TripwireGeometry geometry{
+            .vocab_size  = parameters.model.config().text.vocab_size,
+            .hidden_size = parameters.model.config().text.hidden_size};
+        NumericTripwireEvent event;
+        event.site               = execution::describe_tripwire_site(finding->site);
+        event.element_index      = finding->element_index;
+        event.value              = finding->value;
+        event.offending_elements = finding->offending_count;
+        event.message = execution::format_tripwire_message(*finding, tripwire->abs_limit(), geometry,
+                                                           *suppressed);
+        tripwire_listener(event);
+    } catch (...) {
+        // A diagnostic must never fail a decode round.
+    }
+}
 
 const GdnReplayRecords* ProgramImpl::round_replay_records(std::uint32_t verify_drafts) const {
     if (!replay_records) { return nullptr; }
@@ -339,7 +376,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
         execution::OrdinaryBatchContext schedule_state{
             {device, parameters, work, state_images->linear(0),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, stage_runtime.get()},
+             proposal_head, stage_runtime.get(), tripwire.get()},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -357,6 +394,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             device.synchronize();
         }
         timing.end_wait();
+        report_numeric_tripwire();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -393,6 +431,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         } catch (...) {}
+        discard_numeric_tripwire();
         timing.end_wait();
         clear_execution_failure_lanes(lanes);
         throw;
@@ -503,7 +542,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
 
         execution::MtpBatchContext schedule_state{{device, parameters, work, state_images->linear(0),
                                                    replay_records ? &*replay_records : nullptr, io,
-                                                   prefill_hidden, prefill_chunk, proposal_head, stage_runtime.get()},
+                                                   prefill_hidden, prefill_chunk, proposal_head, stage_runtime.get(),
+                                                   tripwire.get()},
                                                   decoder->text_kv,
                                                   *decoder->mtp_cache(),
                                                   *io.mtp_decode,
@@ -530,6 +570,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             device.synchronize();
         }
         timing.end_wait();
+        report_numeric_tripwire();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -591,6 +632,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         } catch (...) {}
+        discard_numeric_tripwire();
         timing.end_wait();
         clear_execution_failure_lanes(lanes);
         throw;
@@ -809,7 +851,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
 
         execution::DFlashBatchContext schedule_state{
             {device, parameters, work, state_images->linear(0), round_replay_records(verify_drafts),
-             io, prefill_hidden, prefill_chunk, proposal_head, stage_runtime.get()},
+             io, prefill_hidden, prefill_chunk, proposal_head, stage_runtime.get(),
+             tripwire.get()},
             decoder->text_kv,
             *dflash,
             *io.dflash_decode,
@@ -851,6 +894,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             device.synchronize();
         }
         timing.end_wait();
+        report_numeric_tripwire();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -931,6 +975,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         } catch (...) {}
+        discard_numeric_tripwire();
         timing.end_wait();
         clear_execution_failure_lanes(lanes);
         throw;

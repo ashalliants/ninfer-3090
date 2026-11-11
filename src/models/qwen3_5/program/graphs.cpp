@@ -3,6 +3,7 @@
 #include "models/qwen3_5/program/execution_context.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "core/nvtx.h"
+#include "models/qwen3_5/execution/numeric_tripwire.h"
 #include "core/device.h"
 
 #include <algorithm>
@@ -323,7 +324,8 @@ void ProgramImpl::prepare_graphs() {
                                         prefill_hidden,
                                         prefill_chunk,
                                         proposal_head,
-                                        stage_runtime.get()};
+                                        stage_runtime.get(),
+                                        tripwire.get()};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -525,6 +527,8 @@ void ProgramImpl::prepare_graphs() {
                                    dflash->pending_features.bytes(), device.stream));
     }
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
+    // The warm-up and capture runs above executed the model on made-up inputs.
+    if (tripwire) { tripwire->clear(device.stream); }
     device.synchronize();
     for (std::uint32_t row = 0; row < max_concurrency; ++row) {
         if (!state_store->release(capture_states[row])) {

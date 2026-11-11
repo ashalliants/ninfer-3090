@@ -206,6 +206,9 @@ void validate(const EngineOptions& options) {
                "--embedding-q4/q6, --mtp-experts-q4, --mlp-a8-decode, --prefill-cublas, --gdn-state-fp16, "
                "--no-prefill-a8, --no-prefill-cublas-projections)");
     }
+    if (options.numeric_tripwire.enabled) {
+        refuse("has no numeric tripwire probes: remove --numeric-tripwire");
+    }
 }
 
 } // namespace

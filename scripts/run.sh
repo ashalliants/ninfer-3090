@@ -74,6 +74,8 @@
 #     NINFER_HOST_CACHE_MAX_MIB         --host-cache-max-mib N         hard cap on pinned RAM
 #   NINFER_MAX_OUTPUT_TOKENS            --max-output-tokens N          cap every request's output budget
 #   NINFER_MLP_A8_DECODE=on             --mlp-a8-decode                INT8-activation MLP decode
+#   NINFER_NUMERIC_TRIPWIRE=on          --numeric-tripwire             debug: log the first NaN/Inf/overflow
+#                                                                      a decode round produces (off = free)
 #   NINFER_REASONING_LOOP=stop|conclude --reasoning-loop MODE          end (stop) or close the thinking
 #                                                                      (conclude) when it keeps repeating
 #                                                                      whole passages; off (the default)
@@ -344,6 +346,11 @@ if [[ "$profile" == 'tuned' ]]; then
     on) profile_args+=(--mlp-a8-decode) ;;
     off) ;;
     *) printf 'NINFER_MLP_A8_DECODE must be on or off, got %s\n' "$NINFER_MLP_A8_DECODE" >&2; exit 2 ;;
+  esac
+  case "${NINFER_NUMERIC_TRIPWIRE:-off}" in
+    on) profile_args+=(--numeric-tripwire) ;;
+    off) ;;
+    *) printf 'NINFER_NUMERIC_TRIPWIRE must be on or off, got %s\n' "$NINFER_NUMERIC_TRIPWIRE" >&2; exit 2 ;;
   esac
   # Reasoning-loop guard (--reasoning-loop): off unless asked for. It has never fired on the 27B in
   # the measurements behind it (#217: 21 requests, including one written to make the model loop),

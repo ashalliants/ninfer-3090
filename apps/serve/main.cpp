@@ -114,6 +114,12 @@ int run_router(const char* argv0, const ninfer::serve::ServeOptions& options,
                 },
                 [operational_log](const ninfer::ContextStoreHydrationEvent& event) {
                     operational_log.context_store_hydration_failure(event);
+                },
+                [operational_log, logger](const ninfer::NumericTripwireEvent& event) {
+                    try {
+                        operational_log.numeric_tripwire(event);
+                        logger->flush();
+                    } catch (...) {}
                 });
             startup_log.engine_ready(service->load_summary());
             operational_log.engine_capacity(*service);
@@ -333,6 +339,12 @@ int main(int argc, char** argv) {
             },
             [&operational_log](const ninfer::ContextStoreHydrationEvent& e) {
                 operational_log.context_store_hydration_failure(e);
+            },
+            [&operational_log, logger](const ninfer::NumericTripwireEvent& event) {
+                try {
+                    operational_log.numeric_tripwire(event);
+                    logger->flush();
+                } catch (...) {}
             });
         startup_log.engine_ready(service.load_summary());
         operational_log.engine_capacity(service);

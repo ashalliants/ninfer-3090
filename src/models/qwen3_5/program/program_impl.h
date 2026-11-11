@@ -23,12 +23,15 @@
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix_identity.h"
 #include "core/host_context_arena.h"
+#include "models/qwen3_5/execution/numeric_tripwire.h"
+#include "models/qwen3_5/execution/numeric_tripwire_report.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_prefill.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <array>
 #include <limits>
 #include <memory>
@@ -790,6 +793,13 @@ public:
     std::array<CudaEventTimer, 3> context_transfer_timers_;
     CudaEventTimer prefill_gpu_timer_;
 
+    // Numeric tripwire (--numeric-tripwire): null unless asked for, in which case no probe is
+    // launched and no graph carries a node for it. Graphs capture its device
+    // record and pinned host copy, so it is declared before them and destroyed after them.
+    std::unique_ptr<execution::NumericTripwire> tripwire;
+    std::function<void(const NumericTripwireEvent&)> tripwire_listener;
+    execution::TripwireReportThrottle tripwire_throttle;
+
     // Captured transfers and external events reference the buffers and events declared above.
     // Families are destroyed first, including when startup throws.
     DecodeGraphFamily ordinary_graphs;
@@ -883,6 +893,10 @@ public:
                                                             runtime::ExecutionTiming*,
                                                             runtime::TokenMaskProvider*);
     void prepare_graphs();
+    // After a decode round's synchronisation: hands what the numeric tripwire saw to its listener.
+    void report_numeric_tripwire() noexcept;
+    // On a failed round: drops whatever the probes recorded, so the next round starts clean.
+    void discard_numeric_tripwire() noexcept;
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
     void set_device_i32(Tensor& tensor, std::int32_t value);

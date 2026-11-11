@@ -1,5 +1,6 @@
 #include "options.h"
 
+#include <cmath>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
@@ -34,6 +35,28 @@ int main() {
     int failures      = 0;
     const auto choice = parse({"ninfer", "model.ninfer", "--prompt", "hello", "--choice", "",
                                "--choice", "a|b", "--choice", "你好"});
+    {
+        const auto off = parse({"ninfer", "model.ninfer", "--prompt", "hello"});
+        failures += check(!off.numeric_tripwire, "numeric tripwire must be off by default");
+        const auto on = parse({"ninfer", "model.ninfer", "--prompt", "hello", "--numeric-tripwire"});
+        failures += check(on.numeric_tripwire && on.numeric_tripwire_limit == 65504.0F,
+                          "--numeric-tripwire must enable it with the FP16 maximum as limit");
+        const auto limited = parse({"ninfer", "model.ninfer", "--prompt", "hello",
+                                    "--numeric-tripwire-limit", "300.5"});
+        failures += check(limited.numeric_tripwire && limited.numeric_tripwire_limit == 300.5F,
+                          "--numeric-tripwire-limit must set the limit and enable the tripwire");
+        const auto infinite = parse({"ninfer", "model.ninfer", "--prompt", "hello",
+                                     "--numeric-tripwire-limit", "inf"});
+        failures += check(infinite.numeric_tripwire && std::isinf(infinite.numeric_tripwire_limit),
+                          "--numeric-tripwire-limit inf must report only NaN and infinity");
+        for (const char* bad : {"0", "-1", "nan", "abc", ""}) {
+            failures += check(rejects([&] {
+                                  (void)parse({"ninfer", "model.ninfer", "--prompt", "hello",
+                                               "--numeric-tripwire-limit", bad});
+                              }),
+                              "a non-positive or non-numeric tripwire limit was accepted");
+        }
+    }
     failures += check(choice.choices == std::vector<std::string>{"", "a|b", "你好"},
                       "choice flags changed literal text or order");
     failures +=

@@ -344,6 +344,11 @@ int main(int argc, char** argv) {
         engine_options.embedding_q6             = cli.embedding_q6;
         engine_options.mtp_experts_q4           = cli.mtp_experts_q4;
         engine_options.gdn_state_fp16           = cli.gdn_state_fp16;
+        engine_options.numeric_tripwire.enabled   = cli.numeric_tripwire;
+        engine_options.numeric_tripwire.abs_limit = cli.numeric_tripwire_limit;
+        engine_options.numeric_tripwire.listener  = [logger](const ninfer::NumericTripwireEvent& event) {
+            logger->warn("{}", ninfer::product::format_pretty_text(event.message));
+        };
         engine_options.mlp_a8_decode            = cli.mlp_a8_decode;
         engine_options.prefill_a8               = cli.prefill_a8;
         engine_options.prefill_cublas           = cli.prefill_cublas;

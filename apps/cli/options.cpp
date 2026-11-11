@@ -103,6 +103,13 @@ float parse_float(const char* text, std::string_view label, float minimum, float
     return static_cast<float>(value);
 }
 
+// The tripwire limit may be "inf": then only NaN and infinite values are reported.
+float parse_tripwire_limit(const char* text) {
+    if (std::string_view(text) == "inf") { return std::numeric_limits<float>::infinity(); }
+    return parse_float(text, "numeric-tripwire-limit", std::numeric_limits<float>::min(),
+                       std::numeric_limits<float>::max());
+}
+
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
@@ -143,6 +150,7 @@ std::string usage_text(const char* argv0) {
            "       [--ngram-draft-tokens 0|15] [--ngram-min-match N]\n"
            "       [--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4]\n"
            "       [--gdn-state-fp16] [--mlp-a8-decode] [--no-prefill-a8]\n"
+           "       [--numeric-tripwire [--numeric-tripwire-limit F|inf]]\n"
            "       [--prefill-cublas [--no-prefill-cublas-projections]]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -178,6 +186,10 @@ std::string usage_text(const char* argv0) {
            "speed- or memory-for-quality trades, off by "
            "default; see "
            "docs/maintainer/quality-trade-experiments.md for the measured cost of each.\n"
+           "--numeric-tripwire is a debugging aid: a few small probes in every decode round look for "
+           "NaN, infinity and values beyond --numeric-tripwire-limit (default 65504, the FP16 maximum; "
+           "inf reports only NaN and infinity) and log the first sighting as a warning without "
+           "stopping generation. Off by default, and then free. Single device, Qwen3.5 family.\n"
            "--no-prefill-a8 returns full prefill tiles to their A16 routes, which is how the "
            "integer routes are measured on a whole request.\n"
            "--prefill-cublas hands wide prefill GEMMs to cuBLAS: a large prefill speedup for a small "
@@ -272,6 +284,11 @@ Options parse_options(int argc, char** argv) {
             options.mtp_experts_q4 = true;
         } else if (arg == "--gdn-state-fp16") {
             options.gdn_state_fp16 = true;
+        } else if (arg == "--numeric-tripwire") {
+            options.numeric_tripwire = true;
+        } else if (arg == "--numeric-tripwire-limit") {
+            options.numeric_tripwire       = true;
+            options.numeric_tripwire_limit = parse_tripwire_limit(value(arg));
         } else if (arg == "--mlp-a8-decode") {
             options.mlp_a8_decode = true;
         } else if (arg == "--no-prefill-a8") {

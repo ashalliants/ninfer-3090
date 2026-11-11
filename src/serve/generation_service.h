@@ -152,7 +152,8 @@ public:
         ServeOptions options, StartupObserver startup_observer = {},
         std::function<void(const ninfer::ContextStoreWriteEvent&)> store_listener = {},
         std::function<void(const ninfer::EngineFaultEvent&)> fault_listener      = {},
-        std::function<void(const ninfer::ContextStoreHydrationEvent&)> hydration_listener = {});
+        std::function<void(const ninfer::ContextStoreHydrationEvent&)> hydration_listener = {},
+        std::function<void(const ninfer::NumericTripwireEvent&)> tripwire_listener        = {});
     virtual ~GenerationService();
     GenerationService(const GenerationService&)            = delete;
     GenerationService& operator=(const GenerationService&) = delete;

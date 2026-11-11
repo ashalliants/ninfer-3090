@@ -348,6 +348,8 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.embedding_q6             = options.embedding_q6;
     engine_options.mtp_experts_q4           = options.mtp_experts_q4;
     engine_options.gdn_state_fp16           = options.gdn_state_fp16;
+    engine_options.numeric_tripwire.enabled   = options.numeric_tripwire;
+    engine_options.numeric_tripwire.abs_limit = options.numeric_tripwire_limit;
     engine_options.admission_fit_check      = options.admission_fit_check;
     engine_options.suspend                  = options.suspend;
     engine_options.mlp_a8_decode            = options.mlp_a8_decode;
@@ -412,7 +414,8 @@ GenerationService::GenerationService(
     ServeOptions options, StartupObserver startup_observer,
     std::function<void(const ninfer::ContextStoreWriteEvent&)> store_listener,
     std::function<void(const ninfer::EngineFaultEvent&)> fault_listener,
-    std::function<void(const ninfer::ContextStoreHydrationEvent&)> hydration_listener)
+    std::function<void(const ninfer::ContextStoreHydrationEvent&)> hydration_listener,
+    std::function<void(const ninfer::NumericTripwireEvent&)> tripwire_listener)
     : options_(std::move(options)) {
     // Inline ECC on GDDR6X GeForce cards reserves ~6.25% of VRAM for checksums and taxes
     // memory bandwidth on every access. Decode is bandwidth-bound, so an ECC-enabled card
@@ -438,6 +441,7 @@ GenerationService::GenerationService(
     engine_options.context_store.listener = std::move(store_listener);
     engine_options.context_store.hydration_listener = std::move(hydration_listener);
     engine_options.fault_listener         = std::move(fault_listener);
+    engine_options.numeric_tripwire.listener = std::move(tripwire_listener);
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
     // A context fit may have lowered the context; every request limit follows what was resolved.
     options_.max_context = engine_->options().max_context;

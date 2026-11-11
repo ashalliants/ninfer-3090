@@ -5,6 +5,7 @@
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "core/startup.h"
 #include "core/device.h"
+#include <cmath>
 #include <cuda_runtime.h>
 #include "ninfer/ops/target_logprobs.h"
 
@@ -285,6 +286,19 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     if (parameters.text.rank_count != device.size()) {
         throw std::invalid_argument("the model's pipeline stages do not match the attached devices");
+    }
+    if (plan.numeric_tripwire.enabled) {
+        if (device.size() != 1) {
+            throw std::invalid_argument(
+                "--numeric-tripwire does not support a model split over several devices");
+        }
+        // The CLI parsers check this too; EngineOptions is public, so reject it here at startup
+        // rather than on the first decode (or graph capture). +infinity is allowed.
+        if (std::isnan(plan.numeric_tripwire.abs_limit) || !(plan.numeric_tripwire.abs_limit > 0.0F)) {
+            throw std::invalid_argument("numeric tripwire abs_limit must be positive");
+        }
+        tripwire          = std::make_unique<execution::NumericTripwire>(plan.numeric_tripwire.abs_limit);
+        tripwire_listener = plan.numeric_tripwire.listener;
     }
     // From here one workspace arena serves every rank: the layer loop switches it alongside the
     // device, and every workspace call site is unchanged.

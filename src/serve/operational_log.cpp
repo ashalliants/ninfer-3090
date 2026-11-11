@@ -662,6 +662,11 @@ void OperationalLog::engine_fault(const ninfer::EngineFaultEvent& event) const {
     write(render_engine_fault(event));
 }
 
+void OperationalLog::numeric_tripwire(const ninfer::NumericTripwireEvent& event) const {
+    write({.severity = OperationalSeverity::Warning,
+           .message  = product::format_pretty_text(event.message)});
+}
+
 void OperationalLog::engine_fatal_exit(double grace_seconds, bool will_exit) const {
     if (will_exit) {
         logger_->critical("FATAL: inference engine is permanently unavailable after repeated "

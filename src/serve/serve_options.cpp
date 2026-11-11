@@ -35,6 +35,13 @@ float parse_float_in(const char* text, const char* label, float lo, float hi) {
     return static_cast<float>(value);
 }
 
+// The tripwire limit may be "inf": then only NaN and infinite values are reported.
+float parse_tripwire_limit(const char* text) {
+    if (std::string_view(text) == "inf") { return std::numeric_limits<float>::infinity(); }
+    return parse_float_in(text, "numeric-tripwire-limit", std::numeric_limits<float>::min(),
+                          std::numeric_limits<float>::max());
+}
+
 std::uint64_t parse_u64(const char* text, const char* label) {
     if (text == nullptr || *text == '\0' || *text == '-') {
         throw std::invalid_argument(std::string("invalid ") + label + ": " +
@@ -181,7 +188,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--ram-headroom-mib N] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
-           "[--gdn-state-fp16] [--progress-anchor-tokens N [--progress-anchors-shared]] [--admission-fit-check] "
+           "[--gdn-state-fp16] [--numeric-tripwire [--numeric-tripwire-limit F|inf]] "
+           "[--progress-anchor-tokens N [--progress-anchors-shared]] [--admission-fit-check] "
            "[--model-suspend [--suspend-snapshot pageable|pinned] "
            "[--suspend-weights artifact|host] [--no-auto-resume] [--sleep-idle-seconds N]] "
            "[--models-dir DIR] [--models-preset FILE] [--models-max N] [--no-models-autoload] "
@@ -864,6 +872,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.mtp_experts_q4 = true;
         } else if (arg == "--gdn-state-fp16") {
             options.gdn_state_fp16 = true;
+        } else if (arg == "--numeric-tripwire") {
+            options.numeric_tripwire = true;
+        } else if (arg == "--numeric-tripwire-limit") {
+            options.numeric_tripwire       = true;
+            options.numeric_tripwire_limit = parse_tripwire_limit(require_value("--numeric-tripwire-limit"));
         } else if (arg == "--admission-fit-check") {
             options.admission_fit_check = true;
         } else if (arg == "--model-suspend") {

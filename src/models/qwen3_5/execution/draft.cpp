@@ -6,6 +6,7 @@
 #include "models/qwen3_5/execution/workspace.h"
 
 #include "core/nvtx.h"
+#include "models/qwen3_5/execution/numeric_tripwire.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "ninfer/ops/context_kv_materialize.h"
@@ -721,6 +722,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
         card.set_stage_runtime(state.execution.stages);
+        card.set_tripwire(state.execution.tripwire);
         // pending_features stays allocated at the widest round (catch-up reads it at that width);
         // a narrower round captures into the leading `width` columns of each lane.
         Tensor pending_features = dflash_state(state).pending_features.slice(1, 0, width);
@@ -766,6 +768,9 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_5::DFlashDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
+        if (state.execution.tripwire != nullptr) {
+            state.execution.tripwire->drain(state.execution.device.stream);
+        }
     };
 }
 

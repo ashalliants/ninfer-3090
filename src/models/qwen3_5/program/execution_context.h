@@ -41,6 +41,9 @@ struct ExecutionCore {
     ProposalHead proposal_head;
     // Null on one device; see StageRuntime.
     StageRuntime* stages = nullptr;
+    // Numeric tripwire probes and the drain that hands their record to the host; set only for the
+    // decode rounds (ordinary, MTP, DFlash) and their graphs, and only under --numeric-tripwire.
+    NumericTripwire* tripwire = nullptr;
 };
 
 struct PrefillContext {
