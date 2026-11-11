@@ -902,7 +902,12 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     std::vector<ChatRole> message_roles;
     message_roles.reserve(input.messages.size());
     for (const ChatMessage& message : input.messages) { message_roles.push_back(message.role); }
-    const auto tool_call_output = fi::build_tool_call_output_contract(options.tool_jsons);
+    // Loaded-on-demand tools are callable but not rendered in the system prompt (see
+    // PromptOptions::loaded_tool_jsons), so only the parser and grammar contract sees them.
+    std::vector<std::string> callable_tool_jsons = options.tool_jsons;
+    callable_tool_jsons.insert(callable_tool_jsons.end(), options.loaded_tool_jsons.begin(),
+                               options.loaded_tool_jsons.end());
+    const auto tool_call_output = fi::build_tool_call_output_contract(callable_tool_jsons);
     const std::optional<std::uint32_t> leading_boundary =
         leading_instruction_boundary(message_roles);
     std::vector<PromptCacheMarker> rendered_markers = cache_hints.markers;

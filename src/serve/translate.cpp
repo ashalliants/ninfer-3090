@@ -88,17 +88,6 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     return sampling;
 }
 
-std::string render_tool_definition(const ToolDefinition& tool) {
-    using Json  = RequestJson;
-    Json schema = Json::parse(tool.input_schema_json);
-    Json function{{"name", tool.name}, {"parameters", std::move(schema)}, {"strict", tool.strict}};
-    if (!tool.description.empty()) { function["description"] = tool.description; }
-    if (tool.input_examples_json) {
-        function["input_examples"] = Json::parse(*tool.input_examples_json);
-    }
-    return Json{{"type", "function"}, {"function", std::move(function)}}.dump();
-}
-
 // Clients carry a wider effort vocabulary than the Qwen templates expose: OpenAI and Claude Code
 // send 'high', pi sends 'minimal' and 'max'. The maintained templates offer three rungs (low,
 // medium, xhigh) and raise on anything else, so the outer values collapse onto the nearest rung
@@ -122,6 +111,17 @@ ninfer::ReasoningEffort template_reasoning_effort(RequestedReasoningEffort effor
 }
 
 } // namespace
+
+std::string render_tool_definition(const ToolDefinition& tool) {
+    using Json  = RequestJson;
+    Json schema = Json::parse(tool.input_schema_json);
+    Json function{{"name", tool.name}, {"parameters", std::move(schema)}, {"strict", tool.strict}};
+    if (!tool.description.empty()) { function["description"] = tool.description; }
+    if (tool.input_examples_json) {
+        function["input_examples"] = Json::parse(*tool.input_examples_json);
+    }
+    return Json{{"type", "function"}, {"function", std::move(function)}}.dump();
+}
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& request,
                                                  const ServeOptions& server) {
@@ -306,6 +306,13 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     const auto& tools                       = request.tools;
     input.options.tool_jsons.reserve(tools.size());
     for (std::size_t index = 0; index < tools.size(); ++index) {
+        if (tools[index].loaded_on_demand) {
+            input.options.loaded_tool_jsons.push_back(render_tool_definition(tools[index]));
+            continue;
+        }
+        if (!input.options.loaded_tool_jsons.empty()) {
+            throw std::logic_error("loaded-on-demand tools must follow every other tool");
+        }
         input.options.tool_jsons.push_back(render_tool_definition(tools[index]));
         if (tools[index].cache_boundary_after) {
             input.context_cache.markers.push_back(ninfer::PromptCacheMarker{

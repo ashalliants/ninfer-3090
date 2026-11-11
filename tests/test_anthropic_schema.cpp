@@ -478,7 +478,6 @@ int test_tools() {
     body["tools"] = Json::array({ordinary_tool(true)});
     failures += check(parse(body).generation.tools[0].strict, "strict reaches generation");
     body["tool_choice"]               = Json{{"type", "none"}, {"disable_parallel_tool_use", true}};
-    body["tools"][0]["defer_loading"] = true;
     body["tools"][0]["allowed_callers"] = Json::array({"code_execution"});
     const GenerationRequest disabled    = parse(body).generation;
     failures += check(!disabled.uses_tools() && prompt(disabled).options.tool_jsons.size() == 1,
@@ -510,6 +509,163 @@ int test_tools() {
     body["tools"] = Json::array({ordinary_tool(), ordinary_tool()});
     failures += check(api_param([&] { (void)parse(body); }) == "tools",
                       "duplicate tool names were accepted");
+    return failures;
+}
+
+Json named_tool(const char* name, bool deferred) {
+    Json tool{{"name", name},
+              {"description", std::string("Tool ") + name},
+              {"input_schema", Json{{"type", "object"}, {"properties", Json::object()}}}};
+    if (deferred) { tool["defer_loading"] = true; }
+    return tool;
+}
+
+Json tool_reference(const char* name) {
+    return Json{{"type", "tool_reference"}, {"tool_name", name}};
+}
+
+Json tool_result_blocks(std::string id, Json blocks) {
+    return Json{{"type", "tool_result"}, {"tool_use_id", std::move(id)}, {"content", blocks}};
+}
+
+// A client-side tool search: the model calls `search`, which answers with tool_reference blocks.
+Json deferred_tools_request(Json references) {
+    Json body        = base_request();
+    body["tools"]    = Json::array(
+        {named_tool("search", false), named_tool("get_forecast", true), named_tool("other", true)});
+    body["messages"] = Json::array(
+        {message("user", "find a weather tool"),
+         message("assistant", Json::array({tool_use("t1", "search")})),
+         message("user", Json::array({tool_result_blocks("t1", std::move(references))}))});
+    return body;
+}
+
+const std::string& tool_message_text(const GenerationRequest& request, std::size_t turn) {
+    return request.messages.at(turn).content.at(0).text;
+}
+
+int test_deferred_tools() {
+    int failures = 0;
+
+    const GenerationRequest loaded =
+        parse(deferred_tools_request(Json::array({tool_reference("get_forecast")}))).generation;
+    failures += check(loaded.tools.size() == 2 && loaded.tools[0].name == "search" &&
+                          !loaded.tools[0].loaded_on_demand &&
+                          loaded.tools[1].name == "get_forecast" &&
+                          loaded.tools[1].loaded_on_demand,
+                      "a referenced deferred tool did not become callable after the prompt tools");
+    const std::string& text = tool_message_text(loaded, 2);
+    failures += check(text.find("\"name\":\"get_forecast\"") != std::string::npos &&
+                          text.find("<tools>") != std::string::npos &&
+                          text.find("\"name\":\"other\"") == std::string::npos,
+                      "the tool result did not carry exactly the referenced definition");
+    failures += check(loaded.messages.at(2).content.size() == 1 &&
+                          loaded.messages.at(2).content[0].type_raw == "text",
+                      "a tool_reference placeholder survived parsing");
+
+    // The system prompt must not move when a tool is discovered, or its cached prefix is lost.
+    Json undiscovered = deferred_tools_request(Json::array({tool_reference("get_forecast")}));
+    undiscovered["messages"] = Json::array({message("user", "find a weather tool")});
+    const ninfer::PromptInput before = prompt(parse(undiscovered).generation);
+    const ninfer::PromptInput after  = prompt(loaded);
+    failures += check(before.options.tool_jsons == after.options.tool_jsons &&
+                          before.options.tool_jsons.size() == 1 &&
+                          before.options.loaded_tool_jsons.empty() &&
+                          after.options.loaded_tool_jsons.size() == 1 &&
+                          Json::parse(after.options.loaded_tool_jsons[0])["function"]["name"] ==
+                              "get_forecast",
+                      "discovering a tool changed the rendered tool block or hid the tool from "
+                      "the parser");
+
+    // The same history renders the same bytes however many turns follow it.
+    Json longer = deferred_tools_request(Json::array({tool_reference("get_forecast")}));
+    longer["messages"].push_back(message("assistant", "found it"));
+    longer["messages"].push_back(message("user", "thanks"));
+    failures += check(tool_message_text(parse(longer).generation, 2) == text,
+                      "extending the history changed an earlier tool result's rendering");
+
+    // A second reference does not repeat the definition.
+    Json repeated = deferred_tools_request(Json::array({tool_reference("get_forecast")}));
+    repeated["messages"].push_back(message("assistant", Json::array({tool_use("t2", "search")})));
+    repeated["messages"].push_back(message(
+        "user",
+        Json::array({tool_result_blocks("t2", Json::array({tool_reference("get_forecast")}))})));
+    const GenerationRequest twice = parse(repeated).generation;
+    failures += check(twice.tools.size() == 2 && tool_message_text(twice, 4) ==
+                                                     "Already available: get_forecast",
+                      "a repeated tool_reference rendered the definition again");
+
+    // Several references in one result share one text part, in the order given.
+    const GenerationRequest both =
+        parse(deferred_tools_request(
+                  Json::array({tool_reference("other"), tool_reference("get_forecast")})))
+            .generation;
+    failures += check(both.messages.at(2).content.size() == 1 && both.tools.size() == 3 &&
+                          both.tools[1].name == "other" && both.tools[2].name == "get_forecast" &&
+                          tool_message_text(both, 2).find("\"other\"") <
+                              tool_message_text(both, 2).find("\"get_forecast\""),
+                      "references in one result were not merged in order");
+    const ninfer::PromptInput both_prompt = prompt(both);
+    failures += check(both_prompt.options.tool_jsons.size() == 1 &&
+                          both_prompt.options.loaded_tool_jsons.size() == 2,
+                      "loaded tools did not all reach the parser in reference order");
+
+    // Referencing a tool the prompt already carries is harmless.
+    const GenerationRequest plain =
+        parse(deferred_tools_request(Json::array({tool_reference("search")}))).generation;
+    failures += check(plain.tools.size() == 1 &&
+                          tool_message_text(plain, 2) == "Already available: search",
+                      "a tool_reference to a prompt tool changed the tool set");
+
+    // Mixed with ordinary text in the same result.
+    const GenerationRequest mixed =
+        parse(deferred_tools_request(Json::array(
+                  {Json{{"type", "text"}, {"text", "Found:"}}, tool_reference("get_forecast")})))
+            .generation;
+    failures += check(mixed.messages.at(2).content.size() == 2 &&
+                          mixed.messages.at(2).content[0].text == "Found:" &&
+                          mixed.messages.at(2).content[1].text.find("get_forecast") !=
+                              std::string::npos,
+                      "text beside a tool_reference was lost or reordered");
+
+    // Errors follow the Anthropic API.
+    const Json unknown = deferred_tools_request(Json::array({tool_reference("nope")}));
+    failures += check(api_code([&] { (void)parse(unknown); }) == "tool_reference_not_found" &&
+                          api_param([&] { (void)parse(unknown); }) == "messages",
+                      "an unknown tool_reference was not rejected");
+    Json empty_name = deferred_tools_request(Json::array({tool_reference("")}));
+    failures += check(api_param([&] { (void)parse(empty_name); }) == "messages",
+                      "an empty tool_reference name was accepted");
+
+    Json all_deferred = base_request();
+    all_deferred["tools"] = Json::array({named_tool("a", true), named_tool("b", true)});
+    failures += check(api_code([&] { (void)parse(all_deferred); }) == "all_tools_deferred",
+                      "a request with every tool deferred was accepted");
+    Json cached = base_request();
+    cached["tools"] = Json::array({named_tool("a", false), named_tool("b", true)});
+    cached["tools"][1]["cache_control"] = Json{{"type", "ephemeral"}};
+    failures += check(api_code([&] { (void)parse(cached); }) == "deferred_tool_cache_control",
+                      "cache_control on a deferred tool was accepted");
+
+    // A forced tool must be one the model can call.
+    Json forced = deferred_tools_request(Json::array({tool_reference("other")}));
+    forced["tool_choice"] = Json{{"type", "tool"}, {"name", "get_forecast"}};
+    failures += check(api_code([&] { (void)parse(forced); }) == "deferred_tool_not_loaded",
+                      "a tool_choice for an unloaded deferred tool was accepted");
+    forced["messages"] = deferred_tools_request(Json::array({tool_reference("get_forecast")}))
+                             .at("messages");
+    failures += check(api_code([&] { (void)parse(forced); }).empty(),
+                      "a tool_choice for a loaded deferred tool was rejected");
+
+    // Unreferenced deferred tools stay out of the prompt and out of the callable set.
+    Json idle = base_request();
+    idle["tools"] = Json::array({named_tool("a", false), named_tool("b", true)});
+    const GenerationRequest idle_request = parse(idle).generation;
+    const ninfer::PromptInput idle_prompt = prompt(idle_request);
+    failures += check(idle_request.tools.size() == 1 &&
+                          idle_prompt.options.tool_jsons.size() == 1 &&
+                          idle_prompt.options.loaded_tool_jsons.empty(),
+                      "an unreferenced deferred tool reached the prompt");
     return failures;
 }
 
@@ -1078,6 +1234,7 @@ int main() {
     failures += test_system_message_positions();
     failures += test_tool_history();
     failures += test_tools();
+    failures += test_deferred_tools();
     failures += test_prompt_object_order();
     failures += test_thinking_and_count_tokens();
     failures += test_thinking_history_transport_metadata();

@@ -7,6 +7,7 @@
 #include "serve/serve_options.h"
 
 #include <functional>
+#include <string>
 
 namespace ninfer::serve {
 
@@ -30,6 +31,10 @@ struct ResolvedPromptSemantics {
     std::string chat_template_kwargs_json;
     std::string graft;
 };
+
+// The JSON declaration the model sees for one tool: the entry of the system-prompt tool block, and
+// the text a tool_reference expands to. One function so the two can never drift apart.
+std::string render_tool_definition(const ToolDefinition& tool);
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,
                                                  const ServeOptions& server);

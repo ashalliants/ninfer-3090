@@ -88,6 +88,11 @@ struct ToolDefinition {
     bool strict = false;
     std::optional<std::string> input_examples_json;
     std::optional<CacheBoundary> cache_boundary_after;
+    // Declared with defer_loading and discovered later through a tool_reference in the history.
+    // The model can call it, but it stays out of the system-prompt tool block: its definition is in
+    // the conversation at the point of discovery, so discovering a tool never moves the prefix.
+    // Such tools follow every other tool in GenerationRequest::tools, in order of first reference.
+    bool loaded_on_demand = false;
 };
 
 struct ToolCall {
