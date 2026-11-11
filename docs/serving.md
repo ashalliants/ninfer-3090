@@ -2965,6 +2965,15 @@ per 0.01 of total variation at every threshold; decode speed +3 to +20% at tempe
 no measurable loss on gsm8k and MMLU-Pro at 300 and 280 items, and tool calls with declared names
 only. The cost is diversity, which those tasks do not measure.
 
+Measured on an RTX 3090 (2026-11-11), `P = 0.5`, sampled chat prompts at temperature 0.7, through a
+real `ninfer-serve` (so wall-clock decode speed, not just the acceptance-ratio effect):
+- DFlash2, 6 draft tokens: B/A median +2.32%, 12 of 12 positive, range +0.10%..+2.77%; acceptance
+  40.9% -> 43.1%.
+- MTP, 3 draft tokens: see the next GPU-verify update for this card's result.
+
+Both are the expected direction and in the range Basalt's own RTX 5090 numbers above suggest for
+this threshold; neither output-quality task (gsm8k/MMLU-Pro) was re-run on this card.
+
 ### Draft-head context rows
 
 The Qwen3.8-27B and Qwen3.6-35B-A3B drafters (MTP, DFlash and DFlash2 with the optimized proposal
