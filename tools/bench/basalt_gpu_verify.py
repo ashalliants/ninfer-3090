@@ -846,14 +846,15 @@ def run_relaxed_startup_step(ctx: Ctx, step: Step) -> dict:
     model = step.data["model"]
     port = free_port()
     argv = [str(ctx.serve), ctx.need_model(model), "--host", "127.0.0.1", "--port", str(port), "--max-context",
-            "8192", "--spec", "mtp", "--draft-tokens", "3", "--relaxed-drafting", "0.5", *no_state(model)]
+            "8192", "--spec", "mtp", "--draft-tokens", "3", "--relaxed-drafting", "0.5", "--model-id", "test-model",
+            *no_state(model)]
     if model == "flash-next":
-        argv += ["--kv-dtype", "int8"]
+        argv += ["--kv-dtype", "int8", "--allow-unlocked-host-memory"]
     server = Server(argv, log_dir(ctx, step) / "serve.log", None, port, ctx.windows)
     try:
         if not server.wait_ready():
             return result("FAIL", "the server did not start: " + tail(server.output(), 4))
-        code, body, _ = http(port, "/v1/chat/completions", body={"model": model,
+        code, body, _ = http(port, "/v1/chat/completions", body={"model": "test-model",
             "messages": [{"role": "user", "content": "Write a short poem about rivers."}], "max_tokens": 96,
             "temperature": 0.7, "top_p": 0.8, "top_k": 20})
         _, metrics, _ = http(port, "/metrics")
@@ -876,7 +877,8 @@ def pin_failure_line(line: str) -> bool:
 def run_partial_start_step(ctx: Ctx, step: Step) -> dict:
     port = free_port()
     argv = [str(ctx.serve), ctx.need_model("flash-next"), "--host", "127.0.0.1", "--port", str(port),
-            "--kv-dtype", "int8", "--partial-ram-residency", *no_state("flash-next")]
+            "--kv-dtype", "int8", "--model-id", "test-model", "--allow-unlocked-host-memory",
+            "--partial-ram-residency", *no_state("flash-next")]
     server = Server(argv, log_dir(ctx, step) / "serve.log", None, port, ctx.windows)
     try:
         ready = server.wait_ready()
@@ -885,7 +887,7 @@ def run_partial_start_step(ctx: Ctx, step: Step) -> dict:
         warning = next((line for line in lines if "cudaHostRegister" in line), None)
         pin_failure = next((line for line in lines if pin_failure_line(line)), None)
         if ready:
-            code, body, _ = http(port, "/v1/chat/completions", body={"model": "flash-next",
+            code, body, _ = http(port, "/v1/chat/completions", body={"model": "test-model",
                 "messages": [{"role": "user", "content": "Count to five."}], "max_tokens": 32, "temperature": 0})
             ready = code == 200
         detail = ("started and answered" if ready else "did not start") + \
@@ -934,7 +936,7 @@ def run_serve_smoke_step(ctx: Ctx, step: Step) -> dict:
                                  indent=2) + "\n", encoding="utf-8")
     port = free_port()
     argv = [str(ctx.serve), ctx.need_model("qwen38-27b"), "--config", str(config), "--host", "127.0.0.1",
-            "--port", str(port), "--admission-affinity"]
+            "--port", str(port), "--admission-affinity", "--model-id", "test-model"]
     server = Server(argv, log_dir(ctx, step) / "serve.log", None, port, ctx.windows)
     checks: dict[str, bool] = {}
     try:
@@ -946,7 +948,7 @@ def run_serve_smoke_step(ctx: Ctx, step: Step) -> dict:
         checks["Host gpubox.lan (--allowed-host in the config file) accepted"] = code == 200
         code, body, _ = http(port, "/v1/models", headers={"Origin": "http://evil.example"})
         checks["Origin of another site refused (403 origin_not_allowed)"] = code == 403 and "origin_not_allowed" in body
-        code, body, _ = http(port, "/v1/chat/completions", body={"model": "qwen38-27b",
+        code, body, _ = http(port, "/v1/chat/completions", body={"model": "test-model",
             "messages": [{"role": "user", "content": "Say hello."}], "max_tokens": 16, "temperature": 0})
         checks["a chat request answers"] = code == 200
         code, body, _ = http(port, "/slots")
