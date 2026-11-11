@@ -2116,6 +2116,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--lm-head-draft` | optimized proposal head; implied by `--spec`, accepted for compatibility | on with `--spec` |
 | `--ngram-draft-tokens 0\|15` | n-gram copy drafting beside `--spec dflash2`: when the text being written already appeared in the request (the prompt, a tool result -- including `cat -n` numbered ones -- or the output so far), a round verifies up to 15 copied tokens instead of the draft model's proposal; verification licenses every token, so a wrong copy costs speed, never output. Copies run when a round holds one or two requests (at two only for copies of 12 or more tokens, and only while the other request, whose row pays the copy width too, has the balance for it: about 3% of its round time if it never copies); see [the CLI guide](cli.md#n-gram-copy-drafting) | `0` (off) |
+| `--adaptive-draft-tokens 0\|3` | adaptive draft window beside `--spec dflash2` with `--draft-tokens` above 3: a second, narrower neural round (3 drafts) is captured next to the configured one and a round runs it when the requests' recent acceptance is low, since a captured graph costs the same however few drafts are live and only its captured width matters; it costs one more set of CUDA Graphs (startup refuses when they do not fit; it is not available at the concurrency where DFlash2 itself does not fit) and the target still verifies every token. Experimental: measured on an RTX 3090 at +2.9% on a low-acceptance prompt and no worse than -0.5% elsewhere, short of the +5% aimed for, and it can change greedy output; see [the CLI guide](cli.md#adaptive-draft-window) | `0` (off) |
 | `--ngram-min-match N` | tokens the end of the text must match before a copy is proposed, `4..64` | `12` |
 | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
@@ -2274,6 +2275,9 @@ as full-precision JSON numbers. Its `speculative` object contains `backend`, `dr
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, `accepted_per_position` (draft-model rounds
 only), `ngram_draft_tokens` (the copy window, 0 when off), and `ngram_rounds`, `ngram_drafted_tokens`
 and `ngram_accepted_tokens`, the copy rounds, which are a subset of the round and token counts above.
+`adaptive_draft_tokens` is the narrow window of `--adaptive-draft-tokens` (0 when off) and
+`adaptive_low_rounds` how many of the request's draft-model `rounds` ran at it; the rest ran at
+`draft_window`. The stderr request line adds `K=N in R rounds` when it is on.
 The stderr request line adds `copies accepted A/D (P%)` when the request verified copies. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
 `generation.scheduling` records preemptions, snapshot/replay restores, replayed tokens, paused time

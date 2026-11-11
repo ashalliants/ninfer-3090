@@ -452,6 +452,8 @@ int main() {
     outcome.metrics.speculative_ngram_rounds          = 40;
     outcome.metrics.speculative_ngram_drafted_tokens  = 600;
     outcome.metrics.speculative_ngram_accepted_tokens = 540;
+    outcome.metrics.speculative_adaptive_draft_tokens = 3;
+    outcome.metrics.speculative_adaptive_low_rounds   = 120;
     outcome.metrics.engine_request_id                 = 991;
     outcome.metrics.scheduling                        = {
                                .preemptions          = 3,
@@ -570,6 +572,12 @@ int main() {
                           done.at("speculative").at("ngram_drafted_tokens") == 600 &&
                           done.at("speculative").at("ngram_accepted_tokens") == 540,
                       "n-gram copy counters missing");
+    failures += check(done.at("speculative").at("adaptive_draft_tokens") == 3 &&
+                          done.at("speculative").at("adaptive_low_rounds") == 120,
+                      "adaptive draft window counters missing");
+    failures += check(render_request_done(context, outcome).message.find("K=3 in 120 rounds") !=
+                          std::string::npos,
+                      "stderr request line missing the adaptive draft window clause");
     failures += check(
         done.at("engine_timing").at("queue_wait_seconds") == 0.001 &&
             std::abs(done.at("engine_timing").at("host_exposed_seconds").at("total").get<double>() -

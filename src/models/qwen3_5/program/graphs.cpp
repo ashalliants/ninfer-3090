@@ -250,7 +250,7 @@ void ProgramImpl::prepare_graphs() {
                 dflash_host_ingress->context_frontiers[row] =
                     checked_i32(frontier, "graph representative DFlash context frontier");
                 dflash_host_ingress->proposal_valid_columns[row] =
-                    static_cast<std::int32_t>(draft_window + 1U);
+                    static_cast<std::int32_t>(std::min(draft_window, verify_drafts) + 1U);
                 dflash_host_ingress->proposal_extents[row] = static_cast<std::int32_t>(extent);
                 dflash_host_ingress->target_valid_columns[row] =
                     static_cast<std::int32_t>(extent + 1U);

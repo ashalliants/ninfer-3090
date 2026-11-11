@@ -138,6 +138,9 @@ void validate(const EngineOptions& options) {
     if (spec.ngram_draft_tokens != 0) {
         refuse("has no context-lookup drafts: remove --ngram-draft-tokens");
     }
+    if (spec.adaptive_draft_tokens != 0) {
+        refuse("has no adaptive draft window: remove --adaptive-draft-tokens");
+    }
     if (spec.backend == SpeculativeBackend::Mtp) {
         if (spec.draft_tokens < 1 || spec.draft_tokens > 7) {
             refuse("verifies at most 7 MTP drafts per round: use --draft-tokens 1..7");

@@ -224,6 +224,10 @@ result) instead of drafting it: agent turns that write back a file decode 53-76%
 with `NINFER_CONCURRENCY=2`, where the other lane is slowed by at most about 3% when it isn't
 copying. Set `NINFER_NGRAM=off` to turn it off.
 
+`--adaptive-draft-tokens 3` is an opt-in extra (not in any profile): it captures a second, narrower
+DFlash2 round and runs it while a request's drafts are mostly rejected. See
+[the CLI guide](docs/cli.md#adaptive-draft-window).
+
 `NINFER_SPEC=mtp` swaps to `--spec mtp --draft-tokens 3` and `--prefill-chunk 2048`, which runs
 the full 262,144 tokens with two lanes sharing the pool:
 

@@ -215,6 +215,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--lm-head-draft` | optimized proposal head; implied by `--spec`, accepted for compatibility | on with `--spec` |
 | `--ngram-draft-tokens 0\|15` | n-gram copy drafting beside `--spec dflash2`: when the text being written already appeared in the request (the prompt, a tool result -- including `cat -n` numbered ones -- or the output so far), a round verifies up to 15 copied tokens instead of the draft model's proposal; verification licenses every token, so a wrong copy costs speed, never output. Copies run at one or two lanes in a round; see [Speculative decoding](#n-gram-copy-drafting) | `0` (off) |
+| `--adaptive-draft-tokens 0\|3` | adaptive draft window beside `--spec dflash2` with `--draft-tokens` above 3: a second, narrower neural round (3 drafts) is captured next to the configured one and a round runs it when the requests' recent acceptance is low, since a captured graph costs the same however few drafts are live and only its captured width matters; it costs one more set of CUDA Graphs (startup refuses when they do not fit; it is not available at the concurrency where DFlash2 itself does not fit) and the target still verifies every token. Experimental: measured on an RTX 3090 at +2.9% on a low-acceptance prompt and no worse than -0.5% elsewhere, short of the +5% aimed for, and it can change greedy output; see [Adaptive draft window](#adaptive-draft-window) | `0` (off) |
 | `--ngram-min-match N` | tokens the end of the text must match before a copy is proposed, `4..64` | `12` |
 | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
@@ -350,6 +351,34 @@ decoded 42% faster overall and up to 76% faster on turns that return a file, at 
 output that never copies. At two lanes the replay's batch throughput rose 15%, and turns that copy
 little stayed within 1% of their speed without copies; see
 [performance](performance.md#n-gram-copy-drafting-rtx-3090-qwen38-27b).
+
+### Adaptive draft window
+
+A DFlash2 round costs the same whatever number of its drafts are live (the captured graph runs every
+column), and a wide window wastes time when most drafts are rejected: on a low-acceptance workload
+K = 3, 7 and 12 decode at 58.9, 53.2 and 46.1 tokens/s. `--adaptive-draft-tokens 3` (with
+`--spec dflash2` and `--draft-tokens` above 3) captures a second 3-draft round next to the
+configured one. Before each round the engine reads every request's recent acceptance (the drafts
+accepted against the drafts offered, weighted toward the last ten rounds) and runs the window that
+commits more tokens per second of round time. It leaves a window only for one at least 5% better and
+only after eight rounds, so acceptance sitting at the crossover does not flap; requests in the same
+round share one graph, so a batch runs the window that is best for the batch as a whole. It starts
+every request on the configured window. The target verifies every token at either width, so output
+stays what the target would write; the one difference from the fixed window is the different
+column count of the target's verify pass, as between any two `--draft-tokens` values. The second
+set of graphs is part of the startup memory plan; where it does not fit, startup refuses and the
+flag has to be dropped. `request_done.speculative` reports `adaptive_draft_tokens` and
+`adaptive_low_rounds`, the rounds the request ran at the narrow window. Off by default and in no launcher profile.
+
+Measured on an RTX 3090 (27B, DFlash2 at K = 7 against `--adaptive-draft-tokens 3`, greedy, INT8 KV,
+one to four lanes, three prompts of low, middle and high acceptance): the best cell is +2.94%
+(one lane, low acceptance, where the narrow window ran for 885 rounds) and the worst is -0.50%
+(one lane, middle acceptance), so no cell fell below the 0.98x bound. It missed the 1.05x aimed for
+on the low-acceptance prompt. At two and four lanes the narrow window never ran: lanes sharing a
+round share one graph, so a mixed batch rarely favours the narrow one, and the results sit within
+0.2% of the fixed window. It also changes greedy output when it switches (the verify pass runs at a
+different width, as between a fixed K = 3 and K = 7, which differ on all three prompts), so do not
+use it where a byte-stable answer matters. Details in TODO.md.
 
 ## CUDA synchronization
 

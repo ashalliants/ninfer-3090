@@ -17,6 +17,7 @@
 #include "models/qwen3_5/program/lossy/gap_map.h"
 #include "models/qwen3_5/program/lossy/lossy_flow.h"
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/program/speculative/draft_window_policy.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_address_space.h"
@@ -249,6 +250,9 @@ struct RequestControl {
     NgramCopyBackoff ngram_backoff;
     // How much more two-lane copy-round widening by its partner this request can absorb.
     NgramPartnerBalance ngram_partner;
+    // Recent per-draft acceptance of this request's neural rounds, which the adaptive draft window
+    // reads. Copy rounds are not counted: a copy's acceptance says nothing about the draft model.
+    DraftAcceptanceEstimate draft_acceptance;
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -519,6 +523,8 @@ public:
     // N-gram copy drafting: the copy family's window (0 when off) and the tail match a copy needs.
     const std::uint32_t ngram_draft_tokens;
     const std::uint32_t ngram_min_match;
+    // The adaptive draft window's narrow neural window (0 when off).
+    const std::uint32_t adaptive_draft_tokens;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
@@ -804,6 +810,14 @@ public:
     // Families are destroyed first, including when startup throws.
     DecodeGraphFamily ordinary_graphs;
     std::vector<SpeculativeRoundFamily> round_families;
+    // Chooses the neural family of each round (always the wide one when adaptation is off), with
+    // the measured round time of each family by batch size, which refines its cost prior.
+    DraftWindowSelector draft_window_selector;
+    // The lanes (one bit each) that shared the rounds the selector last chose for; it starts over
+    // when they change.
+    std::uint64_t draft_window_lane_set = 0;
+    std::array<RoundCostEstimate, kMaximumConcurrency + 1> narrow_round_cost;
+    std::array<RoundCostEstimate, kMaximumConcurrency + 1> wide_round_cost;
     // The narrowest family of `kind` that verifies at least `drafts`.
     [[nodiscard]] SpeculativeRoundFamily& round_family(SpeculativeRoundKind kind,
                                                        std::uint32_t drafts);

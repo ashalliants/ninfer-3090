@@ -108,9 +108,14 @@ void collect_shape_changes(std::uint32_t lo, std::uint32_t hi, const Shapes& sha
 
 std::vector<SpeculativeRoundShape> speculative_round_shapes(SpeculativeBackend backend,
                                                             std::uint32_t draft_window,
-                                                            std::uint32_t ngram_draft_tokens) {
+                                                            std::uint32_t ngram_draft_tokens,
+                                                            std::uint32_t adaptive_draft_tokens) {
     if (backend == SpeculativeBackend::None) { return {}; }
     std::vector<SpeculativeRoundShape> shapes{{SpeculativeRoundKind::Neural, draft_window}};
+    if (adaptive_draft_tokens != 0) {
+        // Captured after the wide family, whose driver execution storage it shares.
+        shapes.push_back({SpeculativeRoundKind::Neural, adaptive_draft_tokens});
+    }
     if (ngram_draft_tokens != 0) {
         shapes.push_back({SpeculativeRoundKind::Copy, ngram_draft_tokens});
     }

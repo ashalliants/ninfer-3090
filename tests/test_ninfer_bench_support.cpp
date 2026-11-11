@@ -389,7 +389,7 @@ int test_report_contract() {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 19, "report schema v19");
+    failures += expect(report.at("schema_version") == 20, "report schema v20");
     failures += expect(report.at("config").at("speculative_backend") == "mtp" &&
                            report.at("config").at("draft_tokens") == 5,
                        "report identifies its backend and window");
@@ -480,7 +480,8 @@ int test_human_and_csv_reports() {
          {"model_name", "artifact_path", "proposal_head", "kv_payload_bytes",
           "load_host_to_device_bytes", "workspace_general_capacity_bytes",
           "vision_handoff_capacity_bytes", "cuda_graph_allowance_bytes", "workspace_peak_bytes",
-          "workspace_allocator_peak_bytes", "spec_acceptance_rate", "decode_output_tok_s_mean",
+          "workspace_allocator_peak_bytes", "spec_acceptance_rate", "adaptive_draft_tokens",
+          "adaptive_low_rounds", "decode_output_tok_s_mean",
           "decode_engine_tok_s_mean", "total_seconds_mean"}) {
         failures += expect(csv.find(field) != std::string::npos,
                            std::string("CSV field ") + std::string(field));

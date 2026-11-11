@@ -288,6 +288,10 @@ OperationalRecord render_request_done(const RequestLogContext& context,
             << product::format_pretty_count(metrics.speculative_ngram_drafted_tokens) << " ("
             << product::format_pretty_percent(acceptance) << ')';
     }
+    if (metrics.speculative_adaptive_draft_tokens != 0) {
+        out << " | K=" << metrics.speculative_adaptive_draft_tokens << " in "
+            << product::format_pretty_count(metrics.speculative_adaptive_low_rounds) << " rounds";
+    }
     if (outcome.thinking.requested_budget) {
         out << " | thinking "
             << product::format_pretty_count(outcome.thinking.model_thinking_tokens) << '/'

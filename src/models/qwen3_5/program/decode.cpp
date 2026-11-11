@@ -169,7 +169,9 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
         .draft_window          = draft_window,
         .accepted_per_position = std::vector<std::uint64_t>(draft_window, 0),
         .ngram_draft_tokens    = ngram_draft_tokens,
+        .adaptive_draft_tokens = adaptive_draft_tokens,
     };
+    request.draft_acceptance = {};
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
     if (penalties) { CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream)); }
@@ -726,11 +728,41 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                 }
             }
         }
+        // A neural round runs the wide family, or with the adaptive draft window whichever of the
+        // two the rows' recent acceptance favours. The choice depends only on past rounds'
+        // outcomes, never on the output budget, so a budget-limited round runs the family an
+        // unlimited one would. Every row is verified by the target at the round's own width, so the
+        // window changes speed and never which drafts are accepted.
+        std::uint32_t neural_window = draft_window;
+        if (!copy_round && draft_window_selector.enabled()) {
+            std::array<DraftAcceptanceEstimate, kMaximumConcurrency> estimates;
+            // The selector's dwell belongs to one set of lanes sharing rounds: a different set
+            // (another batch size, a lane's request finishing or being replaced) or a request
+            // that has not yet had a neural round starts again on the configured window.
+            std::uint64_t lane_set = 0;
+            bool fresh_request     = false;
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                estimates[row] = requests[lanes[row]].draft_acceptance;
+                lane_set |= std::uint64_t{1} << lanes[row];
+                fresh_request = fresh_request || estimates[row].rounds() == 0;
+            }
+            if (fresh_request || lane_set != draft_window_lane_set) {
+                // The round that starts over runs the configured window outright: choose() would
+                // recompute both candidates and a cheap measured narrow round can win even on
+                // the zero-history prior.
+                draft_window_selector.reset();
+                draft_window_lane_set = lane_set;
+            } else {
+                neural_window = draft_window_selector.choose(
+                    std::span<const DraftAcceptanceEstimate>(estimates.data(), lanes.size()),
+                    narrow_round_cost[lanes.size()], wide_round_cost[lanes.size()]);
+            }
+        }
         // Every row of a round verifies at its family's width; the frame, egress and ReplaySSM
         // records are viewed at it.
         SpeculativeRoundFamily& family =
             copy_round ? round_family(SpeculativeRoundKind::Copy, ngram_draft_tokens)
-                       : round_family(SpeculativeRoundKind::Neural, draft_window);
+                       : round_family(SpeculativeRoundKind::Neural, neural_window);
         const std::uint32_t verify_drafts = family.shape.verify_drafts;
         const std::uint32_t width         = verify_drafts + 1U;
         // In a copy round a row without a copy verifies the draft model's neural window.
@@ -815,9 +847,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                 checked_i32(frontier, "DFlash batch frontier");
             dflash_host_ingress->context_frontiers[row] =
                 checked_i32(sequence.dflash_context_frontier, "DFlash context frontier");
-            // The draft model always proposes its own block, also beside copies.
+            // The draft model always proposes its own block, also beside copies; the narrow neural
+            // family proposes at its own width.
             dflash_host_ingress->proposal_valid_columns[row] =
-                static_cast<std::int32_t>(draft_window + 1U);
+                static_cast<std::int32_t>(std::min(draft_window, verify_drafts) + 1U);
             dflash_host_ingress->proposal_extents[row]       = static_cast<std::int32_t>(extent);
             dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
             for (std::uint32_t column = 0; column < width; ++column) {
@@ -897,6 +930,12 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         report_numeric_tripwire();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        if (!copy_round && draft_window_selector.enabled()) {
+            RoundCostEstimate& cost = verify_drafts == adaptive_draft_tokens
+                                          ? narrow_round_cost[lanes.size()]
+                                          : wide_round_cost[lanes.size()];
+            cost.observe(seconds);
+        }
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = active_sequence(lanes[row]);
             RequestControl& request       = requests[lanes[row]];
@@ -934,6 +973,12 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                                                      draft_window + 1U);
                     }
                 } else {
+                    request.draft_acceptance.observe(extent,
+                                                     static_cast<std::uint32_t>(accepted_i));
+                    if (draft_window_selector.enabled() && !copy_round &&
+                        verify_drafts == adaptive_draft_tokens) {
+                        request.speculative_stats.adaptive_low_rounds += 1;
+                    }
                     if (lanes.size() > 1 && lanes.size() <= copy_round_batch_limit(draft_window) &&
                         ngram_draft_tokens != 0) {
                         if (copy_round) {

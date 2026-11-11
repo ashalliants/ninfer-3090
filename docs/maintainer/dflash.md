@@ -254,6 +254,19 @@ proposal-valid tensor and target-valid tensor have different meanings. Columns o
 target live extent have no logical state effect. P=0 verifies only the anchor and selects a target
 output.
 
+### Adaptive window
+
+With `--adaptive-draft-tokens` the Program captures a second neural round family at a narrower K
+(3) beside the configured one. Both are ordinary neural rounds: the draft block, the target verify
+and the ReplaySSM records all run at the family's own width W=K+1 (the proposal-valid column count
+is `min(K_configured, K_family)+1`), and context catch-up already covers a previous round of either
+width. Only the choice between them is new: the pure policy in
+[`draft_window_policy.h`](../../src/models/qwen3_5/program/speculative/draft_window_policy.h) reads
+each request's recent accepted/offered drafts and the families' round times. It never depends on the
+output budget, so a budget-limited tail round runs the family an unlimited one would, and copy
+rounds are unaffected. Because the target verifies at either width, the committed tokens are the
+target's; the only variation versus a fixed K is the numerical path of a different verify width.
+
 ### Publication and state alignment
 
 If A proposals are accepted, target verification licenses

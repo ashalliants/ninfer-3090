@@ -808,6 +808,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.speculative_ngram_rounds          = result.speculative.ngram_rounds;
     outcome.metrics.speculative_ngram_drafted_tokens  = result.speculative.ngram_drafted_tokens;
     outcome.metrics.speculative_ngram_accepted_tokens = result.speculative.ngram_accepted_tokens;
+    outcome.metrics.speculative_adaptive_draft_tokens = result.speculative.adaptive_draft_tokens;
+    outcome.metrics.speculative_adaptive_low_rounds   = result.speculative.adaptive_low_rounds;
 
     outcome.tool_calls      = std::move(result.tool_calls);
     outcome.tool_call_parse = result.tool_call_parse;

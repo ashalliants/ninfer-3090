@@ -117,6 +117,12 @@ struct SpeculativeOptions {
     std::uint32_t ngram_draft_tokens = 0;
     // Tail tokens a copy must match before it is proposed, 4..64.
     std::uint32_t ngram_min_match = 12;
+    // Adaptive draft window beside DFlash2: a second, narrower neural round family of this many
+    // drafts is captured next to the `draft_tokens` one, and each round runs whichever the
+    // requests' recent acceptance favours. Only the captured window changes a round's cost (a
+    // captured graph executes every column whatever the live extent), hence two graphs. 0 disables
+    // it. Must be below `draft_tokens`; the product flag accepts 0 or 3. Requires DFlash2.
+    std::uint32_t adaptive_draft_tokens = 0;
 };
 
 enum class StartupPhase : std::uint8_t {
@@ -1388,6 +1394,10 @@ struct SpeculativeStats {
     std::uint64_t ngram_rounds          = 0;
     std::uint64_t ngram_drafted_tokens  = 0;
     std::uint64_t ngram_accepted_tokens = 0;
+    // Adaptive draft window: the narrow window (0 when off) and how many of `rounds` this request
+    // ran at it; the remaining draft-model rounds ran at `draft_window`.
+    std::uint32_t adaptive_draft_tokens = 0;
+    std::uint64_t adaptive_low_rounds   = 0;
 };
 
 struct ThinkingBudgetStats {

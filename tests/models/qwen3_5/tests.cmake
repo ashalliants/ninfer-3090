@@ -85,6 +85,18 @@ ninfer_add_test(ninfer_qwen3_5_dflash2_real_test
   LIBRARIES ninfer_engine
   TEST_ARGS 7 1 1 2 int8 0 1)
 
+# Adaptive draft window (--adaptive-draft-tokens 3) through the Engine: both neural round widths run
+# with CUDA Graph replay (argument 1) and eagerly (argument 0), a new request starts on the
+# configured window, and two lanes share one window per round.
+ninfer_add_test(ninfer_qwen3_5_adaptive_draft_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_adaptive_draft_real.cpp"
+  LIBRARIES ninfer_engine
+  TEST_ARGS 1)
+ninfer_bundle_command(ninfer_qwen3_5_adaptive_draft_real_command ninfer_tests
+  ninfer_qwen3_5_adaptive_draft_real_test)
+add_test(NAME ninfer_qwen3_5_adaptive_draft_eager_real_test
+  COMMAND ${ninfer_qwen3_5_adaptive_draft_real_command} 0)
+
 # N-gram copy rounds beside DFlash2: copy exactness against non-speculative greedy, lifecycle,
 # context-store restore, a constrained copy, a copying lane beside a drafting lane and preemption
 # of copying lanes.
@@ -212,6 +224,8 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_vision_workspace_test
   ninfer_qwen3_5_vision_overlay_real_test
   ninfer_qwen3_5_dflash2_real_test
+  ninfer_qwen3_5_adaptive_draft_real_test
+  ninfer_qwen3_5_adaptive_draft_eager_real_test
   ninfer_qwen3_5_ngram_real_test
   ninfer_qwen3_5_dflash_prefill_real_test
   ninfer_qwen3_5_moe_real_test
@@ -287,6 +301,10 @@ ninfer_add_test(ninfer_qwen3_5_text_positions_test
 
 ninfer_add_test(ninfer_qwen3_5_ngram_proposer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_proposer.cpp"
+  LIBRARIES ninfer_core)
+
+ninfer_add_test(ninfer_qwen3_5_draft_window_policy_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_draft_window_policy.cpp"
   LIBRARIES ninfer_core)
 # STANDALONE: the Python schema oracle drives this probe by executable path.
 ninfer_add_test(ninfer_qwen3_5_tool_constraints_test

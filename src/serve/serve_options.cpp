@@ -179,7 +179,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] "
            "[--spec mtp|dflash|dflash2 --draft-tokens N] "
-           "[--ngram-draft-tokens 0|15] [--ngram-min-match N] "
+           "[--ngram-draft-tokens 0|15] [--ngram-min-match N] [--adaptive-draft-tokens 0|3] "
            "[--default-max-tokens N] [--max-output-tokens N] [--default-thinking-budget N] "
            "[--reasoning-loop off|stop|conclude] "
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] "
@@ -303,6 +303,11 @@ std::string serve_usage_text(const char* argv0) {
            "output. 0 (the default) disables it. "
            "--ngram-min-match N (4..64, default 12) is how many tokens must match before a copy "
            "is proposed\n"
+           "       --adaptive-draft-tokens 3 (with --spec dflash2 and --draft-tokens above 3) captures "
+           "a second, narrower draft window and runs it on rounds where recent acceptance is low, "
+           "where the wide window wastes time on rejected drafts. It costs one more set of CUDA "
+           "Graphs (startup refuses when they do not fit); output is still verified by the "
+           "target. 0 (the default) disables it\n"
            "       --no-prefix-reuse disables cross-request history; request pause/replay "
            "resources remain available\n"
            "       --context-store DIR keeps retained sessions on disk so a restart or crash does "
@@ -789,6 +794,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--ngram-draft-tokens"), "ngram-draft-tokens"));
+        } else if (arg == "--adaptive-draft-tokens") {
+            options.speculative.adaptive_draft_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--adaptive-draft-tokens"), "adaptive-draft-tokens"));
         } else if (arg == "--ngram-min-match") {
             options.speculative.ngram_min_match = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--ngram-min-match"), "ngram-min-match"));

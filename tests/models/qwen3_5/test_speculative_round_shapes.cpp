@@ -64,12 +64,12 @@ bool same_shape(const ninfer::Tensor& tensor, std::initializer_list<std::int32_t
 
 void check_round_shapes() {
     using ninfer::SpeculativeBackend;
-    expect(qwen::detail::speculative_round_shapes(SpeculativeBackend::None, 0, 0).empty(),
+    expect(qwen::detail::speculative_round_shapes(SpeculativeBackend::None, 0, 0, 0).empty(),
            "no speculative backend has no round families");
     for (const auto backend :
          {SpeculativeBackend::Mtp, SpeculativeBackend::DFlash, SpeculativeBackend::DFlash2}) {
         for (const std::uint32_t k : {1U, 3U, 7U, 15U}) {
-            const auto shapes = qwen::detail::speculative_round_shapes(backend, k, 0);
+            const auto shapes = qwen::detail::speculative_round_shapes(backend, k, 0, 0);
             const std::string label =
                 "backend " + std::to_string(static_cast<int>(backend)) + " K" + std::to_string(k);
             expect(shapes == std::vector<SpeculativeRoundShape>{{SpeculativeRoundKind::Neural, k}},
@@ -80,13 +80,29 @@ void check_round_shapes() {
     }
     for (const std::uint32_t k : {1U, 7U, 15U}) {
         const auto shapes =
-            qwen::detail::speculative_round_shapes(SpeculativeBackend::DFlash2, k, 15);
+            qwen::detail::speculative_round_shapes(SpeculativeBackend::DFlash2, k, 15, 0);
         const std::string label = "DFlash2 K" + std::to_string(k) + " NG15";
         expect(shapes == std::vector<SpeculativeRoundShape>{{SpeculativeRoundKind::Neural, k},
                                                             {SpeculativeRoundKind::Copy, 15}},
                label + ": the neural family plus exactly one copy family at the copy window");
         expect(qwen::detail::max_verify_drafts(shapes) == 15,
                label + ": round storage is allocated at the copy window");
+    }
+    // The adaptive draft window adds one narrow neural family after the wide one and before any copy
+    // family; round storage stays at the widest.
+    {
+        const auto adaptive =
+            qwen::detail::speculative_round_shapes(SpeculativeBackend::DFlash2, 7, 0, 3);
+        expect(adaptive == std::vector<SpeculativeRoundShape>{{SpeculativeRoundKind::Neural, 7},
+                                                              {SpeculativeRoundKind::Neural, 3}},
+               "adaptive drafting captures a narrow neural family beside the wide one");
+        expect(qwen::detail::max_verify_drafts(adaptive) == 7, "narrow family adds no storage");
+        const auto both =
+            qwen::detail::speculative_round_shapes(SpeculativeBackend::DFlash2, 7, 15, 3);
+        expect(both == std::vector<SpeculativeRoundShape>{{SpeculativeRoundKind::Neural, 7},
+                                                          {SpeculativeRoundKind::Neural, 3},
+                                                          {SpeculativeRoundKind::Copy, 15}},
+               "adaptive and copy families coexist");
     }
     expect(qwen::detail::max_verify_drafts({}) == 0, "no families verify no drafts");
     const std::vector<SpeculativeRoundShape> mixed{{SpeculativeRoundKind::Neural, 7},
