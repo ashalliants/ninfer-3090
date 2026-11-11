@@ -31,6 +31,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_device_sync_invalid_test
   ninfer_effective_thinking_budget_test
   ninfer_engine_scheduling_test
+  ninfer_dsv4_perf_model_test
   ninfer_flash_next_perf_model_test
   ninfer_gdn_head_map_test
   ninfer_gdn_replay_records_test
@@ -146,6 +147,10 @@ if(UNIX)
 endif()
 
 get_property(ninfer_all_tests DIRECTORY PROPERTY TESTS)
+# Pure-Python, registered only where NumPy imports (BenchSupportTests.cmake), so never a stale name.
+if("ninfer_dsv4_tools_test" IN_LIST ninfer_all_tests)
+  list(APPEND NINFER_CPU_ONLY_TESTS ninfer_dsv4_tools_test)
+endif()
 foreach(test IN LISTS NINFER_CPU_ONLY_TESTS)
   # A stale name must not silently turn into "no test", leaving it on the GPU list unnoticed.
   if(NOT test IN_LIST ninfer_all_tests)
