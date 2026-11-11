@@ -232,7 +232,7 @@ def capture(work: Path, tokens_per_domain: int) -> None:
         class Hooked(type(module)):
             def __call__(self, x, *args, **kwargs):
                 flat = np.array(x.astype(mx.float32)).reshape(-1, x.shape[-1])
-                store.setdefault(key, []).append(flat  # FP32: FP16 would clip outliers above 65504)
+                store.setdefault(key, []).append(flat)  # FP32: FP16 would clip outliers above 65504
                 return call(x, *args, **kwargs)
 
         module.__class__ = Hooked
