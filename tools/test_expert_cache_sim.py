@@ -169,7 +169,9 @@ def test_invalid_trace_metadata_rejected():
     header = '{"format": "ninfer-routing-trace", "version": 1, "layers": %s, "experts": %s}\n'
     cases = [(header % ("1.9", "4"), ""), (header % ("0", "4"), ""), (header % ("true", "4"), ""),
              (header % ("1", "4"), '{"t": 1.5, "r": [[0]]}\n'), (header % ("1", "4"), '{"t": 0, "r": [[0]]}\n'),
-             (header % ("1", "4"), '{"t": 1, "r": [[0.5]]}\n'), (header % ("1", "4"), '{"t": 1, "r": [["2"]]}\n')]
+             (header % ("1", "4"), '{"t": 1, "r": [[0.5]]}\n'), (header % ("1", "4"), '{"t": 1, "r": [["2"]]}\n'),
+             (header % ("1", "4"), '[1, 2]\n'), (header % ("1", "4"), '{"t": 1, "r": 5}\n'),
+             (header % ("1", "4"), '{"t": 1, "r": [3]}\n'), ("[1]\n", "")]
     with tempfile.TemporaryDirectory() as d:
         for i, (head, body) in enumerate(cases):
             path = os.path.join(d, f"bad{i}.jsonl")
@@ -183,17 +185,21 @@ def test_invalid_trace_metadata_rejected():
 
 
 def test_default_swap_cap_follows_tokens():
-    # 2 layers, interval 4: 8 tokens between re-selections allows round(2 * 8 / 4) = 4 swaps, not layers*every/interval.
-    s = sim.WindowedSim(2, 8, 4, window=4, every=2, interval=4)
-    s.resident[:4] = True
-    s.n_resident = 4
-    s.win[4:8] = 5
-    check(s._reselect(8) == 4, "token-based default cap allows 4 swaps")
-    s2 = sim.WindowedSim(2, 8, 4, window=4, every=2, interval=4)
-    s2.resident[:4] = True
-    s2.n_resident = 4
-    s2.win[4:8] = 5
-    check(s2._reselect(2) == 1, "2 tokens elapsed allow 1 swap")
+    # 2 layers, interval 4: 8 accrued tokens allow 2 * (8 // 4) = 4 swaps; a fractional budget allows none
+    # and the remainder carries over, as in LfruSim.decode_budget.
+    def make(tokens):
+        s = sim.WindowedSim(2, 8, 4, window=4, every=2, interval=4)
+        s.resident[:4] = True
+        s.n_resident = 4
+        s.win[4:8] = 5
+        s.budget_tokens = tokens
+        return s
+
+    check(make(8)._reselect() == 4, "8 tokens allow 4 swaps")
+    s = make(2)
+    check(s._reselect() == 0 and s.budget_tokens == 2, "2 tokens (< interval) allow no swap and carry over")
+    s.budget_tokens += 2
+    check(s._reselect() == 2 and s.budget_tokens == 0, "carried remainder completes one interval")
 
 
 def test_cli_rejects_invalid_parameters():

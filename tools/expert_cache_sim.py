@@ -77,7 +77,8 @@ def read_trace(path):
     """(layers, experts, rounds) with rounds a list of (tokens, [np.int64 array per layer])."""
     with _opener(path, "rt") as handle:
         header = json.loads(handle.readline())
-        if header.get("format") != "ninfer-routing-trace" or header.get("version") != 1:
+        if (not isinstance(header, dict) or header.get("format") != "ninfer-routing-trace"
+                or header.get("version") != 1):
             raise ValueError("not a ninfer-routing-trace v1 file")
         layers, experts = header.get("layers"), header.get("experts")
         if not (_is_int(layers) and _is_int(experts) and layers > 0 and experts > 0):
@@ -87,13 +88,15 @@ def read_trace(path):
             if not line.strip():
                 continue
             record = json.loads(line)
+            if not isinstance(record, dict) or not isinstance(record.get("r"), list):
+                raise ValueError(f"round {len(rounds) + 1}: want an object with a list \"r\"")
             if not _is_int(record.get("t")) or record["t"] < 1:
                 raise ValueError(f"round {len(rounds) + 1}: t must be a positive integer")
             if len(record["r"]) != layers:
                 raise ValueError(f"round {len(rounds) + 1}: {len(record['r'])} layers, want {layers}")
             groups = []
             for ids in record["r"]:
-                if not all(_is_int(e) for e in ids):
+                if not isinstance(ids, list) or not all(_is_int(e) for e in ids):
                     raise ValueError(f"round {len(rounds) + 1}: expert ids must be integers")
                 group = np.unique(np.asarray(ids, dtype=np.int64))
                 if len(group) and (group[0] < 0 or group[-1] >= experts):
@@ -266,7 +269,7 @@ class WindowedSim:
         # Default swap budget matches LFRU's steady-state promotion rate: `layers` per `interval` tokens,
         # applied to the tokens elapsed since the previous re-selection (rounds can carry many tokens).
         self.max_swaps, self.interval = max_swaps, interval
-        self.tokens_since_select = 0
+        self.budget_tokens = 0  # tokens accrued towards the default swap budget, like LfruSim.budget_tokens
         n = layers * experts
         self.win = np.zeros(n, dtype=np.int64)
         self.ring = deque()
@@ -289,13 +292,11 @@ class WindowedSim:
             if len(self.ring) > self.window:
                 self.win[self.ring.popleft()] -= 1
             if self.n_resident < self.frames:
-                self.tokens_since_select = 0
                 res.promotions += self._fill(all_keys, tokens)
-            elif index % self.every == 0:
-                res.promotions += self._reselect(self.tokens_since_select + tokens)
-                self.tokens_since_select = 0
             else:
-                self.tokens_since_select += tokens
+                self.budget_tokens += tokens
+                if index % self.every == 0:
+                    res.promotions += self._reselect()
             res.record_round(tokens)
         return res
 
@@ -314,9 +315,15 @@ class WindowedSim:
                 added += 1
         return added
 
-    def _reselect(self, tokens_elapsed):
-        budget = self.max_swaps if self.max_swaps is not None else max(
-            1, round(self.layers * tokens_elapsed / self.interval))
+    def _reselect(self):
+        if self.max_swaps is not None:
+            budget = self.max_swaps
+        else:  # LFRU's rate: FILL_BUDGET_PER_LAYER per layer per `interval` tokens, remainder carried over
+            due = self.budget_tokens // self.interval
+            self.budget_tokens %= self.interval
+            budget = due * FILL_BUDGET_PER_LAYER * self.layers
+        if budget <= 0:
+            return 0
         candidates = np.flatnonzero(~self.resident & (self.win > 0))
         if len(candidates) == 0:
             return 0
