@@ -4180,6 +4180,7 @@ private:
         std::vector<float> ones(static_cast<std::size_t>(c_.hc.streams) * execution::kMtpChunkColumns, 1.0F);
         CUDA_CHECK(cudaMemcpy(spec_base() + s.ones, ones.data(), ones.size() * sizeof(float), cudaMemcpyHostToDevice));
         records_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+        rows_records_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
         lane_graphs_.resize(plan_.lanes);
         for (auto& g : lane_graphs_) {
             g.folds.resize(static_cast<std::size_t>(plan_.max_width) + 1);
@@ -4229,6 +4230,36 @@ private:
         v.conv_scratch = Tensor(spec_base() + s.conv, DType::BF16,
                                 {dim(c_.gdn.conv_channels()), dim(c_.gdn.conv_kernel - 1)});
         v.initial_slot = Tensor(spec_base() + s.slot, DType::I32, {1});
+        return v;
+    }
+
+    // The N-row batched verify's own records and scratch at width W
+    // (docs/maintainer/mtp-multi-row-lanes-design.md): record_capacity == plan_.lanes, never
+    // sharing the single-row verify_view's region above (that one serves one speculating lane at a
+    // time; several rows' scratch must coexist in the same round).
+    execution::ForwardRowsVerify rows_verify_view(std::int32_t W) {
+        auto& records = rows_records_.at(static_cast<std::size_t>(W));
+        if (!records) {
+            GdnReplayRecordSpec spec = gdn_records_spec(c_, W, options_.gdn_head_map);
+            spec.record_capacity     = static_cast<std::int32_t>(plan_.lanes);
+            LayoutBuilder builder;
+            const auto layout = plan_gdn_replay_records(builder, spec);
+            records.emplace(DeviceSpan{spec_base() + plan_.spec.rows_gdn_offset, plan_.spec.rows_gdn_bytes}, layout);
+        }
+        const auto& s          = plan_.spec;
+        const auto lanes       = static_cast<std::int32_t>(plan_.lanes);
+        const std::int32_t di = dim(c_.qsa.index_head_dim), r = dim(c_.qsa.compress_ratio);
+        execution::ForwardRowsVerify v;
+        v.gdn        = *records;
+        v.ple_inputs = Tensor(spec_base() + s.rows_ple, DType::BF16, {dim(c_.residual_width()), W, lanes});
+        for (std::uint32_t l = 0; l < c_.attention_layers; ++l) {
+            v.qsa_tails.emplace_back(spec_base() + s.rows_tails + s.rows_tails_layer_stride * l, DType::BF16,
+                                     std::initializer_list<std::int32_t>{di, r - 1, lanes});
+        }
+        for (std::int32_t row = 0; row < lanes; ++row) {
+            v.qsa_keys.emplace_back(spec_base() + s.rows_qsa_keys + s.rows_qsa_keys_stride * static_cast<std::size_t>(row),
+                                    DType::BF16, std::initializer_list<std::int32_t>{di, W, dim(c_.attention_layers)});
+        }
         return v;
     }
 
@@ -5378,6 +5409,9 @@ private:
     const execution::VisionInput* call_vision_ = nullptr;
     std::vector<execution::VisionInput> mtp_vision_inputs_;
     std::vector<std::optional<GdnReplayRecords>> records_;
+    // The N-row batched verify's own records (rows_verify_view), lazily built per width like
+    // records_ above, at record_capacity == plan_.lanes -- a separate region, never shared.
+    std::vector<std::optional<GdnReplayRecords>> rows_records_;
     // --gdn-async-commit: the fold stream (null when off). Declared after the state and the
     // speculation buffers, so it is destroyed (waiting for the fold in flight) before they are freed.
     std::unique_ptr<GdnFoldStream> fold_stream_;
