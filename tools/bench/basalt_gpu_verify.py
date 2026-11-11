@@ -826,9 +826,12 @@ def run_greedy_master_step(ctx: Ctx, step: Step) -> dict:
     prompts = ctx.out / "inputs" / f"prompt-{d['prompt']}.jsonl"
     prompts.parent.mkdir(parents=True, exist_ok=True)
     prompts.write_text(chat_prompt_lines()[d["prompt"] - 1] + "\n", encoding="utf-8")
+    extra = d["extra"]
+    if d["model"] == "flash-next":
+        extra = (extra + " --kv-dtype int8").strip()
     argv = [sys.executable, str(HERE / "greedy_identity.py"), "--a", str(ctx.args.master_cli),
             "--b", str(ctx.exe("apps/ninfer")), "--model", ctx.need_model(d["model"]), "--tokens", "128",
-            "--prompts", str(prompts), f"--extra-args={d['extra']}"]
+            "--prompts", str(prompts), f"--extra-args={extra}"]
     code, output = run_logged(argv, log_dir(ctx, step) / "greedy.log")
     verdict = next((line for line in output.splitlines() if line.startswith("GREEDY")), tail(output, 2))
     return result({0: "PASS", 1: "FAIL"}.get(code, "ERROR"), verdict, config=d["config"], prompt=d["prompt"])
