@@ -102,48 +102,66 @@ first `lanes` slots as `initial_state_slots` targets (the just-copied windows), 
 device-to-device memcpys, same cost class as the single-row path's existing tail/conv scratch
 copies), but it is easy to miss, since nothing in the single-row code suggests it is needed.
 
+## Implementation progress (branch `feat/mtp-multi-row-lanes`, commits after this doc)
+
+Items 1-3 below are done, built, and verified on a real Linux GPU box (compiles clean, and the
+existing `ninfer_qwen4_exp_program_plan_test` -- which checks this exact memory layout -- still
+passes, confirming the new region is additive and does not disturb the single-row plan). Nothing
+exercises any of it yet; it is all reachable-but-uncalled code until the pieces below it land.
+
+1. `ForwardRowsVerify`/`ForwardRowsVerifyBatch` and `Forward::run_rows_verify_front/back` in
+   `forward.h`/`forward.cpp`. Two real simplifications found while writing this that are worth
+   keeping, not reverting to the originally-designed-more-complex version:
+   - **No `causal_conv1d_silu_snapshot`, no scratch-staging dance.** The GDN convolution step is
+     cheap relative to the recurrence it sits next to, so `gdn_rows_verify` just loops per row
+     calling `causal_conv1d_silu_split` (the single-row "distinct state" form, which takes any
+     disjoint input/output with no shared slot-indexing scheme) directly against the real live
+     window -- no staging, no extra scratch, removing an entire class of risk for near-zero
+     performance cost. The batched GDN *recurrence* (`gated_delta_net_replay_record`) is still
+     genuinely batched across rows; that is the part that actually matters for throughput.
+   - **`qsa_keys` is `std::vector<Tensor>` (one per row), not one 4D tensor.** The forward pass
+     wants per-(layer, row) access and the commit wants one row's whole `[Di, W, layers]` slab at
+     once (`qsa_commit_tails` takes every layer in one call); no single axis order makes both
+     slicing patterns contiguous at once, so this sidesteps the question entirely by giving each
+     row its own tensor, shaped exactly like the single-row case's `qsa_keys`.
+2. `SpecLayout::plan()` extended with a second, independent `record_capacity = lanes` region
+   (`rows_gdn`/`rows_ple`/`rows_qsa_keys`/`rows_tails`), appended via the same `take()` builder
+   after the existing single-row fields.
+3. `rows_verify_view(W)`, paralleling `verify_view(W)`, lazily building `ForwardRowsVerify` from
+   the new region (a new `rows_records_` member, parallel to `records_`).
+4. **Found while scoping the next piece (IO staging), not yet acted on:** the existing
+   `IoLayout`/`plan_.io.ids/positions/rope/block_rope/logit_columns` fields are already sized for
+   `columns` (the widest call anywhere -- prefill chunks, easily thousands) wide, far more than
+   `B * W` (<= 8) ever needs, so **no new IoLayout region is needed** for those fields: a new
+   `write_rows_verify_inputs`-style function can write directly into the existing `io_host_`/
+   `io_device_` scratch at `b * W`-offset column ranges, for each row's own lane (`lanes_[lane]`,
+   not `L()`, since this needs several lanes' own history/rope without switching `cur_`). Separately,
+   `plan_.io.rows_block`/`rows_rope` (already `lanes`-sized, built for `decode_rows()`'s one
+   triple-per-row need) can likely be reused as-is for this path's `block_start_rope` too --
+   genuinely the same shape and purpose, not just a coincidence.
+5. **Decision: no CUDA graph capture in the first version.** The single-row verify path's
+   `replay()`/`launch_round()` graph machinery is a real optimization but an orthogonal one -- the
+   throughput win this feature chases comes from batching the forward pass across rows, not from
+   graph replay. `verify_rows()` should call `run_rows_verify_front/back` eagerly (every round,
+   no capture), exactly matching how every new path in this codebase already starts (eager on the
+   first round in the single-row case too). Graph capture for this path is a clean, separable
+   follow-up once correctness is established, not a blocker for a first working version.
+
 ## What's still open (where this document stops, and implementation starts)
 
-1. **New structs** (`forward.h`): `ForwardRowsVerify` (an N-row `ForwardVerify`: `GdnReplayRecords`
-   with `record_capacity` planned for `kMaximumLanes` (today 2, so this grows for free if that cap
-   rises later), `qsa_keys`/`qsa_tails` scratch and `conv_scratch` sized per lane,
-   `initial_slots: I32[N]` holding the active lanes' real slot indices) and
-   `ForwardRowsVerifyBatch` (an N-row, W-column-per-row version of `ForwardRowsBatch`:
-   `ids`/`positions`/`rope_positions`/`ngram_rows` etc. sized `[N*W]` instead of `[B]`, row-major
-   with each row's W columns contiguous, `slots`/`slot_ids` dynamically sized like
-   `ForwardRowsBatch::slots` already is).
-2. **New Forward methods** (`forward.cpp`): `run_rows_verify_front/back`, a new
-   `layer_rows_verify(layer, batch)` parallel to `layer_rows`, with `gdn_rows_verify` (dense
-   batching + `gated_delta_net_replay_record` + `causal_conv1d_silu_snapshot`, both called once
-   with B=N) and `attention_rows_verify` (the per-row W-column loop described above, `for (b = 0;
-   b < N; ++b)`).
-3. **Memory planning: extend `SpecLayout::plan()` directly** (`program.cpp` ~line 426). This struct
-   already plans the single-row verify scratch (`out.ple`, `out.qsa_keys`, `out.tails`, `out.conv`,
-   `out.slot`, `out.gdn`/`out.gdn_bytes` via `gdn_records_spec(c, width, ...)` with
-   `record_capacity` hardcoded to `1`); confirmed NOT reusable for the rows case, both because it
-   is sized for exactly one active speculator and because of the conv-snapshot gap above. Add a
-   parallel set of fields (`rows_gdn`/`rows_gdn_bytes` via a second `gdn_records_spec`-style call
-   with `record_capacity = lanes`, `rows_ple`, `rows_qsa_keys`, `rows_tails`, `rows_conv_scratch`
-   sized `[C, K, 2 * lanes]` per the gap above, `rows_initial_slots`), all taken from the *same*
-   `take()` builder already in this function, sized by the `lanes` parameter `plan()` already
-   receives (not a literal row count -- this function is already called with the real lane count,
-   so it is N-general for free). One concrete, encouraging precedent already in this struct: `out.slot
-   = take(4 * lanes)` is **already sized by `lanes`**, even though `verify_view()` today only ever
-   reads word 0 of it -- i.e. this exact region was already over-provisioned for more than one
-   concurrent speculator, just never used that way.
-4. **New graphs: Program-level, not per-lane** (`program.cpp`'s `lane_graphs_`/`LaneGraphs` is the
-   wrong home for these). Resolved by reading `select_lane()` directly: the per-lane `LaneGraphs`
-   exist because the single-row verify scratch's *source* addresses (`tails_base_`, `ple_state_`,
-   `mtp_tail_`) are repointed by `select_lane()` to whichever *one* lane is currently speculating,
-   so a graph capturing them must be captured once per lane. In the batched design, row i maps to
-   lane i for the server's entire lifetime (not round to round), so both rows' source addresses are
-   fixed forever -- exactly the situation the existing plain-rows path is already in, and it
-   correctly uses a **single, Program-level graph pair** (`rows_front_graph_`, `rows_back_graph_`,
-   declared as plain members, not inside `lane_graphs_`). The new verify-rows graphs should follow
-   that precedent: new Program-level members (not per-lane), indexed by `width` alone (the row
-   count is fixed at `kMaximumLanes` within one running server, so there is nothing else to index
-   by at runtime, even though the *code* should not hardcode that number as a literal).
-5. **New program-level functions**: `try_speculate_rows(sequences, budgets, masks)` (the N-row
+Items equivalent to the original 1-4 here are now **done** -- see "Implementation progress" above
+for what actually landed (in places, simpler than originally planned here: no `conv_scratch`/
+`initial_slots` staging dance, `qsa_keys` as a vector not a single tensor, no new `IoLayout` region
+needed, and no CUDA graph capture in the first version). What remains:
+
+1. **The IO staging function**: a `write_rows_verify_inputs(rows, width)`-style function, writing
+   each active row's W-column ids/positions/RoPE/n-gram-rows into the existing `io_host_`/
+   `io_device_` scratch at `row * W`-offset column ranges (confirmed large enough: sized for
+   `columns`, the widest call anywhere), reading each row's own `lanes_[lane]` state directly
+   (not `L()`, since several lanes' own history/RoPE are needed without switching `cur_`), and each
+   row's `block_start_rope` via the existing `plan_.io.rows_block` (already `lanes`-sized, built
+   for `decode_rows()`'s identical one-triple-per-row need).
+2. **New program-level functions**: `try_speculate_rows(sequences, budgets, masks)` (the N-row
    sibling of `try_speculate`, taking `sequences.size()` as N rather than assuming 2, gated so it
    only attempts the batched path when *every* active row independently passes `try_speculate`'s
    existing eligibility checks -- budget, not constrained without `--mtp-constrained`, not
@@ -155,15 +173,15 @@ copies), but it is easy to miss, since nothing in the single-row code suggests i
    N-general); a `commit_speculative_rows()` (the N-row sibling of `commit_verified()`, using
    `GdnReplayFoldPlan::execute()` with N `GdnReplayFoldRow` entries and calling `qsa_commit_tails`
    N times).
-6. **`decode()`'s dispatch**: replace the unconditional `if (sequences.size() > 1) return
+3. **`decode()`'s dispatch**: replace the unconditional `if (sequences.size() > 1) return
    decode_rows(...)` with "try `try_speculate_rows`, fall back to `decode_rows` if it declines."
-7. **Testing**: a new exactness test mirroring the project's own convention
+4. **Testing**: a new exactness test mirroring the project's own convention
    (`ninfer_qwen4_exp_lanes_real_test --exact --mtp`): run the batched 2-row path and, separately,
    each row's own single-lane MTP path on an identical prompt pair, and assert the outputs are
    **bitwise identical**. This is the only way to catch an indexing/stride mistake in the new code
    -- there is no CPU reference implementation of any of these kernels to check against on paper,
    and the failure mode of a subtle bug here is silently wrong generation, not a crash.
-8. **This needs a CUDA-capable GPU for every step past (1)**: this Mac has no `nvcc`, so none of
+5. **This needs a CUDA-capable GPU for every step past (1)**: this Mac has no `nvcc`, so none of
    this compiles here, and correctness can only be established by actually running the exactness
    test on real hardware (there is no CPU-side way to validate GDN/QSA kernel numerics).
 
