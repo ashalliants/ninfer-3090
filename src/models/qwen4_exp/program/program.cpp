@@ -190,9 +190,23 @@ struct ContractAccess {
         out.timing_ = timing;
         return out;
     }
+    // A verification round over several rows at once (docs/maintainer/mtp-multi-row-lanes-design.md):
+    // row i licenses counts[i] tokens of tokens (stride wide, row-major -- row i's tokens start at
+    // tokens[i * stride]).
+    static PendingBatch make_speculative_rows(const void* owner, std::uint64_t transaction,
+                                              std::span<const SequenceHandle> rows, std::span<const TokenId> tokens,
+                                              std::span<const std::int32_t> counts, std::uint32_t stride,
+                                              runtime::ExecutionTiming timing, std::span<const bool> constraint_failed) {
+        PendingBatch out = make_rows(owner, transaction, rows, tokens, timing, constraint_failed);
+        for (std::size_t i = 0; i < rows.size(); ++i) { out.counts_[i] = counts[i]; }
+        out.stride_      = stride;
+        out.speculative_ = true;
+        return out;
+    }
     static const void* owner(const PendingBatch& p) noexcept { return p.owner_; }
     static std::uint64_t transaction(const PendingBatch& p) noexcept { return p.transaction_; }
     static std::span<const SequenceHandle> rows(const PendingBatch& p) noexcept { return {p.rows_.data(), p.row_count_}; }
+    static bool speculative(const PendingBatch& p) noexcept { return p.speculative_; }
     static void consume(PendingBatch& p) noexcept {
         p.owner_       = nullptr;
         p.transaction_ = 0;
@@ -1873,10 +1887,13 @@ public:
                 throw std::logic_error("Qwen3.8-Flash-Next: decode row is not at a committed frontier");
             }
         }
-        // Several rows decode together in one plain round (MTP drafts only when one row decodes:
-        // docs/maintainer/flash-next-lanes-spike.md); one row runs the single-sequence round.
+        // Several rows: a batched MTP verification round when every row is eligible for one
+        // (try_speculate_rows, docs/maintainer/mtp-multi-row-lanes-design.md), else a plain round
+        // (MTP drafts only when one row decodes otherwise: docs/maintainer/flash-next-lanes-spike.md).
+        // One row runs the single-sequence round below.
         if (sequences.size() > 1) {
             join_gdn_fold();
+            if (auto speculative = try_speculate_rows(sequences, budgets, masks, start)) { return std::move(*speculative); }
             return decode_rows(sequences, failed, masks, start);
         }
         const nvtx::ScopedRange range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode);
@@ -2018,9 +2035,11 @@ public:
             for (std::size_t row = 0; row < rows.size(); ++row) { constraint[row] = pending.constraint_failed(row); }
             std::array<SequenceHandle, kMaximumLanes> handles{};
             std::copy(rows.begin(), rows.end(), handles.begin());
-            const std::size_t count = rows.size();
+            const std::size_t count   = rows.size();
+            const bool speculative_rows = ContractAccess::speculative(pending);
             ContractAccess::consume(pending);
             pending_ = 0;
+            if (speculative_rows) { return commit_speculative_rows({handles.data(), count}, decisions, constraint, start); }
             return commit_rows({handles.data(), count}, decisions, constraint, start);
         }
         select_lane(ContractAccess::lane(rows[0]));
@@ -4181,6 +4200,7 @@ private:
         CUDA_CHECK(cudaMemcpy(spec_base() + s.ones, ones.data(), ones.size() * sizeof(float), cudaMemcpyHostToDevice));
         records_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
         rows_records_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
+        rows_folds_.resize(static_cast<std::size_t>(plan_.max_width) + 1);
         lane_graphs_.resize(plan_.lanes);
         for (auto& g : lane_graphs_) {
             g.folds.resize(static_cast<std::size_t>(plan_.max_width) + 1);
@@ -4204,6 +4224,8 @@ private:
             g.row_catch_runs.assign(plan_.lanes, 0);
         }
         pending_tokens_.assign(static_cast<std::size_t>(plan_.max_width), 0);
+        rows_pending_stride_ = static_cast<std::size_t>(plan_.max_width);
+        rows_pending_tokens_.assign(rows_pending_stride_ * plan_.lanes, 0);
     }
 
     // The verification records of a W-column round: the GDN records planned at width W over the
@@ -4819,6 +4841,375 @@ private:
         return out;
     }
 
+    // ---------------------------------------------------------------- MTP speculation over several lanes
+    // (docs/maintainer/mtp-multi-row-lanes-design.md). Every active row drafts up to the same
+    // shared ceiling (the most-constrained row's own remaining budget), then verifies every row's W
+    // columns in one batched forward call; acceptance stays per row (cheap beside that forward,
+    // reusing the single-row accept Op unchanged) against that row's own joint-acceptance-trimmed
+    // count. Requires --mtp-joint-acceptance (the tuned profile's default): the adaptive, non-joint
+    // policy can choose a different K per row from acceptance history alone, which this first
+    // version does not support. A constrained row (grammar/tool calls) is not supported either --
+    // either falls the whole round back to today's plain decode_rows(). The drafter is not caught
+    // up after a commit here (unlike the single-row commit_verified/mtp_catch_up): a stale drafter
+    // can only cost future acceptance rate, never correctness, since every draft is independently
+    // verified against the real model regardless of how it was proposed -- a deliberate, tracked
+    // scope cut for this first version, not an oversight.
+
+    // The N-row batched verify's own commit fold plan at width W: bound to every lane's own slot in
+    // the shared state pool at once (slot_count == plan_.lanes, no per-lane narrowing), unlike the
+    // single-row fold(W) above (which narrows to the one speculating lane's own offset in
+    // state_backing_). Program-level, not per-lane: see rows_folds_'s comment.
+    const ops::GdnReplayFoldPlan& rows_fold(std::int32_t W) {
+        auto& plan = rows_folds_.at(static_cast<std::size_t>(W));
+        if (!plan) {
+            (void)rows_verify_view(W);
+            const auto* state = static_cast<std::byte*>(state_backing_.p);
+            const auto& conv0 = plan_.sections.at(0);
+            const auto& rec0  = plan_.sections.at(1);
+            const std::int64_t stride =
+                c_.gdn_layers > 1 ? static_cast<std::int64_t>(plan_.sections.at(2).at - conv0.at) : 0;
+            const auto lanes32 = static_cast<std::int32_t>(plan_.lanes);
+            LinearAttentionStateAllLayersView view;
+            view.conv_layer0 = Tensor(const_cast<std::byte*>(state) + conv0.at, DType::BF16,
+                                      {dim(c_.gdn.conv_channels()), dim(c_.gdn.conv_kernel - 1), lanes32});
+            view.recurrent_layer0 =
+                Tensor(const_cast<std::byte*>(state) + rec0.at, DType::FP32,
+                      {dim(c_.gdn.key_head_dim), dim(c_.gdn.value_head_dim), dim(c_.gdn.value_heads), lanes32});
+            view.conv_layer_stride_bytes      = stride;
+            view.recurrent_layer_stride_bytes = stride;
+            view.spec = LinearAttentionStatePoolSpec{.layers         = c_.gdn_layers,
+                                                     .conv_channels  = dim(c_.gdn.conv_channels()),
+                                                     .conv_width     = dim(c_.gdn.conv_kernel - 1),
+                                                     .value_heads    = dim(c_.gdn.value_heads),
+                                                     .value_head_dim = dim(c_.gdn.value_head_dim),
+                                                     .key_head_dim   = dim(c_.gdn.key_head_dim),
+                                                     .slot_count     = lanes32};
+            plan.emplace(*rows_records_.at(static_cast<std::size_t>(W)), view);
+        }
+        return *plan;
+    }
+
+    // Stages the round's inputs: row b's W columns (its own anchor at its own state position, then
+    // its own drafted tokens) at columns [b*W, (b+1)*W) of the shared io block -- exactly
+    // write_inputs/read_rows's own staging, one row at a time, each row's history temporarily
+    // extended with its own drafts (the single-row verify path's own trick) and restored right
+    // after that row's columns are written.
+    void stage_rows_verify_inputs(std::span<const std::uint32_t> lanes,
+                                  const std::array<std::vector<TokenId>, kMaximumLanes>& row_drafts,
+                                  std::int32_t W) {
+        const auto& io    = plan_.io;
+        auto* host        = static_cast<std::byte*>(io_host_.data());
+        auto* ids         = reinterpret_cast<std::int32_t*>(host + io.ids);
+        auto* pos         = reinterpret_cast<std::int32_t*>(host + io.positions);
+        auto* rope        = reinterpret_cast<std::int32_t*>(host + io.rope);
+        auto* block       = reinterpret_cast<std::int32_t*>(host + io.rows_block);
+        auto* slots       = reinterpret_cast<std::int32_t*>(host + io.rows_slots);
+        const auto B      = static_cast<std::int32_t>(lanes.size());
+        const auto total  = static_cast<std::int32_t>(B) * W;
+        const std::size_t heads = hash_.heads(), row_bytes = c_.ple.table.row_bytes;
+        row_ids_.resize(static_cast<std::size_t>(total) * heads);
+        for (std::int32_t b = 0; b < B; ++b) {
+            slots[b] = static_cast<std::int32_t>(lanes[static_cast<std::size_t>(b)]);
+            select_lane(lanes[static_cast<std::size_t>(b)]);
+            const std::size_t history = L().history.size();
+            const auto& drafts        = row_drafts[static_cast<std::size_t>(b)];
+            L().history.insert(L().history.end(), drafts.begin(), drafts.end());
+            const auto first = L().state_tokens;
+            for (std::int32_t j = 0; j < W; ++j) {
+                const std::int32_t column = b * W + j;
+                ids[column] = L().history[static_cast<std::size_t>(first) + static_cast<std::size_t>(j)];
+                pos[column] = static_cast<std::int32_t>(first) + j;
+            }
+            stage_rope(L().rope, first, W, std::span<std::int32_t>(rope, 3ULL * static_cast<std::size_t>(total)),
+                      total, b * W);
+            stage_rope_value(block_start_rope(L().rope, first, c_.qsa.compress_ratio),
+                             std::span<std::int32_t>(block, 3ULL * static_cast<std::size_t>(B)), B, b);
+            ngram_window_rows(hash_, L().history, {}, static_cast<std::int64_t>(first), W, ngram_window_,
+                              std::span<std::uint32_t>(row_ids_).subspan(static_cast<std::size_t>(b * W) * heads,
+                                                                         static_cast<std::size_t>(W) * heads));
+            L().history.resize(history);
+        }
+        volume_.read_rows(row_ids_, std::span<std::byte>(host + io.ngram, row_ids_.size() * row_bytes));
+        upload_pinned(io_device_.p, io_host_.data(), io.ngram + row_ids_.size() * row_bytes, device_.stream);
+    }
+
+    // The N-row batched verify's forward batch at width W: row b's W columns at
+    // [b*W, (b+1)*W) of every tensor, staged by stage_rows_verify_inputs above. `verify` must
+    // outlive the call (the caller's own local, like the single-row batch(W, true, &view) pattern).
+    execution::ForwardRowsVerifyBatch rows_verify_batch(std::span<const std::uint32_t> lanes, std::int32_t W,
+                                                        const execution::ForwardRowsVerify* verify) const {
+        const auto& io = plan_.io;
+        auto* base     = static_cast<std::byte*>(io_device_.p);
+        const auto B   = static_cast<std::int32_t>(lanes.size());
+        const auto T   = B * W;
+        execution::ForwardRowsVerifyBatch b;
+        for (const std::uint32_t lane : lanes) { b.slots.push_back(static_cast<std::int32_t>(lane)); }
+        b.slot_ids         = Tensor(base + io.rows_slots, DType::I32, {B});
+        b.width            = W;
+        b.ids              = Tensor(base + io.ids, DType::I32, {T});
+        b.positions        = Tensor(base + io.positions, DType::I32, {T});
+        b.rope_positions   = Tensor(base + io.rope, DType::I32, {T, 3});
+        b.block_start_rope = Tensor(base + io.rows_block, DType::I32, {3, B});
+        b.ngram_rows       = Tensor(base + io.ngram, DType::U8, {dim(c_.ple.table.row_bytes), dim(hash_.heads()), T});
+        b.verify           = verify;
+        return b;
+    }
+
+    // Row b's acceptance from the round's combined BF16 logits (its own [V, W] slice), against its
+    // own joint-acceptance-trimmed K of its own drafts: the single-row accept Op, unchanged, reused
+    // on the single shared scratch (spec_words_host/device, configs_) sequentially, once per row --
+    // cheap beside the batched forward above, so batching it is not where this feature's win is.
+    // Returns the row's licensed count, writing its licensed tokens into rows_pending_tokens_.
+    std::int32_t accept_row(std::int32_t b, std::int32_t W, std::span<const TokenId> drafts, const Tensor& wide16,
+                            bool& constraint_failed) {
+        const cudaStream_t s  = device_.stream;
+        const auto& sp        = plan_.spec;
+        const std::int32_t K  = static_cast<std::int32_t>(drafts.size());
+        const std::int32_t S  = static_cast<std::int32_t>(L().state_tokens);
+        auto* words           = spec_words_host();
+        for (std::int32_t j = 0; j < K; ++j) { words[sp.w_drafts + j] = drafts[static_cast<std::size_t>(j)]; }
+        words[sp.w_extents] = K;
+        words[sp.w_lengths] = S;
+        words[sp.w_anchors] = L().history[static_cast<std::size_t>(S)];
+        upload_pinned(spec_words_device(), words, 4 * sp.w_mtp_ids, s);
+        Tensor column_logits = wide16.slice(1, b * W, W);
+        Tensor target         = spec_word(sp.w_target, W);
+        ops::argmax(column_logits, target, plan_.token_domain, s);
+        const bool relaxed = install_round_config({}) > 0.0F;
+        {
+            auto scope      = work_->scope();
+            Tensor licensed = spec_word(sp.w_licensed, W).view({W, 1});
+            Tensor counts   = spec_word(sp.w_counts, 1);
+            Tensor accepted = spec_word(sp.w_accepted, 1);
+            Tensor lengths  = spec_word(sp.w_lengths, 1);
+            Tensor anchors  = spec_word(sp.w_anchors, 1);
+            Tensor kept     = spec_word(sp.w_relaxed, 1);
+            ops::speculative_accept_greedy_drafts(target.view({W, 1}), column_logits.view({vocab_, W, 1}),
+                                                  spec_word(sp.w_drafts, K).view({K, 1}), spec_word(sp.w_extents, 1),
+                                                  lengths, anchors, licensed, counts, accepted, plan_.token_domain,
+                                                  configs_, *work_, s, relaxed ? &kept : nullptr);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(words + sp.w_licensed, spec_words_device() + sp.w_licensed,
+                                   4ULL * (sp.w_accepted + 1 - sp.w_licensed), cudaMemcpyDeviceToHost, s));
+        device_.synchronize();
+        const std::int32_t LC = words[sp.w_counts], A = words[sp.w_accepted];
+        if (LC < 1 || LC > W || A != LC - 1) {
+            throw std::logic_error("Qwen3.8-Flash-Next: acceptance returned an invalid extent");
+        }
+        constraint_failed = false; // constrained rows are not supported here; try_speculate_rows excludes them
+        for (std::int32_t j = 0; j < LC; ++j) {
+            const TokenId token = words[sp.w_licensed + j];
+            if (token < 0 || token >= plan_.token_domain) {
+                throw std::runtime_error("Qwen3.8-Flash-Next: the verification produced non-finite logits");
+            }
+            rows_pending_tokens_[static_cast<std::size_t>(b) * rows_pending_stride_ + static_cast<std::size_t>(j)] =
+                token;
+        }
+        auto& stats = L().speculative;
+        ++stats.rounds;
+        stats.drafted_tokens += static_cast<std::uint64_t>(K);
+        stats.accepted_tokens += static_cast<std::uint64_t>(A);
+        if (stats.accepted_per_position.size() < static_cast<std::size_t>(plan_.drafts)) {
+            stats.accepted_per_position.resize(static_cast<std::size_t>(plan_.drafts), 0);
+        }
+        for (std::int32_t j = 0; j < A; ++j) { ++stats.accepted_per_position[static_cast<std::size_t>(j)]; }
+        for (std::int32_t j = 0; j < K; ++j) {
+            ++L().mtp_offered[static_cast<std::size_t>(j)];
+            if (j < A) { ++L().mtp_taken[static_cast<std::size_t>(j)]; }
+        }
+        for (std::int32_t j = 0; j < K && j <= A; ++j) {
+            double& a = L().mtp_accept[static_cast<std::size_t>(j)];
+            a         = (1.0 - kAcceptanceWeight) * a + kAcceptanceWeight * (j < A ? 1.0 : 0.0);
+        }
+        return LC;
+    }
+
+    // The round's eligibility, every active row (try_speculate's own checks, generalized): one
+    // ineligible row falls the whole round back to today's plain decode_rows(), simple and
+    // conservative.
+    std::optional<PendingBatch> try_speculate_rows(std::span<const SequenceHandle> sequences,
+                                                   std::span<const runtime::RoundBudget> budgets,
+                                                   runtime::TokenMaskProvider* masks, Clock::time_point start) {
+        if (!options_.mtp_joint_acceptance) { return std::nullopt; }
+        const auto B = static_cast<std::int32_t>(sequences.size());
+        std::array<std::int32_t, kMaximumLanes> limits{};
+        for (std::int32_t b = 0; b < B; ++b) {
+            select_lane(ContractAccess::lane(sequences[static_cast<std::size_t>(b)]));
+            const auto& budget = budgets[static_cast<std::size_t>(b)];
+            if (plan_.drafts == 0 || !L().mtp_live || (masks != nullptr && masks->constrained(static_cast<std::size_t>(b))) ||
+                cpu_verify_failed()) {
+                return std::nullopt;
+            }
+            const std::int64_t room = std::min<std::int64_t>(static_cast<std::int64_t>(budget.generated_tokens_remaining) - 1,
+                                                              static_cast<std::int64_t>(L().extent) - L().state_tokens - 1);
+            const std::int32_t limit = static_cast<std::int32_t>(std::clamp<std::int64_t>(room, 0, plan_.drafts));
+            if (limit <= 0) { return std::nullopt; }
+            limits[static_cast<std::size_t>(b)] = limit;
+        }
+        const std::int32_t shared_limit = *std::min_element(limits.begin(), limits.begin() + B);
+        if (shared_limit <= 0) { return std::nullopt; }
+        return verify_rows(sequences, shared_limit, start);
+    }
+
+    // The round's speculative verification over every row in `sequences`: every row drafts the
+    // same shared ceiling, verified together in one batched forward call; acceptance stays per row
+    // (accept_row above) against each row's own joint-acceptance-trimmed count.
+    PendingBatch verify_rows(std::span<const SequenceHandle> sequences, std::int32_t limit, Clock::time_point start) {
+        const nvtx::ScopedRange range(nvtx::Name::DecodeMtpRound, nvtx::Category::Decode);
+        const auto B    = static_cast<std::int32_t>(sequences.size());
+        const std::int32_t W = limit + 1;
+        for (std::int32_t b = 0; b < B; ++b) {
+            round_lanes_[static_cast<std::size_t>(b)] = ContractAccess::lane(sequences[static_cast<std::size_t>(b)]);
+        }
+        const std::span<const std::uint32_t> lanes(round_lanes_.data(), static_cast<std::size_t>(B));
+        try {
+            // Draft every row in turn: cheap beside the verify forward below, reused unchanged from
+            // the single-row path via select_lane. Each row's drafts and joint-acceptance
+            // probabilities are copied out before the next row's mtp_draft() overwrites the shared
+            // scratch they land in.
+            std::array<std::vector<TokenId>, kMaximumLanes> row_drafts;
+            for (std::int32_t b = 0; b < B; ++b) {
+                select_lane(lanes[static_cast<std::size_t>(b)]);
+                const auto drafted = mtp_draft(limit);
+                const std::span<const float> probs(static_cast<const float*>(draft_probs_host_.data()),
+                                                   static_cast<std::size_t>(limit));
+                const int kept     = joint_acceptance_window(probs, L().joint_threshold.current());
+                L().joint_offered  = kept;
+                std::copy_n(probs.begin(), kept, L().joint_probs.begin());
+                row_drafts[static_cast<std::size_t>(b)].assign(drafted.begin(), drafted.begin() + kept);
+            }
+            stage_rows_verify_inputs(lanes, row_drafts, W);
+            residency_->before_round(device_.stream);
+            join_gdn_fold();
+            const execution::ForwardRowsVerify view = rows_verify_view(W);
+            auto batch                              = rows_verify_batch(lanes, W, &view);
+            Tensor wide32(logits32_.data, DType::FP32, {vocab_, B * W});
+            Tensor wide16(logits16_.data, DType::BF16, {vocab_, B * W});
+            forward_->run_rows_verify_front(batch);
+            forward_->run_rows_verify_back(batch, wide32);
+            ops::cast_fp32_to_bf16(wide32, wide16, device_.stream);
+            std::array<std::int32_t, kMaximumLanes> counts{};
+            std::array<bool, kMaximumLanes> constraint_failed{};
+            for (std::int32_t b = 0; b < B; ++b) {
+                select_lane(lanes[static_cast<std::size_t>(b)]);
+                counts[static_cast<std::size_t>(b)] =
+                    accept_row(b, W, row_drafts[static_cast<std::size_t>(b)], wide16, constraint_failed[static_cast<std::size_t>(b)]);
+                rows_pending_count_[static_cast<std::size_t>(b)] = counts[static_cast<std::size_t>(b)];
+            }
+            runtime::ExecutionTiming timing;
+            timing.submit_host_ns = elapsed_ns(start);
+            round_width_          = W;
+            deferred_             = true;
+            pending_              = ++transaction_;
+            for (std::int32_t b = 0; b < B; ++b) { lanes_[lanes[static_cast<std::size_t>(b)]].phase = Phase::Pending; }
+            ++decode_rounds_;
+            ++rows_rounds_;
+            return ContractAccess::make_speculative_rows(
+                this, pending_, sequences, {rows_pending_tokens_.data(), rows_pending_tokens_.size()},
+                {counts.data(), static_cast<std::size_t>(B)}, static_cast<std::uint32_t>(rows_pending_stride_), timing,
+                {constraint_failed.data(), static_cast<std::size_t>(B)});
+        } catch (...) {
+            for (std::int32_t b = 0; b < B; ++b) {
+                select_lane(round_lanes_[static_cast<std::size_t>(b)]);
+                release_lane();
+            }
+            throw;
+        }
+    }
+
+    // Commits a batched verification round (the N-row sibling of commit_verified): each row keeps
+    // its own first accepted_tokens licensed tokens; the GDN fold and QSA tails take those columns'
+    // records, one GdnReplayFoldRow per row in a single rows_fold(W).execute() call. The drafter is
+    // not caught up here (see this section's own top comment): a future round that draws on it
+    // simply redrafts from a stale anchor, costing only acceptance rate, never correctness.
+    CommitResult commit_speculative_rows(std::span<const SequenceHandle> rows,
+                                         std::span<const runtime::CommitDecision> decisions,
+                                         const std::array<bool, kMaximumLanes>& constraint_failed,
+                                         Clock::time_point start) {
+        const cudaStream_t s = device_.stream;
+        const auto& sp       = plan_.spec;
+        const std::int32_t W = round_width_;
+        round_width_          = 1;
+        const auto B          = static_cast<std::int32_t>(rows.size());
+        CommitResult out;
+        out.row_count = B;
+        std::array<ops::GdnReplayFoldRow, kMaximumLanes> fold_rows{};
+        std::int32_t total_tokens = 0;
+        for (std::int32_t b = 0; b < B; ++b) {
+            const std::uint32_t lane = ContractAccess::lane(rows[static_cast<std::size_t>(b)]);
+            select_lane(lane);
+            const auto& d = decisions[static_cast<std::size_t>(b)];
+            const bool released = d.cancelled || d.failed;
+            if (released) {
+                if ((d.cancelled && d.failed) || (!d.cancelled && d.failed != constraint_failed[static_cast<std::size_t>(b)]) ||
+                    d.accepted_tokens != 0 || !d.terminal) {
+                    for (std::int32_t r = 0; r < B; ++r) {
+                        select_lane(ContractAccess::lane(rows[static_cast<std::size_t>(r)]));
+                        release_lane();
+                    }
+                    throw std::logic_error("Qwen3.8-Flash-Next: a round's pending decision is invalid");
+                }
+                fold_rows[static_cast<std::size_t>(b)] = {static_cast<std::int32_t>(lane), static_cast<std::int32_t>(lane), 0};
+                out.rows[static_cast<std::size_t>(b)].timings     = timings();
+                out.rows[static_cast<std::size_t>(b)].speculative = speculative_stats();
+                out.rows[static_cast<std::size_t>(b)].disposition =
+                    d.failed ? runtime::CommitDisposition::FailedReleased : runtime::CommitDisposition::CancelledReleased;
+                continue;
+            }
+            const auto k = static_cast<std::int32_t>(d.accepted_tokens);
+            if (k < 1 || k > rows_pending_count_[static_cast<std::size_t>(b)]) {
+                for (std::int32_t r = 0; r < B; ++r) {
+                    select_lane(ContractAccess::lane(rows[static_cast<std::size_t>(r)]));
+                    release_lane();
+                }
+                throw std::logic_error("Qwen3.8-Flash-Next: commit exceeds the licensed tokens");
+            }
+            if (L().joint_offered > 0) {
+                L().joint_threshold.observe(std::span<const float>(L().joint_probs.data(),
+                                                                   static_cast<std::size_t>(L().joint_offered)),
+                                            k - 1);
+                L().joint_offered = 0;
+            }
+            const std::int32_t S = static_cast<std::int32_t>(L().state_tokens);
+            if (L().history.size() == L().prompt_tokens) {
+                L().first_token_seconds = std::chrono::duration<double>(Clock::now() - L().admitted).count();
+                L().cache_at_decode     = residency_->stats();
+                L().ngram_at_decode     = volume_.counters();
+            }
+            for (std::int32_t j = 0; j < k; ++j) {
+                L().history.push_back(
+                    rows_pending_tokens_[static_cast<std::size_t>(b) * rows_pending_stride_ + static_cast<std::size_t>(j)]);
+            }
+            L().state_tokens += static_cast<std::uint32_t>(k);
+            total_tokens += k;
+            fold_rows[static_cast<std::size_t>(b)] = {static_cast<std::int32_t>(lane), static_cast<std::int32_t>(lane), k};
+            // The real live tail and PLE history of row b's columns: qsa_commit_tails and
+            // ple_conv_commit take one row at a time (single-sequence Ops, see the design doc).
+            auto* host_commit = spec_words_host();
+            host_commit[sp.w_commit] = k;
+            upload_pinned(spec_words_device() + sp.w_commit, host_commit + sp.w_commit, 4, s);
+            const Tensor positions(static_cast<std::byte*>(io_device_.p) + plan_.io.positions + 4ULL * static_cast<std::size_t>(b * W),
+                                   DType::I32, {W});
+            const Tensor commit = spec_word(sp.w_commit, 1);
+            Tensor tail0(tails_base_, DType::BF16, {dim(c_.qsa.index_head_dim), dim(c_.qsa.compress_ratio) - 1});
+            ops::qsa_commit_tails(rows_verify_view(W).qsa_keys[static_cast<std::size_t>(b)], positions, commit, tail0,
+                                  static_cast<std::int64_t>(tail_layer_stride_), s);
+            ops::ple_conv_commit(rows_verify_view(W).ple_inputs.slice(2, b, 1).view({dim(c_.residual_width()), W, 1}),
+                                 commit, ple_state_, ple_slot_, s);
+            L().phase = d.terminal ? Phase::Finishable : Phase::Decode;
+            out.rows[static_cast<std::size_t>(b)].disposition =
+                d.terminal ? runtime::CommitDisposition::Finishable : runtime::CommitDisposition::Active;
+            out.rows[static_cast<std::size_t>(b)].timings              = timings();
+            out.rows[static_cast<std::size_t>(b)].speculative          = speculative_stats();
+            out.rows[static_cast<std::size_t>(b)].speculative_counters = speculative_counters();
+            L().permit = false;
+        }
+        rows_fold(W).execute({fold_rows.data(), static_cast<std::size_t>(B)}, s);
+        settle_round(B * W, total_tokens);
+        out.timing.post_host_ns = elapsed_ns(start);
+        return out;
+    }
+
     SpeculativeStats speculative_stats() const {
         SpeculativeStats out = L().speculative;
         out.backend          = plan_.drafts > 0 ? SpeculativeBackend::Mtp : SpeculativeBackend::None;
@@ -5412,11 +5803,22 @@ private:
     // The N-row batched verify's own records (rows_verify_view), lazily built per width like
     // records_ above, at record_capacity == plan_.lanes -- a separate region, never shared.
     std::vector<std::optional<GdnReplayRecords>> rows_records_;
+    // The N-row batched verify's own commit fold plan (rows_fold), Program-level like
+    // rows_front_graph_/rows_back_graph_ (not per-lane: row i is lane i for the server's whole
+    // life, so the view below never changes which physical state it binds).
+    std::vector<std::optional<ops::GdnReplayFoldPlan>> rows_folds_;
     // --gdn-async-commit: the fold stream (null when off). Declared after the state and the
     // speculation buffers, so it is destroyed (waiting for the fold in flight) before they are freed.
     std::unique_ptr<GdnFoldStream> fold_stream_;
     std::vector<TokenId> pending_tokens_, drafts_;
     std::int32_t pending_count_ = 0, round_width_ = 1;
+    // A batched multi-row verification round's own state (docs/maintainer/mtp-multi-row-lanes-
+    // design.md), separate from the single-row members above: row b's licensed tokens at
+    // rows_pending_tokens_[b * rows_pending_stride_ .. ), and its licensed count (read at commit,
+    // like pending_count_ above but one per row).
+    std::vector<TokenId> rows_pending_tokens_;
+    std::size_t rows_pending_stride_ = 0;
+    std::array<std::int32_t, kMaximumLanes> rows_pending_count_{};
     bool plain_round_           = false;
     std::array<std::uint64_t, 9> verify_rounds_{};
 
