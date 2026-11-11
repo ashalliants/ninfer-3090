@@ -165,6 +165,17 @@ def test_lfru_matches_cpp_conformance_fixture():
     check((got_hits, got_misses) == (hits, misses), f"fixture totals {got_hits}/{got_misses} vs {hits}/{misses}")
 
 
+def test_cli_rejects_invalid_parameters():
+    for bad in (["--frames", "0"], ["--window", "-1"], ["--every", "0"], ["--interval", "0"],
+                ["--min-gain", "-1"], ["--hysteresis", "-0.5"], ["--max-swaps", "-2"], ["--expert-bytes", "-1"]):
+        try:
+            sim.main(["unused-trace"] + bad)
+        except SystemExit as e:
+            check(e.code == 2, f"{bad}: exit code {e.code}")
+        else:
+            check(False, f"{bad} was accepted")
+
+
 if __name__ == "__main__":
     test_lfru_hand_computed()
     test_lfru_protects_group_and_budget()
@@ -174,4 +185,5 @@ if __name__ == "__main__":
     test_curve_and_per_layer()
     test_trace_roundtrip()
     test_lfru_matches_cpp_conformance_fixture()
+    test_cli_rejects_invalid_parameters()
     print("expert_cache_sim: all checks passed")

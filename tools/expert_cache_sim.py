@@ -352,6 +352,14 @@ def main(argv=None):
     p.add_argument("--expert-bytes", type=float, default=DEFAULT_EXPERT_BYTES)
     p.add_argument("--per-layer", action="store_true")
     args = p.parse_args(argv)
+    for name in ("frames", "window", "every", "interval"):
+        if getattr(args, name) < 1:
+            p.error(f"--{name} must be at least 1")
+    for name in ("hysteresis", "min_gain", "expert_bytes"):
+        if getattr(args, name) < 0:
+            p.error(f"--{name.replace('_', '-')} must not be negative")
+    if args.max_swaps is not None and args.max_swaps < 0:
+        p.error("--max-swaps must not be negative")
     layers, experts, rounds = read_trace(args.trace)
     print(f"{len(rounds)} rounds, {layers} layers, {experts} experts per layer, frames {args.frames}")
     compare(layers, experts, rounds, args.frames, args.window, args.every, args.hysteresis, args.min_gain,
