@@ -87,6 +87,32 @@ with tempfile.TemporaryDirectory() as scratch:
     done = run("--arm-a", fake, "--arm-b", second, "--reps", 2, "--config", "d:{exe} --job y", "--quiet")
     check("two-build mode still works", done.returncode == 0 and "+0.00%" in done.stdout, done.stdout + done.stderr)
 
+    # --save-a-samples / --a-samples: reusing one arm A across comparisons.
+    saved_logs, saved = root / "saved-logs", root / "saved.json"
+    done = run("--arm-a", fake, "--reps", 4, "--b-args=--fast", "--config", "decode:{exe} --job z",
+               "--log-dir", saved_logs, "--save-a-samples", saved, "--quiet")
+    check("a run with --save-a-samples still exits 0", done.returncode == 0, done.stdout + done.stderr)
+    check("--save-a-samples writes a value per repetition",
+          saved.is_file() and json.loads(saved.read_text(encoding="utf-8")) == [100.0] * 4,
+          saved.read_text(encoding="utf-8") if saved.is_file() else "missing")
+
+    reused_logs, reused_report = root / "reused-logs", root / "reused.json"
+    done = run("--arm-a", fake, "--reps", 4, "--b-args=--fast", "--config", "decode:{exe} --job z",
+               "--log-dir", reused_logs, "--a-samples", saved, "--json", reused_report, "--quiet")
+    check("a run with --a-samples still exits 0", done.returncode == 0, done.stdout + done.stderr)
+    check("reusing arm A gives the same result as measuring it",
+          json.loads(reused_report.read_text(encoding="utf-8"))["configs"][0].get("median") == 1.1,
+          reused_report.read_text(encoding="utf-8") if reused_report.is_file() else "missing")
+    a_logs = sorted(reused_logs.glob("decode-A-*.log")) if reused_logs.is_dir() else []
+    check("--a-samples runs no arm A subprocess", a_logs == [], [p.name for p in a_logs])
+    b_logs = sorted(reused_logs.glob("decode-B-*.log")) if reused_logs.is_dir() else []
+    check("--a-samples still runs arm B every repetition", len(b_logs) == 4, [p.name for p in b_logs])
+
+    done = run("--arm-a", fake, "--reps", 8, "--b-args=--fast", "--config", "decode:{exe} --job z",
+               "--a-samples", saved, "--quiet")
+    check("--a-samples refuses fewer saved values than --reps",
+          done.returncode != 0 and "at least" in done.stderr, done.stdout + done.stderr)
+
 if failures:
     print(f"{len(failures)} check(s) failed:")
     for failure in failures:

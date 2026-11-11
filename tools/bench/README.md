@@ -121,6 +121,17 @@ python tools/bench/run_interleaved_ab.py --arm-a build-ninja/tests/ninfer_tests.
 
 Its self-test, `ninfer_interleaved_ab_test`, uses a fake executable and needs no GPU.
 
+**Reusing one arm A across several comparisons.** `--save-a-samples FILE` writes the measured arm-A
+values (one per repetition) to a JSON file; a later run passes `--a-samples FILE` to reuse them for
+its first (positional) `--config` instead of measuring arm A again, halving that comparison's wall
+time. This is only safe once the card has reached a steady clock/thermal state -- it is exactly the
+"all of arm A, then all of arm B" failure mode above, deferred to *across* runs instead of within
+one, so a run that doesn't already trust the card's stability should leave it alone and measure arm
+A every time. A `--control`, if given, is never served from the cache: its whole purpose is catching
+drift a cache cannot show. `basalt_gpu_verify.py --shared-baseline` uses this to share one arm-A
+measurement across every option whose "off" configuration is identical, cutting its total measurement
+time roughly in half; see that script's `--shared-baseline` help for the cache key.
+
 ## Greedy identity between two builds (`greedy_identity.py`)
 
 Do two builds produce the same tokens? The tool runs each `ninfer` CLI on every prompt of a JSONL file

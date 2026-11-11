@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -428,6 +429,18 @@ def log_dir(ctx: Ctx, step: Step) -> Path:
     return ctx.out / "logs" / re.sub(r"[^A-Za-z0-9._-]+", "_", step.id).strip("_")
 
 
+def baseline_file(ctx: Ctx, workload: str, a_args: list[str]) -> Path:
+    """Where --shared-baseline caches an engine-bench ab: step's arm-A (off) measurement.
+
+    Keyed by workload and the exact a_args: most options' arm A is the plain off configuration
+    (a_args == []), but a few (e.g. --cpu-verify-workers' A run) add their own flags, and those must
+    never be matched against a differently-configured cached baseline."""
+    key = hashlib.sha1(json.dumps([workload, a_args]).encode("utf-8")).hexdigest()[:16]
+    path = ctx.out / "baselines" / f"{workload}-{key}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def result(status: str, detail: str, **data) -> dict:
     return {"status": status, "detail": detail, "data": data}
 
@@ -678,6 +691,9 @@ def run_ab_step(ctx: Ctx, step: Step) -> dict:
                 "--reps", str(ctx.args.reps), f"--a-args={shlex.join(a_args)}", f"--b-args={shlex.join(b_args)}",
                 "--config", "run:" + quote(command), "--metric-regex", engine_metric(workload),
                 "--log-dir", str(logs / "runs"), "--json", str(report), "--timeout", "3600", "--quiet"]
+        if ctx.args.shared_baseline:
+            baseline = baseline_file(ctx, d["workload"], a_args)
+            argv += [f"--a-samples={baseline}"] if baseline.is_file() else [f"--save-a-samples={baseline}"]
         code, output = run_logged(argv, logs / "ab.log", env=ctx.model_env(workload["model"]))
         if not report.is_file():
             return result("FAIL", f"run_interleaved_ab.py exited {code}: {tail(output, 3)}")
@@ -1593,6 +1609,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--resume", action="store_true",
                         help=f"leave out steps whose result is {', '.join(DONE)}; without --out, continue the "
                              "newest run")
+    parser.add_argument("--shared-baseline", action="store_true",
+                        help="cache each engine-bench ab: step's arm-A (off) measurement under {out}/baselines, "
+                             "keyed by workload and the exact --a-args, and reuse it for later steps that share "
+                             "both; cuts measurement time roughly in half on a card that has reached a steady "
+                             "clock/thermal state, at the cost of not catching per-step drift the way a fresh "
+                             "arm A would (see run_interleaved_ab.py's module docstring). Off by default: a run "
+                             "that doesn't already trust this card's stability should measure arm A every time")
     args = parser.parse_args(argv)
     if args.dry_run:
         args.action = "plan"
