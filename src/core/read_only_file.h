@@ -41,6 +41,15 @@ public:
     void read_direct_blocks(std::span<const std::uint64_t> offsets, std::size_t block_bytes, std::span<std::byte> ring,
                             const std::function<void(std::size_t, std::span<const std::byte>)>& consume) const;
 
+    // How many read_direct_blocks calls so far completed without real overlap: on Linux, kernel AIO
+    // (io_setup) failed and the call fell back to reading one block at a time, which forfeits the
+    // ring's whole point and leaves every call's latency on the critical path, serially -- a 2026-11-11
+    // session measured this collapsing n-gram-volume decode speed on one rented box. Windows's
+    // overlapped reads have no equivalent failure mode and this is always 0 there. Zero on Linux too
+    // whenever AIO keeps working, the overwhelmingly common case; a caller that cares (the n-gram
+    // volume) checks this once to warn, not on every call.
+    [[nodiscard]] std::uint64_t serial_fallback_calls() const noexcept;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

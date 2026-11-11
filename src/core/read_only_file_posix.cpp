@@ -4,6 +4,7 @@
 #include "core/read_only_file.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <exception>
@@ -26,6 +27,7 @@ namespace ninfer {
 struct ReadOnlyFile::Impl {
     int fd             = -1;
     std::uint64_t size = 0;
+    mutable std::atomic<std::uint64_t> serial_fallback_calls{0};
 
     explicit Impl(const std::filesystem::path& path) {
         fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
@@ -149,7 +151,9 @@ void ReadOnlyFile::read_direct_blocks(std::span<const std::uint64_t> offsets, st
         return;
     }
 #endif
-    // Without kernel AIO: serial reads into the first ring block.
+    // Without kernel AIO -- io_setup failed above (or this is not Linux): serial reads into the
+    // first ring block, one at a time, forfeiting the ring's overlap entirely.
+    impl_->serial_fallback_calls.fetch_add(1, std::memory_order_relaxed);
     const std::span<std::byte> block = ring.first(block_bytes);
     for (std::size_t i = 0; i < offsets.size(); ++i) {
         if (read_direct(offsets[i], block) != block_bytes) {
@@ -178,6 +182,10 @@ std::size_t ReadOnlyFile::read_direct(std::uint64_t offset, std::span<std::byte>
         total += static_cast<std::size_t>(bytes);
     }
     return total;
+}
+
+std::uint64_t ReadOnlyFile::serial_fallback_calls() const noexcept {
+    return impl_->serial_fallback_calls.load(std::memory_order_relaxed);
 }
 
 } // namespace ninfer

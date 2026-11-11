@@ -5137,6 +5137,17 @@ private:
     // The expert cache and n-gram traffic of the finished request: one line per request.
     void report_request() const noexcept {
         try {
+            // Checked once per request (cheap: an atomic load), not per n-gram read. A 2026-11-11
+            // session measured this collapsing decode speed on one rented box when it fires; see
+            // ReadOnlyFile::serial_fallback_calls.
+            if (!ngram_fallback_warned_ && volume_.used_serial_fallback()) {
+                ngram_fallback_warned_ = true;
+                diagnostic("n-gram volume: kernel AIO is unavailable (or failed) for its reads, so every "
+                           "read falls back to one block at a time with no overlap; this has been measured "
+                           "to collapse decode speed severely. Check the host's AIO support "
+                           "(/proc/sys/fs/aio-max-nr, container seccomp policy) if decode seems far slower "
+                           "than expected");
+            }
             if (plan_.drafts > 0) {
                 // The request's speculation: rounds, acceptance, and acceptance at each draft position.
                 const auto& sp = L().speculative;
@@ -5216,6 +5227,7 @@ private:
     const TextConfig& c_;
     ProgramOptions options_;
     NgramVolume volume_;
+    mutable bool ngram_fallback_warned_ = false;
     NgramHash hash_;
     Layout plan_;
     std::int32_t vocab_ = 0;

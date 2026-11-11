@@ -170,4 +170,9 @@ std::size_t ReadOnlyFile::read_direct(std::uint64_t offset, std::span<std::byte>
     return total;
 }
 
+std::uint64_t ReadOnlyFile::serial_fallback_calls() const noexcept {
+    // read_direct_blocks always uses real overlapped I/O here; there is no fallback mode to count.
+    return 0;
+}
+
 } // namespace ninfer
