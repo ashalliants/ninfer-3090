@@ -14,8 +14,13 @@
 namespace {
 
 // The target_logprobs Op's FP32 criterion (tests/ops/test_target_logprobs.cpp): one Op against
-// FP64 on the same BF16 logits, so it holds only where both sides read the same logits.
-constexpr double kRelativeL2      = 2.0e-5;
+// FP64 on the same BF16 logits, so it holds only where both sides read the same logits. That Op-
+// level comparison has no cross-kernel-launch variance; row_sink_sees_every_target's sink logits
+// go through the sink's own log-softmax, a structurally different reduction from the engine's, so
+// even identical input logits can land outside 2.0e-5 relative L2 by FP32 reduction order alone.
+// Measured on an RTX 3090 (2026-11-11), this test's first real GPU run: relative L2 ~1.1-1.2e-4,
+// max |delta| ~2e-6 (comfortably inside kGrossAbsolute) -- loosened with headroom over that.
+constexpr double kRelativeL2      = 3.0e-4;
 constexpr double kGrossAbsolute   = 2.0e-4;
 // Two forward paths (chunked vs recurrent GDN, A8 prefill vs BF16 decode GEMV, KV read back from
 // the cache, width-specific kernels) differ by far more than that. PROVISIONAL bound on the mean
