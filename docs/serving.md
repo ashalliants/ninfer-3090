@@ -2428,7 +2428,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--ngram-draft-tokens 0\|15` | n-gram copy drafting beside `--spec dflash2`: when the text being written already appeared in the request (the prompt, a tool result -- including `cat -n` numbered ones -- or the output so far), a round verifies up to 15 copied tokens instead of the draft model's proposal; verification licenses every token, so a wrong copy costs speed, never output. Copies run when a round holds one or two requests (at two only for copies of 12 or more tokens, and only while the other request, whose row pays the copy width too, has the balance for it: about 3% of its round time if it never copies); see [the CLI guide](cli.md#n-gram-copy-drafting) | `0` (off) |
 | `--adaptive-draft-tokens 0\|3` | adaptive draft window beside `--spec dflash2` with `--draft-tokens` above 3: a second, narrower neural round (3 drafts) is captured next to the configured one and a round runs it when the requests' recent acceptance is low, since a captured graph costs the same however few drafts are live and only its captured width matters; it costs one more set of CUDA Graphs (startup refuses when they do not fit; it is not available at the concurrency where DFlash2 itself does not fit) and the target still verifies every token. Experimental: measured on an RTX 3090 at +2.9% on a low-acceptance prompt and no worse than -0.5% elsewhere, short of the +5% aimed for, and it can change greedy output; see [the CLI guide](cli.md#adaptive-draft-window) | `0` (off) |
 | `--relaxed-drafting [P]` | [relaxed drafting](#relaxed-drafting), opt-in and it CHANGES THE OUTPUT DISTRIBUTION: under sampling, keep a draft the model gives probability `P` or more (`0..1`; `0.5` without a value) even where exact speculative sampling would draw another token. The default `P` of requests that do not set `relaxed_drafting`; `0` leaves requests exact unless they ask. Needs `--spec` (refused otherwise) | off (exact; requests asking for it are refused) |
-| `--draft-context-rows N` | [draft-head context rows](#draft-head-context-rows): up to `N` (`0..2048`) ids the requests' prompts and outputs hold that the reduced draft head lacks are scored from the full output head and may be drafted; drafts only, so output is unchanged. Needs `--spec`; refused on Qwen3.8-Flash-Next | `0` (off) |
+| `--draft-context-rows N` | [draft-head context rows](#draft-head-context-rows): up to `N` (`0..2048`) ids the requests' prompts and outputs hold that the reduced draft head lacks are scored from the full output head and may be drafted; drafts only, so output is unchanged. Needs `--spec`; refused on Qwen3.8-Flash-Next and with `--max-concurrency` above 1. Measured on an RTX 3090 (2026-11-11), N=512, 27B DFlash2, greedy, one lane: output unchanged, B/A median +0.40%, 12/12 positive | `0` (off) |
 | `--ngram-min-match N` | tokens the end of the text must match before a copy is proposed, `4..64` | `12` |
 | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
@@ -2969,7 +2969,8 @@ Measured on an RTX 3090 (2026-11-11), `P = 0.5`, sampled chat prompts at tempera
 real `ninfer-serve` (so wall-clock decode speed, not just the acceptance-ratio effect):
 - DFlash2, 6 draft tokens: B/A median +2.32%, 12 of 12 positive, range +0.10%..+2.77%; acceptance
   40.9% -> 43.1%.
-- MTP, 3 draft tokens: see the next GPU-verify update for this card's result.
+- MTP, 3 draft tokens: B/A median +3.78%, 12 of 12 positive, range +3.59%..+4.08%; acceptance
+  61.9% -> 65.1%.
 
 Both are the expected direction and in the range Basalt's own RTX 5090 numbers above suggest for
 this threshold; neither output-quality task (gsm8k/MMLU-Pro) was re-run on this card.
@@ -2992,9 +2993,14 @@ take, change.
 
 The rows are read from a Q8, Q6 or Q4 row-split output head (the stored head, `--lm-head-q6` or
 `--lm-head-q4`); startup refuses the option with another head format, without `--spec`, and on
-Qwen3.8-Flash-Next, which drafts with its full output head already. No RTX 3090 measurement has been
-made yet: the gain to expect is bounded by the acceptance a full-vocabulary draft head would add
-(see [performance](performance.md)).
+Qwen3.8-Flash-Next, which drafts with its full output head already. The row set is one shared by
+every lane, so a lane's candidates can be widened by another lane's text; with more than one lane
+(`--max-concurrency` above 1) that measurably changed greedy output under concurrent load even
+though each lane's own sequential output stayed exact, so startup refuses the option above one lane
+until that is root-caused. Measured on an RTX 3090 (2026-11-11), `N = 512`, the 27B with DFlash2,
+greedy, one lane: output unchanged in every run as designed, B/A median +0.40%, 12 of 12 positive,
+range +0.27%..+0.95%, acceptance 40.5% -> 40.8% -- a small, consistent gain in line with the modest
+acceptance lift.
 
 ### Automatic host cache
 
