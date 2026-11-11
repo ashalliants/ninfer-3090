@@ -165,9 +165,40 @@ def test_lfru_matches_cpp_conformance_fixture():
     check((got_hits, got_misses) == (hits, misses), f"fixture totals {got_hits}/{got_misses} vs {hits}/{misses}")
 
 
+def test_invalid_trace_metadata_rejected():
+    header = '{"format": "ninfer-routing-trace", "version": 1, "layers": %s, "experts": %s}\n'
+    cases = [(header % ("1.9", "4"), ""), (header % ("0", "4"), ""), (header % ("true", "4"), ""),
+             (header % ("1", "4"), '{"t": 1.5, "r": [[0]]}\n'), (header % ("1", "4"), '{"t": 0, "r": [[0]]}\n'),
+             (header % ("1", "4"), '{"t": 1, "r": [[0.5]]}\n'), (header % ("1", "4"), '{"t": 1, "r": [["2"]]}\n')]
+    with tempfile.TemporaryDirectory() as d:
+        for i, (head, body) in enumerate(cases):
+            path = os.path.join(d, f"bad{i}.jsonl")
+            with open(path, "w") as f:
+                f.write(head + body)
+            try:
+                sim.read_trace(path)
+            except ValueError:
+                continue
+            check(False, f"invalid trace case {i} was accepted")
+
+
+def test_default_swap_cap_follows_tokens():
+    # 2 layers, interval 4: 8 tokens between re-selections allows round(2 * 8 / 4) = 4 swaps, not layers*every/interval.
+    s = sim.WindowedSim(2, 8, 4, window=4, every=2, interval=4)
+    s.resident[:4] = True
+    s.n_resident = 4
+    s.win[4:8] = 5
+    check(s._reselect(8) == 4, "token-based default cap allows 4 swaps")
+    s2 = sim.WindowedSim(2, 8, 4, window=4, every=2, interval=4)
+    s2.resident[:4] = True
+    s2.n_resident = 4
+    s2.win[4:8] = 5
+    check(s2._reselect(2) == 1, "2 tokens elapsed allow 1 swap")
+
+
 def test_cli_rejects_invalid_parameters():
     for bad in (["--frames", "0"], ["--window", "-1"], ["--every", "0"], ["--interval", "0"],
-                ["--min-gain", "-1"], ["--hysteresis", "-0.5"], ["--max-swaps", "-2"], ["--expert-bytes", "-1"]):
+                ["--min-gain", "-1"], ["--hysteresis", "-0.5"], ["--max-swaps", "-2"], ["--expert-bytes", "-1"], ["--hysteresis", "nan"], ["--hysteresis", "inf"], ["--expert-bytes", "nan"]):
         try:
             sim.main(["unused-trace"] + bad)
         except SystemExit as e:
@@ -185,5 +216,7 @@ if __name__ == "__main__":
     test_curve_and_per_layer()
     test_trace_roundtrip()
     test_lfru_matches_cpp_conformance_fixture()
+    test_invalid_trace_metadata_rejected()
+    test_default_swap_cap_follows_tokens()
     test_cli_rejects_invalid_parameters()
     print("expert_cache_sim: all checks passed")

@@ -53,6 +53,7 @@ RECORDING (not built or run here; no GPU or nvcc on the machine that wrote this)
 import argparse
 import gzip
 import json
+import math
 import sys
 from collections import deque
 
@@ -68,27 +69,37 @@ def _opener(path, mode):
     return gzip.open(path, mode) if str(path).endswith(".gz") else open(path, mode)
 
 
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def read_trace(path):
     """(layers, experts, rounds) with rounds a list of (tokens, [np.int64 array per layer])."""
     with _opener(path, "rt") as handle:
         header = json.loads(handle.readline())
         if header.get("format") != "ninfer-routing-trace" or header.get("version") != 1:
             raise ValueError("not a ninfer-routing-trace v1 file")
-        layers, experts = int(header["layers"]), int(header["experts"])
+        layers, experts = header.get("layers"), header.get("experts")
+        if not (_is_int(layers) and _is_int(experts) and layers > 0 and experts > 0):
+            raise ValueError("trace header: layers and experts must be positive integers")
         rounds = []
         for line in handle:
             if not line.strip():
                 continue
             record = json.loads(line)
+            if not _is_int(record.get("t")) or record["t"] < 1:
+                raise ValueError(f"round {len(rounds) + 1}: t must be a positive integer")
             if len(record["r"]) != layers:
                 raise ValueError(f"round {len(rounds) + 1}: {len(record['r'])} layers, want {layers}")
             groups = []
             for ids in record["r"]:
+                if not all(_is_int(e) for e in ids):
+                    raise ValueError(f"round {len(rounds) + 1}: expert ids must be integers")
                 group = np.unique(np.asarray(ids, dtype=np.int64))
                 if len(group) and (group[0] < 0 or group[-1] >= experts):
                     raise ValueError(f"round {len(rounds) + 1}: expert id out of range")
                 groups.append(group)
-            rounds.append((int(record["t"]), groups))
+            rounds.append((record["t"], groups))
     return layers, experts, rounds
 
 
@@ -252,8 +263,10 @@ class WindowedSim:
         self.layers, self.experts, self.frames = layers, experts, frames
         self.window, self.every = window, every
         self.hysteresis, self.min_gain = hysteresis, min_gain
-        # Default swap budget matches LFRU's steady-state promotion rate: `layers` per `interval` tokens.
-        self.max_swaps = max_swaps if max_swaps is not None else max(1, round(layers * every / interval))
+        # Default swap budget matches LFRU's steady-state promotion rate: `layers` per `interval` tokens,
+        # applied to the tokens elapsed since the previous re-selection (rounds can carry many tokens).
+        self.max_swaps, self.interval = max_swaps, interval
+        self.tokens_since_select = 0
         n = layers * experts
         self.win = np.zeros(n, dtype=np.int64)
         self.ring = deque()
@@ -276,9 +289,13 @@ class WindowedSim:
             if len(self.ring) > self.window:
                 self.win[self.ring.popleft()] -= 1
             if self.n_resident < self.frames:
+                self.tokens_since_select = 0
                 res.promotions += self._fill(all_keys, tokens)
             elif index % self.every == 0:
-                res.promotions += self._reselect()
+                res.promotions += self._reselect(self.tokens_since_select + tokens)
+                self.tokens_since_select = 0
+            else:
+                self.tokens_since_select += tokens
             res.record_round(tokens)
         return res
 
@@ -297,7 +314,9 @@ class WindowedSim:
                 added += 1
         return added
 
-    def _reselect(self):
+    def _reselect(self, tokens_elapsed):
+        budget = self.max_swaps if self.max_swaps is not None else max(
+            1, round(self.layers * tokens_elapsed / self.interval))
         candidates = np.flatnonzero(~self.resident & (self.win > 0))
         if len(candidates) == 0:
             return 0
@@ -305,7 +324,7 @@ class WindowedSim:
         residents = np.flatnonzero(self.resident)
         residents = residents[np.lexsort((residents, self.win[residents]))]
         swaps = 0
-        for c, r in zip(candidates[: self.max_swaps], residents[: self.max_swaps]):
+        for c, r in zip(candidates[:budget], residents[:budget]):
             if self.win[c] - self.win[r] * (1.0 + self.hysteresis) < self.min_gain:
                 break
             self.resident[r] = False
@@ -339,25 +358,31 @@ def compare(layers, experts, rounds, frames, window, every, hysteresis, min_gain
     return a, b
 
 
+def _finite_nonnegative(text):
+    value = float(text)
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"{text!r} must be a finite number >= 0")
+    return value
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="Replay a routing trace through LFRU and a windowed policy.")
     p.add_argument("trace")
     p.add_argument("--frames", type=int, default=11000, help="VRAM expert frames (docs/serving.md: ~11,000-12,500)")
     p.add_argument("--window", type=int, default=256, help="N: rounds in the statistics window")
     p.add_argument("--every", type=int, default=16, help="M: rounds between re-selections")
-    p.add_argument("--hysteresis", type=float, default=0.0, help="relative margin a candidate must beat a resident by")
+    p.add_argument("--hysteresis", type=_finite_nonnegative, default=0.0, help="relative margin a candidate must beat a resident by")
     p.add_argument("--min-gain", type=int, default=1, help="absolute window-count margin")
     p.add_argument("--max-swaps", type=int, default=None, help="swaps per re-selection (default: LFRU's rate)")
     p.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, help="LFRU promotion interval in tokens")
-    p.add_argument("--expert-bytes", type=float, default=DEFAULT_EXPERT_BYTES)
+    p.add_argument("--expert-bytes", type=_finite_nonnegative, default=DEFAULT_EXPERT_BYTES)
     p.add_argument("--per-layer", action="store_true")
     args = p.parse_args(argv)
     for name in ("frames", "window", "every", "interval"):
         if getattr(args, name) < 1:
             p.error(f"--{name} must be at least 1")
-    for name in ("hysteresis", "min_gain", "expert_bytes"):
-        if getattr(args, name) < 0:
-            p.error(f"--{name.replace('_', '-')} must not be negative")
+    if args.min_gain < 0:
+        p.error("--min-gain must not be negative")
     if args.max_swaps is not None and args.max_swaps < 0:
         p.error("--max-swaps must not be negative")
     layers, experts, rounds = read_trace(args.trace)
