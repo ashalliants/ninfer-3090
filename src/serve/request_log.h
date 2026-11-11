@@ -28,7 +28,7 @@ namespace ninfer::serve {
 // 29 adds tool_call_parse.recovered_from_reasoning; 30 adds the Host allocator failure counters
 // and free-run gauge to throughput records (context_cache.pressure.host_geometry_failures,
 // host_shortage_failures, occupancy.host_context_free_extents).
-inline constexpr int kRequestLogSchemaVersion        = 30;
+inline constexpr int kRequestLogSchemaVersion        = 31;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct ServerLogEnvironment {

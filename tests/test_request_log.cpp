@@ -575,6 +575,9 @@ int main() {
     failures += check(done.at("speculative").at("adaptive_draft_tokens") == 3 &&
                           done.at("speculative").at("adaptive_low_rounds") == 120,
                       "adaptive draft window counters missing");
+    failures += check(render_request_done(context, outcome).message.find("K=3 in 120 rounds") !=
+                          std::string::npos,
+                      "stderr request line missing the adaptive draft window clause");
     failures += check(
         done.at("engine_timing").at("queue_wait_seconds") == 0.001 &&
             std::abs(done.at("engine_timing").at("host_exposed_seconds").at("total").get<double>() -

@@ -705,12 +705,16 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                 fresh_request = fresh_request || estimates[row].rounds() == 0;
             }
             if (fresh_request || lane_set != draft_window_lane_set) {
+                // The round that starts over runs the configured window outright: choose() would
+                // recompute both candidates and a cheap measured narrow round can win even on
+                // the zero-history prior.
                 draft_window_selector.reset();
                 draft_window_lane_set = lane_set;
+            } else {
+                neural_window = draft_window_selector.choose(
+                    std::span<const DraftAcceptanceEstimate>(estimates.data(), lanes.size()),
+                    narrow_round_cost[lanes.size()], wide_round_cost[lanes.size()]);
             }
-            neural_window = draft_window_selector.choose(
-                std::span<const DraftAcceptanceEstimate>(estimates.data(), lanes.size()),
-                narrow_round_cost[lanes.size()], wide_round_cost[lanes.size()]);
         }
         // Every row of a round verifies at its family's width; the frame, egress and ReplaySSM
         // records are viewed at it.

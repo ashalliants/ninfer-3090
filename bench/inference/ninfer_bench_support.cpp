@@ -967,6 +967,7 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
            "workspace_peak_bytes,workspace_allocator_peak_bytes,"
            "spec_rounds,spec_fallback_steps,spec_acceptance_rate,"
            "ngram_draft_tokens,ngram_rounds,ngram_drafted_tokens,ngram_accepted_tokens,"
+           "adaptive_draft_tokens,adaptive_low_rounds,"
            "repetitions,prefill_tok_s_mean,prefill_tok_s_stddev,decode_output_tok_s_mean,"
            "decode_output_tok_s_stddev,decode_engine_tok_s_mean,decode_engine_tok_s_stddev,"
            "prepare_seconds_mean,prefill_seconds_mean,decode_seconds_mean,total_seconds_mean,"
@@ -1011,7 +1012,8 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << ',' << result.workspace_allocator_peak_bytes << ',' << spec.rounds << ','
             << spec.fallback_steps << ',' << acceptance << ',' << env.speculative.ngram_draft_tokens
             << ',' << spec.ngram_rounds << ',' << spec.ngram_drafted_tokens << ','
-            << spec.ngram_accepted_tokens << ',' << result.reps.size() / result.concurrency << ',' << mean(prefill_tok_s_series(result))
+            << spec.ngram_accepted_tokens << ',' << env.speculative.adaptive_draft_tokens << ','
+            << spec.adaptive_low_rounds << ',' << result.reps.size() / result.concurrency << ',' << mean(prefill_tok_s_series(result))
             << ',' << stddev(prefill_tok_s_series(result)) << ','
             << mean(decode_output_tok_s_series(result)) << ','
             << stddev(decode_output_tok_s_series(result)) << ','
