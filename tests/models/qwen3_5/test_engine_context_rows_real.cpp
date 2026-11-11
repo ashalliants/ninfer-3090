@@ -42,7 +42,7 @@ ninfer::EngineOptions engine_options(const char* artifact, std::uint32_t context
     ninfer::EngineOptions options;
     options.artifact_path             = artifact;
     options.max_context               = 4096;
-    options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(8192);
+    options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(4096 * max_concurrency);
     options.prefill_chunk             = 1024;
     options.max_concurrency           = max_concurrency;
     options.kv_cache                  = ninfer::KvCacheStorage::Int8Group64;
