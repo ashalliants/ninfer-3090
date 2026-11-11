@@ -587,6 +587,30 @@ void test_end_at_last_message_rejects_keep_all() {
     require(threw, "a keep-all map is never trimmed");
 }
 
+// A follow-up turn that adds an image after the compacted history is the one place lossy prefill
+// and Vision meet: the scout never runs on a prompt with media, but the rewrite onto the kept
+// identity does apply, and the image span must move down with the tokens it follows.
+void test_follow_up_with_an_image_after_the_gap() {
+    const PreparedPromptData original = text_prompt(20);
+    const GapMap map                  = make_gap_map(original, 4, kKept);
+    PreparedPromptData follow         = extend(original, 7, 500); // 27 tokens; 20..26 are new
+    follow.vision_items.emplace_back();
+    follow.vision_items.back().token_spans.push_back({21, 3}); // image tokens 21, 22, 23
+    const auto rewritten = apply_gap_map(follow, map);
+    require(rewritten.has_value(), "an image after original_end still rewrites");
+    const std::size_t dropped = map.dropped_tokens();
+    require(rewritten->token_ids.size() == follow.token_ids.size() - dropped, "compacted length");
+    const auto& span = rewritten->vision_items.front().token_spans.front();
+    require(span.begin == 21 - dropped && span.count == 3, "the image span moves down by the dropped count");
+    for (std::size_t i = 0; i < span.count; ++i) {
+        require(rewritten->token_ids[span.begin + i] == follow.token_ids[21 + i],
+                "the shifted span still lands on the image tokens");
+        require(rewritten->position_axis(0)[span.begin + i] == static_cast<std::int32_t>(21 + i),
+                "the image tokens keep their original positions");
+    }
+    require(rewritten->rope_delta == static_cast<std::int32_t>(dropped), "rope_delta grows by the dropped count");
+}
+
 int main() {
     try {
         test_subsets_tokens_and_keeps_positions();
@@ -600,6 +624,7 @@ int main() {
         test_digest_collision_is_not_enough();
         test_two_maps_apply_in_order();
         test_rejects_invalid_input();
+        test_follow_up_with_an_image_after_the_gap();
         test_apply_returns_nullopt_where_compaction_would_throw();
         test_rewrite_applies_lineage_in_any_order();
         test_rewrite_prefers_the_deepest_map();
