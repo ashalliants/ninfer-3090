@@ -1782,7 +1782,10 @@ Referring to a custom tool as a function, or the reverse, fails (`duplicate_tool
 accepts custom tools in its own wire shape; see [Chat custom tools](#chat-custom-tools).
 
 Hosted tools, remote MCP tools, deferred loading, output schemas, and caller restrictions that
-exclude direct invocation remain unsupported.
+exclude direct invocation remain unsupported. That includes OpenAI tool search: a `tool_search`
+tool, `defer_loading`, and `tool_search_call` / `tool_search_output` items are rejected with an
+error that says tool search is unsupported and to send the tools directly. The Anthropic Messages
+endpoint does support deferred tools (see its section below).
 
 ### Response object and usage
 
