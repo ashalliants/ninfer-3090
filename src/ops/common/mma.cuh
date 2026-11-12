@@ -6,8 +6,9 @@
 namespace ninfer::ops {
 
 __device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned addr) {
-    #if defined(NINFER_VOLTA_EMULATION)
-    r0 = volta::ldmatrix_word(addr, 0); r1 = volta::ldmatrix_word(addr, 1);
+#if defined(NINFER_VOLTA_EMULATION)
+    r0 = volta::ldmatrix_word(addr, 0);
+    r1 = volta::ldmatrix_word(addr, 1);
 #else
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
                  : "=r"(r0), "=r"(r1)
@@ -17,8 +18,11 @@ __device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned
 
 __device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
                                             unsigned addr) {
-    #if defined(NINFER_VOLTA_EMULATION)
-    r0 = volta::ldmatrix_word(addr, 0); r1 = volta::ldmatrix_word(addr, 1); r2 = volta::ldmatrix_word(addr, 2); r3 = volta::ldmatrix_word(addr, 3);
+#if defined(NINFER_VOLTA_EMULATION)
+    r0 = volta::ldmatrix_word(addr, 0);
+    r1 = volta::ldmatrix_word(addr, 1);
+    r2 = volta::ldmatrix_word(addr, 2);
+    r3 = volta::ldmatrix_word(addr, 3);
 #else
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
@@ -27,8 +31,9 @@ __device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned
 }
 
 __device__ __forceinline__ void ldmatrix_x2_t(unsigned& r0, unsigned& r1, unsigned addr) {
-    #if defined(NINFER_VOLTA_EMULATION)
-    r0 = volta::ldmatrix_word_t(addr, 0); r1 = volta::ldmatrix_word_t(addr, 1);
+#if defined(NINFER_VOLTA_EMULATION)
+    r0 = volta::ldmatrix_word_t(addr, 0);
+    r1 = volta::ldmatrix_word_t(addr, 1);
 #else
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
                  : "=r"(r0), "=r"(r1)
@@ -38,8 +43,11 @@ __device__ __forceinline__ void ldmatrix_x2_t(unsigned& r0, unsigned& r1, unsign
 
 __device__ __forceinline__ void ldmatrix_x4_t(unsigned& r0, unsigned& r1, unsigned& r2,
                                               unsigned& r3, unsigned addr) {
-    #if defined(NINFER_VOLTA_EMULATION)
-    r0 = volta::ldmatrix_word_t(addr, 0); r1 = volta::ldmatrix_word_t(addr, 1); r2 = volta::ldmatrix_word_t(addr, 2); r3 = volta::ldmatrix_word_t(addr, 3);
+#if defined(NINFER_VOLTA_EMULATION)
+    r0 = volta::ldmatrix_word_t(addr, 0);
+    r1 = volta::ldmatrix_word_t(addr, 1);
+    r2 = volta::ldmatrix_word_t(addr, 2);
+    r3 = volta::ldmatrix_word_t(addr, 3);
 #else
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
@@ -50,7 +58,7 @@ __device__ __forceinline__ void ldmatrix_x4_t(unsigned& r0, unsigned& r1, unsign
 __device__ __forceinline__ void mma_bf16(float& c0, float& c1, float& c2, float& c3, unsigned a0,
                                          unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                          unsigned b1) {
-    #if defined(NINFER_VOLTA_EMULATION)
+#if defined(NINFER_VOLTA_EMULATION)
     volta::mma_m16n8k16<volta::Bf16Unpack>(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
 #else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
@@ -63,7 +71,7 @@ __device__ __forceinline__ void mma_bf16(float& c0, float& c1, float& c2, float&
 __device__ __forceinline__ void mma_f16(float& c0, float& c1, float& c2, float& c3, unsigned a0,
                                         unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                         unsigned b1) {
-    #if defined(NINFER_VOLTA_EMULATION)
+#if defined(NINFER_VOLTA_EMULATION)
     volta::mma_m16n8k16<volta::F16Unpack>(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
 #else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
@@ -100,7 +108,7 @@ __device__ __forceinline__ void mma_f16_acc16(unsigned& c0, unsigned& c1, unsign
 
 __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0, unsigned a1,
                                        unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
-    #if defined(NINFER_VOLTA_EMULATION)
+#if defined(NINFER_VOLTA_EMULATION)
     volta::mma_m16n8k32_s8(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
 #else
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
@@ -167,7 +175,7 @@ __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, fl
 __device__ __forceinline__ void mma_tf32_bits(float& c0, float& c1, float& c2, float& c3,
                                               unsigned a0, unsigned a1, unsigned a2, unsigned a3,
                                               unsigned b0, unsigned b1) {
-    #if defined(NINFER_VOLTA_EMULATION)
+#if defined(NINFER_VOLTA_EMULATION)
     volta::mma_m16n8k8_tf32(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
 #else
     asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
