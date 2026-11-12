@@ -33,9 +33,11 @@ void launch_for(const Tensor& q, const Tensor& positions, float scale, const Ten
 
     const auto launch = [&]<int Warps, bool Split>() {
         using Shape       = CausalPromptFa2Shape<Warps, PackedValues, PackedKeys>;
+        // The plan never selects a shape the target cannot launch (causal_prompt_fa2_plan).
         if constexpr (Shape::SmemBytes > kMaxDynamicSharedBytes) {
-            throw std::logic_error("FA2 prompt attention: this CTA shape exceeds the block's shared memory");
-        } else {
+            throw std::logic_error(
+                "FA2 prompt attention: this CTA shape exceeds the block's shared memory");
+        }
         const auto kernel = causal_attention_prompt_i8_fa2_kernel<Geometry, Metadata, Warps, Split,
                                                                   PackedValues, PackedKeys>;
         configure_cuda_device_once([] {
@@ -56,7 +58,6 @@ void launch_for(const Tensor& q, const Tensor& positions, float scale, const Ten
             static_cast<__nv_bfloat16*>(out.data), width, static_cast<float*>(partials.rows.data),
             static_cast<float2*>(partials.stats.data));
         CUDA_CHECK(cudaGetLastError());
-        }
     };
 
     if (plan.splits == 1) {
