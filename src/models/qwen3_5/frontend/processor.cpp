@@ -510,7 +510,9 @@ std::uint64_t item_vision_tokens(const VisionItem& item) {
            static_cast<std::uint64_t>(item.grid.w) / (kMerge * kMerge);
 }
 
-// Width and height of an image, probed (decoded) at most once per content digest.
+// Width and height of an image, remembered by content digest so a repeated image is not probed
+// (decoded) again. Two requests that miss at the same moment may both probe: the result is the
+// same, and the probes run under the preparation gate, so the duplicate work stays bounded.
 std::pair<int, int> probe_image_extent(const ChatPart& part, MediaPreprocessCache& cache,
                                        const media::decode::Policy& policy) {
     const auto digest = sha256(part.media.bytes, policy.checkpoint ? policy.checkpoint

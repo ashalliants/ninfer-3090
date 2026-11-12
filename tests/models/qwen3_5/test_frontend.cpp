@@ -2095,7 +2095,9 @@ int test_over_budget_images_drop_when_shrinking_is_not_enough() {
     const Frontend frontend = make_frontend(resources(), options);
     const auto prepared     = frontend.prepare(block_images_input(10));
     const auto& data        = FrontendFactory::inspect(prepared);
-    int failures            = check(!data.vision_items.empty() && data.vision_items.size() < 10,
+    // Omitting every image is a valid outcome here: the fixture tokenizer spends one token per
+    // byte of the omission note, so a note can cost nearly as much as a shrunk image.
+    int failures            = check(data.vision_items.size() < 10,
                                     "images were not dropped when even shrunk they exceed the budget");
     failures += check(data.token_ids.size() <= options.max_context,
                       "prompt with dropped images does not fit max_context");

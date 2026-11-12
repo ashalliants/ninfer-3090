@@ -119,7 +119,8 @@ public:
 
     // Width and height of an image already probed, by content digest. Sizing a request needs
     // every image's extent; remembering it means a repeated screenshot is decoded once, not on
-    // every turn. Bounded: the memo is dropped whole when it fills.
+    // every turn. Bounded: the memo is dropped whole when it fills. Not single-flight: requests
+    // that miss together may each probe, which is harmless and bounded by the request gate.
     [[nodiscard]] std::optional<std::pair<int, int>>
     image_extent(const std::array<std::uint8_t, 32>& digest) const;
     void remember_image_extent(const std::array<std::uint8_t, 32>& digest, int width,
