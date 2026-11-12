@@ -1,3 +1,4 @@
+#include "ops/common/smem_limit.h"
 #include "ops/context_kv_materialize/launch.h"
 #include "core/device.h"
 #include "ops/common/memory.cuh"
@@ -310,6 +311,7 @@ void launch_mma(const Tensor& x, const Tensor& positions, const Tensor& counts, 
                 DeviceLayers layers, ContextKVMaterializeExecutionEnvelope envelope,
                 const Tensor& scratch, cudaStream_t stream) {
     constexpr int bytes = sizeof(MaterializeStorage<Rows, Columns, BlockK>);
+    static_assert(bytes <= kMaxDynamicSharedBytes, "exceeds the target's per-block shared memory");
     if constexpr (bytes > 48 * 1024)
         CUDA_CHECK(cudaFuncSetAttribute(context_kv_mma_kernel<Rows, Columns, BlockK, ColumnWarps>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));

@@ -1,3 +1,4 @@
+#include "ops/common/smem_limit.h"
 #include "ops/linear_attention/kimi_delta_attention/launch.h"
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
@@ -321,6 +322,7 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
 template <int DV>
 void launch(const Arguments& args, const Chunk* workspace, cudaStream_t stream) {
     constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
+    static_assert(shared_bytes <= kMaxDynamicSharedBytes, "exceeds the target's per-block shared memory");
     CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
     chunk_recurrence_kernel<DV>

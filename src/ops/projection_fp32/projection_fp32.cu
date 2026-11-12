@@ -3,6 +3,7 @@
 // q8_g32_fp16/q4_g64_fp16 forms and the vocabulary-head tall and tensor-core mappings are not
 // ported. Namespaces and includes are NInfer's.
 
+#include "ops/common/smem_limit.h"
 #include "ninfer/ops/projection_fp32.h"
 #include "ops/common/memory.cuh"
 
@@ -291,6 +292,7 @@ void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Te
         static_cast<std::size_t>(std::min(kColumns, columns)) * k * sizeof(bf16);
     const int column_groups = (columns + kColumns - 1) / kColumns;
     if (columns >= kWideMinColumns) {
+        static_assert(kWideSharedBytes <= kMaxDynamicSharedBytes);
         static const bool configured = [] {
             return cudaFuncSetAttribute(projection_wide_kernel,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/common/smem_limit.h"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/bf16/bf16_operands.h"
@@ -27,7 +28,7 @@ void launch_bf16_a16_gemv(const Bf16A16Operands& p, Output output, Epilogue epil
     int bytes             = 0;
     if constexpr (Schedule::kActivationAccess == Bf16ActivationAccess::Shared) {
         constexpr int static_bytes = sizeof(Bf16GemvSharedStorage<Schedule>);
-        constexpr int max_dynamic  = (99 * 1024 - static_bytes) / 128 * 128;
+        constexpr int max_dynamic  = (kMaxDynamicSharedBytes - static_bytes) / 128 * 128;
         if (p.k > max_dynamic / 2)
             throw std::invalid_argument("BF16 GEMV activation exceeds shared memory capacity");
         bytes = p.k * 2;

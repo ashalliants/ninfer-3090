@@ -1,3 +1,4 @@
+#include "ops/common/smem_limit.h"
 #include "core/weight.h"
 #include "ops/linear_topk/linear_topk_launch.h"
 
@@ -284,6 +285,7 @@ template <int TileColumns, int kBlockK = 128>
 void launch_tile(const Tensor& hidden, const Weight& head, const Tensor& row_to_global_ids,
                  const LinearTopKWorkspace& workspace, cudaStream_t stream) {
     constexpr int shared_bytes = sizeof(Q4M64ReusableStorage<TileColumns, kBlockK>);
+    static_assert(shared_bytes <= kMaxDynamicSharedBytes, "exceeds the target's per-block shared memory");
     if constexpr (shared_bytes > 48 * 1024) {
         CUDA_CHECK(cudaFuncSetAttribute(q4_m64_linear_topk_kernel<TileColumns, kBlockK>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));

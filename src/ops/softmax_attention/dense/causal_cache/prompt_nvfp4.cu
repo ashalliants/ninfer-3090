@@ -1,4 +1,5 @@
 // ninfer::ops::detail - NVFP4 causal prompt launch ownership.
+#include "ops/common/smem_limit.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include "core/device.h"
@@ -17,6 +18,7 @@ void causal_attention_prompt_nvfp4_attention_launch_for(const Tensor& q, const T
                                                         float scale, const CacheView& cache,
                                                         Metadata metadata, Tensor& out,
                                                         cudaStream_t stream) {
+    static_assert(kCausalPromptNvfp4SmemBytes <= kMaxDynamicSharedBytes);
     configure_cuda_device_once([&] {
         return cudaFuncSetAttribute(
             causal_attention_prompt_nvfp4_kernel<Geometry, Metadata>,

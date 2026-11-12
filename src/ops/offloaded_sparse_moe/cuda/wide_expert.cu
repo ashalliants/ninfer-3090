@@ -16,6 +16,7 @@
 // directly. Down: a CTA owns 64 output rows of one job, decodes their whole K = 640 slice (Q2_0 or
 // IQ4_NL) once and keeps it while each column tile's h codes arrive in one piece.
 
+#include "ops/common/smem_limit.h"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 
 #include "core/device.h"
@@ -52,7 +53,7 @@ constexpr int kXRowBytes    = 32 * kLeafBytes; // one token's blocks (32 leaves)
 // and scales (bytes 640..719) instead.
 constexpr int kHRowBytes    = kIntermediate * 4;
 constexpr int kPlanThreads  = 1024;
-constexpr int kMaxDynamicSmem  = 99 * 1024;
+constexpr int kMaxDynamicSmem  = kMaxDynamicSharedBytes;
 // The accumulator's bias: int32 0x4B400000 + S read as binary32 is 1.5 * 2^23 + S for |S| < 2^22.
 constexpr int kBias        = 0x4B400000;
 constexpr float kBiasValue = 12582912.0F;
