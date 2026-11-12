@@ -5238,6 +5238,13 @@ private:
             forward_->run_rows_verify_front(batch);
             forward_->run_rows_verify_back(batch, wide32);
             ops::cast_fp32_to_bf16(wide32, wide16, device_.stream);
+            // The single-row verify()'s own enqueue_route_download(s, W) call, generalized to this
+            // round's B * W columns: Forward::moe() recorded routes for all of them, and
+            // settle_round(B * W, ...) below drives ExpertResidency::after_round() over that same
+            // column count -- without this download, after_round() reads the previous round's
+            // stale host route buffer instead, corrupting cache hit/promotion decisions on every
+            // batched round (codepulse, PR #451).
+            residency_->enqueue_route_download(device_.stream, B * W);
             std::array<std::int32_t, kMaximumLanes> counts{};
             std::array<bool, kMaximumLanes> constraint_failed{};
             // accept_row's own device_.synchronize() (once per row) is this round's device wait;
@@ -5329,11 +5336,22 @@ private:
                         select_lane(ContractAccess::lane(rows[static_cast<std::size_t>(r)]));
                         release_lane();
                     }
+                    // commit_rows()'s own equivalent throw clears this too: release_lane() does not,
+                    // and the caller already consumed the pending batch, so leaving it true let a
+                    // later operation settle this rejected round's cache update as though it were
+                    // still pending (codepulse, PR #451).
+                    deferred_ = false;
                     throw std::logic_error("Qwen3.8-Flash-Next: a round's pending decision is invalid");
                 }
                 fold_rows[static_cast<std::size_t>(b)] = {static_cast<std::int32_t>(lane), static_cast<std::int32_t>(lane), 0};
                 out.rows[static_cast<std::size_t>(b)].timings     = timings();
                 out.rows[static_cast<std::size_t>(b)].speculative = speculative_stats();
+                // engine_core.h's commit loop subtracts every returned row's counters from the
+                // request's previously observed ones, including a released row, then stores the
+                // result back as the new observed value -- leaving this zero after prior nonzero
+                // MTP rounds underflows that unsigned subtraction and resets the request's observed
+                // statistics (codepulse, PR #451).
+                out.rows[static_cast<std::size_t>(b)].speculative_counters = speculative_counters();
                 out.rows[static_cast<std::size_t>(b)].disposition =
                     d.failed ? runtime::CommitDisposition::FailedReleased : runtime::CommitDisposition::CancelledReleased;
                 // This branch never freed the lane at all, permanently stranding it as occupied
@@ -5354,6 +5372,7 @@ private:
                     select_lane(ContractAccess::lane(rows[static_cast<std::size_t>(r)]));
                     release_lane();
                 }
+                deferred_ = false;
                 throw std::logic_error("Qwen3.8-Flash-Next: commit exceeds the licensed tokens");
             }
             if (L().joint_offered > 0) {
@@ -6142,8 +6161,15 @@ Program::Program(const execution::Parameters& parameters, DeviceContext& device,
 Program::~Program() noexcept = default;
 
 std::uint32_t shared_expert_columns(const ProgramOptions& options) {
+    // Matches plan_layout's own `widest` (program.cpp, the d.work sizing above): under
+    // --mtp-rows-verify a genuine batched round calls moe() -- and so Forward::moe()'s
+    // shared-expert side-stream -- with up to kMaxForwardRows columns, not just
+    // 1 + mtp_draft_tokens. Forward::workspace_bytes() was widened for this; the side-stream arena
+    // wasn't, so a valid batched round could allocate shared-expert scratch from an insufficient
+    // arena (codepulse, PR #451).
     return std::max({std::min(options.prefill_chunk, options.max_context), options.max_concurrency,
-                     1U + options.mtp_draft_tokens});
+                     1U + options.mtp_draft_tokens,
+                     options.mtp_rows_verify ? static_cast<std::uint32_t>(execution::kMaxForwardRows) : 0U});
 }
 
 std::uint64_t plan_shared_expert_workspace(const ProgramOptions& options, const TextConfig& config) {
