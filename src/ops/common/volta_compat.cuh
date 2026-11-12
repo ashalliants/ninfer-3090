@@ -2,11 +2,13 @@
 
 // Volta (sm_70) emulation of the Ampere instructions the kernels are written against.
 //
-// Volta has no cp.async, ldmatrix, or m16n8kK mma.sync, and its tensor cores have no BF16 or INT8
-// mode. Each helper here reproduces the exact PTX fragment layout of the instruction it replaces,
-// so every kernel using ops/common/mma.cuh and ops/common/memory.cuh runs unchanged. The mma
-// emulations accumulate in FP32 (or INT32 via dp4a) with all-lane shuffles; they are a correct
-// baseline, not a fast path. Fast Volta GEMMs belong in dedicated kernels.
+// Volta has no cp.async, ldmatrix, or m16n8kK mma.sync, and its tensor cores have no BF16, INT8 or
+// INT4 mode. Each helper here reproduces the exact PTX fragment layout of the instruction it
+// replaces, so every kernel using ops/common/mma.cuh and ops/common/memory.cuh runs unchanged. The
+// mma emulations accumulate in FP32 (or INT32 via dp4a) with all-lane shuffles; they are a correct
+// baseline, not a fast path. Fast Volta GEMMs belong in dedicated kernels
+// (docs/maintainer/volta-port.md). Kernels must not name the Ampere instructions themselves:
+// scripts/check-volta-compat.sh enforces that.
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 #define NINFER_VOLTA_EMULATION 1
