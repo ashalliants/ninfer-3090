@@ -1766,7 +1766,9 @@ the notes alone still exceed the context the request fails with `context_length_
 image keeps the earlier decisions and the prompt prefix stays reusable; the prefix is lost only
 when a further image has to be shrunk (the image that was newest is shrunk only if every older one
 at the ceiling still leaves the request above the 60% mark). `count_tokens` does not know the context, so for such a
-request it is an upper bound on the prepared prompt. Videos are never shrunk this way.
+request it is an upper bound on the prepared prompt. Videos are never shrunk this way, and are only
+measured for the plan once the images alone are over budget. Image sizes are remembered by content
+digest, so a repeated screenshot is probed once, not on every turn.
 `oversized_image: "error"` still rejects an image that needs the normal resize.
 
 Media cache misses run as independent decode → resize → BF16-pack tasks on a bounded host worker

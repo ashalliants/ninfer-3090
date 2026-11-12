@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <utility>
 #include <string_view>
 
 namespace ninfer::models::qwen3_5::frontend {
@@ -114,6 +116,14 @@ public:
                                       MediaCacheRequestStats& request_stats) const;
 
     [[nodiscard]] MediaCacheStats stats() const;
+
+    // Width and height of an image already probed, by content digest. Sizing a request needs
+    // every image's extent; remembering it means a repeated screenshot is decoded once, not on
+    // every turn. Bounded: the memo is dropped whole when it fills.
+    [[nodiscard]] std::optional<std::pair<int, int>>
+    image_extent(const std::array<std::uint8_t, 32>& digest) const;
+    void remember_image_extent(const std::array<std::uint8_t, 32>& digest, int width,
+                               int height) const;
 
 private:
     struct Impl;
