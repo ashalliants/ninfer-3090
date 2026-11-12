@@ -145,6 +145,22 @@ and record them here.
   - **v0.17.2 ran the helpers cleanly** (an Ontario host, 16 cores, about $0.29 estimated): `vast-up.sh` about 5
     minutes, then `vast-release-linux.sh` about 15 minutes to a pulled-back archive. Run `vast-destroy.sh` the
     moment the archive is in `dist/` and delete any `send_later` backstop.
+  - **v0.18.0 (a Spain host, $0.37/h, 24 cores): `vast-up.sh` about 5 minutes, a warm rerun of
+    `vast-release-linux.sh` about 4.** Traps it hit:
+    - **A stale or revoked API key fails late and confusingly.** `vast-up.sh` printed a Python
+      `JSONDecodeError` and then "No suitable offer"; the real message (`401 Invalid user key`) was a few
+      lines above. Run `vastai show user` first. A throwaway key from an earlier release was dead.
+    - **Killing `vast-release-linux.sh` does not stop the build on the box.** The build is detached there. A
+      second run then started a second packager on the same tree and failed with `tar: ... File removed
+      before we read it`. If you must restart, `./vast-dev-ssh.sh 'pgrep -fa "ninja|cmake|package"'` until
+      nothing is running, then rerun. Better: do not start the Linux run until the commit is final (see the
+      Windows trap below), so you never need to kill it.
+    - `vast-up.sh` rents and destroys hosts until one has a full-power card, so `vastai show instances`
+      may briefly list two `ninfer-release` boxes. Only the one in `~/.cache/ninfer-release/instance_id`
+      is yours; other labels (for example `nevermetered:`) are live services, never touch them.
+    - The script's log is on your machine only; the box's log goes with the box. Read the smoke test's
+      reply out of `/root/release-linux.log` (`./vast-dev-ssh.sh`) **before** `vast-destroy.sh` if the notes
+      should quote it.
   - **Editing the notes after the Linux archive exists does not need another box.** The tarball embeds
     `RELEASE_NOTES_X.Y.Z.md` and an inner `SHA256SUMS.txt`. Extract it to a scratch directory, copy the final
     notes in, regenerate the inner sums exactly as `package-release.sh` does (`find . -maxdepth 1 -type f !
@@ -201,6 +217,26 @@ ccache, then 5 minutes for each repackage. Traps:
   like a completed task.
 - **The notes inside the Windows zip have CRLF line endings** (the checkout on `C:` converts them). When
   comparing them with the committed file use `diff --strip-trailing-cr`; the Linux copy matches byte for byte.
+- **Build the Windows zip first, then start the Linux run.** The Windows build is the only MSVC compile, so
+  it is where a release-blocking error shows up, and fixing one changes the commit that Linux must be built
+  from. v0.18.0 hit `C1061: blocks nested too deeply` again in `serve_options.cpp` (the main option chain,
+  not the context-store or lossy-prefill chains that were already split) after #394 added about 30 flags;
+  the fix was to split the chain in two with a `handled_first_half` flag and `continue`. The Linux box had
+  already been building, so it was rebuilt. Every new batch of flags can trip this again: if the release
+  adds serve options, check the Windows compile before renting anything, or at least before the Linux build
+  finishes.
+- **The disk check is a hard stop at 20 GB free on C:.** The old zips in `C:\ninfer-release\src\dist`
+  (22 GB at v0.18.0, five releases of zips plus their unpacked folders) are safe to delete once those
+  releases are published, and need the user's say-so. `cuda.7z` and `cuda_12.8.1_windows.exe` in
+  `C:\ninfer-release` (6 GB) are only used by a fresh bootstrap and can also go. A failed attempt leaves
+  a partly built tree, so a rerun is incremental.
+- **Check `dist/` only after the release command has exited.** `release-windows-remote.sh` runs `scp` in the
+  foreground and `release-windows-wsl.sh` copies into `dist/` only after PowerShell returns, so a finished
+  script always leaves a whole zip. If you started it as a background task (or copy the zip by some other
+  route) and look early, you will see a short file: one such `ls -l` showed 580 MB (it ends at 1.6 GiB) and
+  `unzip` said "End-of-central-directory signature not found". Wait for the task to exit before checking.
+- **A repackage rebuilds binaries that say `+<commit>`.** After a notes-only commit the Windows binaries
+  report the newer commit; that is expected (the tag is on the merge commit anyway).
 - A `-SkipBootstrap` run needs 20 GB free on C: (the full bootstrap needs 50 GB). The GMKtec box had 29 GB
   in 2026-10; old releases' zips in `C:\ninfer-release\src\dist` take about 1.6 GB each once published.
 
@@ -251,6 +287,19 @@ powercfg /change standby-timeout-ac 0 ; powercfg /change hibernate-timeout-ac 0
 ```
 
 Do not forward port 22 to the internet. Reach the box over a private network such as Tailscale.
+
+## Writing the notes when a release adds many options
+
+v0.18.0 added about 30 opt-in options from one PR (#394), and the first draft listed them by name with a
+pointer to the docs. That hides the part a reader needs: **which ones are slower**. Read the PR's speed
+table and put every measured regression in the notes next to the option, not just the wins (here
+`--ngram-prefetch` -16.6%, `--cpu-verify-misses` -16.7%, `--hc-int8` -26.4%, `--ggml-decode-mma` -5.5%
+end to end). `AGENTS.md` requires adverse results in the notes. Also check the breaking-change audit
+against the Host/Origin-style defaults that change behaviour for working setups (a name-based client
+now needs `--allowed-host`), which no flag diff shows.
+
+Where a PR body and `docs/maintainer/flash-next-plan.md` disagree (the plan's "Verification status" still
+said nothing had run on a GPU after #394 had run it), trust the PR body's dated results and fix the doc.
 
 ## Checks before publishing
 
