@@ -1754,6 +1754,19 @@ has a 32,768 merged-token envelope (131,072 raw patches); the effective Vision l
 `min(--max-context, 32768)`. There is no fixed image/video item-count limit: item count is admitted
 through aggregate source-byte, decoded-pixel, raw-patch, Vision-token, and live-memory budgets.
 
+A request whose images together exceed the Vision budget is not rejected. The budget is
+`min(--max-context, 32768)` merged tokens, less the prompt's text tokens and 1,024 tokens of
+headroom. Agent loops re-send every earlier screenshot each turn, so this is the usual way to hit
+it. The server shrinks the **oldest** images first, to a ceiling of 64 merged tokens (about
+256x256), and keeps the newest image at full size unless nothing else is left to shrink. It stops
+at 60% of the budget so the next few turns have room to grow. If every image at that ceiling still
+does not fit, the oldest are replaced by the text `[image omitted: too many images for the
+context]`. The decision depends only on the images' order and sizes, so a request that appends one
+image keeps the earlier decisions and the prompt prefix stays reusable; the prefix is lost only
+when a further image has to be shrunk. `count_tokens` does not know the context, so for such a
+request it is an upper bound on the prepared prompt. Videos are never shrunk this way.
+`oversized_image: "error"` still rejects an image that needs the normal resize.
+
 Media cache misses run as independent decode → resize → BF16-pack tasks on a bounded host worker
 pool. Prepared payloads are keyed by SHA-256 of the acquired bytes plus modality, so repeated media
 in later requests reuses the exact immutable BF16 patch input; concurrent identical misses use one

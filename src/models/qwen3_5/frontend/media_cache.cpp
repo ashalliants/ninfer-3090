@@ -6,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <list>
 #include <mutex>
@@ -26,7 +27,8 @@ struct KeyHash {
         for (std::uint8_t byte : key.digest) {
             value ^= static_cast<std::size_t>(byte) + 0x9e3779b9U + (value << 6U) + (value >> 2U);
         }
-        return value ^ static_cast<std::size_t>(key.modality);
+        return value ^ static_cast<std::size_t>(key.modality) ^
+               std::hash<std::uint64_t>{}(key.max_pixels);
     }
 };
 

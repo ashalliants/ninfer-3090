@@ -2021,6 +2021,81 @@ int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
     return failures;
 }
 
+ninfer::PromptInput block_images_input(std::size_t count, std::size_t first = 0) {
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    for (std::size_t index = first; index < first + count; ++index) {
+        ninfer::MessagePart image;
+        image.kind              = ninfer::MessagePartKind::Media;
+        image.media.kind        = ninfer::MediaKind::Image;
+        image.media.bytes       = block_ppm(512, 512, static_cast<std::uint8_t>(10 + index * 20));
+        image.media.media_type  = "image/x-portable-pixmap";
+        image.media.source_name = "block-" + std::to_string(index) + ".ppm";
+        message.parts.push_back(std::move(image));
+    }
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    return input;
+}
+
+int test_over_budget_images_shrink_oldest_first() {
+    // 512x512 is 1024 patches (256 merged tokens); the shrunk form is 16x16 patches (64 tokens).
+    ninfer::models::qwen3_5::FrontendOptions options;
+    options.vision_enabled  = true;
+    options.max_context     = 2048;
+    const Frontend frontend = make_frontend(resources(), options);
+
+    const auto prepared = frontend.prepare(block_images_input(6));
+    const auto& items   = FrontendFactory::inspect(prepared).vision_items;
+    int failures        = check(items.size() == 6, "over-budget images were dropped instead of shrunk");
+    const auto patches  = [&](std::size_t index) {
+        return index < items.size() ? items[index].grid.height * items[index].grid.width : 0;
+    };
+    for (std::size_t index = 0; index < 5; ++index) {
+        failures += check(patches(index) == 16 * 16, "an old image was not shrunk to the ceiling");
+    }
+    failures += check(patches(5) == 32 * 32, "the newest image was shrunk although others sufficed");
+    failures += check(FrontendFactory::inspect(prepared).token_ids.size() <= options.max_context,
+                      "shrunk prompt does not fit max_context");
+
+    // Appending an image keeps the earlier decisions, so the prompt prefix stays reusable.
+    const auto longer = frontend.prepare(block_images_input(7));
+    const auto& next  = FrontendFactory::inspect(longer).vision_items;
+    bool stable       = next.size() == 7;
+    for (std::size_t index = 0; stable && index < 5; ++index) {
+        stable = next[index].grid.height == items[index].grid.height &&
+                 next[index].grid.width == items[index].grid.width &&
+                 next[index].content_digest == items[index].content_digest;
+    }
+    failures += check(stable, "appending one image changed an earlier shrink decision");
+
+    // The same bytes alone are under budget: the cache must not hand back the shrunk payload.
+    const auto alone = frontend.prepare(block_images_input(1));
+    const auto& solo = FrontendFactory::inspect(alone).vision_items;
+    failures += check(solo.size() == 1 && solo[0].grid.height * solo[0].grid.width == 32 * 32,
+                      "a shrunk payload was reused for the same image under budget");
+
+    // Counting is an upper bound: it does not know the context and only applies the vision cap.
+    failures += check(frontend.count_tokens(block_images_input(6)) >=
+                          FrontendFactory::inspect(prepared).token_ids.size(),
+                      "token count of an over-budget request is below the prepared prompt");
+    return failures;
+}
+
+int test_over_budget_images_drop_when_shrinking_is_not_enough() {
+    ninfer::models::qwen3_5::FrontendOptions options;
+    options.vision_enabled  = true;
+    options.max_context     = 1500;
+    const Frontend frontend = make_frontend(resources(), options);
+    const auto prepared     = frontend.prepare(block_images_input(10));
+    const auto& data        = FrontendFactory::inspect(prepared);
+    int failures            = check(!data.vision_items.empty() && data.vision_items.size() < 10,
+                                    "images were not dropped when even shrunk they exceed the budget");
+    failures += check(data.token_ids.size() <= options.max_context,
+                      "prompt with dropped images does not fit max_context");
+    return failures;
+}
+
 int test_multimodal_prompt_over_removed_32k_cap(const Frontend& frontend) {
     const std::string long_text(40'000, 'x');
     const ninfer::MediaCacheSummary before_count = frontend.media_cache_summary();
@@ -3763,6 +3838,8 @@ int main() {
     failures += test_input_recovery_requires_proven_closing();
     failures += test_automatic_message_boundary_fallback();
     failures += test_media_admission_uses_aggregate_resources(frontend);
+    failures += test_over_budget_images_shrink_oldest_first();
+    failures += test_over_budget_images_drop_when_shrinking_is_not_enough();
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
     failures += test_attention_pairs_are_diagnostic(frontend);
     failures += test_video_prepare(frontend);

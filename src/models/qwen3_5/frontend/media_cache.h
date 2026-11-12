@@ -14,6 +14,9 @@ namespace ninfer::models::qwen3_5::frontend {
 struct MediaCacheKey {
     std::array<std::uint8_t, 32> digest{};
     Modality modality = Modality::Image;
+    // Pixel ceiling the payload was resized under (images only; 0 for video). The same bytes
+    // built under a smaller ceiling are a different payload.
+    std::uint64_t max_pixels = 0;
 
     [[nodiscard]] bool operator==(const MediaCacheKey&) const noexcept = default;
 };
