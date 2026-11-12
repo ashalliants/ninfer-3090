@@ -241,6 +241,94 @@ forcing them simultaneous, so it reliably missed every one of these:
    logits against a single-row reference for the losing row specifically, column by column, is the
    next step -- not yet done here) without re-deriving any of the above.
 
+## Bug 7 deep dive, no GPU available (2026-11-12, follow-up session)
+
+A follow-up session re-read every line of the rows-batched path by hand (no build, no GPU, no
+Vast box -- this Mac has no `nvcc`) specifically hunting an off-by-row-index, aliasing, or wrong
+stride for row `b != 0`, since bug 7's own symptom ("whichever row lands at a nonzero `b` in
+`verify_rows`'s own per-row loop loses, independent of physical lane or prompt content") points
+squarely at something tied to **loop position**, not lane identity. Nothing new was found --
+every one of the following re-derivations matches the single-row convention or an already-proven
+precedent, confirming (not just repeating) the prior session's own re-derivation:
+
+- `GdnReplayRecordLayer`'s `conv`/`key`/`value`/`gate` tensors are `[*, width, rows]` (`rows`
+  outermost, `width` next, channels fastest) -- flattening `width` and `rows` into one `T` axis
+  (`records.conv.view({C, T})`, `gdn_rows_verify`, `forward.cpp:1296`) therefore produces exactly
+  `t = row * W + w`, matching the `b * W + w` column convention used everywhere else. Checked
+  against `src/core/gdn_replay_records.h:38-42`.
+- `ops::ple_conv_inject`'s own documented contract (`include/ninfer/ops/ple.h:84-97`): "`T` columns
+  form `sequences` runs of `W = T / sequences` consecutive columns" -- `sequences` is
+  `source_slots.numel()` (`= B`, not `T`), so the op's own row-major run convention already matches
+  `rows_verify_batch`'s `b * W` layout without the call site needing to do anything special. Not a
+  bug; the earlier concern that `ple_conv_inject` might want one slot per *column* rather than per
+  *row* is unfounded.
+- `mtp_catch_up_row_rows`'s every `b`-dependent address (`rows_residuals + 2*width*base_column`,
+  `io.positions + 4*base_column`, `io.rows_block + 12*b`, the restaged `io.rope` at offset 0) was
+  re-derived term by term against `mtp_catch_up`'s single-row original and against
+  `commit_speculative_rows`'s own per-row staging just above its call site
+  (`program.cpp:5272-5280`) -- all consistent, no transposition, no stale `S`/`k`/`W` capture.
+- `stage_rows_verify_inputs`'s `stage_rope`/`stage_rope_value` calls (`program.cpp:4979-4982`) write
+  into the shared `[T, 3]` axis-major RoPE buffer at `columns = total`, `column = b * W` -- matches
+  exactly what `attention_rows_verify`'s `cudaMemcpy2DAsync` gather
+  (`forward.cpp:1401-1405`) expects (`spitch = T * 4`, offset `4 * row * W`).
+- The `pooled`/`tail` mutation pattern inside `attention_rows_verify`'s per-row loop (writing
+  directly into the *live* `kv.pooled.at(index)` during verify, same as the single-row
+  `attention_verify` at `forward.cpp:802-808`) is **not new**: the existing, long-proven plain
+  `decode_rows()` path's own `attention_rows()` does the identical thing per row
+  (`forward.cpp:1155-1160`) and shows no such asymmetry there. This rules out "mutating live pooled
+  state out of commit order" as the differentiator, since the exact same pattern already works
+  symmetrically for 2 rows elsewhere in this codebase; whatever is wrong is specific to the
+  *verify*-only additions (W > 1 columns per row, drafting, joint acceptance, catch-up), not to the
+  general per-row attention loop shape.
+- `qsa_pool_keys`/`qsa_select_blocks`/`qsa_attention`'s own doc comments
+  (`include/ninfer/ops/qsa.h:90,167-168,213-214`) state each is a pure, stream-ordered function of
+  its declared inputs and an explicit `WorkspaceArena` -- "no host reads of device values", no
+  hidden call-order-dependent internal state. If taken at face value (no reason found to doubt it),
+  this rules out an internal-kernel-state explanation for an effect that depends on *which call in
+  the loop* a row is, rather than on any value the row's own tensors carry.
+- `kv.max_visible_keys` is a fixed per-slot sizing constant set once at slot creation
+  (`program.cpp:1065`), identical in both lanes' configuration; not round- or order-dependent.
+
+**What this rules in, not just out:** every address a human can check by reading the code is
+correct, and the primitives involved are documented as pure functions of their declared arguments.
+Combined with the prior session's finding that the exactness test (which *would* catch a logits
+divergence, since the committed token is literally `target[0]`, the model's own argmax from the
+real forward pass) keeps passing, the forward pass's *output* for row `b = 1` is, as far as static
+reading can establish, computing the textbook-correct greedy target. If a subtle numeric skew still
+exists, it cannot be a wrong address or a stale buffer by this document's reading -- it would have
+to be something no file read can show: an actual kernel defect reachable only at `B > 1, W > 1`
+that doesn't flip the argmax (so exactness survives) but does shift the distribution enough to
+change which of the *drafter's own* tokens matches it less often, or a real behavioral consequence
+of non-greedy sampling (flagged by the prior session as unconfirmed) actually explaining the whole
+thing. Static review cannot distinguish between these; both predict "acceptance for row b=1 looks
+bad while the exactness test stays green."
+
+**Two concrete, cheap next steps for whoever has GPU access again** (not attempted here --
+this Mac cannot build or run either):
+
+1. **Force `--greedy` and re-run the same two-curl HTTP concurrent test** that originally exposed
+   bug 7. If the asymmetry disappears or sharply narrows under greedy decoding, the "non-greedy
+   sampling" explanation from the prior session (never fully confirmed) is very likely the whole
+   story, and bug 7 may not be a kernel bug at all -- it would just mean `joint_threshold`'s
+   calibration reacting badly to legitimate sampling variance in one row, which is a tuning
+   question, not a correctness one. This is a single flag, no code change, and should be tried
+   *first* since it could retire the bug entirely without touching any kernel.
+2. **If the asymmetry survives `--greedy`**, add one targeted diagnostic: in `verify_rows()`, right
+   after `run_rows_verify_back`, `cudaMemcpy` the top-5 logit values and indices at column `b * W`
+   for `b = 1` to host and print them, then immediately run the *single-row* `attention_verify`
+   path (not the batched one) for that same lane's identical history/anchor in the same process
+   (e.g. a debug-only branch that also runs the old single-lane verify path for comparison, never
+   committing its result) and diff the two top-5 lists. Identical top-5s at identical ranks would
+   finally rule out the forward pass with actual evidence rather than code reading; a divergence
+   would localize the bug to a specific layer by bisecting which layer's `layer_rows_verify` output
+   first differs from the single-row equivalent, column by column -- the next step named in the
+   previous session's write-up, still not done.
+
+**This remains unresolved.** No fix is proposed here: without a GPU to run either experiment above,
+any patch would be a guess dressed up as a fix, which is worse than leaving the flag off. The
+`--mtp-rows-verify` gate stays default-off; this section exists so a future GPU session starts from
+"here is everything already ruled out" instead of re-deriving it a third time.
+
 ## What's still open (where this document stops, and implementation starts)
 
 Items equivalent to the original 1-4 here are now **done** -- see "Implementation progress" above
