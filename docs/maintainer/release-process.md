@@ -230,9 +230,11 @@ ccache, then 5 minutes for each repackage. Traps:
   releases are published, and need the user's say-so. `cuda.7z` and `cuda_12.8.1_windows.exe` in
   `C:\ninfer-release` (6 GB) are only used by a fresh bootstrap and can also go. A failed attempt leaves
   a partly built tree, so a rerun is incremental.
-- **A copy still in progress looks like a small file.** The script prints its result before `dist/` has
-  the zip: a `ls -l` taken then showed 580 MB (it ends at 1.6 GiB) and `unzip` said "End-of-central-directory
-  signature not found". Wait for the background task to complete before checking `dist/`.
+- **Check `dist/` only after the release command has exited.** `release-windows-remote.sh` runs `scp` in the
+  foreground and `release-windows-wsl.sh` copies into `dist/` only after PowerShell returns, so a finished
+  script always leaves a whole zip. If you started it as a background task (or copy the zip by some other
+  route) and look early, you will see a short file: one such `ls -l` showed 580 MB (it ends at 1.6 GiB) and
+  `unzip` said "End-of-central-directory signature not found". Wait for the task to exit before checking.
 - **A repackage rebuilds binaries that say `+<commit>`.** After a notes-only commit the Windows binaries
   report the newer commit; that is expected (the tag is on the merge commit anyway).
 - A `-SkipBootstrap` run needs 20 GB free on C: (the full bootstrap needs 50 GB). The GMKtec box had 29 GB
