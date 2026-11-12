@@ -77,8 +77,8 @@ New maintainer tools: a GPU-free performance model with `nsys` calibration (#438
 
 ## Verification
 
-- **Linux archive:** built on a rented RTX 3090 (CUDA 12.8.1, Ubuntu 24.04) from the release commit. VERIFICATION_LINUX
-- **Windows archive:** built on a machine with no NVIDIA GPU. Its executables were checked for missing DLLs but **not run**; the start-up check with only Windows on `PATH` and a chat completion on the card were not done. The zip's hash is in `SHA256SUMS-v0.18.0-windows.txt`.
+- **Linux archive:** built on a rented RTX 3090 (CUDA 12.8.1, Ubuntu 24.04) from the release commit. The release script checked `--version`, `--help`, the dynamic-library list and every checksum, then started the default launcher profile and answered one chat completion on the card with the 27B model (a 3090 at its full 350 W limit). The library list was **not diffed** against v0.17.2's. Nothing beyond that one completion was run on this archive.
+- **Windows archive:** built on a machine with no NVIDIA GPU, from the same commit (the build also needed a fix to split the option parser for the MSVC compiler, no behaviour change). Its executables were checked for missing DLLs but **not run**; the start-up check with only Windows on `PATH` and a chat completion on the card were not done. The zip's hash is in `SHA256SUMS-v0.18.0-windows.txt`.
 - **Tests not run for this release:** the full GPU suite and all real-model tests; the release only builds the three products. The PRs above carry their own test results, and several (#448, #452) were tested on a machine that could not link the CUDA tests.
 
 ## Install
