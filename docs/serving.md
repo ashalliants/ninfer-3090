@@ -1761,7 +1761,8 @@ it. The server shrinks the **oldest** images first, to a ceiling of 64 merged to
 256x256), and keeps the newest image at full size unless nothing else is left to shrink. It stops
 at 60% of the budget so the next few turns have room to grow. If every image at that ceiling still
 does not fit, the oldest are replaced by the text `[image omitted: too many images for the
-context]`. The decision depends only on the images' order and sizes, so a request that appends one
+context]`; the note's token cost is measured and charged against the budget, and if the text and
+the notes alone still exceed the context the request fails with `context_length_exceeded`. The decision depends only on the images' order and sizes, so a request that appends one
 image keeps the earlier decisions and the prompt prefix stays reusable; the prefix is lost only
 when a further image has to be shrunk (the image that was newest is shrunk only if every older one
 at the ceiling still leaves the request above the 60% mark). `count_tokens` does not know the context, so for such a

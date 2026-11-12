@@ -492,8 +492,8 @@ struct MediaPlan {
 };
 
 constexpr std::string_view kOmittedImageNote = "[image omitted: too many images for the context]";
-// Upper bound on the tokens of kOmittedImageNote, charged against the budget for every drop.
-constexpr std::uint64_t kOmittedNoteTokens = 16;
+// Slack on the measured note length: the note's first and last token can merge with neighbours.
+constexpr std::uint64_t kOmittedNoteSlackTokens = 2;
 // A shrink event stops here rather than at the budget, so the next few turns have room to grow.
 constexpr std::uint64_t kLowWaterNumerator   = 3;
 constexpr std::uint64_t kLowWaterDenominator = 5;
@@ -513,7 +513,8 @@ std::uint64_t item_vision_tokens(const VisionItem& item) {
 }
 
 MediaPlan plan_media_budget(std::span<ChatPart* const> parts, const ProcessorOptions& options,
-                            const media::decode::Policy& policy, std::uint64_t budget_tokens) {
+                            const media::decode::Policy& policy, std::uint64_t budget_tokens,
+                            const Tokenizer& tokenizer) {
     MediaPlan plan;
     plan.image_max_pixels.assign(parts.size(), 0);
     plan.dropped.assign(parts.size(), false);
@@ -557,11 +558,16 @@ MediaPlan plan_media_budget(std::span<ChatPart* const> parts, const ProcessorOpt
         if (i != newest_image) { shrink(i); }
     }
     if (total > budget_tokens && newest_image < parts.size()) { shrink(newest_image); }
+    // A note costs tokens too, measured with the real tokenizer; an image already that small is
+    // not worth replacing. If the text and the notes alone exceed the context, the final context
+    // check reports context_length_exceeded, which is the right answer for that request.
+    const std::uint64_t note_tokens =
+        total > budget_tokens ? tokenizer.encode(kOmittedImageNote).size() + kOmittedNoteSlackTokens
+                              : 0;
     for (std::size_t i = 0; i < parts.size() && total > budget_tokens; ++i) {
-        // A note costs tokens too; an image that is already as small is not worth replacing.
-        if (parts[i]->kind != ChatPartKind::Image || current[i] <= kOmittedNoteTokens) { continue; }
-        total -= current[i] - kOmittedNoteTokens;
-        current[i]      = kOmittedNoteTokens;
+        if (parts[i]->kind != ChatPartKind::Image || current[i] <= note_tokens) { continue; }
+        total -= current[i] - note_tokens;
+        current[i]      = note_tokens;
         plan.dropped[i] = true;
         if (plan.image_max_pixels[i] != 0) {
             plan.image_max_pixels[i] = 0;
@@ -1030,7 +1036,8 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
         for (const ChatPart* part : parts) { enforce_image_resize_policy(*part, options_, policy); }
         const MediaPlan plan = plan_media_budget(
             parts, options_, policy,
-            vision_budget_tokens(options_, std::numeric_limits<std::size_t>::max(), 0));
+            vision_budget_tokens(options_, std::numeric_limits<std::size_t>::max(), 0),
+            tokenizer_);
         if (plan.changed()) {
             caps  = apply_media_plan(plan, parts);
             parts = media_parts(messages);
@@ -1133,7 +1140,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
             }
             const MediaPlan plan = plan_media_budget(
                 parts, options_, plan_policy,
-                vision_budget_tokens(options_, maximum_prompt_tokens, preliminary_tokens));
+                vision_budget_tokens(options_, maximum_prompt_tokens, preliminary_tokens),
+                tokenizer_);
             if (plan.changed()) {
                 degraded_items = plan.degraded;
                 omitted_items  = plan.omitted;
