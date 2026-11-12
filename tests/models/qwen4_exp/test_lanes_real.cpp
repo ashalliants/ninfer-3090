@@ -27,6 +27,7 @@
 // A synthetic prompt is a fixed pseudo-random sequence of ordinary token ids (exactness needs
 // deterministic ids, not language), different per length.
 
+#include "models/qwen4_exp/execution/forward.h"
 #include "ninfer/engine.h"
 #include "ninfer/types.h"
 
@@ -125,6 +126,12 @@ EngineOptions base_options(const std::string& artifact, std::uint32_t max_contex
     if (mtp > 0) {
         options.speculative.backend      = SpeculativeBackend::Mtp;
         options.speculative.draft_tokens = mtp;
+        // Exercise the batched N-row verify path (mtp-multi-row-lanes-design.md), not just the
+        // plain 2-lane fallback: without these two, a round with more than one active row never
+        // reaches try_speculate_rows at all, so this test's own exactness check would prove
+        // nothing about that code.
+        options.flash_next.mtp_joint_acceptance = true;
+        options.flash_next.mtp_rows_verify       = true;
     }
     return options;
 }
@@ -266,6 +273,13 @@ int exact(const std::string& artifact, const Options& o) {
     bool ok = true;
     {
         Engine engine(base_options(artifact, o.max_context, o.lanes, o.mtp, o.cache));
+        // Temporal overlap alone doesn't prove the batched rows-verify path ran: two requests can
+        // overlap while still only ever decoding in separate single-row rounds. rows_rounds (set
+        // only inside verify_rows, the batched path -- see program.cpp) is the direct signal; summed
+        // across every pair below, it must be nonzero whenever --mtp-rows-verify is forced on by
+        // base_options, or this test proves nothing about the code it claims to exercise
+        // (codepulse, PR #451).
+        std::uint64_t rows_rounds_seen = 0;
         const auto pair = [&](std::size_t a, std::size_t b, int stagger_ms, const char* label) {
             Run ra, rb;
             std::thread first([&] { ra = generate(engine, *prompts[a], o.tokens, false, origin); });
@@ -275,6 +289,7 @@ int exact(const std::string& artifact, const Options& o) {
             second.join();
             print_run(std::string(label) + " " + names[a], ra, prompts[a]->size());
             print_run(std::string(label) + " " + names[b], rb, prompts[b]->size());
+            rows_rounds_seen += ra.speculative.rows_rounds + rb.speculative.rows_rounds;
             // The two requests overlapped in time, or this did not test shared rounds.
             const bool overlapped = ra.submitted < rb.finished && rb.submitted < ra.finished;
             if (!overlapped) {
@@ -292,6 +307,20 @@ int exact(const std::string& artifact, const Options& o) {
             // long one's decode rounds), then both decode together.
             pair(2, 0, 1500, "staggered");
             pair(1, 0, 400, "staggered");
+            // Every pair() call above decodes exactly two rows together: try_speculate_rows()'s own
+            // B * (limit + 1) <= kMaxForwardRows gate (program.cpp) decides whether that can batch
+            // at all. A width this test can't batch (e.g. --mtp 7: 2 * 8 = 16 > kMaxForwardRows)
+            // intentionally falls back to the plain/single-row path every round, so asserting a
+            // genuine rows-verify round there would fail the production code for behaving exactly
+            // as designed (codepulse, PR #451).
+            const bool rows_batchable =
+                2 * (static_cast<std::int64_t>(o.mtp) + 1) <= models::qwen4_exp::execution::kMaxForwardRows;
+            if (o.mtp > 0 && rows_batchable && rows_rounds_seen == 0) {
+                std::printf("FAIL: no paired run recorded a genuine rows-verify round (rows_rounds "
+                            "stayed 0 across every pair) -- this test only exercised the plain "
+                            "fallback or single-row MTP, not the batched path\n");
+                ok = false;
+            }
         }
         for (std::size_t i = 0; i < prompts.size(); ++i) {
             const Run r = generate(engine, *prompts[i], o.tokens, false, origin);

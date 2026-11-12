@@ -248,6 +248,51 @@ struct ForwardRowsBatch {
     Tensor residual_out;             // when set: BF16 [S*H, B], the final residual (the drafter's input)
 };
 
+// Several rows, each verifying W consecutive speculative positions (the MTP drafter's anchor plus
+// its drafts) at once, instead of one plain column: the rows' equivalent of ForwardVerify. Unlike
+// ForwardVerify (one speculator at a time, so its scratch can be shared across lanes sequentially,
+// reused by whichever lane is currently speculating), every active row's scratch here must coexist
+// in the same round, so this owns its own dedicated allocation sized for up to `lanes` rows -- never
+// a reinterpretation of the real per-lane live state (see gdn_rows_verify's conv staging in
+// docs/maintainer/mtp-multi-row-lanes-design.md: causal_conv1d_silu_snapshot's read and write slot
+// indices address the same tensor, and the real live-state pool has no spare slots for the write
+// side). The row count active in a given call is a runtime span (ForwardRowsVerifyBatch::slots),
+// like ForwardRowsBatch, not a fixed 2: `lanes` here is however many the caller planned for.
+struct ForwardRowsVerify {
+    GdnReplayRecords gdn;              // spec.width == W, record_capacity == lanes, every GDN layer
+    Tensor ple_inputs;                 // BF16 [S*H, W, lanes]: the PLE convolution inputs
+    // Per row: BF16 [Di, W, attention layers], exactly the single-sequence layout (ForwardVerify's
+    // own qsa_keys) repeated once per active row -- not one combined tensor with a row axis: the
+    // forward pass addresses these per (layer, row) and the commit addresses one row's whole
+    // [Di, W, layers] slab at once (qsa_commit_tails takes every layer in one call), and no single
+    // axis order make both of those slices contiguous at once.
+    std::vector<Tensor> qsa_keys;
+    std::vector<Tensor> qsa_tails;     // per attention layer: BF16 [Di, R - 1, lanes], copies of the live tails
+    // The convolution replays each row's W columns through causal_conv1d_silu_split (the
+    // single-sequence "distinct state" form, taking any disjoint input/output with no slot-indexing
+    // scheme) in a per-row loop, reading the real live window directly -- no staging buffer needed
+    // here, unlike causal_conv1d_silu_snapshot's batched form, which this design does not use.
+};
+
+// One verification call over B rows, each of W consecutive speculative positions (anchor plus
+// drafts): the rows' equivalent of a round in ForwardBatch (ForwardBatch::verify set). Row b's W
+// columns are contiguous, at columns [b*W, (b+1)*W) of every per-column tensor below. Tensors are
+// device memory at addresses that may be captured in a CUDA graph.
+struct ForwardRowsVerifyBatch {
+    std::vector<std::int32_t> slots; // host: B distinct slots, B in [1, kMaxForwardRows / width]
+    Tensor slot_ids;                 // I32 [B]: the same slots
+    std::int32_t width = 0;          // W columns per row (the drafter's anchor plus its drafts)
+    Tensor ids;                      // I32 [B*W]
+    Tensor positions;                // I32 [B*W]: each row's own W consecutive KV positions
+    Tensor rope_positions;           // I32 [B*W, 3] axis-major
+    // One triple per row (not per column): the whole row's W-column verify call shares one pooled-
+    // block start, exactly as ForwardBatch::block_start_rope does for a single-row verify call.
+    Tensor block_start_rope;         // I32 [3, B]
+    Tensor ngram_rows;               // U8 [row bytes, heads, B*W]: each column's n-gram rows
+    Tensor residual_out;             // when set: BF16 [S*H, B*W], the drafter's next input
+    const ForwardRowsVerify* verify = nullptr;
+};
+
 // Optional observation of every block, for reference comparison: BF16 copies per block of the
 // residual after it ([S*H, T]), its routed expert ids (I32 [top k, T]), and the mixer (GDN/QSA)
 // and MoE inputs and outputs ([H, T]), so each op chain can be checked on identical inputs.
@@ -349,6 +394,14 @@ public:
     // layers before rows_layer() (it reads no batch.ngram_rows), the back the rest and the head.
     void run_rows_front(const ForwardRowsBatch& batch);
     void run_rows_back(const ForwardRowsBatch& batch, Tensor& logits);
+    // Several sequences' speculative verification at once: row b's W columns (ForwardRowsVerifyBatch)
+    // batch into one call wherever the geometry allows it (dense Ops, GDN) and loop per row where it
+    // does not (QSA: no batched block-selection kernel exists, so this loops `batch.slots.size()`
+    // times, reusing the exact single-sequence verify Ops ForwardVerify already uses for one row at W
+    // columns). FP32 logits [V, B*W]. The same two-part split as run_rows.
+    void run_rows_verify(const ForwardRowsVerifyBatch& batch, Tensor& logits);
+    void run_rows_verify_front(const ForwardRowsVerifyBatch& batch);
+    void run_rows_verify_back(const ForwardRowsVerifyBatch& batch, Tensor& logits);
 
     // Runs one call of the MTP drafter (requires its parameters and ForwardMtp). Uses the
     // workspace like a forward call (not between run_front and run_back).
@@ -432,6 +485,11 @@ private:
     Tensor gdn_rows(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardRowsBatch& batch);
     Tensor attention_rows(const AttentionParameters& p, const Tensor& x, std::uint32_t index,
                           const ForwardRowsBatch& batch);
+    void layer_rows_verify(std::uint32_t layer, const ForwardRowsVerifyBatch& batch);
+    Tensor gdn_rows_verify(const GdnParameters& p, const Tensor& x, std::uint32_t index,
+                           const ForwardRowsVerifyBatch& batch);
+    Tensor attention_rows_verify(const AttentionParameters& p, const Tensor& x, std::uint32_t index,
+                                 const ForwardRowsVerifyBatch& batch);
     Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject);
     // ForwardOptions::hc_fused_read's view of a routed-expert block's input: the mixer's output and
     // inject, the routing and dispatch, and the A8 planes of x, all in the call's workspace.

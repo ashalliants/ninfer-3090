@@ -338,6 +338,17 @@ as a confirmed win or wash; the full per-option table, including the regressions
 and [docs/serving.md](docs/serving.md#qwen38-flash-next-preview). These are per-option deltas
 against off, not a combined number: no run measured every winning option stacked together.
 
+A later session built a genuinely batched draft-and-verify across both lanes of `NINFER_CONCURRENCY=2`
+(today's two-lane mode otherwise always falls back to plain, non-speculative decoding the moment a
+second request joins a round). It works and is bitwise-exact, but ships **off by default** behind
+a new flag, `--mtp-rows-verify`: a reproducible bug leaves one of the two lanes' acceptance near
+zero every round once they genuinely speculate together, which currently makes 2-lane decode
+*slower* than the plain fallback it would replace. Correctness is unaffected either way. Details,
+the six other bugs found and fixed getting there, and what the flag needs
+(`--mtp-joint-acceptance`) are in
+[docs/maintainer/mtp-multi-row-lanes-design.md](docs/maintainer/mtp-multi-row-lanes-design.md#finished-built-and-tested----but-shipped-off-by-default-2026-11-11-same-session)
+and [docs/performance.md](docs/performance.md#batched-multi-row-mtp-verification-implemented-but-gated-off-by-default-rtx-3090-2026-11-11).
+
 **Keep the n-gram volume on your fastest drive.** The 29 GB `.ngram` file is read on every prompt,
 the 40 GB model only once at load. If the model sits on a SATA SSD or a hard disk, copy just the
 `.ngram` file to an NVMe drive and point the launcher at it; the model can stay where it is:

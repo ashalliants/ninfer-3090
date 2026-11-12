@@ -144,7 +144,34 @@ a round with more than one active row always takes the plain, non-speculative pa
 `try_speculate` is never called. A proper fix needs a genuinely batched draft-and-verify across
 rows (not just removing that fallback: a naive sequential per-row MTP round would cost roughly
 2 x ~20 ms for ~4.6 tokens against today's ~13.5 ms for 2 tokens -- worse, not better, by this
-session's own profiled per-round costs). That work is tracked separately, not in this branch.
+session's own profiled per-round costs). That work was tracked separately, not in this branch --
+see the next entry for what that follow-up found.
+
+### Batched multi-row MTP verification: implemented, but gated off by default (RTX 3090, 2026-11-11)
+
+Branch `feat/mtp-multi-row-lanes` (`docs/maintainer/mtp-multi-row-lanes-design.md`) built the
+genuinely batched draft-and-verify across lanes the entry above called for, and fixed six real bugs
+getting a correct, bitwise-exact version working. A seventh, still open, makes the 2-lane case
+*slower* than the plain fallback it was meant to replace, so it ships **behind a new flag,
+`--mtp-rows-verify` (needs `--mtp-joint-acceptance`), default off, not enabled in any profile** --
+today's measured numbers (above, and the `tuned` profile in general) are unaffected by this branch.
+See the design doc's "Finished, built, and tested -- but shipped off by default" section for the
+full bug list and the open one's symptoms.
+
+Measured on a fresh Vast RTX 3090 (Linux, same box as the Linux-AIO-fix session above),
+`qwen38-flash-next tuned`, HTTP route, warm, four ~3.6-4.1k-token prompts (this repo's own
+`docs/performance.md`, resampled per rep so the prefix cache cannot answer), 150-token completions,
+median of 4 reps:
+
+| Mode | Decode tok/s |
+|---|---:|
+| Solo (1 lane) | 96.6 (unchanged from the 91.5-102.3 baseline above -- this branch does not touch the single-row path) |
+| 2-lane, `--mtp-rows-verify` off (today's shipped behavior: plain fallback) | ~120.2 aggregate (matches the existing 103-125 tok/s baseline above) |
+| 2-lane, `--mtp-rows-verify` on (for measurement only, not shipped on) | ~61.3 aggregate -- one row verifies normally (55-66% acceptance, matching solo), the other's acceptance collapses to near zero every round (bug 7); the slow row drags the pair below even the plain fallback |
+
+The flag-on row is correct (the exactness test still passes bitwise-identical with it forced on),
+just slow for the affected row specifically -- not a regression in the shipped default, since it
+never runs unless explicitly asked for.
 
 ### v0.16.0 release binaries, all three models (2026-10-14)
 
