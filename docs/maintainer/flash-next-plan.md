@@ -1291,11 +1291,18 @@ None has been measured on the RTX 3090 yet.
 
 ### Verification status
 
-Every item below is compiled for sm_86 and covered by the CPU tests, and none has run on a GPU: each
-is **compiled, CPU-tested, GPU-unverified**. `tools/bench/basalt_gpu_verify.ps1` (Windows, under the
-GPU lock) or `.sh` (the Linux box) runs every GPU check in one go from
-`tools/bench/basalt_options.json`;
-[tools/bench/README.md](../../tools/bench/README.md#verifying-the-basalt-options-on-a-gpu) says how.
+**Run on an RTX 3090 (a Vast box, 285 W power cap, CUDA 12.8) on 2026-11-11, from PR #394.** Every item
+compiles for sm_86 and passes the CPU tests, and the whole GPU checklist ran: 156 steps of
+`tools/bench/basalt_gpu_verify.sh` (the `.ps1` is the Windows twin, under the GPU lock), driven by
+`tools/bench/basalt_options.json`; [tools/bench/README.md](../../tools/bench/README.md#verifying-the-basalt-options-on-a-gpu)
+says how. Skipped for lack of an artifact or a tool: the Qwen3.6-35B-A3B checks, the KLD gates (no
+llama.cpp Q8_0 base), the IQ3 packs and `converter-pytests` (no pack, no torch), and the Windows-only
+steps. The per-item sections above still say "Not measured" or "None has run yet"; they were written
+before this run, and **this section supersedes them**. The run found four real bugs, fixed in #394:
+`--draft-context-rows` let a second lane change the first lane's greedy output (now refused above one
+lane), an exact compare in `op_tester.h` that was not NaN-aware, a too-tight KLD sink bound, and two stale assumptions in the artifact-writer interop test (an object
+count and a size limit).
+
 Kinds: identity = designed bit for bit unchanged, quality = numerics or the output distribution
 change, speed = timing or scheduling only, serving = a server feature. The checks named are the
 script's step ids, and the Item column is the issue #383 item (`F<n>`: Flash-Next item n, with the
@@ -1308,40 +1315,50 @@ and, with MTP, each job's line of MTP rounds, plain steps, drafts and accepted d
 (`print_speculation`) must be the same in every run. The 27B A/B with greedy sampling compares the
 answers' text, off against on, per repetition.
 
+Results are the median change in decode or prefill tokens per second, on against off, ABBA at n = 12;
+"k/12" counts the repetitions where on beat off. "Wash" means bit-exact and within noise on this card.
+"Identity" options also passed their identity gate (greedy ids, and with MTP the rounds, drafts and
+acceptances, equal in every run).
+
 Flash-Next options (Qwen3.8-Flash-Next):
 
-| Option | Item | Kind | Checks besides its GPU tests and A/B |
-|---|---|---|---|
-| `--ngram-keepalive-ms N` (default 40, was a fixed 100) | F7a | speed | none scripted: TTFT after an idle pause |
-| `--shared-expert-stream` | F4a | identity | `identity:` forward harness, eager and in graphs |
-| `--mtp-constrained` | F2 | identity | `ninfer_qwen4_exp_mtp_constrained_test`; no speed workload |
-| `--mtp-joint-acceptance` | F3 | identity | `identity:` engine `--mtp-exact 3 --mtp-joint-acceptance` |
-| `--ngram-prefetch` | F7b | identity | the A/B: every job's greedy-id hash and MTP rounds, drafts and acceptances equal in all 24 runs |
-| `--default-expert-state FILE` | F10a | speed | `default-expert-state`: export, then a fresh start from it |
-| `--hot-embedding-rows N` | F10b | identity | `ninfer_qwen4_exp_hot_embedding_test` |
-| `--gdn-head-map` | F5 | identity | `identity:` forward harness; `ninfer_qwen4_exp_gdn_head_map_test` |
-| `--moe-precast-input` | F4b | identity | `identity:` forward harness; `ninfer_qwen4_exp_moe_precast_test` |
-| `--moe-gate-up-registers` | F4c | identity | `identity:` forward harness; its engine test (capture-safe occupancy query) |
-| `--moe-fused-route` | F4d | identity | `identity:` forward harness; `ninfer_qwen4_exp_moe_fused_route_test` |
-| `--cpu-verify-misses` | F4e | identity | `ninfer_qwen4_exp_cpu_verify_misses_test` |
-| `--cpu-verify-workers N` | F4e | speed | A/B 6 against 12 workers |
-| `--prefill-cpu-share F` | F9 | identity | `ninfer_qwen4_exp_prefill_cpu_share_test`; A/B sweep F = 0.2, 0.4, 0.6 on a 2K prompt |
-| `--gdn-async-commit` | F10c | identity | `ninfer_qwen4_exp_gdn_async_commit_test` |
-| `--hc-int8` | F1 | quality | `kld:hc-int8-20`, `-100` against `kld:off-*`; `identity:` prefill bit-exact |
-| `--hc-fused-read` | F10d | identity | `identity:` forward harness, plain and side stream (against `--hc-int8`) |
-| `--ngram-flag-wait` | F7c | identity | `ninfer_qwen4_exp_ngram_flag_wait_test` and `_mtp_test` |
-| `--partial-ram-residency` | F8 | identity | both engine gates; `partial-start` (Windows page-lock warning, pinning) |
-| `--ggml-decode-mma` | F6 | quality | `kld:ggml-decode-mma-*`; `ggml-mma:timing` per shape; `ggml-mma:policy` (nsys) |
+| Option | Item | Kind | Result on the 3090 | Verdict |
+|---|---|---|---|---|
+| `--ngram-keepalive-ms N` (default 40, was a fixed 100) | F7a | speed | not scripted; TTFT after an idle pause was not measured | default changed, unmeasured |
+| `--shared-expert-stream` | F4a | identity | identity passes, eager and in graphs; wash | neutral |
+| `--mtp-constrained` | F2 | identity | `ninfer_qwen4_exp_mtp_constrained_test` passes; no speed workload | unmeasured |
+| `--mtp-joint-acceptance` | F3 | identity | identity gate passes; in the 12-rep A/B the MTP rounds line varied between runs while greedy ids stayed identical (judged noise: it changes which candidates are offered, not which wins); wash | neutral |
+| `--ngram-prefetch` | F7b | identity | identity passes; **-16.57%, 0/12** | regression, keep off |
+| `--default-expert-state FILE` | F10a | speed | export, then a fresh start reads it back and uses it | works |
+| `--hot-embedding-rows N` | F10b | identity | wash | neutral |
+| `--gdn-head-map` | F5 | identity | **+0.83%, 9/12** | mild gain, in the tuned profile |
+| `--moe-precast-input` | F4b | identity | wash | neutral |
+| `--moe-gate-up-registers` | F4c | identity | **+2.49%, 9/12** | gain |
+| `--moe-fused-route` | F4d | identity | wash (the kernel now runs at 512 threads with no spill) | neutral |
+| `--cpu-verify-misses` | F4e | identity | **-16.70%, 0/12** at the default workers | regression, keep off |
+| `--cpu-verify-workers N` | F4e | speed | 12 workers over 6: +11.99%, but still a net loss against `--cpu-verify-misses` off | keep off |
+| `--prefill-cpu-share F` | F9 | identity | F = 0.4 best of 0.2 / 0.4 / 0.6: **+15.47%, 12/12**; alone +17.58%, 12/12 | clear win |
+| `--gdn-async-commit` | F10c | identity | wash | neutral |
+| `--hc-int8` | F1 | quality | **-26.42%, 0/12**; KLD gates not run (no base) | regression, keep off |
+| `--hc-fused-read` | F10d | identity | wash | neutral |
+| `--ngram-flag-wait` | F7c | identity | wash | neutral |
+| `--partial-ram-residency` | F8 | identity | wash; start checked through the Linux memory-lock path (`--allow-unlocked-host-memory`), not the Windows page-lock path | neutral |
+| `--ggml-decode-mma` | F6 | quality | end to end **-5.46%, 1/12**; per-shape timing slower on 41 of 164 (problem, T) cases, all sharing a 2560-sized dimension; nsys confirms the kernel runs with the flag and not without; KLD gates not run | regression, keep off |
 
-Qwen3.8-27B (and Qwen3.6-35B-A3B) and cross-model options:
+Qwen3.8-27B (and Qwen3.6-35B-A3B) and cross-model options. The 35B was not run (no artifact):
 
-| Option | Item | Kind | Checks besides its GPU tests and A/B |
-|---|---|---|---|
-| `--relaxed-drafting [P]` (and the `relaxed_drafting` request key) | X-C | quality | `relaxed-startup:` every model (added ids contiguous); A/B at temperature 0.7 reports acceptance; `greedy-master:` for the 64-byte `SamplingConfig` |
-| `--draft-context-rows N` | X-D | identity | `ninfer_qwen3_5_context_rows_real_test` on the 27B (MTP, DFlash2) and the 35B (MTP); the A/B's greedy answer texts equal, off against on, in every repetition |
-| `--admission-affinity` | S7 | speed | `serve-soak`: overtakes under 4 requests on one lane |
-| `--allowed-host NAME` (Host, Origin and Sec-Fetch-Site checks) | S3 | serving | `serve-smoke` |
-| `--config FILE` | S6 | serving | `serve-smoke`; `launchers:` (the profiles are config files) |
+| Option | Item | Kind | Result on the 3090 | Verdict |
+|---|---|---|---|---|
+| `--relaxed-drafting [P]` (and the `relaxed_drafting` request key) | X-C | quality | P = 0.5, temperature 0.7: DFlash2 **+2.32%, 12/12** (acceptance 40.9% to 43.1%), MTP **+3.78%, 12/12** (61.9% to 65.1%); the 27B and Flash-Next both start and answer a sampled request; the 64-byte `SamplingConfig` leaves greedy output equal to master's (72/72 27B checks) | gain, changes the output distribution |
+| `--draft-context-rows N` | X-D | identity | one lane: greedy answers identical, off against on, in 12/12 repetitions; **two concurrent requests changed the first's output**, so startup now refuses it above one lane (cause not found) | one lane only |
+| `--admission-affinity` | S7 | speed | `serve-soak`, 4 in flight on one lane, 5 minutes: 0 findings, 0 overtakes (an earlier run's two "stalled" findings are the checker's documented false positive under this option) | works, effect unmeasured |
+| `--allowed-host NAME` (Host, Origin and Sec-Fetch-Site checks) | S3 | serving | `serve-smoke` 10/10 on a real 27B server | works |
+| `--config FILE` | S6 | serving | `serve-smoke`; every launcher profile starts with the right settings line | works |
+
+Not run, so still unverified: Flash-Next with every option off against master (16 checks; the box's
+`RLIMIT_MEMLOCK` is near zero and master's CLI has no bypass, so both refuse; needs a host with a normal
+limit), the KLD gates for `--hc-int8` and `--ggml-decode-mma`, the Windows page-lock path for
+`--partial-ram-residency`, the GSQ-RCO IQ3 packs, hand profiling with nsys or ncu, and the 35B.
 
 Other items: the decode-path KLD gate (X-A: `ninfer-perplexity --kld-base` is
 `kld-qwen35:w1`/`w3`, and the forward harness's `kld:off-20-w1` must equal window 3's rows);
@@ -1353,6 +1370,17 @@ ratchet and the greedy-identity tool (S8: CPU-only, run by ctest; the tool's two
 `greedy-master:`); the IQ2_XS/IQ3_XXS/IQ3_S formats and the IQ3 packs (F8: `iq3:`, and
 `converter-pytests`, which needs torch). The two-stage head (X-B) was tried and dropped; see
 [quality-trade experiments](quality-trade-experiments.md).
+
+Results of those: `GET /slots`, `GET /dashboard` and the three new `/metrics` series pass `serve-smoke`
+(the dashboard page is served but nobody has looked at it in a browser, at desktop or phone width);
+`ninfer_bench --preset community-1` produces a valid row carrying the 285 W limit; the soak harness ran
+clean (its first real run); the IQ3 formats and packs and the converter tests did not run.
+
+Follow-up found by the run: `combined_choice()` in `tools/bench/basalt_gpu_verify.py` picks a winner from
+its own narrow A/B without comparing against the true off baseline, so `combined:identity` and
+`combined:all` came out at -4.80% and -8.35% (it kept `--cpu-verify-workers`, which drags in the losing
+`--cpu-verify-misses`). The hand-built `scripts/profiles/qwen38-flash-next-tuned.json` was built from the
+full off-versus-on matrix and does not have the problem.
 
 ## Artifact decisions
 
