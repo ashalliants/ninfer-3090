@@ -1043,6 +1043,8 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
         .max_video_duration_seconds = options_.max_video_duration_seconds,
         .checkpoint                 = [&control] { check_preparation_control(control); },
     };
+    // Probing decodes media, so it runs under the same bounded request gate as preparation.
+    MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
     std::vector<std::uint64_t> caps(parts.size(), 0);
     try {
         // Reject oversized images first: the plan may drop images, and a dropped image must not
@@ -1059,7 +1061,6 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
         validate_media_item_count(parts, options_);
     } catch (const media::decode::Error& error) { throw_decode_error(error); }
     RenderedChat rendered = chat_template_.render(messages, std::move(render_options), control);
-    MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
     std::vector<VisionItem> items;
     items.reserve(parts.size());
     PreprocessStats stats;
@@ -1136,6 +1137,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                                      std::to_string(maximum_prompt_tokens));
         }
     }
+    // Probing decodes media, so the plan runs under the same bounded request gate as preparation.
+    MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
     // Shrink or drop the oldest images when the request is over its vision budget.
     std::vector<std::uint64_t> image_caps(parts.size(), 0);
     std::size_t degraded_items = 0;
@@ -1172,7 +1175,6 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
             validate_media_item_count(parts, options_);
         } catch (const media::decode::Error& error) { throw_decode_error(error); }
     }
-    MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
     std::atomic<bool> stop_preparation{false};
     const PreparationControl worker_control{
         .deadline     = control.deadline,
