@@ -7,7 +7,7 @@
 #
 #   1. device     nvidia-smi reports compute capability 7.0
 #   2. emulation  the standalone numerical test of every emulated instruction (seconds)
-#   3. build      scripts/v100_build.sh ninfer (+ ninfer_tests with --tests)
+#   3. build      scripts/v100_build.sh ninfer (everything, tests included, with --tests)
 #   4. tests      the op correctness suites against their FP32/FP64 oracles (--tests)
 #   5. models     greedy generation per model, so the output can be read, with decode and prefill
 #                 speed (give a model with MODEL_27B, MODEL_BONSAI, MODEL_35B, MODEL_FLASH)
@@ -55,7 +55,8 @@ NVCC="${NVCC:-$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)}"
 # 3. build
 note "--- build ---"
 targets=(ninfer)
-if [ "$RUN_TESTS" -eq 1 ]; then export NINFER_BUILD_TESTS=1; targets+=(ninfer_tests); fi
+# CTest also registers standalone test executables beside the ninfer_tests bundle, so build everything.
+if [ "$RUN_TESTS" -eq 1 ]; then export NINFER_BUILD_TESTS=1; targets=(all); fi
 BUILD_DIR="$BUILD" bash "$SRC/scripts/v100_build.sh" "${targets[@]}" > "$OUT/build.log" 2>&1 \
   || { note "FAILED: build (see $OUT/build.log)"; tail -20 "$OUT/build.log"; exit 1; }
 note "built"

@@ -309,6 +309,10 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   ninfer_add_op_test(ninfer_volta_emulation_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_volta_emulation.cu"
     LIBRARIES ninfer_ops)
+  # The route decisions that keep decode off the emulated mma, and the FA2 plan's shared-memory fit.
+  ninfer_add_op_test(ninfer_volta_routes_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_volta_routes.cpp"
+    LIBRARIES ninfer_ops)
 endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/linear/tests.cmake")
