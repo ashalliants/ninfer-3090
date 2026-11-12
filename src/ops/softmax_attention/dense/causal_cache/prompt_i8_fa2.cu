@@ -23,7 +23,8 @@ void launch_for(const Tensor& q, const Tensor& positions, float scale, const Ten
                 cudaStream_t stream) {
     const auto width = static_cast<std::int32_t>(q.ne[2]);
     const CausalPromptFa2Plan plan = causal_prompt_fa2_plan(
-        Geometry::QHeads, width, envelope.max_visible_keys, multiprocessor_count);
+        Geometry::QHeads, width, envelope.max_visible_keys, multiprocessor_count,
+        causal_prompt_fa2_eight_warps_fit(PackedValues));
     CausalPromptFa2Partials partials{};
     if (plan.splits > 1) {
         partials =
@@ -32,6 +33,9 @@ void launch_for(const Tensor& q, const Tensor& positions, float scale, const Ten
 
     const auto launch = [&]<int Warps, bool Split>() {
         using Shape       = CausalPromptFa2Shape<Warps, PackedValues, PackedKeys>;
+        if constexpr (Shape::SmemBytes > kMaxDynamicSharedBytes) {
+            throw std::logic_error("FA2 prompt attention: this CTA shape exceeds the block's shared memory");
+        } else {
         const auto kernel = causal_attention_prompt_i8_fa2_kernel<Geometry, Metadata, Warps, Split,
                                                                   PackedValues, PackedKeys>;
         configure_cuda_device_once([] {
@@ -52,6 +56,7 @@ void launch_for(const Tensor& q, const Tensor& positions, float scale, const Ten
             static_cast<__nv_bfloat16*>(out.data), width, static_cast<float*>(partials.rows.data),
             static_cast<float2*>(partials.stats.data));
         CUDA_CHECK(cudaGetLastError());
+        }
     };
 
     if (plan.splits == 1) {

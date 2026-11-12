@@ -838,6 +838,11 @@ and the design are in `docs/maintainer/pipeline-parallel-plan.md`.
 - `sm_80` (Ampere GA100, e.g. an unlocked NVIDIA CMP 170HX) is an added but **unmeasured**
   compatibility target: it shares sm_86's instruction set and runs Qwen3.8-27B correctly at roughly
   3090-like speed with no route tables tuned for it yet.
+- `sm_70` (Tesla V100) is an **experimental, never-run** target: it compiles and links, emulating
+  the Ampere instructions the kernels use, and has not been executed on a card. Qwen3.8-27B, Ternary
+  Bonsai 2 27B, Qwen3.6-35B-A3B and Flash-Next are the intended models. See
+  [the Volta port notes](docs/maintainer/volta-port.md) for what it changes, the expected
+  performance and how to validate it.
 
 ## Release history
 

@@ -4,6 +4,7 @@
 // INT8-G64 path only, one sequence, no page spaces, and the dense sentinel (count -1) replaced by an
 // explicit selection.
 
+#include "ops/common/smem_limit.h"
 #include "ops/qsa/launch.h"
 
 #include "ops/common/math.cuh"
@@ -393,6 +394,7 @@ template <int Stages>
 void run(const Tensor& q, const Tensor& positions, const Tensor& selected, const Tensor& counts, float scale,
          const PagedKVLayerView& cache, Tensor& out, cudaStream_t stream) {
     constexpr int bytes = prompt_smem_bytes<Stages>();
+    static_assert(bytes <= kMaxDynamicSharedBytes, "exceeds the target's per-block shared memory");
     static const bool configured =
         cudaFuncSetAttribute(wide_attention_kernel<Stages>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) == cudaSuccess;
     if (!configured) { throw std::runtime_error("qsa wide attention: cannot reserve shared memory"); }
@@ -410,7 +412,7 @@ void run(const Tensor& q, const Tensor& positions, const Tensor& selected, const
 void qsa_attention_wide_launch(const Tensor& q, const Tensor& positions, const Tensor& selected,
                                const Tensor& counts, float scale, const PagedKVLayerView& cache,
                                Tensor& out, std::int32_t sms, cudaStream_t stream) {
-    constexpr bool two_ctas = 2 * (prompt_smem_bytes<1>() + 1024) <= 100 * 1024;
+    constexpr bool two_ctas = 2 * (prompt_smem_bytes<1>() + 1024) <= kSharedBytesPerSm;
     if (two_ctas && q.ne[2] * kQsaKvHeads >= sms) {
         run<1>(q, positions, selected, counts, scale, cache, out, stream);
     } else {

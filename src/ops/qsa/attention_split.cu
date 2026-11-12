@@ -9,6 +9,7 @@
 // of codes) and applies the key group scales to the FP32 partials; PV multiplies probabilities
 // pre-scaled by the value group scales by exact FP16 value codes read with ldmatrix.trans.
 
+#include "ops/common/smem_limit.h"
 #include "ops/qsa/launch.h"
 
 #include "ops/common/memory.cuh"
@@ -484,6 +485,7 @@ void launch_attention(const dim3& grid, const bf16* q, const std::int32_t* posit
                       const Planes& planes, float scale_log2, int tiles_per_split, float* partial,
                       bf16* out, cudaStream_t stream) {
     constexpr int kBytes = static_cast<int>(sizeof(Shared<Stages>));
+    static_assert(kBytes <= kMaxDynamicSharedBytes, "exceeds the target's per-block shared memory");
     static const bool reserved = [] {
         return cudaFuncSetAttribute(attention_kernel<Stages>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,

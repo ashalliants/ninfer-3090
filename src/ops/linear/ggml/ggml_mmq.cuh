@@ -9,6 +9,7 @@
 // NInfer after llama.cpp's mmq.cuh design (MIT, third_party/ggml/LICENSE); no source is copied
 // from it beyond the decoders in ggml_blocks.cuh.
 
+#include "ops/common/smem_limit.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/ggml/ggml_blocks.cuh"
@@ -295,6 +296,7 @@ template <QType F, bool Residual>
 void launch_mmq_instance(const std::uint8_t* w, const std::int8_t* xq, const float* xd,
                          __nv_bfloat16* out, int n, int k, int t, cudaStream_t stream) {
     constexpr std::size_t kShared = mmq_shared_bytes<F>();
+    static_assert(kShared <= kMaxDynamicSharedBytes, "exceeds the target's per-block shared memory");
     static const bool configured = [] {
         if (kShared > 48 * 1024) {
             const cudaError_t error = cudaFuncSetAttribute(

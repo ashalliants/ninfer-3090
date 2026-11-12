@@ -14,7 +14,15 @@ T2Launch select_t2_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     // T = 1..16 take the small-T tensor-core kernel: at T = 1 the v2 kernel streams the
     // text-layer weights at 430..660 GB/s against the SIMT GEMV's 260..430 (RTX 3090).
     // NINFER_T2_DECODE=simt keeps the GEMV at T = 1 for comparison.
-    static const bool decode_simt = [] {
+    // sm_70 emulates mma.sync (ops/common/volta_compat.cuh), so the tensor-core routes below cost
+    // several times the weight stream they are bound by on a 3090. There T = 1 takes the GEMV
+    // and T = 2..8 the SIMT route, which never touch mma. Unmeasured on hardware.
+#if defined(NINFER_SM70)
+    constexpr bool kVolta = true;
+#else
+    constexpr bool kVolta = false;
+#endif
+    static const bool decode_simt = kVolta || [] {
         const char* value = std::getenv("NINFER_T2_DECODE");
         return value != nullptr && std::string(value) == "simt";
     }();
@@ -24,6 +32,8 @@ T2Launch select_t2_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         return value != nullptr && std::string(value) == "v1";
     }();
     const auto small_t = [t]() -> T2Launch {
+        if (kVolta && t <= 4) { return launch_t2_simt_r8_c4; }
+        if (kVolta && t <= 8) { return launch_t2_simt_r8_c8; }
         if (t <= 16) { return small_t_v1 ? launch_t2_small_t_mma : launch_t2_small_t_v2; }
         if (t <= 32) { return launch_t2_mma_r64_c32; }
         if (t <= 64) { return launch_t2_mma_r64_c64; }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/common/smem_limit.h"
 #include "ops/softmax_attention/common/causal_geometry.h"
 #include "ops/softmax_attention/common/mxfp8_tiled_plan.h"
 
@@ -38,7 +39,7 @@ struct Fp8KvTiledMmaSchedule {
     static constexpr int kScaleBytes   = 2 * KeyTile * 2;
     static constexpr int kSharedBytes =
         kQBytes + kQScaleBytes + kKBytes + kVBytes + kVStageBytes + kScaleBytes;
-    static_assert(kSharedBytes <= 99 * 1024);
+    static_assert(kSharedBytes <= kMaxDynamicSharedBytes);
 };
 
 template <int DChunk>

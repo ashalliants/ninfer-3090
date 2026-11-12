@@ -15,6 +15,7 @@
 // order (ops/common/canonical_ggml.h), so the outputs equal the CPU engine's bits. Without staging
 // the expert kernels resolve their records themselves and no stage kernel runs.
 
+#include "ops/common/smem_limit.h"
 #include "ninfer/ops/offloaded_sparse_moe.h"
 
 #include "core/device.h"
@@ -59,7 +60,7 @@ constexpr int kGateUpCtas = moe::kIntermediate / kUnitRows; // 40
 constexpr int kDownCtas   = moe::kHidden / kDownRows;       // 40
 constexpr int kXGroups    = moe::kHidden / canon::kA8Values;       // 80
 constexpr int kHGroups    = moe::kIntermediate / canon::kA8Values; // 20
-constexpr int kMaxDynamicSmem = 99 * 1024;
+constexpr int kMaxDynamicSmem = kMaxDynamicSharedBytes;
 
 // MoeExpertSource::precast_input, gate_up_variant and host_slots lie in the padding after `format`: the kernels
 // taking the source by value keep their parameter layout.

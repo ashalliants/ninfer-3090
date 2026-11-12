@@ -1,3 +1,4 @@
+#include "ops/common/smem_limit.h"
 #include "core/weight.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h"
 
@@ -300,6 +301,7 @@ bool launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
             const auto kernel =
                 bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
                                                      NormalizeInput, NormTokenCapacity>;
+            static_assert(kBf16GdnSmemBytes<Geometry::kBlockN> <= kMaxDynamicSharedBytes);
             configure_cuda_device_once([kernel] {
                 return cudaFuncSetAttribute(
                     kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,

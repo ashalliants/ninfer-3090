@@ -47,7 +47,9 @@ CUDA 12.8. Upstream (`Neroued/ninfer`) targets `sm_120a` on RTX 5090; that is wh
 route tables and published measurements come from, and none of it is authoritative here -- every
 route table this fork inherited and re-measured on sm_86 turned out to be wrong by 12-41%. Treat an
 upstream tuning constant as a hypothesis until measured on this card. The build environment and the
-compatibility constraints are in "Windows build environment (RTX 3090 fork host)" below.
+compatibility constraints are in "Windows build environment (RTX 3090 fork host)" below. `sm_70`
+(Tesla V100) is a compile-qualified, emulated, never-run target; its design and status are in
+`docs/maintainer/volta-port.md`.
 
 Generation uses one resident model on one GPU, one to eight resident execution lanes fixed at
 startup, bounded FIFO ingress with finite bypass (plus an opt-in, bounded cache-affinity overtake),

@@ -1,4 +1,5 @@
 // ninfer::ops::detail - asymmetric FP8-K/NVFP4-V causal prompt launch ownership.
+#include "ops/common/smem_limit.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include "core/device.h"
@@ -17,6 +18,7 @@ void causal_attention_prompt_k8v4_attention_launch_for(const Tensor& q, const Te
                                                        float scale, const CacheView& cache,
                                                        Metadata metadata, Tensor& out,
                                                        cudaStream_t stream) {
+    static_assert(kCausalPromptK8V4SmemBytes <= kMaxDynamicSharedBytes);
     configure_cuda_device_once([&] {
         return cudaFuncSetAttribute(
             causal_attention_prompt_k8v4_kernel<Geometry, Metadata>,

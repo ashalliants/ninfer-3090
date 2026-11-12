@@ -1,10 +1,11 @@
 #pragma once
+#include "ops/common/smem_limit.h"
 #include "core/device.h"
 
 namespace ninfer::ops::detail {
 template <int Bytes>
 __device__ __forceinline__ unsigned char* q8_shared_storage() {
-    static_assert(Bytes <= 99 * 1024);
+    static_assert(Bytes <= kMaxDynamicSharedBytes);
     if constexpr (Bytes > 48 * 1024) {
         extern __shared__ __align__(16) unsigned char dynamic_shared[];
         return dynamic_shared;

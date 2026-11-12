@@ -545,7 +545,8 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     const auto prompt_capacity = [&](std::int32_t width) {
         if (!int8_family) { return std::size_t{0}; }
         const detail::CausalPromptFa2Plan plan = detail::causal_prompt_fa2_plan(
-            q_heads, width, envelope.max_visible_keys, execution.multiprocessor_count);
+            q_heads, width, envelope.max_visible_keys, execution.multiprocessor_count,
+            detail::causal_prompt_fa2_eight_warps_fit(cache_storage != KvCacheStorage::Int8Group64));
         return detail::causal_prompt_fa2_split_bytes(q_heads, width, plan.splits);
     };
     const auto chunk_capacity = [&](std::int32_t width) {
@@ -637,7 +638,8 @@ CausalAttentionLaunchShape causal_softmax_attention_launch_shape(
     if (route == detail::CausalAttentionRoute::Prompt && int8_family_storage(cache_storage)) {
         const detail::CausalPromptFa2Plan plan = detail::causal_prompt_fa2_plan(
             geometry.query_heads, tokens, envelope.max_visible_keys,
-            execution.multiprocessor_count);
+            execution.multiprocessor_count,
+            detail::causal_prompt_fa2_eight_warps_fit(cache_storage != KvCacheStorage::Int8Group64));
         shape.route |= (plan.warps == 4 ? 1U : 0U) << 16U;
         if (plan.splits > 1) {
             shape.route |= 1U << 17U;

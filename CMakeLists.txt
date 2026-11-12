@@ -35,6 +35,12 @@ include(cmake/CompilerCache.cmake)
 if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|80|86|89)$")
   add_compile_definitions(NINFER_SM8X_COMPAT=1)
 endif()
+# Volta (sm_70) has no cp.async, ldmatrix, BF16 or INT8 tensor cores and a 96 KiB shared-memory
+# limit. Device code emulates the instructions (ops/common/volta_compat.cuh); the host-visible
+# constants (ops/common/smem_limit.h) key on this definition.
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  add_compile_definitions(NINFER_SM70=1)
+endif()
 
 # --- Global settings ---------------------------------------------------------
 option(NINFER_BUILD_APPS "Build the NInfer CLI, server and perplexity evaluator" ON)

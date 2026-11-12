@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/common/smem_limit.h"
 #include "core/device.h"
 #include "ops/softmax_attention/dense/causal_cache/bf16/grouped_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/tiled_mma.cuh"
@@ -27,7 +28,7 @@ void validate_bf16_kv_operands(const CausalAttentionOperands& p,
 
 template <int Bytes, auto Kernel>
 int bf16_kv_dynamic_shared() {
-    static_assert(Bytes <= 99 * 1024);
+    static_assert(Bytes <= kMaxDynamicSharedBytes);
     if constexpr (Bytes > 48 * 1024) {
         configure_cuda_device_once([] {
             return cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes);

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/common/smem_limit.h"
 #include "ops/softmax_attention/dense/causal_cache/bf16/tile_io.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/softmax.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/epilogue.cuh"
@@ -27,7 +28,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     constexpr unsigned FullMask = 0xffffffffu;
 
     static_assert(Br == Schedule::kWarps * 16);
-    static_assert(bf16_kv_tiled_shared_bytes<Geometry, Schedule> <= 99 * 1024);
+    static_assert(bf16_kv_tiled_shared_bytes<Geometry, Schedule> <= kMaxDynamicSharedBytes);
 
     extern __shared__ __align__(16) __nv_bfloat16 causal_smem[];
     __nv_bfloat16* q_s = causal_smem;  // [Br, D] swizzled
