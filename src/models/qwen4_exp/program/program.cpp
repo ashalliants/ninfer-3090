@@ -530,6 +530,13 @@ struct SpecLayout {
 
 struct Layout {
     std::int32_t chunk = 0, wide_chunk = 0, columns = 0, token_domain = 0;
+    // The most columns one round routes through Forward::moe() -- `columns` under the plain and
+    // single-row MTP paths, but a genuine --mtp-rows-verify round routes B * W, same bound as
+    // io_columns below. ExpertResidency sizes its route log from this (table_bytes and the runtime
+    // constructor's max_columns); using `columns` alone there let Forward::route_log() throw during
+    // every routed layer of a round the rows eligibility check otherwise allowed (codepulse, PR
+    // #451).
+    std::int32_t expert_route_columns = 0;
     std::size_t wide_work = 0; // workspace of a wide call (in the lent frames)
     // pages: one lane's context; pool_pages: the KV pool every lane's extent comes out of.
     std::uint32_t lanes = 1, pages = 0, pool_pages = 0, base_pages = 0;
@@ -661,6 +668,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
             ? std::max<std::size_t>(static_cast<std::size_t>(d.columns),
                                     static_cast<std::size_t>(d.max_width) * d.lanes)
             : static_cast<std::size_t>(d.columns);
+    d.expert_route_columns = static_cast<std::int32_t>(io_columns);
     d.io = IoLayout::plan(io_columns, static_cast<std::size_t>(c.ple.table.row_bytes) * hash.heads(),
                           static_cast<std::size_t>(d.max_width), static_cast<std::size_t>(d.drafts), o.vision,
                           d.lanes);
@@ -753,7 +761,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.io        = d.io.bytes + (sizeof(float) + 2ULL) * c.vocab_size * logit_columns + 2ULL * c.vocab_size * d.lanes +
                   256 * 4 +
                   (sizeof(ops::SamplingConfig) + 4ULL * public_tokens + 4ULL * d.mask_words + 256) * d.lanes + 4096;
-    b.residency            = ExpertResidency::table_bytes(c, d.columns, o.partial_ram_residency);
+    b.residency            = ExpertResidency::table_bytes(c, d.expert_route_columns, o.partial_ram_residency);
     b.speculation          = d.drafts > 0 ? d.spec.bytes : 0;
     b.expert_record_stride = d.frame_stride;
     b.max_frames           = ExpertResidency::max_frames(c);
@@ -984,8 +992,8 @@ public:
             banks.push_back(bank.host_records);
             bank_strides.push_back(bank.record_stride);
         }
-        residency_ = std::make_unique<ExpertResidency>(c_, std::move(banks), std::move(bank_strides), plan_.columns,
-                                                       device_.device, partial_setup());
+        residency_ = std::make_unique<ExpertResidency>(c_, std::move(banks), std::move(bank_strides),
+                                                       plan_.expert_route_columns, device_.device, partial_setup());
         allocated += plan_.bytes.residency;
         // Partial RAM residency: the CPU miss service reads the residency's host slot tables.
         if (options_.partial_ram_residency && plan_.bytes.cpu_misses != 0) { start_cpu_misses(); }

@@ -27,6 +27,7 @@
 // A synthetic prompt is a fixed pseudo-random sequence of ordinary token ids (exactness needs
 // deterministic ids, not language), different per length.
 
+#include "models/qwen4_exp/execution/forward.h"
 #include "ninfer/engine.h"
 #include "ninfer/types.h"
 
@@ -306,7 +307,15 @@ int exact(const std::string& artifact, const Options& o) {
             // long one's decode rounds), then both decode together.
             pair(2, 0, 1500, "staggered");
             pair(1, 0, 400, "staggered");
-            if (o.mtp > 0 && rows_rounds_seen == 0) {
+            // Every pair() call above decodes exactly two rows together: try_speculate_rows()'s own
+            // B * (limit + 1) <= kMaxForwardRows gate (program.cpp) decides whether that can batch
+            // at all. A width this test can't batch (e.g. --mtp 7: 2 * 8 = 16 > kMaxForwardRows)
+            // intentionally falls back to the plain/single-row path every round, so asserting a
+            // genuine rows-verify round there would fail the production code for behaving exactly
+            // as designed (codepulse, PR #451).
+            const bool rows_batchable =
+                2 * (static_cast<std::int64_t>(o.mtp) + 1) <= models::qwen4_exp::execution::kMaxForwardRows;
+            if (o.mtp > 0 && rows_batchable && rows_rounds_seen == 0) {
                 std::printf("FAIL: no paired run recorded a genuine rows-verify round (rows_rounds "
                             "stayed 0 across every pair) -- this test only exercised the plain "
                             "fallback or single-row MTP, not the batched path\n");
