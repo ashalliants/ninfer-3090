@@ -251,6 +251,8 @@ __device__ __noinline__ float4 mma_m16n8k8_tf32_impl(float4 c, unsigned a0, unsi
                                                      unsigned a2, unsigned a3, unsigned b0,
                                                      unsigned b1) {
     float c0 = c.x, c1 = c.y, c2 = c.z, c3 = c.w;
+    // The native instruction ignores the low 13 bits of each operand (the caller rounds, hence
+    // mma_tf32_bits); mask the same way. Every caller passes exact BF16 expansions.
     constexpr unsigned kTf32Mask = 0xffffe000u;
     const int lane               = laneid();
     const int g                  = lane >> 2;
