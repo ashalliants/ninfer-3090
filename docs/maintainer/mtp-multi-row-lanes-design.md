@@ -324,10 +324,60 @@ this Mac cannot build or run either):
    first differs from the single-row equivalent, column by column -- the next step named in the
    previous session's write-up, still not done.
 
-**This remains unresolved.** No fix is proposed here: without a GPU to run either experiment above,
-any patch would be a guess dressed up as a fix, which is worse than leaving the flag off. The
-`--mtp-rows-verify` gate stays default-off; this section exists so a future GPU session starts from
-"here is everything already ruled out" instead of re-deriving it a third time.
+**This remains unresolved as of the above re-derivation.** No fix was proposed at that point:
+without a GPU to run either experiment above, a patch would have been a guess dressed up as a fix,
+worse than leaving the flag off.
+
+## Bug 7 found: the logits scratch was too small for a batched round (2026-11-12, independent re-review)
+
+An independent review (a fresh agent, told nothing beyond the symptom and pointed at the same
+files) found the actual root cause, confirmed by directly reading the allocation math rather than
+trusting the report: **`logits32_`/`logits16_` are sized for `max(max_width, lanes)` columns
+(`program.cpp`'s `plan_layout` and the `Program` constructor), but a batched rows-verify round
+writes `B * W` columns into them (`verify_rows`'s `Tensor wide32(logits32_.data, FP32, {vocab_, B *
+W})`).** With `--mtp 3` (`max_width = 4`) and 2 lanes, the old sizing allocated 4 columns; a 2-row
+round needs 8. Row 0's 4 columns (columns 0-3) fit inside the real allocation and are always
+correct. Row 1's 4 columns (columns 4-7) silently overrun into whatever is allocated right after --
+`lane_logits_`, `sampled_`, `sample_position_`, `configs_`, and the start of `token_counts_` -- no
+crash, since it's all one buffer, just corrupted logits for row 1, every round, from the first one.
+This matches every observed symptom exactly: deterministic by loop position (not lane, not
+content), present from round 1, the drafter's own proposals look healthy (it never touches this
+buffer), and `target[0]` for row 1 -- read out of corrupted memory -- rarely matches a healthy
+draft. It also explains why the exactness test missed it: that test checks the two requests
+*overlapped in time*, not that they *decoded in the same batched round* (`rows_rounds_` is counted
+but never asserted on), so it is plausible no run of it ever actually exercised a genuine B=2 round
+in the first place.
+
+**Two further, smaller bugs surfaced in the same review**, both affecting every row equally (so
+neither explains the asymmetry, but both are real correctness gaps in the rows-verify path):
+
+- **The per-row QSA tail copy that `attention_rows_verify`'s own comment claims happens was never
+  written.** The single-row verify path explicitly copies the live tail into scratch before every
+  round (`verify()`'s `front` lambda, "the verification pools from copies of the live tails");
+  nothing in `stage_rows_verify_inputs`/`verify_rows` did the per-row equivalent into `rows_tails`,
+  so `qsa_pool_keys` read whatever stale bytes were last there.
+- **`stage_rows_verify_inputs`'s block-start RoPE staging used the wrong layout.** It called
+  `stage_rope_value(value, span, columns=B, column=b)`, which writes the axis-major pattern `word[a
+  * B + b]` (matching the big `[T, 3]` RoPE buffer's own convention) -- but `io.rows_block` is `[3,
+  B]`, 3 *contiguous* words per row (the `rows_block + 12 * b` convention every reader, including
+  `mtp_catch_up_row_rows` and `attention_rows_verify`, relies on). With 2 rows this interleaved the
+  two rows' block-start words: row 0 read `(row0, row1, row0)`, row 1 read `(row1, row0, row1)`.
+  `decode_rows()`'s own staging of the same buffer (`row_block[3 * b + a] = block[a]`) was the
+  correct precedent, a few hundred lines above the broken call.
+
+**All three fixed in this commit** (`logit_columns_for()` sizes the logits scratch for `B * W` when
+`--mtp-rows-verify` is on, plus a runtime capacity check in `verify_rows`; a per-row
+`cudaMemcpy2DAsync` into `rows_tails` added to `verify_rows`'s drafting loop; the block-start RoPE
+write corrected to match `decode_rows()`'s layout). **None of this has been built or run** -- this
+Mac has no CUDA toolchain and no GPU was rented to verify it (per instruction). The logic was
+checked by hand against the existing, working single-row and plain-rows precedents each fix
+mirrors, and the capacity arithmetic was independently re-derived (not just trusted from the
+review), but **this is still unverified until someone runs
+`ninfer_qwen4_exp_lanes_real_test --exact --mtp 3 --generate 96 --cache --max-context 16384` and
+the two-curl HTTP concurrent test on real hardware.** If both pass and the acceptance asymmetry is
+gone, `--mtp-rows-verify` is probably ready to re-measure for the default-on decision; if not, this
+section's fixes are the first thing to re-check, not the forward pass math that two separate
+reviews have now independently re-confirmed as correct.
 
 ## What's still open (where this document stops, and implementation starts)
 

@@ -551,6 +551,17 @@ struct Layout {
     ProgramDevicePlan bytes;
 };
 
+// The widest round the FP32/BF16 logits scratch must hold. A plain round needs at most `lanes`
+// columns (one per lane); a single-row MTP verify needs at most `max_width`. --mtp-rows-verify
+// batches every active lane's own `max_width` columns into one round (T = B * W, B <= lanes, W <=
+// max_width), so with it on the scratch must be sized for the *product*, not just the larger of
+// the two -- sizing it as max(max_width, lanes) let a 2-lane, W=4 round write 8 columns into a
+// 4-column buffer, silently overrunning into the sampling scratch that follows it (bug 7).
+std::size_t logit_columns_for(std::int32_t max_width, std::uint32_t lanes, bool mtp_rows_verify) noexcept {
+    return mtp_rows_verify ? static_cast<std::size_t>(max_width) * lanes
+                           : std::max<std::size_t>(static_cast<std::size_t>(max_width), lanes);
+}
+
 Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t public_tokens,
                    std::span<const std::uint64_t> strides) {
     if (o.max_concurrency < 1 || o.max_concurrency > kMaximumLanes) {
@@ -718,7 +729,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.state     = d.state_total;
     // Logits of the widest round (FP32 and BF16; at least one column per lane), then the sampling
     // words (a config, the counts and a mask per lane).
-    const std::uint64_t logit_columns = std::max<std::uint64_t>(static_cast<std::uint64_t>(d.max_width), d.lanes);
+    const std::uint64_t logit_columns = logit_columns_for(d.max_width, d.lanes, o.mtp_rows_verify);
     b.io        = d.io.bytes + (sizeof(float) + 2ULL) * c.vocab_size * logit_columns + 2ULL * c.vocab_size * d.lanes +
                   256 * 4 +
                   (sizeof(ops::SamplingConfig) + 4ULL * public_tokens + 4ULL * d.mask_words + 256) * d.lanes + 4096;
@@ -869,8 +880,11 @@ public:
         auto* io = static_cast<std::byte*>(io_device_.p);
         std::size_t at = align(plan_.io.bytes);
         // One column's logits; a verification round reads the widest round's columns (and a round
-        // over the lanes one per lane) from here on.
-        const std::size_t logit_columns = std::max<std::size_t>(static_cast<std::size_t>(plan_.max_width), plan_.lanes);
+        // over the lanes one per lane, or with --mtp-rows-verify every lane's own widest round at
+        // once) from here on.
+        const std::size_t logit_columns =
+            logit_columns_for(plan_.max_width, plan_.lanes, options_.mtp_rows_verify);
+        logits_capacity_columns_ = logit_columns;
         logits32_ = Tensor(io + at, DType::FP32, {vocab_, 1});
         at = align(at + sizeof(float) * c_.vocab_size * logit_columns);
         logits16_ = Tensor(io + at, DType::BF16, {vocab_, 1});
@@ -4978,8 +4992,14 @@ private:
             }
             stage_rope(L().rope, first, W, std::span<std::int32_t>(rope, 3ULL * static_cast<std::size_t>(total)),
                       total, b * W);
-            stage_rope_value(block_start_rope(L().rope, first, c_.qsa.compress_ratio),
-                             std::span<std::int32_t>(block, 3ULL * static_cast<std::size_t>(B)), B, b);
+            // batch.block_start_rope is [3, B] (3 contiguous words per row, rows B apart -- the
+            // "rows_block + 12*b" convention every reader uses), not the axis-major [3, columns]
+            // layout stage_rope_value(..., B, b) would produce (that call writes word[a*B + b],
+            // interleaving every row's own 3 words with every other row's); write the 3 words
+            // directly instead, matching decode_rows()'s own identical staging (its row_block[3*b+a]
+            // a few hundred lines above).
+            const RopePosition block_start = block_start_rope(L().rope, first, c_.qsa.compress_ratio);
+            for (std::size_t a = 0; a < 3; ++a) { block[3 * static_cast<std::size_t>(b) + a] = block_start[a]; }
             ngram_window_rows(hash_, L().history, {}, static_cast<std::int64_t>(first), W, ngram_window_,
                               std::span<std::uint32_t>(row_ids_).subspan(static_cast<std::size_t>(b * W) * heads,
                                                                          static_cast<std::size_t>(W) * heads));
@@ -5138,6 +5158,16 @@ private:
             std::array<std::int32_t, kMaximumLanes> row_kept{};
             for (std::int32_t b = 0; b < B; ++b) {
                 select_lane(lanes[static_cast<std::size_t>(b)]);
+                // The round's attention verify pools from a copy of row b's own live tail (the
+                // single-row path's "verification pools from copies of the live tails", generalized
+                // per row): without this, attention_rows_verify's qsa_pool_keys reads whatever
+                // rows_tails last held, which was never written for this row, every round.
+                if (tails_base_ != nullptr) {
+                    CUDA_CHECK(cudaMemcpy2DAsync(spec_base() + plan_.spec.rows_tails + static_cast<std::size_t>(b) * plan_.tail,
+                                                 plan_.spec.rows_tails_layer_stride, tails_base_, tail_layer_stride_,
+                                                 plan_.tail, c_.attention_layers, cudaMemcpyDeviceToDevice,
+                                                 device_.stream));
+                }
                 const auto drafted = mtp_draft(limit);
                 const std::span<const float> probs(static_cast<const float*>(draft_probs_host_.data()),
                                                    static_cast<std::size_t>(limit));
@@ -5146,6 +5176,9 @@ private:
                 std::copy_n(probs.begin(), kept, L().joint_probs.begin());
                 row_kept[static_cast<std::size_t>(b)] = kept;
                 row_drafts[static_cast<std::size_t>(b)].assign(drafted.begin(), drafted.end());
+            }
+            if (static_cast<std::size_t>(B) * static_cast<std::size_t>(W) > logits_capacity_columns_) {
+                throw std::logic_error("Qwen3.8-Flash-Next: rows-verify round exceeds the logits scratch capacity");
             }
             stage_rows_verify_inputs(lanes, row_drafts, W);
             residency_->before_round(device_.stream);
@@ -5797,6 +5830,9 @@ private:
     // Relaxed drafting's tokenizer facts (ProgramOptions::relaxed_drafting; empty when off).
     qwen3_5::frontend::RelaxedDraftingTokens relaxed_tokens_;
     Tensor logits32_, logits16_, sampled_, sample_position_, token_counts_;
+    // The columns logits32_/logits16_ are actually allocated for (logit_columns_for at construction
+    // time); verify_rows checks every round's B * W against this before writing past it.
+    std::size_t logits_capacity_columns_ = 0;
     Tensor lane_logits_; // BF16 [V, lanes]: each lane's last prefill call's logits (checkpoints, exact hits)
     ops::SamplingConfig* configs_ = nullptr;
     std::uint32_t* masks_         = nullptr;
