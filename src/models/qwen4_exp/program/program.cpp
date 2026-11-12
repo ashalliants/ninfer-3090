@@ -646,8 +646,18 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     d.kv         = KvLayout::plan(c, d.pool_pages, c.attention_layers + (d.drafts > 0 ? 1U : 0U),
                                   static_cast<std::size_t>(d.pages) * d.lanes);
     const NgramHash hash(c.ple.ngram, 0);
-    d.io = IoLayout::plan(static_cast<std::size_t>(d.columns),
-                          static_cast<std::size_t>(c.ple.table.row_bytes) * hash.heads(),
+    // stage_rows_verify_inputs writes B * W columns of ids/positions/rope/ngram (B <= lanes, W <=
+    // max_width) into the same io.ids/io.positions/io.rope/io.ngram regions IoLayout::plan sizes
+    // from `columns` -- with --mtp-rows-verify the IO arena must be sized for at least that product,
+    // not just the prefill/wide-chunk width, or a small --max-context/--prefill-chunk configuration
+    // with two lanes drafting several tokens each overruns the pinned host buffer and the device
+    // upload past it.
+    const std::size_t io_columns =
+        o.mtp_rows_verify
+            ? std::max<std::size_t>(static_cast<std::size_t>(d.columns),
+                                    static_cast<std::size_t>(d.max_width) * d.lanes)
+            : static_cast<std::size_t>(d.columns);
+    d.io = IoLayout::plan(io_columns, static_cast<std::size_t>(c.ple.table.row_bytes) * hash.heads(),
                           static_cast<std::size_t>(d.max_width), static_cast<std::size_t>(d.drafts), o.vision,
                           d.lanes);
     d.gdn_conv      = std::size_t(c.gdn.conv_channels()) * (c.gdn.conv_kernel - 1) * 2;
@@ -2129,13 +2139,20 @@ public:
         out.row_count   = rows.size();
         std::array<std::uint32_t, kMaximumLanes> lanes{};
         for (std::size_t row = 0; row < rows.size(); ++row) { lanes[row] = ContractAccess::lane(rows[row]); }
-        const std::size_t count = rows.size();
+        const std::size_t count      = rows.size();
+        const bool speculative_rows  = count > 1 && ContractAccess::speculative(pending);
         ContractAccess::consume(pending);
         pending_     = 0;
         settle_gdn_fold();
-        // The round ran on the device: settle its cache update before the lanes go, as a commit would.
+        // The round ran on the device: settle its cache update before the lanes go, as a commit
+        // would. A speculative multi-row round columned B * round_width_ (not just B, which is only
+        // right for a plain one-token-per-row round); using B alone here undercounted an aborted
+        // rows-verify round's resource/cache accounting (codepulse, PR #451).
         try {
-            settle_round(count > 1 ? static_cast<std::int32_t>(count) : round_width_, 0);
+            const std::int32_t columns = speculative_rows ? static_cast<std::int32_t>(count) * round_width_
+                                        : count > 1       ? static_cast<std::int32_t>(count)
+                                                           : round_width_;
+            settle_round(columns, 0);
         } catch (...) { deferred_ = false; }
         deferred_    = false;
         round_width_ = 1;
@@ -5132,6 +5149,12 @@ private:
         }
         const std::int32_t shared_limit = *std::min_element(limits.begin(), limits.begin() + B);
         if (shared_limit <= 0) { return std::nullopt; }
+        // The dense Ops' column-invariance bound (design doc: "the real ceiling on N is the dense
+        // Ops' column-invariance bound, N * W <= kMaxForwardRows"), checked here, before staging or
+        // drafting anything, so a config that cannot batch (e.g. 2 lanes at --mtp 7) declines to the
+        // existing plain decode_rows() fallback instead of reaching run_rows_verify_front's own
+        // bound check after both lanes are already committed to this round.
+        if (B * (shared_limit + 1) > execution::kMaxForwardRows) { return std::nullopt; }
         return verify_rows(sequences, shared_limit, start);
     }
 
@@ -5140,6 +5163,11 @@ private:
     // (accept_row above) against each row's own joint-acceptance-trimmed count.
     PendingBatch verify_rows(std::span<const SequenceHandle> sequences, std::int32_t limit, Clock::time_point start) {
         const nvtx::ScopedRange range(nvtx::Name::DecodeMtpRound, nvtx::Category::Decode);
+        // --cpu-verify-misses: the round's CPU legs report to a clear error word, matching the
+        // single-row verify()'s own arm/check pair. Without this the batched path's two new MoE
+        // calls (layer_rows_verify) could hand the CPU miss service work and never notice it failed
+        // (codepulse, PR #451).
+        arm_cpu_error(false);
         const auto B    = static_cast<std::int32_t>(sequences.size());
         const std::int32_t W = limit + 1;
         for (std::int32_t b = 0; b < B; ++b) {
@@ -5192,6 +5220,10 @@ private:
             ops::cast_fp32_to_bf16(wide32, wide16, device_.stream);
             std::array<std::int32_t, kMaximumLanes> counts{};
             std::array<bool, kMaximumLanes> constraint_failed{};
+            // accept_row's own device_.synchronize() (once per row) is this round's device wait;
+            // timed as a whole below so submit_host_ns stays host-only, matching the single-row
+            // verify()'s own split (it was all landing in submit_host_ns before, codepulse PR #451).
+            const auto wait = Clock::now();
             for (std::int32_t b = 0; b < B; ++b) {
                 select_lane(lanes[static_cast<std::size_t>(b)]);
                 const std::span<const TokenId> kept_drafts(row_drafts[static_cast<std::size_t>(b)].data(),
@@ -5199,9 +5231,19 @@ private:
                 counts[static_cast<std::size_t>(b)] =
                     accept_row(b, W, kept_drafts, wide16, constraint_failed[static_cast<std::size_t>(b)]);
                 rows_pending_count_[static_cast<std::size_t>(b)] = counts[static_cast<std::size_t>(b)];
+                // Distinguishes a genuine batched round from a single-row MTP round that happened
+                // to run while the other lane was idle: rounds/drafted_tokens/accepted_tokens (set
+                // by accept_row above) count identically either way, so a test asserting the
+                // batched path was actually exercised needs this (codepulse, PR #451).
+                ++L().speculative.rows_rounds;
             }
+            // Every accept_row above synchronized the device at least once, so this is safe to read
+            // now, matching the single-row verify()'s own placement (after its device sync, before
+            // anything trusts the round's outputs).
+            check_cpu_verify();
             runtime::ExecutionTiming timing;
-            timing.submit_host_ns = elapsed_ns(start);
+            timing.device_wait_ns = elapsed_ns(wait);
+            timing.submit_host_ns = elapsed_ns(start) - timing.device_wait_ns;
             round_width_          = W;
             deferred_             = true;
             pending_              = ++transaction_;
@@ -5249,6 +5291,12 @@ private:
         out.row_count = B;
         std::array<ops::GdnReplayFoldRow, kMaximumLanes> fold_rows{};
         std::int32_t total_tokens = 0;
+        // Released rows' lanes are freed after the fold and settle_round below, exactly like
+        // commit_rows()'s own release[]/any_released pattern for the plain multi-row path --
+        // deferred rather than released inline, so settle_round and rows_fold still see every row's
+        // lane in its normal (not yet reset) state while the round settles.
+        std::array<bool, kMaximumLanes> release{};
+        bool any_released = false;
         for (std::int32_t b = 0; b < B; ++b) {
             const std::uint32_t lane = ContractAccess::lane(rows[static_cast<std::size_t>(b)]);
             select_lane(lane);
@@ -5268,6 +5316,10 @@ private:
                 out.rows[static_cast<std::size_t>(b)].speculative = speculative_stats();
                 out.rows[static_cast<std::size_t>(b)].disposition =
                     d.failed ? runtime::CommitDisposition::FailedReleased : runtime::CommitDisposition::CancelledReleased;
+                // This branch never freed the lane at all, permanently stranding it as occupied
+                // (codepulse, PR #451) -- commit_verified's single-row equivalent always does.
+                release[static_cast<std::size_t>(b)] = true;
+                any_released                         = true;
                 continue;
             }
             const auto k = static_cast<std::int32_t>(d.accepted_tokens);
@@ -5321,6 +5373,12 @@ private:
         }
         rows_fold(W).execute({fold_rows.data(), static_cast<std::size_t>(B)}, s);
         settle_round(B * W, total_tokens);
+        for (std::int32_t b = 0; b < B; ++b) {
+            if (!release[static_cast<std::size_t>(b)]) { continue; }
+            select_lane(ContractAccess::lane(rows[static_cast<std::size_t>(b)]));
+            release_lane();
+        }
+        if (any_released) { settle_idle(); }
         out.timing.post_host_ns = elapsed_ns(start);
         return out;
     }

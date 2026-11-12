@@ -1269,16 +1269,21 @@ void Forward::layer_rows_verify(std::uint32_t layer, const ForwardRowsVerifyBatc
     Tensor y = config_.layer_types[layer] == MixerKind::Gdn
                    ? gdn_rows_verify(std::get<GdnParameters>(block.mixer), xa, compact, batch)
                    : attention_rows_verify(std::get<AttentionParameters>(block.mixer), xa, compact, batch);
+    // A rows-verify call always has batch.verify set (rows_verify_batch always supplies it, unlike
+    // the single-row path's ForwardBatch), so the CPU-miss channel cpu_channels() would select for
+    // it is unconditionally experts_.cpu -- passing nullptr here (as the original version did)
+    // silently dropped every CPU-miss expert's contribution to a rows-verify round's logits instead
+    // of routing it through the configured fallback (codepulse, PR #451).
     if (fused_read(block.mlp_hc, T)) {
         const MoeRead read = read_moe(block.mlp_hc, block.moe.router, block.moe.shared_score, residual_, y, inject,
                                       route_log(layer, static_cast<std::size_t>(config_.moe.top_k) * T));
-        Tensor ym          = moe(block.moe, read.x, layer, nullptr, /*cpu=*/nullptr, &read);
+        Tensor ym          = moe(block.moe, read.x, layer, nullptr, &experts_.cpu, &read);
         ops::hyper_connection_inject(ym, read.inject, residual_, s);
         return;
     }
     ops::hyper_connection_inject(y, inject, residual_, s);
     Tensor xm = mix(block.mlp_hc, residual_, &inject);
-    Tensor ym = moe(block.moe, xm, layer, nullptr, /*cpu=*/nullptr);
+    Tensor ym = moe(block.moe, xm, layer, nullptr, &experts_.cpu);
     ops::hyper_connection_inject(ym, inject, residual_, s);
 }
 

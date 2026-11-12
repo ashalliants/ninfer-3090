@@ -1596,6 +1596,11 @@ struct SpeculativeStats {
     // Relaxed drafting: accepted drafts the exact rule would have rejected and the threshold kept,
     // a subset of `accepted_tokens`. Zero unless the request ran with a threshold.
     std::uint64_t relaxed_kept = 0;
+    // --mtp-rows-verify: rounds verified through the batched multi-row path (a subset of `rounds`).
+    // Zero means every round of this request's MTP, if any, ran the single-row path or the plain
+    // multi-row fallback -- useful for a test to assert the batched path was genuinely exercised,
+    // since `rounds`/`drafted_tokens`/`accepted_tokens` count identically either way.
+    std::uint64_t rows_rounds = 0;
 };
 
 struct ThinkingBudgetStats {

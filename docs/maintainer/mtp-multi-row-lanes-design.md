@@ -9,10 +9,13 @@ profiled per-round costs (verify at W=3 ~20 ms vs plain ~12.5 ms; see `docs/perf
 "MTP and lanes" section). A real fix needs the GPU forward pass itself batched across rows, not
 just removing the fallback.
 
-**Status: design only, not implemented.** This document exists so the implementation (by whoever
-picks it up, including a future session) does not have to re-derive the kernel survey below, which
-is the single most valuable and time-consuming part of this investigation: establishing that the
-feature needs **no new CUDA kernels**, only new host-side orchestration.
+**Status: implemented and gated off by default** (`--mtp-rows-verify`, needs
+`--mtp-joint-acceptance`; see "Finished, built, and tested -- but shipped off by default" below for
+why). The kernel survey immediately below predates the implementation and is kept because it is
+still the record of the single most valuable and time-consuming part of this investigation --
+establishing that the feature needed **no new CUDA kernels**, only new host-side orchestration --
+not because any of it remains to be done. Skip to "Implementation progress" and the sections after
+it for what actually landed, the bugs found, and the one that is still open.
 
 **Scoped to N rows, not 2.** `kMaximumLanes = 2` is today's hard cap on Flash-Next concurrency, set
 independently in `qwen4_exp_instance.cpp`'s refusal ("three or more lanes lose to two on one RTX
@@ -379,43 +382,24 @@ gone, `--mtp-rows-verify` is probably ready to re-measure for the default-on dec
 section's fixes are the first thing to re-check, not the forward pass math that two separate
 reviews have now independently re-confirmed as correct.
 
-## What's still open (where this document stops, and implementation starts)
+## What's still open
 
-Items equivalent to the original 1-4 here are now **done** -- see "Implementation progress" above
-for what actually landed (in places, simpler than originally planned here: no `conv_scratch`/
-`initial_slots` staging dance, `qsa_keys` as a vector not a single tensor, no new `IoLayout` region
-needed, and no CUDA graph capture in the first version). What remains:
+Everything the original version of this section listed as remaining work (the IO staging function,
+`try_speculate_rows`/`verify_rows`/`commit_speculative_rows`, `decode()`'s dispatch, the exactness
+test) is **done** -- see "Implementation progress" and "Finished, built, and tested" above. The one
+thing actually left:
 
-1. **The IO staging function**: a `write_rows_verify_inputs(rows, width)`-style function, writing
-   each active row's W-column ids/positions/RoPE/n-gram-rows into the existing `io_host_`/
-   `io_device_` scratch at `row * W`-offset column ranges (confirmed large enough: sized for
-   `columns`, the widest call anywhere), reading each row's own `lanes_[lane]` state directly
-   (not `L()`, since several lanes' own history/RoPE are needed without switching `cur_`), and each
-   row's `block_start_rope` via the existing `plan_.io.rows_block` (already `lanes`-sized, built
-   for `decode_rows()`'s identical one-triple-per-row need).
-2. **New program-level functions**: `try_speculate_rows(sequences, budgets, masks)` (the N-row
-   sibling of `try_speculate`, taking `sequences.size()` as N rather than assuming 2, gated so it
-   only attempts the batched path when *every* active row independently passes `try_speculate`'s
-   existing eligibility checks -- budget, not constrained without `--mtp-constrained`, not
-   CPU-verify-failed -- falling back to today's plain `decode_rows()` entirely, for all rows,
-   otherwise, which is simple and conservative); a `verify_rows()` building the combined batch,
-   running the new Forward calls once, then calling the unchanged single-row accept Op N times
-   (once per row's W-column logits slice) and combining the N results into one `PendingBatch`
-   using its already-existing multi-row fields (themselves sized by `kMaximumLanes`, so already
-   N-general); a `commit_speculative_rows()` (the N-row sibling of `commit_verified()`, using
-   `GdnReplayFoldPlan::execute()` with N `GdnReplayFoldRow` entries and calling `qsa_commit_tails`
-   N times).
-3. **`decode()`'s dispatch**: replace the unconditional `if (sequences.size() > 1) return
-   decode_rows(...)` with "try `try_speculate_rows`, fall back to `decode_rows` if it declines."
-4. **Testing**: a new exactness test mirroring the project's own convention
-   (`ninfer_qwen4_exp_lanes_real_test --exact --mtp`): run the batched 2-row path and, separately,
-   each row's own single-lane MTP path on an identical prompt pair, and assert the outputs are
-   **bitwise identical**. This is the only way to catch an indexing/stride mistake in the new code
-   -- there is no CPU reference implementation of any of these kernels to check against on paper,
-   and the failure mode of a subtle bug here is silently wrong generation, not a crash.
-5. **This needs a CUDA-capable GPU for every step past (1)**: this Mac has no `nvcc`, so none of
-   this compiles here, and correctness can only be established by actually running the exactness
-   test on real hardware (there is no CPU-side way to validate GDN/QSA kernel numerics).
+**Every fix in this document needs to be built and run on a real GPU before `--mtp-rows-verify` can
+be considered for default-on.** This Mac has no CUDA toolchain, so every bug fix recorded here --
+the three from the independent review (the logits-scratch overflow that was bug 7's real cause, the
+missing QSA tail copy, the mis-laid-out block-start RoPE staging) and the further round of
+`codepulse-reviews` findings on PR #451 (the leaked lane on a released row, the IO-arena overrun at
+small `--max-context`/`--prefill-chunk`, the aborted-round column undercount, the missing
+`kMaxForwardRows` pre-check, the bypassed CPU-miss contract, the host/device timing split) -- has
+been applied by reading the code, never by compiling or running it. The next step is
+`ninfer_qwen4_exp_lanes_real_test --exact --mtp 3 --generate 96 --cache --max-context 16384` and the
+two-curl HTTP concurrent test on real hardware; only after both pass is this ready to re-measure for
+a default-on decision.
 
 ## Cost model sanity check (why this is worth doing, if done right)
 

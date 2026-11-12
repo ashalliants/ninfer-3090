@@ -272,6 +272,13 @@ int exact(const std::string& artifact, const Options& o) {
     bool ok = true;
     {
         Engine engine(base_options(artifact, o.max_context, o.lanes, o.mtp, o.cache));
+        // Temporal overlap alone doesn't prove the batched rows-verify path ran: two requests can
+        // overlap while still only ever decoding in separate single-row rounds. rows_rounds (set
+        // only inside verify_rows, the batched path -- see program.cpp) is the direct signal; summed
+        // across every pair below, it must be nonzero whenever --mtp-rows-verify is forced on by
+        // base_options, or this test proves nothing about the code it claims to exercise
+        // (codepulse, PR #451).
+        std::uint64_t rows_rounds_seen = 0;
         const auto pair = [&](std::size_t a, std::size_t b, int stagger_ms, const char* label) {
             Run ra, rb;
             std::thread first([&] { ra = generate(engine, *prompts[a], o.tokens, false, origin); });
@@ -281,6 +288,7 @@ int exact(const std::string& artifact, const Options& o) {
             second.join();
             print_run(std::string(label) + " " + names[a], ra, prompts[a]->size());
             print_run(std::string(label) + " " + names[b], rb, prompts[b]->size());
+            rows_rounds_seen += ra.speculative.rows_rounds + rb.speculative.rows_rounds;
             // The two requests overlapped in time, or this did not test shared rounds.
             const bool overlapped = ra.submitted < rb.finished && rb.submitted < ra.finished;
             if (!overlapped) {
@@ -298,6 +306,12 @@ int exact(const std::string& artifact, const Options& o) {
             // long one's decode rounds), then both decode together.
             pair(2, 0, 1500, "staggered");
             pair(1, 0, 400, "staggered");
+            if (o.mtp > 0 && rows_rounds_seen == 0) {
+                std::printf("FAIL: no paired run recorded a genuine rows-verify round (rows_rounds "
+                            "stayed 0 across every pair) -- this test only exercised the plain "
+                            "fallback or single-row MTP, not the batched path\n");
+                ok = false;
+            }
         }
         for (std::size_t i = 0; i < prompts.size(); ++i) {
             const Run r = generate(engine, *prompts[i], o.tokens, false, origin);
