@@ -21,6 +21,12 @@ namespace ninfer::ops::volta {
 
 constexpr unsigned kFullMask = 0xffffffffu;
 
+__device__ __forceinline__ int laneid() {
+    unsigned lane;
+    asm("mov.u32 %0, %%laneid;\n" : "=r"(lane));
+    return static_cast<int>(lane);
+}
+
 __device__ __forceinline__ unsigned lds32(unsigned addr) {
     unsigned v;
     asm volatile("ld.shared.b32 %0, [%1];\n" : "=r"(v) : "r"(addr));
@@ -36,14 +42,14 @@ __device__ __forceinline__ unsigned lds16(unsigned addr) {
 // Matrix i (0..3) of an ldmatrix: lane 8*i+r supplies the address of row r; each lane receives
 // row lane/4, columns 2*(lane%4), 2*(lane%4)+1.
 __device__ __forceinline__ unsigned ldmatrix_word(unsigned addr, int i) {
-    const int lane = threadIdx.x & 31;
+    const int lane = laneid();
     const unsigned row_addr = __shfl_sync(kFullMask, addr, 8 * i + (lane >> 2));
     return lds32(row_addr + 4 * (lane & 3));
 }
 
 // Transposed: each lane receives M[2*(lane%4)][lane/4] and M[2*(lane%4)+1][lane/4].
 __device__ __forceinline__ unsigned ldmatrix_word_t(unsigned addr, int i) {
-    const int lane = threadIdx.x & 31;
+    const int lane = laneid();
     const int r    = 2 * (lane & 3);
     const unsigned a0 = __shfl_sync(kFullMask, addr, 8 * i + r);
     const unsigned a1 = __shfl_sync(kFullMask, addr, 8 * i + r + 1);
@@ -73,7 +79,7 @@ template <class Unpack>
 __device__ __noinline__ float4 mma_m16n8k16_impl(float4 c, unsigned a0, unsigned a1, unsigned a2,
                                                  unsigned a3, unsigned b0, unsigned b1) {
     float c0 = c.x, c1 = c.y, c2 = c.z, c3 = c.w;
-    const int lane = threadIdx.x & 31;
+    const int lane = laneid();
     const int g    = lane >> 2;
     const int t    = lane & 3;
     // Rolled to keep the non-inlined body small.
@@ -117,7 +123,7 @@ __device__ __forceinline__ void mma_m16n8k16(float& c0, float& c1, float& c2, fl
 __device__ __noinline__ int4 mma_m16n8k32_s8_impl(int4 c, unsigned a0, unsigned a1, unsigned a2,
                                                   unsigned a3, unsigned b0, unsigned b1) {
     int c0 = c.x, c1 = c.y, c2 = c.z, c3 = c.w;
-    const int lane = threadIdx.x & 31;
+    const int lane = laneid();
     const int g    = lane >> 2;
     const int t    = lane & 3;
     // Rolled to keep the non-inlined body small.
@@ -151,6 +157,92 @@ __device__ __forceinline__ void mma_m16n8k32_s8(int& c0, int& c1, int& c2, int& 
     c0 = r.x; c1 = r.y; c2 = r.z; c3 = r.w;
 }
 
+// m16n8k16 s8: a0:(row g, k 4t..4t+3) a1:(row g+8, same)  b0:(k 4t..4t+3, n g). The k32 shape's
+// first half.
+__device__ __noinline__ int4 mma_m16n8k16_s8_impl(int4 c, unsigned a0, unsigned a1, unsigned b0) {
+    int c0 = c.x, c1 = c.y, c2 = c.z, c3 = c.w;
+    const int lane = laneid();
+    const int g    = lane >> 2;
+    const int t    = lane & 3;
+#pragma unroll 1
+    for (int tp = 0; tp < 4; ++tp) {
+        const int src_a = 4 * g + tp;
+        const int A0    = static_cast<int>(__shfl_sync(kFullMask, a0, src_a));
+        const int A1    = static_cast<int>(__shfl_sync(kFullMask, a1, src_a));
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int B0 = static_cast<int>(__shfl_sync(kFullMask, b0, 4 * (2 * t + j) + tp));
+            int& lo      = (j == 0) ? c0 : c1;
+            int& hi      = (j == 0) ? c2 : c3;
+            lo           = __dp4a(A0, B0, lo);
+            hi           = __dp4a(A1, B0, hi);
+        }
+    }
+    return make_int4(c0, c1, c2, c3);
+}
+
+__device__ __forceinline__ void mma_m16n8k16_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0,
+                                                unsigned a1, unsigned b0) {
+    const int4 r = mma_m16n8k16_s8_impl(make_int4(c0, c1, c2, c3), a0, a1, b0);
+    c0 = r.x; c1 = r.y; c2 = r.z; c3 = r.w;
+}
+
+// Eight signed 4-bit values (lowest k in the lowest nibble) as two registers of four sign-extended
+// bytes: the even-k nibbles and the odd-k nibbles. A dot product is the same sum in any k order as
+// long as both operands are split the same way.
+__device__ __forceinline__ void split_s4(unsigned x, int& even, int& odd) {
+    constexpr unsigned kLow  = 0x0F0F0F0Fu;
+    constexpr unsigned kSign = 0x08080808u;
+    // (v ^ 8) - 8 sign-extends a nibble held in a byte; the per-byte subtract cannot borrow
+    // across bytes because every byte is at least 8 after the xor.
+    even = static_cast<int>(__vsub4((x & kLow) ^ kSign, kSign));
+    odd  = static_cast<int>(__vsub4(((x >> 4) & kLow) ^ kSign, kSign));
+}
+
+__device__ __forceinline__ int dot8_s4(unsigned x, unsigned y, int acc) {
+    int xe, xo, ye, yo;
+    split_s4(x, xe, xo);
+    split_s4(y, ye, yo);
+    return __dp4a(xo, yo, __dp4a(xe, ye, acc));
+}
+
+// m16n8k64 s4: a0:(row g, k 8t..8t+7) a1:(row g+8, same) a2:(row g, k 32+8t..) a3:(row g+8, 32+8t..)
+//              b0:(k 8t..8t+7, n g)   b1:(k 32+8t.., n g). D = A*B + C with C separate from D.
+__device__ __noinline__ int4 mma_m16n8k64_s4_impl(int4 c, unsigned a0, unsigned a1, unsigned a2,
+                                                  unsigned a3, unsigned b0, unsigned b1) {
+    int c0 = c.x, c1 = c.y, c2 = c.z, c3 = c.w;
+    const int lane = laneid();
+    const int g    = lane >> 2;
+    const int t    = lane & 3;
+#pragma unroll 1
+    for (int tp = 0; tp < 4; ++tp) {
+        const int src_a   = 4 * g + tp;
+        const unsigned A0 = __shfl_sync(kFullMask, a0, src_a);
+        const unsigned A1 = __shfl_sync(kFullMask, a1, src_a);
+        const unsigned A2 = __shfl_sync(kFullMask, a2, src_a);
+        const unsigned A3 = __shfl_sync(kFullMask, a3, src_a);
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int src_b   = 4 * (2 * t + j) + tp;
+            const unsigned B0 = __shfl_sync(kFullMask, b0, src_b);
+            const unsigned B1 = __shfl_sync(kFullMask, b1, src_b);
+            int& lo           = (j == 0) ? c0 : c1;
+            int& hi           = (j == 0) ? c2 : c3;
+            lo                = dot8_s4(A2, B1, dot8_s4(A0, B0, lo));
+            hi                = dot8_s4(A3, B1, dot8_s4(A1, B0, hi));
+        }
+    }
+    return make_int4(c0, c1, c2, c3);
+}
+
+__device__ __forceinline__ void mma_m16n8k64_s4(int& d0, int& d1, int& d2, int& d3, unsigned a0,
+                                                unsigned a1, unsigned a2, unsigned a3,
+                                                unsigned b0, unsigned b1, int c0, int c1, int c2,
+                                                int c3) {
+    const int4 r = mma_m16n8k64_s4_impl(make_int4(c0, c1, c2, c3), a0, a1, a2, a3, b0, b1);
+    d0 = r.x; d1 = r.y; d2 = r.z; d3 = r.w;
+}
+
 // m16n8k8 tf32: a0:(row g, k t) a1:(row g+8, k t) a2:(row g, k t+4) a3:(row g+8, k t+4)
 //               b0:(k t, n g)   b1:(k t+4, n g)
 __device__ __noinline__ float4 mma_m16n8k8_tf32_impl(float4 c, unsigned a0, unsigned a1,
@@ -158,7 +250,7 @@ __device__ __noinline__ float4 mma_m16n8k8_tf32_impl(float4 c, unsigned a0, unsi
                                                      unsigned b1) {
     float c0 = c.x, c1 = c.y, c2 = c.z, c3 = c.w;
     constexpr unsigned kTf32Mask = 0xffffe000u;
-    const int lane               = threadIdx.x & 31;
+    const int lane               = laneid();
     const int g                  = lane >> 2;
     const int t                  = lane & 3;
     // Rolled to keep the non-inlined body small.

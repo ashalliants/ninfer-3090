@@ -20,6 +20,8 @@
 #include "core/device.h"
 
 #include "ops/common/canonical_ggml.h"
+#include "ops/common/memory.cuh"
+#include "ops/common/warp.cuh"
 #include "ops/offloaded_sparse_moe/coresident.h"
 #include "ops/offloaded_sparse_moe/cpu_selection.h"
 #include "ops/offloaded_sparse_moe/cuda/expert_decode.cuh"
@@ -110,17 +112,16 @@ Geometry device_geometry(const moe::RecordGeometry& g) {
 // read zero-copy over PCIe.
 __device__ __forceinline__ void stage_async(const std::uint8_t* src, std::uint8_t* dst, int bytes) {
     for (int i = static_cast<int>(threadIdx.x) * 16; i < bytes; i += static_cast<int>(blockDim.x) * 16) {
-        const auto s = static_cast<unsigned>(__cvta_generic_to_shared(dst + i));
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(src + i) : "memory");
+        cp_async_mem<16>(dst + i, src + i);
     }
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
+    cp_commit_mem();
 }
 
-__device__ __forceinline__ void stage_wait() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
+__device__ __forceinline__ void stage_wait() { cp_wait_mem<0>(); }
 
 // Waits until at most one issued group is still in flight (the CTA computes the first half of its
 // slice while the second half lands).
-__device__ __forceinline__ void stage_wait_but_one() { asm volatile("cp.async.wait_group 1;\n" ::: "memory"); }
+__device__ __forceinline__ void stage_wait_but_one() { cp_wait_mem<1>(); }
 
 // The distance between device frames (MoeExpertSource::frame_stride, record_stride when zero).
 __device__ __forceinline__ std::uint64_t frame_stride(const MoeExpertSource& source) {
@@ -1082,7 +1083,7 @@ __global__ void __launch_bounds__(kThreads)
         const int count = dispatch.offsets[expert + 1] - dispatch.offsets[expert];
         if (count <= max_width) { atomicAdd(&width_misses[count], 1); }
     }
-    own = __reduce_add_sync(0xFFFFFFFFU, own);
+    own = masked_reduce_add(0xFFFFFFFFU, own);
     if (lane == 0) { atomicAdd(&misses, own); }
     __syncthreads();
     if (threadIdx.x == 0) {

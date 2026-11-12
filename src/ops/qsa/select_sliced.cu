@@ -8,6 +8,7 @@
 #include "ops/qsa/launch.h"
 
 #include "ops/common/score_id_order.cuh"
+#include "ops/common/warp.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 
 #include <cub/block/block_scan.cuh>
@@ -293,10 +294,10 @@ __device__ void filter_scores(const float* column, int lo, int hi, int bin, unsi
             }
         }
     });
-    const unsigned and_hi = __reduce_and_sync(kFullMask, static_cast<unsigned>(and_key >> 32));
-    const unsigned and_lo = __reduce_and_sync(kFullMask, static_cast<unsigned>(and_key));
-    const unsigned or_hi  = __reduce_or_sync(kFullMask, static_cast<unsigned>(or_key >> 32));
-    const unsigned or_lo  = __reduce_or_sync(kFullMask, static_cast<unsigned>(or_key));
+    const unsigned and_hi = masked_reduce_and(kFullMask, static_cast<unsigned>(and_key >> 32));
+    const unsigned and_lo = masked_reduce_and(kFullMask, static_cast<unsigned>(and_key));
+    const unsigned or_hi  = masked_reduce_or(kFullMask, static_cast<unsigned>(or_key >> 32));
+    const unsigned or_lo  = masked_reduce_or(kFullMask, static_cast<unsigned>(or_key));
     if (lane == 0) {
         atomicAnd(&sh.and_key, (static_cast<unsigned long long>(and_hi) << 32) | and_lo);
         atomicOr(&sh.or_key, (static_cast<unsigned long long>(or_hi) << 32) | or_lo);
