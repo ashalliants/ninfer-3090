@@ -5332,6 +5332,13 @@ private:
         // lane in its normal (not yet reset) state while the round settles.
         std::array<bool, kMaximumLanes> release{};
         bool any_released = false;
+        // Pass 1 below only validates decisions, advances history/state and builds fold_rows; the
+        // per-row qsa/ple/catch-up writes that commit_verified() schedules after dispatching its
+        // own fold (so they can run concurrently with it on the fold stream) move to pass 2, once
+        // the complete batch's fold_rows span -- and whether the whole batch can go async -- is
+        // known (codepulse, PR #451: the async path was never reachable here at all).
+        std::array<std::int32_t, kMaximumLanes> committed_k{}, committed_S{};
+        bool any_committed_terminal = false;
         for (std::int32_t b = 0; b < B; ++b) {
             const std::uint32_t lane = ContractAccess::lane(rows[static_cast<std::size_t>(b)]);
             select_lane(lane);
@@ -5402,8 +5409,35 @@ private:
             L().state_tokens += static_cast<std::uint32_t>(k);
             total_tokens += k;
             fold_rows[static_cast<std::size_t>(b)] = {static_cast<std::int32_t>(lane), static_cast<std::int32_t>(lane), k};
-            // The real live tail and PLE history of row b's columns: qsa_commit_tails and
-            // ple_conv_commit take one row at a time (single-sequence Ops, see the design doc).
+            committed_k[static_cast<std::size_t>(b)] = k;
+            committed_S[static_cast<std::size_t>(b)] = S;
+            any_committed_terminal |= d.terminal;
+            L().phase = d.terminal ? Phase::Finishable : Phase::Decode;
+            out.rows[static_cast<std::size_t>(b)].disposition =
+                d.terminal ? runtime::CommitDisposition::Finishable : runtime::CommitDisposition::Active;
+            L().permit = false;
+        }
+        // commit_verified()'s own choice, generalized to the whole batch: async only when every
+        // committed row continues (any terminal row forces the conservative, synchronous fold, same
+        // as that single row would get on its own). The async-fold counter below only ever counted
+        // single-row commits before this; folded entirely, this call is one batch, so it adds one.
+        if (fold_stream_ && gdn_fold_on_side_stream(options_, any_committed_terminal)) {
+            const ops::GdnReplayFoldPlan& plan = rows_fold(W);
+            const std::span<const ops::GdnReplayFoldRow> span(fold_rows.data(), static_cast<std::size_t>(B));
+            fold_stream_->run(s, [&](cudaStream_t side) { plan.execute(span, side); });
+            g_async_gdn_folds.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            rows_fold(W).execute({fold_rows.data(), static_cast<std::size_t>(B)}, s);
+        }
+        // Pass 2: the real live tail and PLE history of each committed row's columns
+        // (qsa_commit_tails/ple_conv_commit take one row at a time) and the drafter's catch-up --
+        // none of these read the recurrent state or the GDN records the fold above writes, so they
+        // are safe to queue on the main stream whether that fold just went sync or async.
+        for (std::int32_t b = 0; b < B; ++b) {
+            if (release[static_cast<std::size_t>(b)]) { continue; }
+            select_lane(ContractAccess::lane(rows[static_cast<std::size_t>(b)]));
+            const std::int32_t k = committed_k[static_cast<std::size_t>(b)];
+            const std::int32_t S = committed_S[static_cast<std::size_t>(b)];
             auto* host_commit = spec_words_host();
             host_commit[sp.w_commit] = k;
             upload_pinned(spec_words_device() + sp.w_commit, host_commit + sp.w_commit, 4, s);
@@ -5416,15 +5450,10 @@ private:
             ops::ple_conv_commit(rows_verify_view(W).ple_inputs.slice(2, b, 1).view({dim(c_.residual_width()), W, 1}),
                                  commit, ple_state_, ple_slot_, s);
             mtp_catch_up_row_rows(b, S, k, W);
-            L().phase = d.terminal ? Phase::Finishable : Phase::Decode;
-            out.rows[static_cast<std::size_t>(b)].disposition =
-                d.terminal ? runtime::CommitDisposition::Finishable : runtime::CommitDisposition::Active;
             out.rows[static_cast<std::size_t>(b)].timings              = timings();
             out.rows[static_cast<std::size_t>(b)].speculative          = speculative_stats();
             out.rows[static_cast<std::size_t>(b)].speculative_counters = speculative_counters();
-            L().permit = false;
         }
-        rows_fold(W).execute({fold_rows.data(), static_cast<std::size_t>(B)}, s);
         settle_round(B * W, total_tokens);
         for (std::int32_t b = 0; b < B; ++b) {
             if (!release[static_cast<std::size_t>(b)]) { continue; }
