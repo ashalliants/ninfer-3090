@@ -1552,12 +1552,14 @@ def _vision_disabled(context: CaseContext, corpus: Corpus) -> None:
     _expect_rejection(context, request, 400, "vision_disabled")
 
 
-def _vision_envelope_over(context: CaseContext, corpus: Corpus) -> None:
+def _vision_envelope_degrade(context: CaseContext, corpus: Corpus) -> None:
+    # 33 full-size images exceed the 32768-token Vision envelope. The server shrinks the oldest
+    # ones to fit instead of answering 400 media_budget_exceeded.
     request = context.start(
         "request",
         chat_request(context.model, corpus.media_messages("many-image-33"), 32),
     )
-    _expect_rejection(context, request, 400, "media_budget_exceeded")
+    context.require_success(request)
 
 
 def _resident_competition(order: str) -> CaseFunction:
@@ -1880,7 +1882,7 @@ _DEFINITIONS = (
     _definition("media-during-decode", "openai_chat", "vision-concurrent", "media", ("holder-4096", "many-image-28-a"), "Heavy media arrival during decode; observe resumed holder output, cancel, then probe cleanup.", _media_during_decode),
     _definition("two-heavy-media-arrivals", "openai_chat", "vision-concurrent", "media", ("many-image-28-a", "many-image-28-b"), "Two byte-distinct legal high-media arrivals.", _two_heavy_media, symmetric_role_groups=(SymmetricRoleGroup("media", ("media-a", "media-b")),)),
     _definition("vision-disabled", "openai_chat", "text-cold-8k", "rejection", ("image-chart",), "Media on a text-only Serve is rejected.", _vision_disabled),
-    _definition("vision-envelope-over", "openai_chat", "vision-boundary", "rejection", ("many-image-33",), "Aggregate Vision envelope rejection.", _vision_envelope_over),
+    _definition("vision-envelope-degrade", "openai_chat", "vision-boundary", "media", ("many-image-33",), "Request over the aggregate Vision budget shrinks its oldest images and succeeds.", _vision_envelope_degrade),
 )
 
 

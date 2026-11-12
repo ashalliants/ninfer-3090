@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <utility>
 #include <string_view>
 
 namespace ninfer::models::qwen3_5::frontend {
@@ -14,6 +16,9 @@ namespace ninfer::models::qwen3_5::frontend {
 struct MediaCacheKey {
     std::array<std::uint8_t, 32> digest{};
     Modality modality = Modality::Image;
+    // Pixel ceiling the payload was resized under (images only; 0 for video). The same bytes
+    // built under a smaller ceiling are a different payload.
+    std::uint64_t max_pixels = 0;
 
     [[nodiscard]] bool operator==(const MediaCacheKey&) const noexcept = default;
 };
@@ -111,6 +116,15 @@ public:
                                       MediaCacheRequestStats& request_stats) const;
 
     [[nodiscard]] MediaCacheStats stats() const;
+
+    // Width and height of an image already probed, by content digest. Sizing a request needs
+    // every image's extent; remembering it means a repeated screenshot is decoded once, not on
+    // every turn. Bounded: the memo is dropped whole when it fills. Not single-flight: requests
+    // that miss together may each probe, which is harmless and bounded by the request gate.
+    [[nodiscard]] std::optional<std::pair<int, int>>
+    image_extent(const std::array<std::uint8_t, 32>& digest) const;
+    void remember_image_extent(const std::array<std::uint8_t, 32>& digest, int width,
+                               int height) const;
 
 private:
     struct Impl;

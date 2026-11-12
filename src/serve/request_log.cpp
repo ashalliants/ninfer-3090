@@ -290,6 +290,8 @@ Json preparation_json(const RequestLogContext& context) {
                 {"tokenize", stats.tokenize_seconds},
                 {"media_items", stats.media_items},
                 {"media_bytes", stats.media_bytes},
+                {"degraded_media_items", stats.degraded_media_items},
+                {"dropped_media_items", stats.dropped_media_items},
                 {"raw_patches", stats.raw_patches},
                 {"vision_tokens", stats.vision_tokens},
                 {"patch_bytes", stats.patch_bytes},
@@ -658,6 +660,11 @@ std::string format_request_start(const RequestLogContext& context) {
             << " media_cache=" << context.preparation.media_cache_hits << '/'
             << context.preparation.media_cache_misses << '/'
             << context.preparation.media_singleflight_waits;
+        if (context.preparation.degraded_media_items != 0 ||
+            context.preparation.dropped_media_items != 0) {
+            out << " media_shrunk=" << context.preparation.degraded_media_items
+                << " media_dropped=" << context.preparation.dropped_media_items;
+        }
     }
     out << " \xE2\x86\x92 submitted";
     return out.str();

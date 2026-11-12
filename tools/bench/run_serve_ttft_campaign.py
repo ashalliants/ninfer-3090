@@ -55,7 +55,7 @@ CONTRACT_CASES = (
     "context-exact",
     "context-over",
     "vision-disabled",
-    "vision-envelope-over",
+    "vision-envelope-degrade",
 )
 LONG_CONTEXT_CASES = ("cold-long-256k",)
 PREPROCESS_CASES = ("many-image-28", "many-image-28-thread-1")
