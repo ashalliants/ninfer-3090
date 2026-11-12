@@ -612,6 +612,24 @@ int main() {
         }
         failures += check(refused, "--mtp-joint-acceptance without --spec mtp was not refused naming both flags");
     }
+    failures += check(!defaults.flash_next.mtp_rows_verify, "batched rows verification is off by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "7",
+                                                 "--mtp-joint-acceptance", "--mtp-rows-verify"}))
+                          .flash_next.mtp_rows_verify,
+                      "--mtp-rows-verify does not reach the Engine");
+    for (const auto& spec : {std::vector<std::string>{"--spec", "mtp", "--draft-tokens", "7"},
+                             std::vector<std::string>{"--spec", "dflash"}}) {
+        std::vector<std::string> args{"ninfer-serve", "model.ninfer", "--mtp-rows-verify"};
+        args.insert(args.end(), spec.begin(), spec.end());
+        bool refused = false;
+        try {
+            (void)parse(args);
+        } catch (const std::invalid_argument& error) {
+            refused = std::string(error.what()).find("--mtp-rows-verify") != std::string::npos &&
+                      std::string(error.what()).find("--mtp-joint-acceptance") != std::string::npos;
+        }
+        failures += check(refused, "--mtp-rows-verify without --mtp-joint-acceptance was not refused naming both flags");
+    }
     failures += check(!defaults.flash_next.ngram_prefetch, "the n-gram prefetch is on by default");
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
                                                  "--ngram-prefetch"}))

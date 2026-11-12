@@ -5343,7 +5343,13 @@ private:
                 continue;
             }
             const auto k = static_cast<std::int32_t>(d.accepted_tokens);
-            if (k < 1 || k > rows_pending_count_[static_cast<std::size_t>(b)]) {
+            // A row that continues (not terminal) must commit every licensed token it was handed --
+            // exactly commit_verified()'s own `!d.terminal && k != pending_count_` rule. Without
+            // this, a nonterminal partial decision silently discarded the remaining licensed tokens:
+            // history/state/fold/catch-up all advanced by k while decoding resumed as if the row had
+            // genuinely only produced k tokens this round (codepulse, PR #451).
+            if (k < 1 || k > rows_pending_count_[static_cast<std::size_t>(b)] ||
+                (!d.terminal && k != rows_pending_count_[static_cast<std::size_t>(b)])) {
                 for (std::int32_t r = 0; r < B; ++r) {
                     select_lane(ContractAccess::lane(rows[static_cast<std::size_t>(r)]));
                     release_lane();
