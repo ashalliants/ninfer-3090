@@ -701,8 +701,14 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
         throw std::runtime_error("Qwen3.8-Flash-Next: cannot read the device's multiprocessor count");
     }
     // A rows round decodes and samples one row per lane, so neither a --prefill-chunk below the lane
-    // count nor a one-row sampling profile may size the workspace below that round.
-    const std::int32_t widest = std::max(d.chunk, static_cast<std::int32_t>(d.lanes));
+    // count nor a one-row sampling profile may size the workspace below that round. Under
+    // --mtp-rows-verify, run_rows_verify_front() can execute with T = B * W columns, bounded only by
+    // try_speculate_rows()'s kMaxForwardRows gate -- the workspace must be sized for that bound too,
+    // or a small --prefill-chunk/--max-context configuration plans a narrower arena than a genuine
+    // batched round needs and overruns it (codepulse, PR #451).
+    const std::int32_t widest =
+        std::max({d.chunk, static_cast<std::int32_t>(d.lanes),
+                  o.mtp_rows_verify ? execution::kMaxForwardRows : 0});
     d.work = execution::Forward::workspace_bytes(c, widest, d.pages * kPagedKVPageSize,
                                                  DeviceExecutionView{nullptr, sms}, o.moe_precast_input) +
              ops::sampling_workspace_capacity_bytes(d.token_domain, 1, static_cast<std::int32_t>(d.lanes)) +
@@ -5092,9 +5098,18 @@ private:
         }
         CUDA_CHECK(cudaMemcpyAsync(words + sp.w_licensed, spec_words_device() + sp.w_licensed,
                                    4ULL * (sp.w_accepted + 1 - sp.w_licensed), cudaMemcpyDeviceToHost, s));
+        // `kept` was computed on the device above whenever relaxed drafting is active, but never
+        // copied back or added to stats.relaxed_kept here -- matching the single-row verify()'s own
+        // copy (program.cpp ~4718) so the batched path's relaxed-drafting diagnostics aren't
+        // silently zero (codepulse, PR #451).
+        if (relaxed) {
+            CUDA_CHECK(cudaMemcpyAsync(words + sp.w_relaxed, spec_words_device() + sp.w_relaxed, 4,
+                                       cudaMemcpyDeviceToHost, s));
+        }
         device_.synchronize();
         const std::int32_t LC = words[sp.w_counts], A = words[sp.w_accepted];
-        if (LC < 1 || LC > KW || A != LC - 1) {
+        const std::int32_t kept = relaxed ? words[sp.w_relaxed] : 0;
+        if (LC < 1 || LC > KW || A != LC - 1 || kept < 0 || kept > A) {
             throw std::logic_error("Qwen3.8-Flash-Next: acceptance returned an invalid extent");
         }
         constraint_failed = false; // constrained rows are not supported here; try_speculate_rows excludes them
@@ -5110,6 +5125,7 @@ private:
         ++stats.rounds;
         stats.drafted_tokens += static_cast<std::uint64_t>(K);
         stats.accepted_tokens += static_cast<std::uint64_t>(A);
+        stats.relaxed_kept += static_cast<std::uint64_t>(kept);
         if (stats.accepted_per_position.size() < static_cast<std::size_t>(plan_.drafts)) {
             stats.accepted_per_position.resize(static_cast<std::size_t>(plan_.drafts), 0);
         }
@@ -6164,7 +6180,17 @@ CpuMissPlan plan_cpu_misses(const ProgramOptions& options) {
         // work) but its column cap: the widest verification.
         const om::CpuMissService::Options defaults;
         p.verify_jobs    = defaults.max_jobs;
-        p.verify_columns = static_cast<int>(1 + options.mtp_draft_tokens);
+        // Under --mtp-rows-verify a genuine batched round calls moe() with T = B * W columns (B up
+        // to max_concurrency lanes, W up to 1 + drafts), not just the single-row path's 1 + drafts
+        // -- cpu_served() rejects any call past max_columns, so sizing this for the single-row case
+        // alone silently ran every CPU miss of a batched round on the GPU instead (codepulse, PR
+        // #451). try_speculate_rows() already caps B * W at kMaxForwardRows, so that bound applies
+        // whichever is smaller.
+        const int single_row_columns = static_cast<int>(1 + options.mtp_draft_tokens);
+        p.verify_columns = options.mtp_rows_verify
+                                ? std::min(static_cast<int>(options.max_concurrency) * single_row_columns,
+                                           execution::kMaxForwardRows)
+                                : single_row_columns;
         p.pcie_divisor   = defaults.pcie_divisor;
     }
     if (prefill) {
