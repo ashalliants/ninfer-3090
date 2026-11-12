@@ -793,6 +793,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             }
             continue;
         }
+        // The main chain is split in two: MSVC refuses an if/else-if chain nested past its limit (C1061).
+        bool handled_first_half = true;
         if (arg == "--host") {
             options.host = require_value("--host");
         } else if (arg == "--port") {
@@ -1005,7 +1007,11 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
                                             "]");
             }
             options.draft_context_rows = static_cast<std::uint32_t>(rows);
-        } else if (arg == "--max-output-tokens") {
+        } else {
+            handled_first_half = false;
+        }
+        if (handled_first_half) { continue; }
+        if (arg == "--max-output-tokens") {
             options.max_output_tokens =
                 parse_nonnegative_int(require_value("--max-output-tokens"), "max-output-tokens");
         } else if (arg == "--default-max-tokens") {
