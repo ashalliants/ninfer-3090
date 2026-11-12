@@ -1,4 +1,5 @@
 #include "ops/linear_swiglu/q4a8/q4a8_linear_swiglu.h"
+#include "ops/common/mma.cuh"
 
 #include "core/device.h"
 
@@ -26,10 +27,7 @@ constexpr int kThreads = 512;
 
 __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0, unsigned a1,
                                        unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    ops::mma_s8(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
 }
 
 // A uint4 read through a char* is emitted as four 32-bit loads unless the compiler can prove the

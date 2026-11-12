@@ -46,7 +46,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/rows/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/softmax_attention/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/sparse_moe/sources.cmake")
 
-if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(80|86|89)$")
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|80|86|89)$")
   get_target_property(ninfer_ops_sources ninfer_ops SOURCES)
   # NVFP4 W4A4 uses mma.sync...kind::mxf4nvf4.block_scale; FP8 A8 uses
   # mma.sync...kind::f8f6f4. Both qualifiers are Blackwell-only, and sm_80/86/89 have no FP8 or FP4

@@ -28,6 +28,7 @@
 #include "ops/hyper_connection/hc_int8_codec.h"
 #include "ops/hyper_connection/hyper_connection_mix_fused.h"
 #include "ops/hyper_connection/hyper_connection_mix_kernels.cuh"
+#include "ops/common/mma.cuh"
 #include "ops/linear/ggml/ggml_blocks.cuh"
 
 #include <cuda_bf16.h>
@@ -78,10 +79,7 @@ __device__ __forceinline__ void split_f16(float a, float b, std::uint32_t& hi, s
 
 __device__ __forceinline__ void mma_f16(float (&c)[4], const std::uint32_t (&a)[4],
                                         std::uint32_t b0, std::uint32_t b1) {
-    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-        "{%0,%1,%2,%3};"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    ops::mma_f16(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
 }
 
 // One thread per group of 32 values (hc_int8::quantize_group).

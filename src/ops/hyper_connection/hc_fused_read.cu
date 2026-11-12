@@ -29,6 +29,7 @@
 
 #include "ninfer/ops/hyper_connection.h"
 
+#include "ops/common/memory.cuh"
 #include "ops/hyper_connection/hyper_connection_mix_fused.h"
 #include "ops/hyper_connection/hyper_connection_mix_kernels.cuh"
 #include "ops/offloaded_sparse_moe/cuda/route_column.cuh"
@@ -219,12 +220,10 @@ __global__ void __launch_bounds__(kRouteThreads)
     const auto* xs =
         reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(first_column) * kHidden);
     for (int i = static_cast<int>(threadIdx.x); i < count * chunks; i += kRouteThreads) {
-        const auto dst = static_cast<unsigned>(__cvta_generic_to_shared(staged + i));
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(xs + i)
-                     : "memory");
+        cp_async_mem<16>(staged + i, xs + i);
     }
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
-    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    cp_commit_mem();
+    cp_wait_mem<0>();
     __syncthreads();
 
     // 2. The row's dot products: chunks lane, lane + 32, ... in order, eight fmaf each, then the

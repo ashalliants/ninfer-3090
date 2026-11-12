@@ -20,6 +20,7 @@
 
 #include "core/device.h"
 #include "ops/common/canonical_ggml.h"
+#include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/offloaded_sparse_moe/cuda/expert_decode.cuh"
 
@@ -163,19 +164,17 @@ inline constexpr bool kStagedSlice =
     static_cast<int>(sizeof(Tiles)) + kRows * kGateUpRowBytes<F> <= kMaxDynamicSmem;
 
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool valid) {
-    const auto s = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(src), "r"(valid ? 16 : 0) : "memory");
+    cp_async_zfill_mem<16>(dst, src, valid ? 16 : 0);
 }
 
 __device__ __forceinline__ void cp_async4(void* dst, const void* src, bool valid) {
-    const auto s = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(s), "l"(src), "r"(valid ? 4 : 0) : "memory");
+    cp_async_zfill_mem<4, Cache::ca>(dst, src, valid ? 4 : 0);
 }
 
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
-__device__ __forceinline__ void cp_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
+__device__ __forceinline__ void cp_commit() { cp_commit_mem(); }
+__device__ __forceinline__ void cp_wait_all() { cp_wait_mem<0>(); }
 // Every group but the newest kXStages - 2 has landed.
-__device__ __forceinline__ void cp_wait_ahead() { asm volatile("cp.async.wait_group %0;\n" ::"n"(kXStages - 2) : "memory"); }
+__device__ __forceinline__ void cp_wait_ahead() { cp_wait_mem<kXStages - 2>(); }
 
 // A contiguous slice into shared memory, 16 bytes per copy (both ends 16-byte aligned).
 __device__ __forceinline__ void stage_slice(const std::uint8_t* src, std::uint8_t* dst, int bytes) {

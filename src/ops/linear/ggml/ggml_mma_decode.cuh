@@ -22,6 +22,7 @@
 // format with the multipliers applied to the int32 sums (canonical_ggml.h step 3); the affine
 // K-quants' offset term from the group's integer code sum.
 
+#include "ops/common/mma.cuh"
 #include "ops/linear/ggml/ggml_blocks.cuh"
 
 #include <cuda_bf16.h>
@@ -240,29 +241,24 @@ constexpr std::size_t mma_shared_bytes(int t) {
 
 __device__ __forceinline__ void mma_k32(int (&d)[4], std::uint32_t a0, std::uint32_t a1, std::uint32_t a2,
                                         std::uint32_t a3, std::uint32_t b0, std::uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-                 "{%10,%10,%10,%10};\n"
-                 : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(0));
+    d[0] = d[1] = d[2] = d[3] = 0;
+    mma_s8(d[0], d[1], d[2], d[3], a0, a1, a2, a3, b0, b1);
 }
 
 __device__ __forceinline__ void mma_k16(int (&d)[4], std::uint32_t a0, std::uint32_t a1, std::uint32_t b0) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};\n"
-                 : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
-                 : "r"(a0), "r"(a1), "r"(b0), "r"(0));
+    d[0] = d[1] = d[2] = d[3] = 0;
+    mma_s8_k16(d[0], d[1], d[2], d[3], a0, a1, b0);
 }
 
 __device__ __forceinline__ void mma_cp_async16(void* smem, const void* global) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(static_cast<unsigned>(__cvta_generic_to_shared(smem))),
-                 "l"(global)
-                 : "memory");
+    cp_async_mem<16>(smem, global);
 }
 
-__device__ __forceinline__ void mma_cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+__device__ __forceinline__ void mma_cp_async_commit() { cp_commit_mem(); }
 
 template <int N>
 __device__ __forceinline__ void mma_cp_async_wait() {
-    asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
+    cp_wait_mem<N>();
 }
 
 // x is BF16 [K,T] (column t at x + t K), out BF16 [N,T]; w is 16-byte aligned and n % 16 == 0.
