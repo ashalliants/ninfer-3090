@@ -7,6 +7,7 @@
 // histogram passes per column in one CTA with no candidate buffer, and the ascending write uses
 // per-warp contiguous ranges.
 
+#include "ops/common/smem_limit.h"
 #include "ops/qsa/launch.h"
 
 #include "ops/common/memory.cuh"
@@ -371,6 +372,7 @@ void qsa_select_group_launch(const Tensor& index_q, const Tensor& positions,
     const dim3 grid(static_cast<unsigned>(std::min(block_tiles, want)),
                     static_cast<unsigned>(column_tiles));
     constexpr int kScoreShared = static_cast<int>(sizeof(ScoreShared));
+    static_assert(kScoreShared <= kMaxDynamicSharedBytes, "exceeds the target's per-block shared memory");
     static const bool reserved = [] {
         return cudaFuncSetAttribute(score_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     kScoreShared) == cudaSuccess;

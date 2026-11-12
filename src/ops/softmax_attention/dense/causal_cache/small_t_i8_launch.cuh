@@ -4,6 +4,7 @@
 // small_t_i8_g*_t*.cu slice translation units, each of which instantiates the kernels for one
 // (head geometry, query-row tile). The route policy and the reducer stay in small_t.cu.
 
+#include "ops/common/smem_limit.h"
 #include "core/device.h" // CUDA_CHECK, configure_cuda_device_once
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
@@ -37,6 +38,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             constexpr std::size_t kDynamicBytes =
                 DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kCausalHeadDim) : 0u;
             if constexpr (DynamicArena) {
+                static_assert(4 * KeyBlock * kCausalHeadDim <= kMaxDynamicSharedBytes);
                 configure_cuda_device_once([] {
                     return cudaFuncSetAttribute(
                         causal_attention_small_t_i8_tiled_kernel<

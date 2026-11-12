@@ -15,7 +15,7 @@ target_sources(ninfer_ops PRIVATE
 # Upstream's per-format fp8/, int8/, nvfp4/ and k8v4/ directories need sm_120a instructions
 # (block-scaled FP8/FP4 MMA, TMA, mbarrier) and lack the rk8v4/rk4v4 codings; they are listed only
 # for an sm_120a build, which this fork's top-level CMakeLists does not currently accept.
-if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(80|86|89)$")
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|80|86|89)$")
   target_sources(ninfer_ops PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t.cu"
     "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_i8_g24_t1_3.cu"

@@ -82,6 +82,17 @@ jobs:
         shell: pwsh
         run: ./tests/release/test-package-release-imports.ps1
 
+  # The Tesla V100 (sm_70) port emulates the Ampere instructions in a few shared helpers. A kernel
+  # that writes cp.async / mma.sync / ldmatrix as raw asm skips the emulation and only fails in a
+  # 20-minute nvcc cross-compile for sm_70, so this catches it in a second.
+  volta-compat:
+    name: No raw Ampere-only instructions outside the sm_70 helpers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run scripts/check-volta-compat.sh
+        run: bash scripts/check-volta-compat.sh
+
   model-cards:
     name: Model card charts match docs/assets
     runs-on: ubuntu-latest

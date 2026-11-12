@@ -1,3 +1,4 @@
+#include "ops/common/smem_limit.h"
 #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
@@ -355,6 +356,7 @@ template <int DV, GdnHeadMap Map>
 void launch(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
             cudaStream_t stream) {
     constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
+    static_assert(shared_bytes <= kMaxDynamicSharedBytes, "exceeds the target's per-block shared memory");
     CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV, Map>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
     chunk_recurrence_kernel<DV, Map>

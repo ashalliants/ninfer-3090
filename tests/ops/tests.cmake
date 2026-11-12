@@ -303,6 +303,18 @@ ninfer_add_op_test(ninfer_route_coverage_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_route_coverage.cpp"
   LIBRARIES ninfer_ops)
 
+# Volta (sm_70) emulation of cp.async / ldmatrix / mma.sync / __reduce_*_sync, against naive
+# references. It only exists for a sm_70 build; on every other target the emulation is compiled out.
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  ninfer_add_op_test(ninfer_volta_emulation_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_volta_emulation.cu"
+    LIBRARIES ninfer_ops)
+  # The route decisions that keep decode off the emulated mma, and the FA2 plan's shared-memory fit.
+  ninfer_add_op_test(ninfer_volta_routes_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_volta_routes.cpp"
+    LIBRARIES ninfer_ops)
+endif()
+
 include("${CMAKE_CURRENT_LIST_DIR}/linear/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_add/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_pair/tests.cmake")

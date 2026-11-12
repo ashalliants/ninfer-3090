@@ -1,4 +1,5 @@
 #pragma once
+#include "ops/common/smem_limit.h"
 #include "core/device.h"
 #include "ops/common/mma.cuh"
 #include "ops/linear/bf16/bf16_schedule.cuh"
@@ -8,7 +9,7 @@ namespace ninfer::ops::detail {
 
 template <int Bytes, auto Kernel>
 int bf16_prepare_shared() {
-    static_assert(Bytes <= 99 * 1024);
+    static_assert(Bytes <= kMaxDynamicSharedBytes);
     if constexpr (Bytes > 48 * 1024) {
         // Per device: function attributes do not carry over to a second GPU.
         configure_cuda_device_once([] {

@@ -8,9 +8,9 @@ cmake_minimum_required(VERSION 3.28)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA architectures to build")
 endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(80|86|89)$")
+if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|80|86|89)$")
   message(FATAL_ERROR
-    "NInfer supports CMAKE_CUDA_ARCHITECTURES=80, 86 or 89; got "
+    "NInfer supports CMAKE_CUDA_ARCHITECTURES=70, 80, 86 or 89; got "
     "'${CMAKE_CUDA_ARCHITECTURES}'")
 endif()
 
@@ -32,8 +32,14 @@ include(cmake/CompilerCache.cmake)
 # PUBLIC for its own consumers, but that link is PRIVATE through ninfer_engine, so apps and tests
 # would not otherwise see it. Defining it globally keeps a single consistent answer for every
 # target, including apps/ninfer-perplexity, whose upstream default KV profile is FP8.
-if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(80|86|89)$")
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|80|86|89)$")
   add_compile_definitions(NINFER_SM8X_COMPAT=1)
+endif()
+# Volta (sm_70) has no cp.async, ldmatrix, BF16 or INT8 tensor cores and a 96 KiB shared-memory
+# limit. Device code emulates the instructions (ops/common/volta_compat.cuh); the host-visible
+# constants (ops/common/smem_limit.h) key on this definition.
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  add_compile_definitions(NINFER_SM70=1)
 endif()
 
 # --- Global settings ---------------------------------------------------------

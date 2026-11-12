@@ -16,10 +16,12 @@
 // directly. Down: a CTA owns 64 output rows of one job, decodes their whole K = 640 slice (Q2_0 or
 // IQ4_NL) once and keeps it while each column tile's h codes arrive in one piece.
 
+#include "ops/common/smem_limit.h"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 
 #include "core/device.h"
 #include "ops/common/canonical_ggml.h"
+#include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/offloaded_sparse_moe/cuda/expert_decode.cuh"
 
@@ -51,7 +53,7 @@ constexpr int kXRowBytes    = 32 * kLeafBytes; // one token's blocks (32 leaves)
 // and scales (bytes 640..719) instead.
 constexpr int kHRowBytes    = kIntermediate * 4;
 constexpr int kPlanThreads  = 1024;
-constexpr int kMaxDynamicSmem  = 99 * 1024;
+constexpr int kMaxDynamicSmem  = kMaxDynamicSharedBytes;
 // The accumulator's bias: int32 0x4B400000 + S read as binary32 is 1.5 * 2^23 + S for |S| < 2^22.
 constexpr int kBias        = 0x4B400000;
 constexpr float kBiasValue = 12582912.0F;
@@ -163,19 +165,17 @@ inline constexpr bool kStagedSlice =
     static_cast<int>(sizeof(Tiles)) + kRows * kGateUpRowBytes<F> <= kMaxDynamicSmem;
 
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool valid) {
-    const auto s = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(src), "r"(valid ? 16 : 0) : "memory");
+    cp_async_zfill_mem<16>(dst, src, valid ? 16 : 0);
 }
 
 __device__ __forceinline__ void cp_async4(void* dst, const void* src, bool valid) {
-    const auto s = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(s), "l"(src), "r"(valid ? 4 : 0) : "memory");
+    cp_async_zfill_mem<4, Cache::ca>(dst, src, valid ? 4 : 0);
 }
 
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
-__device__ __forceinline__ void cp_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
+__device__ __forceinline__ void cp_commit() { cp_commit_mem(); }
+__device__ __forceinline__ void cp_wait_all() { cp_wait_mem<0>(); }
 // Every group but the newest kXStages - 2 has landed.
-__device__ __forceinline__ void cp_wait_ahead() { asm volatile("cp.async.wait_group %0;\n" ::"n"(kXStages - 2) : "memory"); }
+__device__ __forceinline__ void cp_wait_ahead() { cp_wait_mem<kXStages - 2>(); }
 
 // A contiguous slice into shared memory, 16 bytes per copy (both ends 16-byte aligned).
 __device__ __forceinline__ void stage_slice(const std::uint8_t* src, std::uint8_t* dst, int bytes) {

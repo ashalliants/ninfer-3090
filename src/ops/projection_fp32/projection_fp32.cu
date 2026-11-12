@@ -3,7 +3,9 @@
 // q8_g32_fp16/q4_g64_fp16 forms and the vocabulary-head tall and tensor-core mappings are not
 // ported. Namespaces and includes are NInfer's.
 
+#include "ops/common/smem_limit.h"
 #include "ninfer/ops/projection_fp32.h"
+#include "ops/common/memory.cuh"
 
 #include <cuda_bf16.h>
 
@@ -103,13 +105,11 @@ __global__ void __launch_bounds__(Threads)
     for (int u = 0; u < kStagePerThread; ++u) {
         const int i = static_cast<int>(threadIdx.x) + u * Threads;
         if (i < count * chunks) {
-            const auto dst = static_cast<unsigned>(__cvta_generic_to_shared(staged + i));
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(xs + i)
-                         : "memory");
+            cp_async_mem<16>(staged + i, xs + i);
         }
     }
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
-    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    cp_commit_mem();
+    cp_wait_mem<0>();
     __syncthreads();
     for (int r = 0; r < RowsPerWarp; ++r) {
         const int row = first_row + r * Warps;
@@ -173,10 +173,7 @@ __device__ __forceinline__ void widen8(const uint4& packed, float (&out)[8]) {
 
 // 16 bytes from `src` to shared `dst`, or zeros when `valid` is false (src is then not read).
 __device__ __forceinline__ void stage16(uint4* dst, const void* src, bool valid) {
-    const auto d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(d), "l"(src),
-                 "r"(valid ? 16 : 0)
-                 : "memory");
+    cp_async_zfill_mem<16>(dst, src, valid ? 16 : 0);
 }
 
 __global__ void __launch_bounds__(kWideThreads, 1)
@@ -211,7 +208,7 @@ __global__ void __launch_bounds__(kWideThreads, 1)
                         valid);
             }
         }
-        asm volatile("cp.async.commit_group;\n" ::: "memory");
+        cp_commit_mem();
     };
     const int warp = static_cast<int>(threadIdx.x) / 32, lane = static_cast<int>(threadIdx.x) % 32;
     const int r0   = (warp % kWideRowWarps) * kWideTileRows;
@@ -221,9 +218,9 @@ __global__ void __launch_bounds__(kWideThreads, 1)
     for (int s = 0; s < slices; ++s) {
         if (s + 1 < slices) {
             issue(s + 1, (s + 1) & 1);
-            asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+            cp_wait_mem<1>();
         } else {
-            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+            cp_wait_mem<0>();
         }
         __syncthreads();
         if (s * kSliceChunks + lane < chunks) { // the narrow kernels' loop ends at the last chunk
@@ -295,6 +292,7 @@ void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Te
         static_cast<std::size_t>(std::min(kColumns, columns)) * k * sizeof(bf16);
     const int column_groups = (columns + kColumns - 1) / kColumns;
     if (columns >= kWideMinColumns) {
+        static_assert(kWideSharedBytes <= kMaxDynamicSharedBytes);
         static const bool configured = [] {
             return cudaFuncSetAttribute(projection_wide_kernel,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
