@@ -2040,43 +2040,49 @@ ninfer::PromptInput block_images_input(std::size_t count, std::size_t first = 0)
 
 int test_over_budget_images_shrink_oldest_first() {
     // 512x512 is 1024 patches (256 merged tokens); the shrunk form is 16x16 patches (64 tokens).
+    // 12 of them are 3072 tokens, over the budget of 4096 less text and headroom.
     ninfer::models::qwen3_5::FrontendOptions options;
     options.vision_enabled  = true;
-    options.max_context     = 2048;
+    options.max_context     = 4096;
     const Frontend frontend = make_frontend(resources(), options);
 
-    const auto prepared = frontend.prepare(block_images_input(6));
+    const auto prepared = frontend.prepare(block_images_input(12));
     const auto& items   = FrontendFactory::inspect(prepared).vision_items;
-    int failures        = check(items.size() == 6, "over-budget images were dropped instead of shrunk");
-    const auto patches  = [&](std::size_t index) {
-        return index < items.size() ? items[index].grid.height * items[index].grid.width : 0;
+    const auto patches  = [](const auto& list, std::size_t index) {
+        return index < list.size() ? list[index].grid.height * list[index].grid.width : 0;
     };
-    for (std::size_t index = 0; index < 5; ++index) {
-        failures += check(patches(index) == 16 * 16, "an old image was not shrunk to the ceiling");
+    int failures = check(items.size() == 12, "over-budget images were dropped instead of shrunk");
+    std::size_t shrunk = 0;
+    while (shrunk < items.size() && patches(items, shrunk) == 16 * 16) { ++shrunk; }
+    failures += check(shrunk >= 5 && shrunk < 12, "unexpected number of shrunk images");
+    for (std::size_t index = shrunk; index < items.size(); ++index) {
+        failures += check(patches(items, index) == 32 * 32,
+                          "an image after the shrunk prefix is not full size");
     }
-    failures += check(patches(5) == 32 * 32, "the newest image was shrunk although others sufficed");
     failures += check(FrontendFactory::inspect(prepared).token_ids.size() <= options.max_context,
                       "shrunk prompt does not fit max_context");
 
-    // Appending an image keeps the earlier decisions, so the prompt prefix stays reusable.
-    const auto longer = frontend.prepare(block_images_input(7));
+    // Appending an image keeps every earlier decision, including the image that was newest, so
+    // the prompt prefix stays reusable up to the first image that newly has to shrink.
+    const auto longer = frontend.prepare(block_images_input(13));
     const auto& next  = FrontendFactory::inspect(longer).vision_items;
-    bool stable       = next.size() == 7;
-    for (std::size_t index = 0; stable && index < 5; ++index) {
-        stable = next[index].grid.height == items[index].grid.height &&
-                 next[index].grid.width == items[index].grid.width &&
+    bool stable       = next.size() == 13;
+    for (std::size_t index = 0; stable && index < shrunk; ++index) {
+        stable = patches(next, index) == 16 * 16 &&
                  next[index].content_digest == items[index].content_digest;
     }
     failures += check(stable, "appending one image changed an earlier shrink decision");
+    failures += check(patches(next, 11) == 32 * 32 && patches(next, 12) == 32 * 32,
+                      "appending an image shrank the previously newest image");
 
     // The same bytes alone are under budget: the cache must not hand back the shrunk payload.
     const auto alone = frontend.prepare(block_images_input(1));
     const auto& solo = FrontendFactory::inspect(alone).vision_items;
-    failures += check(solo.size() == 1 && solo[0].grid.height * solo[0].grid.width == 32 * 32,
+    failures += check(solo.size() == 1 && patches(solo, 0) == 32 * 32,
                       "a shrunk payload was reused for the same image under budget");
 
     // Counting is an upper bound: it does not know the context and only applies the vision cap.
-    failures += check(frontend.count_tokens(block_images_input(6)) >=
+    failures += check(frontend.count_tokens(block_images_input(12)) >=
                           FrontendFactory::inspect(prepared).token_ids.size(),
                       "token count of an over-budget request is below the prepared prompt");
     return failures;

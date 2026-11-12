@@ -1763,12 +1763,14 @@ at 60% of the budget so the next few turns have room to grow. If every image at 
 does not fit, the oldest are replaced by the text `[image omitted: too many images for the
 context]`. The decision depends only on the images' order and sizes, so a request that appends one
 image keeps the earlier decisions and the prompt prefix stays reusable; the prefix is lost only
-when a further image has to be shrunk. `count_tokens` does not know the context, so for such a
+when a further image has to be shrunk (the image that was newest is shrunk only if every older one
+at the ceiling still leaves the request above the 60% mark). `count_tokens` does not know the context, so for such a
 request it is an upper bound on the prepared prompt. Videos are never shrunk this way.
 `oversized_image: "error"` still rejects an image that needs the normal resize.
 
 Media cache misses run as independent decode → resize → BF16-pack tasks on a bounded host worker
-pool. Prepared payloads are keyed by SHA-256 of the acquired bytes plus modality, so repeated media
+pool. Prepared payloads are keyed by SHA-256 of the acquired bytes, the modality and (for images) the
+pixel ceiling they were resized under, so repeated media
 in later requests reuses the exact immutable BF16 patch input; concurrent identical misses use one
 single-flight build. `--media-cache-mib` bounds LRU-retained payloads, while
 `--media-live-mib` bounds every cache-, request-, or runtime-referenced payload. Cache eviction does
