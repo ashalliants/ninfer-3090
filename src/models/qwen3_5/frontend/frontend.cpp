@@ -834,6 +834,8 @@ PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
         .tokenize_seconds              = stats.tokenize_seconds,
         .media_items                   = stats.media_items,
         .media_bytes                   = stats.media_bytes,
+        .degraded_media_items          = stats.degraded_media_items,
+        .dropped_media_items           = stats.dropped_media_items,
         .raw_patches                   = stats.raw_patches,
         .vision_tokens                 = stats.vision_tokens,
         .patch_bytes                   = stats.patch_bytes,
@@ -982,6 +984,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         }
         result.prepare.media_items              = processed.stats.media_items;
         result.prepare.media_bytes              = processed.stats.media_bytes;
+        result.prepare.degraded_media_items     = processed.stats.degraded_media_items;
+        result.prepare.dropped_media_items      = processed.stats.dropped_media_items;
         result.prepare.raw_patches              = processed.stats.raw_patches;
         result.prepare.vision_tokens            = processed.stats.vision_tokens;
         result.prepare.attention_pairs          = processed.stats.attention_pairs;
