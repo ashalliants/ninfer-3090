@@ -504,21 +504,25 @@ struct SpecLayout {
         out.words      = take(4 * out.w_count);
         // The N-row batched verify's own region (see the struct comment): a second, independent
         // GdnReplayRecords sized record_capacity = lanes, then the rest of its scratch, all appended
-        // after the single-row region above via the same `take()` builder.
-        {
+        // after the single-row region above via the same `take()` builder. try_speculate_rows()
+        // immediately declines without --mtp-rows-verify, so this region is dead weight for every
+        // other MTP program -- skip it so spec_backing_'s allocation (counted before
+        // expert-residency sizing) doesn't cost VRAM/cache headroom a disabled flag never uses
+        // (codepulse, PR #451).
+        if (o.mtp_rows_verify) {
             GdnReplayRecordSpec rows_spec = gdn_records_spec(c, out.width, o.gdn_head_map);
             rows_spec.record_capacity     = static_cast<std::int32_t>(lanes);
             LayoutBuilder rows_builder;
             out.rows_gdn       = plan_gdn_replay_records(rows_builder, rows_spec);
             out.rows_gdn_bytes = align(out.rows_gdn.payload_bytes());
+            out.rows_gdn_offset      = take(out.rows_gdn_bytes);
+            out.rows_ple             = take(w * W * lanes * 2);
+            out.rows_qsa_keys_stride = align(di * W * c.attention_layers * 2);
+            out.rows_qsa_keys        = take(out.rows_qsa_keys_stride * lanes);
+            out.rows_tails_layer_stride = align(tail_bytes * lanes);
+            out.rows_tails              = take(out.rows_tails_layer_stride * c.attention_layers);
+            out.rows_residuals          = take(w * static_cast<std::size_t>(out.width) * lanes * 2);
         }
-        out.rows_gdn_offset      = take(out.rows_gdn_bytes);
-        out.rows_ple             = take(w * W * lanes * 2);
-        out.rows_qsa_keys_stride = align(di * W * c.attention_layers * 2);
-        out.rows_qsa_keys        = take(out.rows_qsa_keys_stride * lanes);
-        out.rows_tails_layer_stride = align(tail_bytes * lanes);
-        out.rows_tails              = take(out.rows_tails_layer_stride * c.attention_layers);
-        out.rows_residuals          = take(w * static_cast<std::size_t>(out.width) * lanes * 2);
         out.bytes      = at;
         return out;
     }

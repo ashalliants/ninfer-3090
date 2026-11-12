@@ -154,12 +154,17 @@ exercises any of it yet; it is all reachable-but-uncalled code until the pieces 
 
 Items 1-5 above landed: `try_speculate_rows`/`verify_rows`/`commit_speculative_rows`, the IO staging
 function, and `decode()`'s dispatch (try the batched path, fall back to `decode_rows()` if it
-declines). `ninfer_qwen4_exp_lanes_real_test --exact --mtp 3 --generate 96 --cache --max-context
-16384` passes bitwise-identical against the single-lane reference with this path genuinely
+declines). As of **this section's own date, 2026-11-11**, on the GPU rented for that session,
+`ninfer_qwen4_exp_lanes_real_test --exact --mtp 3 --generate 96 --cache --max-context
+16384` passed bitwise-identical against the single-lane reference with this path genuinely
 exercised (the test now forces `mtp_joint_acceptance`/`mtp_rows_verify` on itself -- without both,
 a round with more than one row never reaches `try_speculate_rows` at all, so the test would prove
 nothing about this code; this was initially missed and the test silently validated only the plain
-fallback for several iterations of this session).
+fallback for several iterations of this session). **That pass predates bug 7 below and every fix
+since** -- the standalone test's staggered pairs don't force genuine simultaneous lanes the way two
+real concurrent HTTP requests do (next paragraph), so this pass alone never exercised the code path
+bug 7 lived in. It is not evidence for the current head; see "What's still open" for the current,
+unverified status.
 
 Seven real bugs surfaced getting there, six found and fixed, the seventh found but not yet
 root-caused. All but the last were found by firing two real HTTP requests at a running server at
