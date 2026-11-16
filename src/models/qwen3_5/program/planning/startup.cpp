@@ -1175,6 +1175,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency      = inputs.max_concurrency;
     impl->prefill_chunk        = inputs.prefill_chunk;
+    impl->prefill_tail_floor   = inputs.prefill_tail_floor;
     impl->progress_anchor_tokens = inputs.progress_anchor_tokens;
     impl->progress_anchors_shared = inputs.progress_anchors_shared;
     impl->draft_window         = inputs.draft_window;
@@ -1353,6 +1354,11 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .capacity             = options.max_context,
         .max_concurrency      = options.max_concurrency,
         .prefill_chunk        = std::min(options.prefill_chunk, options.max_context),
+        // The route is reached only through the integer policies (parameters.cpp), so it is on
+        // exactly when both options are.
+        .prefill_tail_floor   = options.prefill_a8 && options.prefill_cublas
+                                    ? static_cast<std::uint32_t>(ops::kCublasPrefillMinTokens)
+                                    : 0U,
         .progress_anchor_tokens = options.progress_anchor_tokens,
         .progress_anchors_shared = options.progress_anchors_shared,
         .draft_window         = options.speculative.draft_tokens,

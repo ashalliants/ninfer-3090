@@ -172,6 +172,17 @@ change the cuBLAS GEMM is about half of prefill time, the FP16 weight materialis
 weight-sized, so a larger `--prefill-chunk` amortises it), and the GDN chunked recurrence ~9%
 (emulated TF32/BF16 `mma`).
 
+**Chunk size and the narrow tail.** `--prefill-chunk` past the default 1,024 is worth 1-4% here
+(Qwen3.8-27B, 2k and 4k prompts, chunks 1,024 / 2,048 / 4,096: 796-802 and 748-774 tok/s). What
+cost far more was a narrow segment: the route admits a call from `kCublasPrefillMinTokens` (129,
+which decode/verify widths must stay below), and anything narrower takes the integer/A16 routes,
+emulated here at ~80 tok/s. Steps also split at context-cache captures (just before the closing
+template tokens) and rewrite frontiers, so 1,150 tokens ran as 1,024 + 122 + 4 and paid ~1.3 s for
+the 122. With the route on, `prefill_tail_floor` (planning/startup.h, set to the gate) makes
+`advance_prefill` shorten a step so the segment before the next frontier is at least the gate:
+1,017 + 129 + 4, 449 -> 755 tok/s on that prompt, same output. Prompts shorter than the gate
+still prefill on the narrow routes.
+
 Thermals: sustained prefill holds the card at its 200 W cap and took a passively cooled V100 from
 40 to 75 C in about a minute; measure in short runs without forced airflow.
 

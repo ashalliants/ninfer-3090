@@ -522,6 +522,8 @@ public:
     const std::uint32_t max_concurrency;
     const ContextCacheOptions context_cache;
     const std::uint32_t prefill_chunk;
+    // See SequencePlanImpl::prefill_tail_floor.
+    const std::uint32_t prefill_tail_floor;
     // Spacing of private progress anchors on long prefills (0 off), see plan_request.
     const std::uint32_t progress_anchor_tokens;
     // Anchors are SharedPrefix (survive a cancellation) rather than private LongAnchor.

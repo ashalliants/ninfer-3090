@@ -655,6 +655,34 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
 
         if (staged.cursor < staged.prompt_tokens) {
             std::uint32_t nominal = std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            // Leave no segment narrower than the floor (the cuBLAS route's width gate when it is
+            // on) before the next point the loop below must stop at: a context-cache capture or a
+            // rewrite frontier, else the prompt's end. Shorten this step so that segment is exactly
+            // the floor, as long as this step stays at least as wide. With a capture four tokens
+            // before the end, 1,150 tokens at chunk 1,024 run as 1,017 + 129 + 4 instead of
+            // 1,024 + 122 + 4, whose 122 would take the narrow routes -- emulated mma on sm_70,
+            // ~8x slower there. The capture's own few tokens go to the small-T routes, as before.
+            // Text-only, exact-phase prompts: media spans and lossy phase boundaries decide their
+            // own steps.
+            if (prefill_tail_floor != 0 && !staged.vision && !request.lossy) {
+                std::uint32_t boundary = staged.prompt_tokens;
+                if (request.next_capture < request.capture_groups.size()) {
+                    const std::uint32_t frontier =
+                        request.capture_groups[request.next_capture].frontier;
+                    if (frontier > staged.cursor) { boundary = std::min(boundary, frontier); }
+                }
+                const auto& rewrites = staged.prompt.identity.rewrite_execution_frontiers;
+                const auto rewrite = std::upper_bound(rewrites.begin(), rewrites.end(), staged.cursor);
+                if (rewrite != rewrites.end()) { boundary = std::min<std::uint32_t>(boundary, *rewrite); }
+                const std::uint32_t span = boundary - staged.cursor;
+                if (nominal < span) {
+                    const std::uint32_t rest = span - nominal;
+                    if (rest < prefill_tail_floor &&
+                        nominal >= prefill_tail_floor + (prefill_tail_floor - rest)) {
+                        nominal -= prefill_tail_floor - rest;
+                    }
+                }
+            }
             // A lossy request's Exact phase stops at M, where its scout begins.
             if (request.lossy) {
                 nominal = std::min(nominal, lossy_step_limit(request.lossy->phase, staged.cursor,
