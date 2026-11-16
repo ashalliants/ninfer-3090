@@ -5,7 +5,9 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "core/device.h" // CUDA_CHECK
+#include "ops/linear/common/stream_gemv.cuh"
 #include "ops/linear/q4/q4_ksplit_mma.cuh"
+#include "ops/linear/q4/q4_rowsplit_storage.cuh"
 #include "ops/linear/q4/q4_small_t_mma_i8.cuh"
 
 #include <cuda_bf16.h>
@@ -332,12 +334,29 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
     if (lane == 0) { out[out_row] = __float2bfloat16(silu(gate_acc) * up_acc); }
 }
 
+// The streaming GEMV's pair sink: the same finish as the kernel above, gate in acc[0], up in acc[1].
+struct Q4SwiGluStreamSink {
+    __nv_bfloat16* out;
+
+    __device__ __forceinline__ void finish(int row, const float (&acc)[2]) const {
+        out[row] = __float2bfloat16(silu(acc[0]) * acc[1]);
+    }
+};
+
 } // namespace
 
 void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor& out,
                                        cudaStream_t stream) {
     if (w.n != kN || w.k != kK || w.padded_shape[1] != kK) {
         throw std::invalid_argument("q4 linear_swiglu GEMV requires weight [34816,5120]");
+    }
+    // Gate row r and up row r + kIntermediate as one streaming-GEMV item (stream_gemv.cuh).
+    if (try_launch_stream_gemv_rows<Q4StreamFormat, 2>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            {static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales)},
+            Q4SwiGluStreamSink{static_cast<__nv_bfloat16*>(out.data)}, kIntermediate,
+            kIntermediate, kK, kK, stream)) {
+        return;
     }
     const int grid = kIntermediate / kPairsPerBlock;
     q4_linear_swiglu_gemv_pair_kernel<<<grid, kBlockThreads, 0, stream>>>(

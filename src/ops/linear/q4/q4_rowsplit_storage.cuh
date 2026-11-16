@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/math.cuh"
+#include "ops/linear/common/stream_gemv_decode.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -38,6 +39,61 @@ struct Q4SimtDecodeAtom {
         const int q1      = (static_cast<int>(packed >> 4) ^ 0x08) - 0x08;
         w0                = static_cast<float>(q0) * scale;
         w1                = static_cast<float>(q1) * scale;
+    }
+};
+
+// Q4 for the streaming GEMV (ops/linear/common/stream_gemv.cuh). One lane slice is 16 code bytes,
+// half a group: 32 weights at consecutive k, nibble i of word w at k offset 8w + i, value
+// (n ^ 8) - 8. XORing the word with 0x88888888 gives m = value + 8 in [0, 15], which
+// stream_dot_nibbles8 decodes; the -8 joins the activation correction, so per weight pair
+// (x_even, x_odd) the correction is x' + 8x = 264 x_even + 24 x_odd.
+struct Q4StreamFormat {
+    static constexpr const char* kName = "q4";
+    static constexpr int kGroupK       = Q4RowSplitStorage::kGroupK;
+
+    struct Planes {
+        const std::uint8_t* codes;
+        const std::uint8_t* scales;
+    };
+    struct Row {
+        const uint4* codes;
+        const std::uint16_t* scales;
+    };
+    struct Slice {
+        uint4 codes;
+        std::uint16_t scale;
+    };
+
+    __device__ static __forceinline__ Row row(const Planes& planes, int row, int padded_k) {
+        const std::int64_t groups = static_cast<std::int64_t>(row) * (padded_k / kGroupK);
+        return {reinterpret_cast<const uint4*>(planes.codes +
+                                               groups * Q4RowSplitStorage::kCodeBytesPerGroup),
+                reinterpret_cast<const std::uint16_t*>(
+                    planes.scales + groups * Q4RowSplitStorage::kScaleBytesPerGroup)};
+    }
+    // Slice v covers k 32v .. 32v + 31 (group v / 2).
+    __device__ static __forceinline__ Slice load(const Row& row, int v) {
+        return {__ldg(&row.codes[v]), __ldg(&row.scales[v >> 1])};
+    }
+    __device__ static __forceinline__ Slice empty() { return {make_uint4(0u, 0u, 0u, 0u), 0}; }
+    __device__ static __forceinline__ float scale(const Slice& slice) {
+        return __half2float(__ushort_as_half(slice.scale));
+    }
+    __device__ static __forceinline__ float correction(float x_even, float x_odd) {
+        return fmaf(x_even, kStreamEvenScale + 8.0f, x_odd * (kStreamOddScale + 8.0f));
+    }
+    // x' for k offsets 8w .. 8w + 7 of the slice are chunks[2w] and chunks[2w + 1].
+    __device__ static __forceinline__ float dot(const Slice& slice, const float4 (&chunks)[8],
+                                                const StreamDecodeConstants& c) {
+        const std::uint32_t words[4] = {slice.codes.x, slice.codes.y, slice.codes.z,
+                                        slice.codes.w};
+        float acc = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            acc = stream_dot_nibbles8(words[w] ^ 0x88888888u, chunks[2 * w], chunks[2 * w + 1], c,
+                                      acc);
+        }
+        return acc;
     }
 };
 

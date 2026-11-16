@@ -80,6 +80,11 @@ def test_classification_follows_the_kernel_names_in_src_ops():
         "bf16_split_k_reduce_kernel": "other",
         "rmsnorm_rope_d128_kernel": "other",
         "ggml_mmvq_kernel": "other",
+        # The streaming GEMV serves several formats; its format is the first template argument.
+        "void ninfer::ops::detail::stream_gemv_kernel<ninfer::ops::detail::Q4StreamFormat, (int)8, "
+        "(int)1, (int)2, Sink>(const __nv_bfloat16 *, int)": "q4",
+        "void ninfer::ops::detail::stream_gemv_kernel<ninfer::ops::detail::Q5StreamFormat, (int)16, "
+        "(int)2, (int)1, Sink>(const __nv_bfloat16 *, int)": "q5",
     }
     for raw, expected in cases.items():
         check(kb.classify(raw) == expected, f"{raw}: {kb.classify(raw)}, want {expected}")

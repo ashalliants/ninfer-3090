@@ -96,6 +96,11 @@ def classify(raw: str) -> str:
         return "attention"
     if re.search(r"recurren|chunk_recurrence|gdn_conv|conv_post|gdn_projected|gdn_norm", name):
         return "gdn"
+    # The streaming GEMV (ops/linear/common/stream_gemv.cuh) is one kernel for several formats; its
+    # format is the first template argument, which short_name drops, so read it from the raw name.
+    if name == "stream_gemv_kernel":
+        streamed = re.search(r"\b(q\d+)StreamFormat", raw, re.IGNORECASE)
+        return streamed.group(1).lower() if streamed else "other"
     formats = leading_formats(name)
     if formats:
         return "_".join(formats)
