@@ -92,9 +92,66 @@ def qwen3_6_27b(model, recipe, sources):
     _dense_groupwise(model, recipe, Q6)
 
 
+QWEN3_8_27B_LATE_LAYER = 36
+QWEN3_8_27B_Q4_ROLES = (
+    "/attention/query", "/attention/key", "/gdn/query", "/gdn/key", "/mlp/gate", "/mlp/up",
+)
+QWEN3_8_27B_LATE_Q4_ROLES = ("/attention/output", "/gdn/output", "/mlp/down")
+
+
+# First layer at which each of the three roles that have both a Q4 and a Q5 kernel switches from Q4
+# to Q5; every layer before it is Q4. Chosen at the old rule's byte budget by
+# ``python -m tools.convert.allocation --metric absolute`` (imatrix-weighted rounding error) and
+# measured on the RTX 3090 against the previous rule (Q5 in layers 0-35, Q4 from 36): mean KLD to
+# Q8_0 0.0318 -> 0.0288 on the first held-out file and 0.0197 -> 0.0183 on a second, never-used one,
+# with the same text bytes. docs/maintainer/quality-trade-experiments.md has the rows, and the costs
+# (DFlash2 draft acceptance on the bench corpus, Chinese Wikipedia perplexity).
+QWEN3_8_27B_Q5_FROM_LAYER = {
+    "/attention/output": 23,
+    "/gdn/output": 24,
+    "/mlp/down": 30,
+}
+
+
+def qwen3_8_27b_text_format(name):
+    """The format `qwen3_8_27b` gives one text-layer projection (``text/layers/N/...``)."""
+
+    layer = int(name.split("/")[2])
+    if name.endswith(QWEN3_8_27B_Q4_ROLES):
+        return Q4
+    for role, first_q5_layer in QWEN3_8_27B_Q5_FROM_LAYER.items():
+        if name.endswith(role):
+            return Q5 if layer >= first_q5_layer else Q4
+    return Q5
+
+
+def qwen3_8_27b_legacy_text_format(name, late_layer=QWEN3_8_27B_LATE_LAYER):
+    """The rule `qwen3_8_27b` shipped before the allocation above: Q5 for the three roles in layers
+    0-35 and Q4 from ``late_layer``. Kept as the byte budget and baseline of
+    ``tools.convert.allocation``."""
+
+    layer = int(name.split("/")[2])
+    if name.endswith(QWEN3_8_27B_Q4_ROLES):
+        return Q4
+    if name.endswith(QWEN3_8_27B_LATE_Q4_ROLES) and layer >= late_layer:
+        return Q4
+    return Q5
+
+
+def imatrix_search(sources):
+    """Recipe choice for the importance-weighted search encoder with the ``imatrix`` source."""
+
+    return {
+        "method": "grouped_search",
+        "parameters": {"imatrix": str(sources["imatrix"].path), "negative_scales": True},
+    }
+
+
 def qwen3_8_27b(model, recipe, sources):
     """Qwen3.8-27B for one RTX 3090: the importance-weighted search encoder over every text matrix,
-    a 4-bit embedding, a 6-bit head, and 4-bit mixer outputs and MLP down in layers 36-63.
+    a 4-bit embedding, a 6-bit head, and 5-bit mixer outputs and MLP down only in the later layers
+    (``QWEN3_8_27B_Q5_FROM_LAYER``: attention output from layer 23, GDN output from 24, MLP down
+    from 30), 4-bit before that.
 
     Requires ``--source imatrix=PATH``: a file from ``tools.convert.imatrix`` (the published one is
     imported from Unsloth's Qwen3.8-27B imatrix). Vision, MTP and draft components keep the
@@ -105,10 +162,7 @@ def qwen3_8_27b(model, recipe, sources):
     if "num_experts" in model.config:
         raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
     _optional(model, recipe)
-    search = {
-        "method": "grouped_search",
-        "parameters": {"imatrix": str(sources["imatrix"].path), "negative_scales": True},
-    }
+    search = imatrix_search(sources)
     recipe.assign("text/token_embedding", format=Q4, **search)
     recipe.assign("text/output_head", format=Q6, **search)
     for name, parameter in model.parameters.items():
@@ -117,16 +171,7 @@ def qwen3_8_27b(model, recipe, sources):
         if name.endswith(("/gdn/a_projection", "/gdn/b_projection")):
             recipe.separate(name)
             continue
-        layer = int(name.split("/")[2])
-        if name.endswith(
-            ("/attention/query", "/attention/key", "/gdn/query", "/gdn/key", "/mlp/gate", "/mlp/up")
-        ):
-            format = Q4
-        elif name.endswith(("/attention/output", "/gdn/output", "/mlp/down")) and layer >= 36:
-            format = Q4
-        else:
-            format = Q5
-        recipe.assign(name, format=format, **search)
+        recipe.assign(name, format=qwen3_8_27b_text_format(name), **search)
 
 
 def qwen3_6_35b_a3b(model, recipe, sources):

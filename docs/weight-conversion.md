@@ -61,7 +61,7 @@ The built-in recipes are ordinary Python functions in
 | Recipe | Main representation choices | Additional source |
 |---|---|---|
 | `qwen3_6_27b` | Q4/Q5 projections, Q6 vocabulary weights | None |
-| `qwen3_8_27b` | `grouped_search` with signed scales; Q4/Q5 projections, Q4 mixer outputs and MLP down in layers 36–63, Q4 embedding, Q6 head | `imatrix` |
+| `qwen3_8_27b` | `grouped_search` with signed scales; Q4/Q5 projections (attention output, GDN output and MLP down are Q4 in the early layers and Q5 from layer 23, 24 and 30), Q4 embedding, Q6 head | `imatrix` |
 | `qwen3_6_35b_a3b` | Q4 experts, Q5/Q6 expert down, Q8 shared/projection weights | None |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
@@ -225,6 +225,19 @@ does not cover (the embedding and output head) are searched without weights. `fp
 rounds input values to BF16, then produces E4M3FN codes and one BF16 multiplier per row.
 `import_encoded` preserves compatible code and scale words, including NVFP4's matrix weight divisor.
 It does not dequantize and requantize them.
+
+`python -m tools.convert.allocation` measures, per layer, whether a Q5 projection earns its extra
+bits. For the attention output, GDN output and MLP down projections (the roles with both Q4 and Q5
+kernels) it scores the imatrix-weighted rounding error at each format and writes an `--override`
+file that re-spends the previous layer rule's bytes where the error drops most. The score is a proxy:
+confirm a proposed allocation with a KLD or perplexity run before adopting it.
+`python -m tools.convert.allocation_activations` gives a second proxy on CPU: it runs the
+checkpoint layer by layer on held-out text (needs `transformers`) and measures how much noise each
+format adds to the residual stream; pass its output to `allocation --metric activation`. The
+`absolute` metric produced the shipped rule (`QWEN3_8_27B_Q5_FROM_LAYER` in `official_recipes.py`);
+the `activation` candidate was measured and not adopted. The measurements are in
+[quality trade experiments](maintainer/quality-trade-experiments.md) and the files in
+[`candidates/`](../tools/convert/candidates/README.md).
 
 The exact numeric and packing rules are in [numeric formats](maintainer/tensor-formats.md) and
 [storage layouts](maintainer/storage-layouts.md). Source format names alone do not establish

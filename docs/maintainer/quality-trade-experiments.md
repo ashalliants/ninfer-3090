@@ -413,10 +413,12 @@ is 18.98 GB because it also carries vision, MTP, DFlash2 and the proposal head.
 | `ladder4-attn-kv` | ladder 3, attention key Q6 and value Q8 | 17.96 | 16.96 | 0.0168 | 96.11% | +0.37% |
 | `c1-existing` | C1: Q6 embedding and head, outputs Q4 in layers 36-63 | 16.22 | 15.22 | 0.0281 | 94.60% | +0.30% |
 | `c1-down4late` | C1b: C1 and MLP down Q4 in layers 36-63 | 15.90 | 14.91 | 0.0304 | 94.29% | +0.49% |
-| **`release-emb4`** | **shipped**: C1b with a Q4 embedding | **15.59** | **14.91** | **0.0318** | **94.25%** | **+0.59%** |
+| **`release-emb4`** | the shipped artifact before pull request #445: C1b with a Q4 embedding | **15.59** | **14.91** | **0.0318** | **94.25%** | **+0.59%** |
 | `c2-lean` | C2: C1b, attention key Q6 and value Q8, GDN value and z Q4 in layers 36-63 (needs kernel routes that are not built) | 15.79 | 14.80 | 0.0295 | 94.29% | +0.74% |
 | `unsloth-allocation` | Unsloth UD-Q4_K_XL's per-tensor allocation in our formats, Q4 embedding | 16.53 | 15.86 | 0.0215 | 95.63% | +0.99% |
 | `unsloth-allocation-emb6` | the same with a Q6 embedding | 16.85 | 15.86 | 0.0200 | 95.68% | +0.77% |
+| `alloc-activation` | the shipped layout with the 128 attention-output, GDN-output and MLP-down tensors re-allocated Q4/Q5 at equal bytes by measured activation noise (2026-11-16, PR #445) | 15.58 | 14.91 | 0.0288 | 94.61% | +0.70% |
+| **`alloc-absolute`** | the same, allocated by imatrix-weighted weight error alone (2026-11-16, PR #445): **now shipped** | 15.58 | 14.91 | 0.0288 | 94.41% | +1.20% |
 
 **llama.cpp reference**
 
@@ -443,6 +445,86 @@ What the rows say:
   UD-Q4_K_XL (17.56 GB, 0.0156) is still clearly better than anything NInfer's formats reach; the
   closest, `ladder4-attn-kv`, needs 17.96 GB for 0.0168.
 - **All-Q4 is not an option**: 0.0457 and +3.31% perplexity for 1.4 GB.
+- **Re-allocating Q4/Q5 across the 128 attention-output, GDN-output and MLP-down tensors at equal
+  bytes lowers KLD by about 9.5%; `alloc-absolute` is now the shipped rule** (pull request #445,
+  measured 2026-11-16 with the harness above). The previous rule gave these Q5 in layers 0-35 and Q4 in
+  36-63; both candidates (`tools/convert/candidates/`) move Q5 to later layers, the direction
+  Unsloth's UD-Q4_K_XL takes. The `official` arm reproduced the previous shipped row (15.59 GB, 0.0318, 94.25%,
+  +0.59%). Per stream (KLD, lower is better):
+
+  | Stream | official | alloc-activation | alloc-absolute |
+  |---|---:|---:|---:|
+  | wikipedia_en | 0.0182 | 0.0152 | 0.0173 |
+  | wikipedia_zh | 0.0859 | 0.0731 | 0.0732 |
+  | arxiv | 0.0183 | 0.0160 | 0.0169 |
+  | github_code | 0.0143 | 0.0131 | 0.0136 |
+  | own_code | 0.0169 | 0.0150 | 0.0164 |
+  | synthetic_chat | 0.0373 | **0.0402** | 0.0358 |
+  | **mean** | **0.0318** | **0.0288 (-9.6%)** | **0.0288 (-9.4%)** |
+
+  `alloc-absolute` beat `official` on every stream; `alloc-activation` is 7.6% worse on
+  `synthetic_chat`, which breaks the "no stream more than 2% worse" criterion fixed before the run
+  (the maintainer then said they weigh that stream, AI-written text that is likely to change, much
+  less than code, so this one miss is recorded as waived rather than as a pass).
+- **What it cost, measured before adopting: speed on one corpus and a perplexity margin, not KLD.** `ninfer_bench`, rk4v4 KV,
+  8,192-token context, the same binary, five paired repetitions with the order alternating, paired
+  median of candidate over official (criterion: within -1% on every row):
+
+  | Row | alloc-absolute | alloc-activation |
+  |---|---:|---:|
+  | plain decode, tg128 | 1.0000 | 1.0007 |
+  | prefill, pp4096 | 0.9999 | 0.9993 |
+  | MTP3 + draft head, pp2048+tg256 | 1.0001 | **0.9851** |
+  | DFlash2 K=7 + draft head, pp2048+tg256 | **0.9722** | **0.9707** |
+
+  The DFlash2 loss is acceptance, not kernel time: 7.53 accepted tokens per round for `official`
+  against 7.31 for both candidates on this corpus, which is unusually easy to draft and close to the
+  K=7 ceiling. MTP acceptance is identical for `absolute` (3.821) and a little lower for
+  `activation` (3.765). On the 24 varied prompts of `bench/fixtures/chat_prompts.jsonl` through
+  `ninfer-serve` (greedy, 512 tokens, two repetitions, one stream) the DFlash2 acceptance does not move
+  (3.560, 3.558, 3.558 tokens per round for official, absolute, activation) and decode stays inside
+  run-to-run spread (116.3 and 117.9 tok/s for official, 115.4 and 117.5 for absolute, 115.7 and
+  115.4 for activation); MTP is the same for `absolute` (109.5 against 109.4 tok/s) and about 2%
+  slower for `activation` (107.0), with tokens per round 2.845, 2.844 and 2.834. So the bench row
+  likely overstates what chat sees, but the repetitions there are too few to call a 1% effect.
+  `ninfer-perplexity --quick --kv-dtype int8` on the built artifacts: official 4.3169, absolute 4.3224
+  (+0.13%, over the 0.1% limit, all of it Chinese Wikipedia: 9.143 to 9.266, while arXiv, both code
+  streams and chat improve), activation 4.3114 (-0.13%). llama.cpp's "PPL vs Q8_0" column agrees in
+  direction for the Chinese stream and is worse for both candidates overall (+1.20% and +0.70%
+  against +0.59%), so the KLD gain is not a perplexity gain on every stream.
+- **What the CPU proxy got right and wrong.** It predicted 50% less rounding noise at the residual
+  stream; the measured KLD gain is 9.5%. The sign and the direction (more bits late) were right, the
+  size was not, as the earlier `ladder` rows suggested. The two proxies agree with each other on 112
+  of 128 tensors and land on the same mean KLD (0.0288), so the activation measurement bought
+  nothing over the weight-error metric here.
+- **Second sample, chat-prompt speed and a coding check, then adopted.** The pre-registered criteria
+  above were not all met (speed within -1% on the bench corpus and perplexity within 0.1% both narrowly
+  failed for `alloc-absolute`; `alloc-activation` also failed the per-stream and MTP3 rows), so before
+  deciding the maintainer asked for more evidence that was fixed in advance:
+  - *KLD on the second, never-calibrated file of each held-out stream* (`data/<stream>/01.txt`, same
+    harness, 8 chunks of 4,096 tokens): `official` 0.0197, `alloc-absolute` 0.0183 (-6.7%), top-1 94.17% to
+    94.42%. Every stream improves (wikipedia_en -14.1%, wikipedia_zh -16.0%, arXiv -8.9%, github_code
+    -7.6%, own_code -5.4%) except `synthetic_chat`, +5.2% here and -4.2% on the first file, 0.0%
+    pooled: that stream's sign is not stable across samples. Pooled over both files the mean is -8.4%.
+  - *Decode speed on the 24 chat prompts through `ninfer-serve`* (greedy, 512 tokens, one stream,
+    arms interleaved): DFlash2 K=7, five paired repetitions, median candidate/official 0.9956 (-0.4%);
+    MTP3, six, median 1.0017. Accepted tokens per round are unchanged (DFlash2 3.558 against 3.560, MTP
+    61.40% against 61.39% accepted). The card slowed by about 10% over the MTP run (113 to 98 tok/s),
+    which the pairing absorbs.
+  - *HumanEval (164) plus MBPP sanitized (257), non-thinking, greedy, DFlash2, 1,024 tokens*: `official`
+    375 of 421 (89.1%), `alloc-absolute` 380 (90.3%); 3 problems only official passed, 8 only absolute
+    (exact McNemar p = 0.23). A benchmark this size cannot resolve a gain this small, so it is a check
+    for breakage, which it found none of. 11 and 14 answers hit the token limit and count as failures.
+  The remaining costs are the DFlash2 row on the bench corpus (-2.8%, draft acceptance 7.53 to 7.31
+  accepted per round on a corpus that is unusually easy to draft) and Chinese Wikipedia perplexity
+  (9.14 to 9.27 under `ninfer-perplexity`, and +1.20% against +0.59% in llama.cpp's "PPL vs Q8_0"),
+  even though its KLD improves by 15% in both samples.
+- **Adopted: the rule is three layer thresholds** (`QWEN3_8_27B_Q5_FROM_LAYER`, `tools/convert/
+  official_recipes.py`): attention output Q5 from layer 23, GDN output from 24, MLP down from 30, Q4
+  before; every other projection is unchanged. The previous layer rule stays as
+  `qwen3_8_27b_legacy_text_format`, the byte budget and baseline of `tools.convert.allocation`. The
+  published artifact and its model card still describe the previous layout until the maintainer rebuilds
+  and republishes them; rebuild with `--recipe qwen3_8_27b` and the same sources.
 
 ## Tried and rejected: two-stage output head (Basalt X-B)
 
