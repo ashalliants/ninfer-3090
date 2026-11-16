@@ -22,22 +22,33 @@ Then pass ``--activations activations.json --metric activation`` to ``tools.conv
 
 The reference forward is checked end to end: after the last layer the tool reports the
 cross-entropy of the held-out tokens (a sound pass lands near the model's perplexity, 4.3). The
-hidden state is saved after every layer in ``--work-dir`` so an interrupted run resumes.
+hidden state is saved after every layer in ``--work-dir`` so an interrupted run resumes: the report
+records how many layers are committed, together with their scores, and a run resumes only from the
+same checkpoint, imatrix and corpus tokens it was started with.
 Requires ``transformers`` (not otherwise a dependency of the converter).
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
 from pathlib import Path
 from typing import Callable, Mapping
 
 import torch
 
 from . import imatrix as imatrix_file
-from .allocation import FORMATS, dequantize
+from .allocation import (
+    FORMATS,
+    atomic_write_text,
+    checkpoint_identity,
+    dequantize,
+    file_sha256,
+    require_same_inputs,
+)
 
 STREAMS = ("wikipedia_en", "wikipedia_zh", "github_code", "own_code", "synthetic_chat", "arxiv")
 
@@ -146,6 +157,43 @@ def cross_entropy(hidden, tokens, norm: Callable[[torch.Tensor], torch.Tensor], 
     return float((lse - picked).mean())
 
 
+def resume_state(report_path: Path, settings: dict, work_dir: Path):
+    """Where a repeated run continues: ``(report, first layer to compute, hidden-state file or None)``.
+
+    The report is the single record of what is done. ``completed_layers`` and the scores of those
+    layers are written together by one atomic replace, after the hidden state they depend on, so a run
+    interrupted at any point resumes at a layer whose predecessor is fully committed. Hidden-state files
+    the report does not vouch for (an interruption between the two writes) are ignored and rewritten.
+    """
+
+    if not report_path.exists():
+        return {"settings": settings, "scores": {}, "completed_layers": 0}, 0, None
+    report = json.loads(report_path.read_text())
+    require_same_inputs(report.get("settings", {}), settings, list(settings), report_path)
+    done = int(report.get("completed_layers", 0))
+    if done == 0:
+        return report, 0, None
+    hidden = work_dir / f"hidden_{done - 1}.pt"
+    if not hidden.exists():
+        raise ValueError(
+            f"{report_path} records {done} finished layers but {hidden} is missing; "
+            "delete the report to start again"
+        )
+    return report, done, hidden
+
+
+def commit_layer(report: dict, index: int, hidden: torch.Tensor, report_path: Path, work_dir: Path) -> None:
+    """Make layer ``index`` durable: its hidden state, then the report that vouches for it, and only
+    then drop the previous hidden state."""
+
+    temporary = work_dir / f"hidden_{index}.pt.tmp"
+    torch.save(hidden, temporary)
+    os.replace(temporary, work_dir / f"hidden_{index}.pt")
+    report["completed_layers"] = index + 1
+    atomic_write_text(report_path, json.dumps(report))
+    (work_dir / f"hidden_{index - 1}.pt").unlink(missing_ok=True)
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--model", type=Path, required=True)
@@ -200,15 +248,21 @@ def main(argv=None) -> None:
     rotary = Qwen3_5TextRotaryEmbedding(config)
     position_embeddings = rotary(embed, mrope_positions)
 
-    report = {"settings": {"seq_len": length, "streams": list(STREAMS)}, "scores": {}}
-    start, hidden = 0, embed
-    if args.out.exists():
-        report = json.loads(args.out.read_text())
-    done = sorted(int(path.stem.split("_")[1]) for path in args.work_dir.glob("hidden_*.pt"))
-    if done and (args.work_dir / f"hidden_{done[-1]}.pt").exists():
-        start = done[-1] + 1
-        hidden = torch.load(args.work_dir / f"hidden_{done[-1]}.pt")
+    settings = {
+        "seq_len": length,
+        "streams": list(STREAMS),
+        "checkpoint": checkpoint_identity(args.model),
+        "imatrix_sha256": file_sha256(args.imatrix),
+        "tokens_sha256": hashlib.sha256(tokens.numpy().tobytes()).hexdigest(),
+    }
+    report, start, saved = resume_state(args.out, settings, args.work_dir)
+    hidden = embed
+    if saved is not None:
+        hidden = torch.load(saved)
         print(f"resuming at layer {start}", flush=True)
+    for stale in args.work_dir.glob("hidden_*.pt*"):  # never committed by a report
+        if stale.name.endswith(".tmp") or int(stale.name.split("_")[1].split(".")[0]) >= start:
+            stale.unlink()
 
     layers = config.num_hidden_layers if args.layers is None else min(args.layers, config.num_hidden_layers)
     for index in range(start, layers):
@@ -232,10 +286,7 @@ def main(argv=None) -> None:
         hidden, result = measure_layer(layer, kind, hidden, forward, importance, device=args.device)
         for role, entry in result.items():
             report["scores"][role_names[role]] = entry
-        torch.save(hidden, args.work_dir / f"hidden_{index}.pt")
-        if index > start:
-            (args.work_dir / f"hidden_{index - 1}.pt").unlink(missing_ok=True)
-        args.out.write_text(json.dumps(report))
+        commit_layer(report, index, hidden, args.out, args.work_dir)
         worst = max(entry["output_error"][FORMATS[0]] / entry["residual_energy"] for entry in result.values())
         print(f"[{index + 1}/{config.num_hidden_layers}] {kind}: finite={bool(torch.isfinite(hidden).all())} "
               f"|h|^2={float(hidden.pow(2).sum(-1).mean()):.4g} worst Q4 noise/residual {worst:.3g}", flush=True)
@@ -250,7 +301,7 @@ def main(argv=None) -> None:
             lambda a, b: tensor("lm_head.weight", (a, b)) if a < config.vocab_size else torch.zeros(0, 1),
         )
         report["reference_check"] = {"cross_entropy": loss, "perplexity": math.exp(loss), "tokens": int(batch * (length - 1))}
-        args.out.write_text(json.dumps(report))
+        atomic_write_text(args.out, json.dumps(report))
         print(f"reference check: cross-entropy {loss:.4f} (perplexity {math.exp(loss):.3f})", flush=True)
 
 

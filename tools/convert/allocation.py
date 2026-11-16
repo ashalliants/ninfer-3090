@@ -21,14 +21,18 @@ allocation must be confirmed with a KLD, speed and perplexity run before it repl
 
 Scoring runs the search encoder once per format per tensor: about 10 s for a 5120x17408 MLP
 down projection on an Apple-silicon CPU, so the 128 projections take a quarter of an hour or so.
-``--out`` is written after every tensor and a repeated run resumes from it.
+``--out`` is written (atomically) after every tensor and a repeated run resumes from it, but only if the
+imatrix content and the checkpoint are the ones the report was made from; ``--activations`` scores are
+merged under the same check.
 """
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -51,7 +55,7 @@ FORMATS = (Q4, Q5)
 # Roles with both a Q4 and a Q5 registered kernel for the 27B shapes, in the official recipe.
 FLEXIBLE_ROLES = ("/attention/output", "/gdn/output", "/mlp/down")
 METRICS = ("relative", "absolute", "activation")
-REPORT_VERSION = 1
+REPORT_VERSION = 2
 
 
 def qwen3_8_27b_flexible_names(layers: int = 64, full_attention_interval: int = 4) -> list[str]:
@@ -297,6 +301,49 @@ def apply_assignments(recipe, sources, assignments: Mapping[str, str]) -> None:
         recipe.assign(name, format=format, **search)
 
 
+def file_sha256(path: Path) -> str:
+    """Content hash of a (small) input file, so a regenerated file of the same name is not mistaken
+    for the one a report was made from."""
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def checkpoint_identity(model_dir: Path) -> str:
+    """Fingerprint of a safetensors checkpoint without reading its weights: the config, the tensor
+    index, and every shard's name and size. A different checkpoint, or a re-exported one, changes it."""
+
+    digest = hashlib.sha256()
+    for name in ("config.json", "model.safetensors.index.json"):
+        path = model_dir / name  # a single-file checkpoint has no index
+        digest.update(name.encode() + b"\0" + (path.read_bytes() if path.exists() else b"<absent>"))
+    for shard in sorted(model_dir.glob("*.safetensors")):
+        digest.update(f"{shard.name}\0{shard.stat().st_size}\0".encode())
+    return digest.hexdigest()
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Write ``text`` so that an interruption leaves either the old file or the new one, never half."""
+
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def require_same_inputs(found: Mapping, expected: Mapping, keys: Sequence[str], where: Path) -> None:
+    """Refuse a report whose recorded inputs differ from this run's (stale scores are never merged)."""
+
+    differing = [key for key in keys if found.get(key) != expected.get(key)]
+    if differing:
+        raise ValueError(
+            f"{where} was made from different inputs ({', '.join(differing)}); "
+            "regenerate it, or use another --out"
+        )
+
+
 def _layer_range(text: str | None) -> range | None:
     if text is None:
         return None
@@ -305,7 +352,11 @@ def _layer_range(text: str | None) -> range | None:
 
 
 def _settings(args) -> dict:
-    return {"imatrix": Path(args.imatrix).name, "formats": list(FORMATS)}
+    return {
+        "imatrix_sha256": file_sha256(args.imatrix),
+        "checkpoint": checkpoint_identity(args.model),
+        "formats": list(FORMATS),
+    }
 
 
 def main(argv=None) -> None:
@@ -333,8 +384,9 @@ def main(argv=None) -> None:
     report = {"version": REPORT_VERSION, "settings": settings, "scores": {}}
     if args.out.exists():
         report = json.loads(args.out.read_text())
-        if report.get("version") != REPORT_VERSION or report.get("settings") != settings:
-            raise ValueError(f"{args.out} was made with different settings; use another --out")
+        if report.get("version") != REPORT_VERSION:
+            raise ValueError(f"{args.out} is from an older version of this tool; use another --out")
+        require_same_inputs(report.get("settings", {}), settings, list(settings), args.out)
     vectors = imatrix_file.load(str(args.imatrix))
     with SafetensorsSource(args.model) as base:
         model = build_model(base, components=("text",))
@@ -347,11 +399,15 @@ def main(argv=None) -> None:
                     device=args.device,
                     rows_per_chunk=args.rows_per_chunk,
                 )
-                args.out.write_text(json.dumps(report))
+                atomic_write_text(args.out, json.dumps(report))
             print(f"[{index + 1}/{len(names)}] {name}", flush=True)
     scores = {name: dict(report["scores"][name]) for name in names}
     if args.activations:
-        measured = json.loads(args.activations.read_text())["scores"]
+        activation_report = json.loads(args.activations.read_text())
+        require_same_inputs(
+            activation_report.get("settings", {}), settings, ("imatrix_sha256", "checkpoint"), args.activations
+        )
+        measured = activation_report["scores"]
         for name in names:
             if name in measured:
                 scores[name]["activation"] = measured[name]
@@ -364,7 +420,7 @@ def main(argv=None) -> None:
     report["plan"] = plan(
         scores, metric=args.metric, late_layer=args.late_layer, budget_bytes=args.budget_bytes
     )
-    args.out.write_text(json.dumps(report, indent=1))
+    atomic_write_text(args.out, json.dumps(report, indent=1))
     totals = report["plan"]["totals"]
     for label in ("baseline", "proposed"):
         item = totals[label]

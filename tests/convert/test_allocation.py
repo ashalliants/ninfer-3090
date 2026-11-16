@@ -298,3 +298,134 @@ def test_shipped_rule_is_the_measured_allocation_at_the_legacy_byte_budget():
     # Roles outside the three keep the formats they always had.
     for role, expected in (("attention/query", Q4), ("mlp/gate", Q4), ("gdn/z", Q5), ("attention/value", Q5)):
         assert qwen3_8_27b_text_format(f"text/layers/40/{role}") == expected
+
+
+def test_input_identity_changes_with_content_and_never_with_the_file_name(tmp_path):
+    from tools.convert.allocation import checkpoint_identity, file_sha256, require_same_inputs
+
+    first, second = tmp_path / "a.bin", tmp_path / "b.bin"
+    first.write_bytes(b"imatrix v1")
+    second.write_bytes(b"imatrix v1")
+    assert file_sha256(first) == file_sha256(second)
+    second.write_bytes(b"imatrix v2")
+    assert file_sha256(first) != file_sha256(second)
+
+    checkpoint = tmp_path / "ckpt"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text("{}")
+    (checkpoint / "model.safetensors.index.json").write_text('{"weight_map": {}}')
+    (checkpoint / "model-00001.safetensors").write_bytes(b"x" * 10)
+    before = checkpoint_identity(checkpoint)
+    assert checkpoint_identity(checkpoint) == before
+    (checkpoint / "model-00001.safetensors").write_bytes(b"x" * 11)        # a re-exported shard
+    assert checkpoint_identity(checkpoint) != before
+    (checkpoint / "model-00001.safetensors").write_bytes(b"x" * 10)
+    (checkpoint / "config.json").write_text('{"hidden_size": 1}')            # another config
+    assert checkpoint_identity(checkpoint) != before
+
+    require_same_inputs({"a": 1, "b": 2}, {"a": 1, "b": 2}, ("a", "b"), tmp_path / "r.json")
+    with pytest.raises(ValueError, match=r"different inputs \(b\)"):
+        require_same_inputs({"a": 1, "b": 2}, {"a": 1, "b": 3}, ("a", "b"), tmp_path / "r.json")
+    with pytest.raises(ValueError, match="different inputs"):
+        require_same_inputs({}, {"a": 1}, ("a",), tmp_path / "r.json")        # an old report with no record
+
+
+def test_atomic_write_keeps_the_old_file_when_the_replace_fails(tmp_path, monkeypatch):
+    from tools.convert.allocation import atomic_write_text
+
+    path = tmp_path / "report.json"
+    atomic_write_text(path, "old")
+    assert path.read_text() == "old" and not list(tmp_path.glob("*.tmp"))
+    monkeypatch.setattr("os.replace", lambda *a: (_ for _ in ()).throw(OSError("interrupted")))
+    with pytest.raises(OSError):
+        atomic_write_text(path, "new")
+    assert path.read_text() == "old"
+
+
+def test_activation_resume_only_trusts_layers_the_report_has_committed(tmp_path, monkeypatch):
+    import json
+
+    from tools.convert import allocation_activations as activations
+
+    settings = {"seq_len": 4, "checkpoint": "c1", "imatrix_sha256": "i1", "tokens_sha256": "t1"}
+    report_path, work = tmp_path / "report.json", tmp_path / "work"
+    work.mkdir()
+
+    report, start, saved = activations.resume_state(report_path, settings, work)
+    assert (start, saved, report["scores"]) == (0, None, {})
+
+    for index in range(3):
+        report["scores"][f"layer{index}"] = {"v": index}
+        activations.commit_layer(report, index, torch.full((2,), float(index)), report_path, work)
+    assert sorted(path.name for path in work.iterdir()) == ["hidden_2.pt"]       # earlier ones are gone
+    report, start, saved = activations.resume_state(report_path, settings, work)
+    assert start == 3 and torch.equal(torch.load(saved), torch.full((2,), 2.0))
+    assert sorted(report["scores"]) == ["layer0", "layer1", "layer2"]
+
+    # Interrupted after the hidden state was saved but before the report named it: layer 3 is not
+    # done, whatever file is lying around.
+    torch.save(torch.zeros(2), work / "hidden_3.pt")
+    _, start, saved = activations.resume_state(report_path, settings, work)
+    assert start == 3 and saved.name == "hidden_2.pt"
+
+    # Interrupted while the report is written: the old report and the hidden state it names survive.
+    report["scores"]["layer3"] = {"v": 3}
+    monkeypatch.setattr(activations, "atomic_write_text", lambda *a: (_ for _ in ()).throw(OSError("killed")))
+    with pytest.raises(OSError):
+        activations.commit_layer(report, 3, torch.ones(2), report_path, work)
+    monkeypatch.undo()
+    assert (work / "hidden_2.pt").exists()
+    reloaded, start, _ = activations.resume_state(report_path, settings, work)
+    assert start == 3 and "layer3" not in reloaded["scores"]
+
+    # A report from other inputs, or whose hidden state has gone, is refused rather than merged.
+    for key in settings:
+        with pytest.raises(ValueError, match="different inputs"):
+            activations.resume_state(report_path, {**settings, key: "other"}, work)
+    (work / "hidden_2.pt").unlink()
+    with pytest.raises(ValueError, match="is missing"):
+        activations.resume_state(report_path, settings, work)
+    assert json.loads(report_path.read_text())["completed_layers"] == 3
+
+
+def test_main_refuses_a_report_or_activation_scores_made_from_other_inputs(tmp_path, monkeypatch):
+    import json
+
+    from safetensors.torch import save_file
+
+    from tools.convert.allocation import checkpoint_identity, file_sha256
+
+    entry = {"shape": [2, 64], "weighted": False, "energy": 1.0,
+             "error": {Q4: 0.1, Q5: 0.01}, "bytes": {Q4: 1, Q5: 2}}
+    scored = []
+    monkeypatch.setattr(allocation, "score_parameter", lambda *a, **k: scored.append(1) or dict(entry))
+    imatrix = tmp_path / "imatrix.safetensors"
+    save_file({"text/layers/0/mlp/down": torch.ones(64)}, str(imatrix))
+    out = tmp_path / "report.json"
+    with _checkpoint(tmp_path / "source", _config(), {}):
+        model_dir = tmp_path / "source"
+        base = ["--model", str(model_dir), "--imatrix", str(imatrix), "--out", str(out)]
+        allocation.main(base)
+        assert len(scored) == 4 and json.loads(out.read_text())["settings"]["checkpoint"] == checkpoint_identity(model_dir)
+
+        scored.clear()
+        allocation.main(base)                       # same inputs: resumes, scores nothing new
+        assert scored == []
+
+        # A regenerated imatrix with the same name is a different input; the old scores are not kept.
+        save_file({"text/layers/0/mlp/down": torch.full((64,), 2.0)}, str(imatrix))
+        with pytest.raises(ValueError, match=r"different inputs \(imatrix_sha256\)"):
+            allocation.main(base)
+        assert scored == []
+        save_file({"text/layers/0/mlp/down": torch.ones(64)}, str(imatrix))
+
+        # Activation scores from another checkpoint or imatrix are not merged.
+        activations = tmp_path / "activations.json"
+        good = {"imatrix_sha256": file_sha256(imatrix), "checkpoint": checkpoint_identity(model_dir)}
+        for key in good:
+            activations.write_text(json.dumps({"settings": {**good, key: "other"}, "scores": {}}))
+            with pytest.raises(ValueError, match=f"different inputs \\({key}\\)"):
+                allocation.main([*base[:-2], "--out", str(tmp_path / f"{key}.json"), "--activations", str(activations)])
+        activations.write_text(json.dumps({"settings": good, "scores": {}}))
+        allocation.main([*base[:-2], "--out", str(tmp_path / "ok.json"), "--activations", str(activations)])
+        assert json.loads((tmp_path / "ok.json").read_text())["plan"]["metric"] == "relative"
