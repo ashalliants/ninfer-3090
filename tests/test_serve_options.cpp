@@ -759,8 +759,13 @@ int main() {
     // Every one of these parses without error whether or not the service carries it to the Engine,
     // so the mapping from parsed options to Engine options is what has to be checked.
     const ninfer::EngineOptions default_engine = make_engine_options(defaults);
-    failures += check(!default_engine.prefill_cublas && default_engine.prefill_cublas_projections,
-                      "the cuBLAS prefill route is on by default in serving");
+    failures += check(default_engine.prefill_cublas == ninfer::kPrefillCublasDefault &&
+                          default_engine.prefill_cublas_projections,
+                      "the cuBLAS prefill route does not start at the build's default in serving");
+    const ninfer::EngineOptions route_off =
+        make_engine_options(parse({"ninfer-serve", "model.ninfer", "--no-prefill-cublas"}));
+    failures += check(!route_off.prefill_cublas,
+                      "--no-prefill-cublas did not reach the Engine options");
     const ServeOptions route =
         parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
                "--prefill-cublas", "--no-prefill-cublas-projections"});
@@ -770,7 +775,8 @@ int main() {
                       "--spec and --draft-tokens did not reach the Engine options");
     failures += check(route_engine.prefill_cublas && !route_engine.prefill_cublas_projections,
                       "the cuBLAS prefill controls did not reach the Engine options");
-    for (const char* flag : {"--prefill-cublas", "--no-prefill-cublas-projections"}) {
+    for (const char* flag :
+         {"--prefill-cublas", "--no-prefill-cublas", "--no-prefill-cublas-projections"}) {
         failures += check(kv_help.find(flag) != std::string::npos,
                           "serve help omits an accepted prefill control");
     }

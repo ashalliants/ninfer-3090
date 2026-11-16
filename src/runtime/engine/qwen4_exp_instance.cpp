@@ -270,7 +270,8 @@ void validate(const EngineOptions& options) {
                "--host-context-mib, or 0 to turn prefix reuse off)");
     }
     if (options.lm_head_q4 || options.lm_head_q6 || options.embedding_q4 || options.embedding_q6 ||
-        options.mtp_experts_q4 || options.mlp_a8_decode || options.prefill_cublas || options.gdn_state_fp16 || !options.prefill_a8 ||
+        options.mtp_experts_q4 || options.mlp_a8_decode ||
+        options.prefill_cublas != ninfer::kPrefillCublasDefault || options.gdn_state_fp16 || !options.prefill_a8 ||
         !options.prefill_cublas_projections) {
         refuse("its weights are the GGUF's, stored exactly: remove the load-time weight flags (--lm-head-q4/q6, "
                "--embedding-q4/q6, --mtp-experts-q4, --mlp-a8-decode, --prefill-cublas, --gdn-state-fp16, "

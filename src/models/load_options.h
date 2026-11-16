@@ -27,8 +27,9 @@ struct LoadOptions {
     // Clearing this returns full prefill tiles to their A16 routes; see EngineOptions::prefill_a8.
     bool prefill_a8 = true;
     // See EngineOptions::prefill_cublas: hands wide prefill GEMMs to cuBLAS, a further quality
-    // trade on top of prefill_a8 and therefore off unless asked for.
-    bool prefill_cublas = false;
+    // trade on top of prefill_a8 and therefore off unless asked for -- except on sm_70, where the
+    // route is FP16 and exact in its scales (kPrefillCublasDefault).
+    bool prefill_cublas = ninfer::kPrefillCublasDefault;
     // See EngineOptions::prefill_cublas_projections.
     bool prefill_cublas_projections = true;
     // Store the GDN recurrent state in FP16 between steps; the recurrence still computes in FP32.

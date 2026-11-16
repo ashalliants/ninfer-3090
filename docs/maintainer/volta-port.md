@@ -1,6 +1,7 @@
 # Tesla V100 (sm_70) port
 
-Status: **runs on a V100**: decode is tuned (see "Decode"); prefill still runs on emulated `mma`.
+Status: **runs on a V100**: decode is tuned (see "Decode"); prefill's wide GEMMs run on the
+tensor cores through cuBLAS (see "Prefill"), its attention and GDN recurrence still on emulated `mma`.
 
 The engine's kernels are written against Ampere: `cp.async`, `ldmatrix`, `mma.sync.m16n8kK` for
 BF16, FP16, TF32, INT8 and INT4. Volta has none of them (its tensor cores run FP16 `m8n8k4` only),
@@ -35,8 +36,8 @@ kernel that spends its time in `mma` runs at roughly 6-9 TFLOP/s on a V100 inste
 - **Small T (2-16, MTP / DFlash verification)** is where the 3090 route tables pick `mma`
   schedules. These are tuned for sm_86 and are the first thing to re-measure; several formats
   also have `*_simt` schedules that may win on Volta.
-- **Prefill** is compute-bound and runs entirely on emulated `mma`. A real FP16 HMMA path is the
-  follow-up that matters most for prompt processing.
+- **Prefill** is compute-bound. Its wide GEMMs run on HMMA through cuBLAS (see "Prefill"); the
+  prompt attention, GDN chunked recurrence and the sub-129-token tails still run emulated `mma`.
 - `cp.async` is a synchronous copy, so the multi-stage global-to-shared pipelines lose their
   overlap. Occupancy hides some of it.
 
@@ -145,6 +146,35 @@ overhead of ~690 launches per token (~1.2 ms of gaps plus ramp/tail), and the GD
 read rate in the model (1477 -> 1309 us); its decode is the most ALU-heavy of the three formats,
 so back-to-back microbenchmarks that hold the 200 W power cap understate it.
 
+### Prefill
+
+The wide prefill GEMMs run on the tensor cores through cuBLAS, by default. The cuBLAS prefill
+route (`ops/linear_swiglu/q4cublas/w4_cublas_prefill.cu`, `--prefill-cublas`) is an opt-in quality
+trade on the 3090 because it materialises the weight as int8 with one scale per row and quantises
+the activations; Volta has no integer tensor cores, so on sm_70 the same route (`kFp16Route`)
+materialises the weight as FP16 -- code times its exact group scale, one rounding -- carries the
+activations as FP16 under a per-token power-of-two scale, and runs `cublasGemmEx` FP16 x FP16 ->
+FP32 on HMMA. Activation preparation, the GEMM call and the workspace switch on that constant;
+token tiling, the parents and destinations, and the SwiGLU / store / residual epilogues are shared
+(they read FP32 where the int8 route reads int32, with a row scale of 1).
+
+That makes it more accurate than the routes it replaces, not less:
+
+| | relative L2 vs fp64 (op test) | perplexity, 2,292 tokens (ctx 1024) |
+|---|---|---|
+| A16 reference / default integer routes | 0.007-0.020 | 6.009389 |
+| FP16 cuBLAS route | 0.0011-0.0020 | 6.009804 (+0.007%) |
+
+so `kPrefillCublasDefault` (`include/ninfer/types.h`) turns it on in sm_70 builds and
+`--no-prefill-cublas` turns it off; every other target keeps the int8 route opt-in. Qwen3.8-27B,
+402-token prompt: 80 -> 623 tok/s (the int8 route measured 488 here, its GEMM on `dp4a`). After the
+change the cuBLAS GEMM is about half of prefill time, the FP16 weight materialisation ~16% (it is
+weight-sized, so a larger `--prefill-chunk` amortises it), and the GDN chunked recurrence ~9%
+(emulated TF32/BF16 `mma`).
+
+Thermals: sustained prefill holds the card at its 200 W cap and took a passively cooled V100 from
+40 to 75 C in about a minute; measure in short runs without forced airflow.
+
 ### Why there is no HMMA path yet
 
 The PTX `mma.m8n8k4` computes four independent 8x8x4 products per warp, one per octet (lanes
@@ -202,7 +232,7 @@ Qwen3.8-Flash-Next. A 32 GB V100 holds the 27B (19 GiB) with room for KV; the Bo
    `linear_add` and SwiGLU suites have run so far.
 2. Measure small-T on the other models (MTP / DFlash verification on the 27B is done: see "Decode"), and re-pick the sm_86 route tables where an `mma`
    route loses to a SIMT one on Volta (`docs/maintainer/linear-tuning.md` has the method).
-3. A Volta prefill path with real tensor cores (FP16 `wmma` GEMM for the dequantised weight tile,
-   FP16 attention), keeping BF16 storage with a bounded range (activations can exceed FP16's 65504).
+3. The rest of prefill on tensor cores: prompt attention (FP16), the GDN chunked recurrence, and
+   the narrow (< 129 token) tails, which still take the emulated small-T and A8 routes.
 4. Calibrate `context_cost_defaults.cpp` for the card (`ninfer_context_cost_bench`); until then the
    generic transfer and prefill costs apply.

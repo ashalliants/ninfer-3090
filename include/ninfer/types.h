@@ -718,6 +718,17 @@ struct ModelSuspendOptions {
     bool auto_resume = true;
 };
 
+// Whether EngineOptions::prefill_cublas starts on. On sm_70 builds the route runs in FP16 on the
+// tensor cores with every group scale exact (ops/linear_swiglu/q4cublas/w4_cublas_prefill.cu), so
+// it is not a quality trade there -- +0.007% perplexity against the A16 reference on a V100, 7.6x
+// faster -- and the integer routes it replaces run emulated mma; elsewhere it is the int8 trade
+// and stays opt-in. Keyed on the build's target, which every in-tree consumer of this header shares.
+#if defined(NINFER_SM70)
+inline constexpr bool kPrefillCublasDefault = true;
+#else
+inline constexpr bool kPrefillCublasDefault = false;
+#endif
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
@@ -823,7 +834,8 @@ struct EngineOptions {
     // runs about twice as fast (ops/linear_swiglu/q4cublas/w4_cublas_prefill.h) and is a further
     // quality trade on top of prefill_a8 -- hence off by default. Its dequantise pass is
     // weight-sized, so it wants a large prefill_chunk to amortise; the two belong together.
-    bool prefill_cublas                    = false;
+    // On sm_70 it is FP16, exact in its scales, and on by default: see kPrefillCublasDefault.
+    bool prefill_cublas                    = kPrefillCublasDefault;
     // Extends prefill_cublas to the attention and GDN input projections, which hold about a fifth
     // of the linear parameters. Worth +13% prefill for +0.071% perplexity on top of what the route
     // already costs, the GDN half carrying nearly all of both. Separable because that is a

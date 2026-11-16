@@ -250,7 +250,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--models-dir DIR] [--models-preset FILE] [--models-max N] [--no-models-autoload] "
            "[--unload-idle-seconds N] "
            "[--mlp-a8-decode] [--no-prefill-a8] "
-           "[--prefill-cublas [--no-prefill-cublas-projections]] "
+           "[--prefill-cublas | --no-prefill-cublas] [--no-prefill-cublas-projections] "
            "[--no-thinking] [--preserve-thinking] [--tolerant-tool-calls] "
            "[--graft NAME=PATH]... [--default-graft NAME] "
            "[--reasoning-effort minimal|low|medium|high|xhigh|max] [--cors] "
@@ -346,8 +346,10 @@ std::string serve_usage_text(const char* argv0) {
            "min(0.06 x max_context, N) tokens, at least 1500 (default 8000)\n"
            "       --prefill-cublas hands wide prefill GEMMs to cuBLAS: a large prefill speedup for a "
            "small perplexity cost (docs/performance.md), off by default, and it wants a larger "
-           "--prefill-chunk to pay; --no-prefill-cublas-projections keeps the attention and GDN "
-           "input projections off that route\n"
+           "--prefill-chunk to pay; in sm_70 (Tesla V100) builds it is FP16, exact in its scales, "
+           "and on by default, and --no-prefill-cublas turns it off; "
+           "--no-prefill-cublas-projections keeps the attention and GDN input projections off that "
+           "route\n"
            "       Qwen3.8-Flash-Next (one or two requests at once, --kv-dtype int8; \"the same "
            "output\" below is what an option is designed to keep, not yet checked on a GPU): prefix "
            "reuse keeps "
@@ -1207,6 +1209,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.prefill_a8 = false;
         } else if (arg == "--prefill-cublas") {
             options.prefill_cublas = true;
+        } else if (arg == "--no-prefill-cublas") {
+            options.prefill_cublas = false;
         } else if (arg == "--no-prefill-cublas-projections") {
             options.prefill_cublas_projections = false;
         } else if (arg == "--chat-template") {
