@@ -88,20 +88,23 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     static_assert(PVNtPerWarp == 2 || PVNtPerWarp == 4 || PVNtPerWarp == 8 || PVNtPerWarp == 16);
     static_assert(QKKs == Groups * GroupKc);
 
-    // sm_70 has no tensor-core s8 mma, so mma_s8/ldmatrix are emulated with warp shuffles, and the
-    // producer warp's QK above becomes a chain of ~2,300 dependent shuffles per 32-key tile while
-    // the other warps wait at the tile barrier (nsys/ncu on a V100: the decode partial kernel's
-    // critical path). With one row tile (decode, T <= 2 on the 27B) the whole CTA instead computes
-    // the per-group int8 dot products with dp4a -- one (row, key) pair per thread -- and parks them
-    // in the K tile's shared memory, which QK no longer needs; the producer warp reads its fragment
-    // positions from there and everything after QK (scaling, masking, softmax, P, PV) is shared.
+    // sm_70 has no tensor-core s8 mma, so mma_s8 / mma_f16 / ldmatrix are emulated with warp
+    // shuffles: the producer warp's QK becomes a chain of ~2,300 dependent shuffles per 32-key
+    // tile while the other warps wait at the tile barrier, and PV costs each warp ~4,400
+    // instructions per tile (nsys/ncu on a V100: the decode partial kernel's critical path). With
+    // one row tile (decode, T <= 2 on the 27B), SimtDecode instead
+    //   * computes the per-group int8 QK dots on the whole CTA with dp4a -- one (row, key) pair per
+    //     thread -- and parks them in the K tile's shared memory, which QK no longer needs; the
+    //     producer warp reads its mma fragment positions from there (bit-identical integers);
+    //   * accumulates PV on the CUDA cores into the same fragment positions, in FP32.
+    // Staging, scaling, masking, softmax, P and the epilogue stay shared with every target.
 #if defined(NINFER_SM70)
-    constexpr bool SimtQk = RowTiles == 1;
+    constexpr bool SimtDecode = RowTiles == 1;
 #else
-    constexpr bool SimtQk = false;
+    constexpr bool SimtDecode = false;
 #endif
     // int32 dots [Br][Bc][Groups] in the K tile: Br * Bc * Groups * 4 bytes == Bc * D when Br == 16.
-    static_assert(!SimtQk || Br * Bc * Groups * 4 <= Bc * D);
+    static_assert(!SimtDecode || Br * Bc * Groups * 4 <= Bc * D);
 
     // Keep Q in a compact dedicated tile so the producer can reload one
     // 64-dimension group at a time instead of carrying all eight fragments in
@@ -580,7 +583,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             }
         }
 
-        if constexpr (SimtQk) {
+        if constexpr (SimtDecode) {
             // Every thread takes (row, key) pairs, key fastest, so a warp's 16-byte K reads span
             // eight swizzle phases (conflict-free) and its Q reads broadcast one row.
             constexpr int PairsPerThread = (RowCount * Bc + Threads - 1) / Threads;
@@ -635,7 +638,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 score[nt][3] = 0.0f;
             }
 
-            if constexpr (SimtQk) {
+            if constexpr (SimtDecode) {
                 // The fragment positions mma_s8 would have produced: rows gid / gid + 8, keys
                 // nt * 8 + 2 * lid (+1). Rows past RowCount hold stale bytes; they are masked to
                 // -inf below exactly as before.
@@ -856,24 +859,60 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             acc[n][3] *= alpha1;
         }
 
+        if constexpr (SimtDecode) {
+            // P V on the CUDA cores, into the exact fragment positions mma_f16 accumulates (rows
+            // gid / gid + 8, columns global_n * 8 + 2 * lid and + 1), with FP32 accumulation as
+            // the tensor core does. Emulated, each mma_f16 + ldmatrix pair cost the warp ~4,400
+            // instructions per tile; this is ~20 per key. Rows past RowCount are compile-time
+            // padding and skipped.
+            const int row0 = consumer_row_base + gid;
+            const int row1 = row0 + 8;
+#pragma unroll 4
+            for (int key = 0; key < Bc; ++key) {
+                const float p0 = row0 < RowCount
+                                     ? __half2float(p_consumer[gid * Bc + causal_small_t_tc_swz32(gid, key)])
+                                     : 0.0f;
+                float p1 = 0.0f;
+                if constexpr (RowCount > 8) {
+                    if (row1 < RowCount) {
+                        p1 = __half2float(
+                            p_consumer[(gid + 8) * Bc + causal_small_t_tc_swz32(gid + 8, key)]);
+                    }
+                }
+                const __half* v_row = &v_f16[key * D];
 #pragma unroll
-        for (int n = 0; n < PVNtPerWarp; ++n) {
-            const int global_n = consumer_slice * PVNtPerWarp + n;
+                for (int n = 0; n < PVNtPerWarp; ++n) {
+                    const int global_n = consumer_slice * PVNtPerWarp + n;
+                    const float2 v     = __half22float2(*reinterpret_cast<const __half2*>(
+                        &v_row[causal_small_t_tc_swz(key, global_n * 8) + 2 * lid]));
+                    acc[n][0]          = fmaf(p0, v.x, acc[n][0]);
+                    acc[n][1]          = fmaf(p0, v.y, acc[n][1]);
+                    if constexpr (RowCount > 8) {
+                        acc[n][2] = fmaf(p1, v.x, acc[n][2]);
+                        acc[n][3] = fmaf(p1, v.y, acc[n][3]);
+                    }
+                }
+            }
+        } else {
 #pragma unroll
-            for (int k = 0; k < PVKs; ++k) {
-                unsigned pf[4];
-                const int pcol = k * 16 + a_coloff;
-                ldmatrix_x4(
-                    pf[0], pf[1], pf[2], pf[3],
-                    smem_addr(
-                        &p_consumer[a_rowoff * Bc + causal_small_t_tc_swz32(a_rowoff, pcol)]));
-                unsigned vf[2];
-                const int vrow = k * 16 + b_koff + b_rin;
-                const int vcol = global_n * 8;
-                ldmatrix_x2_t(vf[0], vf[1],
-                              smem_addr(&v_f16[vrow * D + causal_small_t_tc_swz(vrow, vcol)]));
-                mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
-                        vf[0], vf[1]);
+            for (int n = 0; n < PVNtPerWarp; ++n) {
+                const int global_n = consumer_slice * PVNtPerWarp + n;
+#pragma unroll
+                for (int k = 0; k < PVKs; ++k) {
+                    unsigned pf[4];
+                    const int pcol = k * 16 + a_coloff;
+                    ldmatrix_x4(
+                        pf[0], pf[1], pf[2], pf[3],
+                        smem_addr(
+                            &p_consumer[a_rowoff * Bc + causal_small_t_tc_swz32(a_rowoff, pcol)]));
+                    unsigned vf[2];
+                    const int vrow = k * 16 + b_koff + b_rin;
+                    const int vcol = global_n * 8;
+                    ldmatrix_x2_t(vf[0], vf[1],
+                                  smem_addr(&v_f16[vrow * D + causal_small_t_tc_swz(vrow, vcol)]));
+                    mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
+                            vf[0], vf[1]);
+                }
             }
         }
         if (has_next) {

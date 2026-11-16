@@ -50,6 +50,7 @@ Measured on a V100-PCIE-32GB (OCuLink Gen3 x4, 200 W cap, 879 GB/s sustained rea
 | port as first built | 16.0 |
 | + decode routes for the fused input projections and Q4 `linear_add` | 30.8 |
 | + streaming GEMV for every Q4/Q5 T = 1 linear | 40.5 |
+| + decode attention: halved split tiers, CUDA-core QK and PV at one row tile | 41.9 |
 
 The model's weight floor at 879 GB/s is 17.4 ms per token (`tools/perf_model.py`), about 57 tok/s.
 
@@ -84,10 +85,22 @@ Greedy text matches the previous build for ~150 tokens, then may take a differen
 valid continuation: the streaming GEMV sums in a different order (relative error ~1e-6 against
 fp64 on random weights). The op suites' fp32/fp64 oracles pass.
 
+**Decode attention** (`causal_attention_small_t_i8_tiled`) went from 81.5 to 31.7 us per layer at
+~430 keys. Its QK ran emulated `mma_s8` in one producer warp per CTA, a ~2,300-shuffle serial
+chain per 32-key tile with seven warps waiting at the barrier; PV ran emulated `mma_f16`. Two
+changes, both inside the shared kernel:
+
+- `CausalSmallTSplitTiers` (`small_t.cuh`) is now the one table of keys-per-split tiers that the
+  device policy and the host launch capacity both read; sm_70 halves every tier, so more CTAs each
+  carry a shorter serial chain (81.5 -> 53.2 us).
+- `SimtDecode` (`small_t_i8.cuh`, one row tile only): the whole CTA computes the int8 QK dots with
+  `dp4a` into the consumed K tile, the producer reads its fragment positions from there, and PV
+  accumulates on the CUDA cores into the same fragment positions (53.2 -> 31.7 us). Everything
+  else in the kernel is shared. Greedy output is byte-identical.
+
 What is left in decode, by size: the GEMVs' gap to the read rate (~3.5 ms), the per-kernel
-overhead of ~690 launches per token (~1.2 ms of gaps plus ramp/tail), the INT8 decode attention
-(`causal_attention_small_t_i8`, emulated `mma`, ~1.3 ms at depth 500, growing with depth), and the
-Q6 LM head at 77%.
+overhead of ~690 launches per token (~1.2 ms of gaps plus ramp/tail), the Q6 LM head at 77%
+(~1.5 ms), and the GDN recurrent update (~0.5 ms, 32% of its byte rate).
 
 ### Why there is no HMMA path yet
 
