@@ -17,7 +17,7 @@ emulates the instructions underneath it.
 | Shared-memory limit | `ops/common/smem_limit.h`, `NINFER_SM70` from CMake | `kMaxDynamicSharedBytes` is 96 KiB on Volta and 99 KiB elsewhere. Every schedule static-asserts against it, so a schedule that cannot launch fails to compile |
 | Build gates | root `CMakeLists.txt`, `src/ops/CMakeLists.txt`, `softmax_attention/sources.cmake`, the Qwen3.5 startup check | arch 70 takes the sm_8x path (no PDL, FP8 A8 and NVFP4 A4 stubbed) |
 | `sigmoid_approx` | `ops/common/math.cuh` | `tanh.approx` is sm_75; Volta uses `1 / (1 + exp(-x))` |
-| Decode GEMVs | `ops/linear/common/stream_gemv.cuh` (+ `stream_gemv_decode.cuh`, `Q4StreamFormat` / `Q5StreamFormat` in the row-split storage headers) | every Q4/Q5 T = 1 GEMV, routed from `launch_q4_a16_gemv`, `launch_q5_a16_gemv`, the Q4 SwiGLU pair and the Q5 residual linear. See "Decode" below |
+| Decode GEMVs | `ops/linear/common/stream_gemv.cuh` (+ `stream_gemv_decode.cuh`, `Q4StreamFormat` / `Q5StreamFormat` / `Q6StreamFormat` in the row-split storage headers) | every Q4/Q5 T = 1 GEMV, routed from `launch_q4_a16_gemv`, `launch_q5_a16_gemv`, the Q4 SwiGLU pair and the Q5 residual linear; the Q6 T = 1 GEMV (the LM head) from `launch_q6_gemv_t1`. See "Decode" below |
 | Decode routes for the fused input projections and Q4 `linear_add` | `q4_q5_gdn_input_plan.cpp`, `q4_q5_attn_input_plan.cpp`, `q4_linear_add.cu` | T = 1..6 (input projections) and T = 1 (`linear_add`) take their GEMV/SIMT schedules instead of the emulated small-T `mma` |
 
 The mma emulations accumulate in FP32 (INT32 for the integer shapes) exactly as the instruction
@@ -51,6 +51,7 @@ Measured on a V100-PCIE-32GB (OCuLink Gen3 x4, 200 W cap, 879 GB/s sustained rea
 | + decode routes for the fused input projections and Q4 `linear_add` | 30.8 |
 | + streaming GEMV for every Q4/Q5 T = 1 linear | 40.5 |
 | + decode attention: halved split tiers, CUDA-core QK and PV at one row tile | 41.9 |
+| + streaming GEMV for the Q6 LM head | 42.1 |
 
 The model's weight floor at 879 GB/s is 17.4 ms per token (`tools/perf_model.py`), about 57 tok/s.
 
@@ -99,8 +100,10 @@ changes, both inside the shared kernel:
   else in the kernel is shared. Greedy output is byte-identical.
 
 What is left in decode, by size: the GEMVs' gap to the read rate (~3.5 ms), the per-kernel
-overhead of ~690 launches per token (~1.2 ms of gaps plus ramp/tail), the Q6 LM head at 77%
-(~1.5 ms), and the GDN recurrent update (~0.5 ms, 32% of its byte rate).
+overhead of ~690 launches per token (~1.2 ms of gaps plus ramp/tail), and the GDN recurrent update
+(~0.5 ms, 32% of its byte rate). The Q6 LM head (993 MB) runs on the streaming GEMV at 86% of the
+read rate in the model (1477 -> 1309 us); its decode is the most ALU-heavy of the three formats,
+so back-to-back microbenchmarks that hold the 200 W power cap understate it.
 
 ### Why there is no HMMA path yet
 

@@ -42,16 +42,17 @@ struct StreamDecodeConstants {
     std::uint32_t high_nibble; // bits 19..22
     std::uint32_t one;         // fp32 1.0
     std::uint32_t two;         // fp32 2.0
+    std::uint32_t four;        // fp32 4.0
     std::uint32_t bit19;
     std::uint32_t bit22;
 
     __device__ __forceinline__ static StreamDecodeConstants make() {
-        StreamDecodeConstants c{0x00078000u, 0x00780000u, 0x3f800000u,
-                                0x40000000u, 1u << 19,    1u << 22};
+        StreamDecodeConstants c{0x00078000u, 0x00780000u, 0x3f800000u, 0x40000000u,
+                                0x40800000u, 1u << 19,    1u << 22};
         // Opaque to the compiler, so it keeps them in registers instead of folding immediates.
         asm volatile(""
                      : "+r"(c.low_nibble), "+r"(c.high_nibble), "+r"(c.one), "+r"(c.two),
-                       "+r"(c.bit19), "+r"(c.bit22));
+                       "+r"(c.four), "+r"(c.bit19), "+r"(c.bit22));
         return c;
     }
 };
@@ -75,24 +76,32 @@ __device__ __forceinline__ float stream_dot_nibbles8(std::uint32_t word, const f
     return acc;
 }
 
-// Subtracts 16 * sum(bit_i * x[i]) over eight weights, bit i of `bits` being the weight at k offset
-// i (Q5's high plane). Even bits go to bit 19 under 1.0 (1 + b/16, times x' = 256x gives 16x per set
-// bit) and odd bits to bit 22 under 2.0 (2 + b, times x' = 16x gives 16x per set bit), so every set
-// bit costs one LOP3 and one FFMA and contributes exactly 16 * x. The constant part is
-// sum_even(x') + 2 * sum_odd(x'), which the caller folds into its correction.
-__device__ __forceinline__ float stream_sub_bits8(std::uint32_t bits, const float4& x0,
-                                                  const float4& x1, const StreamDecodeConstants& c,
-                                                  float acc) {
-    const std::uint32_t b21 = bits << 21, b19 = bits << 19, b17 = bits << 17, b15 = bits << 15,
-                        b13 = bits << 13;
-    acc = fmaf(stream_lop_magic(b19, c.bit19, c.one), -x0.x, acc); // bit 0 -> 19
-    acc = fmaf(stream_lop_magic(b21, c.bit22, c.two), -x0.y, acc); // bit 1 -> 22
-    acc = fmaf(stream_lop_magic(b17, c.bit19, c.one), -x0.z, acc); // bit 2 -> 19
-    acc = fmaf(stream_lop_magic(b19, c.bit22, c.two), -x0.w, acc); // bit 3 -> 22
-    acc = fmaf(stream_lop_magic(b15, c.bit19, c.one), -x1.x, acc); // bit 4 -> 19
-    acc = fmaf(stream_lop_magic(b17, c.bit22, c.two), -x1.y, acc); // bit 5 -> 22
-    acc = fmaf(stream_lop_magic(b13, c.bit19, c.one), -x1.z, acc); // bit 6 -> 19
-    acc = fmaf(stream_lop_magic(b15, c.bit22, c.two), -x1.w, acc); // bit 7 -> 22
+// Adds or subtracts Scale * sum(bit_i * x[i]) over eight weights, where the bit of the weight at
+// k offset i sits at bit Stride * i + Offset of `bits` (Q5's high plane: stride 1; Q6's two high
+// planes: stride 2, offsets 0 and 1). Scale is 16 or 32.
+//
+// Each bit is shifted to bit 19 (even i) or bit 22 (odd i) and read under a magic exponent:
+// 1 + b/16 and 2 + b against x' = 256x and 16x give 16x per set bit; doubling the magics (2.0 and
+// 4.0) gives 32x. Every set bit is one LOP3 and one FFMA, and shifts shared between weights are
+// computed once. The constant part, Mult * (sum_even(x') + 2 sum_odd(x')) with Mult = Scale / 16,
+// enters with the same sign and is folded into the caller's correction.
+template <int Stride, int Offset, int Scale, bool Subtract>
+__device__ __forceinline__ float stream_bits8(std::uint32_t bits, const float4& x0, const float4& x1,
+                                              const StreamDecodeConstants& c, float acc) {
+    static_assert(Scale == 16 || Scale == 32, "magics exist for 16x and 32x per set bit");
+    constexpr bool kDouble = Scale == 32;
+    const float xs[8]      = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        constexpr int kEvenTarget = 19, kOddTarget = 22;
+        const int target          = (i & 1) ? kOddTarget : kEvenTarget;
+        const int shift           = target - (Stride * i + Offset); // folded per unrolled i
+        const std::uint32_t moved = shift >= 0 ? bits << shift : bits >> -shift;
+        const std::uint32_t mask  = (i & 1) ? c.bit22 : c.bit19;
+        const std::uint32_t magic =
+            kDouble ? ((i & 1) ? c.four : c.two) : ((i & 1) ? c.two : c.one);
+        acc = fmaf(stream_lop_magic(moved, mask, magic), Subtract ? -xs[i] : xs[i], acc);
+    }
     return acc;
 }
 

@@ -20,6 +20,7 @@
 #include "ops/common/warp.cuh"
 #include "ops/linear/q6/q6_launch.h"
 #include "ops/linear/q6/q6_rowsplit_storage.cuh"
+#include "ops/linear/common/stream_gemv.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -197,6 +198,18 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
 } // namespace
 
 void launch_q6_gemv_t1(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    // The streaming GEMV computes the same rows bound by the weight stream where conversions are
+    // slow (sm_70 by default; ops/linear/common/stream_gemv.cuh).
+    if (x.ne[1] == 1 && w.padded_shape[1] % kGroupK == 0 &&
+        try_launch_stream_gemv<Q6StreamFormat>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            {static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.qhigh),
+             static_cast<const std::uint8_t*>(w.scales)},
+            LinearBf16StridedOutput{static_cast<__nv_bfloat16*>(out.data), out.ne[0], 0},
+            LinearIdentityEpilogue{}, out.ne[0], x.ne[0],
+            static_cast<std::int32_t>(w.padded_shape[1]), stream)) {
+        return;
+    }
     launch<1>(x, w, out, stream);
 }
 void launch_q6_gemv_t2(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {

@@ -77,8 +77,8 @@ struct Q5SimtDecodeAtom {
 // Q5 for the streaming GEMV (ops/linear/common/stream_gemv.cuh). One lane slice is 16 code bytes
 // (32 weights, nibble i of word w at k offset 8w + i) plus their four high bytes (byte w, bit i ->
 // k offset 8w + i), value n - 16 * high. stream_dot_nibbles8 adds sum(x') + sum(n x) and
-// stream_sub_bits8 subtracts sum_even(x') + 2 sum_odd(x') + 16 sum(high x), so the constant left is
-// -sum_odd(x'): the correction per weight pair is -16 x_odd.
+// stream_bits8<1, 0, 16, subtract> subtracts sum_even(x') + 2 sum_odd(x') + 16 sum(high x), so the
+// constant left is -sum_odd(x'): the correction per weight pair is -16 x_odd.
 struct Q5StreamFormat {
     static constexpr const char* kName = "q5";
     static constexpr int kGroupK       = Q5RowSplitStorage::kGroupK;
@@ -127,8 +127,8 @@ struct Q5StreamFormat {
 #pragma unroll
         for (int w = 0; w < 4; ++w) {
             acc = stream_dot_nibbles8(words[w], chunks[2 * w], chunks[2 * w + 1], c, acc);
-            acc = stream_sub_bits8((slice.high >> (8 * w)) & 0xffu, chunks[2 * w],
-                                   chunks[2 * w + 1], c, acc);
+            acc = stream_bits8<1, 0, 16, true>((slice.high >> (8 * w)) & 0xffu, chunks[2 * w],
+                                               chunks[2 * w + 1], c, acc);
         }
         return acc;
     }
