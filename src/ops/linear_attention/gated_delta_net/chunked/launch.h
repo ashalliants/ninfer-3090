@@ -9,11 +9,23 @@
 #include <cuda_bf16.h>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace ninfer::ops::detail::gated_delta_net::chunked {
 
 inline constexpr int kChunkSize = 16;
 inline constexpr int kMinTokens = 16;
+
+// The width from which gated_delta_net takes the chunked kernels rather than the sequential
+// recurrence. On sm_70 never: the chunked recurrence's TF32 and BF16 mma.sync are emulated there,
+// and the sequential kernel, which keeps the whole update in FP32, is both faster and closer to
+// exact -- Qwen3.8-27B on a V100: prefill +3.6-4% at 1k-4k-token prompts with identical greedy
+// output, and perplexity 6.00650 against 6.00980 (2,292 tokens, ctx 1024/512).
+#if defined(NINFER_SM70)
+inline constexpr int kPrefillMinTokens = std::numeric_limits<int>::max();
+#else
+inline constexpr int kPrefillMinTokens = kMinTokens;
+#endif
 inline constexpr float kNormEps = 1.0e-6F;
 
 struct Arguments {

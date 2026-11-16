@@ -170,7 +170,10 @@ so `kPrefillCublasDefault` (`include/ninfer/types.h`) turns it on in sm_70 build
 402-token prompt: 80 -> 623 tok/s (the int8 route measured 488 here, its GEMM on `dp4a`). After the
 change the cuBLAS GEMM is about half of prefill time, the FP16 weight materialisation ~16% (it is
 weight-sized, so a larger `--prefill-chunk` amortises it), and the GDN chunked recurrence ~9%
-(emulated TF32/BF16 `mma`).
+(emulated TF32/BF16 `mma`) -- which sm_70 no longer takes: `chunked::kPrefillMinTokens` sends every
+prompt through the sequential FP32 recurrence, +3.6-4% prefill at 1k-4k tokens with identical
+greedy output and perplexity 6.00650 vs 6.00980 (an idea from geoffwatts/ninfer-v100, measured
+here).
 
 **Chunk size and the narrow tail.** `--prefill-chunk` past the default 1,024 is worth 1-4% here
 (Qwen3.8-27B, 2k and 4k prompts, chunks 1,024 / 2,048 / 4,096: 796-802 and 748-774 tok/s). What
@@ -253,6 +256,6 @@ Qwen3.8-Flash-Next. A 32 GB V100 holds the 27B (19 GiB) with room for KV; the Bo
    `linear_add` and SwiGLU suites have run so far.
 2. Measure small-T on the other models (MTP / DFlash verification on the 27B is done: see "Decode"), and re-pick the sm_86 route tables where an `mma`
    route loses to a SIMT one on Volta (`docs/maintainer/linear-tuning.md` has the method).
-3. The rest of prefill on tensor cores: prompt attention (FP16) and the GDN chunked recurrence.
+3. The rest of prefill on tensor cores: prompt attention (FP16).
 4. Calibrate `context_cost_defaults.cpp` for the card (`ninfer_context_cost_bench`); until then the
    generic transfer and prefill costs apply.
