@@ -86,8 +86,18 @@ struct RouteSpec {
 //   r32/c32    209.9 209..211 197.6 197..199 201.7 200..203 201.7 201..203 191.5 189..193
 //
 // so it takes all of 1..32 and the r32/c32 tile serves nothing.
+#if defined(NINFER_SM70)
+// sm_70: Volta emulates mma.sync (ops/common/volta_compat.cuh), so SmallTMma is compute-bound on
+// the emulation at decode widths: profiled on a V100-PCIE-32GB (Qwen3.8-27B decode, nsys) it cost
+// ~394 us per call at T=1 (q5_small_t_mma 212 us + q4_ksplit 182 us). ParentSplitFixed is GEMV at
+// T=1 and SIMT through T=6 (sliced-K MMA from T=7), so it takes 1..6.
+constexpr std::array<RouteSpec, 6> kRoutes{{
+    {{1, 6}, Q4Q5AttnInputScheduleId::ParentSplitFixed},
+    {{7, 32}, Q4Q5AttnInputScheduleId::SmallTMma},
+#else
 constexpr std::array<RouteSpec, 5> kRoutes{{
     {{1, 32}, Q4Q5AttnInputScheduleId::SmallTMma},
+#endif
     {{33, 64}, Q4Q5AttnInputScheduleId::MixedR32C64S3},
     {{65, 127}, Q4Q5AttnInputScheduleId::MixedR64C128S2},
     {{128, 192}, Q4Q5AttnInputScheduleId::MixedR32C64S3},

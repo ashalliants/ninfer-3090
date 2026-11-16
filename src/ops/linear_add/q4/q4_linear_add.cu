@@ -326,6 +326,13 @@ Q4LinearAddLaunch select_q4_linear_add(std::int32_t rows, std::int32_t k, std::i
     // against ksplit24 to 24 and mma_r32_c32 above (median of 15, us):
     //   K=6144   T=17 52.2 vs 69.6   T=24 53.2 vs 71.7   T=25 54.3 vs 100.4  T=32 68.6 vs 94.2
     //   K=17408  T=17 118.8 vs 152.6 T=24 133.1 vs 197.6 T=25 134.1 vs 267.3 T=32 147.5 vs 247.8
+#if defined(NINFER_SM70)
+    // Decode on sm_70. ksplit4 wins T=1 on sm_86 by 18% over the GEMV, but Volta emulates its
+    // mma.sync (ops/common/volta_compat.cuh), and a T=1 tile still pays for 16 padded columns of
+    // that emulation: profiled on a V100-PCIE-32GB (Qwen3.8-27B decode, nsys), ksplit4 took 398 us
+    // per call at K=17408 against the ~56 us its weight stream costs. The GEMV issues no mma.
+    if (tokens == 1) return q4_linear_add_gemv_launch;
+#endif
     if (tokens <= 4) return q4_linear_add_ksplit4_launch;
     if (tokens <= 8) return q4_linear_add_ksplit8_launch;
     if (tokens <= 16) return q4_linear_add_small_t_c16_launch;

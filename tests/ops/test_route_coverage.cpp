@@ -224,8 +224,12 @@ int main() {
                         "attn_input_proj.q4_q5.grouped_homogeneous_pair.mma.r32.c64.s4",
                         "attn_input_proj.q4_q5.mixed.r32.c32.s2",
                         "attn_input_proj.q4_q5.pair.r32.c64.s3",
-                        "attn_input_proj.q4_q5.pair.r32.c64.s4",
-                        "attn_input_proj.q4_q5.parent_split_fixed"}));
+                        "attn_input_proj.q4_q5.pair.r32.c64.s4"
+#if !defined(NINFER_SM70)
+                        ,
+                        "attn_input_proj.q4_q5.parent_split_fixed"
+#endif
+                       }));
 
     std::size_t total = 0;
     bool identity_changed = false;
@@ -280,10 +284,16 @@ int main() {
     //                          ParentSplitFixed since 2026-09-11, when the small-T MMA took
     //                          1..8 from it (q4_q5_attn_input_plan.cpp), and upstream's
     //                          MixedR32C32S2 from the 2026-10-09 catch-up, never measured here.
+    //                          On sm_70 ParentSplitFixed is routed again (1..6, because Volta
+    //                          emulates the small-T MMA), so the Volta build pins 4 here and 40.
     //
     // All of them are kept on purpose: deleting an upstream schedule costs merge effort at every
     // future catch-up for no measured gain here. The point is that the set is written down.
+#if defined(NINFER_SM70)
+    constexpr std::size_t kExpectedUnrouted = 40;
+#else
     constexpr std::size_t kExpectedUnrouted = 41;
+#endif
     if (total != kExpectedUnrouted) {
         std::cerr << "route coverage changed: " << total << " unrouted schedules, expected "
                   << kExpectedUnrouted
