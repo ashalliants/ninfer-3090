@@ -523,8 +523,11 @@ What the rows say:
   official_recipes.py`): attention output Q5 from layer 23, GDN output from 24, MLP down from 30, Q4
   before; every other projection is unchanged. The previous layer rule stays as
   `qwen3_8_27b_legacy_text_format`, the byte budget and baseline of `tools.convert.allocation`. The
-  published artifact and its model card still describe the previous layout until the maintainer rebuilds
-  and republishes them; rebuild with `--recipe qwen3_8_27b` and the same sources.
+  rebuilt artifact (18,979,828,480 bytes, SHA-256 `38304957...`) was published to
+  `WarlaxZ/Qwen3.8-27B-NInfer-3090` on 2026-11-16 as commit `34998730`, with its card, manifest and
+  checksums in the same commit; the previous file stays at `d47f2732`. It reproduces the measured
+  allocation exactly: the held-out perplexity of the rebuilt file is bit-identical (4.322391) and 8
+  greedy coding answers are token-for-token identical to the measured artifact's.
 
 ## Tried and rejected: two-stage output head (Basalt X-B)
 

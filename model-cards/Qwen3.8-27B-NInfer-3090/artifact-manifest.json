@@ -3,8 +3,8 @@
   "schema_version": 2,
   "artifact": {
     "filename": "qwen3_8_27b.ninfer",
-    "bytes": 18982458624,
-    "sha256": "7f2a0086a071ee932c66106e1552d118a85cfec8ddef13c67a54cd64abb39706",
+    "bytes": 18979828480,
+    "sha256": "38304957e3e8b43122ef109e05bad1e18600f8f300e3347fda3092fc51acc381",
     "container_version": 3,
     "architecture": "Qwen3_5ForCausalLM",
     "name": "qwen3.8-27b",
@@ -68,8 +68,8 @@
       "bf16": 627,
       "fp32": 96,
       "int32": 1,
-      "q4_g64_fp16": 240,
-      "q5_g64_fp16": 190,
+      "q4_g64_fp16": 237,
+      "q5_g64_fp16": 193,
       "q6_g64_fp16": 2,
       "q8_g32_fp16": 28
     },
@@ -77,6 +77,6 @@
       "contiguous_le_v1": 724,
       "row_split_k128_v1": 460
     },
-    "payload_bytes": 18982085888
+    "payload_bytes": 18979455744
   }
 }

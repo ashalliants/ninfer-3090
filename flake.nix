@@ -164,10 +164,10 @@
       download-qwen38-27b = mkDownload {
         name = "download-qwen38-27b";
         filename = "qwen3_8_27b.ninfer";
-        revision = "d47f2732d369acaec76dc44228f67c72b081df2f";
-        url = "https://huggingface.co/WarlaxZ/Qwen3.8-27B-NInfer-3090/resolve/d47f2732d369acaec76dc44228f67c72b081df2f/qwen3_8_27b.ninfer";
-        expectedSize = 18982458624;
-        expectedSha256 = "7f2a0086a071ee932c66106e1552d118a85cfec8ddef13c67a54cd64abb39706";
+        revision = "349987303604180bef448d0accbb838b4465d862";
+        url = "https://huggingface.co/WarlaxZ/Qwen3.8-27B-NInfer-3090/resolve/349987303604180bef448d0accbb838b4465d862/qwen3_8_27b.ninfer";
+        expectedSize = 18979828480;
+        expectedSha256 = "38304957e3e8b43122ef109e05bad1e18600f8f300e3347fda3092fc51acc381";
         description = "Qwen3.8-27B NInfer model";
       };
 
