@@ -67,15 +67,35 @@ __device__ __forceinline__ bool causal_valid_q_head(int kv_head, int q_head) {
            q_head < (kv_head + 1) * Geometry::GroupSize && q_head < Geometry::QHeads;
 }
 
+// Keys per split of the small-T partial kernel's default tiers, by window (before the geometry's
+// split scale). One table for the device policy below and the host's launch capacity
+// (causal_small_t_split_upper_bound in small_t.cu), which must agree.
+//
+// sm_70 halves every tier. There the partial kernel's QK runs on emulated mma in one producer warp
+// per CTA while the other warps wait at a barrier, so a CTA's time is set by that serial chain and
+// shorter splits (more CTAs, each with less of it) win until the grid fills the card.
+struct CausalSmallTSplitTiers {
+#if defined(NINFER_SM70)
+    static constexpr int kDivisor = 2;
+#else
+    static constexpr int kDivisor = 1;
+#endif
+    static constexpr int kKeysUpTo4096   = 64 / kDivisor;
+    static constexpr int kKeysUpTo8198   = 128 / kDivisor;
+    static constexpr int kKeysUpTo16390  = 256 / kDivisor;
+    static constexpr int kKeysBeyond     = 480 / kDivisor;
+};
+
 template <typename Geometry>
 __device__ __forceinline__ int causal_small_t_default_splits(int window) {
-    int target_keys_per_split = 480 / Geometry::SmallTSplitScale;
+    using Tiers               = CausalSmallTSplitTiers;
+    int target_keys_per_split = Tiers::kKeysBeyond / Geometry::SmallTSplitScale;
     if (window <= 4096) {
-        target_keys_per_split = 64 / Geometry::SmallTSplitScale;
+        target_keys_per_split = Tiers::kKeysUpTo4096 / Geometry::SmallTSplitScale;
     } else if (window <= 8198) {
-        target_keys_per_split = 128 / Geometry::SmallTSplitScale;
+        target_keys_per_split = Tiers::kKeysUpTo8198 / Geometry::SmallTSplitScale;
     } else if (window <= 16390) {
-        target_keys_per_split = 256 / Geometry::SmallTSplitScale;
+        target_keys_per_split = Tiers::kKeysUpTo16390 / Geometry::SmallTSplitScale;
     }
     constexpr int kMinSplits = 4 * Geometry::SmallTSplitScale;
     int splits               = div_up(window, target_keys_per_split);

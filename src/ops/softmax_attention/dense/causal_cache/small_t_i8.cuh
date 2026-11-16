@@ -88,6 +88,21 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     static_assert(PVNtPerWarp == 2 || PVNtPerWarp == 4 || PVNtPerWarp == 8 || PVNtPerWarp == 16);
     static_assert(QKKs == Groups * GroupKc);
 
+    // sm_70 has no tensor-core s8 mma, so mma_s8/ldmatrix are emulated with warp shuffles, and the
+    // producer warp's QK above becomes a chain of ~2,300 dependent shuffles per 32-key tile while
+    // the other warps wait at the tile barrier (nsys/ncu on a V100: the decode partial kernel's
+    // critical path). With one row tile (decode, T <= 2 on the 27B) the whole CTA instead computes
+    // the per-group int8 dot products with dp4a -- one (row, key) pair per thread -- and parks them
+    // in the K tile's shared memory, which QK no longer needs; the producer warp reads its fragment
+    // positions from there and everything after QK (scaling, masking, softmax, P, PV) is shared.
+#if defined(NINFER_SM70)
+    constexpr bool SimtQk = RowTiles == 1;
+#else
+    constexpr bool SimtQk = false;
+#endif
+    // int32 dots [Br][Bc][Groups] in the K tile: Br * Bc * Groups * 4 bytes == Bc * D when Br == 16.
+    static_assert(!SimtQk || Br * Bc * Groups * 4 <= Bc * D);
+
     // Keep Q in a compact dedicated tile so the producer can reload one
     // 64-dimension group at a time instead of carrying all eight fragments in
     // registers across the whole kernel. The main arena holds K i8, V i8, and
@@ -565,6 +580,47 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             }
         }
 
+        if constexpr (SimtQk) {
+            // Every thread takes (row, key) pairs, key fastest, so a warp's 16-byte K reads span
+            // eight swizzle phases (conflict-free) and its Q reads broadcast one row.
+            constexpr int PairsPerThread = (RowCount * Bc + Threads - 1) / Threads;
+            int4 dots[PairsPerThread];
+#pragma unroll
+            for (int i = 0; i < PairsPerThread; ++i) {
+                dots[i]    = make_int4(0, 0, 0, 0);
+                const int pair = tid + i * Threads;
+                if (pair < RowCount * Bc) {
+                    const int row        = pair / Bc;
+                    const int key_l      = pair - row * Bc;
+                    const auto* q_row    = reinterpret_cast<const int4*>(q_i8 + row * D);
+                    const auto* k_row    = reinterpret_cast<const int4*>(k_i8 + key_l * D);
+                    int group_dot[Groups];
+#pragma unroll
+                    for (int g = 0; g < Groups; ++g) { group_dot[g] = 0; }
+#pragma unroll
+                    for (int c = 0; c < D / 16; ++c) {
+                        const int4 qa = q_row[c ^ (row & 7)];
+                        const int4 kb = k_row[c ^ (key_l & 7)];
+                        int& d        = group_dot[c / (kKVCacheInt8Group / 16)];
+                        d             = __dp4a(qa.x, kb.x, d);
+                        d             = __dp4a(qa.y, kb.y, d);
+                        d             = __dp4a(qa.z, kb.z, d);
+                        d             = __dp4a(qa.w, kb.w, d);
+                    }
+                    static_assert(Groups == 4, "the dot tile stores one int4 per (row, key)");
+                    dots[i] = make_int4(group_dot[0], group_dot[1], group_dot[2], group_dot[3]);
+                }
+            }
+            __syncthreads(); // every thread is done reading the K tile
+            auto* dot_tile = reinterpret_cast<int4*>(k_i8);
+#pragma unroll
+            for (int i = 0; i < PairsPerThread; ++i) {
+                const int pair = tid + i * Threads;
+                if (pair < RowCount * Bc) { dot_tile[pair] = dots[i]; }
+            }
+            __syncthreads();
+        }
+
         // One warp per row tile produces P and alpha while the remaining warps
         // stream/dequant V.
         if (warp < RowTiles) {
@@ -579,49 +635,86 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 score[nt][3] = 0.0f;
             }
 
-#pragma unroll
-            for (int g = 0; g < Groups; ++g) {
-                unsigned af[GroupKc][4];
-#pragma unroll
-                for (int kk = 0; kk < GroupKc; ++kk) {
-                    const int k    = g * GroupKc + kk;
-                    const int acol = k * 16 + a_coloff;
-                    ldmatrix_x4(
-                        af[kk][0], af[kk][1], af[kk][2], af[kk][3],
-                        smem_addr(
-                            &q_b16[(producer_row_base + a_rowoff) * DB16 +
-                                   causal_small_t_tc_swz(producer_row_base + a_rowoff, acol)]));
-                }
-
+            if constexpr (SimtQk) {
+                // The fragment positions mma_s8 would have produced: rows gid / gid + 8, keys
+                // nt * 8 + 2 * lid (+1). Rows past RowCount hold stale bytes; they are masked to
+                // -inf below exactly as before.
+                const auto* dot_tile = reinterpret_cast<const int4*>(k_i8);
+                const int row0       = producer_row_base + gid;
+                const int row1       = row0 + 8;
 #pragma unroll
                 for (int nt = 0; nt < QKNt; ++nt) {
-                    int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                    const int keya = nt * 8 + 2 * lid;
+                    const int keyb = keya + 1;
+                    const int4 d0a = row0 < RowCount ? dot_tile[row0 * Bc + keya] : make_int4(0, 0, 0, 0);
+                    const int4 d0b = row0 < RowCount ? dot_tile[row0 * Bc + keyb] : make_int4(0, 0, 0, 0);
+                    const int4 d1a = row1 < RowCount ? dot_tile[row1 * Bc + keya] : make_int4(0, 0, 0, 0);
+                    const int4 d1b = row1 < RowCount ? dot_tile[row1 * Bc + keyb] : make_int4(0, 0, 0, 0);
+                    const int c0s[Groups] = {d0a.x, d0a.y, d0a.z, d0a.w};
+                    const int c1s[Groups] = {d0b.x, d0b.y, d0b.z, d0b.w};
+                    const int c2s[Groups] = {d1a.x, d1a.y, d1a.z, d1a.w};
+                    const int c3s[Groups] = {d1b.x, d1b.y, d1b.z, d1b.w};
+#pragma unroll
+                    for (int g = 0; g < Groups; ++g) {
+                        float ka  = 0.0f;
+                        float kb2 = 0.0f;
+                        if (gid == 0) {
+                            ka  = __half2float(k_scale_s[keya * Groups + g]);
+                            kb2 = __half2float(k_scale_s[keyb * Groups + g]);
+                        }
+                        ka  = __shfl_sync(FullMask, ka, lid);
+                        kb2 = __shfl_sync(FullMask, kb2, lid);
+                        score[nt][0] += q_scale_r0[g] * ka * static_cast<float>(c0s[g]);
+                        score[nt][1] += q_scale_r0[g] * kb2 * static_cast<float>(c1s[g]);
+                        score[nt][2] += q_scale_r1[g] * ka * static_cast<float>(c2s[g]);
+                        score[nt][3] += q_scale_r1[g] * kb2 * static_cast<float>(c3s[g]);
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int g = 0; g < Groups; ++g) {
+                    unsigned af[GroupKc][4];
 #pragma unroll
                     for (int kk = 0; kk < GroupKc; ++kk) {
                         const int k    = g * GroupKc + kk;
-                        const int brow = nt * 8 + b_rin;
-                        const int bcol = k * 16 + b_koff;
-                        unsigned bf[2];
-                        ldmatrix_x2(
-                            bf[0], bf[1],
-                            smem_addr(&k_b16[brow * DB16 + causal_small_t_tc_swz(brow, bcol)]));
-                        mma_s8(c0, c1, c2, c3, af[kk][0], af[kk][1], af[kk][2], af[kk][3], bf[0],
-                               bf[1]);
+                        const int acol = k * 16 + a_coloff;
+                        ldmatrix_x4(
+                            af[kk][0], af[kk][1], af[kk][2], af[kk][3],
+                            smem_addr(
+                                &q_b16[(producer_row_base + a_rowoff) * DB16 +
+                                       causal_small_t_tc_swz(producer_row_base + a_rowoff, acol)]));
                     }
-                    const int keya = nt * 8 + 2 * lid;
-                    const int keyb = keya + 1;
-                    float ka       = 0.0f;
-                    float kb2      = 0.0f;
-                    if (gid == 0) {
-                        ka  = __half2float(k_scale_s[keya * Groups + g]);
-                        kb2 = __half2float(k_scale_s[keyb * Groups + g]);
+
+#pragma unroll
+                    for (int nt = 0; nt < QKNt; ++nt) {
+                        int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+#pragma unroll
+                        for (int kk = 0; kk < GroupKc; ++kk) {
+                            const int k    = g * GroupKc + kk;
+                            const int brow = nt * 8 + b_rin;
+                            const int bcol = k * 16 + b_koff;
+                            unsigned bf[2];
+                            ldmatrix_x2(
+                                bf[0], bf[1],
+                                smem_addr(&k_b16[brow * DB16 + causal_small_t_tc_swz(brow, bcol)]));
+                            mma_s8(c0, c1, c2, c3, af[kk][0], af[kk][1], af[kk][2], af[kk][3], bf[0],
+                                   bf[1]);
+                        }
+                        const int keya = nt * 8 + 2 * lid;
+                        const int keyb = keya + 1;
+                        float ka       = 0.0f;
+                        float kb2      = 0.0f;
+                        if (gid == 0) {
+                            ka  = __half2float(k_scale_s[keya * Groups + g]);
+                            kb2 = __half2float(k_scale_s[keyb * Groups + g]);
+                        }
+                        ka  = __shfl_sync(FullMask, ka, lid);
+                        kb2 = __shfl_sync(FullMask, kb2, lid);
+                        score[nt][0] += q_scale_r0[g] * ka * static_cast<float>(c0);
+                        score[nt][1] += q_scale_r0[g] * kb2 * static_cast<float>(c1);
+                        score[nt][2] += q_scale_r1[g] * ka * static_cast<float>(c2);
+                        score[nt][3] += q_scale_r1[g] * kb2 * static_cast<float>(c3);
                     }
-                    ka  = __shfl_sync(FullMask, ka, lid);
-                    kb2 = __shfl_sync(FullMask, kb2, lid);
-                    score[nt][0] += q_scale_r0[g] * ka * static_cast<float>(c0);
-                    score[nt][1] += q_scale_r0[g] * kb2 * static_cast<float>(c1);
-                    score[nt][2] += q_scale_r1[g] * ka * static_cast<float>(c2);
-                    score[nt][3] += q_scale_r1[g] * kb2 * static_cast<float>(c3);
                 }
             }
 
