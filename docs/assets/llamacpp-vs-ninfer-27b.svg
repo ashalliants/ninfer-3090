@@ -76,6 +76,6 @@
   <line x1="36" y1="340" x2="924" y2="340" class="nb-hair" stroke-width="1"/>
   <text x="36" y="358" font-size="11" class="nb-muted">llama.cpp: Unsloth UD-Q4_K_XL, best draft count per mode, 25 prompts &#215; 5 passes (Hsiu-Chi Tsai, 2026-08-29).</text>
   <text x="36" y="373" font-size="11" class="nb-muted">NInfer-3090: this fork&#8217;s 6-bit artifact; plain decode from ninfer_bench, speculative rows over 24 chat prompts.</text>
-  <text x="36" y="388" font-size="11" class="nb-muted">Different machines and prompts, so indicative. Unsloth&#8217;s file is closer to Q8_0 (KL divergence 0.0156 against 0.0318).</text>
+  <text x="36" y="388" font-size="11" class="nb-muted">Different machines and prompts, so indicative. Unsloth&#8217;s file is closer to Q8_0 (KL divergence 0.0156 against 0.0288).</text>
   <text x="924" y="388" font-size="11" text-anchor="end" class="nb-secondary">ashalliants/ninfer-3090</text>
 </svg>

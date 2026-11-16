@@ -14,7 +14,8 @@ rem
 rem   qwen38-27b       Qwen3.8-27B, 17.7 GiB. The default 27B for every benchmark in this repository.
 rem                    This fork's own conversion (WarlaxZ/Qwen3.8-27B-NInfer-3090, recipe
 rem                    qwen3_8_27b): the imatrix-weighted grouped_search encoder, a 4-bit embedding, a
-rem                    6-bit head and 4-bit mixer outputs and MLP down in layers 36-63. It carries the
+rem                    6-bit head, and mixer outputs and MLP down at 4 bits in the early layers and 5 bits
+rem                    from layer 23, 24 and 30 on. It carries the
 rem                    vision, MTP and DFlash2 weights, so one file serves --vision, --spec mtp and
 rem                    --spec dflash2. Executables older than the 5120x17408 Q4 linear_add route refuse
 rem                    it at startup. Figures published before 2026-10 were measured against the
@@ -112,9 +113,9 @@ exit /b 0
 set "ARTIFACT=qwen3_8_27b.ninfer"
 set "OWNER=WarlaxZ"
 set "REPO=Qwen3.8-27B-NInfer-3090"
-set "REVISION=d47f2732d369acaec76dc44228f67c72b081df2f"
-set "EXPECTED_SIZE=18982458624"
-set "EXPECTED_SHA256=7f2a0086a071ee932c66106e1552d118a85cfec8ddef13c67a54cd64abb39706"
+set "REVISION=349987303604180bef448d0accbb838b4465d862"
+set "EXPECTED_SIZE=18979828480"
+set "EXPECTED_SHA256=38304957e3e8b43122ef109e05bad1e18600f8f300e3347fda3092fc51acc381"
 set "LABEL=the Qwen3.8-27B model (17.7 GiB)"
 set "TESTS_VARIABLE=NINFER_QWEN3_8_27B_WEIGHTS"
 goto :model_selected

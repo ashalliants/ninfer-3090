@@ -46,18 +46,26 @@ Same model, same container, a different weight encoding. Upstream's
   channel (an imatrix);
 - scales may be negative, which lets a group use the full code range (−8 for Q4, −16 for Q5);
 - the layout spends fewer bytes per decoded token: a 4-bit token embedding, a 6-bit output head,
-  and 4-bit attention/GDN output projections and MLP down projections in layers 36–63.
+  and attention/GDN output projections and MLP down projections that are 4-bit in the early layers
+  and 5-bit from layer 23 (attention output), 24 (GDN output) and 30 (MLP down).
   Everything else keeps upstream's formats (Q4 query/key/gate/up, Q5 value/z/gate/down/output).
 
 Vision, MTP, DFlash2 and the 131,072-row proposal head are carried over with upstream's encoding.
+
+**Revision 2026-11-16.** The first revision of this artifact (commit `d47f2732`, SHA-256 `7f2a0086…`)
+gave those three roles Q5 in layers 0–35 and Q4 in 36–63. This revision reverses that: it puts the
+5-bit bytes where the imatrix-weighted rounding error is largest, at the same byte count, which
+lowers the KL divergence by about 9% (measurements below; pull request
+[#445](https://github.com/ashalliants/ninfer-3090/pull/445)). The old file stays available at its
+commit, and the `download-model` scripts of earlier releases still fetch it by that pin.
 
 ## Artifact
 
 | Field | Value |
 |---|---|
 | Filename | `qwen3_8_27b.ninfer` |
-| Size | 18,982,458,624 bytes (17.68 GiB); upstream's is 20,437,521,664 |
-| SHA-256 | `7f2a0086a071ee932c66106e1552d118a85cfec8ddef13c67a54cd64abb39706` |
+| Size | 18,979,828,480 bytes (17.68 GiB); upstream's is 20,437,521,664 |
+| SHA-256 | `38304957e3e8b43122ef109e05bad1e18600f8f300e3347fda3092fc51acc381` |
 | Container version | 3 |
 | Architecture | `Qwen3_5ForCausalLM` |
 | Public model name | `qwen3.8-27b` |
@@ -66,7 +74,7 @@ Vision, MTP, DFlash2 and the 131,072-row proposal head are carried over with ups
 
 ```bash
 printf '%s  %s\n' \
-  '7f2a0086a071ee932c66106e1552d118a85cfec8ddef13c67a54cd64abb39706' \
+  '38304957e3e8b43122ef109e05bad1e18600f8f300e3347fda3092fc51acc381' \
   'qwen3_8_27b.ninfer' | sha256sum --check
 ```
 
@@ -77,16 +85,23 @@ matrix the encoder used, so the artifact can be rebuilt.
 ## Measurements
 
 RTX 3090 (24 GB), CUDA 12.8, Windows. "Upstream" is `neroued/Qwen3.8-27B-NInfer` at
-`1cbd84e7`, run with the same binaries. Quality was measured at fork commit `66a05b72`; speed with
-the small-T Q6 head kernel that followed it (`36b798c9`), which this artifact needs to be faster
-under speculative decoding.
+`1cbd84e7`, run with the same binaries. The first revision's quality was measured at fork commit
+`66a05b72`; its speed with the small-T Q6 head kernel that followed it (`36b798c9`), which this
+artifact needs to be faster under speculative decoding. The 2026-11-16 revision's quality was
+measured at fork commit `8cf349f1`, together with a re-run of the first revision, and its speed
+against the first revision on the same card (below).
 
 **Quality.** `ninfer-perplexity --quick --kv-dtype int8`:
 
-| Corpus | Upstream | This artifact | Change |
-|---|---:|---:|---:|
-| `perplexity-1m` (inherited) | 4.3428 | 4.3023 | −0.93% |
-| `perplexity-heldout-2026-09` (wikipedia en/zh, arXiv, GitHub, own code, chat) | 4.3396 | 4.3178 | −0.50% |
+| Corpus | Upstream | First revision | This revision | Change vs upstream |
+|---|---:|---:|---:|---:|
+| `perplexity-1m` (inherited) | 4.3428 | 4.3025 | 4.3014 | −0.95% |
+| `perplexity-heldout-2026-09` (wikipedia en/zh, arXiv, GitHub, own code, chat) | 4.3396 | 4.3169 | 4.3224 | −0.40% |
+
+Upstream's figures are from the original measurement; the other two columns were measured together
+on 2026-11-16, where the first revision lands within 0.03% of what it scored originally. On the
+held-out corpus this revision is 0.13% above the first one, all of it Chinese Wikipedia (9.14 to
+9.27 while arXiv, both code streams and chat improve), although that stream's KL divergence falls.
 
 KL divergence against Unsloth's Q8_0 GGUF on the held-out corpus (8 × 4096 tokens per stream,
 llama.cpp b11316 with the NInfer weights exported bit-exactly into Q8_0 blocks):
@@ -94,12 +109,29 @@ llama.cpp b11316 with the NInfer weights exported bit-exactly into Q8_0 blocks):
 | Weights | Mean KLD |
 |---|---:|
 | Upstream encoding and layout | 0.0376 |
-| This layout with a 6-bit embedding | 0.0304 |
-| This artifact (4-bit embedding) | 0.0318 |
+| First revision's layout with a 6-bit embedding | 0.0304 |
+| First revision (4-bit embedding) | 0.0318 |
+| **This revision** (4-bit embedding, Q5 from layer 23, 24 and 30) | **0.0288** |
 | Unsloth UD-Q4_K_XL (llama.cpp formats, 17.56 GB of text weights) | 0.0156 |
 
 The 4-bit embedding costs Chinese Wikipedia (0.0794 → 0.0859) and chat (0.0355 → 0.0373) against
 a 6-bit one; English, arXiv and code streams are unchanged to the fourth decimal.
+
+Per stream, this revision against the first (KL divergence, lower is better):
+
+| Stream | First revision | This revision |
+|---|---:|---:|
+| wikipedia_en | 0.0182 | 0.0173 |
+| wikipedia_zh | 0.0859 | 0.0732 |
+| arXiv | 0.0183 | 0.0169 |
+| github_code | 0.0143 | 0.0136 |
+| own_code | 0.0169 | 0.0164 |
+| synthetic_chat | 0.0373 | 0.0358 |
+
+A second, never-calibrated sample (the other file of each held-out stream, same method) reads
+0.0197 → 0.0183 (−6.7%) and improves every stream except synthetic_chat, which moves from −4.2% on
+the first sample to +5.2% on the second. HumanEval and MBPP (421 problems, greedy, non-thinking)
+gave 375 and 380 passes for the first and this revision, within noise.
 
 Unsloth's UD-Q4_K_XL is still clearly better per byte. Their formats are not NInfer's, and
 about half of the gap is their per-tensor allocation, which needs kernel routes NInfer does not
@@ -108,7 +140,7 @@ have yet.
 **Speed.** `ninfer_bench`, rk4v4 KV, 8,192-token context, two interleaved rounds of three
 repetitions each:
 
-| Workload | Upstream | This artifact | Change |
+| Workload | Upstream | First revision | Change |
 |---|---:|---:|---:|
 | Plain decode, tg128 | 47.1 tok/s | 49.2 tok/s | +4.5% |
 | Prefill, pp4096 | 1,713 tok/s | 1,727 tok/s | +0.8% |
@@ -119,12 +151,19 @@ The bench corpus is unusually easy to draft (DFlash2 accepts 7.3 tokens per roun
 speculative rows were also measured on 24 varied chat prompts through `ninfer-serve` (greedy,
 thinking off, 512 tokens each, one stream):
 
-| Profile | Upstream | This artifact | Tokens per round |
+| Profile | Upstream | First revision | Tokens per round |
 |---|---:|---:|---|
 | DFlash2 K=7 + draft head | 125.9 tok/s | 133.5 tok/s (+6.1%) | 3.53 → 3.57 |
 | MTP3 + draft head | 111.5 tok/s | 115.4 tok/s (+3.5%) | 2.87 → 2.84 |
 
 MTP acceptance is about 1-1.5% lower than upstream's, so its gain is smaller than DFlash2's.
+
+The speed rows above were measured on the first revision. This revision against it, interleaved on
+the same card (paired median of this over first, five or six repetitions): plain decode 1.000,
+prefill 1.000, MTP3 1.000 on the bench corpus, and DFlash2 K=7 **0.972** there (7.31 accepted tokens
+per round instead of 7.53, on a corpus this easy to draft). On the 24 chat prompts the draft
+acceptance does not move (DFlash2 3.558 against 3.560 tokens per round, MTP3 61.40% against
+61.39%) and decode is 0.996 (DFlash2) and 1.002 (MTP3) of the first revision's.
 Before the small-T Q6 kernel, the 6-bit head's 8-token verify took 2.56 ms against 1.58 ms for
 upstream's 8-bit head and cancelled DFlash2's gain (−0.6% on the bench); with it the head reads
 at about 850 GB/s from 3 to 8 tokens.
@@ -142,7 +181,7 @@ as indicative rather than exact.
 | MTP | 66.39 tok/s (2 drafts) | 115.4 tok/s (3 drafts, 24 chat prompts) | 1.74x |
 | DFlash2 | 63.13 tok/s (4 drafts) | 133.5 tok/s (7 drafts, 24 chat prompts) | 2.1x |
 
-Unsloth's file is closer to Q8_0 than this artifact (KL divergence 0.0156 against 0.0318), so this
+Unsloth's file is closer to Q8_0 than this artifact (KL divergence 0.0156 against 0.0288), so this
 is a speed comparison, not one at equal quality. The same post notes llama.cpp's MTP output did not
 match serial greedy decoding byte for byte.
 
