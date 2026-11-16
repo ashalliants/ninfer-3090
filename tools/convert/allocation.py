@@ -313,8 +313,12 @@ def file_sha256(path: Path) -> str:
 
 
 def checkpoint_identity(model_dir: Path) -> str:
-    """Fingerprint of a safetensors checkpoint without reading its weights: the config, the tensor
-    index, and every shard's name and size. A different checkpoint, or a re-exported one, changes it."""
+    """Content hash of a safetensors checkpoint: its config, tensor index and every shard's bytes.
+
+    Reading the 52 GB of the Qwen3.8-27B shards took 48 s on this machine's NVMe, small against the
+    hours a measurement runs, and it is the only check that notices weights replaced by others of the same
+    size. A different checkpoint, or a re-exported one, changes it.
+    """
 
     digest = hashlib.sha256()
     for name in ("config.json", "model.safetensors.index.json"):
@@ -322,6 +326,9 @@ def checkpoint_identity(model_dir: Path) -> str:
         digest.update(name.encode() + b"\0" + (path.read_bytes() if path.exists() else b"<absent>"))
     for shard in sorted(model_dir.glob("*.safetensors")):
         digest.update(f"{shard.name}\0{shard.stat().st_size}\0".encode())
+        with open(shard, "rb") as handle:
+            for block in iter(lambda: handle.read(16 << 20), b""):
+                digest.update(block)
     return digest.hexdigest()
 
 

@@ -319,7 +319,10 @@ def test_input_identity_changes_with_content_and_never_with_the_file_name(tmp_pa
     assert checkpoint_identity(checkpoint) == before
     (checkpoint / "model-00001.safetensors").write_bytes(b"x" * 11)        # a re-exported shard
     assert checkpoint_identity(checkpoint) != before
+    (checkpoint / "model-00001.safetensors").write_bytes(b"y" * 10)        # other weights, same size
+    assert checkpoint_identity(checkpoint) != before
     (checkpoint / "model-00001.safetensors").write_bytes(b"x" * 10)
+    assert checkpoint_identity(checkpoint) == before
     (checkpoint / "config.json").write_text('{"hidden_size": 1}')            # another config
     assert checkpoint_identity(checkpoint) != before
 
