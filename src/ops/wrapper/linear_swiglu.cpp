@@ -38,6 +38,7 @@ void validate_policy(LinearPolicy policy) {
     // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
     // one engine-wide setting does not have to be threaded per Op.
     case LinearPolicy::AllowPrefillCublas:
+    case LinearPolicy::AllowPrefillCublasNarrow:
     // The scout's int4 route: AllowA8Int, with int4 activations wherever the q4a8 route would run.
     case LinearPolicy::ScoutA4Int:
         return;
@@ -101,10 +102,10 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
         // The cuBLAS route holds a materialised int8 weight and an int32 output tile, so it is far
         // and away the widest claimant wherever it is admitted. Any interval reaching its width
         // gate has to reserve for it, because the resolver will pick it at that T.
-        if (allows_cublas_prefill(policy) && max_tokens >= kCublasPrefillMinTokens) {
+        if (allows_cublas_prefill(policy) && max_tokens >= cublas_prefill_min_tokens(policy)) {
             return std::max(a16, detail::w4_cublas_prefill_workspace_capacity_bytes(
                                      gate_up_rows, input_rows,
-                                     std::max(min_tokens, kCublasPrefillMinTokens), max_tokens));
+                                     std::max(min_tokens, cublas_prefill_min_tokens(policy)), max_tokens));
         }
         // The small-T integer route stages quantised activations too, over its padded tile width.
         const auto decode_bytes = [&](std::int32_t t) -> std::size_t {
@@ -223,8 +224,10 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     // The cuBLAS route first, where it is admitted and wide enough to pay: about 2x the integer
     // mainloop at 4096 tokens, 1.83x at 1024, and a loss at narrow widths -- hence the width gate
     // rather than an unconditional preference. Everything narrower falls through to the routes below.
-    if (allows_cublas_prefill(policy) && t >= kCublasPrefillMinTokens && q4_weight &&
-        detail::w4_cublas_prefill_supported(gate_up_weight, t)) {
+    if (allows_cublas_prefill(policy) && t >= cublas_prefill_min_tokens(policy) && q4_weight &&
+        detail::w4_cublas_prefill_supported(gate_up_weight, t) &&
+        (t >= kCublasPrefillMinTokens ||
+         detail::w4_cublas_prefill_fits(ws, gate_up_weight.n, gate_up_weight.k, t))) {
         detail::w4_cublas_swiglu_launch(x, gate_up_weight, out, ws, stream);
         return;
     }

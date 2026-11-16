@@ -102,15 +102,20 @@ std::size_t gdn_record_workspace_bytes(const GdnParameters& parameters, const Gd
 }
 
 void gdn_projection(const Tensor& hidden, const GdnParameters& parameters, Tensor& qkv, Tensor& z,
-                    WorkspaceArena& workspace, cudaStream_t stream, InputBasis basis) {
+                    WorkspaceArena& workspace, cudaStream_t stream, InputBasis basis,
+                    bool prefill) {
     auto scope = workspace.scope();
     const Tensor x =
         rotated_input(hidden, projection_signs(parameters.projection), workspace, stream, basis);
+    const auto policy = [&](ops::LinearPolicy own) {
+        return prefill ? ops::prefill_phase_policy(own) : own;
+    };
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
-        ops::gdn_input_proj(x, pair->first, pair->second, qkv, z, pair->policy, workspace, stream);
+        ops::gdn_input_proj(x, pair->first, pair->second, qkv, z, policy(pair->policy), workspace,
+                            stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
-        ops::gdn_input_proj(x, single.weight, qkv, z, single.policy, workspace, stream);
+        ops::gdn_input_proj(x, single.weight, qkv, z, policy(single.policy), workspace, stream);
     }
 }
 

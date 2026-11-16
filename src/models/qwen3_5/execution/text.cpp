@@ -865,7 +865,8 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
-TextContext::AttentionInputs TextContext::attention_inputs(const BlockParameters& w, Tensor& x) {
+TextContext::AttentionInputs TextContext::attention_inputs(const BlockParameters& w, Tensor& x,
+                                                          bool prefill) {
     const auto& p  = std::get<AttentionParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -892,7 +893,7 @@ TextContext::AttentionInputs TextContext::attention_inputs(const BlockParameters
     Tensor gate_flat = gate.view({dimension(config_.attention->query_width()), T});
     Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
     Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
-    attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s, input_basis);
+    attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s, input_basis, prefill);
 
     const auto results = workspace::text_attention_results(work_, config_, T);
     Tensor qn =
@@ -916,7 +917,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     if (active_causal_attention_envelope_ == nullptr) {
         throw std::logic_error("Text GQA execution envelope is not set");
     }
-    const AttentionInputs inputs = attention_inputs(w, x);
+    const AttentionInputs inputs = attention_inputs(w, x, ph == Phase::Prefill);
     Tensor gate                  = inputs.gate;
     Tensor v                     = inputs.value;
     Tensor qn                    = inputs.query;
@@ -968,11 +969,11 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     Tensor gated = a.view({dimension(config_.attention->query_width()), T});
     if (rotated(p.output.hadamard_signs)) {
         ops::sigmoid_mul_hadamard(gate, a, p.output.hadamard_signs, gated, s);
-        project_add(gated, p.output, x, work_, s, InputBasis::Rotated);
+        project_add(gated, p.output, x, work_, s, InputBasis::Rotated, ph == Phase::Prefill);
         return;
     }
     ops::sigmoid_mul(gate, a, s);
-    project_add(gated, p.output, x, work_, s);
+    project_add(gated, p.output, x, work_, s, InputBasis::Primal, ph == Phase::Prefill);
 }
 
 void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
@@ -1036,7 +1037,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     } else {
         Tensor qkv    = workspace::gdn_prefill_conv(work_, config_, T);
         Tensor z_flat = z.view({dimension(config_.gdn->value_width()), T});
-        gdn_projection(h, p, qkv, z_flat, work_, s, projection_basis);
+        gdn_projection(h, p, qkv, z_flat, work_, s, projection_basis, ph == Phase::Prefill);
         const GdnStateRef gdn_pool = gdn_state(static_cast<std::uint32_t>(gidx));
         Tensor conv_state_in       = gdn_pool.pool->conv_slot(gdn_pool.local, linear_state_source_slot_);
         Tensor conv_state_out =
@@ -1119,11 +1120,11 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     if (rotated(p.output.hadamard_signs)) {
         ops::gated_rmsnorm_hadamard(o, p.norm, z, config_.rms_norm_eps, p.output.hadamard_signs,
                                     normalized, s);
-        project_add(normalized, p.output, x, work_, s, InputBasis::Rotated);
+        project_add(normalized, p.output, x, work_, s, InputBasis::Rotated, ph == Phase::Prefill);
         return;
     }
     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, ctx_.execution_view());
-    project_add(normalized, p.output, x, work_, s);
+    project_add(normalized, p.output, x, work_, s, InputBasis::Primal, ph == Phase::Prefill);
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
@@ -1139,11 +1140,12 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase phas
         ops::rmsnorm_hadamard(x, weights.post_attention_norm, config_.rms_norm_eps, true, *signs, h,
                               ctx_.stream);
         ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view(), false, phase == Phase::Verify,
-            InputBasis::Rotated);
+            InputBasis::Rotated, phase == Phase::Prefill);
         return;
     }
     ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
-    ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view(), false, phase == Phase::Verify);
+    ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view(), false, phase == Phase::Verify,
+        InputBasis::Primal, phase == Phase::Prefill);
 }
 
 TextContext::GdnShard TextContext::gdn_shard(std::uint32_t layer) const {

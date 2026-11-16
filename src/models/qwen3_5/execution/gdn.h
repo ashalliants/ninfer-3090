@@ -18,7 +18,7 @@ namespace ninfer::models::qwen3_5::execution {
                                                      std::int32_t last_width);
 void gdn_projection(const Tensor& hidden, const GdnParameters& parameters, Tensor& qkv, Tensor& z,
                     WorkspaceArena& workspace, cudaStream_t stream,
-                    InputBasis basis = InputBasis::Primal);
+                    InputBasis basis = InputBasis::Primal, bool prefill = false);
 // Returns the basis `hidden` is written in: rotated when the input projection is.
 [[nodiscard]] InputBasis gdn_norm_control(const Tensor& residual, const Tensor& norm, float epsilon,
                                           const GdnParameters& parameters, Tensor& hidden,

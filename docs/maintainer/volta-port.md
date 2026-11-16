@@ -180,8 +180,18 @@ emulated here at ~80 tok/s. Steps also split at context-cache captures (just bef
 template tokens) and rewrite frontiers, so 1,150 tokens ran as 1,024 + 122 + 4 and paid ~1.3 s for
 the 122. With the route on, `prefill_tail_floor` (planning/startup.h, set to the gate) makes
 `advance_prefill` shorten a step so the segment before the next frontier is at least the gate:
-1,017 + 129 + 4, 449 -> 755 tok/s on that prompt, same output. Prompts shorter than the gate
-still prefill on the narrow routes.
+1,017 + 129 + 4, 449 -> 755 tok/s on that prompt, same output.
+
+**Short prompts.** The wide gate exists for decode and verify rounds (up to 8 lanes x 16 columns =
+128 through the same Ops and policies), not for prefill. A prefill-phase call therefore takes
+`ops::prefill_phase_policy(policy)`: `AllowPrefillCublas` becomes `AllowPrefillCublasNarrow`,
+whose gate is `kCublasPrefillNarrowMinTokens` -- 9 on sm_70 (below that the streaming GEMV wins),
+the wide gate elsewhere. The text layers pass the phase to `ffn`, `project_add`,
+`attention_projection` and `gdn_projection` (a defaulted `prefill` flag); decode, verify, MTP and
+draft calls are unchanged. A narrow call takes the route only if its scratch fits in the
+workspace left (`w4_cublas_prefill_fits` / `w4_cublas_projection_fits`), which the chunk-width
+plan covers whenever the chunk reaches the wide gate. Qwen3.8-27B: 54-token prompt 49 -> 140
+tok/s, 125-token prompt 86 -> 268 tok/s, same outputs; decode unchanged.
 
 Thermals: sustained prefill holds the card at its 200 W cap and took a passively cooled V100 from
 40 to 75 C in about a minute; measure in short runs without forced airflow.
@@ -243,7 +253,6 @@ Qwen3.8-Flash-Next. A 32 GB V100 holds the 27B (19 GiB) with room for KV; the Bo
    `linear_add` and SwiGLU suites have run so far.
 2. Measure small-T on the other models (MTP / DFlash verification on the 27B is done: see "Decode"), and re-pick the sm_86 route tables where an `mma`
    route loses to a SIMT one on Volta (`docs/maintainer/linear-tuning.md` has the method).
-3. The rest of prefill on tensor cores: prompt attention (FP16), the GDN chunked recurrence, and
-   the narrow (< 129 token) tails, which still take the emulated small-T and A8 routes.
+3. The rest of prefill on tensor cores: prompt attention (FP16) and the GDN chunked recurrence.
 4. Calibrate `context_cost_defaults.cpp` for the card (`ninfer_context_cost_bench`); until then the
    generic transfer and prefill costs apply.

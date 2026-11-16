@@ -245,7 +245,9 @@ private:
         Tensor key;   // normalized, rotated [head_dim, kv_heads, T]
         Tensor attention; // the attention output's workspace root [query_width, T]
     };
-    [[nodiscard]] AttentionInputs attention_inputs(const BlockParameters& weights, Tensor& x);
+    // `prefill` marks a prefill-phase call (ops::prefill_phase_policy for the input projection).
+    [[nodiscard]] AttentionInputs attention_inputs(const BlockParameters& weights, Tensor& x,
+                                                   bool prefill = false);
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,

@@ -87,6 +87,7 @@ T2Launch select_t2_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     case LinearPolicy::AllowA8Int:
     case LinearPolicy::AllowA8IntDecode:
     case LinearPolicy::AllowPrefillCublas:
+    case LinearPolicy::AllowPrefillCublasNarrow:
         return select_t2_a16_launch(n, k, t);
     case LinearPolicy::AllowA4:
     // Only the four policy-bearing Ops take the scout's int4 route (linear.h); plain Linear

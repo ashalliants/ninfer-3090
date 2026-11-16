@@ -559,6 +559,13 @@ std::size_t w4_cublas_prefill_workspace_capacity_bytes(std::int32_t rows, std::i
            aligned_256(k * 2 * sizeof(float)) + aligned_256(sizeof(float));
 }
 
+bool w4_cublas_prefill_fits(const WorkspaceArena& workspace, std::int32_t rows, std::int32_t cols,
+                            std::int32_t tokens) {
+    if (rows <= 0 || cols <= 0 || tokens <= 0) { return false; }
+    const std::size_t free = workspace.capacity() - workspace.used();
+    return w4_cublas_prefill_workspace_capacity_bytes(rows, cols, tokens, tokens) <= free;
+}
+
 void w4_cublas_swiglu_launch(const Tensor& x, const Weight& gate_up, Tensor& out,
                              WorkspaceArena& workspace, cudaStream_t stream) {
     const std::int32_t tokens = x.ne[1];
@@ -642,6 +649,17 @@ std::size_t w4_cublas_projection_workspace_capacity_bytes(std::int32_t max_rows,
                                                           std::int32_t min_tokens,
                                                           std::int32_t max_tokens) {
     return w4_cublas_prefill_workspace_capacity_bytes(max_rows, cols, min_tokens, max_tokens);
+}
+
+bool w4_cublas_projection_fits(const WorkspaceArena& workspace, const CublasProjection* parents,
+                               int parent_count, std::int32_t tokens) {
+    if (parents == nullptr || parent_count <= 0 || parents[0].weight == nullptr) { return false; }
+    std::int32_t max_rows = 0;
+    for (int p = 0; p < parent_count; ++p) {
+        if (parents[p].weight == nullptr) { return false; }
+        max_rows = std::max(max_rows, parents[p].weight->n);
+    }
+    return w4_cublas_prefill_fits(workspace, max_rows, parents[0].weight->k, tokens);
 }
 
 void w4_cublas_projection_launch(const Tensor& x, const CublasProjection* parents, int parent_count,

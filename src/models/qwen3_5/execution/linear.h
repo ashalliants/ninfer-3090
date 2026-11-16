@@ -16,12 +16,14 @@ inline void project(const Tensor& input, const LinearParameters& p, Tensor& outp
     ops::linear(x, p.weight, output, p.policy, workspace, stream);
 }
 
+// `prefill` marks a prefill-phase call, which takes ops::prefill_phase_policy.
 inline void project_add(const Tensor& input, const LinearParameters& p, Tensor& residual,
                         WorkspaceArena& workspace, cudaStream_t stream,
-                        InputBasis basis = InputBasis::Primal) {
+                        InputBasis basis = InputBasis::Primal, bool prefill = false) {
     auto scope     = workspace.scope();
     const Tensor x = rotated_input(input, p.hadamard_signs, workspace, stream, basis);
-    ops::linear_add(x, p.weight, residual, p.policy, workspace, stream);
+    ops::linear_add(x, p.weight, residual, prefill ? ops::prefill_phase_policy(p.policy) : p.policy,
+                    workspace, stream);
 }
 
 inline void project_swiglu(const Tensor& input, const LinearParameters& p, Tensor& output,
