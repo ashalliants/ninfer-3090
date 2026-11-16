@@ -17,7 +17,7 @@ emulates the instructions underneath it.
 | Shared-memory limit | `ops/common/smem_limit.h`, `NINFER_SM70` from CMake | `kMaxDynamicSharedBytes` is 96 KiB on Volta and 99 KiB elsewhere. Every schedule static-asserts against it, so a schedule that cannot launch fails to compile |
 | Build gates | root `CMakeLists.txt`, `src/ops/CMakeLists.txt`, `softmax_attention/sources.cmake`, the Qwen3.5 startup check | arch 70 takes the sm_8x path (no PDL, FP8 A8 and NVFP4 A4 stubbed) |
 | `sigmoid_approx` | `ops/common/math.cuh` | `tanh.approx` is sm_75; Volta uses `1 / (1 + exp(-x))` |
-| Decode GEMVs | `ops/linear/common/stream_gemv.cuh` (+ `stream_gemv_decode.cuh`, `Q4StreamFormat` / `Q5StreamFormat` / `Q6StreamFormat` in the row-split storage headers) | every Q4/Q5 T = 1 GEMV, routed from `launch_q4_a16_gemv`, `launch_q5_a16_gemv`, the Q4 SwiGLU pair and the Q5 residual linear; the Q6 T = 1 GEMV (the LM head) from `launch_q6_gemv_t1`. See "Decode" below |
+| Decode GEMVs | `ops/linear/common/stream_gemv.cuh` (+ `stream_gemv_decode.cuh`, `Q4StreamFormat` / `Q5StreamFormat` / `Q6StreamFormat` / `Q8StreamFormat` in the row-split storage headers) | every Q4/Q5 T = 1 GEMV, routed from `launch_q4_a16_gemv`, `launch_q5_a16_gemv`, the Q4 SwiGLU pair and the Q5 residual linear; the Q6 head from `launch_q6_gemv_t1`; and T = 2..8 (speculative verification) from the Q4/Q5 `linear_add`, Q4 SwiGLU, Q6 head and Q8 sliced-K launchers. See "Decode" below. See "Decode" below |
 | Decode routes for the fused input projections and Q4 `linear_add` | `q4_q5_gdn_input_plan.cpp`, `q4_q5_attn_input_plan.cpp`, `q4_linear_add.cu` | T = 1..6 (input projections) and T = 1 (`linear_add`) take their GEMV/SIMT schedules instead of the emulated small-T `mma` |
 
 The mma emulations accumulate in FP32 (INT32 for the integer shapes) exactly as the instruction
@@ -53,6 +53,15 @@ Measured on a V100-PCIE-32GB (OCuLink Gen3 x4, 200 W cap, 879 GB/s sustained rea
 | + decode attention: halved split tiers, CUDA-core QK and PV at one row tile | 41.9 |
 | + streaming GEMV for the Q6 LM head | 42.1 |
 
+Speculative decoding (same prompt, 200 greedy tokens, `--lm-head-draft`):
+
+| Build | plain | MTP3 (`--draft-tokens 3`) | DFlash2 (`--draft-tokens 7`) |
+|---|---|---|---|
+| T = 1 work above only | 42.1 | 26.0 | 36.7 |
+| + streaming GEMV for T = 2..8 and the Q8 drafter | 41.4-42 | 69.8 | 46.4 |
+
+Acceptance on that prompt: MTP3 3.3 tokens per round, DFlash2 5.2.
+
 The model's weight floor at 879 GB/s is 17.4 ms per token (`tools/perf_model.py`), about 57 tok/s.
 
 **Where the first two steps came from.** The port's Volta decode routes lived in `q4_dispatch.cpp`,
@@ -85,6 +94,37 @@ flight (1-32 warps, 1-2 slices) moved no shape by more than 2%.
 Greedy text matches the previous build for ~150 tokens, then may take a different but equally
 valid continuation: the streaming GEMV sums in a different order (relative error ~1e-6 against
 fp64 on random weights). The op suites' fp32/fp64 oracles pass.
+
+**Speculative verification (T = 2..8).** MTP3 verifies four columns per round and DFlash2 eight,
+and those widths went to small-T `mma` routes (`q4_ksplit_mma`, `q5_small_t_mma`, the Q6 head's
+`q6_small_t_mma`, and the MTP drafter's Q8 `q8_a16_sliced_k_mma`), emulated and compute-bound
+here: a T = 4 verify cost ~5x a decode step, so both modes ran slower than plain decoding. The
+streaming GEMV now takes 1..8 tokens:
+
+- formats decode a packed word into eight fp32 operands once (`decode_word`) and every token adds
+  one FFMA per weight, so the decode is shared across the verify width;
+- when Cols x K of x' does not fit in shared memory (K = 17408 at T >= 2), K is staged in chunks
+  and each warp keeps its rows' partial sums in shared memory between chunks (`Chunked`, a
+  compile-time property, so the T = 1 kernel carries none of it);
+- from T = 2, x' reads from shared memory bound the kernel (one per token per weight), so a plain
+  GEMV streams two rows per warp (r and r + rows / 2) against each read: 20-36% faster at T = 4
+  and 30-35% at T = 8; four rows spill registers and lose;
+- `Q8StreamFormat` (8-bit fields fill bits 15..22, odd weights under a 16.0 magic) serves the
+  drafter through the identity-row `launch_q8_a16_sliced_k_mma`;
+- the T = 1 kernel is held to 64 registers (`kStreamGemvMinBlocks`): unconstrained, the Q6 decode
+  took 75 and lost a CTA per SM.
+
+Hooks for the verify widths: Q4 `linear_add` (T <= 8), the Q4 SwiGLU small-T launcher, Q5
+`linear_add` (split2 and small-T launchers), the Q6 T = 2 and small-T launchers, and the Q8
+sliced-K launcher. T = 4 costs about 1.6-2x a T = 1 GEMV on the CUDA cores (FMA- and
+shared-memory-bound); tensor cores would flatten that, and are the same work as a Volta prefill
+path.
+
+MTP3's output matched plain decoding before this change and can now differ at near-ties: the
+verify GEMVs sum in a different order from the T = 1 ones (chunked K, paired rows). DFlash2
+already differed from plain on this card before any of this work (T = 1 and T = 8 took different
+kernels even with the streaming GEMV off); speculation is exact with respect to the target's own
+verify-width logits.
 
 **Decode attention** (`causal_attention_small_t_i8_tiled`) went from 81.5 to 31.7 us per layer at
 ~430 keys. Its QK ran emulated `mma_s8` in one producer warp per CTA, a ~2,300-shuffle serial
@@ -160,7 +200,7 @@ Qwen3.8-Flash-Next. A 32 GB V100 holds the 27B (19 GiB) with room for KV; the Bo
 
 1. Run the full op suites (`scripts/v100_validate.sh --tests`); only the linear, input-projection,
    `linear_add` and SwiGLU suites have run so far.
-2. Measure small-T (MTP / DFlash verification) on each model, and re-pick the sm_86 route tables where an `mma`
+2. Measure small-T on the other models (MTP / DFlash verification on the 27B is done: see "Decode"), and re-pick the sm_86 route tables where an `mma`
    route loses to a SIMT one on Volta (`docs/maintainer/linear-tuning.md` has the method).
 3. A Volta prefill path with real tensor cores (FP16 `wmma` GEMM for the dequantised weight tile,
    FP16 attention), keeping BF16 storage with a bounded range (activations can exceed FP16's 65504).

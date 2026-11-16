@@ -49,9 +49,10 @@ struct Q6SimtDecodeAtom {
 // (32 weights, nibble i of word w at k offset 8w + i) plus their eight high bytes, two per 8-weight
 // chunk: as a 16-bit word per chunk, weight i's high pair sits at bits 2i (b0) and 2i + 1 (b1),
 // and the value is ((n | (b0 | b1 << 1) << 4) ^ 0x20) - 0x20 = n + 16 b0 - 32 b1.
-// stream_dot_nibbles8 adds sum(x') + sum(n x); stream_bits8 adds sum_even(x') + 2 sum_odd(x') +
-// 16 sum(b0 x) and subtracts 2 (sum_even(x') + 2 sum_odd(x')) + 32 sum(b1 x). The constant left
-// is -sum_odd(x'), so the correction per weight pair is -16 x_odd, as for Q5.
+// Against x', stream_decode_nibbles8 contributes sum(x') + sum(n x); stream_fold_bits8 adds
+// sum_even(x') + 2 sum_odd(x') + 16 sum(b0 x) and takes away 2 (sum_even(x') + 2 sum_odd(x')) +
+// 32 sum(b1 x). The constant left is -sum_odd(x'), so the correction per weight pair is -16 x_odd,
+// as for Q5.
 struct Q6StreamFormat {
     static constexpr const char* kName = "q6";
     static constexpr int kGroupK       = Q6RowSplitStorage::kGroupK;
@@ -94,20 +95,18 @@ struct Q6StreamFormat {
     __device__ static __forceinline__ float correction(float, float x_odd) {
         return -kStreamOddScale * x_odd;
     }
-    __device__ static __forceinline__ float dot(const Slice& slice, const float4 (&chunks)[8],
-                                                const StreamDecodeConstants& c) {
+    // The eight operands of packed word W (k offsets 8W .. 8W + 7 of the slice).
+    template <int W>
+    __device__ static __forceinline__ void decode_word(const Slice& slice,
+                                                       const StreamDecodeConstants& c,
+                                                       float (&f)[8]) {
         const std::uint32_t words[4] = {slice.codes.x, slice.codes.y, slice.codes.z,
                                         slice.codes.w};
         const std::uint32_t highs[2] = {slice.high.x, slice.high.y};
-        float acc                    = 0.0f;
-#pragma unroll
-        for (int w = 0; w < 4; ++w) {
-            const std::uint32_t high = (highs[w >> 1] >> (16 * (w & 1))) & 0xffffu;
-            acc = stream_dot_nibbles8(words[w], chunks[2 * w], chunks[2 * w + 1], c, acc);
-            acc = stream_bits8<2, 0, 16, false>(high, chunks[2 * w], chunks[2 * w + 1], c, acc);
-            acc = stream_bits8<2, 1, 32, true>(high, chunks[2 * w], chunks[2 * w + 1], c, acc);
-        }
-        return acc;
+        const std::uint32_t high     = (highs[W >> 1] >> (16 * (W & 1))) & 0xffffu;
+        stream_decode_nibbles8(words[W], c, f);
+        stream_fold_bits8<2, 0, 16, false>(high, c, f);
+        stream_fold_bits8<2, 1, 32, true>(high, c, f);
     }
 };
 

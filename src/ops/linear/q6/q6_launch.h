@@ -7,6 +7,9 @@ namespace ninfer::ops::detail {
 using Q6Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 // sm_86 vocabulary-head routes. One warp per row, one or two tokens per weight read
 // (q6_rowsplit_gemv.cu).
+// The streaming GEMV (ops/linear/common/stream_gemv.cuh) for T = 1..8 when it is enabled (sm_70 by
+// default); false when it declines, and the caller launches its own schedule.
+bool try_launch_q6_stream(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q6_gemv_t1(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q6_gemv_t2(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 // One m16 row tile per CTA, eight warps splitting K; up to 8 / 16 / 32 tokens (q6_small_t_mma.cu).

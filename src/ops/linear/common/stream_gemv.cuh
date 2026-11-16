@@ -1,7 +1,7 @@
 #pragma once
 
-// Streaming GEMV: y = W x for one token (T = 1), over row-split weights (Q4, Q5), written to be
-// bound by the weight stream on cards whose integer/half conversions are slow (sm_70).
+// Streaming GEMV: y = W x for one to eight tokens, over row-split weights (Q4, Q5, Q6), written to
+// be bound by the weight stream on cards whose integer/half conversions are slow (sm_70).
 //
 // Shape of the kernel, and why:
 //
@@ -9,13 +9,18 @@
 //     shared memory once per CTA, so its cost is paid per SM, not per row.
 //   * The activation is staged as fp32 x', pre-scaled per k parity, with a per-32-weight correction
 //     (ops/linear/common/stream_gemv_decode.cuh): each weight then costs one LOP3 and one FFMA,
-//     with no conversion instruction. The formats live with their storage
-//     (Q4StreamFormat in q4_rowsplit_storage.cuh, Q5StreamFormat in q5_rowsplit_storage.cuh).
+//     with no conversion instruction. The formats live with their storage (Q4StreamFormat,
+//     Q5StreamFormat, Q6StreamFormat in the q4/q5/q6 row-split storage headers).
 //   * x' is stored in 16-byte chunks swizzled by (slice & 7), so the eight lanes of an LDS.128
 //     phase read eight different bank groups.
 //   * One warp per row; each lane streams 16-byte code vectors (a 512-byte warp transaction) and
-//     prefetches the next iteration's vectors into registers before decoding the current ones,
-//     which keeps loads in flight across the decode (Volta has no cp.async to do it).
+//     prefetches the next step's vectors into registers -- across row boundaries too -- before
+//     decoding the current ones, which keeps loads in flight across the decode (Volta has no
+//     cp.async to do it).
+//   * Several tokens (Cols, up to 8: speculative verification) share every decoded weight: a
+//     format decodes a packed word into eight fp32 operands once, and each token adds one FFMA per
+//     weight. When Cols * K of x' does not fit in shared memory (K = 17408 at T >= 2), K is staged
+//     in chunks and each warp keeps its rows' partial sums in shared memory between chunks.
 //   * The fully reduced row goes through linear_finish_row, so every Output / Epilogue the
 //     family's other GEMVs accept (split outputs, residual add, ...) works unchanged.
 //
@@ -64,35 +69,62 @@ inline bool stream_gemv_enabled() {
     return enabled;
 }
 
-// Shared memory one CTA needs: x' (k floats) plus one correction per 32 weights.
-constexpr std::size_t stream_gemv_shared_bytes(std::int32_t k) {
-    return static_cast<std::size_t>(k) * sizeof(float) +
-           static_cast<std::size_t>(k / 32) * sizeof(float);
+// Shared memory for one K-chunk of x' over Cols tokens: chunk_k floats plus one correction per 32
+// weights, per token.
+constexpr std::size_t stream_gemv_stage_bytes(std::int32_t chunk_k, int cols) {
+    return static_cast<std::size_t>(cols) *
+           (static_cast<std::size_t>(chunk_k) * sizeof(float) +
+            static_cast<std::size_t>(chunk_k / 32) * sizeof(float));
 }
 
-// Stages x (bf16, length k) as x' with the slice swizzle, and Format::correction summed per
-// 32-weight slice. Every thread issues all of its 16-byte loads for a pass before using any of
-// them, so the prologue costs about one memory latency per pass instead of one per element.
-template <class Format, int Threads>
-__device__ __forceinline__ void stream_gemv_stage(const __nv_bfloat16* __restrict__ x, int k,
+// Stages elements [k0, k0 + chunk_k) of Cols tokens of x (bf16; token t at x + t * x_stride) as x'
+// with the slice swizzle, and Format::correction summed per 32-weight slice. Every thread issues
+// all of its 16-byte loads for a pass before using any of them, so the prologue costs about one
+// memory latency per pass instead of one per element.
+// Token and position of flat vector i of a Cols x col_vectors staging grid, without an integer
+// division (a runtime IDIV is ~20 instructions on the prologue's critical path).
+template <int Cols>
+__device__ __forceinline__ void stream_gemv_split_vector(int i, int col_vectors, int& col, int& j) {
+    col = 0;
+    j   = i;
+    if constexpr (Cols > 1) {
+#pragma unroll
+        for (int t = 1; t < Cols; ++t) {
+            if (j >= col_vectors) {
+                j -= col_vectors;
+                ++col;
+            }
+        }
+    }
+}
+
+template <class Format, int Threads, int Cols>
+__device__ __forceinline__ void stream_gemv_stage(const __nv_bfloat16* __restrict__ x,
+                                                  std::int64_t x_stride, int k0, int chunk_k,
                                                   float4* __restrict__ chunks,
                                                   float* __restrict__ corrections) {
     static_assert(Threads % 32 == 0, "four consecutive threads share a slice");
     constexpr int kPassVectors = 4;
-    const auto* vectors        = reinterpret_cast<const uint4*>(x);
-    const int vector_count     = k / 8; // 8 bf16 each; four per 32-weight slice
+    const int col_vectors      = chunk_k / 8; // 8 bf16 each; four per 32-weight slice
+    const int col_slices       = chunk_k / 32;
+    const int vector_count     = Cols * col_vectors;
     for (int pass = 0; pass < vector_count; pass += Threads * kPassVectors) {
         uint4 loaded[kPassVectors];
 #pragma unroll
         for (int p = 0; p < kPassVectors; ++p) {
             const int i = pass + p * Threads + static_cast<int>(threadIdx.x);
-            loaded[p]   = i < vector_count ? __ldg(&vectors[i]) : make_uint4(0u, 0u, 0u, 0u);
+            loaded[p]   = make_uint4(0u, 0u, 0u, 0u);
+            if (i < vector_count) {
+                int col, j;
+                stream_gemv_split_vector<Cols>(i, col_vectors, col, j);
+                loaded[p] = __ldg(reinterpret_cast<const uint4*>(x + col * x_stride + k0) + j);
+            }
         }
 #pragma unroll
         for (int p = 0; p < kPassVectors; ++p) {
             if (pass + p * Threads >= vector_count) break; // uniform across the CTA
-            const int i               = pass + p * Threads + static_cast<int>(threadIdx.x);
-            const std::uint32_t w[4]  = {loaded[p].x, loaded[p].y, loaded[p].z, loaded[p].w};
+            const int i              = pass + p * Threads + static_cast<int>(threadIdx.x);
+            const std::uint32_t w[4] = {loaded[p].x, loaded[p].y, loaded[p].z, loaded[p].w};
             float scaled[8];
             float correction = 0.0f;
 #pragma unroll
@@ -103,182 +135,348 @@ __device__ __forceinline__ void stream_gemv_stage(const __nv_bfloat16* __restric
                 scaled[2 * j + 1] = odd * kStreamOddScale;
                 correction += Format::correction(even, odd);
             }
+            // Four consecutive vectors are one slice of one token (col_vectors is a multiple of 4).
             correction += __shfl_xor_sync(0xffffffffu, correction, 1);
             correction += __shfl_xor_sync(0xffffffffu, correction, 2);
             if (i < vector_count) {
-                const int slice  = i >> 2;
-                const int first  = (i & 3) * 2; // chunks first, first + 1 of the slice
-                float4* base     = chunks + slice * 8;
+                int col, j;
+                stream_gemv_split_vector<Cols>(i, col_vectors, col, j);
+                const int slice = j >> 2;
+                const int first = (j & 3) * 2; // chunks first, first + 1 of the slice
+                float4* base    = chunks + (col * col_slices + slice) * 8;
                 base[first ^ (slice & 7)] =
                     make_float4(scaled[0], scaled[1], scaled[2], scaled[3]);
                 base[(first + 1) ^ (slice & 7)] =
                     make_float4(scaled[4], scaled[5], scaled[6], scaled[7]);
-                if ((i & 3) == 0) corrections[slice] = correction;
+                if ((j & 3) == 0) corrections[col * col_slices + slice] = correction;
             }
         }
     }
 }
 
-// Receives each fully reduced row (Rows = 1) through the GEMV family's Output / Epilogue sink.
+// Receives fully reduced rows through the GEMV family's Output / Epilogue sink, all Cols tokens of
+// a row at once, as the family's multi-token GEMVs do. An item of Rows rows holds rows item,
+// item + row_offset, ...
 template <class Output, class Epilogue>
 struct StreamGemvRowSink {
     Output output;
     Epilogue epilogue;
+    std::int32_t row_offset;
 
-    __device__ __forceinline__ void finish(int row, const float (&acc)[1]) const {
-        const float values[1]{acc[0]};
-        linear_finish_row(output, epilogue, row, 0, values, 1);
+    template <int Rows, int Cols>
+    __device__ __forceinline__ void finish(int item, const float (&acc)[Rows][Cols]) const {
+#pragma unroll
+        for (int r = 0; r < Rows; ++r) {
+            linear_finish_row(output, epilogue, item + r * row_offset, 0, acc[r], Cols);
+        }
     }
 };
 
 // One warp streams `Rows` weight rows per item -- rows item, item + row_offset, ... -- against the
-// same staged activation, and hands their dot products to sink.finish(item, acc). Rows = 1 is the
-// plain GEMV; Rows = 2 serves fused pairs such as SwiGLU's gate and up halves, which read each x'
-// chunk once for both rows.
-template <class Format, int Warps, int Unroll, int Rows, class Sink>
-__global__ __launch_bounds__(Warps * 32) void stream_gemv_kernel(
-    const __nv_bfloat16* __restrict__ x, typename Format::Planes planes, Sink sink,
-    std::int32_t items, std::int32_t row_offset, std::int32_t k, std::int32_t padded_k) {
-    extern __shared__ __align__(16) unsigned char stream_shared[];
-    auto* chunks      = reinterpret_cast<float4*>(stream_shared);
-    auto* corrections = reinterpret_cast<float*>(stream_shared) + k;
+// staged activation of `Cols` tokens, and hands their dot products to sink.finish(item, acc[Rows]
+// [Cols]). Rows = 1 is the plain GEMV; Rows = 2 serves fused pairs such as SwiGLU's gate and up
+// halves, which read each x' chunk once for both rows.
+//
+// K is processed in chunks of chunk_k (a multiple of 256) when it does not fit: each warp then adds
+// its items' per-chunk sums into `partials` (its own items only, so no other warp touches them) and
+// finishes them after the last chunk. With one chunk, items are finished as they complete.
+// Blocks per SM the single-token kernel must fit: it is latency-bound and wants every resident
+// warp it can get, so its registers are capped at 64 per thread (1024 threads per SM). The Q6
+// decode would otherwise take 75 and drop to three CTAs per SM, costing ~10% at T = 1.
+template <int Warps, int Cols>
+inline constexpr int kStreamGemvMinBlocks = Cols == 1 ? 1024 / (Warps * 32) : 1;
 
-    const int lane   = static_cast<int>(threadIdx.x) & 31;
-    const int warp   = static_cast<int>(threadIdx.x) >> 5;
-    const int slices = k / 32;
-    const auto c     = StreamDecodeConstants::make();
+template <class Format, int Warps, int Unroll, int Rows, int Cols, bool Chunked, class Sink>
+__global__ __launch_bounds__(Warps * 32, (kStreamGemvMinBlocks<Warps, Cols>))
+void stream_gemv_kernel(
+    const __nv_bfloat16* __restrict__ x, std::int64_t x_stride, typename Format::Planes planes,
+    Sink sink, std::int32_t items, std::int32_t row_offset, std::int32_t k, std::int32_t padded_k,
+    std::int32_t chunk_k) {
+    extern __shared__ __align__(16) unsigned char stream_shared[];
+    const int chunk_slices = chunk_k / 32;
+    auto* chunks           = reinterpret_cast<float4*>(stream_shared);
+    auto* corrections      = reinterpret_cast<float*>(stream_shared) + Cols * chunk_k;
+    auto* partials         = corrections + Cols * chunk_slices; // [item index][Rows][Cols]
+
+    const int lane        = static_cast<int>(threadIdx.x) & 31;
+    const int warp        = static_cast<int>(threadIdx.x) >> 5;
+    const auto c          = StreamDecodeConstants::make();
+    const int item_stride = static_cast<int>(gridDim.x) * Warps;
+    const int first_item  = static_cast<int>(blockIdx.x) * Warps + warp;
+    // Chunked is a compile-time property so that the single-chunk kernel (every T = 1 launch)
+    // carries no chunk loop or partial-sum code.
+    const int chunk_count = Chunked ? div_up(k, chunk_k) : 1;
     // A lane's slices are lane + 32n, so their swizzle (slice & 7) is fixed per lane.
     int chunk_of[8];
 #pragma unroll
     for (int i = 0; i < 8; ++i) chunk_of[i] = i ^ (lane & 7);
 
-    // The warp walks one flat sequence of steps -- each item's slices, 32 * Unroll at a time, then
-    // the next item's -- and always has the following step's weights in flight while it decodes
-    // the current one, across item boundaries too. A short row (K = 5120 is five slices per lane)
-    // would otherwise wait a full memory latency at the start of every item. The first step's
-    // loads are issued before the activation is staged, so the two latencies overlap.
-    using Slice                = typename Format::Slice;
-    using Row                  = decltype(Format::row(planes, 0, padded_k));
-    const int steps_per_item   = div_up(slices, 32 * Unroll);
-    const int item_stride      = static_cast<int>(gridDim.x) * Warps;
-    const auto fetch           = [&](int item, int step, Slice(&slice)[Rows][Unroll]) {
-        Row row_planes[Rows];
-#pragma unroll
-        for (int r = 0; r < Rows; ++r) {
-            row_planes[r] = Format::row(planes, item < items ? item + r * row_offset : 0, padded_k);
-        }
-#pragma unroll
-        for (int u = 0; u < Unroll; ++u) {
-            const int v = step * 32 * Unroll + u * 32 + lane;
+    using Slice = typename Format::Slice;
+    using Row   = decltype(Format::row(planes, 0, padded_k));
+
+    for (int chunk = 0; chunk < chunk_count; ++chunk) {
+        const int k0             = chunk * chunk_k;
+        const int slice_base     = k0 / 32;
+        const int slices         = min(chunk_k, k - k0) / 32;
+        const int steps_per_item = div_up(slices, 32 * Unroll);
+        // The warp walks one flat sequence of steps -- each item's slices of this chunk, 32 *
+        // Unroll at a time, then the next item's -- with the following step's weights always in
+        // flight while it decodes the current one, across item boundaries too. A short row
+        // (K = 5120 is five slices per lane) would otherwise wait a full memory latency per item.
+        const auto fetch = [&](int item, int step, Slice(&slice)[Rows][Unroll]) {
+            Row row_planes[Rows];
 #pragma unroll
             for (int r = 0; r < Rows; ++r) {
-                slice[r][u] =
-                    item < items && v < slices ? Format::load(row_planes[r], v) : Format::empty();
+                row_planes[r] =
+                    Format::row(planes, item < items ? item + r * row_offset : 0, padded_k);
             }
-        }
-    };
-
-    int item = static_cast<int>(blockIdx.x) * Warps + warp;
-    int step = 0;
-    Slice current[Rows][Unroll];
-    fetch(item, step, current);
-
-    stream_gemv_stage<Format, Warps * 32>(x, k, chunks, corrections);
-    __syncthreads();
-
-    float acc[Rows];
 #pragma unroll
-    for (int r = 0; r < Rows; ++r) acc[r] = 0.0f;
-    while (item < items) {
-        const bool last_step = step + 1 == steps_per_item;
-        const int next_item  = last_step ? item + item_stride : item;
-        const int next_step  = last_step ? 0 : step + 1;
-        Slice next[Rows][Unroll];
-        fetch(next_item, next_step, next);
-#pragma unroll
-        for (int u = 0; u < Unroll; ++u) {
-            const int v = step * 32 * Unroll + u * 32 + lane;
-            if (v < slices) {
-                float4 xs[8];
-#pragma unroll
-                for (int i = 0; i < 8; ++i) xs[i] = chunks[v * 8 + chunk_of[i]];
-                const float correction = corrections[v];
+            for (int u = 0; u < Unroll; ++u) {
+                const int v = step * 32 * Unroll + u * 32 + lane;
 #pragma unroll
                 for (int r = 0; r < Rows; ++r) {
-                    const float dot = Format::dot(current[r][u], xs, c);
-                    acc[r]          = fmaf(Format::scale(current[r][u]), dot - correction, acc[r]);
+                    slice[r][u] = item < items && v < slices
+                                      ? Format::load(row_planes[r], slice_base + v)
+                                      : Format::empty();
                 }
             }
+        };
+
+        int item = first_item;
+        int step = 0;
+        Slice current[Rows][Unroll];
+        // The first step's loads are issued before the chunk is staged, so the two latencies
+        // overlap. The barrier first lets every warp finish reading the previous chunk.
+        fetch(item, step, current);
+        if (chunk > 0) __syncthreads();
+        stream_gemv_stage<Format, Warps * 32, Cols>(x, x_stride, k0, chunk_k, chunks, corrections);
+        __syncthreads();
+
+        float acc[Rows][Cols];
+#pragma unroll
+        for (int r = 0; r < Rows; ++r) {
+#pragma unroll
+            for (int t = 0; t < Cols; ++t) acc[r][t] = 0.0f;
         }
-        if (last_step) {
+        int item_index = warp; // this warp's n-th item has partial index n * Warps + warp
+        while (item < items) {
+            const bool last_step = step + 1 == steps_per_item;
+            const int next_item  = last_step ? item + item_stride : item;
+            const int next_step  = last_step ? 0 : step + 1;
+            Slice next[Rows][Unroll];
+            fetch(next_item, next_step, next);
 #pragma unroll
-            for (int r = 0; r < Rows; ++r) acc[r] = warp_reduce_sum(acc[r]);
-            if (lane == 0) sink.finish(item, acc);
+            for (int u = 0; u < Unroll; ++u) {
+                const int v = step * 32 * Unroll + u * 32 + lane;
+                if (v < slices) {
+                    float part[Rows][Cols];
 #pragma unroll
-            for (int r = 0; r < Rows; ++r) acc[r] = 0.0f;
+                    for (int r = 0; r < Rows; ++r) {
+#pragma unroll
+                        for (int t = 0; t < Cols; ++t) part[r][t] = 0.0f;
+                    }
+                    const auto word = [&]<int W>() {
+                        float f[Rows][8];
+#pragma unroll
+                        for (int r = 0; r < Rows; ++r) {
+                            Format::template decode_word<W>(current[r][u], c, f[r]);
+                        }
+#pragma unroll
+                        for (int t = 0; t < Cols; ++t) {
+                            const float4* xv = chunks + (t * chunk_slices + v) * 8;
+                            const float4 a   = xv[chunk_of[2 * W]];
+                            const float4 b   = xv[chunk_of[2 * W + 1]];
+                            const float xs[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+#pragma unroll
+                            for (int r = 0; r < Rows; ++r) {
+#pragma unroll
+                                for (int i = 0; i < 8; ++i) {
+                                    part[r][t] = fmaf(f[r][i], xs[i], part[r][t]);
+                                }
+                            }
+                        }
+                    };
+                    word.template operator()<0>();
+                    word.template operator()<1>();
+                    word.template operator()<2>();
+                    word.template operator()<3>();
+#pragma unroll
+                    for (int t = 0; t < Cols; ++t) {
+                        const float correction = corrections[t * chunk_slices + v];
+#pragma unroll
+                        for (int r = 0; r < Rows; ++r) {
+                            acc[r][t] = fmaf(Format::scale(current[r][u]),
+                                             part[r][t] - correction, acc[r][t]);
+                        }
+                    }
+                }
+            }
+            if (last_step) {
+#pragma unroll
+                for (int r = 0; r < Rows; ++r) {
+#pragma unroll
+                    for (int t = 0; t < Cols; ++t) acc[r][t] = warp_reduce_sum(acc[r][t]);
+                }
+                if (lane == 0) {
+                    if constexpr (!Chunked) {
+                        sink.finish(item, acc);
+                    } else {
+                        float* p = partials + item_index * Rows * Cols;
+#pragma unroll
+                        for (int r = 0; r < Rows; ++r) {
+#pragma unroll
+                            for (int t = 0; t < Cols; ++t) {
+                                p[r * Cols + t] =
+                                    chunk == 0 ? acc[r][t] : p[r * Cols + t] + acc[r][t];
+                            }
+                        }
+                    }
+                }
+#pragma unroll
+                for (int r = 0; r < Rows; ++r) {
+#pragma unroll
+                    for (int t = 0; t < Cols; ++t) acc[r][t] = 0.0f;
+                }
+                item_index += Warps;
+            }
+#pragma unroll
+            for (int u = 0; u < Unroll; ++u) {
+#pragma unroll
+                for (int r = 0; r < Rows; ++r) current[r][u] = next[r][u];
+            }
+            item = next_item;
+            step = next_step;
         }
+    }
+
+    if constexpr (Chunked) {
+        // Each warp finishes its own items, one per lane.
+        __syncwarp();
+        int n = lane;
+        for (int item = first_item + lane * item_stride; item < items;
+             item += 32 * item_stride, n += 32) {
+            const float* p = partials + (n * Warps + warp) * Rows * Cols;
+            float acc[Rows][Cols];
 #pragma unroll
-        for (int u = 0; u < Unroll; ++u) {
+            for (int r = 0; r < Rows; ++r) {
 #pragma unroll
-            for (int r = 0; r < Rows; ++r) current[r][u] = next[r][u];
+                for (int t = 0; t < Cols; ++t) acc[r][t] = p[r * Cols + t];
+            }
+            sink.finish(item, acc);
         }
-        item = next_item;
-        step = next_step;
     }
 }
 
-// Launches the streaming GEMV over `items` items of `Rows` rows each if it is enabled and K fits
-// the shared-memory budget. Returns false otherwise, and the caller launches its own schedule; the
-// two compute the same function.
-template <class Format, int Rows, class Sink>
-bool try_launch_stream_gemv_rows(const __nv_bfloat16* x, const typename Format::Planes& planes,
-                                 Sink sink, std::int32_t items, std::int32_t row_offset,
-                                 std::int32_t k, std::int32_t padded_k, cudaStream_t stream) {
+// Launches the streaming GEMV over `items` items of `Rows` rows each for `Cols` tokens (token t of
+// x at x + t * x_stride) if it is enabled and the shapes fit. Returns false otherwise, and the
+// caller launches its own schedule; the two compute the same function.
+template <class Format, int Rows, int Cols, class Sink>
+bool try_launch_stream_gemv_rows(const __nv_bfloat16* x, std::int64_t x_stride,
+                                 const typename Format::Planes& planes, Sink sink,
+                                 std::int32_t items, std::int32_t row_offset, std::int32_t k,
+                                 std::int32_t padded_k, cudaStream_t stream) {
+    static_assert(Cols >= 1 && Cols <= 8);
     if (!stream_gemv_enabled()) return false;
-    const std::size_t shared_bytes = stream_gemv_shared_bytes(k);
-    if (k % 128 != 0 || shared_bytes > static_cast<std::size_t>(kMaxDynamicSharedBytes))
-        return false;
+    if (k % 256 != 0 && Cols > 1) return false; // chunks are whole multiples of 256
+    if (k % 128 != 0 || x_stride % 8 != 0) return false;
 
     const auto launch = [&]<int Warps, int Unroll>() {
-        const auto kernel = stream_gemv_kernel<Format, Warps, Unroll, Rows, Sink>;
+        const auto single  = stream_gemv_kernel<Format, Warps, Unroll, Rows, Cols, false, Sink>;
+        const auto chunked = stream_gemv_kernel<Format, Warps, Unroll, Rows, Cols, true, Sink>;
         configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        kMaxDynamicSharedBytes);
+            const cudaError_t first = cudaFuncSetAttribute(
+                single, cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSharedBytes);
+            return first != cudaSuccess
+                       ? first
+                       : cudaFuncSetAttribute(chunked, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                              kMaxDynamicSharedBytes);
         });
-        // About one wave of resident CTAs, each streaming items until none are left.
         int device = 0;
         int sms    = 0;
-        int per_sm = 0;
         CUDA_CHECK(cudaGetDevice(&device));
         CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, Warps * 32,
-                                                                 shared_bytes));
-        const int blocks = std::max(1, std::min(div_up(items, Warps), sms * std::max(per_sm, 1)));
-        kernel<<<blocks, Warps * 32, shared_bytes, stream>>>(x, planes, sink, items, row_offset, k,
-                                                            padded_k);
+
+        // One chunk when all of K fits; then about one wave of resident CTAs.
+        std::int32_t chunk_k     = k;
+        std::size_t shared_bytes = stream_gemv_stage_bytes(k, Cols);
+        int blocks               = 0;
+        if (shared_bytes <= static_cast<std::size_t>(kMaxDynamicSharedBytes)) {
+            int per_sm = 0;
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, single, Warps * 32,
+                                                                     shared_bytes));
+            blocks = std::max(1, std::min(div_up(items, Warps), sms * std::max(per_sm, 1)));
+        } else {
+            // K-chunked: one CTA per SM; the partials take what the chunk leaves.
+            blocks = std::max(1, std::min(div_up(items, Warps), sms));
+            const std::size_t partial_bytes =
+                static_cast<std::size_t>(div_up(items, blocks * Warps)) * Warps * Rows * Cols *
+                sizeof(float);
+            const std::size_t budget = static_cast<std::size_t>(kMaxDynamicSharedBytes);
+            if (partial_bytes + stream_gemv_stage_bytes(256, Cols) > budget) return false;
+            chunk_k = static_cast<std::int32_t>(
+                (budget - partial_bytes) / stream_gemv_stage_bytes(256, Cols) * 256);
+            chunk_k      = std::min(chunk_k, k);
+            shared_bytes = stream_gemv_stage_bytes(chunk_k, Cols) + partial_bytes;
+        }
+        const auto kernel = chunk_k == k ? single : chunked;
+        kernel<<<blocks, Warps * 32, shared_bytes, stream>>>(x, x_stride, planes, sink, items,
+                                                            row_offset, k, padded_k, chunk_k);
         CUDA_CHECK(cudaGetLastError());
+        return true;
     };
-    // K <= 6144 leaves room for several CTAs per SM, and short rows favour more CTAs with one
-    // slice in flight; the long K = 17408 rows want a full SM's worth of warps and deeper prefetch.
-    // A pair already keeps two rows' slices in flight per lane.
-    if (k <= 6144) {
-        launch.template operator()<8, 1>();
-    } else if constexpr (Rows == 1) {
-        launch.template operator()<16, 2>();
+    // T = 1: K <= 6144 leaves room for several CTAs per SM, and short rows favour more CTAs with
+    // one slice in flight; the long K = 17408 rows want a full SM's worth of warps and deeper
+    // prefetch. A pair, or several tokens, already keep more work per weight in flight.
+    if constexpr (Cols == 1) {
+        if (k <= 6144) return launch.template operator()<8, 1>();
+        if constexpr (Rows == 1) {
+            return launch.template operator()<16, 2>();
+        } else {
+            return launch.template operator()<16, 1>();
+        }
     } else {
-        launch.template operator()<16, 1>();
+        return launch.template operator()<16, 1>();
     }
-    return true;
 }
 
-// The plain GEMV: rows rows, each finished through the family's Output / Epilogue.
+// The plain GEMV over `tokens` (1..8) tokens of a contiguous x: rows rows, each finished through
+// the family's Output / Epilogue with every token at once.
 template <class Format, class Output, class Epilogue>
 bool try_launch_stream_gemv(const __nv_bfloat16* x, const typename Format::Planes& planes,
                             Output output, Epilogue epilogue, std::int32_t rows, std::int32_t k,
-                            std::int32_t padded_k, cudaStream_t stream) {
-    return try_launch_stream_gemv_rows<Format, 1>(
-        x, planes, StreamGemvRowSink<Output, Epilogue>{output, epilogue}, rows, 0, k, padded_k,
-        stream);
+                            std::int32_t padded_k, cudaStream_t stream, std::int32_t tokens = 1,
+                            std::int64_t x_stride = -1) {
+    const std::int64_t stride = x_stride < 0 ? k : x_stride;
+    // From two tokens on, shared-memory reads of x' (one per token per weight) bound the kernel, so
+    // each warp streams two rows -- r and r + rows / 2 -- against every x' read: 20-36% at T = 4
+    // and 30-35% at T = 8 on a V100 (four rows spill registers and lose).
+    const bool paired = tokens >= 2 && rows % 2 == 0;
+    switch (tokens) {
+    case 1:
+        return try_launch_stream_gemv_rows<Format, 1, 1>(
+            x, stride, planes, StreamGemvRowSink<Output, Epilogue>{output, epilogue, 0}, rows, 0, k,
+            padded_k, stream);
+#define NINFER_STREAM_GEMV_TOKENS(T)                                                               \
+    case T:                                                                                        \
+        return paired ? try_launch_stream_gemv_rows<Format, 2, T>(                                 \
+                            x, stride, planes,                                                     \
+                            StreamGemvRowSink<Output, Epilogue>{output, epilogue, rows / 2},       \
+                            rows / 2, rows / 2, k, padded_k, stream)                               \
+                      : try_launch_stream_gemv_rows<Format, 1, T>(                                 \
+                            x, stride, planes,                                                     \
+                            StreamGemvRowSink<Output, Epilogue>{output, epilogue, 0}, rows, 0, k,  \
+                            padded_k, stream)
+        NINFER_STREAM_GEMV_TOKENS(2);
+        NINFER_STREAM_GEMV_TOKENS(3);
+        NINFER_STREAM_GEMV_TOKENS(4);
+        NINFER_STREAM_GEMV_TOKENS(5);
+        NINFER_STREAM_GEMV_TOKENS(6);
+        NINFER_STREAM_GEMV_TOKENS(7);
+        NINFER_STREAM_GEMV_TOKENS(8);
+#undef NINFER_STREAM_GEMV_TOKENS
+    default:
+        return false;
+    }
 }
 
 } // namespace ninfer::ops::detail

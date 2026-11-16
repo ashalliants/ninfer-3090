@@ -4,6 +4,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
+#include "ops/linear/common/stream_gemv.cuh"
 #include "ops/linear/q4/q4_gemv_launch.cuh"
 #include "ops/linear/q4/q4_ksplit_mma.cuh"
 #include "ops/linear/q4/q4_mma_launch.cuh"
@@ -291,6 +292,29 @@ void q4_linear_add_mma_r64_c128_launch(const Tensor& x, const Weight& w, Tensor&
     launch_mma<MmaR64C128>(x, w, r, s);
 }
 
+#if defined(NINFER_SM70)
+namespace {
+// T = 2..8 on sm_70: the streaming GEMV (stream_gemv.cuh) decodes each weight once for every token
+// and adds the residual through the same epilogue; the K-split routes it replaces run mma.sync,
+// which is emulated and compute-bound there. Falls back to them if the streaming GEMV declines.
+void q4_linear_add_stream_launch(const Tensor& x, const Weight& w, Tensor& r, cudaStream_t s) {
+    const std::int64_t x_stride = x.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
+    if (try_launch_stream_gemv<Q4StreamFormat>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            {static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales)},
+            residual_output(r), residual_epilogue(r), r.ne[0], w.k, w.padded_shape[1], s, x.ne[1],
+            x_stride)) {
+        return;
+    }
+    if (x.ne[1] <= 4) {
+        q4_linear_add_ksplit4_launch(x, w, r, s);
+    } else {
+        q4_linear_add_ksplit8_launch(x, w, r, s);
+    }
+}
+} // namespace
+#endif
+
 Q4LinearAddLaunch select_q4_linear_add(std::int32_t rows, std::int32_t k, std::int32_t tokens) {
     if (rows != kRows || (k != kMixerCols && k != kDownCols) || tokens <= 0) {
         throw std::invalid_argument("q4 linear_add: unsupported shape or token extent");
@@ -332,6 +356,7 @@ Q4LinearAddLaunch select_q4_linear_add(std::int32_t rows, std::int32_t k, std::i
     // that emulation: profiled on a V100-PCIE-32GB (Qwen3.8-27B decode, nsys), ksplit4 took 398 us
     // per call at K=17408 against the ~56 us its weight stream costs. The GEMV issues no mma.
     if (tokens == 1) return q4_linear_add_gemv_launch;
+    if (tokens <= 8) return q4_linear_add_stream_launch;
 #endif
     if (tokens <= 4) return q4_linear_add_ksplit4_launch;
     if (tokens <= 8) return q4_linear_add_ksplit8_launch;

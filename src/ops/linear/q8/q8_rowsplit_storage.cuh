@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/linear/common/stream_gemv_decode.cuh"
+
 #include <cuda_fp16.h>
 
 #include <cstdint>
@@ -11,6 +13,61 @@ struct Q8RowSplitStorage {
     static constexpr int kCodeBytesPerGroup  = 32;
     static constexpr int kHighBytesPerGroup  = 0;
     static constexpr int kScaleBytesPerGroup = 2;
+};
+
+// Q8 for the streaming GEMV (ops/linear/common/stream_gemv.cuh). One lane slice is one 32-weight
+// group: 32 int8 codes at consecutive k (32 bytes, two 16-byte loads) and its f16 scale. XORing a
+// word with 0x80808080 gives u = code + 128 in [0, 255], which stream_decode_bytes4 reads so that
+// every weight contributes 256x + u x; the constant and the -128 offset join the correction,
+// 384 (x_even + x_odd) per weight pair.
+struct Q8StreamFormat {
+    static constexpr const char* kName = "q8";
+    static constexpr int kGroupK       = Q8RowSplitStorage::kGroupK;
+
+    struct Planes {
+        const std::uint8_t* codes;
+        const std::uint8_t* scales;
+    };
+    struct Row {
+        const uint4* codes;
+        const std::uint16_t* scales;
+    };
+    struct Slice {
+        uint4 lo;
+        uint4 hi;
+        std::uint16_t scale;
+    };
+
+    __device__ static __forceinline__ Row row(const Planes& planes, int row, int padded_k) {
+        const std::int64_t groups = static_cast<std::int64_t>(row) * (padded_k / kGroupK);
+        return {reinterpret_cast<const uint4*>(planes.codes +
+                                               groups * Q8RowSplitStorage::kCodeBytesPerGroup),
+                reinterpret_cast<const std::uint16_t*>(
+                    planes.scales + groups * Q8RowSplitStorage::kScaleBytesPerGroup)};
+    }
+    // Slice v is group v: k 32v .. 32v + 31.
+    __device__ static __forceinline__ Slice load(const Row& row, int v) {
+        return {__ldg(&row.codes[2 * v]), __ldg(&row.codes[2 * v + 1]), __ldg(&row.scales[v])};
+    }
+    __device__ static __forceinline__ Slice empty() {
+        return {make_uint4(0u, 0u, 0u, 0u), make_uint4(0u, 0u, 0u, 0u), 0};
+    }
+    __device__ static __forceinline__ float scale(const Slice& slice) {
+        return __half2float(__ushort_as_half(slice.scale));
+    }
+    __device__ static __forceinline__ float correction(float x_even, float x_odd) {
+        return 384.0f * (x_even + x_odd);
+    }
+    // The eight operands of k offsets 8W .. 8W + 7 of the slice: code words 2W and 2W + 1.
+    template <int W>
+    __device__ static __forceinline__ void decode_word(const Slice& slice,
+                                                       const StreamDecodeConstants& c,
+                                                       float (&f)[8]) {
+        const std::uint32_t words[8] = {slice.lo.x, slice.lo.y, slice.lo.z, slice.lo.w,
+                                        slice.hi.x, slice.hi.y, slice.hi.z, slice.hi.w};
+        stream_decode_bytes4(words[2 * W] ^ 0x80808080u, c, f);
+        stream_decode_bytes4(words[2 * W + 1] ^ 0x80808080u, c, f + 4);
+    }
 };
 
 struct Q8ScalarDecodeAtom {

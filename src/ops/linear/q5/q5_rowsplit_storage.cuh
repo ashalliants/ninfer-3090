@@ -76,9 +76,10 @@ struct Q5SimtDecodeAtom {
 
 // Q5 for the streaming GEMV (ops/linear/common/stream_gemv.cuh). One lane slice is 16 code bytes
 // (32 weights, nibble i of word w at k offset 8w + i) plus their four high bytes (byte w, bit i ->
-// k offset 8w + i), value n - 16 * high. stream_dot_nibbles8 adds sum(x') + sum(n x) and
-// stream_bits8<1, 0, 16, subtract> subtracts sum_even(x') + 2 sum_odd(x') + 16 sum(high x), so the
-// constant left is -sum_odd(x'): the correction per weight pair is -16 x_odd.
+// k offset 8w + i), value n - 16 * high. Against x', stream_decode_nibbles8 contributes
+// sum(x') + sum(n x) and stream_fold_bits8<1, 0, 16, true> takes away
+// sum_even(x') + 2 sum_odd(x') + 16 sum(high x), so the constant left is -sum_odd(x'): the
+// correction per weight pair is -16 x_odd.
 struct Q5StreamFormat {
     static constexpr const char* kName = "q5";
     static constexpr int kGroupK       = Q5RowSplitStorage::kGroupK;
@@ -119,18 +120,15 @@ struct Q5StreamFormat {
     __device__ static __forceinline__ float correction(float, float x_odd) {
         return -kStreamOddScale * x_odd;
     }
-    __device__ static __forceinline__ float dot(const Slice& slice, const float4 (&chunks)[8],
-                                                const StreamDecodeConstants& c) {
+    // The eight operands of packed word W (k offsets 8W .. 8W + 7 of the slice).
+    template <int W>
+    __device__ static __forceinline__ void decode_word(const Slice& slice,
+                                                       const StreamDecodeConstants& c,
+                                                       float (&f)[8]) {
         const std::uint32_t words[4] = {slice.codes.x, slice.codes.y, slice.codes.z,
                                         slice.codes.w};
-        float acc = 0.0f;
-#pragma unroll
-        for (int w = 0; w < 4; ++w) {
-            acc = stream_dot_nibbles8(words[w], chunks[2 * w], chunks[2 * w + 1], c, acc);
-            acc = stream_bits8<1, 0, 16, true>((slice.high >> (8 * w)) & 0xffu, chunks[2 * w],
-                                               chunks[2 * w + 1], c, acc);
-        }
-        return acc;
+        stream_decode_nibbles8(words[W], c, f);
+        stream_fold_bits8<1, 0, 16, true>((slice.high >> (8 * W)) & 0xffu, c, f);
     }
 };
 

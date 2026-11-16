@@ -86,6 +86,10 @@ void q5_linear_add_small_t_mma_launch(const Tensor& x, const Weight& w, Tensor& 
     if (residual_out.ne[0] != kRows || w.n != kRows) {
         throw std::invalid_argument("q5 linear_add small-T MMA: rows must be 5120");
     }
+#if defined(NINFER_SM70)
+    // Speculative verification widths: mma.sync is emulated, and compute-bound, on sm_70.
+    if (try_q5_linear_add_stream(x, w, residual_out, stream)) return;
+#endif
     if (w.k == 6144 && w.padded_shape[1] == 6144) {
         launch_columns<6144>(x, w, residual_out, stream);
     } else if (w.k == 17408 && w.padded_shape[1] == 17408) {

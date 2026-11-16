@@ -334,14 +334,48 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
     if (lane == 0) { out[out_row] = __float2bfloat16(silu(gate_acc) * up_acc); }
 }
 
-// The streaming GEMV's pair sink: the same finish as the kernel above, gate in acc[0], up in acc[1].
+// The streaming GEMV's pair sink: the same finish as the kernels above, gate in acc[0][t], up in
+// acc[1][t], token t's row at out + t * out_stride.
 struct Q4SwiGluStreamSink {
     __nv_bfloat16* out;
+    std::int64_t out_stride;
 
-    __device__ __forceinline__ void finish(int row, const float (&acc)[2]) const {
-        out[row] = __float2bfloat16(silu(acc[0]) * acc[1]);
+    template <int Cols>
+    __device__ __forceinline__ void finish(int row, const float (&acc)[2][Cols]) const {
+#pragma unroll
+        for (int t = 0; t < Cols; ++t) {
+            out[t * out_stride + row] = __float2bfloat16(silu(acc[0][t]) * acc[1][t]);
+        }
     }
 };
+
+// Gate row r and up row r + kIntermediate as one streaming-GEMV item (stream_gemv.cuh), for
+// tokens 1..8. Returns false when the streaming GEMV is off or the tensors do not fit it.
+bool try_launch_swiglu_stream(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    const std::int64_t x_stride   = x.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
+    const std::int64_t out_stride = out.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
+    const auto* x_data            = static_cast<const __nv_bfloat16*>(x.data);
+    const Q4StreamFormat::Planes planes{static_cast<const std::uint8_t*>(w.qdata),
+                                        static_cast<const std::uint8_t*>(w.scales)};
+    const Q4SwiGluStreamSink sink{static_cast<__nv_bfloat16*>(out.data), out_stride};
+    switch (x.ne[1]) {
+#define NINFER_SWIGLU_STREAM_TOKENS(T)                                                             \
+    case T:                                                                                        \
+        return try_launch_stream_gemv_rows<Q4StreamFormat, 2, T>(                                  \
+            x_data, x_stride, planes, sink, kIntermediate, kIntermediate, kK, kK, stream)
+        NINFER_SWIGLU_STREAM_TOKENS(1);
+        NINFER_SWIGLU_STREAM_TOKENS(2);
+        NINFER_SWIGLU_STREAM_TOKENS(3);
+        NINFER_SWIGLU_STREAM_TOKENS(4);
+        NINFER_SWIGLU_STREAM_TOKENS(5);
+        NINFER_SWIGLU_STREAM_TOKENS(6);
+        NINFER_SWIGLU_STREAM_TOKENS(7);
+        NINFER_SWIGLU_STREAM_TOKENS(8);
+#undef NINFER_SWIGLU_STREAM_TOKENS
+    default:
+        return false;
+    }
+}
 
 } // namespace
 
@@ -350,14 +384,7 @@ void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor&
     if (w.n != kN || w.k != kK || w.padded_shape[1] != kK) {
         throw std::invalid_argument("q4 linear_swiglu GEMV requires weight [34816,5120]");
     }
-    // Gate row r and up row r + kIntermediate as one streaming-GEMV item (stream_gemv.cuh).
-    if (try_launch_stream_gemv_rows<Q4StreamFormat, 2>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            {static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales)},
-            Q4SwiGluStreamSink{static_cast<__nv_bfloat16*>(out.data)}, kIntermediate,
-            kIntermediate, kK, kK, stream)) {
-        return;
-    }
+    if (try_launch_swiglu_stream(x, w, out, stream)) return;
     const int grid = kIntermediate / kPairsPerBlock;
     q4_linear_swiglu_gemv_pair_kernel<<<grid, kBlockThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
@@ -369,6 +396,12 @@ void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Ten
                                            cudaStream_t stream) {
     if (x.ne[1] < 2 || x.ne[1] > 32) {
         throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..32");
+    }
+    // T = 2..8 (speculative verification): the streaming GEMV decodes each weight once for every
+    // token, where the small-T kernel below runs mma.sync -- emulated, and compute-bound, on sm_70.
+    if (w.n == kN && w.k == kK && w.padded_shape[1] == kK &&
+        try_launch_swiglu_stream(x, w, out, stream)) {
+        return;
     }
     // A width that fills its tile needs no runtime column count, and dropping it is worth 2-4% at
     // sixteen and twenty-four columns (bench/ops/q4_linear_swiglu_schedule_bench.cu prices it

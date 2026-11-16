@@ -43,54 +43,69 @@ struct StreamDecodeConstants {
     std::uint32_t one;         // fp32 1.0
     std::uint32_t two;         // fp32 2.0
     std::uint32_t four;        // fp32 4.0
+    std::uint32_t sixteen;     // fp32 16.0
+    std::uint32_t byte;        // bits 15..22
     std::uint32_t bit19;
     std::uint32_t bit22;
 
     __device__ __forceinline__ static StreamDecodeConstants make() {
-        StreamDecodeConstants c{0x00078000u, 0x00780000u, 0x3f800000u, 0x40000000u,
-                                0x40800000u, 1u << 19,    1u << 22};
+        StreamDecodeConstants c{0x00078000u, 0x00780000u, 0x3f800000u, 0x40000000u, 0x40800000u,
+                                0x41800000u, 0x007f8000u, 1u << 19,    1u << 22};
         // Opaque to the compiler, so it keeps them in registers instead of folding immediates.
         asm volatile(""
                      : "+r"(c.low_nibble), "+r"(c.high_nibble), "+r"(c.one), "+r"(c.two),
-                       "+r"(c.four), "+r"(c.bit19), "+r"(c.bit22));
+                       "+r"(c.four), "+r"(c.sixteen), "+r"(c.byte), "+r"(c.bit19), "+r"(c.bit22));
         return c;
     }
 };
 
-// sum over eight weights of nibble * x', for one packed code word: nibble i (bits 4i..4i+3) is the
-// weight at k offset i, and x0 / x1 hold x' for offsets 0..3 / 4..7. Returns
-// sum(x') + sum(nibble * x) over the eight, the caller folding sum(x') into its correction.
-__device__ __forceinline__ float stream_dot_nibbles8(std::uint32_t word, const float4& x0,
-                                                     const float4& x1,
-                                                     const StreamDecodeConstants& c, float acc) {
-    // One shift places two nibbles: nibble 2j at bits 15..18 and nibble 2j+1 at bits 19..22.
+// A format decodes each packed word of a lane slice into eight fp32 operands f[i] (weight at k
+// offset i), and the GEMV forms sum_i f[i] * x'[i] for every token it streams: one decode serves
+// all of them. The helpers below build f.
+
+// f[i] = the magic float of nibble i (bits 4i..4i+3) of `word`: 1 + n/256 for even i, 1 + n/16 for
+// odd i, so sum_i f[i] x'[i] = sum(x') + sum(n x). One shift places two nibbles (2j at bits 15..18,
+// 2j+1 at 19..22), so a word costs four shifts and eight LOP3s.
+__device__ __forceinline__ void stream_decode_nibbles8(std::uint32_t word,
+                                                       const StreamDecodeConstants& c,
+                                                       float (&f)[8]) {
     const std::uint32_t s0 = word << 15, s1 = word << 7, s2 = word >> 1, s3 = word >> 9;
-    acc = fmaf(stream_lop_magic(s0, c.low_nibble, c.one), x0.x, acc);
-    acc = fmaf(stream_lop_magic(s0, c.high_nibble, c.one), x0.y, acc);
-    acc = fmaf(stream_lop_magic(s1, c.low_nibble, c.one), x0.z, acc);
-    acc = fmaf(stream_lop_magic(s1, c.high_nibble, c.one), x0.w, acc);
-    acc = fmaf(stream_lop_magic(s2, c.low_nibble, c.one), x1.x, acc);
-    acc = fmaf(stream_lop_magic(s2, c.high_nibble, c.one), x1.y, acc);
-    acc = fmaf(stream_lop_magic(s3, c.low_nibble, c.one), x1.z, acc);
-    acc = fmaf(stream_lop_magic(s3, c.high_nibble, c.one), x1.w, acc);
-    return acc;
+    f[0] = stream_lop_magic(s0, c.low_nibble, c.one);
+    f[1] = stream_lop_magic(s0, c.high_nibble, c.one);
+    f[2] = stream_lop_magic(s1, c.low_nibble, c.one);
+    f[3] = stream_lop_magic(s1, c.high_nibble, c.one);
+    f[4] = stream_lop_magic(s2, c.low_nibble, c.one);
+    f[5] = stream_lop_magic(s2, c.high_nibble, c.one);
+    f[6] = stream_lop_magic(s3, c.low_nibble, c.one);
+    f[7] = stream_lop_magic(s3, c.high_nibble, c.one);
 }
 
-// Adds or subtracts Scale * sum(bit_i * x[i]) over eight weights, where the bit of the weight at
-// k offset i sits at bit Stride * i + Offset of `bits` (Q5's high plane: stride 1; Q6's two high
-// planes: stride 2, offsets 0 and 1). Scale is 16 or 32.
+// f[j] for the four bytes of `word` (byte j = the weight at k offset j, value u in 0..255): u sits
+// at bits 15..22 under 1.0 for even j (1 + u/256, times x' = 256x) and under 16.0 for odd j
+// (16 + u/16, times x' = 16x), so every weight contributes 256x + u x. One shift and one LOP3 per
+// weight.
+__device__ __forceinline__ void stream_decode_bytes4(std::uint32_t word,
+                                                     const StreamDecodeConstants& c, float* f) {
+    f[0] = stream_lop_magic(word << 15, c.byte, c.one);
+    f[1] = stream_lop_magic(word << 7, c.byte, c.sixteen);
+    f[2] = stream_lop_magic(word >> 1, c.byte, c.one);
+    f[3] = stream_lop_magic(word >> 9, c.byte, c.sixteen);
+}
+
+// Folds a plane of one bit per weight into f: f[i] += or -= the magic float of the bit of weight i,
+// which sits at bit Stride * i + Offset of `bits` (Q5's high plane: stride 1; Q6's two high planes:
+// stride 2, offsets 0 and 1).
 //
 // Each bit is shifted to bit 19 (even i) or bit 22 (odd i) and read under a magic exponent:
-// 1 + b/16 and 2 + b against x' = 256x and 16x give 16x per set bit; doubling the magics (2.0 and
-// 4.0) gives 32x. Every set bit is one LOP3 and one FFMA, and shifts shared between weights are
-// computed once. The constant part, Mult * (sum_even(x') + 2 sum_odd(x')) with Mult = Scale / 16,
-// enters with the same sign and is folded into the caller's correction.
+// 1 + b/16 and 2 + b, against x' = 256x and 16x, give 16x per set bit; doubled magics (2.0 and 4.0)
+// give 32x (Scale). The constant part, (Scale / 16) * (sum_even(x') + 2 sum_odd(x')), enters with
+// the same sign and is folded into the format's correction. Both terms of every sum are small
+// dyadic numbers, so f stays exact.
 template <int Stride, int Offset, int Scale, bool Subtract>
-__device__ __forceinline__ float stream_bits8(std::uint32_t bits, const float4& x0, const float4& x1,
-                                              const StreamDecodeConstants& c, float acc) {
+__device__ __forceinline__ void stream_fold_bits8(std::uint32_t bits,
+                                                  const StreamDecodeConstants& c, float (&f)[8]) {
     static_assert(Scale == 16 || Scale == 32, "magics exist for 16x and 32x per set bit");
     constexpr bool kDouble = Scale == 32;
-    const float xs[8]      = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         constexpr int kEvenTarget = 19, kOddTarget = 22;
@@ -100,9 +115,9 @@ __device__ __forceinline__ float stream_bits8(std::uint32_t bits, const float4& 
         const std::uint32_t mask  = (i & 1) ? c.bit22 : c.bit19;
         const std::uint32_t magic =
             kDouble ? ((i & 1) ? c.four : c.two) : ((i & 1) ? c.two : c.one);
-        acc = fmaf(stream_lop_magic(moved, mask, magic), Subtract ? -xs[i] : xs[i], acc);
+        const float term = stream_lop_magic(moved, mask, magic);
+        f[i]             = Subtract ? f[i] - term : f[i] + term;
     }
-    return acc;
 }
 
 } // namespace ninfer::ops::detail

@@ -45,7 +45,7 @@ struct Q4SimtDecodeAtom {
 // Q4 for the streaming GEMV (ops/linear/common/stream_gemv.cuh). One lane slice is 16 code bytes,
 // half a group: 32 weights at consecutive k, nibble i of word w at k offset 8w + i, value
 // (n ^ 8) - 8. XORing the word with 0x88888888 gives m = value + 8 in [0, 15], which
-// stream_dot_nibbles8 decodes; the -8 joins the activation correction, so per weight pair
+// stream_decode_nibbles8 decodes; the -8 joins the activation correction, so per weight pair
 // (x_even, x_odd) the correction is x' + 8x = 264 x_even + 24 x_odd.
 struct Q4StreamFormat {
     static constexpr const char* kName = "q4";
@@ -83,17 +83,14 @@ struct Q4StreamFormat {
         return fmaf(x_even, kStreamEvenScale + 8.0f, x_odd * (kStreamOddScale + 8.0f));
     }
     // x' for k offsets 8w .. 8w + 7 of the slice are chunks[2w] and chunks[2w + 1].
-    __device__ static __forceinline__ float dot(const Slice& slice, const float4 (&chunks)[8],
-                                                const StreamDecodeConstants& c) {
+    // The eight operands of packed word W (k offsets 8W .. 8W + 7 of the slice).
+    template <int W>
+    __device__ static __forceinline__ void decode_word(const Slice& slice,
+                                                       const StreamDecodeConstants& c,
+                                                       float (&f)[8]) {
         const std::uint32_t words[4] = {slice.codes.x, slice.codes.y, slice.codes.z,
                                         slice.codes.w};
-        float acc = 0.0f;
-#pragma unroll
-        for (int w = 0; w < 4; ++w) {
-            acc = stream_dot_nibbles8(words[w] ^ 0x88888888u, chunks[2 * w], chunks[2 * w + 1], c,
-                                      acc);
-        }
-        return acc;
+        stream_decode_nibbles8(words[W] ^ 0x88888888u, c, f);
     }
 };
 
