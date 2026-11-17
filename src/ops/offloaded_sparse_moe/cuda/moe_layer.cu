@@ -680,9 +680,9 @@ __global__ void __launch_bounds__(kThreads)
 constexpr int kRegistersRows      = kWarps;                            // intermediates per item: one a warp
 constexpr int kRegistersRowBlocks = moe::kIntermediate / kRegistersRows; // 80 items per job
 #if defined(NINFER_SM70)
-constexpr bool kGateUpSingleColumnPath = true;
+constexpr bool kSingleColumnJobPath = true;
 #else
-constexpr bool kGateUpSingleColumnPath = false;
+constexpr bool kSingleColumnJobPath = false;
 #endif
 constexpr int kRegistersBlocksPerSm = 2; // the launch bound; the grid follows the measured occupancy
 
@@ -803,7 +803,7 @@ __global__ void __launch_bounds__(kThreads, kRegistersBlocksPerSm)
                 cd[c]        = xd + t * kXGroups;
             }
             float gv[NC], uv[NC];
-            if (kGateUpSingleColumnPath && NC > 1 && n == 1) {
+            if (kSingleColumnJobPath && NC > 1 && n == 1) {
                 // A job of one column (most of a verify round's): the one-column body, without the
                 // multi-column body's per-column guards. The same operations on column 0.
                 float g1[1], u1[1];
@@ -916,8 +916,17 @@ __global__ void __launch_bounds__(kThreads)
             if (!kDownInPlace || half == 0) { __syncthreads(); } // the cast columns, and the staged half
             for (int row0 = half * kDownRows / 2 + RD * warp; row0 < (half + 1) * kDownRows / 2; row0 += RD * kWarps) {
                 float v[RD][NC];
-                row_dots<D, NC, RD>(stage + static_cast<std::size_t>(row0) * g.down_row_bytes, g.down_row_bytes, kSubs,
-                                    sm.hq, sm.hd, kHGroups, n, v, table);
+                if (kSingleColumnJobPath && NC > 1 && n == 1) {
+                    // One column (most jobs of a verify round): the one-column body, same bits.
+                    float v1[RD][1];
+                    row_dots<D, 1, RD>(stage + static_cast<std::size_t>(row0) * g.down_row_bytes, g.down_row_bytes,
+                                       kSubs, sm.hq, sm.hd, kHGroups, 1, v1, table);
+#pragma unroll
+                    for (int r = 0; r < RD; ++r) { v[r][0] = v1[r][0]; }
+                } else {
+                    row_dots<D, NC, RD>(stage + static_cast<std::size_t>(row0) * g.down_row_bytes, g.down_row_bytes,
+                                        kSubs, sm.hq, sm.hd, kHGroups, n, v, table);
+                }
                 if (lane < n) {
                     const int column = dispatch.entries[first + pass + lane];
 #pragma unroll
