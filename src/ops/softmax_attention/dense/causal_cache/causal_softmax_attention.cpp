@@ -363,10 +363,20 @@ constexpr std::array<std::array<std::int8_t, 10>, 6> kH16ChunkTokens{{
     {6, 6, 6, 6, 6, 6, 6, 6, 6, 6}, // > 8198
 }};
 
+#if defined(NINFER_SM70)
+constexpr std::int32_t kVoltaVerifyChunkTokens = 2;
+#endif
+
 std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t width,
                                            std::int32_t batch_size, KvCacheStorage storage,
                                            CausalAttentionExecutionEnvelope envelope) {
     if (batch_size != 1 || !int8_family_storage(storage)) { return q_heads == 16 ? 6 : 8; }
+#if defined(NINFER_SM70)
+    // Two tokens keep a chunk on one row tile (12 rows on the 27B, 16 on the 35B), the row-tile
+    // count the partial kernel's dp4a / CUDA-core path serves (small_t_i8.cuh, SimtDecode); wider
+    // chunks run its QK and PV on the shuffle emulation of mma (resolve_route below).
+    return kVoltaVerifyChunkTokens;
+#endif
     const std::uint32_t tier = int8_family_chunk_tier(q_heads, envelope.max_visible_keys);
     if (q_heads == 16) { return kH16ChunkTokens[tier][static_cast<std::size_t>(width - 7)]; }
     // INT8-G64 keeps 5 + 4/5 at W 9-10 above 8198 keys too, as it did; there rk8v4 measured 2-3 %
@@ -510,6 +520,15 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
         envelope.max_visible_keys <= int8_family_prompt_keys(q_heads, width, storage)) {
         return CausalAttentionRoute::Prompt;
     }
+#if defined(NINFER_SM70)
+    // sm_70: a single-sequence INT8-family verify of three or more columns runs as two-token
+    // chunks on the CUDA-core small-T path rather than one launch on emulated mma. Qwen3.8-27B,
+    // ~2.1K keys, per call: T=4 141 -> ~120 us, T=6 328 -> ~180 us (see causal_attention_chunk_tokens).
+    if (int8_family && batch_size == 1 && width > kVoltaVerifyChunkTokens &&
+        width <= kMaximumVerifyTokens) {
+        return CausalAttentionRoute::ChunkedSmallT;
+    }
+#endif
     if (q_heads == 24 && width <= kMaximumVerifyTokens) {
         if (batch_size == 1 && !int8_family) {
             std::uint32_t prompt_limit = 0;
