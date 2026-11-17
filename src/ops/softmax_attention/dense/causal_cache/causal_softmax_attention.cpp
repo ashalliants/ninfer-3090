@@ -523,7 +523,8 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
 #if defined(NINFER_SM70)
     // sm_70: a single-sequence INT8-family verify of three or more columns runs as two-token
     // chunks on the CUDA-core small-T path rather than one launch on emulated mma. Qwen3.8-27B,
-    // ~2.1K keys, per call: T=4 141 -> ~120 us, T=6 328 -> ~180 us (see causal_attention_chunk_tokens).
+    // ~2.1K keys, an MTP5 verify (T=6): 328 us -> three chunks of 54 us (nsys; see
+    // causal_attention_chunk_tokens).
     if (int8_family && batch_size == 1 && width > kVoltaVerifyChunkTokens &&
         width <= kMaximumVerifyTokens) {
         return CausalAttentionRoute::ChunkedSmallT;
