@@ -60,8 +60,15 @@ Speculative decoding (same prompt, 200 greedy tokens, `--lm-head-draft`):
 |---|---|---|---|
 | T = 1 work above only | 42.1 | 26.0 | 36.7 |
 | + streaming GEMV for T = 2..8 and the Q8 drafter | 41.4-42 | 69.8 | 46.4 |
+| + verify widths (input projections, tensor-core GEMV, chunked attention) | 42.2 | 76.1 | 67.6 |
 
-Acceptance on that prompt: MTP3 3.3 tokens per round, DFlash2 5.2.
+Acceptance on that prompt: MTP3 3.3 tokens per round, DFlash2 5.2. Without `--lm-head-draft` MTP3
+reads 77.4 (same acceptance): on this card the optimized proposal head is not faster.
+
+Across three kinds of text (200 greedy tokens each; code / technical prose / fiction), MTP3 remains
+the best setting: 76.1 / 68.0 / 48.2 tok/s at 76 / 65 / 36% acceptance, against 66.7 / 58.5 / 38.0
+for MTP4, 68.8 / 54.4 / 32.7 for MTP5 and 65.6 / 41.1 / 27.4 for DFlash2 K=7. MTP2 edges it on
+fiction (50.7). At a 16K-token context (bench corpus) plain decode is 38.7 tok/s.
 
 The model's weight floor at 879 GB/s is 17.4 ms per token (`tools/perf_model.py`), about 57 tok/s.
 
