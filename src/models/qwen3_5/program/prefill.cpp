@@ -85,7 +85,8 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
-    card.set_prefill_state_split(state.state_split_frontier, state.state_split_slot);
+    card.set_prefill_state_split(state.state_split_frontier, state.state_split_slot,
+                                 state.state_split_boundaries);
     card.set_layer_ready(state.layer_ready);
     card.set_prefill_slice(slice);
     const std::span<const int> prompt(ids.data(), ids.size());
@@ -748,13 +749,19 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
                 // The prompt's last call takes its checkpoint without ending there
                 // (merge_capture_split): one pass over the weights instead of one per piece.
-                schedule_state.state_split_frontier = -1;
-                bool merged_capture                 = false;
+                schedule_state.state_split_frontier   = -1;
+                schedule_state.state_split_boundaries = {};
+                bool merged_capture                   = false;
                 if (final_candidate && capture_frontier && !staged.vision && !sliced_call &&
                     merge_capture_split(sequence, request, *capture_frontier,
                                         staged.prompt_tokens)) {
                     merged_capture = true;
                     split_frontier.reset();
+                    // The rewrite execution frontiers this call now runs through stay GDN
+                    // decomposition points (TextContext::set_prefill_state_split), so a resumed
+                    // request and a cold one still decompose the recurrent state alike.
+                    schedule_state.state_split_boundaries = std::span<const std::uint32_t>(
+                        rewrite_split, staged.prompt.identity.rewrite_execution_frontiers.end());
                     const std::int32_t slot =
                         state_store->physical_slot(request.capture_reservation->state);
                     schedule_state.state_split_frontier = *capture_frontier;
@@ -823,7 +830,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                           prefill_hidden.slice(
                               1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
                 sequence.tail_hidden_valid = true;
-                if (merged_capture) { request.capture_prefilled = true; }
+                if (merged_capture) {
+                    if (staged.cursor <= *capture_frontier) {
+                        throw std::logic_error("merged capture call stopped before its frontier");
+                    }
+                    request.capture_prefilled = true;
+                }
                 const bool reached_capture = capture_frontier && staged.cursor == *capture_frontier;
                 if (reached_capture) {
                     if (result.finalized) {

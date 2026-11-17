@@ -1042,22 +1042,23 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         Tensor conv_state_in       = gdn_pool.pool->conv_slot(gdn_pool.local, linear_state_source_slot_);
         Tensor conv_state_out =
             gdn_pool.pool->conv_slot(gdn_pool.local, linear_state_destination_slot_);
-        if (const std::int32_t at = active_state_split_column_; at > 0) {
-            // A checkpoint inside the chunk (set_prefill_state_split): columns [0, at) end in the
-            // checkpoint's slot, and the rest start from it.
+        if (active_state_cut_count_ > 0) {
+            // A checkpoint inside the chunk (set_prefill_state_split): the columns run in pieces
+            // at every cut, the piece ending at the checkpoint into its slot and the others into
+            // the destination, each starting from the state the previous one left.
             Tensor conv_state_at =
                 gdn_pool.pool->conv_slot(gdn_pool.local, prefill_state_split_slot_);
-            const auto columns = [](const Tensor& t, std::int32_t first, std::int32_t count) {
-                return t.slice(1, first, count);
-            };
-            Tensor qkv0 = columns(qkv, 0, at), qc0 = columns(qc, 0, at), kc0 = columns(kc, 0, at),
-                   vc0 = columns(vc, 0, at);
-            Tensor qkv1 = columns(qkv, at, T - at), qc1 = columns(qc, at, T - at),
-                   kc1 = columns(kc, at, T - at), vc1 = columns(vc, at, T - at);
-            ops::causal_conv1d_silu_split(qkv0, p.convolution, conv_state_in, conv_state_at, qc0,
-                                          kc0, vc0, s);
-            ops::causal_conv1d_silu_split(qkv1, p.convolution, conv_state_at, conv_state_out, qc1,
-                                          kc1, vc1, s);
+            for_each_state_piece(T, [&](std::int32_t first, std::int32_t count, bool from_split,
+                                        bool into_split, bool from_source) {
+                const Tensor& in = from_source ? conv_state_in
+                                   : from_split ? conv_state_at
+                                                : conv_state_out;
+                Tensor& out      = into_split ? conv_state_at : conv_state_out;
+                Tensor x_part = qkv.slice(1, first, count), q_part = qc.slice(1, first, count),
+                       k_part = kc.slice(1, first, count), v_part = vc.slice(1, first, count);
+                ops::causal_conv1d_silu_split(x_part, p.convolution, in, out, q_part, k_part,
+                                              v_part, s);
+            });
         } else {
             ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc,
                                           kc, vc, s);
@@ -1119,21 +1120,23 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             recurrent_pool.local, linear_state_destination_slot_);
         const float scale = static_cast<float>(
             1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim)));
-        if (const std::int32_t at = active_state_split_column_; at > 0) {
-            // As the convolution above: [0, at) into the checkpoint's slot, the rest from it.
+        if (active_state_cut_count_ > 0) {
+            // In the convolution's pieces (above).
             Tensor recurrent_state_at =
                 recurrent_pool.pool->recurrent_slot(recurrent_pool.local, prefill_state_split_slot_);
-            const auto part = [&](std::int32_t first, std::int32_t count, const Tensor& in,
-                                  Tensor& out_state) {
-                Tensor out_part = o.slice(2, first, count);
+            for_each_state_piece(T, [&](std::int32_t first, std::int32_t count, bool from_split,
+                                        bool into_split, bool from_source) {
+                const Tensor& in = from_source ? recurrent_state_in
+                                   : from_split ? recurrent_state_at
+                                                : recurrent_state_out;
+                Tensor& out      = into_split ? recurrent_state_at : recurrent_state_out;
+                Tensor out_part  = o.slice(2, first, count);
                 ops::gated_delta_net(q_recurrent.slice(2, first, count),
                                      k_recurrent.slice(2, first, count), vv.slice(2, first, count),
                                      g.slice(1, first, count), beta.slice(1, first, count), scale,
-                                     /*normalize_qk=*/true, work_, in, out_state, out_part,
+                                     /*normalize_qk=*/true, work_, in, out, out_part,
                                      ctx_.execution_view());
-            };
-            part(0, at, recurrent_state_in, recurrent_state_at);
-            part(at, T - at, recurrent_state_at, recurrent_state_out);
+            });
         } else {
             ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, scale,
                                  /*normalize_qk=*/true, work_, recurrent_state_in,
@@ -1582,6 +1585,25 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             const std::int64_t state_split = prefill_state_split_frontier_ - base64 - t0;
             active_state_split_column_ =
                 state_split > 0 && state_split < len ? static_cast<std::int32_t>(state_split) : -1;
+            active_state_cut_count_ = 0;
+            if (active_state_split_column_ > 0) {
+                std::array<std::int32_t, kMaxStateCuts> cuts{};
+                int count      = 0;
+                cuts[count++]  = active_state_split_column_;
+                for (const std::uint32_t boundary : prefill_state_split_boundaries_) {
+                    const std::int64_t column = static_cast<std::int64_t>(boundary) - base64 - t0;
+                    if (column <= 0 || column >= len || column == active_state_split_column_) {
+                        continue;
+                    }
+                    if (count == kMaxStateCuts) {
+                        throw std::logic_error("prefill state split has too many boundaries");
+                    }
+                    cuts[count++] = static_cast<std::int32_t>(column);
+                }
+                std::sort(cuts.begin(), cuts.begin() + count);
+                active_state_cuts_      = cuts;
+                active_state_cut_count_ = count;
+            }
         }
         work_.reset();
 
@@ -1723,9 +1745,11 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     CUDA_CHECK(cudaMemcpyAsync(parked.data, x.data, x.bytes(),
                                                cudaMemcpyDeviceToDevice, s));
                     ++prefill_slice_->index;
-                    prefill_split_frontier_       = -1;
-                    prefill_state_split_frontier_ = -1;
-                    active_state_split_column_    = -1;
+                    prefill_split_frontier_         = -1;
+                    prefill_state_split_frontier_   = -1;
+                    prefill_state_split_boundaries_ = {};
+                    active_state_split_column_      = -1;
+                    active_state_cut_count_         = 0;
                     if (prefill_gpu_timer_) { prefill_gpu_timer_->record_stop(); }
                     timing.begin_wait();
                     ctx_.synchronize();
@@ -1892,9 +1916,11 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         break;
     }
 
-    prefill_split_frontier_       = -1;
-    prefill_state_split_frontier_ = -1;
-    active_state_split_column_    = -1;
+    prefill_split_frontier_         = -1;
+    prefill_state_split_frontier_   = -1;
+    prefill_state_split_boundaries_ = {};
+    active_state_split_column_      = -1;
+    active_state_cut_count_         = 0;
 
     if (prefill_gpu_timer_) { prefill_gpu_timer_->record_stop(); }
     timing.begin_wait();

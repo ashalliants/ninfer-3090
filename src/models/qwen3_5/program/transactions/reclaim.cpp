@@ -1130,6 +1130,15 @@ bool ProgramImpl::drop_redundant_device_state() noexcept {
 
 bool ProgramImpl::start_state_writeback() {
     if (context_transaction_) { return false; }
+    // Only when the next admission would have to demote (the Device pool is full), and never into
+    // the last quarter of the Host pool: the copies take free slots only, but a redundant Host
+    // copy still holds its slot until something reclaims it.
+    if (state_store->device_occupied() < state_store->device_capacity()) { return false; }
+    const std::uint32_t host_capacity = state_store->host_capacity();
+    if (host_capacity == 0 ||
+        state_store->host_occupied() + 1 > host_capacity - host_capacity / 4) {
+        return false;
+    }
     for (const auto& slot : checkpoints) {
         if (!slot.value || slot.pins) { continue; }
         const auto handle = slot.value->state;

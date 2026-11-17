@@ -504,6 +504,8 @@ void ProgramImpl::abort_context() noexcept {
         }
         if (tx.kind == ContextOperationKind::Capture) {
             auto& state = sequences[tx.lane];
+            // A prefilled capture's written slot is released below with the reservation.
+            requests[tx.lane].capture_prefilled = false;
             refresh_history_requirements(state.kv);
             if (state_store->role(state.state.read) == StateImageRole::CheckpointImmutable &&
                 !state_store->checkpoint_references(state.state.read)) {

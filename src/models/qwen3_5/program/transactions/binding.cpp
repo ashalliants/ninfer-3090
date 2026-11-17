@@ -156,11 +156,12 @@ bool ProgramImpl::prompt_fits_beside_residents(const RequestBasePlan& base,
     // Live reservations are pages residents will map as they grow, and lent pages are gone from the
     // pool, so the pool's own counters decide what is left (reclaimable checkpoint pages stay free).
     // Optional capture tails are reservations too, but binding reclaims them first, so they are not
-    // a reason to defer.
+    // a reason to defer -- except a prefilled capture's, which reclaim keeps (its slot already
+    // holds the checkpoint).
     std::uint32_t capture_main = 0, capture_backend = 0;
     for (const auto& request : requests) {
         const auto& ticket = request.capture_reservation;
-        if (!ticket) { continue; }
+        if (!ticket || request.capture_prefilled) { continue; }
         if (ticket->main_tail) { capture_main += ticket->main_tail->pages(); }
         if (ticket->backend_tail) { capture_backend += ticket->backend_tail->pages(); }
     }

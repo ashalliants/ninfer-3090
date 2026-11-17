@@ -145,6 +145,10 @@ public:
         return host_ == nullptr ? 0U : host_->occupied();
     }
 
+    [[nodiscard]] std::uint32_t host_capacity() const noexcept {
+        return host_ == nullptr ? 0U : host_->capacity();
+    }
+
     [[nodiscard]] std::optional<StateImageHandle> reserve_destination() noexcept {
         return allocate(StateImageRole::ReservedDestination, true);
     }

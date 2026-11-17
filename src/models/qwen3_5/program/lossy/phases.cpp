@@ -124,6 +124,7 @@ PrefillProgress ProgramImpl::advance_lossy_scout(std::uint32_t lane,
             // groups past M describes the uncompacted prompt and is never used.
             request.recovery.reset();
             request.capture_reservation.reset();
+            request.capture_prefilled = false;
             begin_scout(handle);
             lossy.phase = LossyPhase::Scout;
         }

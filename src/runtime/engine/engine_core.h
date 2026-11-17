@@ -458,6 +458,7 @@ public:
         require_suspend_enabled();
         std::scoped_lock lock(execution_mutex_);
         device_.bind_to_current_thread();
+        drain_idle_state_writeback();
         if (suspended_.load(std::memory_order_acquire)) {
             auto_resume_.store(auto_resume.value_or(suspend_options_.auto_resume),
                                std::memory_order_release);
@@ -676,6 +677,7 @@ public:
     bool restore_image(std::span<const std::uint8_t> image, std::uint64_t read_ns = 0) {
         std::scoped_lock lock(execution_mutex_);
         device_.bind_to_current_thread();
+        drain_idle_state_writeback();
         auto& program = *instance_.program;
         if (program.has_context_transaction() || suspended_.load(std::memory_order_acquire)) {
             return false;
@@ -705,6 +707,7 @@ public:
                               Clock::time_point deadline) {
         std::scoped_lock lock(execution_mutex_);
         device_.bind_to_current_thread();
+        drain_idle_state_writeback();
         auto& program = *instance_.program;
         if (suspended_.load(std::memory_order_acquire)) {
             // Persisting copies device state out, so a model that resumes on demand comes back
@@ -2517,7 +2520,11 @@ private:
             }
             context_owner_.reset();
         }
-        if (progress.kind == decltype(progress.kind)::Demote) { scheduler_.capacity_released(); }
+        // An idle write-back (start_idle_state_writeback) keeps its Device copy: nothing freed.
+        const bool writeback = std::exchange(idle_writeback_open_, false);
+        if (progress.kind == decltype(progress.kind)::Demote && !writeback) {
+            scheduler_.capacity_released();
+        }
         request_admission_check();
         return true;
     }
@@ -4131,23 +4138,45 @@ private:
         } catch (...) {}
     }
 
-    // Writes at most one idle retained continuation to the store. Called by the worker between
-    // units, never while a request waits for admission, binds, prefills or replays, so keeping
-    // the store current does not delay a request already waiting; at least a second apart.
-    // With nothing resident, copy the Program's Device-only checkpoint states to free Host slots
-    // (keeping the Device copies), one per context transaction. The next request's admission
-    // would otherwise demote one synchronously -- a ~150 MiB copy ahead of its prefill (47 ms on a
-    // V100 eGPU link) -- where now it only drops the Device copy. Programs without it skip this.
+    // With nothing resident or waiting, copy the Program's Device-only checkpoint states to free
+    // Host slots (keeping the Device copies), one per context transaction, while its Device pool
+    // is full. The next request's admission would otherwise demote one synchronously -- a
+    // ~150 MiB copy ahead of its prefill (47 ms on a V100 eGPU link) -- where now it only drops
+    // the Device copy. Programs without it skip this. Worker-only.
     void start_idle_state_writeback() {
         if constexpr (requires { instance_.program->start_state_writeback(); }) {
+            if (!instance_.program->has_context_transaction()) { idle_writeback_open_ = false; }
             if (materializing_ || context_owner_ || !resident_empty() || !paused_.empty() ||
-                instance_.program->has_context_transaction()) {
+                admission_decision_ || instance_.program->has_context_transaction()) {
                 return;
             }
-            (void)instance_.program->start_state_writeback();
+            {
+                std::lock_guard queue_lock(queue_mutex_);
+                if (!pending_.empty() || !sibling_waits_.empty()) { return; }
+            }
+            idle_writeback_open_ = instance_.program->start_state_writeback();
         }
     }
 
+    // Finishes an idle write-back (start_idle_state_writeback) still in flight, so callers that
+    // need no open context transaction -- persistence, suspend, image restore -- wait for one Host
+    // copy instead of refusing. Requires execution_mutex_.
+    void drain_idle_state_writeback() {
+        if (!idle_writeback_open_) { return; }
+        while (instance_.program->has_context_transaction()) {
+            auto progress = instance_.program->poll_context(CancellationFlagView{});
+            if (progress.complete) {
+                record_context_work(progress, nullptr);
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        idle_writeback_open_ = false;
+    }
+
+    // Writes at most one idle retained continuation to the store. Called by the worker between
+    // units, never while a request waits for admission, binds, prefills or replays, so keeping
+    // the store current does not delay a request already waiting; at least a second apart.
     void persist_idle_session() noexcept {
         if (!store_.sink) { return; }
         const auto now = Clock::now();
@@ -5385,6 +5414,8 @@ private:
     bool yield_hold_                 = false;
     Clock::time_point yield_hold_until_{};
     const std::uint32_t progress_anchor_tokens_;
+    // The open context transaction is an idle write-back (start_idle_state_writeback).
+    bool idle_writeback_open_ = false;
     const std::function<void(const EngineFaultEvent&)> fault_listener_;
     ResourceManagement resources_;
 
