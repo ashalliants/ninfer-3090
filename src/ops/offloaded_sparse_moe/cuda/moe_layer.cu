@@ -450,15 +450,29 @@ __device__ void quantize_columns_f32(Base base, int n, int groups, std::int8_t* 
 // MoeExpertSource::precast_input: the A8 cast of every column of x (BF16 [T][kHidden]) into codes
 // [T][kHidden] and scales [T][kXGroups], one thread per group, with the same cast the gate/up CTAs
 // apply otherwise (quantize_columns_bf16), so the codes are the same bits.
+// Four lanes per group (quantize_q8_1_part, the same bits): the one-thread form unrolls all 32
+// values (~700 instructions, run once per call with cold instruction caches on Volta).
+constexpr int kPrecastLanes = 4;
+
 __global__ void __launch_bounds__(kThreads)
     precast_kernel(const bf16* __restrict__ x, int groups, std::int8_t* __restrict__ q, float* __restrict__ d) {
-    const int i = static_cast<int>(blockIdx.x) * kThreads + static_cast<int>(threadIdx.x);
-    if (i >= groups) { return; }
-    int words[8];
-    d[i]      = ggml::quantize_q8_1_group(x + static_cast<std::size_t>(i) * canon::kA8Values, words);
-    auto* dst = reinterpret_cast<int4*>(q + static_cast<std::size_t>(i) * canon::kA8Values);
-    dst[0]    = make_int4(words[0], words[1], words[2], words[3]);
-    dst[1]    = make_int4(words[4], words[5], words[6], words[7]);
+    const int t    = static_cast<int>(blockIdx.x) * kThreads + static_cast<int>(threadIdx.x);
+    const int i    = t / kPrecastLanes, part = t % kPrecastLanes;
+    const bool real = i < groups; // every lane of a warp joins the group's shuffles
+    const uint4 raw = real ? *reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(i) * canon::kA8Values + 8 * part)
+                           : make_uint4(0, 0, 0, 0);
+    const std::uint32_t bits[4] = {raw.x, raw.y, raw.z, raw.w};
+    float value[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        value[2 * j]     = __uint_as_float(bits[j] << 16);
+        value[2 * j + 1] = __uint_as_float(bits[j] & 0xFFFF0000U);
+    }
+    int words[2];
+    const float scale = ggml::quantize_q8_1_part<kPrecastLanes>(value, words);
+    if (!real) { return; }
+    *reinterpret_cast<int2*>(q + static_cast<std::size_t>(i) * canon::kA8Values + 8 * part) = make_int2(words[0], words[1]);
+    if (part == 0) { d[i] = scale; }
 }
 
 // The precast codes and scales of `n` columns (column c is x column column(c)) into the shared
@@ -1508,7 +1522,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         require(reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0, "precast input needs 16-byte aligned x");
         const std::int64_t groups = static_cast<std::int64_t>(x.ne[1]) * kXGroups;
         require(groups <= std::numeric_limits<int>::max(), "precast input exceeds INT_MAX groups");
-        precast_kernel<<<grid_blocks(groups, kThreads, kGridMaxX, "precast input exceeds the launch grid"), kThreads, 0,
+        precast_kernel<<<grid_blocks(groups * kPrecastLanes, kThreads, kGridMaxX, "precast input exceeds the launch grid"), kThreads, 0,
                          stream>>>(static_cast<const bf16*>(x.data), static_cast<int>(groups), layout.precast.q,
                                    layout.precast.d);
         check_launch("precast");

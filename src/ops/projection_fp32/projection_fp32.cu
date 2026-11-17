@@ -82,10 +82,11 @@ __device__ __forceinline__ void load_row(const Segments& segments, int row, int 
 // loads before x is staged, so the weights' DRAM trip overlaps the staging instead of following
 // it. Decode-width calls give each warp one row (Threads = 128, RowsPerWarp = 1), so a router's
 // latency is one DRAM round trip; wider calls keep four rows per warp, which stages x in fewer
-// CTAs. Both mappings produce the same bits. Columns is kColumns, or 1 for a single-column call (a
-// decode step's router): the same arithmetic for column 0 in a fifth of the code, which matters
-// because a one-column router call is short enough that fetching cold instructions dominated it on
-// Volta (37 KiB of code, ~23 us against ~10 us warm).
+// CTAs. Both mappings produce the same bits. Columns is the smallest of 1, 2, 4 and kColumns that
+// holds the call's columns (a decode step's router is one column, a speculative verification's two
+// to four): the same arithmetic per column in less code, which matters because a router call is
+// short enough that fetching cold instructions dominated it on Volta (the 8-column form is 37 KiB of
+// code: ~23-27 us a call in the model against ~10 us warm).
 template <int Threads, int RowsPerWarp, int Columns = kColumns>
 __global__ void __launch_bounds__(Threads)
     projection_kernel(const bf16* __restrict__ x, int k, int columns, Segments segments,
@@ -306,17 +307,14 @@ void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Te
                                       (columns + kWideColumns - 1) / kWideColumns),
                                  kWideThreads, kWideSharedBytes, stream>>>(
             static_cast<const bf16*>(x.data), k, columns, segments, static_cast<float*>(out.data));
-    } else if (columns == 1) {
-        constexpr int threads = 128, rows_per_warp = 1, rows_per_cta = threads / 32 * rows_per_warp;
-        projection_kernel<threads, rows_per_warp, 1>
-            <<<dim3((rows + rows_per_cta - 1) / rows_per_cta, 1), threads, staged, stream>>>(
-                static_cast<const bf16*>(x.data), k, columns, segments, static_cast<float*>(out.data));
     } else if (columns <= kColumns) {
         constexpr int threads = 128, rows_per_warp = 1, rows_per_cta = threads / 32 * rows_per_warp;
-        projection_kernel<threads, rows_per_warp>
-            <<<dim3((rows + rows_per_cta - 1) / rows_per_cta, column_groups), threads, staged,
-                stream>>>(static_cast<const bf16*>(x.data), k, columns, segments,
-                          static_cast<float*>(out.data));
+        auto* kernel = columns == 1   ? projection_kernel<threads, rows_per_warp, 1>
+                       : columns <= 2 ? projection_kernel<threads, rows_per_warp, 2>
+                       : columns <= 4 ? projection_kernel<threads, rows_per_warp, 4>
+                                      : projection_kernel<threads, rows_per_warp>;
+        kernel<<<dim3((rows + rows_per_cta - 1) / rows_per_cta, column_groups), threads, staged, stream>>>(
+            static_cast<const bf16*>(x.data), k, columns, segments, static_cast<float*>(out.data));
     } else {
         projection_kernel<kThreads, kRowsPerWarp>
             <<<dim3((rows + kRowsPerCta - 1) / kRowsPerCta, column_groups), kThreads, staged,

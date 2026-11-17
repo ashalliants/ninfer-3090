@@ -1195,7 +1195,7 @@ void test_precast_read_proof() {
                 cuda_ok(cudaGraphGetRootNodes(graph, &precast, &roots), "root nodes");
                 cudaKernelNodeParams params{};
                 cuda_ok(cudaGraphKernelNodeGetParams(precast, &params), "precast node");
-                check(params.gridDim.x == static_cast<unsigned>((80 * columns + 255) / 256) && params.gridDim.y == 1 &&
+                check(params.gridDim.x == static_cast<unsigned>((4 * 80 * columns + 255) / 256) && params.gridDim.y == 1 && // four lanes a group
                           params.blockDim.x == 256,
                       label + ": the root node is not the precast kernel");
                 cuda_ok(cudaGraphNodeSetEnabled(exec, precast, 0), "disable the precast node");
