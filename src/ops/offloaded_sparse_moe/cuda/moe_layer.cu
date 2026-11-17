@@ -554,6 +554,18 @@ struct GateUpShared {
     float y[NC][2 * kUnitRows];
 };
 
+// Entries (8 bytes each) of the codebook gate_up_registers_kernel copies to shared memory before
+// decoding: the pointer-table formats on Volta, 0 otherwise. Their decoders gather four codebook
+// entries per sub-block at lane-divergent indices; from global memory those gathers back up the
+// load queue (lg_throttle) on Volta. The entries are the same bits either way.
+template <QType F>
+constexpr int kSharedGridEntries =
+#if defined(NINFER_SM70)
+    F == QType::GGML_IQ2_XXS ? 256 : F == QType::GGML_IQ2_S ? 1024 : F == QType::GGML_IQ1_M ? 2048 : 0;
+#else
+    0;
+#endif
+
 // One CTA per (16 intermediates u, job): gate rows 16u..16u+15 and up rows likewise, SwiGLU, and h
 // in FP32 to the entry's row of h_rows ([entries][kIntermediate]). A warp computes kGateUpRowsPerWarp
 // rows at a time, so their latency chains overlap. Precast: the columns' A8 codes and scales are
@@ -747,7 +759,13 @@ __global__ void __launch_bounds__(kThreads, kRegistersBlocksPerSm)
     const int jobs = min(*dispatch.job_count - job_base, pass_jobs);
     if (jobs <= 0) { return; }
     const int items   = jobs * kRegistersRowBlocks;
-    const auto grid   = moe::device::ExpertFormat<F>::table();
+    auto grid         = moe::device::ExpertFormat<F>::table();
+    if constexpr (kSharedGridEntries<F> > 0) {
+        __shared__ uint2 grid_s[kSharedGridEntries<F>];
+        for (int e = static_cast<int>(threadIdx.x); e < kSharedGridEntries<F>; e += kThreads) { grid_s[e] = grid[e]; }
+        __syncthreads();
+        grid = grid_s;
+    }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     for (int item = static_cast<int>(blockIdx.x); item < items; item += static_cast<int>(gridDim.x)) {
         const int job = job_base + item / kRegistersRowBlocks;
