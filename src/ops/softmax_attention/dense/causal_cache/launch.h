@@ -151,4 +151,29 @@ void causal_attention_prompt_k8v4_attention_launch(const Tensor& q, const Tensor
                                                    float scale, const PagedKVLayerView& cache,
                                                    Tensor& out, cudaStream_t stream);
 
+#if defined(NINFER_SM70)
+// The sm_70 prompt route: the vendored llama.cpp FP16 MMA flash-attention kernel
+// (third_party/llama_cpp_fattn) over K/V gathered from the paged cache into contiguous FP16 once per
+// layer, Q in blocks of kVoltaFlashQBlockTokens (ops/launcher/gqa_attention_volta_flash.cu,
+// adapted from geoffwatts/ninfer-v100).
+inline constexpr std::int32_t kVoltaFlashQBlockTokens = 1024;
+inline constexpr std::int32_t kVoltaFlashMinimumWidth = 64;
+inline constexpr std::int32_t kVoltaFlashMaskRowPad   = 64;
+inline constexpr std::int32_t kVoltaFlashKeyPad       = 256;
+
+std::size_t causal_attention_volta_flash_meta_elements(std::int32_t q_heads, std::int32_t tokens);
+
+// Kernels one flash call enqueues (append: the growing-cache form, which appends K/V first).
+std::uint32_t causal_attention_volta_flash_kernel_nodes(std::int32_t q_heads, bool append,
+                                                       std::int32_t width,
+                                                       std::int32_t visible_keys);
+
+void causal_attention_volta_flash_launch(
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
+    const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
+    CausalAttentionExecutionEnvelope envelope, std::int32_t q_block_tokens, Tensor& k_gathered,
+    Tensor& v_gathered, Tensor& mask, Tensor& q_f32, Tensor& out_f32, Tensor& dst_meta, Tensor& out,
+    cudaStream_t stream);
+#endif
+
 } // namespace ninfer::ops::detail

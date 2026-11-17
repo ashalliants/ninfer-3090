@@ -21,6 +21,19 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
 endif()
 
 include(basic_sources.cmake)
+
+# The sm_70 prompt flash-attention route drives a vendored llama.cpp kernel (MIT,
+# third_party/llama_cpp_fattn). Its headers are named common.cuh / mma.cuh like ours, so the
+# vendored include directory is scoped to the one translation unit that uses it.
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/launcher/gqa_attention_volta_flash.cu")
+  set_source_files_properties(
+    "${CMAKE_CURRENT_LIST_DIR}/launcher/gqa_attention_volta_flash.cu"
+    TARGET_DIRECTORY ninfer_ops
+    PROPERTIES
+      INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/llama_cpp_fattn"
+      COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda;-diag-suppress=940>")
+endif()
 include("${CMAKE_CURRENT_LIST_DIR}/attention_key_mass/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/attn_input_proj/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/candidate_selector/sources.cmake")

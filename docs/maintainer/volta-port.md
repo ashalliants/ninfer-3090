@@ -196,6 +196,27 @@ workspace left (`w4_cublas_prefill_fits` / `w4_cublas_projection_fits`), which t
 plan covers whenever the chunk reaches the wide gate. Qwen3.8-27B: 54-token prompt 49 -> 140
 tok/s, 125-token prompt 86 -> 268 tok/s, same outputs; decode unchanged.
 
+**Prompt attention.** The INT8 prompt kernel (`causal_attention_prompt_i8_fa2`) runs its `mma` on
+the emulation, and after the GEMMs moved it was ~30% of a 4k-token prefill. On sm_70 a
+single-sequence INT8 G64 call of 64 or more columns (and `causal_softmax_attention_cached` over
+the same) instead takes llama.cpp's FP16 tensor-core flash attention
+(`third_party/llama_cpp_fattn`, MIT, pinned at 62bf73d25), driven by
+`ops/launcher/gqa_attention_volta_flash.cu` -- both adapted from geoffwatts/ninfer-v100
+(Apache-2.0). The launcher appends the call's K/V to the paged cache, dequantizes the visible keys
+into contiguous FP16 once per layer, and runs Q in blocks of `kVoltaFlashQBlockTokens` under a
+causal mask. Qwen3.8-27B: 1,150 / 2,186 / 4,392-token prompts 783 -> 868, 834 -> 959, 778 ->
+1,020 tok/s, same greedy output; perplexity 6.00650 -> 6.00707.
+
+Two costs come with it, both measured in the op suite. The kernel accumulates P x V in FP16 (as
+llama.cpp does on every tensor-core GPU), so its error grows with the key count: relative L2
+3.0e-3 up to 5K keys, 4.0e-3 at 12K, 7.0e-3 at 33K, against 1.75e-3 for the INT8 kernel
+(`kAttentionVoltaFlashCriterion` in `tests/ops/softmax_attention/causal_cache.cpp` holds it under
+the FP8 KV profile's 1.2e-2). And its scratch holds the visible keys in FP16 plus the mask, about
+6 KB per key (roughly 50 MB at 8K, 200 MB at 32K, 800 MB at 128K), which the workspace query
+reports, so it comes out of the memory planned for the KV cache. Chunking the keys with an FP32
+merge of the partial results would remove both; the kernel would need to export its row maxima
+and sums.
+
 Thermals: sustained prefill holds the card at its 200 W cap and took a passively cooled V100 from
 40 to 75 C in about a minute; measure in short runs without forced airflow.
 
@@ -256,6 +277,7 @@ Qwen3.8-Flash-Next. A 32 GB V100 holds the 27B (19 GiB) with room for KV; the Bo
    `linear_add` and SwiGLU suites have run so far.
 2. Measure small-T on the other models (MTP / DFlash verification on the 27B is done: see "Decode"), and re-pick the sm_86 route tables where an `mma`
    route loses to a SIMT one on Volta (`docs/maintainer/linear-tuning.md` has the method).
-3. The rest of prefill on tensor cores: prompt attention (FP16).
+3. Key-chunked flash attention (see "Prompt attention"), so long prompts keep INT8-kernel
+   accuracy and bounded scratch.
 4. Calibrate `context_cost_defaults.cpp` for the card (`ninfer_context_cost_bench`); until then the
    generic transfer and prefill costs apply.
