@@ -169,6 +169,20 @@ __global__ void __launch_bounds__(kThreads)
     const int tile_end   = min(tiles, tile_begin + tiles_per_split);
     const std::int32_t* ids = selected + static_cast<std::int64_t>(column) * kTop;
 
+    // A split past the column's last tile (most of them at short contexts: the split count is set
+    // for the longest list) would only stage the query, merge empty rows and store (-inf, 0): the
+    // merge skips a split by that maximum and reads nothing else of it. Store just that.
+    if (splits > 1 && tile_begin >= tiles) {
+        if (static_cast<int>(threadIdx.x) < kGroup) {
+            const std::int64_t row = (static_cast<std::int64_t>(column) * splits + split) * kHq +
+                                     kv_head * kGroup + static_cast<int>(threadIdx.x);
+            const std::int64_t stats_offset = static_cast<std::int64_t>(gridDim.z) * splits * kHq * kD;
+            partial[stats_offset + 2 * row]     = -CUDART_INF_F;
+            partial[stats_offset + 2 * row + 1] = 0.0F;
+        }
+        return;
+    }
+
     // Query rows: Hadamard-prepared, FP16; rows 12..15 are zero.
     for (int r = warp; r < 16; r += kWarps) {
         if (r < kGroup) {
