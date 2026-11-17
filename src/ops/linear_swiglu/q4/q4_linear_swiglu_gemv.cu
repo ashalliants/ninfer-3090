@@ -347,10 +347,14 @@ struct Q4SwiGluStreamSink {
             out[t * out_stride + row] = __float2bfloat16(silu(acc[0][t]) * acc[1][t]);
         }
     }
+    Q4SwiGluStreamSink with_token_offset(std::int32_t begin) const {
+        return {out + begin * out_stride, out_stride};
+    }
 };
 
 // Gate row r and up row r + kIntermediate as one streaming-GEMV item (stream_gemv.cuh), for
-// tokens 1..8. Returns false when the streaming GEMV is off or the tensors do not fit it.
+// tokens 1..kStreamGemvMaxTokens. Returns false when the streaming GEMV is off or the tensors do
+// not fit it.
 bool try_launch_swiglu_stream(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     const std::int64_t x_stride   = x.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
     const std::int64_t out_stride = out.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
@@ -358,23 +362,9 @@ bool try_launch_swiglu_stream(const Tensor& x, const Weight& w, Tensor& out, cud
     const Q4StreamFormat::Planes planes{static_cast<const std::uint8_t*>(w.qdata),
                                         static_cast<const std::uint8_t*>(w.scales)};
     const Q4SwiGluStreamSink sink{static_cast<__nv_bfloat16*>(out.data), out_stride};
-    switch (x.ne[1]) {
-#define NINFER_SWIGLU_STREAM_TOKENS(T)                                                             \
-    case T:                                                                                        \
-        return try_launch_stream_gemv_rows<Q4StreamFormat, 2, T>(                                  \
-            x_data, x_stride, planes, sink, kIntermediate, kIntermediate, kK, kK, stream)
-        NINFER_SWIGLU_STREAM_TOKENS(1);
-        NINFER_SWIGLU_STREAM_TOKENS(2);
-        NINFER_SWIGLU_STREAM_TOKENS(3);
-        NINFER_SWIGLU_STREAM_TOKENS(4);
-        NINFER_SWIGLU_STREAM_TOKENS(5);
-        NINFER_SWIGLU_STREAM_TOKENS(6);
-        NINFER_SWIGLU_STREAM_TOKENS(7);
-        NINFER_SWIGLU_STREAM_TOKENS(8);
-#undef NINFER_SWIGLU_STREAM_TOKENS
-    default:
-        return false;
-    }
+    return try_launch_stream_gemv_passes<Q4StreamFormat, 2>(x_data, x_stride, planes, sink,
+                                                            kIntermediate, kIntermediate, kK, kK,
+                                                            stream, x.ne[1]);
 }
 
 } // namespace
@@ -397,8 +387,9 @@ void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Ten
     if (x.ne[1] < 2 || x.ne[1] > 32) {
         throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..32");
     }
-    // T = 2..8 (speculative verification): the streaming GEMV decodes each weight once for every
-    // token, where the small-T kernel below runs mma.sync -- emulated, and compute-bound, on sm_70.
+    // T = 2..32 (speculative verification, short prompts): the streaming GEMV decodes each weight
+    // once for every token (in passes of eight), where the small-T kernel below runs mma.sync --
+    // emulated, and compute-bound, on sm_70.
     if (w.n == kN && w.k == kK && w.padded_shape[1] == kK &&
         try_launch_swiglu_stream(x, w, out, stream)) {
         return;

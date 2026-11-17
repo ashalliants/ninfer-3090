@@ -126,12 +126,14 @@ enum class LinearPolicy : std::uint8_t {
 inline constexpr std::int32_t kCublasPrefillMinTokens = 129;
 
 /// The route's gate for a prefill-phase call (LinearPolicy::AllowPrefillCublasNarrow). On sm_70 the
-/// routes below the wide gate run emulated mma at ~12 ms per token per pass of the 27B against the
-/// route's ~90 ms per pass (its weight-sized dequantise) plus well under a millisecond per token,
-/// so it wins from about 8 tokens; at 1..8 the streaming GEMV is faster still. Elsewhere the narrow
-/// gate is the wide one (the int8 route loses at narrow aligned widths on the 3090: see above).
+/// routes below the wide gate ran emulated mma at ~12 ms per token per pass of the 27B against the
+/// route's ~90 ms per pass (its weight-sized dequantise) plus well under a millisecond per token;
+/// the streaming GEMV now takes 1..32 tokens (passes of eight over the quantized weights,
+/// ops/linear/common/stream_gemv.cuh kStreamGemvMaxTokens), so the narrow gate starts above it.
+/// Elsewhere the narrow gate is the wide one (the int8 route loses at narrow aligned widths on the
+/// 3090: see above).
 #if defined(NINFER_SM70)
-inline constexpr std::int32_t kCublasPrefillNarrowMinTokens = 9;
+inline constexpr std::int32_t kCublasPrefillNarrowMinTokens = 33;
 #else
 inline constexpr std::int32_t kCublasPrefillNarrowMinTokens = kCublasPrefillMinTokens;
 #endif

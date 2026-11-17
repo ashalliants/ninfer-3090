@@ -51,6 +51,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace ninfer::ops::detail {
@@ -163,13 +164,19 @@ struct StreamGemvRowSink {
     Output output;
     Epilogue epilogue;
     std::int32_t row_offset;
+    std::int32_t token_begin = 0; // the first token of this pass (try_launch_stream_gemv_passes)
 
     template <int Rows, int Cols>
     __device__ __forceinline__ void finish(int item, const float (&acc)[Rows][Cols]) const {
 #pragma unroll
         for (int r = 0; r < Rows; ++r) {
-            linear_finish_row(output, epilogue, item + r * row_offset, 0, acc[r], Cols);
+            linear_finish_row(output, epilogue, item + r * row_offset, token_begin, acc[r], Cols);
         }
+    }
+    StreamGemvRowSink with_token_offset(std::int32_t begin) const {
+        StreamGemvRowSink sink = *this;
+        sink.token_begin += begin;
+        return sink;
     }
 };
 
@@ -445,8 +452,57 @@ bool try_launch_stream_gemv_rows(const __nv_bfloat16* x, std::int64_t x_stride,
     }
 }
 
-// The plain GEMV over `tokens` (1..8) tokens of a contiguous x: rows rows, each finished through
-// the family's Output / Epilogue with every token at once.
+// The most tokens one call takes: past eight (the kernels' widest instantiation) it runs as passes
+// of up to eight tokens over the same weights, each finished at its token offset. Four passes over
+// the weights still beat the sm_70 alternatives at short-prompt widths -- the emulated small-T mma
+// kernels, or materialising every weight in FP16 for cuBLAS (see kCublasPrefillNarrowMinTokens).
+inline constexpr std::int32_t kStreamGemvMaxTokens = 32;
+
+// `tokens` (1..kStreamGemvMaxTokens) tokens of `items` items of Rows rows: one launch per eight
+// tokens. `sink` must offer with_token_offset(begin). Declines (returns false, nothing launched)
+// unless every pass would run.
+template <class Format, int Rows, class Sink>
+bool try_launch_stream_gemv_passes(const __nv_bfloat16* x, std::int64_t x_stride,
+                                   const typename Format::Planes& planes, Sink sink,
+                                   std::int32_t items, std::int32_t row_offset, std::int32_t k,
+                                   std::int32_t padded_k, cudaStream_t stream,
+                                   std::int32_t tokens) {
+    if (tokens < 1 || tokens > kStreamGemvMaxTokens) return false;
+    if (tokens > 8) {
+        // The checks of the widest pass cover the narrower ones (try_launch_stream_gemv_rows).
+        if (!stream_gemv_enabled() || k % 256 != 0 || k % 128 != 0 || x_stride % 8 != 0) {
+            return false;
+        }
+    }
+    for (std::int32_t begin = 0; begin < tokens; begin += 8) {
+        const std::int32_t count = std::min<std::int32_t>(8, tokens - begin);
+        const __nv_bfloat16* pass_x = x + begin * x_stride;
+        const Sink pass_sink        = sink.with_token_offset(begin);
+        bool launched               = false;
+        switch (count) {
+#define NINFER_STREAM_GEMV_PASS(T)                                                                     case T:                                                                                                launched = try_launch_stream_gemv_rows<Format, Rows, T>(                                               pass_x, x_stride, planes, pass_sink, items, row_offset, k, padded_k, stream);                  break
+            NINFER_STREAM_GEMV_PASS(1);
+            NINFER_STREAM_GEMV_PASS(2);
+            NINFER_STREAM_GEMV_PASS(3);
+            NINFER_STREAM_GEMV_PASS(4);
+            NINFER_STREAM_GEMV_PASS(5);
+            NINFER_STREAM_GEMV_PASS(6);
+            NINFER_STREAM_GEMV_PASS(7);
+            NINFER_STREAM_GEMV_PASS(8);
+#undef NINFER_STREAM_GEMV_PASS
+        }
+        if (!launched) {
+            if (begin > 0) {
+                throw std::logic_error("streaming GEMV declined a pass after launching others");
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+// The plain GEMV over `tokens` (1..kStreamGemvMaxTokens) tokens of a contiguous x: rows rows,
+// each finished through the family's Output / Epilogue with every token of a pass at once.
 template <class Format, class Output, class Epilogue>
 bool try_launch_stream_gemv(const __nv_bfloat16* x, const typename Format::Planes& planes,
                             Output output, Epilogue epilogue, std::int32_t rows, std::int32_t k,
@@ -457,32 +513,14 @@ bool try_launch_stream_gemv(const __nv_bfloat16* x, const typename Format::Plane
     // each warp streams two rows -- r and r + rows / 2 -- against every x' read: 20-36% at T = 4
     // and 30-35% at T = 8 on a V100 (four rows spill registers and lose).
     const bool paired = tokens >= 2 && rows % 2 == 0;
-    switch (tokens) {
-    case 1:
-        return try_launch_stream_gemv_rows<Format, 1, 1>(
-            x, stride, planes, StreamGemvRowSink<Output, Epilogue>{output, epilogue, 0}, rows, 0, k,
-            padded_k, stream);
-#define NINFER_STREAM_GEMV_TOKENS(T)                                                               \
-    case T:                                                                                        \
-        return paired ? try_launch_stream_gemv_rows<Format, 2, T>(                                 \
-                            x, stride, planes,                                                     \
-                            StreamGemvRowSink<Output, Epilogue>{output, epilogue, rows / 2},       \
-                            rows / 2, rows / 2, k, padded_k, stream)                               \
-                      : try_launch_stream_gemv_rows<Format, 1, T>(                                 \
-                            x, stride, planes,                                                     \
-                            StreamGemvRowSink<Output, Epilogue>{output, epilogue, 0}, rows, 0, k,  \
-                            padded_k, stream)
-        NINFER_STREAM_GEMV_TOKENS(2);
-        NINFER_STREAM_GEMV_TOKENS(3);
-        NINFER_STREAM_GEMV_TOKENS(4);
-        NINFER_STREAM_GEMV_TOKENS(5);
-        NINFER_STREAM_GEMV_TOKENS(6);
-        NINFER_STREAM_GEMV_TOKENS(7);
-        NINFER_STREAM_GEMV_TOKENS(8);
-#undef NINFER_STREAM_GEMV_TOKENS
-    default:
-        return false;
+    if (paired) {
+        return try_launch_stream_gemv_passes<Format, 2>(
+            x, stride, planes, StreamGemvRowSink<Output, Epilogue>{output, epilogue, rows / 2},
+            rows / 2, rows / 2, k, padded_k, stream, tokens);
     }
+    return try_launch_stream_gemv_passes<Format, 1>(
+        x, stride, planes, StreamGemvRowSink<Output, Epilogue>{output, epilogue, 0}, rows, 0, k,
+        padded_k, stream, tokens);
 }
 
 } // namespace ninfer::ops::detail

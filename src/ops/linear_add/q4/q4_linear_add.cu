@@ -294,7 +294,7 @@ void q4_linear_add_mma_r64_c128_launch(const Tensor& x, const Weight& w, Tensor&
 
 #if defined(NINFER_SM70)
 namespace {
-// T = 2..8 on sm_70: the streaming GEMV (stream_gemv.cuh) decodes each weight once for every token
+// T = 2..32 on sm_70: the streaming GEMV (stream_gemv.cuh) decodes each weight once for every token
 // and adds the residual through the same epilogue; the K-split routes it replaces run mma.sync,
 // which is emulated and compute-bound there. Falls back to them if the streaming GEMV declines.
 void q4_linear_add_stream_launch(const Tensor& x, const Weight& w, Tensor& r, cudaStream_t s) {
@@ -308,8 +308,12 @@ void q4_linear_add_stream_launch(const Tensor& x, const Weight& w, Tensor& r, cu
     }
     if (x.ne[1] <= 4) {
         q4_linear_add_ksplit4_launch(x, w, r, s);
-    } else {
+    } else if (x.ne[1] <= 8) {
         q4_linear_add_ksplit8_launch(x, w, r, s);
+    } else if (x.ne[1] <= 16) {
+        q4_linear_add_small_t_c16_launch(x, w, r, s);
+    } else {
+        q4_linear_add_small_t_c32_launch(x, w, r, s);
     }
 }
 } // namespace
@@ -356,7 +360,7 @@ Q4LinearAddLaunch select_q4_linear_add(std::int32_t rows, std::int32_t k, std::i
     // that emulation: profiled on a V100-PCIE-32GB (Qwen3.8-27B decode, nsys), ksplit4 took 398 us
     // per call at K=17408 against the ~56 us its weight stream costs. The GEMV issues no mma.
     if (tokens == 1) return q4_linear_add_gemv_launch;
-    if (tokens <= 8) return q4_linear_add_stream_launch;
+    if (tokens <= kStreamGemvMaxTokens) return q4_linear_add_stream_launch;
 #endif
     if (tokens <= 4) return q4_linear_add_ksplit4_launch;
     if (tokens <= 8) return q4_linear_add_ksplit8_launch;

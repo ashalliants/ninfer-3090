@@ -220,10 +220,11 @@ void q4_q5_attn_input_small_t_launch(const Tensor& x, const Weight& query_key_we
                                      const Weight& gate_value_weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, cudaStream_t stream) {
 #if defined(NINFER_SM70)
-    // sm_70: the streaming GEMV serves every verify width (2..8), where the SIMT tiles above ran at
+    // sm_70: the streaming GEMV serves T = 2..32 (verify widths, short prompts), where the SIMT
+    // tiles above ran at
     // 40-60% of the weight stream on a V100 (Qwen3.8-27B MTP3 verify, nsys: 80 + 79 us per call
     // at T=4).
-    if (x.ne[1] >= 2 && x.ne[1] <= 8) {
+    if (x.ne[1] >= 2 && x.ne[1] <= kStreamGemvMaxTokens) {
         const std::int64_t x_stride = x.nb[1] / sizeof(__nv_bfloat16);
         const Q4LinearOperands qk   = q4_linear_operands(x, query_key_weight);
         const Q5LinearOperands gv   = q5_linear_operands(x, gate_value_weight);

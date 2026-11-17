@@ -17,7 +17,7 @@ void launch_q8_a16_sliced_k_mma(const Q8LinearOperands& operands, Output output,
     // computes it bound by the weight stream where mma.sync is emulated (sm_70 by default;
     // ops/linear/common/stream_gemv.cuh). Fused row maps keep this schedule.
     if constexpr (std::is_same_v<RowPolicy, Q8SlicedKIdentityRows>) {
-        if (operands.tokens <= 8 &&
+        if (operands.tokens <= kStreamGemvMaxTokens &&
             try_launch_stream_gemv<Q8StreamFormat>(operands.x, {operands.codes, operands.scales},
                                                    output, epilogue, operands.rows, operands.k,
                                                    operands.padded_k, stream, operands.tokens)) {

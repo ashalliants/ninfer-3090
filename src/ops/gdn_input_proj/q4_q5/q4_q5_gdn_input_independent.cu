@@ -252,10 +252,11 @@ void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight
                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
                                         Tensor& z, cudaStream_t stream) {
 #if defined(NINFER_SM70)
-    // sm_70: the streaming GEMV serves every verify width (2..8), where the split4 / SIMT tiles ran
+    // sm_70: the streaming GEMV serves T = 2..32 (verify widths, short prompts), where the split4 /
+    // SIMT tiles ran
     // at 40-50% of the weight stream on a V100 (Qwen3.8-27B MTP3 verify, nsys: 134 + 51 us per call
     // at T=4).
-    if (x.ne[1] >= 2 && x.ne[1] <= 8) {
+    if (x.ne[1] >= 2 && x.ne[1] <= kStreamGemvMaxTokens) {
         const std::int64_t x_stride = x.nb[1] / sizeof(__nv_bfloat16);
         const Q4LinearOperands q4   = q4_linear_operands(x, qk_weight);
         const Q5LinearOperands q5   = q5_linear_operands(x, value_z_weight);

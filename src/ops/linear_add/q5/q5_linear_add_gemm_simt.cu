@@ -70,11 +70,11 @@ void dispatch_cols(std::int32_t cols, Launch&& launch) {
 
 bool try_q5_linear_add_stream(const Tensor& x, const Weight& w, Tensor& residual_out,
                               cudaStream_t stream) {
-    // T = 1..8 is a GEMV over a few tokens with the residual added in place: the streaming GEMV
+    // T = 1..32 is a GEMV over a few tokens with the residual added in place: the streaming GEMV
     // (stream_gemv.cuh) computes it bound by the weight stream where conversions are slow, decoding
     // each weight once for every token. Each (row, token) is read and written by the one thread
     // that finishes the row, so in place is safe.
-    if (x.ne[1] < 1 || x.ne[1] > 8) return false;
+    if (x.ne[1] < 1 || x.ne[1] > kStreamGemvMaxTokens) return false;
     auto* residual    = static_cast<__nv_bfloat16*>(residual_out.data);
     const auto stride = static_cast<std::int64_t>(residual_out.nb[1] / sizeof(__nv_bfloat16));
     return try_launch_stream_gemv<Q5StreamFormat>(
