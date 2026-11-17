@@ -58,7 +58,12 @@ NINFER_CANON_HD float abs_bits(float x) { return f32_from_bits(f32_bits(x) & 0x7
 // One step of the group maximum: a NaN magnitude never replaces the running maximum.
 NINFER_CANON_HD float a8_amax_step(float amax, float x) {
     const float a = abs_bits(x);
+#if defined(__CUDA_ARCH__)
+    // One FMNMX: fmaxf returns the other operand for a NaN, and amax is never NaN (nor -0).
+    return fmaxf(amax, a);
+#else
     return a > amax ? a : amax;
+#endif
 }
 
 NINFER_CANON_HD float a8_scale(float amax) { return div_rn(amax, 127.0F); }
@@ -74,11 +79,20 @@ NINFER_CANON_HD float a8_inverse(float amax) {
 // The code of one value: rint((x * prescale) * inverse), saturated to [-127, 127], 0 for a NaN
 // product.
 NINFER_CANON_HD int a8_code(float x, float prescale, float inverse) {
+#if defined(__CUDA_ARCH__)
+    // The same codes without branches (a GPU casts a whole input per CTA, so this is hot): one
+    // round-to-nearest-even conversion (rint's mode; cvt.rni maps NaN to 0 and saturates
+    // infinities), then the clamp in integers. clamp(rint(r)) is the saturation below for every r
+    // (checked over all 2^32 binary32 values on sm_70).
+    const float r = mul_rn(mul_rn(x, prescale), inverse);
+    return min(max(__float2int_rn(r), -127), 127);
+#else
     const float r = mul_rn(mul_rn(x, prescale), inverse);
     if (r != r) { return 0; }
     if (r >= 127.0F) { return 127; }
     if (r <= -127.0F) { return -127; }
     return static_cast<int>(rint_rn(r));
+#endif
 }
 
 // The A8 cast of one group of 32 values given as binary32: codes to q, returns d.
