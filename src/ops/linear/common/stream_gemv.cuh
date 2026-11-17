@@ -54,6 +54,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 
 namespace ninfer::ops::detail {
 
@@ -484,9 +485,9 @@ bool try_launch_stream_gemv_passes(const __nv_bfloat16* x, std::int64_t x_stride
         }
     }
     std::int32_t begin = 0;
-    // Whole passes of 32 tokens on the tensor cores where the format allows, then 16 and a last
-    // pass of 9..16 (stream_tile_gemm.cuh: 2-3x the passes of eight it replaces); the rest, up
-    // to eight tokens, as one pass of eight.
+    // Whole passes of 32 tokens on the tensor cores where the format allows, then one pass of the
+    // last 9..31 (stream_tile_gemm.cuh: 1.3-3.6x the passes of eight it replaces); a last one to
+    // eight tokens runs as one pass of eight.
     if (tokens >= 9 && stream_tile_gemm_supported<Format>(k, padded_k, x_stride)) {
         for (; tokens - begin >= 32; begin += 32) {
             (void)try_launch_stream_tile_gemm<Format, Rows, 32>(x + begin * x_stride, x_stride,
@@ -494,29 +495,19 @@ bool try_launch_stream_gemv_passes(const __nv_bfloat16* x, std::int64_t x_stride
                                                                items, row_offset, k, padded_k,
                                                                stream);
         }
-        if (tokens - begin > 16) {
-            (void)try_launch_stream_tile_gemm<Format, Rows, 16>(x + begin * x_stride, x_stride,
-                                                               planes, sink.with_token_offset(begin),
-                                                               items, row_offset, k, padded_k,
-                                                               stream);
-            begin += 16;
-        }
         const std::int32_t last = tokens - begin;
         if (last >= 9) {
             const __nv_bfloat16* pass_x = x + begin * x_stride;
             const Sink pass_sink        = sink.with_token_offset(begin);
-            switch (last) {
-#define NINFER_STREAM_TILE_PASS(T)                                                                     case T:                                                                                                (void)try_launch_stream_tile_gemm<Format, Rows, T>(pass_x, x_stride, planes, pass_sink,                items, row_offset, k, padded_k, stream);                       break
-                NINFER_STREAM_TILE_PASS(9);
-                NINFER_STREAM_TILE_PASS(10);
-                NINFER_STREAM_TILE_PASS(11);
-                NINFER_STREAM_TILE_PASS(12);
-                NINFER_STREAM_TILE_PASS(13);
-                NINFER_STREAM_TILE_PASS(14);
-                NINFER_STREAM_TILE_PASS(15);
-                NINFER_STREAM_TILE_PASS(16);
-#undef NINFER_STREAM_TILE_PASS
-            }
+            [&]<int... I>(std::integer_sequence<int, I...>) {
+                // One instantiation per width 9..31 (32 is the loop above).
+                (void)((last == I + 9 &&
+                        (void(try_launch_stream_tile_gemm<Format, Rows, I + 9>(
+                             pass_x, x_stride, planes, pass_sink, items, row_offset, k, padded_k,
+                             stream)),
+                         true)) ||
+                       ...);
+            }(std::make_integer_sequence<int, 23>{});
             begin = tokens;
         }
     }

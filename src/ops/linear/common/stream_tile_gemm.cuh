@@ -1,15 +1,14 @@
 #pragma once
 
-// Short-prompt GEMM on the Volta tensor cores: 9..16 or 32 tokens per pass over the quantized
-// weights.
+// Short-prompt GEMM on the Volta tensor cores: 9..32 tokens per pass over the quantized weights.
 //
 // Below the cuBLAS prefill route's width gate (kCublasPrefillNarrowMinTokens: its weight-sized
 // FP16 dequantise only pays from ~100 tokens), sm_70 ran 9..32-token prompts as passes of eight
 // through the streaming GEMV, re-reading every weight per pass at ~40 ms per pass of the 27B. Here
 // a CTA dequantises a tile of weight rows into shared memory once per 64-wide K step and multiplies
 // it against all of the pass's tokens with WMMA (m16n16k16, FP16 in, FP32 accumulation), so the
-// weights are read once per pass and the per-token work is tensor-core math. A pass of 9..15
-// tokens runs on a 16-token tile whose missing tokens are zero and are not written. The weight
+// weights are read once per pass and the per-token work is tensor-core math. A pass of fewer
+// tokens than its 16- or 32-token tile has zeros for the rest, which are not written. The weight
 // tile's raw codes are loaded kTileGemmDepth steps ahead, the activation one step ahead.
 //
 // Numerics are the cuBLAS FP16 prefill route's (ops/linear_swiglu/q4cublas/w4_cublas_prefill.cu):
@@ -123,7 +122,7 @@ __global__ __launch_bounds__(kTileGemmThreads, 2) void stream_tile_gemm_kernel(
     Sink sink, std::int32_t items, std::int32_t row_offset, std::int32_t k,
     std::int32_t padded_k) {
     using namespace nvcuda;
-    // Cols tokens (9..16 or 32) on a tile of kTileCols: tokens past Cols are zero and not written.
+    // Cols tokens (9..32) on a tile of kTileCols: tokens past Cols are zero and not written.
     constexpr int kTileCols = Cols <= 16 ? 16 : 32;
     using Shape = TileGemmShape<TileRows, kTileCols, Groups>;
     constexpr int kItemsPerTile = TileRows / Rows;
@@ -306,15 +305,15 @@ bool stream_tile_gemm_supported(std::int32_t k, std::int32_t padded_k, std::int6
     }
 }
 
-// Launches the short-prompt tensor-core GEMM for exactly Cols tokens -- 9..16 (on a 16-token tile)
-// or 32 -- if it is enabled and the format and shape fit; returns false otherwise.
+// Launches the short-prompt tensor-core GEMM for exactly Cols tokens, 9..32 (on a 16- or 32-token
+// tile), if it is enabled and the format and shape fit; returns false otherwise.
 template <class Format, int Rows, int Cols, class Sink>
 bool try_launch_stream_tile_gemm(const __nv_bfloat16* x, std::int64_t x_stride,
                                  const typename Format::Planes& planes, Sink sink,
                                  std::int32_t items, std::int32_t row_offset, std::int32_t k,
                                  std::int32_t padded_k, cudaStream_t stream) {
     if constexpr (!kStreamTileGemmDefault || !StreamTileGemmFormat<Format> ||
-                  !((Cols >= 9 && Cols <= 16) || Cols == 32)) {
+                  Cols < 9 || Cols > 32) {
         return false;
     } else {
         if (!stream_tile_gemm_supported<Format>(k, padded_k, x_stride)) return false;
@@ -339,7 +338,7 @@ bool try_launch_stream_tile_gemm(const __nv_bfloat16* x, std::int64_t x_stride,
         // Measured on the 27B shapes (V100-PCIE-32GB): short tiles whose four warp groups split K
         // win everywhere at 16 tokens; at 32 only the 34816-row SwiGLU matrix fills the card
         // better with tall tiles (473 against 511 us).
-        if (Cols == 32 && rows_total >= static_cast<std::int64_t>(2 * sms) * 128) {
+        if (Cols > 16 && rows_total >= static_cast<std::int64_t>(2 * sms) * 128) {
             return launch.template operator()<128, 1>();
         }
         return launch.template operator()<32, 4>();
