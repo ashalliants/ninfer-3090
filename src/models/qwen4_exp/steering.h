@@ -3,8 +3,10 @@
 // Refusal steering for Qwen3.8-Flash-Next: a direction in the hidden space that the forward pass
 // removes from the residual after a block (ops::direction_project). It is loaded from a GGUF
 // control vector (the llama.cpp convention: general.architecture "controlvector", one F32 tensor
-// "direction.N" of `hidden` values per steered layer N, counted from 1), the file the community
-// publishes for this model. `--graft NAME=PATH` names one, as it names a KV graft on the 27B, and a
+// "direction.N" of `hidden` values per steered layer N), the file the community publishes for this
+// model. N is the zero-based block index, as in llama.cpp (which applies tensors[il] at the output
+// of block il): direction.N is removed after block N, and block 0 has no direction, so N runs
+// from 1. `--graft NAME=PATH` names one, as it names a KV graft on the 27B, and a
 // request selects it with "graft": "NAME".
 
 #include "ninfer/types.h" // GraftSource

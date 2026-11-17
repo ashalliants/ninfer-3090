@@ -76,7 +76,9 @@ before the first steered request must already contain it).
 
 - **Which tensor.** The residual `R` is `[S*H, T]`, so the projection runs on each stream. The
   published vector has one 2,560-wide direction, identical for layers 1-47. It follows llama.cpp's
-  control-vector layer numbering (`direction.N` after layer N, N from 1).
+  control-vector layer numbering: `direction.N` is applied after the zero-based block N (llama.cpp
+  applies `tensors[il]` at the output of block `il`), so block 0 is never steered and N runs from 1
+  to 47 on this 48-block model.
 - **Context cache.** The cache's per-checkpoint `identity_tag` (the prefix-index key's third part,
   checked by exact reuse and written into every checkpoint image) is the Program's configuration tag
   for an unsteered request and a per-vector tag derived from it and the vector's digest for a
