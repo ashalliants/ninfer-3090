@@ -679,6 +679,11 @@ __global__ void __launch_bounds__(kThreads)
 
 constexpr int kRegistersRows      = kWarps;                            // intermediates per item: one a warp
 constexpr int kRegistersRowBlocks = moe::kIntermediate / kRegistersRows; // 80 items per job
+#if defined(NINFER_SM70)
+constexpr bool kGateUpSingleColumnPath = true;
+#else
+constexpr bool kGateUpSingleColumnPath = false;
+#endif
 constexpr int kRegistersBlocksPerSm = 2; // the launch bound; the grid follows the measured occupancy
 
 // The exact int32 P of one sub-block against one column's codes (canonical_ggml.h step 3), in
@@ -798,7 +803,18 @@ __global__ void __launch_bounds__(kThreads, kRegistersBlocksPerSm)
                 cd[c]        = xd + t * kXGroups;
             }
             float gv[NC], uv[NC];
-            gate_up_pair<F, NC>(gate, up, cq, cd, n, gv, uv, grid);
+            if (kGateUpSingleColumnPath && NC > 1 && n == 1) {
+                // A job of one column (most of a verify round's): the one-column body, without the
+                // multi-column body's per-column guards. The same operations on column 0.
+                float g1[1], u1[1];
+                const std::int8_t* const q1[1] = {cq[0]};
+                const float* const d1[1]       = {cd[0]};
+                gate_up_pair<F, 1>(gate, up, q1, d1, 1, g1, u1, grid);
+                gv[0] = g1[0];
+                uv[0] = u1[0];
+            } else {
+                gate_up_pair<F, NC>(gate, up, cq, cd, n, gv, uv, grid);
+            }
             if (lane < n) { // lane c writes column c (every lane holds every value)
                 float gl = gv[0], ul = uv[0];
 #pragma unroll
