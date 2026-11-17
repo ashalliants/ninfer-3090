@@ -76,9 +76,12 @@ struct TileGemmShape {
     static constexpr int kGroupWarps = kTileGemmWarps / Groups;
     static constexpr int kFragments  = (TileRows / 16) * (Cols / 16); // per group
     static_assert(kFragments % kGroupWarps == 0);
-    // A warp's fragments lie in one 16-row block (they share its A fragment).
-    static_assert((kFragments / kGroupWarps) <= Cols / 16 && (Cols / 16) % (kFragments / kGroupWarps) == 0);
     static constexpr int kWarpFragments = kFragments / kGroupWarps;
+    // A warp's fragments: kWarpCols token blocks of kWarpRows 16-row blocks, so each A fragment is
+    // loaded once for kWarpCols products and each B fragment once for kWarpRows.
+    static constexpr int kWarpCols = kWarpFragments < Cols / 16 ? kWarpFragments : Cols / 16;
+    static constexpr int kWarpRows = kWarpFragments / kWarpCols;
+    static_assert((Cols / 16) % kWarpCols == 0 && kWarpRows * kWarpCols == kWarpFragments);
     // Per group: the dequantised weight tile and the staged activation of one step.
     static constexpr int kWeightHalves = TileRows * kTileGemmLd;
     static constexpr int kInputHalves  = Cols * kTileGemmLd;
@@ -116,8 +119,14 @@ __device__ __forceinline__ uint4 tile_gemm_stage_input(uint4 raw) {
     return make_uint4(h[0], h[1], h[2], h[3]);
 }
 
+// CTAs per SM: three for a 16-token tile (its registers capped to fit, with the shared-memory
+// carveout raised to hold three stages) -- 6144 x 5120 at 16 tokens 94 -> 73 us; a 32-token tile
+// spills under that cap and keeps two.
+template <int Cols>
+inline constexpr int kTileGemmBlocksPerSm = Cols <= 16 ? 3 : 2;
+
 template <class Format, int Rows, int Cols, int TileRows, int Groups, class Sink>
-__global__ __launch_bounds__(kTileGemmThreads, 2) void stream_tile_gemm_kernel(
+__global__ __launch_bounds__(kTileGemmThreads, kTileGemmBlocksPerSm<Cols>) void stream_tile_gemm_kernel(
     const __nv_bfloat16* __restrict__ x, std::int64_t x_stride, typename Format::Planes planes,
     Sink sink, std::int32_t items, std::int32_t row_offset, std::int32_t k,
     std::int32_t padded_k) {
@@ -132,6 +141,17 @@ __global__ __launch_bounds__(kTileGemmThreads, 2) void stream_tile_gemm_kernel(
     const int group      = warp / Shape::kGroupWarps;
     const int group_warp = warp % Shape::kGroupWarps;
     const int group_tid  = static_cast<int>(threadIdx.x) - group * Shape::kGroupThreads;
+    // A group's stage is its own: its warps meet at a named barrier (ids 1..Groups), the CTA only
+    // for the final reduction.
+    const auto group_sync = [&] {
+        if constexpr (Groups == 1) {
+            __syncthreads();
+        } else if constexpr (Shape::kGroupWarps == 1) {
+            __syncwarp();
+        } else {
+            asm volatile("bar.sync %0, %1;" ::"r"(group + 1), "r"(Shape::kGroupThreads));
+        }
+    };
     auto* weights = reinterpret_cast<__half*>(tile_gemm_shared) +
                     group * (Shape::kWeightHalves + Shape::kInputHalves);
     auto* inputs  = weights + Shape::kWeightHalves;
@@ -164,10 +184,11 @@ __global__ __launch_bounds__(kTileGemmThreads, 2) void stream_tile_gemm_kernel(
         }
     };
 
-    // A warp's fragments share one 16-row block of the tile (Shape::kWarpFragments token blocks),
-    // so each A fragment is loaded once per 16 k for all of them.
-    const int tm  = (group_warp * Shape::kWarpFragments) / (kTileCols / 16);
-    const int tn0 = (group_warp * Shape::kWarpFragments) % (kTileCols / 16);
+    // This warp's fragments (Shape::kWarpRows x kWarpCols): fragment f is row block tm0 + f / cols,
+    // token block tn0 + f % cols.
+    const int warp_blocks_n = kTileCols / 16 / Shape::kWarpCols; // warps across the tokens
+    const int tm0 = (group_warp / warp_blocks_n) * Shape::kWarpRows;
+    const int tn0 = (group_warp % warp_blocks_n) * Shape::kWarpCols;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[Shape::kWarpFragments];
 #pragma unroll
     for (int f = 0; f < Shape::kWarpFragments; ++f) wmma::fill_fragment(acc[f], 0.0f);
@@ -202,7 +223,7 @@ __global__ __launch_bounds__(kTileGemmThreads, 2) void stream_tile_gemm_kernel(
             if (round >= rounds) break; // uniform across the CTA
             const int step    = round_step(round);
             const bool active = step < steps;
-            if (round > 0) __syncthreads(); // every warp is done with the previous step's tile
+            if (round > 0) group_sync(); // the group's warps are done with the previous step's tile
             if (active) {
 #pragma unroll
                 for (int j = 0; j < Shape::kHalvesPerThread; ++j) {
@@ -237,18 +258,27 @@ __global__ __launch_bounds__(kTileGemmThreads, 2) void stream_tile_gemm_kernel(
                 }
                 if (step + Groups < steps) fetch_x(step + Groups);
             }
-            __syncthreads();
+            group_sync();
             if (active) {
 #pragma unroll
                 for (int kk = 0; kk < kTileGemmStepK; kk += 16) {
-                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
-                    wmma::load_matrix_sync(a, weights + tm * 16 * kTileGemmLd + kk, kTileGemmLd);
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major>
+                        b[Shape::kWarpCols];
 #pragma unroll
-                    for (int f = 0; f < Shape::kWarpFragments; ++f) {
-                        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b;
-                        wmma::load_matrix_sync(b, inputs + (tn0 + f) * 16 * kTileGemmLd + kk,
+                    for (int c = 0; c < Shape::kWarpCols; ++c) {
+                        wmma::load_matrix_sync(b[c], inputs + (tn0 + c) * 16 * kTileGemmLd + kk,
                                                kTileGemmLd);
-                        wmma::mma_sync(acc[f], a, b, acc[f]);
+                    }
+#pragma unroll
+                    for (int r = 0; r < Shape::kWarpRows; ++r) {
+                        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+                        wmma::load_matrix_sync(a, weights + (tm0 + r) * 16 * kTileGemmLd + kk,
+                                               kTileGemmLd);
+#pragma unroll
+                        for (int c = 0; c < Shape::kWarpCols; ++c) {
+                            wmma::mma_sync(acc[r * Shape::kWarpCols + c], a, b[c],
+                                           acc[r * Shape::kWarpCols + c]);
+                        }
                     }
                 }
             }
@@ -260,7 +290,9 @@ __global__ __launch_bounds__(kTileGemmThreads, 2) void stream_tile_gemm_kernel(
     auto* reduce = reinterpret_cast<float*>(tile_gemm_shared);
 #pragma unroll
     for (int f = 0; f < Shape::kWarpFragments; ++f) {
-        wmma::store_matrix_sync(reduce + (group * TileRows + tm * 16) * kTileCols + (tn0 + f) * 16,
+        const int tm = tm0 + f / Shape::kWarpCols;
+        const int tn = tn0 + f % Shape::kWarpCols;
+        wmma::store_matrix_sync(reduce + (group * TileRows + tm * 16) * kTileCols + tn * 16,
                                 acc[f], kTileCols, wmma::mem_row_major);
     }
     __syncthreads();
@@ -326,8 +358,12 @@ bool try_launch_stream_tile_gemm(const __nv_bfloat16* x, std::int64_t x_stride,
             using Shape       = TileGemmShape<TileRows, (Cols <= 16 ? 16 : 32), Groups>;
             const auto kernel = stream_tile_gemm_kernel<Format, Rows, Cols, TileRows, Groups, Sink>;
             configure_cuda_device_once([&] {
-                return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                            static_cast<int>(Shape::kSharedBytes));
+                const cudaError_t e = cudaFuncSetAttribute(
+                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    static_cast<int>(Shape::kSharedBytes));
+                if (e != cudaSuccess || kTileGemmBlocksPerSm<Cols> < 3) return e;
+                return cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                            cudaSharedmemCarveoutMaxShared);
             });
             const int blocks = static_cast<int>(div_up(items, TileRows / Rows));
             kernel<<<blocks, kTileGemmThreads, Shape::kSharedBytes, stream>>>(
