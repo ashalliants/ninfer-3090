@@ -57,15 +57,17 @@ inline constexpr bool kStreamHmmaDefault = true;
 inline constexpr bool kStreamHmmaDefault = false;
 #endif
 
-// NINFER_STREAM_HMMA=0 turns it off at runtime in sm_70 builds, for A/B measurement.
-inline bool stream_hmma_enabled() {
-    static const bool enabled = [] {
+// NINFER_STREAM_HMMA=0 turns it off at runtime in sm_70 builds, and =2 takes it for every shape
+// it can serve (ignoring the measured route), both for A/B measurement.
+inline int stream_hmma_mode() {
+    static const int mode = [] {
         const char* value = std::getenv("NINFER_STREAM_HMMA");
-        if (value == nullptr || *value == '\0') return kStreamHmmaDefault;
-        return std::strcmp(value, "0") != 0;
+        if (value == nullptr || *value == '\0') return kStreamHmmaDefault ? 1 : 0;
+        return std::strcmp(value, "2") == 0 ? 2 : std::strcmp(value, "0") != 0 ? 1 : 0;
     }();
-    return enabled;
+    return mode;
 }
+inline bool stream_hmma_enabled() { return stream_hmma_mode() != 0; }
 
 // The narrowest verify width that takes the tensor cores (see the route in
 // try_launch_stream_hmma_rows): at one token the SIMT kernel's single FFMA per weight is already
@@ -339,19 +341,23 @@ bool try_launch_stream_hmma_rows(const __nv_bfloat16* x, std::int64_t x_stride,
         return false;
     } else {
         if (!stream_hmma_enabled()) return false;
-        // Where it beats the SIMT kernel (Q4, V100-PCIE-32GB, us SIMT / tensor cores):
+        // Where it beats the SIMT kernel (Q4, V100-PCIE-32GB, us SIMT / tensor cores; measure
+        // with NINFER_STREAM_HMMA=0 against =2):
         //
-        //   shape (rows x K)        T=3          T=4          T=5          T=6          T=8
-        //   34816 x 5120 (SwiGLU)  163 / 190    195 / 190    252 / 237    343 / 226    503 / 305
-        //   6144 x 5120             44 /  52     51 /  53     75 /  67     86 /  65    101 /  84
-        //   4096 x 5120             33 /  48     37 /  49     55 /  62     63 /  61     72 /  77
-        //   5120 x 17408           105 / 184    115 / 194    146 / 209    169 / 227    225 / 236
+        //   shape (rows x K)        T=4          T=5          T=6          T=7          T=8
+        //   34816 x 5120 (SwiGLU)  196 / 180    252 / 227    344 / 233    396 / 222    529 / 322
+        //   6144 x 5120             51 /  50     75 /  64     86 /  66     85 /  64    104 /  83
+        //   4096 x 5120             37 /  46     55 /  59     63 /  60     70 /  60     74 /  76
+        //   5120 x 17408           116 / 195    146 / 210    170 / 222    220 / 239    236 / 235
         //
         // The SIMT kernel's cost grows with T (one FFMA per weight and token) and this one's
         // barely does, but it reads each row from one lane, so it needs many rows in flight: it
-        // loses on the long, few-row down projection at every width.
+        // loses on the long, few-row down projection at every width, and is even on 4096 rows.
         const std::int64_t rows_total = static_cast<std::int64_t>(items) * Rows;
-        if (k > 6144 || !(Cols >= 5 || rows_total >= 16384)) return false;
+        const bool wins = k <= 6144 && ((Cols >= 5 && rows_total >= 6144) || rows_total >= 16384);
+        if (stream_hmma_mode() != 2 && !wins) {
+            return false;
+        }
         // Whole steps, and Q5's high plane read in 32-byte pairs of steps.
         if (k % 256 != 0 || padded_k % 256 != 0 || x_stride % 8 != 0) {
             return false;
