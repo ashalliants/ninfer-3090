@@ -240,8 +240,12 @@ __global__ __launch_bounds__(kStreamHmmaWarps * 32, 1) void stream_hmma_kernel(
                 typename Format::HmmaStep loaded = Format::hmma_finish(pending, odd);
                 if (step + 1 < step_last) fetch(step + 1);
                 const __half* a_step = a_row + step * kStepK;
+                // One group (two slices) per iteration: the format shifts the next group into
+                // group 0 between iterations (hmma_advance).
 #pragma unroll 1
-                for (int slice = 0; slice < Format::kHmmaGroups * 2; ++slice) {
+                for (int group_index = 0; group_index < Format::kHmmaGroups; ++group_index) {
+#pragma unroll
+                for (int slice = 0; slice < 2; ++slice) {
                     float d[8];
 #pragma unroll
                     for (int i = 0; i < 8; ++i) d[i] = 0.0f;
@@ -249,10 +253,10 @@ __global__ __launch_bounds__(kStreamHmmaWarps * 32, 1) void stream_hmma_kernel(
                     for (int w = 0; w < 4; ++w) {
                         uint4 a = make_uint4(0u, 0u, 0u, 0u);
                         if (pos < Cols) {
-                            a = *reinterpret_cast<const uint4*>(a_step + slice * 32 + 8 * w);
+                            a = *reinterpret_cast<const uint4*>(a_step + (group_index * 2 + slice) * 32 + 8 * w);
                         }
                         unsigned b[4];
-                        Format::hmma_decode(loaded, 0, w, b);
+                        Format::hmma_decode(loaded, slice, w, b);
                         stream_hmma_m8n8k4(d, a.x, a.y, b[0], b[1]);
                         stream_hmma_m8n8k4(d, a.z, a.w, b[2], b[3]);
                     }
@@ -264,7 +268,8 @@ __global__ __launch_bounds__(kStreamHmmaWarps * 32, 1) void stream_hmma_kernel(
                     const float scale[8] = {s0, s1, s0, s1, s4, s5, s4, s5};
 #pragma unroll
                     for (int i = 0; i < 8; ++i) acc[i] = fmaf(scale[i], d[i], acc[i]);
-                    Format::hmma_advance(loaded);
+                }
+                Format::hmma_advance(loaded);
                 }
             }
 

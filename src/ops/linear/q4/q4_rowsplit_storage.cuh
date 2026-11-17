@@ -127,16 +127,17 @@ struct Q4StreamFormat {
         }
         return step;
     }
-    // Moves slice s + 1 into slice s, so a rolled slice loop always decodes slice 0 (keeps the
-    // loop body inside the instruction cache, without indexing registers at run time).
+    // Moves group g + 1 into group g (slices 2g + 2, 2g + 3 into 2g, 2g + 1), so a rolled group
+    // loop always decodes group 0 (keeps the loop body inside the instruction cache, without
+    // indexing registers at run time).
     __device__ static __forceinline__ void hmma_advance(HmmaStep& step) {
 #pragma unroll
-        for (int s = 0; s + 1 < 2 * kHmmaGroups; ++s) step.codes[s] = step.codes[s + 1];
+        for (int s = 0; s + 2 < 2 * kHmmaGroups; ++s) step.codes[s] = step.codes[s + 2];
+        step.scales = make_uint2(step.scales.x >> 16 | step.scales.y << 16, step.scales.y >> 16);
     }
-    __device__ static __forceinline__ float hmma_scale(const HmmaStep& step, int slice) {
-        const std::uint32_t pair = (slice >> 2) ? step.scales.y : step.scales.x;
-        return __half2float(__ushort_as_half(
-            static_cast<std::uint16_t>(((slice >> 1) & 1) ? pair >> 16 : pair & 0xffffu)));
+    // Group 0's scale (hmma_advance shifts the others down).
+    __device__ static __forceinline__ float hmma_scale(const HmmaStep& step, int) {
+        return __half2float(__ushort_as_half(static_cast<std::uint16_t>(step.scales.x & 0xffffu)));
     }
     // The four FP16 pairs (k 8w + 2j, 8w + 2j + 1) of word w of a slice, as exact integers:
     // m = n ^ 8 sits in the mantissa of 1024 + m, and subtracting 1032 leaves (n ^ 8) - 8.
