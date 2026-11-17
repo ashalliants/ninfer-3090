@@ -96,15 +96,15 @@ struct Q4StreamFormat {
 
     // Tensor-core form (ops/linear/common/stream_hmma.cuh). A step is kHmmaGroups groups of one
     // row: their code bytes, read by lane pairs, and their scales.
-    static constexpr bool kHmma       = true;
-    static constexpr int kHmmaGroups  = 4;
+    static constexpr bool kHmma      = true;
+    static constexpr int kHmmaGroups = 4;
     struct HmmaStep {
-        uint4 codes[2 * kHmmaGroups]; // slice s: k 32s .. 32s + 31
-        uint2 scales;                 // groups 0..3
+        uint4 codes[2 * kHmmaGroups];  // slice s: k 32s .. 32s + 31
+        std::uint32_t scale[kHmmaGroups]; // group g's FP16 scale bits
     };
     struct HmmaRaw {
         StreamHmmaPair codes[kHmmaGroups];
-        uint2 scales;
+        std::uint32_t scales[kHmmaGroups / 2]; // two FP16 scales each
     };
     __device__ static __forceinline__ HmmaRaw hmma_fetch(const Row& even, const Row& odd,
                                                          bool is_odd, int group) {
@@ -115,14 +115,16 @@ struct Q4StreamFormat {
                                                   odd.codes + 2 * (group + g), is_odd);
         }
         const Row& own = is_odd ? odd : even;
-        raw.scales     = __ldg(reinterpret_cast<const uint2*>(own.scales + group));
+        const auto* scales = reinterpret_cast<const std::uint32_t*>(own.scales + group);
+#pragma unroll
+        for (int g = 0; g < kHmmaGroups / 2; ++g) raw.scales[g] = __ldg(scales + g);
         return raw;
     }
     __device__ static __forceinline__ HmmaStep hmma_finish(const HmmaRaw& raw, bool is_odd) {
         HmmaStep step;
-        step.scales = raw.scales;
 #pragma unroll
         for (int g = 0; g < kHmmaGroups; ++g) {
+            step.scale[g] = (g & 1) ? raw.scales[g / 2] >> 16 : raw.scales[g / 2] & 0xffffu;
             stream_hmma_pair_swap(raw.codes[g], is_odd, step.codes[2 * g], step.codes[2 * g + 1]);
         }
         return step;
@@ -133,11 +135,12 @@ struct Q4StreamFormat {
     __device__ static __forceinline__ void hmma_advance(HmmaStep& step) {
 #pragma unroll
         for (int s = 0; s + 2 < 2 * kHmmaGroups; ++s) step.codes[s] = step.codes[s + 2];
-        step.scales = make_uint2(step.scales.x >> 16 | step.scales.y << 16, step.scales.y >> 16);
+#pragma unroll
+        for (int g = 0; g + 1 < kHmmaGroups; ++g) step.scale[g] = step.scale[g + 1];
     }
     // Group 0's scale (hmma_advance shifts the others down).
     __device__ static __forceinline__ float hmma_scale(const HmmaStep& step, int) {
-        return __half2float(__ushort_as_half(static_cast<std::uint16_t>(step.scales.x & 0xffffu)));
+        return __half2float(__ushort_as_half(static_cast<std::uint16_t>(step.scale[0])));
     }
     // The four FP16 pairs (k 8w + 2j, 8w + 2j + 1) of word w of a slice, as exact integers:
     // m = n ^ 8 sits in the mantissa of 1024 + m, and subtracting 1032 leaves (n ^ 8) - 8.
