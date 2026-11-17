@@ -120,7 +120,7 @@ set_tests_properties(ninfer_qwen4_exp_nvme_tier_test PROPERTIES SKIP_RETURN_CODE
 ninfer_add_test(ninfer_qwen4_exp_lanes_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lanes_real.cpp"
   STANDALONE
-  LIBRARIES ninfer_engine ninfer_core)
+  LIBRARIES ninfer_engine ninfer_artifact ninfer_core)
 set_tests_properties(ninfer_qwen4_exp_lanes_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_test(ninfer_qwen4_exp_engine_real_test
