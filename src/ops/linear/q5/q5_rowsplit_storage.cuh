@@ -135,69 +135,77 @@ struct Q5StreamFormat {
     // Tensor-core form (ops/linear/common/stream_hmma.cuh): n - 16 high = m - 16 with
     // m = n + 16 (1 - high) in [0, 31], so the inverted high bit becomes bit 4 of each byte
     // before the same FP16 magic as Q4, with 1040 subtracted.
-    // Tensor-core form (ops/linear/common/stream_hmma.cuh). A step is four groups (256 k) of one
-    // row: 128 code bytes and 32 high bytes, both read by lane pairs, and the four scales.
-    // Off: measured slower than the SIMT kernel at every verify width (the high plane's extra
-    // decode and loads), so Q5 keeps stream_gemv_kernel. The form stays, exercised by nothing.
+    // Tensor-core form (ops/linear/common/stream_hmma.cuh). A step is two groups (128 k) of one
+    // row: 64 code bytes and 16 high bytes, both read by lane pairs, and the two scales.
+    //
+    // Off (kHmma = false): correct, but slower than the SIMT kernel at every verify width on a
+    // V100 (us SIMT / tensor cores; NINFER_STREAM_HMMA=0 against =2 with this set to true):
+    //   12288 x 5120   T=4 103 / 158   T=6 156 / 205   T=8 188 / 203
+    //   5120 x 6144    T=4  67 /  93   T=6  83 /  95   T=8 104 / 102
+    // The high-bit spread costs ~1 instruction per weight on top of Q4's decode, and the half-
+    // sector high-plane reads cost bandwidth.
     static constexpr bool kHmma      = false;
-    static constexpr int kHmmaGroups = 4;
+    static constexpr int kHmmaGroups = 2;
     struct HmmaStep {
-        uint4 codes[8]; // slice s: k 32s .. 32s + 31
-        uint4 high[2];  // word s: slice s's 32 high bits
-        uint2 scales;   // groups 0..3
+        uint4 codes[4]; // slice s: k 32s .. 32s + 31
+        uint4 high;     // word s: slice s's 32 high bits
+        std::uint32_t scales;
     };
     struct HmmaRaw {
-        StreamHmmaPair codes[4];
-        StreamHmmaPair high;
-        uint2 scales;
+        StreamHmmaPair codes[2];
+        uint2 high_from_even;
+        uint2 high_from_odd;
+        std::uint32_t scales;
     };
     __device__ static __forceinline__ HmmaRaw hmma_fetch(const Row& even, const Row& odd,
                                                          bool is_odd, int group) {
         HmmaRaw raw;
 #pragma unroll
-        for (int g = 0; g < 4; ++g) {
+        for (int g = 0; g < 2; ++g) {
             raw.codes[g] = stream_hmma_pair_fetch(even.codes + 2 * (group + g),
                                                   odd.codes + 2 * (group + g), is_odd);
         }
-        raw.high       = stream_hmma_pair_fetch(reinterpret_cast<const uint4*>(even.high + 2 * group),
-                                                reinterpret_cast<const uint4*>(odd.high + 2 * group),
-                                                is_odd);
-        const Row& own = is_odd ? odd : even;
-        raw.scales     = __ldg(reinterpret_cast<const uint2*>(own.scales + group));
+        // 16 high bytes per row: each lane of the pair reads an 8-byte half of both rows'.
+        const int half     = is_odd ? 1 : 0;
+        raw.high_from_even = __ldg(reinterpret_cast<const uint2*>(even.high + 2 * group) + half);
+        raw.high_from_odd  = __ldg(reinterpret_cast<const uint2*>(odd.high + 2 * group) + half);
+        const Row& own     = is_odd ? odd : even;
+        raw.scales         = __ldg(reinterpret_cast<const std::uint32_t*>(own.scales + group));
         return raw;
     }
     __device__ static __forceinline__ HmmaStep hmma_finish(const HmmaRaw& raw, bool is_odd) {
         HmmaStep step;
         step.scales = raw.scales;
 #pragma unroll
-        for (int g = 0; g < 4; ++g) {
+        for (int g = 0; g < 2; ++g) {
             stream_hmma_pair_swap(raw.codes[g], is_odd, step.codes[2 * g], step.codes[2 * g + 1]);
         }
-        stream_hmma_pair_swap(raw.high, is_odd, step.high[0], step.high[1]);
+        const uint2 send = is_odd ? raw.high_from_even : raw.high_from_odd;
+        const uint2 recv = make_uint2(__shfl_xor_sync(0xffffffffu, send.x, 1),
+                                      __shfl_xor_sync(0xffffffffu, send.y, 1));
+        const uint2 lo   = is_odd ? recv : raw.high_from_even;
+        const uint2 hi   = is_odd ? raw.high_from_odd : recv;
+        step.high        = make_uint4(lo.x, lo.y, hi.x, hi.y);
         return step;
     }
-    // Moves slice s + 1 into slice s, so a rolled slice loop always decodes slice 0 (keeps the
-    // loop body inside the instruction cache, without indexing registers at run time).
+    // Moves group 1 into group 0 (stream_hmma.cuh's rolled group loop decodes group 0).
     __device__ static __forceinline__ void hmma_advance(HmmaStep& step) {
-#pragma unroll
-        for (int s = 0; s < 7; ++s) step.codes[s] = step.codes[s + 1];
-        step.high[0] = make_uint4(step.high[0].y, step.high[0].z, step.high[0].w, step.high[1].x);
-        step.high[1] = make_uint4(step.high[1].y, step.high[1].z, step.high[1].w, 0u);
+        step.codes[0] = step.codes[2];
+        step.codes[1] = step.codes[3];
+        step.high     = make_uint4(step.high.z, step.high.w, 0u, 0u);
+        step.scales >>= 16;
     }
-    __device__ static __forceinline__ float hmma_scale(const HmmaStep& step, int slice) {
-        const std::uint32_t pair = (slice >> 2) ? step.scales.y : step.scales.x;
-        return __half2float(__ushort_as_half(
-            static_cast<std::uint16_t>(((slice >> 1) & 1) ? pair >> 16 : pair & 0xffffu)));
+    __device__ static __forceinline__ float hmma_scale(const HmmaStep& step, int) {
+        return __half2float(__ushort_as_half(static_cast<std::uint16_t>(step.scales & 0xffffu)));
     }
     __device__ static __forceinline__ void hmma_decode(const HmmaStep& step, int slice, int w,
                                                        unsigned (&b)[4]) {
         const uint4 codes            = step.codes[slice];
         const std::uint32_t words[4] = {codes.x, codes.y, codes.z, codes.w};
-        const std::uint32_t highs[4] = {step.high[0].x, step.high[0].y, step.high[0].z,
-                                        step.high[0].w};
+        const std::uint32_t highs[4] = {step.high.x, step.high.y, step.high.z, step.high.w};
         const std::uint32_t lo  = words[w] & 0x0f0f0f0fu;
         const std::uint32_t hi  = (words[w] >> 4) & 0x0f0f0f0fu;
-        const std::uint32_t inv = ~(highs[slice & 3] >> (8 * w));
+        const std::uint32_t inv = ~(highs[slice] >> (8 * w));
         // Bit i of a nibble lands in bit 4 of byte i: i + 4 + 7i = 8i + 4, and the cross terms
         // (i + 7j + 4 for i != j) never meet a byte's bit 4 or carry into it.
         const std::uint32_t first  = ((inv & 0xfu) * 0x02040810u) & 0x10101010u;
