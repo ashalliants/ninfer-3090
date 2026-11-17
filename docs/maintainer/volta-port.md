@@ -220,8 +220,11 @@ the 122. With the route on, `prefill_tail_floor` (planning/startup.h, set to the
 **Short prompts.** The wide gate exists for decode and verify rounds (up to 8 lanes x 16 columns =
 128 through the same Ops and policies), not for prefill. A prefill-phase call therefore takes
 `ops::prefill_phase_policy(policy)`: `AllowPrefillCublas` becomes `AllowPrefillCublasNarrow`,
-whose gate is `kCublasPrefillNarrowMinTokens` -- 9 on sm_70 (below that the streaming GEMV wins),
-the wide gate elsewhere. The text layers pass the phase to `ffn`, `project_add`,
+whose gate is `kCublasPrefillNarrowMinTokens` -- 33 on sm_70, the wide gate elsewhere. Below it
+the streaming GEMV takes 1..32 tokens on sm_70, past eight as passes of up to eight over the same
+weights (`kStreamGemvMaxTokens`); before that, wherever the narrow route's scratch did not fit (the
+bench, the server), 9..32 tokens ran the emulated small-T mma kernels: `ninfer_bench -p 32`
+93 -> 139 tok/s. The text layers pass the phase to `ffn`, `project_add`,
 `attention_projection` and `gdn_projection` (a defaulted `prefill` flag); decode, verify, MTP and
 draft calls are unchanged. A narrow call takes the route only if its scratch fits in the
 workspace left (`w4_cublas_prefill_fits` / `w4_cublas_projection_fits`), which the chunk-width
