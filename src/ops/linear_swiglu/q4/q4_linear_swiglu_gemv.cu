@@ -369,6 +369,12 @@ bool try_launch_swiglu_stream(const Tensor& x, const Weight& w, Tensor& out, cud
 
 } // namespace
 
+bool q4_linear_swiglu_try_stream(const Tensor& x, const Weight& w, Tensor& out,
+                                 cudaStream_t stream) {
+    return w.n == kN && w.k == kK && w.padded_shape[1] == kK &&
+           try_launch_swiglu_stream(x, w, out, stream);
+}
+
 void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor& out,
                                        cudaStream_t stream) {
     if (w.n != kN || w.k != kK || w.padded_shape[1] != kK) {

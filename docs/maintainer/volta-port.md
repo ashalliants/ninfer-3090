@@ -220,11 +220,27 @@ the 122. With the route on, `prefill_tail_floor` (planning/startup.h, set to the
 **Short prompts.** The wide gate exists for decode and verify rounds (up to 8 lanes x 16 columns =
 128 through the same Ops and policies), not for prefill. A prefill-phase call therefore takes
 `ops::prefill_phase_policy(policy)`: `AllowPrefillCublas` becomes `AllowPrefillCublasNarrow`,
-whose gate is `kCublasPrefillNarrowMinTokens` -- 33 on sm_70, the wide gate elsewhere. Below it
-the streaming GEMV takes 1..32 tokens on sm_70, past eight as passes of up to eight over the same
-weights (`kStreamGemvMaxTokens`); before that, wherever the narrow route's scratch did not fit (the
-bench, the server), 9..32 tokens ran the emulated small-T mma kernels: `ninfer_bench -p 32`
-93 -> 139 tok/s. The text layers pass the phase to `ffn`, `project_add`,
+whose gate is `kCublasPrefillNarrowMinTokens` -- 65 on sm_70, the wide gate elsewhere. Below it
+the streaming GEMV takes 1..64 tokens of the Q4/Q5 weights on sm_70 (1..32 for formats without the
+tile GEMM; `kStreamGemvMaxTokens`). Past eight it runs whole passes of 32 tokens and a 16 or 9..16
+pass on the tensor cores (`ops/linear/common/stream_tile_gemm.cuh`): a CTA dequantises a tile of
+weight rows to FP16 in shared memory once per 64-wide K step -- the cuBLAS route's `q x scale`
+rounding, ~8.6e-4 relative L2 against the exact streaming GEMV -- and WMMA multiplies it against
+every token of the pass; for matrices of few rows four warp groups split K inside the CTA and add
+in a fixed order. At most eight tokens remain for one pass of eight. Against passes of eight, per
+Qwen3.8-27B matrix: 1.25-2x at 12 tokens, 1.5-2.4x at 16, 2.2-3.6x at 32. `ninfer_bench`:
+pp16 138 -> 236, pp32 143 -> 356, pp48 196 (cuBLAS) -> 306, pp64 262 (cuBLAS) -> 371 tok/s; the
+cuBLAS route still wins from ~100 tokens (pp96 320, pp128 416). Server time to first token on a
+20-token message 175 -> 160 ms, 44-50-token messages 211-246 ms. The tiles reach only 25-35% of
+the weight stream (shared memory issue and barriers bind, not DRAM: deeper prefetch, padding and
+occupancy were tried without gain), and the server splits short prompts at their checkpoint
+frontiers (12 + 7 + 1 tokens for a 20-token chat message), each call one read of the weights.
+`NINFER_STREAM_TILE_GEMM=0` turns the tiles off (passes of eight) for A/B measurement. Before the
+streaming GEMV, wherever the narrow route's scratch did not fit (the bench, the server), 9..32
+tokens ran the emulated small-T mma kernels: `ninfer_bench -p 32` 93 -> 139 tok/s. (A narrow
+cuBLAS call needs its scratch planned: a bench whose largest prompt is under 129 tokens plans none,
+so 65..128 there fall to the emulated MMA schedules -- 55 tok/s at 65 -- where the server, whose
+chunk reaches the wide gate, takes cuBLAS.) The text layers pass the phase to `ffn`, `project_add`,
 `attention_projection` and `gdn_projection` (a defaulted `prefill` flag); decode, verify, MTP and
 draft calls are unchanged. A narrow call takes the route only if its scratch fits in the
 workspace left (`w4_cublas_prefill_fits` / `w4_cublas_projection_fits`), which the chunk-width

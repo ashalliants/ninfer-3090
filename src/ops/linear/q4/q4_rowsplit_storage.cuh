@@ -94,6 +94,37 @@ struct Q4StreamFormat {
         stream_decode_nibbles8(words[W] ^ 0x88888888u, c, f);
     }
 
+    // Short-prompt GEMM form (ops/linear/common/stream_tile_gemm.cuh): half a group (32 k) of one
+    // row per fetch, decoded to the FP16 pairs (k 8w + i, 8w + i + 4) of its words times the
+    // group scale.
+    static constexpr bool kTileGemm = true;
+    using GemmRow                   = Row;
+    struct GemmRaw {
+        uint4 codes;
+        std::uint16_t scale;
+    };
+    __device__ static __forceinline__ GemmRow gemm_row(const Planes& planes, int r, int padded_k) {
+        return row(planes, r, padded_k);
+    }
+    __device__ static __forceinline__ GemmRaw gemm_fetch(const GemmRow& r, int group, int half) {
+        return {__ldg(&r.codes[2 * group + half]), __ldg(&r.scales[group])};
+    }
+    __device__ static __forceinline__ GemmRaw gemm_empty() { return {make_uint4(0u, 0u, 0u, 0u), 0}; }
+    __device__ static __forceinline__ void gemm_decode(const GemmRaw& raw, __half2 (&w)[16]) {
+        const std::uint32_t words[4] = {raw.codes.x, raw.codes.y, raw.codes.z, raw.codes.w};
+        const __half2 bias  = __half2half2(__ushort_as_half(0x6408)); // 1032: (n ^ 8) - 8
+        const __half2 scale = __half2half2(__ushort_as_half(raw.scale));
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const std::uint32_t word = words[q] ^ 0x88888888u;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const std::uint32_t bits = ((word >> (4 * i)) & 0x000f000fu) | 0x64006400u;
+                w[4 * q + i] = __hmul2(__hsub2(half2_from_bits(bits), bias), scale);
+            }
+        }
+    }
+
     // Tensor-core form (ops/linear/common/stream_hmma.cuh). A step is kHmmaGroups groups of one
     // row: their code bytes, read by lane pairs, and their scales.
     static constexpr bool kHmma      = true;

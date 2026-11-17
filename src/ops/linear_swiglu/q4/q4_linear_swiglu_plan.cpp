@@ -247,6 +247,12 @@ void q4_linear_swiglu_execute_schedule(Q4LinearSwiGluScheduleId schedule, const 
                                        const Weight& w, Tensor& out, WorkspaceArena& ws,
                                        cudaStream_t stream) {
     const Q4LinearSwiGluProblem problem{w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
+#if defined(NINFER_SM70)
+    // sm_70 emulates mma.sync, so the MMA schedules below are compute-bound there; the streaming
+    // GEMV takes 1..64 tokens (32- and 16-token tensor-core tiles past sixteen) and declines the
+    // rest, which keep the table's route.
+    if (q4_linear_swiglu_try_stream(x, w, out, stream)) return;
+#endif
     switch (schedule) {
     case Q4LinearSwiGluScheduleId::GemvPair:
         q4_linear_swiglu_gemv_pair_launch(x, w, out, stream);

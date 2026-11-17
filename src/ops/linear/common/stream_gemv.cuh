@@ -43,6 +43,7 @@
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/common/stream_gemv_decode.cuh"
 #include "ops/linear/common/stream_hmma.cuh"
+#include "ops/linear/common/stream_tile_gemm.cuh"
 
 #include <cuda_bf16.h>
 
@@ -453,10 +454,13 @@ bool try_launch_stream_gemv_rows(const __nv_bfloat16* x, std::int64_t x_stride,
 }
 
 // The most tokens one call takes: past eight (the kernels' widest instantiation) it runs as passes
-// of up to eight tokens over the same weights, each finished at its token offset. Four passes over
-// the weights still beat the sm_70 alternatives at short-prompt widths -- the emulated small-T mma
-// kernels, or materialising every weight in FP16 for cuBLAS (see kCublasPrefillNarrowMinTokens).
-inline constexpr std::int32_t kStreamGemvMaxTokens = 32;
+// over the same weights, each finished at its token offset -- whole passes of 32 and 16 tokens on
+// the tensor cores for the formats stream_tile_gemm.cuh serves, passes of eight otherwise. Both
+// beat the sm_70 alternatives at short-prompt widths: the emulated small-T mma kernels, or
+// materialising every weight in FP16 for cuBLAS (see kCublasPrefillNarrowMinTokens). Formats
+// without the tile GEMM stop at kStreamGemvMaxUntiledTokens: four passes of eight still win there.
+inline constexpr std::int32_t kStreamGemvMaxTokens         = 64;
+inline constexpr std::int32_t kStreamGemvMaxUntiledTokens  = 32;
 
 // `tokens` (1..kStreamGemvMaxTokens) tokens of `items` items of Rows rows: one launch per eight
 // tokens. `sink` must offer with_token_offset(begin). Declines (returns false, nothing launched)
@@ -468,13 +472,56 @@ bool try_launch_stream_gemv_passes(const __nv_bfloat16* x, std::int64_t x_stride
                                    std::int32_t padded_k, cudaStream_t stream,
                                    std::int32_t tokens) {
     if (tokens < 1 || tokens > kStreamGemvMaxTokens) return false;
+    // A format the tile GEMM serves takes every width up to the maximum (as passes of eight when
+    // NINFER_STREAM_TILE_GEMM=0 turns the tiles off, so routes sized for it still run).
+    if (tokens > kStreamGemvMaxUntiledTokens && !stream_tile_gemm_format<Format>()) {
+        return false;
+    }
     if (tokens > 8) {
         // The checks of the widest pass cover the narrower ones (try_launch_stream_gemv_rows).
         if (!stream_gemv_enabled() || k % 256 != 0 || k % 128 != 0 || x_stride % 8 != 0) {
             return false;
         }
     }
-    for (std::int32_t begin = 0; begin < tokens; begin += 8) {
+    std::int32_t begin = 0;
+    // Whole passes of 32 tokens on the tensor cores where the format allows, then 16 and a last
+    // pass of 9..16 (stream_tile_gemm.cuh: 2-3x the passes of eight it replaces); the rest, up
+    // to eight tokens, as one pass of eight.
+    if (tokens >= 9 && stream_tile_gemm_supported<Format>(k, padded_k, x_stride)) {
+        for (; tokens - begin >= 32; begin += 32) {
+            (void)try_launch_stream_tile_gemm<Format, Rows, 32>(x + begin * x_stride, x_stride,
+                                                               planes, sink.with_token_offset(begin),
+                                                               items, row_offset, k, padded_k,
+                                                               stream);
+        }
+        if (tokens - begin > 16) {
+            (void)try_launch_stream_tile_gemm<Format, Rows, 16>(x + begin * x_stride, x_stride,
+                                                               planes, sink.with_token_offset(begin),
+                                                               items, row_offset, k, padded_k,
+                                                               stream);
+            begin += 16;
+        }
+        const std::int32_t last = tokens - begin;
+        if (last >= 9) {
+            const __nv_bfloat16* pass_x = x + begin * x_stride;
+            const Sink pass_sink        = sink.with_token_offset(begin);
+            switch (last) {
+#define NINFER_STREAM_TILE_PASS(T)                                                                     case T:                                                                                                (void)try_launch_stream_tile_gemm<Format, Rows, T>(pass_x, x_stride, planes, pass_sink,                items, row_offset, k, padded_k, stream);                       break
+                NINFER_STREAM_TILE_PASS(9);
+                NINFER_STREAM_TILE_PASS(10);
+                NINFER_STREAM_TILE_PASS(11);
+                NINFER_STREAM_TILE_PASS(12);
+                NINFER_STREAM_TILE_PASS(13);
+                NINFER_STREAM_TILE_PASS(14);
+                NINFER_STREAM_TILE_PASS(15);
+                NINFER_STREAM_TILE_PASS(16);
+#undef NINFER_STREAM_TILE_PASS
+            }
+            begin = tokens;
+        }
+    }
+    const std::int32_t tiled = begin;
+    for (; begin < tokens; begin += 8) {
         const std::int32_t count = std::min<std::int32_t>(8, tokens - begin);
         const __nv_bfloat16* pass_x = x + begin * x_stride;
         const Sink pass_sink        = sink.with_token_offset(begin);
@@ -492,7 +539,7 @@ bool try_launch_stream_gemv_passes(const __nv_bfloat16* x, std::int64_t x_stride
 #undef NINFER_STREAM_GEMV_PASS
         }
         if (!launched) {
-            if (begin > 0) {
+            if (begin > 0 || tiled > 0) {
                 throw std::logic_error("streaming GEMV declined a pass after launching others");
             }
             return false;

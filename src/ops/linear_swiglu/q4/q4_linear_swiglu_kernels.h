@@ -38,6 +38,10 @@ void q4_linear_swiglu_small_t_tiled_masked_launch(const Tensor& x, const Weight&
 // too little MMA work to pay for quantising the activations. Measured per width in
 // ops/linear/q4/q4_small_t_mma_i8.cuh.
 [[nodiscard]] bool q4_linear_swiglu_small_t_i8_supported(std::int32_t tokens) noexcept;
+// The streaming GEMV for the [34816,5120] gate/up weight at 1..kStreamGemvMaxTokens tokens
+// (ops/linear/common/stream_gemv.cuh); false, with nothing launched, where it does not apply.
+[[nodiscard]] bool q4_linear_swiglu_try_stream(const Tensor& x, const Weight& w, Tensor& out,
+                                               cudaStream_t stream);
 [[nodiscard]] std::size_t q4_linear_swiglu_small_t_tiled_i8_workspace_bytes(std::int32_t tokens);
 void q4_linear_swiglu_small_t_tiled_i8_launch(const Tensor& x, const Weight& w, Tensor& out,
                                               WorkspaceArena& workspace, cudaStream_t stream);

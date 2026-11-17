@@ -132,6 +132,41 @@ struct Q5StreamFormat {
         stream_fold_bits8<1, 0, 16, true>((slice.high >> (8 * W)) & 0xffu, c, f);
     }
 
+    // Short-prompt GEMM form (ops/linear/common/stream_tile_gemm.cuh), as Q4's: half a group of
+    // one row per fetch, value n - 16 h with the high bit h of each weight from the high plane.
+    static constexpr bool kTileGemm = true;
+    using GemmRow                   = Row;
+    struct GemmRaw {
+        uint4 codes;
+        std::uint32_t high;
+        std::uint16_t scale;
+    };
+    __device__ static __forceinline__ GemmRow gemm_row(const Planes& planes, int r, int padded_k) {
+        return row(planes, r, padded_k);
+    }
+    __device__ static __forceinline__ GemmRaw gemm_fetch(const GemmRow& r, int group, int half) {
+        return {__ldg(&r.codes[2 * group + half]), __ldg(&r.high[2 * group + half]),
+                __ldg(&r.scales[group])};
+    }
+    __device__ static __forceinline__ GemmRaw gemm_empty() {
+        return {make_uint4(0u, 0u, 0u, 0u), 0u, 0};
+    }
+    __device__ static __forceinline__ void gemm_decode(const GemmRaw& raw, __half2 (&w)[16]) {
+        const std::uint32_t words[4] = {raw.codes.x, raw.codes.y, raw.codes.z, raw.codes.w};
+        const __half2 bias  = __half2half2(__ushort_as_half(0x6410)); // 1040
+        const __half2 scale = __half2half2(__ushort_as_half(raw.scale));
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const std::uint32_t high = (raw.high >> (8 * q)) ^ 0xffu; // word q's eight bits
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                std::uint32_t bits = ((words[q] >> (4 * i)) & 0x000f000fu) | 0x64006400u;
+                bits |= (((high >> i) & 1u) << 4) | (((high >> (i + 4)) & 1u) << 20);
+                w[4 * q + i] = __hmul2(__hsub2(half2_from_bits(bits), bias), scale);
+            }
+        }
+    }
+
     // Tensor-core form (ops/linear/common/stream_hmma.cuh): n - 16 high = m - 16 with
     // m = n + 16 (1 - high) in [0, 31], so the inverted high bit becomes bit 4 of each byte
     // before the same FP16 magic as Q4, with 1040 subtracted.
