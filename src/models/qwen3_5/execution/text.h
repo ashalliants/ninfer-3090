@@ -151,6 +151,17 @@ public:
         prefill_split_frontier_ = position;
     }
 
+    // A checkpoint inside the next prefill chunk without ending the chunk there: at absolute
+    // position `position` the GDN layers write their conv and recurrent state into state slot
+    // `slot` and go on from it, the remaining columns publishing to the destination slot as usual;
+    // the hidden state of the column before `position` goes to the rewrite checkpoint hidden
+    // output. Every stateful step is the one two calls split at `position` would run; the
+    // projections run once over the whole chunk. -1 (the default, reset after each chunk) is off.
+    void set_prefill_state_split(std::int64_t position, std::int32_t slot) noexcept {
+        prefill_state_split_frontier_ = position;
+        prefill_state_split_slot_     = slot;
+    }
+
     // Runs the next prefill chunk in slices (PrefillSliceState). Text-only, single-device chunks
     // only; any other chunk runs whole whatever this holds.
     void set_prefill_slice(PrefillSliceState* slice) noexcept { prefill_slice_ = slice; }
@@ -346,6 +357,11 @@ private:
     GdnStateAction gdn_state_action_          = GdnStateAction::UpdateInPlace;
     const GdnReplayRecords* replay_records_   = nullptr;
     std::int64_t prefill_split_frontier_      = -1;
+    std::int64_t prefill_state_split_frontier_ = -1;
+    std::int32_t prefill_state_split_slot_     = 0;
+    // The current prefill chunk's state split as a column of the chunk, -1 when none
+    // (set_prefill_state_split); read by the GDN layers.
+    std::int32_t active_state_split_column_    = -1;
     // The int4 scout's layer parameters while scout_chunk runs (ScoutScratch::a4_layers); empty
     // everywhere else, so every other pass reads the model's own parameters.
     std::span<const BlockParameters> scout_layers_{};

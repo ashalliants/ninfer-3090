@@ -373,6 +373,19 @@ public:
         object.role          = StateImageRole::CheckpointImmutable;
     }
 
+    // A reserved destination that a prefill call wrote whole (the Program's merged capture split)
+    // becomes a checkpoint image as it stands.
+    void freeze_written_destination(StateImageHandle handle) {
+        Object& object = require(handle);
+        if (object.role != StateImageRole::ReservedDestination || !object.device_slot ||
+            object.host_slot || object.source_pins != 0 || object.destination_pinned ||
+            has_pending_replica(object)) {
+            throw std::logic_error("StateImage written destination is not freezable");
+        }
+        object.content_epoch = next_epoch();
+        object.role          = StateImageRole::CheckpointImmutable;
+    }
+
     void thaw(StateImageHandle handle) {
         Object& object = require(handle);
         if (object.role != StateImageRole::CheckpointImmutable || !object.device_slot ||

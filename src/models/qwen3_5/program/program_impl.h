@@ -251,6 +251,10 @@ struct RequestControl {
     std::vector<CaptureGroup> capture_groups;
     std::size_t next_capture = 0;
     bool capture_pending     = false;
+    // The pending capture's image was written by the prefill call that ran past its frontier
+    // (ProgramImpl::merge_capture_split): capture_reservation's state holds it, and the lane's
+    // own state moved on to the call's end.
+    bool capture_prefilled = false;
     // This request's n-gram copy index (null unless the Frontend builds them). It lives with the
     // control, which a pause moves into the ResumeState together with the ledger it indexes.
     std::unique_ptr<NgramRequestIndex> ngram;
@@ -921,6 +925,11 @@ public:
     void complete_binding(ContextTransaction&, ContextProgress&);
     void publish_capture(ContextTransaction&);
     [[nodiscard]] bool reserve_capture_destination(std::uint32_t lane, std::uint32_t frontier);
+    // Whether the prompt's last prefill call runs through the pending capture's frontier and writes
+    // its image on the way (TextContext::set_prefill_state_split) rather than ending there; true
+    // with a Device destination reserved. See capture.cpp.
+    [[nodiscard]] bool merge_capture_split(const SequenceState& sequence, RequestControl& request,
+                                           std::uint32_t frontier, std::uint32_t prompt_tokens);
     void prepare_capture_boundary(std::uint32_t lane);
     [[nodiscard]] ResumeState complete_pause(ContextTransaction&);
     void install_resume_sampling(SequenceState&, RequestControl&);

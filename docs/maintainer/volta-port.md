@@ -235,7 +235,24 @@ cuBLAS route still wins from ~100 tokens (pp96 320, pp128 416). Server time to f
 the weight stream (shared memory issue and barriers bind, not DRAM: deeper prefetch, padding and
 occupancy were tried without gain), and the server splits short prompts at their checkpoint
 frontiers (12 + 7 + 1 tokens for a 20-token chat message), each call one read of the weights.
-`NINFER_STREAM_TILE_GEMM=0` turns the tiles off (passes of eight) for A/B measurement. Before the
+`NINFER_STREAM_TILE_GEMM=0` turns the tiles off (passes of eight) for A/B measurement.
+
+**Merged checkpoint splits.** With prefix reuse on, a chat prompt's checkpoint (its recovery
+frontier, before the assistant opener) and the opener's rewrite execution frontiers cut the prompt
+into separate prefill calls, and on sm_70 every call costs a full read of the weights whatever its
+width (~70 ms for the 27B at 9-12 tokens): a 20-token message ran as 11 + 5 + 4 tokens. On sm_70 the
+prompt's last call now runs through its pending capture's frontier
+(`ProgramImpl::merge_capture_split`, `transactions/capture.cpp`): each GDN layer runs its
+convolution and recurrence over the columns before the frontier into the capture's reserved state
+slot and on from it (`TextContext::set_prefill_state_split`) -- the stateful steps the split calls
+ran -- while the projections and attention run once over the whole call; the hidden state of the
+frontier's last column goes to that slot's continuation hidden. After the first token is committed
+the capture publishes the written slot as the checkpoint (`StateImageStore::freeze_written_destination`)
+instead of freezing the lane's state and forking. It applies to text prompts whose last call holds
+the request's last capture group with a Device destination reserved (not lossy, sliced or DFlash);
+anything else splits as before, and `NINFER_MERGE_CAPTURE_SPLIT=0` turns it off. Server, MTP3:
+20-token message TTFT ~158 -> ~104 ms, 44 / 50 tokens 215 / 244 -> 179 / 198 ms, follow-up turns
+prefill in ~105 ms; greedy replies, cache hits and shared-prefix reuse unchanged. Before the
 streaming GEMV, wherever the narrow route's scratch did not fit (the bench, the server), 9..32
 tokens ran the emulated small-T mma kernels: `ninfer_bench -p 32` 93 -> 139 tok/s. (A narrow
 cuBLAS call needs its scratch planned: a bench whose largest prompt is under 129 tokens plans none,

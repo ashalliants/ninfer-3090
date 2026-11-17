@@ -482,7 +482,8 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
             RequestControl::Prefill& prefill = *request.prefill;
             if (prefill.cursor != prefill.prompt_tokens ||
                 request.next_capture >= request.capture_groups.size() ||
-                request.capture_groups[request.next_capture].frontier != prefill.prompt_tokens ||
+                (request.capture_groups[request.next_capture].frontier != prefill.prompt_tokens &&
+                 !request.capture_prefilled) ||
                 request.capture_pending) {
                 throw std::logic_error("prompt-frontier capture carrier is inconsistent");
             }

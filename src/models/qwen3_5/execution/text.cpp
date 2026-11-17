@@ -1042,8 +1042,26 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         Tensor conv_state_in       = gdn_pool.pool->conv_slot(gdn_pool.local, linear_state_source_slot_);
         Tensor conv_state_out =
             gdn_pool.pool->conv_slot(gdn_pool.local, linear_state_destination_slot_);
-        ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc, kc, vc,
-                                      s);
+        if (const std::int32_t at = active_state_split_column_; at > 0) {
+            // A checkpoint inside the chunk (set_prefill_state_split): columns [0, at) end in the
+            // checkpoint's slot, and the rest start from it.
+            Tensor conv_state_at =
+                gdn_pool.pool->conv_slot(gdn_pool.local, prefill_state_split_slot_);
+            const auto columns = [](const Tensor& t, std::int32_t first, std::int32_t count) {
+                return t.slice(1, first, count);
+            };
+            Tensor qkv0 = columns(qkv, 0, at), qc0 = columns(qc, 0, at), kc0 = columns(kc, 0, at),
+                   vc0 = columns(vc, 0, at);
+            Tensor qkv1 = columns(qkv, at, T - at), qc1 = columns(qc, at, T - at),
+                   kc1 = columns(kc, at, T - at), vc1 = columns(vc, at, T - at);
+            ops::causal_conv1d_silu_split(qkv0, p.convolution, conv_state_in, conv_state_at, qc0,
+                                          kc0, vc0, s);
+            ops::causal_conv1d_silu_split(qkv1, p.convolution, conv_state_at, conv_state_out, qc1,
+                                          kc1, vc1, s);
+        } else {
+            ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc,
+                                          kc, vc, s);
+        }
     }
 
     Tensor q_recurrent = qc.view({dimension(config_.gdn->linear_key_head_dim),
@@ -1099,12 +1117,28 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             recurrent_pool.pool->recurrent_slot(recurrent_pool.local, linear_state_source_slot_);
         Tensor recurrent_state_out = recurrent_pool.pool->recurrent_slot(
             recurrent_pool.local, linear_state_destination_slot_);
-        ops::gated_delta_net(
-            q_recurrent, k_recurrent, vv, g, beta,
-            static_cast<float>(1.0 /
-                               std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
-            /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out, o,
-            ctx_.execution_view());
+        const float scale = static_cast<float>(
+            1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim)));
+        if (const std::int32_t at = active_state_split_column_; at > 0) {
+            // As the convolution above: [0, at) into the checkpoint's slot, the rest from it.
+            Tensor recurrent_state_at =
+                recurrent_pool.pool->recurrent_slot(recurrent_pool.local, prefill_state_split_slot_);
+            const auto part = [&](std::int32_t first, std::int32_t count, const Tensor& in,
+                                  Tensor& out_state) {
+                Tensor out_part = o.slice(2, first, count);
+                ops::gated_delta_net(q_recurrent.slice(2, first, count),
+                                     k_recurrent.slice(2, first, count), vv.slice(2, first, count),
+                                     g.slice(1, first, count), beta.slice(1, first, count), scale,
+                                     /*normalize_qk=*/true, work_, in, out_state, out_part,
+                                     ctx_.execution_view());
+            };
+            part(0, at, recurrent_state_in, recurrent_state_at);
+            part(at, T - at, recurrent_state_at, recurrent_state_out);
+        } else {
+            ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, scale,
+                                 /*normalize_qk=*/true, work_, recurrent_state_in,
+                                 recurrent_state_out, o, ctx_.execution_view());
+        }
     }
     // The new state is not read here, so the layer's output (computed from it) stands in for it:
     // a NaN or an FP16 overflow in the state reaches `o` in the same step.
@@ -1544,6 +1578,11 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     for (; t0 < T;) {
         int len = std::min(chunk, T - t0);
         if (split_rel > 0 && t0 < split_rel && t0 + len > split_rel) { len = split_rel - t0; }
+        {
+            const std::int64_t state_split = prefill_state_split_frontier_ - base64 - t0;
+            active_state_split_column_ =
+                state_split > 0 && state_split < len ? static_cast<std::int32_t>(state_split) : -1;
+        }
         work_.reset();
 
         VisionChunk vision_chunk;
@@ -1684,7 +1723,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     CUDA_CHECK(cudaMemcpyAsync(parked.data, x.data, x.bytes(),
                                                cudaMemcpyDeviceToDevice, s));
                     ++prefill_slice_->index;
-                    prefill_split_frontier_ = -1;
+                    prefill_split_frontier_       = -1;
+                    prefill_state_split_frontier_ = -1;
+                    active_state_split_column_    = -1;
                     if (prefill_gpu_timer_) { prefill_gpu_timer_->record_stop(); }
                     timing.begin_wait();
                     ctx_.synchronize();
@@ -1821,6 +1862,15 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 }
             }
 
+            if (active_state_split_column_ > 0 && rewrite_checkpoint_hidden_output_ != nullptr) {
+                require_tensor_shape(*rewrite_checkpoint_hidden_output_, DType::BF16,
+                                     {dimension(config_.hidden_size), 1},
+                                     "rewrite checkpoint hidden output");
+                const Tensor checkpoint_hidden = xf.slice(1, active_state_split_column_ - 1, 1);
+                CUDA_CHECK(cudaMemcpyAsync(rewrite_checkpoint_hidden_output_->data,
+                                           checkpoint_hidden.data, checkpoint_hidden.bytes(),
+                                           cudaMemcpyDeviceToDevice, s));
+            }
             if (split_rel > 0 && t0 + len == split_rel &&
                 rewrite_checkpoint_hidden_output_ != nullptr) {
                 require_tensor_shape(*rewrite_checkpoint_hidden_output_, DType::BF16,
@@ -1842,7 +1892,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         break;
     }
 
-    prefill_split_frontier_ = -1;
+    prefill_split_frontier_       = -1;
+    prefill_state_split_frontier_ = -1;
+    active_state_split_column_    = -1;
 
     if (prefill_gpu_timer_) { prefill_gpu_timer_->record_stop(); }
     timing.begin_wait();

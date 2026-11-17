@@ -17,8 +17,9 @@ void ProgramImpl::initialize_captures(std::uint32_t lane, std::uint32_t from,
                                       std::uint32_t through) {
     auto& request = requests[lane];
     request.capture_groups.clear();
-    request.next_capture    = 0;
-    request.capture_pending = false;
+    request.next_capture      = 0;
+    request.capture_pending   = false;
+    request.capture_prefilled = false;
     for (const auto& group : request.base->capture_groups) {
         if (group.frontier > from && group.frontier <= through) {
             request.capture_groups.push_back(group);

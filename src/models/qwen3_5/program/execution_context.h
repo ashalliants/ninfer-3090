@@ -68,6 +68,10 @@ struct PrefillContext {
     // A Host restore still landing: one event per full-attention layer, waited by the next layer
     // pass just before that layer. Empty when the lane's KV is already resident.
     std::span<const cudaEvent_t> layer_ready;
+    // A checkpoint inside the chunk that does not end it (TextContext::set_prefill_state_split):
+    // its absolute frontier, -1 for none, and the state slot it is written to.
+    std::int64_t state_split_frontier                          = -1;
+    std::int32_t state_split_slot                              = 0;
 };
 
 struct OrdinaryBatchContext {
