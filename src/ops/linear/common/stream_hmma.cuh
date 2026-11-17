@@ -151,8 +151,8 @@ __global__ __launch_bounds__(kStreamHmmaWarps * 32, 1) void stream_hmma_kernel(
 
     const int lane       = static_cast<int>(threadIdx.x) & 31;
     const int warp       = static_cast<int>(threadIdx.x) >> 5;
-    // `groups` tiles at once (4, 2 or 1: the launcher picks fewer when there are few tiles), each
-    // with group_warps warps splitting its K.
+    // `groups` tiles at once (4, or 2 when there are few tiles: see the launcher), each with
+    // group_warps warps splitting its K.
     const int group_warps = kStreamHmmaWarps / groups;
     const int group       = warp / group_warps; // the tile this warp works on
     const int group_warp  = warp % group_warps; // its share of that tile's K
@@ -346,15 +346,16 @@ bool try_launch_stream_hmma_rows(const __nv_bfloat16* x, std::int64_t x_stride,
         //
         //   shape (rows x K)        T=4          T=5          T=6          T=7          T=8
         //   34816 x 5120 (SwiGLU)  196 / 180    252 / 227    344 / 233    396 / 222    529 / 322
-        //   6144 x 5120             51 /  50     75 /  64     86 /  66     85 /  64    104 /  83
-        //   4096 x 5120             37 /  46     55 /  59     63 /  60     70 /  60     74 /  76
-        //   5120 x 17408           116 / 195    146 / 210    170 / 222    220 / 239    236 / 235
+        //   6144 x 5120             51 /  48     75 /  60     85 /  64     83 /  67    103 /  85
+        //   4096 x 5120             38 /  37     55 /  43     62 /  46     69 /  48     74 /  66
+        //   5120 x 17408           115 / 161    146 / 167    169 / 183    220 / 192    231 / 192
         //
         // The SIMT kernel's cost grows with T (one FFMA per weight and token) and this one's
-        // barely does, but it reads each row from one lane, so it needs many rows in flight: it
-        // loses on the long, few-row down projection at every width, and is even on 4096 rows.
+        // barely does, but it reads each row from one lane, so it needs many rows in flight: the
+        // long, few-row down projection only pays from seven tokens, and 4096 rows from five.
         const std::int64_t rows_total = static_cast<std::int64_t>(items) * Rows;
-        const bool wins = k <= 6144 && ((Cols >= 5 && rows_total >= 6144) || rows_total >= 16384);
+        const bool wins = Cols >= 7 || (k <= 6144 && (rows_total >= 6144 ||
+                                                      (Cols >= 5 && rows_total >= 4096)));
         if (stream_hmma_mode() != 2 && !wins) {
             return false;
         }
@@ -383,9 +384,9 @@ bool try_launch_stream_hmma_rows(const __nv_bfloat16* x, std::int64_t x_stride,
         const std::size_t fixed  = stream_hmma_reduce_bytes();
         std::int32_t chunk_k     = k;
         std::size_t shared_bytes = stream_hmma_stage_bytes(k, Cols) + fixed;
-        // Up to four tiles per CTA, fewer when that would leave SMs idle (each then splits its K
-        // across more warps).
-        const int groups = kStreamHmmaGroups;
+        // Four tiles per CTA, or two when that still fits in one wave: a matrix of 5,120 or fewer
+        // rows would otherwise leave half the SMs idle (4096 x 5120 at T=6: 60 -> 47 us).
+        const int groups = div_up(tiles, 2) <= sms ? 2 : kStreamHmmaGroups;
         int blocks = std::max(1, std::min(div_up(tiles, groups), sms));
         if (shared_bytes > budget) {
             const std::size_t partial = stream_hmma_partial_bytes(
