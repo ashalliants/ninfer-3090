@@ -203,13 +203,27 @@ code size is time. The changes above are bit-identical and shared with the 3090:
   (`quantize_q8_1_part`) instead of one thread unrolling all 32 values (30 KiB -> 16 KiB). The
   same-format pair kernel runs one copy of the body.
 
-Tried without a gain in the model: the HC mixers' K1a at three CTAs per SM (its 164 CTAs are two
-waves on 80 SMs; it spilled and did not get faster) or with a one-column instance (~3 us per call
-in isolation, nothing measurable in the model); the routed experts' gate/up with the IQ2 codebook
-in shared memory (removes its `lg_throttle` stalls, the load queue backed up by divergent codebook
-gathers from global memory) and with the slice staging issuing every load before its stores (the
-`cp.async` emulation is a synchronous copy). Gate/up stays ~58 us for 10.5 MB, bound by
-instruction issue and latency; it needs a redesign, not a tweak. The bit-identical MoE options
+Tried without a gain in the model: the HC mixers' K1a at three CTAs per SM (it spilled; nine rows
+a CTA fixed the second wave instead, below) or with a one-column instance (~3 us per call in
+isolation, nothing measurable in the model).
+
+The routed experts' gate/up: the IQ2 codebook in shared memory helps the register kernel
+(`gate_up_registers_kernel`, the tuned profile's) and is kept: 101 -> 84 us a call under MTP3.
+These did not help:
+- the codebook in shared memory for the staged kernel (`gate_up_kernel`);
+- that kernel's slice staging issuing every load before its stores (the `cp.async` emulation is a
+  synchronous copy);
+- in the register kernel:
+  - the call's precast activations copied to shared memory per block (no change);
+  - three blocks per SM (10% faster in isolation, 1.5 tok/s slower in the model);
+  - each warp copying its gate and up rows to shared memory with coalesced 4-byte loads, the next
+    item's rows loaded while the current one computes (84 -> 98 us a call). Lanes 0-7 decode
+    sub-blocks of the same 82-byte block, so the kernel's small global loads mostly hit L1. The
+    copy adds stores, warp syncs and byte reads from shared memory, and 7 KiB of code.
+
+Gate/up is bound by instruction issue in the decode and the dp4a products, not by its loads.
+`--cpu-verify-misses` (verification misses served on the CPU) cost 1.5 tok/s.
+The bit-identical MoE options
 (`--moe-precast-input`, `--moe-gate-up-registers`, `--moe-fused-route`) are neutral here.
 
 The HC mixer pair (`hyper_connection_mix_fused.cu`) was sized for the 3090's 82 SMs: its down
