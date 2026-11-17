@@ -316,6 +316,235 @@ __global__ __launch_bounds__(kTileGemmThreads, kTileGemmBlocksPerSm<Cols>) void 
     }
 }
 
+
+// ---- Register-fragment form ------------------------------------------------------------------
+//
+// The weights never pass through shared memory: each lane decodes one weight row straight into
+// mma.m8n8k4 A fragments (row-major, four k of one row), and the activation of the step is the B
+// operand (column-major, four k of one token), staged per K group as FP16 in the formats' permuted K
+// order (tile_gemm_stage_input). Lane position p = (lane & 3) + 4 * ((lane >> 4) & 1) of quadpair
+// q = (lane >> 2) & 3 supplies A row q * 8 + p of the warp's 32 rows and B column p of an
+// eight-token block; the four quadpairs read the same B (a broadcast). Accumulator register i of
+// lane L holds row (i & 2) | ((L >> 4) & 1) << 2 | (L & 1) of its quadpair's eight and token
+// (i & 1) | ((L >> 1) & 1) << 1 | (i >> 2) << 2 of the block (stream_hmma.cuh's map, with A and B
+// swapped). A CTA's warps form KSplit groups of RowWarps: a group's warps cover all the CTA's rows
+// and share one stage, and the groups split the K steps (step s to group s % KSplit), their sums
+// added in group order through shared memory. Each lane owns
+// LaneRows rows (one per 32-row set), so every staged B fragment feeds LaneRows products, and the
+// lane pair (lane, lane ^ 1) reads the two rows' code sectors whole (Format::gemm_fetch_pair).
+// Numerics match the WMMA form's: the same FP16 weights and activation, the same m8n8k4 products in
+// the same K order.
+
+inline constexpr int kFragGemmRows    = 32; // weight rows per lane-row set: one per lane
+// The register-fragment form serves matrices of at least this many rows
+// (try_launch_stream_tile_gemm).
+inline constexpr std::int64_t kFragGemmMinRows = 16384;
+inline constexpr int kFragGemmInputLd = 36; // u32 per staged token (32 + 4: tokens 4 banks apart)
+
+__device__ __forceinline__ void frag_gemm_m8n8k4(float (&d)[8], unsigned a0, unsigned a1,
+                                                 unsigned b0, unsigned b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+                 "{%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9}, {%10, %11}, "
+                 "{%0, %1, %2, %3, %4, %5, %6, %7};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]),
+                   "+f"(d[6]), "+f"(d[7])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+#endif
+}
+
+template <int Cols, int RowWarps, int KSplit, int LaneRows>
+struct FragGemmShape {
+    static constexpr int kWarps        = RowWarps * KSplit;
+    static constexpr int kWarpRows     = kFragGemmRows * LaneRows; // a lane owns LaneRows rows
+    static constexpr int kRows         = kWarpRows * RowWarps;     // weight rows per CTA
+    static constexpr int kBlocks       = (Cols + 7) / 8;           // eight-token B blocks
+    static constexpr int kTileCols     = kBlocks * 8;
+    static constexpr int kStageU32     = kTileCols * kFragGemmInputLd; // per K group
+    static constexpr std::size_t kStageBytes =
+        static_cast<std::size_t>(KSplit) * kStageU32 * sizeof(std::uint32_t);
+    static constexpr std::size_t kReduceBytes =
+        static_cast<std::size_t>(KSplit) * kRows * kTileCols * sizeof(float);
+    static constexpr std::size_t kSharedBytes =
+        kStageBytes > kReduceBytes ? kStageBytes : kReduceBytes;
+    // Activation vectors (eight k of one token) of one step, per thread of a K group.
+    static constexpr int kGroupThreads = RowWarps * 32;
+    static constexpr int kInputPerThread =
+        (kTileCols * (kTileGemmStepK / 8) + kGroupThreads - 1) / kGroupThreads;
+};
+
+template <class Format, int Rows, int Cols, int RowWarps, int KSplit, int LaneRows, class Sink>
+__global__ __launch_bounds__(RowWarps * KSplit * 32) void stream_frag_gemm_kernel(
+    const __nv_bfloat16* __restrict__ x, std::int64_t x_stride, typename Format::Planes planes,
+    Sink sink, std::int32_t items, std::int32_t row_offset, std::int32_t k,
+    std::int32_t padded_k) {
+    using Shape = FragGemmShape<Cols, RowWarps, KSplit, LaneRows>;
+    constexpr int kItemsPerTile = Shape::kRows / Rows;
+    extern __shared__ __align__(16) unsigned char frag_gemm_shared[];
+
+    const int lane      = static_cast<int>(threadIdx.x) & 31;
+    const int warp      = static_cast<int>(threadIdx.x) >> 5;
+    const int row_warp  = warp % RowWarps; // which rows
+    const int group     = warp / RowWarps; // which K steps
+    const int group_tid = row_warp * 32 + lane;
+    const int pos       = (lane & 3) + ((lane >> 4) & 1) * 4;
+    const int quad      = (lane >> 2) & 3;
+    const bool odd      = (lane & 1) != 0;
+    auto* stage = reinterpret_cast<std::uint32_t*>(frag_gemm_shared) + group * Shape::kStageU32;
+    // The group's warps share its stage: they meet at a named barrier (ids 1..KSplit).
+    const auto group_sync = [&] {
+        if constexpr (RowWarps == 1) {
+            __syncwarp();
+        } else if constexpr (KSplit == 1) {
+            __syncthreads();
+        } else {
+            asm volatile("bar.sync %0, %1;" ::"r"(group + 1), "r"(Shape::kGroupThreads));
+        }
+    };
+
+    // Lane row l: CTA row row_warp * kWarpRows + l * 32 + quad * 8 + pos. The lane pair
+    // (lane, lane ^ 1) owns rows r & ~1 and r | 1 and reads each group's 32-byte code sector of
+    // both whole, swapping halves (Format::gemm_fetch_pair).
+    const int item0 = static_cast<int>(blockIdx.x) * kItemsPerTile;
+    const auto row_of = [&](int r) {
+        const int it = item0 + r / Rows;
+        return Format::gemm_row(planes, it < items ? it + (r % Rows) * row_offset : 0, padded_k);
+    };
+    typename Format::GemmRow even_row[LaneRows], odd_row[LaneRows];
+    bool live[LaneRows];
+#pragma unroll
+    for (int l = 0; l < LaneRows; ++l) {
+        const int r = row_warp * Shape::kWarpRows + l * kFragGemmRows + quad * 8 + pos;
+        live[l]     = item0 + r / Rows < items;
+        even_row[l] = row_of(r & ~1);
+        odd_row[l]  = row_of(r | 1);
+    }
+
+    const int steps = k / kTileGemmStepK;
+    // A step's raw weights (both halves of each row's group) and activation, a step ahead.
+    typename Format::GemmRaw raw[LaneRows][2];
+    uint4 xin[Shape::kInputPerThread];
+    const auto fetch = [&](int step) {
+#pragma unroll
+        for (int l = 0; l < LaneRows; ++l) {
+            Format::gemm_fetch_pair(even_row[l], odd_row[l], odd, step, raw[l]);
+            if (!live[l]) { raw[l][0] = raw[l][1] = Format::gemm_empty(); }
+        }
+        const int k0 = step * kTileGemmStepK;
+#pragma unroll
+        for (int j = 0; j < Shape::kInputPerThread; ++j) {
+            const int i   = group_tid + j * Shape::kGroupThreads;
+            const int col = i / (kTileGemmStepK / 8);
+            const int v   = i % (kTileGemmStepK / 8);
+            xin[j] = col < Cols ? __ldg(reinterpret_cast<const uint4*>(x + col * x_stride + k0) + v)
+                                : make_uint4(0u, 0u, 0u, 0u);
+        }
+    };
+
+    float acc[LaneRows][Shape::kBlocks][8];
+#pragma unroll
+    for (int l = 0; l < LaneRows; ++l) {
+#pragma unroll
+        for (int b = 0; b < Shape::kBlocks; ++b) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[l][b][i] = 0.0f;
+        }
+    }
+
+    const int rounds = div_up(steps, KSplit);
+    if (group < steps) fetch(group);
+    for (int round = 0; round < rounds; ++round) {
+        const int step    = round * KSplit + group;
+        const bool active = step < steps;
+        // Stage this step's activation; keep its weights; start the next step's loads.
+        group_sync();
+        typename Format::GemmRaw current[LaneRows][2];
+#pragma unroll
+        for (int l = 0; l < LaneRows; ++l) {
+            current[l][0] = raw[l][0];
+            current[l][1] = raw[l][1];
+        }
+        if (active) {
+#pragma unroll
+            for (int j = 0; j < Shape::kInputPerThread; ++j) {
+                const int i   = group_tid + j * Shape::kGroupThreads;
+                const int col = i / (kTileGemmStepK / 8);
+                const int v   = i % (kTileGemmStepK / 8);
+                if (col < Shape::kTileCols) {
+                    *reinterpret_cast<uint4*>(stage + col * kFragGemmInputLd + 4 * v) =
+                        tile_gemm_stage_input(xin[j]);
+                }
+            }
+            if (step + KSplit < steps) fetch(step + KSplit);
+        }
+        group_sync();
+        if (!active) continue;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            __half2 w[LaneRows][16];
+#pragma unroll
+            for (int l = 0; l < LaneRows; ++l) Format::gemm_decode(current[l][half], w[l]);
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+#pragma unroll
+                for (int sub = 0; sub < 2; ++sub) {
+                    // k vector (half * 4 + q) of the step, pairs 2 sub and 2 sub + 1.
+                    const int u = (half * 4 + q) * 4 + 2 * sub;
+#pragma unroll
+                    for (int b = 0; b < Shape::kBlocks; ++b) {
+                        const uint2 bv = *reinterpret_cast<const uint2*>(
+                            stage + (b * 8 + pos) * kFragGemmInputLd + u);
+#pragma unroll
+                        for (int l = 0; l < LaneRows; ++l) {
+                            const unsigned a0 =
+                                *reinterpret_cast<const unsigned*>(&w[l][4 * q + 2 * sub]);
+                            const unsigned a1 =
+                                *reinterpret_cast<const unsigned*>(&w[l][4 * q + 2 * sub + 1]);
+                            frag_gemm_m8n8k4(acc[l][b], a0, a1, bv.x, bv.y);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // The K groups' sums, [group][CTA row][token], added in group order.
+    __syncthreads();
+    auto* reduce = reinterpret_cast<float*>(frag_gemm_shared);
+#pragma unroll
+    for (int l = 0; l < LaneRows; ++l) {
+#pragma unroll
+        for (int b = 0; b < Shape::kBlocks; ++b) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int r = row_warp * Shape::kWarpRows + l * kFragGemmRows + quad * 8 +
+                              ((i & 2) | (((lane >> 4) & 1) << 2) | (lane & 1));
+                const int t = b * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
+                reduce[(group * Shape::kRows + r) * Shape::kTileCols + t] = acc[l][b][i];
+            }
+        }
+    }
+    __syncthreads();
+    for (int t = static_cast<int>(threadIdx.x); t < kItemsPerTile; t += Shape::kWarps * 32) {
+        const int out_item = item0 + t;
+        if (out_item >= items) continue;
+        float sum[Rows][Cols];
+#pragma unroll
+        for (int r = 0; r < Rows; ++r) {
+#pragma unroll
+            for (int c = 0; c < Cols; ++c) {
+                float s = 0.0f;
+#pragma unroll
+                for (int g = 0; g < KSplit; ++g) {
+                    s += reduce[(g * Shape::kRows + t * Rows + r) * Shape::kTileCols + c];
+                }
+                sum[r][c] = s;
+            }
+        }
+        sink.finish(out_item, sum);
+    }
+}
+
 // Whether this build's tile GEMM serves the format at all (sm_70 builds, Q4 and Q5).
 template <class Format>
 constexpr bool stream_tile_gemm_format() {
@@ -374,6 +603,32 @@ bool try_launch_stream_tile_gemm(const __nv_bfloat16* x, std::int64_t x_stride,
         // Measured on the 27B shapes (V100-PCIE-32GB): short tiles whose four warp groups split K
         // win everywhere at 16 tokens; at 32 only the 34816-row SwiGLU matrix fills the card
         // better with tall tiles (473 against 511 us).
+        // Matrices of many rows (the 34816-row SwiGLU gate/up) run the register-fragment form, whose
+        // weights skip shared memory: SwiGLU at 16 tokens 328 -> 260 us, at 32 464 -> 413 us
+        // (ninfer_bench pp16 263 -> 285 tok/s). Shorter matrices keep the WMMA tiles, which split K
+        // across warp groups to fill the card (6144 x 5120: 73 against 74 us, GDN 12288 x 5120: 162
+        // against 176).
+        if (rows_total >= kFragGemmMinRows) {
+            const auto frag = [&]<int RowWarps, int KSplit, int LaneRows>() {
+                using FShape      = FragGemmShape<Cols, RowWarps, KSplit, LaneRows>;
+                const auto kernel =
+                    stream_frag_gemm_kernel<Format, Rows, Cols, RowWarps, KSplit, LaneRows, Sink>;
+                configure_cuda_device_once([&] {
+                    const cudaError_t e = cudaFuncSetAttribute(
+                        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        static_cast<int>(FShape::kSharedBytes));
+                    if (e != cudaSuccess) return e;
+                    return cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                                cudaSharedmemCarveoutMaxShared);
+                });
+                const int blocks = static_cast<int>(div_up(items, FShape::kRows / Rows));
+                kernel<<<blocks, FShape::kWarps * 32, FShape::kSharedBytes, stream>>>(
+                    x, x_stride, planes, sink, items, row_offset, k, padded_k);
+                CUDA_CHECK(cudaGetLastError());
+                return true;
+            };
+            return frag.template operator()<1, 8, 2>();
+        }
         if (Cols > 16 && rows_total >= static_cast<std::int64_t>(2 * sms) * 128) {
             return launch.template operator()<128, 1>();
         }

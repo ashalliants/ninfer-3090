@@ -110,6 +110,18 @@ struct Q4StreamFormat {
         return {__ldg(&r.codes[2 * group + half]), __ldg(&r.scales[group])};
     }
     __device__ static __forceinline__ GemmRaw gemm_empty() { return {make_uint4(0u, 0u, 0u, 0u), 0}; }
+    // Both halves of one group of this lane's row, the lane pair (lane, lane ^ 1) owning rows
+    // `even` and `odd` and reading each 32-byte sector whole (stream_hmma_pair_fetch).
+    __device__ static __forceinline__ void gemm_fetch_pair(const GemmRow& even, const GemmRow& odd,
+                                                           bool is_odd, int group,
+                                                           GemmRaw (&out)[2]) {
+        const StreamHmmaPair pair =
+            stream_hmma_pair_fetch(even.codes + 2 * group, odd.codes + 2 * group, is_odd);
+        const std::uint16_t scale = __ldg(&(is_odd ? odd : even).scales[group]);
+        stream_hmma_pair_swap(pair, is_odd, out[0].codes, out[1].codes);
+        out[0].scale = scale;
+        out[1].scale = scale;
+    }
     __device__ static __forceinline__ void gemm_decode(const GemmRaw& raw, __half2 (&w)[16]) {
         const std::uint32_t words[4] = {raw.codes.x, raw.codes.y, raw.codes.z, raw.codes.w};
         const __half2 bias  = __half2half2(__ushort_as_half(0x6408)); // 1032: (n ^ 8) - 8

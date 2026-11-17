@@ -151,6 +151,22 @@ struct Q5StreamFormat {
     __device__ static __forceinline__ GemmRaw gemm_empty() {
         return {make_uint4(0u, 0u, 0u, 0u), 0u, 0};
     }
+    // As Q4's: the lane pair reads each code sector whole; the high bits (8 bytes a group) and the
+    // scale are this lane's own.
+    __device__ static __forceinline__ void gemm_fetch_pair(const GemmRow& even, const GemmRow& odd,
+                                                           bool is_odd, int group,
+                                                           GemmRaw (&out)[2]) {
+        const StreamHmmaPair pair =
+            stream_hmma_pair_fetch(even.codes + 2 * group, odd.codes + 2 * group, is_odd);
+        const GemmRow& own = is_odd ? odd : even;
+        const uint2 high          = __ldg(reinterpret_cast<const uint2*>(own.high) + group);
+        const std::uint16_t scale = __ldg(&own.scales[group]);
+        stream_hmma_pair_swap(pair, is_odd, out[0].codes, out[1].codes);
+        out[0].high  = high.x;
+        out[1].high  = high.y;
+        out[0].scale = scale;
+        out[1].scale = scale;
+    }
     __device__ static __forceinline__ void gemm_decode(const GemmRaw& raw, __half2 (&w)[16]) {
         const std::uint32_t words[4] = {raw.codes.x, raw.codes.y, raw.codes.z, raw.codes.w};
         const __half2 bias  = __half2half2(__ushort_as_half(0x6410)); // 1040

@@ -235,6 +235,12 @@ cuBLAS route still wins from ~100 tokens (pp96 320, pp128 416). Server time to f
 the weight stream (shared memory issue and barriers bind, not DRAM: deeper prefetch, padding and
 occupancy were tried without gain), and the server splits short prompts at their checkpoint
 frontiers (12 + 7 + 1 tokens for a 20-token chat message), each call one read of the weights.
+Matrices of 16,384 or more rows (the SwiGLU gate/up) take a second form of the same GEMM that
+decodes the weights straight into `mma.m8n8k4` A-fragment registers (each lane owns two weight
+rows, lane pairs read whole code sectors, the activation is staged per K group as the B operand):
+SwiGLU at 16 tokens 328 -> 260 us, at 32 464 -> 413 us; bit-identical to the WMMA tiles on the
+measured shapes. Shorter matrices keep the WMMA tiles, which split K across warp groups and win
+there (both kernels are in `stream_tile_gemm.cuh`).
 `NINFER_STREAM_TILE_GEMM=0` turns the tiles off (passes of eight) for A/B measurement.
 
 **Merged checkpoint splits.** With prefix reuse on, a chat prompt's checkpoint (its recovery
