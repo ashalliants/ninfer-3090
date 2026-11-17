@@ -63,11 +63,6 @@ EngineOptions engine_options(const std::string& artifact, const std::string& vec
     options.kv_cache                          = KvCacheStorage::Int8Group64;
     options.context_cache.enabled             = true;
     options.context_cache.host_capacity_bytes = std::optional<std::size_t>(1ULL << 30);
-    // With every expert pinned, Windows can refuse a further 1 GiB page-lock (the context cache's
-    // Host tier then reports "prefix reuse is off" and the reuse checks fail): ask for less.
-    if (const char* mib = std::getenv("NINFER_TEST_HOST_CONTEXT_MIB")) {
-        options.context_cache.host_capacity_bytes = std::optional<std::size_t>(std::stoull(mib) << 20);
-    }
     options.pending_timeout_ms                = 3'600'000;
     options.flash_next.save_expert_state      = false;
     options.flash_next.allow_unlocked_host_memory = true;
