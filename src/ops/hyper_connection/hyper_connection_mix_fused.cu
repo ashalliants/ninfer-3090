@@ -392,6 +392,10 @@ __global__ __launch_bounds__(kUpThreads, kUpMinBlocks) void hc_up_collapse_kerne
     // 3. u_s = W_up[s*H + d] . m: per lane, each chunk's eight products in k order, added to its
     //    stream's sum in chunk order; a warp butterfly per stream, then the collapse in lane 0.
     float lane_rn = 0.0F; // Rn_s of column t for lane s + 4 (t % 8)
+    // j / chunks as a multiply-high by ceil(2^32 / chunks): the division by the runtime chunk
+    // count cost more issue slots in the column loop than the products. Exact here: the error term
+    // j * (magic * chunks - 2^32) < j * chunks stays far below 2^32 (j < S * rank / 8).
+    const unsigned magic = static_cast<unsigned>((0x100000000ULL + chunks - 1) / static_cast<unsigned>(chunks));
 #pragma unroll 1
     for (int t = 0; t < columns; ++t) {
         if (t % 8 == 0) {
@@ -407,9 +411,10 @@ __global__ __launch_bounds__(kUpThreads, kUpMinBlocks) void hc_up_collapse_kerne
         for (int i = 0; i < PerLane; ++i) {
             const int j = lane + 32 * i;
             if (j < total) {
-                const int s    = j / chunks, c = j - s * chunks;
-                const float4 a = *reinterpret_cast<const float4*>(mt + c * 8);
-                const float4 b = *reinterpret_cast<const float4*>(mt + c * 8 + 4);
+                const int s    = static_cast<int>(__umulhi(static_cast<unsigned>(j), magic));
+                const int k    = (j - s * chunks) * 8;
+                const float4 a = *reinterpret_cast<const float4*>(mt + k);
+                const float4 b = *reinterpret_cast<const float4*>(mt + k + 4);
                 float wv[8];
                 Codec::decode(chunk[i], wv);
                 float p = wv[0] * a.x;
