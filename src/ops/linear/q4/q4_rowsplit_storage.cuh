@@ -2,6 +2,7 @@
 
 #include "ops/common/math.cuh"
 #include "ops/linear/common/stream_gemv_decode.cuh"
+#include "ops/linear/common/stream_hmma.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -91,6 +92,62 @@ struct Q4StreamFormat {
         const std::uint32_t words[4] = {slice.codes.x, slice.codes.y, slice.codes.z,
                                         slice.codes.w};
         stream_decode_nibbles8(words[W] ^ 0x88888888u, c, f);
+    }
+
+    // Tensor-core form (ops/linear/common/stream_hmma.cuh). A step is kHmmaGroups groups of one
+    // row: their code bytes, read by lane pairs, and their scales.
+    static constexpr bool kHmma       = true;
+    static constexpr int kHmmaGroups  = 4;
+    struct HmmaStep {
+        uint4 codes[2 * kHmmaGroups]; // slice s: k 32s .. 32s + 31
+        uint2 scales;                 // groups 0..3
+    };
+    struct HmmaRaw {
+        StreamHmmaPair codes[kHmmaGroups];
+        uint2 scales;
+    };
+    __device__ static __forceinline__ HmmaRaw hmma_fetch(const Row& even, const Row& odd,
+                                                         bool is_odd, int group) {
+        HmmaRaw raw;
+#pragma unroll
+        for (int g = 0; g < kHmmaGroups; ++g) {
+            raw.codes[g] = stream_hmma_pair_fetch(even.codes + 2 * (group + g),
+                                                  odd.codes + 2 * (group + g), is_odd);
+        }
+        const Row& own = is_odd ? odd : even;
+        raw.scales     = __ldg(reinterpret_cast<const uint2*>(own.scales + group));
+        return raw;
+    }
+    __device__ static __forceinline__ HmmaStep hmma_finish(const HmmaRaw& raw, bool is_odd) {
+        HmmaStep step;
+        step.scales = raw.scales;
+#pragma unroll
+        for (int g = 0; g < kHmmaGroups; ++g) {
+            stream_hmma_pair_swap(raw.codes[g], is_odd, step.codes[2 * g], step.codes[2 * g + 1]);
+        }
+        return step;
+    }
+    // Moves slice s + 1 into slice s, so a rolled slice loop always decodes slice 0 (keeps the
+    // loop body inside the instruction cache, without indexing registers at run time).
+    __device__ static __forceinline__ void hmma_advance(HmmaStep& step) {
+#pragma unroll
+        for (int s = 0; s + 1 < 2 * kHmmaGroups; ++s) step.codes[s] = step.codes[s + 1];
+    }
+    __device__ static __forceinline__ float hmma_scale(const HmmaStep& step, int slice) {
+        const std::uint32_t pair = (slice >> 2) ? step.scales.y : step.scales.x;
+        return __half2float(__ushort_as_half(
+            static_cast<std::uint16_t>(((slice >> 1) & 1) ? pair >> 16 : pair & 0xffffu)));
+    }
+    // The four FP16 pairs (k 8w + 2j, 8w + 2j + 1) of word w of a slice, as exact integers:
+    // m = n ^ 8 sits in the mantissa of 1024 + m, and subtracting 1032 leaves (n ^ 8) - 8.
+    __device__ static __forceinline__ void hmma_decode(const HmmaStep& step, int slice, int w,
+                                                       unsigned (&b)[4]) {
+        const uint4 codes             = step.codes[slice];
+        const std::uint32_t words[4]  = {codes.x, codes.y, codes.z, codes.w};
+        const std::uint32_t m  = words[w] ^ 0x88888888u;
+        const std::uint32_t lo = m & 0x0f0f0f0fu;        // byte j: k 2j
+        const std::uint32_t hi = (m >> 4) & 0x0f0f0f0fu; // byte j: k 2j + 1
+        stream_hmma_pairs(__byte_perm(lo, hi, 0x5140), __byte_perm(lo, hi, 0x7362), 0x6408u, b);
     }
 };
 

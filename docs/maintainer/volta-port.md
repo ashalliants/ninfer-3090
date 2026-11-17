@@ -146,6 +146,31 @@ overhead of ~690 launches per token (~1.2 ms of gaps plus ramp/tail), and the GD
 read rate in the model (1477 -> 1309 us); its decode is the most ALU-heavy of the three formats,
 so back-to-back microbenchmarks that hold the 200 W power cap understate it.
 
+**Verify widths.** A speculative round verifies T = K + 1 columns, and there the SIMT streaming
+GEMV, one FFMA per weight per token, stops being bound by the weight stream: at T = 4 an MTP3
+round spent ~26 ms of ~50 in it against a ~19 ms read. Two changes:
+
+- The attention and GDN input projections ran T = 2..6 on SIMT tiles at 40-60% of the stream and
+  T = 7..8 on the emulated sliced-K mma; they now take the streaming GEMV for T = 2..8 (11.4 ->
+  ~6 ms per MTP3 round).
+- `ops/linear/common/stream_hmma.cuh` runs the same function on the tensor cores: each lane of
+  `mma.m8n8k4` streams one weight row, quadpairs share the activation, the format decodes a
+  packed word straight into exact FP16 integer pairs, and group scales are applied in FP32 per
+  32-weight slice. Lane pairs read each 32-byte sector whole and swap halves (half-sector reads
+  from 32 rows at once cost 2-3x the bytes in DRAM). It sits behind `try_launch_stream_gemv`, so
+  every Output / Epilogue works unchanged, and takes Q4 rows of K <= 6144 at T >= 5, or T = 4 on
+  the SwiGLU-sized matrices; its cost barely grows with T, the SIMT kernel's does (table in
+  `try_launch_stream_hmma_rows`). Q5 measured slower at every width and stays on SIMT.
+  `NINFER_STREAM_HMMA=0` turns it off.
+
+`ninfer_bench -pg 2048,256`, bench corpus, optimized proposal head (tok/s):
+
+| | MTP3 | MTP5 | MTP7 | DFlash2 K=7 |
+|---|---|---|---|---|
+| before | 78.3 | | | |
+| + input projections on the streaming GEMV | 82.3 | 75.6 | 72.5 | 72.3 |
+| + tensor-core verify GEMV | 86.3 | 85.9 | 85.4 | 84.2 |
+
 ### Prefill
 
 The wide prefill GEMMs run on the tensor cores through cuBLAS, by default. The cuBLAS prefill

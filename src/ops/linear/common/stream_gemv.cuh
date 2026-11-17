@@ -42,6 +42,7 @@
 #include "ops/common/warp.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/common/stream_gemv_decode.cuh"
+#include "ops/linear/common/stream_hmma.cuh"
 
 #include <cuda_bf16.h>
 
@@ -377,6 +378,11 @@ bool try_launch_stream_gemv_rows(const __nv_bfloat16* x, std::int64_t x_stride,
                                  std::int32_t padded_k, cudaStream_t stream) {
     static_assert(Cols >= 1 && Cols <= 8);
     if (!stream_gemv_enabled()) return false;
+    // Verify widths run on the tensor cores where the format supports it (stream_hmma.cuh).
+    if (try_launch_stream_hmma_rows<Format, Rows, Cols>(x, x_stride, planes, sink, items,
+                                                        row_offset, k, padded_k, stream)) {
+        return true;
+    }
     if (k % 256 != 0 && Cols > 1) return false; // chunks are whole multiples of 256
     if (k % 128 != 0 || x_stride % 8 != 0) return false;
 

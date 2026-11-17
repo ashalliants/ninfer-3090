@@ -2,6 +2,7 @@
 
 #include "ops/common/math.cuh"
 #include "ops/linear/common/stream_gemv_decode.cuh"
+#include "ops/linear/common/stream_hmma.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -129,6 +130,80 @@ struct Q5StreamFormat {
                                         slice.codes.w};
         stream_decode_nibbles8(words[W], c, f);
         stream_fold_bits8<1, 0, 16, true>((slice.high >> (8 * W)) & 0xffu, c, f);
+    }
+
+    // Tensor-core form (ops/linear/common/stream_hmma.cuh): n - 16 high = m - 16 with
+    // m = n + 16 (1 - high) in [0, 31], so the inverted high bit becomes bit 4 of each byte
+    // before the same FP16 magic as Q4, with 1040 subtracted.
+    // Tensor-core form (ops/linear/common/stream_hmma.cuh). A step is four groups (256 k) of one
+    // row: 128 code bytes and 32 high bytes, both read by lane pairs, and the four scales.
+    // Off: measured slower than the SIMT kernel at every verify width (the high plane's extra
+    // decode and loads), so Q5 keeps stream_gemv_kernel. The form stays, exercised by nothing.
+    static constexpr bool kHmma      = false;
+    static constexpr int kHmmaGroups = 4;
+    struct HmmaStep {
+        uint4 codes[8]; // slice s: k 32s .. 32s + 31
+        uint4 high[2];  // word s: slice s's 32 high bits
+        uint2 scales;   // groups 0..3
+    };
+    struct HmmaRaw {
+        StreamHmmaPair codes[4];
+        StreamHmmaPair high;
+        uint2 scales;
+    };
+    __device__ static __forceinline__ HmmaRaw hmma_fetch(const Row& even, const Row& odd,
+                                                         bool is_odd, int group) {
+        HmmaRaw raw;
+#pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            raw.codes[g] = stream_hmma_pair_fetch(even.codes + 2 * (group + g),
+                                                  odd.codes + 2 * (group + g), is_odd);
+        }
+        raw.high       = stream_hmma_pair_fetch(reinterpret_cast<const uint4*>(even.high + 2 * group),
+                                                reinterpret_cast<const uint4*>(odd.high + 2 * group),
+                                                is_odd);
+        const Row& own = is_odd ? odd : even;
+        raw.scales     = __ldg(reinterpret_cast<const uint2*>(own.scales + group));
+        return raw;
+    }
+    __device__ static __forceinline__ HmmaStep hmma_finish(const HmmaRaw& raw, bool is_odd) {
+        HmmaStep step;
+        step.scales = raw.scales;
+#pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            stream_hmma_pair_swap(raw.codes[g], is_odd, step.codes[2 * g], step.codes[2 * g + 1]);
+        }
+        stream_hmma_pair_swap(raw.high, is_odd, step.high[0], step.high[1]);
+        return step;
+    }
+    // Moves slice s + 1 into slice s, so a rolled slice loop always decodes slice 0 (keeps the
+    // loop body inside the instruction cache, without indexing registers at run time).
+    __device__ static __forceinline__ void hmma_advance(HmmaStep& step) {
+#pragma unroll
+        for (int s = 0; s < 7; ++s) step.codes[s] = step.codes[s + 1];
+        step.high[0] = make_uint4(step.high[0].y, step.high[0].z, step.high[0].w, step.high[1].x);
+        step.high[1] = make_uint4(step.high[1].y, step.high[1].z, step.high[1].w, 0u);
+    }
+    __device__ static __forceinline__ float hmma_scale(const HmmaStep& step, int slice) {
+        const std::uint32_t pair = (slice >> 2) ? step.scales.y : step.scales.x;
+        return __half2float(__ushort_as_half(
+            static_cast<std::uint16_t>(((slice >> 1) & 1) ? pair >> 16 : pair & 0xffffu)));
+    }
+    __device__ static __forceinline__ void hmma_decode(const HmmaStep& step, int slice, int w,
+                                                       unsigned (&b)[4]) {
+        const uint4 codes            = step.codes[slice];
+        const std::uint32_t words[4] = {codes.x, codes.y, codes.z, codes.w};
+        const std::uint32_t highs[4] = {step.high[0].x, step.high[0].y, step.high[0].z,
+                                        step.high[0].w};
+        const std::uint32_t lo  = words[w] & 0x0f0f0f0fu;
+        const std::uint32_t hi  = (words[w] >> 4) & 0x0f0f0f0fu;
+        const std::uint32_t inv = ~(highs[slice & 3] >> (8 * w));
+        // Bit i of a nibble lands in bit 4 of byte i: i + 4 + 7i = 8i + 4, and the cross terms
+        // (i + 7j + 4 for i != j) never meet a byte's bit 4 or carry into it.
+        const std::uint32_t first  = ((inv & 0xfu) * 0x02040810u) & 0x10101010u;
+        const std::uint32_t second = (((inv >> 4) & 0xfu) * 0x02040810u) & 0x10101010u;
+        stream_hmma_pairs(__byte_perm(lo, hi, 0x5140) | first,
+                          __byte_perm(lo, hi, 0x7362) | second, 0x6410u, b);
     }
 };
 

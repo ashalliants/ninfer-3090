@@ -120,4 +120,23 @@ __device__ __forceinline__ void stream_fold_bits8(std::uint32_t bits,
     }
 }
 
+// The tensor-core streaming GEMV's operand builder (stream_hmma.cuh): `first` holds the integer
+// codes m (< 256) of k offsets 0..3 of a packed word in its four bytes and `second` those of 4..7.
+// Each m becomes the FP16 1024 + m (exponent byte 0x64 above it) and `bias_bits` (an FP16, 1024 +
+// the format's zero point) is subtracted, so b[j] = (k 2j, 2j + 1) as exact integers.
+__device__ __forceinline__ void stream_hmma_pairs(std::uint32_t first, std::uint32_t second,
+                                                  std::uint32_t bias_bits, unsigned (&b)[4]) {
+    const std::uint32_t magic   = 0x64646464u;
+    const std::uint32_t bias2   = bias_bits | (bias_bits << 16);
+    const std::uint32_t raw[4]  = {__byte_perm(first, magic, 0x4140), __byte_perm(first, magic, 0x4342),
+                                   __byte_perm(second, magic, 0x4140),
+                                   __byte_perm(second, magic, 0x4342)};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        std::uint32_t out;
+        asm("sub.f16x2 %0, %1, %2;" : "=r"(out) : "r"(raw[j]), "r"(bias2));
+        b[j] = out;
+    }
+}
+
 } // namespace ninfer::ops::detail
