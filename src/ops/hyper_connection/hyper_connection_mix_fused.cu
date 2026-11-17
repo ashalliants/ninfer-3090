@@ -136,6 +136,15 @@ struct Bf16Codec {
     __device__ static Chunk load(const Params& p, std::int64_t row, int k) {
         return {ld_nc_na_16(p.data + row * p.stride + k)};
     }
+    // An opaque use: the bits are unchanged, but the compiler cannot move their decode above it.
+    // (Volta only: measured there; elsewhere a no-op.)
+    __device__ static void pin(Chunk& c) {
+#if defined(NINFER_SM70)
+        asm volatile("" : "+r"(c.bits.x), "+r"(c.bits.y), "+r"(c.bits.z), "+r"(c.bits.w));
+#else
+        (void)c;
+#endif
+    }
     __device__ static void decode(const Chunk& c, float (&w)[8]) {
         const float2 a = bf16x2_bits_to_float2(c.bits.x), b = bf16x2_bits_to_float2(c.bits.y);
         const float2 d = bf16x2_bits_to_float2(c.bits.z), e = bf16x2_bits_to_float2(c.bits.w);
@@ -164,6 +173,13 @@ struct Int8Codec {
                 __ldg(p.scales + row * p.scale_stride + k / 32)};
     }
 
+    __device__ static void pin(Chunk& c) {
+#if defined(NINFER_SM70)
+        asm volatile("" : "+r"(c.bits.x), "+r"(c.bits.y), "+h"(c.scale));
+#else
+        (void)c;
+#endif
+    }
     __device__ static void decode(const Chunk& c, float (&w)[8]) {
         const float s  = __half2float(__ushort_as_half(c.scale));
         const float4 a = i8x4_to_float4(c.bits.x), b = i8x4_to_float4(c.bits.y);
@@ -266,7 +282,11 @@ __global__ __launch_bounds__(kDownThreads, 2) void hc_down_partials_kernel(
                 inv[threadIdx.x];
         }
         __syncthreads();
-        // 3. The row's dot products: the lane-chunk order, then a warp butterfly.
+        // 3. The row's dot products: the lane-chunk order, then a warp butterfly. The chunks are
+        //    pinned here: their decode is the same every pass, and hoisted above the pass loop it held
+        //    80 unpacked weights live through the staging (spilled under the 96-register bound).
+#pragma unroll
+        for (int m = 0; m < kChunks; ++m) { Codec::pin(chunk[m]); }
         float acc[kPassColumns];
 #pragma unroll
         for (int c = 0; c < kPassColumns; ++c) { acc[c] = 0.0F; }
