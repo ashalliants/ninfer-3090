@@ -21,6 +21,11 @@ namespace ninfer::ops::ggml {
 
 inline constexpr int kMmvqThreads = 256;
 inline constexpr int kMmvqWarps   = kMmvqThreads / 32;
+#if defined(NINFER_SM70)
+inline constexpr int kMmvqMinBlocks = 3;
+#else
+inline constexpr int kMmvqMinBlocks = 1;
+#endif
 
 // Lanes that share one row: the widest power of two that divides the row's sub-block count and
 // still leaves each lane at least four sub-blocks to keep loads in flight.
@@ -194,7 +199,7 @@ __device__ __forceinline__ void mmvq_body(const std::uint8_t* __restrict__ w, co
 }
 
 template <QType F, int K, int T, bool Residual, class Out = __nv_bfloat16>
-__global__ void __launch_bounds__(kMmvqThreads)
+__global__ void __launch_bounds__(kMmvqThreads, kMmvqMinBlocks)
     ggml_mmvq_kernel(const std::uint8_t* __restrict__ w, const __nv_bfloat16* __restrict__ x,
                      Out* __restrict__ out, int n) {
     extern __shared__ __align__(16) unsigned char smem[];
@@ -204,7 +209,7 @@ __global__ void __launch_bounds__(kMmvqThreads)
 // Two matrices of one input in one launch (linear_pair): CTAs [0, first_ctas) compute the first,
 // the rest the second, each with the single kernel's body.
 template <QType F1, QType F2, int K, int T>
-__global__ void __launch_bounds__(kMmvqThreads)
+__global__ void __launch_bounds__(kMmvqThreads, kMmvqMinBlocks)
     ggml_mmvq_pair_kernel(const std::uint8_t* __restrict__ w1, const std::uint8_t* __restrict__ w2,
                           const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out1,
                           __nv_bfloat16* __restrict__ out2, int n, int first_ctas) {

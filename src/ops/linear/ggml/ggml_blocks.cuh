@@ -147,10 +147,22 @@ struct Format<QType::GGML_IQ4_XS> {
     __device__ static void decode(const std::uint8_t* row, int s, const Tables& t, SubBlock& out) {
         const std::uint8_t* b = row + (s >> 3) * kBlockBytes;
         const int ib          = s & 7;
+#if defined(NINFER_SM70)
+        // The block's 8-byte header (d, scales_h, scales_l) in one load: Volta's load queue
+        // throttled on the three small loads a sub-block issued. Same bytes.
+        const uint2 header    = *reinterpret_cast<const uint2*>(b);
+        const std::uint32_t h = header.x >> 16;
+        const int ls          = ((header.y >> (8 * (ib >> 1) + 4 * (ib & 1))) & 0x0F) |
+                       (static_cast<int>((h >> (2 * ib)) & 3) << 4);
+        out.scale[0] = out.scale[1] =
+            __half2float(__ushort_as_half(static_cast<unsigned short>(header.x & 0xFFFFU))) *
+            static_cast<float>(ls - 32);
+#else
         const std::uint32_t h = load_u16(b + 2);
         const int ls          = ((b[4 + (ib >> 1)] >> (4 * (ib & 1))) & 0x0F) |
                        (static_cast<int>((h >> (2 * ib)) & 3) << 4);
         out.scale[0] = out.scale[1] = load_half(b) * static_cast<float>(ls - 32);
+#endif
         // Blocks are 136 bytes, so the codes of an 8-byte aligned row are 8-byte aligned.
         const auto* qs = reinterpret_cast<const uint2*>(b + 8 + 16 * ib);
         const uint2 q01 = qs[0];
