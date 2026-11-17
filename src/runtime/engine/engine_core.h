@@ -4134,6 +4134,20 @@ private:
     // Writes at most one idle retained continuation to the store. Called by the worker between
     // units, never while a request waits for admission, binds, prefills or replays, so keeping
     // the store current does not delay a request already waiting; at least a second apart.
+    // With nothing resident, copy the Program's Device-only checkpoint states to free Host slots
+    // (keeping the Device copies), one per context transaction. The next request's admission
+    // would otherwise demote one synchronously -- a ~150 MiB copy ahead of its prefill (47 ms on a
+    // V100 eGPU link) -- where now it only drops the Device copy. Programs without it skip this.
+    void start_idle_state_writeback() {
+        if constexpr (requires { instance_.program->start_state_writeback(); }) {
+            if (materializing_ || context_owner_ || !resident_empty() || !paused_.empty() ||
+                instance_.program->has_context_transaction()) {
+                return;
+            }
+            (void)instance_.program->start_state_writeback();
+        }
+    }
+
     void persist_idle_session() noexcept {
         if (!store_.sink) { return; }
         const auto now = Clock::now();
@@ -5298,6 +5312,7 @@ private:
                 unit = "boundary";
                 persist_shared_prefix();
                 persist_idle_session();
+                start_idle_state_writeback();
                 publish_runtime_stats();
             } catch (...) {
                 const std::exception_ptr error = std::current_exception();

@@ -411,6 +411,10 @@ public:
                                                             std::span<const CheckpointHandle>,
                                                             runtime::ContextResourceUsage) const;
     [[nodiscard]] bool start_demote(const ContextDemotion&);
+    [[nodiscard]] bool start_state_writeback();
+    // Frees one Device state slot held by an unpinned checkpoint whose image also has a current
+    // Host copy (what a demotion of it would do, minus the copy). False when none qualifies.
+    [[nodiscard]] bool drop_redundant_device_state() noexcept;
     [[nodiscard]] bool start_pause(SequenceHandle, bool save_snapshot, runtime::ExecutionTiming*,
                                    bool require_snapshot = false);
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView);

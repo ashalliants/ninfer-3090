@@ -1119,6 +1119,46 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
     return true;
 }
 
+bool ProgramImpl::drop_redundant_device_state() noexcept {
+    for (const auto& slot : checkpoints) {
+        if (!slot.value || slot.pins) { continue; }
+        // Refuses images without a Host copy, with readers, or with a transfer in flight.
+        if (state_store->drop_device_replica(slot.value->state)) { return true; }
+    }
+    return false;
+}
+
+bool ProgramImpl::start_state_writeback() {
+    if (context_transaction_) { return false; }
+    for (const auto& slot : checkpoints) {
+        if (!slot.value || slot.pins) { continue; }
+        const auto handle = slot.value->state;
+        if (state_store->role(handle) != StateImageRole::CheckpointImmutable ||
+            !state_store->device_resident(handle) || state_store->host_resident(handle)) {
+            continue;
+        }
+        // Takes only a free Host slot (nothing is evicted for it), and keeps the Device copy.
+        auto transfer = state_store->reserve_device_to_host(handle);
+        if (!transfer) { continue; }
+        ContextTransaction transaction;
+        transaction.kind                  = ContextOperationKind::Demote;
+        transaction.preserve_state_device = true;
+        transaction.state_transfer.emplace(std::move(*transfer));
+        context_transaction_.emplace(std::move(transaction));
+        try {
+            context_source_ready_.record(compute_streams);
+            context_source_ready_.wait(transfer_streams);
+            enqueue_state_backup(*context_transaction_);
+            enqueue_context_transfers(*context_transaction_);
+        } catch (...) {
+            abort_context();
+            throw;
+        }
+        return true;
+    }
+    return false;
+}
+
 } // namespace ninfer::models::qwen3_5::detail
 
 namespace ninfer::models::qwen3_5 {

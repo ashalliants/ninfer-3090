@@ -58,6 +58,12 @@ bool ProgramImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t 
         ticket->points.emplace_back(*point, role);
     }
     auto destination = state_store->reserve_destination();
+    // A full pool whose other images already have Host copies (an idle engine writes them back,
+    // engine_core start_idle_state_writeback) gives up one of those for free: the capture is then
+    // a Device fork rather than a copy to Host that the prefill waits on.
+    if (!destination && drop_redundant_device_state()) {
+        destination = state_store->reserve_destination();
+    }
     if (!destination && host_context_arena) {
         ticket->host = host_context_arena->allocate(state_images->host_layout().image_bytes);
         if (ticket->host) { destination = state_store->reserve_logical_destination(); }

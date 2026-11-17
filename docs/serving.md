@@ -2636,6 +2636,13 @@ Frequency penalty is `0` for all registered presets. Process flags override regi
 request fields override process flags, and `--greedy` finally forces temperature `0`.
 
 For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage capacity is `C+H`.
+When the pool is full, a new request first evicts a checkpoint image to Host memory, and a prompt
+checkpoint is copied to Host instead of forked on the Device; on a slow link (a V100 eGPU moves the
+~150 MiB image in ~47 ms) each copy delays the first token. An idle engine therefore copies its
+Device-only checkpoint images to free Host slots ahead of need, keeping the Device copies: the
+eviction is then a free drop, and a prompt checkpoint takes the slot of an image that already has
+its Host copy and forks. Requests sent back to back leave no idle time for this and still pay the
+copy.
 Host state and Main/Backend KV share one startup-fixed byte budget; this is context storage, not a
 limit on total process RAM. `--host-context-mib 0` disables Host context backing.
 `--no-prefix-reuse` disables cross-request history reads and writes; pause/replay recovery remains
