@@ -429,6 +429,11 @@ struct ProgramOptions {
     // JointAcceptanceThreshold. It replaces the acceptance-estimate policy; with mtp_fixed_drafts
     // it is refused. Off: the drafter graphs, the drafts and the window are as before.
     bool mtp_joint_acceptance = false;
+    // FlashNextOptions::mtp_staged_drafts: with mtp_joint_acceptance, a round drafts one step at a
+    // time (the first through draft_graphs[1], each later one through a single-step continuation
+    // graph) and stops once the joint product of the drafts so far is below the threshold. The
+    // drafts it makes are the full chain's first ones, bit for bit, and the window is the same.
+    bool mtp_staged_drafts = false;
     // FlashNextOptions::mtp_rows_verify: a round with more than one eligible row speculates
     // genuinely in a single batched draft-and-verify (docs/maintainer/mtp-multi-row-lanes-design.md)
     // instead of always falling back to a plain round. Requires mtp_joint_acceptance. Off by

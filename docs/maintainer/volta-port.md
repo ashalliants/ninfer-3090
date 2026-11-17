@@ -240,6 +240,17 @@ are unchanged. The per-column work was the larger cost at verify widths:
 Bench pair at T = 1 / 4: 43.3 / 75.4 -> 41.2 / 60.9 us, bit-identical at T = 1-16. MTP3 decode
 72.4 -> 74.0 tok/s.
 
+MTP rounds with `--mtp-joint-acceptance` drafted `--draft-tokens` (3) steps every round, ~1.2 ms a
+step here, then verified the prefix the joint rule kept: over 96 rounds of the bench story, position
+2 was offered 46 times and position 3 only 10. `--mtp-staged-drafts` drafts one step at a time and
+stops once the joint product of the drafts so far is below the threshold (no later draft could then
+be verified, since the rule breaks at the first such draft). Every draft and probability is the full
+chain's (step 0 is the one-step draft graph, each later step a single-step continuation graph), the
+window is the same, and so is the output; a round pays a host sync per extra step. MTP3
+story/code/zh/fr 76.0/95.3/69.0/79.1 -> 78.1/95.7/71.5/80.9 tok/s, tokens per round unchanged
+(2.14). `run-v100.sh` turns it on for Flash-Next. Plain `--draft-tokens 2` gained on zh/fr (+2) but
+lost 6.6 on code; staged drafting keeps the third draft for the rounds that use it.
+
 Working with the 3.3 GB/s eGPU link (Flash-Next, measured 2026-11-17):
 - In steady decode the link costs almost nothing: the expert cache hits 99.6-100% and
   `stage_kernel` is ~5 us a call. The link matters for prefill and for refilling the cache.

@@ -603,7 +603,7 @@ passthrough_switch_flags=(
   no-prefill-a8 no-prefill-cublas-projections context-store-compress no-exit-on-engine-failure
   admission-fit-check progress-anchors-shared model-suspend no-auto-resume
   lm-head-q4 lm-head-q6 embedding-q4 embedding-q6 lossy-prefill-scout-a4 request-log-lossy-detail
-  no-expert-state
+  no-expert-state mtp-staged-drafts
 )
 env_name_for_flag() { printf 'NINFER_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; }
 for flag in "${passthrough_value_flags[@]}"; do

@@ -235,7 +235,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] "
            "[--no-cuda-graph] [--no-prefix-reuse] [--devices N,M,...] [--stage-layers A,B,...] "
            "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
-           "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--mtp-rows-verify] [--ngram-prefetch] "
+           "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--mtp-staged-drafts] [--mtp-rows-verify] [--ngram-prefetch] "
            "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
            "[--moe-fused-route] [--cpu-verify-misses] [--prefill-cpu-share F [--prefill-cpu-all-columns N]] [--cpu-verify-workers N] [--gdn-async-commit] [--hc-int8 [--hc-fused-read]] "
            "[--ngram-flag-wait] [--partial-ram-residency] [--ggml-decode-mma] "
@@ -379,7 +379,10 @@ std::string serve_usage_text(const char* argv0) {
            "own grammar mask (off by default: they decode without MTP); --mtp-joint-acceptance "
            "(--spec mtp) drafts --draft-tokens each round and verifies the drafts whose joint chance "
            "of acceptance, estimated from each draft's probability, stays above an adaptive threshold "
-           "(off by default: an acceptance estimate picks the count before drafting); --mtp-rows-verify "
+           "(off by default: an acceptance estimate picks the count before drafting); --mtp-staged-drafts "
+           "(needs --mtp-joint-acceptance) drafts one step at a time and stops once no further draft "
+           "could be verified (the same output; off by default: every round drafts --draft-tokens); "
+           "--mtp-rows-verify "
            "(needs --mtp-joint-acceptance) batches a genuine draft-and-verify across every eligible row "
            "when two or more lanes decode together, instead of always falling back to a plain round "
            "(off by default: a known bug currently leaves one row's acceptance near zero once two rows "
@@ -1072,6 +1075,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.flash_next.mtp_constrained = true;
         } else if (arg == "--mtp-joint-acceptance") {
             options.flash_next.mtp_joint_acceptance = true;
+        } else if (arg == "--mtp-staged-drafts") {
+            options.flash_next.mtp_staged_drafts = true;
         } else if (arg == "--mtp-rows-verify") {
             options.flash_next.mtp_rows_verify = true;
         } else if (arg == "--ngram-prefetch") {
@@ -1350,6 +1355,10 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
     if (options.flash_next.mtp_joint_acceptance && options.speculative.backend != SpeculativeBackend::Mtp) {
         throw std::invalid_argument("--mtp-joint-acceptance chooses how many MTP drafts a round verifies and "
                                     "needs --spec mtp");
+    }
+    if (options.flash_next.mtp_staged_drafts && !options.flash_next.mtp_joint_acceptance) {
+        throw std::invalid_argument("--mtp-staged-drafts stops drafting by the joint-acceptance window and "
+                                    "needs --mtp-joint-acceptance");
     }
     if (options.flash_next.mtp_rows_verify && !options.flash_next.mtp_joint_acceptance) {
         throw std::invalid_argument("--mtp-rows-verify batches draft-and-verify across lanes under the same "

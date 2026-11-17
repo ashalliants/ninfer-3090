@@ -4409,6 +4409,9 @@ private:
             g.draft_graphs.resize(static_cast<std::size_t>(plan_.drafts) + 1);
             g.draft_execs.resize(static_cast<std::size_t>(plan_.drafts) + 1);
             g.draft_runs.assign(static_cast<std::size_t>(plan_.drafts) + 1, 0);
+            g.draft_step_graphs.resize(static_cast<std::size_t>(plan_.drafts) + 1);
+            g.draft_step_execs.resize(static_cast<std::size_t>(plan_.drafts) + 1);
+            g.draft_step_runs.assign(static_cast<std::size_t>(plan_.drafts) + 1, 0);
             g.catch_graphs.resize(static_cast<std::size_t>(plan_.max_width) + 1);
             g.catch_execs.resize(static_cast<std::size_t>(plan_.max_width) + 1);
             g.catch_runs.assign(static_cast<std::size_t>(plan_.max_width) + 1, 0);
@@ -4629,6 +4632,59 @@ private:
         L().mtp_cells = L().state_tokens;
     }
 
+    // Drafter step j of a round's chain: the chain residual and the scratch tail as the previous step
+    // left them (step 0: as mtp_draft's graph copies them), the previous draft (step 0: the anchor).
+    void draft_step(std::int32_t j) {
+        const Tensor chain_tensor(spec_base() + plan_.spec.chain, DType::BF16, {dim(c_.residual_width()), 1});
+        auto call         = draft_call(j);
+        call.residuals    = chain_tensor;
+        call.ids          = j == 0 ? Tensor(static_cast<std::byte*>(io_device_.p) + plan_.io.draft_anchor, DType::I32, {1})
+                                   : spec_word(plan_.spec.w_drafts + static_cast<std::size_t>(j - 1), 1);
+        call.tail         = mtp_scratch_tail();
+        call.kv_only      = false;
+        call.residual_out = chain_tensor;
+        call.drafts       = spec_word(plan_.spec.w_drafts + static_cast<std::size_t>(j), 1);
+        if (options_.mtp_joint_acceptance) {
+            call.probs = Tensor(static_cast<std::byte*>(draft_probs_.p) + 4 * static_cast<std::size_t>(j), DType::FP32, {1});
+        }
+        forward_->run_mtp(call);
+    }
+
+    // --mtp-staged-drafts (with --mtp-joint-acceptance): the round's drafts one step at a time, up
+    // to `limit`. Step 0 is mtp_draft(1)'s graph; step j > 0 continues the chain through its own
+    // single-step graph, so every draft and probability is the full chain's, bit for bit. Drafting
+    // stops once the joint product of the drafts so far is below `threshold`: joint_acceptance_length
+    // breaks at that draft, so no later one could be verified and the window equals the one over
+    // `limit` drafts. The steps a round skips are the work saved; each extra step costs a host sync.
+    std::span<const TokenId> mtp_draft_staged(std::int32_t limit, float threshold) {
+        const cudaStream_t s = device_.stream;
+        stage_draft_words(limit);
+        std::span<const TokenId> first = mtp_draft(1);
+        const auto* probs = static_cast<const float*>(draft_probs_host_.data());
+        std::int32_t made = 1;
+        float joint       = joint_acceptance_table(probs[0]);
+        while (made < limit && joint >= threshold) {
+            const nvtx::ScopedRange range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Decode);
+            const std::int32_t j = made;
+            const auto at        = static_cast<std::size_t>(j);
+            replay(G().draft_step_graphs.at(at), G().draft_step_execs.at(at), G().draft_step_runs.at(at),
+                   [&] { draft_step(j); });
+            CUDA_CHECK(cudaMemcpyAsync(spec_words_host() + plan_.spec.w_drafts + j, spec_words_device() + plan_.spec.w_drafts + j,
+                                       4, cudaMemcpyDeviceToHost, s));
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<float*>(draft_probs_host_.data()) + j,
+                                       static_cast<const float*>(draft_probs_.p) + j, 4, cudaMemcpyDeviceToHost, s));
+            {
+                const nvtx::ScopedRange wait(nvtx::Name::DecodeMtpWait, nvtx::Category::Decode);
+                device_.synchronize();
+            }
+            joint = joint * joint_acceptance_table(probs[j]);
+            ++made;
+        }
+        (void)first;
+        drafts_.assign(spec_words_host() + plan_.spec.w_drafts, spec_words_host() + plan_.spec.w_drafts + made);
+        return drafts_;
+    }
+
     // `steps` chained drafter steps from the saved residual and the anchor (Infernix mtp_draft):
     // step j writes the cell S - 1 + j and drafts the token at S + 1 + j. The steps pool from a copy
     // of the drafter's tail. Returns the drafts on the host (with --mtp-joint-acceptance their
@@ -4645,23 +4701,7 @@ private:
                    CUDA_CHECK(cudaMemcpyAsync(chain, saved_residual().data, column, cudaMemcpyDeviceToDevice, s));
                    const Tensor scratch = mtp_scratch_tail();
                    CUDA_CHECK(cudaMemcpyAsync(scratch.data, mtp_tail_.data, mtp_tail_.bytes(), cudaMemcpyDeviceToDevice, s));
-                   const Tensor chain_tensor(chain, DType::BF16, {dim(c_.residual_width()), 1});
-                   for (std::int32_t j = 0; j < steps; ++j) {
-                       auto call         = draft_call(j);
-                       call.residuals    = chain_tensor;
-                       call.ids          = j == 0 ? Tensor(static_cast<std::byte*>(io_device_.p) + plan_.io.draft_anchor,
-                                                           DType::I32, {1})
-                                                  : spec_word(plan_.spec.w_drafts + static_cast<std::size_t>(j - 1), 1);
-                       call.tail         = scratch;
-                       call.kv_only      = false;
-                       call.residual_out = chain_tensor;
-                       call.drafts       = spec_word(plan_.spec.w_drafts + static_cast<std::size_t>(j), 1);
-                       if (options_.mtp_joint_acceptance) {
-                           call.probs = Tensor(static_cast<std::byte*>(draft_probs_.p) + 4 * static_cast<std::size_t>(j),
-                                               DType::FP32, {1});
-                       }
-                       forward_->run_mtp(call);
-                   }
+                   for (std::int32_t j = 0; j < steps; ++j) { draft_step(j); }
                });
         CUDA_CHECK(cudaMemcpyAsync(spec_words_host() + plan_.spec.w_drafts, spec_words_device() + plan_.spec.w_drafts,
                                    4ULL * steps, cudaMemcpyDeviceToHost, s));
@@ -4708,9 +4748,12 @@ private:
         // --mtp-joint-acceptance (phase A): draft the ceiling, then verify the prefix the joint rule
         // keeps under the request's threshold (at least the first draft). A constrained row's masks
         // are filled for the verified drafts only.
-        const std::int32_t steps = options_.mtp_joint_acceptance ? limit : choose_draft_length(limit);
+        std::int32_t steps = options_.mtp_joint_acceptance ? limit : choose_draft_length(limit);
         if (steps == 0) { return std::nullopt; }
-        auto drafts = mtp_draft(steps);
+        auto drafts = options_.mtp_staged_drafts && options_.mtp_joint_acceptance
+                          ? mtp_draft_staged(steps, L().joint_threshold.current())
+                          : mtp_draft(steps);
+        steps = static_cast<std::int32_t>(drafts.size());
         if (options_.mtp_joint_acceptance) {
             const std::span<const float> probs(static_cast<const float*>(draft_probs_host_.data()),
                                                static_cast<std::size_t>(steps));
@@ -6154,6 +6197,10 @@ private:
         std::vector<DecodeGraphDefinition> verify_front, verify_back, draft_graphs, catch_graphs, row_catch_graphs;
         std::vector<DecodeGraphExecutable> verify_front_exec, verify_back_exec, draft_execs, catch_execs, row_catch_execs;
         std::vector<std::uint64_t> verify_runs, verify_back_runs, draft_runs, catch_runs, row_catch_runs;
+        // --mtp-staged-drafts: draft step j > 0 alone, continuing the chain (index j).
+        std::vector<DecodeGraphDefinition> draft_step_graphs;
+        std::vector<DecodeGraphExecutable> draft_step_execs;
+        std::vector<std::uint64_t> draft_step_runs;
     };
     std::vector<LaneGraphs> lane_graphs_;
     LaneGraphs& G() noexcept { return lane_graphs_[cur_]; }

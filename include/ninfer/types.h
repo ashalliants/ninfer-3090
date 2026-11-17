@@ -583,6 +583,12 @@ struct FlashNextOptions {
     // whole, from each draft's probability, stays above a per-request adaptive threshold. Off: the
     // acceptance-estimate policy picks the count before drafting.
     bool mtp_joint_acceptance = false;
+    // Drafts one step at a time under --mtp-joint-acceptance (--mtp-staged-drafts; needs it): a
+    // round stops drafting once the joint chance of the drafts so far falls below the threshold,
+    // since no later draft could then be verified. The verified drafts, and so the output, are the
+    // same; a round pays a host sync per extra step instead of always running --draft-tokens steps.
+    // Off: every round drafts --draft-tokens in one graph.
+    bool mtp_staged_drafts = false;
     // Batches a genuine draft-and-verify across every eligible row when two or more lanes decode
     // together (--mtp-rows-verify; needs --mtp-joint-acceptance), instead of always falling back to
     // a plain round. Off by default: a known bug (docs/maintainer/mtp-multi-row-lanes-design.md)
