@@ -212,6 +212,20 @@ gathers from global memory) and with the slice staging issuing every load before
 instruction issue and latency; it needs a redesign, not a tweak. The bit-identical MoE options
 (`--moe-precast-input`, `--moe-gate-up-registers`, `--moe-fused-route`) are neutral here.
 
+The HC mixer pair (`hyper_connection_mix_fused.cu`) was sized for the 3090's 82 SMs: its down
+kernel's 164 CTAs ran as a second wave of four on the V100's 80. On sm_70 it takes 9 rows a CTA
+(144 CTAs, one wave). The sums of squares stay on the first 256 threads, so their order and the bits
+are unchanged. The per-column work was the larger cost at verify widths:
+- the columns' slices are now staged together, with one barrier pair;
+- the `Rn` pass reads `w` once per four features instead of a dependent load per element;
+- the shared `Rn` layout splits each 8-value chunk into two planes (the lanes' `float4` reads had a
+  two-way bank conflict);
+- the up kernel prefetches the collapse's residual values across lanes instead of loading them on
+  lane 0 per column.
+
+Bench pair at T = 1 / 4: 43.3 / 75.4 -> 41.2 / 60.9 us, bit-identical at T = 1-16. MTP3 decode
+72.4 -> 74.0 tok/s.
+
 Serving on a V100: `scripts/run-v100.sh <model>` is run.sh with the V100's defaults (the sm_70
 server from build-v100/, the memory-lock fallback, a GPU check). For Flash-Next it keeps run.sh's
 `tuned` profile, which measured best here: MTP3 decode 68.9 tok/s and a 2K-token prefill 293 tok/s

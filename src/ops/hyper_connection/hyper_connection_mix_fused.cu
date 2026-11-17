@@ -13,7 +13,7 @@
 // The fused route of hyper_connection_mix: two kernels instead of norm, the down projection,
 // gates, the up projection and collapse.
 //
-// K1a hc_down_partials: one CTA per (stream s, 8 rows of W_down), a row per warp. The CTA stages
+// K1a hc_down_partials: one CTA per (stream s, kDownRows rows of W_down), a row per warp. The CTA stages
 // its stream's slice of R for up to 4 columns per pass, reduces each column's sum of squares in a fixed
 // order (per-thread sums over its elements in index order, a warp butterfly, warps in order),
 // forms Rn = R * inv * w in FP32 shared memory and computes the slice's dot products in the
@@ -58,7 +58,15 @@ constexpr int kStreams     = 4;
 constexpr int kHidden      = 2560;
 constexpr int kChunks      = kHidden / 256; // a lane's 8-weight chunks per stream slice
 constexpr int kMaxRank     = 512;
-constexpr int kDownRows    = 8; // rows of W_down per CTA (a row per warp)
+// Rows of W_down per CTA (a row per warp). Volta: 10, so Flash-Next's 324 rows x 4 streams make 132
+// CTAs, one wave on 80 SMs at two per SM (8 made 164, a second wave of 4). The sums of squares
+// are always taken by the first kSumThreads threads, so their order does not depend on kDownRows.
+#if defined(NINFER_SM70)
+constexpr int kDownRows = 9;
+#else
+constexpr int kDownRows = 8;
+#endif
+constexpr int kSumThreads = 8 * 32;
 constexpr int kDownThreads = kDownRows * 32;
 constexpr int kPassColumns = 4; // 40 KiB of Rn: two CTAs per SM
 constexpr int kUpFeatures  = 16; // features d per CTA (a d per warp)
@@ -86,6 +94,34 @@ __device__ __forceinline__ float block_sum(float value, float* scratch) {
     for (int w = 0; w < Threads / 32; ++w) { total += scratch[w]; }
     __syncthreads();
     return total;
+}
+
+// Where feature i of a column sits in K1a's shared Rn: the first four values of every 8-value chunk
+// in one plane, the last four in the other, so lane l's float4 reads of chunk l are contiguous
+// across the warp (16 bytes apart) instead of 32 bytes apart, a two-way bank conflict.
+__device__ __forceinline__ int rn_slot(int i) { // i % 4 == 0
+    return (i & 4) * (kHidden / 8) + (i >> 3) * 4;
+}
+
+// block_sum for N values at once, each in the same order, under one barrier pair. Only the first
+// Threads threads contribute; every thread of the block must call it.
+template <int Threads, int N>
+__device__ __forceinline__ void block_sums(float (&value)[N], float* scratch) { // scratch: [N][Threads / 32]
+    const int warp = static_cast<int>(threadIdx.x) >> 5, lane = static_cast<int>(threadIdx.x) & 31;
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+        value[n] = warp_sum(value[n]);
+        if (lane == 0 && warp < Threads / 32) { scratch[n * (Threads / 32) + warp] = value[n]; }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+        float total = 0.0F;
+#pragma unroll
+        for (int w = 0; w < Threads / 32; ++w) { total += scratch[n * (Threads / 32) + w]; }
+        value[n] = total;
+    }
+    __syncthreads();
 }
 
 // BF16 contiguous: rows of `stride` elements.
@@ -146,8 +182,8 @@ __global__ __launch_bounds__(kDownThreads, 2) void hc_down_partials_kernel(
     typename Codec::Params down, int rows, int columns, float eps, float* __restrict__ partial,
     float* __restrict__ inv_out, const bf16* __restrict__ fold_y,
     const float* __restrict__ fold_inject) {
-    extern __shared__ __align__(16) float rn[]; // [kPassColumns][kHidden]
-    __shared__ float scratch[kDownThreads / 32];
+    extern __shared__ __align__(16) float rn[]; // [kPassColumns][kHidden], features at rn_slot
+    __shared__ float scratch[kPassColumns * (kSumThreads / 32)];
     __shared__ float inv[kPassColumns];
     const int lane = static_cast<int>(threadIdx.x) & 31, warp = static_cast<int>(threadIdx.x) >> 5;
     const int s    = static_cast<int>(blockIdx.y);
@@ -167,44 +203,63 @@ __global__ __launch_bounds__(kDownThreads, 2) void hc_down_partials_kernel(
 #pragma unroll 1
     for (int c0 = 0; c0 < columns; c0 += kPassColumns) {
         const int pass = min(kPassColumns, columns - c0);
-        // 2. Stage the slice in FP32 and reduce each column's sum of squares in a fixed order.
-#pragma unroll 1
-        for (int c = 0; c < pass; ++c) {
-            const bf16* r = residual + static_cast<std::int64_t>(c0 + c) * width +
-                            static_cast<std::int64_t>(s) * kHidden;
-            float sum = 0.0F;
-            for (int i = static_cast<int>(threadIdx.x) * 8; i < kHidden; i += kDownThreads * 8) {
-                const uint4 values = load_ldg<uint4>(r + i);
-                const float2 v0 = bf16x2_bits_to_float2(values.x), v1 = bf16x2_bits_to_float2(values.y);
-                const float2 v2 = bf16x2_bits_to_float2(values.z), v3 = bf16x2_bits_to_float2(values.w);
-                float v[8] = {v0.x, v0.y, v1.x, v1.y, v2.x, v2.y, v3.x, v3.y};
-                if constexpr (Fold) {
-                    const std::int64_t t = c0 + c;
-                    const uint4 ys       = load_ldg<uint4>(fold_y + t * kHidden + i);
-                    const float g        = fold_inject[t * kStreams + s];
-                    const float2 y0 = bf16x2_bits_to_float2(ys.x), y1 = bf16x2_bits_to_float2(ys.y);
-                    const float2 y2 = bf16x2_bits_to_float2(ys.z), y3 = bf16x2_bits_to_float2(ys.w);
-                    const float y[8] = {y0.x, y0.y, y1.x, y1.y, y2.x, y2.y, y3.x, y3.y};
+        // 2. Stage the pass's slices in FP32 and reduce each column's sum of squares in a fixed
+        //    order. The columns' loads are issued together and their sums reduced under one barrier
+        //    pair (each column's order is unchanged).
+        float sum[kPassColumns];
 #pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        v[j] = __bfloat162float(__float2bfloat16_rn(__fmaf_rn(g, y[j], v[j])));
+        for (int c = 0; c < kPassColumns; ++c) { sum[c] = 0.0F; }
+        for (int i = static_cast<int>(threadIdx.x) * 8; i < kHidden && static_cast<int>(threadIdx.x) < kSumThreads;
+             i += kSumThreads * 8) {
+#pragma unroll
+            for (int c = 0; c < kPassColumns; ++c) {
+                if (c < pass) {
+                    const bf16* r = residual + static_cast<std::int64_t>(c0 + c) * width +
+                                    static_cast<std::int64_t>(s) * kHidden;
+                    const uint4 values = load_ldg<uint4>(r + i);
+                    const float2 v0 = bf16x2_bits_to_float2(values.x), v1 = bf16x2_bits_to_float2(values.y);
+                    const float2 v2 = bf16x2_bits_to_float2(values.z), v3 = bf16x2_bits_to_float2(values.w);
+                    float v[8] = {v0.x, v0.y, v1.x, v1.y, v2.x, v2.y, v3.x, v3.y};
+                    if constexpr (Fold) {
+                        const std::int64_t t = c0 + c;
+                        const uint4 ys       = load_ldg<uint4>(fold_y + t * kHidden + i);
+                        const float g        = fold_inject[t * kStreams + s];
+                        const float2 y0 = bf16x2_bits_to_float2(ys.x), y1 = bf16x2_bits_to_float2(ys.y);
+                        const float2 y2 = bf16x2_bits_to_float2(ys.z), y3 = bf16x2_bits_to_float2(ys.w);
+                        const float y[8] = {y0.x, y0.y, y1.x, y1.y, y2.x, y2.y, y3.x, y3.y};
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            v[j] = __bfloat162float(__float2bfloat16_rn(__fmaf_rn(g, y[j], v[j])));
+                        }
                     }
-                }
-                float* out = rn + c * kHidden + i;
 #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    out[j] = v[j];
-                    sum += v[j] * v[j];
+                    for (int j = 0; j < 8; ++j) { sum[c] += v[j] * v[j]; }
+                    *reinterpret_cast<float4*>(rn + c * kHidden + rn_slot(i))     = make_float4(v[0], v[1], v[2], v[3]);
+                    *reinterpret_cast<float4*>(rn + c * kHidden + rn_slot(i + 4)) = make_float4(v[4], v[5], v[6], v[7]);
                 }
             }
-            const float total = block_sum<kDownThreads>(sum, scratch);
-            if (threadIdx.x == 0) { inv[c] = rsqrtf(total / static_cast<float>(kHidden) + eps); }
+        }
+        block_sums<kSumThreads>(sum, scratch);
+        if (threadIdx.x == 0) {
+#pragma unroll
+            for (int c = 0; c < kPassColumns; ++c) {
+                if (c < pass) { inv[c] = rsqrtf(sum[c] / static_cast<float>(kHidden) + eps); }
+            }
         }
         __syncthreads();
-        // Rn = R * inv * w, FP32.
-        for (int i = static_cast<int>(threadIdx.x); i < pass * kHidden; i += kDownThreads) {
-            const int c = i / kHidden, d = i - c * kHidden;
-            rn[i]       = rn[i] * inv[c] * w[d];
+        // Rn = R * inv * w, FP32: four features a step, w read once for every column.
+        for (int i = static_cast<int>(threadIdx.x) * 4; i < kHidden; i += kDownThreads * 4) {
+            const float4 wi = make_float4(__ldg(w + i), __ldg(w + i + 1), __ldg(w + i + 2), __ldg(w + i + 3));
+#pragma unroll
+            for (int c = 0; c < kPassColumns; ++c) {
+                if (c < pass) {
+                    float4* p = reinterpret_cast<float4*>(rn + c * kHidden + rn_slot(i));
+                    float4 r  = *p;
+                    r.x = r.x * inv[c] * wi.x, r.y = r.y * inv[c] * wi.y, r.z = r.z * inv[c] * wi.z,
+                    r.w = r.w * inv[c] * wi.w;
+                    *p = r;
+                }
+            }
         }
         if (blockIdx.x == 0 && static_cast<int>(threadIdx.x) < pass) {
             inv_out[static_cast<std::int64_t>(s) * columns + c0 + static_cast<int>(threadIdx.x)] =
@@ -223,8 +278,8 @@ __global__ __launch_bounds__(kDownThreads, 2) void hc_down_partials_kernel(
 #pragma unroll
             for (int c = 0; c < kPassColumns; ++c) {
                 if (c < pass) {
-                    const float4 a = *reinterpret_cast<const float4*>(rn + c * kHidden + kk);
-                    const float4 b = *reinterpret_cast<const float4*>(rn + c * kHidden + kk + 4);
+                    const float4 a = *reinterpret_cast<const float4*>(rn + c * kHidden + rn_slot(kk));
+                    const float4 b = *reinterpret_cast<const float4*>(rn + c * kHidden + rn_slot(kk + 4));
                     acc[c]         = fmaf(wv[0], a.x, acc[c]);
                     acc[c]         = fmaf(wv[1], a.y, acc[c]);
                     acc[c]         = fmaf(wv[2], a.z, acc[c]);
@@ -280,6 +335,18 @@ __global__ __launch_bounds__(kUpThreads, kUpMinBlocks) void hc_up_collapse_kerne
         }
     }
 
+    // The collapse's residual values, eight columns at a time: lane s + 4 (t % 8) holds stream s of
+    // column t, loaded here for the first eight so the load overlaps the steps below.
+    const int lane_stream = lane & 3, lane_column = lane >> 2;
+    const auto load_residual = [&](int t0) {
+        const int t = t0 + lane_column;
+        return live && t < columns ? __bfloat162float(residual[static_cast<std::int64_t>(t) * width +
+                                                               static_cast<std::int64_t>(lane_stream) * kHidden + d])
+                                   : 0.0F;
+    };
+    float lane_residual = load_residual(0);
+    const float lane_norm = live ? norm_weight[static_cast<std::int64_t>(lane_stream) * kHidden + d] : 0.0F;
+
     // 2. z = sum_s partial[s] in order s = 0..S-1; m = SiLU(z / S); CTA 0 writes the injects.
     const float inv_streams = 1.0F / static_cast<float>(kStreams);
     for (int i = static_cast<int>(threadIdx.x); i < down_rows * columns; i += kUpThreads) {
@@ -304,13 +371,14 @@ __global__ __launch_bounds__(kUpThreads, kUpMinBlocks) void hc_up_collapse_kerne
 
     // 3. u_s = W_up[s*H + d] . m: per lane, each chunk's eight products in k order, added to its
     //    stream's sum in chunk order; a warp butterfly per stream, then the collapse in lane 0.
-    float w_norm[kStreams];
-#pragma unroll
-    for (int s = 0; s < kStreams; ++s) {
-        w_norm[s] = norm_weight[static_cast<std::int64_t>(s) * kHidden + d];
-    }
+    float lane_rn = 0.0F; // Rn_s of column t for lane s + 4 (t % 8)
 #pragma unroll 1
     for (int t = 0; t < columns; ++t) {
+        if (t % 8 == 0) {
+            if (t > 0) { lane_residual = load_residual(t); }
+            const int tc = t + lane_column;
+            lane_rn = tc < columns ? lane_residual * inv[lane_stream * columns + tc] * lane_norm : 0.0F;
+        }
         const float* mt = m + t * rank;
         float acc[kStreams];
 #pragma unroll
@@ -340,16 +408,13 @@ __global__ __launch_bounds__(kUpThreads, kUpMinBlocks) void hc_up_collapse_kerne
         }
 #pragma unroll
         for (int s = 0; s < kStreams; ++s) { acc[s] = warp_sum(acc[s]); }
+        float rn[kStreams];
+#pragma unroll
+        for (int s = 0; s < kStreams; ++s) { rn[s] = __shfl_sync(0xFFFFFFFFU, lane_rn, s + 4 * (t % 8)); }
         if (lane == 0) {
             float sum = 0.0F;
 #pragma unroll
-            for (int s = 0; s < kStreams; ++s) {
-                const float r = __bfloat162float(
-                    residual[static_cast<std::int64_t>(t) * width +
-                             static_cast<std::int64_t>(s) * kHidden + d]);
-                const float rn = r * inv[s * columns + t] * w_norm[s];
-                sum += sigmoidf(acc[s]) * rn;
-            }
+            for (int s = 0; s < kStreams; ++s) { sum += sigmoidf(acc[s]) * rn[s]; }
             x[static_cast<std::int64_t>(t) * kHidden + d] = __float2bfloat16_rn(sum * inv_streams);
         }
     }
