@@ -268,7 +268,20 @@ int shipped_profiles_parse() {
                     std::cerr << "shipped profiles: " << name << " sets no option\n";
                     ++failures;
                 }
-                (void)parse({"ninfer-serve", "model.ninfer", "--config", entry.path().string()});
+                // A profile need not choose the speculation backend: the launcher does. The
+                // Flash-Next profile sets MTP options, which are only valid once it has said
+                // --spec mtp, so supply that here.
+                std::vector<std::string> arguments{"ninfer-serve", "model.ninfer", "--config",
+                                                   entry.path().string()};
+                const auto& words = read_serve_config(entry.path()).words;
+                const bool sets_spec = std::find(words.begin(), words.end(), "--spec") != words.end();
+                const bool sets_mtp  = std::any_of(words.begin(), words.end(), [](const std::string& word) {
+                    return word.rfind("--mtp-", 0) == 0;
+                });
+                if (!sets_spec && sets_mtp) {
+                    arguments.insert(arguments.end(), {"--spec", "mtp", "--draft-tokens", "3"});
+                }
+                (void)parse(arguments);
             } catch (const std::invalid_argument& error) {
                 std::cerr << "shipped profiles: " << error.what() << '\n';
                 ++failures;

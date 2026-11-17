@@ -804,7 +804,7 @@ int main() {
             "req#7 done | openai-chat | output limit | prompt 401 | output 1,024 | cache 101 "
             "(25.2%, checkpoint) | TTFT 358 ms | total 5.7s | prefill 1.28k tok/s | "
             "decode 191.4 tok/s | mtp accepted 720/900 (80.0%) | copies accepted 540/600 (90.0%) "
-            "| thinking 256/256, control 19",
+            "| K=3 in 120 rounds | thinking 256/256, control 19",
         "pretty request-done record mismatch");
 
     GenerationOutcome normalized_tool_outcome = outcome;
