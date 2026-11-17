@@ -212,6 +212,14 @@ gathers from global memory) and with the slice staging issuing every load before
 instruction issue and latency; it needs a redesign, not a tweak. The bit-identical MoE options
 (`--moe-precast-input`, `--moe-gate-up-registers`, `--moe-fused-route`) are neutral here.
 
+Serving on a V100: `scripts/run-v100.sh <model>` is run.sh with the V100's defaults (the sm_70
+server from build-v100/, the memory-lock fallback, a GPU check). For Flash-Next it keeps run.sh's
+`tuned` profile, which measured best here: MTP3 decode 68.9 tok/s and a 2K-token prefill 293 tok/s
+against 63 and 251 with only `--spec mtp --draft-tokens 3 --gdn-head-map`; leaving out any one of
+its flags was neutral or slower (MTP joint acceptance -4 tok/s, the shared-expert stream -1.7, CPU
+prefill share 0 -> 226 tok/s prefill, 0.6 -> 285). Through the launcher at its 32K context with
+vision: 307 tok/s prefill, 71 tok/s MTP3 decode. For the 27B it picks MTP3 with INT8 KV.
+
 Never profile the Flash-Next server with `ncu` kernel replay: it backs device memory up to host
 RAM (~21 GB beside the 33 GB of pinned experts) and the OOM killer ends the server. Profile the
 kernels in a standalone bench or a test binary instead; `ncu`'s cold caches match the model's.
