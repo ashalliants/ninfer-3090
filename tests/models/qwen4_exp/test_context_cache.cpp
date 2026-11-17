@@ -415,10 +415,10 @@ void fill(MemoryTier& tier, std::span<const std::uint32_t> slabs, std::uint32_t 
 Handle point(HostCheckpointStore& store, MemoryTier& tier, const CheckpointLayout& layout,
              std::shared_ptr<CheckpointIdentity> id, std::uint32_t frontier, const std::vector<std::uint32_t>& shared,
              runtime::CheckpointRole role, std::uint32_t mtp_cells, std::optional<TokenId> next, bool logits,
-             std::uint32_t seed) {
+             std::uint32_t seed, std::uint32_t tag = 0) {
     HostCheckpoint record;
     record.identity     = std::move(id);
-    record.identity_tag = layout.identity_tag;
+    record.identity_tag = tag != 0 ? tag : layout.identity_tag;
     record.frontier     = frontier;
     record.role         = role;
     record.full_pages   = frontier / 64;
@@ -599,6 +599,51 @@ void test_shared_prefix_images() {
     std::printf("ok: shared prefix images\n");
 }
 
+// Refusal steering: a checkpoint computed under a steering vector carries that vector's tag (the
+// context cache's tag, derived per vector). An image keeps each point's own tag, keys it with that
+// tag, and only a Program holding the vector accepts it; it never comes back as an unsteered point.
+void test_steered_images() {
+    CheckpointLayout layout = test_layout();
+    const std::uint32_t steered = layout.identity_tag + 0x1111;
+    layout.extra_tags           = {steered};
+    HostCheckpointStore a(64, kSlab);
+    MemoryTier ta(64, kSlab);
+    const auto tokens = sequence(300);
+    const auto id     = identity(tokens);
+    const Handle plain =
+        point(a, ta, layout, id, 128, {}, runtime::CheckpointRole::InputReplay, 128, tokens[128], true, 6);
+    const Handle red =
+        point(a, ta, layout, id, 256, {}, runtime::CheckpointRole::InputReplay, 256, tokens[256], true, 7, steered);
+
+    require(layout.accepts_tag(layout.identity_tag) && layout.accepts_tag(steered) && !layout.accepts_tag(steered + 1),
+            "a layout accepts its own tag and its steering vectors' only");
+
+    // A steered point round-trips with its tag, and its image is keyed by it.
+    const auto image = export_checkpoint_image(a, ta, layout, {&red, 1}, std::nullopt, "binding-1");
+    require(image.keys.size() == 1 && image.keys[0].identity_tag == steered,
+            "a steered point's image is not keyed by its steering tag");
+    HostCheckpointStore b(64, kSlab);
+    MemoryTier tb(64, kSlab);
+    const auto imported = import_checkpoint_image(b, tb, layout, image.bytes, "binding-1");
+    require(imported && imported->points.size() == 1 && b.at(imported->points[0]).identity_tag == steered,
+            "a steered point lost its tag through an image");
+
+    // An unsteered point still carries the Program's tag.
+    const auto plain_image = export_checkpoint_image(a, ta, layout, {&plain, 1}, std::nullopt, "binding-1");
+    require(plain_image.keys[0].identity_tag == layout.identity_tag, "an unsteered point lost the configuration's tag");
+
+    // A Program that does not hold the vector (another run, another set of --graft files) refuses it.
+    CheckpointLayout without = layout;
+    without.extra_tags.clear();
+    require(refused([&] { (void)import_checkpoint_image(b, tb, without, image.bytes, "binding-1"); }),
+            "an image of a steered point was accepted by a Program without that vector");
+    CheckpointLayout other = layout;
+    other.extra_tags       = {steered + 1};
+    require(refused([&] { (void)import_checkpoint_image(b, tb, other, image.bytes, "binding-1"); }),
+            "an image of a steered point was accepted under another vector's tag");
+    std::printf("ok: steered checkpoint images\n");
+}
+
 } // namespace
 
 int main() {
@@ -615,6 +660,7 @@ int main() {
         test_image_round_trip();
         test_image_refusals();
         test_shared_prefix_images();
+        test_steered_images();
         std::printf("qwen4_exp context cache tests passed\n");
         return 0;
     } catch (const std::exception& error) {

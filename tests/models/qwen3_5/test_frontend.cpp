@@ -1259,6 +1259,54 @@ int test_media_token_ids_come_from_tokenizer() {
                  "Vision preparation ignored the loaded image token ID");
 }
 
+// A steering name (Qwen3.8-Flash-Next's --graft) selects a vector, not a prompt: the prompt keeps
+// its tokens, positions and token count, and the selection arrives as PreparedPromptData::steering.
+int test_steering_selection() {
+    const ninfer::models::qwen3_5::PromptGraft graft{
+        .name = "product", .tokens = {248045, fixture_byte_token('s'), 248046}};
+    ninfer::models::qwen3_5::FrontendOptions options;
+    options.vision_enabled = false;
+    options.max_context    = std::numeric_limits<std::uint32_t>::max();
+    options.grafts         = {graft};
+    options.steering_names = {"red", "blue"};
+    const Frontend frontend = make_frontend(resources(), options);
+
+    const auto text_input = [](std::string name) {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(
+            ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(message));
+        input.options.graft = std::move(name);
+        return input;
+    };
+    const auto plain = frontend.prepare(text_input(""));
+    const auto red   = frontend.prepare(text_input("red"));
+    const auto blue  = frontend.prepare(text_input("blue"));
+    const auto kv    = frontend.prepare(text_input("product"));
+    const auto& p    = FrontendFactory::inspect(plain);
+    const auto& r    = FrontendFactory::inspect(red);
+    const auto& b    = FrontendFactory::inspect(blue);
+    const auto& g    = FrontendFactory::inspect(kv);
+
+    int failures = check(p.steering == -1, "a request with no graft selected a steering vector");
+    failures += check(r.steering == 0 && b.steering == 1, "a steering name did not select its index");
+    failures += check(g.steering == -1, "a prompt graft selected a steering vector");
+    failures += check(r.token_ids == p.token_ids && b.token_ids == p.token_ids,
+                      "selecting a steering vector changed the prompt's tokens");
+    failures += check(r.external_prefix_tokens == 0 && g.token_ids.size() == p.token_ids.size() + graft.tokens.size(),
+                      "a steering name acted like a prompt graft, or a prompt graft stopped working beside one");
+    failures += check(frontend.count_tokens(text_input("red")) == frontend.count_tokens(text_input("")),
+                      "token counting added tokens for a steering vector");
+    bool unknown = false;
+    try {
+        (void)frontend.prepare(text_input("green"));
+    } catch (const std::invalid_argument&) { unknown = true; }
+    failures += check(unknown, "a name that is neither a steering vector nor a graft was accepted");
+    return failures;
+}
+
 // A graft is a hidden token prefix: the grafted prompt must be exactly the graft followed by the
 // ungrafted prompt, with every later position, frontier and Vision span moved by the graft length.
 int test_prompt_graft() {
@@ -3835,6 +3883,7 @@ int main() {
     failures += test_invalid_public_part_enums(frontend);
     failures += test_text_and_image_prepare(frontend);
     failures += test_prompt_graft();
+    failures += test_steering_selection();
     failures += test_direct_graft_prepare();
     failures += test_media_token_ids_come_from_tokenizer();
     failures += test_template_media_contract();

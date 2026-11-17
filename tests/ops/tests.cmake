@@ -5,6 +5,7 @@ set(ninfer_op_tests
   hadamard_overlap
   silu_mul
   residual_add
+  direction_project
   sigmoid_mul
   rmsnorm
   rmsnorm_pack_tail

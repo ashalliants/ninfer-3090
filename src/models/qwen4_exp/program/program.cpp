@@ -125,6 +125,10 @@ struct BasePlanImpl {
     bool reuse = false;
     std::shared_ptr<const CheckpointIdentity> identity;
     std::uint32_t identity_tag = 0;
+    // The refusal-steering vector the request selected (an index into ProgramOptions::steering), or
+    // -1: the forward removes its direction from this request's columns, and `identity_tag` is the
+    // vector's, so only a request that selected the same vector reuses this one's context.
+    std::int32_t steering = -1;
     std::vector<CaptureGroup> captures;
     std::uint32_t recovery = 0; // the typed rewrite's recovery frontier (0: none)
     // The capture groups' and the typed rewrite's execution frontiers inside the prompt, ascending:
@@ -381,6 +385,9 @@ struct IoLayout {
     // A plain round over several lanes: the slot of each row, each row's RoPE words (3 per row)
     // and pooled-block start (3 per row); the ids, positions and [rows, 3] RoPE words are the call's.
     std::size_t rows_slots = 0, rows_rope = 0, rows_block = 0;
+    // Refusal steering: each column's steering set (I32, -1 for none) for a call of up to `columns`
+    // columns or one per lane, staged with the call's other inputs.
+    std::size_t steer = 0;
     std::size_t ngram = 0, bytes = 0;
 
     static IoLayout plan(std::size_t columns, std::size_t row_bytes, std::size_t logits, std::size_t drafts,
@@ -395,6 +402,8 @@ struct IoLayout {
         out.rows_rope     = align(out.rows_slots + 4 * lanes);
         out.rows_block    = align(out.rows_rope + 12 * lanes);
         at                = align(out.rows_block + 12 * lanes);
+        out.steer         = at;
+        at                = align(at + 4 * std::max(columns, lanes));
         if (vision) {
             out.vision_columns = at;
             at                 = align(at + 4 * columns);
@@ -752,6 +761,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.hot_embedding           = plan_hot_embedding(c.vocab_size, c.hidden_size, o.hot_embedding_rows).hot;
     b.cpu_misses              = plan_cpu_misses(o).device;
     b.hc_int8_bytes           = plan_hc_int8(o, c);
+    b.steering                = plan_steering(o, c);
     b.ngram_flag_wait         = plan_ngram_flag_wait(o).device;
     b.staging   = d.staging;
     b.state     = d.state_total;
@@ -985,6 +995,8 @@ public:
                 plan_.bytes.hc_int8_bytes, device_.stream);
         }
         allocated += plan_.bytes.hc_int8_bytes;
+        if (plan_.bytes.steering != 0) { build_steering_table(); }
+        allocated += plan_.bytes.steering;
 
         std::vector<const std::uint8_t*> banks;
         std::vector<std::uint64_t> bank_strides;
@@ -1237,6 +1249,59 @@ public:
 
     // The forward's options; with --hot-embedding-rows its two embedding planes: the device copy of
     // the first rows and the whole table through its device pointer in the mapped pinned block.
+    // Refusal steering: every vector's directions as one device table, FP32 [vectors][layers][hidden].
+    void build_steering_table() {
+        const std::size_t sets = options_.steering.size(), layers = c_.num_hidden_layers, hidden = c_.hidden_size;
+        std::vector<float> host(sets * layers * hidden, 0.0f);
+        steering_table_.active.assign(layers, 0);
+        for (std::size_t k = 0; k < sets; ++k) {
+            const SteeringVector& vector = *options_.steering[k];
+            if (vector.layers != static_cast<std::int32_t>(layers) || vector.hidden != static_cast<std::int32_t>(hidden)) {
+                throw std::invalid_argument("Qwen3.8-Flash-Next: steering vector '" + vector.name +
+                                            "' does not match the model's layers and hidden size");
+            }
+            std::copy(vector.directions.begin(), vector.directions.end(), host.begin() + k * layers * hidden);
+            for (std::size_t l = 0; l < layers; ++l) {
+                steering_table_.active[l] = static_cast<std::uint8_t>(steering_table_.active[l] | vector.active[l]);
+            }
+        }
+        steering_backing_ = DeviceBuffer(plan_.bytes.steering);
+        steering_backing_.copy_from_host(host.data(), steering_backing_.bytes);
+        steering_table_.directions = static_cast<const float*>(steering_backing_.p);
+        steering_table_.sets       = static_cast<std::int32_t>(sets);
+        steering_table_.layers     = static_cast<std::int32_t>(layers);
+        steering_table_.hidden     = static_cast<std::int32_t>(hidden);
+        derive_steering_tags(); // the context cache's own call, once its tag exists, replaces these
+    }
+
+    // A request that selects a steering vector computes different activations, so its checkpoints
+    // must never serve a request that selects another vector, or none. The context cache keeps a
+    // tag with every checkpoint (it is part of the prefix index's key, of the exact-reuse check and
+    // of a checkpoint image); each vector gets its own, derived from the configuration's tag and the
+    // vector's digest and made distinct from the configuration's and from every other vector's.
+    void derive_steering_tags() {
+        steering_tags_.clear();
+        for (const auto& vector : options_.steering) {
+            std::uint64_t mixed = (static_cast<std::uint64_t>(identity_tag_) ^ vector->digest) * 1099511628211ULL;
+            auto tag            = static_cast<std::uint32_t>(mixed ^ (mixed >> 32));
+            const auto taken    = [&](std::uint32_t candidate) {
+                return candidate == identity_tag_ ||
+                       std::find(steering_tags_.begin(), steering_tags_.end(), candidate) != steering_tags_.end();
+            };
+            while (taken(tag)) { ++tag; }
+            steering_tags_.push_back(tag);
+        }
+    }
+
+    // The context-cache tag of a request that selected steering vector `steering` (-1: none).
+    std::uint32_t request_tag(std::int32_t steering) const {
+        if (steering < 0) { return identity_tag_; }
+        if (static_cast<std::size_t>(steering) >= steering_tags_.size()) {
+            throw std::invalid_argument("prompt selects a steering vector this Program does not hold");
+        }
+        return steering_tags_[static_cast<std::size_t>(steering)];
+    }
+
     execution::ForwardOptions forward_options() const {
         execution::ForwardOptions out{.shared_expert_stream = options_.shared_expert_stream,
                                       .gdn_head_map         = options_.gdn_head_map,
@@ -1245,7 +1310,8 @@ public:
                                       .moe_fused_route       = options_.moe_fused_route,
                                       .hc_int8               = hc_int8_.get(),
                                       .hc_fused_read         = options_.hc_fused_read,
-                                      .ggml_decode_mma       = options_.ggml_decode_mma};
+                                      .ggml_decode_mma       = options_.ggml_decode_mma,
+                                      .steering = steering_table_.directions != nullptr ? &steering_table_ : nullptr};
         if (plan_.bytes.hot_embedding == 0) { return out; }
         const Weight& table        = parameters_.token_embedding;
         const auto rows            = static_cast<std::int32_t>(options_.hot_embedding_rows);
@@ -1495,6 +1561,12 @@ public:
         }
         auto base = std::make_shared<BasePlanImpl>();
         if (data.has_media()) { plan_vision(data, *base); }
+        if (data.steering >= 0 && static_cast<std::size_t>(data.steering) >= options_.steering.size()) {
+            throw std::invalid_argument("prompt selects a steering vector this Program does not hold");
+        }
+        base->steering     = data.steering;
+        // Every record the lane captures carries its request's tag, not only a reusable prompt's.
+        base->identity_tag = request_tag(data.steering);
         if (data.external_prefix_tokens != 0) {
             throw std::invalid_argument("Qwen3.8-Flash-Next has no prompt grafts (they need the context cache)");
         }
@@ -1592,7 +1664,6 @@ public:
             identity->prefix_identity.assign(data);
             identity->digests.assign(data);
             base->identity     = std::move(identity);
-            base->identity_tag = identity_tag_;
             base->captures     = std::move(groups);
         }
         base->prompt = std::make_shared<const std::vector<TokenId>>(std::move(data.token_ids));
@@ -2805,7 +2876,7 @@ private:
         const auto& all = held.slabs();
         HostCheckpoint r;
         r.frontier     = frontier;
-        r.identity_tag = identity_tag_;
+        r.identity_tag = L().base->identity_tag;
         r.full_pages   = full;
         r.mtp_cells    = plan_.drafts > 0 ? L().mtp_cells : 0;
         if (L().history.size() > frontier) { r.next_token = L().history[frontier]; }
@@ -3220,8 +3291,10 @@ private:
             tag = (tag ^ v) * 1099511628211ULL;
         }
         identity_tag_ = static_cast<std::uint32_t>(tag ^ (tag >> 32));
+        derive_steering_tags();
         // What a checkpoint image must match (checkpoint_image.h).
         layout_               = CheckpointLayout{};
+        layout_.extra_tags    = steering_tags_;
         layout_.slab_bytes    = record;
         layout_.plane_offsets = record_planes_;
         for (const auto& planes : plan_.kv.layers) {
@@ -3316,9 +3389,12 @@ private:
         auto* rope     = reinterpret_cast<std::int32_t*>(host + io.rope);
         auto* block    = reinterpret_cast<std::int32_t*>(host + io.block_rope);
         auto* columns  = reinterpret_cast<std::int32_t*>(host + io.logit_columns);
+        auto* steer    = reinterpret_cast<std::int32_t*>(host + io.steer);
+        const std::int32_t selected = L().base != nullptr ? L().base->steering : -1;
         for (std::int32_t t = 0; t < width; ++t) {
-            ids[t] = L().history[static_cast<std::size_t>(begin + t)];
-            pos[t] = begin + t;
+            ids[t]   = L().history[static_cast<std::size_t>(begin + t)];
+            pos[t]   = begin + t;
+            steer[t] = selected;
         }
         const auto first = static_cast<std::uint32_t>(begin);
         stage_rope(L().rope, first, width, std::span<std::int32_t>(rope, 3ULL * width), width, 0);
@@ -3797,6 +3873,7 @@ private:
         b.rope_positions   = Tensor(base + io.rope, DType::I32, {width, 3});
         b.block_start_rope = Tensor(base + io.block_rope, DType::I32, {3});
         b.logit_columns    = Tensor(base + io.logit_columns, DType::I32, {round ? width : 1});
+        if (steering_table_.directions != nullptr) { b.steer = Tensor(base + io.steer, DType::I32, {width}); }
         b.ngram_rows       = Tensor(base + io.ngram, DType::U8,
                                     {dim(c_.ple.table.row_bytes), dim(hash_.heads()), width});
         b.verify           = verify;
@@ -4016,8 +4093,10 @@ private:
         auto* slots      = reinterpret_cast<std::int32_t*>(host + io.rows_slots);
         auto* row_rope   = reinterpret_cast<std::int32_t*>(host + io.rows_rope);
         auto* row_block  = reinterpret_cast<std::int32_t*>(host + io.rows_block);
+        auto* steer      = reinterpret_cast<std::int32_t*>(host + io.steer);
         for (std::int32_t b = 0; b < B; ++b) {
             const Lane& lane = lanes_[lanes[static_cast<std::size_t>(b)]];
+            steer[b]         = lane.base != nullptr ? lane.base->steering : -1;
             // state_tokens was advanced by the previous round only at commit time: the round's
             // position is the committed frontier.
             const std::uint32_t at = lane.state_tokens;
@@ -4048,6 +4127,7 @@ private:
         b.row_rope         = Tensor(base + io.rows_rope, DType::I32, {3, B});
         b.block_start_rope = Tensor(base + io.rows_block, DType::I32, {3, B});
         b.ngram_rows       = Tensor(base + io.ngram, DType::U8, {dim(c_.ple.table.row_bytes), dim(hash_.heads()), B});
+        if (steering_table_.directions != nullptr) { b.steer = Tensor(base + io.steer, DType::I32, {B}); }
         if (plan_.drafts > 0) {
             b.residual_out = Tensor(spec_base() + plan_.spec.residuals, DType::BF16, {dim(c_.residual_width()), B});
         }
@@ -5009,6 +5089,7 @@ private:
         auto* rope        = reinterpret_cast<std::int32_t*>(host + io.rope);
         auto* block       = reinterpret_cast<std::int32_t*>(host + io.rows_block);
         auto* slots       = reinterpret_cast<std::int32_t*>(host + io.rows_slots);
+        auto* steer       = reinterpret_cast<std::int32_t*>(host + io.steer);
         const auto B      = static_cast<std::int32_t>(lanes.size());
         const auto total  = static_cast<std::int32_t>(B) * W;
         const std::size_t heads = hash_.heads(), row_bytes = c_.ple.table.row_bytes;
@@ -5022,8 +5103,9 @@ private:
             const auto first = L().state_tokens;
             for (std::int32_t j = 0; j < W; ++j) {
                 const std::int32_t column = b * W + j;
-                ids[column] = L().history[static_cast<std::size_t>(first) + static_cast<std::size_t>(j)];
-                pos[column] = static_cast<std::int32_t>(first) + j;
+                ids[column]   = L().history[static_cast<std::size_t>(first) + static_cast<std::size_t>(j)];
+                pos[column]   = static_cast<std::int32_t>(first) + j;
+                steer[column] = L().base != nullptr ? L().base->steering : -1;
             }
             stage_rope(L().rope, first, W, std::span<std::int32_t>(rope, 3ULL * static_cast<std::size_t>(total)),
                       total, b * W);
@@ -5063,6 +5145,7 @@ private:
         b.block_start_rope = Tensor(base + io.rows_block, DType::I32, {3, B});
         b.ngram_rows       = Tensor(base + io.ngram, DType::U8, {dim(c_.ple.table.row_bytes), dim(hash_.heads()), T});
         b.residual_out     = Tensor(spec_base() + plan_.spec.rows_residuals, DType::BF16, {dim(c_.residual_width()), T});
+        if (steering_table_.directions != nullptr) { b.steer = Tensor(base + io.steer, DType::I32, {T}); }
         b.verify           = verify;
         return b;
     }
@@ -5957,6 +6040,11 @@ private:
     std::uint32_t kv_taken_     = 0; // expert frames the pool's growths took and not yet returned
     std::uint64_t kv_added_     = 0; // the bytes those growths mapped and not yet released
     DeviceBuffer io_device_;
+    // Refusal steering (ProgramOptions::steering): the device table the Forward reads, and each
+    // vector's identity tag (steering_tags_[k]); both empty without a vector.
+    DeviceBuffer steering_backing_;
+    execution::SteeringTable steering_table_;
+    std::vector<std::uint32_t> steering_tags_;
     PinnedHostBuffer io_host_{1};
     PinnedHostBuffer host_token_{1};
     PinnedHostBuffer mask_host_{1};
@@ -6234,6 +6322,11 @@ std::uint64_t plan_hc_int8(const ProgramOptions& options, const TextConfig& conf
     const bool drafter = options.mtp_draft_tokens > 0;
     return (2ULL * config.num_hidden_layers + (drafter ? 2U : 0U)) * block + (drafter ? 2U : 1U) * final_mixer +
            execution::HcInt8Copies::kStatusBytes;
+}
+
+std::uint64_t plan_steering(const ProgramOptions& options, const TextConfig& config) {
+    return static_cast<std::uint64_t>(options.steering.size()) * config.num_hidden_layers * config.hidden_size *
+           sizeof(float);
 }
 
 std::uint64_t plan_mtp_draft_probs(const ProgramOptions& options) {

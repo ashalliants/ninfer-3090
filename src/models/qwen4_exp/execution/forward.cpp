@@ -17,6 +17,7 @@
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gated_rmsnorm.h"
 #include "ninfer/ops/gdn_gating.h"
+#include "ninfer/ops/direction_project.h"
 #include "ninfer/ops/hyper_connection.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/linear.h"
@@ -152,6 +153,17 @@ void require_hc_int8(const Parameters& parameters, const HcInt8Copies* copies, b
     }
 }
 
+// ForwardOptions::steering: the table must match the model's blocks and hidden size.
+void require_steering(const Parameters& parameters, const SteeringTable* table) {
+    if (table == nullptr) { return; }
+    const TextConfig& c = parameters.model.config();
+    if (table->directions == nullptr || table->sets < 1 || table->layers != static_cast<std::int32_t>(c.num_hidden_layers) ||
+        table->hidden != static_cast<std::int32_t>(c.hidden_size) ||
+        table->active.size() != static_cast<std::size_t>(table->layers)) {
+        throw std::invalid_argument("Qwen4Exp forward: the steering table does not match the model's layers and hidden size");
+    }
+}
+
 // ForwardOptions::ggml_decode_mma: every projection the forward runs must suit the int8 tensor-core
 // decode route (Forward::ggml_decode_mma_aligned), checked once here rather than at a decode call.
 void require_ggml_decode_mma(const Parameters& parameters, bool on) {
@@ -242,9 +254,10 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
       cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map),
       moe_precast_input_(options.moe_precast_input), moe_gate_up_registers_(options.moe_gate_up_registers),
       moe_fused_route_(options.moe_fused_route), hc_int8_(options.hc_int8), hc_fused_read_(options.hc_fused_read),
-      ggml_decode_mma_(options.ggml_decode_mma) {
+      ggml_decode_mma_(options.ggml_decode_mma), steering_(options.steering) {
     require_hc_int8(parameters_, hc_int8_, hc_fused_read_);
     require_ggml_decode_mma(parameters_, ggml_decode_mma_);
+    require_steering(parameters_, steering_);
     if (state_.gdn_conv.size() != config_.gdn_layers || state_.gdn_recurrent.size() != config_.gdn_layers ||
         state_.ple_slot.dtype != DType::I32 || state_.ple_slot.numel() != 1 ||
         state_.qsa_tails.size() != config_.attention_layers || kv_.layers.size() != config_.attention_layers ||
@@ -274,9 +287,10 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
       cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map),
       moe_precast_input_(options.moe_precast_input), moe_gate_up_registers_(options.moe_gate_up_registers),
       moe_fused_route_(options.moe_fused_route), hc_int8_(options.hc_int8), hc_fused_read_(options.hc_fused_read),
-      ggml_decode_mma_(options.ggml_decode_mma) {
+      ggml_decode_mma_(options.ggml_decode_mma), steering_(options.steering) {
     require_hc_int8(parameters_, hc_int8_, hc_fused_read_);
     require_ggml_decode_mma(parameters_, ggml_decode_mma_);
+    require_steering(parameters_, steering_);
     if (mtp.has_value() != parameters_.mtp.has_value()) {
         throw std::invalid_argument("Qwen4Exp forward: the MTP drafter's parameters and state go together");
     }
@@ -565,6 +579,7 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
         ym = moe(block.moe, xm, layer, route_tap, cpu_channels(batch));
     }
     ops::hyper_connection_inject(ym, mlp_inject, residual, s);
+    steer(layer, residual, batch.steer);
     if (tap != nullptr) {
         copy_tap(tap->mixer_inputs, layer, xa, s);
         copy_tap(tap->mixer_outputs, layer, y, s);
@@ -572,6 +587,17 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
         copy_tap(tap->moe_outputs, layer, ym, s);
         copy_tap(tap->residuals, layer, residual, s);
     }
+}
+
+void Forward::steer(std::uint32_t layer, Tensor& residual, const Tensor& select) {
+    if (steering_ == nullptr || select.data == nullptr || layer >= steering_->active.size() ||
+        steering_->active[layer] == 0) {
+        return;
+    }
+    const std::int64_t set_stride = static_cast<std::int64_t>(steering_->layers) * steering_->hidden;
+    ops::direction_project(residual, dim(config_.hc.streams),
+                           steering_->directions + static_cast<std::int64_t>(layer) * steering_->hidden, set_stride,
+                           static_cast<const std::int32_t*>(select.data), device_.stream);
 }
 
 Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject) {
@@ -1030,12 +1056,14 @@ void Forward::layer_rows(std::uint32_t layer, const ForwardRowsBatch& batch) {
                                       route_log(layer, static_cast<std::size_t>(config_.moe.top_k) * B));
         Tensor ym          = moe(block.moe, read.x, layer, nullptr, /*cpu=*/nullptr, &read);
         ops::hyper_connection_inject(ym, read.inject, residual_, s);
+        steer(layer, residual_, batch.steer);
         return;
     }
     ops::hyper_connection_inject(y, inject, residual_, s);
     Tensor xm = mix(block.mlp_hc, residual_, &inject);
     Tensor ym = moe(block.moe, xm, layer, nullptr, /*cpu=*/nullptr);
     ops::hyper_connection_inject(ym, inject, residual_, s);
+    steer(layer, residual_, batch.steer);
 }
 
 Tensor Forward::gdn_rows(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardRowsBatch& batch) {
@@ -1279,12 +1307,14 @@ void Forward::layer_rows_verify(std::uint32_t layer, const ForwardRowsVerifyBatc
                                       route_log(layer, static_cast<std::size_t>(config_.moe.top_k) * T));
         Tensor ym          = moe(block.moe, read.x, layer, nullptr, &experts_.cpu, &read);
         ops::hyper_connection_inject(ym, read.inject, residual_, s);
+        steer(layer, residual_, batch.steer);
         return;
     }
     ops::hyper_connection_inject(y, inject, residual_, s);
     Tensor xm = mix(block.mlp_hc, residual_, &inject);
     Tensor ym = moe(block.moe, xm, layer, nullptr, &experts_.cpu);
     ops::hyper_connection_inject(ym, inject, residual_, s);
+    steer(layer, residual_, batch.steer);
 }
 
 Tensor Forward::gdn_rows_verify(const GdnParameters& p, const Tensor& x, std::uint32_t index,

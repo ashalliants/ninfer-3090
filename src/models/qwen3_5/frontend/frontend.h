@@ -32,6 +32,10 @@ struct FrontendOptions {
     std::uint32_t vision_max_merged_tokens = 16384;
     // Hidden prompt prefixes a request may select through PromptOptions::graft.
     std::vector<PromptGraft> grafts;
+    // Names a request may select through PromptOptions::graft that name a refusal-steering vector
+    // rather than a prompt (Qwen3.8-Flash-Next): a request's selection becomes
+    // PreparedPromptData::steering, the name's index here. Disjoint from `grafts`' names.
+    std::vector<std::string> steering_names;
     // Build each prepared prompt's n-gram copy index, sized from max_context, over its tokens and
     // the de-numbered runs of its tool results, on the preparing thread.
     bool ngram_index = false;
