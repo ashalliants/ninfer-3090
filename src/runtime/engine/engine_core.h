@@ -4319,11 +4319,16 @@ private:
         bool expired = false;
         // Not a read: look the bucket up for images ending on the request's prompt, then consult
         // the store again. Copied from the plan on the worker, which owns it: the prompt's prefix
-        // digest at each frontier from lookup_from + 1 on (nullopt where it has none), and when the
-        // request asked.
+        // digest and identity tag at each frontier from lookup_from + 1 on (nullopt where it has
+        // none), and when the request asked. The tag is the request's own (a steered request's
+        // differs), so a listed image of the same endpoint under another tag is not wanted.
         bool lookup = false;
         std::uint32_t lookup_from = 0;
-        std::vector<std::optional<std::array<std::uint64_t, 2>>> lookup_digests;
+        struct LookupKey {
+            std::array<std::uint64_t, 2> digests{};
+            std::uint32_t identity_tag = 0;
+        };
+        std::vector<std::optional<LookupKey>> lookup_digests;
         Clock::time_point lookup_asked{};
         // Wanted images the index held after the lookup.
         std::size_t lookup_found = 0;
@@ -4421,7 +4426,12 @@ private:
                 task.lookup_digests.reserve(prompt_tokens > resident ? prompt_tokens - resident : 0);
                 for (std::uint32_t frontier = resident + 1; frontier <= prompt_tokens; ++frontier) {
                     const auto key = base.prefix_shortlist_key(frontier);
-                    task.lookup_digests.push_back(key ? std::optional(key->digests) : std::nullopt);
+                    auto& entry = task.lookup_digests.emplace_back(); // nullopt where there is no key
+                    if (key) {
+                        entry.emplace();
+                        entry->digests      = key->digests;
+                        entry->identity_tag = key->identity_tag;
+                    }
                 }
             } catch (...) { return false; }
             request->store_looked_up    = true;
@@ -4518,7 +4528,8 @@ private:
                             }
                             const auto& mine =
                                 task.lookup_digests[parsed->frontier - task.lookup_from - 1];
-                            return mine && *mine == parsed->digests;
+                            return mine && mine->digests == parsed->digests &&
+                                   mine->identity_tag == parsed->identity_tag;
                         };
                         task.lookup_found =
                             store_.store->lookup_remote(task.lookup_asked, task.deadline, wanted).held;
