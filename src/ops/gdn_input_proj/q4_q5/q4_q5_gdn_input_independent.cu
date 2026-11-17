@@ -251,6 +251,32 @@ void launch_t4_pdl(const Tensor& x, const Weight& qk_weight, const Weight& value
 void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
                                         Tensor& z, cudaStream_t stream) {
+#if defined(NINFER_SM70)
+    // sm_70: the streaming GEMV serves every verify width (2..8), where the split4 / SIMT tiles ran
+    // at 40-50% of the weight stream on a V100 (Qwen3.8-27B MTP3 verify, nsys: 134 + 51 us per call
+    // at T=4).
+    if (x.ne[1] >= 2 && x.ne[1] <= 8) {
+        const std::int64_t x_stride = x.nb[1] / sizeof(__nv_bfloat16);
+        const Q4LinearOperands q4   = q4_linear_operands(x, qk_weight);
+        const Q5LinearOperands q5   = q5_linear_operands(x, value_z_weight);
+        if (!try_launch_stream_gemv<Q4StreamFormat>(
+                q4.x, {q4.codes, q4.scales},
+                LinearBf16StridedOutput{static_cast<__nv_bfloat16*>(qk.data),
+                                        static_cast<std::int64_t>(qk.nb[1] / sizeof(__nv_bfloat16)),
+                                        0},
+                LinearIdentityEpilogue{}, q4.rows, q4.k, q4.padded_k, stream, q4.tokens,
+                x_stride)) {
+            launch_q4(x, qk_weight, qk, stream);
+        }
+        if (!try_launch_stream_gemv<Q5StreamFormat>(
+                q5.x, {q5.codes, q5.high, q5.scales}, q5_projection_output(value, z),
+                LinearIdentityEpilogue{}, q5.rows, q5.k, q5.padded_k, stream, q5.tokens,
+                x_stride)) {
+            launch_q5(x, value_z_weight, value, z, stream);
+        }
+        return;
+    }
+#endif
     if (x.ne[1] == 4) {
         launch_t4_pdl(x, qk_weight, value_z_weight, qk, value, z, stream);
         return;

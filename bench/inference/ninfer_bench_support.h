@@ -79,7 +79,7 @@ struct BenchOptions {
     int device            = 0;
     bool use_cuda_graph   = true;
     bool prefill_a8       = true;
-    bool prefill_cublas   = false;
+    bool prefill_cublas   = ninfer::kPrefillCublasDefault; // on for sm_70 builds (FP16, exact scales)
     bool prefill_cublas_projections = true;
     bool profile_measured = false;
     OutputFormat output   = OutputFormat::Table;

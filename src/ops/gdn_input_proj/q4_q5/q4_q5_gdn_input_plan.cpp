@@ -188,11 +188,11 @@ struct RouteSpec {
 // sm_70: Volta emulates mma.sync (ops/common/volta_compat.cuh), so SmallTMma's flat ~80 us above
 // becomes compute-bound on the emulation: profiled on a V100-PCIE-32GB (Qwen3.8-27B decode, nsys)
 // it cost ~445 us per call at T=1 (q5_small_t_mma 317 us + q4_ksplit 128 us) against ~64 us of
-// weight stream. IndependentDirectFixed is GEMV at T=1 and SIMT through T=6 (it reaches the
-// sliced-K MMA from T=7), so it takes 1..6 and SmallTMma keeps the rest of its range.
+// weight stream. IndependentDirectFixed runs the streaming GEMV at T=1..8 on sm_70
+// (q4_q5_gdn_input_independent.cu), so it takes 1..8 and SmallTMma keeps the rest of its range.
 constexpr std::array<RouteSpec, 4> kRoutes{{
-    {{1, 6}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
-    {{7, 32}, Q4Q5GdnInputScheduleId::SmallTMma},
+    {{1, 8}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
+    {{9, 32}, Q4Q5GdnInputScheduleId::SmallTMma},
     {{33, 64}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C64},
     {{65, kAnyCols}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128},
 }};

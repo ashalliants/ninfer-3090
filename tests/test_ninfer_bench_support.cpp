@@ -209,8 +209,12 @@ int test_cli_contract() {
                        "benchmark help omits new KV modes");
     const qb::BenchOptions route_defaults =
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer"});
-    failures += expect(!route_defaults.prefill_cublas && route_defaults.prefill_cublas_projections,
-                       "cuBLAS prefill on by default");
+    failures += expect(route_defaults.prefill_cublas == ninfer::kPrefillCublasDefault &&
+                           route_defaults.prefill_cublas_projections,
+                       "cuBLAS prefill default differs from kPrefillCublasDefault");
+    const qb::BenchOptions no_cublas = parse_for_test(
+        {"ninfer_bench", "--weights", "model.ninfer", "--no-prefill-cublas"});
+    failures += expect(!no_cublas.prefill_cublas, "--no-prefill-cublas leaves cuBLAS prefill on");
     const qb::BenchOptions route =
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "mtp",
                         "--draft-tokens", "3", "--prefill-cublas",
@@ -218,7 +222,8 @@ int test_cli_contract() {
     failures += expect(route.prefill_cublas && !route.prefill_cublas_projections &&
                            route.speculative.backend == ninfer::SpeculativeBackend::Mtp,
                        "benchmark cuBLAS prefill and drafting controls");
-    for (const char* flag : {"--prefill-cublas", "--no-prefill-cublas-projections"}) {
+    for (const char* flag :
+         {"--prefill-cublas", "--no-prefill-cublas", "--no-prefill-cublas-projections"}) {
         failures += expect(qb::usage_text("ninfer_bench").find(flag) != std::string::npos,
                            std::string("benchmark help omits ") + flag);
     }

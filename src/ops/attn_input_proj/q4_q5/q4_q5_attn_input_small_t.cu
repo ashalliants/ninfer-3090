@@ -219,6 +219,32 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& valu
 void q4_q5_attn_input_small_t_launch(const Tensor& x, const Weight& query_key_weight,
                                      const Weight& gate_value_weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, cudaStream_t stream) {
+#if defined(NINFER_SM70)
+    // sm_70: the streaming GEMV serves every verify width (2..8), where the SIMT tiles above ran at
+    // 40-60% of the weight stream on a V100 (Qwen3.8-27B MTP3 verify, nsys: 80 + 79 us per call
+    // at T=4).
+    if (x.ne[1] >= 2 && x.ne[1] <= 8) {
+        const std::int64_t x_stride = x.nb[1] / sizeof(__nv_bfloat16);
+        const Q4LinearOperands qk   = q4_linear_operands(x, query_key_weight);
+        const Q5LinearOperands gv   = q5_linear_operands(x, gate_value_weight);
+        const bool q4_streamed      = try_launch_stream_gemv<Q4StreamFormat>(
+            qk.x, {qk.codes, qk.scales},
+            LinearBf16SplitOutput2<kSplitRow>{
+                {static_cast<__nv_bfloat16*>(q.data),
+                 static_cast<std::int64_t>(q.nb[1] / sizeof(__nv_bfloat16)), 0},
+                {static_cast<__nv_bfloat16*>(k.data),
+                 static_cast<std::int64_t>(k.nb[1] / sizeof(__nv_bfloat16)), 0}},
+            LinearIdentityEpilogue{}, qk.rows, qk.k, qk.padded_k, stream, qk.tokens, x_stride);
+        if (!q4_streamed) { launch_q4(x, query_key_weight, q, k, stream); }
+        if (!try_launch_stream_gemv<Q5StreamFormat>(
+                gv.x, {gv.codes, gv.high, gv.scales}, q5_projection_output(gate, v),
+                LinearIdentityEpilogue{}, gv.rows, gv.k, gv.padded_k, stream, gv.tokens,
+                x_stride)) {
+            launch_q5(x, gate_value_weight, gate, v, stream);
+        }
+        return;
+    }
+#endif
     launch_q4(x, query_key_weight, q, k, stream);
     launch_q5(x, gate_value_weight, gate, v, stream);
 }
