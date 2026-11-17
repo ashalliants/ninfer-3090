@@ -1,6 +1,8 @@
 #include "runtime/engine/context_store/context_store.h"
+#include "runtime/engine/context_store/image_id.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -108,11 +110,34 @@ void test_hash() {
 
 // Stores on disk and in buckets are keyed by these ids: the format must not change.
 void test_image_id() {
-    check(ContextStore::image_id({0x0123456789abcdefULL, 0xfedcba9876543210ULL}, 0x1ad2d, false) ==
-              "0123456789abcdeffedcba98765432100001ad2d",
+    check(ContextStore::image_id({0x0123456789abcdefULL, 0xfedcba9876543210ULL}, 0x1ad2d, 0xabcd1234U, false) ==
+              "0123456789abcdeffedcba98765432100001ad2dabcd1234",
           "conversation image id");
-    check(ContextStore::image_id({1, 2}, 16384, true) == "0000000000000001000000000000000200004000" "5",
+    check(ContextStore::image_id({1, 2}, 16384, 7, true) == "0000000000000001000000000000000200004000" "00000007" "5",
           "shared prefix image id");
+
+    // The identity tag is part of the id: one prompt endpoint under two tags (a plain and a
+    // steered checkpoint) is two images, not one replacing the other. Both shapes name the same
+    // endpoint when the tag is the same.
+    const std::array<std::uint64_t, 2> digests{0x1111, 0x2222};
+    const auto plain   = ContextStore::image_id(digests, 4096, 0xABCDU, false);
+    const auto steered = ContextStore::image_id(digests, 4096, 0xABCDU + 0x1111U, false);
+    check(plain != steered, "images of one endpoint under different tags share an id");
+    check(ContextStore::image_id(digests, 4096, 0xABCDU, true) != ContextStore::image_id(digests, 4096, 0xABCDU + 1, true),
+          "shared prefixes under different tags share an id");
+    check(plain == ContextStore::image_id(digests, 4096, 0xABCDU, false), "an id is not deterministic");
+
+    // Ids parse back to the key they name; an id of the earlier shape (no tag) is not one of ours.
+    const auto parsed = ninfer::runtime::parse_context_store_image_id(steered);
+    check(parsed && parsed->digests == digests && parsed->frontier == 4096 && parsed->identity_tag == 0xABCDU + 0x1111U &&
+              !parsed->shared,
+          "a conversation id did not parse back to its key");
+    const auto shared = ninfer::runtime::parse_context_store_image_id(ContextStore::image_id(digests, 4096, 9, true));
+    check(shared && shared->shared && shared->identity_tag == 9, "a shared prefix id did not parse back to its key");
+    check(!ninfer::runtime::parse_context_store_image_id("0123456789abcdeffedcba98765432100001ad2d"),
+          "an id of the earlier shape (no tag) parsed");
+    check(!ninfer::runtime::parse_context_store_image_id("0123456789abcdeffedcba98765432100001ad2d" "5"),
+          "a shared id of the earlier shape (no tag) parsed");
 }
 
 // A load into a reused buffer (larger than the image, full of another image's bytes) gives the

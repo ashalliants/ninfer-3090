@@ -3955,8 +3955,8 @@ private:
                     frontier = depth;
                 }
             }
-            return ContextStore::image_id(program.checkpoint_key(deepest, frontier).digests,
-                                          frontier, shared);
+            const auto key = program.checkpoint_key(deepest, frontier);
+            return ContextStore::image_id(key.digests, frontier, key.identity_tag, shared);
         } catch (...) { return {}; }
     }
 
@@ -4223,7 +4223,8 @@ private:
                                                                    Checkpoint handle) const {
         const auto frontier = program.checkpoint_metadata(handle).frontier;
         const auto key      = program.checkpoint_key(handle, frontier);
-        const auto info = store_.store->find(context_store_image_id(key.digests, frontier, true));
+        const auto info =
+            store_.store->find(context_store_image_id(key.digests, frontier, key.identity_tag, true));
         if (!info || !info->shared || info->binding != store_.binding || info->checkpoints.empty()) {
             return std::nullopt;
         }
