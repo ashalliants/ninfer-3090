@@ -431,19 +431,30 @@ __device__ void quantize_columns_bf16(Base base, int n, int groups, std::int8_t*
 // The same for FP32 columns (h), 16-byte loads.
 template <class Base>
 __device__ void quantize_columns_f32(Base base, int n, int groups, std::int8_t* q, float* d) {
-    for (int i = threadIdx.x; i < n * groups; i += blockDim.x) {
-        const int c = i / groups, g = i % groups;
-        const auto* src = reinterpret_cast<const float4*>(base(c) + canon::kA8Values * g);
-        float v[32];
+    // Four lanes a group (quantize_q8_1_part: the same steps, the amax combined across the lanes),
+    // so a one-column cast keeps 80 threads busy instead of 20 while the rest wait at the barrier.
+    constexpr int kLanes = 4;
+    const int total      = n * groups * kLanes;
+    for (int t0 = 0; t0 < total; t0 += static_cast<int>(blockDim.x)) { // whole warps join the shuffles
+        const int t = t0 + static_cast<int>(threadIdx.x);
+        const int i = t / kLanes, part = t % kLanes;
+        const bool real = t < total;
+        float v[32 / kLanes];
+        if (real) {
+            const int c = i / groups, g = i % groups;
+            const auto* src = reinterpret_cast<const float4*>(base(c) + canon::kA8Values * g + 8 * part);
+            const float4 a = src[0], b = src[1];
+            v[0] = a.x, v[1] = a.y, v[2] = a.z, v[3] = a.w, v[4] = b.x, v[5] = b.y, v[6] = b.z, v[7] = b.w;
+        } else {
 #pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            const float4 f = src[k];
-            v[4 * k]       = f.x;
-            v[4 * k + 1]   = f.y;
-            v[4 * k + 2]   = f.z;
-            v[4 * k + 3]   = f.w;
+            for (int k = 0; k < 32 / kLanes; ++k) { v[k] = 0.0F; }
         }
-        d[i] = canon::a8_quantize_f32(v, q + i * canon::kA8Values);
+        int words[8 / kLanes];
+        const float scale = ggml::quantize_q8_1_part<kLanes>(v, words);
+        if (real) {
+            *reinterpret_cast<int2*>(q + i * canon::kA8Values + 8 * part) = make_int2(words[0], words[1]);
+            if (part == 0) { d[i] = scale; }
+        }
     }
 }
 
@@ -829,6 +840,17 @@ int coresident_grid() {
     return out;
 }
 
+// Volta: down_kernel decodes its rows where the record is instead of staging its slice in shared
+// memory first. The cp.async staging is emulated there as a synchronous copy, so every warp waited
+// at the barrier for the whole slice before any computed (barrier stalls led the kernel's profile);
+// in place, each warp starts on its rows as they arrive, and a warp's small decode loads share L1
+// lines. The rows' bytes, and so the bits, are the same.
+#if defined(NINFER_SM70)
+constexpr bool kDownInPlace = true;
+#else
+constexpr bool kDownInPlace = false;
+#endif
+
 template <int NC>
 struct DownShared {
     alignas(16) std::int8_t hq[NC * moe::kIntermediate];
@@ -845,8 +867,7 @@ __global__ void __launch_bounds__(kThreads)
     extern __shared__ __align__(16) unsigned char smem_raw[];
     constexpr int RD      = kDownRowsPerWarp;
     const int slice_bytes = kDownRows * static_cast<int>(g.down_row_bytes);
-    std::uint8_t* stage   = smem_raw;
-    auto& sm              = *reinterpret_cast<DownShared<NC>*>(smem_raw + slice_bytes);
+    auto& sm = *reinterpret_cast<DownShared<NC>*>(smem_raw + (kDownInPlace ? 0 : slice_bytes));
     const int job         = job_base + static_cast<int>(blockIdx.y);
     if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
     const int expert           = dispatch.jobs[job];
@@ -854,8 +875,11 @@ __global__ void __launch_bounds__(kThreads)
     const std::uint8_t* record = job_record(source, job_records, expert, job);
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
     const std::uint8_t* slice = record + g.down_offset + static_cast<std::size_t>(tile) * slice_bytes;
-    stage_async(slice, stage, slice_bytes / 2);
-    stage_async(slice + slice_bytes / 2, stage + slice_bytes / 2, slice_bytes / 2);
+    const std::uint8_t* stage = kDownInPlace ? slice : smem_raw;
+    if constexpr (!kDownInPlace) {
+        stage_async(slice, smem_raw, slice_bytes / 2);
+        stage_async(slice + slice_bytes / 2, smem_raw + slice_bytes / 2, slice_bytes / 2);
+    }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     constexpr int kSubs = moe::kIntermediate / canon::kA8Values;
     const auto table    = moe::device::ExpertFormat<D>::table();
@@ -866,12 +890,14 @@ __global__ void __launch_bounds__(kThreads)
             [&](int c) { return h_rows + static_cast<std::size_t>(first + pass + c) * moe::kIntermediate; }, n, kHGroups,
             sm.hq, sm.hd);
         for (int half = 0; half < 2; ++half) {
-            if (half == 0) {
-                stage_wait_but_one();
-            } else {
-                stage_wait();
+            if constexpr (!kDownInPlace) {
+                if (half == 0) {
+                    stage_wait_but_one();
+                } else {
+                    stage_wait();
+                }
             }
-            __syncthreads();
+            if (!kDownInPlace || half == 0) { __syncthreads(); } // the cast columns, and the staged half
             for (int row0 = half * kDownRows / 2 + RD * warp; row0 < (half + 1) * kDownRows / 2; row0 += RD * kWarps) {
                 float v[RD][NC];
                 row_dots<D, NC, RD>(stage + static_cast<std::size_t>(row0) * g.down_row_bytes, g.down_row_bytes, kSubs,
@@ -919,7 +945,8 @@ template <QType D, int NC>
 void launch_down(const MoeDispatch& dispatch, const MoeExpertSource& source, const Geometry& g,
                  const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                  const float* h_rows, bf16* outputs, cudaStream_t stream) {
-    const int down_smem = kDownRows * static_cast<int>(g.down_row_bytes) + static_cast<int>(sizeof(DownShared<NC>));
+    const int down_smem =
+        (kDownInPlace ? 0 : kDownRows * static_cast<int>(g.down_row_bytes)) + static_cast<int>(sizeof(DownShared<NC>));
     configure_cuda_device_once([] {
         const void* kernel = reinterpret_cast<const void*>(down_kernel<D, NC>);
         cudaError_t e      = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSmem);
