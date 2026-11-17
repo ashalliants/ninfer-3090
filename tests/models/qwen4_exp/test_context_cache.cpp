@@ -553,6 +553,14 @@ void test_image_refusals() {
     header[20] ^= 0x01; // inside the binding
     require(refused([&] { (void)load(header, "binding-1", layout); }), "a damaged header is refused");
     require(refused([&] { (void)load(image, "binding-2", layout); }), "another model's image is refused");
+    // An image written before points carried their own tag (version 1, "FN" 0x464E0001, little
+    // endian after the 8-byte magic) is a clean refusal, not parsed against the new layout.
+    auto version_one = image;
+    version_one[8]   = 0x01;
+    version_one[9]   = 0x00;
+    version_one[10]  = 0x4E;
+    version_one[11]  = 0x46;
+    require(refused([&] { (void)load(version_one, "binding-1", layout); }), "a version-1 image is refused");
     auto other_tag = layout;
     ++other_tag.identity_tag;
     require(refused([&] { (void)load(image, "binding-1", other_tag); }), "another configuration's image is refused");

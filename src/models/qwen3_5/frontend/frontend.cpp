@@ -755,8 +755,10 @@ public:
         }
     }
 
-    // The steering vector a request names (an index into steering_names), or -1 for none.
+    // The steering vector a request names (an index into steering_names), or -1 for none. An empty
+    // name is the opt-out / no selection, whatever the table holds.
     [[nodiscard]] std::int32_t find_steering(const std::string& name) const {
+        if (name.empty()) { return -1; }
         for (std::size_t i = 0; i < steering_names.size(); ++i) {
             if (steering_names[i] == name) { return static_cast<std::int32_t>(i); }
         }

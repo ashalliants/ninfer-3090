@@ -1304,6 +1304,17 @@ int test_steering_selection() {
         (void)frontend.prepare(text_input("green"));
     } catch (const std::invalid_argument&) { unknown = true; }
     failures += check(unknown, "a name that is neither a steering vector nor a graft was accepted");
+
+    // A table that (wrongly) holds an empty name must still never be selected by an empty request
+    // graft: "" is always "none", the explicit opt-out too.
+    auto empty_named           = options;
+    empty_named.steering_names = {"", "red"};
+    const Frontend guarded     = make_frontend(resources(), empty_named);
+    const auto none            = guarded.prepare(text_input(""));
+    const auto named           = guarded.prepare(text_input("red"));
+    failures += check(FrontendFactory::inspect(none).steering == -1,
+                      "an empty request graft selected an empty-named steering vector");
+    failures += check(FrontendFactory::inspect(named).steering == 1, "a name beside an empty-named entry lost its index");
     return failures;
 }
 

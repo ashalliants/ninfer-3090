@@ -18,7 +18,9 @@ using codec::ImageWriter;
 
 // Not the Qwen3.5 Program's version (2): either Program rejects the other's images at the head even
 // before the binding (which already differs) is compared.
-constexpr std::uint32_t kImageVersion   = 0x464E0001U; // "FN", 1
+// Version 2: every point record carries its own identity tag (refusal steering). A version-1 image
+// (a persisted context store from before) fails the head check and is a clean miss.
+constexpr std::uint32_t kImageVersion   = 0x464E0002U; // "FN", 2
 constexpr std::uint32_t kMaximumLayers  = 64;
 // Slabs moved per tier call while exporting or importing (about 60 MiB of page records).
 constexpr std::size_t kSlabsPerTransfer = 64;

@@ -236,6 +236,9 @@ void validate(const EngineOptions& options) {
         refuse("holds at most " + std::to_string(kMaxSteeringVectors) + " --graft steering vectors");
     }
     for (std::size_t i = 0; i < options.grafts.size(); ++i) {
+        if (options.grafts[i].name.empty()) {
+            refuse("has a --graft vector with no name (an empty request graft means none)");
+        }
         for (std::size_t j = i + 1; j < options.grafts.size(); ++j) {
             if (options.grafts[i].name == options.grafts[j].name) {
                 refuse("has two --graft vectors named '" + options.grafts[i].name + "'");
