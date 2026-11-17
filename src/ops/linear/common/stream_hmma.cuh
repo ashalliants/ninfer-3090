@@ -57,7 +57,7 @@ inline constexpr bool kStreamHmmaDefault = true;
 inline constexpr bool kStreamHmmaDefault = false;
 #endif
 
-// NINFER_STREAM_HMMA=0/1 overrides the default at runtime, for A/B measurement.
+// NINFER_STREAM_HMMA=0 turns it off at runtime in sm_70 builds, for A/B measurement.
 inline bool stream_hmma_enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("NINFER_STREAM_HMMA");
@@ -328,7 +328,9 @@ bool try_launch_stream_hmma_rows(const __nv_bfloat16* x, std::int64_t x_stride,
                                  const typename Format::Planes& planes, Sink sink,
                                  std::int32_t items, std::int32_t row_offset, std::int32_t k,
                                  std::int32_t padded_k, cudaStream_t stream) {
-    if constexpr (!StreamHmmaFormat<Format> || Cols < kStreamHmmaMinCols || Cols > 8) {
+    // Compiled for sm_70 builds only: other cards have native mma routes for these widths.
+    if constexpr (!kStreamHmmaDefault || !StreamHmmaFormat<Format> || Cols < kStreamHmmaMinCols ||
+                  Cols > 8) {
         return false;
     } else {
         if (!stream_hmma_enabled()) return false;
