@@ -298,11 +298,21 @@ Qwen3.8-Flash-Next. A 32 GB V100 holds the 27B (19 GiB) with room for KV; the Bo
 
 ## Next, in order
 
-1. Run the full op suites (`scripts/v100_validate.sh --tests`); only the linear, input-projection,
-   `linear_add` and SwiGLU suites have run so far.
+1. Run the full op suites (`scripts/v100_validate.sh --tests`); the linear, input-projection,
+   `linear_add`, SwiGLU, GDN, MTP-round and attention suites have run.
 2. Measure small-T on the other models (MTP / DFlash verification on the 27B is done: see "Decode"), and re-pick the sm_86 route tables where an `mma`
    route loses to a SIMT one on Volta (`docs/maintainer/linear-tuning.md` has the method).
-3. Key-chunked flash attention (see "Prompt attention"), so long prompts keep INT8-kernel
+3. Verify widths on the few-row matrices: the out projections (5120 x 6144) and the long down
+   projection (5120 x 17408) run at 35-55% of the weight stream at T = 4 in both streaming GEMVs
+   (the SIMT one stages K = 6144 in two chunks at four tokens; the tensor-core one has too few
+   rows in flight). A K-split across CTAs would fill the card. Q5 on the tensor-core form needs
+   its high plane decoded more cheaply first, and Q6 (the verify LM head, 2 ms of an MTP3 round)
+   has no tensor-core form yet.
+4. Kernel count: a plain decode step is ~700 kernels, and each short GEMV loses ~8 us to fill and
+   drain between dependent kernels (Volta has no programmatic dependent launch), ~1-2 ms a token.
+   Fusing the norms and small element-wise steps into their neighbours is the remaining decode
+   headroom beyond the GEMVs themselves.
+5. Key-chunked flash attention (see "Prompt attention"), so long prompts keep INT8-kernel
    accuracy and bounded scratch.
-4. Calibrate `context_cost_defaults.cpp` for the card (`ninfer_context_cost_bench`); until then the
+6. Calibrate `context_cost_defaults.cpp` for the card (`ninfer_context_cost_bench`); until then the
    generic transfer and prefill costs apply.
