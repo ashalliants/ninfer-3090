@@ -178,6 +178,44 @@ round spent ~26 ms of ~50 in it against a ~19 ms read. Two changes:
 | + input projections on the streaming GEMV | 82.3 | 75.6 | 72.5 | 72.3 |
 | + tensor-core verify GEMV | 86.3 | 85.9 | 85.4 | 84.2 |
 
+### Decode: Qwen3.8-Flash-Next
+
+Same card at 250 W, Flash-Next IQ2_XS (`qwen4exp-iq2xs-mtp-vision.ninfer`), INT8 KV, 8K context,
+warm expert cache (18.7K frames, 26 GiB), 200 greedy tokens, 2026-11-17:
+
+| Build | plain | MTP3 |
+|---|---|---|
+| port as first built | 44.7 | |
+| + compact routing kernels and one-column router projection | 48.3 | |
+| + `ggml_mmvq`: one decode site, lane-parallel Q8_1 cast | 52.2 | 61.8 |
+| + `--gdn-head-map` | 53.3 | 63.1 |
+
+A decode step is ~900 launches of ~40 different kernels, more code than an SM's instruction caches
+hold, so every kernel starts cold. In a standalone bench, evicting only the instruction caches
+before a dense IQ4_XS GEMV added ~9 us to its ~30 us (`imc_miss`/`no_instruction` stalls), and a
+kernel that one warp runs straight through pays for every instruction it fetches: the fully
+unrolled routing top-k (57 KiB of code) took ~27 us in the model against ~10 us warm. On this card
+code size is time. The changes above are bit-identical and shared with the 3090:
+
+- `route_column` rolls the top-k rounds (lane k keeps pick k); 57 KiB -> 8 KiB.
+- `projection_fp32` has a one-column instance for the decode router (37 KiB -> 8 KiB).
+- `ggml_mmvq` decodes at one site instead of two, and casts x to Q8_1 four lanes per group
+  (`quantize_q8_1_part`) instead of one thread unrolling all 32 values (30 KiB -> 16 KiB). The
+  same-format pair kernel runs one copy of the body.
+
+Tried without a gain in the model: the HC mixers' K1a at three CTAs per SM (its 164 CTAs are two
+waves on 80 SMs; it spilled and did not get faster) or with a one-column instance (~3 us per call
+in isolation, nothing measurable in the model); the routed experts' gate/up with the IQ2 codebook
+in shared memory (removes its `lg_throttle` stalls, the load queue backed up by divergent codebook
+gathers from global memory) and with the slice staging issuing every load before its stores (the
+`cp.async` emulation is a synchronous copy). Gate/up stays ~58 us for 10.5 MB, bound by
+instruction issue and latency; it needs a redesign, not a tweak. The bit-identical MoE options
+(`--moe-precast-input`, `--moe-gate-up-registers`, `--moe-fused-route`) are neutral here.
+
+Never profile the Flash-Next server with `ncu` kernel replay: it backs device memory up to host
+RAM (~21 GB beside the 33 GB of pinned experts) and the OOM killer ends the server. Profile the
+kernels in a standalone bench or a test binary instead; `ncu`'s cold caches match the model's.
+
 ### Prefill
 
 The wide prefill GEMMs run on the tensor cores through cuBLAS, by default. The cuBLAS prefill

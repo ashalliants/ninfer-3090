@@ -74,42 +74,88 @@ __device__ __forceinline__ void mmvq_body(const std::uint8_t* __restrict__ w, co
     load_tables<F>(tables, grid_s);
     if constexpr (kNeedsIq3sGrid<F>) __syncthreads();
 
-    // The first row group's weight loads go out before the cast, so the cast's reads of x overlap
-    // them instead of delaying every CTA's first DRAM request.
+    // One decode site (the decode is most of the kernel's code, and a decode step's kernels run
+    // with cold instruction caches on Volta, so code size is time): each pass first issues the loads
+    // of the group it will compute next, then finishes the previous pass's group (or, on the first
+    // pass, casts x, which overlaps the first group's DRAM trip), then computes the new group. The
+    // order of loads and arithmetic per group is the two-site form's, so the bits are unchanged.
     SubBlockOf<F> sb[kSubsLane];
-    const auto decode = [&](int group) {
-        const std::uint8_t* wrow =
-            w + static_cast<std::size_t>(group * kRowsWarp + lane / kLanes) * kRowBytes;
+    float acc[T];
+    int row = 0;
+    for (bool first = true;; first = false) {
+        if (rg < groups) {
+            const std::uint8_t* wrow =
+                w + static_cast<std::size_t>(rg * kRowsWarp + lane / kLanes) * kRowBytes;
 #pragma unroll
-        for (int i = 0; i < kSubsLane; ++i) Fmt::decode(wrow, sub_lane + kLanes * i, tables, sb[i]);
-    };
-    if (rg < groups) decode(rg);
-
-    for (int g = static_cast<int>(threadIdx.x); g < T * kSubs; g += kMmvqThreads) {
-        const int t  = g / kSubs;
-        const int gi = g - t * kSubs;
-        int words[8];
-        if constexpr (kAffine<F>) {
-            const float xd = quantize_q8_1_group(x + static_cast<std::size_t>(t) * K + kSubValues * gi, words);
-            xd_s[g]        = xd;
-            int sum        = 0;
-#pragma unroll
-            for (int w = 0; w < 8; ++w) sum = __dp4a(words[w], 0x01010101, sum);
-            auto* xm_s = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(grid_s) + (kNeedsIq3sGrid<F> ? 512 * 4 : 0));
-            xm_s[g]    = xd * static_cast<float>(sum);
-        } else {
-            xd_s[g] = quantize_q8_1_group(x + static_cast<std::size_t>(t) * K + kSubValues * gi, words);
+            for (int i = 0; i < kSubsLane; ++i) Fmt::decode(wrow, sub_lane + kLanes * i, tables, sb[i]);
         }
-        *reinterpret_cast<int4*>(xq_s + t * K + 16 * gi) =
-            make_int4(words[0], words[1], words[2], words[3]);
-        *reinterpret_cast<int4*>(xq_s + t * K + K / 2 + 16 * gi) =
-            make_int4(words[4], words[5], words[6], words[7]);
-    }
-    __syncthreads();
-
-    for (; rg < groups; rg += stride) {
-        const int row = rg * kRowsWarp + lane / kLanes;
-        float acc[T];
+        if (first) {
+            // The Q8_1 cast: four lanes per 32-value group (eight values each), eight groups per
+            // warp. The loop is warp-uniform because the cast's shuffles need every lane.
+            constexpr int kCastLanes = 4;
+            const int part           = lane % kCastLanes;
+            for (int base = warp * (32 / kCastLanes); base < T * kSubs; base += kMmvqThreads / kCastLanes) {
+                const int g     = base + lane / kCastLanes;
+                const bool real = g < T * kSubs;
+                const int t     = real ? g / kSubs : 0;
+                const int gi    = real ? g - t * kSubs : 0;
+                float value[32 / kCastLanes];
+                const uint4 raw = real ? *reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * K +
+                                                                         kSubValues * gi + 8 * part)
+                                       : make_uint4(0, 0, 0, 0);
+                const std::uint32_t bits[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    value[2 * i]     = __uint_as_float(bits[i] << 16);
+                    value[2 * i + 1] = __uint_as_float(bits[i] & 0xFFFF0000U);
+                }
+                int words[8 / kCastLanes];
+                const float xd = quantize_q8_1_part<kCastLanes>(value, words);
+                int sum        = 0;
+                if constexpr (kAffine<F>) {
+#pragma unroll
+                    for (int w = 0; w < 8 / kCastLanes; ++w) sum = __dp4a(words[w], 0x01010101, sum);
+#pragma unroll
+                    for (int offset = kCastLanes / 2; offset > 0; offset >>= 1) sum += __shfl_xor_sync(0xFFFFFFFFU, sum, offset);
+                }
+                if (real) {
+                    // Values 8 part .. 8 part + 7: the first or second 16-byte half of the group.
+                    *reinterpret_cast<int2*>(xq_s + t * K + (part < 2 ? 0 : K / 2) + 16 * gi + 8 * (part & 1)) =
+                        make_int2(words[0], words[1]);
+                    if (part == 0) {
+                        xd_s[g] = xd;
+                        if constexpr (kAffine<F>) {
+                            auto* xm_s = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(grid_s) +
+                                                                  (kNeedsIq3sGrid<F> ? 512 * 4 : 0));
+                            xm_s[g]    = xd * static_cast<float>(sum);
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+        } else {
+            // The previous group: reduce and store while this pass's loads are in flight.
+#pragma unroll
+            for (int offset = kLanes / 2; offset > 0; offset >>= 1) {
+#pragma unroll
+                for (int t = 0; t < T; ++t) acc[t] += __shfl_xor_sync(0xFFFFFFFFU, acc[t], offset);
+            }
+#pragma unroll
+            for (int t = 0; t < T; ++t) {
+                if (sub_lane == t % kLanes) {
+                    const std::size_t o = static_cast<std::size_t>(t) * n + row;
+                    float y             = acc[t];
+                    if constexpr (std::is_same_v<Out, float>) {
+                        out[o] = y;
+                    } else {
+                        if constexpr (Residual) y += __bfloat162float(out[o]);
+                        out[o] = __float2bfloat16_rn(y);
+                    }
+                }
+            }
+        }
+        if (rg >= groups) { break; }
+        row = rg * kRowsWarp + lane / kLanes;
 #pragma unroll
         for (int t = 0; t < T; ++t) acc[t] = 0.0F;
 #pragma unroll
@@ -143,26 +189,7 @@ __device__ __forceinline__ void mmvq_body(const std::uint8_t* __restrict__ w, co
                 }
             }
         }
-        // The next group's loads are in flight while this one reduces and stores.
-        if (rg + stride < groups) decode(rg + stride);
-#pragma unroll
-        for (int offset = kLanes / 2; offset > 0; offset >>= 1) {
-#pragma unroll
-            for (int t = 0; t < T; ++t) acc[t] += __shfl_xor_sync(0xFFFFFFFFU, acc[t], offset);
-        }
-#pragma unroll
-        for (int t = 0; t < T; ++t) {
-            if (sub_lane == t % kLanes) {
-                const std::size_t o = static_cast<std::size_t>(t) * n + row;
-                float y             = acc[t];
-                if constexpr (std::is_same_v<Out, float>) {
-                    out[o] = y;
-                } else {
-                    if constexpr (Residual) y += __bfloat162float(out[o]);
-                    out[o] = __float2bfloat16_rn(y);
-                }
-            }
-        }
+        rg += stride;
     }
 }
 
@@ -183,7 +210,12 @@ __global__ void __launch_bounds__(kMmvqThreads)
                           __nv_bfloat16* __restrict__ out2, int n, int first_ctas) {
     extern __shared__ __align__(16) unsigned char smem[];
     const int cta = static_cast<int>(blockIdx.x);
-    if (cta < first_ctas) {
+    if constexpr (F1 == F2) {
+        // One copy of the body (half the code; see mmvq_body): the CTA picks its matrix's operands.
+        const bool second = cta >= first_ctas;
+        mmvq_body<F1, K, T, false>(second ? w2 : w1, x, second ? out2 : out1, n, second ? cta - first_ctas : cta,
+                                   second ? static_cast<int>(gridDim.x) - first_ctas : first_ctas, smem);
+    } else if (cta < first_ctas) {
         mmvq_body<F1, K, T, false>(w1, x, out1, n, cta, first_ctas, smem);
     } else {
         mmvq_body<F2, K, T, false>(w2, x, out2, n, cta - first_ctas, static_cast<int>(gridDim.x) - first_ctas, smem);

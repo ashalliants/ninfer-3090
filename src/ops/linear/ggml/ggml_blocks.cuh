@@ -456,4 +456,37 @@ __device__ __forceinline__ float quantize_q8_1_group(const __nv_bfloat16* x, int
     return canon::a8_scale(amax);
 }
 
+// quantize_q8_1_group split over Lanes adjacent lanes (an aligned group of a warp): the lane at
+// position p of the group holds values 32 / Lanes * p onward and gets their code words; every lane
+// gets d. amax is the group's maximum of the lanes' a8_amax_step runs (a maximum of non-NaN values,
+// so its bits do not depend on the order), and each code is the same a8_code of the same operands,
+// so the result is the per-thread form's. The per-thread form unrolls all 32 values (~700
+// instructions), which matters to a decode GEMV that runs with cold instruction caches
+// (ggml_mmvq.cuh). Every lane of the warp must call it.
+template <int Lanes>
+__device__ __forceinline__ float quantize_q8_1_part(const float (&value)[32 / Lanes], int (&words)[8 / Lanes]) {
+    static_assert(Lanes == 1 || Lanes == 2 || Lanes == 4 || Lanes == 8);
+    float amax = 0.0F;
+#pragma unroll
+    for (int j = 0; j < 32 / Lanes; ++j) amax = canon::a8_amax_step(amax, value[j]);
+#pragma unroll
+    for (int offset = Lanes / 2; offset > 0; offset >>= 1) {
+        const float other = __shfl_xor_sync(0xFFFFFFFFU, amax, offset);
+        amax              = other > amax ? other : amax;
+    }
+    const float prescale = canon::a8_prescale(amax);
+    const float inverse  = canon::a8_inverse(amax);
+#pragma unroll
+    for (int w = 0; w < 8 / Lanes; ++w) {
+        std::uint32_t word = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int q = canon::a8_code(value[4 * w + j], prescale, inverse);
+            word |= (static_cast<std::uint32_t>(q) & 0xFFU) << (8 * j);
+        }
+        words[w] = static_cast<int>(word);
+    }
+    return canon::a8_scale(amax);
+}
+
 } // namespace ninfer::ops::ggml
