@@ -17,6 +17,8 @@
 #   - Qwen3.8-27B: MTP3 with INT8 KV (NINFER_SPEC=mtp, NINFER_KV_DTYPE=int8) instead of run.sh's
 #     DFlash2 with rk4v4. On the V100 MTP3 decodes 76 tok/s against DFlash2's 66 (code), and INT8
 #     KV is the cache validated on the card;
+#   - Flash-Next prefill calls of up to 1024 tokens hand the CPU every expert miss it can take
+#     (--prefill-cpu-all-columns 1024; NINFER_PREFILL_CPU_ALL_COLUMNS=0 turns it off);
 #   - the memory-lock limit: Flash-Next pins 33 GiB of experts. When `ulimit -l` is below that and
 #     cannot be raised here, NINFER_ALLOW_UNLOCKED_HOST_MEMORY=on is set (the server then continues
 #     and still fails loudly if the pin itself fails). To lift the limit for good, as root:
@@ -56,6 +58,11 @@ case "$model_key" in
     export NINFER_SPEC="${NINFER_SPEC:-mtp}"
     export NINFER_KV_DTYPE="${NINFER_KV_DTYPE:-int8}" ;;
   qwen38-flash-next)
+    # The tuned profile's CPU share (0.4) suits long prompts; calls of up to 1024 tokens give the CPU
+    # every miss it can take instead, since their missed experts see a few tokens each and the CPU
+    # computes them faster than this link copies them (TTFT of a short prompt ~300 -> ~250 ms, a
+    # 342-token prompt 1.6 -> 1.5 s, 2K prompts unchanged).
+    export NINFER_PREFILL_CPU_ALL_COLUMNS="${NINFER_PREFILL_CPU_ALL_COLUMNS:-1024}"
     lock_kib="$(ulimit -l)"
     need_kib=$(( 36 * 1024 * 1024 )) # the 33 GiB expert pin and its neighbours
     if [[ "$lock_kib" != 'unlimited' ]] && (( lock_kib < need_kib )); then

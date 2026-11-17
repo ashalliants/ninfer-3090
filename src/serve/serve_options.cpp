@@ -237,7 +237,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
            "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--mtp-rows-verify] [--ngram-prefetch] "
            "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
-           "[--moe-fused-route] [--cpu-verify-misses] [--prefill-cpu-share F] [--cpu-verify-workers N] [--gdn-async-commit] [--hc-int8 [--hc-fused-read]] "
+           "[--moe-fused-route] [--cpu-verify-misses] [--prefill-cpu-share F [--prefill-cpu-all-columns N]] [--cpu-verify-workers N] [--gdn-async-commit] [--hc-int8 [--hc-fused-read]] "
            "[--ngram-flag-wait] [--partial-ram-residency] [--ggml-decode-mma] "
            "[--ram-headroom-mib N] [--allow-unlocked-host-memory] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
@@ -401,7 +401,11 @@ std::string serve_usage_text(const char* argv0) {
            "computes the share F (0..1, two decimals; Basalt uses 0.6) of each layer's uncached experts of "
            "a prefill call on the same CPU threads, the ones routed fewest tokens first, while the GPU "
            "copies the rest (a call that streams its experts leaves out the least-used ones for it; the "
-           "same output, bit for bit; 0, the default, is off); --gdn-async-commit "
+           "same output, bit for bit; 0, the default, is off); --prefill-cpu-all-columns N (with "
+           "--prefill-cpu-share) gives the CPU every uncached expert it can take (share 1) in prefill calls "
+           "of at most N tokens, whose uncached experts see few tokens each: faster than copying them over "
+           "a slow PCIe link (scripts/run-v100.sh sets 1024; the same output, bit for bit; 0, the default, "
+           "is off); --gdn-async-commit "
            "(--spec mtp) folds each verification's accepted columns into the GDN state on a side stream "
            "while the drafter catches up and drafts the next round (the same state, bit for bit; off by "
            "default); --hc-int8 makes int8 copies of the hyper-connection mixers' weights at startup and "
@@ -1096,6 +1100,10 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.flash_next.ggml_decode_mma = true;
         } else if (arg == "--prefill-cpu-share") {
             options.flash_next.prefill_cpu_share = parse_share(require_value("--prefill-cpu-share"));
+        } else if (arg == "--prefill-cpu-all-columns") {
+            const int columns = parse_nonnegative_int(require_value("--prefill-cpu-all-columns"), "prefill-cpu-all-columns");
+            if (columns > 65536) { throw std::invalid_argument("--prefill-cpu-all-columns must be at most 65536"); }
+            options.flash_next.prefill_cpu_all_columns = static_cast<std::uint32_t>(columns);
         } else if (arg == "--cpu-verify-workers") {
             const int workers = parse_nonnegative_int(require_value("--cpu-verify-workers"), "cpu-verify-workers");
             if (workers < 1 || workers > 64) { throw std::invalid_argument("--cpu-verify-workers must be in [1, 64]"); }
@@ -1358,6 +1366,10 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
     if (options.flash_next.gdn_async_commit && options.speculative.backend != SpeculativeBackend::Mtp) {
         throw std::invalid_argument("--gdn-async-commit folds MTP verification commits on a side stream and needs "
                                     "--spec mtp");
+    }
+    if (options.flash_next.prefill_cpu_all_columns != 0 && options.flash_next.prefill_cpu_share.num == 0) {
+        throw std::invalid_argument("--prefill-cpu-all-columns widens the CPU share of short prefill calls and needs "
+                                    "--prefill-cpu-share");
     }
     if (cpu_verify_workers_set && !options.flash_next.cpu_verify_misses &&
         options.flash_next.prefill_cpu_share.num == 0) {

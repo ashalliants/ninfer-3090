@@ -277,6 +277,9 @@ constexpr std::size_t kDecodePromotionsPerLayer = 1;
 // Once the frames are full, decode promotes only every interval-th round on the reference link.
 constexpr std::uint64_t kDecodePromotionInterval = 4;
 constexpr double kReferenceLinkBytesPerSecond    = 27.5e9;
+// A link below this share of the reference fills a warm start's free frames in the background at
+// startup (fill_free_frames_on_slow_link).
+constexpr double kSlowLinkShare = 0.5;
 // Calls this narrow promote at the decode rate; wider prefill calls promote nothing.
 constexpr std::int32_t kServedCallColumns = 8;
 // A seeded count is capped, so an expert used heavily in an old session yields to new uses.
@@ -1216,6 +1219,9 @@ public:
         select_lane(0);
         warm_vision();
         warm_start_experts();
+        if (options_.expert_cache && !options_.partial_ram_residency && residency_->frames() != 0) {
+            fill_free_frames_on_slow_link();
+        }
         device_.synchronize();
         report_startup();
         if (options_.context_cache_bytes != 0 || options_.context_nvme_bytes != 0) { setup_context_cache(); }
@@ -3895,6 +3901,9 @@ private:
         // than the prefill channel's columns stays on the GPU). A streamed call first leaves each
         // layer's predicted-cold experts out of the stream (ExpertStream::Share), so they are misses.
         b.cpu_share = width <= prefill_cpu_columns_ && prefill_cpu_share_live();
+        // --prefill-cpu-all-columns: a short call's misses see few tokens each, so the CPU takes them all.
+        const bool all_to_cpu = b.cpu_share && width <= static_cast<std::int32_t>(options_.prefill_cpu_all_columns);
+        forward_->set_prefill_cpu_all(all_to_cpu);
         if (b.cpu_share) {
             arm_cpu_error(true);
         } else {
@@ -3910,8 +3919,8 @@ private:
                 execution::ExpertStream::Share share;
                 if (b.cpu_share) {
                     residency_->use_counts(stream_counts_);
-                    share = {static_cast<int>(options_.prefill_cpu_share_num),
-                             static_cast<int>(options_.prefill_cpu_share_den), stream_counts_.data()};
+                    share = {all_to_cpu ? 1 : static_cast<int>(options_.prefill_cpu_share_num),
+                             all_to_cpu ? 1 : static_cast<int>(options_.prefill_cpu_share_den), stream_counts_.data()};
                 }
                 stream_->begin(residency_->host_table(), stream_tables_, ring_first_, ring_frames_, device_.stream,
                                share);
@@ -5694,6 +5703,23 @@ private:
                       std::chrono::duration<double>(Clock::now() - start).count());
         diagnostic(line);
         expert_state_routed_ = residency_->stats().routed;
+    }
+
+    // On a slow link the frames a warm start leaves free fill in the background now, while the
+    // server waits for its first request. Otherwise the first wide prefill's give-back fills them
+    // all (12 GiB for Qwen3.8-Flash-Next on a 32 GB card: ~4 s at 3.3 GB/s, which the next request
+    // waited out), and until then decode promotes them at its own rate (the first requests hit
+    // 80-87% instead of 99%+). A fast link keeps the reference behaviour.
+    void fill_free_frames_on_slow_link() {
+        if (link_ <= 0.0 || link_ >= kSlowLinkShare * kReferenceLinkBytesPerSecond) { return; }
+        const std::uint32_t loads = residency_->fill_free(device_.stream);
+        if (loads == 0) { return; }
+        char line[200];
+        std::snprintf(line, sizeof(line),
+                      "expert cache: filling %u free frames (%.1f GiB) in the background (a %.1f GB/s link)", loads,
+                      static_cast<double>(loads) * static_cast<double>(residency_->frame_stride()) / (1ULL << 30),
+                      link_ / 1e9);
+        diagnostic(line);
     }
 
     void warm_start_experts() {

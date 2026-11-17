@@ -925,6 +925,10 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     // GPU's experts (and their staging) and the shared expert.
     const bool cpu = cpu_leg != nullptr && !cpu_leg->empty();
     if (cpu) { source.cpu = (*cpu_leg)[layer]; }
+    if (cpu && cpu_leg == &experts_.prefill_cpu && prefill_cpu_all_) { // set_prefill_cpu_all
+        source.cpu.share_num = 1;
+        source.cpu.share_den = 1;
+    }
     ExpertStream* stream = experts_.stream != nullptr && experts_.stream->active() ? experts_.stream : nullptr;
     if (stream != nullptr) {
         source.frames = stream->table(layer);

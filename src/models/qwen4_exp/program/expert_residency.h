@@ -160,6 +160,9 @@ public:
     // before the prompt), then with the highest-score experts that are not resident. Returns the
     // number of refill loads.
     std::uint32_t give_back(FrameLease& lease, cudaStream_t compute);
+    // Fills every free frame with the highest-score experts that are not resident, on the copy
+    // stream behind `compute` (give_back's refill without a lease). Returns the number of loads.
+    std::uint32_t fill_free(cudaStream_t compute);
     [[nodiscard]] std::uint32_t lent_frames() const noexcept;
 
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }

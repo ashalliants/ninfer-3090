@@ -596,7 +596,7 @@ passthrough_value_flags=(
   lossy-prefill-recent lossy-prefill-head lossy-prefill-query-rows lossy-prefill-pool-window
   lossy-prefill-skip lossy-prefill-strategy lossy-prefill-summary-max-tokens
   devices stage-layers expert-state vram-headroom-mib ram-headroom-mib expert-cache-mib
-  context-nvme-dir
+  context-nvme-dir prefill-cpu-all-columns
 )
 passthrough_switch_flags=(
   cors greedy no-thinking preserve-thinking tolerant-tool-calls no-cuda-graph no-prefix-reuse

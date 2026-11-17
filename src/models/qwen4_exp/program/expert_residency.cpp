@@ -492,6 +492,11 @@ std::uint32_t ExpertResidency::give_back(FrameLease& lease, cudaStream_t compute
     return settle_return(compute, 0);
 }
 
+std::uint32_t ExpertResidency::fill_free(cudaStream_t compute) {
+    commands_.clear();
+    return refill(compute, {});
+}
+
 std::uint32_t ExpertResidency::settle_return(cudaStream_t compute, std::size_t displaced_from) {
     // The experts the run displaced come back first: prefill calls promote nothing, so they are
     // the set decode had before the prompt. Refilling by score alone took the experts the prompt's

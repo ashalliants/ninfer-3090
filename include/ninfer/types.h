@@ -647,6 +647,11 @@ struct FlashNextOptions {
         std::uint32_t den = 1;
     };
     Fraction prefill_cpu_share{};
+    // Prefill calls of at most this many columns hand the CPU every miss it can take (share 1),
+    // whatever prefill_cpu_share is (--prefill-cpu-all-columns; needs a nonzero share). Their
+    // missed experts are routed few tokens each, which the CPU computes faster than a slow PCIe link
+    // copies the experts. 0 (the default) is off. The same output, bit for bit.
+    std::uint32_t prefill_cpu_all_columns = 0;
     // Run an MTP verification commit's GDN replay fold (the accepted columns folded into the
     // recurrent state) on a stream of its own (--gdn-async-commit; needs --spec mtp), beside the
     // drafter's catch-up and next drafts and the host's work; the next round's forward waits for it.

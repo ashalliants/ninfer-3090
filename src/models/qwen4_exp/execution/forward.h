@@ -442,6 +442,9 @@ public:
     // The workspace later calls allocate from (a wide prefill call's lent arena, or the static one).
     // Not between run_front and run_back: the front's residual lives in the workspace.
     void use_workspace(WorkspaceArena& work) noexcept { work_ = &work; }
+    // The next prefill calls' CPU share (ForwardBatch::cpu_share) takes every miss of at most 8
+    // columns, as a streamed call's does, instead of the channel's share (--prefill-cpu-all-columns).
+    void set_prefill_cpu_all(bool all) noexcept { prefill_cpu_all_ = all; }
 
     // The same call in two parts: run_front(batch, end) runs the embedding and layers [0, end), at
     // most up to rows_layer(), so it reads no batch.ngram_rows (a caller may still be writing them,
@@ -595,6 +598,7 @@ private:
     ForwardState state_;
     ForwardKV kv_;
     ForwardExperts experts_;
+    bool prefill_cpu_all_ = false;
     std::optional<ForwardMtp> mtp_;
     std::unique_ptr<SideStream> side_; // set with ForwardOptions::shared_expert_stream
     // ForwardOptions::hot_embedding_rows and its planes (0: parameters_.token_embedding).

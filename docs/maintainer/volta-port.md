@@ -240,6 +240,21 @@ are unchanged. The per-column work was the larger cost at verify widths:
 Bench pair at T = 1 / 4: 43.3 / 75.4 -> 41.2 / 60.9 us, bit-identical at T = 1-16. MTP3 decode
 72.4 -> 74.0 tok/s.
 
+Working with the 3.3 GB/s eGPU link (Flash-Next, measured 2026-11-17):
+- In steady decode the link costs almost nothing: the expert cache hits 99.6-100% and
+  `stage_kernel` is ~5 us a call. The link matters for prefill and for refilling the cache.
+- A warm start restores half the cache's frames (`kSeedShare`). The first wide prefill's give-back
+  then refilled every free frame, ~12 GiB, about 4 s here, and the next request waited it out (a
+  19-token prompt took 4.5 s). On a link below half the 27.5 GB/s reference, the Program now issues
+  that fill in the background right after the warm start (`fill_free_frames_on_slow_link`). Prompts
+  of 342 / 939 tokens prefill in 1.3 / 3.7 s instead of 3.3 / 5.4 s, the first requests decode at
+  94-99% hits instead of 80-87%, and the 2K bench prefills at 333 tok/s instead of 301.
+- A missed expert costs ~450 us to copy (1.5 MB). Computing it on the CPU costs less while it sees
+  few tokens, as in short prompts. `--prefill-cpu-all-columns N` gives the CPU every miss it can
+  take in prefill calls of at most N tokens; `run-v100.sh` sets 1024. A short prompt's TTFT drops
+  from ~300 to ~250 ms, while 2K prompts keep share 0.4 (share 1 there: 333 -> 326 tok/s, and
+  1,852 tokens 4.95 -> 5.52 s).
+
 Serving on a V100: `scripts/run-v100.sh <model>` is run.sh with the V100's defaults (the sm_70
 server from build-v100/, the memory-lock fallback, a GPU check). For Flash-Next it keeps run.sh's
 `tuned` profile, which measured best here: MTP3 decode 68.9 tok/s and a 2K-token prefill 293 tok/s
