@@ -962,8 +962,10 @@ struct ExecutionOptions {
     // Return the log-probability of each generated token and of its `*logprobs_top_k` most likely
     // alternatives (0 returns the generated token's alone), in GenerationResult::token_logprobs.
     // The distribution is the model's own: a softmax over the raw logits, before temperature,
-    // penalties, filters and grammar masks. Only the first generated token is supported, so a
-    // request that sets this must ask for exactly one output token. Max kMaxLogprobsTopK.
+    // penalties, filters and grammar masks. Every generated token gets an entry (the stop token
+    // included), so the list lines up with generated_token_ids. Not available together with a
+    // thinking budget or a reasoning-loop guard, whose inserted control tokens have none.
+    // Max kMaxLogprobsTopK.
     std::optional<std::uint32_t> logprobs_top_k;
 };
 
@@ -1727,7 +1729,8 @@ struct GenerationResult {
     std::uint64_t engine_request_id = 0;
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
-    // One entry per generated token when ExecutionOptions::logprobs_top_k was set, else empty.
+    // One entry per generated token (aligned with generated_token_ids) when
+    // ExecutionOptions::logprobs_top_k was set, else empty.
     std::vector<TokenLogprob> token_logprobs;
     std::string content;
     std::string reasoning;

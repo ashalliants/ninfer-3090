@@ -547,7 +547,6 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (plan.persistent.sampling_config) {
         sampling_config = plan.persistent.sampling_config->bind(backing);
     }
-    logprobs_scratch = DeviceBuffer(kLogprobsScratchBytes);
     if (plan.persistent.grammar_masks) {
         grammar_masks_device = plan.persistent.grammar_masks->bind(backing);
         grammar_masks_host.emplace(grammar_masks_device.bytes());

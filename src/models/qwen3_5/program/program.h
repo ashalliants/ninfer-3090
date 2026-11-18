@@ -300,7 +300,7 @@ public:
           row_counts_(other.row_counts_), row_stride_(other.row_stride_), timing_(other.timing_),
           constraint_failed_(other.constraint_failed_),
           token_domain_failed_(other.token_domain_failed_),
-          first_token_logprobs_(std::move(other.first_token_logprobs_)) {
+          token_logprobs_(std::move(other.token_logprobs_)) {
         other.tokens_     = {};
         other.row_counts_ = {};
         other.row_stride_ = 0;
@@ -329,12 +329,10 @@ public:
         return token_domain_failed_.at(row);
     }
 
-    // The first generated token's log-probabilities, on a prefill Begin row whose request asked
-    // for them. The Engine takes them when it commits the token.
-    [[nodiscard]] const std::optional<runtime::TokenLogprobs>&
-    first_token_logprobs(std::size_t row) const noexcept {
-        static const std::optional<runtime::TokenLogprobs> none;
-        return row == 0 ? first_token_logprobs_ : none;
+    // The log-probabilities of the row's licensed tokens, in order, when its request asked for
+    // them; empty otherwise. The Engine takes the entries of the tokens it commits.
+    [[nodiscard]] std::span<const runtime::TokenLogprobs> token_logprobs(std::size_t row) const {
+        return token_logprobs_.at(row);
     }
 
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
@@ -350,8 +348,7 @@ private:
     runtime::ExecutionTiming timing_;
     std::array<bool, kMaximumConcurrency> constraint_failed_{};
     std::array<bool, kMaximumConcurrency> token_domain_failed_{};
-    // Set only by a single-row prefill Begin pending batch.
-    std::optional<runtime::TokenLogprobs> first_token_logprobs_;
+    std::array<std::vector<runtime::TokenLogprobs>, kMaximumConcurrency> token_logprobs_;
 
     friend struct detail::ContractAccess;
 };

@@ -651,13 +651,24 @@ public:
     std::vector<std::weak_ptr<const GapMap>> gap_map_registry;
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
-    // The first token's log-probabilities, written by the prefill step that samples it (see
-    // execution::LogprobsOutput): chosen at 0, the top ids at kLogprobsIdsOffset and the top values
-    // at kLogprobsValuesOffset, each up to ops::kTopLogprobsMaxK long.
-    static constexpr std::size_t kLogprobsIdsOffset    = 64;
-    static constexpr std::size_t kLogprobsValuesOffset = 192;
-    static constexpr std::size_t kLogprobsScratchBytes = 320;
+    // Token log-probabilities (ops::top_logprobs) for the requests that asked. A step or round that
+    // produces tokens for such a request enqueues the Op on the logits it just used and reads the
+    // result back once it has synchronized; the entries wait in round_logprobs, by row, until
+    // wrap_pending hands them to the PendingBatch.
     DeviceBuffer logprobs_scratch;
+    std::array<std::vector<runtime::TokenLogprobs>, kMaximumConcurrency> round_logprobs;
+    // Views over the scratch for `columns` columns of `k` alternatives; grows it on first need.
+    [[nodiscard]] qwen3_5::LogprobsOutput logprobs_views(std::uint32_t columns, std::uint32_t k);
+    // The largest top-k any of the lanes' requests asked for; empty when none did.
+    [[nodiscard]] std::optional<std::uint32_t>
+    round_logprobs_top_k(std::span<const std::uint32_t> lanes) const;
+    // Enqueues the Op over `columns` leading columns of `logits` for the sampled/licensed `tokens`.
+    void enqueue_logprobs(const Tensor& logits, const Tensor& tokens,
+                          const qwen3_5::LogprobsOutput& output);
+    // After the round has synchronized: row r's first counts[r] columns, from column r * stride (a
+    // null `counts` means one each), into round_logprobs[r] for the rows whose request asked.
+    void read_logprobs(std::span<const std::uint32_t> lanes, const qwen3_5::LogprobsOutput& output,
+                       std::uint32_t stride, const std::int32_t* counts);
     Tensor grammar_masks_device;
     std::optional<PinnedHostBuffer> grammar_masks_host;
     std::optional<DFlashDraftHandoff> dflash_draft_handoff;

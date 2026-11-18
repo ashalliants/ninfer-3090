@@ -11,6 +11,7 @@
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scatter.h"
+#include "ninfer/ops/top_logprobs.h"
 
 #include <algorithm>
 #include <array>
@@ -446,6 +447,14 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
         mark_workspace_usage(workspace_plan.ordinary_round);
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                          envelope, executable);
+        // Token log-probabilities for the rows that asked, from the logits the sampler just read.
+        std::optional<qwen3_5::LogprobsOutput> logprobs;
+        if (const auto top_k = round_logprobs_top_k(lanes)) {
+            const auto batch = static_cast<std::int32_t>(lanes.size());
+            logprobs.emplace(logprobs_views(static_cast<std::uint32_t>(batch), *top_k));
+            enqueue_logprobs(io.ordinary->logits.slice(1, 0, batch),
+                             io.ordinary->sampled_tokens.slice(0, 0, batch), *logprobs);
+        }
         submit_range.reset();
         timing.begin_wait();
         {
@@ -455,6 +464,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
         }
         timing.end_wait();
         report_numeric_tripwire();
+        if (logprobs) { read_logprobs(lanes, *logprobs, 1, nullptr); }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -625,6 +635,22 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         }
         execution::mtp_decode_batch(schedule_state, batch, draft_window, envelopes, finish,
                                     execution::SpeculativePhase::Finish);
+        // Token log-probabilities for the rows that asked: the target's verify logits, one column
+        // per licensed position (row-major, `width` columns a row).
+        std::optional<qwen3_5::LogprobsOutput> logprobs;
+        if (const auto top_k = round_logprobs_top_k(lanes)) {
+            const std::int32_t columns = static_cast<std::int32_t>(width) * batch;
+            const auto& frame          = *io.mtp_decode;
+            logprobs.emplace(logprobs_views(static_cast<std::uint32_t>(columns), *top_k));
+            enqueue_logprobs(Tensor(frame.target_logits.data, DType::BF16,
+                                    {frame.target_logits.ne[0],
+                                     frame.target_logits.ne[1] * frame.target_logits.ne[2]})
+                                 .slice(1, 0, columns),
+                             Tensor(frame.licensed_tokens.data, DType::I32,
+                                    {frame.licensed_tokens.ne[0] * frame.licensed_tokens.ne[1]})
+                                 .slice(0, 0, columns),
+                             *logprobs);
+        }
         submit_range.reset();
         timing.begin_wait();
         {
@@ -634,6 +660,9 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         }
         timing.end_wait();
         report_numeric_tripwire();
+        if (logprobs) {
+            read_logprobs(lanes, *logprobs, width, mtp_host_egress->licensed_counts.data());
+        }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -987,6 +1016,22 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         execution::dflash_decode_batch(schedule_state, batch, verify_drafts, envelopes,
                                        target_envelope, finish,
                                        execution::SpeculativePhase::Finish);
+        // Token log-probabilities for the rows that asked: the target's verify logits, one column
+        // per licensed position (row-major, `width` columns a row) at this round's width.
+        std::optional<qwen3_5::LogprobsOutput> logprobs;
+        if (const auto top_k = round_logprobs_top_k(lanes)) {
+            const std::int32_t columns = static_cast<std::int32_t>(width) * batch;
+            const auto frame           = io.dflash_decode->narrowed(verify_drafts);
+            logprobs.emplace(logprobs_views(static_cast<std::uint32_t>(columns), *top_k));
+            enqueue_logprobs(Tensor(frame.target_logits.data, DType::BF16,
+                                    {frame.target_logits.ne[0],
+                                     frame.target_logits.ne[1] * frame.target_logits.ne[2]})
+                                 .slice(1, 0, columns),
+                             Tensor(frame.licensed_tokens.data, DType::I32,
+                                    {frame.licensed_tokens.ne[0] * frame.licensed_tokens.ne[1]})
+                                 .slice(0, 0, columns),
+                             *logprobs);
+        }
         submit_range.reset();
         timing.begin_wait();
         {
@@ -996,6 +1041,9 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         }
         timing.end_wait();
         report_numeric_tripwire();
+        if (logprobs) {
+            read_logprobs(lanes, *logprobs, width, dflash_host_egress->licensed_counts.data());
+        }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         if (!copy_round && draft_window_selector.enabled()) {
@@ -1103,6 +1151,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_raw(
     std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,
     runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks) {
     token_domain_faults.fill(false);
+    for (auto& entries : round_logprobs) { entries.clear(); }
     if (speculative_backend == SpeculativeBackend::None) {
         return decode_ordinary_batch(lanes, budgets, failed_timing, masks);
     }

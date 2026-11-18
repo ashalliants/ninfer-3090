@@ -392,6 +392,17 @@ struct DFlashDecodeState {
     [[nodiscard]] DFlashDecodeState narrowed(std::uint32_t k) const;
 };
 
+// Where token log-probabilities go (ops::top_logprobs), for a request that asked for them: device
+// tensors the Program owns and reads back once the round has synchronized. chosen is FP32
+// [columns], top_ids I32 [k,columns] and top_logprobs FP32 [k,columns].
+struct LogprobsOutput {
+    std::int32_t k       = 0;
+    std::int32_t columns = 0;
+    Tensor chosen;
+    Tensor top_ids;
+    Tensor top_logprobs;
+};
+
 struct RoundState {
     std::optional<OrdinaryDecodeState> ordinary;
     std::optional<ScoreDecodeState> score_decode;

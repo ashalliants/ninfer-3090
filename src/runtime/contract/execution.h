@@ -90,9 +90,6 @@ struct PrefillStepResult {
     GeneratedRound round;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
-    // The first generated token's log-probabilities, when the request asked for them and this step
-    // sampled that token.
-    std::optional<TokenLogprobs> first_token_logprobs;
     // Part of one chunk ran (a sliced step): no prompt tokens are processed yet, and the next
     // advance_prefill for the lane runs the next slice.
     bool partial = false;

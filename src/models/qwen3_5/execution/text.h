@@ -32,16 +32,6 @@ enum class GdnStateAction : std::uint8_t {
     RecordForReplay,
 };
 
-// Where the first generated token's log-probabilities go (ops::top_logprobs), for a request that
-// asked for them. Device tensors the Program owns and reads back once the prefill step has
-// synchronized: chosen is FP32 [1], top_ids I32 [k,1], top_logprobs FP32 [k,1].
-struct LogprobsOutput {
-    std::int32_t k = 0;
-    Tensor chosen;
-    Tensor top_ids;
-    Tensor top_logprobs;
-};
-
 struct NullTap {
     static constexpr bool enabled = false;
 };

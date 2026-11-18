@@ -671,6 +671,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         }
         if (!prepared.enable_thinking) {
             request_options.execution.thinking.budget.reset();
+            request_options.execution.thinking.loop = ninfer::ReasoningLoopAction::Off;
             prepared.thinking_budget.reset();
             prepared.effective_thinking_budget.reset();
         }

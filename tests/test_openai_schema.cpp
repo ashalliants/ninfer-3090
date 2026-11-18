@@ -181,7 +181,6 @@ int test_standard_field_policy() {
 
     rejected("n", 2, "n_not_supported");
     rejected("logit_bias", Json{{"12", 1}}, "logit_bias_not_supported");
-    rejected("logprobs", true, "logprobs_not_supported");
     rejected("top_logprobs", 2, "");
     rejected("modalities", Json::array({"text", "audio"}), "modality_not_supported");
     rejected("web_search_options", Json::object(), "web_search_not_supported");
@@ -1167,8 +1166,8 @@ int test_logprobs_request() {
     int failures = 0;
 
     const OpenAIChatRequest accepted = parse(logprobs_request(Json{{"top_logprobs", 5}}));
-    failures += check(accepted.generation.logprobs_top_k == 5U,
-                      "logprobs with a one-token budget requests the top alternatives");
+    failures +=
+        check(accepted.generation.logprobs_top_k == 5U, "logprobs request the top alternatives");
     failures += check(parse(logprobs_request()).generation.logprobs_top_k == 0U,
                       "logprobs without top_logprobs requests the chosen token only");
     failures +=
@@ -1182,13 +1181,13 @@ int test_logprobs_request() {
         const ApiError error = api_error([&] { (void)parse(std::move(body)); });
         return error.param == param && error.code == code;
     };
-    failures += check(rejected_with(logprobs_request(Json{{"max_tokens", 2}}), "logprobs",
-                                    "logprobs_not_supported"),
-                      "logprobs with more than one output token is refused");
+    failures += check(parse(logprobs_request(Json{{"max_tokens", 64}, {"top_logprobs", 3}}))
+                              .generation.logprobs_top_k == 3U,
+                      "logprobs are accepted for a request with a longer output budget");
     Json no_limit        = base_request();
     no_limit["logprobs"] = true;
-    failures += check(rejected_with(no_limit, "logprobs", "logprobs_not_supported"),
-                      "logprobs without an explicit one-token limit is refused");
+    failures += check(parse(no_limit).generation.logprobs_top_k == 0U,
+                      "logprobs are accepted without an explicit output limit");
     failures += check(rejected_with(logprobs_request(Json{{"stream", true}}), "logprobs",
                                     "logprobs_not_supported"),
                       "streamed logprobs are refused");

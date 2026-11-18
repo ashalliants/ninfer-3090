@@ -77,10 +77,12 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
             throw std::invalid_argument("logprobs_top_k must be at most " +
                                         std::to_string(kMaxLogprobsTopK));
         }
-        if (options.execution.requested_output_tokens != 1) {
+        if (options.execution.thinking.budget ||
+            options.execution.thinking.loop != ReasoningLoopAction::Off) {
+            // The Engine inserts control tokens when a thinking budget or loop guard closes the
+            // reasoning; no model distribution produced them, so they have no log-probability.
             throw std::invalid_argument(
-                "logprobs are available for a single generated token only: request exactly one "
-                "output token");
+                "logprobs cannot be combined with a thinking budget or a reasoning-loop guard");
         }
     }
     resolved.stop                              = std::move(options.stop);

@@ -83,10 +83,10 @@ public:
     // for any other, the option is refused at startup and the Engine never takes the path.
     using ProgramType = typename ModelContract::Program;
     using BasePlan    = typename ModelContract::RequestBasePlan;
-    // First-token logprobs need a Program whose pending batch can carry them (the Qwen3.5 one).
+    // Token logprobs need a Program whose pending batch can carry them (the Qwen3.5 one).
     static constexpr bool kLogprobsCapable =
         requires(const typename ModelContract::PendingBatch& pending) {
-            pending.first_token_logprobs(std::size_t{});
+            pending.token_logprobs(std::size_t{});
         };
     static constexpr bool kLossyCapable =
         requires(ProgramType& program, const ProgramType& view, const BasePlan& plan,
@@ -1266,6 +1266,12 @@ private:
         result.scheduling.host_to_device_bytes = request->host_to_device_bytes;
         result.prompt                          = request->prompt_summary;
         result.generated_token_ids             = std::move(request->generated);
+        if (request->options.execution.logprobs_top_k &&
+            request->token_logprobs.size() != result.generated_token_ids.size()) {
+            // Every token path attaches its entries, so a mismatch is a bug; a misaligned list
+            // would silently label tokens with the wrong probabilities.
+            throw std::logic_error("generated tokens and their logprobs are out of step");
+        }
         for (std::size_t index = 0; index < request->token_logprobs.size(); ++index) {
             const TokenLogprobs& logprobs = request->token_logprobs[index];
             const auto entry              = [&](TokenId token, float logprob) {
@@ -1608,12 +1614,16 @@ private:
                 request->generated.insert(request->generated.end(), first,
                                           first + static_cast<std::ptrdiff_t>(accepted));
                 if constexpr (kLogprobsCapable) {
-                    // Only a prefill Begin row carries them, and it licenses exactly one token.
-                    if (const auto& logprobs = pending.first_token_logprobs(row); logprobs) {
-                        if (accepted != 1 || request->generated.size() != 1) {
-                            throw std::logic_error("first-token logprobs on a multi-token commit");
+                    // A row whose request asked carries one entry per licensed token, in order;
+                    // the committed tokens are the first `accepted` of them.
+                    if (request->options.execution.logprobs_top_k) {
+                        const auto logprobs = pending.token_logprobs(row);
+                        if (logprobs.size() < accepted) {
+                            throw std::logic_error("a committed token has no logprobs");
                         }
-                        request->token_logprobs.push_back(*logprobs);
+                        request->token_logprobs.insert(
+                            request->token_logprobs.end(), logprobs.begin(),
+                            logprobs.begin() + static_cast<std::ptrdiff_t>(accepted));
                     }
                 }
             }
