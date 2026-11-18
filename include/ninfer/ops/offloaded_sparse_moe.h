@@ -107,7 +107,11 @@ namespace offloaded_moe {
 
 inline constexpr int kHidden       = 2560;
 inline constexpr int kIntermediate = 640;
-inline constexpr int kMaxColumns   = 8; // columns of one CPU-served expert
+inline constexpr int kMaxColumns   = 8; // columns of one CPU-served expert (one request slot)
+// The widest job a channel may hand the CPU (MoeCpuChannel::max_job_columns): a job of w > 8
+// columns takes ceil(w / 8) consecutive request slots of the same expert, 8 columns each and the
+// last the rest. Every column's output is the same bits in any grouping.
+inline constexpr int kMaxCpuSplitColumns = 64;
 
 inline constexpr int kMaxCpuJobs        = 512;  // CPU-served experts per layer call
 inline constexpr int kMaxCpuCallColumns = 4096; // columns of a CPU-served call
@@ -269,7 +273,9 @@ struct MoeCpuChannel {
     std::int32_t max_jobs               = 0; // 0 disables
     std::int32_t max_columns            = 0;
     std::int32_t pcie_divisor           = 3;
-    std::int32_t max_job_columns        = offloaded_moe::kMaxColumns; // 1..kMaxColumns
+    // 1..kMaxCpuSplitColumns; a job wider than kMaxColumns takes ceil(width / 8) request slots, and
+    // max_jobs bounds the slots.
+    std::int32_t max_job_columns        = offloaded_moe::kMaxColumns;
     // The share rule (prefill calls): 0 <= share_num <= share_den; share_den == 0 keeps the divisor.
     // Two 16-bit words in the struct's tail padding, so its size and every kernel's parameter
     // offsets are unchanged.

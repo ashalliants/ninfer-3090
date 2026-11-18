@@ -510,6 +510,8 @@ struct ProgramOptions {
     // FlashNextOptions::prefill_cpu_all_columns: a cpu_share call of at most this many columns uses
     // share 1 / 1 instead (the channel's rule, and its stream's cold set). 0: off.
     std::uint32_t prefill_cpu_all_columns = 0;
+    // FlashNextOptions::prefill_cpu_max_columns: the prefill channel's max_job_columns (1..64).
+    std::uint32_t prefill_cpu_max_columns = 8;
     // FlashNextOptions::gdn_async_commit: a verification commit the row continues from folds its
     // GDN columns on the Program's fold stream (gdn_fold_on_side_stream); every later device use of
     // the state (the next round's front, any other entry point) waits for it. Requires MTP

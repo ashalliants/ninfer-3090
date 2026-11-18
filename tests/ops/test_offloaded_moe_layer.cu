@@ -808,7 +808,8 @@ void test_host_silent() {
 // The CPU leg of a verification call (--cpu-verify-misses), in the Forward's order: moe_experts with
 // wait_for_cpu == false, unrelated work on the stream (the shared expert), then moe_experts_cpu_wait.
 // The outputs equal the CPU engine's, eagerly and from a replayed graph; the request the call
-// publishes is select_cpu_jobs of the call's dispatch and residency.
+// publishes is select_cpu_jobs of the call's dispatch and residency, expanded into request slots
+// (cpu_request_slots: a job wider than 8 columns, max_job_columns permitting, takes several).
 void test_cpu_verify_leg() {
     std::mt19937 rng(606);
     constexpr int kExperts = 64, kTopK = 10, kStagingSlots = 4;
@@ -824,11 +825,14 @@ void test_cpu_verify_leg() {
     };
     int published = 0;
     for (const Leg& leg : {Leg{"4 jobs, divisor 3", 3, 4, 3, om::kMaxColumns, 6},
-                           Leg{"every miss", 4, 64, 0, om::kMaxColumns, 6}, Leg{"2-column jobs", 3, 3, 3, 2, 1}}) {
+                           Leg{"every miss", 4, 64, 0, om::kMaxColumns, 6}, Leg{"2-column jobs", 3, 3, 3, 2, 1},
+                           Leg{"split jobs", 4, 256, 0, om::kMaxCpuSplitColumns, 6},
+                           Leg{"split jobs, 9 slots", 5, 9, 0, om::kMaxCpuSplitColumns, 3}}) {
+        const bool split = leg.max_job_columns > om::kMaxColumns;
         om::CpuMissService::Options o;
         o.workers         = leg.workers;
         o.max_jobs        = leg.cap;
-        o.max_columns     = 16;
+        o.max_columns     = split ? 64 : 16;
         o.pcie_divisor    = leg.divisor;
         o.max_job_columns = leg.max_job_columns;
         om::CpuMissService service({{bank.pinned->host, bank.stride, bank.format}}, o);
@@ -844,7 +848,10 @@ void test_cpu_verify_leg() {
         Pinned error(64);
         auto* error_word = reinterpret_cast<volatile std::uint32_t*>(error.host);
         *error_word      = 0;
-        for (const int columns : g_small ? std::vector<int>{2, 8} : std::vector<int>{2, 3, 8, 16}) {
+        // Wide calls route experts more than 8 columns for the split legs.
+        const std::vector<int> widths_of_calls = split ? (g_small ? std::vector<int>{48} : std::vector<int>{16, 48, 64})
+                                                       : (g_small ? std::vector<int>{2, 8} : std::vector<int>{2, 3, 8, 16});
+        for (const int columns : widths_of_calls) {
             const std::string label = std::string(leg.name) + " T=" + std::to_string(columns);
             std::vector<float> f32;
             (void)random_logits(kExperts, columns, rng, f32);
@@ -881,6 +888,7 @@ void test_cpu_verify_leg() {
             std::vector<std::int32_t> widths;
             for (const int e : experts) { widths.push_back(offsets[e + 1] - offsets[e]); }
             const auto chosen = om::select_cpu_jobs(experts, widths, resident, leg.cap, leg.divisor, leg.max_job_columns);
+            const auto slots  = om::cpu_request_slots(chosen, widths);
             std::vector<int> compact(static_cast<std::size_t>(columns), -1);
             {
                 std::vector<bool> used(static_cast<std::size_t>(columns), false);
@@ -900,14 +908,16 @@ void test_cpu_verify_leg() {
                     return;
                 }
                 check(sequence != before, at + ": the call published no request");
-                check(q.layer == 0 && q.jobs == static_cast<int>(chosen.size()),
-                      at + ": the request's job count differs from select_cpu_jobs");
-                for (std::size_t i = 0; i < chosen.size() && i < static_cast<std::size_t>(q.jobs); ++i) {
-                    const int e = experts[static_cast<std::size_t>(chosen[i])];
-                    check(q.expert[i] == e && q.ncols[i] == widths[static_cast<std::size_t>(chosen[i])],
+                check(q.layer == 0 && q.jobs == static_cast<int>(slots.size()),
+                      at + ": the request's slot count differs from select_cpu_jobs");
+                for (std::size_t i = 0; i < slots.size() && i < static_cast<std::size_t>(q.jobs); ++i) {
+                    const int j  = slots[i].job, c0 = slots[i].column;
+                    const int e  = experts[static_cast<std::size_t>(j)];
+                    const int nc = std::min(om::kMaxColumns, widths[static_cast<std::size_t>(j)] - c0);
+                    check(q.expert[i] == e && q.ncols[i] == nc,
                           at + ": slot " + std::to_string(i) + " differs from select_cpu_jobs");
                     for (int c = 0; c < q.ncols[i] && c < om::kMaxColumns; ++c) {
-                        check(q.column[i][c] == compact[static_cast<std::size_t>(entries[offsets[e] + c] / kTopK)],
+                        check(q.column[i][c] == compact[static_cast<std::size_t>(entries[offsets[e] + c0 + c] / kTopK)],
                               at + ": slot " + std::to_string(i) + " column " + std::to_string(c) + " is not compacted");
                     }
                 }
@@ -945,12 +955,14 @@ void test_cpu_verify_leg() {
             cuda_ok(cudaGraphExecDestroy(exec), "destroy exec");
             cuda_ok(cudaGraphDestroy(graph), "destroy graph");
             check(service.failure().empty(), label + ": the CPU service failed: " + service.failure());
-            check(service.served_experts() - served == 3 * chosen.size(),
-                  label + ": the service did not serve select_cpu_jobs' experts on each of the three calls");
+            check(service.served_experts() - served == 3 * slots.size(),
+                  label + ": the service did not serve select_cpu_jobs' slots on each of the three calls");
+            int widest = 0;
+            for (const int j : chosen) { widest = std::max(widest, widths[static_cast<std::size_t>(j)]); }
             published += chosen.empty() ? 0 : 1;
-            std::printf("cpu_verify_leg %s: %zu of %d jobs on the CPU, outputs bit-identical eagerly and in two "
-                        "replays, request = select_cpu_jobs\n",
-                        label.c_str(), chosen.size(), jobs);
+            std::printf("cpu_verify_leg %s: %zu of %d jobs on the CPU in %zu slots (widest %d), outputs "
+                        "bit-identical eagerly and in two replays, request = select_cpu_jobs\n",
+                        label.c_str(), chosen.size(), jobs, slots.size(), widest);
         }
     }
     check(published > 0, "cpu_verify_leg: no call handed the CPU any expert");

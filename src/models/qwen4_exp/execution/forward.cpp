@@ -951,12 +951,16 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     if (cpu && cpu_leg == &experts_.prefill_cpu && prefill_cpu_all_) { // set_prefill_cpu_all
         source.cpu.share_num = 1;
         source.cpu.share_den = 1;
+        // Every miss of a short call goes to the CPU: at most 8 columns each, or the CPU would take
+        // the wide ones too and become the call's bottleneck (308-token prompts: +10%).
+        source.cpu.max_job_columns = std::min(source.cpu.max_job_columns, ops::offloaded_moe::kMaxColumns);
     }
     ExpertStream* stream = experts_.stream != nullptr && experts_.stream->active() ? experts_.stream : nullptr;
     if (stream != nullptr) {
         source.frames = stream->table(layer);
         // A streamed call's misses are the cold set its stream left out (which already encodes the
-        // prefill share) and any experts beyond the ring: the CPU takes every one of at most 8 columns.
+        // prefill share) and any experts beyond the ring: the CPU takes every one of at most the
+        // channel's max_job_columns (--prefill-cpu-max-columns), slots permitting.
         if (cpu && cpu_leg == &experts_.prefill_cpu) {
             source.cpu.share_num = 1;
             source.cpu.share_den = 1;

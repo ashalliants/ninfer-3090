@@ -34,14 +34,15 @@ inline int cpu_share_take(int streamed_experts, int candidates, int num, int den
 
 /// The prefill share's choice. The call's jobs are job_experts[j] with job_rows[j] rows (columns)
 /// each; resident[e] != 0 when expert e has a device frame. Of the n non-resident jobs, those with
-/// at most max_rows rows are the candidates, ordered by (rows, expert id); the first
-/// min(cap, cpu_share_take(n, candidates, num, den)) go to the CPU. Returns their indices into
-/// job_experts in that order (the request's slots). cap is the channel's max_jobs.
+/// at most max_rows rows (up to kMaxCpuSplitJobColumns) are the candidates, ordered by (rows, expert
+/// id); the first min(cap, cpu_share_take(n, candidates, num, den)) whose slots (cpu_job_slots) fit
+/// in cap go to the CPU. Returns their indices into job_experts in that order (cpu_request_slots
+/// expands them into the request's slots). cap is the channel's max_jobs.
 inline std::vector<int> select_prefill_cpu_jobs(std::span<const std::int32_t> job_experts,
                                                 std::span<const std::int32_t> job_rows,
                                                 std::span<const std::uint8_t> resident, int num, int den,
                                                 int max_rows = kMaxCpuJobColumns, int cap = INT_MAX) {
-    if (job_experts.size() != job_rows.size() || cap < 0 || max_rows < 1 || max_rows > kMaxCpuJobColumns) {
+    if (job_experts.size() != job_rows.size() || cap < 0 || max_rows < 1 || max_rows > kMaxCpuSplitJobColumns) {
         throw std::invalid_argument("select_prefill_cpu_jobs: inconsistent jobs or options out of range");
     }
     int misses = 0;
@@ -59,9 +60,8 @@ inline std::vector<int> select_prefill_cpu_jobs(std::span<const std::int32_t> jo
         const auto ra = job_rows[static_cast<std::size_t>(a)], rb = job_rows[static_cast<std::size_t>(b)];
         return ra != rb ? ra < rb : job_experts[static_cast<std::size_t>(a)] < job_experts[static_cast<std::size_t>(b)];
     });
-    const int take = std::min(cap, cpu_share_take(misses, static_cast<int>(candidates.size()), num, den));
-    candidates.resize(static_cast<std::size_t>(take));
-    return candidates;
+    const int want = std::min(cap, cpu_share_take(misses, static_cast<int>(candidates.size()), num, den));
+    return take_cpu_slots(std::move(candidates), job_rows, want, cap);
 }
 
 /// The prefill share of a streamed call, chosen before routing (the expert stream copies a layer's
@@ -69,7 +69,8 @@ inline std::vector<int> select_prefill_cpu_jobs(std::span<const std::int32_t> jo
 /// them); the stream would copy min(n, capacity) of them. Of the n, the
 /// cpu_share_take(s, s, num, den) with s = min(n, capacity) that have the lowest prior use counts
 /// (counts[e]; ties to the lower id) are predicted cold: the stream leaves them out, so they stay
-/// misses for the call, whose channel then takes every one routed at most 8 rows (the device rule
+/// misses for the call, whose channel then takes every one routed at most max_job_columns rows (8
+/// unless the channel splits wider jobs, kMaxCpuSplitJobColumns; the device rule
 /// above at share 1 / 1: select_prefill_cpu_jobs(..., 1, 1, ...)).
 /// Returns their ids, ascending. num 0 returns none.
 inline std::vector<std::int32_t> select_stream_cold(std::span<const std::int32_t> frames,

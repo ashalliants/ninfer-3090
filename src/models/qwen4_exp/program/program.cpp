@@ -630,6 +630,10 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
         throw std::invalid_argument(
             "Qwen3.8-Flash-Next: --prefill-cpu-share must be a fraction in [0, 1] (denominator 1..32767)");
     }
+    if (o.prefill_cpu_max_columns < 1 ||
+        o.prefill_cpu_max_columns > static_cast<std::uint32_t>(ops::offloaded_moe::kMaxCpuSplitColumns)) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: --prefill-cpu-max-columns must be 1..64");
+    }
     if (o.gdn_async_commit && o.mtp_draft_tokens == 0) {
         throw std::invalid_argument("Qwen3.8-Flash-Next: --gdn-async-commit folds MTP verification commits on a side "
                                     "stream and needs --spec mtp: add --spec mtp or remove --gdn-async-commit");
@@ -1201,6 +1205,7 @@ public:
                     prefill.max_columns        = p.prefill_columns;
                     prefill.share_num          = static_cast<std::int16_t>(p.share_num);
                     prefill.share_den          = static_cast<std::int16_t>(p.share_den);
+                    prefill.max_job_columns    = static_cast<std::int32_t>(options_.prefill_cpu_max_columns);
                     experts.prefill_cpu.push_back(prefill);
                 }
             }

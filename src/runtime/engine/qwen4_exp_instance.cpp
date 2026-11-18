@@ -394,6 +394,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.prefill_cpu_share_num = next.prefill_cpu_share.num;
     program_options.prefill_cpu_share_den = next.prefill_cpu_share.den;
     program_options.prefill_cpu_all_columns = next.prefill_cpu_all_columns;
+    program_options.prefill_cpu_max_columns = next.prefill_cpu_max_columns;
     program_options.gdn_async_commit      = next.gdn_async_commit;
     program_options.hc_int8               = next.hc_int8;
     program_options.hc_fused_read         = next.hc_fused_read;

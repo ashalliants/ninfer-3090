@@ -658,6 +658,11 @@ struct FlashNextOptions {
     // missed experts are routed few tokens each, which the CPU computes faster than a slow PCIe link
     // copies the experts. 0 (the default) is off. The same output, bit for bit.
     std::uint32_t prefill_cpu_all_columns = 0;
+    // The widest miss of a prefill call the CPU takes (--prefill-cpu-max-columns, 1..64; needs a
+    // nonzero share). A miss wider than 8 columns goes as ceil(columns / 8) jobs of 8, so a cold
+    // expert routed many tokens is computed beside the GPU instead of copied over PCIe inside its
+    // layer. 8 (the default) keeps the CPU job width. The same output, bit for bit.
+    std::uint32_t prefill_cpu_max_columns = 8;
     // Run an MTP verification commit's GDN replay fold (the accepted columns folded into the
     // recurrent state) on a stream of its own (--gdn-async-commit; needs --spec mtp), beside the
     // drafter's catch-up and next drafts and the host's work; the next round's forward waits for it.

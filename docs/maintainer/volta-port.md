@@ -265,6 +265,30 @@ Working with the 3.3 GB/s eGPU link (Flash-Next, measured 2026-11-17):
   take in prefill calls of at most N tokens; `run-v100.sh` sets 1024. A short prompt's TTFT drops
   from ~300 to ~250 ms, while 2K prompts keep share 0.4 (share 1 there: 333 -> 326 tok/s, and
   1,852 tokens 4.95 -> 5.52 s).
+- Longer calls hit a different limit: a cold expert routed more than 8 tokens used to be too wide
+  for a CPU job, so it was copied (`stage_kernel`) inside its layer, on the critical path (740 ms
+  of a 3.9K-token prompt). `--prefill-cpu-max-columns N` (1..64) lets the CPU take a miss of up to
+  N columns as ceil(N / 8) request slots of the same expert (`cpu_plan_kernel` publishes them,
+  `cpu_wait_kernel` places each slot's columns; the bits are the same in any grouping). Calls that
+  give the CPU every miss (`--prefill-cpu-all-columns`) keep 8 columns, or the CPU becomes their
+  bottleneck (308 tokens: +10%). With 64 the best share rises to 0.5-0.6; `run-v100.sh` sets
+  `--prefill-cpu-max-columns 64 --prefill-cpu-share 0.5`. Prompt times, the same reply bit for
+  bit (2026-11-18, two runs each):
+
+  | Tokens | 8 columns, share 0.4 | 64 columns, share 0.5 |
+  |---|---|---|
+  | 308 | 0.85-0.87 s | 0.85 s |
+  | 939 | 1.87-1.88 s | 1.87-1.88 s |
+  | 1,979 | 3.77-3.78 s | 3.36 s |
+  | 2,573 | 4.61-4.62 s | 4.20-4.21 s |
+  | 3,641 | 5.17-5.18 s | 4.84-4.85 s |
+
+  What remains of the 3.9K-token prompt (5.05-5.18 s): 2.55 s of expert copies (6.2 GB) overlapped
+  with compute, 360 ms of in-layer staging, and an 838 ms idle start waiting on the n-gram read. That
+  read is 46K random 4K reads on a drive that tops out at ~43K IOPS, and the link is PCIe gen3 x4
+  (3.3 GB/s), so both are hardware limits here. Shrinking the stream's ring (1,024 frames) to keep
+  more experts cached measured no better (ring 512: 5.17 s; 320: 5.04 s with 1,529 misses left
+  to staging).
 
 Serving on a V100: `scripts/run-v100.sh <model>` is run.sh with the V100's defaults (the sm_70
 server from build-v100/, the memory-lock fallback, a GPU check). For Flash-Next it keeps run.sh's

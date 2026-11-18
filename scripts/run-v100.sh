@@ -18,7 +18,10 @@
 #     DFlash2 with rk4v4. On the V100 MTP3 decodes 76 tok/s against DFlash2's 66 (code), and INT8
 #     KV is the cache validated on the card;
 #   - Flash-Next prefill calls of up to 1024 tokens hand the CPU every expert miss it can take
-#     (--prefill-cpu-all-columns 1024; NINFER_PREFILL_CPU_ALL_COLUMNS=0 turns it off);
+#     (--prefill-cpu-all-columns 1024; NINFER_PREFILL_CPU_ALL_COLUMNS=0 turns it off), and longer
+#     calls hand it cold experts routed up to 64 tokens at share 0.5 (--prefill-cpu-max-columns 64
+#     --prefill-cpu-share 0.5; NINFER_PREFILL_CPU_MAX_COLUMNS=8 NINFER_PREFILL_CPU_SHARE=0.4 restore
+#     the tuned profile's);
 #   - Flash-Next MTP drafts step by step (--mtp-staged-drafts; NINFER_MTP_STAGED_DRAFTS=off turns it
 #     off): +2-4% decode, the same output;
 #   - Flash-Next MTP verification rounds compute part of their uncached experts on the CPU
@@ -79,6 +82,11 @@ case "$model_key" in
     # computes them faster than this link copies them (TTFT of a short prompt ~300 -> ~250 ms, a
     # 342-token prompt 1.6 -> 1.5 s, 2K prompts unchanged).
     export NINFER_PREFILL_CPU_ALL_COLUMNS="${NINFER_PREFILL_CPU_ALL_COLUMNS:-1024}"
+    # Longer calls let the CPU take cold experts routed up to 64 tokens (as jobs of 8) instead of
+    # copying them over the link inside their layer, at share 0.5 instead of the profile's 0.4: a
+    # 2K-token prompt 3.78 -> 3.36 s, 3.6K 5.17 -> 4.85 s, short prompts unchanged, the same output.
+    export NINFER_PREFILL_CPU_MAX_COLUMNS="${NINFER_PREFILL_CPU_MAX_COLUMNS:-64}"
+    export NINFER_PREFILL_CPU_SHARE="${NINFER_PREFILL_CPU_SHARE:-0.5}"
     # MTP drafts one step at a time and stops once no further draft could be verified (the same
     # output): a round mostly needs one or two of the three drafts, and a step is ~1.2 ms here.
     export NINFER_MTP_STAGED_DRAFTS="${NINFER_MTP_STAGED_DRAFTS:-on}"

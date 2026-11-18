@@ -237,7 +237,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
            "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--mtp-staged-drafts] [--mtp-rows-verify] [--ngram-prefetch] "
            "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
-           "[--moe-fused-route] [--cpu-verify-misses] [--prefill-cpu-share F [--prefill-cpu-all-columns N]] [--cpu-verify-workers N] [--gdn-async-commit] [--hc-int8 [--hc-fused-read]] "
+           "[--moe-fused-route] [--cpu-verify-misses] [--prefill-cpu-share F [--prefill-cpu-all-columns N] [--prefill-cpu-max-columns N]] [--cpu-verify-workers N] [--gdn-async-commit] [--hc-int8 [--hc-fused-read]] "
            "[--ngram-flag-wait] [--partial-ram-residency] [--ggml-decode-mma] "
            "[--ram-headroom-mib N] [--allow-unlocked-host-memory] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
@@ -408,7 +408,10 @@ std::string serve_usage_text(const char* argv0) {
            "--prefill-cpu-share) gives the CPU every uncached expert it can take (share 1) in prefill calls "
            "of at most N tokens, whose uncached experts see few tokens each: faster than copying them over "
            "a slow PCIe link (scripts/run-v100.sh sets 1024; the same output, bit for bit; 0, the default, "
-           "is off); --gdn-async-commit "
+           "is off); --prefill-cpu-max-columns N (with --prefill-cpu-share, 1..64) lets the CPU take uncached "
+           "experts routed up to N tokens, a wider one as several jobs of 8, so a cold expert routed many "
+           "tokens is computed beside the GPU instead of copied over PCIe inside its layer (scripts/run-v100.sh "
+           "sets 64; the same output, bit for bit; 8, the default, is the CPU job width); --gdn-async-commit "
            "(--spec mtp) folds each verification's accepted columns into the GDN state on a side stream "
            "while the drafter catches up and drafts the next round (the same state, bit for bit; off by "
            "default); --hc-int8 makes int8 copies of the hyper-connection mixers' weights at startup and "
@@ -1105,6 +1108,10 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.flash_next.ggml_decode_mma = true;
         } else if (arg == "--prefill-cpu-share") {
             options.flash_next.prefill_cpu_share = parse_share(require_value("--prefill-cpu-share"));
+        } else if (arg == "--prefill-cpu-max-columns") {
+            const int columns = parse_nonnegative_int(require_value("--prefill-cpu-max-columns"), "prefill-cpu-max-columns");
+            if (columns < 1 || columns > 64) { throw std::invalid_argument("--prefill-cpu-max-columns must be 1..64"); }
+            options.flash_next.prefill_cpu_max_columns = static_cast<std::uint32_t>(columns);
         } else if (arg == "--prefill-cpu-all-columns") {
             const int columns = parse_nonnegative_int(require_value("--prefill-cpu-all-columns"), "prefill-cpu-all-columns");
             if (columns > 65536) { throw std::invalid_argument("--prefill-cpu-all-columns must be at most 65536"); }
@@ -1375,6 +1382,10 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
     if (options.flash_next.gdn_async_commit && options.speculative.backend != SpeculativeBackend::Mtp) {
         throw std::invalid_argument("--gdn-async-commit folds MTP verification commits on a side stream and needs "
                                     "--spec mtp");
+    }
+    if (options.flash_next.prefill_cpu_max_columns != 8 && options.flash_next.prefill_cpu_share.num == 0) {
+        throw std::invalid_argument("--prefill-cpu-max-columns widens the CPU share of prefill calls and needs "
+                                    "--prefill-cpu-share");
     }
     if (options.flash_next.prefill_cpu_all_columns != 0 && options.flash_next.prefill_cpu_share.num == 0) {
         throw std::invalid_argument("--prefill-cpu-all-columns widens the CPU share of short prefill calls and needs "
