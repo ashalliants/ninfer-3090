@@ -802,22 +802,25 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
         project_pair(x, p.key, p.value, kf, vf, *work_, s, ggml_decode_mma_);
     }
     // The indexer's BF16 rows in FP32, then rounded once to BF16 (Linear's BF16 output boundary).
-    Tensor indexed = work_->alloc(DType::FP32, {IH * ID + ID, T});
-    {
-        const Tensor* rows[] = {&p.index_query, &p.index_key};
-        ops::projection_fp32(x, rows, indexed, s);
-    }
-    Tensor index_rows = work_->alloc(DType::BF16, {IH * ID + ID, T});
-    ops::cast_fp32_to_bf16(indexed, index_rows, s);
     Tensor iq = work_->alloc(DType::BF16, {ID, IH, T});
     // A verification call records the raw index keys for the tail commit.
     Tensor ik = batch.verify != nullptr
                     ? batch.verify->qsa_keys.slice(2, static_cast<std::int32_t>(index), 1).view({ID, T})
                     : work_->alloc(DType::BF16, {ID, T});
     {
-        Tensor iqf      = iq.view({IH * ID, T});
-        Tensor* parts[] = {&iqf, &ik};
-        ops::split_rows(index_rows, parts, s);
+        const Tensor* rows[] = {&p.index_query, &p.index_key};
+        Tensor iqf           = iq.view({IH * ID, T});
+        if (ops::projection_bf16_split_supported(T)) {
+            // Rounded and split in the projection's launch (the same bits).
+            ops::projection_bf16_split(x, rows, iqf, ik, s);
+        } else {
+            Tensor indexed = work_->alloc(DType::FP32, {IH * ID + ID, T});
+            ops::projection_fp32(x, rows, indexed, s);
+            Tensor index_rows = work_->alloc(DType::BF16, {IH * ID + ID, T});
+            ops::cast_fp32_to_bf16(indexed, index_rows, s);
+            Tensor* parts[] = {&iqf, &ik};
+            ops::split_rows(index_rows, parts, s);
+        }
     }
     Tensor qn = work_->alloc(DType::BF16, {D, NH, T});
     Tensor kn = work_->alloc(DType::BF16, {D, KVH, T});
