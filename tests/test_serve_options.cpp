@@ -1740,6 +1740,14 @@ int main() {
                           make_engine_options(fitted).fit_context_floor == 32768 &&
                           parse({"ninfer-serve", "model.ninfer"}).fit_context_floor == 0,
                       "--fit-context did not reach the Engine options or is on by default");
+    const ServeOptions headroom_fit =
+        parse({"ninfer-serve", "model.ninfer", "--max-context", "188416", "--kv-capacity", "188416",
+               "--fit-context", "32768", "--vram-headroom-mib", "64"});
+    failures += check(ninfer::fit_context_headroom_bytes(make_engine_options(headroom_fit)) ==
+                              (64ULL << 20) &&
+                          ninfer::fit_context_headroom_bytes(make_engine_options(fitted)) ==
+                              ninfer::kFitContextHeadroomBytes,
+                      "--vram-headroom-mib did not replace the context fit's spare memory");
     failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--max-context", "16384",
                                      "--fit-context", "32768"},
                                     "must not exceed --max-context"),

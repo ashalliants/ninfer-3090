@@ -534,7 +534,7 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                       product::format_pretty_count(engine.max_context),
                       product::format_pretty_count(memory.requested_max_context),
                       product::format_pretty_bytes(memory.available_after_weights_bytes),
-                      ninfer::kFitContextHeadroomBytes / (1024U * 1024U));
+                      ninfer::fit_context_headroom_bytes(engine) / (1024U * 1024U));
     }
     if (!memory.stage_runtime_reservation_bytes.empty()) {
         std::string reservations;
