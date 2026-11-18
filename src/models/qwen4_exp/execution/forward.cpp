@@ -824,15 +824,12 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
     }
     Tensor qn = work_->alloc(DType::BF16, {D, NH, T});
     Tensor kn = work_->alloc(DType::BF16, {D, KVH, T});
-    {
-        Tensor qn_rows = qn.view({D, NH * T}), kn_rows = kn.view({D, KVH * T});
-        ops::rmsnorm(q.view({D, NH * T}), p.query_norm, config_.rms_norm_eps, true, qn_rows, s);
-        ops::rmsnorm(k.view({D, KVH * T}), p.key_norm, config_.rms_norm_eps, true, kn_rows, s);
-    }
-    // Interleaved MRoPE over the three-axis RoPE positions (an image's tokens take the frontend's
-    // grid positions, later tokens their index plus the prompt's rope delta). A text token's equal
-    // axes give the 1-D rotation bit for bit (the kernel computes position[axis] * frequency).
-    ops::rope(batch.rope_positions, dim(config_.rope.rotary_dim), config_.rope.theta, qn, kn, device_.execution_view());
+    // The q/k norms, then interleaved MRoPE over the three-axis RoPE positions (an image's tokens
+    // take the frontend's grid positions, later tokens their index plus the prompt's rope delta; a
+    // text token's equal axes give the 1-D rotation bit for bit, as the kernel computes
+    // position[axis] * frequency), in one launch where the shapes allow.
+    ops::rmsnorm_pair_rope(q, p.query_norm, qn, k, p.key_norm, kn, config_.rms_norm_eps, batch.rope_positions,
+                           dim(config_.rope.rotary_dim), config_.rope.theta, device_.execution_view());
 
     const PagedKVLayerView& cache = kv_.layers.at(index);
     ops::kv_cache_append(kn, v, batch.positions, cache, s);
@@ -1184,8 +1181,8 @@ Tensor Forward::attention_rows(const AttentionParameters& p, const Tensor& x, st
     Tensor kn = work_->alloc(DType::BF16, {D, KVH, B});
     {
         Tensor qn_rows = qn.view({D, NH * B}), kn_rows = kn.view({D, KVH * B});
-        ops::rmsnorm(q.view({D, NH * B}), p.query_norm, config_.rms_norm_eps, true, qn_rows, s);
-        ops::rmsnorm(k.view({D, KVH * B}), p.key_norm, config_.rms_norm_eps, true, kn_rows, s);
+        ops::rmsnorm_pair(q.view({D, NH * B}), p.query_norm, qn_rows, k.view({D, KVH * B}), p.key_norm,
+                          kn_rows, config_.rms_norm_eps, true, s);
     }
     ops::rope(batch.rope_positions, dim(config_.rope.rotary_dim), config_.rope.theta, qn, kn, device_.execution_view());
     const auto geometry = qsa_geometry(config_);
@@ -1438,8 +1435,8 @@ Tensor Forward::attention_rows_verify(const AttentionParameters& p, const Tensor
     Tensor kn = work_->alloc(DType::BF16, {D, KVH, T});
     {
         Tensor qn_rows = qn.view({D, NH * T}), kn_rows = kn.view({D, KVH * T});
-        ops::rmsnorm(q.view({D, NH * T}), p.query_norm, config_.rms_norm_eps, true, qn_rows, s);
-        ops::rmsnorm(k.view({D, KVH * T}), p.key_norm, config_.rms_norm_eps, true, kn_rows, s);
+        ops::rmsnorm_pair(q.view({D, NH * T}), p.query_norm, qn_rows, k.view({D, KVH * T}), p.key_norm,
+                          kn_rows, config_.rms_norm_eps, true, s);
     }
     ops::rope(batch.rope_positions, dim(config_.rope.rotary_dim), config_.rope.theta, qn, kn, device_.execution_view());
     const auto geometry = qsa_geometry(config_);

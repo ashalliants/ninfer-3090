@@ -1,4 +1,5 @@
 #include "ninfer/ops/rmsnorm.h"
+#include "ninfer/ops/rope.h"
 #include "ops/norm_test_common.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
@@ -116,6 +117,116 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
     return failures;
 }
 
+// rmsnorm_pair against two rmsnorm calls, bit for bit: the fused D = 256 unit-offset route and the
+// fallback (another D or the plain gain).
+int run_pair(std::int32_t d, std::int32_t rows1, std::int32_t rows2, bool unit_offset, std::uint32_t seed) {
+    auto make = [&](std::int32_t rows, std::uint32_t s) {
+        std::vector<float> v(static_cast<std::size_t>(d) * rows);
+        fill_uniform(v, s, -4.0F, 4.0F);
+        round_to_bf16(v);
+        std::vector<std::uint16_t> bits(v.size());
+        for (std::size_t i = 0; i < v.size(); ++i) bits[i] = f32_to_bf16(v[i]);
+        return bits;
+    };
+    const auto x1 = make(rows1, seed), x2 = make(rows2, seed + 1), w1 = make(1, seed + 2), w2 = make(1, seed + 3);
+    auto up = [](const std::vector<std::uint16_t>& h) {
+        void* p = nullptr;
+        CUDA_CHECK(cudaMalloc(&p, h.size() * 2));
+        CUDA_CHECK(cudaMemcpy(p, h.data(), h.size() * 2, cudaMemcpyHostToDevice));
+        return p;
+    };
+    void *dx1 = up(x1), *dx2 = up(x2), *dw1 = up(w1), *dw2 = up(w2);
+    GuardedDeviceBuffer a1(x1.size() * 2), a2(x2.size() * 2), b1(x1.size() * 2), b2(x2.size() * 2);
+    for (auto* b : {&a1, &a2, &b1, &b2}) b->fill(0xff);
+    const Tensor tx1(dx1, DType::BF16, {d, rows1}), tx2(dx2, DType::BF16, {d, rows2}), tw1(dw1, DType::BF16, {d}),
+        tw2(dw2, DType::BF16, {d});
+    Tensor ta1(a1.data(), DType::BF16, {d, rows1}), ta2(a2.data(), DType::BF16, {d, rows2}),
+        tb1(b1.data(), DType::BF16, {d, rows1}), tb2(b2.data(), DType::BF16, {d, rows2});
+    ops::rmsnorm(tx1, tw1, kEps, unit_offset, ta1, nullptr);
+    ops::rmsnorm(tx2, tw2, kEps, unit_offset, ta2, nullptr);
+    ops::rmsnorm_pair(tx1, tw1, tb1, tx2, tw2, tb2, kEps, unit_offset, nullptr);
+    cuda_synchronize();
+    const std::string label = "rmsnorm_pair D=" + std::to_string(d) + " rows " + std::to_string(rows1) + "+" +
+                              std::to_string(rows2) + (unit_offset ? " offset" : " plain");
+    int failures = 0;
+    if (from_device_bf16(a1.data(), x1.size()) != from_device_bf16(b1.data(), x1.size()) ||
+        from_device_bf16(a2.data(), x2.size()) != from_device_bf16(b2.data(), x2.size())) {
+        std::cerr << label << ": differs from two rmsnorm calls\n";
+        ++failures;
+    }
+    for (auto* b : {&b1, &b2}) failures += b->verify_guards(label);
+    for (void* p : {dx1, dx2, dw1, dw2}) CUDA_CHECK(cudaFree(p));
+    return failures;
+}
+
+// rmsnorm_pair_rope against rmsnorm twice then rope, bit for bit (q [256, h1, T], k [256, h2, T],
+// MRoPE [T, 3] or 1-D [T] positions, rotary_dim 64).
+int run_pair_rope(std::int32_t h1, std::int32_t h2, std::int32_t T, int axes, std::uint32_t seed) {
+    constexpr std::int32_t D = 256;
+    auto make = [&](std::size_t count, std::uint32_t s) {
+        std::vector<float> v(count);
+        fill_uniform(v, s, -4.0F, 4.0F);
+        round_to_bf16(v);
+        std::vector<std::uint16_t> bits(v.size());
+        for (std::size_t i = 0; i < v.size(); ++i) bits[i] = f32_to_bf16(v[i]);
+        return bits;
+    };
+    const auto x1 = make(static_cast<std::size_t>(D) * h1 * T, seed), x2 = make(static_cast<std::size_t>(D) * h2 * T, seed + 1),
+               w1 = make(D, seed + 2), w2 = make(D, seed + 3);
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(T) * axes);
+    for (std::size_t i = 0; i < positions.size(); ++i) positions[i] = static_cast<std::int32_t>((i * 2654435761U + seed) % 5000U);
+    auto up = [](const void* h, std::size_t bytes) {
+        void* p = nullptr;
+        CUDA_CHECK(cudaMalloc(&p, bytes));
+        CUDA_CHECK(cudaMemcpy(p, h, bytes, cudaMemcpyHostToDevice));
+        return p;
+    };
+    void *dx1 = up(x1.data(), x1.size() * 2), *dx2 = up(x2.data(), x2.size() * 2), *dw1 = up(w1.data(), w1.size() * 2),
+         *dw2 = up(w2.data(), w2.size() * 2), *dp = up(positions.data(), positions.size() * 4);
+    GuardedDeviceBuffer a1(x1.size() * 2), a2(x2.size() * 2), b1(x1.size() * 2), b2(x2.size() * 2);
+    for (auto* b : {&a1, &a2, &b1, &b2}) b->fill(0xff);
+    const Tensor tx1(dx1, DType::BF16, {D, h1, T}), tx2(dx2, DType::BF16, {D, h2, T}), tw1(dw1, DType::BF16, {D}),
+        tw2(dw2, DType::BF16, {D});
+    const Tensor pos = axes == 1 ? Tensor(dp, DType::I32, {T}) : Tensor(dp, DType::I32, {T, axes});
+    Tensor ta1(a1.data(), DType::BF16, {D, h1, T}), ta2(a2.data(), DType::BF16, {D, h2, T}),
+        tb1(b1.data(), DType::BF16, {D, h1, T}), tb2(b2.data(), DType::BF16, {D, h2, T});
+    DeviceContext device;
+    ops::rmsnorm(tx1, tw1, kEps, true, ta1, device.stream);
+    ops::rmsnorm(tx2, tw2, kEps, true, ta2, device.stream);
+    ops::rope(pos, 64, 1.0e7F, ta1, ta2, device.execution_view());
+    ops::rmsnorm_pair_rope(tx1, tw1, tb1, tx2, tw2, tb2, kEps, pos, 64, 1.0e7F, device.execution_view());
+    cuda_synchronize(device.stream);
+    auto bits = [](const GuardedDeviceBuffer& buffer, std::size_t count) {
+        std::vector<std::uint16_t> h(count);
+        CUDA_CHECK(cudaMemcpy(h.data(), buffer.data(), count * 2, cudaMemcpyDeviceToHost));
+        return h;
+    };
+    const std::string label = "rmsnorm_pair_rope heads " + std::to_string(h1) + "/" + std::to_string(h2) + " T=" +
+                              std::to_string(T) + " axes " + std::to_string(axes);
+    int failures = 0;
+    if (bits(a1, x1.size()) != bits(b1, x1.size()) || bits(a2, x2.size()) != bits(b2, x2.size())) {
+        std::cerr << label << ": differs from rmsnorm + rope\n";
+        for (int which = 0; which < 2; ++which) {
+            const std::size_t count = which == 0 ? x1.size() : x2.size();
+            const std::int32_t heads = which == 0 ? h1 : h2;
+            const auto want = bits(which == 0 ? a1 : a2, count), got = bits(which == 0 ? b1 : b2, count);
+            int differing = 0;
+            for (std::size_t i = 0; i < count; ++i) {
+                if (want[i] == got[i]) { continue; }
+                if (differing++ < 4) {
+                    std::cerr << "  out" << which + 1 << " d " << i % D << " head " << (i / D) % heads << " token "
+                              << i / D / heads << ": " << want[i] << " vs " << got[i] << "\n";
+                }
+            }
+            std::cerr << "  out" << which + 1 << ": " << differing << " elements differ\n";
+        }
+        ++failures;
+    }
+    for (auto* b : {&b1, &b2}) failures += b->verify_guards(label);
+    for (void* p : {dx1, dx2, dw1, dw2, dp}) CUDA_CHECK(cudaFree(p));
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -125,6 +236,20 @@ int main() {
     }
 
     int failures = 0;
+    for (std::int32_t t : {1, 2, 3, 4, 7}) {
+        failures += run_pair_rope(32, 4, t, 3, 3400U + static_cast<std::uint32_t>(t));
+        failures += run_pair_rope(8, 2, t, 1, 3500U + static_cast<std::uint32_t>(t));
+        failures += run_pair_rope(24, 2, t, 3, 3700U + static_cast<std::uint32_t>(t)); // Flash-Next
+
+        failures += run_pair_rope(24, 4, t, 3, 3600U + static_cast<std::uint32_t>(t)); // the fixed RoPE route
+        failures += run_pair(256, 32 * t, 4 * t, true, 3100U + static_cast<std::uint32_t>(t));
+        failures += run_pair(256, 16 * t, 2 * t, false, 3200U + static_cast<std::uint32_t>(t));
+        failures += run_pair(128, 32 * t, 8 * t, true, 3300U + static_cast<std::uint32_t>(t));
+    }
+    for (std::int32_t t : {8, 9, 28, 32, 33, 300, 1024}) {
+        failures += run_pair_rope(24, 2, t, 3, 3800U + static_cast<std::uint32_t>(t));
+        failures += run_pair_rope(24, 2, t, 1, 3900U + static_cast<std::uint32_t>(t));
+    }
     failures += run_case("rmsnorm offset [5120,1]", {5120, 1}, true, 1101U);
     failures += run_case("rmsnorm offset [5120,128]", {5120, 128}, true, 1102U);
     failures += run_case("rmsnorm offset [5120,1024]", {5120, 1024}, true, 1107U);

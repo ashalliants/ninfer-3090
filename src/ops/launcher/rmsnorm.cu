@@ -161,4 +161,39 @@ void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_
     CUDA_CHECK(cudaGetLastError());
 }
 
+bool rmsnorm_pair_rope_launch(const Tensor& x1, const Tensor& w1, Tensor& out1, const Tensor& x2, const Tensor& w2,
+                              Tensor& out2, float eps, const Tensor& positions, float theta, cudaStream_t stream) {
+    const auto addresses = reinterpret_cast<std::uintptr_t>(x1.data) | reinterpret_cast<std::uintptr_t>(w1.data) |
+                           reinterpret_cast<std::uintptr_t>(out1.data) | reinterpret_cast<std::uintptr_t>(x2.data) |
+                           reinterpret_cast<std::uintptr_t>(w2.data) | reinterpret_cast<std::uintptr_t>(out2.data);
+    if (out1.ne[0] != 256 || out2.ne[0] != 256 || (addresses & (alignof(__nv_bfloat162) - 1)) != 0) { return false; }
+    const std::int64_t rows1 = out1.numel() / 256, rows2 = out2.numel() / 256;
+    if (rows1 + rows2 > std::numeric_limits<int>::max()) { return false; }
+    constexpr int block = 128;
+    rmsnorm_pair_rope256_kernel<block><<<static_cast<unsigned>((rows1 + rows2 + 3) / 4), block, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat162*>(x1.data), reinterpret_cast<const __nv_bfloat162*>(w1.data),
+        reinterpret_cast<__nv_bfloat162*>(out1.data), rows1, out1.ne[1], reinterpret_cast<const __nv_bfloat162*>(x2.data),
+        reinterpret_cast<const __nv_bfloat162*>(w2.data), reinterpret_cast<__nv_bfloat162*>(out2.data), rows2,
+        out2.ne[1], eps, static_cast<const std::int32_t*>(positions.data), positions.ne[1], theta, out1.ne[2]);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool rmsnorm_pair_launch(const Tensor& x1, const Tensor& w1, Tensor& out1, const Tensor& x2, const Tensor& w2,
+                         Tensor& out2, float eps, cudaStream_t stream) {
+    const auto addresses = reinterpret_cast<std::uintptr_t>(x1.data) | reinterpret_cast<std::uintptr_t>(w1.data) |
+                           reinterpret_cast<std::uintptr_t>(out1.data) | reinterpret_cast<std::uintptr_t>(x2.data) |
+                           reinterpret_cast<std::uintptr_t>(w2.data) | reinterpret_cast<std::uintptr_t>(out2.data);
+    if (x1.ne[0] != 256 || x2.ne[0] != 256 || (addresses & (alignof(__nv_bfloat162) - 1)) != 0) { return false; }
+    const std::int64_t rows1 = out1.numel() / 256, rows2 = out2.numel() / 256;
+    if (rows1 + rows2 > std::numeric_limits<int>::max()) { return false; }
+    constexpr int block = 128; // rmsnorm_launch's Offset D = 256 route: four rows per CTA
+    rmsnorm_pair_offset256_kernel<block><<<static_cast<unsigned>((rows1 + rows2 + 3) / 4), block, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat162*>(x1.data), reinterpret_cast<const __nv_bfloat162*>(w1.data),
+        reinterpret_cast<__nv_bfloat162*>(out1.data), rows1, reinterpret_cast<const __nv_bfloat162*>(x2.data),
+        reinterpret_cast<const __nv_bfloat162*>(w2.data), reinterpret_cast<__nv_bfloat162*>(out2.data), rows2, eps);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 } // namespace ninfer::ops::detail

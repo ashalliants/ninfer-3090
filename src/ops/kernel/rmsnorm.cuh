@@ -4,6 +4,7 @@
 
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
+#include "ops/kernel/rope_math.cuh"
 
 #include <cuda_bf16.h>
 
@@ -34,19 +35,21 @@ __device__ __forceinline__ float rmsnorm_epilogue(float x, float inv, float weig
 // Fast geometry for D in {64, 128, 192, 256}. One warp owns one row, keeps the input in
 // registers, and uses only warp shuffles for the reduction. Block is a scheduling choice rather
 // than part of the row geometry.
-template <RmsEpilogue Epilogue, int Block, bool Prefetch, int FixedD = 0>
-__launch_bounds__(Block) __global__
-    void rmsnorm_warp_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
-                                    const __nv_bfloat162* z, __nv_bfloat162* out,
-                                    std::int32_t input_d, std::int64_t rows, float eps) {
+// The stored pair of slot 0 as it is (Slot0 of rmsnorm_warp_row).
+struct RmsSlot0Plain {
+    __device__ __forceinline__ __nv_bfloat162 operator()(__nv_bfloat162 value) const { return value; }
+};
+
+// One row by one warp (the kernels below). slot0 maps each lane's first output pair before it is
+// stored (the fused RoPE rotates the rows' first 64 features there).
+template <RmsEpilogue Epilogue, bool Prefetch, int FixedD = 0, class Slot0 = RmsSlot0Plain>
+__device__ __forceinline__ void rmsnorm_warp_row(const __nv_bfloat162* x, const __nv_bfloat162* weight,
+                                                 const __nv_bfloat162* z, __nv_bfloat162* out,
+                                                 std::int32_t input_d, std::int64_t row, float eps,
+                                                 Slot0 slot0 = {}) {
     const int d = FixedD ? FixedD : input_d;
-    static_assert(Block % kWarpSize == 0);
-    constexpr int kWarpsPerBlock   = Block / kWarpSize;
     constexpr int kMaxPairsPerLane = 4;
     const int lane                 = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
-    const int warp                 = static_cast<int>(threadIdx.x) / kWarpSize;
-    const std::int64_t row         = static_cast<std::int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
-    if (row >= rows) { return; }
 
     const int pairs             = d / 2;
     const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
@@ -90,10 +93,85 @@ __launch_bounds__(Block) __global__
             const float2 wf = __bfloat1622float2(w_pair);
             float2 zf{0.0f, 0.0f};
             if constexpr (kRmsGated<Epilogue>) { zf = __bfloat1622float2(z_pair); }
-            out[row_base + pair] =
+            const __nv_bfloat162 stored =
                 __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
+            out[row_base + pair] = k == 0 ? slot0(stored) : stored;
         }
+    }
+}
+
+template <RmsEpilogue Epilogue, int Block, bool Prefetch, int FixedD = 0>
+__launch_bounds__(Block) __global__
+    void rmsnorm_warp_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
+                                    const __nv_bfloat162* z, __nv_bfloat162* out,
+                                    std::int32_t input_d, std::int64_t rows, float eps) {
+    static_assert(Block % kWarpSize == 0);
+    constexpr int kWarpsPerBlock = Block / kWarpSize;
+    const int warp               = static_cast<int>(threadIdx.x) / kWarpSize;
+    const std::int64_t row       = static_cast<std::int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
+    if (row >= rows) { return; }
+    rmsnorm_warp_row<Epilogue, Prefetch, FixedD>(x, weight, z, out, input_d, row, eps);
+}
+
+// Two unit-offset D = 256 norms in one launch (rmsnorm_pair): rows [0, rows1) of the first, then
+// the second's; each row is rmsnorm_warp_bf16x2_kernel's.
+template <int Block>
+__launch_bounds__(Block) __global__
+    void rmsnorm_pair_offset256_kernel(const __nv_bfloat162* x1, const __nv_bfloat162* w1, __nv_bfloat162* o1,
+                                       std::int64_t rows1, const __nv_bfloat162* x2, const __nv_bfloat162* w2,
+                                       __nv_bfloat162* o2, std::int64_t rows2, float eps) {
+    constexpr int kWarpsPerBlock = Block / kWarpSize;
+    const int warp               = static_cast<int>(threadIdx.x) / kWarpSize;
+    const std::int64_t row       = static_cast<std::int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
+    if (row < rows1) {
+        rmsnorm_warp_row<RmsEpilogue::Offset, true, 256>(x1, w1, nullptr, o1, 256, row, eps);
+    } else if (row - rows1 < rows2) {
+        rmsnorm_warp_row<RmsEpilogue::Offset, true, 256>(x2, w2, nullptr, o2, 256, row - rows1, eps);
+    }
+}
+
+// rope_generic_kernel's rotation of features [0, 64) (rotary_dim 64) applied to the normalized,
+// BF16-rounded values: lane l holds features 2l and 2l + 1 of slot 0, so pair p's two features sit
+// 16 lanes apart (lanes below 16 hold the first of each pair). c/s: pairs 2 (l % 16) and + 1.
+struct RmsSlot0Rope64 {
+    float c0, c1, s0, s1;
+    int lane;
+    __device__ __forceinline__ __nv_bfloat162 operator()(__nv_bfloat162 value) const {
+        const float2 f  = __bfloat1622float2(value);
+        const float px  = __shfl_xor_sync(kFullWarpMask, f.x, 16);
+        const float py  = __shfl_xor_sync(kFullWarpMask, f.y, 16);
+        const bool head = lane < 16;
+        const float a   = head ? rope_first(f.x, px, c0, s0) : rope_second(px, f.x, c0, s0);
+        const float b   = head ? rope_first(f.y, py, c1, s1) : rope_second(py, f.y, c1, s1);
+        return __halves2bfloat162(__float2bfloat16_rn(a), __float2bfloat16_rn(b));
+    }
+};
+
+// rmsnorm_pair_offset256_kernel followed by rope_generic_kernel over q (rows1 = heads1 x T) and k
+// (rows2 = heads2 x T), rotary_dim 64: each row's sin/cos as that kernel forms them.
+template <int Block>
+__launch_bounds__(Block) __global__
+    void rmsnorm_pair_rope256_kernel(const __nv_bfloat162* x1, const __nv_bfloat162* w1, __nv_bfloat162* o1,
+                                     std::int64_t rows1, int heads1, const __nv_bfloat162* x2,
+                                     const __nv_bfloat162* w2, __nv_bfloat162* o2, std::int64_t rows2, int heads2,
+                                     float eps, const std::int32_t* positions, int axes, float theta, int tokens) {
+    constexpr int kWarpsPerBlock = Block / kWarpSize;
+    const int warp               = static_cast<int>(threadIdx.x) / kWarpSize;
+    const int lane               = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const std::int64_t row       = static_cast<std::int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
+    const bool first             = row < rows1;
+    const std::int64_t local     = first ? row : row - rows1;
+    if (!first && local >= rows2) { return; }
+    const int token = static_cast<int>(local / (first ? heads1 : heads2));
+    const int pair  = 2 * (lane & 15);
+    RmsSlot0Rope64 rope{0.0F, 0.0F, 0.0F, 0.0F, lane};
+    generic_sincos(positions, axes, 256, 64, theta, tokens, token, pair, &rope.s0, &rope.c0);
+    generic_sincos(positions, axes, 256, 64, theta, tokens, token, pair + 1, &rope.s1, &rope.c1);
+    if (first) {
+        rmsnorm_warp_row<RmsEpilogue::Offset, true, 256>(x1, w1, nullptr, o1, 256, local, eps, rope);
+    } else {
+        rmsnorm_warp_row<RmsEpilogue::Offset, true, 256>(x2, w2, nullptr, o2, 256, local, eps, rope);
     }
 }
 
