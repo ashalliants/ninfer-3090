@@ -81,6 +81,15 @@ __device__ __forceinline__ unsigned codes_to_half2(unsigned biased, unsigned sel
     return *reinterpret_cast<const unsigned*>(&h);
 }
 
+#if defined(NINFER_SM70)
+// Code byte k of a word already XORed with 0x80808080 (so the byte is code + 128) as an exact FP32:
+// the bits 0x4B0000uu are 2^23 + u, and 2^23 + 128 off that is the code. Two full-rate
+// instructions, where I2F runs at a quarter of the FP32 rate on Volta.
+__device__ __forceinline__ float biased_code_to_float(unsigned biased, unsigned k) {
+    return __int_as_float(static_cast<int>(__byte_perm(biased, 0x4B000000U, 0x7540U | k))) - 8388736.0F;
+}
+#endif
+
 __device__ __forceinline__ unsigned pack_half2(float lo, float hi) {
     const __half2 h = __floats2half2_rn(lo, hi);
     return *reinterpret_cast<const unsigned*>(&h);
@@ -117,6 +126,38 @@ __device__ __forceinline__ void stage_tile(Stage& st, const Planes& planes, int 
             live = 1;
         }
     }
+#if defined(NINFER_SM70)
+    // Volta emulates cp.async as a copy, each a load the store then waits on: issue every load of
+    // the tile first (same bytes, zeros past the list), then store them.
+    {
+        uint4 kc[8], vc[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int chunk = lane + 32 * j;
+            const int token = chunk >> 4, part = chunk & 15;
+            const int r     = __shfl_sync(kAll, row, token);
+            const int ok    = __shfl_sync(kAll, live, token);
+            const std::int64_t offset = static_cast<std::int64_t>(r) * kD + part * 16;
+            kc[j] = ok ? *reinterpret_cast<const uint4*>(planes.k + offset) : make_uint4(0, 0, 0, 0);
+            vc[j] = ok ? *reinterpret_cast<const uint4*>(planes.v + offset) : make_uint4(0, 0, 0, 0);
+        }
+        const int token = lane & 15;
+        const int r     = __shfl_sync(kAll, row, token);
+        const int ok    = __shfl_sync(kAll, live, token);
+        const std::int64_t offset = static_cast<std::int64_t>(r) * kGroups;
+        const __half* scales      = lane < 16 ? planes.k_scale : planes.v_scale;
+        const uint2 sc = ok ? *reinterpret_cast<const uint2*>(scales + offset) : make_uint2(0, 0);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int chunk = lane + 32 * j;
+            const int tk = chunk >> 4, part = chunk & 15;
+            *reinterpret_cast<uint4*>(&st.k[tk][part * 16]) = kc[j];
+            *reinterpret_cast<uint4*>(&st.v[tk][part * 16]) = vc[j];
+        }
+        *reinterpret_cast<uint2*>(lane < 16 ? &st.k_scale[token][0] : &st.v_scale[token][0]) = sc;
+    }
+    return;
+#endif
     // Codes: 16 tokens x 256 B per plane = 256 chunks of 16 B per plane.
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
@@ -184,6 +225,31 @@ __global__ void __launch_bounds__(kThreads)
     }
 
     // Query rows: Hadamard-prepared, FP16; rows 12..15 are zero.
+#if defined(NINFER_SM70)
+    // The warp's rows' loads first, then their transforms (one latency instead of one per row).
+    {
+        float values[16 / kWarps][8];
+#pragma unroll
+        for (int i = 0; i < 16 / kWarps; ++i) {
+            const int r = warp + kWarps * i;
+            const bf16* row = q + (static_cast<std::int64_t>(column) * kHq + kv_head * kGroup + min(r, kGroup - 1)) * kD;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { values[i][j] = r < kGroup ? __bfloat162float(row[lane + 32 * j]) : 0.0F; }
+        }
+#pragma unroll
+        for (int i = 0; i < 16 / kWarps; ++i) {
+            const int r = warp + kWarps * i;
+            if (r < kGroup) {
+                normalized_hadamard_d256_inplace(values[i], lane);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) { sh.q[r][lane + 32 * j] = __float2half_rn(values[i][j]); }
+            } else {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) { sh.q[r][lane + 32 * j] = __float2half_rn(0.0F); }
+            }
+        }
+    }
+#else
     for (int r = warp; r < 16; r += kWarps) {
         if (r < kGroup) {
             const bf16* row = q + (static_cast<std::int64_t>(column) * kHq + kv_head * kGroup + r) * kD;
@@ -198,6 +264,7 @@ __global__ void __launch_bounds__(kThreads)
             for (int j = 0; j < 8; ++j) { sh.q[r][lane + 32 * j] = __float2half_rn(0.0F); }
         }
     }
+#endif
     __syncthreads();
 
     float o[32][4];
@@ -239,6 +306,59 @@ __global__ void __launch_bounds__(kThreads)
 
         // S = Q K^T over 16 tokens, group by group.
         float s_acc[2][4] = {{0.0F, 0.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 0.0F, 0.0F}};
+#if defined(NINFER_SM70)
+        // sm_70 has no m16n8k16 MMA: its emulation (volta_compat.cuh) costs a call, 32 shuffles and
+        // the unpacks per MMA. This computes each lane's outputs directly with the emulation's
+        // arithmetic: output (row, token) of a group is one FMA chain over the group's 64
+        // dimensions in order from 0 (an MMA step's k order is dimensions 4 tp .. 4 tp + 3 for tp =
+        // 0..3), and the FP16 query and the codes convert to FP32 exactly either way.
+        // c[nt][e]: row g (e < 2) or g + 8, token 8 nt + 2 quad + (e & 1), as the fragments.
+        const int tok[4] = {2 * quad, 2 * quad + 1, 8 + 2 * quad, 9 + 2 * quad};
+#pragma unroll 1
+        for (int group = 0; group < kGroups; ++group) {
+            float c[2][4] = {{0.0F, 0.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 0.0F, 0.0F}};
+#pragma unroll 4
+            for (int d4 = 0; d4 < 16; ++d4) {
+                const int d    = 64 * group + 4 * d4;
+                const uint2 lo = *reinterpret_cast<const uint2*>(&sh.q[g][d]);
+                const uint2 hi = *reinterpret_cast<const uint2*>(&sh.q[g + 8][d]);
+                const float2 l01 = __half22float2(*reinterpret_cast<const __half2*>(&lo.x));
+                const float2 l23 = __half22float2(*reinterpret_cast<const __half2*>(&lo.y));
+                const float2 h01 = __half22float2(*reinterpret_cast<const __half2*>(&hi.x));
+                const float2 h23 = __half22float2(*reinterpret_cast<const __half2*>(&hi.y));
+                const float ql[4] = {l01.x, l01.y, l23.x, l23.y};
+                const float qh[4] = {h01.x, h01.y, h23.x, h23.y};
+                unsigned w[4];
+#pragma unroll
+                for (int k = 0; k < 4; ++k) { w[k] = *reinterpret_cast<const unsigned*>(&st.k[tok[k]][d]) ^ 0x80808080U; }
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    float kv[4];
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        kv[k] = biased_code_to_float(w[k], static_cast<unsigned>(j));
+                    }
+                    c[0][0] = fmaf(ql[j], kv[0], c[0][0]);
+                    c[0][1] = fmaf(ql[j], kv[1], c[0][1]);
+                    c[0][2] = fmaf(qh[j], kv[0], c[0][2]);
+                    c[0][3] = fmaf(qh[j], kv[1], c[0][3]);
+                    c[1][0] = fmaf(ql[j], kv[2], c[1][0]);
+                    c[1][1] = fmaf(ql[j], kv[3], c[1][1]);
+                    c[1][2] = fmaf(qh[j], kv[2], c[1][2]);
+                    c[1][3] = fmaf(qh[j], kv[3], c[1][3]);
+                }
+            }
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                const float s0 = __half2float(st.k_scale[8 * nt + 2 * quad][group]);
+                const float s1 = __half2float(st.k_scale[8 * nt + 2 * quad + 1][group]);
+                s_acc[nt][0] += c[nt][0] * s0;
+                s_acc[nt][1] += c[nt][1] * s1;
+                s_acc[nt][2] += c[nt][2] * s0;
+                s_acc[nt][3] += c[nt][3] * s1;
+            }
+        }
+#else
 #pragma unroll
         for (int group = 0; group < kGroups; ++group) {
             float c[2][4] = {{0.0F, 0.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 0.0F, 0.0F}};
@@ -266,6 +386,7 @@ __global__ void __launch_bounds__(kThreads)
                 s_acc[nt][3] += c[nt][3] * s1;
             }
         }
+#endif
 
         // Online softmax in log2 units; tokens past the list are -inf.
         const int token0 = tile * kTile;
@@ -321,6 +442,41 @@ __global__ void __launch_bounds__(kThreads)
             const unsigned a1 = pack_half2(pr[0][2] * v0, pr[0][3] * v1);
             const unsigned a2 = pack_half2(pr[1][0] * v2, pr[1][1] * v3);
             const unsigned a3 = pack_half2(pr[1][2] * v2, pr[1][3] * v3);
+#if defined(NINFER_SM70)
+            // Direct form (see QK): output (row, dim) adds the tile's tokens in the emulation's k
+            // order, tokens 2 tp, 2 tp + 1, 8 + 2 tp, 9 + 2 tp for tp = 0..3, each term the
+            // FP16-rounded P x value scale of quad lane tp (its a0..a3) times the value code. This
+            // lane's dims of tile i = ((group 2 + chunk) 2 + sub) 2 + parity, entry e, are
+            // 64 group + 32 chunk + 16 sub + 4 quad + 2 (e & 1) + parity: one code word per token.
+#pragma unroll 1
+            for (int tp = 0; tp < 4; ++tp) {
+                const int src = 4 * g + tp;
+                const unsigned x0 = __shfl_sync(kAll, a0, src), x1 = __shfl_sync(kAll, a1, src);
+                const unsigned x2 = __shfl_sync(kAll, a2, src), x3 = __shfl_sync(kAll, a3, src);
+                const float2 p_lo_a = __half22float2(*reinterpret_cast<const __half2*>(&x0)); // row g, 2tp, 2tp+1
+                const float2 p_hi_a = __half22float2(*reinterpret_cast<const __half2*>(&x1)); // row g+8
+                const float2 p_lo_b = __half22float2(*reinterpret_cast<const __half2*>(&x2)); // row g, 8+2tp, 9+2tp
+                const float2 p_hi_b = __half22float2(*reinterpret_cast<const __half2*>(&x3)); // row g+8
+                const int tokens[4]  = {2 * tp, 2 * tp + 1, 8 + 2 * tp, 9 + 2 * tp};
+                const float p_lo[4]  = {p_lo_a.x, p_lo_a.y, p_lo_b.x, p_lo_b.y};
+                const float p_hi[4]  = {p_hi_a.x, p_hi_a.y, p_hi_b.x, p_hi_b.y};
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+#pragma unroll
+                    for (int cs = 0; cs < 4; ++cs) { // chunk = cs >> 1, sub = cs & 1
+                        const unsigned word =
+                            *reinterpret_cast<const unsigned*>(&st.v[tokens[k]][64 * group + 16 * cs + 4 * quad]) ^ 0x80808080U;
+#pragma unroll
+                        for (int b = 0; b < 4; ++b) { // e & 1 = b >> 1, parity = b & 1
+                            const float vv = biased_code_to_float(word, static_cast<unsigned>(b));
+                            float* acc     = o[(group * 4 + cs) * 2 + (b & 1)];
+                            acc[b >> 1]       = fmaf(p_lo[k], vv, acc[b >> 1]);
+                            acc[2 + (b >> 1)] = fmaf(p_hi[k], vv, acc[2 + (b >> 1)]);
+                        }
+                    }
+                }
+            }
+#else
 #pragma unroll
             for (int chunk = 0; chunk < 2; ++chunk) {
                 // ldmatrix.trans of four 8x8 b16 matrices: tokens 0-7 / 8-15 by dims
@@ -345,6 +501,7 @@ __global__ void __launch_bounds__(kThreads)
                     }
                 }
             }
+#endif
         }
         __syncwarp();
         slot = (slot + 1) % Stages;
