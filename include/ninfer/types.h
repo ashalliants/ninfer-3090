@@ -1283,6 +1283,8 @@ enum class RequestErrorKind : std::uint8_t {
     Cancelled,
     Unavailable,
     NumericalFailure,
+    // The request asked for token log-probabilities this model or request shape cannot return.
+    LogprobsNotSupported,
 };
 
 enum class RequestErrorSource : std::uint8_t { OutputConstraint, Tools };
