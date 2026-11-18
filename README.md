@@ -30,7 +30,8 @@ Windows preview, the 512-expert **Qwen3.8-Flash-Next** on one
 runtime loads the official groupwise `.ninfer` artifacts, serves OpenAI- and Anthropic-compatible
 APIs, and supports paged KV, compatible-prefix reuse, structured JSON output, CUDA Graphs, MTP and
 DFlash2 speculative decoding, vision, reasoning-effort control, ReplaySSM state transactions, and
-concurrent cohorts through **C8**.
+concurrent cohorts through **C8**. A 32 GB **Tesla V100** (`sm_70`, built from source on Linux) runs
+Qwen3.8-27B and Qwen3.8-Flash-Next too: [V100 guide](docs/tesla-v100.md).
 
 **One RTX 3090, Linux launcher defaults (`rk4v4` KV):**
 
@@ -44,6 +45,16 @@ concurrent cohorts through **C8**.
 **Qwen3.8-Flash-Next (preview, Windows)** runs on the same card too: a 512-expert MoE at 2 bits per
 weight with its experts pinned in host RAM, at **1.15-1.18x Strata's plain decode** and
 **109-113 tok/s with MTP**. [Details](#qwen38-flash-next-preview) · [every re-measurement](#latest-benchmarks)
+
+**On a Tesla V100-32GB** ([guide](docs/tesla-v100.md); built from source, `scripts/run-v100.sh`):
+
+| | Qwen3.8-27B | Qwen3.8-Flash-Next |
+|---|---:|---:|
+| **Max context** | 262,144 tokens | 262,144 tokens |
+| **Prefill** | ~1,020 tok/s at 4.4K tokens | ~990 tok/s at 3.8K, a 38K-token prompt in 38 s |
+| **Decode**, one stream, MTP3 | 76-86 tok/s | 72-96 tok/s, flat from 10K to 221K tokens of context |
+
+Measured over a 3.3 GB/s eGPU link (PCIe Gen3 x4) on a 59 GiB host, 2026-11-18.
 
 ![Qwen3.8-27B on one RTX 3090: llama.cpp against NInfer-3090 (llama.cpp figures from a third party's published run)](docs/assets/llamacpp-vs-ninfer-27b.svg)
 
@@ -74,6 +85,7 @@ requests are not guaranteed.
 - [Features](#features) and [serving APIs](#serving-apis)
 - [Models](#models)
 - [Performance on an RTX 3090](#performance-on-an-rtx-3090), starting with the [latest benchmarks](#latest-benchmarks)
+- [Tesla V100](docs/tesla-v100.md) — building, running and measured performance on `sm_70`
 - [Choosing a KV format](#choosing-a-kv-format)
 - [Several GPUs](#several-gpus-pipeline-stages---devices-ab)
 - [Current limits](#current-limits)
@@ -293,7 +305,9 @@ ran one user at 147,456 tokens; `rk4v4` stores the same context in 31% less memo
 
 The 48-layer, 512-expert Qwen3.8-Flash-Next runs from the ISTA DASLab GSQ-RCO IQ2_XS GGUF,
 converted exactly (no re-quantization) into a 39.2 GB `.ninfer` plus a 29.1 GB n-gram volume
-beside it (`tools/convert/qwen4_exp.py`; [plan](docs/maintainer/flash-next-plan.md)). Start it with:
+beside it (`tools/convert/qwen4_exp.py`; [plan](docs/maintainer/flash-next-plan.md)). It also runs
+on a 32 GB Tesla V100 under Linux with its full 262,144-token context
+([V100 guide](docs/tesla-v100.md)). Start it with:
 
 ```bat
 set NINFER_MODEL=K:\ninfer-models\qwen4exp\qwen4exp-iq2xs-mtp-vision.ninfer
@@ -366,7 +380,9 @@ belongs to another conversion.
 
 ## Building from source
 
-Only needed if you are changing the code — the release archives are prebuilt for `sm_86`.
+Only needed if you are changing the code — the release archives are prebuilt for `sm_86`. A Tesla
+V100 (`sm_70`) always builds from source: `scripts/v100_build.sh`, then `scripts/run-v100.sh` (see the
+[V100 guide](docs/tesla-v100.md)).
 
 `scripts/build.ps1` (Windows) and `scripts/build.sh` (Linux/WSL) pin the toolchain this project
 needs and fail with a message naming the real cause when one is missing. Three things are not the

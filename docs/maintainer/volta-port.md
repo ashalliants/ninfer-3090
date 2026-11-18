@@ -1,7 +1,10 @@
 # Tesla V100 (sm_70) port
 
-Status: **runs on a V100**: decode is tuned (see "Decode"); prefill's wide GEMMs run on the
-tensor cores through cuBLAS (see "Prefill"), its attention and GDN recurrence still on emulated `mma`.
+Status: **runs on a V100**, Qwen3.8-27B and Qwen3.8-Flash-Next both tuned. Decode is tuned (see
+"Decode"); prefill's wide GEMMs run on the tensor cores through cuBLAS and prompt attention on FP16
+tensor cores (see "Prefill"); the GDN recurrence runs the sequential FP32 kernel. The user-facing
+summary (requirements, launcher defaults, current numbers) is [docs/tesla-v100.md](../tesla-v100.md);
+this page is the engineering record behind it.
 
 The engine's kernels are written against Ampere: `cp.async`, `ldmatrix`, `mma.sync.m16n8kK` for
 BF16, FP16, TF32, INT8 and INT4. Volta has none of them (its tensor cores run FP16 `m8n8k4` only),
@@ -371,6 +374,27 @@ Working with the 3.3 GB/s eGPU link (Flash-Next, measured 2026-11-17):
   context, 128-dim) stays small. tok/s follows MTP acceptance, which follows the content (1.97-2.65
   tokens per round), not the context. A 221,567-token prompt prefills in 245 s (903 tok/s; 10,670
   tokens 811 tok/s). Peak 68 C at 215 W through the whole run.
+- Wide prefill calls are 8,192 tokens (897d725a; Infernix's are 4,096). A call streams nearly every
+  non-resident expert whatever its width, so a 4K call paid the link for ~4,000 experts per 4,096
+  tokens; at 8K the same bytes cover twice the tokens (a 38K-token prompt streamed 20,805 experts
+  instead of 38,300). `kMaxCpuCallColumns` follows (`cpu_plan_kernel`'s two `short` column arrays
+  are 32 KiB of static shared memory at 8,192; 16,384 would need dynamic shared memory). An 8K call
+  is compute-bound: in a 16K-token prompt's profile the main stream ran kernels 12.7 of 15.9 s and
+  the link was busy 5.9 s (gate/up 4.4 s, the tensor-core linears' casts and epilogues ~2.5 s,
+  down 1.3 s, in-layer staging 1.3 s). The CPU share stays 0.5 (0.3 / 0.4 measured no better).
+- On a slow link a prompt's give-back no longer refills the frames it lent (897d725a). The refill
+  loaded every displaced expert in one burst, 2.5 GB after an 8K-token prompt (~0.75 s of the
+  link), and the decode rounds that followed slowed by about that much: an 8,063-token prompt then
+  128 tokens decoded at 57 tok/s with the refill, 67 with it capped to 1,086 frames and 83 without
+  (the same hit rate). Over 512 tokens and the requests after it, no refill decoded faster at an
+  equal or higher hit rate (decode promotes the experts it routes into the free frames), and the
+  next long prompt prefilled in the same time. The rule is the slow-link one (`kSlowLinkShare` of
+  the 27.5 GB/s reference); a fast link refills as before, and `lend()`'s undo always does.
+  Together, ABAB against 079c2fa2 (the same replies): 8,009 tokens 8.98-9.00 -> 8.23-8.24
+  s and the decode after it 72.7-72.9 -> 81.7-81.9 tok/s; 9,823 tokens 9.87-9.93 -> 9.60-9.67 s;
+  10,667 12.96 -> 12.41-12.44 s; 12,958 13.47-13.49 -> 12.70-12.75 s; 38,237 41.4-41.5 -> 38.4 s
+  (37.5 s with the 8K calls alone: without the refill a prompt right after another one starts with
+  fewer experts cached); 365-3,798 tokens unchanged (one call either way).
 
 Serving on a V100: `scripts/run-v100.sh <model>` is run.sh with the V100's defaults (the sm_70
 server from build-v100/, the memory-lock fallback, a GPU check). For Flash-Next it keeps run.sh's
