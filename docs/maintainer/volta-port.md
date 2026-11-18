@@ -289,6 +289,14 @@ Working with the 3.3 GB/s eGPU link (Flash-Next, measured 2026-11-17):
   (3.3 GB/s), so both are hardware limits here. Shrinking the stream's ring (1,024 frames) to keep
   more experts cached measured no better (ring 512: 5.17 s; 320: 5.04 s with 1,529 misses left
   to staging).
+- A prompt's first call reads its n-gram rows from the volume before anything else could run
+  (later calls' rows are prefetched during the previous call). `run_call` now uploads the other
+  inputs, starts the expert stream and queues the layers before the PLE layer first, then reads
+  the rows while the device and the link work (`Forward::run_front` / `run_back`, the same output).
+  3.9K tokens 5.15-5.25 -> 5.07-5.08 s; 939 tokens 1.87-2.05 -> 1.83-1.84 s; 2,149 tokens 3.46-3.48
+  -> 3.38 s. The read itself (46K random 4 KiB reads, 0.85 s) is the drive's limit: the YMTC
+  PC300-256GB (gen4 x4, no I/O scheduler) plateaus at ~43K random reads/s at any queue depth or
+  span (~115 us at depth 1). Making it faster would mean holding part of the 29 GB volume in RAM.
 
 Serving on a V100: `scripts/run-v100.sh <model>` is run.sh with the V100's defaults (the sm_70
 server from build-v100/, the memory-lock fallback, a GPU check). For Flash-Next it keeps run.sh's

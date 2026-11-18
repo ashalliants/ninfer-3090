@@ -3385,14 +3385,14 @@ private:
         upload_pinned(io_device_.p, io_host_.data(), tokens.size() * 4, device_.stream);
     }
 
-    // Stages the inputs of positions [begin, begin + width) of the lane's history and uploads them:
-    // write_inputs' words, then the n-gram rows.
-    void stage(std::int32_t begin, std::int32_t width) {
+    // Stages the inputs of positions [begin, begin + width) of the lane's history and uploads them,
+    // all but the n-gram rows (the last part of the block): run_call reads those while the device
+    // runs the layers before the PLE layer and the expert stream copies.
+    void stage_inputs(std::int32_t begin, std::int32_t width) {
         write_inputs(begin, width);
         write_mtp_chunk(begin, width);
         call_vision_ = stage_vision(begin, width);
-        const std::size_t rows = read_rows(begin, width);
-        upload_pinned(io_device_.p, io_host_.data(), plan_.io.ngram + rows, device_.stream);
+        upload_pinned(io_device_.p, io_host_.data(), plan_.io.ngram, device_.stream);
     }
 
     // The same in two uploads, so the forward's front can start before the rows are read.
@@ -3917,7 +3917,7 @@ private:
     // A wide call allocates from the lent workspace and streams its non-resident experts. With MTP
     // the call also writes the drafter's cells of its positions.
     void run_call(std::int32_t begin, std::int32_t width, bool wide) {
-        stage(begin, width);
+        stage_inputs(begin, width);
         residency_->before_round(device_.stream);
         auto b = batch(width);
         // --prefill-cpu-share: the call hands the CPU its share of each layer's misses (a call wider
@@ -3934,8 +3934,18 @@ private:
         }
         if (mtp_chunk_) { b.mtp_chunk = &*mtp_chunk_; }
         b.vision = call_vision_;
+        // The forward in two parts around the n-gram read: the front (the layers before the PLE
+        // layer, the only reader of the rows) and the expert stream's first copies are queued
+        // before the read, so a call whose rows were not prefetched (a prompt's first) reads them
+        // from the volume (~0.8 s for 4K tokens on this drive) while the device and the link work.
+        const std::uint32_t split = forward_->rows_layer();
+        const auto forward        = [&] {
+            forward_->run_front(b, split);
+            upload_rows(begin, width);
+            forward_->run_back(b, split, logits32_);
+        };
         if (!wide) {
-            forward_->run(b, logits32_);
+            forward();
         } else {
             forward_->use_workspace(*wide_work_);
             try {
@@ -3947,7 +3957,7 @@ private:
                 }
                 stream_->begin(residency_->host_table(), stream_tables_, ring_first_, ring_frames_, device_.stream,
                                share);
-                forward_->run(b, logits32_);
+                forward();
             } catch (...) {
                 stream_->end();
                 forward_->use_workspace(*work_);
