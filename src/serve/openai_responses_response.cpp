@@ -17,6 +17,15 @@ namespace {
 
 using Json = nlohmann::json;
 
+constexpr std::string_view kReasoningTokenPrefix = "ninfer-r1:";
+
+void add_reasoning_token(const OpenAIResponsesCreateRequest& request, const std::string& text,
+                         Json& item) {
+    if (request.include_reasoning_encrypted_content) {
+        item["encrypted_content"] = encode_reasoning_token(text);
+    }
+}
+
 std::string response_status(ninfer::FinishReason reason) {
     switch (reason) {
     case ninfer::FinishReason::OutputLimit:
@@ -167,13 +176,14 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
         const char* reasoning_status = (!outcome.text.empty() || !outcome.tool_calls.empty())
                                            ? "completed"
                                            : item_status.c_str();
-        built.output_items.push_back(
-            Json{{"id", ids.reasoning},
-                 {"type", "reasoning"},
-                 {"status", reasoning_status},
-                 {"summary", Json::array()},
-                 {"content",
-                  Json::array({Json{{"type", "reasoning_text"}, {"text", outcome.reasoning}}})}});
+        Json reasoning_item{{"id", ids.reasoning},
+                            {"type", "reasoning"},
+                            {"status", reasoning_status},
+                            {"summary", Json::array()},
+                            {"content", Json::array({Json{{"type", "reasoning_text"},
+                                                          {"text", outcome.reasoning}}})}};
+        add_reasoning_token(request, outcome.reasoning, reasoning_item);
+        built.output_items.push_back(std::move(reasoning_item));
     }
 
     if (needs_message_item(outcome, status)) {
@@ -268,6 +278,46 @@ Json in_progress_response(const std::string& id, std::int64_t created_at,
 
 } // namespace
 
+std::string encode_reasoning_token(const std::string& reasoning_text) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string token(kReasoningTokenPrefix);
+    token.reserve(token.size() + reasoning_text.size() * 2);
+    for (const unsigned char byte : reasoning_text) {
+        token.push_back(digits[byte >> 4]);
+        token.push_back(digits[byte & 15]);
+    }
+    return token;
+}
+
+bool has_reasoning_token_prefix(const std::string& token) {
+    return token.starts_with(kReasoningTokenPrefix);
+}
+
+std::optional<std::string> decode_reasoning_token(const std::string& token) {
+    if (!token.starts_with(kReasoningTokenPrefix)) { return std::nullopt; }
+    const std::string_view hex = std::string_view(token).substr(kReasoningTokenPrefix.size());
+    if (hex.size() % 2 != 0) { return std::nullopt; }
+    const auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') { return c - '0'; }
+        if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+        return -1;
+    };
+    std::string text;
+    text.reserve(hex.size() / 2);
+    for (std::size_t index = 0; index < hex.size(); index += 2) {
+        const int high = nibble(hex[index]);
+        const int low  = nibble(hex[index + 1]);
+        if (high < 0 || low < 0) { return std::nullopt; }
+        text.push_back(static_cast<char>(high << 4 | low));
+    }
+    // Reasoning text is JSON text everywhere it goes next; bytes that are not UTF-8 would fail
+    // there rather than here, as a server error.
+    try {
+        (void)Json(text).dump();
+    } catch (const Json::type_error&) { return std::nullopt; }
+    return text;
+}
+
 BuiltOpenAIResponse make_openai_response_object(const std::string& id, std::int64_t created_at,
                                                 const OpenAIResponsesCreateRequest& request,
                                                 const OpenAIResponsesRuntimeValues& runtime,
@@ -317,11 +367,12 @@ public:
         reasoning_done  = true;
         reasoning_text  = final_text;
         const Json part = {{"type", "reasoning_text"}, {"text", reasoning_text}};
-        const Json item = {{"id", ids.reasoning},
+        Json item       = {{"id", ids.reasoning},
                            {"type", "reasoning"},
                            {"status", item_status},
                            {"summary", Json::array()},
                            {"content", Json::array({part})}};
+        add_reasoning_token(request, reasoning_text, item);
         return {sse(event("response.reasoning_text.done", Json{{"item_id", ids.reasoning},
                                                                {"output_index", reasoning_index},
                                                                {"content_index", 0},
