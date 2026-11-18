@@ -361,6 +361,16 @@ Working with the 3.3 GB/s eGPU link (Flash-Next, measured 2026-11-17):
   from 365 to 146. Prompts (HEAD | this, the same replies): 3,935 tokens 4.74-4.75 | 4.62-4.65 s;
   3,798 4.11 | 3.88-3.90 s; 2,573 3.62-3.64 | 3.40-3.41 s; 2,212 3.39 | 3.19-3.20 s; 1,414
   2.84-2.85 | 2.78-2.79 s; 939 1.73 | 1.69-1.71 s; an 8,063-token prompt (two calls) 8.93 | 8.92-8.96 s.
+- Flash-Next serves its full 262,144-token context from `run-v100.sh` (ac760a09; run.sh's default
+  is 32,768). The INT8 KV pool backs 496 MiB at startup and grows into expert frames as a
+  conversation fills it (3.6 GiB at 256K), so the expert cache starts at 18,108 frames against
+  18,330 at 8K. Decode does not slow with context (2026-11-18, one request each, 256 tokens, MTP3):
+  10,670 tokens 68.8 tok/s at 29.4 ms per verification round; 38,240 72.2 at 27.3; 79,228 76.8 at
+  27.0; 148,129 77.9 at 27.3; 221,567 78.8 at 28.2; decode hit rates 97.9-99.3%. QSA reads a fixed
+  2,048-token budget per query, and its indexer's pass over the pooled keys (a quarter of the
+  context, 128-dim) stays small. tok/s follows MTP acceptance, which follows the content (1.97-2.65
+  tokens per round), not the context. A 221,567-token prompt prefills in 245 s (903 tok/s; 10,670
+  tokens 811 tok/s). Peak 68 C at 215 W through the whole run.
 
 Serving on a V100: `scripts/run-v100.sh <model>` is run.sh with the V100's defaults (the sm_70
 server from build-v100/, the memory-lock fallback, a GPU check). For Flash-Next it keeps run.sh's
