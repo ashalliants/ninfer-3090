@@ -28,6 +28,10 @@
 #     A prompt's row read halves (3.9K tokens 0.86 -> 0.50 s): 4-8% faster prefill (939 tokens
 #     1.82-2.00 -> 1.68-1.71 s), the same output. NINFER_NGRAM_RAM_MIB=0 turns it off (when other
 #     programs need that RAM), or N caps it at N MiB;
+#   - Flash-Next serves a 262,144-token context instead of run.sh's 32,768 (NINFER_CONTEXT
+#     overrides). The INT8 KV pool backs 496 MiB at startup and grows into the expert cache's frames
+#     only as a conversation gets long (3.6 GiB at 256K tokens), so the cache starts 222 frames (1%)
+#     smaller than at 8K; a 256K-token checkpoint (3.6 GiB) still fits the 4 GiB Host context tier;
 #   - Flash-Next MTP drafts step by step (--mtp-staged-drafts; NINFER_MTP_STAGED_DRAFTS=off turns it
 #     off): +2-4% decode, the same output;
 #   - Flash-Next MTP verification rounds compute part of their uncached experts on the CPU
@@ -96,6 +100,9 @@ case "$model_key" in
     # The n-gram table's blocks in the RAM the ledger spares last (after the experts, the context
     # cache and a 2 GiB margin): a prompt's row read halves on this drive (the same output).
     export NINFER_NGRAM_RAM_MIB="${NINFER_NGRAM_RAM_MIB:-auto}"
+    # The model's full 262,144-token context: the KV pool is backed as it fills, borrowing expert
+    # frames only then (run.sh's Flash-Next default is 32,768).
+    export NINFER_CONTEXT="${NINFER_CONTEXT:-262144}"
     # MTP drafts one step at a time and stops once no further draft could be verified (the same
     # output): a round mostly needs one or two of the three drafts, and a step is ~1.2 ms here.
     export NINFER_MTP_STAGED_DRAFTS="${NINFER_MTP_STAGED_DRAFTS:-on}"
