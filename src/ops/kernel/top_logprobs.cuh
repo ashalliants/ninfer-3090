@@ -17,9 +17,11 @@ namespace ninfer::ops {
 
 inline constexpr int kTopLogprobsBlock = 1024;
 
-// Monotone map of a finite float to an unsigned key (larger float, larger key).
+// Monotone map of a finite float to an unsigned key (larger float, larger key). -0 and +0 compare
+// equal, so they must share a key or the lower-row tie-break would not apply between them.
 __device__ __forceinline__ std::uint32_t top_logprobs_float_key(float value) {
-    const std::uint32_t bits = __float_as_uint(value);
+    std::uint32_t bits = __float_as_uint(value);
+    if (bits == 0x80000000u) { bits = 0u; }
     return (bits & 0x80000000u) != 0u ? ~bits : (bits | 0x80000000u);
 }
 

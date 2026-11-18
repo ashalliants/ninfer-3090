@@ -83,9 +83,53 @@ Expected oracle(const std::vector<std::uint16_t>& logits, const std::vector<std:
     return expected;
 }
 
+// Rows alternate between -0, +0 and a few small values: -0 and +0 are equal, so the lower row must
+// rank first whichever sign it carries.
+std::vector<std::uint16_t> make_signed_zero_logits(std::int32_t physical_rows,
+                                                   std::int32_t valid_rows, std::int32_t columns) {
+    std::vector<std::uint16_t> logits(static_cast<std::size_t>(physical_rows) * columns);
+    for (std::int32_t column = 0; column < columns; ++column) {
+        const std::size_t base = static_cast<std::size_t>(column) * physical_rows;
+        for (std::int32_t row = 0; row < valid_rows; ++row) {
+            float value;
+            switch ((row + column) % 5) {
+            case 0:
+                value = -0.0f;
+                break;
+            case 1:
+                value = 0.0f;
+                break;
+            case 2:
+                value = -0.0f;
+                break;
+            case 3:
+                value = -1.0f;
+                break;
+            default:
+                value = -2.5f;
+                break;
+            }
+            logits[base + static_cast<std::size_t>(row)] = f32_to_bf16(value);
+        }
+        for (std::int32_t row = valid_rows; row < physical_rows; ++row) {
+            logits[base + static_cast<std::size_t>(row)] = f32_to_bf16(90.0f);
+        }
+    }
+    return logits;
+}
+
+int run_logits_case(const std::string& label, std::int32_t physical_rows, std::int32_t valid_rows,
+                    std::int32_t columns, std::int32_t k, const std::vector<std::uint16_t>& logits);
+
 int run_case(const std::string& label, std::int32_t physical_rows, std::int32_t valid_rows,
              std::int32_t columns, std::int32_t k, std::uint32_t distinct) {
-    const auto logits = make_logits(physical_rows, valid_rows, columns, distinct);
+    return run_logits_case(label, physical_rows, valid_rows, columns, k,
+                           make_logits(physical_rows, valid_rows, columns, distinct));
+}
+
+int run_logits_case(const std::string& label, std::int32_t physical_rows, std::int32_t valid_rows,
+                    std::int32_t columns, std::int32_t k,
+                    const std::vector<std::uint16_t>& logits) {
     std::vector<std::int32_t> chosen(static_cast<std::size_t>(columns));
     for (std::int32_t column = 0; column < columns; ++column) {
         chosen[static_cast<std::size_t>(column)] = (column * 7919 + 13) % valid_rows;
@@ -227,6 +271,8 @@ int main() {
     failures += run_case("top_logprobs k=1", 523, 509, 9, 1, 1024);
     failures += run_case("top_logprobs k equals valid_rows", 40, 7, 3, 7, 6);
     failures += run_case("top_logprobs fewer rows than threads", 20, 20, 2, 20, 1024);
+    failures += run_logits_case("top_logprobs signed zeros tie by row", 64, 40, 5, 20,
+                                make_signed_zero_logits(64, 40, 5));
     failures += run_validation_cases();
 
     std::cout << (failures ? "FAIL" : "OK") << " top_logprobs\n";
