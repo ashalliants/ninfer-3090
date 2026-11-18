@@ -1102,4 +1102,22 @@ graft_reset
 run_graft HF_TOKEN=t NINFER_GRAFTS=off >/dev/null || graft_fail 'NINFER_GRAFTS=off failed the model download'
 [[ ! -s "$GRAFT_LOG" && ! -e "$gdir" ]] || graft_fail 'NINFER_GRAFTS=off still fetched'
 
+# scripts/run-v100.sh finds the server scripts/v100_build.sh built: in BUILD_DIR when it is set,
+# else in that script's default, $HOME/build-v100, wherever the checkout is.
+v100_fail() { printf 'run-v100.sh: %s\n' "$1" >&2; exit 1; }
+for layout in build-dir home; do
+  v100_home="$tmp/v100-$layout-home"; v100_tree="$tmp/v100-$layout-tree"
+  [[ "$layout" == home ]] && v100_tree="$v100_home/build-v100"
+  mkdir -p -- "$v100_home" "$v100_tree/apps"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$0" > "$NINFER_TEST_WHO"\nprintf "%%s\\n" "$@" > "$NINFER_TEST_ARGS"\n' \
+    > "$v100_tree/apps/ninfer-serve"
+  chmod +x "$v100_tree/apps/ninfer-serve"
+  v100_build=(); [[ "$layout" == build-dir ]] && v100_build=(BUILD_DIR="$v100_tree")
+  clear_env HOME="$v100_home" NINFER_TEST_WHO="$tmp/v100.who" NINFER_TEST_ARGS="$tmp/v100.args" \
+    NINFER_MODEL_DIR="$tmp" ${v100_build[@]+"${v100_build[@]}"} "$root/run-v100.sh" qwen38-27b \
+    >/dev/null 2>&1 || v100_fail "($layout) did not start the server it built"
+  [[ "$(cat -- "$tmp/v100.who")" == "$v100_tree/apps/ninfer-serve" ]] ||
+    v100_fail "($layout) started $(cat -- "$tmp/v100.who"), not $v100_tree/apps/ninfer-serve"
+done
+
 printf '%s\n' 'Linux script checks passed.'
