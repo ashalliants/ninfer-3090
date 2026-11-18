@@ -310,6 +310,11 @@ std::optional<std::string> decode_reasoning_token(const std::string& token) {
         if (high < 0 || low < 0) { return std::nullopt; }
         text.push_back(static_cast<char>(high << 4 | low));
     }
+    // Reasoning text is JSON text everywhere it goes next; bytes that are not UTF-8 would fail
+    // there rather than here, as a server error.
+    try {
+        (void)Json(text).dump();
+    } catch (const Json::type_error&) { return std::nullopt; }
     return text;
 }
 

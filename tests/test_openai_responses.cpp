@@ -1545,6 +1545,13 @@ int test_include_reasoning_encrypted_content() {
         check(api_code([&] { (void)replay_turns(tampered); }) == "reasoning_content_not_supported",
               "a corrupted encrypted_content token was accepted");
 
+    // Well-formed hex that spells bytes which are not UTF-8 is a damaged token too.
+    Json not_utf8                 = stripped;
+    not_utf8["encrypted_content"] = "ninfer-r1:ff";
+    failures +=
+        check(api_code([&] { (void)replay_turns(not_utf8); }) == "reasoning_content_not_supported",
+              "a token that decodes to invalid UTF-8 was accepted");
+
     // A damaged token is refused even beside the raw content that would have made it unnecessary;
     // another provider's token beside raw content is ignored, as before.
     Json damaged_with_content = item;
