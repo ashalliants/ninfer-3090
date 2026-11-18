@@ -61,7 +61,14 @@ scripts/run-v100.sh qwen38-flash-next     # or: scripts/run-v100.sh qwen38-27b
 
 `run-v100.sh` finds the `sm_70` server in `build-v100/` (or uses `NINFER_SERVER`), checks that the
 card is a V100 with nothing else running on it, and starts `run.sh` with the V100's measured
-defaults. Every `NINFER_*` variable you set still wins. These are the defaults it sets:
+defaults. Every `NINFER_*` variable you set still wins.
+
+The server listens on every interface (`0.0.0.0`), so other machines on the network reach it at
+`http://<this machine's IP or host name>:8080`. Set `NINFER_API_KEY` as well: without a key,
+anyone who can reach the port can use the model, and the launcher and server both warn about it.
+`NINFER_HOST=127.0.0.1` keeps it local to this machine.
+
+These are the model defaults it sets:
 
 | Setting | Model | Effect on the V100 |
 |---|---|---|
@@ -73,6 +80,30 @@ defaults. Every `NINFER_*` variable you set still wins. These are the defaults i
 | `NINFER_CPU_VERIFY_MISSES=on` | Flash-Next | During decode, experts that miss the cache are computed on CPU threads beside the GPU. A cold cache decodes at 68-80 instead of 48-63 tok/s |
 | `NINFER_HOT_EMBEDDING_ROWS=8192` | Flash-Next | Only the common embedding rows stay in VRAM, freeing room for 216 more cached experts |
 | `NINFER_SPEC=mtp`, `NINFER_KV_DTYPE=int8` | 27B | MTP3 with INT8 KV, which is faster than DFlash2 on this card (76 against 66 tok/s on code) |
+
+### Refusal steering (Flash-Next)
+
+The community refusal-direction vector for Qwen3.8-Flash-Next ships in the Strata repository as
+[`data/experimental-speed-projection/Qwen3.8-Flash-Next-experimental-speed-projection.gguf`](https://github.com/Niko1221/Strata/tree/main/data/experimental-speed-projection),
+480 KB. Strata presents it as an off-by-default "experimental speed projection", but its README
+says what it is: a refusal-direction projection that makes the model decline far fewer requests,
+removing a safety behaviour. The Qwen Community License of the model applies to it.
+
+The file holds directions for layers 1-47, but its authors apply only layers 4-44 (`layer_range`
+in the JSON beside it; their scores are for that range). `--graft` applies every direction in the
+file, so make a copy with only those layers, then load it:
+
+```bash
+python3 tools/control_vector_layers.py Qwen3.8-Flash-Next-experimental-speed-projection.gguf \
+    flash-next-refusal-L4-44.gguf --first 4 --last 44
+NINFER_GRAFT="uncensored=$PWD/flash-next-refusal-L4-44.gguf" scripts/run-v100.sh qwen38-flash-next
+```
+
+A request then opts in with `"graft": "uncensored"`. `NINFER_DEFAULT_GRAFT=uncensored` applies it to
+every request that names no graft, and a request opts out with `"graft": ""`. On the V100,
+`ninfer_qwen4_exp_steering_real_test` passes with this copy, and a steered request gives a
+different answer from the same unsteered one (2026-11-18). Loaded, the vector costs about 50 us
+per token even for requests that do not select it; with no vector loaded, nothing changes.
 
 ## Performance
 

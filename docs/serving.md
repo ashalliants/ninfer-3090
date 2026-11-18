@@ -2363,7 +2363,13 @@ Qwen3.8-Flash-Next has no hidden prompts. On it `--graft NAME=PATH` loads a **re
 control vector** instead: a GGUF file with one `direction.N` tensor of 2,560 F32 values per steered
 layer (the llama.cpp control-vector layout, `general.architecture` `controlvector`, with
 `controlvector.model_hint` `qwen4exp` when it names a model). The community publishes one for this
-model (for Strata, which loads it with `--control-vector-scaled ... --cvec-mode project`).
+model (for Strata, which loads it with `--control-vector-scaled ... --cvec-mode project`). Strata
+ships it as `data/experimental-speed-projection/Qwen3.8-Flash-Next-experimental-speed-projection.gguf`
+in [its repository](https://github.com/Niko1221/Strata/tree/main/data/experimental-speed-projection).
+That file holds layers 1-47, but its authors apply layers 4-44, and NInfer applies every direction
+in the file: `python3 tools/control_vector_layers.py IN.gguf OUT.gguf --first 4 --last 44` makes the
+copy to load. The launchers take `NINFER_GRAFT=NAME=PATH` (several separated by `;`) and
+`NINFER_DEFAULT_GRAFT`.
 
 ```bash
 ninfer-serve qwen4exp.ninfer --graft uncensored=C:/vectors/orcarouter.gguf
