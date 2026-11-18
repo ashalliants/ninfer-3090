@@ -140,6 +140,22 @@ __global__ void quantize_x_kernel(const __nv_bfloat16* __restrict__ x, int colum
 // halves, so the eight rows an ldmatrix phase reads fall in distinct banks.
 __device__ __forceinline__ int tile_offset(int r, int h) { return r * 32 + ((h ^ ((r >> 2) & 1)) << 4); }
 
+#if defined(NINFER_SM70)
+// sm_70 has no integer tensor cores: the emulated ldmatrix and mma cost ~4x the dp4a they wrap in
+// shuffles. Instead each thread reads its own rows and columns of a warp's m16n8 tiles (rows
+// row_a[t] + gq + 8 rh, columns cgroup + 8 nt + 2 tig + j: the mma fragment's ownership) and sums
+// them with dp4a. Integer sums are exact in any order, so the results are the mma's bit for bit.
+__device__ __forceinline__ int dot16(int4 a, int4 b, int acc) {
+    acc = __dp4a(a.x, b.x, acc);
+    acc = __dp4a(a.y, b.y, acc);
+    acc = __dp4a(a.z, b.z, acc);
+    return __dp4a(a.w, b.w, acc);
+}
+__device__ __forceinline__ int4 lds_half(const std::uint8_t* tile, int r, int h) {
+    return *reinterpret_cast<const int4*>(tile + tile_offset(r, h));
+}
+#endif
+
 struct alignas(16) Tiles {
     std::uint8_t w[kWStages][kMaxLeafSubs][kRows][32];        // decoded weights per stage and sub-block
     std::uint8_t x[kXStages][kMaxLeafSubs][kTileColumns][32]; // the columns' A8 codes
@@ -405,6 +421,17 @@ __global__ void __launch_bounds__(kThreads, 1)
                 const int s = static_cast<int>(__brev(static_cast<unsigned>(n)) >> 27);
                 float v[2][2][4];
                 if (s < kDownSubs) {
+#if defined(NINFER_SM70)
+                    int4 wr[2][2][2]; // [t][rh][half]
+#pragma unroll
+                    for (int t = 0; t < 2; ++t) {
+#pragma unroll
+                        for (int rh = 0; rh < 2; ++rh) {
+                            wr[t][rh][0] = lds_half(&sm.w[s][0][0], row_a[t] + gq + 8 * rh, 0);
+                            wr[t][rh][1] = lds_half(&sm.w[s][0][0], row_a[t] + gq + 8 * rh, 1);
+                        }
+                    }
+#else
                     unsigned a[2][4], b[4];
 #pragma unroll
                     for (int t = 0; t < 2; ++t) {
@@ -419,6 +446,7 @@ __global__ void __launch_bounds__(kThreads, 1)
                         ldmatrix_x4(b[0], b[1], b[2], b[3],
                                     static_cast<unsigned>(__cvta_generic_to_shared(&sm.x[s][0][0] + tile_offset(c, m & 1))));
                     }
+#endif
                     float cr[2][2];
 #pragma unroll
                     for (int t = 0; t < 2; ++t) {
@@ -429,10 +457,25 @@ __global__ void __launch_bounds__(kThreads, 1)
                     for (int nt = 0; nt < 2; ++nt) {
                         const int c0     = cgroup + 8 * nt + 2 * tig;
                         const float d[2] = {sm.xd[s][c0], sm.xd[s][c0 + 1]};
+#if defined(NINFER_SM70)
+                        int4 xc[2][2]; // [j][half]
+#pragma unroll
+                        for (int j = 0; j < 2; ++j) {
+                            xc[j][0] = lds_half(&sm.x[s][0][0], c0 + j, 0);
+                            xc[j][1] = lds_half(&sm.x[s][0][0], c0 + j, 1);
+                        }
+#endif
 #pragma unroll
                         for (int t = 0; t < 2; ++t) {
                             int acc[4] = {kBias, kBias, kBias, kBias};
+#if defined(NINFER_SM70)
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) {
+                                acc[i] = dot16(wr[t][i / 2][1], xc[i % 2][1], dot16(wr[t][i / 2][0], xc[i % 2][0], kBias));
+                            }
+#else
                             mma_s8(acc[0], acc[1], acc[2], acc[3], a[t][0], a[t][1], a[t][2], a[t][3], b[2 * nt], b[2 * nt + 1]);
+#endif
 #pragma unroll
                             for (int i = 0; i < 4; ++i) {
                                 const float p = __fsub_rn(__int_as_float(acc[i]), kBiasValue); // m0 = m1 = 1
@@ -564,8 +607,19 @@ __global__ void __launch_bounds__(kThreads, 1)
 #pragma unroll
                 for (int k = 0; k < kMaxLeafSubs; ++k) {
                     if (k >= subs) { break; }
-                    unsigned a[2][4], b[4];
                     const auto* wbase = &sm.w[ws][k][0][0];
+#if defined(NINFER_SM70)
+                    int4 wr[2][2][2]; // [t][rh][half]
+#pragma unroll
+                    for (int t = 0; t < 2; ++t) {
+#pragma unroll
+                        for (int rh = 0; rh < 2; ++rh) {
+                            wr[t][rh][0] = lds_half(wbase, row_a[t] + gq + 8 * rh, 0);
+                            wr[t][rh][1] = lds_half(wbase, row_a[t] + gq + 8 * rh, 1);
+                        }
+                    }
+#else
+                    unsigned a[2][4], b[4];
 #pragma unroll
                     for (int t = 0; t < 2; ++t) {
                         const int m = lane / 8;
@@ -581,6 +635,7 @@ __global__ void __launch_bounds__(kThreads, 1)
                         ldmatrix_x4(b[0], b[1], b[2], b[3],
                                     static_cast<unsigned>(__cvta_generic_to_shared(&sm.x[xs][k][0][0] + tile_offset(c, m & 1))));
                     }
+#endif
                     float cr[2][2], m0[2][2], m1[2][2];
 #pragma unroll
                     for (int t = 0; t < 2; ++t) {
@@ -595,6 +650,27 @@ __global__ void __launch_bounds__(kThreads, 1)
 #pragma unroll
                     for (int nt = 0; nt < 2; ++nt) {
                         int lo[2][4], hi[2][4];
+#if defined(NINFER_SM70)
+                        int4 xc[2][2]; // [j][half]
+#pragma unroll
+                        for (int j = 0; j < 2; ++j) {
+                            xc[j][0] = lds_half(&sm.x[xs][k][0][0], cgroup + 8 * nt + 2 * tig + j, 0);
+                            xc[j][1] = lds_half(&sm.x[xs][k][0][0], cgroup + 8 * nt + 2 * tig + j, 1);
+                        }
+#pragma unroll
+                        for (int t = 0; t < 2; ++t) {
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) {
+                                const int rh = i / 2, j = i % 2;
+                                if constexpr (kOneMultiplier<F>) {
+                                    lo[t][i] = dot16(wr[t][rh][1], xc[j][1], dot16(wr[t][rh][0], xc[j][0], kBias));
+                                } else {
+                                    lo[t][i] = dot16(wr[t][rh][0], xc[j][0], kBias);
+                                    hi[t][i] = dot16(wr[t][rh][1], xc[j][1], kBias);
+                                }
+                            }
+                        }
+#else
 #pragma unroll
                         for (int t = 0; t < 2; ++t) {
 #pragma unroll
@@ -607,6 +683,7 @@ __global__ void __launch_bounds__(kThreads, 1)
                                 mma_s8_k16(hi[t][0], hi[t][1], hi[t][2], hi[t][3], a[t][2], a[t][3], b[2 * nt + 1]);
                             }
                         }
+#endif
                         const int c0     = cgroup + 8 * nt + 2 * tig;
                         const float d[2] = {sm.xd[xs][c0][k], sm.xd[xs][c0 + 1][k]};
 #pragma unroll
