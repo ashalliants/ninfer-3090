@@ -1914,12 +1914,19 @@ wire response contains typed `output` Items.
 | `parallel_tool_calls` | `true` by default; `false` enforces at most one call |
 | `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; NInfer does not execute hosted tools |
 | `truncation` | omitted or `disabled`; overlong input fails instead of silently dropping Items |
-| `top_logprobs` | omitted or `0` |
+| `top_logprobs` | `0` to `20`, the alternatives per generated token; nonzero needs `include` to contain `message.output_text.logprobs`; see [log probabilities](#responses-log-probabilities) |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |
 | `background` | omitted or `false` |
-| `include` | omitted or an empty array |
+| `include` | `reasoning.encrypted_content` (reasoning Items also carry `encrypted_content`, a plain encoding of the raw reasoning text that lets a `store=false` client replay it: not encryption or a signature) and `message.output_text.logprobs` (see [log probabilities](#responses-log-probabilities)); any other value fails with `include_not_supported` |
 | `stream_options.include_obfuscation` | optional boolean; accepted as a transport hint, but this local server emits no padding |
 | cache and client hints | `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, and explicit breakpoints follow [OpenAI prompt caching](#openai-prompt-caching); `safety_identifier` and `user` are accepted as client hints |
+
+<a id="responses-log-probabilities"></a>
+**Log probabilities.** With `include: ["message.output_text.logprobs"]` the message's `output_text`
+part carries `logprobs`, the same entries as [Chat](#chat-log-probabilities) (`token`, `logprob`,
+`bytes`, and `top_logprobs` when `top_logprobs` is set), one for every generated token. The same
+limits apply: non-streaming only, and thinking disabled (`reasoning.effort: "none"`); anything else
+fails with `logprobs_not_supported`.
 
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
 with a field-specific 400 error instead of being silently ignored.

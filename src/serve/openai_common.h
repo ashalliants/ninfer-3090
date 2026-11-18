@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace ninfer::serve {
 
@@ -77,6 +78,12 @@ std::string make_error_body(const ApiError& error);
 std::int64_t unix_time_now();
 
 void validate_openai_model(std::string_view requested, std::string_view available);
+
+// The OpenAI wire form of token log-probabilities, shared by Chat (`choices[].logprobs.content`)
+// and Responses (`output_text.logprobs`): [{token, logprob, bytes, top_logprobs: [{token, logprob,
+// bytes}]}], one per generated token. A token's text is lossy UTF-8 (U+FFFD for a stretch that is
+// not valid alone) and `bytes` is exact.
+nlohmann::json openai_logprob_entries(const std::vector<ninfer::TokenLogprob>& tokens);
 
 std::string new_openai_chat_completion_id();
 std::string new_openai_chat_tool_call_id();

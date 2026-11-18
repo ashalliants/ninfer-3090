@@ -1487,7 +1487,7 @@ int test_include_reasoning_encrypted_content() {
         check(rejected.empty(), "include=[reasoning.encrypted_content] was rejected: " + rejected);
 
     Json unknown       = base;
-    unknown["include"] = Json::array({"message.output_text.logprobs"});
+    unknown["include"] = Json::array({"web_search_call.action.sources"});
     failures += check(api_code([&] {
                           (void)parse_openai_responses_create_request(unknown, limits());
                       }) == "include_not_supported",
@@ -1595,6 +1595,67 @@ int test_include_reasoning_encrypted_content() {
             terminal.at("response").at("output").at(0).value("encrypted_content", std::string()) ==
                 item.at("encrypted_content").get<std::string>(),
         "streamed reasoning item lacks the requested encrypted_content");
+    return failures;
+}
+
+// include=["message.output_text.logprobs"] with top_logprobs: the log-probabilities of every
+// generated token on the output_text part, like Chat's.
+int test_output_text_logprobs() {
+    const Json base = {{"model", "m"}, {"input", "hello"}, {"store", false}};
+    int failures    = 0;
+
+    Json asked            = base;
+    asked["include"]      = Json::array({"message.output_text.logprobs"});
+    asked["top_logprobs"] = 2;
+    const OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(asked, limits());
+    failures += check(request.prompt.generation.logprobs_top_k == 2U,
+                      "include + top_logprobs did not request the alternatives");
+    Json include_only       = base;
+    include_only["include"] = Json::array({"message.output_text.logprobs"});
+    failures += check(parse_openai_responses_create_request(include_only, limits())
+                              .prompt.generation.logprobs_top_k == 0U,
+                      "include alone requests the chosen token only");
+    failures += check(
+        !parse_openai_responses_create_request(base, limits()).prompt.generation.logprobs_top_k,
+        "logprobs were requested without asking");
+
+    Json orphan            = base;
+    orphan["top_logprobs"] = 3;
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(orphan, limits());
+                      }) == "logprobs_not_supported",
+                      "top_logprobs without the include was accepted");
+    Json streamed      = asked;
+    streamed["stream"] = true;
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(streamed, limits());
+                      }) == "logprobs_not_supported",
+                      "streamed logprobs were accepted");
+
+    GenerationOutcome outcome = sample_outcome();
+    outcome.token_logprobs.push_back(
+        ninfer::TokenLogprob{.sampled = {.token = 65, .logprob = -0.25F, .bytes = "A"},
+                             .top     = {{.token = 65, .logprob = -0.25F, .bytes = "A"},
+                                         {.token = 66, .logprob = -2.5F, .bytes = "B"}}});
+    const BuiltOpenAIResponse built =
+        make_openai_response_object("resp_lp", 1, request, {}, outcome);
+    const Json& part = built.body.at("output").at(1).at("content").at(0);
+    failures +=
+        check(part.at("logprobs").size() == 1 && part.at("logprobs")[0].at("token") == "A" &&
+                  part.at("logprobs")[0].at("logprob") == -0.25 &&
+                  part.at("logprobs")[0].at("bytes") == Json::array({65}) &&
+                  part.at("logprobs")[0].at("top_logprobs").size() == 2 &&
+                  part.at("logprobs")[0].at("top_logprobs")[1].at("token") == "B",
+              "the output_text part does not carry the token's logprobs");
+    failures += check(built.body.at("top_logprobs") == 2,
+                      "the response does not report the requested top_logprobs");
+    const BuiltOpenAIResponse plain = make_openai_response_object(
+        "resp_plain", 1, parse_openai_responses_create_request(base, limits()), {},
+        sample_outcome());
+    failures += check(plain.body.at("output").at(1).at("content").at(0).at("logprobs").empty() &&
+                          plain.body.at("top_logprobs") == 0,
+                      "a request that did not ask carries logprobs");
     return failures;
 }
 
@@ -1939,6 +2000,7 @@ int main() {
     failures += test_prompt_cache_key_retention();
     failures += test_reasoning_summary_options();
     failures += test_response_object();
+    failures += test_output_text_logprobs();
     failures += test_include_reasoning_encrypted_content();
     failures += test_sse_sequence_and_failures();
     failures += test_input_tokens_uses_shared_state_path();

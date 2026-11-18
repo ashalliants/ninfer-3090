@@ -1486,12 +1486,17 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
                         "background_not_supported");
         }
     }
+    bool include_logprobs = false;
     if (body.contains("include") && !body.at("include").is_null()) {
         if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
         for (const Json& entry : body.at("include")) {
             if (!entry.is_string()) { bad_request("include entries must be strings", "include"); }
             if (entry.get<std::string>() == "reasoning.encrypted_content") {
                 out.include_reasoning_encrypted_content = true;
+                continue;
+            }
+            if (entry.get<std::string>() == "message.output_text.logprobs") {
+                include_logprobs = true;
                 continue;
             }
             bad_request("the requested additional response field '" + entry.get<std::string>() +
@@ -1522,14 +1527,25 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
                         "service_tier", "service_tier_not_supported");
         }
     }
+    int top_logprobs_count = 0;
     if (const std::optional<int> top_logprobs = optional_int(body, "top_logprobs")) {
         if (*top_logprobs < 0 || *top_logprobs > 20) {
             bad_request("top_logprobs must be in [0,20]", "top_logprobs");
         }
-        if (*top_logprobs != 0) {
-            bad_request("the Engine does not return token log probabilities", "top_logprobs",
+        if (*top_logprobs != 0 && !include_logprobs) {
+            bad_request("top_logprobs requires include to contain message.output_text.logprobs",
+                        "top_logprobs", "logprobs_not_supported");
+        }
+        top_logprobs_count = *top_logprobs;
+    }
+    if (include_logprobs) {
+        // The Engine returns them for a finished request, so a stream cannot carry them (and the
+        // generation service requires thinking to be off).
+        if (out.stream) {
+            bad_request("log probabilities are not available for streaming responses", "include",
                         "logprobs_not_supported");
         }
+        out.prompt.generation.logprobs_top_k = static_cast<std::uint32_t>(top_logprobs_count);
     }
     if (const std::optional<int> max_tool_calls = optional_int(body, "max_tool_calls")) {
         if (*max_tool_calls < 0) {
