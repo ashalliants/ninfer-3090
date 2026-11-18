@@ -527,6 +527,7 @@ struct FlashNextOptions {
     bool ngram_keepalive_ms_set   = false;
     bool ram_headroom_bytes_set   = false;
     bool cpu_verify_workers_set   = false;
+    bool prefill_cpu_max_columns_set = false;
     // --ngram-ram-mib N|auto: hold up to this many bytes of the n-gram volume's blocks in RAM, so a
     // prompt's rows in them are copied instead of read from the drive (a cold prompt's read shrinks
     // by the held fraction). Only what the RAM ledger spares after the experts, the context cache,

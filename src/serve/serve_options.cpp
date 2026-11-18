@@ -1123,7 +1123,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
         } else if (arg == "--prefill-cpu-max-columns") {
             const int columns = parse_nonnegative_int(require_value("--prefill-cpu-max-columns"), "prefill-cpu-max-columns");
             if (columns < 1 || columns > 64) { throw std::invalid_argument("--prefill-cpu-max-columns must be 1..64"); }
-            options.flash_next.prefill_cpu_max_columns = static_cast<std::uint32_t>(columns);
+            options.flash_next.prefill_cpu_max_columns     = static_cast<std::uint32_t>(columns);
+            options.flash_next.prefill_cpu_max_columns_set = true;
         } else if (arg == "--prefill-cpu-all-columns") {
             const int columns = parse_nonnegative_int(require_value("--prefill-cpu-all-columns"), "prefill-cpu-all-columns");
             if (columns > 65536) { throw std::invalid_argument("--prefill-cpu-all-columns must be at most 65536"); }
