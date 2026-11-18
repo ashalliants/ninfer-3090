@@ -26,6 +26,9 @@
 #     quarter of the routed experts do not fit in VRAM, so a prompt's first pass misses 3-7% of
 #     the experts it routes to. Over this card's 3.3 GB/s link, that first pass decoded 48-63
 #     tok/s and now decodes 68-80 (2026-11-18). With a warm cache it is within 2% either way;
+#   - Flash-Next keeps only the token embedding's first 8192 rows in VRAM (--hot-embedding-rows
+#     8192; NINFER_HOT_EMBEDDING_ROWS=0 keeps the whole table): 216 more expert frames, the same
+#     output, a prompt's first pass +1-1.5%;
 #   - the memory-lock limit: Flash-Next pins 33 GiB of experts. When `ulimit -l` is below that and
 #     cannot be raised here, NINFER_ALLOW_UNLOCKED_HOST_MEMORY=on is set (the server then continues
 #     and still fails loudly if the pin itself fails). To lift the limit for good, as root:
@@ -76,6 +79,8 @@ case "$model_key" in
     # A verification round's misses go partly to CPU threads beside the GPU instead of over the link
     # (the same output): a prompt's first pass, 48-63 -> 68-80 tok/s on this card.
     export NINFER_CPU_VERIFY_MISSES="${NINFER_CPU_VERIFY_MISSES:-on}"
+    # The embedding's rare rows are read from pinned RAM, giving their VRAM to the expert cache.
+    export NINFER_HOT_EMBEDDING_ROWS="${NINFER_HOT_EMBEDDING_ROWS:-8192}"
     lock_kib="$(ulimit -l)"
     need_kib=$(( 36 * 1024 * 1024 )) # the 33 GiB expert pin and its neighbours
     if [[ "$lock_kib" != 'unlimited' ]] && (( lock_kib < need_kib )); then
