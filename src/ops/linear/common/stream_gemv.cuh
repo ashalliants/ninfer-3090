@@ -102,14 +102,18 @@ __device__ __forceinline__ void stream_gemv_split_vector(int i, int col_vectors,
     }
 }
 
+// Stages x[k0, k0 + chunk_k) of every token, laid out for chunk_k. Only the first valid_k of them
+// exist (the last chunk of a K that chunk_k does not divide): the rest are staged as zeros and never
+// read from global memory, since x ends at the token's row (the kernel's slices stop at valid_k).
 template <class Format, int Threads, int Cols>
 __device__ __forceinline__ void stream_gemv_stage(const __nv_bfloat16* __restrict__ x,
                                                   std::int64_t x_stride, int k0, int chunk_k,
-                                                  float4* __restrict__ chunks,
+                                                  int valid_k, float4* __restrict__ chunks,
                                                   float* __restrict__ corrections) {
     static_assert(Threads % 32 == 0, "four consecutive threads share a slice");
     constexpr int kPassVectors = 4;
     const int col_vectors      = chunk_k / 8; // 8 bf16 each; four per 32-weight slice
+    const int valid_vectors    = valid_k / 8;
     const int col_slices       = chunk_k / 32;
     const int vector_count     = Cols * col_vectors;
     for (int pass = 0; pass < vector_count; pass += Threads * kPassVectors) {
@@ -121,7 +125,9 @@ __device__ __forceinline__ void stream_gemv_stage(const __nv_bfloat16* __restric
             if (i < vector_count) {
                 int col, j;
                 stream_gemv_split_vector<Cols>(i, col_vectors, col, j);
-                loaded[p] = __ldg(reinterpret_cast<const uint4*>(x + col * x_stride + k0) + j);
+                if (j < valid_vectors) {
+                    loaded[p] = __ldg(reinterpret_cast<const uint4*>(x + col * x_stride + k0) + j);
+                }
             }
         }
 #pragma unroll
@@ -259,7 +265,8 @@ void stream_gemv_kernel(
         // overlap. The barrier first lets every warp finish reading the previous chunk.
         fetch(item, step, current);
         if (chunk > 0) __syncthreads();
-        stream_gemv_stage<Format, Warps * 32, Cols>(x, x_stride, k0, chunk_k, chunks, corrections);
+        stream_gemv_stage<Format, Warps * 32, Cols>(x, x_stride, k0, chunk_k, min(chunk_k, k - k0),
+                                                    chunks, corrections);
         __syncthreads();
 
         float acc[Rows][Cols];

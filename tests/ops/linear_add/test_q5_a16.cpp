@@ -44,6 +44,14 @@ int q5_a16_conformance() {
             "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
             ShapeCase{5120, k, 401U, no_starts, full, {}, true, 0});
     }
+    // T = 8 alone, so the activation ends where the last token's row does: the K-chunked
+    // streaming GEMV (sm_70 decode/verify, T >= 2) stages K = 17408 in chunks that do not divide
+    // it, and its last chunk must stage only the K that is left. Reading a full chunk there runs
+    // kilobytes past the allocation, which compute-sanitizer memcheck reports.
+    constexpr std::array<std::int32_t, 1> exact{8};
+    failures += ninfer::test::linear_add::run_shape(
+        "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
+        ShapeCase{5120, 17408, 403U, no_starts, exact, {}, true, 0});
     return failures;
 }
 
