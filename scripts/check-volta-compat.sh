@@ -11,6 +11,9 @@
 #   __reduce_{max,...}_sync  -> ops/common/warp.cuh      (masked_reduce_max, ...)
 #   asm "tanh.approx..."     -> ops/common/math.cuh      (sigmoid_approx)
 #
+# `mma.sync.aligned.m8n8k4` is Volta's own HMMA shape (sm_70+; the tensor-core kernels written for the
+# V100 use it), so it is not an Ampere-only instruction and is not flagged.
+#
 # The helpers themselves and the TMA routes (Hopper and Blackwell only; the build never instantiates
 # them for sm_8x or sm_70) are the only places allowed to name the instructions.
 set -euo pipefail
@@ -20,7 +23,9 @@ cd "$root"
 allowed='^src/ops/common/(mma|memory|volta_compat|warp|math)\.cuh:|^src/ops/linear/(fp8/fp8_a8_tma_mma|bf16/bf16_a16_tma_mma|nvfp4/nvfp4_a4_tma)\.cuh:|^src/ops/common/mbarrier\.cuh:'
 instruction='"(mma\.sync\.aligned|cp\.async\.(ca|cg)\.shared|cp\.async\.(commit_group|wait_group)|ldmatrix\.sync|tanh\.approx\.f32)|[^_a-z]__reduce_(max|min|add|or|and|xor)_sync\('
 
-hits="$(grep -rnE "$instruction" src --include='*.cu' --include='*.cuh' --include='*.h' | grep -vE "$allowed" || true)"
+volta_native='mma\.sync\.aligned\.m8n8k4\.'
+hits="$(grep -rnE "$instruction" src --include='*.cu' --include='*.cuh' --include='*.h' | grep -vE "$allowed" |
+  grep -vE "$volta_native" || true)"
 
 if [ -n "$hits" ]; then
   echo "Ampere-only instructions outside the helpers that emulate them on sm_70:" >&2
