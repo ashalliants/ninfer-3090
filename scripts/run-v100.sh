@@ -22,12 +22,12 @@
 #     calls hand it cold experts routed up to 64 tokens at share 0.5 (--prefill-cpu-max-columns 64
 #     --prefill-cpu-share 0.5; NINFER_PREFILL_CPU_MAX_COLUMNS=8 NINFER_PREFILL_CPU_SHARE=0.4 restore
 #     the tuned profile's);
-#   - opt-in, not set by default: NINFER_NGRAM_RAM_MIB=auto (--ngram-ram-mib) holds as much of the
-#     29 GB n-gram table in RAM as the RAM ledger spares after the experts, the context cache and
-#     a 2 GiB margin beyond the reserve (~13 GiB, half the table, on a 59 GiB host; ~6 GiB stays
-#     available), loaded in ~6 s after startup. A prompt's row read halves (3.9K tokens 0.86 ->
-#     0.50 s): 4-8% faster prefill (939 tokens 1.82-2.00 -> 1.68-1.71 s), the same output. Leave
-#     it off when other programs need that RAM;
+#   - Flash-Next holds as much of the 29 GB n-gram table in RAM as the RAM ledger spares after the
+#     experts, the context cache and a 2 GiB margin beyond the reserve (--ngram-ram-mib auto; ~13
+#     GiB, half the table, on a 59 GiB host; ~6 GiB stays available), loaded in ~6 s after startup.
+#     A prompt's row read halves (3.9K tokens 0.86 -> 0.50 s): 4-8% faster prefill (939 tokens
+#     1.82-2.00 -> 1.68-1.71 s), the same output. NINFER_NGRAM_RAM_MIB=0 turns it off (when other
+#     programs need that RAM), or N caps it at N MiB;
 #   - Flash-Next MTP drafts step by step (--mtp-staged-drafts; NINFER_MTP_STAGED_DRAFTS=off turns it
 #     off): +2-4% decode, the same output;
 #   - Flash-Next MTP verification rounds compute part of their uncached experts on the CPU
@@ -93,6 +93,9 @@ case "$model_key" in
     # 2K-token prompt 3.78 -> 3.36 s, 3.6K 5.17 -> 4.85 s, short prompts unchanged, the same output.
     export NINFER_PREFILL_CPU_MAX_COLUMNS="${NINFER_PREFILL_CPU_MAX_COLUMNS:-64}"
     export NINFER_PREFILL_CPU_SHARE="${NINFER_PREFILL_CPU_SHARE:-0.5}"
+    # The n-gram table's blocks in the RAM the ledger spares last (after the experts, the context
+    # cache and a 2 GiB margin): a prompt's row read halves on this drive (the same output).
+    export NINFER_NGRAM_RAM_MIB="${NINFER_NGRAM_RAM_MIB:-auto}"
     # MTP drafts one step at a time and stops once no further draft could be verified (the same
     # output): a round mostly needs one or two of the three drafts, and a step is ~1.2 ms here.
     export NINFER_MTP_STAGED_DRAFTS="${NINFER_MTP_STAGED_DRAFTS:-on}"

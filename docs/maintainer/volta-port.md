@@ -297,7 +297,8 @@ Working with the 3.3 GB/s eGPU link (Flash-Next, measured 2026-11-17):
   -> 3.38 s. The read itself (46K random 4 KiB reads, 0.85 s) is the drive's limit: the YMTC
   PC300-256GB (gen4 x4, no I/O scheduler) plateaus at ~43K random reads/s at any queue depth or
   span (~115 us at depth 1).
-- `--ngram-ram-mib N|auto` (opt-in; `NINFER_NGRAM_RAM_MIB=auto` through `run-v100.sh`) holds a
+- `--ngram-ram-mib N|auto` (off by default in the server; `run-v100.sh` sets `auto`, and
+  `NINFER_NGRAM_RAM_MIB=0` turns it off there) holds a
   prefix of the volume's blocks in pageable RAM, loaded by a background thread in 8 MiB sequential
   reads (2.7 GB/s) that pause while a request reads rows. Rows hash uniformly over the blocks, so a
   held fraction f serves ~f of a cold prompt's rows. The engine fits it last
