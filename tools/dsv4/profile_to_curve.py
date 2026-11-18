@@ -43,7 +43,11 @@ def load_counts(path: Path, experts: int, backbone_layers: int) -> np.ndarray:
     raw = np.fromfile(path, dtype="<u4")
     if raw.size % experts:
         raise ValueError(f"{path}: {raw.size} counts is not a multiple of {experts} experts")
-    return raw.reshape(-1, experts)[:backbone_layers].astype(np.float64)
+    rows = raw.reshape(-1, experts)
+    if rows.shape[0] < backbone_layers:
+        raise ValueError(f"{path}: {rows.shape[0]} layers of counts, expected at least {backbone_layers} "
+                         "(truncated profile?)")
+    return rows[:backbone_layers].astype(np.float64)
 
 
 def main() -> None:

@@ -132,7 +132,7 @@ jobs:
           sudo apt-get update -q
           sudo apt-get -o Dir::Cache::Archives="$HOME/apt-archives" install -y -q --no-install-recommends \
             cuda-cudart-dev-12-8 cuda-crt-12-8 cuda-nvtx-12-8 \
-            ccache ninja-build pkg-config libavcodec-dev libavformat-dev libavutil-dev \
+            ccache ninja-build pkg-config python3-numpy libavcodec-dev libavformat-dev libavutil-dev \
             libswscale-dev libcurl4-openssl-dev libzstd-dev
           # The cache step runs as the runner user; apt left the files root's.
           sudo chown -R "$USER" ~/apt-archives

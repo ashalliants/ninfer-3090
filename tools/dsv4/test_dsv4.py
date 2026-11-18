@@ -238,6 +238,30 @@ def test_report_cross_checks_config_against_headers():
         check(False, "a config/header size disagreement must be an error")
 
 
+def test_truncated_profile_is_refused():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "profile.bin"
+        np.ones((3, 8), dtype="<u4").tofile(path)
+        try:
+            pc.load_counts(path, 8, 5)
+        except ValueError:
+            pass
+        else:
+            check(False, "3 layers of counts must not pass for 5 expected")
+        check(pc.load_counts(path, 8, 3).shape == (3, 8), "a complete profile loads")
+
+
+def test_fetch_refuses_a_directory_for_another_repo():
+    import fetch_headers as fh
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "repo.txt").write_text("someone/else\n")
+        try:
+            fh.fetch("deepseek-ai/other", Path(d), None, 1)
+        except SystemExit:
+            return
+        check(False, "a cache stamped for another repository must be refused")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

@@ -10,7 +10,8 @@ shard) is enough to know the exact layout and size of a 500 GB checkpoint.
 
 Writes `out_dir/config.json`, `out_dir/model.safetensors.index.json` and one
 `out_dir/headers/<shard>.json` per shard: {tensor name: {dtype, shape, data_offsets}} with offsets
-relative to the start of the shard's data section. Shards already fetched are skipped.
+relative to the start of the shard's data section. Shards already fetched are skipped; `repo.txt` records which repository the
+directory belongs to, and fetching a different one into it is refused.
 """
 
 from __future__ import annotations
@@ -67,6 +68,10 @@ def read_tensor(repo: str, directory: Path, name: str, offset: int = 0, length: 
 
 def fetch(repo: str, out: Path, only: set[int] | None, workers: int) -> None:
     out.mkdir(parents=True, exist_ok=True)
+    stamp = out / "repo.txt"
+    if stamp.exists() and stamp.read_text().strip() != repo:
+        raise SystemExit(f"{out} holds headers for {stamp.read_text().strip()}, not {repo}: use another directory")
+    stamp.write_text(repo + "\n")
     (out / "headers").mkdir(exist_ok=True)
     for name in ("config.json", "model.safetensors.index.json"):
         if not (out / name).exists():

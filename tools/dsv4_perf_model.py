@@ -97,7 +97,7 @@ class Machine:
     vram_reserve_gib: float = 1.8  # CUDA context, graphs, workspaces, staging slots
     ram_gib: float = 64.0
     ram_reserve_gib: float = 14.0  # OS, the embedding table, staging, Engram row cache, pinned buffers
-    ssd_gb_s: float = 5.0  # NVMe gen4 sequential-ish 10 MB reads; SATA is 0.5
+    ssd_gb_s: float = 3.6  # the target box's NVMe, as in the plan; gen4 is about 7, SATA 0.5
     pcie_gb_s: float = fn.PCIE_GB_S
     card_gb_s: float = fn.CARD_GB_S
     dense_eff: float = 0.60  # ASSUMPTION: dense GEMVs reach 60% of the card; measure and replace
@@ -264,6 +264,16 @@ def main() -> None:
     ap.add_argument("--sweep", action="store_true", help="skew x SSD speed at 1 and 4 lanes")
     ap.add_argument("--calibrate", action="store_true")
     a = ap.parse_args()
+    if a.ssd_gb_s <= 0 or a.ram_gib <= 0:
+        ap.error("--ssd-gb-s and --ram-gib must be positive")
+    if not 0 < a.dense_eff <= 1:
+        ap.error("--dense-eff must be in (0, 1]")
+    if not 0 <= a.overlap <= 1:
+        ap.error("--overlap must be in [0, 1]")
+    if any(n < 1 for n in a.lanes):
+        ap.error("--lanes must be at least 1")
+    if a.skew is not None and a.skew < 0:
+        ap.error("--skew must not be negative")
 
     fitted = calibrate_skew()
     if a.calibrate:

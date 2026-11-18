@@ -135,6 +135,19 @@ def test_everything_resident_has_no_staging_cost():
     check(r["ram_ms"] == 0.0 and r["ssd_ms"] == 0.0, f"{r}")
 
 
+def test_default_ssd_speed_is_the_documented_target():
+    check(dm.Machine().ssd_gb_s == 3.6, "the plan's headline numbers assume 3.6 GB/s")
+
+
+def test_the_cli_rejects_values_that_break_the_arithmetic():
+    import subprocess
+    for flag in (["--ssd-gb-s", "0"], ["--ssd-gb-s", "-1"], ["--ram-gib", "0"], ["--dense-eff", "0"],
+                 ["--overlap", "1.5"], ["--lanes", "0"], ["--skew", "-1"]):
+        r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "dsv4_perf_model.py"), *flag],
+                           capture_output=True, text=True)
+        check(r.returncode == 2 and "Traceback" not in r.stderr, f"{flag}: exit {r.returncode}: {r.stderr[-200:]}")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

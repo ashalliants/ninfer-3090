@@ -70,6 +70,8 @@ if(ninfer_numpy_missing)
 else()
   add_test(NAME ninfer_dsv4_tools_test
     COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/dsv4/test_dsv4.py)
+  # It links nothing, so it is host-only too (HostOnlyTests.cmake is read before this, hence the append here).
+  list(APPEND NINFER_HOST_ONLY_TESTS ninfer_dsv4_tools_test)
 endif()
 
 # The rental script's power-limit guard (scripts/vast/power_guard.py): a Vast host can cap the card well
