@@ -11,8 +11,11 @@ namespace ninfer {
 
 // The image format every binding names: bump it together with kImageVersion in
 // models/qwen3_5/program/storage/checkpoint_image.cpp. Format 2 carries the StateImage geometry
-// (GDN state type, DFlash local rings) explicitly instead of only its total size.
-inline constexpr std::string_view kCheckpointImageFormat = "checkpoint-image-2";
+// (GDN state type, DFlash local rings) explicitly instead of only its total size. Format 3 also
+// names the store's image ids, which now carry the checkpoint's identity tag
+// (runtime/engine/context_store/image_id.h): a store written under format 2 has ids of the old
+// shape, never matches, and ages out as misses.
+inline constexpr std::string_view kCheckpointImageFormat = "checkpoint-image-3";
 
 // What a stored checkpoint image binds to: the model, its weight formats and quantization, the
 // artifact file, the KV, recurrent-state and speculative settings its layout was built for, and the

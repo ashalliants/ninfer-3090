@@ -701,7 +701,7 @@ private:
     // The image's endpoint key (runtime/engine/context_store/image_id.h).
     static std::string image_id(const CheckpointImage& image, bool shared) {
         const auto& key = image.keys.front();
-        return runtime::context_store_image_id(key.digests, key.frontier, shared);
+        return runtime::context_store_image_id(key.digests, key.frontier, key.identity_tag, shared);
     }
 
     // Writes one image to the store. On the writer thread, or at shutdown.

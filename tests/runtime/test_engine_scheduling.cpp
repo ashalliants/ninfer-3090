@@ -1099,21 +1099,22 @@ bool store_drained(ContextStore& store) {
 
 // The id the Engine stores a session of prompt `id` up to `frontier` under (the fake's shortlist key
 // is {id, 0} at every frontier).
-std::string session_id(std::uint64_t id, std::uint32_t frontier) {
-    return context_store_image_id({id, 0}, frontier, false);
+std::string session_id(std::uint64_t id, std::uint32_t frontier, std::uint32_t identity_tag = 0) {
+    return context_store_image_id({id, 0}, frontier, identity_tag, false);
 }
 
 // Another engine stores a session of prompt `id` up to `frontier`, with `bytes` of state, and
-// uploads it.
+// uploads it. `identity_tag` is the configuration it was computed under (the fake's requests use 0).
 void store_session_elsewhere(const std::shared_ptr<MemoryBucket>& bucket, std::uint64_t id,
-                             std::uint32_t frontier, std::size_t bytes) {
+                             std::uint32_t frontier, std::size_t bytes, std::uint32_t identity_tag = 0) {
     StoreDirectory directory;
     ContextStore other(bucket_store_options(directory.path(), bucket));
     ContextStore::Description description;
-    description.id      = session_id(id, frontier);
+    description.id      = session_id(id, frontier, identity_tag);
     description.binding = "fake-binding";
     description.tokens  = frontier;
-    description.checkpoints.push_back({.frontier = frontier, .digests = {id, 0}, .identity_tag = 0});
+    description.checkpoints.push_back(
+        {.frontier = frontier, .digests = {id, 0}, .identity_tag = identity_tag});
     std::vector<std::uint8_t> image(64 + bytes);
     std::uint32_t state = static_cast<std::uint32_t>(id) * 2654435761U + 1U;
     for (auto& byte : image) {
@@ -1298,6 +1299,29 @@ void test_a_lookup_reads_only_the_requests_own_manifests() {
     require(store.refresh_remote() == 7, "the refresh did not register what the lookups left");
 }
 
+// An image of the request's own endpoint under another identity tag (a steered checkpoint of the
+// same prompt) is not wanted by a plain request's lookup: its manifest is not read, it is not
+// registered, and it is not counted as a hit. Its id differs from the plain one only in the tag.
+void test_a_lookup_ignores_the_same_endpoint_under_another_tag() {
+    auto bucket = std::make_shared<MemoryBucket>();
+    StoreDirectory directory;
+    ContextStore store(bucket_store_options(directory.path(), bucket));
+    require(store_drained(store), "the start-up refresh did not finish");
+    constexpr std::uint32_t kOtherTag = 7;
+    store_session_elsewhere(bucket, 14, 30'000, 4096, kOtherTag);
+    require(session_id(14, 30'000) != session_id(14, 30'000, kOtherTag), "the two tags share an id");
+    const int manifests = bucket->manifest_gets;
+    Rig rig({.chunk = 1024, .lanes = 1});
+    rig.attach_store(store, std::chrono::seconds(2));
+    auto result = rig.run(14, kLongPrompt, 1);
+    require(finished(result), "the request did not finish\n" + rig.dump());
+    const auto stats = rig.core().runtime_stats();
+    require(stats.context_store_lookups == 1 && stats.context_store_lookup_hits == 0,
+            "a lookup counted an image of another tag as a hit");
+    require(bucket->manifest_gets == manifests && !store.find(session_id(14, 30'000, kOtherTag)),
+            "a lookup read or registered an image of another tag");
+}
+
 // A download that cannot finish in the request's wait stops at its deadline (a miss, not damage):
 // the request prefills, and the reader is free for the next request instead of downloading the
 // rest of a session nobody waits for.
@@ -1401,7 +1425,7 @@ void test_an_import_that_throws_fails_only_the_hydration() {
 void put_image(ContextStore& store, const fake::CheckpointImage& image) {
     ContextStore::Description description;
     const auto& key     = image.keys.front();
-    description.id      = ContextStore::image_id(key.digests, key.frontier, false);
+    description.id      = ContextStore::image_id(key.digests, key.frontier, key.identity_tag, false);
     description.binding = "fake-binding";
     description.tokens  = image.tokens;
     description.checkpoints.push_back(
@@ -1436,7 +1460,7 @@ void supersede_elsewhere(ContextStore& store) {
 // retained continuation the store holds as it is.
 void restore_stored(Rig& rig, ContextStore& store, std::uint64_t group) {
     const auto image = rig.program().image_of(group, 4096);
-    const auto id    = ContextStore::image_id(image.keys.front().digests, 4096, false);
+    const auto id    = ContextStore::image_id(image.keys.front().digests, 4096, image.keys.front().identity_tag, false);
     const auto bytes = store.load(id);
     require(bytes.has_value(), "the stored session could not be read");
     require(rig.core().restore_image(*bytes), "the stored session was not restored");
@@ -1555,7 +1579,7 @@ void test_a_failed_write_is_retried_after_a_removal_scan_dropped_it() {
         std::chrono::milliseconds(50), [&] { return failed.failures(); },
         [&] { return failed.take(); });
     const auto image = rig.program().image_of(1, 4096);
-    const auto id    = ContextStore::image_id(image.keys.front().digests, 4096, false);
+    const auto id    = ContextStore::image_id(image.keys.front().digests, 4096, image.keys.front().identity_tag, false);
     put_image(store, image);
     restore_stored(rig, store, 1);
     // The write "failed": its image is not in the store. A removal elsewhere is scanned first.
@@ -1607,8 +1631,8 @@ void test_a_flush_writes_unsaved_sessions_with_idle_writes_off() {
         restore_stored(rig, store, group);
     }
     // Session 1's write "failed": it is unsaved; session 2 is stored.
-    const auto id =
-        ContextStore::image_id(rig.program().image_of(1, 4096).keys.front().digests, 4096, false);
+    const auto& key1 = rig.program().image_of(1, 4096).keys.front();
+    const auto id    = ContextStore::image_id(key1.digests, 4096, key1.identity_tag, false);
     require(store.erase(id), "the image could not be erased");
     failed.fail(id);
     require(rig.core().unsaved_store_sessions() == 1, "the failed write did not leave one unsaved");
@@ -1640,15 +1664,15 @@ void test_lost_failure_reports_retry_every_missing_session() {
         restore_stored(rig, store, group);
     }
     // Session 1's write "failed" and its report was lost; session 2 is still stored.
-    const auto lost_id =
-        ContextStore::image_id(rig.program().image_of(1, 4096).keys.front().digests, 4096, false);
+    const auto& lost_key = rig.program().image_of(1, 4096).keys.front();
+    const auto lost_id   = ContextStore::image_id(lost_key.digests, 4096, lost_key.identity_tag, false);
     require(store.erase(lost_id), "the image could not be erased");
     failed.lose();
     std::vector<std::string> flushed;
     (void)rig.core().persist_all(
         [&](fake::CheckpointImage&& written, bool) {
-            flushed.push_back(ContextStore::image_id(written.keys.front().digests,
-                                                     written.keys.front().frontier, false));
+            flushed.push_back(ContextStore::image_id(written.keys.front().digests, written.keys.front().frontier,
+                                                     written.keys.front().identity_tag, false));
             put_image(store, written);
             return true;
         },
@@ -1676,7 +1700,7 @@ void test_an_export_reuses_the_writers_spare_buffer() {
                                   .failed_writes = [&] { return failed.take(); },
                                   .export_buffer = [&] { return std::exchange(spare, {}); }});
     const auto image = rig.program().image_of(1, 4096);
-    const auto id    = ContextStore::image_id(image.keys.front().digests, 4096, false);
+    const auto id    = ContextStore::image_id(image.keys.front().digests, 4096, image.keys.front().identity_tag, false);
     put_image(store, image);
     restore_stored(rig, store, 1);
     require(store.erase(id), "the image could not be erased");
@@ -1715,7 +1739,7 @@ void test_a_foreign_image_of_the_same_id_does_not_count_as_stored() {
         std::chrono::milliseconds(50), [&] { return failed.failures(); },
         [&] { return failed.take(); });
     const auto image = rig.program().image_of(1, 4096);
-    const auto id    = ContextStore::image_id(image.keys.front().digests, 4096, false);
+    const auto id    = ContextStore::image_id(image.keys.front().digests, 4096, image.keys.front().identity_tag, false);
     put_image(store, image);
     restore_stored(rig, store, 1);
     // Another configuration's image now holds the id, and this Engine's write of it failed.
@@ -2487,6 +2511,8 @@ int main() {
         test_a_stalled_listing_releases_the_request_at_its_budget);
     run("a lookup reads only the request's own manifests",
         test_a_lookup_reads_only_the_requests_own_manifests);
+    run("a lookup ignores the same endpoint under another tag",
+        test_a_lookup_ignores_the_same_endpoint_under_another_tag);
     run("a slow download stops at the request's deadline",
         test_a_slow_download_stops_at_the_requests_deadline);
     run("a read finished after the deadline is not imported",

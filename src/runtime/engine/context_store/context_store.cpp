@@ -388,8 +388,8 @@ std::array<std::uint64_t, 2> ContextStore::hash(std::span<const std::uint8_t> by
 }
 
 std::string ContextStore::image_id(const std::array<std::uint64_t, 2>& digests,
-                                   std::uint32_t frontier, bool shared) {
-    return context_store_image_id(digests, frontier, shared);
+                                   std::uint32_t frontier, std::uint32_t identity_tag, bool shared) {
+    return context_store_image_id(digests, frontier, identity_tag, shared);
 }
 
 // An exclusive lock on one file of the directory, held for the store's life. The directory's logic
