@@ -262,13 +262,18 @@ constexpr std::int32_t kStagingSlots = 64;
 // Lanes (requests decoded in the same rounds): two. Three and four give +14% and +17% over two at
 // 41 and 32 tok/s per stream (docs/maintainer/flash-next-lanes-spike.md).
 constexpr std::uint32_t kMaximumLanes = 2;
-// Wide prefill calls (8,192 tokens; Infernix's are 4,096, NInfer-3090 measured on a V100 over a 3.3
-// GB/s link: a call streams nearly every non-resident expert whatever its width, so twice the
-// columns halve the streamed bytes per token: 38K-token prompt 40.9-41.0 -> 37.5 s, 8K 9.1-9.5 ->
-// 8.2 s, 10.7K 13.0 -> 12.45 s, the same output): their workspace and the expert stream's ring
-// are frames lent by the expert cache for the prompt, so the static workspace stays sized for the
-// configured chunk. A prompt shorter than kStreamMinColumns runs static calls without the stream.
-constexpr std::int32_t kWideChunk        = 8192;
+// Wide prefill calls: their workspace and the expert stream's ring are frames lent by the expert
+// cache for the prompt, so the static workspace stays sized for the configured chunk. A prompt
+// shorter than kStreamMinColumns runs static calls without the stream.
+// Width: kWideChunk (8,192) on a slow link (below kSlowLinkShare of the reference, measured at
+// startup), kFastLinkWideChunk (4,096, Infernix's) otherwise. A call streams nearly every
+// non-resident expert whatever its width, so on a slow link twice the columns halve the streamed
+// bytes per token (V100 over a 3.3 GB/s link: 38K-token prompt 40.9-41.0 -> 37.5 s, 8K 9.1-9.5 ->
+// 8.2 s, 10.7K 13.0 -> 12.45 s, the same output). A fast link has not been measured at 8,192, so it
+// keeps 4,096. The plan (IO, the workspace cap, the CPU share's columns) is sized for kWideChunk
+// either way; ProgramImpl::wide_call() picks the width once the link is known.
+constexpr std::int32_t kWideChunk         = 8192;
+constexpr std::int32_t kFastLinkWideChunk = 4096;
 constexpr std::int32_t kStreamMinColumns = 512;
 // Ring frames per half: a layer's every expert, so every non-resident one streams and a wide call
 // needs no staging pass (resident counts vary widely by layer: a 320-frame half left 29% of the
@@ -2466,7 +2471,7 @@ public:
     // kWideChunk-token calls from `begin`, which is how a resumed prefill runs) and the images it
     // encodes again (any image with a token at or after `begin`: plan_lane_vision's set).
     runtime::PrefillWork work_between(const BasePlanImpl& base, std::uint32_t begin, std::uint32_t end) const {
-        return prefill_work_between(begin, end, static_cast<std::uint32_t>(std::max(plan_.chunk, plan_.wide_chunk)),
+        return prefill_work_between(begin, end, static_cast<std::uint32_t>(std::max(plan_.chunk, wide_call())),
                                     base.media);
     }
 
@@ -3498,7 +3503,13 @@ private:
 
     // The width of a prefill call. A half-width first call (to start the GPU after fewer n-gram
     // reads) measured slower: the extra call streams the non-resident experts once more.
-    std::int32_t call_width(bool wide) const noexcept { return wide ? plan_.wide_chunk : plan_.chunk; }
+    std::int32_t call_width(bool wide) const noexcept { return wide ? wide_call() : plan_.chunk; }
+
+    // A wide call's columns: the planned kWideChunk on a slow link, kFastLinkWideChunk otherwise
+    // (and before the link is measured, which then counts as fast).
+    std::int32_t wide_call() const noexcept {
+        return wide_call_ > 0 ? wide_call_ : std::min(plan_.wide_chunk, kFastLinkWideChunk);
+    }
 
     // The prefill call from `begin`: the route's width, ending at the prompt's end or at the next
     // capture group's frontier, whichever comes first (a capture copies the state there).
@@ -3552,7 +3563,7 @@ private:
         // columns, where the configuration-only bound said 1.67). The keys stay the planned
         // envelope: Forward::attention runs the QSA selection at kv_.max_visible_keys, whose
         // scratch grows with it, so a smaller figure here would under-allocate the lent arena.
-        const std::int32_t widest   = std::min(plan_.wide_chunk, remaining);
+        const std::int32_t widest   = std::min(wide_call(), remaining);
         const std::uint32_t keys    = plan_.pages * kPagedKVPageSize;
         const std::size_t work      = std::min<std::size_t>(
             plan_.wide_work, forward_->call_workspace_bytes(widest, keys, DeviceExecutionView{nullptr, plan_.sms}));
@@ -5740,10 +5751,12 @@ private:
         // (2026-11-18). A fast link refills as before.
         const bool slow_link = link_ > 0.0 && link_ < kSlowLinkShare * kReferenceLinkBytesPerSecond;
         residency_->set_refill_on_return(!slow_link);
-        char text[240];
+        // Wide prefill calls of kWideChunk columns on a slow link only (see kWideChunk).
+        wide_call_ = slow_link ? plan_.wide_chunk : std::min(plan_.wide_chunk, kFastLinkWideChunk);
+        char text[300];
         std::snprintf(text, sizeof(text),
-                      "PCIe link to the GPU: %.1f GB/s%s; decode promotes every %llu tokens once full%s",
-                      link_ / 1e9, options_.link_bytes_per_second > 0.0 ? " (fixed)" : " measured",
+                      "PCIe link to the GPU: %.1f GB/s%s; prefill calls of up to %d tokens; decode promotes every %llu tokens once full%s",
+                      link_ / 1e9, options_.link_bytes_per_second > 0.0 ? " (fixed)" : " measured", wide_call(),
                       static_cast<unsigned long long>(promotion_interval()),
                       slow_link ? "; frames a prompt lent come back free (decode promotes into them)" : "");
         diagnostic(text);
@@ -6206,6 +6219,7 @@ private:
     std::uint32_t frames_now_ = 0, startup_frames_ = 0;
     std::uint64_t pool_now_ = 0;
     double link_            = kReferenceLinkBytesPerSecond;
+    std::int32_t wide_call_ = 0; // wide_call(): set by measure_link
 
     DeviceBuffer state_backing_;
     std::unique_ptr<VmmRange> kv_vmm_;

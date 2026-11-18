@@ -374,7 +374,9 @@ Working with the 3.3 GB/s eGPU link (Flash-Next, measured 2026-11-17):
   context, 128-dim) stays small. tok/s follows MTP acceptance, which follows the content (1.97-2.65
   tokens per round), not the context. A 221,567-token prompt prefills in 245 s (903 tok/s; 10,670
   tokens 811 tok/s). Peak 68 C at 215 W through the whole run.
-- Wide prefill calls are 8,192 tokens (897d725a; Infernix's are 4,096). A call streams nearly every
+- Wide prefill calls are 8,192 tokens on a slow link (897d725a; Infernix's are 4,096, which a fast
+  link, at or above half the 27.5 GB/s reference, keeps: an RTX 3090 has not been measured at 8,192,
+  so the width is picked from the link measured at startup and logged with it). A call streams nearly every
   non-resident expert whatever its width, so a 4K call paid the link for ~4,000 experts per 4,096
   tokens; at 8K the same bytes cover twice the tokens (a 38K-token prompt streamed 20,805 experts
   instead of 38,300). `kMaxCpuCallColumns` follows (`cpu_plan_kernel`'s two `short` column arrays
