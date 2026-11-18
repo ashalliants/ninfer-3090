@@ -53,6 +53,19 @@ __device__ __forceinline__ float small_int_to_float(int i) {
     return __int_as_float(i + 0x4B400000) - 12582912.0F;
 }
 
+#if defined(NINFER_SM70)
+// sm_70 has no integer tensor cores and the emulated ldmatrix/mma spend ~2 shuffles per dp4a: each
+// thread instead reads its own fragment rows (wm 32 + mt 16 + lane / 4 + 8 i) and tokens
+// (wn 32 + nt 8 + 2 (lane % 4) + j) from shared memory and sums them with dp4a. Integer sums are
+// exact in any order, so every c and every FP32 step after it is the mma path's bit for bit.
+__device__ __forceinline__ int mmq_dot16(int4 a, int4 b, int acc) {
+    acc = __dp4a(a.x, b.x, acc);
+    acc = __dp4a(a.y, b.y, acc);
+    acc = __dp4a(a.z, b.z, acc);
+    return __dp4a(a.w, b.w, acc);
+}
+#endif
+
 template <QType F, bool Residual>
 __global__ void __launch_bounds__(kMmqThreads, 2)
     ggml_mmq_kernel(const std::uint8_t* __restrict__ w, const std::int8_t* __restrict__ xq,
@@ -156,6 +169,21 @@ __global__ void __launch_bounds__(kMmqThreads, 2)
 
 #pragma unroll
         for (int sub = 0; sub < kSubTile; ++sub) {
+#if defined(NINFER_SM70)
+            int4 ar[2][2][2]; // [mt][i][half]
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+                for (int i = 0; i < 2; ++i)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h)
+                        ar[mt][i][h] = *reinterpret_cast<const int4*>(
+                            wq_s + (wm * 32 + mt * 16 + (lane >> 2) + 8 * i) * kMmqStride + kSubValues * sub + 16 * h);
+            const auto token_half = [&](int nt, int j, int h) {
+                return *reinterpret_cast<const int4*>(xq_s + (wn * 32 + nt * 8 + 2 * (lane & 3) + j) * kMmqStride +
+                                                      kSubValues * sub + 16 * h);
+            };
+#else
             unsigned a[2][4];
             unsigned b[4][2];
 #pragma unroll
@@ -171,6 +199,7 @@ __global__ void __launch_bounds__(kMmqThreads, 2)
                             smem_addr(xq_s + tok * kMmqStride + kSubValues * sub +
                                       16 * ((lane >> 3) & 1)));
             }
+#endif
             float xs[4][2];
 #pragma unroll
             for (int nt = 0; nt < 4; ++nt)
@@ -188,6 +217,25 @@ __global__ void __launch_bounds__(kMmqThreads, 2)
                         for (int i = 0; i < 2; ++i)
                             ws[mt][i] = ws_s[(wm * 32 + mt * 16 + (lane >> 2) + 8 * i) * kScales +
                                              2 * sub + half];
+#if defined(NINFER_SM70)
+                    // Each acc element's FMA chain (sub, then half) is unchanged; only the order
+                    // of the independent (mt, nt) elements differs, so each token loads once.
+#pragma unroll
+                    for (int nt = 0; nt < 4; ++nt) {
+                        const int4 xt[2] = {token_half(nt, 0, half), token_half(nt, 1, half)};
+#pragma unroll
+                        for (int mt = 0; mt < 2; ++mt) {
+                            int c[4];
+#pragma unroll
+                            for (int e = 0; e < 4; ++e) c[e] = mmq_dot16(ar[mt][e >> 1][half], xt[e & 1], 0);
+#pragma unroll
+                            for (int e = 0; e < 4; ++e)
+                                acc[mt][nt][e] = fmaf(small_int_to_float(c[e]),
+                                                      ws[mt][e >> 1] * xs[nt][e & 1],
+                                                      acc[mt][nt][e]);
+                        }
+                    }
+#else
 #pragma unroll
                     for (int mt = 0; mt < 2; ++mt)
 #pragma unroll
@@ -201,6 +249,7 @@ __global__ void __launch_bounds__(kMmqThreads, 2)
                                                       ws[mt][e >> 1] * xs[nt][e & 1],
                                                       acc[mt][nt][e]);
                         }
+#endif
                 }
             } else {
                 float ws[2][2];
@@ -210,6 +259,24 @@ __global__ void __launch_bounds__(kMmqThreads, 2)
                     for (int i = 0; i < 2; ++i)
                         ws[mt][i] =
                             ws_s[(wm * 32 + mt * 16 + (lane >> 2) + 8 * i) * kScales + sub];
+#if defined(NINFER_SM70)
+#pragma unroll
+                for (int nt = 0; nt < 4; ++nt) {
+                    const int4 xt[2][2] = {{token_half(nt, 0, 0), token_half(nt, 0, 1)},
+                                           {token_half(nt, 1, 0), token_half(nt, 1, 1)}};
+#pragma unroll
+                    for (int mt = 0; mt < 2; ++mt) {
+                        int c[4];
+#pragma unroll
+                        for (int e = 0; e < 4; ++e)
+                            c[e] = mmq_dot16(ar[mt][e >> 1][1], xt[e & 1][1], mmq_dot16(ar[mt][e >> 1][0], xt[e & 1][0], 0));
+#pragma unroll
+                        for (int e = 0; e < 4; ++e)
+                            acc[mt][nt][e] = fmaf(small_int_to_float(c[e]),
+                                                  ws[mt][e >> 1] * xs[nt][e & 1], acc[mt][nt][e]);
+                    }
+                }
+#else
 #pragma unroll
                 for (int mt = 0; mt < 2; ++mt)
 #pragma unroll
@@ -222,6 +289,7 @@ __global__ void __launch_bounds__(kMmqThreads, 2)
                             acc[mt][nt][e] = fmaf(small_int_to_float(c[e]),
                                                   ws[mt][e >> 1] * xs[nt][e & 1], acc[mt][nt][e]);
                     }
+#endif
             }
         }
         // Affine formats: the tile's four offset terms, after its scale terms (apart from the MMA
