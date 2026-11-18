@@ -97,6 +97,63 @@ bf16_mma_compute_stage(const __nv_bfloat16* As, const __nv_bfloat16* Bs,
         }
     };
 
+#if defined(NINFER_SM70)
+    // sm_70 has no BF16 tensor cores: the emulated ldmatrix and m16n8k16 (volta_compat.cuh) spend
+    // ~44 shuffles per 64 FMAs a lane does. Each thread instead reads its own fragment rows
+    // (wm WM + mi 16 + g + 8 rh) and tokens (wn WN + ni 8 + 2 t + j) from the swizzled tiles, 16
+    // bytes per 8-value chunk, and runs each output's FMAs in the emulation's order: per k16 step,
+    // for tp = 0..3, k = 2 tp, 2 tp + 1, 2 tp + 8, 2 tp + 9, as fmaf(weight, activation, acc).
+    // Same operands, same order: bit for bit the emulated mma.
+    if constexpr (true) {
+        (void)a_row_offset; (void)a_col_offset; (void)b_inner_row; (void)b_k_offset;
+        const int g = lane >> 2, t = lane & 3;
+        const auto chunk = [&](const __nv_bfloat16* tile, int row, int col) {
+            return *reinterpret_cast<const uint4*>(&tile[row * BK + bf16_mma_shared_col<Schedule>(row, col)]);
+        };
+        const auto word = [](const uint4& v, int i) { return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w; };
+        // Rolled: unrolled, the hoisted loads of every k step spill under the 80-register schedules.
+#pragma unroll 1
+        for (int k_step = 0; k_step < KSUB; ++k_step) {
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi) {
+                uint4 ar[2][2]; // [rh][chunk]
+#pragma unroll
+                for (int rh = 0; rh < 2; ++rh) {
+                    const int row = wm * WM + mi * 16 + g + 8 * rh;
+                    ar[rh][0]     = chunk(As, row, k_step * 16);
+                    ar[rh][1]     = chunk(As, row, k_step * 16 + 8);
+                }
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni) {
+                    uint4 bt[2][2]; // [j][chunk]
+#pragma unroll
+                    for (int j = 0; j < 2; ++j) {
+                        const int tok = wn * WN + ni * 8 + 2 * t + j;
+                        bt[j][0]      = chunk(Bs, tok, k_step * 16);
+                        bt[j][1]      = chunk(Bs, tok, k_step * 16 + 8);
+                    }
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        const uint4& w0 = ar[e >> 1][0];
+                        const uint4& w1 = ar[e >> 1][1];
+                        const uint4& x0 = bt[e & 1][0];
+                        const uint4& x1 = bt[e & 1][1];
+                        float acc       = accum[mi][ni][e];
+#pragma unroll
+                        for (int tp = 0; tp < 4; ++tp) {
+                            const unsigned a0 = word(w0, tp), b0 = word(x0, tp), a2 = word(w1, tp), b1 = word(x1, tp);
+                            acc = fmaf(__uint_as_float(a0 << 16), __uint_as_float(b0 << 16), acc);
+                            acc = fmaf(__uint_as_float(a0 & 0xFFFF0000U), __uint_as_float(b0 & 0xFFFF0000U), acc);
+                            acc = fmaf(__uint_as_float(a2 << 16), __uint_as_float(b1 << 16), acc);
+                            acc = fmaf(__uint_as_float(a2 & 0xFFFF0000U), __uint_as_float(b1 & 0xFFFF0000U), acc);
+                        }
+                        accum[mi][ni][e] = acc;
+                    }
+                }
+            }
+        }
+    } else
+#endif
     if constexpr (Schedule::kFragmentPipeline == Bf16MmaFragmentPipeline::PingPong) {
         unsigned a_frag[2][MT][4];
         unsigned b_frag[2][NT][2];
