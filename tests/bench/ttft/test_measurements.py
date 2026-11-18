@@ -451,7 +451,7 @@ def first_output_event():
 def test_first_output_partition_preserves_terminal_and_overlapping_work(tmp_path):
     measured = record([output(101_000_000), ProtocolEvent("terminal", "done", 102_000_000)])
     done = first_output_event()
-    done["schema_version"] = 29
+    done["schema_version"] = 32
     done["generation"]["admission"] = {
         "preferred_reused_tokens": 19057, "source_wait_seconds": 0.003,
         "revoked_checkpoints": 1, "fallback_reason": "source_revoked",
@@ -626,10 +626,10 @@ def test_replay_progress_uses_engine_interval_and_subtracts_self(tmp_path, other
     measured = record([output(5_000_000), ProtocolEvent("terminal", "done", 15_000_000)])
     measured["response_id"] = "response-a"
     done = done_event(1, "req_wire", "response-a", preemptions=1, replay=1)
-    done["schema_version"] = 29
+    done["schema_version"] = 32
     def transition(name, at, replayed, decoded):
         return {
-            "artifact_type": "ninfer_serve_request_log", "schema_version": 29,
+            "artifact_type": "ninfer_serve_request_log", "schema_version": 32,
             "event": "request_scheduling", "server_instance_id": "serve-test",
             "request": {"request_id": 1, "http_request_id": "req_wire"},
             "engine_request_id": 11, "preemption_index": 1, "route": "replay",
@@ -673,9 +673,9 @@ def test_replay_evidence_missing_events_cannot_prove_no_other_progress(tmp_path,
     measured = record([output(5_000_000), ProtocolEvent("terminal", "done", 15_000_000)])
     measured["response_id"] = "response-a"
     done = done_event(1, "req_wire", "response-a", preemptions=1, replay=1)
-    done["schema_version"] = 29
+    done["schema_version"] = 32
     event = {
-        "artifact_type": "ninfer_serve_request_log", "schema_version": 29,
+        "artifact_type": "ninfer_serve_request_log", "schema_version": 32,
         "event": "request_scheduling", "server_instance_id": "serve-test",
         "request": {"request_id": 1, "http_request_id": "req_wire"},
         "engine_request_id": 11, "preemption_index": 1, "route": "replay",
@@ -694,3 +694,16 @@ def test_replay_evidence_missing_events_cannot_prove_no_other_progress(tmp_path,
     assert workload["required_mechanism_status"] == "unavailable"
     assert data.runs[0]["scheduling_observations"]["status"] == "unavailable"
     assert data.runs[0]["scheduling_observations"]["incomplete_requests"]
+
+
+def test_reader_accepts_the_request_log_schema_the_server_writes():
+    import re
+    from tools.bench.ttft import diagnostics
+
+    header = Path(__file__).resolve().parents[3] / "src" / "serve" / "request_log.h"
+    match = re.search(r"kRequestLogSchemaVersion\s*=\s*(\d+)", header.read_text())
+    assert match, "kRequestLogSchemaVersion not found in request_log.h"
+    produced = int(match.group(1))
+    assert produced in diagnostics.REQUEST_LOG_SCHEMAS
+    assert produced in diagnostics.REQUEST_LOG_SCHEMAS_WITH_RUNTIME_COUNTERS
+    assert produced + 1 not in diagnostics.REQUEST_LOG_SCHEMAS
