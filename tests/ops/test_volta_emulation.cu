@@ -165,6 +165,18 @@ __global__ void ldmatrix_kernel(const unsigned short* src, unsigned* out) {
     for (int i = 0; i < 2; ++i) { out[(2 * 32 + lane) * 4 + i] = r2[i]; out[(3 * 32 + lane) * 4 + i] = r2t[i]; }
 }
 
+// Any CUDA error ends the test with the failing call, before a buffer it should have written is
+// read: a failed launch must not read as a numeric mismatch (or a pass, on stale managed memory).
+#define CK(call)                                                                                   \
+    do {                                                                                           \
+        const cudaError_t ck_err = (call);                                                         \
+        if (ck_err != cudaSuccess) {                                                               \
+            std::fprintf(stderr, "%s:%d: %s failed: %s\n", __FILE__, __LINE__, #call,             \
+                         cudaGetErrorString(ck_err));                                              \
+            std::exit(2);                                                                          \
+        }                                                                                          \
+    } while (0)
+
 float rnd() { return (static_cast<float>(rand()) / RAND_MAX - 0.5f) * 4.f; }
 float bf(float x) { return __bfloat162float(__float2bfloat16(x)); }
 float hf(float x) { return __half2float(__float2half(x)); }
@@ -175,14 +187,14 @@ int main() {
     int fails = 0;
     srand(1);
     float *dA, *dB, *dC;
-    cudaMallocManaged(&dA, 16 * 16 * 4); cudaMallocManaged(&dB, 16 * 8 * 4); cudaMallocManaged(&dC, 16 * 8 * 4);
+    CK(cudaMallocManaged(&dA, 16 * 16 * 4)); CK(cudaMallocManaged(&dB, 16 * 8 * 4)); CK(cudaMallocManaged(&dC, 16 * 8 * 4));
     const float acc[4] = {0.5f, 0.25f, -0.5f, 1.f};
     for (int variant = 0; variant < 2; ++variant) {
         for (int i = 0; i < 256; ++i) dA[i] = rnd();
         for (int i = 0; i < 128; ++i) dB[i] = rnd();
         if (variant == 0) mma16_kernel<true><<<1, 32>>>(dA, dB, dC);
         else mma16_kernel<false><<<1, 32>>>(dA, dB, dC);
-        cudaDeviceSynchronize();
+        CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
         float maxerr = 0;
         for (int m = 0; m < 16; ++m) for (int n = 0; n < 8; ++n) {
             // initial C per (g,t) mapping: c0/c1 for rows<8, c2/c3 for rows>=8
@@ -197,7 +209,7 @@ int main() {
     { // tf32
         for (int i = 0; i < 128; ++i) dA[i] = rnd();
         for (int i = 0; i < 64; ++i) dB[i] = rnd();
-        mma_tf32_kernel<<<1, 32>>>(dA, dB, dC); cudaDeviceSynchronize();
+        mma_tf32_kernel<<<1, 32>>>(dA, dB, dC); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
         float maxerr = 0;
         auto tf = [](float x) { unsigned u; memcpy(&u, &x, 4); u &= 0xffffe000u; memcpy(&x, &u, 4); return x; };
         for (int m = 0; m < 16; ++m) for (int n = 0; n < 8; ++n) {
@@ -209,10 +221,10 @@ int main() {
     }
     { // s8
         signed char *sA, *sB; int* sC;
-        cudaMallocManaged(&sA, 16 * 32); cudaMallocManaged(&sB, 32 * 8); cudaMallocManaged(&sC, 16 * 8 * 4);
+        CK(cudaMallocManaged(&sA, 16 * 32)); CK(cudaMallocManaged(&sB, 32 * 8)); CK(cudaMallocManaged(&sC, 16 * 8 * 4));
         for (int i = 0; i < 512; ++i) sA[i] = rand() % 255 - 127;
         for (int i = 0; i < 256; ++i) sB[i] = rand() % 255 - 127;
-        mma_s8_kernel<<<1, 32>>>(sA, sB, sC); cudaDeviceSynchronize();
+        mma_s8_kernel<<<1, 32>>>(sA, sB, sC); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
         int bad = 0;
         for (int m = 0; m < 16; ++m) for (int n = 0; n < 8; ++n) {
             int ref = (m < 8) ? 1 + (n & 1) : 3 + (n & 1);
@@ -224,10 +236,10 @@ int main() {
     }
     { // s8 k16
         signed char *sA, *sB; int* sC;
-        cudaMallocManaged(&sA, 16 * 16); cudaMallocManaged(&sB, 16 * 8); cudaMallocManaged(&sC, 16 * 8 * 4);
+        CK(cudaMallocManaged(&sA, 16 * 16)); CK(cudaMallocManaged(&sB, 16 * 8)); CK(cudaMallocManaged(&sC, 16 * 8 * 4));
         for (int i = 0; i < 256; ++i) sA[i] = rand() % 255 - 127;
         for (int i = 0; i < 128; ++i) sB[i] = rand() % 255 - 127;
-        mma_s8_k16_kernel<<<1, 32>>>(sA, sB, sC); cudaDeviceSynchronize();
+        mma_s8_k16_kernel<<<1, 32>>>(sA, sB, sC); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
         int bad = 0;
         const int acc0[4] = {5, -6, 7, -8};
         for (int m = 0; m < 16; ++m) for (int n = 0; n < 8; ++n) {
@@ -240,12 +252,12 @@ int main() {
     }
     { // s4 k64
         signed char *sA, *sB; int* sC;
-        cudaMallocManaged(&sA, 16 * 64); cudaMallocManaged(&sB, 64 * 8); cudaMallocManaged(&sC, 16 * 8 * 4);
+        CK(cudaMallocManaged(&sA, 16 * 64)); CK(cudaMallocManaged(&sB, 64 * 8)); CK(cudaMallocManaged(&sC, 16 * 8 * 4));
         for (int i = 0; i < 16 * 64; ++i) sA[i] = rand() % 16 - 8;
         for (int i = 0; i < 64 * 8; ++i) sB[i] = rand() % 16 - 8;
         // pin the extremes so the sign extension is exercised
         sA[0] = -8; sB[0] = -8; sA[1] = 7; sB[8] = 7;
-        mma_s4_kernel<<<1, 32>>>(sA, sB, sC); cudaDeviceSynchronize();
+        mma_s4_kernel<<<1, 32>>>(sA, sB, sC); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
         int bad = 0;
         const int acc0[4] = {11, 12, 13, 14};
         for (int m = 0; m < 16; ++m) for (int n = 0; n < 8; ++n) {
@@ -259,7 +271,7 @@ int main() {
     { // f16 accumulate: values on a 1/8 grid keep every FP16 partial sum exact
         for (int i = 0; i < 256; ++i) dA[i] = static_cast<float>(rand() % 9 - 4) / 8.f;
         for (int i = 0; i < 128; ++i) dB[i] = static_cast<float>(rand() % 9 - 4) / 8.f;
-        mma_f16_acc16_kernel<<<1, 32>>>(dA, dB, dC); cudaDeviceSynchronize();
+        mma_f16_acc16_kernel<<<1, 32>>>(dA, dB, dC); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
         float maxerr = 0;
         for (int m = 0; m < 16; ++m) for (int n = 0; n < 8; ++n) {
             float ref = (m < 8) ? acc[n & 1] : acc[2 + (n & 1)];
@@ -271,13 +283,13 @@ int main() {
     }
     { // masked reductions: a full warp and two partial masks (the sampler merges one lane per warp)
         unsigned *in, *out;
-        cudaMallocManaged(&in, 32 * 4); cudaMallocManaged(&out, 4 * 4);
+        CK(cudaMallocManaged(&in, 32 * 4)); CK(cudaMallocManaged(&out, 4 * 4));
         int bad = 0;
         for (int members : {32, 16, 5}) {
             unsigned mx = 0, an = 0xFFFFFFFFu, orr = 0, ad = 0;
             for (int i = 0; i < 32; ++i) in[i] = (static_cast<unsigned>(rand()) << 16) ^ static_cast<unsigned>(rand()) | 0x80000000u * (i & 1);
             for (int i = 0; i < members; ++i) { mx = in[i] > mx ? in[i] : mx; an &= in[i]; orr |= in[i]; ad += in[i]; }
-            masked_reduce_kernel<<<1, 32>>>(in, out, members); cudaDeviceSynchronize();
+            masked_reduce_kernel<<<1, 32>>>(in, out, members); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
             bad += out[0] != mx; bad += out[1] != an; bad += out[2] != orr; bad += out[3] != ad;
         }
         printf("masked_reduce max/and/or/add (32, 16, 5 lanes): mismatches %d %s\n", bad, bad ? "FAIL" : "OK");
@@ -285,9 +297,9 @@ int main() {
     }
     { // sigmoid_approx
         float *x, *y;
-        cudaMallocManaged(&x, 32 * 4); cudaMallocManaged(&y, 32 * 4);
+        CK(cudaMallocManaged(&x, 32 * 4)); CK(cudaMallocManaged(&y, 32 * 4));
         for (int i = 0; i < 32; ++i) x[i] = (i - 16) * 1.5f;
-        sigmoid_kernel<<<1, 32>>>(x, y, 32); cudaDeviceSynchronize();
+        sigmoid_kernel<<<1, 32>>>(x, y, 32); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
         float maxerr = 0;
         for (int i = 0; i < 32; ++i) maxerr = fmaxf(maxerr, fabsf(1.f / (1.f + expf(-x[i])) - y[i]));
         printf("sigmoid_approx: max abs err %.3g %s\n", maxerr, maxerr < 1e-3f ? "OK" : "FAIL");
@@ -295,9 +307,9 @@ int main() {
     }
     { // ldmatrix
         unsigned short* src; unsigned* out;
-        cudaMallocManaged(&src, 256 * 2); cudaMallocManaged(&out, 4 * 32 * 4 * 4);
+        CK(cudaMallocManaged(&src, 256 * 2)); CK(cudaMallocManaged(&out, 4 * 32 * 4 * 4));
         for (int i = 0; i < 256; ++i) src[i] = static_cast<unsigned short>(i + 1);
-        ldmatrix_kernel<<<1, 32>>>(src, out); cudaDeviceSynchronize();
+        ldmatrix_kernel<<<1, 32>>>(src, out); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
         int bad = 0;
         auto M = [&](int m, int r, int c) { return static_cast<unsigned>(src[m * 64 + r * 8 + c]); };
         for (int lane = 0; lane < 32; ++lane) for (int i = 0; i < 4; ++i) {
