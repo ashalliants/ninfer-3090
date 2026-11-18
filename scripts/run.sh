@@ -373,6 +373,14 @@ case "$model_key/$profile" in
       none) spec_label='no speculation' ;;
       *) printf 'NINFER_SPEC must be mtp or none for Qwen3.8-Flash-Next, got %s\n' "$SPEC" >&2; exit 2 ;;
     esac
+    # NINFER_CPU_VERIFY_MISSES=on: each MTP verification round's uncached experts are partly computed
+    # on CPU threads instead of read over PCIe (--cpu-verify-misses; the same output). It needs MTP,
+    # so it is dropped with NINFER_SPEC=none. Off by default; run-v100.sh turns it on.
+    case "${NINFER_CPU_VERIFY_MISSES:-off}" in
+      on)  [[ "$SPEC" != 'mtp' ]] || spec_args+=(--cpu-verify-misses) ;;
+      off) ;;
+      *) printf 'NINFER_CPU_VERIFY_MISSES must be on or off, got %s\n' "$NINFER_CPU_VERIFY_MISSES" >&2; exit 2 ;;
+    esac
     # Prefix reuse (the context cache): checkpoints of the conversation in a pinned Host tier beside
     # the experts, 4 GiB by default; the server shrinks it to what its RAM ledger can spare (off
     # below 512 MiB) and says so. NINFER_PREFIX_CACHE=off turns it off; NINFER_HOST_CONTEXT_MIB sets

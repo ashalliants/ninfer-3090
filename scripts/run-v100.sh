@@ -21,6 +21,11 @@
 #     (--prefill-cpu-all-columns 1024; NINFER_PREFILL_CPU_ALL_COLUMNS=0 turns it off);
 #   - Flash-Next MTP drafts step by step (--mtp-staged-drafts; NINFER_MTP_STAGED_DRAFTS=off turns it
 #     off): +2-4% decode, the same output;
+#   - Flash-Next MTP verification rounds compute part of their uncached experts on the CPU
+#     (--cpu-verify-misses; NINFER_CPU_VERIFY_MISSES=off turns it off), the same output. About a
+#     quarter of the routed experts do not fit in VRAM, so a prompt's first pass misses 3-7% of
+#     the experts it routes to. Over this card's 3.3 GB/s link, that first pass decoded 48-63
+#     tok/s and now decodes 68-80 (2026-11-18). With a warm cache it is within 2% either way;
 #   - the memory-lock limit: Flash-Next pins 33 GiB of experts. When `ulimit -l` is below that and
 #     cannot be raised here, NINFER_ALLOW_UNLOCKED_HOST_MEMORY=on is set (the server then continues
 #     and still fails loudly if the pin itself fails). To lift the limit for good, as root:
@@ -68,6 +73,9 @@ case "$model_key" in
     # MTP drafts one step at a time and stops once no further draft could be verified (the same
     # output): a round mostly needs one or two of the three drafts, and a step is ~1.2 ms here.
     export NINFER_MTP_STAGED_DRAFTS="${NINFER_MTP_STAGED_DRAFTS:-on}"
+    # A verification round's misses go partly to CPU threads beside the GPU instead of over the link
+    # (the same output): a prompt's first pass, 48-63 -> 68-80 tok/s on this card.
+    export NINFER_CPU_VERIFY_MISSES="${NINFER_CPU_VERIFY_MISSES:-on}"
     lock_kib="$(ulimit -l)"
     need_kib=$(( 36 * 1024 * 1024 )) # the 33 GiB expert pin and its neighbours
     if [[ "$lock_kib" != 'unlimited' ]] && (( lock_kib < need_kib )); then
