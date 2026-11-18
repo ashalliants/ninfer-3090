@@ -7,6 +7,10 @@
 # Every run.sh variable (NINFER_*) still applies and wins over what this script picks; run.sh's
 # header documents them. What this adds:
 #
+#   - the server listens on every interface (NINFER_HOST=0.0.0.0; run.sh's default is 127.0.0.1),
+#     so other machines on the network reach it at http://<this machine's IP or name>:8080
+#     (NINFER_HOST=127.0.0.1 keeps it local). Set NINFER_API_KEY too: without a key anyone who can
+#     reach the port can use the model, and the server says so at startup;
 #   - the sm_70 server: NINFER_SERVER, else the first ninfer-serve found in build-v100/ beside the
 #     checkout, in ../build-v100/, or in /workspace/build-v100/ (scripts/v100_build.sh's default);
 #   - Qwen3.8-Flash-Next: run.sh's `tuned` profile unchanged. Measured on a V100-PCIE-32GB
@@ -80,6 +84,12 @@ if [[ -z "${NINFER_SERVER:-}" ]]; then
     exit 1
   fi
   export NINFER_SERVER
+fi
+
+# Serve the network as well as this machine (see the header); NINFER_HOST overrides it.
+export NINFER_HOST="${NINFER_HOST:-0.0.0.0}"
+if [[ "$NINFER_HOST" != 127.0.0.1 && "$NINFER_HOST" != localhost && "$NINFER_HOST" != ::1 && -z "${NINFER_API_KEY:-}" ]]; then
+  printf 'Note: listening on %s without NINFER_API_KEY; anyone who can reach the port can use the model.\n' "$NINFER_HOST"
 fi
 
 case "$model_key" in

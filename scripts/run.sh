@@ -143,7 +143,8 @@
 #           NO_EXIT_ON_ENGINE_FAILURE ADMISSION_FIT_CHECK PROGRESS_ANCHORS_SHARED MODEL_SUSPEND
 #           NO_AUTO_RESUME LM_HEAD_Q4 LM_HEAD_Q6 EMBEDDING_Q4 EMBEDDING_Q6 NO_EXPERT_STATE
 #           LOSSY_PREFILL_SCOUT_A4 REQUEST_LOG_LOSSY_DETAIL
-# Not here: the repeatable --graft and --context-store-peer, router mode (--models-*), and
+# NINFER_GRAFT (NAME=PATH;NAME=PATH, each --graft) and NINFER_DEFAULT_GRAFT (--default-graft).
+# Not here: the repeatable --context-store-peer, router mode (--models-*), and
 # --allow-unlocked-host-memory (NINFER_ALLOW_UNLOCKED_HOST_MEMORY, Flash-Next only, above). The S3
 # store reads its credentials from the environment (NINFER_S3_ACCESS_KEY_ID,
 # NINFER_S3_SECRET_ACCESS_KEY), never from a flag.
@@ -630,6 +631,19 @@ done
 
 if [[ -n "${NINFER_CHAT_TEMPLATE:-}" ]]; then
   profile_args+=(--chat-template "$NINFER_CHAT_TEMPLATE")
+fi
+# Grafts: NINFER_GRAFT is one or more NAME=PATH entries separated by ';' (a path may hold spaces
+# or commas), each passed as --graft; NINFER_DEFAULT_GRAFT names the one requests get when they
+# state none (--default-graft). On Qwen3.8-Flash-Next a graft is a refusal-steering vector
+# (docs/serving.md, "Refusal steering on Qwen3.8-Flash-Next"); ninfer-serve checks each entry.
+if [[ -n "${NINFER_GRAFT:-}" ]]; then
+  IFS=';' read -r -a graft_entries <<< "$NINFER_GRAFT"
+  for graft_entry in ${graft_entries[@]+"${graft_entries[@]}"}; do
+    [[ -z "$graft_entry" ]] || profile_args+=(--graft "$graft_entry")
+  done
+fi
+if [[ -n "${NINFER_DEFAULT_GRAFT:-}" ]]; then
+  profile_args+=(--default-graft "$NINFER_DEFAULT_GRAFT")
 fi
 # Names for the Host check (a DNS alias, a proxy's public name). ninfer-serve refuses a value that
 # is not a plain host name or address, naming it, so nothing is checked here.
