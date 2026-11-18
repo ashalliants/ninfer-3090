@@ -609,6 +609,7 @@ struct NgramFlagPlan {
 struct CpuMissPlan {
     int workers = 0, max_jobs = 0, max_columns = 0;
     int verify_jobs = 0, verify_columns = 0, pcie_divisor = 0;
+    int verify_jobs_slow_link = 0; // verify_jobs on a link below half the reference (the CPU takes more)
     int prefill_jobs = 0, prefill_columns = 0, share_num = 0, share_den = 0;
     std::uint64_t device   = 0;
     std::uint64_t pinned   = 0;

@@ -429,11 +429,14 @@ int main() {
         leg.cpu_verify_workers  = 12;
         const q4::CpuMissPlan served = q4::plan_cpu_misses(leg);
         check(served.device == 4, "on plans the service's 4-byte request counter on the device");
-        check(served.pinned == sizeof(om::MissRequest) + 2ULL * 2560 * 8 + 2ULL * 2560 * 4 * 8 + 64 + 64,
-              "on pins the request, x for 8 columns, y for 4 jobs of 8 columns, the done line and the error word");
-        check(served.workers == 12 && served.verify_jobs == 4 && served.verify_columns == 8 &&
-                  served.pcie_divisor == 3 && served.max_jobs == 4 && served.max_columns == 8,
-              "the service takes the worker count, 4 jobs, the verification's 8 columns and divisor 3");
+        check(served.pinned == sizeof(om::MissRequest) + 2ULL * 2560 * 8 + 2ULL * 2560 * 16 * 8 + 64 + 64,
+              "on pins the request, x for 8 columns, y for 16 jobs (a slow link's) of 8 columns, the done line "
+              "and the error word");
+        check(served.workers == 12 && served.verify_jobs == 4 && served.verify_jobs_slow_link == 16 &&
+                  served.verify_columns == 8 && served.pcie_divisor == 3 && served.max_jobs == 16 &&
+                  served.max_columns == 8,
+              "the service takes the worker count, 4 jobs (16 on a slow link), the verification's 8 columns and "
+              "divisor 3");
         check(served.prefill_jobs == 0 && served.prefill_columns == 0 && served.share_den == 0,
               "--cpu-verify-misses alone plans no prefill channel");
         leg.mtp_draft_tokens = 3;
@@ -467,8 +470,9 @@ int main() {
         check(prefill.pinned == sizeof(om::MissRequest) + 2ULL * 2560 * 4096 + 2ULL * 2560 * 512 * 8 + 64 + 64,
               "the share pins x for 4096 columns and y for 512 jobs of 8 columns");
         const std::uint64_t per_job = 8ULL * (2560 + 4 * 80 + 640 + 4 * 20) + sizeof(om::RecordGeometry) + sizeof(om::CpuExpertJob);
-        check(prefill.pageable == 512 * per_job && served.pageable == 4 * per_job,
-              "the worker team's buffers for 512 (share) or 4 (verification) jobs are pageable demand");
+        check(prefill.pageable == 512 * per_job && served.pageable == 16 * per_job,
+              "the worker team's buffers for 512 (share) or 16 (verification, a slow link's) jobs are pageable "
+              "demand");
         check(q4::plan_cpu_misses(q4::ProgramOptions{}).pageable == 0, "off plans no pageable buffers");
         share.prefill_chunk = 8192;
         check(q4::plan_cpu_misses(share).prefill_columns == om::kMaxCpuCallColumns,

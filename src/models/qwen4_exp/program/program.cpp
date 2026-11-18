@@ -280,6 +280,14 @@ constexpr double kReferenceLinkBytesPerSecond    = 27.5e9;
 // A link below this share of the reference fills a warm start's free frames in the background at
 // startup (fill_free_frames_on_slow_link).
 constexpr double kSlowLinkShare = 0.5;
+// On such a link --cpu-verify-misses hands the CPU up to this many of a verification layer call's
+// misses and keeps none back for the link (pcie_divisor 0), against the service's 4 and a third kept
+// on a fast link: copying a 1.5 MB expert at ~3 GB/s costs more than the CPU computing its few
+// columns. V100 on a 3.3 GB/s link, a prompt's first (cold-cache) MTP3 pass, story/code/zh/fr:
+// 72.5/72.7/68.9/80.4 -> 77.8/85.9/70.7/81.8 tok/s (8 jobs: 76.9/84.3/70.6/81.8; 32: no better);
+// warm passes unchanged; the same output (placement-invariant routes).
+constexpr int kSlowLinkVerifyJobs    = 16;
+constexpr int kSlowLinkPcieDivisor   = 0;
 // Calls this narrow promote at the decode rate; wider prefill calls promote nothing.
 constexpr std::int32_t kServedCallColumns = 8;
 // A seeded count is capped, so an expert used heavily in an old session yields to new uses.
@@ -1167,15 +1175,23 @@ public:
             // the service's one buffer (layer calls run in stream order, each wait before the next
             // call's plan), each narrowed to its own jobs, columns and rule.
             const CpuMissPlan p  = plan_cpu_misses(options_);
+            const bool slow_link = link_ > 0.0 && link_ < kSlowLinkShare * kReferenceLinkBytesPerSecond;
+            if (slow_link && p.verify_jobs > 0) {
+                char line[160];
+                std::snprintf(line, sizeof(line),
+                              "verification misses: up to %d per layer call on the CPU, none kept for the %.1f GB/s link",
+                              p.verify_jobs_slow_link, link_ / 1e9);
+                diagnostic(line);
+            }
             experts.error        = cpu_error_device_;
             prefill_cpu_columns_ = p.prefill_columns;
             for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
                 ops::MoeCpuChannel channel = cpu_misses_->channel(static_cast<int>(l));
                 if (p.verify_jobs > 0) {
                     ops::MoeCpuChannel verify = channel;
-                    verify.max_jobs           = p.verify_jobs;
+                    verify.max_jobs           = slow_link ? p.verify_jobs_slow_link : p.verify_jobs;
                     verify.max_columns        = p.verify_columns;
-                    verify.pcie_divisor       = p.pcie_divisor;
+                    verify.pcie_divisor       = slow_link ? kSlowLinkPcieDivisor : p.pcie_divisor;
                     experts.cpu.push_back(verify);
                 }
                 if (p.prefill_jobs > 0) {
@@ -6419,6 +6435,8 @@ CpuMissPlan plan_cpu_misses(const ProgramOptions& options) {
         // work) but its column cap: the widest verification.
         const om::CpuMissService::Options defaults;
         p.verify_jobs    = defaults.max_jobs;
+        // A slow link (startup measures it after this plan) gives the CPU more: the buffers fit both.
+        p.verify_jobs_slow_link = std::max(p.verify_jobs, detail::kSlowLinkVerifyJobs);
         // Under --mtp-rows-verify a genuine batched round calls moe() with T = B * W columns (B up
         // to max_concurrency lanes, W up to 1 + drafts), not just the single-row path's 1 + drafts
         // -- cpu_served() rejects any call past max_columns, so sizing this for the single-row case
@@ -6447,7 +6465,7 @@ CpuMissPlan plan_cpu_misses(const ProgramOptions& options) {
         p.share_num = static_cast<int>(options.prefill_cpu_share_num);
         p.share_den = static_cast<int>(options.prefill_cpu_share_den);
     }
-    p.max_jobs    = std::max(p.verify_jobs, p.prefill_jobs);
+    p.max_jobs    = std::max({p.verify_jobs, p.verify_jobs_slow_link, p.prefill_jobs});
     p.max_columns = std::max(p.verify_columns, p.prefill_columns);
     p.device      = sizeof(std::uint32_t);
     // The service's mapped request, x [H, max_columns], y [H, max_jobs * 8] and its done/heartbeat
