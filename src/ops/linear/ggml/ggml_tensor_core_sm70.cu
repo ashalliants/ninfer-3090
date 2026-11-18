@@ -77,30 +77,33 @@ __global__ void __launch_bounds__(kThreads)
 }
 
 template <QType F>
-void run(const Weight& w, const Sm70HalfWeight& half, cudaStream_t stream) {
-    ggml_rows_to_f16<F><<<w.n, kThreads, 0, stream>>>(static_cast<const std::uint8_t*>(w.qdata), w.k, half.values,
-                                                      half.inverse);
+void run(const Weight& w, const Sm70Staging& st, cudaStream_t stream) {
+    ggml_rows_to_f16<F><<<w.n, kThreads, 0, stream>>>(static_cast<const std::uint8_t*>(w.qdata), w.k, st.weight,
+                                                      st.weight_inverse);
     CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
 
-bool ggml_tensor_core_linear(const Tensor& x, const Weight& w, Tensor& out, bool residual, cudaStream_t stream) {
-    const int tokens = x.ne[1];
-    if (!sm70_tensor_core_admits(w.n, w.k, tokens, sm70_tensor_cores_enabled())) { return false; }
-    const Sm70HalfWeight half = sm70_half_weight(w.n, w.k);
+bool ggml_tensor_core_linear(const Tensor& x, const Weight& w, Tensor& out, bool residual, WorkspaceArena* workspace,
+                             cudaStream_t stream) {
+    if (!sm70_tensor_core_admits(w.n, w.k, x.ne[1])) { return false; }
+    Sm70Staging st{};
+    if (workspace == nullptr) { return sm70_staging(nullptr, w.n, w.k, x.ne[1], st); } // false, reported
+    const auto scope = workspace->scope();
+    if (!sm70_staging(workspace, w.n, w.k, x.ne[1], st)) { return false; }
     switch (w.qtype) {
-    case QType::GGML_IQ4_XS: run<QType::GGML_IQ4_XS>(w, half, stream); break;
-    case QType::GGML_IQ3_S: run<QType::GGML_IQ3_S>(w, half, stream); break;
-    case QType::GGML_Q6_K: run<QType::GGML_Q6_K>(w, half, stream); break;
-    case QType::GGML_Q5_K: run<QType::GGML_Q5_K>(w, half, stream); break;
-    case QType::GGML_Q4_K: run<QType::GGML_Q4_K>(w, half, stream); break;
-    case QType::GGML_IQ4_NL: run<QType::GGML_IQ4_NL>(w, half, stream); break;
-    case QType::GGML_Q8_0: run<QType::GGML_Q8_0>(w, half, stream); break;
-    case QType::GGML_Q2_0: run<QType::GGML_Q2_0>(w, half, stream); break;
+    case QType::GGML_IQ4_XS: run<QType::GGML_IQ4_XS>(w, st, stream); break;
+    case QType::GGML_IQ3_S: run<QType::GGML_IQ3_S>(w, st, stream); break;
+    case QType::GGML_Q6_K: run<QType::GGML_Q6_K>(w, st, stream); break;
+    case QType::GGML_Q5_K: run<QType::GGML_Q5_K>(w, st, stream); break;
+    case QType::GGML_Q4_K: run<QType::GGML_Q4_K>(w, st, stream); break;
+    case QType::GGML_IQ4_NL: run<QType::GGML_IQ4_NL>(w, st, stream); break;
+    case QType::GGML_Q8_0: run<QType::GGML_Q8_0>(w, st, stream); break;
+    case QType::GGML_Q2_0: run<QType::GGML_Q2_0>(w, st, stream); break;
     default: return false;
     }
-    sm70_tensor_core_gemm(half, w.n, w.k, x.data, tokens, out.data, residual, stream);
+    sm70_tensor_core_gemm(st, w.n, w.k, x.data, x.ne[1], out.data, residual, stream);
     return true;
 }
 

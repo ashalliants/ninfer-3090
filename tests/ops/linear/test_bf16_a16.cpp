@@ -1,3 +1,4 @@
+#include "ops/linear/common/sm70_tensor_core.h"
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
 
@@ -373,7 +374,9 @@ int run_new_bf16_geometry(const Geometry& shape) {
     int failures      = 0;
     for (const auto policy :
          {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8, ops::LinearPolicy::AllowA4}) {
-        if (ops::linear_workspace_capacity_bytes(QType::BF16, shape.n, shape.k, policy, step,
+        // (The sm_70 tensor-core route, when NINFER_SM70_TENSOR_CORES=1, stages from the workspace.)
+        if (!ops::detail::sm70_tensor_cores_enabled() &&
+            ops::linear_workspace_capacity_bytes(QType::BF16, shape.n, shape.k, policy, step,
                                                  maximum) != 0) {
             std::cerr << "BF16: expected zero workspace across the admitted column domain\n";
             ++failures;

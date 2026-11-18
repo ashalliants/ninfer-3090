@@ -36,9 +36,10 @@
 #     and still fails loudly if the pin itself fails). To lift the limit for good, as root:
 #       printf '%s - memlock unlimited\n' "$USER" > /etc/security/limits.d/90-ninfer-memlock.conf
 #     then log in again;
-#   - opt-in, not set here: NINFER_SM70_TENSOR_CORES=1 runs prefill's BF16 and GGML linears on the
-#     FP16 tensor cores (Flash-Next 3.9K-token prompt 6.6 -> 6.2 s; close to, not bit for bit, the
-#     default output; docs/maintainer/volta-port.md "Flash-Next: the opt-in tensor-core route");
+#   - Flash-Next runs prefill's BF16 and GGML linears on the FP16 tensor cores
+#     (NINFER_SM70_TENSOR_CORES=1; =0 turns it off): a 3.9K-token prompt 6.6 -> 6.2 s, close to but
+#     not bit for bit the plain server's output (docs/maintainer/volta-port.md "Flash-Next: the
+#     tensor-core route");
 #   - checks before starting: the card is a V100 (a warning otherwise), no other process is on it
 #     (a warning: the server sizes itself to the free memory), and the power limit (the card's
 #     default is 250 W; a lower cap slows decode, which is clock-bound on Volta).
@@ -91,6 +92,10 @@ case "$model_key" in
     fi
     # The embedding's rare rows are read from pinned RAM, giving their VRAM to the expert cache.
     export NINFER_HOT_EMBEDDING_ROWS="${NINFER_HOT_EMBEDDING_ROWS:-8192}"
+    # Prefill's BF16 and GGML linears on the FP16 tensor cores (cuBLAS) instead of emulated Ampere MMA:
+    # a 3.9K-token prompt 6.6 -> 6.2 s, more accurate per op than the int8 route (no activation cast),
+    # not bit for bit the same output. NINFER_SM70_TENSOR_CORES=0 turns it off.
+    export NINFER_SM70_TENSOR_CORES="${NINFER_SM70_TENSOR_CORES:-1}"
     lock_kib="$(ulimit -l)"
     need_kib=$(( 36 * 1024 * 1024 )) # the 33 GiB expert pin and its neighbours
     if [[ "$lock_kib" != 'unlimited' ]] && (( lock_kib < need_kib )); then

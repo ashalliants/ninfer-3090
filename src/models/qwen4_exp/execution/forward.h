@@ -482,6 +482,9 @@ public:
     // shared_expert_scratch_bytes; a caller checks the loaded weights' need against this plan with
     // max_shared_expert_scratch_bytes.
     [[nodiscard]] static std::size_t shared_expert_workspace_bytes(const TextConfig& config, std::int32_t columns);
+    // A wide call's extra workspace for the sm_70 tensor-core route's staging when it is on (0 otherwise,
+    // and below 64 columns): a bound over the text model's and the drafter's linears.
+    [[nodiscard]] static std::size_t tensor_core_workspace_bytes(const TextConfig& config, std::int32_t columns);
     // The scratch one MoE block's shared expert Linears (gate, up, down) take at calls of `first`
     // to `last` columns: the largest ops::linear_workspace_capacity_bytes of the three, at least 256
     // bytes (the carve is never empty).

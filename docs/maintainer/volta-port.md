@@ -394,7 +394,7 @@ and sums.
 Thermals: sustained prefill holds the card at its 200 W cap and took a passively cooled V100 from
 40 to 75 C in about a minute; measure in short runs without forced airflow.
 
-#### Flash-Next: the opt-in tensor-core route (`NINFER_SM70_TENSOR_CORES=1`)
+#### Flash-Next: the tensor-core route (`NINFER_SM70_TENSOR_CORES=1`)
 
 Qwen3.8-Flash-Next's prefill linears are BF16 (hyper-connection, PLE, router, indexer, MTP
 drafter) and GGML (attention and GDN projections, shared expert), and on sm_70 both run emulated
@@ -414,7 +414,9 @@ to that oracle):
 | default route | 3.8e-3 from the Q8_1 cast alone, before its BF16 rounding | 1.66e-3 |
 | tensor-core route | 1.67e-3 (the BF16 output rounding) | 1.66e-3 |
 
-It is not bit-identical (FP32 summation order, and no cast), so it is off by default. Measured on
+It is not bit-identical (FP32 summation order, and no cast), so the server keeps it off unless the
+variable is set; `scripts/run-v100.sh` sets it for Flash-Next (`NINFER_SM70_TENSOR_CORES=0` there
+turns it off). Measured on
 the 3,935-token prompt: 6.62 -> 6.16 s (594 -> 639 tok/s, ABAB); the compute stream's kernel time
 drops ~490 ms, and the rest is absorbed by waits on the expert stream (the 3.3 GB/s link) and the
 0.82 s n-gram volume read the first call makes before the device starts. Model-level checks (no
@@ -422,9 +424,16 @@ perplexity tool serves Flash-Next yet): a long-context retrieval set (24 prompts
 with one planted fact each) scores 24/24 both ways; greedy 128-token replies to 12 document prompts
 diverge after a median ~300 characters into equivalent text, as any reordering does. Decode is
 untouched (its calls are narrower than 64 tokens) except that the MTP drafter's catch-up over a
-prompt of 64+ tokens takes the route, so its drafts (never the accepted tokens) can differ. The
-staging buffers are private and grow to ~100 MB at Flash-Next's widest call; they are not in the
-workspace plan, which is the main thing to do before it could become a default.
+prompt of 64+ tokens takes the route, so its drafts (never the accepted tokens) can differ. 
+Every staging buffer, cuBLAS's workspace included (set per call), comes from the call's
+`WorkspaceArena`, so the shared expert's side stream and the device stream never share scratch.
+`linear_workspace_capacity_bytes` (BF16) and the GGML capacity queries include
+`sm70_tensor_core_workspace_bytes` while the route is on; Flash-Next adds
+`Forward::tensor_core_workspace_bytes` (a bound over its widest linears, ~110 MB at 512+ columns)
+to a wide call's lent arena, which comes out of expert frames only for that call, and to the shared
+expert's carve. The static workspace is not grown, so decode keeps its expert frames: a static call
+(a prompt or tail under 512 tokens) takes the route when its arena has room and otherwise keeps
+the default kernels, which the server reports once on stderr.
 
 ### Why there is no HMMA path yet
 

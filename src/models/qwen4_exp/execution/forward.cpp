@@ -5,6 +5,7 @@
 // GDN value heads are in tiled order (value head h reads key head h % key_heads), and the indexer
 // projections are BF16 rows projected in FP32.
 
+#include "ops/linear/common/sm70_tensor_core.h"
 #include "models/qwen4_exp/execution/forward.h"
 
 #include "core/side_stream_delay.h"
@@ -436,7 +437,17 @@ std::size_t Forward::shared_expert_workspace_bytes(const TextConfig& c, std::int
     const auto aligned = [](std::size_t n) { return (n + 255) / 256 * 256; };
     const std::size_t t = static_cast<std::size_t>(columns);
     const std::size_t k = std::max(c.hidden_size, c.moe.shared_intermediate);
-    return aligned(k * t) + aligned(k / 32 * t * sizeof(float));
+    // The sm_70 tensor-core route's staging instead, when it is on (ops/linear/common/sm70_tensor_core.h).
+    return std::max(aligned(k * t) + aligned(k / 32 * t * sizeof(float)),
+                    ops::detail::sm70_tensor_core_workspace_bound(static_cast<int>(k), columns));
+}
+
+std::size_t Forward::tensor_core_workspace_bytes(const TextConfig& c, std::int32_t columns) {
+    // The widest prefill linears: the PLE parent [S*H + H, H], the attention's query and gate rows,
+    // the GDN input projection, the hyper-connection [*, S*H] (the MTP drafter's are [H, H]).
+    const std::uint32_t widest = std::max({c.residual_width() + c.hidden_size, 2 * c.attention.query_width(),
+                                           c.gdn.conv_channels(), c.gdn.value_width()});
+    return ops::detail::sm70_tensor_core_workspace_bound(static_cast<int>(widest), columns);
 }
 
 std::size_t Forward::shared_expert_scratch_bytes(const MoeParameters& p, std::int32_t first, std::int32_t last) {

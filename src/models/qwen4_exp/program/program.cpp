@@ -758,7 +758,8 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     d.sms       = sms;
     d.wide_work = execution::Forward::workspace_bytes(c, d.wide_chunk, d.pages * kPagedKVPageSize,
                                                       DeviceExecutionView{nullptr, sms}, o.moe_precast_input) +
-                  (o.shared_expert_stream ? execution::Forward::shared_expert_workspace_bytes(c, d.wide_chunk) : 0);
+                  (o.shared_expert_stream ? execution::Forward::shared_expert_workspace_bytes(c, d.wide_chunk) : 0) +
+                  execution::Forward::tensor_core_workspace_bytes(c, d.wide_chunk);
     d.vmm = VmmArena::supported(o.device);
 
     auto& b     = d.bytes;
@@ -3544,7 +3545,8 @@ private:
             plan_.wide_work,
             execution::Forward::workspace_bytes(c_, widest, keys, DeviceExecutionView{nullptr, plan_.sms},
                                                 options_.moe_precast_input) +
-                (options_.shared_expert_stream ? forward_->max_shared_expert_scratch_bytes(widest) : 0));
+                (options_.shared_expert_stream ? forward_->max_shared_expert_scratch_bytes(widest) : 0) +
+                execution::Forward::tensor_core_workspace_bytes(c_, widest));
         const std::uint64_t stride  = residency_->frame_stride();
         const std::size_t tables    = align(stream_->table_bytes());
         const auto work_frames      = static_cast<std::uint32_t>((tables + work + stride - 1) / stride);

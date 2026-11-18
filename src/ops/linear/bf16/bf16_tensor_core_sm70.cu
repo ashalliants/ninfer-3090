@@ -39,17 +39,19 @@ __global__ void __launch_bounds__(kThreads)
 
 } // namespace
 
-bool bf16_tensor_core_linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    const int tokens = x.ne[1];
-    if (!sm70_tensor_core_admits(w.n, w.k, tokens, sm70_tensor_cores_enabled()) || out.dtype != DType::BF16 ||
-        x.dtype != DType::BF16) {
+bool bf16_tensor_core_linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena* workspace,
+                             cudaStream_t stream) {
+    if (out.dtype != DType::BF16 || x.dtype != DType::BF16 || !sm70_tensor_core_admits(w.n, w.k, x.ne[1])) {
         return false;
     }
-    const Sm70HalfWeight half = sm70_half_weight(w.n, w.k);
-    bf16_rows_to_f16<<<w.n, kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(w.qdata), w.k, half.values,
-                                                   half.inverse);
+    Sm70Staging st{};
+    if (workspace == nullptr) { return sm70_staging(nullptr, w.n, w.k, x.ne[1], st); } // false, reported
+    const auto scope = workspace->scope();
+    if (!sm70_staging(workspace, w.n, w.k, x.ne[1], st)) { return false; }
+    bf16_rows_to_f16<<<w.n, kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(w.qdata), w.k, st.weight,
+                                                   st.weight_inverse);
     CUDA_CHECK(cudaGetLastError());
-    sm70_tensor_core_gemm(half, w.n, w.k, x.data, tokens, out.data, false, stream);
+    sm70_tensor_core_gemm(st, w.n, w.k, x.data, x.ne[1], out.data, false, stream);
     return true;
 }
 

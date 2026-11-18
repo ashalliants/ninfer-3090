@@ -6,6 +6,8 @@
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -14,7 +16,6 @@ namespace ninfer::ops::detail {
 namespace {
 
 constexpr int kThreads     = 256;
-constexpr int kSliceTokens = 512; // tokens per GEMM (bounds the FP16 activation and FP32 buffers: ~36 MB at the widest)
 
 void check_blas(cublasStatus_t status, const char* what) {
     if (status != CUBLAS_STATUS_SUCCESS) {
@@ -32,21 +33,6 @@ cublasHandle_t handle() {
     return h;
 }
 
-// A device buffer that grows on demand to the largest call seen (~100 MB for Flash-Next in all:
-// the [12800, 2560] FP16 weight and a 512-token slice). Not workspace-planned: the route is opt-in.
-struct Buffer {
-    void* p          = nullptr;
-    std::size_t size = 0;
-    void* reserve(std::size_t bytes) {
-        if (bytes > size) {
-            if (p != nullptr) { CUDA_CHECK(cudaFree(p)); }
-            CUDA_CHECK(cudaMalloc(&p, bytes));
-            size = bytes;
-        }
-        return p;
-    }
-};
-Buffer g_weight, g_weight_inverse, g_acts, g_accum, g_token_inverse;
 
 __device__ __forceinline__ float block_absmax(float v, float* red) {
 #pragma unroll
@@ -109,36 +95,55 @@ bool sm70_tensor_cores_enabled() noexcept {
 #endif
 }
 
-Sm70HalfWeight sm70_half_weight(int rows, int k) {
-    return {static_cast<__half*>(g_weight.reserve(static_cast<std::size_t>(rows) * k * sizeof(__half))),
-            static_cast<float*>(g_weight_inverse.reserve(static_cast<std::size_t>(rows) * sizeof(float)))};
+bool sm70_staging(WorkspaceArena* arena, int rows, int k, int tokens, Sm70Staging& out) {
+    const std::size_t need = sm70_tensor_core_workspace_bytes(rows, k, tokens);
+    if (need == 0) { return false; }
+    if (arena == nullptr || arena->capacity() - arena->used() < need) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            std::fprintf(stderr,
+                         "[sm70 tensor cores] a [%d, %d] call of %d tokens found %zu of the %zu workspace bytes it "
+                         "needs and kept the default kernels (reported once)\n",
+                         rows, k, tokens, arena == nullptr ? std::size_t{0} : arena->capacity() - arena->used(), need);
+        }
+        return false;
+    }
+    const std::size_t r = static_cast<std::size_t>(rows), kk = static_cast<std::size_t>(k);
+    const std::size_t slice = static_cast<std::size_t>(std::min(tokens, kSm70TensorCoreSliceTokens));
+    out.weight           = static_cast<__half*>(arena->alloc_bytes(r * kk * 2).data);
+    out.weight_inverse   = static_cast<float*>(arena->alloc_bytes(r * 4).data);
+    out.acts             = static_cast<__half*>(arena->alloc_bytes(slice * kk * 2).data);
+    out.accum            = static_cast<float*>(arena->alloc_bytes(slice * r * 4).data);
+    out.token_inverse    = static_cast<float*>(arena->alloc_bytes(slice * 4).data);
+    out.cublas_workspace = arena->alloc_bytes(kSm70CublasWorkspaceBytes).data;
+    return true;
 }
 
-void sm70_tensor_core_gemm(const Sm70HalfWeight& w, int rows, int k, const void* x, int tokens, void* out,
+void sm70_tensor_core_gemm(const Sm70Staging& st, int rows, int k, const void* x, int tokens, void* out,
                            bool residual, cudaStream_t stream) {
-    const int slice = tokens < kSliceTokens ? tokens : kSliceTokens;
-    auto* xh  = static_cast<__half*>(g_acts.reserve(static_cast<std::size_t>(k) * slice * sizeof(__half)));
-    auto* c   = static_cast<float*>(g_accum.reserve(static_cast<std::size_t>(rows) * slice * sizeof(float)));
-    auto* inv = static_cast<float*>(g_token_inverse.reserve(static_cast<std::size_t>(slice) * sizeof(float)));
+    const int slice = std::min(tokens, kSm70TensorCoreSliceTokens);
     cublasHandle_t h = handle();
     check_blas(cublasSetStream(h, stream), "cublasSetStream");
+    // After the stream: cublasSetStream resets the workspace to the handle's default pool.
+    check_blas(cublasSetWorkspace(h, st.cublas_workspace, kSm70CublasWorkspaceBytes), "cublasSetWorkspace");
     const float one = 1.0F, zero = 0.0F;
     const auto* xs = static_cast<const __nv_bfloat16*>(x);
     auto* ys       = static_cast<__nv_bfloat16*>(out);
     for (int t0 = 0; t0 < tokens; t0 += slice) {
         const int n = tokens - t0 < slice ? tokens - t0 : slice;
-        tokens_to_f16<<<n, kThreads, 0, stream>>>(xs + static_cast<std::size_t>(t0) * k, k, xh, inv);
+        tokens_to_f16<<<n, kThreads, 0, stream>>>(xs + static_cast<std::size_t>(t0) * k, k, st.acts, st.token_inverse);
         CUDA_CHECK(cudaGetLastError());
-        check_blas(cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, rows, n, k, &one, w.values, CUDA_R_16F, k, xh, CUDA_R_16F,
-                                k, &zero, c, CUDA_R_32F, rows, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+        check_blas(cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, rows, n, k, &one, st.weight, CUDA_R_16F, k, st.acts,
+                                CUDA_R_16F, k, &zero, st.accum, CUDA_R_32F, rows, CUBLAS_COMPUTE_32F,
+                                CUBLAS_GEMM_DEFAULT_TENSOR_OP),
                    "cublasGemmEx");
         const std::size_t count = static_cast<std::size_t>(rows) * n;
         const auto blocks       = static_cast<unsigned>((count + kThreads - 1) / kThreads);
         auto* dst               = ys + static_cast<std::size_t>(t0) * rows;
         if (residual) {
-            finish<true><<<blocks, kThreads, 0, stream>>>(c, rows, n, w.inverse, inv, dst);
+            finish<true><<<blocks, kThreads, 0, stream>>>(st.accum, rows, n, st.weight_inverse, st.token_inverse, dst);
         } else {
-            finish<false><<<blocks, kThreads, 0, stream>>>(c, rows, n, w.inverse, inv, dst);
+            finish<false><<<blocks, kThreads, 0, stream>>>(st.accum, rows, n, st.weight_inverse, st.token_inverse, dst);
         }
         CUDA_CHECK(cudaGetLastError());
     }

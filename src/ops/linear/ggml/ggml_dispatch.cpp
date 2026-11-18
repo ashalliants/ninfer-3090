@@ -1,4 +1,5 @@
 #include "ops/linear/ggml/ggml_dispatch.h"
+#include "ops/linear/common/sm70_tensor_core.h"
 #include "ops/linear/ggml/ggml_tensor_core_sm70.h"
 
 #include "core/layout.h"
@@ -79,7 +80,7 @@ void run(const Tensor& x, const Weight& w, Tensor& out, bool residual, bool deco
         ggml_mmvq_launch<F>(codes, xb, ob, w.n, w.k, t, residual, stream);
         return;
     }
-    if (ggml_tensor_core_linear(x, w, out, residual, stream)) { return; }
+    if (ggml_tensor_core_linear(x, w, out, residual, workspace, stream)) { return; }
     if (workspace == nullptr) {
         throw std::invalid_argument("ggml linear: T > 8 requires caller workspace");
     }
@@ -116,7 +117,8 @@ std::size_t ggml_linear_workspace_capacity_bytes(QType format, std::int32_t n, s
     if (max_tokens <= kGgmlDecodeMaxTokens) { return 0; }
     WorkspaceLayoutBuilder layout;
     (void)allocate_q81(layout, k, max_tokens);
-    return layout.peak_bytes(1);
+    // The sm_70 tensor-core route's staging when it is on (the widest call needs the most).
+    return std::max(layout.peak_bytes(1), sm70_tensor_core_workspace_bytes(n, k, max_tokens));
 }
 
 void ggml_linear_dispatch(const Tensor& x, const Weight& w, Tensor& out, bool residual, bool decode_mma,
