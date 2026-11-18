@@ -195,7 +195,26 @@ __device__ __forceinline__ void cp_wait_ahead() { cp_wait_mem<kXStages - 2>(); }
 
 // A contiguous slice into shared memory, 16 bytes per copy (both ends 16-byte aligned).
 __device__ __forceinline__ void stage_slice(const std::uint8_t* src, std::uint8_t* dst, int bytes) {
+#if defined(NINFER_SM70)
+    // sm_70's cp.async is a synchronous load and store, so a loop of them waits out one global
+    // round trip per copy: issue a batch of loads into registers, then store them.
+    constexpr int kBatch = 8;
+    for (int base = static_cast<int>(threadIdx.x) * 16; base < bytes; base += kThreads * 16 * kBatch) {
+        int4 v[kBatch];
+#pragma unroll
+        for (int j = 0; j < kBatch; ++j) {
+            const int i = base + j * kThreads * 16;
+            if (i < bytes) { v[j] = __ldcg(reinterpret_cast<const int4*>(src + i)); }
+        }
+#pragma unroll
+        for (int j = 0; j < kBatch; ++j) {
+            const int i = base + j * kThreads * 16;
+            if (i < bytes) { *reinterpret_cast<int4*>(dst + i) = v[j]; }
+        }
+    }
+#else
     for (int i = static_cast<int>(threadIdx.x) * 16; i < bytes; i += kThreads * 16) { cp_async16(dst + i, src + i, true); }
+#endif
 }
 
 __device__ __forceinline__ int leaf_of(int n) { return static_cast<int>(__brev(static_cast<unsigned>(n)) >> 27); }
@@ -223,6 +242,55 @@ __device__ __forceinline__ void load_columns(Tiles& sm, int st, int n) {
         }
     }
 }
+
+#if defined(NINFER_SM70)
+// sm_70's cp.async is synchronous, so load_columns stalls each leaf on its global round trips. The
+// same copies split in two instead: fetch_columns issues leaf n's loads into registers (before the
+// current leaf's arithmetic) and store_columns writes them to their stage after it.
+struct ColumnFetch {
+    int4 v[2];
+};
+static_assert(7 * kTileColumns <= 2 * kThreads, "a leaf's parts fit two copies per thread");
+
+template <int kSubs>
+__device__ __forceinline__ ColumnFetch fetch_columns(const Tiles& sm, int n) {
+    ColumnFetch f;
+    f.v[0] = f.v[1] = make_int4(0, 0, 0, 0);
+    if (n >= kLeaves) { return f; }
+    const int leaf = leaf_of(n), subs = leaf_subs<kSubs>(leaf);
+    const int parts = 2 * subs + 1;
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int i = static_cast<int>(threadIdx.x) + j * kThreads;
+        if (i < parts * kTileColumns) {
+            const int c = i / parts, part = i % parts;
+            const std::int8_t* in = sm.code[c];
+            if (in != nullptr) {
+                const std::int8_t* src = in + leaf * kLeafBytes + (part < 2 * subs ? 16 * part : kLeafScales);
+                f.v[j] = __ldcg(reinterpret_cast<const int4*>(src));
+            }
+        }
+    }
+    return f;
+}
+
+template <int kSubs>
+__device__ __forceinline__ void store_columns(Tiles& sm, int st, int n, const ColumnFetch& f) {
+    if (n >= kLeaves) { return; }
+    const int leaf = leaf_of(n), subs = leaf_subs<kSubs>(leaf);
+    const int parts = 2 * subs + 1;
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int i = static_cast<int>(threadIdx.x) + j * kThreads;
+        if (i < parts * kTileColumns) {
+            const int c = i / parts, part = i % parts;
+            void* dst = part < 2 * subs ? static_cast<void*>(&sm.x[st][part / 2][0][0] + tile_offset(c, part % 2))
+                                        : static_cast<void*>(&sm.xd[st][c][0]);
+            *reinterpret_cast<int4*>(dst) = f.v[j];
+        }
+    }
+}
+#endif
 
 // Leaf n's sub-blocks of the unit's rows decoded into weight stage `st`, one (row, sub-block) per
 // thread. Row r is raw + r * row_bytes in the staged slice (gate rows 0..31, then up rows), or, when
@@ -401,6 +469,41 @@ __global__ void __launch_bounds__(kThreads, 1)
         for (int col0 = begin; col0 < end; col0 += kTileColumns) {
             const int count = min(kTileColumns, end - col0);
             __syncthreads(); // decode done (first tile) / the previous tile's reads done
+#if defined(NINFER_SM70)
+            {
+                // The tile's codes and scales, every load issued before any store (see stage_slice).
+                constexpr int kCodes = kDownSubs * kTileColumns * 2 / kThreads; // 10
+                constexpr int kScalesPer = kDownSubs * kTileColumns / kThreads; // 5
+                static_assert(kCodes * kThreads == kDownSubs * kTileColumns * 2 && kScalesPer * kThreads == kDownSubs * kTileColumns);
+                int4 code[kCodes];
+                float scale[kScalesPer];
+#pragma unroll
+                for (int j = 0; j < kCodes; ++j) {
+                    const int i = static_cast<int>(threadIdx.x) + j * kThreads;
+                    const int s = i / (2 * kTileColumns), c = (i / 2) % kTileColumns, h = i % 2;
+                    const auto* row = reinterpret_cast<const std::uint8_t*>(h_rows) + static_cast<std::size_t>(col0 + c) * kHRowBytes;
+                    code[j] = c < count ? __ldcg(reinterpret_cast<const int4*>(row + 32 * s + 16 * h)) : make_int4(0, 0, 0, 0);
+                }
+#pragma unroll
+                for (int j = 0; j < kScalesPer; ++j) {
+                    const int i = static_cast<int>(threadIdx.x) + j * kThreads;
+                    const int s = i / kTileColumns, c = i % kTileColumns;
+                    const auto* row = reinterpret_cast<const std::uint8_t*>(h_rows) + static_cast<std::size_t>(col0 + c) * kHRowBytes;
+                    scale[j] = c < count ? reinterpret_cast<const float*>(row + kIntermediate)[s] : 0.0F;
+                }
+#pragma unroll
+                for (int j = 0; j < kCodes; ++j) {
+                    const int i = static_cast<int>(threadIdx.x) + j * kThreads;
+                    const int s = i / (2 * kTileColumns), c = (i / 2) % kTileColumns, h = i % 2;
+                    *reinterpret_cast<int4*>(&sm.x[s][0][0] + tile_offset(c, h)) = code[j];
+                }
+#pragma unroll
+                for (int j = 0; j < kScalesPer; ++j) {
+                    const int i = static_cast<int>(threadIdx.x) + j * kThreads;
+                    sm.xd[i / kTileColumns][i % kTileColumns] = scale[j];
+                }
+            }
+#else
             for (int i = static_cast<int>(threadIdx.x); i < kDownSubs * kTileColumns * 2; i += kThreads) {
                 const int s = i / (2 * kTileColumns), c = (i / 2) % kTileColumns, h = i % 2;
                 const auto* row = reinterpret_cast<const std::uint8_t*>(h_rows) + static_cast<std::size_t>(col0 + min(c, count - 1)) * kHRowBytes;
@@ -411,6 +514,7 @@ __global__ void __launch_bounds__(kThreads, 1)
                 const auto* row = reinterpret_cast<const std::uint8_t*>(h_rows) + static_cast<std::size_t>(col0 + min(c, count - 1)) * kHRowBytes;
                 cp_async4(&sm.xd[s][c], reinterpret_cast<const float*>(row + kIntermediate) + s, c < count);
             }
+#endif
             cp_commit();
             cp_wait_all();
             __syncthreads();
@@ -420,7 +524,7 @@ __global__ void __launch_bounds__(kThreads, 1)
             for (int n = 0; n < kLeaves; ++n) {
                 const int s = static_cast<int>(__brev(static_cast<unsigned>(n)) >> 27);
                 float v[2][2][4];
-                if (s < kDownSubs) {
+                if (s < kDownSubs && cgroup < count) { // a warp past the tile's columns stores nothing
 #if defined(NINFER_SM70)
                     int4 wr[2][2][2]; // [t][rh][half]
 #pragma unroll
@@ -598,8 +702,12 @@ __global__ void __launch_bounds__(kThreads, 1)
             for (int half = 0; half < 2; ++half) {
                 const int n  = n2 + half;
                 const int xs = n % kXStages, ws = n % kWStages;
+#if defined(NINFER_SM70)
+                const ColumnFetch ahead = fetch_columns<kSubs>(sm, n + kXStages - 1);
+#else
                 load_columns<kSubs>(sm, (n + kXStages - 1) % kXStages, n + kXStages - 1);
                 cp_commit();
+#endif
                 const int subs = half == 0 ? 3 : 2; // leaf_subs<kSubs>(leaf_of(n))
                 float v[16];
 #pragma unroll
@@ -607,6 +715,9 @@ __global__ void __launch_bounds__(kThreads, 1)
 #pragma unroll
                 for (int k = 0; k < kMaxLeafSubs; ++k) {
                     if (k >= subs) { break; }
+                    // A warp whose 16 columns all lie past the tile's columns has nothing to store
+                    // (the epilogue reads only columns < count): its v stays 0.
+                    if (cgroup >= count) { break; }
                     const auto* wbase = &sm.w[ws][k][0][0];
 #if defined(NINFER_SM70)
                     int4 wr[2][2][2]; // [t][rh][half]
@@ -707,6 +818,9 @@ __global__ void __launch_bounds__(kThreads, 1)
                     }
                 }
                 fold_all(n, v, stack, root);
+#if defined(NINFER_SM70)
+                store_columns<kSubs>(sm, (n + kXStages - 1) % kXStages, n + kXStages - 1, ahead);
+#endif
                 // Two leaves ahead, after this leaf's tensor work in program order.
                 decode_rows<F, kSubs>(sm, (n + 2) % kWStages, n + 2, rows, up, row_bytes, grid);
                 cp_wait_ahead();
