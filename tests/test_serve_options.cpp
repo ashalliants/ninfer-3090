@@ -666,6 +666,18 @@ int main() {
     failures += check(parse({"ninfer-serve", "model.ninfer", "--ngram-keepalive-ms", "0"})
                               .flash_next.ngram_keepalive_ms == 0,
                       "--ngram-keepalive-ms 0 did not turn the keep-alive off");
+    {
+        // Flags typed with their own default value are still recorded as set.
+        const auto same = make_engine_options(parse({"ninfer-serve", "model.ninfer", "--ngram-keepalive-ms", "40",
+                                                     "--ram-headroom-mib", "2048", "--spec", "mtp", "--draft-tokens", "3", "--cpu-verify-misses",
+                                                     "--cpu-verify-workers", "6"}))
+                              .flash_next;
+        failures += check(same.ngram_keepalive_ms_set && same.ram_headroom_bytes_set && same.cpu_verify_workers_set,
+                          "default-valued Flash-Next flags were not recorded as set");
+        const auto none = make_engine_options(parse({"ninfer-serve", "model.ninfer"})).flash_next;
+        failures += check(!none.ngram_keepalive_ms_set && !none.ram_headroom_bytes_set && !none.cpu_verify_workers_set,
+                          "omitted Flash-Next flags were recorded as set");
+    }
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--ngram-keepalive-ms", "25"}))
                               .flash_next.ngram_keepalive_ms == 25,
                       "--ngram-keepalive-ms does not reach the Engine");

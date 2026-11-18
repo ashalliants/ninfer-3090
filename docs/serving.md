@@ -227,6 +227,8 @@ the Qwen3.5 models:
   scripts\run.bat qwen38-flash-next
   ```
 
+These options belong to Flash-Next. A Qwen3.5, 3.6 or 3.8 dense model refuses any of them that is set, naming the flag, instead of ignoring it (`--vram-headroom-mib` is also read by the dense context fit; see `--fit-context`).
+
 | Flash-Next option | Meaning | Default |
 |---|---|---|
 | `--ngram-volume FILE` | the per-layer n-gram embedding volume | `<model>.ngram` |

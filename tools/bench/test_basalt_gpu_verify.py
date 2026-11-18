@@ -333,6 +333,29 @@ with tempfile.TemporaryDirectory() as scratch:
           captured.get("b") == ["--moe-fused-route"] and "1 option(s) on" in r["detail"], f"{captured} {r}")
     check("no winner, no combined run", v.combined_choice(ctx, by_id["combined:qwen38-27b"]) == ([], []))
 
+    # A variant measured on top of other options (its A side carries them) only counts while those
+    # options are in the row: --cpu-verify-workers beat 6 workers WITH --cpu-verify-misses, which
+    # says nothing about it against off, and once dragged the losing --cpu-verify-misses into a row.
+    stacked = make_ctx(str(root / "stacked"))
+
+    def record(step_id, median):
+        path = v.result_path(stacked, step_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"status": "MEASURED", "data": {"wins": median >= 1.01, "median": median}}))
+    record("ab:--cpu-verify-workers", 1.03)
+    record("ab:--moe-gate-up-registers", 1.02)
+    record("ab:--cpu-verify-misses", 0.95)
+    stacked_by_id = {s.id: s for s in v.build_steps(stacked)}
+    check("stacked winners without their winning baseline are left out",
+          v.combined_choice(stacked, stacked_by_id["combined:identity"]) == ([], []))
+    record("ab:--cpu-verify-misses", 1.04)
+    record("ab:--moe-precast-input", 1.01)
+    chosen, b_args = v.combined_choice(stacked, stacked_by_id["combined:identity"])
+    check("stacked winners come in with their winning baseline",
+          set(chosen) == {"--cpu-verify-workers", "--cpu-verify-misses", "--moe-gate-up-registers",
+                          "--moe-precast-input"}
+          and "--cpu-verify-workers" in b_args and "12" in b_args, f"{chosen} {b_args}")
+
 # No child inherits the side-stream delay (the gates set their own; timing A/Bs must run undelayed).
 saved_delay = os.environ.get(v.SIDE_STREAM_DELAY)
 os.environ[v.SIDE_STREAM_DELAY] = "0"

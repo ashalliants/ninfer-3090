@@ -1376,11 +1376,12 @@ Results of those: `GET /slots`, `GET /dashboard` and the three new `/metrics` se
 `ninfer_bench --preset community-1` produces a valid row carrying the 285 W limit; the soak harness ran
 clean (its first real run); the IQ3 formats and packs and the converter tests did not run.
 
-Follow-up found by the run: `combined_choice()` in `tools/bench/basalt_gpu_verify.py` picks a winner from
-its own narrow A/B without comparing against the true off baseline, so `combined:identity` and
-`combined:all` came out at -4.80% and -8.35% (it kept `--cpu-verify-workers`, which drags in the losing
-`--cpu-verify-misses`). The hand-built `scripts/profiles/qwen38-flash-next-tuned.json` was built from the
-full off-versus-on matrix and does not have the problem.
+Follow-up found by the run, since fixed: `combined_choice()` in `tools/bench/basalt_gpu_verify.py` picked a
+winner from its own narrow A/B without comparing against the true off baseline, so `combined:identity`
+and `combined:all` came out at -4.80% and -8.35% (it kept `--cpu-verify-workers`, which drags in the
+losing `--cpu-verify-misses`). A variant whose A side carries other options now counts only while those
+options are also in the row. The hand-built `scripts/profiles/qwen38-flash-next-tuned.json` was built
+from the full off-versus-on matrix and never had the problem.
 
 ## Artifact decisions
 

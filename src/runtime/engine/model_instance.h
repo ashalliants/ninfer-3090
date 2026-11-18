@@ -14,8 +14,9 @@ namespace ninfer::runtime {
 
 [[nodiscard]] EngineOptions normalize_engine_options(EngineOptions options);
 
-// Throws std::invalid_argument when --vram-headroom-mib is set without a context fit (Qwen3.8 dense).
-void validate_headroom_use(const EngineOptions& options);
+// Throws std::invalid_argument naming every Flash-Next-only option set for a dense model (which would
+// ignore it), and --vram-headroom-mib when it is set without a context fit.
+void validate_flash_next_options_unused(const EngineOptions& options);
 
 struct ModelInstance {
     using ModelContract = models::qwen3_5::RuntimeTypes;
