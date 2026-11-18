@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import struct
 import sys
 import urllib.request
@@ -25,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HF = "https://huggingface.co"
+SHARD_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")  # a bare file name: no separators, no "..\"
 MAX_HEADER_BYTES = 1 << 28  # a header is at most a few MB; refuse anything absurd
 
 
@@ -46,12 +48,30 @@ def read_header(url: str) -> dict:
     return header
 
 
+def shard_name(name: str) -> str:
+    """`name` if it is a plain file name. Shard names come from the remote index, and are used as a path under
+    the cache and as a URL part, so one with a separator or `..` must not get that far."""
+    if not SHARD_NAME.fullmatch(name) or name.startswith(".."):
+        raise ValueError(f"refusing shard name {name!r} from the index")
+    return name
+
+
+def check_stamp(repo: str, directory: Path) -> None:
+    """Refuse a cache directory that was not fetched from `repo` (or has no stamp)."""
+    stamp = directory / "repo.txt"
+    found = stamp.read_text().strip() if stamp.exists() else None
+    if found != repo:
+        raise SystemExit(f"{directory} holds headers for {found or 'an unknown repository'}, not {repo}: "
+                         "fetch into a fresh directory")
+
+
 def read_tensor(repo: str, directory: Path, name: str, offset: int = 0, length: int | None = None) -> bytes:
     """Bytes `[offset, offset + length)` of one tensor (default all of it), by range request.
 
     `directory` is a `fetch` output directory; the header cache says which shard holds `name` and
     where. Use `offset`/`length` to read a single row of a table too big to download."""
-    shard = json.loads((directory / "model.safetensors.index.json").read_text())["weight_map"][name]
+    check_stamp(repo, directory)
+    shard = shard_name(json.loads((directory / "model.safetensors.index.json").read_text())["weight_map"][name])
     entry = json.loads((directory / "headers" / f"{shard}.json").read_text())[name]
     url = f"{HF}/{repo}/resolve/main/{shard}"
     (header_len,) = struct.unpack("<Q", _get(url, 0, 7))
@@ -69,15 +89,16 @@ def read_tensor(repo: str, directory: Path, name: str, offset: int = 0, length: 
 def fetch(repo: str, out: Path, only: set[int] | None, workers: int) -> None:
     out.mkdir(parents=True, exist_ok=True)
     stamp = out / "repo.txt"
-    if stamp.exists() and stamp.read_text().strip() != repo:
-        raise SystemExit(f"{out} holds headers for {stamp.read_text().strip()}, not {repo}: use another directory")
-    stamp.write_text(repo + "\n")
+    if stamp.exists():
+        check_stamp(repo, out)
+    else:
+        stamp.write_text(repo + "\n")
     (out / "headers").mkdir(exist_ok=True)
     for name in ("config.json", "model.safetensors.index.json"):
         if not (out / name).exists():
             (out / name).write_bytes(_get(f"{HF}/{repo}/resolve/main/{name}"))
     index = json.loads((out / "model.safetensors.index.json").read_text())
-    shards = sorted(set(index["weight_map"].values()))
+    shards = sorted(shard_name(n) for n in set(index["weight_map"].values()))
 
     def one(shard: str) -> str:
         target = out / "headers" / f"{shard}.json"

@@ -274,6 +274,30 @@ def test_fetch_refuses_a_directory_for_another_repo():
         check(False, "a cache stamped for another repository must be refused")
 
 
+def test_shard_names_from_the_index_cannot_leave_the_cache():
+    import fetch_headers as fh
+    for bad in ("../x.safetensors", "a/b.safetensors", "..", "/etc/passwd", "a\\b", ""):
+        try:
+            fh.shard_name(bad)
+        except ValueError:
+            continue
+        check(False, f"{bad!r} must be refused")
+    check(fh.shard_name("model-00001-of-00046.safetensors") == "model-00001-of-00046.safetensors", "a real name passes")
+
+
+def test_read_tensor_requires_the_matching_stamp():
+    import fetch_headers as fh
+    with tempfile.TemporaryDirectory() as d:
+        for stamp in (None, "someone/else"):
+            if stamp:
+                (Path(d) / "repo.txt").write_text(stamp + "\n")
+            try:
+                fh.read_tensor("deepseek-ai/other", Path(d), "w")
+            except SystemExit:
+                continue
+            check(False, f"stamp {stamp!r} must be refused before any read")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

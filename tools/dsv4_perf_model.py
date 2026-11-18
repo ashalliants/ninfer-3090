@@ -184,6 +184,10 @@ def round_time(lanes: int, plan: Plan, routing: float | list[float], m: Machine)
     def touched(a: int, b: int) -> float:  # expected distinct experts one layer touches in rank [a, b)
         return sum(1.0 - (1.0 - qi) ** lanes for qi in q[a:b])
 
+    # Expert-grouped execution (plan section 7, rule 2): each distinct (layer, expert) is read once per round and
+    # applied to every lane that chose it, so weight traffic follows the UNIQUE experts above. The extra
+    # arithmetic per additional lane (about 2 x 34 M weights x 6 experts x 40 layers = 16 GFLOP, a few ms on the
+    # card) is small beside the transfers and is folded into `lane_ms`, not charged as extra weight reads.
     reads = [LAYERS * touched(edges[i], edges[i + 1]) for i in range(3)]  # per round: vram, ram, ssd
     eb = plan.expert_bytes
     dense_ms = DENSE_BYTES / (m.dense_eff * m.card_gb_s * 1e9) * 1e3
