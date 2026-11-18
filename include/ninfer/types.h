@@ -521,6 +521,12 @@ struct FlashNextOptions {
     // sleeping (SSDs drop into a slow power state after about 100 ms idle), for a minute after the
     // last request; 0 turns the keep-alive off. Changes timing only, never the output.
     std::uint32_t ngram_keepalive_ms = 40;
+    // Presence bits for the options above and below whose default is a real value, so a flag typed
+    // with that very value (--ngram-keepalive-ms 40) is still known to be set. The CLI parser sets
+    // them; only the dense-model refusal reads them. They change nothing for Flash-Next.
+    bool ngram_keepalive_ms_set   = false;
+    bool ram_headroom_bytes_set   = false;
+    bool cpu_verify_workers_set   = false;
     // The VRAM expert cache's saved state: read at startup to fill the cache with the experts the
     // last session used most (warm start), written at shutdown and between requests every 10
     // minutes. Empty uses `<artifact>.expert-state`; `save_expert_state = false` neither reads nor

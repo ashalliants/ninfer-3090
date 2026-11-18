@@ -277,12 +277,12 @@ void validate_flash_next_options_unused(const EngineOptions& options) {
         if (changed) { flags.emplace_back(flag); }
     };
     note(!set.ngram_volume_path.empty(), "--ngram-volume");
-    note(set.ngram_keepalive_ms != unset.ngram_keepalive_ms, "--ngram-keepalive-ms");
+    note(set.ngram_keepalive_ms_set || set.ngram_keepalive_ms != unset.ngram_keepalive_ms, "--ngram-keepalive-ms");
     note(!set.expert_state_path.empty(), "--expert-state");
     note(!set.save_expert_state, "--no-expert-state");
     note(!set.default_expert_state_path.empty(), "--default-expert-state");
     note(set.expert_cache_bytes.has_value(), "--expert-cache-mib");
-    note(set.ram_headroom_bytes != unset.ram_headroom_bytes, "--ram-headroom-mib");
+    note(set.ram_headroom_bytes_set || set.ram_headroom_bytes != unset.ram_headroom_bytes, "--ram-headroom-mib");
     note(set.allow_unlocked_host_memory, "--allow-unlocked-host-memory");
     note(set.partial_ram_residency, "--partial-ram-residency");
     note(set.mtp_constrained, "--mtp-constrained");
@@ -296,7 +296,7 @@ void validate_flash_next_options_unused(const EngineOptions& options) {
     note(set.moe_gate_up_registers, "--moe-gate-up-registers");
     note(set.moe_fused_route, "--moe-fused-route");
     note(set.cpu_verify_misses, "--cpu-verify-misses");
-    note(set.cpu_verify_workers != unset.cpu_verify_workers, "--cpu-verify-workers");
+    note(set.cpu_verify_workers_set || set.cpu_verify_workers != unset.cpu_verify_workers, "--cpu-verify-workers");
     note(set.prefill_cpu_share.num != 0, "--prefill-cpu-share");
     note(set.gdn_async_commit, "--gdn-async-commit");
     note(set.hc_int8, "--hc-int8");

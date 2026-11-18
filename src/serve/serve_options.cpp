@@ -1058,7 +1058,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
                                             std::to_string(kNgramKeepaliveWindowMs) +
                                             "]: keep-alive reads run only for a minute after a request");
             }
-            options.flash_next.ngram_keepalive_ms = static_cast<std::uint32_t>(ms);
+            options.flash_next.ngram_keepalive_ms     = static_cast<std::uint32_t>(ms);
+            options.flash_next.ngram_keepalive_ms_set = true;
         } else if (arg == "--shared-expert-stream") {
             options.flash_next.shared_expert_stream = true;
         } else if (arg == "--mtp-constrained") {
@@ -1096,7 +1097,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
         } else if (arg == "--cpu-verify-workers") {
             const int workers = parse_nonnegative_int(require_value("--cpu-verify-workers"), "cpu-verify-workers");
             if (workers < 1 || workers > 64) { throw std::invalid_argument("--cpu-verify-workers must be in [1, 64]"); }
-            options.flash_next.cpu_verify_workers = static_cast<std::uint32_t>(workers);
+            options.flash_next.cpu_verify_workers     = static_cast<std::uint32_t>(workers);
+            options.flash_next.cpu_verify_workers_set = true;
             cpu_verify_workers_set = true;
         } else if (arg == "--hot-embedding-rows") {
             options.flash_next.hot_embedding_rows = static_cast<std::uint32_t>(
@@ -1119,6 +1121,7 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
         } else if (arg == "--ram-headroom-mib") {
             options.flash_next.ram_headroom_bytes =
                 parse_mib_bytes(require_value("--ram-headroom-mib"), "ram-headroom-mib");
+            options.flash_next.ram_headroom_bytes_set = true;
         } else if (arg == "--allow-unlocked-host-memory") {
             options.flash_next.allow_unlocked_host_memory = true;
         } else if (arg == "--expert-cache-mib") {

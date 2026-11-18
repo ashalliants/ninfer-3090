@@ -384,6 +384,18 @@ int check_flash_next_options_refused() {
                               message.find("Flash-Next") != std::string::npos,
                           (std::string(item.flag) + " was not refused naming itself").c_str());
     }
+    // A flag typed with its own default value is still set.
+    {
+        ninfer::EngineOptions same;
+        same.flash_next.ngram_keepalive_ms_set = true;
+        same.flash_next.ram_headroom_bytes_set = true;
+        same.flash_next.cpu_verify_workers_set = true;
+        const std::string message = refusal(same);
+        failures += check(message.find("--ngram-keepalive-ms") != std::string::npos &&
+                              message.find("--ram-headroom-mib") != std::string::npos &&
+                              message.find("--cpu-verify-workers") != std::string::npos,
+                          "default-valued Flash-Next flags were not refused");
+    }
     ninfer::EngineOptions several;
     several.flash_next.hc_int8         = true;
     several.flash_next.ngram_prefetch  = true;
