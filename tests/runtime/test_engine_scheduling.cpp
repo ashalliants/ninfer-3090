@@ -159,7 +159,7 @@ public:
     std::optional<std::uint32_t> logprobs_top_k;
 
     void report_begin_logprobs(TokenLogprobs logprobs) {
-        instance_.program->begin_logprobs = std::move(logprobs);
+        instance_.program->report_logprobs = std::move(logprobs);
     }
 
     // Gives the Engine a context store backed by a bucket. The store must outlive the Rig. Each
@@ -321,7 +321,7 @@ void test_a_request_runs_to_completion() {
 static_assert(EngineCore<fake::Instance>::kLogprobsCapable,
               "the fake must model the logprob Program contract the Engine uses");
 
-void test_first_token_logprobs_reach_the_result() {
+void test_token_logprobs_reach_the_result() {
     Rig rig({.chunk = 256, .lanes = 1});
     TokenLogprobs reported;
     reported.chosen       = -0.5F;
@@ -330,24 +330,28 @@ void test_first_token_logprobs_reach_the_result() {
     reported.top_logprobs = {-0.5F, -1.75F};
 
     // Not asked for: the Program reports none and the result has none.
-    auto plain = rig.run(1, 300, 1);
+    auto plain = rig.run(1, 300, 3);
     require(finished(plain), "the request did not finish\n" + rig.dump());
     require(plain.get().token_logprobs.empty(), "logprobs appeared on a request that did not ask");
 
+    // Asked for: one entry per generated token (the first from prefill, the rest from decode
+    // rounds), in step with the generated ids, each with its bytes.
     rig.report_begin_logprobs(reported);
     rig.logprobs_top_k = 2;
-    auto asked         = rig.run(2, 300, 1);
+    auto asked         = rig.run(2, 300, 3);
     require(finished(asked), "the request did not finish\n" + rig.dump());
     const GenerationResult generation = asked.get();
-    require(generation.generated_token_ids.size() == 1 && generation.token_logprobs.size() == 1,
-            "one generated token did not give one logprob entry");
-    const TokenLogprob& entry = generation.token_logprobs[0];
-    require(entry.sampled.token == 7 && entry.sampled.logprob == -0.5F &&
-                entry.sampled.bytes == "tok7",
-            "the generated token's logprob entry is wrong");
-    require(entry.top.size() == 2 && entry.top[1].token == 9 && entry.top[1].logprob == -1.75F &&
-                entry.top[1].bytes == "tok9",
-            "the alternatives were not reported best first with their bytes");
+    require(generation.generated_token_ids.size() == 3 && generation.token_logprobs.size() == 3,
+            "three generated tokens did not give three logprob entries");
+    for (std::size_t index = 0; index < generation.token_logprobs.size(); ++index) {
+        const TokenLogprob& entry = generation.token_logprobs[index];
+        require(entry.sampled.token == generation.generated_token_ids[index] &&
+                    entry.sampled.logprob == -0.5F && entry.sampled.bytes == "tok7",
+                "a generated token's logprob entry is wrong");
+        require(entry.top.size() == 2 && entry.top[1].token == 9 &&
+                    entry.top[1].logprob == -1.75F && entry.top[1].bytes == "tok9",
+                "the alternatives were not reported best first with their bytes");
+    }
 }
 
 // Long output keeps a lane decoding while another request prefills.
@@ -2496,7 +2500,7 @@ int main() {
         }
     };
     run("a request runs to completion", test_a_request_runs_to_completion);
-    run("first-token logprobs reach the result", test_first_token_logprobs_reach_the_result);
+    run("token logprobs reach the result", test_token_logprobs_reach_the_result);
     run("stall budget caps steps next to a decoding lane",
         test_stall_budget_caps_steps_next_to_a_decoding_lane);
     run("stall budget leaves a lone prefill alone", test_stall_budget_leaves_a_lone_prefill_alone);

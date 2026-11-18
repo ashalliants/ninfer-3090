@@ -77,10 +77,13 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
             throw std::invalid_argument("logprobs_top_k must be at most " +
                                         std::to_string(kMaxLogprobsTopK));
         }
-        if (options.execution.requested_output_tokens != 1) {
-            throw std::invalid_argument(
-                "logprobs are available for a single generated token only: request exactly one "
-                "output token");
+        if (options.execution.thinking.budget ||
+            options.execution.thinking.loop != ReasoningLoopAction::Off) {
+            // The Engine inserts control tokens when a thinking budget or loop guard closes the
+            // reasoning; no model distribution produced them, so they have no log-probability.
+            throw RequestError(
+                RequestErrorKind::LogprobsNotSupported,
+                "logprobs cannot be combined with a thinking budget or a reasoning-loop guard");
         }
     }
     resolved.stop                              = std::move(options.stop);
@@ -258,6 +261,9 @@ public:
     static_assert(GenerationCore::kLossyCapable,
                   "the Qwen3.5 Program must provide the lossy prefill contract the Engine uses");
     static_assert(!Qwen4ExpCore::kLossyCapable);
+    // Token log-probabilities: the Qwen3.5 Program carries them, qwen4_exp does not.
+    static_assert(GenerationCore::kLogprobsCapable);
+    static_assert(!Qwen4ExpCore::kLogprobsCapable);
     using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
                               std::unique_ptr<ScoringCore>, std::unique_ptr<Qwen4ExpCore>>;
 
@@ -376,6 +382,8 @@ public:
     [[nodiscard]] const models::qwen3_5::Frontend& frontend() const {
         return qwen4 != nullptr ? qwen4->frontend : active->frontend;
     }
+
+    [[nodiscard]] bool returns_logprobs() const { return qwen4 == nullptr; }
 
     [[nodiscard]] std::uint32_t capacity() const {
         return qwen4 != nullptr ? qwen4->capacity : active->capacity;
@@ -1139,6 +1147,12 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         resolve_request_options(impl_->sampling_defaults, prompt.impl_->sampling_mode,
                                 std::move(options), impl_->options.relaxed_drafting);
     const ResolvedSamplingParameters resolved_sampling = resolved_options.execution.sampling;
+    // Checked here, ahead of the zero-output shortcut below, so a model that cannot return
+    // logprobs refuses the request whatever its output budget.
+    if (resolved_options.execution.logprobs_top_k && !impl_->returns_logprobs()) {
+        throw RequestError(RequestErrorKind::LogprobsNotSupported,
+                           "this model does not return token log-probabilities");
+    }
 
     const PromptSummary prompt_summary = prompt.impl_->summary;
     if (const auto external = models::qwen3_5::PreparedPromptAccess::view(prompt.impl_->value)

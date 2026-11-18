@@ -612,17 +612,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         // The first token's log-probabilities, for a request that asked: the sampling sites write
         // them to the Program's one scratch buffer and they are read back once the step has
         // synchronized. Only one prefill step runs at a time, so the buffer is never shared.
-        std::optional<execution::LogprobsOutput> logprobs_output;
+        std::optional<qwen3_5::LogprobsOutput> logprobs_output;
         if (request.base->logprobs_top_k) {
-            const auto k  = static_cast<std::int32_t>(std::max(1U, *request.base->logprobs_top_k));
-            const auto at = [&](std::size_t offset) {
-                return static_cast<char*>(logprobs_scratch.p) + offset;
-            };
-            logprobs_output.emplace(execution::LogprobsOutput{
-                .k            = k,
-                .chosen       = Tensor(at(0), DType::FP32, {1}),
-                .top_ids      = Tensor(at(kLogprobsIdsOffset), DType::I32, {k, 1}),
-                .top_logprobs = Tensor(at(kLogprobsValuesOffset), DType::FP32, {k, 1})});
+            logprobs_output.emplace(logprobs_views(1, *request.base->logprobs_top_k));
             schedule_state.logprobs = &*logprobs_output;
         }
         if (staged.cursor >= staged.prompt_tokens) {
@@ -872,17 +864,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         const double vision_seconds = staged.retired_vision_seconds +
                                       (staged.vision ? staged.vision->elapsed_seconds() : 0.0);
         const std::uint32_t prompt_tokens = staged.prompt_tokens;
-        std::optional<runtime::TokenLogprobs> first_token_logprobs;
         if (logprobs_output) {
-            runtime::TokenLogprobs host;
-            host.count = *request.base->logprobs_top_k;
-            CUDA_CHECK(cudaMemcpy(&host.chosen, logprobs_output->chosen.data, sizeof(float),
-                                  cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(host.top_ids.data(), logprobs_output->top_ids.data,
-                                  host.count * sizeof(TokenId), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(host.top_logprobs.data(), logprobs_output->top_logprobs.data,
-                                  host.count * sizeof(float), cudaMemcpyDeviceToHost));
-            first_token_logprobs = host;
+            const std::uint32_t lane = sequence.lane;
+            read_logprobs(std::span<const std::uint32_t>(&lane, 1), *logprobs_output, 1, nullptr);
         }
 
         if (!license_tokens(std::span<TokenId>(host_tokens, 1))) { token_domain_faults[0] = true; }
@@ -936,7 +920,6 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             .round   = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},
             .processed_prompt_tokens = processed_prompt_tokens,
             .complete                = true,
-            .first_token_logprobs    = first_token_logprobs,
             .timing                  = timing.finish(),
         };
     } catch (...) {

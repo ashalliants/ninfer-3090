@@ -1305,7 +1305,7 @@ The endpoint supports:
 - Assistant `reasoning_content` and `reasoning` history aliases.
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
-behavior. This includes nonzero `logit_bias`, log probabilities beyond the single-token
+behavior. This includes nonzero `logit_bias`, log probabilities outside the non-streaming
 [Chat form](#chat-log-probabilities), audio/file input or audio output, explicit low/high image detail, web search,
 moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
@@ -1684,10 +1684,10 @@ supported.
 
 ### Chat log probabilities
 
-`logprobs: true` on Chat Completions returns the log-probability of the generated token and, with
-`top_logprobs` (0 to 20), of its most likely alternatives in `choices[0].logprobs.content`. It is
-built for classification, multiple-choice scoring and calibration, where one answer token carries
-the result:
+`logprobs: true` on Chat Completions returns the log-probability of every generated token and, with
+`top_logprobs` (0 to 20), of its most likely alternatives in `choices[0].logprobs.content`. The
+common use is classification, multiple-choice scoring and calibration, where one answer token
+carries the result:
 
 ```json
 {"model": "qwen3.8-27b", "messages": [{"role": "user", "content": "Answer A, B, C or D: ..."}],
@@ -1697,15 +1697,19 @@ the result:
 
 Each entry has `token`, `logprob` and `bytes` (the token's exact bytes, which are not always valid
 UTF-8 alone: `token` then shows U+FFFD for the broken part), plus `top_logprobs` in the same shape,
-best first. The values are the model's own distribution, a softmax over the raw logits before
-temperature, penalties, filters and grammar masks, so they do not change with the sampling
-settings.
+best first. There is one entry for each generated token, in order, so the list is as long as
+`usage.completion_tokens`; the stop token that ends a reply is one of them. The values are the
+model's own distribution, a softmax over the raw logits before temperature, penalties, filters and
+grammar masks, so they do not change with the sampling settings. They are exact under every
+decoding mode, including MTP and DFlash2 speculative rounds: an accepted draft token reports the
+target model's probability for it, like any other token.
 
-Only the first generated token is supported, so the request must be non-streaming, set
-`max_tokens` (or `max_completion_tokens`) to `1`, and have thinking disabled (otherwise the first
-token is reasoning). Anything else fails with `logprobs_not_supported`. The Responses endpoint
-still refuses nonzero `top_logprobs`, and the Anthropic endpoint has no log-probability field.
-Multi-token log probabilities are not available yet.
+The response is built when generation finishes, so the request must be non-streaming, and thinking
+must be disabled (`chat_template_kwargs.enable_thinking=false` or `reasoning_effort=none`):
+otherwise the first tokens are reasoning, and a thinking budget or reasoning-loop guard inserts
+tokens the model never produced. Anything else fails with `logprobs_not_supported`. The Responses
+endpoint still refuses nonzero `top_logprobs`, and the Anthropic endpoint has no log-probability
+field.
 
 ### Chat custom tools
 

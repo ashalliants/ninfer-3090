@@ -282,14 +282,13 @@ public:
         return row < domain_failed_.size() && domain_failed_[row];
     }
 
-    [[nodiscard]] const std::optional<TokenLogprobs>&
-    first_token_logprobs(std::size_t row) const noexcept {
-        static const std::optional<TokenLogprobs> none;
-        return row == 0 ? first_logprobs_ : none;
+    [[nodiscard]] std::span<const TokenLogprobs> token_logprobs(std::size_t row) const {
+        return row < logprobs_.size() ? std::span<const TokenLogprobs>(logprobs_[row])
+                                      : std::span<const TokenLogprobs>();
     }
     [[nodiscard]] ExecutionTiming execution_timing() const noexcept { return timing_; }
 
-    std::optional<TokenLogprobs> first_logprobs_; // a Begin row's, when the request asked
+    std::vector<std::vector<TokenLogprobs>> logprobs_; // per row, one entry per licensed token
     std::vector<SequenceHandle> rows_;
     std::vector<TokenId> tokens_;
     std::vector<bool> domain_failed_; // a row whose sampled token left the vocabulary
@@ -878,9 +877,9 @@ public:
     }
 
     // ---- execution ----
-    // What a Begin row reports as its first token's log-probabilities (a real Program reads them
-    // from the device, and only for a request that asked).
-    std::optional<TokenLogprobs> begin_logprobs;
+    // What every licensed token reports as its log-probabilities (a real Program reads them from
+    // the device, and only for a request that asked).
+    std::optional<TokenLogprobs> report_logprobs;
 
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   ExecutionTiming* = nullptr,
@@ -957,7 +956,8 @@ public:
             PendingBatch batch;
             batch.rows_.push_back(sequence);
             batch.tokens_.push_back(7);
-            batch.first_logprobs_ = begin_logprobs;
+            batch.logprobs_.push_back(report_logprobs ? std::vector<TokenLogprobs>{*report_logprobs}
+                                                      : std::vector<TokenLogprobs>{});
             progress.pending      = std::move(batch);
             lane.pending     = true;
         }
@@ -979,6 +979,8 @@ public:
             checked(sequence).pending = true;
             batch.rows_.push_back(sequence);
             batch.tokens_.push_back(7);
+            batch.logprobs_.push_back(report_logprobs ? std::vector<TokenLogprobs>{*report_logprobs}
+                                                      : std::vector<TokenLogprobs>{});
             const std::uint64_t faulted = token_domain_fault_request.load();
             batch.domain_failed_.push_back(faulted != 0 && lanes_[sequence.lane].plan == faulted);
         }
