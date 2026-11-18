@@ -359,6 +359,38 @@ banner="$(banner_of NINFER_ALLOWED_HOST=gpubox.lan -- qwen38-27b)"
   exit 1
 }
 
+# NINFER_NO_PREFILL_CUBLAS=on turns the cuBLAS prefill route off (on by default in sm_70 builds,
+# and set by the 27B MTP profile). It must follow --config: ninfer-serve reads the file's words
+# first and the command line's after, so the later --no-prefill-cublas wins.
+recorded="$(record no_cublas NINFER_SPEC=mtp NINFER_NO_PREFILL_CUBLAS=on -- qwen38-27b)"
+expect_flags '27B NINFER_NO_PREFILL_CUBLAS=on' "$recorded" '--no-prefill-cublas'
+mapfile -t raw_words < "$recorded.raw"
+config_at=-1 no_cublas_at=-1
+for i in "${!raw_words[@]}"; do
+  [[ "${raw_words[$i]}" == --config ]] && config_at=$i
+  [[ "${raw_words[$i]}" == --no-prefill-cublas ]] && no_cublas_at=$i
+done
+(( config_at >= 0 && no_cublas_at > config_at )) || {
+  printf 'run.sh must pass --no-prefill-cublas after --config (got --config at %s, it at %s)\n' \
+    "$config_at" "$no_cublas_at" >&2
+  exit 1
+}
+refuse_flag '27B default' "$(record cublas_default -- qwen38-27b)" '--no-prefill-cublas'
+
+# NINFER_GRAFT: each ';'-separated NAME=PATH (a path may hold spaces or commas) becomes one --graft;
+# NINFER_DEFAULT_GRAFT passes --default-graft; unset, there is neither.
+recorded="$(record graft NINFER_GRAFT='uncensored=/v/a b,c.gguf;;other=/v/o.gguf' \
+  NINFER_DEFAULT_GRAFT=uncensored -- qwen38-27b)"
+expect_flags '27B NINFER_GRAFT' "$recorded" '--default-graft uncensored'
+grep -Fxq -- '--graft uncensored=/v/a b,c.gguf' "$recorded" && grep -Fxq -- '--graft other=/v/o.gguf' "$recorded" &&
+  [[ "$(grep -c -- '^--graft ' "$recorded")" == 2 ]] || {
+  printf 'run.sh did not pass NINFER_GRAFT as two --graft entries:\n%s\n' "$(cat -- "$recorded")" >&2
+  exit 1
+}
+recorded="$(record graft_none -- qwen38-27b)"
+refuse_flag '27B default' "$recorded" '--graft'
+refuse_flag '27B default' "$recorded" '--default-graft'
+
 # An explicit override beats the profile's default; vision can be turned off.
 recorded="$(record override NINFER_CONTEXT=65536 NINFER_PREFILL_CHUNK=1024 NINFER_CONCURRENCY=2 \
   NINFER_VISION=off -- qwen38-27b)"

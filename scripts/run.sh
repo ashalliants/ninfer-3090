@@ -139,7 +139,7 @@
 #           and for Qwen3.8-Flash-Next: DEVICES STAGE_LAYERS EXPERT_STATE VRAM_HEADROOM_MIB
 #           RAM_HEADROOM_MIB EXPERT_CACHE_MIB CONTEXT_NVME_DIR
 #   on|off: CORS GREEDY NO_THINKING PRESERVE_THINKING TOLERANT_TOOL_CALLS NO_CUDA_GRAPH
-#           NO_PREFIX_REUSE NO_PREFILL_A8 NO_PREFILL_CUBLAS_PROJECTIONS CONTEXT_STORE_COMPRESS
+#           NO_PREFIX_REUSE NO_PREFILL_A8 NO_PREFILL_CUBLAS NO_PREFILL_CUBLAS_PROJECTIONS CONTEXT_STORE_COMPRESS
 #           NO_EXIT_ON_ENGINE_FAILURE ADMISSION_FIT_CHECK PROGRESS_ANCHORS_SHARED MODEL_SUSPEND
 #           NO_AUTO_RESUME LM_HEAD_Q4 LM_HEAD_Q6 EMBEDDING_Q4 EMBEDDING_Q6 NO_EXPERT_STATE
 #           LOSSY_PREFILL_SCOUT_A4 REQUEST_LOG_LOSSY_DETAIL
@@ -610,7 +610,7 @@ passthrough_value_flags=(
 )
 passthrough_switch_flags=(
   cors greedy no-thinking preserve-thinking tolerant-tool-calls no-cuda-graph no-prefix-reuse
-  no-prefill-a8 no-prefill-cublas-projections context-store-compress no-exit-on-engine-failure
+  no-prefill-a8 no-prefill-cublas no-prefill-cublas-projections context-store-compress no-exit-on-engine-failure
   admission-fit-check progress-anchors-shared model-suspend no-auto-resume
   lm-head-q4 lm-head-q6 embedding-q4 embedding-q6 lossy-prefill-scout-a4 request-log-lossy-detail
   no-expert-state mtp-staged-drafts
