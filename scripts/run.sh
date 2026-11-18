@@ -595,6 +595,7 @@ passthrough_value_flags=(
   max-request-mib media-cache-mib media-live-mib media-preprocess-threads vision-max-merged
   response-store-max-records response-store-max-mib context-cost-presets
   prefill-stall-budget-ms yield-long-prefill-ms prefill-decode-share prefill-layer-slices hot-embedding-rows
+  cpu-verify-workers
   progress-anchor-tokens sleep-idle-seconds suspend-snapshot suspend-weights
   context-store-ttl-hours context-store-idle-seconds context-store-restore-seconds
   context-store-flush-seconds context-store-peer-poll-ms context-store-s3-endpoint

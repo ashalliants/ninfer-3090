@@ -26,6 +26,8 @@
 #     quarter of the routed experts do not fit in VRAM, so a prompt's first pass misses 3-7% of
 #     the experts it routes to. Over this card's 3.3 GB/s link, that first pass decoded 48-63
 #     tok/s and now decodes 68-80 (2026-11-18). With a warm cache it is within 2% either way;
+#     The CPU threads are nproc - 6, clamped to 6..10 (NINFER_CPU_VERIFY_WORKERS overrides): on an
+#     8-core/16-thread host 10 or 12 measured +1-3% over the default 6, 14 lost to oversubscription;
 #   - Flash-Next keeps only the token embedding's first 8192 rows in VRAM (--hot-embedding-rows
 #     8192; NINFER_HOT_EMBEDDING_ROWS=0 keeps the whole table): 216 more expert frames, the same
 #     output, a prompt's first pass +1-1.5%;
@@ -79,6 +81,11 @@ case "$model_key" in
     # A verification round's misses go partly to CPU threads beside the GPU instead of over the link
     # (the same output): a prompt's first pass, 48-63 -> 68-80 tok/s on this card.
     export NINFER_CPU_VERIFY_MISSES="${NINFER_CPU_VERIFY_MISSES:-on}"
+    if [[ -z "${NINFER_CPU_VERIFY_WORKERS:-}" ]]; then
+      threads="$(nproc 2>/dev/null || echo 12)"
+      workers=$(( threads - 6 )); (( workers < 6 )) && workers=6; (( workers > 10 )) && workers=10
+      export NINFER_CPU_VERIFY_WORKERS="$workers"
+    fi
     # The embedding's rare rows are read from pinned RAM, giving their VRAM to the expert cache.
     export NINFER_HOT_EMBEDDING_ROWS="${NINFER_HOT_EMBEDDING_ROWS:-8192}"
     lock_kib="$(ulimit -l)"
