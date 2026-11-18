@@ -50,12 +50,24 @@ __global__ void split_vector_kernel(const uint4* __restrict__ in, int rows8, int
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= rows8) { return; }
     const int row = r * 8;
-    int i         = 0;
-    while (row >= targets.begin[i + 1]) { ++i; }
-    const int width = targets.begin[i + 1] - targets.begin[i];
-    auto* out       = reinterpret_cast<uint4*>(targets.data[i]);
+    // The output is found with compile-time indices only: a runtime index into the kernel parameter
+    // copies all of it to local memory first. Unused begin[] entries hold the total, so the compares
+    // stop at the last output.
+    __nv_bfloat16* data = targets.data[0];
+    int begin           = 0;
+    int end             = targets.begin[1];
+#pragma unroll
+    for (int s = 1; s < kMaxOutputs; ++s) {
+        if (row >= targets.begin[s]) {
+            data  = targets.data[s];
+            begin = targets.begin[s];
+            end   = targets.begin[s + 1];
+        }
+    }
+    const int width = end - begin;
+    auto* out       = reinterpret_cast<uint4*>(data);
     for (int t = blockIdx.y; t < columns; t += gridDim.y) {
-        out[(static_cast<std::size_t>(t) * width + (row - targets.begin[i])) / 8] =
+        out[(static_cast<std::size_t>(t) * width + (row - begin)) / 8] =
             in[static_cast<std::size_t>(t) * rows8 + r];
     }
 }
