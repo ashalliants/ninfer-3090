@@ -81,6 +81,10 @@ These are the model defaults it sets:
 | `NINFER_HOT_EMBEDDING_ROWS=8192` | Flash-Next | Only the common embedding rows stay in VRAM, freeing room for 216 more cached experts |
 | `NINFER_SPEC=mtp`, `NINFER_KV_DTYPE=int8` | 27B | MTP3 with INT8 KV, which is faster than DFlash2 on this card (76 against 66 tok/s on code) |
 
+One default comes from the build rather than the launcher: in an `sm_70` build `--prefill-cublas` is
+on, so the 27B's wide prefill GEMMs run on the tensor cores through cuBLAS instead of emulated integer
+kernels. `--no-prefill-cublas` (`NINFER_NO_PREFILL_CUBLAS=1`) turns it off.
+
 ### Refusal steering (Flash-Next)
 
 The community refusal-direction vector for Qwen3.8-Flash-Next ships in the Strata repository as
