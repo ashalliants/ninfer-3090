@@ -2,6 +2,7 @@
 #include "ninfer/ops/causal_conv1d_silu.h"
 
 #include "ops/launcher/causal_conv1d.h" // detail::causal_conv1d_*_launch
+#include "ops/launcher/gdn_gating.h"    // detail::packed_gate_job
 
 #include <cstdint>
 #include <limits>
@@ -274,9 +275,10 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& con
     }
 }
 
-void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
-                              Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
-                              cudaStream_t stream) {
+namespace {
+
+void split_impl(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in, Tensor& conv_state_out,
+                Tensor& out0, Tensor& out1, Tensor& out2, const GdnGateJob* gate, cudaStream_t stream) {
     if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 ||
         conv_state_in.dtype != DType::BF16 || conv_state_out.dtype != DType::BF16) {
         throw std::invalid_argument("causal_conv1d: x/weight/conv_state must be BF16");
@@ -315,11 +317,28 @@ void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tenso
     // it beats the prefill pair, which is flat above it.
     if (x.ne[1] <= detail::kCausalConvParallelMaxTokens) {
         detail::causal_conv1d_smallt_split_launch(x, weight, conv_state_in, conv_state_out, out0,
-                                                  out1, out2, geometry, stream);
+                                                  out1, out2, geometry, stream, gate);
     } else {
+        if (gate != nullptr) { detail::gdn_gate_job_launch(*gate, stream); }
         detail::causal_conv1d_prefill_split_launch(x, weight, conv_state_in, conv_state_out, out0,
                                                    out1, out2, geometry, stream);
     }
+}
+
+} // namespace
+
+void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
+                              Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
+                              cudaStream_t stream) {
+    split_impl(x, weight, conv_state_in, conv_state_out, out0, out1, out2, nullptr, stream);
+}
+
+void causal_conv1d_silu_split_gated(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
+                                    Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
+                                    const Tensor& ab, const Tensor& decay, const Tensor& dt_bias, Tensor& g,
+                                    Tensor& beta, cudaStream_t stream) {
+    const GdnGateJob gate = detail::packed_gate_job(ab, decay, dt_bias, g, beta);
+    split_impl(x, weight, conv_state_in, conv_state_out, out0, out1, out2, gate.n > 0 ? &gate : nullptr, stream);
 }
 
 void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_state, Tensor& out,

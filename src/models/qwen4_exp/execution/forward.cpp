@@ -727,10 +727,10 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     project_verify(x, p.control, ab, batch.verify != nullptr);
     Tensor gate = work_->alloc(DType::FP32, {NV, T});
     Tensor beta = work_->alloc(DType::FP32, {NV, T});
-    // a and b straight from the control projection's halves (no split).
-    if (NV == 48) {
-        ops::gdn_gating_decay_packed(ab, p.decay, p.dt_bias, gate, beta, s);
-    } else {
+    // a and b straight from the control projection's halves (no split); the gates are computed in
+    // the convolution's launch below.
+    const bool packed_gates = NV == 48;
+    if (!packed_gates) {
         Tensor a = work_->alloc(DType::BF16, {NV, T});
         Tensor b = work_->alloc(DType::BF16, {NV, T});
         Tensor* parts[] = {&a, &b};
@@ -744,7 +744,12 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     Tensor& conv_state = state_.gdn_conv.at(index);
     // Verification reads the live convolution window and discards the advanced one.
     Tensor conv_out = batch.verify != nullptr ? batch.verify->conv_scratch : conv_state;
-    ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state, conv_out, q, k, v, s);
+    if (packed_gates) {
+        ops::causal_conv1d_silu_split_gated(qkv, p.convolution, conv_state, conv_out, q, k, v, ab, p.decay, p.dt_bias,
+                                            gate, beta, s);
+    } else {
+        ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state, conv_out, q, k, v, s);
+    }
     const GdnQk qk     = gdn_qk(q, k, DK, NK, NV, T, gdn_head_map_, *work_, s);
     const std::int32_t NQ = qk.q.ne[1];
     Tensor o = work_->alloc(DType::BF16, {DV, NV, T});

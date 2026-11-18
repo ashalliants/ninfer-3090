@@ -4,6 +4,7 @@
 // SiLU is computed as x / (1 + exp(-x)) in fp32, with no polynomial approximation.
 
 #include "ops/common/math.cuh"
+#include "ops/kernel/gdn_gating.cuh"
 
 #include <cuda_bf16.h>
 
@@ -176,13 +177,18 @@ __global__ void causal_conv1d_prefill_state_kernel(const __nv_bfloat16* x,
 // Small-T ordinary form parallelized across both channels and tokens. Each CTA owns one channel
 // tile for the full sequence. Loading history into shared memory before any state publication makes
 // the exact-alias state form safe without a second kernel.
+// `gate` (gate.n > 0): one more CTA past the channel tiles computes the GDN gates instead.
 template <class Output>
 __global__ void causal_conv1d_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                                             const __nv_bfloat16* conv_state_in,
                                             __nv_bfloat16* conv_state_out, Output out,
-                                            std::int32_t C, std::int32_t T) {
+                                            std::int32_t C, std::int32_t T, GdnGateJob gate = {}) {
     __shared__ __nv_bfloat16 history[3][kCausalConvChannelTile];
     __shared__ __nv_bfloat16 weights[4][kCausalConvChannelTile];
+    if (gate.n > 0 && blockIdx.x == gridDim.x - 1) {
+        run_gdn_gate_job(gate, threadIdx.y * blockDim.x + threadIdx.x, static_cast<std::int64_t>(blockDim.x) * blockDim.y);
+        return;
+    }
 
     const std::int32_t lane = static_cast<std::int32_t>(threadIdx.x);
     const std::int32_t t    = static_cast<std::int32_t>(threadIdx.y);

@@ -3,6 +3,7 @@
 // ninfer::ops::detail - private launch prototypes for causal_conv1d.
 
 #include "core/tensor.h"
+#include "ops/launcher/gdn_gate_job.h"
 
 #include <cuda_runtime.h>
 
@@ -31,7 +32,8 @@ void causal_conv1d_smallt_launch(const Tensor& x, const Tensor& weight, const Te
 void causal_conv1d_smallt_split_launch(const Tensor& x, const Tensor& weight,
                                        const Tensor& conv_state_in, Tensor& conv_state_out,
                                        Tensor& out0, Tensor& out1, Tensor& out2,
-                                       CausalConvSplitGeometry geometry, cudaStream_t stream);
+                                       CausalConvSplitGeometry geometry, cudaStream_t stream,
+                                       const GdnGateJob* gate = nullptr);
 void causal_conv1d_decode_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                                  Tensor& conv_state_out, Tensor& out, cudaStream_t stream);
 void causal_conv1d_snapshot_launch(const Tensor& x, const Tensor& weight, Tensor& conv_states,

@@ -108,8 +108,9 @@ void gdn_gating_decay(const Tensor& a, const Tensor& b, const Tensor& decay, con
     gdn_gating_impl(a, b, decay, dt_bias, true, g, beta, stream);
 }
 
-void gdn_gating_decay_packed(const Tensor& ab, const Tensor& decay, const Tensor& dt_bias, Tensor& g,
-                             Tensor& beta, cudaStream_t stream) {
+namespace detail {
+
+GdnGateJob packed_gate_job(const Tensor& ab, const Tensor& decay, const Tensor& dt_bias, Tensor& g, Tensor& beta) {
     if (ab.dtype != DType::BF16 || ab.ne[0] != 96 || ab.ne[2] != 1 || ab.ne[3] != 1 || !ab.is_contiguous() ||
         ab.data == nullptr) {
         throw std::invalid_argument("gdn_gating: ab must be contiguous BF16 [96,T]");
@@ -124,13 +125,27 @@ void gdn_gating_decay_packed(const Tensor& ab, const Tensor& decay, const Tensor
     require_vector48_shape(dt_bias, "dt_bias");
     require_same_gate_shape(g, beta, "beta");
     if (g.ne[1] != ab.ne[1]) { throw std::invalid_argument("gdn_gating: ab and g column counts differ"); }
-    if (g.numel() == 0) { return; }
+    if (g.numel() == 0) { return {}; }
     if (!decay.is_contiguous() || !dt_bias.is_contiguous() || !g.is_contiguous() || !beta.is_contiguous() ||
         decay.data == nullptr || dt_bias.data == nullptr || g.data == nullptr || beta.data == nullptr) {
         throw std::invalid_argument("gdn_gating: all tensors must be contiguous and non-null");
     }
     const auto* a = static_cast<const __nv_bfloat16*>(ab.data);
-    detail::gdn_gating_launch(a, a + 48, 96, decay, dt_bias, true, g, beta, stream);
+    return GdnGateJob{.a         = a,
+                      .b         = a + 48,
+                      .decay     = static_cast<const float*>(decay.data),
+                      .dt_bias   = static_cast<const float*>(dt_bias.data),
+                      .g         = static_cast<float*>(g.data),
+                      .beta      = static_cast<float*>(beta.data),
+                      .n         = g.numel(),
+                      .ab_stride = 96};
+}
+
+} // namespace detail
+
+void gdn_gating_decay_packed(const Tensor& ab, const Tensor& decay, const Tensor& dt_bias, Tensor& g,
+                             Tensor& beta, cudaStream_t stream) {
+    detail::gdn_gate_job_launch(detail::packed_gate_job(ab, decay, dt_bias, g, beta), stream);
 }
 
 } // namespace ninfer::ops

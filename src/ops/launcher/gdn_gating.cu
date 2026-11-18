@@ -35,4 +35,14 @@ void gdn_gating_launch(const __nv_bfloat16* av, const __nv_bfloat16* bv, int ab_
     CUDA_CHECK(cudaGetLastError());
 }
 
+void gdn_gate_job_launch(const GdnGateJob& job, cudaStream_t stream) {
+    if (job.n == 0) { return; }
+    constexpr int kBlock = 256;
+    const int grid =
+        static_cast<int>(std::max<std::int64_t>(1, div_up(job.n, static_cast<std::int64_t>(kBlock))));
+    gdn_gating_kernel<true><<<grid, kBlock, 0, stream>>>(job.a, job.b, job.decay, job.dt_bias, job.g, job.beta,
+                                                         job.n, job.ab_stride);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

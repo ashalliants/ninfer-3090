@@ -103,14 +103,14 @@ void causal_conv1d_smallt_launch(const Tensor& x, const Tensor& weight, const Te
 template <std::int32_t Rows0, std::int32_t Rows1, std::int32_t Rows2>
 void smallt_split_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                          Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
-                         cudaStream_t stream) {
+                         cudaStream_t stream, const GdnGateJob& gate) {
     const std::int32_t C = x.ne[0];
     const std::int32_t T = x.ne[1];
     if (Rows0 + Rows1 + Rows2 != C) {
         throw std::invalid_argument("causal_conv1d: split geometry does not cover the channels");
     }
     const dim3 block(kCausalConvChannelTile, static_cast<unsigned int>(T));
-    const int grid = grid_for(C, kCausalConvChannelTile, "small-T");
+    const int grid = grid_for(C, kCausalConvChannelTile, "small-T") + (gate.n > 0 ? 1 : 0);
 
     const CausalConvSplitOutput3<__nv_bfloat16, Rows0, Rows1, Rows2> out_map{
         static_cast<__nv_bfloat16*>(out0.data), static_cast<__nv_bfloat16*>(out1.data),
@@ -118,22 +118,24 @@ void smallt_split_launch(const Tensor& x, const Tensor& weight, const Tensor& co
     causal_conv1d_smallt_kernel<<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
         static_cast<const __nv_bfloat16*>(conv_state_in.data),
-        static_cast<__nv_bfloat16*>(conv_state_out.data), out_map, C, T);
+        static_cast<__nv_bfloat16*>(conv_state_out.data), out_map, C, T, gate);
     CUDA_CHECK(cudaGetLastError());
 }
 
 void causal_conv1d_smallt_split_launch(const Tensor& x, const Tensor& weight,
                                        const Tensor& conv_state_in, Tensor& conv_state_out,
                                        Tensor& out0, Tensor& out1, Tensor& out2,
-                                       CausalConvSplitGeometry geometry, cudaStream_t stream) {
+                                       CausalConvSplitGeometry geometry, cudaStream_t stream,
+                                       const GdnGateJob* gate_job) {
+    const GdnGateJob gate = gate_job != nullptr ? *gate_job : GdnGateJob{};
     switch (geometry) {
     case CausalConvSplitGeometry::Rows2048x2048x4096:
         smallt_split_launch<2048, 2048, 4096>(x, weight, conv_state_in, conv_state_out, out0, out1,
-                                              out2, stream);
+                                              out2, stream, gate);
         return;
     case CausalConvSplitGeometry::Rows2048x2048x6144:
         smallt_split_launch<2048, 2048, 6144>(x, weight, conv_state_in, conv_state_out, out0, out1,
-                                              out2, stream);
+                                              out2, stream, gate);
         return;
     }
     throw std::logic_error("causal_conv1d: unhandled split geometry");
