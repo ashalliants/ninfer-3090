@@ -21,6 +21,8 @@ using S5 = Bf16ScheduleInstance<
     2560>;
 } // namespace
 
+Bf16Launch select_bf16_n96_k2560_columns() { return launch_bf16_gemv_columns<S0>; }
+
 Bf16Launch select_bf16_n96_k2560(std::int32_t tokens) {
     if (tokens <= 1) return launch_bf16_gemv<S0>;
     if (tokens <= 4) return launch_bf16_simt<S1>;

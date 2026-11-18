@@ -262,8 +262,45 @@ int run_selector_linear() {
     return failures;
 }
 
-int run_bf16_linear() {
+// linear_columnwise on the GDN control shape [96, 2560], T = 1..8: every column equals a one-column
+// linear() of it bit for bit.
+int run_columnwise() {
+    constexpr int n = 96, k = 2560, max_t = 8;
+    DeviceWeight weight(make_patterned(n, k, 431U));
+    if (!ops::linear_columnwise_supported(weight.view())) {
+        std::cerr << "linear_columnwise: [96, 2560] not supported\n";
+        return 1;
+    }
+    const auto bits     = make_activation_bits(k, max_t);
+    DeviceBuffer input  = to_device(bits);
+    DeviceContext context;
+    DeviceArena scratch(256);
     int failures = 0;
+    for (int tokens = 1; tokens <= max_t; ++tokens) {
+        GuardedDeviceBuffer got(static_cast<std::size_t>(n) * tokens * 2), want(static_cast<std::size_t>(n) * tokens * 2);
+        got.fill(0xff);
+        want.fill(0xff);
+        Tensor x(input.p, DType::BF16, {k, tokens});
+        Tensor out(got.data(), DType::BF16, {n, tokens});
+        ops::linear_columnwise(x, weight.view(), out, ops::LinearPolicy::A16Only, context.stream);
+        for (int t = 0; t < tokens; ++t) {
+            Tensor column(static_cast<std::uint16_t*>(input.p) + static_cast<std::size_t>(t) * k, DType::BF16, {k, 1});
+            Tensor one(static_cast<std::uint16_t*>(want.data()) + static_cast<std::size_t>(t) * n, DType::BF16, {n, 1});
+            ops::linear(column, weight.view(), one, ops::LinearPolicy::A16Only, scratch, context.stream);
+        }
+        cuda_synchronize(context.stream);
+        const std::string label = "linear_columnwise [96,2560] T=" + std::to_string(tokens);
+        failures += got.verify_guards(label);
+        if (from_device<std::uint16_t>(got.data(), n * tokens) != from_device<std::uint16_t>(want.data(), n * tokens)) {
+            std::cerr << label << ": differs from one-column linear() bit for bit\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
+int run_bf16_linear() {
+    int failures = run_columnwise();
     DeviceWeight attention_weight(make_patterned(14336, 5120, 401U));
     DeviceWeight output_weight(make_patterned(5120, 6144, 409U));
     for (DeviceWeight* weight : {&attention_weight, &output_weight}) {

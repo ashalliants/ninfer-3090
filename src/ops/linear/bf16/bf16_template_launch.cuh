@@ -12,11 +12,13 @@
 
 namespace ninfer::ops::detail {
 
+// columns: p.tokens columns, each computed as its own one-column GEMV (a grid row per column), so
+// column t equals a one-column launch on x[:, t] bit for bit. Otherwise p.tokens must be 1.
 template <class Schedule, class Output, class Epilogue>
 void launch_bf16_a16_gemv(const Bf16A16Operands& p, Output output, Epilogue epilogue,
-                          cudaStream_t stream) {
+                          cudaStream_t stream, bool columns = false) {
     validate_bf16_operands<Schedule>(p);
-    if (p.tokens != 1 || p.rows % Schedule::kBlockRows ||
+    if ((columns ? (p.tokens < 1 || p.tokens > 65535) : p.tokens != 1) || p.rows % Schedule::kBlockRows ||
         p.k % (bf16_predicated_k<Schedule>
                    ? (Schedule::kValuesPerLane < 8 ? 8 : Schedule::kValuesPerLane)
                    : Schedule::kWarpsPerRow * 32 * Schedule::kValuesPerLane))
@@ -40,7 +42,7 @@ void launch_bf16_a16_gemv(const Bf16A16Operands& p, Output output, Epilogue epil
             });
         }
     }
-    kernel<<<p.rows / Schedule::kBlockRows, Schedule::kThreads, bytes, stream>>>(
+    kernel<<<dim3(p.rows / Schedule::kBlockRows, columns ? p.tokens : 1), Schedule::kThreads, bytes, stream>>>(
         p.x, p.weight, output, epilogue, p.k);
     CUDA_CHECK(cudaGetLastError());
 }

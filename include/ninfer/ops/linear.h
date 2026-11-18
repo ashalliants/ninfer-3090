@@ -274,4 +274,14 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
  */
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 
+/**
+ * linear_columnwise: out[:, t] = linear(x[:, t], w) for every column t, each column bit for bit the
+ * output of a one-column linear() call with the same policy (not the T-column route, whose
+ * arithmetic differs), in one launch. Supported for the weights linear_columnwise_supported()
+ * accepts (BF16 [96, 2560], Qwen3.8-Flash-Next's GDN control projection); throws otherwise.
+ * Shapes, contiguity and alignment as linear(). Stream-ordered, graph capturable, no workspace.
+ */
+[[nodiscard]] bool linear_columnwise_supported(const Weight& w);
+void linear_columnwise(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy, cudaStream_t stream);
+
 } // namespace ninfer::ops

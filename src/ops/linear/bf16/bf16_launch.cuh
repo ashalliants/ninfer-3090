@@ -10,6 +10,14 @@ void launch_bf16_gemv(const Tensor& x, const Weight& w, Tensor& out, cudaStream_
                                    LinearIdentityEpilogue{}, stream);
 }
 
+// Every column of x through the one-column GEMV in one launch (linear_columnwise).
+template <class Schedule>
+void launch_bf16_gemv_columns(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_bf16_a16_gemv<Schedule>(bf16_a16_operands(x, w),
+                                   LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n},
+                                   LinearIdentityEpilogue{}, stream, /*columns=*/true);
+}
+
 template <class Schedule>
 void launch_bf16_simt(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_bf16_a16_simt<Schedule>(bf16_a16_operands(x, w),

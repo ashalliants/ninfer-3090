@@ -205,4 +205,20 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
     dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, stream);
 }
 
+bool linear_columnwise_supported(const Weight& w) {
+    return w.qtype == QType::BF16 && detail::select_bf16_columnwise(w.n, w.k) != nullptr;
+}
+
+void linear_columnwise(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy, cudaStream_t stream) {
+    validate_linear_semantics(x, w, out, policy);
+    require_policy_format(w.qtype, policy);
+    const detail::Bf16Launch launch = w.qtype == QType::BF16 ? detail::select_bf16_columnwise(w.n, w.k) : nullptr;
+    if (launch == nullptr) { throw std::invalid_argument("linear_columnwise: unsupported weight"); }
+    // The one-column route must be the GEMV this launch runs per column.
+    if (detail::select_bf16_launch(w.n, w.k, 1, policy) == nullptr) {
+        throw std::invalid_argument("linear_columnwise: no one-column route");
+    }
+    launch(x, w, out, stream);
+}
+
 } // namespace ninfer::ops

@@ -700,6 +700,11 @@ void Forward::project_verify(const Tensor& x, const LinearParameters& p, Tensor&
         project(x, p, out, *work_, s, ggml_decode_mma_);
         return;
     }
+    if (ops::linear_columnwise_supported(p.weight)) {
+        // The per-column calls below in one launch (the same bits).
+        ops::linear_columnwise(x, p.weight, out, linear_policy(p, ggml_decode_mma_), s);
+        return;
+    }
     for (std::int32_t t = 0; t < x.ne[1]; ++t) {
         Tensor column = out.slice(1, t, 1);
         project(x.slice(1, t, 1), p, column, *work_, s, ggml_decode_mma_);
