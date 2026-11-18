@@ -261,10 +261,13 @@ constexpr std::int32_t kStagingSlots = 64;
 // Lanes (requests decoded in the same rounds): two. Three and four give +14% and +17% over two at
 // 41 and 32 tok/s per stream (docs/maintainer/flash-next-lanes-spike.md).
 constexpr std::uint32_t kMaximumLanes = 2;
-// Wide prefill calls (Infernix's 4,096-token calls): their workspace and the expert stream's ring
+// Wide prefill calls (8,192 tokens; Infernix's are 4,096, NInfer-3090 measured on a V100 over a 3.3
+// GB/s link: a call streams nearly every non-resident expert whatever its width, so twice the
+// columns halve the streamed bytes per token: 38K-token prompt 40.9-41.0 -> 37.5 s, 8K 9.1-9.5 ->
+// 8.2 s, 10.7K 13.0 -> 12.45 s, the same output): their workspace and the expert stream's ring
 // are frames lent by the expert cache for the prompt, so the static workspace stays sized for the
 // configured chunk. A prompt shorter than kStreamMinColumns runs static calls without the stream.
-constexpr std::int32_t kWideChunk        = 4096;
+constexpr std::int32_t kWideChunk        = 8192;
 constexpr std::int32_t kStreamMinColumns = 512;
 // Ring frames per half: a layer's every expert, so every non-resident one streams and a wide call
 // needs no staging pass (resident counts vary widely by layer: a 320-frame half left 29% of the
@@ -2459,7 +2462,7 @@ public:
     }
 
     // The prefill cost of prompt positions [begin, end): its tokens and calls (the wide route's
-    // 4,096-token calls from `begin`, which is how a resumed prefill runs) and the images it
+    // kWideChunk-token calls from `begin`, which is how a resumed prefill runs) and the images it
     // encodes again (any image with a token at or after `begin`: plan_lane_vision's set).
     runtime::PrefillWork work_between(const BasePlanImpl& base, std::uint32_t begin, std::uint32_t end) const {
         return prefill_work_between(begin, end, static_cast<std::uint32_t>(std::max(plan_.chunk, plan_.wide_chunk)),
@@ -5730,10 +5733,18 @@ private:
             if (source != nullptr) { rate = measure_h2d_bytes_per_second(source, staging_.p, plan_.staging, 32); }
         }
         if (rate > 0.0) { link_ = rate; }
-        char text[160];
-        std::snprintf(text, sizeof(text), "PCIe link to the GPU: %.1f GB/s%s; decode promotes every %llu tokens once full",
+        // On a slow link a give-back leaves the returned frames free for decode's promotions
+        // instead of refilling them in one burst (ExpertResidency::set_refill_on_return): after an
+        // 8K-token prompt on a 3.3 GB/s link, decode 64.0 -> 75.7-76.9 tok/s at a higher hit rate
+        // (2026-11-18). A fast link refills as before.
+        const bool slow_link = link_ > 0.0 && link_ < kSlowLinkShare * kReferenceLinkBytesPerSecond;
+        residency_->set_refill_on_return(!slow_link);
+        char text[240];
+        std::snprintf(text, sizeof(text),
+                      "PCIe link to the GPU: %.1f GB/s%s; decode promotes every %llu tokens once full%s",
                       link_ / 1e9, options_.link_bytes_per_second > 0.0 ? " (fixed)" : " measured",
-                      static_cast<unsigned long long>(promotion_interval()));
+                      static_cast<unsigned long long>(promotion_interval()),
+                      slow_link ? "; frames a prompt lent come back free (decode promotes into them)" : "");
         diagnostic(text);
     }
 

@@ -471,7 +471,7 @@ ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStrea
         try {
             commands_.clear();
             controller_->give_back(*first, count, commands_);
-            (void)settle_return(compute, displaced_mark);
+            (void)settle_return(compute, displaced_mark, /*refill=*/true);
         } catch (...) {}
         displaced_.resize(std::min(displaced_.size(), displaced_mark));
         throw;
@@ -489,7 +489,7 @@ std::uint32_t ExpertResidency::give_back(FrameLease& lease, cudaStream_t compute
     commands_.clear();
     controller_->give_back(lease.first, lease.count, commands_);
     lease = {};
-    return settle_return(compute, 0);
+    return settle_return(compute, 0, refill_on_return_);
 }
 
 std::uint32_t ExpertResidency::fill_free(cudaStream_t compute) {
@@ -497,7 +497,7 @@ std::uint32_t ExpertResidency::fill_free(cudaStream_t compute) {
     return refill(compute, {});
 }
 
-std::uint32_t ExpertResidency::settle_return(cudaStream_t compute, std::size_t displaced_from) {
+std::uint32_t ExpertResidency::settle_return(cudaStream_t compute, std::size_t displaced_from, bool refill) {
     // The experts the run displaced come back first: prefill calls promote nothing, so they are
     // the set decode had before the prompt. Refilling by score alone took the experts the prompt's
     // own calls had just used (they score highest), and decode after the prompt hit 1.1-1.6 points
@@ -505,7 +505,11 @@ std::uint32_t ExpertResidency::settle_return(cudaStream_t compute, std::size_t d
     std::uint32_t loaded = 0;
     std::exception_ptr failure;
     try {
-        loaded = refill(compute, std::span<const std::uint32_t>(displaced_).subspan(displaced_from));
+        if (refill) {
+            loaded = this->refill(compute, std::span<const std::uint32_t>(displaced_).subspan(displaced_from));
+        } else {
+            issue_loads(compute); // the give-back's queued loads only
+        }
     } catch (...) {
         failure = std::current_exception();
     }

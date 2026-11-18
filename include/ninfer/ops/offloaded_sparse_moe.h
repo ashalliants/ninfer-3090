@@ -114,7 +114,9 @@ inline constexpr int kMaxColumns   = 8; // columns of one CPU-served expert (one
 inline constexpr int kMaxCpuSplitColumns = 64;
 
 inline constexpr int kMaxCpuJobs        = 512;  // CPU-served experts per layer call
-inline constexpr int kMaxCpuCallColumns = 4096; // columns of a CPU-served call
+// Columns of a CPU-served call: a Qwen3.8-Flash-Next wide prefill call's 8192. cpu_plan_kernel holds
+// two shorts per column in static shared memory (32 KiB at 8192, within the 48 KiB limit).
+inline constexpr int kMaxCpuCallColumns = 8192;
 
 // Device-detected failure code of a call's error word (layer << 16 | code). Host-reported failures
 // carry an errno value, all below 0x8000.
