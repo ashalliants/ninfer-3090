@@ -10,7 +10,8 @@
 //               show another position's distribution
 //   shape       alternatives are best first, finite, and their probabilities sum to at most one
 //   unchanged   asking for logprobs does not change the generated tokens
-//   speculative the speculative modes ran rounds and accepted drafts, and the n-gram mode ran copy
+//   speculative the speculative modes ran rounds, accepted drafts and also rejected some (a
+//               truncated round commits only a prefix of its columns), and the n-gram mode ran copy
 //               rounds (whose width differs from the draft model's), so the mapping was exercised
 //               at more than one verify width
 //   lanes       a request that asks and one that does not run side by side, and each equals its
@@ -156,7 +157,7 @@ void check_mode(const char* artifact, ninfer::KvCacheStorage kv, Mode mode) {
     constexpr std::uint32_t kTop = 3;
 
     std::vector<std::vector<ninfer::TokenId>> plain_ids;
-    std::uint64_t rounds = 0, accepted = 0, copy_rounds = 0;
+    std::uint64_t rounds = 0, drafted = 0, accepted = 0, copy_rounds = 0;
     for (std::size_t index = 0; index < prompts.size(); ++index) {
         const std::string where = label + " prompt " + std::to_string(index);
         const auto plain = engine.generate(engine.prepare(prompts[index]), greedy(std::nullopt));
@@ -167,6 +168,7 @@ void check_mode(const char* artifact, ninfer::KvCacheStorage kv, Mode mode) {
         check_entries(asked, kTop, where);
         plain_ids.push_back(plain.generated_token_ids);
         rounds += asked.speculative.rounds;
+        drafted += asked.speculative.drafted_tokens;
         accepted += asked.speculative.accepted_tokens;
         copy_rounds += asked.speculative.ngram_rounds;
         std::cout << where << ": " << asked.generated_token_ids.size() << " tokens, rounds "
@@ -175,6 +177,10 @@ void check_mode(const char* artifact, ninfer::KvCacheStorage kv, Mode mode) {
     }
     if (mode != Mode::Ordinary) {
         require(rounds > 0 && accepted > 0, label + ": no speculative round accepted a draft");
+        // A round that keeps only part of its drafts commits a prefix of its licensed columns:
+        // the truncation the row/stride mapping has to get right.
+        require(drafted > accepted,
+                label + ": every draft was accepted, so no round was truncated");
     }
     if (mode == Mode::DFlash2Ngram) {
         require(copy_rounds > 0, label + ": no copy round ran, so only one verify width was tried");
