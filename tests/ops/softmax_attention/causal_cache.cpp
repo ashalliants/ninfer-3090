@@ -3235,6 +3235,16 @@ int run_quantized_batch_cases(KvCacheStorage storage, std::uint32_t seed) {
 
 int run_batch_cases() {
     int failures = 0;
+    // One sequence, INT8 G64, the 24-head geometry and a width of 2048 (two of the Volta flash
+    // route's 1,024-token Q blocks): on sm_70 the shape of that route. Masked with 64 valid columns
+    // and a tight envelope (context + valid): one with fewer visible keys than the width, one with
+    // more, where the valid columns (all in the first Q block) still see more keys than an unmasked
+    // call of this width would give that block. The flash route bounds each block's keys for an
+    // unmasked call; these must take a route that reads the mask, and match the oracle.
+    failures += run_batch_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                               {2048, {100}, {64}, {0}, MappingPattern::Identity, 510u});
+    failures += run_batch_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                               {2048, {2100}, {64}, {0}, MappingPattern::Fragmented, 511u});
     failures += run_batch_case(kGeometries[0], kPlanInt8,
                                {6, {127}, {3}, {0}, MappingPattern::Identity, 499u});
     failures += run_batch_case(kGeometries[0], kPlanBf16,

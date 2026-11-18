@@ -580,11 +580,20 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
     CUDA_CHECK(cudaGetLastError());
 
     // 3. Q-blocks. Bounding the block bounds mask memory, and lets earlier blocks
-    //    attend over a shorter key range than later ones.
+    //    attend over a shorter key range than later ones. That bound assumes the last column
+    //    sees n_kv_total keys, which holds for an unmasked call (the validator requires
+    //    max_visible_keys >= width of one). A masked call's valid columns end earlier, so they can
+    //    see more keys than their block's bound, and with max_visible_keys < width the bound goes
+    //    negative: every block of a masked call attends over the whole gathered range instead
+    //    (n_kv_alloc, what the gather and mask buffers are sized for), and the position mask
+    //    limits each row as before. The same workspace either way. kernel_nodes_impl counts an
+    //    unmasked call: graph profiles record only verify and draft widths, below
+    //    kVoltaFlashMinimumWidth.
     const std::int32_t base = n_kv_total - width;
+    const bool masked       = valid_ptr != nullptr;
     for (std::int32_t begin = 0; begin < width; begin += q_block_tokens) {
         const std::int32_t tokens = std::min(q_block_tokens, width - begin);
-        const std::int32_t n_kv   = round_up_keys(base + begin + tokens);
+        const std::int32_t n_kv   = masked ? n_kv_alloc : round_up_keys(base + begin + tokens);
         const std::int32_t rows_padded =
             ((tokens + kVoltaFlashMaskRowPad - 1) / kVoltaFlashMaskRowPad) * kVoltaFlashMaskRowPad;
 
