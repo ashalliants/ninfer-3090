@@ -134,10 +134,22 @@ def test_golden_fixture_is_deterministic_and_self_consistent():
           "routing weight scales linearly through the down projection")
 
 
+def _same(a, b, rtol=1e-4, atol=1e-6):
+    """Equal, with floats compared to a tolerance: float32 matmul and tanh differ in the last bits
+    between NumPy/BLAS builds, while the packed bytes, shapes and seeds must match exactly."""
+    if isinstance(a, dict):
+        return isinstance(b, dict) and a.keys() == b.keys() and all(_same(a[k], b[k], rtol, atol) for k in a)
+    if isinstance(a, list):
+        return isinstance(b, list) and len(a) == len(b) and all(_same(x, y, rtol, atol) for x, y in zip(a, b))
+    if isinstance(a, float) or isinstance(b, float):
+        return abs(a - b) <= atol + rtol * abs(b)
+    return a == b
+
+
 def test_committed_golden_fixture_is_current():
     path = Path(HERE).parent.parent / "tests" / "fixtures" / "dsv4" / "golden.json"
     committed = json.loads(path.read_text())
-    check(committed == json.loads(json.dumps(ref.golden())), f"{path} is stale: rerun reference.py --emit-golden")
+    check(_same(committed, json.loads(json.dumps(ref.golden()))), f"{path} is stale: rerun reference.py --emit-golden")
 
 
 def test_expert_size_matches_the_real_v41_headers():
