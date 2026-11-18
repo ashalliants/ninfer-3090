@@ -41,10 +41,10 @@ std::string response_status(ninfer::FinishReason reason) {
     return "failed";
 }
 
-Json output_text_part(const std::string& text) {
+Json output_text_part(const std::string& text, Json logprobs = Json::array()) {
     return Json{{"type", "output_text"},
                 {"annotations", Json::array()},
-                {"logprobs", Json::array()},
+                {"logprobs", std::move(logprobs)},
                 {"text", text}};
 }
 
@@ -152,7 +152,7 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"text", Json{{"format", request.text_format}}},
         {"tool_choice", request.tool_choice},
         {"tools", request.tools},
-        {"top_logprobs", 0},
+        {"top_logprobs", request.prompt.generation.logprobs_top_k.value_or(0)},
         {"top_p", runtime.top_p},
         {"truncation", "disabled"}};
 }
@@ -193,7 +193,8 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
                  {"type", "message"},
                  {"status", item_status},
                  {"role", "assistant"},
-                 {"content", Json::array({output_text_part(outcome.text)})}});
+                 {"content", Json::array({output_text_part(
+                                 outcome.text, openai_logprob_entries(outcome.token_logprobs))})}});
     }
 
     ids.function_calls.resize(outcome.tool_calls.size());

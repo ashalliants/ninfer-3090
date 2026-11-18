@@ -180,67 +180,10 @@ CompletionUsage usage_from(const GenerationOutcome& outcome) {
     };
 }
 
-// A token's text for the wire. A token can end inside a multi-byte character, so its bytes alone
-// are not always valid UTF-8: such a stretch becomes U+FFFD here, and `bytes` carries the exact
-// value (OpenAI does the same).
-std::string utf8_or_replacement(std::string_view bytes) {
-    std::string out;
-    out.reserve(bytes.size());
-    std::size_t i = 0;
-    while (i < bytes.size()) {
-        const auto lead   = static_cast<unsigned char>(bytes[i]);
-        std::size_t width = lead < 0x80           ? 1
-                            : (lead >> 5) == 0x6  ? 2
-                            : (lead >> 4) == 0xe  ? 3
-                            : (lead >> 3) == 0x1e ? 4
-                                                  : 0;
-        bool valid        = width != 0 && i + width <= bytes.size();
-        for (std::size_t j = 1; valid && j < width; ++j) {
-            valid = (static_cast<unsigned char>(bytes[i + j]) & 0xc0) == 0x80;
-        }
-        // Overlong forms, surrogates and values past U+10FFFF are not UTF-8.
-        if (valid && width == 2) { valid = lead >= 0xc2; }
-        if (valid && width == 3) {
-            const auto second = static_cast<unsigned char>(bytes[i + 1]);
-            valid = !(lead == 0xe0 && second < 0xa0) && !(lead == 0xed && second >= 0xa0);
-        }
-        if (valid && width == 4) {
-            const auto second = static_cast<unsigned char>(bytes[i + 1]);
-            valid             = lead <= 0xf4 && !(lead == 0xf0 && second < 0x90) &&
-                    !(lead == 0xf4 && second >= 0x90);
-        }
-        if (valid) {
-            out.append(bytes.substr(i, width));
-            i += width;
-        } else {
-            out += "\xEF\xBF\xBD";
-            ++i;
-        }
-    }
-    return out;
-}
-
-Json token_logprob_json(const ninfer::TokenLogprobEntry& entry) {
-    Json bytes = Json::array();
-    for (const char byte : entry.bytes) { bytes.push_back(static_cast<unsigned char>(byte)); }
-    return Json{{"token", utf8_or_replacement(entry.bytes)},
-                {"logprob", entry.logprob},
-                {"bytes", std::move(bytes)}};
-}
-
 // choices[].logprobs: null unless the request asked for them.
 Json choice_logprobs_json(const GenerationOutcome& outcome) {
     if (outcome.token_logprobs.empty()) { return nullptr; }
-    Json content = Json::array();
-    for (const ninfer::TokenLogprob& token : outcome.token_logprobs) {
-        Json entry            = token_logprob_json(token.sampled);
-        entry["top_logprobs"] = Json::array();
-        for (const ninfer::TokenLogprobEntry& alternative : token.top) {
-            entry["top_logprobs"].push_back(token_logprob_json(alternative));
-        }
-        content.push_back(std::move(entry));
-    }
-    return Json{{"content", std::move(content)}, {"refusal", nullptr}};
+    return Json{{"content", openai_logprob_entries(outcome.token_logprobs)}, {"refusal", nullptr}};
 }
 
 Json base_payload(const OpenAIChatResponseIdentity& identity, const char* object) {

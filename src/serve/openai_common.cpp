@@ -320,4 +320,69 @@ std::string new_openai_response_item_id(std::string_view prefix) {
     return responses_identifier(prefix);
 }
 
+namespace {
+
+// A token's text for the wire. A token can end inside a multi-byte character, so its bytes alone
+// are not always valid UTF-8: such a stretch becomes U+FFFD here, and `bytes` carries the exact
+// value (OpenAI does the same).
+std::string utf8_or_replacement(std::string_view bytes) {
+    std::string out;
+    out.reserve(bytes.size());
+    std::size_t i = 0;
+    while (i < bytes.size()) {
+        const auto lead   = static_cast<unsigned char>(bytes[i]);
+        std::size_t width = lead < 0x80           ? 1
+                            : (lead >> 5) == 0x6  ? 2
+                            : (lead >> 4) == 0xe  ? 3
+                            : (lead >> 3) == 0x1e ? 4
+                                                  : 0;
+        bool valid        = width != 0 && i + width <= bytes.size();
+        for (std::size_t j = 1; valid && j < width; ++j) {
+            valid = (static_cast<unsigned char>(bytes[i + j]) & 0xc0) == 0x80;
+        }
+        // Overlong forms, surrogates and values past U+10FFFF are not UTF-8.
+        if (valid && width == 2) { valid = lead >= 0xc2; }
+        if (valid && width == 3) {
+            const auto second = static_cast<unsigned char>(bytes[i + 1]);
+            valid = !(lead == 0xe0 && second < 0xa0) && !(lead == 0xed && second >= 0xa0);
+        }
+        if (valid && width == 4) {
+            const auto second = static_cast<unsigned char>(bytes[i + 1]);
+            valid             = lead <= 0xf4 && !(lead == 0xf0 && second < 0x90) &&
+                    !(lead == 0xf4 && second >= 0x90);
+        }
+        if (valid) {
+            out.append(bytes.substr(i, width));
+            i += width;
+        } else {
+            out += "\xEF\xBF\xBD";
+            ++i;
+        }
+    }
+    return out;
+}
+
+nlohmann::json token_logprob_json(const ninfer::TokenLogprobEntry& entry) {
+    nlohmann::json bytes = nlohmann::json::array();
+    for (const char byte : entry.bytes) { bytes.push_back(static_cast<unsigned char>(byte)); }
+    return nlohmann::json{{"token", utf8_or_replacement(entry.bytes)},
+                          {"logprob", entry.logprob},
+                          {"bytes", std::move(bytes)}};
+}
+
+} // namespace
+
+nlohmann::json openai_logprob_entries(const std::vector<ninfer::TokenLogprob>& tokens) {
+    nlohmann::json content = nlohmann::json::array();
+    for (const ninfer::TokenLogprob& token : tokens) {
+        nlohmann::json entry  = token_logprob_json(token.sampled);
+        entry["top_logprobs"] = nlohmann::json::array();
+        for (const ninfer::TokenLogprobEntry& alternative : token.top) {
+            entry["top_logprobs"].push_back(token_logprob_json(alternative));
+        }
+        content.push_back(std::move(entry));
+    }
+    return content;
+}
+
 } // namespace ninfer::serve
