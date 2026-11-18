@@ -74,6 +74,7 @@
 #include "ninfer/ops/qsa.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ops/offloaded_sparse_moe/cpu_share.h"
 #include "ops/common/relaxed_accept.h"
 
 #include <cuda_runtime.h>
@@ -3559,7 +3560,8 @@ private:
         const auto work_frames      = static_cast<std::uint32_t>((tables + work + stride - 1) / stride);
         const std::uint32_t can     = residency_->lendable();
         if (can < work_frames + 2) { return false; } // a small cache: static calls through staging
-        const std::uint32_t ring    = std::min(2 * c_.moe.experts, (can - work_frames) & ~1U);
+        const std::uint32_t ring =
+            std::min({2 * c_.moe.experts, (can - work_frames) & ~1U, ring_need(widest, work_frames)});
         lease_          = residency_->lend(work_frames + ring, device_.stream);
         lease_owner_    = cur_;
         auto* base      = static_cast<std::byte*>(lease_.memory.data);
@@ -3585,6 +3587,37 @@ private:
             diagnostic(line);
         }
         return true;
+    }
+
+    // The stream ring this prompt's calls need: twice the most experts a layer streams (the layer
+    // parities take a half each). A layer streams its non-resident experts less the cold set its
+    // call leaves to the CPU (run_call's share of the widest call, which streams the most: 1 when
+    // the CPU takes every miss; prefill promotes nothing, so the residency the calls see is the one
+    // before the lend less the lend's evictions), counted from the residency before the lend, plus a margin for the experts the lend itself evicts (it
+    // spreads them over the layers: their mean, three standard deviations and 8). A layer needing
+    // more than its half stages the rest, as before. Each frame not lent keeps an expert cached
+    // through the prompt: a 3.9K-token prompt needed 382 frames instead of 1024.
+    std::uint32_t ring_need(std::int32_t widest, std::uint32_t work_frames) {
+        int num = 0, den = 1;
+        if (widest <= prefill_cpu_columns_ && prefill_cpu_share_live()) {
+            const bool all = widest <= static_cast<std::int32_t>(options_.prefill_cpu_all_columns);
+            num = all ? 1 : static_cast<int>(options_.prefill_cpu_share_num);
+            den = all ? 1 : static_cast<int>(options_.prefill_cpu_share_den);
+        }
+        const std::uint32_t E = c_.moe.experts, layers = c_.num_hidden_layers;
+        const std::int32_t* table = residency_->host_table();
+        std::uint32_t most = 0;
+        for (std::uint32_t l = 0; l < layers; ++l) {
+            std::uint32_t n = 0;
+            for (std::uint32_t e = 0; e < E; ++e) { n += table[static_cast<std::size_t>(l) * E + e] < 0 ? 1U : 0U; }
+            const auto cold = static_cast<std::uint32_t>(
+                ops::offloaded_moe::cpu_share_take(static_cast<int>(n), static_cast<int>(n), num, den));
+            most = std::max(most, n - cold);
+        }
+        // The lend evicts work_frames + the ring; a first estimate of the ring sizes the margin.
+        const double mean   = static_cast<double>(work_frames + 2 * most) / std::max(1U, layers);
+        const auto margin   = static_cast<std::uint32_t>(std::ceil(mean + 3.0 * std::sqrt(mean))) + 8;
+        return 2 * std::min(E, most + margin);
     }
 
     // Runs every step even when an earlier one threw, then rethrows the first failure. Used where a

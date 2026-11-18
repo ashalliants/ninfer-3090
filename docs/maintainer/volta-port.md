@@ -326,6 +326,22 @@ Working with the 3.3 GB/s eGPU link (Flash-Next, measured 2026-11-17):
   The two-layer parity ring with 64-column CPU jobs at share 0.5 is the balance of stream lookahead
   against staging contention. Fewer bytes over the link (a higher expert-cache hit rate) is what
   would shorten it.
+- The stream ring is sized to what the prompt streams (2026-11-18). A wide prompt lent the expert
+  cache's frames for its workspace and a ring of 2 x 512 frames, evicting that many cached experts
+  for the prompt, but a layer streams at most ~190 experts (its misses less the CPU share's cold
+  set). `ring_need` counts each layer's non-resident experts before the lend, takes away the cold
+  set of the widest call's share, and adds a margin for the experts the lend itself evicts (their
+  mean per layer, three standard deviations and 8); a layer still needing more than its half stages
+  the rest, as before. `select_stream_cold` now takes the layer's whole miss count as its capacity,
+  so the cold set no longer depends on the ring's size. On a 3.9K-token prompt the lend fell from
+  2,210 to 1,666 frames and streamed experts from 4,216 to 3,944, with no expert left to staging:
+  3,798 tokens 4.60-4.63 -> 4.39 s, 2,573 tokens 4.02-4.05 -> 3.77-3.79 s, 2,179 tokens 3.82-3.85 ->
+  3.54 s, 1,313 tokens 3.40-3.41 -> 2.90 s (the same replies). An 8,068-token prompt (two calls)
+  prefills in the same time (8.65-9.16 against 9.07-9.08 s), and decode after it is 56.6 tok/s against
+  50-51, because the give-back reloads fewer displaced experts. The workspace is the other half of the
+  lend: its bound is 1,709 MiB at 3,935 columns (Forward 1,588, tensor-core staging 108, shared expert
+  13), but the arena's measured peak is 835 MiB. Tightening it needs each op's scratch audited,
+  because an arena that is too small fails the call.
 
 Serving on a V100: `scripts/run-v100.sh <model>` is run.sh with the V100's defaults (the sm_70
 server from build-v100/, the memory-lock fallback, a GPU check). For Flash-Next it keeps run.sh's

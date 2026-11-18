@@ -31,7 +31,9 @@
 namespace ninfer::models::qwen4_exp::execution {
 
 // ExpertStream::begin's CPU share: select_stream_cold of each layer's residency row and `counts` row
-// (U32 [layers][experts], the expert cache's LFRU use counts), the half's capacity and num / den.
+// (U32 [layers][experts], the expert cache's LFRU use counts) and num / den, over every
+// non-resident expert of the layer (the share does not depend on the ring's size, which the
+// Program fits to what the layers then stream).
 struct ExpertStreamShare {
     int num = 0, den = 1;
     const std::uint32_t* counts = nullptr;
