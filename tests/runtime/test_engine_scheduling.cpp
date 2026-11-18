@@ -1676,7 +1676,8 @@ void test_a_flush_writes_unsaved_sessions_with_idle_writes_off() {
         restore_stored(rig, store, group);
     }
     // Session 1's write "failed": it is unsaved; session 2 is stored.
-    const auto& key1 = rig.program().image_of(1, 4096).keys.front();
+    const auto image1 = rig.program().image_of(1, 4096);
+    const auto& key1  = image1.keys.front();
     const auto id    = ContextStore::image_id(key1.digests, 4096, key1.identity_tag, false);
     require(store.erase(id), "the image could not be erased");
     failed.fail(id);
@@ -1709,7 +1710,8 @@ void test_lost_failure_reports_retry_every_missing_session() {
         restore_stored(rig, store, group);
     }
     // Session 1's write "failed" and its report was lost; session 2 is still stored.
-    const auto& lost_key = rig.program().image_of(1, 4096).keys.front();
+    const auto lost_image = rig.program().image_of(1, 4096);
+    const auto& lost_key  = lost_image.keys.front();
     const auto lost_id   = ContextStore::image_id(lost_key.digests, 4096, lost_key.identity_tag, false);
     require(store.erase(lost_id), "the image could not be erased");
     failed.lose();
