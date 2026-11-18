@@ -76,7 +76,8 @@ enum class KvCapacityMode : std::uint8_t {
 inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
 // EngineOptions::fit_context_floor: the device memory a fitted context leaves free beyond its plan,
 // so a desktop that grows after startup (140-230 MB measured on a Windows desktop) does not push
-// the card into paging, and the step between fitted contexts.
+// the card into paging, and the step between fitted contexts. --vram-headroom-mib replaces the
+// headroom (see fit_context_headroom_bytes).
 inline constexpr std::size_t kFitContextHeadroomBytes = 256ULL * 1024ULL * 1024ULL;
 inline constexpr std::uint32_t kFitContextStepTokens  = 1024;
 // PrefillScheduleOptions::stall_budget_ms: a minute is far past any step the engine runs.
@@ -848,6 +849,14 @@ struct EngineOptions {
     std::function<void(const EngineFaultEvent& event)> fault_listener;
     NumericTripwireOptions numeric_tripwire;
 };
+
+// The device memory a context fit (EngineOptions::fit_context_floor) keeps spare: --vram-headroom-mib
+// when given, else kFitContextHeadroomBytes.
+inline std::size_t fit_context_headroom_bytes(const EngineOptions& options) {
+    return options.flash_next.vram_headroom_bytes
+               ? static_cast<std::size_t>(*options.flash_next.vram_headroom_bytes)
+               : kFitContextHeadroomBytes;
+}
 
 enum class SamplingMode : std::uint8_t {
     Thinking,

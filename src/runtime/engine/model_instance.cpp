@@ -186,10 +186,10 @@ std::string token_text(std::uint32_t tokens) {
 }
 
 // EngineOptions::fit_context_floor: lowers max_context and kv_capacity together to the largest
-// context whose plan fits the device memory free now, less kFitContextHeadroomBytes. Each candidate
+// context whose plan fits the device memory free now, less fit_context_headroom_bytes(). Each candidate
 // is planned exactly as the real plan will be, so the answer is the planner's, not an estimate.
 void fit_context_to_device(EngineOptions& options, ModelInstance& instance, DeviceContext& device) {
-    const std::vector<std::size_t> budgets = free_bytes_by_rank(device, kFitContextHeadroomBytes);
+    const std::vector<std::size_t> budgets = free_bytes_by_rank(device, fit_context_headroom_bytes(options));
     const std::size_t primary              = budgets.front();
     const std::vector<std::size_t> extras(budgets.begin() + 1, budgets.end());
     const std::uint32_t ceiling       = options.max_context;
@@ -252,7 +252,7 @@ void fit_context_to_device(EngineOptions& options, ModelInstance& instance, Devi
             "not enough free GPU memory to start: even the smallest context allowed, " +
             token_text(floor) + " tokens, needs " + gib_text(short_rank->need_bytes) +
             " beside the model weights plus " +
-            std::to_string(kFitContextHeadroomBytes / (1024U * 1024U)) +
+            std::to_string(fit_context_headroom_bytes(options) / (1024U * 1024U)) +
             " MiB kept spare, and only " + gib_text(free_now[short_rank->rank]) + " is free" +
             (free_now.size() > 1 ? " on device " + std::to_string(short_rank->rank) : std::string()) +
             ". Close other programs that use the GPU and start again");
@@ -264,6 +264,17 @@ void fit_context_to_device(EngineOptions& options, ModelInstance& instance, Devi
 }
 
 } // namespace
+
+// The only thing a Qwen3.8 dense model reads --vram-headroom-mib for is the context fit; without
+// one it would be silently ignored, so refuse it and say what it is for.
+void validate_headroom_use(const EngineOptions& options) {
+    if (options.flash_next.vram_headroom_bytes && options.fit_context_floor == 0) {
+        throw std::invalid_argument(
+            "--vram-headroom-mib has no effect on this model without --fit-context MIN: it sets the "
+            "GPU memory the fitted context keeps spare (default 256 MiB). Add --fit-context, or "
+            "remove --vram-headroom-mib");
+    }
+}
 
 EngineOptions normalize_engine_options(EngineOptions options) {
     switch (options.purpose) {
@@ -523,6 +534,7 @@ ResidencyTransition ModelInstance::resume(DeviceContext& device, DeviceSnapshot&
 
 ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) {
     validate_engine_options(options);
+    validate_headroom_use(options);
     const auto start = Clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     // Shared so a suspendable model can keep its files open and upload the weights again on resume.

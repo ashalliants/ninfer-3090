@@ -294,7 +294,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --fit-context MIN makes --max-context a ceiling: when it does not fit the GPU "
            "memory free after the weights, less " +
            std::to_string(kFitContextHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB kept spare, the server starts at the largest multiple of " +
+           " MiB (--vram-headroom-mib N changes it) kept spare, the server starts at the largest multiple of " +
            std::to_string(kFitContextStepTokens) +
            " tokens that does (the KV pool follows) and logs the reduction; below MIN it refuses "
            "to start\n"

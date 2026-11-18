@@ -655,6 +655,11 @@ fi
 [[ -z "${NINFER_CHAT_TEMPLATE:-}" ]] || printf 'Chat template: %s\n' "$NINFER_CHAT_TEMPLATE"
 (( ${#allowed_hosts[@]} == 0 )) || printf 'Allowed host names: %s\n' "$NINFER_ALLOWED_HOST"
 [[ -z "${hint:-}" ]] || printf '%s\n' "$hint"
+# The exact command, so a tuned setup can be copied into another launcher (llama-swap, a service).
+printf 'Command:'
+printf ' %q' "$server" "$MODEL" --host "$HOST" --port "$PORT" --config "$profile_file" \
+  ${profile_args[@]+"${profile_args[@]}"}
+printf '\n'
 printf 'API: http://%s:%s/v1\n\n' "$HOST" "$PORT"
 
 # Host retry eligibility. Only the tuned profile's default Host context budget may be

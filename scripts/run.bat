@@ -796,6 +796,8 @@ if defined GRAFT_ARGS echo Graft: godmode = %GRAFT_FILE%
 if defined CHAT_TEMPLATE_ARGS echo Chat template: "%NINFER_CHAT_TEMPLATE%"
 if defined ALLOWED_HOST_ARGS echo Allowed host names: %NINFER_ALLOWED_HOST%
 if not "%HINT%"=="" echo %HINT%
+rem The exact command, so a tuned setup can be copied into another launcher (llama-swap, a service).
+echo Command: "%SERVER%" "%MODEL%" --host %HOST% --port %PORT% --config "%PROFILE_FILE%" %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %CHAT_TEMPLATE_ARGS% %ALLOWED_HOST_ARGS% %EXTRA_ARGS%
 echo API: http://%HOST%:%PORT%/v1
 echo.
 
