@@ -289,6 +289,10 @@ std::string encode_reasoning_token(const std::string& reasoning_text) {
     return token;
 }
 
+bool has_reasoning_token_prefix(const std::string& token) {
+    return token.starts_with(kReasoningTokenPrefix);
+}
+
 std::optional<std::string> decode_reasoning_token(const std::string& token) {
     if (!token.starts_with(kReasoningTokenPrefix)) { return std::nullopt; }
     const std::string_view hex = std::string_view(token).substr(kReasoningTokenPrefix.size());

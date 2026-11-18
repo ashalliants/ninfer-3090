@@ -1533,7 +1533,7 @@ int test_include_reasoning_encrypted_content() {
     failures += check(restored.size() == 3 && restored[1].reasoning_content == "thought",
                       "encrypted_content did not restore the reasoning text");
 
-    // A token this server did not mint cannot be turned back into the model context.
+    // A token in another provider's format cannot be turned back into the model context.
     Json foreign                 = stripped;
     foreign["encrypted_content"] = "gAAAAABforeign";
     failures +=
@@ -1544,6 +1544,25 @@ int test_include_reasoning_encrypted_content() {
     failures +=
         check(api_code([&] { (void)replay_turns(tampered); }) == "reasoning_content_not_supported",
               "a corrupted encrypted_content token was accepted");
+
+    // A damaged token is refused even beside the raw content that would have made it unnecessary;
+    // another provider's token beside raw content is ignored, as before.
+    Json damaged_with_content = item;
+    damaged_with_content["encrypted_content"] =
+        item.at("encrypted_content").get<std::string>() + "!";
+    failures += check(api_code([&] { (void)replay_turns(damaged_with_content); }) ==
+                          "reasoning_content_not_supported",
+                      "a damaged token beside raw content was accepted");
+    Json foreign_with_content                 = item;
+    foreign_with_content["encrypted_content"] = "gAAAAABforeign";
+    failures += check(api_code([&] { (void)replay_turns(foreign_with_content); }).empty(),
+                      "another provider's token beside raw content was refused");
+    // The format is an encoding, not a signature: a hand-built token restores the text it spells,
+    // which is no more than sending that text as content would.
+    Json handmade                 = stripped;
+    handmade["encrypted_content"] = encode_reasoning_token("handmade");
+    failures += check(replay_turns(handmade)[1].reasoning_content == "handmade",
+                      "a token in this server's format did not restore its text");
 
     // Streaming carries the same value on output_item.done and in the terminal response.
     OpenAIResponsesCreateRequest stream_request = request;

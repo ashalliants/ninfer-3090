@@ -102,10 +102,13 @@ BuiltOpenAIResponse make_openai_response_object(const std::string& id, std::int6
 
 // The opaque `encrypted_content` token for a reasoning Item. This server keeps the model's raw
 // reasoning and has nothing to hide from the client, so the token is a versioned encoding of that
-// text, not encryption. It lets a client that replays only `encrypted_content` (the OpenAI
-// store=false convention) restore the reasoning. Decoding refuses anything this server did not
-// mint (another provider's token, or a damaged one).
+// text, not encryption and not a signature: anyone can build one for any text, exactly as they can
+// already send that text as `content`. It exists so a client that replays only `encrypted_content`
+// (the OpenAI store=false convention) restores the reasoning. Decoding accepts only this format;
+// a token in another provider's format, or a damaged one, restores nothing.
 std::string encode_reasoning_token(const std::string& reasoning_text);
+// True when `token` claims to be in this server's format (whether or not it is intact).
+bool has_reasoning_token_prefix(const std::string& token);
 std::optional<std::string> decode_reasoning_token(const std::string& token);
 
 std::string make_openai_response_input_tokens_body(int input_tokens);

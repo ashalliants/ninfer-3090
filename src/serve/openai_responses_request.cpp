@@ -393,12 +393,20 @@ std::string parse_reasoning_item(const Json& item, Json& canonical) {
         text += part.at("text").get<std::string>();
         content.push_back(Json{{"type", "reasoning_text"}, {"text", part.at("text")}});
     }
-    // A token this server minted carries the raw reasoning, so a client that replays only
-    // encrypted_content (store=false) still restores the model's context.
-    if (text.empty() && has_encrypted) {
-        if (const auto decoded = decode_reasoning_token(item.at("encrypted_content"))) {
-            text = *decoded;
-            if (!text.empty()) {
+    // A token in this server's format carries the raw reasoning, so a client that replays only
+    // encrypted_content (store=false) still restores the model's context. One that claims the
+    // format but is damaged is an error even beside raw content; a token in another provider's
+    // format is ignored as before.
+    if (has_encrypted) {
+        const std::string& token = item.at("encrypted_content").get_ref<const std::string&>();
+        if (has_reasoning_token_prefix(token)) {
+            const std::optional<std::string> decoded = decode_reasoning_token(token);
+            if (!decoded) {
+                bad_request("reasoning encrypted_content is damaged", "input",
+                            "reasoning_content_not_supported");
+            }
+            if (text.empty() && !decoded->empty()) {
+                text = *decoded;
                 content.push_back(Json{{"type", "reasoning_text"}, {"text", text}});
             }
         }
