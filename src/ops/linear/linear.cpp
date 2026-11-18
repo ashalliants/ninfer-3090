@@ -2,6 +2,7 @@
 #include "ninfer/ops/linear.h"
 
 #include "ops/linear/bf16/bf16_dispatch.h"
+#include "ops/linear/bf16/bf16_tensor_core_sm70.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear/ggml/ggml_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
@@ -109,6 +110,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::t2_dispatch(x, w, out, policy, stream);
         return;
     case QType::BF16:
+        if (detail::bf16_tensor_core_linear(x, w, out, stream)) { return; }
         detail::bf16_dispatch(x, w, out, policy, stream);
         return;
     case QType::NVFP4:

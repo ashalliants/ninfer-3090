@@ -43,6 +43,7 @@
 #include "ops/ggml_linear_emulation.h"
 #include "ops/linear/ggml/ggml_launch.h"
 #include "ops/linear/ggml/ggml_mma_emulation.h"
+#include "ops/linear/common/sm70_tensor_core.h"
 #include "ops/linear/ggml/ggml_shapes.h"
 #include "ops/op_check.h"
 #include "ops/op_tester.h"
@@ -155,6 +156,9 @@ std::vector<std::uint16_t> make_activation(std::int32_t k, std::int32_t t, std::
     return x;
 }
 
+std::vector<double> oracle_of(const std::vector<float>& w, const std::vector<double>& xr, std::int32_t n,
+                              std::int32_t k, std::int32_t t, const std::vector<std::uint16_t>* residual);
+
 // out[t][n] = sum_k w[n][k] * q[t][k] * d[t][k / 32] (+ residual), naive FP64.
 std::vector<double> oracle(const std::vector<float>& w, const Q81& x, std::int32_t n,
                            std::int32_t k, std::int32_t t,
@@ -163,6 +167,28 @@ std::vector<double> oracle(const std::vector<float>& w, const Q81& x, std::int32
     for (std::size_t i = 0; i < xr.size(); ++i) {
         xr[i] = static_cast<double>(x.q[i]) * static_cast<double>(x.d[i / 32]);
     }
+    return oracle_of(w, xr, n, k, t, residual);
+}
+
+// The same over the BF16 activations themselves (the sm_70 tensor-core route casts nothing).
+std::vector<double> oracle_bf16(const std::vector<float>& w, const std::vector<std::uint16_t>& x, std::int32_t n,
+                                std::int32_t k, std::int32_t t, const std::vector<std::uint16_t>* residual) {
+    std::vector<double> xr(static_cast<std::size_t>(k) * t);
+    for (std::size_t i = 0; i < xr.size(); ++i) xr[i] = static_cast<double>(bf16_to_f32(x[i]));
+    return oracle_of(w, xr, n, k, t, residual);
+}
+
+double relative_l2(std::span<const double> got, std::span<const double> ref) {
+    double e = 0.0, r = 0.0;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        e += (got[i] - ref[i]) * (got[i] - ref[i]);
+        r += ref[i] * ref[i];
+    }
+    return r > 0.0 ? std::sqrt(e / r) : 0.0;
+}
+
+std::vector<double> oracle_of(const std::vector<float>& w, const std::vector<double>& xr, std::int32_t n,
+                              std::int32_t k, std::int32_t t, const std::vector<std::uint16_t>* residual) {
     std::vector<double> out(static_cast<std::size_t>(n) * t);
     const unsigned workers = std::max(1U, std::min(16U, std::thread::hardware_concurrency()));
     std::vector<std::thread> pool;
@@ -285,6 +311,12 @@ int run_problem(QType format, std::int32_t n, std::int32_t k, bool add) {
     }
     const auto expected = oracle(w, xq, n, k, kMaxTokens, add ? &residual : nullptr);
     const auto emulated = emulate(format, blocks, n, k, xq, add ? &residual : nullptr);
+    // NINFER_SM70_TENSOR_CORES=1 (sm_70): the wide calls take the FP16 tensor-core route, which
+    // skips the Q8_1 cast, so they are held to the oracle over the BF16 activations instead (same
+    // criterion), and both routes' relative L2 against it is reported.
+    const bool tensor_cores = ops::detail::sm70_tensor_cores_enabled();
+    const auto exact = tensor_cores ? oracle_bf16(w, x_bits, n, k, kMaxTokens, add ? &residual : nullptr)
+                                    : std::vector<double>{};
 
     DeviceBuffer d_w(blocks.size());
     d_w.copy_from_host(blocks.data(), blocks.size());
@@ -320,6 +352,16 @@ int run_problem(QType format, std::int32_t n, std::int32_t k, bool add) {
         const auto got_bits = download_bf16(d_out.p, static_cast<std::size_t>(n) * t);
         std::vector<double> got(got_bits.size());
         for (std::size_t i = 0; i < got.size(); ++i) got[i] = bf16_to_f32(got_bits[i]);
+        if (tensor_cores && t >= ops::detail::kSm70TensorCoreMinTokens) {
+            const std::span<const double> ref(exact.data(), got.size());
+            failures += test::verify_reduction(label + " T=" + std::to_string(t) + " (tensor cores)", got, ref,
+                                               kGgmlQ81Criterion);
+            std::printf("%s T=%d: relative L2 against FP64 over the BF16 activations: tensor cores %.3e, "
+                        "the A8 route's oracle (its Q8_1 cast alone) %.3e\n",
+                        label.c_str(), static_cast<int>(t), relative_l2(got, ref),
+                        relative_l2(std::span<const double>(expected.data(), got.size()), ref));
+            continue;
+        }
         const std::span<const double> ref(expected.data(), got.size());
         failures += test::verify_reduction(label + " T=" + std::to_string(t), got, ref,
                                            kGgmlQ81Criterion);
@@ -530,6 +572,8 @@ int cast_probe() {
     DeviceBuffer d_out(static_cast<std::size_t>(n) * 65 * 2);
     int failures = 0;
     for (const std::int32_t t : {1, 3, 8, 9, 65}) {
+        // The sm_70 tensor-core route casts nothing (run_problem holds it to the BF16 oracle).
+        if (ops::detail::sm70_tensor_cores_enabled() && t >= ops::detail::kSm70TensorCoreMinTokens) continue;
         const std::size_t capacity =
             ops::linear_workspace_capacity_bytes(QType::GGML_Q8_0, n, k, LinearPolicy::AllowA8, t, t);
         DeviceArena workspace(std::max<std::size_t>(capacity, 256));

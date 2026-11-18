@@ -394,6 +394,38 @@ and sums.
 Thermals: sustained prefill holds the card at its 200 W cap and took a passively cooled V100 from
 40 to 75 C in about a minute; measure in short runs without forced airflow.
 
+#### Flash-Next: the opt-in tensor-core route (`NINFER_SM70_TENSOR_CORES=1`)
+
+Qwen3.8-Flash-Next's prefill linears are BF16 (hyper-connection, PLE, router, indexer, MTP
+drafter) and GGML (attention and GDN projections, shared expert), and on sm_70 both run emulated
+Ampere MMA (BF16 `mma`, int8 `mma` / `dp4a` over a Q8_1 activation cast). With
+`NINFER_SM70_TENSOR_CORES=1` in the server's environment, every such linear of at least 64 tokens
+on a weight of at most 33M elements goes through `ops/linear/common/sm70_tensor_core.h` instead:
+the weight row converted to FP16 under its own power of two (exact for BF16; one FP16 rounding of
+code x scale for GGML), the token's BF16 activations converted exactly under theirs, cuBLAS
+`cublasGemmEx` FP16 x FP16 -> FP32 on HMMA, and both powers of two undone before the BF16 output
+rounding (plus the residual for LinearAdd). Like the dense route above it drops the integer
+route's activation cast, so it is more accurate per op, not less (relative L2 against FP64 over the
+BF16 activations, `ninfer_linear_ggml_test` with the variable set, which then holds the wide calls
+to that oracle):
+
+| | GGML linears (every format and shape, T=300) | BF16 linear (HC down shape) |
+|---|---|---|
+| default route | 3.8e-3 from the Q8_1 cast alone, before its BF16 rounding | 1.66e-3 |
+| tensor-core route | 1.67e-3 (the BF16 output rounding) | 1.66e-3 |
+
+It is not bit-identical (FP32 summation order, and no cast), so it is off by default. Measured on
+the 3,935-token prompt: 6.62 -> 6.16 s (594 -> 639 tok/s, ABAB); the compute stream's kernel time
+drops ~490 ms, and the rest is absorbed by waits on the expert stream (the 3.3 GB/s link) and the
+0.82 s n-gram volume read the first call makes before the device starts. Model-level checks (no
+perplexity tool serves Flash-Next yet): a long-context retrieval set (24 prompts of 2.4-4.3K tokens
+with one planted fact each) scores 24/24 both ways; greedy 128-token replies to 12 document prompts
+diverge after a median ~300 characters into equivalent text, as any reordering does. Decode is
+untouched (its calls are narrower than 64 tokens) except that the MTP drafter's catch-up over a
+prompt of 64+ tokens takes the route, so its drafts (never the accepted tokens) can differ. The
+staging buffers are private and grow to ~100 MB at Flash-Next's widest call; they are not in the
+workspace plan, which is the main thing to do before it could become a default.
+
 ### Why there is no HMMA path yet
 
 The PTX `mma.m8n8k4` computes four independent 8x8x4 products per warp, one per octet (lanes

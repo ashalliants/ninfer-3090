@@ -36,6 +36,9 @@
 #     and still fails loudly if the pin itself fails). To lift the limit for good, as root:
 #       printf '%s - memlock unlimited\n' "$USER" > /etc/security/limits.d/90-ninfer-memlock.conf
 #     then log in again;
+#   - opt-in, not set here: NINFER_SM70_TENSOR_CORES=1 runs prefill's BF16 and GGML linears on the
+#     FP16 tensor cores (Flash-Next 3.9K-token prompt 6.6 -> 6.2 s; close to, not bit for bit, the
+#     default output; docs/maintainer/volta-port.md "Flash-Next: the opt-in tensor-core route");
 #   - checks before starting: the card is a V100 (a warning otherwise), no other process is on it
 #     (a warning: the server sizes itself to the free memory), and the power limit (the card's
 #     default is 250 W; a lower cap slows decode, which is clock-bound on Volta).

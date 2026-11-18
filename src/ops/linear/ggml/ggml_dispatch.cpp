@@ -1,4 +1,5 @@
 #include "ops/linear/ggml/ggml_dispatch.h"
+#include "ops/linear/ggml/ggml_tensor_core_sm70.h"
 
 #include "core/layout.h"
 #include "ops/linear/ggml/ggml_launch.h"
@@ -78,6 +79,7 @@ void run(const Tensor& x, const Weight& w, Tensor& out, bool residual, bool deco
         ggml_mmvq_launch<F>(codes, xb, ob, w.n, w.k, t, residual, stream);
         return;
     }
+    if (ggml_tensor_core_linear(x, w, out, residual, stream)) { return; }
     if (workspace == nullptr) {
         throw std::invalid_argument("ggml linear: T > 8 requires caller workspace");
     }
