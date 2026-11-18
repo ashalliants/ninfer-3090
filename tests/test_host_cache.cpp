@@ -326,19 +326,72 @@ int check_draft_context_rows() {
     return failures;
 }
 
-// A Qwen3.8 dense model reads --vram-headroom-mib only through the context fit, so the flag without
-// one is refused (naming --fit-context) rather than silently ignored.
-int check_headroom_needs_fit() {
-    using ninfer::runtime::validate_headroom_use;
+// A dense Qwen model reads none of the Flash-Next-only options, so each one set is refused naming
+// its flag rather than silently ignored. --vram-headroom-mib is also the spare memory of the
+// context fit, so it is refused only without --fit-context.
+int check_flash_next_options_refused() {
+    using ninfer::runtime::validate_flash_next_options_unused;
     int failures = 0;
-    ninfer::EngineOptions options;
     const auto refusal = [](const ninfer::EngineOptions& value) {
         try {
-            validate_headroom_use(value);
+            validate_flash_next_options_unused(value);
         } catch (const std::invalid_argument& error) { return std::string(error.what()); }
         return std::string();
     };
-    failures += check(refusal(options).empty(), "no headroom flag was refused");
+    ninfer::EngineOptions options;
+    failures += check(refusal(options).empty(), "options with no Flash-Next flag were refused");
+
+    struct Case {
+        const char* flag;
+        void (*set)(ninfer::FlashNextOptions&);
+    };
+    const Case cases[] = {
+        {"--ngram-volume", [](auto& n) { n.ngram_volume_path = "x.ngram"; }},
+        {"--ngram-keepalive-ms", [](auto& n) { n.ngram_keepalive_ms = 0; }},
+        {"--expert-state", [](auto& n) { n.expert_state_path = "x.state"; }},
+        {"--no-expert-state", [](auto& n) { n.save_expert_state = false; }},
+        {"--default-expert-state", [](auto& n) { n.default_expert_state_path = "x.default"; }},
+        {"--expert-cache-mib", [](auto& n) { n.expert_cache_bytes = 1ULL << 30; }},
+        {"--ram-headroom-mib", [](auto& n) { n.ram_headroom_bytes = 1ULL << 30; }},
+        {"--allow-unlocked-host-memory", [](auto& n) { n.allow_unlocked_host_memory = true; }},
+        {"--partial-ram-residency", [](auto& n) { n.partial_ram_residency = true; }},
+        {"--mtp-constrained", [](auto& n) { n.mtp_constrained = true; }},
+        {"--mtp-joint-acceptance", [](auto& n) { n.mtp_joint_acceptance = true; }},
+        {"--mtp-rows-verify", [](auto& n) { n.mtp_rows_verify = true; }},
+        {"--ngram-prefetch", [](auto& n) { n.ngram_prefetch = true; }},
+        {"--shared-expert-stream", [](auto& n) { n.shared_expert_stream = true; }},
+        {"--hot-embedding-rows", [](auto& n) { n.hot_embedding_rows = 8192; }},
+        {"--gdn-head-map", [](auto& n) { n.gdn_head_map = true; }},
+        {"--moe-precast-input", [](auto& n) { n.moe_precast_input = true; }},
+        {"--moe-gate-up-registers", [](auto& n) { n.moe_gate_up_registers = true; }},
+        {"--moe-fused-route", [](auto& n) { n.moe_fused_route = true; }},
+        {"--cpu-verify-misses", [](auto& n) { n.cpu_verify_misses = true; }},
+        {"--cpu-verify-workers", [](auto& n) { n.cpu_verify_workers = 8; }},
+        {"--prefill-cpu-share", [](auto& n) { n.prefill_cpu_share = {3, 5}; }},
+        {"--gdn-async-commit", [](auto& n) { n.gdn_async_commit = true; }},
+        {"--hc-int8", [](auto& n) { n.hc_int8 = true; }},
+        {"--hc-fused-read", [](auto& n) { n.hc_fused_read = true; }},
+        {"--ngram-flag-wait", [](auto& n) { n.ngram_flag_wait = true; }},
+        {"--ggml-decode-mma", [](auto& n) { n.ggml_decode_mma = true; }},
+        {"--context-nvme-mib", [](auto& n) { n.context_nvme_bytes = 1ULL << 30; }},
+        {"--context-nvme-dir", [](auto& n) { n.context_nvme_dir = "scratch"; }},
+    };
+    for (const Case& item : cases) {
+        ninfer::EngineOptions edited;
+        item.set(edited.flash_next);
+        const std::string message = refusal(edited);
+        failures += check(message.find(item.flag) != std::string::npos &&
+                              message.find("Flash-Next") != std::string::npos,
+                          (std::string(item.flag) + " was not refused naming itself").c_str());
+    }
+    ninfer::EngineOptions several;
+    several.flash_next.hc_int8         = true;
+    several.flash_next.ngram_prefetch  = true;
+    const std::string both             = refusal(several);
+    failures += check(both.find("--hc-int8") != std::string::npos &&
+                          both.find("--ngram-prefetch") != std::string::npos,
+                      "two Flash-Next flags were not both named in one refusal");
+
     options.flash_next.vram_headroom_bytes = 64ULL << 20;
     failures += check(refusal(options).find("--fit-context") != std::string::npos,
                       "--vram-headroom-mib without --fit-context was not refused naming --fit-context");
@@ -352,7 +405,7 @@ int check_headroom_needs_fit() {
 int main() {
     int failures = 0;
     failures += check_automatic_normalization();
-    failures += check_headroom_needs_fit();
+    failures += check_flash_next_options_refused();
     failures += check_relaxed_drafting();
     failures += check_draft_context_rows();
     failures += check_fork_options_accepted();

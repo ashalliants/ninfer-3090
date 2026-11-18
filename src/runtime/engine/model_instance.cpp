@@ -265,10 +265,54 @@ void fit_context_to_device(EngineOptions& options, ModelInstance& instance, Devi
 
 } // namespace
 
-// The only thing a Qwen3.8 dense model reads --vram-headroom-mib for is the context fit; without
-// one it would be silently ignored, so refuse it and say what it is for.
-void validate_headroom_use(const EngineOptions& options) {
-    if (options.flash_next.vram_headroom_bytes && options.fit_context_floor == 0) {
+// The Flash-Next-only options (FlashNextOptions) are read by the Flash-Next model alone. A dense
+// Qwen3.5/3.6/3.8 model would drop them silently, so refuse each one that was set and say so.
+// --vram-headroom-mib is the one exception: a dense model reads it as the spare memory its context
+// fit (--fit-context) keeps, so it is refused only without a fit.
+void validate_flash_next_options_unused(const EngineOptions& options) {
+    const FlashNextOptions& set = options.flash_next;
+    const FlashNextOptions unset{};
+    std::vector<std::string> flags;
+    const auto note = [&](bool changed, const char* flag) {
+        if (changed) { flags.emplace_back(flag); }
+    };
+    note(!set.ngram_volume_path.empty(), "--ngram-volume");
+    note(set.ngram_keepalive_ms != unset.ngram_keepalive_ms, "--ngram-keepalive-ms");
+    note(!set.expert_state_path.empty(), "--expert-state");
+    note(!set.save_expert_state, "--no-expert-state");
+    note(!set.default_expert_state_path.empty(), "--default-expert-state");
+    note(set.expert_cache_bytes.has_value(), "--expert-cache-mib");
+    note(set.ram_headroom_bytes != unset.ram_headroom_bytes, "--ram-headroom-mib");
+    note(set.allow_unlocked_host_memory, "--allow-unlocked-host-memory");
+    note(set.partial_ram_residency, "--partial-ram-residency");
+    note(set.mtp_constrained, "--mtp-constrained");
+    note(set.mtp_joint_acceptance, "--mtp-joint-acceptance");
+    note(set.mtp_rows_verify, "--mtp-rows-verify");
+    note(set.ngram_prefetch, "--ngram-prefetch");
+    note(set.shared_expert_stream, "--shared-expert-stream");
+    note(set.hot_embedding_rows != 0, "--hot-embedding-rows");
+    note(set.gdn_head_map, "--gdn-head-map");
+    note(set.moe_precast_input, "--moe-precast-input");
+    note(set.moe_gate_up_registers, "--moe-gate-up-registers");
+    note(set.moe_fused_route, "--moe-fused-route");
+    note(set.cpu_verify_misses, "--cpu-verify-misses");
+    note(set.cpu_verify_workers != unset.cpu_verify_workers, "--cpu-verify-workers");
+    note(set.prefill_cpu_share.num != 0, "--prefill-cpu-share");
+    note(set.gdn_async_commit, "--gdn-async-commit");
+    note(set.hc_int8, "--hc-int8");
+    note(set.hc_fused_read, "--hc-fused-read");
+    note(set.ngram_flag_wait, "--ngram-flag-wait");
+    note(set.ggml_decode_mma, "--ggml-decode-mma");
+    note(set.context_nvme_bytes != 0, "--context-nvme-mib");
+    note(!set.context_nvme_dir.empty(), "--context-nvme-dir");
+    if (!flags.empty()) {
+        std::string list;
+        for (const std::string& flag : flags) { list += (list.empty() ? "" : ", ") + flag; }
+        throw std::invalid_argument(
+            "this model does not use " + list + ": those options are for Qwen3.8-Flash-Next only. "
+            "Remove " + std::string(flags.size() == 1 ? "it" : "them"));
+    }
+    if (set.vram_headroom_bytes && options.fit_context_floor == 0) {
         throw std::invalid_argument(
             "--vram-headroom-mib has no effect on this model without --fit-context MIN: it sets the "
             "GPU memory the fitted context keeps spare (default 256 MiB). Add --fit-context, or "
@@ -534,7 +578,7 @@ ResidencyTransition ModelInstance::resume(DeviceContext& device, DeviceSnapshot&
 
 ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) {
     validate_engine_options(options);
-    validate_headroom_use(options);
+    validate_flash_next_options_unused(options);
     const auto start = Clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     // Shared so a suspendable model can keep its files open and upload the weights again on resume.

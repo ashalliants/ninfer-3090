@@ -785,7 +785,8 @@ def combined_choice(ctx: Ctx, step: Step) -> tuple[list[str], list[str]]:
     d = step.data
     options = ctx.config["options"]
     quality_flags = {o["flag"] for o in options if o["kind"] == "quality"}
-    chosen, args = [], []
+    option_flags = {o["flag"] for o in options}
+    candidates = []  # (option flag, winning variant)
     for option in options:
         if option["model"] != d["model"] or option["kind"] not in d["include"]:
             continue
@@ -799,9 +800,19 @@ def combined_choice(ctx: Ctx, step: Step) -> tuple[list[str], list[str]]:
             if r and r["data"].get("wins") and (best is None or r["data"]["median"] > best[1]["data"]["median"]):
                 best = (variant, r)
         if best:
-            chosen.append(option["flag"])
-            args.append(best[0]["b"])
-    return chosen, union_args(args)
+            candidates.append((option["flag"], best[0]))
+    # A variant whose A side already carries other options (--cpu-verify-workers measures 12 against 6
+    # workers with --cpu-verify-misses on) only beat THAT baseline, not off. Keep it only while every
+    # option its A side turns on is also in the row, so its win is an addition to a baseline that won.
+    # Dropping one can orphan another, so repeat until nothing changes.
+    while True:
+        in_row = {flag for flag, _ in candidates}
+        kept = [(flag, variant) for flag, variant in candidates
+                if all(base in in_row for base in option_flags.intersection(variant.get("a", [])))]
+        if len(kept) == len(candidates):
+            break
+        candidates = kept
+    return [flag for flag, _ in candidates], union_args([variant["b"] for _, variant in candidates])
 
 
 def run_combined_step(ctx: Ctx, step: Step) -> dict:

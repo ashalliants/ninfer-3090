@@ -512,7 +512,8 @@ struct GraftSource {
     std::filesystem::path path;
 };
 
-// Qwen3.8-Flash-Next (Qwen4ExpForCausalLM) only; other models ignore these.
+// Qwen3.8-Flash-Next (Qwen4ExpForCausalLM) only; a dense model refuses any of these that is set
+// (runtime::validate_flash_next_options_unused) rather than ignoring it.
 struct FlashNextOptions {
     // The per-layer n-gram embedding volume. Empty uses `<artifact>.ngram`.
     std::filesystem::path ngram_volume_path;
