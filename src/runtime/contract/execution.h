@@ -2,7 +2,9 @@
 
 #include "runtime/contract/request.h"
 #include "runtime/contract/timing.h"
+#include <array>
 #include <compare>
+#include <optional>
 #include <span>
 
 namespace ninfer::runtime {
@@ -67,6 +69,15 @@ struct GeneratedRound {
     std::span<const TokenId> tokens;
 };
 
+// The log-probabilities of one generated token, as the Program reads them back from the device:
+// the token's own and its `count` most likely alternatives, best first.
+struct TokenLogprobs {
+    float chosen        = 0.0F;
+    std::uint32_t count = 0;
+    std::array<TokenId, kMaxLogprobsTopK> top_ids{};
+    std::array<float, kMaxLogprobsTopK> top_logprobs{};
+};
+
 struct BatchedGeneratedRound {
     std::span<const TokenId> tokens;
     std::span<const std::int32_t> row_counts;
@@ -79,6 +90,9 @@ struct PrefillStepResult {
     GeneratedRound round;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    // The first generated token's log-probabilities, when the request asked for them and this step
+    // sampled that token.
+    std::optional<TokenLogprobs> first_token_logprobs;
     // Part of one chunk ran (a sliced step): no prompt tokens are processed yet, and the next
     // advance_prefill for the lane runs the next slice.
     bool partial = false;

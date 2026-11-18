@@ -83,6 +83,11 @@ public:
     // for any other, the option is refused at startup and the Engine never takes the path.
     using ProgramType = typename ModelContract::Program;
     using BasePlan    = typename ModelContract::RequestBasePlan;
+    // First-token logprobs need a Program whose pending batch can carry them (the Qwen3.5 one).
+    static constexpr bool kLogprobsCapable =
+        requires(const typename ModelContract::PendingBatch& pending) {
+            pending.first_token_logprobs(std::size_t{});
+        };
     static constexpr bool kLossyCapable =
         requires(ProgramType& program, const ProgramType& view, const BasePlan& plan,
                  SequenceHandle sequence, typename ModelContract::PrefillProgress& progress) {
@@ -290,6 +295,9 @@ public:
                                "inference request expired before submission");
         }
 
+        if (options.execution.logprobs_top_k && !kLogprobsCapable) {
+            throw std::invalid_argument("this model does not return token log-probabilities");
+        }
         std::uint64_t request_id        = 0;
         std::uint64_t publication_order = 0;
         {
@@ -1258,6 +1266,18 @@ private:
         result.scheduling.host_to_device_bytes = request->host_to_device_bytes;
         result.prompt                          = request->prompt_summary;
         result.generated_token_ids             = std::move(request->generated);
+        for (std::size_t index = 0; index < request->token_logprobs.size(); ++index) {
+            const TokenLogprobs& logprobs = request->token_logprobs[index];
+            const auto entry              = [&](TokenId token, float logprob) {
+                return TokenLogprobEntry{token, logprob, instance_.frontend.token_bytes(token)};
+            };
+            TokenLogprob out{.sampled =
+                                 entry(result.generated_token_ids.at(index), logprobs.chosen)};
+            for (std::uint32_t rank = 0; rank < logprobs.count; ++rank) {
+                out.top.push_back(entry(logprobs.top_ids[rank], logprobs.top_logprobs[rank]));
+            }
+            result.token_logprobs.push_back(std::move(out));
+        }
         result.content                         = std::move(request->content);
         result.reasoning                       = std::move(request->reasoning);
         result.constraint                      = request->output.constraint_observation();
@@ -1513,6 +1533,9 @@ private:
                 if (generated_staged && request != nullptr &&
                     request->generated.size() >= generated_sizes[row]) {
                     request->generated.resize(generated_sizes[row]);
+                    if (request->token_logprobs.size() > generated_sizes[row]) {
+                        request->token_logprobs.resize(generated_sizes[row]);
+                    }
                 }
             }
             generated_staged = false;
@@ -1584,6 +1607,15 @@ private:
                                    static_cast<std::ptrdiff_t>(row * pending.row_stride());
                 request->generated.insert(request->generated.end(), first,
                                           first + static_cast<std::ptrdiff_t>(accepted));
+                if constexpr (kLogprobsCapable) {
+                    // Only a prefill Begin row carries them, and it licenses exactly one token.
+                    if (const auto& logprobs = pending.first_token_logprobs(row); logprobs) {
+                        if (accepted != 1 || request->generated.size() != 1) {
+                            throw std::logic_error("first-token logprobs on a multi-token commit");
+                        }
+                        request->token_logprobs.push_back(*logprobs);
+                    }
+                }
             }
         } catch (...) {
             const std::exception_ptr error = std::current_exception();

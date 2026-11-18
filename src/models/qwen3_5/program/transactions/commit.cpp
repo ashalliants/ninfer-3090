@@ -66,6 +66,7 @@ PrefillProgress ProgramImpl::wrap_prefill(std::uint32_t lane, runtime::PrefillSt
             .row_stride = 1,
         };
         out.pending.emplace(wrap_pending(lanes, round));
+        ContractAccess::first_token_logprobs(*out.pending, std::move(step.first_token_logprobs));
     } else if (requests[lane].prefill && requests[lane].capture_pending) {
         out.capture_ready = true;
     }

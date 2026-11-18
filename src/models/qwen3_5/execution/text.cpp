@@ -29,6 +29,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/top_logprobs.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_rows.h"
@@ -1720,6 +1721,14 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 } else {
                     ops::argmax(logits, io_.token,
                                 dimension(parameters_.model.resources().public_token_count), s);
+                }
+                if (logprobs_ != nullptr) {
+                    Tensor chosen       = logprobs_->chosen;
+                    Tensor top_ids      = logprobs_->top_ids;
+                    Tensor top_logprobs = logprobs_->top_logprobs;
+                    ops::top_logprobs(logits, io_.token,
+                                      dimension(parameters_.model.resources().public_token_count),
+                                      logprobs_->k, chosen, top_ids, top_logprobs, s);
                 }
             }
 

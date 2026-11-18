@@ -71,6 +71,18 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
     resolved.execution.thinking                = options.execution.thinking;
+    resolved.execution.logprobs_top_k          = options.execution.logprobs_top_k;
+    if (const auto top_k = options.execution.logprobs_top_k) {
+        if (*top_k > kMaxLogprobsTopK) {
+            throw std::invalid_argument("logprobs_top_k must be at most " +
+                                        std::to_string(kMaxLogprobsTopK));
+        }
+        if (options.execution.requested_output_tokens != 1) {
+            throw std::invalid_argument(
+                "logprobs are available for a single generated token only: request exactly one "
+                "output token");
+        }
+    }
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
     resolved.constraint                        = options.constraint;

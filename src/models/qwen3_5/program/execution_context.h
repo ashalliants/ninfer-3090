@@ -63,6 +63,8 @@ struct PrefillContext {
     qwen3_5::DFlashPrefillIngress* dflash_prefill_host_ingress = nullptr;
     std::int32_t rope_delta                                    = 0;
     CudaEventTimer* prefill_gpu_timer                          = nullptr;
+    // Set when this request asked for the first token's log-probabilities.
+    const LogprobsOutput* logprobs = nullptr;
     // A Host restore still landing: one event per full-attention layer, waited by the next layer
     // pass just before that layer. Empty when the lane's KV is already resident.
     std::span<const cudaEvent_t> layer_ready;

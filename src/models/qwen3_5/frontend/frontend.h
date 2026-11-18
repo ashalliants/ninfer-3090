@@ -85,6 +85,9 @@ public:
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
+    // The raw bytes the artifact tokenizer decodes one vocabulary token to (not necessarily valid
+    // UTF-8 alone). Special tokens keep their text. Throws on an id outside the vocabulary.
+    [[nodiscard]] std::string token_bytes(TokenId token) const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] OutputSession
     make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,

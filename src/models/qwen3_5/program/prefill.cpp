@@ -8,6 +8,7 @@
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/top_logprobs.h"
 
 #include <algorithm>
 #include <array>
@@ -79,6 +80,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
     card.set_prefill_gpu_timer(state.prefill_gpu_timer);
+    card.set_logprobs(state.logprobs);
     card.set_rope_delta(state.rope_delta);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
@@ -107,6 +109,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
     card.set_prefill_gpu_timer(state.prefill_gpu_timer);
+    card.set_logprobs(state.logprobs);
     card.set_rope_delta(state.rope_delta);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
@@ -175,6 +178,15 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
                 dimension(state.execution.parameters.model.resources().public_token_count),
                 state.sampling, state.execution.io.pos, purpose, state.execution.work,
                 state.execution.device.stream);
+    if (state.logprobs != nullptr) {
+        Tensor chosen       = state.logprobs->chosen;
+        Tensor top_ids      = state.logprobs->top_ids;
+        Tensor top_logprobs = state.logprobs->top_logprobs;
+        ops::top_logprobs(
+            logits, state.execution.io.token,
+            dimension(state.execution.parameters.model.resources().public_token_count),
+            state.logprobs->k, chosen, top_ids, top_logprobs, state.execution.device.stream);
+    }
     state.execution.work.reset();
 }
 
@@ -597,6 +609,22 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             sequence.rope_delta};
         schedule_state.prefill_gpu_timer = &prefill_gpu_timer_;
         schedule_state.layer_ready       = take_restore_layers(sequence.lane);
+        // The first token's log-probabilities, for a request that asked: the sampling sites write
+        // them to the Program's one scratch buffer and they are read back once the step has
+        // synchronized. Only one prefill step runs at a time, so the buffer is never shared.
+        std::optional<execution::LogprobsOutput> logprobs_output;
+        if (request.base->logprobs_top_k) {
+            const auto k  = static_cast<std::int32_t>(std::max(1U, *request.base->logprobs_top_k));
+            const auto at = [&](std::size_t offset) {
+                return static_cast<char*>(logprobs_scratch.p) + offset;
+            };
+            logprobs_output.emplace(execution::LogprobsOutput{
+                .k            = k,
+                .chosen       = Tensor(at(0), DType::FP32, {1}),
+                .top_ids      = Tensor(at(kLogprobsIdsOffset), DType::I32, {k, 1}),
+                .top_logprobs = Tensor(at(kLogprobsValuesOffset), DType::FP32, {k, 1})});
+            schedule_state.logprobs = &*logprobs_output;
+        }
         if (staged.cursor >= staged.prompt_tokens) {
             // An exact hit runs no prefill chunk, so nothing waits for the restored layers before
             // the tail hidden state is sampled and later compute reads Main KV. Wait for the
@@ -844,6 +872,18 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         const double vision_seconds = staged.retired_vision_seconds +
                                       (staged.vision ? staged.vision->elapsed_seconds() : 0.0);
         const std::uint32_t prompt_tokens = staged.prompt_tokens;
+        std::optional<runtime::TokenLogprobs> first_token_logprobs;
+        if (logprobs_output) {
+            runtime::TokenLogprobs host;
+            host.count = *request.base->logprobs_top_k;
+            CUDA_CHECK(cudaMemcpy(&host.chosen, logprobs_output->chosen.data, sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(host.top_ids.data(), logprobs_output->top_ids.data,
+                                  host.count * sizeof(TokenId), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(host.top_logprobs.data(), logprobs_output->top_logprobs.data,
+                                  host.count * sizeof(float), cudaMemcpyDeviceToHost));
+            first_token_logprobs = host;
+        }
 
         if (!license_tokens(std::span<TokenId>(host_tokens, 1))) { token_domain_faults[0] = true; }
         if (sequence.ledger.size() != prompt_tokens) {
@@ -896,6 +936,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             .round   = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},
             .processed_prompt_tokens = processed_prompt_tokens,
             .complete                = true,
+            .first_token_logprobs    = first_token_logprobs,
             .timing                  = timing.finish(),
         };
     } catch (...) {

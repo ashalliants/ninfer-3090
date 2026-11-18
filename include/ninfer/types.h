@@ -959,6 +959,12 @@ struct ExecutionOptions {
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;
+    // Return the log-probability of each generated token and of its `*logprobs_top_k` most likely
+    // alternatives (0 returns the generated token's alone), in GenerationResult::token_logprobs.
+    // The distribution is the model's own: a softmax over the raw logits, before temperature,
+    // penalties, filters and grammar masks. Only the first generated token is supported, so a
+    // request that sets this must ask for exactly one output token. Max kMaxLogprobsTopK.
+    std::optional<std::uint32_t> logprobs_top_k;
 };
 
 struct OutputOptions {
@@ -1698,11 +1704,31 @@ struct LossyPrefillReport {
     std::optional<LossySummaryProbe> summary_probe;
 };
 
+// Largest ExecutionOptions::logprobs_top_k (OpenAI's top_logprobs limit).
+inline constexpr std::uint32_t kMaxLogprobsTopK = 20;
+
+// A token and its log-probability. `bytes` is the token's raw byte string, which is not always
+// valid UTF-8 on its own.
+struct TokenLogprobEntry {
+    TokenId token = 0;
+    float logprob = 0.0F;
+    std::string bytes;
+};
+
+// The log-probabilities for one generated token: its own, and its most likely alternatives in
+// descending order of probability (lower token id first among equals).
+struct TokenLogprob {
+    TokenLogprobEntry sampled;
+    std::vector<TokenLogprobEntry> top;
+};
+
 struct GenerationResult {
     // Unique within this Engine instance; diagnostic correlation only.
     std::uint64_t engine_request_id = 0;
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
+    // One entry per generated token when ExecutionOptions::logprobs_top_k was set, else empty.
+    std::vector<TokenLogprob> token_logprobs;
     std::string content;
     std::string reasoning;
     std::vector<GeneratedToolCall> tool_calls;

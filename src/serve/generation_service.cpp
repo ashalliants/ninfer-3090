@@ -660,6 +660,15 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                               "prompts prefill in full (shown once)");
         }
         prepared.enable_thinking = prompt.summary().starts_in_reasoning;
+        if (request.logprobs_top_k && prepared.enable_thinking) {
+            // The first token of a thinking request is reasoning, not an answer a caller can score.
+            ApiError error;
+            error.message = "logprobs are available only when thinking is disabled "
+                            "(chat_template_kwargs.enable_thinking=false or reasoning_effort=none)";
+            error.param   = "logprobs";
+            error.code    = "logprobs_not_supported";
+            throw ApiException(std::move(error));
+        }
         if (!prepared.enable_thinking) {
             request_options.execution.thinking.budget.reset();
             prepared.thinking_budget.reset();
@@ -765,6 +774,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.prompt_tokens       = static_cast<int>(result.prompt.prompt_tokens);
     outcome.completion_tokens   = static_cast<int>(result.generated_token_ids.size());
     outcome.generated_token_ids = std::move(result.generated_token_ids);
+    outcome.token_logprobs      = std::move(result.token_logprobs);
     outcome.reasoning_tokens    = static_cast<int>(result.reasoning_tokens);
     outcome.thinking            = result.thinking;
     outcome.constraint          = result.constraint;
