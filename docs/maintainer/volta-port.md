@@ -445,6 +445,24 @@ expert's carve. The static workspace is not grown, so decode keeps its expert fr
 (a prompt or tail under 512 tokens) takes the route when its arena has room and otherwise keeps
 the default kernels, which the server reports once on stderr.
 
+### The routed experts' wide gate/up
+
+`wide_gate_up_kernel` (the wide route, one CTA per 32 intermediates and job) stays on dp4a: each
+32-value sub-block's integer sum is exact, so it is bit-identical to the CPU engine. Measured on
+`ninfer_offloaded_moe_wide_test --bench` with `clock64` per warp and phase, a full 64-column tile
+spends ~51% of a warp's time in the dp4a-and-scaling loop (at ~80% of the FMA pipe's peak with both
+of a scheduler's warps busy), the rest in the column fetch, fold and decode; the IQ2 decode alone is
+~7% (stubbed out: 1,287 -> 1,201 ms). With the dp4a work free (stubbed), the kernel drops only 22%,
+so FP16 tensor cores could not gain more than that. The loss was in narrow tiles: a warp's math is
+latency-bound, so a 16-column tile cost ~77% of a full one (its two busy warps ran a full share
+while six waited at each leaf's barrier), and half the bench's tiles have 32 columns or fewer. The
+kernel now picks its warp layout from the tile's width (`kLayout`: 2x16, 2x8 or 1x8 row-by-column
+tiles per warp), as three kernels, because one kernel holding all three bodies spills. The bench's
+gate/up time is 12-17% lower (IQ2_S, Flash-Next's format, 1,703 -> 1,421 ms). The 3,935-token
+prompt's gate/up time drops 1,468 -> 1,387 ms, and its tiles are mostly full. Prompt time is
+unchanged at 3.6-3.9K tokens: the compute stream waits on the expert uploads (4.3 s of copies over
+the 3.3 GB/s link). Prompt time improves ~6% at ~940 tokens (2.02 -> 1.87 s, two runs each).
+
 ### Why there is no HMMA path yet
 
 The PTX `mma.m8n8k4` computes four independent 8x8x4 products per warp, one per octet (lanes
