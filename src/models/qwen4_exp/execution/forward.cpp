@@ -717,9 +717,8 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     GdnReplayRecordLayer records;
     if (batch.verify != nullptr) { records = batch.verify->gdn.layer(static_cast<std::int32_t>(index), 1); }
     Tensor qkv = batch.verify != nullptr ? records.conv.view({C, T}) : work_->alloc(DType::BF16, {C, T});
-    project(x, p.qkv, qkv, *work_, s, ggml_decode_mma_);
-    Tensor z = work_->alloc(DType::BF16, {VW, T});
-    project(x, p.z, z, *work_, s, ggml_decode_mma_);
+    Tensor z   = work_->alloc(DType::BF16, {VW, T});
+    project_pair(x, p.qkv, p.z, qkv, z, *work_, s, ggml_decode_mma_);
     Tensor ab = work_->alloc(DType::BF16, {2 * NV, T});
     project_verify(x, p.control, ab, batch.verify != nullptr);
     Tensor a = work_->alloc(DType::BF16, {NV, T});
@@ -1078,9 +1077,8 @@ Tensor Forward::gdn_rows(const GdnParameters& p, const Tensor& x, std::uint32_t 
     const std::int32_t NV = dim(g.value_heads), NK = dim(g.key_heads), DK = dim(g.key_head_dim),
                        DV = dim(g.value_head_dim);
     Tensor qkv = work_->alloc(DType::BF16, {C, B});
-    project(x, p.qkv, qkv, *work_, s, ggml_decode_mma_);
-    Tensor z = work_->alloc(DType::BF16, {VW, B});
-    project(x, p.z, z, *work_, s, ggml_decode_mma_);
+    Tensor z   = work_->alloc(DType::BF16, {VW, B});
+    project_pair(x, p.qkv, p.z, qkv, z, *work_, s, ggml_decode_mma_);
     Tensor ab = work_->alloc(DType::BF16, {2 * NV, B});
     project_verify(x, p.control, ab, /*columnwise=*/true);
     Tensor a = work_->alloc(DType::BF16, {NV, B});
@@ -1333,9 +1331,8 @@ Tensor Forward::gdn_rows_verify(const GdnParameters& p, const Tensor& x, std::ui
     // The round's inputs are projected straight into the replay records (recorded, per row), as the
     // single-row verify path does.
     Tensor qkv = records.conv.view({C, T});
-    project(x, p.qkv, qkv, *work_, s, ggml_decode_mma_);
-    Tensor z = work_->alloc(DType::BF16, {VW, T});
-    project(x, p.z, z, *work_, s, ggml_decode_mma_);
+    Tensor z   = work_->alloc(DType::BF16, {VW, T});
+    project_pair(x, p.qkv, p.z, qkv, z, *work_, s, ggml_decode_mma_);
     Tensor ab = work_->alloc(DType::BF16, {2 * NV, T});
     project_verify(x, p.control, ab, /*columnwise=*/true);
     Tensor a = work_->alloc(DType::BF16, {NV, T});

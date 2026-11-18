@@ -11,6 +11,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -206,24 +207,25 @@ __global__ void __launch_bounds__(kMmvqThreads, kMmvqMinBlocks)
     mmvq_body<F, K, T, Residual, Out>(w, x, out, n, static_cast<int>(blockIdx.x), static_cast<int>(gridDim.x), smem);
 }
 
-// Two matrices of one input in one launch (linear_pair): CTAs [0, first_ctas) compute the first,
-// the rest the second, each with the single kernel's body.
+// Two matrices of one input in one launch (linear_pair): CTAs [0, first_ctas) compute the first
+// ([n1, K]), the rest the second ([n2, K]), each with the single kernel's body.
 template <QType F1, QType F2, int K, int T>
 __global__ void __launch_bounds__(kMmvqThreads, kMmvqMinBlocks)
     ggml_mmvq_pair_kernel(const std::uint8_t* __restrict__ w1, const std::uint8_t* __restrict__ w2,
                           const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out1,
-                          __nv_bfloat16* __restrict__ out2, int n, int first_ctas) {
+                          __nv_bfloat16* __restrict__ out2, int n1, int n2, int first_ctas) {
     extern __shared__ __align__(16) unsigned char smem[];
     const int cta = static_cast<int>(blockIdx.x);
     if constexpr (F1 == F2) {
         // One copy of the body (half the code; see mmvq_body): the CTA picks its matrix's operands.
         const bool second = cta >= first_ctas;
-        mmvq_body<F1, K, T, false>(second ? w2 : w1, x, second ? out2 : out1, n, second ? cta - first_ctas : cta,
+        mmvq_body<F1, K, T, false>(second ? w2 : w1, x, second ? out2 : out1, second ? n2 : n1,
+                                   second ? cta - first_ctas : cta,
                                    second ? static_cast<int>(gridDim.x) - first_ctas : first_ctas, smem);
     } else if (cta < first_ctas) {
-        mmvq_body<F1, K, T, false>(w1, x, out1, n, cta, first_ctas, smem);
+        mmvq_body<F1, K, T, false>(w1, x, out1, n1, cta, first_ctas, smem);
     } else {
-        mmvq_body<F2, K, T, false>(w2, x, out2, n, cta - first_ctas, static_cast<int>(gridDim.x) - first_ctas, smem);
+        mmvq_body<F2, K, T, false>(w2, x, out2, n2, cta - first_ctas, static_cast<int>(gridDim.x) - first_ctas, smem);
     }
 }
 
@@ -264,11 +266,12 @@ void launch_mmvq_instance(const std::uint8_t* w, const __nv_bfloat16* x, Out* ou
     mmvq_check(cudaGetLastError(), "launch");
 }
 
-// The pair: as many CTAs as fit at once, split evenly between the two matrices (same rows and K),
-// never more than a matrix has row groups.
+// The pair: as many CTAs as fit at once, split between the two matrices (same K) in proportion to
+// their rows (evenly for equal rows), never more than a matrix has row groups. A row's arithmetic
+// does not depend on the CTA that computes it, so the split changes no output.
 template <QType F1, QType F2, int K, int T>
 void launch_mmvq_pair_instance(const std::uint8_t* w1, const std::uint8_t* w2, const __nv_bfloat16* x,
-                               __nv_bfloat16* out1, __nv_bfloat16* out2, int n, cudaStream_t stream) {
+                               __nv_bfloat16* out1, __nv_bfloat16* out2, int n1, int n2, cudaStream_t stream) {
     constexpr std::size_t kShared = mmvq_shared_bytes<F1, K, T>() > mmvq_shared_bytes<F2, K, T>()
                                         ? mmvq_shared_bytes<F1, K, T>()
                                         : mmvq_shared_bytes<F2, K, T>();
@@ -290,10 +293,13 @@ void launch_mmvq_pair_instance(const std::uint8_t* w1, const std::uint8_t* w2, c
                    "occupancy");
         return sms * (per_sm > 0 ? per_sm : 1);
     }();
-    const int ctas_needed = (n + kRowsCta - 1) / kRowsCta;
-    const int half        = resident / 2 > 0 ? resident / 2 : 1;
-    const int each        = ctas_needed < half ? ctas_needed : half;
-    ggml_mmvq_pair_kernel<F1, F2, K, T><<<2 * each, kMmvqThreads, kShared, stream>>>(w1, w2, x, out1, out2, n, each);
+    const int needed1 = (n1 + kRowsCta - 1) / kRowsCta, needed2 = (n2 + kRowsCta - 1) / kRowsCta;
+    const int share1  = n1 == n2 ? std::max(1, resident / 2)
+                                 : static_cast<int>(static_cast<long long>(resident) * n1 / (n1 + n2));
+    const int each1   = std::max(1, std::min(needed1, share1));
+    const int each2   = n1 == n2 ? each1 : std::max(1, std::min(needed2, resident - each1));
+    ggml_mmvq_pair_kernel<F1, F2, K, T>
+        <<<each1 + each2, kMmvqThreads, kShared, stream>>>(w1, w2, x, out1, out2, n1, n2, each1);
     mmvq_check(cudaGetLastError(), "pair launch");
 }
 

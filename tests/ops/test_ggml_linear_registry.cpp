@@ -108,7 +108,8 @@ const std::vector<Pack> kPacks = {
 };
 
 // The two-projection families the forward runs through one linear_pair at decode width.
-constexpr std::pair<const Family*, const Family*> kPairs[] = {{&kGateShexp, &kUpShexp}, {&kAttnK, &kAttnV}};
+constexpr std::pair<const Family*, const Family*> kPairs[] = {
+    {&kGateShexp, &kUpShexp}, {&kAttnK, &kAttnV}, {&kAttnQkv, &kAttnGate}};
 
 std::string label(const Pack& pack, const Family& family, QType format) {
     return std::string(pack.name) + " " + family.name + " format " + std::to_string(static_cast<int>(format));
@@ -143,7 +144,7 @@ int run() {
             for (const QType a : formats_of(pack, first)) {
                 for (const QType b : formats_of(pack, second)) {
                     ++pairs;
-                    if (!d::ggml_pair_registered(a, b, first->n, first->k)) {
+                    if (!d::ggml_pair_registered(a, b, first->n, second->n, first->k)) {
                         fail(label(pack, *first, a) + " with " + second->name + " format " +
                              std::to_string(static_cast<int>(b)) + ": no linear_pair");
                     }

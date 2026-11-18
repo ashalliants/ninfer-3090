@@ -378,34 +378,36 @@ int run_problem(QType format, std::int32_t n, std::int32_t k, bool add) {
     return failures + mma_failures;
 }
 
-// linear_pair on (first, second) at [n, k], T = 1..8: both outputs against the FP64 oracle and bit
+// linear_pair on (first, second) at [n1, k] and [n2, k], T = 1..8: both outputs against the FP64 oracle and bit
 // for bit against linear() of each weight alone.
-int run_pair(QType first, QType second, std::int32_t n, std::int32_t k) {
-    const std::uint32_t seed = static_cast<std::uint32_t>(n * 17 + k + 97 * static_cast<int>(first) + static_cast<int>(second));
-    const auto blocks1       = make_blocks(first, n, k, seed);
-    const auto blocks2       = make_blocks(second, n, k, seed ^ 0x9e3779b9U);
-    std::vector<float> w1(static_cast<std::size_t>(n) * k), w2(w1.size());
+int run_pair(QType first, QType second, std::int32_t n1, std::int32_t n2, std::int32_t k) {
+    const std::uint32_t seed = static_cast<std::uint32_t>(n1 * 17 + n2 * 5 + k + 97 * static_cast<int>(first) + static_cast<int>(second));
+    const auto blocks1       = make_blocks(first, n1, k, seed);
+    const auto blocks2       = make_blocks(second, n2, k, seed ^ 0x9e3779b9U);
+    std::vector<float> w1(static_cast<std::size_t>(n1) * k), w2(static_cast<std::size_t>(n2) * k);
     test::ggml::decode_blocks(first, std::as_bytes(std::span(blocks1)), w1);
     test::ggml::decode_blocks(second, std::as_bytes(std::span(blocks2)), w2);
     constexpr std::int32_t kPairTokens = 8;
     const auto x_bits = make_activation(k, kPairTokens, seed ^ 0x5bd1e995U);
     const Q81 xq      = cast_q81(x_bits, k, kPairTokens);
-    const auto want1  = oracle(w1, xq, n, k, kPairTokens, nullptr);
-    const auto want2  = oracle(w2, xq, n, k, kPairTokens, nullptr);
+    const auto want1  = oracle(w1, xq, n1, k, kPairTokens, nullptr);
+    const auto want2  = oracle(w2, xq, n2, k, kPairTokens, nullptr);
 
     DeviceBuffer d_w1(blocks1.size()), d_w2(blocks2.size());
     d_w1.copy_from_host(blocks1.data(), blocks1.size());
     d_w2.copy_from_host(blocks2.data(), blocks2.size());
     DeviceBuffer d_x(x_bits.size() * 2);
     d_x.copy_from_host(x_bits.data(), x_bits.size() * 2);
-    const std::size_t out_bytes = static_cast<std::size_t>(n) * kPairTokens * 2;
-    DeviceBuffer d_o1(out_bytes), d_o2(out_bytes), d_r1(out_bytes), d_r2(out_bytes);
-    const Weight weight1 = device_weight(first, n, k, d_w1);
-    const Weight weight2 = device_weight(second, n, k, d_w2);
+    const std::size_t out1_bytes = static_cast<std::size_t>(n1) * kPairTokens * 2;
+    const std::size_t out2_bytes = static_cast<std::size_t>(n2) * kPairTokens * 2;
+    DeviceBuffer d_o1(out1_bytes), d_o2(out2_bytes), d_r1(out1_bytes), d_r2(out2_bytes);
+    const Weight weight1 = device_weight(first, n1, k, d_w1);
+    const Weight weight2 = device_weight(second, n2, k, d_w2);
     DeviceArena workspace(256);
 
     const std::string label = std::string("linear_pair ") + format_name(first) + "+" + format_name(second) + " [" +
-                              std::to_string(n) + "," + std::to_string(k) + "]";
+                              std::to_string(n1) + (n1 == n2 ? "" : "/" + std::to_string(n2)) + "," +
+                              std::to_string(k) + "]";
     int failures = 0;
     for (std::int32_t t = 1; t <= kPairTokens; ++t) {
         if (ops::linear_pair_workspace_capacity_bytes(weight1, weight2, t, t) != 0) {
@@ -413,18 +415,18 @@ int run_pair(QType first, QType second, std::int32_t n, std::int32_t k) {
             ++failures;
         }
         Tensor x(d_x.p, DType::BF16, {k, t});
-        Tensor o1(d_o1.p, DType::BF16, {n, t}), o2(d_o2.p, DType::BF16, {n, t});
-        Tensor r1(d_r1.p, DType::BF16, {n, t}), r2(d_r2.p, DType::BF16, {n, t});
+        Tensor o1(d_o1.p, DType::BF16, {n1, t}), o2(d_o2.p, DType::BF16, {n2, t});
+        Tensor r1(d_r1.p, DType::BF16, {n1, t}), r2(d_r2.p, DType::BF16, {n2, t});
         for (const auto* buffer : {&d_o1, &d_o2, &d_r1, &d_r2}) {
-            cuda_check(cudaMemset(buffer->p, 0xFF, out_bytes), "poison");
+            cuda_check(cudaMemset(buffer->p, 0xFF, buffer->bytes), "poison");
         }
         ops::linear_pair(x, weight1, weight2, o1, o2, nullptr);
         ops::linear(x, weight1, r1, LinearPolicy::AllowA8, workspace, nullptr);
         ops::linear(x, weight2, r2, LinearPolicy::AllowA8, workspace, nullptr);
         cuda_check(cudaDeviceSynchronize(), "linear_pair");
-        const std::size_t count = static_cast<std::size_t>(n) * t;
-        const auto got1 = download_bf16(d_o1.p, count), got2 = download_bf16(d_o2.p, count);
-        const auto ref1 = download_bf16(d_r1.p, count), ref2 = download_bf16(d_r2.p, count);
+        const std::size_t count1 = static_cast<std::size_t>(n1) * t, count2 = static_cast<std::size_t>(n2) * t;
+        const auto got1 = download_bf16(d_o1.p, count1), got2 = download_bf16(d_o2.p, count2);
+        const auto ref1 = download_bf16(d_r1.p, count1), ref2 = download_bf16(d_r2.p, count2);
         if (got1 != ref1 || got2 != ref2) {
             std::cerr << label << " T=" << t << ": outputs differ from linear() bit for bit\n";
             ++failures;
@@ -650,7 +652,7 @@ int pair_admission() {
     const Weight wide = device_weight(QType::GGML_IQ4_XS, 10240, 2560, b);
     failures += expect_throw("pair beyond the decode route", [&] { (void)ops::linear_pair_workspace_capacity_bytes(iq4, q6, 1, 9); });
     failures += expect_throw("pair with an unpaired format", [&] { (void)ops::linear_pair_workspace_capacity_bytes(iq4, q8_0, 1, 1); });
-    failures += expect_throw("pair of different shapes", [&] { (void)ops::linear_pair_workspace_capacity_bytes(iq4, wide, 1, 1); });
+    failures += expect_throw("pair of unregistered different shapes", [&] { (void)ops::linear_pair_workspace_capacity_bytes(iq4, wide, 1, 1); });
     failures += expect_throw("pair at an unregistered pair shape", [&] { (void)ops::linear_pair_workspace_capacity_bytes(wide, wide, 1, 1); });
     return failures;
 }
@@ -771,7 +773,9 @@ int main(int argc, char** argv) {
             failures += pair_admission();
             for (const auto& shape : ops::detail::kGgmlPairShapes) {
                 for (const QType f1 : ops::detail::kGgmlPairFormats) {
-                    for (const QType f2 : ops::detail::kGgmlPairFormats) { failures += run_pair(f1, f2, shape.n, shape.k); }
+                    for (const QType f2 : ops::detail::kGgmlPairFormats) {
+                        failures += run_pair(f1, f2, shape.n1, shape.n2, shape.k);
+                    }
                 }
             }
             for (const std::int32_t kk : {640, 2560, 6144}) failures += cast_exact(kk, 300);

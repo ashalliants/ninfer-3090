@@ -95,9 +95,9 @@ bool ggml_pair(const Weight& first_weight, const Weight& second_weight) {
 
 void require_ggml_pair(const Weight& first_weight, const Weight& second_weight) {
     if (first_weight.layout != QuantLayout::GgmlBlocks || second_weight.layout != QuantLayout::GgmlBlocks ||
-        first_weight.ndim != 2 || second_weight.ndim != 2 || first_weight.n != second_weight.n ||
-        first_weight.k != second_weight.k ||
-        !detail::ggml_pair_registered(first_weight.qtype, second_weight.qtype, first_weight.n, first_weight.k)) {
+        first_weight.ndim != 2 || second_weight.ndim != 2 || first_weight.k != second_weight.k ||
+        !detail::ggml_pair_registered(first_weight.qtype, second_weight.qtype, first_weight.n, second_weight.n,
+                                      first_weight.k)) {
         throw std::invalid_argument("linear_pair: unsupported GGML format pair or shape");
     }
 }
@@ -115,11 +115,12 @@ void require_ggml_nonoverlap(const Tensor& x, const Weight& first_weight, const 
         const char* label;
     };
     const std::uint64_t cols = static_cast<std::uint64_t>(x.ne[1]);
-    const std::uint64_t n    = static_cast<std::uint64_t>(first_weight.n);
+    const std::uint64_t n1   = static_cast<std::uint64_t>(first_weight.n);
+    const std::uint64_t n2   = static_cast<std::uint64_t>(second_weight.n);
     const std::array<Range, 5> ranges{{
         {x.data, static_cast<std::uint64_t>(x.ne[0]) * cols * 2u, "x"},
-        {first_out.data, n * cols * 2u, "first output"},
-        {second_out.data, n * cols * 2u, "second output"},
+        {first_out.data, n1 * cols * 2u, "first output"},
+        {second_out.data, n2 * cols * 2u, "second output"},
         {first_weight.qdata, ggml_payload_bytes(first_weight), "first weight"},
         {second_weight.qdata, ggml_payload_bytes(second_weight), "second weight"},
     }};
@@ -165,7 +166,7 @@ void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& seco
         require_ggml_pair(first_weight, second_weight);
         require_matrix(x, first_weight.k, cols, "x");
         require_matrix(first_out, first_weight.n, cols, "first output");
-        require_matrix(second_out, first_weight.n, cols, "second output");
+        require_matrix(second_out, second_weight.n, cols, "second output");
         require_ggml_nonoverlap(x, first_weight, second_weight, first_out, second_out);
         detail::ggml_pair_dispatch(x, first_weight, second_weight, first_out, second_out, stream);
         return;

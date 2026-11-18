@@ -29,10 +29,10 @@ void ggml_mma_decode_launch(const std::uint8_t* w, const __nv_bfloat16* x, __nv_
                             cudaStream_t stream);
 
 // linear_pair's decode route: out1 = W1 x and out2 = W2 x in one launch, each row computed as
-// ggml_mmvq_launch computes it. (first, second, n, k) must satisfy ggml_pair_registered.
+// ggml_mmvq_launch computes it. (first, second, n1, n2, k) must satisfy ggml_pair_registered.
 void ggml_mmvq_pair_launch(QType first, QType second, const std::uint8_t* w1, const std::uint8_t* w2,
-                           const __nv_bfloat16* x, __nv_bfloat16* out1, __nv_bfloat16* out2, std::int32_t n,
-                           std::int32_t k, std::int32_t t, cudaStream_t stream);
+                           const __nv_bfloat16* x, __nv_bfloat16* out1, __nv_bfloat16* out2, std::int32_t n1,
+                           std::int32_t n2, std::int32_t k, std::int32_t t, cudaStream_t stream);
 
 // Wide route: int8 tensor-core GEMM over the Q8_1 activation in (xq, xd), written by
 // ggml_quantize_q8_1_launch. Requires n % 128 == 0 and k % 128 == 0.

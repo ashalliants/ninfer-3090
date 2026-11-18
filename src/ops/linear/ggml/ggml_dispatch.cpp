@@ -148,7 +148,7 @@ void ggml_pair_dispatch(const Tensor& x, const Weight& first, const Weight& seco
     validate_weight(first);
     validate_weight(second);
     const std::int32_t t = x.ne[1];
-    if (first.n != second.n || first.k != second.k || !ggml_pair_registered(first.qtype, second.qtype, first.n, first.k)) {
+    if (first.k != second.k || !ggml_pair_registered(first.qtype, second.qtype, first.n, second.n, first.k)) {
         throw std::invalid_argument("linear_pair: unsupported GGML format pair or shape");
     }
     if (t < 1 || t > kGgmlDecodeMaxTokens) {
@@ -157,7 +157,7 @@ void ggml_pair_dispatch(const Tensor& x, const Weight& first, const Weight& seco
     ggml_mmvq_pair_launch(first.qtype, second.qtype, static_cast<const std::uint8_t*>(first.qdata),
                           static_cast<const std::uint8_t*>(second.qdata), static_cast<const __nv_bfloat16*>(x.data),
                           static_cast<__nv_bfloat16*>(first_out.data), static_cast<__nv_bfloat16*>(second_out.data),
-                          first.n, first.k, t, stream);
+                          first.n, second.n, first.k, t, stream);
 }
 
 } // namespace ninfer::ops::detail
