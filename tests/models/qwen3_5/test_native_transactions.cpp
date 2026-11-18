@@ -1680,6 +1680,66 @@ public:
         expect_empty("pause-fit exhausted-arena fixture leaked physical resources");
     }
 
+    // A pause may use the Host arena's snapshot reserve (--host-pause-reserve-mib) that cached
+    // history may not (#427): with the general budget full of demoted checkpoints, a pause still
+    // fits, takes exactly the Host bytes pause_host_bytes promised, and those bytes sit in the
+    // reserve (they count against it) until the snapshot is dropped. Needs a Program built with a
+    // reserve; the arena without one is covered by pause_fit_matches_pause.
+    void pause_uses_snapshot_reserve() {
+        const std::span<const qwen::CheckpointHandle> none;
+        // occupied.host_bytes counts only the general budget (the cache cannot use the reserve);
+        // a snapshot's bytes beyond it are reported as host_pause_reserve_occupied_bytes.
+        const auto host_bytes = [&] {
+            const auto usage = program_.physical_usage();
+            return usage.occupied.host_bytes + usage.host_pause_reserve_occupied_bytes;
+        };
+        require(program_.physical_usage().host_pause_reserve_bytes > 0,
+                "the reserve fixture was built without a pause snapshot reserve");
+        auto probe_base     = request(2 * kChunk);
+        const auto sequence = bind(probe_base, 1);
+        prefill_prefix(sequence, kChunk);
+        const auto need = program_.pause_host_bytes(sequence);
+        require(need && program_.pause_snapshot_fits(sequence),
+                "the reserve probe did not fit an empty arena");
+        // Fill the general budget with demoted checkpoints until the next would not fit.
+        std::vector<qwen::CheckpointHandle> fillers;
+        std::size_t cost = 0;
+        for (std::uint32_t tokens = 2 * kChunk; fillers.size() < 6; ++tokens) {
+            const auto free = program_.host_free_runs_after_release(none).budget_free();
+            if (cost != 0 && free < cost) { break; }
+            const auto before = host_bytes();
+            auto filler_base  = request(tokens, true);
+            fillers.push_back(checkpoint(filler_base));
+            demote_to_host(fillers.back());
+            cost = std::max<std::size_t>(cost, host_bytes() - before);
+        }
+        require(program_.host_free_runs_after_release(none).budget_free() < *need,
+                "the fixture left the general budget room for the pause");
+        require(program_.pause_snapshot_fits(sequence) &&
+                    program_.pause_state_image_unplaced(sequence) == 0,
+                "a pause that fits only in the snapshot reserve was reported as not fitting");
+        const auto reserve_before = program_.physical_usage().host_pause_reserve_occupied_bytes;
+        const auto before         = host_bytes();
+        require(program_.start_pause(sequence, true, nullptr, true),
+                "a pause that fits only in the snapshot reserve was refused");
+        auto paused = settle();
+        require(paused.paused && paused.paused->snapshot_handle(),
+                "the reserve pause kept no snapshot");
+        require(host_bytes() - before == *need,
+                "the reserve pause took a different number of Host bytes than pause_host_bytes");
+        require(program_.physical_usage().host_pause_reserve_occupied_bytes > reserve_before,
+                "the snapshot was not placed in the pause reserve");
+        require(program_.revoke_snapshot(*paused.paused),
+                "the reserve snapshot could not be revoked");
+        paused.paused.reset();
+        require(program_.physical_usage().host_pause_reserve_occupied_bytes == reserve_before,
+                "dropping the snapshot left bytes in the pause reserve");
+        for (const auto handle : fillers) {
+            require(program_.release_checkpoint(handle), "a filler checkpoint did not release");
+        }
+        expect_empty("pause-reserve fixture leaked physical resources");
+    }
+
     void physical_facts() {
         auto seed         = request(64, true);
         const auto source = checkpoint(seed);
@@ -4309,6 +4369,17 @@ int main(int argc, char** argv) {
             full_pool_fixture.restore_full_pool_snapshot();
         }
         full_pool.reset();
+        // A Host arena that keeps part of its capacity for pause snapshots.
+        options.context_cache.host_pause_reserve_bytes = std::size_t{256} << 20;
+        auto reserve_planner = qwen::make_sequence_planner(parameters, device, options);
+        auto reserve_plan    = std::move(reserve_planner).finalize(8);
+        auto reserve_program = qwen::create_program(parameters, std::move(reserve_plan), device, {});
+        {
+            Fixture reserve_fixture(device, *reserve_program, frontend);
+            reserve_fixture.pause_uses_snapshot_reserve();
+        }
+        reserve_program.reset();
+        options.context_cache.host_pause_reserve_bytes = 0;
         options.max_context                       = kCapacity;
         options.max_concurrency                   = 1;
         options.context_cache.device_state_slots  = 0;
