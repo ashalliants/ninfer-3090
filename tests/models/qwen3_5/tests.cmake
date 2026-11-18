@@ -104,6 +104,13 @@ ninfer_add_test(ninfer_qwen3_5_ngram_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_ngram_real.cpp"
   LIBRARIES ninfer_engine ninfer::json)
 
+# Token log-probabilities under ordinary, MTP and DFlash2 + n-gram decoding: one aligned entry per
+# generated token, greedy tokens equal their own top alternative (which ties each speculative verify
+# column to its licensed token), and a logprob request beside a plain one.
+ninfer_add_test(ninfer_qwen3_5_logprobs_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_logprobs_real.cpp"
+  LIBRARIES ninfer_engine)
+
 ninfer_add_test(ninfer_qwen3_5_dflash_prefill_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash_prefill_real.cpp"
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)
@@ -234,6 +241,7 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_adaptive_draft_real_test
   ninfer_qwen3_5_adaptive_draft_eager_real_test
   ninfer_qwen3_5_ngram_real_test
+  ninfer_qwen3_5_logprobs_real_test
   ninfer_qwen3_5_dflash_prefill_real_test
   ninfer_qwen3_5_moe_real_test
   ninfer_qwen3_5_dflash_real_test
