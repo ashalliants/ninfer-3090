@@ -22,6 +22,12 @@
 #     calls hand it cold experts routed up to 64 tokens at share 0.5 (--prefill-cpu-max-columns 64
 #     --prefill-cpu-share 0.5; NINFER_PREFILL_CPU_MAX_COLUMNS=8 NINFER_PREFILL_CPU_SHARE=0.4 restore
 #     the tuned profile's);
+#   - opt-in, not set by default: NINFER_NGRAM_RAM_MIB=auto (--ngram-ram-mib) holds as much of the
+#     29 GB n-gram table in RAM as the RAM ledger spares after the experts, the context cache and
+#     a 2 GiB margin beyond the reserve (~13 GiB, half the table, on a 59 GiB host; ~6 GiB stays
+#     available), loaded in ~6 s after startup. A prompt's row read halves (3.9K tokens 0.86 ->
+#     0.50 s): 4-8% faster prefill (939 tokens 1.82-2.00 -> 1.68-1.71 s), the same output. Leave
+#     it off when other programs need that RAM;
 #   - Flash-Next MTP drafts step by step (--mtp-staged-drafts; NINFER_MTP_STAGED_DRAFTS=off turns it
 #     off): +2-4% decode, the same output;
 #   - Flash-Next MTP verification rounds compute part of their uncached experts on the CPU

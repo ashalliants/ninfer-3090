@@ -573,6 +573,29 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const auto cache_fit = models::qwen4_exp::fit_context_cache(snapshot, demand, requested_cache, kMinimumHostContextBytes,
                                                                 kHostContextGranule);
     demand.context_cache = cache_fit.bytes;
+    // --ngram-ram-mib: the n-gram volume's RAM-held blocks take what is left after everything else
+    // (the context cache included) and a margin, never more than the volume.
+    if (next.ngram_ram_bytes != 0) {
+        const std::uint64_t volume = models::qwen4_exp::NgramVolume::ram_bytes(config.ple.table, ~std::uint64_t{0});
+        const std::uint64_t asked  = std::min(next.ngram_ram_bytes, volume);
+        const std::uint64_t fitted = models::qwen4_exp::NgramVolume::ram_bytes(
+            config.ple.table, models::qwen4_exp::fit_ngram_ram(snapshot, demand, asked));
+        demand.pageable += fitted;
+        program_options.ngram_ram_bytes = fitted;
+        char line[320];
+        std::snprintf(line, sizeof(line),
+                      "n-gram table: %.2f of %.2f GiB held in RAM (%.0f%% of its blocks), loading in the background%s",
+                      static_cast<double>(fitted) / static_cast<double>(1ULL << 30),
+                      static_cast<double>(volume) / static_cast<double>(1ULL << 30),
+                      volume ? 100.0 * static_cast<double>(fitted) / static_cast<double>(volume) : 0.0,
+                      next.ngram_ram_bytes != FlashNextOptions::kNgramRamAuto && fitted < asked
+                          ? "; less than asked: that is what the RAM ledger spares beside the experts, the context "
+                            "cache and a 2 GiB margin"
+                          : "");
+        report(fitted == 0 ? std::string("n-gram table: no RAM to spare for --ngram-ram-mib beside the experts, the "
+                                         "context cache and a 2 GiB margin; rows are read from the drive")
+                           : std::string(line));
+    }
     const auto ledger    = models::qwen4_exp::plan_host_memory(snapshot, demand);
     program_options.context_cache_bytes = cache_fit.bytes;
     program_options.context_nvme_bytes  = nvme_bytes;

@@ -234,7 +234,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--reasoning-loop off|stop|conclude] "
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] "
            "[--no-cuda-graph] [--no-prefix-reuse] [--devices N,M,...] [--stage-layers A,B,...] "
-           "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
+           "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--ngram-ram-mib N|auto] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
            "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--mtp-staged-drafts] [--mtp-rows-verify] [--ngram-prefetch] "
            "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
            "[--moe-fused-route] [--cpu-verify-misses] [--prefill-cpu-share F [--prefill-cpu-all-columns N] [--prefill-cpu-max-columns N]] [--cpu-verify-workers N] [--gdn-async-commit] [--hc-int8 [--hc-fused-read]] "
@@ -359,7 +359,10 @@ std::string serve_usage_text(const char* argv0) {
            "cache (0: disk only); --context-store DIR keeps it across restarts; "
            "--ngram-volume FILE is its n-gram table (default <model>.ngram); --ngram-keepalive-ms N "
            "reads a block from it after N ms of idleness so the drive stays awake (default 40, "
-           "0 turns it off, at most 60000); --expert-state FILE "
+           "0 turns it off, at most 60000); --ngram-ram-mib N|auto holds up to N MiB of the n-gram table in RAM "
+           "(auto: all the RAM ledger spares after the experts, the context cache, the other planned "
+           "allocations, the reserve and 2 GiB more), loaded in the background, so a prompt reads that "
+           "share of its rows from RAM instead of the drive (default 0, off; the same output); --expert-state FILE "
            "keeps the VRAM expert cache's state across restarts (default <model>.expert-state; "
            "--no-expert-state starts it empty and saves nothing); --default-expert-state FILE is a state "
            "shipped for a fresh install, read only when the saved one does not load (missing, another "
@@ -1072,6 +1075,15 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             }
             options.flash_next.ngram_keepalive_ms     = static_cast<std::uint32_t>(ms);
             options.flash_next.ngram_keepalive_ms_set = true;
+        } else if (arg == "--ngram-ram-mib") {
+            const std::string value = require_value("--ngram-ram-mib");
+            if (value == "auto") {
+                options.flash_next.ngram_ram_bytes = FlashNextOptions::kNgramRamAuto;
+            } else {
+                const std::uint64_t mib = parse_u64(value.c_str(), "ngram-ram-mib");
+                if (mib > (std::uint64_t{1} << 30)) { throw std::invalid_argument("--ngram-ram-mib is too large"); }
+                options.flash_next.ngram_ram_bytes = mib << 20U;
+            }
         } else if (arg == "--shared-expert-stream") {
             options.flash_next.shared_expert_stream = true;
         } else if (arg == "--mtp-constrained") {

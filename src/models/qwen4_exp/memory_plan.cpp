@@ -188,6 +188,17 @@ void plan_pinned_weights(HostMemoryDemand& demand, std::uint64_t pinned_block, c
     demand.other_pinned = hot.table;
 }
 
+std::uint64_t fit_ngram_ram(const HostMemorySnapshot& snapshot, const HostMemoryDemand& demand, std::uint64_t requested,
+                            std::uint64_t margin) {
+    if (requested == 0) { return 0; }
+    const HostMemoryLedger with = plan_host_memory(snapshot, demand);
+    if (!with.fits) { return 0; }
+    const std::uint64_t floor_bytes = demand.reserve + with.planned + with.full_need + margin;
+    const std::uint64_t spare       = std::min(saturating_sub(snapshot.available_physical, floor_bytes),
+                                               saturating_sub(snapshot.available_commit, floor_bytes));
+    return std::min(requested, spare);
+}
+
 ContextCacheFit fit_context_cache(const HostMemorySnapshot& snapshot, HostMemoryDemand demand, std::uint64_t requested,
                                   std::uint64_t minimum, std::uint64_t granule) {
     ContextCacheFit out;

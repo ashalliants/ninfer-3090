@@ -386,6 +386,8 @@ struct ProgramOptions {
     std::filesystem::path ngram_volume;
     // The n-gram volume's keep-alive period in milliseconds (0: off); see FlashNextOptions.
     std::uint32_t ngram_keepalive_ms = 40;
+    // FlashNextOptions::ngram_ram_bytes as the RAM ledger fitted it (0: off).
+    std::uint64_t ngram_ram_bytes = 0;
     // The expert cache's saved state: read at startup to fill the frames (warm start), written at
     // shutdown and, between requests, every 10 minutes. Empty: no warm start. The identity names
     // the artifact the state belongs to.

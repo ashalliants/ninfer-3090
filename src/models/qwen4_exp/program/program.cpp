@@ -890,6 +890,8 @@ public:
         // drive awake (a zero period leaves the keep-alive off).
         volume_.set_keepalive(std::chrono::milliseconds(options_.ngram_keepalive_ms),
                               std::chrono::milliseconds(kNgramKeepaliveWindowMs));
+        // --ngram-ram-mib: a prefix of the volume's blocks loads into RAM in the background.
+        volume_.hold_in_ram(options_.ngram_ram_bytes);
         vocab_ = dim(c_.vocab_size);
 
         // Every fixed allocation is checked against the plan and against device free memory (an
@@ -6084,7 +6086,7 @@ private:
             std::snprintf(text, sizeof(text),
                           "request: %u prompt + %u generated tokens; prefill %.2f s, decode %.2f s (%.2f tok/s); expert "
                           "cache %u frames, %.1f%% of %llu routed experts hit, %llu promotions; decode %.1f%% of %llu hit, "
-                          "%llu promotions; since start %.1f%%; n-gram rows %llu (%llu cached, %llu block reads, %.2f s; "
+                          "%llu promotions; since start %.1f%%; n-gram rows %llu (%llu cached, %llu from RAM (%.0f%% of the blocks held), %llu block reads, %.2f s; "
                           "decode %llu block reads, %.2f s); VRAM free %zu MiB",
                           L().prompt_tokens, generated, seconds(L().prefill_ns), seconds(L().decode_ns),
                           L().decode_ns ? (generated > 1 ? (generated - 1) / seconds(L().decode_ns) : 0.0) : 0.0,
@@ -6096,6 +6098,10 @@ private:
                           static_cast<unsigned long long>(s.promotions - d.promotions),
                           s.routed ? 100.0 * static_cast<double>(s.hits) / static_cast<double>(s.routed) : 0.0,
                           static_cast<unsigned long long>(n.rows - m.rows), static_cast<unsigned long long>(n.hits - m.hits),
+                          static_cast<unsigned long long>(n.ram - m.ram),
+                          c_.ple.table.blocks ? 100.0 * static_cast<double>(volume_.ram_blocks_loaded()) /
+                                                    static_cast<double>(c_.ple.table.blocks)
+                                              : 0.0,
                           static_cast<unsigned long long>(n.reads - m.reads), seconds(n.read_ns - m.read_ns),
                           static_cast<unsigned long long>(n.reads - L().ngram_at_decode.reads),
                           seconds(n.read_ns - L().ngram_at_decode.read_ns), free_vram >> 20);

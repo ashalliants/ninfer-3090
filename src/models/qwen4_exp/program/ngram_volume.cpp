@@ -59,6 +59,8 @@ NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConf
 }
 
 NgramVolume::~NgramVolume() {
+    ram_stop_.store(true, std::memory_order_relaxed);
+    if (ram_thread_.joinable()) { ram_thread_.join(); }
     {
         const std::lock_guard lock(keepalive_mutex_);
         keepalive_stop_ = true;
@@ -77,14 +79,26 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
         throw std::invalid_argument("n-gram rows: output size differs from the row count");
     }
     last_request_ns_.store(now_ns(), std::memory_order_relaxed);
+    // The RAM loader pauses while this call reads (it finishes its current chunk first).
+    struct Reading {
+        std::atomic<bool>& flag;
+        explicit Reading(std::atomic<bool>& f) : flag(f) { flag.store(true, std::memory_order_relaxed); }
+        ~Reading() { flag.store(false, std::memory_order_relaxed); }
+    } reading{reading_};
     const std::size_t row_bytes = table_.row_bytes;
+    const std::uint64_t ram_blocks = ram_loaded_.load(std::memory_order_acquire);
     misses_.clear();
     for (std::size_t i = 0; i < rows.size(); ++i) {
         if (rows[i] >= table_.rows) { throw std::out_of_range("n-gram row id outside the table"); }
         const std::size_t slot = slot_of(rows[i]);
+        const std::uint64_t block = rows[i] / table_.rows_per_block;
         if (tags_[slot] == rows[i]) {
             std::memcpy(out.data() + i * row_bytes, cache_.data() + slot * row_bytes, row_bytes);
             ++counters_.hits;
+        } else if (block < ram_blocks) {
+            std::memcpy(out.data() + i * row_bytes,
+                        ram_.get() + block * table_.block_bytes + (rows[i] % table_.rows_per_block) * row_bytes, row_bytes);
+            ++counters_.ram;
         } else {
             misses_.push_back((static_cast<std::uint64_t>(rows[i] / table_.rows_per_block) << 32U) | i);
         }
@@ -188,6 +202,36 @@ void NgramVolume::set_keepalive(std::chrono::milliseconds period, std::chrono::m
         keepalive_thread_ = std::thread([this] { keepalive_loop(); });
     }
     keepalive_wake_.notify_all();
+}
+
+void NgramVolume::hold_in_ram(std::uint64_t bytes) {
+    if (ram_ || ram_thread_.joinable()) { throw std::logic_error("n-gram volume: hold_in_ram is called once"); }
+    const std::uint64_t held = ram_bytes(table_, bytes);
+    if (held == 0) { return; }
+    ram_.reset(static_cast<std::byte*>(::operator new[](held, std::align_val_t{4096})));
+    ram_wanted_ = held / table_.block_bytes;
+    ram_thread_ = std::thread([this] { ram_loader(); });
+}
+
+void NgramVolume::ram_loader() {
+    // 8 MiB sequential reads: a few ms each, so a read_rows call waits at most one chunk.
+    constexpr std::uint64_t kChunk = std::uint64_t{8} << 20;
+    const std::uint64_t total      = ram_wanted_ * table_.block_bytes;
+    std::uint64_t at               = 0;
+    try {
+        while (at < total && !ram_stop_.load(std::memory_order_relaxed)) {
+            if (reading_.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
+            }
+            const std::uint64_t n = std::min(kChunk, total - at);
+            if (file_.read_direct(table_.header_bytes + at, std::span<std::byte>(ram_.get() + at, n)) != n) { return; }
+            at += n;
+            ram_loaded_.store(at / table_.block_bytes, std::memory_order_release);
+        }
+    } catch (...) {
+        // The loaded blocks keep serving; the rest read from the volume as without hold_in_ram.
+    }
 }
 
 void NgramVolume::keepalive_loop() {

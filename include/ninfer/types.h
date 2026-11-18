@@ -527,6 +527,13 @@ struct FlashNextOptions {
     bool ngram_keepalive_ms_set   = false;
     bool ram_headroom_bytes_set   = false;
     bool cpu_verify_workers_set   = false;
+    // --ngram-ram-mib N|auto: hold up to this many bytes of the n-gram volume's blocks in RAM, so a
+    // prompt's rows in them are copied instead of read from the drive (a cold prompt's read shrinks
+    // by the held fraction). Only what the RAM ledger spares after the experts, the context cache,
+    // every other planned allocation, the reserve and a further 2 GiB; kNgramRamAuto takes all of
+    // that. 0 (the default) is off. Loaded in the background after startup. The same output.
+    static constexpr std::uint64_t kNgramRamAuto = ~std::uint64_t{0};
+    std::uint64_t ngram_ram_bytes = 0;
     // The VRAM expert cache's saved state: read at startup to fill the cache with the experts the
     // last session used most (warm start), written at shutdown and between requests every 10
     // minutes. Empty uses `<artifact>.expert-state`; `save_expert_state = false` neither reads nor

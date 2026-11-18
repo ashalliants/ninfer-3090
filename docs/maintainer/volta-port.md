@@ -296,7 +296,17 @@ Working with the 3.3 GB/s eGPU link (Flash-Next, measured 2026-11-17):
   3.9K tokens 5.15-5.25 -> 5.07-5.08 s; 939 tokens 1.87-2.05 -> 1.83-1.84 s; 2,149 tokens 3.46-3.48
   -> 3.38 s. The read itself (46K random 4 KiB reads, 0.85 s) is the drive's limit: the YMTC
   PC300-256GB (gen4 x4, no I/O scheduler) plateaus at ~43K random reads/s at any queue depth or
-  span (~115 us at depth 1). Making it faster would mean holding part of the 29 GB volume in RAM.
+  span (~115 us at depth 1).
+- `--ngram-ram-mib N|auto` (opt-in; `NINFER_NGRAM_RAM_MIB=auto` through `run-v100.sh`) holds a
+  prefix of the volume's blocks in pageable RAM, loaded by a background thread in 8 MiB sequential
+  reads (2.7 GB/s) that pause while a request reads rows. Rows hash uniformly over the blocks, so a
+  held fraction f serves ~f of a cold prompt's rows. The engine fits it last
+  (`fit_ngram_ram`): after the experts, the context cache's Host tier, every planned allocation
+  and the reserve, with 2 GiB more left free. On this 59 GiB host `auto` holds 13.1 of 27.1 GiB
+  (48% of the blocks); the context cache keeps its 4 GiB and ~6 GiB stays available with no new
+  swapping. A 3.9K-token prompt reads 27K blocks instead of 46K (0.50 s instead of 0.86): 4.97-5.05
+  -> 4.67-4.79 s; 344 tokens 0.90-0.92 -> 0.84 s, 939 tokens 1.82-2.00 -> 1.68-1.71 s, 3,726 tokens
+  4.78-4.80 -> 4.61 s; the same reply. The request log line counts rows served from RAM.
 
 Serving on a V100: `scripts/run-v100.sh <model>` is run.sh with the V100's defaults (the sm_70
 server from build-v100/, the memory-lock fallback, a GPU check). For Flash-Next it keeps run.sh's
