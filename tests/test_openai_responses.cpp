@@ -1472,6 +1472,106 @@ int test_reasoning_summary_options() {
     return failures;
 }
 
+// Codex and the Agents SDK send include=["reasoning.encrypted_content"] on every request that
+// has reasoning on, so the server must honour it rather than answer 400 include_not_supported.
+int test_include_reasoning_encrypted_content() {
+    const Json base = {{"model", "m"}, {"input", "hello"}, {"store", false}};
+    int failures    = 0;
+
+    Json with_include       = base;
+    with_include["include"] = Json::array({"reasoning.encrypted_content"});
+    OpenAIResponsesCreateRequest request;
+    const std::string rejected =
+        api_code([&] { request = parse_openai_responses_create_request(with_include, limits()); });
+    failures +=
+        check(rejected.empty(), "include=[reasoning.encrypted_content] was rejected: " + rejected);
+
+    Json unknown       = base;
+    unknown["include"] = Json::array({"message.output_text.logprobs"});
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(unknown, limits());
+                      }) == "include_not_supported",
+                      "an include value with no representation is still rejected");
+    Json not_string       = base;
+    not_string["include"] = Json::array({1});
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(not_string, limits());
+                      }).param == "include",
+                      "a non-string include entry is rejected on the include param");
+
+    // Without the request, the reasoning item carries no encrypted_content; with it, it does.
+    const OpenAIResponsesCreateRequest plain =
+        parse_openai_responses_create_request(base, limits());
+    const BuiltOpenAIResponse without =
+        make_openai_response_object("resp_a", 1, plain, {}, sample_outcome());
+    failures += check(!without.output_items.at(0).contains("encrypted_content"),
+                      "encrypted_content was emitted without being requested");
+    const BuiltOpenAIResponse with =
+        make_openai_response_object("resp_b", 1, request, {}, sample_outcome());
+    const Json& item = with.output_items.at(0);
+    failures +=
+        check(item.contains("encrypted_content") && item.at("encrypted_content").is_string() &&
+                  with.body.at("output").at(0) == item,
+              "requested encrypted_content missing from the reasoning item");
+
+    // The OpenAI client replays only encrypted_content (store=false): it must restore the context.
+    Json stripped = item;
+    stripped.erase("content");
+    const auto replay_turns = [&](Json reasoning) {
+        return parse_openai_responses_create_request(
+                   Json{{"model", "m"},
+                        {"input",
+                         Json::array(
+                             {Json{{"type", "message"}, {"role", "user"}, {"content", "hello"}},
+                              std::move(reasoning),
+                              Json{{"type", "message"}, {"role", "user"}, {"content", "again"}}})},
+                        {"store", false}},
+                   limits())
+            .prompt.input_turns;
+    };
+    const std::vector<ChatTurn> restored = replay_turns(stripped);
+    failures += check(restored.size() == 3 && restored[1].reasoning_content == "thought",
+                      "encrypted_content did not restore the reasoning text");
+
+    // A token this server did not mint cannot be turned back into the model context.
+    Json foreign                 = stripped;
+    foreign["encrypted_content"] = "gAAAAABforeign";
+    failures +=
+        check(api_code([&] { (void)replay_turns(foreign); }) == "reasoning_content_not_supported",
+              "a foreign encrypted_content token was accepted");
+    Json tampered                 = stripped;
+    tampered["encrypted_content"] = item.at("encrypted_content").get<std::string>() + "!";
+    failures +=
+        check(api_code([&] { (void)replay_turns(tampered); }) == "reasoning_content_not_supported",
+              "a corrupted encrypted_content token was accepted");
+
+    // Streaming carries the same value on output_item.done and in the terminal response.
+    OpenAIResponsesCreateRequest stream_request = request;
+    stream_request.stream                       = true;
+    OpenAIResponsesEventStream stream("resp_c", 1, stream_request, {});
+    (void)stream.start();
+    std::vector<std::string> events            = stream.reasoning_delta("thought");
+    const OpenAIResponsesStreamFinish finished = stream.finish(sample_outcome());
+    events.insert(events.end(), finished.events_before_terminal.begin(),
+                  finished.events_before_terminal.end());
+    bool done_has_token = false;
+    for (const std::string& wire : events) {
+        const Json event = parse_event(wire);
+        if (event.at("type") == "response.output_item.done" &&
+            event.at("item").at("type") == "reasoning") {
+            done_has_token = event.at("item").value("encrypted_content", std::string()) ==
+                             item.at("encrypted_content").get<std::string>();
+        }
+    }
+    const Json terminal = parse_event(stream.terminal(finished.response));
+    failures += check(
+        done_has_token &&
+            terminal.at("response").at("output").at(0).value("encrypted_content", std::string()) ==
+                item.at("encrypted_content").get<std::string>(),
+        "streamed reasoning item lacks the requested encrypted_content");
+    return failures;
+}
+
 int test_response_object() {
     const OpenAIResponsesCreateRequest request =
         parse_openai_responses_create_request(Json{{"model", "m"},
@@ -1813,6 +1913,7 @@ int main() {
     failures += test_prompt_cache_key_retention();
     failures += test_reasoning_summary_options();
     failures += test_response_object();
+    failures += test_include_reasoning_encrypted_content();
     failures += test_sse_sequence_and_failures();
     failures += test_input_tokens_uses_shared_state_path();
     if (failures == 0) { std::cout << "ok\n"; }

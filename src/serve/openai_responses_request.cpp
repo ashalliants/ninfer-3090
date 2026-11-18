@@ -393,6 +393,16 @@ std::string parse_reasoning_item(const Json& item, Json& canonical) {
         text += part.at("text").get<std::string>();
         content.push_back(Json{{"type", "reasoning_text"}, {"text", part.at("text")}});
     }
+    // A token this server minted carries the raw reasoning, so a client that replays only
+    // encrypted_content (store=false) still restores the model's context.
+    if (text.empty() && has_encrypted) {
+        if (const auto decoded = decode_reasoning_token(item.at("encrypted_content"))) {
+            text = *decoded;
+            if (!text.empty()) {
+                content.push_back(Json{{"type", "reasoning_text"}, {"text", text}});
+            }
+        }
+    }
     if (text.empty() &&
         (has_encrypted || (item.contains("summary") && !item.at("summary").is_null() &&
                            !item.at("summary").empty()))) {
@@ -1470,9 +1480,14 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     }
     if (body.contains("include") && !body.at("include").is_null()) {
         if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
-        if (!body.at("include").empty()) {
-            bad_request("the requested additional response fields have no available response "
-                        "representation",
+        for (const Json& entry : body.at("include")) {
+            if (!entry.is_string()) { bad_request("include entries must be strings", "include"); }
+            if (entry.get<std::string>() == "reasoning.encrypted_content") {
+                out.include_reasoning_encrypted_content = true;
+                continue;
+            }
+            bad_request("the requested additional response field '" + entry.get<std::string>() +
+                            "' has no available response representation",
                         "include", "include_not_supported");
         }
     }
