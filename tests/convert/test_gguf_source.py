@@ -142,6 +142,21 @@ def test_missing_split_file_is_reported(tmp_path):
         GgufModel(first)
 
 
+def test_metadata_only_shard_may_end_before_its_alignment_padding(tmp_path):
+    # Unsloth's split GGUFs begin with a shard of metadata alone, cut at the end of the header: its
+    # aligned data start lies past the end of the file and nothing reads it.
+    unpadded = gguf_bytes([("general.architecture", 8, "x")], []).rstrip(b"\0")
+    assert len(unpadded) % 32 != 0
+    path = tmp_path / "meta.gguf"
+    path.write_bytes(unpadded)
+    assert GgufFile(path).tensors == {}
+    # A file that declares a tensor still must hold its data region.
+    truncated = gguf_bytes([], _two())
+    path.write_bytes(truncated[: truncated.index(b"x") + 40])
+    with pytest.raises(GgufError):
+        GgufFile(path)
+
+
 def _two(ne=(32, 2), type_id=8):
     return [("x", type_id, ne, tensor_bytes(type_id, ne)), ("y", 8, (32, 2), tensor_bytes(8, (32, 2), 1))]
 

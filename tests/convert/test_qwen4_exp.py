@@ -17,6 +17,7 @@ from tools.convert.recipe import Recipe
 from tools.convert.sources.gguf import GgufError, GgufModel
 
 from . import qwen4_exp_fixture as fixture
+from .gguf_writer import write_gguf
 from .qwen4_exp_verify import verify
 
 # Infernix a3edb450 parse_config's text keys (src/models/qwen4_exp/config.cpp:115-127).
@@ -351,6 +352,69 @@ def test_iq3_pack_dense_formats_are_copied(tmp_path):
     formats = {item["parameters"][0]: item["format"] for item in report["methods"]}
     for _, _, parameter, name in retyped.values():
         assert formats[parameter] == name
+
+
+# Unsloth's Dynamic GGUFs store tensors the model reads as BF16 as F32 (router, shared score, GDN a/b
+# projections, hyper-connection inject) or Q8_0 (hyper-connection mixers, PLE projections), and keep
+# a Q6_K token embedding and Q8_0 dense projections. The BF16 ones are stored as BF16, the F32 ones
+# exactly, the Q8_0 ones rounded once; the rest are copied as their own block formats.
+_BF16_RETYPED = {
+    "output_hc_down.weight": (fixture.Q8_0, (fixture.HC * fixture.H, fixture.LOW)),
+    "blk.0.hc_attn_down.weight": (fixture.Q8_0, (fixture.HC * fixture.H, fixture.LOW)),
+    "blk.0.hc_attn_inject.weight": (fixture.F32, (fixture.HC * fixture.H, fixture.HC)),
+    "blk.1.ple_key.weight": (fixture.Q8_0, (fixture.PLE_DIM * fixture.PLE_HEADS, fixture.HC * fixture.H)),
+    "blk.1.ple_value.weight": (fixture.Q8_0, (fixture.PLE_DIM * fixture.PLE_HEADS, fixture.H)),
+    "blk.0.ssm_alpha.weight": (fixture.F32, (fixture.H, 4)),
+    "blk.0.ssm_beta.weight": (fixture.F32, (fixture.H, 4)),
+    "blk.2.ffn_gate_inp.weight": (fixture.F32, (fixture.H, fixture.E)),
+    "blk.2.ffn_gate_inp_shexp.weight": (fixture.F32, (fixture.H,)),
+}
+
+
+def test_unsloth_style_tensors_are_stored_as_bf16(tmp_path):
+    retyped = {
+        **_BF16_RETYPED,
+        "token_embd.weight": (fixture.Q6_K, (fixture.H, 16)),
+        "blk.0.attn_qkv.weight": (fixture.Q6_K, (fixture.H, 128)),
+    }
+    extra = tuple((name, kind, ne) for name, (kind, ne) in retyped.items())
+    path = fixture.write(tmp_path / "unsloth.gguf", drop=tuple(retyped), extra=extra)
+    out = tmp_path / "unsloth.ninfer"
+    with GgufModel(path) as gguf:
+        report = _convert(gguf, out)
+        summary = verify(out, gguf, volume=str(out) + ".ngram")
+    # hc_attn_down + inject are one packed object, so layer 0's two mixers count as one Q8_0 object
+    # each: the packed pair, output_hc_down, the PLE key/value pair, and the F32-only objects.
+    assert summary["bf16_from_q8_0"] == 3 and summary["bf16_from_f32"] == 3
+    formats = {item["parameters"][0]: item["format"] for item in report["methods"]}
+    for parameter in (
+        "text/final_mixer/down", "text/layers/0/attn_hc/down", "text/layers/1/ple/key",
+        "text/layers/0/gdn/a_projection", "text/layers/2/moe/router", "text/layers/2/moe/shared_score",
+    ):
+        assert formats[parameter] == "bf16", parameter
+    assert formats["text/token_embedding"] == "ggml_q6_k"
+    assert formats["text/layers/0/gdn/qkv"] == "ggml_q6_k"
+
+
+def test_f32_tensors_read_as_bf16_must_be_bf16_words(tmp_path):
+    name = "blk.2.ffn_gate_inp.weight"
+    tensors = [
+        (n, kind, ne, np.full(fixture.H * fixture.E, 0.1, "<f4").tobytes() if n == name else data)
+        for n, kind, ne, data in fixture.tensors(drop=(name,), extra=((name, fixture.F32, (fixture.H, fixture.E)),))
+    ]
+    path = write_gguf(tmp_path / "inexact.gguf", fixture.metadata(), tensors)
+    with GgufModel(path) as gguf, pytest.raises(GgufError, match=r"blk\.2\.ffn_gate_inp\.weight: .* are not BF16 words"):
+        qwen4_exp.build_model(gguf)
+
+
+def test_bf16_rounding_is_to_nearest_even():
+    wide = torch.tensor([1.0, 1.0 + 2.0**-8, 1.0 + 3 * 2.0**-8, 0.1])
+    narrow, rounded = qwen4_exp.bf16_for_model("n", wide, exact_only=False)
+    # 1 + 2^-8 is a tie between 1 and 1 + 2^-7 (to even: 1); 1 + 3 * 2^-8 ties up to 1 + 2^-6.
+    assert narrow.float().tolist()[:3] == [1.0, 1.0, 1.0 + 2.0**-6]
+    assert rounded == 3
+    with pytest.raises(GgufError, match="are not BF16 words"):
+        qwen4_exp.bf16_for_model("n", wide, exact_only=True)
 
 
 def test_mtp_drafter_is_stored_exactly(tmp_path):
