@@ -78,6 +78,8 @@ struct GenerationOutcome {
     std::string text;
     std::string reasoning;
     std::vector<ninfer::TokenId> generated_token_ids;
+    // One entry per generated token when the request asked for logprobs.
+    std::vector<ninfer::TokenLogprob> token_logprobs;
     std::vector<ninfer::GeneratedToolCall> tool_calls;
     ninfer::ToolCallParseDiagnostics tool_call_parse;
     int prompt_tokens     = 0;

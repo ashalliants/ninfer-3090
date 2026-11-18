@@ -77,6 +77,8 @@ struct RequestBasePlanImpl {
     runtime::RequestPlanSummary summary;
     qwen3_5::PreparedContextCache context_cache;
     ops::SamplingConfig sampling;
+    // Return the first generated token's log-probabilities, with this many alternatives.
+    std::optional<std::uint32_t> logprobs_top_k;
     std::shared_ptr<const VisionControlPlan> vision_control_plan;
     std::vector<CaptureGroup> capture_groups;
     std::shared_ptr<const PreparedCaptureBacking> capture_backing;
@@ -649,6 +651,13 @@ public:
     std::vector<std::weak_ptr<const GapMap>> gap_map_registry;
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
+    // The first token's log-probabilities, written by the prefill step that samples it (see
+    // execution::LogprobsOutput): chosen at 0, the top ids at kLogprobsIdsOffset and the top values
+    // at kLogprobsValuesOffset, each up to ops::kTopLogprobsMaxK long.
+    static constexpr std::size_t kLogprobsIdsOffset    = 64;
+    static constexpr std::size_t kLogprobsValuesOffset = 192;
+    static constexpr std::size_t kLogprobsScratchBytes = 320;
+    DeviceBuffer logprobs_scratch;
     Tensor grammar_masks_device;
     std::optional<PinnedHostBuffer> grammar_masks_host;
     std::optional<DFlashDraftHandoff> dflash_draft_handoff;

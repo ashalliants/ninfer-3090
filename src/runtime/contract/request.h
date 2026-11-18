@@ -14,6 +14,7 @@ struct ResolvedExecutionOptions {
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;
+    std::optional<std::uint32_t> logprobs_top_k;
 };
 
 struct ResolvedRequestOptions {

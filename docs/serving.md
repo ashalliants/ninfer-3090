@@ -1305,8 +1305,8 @@ The endpoint supports:
 - Assistant `reasoning_content` and `reasoning` history aliases.
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
-behavior. This includes nonzero `logit_bias`, requested log probabilities,
-audio/file input or audio output, explicit low/high image detail, web search,
+behavior. This includes nonzero `logit_bias`, log probabilities beyond the single-token
+[Chat form](#chat-log-probabilities), audio/file input or audio output, explicit low/high image detail, web search,
 moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
 
@@ -1681,6 +1681,31 @@ finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a
 and reasoning-token details; choices carry `logprobs: null` when log probabilities were not
 requested, and aggregate assistant messages carry `refusal: null` because refusal output is not
 supported.
+
+### Chat log probabilities
+
+`logprobs: true` on Chat Completions returns the log-probability of the generated token and, with
+`top_logprobs` (0 to 20), of its most likely alternatives in `choices[0].logprobs.content`. It is
+built for classification, multiple-choice scoring and calibration, where one answer token carries
+the result:
+
+```json
+{"model": "qwen3.8-27b", "messages": [{"role": "user", "content": "Answer A, B, C or D: ..."}],
+ "max_tokens": 1, "temperature": 0, "logprobs": true, "top_logprobs": 5,
+ "chat_template_kwargs": {"enable_thinking": false}}
+```
+
+Each entry has `token`, `logprob` and `bytes` (the token's exact bytes, which are not always valid
+UTF-8 alone: `token` then shows U+FFFD for the broken part), plus `top_logprobs` in the same shape,
+best first. The values are the model's own distribution, a softmax over the raw logits before
+temperature, penalties, filters and grammar masks, so they do not change with the sampling
+settings.
+
+Only the first generated token is supported, so the request must be non-streaming, set
+`max_tokens` (or `max_completion_tokens`) to `1`, and have thinking disabled (otherwise the first
+token is reasoning). Anything else fails with `logprobs_not_supported`. The Responses endpoint
+still refuses nonzero `top_logprobs`, and the Anthropic endpoint has no log-probability field.
+Multi-token log probabilities are not available yet.
 
 ### Chat custom tools
 

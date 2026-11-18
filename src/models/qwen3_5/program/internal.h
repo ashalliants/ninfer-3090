@@ -18,6 +18,10 @@ struct ContractAccess {
         pending.constraint_failed_.at(row) = failed;
     }
 
+    static void first_token_logprobs(PendingBatch& pending,
+                                     std::optional<runtime::TokenLogprobs> logprobs) {
+        pending.first_token_logprobs_ = std::move(logprobs);
+    }
     static void token_domain_failed(PendingBatch& pending, std::size_t row, bool failed) {
         pending.token_domain_failed_.at(row) = failed;
     }

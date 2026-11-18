@@ -208,6 +208,8 @@ struct RequestRecord {
     std::optional<BeginSummary> admitted_begin;
     std::optional<BeginSummary> begin;
     std::vector<TokenId> generated;
+    // The first generated token's log-probabilities, when the request asked for them.
+    std::vector<TokenLogprobs> token_logprobs;
     std::string content;
     std::string reasoning;
     std::optional<LaneId> lane;

@@ -128,6 +128,7 @@ public:
                       std::optional<compaction::SummaryRecord> record = std::nullopt) {
         ResolvedRequestOptions request;
         request.execution.requested_output_tokens = output_tokens;
+        request.execution.logprobs_top_k          = logprobs_top_k;
         PromptSummary summary;
         summary.prompt_tokens =
             record && record->rewrite ? record->rewrite->original_tokens : prompt.tokens;
@@ -151,6 +152,14 @@ public:
             } catch (...) { promise->set_exception(std::current_exception()); }
         });
         return result;
+    }
+
+    // Asks for the first token's log-probabilities on later runs, and sets what the fake Program
+    // reports for them.
+    std::optional<std::uint32_t> logprobs_top_k;
+
+    void report_begin_logprobs(TokenLogprobs logprobs) {
+        instance_.program->begin_logprobs = std::move(logprobs);
     }
 
     // Gives the Engine a context store backed by a bucket. The store must outlive the Rig. Each
@@ -307,6 +316,38 @@ void test_a_request_runs_to_completion() {
     require(rig.count(Event::Kind::Decode) == 2, "unexpected number of decode rounds\n" + rig.dump());
     require(rig.count(Event::Kind::Finish) == 1 && rig.count(Event::Kind::Bind) == 1,
             "the request did not bind and finish once\n" + rig.dump());
+}
+
+static_assert(EngineCore<fake::Instance>::kLogprobsCapable,
+              "the fake must model the logprob Program contract the Engine uses");
+
+void test_first_token_logprobs_reach_the_result() {
+    Rig rig({.chunk = 256, .lanes = 1});
+    TokenLogprobs reported;
+    reported.chosen       = -0.5F;
+    reported.count        = 2;
+    reported.top_ids      = {7, 9};
+    reported.top_logprobs = {-0.5F, -1.75F};
+
+    // Not asked for: the Program reports none and the result has none.
+    auto plain = rig.run(1, 300, 1);
+    require(finished(plain), "the request did not finish\n" + rig.dump());
+    require(plain.get().token_logprobs.empty(), "logprobs appeared on a request that did not ask");
+
+    rig.report_begin_logprobs(reported);
+    rig.logprobs_top_k = 2;
+    auto asked         = rig.run(2, 300, 1);
+    require(finished(asked), "the request did not finish\n" + rig.dump());
+    const GenerationResult generation = asked.get();
+    require(generation.generated_token_ids.size() == 1 && generation.token_logprobs.size() == 1,
+            "one generated token did not give one logprob entry");
+    const TokenLogprob& entry = generation.token_logprobs[0];
+    require(entry.sampled.token == 7 && entry.sampled.logprob == -0.5F &&
+                entry.sampled.bytes == "tok7",
+            "the generated token's logprob entry is wrong");
+    require(entry.top.size() == 2 && entry.top[1].token == 9 && entry.top[1].logprob == -1.75F &&
+                entry.top[1].bytes == "tok9",
+            "the alternatives were not reported best first with their bytes");
 }
 
 // Long output keeps a lane decoding while another request prefills.
@@ -2455,6 +2496,7 @@ int main() {
         }
     };
     run("a request runs to completion", test_a_request_runs_to_completion);
+    run("first-token logprobs reach the result", test_first_token_logprobs_reach_the_result);
     run("stall budget caps steps next to a decoding lane",
         test_stall_budget_caps_steps_next_to_a_decoding_lane);
     run("stall budget leaves a lone prefill alone", test_stall_budget_leaves_a_lone_prefill_alone);

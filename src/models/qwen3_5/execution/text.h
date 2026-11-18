@@ -32,6 +32,16 @@ enum class GdnStateAction : std::uint8_t {
     RecordForReplay,
 };
 
+// Where the first generated token's log-probabilities go (ops::top_logprobs), for a request that
+// asked for them. Device tensors the Program owns and reads back once the prefill step has
+// synchronized: chosen is FP32 [1], top_ids I32 [k,1], top_logprobs FP32 [k,1].
+struct LogprobsOutput {
+    std::int32_t k = 0;
+    Tensor chosen;
+    Tensor top_ids;
+    Tensor top_logprobs;
+};
+
 struct NullTap {
     static constexpr bool enabled = false;
 };
@@ -129,6 +139,10 @@ public:
     void set_rope_delta(std::int32_t delta) noexcept { rope_delta_ = delta; }
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
+
+    // When set, a prefill chunk that samples the first token also writes that token's
+    // log-probabilities here, from the same logits.
+    void set_logprobs(const LogprobsOutput* output) noexcept { logprobs_ = output; }
 
     // Present when the model is split over several devices; see StageRuntime.
     void set_stage_runtime(StageRuntime* runtime) noexcept { stage_runtime_ = runtime; }
@@ -354,6 +368,7 @@ private:
     const std::int32_t* proposal_head_ids_      = nullptr;
     int proposal_head_n_                        = 0;
     const ops::SamplingConfig* sampling_config_ = nullptr;
+    const LogprobsOutput* logprobs_             = nullptr;
     const MtpParameters* mtp_                   = nullptr;
     StageRuntime* stage_runtime_                = nullptr;
     NumericTripwire* tripwire_                  = nullptr;

@@ -202,6 +202,9 @@ struct GenerationRequest {
     // The request omitted its limit and the server has no fixed default: GenerationService replaces
     // max_tokens (then the --max-context upper bound) with the prompt's remaining context.
     bool derive_output_budget = false;
+    // Return the log-probabilities of the (single) generated token and of this many alternatives.
+    // The wire adapter has already required a one-token, non-streaming request.
+    std::optional<std::uint32_t> logprobs_top_k;
     std::optional<bool> enable_thinking;      // unset => use the server default
     std::optional<std::uint32_t> thinking_budget;
     std::optional<RequestedReasoningEffort> reasoning_effort;

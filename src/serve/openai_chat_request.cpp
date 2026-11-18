@@ -117,26 +117,6 @@ void validate_standard_output_controls(const Json& body) {
             }
         }
     }
-    if (body.contains("logprobs") && !body.at("logprobs").is_null()) {
-        if (!body.at("logprobs").is_boolean()) {
-            bad_request("logprobs must be a boolean", "logprobs");
-        }
-        if (body.at("logprobs").get<bool>()) {
-            bad_request("logprobs=true requires per-token log probabilities in the response, which "
-                        "NInfer does not provide",
-                        "logprobs", "logprobs_not_supported");
-        }
-    }
-    if (const std::optional<int> top_logprobs = optional_int(body, "top_logprobs")) {
-        if (*top_logprobs != 0) {
-            bad_request(
-                "nonzero top_logprobs requires alternative-token probabilities in the response, "
-                "which NInfer does not provide",
-                "top_logprobs", "logprobs_not_supported");
-        }
-    }
-
-
     if (body.contains("modalities") && !body.at("modalities").is_null()) {
         const Json& modalities = body.at("modalities");
         if (!modalities.is_array() || modalities.empty()) {
@@ -934,6 +914,40 @@ void parse_stream_options(const Json& body, OpenAIChatRequest& output) {
     }
 }
 
+// logprobs/top_logprobs: the first generated token's log-probabilities. That is all the Engine can
+// return today, so the request must be one non-streaming single-token completion; the generation
+// service additionally requires thinking to be off.
+void parse_logprobs(const Json& body, OpenAIChatRequest& output) {
+    bool logprobs = false;
+    if (body.contains("logprobs") && !body.at("logprobs").is_null()) {
+        if (!body.at("logprobs").is_boolean()) {
+            bad_request("logprobs must be a boolean", "logprobs");
+        }
+        logprobs = body.at("logprobs").get<bool>();
+    }
+    const std::optional<int> top_logprobs = optional_int(body, "top_logprobs");
+    if (top_logprobs && (*top_logprobs < 0 || *top_logprobs > 20)) {
+        bad_request("top_logprobs must be in [0,20]", "top_logprobs");
+    }
+    if (!logprobs) {
+        if (top_logprobs && *top_logprobs != 0) {
+            bad_request("top_logprobs requires logprobs to be true", "top_logprobs",
+                        "logprobs_not_supported");
+        }
+        return;
+    }
+    if (output.stream) {
+        bad_request("logprobs are not available for streaming responses", "logprobs",
+                    "logprobs_not_supported");
+    }
+    if (!output.output_tokens_explicit || output.generation.max_tokens != 1) {
+        bad_request("logprobs are available for a single generated token only: set max_tokens "
+                    "(or max_completion_tokens) to 1",
+                    "logprobs", "logprobs_not_supported");
+    }
+    output.generation.logprobs_top_k = static_cast<std::uint32_t>(top_logprobs.value_or(0));
+}
+
 void parse_response_observations(const Json& body, OpenAIChatRequest& output) {
     output.timings_per_token = get_bool(body, "timings_per_token", false);
     output.return_progress   = get_bool(body, "return_progress", false);
@@ -980,6 +994,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_stream_options(body, output);
     parse_response_observations(body, output);
     parse_output_limit(body, limits, output);
+    parse_logprobs(body, output);
     parse_reasoning_effort(body, output.generation);
     const TemplateOptions template_options      = parse_template_options(body);
     output.generation.enable_thinking           = template_options.enable_thinking;

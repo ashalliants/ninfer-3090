@@ -1155,6 +1155,100 @@ OpenAIChatResponseIdentity identity() {
     return OpenAIChatResponseIdentity{.id = "chatcmpl-test", .model = "qwen", .created = 42};
 }
 
+Json logprobs_request(Json extra = Json::object()) {
+    Json body          = base_request();
+    body["logprobs"]   = true;
+    body["max_tokens"] = 1;
+    for (auto it = extra.begin(); it != extra.end(); ++it) { body[it.key()] = it.value(); }
+    return body;
+}
+
+int test_logprobs_request() {
+    int failures = 0;
+
+    const OpenAIChatRequest accepted = parse(logprobs_request(Json{{"top_logprobs", 5}}));
+    failures += check(accepted.generation.logprobs_top_k == 5U,
+                      "logprobs with a one-token budget requests the top alternatives");
+    failures += check(parse(logprobs_request()).generation.logprobs_top_k == 0U,
+                      "logprobs without top_logprobs requests the chosen token only");
+    failures +=
+        check(parse(logprobs_request(Json{{"max_completion_tokens", 1}, {"max_tokens", nullptr}}))
+                      .generation.logprobs_top_k == 0U,
+              "max_completion_tokens=1 also satisfies the one-token rule");
+    failures += check(!parse(base_request()).generation.logprobs_top_k,
+                      "a request that does not ask for logprobs does not request them");
+
+    const auto rejected_with = [&](Json body, const char* param, const char* code) {
+        const ApiError error = api_error([&] { (void)parse(std::move(body)); });
+        return error.param == param && error.code == code;
+    };
+    failures += check(rejected_with(logprobs_request(Json{{"max_tokens", 2}}), "logprobs",
+                                    "logprobs_not_supported"),
+                      "logprobs with more than one output token is refused");
+    Json no_limit        = base_request();
+    no_limit["logprobs"] = true;
+    failures += check(rejected_with(no_limit, "logprobs", "logprobs_not_supported"),
+                      "logprobs without an explicit one-token limit is refused");
+    failures += check(rejected_with(logprobs_request(Json{{"stream", true}}), "logprobs",
+                                    "logprobs_not_supported"),
+                      "streamed logprobs are refused");
+    failures +=
+        check(rejected_with(logprobs_request(Json{{"top_logprobs", 21}}), "top_logprobs", ""),
+              "top_logprobs above 20 is refused");
+    failures +=
+        check(rejected_with(logprobs_request(Json{{"top_logprobs", -1}}), "top_logprobs", ""),
+              "negative top_logprobs is refused");
+    Json orphan            = base_request();
+    orphan["top_logprobs"] = 3;
+    failures += check(rejected_with(orphan, "top_logprobs", "logprobs_not_supported"),
+                      "top_logprobs without logprobs is refused");
+    failures += check(rejected_with(logprobs_request(Json{{"logprobs", "yes"}}), "logprobs", ""),
+                      "a non-boolean logprobs is refused");
+
+    // An Engine that cannot carry logprobs refuses with its own kind, which maps to the same
+    // structured error as the wire-level refusals (not the generic invalid-prompt one).
+    const ApiError unsupported = request_error_to_api_error(
+        ninfer::RequestError(ninfer::RequestErrorKind::LogprobsNotSupported,
+                             "this model does not return token log-probabilities"));
+    failures += check(unsupported.status == 400 && unsupported.param == "logprobs" &&
+                          unsupported.code == "logprobs_not_supported",
+                      "an Engine logprobs refusal maps to logprobs_not_supported");
+
+    ServeOptions server;
+    failures +=
+        check(to_request_options(accepted.generation, server, semantics(accepted.generation), true)
+                      .execution.logprobs_top_k == 5U,
+              "the request's top-k reaches the Engine options");
+    return failures;
+}
+
+int test_logprobs_response() {
+    int failures              = 0;
+    GenerationOutcome outcome = sample_outcome();
+    outcome.token_logprobs.push_back(
+        ninfer::TokenLogprob{.sampled = {.token = 65, .logprob = -0.25F, .bytes = "A"},
+                             .top     = {{.token = 65, .logprob = -0.25F, .bytes = "A"},
+                                         // The first two bytes of "€": not UTF-8 on their own.
+                                         {.token = 99, .logprob = -3.5F, .bytes = "\xE2\x82"}}});
+    const Json response  = Json::parse(make_chat_completion_response(identity(), outcome));
+    const Json& logprobs = response["choices"][0]["logprobs"];
+    failures += check(logprobs["content"].size() == 1 && logprobs["refusal"].is_null(),
+                      "logprobs carry one content entry per generated token");
+    const Json& entry = logprobs["content"][0];
+    failures += check(entry["token"] == "A" && entry["logprob"] == -0.25 &&
+                          entry["bytes"] == Json::array({65}),
+                      "the generated token is reported with its text, logprob and bytes");
+    failures +=
+        check(entry["top_logprobs"].size() == 2 && entry["top_logprobs"][0]["token"] == "A" &&
+                  entry["top_logprobs"][1]["logprob"] == -3.5,
+              "alternatives are listed best first");
+    failures +=
+        check(entry["top_logprobs"][1]["bytes"] == Json::array({0xE2, 0x82}) &&
+                  entry["top_logprobs"][1]["token"] == "\xEF\xBF\xBD\xEF\xBF\xBD",
+              "a partial multi-byte token keeps exact bytes and a replacement-character text");
+    return failures;
+}
+
 int test_aggregate_response() {
     int failures              = 0;
     GenerationOutcome outcome = sample_outcome();
@@ -1616,6 +1710,8 @@ int main() {
     failures += test_messages_and_media();
     failures += test_reasoning_and_extensions();
     failures += test_stops_and_ranges();
+    failures += test_logprobs_request();
+    failures += test_logprobs_response();
     failures += test_aggregate_response();
     failures += test_stream_response();
     failures += test_custom_tool_responses();

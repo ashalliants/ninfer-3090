@@ -281,8 +281,15 @@ public:
     [[nodiscard]] bool token_domain_failed(std::size_t row) const {
         return row < domain_failed_.size() && domain_failed_[row];
     }
+
+    [[nodiscard]] const std::optional<TokenLogprobs>&
+    first_token_logprobs(std::size_t row) const noexcept {
+        static const std::optional<TokenLogprobs> none;
+        return row == 0 ? first_logprobs_ : none;
+    }
     [[nodiscard]] ExecutionTiming execution_timing() const noexcept { return timing_; }
 
+    std::optional<TokenLogprobs> first_logprobs_; // a Begin row's, when the request asked
     std::vector<SequenceHandle> rows_;
     std::vector<TokenId> tokens_;
     std::vector<bool> domain_failed_; // a row whose sampled token left the vocabulary
@@ -501,6 +508,10 @@ private:
 
 struct Frontend {
     [[nodiscard]] std::uint32_t thinking_control_token_count() const noexcept { return 0; }
+
+    [[nodiscard]] std::string token_bytes(TokenId token) const {
+        return "tok" + std::to_string(token);
+    }
     template <class... Options>
     [[nodiscard]] OutputSession make_output_session(const PreparedPrompt&, const Options&...) const {
         return {};
@@ -867,6 +878,10 @@ public:
     }
 
     // ---- execution ----
+    // What a Begin row reports as its first token's log-probabilities (a real Program reads them
+    // from the device, and only for a request that asked).
+    std::optional<TokenLogprobs> begin_logprobs;
+
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   ExecutionTiming* = nullptr,
                                                   TokenMaskProvider* = nullptr,
@@ -942,7 +957,8 @@ public:
             PendingBatch batch;
             batch.rows_.push_back(sequence);
             batch.tokens_.push_back(7);
-            progress.pending = std::move(batch);
+            batch.first_logprobs_ = begin_logprobs;
+            progress.pending      = std::move(batch);
             lane.pending     = true;
         }
         return progress;

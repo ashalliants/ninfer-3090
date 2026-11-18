@@ -220,6 +220,7 @@ void ProgramImpl::install_compacted_prompt(std::uint32_t lane, PreparedPromptDat
     rebased->summary.prompt_tokens      = static_cast<std::uint32_t>(compacted.token_ids.size());
     rebased->context_cache              = compacted.context_cache;
     rebased->sampling                   = original.sampling;
+    rebased->logprobs_top_k             = original.logprobs_top_k;
     rebased->allow_prefix_reuse         = original.allow_prefix_reuse;
     rebased->gap_maps                   = original.gap_maps;
     rebased->gap_maps.push_back(map);
