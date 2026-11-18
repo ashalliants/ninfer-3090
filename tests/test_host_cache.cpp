@@ -326,11 +326,33 @@ int check_draft_context_rows() {
     return failures;
 }
 
+// A Qwen3.8 dense model reads --vram-headroom-mib only through the context fit, so the flag without
+// one is refused (naming --fit-context) rather than silently ignored.
+int check_headroom_needs_fit() {
+    using ninfer::runtime::validate_headroom_use;
+    int failures = 0;
+    ninfer::EngineOptions options;
+    const auto refusal = [](const ninfer::EngineOptions& value) {
+        try {
+            validate_headroom_use(value);
+        } catch (const std::invalid_argument& error) { return std::string(error.what()); }
+        return std::string();
+    };
+    failures += check(refusal(options).empty(), "no headroom flag was refused");
+    options.flash_next.vram_headroom_bytes = 64ULL << 20;
+    failures += check(refusal(options).find("--fit-context") != std::string::npos,
+                      "--vram-headroom-mib without --fit-context was not refused naming --fit-context");
+    options.fit_context_floor = 32768;
+    failures += check(refusal(options).empty(), "--vram-headroom-mib with --fit-context was refused");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
     failures += check_automatic_normalization();
+    failures += check_headroom_needs_fit();
     failures += check_relaxed_drafting();
     failures += check_draft_context_rows();
     failures += check_fork_options_accepted();

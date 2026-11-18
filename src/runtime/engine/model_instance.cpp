@@ -265,6 +265,17 @@ void fit_context_to_device(EngineOptions& options, ModelInstance& instance, Devi
 
 } // namespace
 
+// The only thing a Qwen3.8 dense model reads --vram-headroom-mib for is the context fit; without
+// one it would be silently ignored, so refuse it and say what it is for.
+void validate_headroom_use(const EngineOptions& options) {
+    if (options.flash_next.vram_headroom_bytes && options.fit_context_floor == 0) {
+        throw std::invalid_argument(
+            "--vram-headroom-mib has no effect on this model without --fit-context MIN: it sets the "
+            "GPU memory the fitted context keeps spare (default 256 MiB). Add --fit-context, or "
+            "remove --vram-headroom-mib");
+    }
+}
+
 EngineOptions normalize_engine_options(EngineOptions options) {
     switch (options.purpose) {
     case EnginePurpose::Generation:
@@ -523,14 +534,7 @@ ResidencyTransition ModelInstance::resume(DeviceContext& device, DeviceSnapshot&
 
 ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) {
     validate_engine_options(options);
-    // The only thing a Qwen3.8 dense model reads --vram-headroom-mib for is the context fit; without
-    // one it would be silently ignored, so refuse it and say what it is for.
-    if (options.flash_next.vram_headroom_bytes && options.fit_context_floor == 0) {
-        throw std::invalid_argument(
-            "--vram-headroom-mib has no effect on this model without --fit-context MIN: it sets the "
-            "GPU memory the fitted context keeps spare (default 256 MiB). Add --fit-context, or "
-            "remove --vram-headroom-mib");
-    }
+    validate_headroom_use(options);
     const auto start = Clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     // Shared so a suspendable model can keep its files open and upload the weights again on resume.
