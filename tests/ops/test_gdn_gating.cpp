@@ -127,6 +127,33 @@ int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendental
                              from_device<float>(device_a_log, a_log.size()), a_log);
     failures += verify_exact((label + " dt_bias immutable").c_str(),
                              from_device<float>(device_dt_bias, dt_bias.size()), dt_bias);
+    if (decay) {
+        // gdn_gating_decay_packed: a and b as the halves of one [96,T] tensor, the same bits.
+        std::vector<std::uint16_t> ab_bits(2 * elements);
+        for (std::int32_t t = 0; t < tokens; ++t) {
+            for (int h = 0; h < kHeads; ++h) {
+                ab_bits[static_cast<std::size_t>(t) * 2 * kHeads + h] = a_bits[static_cast<std::size_t>(t) * kHeads + h];
+                ab_bits[static_cast<std::size_t>(t) * 2 * kHeads + kHeads + h] =
+                    b_bits[static_cast<std::size_t>(t) * kHeads + h];
+            }
+        }
+        DeviceBuffer device_ab = to_device(ab_bits);
+        GuardedDeviceBuffer packed_g(elements * sizeof(float));
+        GuardedDeviceBuffer packed_beta(elements * sizeof(float));
+        packed_g.fill(0xff);
+        packed_beta.fill(0xff);
+        Tensor tensor_ab(device_ab.p, DType::BF16, {2 * kHeads, tokens});
+        Tensor tensor_pg(packed_g.data(), DType::FP32, {kHeads, tokens});
+        Tensor tensor_pbeta(packed_beta.data(), DType::FP32, {kHeads, tokens});
+        ops::gdn_gating_decay_packed(tensor_ab, tensor_a_log, tensor_dt_bias, tensor_pg, tensor_pbeta, nullptr);
+        cuda_synchronize();
+        failures += verify_exact((label + " packed g").c_str(), read_fp32(packed_g.data(), elements),
+                                 read_fp32(device_g.data(), elements));
+        failures += verify_exact((label + " packed beta").c_str(), read_fp32(packed_beta.data(), elements),
+                                 read_fp32(device_beta.data(), elements));
+        failures += packed_g.verify_guards((label + " packed g").c_str());
+        failures += packed_beta.verify_guards((label + " packed beta").c_str());
+    }
     return failures;
 }
 

@@ -726,15 +726,18 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     project_pair(x, p.qkv, p.z, qkv, z, *work_, s, ggml_decode_mma_);
     Tensor ab = work_->alloc(DType::BF16, {2 * NV, T});
     project_verify(x, p.control, ab, batch.verify != nullptr);
-    Tensor a = work_->alloc(DType::BF16, {NV, T});
-    Tensor b = work_->alloc(DType::BF16, {NV, T});
-    {
-        Tensor* parts[] = {&a, &b};
-        ops::split_rows(ab, parts, s);
-    }
     Tensor gate = work_->alloc(DType::FP32, {NV, T});
     Tensor beta = work_->alloc(DType::FP32, {NV, T});
-    ops::gdn_gating_decay(a, b, p.decay, p.dt_bias, gate, beta, s);
+    // a and b straight from the control projection's halves (no split).
+    if (NV == 48) {
+        ops::gdn_gating_decay_packed(ab, p.decay, p.dt_bias, gate, beta, s);
+    } else {
+        Tensor a = work_->alloc(DType::BF16, {NV, T});
+        Tensor b = work_->alloc(DType::BF16, {NV, T});
+        Tensor* parts[] = {&a, &b};
+        ops::split_rows(ab, parts, s);
+        ops::gdn_gating_decay(a, b, p.decay, p.dt_bias, gate, beta, s);
+    }
 
     Tensor q = work_->alloc(DType::BF16, {KW, T});
     Tensor k = work_->alloc(DType::BF16, {KW, T});
@@ -1086,15 +1089,18 @@ Tensor Forward::gdn_rows(const GdnParameters& p, const Tensor& x, std::uint32_t 
     project_pair(x, p.qkv, p.z, qkv, z, *work_, s, ggml_decode_mma_);
     Tensor ab = work_->alloc(DType::BF16, {2 * NV, B});
     project_verify(x, p.control, ab, /*columnwise=*/true);
-    Tensor a = work_->alloc(DType::BF16, {NV, B});
-    Tensor b = work_->alloc(DType::BF16, {NV, B});
-    {
-        Tensor* parts[] = {&a, &b};
-        ops::split_rows(ab, parts, s);
-    }
     Tensor gate = work_->alloc(DType::FP32, {NV, B});
     Tensor beta = work_->alloc(DType::FP32, {NV, B});
-    ops::gdn_gating_decay(a, b, p.decay, p.dt_bias, gate, beta, s);
+    // a and b straight from the control projection's halves (no split).
+    if (NV == 48) {
+        ops::gdn_gating_decay_packed(ab, p.decay, p.dt_bias, gate, beta, s);
+    } else {
+        Tensor a = work_->alloc(DType::BF16, {NV, B});
+        Tensor b = work_->alloc(DType::BF16, {NV, B});
+        Tensor* parts[] = {&a, &b};
+        ops::split_rows(ab, parts, s);
+        ops::gdn_gating_decay(a, b, p.decay, p.dt_bias, gate, beta, s);
+    }
 
     // Each row's convolution window, read and replaced in its slot (the snapshot form at one column
     // per row: the same arithmetic as the single-sequence split form).
@@ -1340,15 +1346,18 @@ Tensor Forward::gdn_rows_verify(const GdnParameters& p, const Tensor& x, std::ui
     project_pair(x, p.qkv, p.z, qkv, z, *work_, s, ggml_decode_mma_);
     Tensor ab = work_->alloc(DType::BF16, {2 * NV, T});
     project_verify(x, p.control, ab, /*columnwise=*/true);
-    Tensor a = work_->alloc(DType::BF16, {NV, T});
-    Tensor b = work_->alloc(DType::BF16, {NV, T});
-    {
-        Tensor* parts[] = {&a, &b};
-        ops::split_rows(ab, parts, s);
-    }
     Tensor gate = work_->alloc(DType::FP32, {NV, T});
     Tensor beta = work_->alloc(DType::FP32, {NV, T});
-    ops::gdn_gating_decay(a, b, p.decay, p.dt_bias, gate, beta, s);
+    // a and b straight from the control projection's halves (no split).
+    if (NV == 48) {
+        ops::gdn_gating_decay_packed(ab, p.decay, p.dt_bias, gate, beta, s);
+    } else {
+        Tensor a = work_->alloc(DType::BF16, {NV, T});
+        Tensor b = work_->alloc(DType::BF16, {NV, T});
+        Tensor* parts[] = {&a, &b};
+        ops::split_rows(ab, parts, s);
+        ops::gdn_gating_decay(a, b, p.decay, p.dt_bias, gate, beta, s);
+    }
 
     Tensor q = work_->alloc(DType::BF16, {KW, T});
     Tensor k = work_->alloc(DType::BF16, {KW, T});

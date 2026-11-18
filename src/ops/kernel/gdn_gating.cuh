@@ -14,16 +14,19 @@ namespace ninfer::ops {
 
 // Decay = false: rate[h] holds A_log and the decay is -exp(A_log). Decay = true: rate[h] is the
 // decay itself (GGUF ssm_a = -exp(A_log)).
+// Element (h, t) of a and b is at t * ab_stride + h (48 for separate [48, T] tensors, 96 for the
+// halves of one [96, T] projection); g and beta are [48, T].
 template <bool Decay>
 __global__ void gdn_gating_kernel(const __nv_bfloat16* a, const __nv_bfloat16* b,
                                   const float* rate, const float* dt_bias, float* g, float* beta,
-                                  std::int64_t n) {
+                                  std::int64_t n, int ab_stride) {
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < n; i += stride) {
         const int h    = static_cast<int>(i % 48);
-        const float av = __bfloat162float(a[i]);
-        const float bv = __bfloat162float(b[i]);
+        const std::int64_t at = (i / 48) * ab_stride + h;
+        const float av = __bfloat162float(a[at]);
+        const float bv = __bfloat162float(b[at]);
         const float sp = softplus(av + dt_bias[h]);
         if constexpr (Decay) {
             g[i] = rate[h] * sp;
