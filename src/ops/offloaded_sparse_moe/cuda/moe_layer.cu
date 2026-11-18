@@ -148,6 +148,47 @@ __device__ __forceinline__ const std::uint8_t* job_record(const MoeExpertSource&
                       : source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride;
 }
 
+// MoeExpertSource::precast_input: the A8 cast of every column of x (BF16 [T][kHidden]) into codes
+// [T][kHidden] and scales [T][kXGroups], one thread per group, with the same cast the gate/up CTAs
+// apply otherwise (quantize_columns_bf16), so the codes are the same bits.
+// Four lanes per group (quantize_q8_1_part, the same bits): the one-thread form unrolls all 32
+// values (~700 instructions, run once per call with cold instruction caches on Volta).
+constexpr int kPrecastLanes = 4;
+
+__device__ __forceinline__ void precast_block(const bf16* __restrict__ x, int groups, std::int8_t* __restrict__ q,
+                                              float* __restrict__ d, int block) {
+    const int t    = block * kThreads + static_cast<int>(threadIdx.x);
+    const int i    = t / kPrecastLanes, part = t % kPrecastLanes;
+    const bool real = i < groups; // every lane of a warp joins the group's shuffles
+    const uint4 raw = real ? *reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(i) * canon::kA8Values + 8 * part)
+                           : make_uint4(0, 0, 0, 0);
+    const std::uint32_t bits[4] = {raw.x, raw.y, raw.z, raw.w};
+    float value[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        value[2 * j]     = __uint_as_float(bits[j] << 16);
+        value[2 * j + 1] = __uint_as_float(bits[j] & 0xFFFF0000U);
+    }
+    int words[2];
+    const float scale = ggml::quantize_q8_1_part<kPrecastLanes>(value, words);
+    if (!real) { return; }
+    *reinterpret_cast<int2*>(q + static_cast<std::size_t>(i) * canon::kA8Values + 8 * part) = make_int2(words[0], words[1]);
+    if (part == 0) { d[i] = scale; }
+}
+
+__global__ void __launch_bounds__(kThreads)
+    precast_kernel(const bf16* __restrict__ x, int groups, std::int8_t* __restrict__ q, float* __restrict__ d) {
+    precast_block(x, groups, q, d, static_cast<int>(blockIdx.x));
+}
+
+// A precast riding a stage launch: its CTAs follow the kStageCtas staging CTAs (groups == 0: none).
+struct PrecastJob {
+    const bf16* x  = nullptr;
+    int groups     = 0;
+    std::int8_t* q = nullptr;
+    float* d       = nullptr;
+};
+
 // ------------------------------------------------------------------------------------- staging
 
 constexpr int kStageCtas   = 16;    // with 16 KiB chunks, a 256 KiB window of host reads in flight
@@ -161,10 +202,14 @@ constexpr int kMaxPassJobs = 512;
 __global__ void __launch_bounds__(kThreads)
     stage_kernel(MoeDispatch dispatch, MoeExpertSource source, std::uint32_t record_bytes, int job_base,
                  int pass_jobs, const std::int32_t* __restrict__ cpu_flags,
-                 const std::uint8_t** __restrict__ job_records) {
+                 const std::uint8_t** __restrict__ job_records, PrecastJob precast = {}) {
     __shared__ int miss_jobs[kMaxPassJobs];
     __shared__ int warp_misses[kWarps];
     __shared__ int misses;
+    if (static_cast<int>(blockIdx.x) >= kStageCtas) {
+        precast_block(precast.x, precast.groups, precast.q, precast.d, static_cast<int>(blockIdx.x) - kStageCtas);
+        return;
+    }
     const int jobs = min(*dispatch.job_count - job_base, pass_jobs);
     if (jobs <= 0) { return; }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
@@ -217,7 +262,7 @@ __global__ void __launch_bounds__(kThreads)
     const int chunks = static_cast<int>((record_bytes + kStageChunk - 1) / kStageChunk);
     constexpr int kVec = kStageChunk / 16;
     const int total    = misses * chunks;
-    for (int c = blockIdx.x; c < total; c += gridDim.x) {
+    for (int c = blockIdx.x; c < total; c += kStageCtas) {
         const int m = c / chunks, offset = (c % chunks) * kStageChunk;
         const int bytes  = min(kStageChunk, static_cast<int>(record_bytes) - offset);
         const int expert = dispatch.jobs[miss_jobs[m]];
@@ -456,34 +501,6 @@ __device__ void quantize_columns_f32(Base base, int n, int groups, std::int8_t* 
             if (part == 0) { d[i] = scale; }
         }
     }
-}
-
-// MoeExpertSource::precast_input: the A8 cast of every column of x (BF16 [T][kHidden]) into codes
-// [T][kHidden] and scales [T][kXGroups], one thread per group, with the same cast the gate/up CTAs
-// apply otherwise (quantize_columns_bf16), so the codes are the same bits.
-// Four lanes per group (quantize_q8_1_part, the same bits): the one-thread form unrolls all 32
-// values (~700 instructions, run once per call with cold instruction caches on Volta).
-constexpr int kPrecastLanes = 4;
-
-__global__ void __launch_bounds__(kThreads)
-    precast_kernel(const bf16* __restrict__ x, int groups, std::int8_t* __restrict__ q, float* __restrict__ d) {
-    const int t    = static_cast<int>(blockIdx.x) * kThreads + static_cast<int>(threadIdx.x);
-    const int i    = t / kPrecastLanes, part = t % kPrecastLanes;
-    const bool real = i < groups; // every lane of a warp joins the group's shuffles
-    const uint4 raw = real ? *reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(i) * canon::kA8Values + 8 * part)
-                           : make_uint4(0, 0, 0, 0);
-    const std::uint32_t bits[4] = {raw.x, raw.y, raw.z, raw.w};
-    float value[8];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        value[2 * j]     = __uint_as_float(bits[j] << 16);
-        value[2 * j + 1] = __uint_as_float(bits[j] & 0xFFFF0000U);
-    }
-    int words[2];
-    const float scale = ggml::quantize_q8_1_part<kPrecastLanes>(value, words);
-    if (!real) { return; }
-    *reinterpret_cast<int2*>(q + static_cast<std::size_t>(i) * canon::kA8Values + 8 * part) = make_int2(words[0], words[1]);
-    if (part == 0) { d[i] = scale; }
 }
 
 // The precast codes and scales of `n` columns (column c is x column column(c)) into the shared
@@ -1609,6 +1626,8 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     const bool narrow = !wide || !moe::wide::all_wide(x.ne[1]);
     // The input's A8 cast, once for every pass's narrow gate/up CTAs (the wide route casts its own).
     PrecastInput precast;
+    PrecastJob precast_job;
+    int precast_job_ctas = 0;
     if (cast_given && narrow) {
         // The kernels only read the planes (PrecastInput also carries the planes the cast writes).
         precast.q = const_cast<std::int8_t*>(input.codes);
@@ -1617,10 +1636,19 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         require(reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0, "precast input needs 16-byte aligned x");
         const std::int64_t groups = static_cast<std::int64_t>(x.ne[1]) * kXGroups;
         require(groups <= std::numeric_limits<int>::max(), "precast input exceeds INT_MAX groups");
-        precast_kernel<<<grid_blocks(groups * kPrecastLanes, kThreads, kGridMaxX, "precast input exceeds the launch grid"), kThreads, 0,
-                         stream>>>(static_cast<const bf16*>(x.data), static_cast<int>(groups), layout.precast.q,
-                                   layout.precast.d);
-        check_launch("precast");
+        const int precast_ctas =
+            grid_blocks(groups * kPrecastLanes, kThreads, kGridMaxX, "precast input exceeds the launch grid");
+        if (source.staging_slots > 0) {
+            // In the first stage launch's grid (the gate/up kernels read it after that launch).
+            precast_job = PrecastJob{static_cast<const bf16*>(x.data), static_cast<int>(groups), layout.precast.q,
+                                     layout.precast.d};
+            precast_job_ctas = precast_ctas;
+        } else {
+            precast_kernel<<<precast_ctas, kThreads, 0, stream>>>(static_cast<const bf16*>(x.data),
+                                                                  static_cast<int>(groups), layout.precast.q,
+                                                                  layout.precast.d);
+            check_launch("precast");
+        }
         precast = layout.precast;
     }
     for (int base = 0; base < max_jobs; base += pass_jobs) {
@@ -1628,10 +1656,12 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         // Without staging the expert kernels resolve their records themselves.
         const std::uint8_t* const* records = nullptr;
         if (source.staging_slots > 0) {
-            stage_kernel<<<kStageCtas, kThreads, 0, stream>>>(dispatch, stage_source,
-                                                              static_cast<std::uint32_t>(geometry.bytes), base, jobs,
-                                                              flags, layout.job_records);
+            stage_kernel<<<kStageCtas + precast_job_ctas, kThreads, 0, stream>>>(
+                dispatch, stage_source, static_cast<std::uint32_t>(geometry.bytes), base, jobs, flags,
+                layout.job_records, precast_job);
             check_launch("stage");
+            precast_job      = PrecastJob{};
+            precast_job_ctas = 0;
             records = layout.job_records;
         }
         if (narrow) {
