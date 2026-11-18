@@ -95,17 +95,15 @@ bool sm70_tensor_cores_enabled() noexcept {
 #endif
 }
 
+namespace {
+std::atomic<std::uint64_t> g_sm70_fallbacks{0};
+} // namespace
+
 bool sm70_staging(WorkspaceArena* arena, int rows, int k, int tokens, Sm70Staging& out) {
     const std::size_t need = sm70_tensor_core_workspace_bytes(rows, k, tokens);
     if (need == 0) { return false; }
     if (arena == nullptr || arena->capacity() - arena->used() < need) {
-        static std::atomic<bool> reported{false};
-        if (!reported.exchange(true)) {
-            std::fprintf(stderr,
-                         "[sm70 tensor cores] a [%d, %d] call of %d tokens found %zu of the %zu workspace bytes it "
-                         "needs and kept the default kernels (reported once)\n",
-                         rows, k, tokens, arena == nullptr ? std::size_t{0} : arena->capacity() - arena->used(), need);
-        }
+        g_sm70_fallbacks.fetch_add(1, std::memory_order_relaxed); // ops::sm70_tensor_core_fallbacks
         return false;
     }
     const std::size_t r = static_cast<std::size_t>(rows), kk = static_cast<std::size_t>(k);
@@ -150,3 +148,11 @@ void sm70_tensor_core_gemm(const Sm70Staging& st, int rows, int k, const void* x
 }
 
 } // namespace ninfer::ops::detail
+
+namespace ninfer::ops {
+
+std::uint64_t sm70_tensor_core_fallbacks() noexcept {
+    return detail::g_sm70_fallbacks.load(std::memory_order_relaxed);
+}
+
+} // namespace ninfer::ops

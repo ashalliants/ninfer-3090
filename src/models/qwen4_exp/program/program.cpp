@@ -69,6 +69,7 @@
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/cast.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ninfer/ops/ple.h"
 #include "ninfer/ops/qsa.h"
@@ -6168,8 +6169,22 @@ private:
                               wide_peak_ >> 20, plan_.wide_work >> 20, static_cast<unsigned long long>(refilled_));
                 diagnostic(text);
             }
+            // The ops library counts linears the sm_70 tensor-core route handed back for want of
+            // workspace (they run the default kernels, more slowly); a rise is a workspace sizing
+            // gap, reported here because the ops library does not log.
+            const std::uint64_t tc_fallbacks = ops::sm70_tensor_core_fallbacks();
+            if (tc_fallbacks > tc_fallbacks_reported_) {
+                std::snprintf(text, sizeof(text),
+                              "sm_70 tensor cores: %llu linear calls since start found too little workspace and ran "
+                              "the default kernels",
+                              static_cast<unsigned long long>(tc_fallbacks));
+                diagnostic(text);
+                tc_fallbacks_reported_ = tc_fallbacks;
+            }
         } catch (...) {}
     }
+
+    mutable std::uint64_t tc_fallbacks_reported_ = 0; // ops::sm70_tensor_core_fallbacks at the last report
 
     const execution::Parameters& parameters_;
     DeviceContext& device_;

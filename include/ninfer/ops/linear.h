@@ -12,6 +12,14 @@
 namespace ninfer::ops {
 
 /**
+ * @brief Linear calls since process start that the sm_70 FP16 tensor-core route
+ * (NINFER_SM70_TENSOR_CORES=1) handed back to the default kernels because the call's workspace
+ * was short of its staging. Zero on every other architecture. The ops library does not log
+ * (docs/maintainer/logging.md); an owner with a diagnostic channel reports a rise.
+ */
+std::uint64_t sm70_tensor_core_fallbacks() noexcept;
+
+/**
  * @brief Permitted private activation-compute profiles for a linear projection.
  *
  * The policy constrains private route selection; it does not select a kernel or prescribe a
