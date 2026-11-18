@@ -1,7 +1,9 @@
 #include "ninfer/engine.h"
+#include "ninfer/object_store.h"
 #include "product/object_store/s3_object_store.h"
 #include "runtime/engine/worker_fault.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -9,6 +11,8 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -576,6 +580,95 @@ int exercise_bucket(const char* artifact, const fs::path& root, const Control& c
     return 0;
 }
 
+// A bucket that holds nothing and takes `delay` to list it, as a slow link does; every other call
+// is instant.
+class SlowListingBucket final : public ninfer::ObjectStore {
+public:
+    explicit SlowListingBucket(std::chrono::milliseconds delay) : delay_(delay) {}
+    void put(const std::string&, std::span<const std::uint8_t>) override {}
+    std::optional<std::vector<std::uint8_t>> get(const std::string&) override { return std::nullopt; }
+    bool exists(const std::string&) override { return false; }
+    std::vector<ninfer::ObjectInfo> list(const std::string&) override {
+        ++lists;
+        std::this_thread::sleep_for(delay_);
+        return {};
+    }
+    bool touch(const std::string&) override { return false; }
+    void remove(const std::string&) override {}
+    std::atomic<int> lists{0};
+
+private:
+    std::chrono::milliseconds delay_;
+};
+
+// The start-up restore budget is one absolute deadline, fixed before the bucket is listed and shared
+// with the restore (#431, anchored in Engine's open_context_store). A listing that takes the whole
+// budget therefore leaves the restore none, and a session on local disk stays in the store instead
+// of delaying start-up by a second full budget. The control, same store and budget with a prompt
+// listing, restores it, so the budget alone is not what stops the restore.
+int exercise_startup_deadline(const char* artifact, const fs::path& root, const Control& control) {
+    const fs::path directory = root / "startup-deadline";
+    {
+        ninfer::Engine engine(
+            with_store(store_engine_options(artifact), directory, std::chrono::seconds(0)));
+        const auto reply = engine.generate(engine.prepare(conversation(kShortFirst)), greedy());
+        if (reply.content != control.reply) {
+            std::cerr << "startup-deadline: the first turn differs from the control\n";
+            return 1;
+        }
+    }
+    constexpr auto kBudget = std::chrono::seconds(3);
+    const auto start = [&](std::chrono::milliseconds listing, int& lists,
+                           ninfer::RuntimeStats& stats) {
+        auto bucket  = std::make_shared<SlowListingBucket>(listing);
+        auto options = with_store(store_engine_options(artifact), directory, std::chrono::seconds(0));
+        options.context_store.remote        = bucket;
+        options.context_store.restore_budget = kBudget;
+        const auto begun = std::chrono::steady_clock::now();
+        ninfer::Engine engine(std::move(options));
+        const auto took = std::chrono::steady_clock::now() - begun;
+        stats = engine.runtime_stats();
+        lists = bucket->lists.load();
+        return took;
+    };
+    int prompt_lists = 0, slow_lists = 0;
+    ninfer::RuntimeStats prompt, slow;
+    const auto prompt_start = start(std::chrono::milliseconds(0), prompt_lists, prompt);
+    if (prompt.context_store_restored != 1 || prompt_lists < 1) {
+        std::cerr << "startup-deadline: with a prompt listing the session was not restored: restored="
+                  << prompt.context_store_restored << " listings=" << prompt_lists << '\n';
+        return 1;
+    }
+    // A listing that outlasts the whole budget.
+    const auto slow_start = start(kBudget + std::chrono::seconds(1), slow_lists, slow);
+    if (slow_lists < 1) {
+        std::cerr << "startup-deadline: the bucket was never listed\n";
+        return 1;
+    }
+    if (slow.context_store_restored != 0) {
+        std::cerr << "startup-deadline: the restore ran after the listing had used the budget "
+                     "(restored=" << slow.context_store_restored
+                  << "): refresh and restore are not sharing one deadline\n";
+        return 1;
+    }
+    if (slow.context_store_images != 1) {
+        std::cerr << "startup-deadline: the skipped session left the store: images="
+                  << slow.context_store_images << '\n';
+        return 1;
+    }
+    // The stalled start-up costs the listing, not a second budget on top of it.
+    const auto extra = std::chrono::duration<double>(slow_start - prompt_start).count();
+    if (extra > static_cast<double>(kBudget.count()) + 1.0 + 3.0) {
+        std::cerr << "startup-deadline: the slow listing delayed start-up by " << extra
+                  << " s, more than the listing plus a margin\n";
+        return 1;
+    }
+    std::cout << "startup-deadline: a listing that used the " << kBudget.count()
+              << " s budget left the restore none (start-up " << extra
+              << " s slower than a prompt listing); the prompt control restored the session\n";
+    return 0;
+}
+
 // The restart store, opened by an Engine of the other speculative family (MTP for a DFlash2 store
 // and the reverse): its sessions hold another draft's state, so none is restored, and start-up
 // reports them as written under another configuration.
@@ -798,6 +891,9 @@ int main(int argc, char** argv) {
         }
         if (scenario == "all" || scenario == "bucket") {
             if (exercise_bucket(artifact, root, short_control) != 0) { return 1; }
+        }
+        if (scenario == "all" || scenario == "startup-deadline") {
+            if (exercise_startup_deadline(artifact, root, short_control) != 0) { return 1; }
         }
         if (scenario == "all" || scenario == "flush") {
             if (exercise_flush(artifact, root) != 0) { return 1; }

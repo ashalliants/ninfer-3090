@@ -1458,6 +1458,228 @@ public:
         expect_empty("batched demotion leaked physical resources");
     }
 
+    // The Host free runs Program predicts a release will leave (host_free_runs_after_release, the
+    // input of demotion victim selection, #406/#419) equal the arena's actual free runs after really
+    // releasing the same checkpoints. The CPU tests check the allocator arithmetic and the policy;
+    // this checks the Program's wiring of them on a real arena: aligned State images, KV extents
+    // addressed by page, and a Host page that two checkpoints alias, which the release must count
+    // once and only when its last holder goes (#430).
+    void host_free_runs_match_real_release() {
+        const std::span<const qwen::CheckpointHandle> none;
+        const auto runs_now = [&] { return program_.host_free_runs_after_release(none); };
+        const auto same = [](const runtime::HostFreeRuns& a, const runtime::HostFreeRuns& b) {
+            return a.runs == b.runs && a.general_capacity == b.general_capacity &&
+                   a.occupied == b.occupied;
+        };
+        // A source whose State and Main KV are on the Host, and a descendant that aliases the
+        // source's Host page and adds a private tail, itself demoted to the Host.
+        const auto build = [&] {
+            auto seed         = request(64, true);
+            const auto source = checkpoint(seed);
+            demote_to_host(source);
+            auto extension       = request(128, true);
+            const auto candidate = program_.inspect_source(extension, source);
+            require(candidate &&
+                        static_cast<bool>(program_.start_binding(extension, {1}, *candidate)),
+                    "Host-run fixture could not bind its descendant");
+            const auto bound = settle();
+            require(bound.sequence.has_value(), "Host-run fixture descendant did not publish");
+            finish_prefill(*bound.sequence, 64, true);
+            const auto finished = program_.finish(*bound.sequence);
+            require(finished.checkpoint.has_value(), "Host-run fixture descendant kept no checkpoint");
+            const std::array family{source, *finished.checkpoint};
+            demote_to_host(std::span<const qwen::CheckpointHandle>(family));
+            return std::pair{source, *finished.checkpoint};
+        };
+        // Releases `release_order` and requires the runs predicted for `set` beforehand to be the
+        // arena's actual runs afterwards. Returns the runs before and after.
+        const auto release_matches = [&](std::span<const qwen::CheckpointHandle> set,
+                                         std::span<const qwen::CheckpointHandle> release_order,
+                                         std::string_view label) {
+            const auto before    = runs_now();
+            const auto predicted = program_.host_free_runs_after_release(set);
+            for (const auto handle : release_order) {
+                require(program_.release_checkpoint(handle), "Host-run fixture could not release");
+            }
+            const auto actual = runs_now();
+            require(same(predicted, actual),
+                    std::string("predicted Host free runs differ from the arena's after releasing ") +
+                        std::string(label));
+            return std::pair{before, actual};
+        };
+
+        // Both checkpoints at once: the shared page goes with its last holder, so the family frees
+        // more than either alone.
+        {
+            const auto [source, descendant] = build();
+            const std::array family{source, descendant};
+            const auto [before, after] = release_matches(family, family, "the whole family");
+            require(!same(before, after) && after.occupied < before.occupied,
+                    "releasing the family freed no Host bytes");
+        }
+        expect_empty("Host-run family fixture leaked physical resources");
+
+        // Descendant first, then source: after the first release the shared page is still held, so
+        // the runs only grow by what the descendant owned alone; the second frees the rest.
+        {
+            const auto [source, descendant] = build();
+            const std::array<qwen::CheckpointHandle, 1> only_descendant{descendant};
+            const auto [before_one, after_one] =
+                release_matches(only_descendant, only_descendant, "the descendant alone");
+            require(!same(before_one, after_one), "releasing the descendant freed no Host bytes");
+            const std::array<qwen::CheckpointHandle, 1> only_source{source};
+            const auto [before_two, after_two] =
+                release_matches(only_source, only_source, "the last holder of the shared page");
+            require(after_two.occupied < before_two.occupied,
+                    "releasing the source freed no Host bytes");
+        }
+        expect_empty("Host-run sequential fixture leaked physical resources");
+
+        // Source first: the descendant still holds the shared page, so only the source's own State
+        // image is freed, and the prediction must not count the aliased page.
+        {
+            const auto [source, descendant] = build();
+            const std::array<qwen::CheckpointHandle, 1> only_source{source};
+            (void)release_matches(only_source, only_source, "an ancestor whose page is aliased");
+            const std::array<qwen::CheckpointHandle, 1> only_descendant{descendant};
+            const auto [before_two, after_two] = release_matches(
+                only_descendant, only_descendant, "the descendant after its ancestor");
+            require(after_two.occupied < before_two.occupied,
+                    "releasing the descendant after its ancestor freed no Host bytes");
+        }
+        expect_empty("Host-run ancestor-first fixture leaked physical resources");
+    }
+
+    // The pause path's Host accounting on real pools (#427): pause_host_bytes (the need the Engine
+    // reserves), pause_snapshot_fits (the placement it replays on the Host arena) and the pause
+    // itself must agree. Run for each backend, a speculative one adds a second KV pool with its own
+    // page stride and a masked-draft lane appends features before the snapshot is taken.
+    void pause_fit_matches_pause() {
+        const std::span<const qwen::CheckpointHandle> none;
+        const auto host_bytes = [&] { return program_.physical_usage().occupied.host_bytes; };
+
+        // Pauses `sequence` for real and requires it to take exactly the Host bytes
+        // pause_host_bytes promised, then drops the snapshot again.
+        const auto pause_takes_exactly = [&](qwen::SequenceHandle sequence, std::size_t need,
+                                             std::string_view label) {
+            const auto before = host_bytes();
+            require(program_.start_pause(sequence, true, nullptr, true),
+                    std::string(label) + ": a pause that fits was refused");
+            auto paused = settle();
+            require(paused.paused && paused.paused->snapshot_handle(),
+                    std::string(label) + ": the pause kept no snapshot");
+            require(host_bytes() - before == need,
+                    std::string(label) + ": the pause took a different number of Host bytes than "
+                                         "pause_host_bytes reported");
+            require(program_.revoke_snapshot(*paused.paused),
+                    std::string(label) + ": the snapshot could not be revoked");
+        };
+
+        // 1. A lone request part-way through its prompt.
+        {
+            auto base = request(2 * kChunk);
+            const auto sequence = bind(base);
+            prefill_prefix(sequence, kChunk);
+            const auto need = program_.pause_host_bytes(sequence);
+            require(need && *need > 0 && program_.pause_snapshot_fits(sequence) &&
+                        program_.pause_state_image_unplaced(sequence) == 0,
+                    "a pause with room on the Host was reported as not fitting");
+            pause_takes_exactly(sequence, *need, "a lone request");
+        }
+        expect_empty("pause-fit lone request leaked physical resources");
+
+        // 2. Two residents that read the same pages: the pages another active reader keeps on the
+        //    Device need no new Host allocation, so the pair's need is smaller than the same
+        //    request's need once its sibling is gone. Each is checked against a real pause.
+        const auto shared_pair = [&](bool sibling_leaves, std::string_view label) {
+            auto seed_base        = request(2 * 64, true);
+            const auto source     = checkpoint(seed_base);
+            auto extension        = request(3 * kChunk, true);
+            const auto first_sel  = program_.inspect_source(extension, source);
+            require(first_sel &&
+                        static_cast<bool>(program_.start_binding(extension, {0}, *first_sel)),
+                    "the first reader of a shared prefix could not bind");
+            const auto first = settle();
+            require(first.sequence.has_value(), "the first shared reader did not publish");
+            const auto second_sel = program_.inspect_source(extension, source);
+            require(second_sel &&
+                        static_cast<bool>(program_.start_binding(extension, {1}, *second_sel)),
+                    "the second reader of a shared prefix could not bind");
+            const auto second = settle();
+            require(second.sequence.has_value(), "the second shared reader did not publish");
+            prefill_prefix(*first.sequence, kChunk);
+            prefill_prefix(*second.sequence, kChunk);
+            if (sibling_leaves) {
+                require(program_.abort(*first.sequence).status == runtime::ConsumeStatus::Consumed,
+                        "the sibling reader could not be released");
+            }
+            const auto need = program_.pause_host_bytes(*second.sequence);
+            require(need && program_.pause_snapshot_fits(*second.sequence),
+                    std::string(label) + ": a shared-prefix pause was reported as not fitting");
+            pause_takes_exactly(*second.sequence, *need, label);
+            if (!sibling_leaves) {
+                require(program_.abort(*first.sequence).status == runtime::ConsumeStatus::Consumed,
+                        "the sibling reader could not be released");
+            }
+            require(program_.release_checkpoint(source), "the shared source could not be released");
+            return *need;
+        };
+        const auto need_with_sibling = shared_pair(false, "a reader with a sibling");
+        expect_empty("pause-fit shared pair leaked physical resources");
+        const auto need_alone = shared_pair(true, "the same reader once its sibling left");
+        expect_empty("pause-fit shared pair (alone) leaked physical resources");
+        require(need_with_sibling < need_alone,
+                "pages a sibling keeps on the Device were still counted as needing a Host copy");
+
+        // 3. A Host arena without room for the pause: the Program reports that it does not fit,
+        //    refuses a pause that must keep its snapshot with nothing changed, and a pause that may
+        //    fall back leaves no snapshot and takes no Host bytes. The arena is filled with
+        //    demoted checkpoints (one State image each, whose size depends on the backend) until
+        //    the next one would not fit, which leaves less than a pause needs.
+        {
+            auto probe_base     = request(2 * kChunk);
+            const auto sequence = bind(probe_base, 1);
+            prefill_prefix(sequence, kChunk);
+            const auto need = program_.pause_host_bytes(sequence);
+            require(need && program_.pause_snapshot_fits(sequence),
+                    "the exhausted-arena probe did not fit an empty arena");
+            std::vector<qwen::CheckpointHandle> fillers;
+            std::size_t cost = 0;
+            for (std::uint32_t tokens = 2 * kChunk; fillers.size() < 6; ++tokens) {
+                const auto free = program_.host_free_runs_after_release(none).budget_free();
+                if (cost != 0 && free < cost) { break; }
+                const auto before = host_bytes();
+                auto filler_base  = request(tokens, true);
+                fillers.push_back(checkpoint(filler_base));
+                demote_to_host(fillers.back());
+                cost = std::max<std::size_t>(cost, host_bytes() - before);
+            }
+            require(!program_.pause_snapshot_fits(sequence),
+                    "a pause with less Host room than it needs was reported as fitting");
+            const auto usage_before = program_.physical_usage();
+            const auto runs_before  = program_.host_free_runs_after_release(none);
+            require(!program_.start_pause(sequence, true, nullptr, true) &&
+                        !program_.has_context_transaction(),
+                    "a pause that must keep its snapshot was started with no room for it");
+            expect_usage(usage_before, "a refused pause changed physical ownership");
+            const auto runs_after = program_.host_free_runs_after_release(none);
+            require(runs_after.runs == runs_before.runs && runs_after.occupied == runs_before.occupied,
+                    "a refused pause changed the Host arena");
+            require(program_.start_pause(sequence, true, nullptr, false),
+                    "a pause that may fall back was refused");
+            auto fell_back = settle();
+            require(fell_back.paused && !fell_back.paused->snapshot_handle(),
+                    "a pause with no room for its snapshot kept one");
+            require(host_bytes() == usage_before.occupied.host_bytes,
+                    "a pause that kept no snapshot took Host bytes");
+            fell_back.paused.reset();
+            for (const auto handle : fillers) {
+                require(program_.release_checkpoint(handle), "a filler checkpoint did not release");
+            }
+        }
+        expect_empty("pause-fit exhausted-arena fixture leaked physical resources");
+    }
+
     void physical_facts() {
         auto seed         = request(64, true);
         const auto source = checkpoint(seed);
@@ -1701,34 +1923,38 @@ public:
 
     void demote_to_host(qwen::CheckpointHandle source) {
         const std::array<qwen::CheckpointHandle, 1> allowed{source};
-        for (const auto resource :
-             {runtime::ContextResourceClass::State, runtime::ContextResourceClass::MainKV,
-              runtime::ContextResourceClass::BackendKV}) {
+        demote_to_host(std::span<const qwen::CheckpointHandle>(allowed));
+    }
+
+    // Demotes everything the checkpoints hold on the Device. A page two of them share is only
+    // reclaimable when every holder is allowed, so a family is demoted as a set.
+    void demote_to_host(std::span<const qwen::CheckpointHandle> allowed) {
+        // A family holds one State slot each and shares Main pages, so one resource can take
+        // several demotions: repeat until the set holds nothing on the Device (bounded).
+        for (unsigned round = 0; round < 16; ++round) {
             const auto usage = program_.checkpoint_footprint(allowed);
+            if (!usage.state_slots && !usage.main_kv_pages && !usage.backend_kv_pages) { return; }
             runtime::ContextResourceUsage shortage;
-            switch (resource) {
-            case runtime::ContextResourceClass::State:
+            if (usage.state_slots) {
                 shortage.state_slots = usage.state_slots;
-                break;
-            case runtime::ContextResourceClass::MainKV:
+            } else if (usage.main_kv_pages) {
                 shortage.main_kv_pages = usage.main_kv_pages;
-                break;
-            case runtime::ContextResourceClass::BackendKV:
+            } else {
                 shortage.backend_kv_pages = usage.backend_kv_pages;
-                break;
-            }
-            if (!shortage.state_slots && !shortage.main_kv_pages && !shortage.backend_kv_pages) {
-                continue;
             }
             const auto candidates = program_.plan_reclaim(allowed, {}, shortage).demotions;
-            const auto* quote     = demotion_with_sources(candidates, allowed);
+            // The quote that takes the whole set when there is one, else any quote that makes progress.
+            const auto* quote = demotion_with_sources(candidates, allowed);
+            if (!quote && !candidates.empty()) { quote = &candidates.front(); }
             require(quote && program_.start_demote(*quote),
                     "image fixture could not demote its checkpoint to Host");
-            require(settle().published, "image fixture demotion did not complete");
+            // A page whose Host copy already exists is dropped from the Device with no transfer,
+            // so there may be nothing to settle.
+            if (program_.has_context_transaction()) {
+                require(settle().published, "image fixture demotion did not complete");
+            }
         }
-        const auto left = program_.checkpoint_footprint(allowed);
-        require(!left.state_slots && !left.main_kv_pages && !left.backend_kv_pages,
-                "image fixture checkpoint kept Device replicas after demotion");
+        throw std::runtime_error("image fixture checkpoint kept Device replicas after demotion");
     }
 
     // A checkpoint image is the exact Host representation of its points: exporting a Device
@@ -2466,8 +2692,8 @@ void prompt_fits_beside_residents_on_real_pools(DeviceContext& device,
     options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(kPoolTokens);
     options.prefill_chunk                     = kChunk;
     options.max_concurrency                   = 2;
-    options.context_cache.enabled             = false;
-    options.context_cache.device_state_slots  = 0;
+    options.context_cache.enabled             = true; // the reused-prefix cases retain source checkpoints
+    options.context_cache.device_state_slots  = 2;
     options.context_cache.host_capacity_bytes = 0;
     auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
     // Not the curve minimum (8 pages, one request's worth): the pool this test needs is the 15 pages
@@ -2566,6 +2792,96 @@ void prompt_fits_beside_residents_on_real_pools(DeviceContext& device,
     require(program.abort(starting).status == runtime::ConsumeStatus::Consumed,
             "the starting resident retained its resources");
     require(program.physical_usage().occupied == empty, "the fit check leaked physical resources");
+
+    // A reused prefix a resident already holds counts once (#347). The pool has 15 pages and a
+    // 500-token prompt needs 8, so a resident and a fresh copy of the same prompt do not fit
+    // (16 > 15) unless the newcomer's shared prefix is recognised as the resident's own pages,
+    // which is what keeps a shared system prompt from being deferred behind its own readers.
+    const auto make_source = [&](const std::vector<TokenId>& ids) {
+        auto base = [&] {
+            runtime::ResolvedExecutionOptions request;
+            request.requested_output_tokens = 8;
+            request.allow_prefix_reuse      = true;
+            return program.plan_request(
+                qwen::PreparedPromptAccess::take(frontend.prepare_tokens(ids, true)), request);
+        }();
+        const auto root = program.inspect_source(base, std::nullopt);
+        require(root.has_value(), "source request has no root source");
+        require(static_cast<bool>(program.start_binding(
+                    base, {0}, *root, nullptr, qwen::ExecutionUnitKind::Prefill, 0)),
+                "source request could not bind");
+        const auto bound = settle();
+        require(bound.sequence.has_value(), "source binding did not publish");
+        const auto sequence     = *bound.sequence;
+        std::uint32_t processed = 0;
+        for (unsigned call = 0; call < 64 && processed < ids.size(); ++call) {
+            const std::array<qwen::ExecutionUnit, 1> units{
+                {{sequence, qwen::ExecutionUnitKind::Prefill}}};
+            require(static_cast<bool>(program.reserve_units(units)),
+                    "source request could not reserve its unit");
+            auto step = program.advance_prefill(sequence, nullptr, nullptr, 0);
+            processed += step.processed_prompt_tokens;
+            if (step.pending) {
+                const std::array<runtime::CommitDecision, 1> accepted{
+                    {{.accepted_tokens = 1, .terminal = true}}};
+                (void)program.commit(std::move(*step.pending), accepted, {}, nullptr);
+            }
+        }
+        require(processed == ids.size(), "source prefill did not finish");
+        const auto finished = program.finish(sequence);
+        require(finished.checkpoint.has_value(), "source request retained no checkpoint");
+        return *finished.checkpoint;
+    };
+    // A resident bound from `source`, prefilled to its end.
+    const auto resident_from = [&](qwen::CheckpointHandle source, const std::vector<TokenId>& ids,
+                                   std::uint32_t lane) {
+        auto base            = plan_request(ids);
+        const auto candidate = program.inspect_source(base, source);
+        require(candidate.has_value(), "resident has no usable source checkpoint");
+        require(static_cast<bool>(program.start_binding(
+                    base, {lane}, *candidate, nullptr, qwen::ExecutionUnitKind::Prefill, 0)),
+                "resident could not bind from its source");
+        const auto bound = settle();
+        require(bound.sequence.has_value(), "source-bound resident did not publish");
+        const auto sequence = *bound.sequence;
+        for (unsigned call = 0; call < 64; ++call) {
+            const std::array<qwen::ExecutionUnit, 1> units{
+                {{sequence, qwen::ExecutionUnitKind::Prefill}}};
+            require(static_cast<bool>(program.reserve_units(units)),
+                    "source-bound resident could not reserve its unit");
+            auto step = program.advance_prefill(sequence, nullptr, nullptr, 0);
+            if (step.pending) {
+                const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
+                (void)program.commit(std::move(*step.pending), accepted, {}, nullptr);
+            }
+            if (step.complete) { return sequence; }
+        }
+        throw std::runtime_error("source-bound resident prefill did not finish");
+    };
+    const auto fits_from = [&](const std::vector<TokenId>& ids, qwen::CheckpointHandle source) {
+        auto base            = plan_request(ids);
+        const auto candidate = program.inspect_source(base, source);
+        require(candidate.has_value(), "candidate has no usable source checkpoint");
+        return program.prompt_fits_beside_residents(base, *candidate);
+    };
+    // Same prompt as the resident, so the first `prefix` tokens are the resident's own pages.
+    for (const std::uint32_t prefix : {256U, 264U}) {
+        const auto label = prefix % 64 == 0 ? "an aligned" : "an unaligned";
+        const auto source = make_source(make_ids(prefix, 21));
+        const auto prompt = make_ids(500, 21);
+        const auto reader = resident_from(source, prompt, 0);
+        require(!fits(prompt),
+                std::string("the same prompt with no source fit beside its reader (") + label +
+                    " prefix): the fixture no longer exercises the shared-page case");
+        require(fits_from(prompt, source),
+                std::string("a prompt was deferred behind the resident that holds its shared prefix (") +
+                    label + " prefix): the shared pages were counted twice");
+        require(program.abort(reader).status == runtime::ConsumeStatus::Consumed,
+                "the source-bound resident retained its resources");
+        require(program.release_checkpoint(source), "the source checkpoint did not release");
+        require(program.physical_usage().occupied == empty,
+                "the reused-prefix fit check leaked physical resources");
+    }
 }
 
 void replay_sampling_counts(DeviceContext& device, const qwen::execution::Parameters& parameters,
@@ -3974,6 +4290,8 @@ int main(int argc, char** argv) {
             fixture.demotion_holder_changes();
             fixture.batched_physical_demotions();
             fixture.physical_facts();
+            fixture.host_free_runs_match_real_release();
+            fixture.pause_fit_matches_pause();
             fixture.grammar_row_failure();
             fixture.checkpoint_image_round_trip();
             fixture.shared_prefix_image_round_trip();
