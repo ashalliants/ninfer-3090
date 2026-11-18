@@ -105,5 +105,10 @@ void qsa_attention_split_launch(const Tensor& q, const Tensor& positions, const 
 void qsa_attention_wide_launch(const Tensor& q, const Tensor& positions, const Tensor& selected,
                                const Tensor& counts, float scale, const PagedKVLayerView& cache,
                                Tensor& out, std::int32_t multiprocessor_count, cudaStream_t stream);
+// The same on Volta's FP16 tensor cores (attention_wide_hmma.cu): taken in its place when the sm_70
+// tensor-core route is on (NINFER_SM70_TENSOR_CORES=1); close to it, not bit for bit.
+void qsa_attention_wide_hmma_launch(const Tensor& q, const Tensor& positions, const Tensor& selected,
+                               const Tensor& counts, float scale, const PagedKVLayerView& cache,
+                               Tensor& out, std::int32_t multiprocessor_count, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

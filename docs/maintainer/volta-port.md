@@ -425,6 +425,16 @@ with one planted fact each) scores 24/24 both ways; greedy 128-token replies to 
 diverge after a median ~300 characters into equivalent text, as any reordering does. Decode is
 untouched (its calls are narrower than 64 tokens) except that the MTP drafter's catch-up over a
 prompt of 64+ tokens takes the route, so its drafts (never the accepted tokens) can differ. 
+The same variable moves prompt attention onto the tensor cores: the QSA wide route (one CTA per
+column and KV head, the unsplit prefill form) runs `ops/qsa/attention_wide_hmma.cu` instead of
+`attention_wide.cu`, written in native `mma.sync.m8n8k4` fragments where the original's m16n8k16 is
+emulated on sm_70. QK takes the INT8 key codes widened exactly with the per-group scales in FP32 as
+before; PV folds the value scale into the probability (one FP16 rounding of `p * vscale` per tile,
+under a per-tile power of two). `ninfer_qsa_test` with the variable set: relative L2 against FP64
+1.660-1.680e-3 on the wide cases against 1.676-1.699e-3 for the original (the decode and split
+cases do not take it). The 12 attention calls of the 3,935-token prompt: 715 -> 172 ms; the prompt
+6.40 -> 5.97 s (6.90 s with the variable unset).
+
 Every staging buffer, cuBLAS's workspace included (set per call), comes from the call's
 `WorkspaceArena`, so the shared expert's side stream and the device stream never share scratch.
 `linear_workspace_capacity_bytes` (BF16) and the GGML capacity queries include

@@ -2,6 +2,7 @@
 // Adapted from Infernix fd2aa93c9f8bc716d7ec1fea3c36abba067ad8de src/ops/qsa/qsa.cu and
 // src/ops/qsa/qsa_select.cu (Apache-2.0).
 
+#include "ops/linear/common/sm70_tensor_core.h"
 #include "ninfer/ops/qsa.h"
 
 #include "ops/qsa/launch.h"
@@ -255,6 +256,11 @@ void qsa_attention(const Tensor& q, const Tensor& positions, const Tensor& selec
 
     const QsaAttentionPlan plan = qsa_attention_plan(tokens, execution.multiprocessor_count);
     if (plan.splits == 1) {
+        if (sm70_tensor_cores_enabled()) {
+            qsa_attention_wide_hmma_launch(q, positions, selected, counts, scale, cache, out,
+                                           execution.multiprocessor_count, execution.stream);
+            return;
+        }
         qsa_attention_wide_launch(q, positions, selected, counts, scale, cache, out,
                                   execution.multiprocessor_count, execution.stream);
         return;
