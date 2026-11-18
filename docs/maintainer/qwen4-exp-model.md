@@ -32,6 +32,9 @@ Per call of T consecutive positions of one sequence (`execution/forward.cpp`):
 2. For each block: the PLE injection (its layer), `xa, inject = mix(attn_hc, R)`,
    `y = GDN(xa)` or `QSA(xa)`, `R += inject * y`, `xm, inject = mix(mlp_hc, R)`, `y = MoE(xm)`,
    `R += inject * y` (each update rounded once to BF16).
+   With refusal steering loaded (`--graft`, below), each block ends with
+   `R[s] -= (R[s] . v_l) v_l` for the four streams `s`, columns that selected a vector only
+   (`ops::direction_project`; v_l is the unit direction of layer l, layers 1-47).
 3. `x = mix(final_mixer, R)`; FP32 logits of the IQ4_XS head with the A8 activation cast.
 
 The mixer, injection and PLE are the `hyper_connection` and `ple` Ops; their formulas are in their
@@ -59,6 +62,31 @@ blocks of 4 raw keys are pooled, normalized and rotated; each query selects at m
 renormalized; each expert is `A8(x)`, gate/up rowdots, `SiLU(gate) * up` in FP32, `A8(h)`, the down
 rowdot rounded to BF16; `y = sum_i w_i expert_i + sigmoid(score) * shared(x)` with the shared
 expert `W_d A8(SiLU(W_g A8(x)) * W_u A8(x))`.
+
+## Refusal steering
+
+`--graft NAME=PATH` loads a GGUF control vector (`models/qwen4_exp/steering.h`; the serving side is in
+[serving.md](../serving.md#refusal-steering-on-qwen38-flash-next)). The forward removes its direction
+from the residual after each block's MLP write, per column: `ForwardBatch::steer` and the rows
+batches' carry one I32 per column (the vector's index, or -1), staged beside `ids` in the call's
+pinned input block, so a captured decode graph sees each replay's selection. With no vector the
+Forward holds no table and launches nothing. With one, every steered layer launches the Op in every
+call, a no-op for a column that selects none (it is not captured conditionally: a graph captured
+before the first steered request must already contain it).
+
+- **Which tensor.** The residual `R` is `[S*H, T]`, so the projection runs on each stream. The
+  published vector has one 2,560-wide direction, identical for layers 1-47. It follows llama.cpp's
+  control-vector layer numbering: `direction.N` is applied after the zero-based block N (llama.cpp
+  applies `tensors[il]` at the output of block `il`), so block 0 is never steered and N runs from 1
+  to 47 on this 48-block model.
+- **Context cache.** The cache's per-checkpoint `identity_tag` (the prefix-index key's third part,
+  checked by exact reuse and written into every checkpoint image) is the Program's configuration tag
+  for an unsteered request and a per-vector tag derived from it and the vector's digest for a
+  steered one (`ProgramImpl::request_tag`), distinct from the configuration's and from every other
+  vector's. An image's layout lists the tags its Program may import (`CheckpointLayout::extra_tags`).
+  Tokens, positions and digests stay the prompt's own.
+- **The drafter** (`run_mtp`) does not steer. Verification does, so a steered request's tokens are
+  the target's and only its acceptance rate can fall.
 
 ## MTP drafter
 

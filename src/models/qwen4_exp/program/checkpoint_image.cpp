@@ -18,7 +18,9 @@ using codec::ImageWriter;
 
 // Not the Qwen3.5 Program's version (2): either Program rejects the other's images at the head even
 // before the binding (which already differs) is compared.
-constexpr std::uint32_t kImageVersion   = 0x464E0001U; // "FN", 1
+// Version 2: every point record carries its own identity tag (refusal steering). A version-1 image
+// (a persisted context store from before) fails the head check and is a clean miss.
+constexpr std::uint32_t kImageVersion   = 0x464E0002U; // "FN", 2
 constexpr std::uint32_t kMaximumLayers  = 64;
 // Slabs moved per tier call while exporting or importing (about 60 MiB of page records).
 constexpr std::size_t kSlabsPerTransfer = 64;
@@ -69,6 +71,7 @@ struct PointRecord {
     std::int32_t rope_delta = 0;
     std::uint32_t identity  = 0;
     std::uint32_t image     = 0;
+    std::uint32_t tag       = 0; // the checkpoint's context-cache tag (CheckpointLayout::accepts_tag)
     std::vector<std::uint32_t> pages; // indices into the page table
     std::array<std::uint64_t, 2> digests{};
 };
@@ -138,10 +141,11 @@ ParsedImage parse_image(const CheckpointLayout& layout, std::span<const std::uin
         point.digests[0] = reader.pod<std::uint64_t>();
         point.digests[1] = reader.pod<std::uint64_t>();
         const auto tag   = reader.pod<std::uint32_t>();
+        point.tag        = tag;
         if (point.frontier == 0 || point.frontier > layout.capacity || point.identity >= identity_count ||
             point.image >= parsed.image_count || point.pages.size() != pages_for(point.frontier) ||
             point.full_pages > point.frontier / static_cast<std::uint32_t>(kPagedKVPageSize) ||
-            point.mtp_cells > point.frontier || tag != layout.identity_tag ||
+            point.mtp_cells > point.frontier || !layout.accepts_tag(tag) ||
             (next && (token < 0 || token >= layout.vocabulary))) {
             throw std::invalid_argument("checkpoint image point is out of range");
         }
@@ -237,6 +241,7 @@ qwen3_5::CheckpointImage export_checkpoint_image(const HostCheckpointStore& stor
         point.next_token = r.next_token;
         point.logits     = r.logits;
         point.rope_delta = r.rope_delta;
+        point.tag        = r.identity_tag;
         point.digests    = r.identity->digests.at(r.frontier);
         const auto id    = std::find(identities.begin(), identities.end(), r.identity.get());
         point.identity   = static_cast<std::uint32_t>(id - identities.begin());
@@ -281,7 +286,7 @@ qwen3_5::CheckpointImage export_checkpoint_image(const HostCheckpointStore& stor
         writer.vector(point.pages);
         writer.pod(point.digests[0]);
         writer.pod(point.digests[1]);
-        writer.pod(layout.identity_tag);
+        writer.pod(point.tag);
     }
     const std::size_t page_bytes   = layout.page_bytes();
     const std::size_t pages_offset = writer.reserve(page_slabs.size() * page_bytes);
@@ -323,7 +328,7 @@ qwen3_5::CheckpointImage export_checkpoint_image(const HostCheckpointStore& stor
 
     for (const PointRecord& point : records) {
         image.keys.push_back(qwen3_5::PrefixShortlistKey{
-            .digests = point.digests, .frontier = point.frontier, .identity_tag = layout.identity_tag});
+            .digests = point.digests, .frontier = point.frontier, .identity_tag = point.tag});
     }
     image.tokens        = records.front().frontier;
     const auto& digests = identities[records.front().identity]->digests.image();
@@ -394,7 +399,7 @@ std::optional<qwen3_5::ImportedCheckpoints> import_checkpoint_image(HostCheckpoi
         for (const PointRecord& point : parsed.points) {
             HostCheckpoint r;
             r.identity     = parsed.identities[point.identity];
-            r.identity_tag = layout.identity_tag;
+            r.identity_tag = point.tag;
             r.frontier     = point.frontier;
             r.role         = point.role;
             r.full_pages   = point.full_pages;

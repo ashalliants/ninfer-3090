@@ -4,6 +4,7 @@
 #include "core/paged_kv_cache.h"
 #include "core/startup.h"
 #include "models/qwen3_5/frontend/graft.h"
+#include "runtime/engine/qwen4_exp_instance.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/lossy_options.h"
@@ -321,8 +322,12 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     const std::uint32_t concurrency = options.max_concurrency;
     // Each direct graft is installed as a pinned context-cache checkpoint that holds one StateImage
     // for the Engine's life, so the Device state pool grows by one per graft.
-    const auto direct_grafts = static_cast<std::uint32_t>(
-        models::qwen3_5::direct_graft_slots(options.grafts).size());
+    // A Qwen3.8-Flash-Next --graft names a refusal-steering vector (a GGUF file with no sidecar and no
+    // KV to install), so it holds no state image.
+    const auto direct_grafts =
+        artifact_is_qwen4_exp(options.artifact_path)
+            ? 0U
+            : static_cast<std::uint32_t>(models::qwen3_5::direct_graft_slots(options.grafts).size());
     if (direct_grafts != 0 && !cache.enabled) {
         throw std::invalid_argument(
             "direct prompt grafts are held in the context cache, which is disabled");

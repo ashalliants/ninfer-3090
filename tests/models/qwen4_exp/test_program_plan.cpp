@@ -260,6 +260,27 @@ int main() {
         with_probs.mtp_draft_probs = 28;
         check(with_probs.fixed_bytes() == 528, "fixed_bytes counts the draft probabilities");
 
+        // Refusal steering (--graft): the device table is FP32 [vectors][layers][hidden]; nothing
+        // is planned without a vector, and fixed_bytes counts it.
+        {
+            q4::TextConfig steered_config   = config();
+            steered_config.num_hidden_layers = 48;
+            steered_config.hidden_size       = 2560;
+            q4::ProgramOptions steered;
+            steered.max_context = 32768;
+            check(q4::plan_steering(steered, steered_config) == 0, "without a steering vector nothing is planned");
+            for (const std::size_t vectors : {std::size_t{1}, std::size_t{3}}) {
+                steered.steering.assign(vectors, std::make_shared<const q4::SteeringVector>());
+                const std::uint64_t table = q4::plan_steering(steered, steered_config);
+                check(table == vectors * 48ULL * 2560ULL * 4ULL,
+                      "the steering table is FP32 [vectors][layers][hidden]");
+                q4::ProgramDevicePlan with_steering;
+                with_steering.io       = 500;
+                with_steering.steering = table;
+                check(with_steering.fixed_bytes() == 500 + table, "fixed_bytes counts the steering table");
+            }
+        }
+
         // The joint rule chooses each round's count; mtp_fixed_drafts (--mtp-fixed) would always verify
         // --draft-tokens. Startup refuses the pair naming both, before the device is asked anything.
         q4::TextConfig model            = config();

@@ -674,7 +674,7 @@ public:
           tokenizer(resources.tokenizer),
           processor(options.vision_enabled ? processor_options(resources) : fi::ProcessorOptions{}),
           vision_enabled(options.vision_enabled), max_context(options.max_context),
-          grafts(std::move(options.grafts)) {
+          grafts(std::move(options.grafts)), steering_names(std::move(options.steering_names)) {
         fi::bound_merged_tokens(processor, options.vision_max_merged_tokens);
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
@@ -755,9 +755,19 @@ public:
         }
     }
 
-    // The graft a request names, or null for none.
+    // The steering vector a request names (an index into steering_names), or -1 for none. An empty
+    // name is the opt-out / no selection, whatever the table holds.
+    [[nodiscard]] std::int32_t find_steering(const std::string& name) const {
+        if (name.empty()) { return -1; }
+        for (std::size_t i = 0; i < steering_names.size(); ++i) {
+            if (steering_names[i] == name) { return static_cast<std::int32_t>(i); }
+        }
+        return -1;
+    }
+
+    // The graft a request names, or null for none (a steering vector is not a prompt graft).
     [[nodiscard]] const PromptGraft* find_graft(const std::string& name) const {
-        if (name.empty()) { return nullptr; }
+        if (name.empty() || find_steering(name) >= 0) { return nullptr; }
         for (const PromptGraft& graft : grafts) {
             if (graft.name == name) { return &graft; }
         }
@@ -775,6 +785,7 @@ public:
     std::uint32_t max_context       = 0;
     std::size_t grammar_cache_bytes = 0;
     std::vector<PromptGraft> grafts;
+    std::vector<std::string> steering_names;
     bool ngram_index = false;
     // Special tokens: n-gram copy spans end at them.
     std::vector<TokenId> ngram_boundaries;
@@ -1028,6 +1039,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     }
     (void)checked_token_count(result.token_ids.size());
     if (graft) { prepend_graft(*graft, result, message_boundaries, cache_boundaries); }
+    result.steering          = impl_->find_steering(options.graft);
     result.identity.reusable = true;
     // A replayed graft's end is published as a shared prefix, so the graft is prefilled once. A
     // direct graft already is a pinned checkpoint at that frontier and publishes nothing there.

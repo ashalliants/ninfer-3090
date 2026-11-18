@@ -5,6 +5,7 @@ target_sources(ninfer_model_loading PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/config.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/load.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/memory_plan.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/steering.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/ngram_hash.cpp"
 )
 target_sources(ninfer_model_runtime PRIVATE

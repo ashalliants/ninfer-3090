@@ -26,6 +26,7 @@
 #include "models/qwen3_5/program/program.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/memory_plan.h"
+#include "models/qwen4_exp/steering.h"
 #include "models/qwen4_exp/program/expert_cache/expert_cache.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
@@ -355,6 +356,9 @@ struct ProgramDevicePlan {
     // --hc-int8: the int8 copies of every mixer's hyper-connection matrices (plan_hc_int8; 0 when
     // off), beside the BF16 weights, which stay loaded.
     std::uint64_t hc_int8_bytes = 0;
+    // Refusal steering (--graft NAME=PATH): the device table of every vector's per-layer
+    // directions, FP32 [vectors][layers][hidden] (plan_steering; 0 without a vector).
+    std::uint64_t steering = 0;
     // --ngram-flag-wait: the device counter of the round graphs' flag waits
     // (plan_ngram_flag_wait(...).device; 0 when off). The flag and the error word are pinned host
     // memory (.pinned), charged to the RAM ledger.
@@ -366,11 +370,14 @@ struct ProgramDevicePlan {
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept {
         return kv + workspace + staging + state + io + residency + speculation + shared_expert_workspace +
                mtp_constrained_masks + mtp_draft_probs + hot_embedding + cpu_misses + hc_int8_bytes +
-               ngram_flag_wait;
+               steering + ngram_flag_wait;
     }
 };
 
 struct ProgramOptions {
+    // The refusal-steering vectors a request may select (PreparedPromptData::steering indexes this
+    // list); empty: the forward runs no steering Op at all.
+    std::vector<std::shared_ptr<const SteeringVector>> steering;
     int device                    = 0;
     std::uint32_t max_context     = 0;
     std::uint32_t max_concurrency = 1;
@@ -568,6 +575,9 @@ struct NgramFlagPlan {
 // rows, the final mixer without, and with MTP the drafter's two block mixers and final mixer: 97,
 // or 100 with MTP, on Flash-Next); 0 without hc_int8.
 [[nodiscard]] std::uint64_t plan_hc_int8(const ProgramOptions& options, const TextConfig& config);
+
+// ProgramDevicePlan::steering of these options: FP32 [vectors][layers][hidden]; 0 without a vector.
+[[nodiscard]] std::uint64_t plan_steering(const ProgramOptions& options, const TextConfig& config);
 
 // --hc-fused-read's share of the forward workspace for calls of up to `columns` columns
 // (execution::Forward::hc_fused_read_workspace_bytes), part of ProgramDevicePlan::workspace (the

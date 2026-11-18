@@ -18,6 +18,9 @@
 
 #include "models/qwen4_exp/program/context_cache.h"
 
+#include <algorithm>
+#include <vector>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -44,9 +47,18 @@ struct CheckpointLayout {
     std::uint32_t image_slabs   = 0;
     bool vision                 = false;
     std::uint32_t identity_tag  = 0;
+    // The tags of the refusal-steering vectors the Program holds (Program::request_tag): a point
+    // whose context was computed under a vector carries that vector's tag, and an image of it is
+    // valid only to a Program holding the same vector.
+    std::vector<std::uint32_t> extra_tags;
     // Bounds for import: the context (tokens) and the public token domain.
     std::uint32_t capacity = 0;
     std::int64_t vocabulary = 0;
+
+    // Whether a point may carry `tag`: the Program's own, or one of a steering vector it holds.
+    [[nodiscard]] bool accepts_tag(std::uint32_t tag) const noexcept {
+        return tag == identity_tag || std::find(extra_tags.begin(), extra_tags.end(), tag) != extra_tags.end();
+    }
 
     [[nodiscard]] std::size_t page_bytes() const noexcept;
     [[nodiscard]] std::size_t image_bytes() const noexcept { return state_bytes + residual_bytes + logits_bytes; }

@@ -227,3 +227,19 @@ set_tests_properties(ninfer_qwen4_exp_ngram_flag_wait_mtp_test PROPERTIES SKIP_R
 add_test(NAME ninfer_qwen4_exp_gdn_async_commit_test
   COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --gdn-async-commit-exact --mtp 3)
 set_tests_properties(ninfer_qwen4_exp_gdn_async_commit_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# Host only: the refusal-steering control vector reader (--graft NAME=PATH on Qwen3.8-Flash-Next).
+# GGUF files written in memory: a valid one, its normalisation and digest, and every refusal.
+ninfer_add_test(ninfer_qwen4_exp_steering_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_steering.cpp"
+  LIBRARIES ninfer_model_loading)
+
+# GPU, real artifact (skips without NINFER_TEST_QWEN4EXP_ARTIFACT and NINFER_TEST_STEERING_VECTOR, a
+# GGUF control vector for the model): refusal steering (--graft NAME=PATH) through the Engine. The
+# steered and unsteered ids differ; the two decode side by side in two lanes with each one's solo
+# ids; and the context cache keeps them apart (a steered prompt is reused by steered requests only).
+ninfer_add_test(ninfer_qwen4_exp_steering_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_steering_real.cpp"
+  STANDALONE
+  LIBRARIES ninfer_engine ninfer_core)
+set_tests_properties(ninfer_qwen4_exp_steering_real_test PROPERTIES SKIP_RETURN_CODE 77)

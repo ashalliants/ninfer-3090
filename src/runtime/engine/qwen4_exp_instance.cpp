@@ -54,6 +54,8 @@ constexpr std::uint32_t kFewFrames = 2048;
 // counts, convert them to signed 64-bit and divide them into 32-bit frame counts); a caller that
 // builds EngineOptions directly gets the same bound.
 constexpr std::uint64_t kMaxByteOption = 1ULL << 40;
+// Refusal-steering vectors (--graft) one Engine holds; each is 0.5 MiB of device memory.
+constexpr std::size_t kMaxSteeringVectors = 16;
 // The context cache's Host tier: 4 GiB unless --host-context-mib says otherwise (Infernix's Flash-Next
 // default; about six 32K-token conversations, or many more sharing a prefix), off below 512 MiB (four
 // 32K-token checkpoints' state images), sized in 64 MiB steps.
@@ -228,7 +230,21 @@ void validate(const EngineOptions& options) {
     if (options.enable_vision && options.media_live_bytes == 0) {
         refuse("images need room for their decoded pixels: set a nonzero media live-byte budget");
     }
-    if (!options.grafts.empty()) { refuse("has no prompt grafts: remove --graft"); }
+    // --graft NAME=PATH names a refusal-steering vector (a GGUF control vector, models/qwen4_exp/
+    // steering.h), not a prompt: the model has no hidden prompts.
+    if (options.grafts.size() > kMaxSteeringVectors) {
+        refuse("holds at most " + std::to_string(kMaxSteeringVectors) + " --graft steering vectors");
+    }
+    for (std::size_t i = 0; i < options.grafts.size(); ++i) {
+        if (options.grafts[i].name.empty()) {
+            refuse("has a --graft vector with no name (an empty request graft means none)");
+        }
+        for (std::size_t j = i + 1; j < options.grafts.size(); ++j) {
+            if (options.grafts[i].name == options.grafts[j].name) {
+                refuse("has two --graft vectors named '" + options.grafts[i].name + "'");
+            }
+        }
+    }
     // A single --devices entry selects the card (Engine builds its DeviceContext from it), so it is
     // honored; more than one entry, or per-stage layer counts, would need pipeline stages.
     if (options.devices.size() > 1) { refuse("runs on one GPU: pass a single id to --devices"); }
@@ -276,6 +292,16 @@ bool artifact_is_qwen4_exp(const std::filesystem::path& artifact) noexcept {
     }
 }
 
+namespace {
+
+std::vector<std::string> graft_names(const std::vector<GraftSource>& grafts) {
+    std::vector<std::string> names;
+    for (const GraftSource& graft : grafts) { names.push_back(graft.name); }
+    return names;
+}
+
+} // namespace
+
 Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> source, const EngineOptions& options)
     : model(std::move(source)), parameters(*model),
       frontend(models::qwen3_5::make_frontend(model->resources(),
@@ -287,7 +313,8 @@ Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> sou
                                                .media_cache_bytes        = options.media_cache_bytes,
                                                .media_live_bytes         = options.media_live_bytes,
                                                .media_preprocess_threads = options.media_preprocess_threads,
-                                               .vision_max_merged_tokens = options.vision_max_merged_tokens})),
+                                               .vision_max_merged_tokens = options.vision_max_merged_tokens,
+                                               .steering_names           = graft_names(options.grafts)})),
       capacity(options.max_context) {}
 
 Qwen4ExpInstance::~Qwen4ExpInstance() = default;
@@ -318,11 +345,19 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     auto plan      = models::qwen4_exp::plan_load(reader, mtp, vision, next.hot_embedding_rows != 0, partial);
     binding.complete();
     const auto& config = plan.config();
+    // The refusal-steering vectors (--graft): read and checked before anything is pinned or loaded.
+    std::vector<std::shared_ptr<const models::qwen4_exp::SteeringVector>> steering;
+    for (const GraftSource& source : options.grafts) {
+        steering.push_back(std::make_shared<const models::qwen4_exp::SteeringVector>(
+            models::qwen4_exp::load_steering_vector(source, static_cast<std::int32_t>(config.hidden_size),
+                                                    static_cast<std::int32_t>(config.num_hidden_layers))));
+    }
     const auto hot_embedding =
         models::qwen4_exp::plan_hot_embedding(config.vocab_size, config.hidden_size, next.hot_embedding_rows);
 
     // The Program's options (the context cache's Host tier is set once the RAM ledger sized it).
     models::qwen4_exp::ProgramOptions program_options;
+    program_options.steering        = steering;
     program_options.device          = device.device;
     program_options.max_context     = options.max_context;
     program_options.max_concurrency = options.max_concurrency;

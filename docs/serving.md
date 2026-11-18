@@ -2318,6 +2318,44 @@ evicted, and later turns and shared prefixes are captured after it. In the promp
 positions are held by ids derived from the container's sha256, so the checkpoint is only ever
 matched by requests using the same graft.
 
+### Refusal steering on Qwen3.8-Flash-Next
+
+Qwen3.8-Flash-Next has no hidden prompts. On it `--graft NAME=PATH` loads a **refusal-direction
+control vector** instead: a GGUF file with one `direction.N` tensor of 2,560 F32 values per steered
+layer (the llama.cpp control-vector layout, `general.architecture` `controlvector`, with
+`controlvector.model_hint` `qwen4exp` when it names a model). The community publishes one for this
+model (for Strata, which loads it with `--control-vector-scaled ... --cvec-mode project`).
+
+```bash
+ninfer-serve qwen4exp.ninfer --graft uncensored=C:/vectors/orcarouter.gguf
+```
+
+A request selects it exactly as it selects a 27B graft, with `"graft": "NAME"` on Chat Completions,
+Responses and Anthropic Messages. `--default-graft NAME` turns it on for every request that states
+none, which makes it permanent for the model; a request opts out with `"graft": ""`. The
+selection table above applies unchanged. A name the server did not load fails with
+`400 unknown_graft`.
+
+A selecting request runs the same model, with the direction removed from the residual stream after
+every steered layer (`x <- x - (x . v) v` on each of the four hyper-connection streams, in FP32
+with one BF16 rounding). The projection is one small launch per layer, which is in the decode graph
+for as long as a vector is loaded: a request that selects none runs it as a no-op and its tokens
+are bit-for-bit those of a server with no vector. With no `--graft`, nothing changes at all.
+
+- **Context cache.** Steering changes the activations, so a steered request has its own cache
+  identity: it reuses only checkpoints computed under the same vector, and an unsteered request
+  never resumes from them. Both keep working, side by side, including persisted checkpoint images,
+  which carry each checkpoint's own identity and are refused by a server that does not hold the
+  vector.
+- **Lanes.** Each lane's selection is its own, so a steered and an unsteered request decode in the
+  same rounds.
+- **Speculation.** `--spec mtp` verifies with the steering on, so its tokens are the target's. The
+  drafter does not steer, which can lower the acceptance rate of a steered request, never the
+  tokens.
+- **The file.** Each direction is read as F32, checked (finite, non-zero, the model's width, a
+  layer in `[1, 47]`) and normalised to unit length at startup; anything else refuses to start,
+  naming the graft. Up to 16 vectors may be loaded, 0.5 MiB of device memory each.
+
 ## Authentication and CORS
 
 Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or Anthropic

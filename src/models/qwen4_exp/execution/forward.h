@@ -147,6 +147,9 @@ struct ForwardBatch {
     Tensor residual_out;     // when set: BF16 [S*H, T] copy of the final residual (the drafter's input)
     const MtpChunk* mtp_chunk = nullptr; // when set: the call's drafter cells (run_back writes them)
     const VisionInput* vision = nullptr; // when set: the image columns of a prefill call
+    // Refusal steering (ForwardOptions::steering): I32 [T], per column the steering set to remove
+    // after each layer, or -1 for none. Unset: no column is steered.
+    Tensor steer;
 };
 
 // The MTP drafter's own QSA layer (a 13th attention layer through the same block table) and state.
@@ -246,6 +249,7 @@ struct ForwardRowsBatch {
     Tensor block_start_rope;         // I32 [3, B]: each row's pooled-block start (ops::qsa_pool_keys)
     Tensor ngram_rows;               // U8 [row bytes, heads, B]: each column's n-gram rows
     Tensor residual_out;             // when set: BF16 [S*H, B], the final residual (the drafter's input)
+    Tensor steer;                    // when set: I32 [B], each row's steering set or -1 (ForwardBatch::steer)
 };
 
 // Several rows, each verifying W consecutive speculative positions (the MTP drafter's anchor plus
@@ -290,6 +294,7 @@ struct ForwardRowsVerifyBatch {
     Tensor block_start_rope;         // I32 [3, B]
     Tensor ngram_rows;               // U8 [row bytes, heads, B*W]: each column's n-gram rows
     Tensor residual_out;             // when set: BF16 [S*H, B*W], the drafter's next input
+    Tensor steer;                    // when set: I32 [B*W], each column's steering set or -1
     const ForwardRowsVerify* verify = nullptr;
 };
 
@@ -303,6 +308,19 @@ struct ForwardTap {
     std::vector<Tensor>* mixer_outputs = nullptr;
     std::vector<Tensor>* moe_inputs    = nullptr;
     std::vector<Tensor>* moe_outputs   = nullptr;
+};
+
+// Refusal steering (models/qwen4_exp/steering.h): unit directions, one per (set, layer), that
+// ops::direction_project removes from the residual after each block's MLP write. A call selects a
+// set per column (ForwardBatch::steer and the rows batches'); a column that selects none, and every
+// call that selects nothing, is untouched. The table is device memory owned by the caller and
+// outlives the Forward.
+struct SteeringTable {
+    const float* directions = nullptr; // device FP32 [sets][layers][hidden]
+    std::int32_t sets       = 0;
+    std::int32_t layers     = 0;
+    std::int32_t hidden     = 0;
+    std::vector<std::uint8_t> active; // per layer: some set steers it
 };
 
 // Opt-in execution choices of a Forward. Off (the default) runs every Op on the device's stream in
@@ -371,6 +389,12 @@ struct ForwardOptions {
     // linear_pair. NOT bitwise: the same A8 cast and integer products, summed in another fixed order
     // (still column invariant). Wider calls (prefill) are unchanged. No workspace.
     bool ggml_decode_mma = false;
+    // Refusal steering: null (the default) runs no extra Op, and the outputs are bitwise those of a
+    // Forward without the option. Set, a layer the table steers launches ops::direction_project for
+    // each call that carries a selection (the batches' `steer`). Not applied to the MTP drafter:
+    // speculation then drafts without the direction and the target's verification, which does apply
+    // it, accepts fewer drafts, never different tokens.
+    const SteeringTable* steering = nullptr;
 };
 
 class Forward {
@@ -474,6 +498,10 @@ public:
 private:
     void layers(std::uint32_t begin, std::uint32_t end, const ForwardBatch& batch, const ForwardTap* tap);
     void layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap);
+    // ForwardOptions::steering: removes each selected column's direction from the residual a layer
+    // just wrote (one launch); nothing when steering is off, the layer is not steered, or the call
+    // selects no column.
+    void steer(std::uint32_t layer, Tensor& residual, const Tensor& select);
     void ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);
     // The PLE injection of a call's columns: n-gram rows to the projection (one column at a time
     // when `columnwise`), the gate, and the convolution over `states` from `source` to
@@ -578,6 +606,7 @@ private:
     bool moe_fused_route_ = false; // ForwardOptions::moe_fused_route
     const HcInt8Copies* hc_int8_ = nullptr; // ForwardOptions::hc_int8
     bool hc_fused_read_ = false; // ForwardOptions::hc_fused_read
+    const SteeringTable* steering_ = nullptr; // ForwardOptions::steering
     bool ggml_decode_mma_ = false; // ForwardOptions::ggml_decode_mma
     Tensor mtp_frames_; // I32 [E]: every drafter expert resident at its own index
     DeviceBuffer mtp_frames_backing_;
