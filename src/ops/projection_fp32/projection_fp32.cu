@@ -31,6 +31,7 @@ struct Segments {
     const bf16* data[kMaxSegments];
     int begin[kMaxSegments + 1]; // first output row of each segment, then the total
     int count;
+    int rows; // the total again, at a fixed offset (see total_rows)
 };
 
 void require(bool condition, const char* message) {
@@ -41,14 +42,9 @@ bool aligned16(const void* p) { return reinterpret_cast<std::uintptr_t>(p) % 16 
 
 // The total row count. Segment fields are read at compile-time indices only: a runtime index into
 // the kernel parameter would copy it to local memory and put a local load before the weight loads.
-__device__ __forceinline__ int total_rows(const Segments& segments) {
-    int rows = segments.begin[1];
-#pragma unroll
-    for (int s = 2; s <= kMaxSegments; ++s) {
-        if (s == segments.count) { rows = segments.begin[s]; }
-    }
-    return rows;
-}
+// (Selecting begin[count] by compile-time compares was folded back into that indexed load, so the
+// host stores the total in its own field.)
+__device__ __forceinline__ int total_rows(const Segments& segments) { return segments.rows; }
 
 // The address of chunk `chunk` (8 elements) of output row `row`.
 __device__ __forceinline__ const uint4* row_chunk(const Segments& segments, int row, int k,
@@ -290,6 +286,7 @@ void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Te
         rows += w.ne[1];
     }
     segments.begin[segments.count] = rows;
+    segments.rows                  = rows;
     require(out.ne[0] == rows && out.ne[1] == columns && out.ne[2] == 1 && out.ne[3] == 1,
             "out must be FP32 [sum N, T]");
     const std::size_t staged =
