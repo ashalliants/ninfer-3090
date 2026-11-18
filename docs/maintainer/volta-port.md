@@ -308,6 +308,24 @@ Working with the 3.3 GB/s eGPU link (Flash-Next, measured 2026-11-17):
   swapping. A 3.9K-token prompt reads 27K blocks instead of 46K (0.50 s instead of 0.86): 4.97-5.05
   -> 4.67-4.79 s; 344 tokens 0.90-0.92 -> 0.84 s, 939 tokens 1.82-2.00 -> 1.68-1.71 s, 3,726 tokens
   4.78-4.80 -> 4.61 s; the same reply. The request log line counts rows served from RAM.
+- In-layer staging (`stage_kernel`) is link time, not latency to hide (2026-11-18, nothing kept).
+  On a 3.9K-token prompt (4.6-4.7 s) 87 of 480 stage launches carry ~370 ms: cold experts routed
+  more than 64 tokens, too wide for a CPU job. Pinned H2D on this link is 3.34 GB/s by DMA or by SM
+  copies (4-80 CTAs) alike, and the two share it: the expert stream's DMA runs at 2.73 GB/s alone
+  and 1.48 GB/s while a large stage copy runs. Tried, each the same or slower:
+  - the copy on a high-priority side stream while the pass's resident jobs compute, its staged jobs
+    after: the stage left the compute stream (377 -> 18 ms), but the split doubled the gate/up
+    launches (+162 ms) and the stream waits grew: 4.66-4.71 against 4.63-4.70 s;
+  - the same with 128 double-buffered slots, pass p + 1's copy under pass p: 4.63-4.72 against
+    4.63-4.64 s;
+  - the stream's ring as a FIFO in layer order (about nine layers of lookahead in the same 1024
+    frames): 5.04-5.07 against 4.73-4.74 s, as the link never idles when a layer stages;
+  - the next layer's stream copies held until this layer's staging is enqueued: 5.50-5.54 against
+    4.65-4.66 s (too little lookahead);
+  - CPU jobs wider than 64 columns: 128 -> 5.15-5.21 s, 256 -> 5.64 s (the CPU becomes the limit).
+  The two-layer parity ring with 64-column CPU jobs at share 0.5 is the balance of stream lookahead
+  against staging contention. Fewer bytes over the link (a higher expert-cache hit rate) is what
+  would shorten it.
 
 Serving on a V100: `scripts/run-v100.sh <model>` is run.sh with the V100's defaults (the sm_70
 server from build-v100/, the memory-lock fallback, a GPU check). For Flash-Next it keeps run.sh's
