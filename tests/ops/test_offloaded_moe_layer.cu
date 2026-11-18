@@ -61,6 +61,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/offloaded_sparse_moe.h"
+#include "ninfer/ops/hyper_connection.h"
 #include "ninfer/ops/silu_mul.h"
 #include "offloaded_moe_fixtures.h"
 #include "ops/offloaded_sparse_moe/cpu_selection.h"
@@ -331,6 +332,29 @@ void test_combine() {
         const auto crit = measure(got, want);
         check(accept(crit), "moe_combine outside the BF16 criterion against FP64");
         std::printf("combine T=%d vs FP64: normwise %.3e, worst %.3e\n", columns, crit.normwise, crit.worst);
+
+        // moe_combine_inject: the same y, and the residual hyper_connection_inject leaves, bit for bit.
+        constexpr int kStreams = 4;
+        std::vector<float> inject(static_cast<std::size_t>(kStreams) * columns);
+        std::uniform_real_distribution<float> spread(-2.0F, 2.0F);
+        for (float& v : inject) { v = spread(rng); }
+        const auto residual = random_x(kStreams * columns, rng);
+        DeviceBuffer d_inject(inject.size() * 4), d_r1(residual.size() * 2), d_r2(residual.size() * 2),
+            d_y2(shared.size() * 2);
+        d_inject.copy_from_host(inject.data(), inject.size() * 4);
+        d_r1.copy_from_host(residual.data(), residual.size() * 2);
+        d_r2.copy_from_host(residual.data(), residual.size() * 2);
+        const Tensor it(d_inject.p, DType::FP32, {kStreams, columns});
+        Tensor r1(d_r1.p, DType::BF16, {kStreams * om::kHidden, columns});
+        Tensor r2(d_r2.p, DType::BF16, {kStreams * om::kHidden, columns});
+        Tensor y2(d_y2.p, DType::BF16, {om::kHidden, columns});
+        ops::hyper_connection_inject(yt, it, r1, nullptr);
+        ops::moe_combine_inject(ot, r.routing, st, y2, it, r2, nullptr);
+        cuda_ok(cudaDeviceSynchronize(), "combine inject");
+        check(download<std::uint16_t>(d_y2.p, shared.size()) == got, "moe_combine_inject y differs from moe_combine");
+        check(download<std::uint16_t>(d_r2.p, residual.size()) == download<std::uint16_t>(d_r1.p, residual.size()),
+              "moe_combine_inject residual differs from hyper_connection_inject");
+        std::printf("combine+inject T=%d: bitwise the two launches\n", columns);
     }
 }
 

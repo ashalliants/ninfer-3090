@@ -390,6 +390,11 @@ void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const Mo
 void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared, Tensor& y,
                  cudaStream_t stream);
 
+/// moe_combine, then hyper_connection_inject(y, inject, residual) in the same launch: inject FP32
+/// [S, T], residual BF16 [S*H, T] (S <= 64). The same y and residual bits as the two calls.
+void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared, Tensor& y,
+                        const Tensor& inject, Tensor& residual, cudaStream_t stream);
+
 namespace offloaded_moe {
 
 // The host side of CPU-served misses: a service thread watches the mapped request that moe_experts

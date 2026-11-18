@@ -1373,6 +1373,31 @@ __global__ void combine_kernel(const bf16* __restrict__ outputs, const float* __
     y[static_cast<std::size_t>(t) * hidden + d] = __float2bfloat16_rn(sum);
 }
 
+// combine_kernel followed by hyper_connection_inject's update of every stream with the stored
+// (rounded) y, in one pass: the same y and residual bits as the two kernels.
+__global__ void combine_inject_kernel(const bf16* __restrict__ outputs, const float* __restrict__ weights,
+                                      const float* __restrict__ shared_gate, const bf16* __restrict__ shared,
+                                      int hidden, int top_k, int columns, bf16* __restrict__ y,
+                                      const float* __restrict__ inject, int streams, bf16* __restrict__ residual) {
+    const int d = blockIdx.y * blockDim.x + threadIdx.x;
+    const int t = blockIdx.x;
+    if (d >= hidden || t >= columns) { return; }
+    float sum = 0.0F;
+    for (int k = 0; k < top_k; ++k) { // fixed slot order
+        sum = __fmaf_rn(weights[static_cast<std::size_t>(t) * top_k + k],
+                        __bfloat162float(outputs[(static_cast<std::size_t>(t) * top_k + k) * hidden + d]), sum);
+    }
+    sum = __fmaf_rn(shared_gate[t], __bfloat162float(shared[static_cast<std::size_t>(t) * hidden + d]), sum);
+    const bf16 stored = __float2bfloat16_rn(sum);
+    y[static_cast<std::size_t>(t) * hidden + d] = stored;
+    const float v           = __bfloat162float(stored);
+    const std::size_t width = static_cast<std::size_t>(streams) * hidden;
+    for (int s = 0; s < streams; ++s) {
+        bf16& r = residual[static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d];
+        r       = __float2bfloat16_rn(__bfloat162float(r) + inject[static_cast<std::size_t>(t) * streams + s] * v);
+    }
+}
+
 // ------------------------------------------------------------------------------------ workspace
 
 struct ExpertsWorkspace {
@@ -1646,6 +1671,38 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
         static_cast<const float*>(routing.shared_gate.data), static_cast<const bf16*>(shared.data), hidden, top_k,
         columns, static_cast<bf16*>(y.data));
     check_launch("combine");
+}
+
+void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared, Tensor& y,
+                        const Tensor& inject, Tensor& residual, cudaStream_t stream) {
+    require(contiguous(outputs, DType::BF16) && contiguous(shared, DType::BF16) && contiguous(y, DType::BF16) &&
+                contiguous(routing.weights, DType::FP32) && contiguous(routing.shared_gate, DType::FP32) &&
+                contiguous(inject, DType::FP32) && contiguous(residual, DType::BF16),
+            "combine requires contiguous BF16 tensors and FP32 routing");
+    const std::int64_t hidden64 = y.ne[0], columns64 = y.ne[1], top_k64 = routing.weights.ne[0];
+    require(top_k64 >= 1 && top_k64 <= 16, "combine supports top_k in [1, 16]");
+    require(hidden64 > 0 && hidden64 <= std::numeric_limits<int>::max() && columns64 > 0 &&
+                columns64 * top_k64 <= std::numeric_limits<int>::max(),
+            "combine dimensions out of range");
+    const int hidden = static_cast<int>(hidden64), columns = static_cast<int>(columns64),
+              top_k = static_cast<int>(top_k64);
+    require(outputs.ne[0] == hidden && outputs.ne[1] == columns * top_k && shared.ne[0] == hidden &&
+                shared.ne[1] == columns && routing.weights.ne[1] == columns &&
+                routing.shared_gate.numel() == columns,
+            "combine shapes disagree");
+    const std::int64_t streams64 = inject.ne[0];
+    require(streams64 >= 1 && streams64 <= 64 && inject.ne[1] == columns && inject.numel() == streams64 * columns &&
+                residual.ne[0] == streams64 * hidden && residual.ne[1] == columns &&
+                residual.numel() == streams64 * hidden * columns,
+            "combine inject shapes disagree");
+    const dim3 grid(grid_blocks(columns, 1, kGridMaxX, "combine columns exceed the launch grid"),
+                    grid_blocks(hidden, kThreads, kGridMaxY, "combine hidden extent exceeds the launch grid"));
+    combine_inject_kernel<<<grid, kThreads, 0, stream>>>(
+        static_cast<const bf16*>(outputs.data), static_cast<const float*>(routing.weights.data),
+        static_cast<const float*>(routing.shared_gate.data), static_cast<const bf16*>(shared.data), hidden, top_k,
+        columns, static_cast<bf16*>(y.data), static_cast<const float*>(inject.data), static_cast<int>(streams64),
+        static_cast<bf16*>(residual.data));
+    check_launch("combine inject");
 }
 
 } // namespace ninfer::ops

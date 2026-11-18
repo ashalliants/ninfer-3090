@@ -572,13 +572,12 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
                                       route_log(layer, static_cast<std::size_t>(config_.moe.top_k) * T));
         xm         = read.x;
         mlp_inject = read.inject;
-        ym         = moe(block.moe, xm, layer, route_tap, cpu_channels(batch), &read);
+        ym         = moe(block.moe, xm, layer, route_tap, cpu_channels(batch), &read, &mlp_inject, &residual);
     } else {
         ops::hyper_connection_inject(y, inject, residual, s);
         xm = mix(block.mlp_hc, residual, &inject);
-        ym = moe(block.moe, xm, layer, route_tap, cpu_channels(batch));
+        ym = moe(block.moe, xm, layer, route_tap, cpu_channels(batch), nullptr, &inject, &residual);
     }
-    ops::hyper_connection_inject(ym, mlp_inject, residual, s);
     steer(layer, residual, batch.steer);
     if (tap != nullptr) {
         copy_tap(tap->mixer_inputs, layer, xa, s);
@@ -859,7 +858,8 @@ const std::vector<ops::MoeCpuChannel>* Forward::cpu_channels(const ForwardBatch&
 }
 
 Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
-                    const std::vector<ops::MoeCpuChannel>* cpu_leg, const MoeRead* read) {
+                    const std::vector<ops::MoeCpuChannel>* cpu_leg, const MoeRead* read, const Tensor* inject,
+                    Tensor* residual) {
     const cudaStream_t s = device_.stream;
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
@@ -966,7 +966,11 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     // was allocated before the shared expert's tensors and the scope ends with the layer).
     if (cpu) { ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s); }
     Tensor y = work_->alloc(DType::BF16, {H, T});
-    ops::moe_combine(outputs, routing, shared, y, s);
+    if (inject != nullptr && residual != nullptr) {
+        ops::moe_combine_inject(outputs, routing, shared, y, *inject, *residual, s);
+    } else {
+        ops::moe_combine(outputs, routing, shared, y, s);
+    }
     return y;
 }
 
@@ -1065,15 +1069,13 @@ void Forward::layer_rows(std::uint32_t layer, const ForwardRowsBatch& batch) {
     if (fused_read(block.mlp_hc, B)) {
         const MoeRead read = read_moe(block.mlp_hc, block.moe.router, block.moe.shared_score, residual_, y, inject,
                                       route_log(layer, static_cast<std::size_t>(config_.moe.top_k) * B));
-        Tensor ym          = moe(block.moe, read.x, layer, nullptr, /*cpu=*/nullptr, &read);
-        ops::hyper_connection_inject(ym, read.inject, residual_, s);
+        moe(block.moe, read.x, layer, nullptr, /*cpu=*/nullptr, &read, &read.inject, &residual_);
         steer(layer, residual_, batch.steer);
         return;
     }
     ops::hyper_connection_inject(y, inject, residual_, s);
     Tensor xm = mix(block.mlp_hc, residual_, &inject);
-    Tensor ym = moe(block.moe, xm, layer, nullptr, /*cpu=*/nullptr);
-    ops::hyper_connection_inject(ym, inject, residual_, s);
+    moe(block.moe, xm, layer, nullptr, /*cpu=*/nullptr, nullptr, &inject, &residual_);
     steer(layer, residual_, batch.steer);
 }
 
@@ -1318,15 +1320,13 @@ void Forward::layer_rows_verify(std::uint32_t layer, const ForwardRowsVerifyBatc
     if (fused_read(block.mlp_hc, T)) {
         const MoeRead read = read_moe(block.mlp_hc, block.moe.router, block.moe.shared_score, residual_, y, inject,
                                       route_log(layer, static_cast<std::size_t>(config_.moe.top_k) * T));
-        Tensor ym          = moe(block.moe, read.x, layer, nullptr, &experts_.cpu, &read);
-        ops::hyper_connection_inject(ym, read.inject, residual_, s);
+        moe(block.moe, read.x, layer, nullptr, &experts_.cpu, &read, &read.inject, &residual_);
         steer(layer, residual_, batch.steer);
         return;
     }
     ops::hyper_connection_inject(y, inject, residual_, s);
     Tensor xm = mix(block.mlp_hc, residual_, &inject);
-    Tensor ym = moe(block.moe, xm, layer, nullptr, &experts_.cpu);
-    ops::hyper_connection_inject(ym, inject, residual_, s);
+    moe(block.moe, xm, layer, nullptr, &experts_.cpu, nullptr, &inject, &residual_);
     steer(layer, residual_, batch.steer);
 }
 

@@ -547,8 +547,11 @@ private:
     [[nodiscard]] const std::vector<ops::MoeCpuChannel>* cpu_channels(const ForwardBatch& batch) const noexcept;
     // `cpu`: the call's CPU channels (cpu_channels; null or empty: every expert on the GPU). `read`:
     // the block's input as the fused read left it (x is read->x), whose routing it uses.
+    // `inject`/`residual` (both or neither): also hyper_connection_inject(y, *inject, *residual), in
+    // the combine's launch.
     Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
-               const std::vector<ops::MoeCpuChannel>* cpu, const MoeRead* read = nullptr);
+               const std::vector<ops::MoeCpuChannel>* cpu, const MoeRead* read = nullptr,
+               const Tensor* inject = nullptr, Tensor* residual = nullptr);
     // A BF16 Linear of a verification call: one column at a time, so each column takes the
     // one-column route a decode call takes (their T > 1 routes sum in other orders).
     void project_verify(const Tensor& x, const LinearParameters& p, Tensor& out, bool columnwise);
