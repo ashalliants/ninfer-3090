@@ -493,6 +493,17 @@ public:
     // The largest shared_expert_scratch_bytes over the text model's layers at calls of 1 to
     // `columns` columns (the drafter's shared expert is BF16 rows projected in FP32: no scratch).
     [[nodiscard]] std::size_t max_shared_expert_scratch_bytes(std::int32_t columns) const;
+    // The workspace a run_front + run_back call of `columns` columns peaks at, from this Forward's
+    // weights and options: the call's allocations replayed on a bump allocator, layer by layer
+    // (the residual, then each layer's held tensors in order, through the MoE's), with each Op's
+    // own scratch (its workspace capacity query) taken at the offset where it runs. A layer's
+    // mixer tensors stay live through its MoE, so it is a sum along the layer, not a max over
+    // blocks as workspace_bytes is. workspace_bytes stays the plan's configuration-only bound
+    // (before the weights load); this is at most it. A call of fewer columns peaks no higher.
+    // Calls of at most kHcInt8MaxColumns columns (the int8 mixers and the fused read) return
+    // workspace_bytes and its additions.
+    [[nodiscard]] std::size_t call_workspace_bytes(std::int32_t columns, std::uint32_t max_visible_keys,
+                                                   DeviceExecutionView execution) const;
     // ForwardOptions::ggml_decode_mma: whether projection `p` can run as it would under the option.
     // The int8 tensor-core decode route stages a GGML weight from the 16-byte unit holding its first
     // byte, so a projection the option moves to it (a GGML weight whose policy admits A8) must start

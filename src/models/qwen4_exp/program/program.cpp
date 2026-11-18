@@ -3543,18 +3543,16 @@ private:
             return_lease();
         }
         if (!stream_ || plan_.wide_work == 0 || remaining < kStreamMinColumns) { return false; }
-        // The workspace of this prompt's widest call (not the planned wide_chunk columns). The keys
-        // stay the planned envelope: Forward::attention runs the QSA selection at
-        // kv_.max_visible_keys, whose scratch grows with it, so a smaller figure here would
-        // under-allocate the lent arena.
+        // The workspace of this prompt's widest call (not the planned wide_chunk columns), replayed
+        // from the Forward's own allocations (Forward::call_workspace_bytes: 0.86 GiB at 3.9K
+        // columns, where the configuration-only bound said 1.67). The keys stay the planned
+        // envelope: Forward::attention runs the QSA selection at kv_.max_visible_keys, whose
+        // scratch grows with it, so a smaller figure here would under-allocate the lent arena.
         const std::int32_t widest   = std::min(plan_.wide_chunk, remaining);
         const std::uint32_t keys    = plan_.pages * kPagedKVPageSize;
         const std::size_t work      = std::min<std::size_t>(
-            plan_.wide_work,
-            execution::Forward::workspace_bytes(c_, widest, keys, DeviceExecutionView{nullptr, plan_.sms},
-                                                options_.moe_precast_input) +
-                (options_.shared_expert_stream ? forward_->max_shared_expert_scratch_bytes(widest) : 0) +
-                execution::Forward::tensor_core_workspace_bytes(c_, widest));
+            plan_.wide_work, forward_->call_workspace_bytes(widest, keys, DeviceExecutionView{nullptr, plan_.sms}));
+        lease_work_ = work;
         const std::uint64_t stride  = residency_->frame_stride();
         const std::size_t tables    = align(stream_->table_bytes());
         const auto work_frames      = static_cast<std::uint32_t>((tables + work + stride - 1) / stride);
@@ -3644,7 +3642,17 @@ private:
     // still has them lent.
     void return_lease() {
         if (!lease_.valid()) { return; }
-        wide_peak_ = std::max(wide_peak_, wide_work_ ? wide_work_->peak_used() : 0);
+        const std::size_t peak = wide_work_ ? wide_work_->peak_used() : 0;
+        wide_peak_ = std::max(wide_peak_, peak);
+        if (peak > lease_work_ && !lease_work_reported_) {
+            // The lent arena's frames round the estimate up, so the call still fit; but the replay
+            // in Forward::call_workspace_bytes no longer matches the forward's allocations.
+            lease_work_reported_ = true;
+            char line[200];
+            std::snprintf(line, sizeof(line), "prefill workspace: a call peaked at %zu bytes, above the %zu estimated",
+                          peak, lease_work_);
+            diagnostic(line);
+        }
         // The forward must never keep pointing at the lent arena destroyed below.
         if (forward_) { forward_->use_workspace(*work_); }
         wide_work_.reset();
@@ -6246,6 +6254,8 @@ private:
     std::int32_t* stream_tables_ = nullptr;
     std::uint32_t ring_first_ = 0, ring_frames_ = 0;
     std::size_t wide_peak_ = 0;
+    std::size_t lease_work_         = 0; // the held lease's workspace estimate
+    bool lease_work_reported_       = false;
     std::uint64_t leases_ = 0, refilled_ = 0;
     std::uint32_t last_lease_ = 0;
     // The next prefill call's n-gram rows, read while the device runs the current one.

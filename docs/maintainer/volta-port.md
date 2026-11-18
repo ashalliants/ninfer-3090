@@ -342,6 +342,25 @@ Working with the 3.3 GB/s eGPU link (Flash-Next, measured 2026-11-17):
   lend: its bound is 1,709 MiB at 3,935 columns (Forward 1,588, tensor-core staging 108, shared expert
   13), but the arena's measured peak is 835 MiB. Tightening it needs each op's scratch audited,
   because an arena that is too small fails the call.
+- The prefill lend's workspace is the call's replayed peak (2026-11-18). `Forward::workspace_bytes`
+  is a configuration-only bound for the plan: the largest block's scratch plus 462 MiB of linear
+  casts and 256 MiB of slack, but a block's mixer tensors stay live through its MoE, so the arena's
+  shape is a sum along the layer, not a max. `Forward::call_workspace_bytes` replays the call's
+  allocations on a bump allocator with the arena's 256-byte alignment, from the Forward's own
+  weights and options: the residual; per layer the PLE scope, the inject, the mix, the GDN or
+  attention tensors in order, then the MoE (mix, the side stream's carve and shared-expert tensors,
+  routing, dispatch, the routed outputs and the experts' workspace); the drafter's prefill cells
+  (`kv_only`, so up to the KV append); the final mix. Each Op's own scratch is its capacity query
+  (linear, which includes the sm_70 tensor-core staging; hyper-connection mix; GDN; QSA select and
+  attention) taken at the offset where it runs. Calls of at most 16 columns (the int8 mixers and the
+  fused read) keep the old bound, and the result never exceeds it. The forward real test checks
+  each mode (serial, the shared-expert side stream, `--gdn-head-map`, `--moe-precast-input`, tensor
+  cores on and off) at 1,495-1,500 columns: the estimate equals the arena's peak or exceeds it by at
+  most 1.5 KB. `program.cpp` logs a diagnostic once if a lent call ever peaks above its estimate.
+  At 3,935 columns the workspace lend fell from 1,186 to 582 frames (835 MiB peak); at 939 columns
+  from 365 to 146. Prompts (HEAD | this, the same replies): 3,935 tokens 4.74-4.75 | 4.62-4.65 s;
+  3,798 4.11 | 3.88-3.90 s; 2,573 3.62-3.64 | 3.40-3.41 s; 2,212 3.39 | 3.19-3.20 s; 1,414
+  2.84-2.85 | 2.78-2.79 s; 939 1.73 | 1.69-1.71 s; an 8,063-token prompt (two calls) 8.93 | 8.92-8.96 s.
 
 Serving on a V100: `scripts/run-v100.sh <model>` is run.sh with the V100's defaults (the sm_70
 server from build-v100/, the memory-lock fallback, a GPU check). For Flash-Next it keeps run.sh's

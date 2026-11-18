@@ -459,6 +459,178 @@ std::size_t Forward::shared_expert_scratch_bytes(const MoeParameters& p, std::in
     return bytes;
 }
 
+std::size_t Forward::call_workspace_bytes(std::int32_t columns, std::uint32_t max_visible_keys,
+                                          DeviceExecutionView execution) const {
+    const TextConfig& c = config_;
+    const std::size_t bound =
+        workspace_bytes(c, columns, max_visible_keys, execution, moe_precast_input_) +
+        (side_ ? max_shared_expert_scratch_bytes(columns) : 0) + tensor_core_workspace_bytes(c, columns);
+    if (columns <= ops::kHcInt8MaxColumns) { return bound; }
+    // DeviceArena's bump allocation: each block 256-aligned from the arena's (aligned) base.
+    struct Replay {
+        std::size_t off = 0, peak = 0;
+        static std::size_t up(std::size_t n) { return (n + 255) / 256 * 256; }
+        void alloc(std::size_t bytes) {
+            off  = up(off) + bytes;
+            peak = std::max(peak, off);
+        }
+        void scratch(std::size_t bytes) { peak = std::max(peak, up(off) + bytes); } // an Op's, released
+    } r;
+    const std::size_t T = static_cast<std::size_t>(columns), bf = 2, f = 4;
+    const std::size_t H = c.hidden_size, W = c.residual_width(), S = c.hc.streams;
+    const auto linear = [&](const LinearParameters& p, std::int32_t t = 0) {
+        return ops::linear_workspace_capacity_bytes(p.weight.qtype, p.weight.n, p.weight.k,
+                                                    linear_policy(p, ggml_decode_mma_), 1, t > 0 ? t : columns);
+    };
+    const auto mix = [&](const HyperConnectionParameters& p, std::int32_t t = 0) {
+        t = t > 0 ? t : columns;
+        r.alloc(H * static_cast<std::size_t>(t) * bf);
+        r.scratch(ops::hyper_connection_mix_workspace_capacity_bytes(p.down.weight, p.up.weight, p.down.policy,
+                                                                     dim(c.hc.streams), dim(c.hc.rank), t));
+    };
+    // run_front: the residual, then the embedding's scope.
+    r.alloc(W * T * bf);
+    const std::size_t residual_end = r.off;
+    r.scratch(H * T * bf);
+    const auto& g = c.gdn;
+    const std::size_t C = g.conv_channels(), KW = g.key_width(), VW = g.value_width(), NV = g.value_heads;
+    const std::size_t DK = g.key_head_dim, DV = g.value_head_dim;
+    const auto& a = c.attention;
+    const std::size_t D = a.head_dim, NH = a.heads, KVH = a.kv_heads, QW = a.query_width();
+    const std::size_t IH = c.qsa.index_heads, ID = c.qsa.index_head_dim;
+    const auto geometry = qsa_geometry(c);
+    for (std::uint32_t l = 0; l < c.num_hidden_layers; ++l) {
+        const auto& block = parameters_.layers[l];
+        r.off = residual_end; // the layer's scope
+        if (block.ple) {      // ple_inject's own scope
+            r.alloc(std::size_t(c.ple.embed_dim) * T * bf);
+            r.alloc((W + H) * T * bf);
+            r.scratch(linear(block.ple->projection));
+            r.alloc(W * T * bf);
+            r.alloc(H * T * bf);
+            r.alloc(W * T * bf);
+            r.alloc(W * T * bf);
+            r.off = residual_end;
+        }
+        r.alloc(S * T * f); // inject
+        mix(block.attn_hc);
+        if (c.layer_types[l] == MixerKind::Gdn) {
+            const auto& p = std::get<GdnParameters>(block.mixer);
+            r.alloc(C * T * bf);
+            r.alloc(VW * T * bf);
+            r.scratch(std::max(linear(p.qkv), linear(p.z)));
+            r.alloc(2 * NV * T * bf);
+            r.scratch(linear(p.control));
+            r.alloc(NV * T * f);
+            r.alloc(NV * T * f);
+            if (NV != 48) { // gdn(): the gates split out when they are not packed
+                r.alloc(NV * T * bf);
+                r.alloc(NV * T * bf);
+            }
+            r.alloc(KW * T * bf);
+            r.alloc(KW * T * bf);
+            r.alloc(VW * T * bf);
+            if (!gdn_head_map_) {
+                r.alloc(DK * NV * T * bf);
+                r.alloc(DK * NV * T * bf);
+            }
+            r.alloc(DV * NV * T * bf);
+            const auto qk_heads = dim(gdn_head_map_ ? g.key_heads : g.value_heads);
+            r.scratch(ops::gated_delta_net_workspace_capacity_bytes(qk_heads, dim(g.value_heads), 1, columns));
+            r.alloc(DV * NV * T * bf);
+            r.alloc(H * T * bf);
+            r.scratch(linear(p.output));
+        } else {
+            const auto& p = std::get<AttentionParameters>(block.mixer);
+            r.alloc(2 * QW * T * bf);
+            r.scratch(linear(p.query_gate));
+            r.alloc(D * NH * T * bf);
+            r.alloc(D * NH * T * bf);
+            r.alloc(D * KVH * T * bf);
+            r.alloc(D * KVH * T * bf);
+            r.scratch(std::max(linear(p.key), linear(p.value)));
+            r.alloc(ID * IH * T * bf);
+            r.alloc(ID * T * bf);
+            if (!ops::projection_bf16_split_supported(columns)) {
+                r.alloc((IH * ID + ID) * T * f);
+                r.alloc((IH * ID + ID) * T * bf);
+            }
+            r.alloc(D * NH * T * bf);
+            r.alloc(D * KVH * T * bf);
+            r.alloc(std::size_t(c.qsa.budget / c.qsa.compress_ratio) * T * f);
+            r.alloc(T * f);
+            r.scratch(ops::qsa_select_blocks_workspace_capacity_bytes(geometry, {max_visible_keys}, 1, columns, execution));
+            r.alloc(D * NH * T * bf);
+            r.scratch(ops::qsa_attention_workspace_capacity_bytes({dim(a.head_dim), dim(a.heads), dim(a.kv_heads)},
+                                                                  geometry, KvCacheStorage::Int8Group64, 1, columns,
+                                                                  execution));
+            r.alloc(H * T * bf);
+            r.scratch(linear(p.output));
+        }
+        // The MoE (above kHcInt8MaxColumns there is no fused read): its input mix, then moe().
+        mix(block.mlp_hc);
+        const auto& m = c.moe;
+        const std::size_t E = m.experts, K = m.top_k, I = m.shared_intermediate;
+        const auto shared_tensors = [&](bool own_scratch) {
+            const auto& p = block.moe;
+            r.alloc(I * T * bf);
+            r.alloc(I * T * bf);
+            if (own_scratch) { r.scratch(std::max(linear(p.shared_gate), linear(p.shared_up))); }
+            r.alloc(I * T * bf);
+            r.alloc(H * T * bf);
+            if (own_scratch) { r.scratch(linear(p.shared_down)); }
+        };
+        if (side_) {
+            r.alloc(shared_expert_scratch_bytes(block.moe, columns, columns)); // the side stream's carve
+            shared_tensors(false);
+        }
+        r.alloc((E + 1) * T * f);
+        r.alloc(K * T * f);
+        r.alloc(K * T * f);
+        r.alloc(T * f);
+        r.alloc(ops::moe_dispatch_bytes(dim(E), dim(K * T)));
+        r.alloc(H * K * T * bf);
+        const std::int32_t max_jobs = std::min(dim(E), dim(K * T));
+        r.alloc(ops::moe_experts_workspace_bytes(max_jobs, dim(K * T), columns, moe_precast_input_));
+        if (!side_) { shared_tensors(true); }
+        r.alloc(H * T * bf);
+    }
+    // run_back: the drafter's cells (mtp_cells: sub-chunks of at most kMtpChunkColumns of the call's
+    // columns and a prepended cell; mtp_block with kv_only returns after mtp_attention's KV append),
+    // then the final mix and the gathered logit columns.
+    r.off = residual_end;
+    if (parameters_.mtp) {
+        const auto& p         = *parameters_.mtp;
+        const std::int32_t n  = std::min(columns + 1, kMtpChunkColumns);
+        const std::size_t N   = static_cast<std::size_t>(n);
+        const auto rows       = [&](std::size_t width) { // project_rows: FP32 rows, then their BF16 cast
+            r.alloc(width * N * f);
+            r.alloc(width * N * bf);
+        };
+        r.alloc(W * N * bf); // the cells' residual rows
+        r.alloc(H * N * bf); // x0
+        r.alloc(H * N * bf); // e
+        r.alloc(H * N * bf); // ep
+        r.scratch(linear(p.embedding_projection, n));
+        r.alloc(W * N * bf); // hn
+        r.alloc(W * N * bf); // the fused residual
+        r.scratch(linear(p.hidden_projection, dim(S) * n));
+        r.alloc(S * N * f); // inject
+        mix(p.attn_hc, n);
+        rows(2 * D * KVH);
+        r.alloc(D * KVH * N * bf);
+        r.alloc(D * KVH * N * bf);
+        rows(IH * ID + ID);
+        r.alloc(ID * IH * N * bf);
+        r.alloc(ID * N * bf);
+        r.alloc(D * KVH * N * bf);
+        r.off = residual_end;
+    }
+    mix(parameters_.final_mixer);
+    r.alloc(H * T * bf);
+    return std::min(bound, r.peak);
+}
+
 std::size_t Forward::max_shared_expert_scratch_bytes(std::int32_t columns) const {
     std::size_t bytes = 0;
     for (const auto& block : parameters_.layers) {

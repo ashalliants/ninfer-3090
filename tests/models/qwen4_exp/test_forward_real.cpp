@@ -362,6 +362,19 @@ struct Harness {
     std::unique_ptr<ex::Forward> forward;
 };
 
+// The Program lends a prefill call Forward::call_workspace_bytes and no more: a call of `columns`
+// must not have peaked above it (the arena itself is sized by the configuration-only bound).
+void require_call_workspace(const Harness& harness, std::int32_t columns, std::int32_t context, DeviceContext& device) {
+    const std::size_t peak = harness.work->peak_used();
+    const std::size_t estimate =
+        harness.forward->call_workspace_bytes(columns, static_cast<std::uint32_t>(context), device.execution_view());
+    std::printf("workspace of a %d-column call: peak %zu, estimate %zu bytes\n", columns, peak, estimate);
+    if (peak > estimate) {
+        throw std::runtime_error("a " + std::to_string(columns) + "-column call peaked at " + std::to_string(peak) +
+                                 " workspace bytes, above Forward::call_workspace_bytes " + std::to_string(estimate));
+    }
+}
+
 // Device copies of one call's inputs: positions [first, first + width) of `tokens`.
 struct Call {
     DeviceBuffer buffer;
@@ -1457,6 +1470,7 @@ int shared_expert_mode(int argc, char** argv, const char* artifact_env) {
         std::vector<std::vector<float>> rows;
         harness.forward->run(prompt.batch, out);
         device.synchronize();
+        require_call_workspace(harness, head, context, device);
         rows.push_back(to_float(logits, vocab));
         for (const Call& step : steps) {
             if (graphs) {
@@ -1585,6 +1599,7 @@ int identity_mode(int argc, char** argv, const char* artifact_env, const std::st
         Tensor one(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 1});
         harness.forward->run(prompt.batch, one);
         device.synchronize();
+        require_call_workspace(harness, head, context, device);
         rows.push_back(to_float(logits, vocab));
         const ex::ForwardVerify view = verifier.view(window);
         verify.batch.verify          = &view;
@@ -1813,6 +1828,7 @@ int main(int argc, char** argv) {
             harness.forward->run(full.batch, full_logits, tapped ? &tap : nullptr);
             device.synchronize();
             std::printf("prefill %d tokens as one chunk: %.1f ms\n", n, seconds_since(t0) * 1e3);
+            require_call_workspace(harness, n, context, device);
             const auto dump = [&](const std::string& path, std::size_t offset, std::size_t bytes) {
                 if (path.empty()) { return; }
                 std::vector<std::byte> host(bytes);
