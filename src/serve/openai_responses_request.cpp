@@ -1545,6 +1545,12 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
             bad_request("log probabilities are not available for streaming responses", "include",
                         "logprobs_not_supported");
         }
+        // A reply that only calls tools has no output_text part to hold the entries, and the
+        // request cannot say beforehand whether the model will call one.
+        if (!out.tools.empty()) {
+            bad_request("log probabilities are not available when tools are declared", "include",
+                        "logprobs_not_supported");
+        }
         out.prompt.generation.logprobs_top_k = static_cast<std::uint32_t>(top_logprobs_count);
     }
     if (const std::optional<int> max_tool_calls = optional_int(body, "max_tool_calls")) {

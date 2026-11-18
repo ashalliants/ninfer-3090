@@ -1633,6 +1633,16 @@ int test_output_text_logprobs() {
                       }) == "logprobs_not_supported",
                       "streamed logprobs were accepted");
 
+    Json with_tools     = asked;
+    with_tools["tools"] = Json::array(
+        {Json{{"type", "function"},
+              {"name", "weather"},
+              {"parameters", Json{{"type", "object"}, {"properties", Json::object()}}}}});
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(with_tools, limits());
+                      }).code == "logprobs_not_supported",
+                      "logprobs with declared tools were accepted");
+
     GenerationOutcome outcome = sample_outcome();
     outcome.token_logprobs.push_back(
         ninfer::TokenLogprob{.sampled = {.token = 65, .logprob = -0.25F, .bytes = "A"},

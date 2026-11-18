@@ -1707,9 +1707,9 @@ target model's probability for it, like any other token.
 The response is built when generation finishes, so the request must be non-streaming, and thinking
 must be disabled (`chat_template_kwargs.enable_thinking=false` or `reasoning_effort=none`):
 otherwise the first tokens are reasoning, and a thinking budget or reasoning-loop guard inserts
-tokens the model never produced. Anything else fails with `logprobs_not_supported`. The Responses
-endpoint still refuses nonzero `top_logprobs`, and the Anthropic endpoint has no log-probability
-field.
+tokens the model never produced. Anything else fails with `logprobs_not_supported`. The
+[Responses endpoint](#responses-log-probabilities) returns the same entries; the Anthropic endpoint
+has no log-probability field.
 
 ### Chat custom tools
 
@@ -1926,7 +1926,8 @@ wire response contains typed `output` Items.
 part carries `logprobs`, the same entries as [Chat](#chat-log-probabilities) (`token`, `logprob`,
 `bytes`, and `top_logprobs` when `top_logprobs` is set), one for every generated token. The same
 limits apply: non-streaming only, and thinking disabled (`reasoning.effort: "none"`); anything else
-fails with `logprobs_not_supported`.
+fails with `logprobs_not_supported`. A request that declares `tools` is refused too: a response that
+only calls tools has no message to carry the entries, so they would be dropped silently.
 
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
 with a field-specific 400 error instead of being silently ignored.
