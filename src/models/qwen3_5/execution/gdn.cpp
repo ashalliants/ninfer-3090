@@ -64,20 +64,23 @@ std::size_t record_scratch_bytes(const GdnParameters& parameters, const GdnConfi
 } // namespace
 
 std::size_t gdn_projection_workspace_bytes(const GdnParameters& parameters, std::int32_t first,
-                                           std::int32_t last) {
+                                           std::int32_t last, bool prefill) {
+    const auto policy = [&](ops::LinearPolicy own) {
+        return prefill ? ops::prefill_phase_policy(own) : own;
+    };
     if (first <= 0 || last < first) {
         throw std::invalid_argument("GDN projection: invalid column interval");
     }
     std::size_t inner;
     if (const auto* single = std::get_if<LinearParameters>(&parameters.projection)) {
         const auto& w = single->weight;
-        inner = ops::gdn_input_proj_workspace_capacity_bytes(w.qtype, w.n, w.k, single->policy,
-                                                             first, last);
+        inner = ops::gdn_input_proj_workspace_capacity_bytes(w.qtype, w.n, w.k,
+                                                             policy(single->policy), first, last);
     } else {
         const auto& pair = std::get<ops::PairedProjectionWeights>(parameters.projection);
         inner            = ops::gdn_input_proj_split_workspace_capacity_bytes(
             pair.first.qtype, pair.first.n, pair.second.qtype, pair.second.n, pair.first.k,
-            pair.policy, first, last);
+            policy(pair.policy), first, last);
     }
     return rotated_workspace_bytes(projection_signs(parameters.projection),
                                    projection_input_rows(parameters.projection), last, inner);

@@ -10,6 +10,7 @@
 
 #include "guarded_main.h"
 #include "models/qwen3_5/execution/ffn.h"
+#include "ninfer/ops/linear.h"
 
 #include <cstdint>
 #include <iostream>
@@ -135,9 +136,41 @@ void run_combined_flags() {
     }
 }
 
+// The cuBLAS prefill route admits prefill-phase calls from kCublasPrefillNarrowMinTokens (65 on
+// sm_70; the wide gate, 129, elsewhere) through ops::prefill_phase_policy, while decode and verify
+// keep the wide gate. Planning once sized prefill for the weight's own policy, so a --prefill-chunk
+// of 65-128 planned no route scratch and every such call quietly fell back (PR #300 review).
+void run_prefill_phase_gate() {
+#if defined(NINFER_SM8X_COMPAT)
+    DenseParameters cublas = parameters(/*prefill_a8=*/true, /*a8_decode=*/false);
+    cublas.gate_up.policy        = LinearPolicy::AllowPrefillCublas; // --prefill-cublas
+    cublas.down.policy           = LinearPolicy::AllowPrefillCublas;
+    cublas.verify_gate_up_policy = cublas.gate_up.policy;
+    const bool narrow = ninfer::ops::kCublasPrefillNarrowMinTokens < ninfer::ops::kCublasPrefillMinTokens;
+    for (const std::int32_t width : {64, 65, 96, 128, 129, 1024}) {
+        const std::size_t phase = ffn_workspace_bytes(cublas, 1, width, false, false, /*prefill=*/true);
+        const std::size_t own   = ffn_workspace_bytes(cublas, 1, width, false, false, /*prefill=*/false);
+        const bool opens        = narrow && width >= ninfer::ops::kCublasPrefillNarrowMinTokens &&
+                           width < ninfer::ops::kCublasPrefillMinTokens;
+        if (opens) {
+            check(phase > own, "a prefill chunk of " + std::to_string(width) +
+                                   " must plan the route scratch its calls take");
+        } else {
+            check(phase == own, "prefill planning must equal the weight's own policy at chunk " +
+                                    std::to_string(width));
+        }
+        // Verify keeps the wide gate whatever the phase sizing does.
+        check(ffn_workspace_bytes(cublas, 1, width, false, true) ==
+                  ffn_workspace_bytes(cublas, 1, width, false, true, /*prefill=*/false),
+              "verify planning must not change at T=" + std::to_string(width));
+    }
+#endif
+}
+
 int run() {
     run_planning();
     run_combined_flags();
+    run_prefill_phase_gate();
     std::cout << (failures == 0 ? "OK" : "FAIL")
               << " --mlp-a8-decode phase gate and workspace planning\n";
     return failures == 0 ? 0 : 1;

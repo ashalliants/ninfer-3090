@@ -21,7 +21,10 @@ bool rotated_dense(const DenseParameters& p) {
 // A Hadamard-rotated Dense FFN projects gate/up into one plane from the rotated input; when down
 // is rotated, silu_mul_hadamard writes its input already in the rotated basis.
 std::size_t rotated_dense_workspace_bytes(const DenseParameters& p, std::int32_t first,
-                                          std::int32_t last) {
+                                          std::int32_t last, bool prefill) {
+    const auto policy = [&](ops::LinearPolicy own) {
+        return prefill ? ops::prefill_phase_policy(own) : own;
+    };
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
     WorkspaceLayoutBuilder layout;
@@ -31,11 +34,11 @@ std::size_t rotated_dense_workspace_bytes(const DenseParameters& p, std::int32_t
         (void)layout.alloc_bytes(
             rotated_workspace_bytes(p.gate_up.hadamard_signs, gu.k, last,
                                     ops::linear_workspace_capacity_bytes(
-                                        gu.qtype, gu.n, gu.k, p.gate_up.policy, first, last)));
+                                        gu.qtype, gu.n, gu.k, policy(p.gate_up.policy), first, last)));
     }
     (void)layout.alloc(DType::BF16, {gu.n / 2, last});
-    (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(down.qtype, down.n, down.k,
-                                                                      p.down.policy, first, last));
+    (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
+        down.qtype, down.n, down.k, policy(p.down.policy), first, last));
     return layout.peak_bytes(1);
 }
 
@@ -67,14 +70,18 @@ void rotated_dense_ffn(const Tensor& hidden, const DenseParameters& p, Tensor& r
 } // namespace
 
 std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
-                                std::int32_t last, bool mtp, bool verify) {
+                                std::int32_t last, bool mtp, bool verify, bool prefill) {
     if (first <= 0 || last < first) { throw std::invalid_argument("FFN: invalid column interval"); }
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {
         return ops::sparse_moe_workspace_capacity_bytes(moe->routed_gate_up.qtype,
                                                         moe->routed_down.qtype, first, last);
     }
     const auto& p = std::get<DenseParameters>(parameters);
-    if (rotated_dense(p)) { return rotated_dense_workspace_bytes(p, first, last); }
+    if (rotated_dense(p)) { return rotated_dense_workspace_bytes(p, first, last, prefill); }
+    // The policies ffn() / rotated_dense_ffn() run with (prefill: ops::prefill_phase_policy).
+    const auto policy = [&](ops::LinearPolicy own) {
+        return prefill ? ops::prefill_phase_policy(own) : own;
+    };
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
     WorkspaceLayoutBuilder layout;
@@ -94,13 +101,13 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
         {
             auto scope = layout.scope();
             (void)layout.alloc_bytes(ops::linear_swiglu_workspace_capacity_bytes(
-                gu.qtype, gu.n, gu.k, verify ? p.verify_gate_up_policy : p.gate_up.policy, first,
-                last));
+                gu.qtype, gu.n, gu.k, verify ? p.verify_gate_up_policy : policy(p.gate_up.policy),
+                first, last));
         }
         {
             auto scope = layout.scope();
             (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
-                down.qtype, down.n, down.k, p.down.policy, first, last));
+                down.qtype, down.n, down.k, policy(p.down.policy), first, last));
         }
     }
     return layout.peak_bytes(1);

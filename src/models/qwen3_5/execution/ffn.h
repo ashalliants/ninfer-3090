@@ -7,10 +7,11 @@
 namespace ninfer::models::qwen3_5::execution {
 
 // `verify` selects the Verify-phase gate_up policy (DenseParameters::verify_gate_up_policy).
-// `prefill` marks a prefill-phase call, whose dense projections take ops::prefill_phase_policy.
+// `prefill` marks a prefill-phase call, whose dense projections take ops::prefill_phase_policy;
+// ffn_workspace_bytes sizes for the same policies ffn() runs with.
 [[nodiscard]] std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
                                               std::int32_t last, bool mtp = false,
-                                              bool verify = false);
+                                              bool verify = false, bool prefill = false);
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, DeviceExecutionView execution,
          bool mtp = false, bool verify = false, InputBasis basis = InputBasis::Primal,

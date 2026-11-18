@@ -419,12 +419,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                             ops::linear_workspace_capacity_bytes(
                                 p.weight.qtype, p.weight.n, p.weight.k, p.policy, first, last)));
     };
+    // A mixer's output projection (execution::linear_add): `prefill` sizes it for the prefill-phase
+    // policy the call runs with (ops::prefill_phase_policy, whose cuBLAS gate is
+    // kCublasPrefillNarrowMinTokens), decode and verify for the weight's own.
     const auto add_scratch = [&](WorkspaceLayoutBuilder& layout,
-                                 const execution::LinearParameters& p, int first, int last) {
+                                 const execution::LinearParameters& p, int first, int last,
+                                 bool prefill) {
+        const ops::LinearPolicy policy = prefill ? ops::prefill_phase_policy(p.policy) : p.policy;
         scratch(layout, execution::rotated_workspace_bytes(
                             p.hadamard_signs, p.weight.k, last,
                             ops::linear_add_workspace_capacity_bytes(
-                                p.weight.qtype, p.weight.n, p.weight.k, p.policy, first, last)));
+                                p.weight.qtype, p.weight.n, p.weight.k, policy, first, last)));
     };
     // `layers` is the model's own parameters everywhere but the int4 scout (scout_a4_layers).
     const auto target_layers = [&](WorkspaceLayoutBuilder& layout,
@@ -433,14 +438,18 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                    GdnWorkspacePath path, std::int32_t batch_size,
                                    std::int32_t min_width, std::int32_t max_width,
                                    ops::CausalAttentionExecutionEnvelope envelope) {
+        // Prefill-phase calls open the cuBLAS route from kCublasPrefillNarrowMinTokens (65 on
+        // sm_70): size their projections for the policy they run with, or a chunk of 65-128
+        // columns would plan no route scratch and every such call would fall back.
+        const bool prefill = phase == TextPhase::Prefill;
         for (const auto& block : layers) {
             {
                 auto stage = layout.scope();
                 if (const auto* attention =
                         std::get_if<execution::AttentionParameters>(&block.mixer)) {
                     (void)workspace::text_attention_projection(layout, config, last);
-                    scratch(layout, execution::attention_projection_workspace_bytes(*attention,
-                                                                                    first, last));
+                    scratch(layout, execution::attention_projection_workspace_bytes(
+                                        *attention, first, last, prefill));
                     (void)workspace::text_attention_results(layout, config, last);
                     scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
                                         {dimension(config.attention->head_dim),
@@ -448,7 +457,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                          dimension(config.attention->num_key_value_heads)},
                                         plan.kv_storage, envelope, batch_size, min_width, max_width,
                                         device_execution));
-                    add_scratch(layout, attention->output, first, last);
+                    add_scratch(layout, attention->output, first, last, prefill);
                 } else {
                     const auto& gdn = std::get<execution::GdnParameters>(block.mixer);
                     (void)workspace::gdn_control(layout, config, last);
@@ -464,8 +473,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                             gdn, *config.gdn, batch_size, min_width, max_width));
                     } else {
                         (void)workspace::gdn_prefill_conv(layout, config, last);
-                        scratch(layout,
-                                execution::gdn_projection_workspace_bytes(gdn, first, last));
+                        scratch(layout, execution::gdn_projection_workspace_bytes(gdn, first, last,
+                                                                                  prefill));
                     }
                     (void)workspace::gdn_recurrent_output(layout, config, last);
                     if (path == GdnWorkspacePath::Prefill) {
@@ -475,13 +484,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                     dimension(config.gdn->linear_num_value_heads), first, last));
                     }
                     (void)workspace::gdn_normalized_output(layout, config, last);
-                    add_scratch(layout, gdn.output, first, last);
+                    add_scratch(layout, gdn.output, first, last, prefill);
                 }
             }
             auto stage = layout.scope();
             (void)workspace::post_mixer_hidden(layout, config, last);
             scratch(layout, execution::ffn_workspace_bytes(block.ffn, first, last, false,
-                                                           phase == TextPhase::Verify));
+                                                           phase == TextPhase::Verify, prefill));
         }
         if (!plan.causal_scoring) {
             linear_scratch(layout, parameters.text.output_head, first, last);
@@ -821,7 +830,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                           dimension(draft->attention.num_key_value_heads)},
                                          {0, plan.capacity}, width, width, batch)));
                     for (const auto& block : parameters.draft->layers) {
-                        add_scratch(layout, block.output, tokens, tokens);
+                        add_scratch(layout, block.output, tokens, tokens, /*prefill=*/false);
                     }
                 }
                 {
@@ -836,7 +845,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                                 tokens, tokens)));
                     }
                     for (const auto& block : parameters.draft->layers) {
-                        add_scratch(layout, block.mlp.down, tokens, tokens);
+                        add_scratch(layout, block.mlp.down, tokens, tokens, /*prefill=*/false);
                     }
                 }
                 matrix(layout, DType::BF16, dimension(config.hidden_size), drafts * batch);
@@ -1355,9 +1364,11 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .max_concurrency      = options.max_concurrency,
         .prefill_chunk        = std::min(options.prefill_chunk, options.max_context),
         // The route is reached only through the integer policies (parameters.cpp), so it is on
-        // exactly when both options are.
+        // exactly when both options are. Prefill calls admit it from the prefill-phase gate
+        // (ops::prefill_phase_policy: 65 on sm_70, the wide 129 elsewhere), so a tail is reshaped
+        // only when it is narrower than that.
         .prefill_tail_floor   = options.prefill_a8 && options.prefill_cublas
-                                    ? static_cast<std::uint32_t>(ops::kCublasPrefillMinTokens)
+                                    ? static_cast<std::uint32_t>(ops::kCublasPrefillNarrowMinTokens)
                                     : 0U,
         .progress_anchor_tokens = options.progress_anchor_tokens,
         .progress_anchors_shared = options.progress_anchors_shared,

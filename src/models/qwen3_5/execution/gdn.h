@@ -6,8 +6,10 @@
 
 namespace ninfer::models::qwen3_5::execution {
 
+// `prefill`: size for the prefill-phase policy gdn_projection() runs with (ops::prefill_phase_policy).
 [[nodiscard]] std::size_t gdn_projection_workspace_bytes(const GdnParameters& parameters,
-                                                         std::int32_t first, std::int32_t last);
+                                                         std::int32_t first, std::int32_t last,
+                                                         bool prefill = false);
 [[nodiscard]] std::size_t gdn_snapshot_workspace_bytes(const GdnParameters& parameters,
                                                        const GdnConfig& config, std::int32_t batch,
                                                        std::int32_t first_width,
