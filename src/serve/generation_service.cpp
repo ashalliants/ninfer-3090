@@ -133,6 +133,11 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception,
         error.type   = "server_error";
         error.code   = "service_unavailable";
         break;
+    case ninfer::RequestErrorKind::LogprobsNotSupported:
+        error.status = 400;
+        error.param  = "logprobs";
+        error.code   = "logprobs_not_supported";
+        break;
     case ninfer::RequestErrorKind::NumericalFailure:
         error.param.clear();
         error.status = 500;

@@ -81,7 +81,8 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
             options.execution.thinking.loop != ReasoningLoopAction::Off) {
             // The Engine inserts control tokens when a thinking budget or loop guard closes the
             // reasoning; no model distribution produced them, so they have no log-probability.
-            throw std::invalid_argument(
+            throw RequestError(
+                RequestErrorKind::LogprobsNotSupported,
                 "logprobs cannot be combined with a thinking budget or a reasoning-loop guard");
         }
     }

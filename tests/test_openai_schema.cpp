@@ -181,7 +181,7 @@ int test_standard_field_policy() {
 
     rejected("n", 2, "n_not_supported");
     rejected("logit_bias", Json{{"12", 1}}, "logit_bias_not_supported");
-    rejected("top_logprobs", 2, "");
+    rejected("top_logprobs", 2, "logprobs_not_supported");
     rejected("modalities", Json::array({"text", "audio"}), "modality_not_supported");
     rejected("web_search_options", Json::object(), "web_search_not_supported");
     rejected("moderation", Json::object(), "moderation_not_supported");
@@ -1199,10 +1199,19 @@ int test_logprobs_request() {
               "negative top_logprobs is refused");
     Json orphan            = base_request();
     orphan["top_logprobs"] = 3;
-    failures += check(rejected_with(orphan, "top_logprobs", ""),
+    failures += check(rejected_with(orphan, "top_logprobs", "logprobs_not_supported"),
                       "top_logprobs without logprobs is refused");
     failures += check(rejected_with(logprobs_request(Json{{"logprobs", "yes"}}), "logprobs", ""),
                       "a non-boolean logprobs is refused");
+
+    // An Engine that cannot carry logprobs refuses with its own kind, which maps to the same
+    // structured error as the wire-level refusals (not the generic invalid-prompt one).
+    const ApiError unsupported = request_error_to_api_error(
+        ninfer::RequestError(ninfer::RequestErrorKind::LogprobsNotSupported,
+                             "this model does not return token log-probabilities"));
+    failures += check(unsupported.status == 400 && unsupported.param == "logprobs" &&
+                          unsupported.code == "logprobs_not_supported",
+                      "an Engine logprobs refusal maps to logprobs_not_supported");
 
     ServeOptions server;
     failures +=

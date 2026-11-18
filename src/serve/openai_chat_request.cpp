@@ -931,7 +931,8 @@ void parse_logprobs(const Json& body, OpenAIChatRequest& output) {
     }
     if (!logprobs) {
         if (top_logprobs && *top_logprobs != 0) {
-            bad_request("top_logprobs requires logprobs to be true", "top_logprobs");
+            bad_request("top_logprobs requires logprobs to be true", "top_logprobs",
+                        "logprobs_not_supported");
         }
         return;
     }

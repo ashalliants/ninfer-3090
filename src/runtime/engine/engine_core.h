@@ -296,7 +296,8 @@ public:
         }
 
         if (options.execution.logprobs_top_k && !kLogprobsCapable) {
-            throw std::invalid_argument("this model does not return token log-probabilities");
+            throw RequestError(RequestErrorKind::LogprobsNotSupported,
+                               "this model does not return token log-probabilities");
         }
         std::uint64_t request_id        = 0;
         std::uint64_t publication_order = 0;
