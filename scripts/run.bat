@@ -280,6 +280,9 @@ if /i "%MODEL_KEY%"=="qwen38-flash-next" goto :ngram_guard_done
 echo NINFER_NGRAM_VOLUME is for qwen38-flash-next only; clear it to serve %MODEL_KEY% 1>&2
 exit /b 2
 :ngram_guard_done
+set "REASONING_LOOP="
+set "LOOP_NOTE="
+set "FN_SAMPLING_ARGS="
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-27b/tuned" goto :profile_27b_tuned
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen36-35b-a3b/tuned" goto :profile_35b_tuned
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-flash-next/tuned" goto :profile_flash_next
@@ -514,6 +517,16 @@ echo NINFER_NGRAM_VOLUME names a file that does not exist: "%NINFER_NGRAM_VOLUME
 echo Copy the model's .ngram file there, or clear NINFER_NGRAM_VOLUME to read the one beside the model. 1>&2
 exit /b 2
 :ngram_volume_done
+rem The reasoning-loop guard, and the sampling guard's two overrides, only when asked for. The 27B's
+rem tuned profile defaults min-p and the presence penalty for its small quant; Flash-Next keeps its
+rem registered presets unless one is set ("default" also leaves the preset). A presence penalty is
+rem what broke the reasoning loops seen with a refusal-steering graft at temperature 0
+rem (docs\tesla-v100.md, "Refusal steering").
+call :reasoning_loop_guard || exit /b 2
+if defined REASONING_LOOP set "PROFILE_ARGS=%PROFILE_ARGS% --reasoning-loop %REASONING_LOOP%"
+if not "%NINFER_MIN_P%"=="" if /i not "%NINFER_MIN_P%"=="default" set "FN_SAMPLING_ARGS=--min-p %NINFER_MIN_P%"
+if not "%NINFER_PRESENCE_PENALTY%"=="" if /i not "%NINFER_PRESENCE_PENALTY%"=="default" set "FN_SAMPLING_ARGS=%FN_SAMPLING_ARGS% --presence-penalty %NINFER_PRESENCE_PENALTY%"
+if defined FN_SAMPLING_ARGS set "PROFILE_ARGS=%PROFILE_ARGS% %FN_SAMPLING_ARGS%"
 goto :launch
 
 :profile_27b_int8
@@ -618,30 +631,7 @@ if not "%NINFER_NUMERIC_TRIPWIRE%"=="" if /i not "%NINFER_NUMERIC_TRIPWIRE%"=="o
   echo NINFER_NUMERIC_TRIPWIRE must be on or off, got %NINFER_NUMERIC_TRIPWIRE% 1>&2
   exit /b 2
 )
-rem Reasoning-loop guard (--reasoning-loop): off unless asked for. It has never fired on the 27B in
-rem the measurements behind it (#217: 21 requests, including one written to make the model loop),
-rem and its thresholds come from other models, so turning it on by default would trade an unmeasured
-rem false-positive risk for no observed benefit. `off` is the server's own default and passes nothing.
-set "REASONING_LOOP="
-set "LOOP_NOTE="
-if "%NINFER_REASONING_LOOP%"=="" goto :loop_done
-if /i "%NINFER_REASONING_LOOP%"=="off" (
-  set "LOOP_NOTE=Reasoning-loop guard: off  (NINFER_REASONING_LOOP)"
-  goto :loop_done
-)
-if /i "%NINFER_REASONING_LOOP%"=="stop" (
-  set "REASONING_LOOP=stop"
-  set "LOOP_NOTE=Reasoning-loop guard: stop - a reply whose thinking keeps repeating itself ends early  (NINFER_REASONING_LOOP)"
-  goto :loop_done
-)
-if /i "%NINFER_REASONING_LOOP%"=="conclude" (
-  set "REASONING_LOOP=conclude"
-  set "LOOP_NOTE=Reasoning-loop guard: conclude - thinking that keeps repeating itself is closed and the model answers  (NINFER_REASONING_LOOP)"
-  goto :loop_done
-)
-echo NINFER_REASONING_LOOP must be off, stop or conclude, got %NINFER_REASONING_LOOP% 1>&2
-exit /b 2
-:loop_done
+call :reasoning_loop_guard || exit /b 2
 if defined REASONING_LOOP set "KNOB_ARGS=%KNOB_ARGS% --reasoning-loop %REASONING_LOOP%"
 rem The store directory is an arbitrary path: the unquoted `set NAME=value` form puts the quotes
 rem around the expansion, as for CHAT_TEMPLATE_ARGS below, so metacharacters stay inert.
@@ -789,7 +779,8 @@ if not "%PREFILL_NOTE%"=="" echo %PREFILL_NOTE%
 if defined NGRAM_VOLUME_NOTE echo %NGRAM_VOLUME_NOTE%
 if /i "%PROFILE%"=="tuned" echo %CACHE_NOTE%
 if /i "%PROFILE%"=="tuned" echo Sampling guard: min-p %MIN_P%, presence penalty %PRESENCE%  (NINFER_MIN_P, NINFER_PRESENCE_PENALTY; "default" = registered preset)
-if /i "%PROFILE%"=="tuned" if defined LOOP_NOTE echo %LOOP_NOTE%
+if defined FN_SAMPLING_ARGS echo Sampling:%FN_SAMPLING_ARGS%  (NINFER_MIN_P, NINFER_PRESENCE_PENALTY)
+if defined LOOP_NOTE echo %LOOP_NOTE%
 rem GRAFT_ARGS carries literal embedded quotes (--graft "godmode=<path>"), so re-quoting it for a
 rem string comparison here garbles the quoting and breaks the if statement. `defined` sidesteps
 rem that: it tests the variable directly, with no substitution.
@@ -880,6 +871,32 @@ if not "%NINFER_KV_DTYPE%"=="" set "OVERRIDE_ARGS=%OVERRIDE_ARGS% --kv-dtype %NI
 if /i not "%SPEC%"=="none" if not "%NINFER_DRAFT_TOKENS%"=="" set "OVERRIDE_ARGS=%OVERRIDE_ARGS% --draft-tokens %NINFER_DRAFT_TOKENS%"
 if not "%NINFER_PREFILL_CHUNK%"=="" set "OVERRIDE_ARGS=%OVERRIDE_ARGS% --prefill-chunk %NINFER_PREFILL_CHUNK%"
 exit /b 0
+
+:reasoning_loop_guard
+rem Reasoning-loop guard (--reasoning-loop): off unless asked for, on every model's tuned profile. It
+rem has never fired on the 27B in the measurements behind it (#217: 21 requests, including one written
+rem to make the model loop), and its thresholds come from other models, so turning it on by default
+rem would trade an unmeasured false-positive risk for no observed benefit. `off` is the server's own
+rem default and passes nothing. Sets REASONING_LOOP and LOOP_NOTE; exits 2 on an unknown mode.
+set "REASONING_LOOP="
+set "LOOP_NOTE="
+if "%NINFER_REASONING_LOOP%"=="" exit /b 0
+if /i "%NINFER_REASONING_LOOP%"=="off" (
+  set "LOOP_NOTE=Reasoning-loop guard: off  (NINFER_REASONING_LOOP)"
+  exit /b 0
+)
+if /i "%NINFER_REASONING_LOOP%"=="stop" (
+  set "REASONING_LOOP=stop"
+  set "LOOP_NOTE=Reasoning-loop guard: stop - a reply whose thinking keeps repeating itself ends early  (NINFER_REASONING_LOOP)"
+  exit /b 0
+)
+if /i "%NINFER_REASONING_LOOP%"=="conclude" (
+  set "REASONING_LOOP=conclude"
+  set "LOOP_NOTE=Reasoning-loop guard: conclude - thinking that keeps repeating itself is closed and the model answers  (NINFER_REASONING_LOOP)"
+  exit /b 0
+)
+echo NINFER_REASONING_LOOP must be off, stop or conclude, got %NINFER_REASONING_LOOP% 1>&2
+exit /b 2
 
 :usage
 echo usage: run.bat ^<model^> [profile]

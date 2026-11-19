@@ -94,7 +94,8 @@
 # NINFER_CONTEXT, NINFER_CONCURRENCY,
 # NINFER_KV_CAPACITY, NINFER_KV_DTYPE, NINFER_SPEC, NINFER_DRAFT_TOKENS, NINFER_PREFILL_CHUNK,
 # NINFER_NGRAM (on|off; n-gram copy drafting, on with DFlash2 at one or two lanes), NINFER_VISION (on|off), NINFER_VISION_RESIDENCY, NINFER_HOST_CONTEXT_MIB (8192), NINFER_MIN_P (0.03) and
-# NINFER_PRESENCE_PENALTY (0.5), the loop guard ("default" keeps the registered preset).
+# NINFER_PRESENCE_PENALTY (0.5), the loop guard ("default" keeps the registered preset). On
+# qwen38-flash-next those two are passed only when set, and NINFER_REASONING_LOOP (below) applies too.
 #
 # SERVING KNOBS, `tuned` only. Each is passed to ninfer-serve only when set, so leaving them all
 # unset keeps the profile exactly as measured; `ninfer-serve --help` says what each one does.
@@ -232,11 +233,33 @@ tuned_overrides() {
   [[ -z "${NINFER_PREFILL_CHUNK:-}" ]] || profile_args+=(--prefill-chunk "$NINFER_PREFILL_CHUNK")
 }
 
+# Reasoning-loop guard (--reasoning-loop): off unless asked for, on every model's tuned profile. It
+# has never fired on the 27B in the measurements behind it (#217: 21 requests, including one written
+# to make the model loop), and its thresholds come from other models, so turning it on by default
+# would trade an unmeasured false-positive risk for no observed benefit. `off` is the server's own
+# default and passes nothing.
+reasoning_loop_guard() {
+  loop_note=''
+  case "${NINFER_REASONING_LOOP:-}" in
+    '') ;;
+    off) loop_note='Reasoning-loop guard: off  (NINFER_REASONING_LOOP)' ;;
+    stop)
+      profile_args+=(--reasoning-loop stop)
+      loop_note='Reasoning-loop guard: stop - a reply whose thinking keeps repeating itself ends early  (NINFER_REASONING_LOOP)' ;;
+    conclude)
+      profile_args+=(--reasoning-loop conclude)
+      loop_note='Reasoning-loop guard: conclude - thinking that keeps repeating itself is closed and the model answers  (NINFER_REASONING_LOOP)' ;;
+    *) printf 'NINFER_REASONING_LOOP must be off, stop or conclude, got %s\n' "$NINFER_REASONING_LOOP" >&2; exit 2 ;;
+  esac
+}
+
 # The profile fixes the whole serving shape. `label` is the banner; `profile_file` is the profile
 # file and `profile_args` everything after it on the command line.
 label=''
 profile_file=''
 profile_args=()
+loop_note=''
+fn_sampling_note=''
 case "$model_key/$profile" in
   qwen38-27b/tuned)
     # The speculative backend fixes everything that has to move with it, so each has its own file:
@@ -466,6 +489,20 @@ case "$model_key/$profile" in
       profile_args+=(--ngram-volume "$NINFER_NGRAM_VOLUME")
       ngram_note="N-gram volume: $NINFER_NGRAM_VOLUME  (NINFER_NGRAM_VOLUME)"
     fi
+    # The reasoning-loop guard, and the sampling guard's two overrides, only when asked for. The 27B's
+    # tuned profile defaults min-p and the presence penalty for its small quant; Flash-Next keeps its
+    # registered presets unless one is set ("default" also leaves the preset). A presence penalty
+    # is what broke the reasoning loops seen with a refusal-steering graft at temperature 0
+    # (docs/tesla-v100.md, "Refusal steering").
+    reasoning_loop_guard
+    fn_sampling=()
+    [[ -z "${NINFER_MIN_P:-}" || "$NINFER_MIN_P" == 'default' ]] || fn_sampling+=(--min-p "$NINFER_MIN_P")
+    [[ -z "${NINFER_PRESENCE_PENALTY:-}" || "$NINFER_PRESENCE_PENALTY" == 'default' ]] ||
+      fn_sampling+=(--presence-penalty "$NINFER_PRESENCE_PENALTY")
+    if (( ${#fn_sampling[@]} > 0 )); then
+      profile_args+=("${fn_sampling[@]}")
+      fn_sampling_note="Sampling: ${fn_sampling[*]}  (NINFER_MIN_P, NINFER_PRESENCE_PENALTY)"
+    fi
     # Not the shared tuned profile: no vision/host-cache/sampling-guard block below, no host-pin
     # retry at the bottom. Renamed so both skip it cleanly, same trick as run.bat's PROFILE rename.
     profile='flash-next' ;;
@@ -542,23 +579,7 @@ if [[ "$profile" == 'tuned' ]]; then
     off) ;;
     *) printf 'NINFER_NUMERIC_TRIPWIRE must be on or off, got %s\n' "$NINFER_NUMERIC_TRIPWIRE" >&2; exit 2 ;;
   esac
-  # Reasoning-loop guard (--reasoning-loop): off unless asked for. It has never fired on the 27B in
-  # the measurements behind it (#217: 21 requests, including one written to make the model loop),
-  # and its thresholds come from other models, so turning it on by default would trade an
-  # unmeasured false-positive risk for no observed benefit. `off` is the server's own default and
-  # passes nothing.
-  loop_note=''
-  case "${NINFER_REASONING_LOOP:-}" in
-    '') ;;
-    off) loop_note='Reasoning-loop guard: off  (NINFER_REASONING_LOOP)' ;;
-    stop)
-      profile_args+=(--reasoning-loop stop)
-      loop_note='Reasoning-loop guard: stop - a reply whose thinking keeps repeating itself ends early  (NINFER_REASONING_LOOP)' ;;
-    conclude)
-      profile_args+=(--reasoning-loop conclude)
-      loop_note='Reasoning-loop guard: conclude - thinking that keeps repeating itself is closed and the model answers  (NINFER_REASONING_LOOP)' ;;
-    *) printf 'NINFER_REASONING_LOOP must be off, stop or conclude, got %s\n' "$NINFER_REASONING_LOOP" >&2; exit 2 ;;
-  esac
+  reasoning_loop_guard
   if [[ -n "${NINFER_CONTEXT_STORE:-}" ]]; then
     profile_args+=(--context-store "$NINFER_CONTEXT_STORE")
     [[ -z "${NINFER_CONTEXT_STORE_MAX_GIB:-}" ]] || profile_args+=(--context-store-max-gib "$NINFER_CONTEXT_STORE_MAX_GIB")
@@ -673,8 +694,9 @@ if [[ "$profile" == 'tuned' ]]; then
   printf '%s\n' "$cache_note"
   printf 'Sampling guard: min-p %s, presence penalty %s  (NINFER_MIN_P, NINFER_PRESENCE_PENALTY; "default" = registered preset)\n' \
     "$MIN_P" "$PRESENCE_PENALTY"
-  [[ -z "$loop_note" ]] || printf '%s\n' "$loop_note"
 fi
+[[ -z "$fn_sampling_note" ]] || printf '%s\n' "$fn_sampling_note"
+[[ -z "$loop_note" ]] || printf '%s\n' "$loop_note"
 [[ -z "${NINFER_CHAT_TEMPLATE:-}" ]] || printf 'Chat template: %s\n' "$NINFER_CHAT_TEMPLATE"
 (( ${#allowed_hosts[@]} == 0 )) || printf 'Allowed host names: %s\n' "$NINFER_ALLOWED_HOST"
 [[ -z "${hint:-}" ]] || printf '%s\n' "$hint"

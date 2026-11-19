@@ -79,7 +79,7 @@ cat > "$tmp/ninfer-serve" <<'SERVER'
 printf '%s\n' "$@" > "$NINFER_TEST_ARGS"
 SERVER
 chmod +x "$tmp/ninfer-serve"
-touch "$tmp/qwen3_8_27b.ninfer" "$tmp/qwen3_6_35b_a3b.ninfer"
+touch "$tmp/qwen3_8_27b.ninfer" "$tmp/qwen3_6_35b_a3b.ninfer" "$tmp/qwen4exp-iq2xs.ninfer"
 
 # Hermetic fixtures. A developer's shell may already export NINFER_MODEL, NINFER_HOST and friends
 # -- the machine this was written on exports both -- and inheriting them makes every assertion below
@@ -419,6 +419,24 @@ expect_flags '35B NINFER_REASONING_LOOP=conclude' \
   "$(record loop_conclude35 NINFER_REASONING_LOOP=conclude -- qwen36-35b-a3b)" '--reasoning-loop conclude'
 refuse_flag '27B int8 NINFER_REASONING_LOOP=stop' \
   "$(record loop_int8 NINFER_REASONING_LOOP=stop -- qwen38-27b int8)" '--reasoning-loop'
+# Flash-Next takes the guard too, and the sampling guard's two overrides only when they are set:
+# its registered presets stay in force by default, unlike the 27B's small-quant defaults.
+refuse_flag 'Flash-Next reasoning loop unset' "$(record fn_loop_unset -- qwen38-flash-next)" '--reasoning-loop'
+expect_flags 'Flash-Next NINFER_REASONING_LOOP=conclude' \
+  "$(record fn_loop_conclude NINFER_REASONING_LOOP=conclude -- qwen38-flash-next)" '--reasoning-loop conclude'
+refuse_flag 'Flash-Next default presence penalty' "$(record fn_sampling_unset -- qwen38-flash-next)" '--presence-penalty'
+refuse_flag 'Flash-Next default min-p' "$(record fn_min_p_unset -- qwen38-flash-next)" '--min-p'
+expect_flags 'Flash-Next NINFER_PRESENCE_PENALTY and NINFER_MIN_P' \
+  "$(record fn_sampling NINFER_PRESENCE_PENALTY=1.0 NINFER_MIN_P=0.05 -- qwen38-flash-next)" \
+  '--presence-penalty 1.0' '--min-p 0.05'
+refuse_flag 'Flash-Next NINFER_PRESENCE_PENALTY=default' \
+  "$(record fn_sampling_default NINFER_PRESENCE_PENALTY=default -- qwen38-flash-next)" '--presence-penalty'
+banner="$(clear_env NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$tmp/unused.args" NINFER_MODEL_DIR="$tmp" \
+  NINFER_REASONING_LOOP=stop NINFER_PRESENCE_PENALTY=1.0 "$root/run.sh" qwen38-flash-next)"
+[[ "$banner" == *'Reasoning-loop guard: stop'* && "$banner" == *'Sampling: --presence-penalty 1.0'* ]] || {
+  printf 'run.sh banner does not report the Flash-Next loop guard and sampling: %s\n' "$banner" >&2
+  exit 1
+}
 banner="$(clear_env NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$tmp/unused.args" \
   NINFER_MODEL_DIR="$tmp" NINFER_REASONING_LOOP=conclude "$root/run.sh" qwen38-27b)"
 [[ "$banner" == *'Reasoning-loop guard: conclude'* ]] || {
@@ -479,6 +497,8 @@ expect_exit 2 'NINFER_NGRAM=on on the 35B' clear_env "${serve_env[@]}" NINFER_NG
 expect_exit 2 'unknown NINFER_NGRAM on the 35B' clear_env "${serve_env[@]}" NINFER_NGRAM=yes "$root/run.sh" qwen36-35b-a3b
 expect_exit 2 'unknown NINFER_REASONING_LOOP' clear_env "${serve_env[@]}" NINFER_REASONING_LOOP=on \
   "$root/run.sh" qwen38-27b
+expect_exit 2 'unknown NINFER_REASONING_LOOP on Flash-Next' clear_env "${serve_env[@]}" NINFER_REASONING_LOOP=on \
+  "$root/run.sh" qwen38-flash-next
 # The Flash-Next n-gram volume override belongs to run.bat; these models have no volume to point at.
 touch "$tmp/volume.ngram"
 expect_exit 2 'NINFER_NGRAM_VOLUME on the 27B' clear_env "${serve_env[@]}" NINFER_NGRAM_VOLUME="$tmp/volume.ngram" \
