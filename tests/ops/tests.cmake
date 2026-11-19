@@ -121,6 +121,10 @@ ninfer_add_op_test(ninfer_linear_rows_test
 ninfer_add_op_test(ninfer_hyper_connection_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hyper_connection.cpp"
   LIBRARIES ninfer_linear_test_support)
+# DeepSeek-V4's hyper-connections (Sinkhorn-mixed streams) against FP64 oracles of the formulas.
+ninfer_add_op_test(ninfer_hc_sinkhorn_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hc_sinkhorn.cpp"
+  LIBRARIES ninfer_ops)
 # Host-only: the int8 hyper-connection codec (--hc-int8): the group rule the quantize kernel runs,
 # against exact FP64 checks and an independent re-implementation of Basalt's rule.
 ninfer_add_op_test(ninfer_hc_int8_codec_test
