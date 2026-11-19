@@ -196,7 +196,8 @@ function onMetrics(text, now) {
     // spent is the real throughput; between units, hold it while a prefill is still running.
     const ptok = rate(m, previous.m, 'ninfer_prefill_tokens_total', 1);
     const psec = rate(m, previous.m, 'ninfer_prefill_seconds_total', 1);
-    if (ptok !== null && psec !== null && psec > 0) prefill = ptok / psec;
+    // psec can advance for partial progress before ptok does, so test ptok first.
+    if (ptok !== null && psec !== null && ptok > 0 && psec > 0) prefill = ptok / psec;
     else if (ptok === 0 && m.get('ninfer_requests_prefilling') > 0) prefill = lastPrefill;
     else if (ptok !== null) prefill = 0;
     lastPrefill = prefill;
