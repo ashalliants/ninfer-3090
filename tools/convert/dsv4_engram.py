@@ -94,9 +94,11 @@ def refuse_artifact_path(volume: str | Path, out: str | Path) -> None:
     """Refuse a volume path that is one of the conversion's own outputs (the artifact, its ``.part-NNNN``
     continuation files and its report): the volume is written after the artifact, and a collision there would
     make the failure rollback delete the artifact."""
-    volume, out = Path(volume).absolute(), Path(out).absolute()
-    if volume.parent == out.parent and (
-        volume.name in (out.name, out.name + ".conversion.json") or volume.name.startswith(out.name + ".part-")
+    # Directories are compared after resolving `..` and symlinks, names with the platform's case rule.
+    volume_dir, out_dir = os.path.realpath(Path(volume).parent), os.path.realpath(Path(out).parent)
+    volume_name, out_name = os.path.normcase(Path(volume).name), os.path.normcase(Path(out).name)
+    if os.path.normcase(volume_dir) == os.path.normcase(out_dir) and (
+        volume_name in (out_name, out_name + ".conversion.json") or volume_name.startswith(out_name + ".part-")
     ):
         raise ValueError(f"--ngram-out {volume} is one of the conversion's own output files; pick another path")
 

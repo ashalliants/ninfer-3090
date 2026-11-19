@@ -82,6 +82,13 @@ def test_a_volume_path_that_is_one_of_the_conversions_outputs_is_refused_before_
         with pytest.raises(ValueError, match="one of the conversion's own output files"):
             _cli(gguf_path, out, tmp_path, "--ngram-out", str(tmp_path / name))
     assert not list(tmp_path.glob("g.ninfer*"))
+    # The same files by another spelling: a `..` detour and a symlinked directory.
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "alias").symlink_to(tmp_path, target_is_directory=True)
+    for spelling in (tmp_path / "sub" / ".." / "g.ninfer", tmp_path / "alias" / "g.ninfer.conversion.json"):
+        with pytest.raises(ValueError, match="one of the conversion's own output files"):
+            _cli(gguf_path, out, tmp_path, "--ngram-out", str(spelling))
+    assert not list(tmp_path.glob("g.ninfer*"))
     # Another file beside it is fine.
     _cli(gguf_path, out, tmp_path, "--ngram-out", str(tmp_path / "g.engram"))
     assert out.exists() and (tmp_path / "g.engram").exists()
