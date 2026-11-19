@@ -94,13 +94,18 @@ def refuse_artifact_path(volume: str | Path, out: str | Path) -> None:
     """Refuse a volume path that is one of the conversion's own outputs (the artifact, its ``.part-NNNN``
     continuation files and its report): the volume is written after the artifact, and a collision there would
     make the failure rollback delete the artifact."""
-    # Directories are compared after resolving `..` and symlinks, names with the platform's case rule.
-    volume_dir, out_dir = os.path.realpath(Path(volume).parent), os.path.realpath(Path(out).parent)
-    volume_name, out_name = os.path.normcase(Path(volume).name), os.path.normcase(Path(out).name)
-    if os.path.normcase(volume_dir) == os.path.normcase(out_dir) and (
-        volume_name in (out_name, out_name + ".conversion.json") or volume_name.startswith(out_name + ".part-")
-    ):
-        raise ValueError(f"--ngram-out {volume} is one of the conversion's own output files; pick another path")
+    # Compared after resolving `..` and symlinks, the final component of the volume path included (a symlink named
+    # anything that points at an output would collide just the same); names with the platform's case rule.
+    def canonical(path) -> tuple[str, str]:
+        directory, name = os.path.split(os.path.realpath(path))
+        return os.path.normcase(directory), os.path.normcase(name)
+
+    out_dir, out_name = canonical(out)
+    for candidate in (canonical(volume), canonical(Path(os.path.realpath(Path(volume).parent)) / Path(volume).name)):
+        if candidate[0] == out_dir and (
+            candidate[1] in (out_name, out_name + ".conversion.json") or candidate[1].startswith(out_name + ".part-")
+        ):
+            raise ValueError(f"--ngram-out {volume} is one of the conversion's own output files; pick another path")
 
 
 def new_volume_id() -> bytes:

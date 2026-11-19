@@ -89,6 +89,16 @@ def test_a_volume_path_that_is_one_of_the_conversions_outputs_is_refused_before_
         with pytest.raises(ValueError, match="one of the conversion's own output files"):
             _cli(gguf_path, out, tmp_path, "--ngram-out", str(spelling))
     assert not list(tmp_path.glob("g.ninfer*"))
+    # A symlink (named anything, even dangling) that points at an output: refused, and the target never appears.
+    (tmp_path / "link.engram").symlink_to(out)
+    with pytest.raises(ValueError, match="one of the conversion's own output files"):
+        _cli(gguf_path, out, tmp_path, "--ngram-out", str(tmp_path / "link.engram"))
+    (tmp_path / "link.engram").unlink()
+    (tmp_path / "taken.engram").symlink_to(tmp_path / "nowhere")
+    with pytest.raises(FileExistsError, match="already exists"):
+        _cli(gguf_path, out, tmp_path, "--ngram-out", str(tmp_path / "taken.engram"))
+    (tmp_path / "taken.engram").unlink()
+    assert not list(tmp_path.glob("g.ninfer*"))
     # Another file beside it is fine.
     _cli(gguf_path, out, tmp_path, "--ngram-out", str(tmp_path / "g.engram"))
     assert out.exists() and (tmp_path / "g.engram").exists()
