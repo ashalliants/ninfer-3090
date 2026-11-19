@@ -36,6 +36,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import attention as att  # noqa: E402
 import engram_ref as eng  # noqa: E402
+import model_ref as mref  # noqa: E402
 import moe as moe_ref  # noqa: E402
 
 REPO = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
@@ -106,10 +107,24 @@ def _stub_modules(torch) -> None:
                 out[bi, i] = (e @ kv[bi, valid]) / denom[:, None]
         return out
 
+    def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult=4, sinkhorn_iters=20, eps=1e-6):
+        """The kernel's documented arithmetic (inference/kernel.py hc_split_sinkhorn_kernel), in PyTorch."""
+        hc = hc_mult
+        pre = torch.sigmoid(mixes[..., :hc] * hc_scale[0] + hc_base[:hc]) + eps
+        post = 2 * torch.sigmoid(mixes[..., hc : 2 * hc] * hc_scale[1] + hc_base[hc : 2 * hc])
+        comb = (mixes[..., 2 * hc :] * hc_scale[2] + hc_base[2 * hc :]).unflatten(-1, (hc, hc))
+        comb = comb.softmax(-1) + eps
+        comb = comb / (comb.sum(-2, keepdim=True) + eps)
+        for _ in range(sinkhorn_iters - 1):
+            comb = comb / (comb.sum(-1, keepdim=True) + eps)
+            comb = comb / (comb.sum(-2, keepdim=True) + eps)
+        return pre, post, comb
+
     kernel = types.ModuleType("kernel")
     kernel.act_quant = lambda x, *a, **k: None  # in-place round trip: identity here
     kernel.fp4_act_quant = lambda x, *a, **k: None
-    for name in ("fp4_gemm", "fp8_gemm", "hc_split_sinkhorn"):
+    kernel.hc_split_sinkhorn = hc_split_sinkhorn
+    for name in ("fp4_gemm", "fp8_gemm"):
         setattr(kernel, name, lambda *a, **k: (_ for _ in ()).throw(RuntimeError("not stubbed")))
     kernel.sparse_attn = sparse_attn
     engram = types.ModuleType("engram")
@@ -259,6 +274,130 @@ def run_engram(model_dir: Path) -> tuple[np.ndarray, list[np.ndarray]]:
     return hashes[0].numpy(), outputs
 
 
+def run_model(model_dir: Path) -> np.ndarray:
+    """The repo's real `Block`s (attention, MoE, hyper-connections, Engram), `ParallelEmbedding`, `RMSNorm` and
+    `ParallelHead` on `model_ref.build_case()`, composed exactly as `Transformer.forward` composes them (the
+    loop is copied; the Transformer class itself also builds the MTP, DSpark and vision parts, which are not
+    needed). Same stand-ins as the other goldens: identity quantisation, a PyTorch `sparse_attn`,
+    `hc_split_sinkhorn`, a trial-division `isprime`, FP32 Engram rows."""
+    import torch
+
+    _stub_modules(torch)
+    sympy = types.ModuleType("sympy")
+    sympy.isprime = eng._is_prime
+    sys.modules["sympy"] = sympy
+    sys.path.insert(0, str(model_dir))
+    sys.modules.pop("engram", None)
+    sys.modules.pop("model", None)
+    engram = importlib.import_module("engram")
+    model = importlib.import_module("model")
+    model.default_dtype = torch.float32
+    model.shared_attn.__init__()  # no state from an earlier run
+
+    def lookup(self, indices):
+        values = torch.nn.functional.embedding(indices, self.weight).float().unflatten(-1, (-1, self.block_size))
+        scales = torch.nn.functional.embedding(indices, self.scale).float().unsqueeze(-1)
+        return (values * scales).flatten(-2)
+
+    model.ParallelEngramEmbedding.forward = lookup
+    case = mref.build_case()
+    cfgs = case.configs
+    c0 = cfgs[0]
+    args = model.ModelArgs(
+        max_batch_size=1, max_seq_len=16, vocab_size=mref.VOCAB, dim=mref.DIM, moe_inter_dim=mref.INTER, n_layers=len(cfgs),
+        n_mtp_layers=0, n_heads=c0.n_heads, n_routed_experts=mref.EXPERTS, n_shared_experts=1,
+        n_activated_experts=mref.MOE.topk, score_func="sqrtsoftplus", norm_topk_prob=mref.MOE.norm_topk_prob,
+        route_scale=mref.MOE.route_scale, swiglu_limit=mref.MOE.clamp_experts, expert_dtype=None,
+        q_lora_rank=c0.q_lora_rank, head_dim=c0.head_dim, rope_head_dim=c0.rope_dim, norm_eps=mref.EPS,
+        o_groups=c0.o_groups, o_lora_rank=c0.o_lora_rank, window_size=c0.window,
+        compress_ratios=tuple(c.compress_ratio for c in cfgs),
+        kv_source_layers=tuple(i for i, c in enumerate(cfgs) if c.is_kv_source),
+        index_source_layers=tuple(i for i, c in enumerate(cfgs) if c.is_index_source),
+        compress_rope_theta=c0.compress_rope_theta, original_seq_len=c0.original_seq_len, rope_theta=c0.rope_theta,
+        rope_factor=c0.rope_factor, beta_fast=c0.beta_fast, beta_slow=c0.beta_slow,
+        index_n_heads=c0.index_n_heads, index_head_dim=c0.index_head_dim, index_topk=c0.index_topk,
+        candidate_source_layer=c0.candidate_source_layer, candidate_topk_blocks=c0.candidate_topk_blocks,
+        candidate_block_size=c0.candidate_block_size,
+        hc_mult=mref.HC, hc_sinkhorn_iters=mref.HC_ITERS, hc_eps=mref.HC_EPS,
+        engram_layer_ids=mref.ENGRAM_LAYERS,
+        engram_num_embeddings=tuple(int(p.sum()) for p in case.primes), engram_max_ngram_size=mref.NGRAM,
+        engram_vocab_size=mref.BUCKET_START, engram_n_heads=mref.ENGRAM_HEADS, engram_head_dim=mref.ENGRAM_ROW,
+        engram_pad_id=2, engram_compressed_vocab_size=mref.COMPRESSED,
+    )
+    layout = engram.EngramLayout.from_args(args)
+    assert np.array_equal(np.array(layout.primes), case.primes), "bucket primes differ from the repo's"
+    state = engram.NgramHashState.__new__(engram.NgramHashState)
+    torch.nn.Module.__init__(state)
+    state.layout, state.pad_id = layout, case.pad_id
+    flat = [[p for per_ngram in layer for p in per_ngram] for layer in layout.primes]
+    multipliers = engram.compute_hash_multipliers(layout.layer_ids, layout.max_ngram_size, mref.COMPRESSED)
+    assert np.array_equal(multipliers.numpy(), case.multipliers), "multipliers differ from the repo's"
+    for name, value in (("primes", torch.tensor(layout.primes)),
+                        ("offsets", torch.tensor(np.array([np.cumsum([0, *sizes[:-1]]) for sizes in flat]))),
+                        ("multipliers", multipliers), ("token_map", torch.tensor(case.token_map)),
+                        ("cache", torch.empty(1, 16, dtype=torch.int64))):
+        state.register_buffer(name, value, persistent=False)
+
+    def put(linear, array):
+        linear.weight = torch.nn.Parameter(torch.tensor(array, dtype=torch.float32))
+
+    def vec(parameter, array):
+        parameter.data = torch.tensor(array, dtype=torch.float32)
+
+    with torch.no_grad():
+        blocks = []
+        for i, (cfg, lw) in enumerate(zip(cfgs, case.layers)):
+            block = model.Block(i, args, layout)
+            w = lw.attention
+            attn = block.attn
+            put(attn.wq_a, w.wq_a); vec(attn.q_norm.weight, w.q_norm); put(attn.wq_b, w.wq_b)
+            put(attn.wkv, w.wkv); vec(attn.kv_norm.weight, w.kv_norm); put(attn.wo_a, w.wo_a); put(attn.wo_b, w.wo_b)
+            vec(attn.attn_sink, w.attn_sink)
+            if attn.compressor is not None:
+                put(attn.compressor.wkv, w.comp_wkv); vec(attn.compressor.norm.weight, w.comp_norm)
+                if w.comp_wgate is not None:
+                    put(attn.compressor.wgate, w.comp_wgate)
+            if attn.indexer is not None:
+                put(attn.indexer.wq_b, w.idx_wq_b); put(attn.indexer.weights_proj, w.idx_weights_proj)
+                if w.idx_wk is not None:
+                    put(attn.indexer.wk, w.idx_wk); vec(attn.indexer.k_norm.weight, w.idx_k_norm)
+            vec(block.attn_norm.weight, lw.attn_norm); vec(block.ffn_norm.weight, lw.ffn_norm)
+            for name, (fn, scale, base) in (("attn", lw.hc_attn), ("ffn", lw.hc_ffn)):
+                vec(getattr(block, f"hc_{name}_fn"), fn); vec(getattr(block, f"hc_{name}_scale"), scale)
+                vec(getattr(block, f"hc_{name}_base"), base)
+            ffn = block.ffn
+            put(ffn.gate, lw.moe.router); vec(ffn.gate.bias, lw.moe.bias)
+            for target, e in [*zip(ffn.experts, lw.moe.experts), (ffn.shared_experts, lw.moe.shared)]:
+                put(target.w1, e.w1); put(target.w2, e.w2); put(target.w3, e.w3)
+            if block.engram is not None:
+                t = lw.engram["table"]
+                block.engram.embed.weight = torch.nn.Parameter(torch.tensor(t["codes"]).view(torch.float8_e4m3fn), requires_grad=False)
+                block.engram.embed.scale = torch.nn.Parameter(torch.tensor(t["scales"]).view(torch.float8_e8m0fnu), requires_grad=False)
+                put(block.engram.wkv, lw.engram["wkv"])
+                block.engram.q_weight.data = torch.tensor(lw.engram["weight"])
+                block.engram.k_weight.data = torch.ones_like(block.engram.k_weight)
+            blocks.append(block)
+        embed = model.ParallelEmbedding(mref.VOCAB, mref.DIM)
+        vec(embed.weight, case.embed)
+        norm = model.RMSNorm(mref.DIM, mref.EPS)
+        vec(norm.weight, case.norm)
+        head = model.ParallelHead(mref.VOCAB, mref.DIM)
+        vec(head.weight, case.head)
+
+        # Transformer.forward, text only, start_pos 0
+        input_ids = torch.tensor(case.input_ids)[None]
+        engram_hashes = state(input_ids, 0, None)
+        h = embed(input_ids)
+        h = h.unsqueeze(2).repeat(1, 1, mref.HC, 1)
+        pre_mix = model.make_identity_pre_mix(h, mref.HC)
+        for layer in blocks:
+            if layer.engram is not None:
+                h = layer.engram(h, engram_hashes[:, :, layer.engram.layer_hash_index, :], None)
+            h, pre_mix = layer(h, 0, pre_mix, None)
+        h = layer.hc_pre(h, pre_mix)
+        return head(norm(h), full_logits=True)[0].numpy()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--fetch", type=Path, metavar="DIR", help="download the repo's inference files into DIR")
@@ -266,6 +405,7 @@ def main() -> None:
     parser.add_argument("--emit", type=Path, help="write the attention stack's outputs")
     parser.add_argument("--emit-moe", type=Path, help="write the MoE layers' outputs")
     parser.add_argument("--emit-engram", type=Path, help="write the Engram hash ids and layer outputs")
+    parser.add_argument("--emit-model", type=Path, help="write the whole model's logits")
     args = parser.parse_args()
     if args.fetch:
         fetch(args.fetch)
@@ -292,6 +432,13 @@ def main() -> None:
                         "hash_ids": ids.tolist(), "outputs": [o.tolist() for o in outputs]}) + "\n"
         )
         print(f"wrote {args.emit_engram} ({len(outputs)} layers)")
+    if args.emit_model:
+        if not args.model_dir:
+            parser.error("--emit-model needs --model-dir")
+        logits = run_model(args.model_dir)
+        args.emit_model.write_text(json.dumps({"model_repo": REPO, "revision": revision_of(args.model_dir), "seed": mref.SEED,
+                                               "logits": logits.tolist()}) + "\n")
+        print(f"wrote {args.emit_model} (logits {logits.shape})")
 
 
 if __name__ == "__main__":

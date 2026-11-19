@@ -22,6 +22,9 @@ import hyper_connection as hcr  # noqa: E402
 import model_golden as mg  # noqa: E402
 
 
+
+
+import model_ref as mref  # noqa: E402
 import moe as moe_ref  # noqa: E402
 import gguf_sizes as gs  # noqa: E402
 import layout as lo  # noqa: E402
@@ -992,6 +995,43 @@ def test_engram_gate_semantics():
     check(np.array_equal(m[1], x[1]) and np.allclose(m[[0, 2, 3]], out[[0, 2, 3]]), "a masked position is unchanged")
     zero = eng.engram_forward(x, np.zeros_like(rows), wkv, weight, 1e-6)
     check(np.allclose(zero, x), "zero rows give zero key and value: no change")
+
+
+def test_whole_model_matches_the_model_repos_own_blocks():
+    """The golden is the repo's Block (attention, MoE, hyper-connections, Engram), embedding, RMSNorm and head
+    on CPU, composed as Transformer.forward composes them (tools/dsv4/model_golden.py): 7 layers with the compressor,
+    indexer and candidate paths, two Engram layers, hc_mult 4, logits for every position of 11 tokens."""
+    golden = json.loads((Path(HERE).parent.parent / "tests" / "fixtures" / "dsv4" / "model_golden.json").read_text())
+    check(golden["seed"] == mref.SEED, "the golden is for another seed")
+    check(golden["model_repo"] == mg.REPO and len(golden["revision"]) == 40, "the golden must record the model repo commit")
+    got = mref.forward(mref.build_case())
+    want = np.array(golden["logits"], np.float32)
+    check(got.shape == want.shape == (mref.LENGTH, mref.VOCAB), "logits shape")
+    err = float(np.abs(got - want).max())
+    check(err < 1e-4, f"the logits differ from the model repo's by {err}")
+    check((got.argmax(-1) == want.argmax(-1)).all(), "the greedy token must agree at every position")
+
+
+def test_whole_model_is_causal_and_each_part_matters():
+    case = mref.build_case()
+    full = mref.forward(case)
+    for n in (1, 3, 6, 11):
+        check(np.allclose(mref.forward(case, tokens=n), full[:n], atol=2e-5), f"logits of a {n}-token prefix differ from the first {n} rows of the full run")
+    # Each part changes the logits: the Engram write, the MoE's shared expert, the attention sink.
+    import copy
+    import dataclasses
+
+    no_engram = copy.deepcopy(case)
+    for layer in no_engram.layers:
+        if layer.engram is not None:
+            layer.engram["wkv"] = layer.engram["wkv"] * 0.0
+    check(float(np.abs(mref.forward(no_engram) - full).max()) > 1e-3, "the Engram write must influence the logits")
+    no_shared = copy.deepcopy(case)
+    for layer in no_shared.layers:
+        layer.moe.shared.w2 = layer.moe.shared.w2 * 0.0
+    check(float(np.abs(mref.forward(no_shared) - full).max()) > 1e-3, "the shared expert must influence the logits")
+    other_ids = dataclasses.replace(case, input_ids=(case.input_ids + 1) % mref.VOCAB)
+    check(float(np.abs(mref.forward(other_ids) - full).max()) > 1e-2, "the tokens must influence the logits")
 
 
 if __name__ == "__main__":
