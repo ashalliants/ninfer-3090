@@ -11,11 +11,12 @@ window ring and the shared state between layers, is the repo's code unchanged.
 
 It needs `torch` and a directory holding the repo's `inference/` files (fetch with `--fetch`):
 
-    python tools/dsv4/model_golden.py --fetch DIR            # model.py, convert.py, kernel.py from the HF repo
+    python tools/dsv4/model_golden.py --fetch DIR            # the repo's inference files at one commit, recorded in DIR/revision.txt
     python tools/dsv4/model_golden.py --model-dir DIR --emit tests/fixtures/dsv4/attention_golden.json
 
 The weights and inputs are `attention.stack_inputs()`, so the NumPy side regenerates them from the seed
-and the golden file holds only the outputs.
+and the golden file holds only the outputs and the commit of the model repo they came from (`revision`): a
+regeneration from another commit is visible in the diff, and `--fetch` pins one commit for all its files.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import re
 import sys
 import types
 import urllib.request
@@ -35,16 +37,51 @@ sys.path.insert(0, str(HERE))
 import attention as att  # noqa: E402
 
 REPO = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
-FILES = ("model.py", "kernel.py", "convert.py")
+# What the goldens import: model.py and kernel.py (stubbed), engram.py (the real hash code), convert.py (not imported
+# by the goldens, fetched so the directory is the repo's whole inference set for reading).
+FILES = ("model.py", "kernel.py", "engram.py", "convert.py")
+REVISION_FILE = "revision.txt"
 
 
-def fetch(directory: Path) -> None:
-    directory.mkdir(parents=True, exist_ok=True)
-    for name in FILES:
-        url = f"https://huggingface.co/{REPO}/resolve/main/inference/{name}"
-        with urllib.request.urlopen(url, timeout=60) as response:  # noqa: S310
-            (directory / name).write_bytes(response.read())
-        print(f"fetched {name}")
+def _sha(text: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{40}", text):
+        raise SystemExit(f"{text!r} is not a 40-hex commit")
+    return text
+
+
+def revision_of(directory: Path) -> str:
+    """The commit of the model repo that `directory` was fetched at; every golden records it."""
+    path = directory / REVISION_FILE
+    if not path.exists():
+        raise SystemExit(f"{directory} has no {REVISION_FILE}: fetch it with --fetch so its commit is recorded")
+    return _sha(path.read_text().strip())
+
+
+def fetch(directory: Path) -> str:
+    """All of FILES at ONE commit of the model repo, staged in a temporary directory and moved into place only
+    when every file arrived, so a failed fetch leaves no mixed revision. Returns the commit."""
+    if directory.exists() and any(directory.iterdir()):
+        raise SystemExit(f"{directory} is not empty: fetch into a fresh directory")
+    with urllib.request.urlopen(f"https://huggingface.co/api/models/{REPO}", timeout=60) as response:  # noqa: S310
+        sha = _sha(json.load(response)["sha"])
+    staging = directory.with_name(directory.name + f".staging-{sha[:12]}")
+    staging.mkdir(parents=True, exist_ok=False)
+    try:
+        for name in FILES:
+            url = f"https://huggingface.co/{REPO}/resolve/{sha}/inference/{name}"
+            with urllib.request.urlopen(url, timeout=60) as response:  # noqa: S310
+                (staging / name).write_bytes(response.read())
+            print(f"fetched {name}")
+        (staging / REVISION_FILE).write_text(sha + "\n")
+        directory.mkdir(parents=True, exist_ok=True)
+        for item in staging.iterdir():
+            item.replace(directory / item.name)
+    finally:
+        for item in staging.iterdir():
+            item.unlink()
+        staging.rmdir()
+    print(f"model repo {REPO} at {sha}")
+    return sha
 
 
 def _stub_modules(torch) -> None:
@@ -138,7 +175,8 @@ def main() -> None:
         if not args.model_dir:
             parser.error("--emit needs --model-dir")
         outputs = run(args.model_dir)
-        args.emit.write_text(json.dumps({"seed": att.STACK_SEED, "seq": att.STACK_SEQ, "outputs": [o.tolist() for o in outputs]}) + "\n")
+        args.emit.write_text(json.dumps({"model_repo": REPO, "revision": revision_of(args.model_dir), "seed": att.STACK_SEED,
+                                         "seq": att.STACK_SEQ, "outputs": [o.tolist() for o in outputs]}) + "\n")
         print(f"wrote {args.emit} ({len(outputs)} layers)")
 
 

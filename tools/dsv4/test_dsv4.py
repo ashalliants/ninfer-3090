@@ -18,6 +18,7 @@ sys.path.insert(0, HERE)
 import attention as att  # noqa: E402
 import gguf_headers as gh  # noqa: E402
 import hyper_connection as hcr  # noqa: E402
+import model_golden as mg  # noqa: E402
 import gguf_sizes as gs  # noqa: E402
 import layout as lo  # noqa: E402
 import profile_to_curve as pc  # noqa: E402
@@ -649,6 +650,8 @@ def test_attention_stack_matches_the_model_repos_own_code():
     with two later layers searching inside its blocks, YaRN active."""
     golden = json.loads((Path(HERE).parent.parent / "tests" / "fixtures" / "dsv4" / "attention_golden.json").read_text())
     check(golden["seed"] == att.STACK_SEED and golden["seq"] == att.STACK_SEQ, "the golden is for another seed or length")
+    check(golden["model_repo"] == mg.REPO and len(golden["revision"]) == 40 and set(golden["revision"]) <= set("0123456789abcdef"),
+          "the golden must record the commit of the model repo it was produced from")
     mine = att.run_stack()
     check(len(mine) == len(golden["outputs"]) == att.STACK_LAYERS, "layer count")
     for layer, (want, got) in enumerate(zip(golden["outputs"], mine)):
@@ -773,6 +776,70 @@ def test_indexer_selection_is_reachable_ordered_and_padded():
     for i in range(s):
         for j in row[i][row[i] >= 0] - s:
             check(cand[i, j], f"layer 5 query {i} selected group {j} outside the candidate blocks")
+
+
+def test_model_golden_fetch_pins_one_commit_and_is_all_or_nothing():
+    import io
+    import tempfile
+    from unittest import mock
+
+    sha = "ab" * 20
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    urls = []
+
+    def urlopen(url, timeout=0):
+        urls.append(url)
+        if url.endswith("/api/models/" + mg.REPO):
+            return Response(json.dumps({"sha": sha}).encode())
+        return Response(b"# " + url.encode())
+
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "inference"
+        with mock.patch.object(mg.urllib.request, "urlopen", side_effect=urlopen):
+            check(mg.fetch(target) == sha, "fetch returns the commit")
+        files = sorted(f.name for f in target.iterdir())
+        check(files == sorted([*mg.FILES, mg.REVISION_FILE]), f"fetch writes every file and the revision: {files}")
+        check("engram.py" in mg.FILES, "engram.py is imported by --emit-engram and --emit-model, so it must be fetched")
+        check(all(f"/resolve/{sha}/inference/" in u for u in urls if "/resolve/" in u), "every file is fetched at the pinned commit, not main")
+        check(mg.revision_of(target) == sha, "the directory records its commit")
+        try:
+            mg.fetch(target)
+        except SystemExit:
+            pass
+        else:
+            check(False, "fetching into a non-empty directory must be refused")
+        # A fetch that fails part-way leaves nothing behind: no mixed revision, no staging directory.
+        other = Path(d) / "other"
+        calls = {"n": 0}
+
+        def flaky(url, timeout=0):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise OSError("network down")
+            return urlopen(url, timeout)
+
+        with mock.patch.object(mg.urllib.request, "urlopen", side_effect=flaky):
+            try:
+                mg.fetch(other)
+            except OSError:
+                pass
+            else:
+                check(False, "a failed fetch must raise")
+        check(not other.exists() or not any(other.iterdir()), "a failed fetch leaves no files in the target")
+        check(not list(Path(d).glob("*.staging-*")), "a failed fetch removes its staging directory")
+        try:
+            mg.revision_of(Path(d) / "nowhere")
+        except SystemExit:
+            pass
+        else:
+            check(False, "a directory without a recorded commit must be refused")
 
 
 if __name__ == "__main__":
