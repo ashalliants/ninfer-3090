@@ -37,7 +37,16 @@ def _get(url: str, start: int | None = None, end: int | None = None) -> bytes:
     if start is not None:
         request.add_header("Range", f"bytes={start}-{end}")
     with urllib.request.urlopen(request, timeout=120) as response:
-        return response.read()
+        if start is None:
+            return response.read()
+        # A server or proxy that ignores Range answers 200 with the whole shard: refuse it before reading.
+        if response.status != 206 or not (response.headers.get("Content-Range") or "").startswith(f"bytes {start}-"):
+            raise ValueError(f"{url}: expected 206 for bytes {start}-{end}, got HTTP {response.status}")
+        want = end - start + 1
+        data = response.read(want + 1)
+        if len(data) > want:
+            raise ValueError(f"{url}: the server sent more than the {want} bytes asked for")
+        return data
 
 
 def read_header(url: str) -> dict:

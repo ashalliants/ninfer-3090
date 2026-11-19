@@ -316,6 +316,49 @@ def test_fetch_pins_one_commit_and_reuses_it():
         fh._get, fh.resolve_revision = real
 
 
+def test_range_reads_are_bounded_and_refuse_a_server_that_ignores_range():
+    import fetch_headers as fh
+
+    class Reply:
+        def __init__(self, status, body, content_range=None):
+            self.status, self.body, self.headers = status, body, {"Content-Range": content_range} if content_range else {}
+            self.read_sizes = []
+
+        def read(self, n=-1):
+            self.read_sizes.append(n)
+            return self.body if n < 0 else self.body[:n]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    real = fh.urllib.request.urlopen
+    try:
+        cases = [(Reply(206, b"abcd", "bytes 10-13/99"), b"abcd"),
+                 (Reply(200, b"x" * 1000), None),                 # ignored Range: the whole file
+                 (Reply(206, b"abcd", "bytes 0-3/99"), None),     # the wrong range
+                 (Reply(206, b"abcdefgh", "bytes 10-13/99"), None)]  # more than asked for
+        for reply, expected in cases:
+            fh.urllib.request.urlopen = lambda request, timeout=0, reply=reply: reply
+            if expected is None:
+                try:
+                    fh._get("http://x/f", 10, 13)
+                except ValueError:
+                    check(-1 not in reply.read_sizes, "a refused reply must not be read unbounded")
+                    continue
+                check(False, "a reply that is not exactly the requested range must be refused")
+            else:
+                check(fh._get("http://x/f", 10, 13) == expected, "a correct 206 returns its bytes")
+                check(reply.read_sizes == [5], "the read is bounded by the range")
+        whole = Reply(200, b"{}")
+        fh.urllib.request.urlopen = lambda request, timeout=0: whole
+        check(fh._get("http://x/index.json") == b"{}", "an unranged request still reads the whole body")
+    finally:
+        fh.urllib.request.urlopen = real
+
+
 def test_a_stamp_without_a_commit_is_refused():
     import fetch_headers as fh
     with tempfile.TemporaryDirectory() as d:
