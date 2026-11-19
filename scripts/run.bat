@@ -496,7 +496,9 @@ set "DRAFT_TOKENS=3"
 if not "%NINFER_DRAFT_TOKENS%"=="" set "DRAFT_TOKENS=%NINFER_DRAFT_TOKENS%"
 set "SPEC_ARGS="
 set "SPEC_LABEL=no speculation"
-if /i "%SPEC%"=="mtp" set "SPEC_ARGS=--spec mtp --draft-tokens %DRAFT_TOKENS%"
+rem The two MTP-only options of the tuned profile ride with --spec mtp: the server refuses them without it, so
+rem they cannot sit in the profile file (NINFER_SPEC=none and a drafter-less artifact start).
+if /i "%SPEC%"=="mtp" set "SPEC_ARGS=--spec mtp --draft-tokens %DRAFT_TOKENS% --mtp-joint-acceptance --gdn-async-commit"
 if /i "%SPEC%"=="mtp" set "SPEC_LABEL=MTP, up to %DRAFT_TOKENS% drafts"
 if /i not "%SPEC%"=="mtp" if /i not "%SPEC%"=="none" (
   echo NINFER_SPEC must be mtp or none for Qwen3.8-Flash-Next, got %SPEC% 1>&2
@@ -840,6 +842,15 @@ if not "%HINT%"=="" echo %HINT%
 rem The exact command, so a tuned setup can be copied into another launcher (llama-swap, a service).
 echo Command: "%SERVER%" "%MODEL%" --host %HOST% --port %PORT% --config "%PROFILE_FILE%" %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %CHAT_TEMPLATE_ARGS% %ALLOWED_HOST_ARGS% %EXTRA_ARGS%
 echo API: http://%HOST%:%PORT%/v1
+rem The live dashboard (speed, lanes, memory, GPU). The key, when there is one, rides after the #, which
+rem the browser never sends to the server, so the page opens already signed in. PowerShell percent-encodes
+rem the key, so any character in it is safe in a link.
+set "DASH_HOST=%HOST%"
+if "%HOST%"=="0.0.0.0" set "DASH_HOST=127.0.0.1"
+set "DASH_KEY="
+if defined NINFER_API_KEY for /f "usebackq delims=" %%K in (`powershell -NoProfile -Command "[uri]::EscapeDataString($env:NINFER_API_KEY)"`) do set "DASH_KEY=#key=%%K"
+echo Dashboard: http://%DASH_HOST%:%PORT%/dashboard%DASH_KEY%
+if not "%DASH_HOST%"=="%HOST%" echo            (on another computer, use this machine's address instead of %DASH_HOST%)
 echo.
 
 rem --host-context-mib 8192 really pins 8 GiB of host RAM here. Earlier builds clamped it on Windows

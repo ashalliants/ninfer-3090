@@ -372,8 +372,8 @@ with the unquantized model. How its files are made, including the one place the 
 A later session measured a batch of opt-in speed options from #383 ("Basalt learnings") against
 off, each on an RTX 3090, ABBA A/B, 12 repetitions: `--prefill-cpu-share 0.4` is the clear win on
 prefill (+15.47% median, every repetition faster); `--moe-gate-up-registers` the best decode-side
-gain (+2.49%). `scripts/profiles/qwen38-flash-next-tuned.json` turns on every option that measured
-as a confirmed win or wash; the full per-option table, including the regressions left off
+gain (+2.49%). The launchers' tuned configuration (`scripts/profiles/qwen38-flash-next-tuned.json`, plus `--mtp-joint-acceptance` and `--gdn-async-commit`, which they add with `--spec mtp`) turns on every option that
+measured as a confirmed win or wash; the full per-option table, including the regressions left off
 (`--ngram-prefetch`, `--cpu-verify-misses`, `--hc-int8`, `--ggml-decode-mma`), is in
 [docs/performance.md](docs/performance.md#basalt-learnings-options-measured-relative-to-off-rtx-3090-2026-11-11)
 and [docs/serving.md](docs/serving.md#qwen38-flash-next-preview). These are per-option deltas
@@ -596,7 +596,7 @@ forked as 1+2+4, each branch could be continued again and reused its whole share
 A batch of opt-in options from #383 ("Basalt learnings") were measured on an RTX 3090 (2026-11-11,
 each against the same option off, ABBA, 12 reps): **+15.47% prefill** with `--prefill-cpu-share 0.4`
 (the clear win, every repetition faster), **+2.49% decode** with `--moe-gate-up-registers` (the best
-decode-side gain). `scripts/profiles/qwen38-flash-next-tuned.json` turns on every option that
+decode-side gain). The launchers' tuned configuration (`scripts/profiles/qwen38-flash-next-tuned.json`, plus `--mtp-joint-acceptance` and `--gdn-async-commit`, which they add with `--spec mtp`) turns on every option that
 measured as a win or a wash; two options measured as clear regressions and stayed off
 (`--ngram-prefetch`, `--cpu-verify-misses`). [Details](docs/performance.md#basalt-learnings-options-measured-relative-to-off-rtx-3090-2026-11-11).
 
