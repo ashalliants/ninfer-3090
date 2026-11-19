@@ -11,7 +11,8 @@
 // exact FP32 inputs). Also: each column bitwise independent of the others (T = 1 against its own
 // column of a T = 8 call), a graph-captured call bitwise equal to the eager call, in-place
 // expand_mix equal to the oracle on the pre-call residual, and refusals (misaligned residual,
-// overlapping outputs, a wrong shape; a Tensor cannot have T = 0).
+// overlapping outputs, a wrong shape, non-contiguous scale and base, non-finite epsilons; a Tensor
+// cannot have T = 0), and T = 65,537 (past grid.y) in every operation.
 
 #include "ninfer/ops/hc_sinkhorn.h"
 
@@ -25,6 +26,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -346,7 +348,34 @@ void test_refusals(cudaStream_t stream) {
     const Tensor wrong_fn(fd.p, DType::FP32, {width, kMix - 1});
     check(refuses([&] { o::hc_sinkhorn_mixes(R, wrong_fn, S, B, 1e-6F, 1e-6F, 4, pre, post, comb, stream); }),
           "a wrong fn shape is refused");
+    // A non-contiguous base (a same-size permuted view; scale goes through the same check), and non-finite epsilons.
+    const Tensor strided_base = B.view({kMix / 2, 2, 1, 1}).permute({1, 0, 2, 3});
+    check(refuses([&] { o::hc_sinkhorn_mixes(R, F, S, strided_base, 1e-6F, 1e-6F, 4, pre, post, comb, stream); }),
+          "a non-contiguous base is refused");
+    const float inf = std::numeric_limits<float>::infinity();
+    check(refuses([&] { o::hc_sinkhorn_mixes(R, F, S, B, 1e-6F, inf, 4, pre, post, comb, stream); }), "an infinite sinkhorn_eps is refused");
+    check(refuses([&] { o::hc_sinkhorn_mixes(R, F, S, B, inf, 1e-6F, 4, pre, post, comb, stream); }), "an infinite norm_eps is refused");
+    check(refuses([&] { o::hc_sinkhorn_mixes(R, F, S, B, std::nanf(""), 1e-6F, 4, pre, post, comb, stream); }), "a NaN norm_eps is refused");
     t::cuda_check(cudaStreamSynchronize(stream), "sync");
+}
+
+// More columns than grid.y can hold (65,535): every operation serves them, columns checked against the oracle
+// or against a single-column call.
+void test_many_columns(cudaStream_t stream) {
+    const int T = 65537;
+    test_collapse_and_expand(8, T, stream);
+    const int width = 256;
+    const auto r    = bf16_values(static_cast<std::size_t>(width) * T, 77U, 1.0F);
+    const Weights w = make_weights(width, 5U, 0.1F);
+    const MixesRun all = run_mixes(r, w, width, T, 1e-6F, 1e-6F, 20, stream);
+    for (const int c : {0, 65535, 65536}) {
+        const std::vector<std::uint16_t> one(r.begin() + static_cast<std::ptrdiff_t>(c) * width,
+                                             r.begin() + static_cast<std::ptrdiff_t>(c + 1) * width);
+        const MixesRun alone = run_mixes(one, w, width, 1, 1e-6F, 1e-6F, 20, stream);
+        check(std::memcmp(alone.comb.data(), all.comb.data() + static_cast<std::size_t>(c) * kS * kS, kS * kS * 4) == 0 &&
+                  std::memcmp(alone.pre.data(), all.pre.data() + static_cast<std::size_t>(c) * kS, kS * 4) == 0,
+              "mixes column " + std::to_string(c) + " of a 65,537-column call equals its own call");
+    }
 }
 
 } // namespace
@@ -366,6 +395,7 @@ int main() {
         for (const int T : {1, 3, 8}) { test_collapse_and_expand(5120, T, stream); }
         test_collapse_and_expand(37, 5, stream); // a hidden size no vector width divides
         test_refusals(stream);
+        test_many_columns(stream);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "EXCEPTION: %s\n", e.what());
         return 1;

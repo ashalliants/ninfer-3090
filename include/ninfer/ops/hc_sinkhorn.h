@@ -46,7 +46,8 @@ inline constexpr std::int32_t kHcSinkhornMixRows = (2 + kHcSinkhornStreams) * kH
  *
  * Supported domain:
  *   Contiguous tensors; S*H a multiple of 8 and at most 32,768; 16-byte aligned residual and fn;
- *   norm_eps > 0, sinkhorn_eps >= 0, 1 <= iters <= 64.
+ *   scale and base contiguous too; norm_eps > 0 and sinkhorn_eps >= 0, both finite; 1 <= iters <= 64.
+ *   T is any positive value (columns are independent).
  *
  * Numeric:
  *   FP32 arithmetic from the represented BF16 residual and FP32 weights; the statistic and the
@@ -71,7 +72,7 @@ void hc_sinkhorn_mixes(const Tensor& residual, const Tensor& fn, const Tensor& s
  * Logical shapes:
  *   residual BF16 [S*H, T]; pre FP32 [S, T]; x BF16 [H, T]. S = kHcSinkhornStreams; T >= 1.
  *
- * Supported domain: contiguous tensors; H >= 1.
+ * Supported domain: contiguous tensors; 1 <= H <= 16,776,960.
  *
  * Numeric: the sum is FP32 from the represented values, rounded once to BF16.
  *
@@ -92,7 +93,7 @@ void hc_collapse(const Tensor& residual, const Tensor& pre, Tensor& x, cudaStrea
  *   y BF16 [H, T]; post FP32 [S, T]; comb FP32 [S*S, T] (hc_sinkhorn_mixes' layout); residual BF16
  *   [S*H, T]. S = kHcSinkhornStreams; T >= 1.
  *
- * Supported domain: contiguous tensors.
+ * Supported domain: contiguous tensors; 1 <= H <= 16,776,960.
  *
  * Numeric: the products and sum are FP32 from the represented values, rounded once to BF16.
  *

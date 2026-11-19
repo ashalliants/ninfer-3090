@@ -6,6 +6,7 @@
 
 #include <cuda_bf16.h>
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -24,6 +25,8 @@ constexpr int kMixWarps   = kMixThreads / 32;
 constexpr int kElementThreads = 256;
 constexpr std::int32_t kMaxStreamWidth = 32768;
 constexpr std::int32_t kMaxIters       = 64;
+// Feature tiles of an element-wise launch ride grid.y (at most 65,535); columns ride grid.x.
+constexpr std::int32_t kMaxHidden      = 65535 * kElementThreads;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("hc_sinkhorn: ") + message); }
@@ -137,8 +140,8 @@ mixes_kernel(const bf16* __restrict__ residual, const float* __restrict__ fn,
 
 __global__ void collapse_kernel(const bf16* __restrict__ residual, const float* __restrict__ pre,
                                 int hidden, bf16* __restrict__ x) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int t = blockIdx.y;
+    const int d = blockIdx.y * blockDim.x + threadIdx.x;
+    const int t = blockIdx.x;
     if (d >= hidden) { return; }
     const std::size_t column = static_cast<std::size_t>(t) * kS * hidden;
     float sum = 0.0F;
@@ -151,8 +154,8 @@ __global__ void collapse_kernel(const bf16* __restrict__ residual, const float* 
 
 __global__ void expand_mix_kernel(const bf16* __restrict__ y, const float* __restrict__ post,
                                   const float* __restrict__ comb, int hidden, bf16* residual) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int t = blockIdx.y;
+    const int d = blockIdx.y * blockDim.x + threadIdx.x;
+    const int t = blockIdx.x;
     if (d >= hidden) { return; }
     const std::size_t column = static_cast<std::size_t>(t) * kS * hidden;
     float old[kS];
@@ -182,8 +185,8 @@ void hc_sinkhorn_mixes(const Tensor& residual, const Tensor& fn, const Tensor& s
                        Tensor& post, Tensor& comb, cudaStream_t stream) {
     require(contiguous_2d(residual, DType::BF16) && contiguous_2d(fn, DType::FP32) &&
                 contiguous_2d(pre, DType::FP32) && contiguous_2d(post, DType::FP32) &&
-                contiguous_2d(comb, DType::FP32) && scale.data != nullptr && base.data != nullptr &&
-                scale.dtype == DType::FP32 && base.dtype == DType::FP32,
+                contiguous_2d(comb, DType::FP32) && contiguous_2d(scale, DType::FP32) &&
+                contiguous_2d(base, DType::FP32),
             "mixes need contiguous BF16 residual and FP32 weights and outputs");
     const int width = residual.ne[0], columns = residual.ne[1];
     require(width % 8 == 0 && width > 0 && width <= kMaxStreamWidth && columns > 0 && width % kS == 0,
@@ -194,7 +197,8 @@ void hc_sinkhorn_mixes(const Tensor& residual, const Tensor& fn, const Tensor& s
                 comb.ne[0] == kS * kS && comb.ne[1] == columns,
             "pre, post or comb have the wrong shape");
     require(aligned16(residual.data) && aligned16(fn.data), "the residual and fn must be 16-byte aligned");
-    require(norm_eps > 0.0F && sinkhorn_eps >= 0.0F && sinkhorn_iters >= 1 && sinkhorn_iters <= kMaxIters,
+    require(std::isfinite(norm_eps) && norm_eps > 0.0F && std::isfinite(sinkhorn_eps) && sinkhorn_eps >= 0.0F &&
+                sinkhorn_iters >= 1 && sinkhorn_iters <= kMaxIters,
             "epsilons or iteration count out of range");
     for (const Tensor* out : {&pre, &post, &comb}) {
         for (const Tensor* in : {&residual, &fn, &scale, &base}) {
@@ -215,11 +219,11 @@ void hc_collapse(const Tensor& residual, const Tensor& pre, Tensor& x, cudaStrea
                 contiguous_2d(x, DType::BF16),
             "collapse needs contiguous tensors");
     const int hidden = x.ne[0], columns = x.ne[1];
-    require(hidden > 0 && columns > 0 && residual.ne[0] == kS * hidden && residual.ne[1] == columns &&
-                pre.ne[0] == kS && pre.ne[1] == columns,
+    require(hidden > 0 && hidden <= kMaxHidden && columns > 0 && residual.ne[0] == kS * hidden &&
+                residual.ne[1] == columns && pre.ne[0] == kS && pre.ne[1] == columns,
             "collapse shapes disagree");
     require(!overlaps(x, residual) && !overlaps(x, pre), "collapse output overlaps an input");
-    collapse_kernel<<<dim3((hidden + kElementThreads - 1) / kElementThreads, columns), kElementThreads, 0, stream>>>(
+    collapse_kernel<<<dim3(columns, (hidden + kElementThreads - 1) / kElementThreads), kElementThreads, 0, stream>>>(
         static_cast<const bf16*>(residual.data), static_cast<const float*>(pre.data), hidden,
         static_cast<bf16*>(x.data));
     check_launch("collapse");
@@ -231,12 +235,12 @@ void hc_expand_mix(const Tensor& y, const Tensor& post, const Tensor& comb, Tens
                 contiguous_2d(comb, DType::FP32) && contiguous_2d(residual, DType::BF16),
             "expand_mix needs contiguous tensors");
     const int hidden = y.ne[0], columns = y.ne[1];
-    require(hidden > 0 && columns > 0 && residual.ne[0] == kS * hidden && residual.ne[1] == columns &&
-                post.ne[0] == kS && post.ne[1] == columns && comb.ne[0] == kS * kS && comb.ne[1] == columns,
+    require(hidden > 0 && hidden <= kMaxHidden && columns > 0 && residual.ne[0] == kS * hidden &&
+                residual.ne[1] == columns && post.ne[0] == kS && post.ne[1] == columns && comb.ne[0] == kS * kS && comb.ne[1] == columns,
             "expand_mix shapes disagree");
     require(!overlaps(residual, y) && !overlaps(residual, post) && !overlaps(residual, comb),
             "the residual overlaps an input");
-    expand_mix_kernel<<<dim3((hidden + kElementThreads - 1) / kElementThreads, columns), kElementThreads, 0, stream>>>(
+    expand_mix_kernel<<<dim3(columns, (hidden + kElementThreads - 1) / kElementThreads), kElementThreads, 0, stream>>>(
         static_cast<const bf16*>(y.data), static_cast<const float*>(post.data),
         static_cast<const float*>(comb.data), hidden, static_cast<bf16*>(residual.data));
     check_launch("expand_mix");
