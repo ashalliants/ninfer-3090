@@ -123,7 +123,7 @@ case "${1:-}" in
     artifact='qwen4exp-ud-iq3xxs-mtp-vision.ninfer'
     owner='WarlaxZ'
     repo='Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090'
-    revision='38039dacc0e9ced2f4a8d233b44d33d8a663f933'
+    revision='196f11834dfe4fc21342f0255bcee034a5120ae7'
     expected_size=32000000000
     expected_sha256='0edec1ba7ba56e3cf0a0a2b3bfa990a7a645243c649265e507cdfa78c37a2fe6'
     part_sizes=(25087457792)

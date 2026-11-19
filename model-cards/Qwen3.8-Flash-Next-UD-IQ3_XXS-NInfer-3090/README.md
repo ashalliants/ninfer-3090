@@ -215,7 +215,7 @@ tokens with INT8 KV and MTP; `NINFER_CONTEXT` raises the context and `NINFER_SPE
 | Vision tower | the same repository's `mmproj-BF16.gguf` (907,542,944 bytes, `2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355`) |
 | MTP drafter | `mtp-q2_0.gguf` as installed by Strata 0.1.38 (889,017,216 bytes, `a22206a4d74eafbf31063a84610292535fb3b49af9a339963817fd04aed81e4d`), the same file as the IQ2_XS build |
 | Recipe | `qwen4_exp_gguf` |
-| Converter | `python -m tools.convert --model Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf --mtp-gguf mtp-q2_0.gguf --mmproj mmproj-BF16.gguf --recipe qwen4_exp_gguf --device cpu --out qwen4exp-ud-iq3xxs-mtp-vision.ninfer --ngram-reuse qwen4exp-iq2xs.ninfer.ngram` with the converter of fork commit `526c268f2` (the branch `feat/flash-next-ud-iq3xxs`) |
+| Converter | `python -m tools.convert --model Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf --mtp-gguf mtp-q2_0.gguf --mmproj mmproj-BF16.gguf --recipe qwen4_exp_gguf --device cpu --out qwen4exp-ud-iq3xxs-mtp-vision.ninfer --ngram-reuse qwen4exp-iq2xs.ninfer.ngram` with the converter of fork commit `848cbe3f8` (PR #481, which merged it into master) |
 
 The GGUF hashes are those Hugging Face reports for that revision, and the local copies that were converted
 have the same SHA-256 values. Unsloth's repository also holds an importance matrix
