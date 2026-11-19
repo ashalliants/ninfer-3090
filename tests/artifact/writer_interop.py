@@ -42,9 +42,10 @@ def _ggml_objects() -> tuple[list[TensorSpec], dict[str, bytes], dict[str, dict]
     # Rows 1..2 of one parent: a partial region of a GGML block parent.
     k = 2 * GGML_BLOCK_FORMATS["ggml_q6_k"].block_elems
     bindings["ggml_q6_k_rows"] = {"parts": [{"object": "ggml_q6_k", "range": [k, 3 * k]}]}
-    # [2 experts, hidden 256, intermediate 64]: IQ2_S and IQ2_XXS gate parts leave a gap.
-    for name in sorted(GGML_RECORD_FORMATS):
-        shape = (2, 256, 64)
+    # [2 experts, hidden 256, intermediate 64]: IQ2_S and IQ2_XXS gate parts leave a gap. A down part
+    # of 256-value blocks (the V4.1-Flash pairs) needs the intermediate size to be a multiple of 256.
+    for name, record in sorted(GGML_RECORD_FORMATS.items()):
+        shape = (2, 256, 256 if record.down.block_elems == 256 else 64)
         specs.append(TensorSpec(name, shape, name, "ggml_expert_record_v1"))
         data[name] = _records(name, shape)
         bindings[name] = {"object": name}
