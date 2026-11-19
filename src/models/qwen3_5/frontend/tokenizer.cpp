@@ -674,25 +674,31 @@ std::size_t dsv4_match_at(std::string_view text, std::size_t at, std::size_t lim
     return count >= 2 ? last_begin : end;
 }
 
-std::size_t dsv4_word_end(std::string_view text, std::size_t begin) {
-    const uni::CodepointSpan first = qwen_codepoint_at(text, begin);
-    const std::int32_t cp          = first.value;
-    if (uni::is_number(cp)) {  // stage 1: up to three digits, and nothing else matches a digit piece
-        std::size_t end = begin;
-        for (int count = 0; count < 3 && end < text.size(); ++count) {
-            const uni::CodepointSpan value = qwen_codepoint_at(text, end);
-            if (!uni::is_number(value.value)) { break; }
-            end += value.length;
+// `limit` is the end of the stage 1/2 piece the previous call was inside (0 at the start): a word that ends before
+// it starts inside the same piece, so the piece's end is found once per piece, not once per word (a long run of
+// ordinary text would otherwise be rescanned to its end for every word: quadratic in the prompt).
+std::size_t dsv4_word_end(std::string_view text, std::size_t begin, std::size_t& limit) {
+    if (begin >= limit) {
+        const uni::CodepointSpan first = qwen_codepoint_at(text, begin);
+        const std::int32_t cp          = first.value;
+        if (uni::is_number(cp)) {  // stage 1: up to three digits, and nothing else matches a digit piece
+            std::size_t end = begin;
+            for (int count = 0; count < 3 && end < text.size(); ++count) {
+                const uni::CodepointSpan value = qwen_codepoint_at(text, end);
+                if (!uni::is_number(value.value)) { break; }
+                end += value.length;
+            }
+            limit = end;
+            return end;
         }
-        return end;
-    }
-    // The piece stages 1 and 2 leave around `begin`: a CJK run, or the text up to the next digit or CJK char.
-    const bool cjk = dsv4_is_cjk(cp);
-    std::size_t limit = begin;
-    while (limit < text.size()) {
-        const uni::CodepointSpan value = qwen_codepoint_at(text, limit);
-        if (cjk ? !dsv4_is_cjk(value.value) : (uni::is_number(value.value) || dsv4_is_cjk(value.value))) { break; }
-        limit += value.length;
+        // The piece stages 1 and 2 leave from `begin`: a CJK run, or the text up to the next digit or CJK char.
+        const bool cjk = dsv4_is_cjk(cp);
+        limit          = begin;
+        while (limit < text.size()) {
+            const uni::CodepointSpan value = qwen_codepoint_at(text, limit);
+            if (cjk ? !dsv4_is_cjk(value.value) : (uni::is_number(value.value) || dsv4_is_cjk(value.value))) { break; }
+            limit += value.length;
+        }
     }
     // Stage 3 within [begin, limit): a match starting here is the word; otherwise the gap up to the next match.
     std::size_t at = begin;
@@ -704,9 +710,21 @@ std::size_t dsv4_word_end(std::string_view text, std::size_t begin) {
     return limit;
 }
 
-std::size_t word_end(Pipeline pipeline, std::string_view text, std::size_t begin) {
-    return pipeline == Pipeline::Dsv4 ? dsv4_word_end(text, begin) : qwen_word_end(text, begin);
-}
+// Walks a text word by word. Stateful for DeepSeek-V4 (the stage 1/2 piece end, see dsv4_word_end); Qwen's
+// splitter looks at one word at a time.
+class WordCursor {
+public:
+    WordCursor(Pipeline pipeline, std::string_view text) : pipeline_(pipeline), text_(text) {}
+    // The end of the word starting at `begin`; words must be asked for in order, each starting where the last ended.
+    std::size_t next(std::size_t begin) {
+        return pipeline_ == Pipeline::Dsv4 ? dsv4_word_end(text_, begin, limit_) : qwen_word_end(text_, begin);
+    }
+
+private:
+    Pipeline pipeline_;
+    std::string_view text_;
+    std::size_t limit_ = 0;
+};
 
 // NFC for Qwen; DeepSeek-V4 has no normalizer, so its text passes through unchanged.
 std::string normalize_text(Pipeline pipeline, std::string_view text) {
@@ -772,8 +790,9 @@ bool append_normalized_bpe_ids(Pipeline pipeline, std::vector<int>& ids, std::st
     if (normalized.empty()) { return true; }
     if (ids.size() == max_tokens) { return false; }
 
+    WordCursor words(pipeline, normalized);
     for (std::size_t begin = 0; begin < normalized.size();) {
-        const std::size_t end = word_end(pipeline, normalized, begin);
+        const std::size_t end = words.next(begin);
         const std::string_view word(normalized.data() + begin, end - begin);
         auto& nodes = scratch.nodes;
         nodes.clear();
@@ -963,8 +982,9 @@ bool append_ordinary_text(Pipeline pipeline, BoundaryEncodedText& encoded, std::
 
 std::vector<std::size_t> pre_tokenize_ends(Pipeline pipeline, std::string_view text) {
     std::vector<std::size_t> ends;
+    WordCursor words(pipeline, text);
     for (std::size_t begin = 0; begin < text.size();) {
-        begin = word_end(pipeline, text, begin);
+        begin = words.next(begin);
         ends.push_back(begin);
     }
     return ends;

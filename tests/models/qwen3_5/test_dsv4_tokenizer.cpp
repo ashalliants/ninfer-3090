@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -63,6 +64,18 @@ void pre_tokenizer_matches_hugging_face() {
         ++checked;
     }
     expect(checked > 1000, "the golden has over a thousand cases");
+}
+
+// A long prompt of ordinary text (no digits, no CJK: one stage 1/2 piece) is cut in time linear in its length. The
+// stage 1/2 piece end used to be rescanned for every word, which is quadratic: 600,000 words took minutes.
+void long_text_is_pre_tokenized_in_linear_time() {
+    std::string text;
+    for (int i = 0; i < 600000; ++i) { text += "word, "; }
+    const auto start = std::chrono::steady_clock::now();
+    const auto ends  = ninfer::models::qwen3_5::frontend::pre_tokenize_ends(Pipeline::Dsv4, text);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    expect(ends.size() == 2 * 600000 + 1 && ends.back() == text.size(), "\"word, \" repeated cuts into word, comma, space-led words and a final space");
+    expect(seconds < 10.0, "3.6 MB of ordinary text pre-tokenized in " + std::to_string(seconds) + " s (quadratic behaviour?)");
 }
 
 // ByteLevel's alphabet (GPT-2's bytes_to_unicode), to write a vocabulary of the 256 single bytes.
@@ -227,6 +240,7 @@ void real_tokenizer_encodes_like_hugging_face() {
 int main() {
     try {
         pre_tokenizer_matches_hugging_face();
+        long_text_is_pre_tokenized_in_linear_time();
         a_dsv4_tokenizer_loads_and_encodes_without_normalizing();
         other_descriptions_are_refused();
         real_tokenizer_encodes_like_hugging_face();
