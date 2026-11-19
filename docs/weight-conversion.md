@@ -370,13 +370,25 @@ that reproduces `v`), `ssm_norm` and `ssm_conv1d` (F32 words that are BF16 words
 rows). Each layer's routed experts become one expert bank in
 `ggml_expert_record_v1`: one record per expert holding its gate, up and down blocks, the unit the
 expert cache moves. Name the first file of a split GGUF; the reader finds the others by their
-`-0000N-of-0000M` names and checks the split metadata.
+`-0000N-of-0000M` names and checks the split metadata (a shard holding only metadata, as the first
+shard of Unsloth's splits is, is accepted).
 
 ```bash
 python -m tools.convert \
   --model /models/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
   --recipe qwen4_exp_gguf --device cpu --out out/qwen4exp.ninfer
 ```
+
+Unsloth's Dynamic v3.1 GGUFs (`unsloth/Qwen3.8-Flash-Next-GGUF`, for example `UD-IQ3_XXS/`) convert
+the same way. They store the dense projections, token embedding and output head as Q6_K or Q8_0
+(the engine reads both), and some tensors the model reads as BF16 in other types: the router, the
+shared-expert score, the GDN `a`/`b` projections and the hyper-connection `inject` rows as F32, the
+hyper-connection `down`/`up` mixers and the PLE `key`/`value` projections as Q8_0. The converter
+stores all of them as BF16 (`BF16_PARAMETERS` in `tools/convert/qwen4_exp.py`): an F32 source must
+already hold BF16 words (any other value is refused), and a Q8_0 source is decoded exactly to FP32
+and rounded once to nearest even. That rounding is the only one this recipe makes; the converter
+prints how many values it touched, and `tests/convert/qwen4_exp_verify.py` checks every such tensor
+against its own integer rounding of the GGUF's values. Everything else is still byte for byte.
 
 The PLE n-gram table is not stored in the artifact. The converter writes it after the artifact as
 a separate n-gram volume (storage layouts Section 11), by default `OUT.ngram`; `--ngram-out PATH`

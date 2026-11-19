@@ -60,6 +60,7 @@ rem Only qwen38-flash-next has continuation parts and an n-gram volume. Cleared 
 rem inherits the caller's environment.
 set "PART_COUNT=0"
 set "NGRAM_NAME="
+set "NGRAM_REPO="
 
 if "%~1"=="" goto :menu
 if /i "%~1"=="qwen38-27b" goto :model_qwen38_27b
@@ -67,6 +68,7 @@ if /i "%~1"=="bonsai2-27b" goto :model_bonsai2_27b
 if /i "%~1"=="qwen36-27b" goto :model_qwen36_27b
 if /i "%~1"=="qwen36-35b-a3b" goto :model_qwen36_35b_a3b
 if /i "%~1"=="qwen38-flash-next" goto :model_qwen38_flash_next
+if /i "%~1"=="qwen38-flash-next-iq3" goto :model_qwen38_flash_next_iq3
 if /i "%~1"=="-h" goto :usage_help
 if /i "%~1"=="--help" goto :usage_help
 goto :usage_error
@@ -79,11 +81,13 @@ echo   2 = Qwen3.6-35B-A3B                 qwen36-35b-a3b
 echo   3 = Qwen3.6-27B                     qwen36-27b
 echo   4 = Qwen3.8-Flash-Next (preview)    qwen38-flash-next   (needs 64 GB of RAM)
 echo   5 = Ternary Bonsai 2 27B            bonsai2-27b
+echo   6 = Qwen3.8-Flash-Next UD-IQ3_XXS    qwen38-flash-next-iq3   (preview, needs 64 GB of RAM)
 echo.
-choice /c 12345 /n /m "Choose 1-5: "
+choice /c 123456 /n /m "Choose 1-6: "
 rem choice reports 255 when it cannot read a key (no console, closed stdin). Refuse rather than
 rem let that fall through and pick a model nobody chose.
 if errorlevel 255 exit /b 2
+if errorlevel 6 goto :model_qwen38_flash_next_iq3
 if errorlevel 5 goto :model_bonsai2_27b
 if errorlevel 4 goto :model_qwen38_flash_next
 if errorlevel 3 goto :model_qwen36_27b
@@ -107,6 +111,7 @@ echo   bonsai2-27b
 echo   qwen36-27b
 echo   qwen36-35b-a3b
 echo   qwen38-flash-next (preview)
+echo   qwen38-flash-next-iq3 (preview, Unsloth UD-IQ3_XXS)
 exit /b 0
 
 :model_qwen38_27b
@@ -170,6 +175,27 @@ set "NGRAM_REVISION=95b1b0169bd25db96ceb772a8a67cc6e87088a1f"
 set "NGRAM_SIZE=29127258112"
 set "NGRAM_SHA256=7623459b2385eef4505891c2ff133b3dd8ad4ecd0ad334c901878f3fa1d1b051"
 set "LABEL=the Qwen3.8-Flash-Next model (38.2 GiB in two files)"
+set "TESTS_VARIABLE=NINFER_TEST_QWEN4EXP_ARTIFACT"
+goto :model_selected
+
+:model_qwen38_flash_next_iq3
+rem The Unsloth UD-IQ3_XXS build of the same model. Its n-gram table is the same table, so it reads the
+rem volume of the IQ2_XS repo above: one 27.1 GiB file serves both builds.
+set "ARTIFACT=qwen4exp-ud-iq3xxs-mtp-vision.ninfer"
+set "OWNER=WarlaxZ"
+set "REPO=Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090"
+set "REVISION=38039dacc0e9ced2f4a8d233b44d33d8a663f933"
+set "EXPECTED_SIZE=32000000000"
+set "EXPECTED_SHA256=0edec1ba7ba56e3cf0a0a2b3bfa990a7a645243c649265e507cdfa78c37a2fe6"
+set "PART_COUNT=1"
+set "PART_1_SIZE=25087457792"
+set "PART_1_SHA256=f971f41af085d3e40cd3ef6658f34d09871f3e7145d328c18df1ec3010a021f7"
+set "NGRAM_NAME=qwen4exp-iq2xs-mtp-vision.ninfer.ngram"
+set "NGRAM_REPO=Qwen3.8-Flash-Next-NInfer-3090"
+set "NGRAM_REVISION=95b1b0169bd25db96ceb772a8a67cc6e87088a1f"
+set "NGRAM_SIZE=29127258112"
+set "NGRAM_SHA256=7623459b2385eef4505891c2ff133b3dd8ad4ecd0ad334c901878f3fa1d1b051"
+set "LABEL=the Qwen3.8-Flash-Next UD-IQ3_XXS model (53.17 GiB in two files)"
 set "TESTS_VARIABLE=NINFER_TEST_QWEN4EXP_ARTIFACT"
 goto :model_selected
 
@@ -262,7 +288,9 @@ echo If it is the v2 file from an earlier release, you can upgrade it instead of
 echo   python tools\upgrade_ninfer_v2_to_v3.py "!F_PATH!" "!F_PATH!.v3" ^&^& move /y "!F_PATH!.v3" "!F_PATH!"
 :fetch_download
 echo Downloading %F_WHAT%...
-set "URL=https://huggingface.co/%OWNER%/%REPO%/resolve/%F_REV%/%F_NAME%"
+set "F_REPO=%REPO%"
+if /i "%F_KIND%"=="volume" if defined NGRAM_REPO set "F_REPO=%NGRAM_REPO%"
+set "URL=https://huggingface.co/%OWNER%/%F_REPO%/resolve/%F_REV%/%F_NAME%"
 where /q aria2c
 if errorlevel 1 goto :fetch_curl
 rem 16 parallel ranges over one file, not single-stream curl. On the Vast rental boxes this repo

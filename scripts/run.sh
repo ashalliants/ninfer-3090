@@ -8,6 +8,7 @@
 #   qwen38-27b        tuned (default), int8, c8   <- recommended
 #   qwen36-35b-a3b    tuned (default)
 #   qwen38-flash-next tuned (default)      <- Qwen3.8-Flash-Next from the IQ2_XS GGUF (preview)
+#   qwen38-flash-next-iq3 tuned (default)  <- the same model from Unsloth's UD-IQ3_XXS GGUF (preview)
 #
 # `tuned` is the recommended profile: rk4v4 KV, speculation plus the draft head, the memory flags,
 # vision in overlay residency, and an 8 GiB pinned Host context budget for the cache. `int8` and
@@ -160,6 +161,7 @@ usage() {
   printf '  qwen38-27b       tuned (default), int8, c8   (recommended)\n'
   printf '  qwen36-35b-a3b   tuned (default)\n'
   printf '  qwen38-flash-next tuned (default)      (preview)\n'
+  printf '  qwen38-flash-next-iq3 tuned (default)   (preview, Unsloth UD-IQ3_XXS)\n'
 }
 
 model_key="${1:-}"
@@ -169,6 +171,7 @@ case "$model_key" in
   qwen38-27b)        artifact='qwen3_8_27b.ninfer';     title='Qwen3.8-27B' ;;
   qwen36-35b-a3b)     artifact='qwen3_6_35b_a3b.ninfer'; title='Qwen3.6-35B-A3B' ;;
   qwen38-flash-next)  artifact='qwen4exp-iq2xs.ninfer';  title='Qwen3.8-Flash-Next (IQ2_XS)' ;;
+  qwen38-flash-next-iq3) artifact='qwen4exp-ud-iq3xxs-mtp-vision.ninfer'; title='Qwen3.8-Flash-Next (Unsloth UD-IQ3_XXS)' ;;
   '') usage >&2; exit 2 ;;
   *) printf 'Unknown model: %s\n' "$model_key" >&2; usage >&2; exit 2 ;;
 esac
@@ -176,8 +179,8 @@ esac
 # silently ignore it elsewhere. Every other once-Flash-Next-only override (devices, stage layers,
 # expert state and headroom, the NVMe tier directory) is now a plain passthrough flag below, since
 # the server itself decides whether a flag applies to the model it loaded.
-if [[ -n "${NINFER_NGRAM_VOLUME:-}" && "$model_key" != 'qwen38-flash-next' ]]; then
-  printf 'NINFER_NGRAM_VOLUME is for qwen38-flash-next only; clear it to serve %s\n' "$model_key" >&2
+if [[ -n "${NINFER_NGRAM_VOLUME:-}" && "$model_key" != 'qwen38-flash-next' && "$model_key" != 'qwen38-flash-next-iq3' ]]; then
+  printf 'NINFER_NGRAM_VOLUME is for the qwen38-flash-next models only; clear it to serve %s\n' "$model_key" >&2
   exit 2
 fi
 
@@ -348,7 +351,7 @@ case "$model_key/$profile" in
     tuned_overrides
     label="C$CONCURRENCY  |  context $CONTEXT  |  KV pool $KV_CAPACITY  |  $KV_DTYPE  |  $spec_label" ;;
 
-  qwen38-flash-next/tuned)
+  qwen38-flash-next/tuned|qwen38-flash-next-iq3/tuned)
     # The serving shape this release supports: INT8 KV and one lane, or two (NINFER_CONCURRENCY=2:
     # two requests decode in the same rounds; docs/maintainer/flash-next-plan.md has the
     # measurements). No step-down ladder here (its refusals are another model's); a refusal below
@@ -357,6 +360,27 @@ case "$model_key/$profile" in
     #
     # The file holds the INT8 KV, the prefill chunk and the request queue; the rest is chosen below.
     use_profile qwen38-flash-next-tuned
+    # Two builds share this block. The IQ2_XS build (the first, GSQ-RCO) pins all its experts in host
+    # RAM. The Unsloth UD-IQ3_XXS build (qwen38-flash-next-iq3) is 3 bits per routed weight, so its
+    # experts do not all fit beside the OS on a 64 GB machine: --partial-ram-residency keeps the
+    # hottest in VRAM and pins only the rest. That mode does not take images (--vision is refused
+    # with it), so the build runs text only whatever the file carries, and its n-gram volume is the
+    # IQ2_XS build's (the same table).
+    fn_base='qwen4exp-iq2xs'
+    fn_iq3=0
+    fn_partial_args=()
+    fn_partial=0
+    if [[ "$model_key" == 'qwen38-flash-next-iq3' ]]; then
+      fn_base='qwen4exp-ud-iq3xxs'
+      fn_iq3=1
+      # NINFER_PARTIAL_RAM_RESIDENCY=off pins every expert instead (the full 42.3 GiB bank: about 50
+      # GiB of available RAM), which takes images and a context above 32,768 tokens.
+      case "${NINFER_PARTIAL_RAM_RESIDENCY:-on}" in
+        on)  fn_partial=1; fn_partial_args=(--partial-ram-residency) ;;
+        off) ;;
+        *) printf 'NINFER_PARTIAL_RAM_RESIDENCY must be on or off, got %s\n' "$NINFER_PARTIAL_RAM_RESIDENCY" >&2; exit 2 ;;
+      esac
+    fi
     CONTEXT="${NINFER_CONTEXT:-32768}"
     # MTP speculation needs the artifact converted with the drafter (--mtp-gguf). Without an
     # explicit NINFER_MODEL, that artifact is preferred when it sits beside the plain one;
@@ -369,20 +393,28 @@ case "$model_key/$profile" in
     # passed when the model is a -vision artifact (NINFER_VISION=off drops it).
     model_folder="$(dirname -- "$MODEL")"
     if [[ -z "${NINFER_MODEL:-}" ]]; then
-      [[ -f "$model_folder/qwen4exp-iq2xs-mtp.ninfer" ]] && MODEL="$model_folder/qwen4exp-iq2xs-mtp.ninfer"
-      [[ -f "$model_folder/qwen4exp-iq2xs-mtp-vision.ninfer" ]] && MODEL="$model_folder/qwen4exp-iq2xs-mtp-vision.ninfer"
+      [[ -f "$model_folder/$fn_base-mtp.ninfer" ]] && MODEL="$model_folder/$fn_base-mtp.ninfer"
+      [[ -f "$model_folder/$fn_base-mtp-vision.ninfer" ]] && MODEL="$model_folder/$fn_base-mtp-vision.ninfer"
     fi
     model_base="$(basename -- "$MODEL")"
     SPEC='none'
     FN_VISION='off'
     case "$model_base" in
-      qwen4exp-iq2xs-mtp.ninfer|qwen4exp-iq2xs-mtp-vision.ninfer) SPEC='mtp' ;;
+      "$fn_base-mtp.ninfer"|"$fn_base-mtp-vision.ninfer") SPEC='mtp' ;;
     esac
     case "$model_base" in
-      qwen4exp-iq2xs-mtp-vision.ninfer|qwen4exp-iq2xs-vision.ninfer) FN_VISION='on' ;;
+      "$fn_base-mtp-vision.ninfer"|"$fn_base-vision.ninfer") FN_VISION='on' ;;
     esac
     [[ -z "${NINFER_SPEC:-}" ]] || SPEC="$NINFER_SPEC"
     [[ -z "${NINFER_VISION:-}" ]] || FN_VISION="$NINFER_VISION"
+    if [[ "$fn_partial" == 1 ]]; then
+      # The file carries the vision tower, but --partial-ram-residency refuses --vision.
+      [[ -z "${NINFER_VISION:-}" || "$NINFER_VISION" != 'on' ]] || {
+        printf 'The Unsloth UD-IQ3_XXS build runs with --partial-ram-residency, which does not take images; set NINFER_PARTIAL_RAM_RESIDENCY=off (needs about 50 GiB of available RAM) or use qwen38-flash-next.\n' >&2
+        exit 2
+      }
+      FN_VISION='off'
+    fi
     fn_vision_args=()
     fn_input='text only'
     case "$FN_VISION" in
@@ -451,9 +483,10 @@ case "$model_key/$profile" in
       ${spec_args[@]+"${spec_args[@]}"} ${fn_vision_args[@]+"${fn_vision_args[@]}"}
       ${fn_cache_args[@]+"${fn_cache_args[@]}"} ${store_args[@]+"${store_args[@]}"}
       ${profile_args_fn_memlock[@]+"${profile_args_fn_memlock[@]}"}
+      ${fn_partial_args[@]+"${fn_partial_args[@]}"}
     )
     label="$fn_lanes_label  |  context $CONTEXT  |  INT8 KV  |  $fn_input, $spec_label  |  $fn_cache_label"
-    if [[ "$FN_VISION" == 'off' && -z "${NINFER_VISION:-}" ]]; then
+    if [[ "$fn_partial" == 0 && "$FN_VISION" == 'off' && -z "${NINFER_VISION:-}" ]]; then
       hint='Images: convert with --mtp-gguf and --mmproj to qwen4exp-iq2xs-mtp-vision.ninfer (docs/weight-conversion.md); this launcher then uses it.'
       if [[ -n "${NINFER_MODEL:-}" && -f "$model_folder/qwen4exp-iq2xs-mtp-vision.ninfer" ]]; then
         hint='Images: qwen4exp-iq2xs-mtp-vision.ninfer is beside this model; clear NINFER_MODEL to use it.'
@@ -461,7 +494,7 @@ case "$model_key/$profile" in
     fi
     if [[ "$SPEC" == 'none' ]]; then
       case "$model_base" in
-        qwen4exp-iq2xs-mtp.ninfer|qwen4exp-iq2xs-mtp-vision.ninfer) ;;
+        "$fn_base-mtp.ninfer"|"$fn_base-mtp-vision.ninfer") ;;
         *)
           hint='Faster decode: convert with --mtp-gguf to qwen4exp-iq2xs-mtp.ninfer (docs/weight-conversion.md); this launcher then uses it.'
           if [[ -n "${NINFER_MODEL:-}" && -f "$model_folder/qwen4exp-iq2xs-mtp.ninfer" ]]; then
@@ -470,6 +503,11 @@ case "$model_key/$profile" in
       esac
     fi
     prefill_note='Loads in about 2 minutes: 33 GiB of experts are pinned in host RAM'
+    if [[ "$fn_partial" == 1 ]]; then
+      prefill_note='Loads in 2-3 minutes: 36 GiB of experts are pinned in host RAM, the hottest 6,000 live in VRAM'
+    elif [[ "$fn_iq3" == 1 ]]; then
+      prefill_note='Loads in about 3 minutes: all 42 GiB of experts are pinned in host RAM (NINFER_PARTIAL_RAM_RESIDENCY=off)'
+    fi
     # The 29 GB n-gram volume is read unbuffered on every prompt, so its drive sets prefill speed
     # while the 40 GB artifact is read once at load. NINFER_NGRAM_VOLUME points at a faster copy;
     # the server checks it belongs to the model, so one copy serves the plain and the -mtp artifact
@@ -488,6 +526,10 @@ case "$model_key/$profile" in
       fi
       profile_args+=(--ngram-volume "$NINFER_NGRAM_VOLUME")
       ngram_note="N-gram volume: $NINFER_NGRAM_VOLUME  (NINFER_NGRAM_VOLUME)"
+    elif [[ "$fn_iq3" == 1 && -f "$model_folder/qwen4exp-iq2xs-mtp-vision.ninfer.ngram" ]]; then
+      # The UD-IQ3_XXS build is bound to the IQ2_XS build's n-gram volume (the same table;
+      # download-model fetches it once for both): use it when it sits beside the model.
+      profile_args+=(--ngram-volume "$model_folder/qwen4exp-iq2xs-mtp-vision.ninfer.ngram")
     fi
     # The reasoning-loop guard, and the sampling guard's two overrides, only when asked for. The 27B's
     # tuned profile defaults min-p and the presence penalty for its small quant; Flash-Next keeps its

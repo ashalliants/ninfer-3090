@@ -9,6 +9,13 @@ rem   model             profiles
 rem   qwen38-27b        tuned (default), int8, c8   <- recommended
 rem   qwen36-35b-a3b    tuned (default)
 rem   qwen38-flash-next tuned (default)      <- Qwen3.8-Flash-Next from the IQ2_XS GGUF (preview)
+rem   qwen38-flash-next-iq3 tuned (default)  <- the same model from Unsloth's UD-IQ3_XXS GGUF (preview)
+rem
+rem QWEN3.8-FLASH-NEXT-IQ3 is the same model quantized at 3 bits per routed weight (Unsloth Dynamic
+rem v3.1 UD-IQ3_XXS). It reads better than the IQ2_XS build on every text measured, at a lower decode
+rem speed, and needs the same 64 GB of RAM: its experts do not all fit beside Windows, so it runs with
+rem --partial-ram-residency (the hottest experts live in VRAM, the rest pinned in RAM) and takes text
+rem only. Everything below applies to both builds except the file names and images.
 rem
 rem QWEN3.8-FLASH-NEXT: one request at a time (NINFER_CONCURRENCY=2: two), 32,768 tokens of context, INT8 KV, prefix reuse from
 rem a 4 GiB Host cache (a conversation's next turn prefills only what is new; NINFER_PREFIX_CACHE=off
@@ -191,6 +198,11 @@ if /i "%MODEL_KEY%"=="qwen38-flash-next" (
   set "TITLE=Qwen3.8-Flash-Next (IQ2_XS)"
   goto :model_known
 )
+if /i "%MODEL_KEY%"=="qwen38-flash-next-iq3" (
+  set "ARTIFACT=qwen4exp-ud-iq3xxs-mtp-vision.ninfer"
+  set "TITLE=Qwen3.8-Flash-Next (Unsloth UD-IQ3_XXS)"
+  goto :model_known
+)
 echo Unknown model: %MODEL_KEY% 1>&2
 call :usage 1>&2
 exit /b 2
@@ -202,9 +214,12 @@ echo Which model?
 echo   1  Qwen3.8-27B  (recommended)
 echo   2  Qwen3.6-35B-A3B
 echo   3  Qwen3.8-Flash-Next  (preview: one request at a time, 32K context; NINFER_CONCURRENCY=2 for two)
-choice /c 123 /n /m "Choose 1, 2 or 3: "
+echo   4  Qwen3.8-Flash-Next, Unsloth UD-IQ3_XXS  (preview: better text quality, about half the speed, no images)
+choice /c 1234 /n /m "Choose 1, 2, 3 or 4: "
 if errorlevel 255 exit /b 2
-if errorlevel 3 (
+if errorlevel 4 (
+  set "MODEL_KEY=qwen38-flash-next-iq3"
+) else if errorlevel 3 (
   set "MODEL_KEY=qwen38-flash-next"
 ) else if errorlevel 2 (
   set "MODEL_KEY=qwen36-35b-a3b"
@@ -277,7 +292,8 @@ rem Only Flash-Next has an n-gram volume, so refuse rather than ignore the varia
 rem Branch with goto rather than a parenthesised block, so the variable's value never sits inside one.
 if "%NINFER_NGRAM_VOLUME%"=="" goto :ngram_guard_done
 if /i "%MODEL_KEY%"=="qwen38-flash-next" goto :ngram_guard_done
-echo NINFER_NGRAM_VOLUME is for qwen38-flash-next only; clear it to serve %MODEL_KEY% 1>&2
+if /i "%MODEL_KEY%"=="qwen38-flash-next-iq3" goto :ngram_guard_done
+echo NINFER_NGRAM_VOLUME is for the qwen38-flash-next models only; clear it to serve %MODEL_KEY% 1>&2
 exit /b 2
 :ngram_guard_done
 set "REASONING_LOOP="
@@ -286,6 +302,7 @@ set "FN_SAMPLING_ARGS="
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-27b/tuned" goto :profile_27b_tuned
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen36-35b-a3b/tuned" goto :profile_35b_tuned
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-flash-next/tuned" goto :profile_flash_next
+if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-flash-next-iq3/tuned" goto :profile_flash_next
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-27b/int8" goto :profile_27b_int8
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-27b/c8" goto :profile_27b_c8
 echo Model %MODEL_KEY% has no profile %PROFILE% 1>&2
@@ -416,6 +433,26 @@ rem step-down ladder does not apply (its refusals are another model's); a refusa
 rem change. PROFILE is renamed so the tuned profiles' cache and sampling notes are not printed for it.
 set "LADDER=0"
 set "PROFILE=flash-next"
+rem Two builds share this block. The IQ2_XS build (the first, GSQ-RCO) pins all its experts in host RAM.
+rem The Unsloth UD-IQ3_XXS build (qwen38-flash-next-iq3) is 3 bits per routed weight, so its experts do
+rem not fit beside Windows on a 64 GB machine: --partial-ram-residency keeps the hottest in VRAM and
+rem pins only the rest. That mode does not take images (--vision is refused with it), so the build runs
+rem text only whatever the file carries, and its n-gram volume is the IQ2_XS build's (the same table).
+set "FN_BASE=qwen4exp-iq2xs"
+set "FN_IQ3=0"
+set "FN_PARTIAL=0"
+set "FN_PARTIAL_ARGS="
+if /i "%MODEL_KEY%"=="qwen38-flash-next-iq3" set "FN_BASE=qwen4exp-ud-iq3xxs"
+if /i "%MODEL_KEY%"=="qwen38-flash-next-iq3" set "FN_IQ3=1"
+rem NINFER_PARTIAL_RAM_RESIDENCY=off pins every expert instead (the full 42.3 GiB bank: about 50 GiB of
+rem available RAM), which takes images and a context above 32,768 tokens.
+if /i "%MODEL_KEY%"=="qwen38-flash-next-iq3" set "FN_PARTIAL=1"
+if /i "%MODEL_KEY%"=="qwen38-flash-next-iq3" if /i "%NINFER_PARTIAL_RAM_RESIDENCY%"=="off" set "FN_PARTIAL=0"
+if "%FN_PARTIAL%"=="1" set "FN_PARTIAL_ARGS=--partial-ram-residency"
+if /i "%MODEL_KEY%"=="qwen38-flash-next-iq3" if not "%NINFER_PARTIAL_RAM_RESIDENCY%"=="" if /i not "%NINFER_PARTIAL_RAM_RESIDENCY%"=="on" if /i not "%NINFER_PARTIAL_RAM_RESIDENCY%"=="off" (
+  echo NINFER_PARTIAL_RAM_RESIDENCY must be on or off, got %NINFER_PARTIAL_RAM_RESIDENCY% 1>&2
+  exit /b 2
+)
 rem The file holds the INT8 KV, the prefill chunk and the request queue; the rest is chosen below.
 set "PROFILE_FILE=%PROFILES_DIR%\qwen38-flash-next-tuned.json"
 call :read_profile || exit /b 1
@@ -427,19 +464,26 @@ rem when the model is it. NINFER_SPEC=none turns it off, NINFER_SPEC=mtp forces 
 rem then refuses at startup with the conversion to run). A ceiling of 3 drafts measured best or tied
 rem at 1K-32K (docs\maintainer\flash-next-plan.md, PR 13); each round drafts what acceptance pays for.
 rem Image input needs the artifact converted with the vision tower (--mmproj); the one with the
-rem drafter and the tower (qwen4exp-iq2xs-mtp-vision.ninfer) is preferred over the drafter-only one,
+rem drafter and the tower (%FN_BASE%-mtp-vision.ninfer) is preferred over the drafter-only one,
 rem and --vision is passed when the model is a -vision artifact (NINFER_VISION=off drops it).
 for %%F in ("%MODEL%") do set "MODEL_FOLDER=%%~dpF"
-if "%NINFER_MODEL%"=="" if exist "%MODEL_FOLDER%qwen4exp-iq2xs-mtp.ninfer" set "MODEL=%MODEL_FOLDER%qwen4exp-iq2xs-mtp.ninfer"
-if "%NINFER_MODEL%"=="" if exist "%MODEL_FOLDER%qwen4exp-iq2xs-mtp-vision.ninfer" set "MODEL=%MODEL_FOLDER%qwen4exp-iq2xs-mtp-vision.ninfer"
+if "%NINFER_MODEL%"=="" if exist "%MODEL_FOLDER%%FN_BASE%-mtp.ninfer" set "MODEL=%MODEL_FOLDER%%FN_BASE%-mtp.ninfer"
+if "%NINFER_MODEL%"=="" if exist "%MODEL_FOLDER%%FN_BASE%-mtp-vision.ninfer" set "MODEL=%MODEL_FOLDER%%FN_BASE%-mtp-vision.ninfer"
 set "SPEC=none"
 set "FN_VISION=off"
-for %%F in ("%MODEL%") do if /i "%%~nF"=="qwen4exp-iq2xs-mtp" set "SPEC=mtp"
-for %%F in ("%MODEL%") do if /i "%%~nF"=="qwen4exp-iq2xs-mtp-vision" set "SPEC=mtp"
-for %%F in ("%MODEL%") do if /i "%%~nF"=="qwen4exp-iq2xs-mtp-vision" set "FN_VISION=on"
-for %%F in ("%MODEL%") do if /i "%%~nF"=="qwen4exp-iq2xs-vision" set "FN_VISION=on"
+for %%F in ("%MODEL%") do if /i "%%~nF"=="%FN_BASE%-mtp" set "SPEC=mtp"
+for %%F in ("%MODEL%") do if /i "%%~nF"=="%FN_BASE%-mtp-vision" set "SPEC=mtp"
+for %%F in ("%MODEL%") do if /i "%%~nF"=="%FN_BASE%-mtp-vision" set "FN_VISION=on"
+for %%F in ("%MODEL%") do if /i "%%~nF"=="%FN_BASE%-vision" set "FN_VISION=on"
 if not "%NINFER_SPEC%"=="" set "SPEC=%NINFER_SPEC%"
+rem The file carries the vision tower, but --partial-ram-residency does not load it: images stay off then
+rem unless asked for, and asking is an error.
+if "%FN_PARTIAL%"=="1" set "FN_VISION=off"
 if not "%NINFER_VISION%"=="" set "FN_VISION=%NINFER_VISION%"
+if "%FN_PARTIAL%"=="1" if /i "%FN_VISION%"=="on" (
+  echo The Unsloth UD-IQ3_XXS build runs with --partial-ram-residency, which does not take images; set NINFER_PARTIAL_RAM_RESIDENCY=off ^(needs about 50 GiB of available RAM^) or use qwen38-flash-next. 1>&2
+  exit /b 2
+)
 if /i not "%FN_VISION%"=="on" if /i not "%FN_VISION%"=="off" (
   echo NINFER_VISION must be on or off, got %FN_VISION% 1>&2
   exit /b 2
@@ -489,13 +533,15 @@ if not "%FN_LANES%"=="1" if not "%FN_LANES%"=="2" (
 )
 set "FN_LANES_LABEL=one request"
 if "%FN_LANES%"=="2" set "FN_LANES_LABEL=two requests at once"
-set "PROFILE_ARGS=--max-concurrency %FN_LANES% --max-context %CONTEXT% --kv-capacity %CONTEXT% %SPEC_ARGS% %FN_VISION_ARGS% %FN_CACHE_ARGS%"
+set "PROFILE_ARGS=--max-concurrency %FN_LANES% --max-context %CONTEXT% --kv-capacity %CONTEXT% %SPEC_ARGS% %FN_VISION_ARGS% %FN_PARTIAL_ARGS% %FN_CACHE_ARGS%"
 set "LABEL=%FN_LANES_LABEL%  ^|  context %CONTEXT%  ^|  INT8 KV  ^|  %FN_INPUT%, %SPEC_LABEL%  ^|  %FN_CACHE_LABEL%"
-if /i "%FN_VISION%"=="off" if "%NINFER_VISION%"=="" set "HINT=Images: convert with --mtp-gguf and --mmproj to qwen4exp-iq2xs-mtp-vision.ninfer (docs\weight-conversion.md); this launcher then uses it."
-if /i "%FN_VISION%"=="off" if "%NINFER_VISION%"=="" if not "%NINFER_MODEL%"=="" if exist "%MODEL_FOLDER%qwen4exp-iq2xs-mtp-vision.ninfer" set "HINT=Images: qwen4exp-iq2xs-mtp-vision.ninfer is beside this model; clear NINFER_MODEL to use it."
-if /i "%SPEC%"=="none" if exist "%MODEL%" for %%F in ("%MODEL%") do if /i not "%%~nF"=="qwen4exp-iq2xs-mtp" if /i not "%%~nF"=="qwen4exp-iq2xs-mtp-vision" set "HINT=Faster decode: convert with --mtp-gguf to qwen4exp-iq2xs-mtp.ninfer (docs\weight-conversion.md); this launcher then uses it."
-if /i "%SPEC%"=="none" if not "%NINFER_MODEL%"=="" if exist "%MODEL_FOLDER%qwen4exp-iq2xs-mtp.ninfer" for %%F in ("%MODEL%") do if /i not "%%~nF"=="qwen4exp-iq2xs-mtp" if /i not "%%~nF"=="qwen4exp-iq2xs-mtp-vision" set "HINT=Faster decode: qwen4exp-iq2xs-mtp.ninfer is beside this model; clear NINFER_MODEL to use it."
+if "%FN_PARTIAL%"=="0" if /i "%FN_VISION%"=="off" if "%NINFER_VISION%"=="" set "HINT=Images: convert with --mtp-gguf and --mmproj to %FN_BASE%-mtp-vision.ninfer (docs\weight-conversion.md); this launcher then uses it."
+if "%FN_PARTIAL%"=="0" if /i "%FN_VISION%"=="off" if "%NINFER_VISION%"=="" if not "%NINFER_MODEL%"=="" if exist "%MODEL_FOLDER%%FN_BASE%-mtp-vision.ninfer" set "HINT=Images: %FN_BASE%-mtp-vision.ninfer is beside this model; clear NINFER_MODEL to use it."
+if /i "%SPEC%"=="none" if exist "%MODEL%" for %%F in ("%MODEL%") do if /i not "%%~nF"=="%FN_BASE%-mtp" if /i not "%%~nF"=="%FN_BASE%-mtp-vision" set "HINT=Faster decode: convert with --mtp-gguf to %FN_BASE%-mtp.ninfer (docs\weight-conversion.md); this launcher then uses it."
+if /i "%SPEC%"=="none" if not "%NINFER_MODEL%"=="" if exist "%MODEL_FOLDER%%FN_BASE%-mtp.ninfer" for %%F in ("%MODEL%") do if /i not "%%~nF"=="%FN_BASE%-mtp" if /i not "%%~nF"=="%FN_BASE%-mtp-vision" set "HINT=Faster decode: %FN_BASE%-mtp.ninfer is beside this model; clear NINFER_MODEL to use it."
 set "PREFILL_NOTE=Loads in about 2 minutes: 33 GiB of experts are pinned in host RAM"
+if "%FN_PARTIAL%"=="1" set "PREFILL_NOTE=Loads in 2-3 minutes: 36 GiB of experts are pinned in host RAM, the hottest 6,000 live in VRAM"
+if "%FN_IQ3%"=="1" if "%FN_PARTIAL%"=="0" set "PREFILL_NOTE=Loads in about 3 minutes: all 42 GiB of experts are pinned in host RAM (NINFER_PARTIAL_RAM_RESIDENCY=off)"
 rem The 29 GB n-gram volume is read unbuffered on every prompt, so its drive sets prefill speed while
 rem the 40 GB artifact is read once at load. Measured 2026-10-12 with the artifact on a SATA SSD:
 rem moving only the volume to NVMe made prefill 1.37x / 1.11x / 1.13x faster at 4K / 32K / 128K
@@ -517,6 +563,9 @@ echo NINFER_NGRAM_VOLUME names a file that does not exist: "%NINFER_NGRAM_VOLUME
 echo Copy the model's .ngram file there, or clear NINFER_NGRAM_VOLUME to read the one beside the model. 1>&2
 exit /b 2
 :ngram_volume_done
+rem The UD-IQ3_XXS build is bound to the IQ2_XS build's n-gram volume (the same table; download-model
+rem fetches it once for both). Use it when it sits beside the model and nothing else was chosen.
+if "%FN_IQ3%"=="1" if "%NGRAM_VOLUME_ARGS%"=="" if exist "%MODEL_FOLDER%qwen4exp-iq2xs-mtp-vision.ninfer.ngram" set NGRAM_VOLUME_ARGS=--ngram-volume "%MODEL_FOLDER%qwen4exp-iq2xs-mtp-vision.ninfer.ngram"
 rem The reasoning-loop guard, and the sampling guard's two overrides, only when asked for. The 27B's
 rem tuned profile defaults min-p and the presence penalty for its small quant; Flash-Next keeps its
 rem registered presets unless one is set ("default" also leaves the preset). A presence penalty is
@@ -903,6 +952,7 @@ echo usage: run.bat ^<model^> [profile]
 echo   qwen38-27b       tuned (default), int8, c8   (recommended)
 echo   qwen36-35b-a3b   tuned (default)
 echo   qwen38-flash-next tuned (default)   (preview)
+echo   qwen38-flash-next-iq3 tuned (default)   (preview, Unsloth UD-IQ3_XXS)
 exit /b 0
 
 :pass_value

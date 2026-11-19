@@ -78,6 +78,7 @@ These are the model defaults it sets:
 | `NINFER_NGRAM_RAM_MIB=auto` | Flash-Next | Keeps about half the n-gram table (13 GiB on a 59 GiB host) in RAM after the experts and context cache are sized, which halves a prompt's disk reads |
 | `NINFER_MTP_STAGED_DRAFTS=on` | Flash-Next | Drafts one token at a time and stops when no further draft could be accepted: up to +3.6% decode (story, Chinese, French; code unchanged), same output |
 | `NINFER_CPU_VERIFY_MISSES=on` | Flash-Next | During decode, experts that miss the cache are computed on CPU threads beside the GPU. A cold cache decodes at 68-80 instead of 48-63 tok/s |
+| `NINFER_PARTIAL_RAM_RESIDENCY=on` | Flash-Next UD-IQ3_XXS | Pins only the experts the VRAM cache does not hold (`--partial-ram-residency`), so the 42 GiB bank fits; no images, context 32,768. `off` pins every expert (about 50 GiB) and restores images and the 262,144-token context |
 | `NINFER_HOT_EMBEDDING_ROWS=8192` | Flash-Next | Only the common embedding rows stay in VRAM, freeing room for 216 more cached experts |
 | `NINFER_SPEC=mtp`, `NINFER_KV_DTYPE=int8` | 27B | MTP3 with INT8 KV, which is faster than DFlash2 on this card (76 against 66 tok/s on code) |
 
@@ -176,6 +177,39 @@ Decode against context length, one request each, 256 tokens:
 | 79,228 | 76.8 tok/s | 27.0 | 99.1% |
 | 148,129 | 77.9 tok/s | 27.3 | 99.3% |
 | 221,567 | 78.8 tok/s | 28.2 | 98.4% |
+
+### Qwen3.8-Flash-Next, UD-IQ3_XXS (not yet run on a V100)
+
+`scripts/run-v100.sh qwen38-flash-next-iq3` serves Unsloth's 3-bit build (README, "Which Flash-Next
+build?"). **It has not been run on a V100**: it was built and tested on an RTX 3090, and what is known
+for this card is what compiles and what the op tests check.
+
+- **Formats.** The build's dense weights and embedding are Q6_K and Q8_0. The sm_70 linear routes
+  are generic over the GGML block formats and already cover both: the dp4a decode GEMV (`ggml_mmvq`,
+  launch-bounded to three CTAs an SM), the wide `ggml_mmq` and the FP16 tensor-core route
+  (`ggml_tensor_core_sm70.cu`, which names Q6_K and Q8_0). Cross-compiled for sm_70 with CUDA 12.8 the
+  new code builds cleanly and stays inside the envelope of the existing kernels (`cuobjdump
+  --dump-resource-usage`): the Q8_0 decode kernels use at most 128 registers and a 40-byte stack
+  (IQ4_XS: 128 and 56), the Q8_0 pair kernels 80 and 40 (the same as IQ4_XS's), none spills to local
+  memory, and the Q6_K embedding gathers, split ones included, use 32 registers and no stack.
+- **`--hot-embedding-rows`** (`NINFER_HOT_EMBEDDING_ROWS=8192`, on by default in `run-v100.sh`) works
+  with the Q6_K embedding: the table is 497 MiB, so keeping 8,192 rows on the card frees 480 MiB for
+  the expert cache (311 MiB for the IQ4_XS table). `ninfer_embedding_test` checks the split gather
+  bit for bit against the unsplit one.
+- **Memory.** The bank is 42.3 GiB. By default the build runs with `--partial-ram-residency`, which
+  pins only the experts the VRAM cache does not hold, takes no images and no elastic KV pool, so the
+  context defaults to 32,768 tokens; the memory-lock limit it asks for is 42 GiB. With
+  `NINFER_PARTIAL_RAM_RESIDENCY=off` every expert is pinned (about 50 GiB of available RAM: the 59 GiB
+  test host should fit it, and nothing else should be running), and the full 262,144-token context and
+  images come back. Neither mode has been measured on this card.
+- **Not done: Volta tuning of Q6_K.** The IQ4_XS decode GEMV has an sm_70 form that reads a
+  sub-block's header in one load (+2-8% per call, about +0.5% in the model). Q6_K, the build's main
+  dense format, has none; it would need the same standalone bench on a V100 (`ggml_mmvq` at Flash-Next's
+  five dense shapes, T = 1-4), and its sm_70 kernels already carry a larger stack than IQ4_XS's (112
+  bytes against 56), a hint that it spends more instructions per sub-block.
+- **To check it on a V100:** `scripts/v100_validate.sh --tests` runs the new op tests with the rest, then
+  `MODEL_FLASH=/path/qwen4exp-ud-iq3xxs-mtp-vision.ninfer scripts/v100_validate.sh --models` generates
+  text from it, and `scripts/run-v100.sh qwen38-flash-next-iq3` serves it.
 
 ### What limits Flash-Next here
 
