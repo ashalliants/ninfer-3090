@@ -149,6 +149,14 @@ void test_read(const std::filesystem::path& path) {
     std::vector<ExpertExtent> past = packed.extents;
     past.push_back({packed.end, 1});
     check(throws<std::out_of_range>([&] { const ExpertExtentReader r(file, past); }), "reader: an extent past the file is refused");
+    // Near-maximum sizes must not wrap to a zero-byte padded size (which would divide by zero in read).
+    for (const std::uint64_t huge : {std::numeric_limits<std::uint64_t>::max(),
+                                     std::numeric_limits<std::uint64_t>::max() - kExtentAlignment + 2,
+                                     std::uint64_t{1} << 63}) {
+        std::vector<ExpertExtent> wrap{{0, huge}};
+        check(throws<std::out_of_range>([&] { const ExpertExtentReader r(file, wrap); }),
+              "reader: a near-maximum extent size is refused, not wrapped");
+    }
     std::vector<ExpertExtent> misaligned{{100, 10}};
     check(throws<std::invalid_argument>([&] { const ExpertExtentReader r(file, misaligned); }),
           "reader: a misaligned extent is refused");

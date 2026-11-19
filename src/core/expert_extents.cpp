@@ -40,6 +40,11 @@ ExpertExtentReader::ExpertExtentReader(const ReadOnlyFile& file, std::vector<Exp
         if (e.bytes == 0 || e.offset % kExtentAlignment != 0) {
             throw std::invalid_argument("expert extent " + std::to_string(i) + " is empty or misaligned");
         }
+        // Before padding: a record larger than the file is refused here, so padding (which adds up
+        // to 4095) cannot wrap and every padded size below is exact.
+        if (e.bytes > file_bytes) {
+            throw std::out_of_range("expert extent " + std::to_string(i) + " is larger than the file");
+        }
         const std::uint64_t padded = padded_extent_bytes(e.bytes);
         if (e.offset > file_bytes || padded > file_bytes - e.offset) {
             throw std::out_of_range("expert extent " + std::to_string(i) + " ends past the file");
