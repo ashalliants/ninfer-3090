@@ -118,6 +118,31 @@ void aggregates_that_overflow_are_not_reported_wrongly() {
                std::abs(plan.score_share[2] - 0.25) < 1e-12,
            "DBL_MAX scores give exact shares");
 }
+
+void the_ssd_budget_is_enforced() {
+    // Three 10-byte experts, 10 bytes of VRAM and 10 of RAM: one expert (10 bytes) lands on the SSD.
+    const std::vector<TierExpert> experts{{0, 0, 10, 3.0}, {0, 1, 10, 2.0}, {0, 2, 10, 1.0}};
+    TierBudget budget{10, 10};
+    expect(ninfer::plan_expert_tiers(experts, budget).bytes[2] == 10, "the default SSD budget is unlimited");
+    budget.ssd_bytes = 10;
+    expect(ninfer::plan_expert_tiers(experts, budget).bytes[2] == 10, "an SSD budget of exactly the need is fine");
+    budget.ssd_bytes = 9;
+    bool refused = false;
+    try {
+        (void)ninfer::plan_expert_tiers(experts, budget);
+    } catch (const ninfer::ExpertTierCapacityError& e) { refused = e.needed == 10 && e.available == 9; }
+    expect(refused, "an SSD too small for the rest is refused with the numbers");
+    budget.vram_bytes = 20; // more VRAM: nothing is left for the SSD
+    expect(ninfer::plan_expert_tiers(experts, budget).bytes[2] == 0, "experts placed above leave the SSD empty");
+    budget = TierBudget{30, 0, 0};
+    expect(ninfer::plan_expert_tiers(experts, budget).count[2] == 0, "no SSD needed, none given");
+    budget  = TierBudget{10, 10, 0};
+    refused = false;
+    try {
+        (void)ninfer::plan_expert_tiers(experts, budget);
+    } catch (const ninfer::ExpertTierCapacityError&) { refused = true; }
+    expect(refused, "a zero SSD budget with experts left over is refused");
+}
 } // namespace
 
 int main() {
@@ -129,6 +154,7 @@ int main() {
     unscored_experts_have_no_hit_rate_but_are_still_placed();
     bad_input_is_refused();
     aggregates_that_overflow_are_not_reported_wrongly();
+    the_ssd_budget_is_enforced();
     if (failures == 0) { std::cout << "expert_tier_plan: all tests passed\n"; }
     return failures == 0 ? 0 : 1;
 }

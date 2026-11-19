@@ -17,6 +17,7 @@
 #include <numeric>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace ninfer {
@@ -34,6 +35,21 @@ struct TierExpert {
 struct TierBudget {
     std::uint64_t vram_bytes = 0; // what the expert cache may take
     std::uint64_t ram_bytes  = 0; // what pinned host memory may take for experts
+    // What the SSD may hold for experts (the free space of the drive the artifact lives on); unlimited by default.
+    std::uint64_t ssd_bytes = std::numeric_limits<std::uint64_t>::max();
+};
+
+// Thrown when the experts that fit neither VRAM nor RAM do not fit the SSD either: no placement exists.
+// `needed` is what the SSD tier would hold, `available` what the budget gave it.
+class ExpertTierCapacityError : public std::runtime_error {
+public:
+    ExpertTierCapacityError(std::uint64_t needed_bytes, std::uint64_t available_bytes)
+        : std::runtime_error("expert tier plan: " + std::to_string(needed_bytes) +
+                             " bytes of experts fit neither VRAM nor RAM, but the SSD has room for " +
+                             std::to_string(available_bytes)),
+          needed(needed_bytes), available(available_bytes) {}
+    std::uint64_t needed;
+    std::uint64_t available;
 };
 
 struct ExpertTierPlan {
@@ -50,7 +66,9 @@ struct ExpertTierPlan {
 //
 // Places every expert. An expert that does not fit the remaining VRAM goes to RAM, and one that does
 // not fit that goes to the SSD, so a small expert can still take space a large one could not. Ties
-// in score per byte break by (layer, expert), so the plan is deterministic.
+// in score per byte break by (layer, expert), so the plan is deterministic. When the SSD tier's total
+// exceeds budget.ssd_bytes the plan is refused with ExpertTierCapacityError (the model does not fit
+// this machine) rather than returning a placement nothing can hold.
 [[nodiscard]] inline ExpertTierPlan plan_expert_tiers(std::span<const TierExpert> experts,
                                                       const TierBudget& budget) {
     for (const auto& e : experts) {
@@ -97,6 +115,9 @@ struct ExpertTierPlan {
         const double relative = max_score > 0.0 ? e.score / max_score : 0.0; // at most 1, so a sum of N is at most N
         score[k] += relative;
         total += relative;
+    }
+    if (plan.bytes[static_cast<std::size_t>(ExpertTier::Ssd)] > budget.ssd_bytes) {
+        throw ExpertTierCapacityError(plan.bytes[static_cast<std::size_t>(ExpertTier::Ssd)], budget.ssd_bytes);
     }
     if (total > 0.0) {
         for (std::size_t k = 0; k < kExpertTierCount; ++k) { plan.score_share[k] = score[k] / total; }
