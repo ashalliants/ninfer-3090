@@ -96,12 +96,13 @@ def test_tensor_source_selects_rows_without_moving_bytes(tmp_path):
             tensor_source(model, "experts", rows=(4, 8), shape=(8, 32))
 
 
-def _shards(tmp_path, *, count_field=2, tensors_count=2, second_no=1, second_tensors_count=None):
+def _shards(tmp_path, *, count_field=2, tensors_count=2, second_no=1, second_tensors_count=None,
+            first_extra=(), second_extra=()):
     stem = tmp_path / "m"
     first = [("split.no", 2, 0), ("split.count", 2, count_field), ("split.tensors.count", 5, tensors_count),
-             ("general.architecture", 8, "test")]
+             ("general.architecture", 8, "test"), *first_extra]
     second = [("split.no", 2, second_no), ("split.count", 2, count_field),
-              ("split.tensors.count", 5, second_tensors_count or tensors_count)]
+              ("split.tensors.count", 5, second_tensors_count or tensors_count), *second_extra]
     a = ("a", 8, (32, 2), tensor_bytes(8, (32, 2)))
     b = ("b", 20, (32, 3), tensor_bytes(20, (32, 3), seed=1))
     write_gguf(stem.with_name("m-00001-of-00002.gguf"), first, [a])
@@ -132,6 +133,23 @@ def test_split_files_join_by_name_and_metadata(tmp_path):
 def test_bad_split_metadata_is_rejected(tmp_path, options, message):
     first, _, _ = _shards(tmp_path, **options)
     with pytest.raises(GgufError, match=message):
+        GgufModel(first)
+
+
+def test_a_shard_may_name_itself_differently_but_not_disagree_about_the_model(tmp_path):
+    # ISTA's Engram shard is shared by every build and carries its own name and description.
+    first, _, _ = _shards(
+        tmp_path,
+        first_extra=[("general.name", 8, "Model IQ2_XXS")],
+        second_extra=[("general.name", 8, "Model Engram tables"), ("general.description", 8, "Shard 2 of 2")],
+    )
+    with GgufModel(first) as model:
+        assert model.metadata["general.name"] == "Model IQ2_XXS"
+        assert model.metadata["general.description"] == "Shard 2 of 2"
+    other = tmp_path / "other"
+    other.mkdir()
+    first, _, _ = _shards(other, second_extra=[("general.architecture", 8, "another")])
+    with pytest.raises(GgufError, match="general.architecture.*disagrees"):
         GgufModel(first)
 
 

@@ -283,6 +283,11 @@ def split_paths(path: str | Path) -> tuple[Path, ...]:
     )
 
 
+# Metadata that names or describes a file rather than the model: a later shard's value is ignored (the first
+# shard's is the model's), not required to agree.
+_DESCRIPTIVE_KEYS = frozenset({"general.name", "general.description"})
+
+
 class GgufModel:
     """The tensors and metadata of one GGUF model, possibly split across several files."""
 
@@ -298,6 +303,11 @@ class GgufModel:
         for file in self.files[1:]:
             for key, value in file.metadata.items():
                 if key.startswith("split."):
+                    continue
+                if key in _DESCRIPTIVE_KEYS:
+                    # a shard may describe itself (ISTA's Engram shard is shared by every build): the first
+                    # shard's value stands, a later one only fills a gap
+                    self.metadata.setdefault(key, value)
                     continue
                 if key in self.metadata and self.metadata[key] != value:
                     raise GgufError(f"{file.path}: metadata {key!r} disagrees with split 0")
