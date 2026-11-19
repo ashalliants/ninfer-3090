@@ -2,7 +2,7 @@
 
 // Which tier each routed expert of an offloaded MoE lives in: the VRAM cache, pinned host RAM or the
 // SSD. Pure arithmetic over a list of experts, so it is tested without a device and shared by any
-// model whose experts outnumber VRAM + RAM (the DSV4-Flash scoping plan, PR 449).
+// model whose experts outnumber VRAM + RAM (docs/maintainer/dsv4-flash-plan.md, sections 3 and 7).
 //
 // Experts are placed greedily by routing score per byte, so a popular expert earns the fast tier
 // and a large expert pays for what it takes (quantisation can differ by layer, so sizes do too).
