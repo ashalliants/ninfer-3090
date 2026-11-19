@@ -149,7 +149,7 @@ flag set:
 | `qwen38-27b-tuned-dflash2.json`, `qwen38-27b-tuned-mtp.json`, `qwen38-27b-tuned-none.json` | Qwen3.8-27B `tuned`, one per `NINFER_SPEC` |
 | `qwen36-35b-a3b-tuned-mtp.json`, `qwen36-35b-a3b-tuned-none.json` | Qwen3.6-35B-A3B `tuned`, one per `NINFER_SPEC` |
 | `qwen38-27b-int8.json`, `qwen38-27b-c8.json` | the reference profiles: every flag |
-| `qwen38-flash-next-tuned.json` | Qwen3.8-Flash-Next (`run.bat` only): INT8 KV, the prefill chunk, the request queue |
+| `qwen38-flash-next-tuned.json` | Qwen3.8-Flash-Next: INT8 KV, the prefill chunk, the request queue and the tuned speed options. Not `--mtp-joint-acceptance` and `--gdn-async-commit`: the server refuses those without `--spec mtp`, so the launchers add them with it |
 
 The launchers keep what differs between the platforms or is decided at start, and pass it after
 `--config`, where the command line wins over the file: the context, KV pool and lanes of the

@@ -425,7 +425,10 @@ case "$model_key/$profile" in
     DRAFT_TOKENS="${NINFER_DRAFT_TOKENS:-3}"
     spec_args=()
     case "$SPEC" in
-      mtp)  spec_args=(--spec mtp --draft-tokens "$DRAFT_TOKENS"); spec_label="MTP, up to $DRAFT_TOKENS drafts" ;;
+      # The two MTP-only options of the tuned profile ride with --spec mtp: the server refuses them without
+      # it, so they cannot sit in the profile file (NINFER_SPEC=none and a drafter-less artifact start).
+      mtp)  spec_args=(--spec mtp --draft-tokens "$DRAFT_TOKENS" --mtp-joint-acceptance --gdn-async-commit)
+            spec_label="MTP, up to $DRAFT_TOKENS drafts" ;;
       none) spec_label='no speculation' ;;
       *) printf 'NINFER_SPEC must be mtp or none for Qwen3.8-Flash-Next, got %s\n' "$SPEC" >&2; exit 2 ;;
     esac
