@@ -471,7 +471,7 @@ block tensors keep their GGML blocks, BF16 and F32 keep their words, and each la
 one `ggml_expert_record_v1` bank in that layer's own pair of GGML types (GSQ-RCO picks them per layer; the
 IQ2_XXS build uses eight pairs, see [tensor formats](maintainer/tensor-formats.md)). Name the first file of the
 split GGUF. The converter checks the whole tensor list against the architecture (an unknown, missing,
-misplaced or mis-shaped tensor is refused) and writes no n-gram volume.
+misplaced or mis-shaped tensor is refused). It writes no Engram volume unless you ask (`--ngram-out`, below).
 
 **The checkpoint's `tokenizer.json` is required**, because the GGUF alone does not say which added tokens are
 special (49 of its control tokens, the tool-call and role markers, are not) or what the pre-tokenizer is. Get it

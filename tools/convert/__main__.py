@@ -147,7 +147,8 @@ def main(argv=None):
     parser.add_argument(
         "--ngram-out",
         type=Path,
-        help="GGUF: where to write the n-gram volume (default OUT + '.ngram'); any drive",
+        help="GGUF: where to write the n-gram volume (Qwen: default OUT + '.ngram'; DeepSeek-V4.1: none unless given, "
+        "the Engram volume is 112 GB); any drive",
     )
     parser.add_argument(
         "--ngram-reuse",
