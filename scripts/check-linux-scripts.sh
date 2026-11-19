@@ -460,6 +460,13 @@ banner="$(clear_env "${iq3_env[@]}" NINFER_MODEL="$tmp/qwen4exp-ud-iq3xxs.ninfer
   printf 'run.sh (IQ3 build) hints do not name the IQ3 files: %s\n' "$banner" >&2
   exit 1
 }
+# The two options ninfer-serve refuses without --spec mtp ride with it instead of sitting in the profile
+# file: a plain artifact and NINFER_SPEC=none must not pass them (the server would not start), and MTP does.
+refuse_flag 'Flash-Next without MTP' "$(record fn_plain_a -- qwen38-flash-next)" '--mtp-joint-acceptance'
+refuse_flag 'Flash-Next without MTP' "$(record fn_plain_b -- qwen38-flash-next)" '--gdn-async-commit'
+refuse_flag 'Flash-Next NINFER_SPEC=none' "$(record fn_none NINFER_SPEC=none -- qwen38-flash-next)" '--mtp-joint-acceptance'
+expect_flags 'Flash-Next NINFER_SPEC=mtp' "$(record fn_mtp NINFER_SPEC=mtp -- qwen38-flash-next)" \
+  '--spec mtp' '--mtp-joint-acceptance' '--gdn-async-commit'
 banner="$(clear_env NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$tmp/unused.args" NINFER_MODEL_DIR="$tmp" \
   NINFER_REASONING_LOOP=stop NINFER_PRESENCE_PENALTY=1.0 "$root/run.sh" qwen38-flash-next)"
 [[ "$banner" == *'Reasoning-loop guard: stop'* && "$banner" == *'Sampling: --presence-penalty 1.0'* ]] || {

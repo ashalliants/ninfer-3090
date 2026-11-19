@@ -68,7 +68,7 @@ table.
 | `--relaxed-drafting 0.5`, DFlash2 | 27B, sampled chat | **+2.32%** | 12/12 | win (changes output distribution; opt-in) |
 | `--relaxed-drafting 0.5`, MTP | 27B, sampled chat | **+3.78%** | 12/12 | win (changes output distribution; opt-in) |
 | `--gdn-head-map` | Flash-Next, decode+MTP | +0.83% | 9/12 | mild gain, in the tuned profile |
-| `--gdn-async-commit` | Flash-Next, decode+MTP | +0.63% | 8/12 | wash, in the tuned profile |
+| `--gdn-async-commit` | Flash-Next, decode+MTP | +0.63% | 8/12 | wash, in the tuned launcher configuration (added with `--spec mtp`) |
 | `--shared-expert-stream` | Flash-Next, decode+MTP | +0.37% | 7/12 | wash, in the tuned profile |
 | `--hot-embedding-rows 8192` | Flash-Next, decode+MTP | +0.46% | 7/12 | wash; VRAM/RAM tradeoff, not in the profile |
 | `--moe-precast-input` | Flash-Next, decode+MTP | +0.15% | 7/12 | wash, in the tuned profile (`--moe-gate-up-registers`'s prerequisite) |
@@ -82,7 +82,7 @@ table.
 | `--ggml-decode-mma` | Flash-Next, decode+MTP | -5.46% | 1/12 | regression; also changes output (quality-kind), unverified without a KLD base |
 | `--hc-int8` | Flash-Next, decode+MTP | **-26.42%** | 0/12 | regression; also changes output (quality-kind), unverified without a KLD base |
 
-`scripts/profiles/qwen38-flash-next-tuned.json` enables every confirmed win and wash above except
+The launchers' tuned configuration (`scripts/profiles/qwen38-flash-next-tuned.json`, plus `--mtp-joint-acceptance` and `--gdn-async-commit`, which they add with `--spec mtp`) enables every confirmed win and wash above except
 `--hot-embedding-rows` (a deliberate VRAM/RAM sizing tradeoff, not a speed call) and
 `--moe-fused-route` (slight negative, excluded conservatively).
 
