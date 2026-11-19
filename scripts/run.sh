@@ -406,14 +406,14 @@ case "$model_key/$profile" in
       "$fn_base-mtp-vision.ninfer"|"$fn_base-vision.ninfer") FN_VISION='on' ;;
     esac
     [[ -z "${NINFER_SPEC:-}" ]] || SPEC="$NINFER_SPEC"
+    # The file carries the vision tower, but --partial-ram-residency does not load it: images are off
+    # then unless asked for, and asking is an error. The override is applied (and validated by the case
+    # below) in either mode, so a mistyped NINFER_VISION fails here too, as in run.bat.
+    [[ "$fn_partial" == 0 ]] || FN_VISION='off'
     [[ -z "${NINFER_VISION:-}" ]] || FN_VISION="$NINFER_VISION"
-    if [[ "$fn_partial" == 1 ]]; then
-      # The file carries the vision tower, but --partial-ram-residency refuses --vision.
-      [[ -z "${NINFER_VISION:-}" || "$NINFER_VISION" != 'on' ]] || {
-        printf 'The Unsloth UD-IQ3_XXS build runs with --partial-ram-residency, which does not take images; set NINFER_PARTIAL_RAM_RESIDENCY=off (needs about 50 GiB of available RAM) or use qwen38-flash-next.\n' >&2
-        exit 2
-      }
-      FN_VISION='off'
+    if [[ "$fn_partial" == 1 && "$FN_VISION" == 'on' ]]; then
+      printf 'The Unsloth UD-IQ3_XXS build runs with --partial-ram-residency, which does not take images; set NINFER_PARTIAL_RAM_RESIDENCY=off (needs about 50 GiB of available RAM) or use qwen38-flash-next.\n' >&2
+      exit 2
     fi
     fn_vision_args=()
     fn_input='text only'
@@ -487,18 +487,18 @@ case "$model_key/$profile" in
     )
     label="$fn_lanes_label  |  context $CONTEXT  |  INT8 KV  |  $fn_input, $spec_label  |  $fn_cache_label"
     if [[ "$fn_partial" == 0 && "$FN_VISION" == 'off' && -z "${NINFER_VISION:-}" ]]; then
-      hint='Images: convert with --mtp-gguf and --mmproj to qwen4exp-iq2xs-mtp-vision.ninfer (docs/weight-conversion.md); this launcher then uses it.'
-      if [[ -n "${NINFER_MODEL:-}" && -f "$model_folder/qwen4exp-iq2xs-mtp-vision.ninfer" ]]; then
-        hint='Images: qwen4exp-iq2xs-mtp-vision.ninfer is beside this model; clear NINFER_MODEL to use it.'
+      hint="Images: convert with --mtp-gguf and --mmproj to $fn_base-mtp-vision.ninfer (docs/weight-conversion.md); this launcher then uses it."
+      if [[ -n "${NINFER_MODEL:-}" && -f "$model_folder/$fn_base-mtp-vision.ninfer" ]]; then
+        hint="Images: $fn_base-mtp-vision.ninfer is beside this model; clear NINFER_MODEL to use it."
       fi
     fi
     if [[ "$SPEC" == 'none' ]]; then
       case "$model_base" in
         "$fn_base-mtp.ninfer"|"$fn_base-mtp-vision.ninfer") ;;
         *)
-          hint='Faster decode: convert with --mtp-gguf to qwen4exp-iq2xs-mtp.ninfer (docs/weight-conversion.md); this launcher then uses it.'
-          if [[ -n "${NINFER_MODEL:-}" && -f "$model_folder/qwen4exp-iq2xs-mtp.ninfer" ]]; then
-            hint='Faster decode: qwen4exp-iq2xs-mtp.ninfer is beside this model; clear NINFER_MODEL to use it.'
+          hint="Faster decode: convert with --mtp-gguf to $fn_base-mtp.ninfer (docs/weight-conversion.md); this launcher then uses it."
+          if [[ -n "${NINFER_MODEL:-}" && -f "$model_folder/$fn_base-mtp.ninfer" ]]; then
+            hint="Faster decode: $fn_base-mtp.ninfer is beside this model; clear NINFER_MODEL to use it."
           fi ;;
       esac
     fi
