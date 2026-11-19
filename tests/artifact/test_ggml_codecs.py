@@ -203,7 +203,8 @@ def test_expert_record_geometry_at_the_real_shapes():
         "ggml_rec_iq3_s_iq4_nl": (704_000, 2_329_600),
         "ggml_rec_iq4_xs_iq4_nl": (870_400, 2_662_400),
     }
-    assert set(expected) == set(GGML_RECORD_FORMATS)
+    # The V4.1-Flash pairs have K-quant downs and need other shapes: see the next test.
+    assert set(expected) <= set(GGML_RECORD_FORMATS)
     for name, (gate_bytes, record_bytes) in expected.items():
         g = ggml_expert_record_geometry(name, shape)
         assert (g.gate_bytes, g.up_offset, g.down_offset) == (
@@ -278,3 +279,27 @@ def test_expert_records_with_iq4_nl_down_invert_exactly():
     unpacked = unpack_expert_records(records.tobytes(), name, shape)
     for a, b in zip(unpacked, (gate, up, down)):
         assert np.array_equal(a, b)
+
+
+def test_v41_flash_expert_records_at_the_real_shapes():
+    # V4.1-Flash banks [384 experts, hidden 5120, intermediate 2304]. Down rows are K-quant blocks
+    # here (2304 = 9 x 256), so a part is rows x (K / 256) x block bytes: IQ1_M 56, IQ2_XXS 66, IQ2_XS 74.
+    shape = (384, 5120, 2304)
+    block = {"iq1_m": 56, "iq2_xxs": 66, "iq2_xs": 74}
+    pairs = [
+        ("iq1_m", "iq1_m"), ("iq2_xxs", "iq1_m"), ("iq2_xxs", "iq2_xxs"), ("iq2_xs", "iq1_m"),
+        ("iq2_xxs", "iq2_xs"), ("iq1_m", "iq2_xxs"), ("iq2_xs", "iq2_xxs"), ("iq2_xs", "iq2_xs"),
+    ]
+    assert {f"ggml_rec_{a}_{b}" for a, b in pairs} <= set(GGML_RECORD_FORMATS)
+    assert len(GGML_RECORD_FORMATS) == 13 + len(pairs)  # the earlier thirteen are tested above
+    for gate_up, down in pairs:
+        name = f"ggml_rec_{gate_up}_{down}"
+        g = ggml_expert_record_geometry(name, shape)
+        gate_bytes = 2304 * (5120 // 256) * block[gate_up]
+        down_bytes = 5120 * (2304 // 256) * block[down]
+        assert (g.gate_bytes, g.down_bytes) == (gate_bytes, down_bytes), name
+        assert (g.down_row_bytes, g.up_offset) == ((2304 // 256) * block[down], gate_bytes), name
+        assert g.record_bytes == 2 * gate_bytes + down_bytes and g.record_stride % 256 == 0, name
+        assert encoded_size("ggml_expert_record_v1", name, shape) == 384 * g.record_stride, name
+    # The published layer-0 expert of the IQ2_XXS build (IQ1_M everywhere) is 7.74 MB, the smallest.
+    assert ggml_expert_record_geometry("ggml_rec_iq1_m_iq1_m", shape).record_bytes == 7_741_440

@@ -307,6 +307,63 @@ void ggml_geometry() {
     rejects([&] { (void)describe_tensor(object); }, "a bank without its last record's tail accepted");
 }
 
+// The V4.1-Flash IQ2_XXS build's eight expert record pairs at its real bank shape [384 experts,
+// hidden 5120, intermediate 2304]. Down rows are K-quant blocks here (2304 = 9 x 256), so each part
+// is rows x (K / 256) x block bytes (IQ1_M 56, IQ2_XXS 66, IQ2_XS 74); every part is a multiple of
+// 256 B, so records are back to back.
+void v41_flash_records() {
+    const auto block = [](QType format) -> std::uint64_t {
+        return format == QType::GGML_IQ1_M ? 56 : format == QType::GGML_IQ2_XXS ? 66 : 74;
+    };
+    struct Pair {
+        const char* name;
+        QType format;
+        QType gate_up;
+        QType down;
+    };
+    constexpr std::array pairs = {
+        Pair{"ggml_rec_iq1_m_iq1_m", QType::GGML_REC_IQ1_M_IQ1_M, QType::GGML_IQ1_M, QType::GGML_IQ1_M},
+        Pair{"ggml_rec_iq2_xxs_iq1_m", QType::GGML_REC_IQ2_XXS_IQ1_M, QType::GGML_IQ2_XXS, QType::GGML_IQ1_M},
+        Pair{"ggml_rec_iq2_xxs_iq2_xxs", QType::GGML_REC_IQ2_XXS_IQ2_XXS, QType::GGML_IQ2_XXS, QType::GGML_IQ2_XXS},
+        Pair{"ggml_rec_iq2_xs_iq1_m", QType::GGML_REC_IQ2_XS_IQ1_M, QType::GGML_IQ2_XS, QType::GGML_IQ1_M},
+        Pair{"ggml_rec_iq2_xxs_iq2_xs", QType::GGML_REC_IQ2_XXS_IQ2_XS, QType::GGML_IQ2_XXS, QType::GGML_IQ2_XS},
+        Pair{"ggml_rec_iq1_m_iq2_xxs", QType::GGML_REC_IQ1_M_IQ2_XXS, QType::GGML_IQ1_M, QType::GGML_IQ2_XXS},
+        Pair{"ggml_rec_iq2_xs_iq2_xxs", QType::GGML_REC_IQ2_XS_IQ2_XXS, QType::GGML_IQ2_XS, QType::GGML_IQ2_XXS},
+        Pair{"ggml_rec_iq2_xs_iq2_xs", QType::GGML_REC_IQ2_XS_IQ2_XS, QType::GGML_IQ2_XS, QType::GGML_IQ2_XS},
+    };
+    const std::array<std::uint64_t, 3> layer{384, 5120, 2304};
+    for (const auto& item : pairs) {
+        require(parse_format(item.name) == item.format && format_name(item.format) == item.name &&
+                    is_ggml_record(item.format) && !is_ggml_block(item.format) &&
+                    ggml_record_parts(item.format).gate_up == item.gate_up &&
+                    ggml_record_parts(item.format).down == item.down,
+                (std::string(item.name) + ": format does not round-trip").c_str());
+        const std::uint64_t gate_bytes = 2304 * (5120 / 256) * block(item.gate_up);
+        const std::uint64_t down_row   = (2304 / 256) * block(item.down);
+        const std::uint64_t record     = 2 * gate_bytes + 5120 * down_row;
+        const auto g = weight_geometry(item.format, QuantLayout::GgmlExpertRecord, layer);
+        require(g.record_up_offset == gate_bytes && g.record_down_offset == 2 * gate_bytes &&
+                    g.record_bytes == record && g.record_stride == record && g.bytes == 384 * record &&
+                    g.alignment == 256,
+                (std::string(item.name) + ": record geometry differs from the GGUF").c_str());
+        const auto down = ggml_record_part(g, 383, ExpertPart::Down);
+        require(down.format == item.down && down.rows == 5120 && down.k == 2304 &&
+                    down.row_bytes == down_row && down.offset + down.rows * down.row_bytes == g.bytes,
+                (std::string(item.name) + ": the last expert's down part is not the end of the bank").c_str());
+    }
+    // The IQ2_XXS build's smallest expert (IQ1_M everywhere) is the 7.74 MB the plan quotes.
+    require(weight_geometry(QType::GGML_REC_IQ1_M_IQ1_M, QuantLayout::GgmlExpertRecord, layer).record_bytes ==
+                7'741'440,
+            "the all-IQ1_M expert is not 7.74 MB");
+    // A down type of 256-value blocks needs the intermediate size to be a multiple of 256.
+    rejects<std::invalid_argument>(
+        [&] {
+            (void)weight_geometry(QType::GGML_REC_IQ2_XXS_IQ2_XXS, QuantLayout::GgmlExpertRecord,
+                                  std::array<std::uint64_t, 3>{2, 5120, 640});
+        },
+        "a K-quant down over an intermediate size of 640 was accepted");
+}
+
 void invalid_directories() {
     Fixture fixture;
     const auto bad = [&](auto mutate) {
@@ -354,6 +411,7 @@ int main(int argc, char** argv) {
         artifact_id_ignores_file_time();
         geometry_and_views();
         ggml_geometry();
+        v41_flash_records();
         invalid_directories();
         // Optional production-writer fixture or explicitly selected real artifact.
         if (argc == 2) {

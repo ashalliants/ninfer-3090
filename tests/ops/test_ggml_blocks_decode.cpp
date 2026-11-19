@@ -7,6 +7,7 @@
 
 #include "ops/ggml_blocks_decode.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstring>
@@ -86,13 +87,15 @@ std::vector<std::byte> golden(QType format, const char* name) {
 void record_parts_decode_like_blocks(QType record, const std::vector<std::byte>& gate_up,
                                      const std::vector<std::byte>& down) {
     const auto parts = ggml_record_parts(record);
-    const auto g     = weight_geometry(record, QuantLayout::GgmlExpertRecord,
-                                       std::array<std::uint64_t, 3>{2, 256, 64});
     const auto gu = ggml_block(parts.gate_up), d = ggml_block(parts.down);
-    const auto gate_bytes = 64 * (256 / gu.values) * gu.bytes;
+    // The intermediate size: 64, or one block of a down type of 256-value blocks.
+    const std::uint64_t inter = std::max<std::uint64_t>(64, d.values);
+    const auto g     = weight_geometry(record, QuantLayout::GgmlExpertRecord,
+                                       std::array<std::uint64_t, 3>{2, 256, inter});
+    const auto gate_bytes = inter * (256 / gu.values) * gu.bytes;
     require(g.record_up_offset == (gate_bytes + 255) / 256 * 256 &&
                 g.record_down_offset == (g.record_up_offset + gate_bytes + 255) / 256 * 256 &&
-                g.record_bytes == g.record_down_offset + 256 * (64 / d.values) * d.bytes &&
+                g.record_bytes == g.record_down_offset + 256 * (inter / d.values) * d.bytes &&
                 g.record_stride == (g.record_bytes + 255) / 256 * 256 &&
                 g.bytes == 2 * g.record_stride,
             "expert record geometry differs from 256-byte aligned parts");
@@ -114,7 +117,7 @@ void record_parts_decode_like_blocks(QType record, const std::vector<std::byte>&
         for (const auto part : kParts) {
             const bool is_down = part == ExpertPart::Down;
             auto bytes = blocks_of(is_down ? down : gate_up, is_down ? d : gu,
-                                   is_down ? 256 * (64 / d.values) : 64 * (256 / gu.values),
+                                   is_down ? 256 * (inter / d.values) : inter * (256 / gu.values),
                                    expert == 1 || part == ExpertPart::Up);
             const auto at = ggml_record_part(g, expert, part).offset;
             std::memcpy(payload.data() + at, bytes.data(), bytes.size());
@@ -154,7 +157,9 @@ int run() {
           QType::GGML_REC_Q2_0_Q2_0, QType::GGML_REC_IQ2_XS_Q2_0, QType::GGML_REC_IQ2_XS_IQ4_NL,
           QType::GGML_REC_IQ2_XXS_IQ4_NL, QType::GGML_REC_IQ2_S_IQ4_NL, QType::GGML_REC_IQ3_XXS_Q2_0,
           QType::GGML_REC_IQ3_XXS_IQ4_NL, QType::GGML_REC_IQ3_S_Q2_0, QType::GGML_REC_IQ3_S_IQ4_NL,
-          QType::GGML_REC_IQ4_XS_IQ4_NL}) {
+          QType::GGML_REC_IQ4_XS_IQ4_NL, QType::GGML_REC_IQ1_M_IQ1_M, QType::GGML_REC_IQ2_XXS_IQ1_M,
+          QType::GGML_REC_IQ2_XXS_IQ2_XXS, QType::GGML_REC_IQ2_XS_IQ1_M, QType::GGML_REC_IQ2_XXS_IQ2_XS,
+          QType::GGML_REC_IQ1_M_IQ2_XXS, QType::GGML_REC_IQ2_XS_IQ2_XXS, QType::GGML_REC_IQ2_XS_IQ2_XS}) {
         const auto parts = ggml_record_parts(record);
         require(of(QType::GGML_Q2_0).size() >= 256 * ggml_block(QType::GGML_Q2_0).bytes,
                 "the Q2_0 fixture has fewer than 256 blocks");

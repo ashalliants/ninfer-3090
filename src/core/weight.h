@@ -54,6 +54,17 @@ enum class QType : std::uint16_t {
     // of the GSQ-RCO IQ3 packs.
     GGML_Q4_K = 34,
     GGML_Q5_K = 35,
+    // The pairs of the GSQ-RCO V4.1-Flash IQ2_XXS build (docs/maintainer/dsv4-flash-plan.md), which picks a
+    // type per layer for gate/up and for down independently. Registered so an artifact can hold and
+    // describe them; the expert kernels run only the pairs above until milestone 5.
+    GGML_REC_IQ1_M_IQ1_M = 36,
+    GGML_REC_IQ2_XXS_IQ1_M = 37,
+    GGML_REC_IQ2_XXS_IQ2_XXS = 38,
+    GGML_REC_IQ2_XS_IQ1_M = 39,
+    GGML_REC_IQ2_XXS_IQ2_XS = 40,
+    GGML_REC_IQ1_M_IQ2_XXS = 41,
+    GGML_REC_IQ2_XS_IQ2_XXS = 42,
+    GGML_REC_IQ2_XS_IQ2_XS = 43,
 };
 
 // One GGML block: `values` consecutive K values encoded in `bytes` bytes, scales included.
@@ -135,6 +146,22 @@ struct GgmlRecordParts {
         return {QType::GGML_IQ3_S, QType::GGML_IQ4_NL};
     case QType::GGML_REC_IQ4_XS_IQ4_NL:
         return {QType::GGML_IQ4_XS, QType::GGML_IQ4_NL};
+    case QType::GGML_REC_IQ1_M_IQ1_M:
+        return {QType::GGML_IQ1_M, QType::GGML_IQ1_M};
+    case QType::GGML_REC_IQ2_XXS_IQ1_M:
+        return {QType::GGML_IQ2_XXS, QType::GGML_IQ1_M};
+    case QType::GGML_REC_IQ2_XXS_IQ2_XXS:
+        return {QType::GGML_IQ2_XXS, QType::GGML_IQ2_XXS};
+    case QType::GGML_REC_IQ2_XS_IQ1_M:
+        return {QType::GGML_IQ2_XS, QType::GGML_IQ1_M};
+    case QType::GGML_REC_IQ2_XXS_IQ2_XS:
+        return {QType::GGML_IQ2_XXS, QType::GGML_IQ2_XS};
+    case QType::GGML_REC_IQ1_M_IQ2_XXS:
+        return {QType::GGML_IQ1_M, QType::GGML_IQ2_XXS};
+    case QType::GGML_REC_IQ2_XS_IQ2_XXS:
+        return {QType::GGML_IQ2_XS, QType::GGML_IQ2_XXS};
+    case QType::GGML_REC_IQ2_XS_IQ2_XS:
+        return {QType::GGML_IQ2_XS, QType::GGML_IQ2_XS};
     default:
         return {};
     }

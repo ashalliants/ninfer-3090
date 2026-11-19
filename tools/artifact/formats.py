@@ -131,6 +131,15 @@ GGML_REC_IQ3_XXS_IQ4_NL = GgmlExpertRecordFormat(
 GGML_REC_IQ3_S_Q2_0 = GgmlExpertRecordFormat("ggml_rec_iq3_s_q2_0", GGML_IQ3_S, GGML_Q2_0)
 GGML_REC_IQ3_S_IQ4_NL = GgmlExpertRecordFormat("ggml_rec_iq3_s_iq4_nl", GGML_IQ3_S, GGML_IQ4_NL)
 GGML_REC_IQ4_XS_IQ4_NL = GgmlExpertRecordFormat("ggml_rec_iq4_xs_iq4_nl", GGML_IQ4_XS, GGML_IQ4_NL)
+# The pairs of the GSQ-RCO V4.1-Flash IQ2_XXS build, which picks gate/up and down types per layer:
+GGML_REC_IQ1_M_IQ1_M = GgmlExpertRecordFormat("ggml_rec_iq1_m_iq1_m", GGML_IQ1_M, GGML_IQ1_M)
+GGML_REC_IQ2_XXS_IQ1_M = GgmlExpertRecordFormat("ggml_rec_iq2_xxs_iq1_m", GGML_IQ2_XXS, GGML_IQ1_M)
+GGML_REC_IQ2_XXS_IQ2_XXS = GgmlExpertRecordFormat("ggml_rec_iq2_xxs_iq2_xxs", GGML_IQ2_XXS, GGML_IQ2_XXS)
+GGML_REC_IQ2_XS_IQ1_M = GgmlExpertRecordFormat("ggml_rec_iq2_xs_iq1_m", GGML_IQ2_XS, GGML_IQ1_M)
+GGML_REC_IQ2_XXS_IQ2_XS = GgmlExpertRecordFormat("ggml_rec_iq2_xxs_iq2_xs", GGML_IQ2_XXS, GGML_IQ2_XS)
+GGML_REC_IQ1_M_IQ2_XXS = GgmlExpertRecordFormat("ggml_rec_iq1_m_iq2_xxs", GGML_IQ1_M, GGML_IQ2_XXS)
+GGML_REC_IQ2_XS_IQ2_XXS = GgmlExpertRecordFormat("ggml_rec_iq2_xs_iq2_xxs", GGML_IQ2_XS, GGML_IQ2_XXS)
+GGML_REC_IQ2_XS_IQ2_XS = GgmlExpertRecordFormat("ggml_rec_iq2_xs_iq2_xs", GGML_IQ2_XS, GGML_IQ2_XS)
 
 
 DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT32)})
@@ -179,6 +188,14 @@ GGML_RECORD_FORMATS = MappingProxyType(
             GGML_REC_IQ3_S_Q2_0,
             GGML_REC_IQ3_S_IQ4_NL,
             GGML_REC_IQ4_XS_IQ4_NL,
+            GGML_REC_IQ1_M_IQ1_M,
+            GGML_REC_IQ2_XXS_IQ1_M,
+            GGML_REC_IQ2_XXS_IQ2_XXS,
+            GGML_REC_IQ2_XS_IQ1_M,
+            GGML_REC_IQ2_XXS_IQ2_XS,
+            GGML_REC_IQ1_M_IQ2_XXS,
+            GGML_REC_IQ2_XS_IQ2_XXS,
+            GGML_REC_IQ2_XS_IQ2_XS,
         )
     }
 )
@@ -307,6 +324,14 @@ __all__ = [
     "GGML_REC_IQ3_S_Q2_0",
     "GGML_REC_IQ3_S_IQ4_NL",
     "GGML_REC_IQ4_XS_IQ4_NL",
+    "GGML_REC_IQ1_M_IQ1_M",
+    "GGML_REC_IQ2_XXS_IQ1_M",
+    "GGML_REC_IQ2_XXS_IQ2_XXS",
+    "GGML_REC_IQ2_XS_IQ1_M",
+    "GGML_REC_IQ2_XXS_IQ2_XS",
+    "GGML_REC_IQ1_M_IQ2_XXS",
+    "GGML_REC_IQ2_XS_IQ2_XXS",
+    "GGML_REC_IQ2_XS_IQ2_XS",
     "DIRECT_FORMATS",
     "QUANT_FORMATS",
     "NVFP4_FORMATS",

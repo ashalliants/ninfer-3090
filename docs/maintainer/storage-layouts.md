@@ -16,7 +16,7 @@ The storage registry contains exactly these identities:
 | `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
 | `ggml_blocks_v1` | tensor layout | the thirteen `ggml_*` block formats | rank `1..16`, `K % values_per_block == 0` | 256 bytes |
-| `ggml_expert_record_v1` | tensor layout | the three `ggml_rec_*` expert record formats | rank 3 `[E,H,I]`, `H` and `I` whole blocks of their parts | 256 bytes |
+| `ggml_expert_record_v1` | tensor layout | the twenty-one `ggml_rec_*` expert record formats (Section 7) | rank 3 `[E,H,I]`, `H` and `I` whole blocks of their parts | 256 bytes |
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
 These format/layout pairs define the current codec support. Native consumer requirements are
@@ -394,6 +394,20 @@ layers. `record_stride` in bytes:
 | IQ4_XS | | 2,662,400 |
 
 The MTP drafter's `ggml_rec_q2_0_q2_0` record is 1,382,400 bytes.
+
+The eight pairs of the GSQ-RCO V4.1-Flash IQ2_XXS build have K-quant downs: IQ1_M, IQ2_XXS or
+IQ2_XS rows over `I`, so `I` must be a multiple of 256 (the Qwen3.8 shape's 640 is not). At
+V4.1-Flash's `[384, 5120, 2304]` a gate or up row is `20` blocks and a down row `9` blocks, every
+part is a multiple of 256 bytes and `record_stride` in bytes is:
+
+| Gate/up | IQ1_M down (504-byte rows) | IQ2_XXS down (594-byte rows) | IQ2_XS down (666-byte rows) |
+|---|---:|---:|---:|
+| IQ1_M | 7,741,440 | 8,202,240 | |
+| IQ2_XXS | 8,663,040 | 9,123,840 | 9,492,480 |
+| IQ2_XS | 9,400,320 | 9,861,120 | 10,229,760 |
+
+(`ggml_rec_iq1_m_iq1_m` through `ggml_rec_iq2_xs_iq2_xs`; the table lists the eight that are registered, a
+blank is not registered.) The expert kernels do not run these downs yet; an artifact can hold them.
 
 ## 8. `raw_bytes_v1`
 
