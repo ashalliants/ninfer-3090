@@ -143,10 +143,19 @@ G_VOCAB, G_COMPRESSED, G_LAYERS_IDS, G_NGRAM, G_HEADS, G_ROW = 40, 23, (1, 14), 
 G_BUCKET_START, G_DIM, G_HC, G_LEN, G_EPS = 50, 32, 2, 12, 1e-6
 
 
+def random_table(rng: np.random.Generator, rows: int, row_dim: int) -> dict:
+    """A random FP8 (E4M3) table with E8M0 block scales and its dequantised float32 rows."""
+    from reference import FP8_BLOCK, decode_e4m3, e8m0_to_float
+
+    codes = rng.integers(0, 0x7F, size=(rows, row_dim)).astype(np.uint8)  # positive finite e4m3 codes...
+    codes |= (rng.integers(0, 2, size=(rows, row_dim)) << 7).astype(np.uint8)  # ...with random signs
+    scales = rng.integers(120, 127, size=(rows, row_dim // FP8_BLOCK)).astype(np.uint8)  # 2^-7 .. 2^-1
+    values = decode_e4m3(codes).reshape(rows, row_dim // FP8_BLOCK, FP8_BLOCK) * e8m0_to_float(scales)[..., None]
+    return {"codes": codes, "scales": scales, "dequantised": values.reshape(rows, row_dim).astype(np.float32)}
+
+
 def golden_case(seed: int = GOLDEN_SEED) -> dict:
     """Everything the golden needs, as arrays: tables and weights drawn from `seed` in a fixed order."""
-    from reference import decode_e4m3, e8m0_to_float, FP8_BLOCK
-
     rng = np.random.default_rng(seed)
     n_layers, cols = len(G_LAYERS_IDS), (G_NGRAM - 1) * G_HEADS
     primes = bucket_primes(n_layers, G_NGRAM, G_HEADS, G_BUCKET_START)
@@ -158,11 +167,7 @@ def golden_case(seed: int = GOLDEN_SEED) -> dict:
     tables, wkvs, weights = [], [], []
     for layer in range(n_layers):
         rows = sum(sum(per_order) for per_order in primes[layer])
-        codes = rng.integers(0, 0x7F, size=(rows, G_ROW)).astype(np.uint8)  # positive finite e4m3 codes...
-        codes |= (rng.integers(0, 2, size=(rows, G_ROW)) << 7).astype(np.uint8)  # ...with random signs
-        scales = rng.integers(120, 127, size=(rows, G_ROW // FP8_BLOCK)).astype(np.uint8)  # 2^-7 .. 2^-1
-        values = decode_e4m3(codes).reshape(rows, G_ROW // FP8_BLOCK, FP8_BLOCK) * e8m0_to_float(scales)[..., None]
-        tables.append({"codes": codes, "scales": scales, "dequantised": values.reshape(rows, G_ROW).astype(np.float32)})
+        tables.append(random_table(rng, rows, G_ROW))
         wkvs.append((rng.standard_normal(((G_HC + 1) * G_DIM, cols * G_ROW)) / np.sqrt(cols * G_ROW) * 3).astype(np.float32))
         weights.append((1.0 + 0.2 * rng.standard_normal((G_HC, G_DIM))).astype(np.float32))
     input_ids = rng.integers(0, G_VOCAB, size=G_LEN)
