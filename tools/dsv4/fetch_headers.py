@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import struct
 import sys
@@ -111,21 +112,29 @@ def read_tensor(repo: str, directory: Path, name: str, offset: int = 0, length: 
     return _get(url, start, start + length - 1)
 
 
+def write_atomic(path: Path, data: bytes) -> None:
+    """Write `path` so it either has all of `data` or does not exist: a run killed part-way leaves only a
+    `.part` file, which `fetch` ignores, instead of a truncated cache file it would skip as already fetched."""
+    part = path.with_name(path.name + ".part")
+    part.write_bytes(data)
+    os.replace(part, path)
+
+
 def fetch(repo: str, out: Path, only: set[int] | None, workers: int) -> None:
     out.mkdir(parents=True, exist_ok=True)
     stamp = out / "repo.txt"
     if stamp.exists():
         revision = check_stamp(repo, out)
     else:
-        if any(out.iterdir()):
+        if any(not f.name.endswith(".part") for f in out.iterdir()):
             raise SystemExit(f"{out} is not empty and has no repo.txt stamp, so its cached headers "
                              "cannot be tied to a repository: fetch into a fresh directory")
         revision = resolve_revision(repo)
-        stamp.write_text(f"{repo}@{revision}\n")
+        write_atomic(stamp, f"{repo}@{revision}\n".encode())
     (out / "headers").mkdir(exist_ok=True)
     for name in ("config.json", "model.safetensors.index.json"):
         if not (out / name).exists():
-            (out / name).write_bytes(_get(f"{HF}/{repo}/resolve/{revision}/{name}"))
+            write_atomic(out / name, _get(f"{HF}/{repo}/resolve/{revision}/{name}"))
     index = json.loads((out / "model.safetensors.index.json").read_text())
     shards = sorted(shard_name(n) for n in set(index["weight_map"].values()))
 
@@ -134,7 +143,7 @@ def fetch(repo: str, out: Path, only: set[int] | None, workers: int) -> None:
         if target.exists():
             return f"cached {shard}"
         header = read_header(f"{HF}/{repo}/resolve/{revision}/{shard}")
-        target.write_text(json.dumps(header, separators=(",", ":")))
+        write_atomic(target, json.dumps(header, separators=(",", ":")).encode())
         return f"fetched {shard} ({len(header)} tensors)"
 
     wanted = [s for i, s in enumerate(shards, 1) if only is None or i in only]

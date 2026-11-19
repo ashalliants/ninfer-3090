@@ -360,6 +360,38 @@ def test_range_reads_are_bounded_and_refuse_a_server_that_ignores_range():
         fh.urllib.request.urlopen = real
 
 
+def test_an_interrupted_write_leaves_no_cache_file_and_the_next_fetch_recovers():
+    import fetch_headers as fh
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "config.json"
+        real = os.replace
+
+        def killed(src, dst):
+            raise KeyboardInterrupt  # the process dies after the data is written, before the rename
+
+        os.replace = killed
+        try:
+            fh.write_atomic(target, b"{}")
+        except KeyboardInterrupt:
+            pass
+        finally:
+            os.replace = real
+        check(not target.exists(), "an interrupted write must not leave the final file")
+        check((Path(d) / "config.json.part").exists(), "the partial data is only in the .part file")
+        fh.write_atomic(target, b'{"a": 1}')
+        check(json.loads(target.read_text()) == {"a": 1}, "a later write replaces it whole")
+    with tempfile.TemporaryDirectory() as d:  # a run killed while stamping must not make the directory look used
+        (Path(d) / "repo.txt.part").write_text("o/r@")
+        real_resolve, real_get = fh.resolve_revision, fh._get
+        fh.resolve_revision = lambda repo: "a" * 40
+        fh._get = lambda url, start=None, end=None: b'{"weight_map": {}}'
+        try:
+            fh.fetch("o/r", Path(d), None, 1)
+        finally:
+            fh.resolve_revision, fh._get = real_resolve, real_get
+        check(fh.check_stamp("o/r", Path(d)) == "a" * 40, "fetch recovers over a stray .part file")
+
+
 def test_a_stamp_without_a_commit_is_refused():
     import fetch_headers as fh
     with tempfile.TemporaryDirectory() as d:
