@@ -288,7 +288,8 @@ def main() -> None:
             parser.error("--emit-engram needs --model-dir")
         ids, outputs = run_engram(args.model_dir)
         args.emit_engram.write_text(
-            json.dumps({"seed": eng.GOLDEN_SEED, "hash_ids": ids.tolist(), "outputs": [o.tolist() for o in outputs]}) + "\n"
+            json.dumps({"model_repo": REPO, "revision": revision_of(args.model_dir), "seed": eng.GOLDEN_SEED,
+                        "hash_ids": ids.tolist(), "outputs": [o.tolist() for o in outputs]}) + "\n"
         )
         print(f"wrote {args.emit_engram} ({len(outputs)} layers)")
 

@@ -924,6 +924,7 @@ def test_engram_matches_the_model_repos_own_code():
     (tools/dsv4/model_golden.py): hash ids must match exactly, the gated residual write to float32 rounding."""
     golden = json.loads((Path(HERE).parent.parent / "tests" / "fixtures" / "dsv4" / "engram_golden.json").read_text())
     check(golden["seed"] == eng.GOLDEN_SEED, "the golden is for another seed")
+    check(golden["model_repo"] == mg.REPO and len(golden["revision"]) == 40, "the golden must record the model repo commit")
     ids, outputs = eng.run_golden()
     check(np.array_equal(np.array(golden["hash_ids"]), ids), "hash ids differ from the model repo's")
     x = eng.golden_case()["x"]
