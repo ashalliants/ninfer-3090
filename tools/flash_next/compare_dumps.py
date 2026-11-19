@@ -42,6 +42,10 @@ def score(ids: list[int], rows_a, rows_b) -> dict:
         raise ValueError(f"the dumps hold {rows_a.shape[0]} and {rows_b.shape[0]} rows for {n} predictions")
     if rows_a.shape[1] != rows_b.shape[1]:
         raise ValueError("the two dumps have different vocabularies")
+    vocab = rows_a.shape[1]
+    bad = [i for i in ids[1:n + 1] if not 0 <= i < vocab]
+    if bad:
+        raise ValueError(f"target token id {bad[0]} is outside the dumps' {vocab}-token vocabulary")
     nll_a, nll_b, kl, top_a, top_b, agree = [], [], [], 0, 0, 0
     for t in range(n):
         la, lb = log_softmax(np.asarray(rows_a[t])), log_softmax(np.asarray(rows_b[t]))

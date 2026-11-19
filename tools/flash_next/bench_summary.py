@@ -24,6 +24,9 @@ REQUEST = re.compile(
     r"request: (\d+) prompt \+ (\d+) generated tokens; prefill ([\d.]+) s, decode ([\d.]+) s \(([\d.]+) tok/s\)"
 )
 LENGTHS = ("1K", "8K", "30K")
+# The prompt sizes (tokens) each group may have: the nominal 1K / 8K / 30K prompts tokenise to a little
+# under or over their name, so these are bands, not exact values.
+PROMPT_BANDS = {"1K": (700, 1500), "8K": (6000, 10000), "30K": (24000, 36000)}
 SERVER_STARTUP_REQUESTS = 1  # the warm-up request ninfer-serve makes for itself
 
 
@@ -49,6 +52,13 @@ def summarize(requests: list, warmups: int = 12, reps: int = 5) -> dict[str, dic
     out = {}
     for index, length in enumerate(LENGTHS):
         group = measured[index * reps:(index + 1) * reps]
+        low, high = PROMPT_BANDS[length]
+        wrong = [r[0] for r in group if not low <= r[0] <= high]
+        if wrong:
+            raise ValueError(
+                f"the {length} group should hold prompts of {low}-{high} tokens but has {wrong}: "
+                "a request is missing, duplicated or out of order"
+            )
         decode = [r[4] for r in group]
         prefill = [r[0] / r[2] for r in group]
         out[length] = {

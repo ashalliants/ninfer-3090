@@ -78,6 +78,8 @@ def test_extra_rows_beyond_the_predictions_are_ignored():
         ([1, 2], np.zeros((1, 4), np.float32), np.zeros((1, 4), np.float32), "at least three tokens"),
         ([1, 2, 3, 4], np.zeros((2, 4), np.float32), np.zeros((3, 4), np.float32), "rows for 3 predictions"),
         ([1, 2, 3, 4], np.zeros((3, 4), np.float32), np.zeros((3, 5), np.float32), "different vocabularies"),
+        ([1, 2, 3, 4], np.zeros((3, 4), np.float32), np.zeros((3, 4), np.float32), "id 4 is outside"),
+        ([1, -1, 2, 3], np.zeros((3, 4), np.float32), np.zeros((3, 4), np.float32), "id -1 is outside"),
     ],
 )
 def test_score_refuses_inputs_that_do_not_line_up(ids, rows_a, rows_b, match):
@@ -149,6 +151,12 @@ def test_summarize_refuses_a_log_that_is_not_the_whole_run():
     truncated = "\n".join(log.splitlines()[:-3])
     with pytest.raises(ValueError, match="expected 15 measured requests"):
         bench_summary.summarize(bench_summary.parse_requests(truncated))
+
+
+def test_summarize_refuses_groups_whose_prompt_lengths_are_wrong():
+    swapped = run_log([[80] * 5, [70] * 5, [60] * 5]).replace("1000 prompt", "30000 prompt")
+    with pytest.raises(ValueError, match="1K group should hold"):
+        bench_summary.summarize(bench_summary.parse_requests(swapped))
 
 
 def test_main_prints_a_row_per_length(tmp_path, capsys):
