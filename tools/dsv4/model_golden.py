@@ -35,6 +35,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import attention as att  # noqa: E402
+import moe as moe_ref  # noqa: E402
 
 REPO = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
 # What the goldens import: model.py and kernel.py (stubbed), engram.py (the real hash code), convert.py (not imported
@@ -166,11 +167,40 @@ def run(model_dir: Path) -> list[np.ndarray]:
     return outputs
 
 
+def run_moe(model_dir: Path) -> list[np.ndarray]:
+    """The repo's real `MoE` (router, routed experts, shared expert) on `moe.golden_inputs()`."""
+    import torch
+
+    _stub_modules(torch)
+    sys.path.insert(0, str(model_dir))
+    model = importlib.import_module("model")
+    model.default_dtype = torch.float32
+    outputs = []
+    with torch.no_grad():
+        for x, w, cfg in moe_ref.golden_inputs():
+            args = model.ModelArgs(
+                dim=moe_ref.GOLDEN_DIM, moe_inter_dim=moe_ref.GOLDEN_INTER, n_layers=1,
+                n_routed_experts=moe_ref.GOLDEN_EXPERTS, n_shared_experts=1, n_activated_experts=cfg.topk,
+                score_func="sqrtsoftplus", gate_temp=cfg.gate_temp, norm_topk_prob=cfg.norm_topk_prob,
+                route_scale=cfg.route_scale, swiglu_limit=cfg.clamp_experts, expert_dtype=None,
+            )
+            assert cfg.clamp_experts == cfg.clamp_shared, "the repo's MoE has one swiglu limit for both"
+            layer = model.MoE(0, args)
+            layer.gate.weight = torch.nn.Parameter(torch.tensor(w.router))
+            layer.gate.bias = torch.nn.Parameter(torch.tensor(w.bias))
+            for target, e in [*zip(layer.experts, w.experts), (layer.shared_experts, w.shared)]:
+                for name, array in (("w1", e.w1), ("w2", e.w2), ("w3", e.w3)):
+                    getattr(target, name).weight = torch.nn.Parameter(torch.tensor(array))
+            outputs.append(layer(torch.tensor(x)[None])[0].numpy())
+    return outputs
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--fetch", type=Path, metavar="DIR", help="download the repo's inference files into DIR")
     parser.add_argument("--model-dir", type=Path)
-    parser.add_argument("--emit", type=Path)
+    parser.add_argument("--emit", type=Path, help="write the attention stack's outputs")
+    parser.add_argument("--emit-moe", type=Path, help="write the MoE layers' outputs")
     args = parser.parse_args()
     if args.fetch:
         fetch(args.fetch)
@@ -181,6 +211,13 @@ def main() -> None:
         args.emit.write_text(json.dumps({"model_repo": REPO, "revision": revision_of(args.model_dir), "seed": att.STACK_SEED,
                                          "seq": att.STACK_SEQ, "outputs": [o.tolist() for o in outputs]}) + "\n")
         print(f"wrote {args.emit} ({len(outputs)} layers)")
+    if args.emit_moe:
+        if not args.model_dir:
+            parser.error("--emit-moe needs --model-dir")
+        outputs = run_moe(args.model_dir)
+        args.emit_moe.write_text(json.dumps({"model_repo": REPO, "revision": revision_of(args.model_dir), "seed": moe_ref.GOLDEN_SEED,
+                                             "outputs": [o.tolist() for o in outputs]}) + "\n")
+        print(f"wrote {args.emit_moe} ({len(outputs)} layers)")
 
 
 if __name__ == "__main__":

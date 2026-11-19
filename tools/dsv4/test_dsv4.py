@@ -19,6 +19,9 @@ import attention as att  # noqa: E402
 import gguf_headers as gh  # noqa: E402
 import hyper_connection as hcr  # noqa: E402
 import model_golden as mg  # noqa: E402
+
+
+import moe as moe_ref  # noqa: E402
 import gguf_sizes as gs  # noqa: E402
 import layout as lo  # noqa: E402
 import profile_to_curve as pc  # noqa: E402
@@ -859,6 +862,60 @@ def test_model_golden_fetch_pins_one_commit_and_is_all_or_nothing():
             pass
         else:
             check(False, "a directory without a recorded commit must be refused")
+
+
+def test_moe_matches_the_model_repos_own_code():
+    """The golden is the model repo's MoE (Gate, Expert, shared expert) run on CPU (tools/dsv4/model_golden.py):
+    one layer with swiglu clamps, top-2 and a route scale; one without clamps, top-3 and no normalisation."""
+    golden = json.loads((Path(HERE).parent.parent / "tests" / "fixtures" / "dsv4" / "moe_golden.json").read_text())
+    check(golden["seed"] == moe_ref.GOLDEN_SEED, "the golden is for another seed")
+    check(golden["model_repo"] == mg.REPO and len(golden["revision"]) == 40, "the golden must record the model repo commit")
+    for layer, (want, got) in enumerate(zip(golden["outputs"], moe_ref.run_golden())):
+        want = np.array(want, np.float32)
+        check(np.allclose(want, got, rtol=2e-6, atol=2e-6 * float(np.abs(want).max())), f"moe layer {layer} differs from the model repo's output")
+
+
+def test_moe_is_the_weighted_routed_sum_plus_the_shared_expert():
+    x, w, cfg = moe_ref.golden_inputs()[0]
+    got = moe_ref.moe_forward(x, w, cfg)
+    weights, indices = moe_ref.route(x, w, cfg)
+    for t in range(x.shape[0]):  # one token at a time, with the loop spelled out
+        want = ref.expert_forward(x[t : t + 1], w.shared.w1, w.shared.w2, w.shared.w3, cfg.clamp_shared)[0].copy()
+        routed = np.zeros_like(want)
+        for slot in range(cfg.topk):
+            e = w.experts[indices[t, slot]]
+            routed += ref.expert_forward(x[t : t + 1], e.w1, e.w2, e.w3, cfg.clamp_experts, weights[t : t + 1, slot : slot + 1])[0]
+        check(np.allclose(got[t], routed + want, atol=1e-5), f"token {t} is not routed sum + shared expert")
+    check(np.allclose(weights.sum(axis=1), cfg.route_scale, atol=1e-5), "normalised routing weights sum to the route scale")
+    # An expert nobody picked contributes nothing: perturbing it changes no output.
+    unused = [e for e in range(6) if e not in set(indices.ravel().tolist())]
+    check(bool(unused), "the golden should leave an expert unpicked to exercise the skip")
+    w.experts[unused[0]].w2 = w.experts[unused[0]].w2 + 5.0
+    check(np.array_equal(got, moe_ref.moe_forward(x, w, cfg)), "an unpicked expert must not affect the output")
+
+
+def test_moe_clamps_and_shared_expert_are_separate_knobs():
+    x, w, cfg = moe_ref.golden_inputs()[0]
+    base = moe_ref.moe_forward(x, w, cfg)
+    import dataclasses
+
+    no_routed_clamp = moe_ref.moe_forward(x, w, dataclasses.replace(cfg, clamp_experts=0.0))
+    no_shared_clamp = moe_ref.moe_forward(x, w, dataclasses.replace(cfg, clamp_shared=0.0))
+    check(not np.allclose(base, no_routed_clamp, atol=1e-4), "the routed experts' clamp must matter in the golden")
+    check(not np.allclose(base, no_shared_clamp, atol=1e-4), "the shared expert's clamp must matter in the golden")
+    for bad in (dataclasses.replace(cfg, topk=0), dataclasses.replace(cfg, topk=7)):
+        try:
+            moe_ref.moe_forward(x, w, bad)
+        except ValueError:
+            continue
+        check(False, "a top-k outside 1..experts must be refused")
+    short = moe_ref.MoEWeights(w.router, w.bias, w.experts[:-1], w.shared)
+    try:
+        moe_ref.moe_forward(x, short, cfg)
+    except ValueError:
+        pass
+    else:
+        check(False, "a router that scores more experts than there are must be refused")
 
 
 if __name__ == "__main__":
