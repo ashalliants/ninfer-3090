@@ -436,7 +436,8 @@ def main() -> None:
         if not args.model_dir:
             parser.error("--emit-model needs --model-dir")
         logits = run_model(args.model_dir)
-        args.emit_model.write_text(json.dumps({"seed": mref.SEED, "logits": logits.tolist()}) + "\n")
+        args.emit_model.write_text(json.dumps({"model_repo": REPO, "revision": revision_of(args.model_dir), "seed": mref.SEED,
+                                               "logits": logits.tolist()}) + "\n")
         print(f"wrote {args.emit_model} (logits {logits.shape})")
 
 

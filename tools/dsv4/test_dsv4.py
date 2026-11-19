@@ -1003,6 +1003,7 @@ def test_whole_model_matches_the_model_repos_own_blocks():
     indexer and candidate paths, two Engram layers, hc_mult 4, logits for every position of 11 tokens."""
     golden = json.loads((Path(HERE).parent.parent / "tests" / "fixtures" / "dsv4" / "model_golden.json").read_text())
     check(golden["seed"] == mref.SEED, "the golden is for another seed")
+    check(golden["model_repo"] == mg.REPO and len(golden["revision"]) == 40, "the golden must record the model repo commit")
     got = mref.forward(mref.build_case())
     want = np.array(golden["logits"], np.float32)
     check(got.shape == want.shape == (mref.LENGTH, mref.VOCAB), "logits shape")
