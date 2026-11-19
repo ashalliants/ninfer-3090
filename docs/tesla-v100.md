@@ -109,6 +109,26 @@ every request that names no graft, and a request opts out with `"graft": ""`. On
 different answer from the same unsteered one (2026-11-18). Loaded, the vector costs about 50 us
 per token even for requests that do not select it; with no vector loaded, nothing changes.
 
+With the vector on, the model can reason for a long time about a prompt it would otherwise refuse,
+and at temperature 0 it can loop in its reasoning. On the V100 (2026-11-19), two such prompts at
+temperature 0 reasoned to a 12,000-token limit repeating the same few lines; sampled at
+temperature 0.6 they answered after 3,200-7,500 tokens (44-99 s). Narrowing the vector's layer
+range did not stop the loops. Three settings did, each request answering without a refusal:
+
+- **A presence penalty** of 1.0 (`NINFER_PRESENCE_PENALTY=1.0`) broke the loop on its own: the same
+  temperature-0 request then answered after 2,742 thinking tokens.
+- **A thinking cap** (`NINFER_DEFAULT_THINKING_BUDGET=1024`) bounds the time: those prompts then
+  answered in 16-25 s, at temperature 0 and 0.6. It caps every request; a request can raise it with
+  `"thinking_budget"`.
+- **The reasoning-loop guard** (`NINFER_REASONING_LOOP=conclude`) is a backstop. It did not need
+  to fire once the presence penalty was set.
+
+```bash
+NINFER_GRAFT="uncensored=$PWD/flash-next-refusal-L4-44.gguf" NINFER_DEFAULT_GRAFT=uncensored \
+NINFER_PRESENCE_PENALTY=1.0 NINFER_DEFAULT_THINKING_BUDGET=1024 NINFER_REASONING_LOOP=conclude \
+NINFER_TEMPERATURE=0.6 NINFER_TOP_P=0.95 NINFER_TOP_K=20 scripts/run-v100.sh qwen38-flash-next
+```
+
 ## Performance
 
 ### Qwen3.8-27B
