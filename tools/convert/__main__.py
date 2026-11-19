@@ -205,6 +205,7 @@ def main(argv=None):
                     dsv4_engram.bind(config, dsv4_engram.read_volume_id(base, config, args.ngram_reuse))
                 elif args.ngram_out is not None:
                     ngram_out = args.ngram_out
+                    dsv4_engram.refuse_artifact_path(ngram_out, args.out)
                     if ngram_out.exists():
                         raise FileExistsError(f"Engram volume already exists: {ngram_out}")
                     dsv4_engram.bind(config, dsv4_engram.new_volume_id())

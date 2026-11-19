@@ -76,6 +76,17 @@ def test_an_existing_volume_is_never_overwritten(gguf_path, tmp_path):  # noqa: 
     assert volume.read_bytes() == b"precious" and not (tmp_path / "d.ninfer").exists()
 
 
+def test_a_volume_path_that_is_one_of_the_conversions_outputs_is_refused_before_anything_is_written(gguf_path, tmp_path):  # noqa: F811
+    out = tmp_path / "g.ninfer"
+    for name in ("g.ninfer", "g.ninfer.conversion.json", "g.ninfer.part-0001"):
+        with pytest.raises(ValueError, match="one of the conversion's own output files"):
+            _cli(gguf_path, out, tmp_path, "--ngram-out", str(tmp_path / name))
+    assert not list(tmp_path.glob("g.ninfer*"))
+    # Another file beside it is fine.
+    _cli(gguf_path, out, tmp_path, "--ngram-out", str(tmp_path / "g.engram"))
+    assert out.exists() and (tmp_path / "g.engram").exists()
+
+
 def test_the_two_volume_options_are_exclusive(gguf_path, tmp_path):  # noqa: F811
     with pytest.raises(ValueError, match="exclusive"):
         _cli(gguf_path, tmp_path / "e.ninfer", tmp_path, "--ngram-out", str(tmp_path / "x"), "--ngram-reuse", str(tmp_path / "y"))

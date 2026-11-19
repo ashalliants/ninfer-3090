@@ -90,5 +90,16 @@ def read_volume_id(gguf: GgufModel, config: dict, path: str | Path) -> bytes:
     return ngram_volume.check_reuse(path, g, source_row)
 
 
+def refuse_artifact_path(volume: str | Path, out: str | Path) -> None:
+    """Refuse a volume path that is one of the conversion's own outputs (the artifact, its ``.part-NNNN``
+    continuation files and its report): the volume is written after the artifact, and a collision there would
+    make the failure rollback delete the artifact."""
+    volume, out = Path(volume).absolute(), Path(out).absolute()
+    if volume.parent == out.parent and (
+        volume.name in (out.name, out.name + ".conversion.json") or volume.name.startswith(out.name + ".part-")
+    ):
+        raise ValueError(f"--ngram-out {volume} is one of the conversion's own output files; pick another path")
+
+
 def new_volume_id() -> bytes:
     return os.urandom(ngram_volume.VOLUME_ID_BYTES)
