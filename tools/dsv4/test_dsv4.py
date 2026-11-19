@@ -6,6 +6,7 @@ golden fixture's consistency. No network, no weights.
 """
 import json
 import os
+import struct
 import sys
 import tempfile
 from pathlib import Path
@@ -284,6 +285,46 @@ def test_fetch_refuses_an_unstamped_non_empty_directory():
             check(not (Path(d) / "repo.txt").exists(), "a refused directory must not get a stamp")
             return
         check(False, "an unstamped directory with cached files must be refused")
+
+
+def test_fetch_pins_one_commit_and_reuses_it():
+    import fetch_headers as fh
+    sha, other = "a" * 40, "b" * 40
+    seen = []
+    real = (fh._get, fh.resolve_revision)
+    index = json.dumps({"weight_map": {"w": "m-1.safetensors"}}).encode()
+    header = json.dumps({"w": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}).encode()
+
+    def fake_get(url, start=None, end=None):
+        seen.append(url)
+        if url.endswith(".safetensors"):
+            return struct.pack("<Q", len(header)) if end == 7 else header
+        return index if url.endswith("index.json") else b"{}"
+    try:
+        fh._get = fake_get
+        for revision in (sha, other):  # the second run must ignore a newer remote commit
+            fh.resolve_revision = lambda repo, revision=revision: revision
+            with tempfile.TemporaryDirectory() as d:
+                fh.fetch("o/r", Path(d), None, 1)
+                fh.resolve_revision = lambda repo: "c" * 40
+                fh.fetch("o/r", Path(d), None, 1)
+                check((Path(d) / "repo.txt").read_text().strip() == f"o/r@{revision}", "stamp names the commit")
+                check(fh.check_stamp("o/r", Path(d)) == revision, "check_stamp returns the commit")
+            check(all(f"/resolve/{revision}/" in u for u in seen), f"every request uses the commit: {seen}")
+            seen.clear()
+    finally:
+        fh._get, fh.resolve_revision = real
+
+
+def test_a_stamp_without_a_commit_is_refused():
+    import fetch_headers as fh
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "repo.txt").write_text("o/r\n")
+        try:
+            fh.check_stamp("o/r", Path(d))
+        except SystemExit:
+            return
+        check(False, "a stamp that names no commit must be refused")
 
 
 def test_shard_names_from_the_index_cannot_leave_the_cache():

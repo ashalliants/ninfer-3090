@@ -10,8 +10,9 @@ shard) is enough to know the exact layout and size of a 500 GB checkpoint.
 
 Writes `out_dir/config.json`, `out_dir/model.safetensors.index.json` and one
 `out_dir/headers/<shard>.json` per shard: {tensor name: {dtype, shape, data_offsets}} with offsets
-relative to the start of the shard's data section. Shards already fetched are skipped; `repo.txt` records which repository the
-directory belongs to, and fetching a different one into it is refused.
+relative to the start of the shard's data section. Shards already fetched are skipped. `repo.txt` records the repository and the commit it was fetched at
+(`repo@<sha>`): every request, now and on later runs, uses that commit, so the cached offsets always match the
+bytes read, and fetching a different repository into the directory is refused.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from pathlib import Path
 
 HF = "https://huggingface.co"
 SHARD_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")  # a bare file name: no separators, no "..\"
+COMMIT = re.compile(r"[0-9a-f]{40}")
 MAX_HEADER_BYTES = 1 << 28  # a header is at most a few MB; refuse anything absurd
 
 
@@ -56,13 +58,27 @@ def shard_name(name: str) -> str:
     return name
 
 
-def check_stamp(repo: str, directory: Path) -> None:
-    """Refuse a cache directory that was not fetched from `repo` (or has no stamp)."""
+def resolve_revision(repo: str) -> str:
+    """The commit `repo`'s default branch is at now, so a whole cache can be pinned to one immutable revision."""
+    sha = json.loads(_get(f"{HF}/api/models/{repo}"))["sha"]
+    if not COMMIT.fullmatch(sha):
+        raise ValueError(f"{repo}: unexpected revision {sha!r}")
+    return sha
+
+
+def check_stamp(repo: str, directory: Path) -> str:
+    """The commit `directory` was fetched at. Refuses a directory not fetched from `repo`, with no stamp,
+    or with an old stamp that names no commit."""
     stamp = directory / "repo.txt"
     found = stamp.read_text().strip() if stamp.exists() else None
-    if found != repo:
-        raise SystemExit(f"{directory} holds headers for {found or 'an unknown repository'}, not {repo}: "
+    name, _, revision = (found or "").partition("@")
+    if name != repo:
+        raise SystemExit(f"{directory} holds headers for {name or 'an unknown repository'}, not {repo}: "
                          "fetch into a fresh directory")
+    if not COMMIT.fullmatch(revision):
+        raise SystemExit(f"{directory}/repo.txt names no commit, so its headers cannot be tied to one revision: "
+                         "fetch into a fresh directory")
+    return revision
 
 
 def read_tensor(repo: str, directory: Path, name: str, offset: int = 0, length: int | None = None) -> bytes:
@@ -70,10 +86,10 @@ def read_tensor(repo: str, directory: Path, name: str, offset: int = 0, length: 
 
     `directory` is a `fetch` output directory; the header cache says which shard holds `name` and
     where. Use `offset`/`length` to read a single row of a table too big to download."""
-    check_stamp(repo, directory)
+    revision = check_stamp(repo, directory)
     shard = shard_name(json.loads((directory / "model.safetensors.index.json").read_text())["weight_map"][name])
     entry = json.loads((directory / "headers" / f"{shard}.json").read_text())[name]
-    url = f"{HF}/{repo}/resolve/main/{shard}"
+    url = f"{HF}/{repo}/resolve/{revision}/{shard}"
     (header_len,) = struct.unpack("<Q", _get(url, 0, 7))
     first, last = entry["data_offsets"]
     size = last - first
@@ -90,16 +106,17 @@ def fetch(repo: str, out: Path, only: set[int] | None, workers: int) -> None:
     out.mkdir(parents=True, exist_ok=True)
     stamp = out / "repo.txt"
     if stamp.exists():
-        check_stamp(repo, out)
+        revision = check_stamp(repo, out)
     else:
         if any(out.iterdir()):
             raise SystemExit(f"{out} is not empty and has no repo.txt stamp, so its cached headers "
                              "cannot be tied to a repository: fetch into a fresh directory")
-        stamp.write_text(repo + "\n")
+        revision = resolve_revision(repo)
+        stamp.write_text(f"{repo}@{revision}\n")
     (out / "headers").mkdir(exist_ok=True)
     for name in ("config.json", "model.safetensors.index.json"):
         if not (out / name).exists():
-            (out / name).write_bytes(_get(f"{HF}/{repo}/resolve/main/{name}"))
+            (out / name).write_bytes(_get(f"{HF}/{repo}/resolve/{revision}/{name}"))
     index = json.loads((out / "model.safetensors.index.json").read_text())
     shards = sorted(shard_name(n) for n in set(index["weight_map"].values()))
 
@@ -107,7 +124,7 @@ def fetch(repo: str, out: Path, only: set[int] | None, workers: int) -> None:
         target = out / "headers" / f"{shard}.json"
         if target.exists():
             return f"cached {shard}"
-        header = read_header(f"{HF}/{repo}/resolve/main/{shard}")
+        header = read_header(f"{HF}/{repo}/resolve/{revision}/{shard}")
         target.write_text(json.dumps(header, separators=(",", ":")))
         return f"fetched {shard} ({len(header)} tensors)"
 
