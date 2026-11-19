@@ -339,7 +339,7 @@ void test_real_records(const char* dir) {
         std::printf("real %s: %d experts\n", record_name(format), count);
         // Unit-scale activations (a normed hidden state), then larger ones that reach the clamp.
         check_bank(bank, std::min(2, count), {1, 3, 8}, 1.0F, false, rng);
-        check_bank(bank, std::min(2, count), {1, 3}, 6.0F, false, rng);
+        check_bank(bank, std::min(2, count), {1, 3}, 6.0F, true, rng);
     }
 }
 
