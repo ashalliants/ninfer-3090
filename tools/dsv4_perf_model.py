@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -268,6 +269,10 @@ def main() -> None:
     ap.add_argument("--sweep", action="store_true", help="skew x SSD speed at 1 and 4 lanes")
     ap.add_argument("--calibrate", action="store_true")
     a = ap.parse_args()
+    for flag in ("ssd_gb_s", "ram_gib", "dense_eff", "overlap", "skew"):
+        v = getattr(a, flag)
+        if v is not None and not math.isfinite(v):
+            ap.error(f"--{flag.replace('_', '-')} must be a finite number")
     if a.ssd_gb_s <= 0 or a.ram_gib <= 0:
         ap.error("--ssd-gb-s and --ram-gib must be positive")
     if not 0 < a.dense_eff <= 1:

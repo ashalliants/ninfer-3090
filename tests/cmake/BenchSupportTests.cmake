@@ -63,7 +63,7 @@ add_test(NAME ninfer_flash_next_perf_model_test
 # importable (the cpu list below picks it up if it exists); the message says when it is left out.
 add_test(NAME ninfer_dsv4_perf_model_test
   COMMAND ${Python3_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/tools/test_dsv4_perf_model.py)
-execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
+execute_process(COMMAND ${Python3_EXECUTABLE} -I -c "import numpy"
   RESULT_VARIABLE ninfer_numpy_missing OUTPUT_QUIET ERROR_QUIET)
 if(ninfer_numpy_missing)
   message(STATUS "ninfer_dsv4_tools_test not registered: ${Python3_EXECUTABLE} cannot import numpy")

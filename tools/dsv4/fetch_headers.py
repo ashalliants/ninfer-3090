@@ -92,6 +92,9 @@ def fetch(repo: str, out: Path, only: set[int] | None, workers: int) -> None:
     if stamp.exists():
         check_stamp(repo, out)
     else:
+        if any(out.iterdir()):
+            raise SystemExit(f"{out} is not empty and has no repo.txt stamp, so its cached headers "
+                             "cannot be tied to a repository: fetch into a fresh directory")
         stamp.write_text(repo + "\n")
     (out / "headers").mkdir(exist_ok=True)
     for name in ("config.json", "model.safetensors.index.json"):

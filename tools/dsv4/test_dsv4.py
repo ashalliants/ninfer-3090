@@ -274,6 +274,18 @@ def test_fetch_refuses_a_directory_for_another_repo():
         check(False, "a cache stamped for another repository must be refused")
 
 
+def test_fetch_refuses_an_unstamped_non_empty_directory():
+    import fetch_headers as fh
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "config.json").write_text("{}")
+        try:
+            fh.fetch("deepseek-ai/other", Path(d), None, 1)
+        except SystemExit:
+            check(not (Path(d) / "repo.txt").exists(), "a refused directory must not get a stamp")
+            return
+        check(False, "an unstamped directory with cached files must be refused")
+
+
 def test_shard_names_from_the_index_cannot_leave_the_cache():
     import fetch_headers as fh
     for bad in ("../x.safetensors", "a/b.safetensors", "..", "/etc/passwd", "a\\b", ""):
