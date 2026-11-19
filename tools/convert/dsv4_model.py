@@ -26,7 +26,7 @@ from typing import Mapping
 
 from tools.artifact.formats import ggml_record_format
 
-from . import dsv4, dsv4_tokenizer
+from . import dsv4, dsv4_engram, dsv4_tokenizer
 from .dsv4 import Dsv4Error
 from .methods import import_encoded
 from .model import Model, Parameter
@@ -72,7 +72,7 @@ def _inputs(parameter: str) -> tuple[str, ...]:
 
 
 def build_model(gguf: GgufModel, *, resource_overrides: Mapping[str, str | Path] | None = None) -> Model:
-    """The logical model of a V4.1-Flash GGUF, without the Engram volume.
+    """The logical model of a V4.1-Flash GGUF, without the Engram volume (``dsv4_engram`` writes that).
 
     ``resource_overrides`` maps ``tokenizer.json`` (required to get a tokenizer) and ``chat_template.jinja``
     (optional: the GGUF's is the default) to files of the checkpoint."""
@@ -86,6 +86,9 @@ def build_model(gguf: GgufModel, *, resource_overrides: Mapping[str, str | Path]
     if vocab is None:
         raise Dsv4Error("GGUF tensor 'token_embd.weight' is missing")
     config = {**dsv4.text_config(gguf.metadata, vocab), "model_type": MODEL_TYPE}
+    # The Engram table is a volume beside the artifact; its geometry is recorded now and its id when the volume
+    # is written or reused (dsv4_engram.bind).
+    config[dsv4_engram.CONFIG_KEY] = dsv4_engram.config_record(gguf)
     mappings = dsv4.name_map(gguf.tensors, config)
     resources: dict[str, bytes] = {}
     if "tokenizer.json" in overrides:

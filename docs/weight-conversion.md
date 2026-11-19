@@ -479,8 +479,7 @@ from `deepseek-ai/DeepSeek-V4.1-Flash-1017` and pass it with `--resource`; the c
 pipeline is the one the runtime implements and its vocabulary, merges and added tokens agree with the GGUF's
 token types. The chat template defaults to the GGUF's; `--resource chat_template.jinja=PATH` (only together
 with `tokenizer.json`) replaces it with the checkpoint's. `tokenizer_config.json` and `generation_config.json`
-are derived. `--subset`, `--ngram-out`, `--ngram-reuse`, `--mtp-gguf` and `--mmproj` do not apply and are
-refused.
+are derived. `--subset`, `--mtp-gguf` and `--mmproj` do not apply and are refused.
 
 ```bash
 python -m tools.convert \
@@ -489,9 +488,13 @@ python -m tools.convert \
   --resource tokenizer.json=/models/DeepSeek-V4.1-Flash-1017/tokenizer.json
 ```
 
-The Engram table (`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`, the build's last shard) is not part of the
-artifact yet, and nothing loads the artifact until the model's runtime lands (milestone 4 of the
-[DSV4 plan](maintainer/dsv4-flash-plan.md)).
+The Engram table (`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`, the build's last shard: name it
+`...-00006-of-00006.gguf` beside the others so the split set is complete) is 110 GB and read a few rows per
+token, so it is not stored in the artifact. `--ngram-out PATH` also writes it as a separate volume (one row per
+4 KiB read, the rows' GGUF bytes exactly, never replacing an existing file; any drive) and binds the artifact to
+that volume's id; `--ngram-reuse PATH` binds to an existing volume of the same table (header, size and 512
+sampled rows are checked). Without either the artifact records the volume's geometry but no id. Nothing loads
+the artifact until the model's runtime lands (milestone 4 of the [DSV4 plan](maintainer/dsv4-flash-plan.md)).
 
 ## Write a conversion method
 

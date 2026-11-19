@@ -14,7 +14,7 @@ from .official_recipes import RECIPES
 from .pipeline import convert, discard
 from .proposal import DEFAULT_RANKING, add_official_proposal
 from .qwen3_5 import build_model
-from . import dsv4, dsv4_model, qwen4_exp
+from . import dsv4, dsv4_engram, dsv4_model, qwen4_exp
 from .recipe import Recipe
 from .sources.gguf import GgufModel
 from .sources.gguf_ternary import GGUFFile
@@ -189,18 +189,24 @@ def main(argv=None):
             sources = {"base": base}
             architecture = base.metadata.get("general.architecture")
             if architecture == dsv4.ARCHITECTURE:
-                # DeepSeek-V4.1-Flash: no n-gram volume, tokenizer or optional components yet.
-                if args.subset or args.ngram_out or args.ngram_reuse or args.mtp_gguf or args.mmproj:
-                    raise ValueError(
-                        "a deepseek41 GGUF takes none of --subset, --ngram-out, --ngram-reuse, "
-                        "--mtp-gguf and --mmproj"
-                    )
+                # DeepSeek-V4.1-Flash: the Engram volume is opt-in (--ngram-out or --ngram-reuse, 110 GB); no
+                # subsets or optional components yet.
+                if args.subset or args.mtp_gguf or args.mmproj:
+                    raise ValueError("a deepseek41 GGUF takes none of --subset, --mtp-gguf and --mmproj")
                 if "tokenizer.json" not in overrides:
                     raise ValueError(
                         "a deepseek41 GGUF needs the checkpoint's tokenizer: --resource tokenizer.json=PATH "
                         "(the GGUF alone does not say which added tokens are special)"
                     )
                 model = dsv4_model.build_model(base, resource_overrides=overrides)
+                config = model.config
+                if args.ngram_reuse is not None:
+                    dsv4_engram.bind(config, dsv4_engram.read_volume_id(base, config, args.ngram_reuse))
+                elif args.ngram_out is not None:
+                    ngram_out = args.ngram_out
+                    if ngram_out.exists():
+                        raise FileExistsError(f"Engram volume already exists: {ngram_out}")
+                    dsv4_engram.bind(config, dsv4_engram.new_volume_id())
             else:
                 mtp = stack.enter_context(GgufModel(args.mtp_gguf)) if args.mtp_gguf else None
                 mmproj = stack.enter_context(GgufModel(args.mmproj)) if args.mmproj else None
@@ -288,12 +294,15 @@ def main(argv=None):
             # The artifact names a volume id that only this volume carries: without the volume
             # it is unusable, and it would block a retry at the same --out.
             try:
-                geometry = qwen4_exp.write_ngram_volume(base, model, ngram_out)
+                if base.metadata.get("general.architecture") == dsv4.ARCHITECTURE:
+                    geometry = dsv4_engram.write_volume(base, model.config, ngram_out)
+                else:
+                    geometry = qwen4_exp.write_ngram_volume(base, model, ngram_out)
             except BaseException:
                 discard(report)
                 raise
             print(f"wrote {ngram_out}: {geometry.blocks} blocks of {geometry.rows} rows", flush=True)
-        elif gguf and base.metadata.get("general.architecture") != dsv4.ARCHITECTURE:
+        elif gguf and args.ngram_reuse is not None:
             print(f"bound {args.out} to the n-gram volume {args.ngram_reuse}", flush=True)
 
 

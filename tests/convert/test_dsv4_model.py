@@ -177,7 +177,7 @@ def test_the_public_cli_converts_a_deepseek41_gguf(gguf_path, tmp_path):
     out = tmp_path / "cli.ninfer"
     main(["--model", str(gguf_path), "--recipe", "dsv4_gguf", "--device", "cpu", "--out", str(out),
           "--resource", f"tokenizer.json={tokenizer_file(tmp_path)}"])
-    assert out.exists() and not (tmp_path / "cli.ninfer.ngram").exists()  # no n-gram volume
+    assert out.exists() and not (tmp_path / "cli.ninfer.ngram").exists()  # the Engram volume is opt-in
     report = json.loads((tmp_path / "cli.ninfer.conversion.json").read_text())
     assert report["provenance"]["recipe"] == "dsv4_gguf"
     assert report["provenance"]["sources"]["base"]["paths"] == [str(gguf_path)]
@@ -189,7 +189,7 @@ def test_the_cli_refuses_options_a_deepseek41_gguf_cannot_take(gguf_path, tmp_pa
     from tools.convert.__main__ import main
 
     base = ["--model", str(gguf_path), "--recipe", "dsv4_gguf", "--device", "cpu"]
-    for extra in (["--subset", "dev"], ["--ngram-out", str(tmp_path / "v")], ["--mtp-gguf", str(gguf_path)]):
+    for extra in (["--subset", "dev"], ["--mtp-gguf", str(gguf_path)]):
         with pytest.raises(ValueError, match="takes none of"):
             main([*base, *extra, "--out", str(tmp_path / "x.ninfer")])
     with pytest.raises(ValueError, match="needs the checkpoint's tokenizer"):
