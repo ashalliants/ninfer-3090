@@ -72,6 +72,9 @@ struct Dims {
     static constexpr int kRegistersRowBlocks = I / kRegistersRows;             // 80 items per job
     static_assert(H % kDownRows == 0 && I % kUnitRows == 0 && H % canon::kA8Values == 0 && I % canon::kA8Values == 0,
                   "an expert's dimensions must tile the kernels' units");
+    // copy_precast_columns moves the codes in 16-byte vectors and the scales (kXGroups floats a column) in 16-byte
+    // vectors too, so the groups of a column must fill whole vectors: a multiple of four.
+    static_assert(kXGroups % 4 == 0, "a column's A8 scales must fill whole 16-byte vectors");
 };
 using QwenDims = Dims<moe::kHidden, moe::kIntermediate>;
 constexpr int kMaxDynamicSmem = kMaxDynamicSharedBytes;
