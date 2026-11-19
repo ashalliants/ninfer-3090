@@ -705,7 +705,25 @@ printf 'Command:'
 printf ' %q' "$server" "$MODEL" --host "$HOST" --port "$PORT" --config "$profile_file" \
   ${profile_args[@]+"${profile_args[@]}"}
 printf '\n'
-printf 'API: http://%s:%s/v1\n\n' "$HOST" "$PORT"
+printf 'API: http://%s:%s/v1\n' "$HOST" "$PORT"
+# The live dashboard (speed, lanes, memory, GPU). The key, when there is one, rides after the #, which
+# the browser never sends to the server, so the page opens already signed in.
+dash_host="$HOST"
+case "$dash_host" in 0.0.0.0|'::'|'[::]') dash_host=127.0.0.1 ;; esac
+dash_key=''
+if [[ -n "${NINFER_API_KEY:-}" ]]; then
+  dash_key="#key=$(
+    LC_ALL=C
+    key="$NINFER_API_KEY"
+    for ((i = 0; i < ${#key}; i++)); do
+      c="${key:i:1}"
+      case "$c" in [A-Za-z0-9._~-]) printf '%s' "$c" ;; *) printf '%%%02X' "'$c" ;; esac
+    done
+  )"
+fi
+printf 'Dashboard: http://%s:%s/dashboard%s\n' "$dash_host" "$PORT" "$dash_key"
+[[ "$dash_host" == "$HOST" ]] || printf '           (on another computer, use this machine'"'"'s address instead of %s)\n' "$dash_host"
+printf '\n'
 
 # Host retry eligibility. Only the tuned profile's default Host context budget may be
 # second-guessed; a value the caller chose is theirs. A retry is a re-run of this script with a

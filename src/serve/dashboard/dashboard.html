@@ -49,15 +49,18 @@ input, button {
   font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border);
   border-radius: 6px; padding: 4px 8px;
 }
-button { cursor: pointer; }
+button { cursor: pointer; white-space: nowrap; }
+@media (max-width: 640px) { .key { margin-left: 0; width: 100%; } .key input { flex: 1; width: auto; min-width: 0; } }
 .key.needed input { border-color: var(--critical); }
-.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 16px; }
+@media (max-width: 640px) { .tiles { grid-template-columns: repeat(2, 1fr); } body { padding: 12px; } }
 .tile, .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
 .tile { padding: 10px 12px; }
 .tile .label { color: var(--text-2); font-size: 12px; }
 .tile .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .tile .sub { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
-.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.lanes-panel { margin-bottom: 16px; }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 12px; margin-bottom: 16px; }
 .panel { padding: 12px; position: relative; }
 .panel canvas { width: 100%; height: 160px; display: block; }
 .tip {
@@ -66,13 +69,86 @@ button { cursor: pointer; }
   white-space: nowrap; display: none; font-variant-numeric: tabular-nums;
 }
 table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+th, td { text-align: left; padding: 6px 6px; border-bottom: 1px solid var(--border); vertical-align: middle; }
 th { color: var(--text-2); font-weight: 600; font-size: 12px; }
 td.num, th.num { text-align: right; }
 .bar { height: 6px; border-radius: 3px; background: var(--track); overflow: hidden; margin-top: 3px; min-width: 80px; }
 .bar div { height: 100%; background: var(--series); border-radius: 3px; }
 .muted { color: var(--muted); }
+.reuse { font-weight: 600; }
+.nw { white-space: nowrap; }
+.sub-line { color: var(--muted); font-size: 12px; white-space: nowrap; }
+/* Phone: each lane is a card (label left, value right) instead of a table row, so nothing scrolls sideways. */
+@media (max-width: 640px) {
+  .wide { overflow-x: visible; }
+  .lanes-table, .lanes-table tbody, .lanes-table tr, .lanes-table td { display: block; width: 100%; }
+  .lanes-table thead { display: none; }
+  .lanes-table tr { border: 1px solid var(--border); border-radius: 8px; padding: 4px 10px; margin-bottom: 8px; }
+  .lanes-table td, .lanes-table td.num {
+    display: grid; grid-template-columns: 110px 1fr; gap: 0 8px; align-items: center;
+    text-align: left; border-bottom: 0; padding: 4px 0;
+  }
+  .lanes-table td[data-label]::before { content: attr(data-label); color: var(--text-2); font-size: 12px; font-weight: 600; }
+  .lanes-table td > * { grid-column: 2; }
+  .lanes-table td:not([data-label]) { display: block; }
+  /* Lane, state and request read as one heading line: "Lane 0  prefill  #10". */
+  .lanes-table td:nth-child(-n+3) { display: inline-block; width: auto; margin-right: 12px; font-weight: 600; }
+  .lanes-table td:nth-child(-n+3)::before { content: none; }
+  .lanes-table td:nth-child(1)::before { content: 'Lane '; color: var(--text-2); font-weight: 400; font-size: inherit; }
+  .lanes-table td:nth-child(3) { font-weight: 400; color: var(--text-2); }
+  .lanes-table td:nth-child(2) .sub-line { display: inline; margin-left: 6px; font-weight: 400; }
+  .lanes-table tr.idle td:nth-child(n+3) { display: none; }
+  .lanes-table .bar { min-width: 0; }
+}
+.info {
+  display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px;
+  margin-left: 4px; border: 1px solid var(--muted); border-radius: 50%; color: var(--muted);
+  font-size: 10px; font-weight: 600; line-height: 1; cursor: help; position: relative;
+  vertical-align: middle; text-transform: none;
+}
+.info:hover, .info:focus { color: var(--text); border-color: var(--text); outline: none; }
+.info::after {
+  content: attr(data-tip); display: none; position: absolute; z-index: 10; left: 50%; top: 20px;
+  transform: translateX(-50%); width: 220px; padding: 6px 8px; border-radius: 6px;
+  background: var(--surface); color: var(--text); border: 1px solid var(--border);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18); font-size: 12px; font-weight: 400; text-align: left;
+  white-space: normal; line-height: 1.4;
+}
+.info:hover::after, .info:focus::after { display: block; }
+.tile:nth-child(4n) .info::after, th:last-child .info::after { left: auto; right: -8px; transform: none; }
+.reuse.good { color: var(--good); } .reuse.warning { color: var(--warning); } .reuse.critical { color: var(--critical); }
 .queue { margin-top: 10px; color: var(--text-2); }
+.queue .hot { color: var(--critical); font-weight: 600; }
+.tile .value.good { color: var(--good); } .tile .value.warning { color: var(--warning); } .tile .value.critical { color: var(--critical); }
+.attention { margin-bottom: 16px; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border);
+  border-left: 4px solid var(--warning); background: var(--surface); }
+.attention.critical { border-left-color: var(--critical); }
+.attention h2 { margin: 0 0 4px; color: var(--text); }
+.attention ul { margin: 0; padding-left: 18px; }
+.attention li.critical::marker { color: var(--critical); } .attention li.warning::marker { color: var(--warning); }
+.linklike { font: inherit; color: var(--text); background: none; border: 0; padding: 0; text-align: left;
+  text-decoration: underline; text-decoration-color: var(--muted); cursor: pointer; white-space: normal; }
+.toolbar { display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-bottom: 8px; color: var(--text-2); }
+.seg { display: inline-flex; }
+.seg button { border-radius: 0; }
+.seg button:first-child { border-radius: 6px 0 0 6px; } .seg button:last-child { border-radius: 0 6px 6px 0; margin-left: -1px; }
+button[aria-pressed="true"] { background: var(--series); color: #fff; border-color: var(--series); }
+.lane-row { cursor: pointer; }
+.lane-row:hover td, .lane-row.selected td { background: var(--track); }
+.lane-row:focus-visible { outline: 2px solid var(--series); outline-offset: -2px; }
+.drawer { position: fixed; top: 0; right: 0; bottom: 0; width: 340px; max-width: 100%; z-index: 20; overflow: auto;
+  background: var(--surface); border-left: 1px solid var(--border); box-shadow: -4px 0 16px rgba(0, 0, 0, 0.18); padding: 16px; }
+.drawer[hidden], .attention[hidden] { display: none; }
+.drawer-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.drawer-head h2 { margin: 0; font-size: 16px; color: var(--text); }
+.drawer dl { margin: 0; display: grid; grid-template-columns: 120px 1fr; gap: 8px 10px; }
+.drawer dt { color: var(--text-2); font-size: 12px; font-weight: 600; align-self: center; }
+.drawer dd { margin: 0; font-variant-numeric: tabular-nums; }
+.drawer .bar { min-width: 0; }
+@media (max-width: 640px) {
+  .drawer { top: auto; left: 0; width: 100%; max-height: 75vh; border-left: 0; border-top: 1px solid var(--border);
+    border-radius: 12px 12px 0 0; }
+}
 .wide { overflow-x: auto; }
 </style>
 </head>
@@ -87,16 +163,40 @@ td.num, th.num { text-align: right; }
   </div>
 </header>
 
+<section class="attention" id="attention" hidden aria-live="polite"></section>
+
 <section class="tiles" aria-label="Current values">
   <div class="tile"><div class="label">Decode</div><div class="value" id="t-decode">-</div><div class="sub">tokens/s</div></div>
-  <div class="tile"><div class="label">Prefill</div><div class="value" id="t-prefill">-</div><div class="sub">tokens/s</div></div>
-  <div class="tile"><div class="label">Draft acceptance</div><div class="value" id="t-accept">-</div><div class="sub" id="t-accept-sub">since start</div></div>
-  <div class="tile"><div class="label">Requests</div><div class="value" id="t-requests">-</div><div class="sub" id="t-requests-sub">running / waiting</div></div>
-  <div class="tile"><div class="label">KV pool in use</div><div class="value" id="t-kv">-</div><div class="sub" id="t-kv-sub">incl. retained prefixes</div></div>
+  <div class="tile"><div class="label">Prefill<span class="info" tabindex="0" role="img" aria-label="About Prefill" data-tip="How fast the server reads incoming prompts, in tokens per second.">?</span></div><div class="value" id="t-prefill">-</div><div class="sub">tokens/s</div></div>
+  <div class="tile"><div class="label">Draft acceptance<span class="info" tabindex="0" role="img" aria-label="About Draft acceptance" data-tip="The server guesses several tokens ahead and checks them. A higher share accepted means faster replies.">?</span></div><div class="value" id="t-accept">-</div><div class="sub" id="t-accept-sub">since start</div></div>
+  <div class="tile"><div class="label">Requests<span class="info" tabindex="0" role="img" aria-label="About Requests" data-tip="Running is being answered now. Waiting is queued until a lane is free.">?</span></div><div class="value" id="t-requests">-</div><div class="sub" id="t-requests-sub">running / waiting</div></div>
+  <div class="tile"><div class="label">Conversation memory<span class="info" tabindex="0" role="img" aria-label="About conversation memory" data-tip="Also called the KV cache. The memory that holds conversations so they need not be re-read. It includes older prompts kept for reuse. Red means it is nearly full.">?</span></div><div class="value" id="t-kv">-</div><div class="sub" id="t-kv-sub">incl. retained prefixes</div></div>
   <div class="tile"><div class="label">GPU power</div><div class="value" id="t-power">-</div><div class="sub" id="t-util">utilization</div></div>
   <div class="tile"><div class="label">VRAM</div><div class="value" id="t-vram">-</div><div class="sub" id="t-vram-sub">all processes</div></div>
   <div class="tile"><div class="label">GPU temperature</div><div class="value" id="t-temp">-</div><div class="sub">core</div></div>
 </section>
+
+<section class="panel lanes-panel">
+  <h2>Lanes</h2>
+  <div class="wide">
+    <table class="lanes-table">
+      <thead><tr>
+        <th>Lane</th><th>State</th><th>Request</th><th>Prompt<span class="info" tabindex="0" role="img" aria-label="About reused" data-tip="Tokens already processed. Reused is the part of the prompt served from cache instead of being recomputed: higher is faster.">?</span></th><th class="num">Generated</th>
+        <th>Context<span class="info" tabindex="0" role="img" aria-label="About context" data-tip="How much of this lane's memory window is filled. Red means it is nearly full.">?</span></th><th class="num">tok/s</th><th class="num">Drafts accepted</th>
+      </tr></thead>
+      <tbody id="lanes"></tbody>
+    </table>
+  </div>
+  <div class="queue" id="queue"></div>
+</section>
+
+<div class="toolbar">
+  <span class="seg" role="group" aria-label="Chart time range">
+    <button type="button" id="range-2m" aria-pressed="true">2 min</button>
+    <button type="button" id="range-15m" aria-pressed="false">15 min</button>
+  </span>
+  <button type="button" id="pause-charts" aria-pressed="false">Pause charts</button>
+</div>
 
 <section class="charts">
   <div class="panel"><h2>Decode tokens/s</h2><canvas id="c-decode" role="img" aria-label="Decode tokens per second"></canvas><div class="tip"></div></div>
@@ -105,37 +205,36 @@ td.num, th.num { text-align: right; }
   <div class="panel"><h2>GPU power W</h2><canvas id="c-power" role="img" aria-label="GPU power in watts"></canvas><div class="tip"></div></div>
 </section>
 
-<section class="panel">
-  <h2>Lanes</h2>
-  <div class="wide">
-    <table>
-      <thead><tr>
-        <th>Lane</th><th>State</th><th>Request</th><th>Prompt</th><th class="num">Generated</th>
-        <th>Context</th><th class="num">tok/s</th><th class="num">Drafts accepted</th>
-      </tr></thead>
-      <tbody id="lanes"></tbody>
-    </table>
-  </div>
-  <div class="queue" id="queue"></div>
-</section>
+<aside class="drawer" id="drawer" hidden aria-label="Lane details">
+  <div class="drawer-head"><h2 id="d-title">Lane</h2><button type="button" id="d-close">Close</button></div>
+  <dl id="d-body"></dl>
+</aside>
 
 <script>
 'use strict';
-const WINDOW_S = 120, POLL_MS = 1000, KEY_STORE = 'ninfer-dashboard-key';
+const HISTORY_S = 900, POLL_MS = 1000, KEY_STORE = 'ninfer-dashboard-key';
+let windowS = 120;       // how much of the history the charts show: 120 or 900 seconds
+let frozenAt = null;     // chart time while charts are paused, else null
 const $ = (id) => document.getElementById(id);
 const nf1 = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
 const nf0 = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
+const nf2 = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
 
 let apiKey = '';
 try { apiKey = sessionStorage.getItem(KEY_STORE) || ''; } catch (e) { /* storage disabled */ }
 let samples = [];        // {t (ms), decode, prefill, accept, power}; null where unknown
 let previous = null;     // the last /metrics counters and when they were read
 let timer = null, busy = false;
+let lastSlots = [], lastLoad = null;
+let gpu = { temp: null, vramUsed: null, vramTotal: null };
+let selectedLane = null;
+const laneSeen = new Map();   // lane id -> { req, t, pre }: when this page first saw the request
+let slotsPolled = false;
 
 const charts = [
   { id: 'c-decode', field: 'decode', unit: 'tok/s' },
   { id: 'c-prefill', field: 'prefill', unit: 'tok/s' },
-  { id: 'c-accept', field: 'accept', unit: '%', max: 100 },
+  { id: 'c-accept', field: 'accept', unit: '%', max: 100, empty: 'No drafts yet' },
   { id: 'c-power', field: 'power', unit: 'W' },
 ];
 
@@ -184,6 +283,25 @@ function show(id, text) { $(id).textContent = text; }
 const orDash = (v, fmt) => (v === null || v === undefined || !isFinite(v) ? '-' : fmt(v));
 const gib = (b) => nf1.format(b / 1073741824) + ' GiB';
 
+function fmtDuration(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return s + ' s';
+  if (s < 3600) return Math.floor(s / 60) + ' min ' + (s % 60) + ' s';
+  return Math.floor(s / 3600) + ' h ' + Math.floor((s % 3600) / 60) + ' min';
+}
+const fmtAgo = (ms) => (ms >= 120000 ? nf0.format(ms / 60000) + ' min' : nf0.format(ms / 1000) + ' s') + ' ago';
+
+// Tile value colours: only warnings and problems are coloured, so a calm page stays calm.
+function level(id, lvl) { $(id).className = 'value' + (lvl ? ' ' + lvl : ''); }
+const levelOf = (v, warn, crit) => (v >= crit ? 'critical' : v >= warn ? 'warning' : '');
+
+function writeHash() {
+  const parts = [];
+  if (windowS === 900) parts.push('range=15m');
+  if (selectedLane !== null) parts.push('lane=' + selectedLane);
+  try { history.replaceState(null, '', parts.length ? '#' + parts.join('&') : location.pathname + location.search); } catch (e) { /* ignore */ }
+}
+
 let lastPrefill = null;
 function onMetrics(text, now) {
   const m = parseMetrics(text);
@@ -226,7 +344,11 @@ function onMetrics(text, now) {
   const used = m.get('ninfer_gpu_memory_used_bytes'), total = m.get('ninfer_gpu_memory_total_bytes');
   show('t-vram', orDash(used, gib));
   show('t-vram-sub', total ? 'of ' + gib(total) + ', all processes' : 'all processes');
-  show('t-temp', orDash(m.get('ninfer_gpu_temperature_celsius'), (v) => nf0.format(v) + ' \u00b0C'));
+  const temp = m.get('ninfer_gpu_temperature_celsius');
+  show('t-temp', orDash(temp, (v) => nf0.format(v) + ' \u00b0C'));
+  gpu = { temp: temp === undefined ? null : temp, vramUsed: used === undefined ? null : used, vramTotal: total || null };
+  level('t-temp', gpu.temp === null ? '' : levelOf(gpu.temp, 80, 85));
+  level('t-vram', gpu.vramTotal && gpu.vramUsed !== null ? levelOf(gpu.vramUsed / gpu.vramTotal, 0.9, 0.95) : '');
 }
 
 function onLoad(load) {
@@ -237,17 +359,9 @@ function onLoad(load) {
   if (cap.kv_capacity_tokens > 0) {
     show('t-kv', nf0.format(100 * occ.device_main_kv_tokens / cap.kv_capacity_tokens) + '%');
     show('t-kv-sub', nf0.format(occ.device_main_kv_tokens) + ' of ' + nf0.format(cap.kv_capacity_tokens) + ' tokens');
+    level('t-kv', levelOf(occ.device_main_kv_tokens / cap.kv_capacity_tokens, 0.75, 0.9));
   }
-  const queue = $('queue');
-  queue.replaceChildren();
-  const waiting = Array.isArray(req.queue) ? req.queue : [];
-  const totalWaiting = req.queue_total || 0;
-  if (totalWaiting === 0) { queue.textContent = 'No requests waiting for a lane.'; return; }
-  const parts = waiting.slice(0, 8).map((w) =>
-    '#' + w.id + ' (' + nf0.format(w.prompt_tokens) + ' tokens, ' + nf1.format(w.waited_s) + ' s)');
-  let text = 'Waiting (' + totalWaiting + '): ' + parts.join(', ');
-  if (totalWaiting > parts.length) text += ', ...';
-  queue.textContent = text;
+  lastLoad = load;
 }
 
 function cell(row, text, cls) {
@@ -267,9 +381,37 @@ function bar(td, fraction) {
   td.appendChild(outer);
 }
 
+const LANE_COLUMNS = ['Lane', 'State', 'Request', 'Prompt', 'Generated', 'Context', 'Speed (tok/s)', 'Drafts accepted'];
+
+function trackLanes(slots) {
+  const now = performance.now();
+  for (const sl of slots) {
+    if (sl.state === 'idle') { laneSeen.delete(sl.id); continue; }
+    const seen = laneSeen.get(sl.id);
+    if (!seen || seen.req !== sl.request_id) laneSeen.set(sl.id, { req: sl.request_id, t: now, pre: !slotsPolled });
+  }
+  slotsPolled = true;
+}
+
+// How long this page has watched the lane's request. A "+" marks a request already running when
+// the page opened, whose true age is unknown.
+function laneAge(id) {
+  const seen = laneSeen.get(id);
+  return seen ? fmtDuration(performance.now() - seen.t) + (seen.pre ? '+' : '') : '';
+}
+
+function selectLane(id) {
+  selectedLane = selectedLane === id ? null : id;
+  writeHash();
+  onSlots(lastSlots);
+  renderDrawer();
+}
+
 function onSlots(slots) {
   const body = $('lanes');
   body.replaceChildren();
+  lastSlots = Array.isArray(slots) ? slots : [];
+  trackLanes(lastSlots);
   if (!Array.isArray(slots) || slots.length === 0) {
     const row = body.insertRow();
     cell(row, 'No lanes reported.', 'muted').colSpan = 8;
@@ -279,24 +421,197 @@ function onSlots(slots) {
     const row = body.insertRow();
     const idle = s.state === 'idle';
     cell(row, String(s.id));
-    cell(row, String(s.state));
+    const stateCell = cell(row, idle ? String(s.state) : s.state);
+    if (!idle) {
+      const age = document.createElement('div');
+      age.className = 'sub-line';
+      age.textContent = 'for ' + laneAge(s.id);
+      stateCell.appendChild(age);
+    }
     cell(row, idle ? '-' : '#' + s.request_id, idle ? 'muted' : '');
     const prompt = cell(row);
     if (idle) { prompt.textContent = '-'; prompt.className = 'muted'; } else {
-      let text = nf0.format(s.prompt_done) + ' / ' + nf0.format(s.prompt_tokens);
-      if (s.reused > 0) text += ' (' + nf0.format(s.reused) + ' reused)';
-      prompt.textContent = text;
+      const line = document.createElement('div');
+      line.className = 'nw';
+      line.textContent = nf0.format(s.prompt_done) + ' / ' + nf0.format(s.prompt_tokens);
+      prompt.appendChild(line);
+      if (s.reused > 0 && s.prompt_tokens > 0) {
+        // Share of the prompt served from cache: green >= 70%, yellow >= 30%, else red.
+        const pct = 100 * s.reused / s.prompt_tokens;
+        const sub = document.createElement('div');
+        sub.className = 'sub-line';
+        const tag = document.createElement('span');
+        tag.className = 'reuse ' + (pct >= 70 ? 'good' : pct >= 30 ? 'warning' : 'critical');
+        tag.textContent = nf0.format(pct) + '%';
+        sub.append(tag, ' reused (' + nf0.format(s.reused) + ')');
+        prompt.appendChild(sub);
+      }
       bar(prompt, s.prompt_tokens > 0 ? s.prompt_done / s.prompt_tokens : 0);
     }
     cell(row, idle ? '-' : nf0.format(s.generated), 'num' + (idle ? ' muted' : ''));
     const ctx = cell(row);
-    ctx.textContent = nf0.format(s.n_ctx_used) + ' / ' + nf0.format(s.n_ctx);
-    bar(ctx, s.n_ctx > 0 ? s.n_ctx_used / s.n_ctx : 0);
+    if (s.n_ctx > 0) {
+      const frac = s.n_ctx_used / s.n_ctx;
+      const line = document.createElement('div');
+      line.className = 'nw';
+      line.append(nf0.format(s.n_ctx_used) + ' / ' + nf0.format(s.n_ctx) + ' ');
+      const tag = document.createElement('span');
+      // The reverse of reuse: a nearly full window is the bad case.
+      tag.className = 'reuse ' + (frac >= 0.9 ? 'critical' : frac >= 0.7 ? 'warning' : 'good');
+      tag.textContent = nf0.format(100 * frac) + '%';
+      line.appendChild(tag);
+      ctx.appendChild(line);
+      bar(ctx, frac);
+    } else { ctx.textContent = '-'; ctx.className = 'muted'; }
     cell(row, s.tokens_per_second > 0 ? nf1.format(s.tokens_per_second) : '-', 'num');
     cell(row, s.drafted > 0
       ? nf0.format(s.accepted) + ' / ' + nf0.format(s.drafted) + ' (' + nf0.format(100 * s.accepted / s.drafted) + '%)'
       : '-', 'num');
+    // Column names for the phone layout, where each row becomes a card and the header is hidden.
+    LANE_COLUMNS.forEach((name, i) => { row.cells[i].dataset.label = name; });
+    row.className = 'lane-row' + (idle ? ' idle' : '') + (s.id === selectedLane ? ' selected' : '');
+    row.tabIndex = 0;
+    row.title = 'Click for details';
+    row.addEventListener('click', () => selectLane(s.id));
+    row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectLane(s.id); } });
   }
+}
+
+const busyLanes = () => lastSlots.filter((l) => l.state !== 'idle');
+
+function renderQueue() {
+  const queue = $('queue');
+  queue.replaceChildren();
+  if (!lastLoad) return;
+  const req = lastLoad.requests || {};
+  const waiting = Array.isArray(req.queue) ? req.queue : [];
+  const total = req.queue_total || 0;
+  if (total === 0) { queue.textContent = 'No requests waiting for a lane.'; return; }
+  const lanes = lastSlots.length;
+  const allBusy = lanes > 0 && busyLanes().length === lanes;
+  queue.append(total + (total === 1 ? ' request is' : ' requests are') + ' waiting for a lane' +
+    (allBusy ? ' (all ' + lanes + ' lanes are busy)' : ''));
+  const longest = waiting.reduce((m, w) => Math.max(m, w.waited_s || 0), 0);
+  if (longest > 0) {
+    queue.append('. Longest wait: ');
+    const t = document.createElement('span');
+    if (longest >= 30) t.className = 'hot';
+    t.textContent = nf0.format(longest) + ' s';
+    queue.append(t);
+  }
+  const parts = waiting.slice(0, 8).map((w) => '#' + w.id + ' (' + nf0.format(w.prompt_tokens) + ' tokens, ' + nf1.format(w.waited_s) + ' s)');
+  let text = '. Queue: ' + parts.join(', ');
+  if (total > parts.length) text += ', ...';
+  queue.append(text);
+}
+
+// Problems worth a person's attention right now, worst first. Empty when all is well.
+function findIssues() {
+  const issues = [];
+  const add = (lvl, text, lane) => issues.push({ lvl, text, lane });
+  for (const l of lastSlots) {
+    if (l.n_ctx > 0 && l.state !== 'idle') {
+      const f = l.n_ctx_used / l.n_ctx;
+      if (f >= 0.9) add('critical', 'Lane ' + l.id + ' is nearly out of room (' + nf0.format(100 * f) + '% of its context).', l.id);
+    }
+    if (l.state !== 'idle' && l.prompt_tokens >= 8000 && l.reused / l.prompt_tokens < 0.1) {
+      add('warning', 'Lane ' + l.id + ' is re-reading almost its whole prompt (' + nf0.format(100 * l.reused / l.prompt_tokens) + '% reused), so it will be slow.', l.id);
+    }
+  }
+  if (lastLoad) {
+    const req = lastLoad.requests || {}, cap = lastLoad.capacity || {}, occ = lastLoad.occupancy || {};
+    const longest = (Array.isArray(req.queue) ? req.queue : []).reduce((m, w) => Math.max(m, w.waited_s || 0), 0);
+    if ((req.queue_total || 0) > 0 && longest >= 30) {
+      add(longest >= 120 ? 'critical' : 'warning', req.queue_total + ' waiting for a lane; the longest has waited ' + nf0.format(longest) + ' s.');
+    }
+    if (cap.kv_capacity_tokens > 0 && occ.device_main_kv_tokens / cap.kv_capacity_tokens >= 0.9) {
+      add('warning', 'Conversation memory is almost full (' + nf0.format(100 * occ.device_main_kv_tokens / cap.kv_capacity_tokens) + '%); older cached prompts will be dropped.');
+    }
+  }
+  if (gpu.temp !== null && gpu.temp >= 80) add(gpu.temp >= 85 ? 'critical' : 'warning', 'The GPU is hot (' + nf0.format(gpu.temp) + ' \u00b0C).');
+  if (gpu.vramTotal && gpu.vramUsed / gpu.vramTotal >= 0.95) add('critical', 'GPU memory is almost full (' + nf0.format(100 * gpu.vramUsed / gpu.vramTotal) + '%).');
+  issues.sort((x, y) => (x.lvl === y.lvl ? 0 : x.lvl === 'critical' ? -1 : 1));
+  return issues;
+}
+
+function renderAttention(issues) {
+  const box = $('attention');
+  box.replaceChildren();
+  if (issues.length === 0) { box.hidden = true; return; }
+  box.hidden = false;
+  box.className = 'attention' + (issues[0].lvl === 'critical' ? ' critical' : '');
+  const h = document.createElement('h2');
+  h.textContent = issues.length === 1 ? 'Needs attention' : issues.length + ' things need attention';
+  const ul = document.createElement('ul');
+  for (const it of issues.slice(0, 3)) {
+    const li = document.createElement('li');
+    li.className = it.lvl;
+    if (it.lane !== undefined) {
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'linklike'; b.textContent = it.text; b.title = 'Show this lane';
+      b.addEventListener('click', () => { selectedLane = it.lane; writeHash(); onSlots(lastSlots); renderDrawer(); });
+      li.appendChild(b);
+    } else li.textContent = it.text;
+    ul.appendChild(li);
+  }
+  if (issues.length > 3) { const li = document.createElement('li'); li.textContent = 'and ' + (issues.length - 3) + ' more'; ul.appendChild(li); }
+  box.append(h, ul);
+}
+
+function healthSummary(issues) {
+  const lanes = lastSlots.length, busy = busyLanes().length;
+  const waiting = lastLoad && lastLoad.requests ? lastLoad.requests.queue_total || 0 : 0;
+  const head = issues.length === 0 ? 'Healthy' : 'Needs attention';
+  return head + ' \u00b7 ' + (lanes ? busy + ' of ' + lanes + ' lanes busy' : 'no lanes reported') + ', ' +
+    (waiting > 0 ? waiting + ' waiting' : 'nothing waiting');
+}
+
+function renderDrawer() {
+  const box = $('drawer');
+  if (selectedLane === null) { box.hidden = true; return; }
+  const l = lastSlots.find((x) => x.id === selectedLane);
+  box.hidden = false;
+  $('d-title').textContent = 'Lane ' + selectedLane;
+  const dl = $('d-body');
+  dl.replaceChildren();
+  const row = (name, value, frac) => {
+    const dt = document.createElement('dt'); dt.textContent = name;
+    const dd = document.createElement('dd');
+    if (value instanceof Node) dd.appendChild(value); else dd.textContent = value;
+    if (frac !== undefined) bar(dd, frac);
+    dl.append(dt, dd);
+  };
+  if (!l) { row('State', 'Not reported'); return; }
+  if (l.state === 'idle') { row('State', 'Idle: ready for the next request'); return; }
+  row('Request', '#' + l.request_id);
+  row('State', l.state);
+  const seen = laneSeen.get(l.id);
+  row('Running for', laneAge(l.id) + (seen && seen.pre ? ' (it started before this page opened)' : ''));
+  row('Prompt', nf0.format(l.prompt_done) + ' / ' + nf0.format(l.prompt_tokens) + ' tokens', l.prompt_tokens > 0 ? l.prompt_done / l.prompt_tokens : 0);
+  if (l.prompt_tokens > 0) {
+    const pct = 100 * l.reused / l.prompt_tokens;
+    const span = document.createElement('span');
+    span.className = 'reuse ' + (pct >= 70 ? 'good' : pct >= 30 ? 'warning' : 'critical');
+    span.textContent = nf0.format(pct) + '%';
+    const wrap = document.createElement('span');
+    wrap.append(span, ' (' + nf0.format(l.reused) + ' tokens from cache)');
+    row('Reused', wrap);
+  }
+  if (l.n_ctx > 0) {
+    const f = l.n_ctx_used / l.n_ctx;
+    row('Context', nf0.format(l.n_ctx_used) + ' / ' + nf0.format(l.n_ctx) + ' (' + nf0.format(100 * f) + '%)', f);
+  }
+  row('Generated', nf0.format(l.generated) + ' tokens');
+  row('Speed', l.tokens_per_second > 0 ? nf1.format(l.tokens_per_second) + ' tok/s' : '-');
+  row('Drafts accepted', l.drafted > 0 ? nf0.format(l.accepted) + ' / ' + nf0.format(l.drafted) + ' (' + nf0.format(100 * l.accepted / l.drafted) + '%)' : '-');
+}
+
+function renderSummary() {
+  renderQueue();
+  const issues = findIssues();
+  renderAttention(issues);
+  renderDrawer();
+  return issues;
 }
 
 // A round axis maximum: 1, 2 or 5 times a power of ten.
@@ -321,10 +636,10 @@ function draw(chart) {
   g.clearRect(0, 0, w, h);
   const left = 44, right = 8, top = 6, bottom = 18;
   const pw = w - left - right, ph = h - top - bottom;
-  const now = performance.now(), t0 = now - WINDOW_S * 1000;
-  const values = samples.map((s) => s[chart.field]).filter((v) => v !== null && isFinite(v));
+  const now = frozenAt !== null ? frozenAt : performance.now(), t0 = now - windowS * 1000;
+  const values = samples.filter((s) => s.t >= t0 && s.t <= now).map((s) => s[chart.field]).filter((v) => v !== null && isFinite(v));
   const max = chart.max || niceMax(Math.max(0, ...values) * 1.1);
-  const x = (t) => left + pw * (t - t0) / (WINDOW_S * 1000);
+  const x = (t) => left + pw * (t - t0) / (windowS * 1000);
   const y = (v) => top + ph * (1 - Math.min(v, max) / max);
 
   g.font = '11px system-ui, sans-serif';
@@ -335,11 +650,22 @@ function draw(chart) {
   for (let i = 0; i <= 4; i++) {
     const v = max * i / 4, yy = Math.round(y(v)) + 0.5;
     g.beginPath(); g.moveTo(left, yy); g.lineTo(left + pw, yy); g.stroke();
-    g.fillText(nf1.format(v), left - 6, yy);
+    g.fillText(nf2.format(v), left - 6, yy);
   }
   g.textAlign = 'center'; g.textBaseline = 'alphabetic';
-  for (const s of [120, 90, 60, 30, 0]) {
-    g.fillText(s === 0 ? 'now' : '-' + s + 's', Math.min(Math.max(x(now - s * 1000), left + 12), left + pw - 12), h - 4);
+  for (const s of (windowS === 900 ? [900, 720, 540, 360, 180, 0] : [120, 90, 60, 30, 0])) {
+    g.fillText(s === 0 ? (frozenAt !== null ? 'paused' : 'now') : s >= 120 ? '-' + (s / 60) + 'm' : '-' + s + 's', Math.min(Math.max(x(now - s * 1000), left + 12), left + pw - 12), h - 4);
+  }
+
+  if (values.length === 0) {
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.font = '13px system-ui, sans-serif';
+    const label = chart.empty || 'Waiting for data\u2026', lw = g.measureText(label).width + 16;
+    // A surface-coloured plate so the message does not sit on a gridline.
+    g.fillStyle = color('--surface');
+    g.fillRect(left + pw / 2 - lw / 2, top + ph / 2 - 11, lw, 22);
+    g.fillStyle = color('--muted');
+    g.fillText(label, left + pw / 2, top + ph / 2);
   }
 
   // The line, broken where a value is unknown (no previous sample, polling paused).
@@ -347,7 +673,7 @@ function draw(chart) {
   let run = [];
   for (const s of samples) {
     const v = s[chart.field];
-    if (v === null || !isFinite(v) || s.t < t0) { if (run.length) runs.push(run); run = []; continue; }
+    if (v === null || !isFinite(v) || s.t < t0 || s.t > now) { if (run.length) runs.push(run); run = []; continue; }
     run.push([x(s.t), y(v)]);
   }
   if (run.length) runs.push(run);
@@ -365,7 +691,7 @@ function draw(chart) {
 
   const last = samples.length ? samples[samples.length - 1][chart.field] : null;
   canvas.setAttribute('aria-label', canvas.parentNode.querySelector('h2').textContent +
-    ', last two minutes; now ' + orDash(last, nf1.format));
+    ', last ' + (windowS === 900 ? '15 minutes' : 'two minutes') + '; now ' + orDash(last, nf1.format));
 
   // Hover: a crosshair at the nearest sample and its value.
   const tip = canvas.parentNode.querySelector('.tip');
@@ -373,7 +699,7 @@ function draw(chart) {
   let best = null;
   for (const s of samples) {
     const v = s[chart.field];
-    if (v === null || !isFinite(v) || s.t < t0) continue;
+    if (v === null || !isFinite(v) || s.t < t0 || s.t > now) continue;
     if (!best || Math.abs(x(s.t) - chart.hoverX) < Math.abs(x(best.t) - chart.hoverX)) best = s;
   }
   if (!best) { tip.style.display = 'none'; return; }
@@ -383,7 +709,12 @@ function draw(chart) {
   g.beginPath(); g.arc(bx, by, 4, 0, 2 * Math.PI);
   g.fillStyle = color('--series'); g.fill();
   g.strokeStyle = color('--surface'); g.lineWidth = 2; g.stroke();
-  tip.textContent = nf1.format(best[chart.field]) + ' ' + chart.unit + ', ' + nf0.format((now - best.t) / 1000) + ' s ago';
+  let tipText = nf1.format(best[chart.field]) + ' ' + chart.unit + ', ' + fmtAgo(now - best.t);
+  if (best.reqs && best.reqs.length) {
+    tipText += ' \u00b7 request' + (best.reqs.length > 1 ? 's ' : ' ') + best.reqs.slice(0, 3).map((r) => '#' + r).join(', ') +
+      (best.reqs.length > 3 ? ' +' + (best.reqs.length - 3) : '');
+  }
+  tip.textContent = tipText;
   tip.style.display = 'block';
   const tx = canvas.offsetLeft + bx + 10;
   tip.style.left = Math.min(tx, canvas.offsetLeft + w - tip.offsetWidth) + 'px';
@@ -398,12 +729,13 @@ async function tick() {
   try {
     const [metrics, load, slots] = await Promise.all([get('/metrics', false), get('/v1/load', true), get('/slots', true)]);
     const now = performance.now();
-    samples = samples.filter((s) => s.t >= now - WINDOW_S * 1000);
+    samples = samples.filter((s) => s.t >= now - HISTORY_S * 1000);
     const results = [metrics, load, slots];
     const failed = results.find((r) => r.status !== 200);
     $('keybox').classList.toggle('needed', results.some((r) => r.status === 401));
     // A poll still in flight when the tab was hidden must not overwrite "Paused".
     const paused = timer === null && document.hidden;
+    let live = false;
     if (paused) {
       // stop() has said why the page is not updating.
     } else if (results.some((r) => r.status === 0)) {
@@ -413,11 +745,16 @@ async function tick() {
     } else if (failed) {
       setStatus(failed.status === 503 ? 'warning' : 'critical', errorText(failed));
     } else {
-      setStatus('good', 'Live, updated every second');
+      live = true;
     }
     if (metrics.status === 200) onMetrics(metrics.body, now); else { previous = null; samples.push({ t: now, decode: null, prefill: null, accept: null, power: null }); }
     if (load.status === 200 && load.body) onLoad(load.body);
     if (slots.status === 200) onSlots(slots.body);
+    // Tag this sample with the requests running at the time, for the chart tooltips.
+    const lastSample = samples[samples.length - 1];
+    if (lastSample && slots.status === 200) lastSample.reqs = busyLanes().map((l) => l.request_id);
+    const issues = renderSummary();
+    if (live) setStatus(issues.some((i) => i.lvl === 'critical') ? 'critical' : issues.length ? 'warning' : 'good', healthSummary(issues));
     drawAll();
   } finally {
     busy = false;
@@ -458,6 +795,43 @@ $('use-key').addEventListener('click', useKey);
 $('key').addEventListener('keydown', (e) => { if (e.key === 'Enter') useKey(); });
 $('forget-key').addEventListener('click', () => { $('key').value = ''; useKey(); });
 if (apiKey) $('key').placeholder = 'Key set for this tab';
+
+function setRange(seconds) {
+  windowS = seconds;
+  $('range-2m').setAttribute('aria-pressed', String(seconds === 120));
+  $('range-15m').setAttribute('aria-pressed', String(seconds === 900));
+  writeHash();
+  drawAll();
+}
+$('range-2m').addEventListener('click', () => setRange(120));
+$('range-15m').addEventListener('click', () => setRange(900));
+$('pause-charts').addEventListener('click', () => {
+  frozenAt = frozenAt === null ? performance.now() : null;
+  $('pause-charts').setAttribute('aria-pressed', String(frozenAt !== null));
+  $('pause-charts').textContent = frozenAt !== null ? 'Resume charts' : 'Pause charts';
+  drawAll();
+});
+$('d-close').addEventListener('click', () => { selectedLane = null; writeHash(); onSlots(lastSlots); renderDrawer(); });
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && selectedLane !== null) { selectedLane = null; writeHash(); onSlots(lastSlots); renderDrawer(); }
+});
+
+// The address keeps the chart range and the open lane, so a reload or a shared link looks the same.
+{
+  const q = new URLSearchParams(location.hash.slice(1));
+  // The launch scripts print a link ending in #key=...: the part after # stays in the browser and
+  // is never sent to the server. Keep the key for this tab, then drop it from the address bar
+  // (writeHash below rebuilds the address without it).
+  if (q.get('key')) {
+    apiKey = q.get('key');
+    try { sessionStorage.setItem(KEY_STORE, apiKey); } catch (e) { /* storage disabled */ }
+    $('key').placeholder = 'Key set for this tab';
+  }
+  if (q.get('range') === '15m') setRange(900);
+  const lane = Number(q.get('lane'));
+  if (q.has('lane') && Number.isInteger(lane) && lane >= 0) selectedLane = lane;
+  if (q.has('key')) writeHash();
+}
 
 if (!document.hidden) start(); else stop();
 drawAll();
