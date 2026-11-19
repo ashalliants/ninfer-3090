@@ -298,6 +298,7 @@ void validate_policy(LinearPolicy policy) {
     // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
     // one engine-wide setting does not have to be threaded per Op.
     case LinearPolicy::AllowPrefillCublas:
+    case LinearPolicy::AllowPrefillCublasNarrow:
     // The lossy scout's int4 route, registered for the split Q4/Q5 pair's prefill form only.
     case LinearPolicy::ScoutA4Int:
         return;
@@ -854,7 +855,7 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
     }
     // qk fills the head of `qkv`; value_z fills its tail and, from its own second row range, `z`.
     // Both parents read the same activations, so one quantisation serves all three destinations.
-    if (allows_cublas_prefill(policy) && x.ne[1] >= kCublasPrefillMinTokens) {
+    if (allows_cublas_prefill(policy) && x.ne[1] >= cublas_prefill_min_tokens(policy)) {
         const std::int32_t qkv_rows   = qkv.ne[0];
         const std::int32_t z_rows     = z.ne[0];
         const std::int32_t qk_rows    = qk_weight.n;
@@ -866,7 +867,9 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
             {z.data, value_rows, z_rows, z_rows, 0}};
         const detail::CublasProjection parents[] = {
             {&qk_weight, qk_dests, 1}, {&value_z_weight, vz_dests, 2}};
-        if (value_rows > 0 && detail::w4_cublas_projection_supported(parents, 2, x.ne[1])) {
+        if (value_rows > 0 && detail::w4_cublas_projection_supported(parents, 2, x.ne[1]) &&
+            (x.ne[1] >= kCublasPrefillMinTokens ||
+             detail::w4_cublas_projection_fits(workspace, parents, 2, x.ne[1]))) {
             detail::w4_cublas_projection_launch(x, parents, 2, workspace, stream);
             return;
         }
@@ -906,10 +909,10 @@ std::size_t gdn_input_proj_split_workspace_capacity_bytes(
         return std::max(a8, detail::q4_q5_gdn_input_scout_a4_workspace_capacity_bytes(
                                 min_tokens, max_tokens));
     }
-    if (allows_cublas_prefill(policy) && max_tokens >= kCublasPrefillMinTokens) {
+    if (allows_cublas_prefill(policy) && max_tokens >= cublas_prefill_min_tokens(policy)) {
         return std::max(a8, detail::w4_cublas_projection_workspace_capacity_bytes(
                                 std::max(qk_rows, value_z_rows), input_rows,
-                                std::max(min_tokens, kCublasPrefillMinTokens), max_tokens));
+                                std::max(min_tokens, cublas_prefill_min_tokens(policy)), max_tokens));
     }
     return a8;
 }

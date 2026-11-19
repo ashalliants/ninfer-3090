@@ -139,11 +139,12 @@
 #           and for Qwen3.8-Flash-Next: DEVICES STAGE_LAYERS EXPERT_STATE VRAM_HEADROOM_MIB
 #           RAM_HEADROOM_MIB EXPERT_CACHE_MIB CONTEXT_NVME_DIR
 #   on|off: CORS GREEDY NO_THINKING PRESERVE_THINKING TOLERANT_TOOL_CALLS NO_CUDA_GRAPH
-#           NO_PREFIX_REUSE NO_PREFILL_A8 NO_PREFILL_CUBLAS_PROJECTIONS CONTEXT_STORE_COMPRESS
+#           NO_PREFIX_REUSE NO_PREFILL_A8 NO_PREFILL_CUBLAS NO_PREFILL_CUBLAS_PROJECTIONS CONTEXT_STORE_COMPRESS
 #           NO_EXIT_ON_ENGINE_FAILURE ADMISSION_FIT_CHECK PROGRESS_ANCHORS_SHARED MODEL_SUSPEND
 #           NO_AUTO_RESUME LM_HEAD_Q4 LM_HEAD_Q6 EMBEDDING_Q4 EMBEDDING_Q6 NO_EXPERT_STATE
 #           LOSSY_PREFILL_SCOUT_A4 REQUEST_LOG_LOSSY_DETAIL
-# Not here: the repeatable --graft and --context-store-peer, router mode (--models-*), and
+# NINFER_GRAFT (NAME=PATH;NAME=PATH, each --graft) and NINFER_DEFAULT_GRAFT (--default-graft).
+# Not here: the repeatable --context-store-peer, router mode (--models-*), and
 # --allow-unlocked-host-memory (NINFER_ALLOW_UNLOCKED_HOST_MEMORY, Flash-Next only, above). The S3
 # store reads its credentials from the environment (NINFER_S3_ACCESS_KEY_ID,
 # NINFER_S3_SECRET_ACCESS_KEY), never from a flag.
@@ -373,6 +374,14 @@ case "$model_key/$profile" in
       none) spec_label='no speculation' ;;
       *) printf 'NINFER_SPEC must be mtp or none for Qwen3.8-Flash-Next, got %s\n' "$SPEC" >&2; exit 2 ;;
     esac
+    # NINFER_CPU_VERIFY_MISSES=on: each MTP verification round's uncached experts are partly computed
+    # on CPU threads instead of read over PCIe (--cpu-verify-misses; the same output). It needs MTP,
+    # so it is dropped with NINFER_SPEC=none. Off by default; run-v100.sh turns it on.
+    case "${NINFER_CPU_VERIFY_MISSES:-off}" in
+      on)  [[ "$SPEC" != 'mtp' ]] || spec_args+=(--cpu-verify-misses) ;;
+      off) ;;
+      *) printf 'NINFER_CPU_VERIFY_MISSES must be on or off, got %s\n' "$NINFER_CPU_VERIFY_MISSES" >&2; exit 2 ;;
+    esac
     # Prefix reuse (the context cache): checkpoints of the conversation in a pinned Host tier beside
     # the experts, 4 GiB by default; the server shrinks it to what its RAM ledger can spare (off
     # below 512 MiB) and says so. NINFER_PREFIX_CACHE=off turns it off; NINFER_HOST_CONTEXT_MIB sets
@@ -586,7 +595,8 @@ passthrough_value_flags=(
   temperature top-p top-k frequency-penalty seed ngram-min-match
   max-request-mib media-cache-mib media-live-mib media-preprocess-threads vision-max-merged
   response-store-max-records response-store-max-mib context-cost-presets
-  prefill-stall-budget-ms yield-long-prefill-ms prefill-decode-share prefill-layer-slices
+  prefill-stall-budget-ms yield-long-prefill-ms prefill-decode-share prefill-layer-slices hot-embedding-rows
+  cpu-verify-workers
   progress-anchor-tokens sleep-idle-seconds suspend-snapshot suspend-weights
   context-store-ttl-hours context-store-idle-seconds context-store-restore-seconds
   context-store-flush-seconds context-store-peer-poll-ms context-store-s3-endpoint
@@ -596,14 +606,14 @@ passthrough_value_flags=(
   lossy-prefill-recent lossy-prefill-head lossy-prefill-query-rows lossy-prefill-pool-window
   lossy-prefill-skip lossy-prefill-strategy lossy-prefill-summary-max-tokens
   devices stage-layers expert-state vram-headroom-mib ram-headroom-mib expert-cache-mib
-  context-nvme-dir
+  context-nvme-dir prefill-cpu-all-columns prefill-cpu-max-columns prefill-cpu-share ngram-ram-mib
 )
 passthrough_switch_flags=(
   cors greedy no-thinking preserve-thinking tolerant-tool-calls no-cuda-graph no-prefix-reuse
-  no-prefill-a8 no-prefill-cublas-projections context-store-compress no-exit-on-engine-failure
+  no-prefill-a8 no-prefill-cublas no-prefill-cublas-projections context-store-compress no-exit-on-engine-failure
   admission-fit-check progress-anchors-shared model-suspend no-auto-resume
   lm-head-q4 lm-head-q6 embedding-q4 embedding-q6 lossy-prefill-scout-a4 request-log-lossy-detail
-  no-expert-state
+  no-expert-state mtp-staged-drafts
 )
 env_name_for_flag() { printf 'NINFER_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; }
 for flag in "${passthrough_value_flags[@]}"; do
@@ -621,6 +631,19 @@ done
 
 if [[ -n "${NINFER_CHAT_TEMPLATE:-}" ]]; then
   profile_args+=(--chat-template "$NINFER_CHAT_TEMPLATE")
+fi
+# Grafts: NINFER_GRAFT is one or more NAME=PATH entries separated by ';' (a path may hold spaces
+# or commas), each passed as --graft; NINFER_DEFAULT_GRAFT names the one requests get when they
+# state none (--default-graft). On Qwen3.8-Flash-Next a graft is a refusal-steering vector
+# (docs/serving.md, "Refusal steering on Qwen3.8-Flash-Next"); ninfer-serve checks each entry.
+if [[ -n "${NINFER_GRAFT:-}" ]]; then
+  IFS=';' read -r -a graft_entries <<< "$NINFER_GRAFT"
+  for graft_entry in ${graft_entries[@]+"${graft_entries[@]}"}; do
+    [[ -z "$graft_entry" ]] || profile_args+=(--graft "$graft_entry")
+  done
+fi
+if [[ -n "${NINFER_DEFAULT_GRAFT:-}" ]]; then
+  profile_args+=(--default-graft "$NINFER_DEFAULT_GRAFT")
 fi
 # Names for the Host check (a DNS alias, a proxy's public name). ninfer-serve refuses a value that
 # is not a plain host name or address, naming it, so nothing is checked here.

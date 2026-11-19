@@ -122,6 +122,14 @@ inline constexpr std::size_t kCublasTileBudgetBytes = 256u << 20;
                                                                     std::int32_t min_tokens,
                                                                     std::int32_t max_tokens);
 
+// Whether the route's scratch for one call of `tokens` tokens fits in what is left of `workspace`.
+// A prefill-phase call narrower than kCublasPrefillMinTokens (LinearPolicy::AllowPrefillCublasNarrow)
+// checks this before taking the route: its workspace was planned for the chunk width, which covers
+// it whenever the chunk reaches the wide gate, and the call falls back to the narrow routes when
+// it does not.
+[[nodiscard]] bool w4_cublas_prefill_fits(const WorkspaceArena& workspace, std::int32_t rows,
+                                          std::int32_t cols, std::int32_t tokens);
+
 // out[i, t] = silu(C[i, t]) * C[i + out_rows, t], with C the int32 GEMM rescaled by
 // row_scale[row] * token_scale[t].
 void w4_cublas_swiglu_launch(const Tensor& x, const Weight& gate_up, Tensor& out,
@@ -156,6 +164,11 @@ struct CublasProjection {
                                                                         std::int32_t cols,
                                                                         std::int32_t min_tokens,
                                                                         std::int32_t max_tokens);
+
+// w4_cublas_prefill_fits for a split-parent projection.
+[[nodiscard]] bool w4_cublas_projection_fits(const WorkspaceArena& workspace,
+                                             const CublasProjection* parents, int parent_count,
+                                             std::int32_t tokens);
 
 void w4_cublas_projection_launch(const Tensor& x, const CublasProjection* parents, int parent_count,
                                  WorkspaceArena& workspace, cudaStream_t stream);

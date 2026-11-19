@@ -7,4 +7,5 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/select_sliced.cu"
   "${CMAKE_CURRENT_LIST_DIR}/attention_split.cu"
   "${CMAKE_CURRENT_LIST_DIR}/attention_wide.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/attention_wide_hmma.cu"
 )

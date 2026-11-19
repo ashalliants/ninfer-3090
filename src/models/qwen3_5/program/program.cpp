@@ -292,6 +292,7 @@ std::optional<CapturePreparation> Program::prepare_capture(SequenceHandle h) {
 void Program::skip_capture(SequenceHandle h) { impl_->skip_capture(h); }
 
 bool Program::start_demote(const ContextDemotion& plan) { return impl_->start_demote(plan); }
+bool Program::start_state_writeback() { return impl_->start_state_writeback(); }
 
 ContextReclaimPlan Program::plan_reclaim(std::span<const CheckpointHandle> allowed,
                                          std::span<const CheckpointHandle> excluded,

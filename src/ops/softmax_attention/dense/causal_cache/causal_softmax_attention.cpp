@@ -363,10 +363,20 @@ constexpr std::array<std::array<std::int8_t, 10>, 6> kH16ChunkTokens{{
     {6, 6, 6, 6, 6, 6, 6, 6, 6, 6}, // > 8198
 }};
 
+#if defined(NINFER_SM70)
+constexpr std::int32_t kVoltaVerifyChunkTokens = 2;
+#endif
+
 std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t width,
                                            std::int32_t batch_size, KvCacheStorage storage,
                                            CausalAttentionExecutionEnvelope envelope) {
     if (batch_size != 1 || !int8_family_storage(storage)) { return q_heads == 16 ? 6 : 8; }
+#if defined(NINFER_SM70)
+    // Two tokens keep a chunk on one row tile (12 rows on the 27B, 16 on the 35B), the row-tile
+    // count the partial kernel's dp4a / CUDA-core path serves (small_t_i8.cuh, SimtDecode); wider
+    // chunks run its QK and PV on the shuffle emulation of mma (resolve_route below).
+    return kVoltaVerifyChunkTokens;
+#endif
     const std::uint32_t tier = int8_family_chunk_tier(q_heads, envelope.max_visible_keys);
     if (q_heads == 16) { return kH16ChunkTokens[tier][static_cast<std::size_t>(width - 7)]; }
     // INT8-G64 keeps 5 + 4/5 at W 9-10 above 8198 keys too, as it did; there rk8v4 measured 2-3 %
@@ -380,6 +390,52 @@ struct SmallTWorkspace {
     Tensor m;
     Tensor l;
 };
+
+#if defined(NINFER_SM70)
+// The prompt route on sm_70 (launch.h, kVoltaFlash*): FP16 tensor-core flash attention where the
+// INT8 prompt kernel would run emulated mma. One sequence, the two shipped geometries, INT8 G64 KV.
+bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width, std::int32_t batch_size,
+                                KvCacheStorage cache_storage) {
+    // The two geometries the launcher instantiates (geometry.cuh: CausalD256H24Kv4,
+    // CausalD256H16Kv2), by query heads.
+    const bool supported_geometry = q_heads == 24 || q_heads == 16;
+    return supported_geometry && batch_size == 1 && cache_storage == KvCacheStorage::Int8Group64 &&
+           width >= detail::kVoltaFlashMinimumWidth;
+}
+
+struct VoltaFlashWorkspace {
+    Tensor k_gathered;
+    Tensor v_gathered;
+    Tensor mask;
+    Tensor q_f32;
+    Tensor out_f32;
+    Tensor dst_meta;
+};
+
+template <class Allocator>
+VoltaFlashWorkspace allocate_volta_flash_workspace(Allocator& workspace, std::int32_t q_heads,
+                                                   std::int32_t width,
+                                                   CausalAttentionExecutionEnvelope envelope) {
+    const std::int32_t kv_heads = q_heads == 24 ? 4 : 2; // CausalD256H24Kv4 / CausalD256H16Kv2
+    const auto visible          = static_cast<std::int32_t>(envelope.max_visible_keys);
+    const std::int32_t n_kv =
+        ((visible + detail::kVoltaFlashKeyPad - 1) / detail::kVoltaFlashKeyPad) *
+        detail::kVoltaFlashKeyPad;
+    const std::int32_t tokens = std::min(width, detail::kVoltaFlashQBlockTokens);
+    return {
+        workspace.alloc(DType::FP16, {kHeadDim, kv_heads, n_kv, 1}),
+        workspace.alloc(DType::FP16, {kHeadDim, kv_heads, n_kv, 1}),
+        workspace.alloc(DType::FP16, {n_kv, tokens + detail::kVoltaFlashMaskRowPad, 1, 1}),
+        workspace.alloc(DType::FP32, {kHeadDim, q_heads, tokens, 1}),
+        workspace.alloc(DType::FP32, {kHeadDim, q_heads, tokens, 1}),
+        workspace.alloc(DType::FP32,
+                        {2,
+                         static_cast<std::int32_t>(
+                             detail::causal_attention_volta_flash_meta_elements(q_heads, tokens)),
+                         1, 1}),
+    };
+}
+#endif
 
 template <class Allocator>
 SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t q_heads,
@@ -464,6 +520,16 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
         envelope.max_visible_keys <= int8_family_prompt_keys(q_heads, width, storage)) {
         return CausalAttentionRoute::Prompt;
     }
+#if defined(NINFER_SM70)
+    // sm_70: a single-sequence INT8-family verify of three or more columns runs as two-token
+    // chunks on the CUDA-core small-T path rather than one launch on emulated mma. Qwen3.8-27B,
+    // ~2.1K keys, an MTP5 verify (T=6): 328 us -> three chunks of 54 us (nsys; see
+    // causal_attention_chunk_tokens).
+    if (int8_family && batch_size == 1 && width > kVoltaVerifyChunkTokens &&
+        width <= kMaximumVerifyTokens) {
+        return CausalAttentionRoute::ChunkedSmallT;
+    }
+#endif
     if (q_heads == 24 && width <= kMaximumVerifyTokens) {
         if (batch_size == 1 && !int8_family) {
             std::uint32_t prompt_limit = 0;
@@ -543,9 +609,19 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     // (prompt_i8_fa2_plan.h).
     const bool int8_family     = int8_family_storage(cache_storage);
     const auto prompt_capacity = [&](std::int32_t width) {
+#if defined(NINFER_SM70)
+        // The flash route replaces the INT8 prompt kernel wherever it applies (the dispatch in
+        // causal_softmax_attention), so it is that call's whole workspace.
+        if (volta_flash_route_possible(q_heads, width, batch_size, cache_storage)) {
+            WorkspaceLayoutBuilder layout;
+            (void)allocate_volta_flash_workspace(layout, q_heads, width, envelope);
+            return layout.peak_bytes(1);
+        }
+#endif
         if (!int8_family) { return std::size_t{0}; }
         const detail::CausalPromptFa2Plan plan = detail::causal_prompt_fa2_plan(
-            q_heads, width, envelope.max_visible_keys, execution.multiprocessor_count);
+            q_heads, width, envelope.max_visible_keys, execution.multiprocessor_count,
+            detail::causal_prompt_fa2_eight_warps_fit(cache_storage != KvCacheStorage::Int8Group64));
         return detail::causal_prompt_fa2_split_bytes(q_heads, width, plan.splits);
     };
     const auto chunk_capacity = [&](std::int32_t width) {
@@ -581,10 +657,16 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         }
     }
     // Wider calls are single-row prompt launches; only an INT8-family split needs scratch, and a
-    // split needs at least two runs of kCausalPromptFa2MinPagesPerSplit pages.
+    // split needs at least two runs of kCausalPromptFa2MinPagesPerSplit pages. On sm_70 the flash
+    // route's staging needs scratch at every key count.
+#if defined(NINFER_SM70)
+    constexpr bool kPromptScratchAtAnyKeys = true;
+#else
+    constexpr bool kPromptScratchAtAnyKeys = false;
+#endif
     if (max_width > kMaximumVerifyTokens && int8_family &&
-        detail::causal_prompt_fa2_pages(envelope.max_visible_keys) >=
-            2 * detail::kCausalPromptFa2MinPagesPerSplit) {
+        (kPromptScratchAtAnyKeys || detail::causal_prompt_fa2_pages(envelope.max_visible_keys) >=
+                                        2 * detail::kCausalPromptFa2MinPagesPerSplit)) {
         for (std::int32_t width = std::max(min_width, kMaximumVerifyTokens + 1);
              width <= max_width; ++width) {
             maximum = std::max(maximum, prompt_capacity(width));
@@ -634,10 +716,20 @@ CausalAttentionLaunchShape causal_softmax_attention_launch_shape(
     // An INT8-family prompt launch's CTA shape and split choice are distinct kernel instantiations
     // and part of the route, and a launch that splits its keys adds the merge kernel.
     CausalAttentionLaunchShape shape{.route = static_cast<std::uint32_t>(route), .kernel_nodes = 2U};
+#if defined(NINFER_SM70)
+    if (route == detail::CausalAttentionRoute::Prompt &&
+        volta_flash_route_possible(geometry.query_heads, tokens, batch_size, cache_storage)) {
+        shape.route |= 1U << 18U;
+        shape.kernel_nodes = detail::causal_attention_volta_flash_kernel_nodes(
+            geometry.query_heads, true, tokens, static_cast<std::int32_t>(envelope.max_visible_keys));
+        return shape;
+    }
+#endif
     if (route == detail::CausalAttentionRoute::Prompt && int8_family_storage(cache_storage)) {
         const detail::CausalPromptFa2Plan plan = detail::causal_prompt_fa2_plan(
             geometry.query_heads, tokens, envelope.max_visible_keys,
-            execution.multiprocessor_count);
+            execution.multiprocessor_count,
+            detail::causal_prompt_fa2_eight_warps_fit(cache_storage != KvCacheStorage::Int8Group64));
         shape.route |= (plan.warps == 4 ? 1U : 0U) << 16U;
         if (plan.splits > 1) {
             shape.route |= 1U << 17U;
@@ -699,6 +791,18 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     auto scope                = workspace.scope();
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], width, batch, cache.storage, envelope);
+#if defined(NINFER_SM70)
+    if (route == detail::CausalAttentionRoute::Prompt &&
+        volta_flash_route_possible(q.ne[1], width, batch, cache.storage)) {
+        VoltaFlashWorkspace staging =
+            allocate_volta_flash_workspace(workspace, q.ne[1], width, envelope);
+        detail::causal_attention_volta_flash_launch(
+            q, k, v, positions, valid_columns, kv_table_rows, scale, cache, envelope,
+            detail::kVoltaFlashQBlockTokens, staging.k_gathered, staging.v_gathered, staging.mask,
+            staging.q_f32, staging.out_f32, staging.dst_meta, out, stream);
+        return;
+    }
+#endif
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
         launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
                                envelope, workspace, out, stream);
@@ -769,6 +873,20 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     auto scope                = workspace.scope();
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], q.ne[2], 1, cache.storage, envelope);
+#if defined(NINFER_SM70)
+    if (route == detail::CausalAttentionRoute::Prompt &&
+        volta_flash_route_possible(q.ne[1], q.ne[2], 1, cache.storage)) {
+        VoltaFlashWorkspace staging =
+            allocate_volta_flash_workspace(workspace, q.ne[1], q.ne[2], envelope);
+        Tensor table_rows; // null: the view's single table row
+        detail::causal_attention_volta_flash_launch(
+            q, Tensor{}, Tensor{}, positions, Tensor{}, table_rows, scale,
+            single_row_paged_kv_batch_view(cache), envelope, detail::kVoltaFlashQBlockTokens,
+            staging.k_gathered, staging.v_gathered, staging.mask, staging.q_f32, staging.out_f32,
+            staging.dst_meta, out, stream);
+        return;
+    }
+#endif
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
         launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream);
         return;

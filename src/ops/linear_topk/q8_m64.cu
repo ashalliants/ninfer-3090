@@ -1,3 +1,4 @@
+#include "ops/common/smem_limit.h"
 #include "core/weight.h"
 #include "ops/linear_topk/linear_topk_launch.h"
 
@@ -328,6 +329,7 @@ void launch_tile(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
     constexpr int shared_bytes =
         sizeof(M64ReusableStorage<TileColumns, kBlockK, kRowsPerProducer>) +
         (kRowsPerProducer > 64 ? TileColumns * kLinearTopK * sizeof(std::uint64_t) : 0);
+    static_assert(shared_bytes <= kMaxDynamicSharedBytes, "exceeds the target's per-block shared memory");
     if constexpr (shared_bytes > 48 * 1024) {
         CUDA_CHECK(
             cudaFuncSetAttribute(q8_m64_linear_topk_kernel<TileColumns, kBlockK, kRowsPerProducer>,

@@ -1,4 +1,5 @@
 // ninfer::ops::detail - group-16 NVFP4 split-KV small-T launch ownership.
+#include "ops/common/smem_limit.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include "core/device.h"
@@ -28,6 +29,7 @@ void launch_nvfp4_partial(const Tensor& q, CacheInput input, const Tensor& posit
     const auto launch = [&]() {
         auto kernel = causal_attention_small_t_nvfp4_tiled_kernel<
             Geometry, TokenTile, Warps, MinBlocks, KeyBlock, true, MultiBatch, Masked, KernelInput>;
+        static_assert(DynamicBytes <= kMaxDynamicSharedBytes);
         configure_cuda_device_once([&] {
             return cudaFuncSetAttribute(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(DynamicBytes));

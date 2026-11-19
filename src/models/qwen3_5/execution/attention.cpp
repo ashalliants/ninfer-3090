@@ -21,7 +21,12 @@ void require_rope_axes(const Tensor& positions, const RopeConfig& config) {
 } // namespace
 
 std::size_t attention_projection_workspace_bytes(const AttentionParameters& parameters,
-                                                 std::int32_t first, std::int32_t last) {
+                                                 std::int32_t first, std::int32_t last,
+                                                 bool prefill) {
+    // The policy attention_projection() runs with (prefill: ops::prefill_phase_policy).
+    const auto policy = [&](ops::LinearPolicy own) {
+        return prefill ? ops::prefill_phase_policy(own) : own;
+    };
     if (first <= 0 || last < first) {
         throw std::invalid_argument("attention projection: invalid column interval");
     }
@@ -31,28 +36,33 @@ std::size_t attention_projection_workspace_bytes(const AttentionParameters& para
         return rotated_workspace_bytes(
             signs, weight.k, last,
             ops::attn_input_proj_workspace_capacity_bytes(weight.qtype, weight.n, weight.k,
-                                                          single->policy, first, last));
+                                                          policy(single->policy), first, last));
     }
     const auto& pair = std::get<ops::PairedProjectionWeights>(parameters.projection);
     return rotated_workspace_bytes(signs, pair.first.k, last,
                                    ops::attn_input_proj_split_workspace_capacity_bytes(
                                        pair.first.qtype, pair.first.n, pair.second.qtype,
-                                       pair.second.n, pair.first.k, pair.policy, first, last));
+                                       pair.second.n, pair.first.k, policy(pair.policy), first,
+                                       last));
 }
 
 void attention_projection(const Tensor& hidden, const AttentionParameters& parameters,
                           Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
-                          WorkspaceArena& workspace, cudaStream_t stream, InputBasis basis) {
+                          WorkspaceArena& workspace, cudaStream_t stream, InputBasis basis,
+                          bool prefill) {
     auto scope = workspace.scope();
     const Tensor x =
         rotated_input(hidden, projection_signs(parameters.projection), workspace, stream, basis);
+    const auto policy = [&](ops::LinearPolicy own) {
+        return prefill ? ops::prefill_phase_policy(own) : own;
+    };
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
-        ops::attn_input_proj(x, pair->first, pair->second, query, gate, key, value, pair->policy,
-                             workspace, stream);
+        ops::attn_input_proj(x, pair->first, pair->second, query, gate, key, value,
+                             policy(pair->policy), workspace, stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
-        ops::attn_input_proj(x, single.weight, query, gate, key, value, single.policy, workspace,
-                             stream);
+        ops::attn_input_proj(x, single.weight, query, gate, key, value, policy(single.policy),
+                             workspace, stream);
     }
 }
 

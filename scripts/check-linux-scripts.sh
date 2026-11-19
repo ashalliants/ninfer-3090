@@ -359,6 +359,38 @@ banner="$(banner_of NINFER_ALLOWED_HOST=gpubox.lan -- qwen38-27b)"
   exit 1
 }
 
+# NINFER_NO_PREFILL_CUBLAS=on turns the cuBLAS prefill route off (on by default in sm_70 builds,
+# and set by the 27B MTP profile). It must follow --config: ninfer-serve reads the file's words
+# first and the command line's after, so the later --no-prefill-cublas wins.
+recorded="$(record no_cublas NINFER_SPEC=mtp NINFER_NO_PREFILL_CUBLAS=on -- qwen38-27b)"
+expect_flags '27B NINFER_NO_PREFILL_CUBLAS=on' "$recorded" '--no-prefill-cublas'
+mapfile -t raw_words < "$recorded.raw"
+config_at=-1 no_cublas_at=-1
+for i in "${!raw_words[@]}"; do
+  [[ "${raw_words[$i]}" == --config ]] && config_at=$i
+  [[ "${raw_words[$i]}" == --no-prefill-cublas ]] && no_cublas_at=$i
+done
+(( config_at >= 0 && no_cublas_at > config_at )) || {
+  printf 'run.sh must pass --no-prefill-cublas after --config (got --config at %s, it at %s)\n' \
+    "$config_at" "$no_cublas_at" >&2
+  exit 1
+}
+refuse_flag '27B default' "$(record cublas_default -- qwen38-27b)" '--no-prefill-cublas'
+
+# NINFER_GRAFT: each ';'-separated NAME=PATH (a path may hold spaces or commas) becomes one --graft;
+# NINFER_DEFAULT_GRAFT passes --default-graft; unset, there is neither.
+recorded="$(record graft NINFER_GRAFT='uncensored=/v/a b,c.gguf;;other=/v/o.gguf' \
+  NINFER_DEFAULT_GRAFT=uncensored -- qwen38-27b)"
+expect_flags '27B NINFER_GRAFT' "$recorded" '--default-graft uncensored'
+grep -Fxq -- '--graft uncensored=/v/a b,c.gguf' "$recorded" && grep -Fxq -- '--graft other=/v/o.gguf' "$recorded" &&
+  [[ "$(grep -c -- '^--graft ' "$recorded")" == 2 ]] || {
+  printf 'run.sh did not pass NINFER_GRAFT as two --graft entries:\n%s\n' "$(cat -- "$recorded")" >&2
+  exit 1
+}
+recorded="$(record graft_none -- qwen38-27b)"
+refuse_flag '27B default' "$recorded" '--graft'
+refuse_flag '27B default' "$recorded" '--default-graft'
+
 # An explicit override beats the profile's default; vision can be turned off.
 recorded="$(record override NINFER_CONTEXT=65536 NINFER_PREFILL_CHUNK=1024 NINFER_CONCURRENCY=2 \
   NINFER_VISION=off -- qwen38-27b)"
@@ -1069,5 +1101,23 @@ out="$(run_graft HF_TOKEN=t NINFER_GRAFT_DIR="$tmp/graft-afile/sub")" || graft_f
 graft_reset
 run_graft HF_TOKEN=t NINFER_GRAFTS=off >/dev/null || graft_fail 'NINFER_GRAFTS=off failed the model download'
 [[ ! -s "$GRAFT_LOG" && ! -e "$gdir" ]] || graft_fail 'NINFER_GRAFTS=off still fetched'
+
+# scripts/run-v100.sh finds the server scripts/v100_build.sh built: in BUILD_DIR when it is set,
+# else in that script's default, $HOME/build-v100, wherever the checkout is.
+v100_fail() { printf 'run-v100.sh: %s\n' "$1" >&2; exit 1; }
+for layout in build-dir home; do
+  v100_home="$tmp/v100-$layout-home"; v100_tree="$tmp/v100-$layout-tree"
+  [[ "$layout" == home ]] && v100_tree="$v100_home/build-v100"
+  mkdir -p -- "$v100_home" "$v100_tree/apps"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$0" > "$NINFER_TEST_WHO"\nprintf "%%s\\n" "$@" > "$NINFER_TEST_ARGS"\n' \
+    > "$v100_tree/apps/ninfer-serve"
+  chmod +x "$v100_tree/apps/ninfer-serve"
+  v100_build=(); [[ "$layout" == build-dir ]] && v100_build=(BUILD_DIR="$v100_tree")
+  clear_env HOME="$v100_home" NINFER_TEST_WHO="$tmp/v100.who" NINFER_TEST_ARGS="$tmp/v100.args" \
+    NINFER_MODEL_DIR="$tmp" ${v100_build[@]+"${v100_build[@]}"} "$root/run-v100.sh" qwen38-27b \
+    >/dev/null 2>&1 || v100_fail "($layout) did not start the server it built"
+  [[ "$(cat -- "$tmp/v100.who")" == "$v100_tree/apps/ninfer-serve" ]] ||
+    v100_fail "($layout) started $(cat -- "$tmp/v100.who"), not $v100_tree/apps/ninfer-serve"
+done
 
 printf '%s\n' 'Linux script checks passed.'

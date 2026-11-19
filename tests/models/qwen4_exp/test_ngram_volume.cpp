@@ -327,6 +327,47 @@ int main() {
         }
 
         {
+            // --ngram-ram-mib: the volume's first half of blocks held in RAM. Once loaded, a cold
+            // call's rows in them are copied from RAM (no block read, not cached), the others read
+            // as before; every row equals the oracle.
+            q4::NgramVolume volume(path, table);
+            check(q4::NgramVolume::ram_bytes(table, ~std::uint64_t{0}) == table.blocks * kBlockBytes,
+                  "ram_bytes is at most the whole volume");
+            check(q4::NgramVolume::ram_bytes(table, kBlockBytes + 100) == kBlockBytes, "ram_bytes is whole blocks");
+            const std::uint64_t half = table.blocks / 2;
+            volume.hold_in_ram(half * kBlockBytes);
+            check(volume.ram_blocks_wanted() == half, "hold_in_ram takes the blocks asked for");
+            bool threw = false;
+            try {
+                volume.hold_in_ram(kBlockBytes);
+            } catch (const std::logic_error&) { threw = true; }
+            check(threw, "hold_in_ram is called once");
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+            while (volume.ram_blocks_loaded() < half && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            check(volume.ram_blocks_loaded() == half, "the loader holds every block asked for");
+            std::mt19937 rng(20261118);
+            std::vector<std::uint32_t> cold(6000);
+            for (auto& r : cold) { r = static_cast<std::uint32_t>(rng() % kRows); }
+            std::uint64_t in_ram = 0;
+            std::set<std::uint32_t> on_disk;
+            for (const auto r : cold) {
+                if (r / kRowsPerBlock < half) {
+                    ++in_ram;
+                } else {
+                    on_disk.insert(r / kRowsPerBlock);
+                }
+            }
+            check(in_ram > 1000 && !on_disk.empty(), "the rows lie on both sides of the held prefix");
+            const auto before = volume.counters();
+            check(rows_match(cold, read(volume, cold)), "rows from RAM and from the drive equal the oracle");
+            check(volume.counters().ram - before.ram == in_ram, "every row of a held block is copied from RAM");
+            check(volume.counters().reads - before.reads == on_disk.size(), "only the other blocks are read");
+            check(rows_match(cold, read(volume, cold)), "the same rows again equal the oracle");
+        }
+
+        {
             // The prefetch: the anchor column's rows read while the draft graph runs are cached
             // when verification reads the whole window (anchor and drafts).
             q4::NgramVolume volume(path, table);

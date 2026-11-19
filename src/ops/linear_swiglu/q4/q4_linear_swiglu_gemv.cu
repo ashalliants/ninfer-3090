@@ -5,7 +5,9 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "core/device.h" // CUDA_CHECK
+#include "ops/linear/common/stream_gemv.cuh"
 #include "ops/linear/q4/q4_ksplit_mma.cuh"
+#include "ops/linear/q4/q4_rowsplit_storage.cuh"
 #include "ops/linear/q4/q4_small_t_mma_i8.cuh"
 
 #include <cuda_bf16.h>
@@ -332,13 +334,53 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
     if (lane == 0) { out[out_row] = __float2bfloat16(silu(gate_acc) * up_acc); }
 }
 
+// The streaming GEMV's pair sink: the same finish as the kernels above, gate in acc[0][t], up in
+// acc[1][t], token t's row at out + t * out_stride.
+struct Q4SwiGluStreamSink {
+    __nv_bfloat16* out;
+    std::int64_t out_stride;
+
+    template <int Cols>
+    __device__ __forceinline__ void finish(int row, const float (&acc)[2][Cols]) const {
+#pragma unroll
+        for (int t = 0; t < Cols; ++t) {
+            out[t * out_stride + row] = __float2bfloat16(silu(acc[0][t]) * acc[1][t]);
+        }
+    }
+    Q4SwiGluStreamSink with_token_offset(std::int32_t begin) const {
+        return {out + begin * out_stride, out_stride};
+    }
+};
+
+// Gate row r and up row r + kIntermediate as one streaming-GEMV item (stream_gemv.cuh), for
+// tokens 1..kStreamGemvMaxTokens. Returns false when the streaming GEMV is off or the tensors do
+// not fit it.
+bool try_launch_swiglu_stream(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    const std::int64_t x_stride   = x.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
+    const std::int64_t out_stride = out.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
+    const auto* x_data            = static_cast<const __nv_bfloat16*>(x.data);
+    const Q4StreamFormat::Planes planes{static_cast<const std::uint8_t*>(w.qdata),
+                                        static_cast<const std::uint8_t*>(w.scales)};
+    const Q4SwiGluStreamSink sink{static_cast<__nv_bfloat16*>(out.data), out_stride};
+    return try_launch_stream_gemv_passes<Q4StreamFormat, 2>(x_data, x_stride, planes, sink,
+                                                            kIntermediate, kIntermediate, kK, kK,
+                                                            stream, x.ne[1]);
+}
+
 } // namespace
+
+bool q4_linear_swiglu_try_stream(const Tensor& x, const Weight& w, Tensor& out,
+                                 cudaStream_t stream) {
+    return w.n == kN && w.k == kK && w.padded_shape[1] == kK &&
+           try_launch_swiglu_stream(x, w, out, stream);
+}
 
 void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor& out,
                                        cudaStream_t stream) {
     if (w.n != kN || w.k != kK || w.padded_shape[1] != kK) {
         throw std::invalid_argument("q4 linear_swiglu GEMV requires weight [34816,5120]");
     }
+    if (try_launch_swiglu_stream(x, w, out, stream)) return;
     const int grid = kIntermediate / kPairsPerBlock;
     q4_linear_swiglu_gemv_pair_kernel<<<grid, kBlockThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
@@ -350,6 +392,13 @@ void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Ten
                                            cudaStream_t stream) {
     if (x.ne[1] < 2 || x.ne[1] > 32) {
         throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..32");
+    }
+    // T = 2..32 (speculative verification, short prompts): the streaming GEMV decodes each weight
+    // once for every token (in passes of eight), where the small-T kernel below runs mma.sync --
+    // emulated, and compute-bound, on sm_70.
+    if (w.n == kN && w.k == kK && w.padded_shape[1] == kK &&
+        try_launch_swiglu_stream(x, w, out, stream)) {
+        return;
     }
     // A width that fills its tile needs no runtime column count, and dropping it is worth 2-4% at
     // sixteen and twenty-four columns (bench/ops/q4_linear_swiglu_schedule_bench.cu prices it

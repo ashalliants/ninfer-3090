@@ -12,6 +12,14 @@
 namespace ninfer::ops {
 
 /**
+ * @brief Linear calls since process start that the sm_70 FP16 tensor-core route
+ * (NINFER_SM70_TENSOR_CORES=1) handed back to the default kernels because the call's workspace
+ * was short of its staging. Zero on every other architecture. The ops library does not log
+ * (docs/maintainer/logging.md); an owner with a diagnostic channel reports a rise.
+ */
+std::uint64_t sm70_tensor_core_fallbacks() noexcept;
+
+/**
  * @brief Permitted private activation-compute profiles for a linear projection.
  *
  * The policy constrains private route selection; it does not select a kernel or prescribe a
@@ -54,6 +62,12 @@ enum class LinearPolicy : std::uint8_t {
     /// engine. Only GGML block-format weights admit it: Linear and LinearAdd reject it for every
     /// other format, and wider calls (T > 8) take AllowA8's route.
     AllowA8GgmlDecodeMma,
+    /// AllowPrefillCublas for a prefill-phase call: the same routes, with the cuBLAS route admitted
+    /// from kCublasPrefillNarrowMinTokens instead of kCublasPrefillMinTokens. Never stored in a
+    /// weight's parameters: the model's prefill layers derive it per call through
+    /// prefill_phase_policy, so decode and verify rounds -- which share the weights and policies --
+    /// keep the wide gate, their workspace and their numerics.
+    AllowPrefillCublasNarrow,
 };
 
 /// The policies every Linear-family Op accepts. ScoutA4Int is deliberately absent: only the four
@@ -62,7 +76,8 @@ enum class LinearPolicy : std::uint8_t {
     return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
            policy == LinearPolicy::AllowA4 || policy == LinearPolicy::AllowA8Int ||
            policy == LinearPolicy::AllowA8IntDecode || policy == LinearPolicy::AllowPrefillCublas ||
-           policy == LinearPolicy::AllowA8GgmlDecodeMma;
+           policy == LinearPolicy::AllowA8GgmlDecodeMma ||
+           policy == LinearPolicy::AllowPrefillCublasNarrow;
 }
 
 [[nodiscard]] constexpr bool allows_a8(LinearPolicy policy) noexcept {
@@ -76,7 +91,8 @@ enum class LinearPolicy : std::uint8_t {
 /// Integer-A8 (s8 activation, groupwise-int weight) profiles. Never implies the FP8 A8 path.
 [[nodiscard]] constexpr bool allows_a8_int(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::AllowA8Int || policy == LinearPolicy::AllowA8IntDecode ||
-           policy == LinearPolicy::AllowPrefillCublas || policy == LinearPolicy::ScoutA4Int;
+           policy == LinearPolicy::AllowPrefillCublas || policy == LinearPolicy::ScoutA4Int ||
+           policy == LinearPolicy::AllowPrefillCublasNarrow;
 }
 
 /// The scout's int4-activation route for Q4_G64_FP16 matrices (LinearPolicy::ScoutA4Int).
@@ -100,7 +116,8 @@ enum class LinearPolicy : std::uint8_t {
 /// The cuBLAS prefill route. Only ever admitted above `kCublasPrefillMinTokens`, because its
 /// dequantise pass is weight-sized and has to be amortised over the tokens in the call.
 [[nodiscard]] constexpr bool allows_cublas_prefill(LinearPolicy policy) noexcept {
-    return policy == LinearPolicy::AllowPrefillCublas;
+    return policy == LinearPolicy::AllowPrefillCublas ||
+           policy == LinearPolicy::AllowPrefillCublasNarrow;
 }
 
 /// Below this width the route can lose to the route it replaces: the dequantise pass costs the same
@@ -115,6 +132,35 @@ enum class LinearPolicy : std::uint8_t {
 /// kMaximumConcurrency lanes of draft window + 1 tokens, 8 x 16 = 128 columns, through these same
 /// Ops and policies, and those widths must stay off the route (startup.cpp asserts it).
 inline constexpr std::int32_t kCublasPrefillMinTokens = 129;
+
+/// The route's gate for a prefill-phase call (LinearPolicy::AllowPrefillCublasNarrow). On sm_70 the
+/// routes below the wide gate ran emulated mma at ~12 ms per token per pass of the 27B against the
+/// route's ~90 ms per pass (its weight-sized dequantise) plus well under a millisecond per token;
+/// the streaming GEMV now takes 1..64 tokens of the Q4/Q5 weights (tensor-core tiles of 32 and 16
+/// tokens, ops/linear/common/stream_tile_gemm.cuh; kStreamGemvMaxTokens), so the narrow gate starts
+/// above it. Qwen3.8-27B prefill on a V100: the route ran 48 / 64 / 96 / 128 tokens at 196 / 262 /
+/// 321 / 416 tok/s against ~355 for the tiles, so the crossover is near 100 tokens; 65 keeps the
+/// tiles to whole multiples of their widths' useful range.
+/// Elsewhere the narrow gate is the wide one (the int8 route loses at narrow aligned widths on the
+/// 3090: see above).
+#if defined(NINFER_SM70)
+inline constexpr std::int32_t kCublasPrefillNarrowMinTokens = 65;
+#else
+inline constexpr std::int32_t kCublasPrefillNarrowMinTokens = kCublasPrefillMinTokens;
+#endif
+
+/// The width from which `policy` admits the cuBLAS prefill route.
+[[nodiscard]] constexpr std::int32_t cublas_prefill_min_tokens(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::AllowPrefillCublasNarrow ? kCublasPrefillNarrowMinTokens
+                                                            : kCublasPrefillMinTokens;
+}
+
+/// The policy a prefill-phase call uses: the weight's own, except that the cuBLAS route opens to
+/// prefill widths below the wide gate.
+[[nodiscard]] constexpr LinearPolicy prefill_phase_policy(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::AllowPrefillCublas ? LinearPolicy::AllowPrefillCublasNarrow
+                                                      : policy;
+}
 
 /**
  * Returns the caller-owned transient capacity required by Linear for every T in the inclusive
@@ -235,5 +281,15 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
  * @param[in] stream CUDA stream on which execution is enqueued.
  */
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+
+/**
+ * linear_columnwise: out[:, t] = linear(x[:, t], w) for every column t, each column bit for bit the
+ * output of a one-column linear() call with the same policy (not the T-column route, whose
+ * arithmetic differs), in one launch. Supported for the weights linear_columnwise_supported()
+ * accepts (BF16 [96, 2560], Qwen3.8-Flash-Next's GDN control projection); throws otherwise.
+ * Shapes, contiguity and alignment as linear(). Stream-ordered, graph capturable, no workspace.
+ */
+[[nodiscard]] bool linear_columnwise_supported(const Weight& w);
+void linear_columnwise(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy, cudaStream_t stream);
 
 } // namespace ninfer::ops

@@ -43,6 +43,11 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
     throw std::invalid_argument("bf16 linear: unsupported shape");
 }
 
+Bf16Launch select_bf16_columnwise(std::int32_t n, std::int32_t k) {
+    if (n == 96 && k == 2560) return select_bf16_n96_k2560_columns();
+    return nullptr;
+}
+
 Bf16Launch select_bf16_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
     if (!valid_linear_policy(policy))
         throw std::invalid_argument("bf16 linear: unsupported policy");

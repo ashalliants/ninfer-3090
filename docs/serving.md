@@ -2363,7 +2363,13 @@ Qwen3.8-Flash-Next has no hidden prompts. On it `--graft NAME=PATH` loads a **re
 control vector** instead: a GGUF file with one `direction.N` tensor of 2,560 F32 values per steered
 layer (the llama.cpp control-vector layout, `general.architecture` `controlvector`, with
 `controlvector.model_hint` `qwen4exp` when it names a model). The community publishes one for this
-model (for Strata, which loads it with `--control-vector-scaled ... --cvec-mode project`).
+model (for Strata, which loads it with `--control-vector-scaled ... --cvec-mode project`). Strata
+ships it as `data/experimental-speed-projection/Qwen3.8-Flash-Next-experimental-speed-projection.gguf`
+in [its repository](https://github.com/Niko1221/Strata/tree/main/data/experimental-speed-projection).
+That file holds layers 1-47, but its authors apply layers 4-44, and NInfer applies every direction
+in the file: `python3 tools/control_vector_layers.py IN.gguf OUT.gguf --first 4 --last 44` makes the
+copy to load. The launchers take `NINFER_GRAFT=NAME=PATH` (several separated by `;`) and
+`NINFER_DEFAULT_GRAFT`.
 
 ```bash
 ninfer-serve qwen4exp.ninfer --graft uncensored=C:/vectors/orcarouter.gguf
@@ -2545,7 +2551,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--relaxed-drafting [P]` | [relaxed drafting](#relaxed-drafting), opt-in and it CHANGES THE OUTPUT DISTRIBUTION: under sampling, keep a draft the model gives probability `P` or more (`0..1`; `0.5` without a value) even where exact speculative sampling would draw another token. The default `P` of requests that do not set `relaxed_drafting`; `0` leaves requests exact unless they ask. Needs `--spec` (refused otherwise) | off (exact; requests asking for it are refused) |
 | `--draft-context-rows N` | [draft-head context rows](#draft-head-context-rows): up to `N` (`0..2048`) ids the requests' prompts and outputs hold that the reduced draft head lacks are scored from the full output head and may be drafted; drafts only, so output is unchanged. Needs `--spec`; refused on Qwen3.8-Flash-Next and with `--max-concurrency` above 1. Measured on an RTX 3090 (2026-11-11), N=512, 27B DFlash2, greedy, one lane: output unchanged, B/A median +0.40%, 12/12 positive | `0` (off) |
 | `--ngram-min-match N` | tokens the end of the text must match before a copy is proposed, `4..64` | `12` |
-| `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |
+| `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off; **on** in an `sm_70` (V100) build, where the integer kernels are emulated ([tesla-v100.md](tesla-v100.md)) |
+| `--no-prefill-cublas` | turn the route off, for an `sm_70` build whose default is on | |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
 | `--default-max-tokens N` | output limit when omitted by a request; see [default output limit](#default-output-limit) | the remaining context |
 | `--max-output-tokens N` | upper bound on every request's output budget, stated or derived; see [default output limit](#default-output-limit) | none |
@@ -2636,6 +2643,13 @@ Frequency penalty is `0` for all registered presets. Process flags override regi
 request fields override process flags, and `--greedy` finally forces temperature `0`.
 
 For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage capacity is `C+H`.
+When the pool is full, a new request first evicts a checkpoint image to Host memory, and a prompt
+checkpoint is copied to Host instead of forked on the Device; on a slow link (a V100 eGPU moves the
+~150 MiB image in ~47 ms) each copy delays the first token. An idle engine therefore copies its
+Device-only checkpoint images to free Host slots ahead of need, keeping the Device copies: the
+eviction is then a free drop, and a prompt checkpoint takes the slot of an image that already has
+its Host copy and forks. Requests sent back to back leave no idle time for this and still pay the
+copy.
 Host state and Main/Backend KV share one startup-fixed byte budget; this is context storage, not a
 limit on total process RAM. `--host-context-mib 0` disables Host context backing.
 `--no-prefix-reuse` disables cross-request history reads and writes; pause/replay recovery remains

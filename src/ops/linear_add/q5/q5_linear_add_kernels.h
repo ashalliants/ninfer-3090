@@ -7,6 +7,10 @@
 
 namespace ninfer::ops::detail {
 
+// The streaming GEMV (ops/linear/common/stream_gemv.cuh) for T = 1..8 when it is enabled (sm_70 by
+// default); false when it declines, and the caller launches its own schedule.
+bool try_q5_linear_add_stream(const Tensor& x, const Weight& w, Tensor& residual_out,
+                              cudaStream_t stream);
 void q5_linear_add_split2_exact_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                        cudaStream_t stream);
 void q5_linear_add_small_t_mma_launch(const Tensor& x, const Weight& w, Tensor& residual_out,

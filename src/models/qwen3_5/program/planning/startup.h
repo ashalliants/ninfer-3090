@@ -111,6 +111,11 @@ struct SequencePlanningInputs {
     std::uint32_t capacity                  = 0;
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
+    // A prefill remainder narrower than this is avoided by shortening the step before it (0: no
+    // floor). Set to the cuBLAS prefill route's width gate when that route is on: a remainder
+    // below the gate would take the narrow routes -- emulated mma on sm_70, ~8x slower there --
+    // and the route itself does not care about 128-alignment.
+    std::uint32_t prefill_tail_floor        = 0;
     std::uint32_t progress_anchor_tokens    = 0;
     bool progress_anchors_shared            = false;
     std::uint32_t draft_window              = 0;
@@ -145,6 +150,8 @@ struct SequencePlanImpl {
     std::uint32_t main_page_groups          = 0;
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
+    // See SequencePlanningInputs::prefill_tail_floor.
+    std::uint32_t prefill_tail_floor        = 0;
     std::uint32_t progress_anchor_tokens    = 0;
     bool progress_anchors_shared            = false;
     std::uint32_t draft_window              = 0;

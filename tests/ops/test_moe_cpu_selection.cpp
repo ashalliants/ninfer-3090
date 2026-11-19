@@ -18,6 +18,9 @@
 //   - prefill_sorted_by_rows_then_id: the fewest rows first, then the lower expert id, whatever the
 //     job order;
 //   - share_zero_takes_none: num 0 takes nothing; bad fractions are refused.
+//   - split_slots: with max_job_columns above 8 a job of w columns takes ceil(w / 8) request slots
+//     (cpu_request_slots), the cap bounds slots, and selection stops at the first job that does not
+//     fit (wider ones never fit after it);
 //   - stream_cold_lowest_counts: a streamed call leaves out round(share * min(n, capacity)) of a
 //     layer's n non-resident experts, those with the lowest prior use counts (ties to the lower id),
 //     never a resident one; the result is ascending.
@@ -132,8 +135,8 @@ void cap_limits() {
           "cap_limits: mismatched spans are refused");
     check(refused([&] { (void)om::select_cpu_jobs(ints{9}, ints{1}, none, 4, 3, 8); }),
           "cap_limits: an expert outside resident is refused");
-    check(refused([&] { (void)om::select_cpu_jobs(experts, columns, none, 4, 3, 9); }),
-          "cap_limits: max_job_columns above 8 is refused");
+    check(refused([&] { (void)om::select_cpu_jobs(experts, columns, none, 4, 3, 65); }),
+          "cap_limits: max_job_columns above 64 is refused");
     check(refused([&] { (void)om::select_cpu_jobs(experts, columns, none, -1, 3, 8); }),
           "cap_limits: a negative cap is refused");
 }
@@ -209,10 +212,36 @@ void share_zero_takes_none() {
           "share_zero_takes_none: more candidates than misses is refused");
     check(refused([&] { (void)om::select_prefill_cpu_jobs(experts, ints{1}, none, 3, 5, 8); }),
           "share_zero_takes_none: mismatched spans are refused");
-    check(refused([&] { (void)om::select_prefill_cpu_jobs(experts, rows, none, 3, 5, 9); }),
-          "share_zero_takes_none: max_rows above 8 is refused");
+    check(refused([&] { (void)om::select_prefill_cpu_jobs(experts, rows, none, 3, 5, 65); }),
+          "share_zero_takes_none: max_rows above 64 is refused");
     check(refused([&] { (void)om::select_prefill_cpu_jobs(experts, rows, none, 3, 5, 8, -1); }),
           "share_zero_takes_none: a negative cap is refused");
+}
+
+void split_slots() {
+    const ints experts = {0, 1, 2, 3, 4, 5};
+    const ints columns = {12, 3, 20, 8, 64, 9};
+    const std::vector<std::uint8_t> none(6, 0);
+    // Widths 3, 8, 9, 12, 20, 64 (jobs 1, 3, 5, 0, 2, 4) take 1, 1, 2, 2, 3, 8 slots.
+    check(om::select_cpu_jobs(experts, columns, none, 64, 0, 64) == picks{1, 3, 5, 0, 2, 4},
+          "split_slots: every width up to 64, fewest columns first");
+    check(om::select_cpu_jobs(experts, columns, none, 64, 0, 12) == picks{1, 3, 5, 0},
+          "split_slots: max_job_columns 12 stops before 20");
+    // A cap of 6 slots: 1 + 1 + 2 fit (4), the 12-column job's 2 make 6, the 20-column job does not.
+    check(om::select_cpu_jobs(experts, columns, none, 6, 0, 64) == picks{1, 3, 5, 0}, "split_slots: the cap bounds slots");
+    check(om::select_cpu_jobs(experts, columns, none, 5, 0, 64) == picks{1, 3, 5},
+          "split_slots: a job whose slots do not fit stops the selection");
+    // 8 columns is still one slot: the old rule is unchanged at max_job_columns 8.
+    check(om::select_cpu_jobs(experts, columns, none, 2, 0, 8) == picks{1, 3}, "split_slots: width 8 is one slot");
+    const auto slots = om::cpu_request_slots(picks{1, 5, 2}, columns);
+    using S = om::CpuSlot;
+    check(slots == std::vector<S>{{1, 0}, {5, 0}, {5, 8}, {2, 0}, {2, 8}, {2, 16}},
+          "split_slots: cpu_request_slots lists each job's slots of 8 columns in order");
+    // The prefill rule: share 1 / 1 of the 6 misses, rows as columns.
+    check(om::select_prefill_cpu_jobs(experts, columns, none, 1, 1, 64, 9) == picks{1, 3, 5, 0, 2},
+          "split_slots: the prefill share bounds slots the same way (9 slots: 1 + 1 + 2 + 2 + 3)");
+    check(om::select_prefill_cpu_jobs(experts, columns, none, 1, 1, 8) == picks{1, 3},
+          "split_slots: prefill max_rows 8 keeps the old candidates");
 }
 
 void stream_cold_lowest_counts() {
@@ -253,6 +282,7 @@ int main() {
     prefill_rows_cap();
     prefill_sorted_by_rows_then_id();
     share_zero_takes_none();
+    split_slots();
     stream_cold_lowest_counts();
     if (failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

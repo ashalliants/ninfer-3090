@@ -608,6 +608,12 @@ public:
                   std::span<const CheckpointHandle> excluded,
                   runtime::ContextResourceUsage shortage) const;
     [[nodiscard]] bool start_demote(const ContextDemotion& plan);
+    // Starts copying one Device-only checkpoint state image to a free Host slot while keeping its
+    // Device copy (no eviction anywhere), as a context transaction the caller polls like a
+    // demotion. For an idle engine: a later demotion of that image is then a free drop instead
+    // of a copy on the next request's critical path. False when nothing qualifies, a context
+    // transaction is in flight, or the Host tier has no free slot.
+    [[nodiscard]] bool start_state_writeback();
     // `require_snapshot` makes the pause all-or-nothing for a caller that only serves the queue: it is
     // refused, with nothing changed, where the progress could not be saved (a replaying lane, or a
     // chunk part-way through a Vision item). A backup reservation that fails after the pause has

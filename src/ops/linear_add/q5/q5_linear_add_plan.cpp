@@ -294,6 +294,12 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
         throw std::invalid_argument("q5 linear_add: plan does not match the exact problem");
     }
     (void)ws;
+#if defined(NINFER_SM70)
+    // sm_70 emulates mma.sync, so every MMA schedule below is compute-bound there; the streaming
+    // GEMV takes 1..64 tokens (32- and 16-token tensor-core tiles past sixteen) and declines the
+    // rest, which keep the table's route.
+    if (try_q5_linear_add_stream(x, w, residual_out, stream)) return;
+#endif
 
     switch (plan.schedule) {
     case Q5LinearAddScheduleId::Split2ExactResidual:

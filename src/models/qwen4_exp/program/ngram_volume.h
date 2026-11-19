@@ -12,16 +12,24 @@
 // fixed ring, so their latency overlaps and the memory stays bounded. A call with many distinct
 // blocks (a prefill chunk) splits them over kReadThreads threads with a kParallelInFlight-block
 // ring each. The volume must not be mapped (core/read_only_file.h).
+//
+// --ngram-ram-mib (hold_in_ram): a prefix of the volume's blocks is also held in pageable RAM,
+// loaded by a background thread in large sequential reads that pause while read_rows reads; a row
+// in a loaded block is copied from RAM, never read. Rows hash uniformly over the blocks, so holding
+// a fraction f of them serves about f of a cold prompt's rows.
 
 #include "core/read_only_file.h"
 #include "models/qwen4_exp/config.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
+#include <new>
 #include <mutex>
 #include <span>
 #include <thread>
@@ -57,10 +65,23 @@ public:
     // A failed keep-alive read turns the keep-alive off, never the volume.
     void set_keepalive(std::chrono::milliseconds period, std::chrono::milliseconds window);
 
+    // Holds the first ram_bytes(table, bytes) bytes of the volume's blocks in RAM, loading them on a
+    // background thread (pausing while read_rows reads). Once per volume; 0 does nothing. A failed
+    // load read stops the loading: the blocks loaded so far still serve, the rest read from disk.
+    void hold_in_ram(std::uint64_t bytes);
+    // Whole blocks of the volume, at most all of them.
+    [[nodiscard]] static std::uint64_t ram_bytes(const NgramTableConfig& table, std::uint64_t bytes) noexcept {
+        return std::min<std::uint64_t>(bytes / table.block_bytes, table.blocks) * table.block_bytes;
+    }
+    // Blocks held so far, and how many hold_in_ram asked for.
+    [[nodiscard]] std::uint64_t ram_blocks_loaded() const noexcept { return ram_loaded_.load(std::memory_order_acquire); }
+    [[nodiscard]] std::uint64_t ram_blocks_wanted() const noexcept { return ram_wanted_; }
+
     // Row traffic since the volume was opened: rows requested, rows served by the host cache, 4 KiB
     // blocks read for rows, the wall time of the calls' volume reads, and keep-alive reads.
     struct Counters {
-        std::uint64_t rows = 0, hits = 0, reads = 0, read_ns = 0, keepalive_reads = 0;
+        // ram: rows copied from the RAM-held blocks (hold_in_ram).
+        std::uint64_t rows = 0, hits = 0, reads = 0, read_ns = 0, keepalive_reads = 0, ram = 0;
     };
     [[nodiscard]] Counters counters() const noexcept;
 
@@ -81,6 +102,7 @@ private:
         return static_cast<std::size_t>((row * 2654435761U) >> (32U - kCacheBits));
     }
     void keepalive_loop();
+    void ram_loader();
     static std::int64_t now_ns() noexcept;
 
     ReadOnlyFile file_;
@@ -97,6 +119,18 @@ private:
     mutable std::vector<std::uint64_t> offsets_;
     mutable std::vector<std::size_t> first_miss_;
     mutable Counters counters_;
+
+    // hold_in_ram: the RAM-held blocks [0, ram_wanted_), loaded up to ram_loaded_ (release-stored
+    // after each chunk). The loader waits while reading_ is set (a read_rows call is reading).
+    struct AlignedFree {
+        void operator()(std::byte* p) const noexcept { ::operator delete[](p, std::align_val_t{4096}); }
+    };
+    std::unique_ptr<std::byte[], AlignedFree> ram_;
+    std::uint64_t ram_wanted_ = 0;
+    std::atomic<std::uint64_t> ram_loaded_{0};
+    mutable std::atomic<bool> reading_{false};
+    std::atomic<bool> ram_stop_{false};
+    std::thread ram_thread_;
 
     // Keep-alive state: the thread reads these clocks (steady, ns) without the call's lock.
     mutable std::atomic<std::int64_t> last_request_ns_{0};

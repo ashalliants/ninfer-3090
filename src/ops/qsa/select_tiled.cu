@@ -7,6 +7,7 @@
 // histogram passes per column in one CTA with no candidate buffer, and the ascending write uses
 // per-warp contiguous ranges.
 
+#include "ops/common/smem_limit.h"
 #include "ops/qsa/launch.h"
 
 #include "ops/common/memory.cuh"
@@ -266,12 +267,11 @@ __global__ void __launch_bounds__(kSelectThreads)
         sh.done      = false;
     }
     // Three digits of the order key: bits [31:21], [20:10], [9:0].
-    constexpr int kShift[3] = {21, 10, 0};
-    constexpr int kWidth[3] = {11, 11, 10};
 #pragma unroll 1
     for (int pass = 0; pass < 3; ++pass) {
-        const int shift = kShift[pass];
-        const unsigned digit_mask = (1U << kWidth[pass]) - 1U;
+        // (Selects, not a constexpr table: a table indexed by the rolled loop lives in local memory.)
+        const int shift = pass == 0 ? 21 : (pass == 1 ? 10 : 0);
+        const unsigned digit_mask = pass == 2 ? 0x3FFU : 0x7FFU;
         for (int i = threadIdx.x; i < kBins; i += kSelectThreads) { sh.histogram[i] = 0; }
         __syncthreads();
         if (sh.done) { break; }
@@ -371,6 +371,7 @@ void qsa_select_group_launch(const Tensor& index_q, const Tensor& positions,
     const dim3 grid(static_cast<unsigned>(std::min(block_tiles, want)),
                     static_cast<unsigned>(column_tiles));
     constexpr int kScoreShared = static_cast<int>(sizeof(ScoreShared));
+    static_assert(kScoreShared <= kMaxDynamicSharedBytes, "exceeds the target's per-block shared memory");
     static const bool reserved = [] {
         return cudaFuncSetAttribute(score_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     kScoreShared) == cudaSuccess;

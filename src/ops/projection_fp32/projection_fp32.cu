@@ -3,7 +3,9 @@
 // q8_g32_fp16/q4_g64_fp16 forms and the vocabulary-head tall and tensor-core mappings are not
 // ported. Namespaces and includes are NInfer's.
 
+#include "ops/common/smem_limit.h"
 #include "ninfer/ops/projection_fp32.h"
+#include "ops/common/memory.cuh"
 
 #include <cuda_bf16.h>
 
@@ -29,6 +31,7 @@ struct Segments {
     const bf16* data[kMaxSegments];
     int begin[kMaxSegments + 1]; // first output row of each segment, then the total
     int count;
+    int rows; // the total again, at a fixed offset (see total_rows)
 };
 
 void require(bool condition, const char* message) {
@@ -39,14 +42,9 @@ bool aligned16(const void* p) { return reinterpret_cast<std::uintptr_t>(p) % 16 
 
 // The total row count. Segment fields are read at compile-time indices only: a runtime index into
 // the kernel parameter would copy it to local memory and put a local load before the weight loads.
-__device__ __forceinline__ int total_rows(const Segments& segments) {
-    int rows = segments.begin[1];
-#pragma unroll
-    for (int s = 2; s <= kMaxSegments; ++s) {
-        if (s == segments.count) { rows = segments.begin[s]; }
-    }
-    return rows;
-}
+// (Selecting begin[count] by compile-time compares was folded back into that indexed load, so the
+// host stores the total in its own field.)
+__device__ __forceinline__ int total_rows(const Segments& segments) { return segments.rows; }
 
 // The address of chunk `chunk` (8 elements) of output row `row`.
 __device__ __forceinline__ const uint4* row_chunk(const Segments& segments, int row, int k,
@@ -80,17 +78,42 @@ __device__ __forceinline__ void load_row(const Segments& segments, int row, int 
 // loads before x is staged, so the weights' DRAM trip overlaps the staging instead of following
 // it. Decode-width calls give each warp one row (Threads = 128, RowsPerWarp = 1), so a router's
 // latency is one DRAM round trip; wider calls keep four rows per warp, which stages x in fewer
-// CTAs. Both mappings produce the same bits.
-template <int Threads, int RowsPerWarp>
+// CTAs. Both mappings produce the same bits. Columns is the smallest of 1, 2, 4 and kColumns that
+// holds the call's columns (a decode step's router is one column, a speculative verification's two
+// to four): the same arithmetic per column in less code, which matters because a router call is
+// short enough that fetching cold instructions dominated it on Volta (the 8-column form is 37 KiB of
+// code: ~23-27 us a call in the model against ~10 us warm).
+// Where a result goes: FP32 [rows, T], or rounded to BF16 (as cast_fp32_to_bf16 rounds) with rows
+// [0, first_rows) in `first` and the rest in `second`.
+struct Fp32Out {
+    float* out;
+    __device__ __forceinline__ void store(int row, int column, int rows, float v) const {
+        out[static_cast<std::size_t>(column) * rows + row] = v;
+    }
+};
+struct Bf16SplitOut {
+    bf16* first;
+    bf16* second;
+    int first_rows;
+    __device__ __forceinline__ void store(int row, int column, int rows, float v) const {
+        if (row < first_rows) {
+            first[static_cast<std::size_t>(column) * first_rows + row] = __float2bfloat16_rn(v);
+        } else {
+            const int second_rows = rows - first_rows;
+            second[static_cast<std::size_t>(column) * second_rows + row - first_rows] = __float2bfloat16_rn(v);
+        }
+    }
+};
+
+template <int Threads, int RowsPerWarp, int Columns = kColumns, class Out = Fp32Out>
 __global__ void __launch_bounds__(Threads)
-    projection_kernel(const bf16* __restrict__ x, int k, int columns, Segments segments,
-                      float* __restrict__ out) {
+    projection_kernel(const bf16* __restrict__ x, int k, int columns, Segments segments, Out out) {
     constexpr int Warps = Threads / 32;
     // 16-byte x chunks of the CTA's columns, as one unrolled batch of at most this many per thread.
-    constexpr int kStagePerThread = (kColumns * kMaxK / 8 + Threads - 1) / Threads;
+    constexpr int kStagePerThread = (Columns * kMaxK / 8 + Threads - 1) / Threads;
     extern __shared__ uint4 staged[];
     const int first_column = blockIdx.y * kColumns;
-    const int count        = min(kColumns, columns - first_column);
+    const int count        = min(Columns, columns - first_column);
     const int chunks       = k / 8;
     const int rows         = total_rows(segments);
     const int lane         = threadIdx.x % 32;
@@ -103,19 +126,17 @@ __global__ void __launch_bounds__(Threads)
     for (int u = 0; u < kStagePerThread; ++u) {
         const int i = static_cast<int>(threadIdx.x) + u * Threads;
         if (i < count * chunks) {
-            const auto dst = static_cast<unsigned>(__cvta_generic_to_shared(staged + i));
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(xs + i)
-                         : "memory");
+            cp_async_mem<16>(staged + i, xs + i);
         }
     }
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
-    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    cp_commit_mem();
+    cp_wait_mem<0>();
     __syncthreads();
     for (int r = 0; r < RowsPerWarp; ++r) {
         const int row = first_row + r * Warps;
         if (row >= rows) { return; }
         if (r > 0) { load_row(segments, row, k, chunks, lane, loaded); }
-        float sums[kColumns] = {};
+        float sums[Columns] = {};
 #pragma unroll
         for (int i = 0; i < kMaxLaneChunks; ++i) {
             const int chunk = lane + 32 * i;
@@ -124,7 +145,7 @@ __global__ void __launch_bounds__(Threads)
             const bf16* wv     = reinterpret_cast<const bf16*>(&packed);
             float wf[8];
             for (int e = 0; e < 8; ++e) { wf[e] = __bfloat162float(wv[e]); }
-            for (int column = 0; column < kColumns; ++column) {
+            for (int column = 0; column < Columns; ++column) {
                 if (column < count) {
                     const uint4 xp = staged[column * chunks + chunk];
                     const bf16* xv = reinterpret_cast<const bf16*>(&xp);
@@ -134,13 +155,13 @@ __global__ void __launch_bounds__(Threads)
                 }
             }
         }
-        for (int column = 0; column < kColumns; ++column) {
+        for (int column = 0; column < Columns; ++column) {
             float v = sums[column];
             for (int offset = 16; offset > 0; offset >>= 1) {
                 v += __shfl_xor_sync(0xFFFFFFFFU, v, offset);
             }
             if (lane == 0 && column < count) {
-                out[static_cast<std::size_t>(first_column + column) * rows + row] = v;
+                out.store(row, first_column + column, rows, v);
             }
         }
     }
@@ -173,10 +194,7 @@ __device__ __forceinline__ void widen8(const uint4& packed, float (&out)[8]) {
 
 // 16 bytes from `src` to shared `dst`, or zeros when `valid` is false (src is then not read).
 __device__ __forceinline__ void stage16(uint4* dst, const void* src, bool valid) {
-    const auto d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(d), "l"(src),
-                 "r"(valid ? 16 : 0)
-                 : "memory");
+    cp_async_zfill_mem<16>(dst, src, valid ? 16 : 0);
 }
 
 __global__ void __launch_bounds__(kWideThreads, 1)
@@ -211,7 +229,7 @@ __global__ void __launch_bounds__(kWideThreads, 1)
                         valid);
             }
         }
-        asm volatile("cp.async.commit_group;\n" ::: "memory");
+        cp_commit_mem();
     };
     const int warp = static_cast<int>(threadIdx.x) / 32, lane = static_cast<int>(threadIdx.x) % 32;
     const int r0   = (warp % kWideRowWarps) * kWideTileRows;
@@ -221,9 +239,9 @@ __global__ void __launch_bounds__(kWideThreads, 1)
     for (int s = 0; s < slices; ++s) {
         if (s + 1 < slices) {
             issue(s + 1, (s + 1) & 1);
-            asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+            cp_wait_mem<1>();
         } else {
-            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+            cp_wait_mem<0>();
         }
         __syncthreads();
         if (s * kSliceChunks + lane < chunks) { // the narrow kernels' loop ends at the last chunk
@@ -263,22 +281,18 @@ __global__ void __launch_bounds__(kWideThreads, 1)
     }
 }
 
-} // namespace
-
-void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Tensor& out,
-                     cudaStream_t stream) {
+// x's and the weights' checks, and the weights bound as segments (rows: their total).
+Segments bind_segments(const Tensor& x, std::span<const Tensor* const> weights, int& rows) {
     require(x.data != nullptr && x.dtype == DType::BF16 && x.is_contiguous() && x.ne[2] == 1 &&
                 x.ne[3] == 1,
             "x must be contiguous BF16 [K, T]");
-    require(out.data != nullptr && out.dtype == DType::FP32 && out.is_contiguous(),
-            "out must be contiguous FP32");
     const int k = x.ne[0], columns = x.ne[1];
     require(k > 0 && k % 8 == 0 && k <= kMaxK && columns > 0, "K must be a multiple of 8 up to 3072");
     require(!weights.empty() && weights.size() <= kMaxSegments, "between one and four weights");
     require(aligned16(x.data), "x must be 16-byte aligned");
     Segments segments{};
     segments.count = static_cast<int>(weights.size());
-    int rows       = 0;
+    rows           = 0;
     for (std::size_t i = 0; i < weights.size(); ++i) {
         const Tensor& w = *weights[i];
         require(w.data != nullptr && w.dtype == DType::BF16 && w.is_contiguous() && w.ne[0] == k &&
@@ -289,12 +303,56 @@ void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Te
         rows += w.ne[1];
     }
     segments.begin[segments.count] = rows;
+    segments.rows                  = rows;
+    return segments;
+}
+
+} // namespace
+
+bool projection_bf16_split_supported(std::int32_t columns) noexcept { return columns >= 1 && columns <= kColumns; }
+
+void projection_bf16_split(const Tensor& x, std::span<const Tensor* const> weights, Tensor& first, Tensor& second,
+                           cudaStream_t stream) {
+    int rows                = 0;
+    const Segments segments = bind_segments(x, weights, rows);
+    const int k = x.ne[0], columns = x.ne[1];
+    require(projection_bf16_split_supported(columns), "the BF16 split form serves 1 to 8 columns");
+    for (const Tensor* t : {&first, &second}) {
+        require(t->data != nullptr && t->dtype == DType::BF16 && t->is_contiguous() && t->ne[1] == columns &&
+                    t->ne[2] == 1 && t->ne[3] == 1,
+                "the BF16 outputs must be contiguous BF16 [N, T]");
+    }
+    require(first.ne[0] > 0 && second.ne[0] > 0 && first.ne[0] + second.ne[0] == rows,
+            "the BF16 outputs' rows must split the weights' rows");
+    const std::size_t staged = static_cast<std::size_t>(columns) * k * sizeof(bf16);
+    constexpr int threads = 128, rows_per_warp = 1, rows_per_cta = threads / 32 * rows_per_warp;
+    auto* kernel = columns == 1   ? projection_kernel<threads, rows_per_warp, 1, Bf16SplitOut>
+                   : columns <= 2 ? projection_kernel<threads, rows_per_warp, 2, Bf16SplitOut>
+                   : columns <= 4 ? projection_kernel<threads, rows_per_warp, 4, Bf16SplitOut>
+                                  : projection_kernel<threads, rows_per_warp, kColumns, Bf16SplitOut>;
+    kernel<<<dim3((rows + rows_per_cta - 1) / rows_per_cta, 1), threads, staged, stream>>>(
+        static_cast<const bf16*>(x.data), k, columns, segments,
+        Bf16SplitOut{static_cast<bf16*>(first.data), static_cast<bf16*>(second.data), static_cast<int>(first.ne[0])});
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        throw std::runtime_error(std::string("projection_bf16_split: ") + cudaGetErrorString(error));
+    }
+}
+
+void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Tensor& out,
+                     cudaStream_t stream) {
+    require(out.data != nullptr && out.dtype == DType::FP32 && out.is_contiguous(),
+            "out must be contiguous FP32");
+    int rows                = 0;
+    const Segments segments = bind_segments(x, weights, rows);
+    const int k = x.ne[0], columns = x.ne[1];
     require(out.ne[0] == rows && out.ne[1] == columns && out.ne[2] == 1 && out.ne[3] == 1,
             "out must be FP32 [sum N, T]");
     const std::size_t staged =
         static_cast<std::size_t>(std::min(kColumns, columns)) * k * sizeof(bf16);
     const int column_groups = (columns + kColumns - 1) / kColumns;
     if (columns >= kWideMinColumns) {
+        static_assert(kWideSharedBytes <= kMaxDynamicSharedBytes);
         static const bool configured = [] {
             return cudaFuncSetAttribute(projection_wide_kernel,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -307,15 +365,17 @@ void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Te
             static_cast<const bf16*>(x.data), k, columns, segments, static_cast<float*>(out.data));
     } else if (columns <= kColumns) {
         constexpr int threads = 128, rows_per_warp = 1, rows_per_cta = threads / 32 * rows_per_warp;
-        projection_kernel<threads, rows_per_warp>
-            <<<dim3((rows + rows_per_cta - 1) / rows_per_cta, column_groups), threads, staged,
-                stream>>>(static_cast<const bf16*>(x.data), k, columns, segments,
-                          static_cast<float*>(out.data));
+        auto* kernel = columns == 1   ? projection_kernel<threads, rows_per_warp, 1>
+                       : columns <= 2 ? projection_kernel<threads, rows_per_warp, 2>
+                       : columns <= 4 ? projection_kernel<threads, rows_per_warp, 4>
+                                      : projection_kernel<threads, rows_per_warp>;
+        kernel<<<dim3((rows + rows_per_cta - 1) / rows_per_cta, column_groups), threads, staged, stream>>>(
+            static_cast<const bf16*>(x.data), k, columns, segments, Fp32Out{static_cast<float*>(out.data)});
     } else {
         projection_kernel<kThreads, kRowsPerWarp>
             <<<dim3((rows + kRowsPerCta - 1) / kRowsPerCta, column_groups), kThreads, staged,
                 stream>>>(static_cast<const bf16*>(x.data), k, columns, segments,
-                          static_cast<float*>(out.data));
+                          Fp32Out{static_cast<float*>(out.data)});
     }
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {

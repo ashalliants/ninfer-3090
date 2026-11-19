@@ -6,6 +6,7 @@
 // rotary coefficients across heads.
 
 #include "ops/common/dflash_rope.cuh"
+#include "ops/kernel/rope_math.cuh"
 
 #include <cuda_bf16.h>
 
@@ -165,17 +166,6 @@ __global__ void rope_fixed_split_kernel(const std::int32_t* positions, __nv_bflo
     }
 }
 
-__device__ __forceinline__ void generic_axis_frequency(int axes, int head_dim, int rotary_dim,
-                                                       int pair, int* axis, float* exponent) {
-    if (axes == 2 && head_dim == 72 && rotary_dim == 72) {
-        *axis           = pair / 18;
-        const int local = pair % 18;
-        *exponent       = -2.0F * static_cast<float>(local) / 36.0F;
-    } else {
-        *axis     = axes == 3 ? pair % 3 : 0;
-        *exponent = -2.0F * static_cast<float>(pair) / static_cast<float>(rotary_dim);
-    }
-}
 
 static __global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t axes,
                                            __nv_bfloat16* q, __nv_bfloat16* k,
@@ -194,14 +184,8 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
             fixed_sincos<RopeKernelMode::DflashText1D>(positions, tokens, token, pair,
                                                        &sin_cache[pair], &cos_cache[pair]);
         } else {
-            int axis       = 0;
-            float exponent = 0.0F;
-            generic_axis_frequency(axes, head_dim, rotary_dim, pair, &axis, &exponent);
-            const float frequency = powf(theta, exponent);
-            const float angle =
-                static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
-                frequency;
-            sincosf(angle, &sin_cache[pair], &cos_cache[pair]);
+            generic_sincos(positions, axes, head_dim, rotary_dim, theta, tokens, token, pair, &sin_cache[pair],
+                           &cos_cache[pair]);
         }
     }
     __syncthreads();
@@ -222,8 +206,8 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
             const float second       = __bfloat162float(data[base + pair + half]);
             const float c            = cos_cache[pair];
             const float s            = sin_cache[pair];
-            data[base + pair]        = __float2bfloat16_rn(first * c - second * s);
-            data[base + pair + half] = __float2bfloat16_rn(second * c + first * s);
+            data[base + pair]        = __float2bfloat16_rn(rope_first(first, second, c, s));
+            data[base + pair + half] = __float2bfloat16_rn(rope_second(first, second, c, s));
         }
     }
 }

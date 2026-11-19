@@ -151,7 +151,7 @@ std::string usage_text(const char* argv0) {
            "       [--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4]\n"
            "       [--gdn-state-fp16] [--mlp-a8-decode] [--no-prefill-a8]\n"
            "       [--numeric-tripwire [--numeric-tripwire-limit F|inf]]\n"
-           "       [--prefill-cublas [--no-prefill-cublas-projections]]\n"
+           "       [--prefill-cublas | --no-prefill-cublas] [--no-prefill-cublas-projections]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
@@ -194,8 +194,10 @@ std::string usage_text(const char* argv0) {
            "integer routes are measured on a whole request.\n"
            "--prefill-cublas hands wide prefill GEMMs to cuBLAS: a large prefill speedup for a small "
            "perplexity cost (docs/performance.md), off by default, and it wants a larger "
-           "--prefill-chunk to pay. --no-prefill-cublas-projections keeps the attention and GDN "
-           "input projections off that route.\n"
+           "--prefill-chunk to pay. In sm_70 (Tesla V100) builds the route is FP16, exact in its "
+           "scales, and on by default; --no-prefill-cublas turns it off. "
+           "--no-prefill-cublas-projections keeps the attention and GDN input projections off that "
+           "route.\n"
            "--ngram-draft-tokens 15 adds n-gram copy drafting beside --spec dflash2: when the "
            "text being written already appeared in the request (a tool result, the prompt or the "
            "output so far), a round verifies up to 15 copied tokens instead of the draft model's "
@@ -303,6 +305,8 @@ Options parse_options(int argc, char** argv) {
             options.prefill_a8 = false;
         } else if (arg == "--prefill-cublas") {
             options.prefill_cublas = true;
+        } else if (arg == "--no-prefill-cublas") {
+            options.prefill_cublas = false;
         } else if (arg == "--no-prefill-cublas-projections") {
             options.prefill_cublas_projections = false;
         } else if (arg == "--raw-output") {

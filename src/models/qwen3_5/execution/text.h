@@ -151,6 +151,22 @@ public:
         prefill_split_frontier_ = position;
     }
 
+    // A checkpoint inside the next prefill chunk without ending the chunk there: at absolute
+    // position `position` the GDN layers write their conv and recurrent state into state slot
+    // `slot` and go on from it, the remaining columns publishing to the destination slot as usual;
+    // the hidden state of the column before `position` goes to the rewrite checkpoint hidden
+    // output. `boundaries` (absolute, ascending) are further positions where the GDN layers
+    // decompose the chunk without a checkpoint -- the rewrite execution frontiers the separate
+    // calls would have ended at. Every stateful step is the one the split calls would run; the
+    // projections run once over the whole chunk. -1 (the default, reset after each chunk) is off.
+    // The span must outlive the next prefill_chunk call.
+    void set_prefill_state_split(std::int64_t position, std::int32_t slot,
+                                 std::span<const std::uint32_t> boundaries = {}) noexcept {
+        prefill_state_split_frontier_   = position;
+        prefill_state_split_slot_       = slot;
+        prefill_state_split_boundaries_ = boundaries;
+    }
+
     // Runs the next prefill chunk in slices (PrefillSliceState). Text-only, single-device chunks
     // only; any other chunk runs whole whatever this holds.
     void set_prefill_slice(PrefillSliceState* slice) noexcept { prefill_slice_ = slice; }
@@ -245,7 +261,9 @@ private:
         Tensor key;   // normalized, rotated [head_dim, kv_heads, T]
         Tensor attention; // the attention output's workspace root [query_width, T]
     };
-    [[nodiscard]] AttentionInputs attention_inputs(const BlockParameters& weights, Tensor& x);
+    // `prefill` marks a prefill-phase call (ops::prefill_phase_policy for the input projection).
+    [[nodiscard]] AttentionInputs attention_inputs(const BlockParameters& weights, Tensor& x,
+                                                   bool prefill = false);
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
@@ -344,6 +362,32 @@ private:
     GdnStateAction gdn_state_action_          = GdnStateAction::UpdateInPlace;
     const GdnReplayRecords* replay_records_   = nullptr;
     std::int64_t prefill_split_frontier_      = -1;
+    std::int64_t prefill_state_split_frontier_ = -1;
+    std::int32_t prefill_state_split_slot_     = 0;
+    std::span<const std::uint32_t> prefill_state_split_boundaries_{};
+    // The current prefill chunk's checkpoint column, -1 when none (set_prefill_state_split), and
+    // every column the GDN layers decompose it at (the checkpoint's and the boundaries', ascending).
+    static constexpr int kMaxStateCuts = 8;
+    std::int32_t active_state_split_column_ = -1;
+    std::array<std::int32_t, kMaxStateCuts> active_state_cuts_{};
+    std::int32_t active_state_cut_count_ = 0;
+    // Calls fn(first, count, from_split, into_split, from_source) for each piece of a T-column chunk
+    // between the active state cuts: the first piece reads the source state, a piece ending at the
+    // checkpoint column writes the checkpoint's slot, the next one reads it, and every other piece
+    // reads and writes the destination.
+    template <typename Fn>
+    void for_each_state_piece(std::int32_t T, Fn&& fn) const {
+        std::int32_t first    = 0;
+        bool from_split       = false;
+        for (std::int32_t i = 0; i <= active_state_cut_count_; ++i) {
+            const std::int32_t end =
+                i < active_state_cut_count_ ? active_state_cuts_[static_cast<std::size_t>(i)] : T;
+            const bool into_split = end == active_state_split_column_;
+            fn(first, end - first, from_split, into_split, first == 0);
+            from_split = into_split;
+            first      = end;
+        }
+    }
     // The int4 scout's layer parameters while scout_chunk runs (ScoutScratch::a4_layers); empty
     // everywhere else, so every other pass reads the model's own parameters.
     std::span<const BlockParameters> scout_layers_{};

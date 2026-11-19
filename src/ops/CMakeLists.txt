@@ -21,6 +21,19 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
 endif()
 
 include(basic_sources.cmake)
+
+# The sm_70 prompt flash-attention route drives a vendored llama.cpp kernel (MIT,
+# third_party/llama_cpp_fattn). Its headers are named common.cuh / mma.cuh like ours, so the
+# vendored include directory is scoped to the one translation unit that uses it.
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/launcher/gqa_attention_volta_flash.cu")
+  set_source_files_properties(
+    "${CMAKE_CURRENT_LIST_DIR}/launcher/gqa_attention_volta_flash.cu"
+    TARGET_DIRECTORY ninfer_ops
+    PROPERTIES
+      INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/llama_cpp_fattn"
+      COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda;-diag-suppress=940>")
+endif()
 include("${CMAKE_CURRENT_LIST_DIR}/attention_key_mass/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/attn_input_proj/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/candidate_selector/sources.cmake")
@@ -46,7 +59,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/rows/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/softmax_attention/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/sparse_moe/sources.cmake")
 
-if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(80|86|89)$")
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|80|86|89)$")
   get_target_property(ninfer_ops_sources ninfer_ops SOURCES)
   # NVFP4 W4A4 uses mma.sync...kind::mxf4nvf4.block_scale; FP8 A8 uses
   # mma.sync...kind::f8f6f4. Both qualifiers are Blackwell-only, and sm_80/86/89 have no FP8 or FP4

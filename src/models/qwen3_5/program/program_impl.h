@@ -251,6 +251,10 @@ struct RequestControl {
     std::vector<CaptureGroup> capture_groups;
     std::size_t next_capture = 0;
     bool capture_pending     = false;
+    // The pending capture's image was written by the prefill call that ran past its frontier
+    // (ProgramImpl::merge_capture_split): capture_reservation's state holds it, and the lane's
+    // own state moved on to the call's end.
+    bool capture_prefilled = false;
     // This request's n-gram copy index (null unless the Frontend builds them). It lives with the
     // control, which a pause moves into the ResumeState together with the ledger it indexes.
     std::unique_ptr<NgramRequestIndex> ngram;
@@ -411,6 +415,10 @@ public:
                                                             std::span<const CheckpointHandle>,
                                                             runtime::ContextResourceUsage) const;
     [[nodiscard]] bool start_demote(const ContextDemotion&);
+    [[nodiscard]] bool start_state_writeback();
+    // Frees one Device state slot held by an unpinned checkpoint whose image also has a current
+    // Host copy (what a demotion of it would do, minus the copy). False when none qualifies.
+    [[nodiscard]] bool drop_redundant_device_state() noexcept;
     [[nodiscard]] bool start_pause(SequenceHandle, bool save_snapshot, runtime::ExecutionTiming*,
                                    bool require_snapshot = false);
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView);
@@ -522,6 +530,8 @@ public:
     const std::uint32_t max_concurrency;
     const ContextCacheOptions context_cache;
     const std::uint32_t prefill_chunk;
+    // See SequencePlanImpl::prefill_tail_floor.
+    const std::uint32_t prefill_tail_floor;
     // Spacing of private progress anchors on long prefills (0 off), see plan_request.
     const std::uint32_t progress_anchor_tokens;
     // Anchors are SharedPrefix (survive a cancellation) rather than private LongAnchor.
@@ -915,6 +925,11 @@ public:
     void complete_binding(ContextTransaction&, ContextProgress&);
     void publish_capture(ContextTransaction&);
     [[nodiscard]] bool reserve_capture_destination(std::uint32_t lane, std::uint32_t frontier);
+    // Whether the prompt's last prefill call runs through the pending capture's frontier and writes
+    // its image on the way (TextContext::set_prefill_state_split) rather than ending there; true
+    // with a Device destination reserved. See capture.cpp.
+    [[nodiscard]] bool merge_capture_split(const SequenceState& sequence, RequestControl& request,
+                                           std::uint32_t frontier, std::uint32_t prompt_tokens);
     void prepare_capture_boundary(std::uint32_t lane);
     [[nodiscard]] ResumeState complete_pause(ContextTransaction&);
     void install_resume_sampling(SequenceState&, RequestControl&);

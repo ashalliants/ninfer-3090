@@ -69,11 +69,13 @@
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/cast.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ninfer/ops/ple.h"
 #include "ninfer/ops/qsa.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ops/offloaded_sparse_moe/cpu_share.h"
 #include "ops/common/relaxed_accept.h"
 
 #include <cuda_runtime.h>
@@ -260,10 +262,18 @@ constexpr std::int32_t kStagingSlots = 64;
 // Lanes (requests decoded in the same rounds): two. Three and four give +14% and +17% over two at
 // 41 and 32 tok/s per stream (docs/maintainer/flash-next-lanes-spike.md).
 constexpr std::uint32_t kMaximumLanes = 2;
-// Wide prefill calls (Infernix's 4,096-token calls): their workspace and the expert stream's ring
-// are frames lent by the expert cache for the prompt, so the static workspace stays sized for the
-// configured chunk. A prompt shorter than kStreamMinColumns runs static calls without the stream.
-constexpr std::int32_t kWideChunk        = 4096;
+// Wide prefill calls: their workspace and the expert stream's ring are frames lent by the expert
+// cache for the prompt, so the static workspace stays sized for the configured chunk. A prompt
+// shorter than kStreamMinColumns runs static calls without the stream.
+// Width: kWideChunk (8,192) on a slow link (below kSlowLinkShare of the reference, measured at
+// startup), kFastLinkWideChunk (4,096, Infernix's) otherwise. A call streams nearly every
+// non-resident expert whatever its width, so on a slow link twice the columns halve the streamed
+// bytes per token (V100 over a 3.3 GB/s link: 38K-token prompt 40.9-41.0 -> 37.5 s, 8K 9.1-9.5 ->
+// 8.2 s, 10.7K 13.0 -> 12.45 s, the same output). A fast link has not been measured at 8,192, so it
+// keeps 4,096. The plan (IO, the workspace cap, the CPU share's columns) is sized for kWideChunk
+// either way; ProgramImpl::wide_call() picks the width once the link is known.
+constexpr std::int32_t kWideChunk         = 8192;
+constexpr std::int32_t kFastLinkWideChunk = 4096;
 constexpr std::int32_t kStreamMinColumns = 512;
 // Ring frames per half: a layer's every expert, so every non-resident one streams and a wide call
 // needs no staging pass (resident counts vary widely by layer: a 320-frame half left 29% of the
@@ -277,6 +287,17 @@ constexpr std::size_t kDecodePromotionsPerLayer = 1;
 // Once the frames are full, decode promotes only every interval-th round on the reference link.
 constexpr std::uint64_t kDecodePromotionInterval = 4;
 constexpr double kReferenceLinkBytesPerSecond    = 27.5e9;
+// A link below this share of the reference fills a warm start's free frames in the background at
+// startup (fill_free_frames_on_slow_link).
+constexpr double kSlowLinkShare = 0.5;
+// On such a link --cpu-verify-misses hands the CPU up to this many of a verification layer call's
+// misses and keeps none back for the link (pcie_divisor 0), against the service's 4 and a third kept
+// on a fast link: copying a 1.5 MB expert at ~3 GB/s costs more than the CPU computing its few
+// columns. V100 on a 3.3 GB/s link, a prompt's first (cold-cache) MTP3 pass, story/code/zh/fr:
+// 72.5/72.7/68.9/80.4 -> 77.8/85.9/70.7/81.8 tok/s (8 jobs: 76.9/84.3/70.6/81.8; 32: no better);
+// warm passes unchanged; the same output (placement-invariant routes).
+constexpr int kSlowLinkVerifyJobs    = 16;
+constexpr int kSlowLinkPcieDivisor   = 0;
 // Calls this narrow promote at the decode rate; wider prefill calls promote nothing.
 constexpr std::int32_t kServedCallColumns = 8;
 // A seeded count is capped, so an expert used heavily in an old session yields to new uses.
@@ -619,6 +640,10 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
         throw std::invalid_argument(
             "Qwen3.8-Flash-Next: --prefill-cpu-share must be a fraction in [0, 1] (denominator 1..32767)");
     }
+    if (o.prefill_cpu_max_columns < 1 ||
+        o.prefill_cpu_max_columns > static_cast<std::uint32_t>(ops::offloaded_moe::kMaxCpuSplitColumns)) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next: --prefill-cpu-max-columns must be 1..64");
+    }
     if (o.gdn_async_commit && o.mtp_draft_tokens == 0) {
         throw std::invalid_argument("Qwen3.8-Flash-Next: --gdn-async-commit folds MTP verification commits on a side "
                                     "stream and needs --spec mtp: add --spec mtp or remove --gdn-async-commit");
@@ -747,7 +772,8 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     d.sms       = sms;
     d.wide_work = execution::Forward::workspace_bytes(c, d.wide_chunk, d.pages * kPagedKVPageSize,
                                                       DeviceExecutionView{nullptr, sms}, o.moe_precast_input) +
-                  (o.shared_expert_stream ? execution::Forward::shared_expert_workspace_bytes(c, d.wide_chunk) : 0);
+                  (o.shared_expert_stream ? execution::Forward::shared_expert_workspace_bytes(c, d.wide_chunk) : 0) +
+                  execution::Forward::tensor_core_workspace_bytes(c, d.wide_chunk);
     d.vmm = VmmArena::supported(o.device);
 
     auto& b     = d.bytes;
@@ -874,6 +900,8 @@ public:
         // drive awake (a zero period leaves the keep-alive off).
         volume_.set_keepalive(std::chrono::milliseconds(options_.ngram_keepalive_ms),
                               std::chrono::milliseconds(kNgramKeepaliveWindowMs));
+        // --ngram-ram-mib: a prefix of the volume's blocks loads into RAM in the background.
+        volume_.hold_in_ram(options_.ngram_ram_bytes);
         vocab_ = dim(c_.vocab_size);
 
         // Every fixed allocation is checked against the plan and against device free memory (an
@@ -1164,15 +1192,23 @@ public:
             // the service's one buffer (layer calls run in stream order, each wait before the next
             // call's plan), each narrowed to its own jobs, columns and rule.
             const CpuMissPlan p  = plan_cpu_misses(options_);
+            const bool slow_link = link_ > 0.0 && link_ < kSlowLinkShare * kReferenceLinkBytesPerSecond;
+            if (slow_link && p.verify_jobs > 0) {
+                char line[160];
+                std::snprintf(line, sizeof(line),
+                              "verification misses: up to %d per layer call on the CPU, none kept for the %.1f GB/s link",
+                              p.verify_jobs_slow_link, link_ / 1e9);
+                diagnostic(line);
+            }
             experts.error        = cpu_error_device_;
             prefill_cpu_columns_ = p.prefill_columns;
             for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
                 ops::MoeCpuChannel channel = cpu_misses_->channel(static_cast<int>(l));
                 if (p.verify_jobs > 0) {
                     ops::MoeCpuChannel verify = channel;
-                    verify.max_jobs           = p.verify_jobs;
+                    verify.max_jobs           = slow_link ? p.verify_jobs_slow_link : p.verify_jobs;
                     verify.max_columns        = p.verify_columns;
-                    verify.pcie_divisor       = p.pcie_divisor;
+                    verify.pcie_divisor       = slow_link ? kSlowLinkPcieDivisor : p.pcie_divisor;
                     experts.cpu.push_back(verify);
                 }
                 if (p.prefill_jobs > 0) {
@@ -1181,6 +1217,7 @@ public:
                     prefill.max_columns        = p.prefill_columns;
                     prefill.share_num          = static_cast<std::int16_t>(p.share_num);
                     prefill.share_den          = static_cast<std::int16_t>(p.share_den);
+                    prefill.max_job_columns    = static_cast<std::int32_t>(options_.prefill_cpu_max_columns);
                     experts.prefill_cpu.push_back(prefill);
                 }
             }
@@ -1216,6 +1253,9 @@ public:
         select_lane(0);
         warm_vision();
         warm_start_experts();
+        if (options_.expert_cache && !options_.partial_ram_residency && residency_->frames() != 0) {
+            fill_free_frames_on_slow_link();
+        }
         device_.synchronize();
         report_startup();
         if (options_.context_cache_bytes != 0 || options_.context_nvme_bytes != 0) { setup_context_cache(); }
@@ -2428,10 +2468,10 @@ public:
     }
 
     // The prefill cost of prompt positions [begin, end): its tokens and calls (the wide route's
-    // 4,096-token calls from `begin`, which is how a resumed prefill runs) and the images it
+    // kWideChunk-token calls from `begin`, which is how a resumed prefill runs) and the images it
     // encodes again (any image with a token at or after `begin`: plan_lane_vision's set).
     runtime::PrefillWork work_between(const BasePlanImpl& base, std::uint32_t begin, std::uint32_t end) const {
-        return prefill_work_between(begin, end, static_cast<std::uint32_t>(std::max(plan_.chunk, plan_.wide_chunk)),
+        return prefill_work_between(begin, end, static_cast<std::uint32_t>(std::max(plan_.chunk, wide_call())),
                                     base.media);
     }
 
@@ -3357,14 +3397,14 @@ private:
         upload_pinned(io_device_.p, io_host_.data(), tokens.size() * 4, device_.stream);
     }
 
-    // Stages the inputs of positions [begin, begin + width) of the lane's history and uploads them:
-    // write_inputs' words, then the n-gram rows.
-    void stage(std::int32_t begin, std::int32_t width) {
+    // Stages the inputs of positions [begin, begin + width) of the lane's history and uploads them,
+    // all but the n-gram rows (the last part of the block): run_call reads those while the device
+    // runs the layers before the PLE layer and the expert stream copies.
+    void stage_inputs(std::int32_t begin, std::int32_t width) {
         write_inputs(begin, width);
         write_mtp_chunk(begin, width);
         call_vision_ = stage_vision(begin, width);
-        const std::size_t rows = read_rows(begin, width);
-        upload_pinned(io_device_.p, io_host_.data(), plan_.io.ngram + rows, device_.stream);
+        upload_pinned(io_device_.p, io_host_.data(), plan_.io.ngram, device_.stream);
     }
 
     // The same in two uploads, so the forward's front can start before the rows are read.
@@ -3463,7 +3503,13 @@ private:
 
     // The width of a prefill call. A half-width first call (to start the GPU after fewer n-gram
     // reads) measured slower: the extra call streams the non-resident experts once more.
-    std::int32_t call_width(bool wide) const noexcept { return wide ? plan_.wide_chunk : plan_.chunk; }
+    std::int32_t call_width(bool wide) const noexcept { return wide ? wide_call() : plan_.chunk; }
+
+    // A wide call's columns: the planned kWideChunk on a slow link, kFastLinkWideChunk otherwise
+    // (and before the link is measured, which then counts as fast).
+    std::int32_t wide_call() const noexcept {
+        return wide_call_ > 0 ? wide_call_ : std::min(plan_.wide_chunk, kFastLinkWideChunk);
+    }
 
     // The prefill call from `begin`: the route's width, ending at the prompt's end or at the next
     // capture group's frontier, whichever comes first (a capture copies the state there).
@@ -3512,23 +3558,23 @@ private:
             return_lease();
         }
         if (!stream_ || plan_.wide_work == 0 || remaining < kStreamMinColumns) { return false; }
-        // The workspace of this prompt's widest call (not the planned wide_chunk columns). The keys
-        // stay the planned envelope: Forward::attention runs the QSA selection at
-        // kv_.max_visible_keys, whose scratch grows with it, so a smaller figure here would
-        // under-allocate the lent arena.
-        const std::int32_t widest   = std::min(plan_.wide_chunk, remaining);
+        // The workspace of this prompt's widest call (not the planned wide_chunk columns), replayed
+        // from the Forward's own allocations (Forward::call_workspace_bytes: 0.86 GiB at 3.9K
+        // columns, where the configuration-only bound said 1.67). The keys stay the planned
+        // envelope: Forward::attention runs the QSA selection at kv_.max_visible_keys, whose
+        // scratch grows with it, so a smaller figure here would under-allocate the lent arena.
+        const std::int32_t widest   = std::min(wide_call(), remaining);
         const std::uint32_t keys    = plan_.pages * kPagedKVPageSize;
         const std::size_t work      = std::min<std::size_t>(
-            plan_.wide_work,
-            execution::Forward::workspace_bytes(c_, widest, keys, DeviceExecutionView{nullptr, plan_.sms},
-                                                options_.moe_precast_input) +
-                (options_.shared_expert_stream ? forward_->max_shared_expert_scratch_bytes(widest) : 0));
+            plan_.wide_work, forward_->call_workspace_bytes(widest, keys, DeviceExecutionView{nullptr, plan_.sms}));
+        lease_work_ = work;
         const std::uint64_t stride  = residency_->frame_stride();
         const std::size_t tables    = align(stream_->table_bytes());
         const auto work_frames      = static_cast<std::uint32_t>((tables + work + stride - 1) / stride);
         const std::uint32_t can     = residency_->lendable();
         if (can < work_frames + 2) { return false; } // a small cache: static calls through staging
-        const std::uint32_t ring    = std::min(2 * c_.moe.experts, (can - work_frames) & ~1U);
+        const std::uint32_t ring =
+            std::min({2 * c_.moe.experts, (can - work_frames) & ~1U, ring_need(widest, work_frames)});
         lease_          = residency_->lend(work_frames + ring, device_.stream);
         lease_owner_    = cur_;
         auto* base      = static_cast<std::byte*>(lease_.memory.data);
@@ -3556,6 +3602,37 @@ private:
         return true;
     }
 
+    // The stream ring this prompt's calls need: twice the most experts a layer streams (the layer
+    // parities take a half each). A layer streams its non-resident experts less the cold set its
+    // call leaves to the CPU (run_call's share of the widest call, which streams the most: 1 when
+    // the CPU takes every miss; prefill promotes nothing, so the residency the calls see is the one
+    // before the lend less the lend's evictions), counted from the residency before the lend, plus a margin for the experts the lend itself evicts (it
+    // spreads them over the layers: their mean, three standard deviations and 8). A layer needing
+    // more than its half stages the rest, as before. Each frame not lent keeps an expert cached
+    // through the prompt: a 3.9K-token prompt needed 382 frames instead of 1024.
+    std::uint32_t ring_need(std::int32_t widest, std::uint32_t work_frames) {
+        int num = 0, den = 1;
+        if (widest <= prefill_cpu_columns_ && prefill_cpu_share_live()) {
+            const bool all = widest <= static_cast<std::int32_t>(options_.prefill_cpu_all_columns);
+            num = all ? 1 : static_cast<int>(options_.prefill_cpu_share_num);
+            den = all ? 1 : static_cast<int>(options_.prefill_cpu_share_den);
+        }
+        const std::uint32_t E = c_.moe.experts, layers = c_.num_hidden_layers;
+        const std::int32_t* table = residency_->host_table();
+        std::uint32_t most = 0;
+        for (std::uint32_t l = 0; l < layers; ++l) {
+            std::uint32_t n = 0;
+            for (std::uint32_t e = 0; e < E; ++e) { n += table[static_cast<std::size_t>(l) * E + e] < 0 ? 1U : 0U; }
+            const auto cold = static_cast<std::uint32_t>(
+                ops::offloaded_moe::cpu_share_take(static_cast<int>(n), static_cast<int>(n), num, den));
+            most = std::max(most, n - cold);
+        }
+        // The lend evicts work_frames + the ring; a first estimate of the ring sizes the margin.
+        const double mean   = static_cast<double>(work_frames + 2 * most) / std::max(1U, layers);
+        const auto margin   = static_cast<std::uint32_t>(std::ceil(mean + 3.0 * std::sqrt(mean))) + 8;
+        return 2 * std::min(E, most + margin);
+    }
+
     // Runs every step even when an earlier one threw, then rethrows the first failure. Used where a
     // wait (a device sync, a stream drain) precedes handing a lent run back: a failed wait must not
     // skip the give-back, or the frames stay lent for good. The give-back itself orders its copies
@@ -3580,7 +3657,17 @@ private:
     // still has them lent.
     void return_lease() {
         if (!lease_.valid()) { return; }
-        wide_peak_ = std::max(wide_peak_, wide_work_ ? wide_work_->peak_used() : 0);
+        const std::size_t peak = wide_work_ ? wide_work_->peak_used() : 0;
+        wide_peak_ = std::max(wide_peak_, peak);
+        if (peak > lease_work_ && !lease_work_reported_) {
+            // The lent arena's frames round the estimate up, so the call still fit; but the replay
+            // in Forward::call_workspace_bytes no longer matches the forward's allocations.
+            lease_work_reported_ = true;
+            char line[200];
+            std::snprintf(line, sizeof(line), "prefill workspace: a call peaked at %zu bytes, above the %zu estimated",
+                          peak, lease_work_);
+            diagnostic(line);
+        }
         // The forward must never keep pointing at the lent arena destroyed below.
         if (forward_) { forward_->use_workspace(*work_); }
         wide_work_.reset();
@@ -3888,13 +3975,16 @@ private:
     // A wide call allocates from the lent workspace and streams its non-resident experts. With MTP
     // the call also writes the drafter's cells of its positions.
     void run_call(std::int32_t begin, std::int32_t width, bool wide) {
-        stage(begin, width);
+        stage_inputs(begin, width);
         residency_->before_round(device_.stream);
         auto b = batch(width);
         // --prefill-cpu-share: the call hands the CPU its share of each layer's misses (a call wider
         // than the prefill channel's columns stays on the GPU). A streamed call first leaves each
         // layer's predicted-cold experts out of the stream (ExpertStream::Share), so they are misses.
         b.cpu_share = width <= prefill_cpu_columns_ && prefill_cpu_share_live();
+        // --prefill-cpu-all-columns: a short call's misses see few tokens each, so the CPU takes them all.
+        const bool all_to_cpu = b.cpu_share && width <= static_cast<std::int32_t>(options_.prefill_cpu_all_columns);
+        forward_->set_prefill_cpu_all(all_to_cpu);
         if (b.cpu_share) {
             arm_cpu_error(true);
         } else {
@@ -3902,20 +3992,30 @@ private:
         }
         if (mtp_chunk_) { b.mtp_chunk = &*mtp_chunk_; }
         b.vision = call_vision_;
+        // The forward in two parts around the n-gram read: the front (the layers before the PLE
+        // layer, the only reader of the rows) and the expert stream's first copies are queued
+        // before the read, so a call whose rows were not prefetched (a prompt's first) reads them
+        // from the volume (~0.8 s for 4K tokens on this drive) while the device and the link work.
+        const std::uint32_t split = forward_->rows_layer();
+        const auto forward        = [&] {
+            forward_->run_front(b, split);
+            upload_rows(begin, width);
+            forward_->run_back(b, split, logits32_);
+        };
         if (!wide) {
-            forward_->run(b, logits32_);
+            forward();
         } else {
             forward_->use_workspace(*wide_work_);
             try {
                 execution::ExpertStream::Share share;
                 if (b.cpu_share) {
                     residency_->use_counts(stream_counts_);
-                    share = {static_cast<int>(options_.prefill_cpu_share_num),
-                             static_cast<int>(options_.prefill_cpu_share_den), stream_counts_.data()};
+                    share = {all_to_cpu ? 1 : static_cast<int>(options_.prefill_cpu_share_num),
+                             all_to_cpu ? 1 : static_cast<int>(options_.prefill_cpu_share_den), stream_counts_.data()};
                 }
                 stream_->begin(residency_->host_table(), stream_tables_, ring_first_, ring_frames_, device_.stream,
                                share);
-                forward_->run(b, logits32_);
+                forward();
             } catch (...) {
                 stream_->end();
                 forward_->use_workspace(*work_);
@@ -4400,6 +4500,9 @@ private:
             g.draft_graphs.resize(static_cast<std::size_t>(plan_.drafts) + 1);
             g.draft_execs.resize(static_cast<std::size_t>(plan_.drafts) + 1);
             g.draft_runs.assign(static_cast<std::size_t>(plan_.drafts) + 1, 0);
+            g.draft_step_graphs.resize(static_cast<std::size_t>(plan_.drafts) + 1);
+            g.draft_step_execs.resize(static_cast<std::size_t>(plan_.drafts) + 1);
+            g.draft_step_runs.assign(static_cast<std::size_t>(plan_.drafts) + 1, 0);
             g.catch_graphs.resize(static_cast<std::size_t>(plan_.max_width) + 1);
             g.catch_execs.resize(static_cast<std::size_t>(plan_.max_width) + 1);
             g.catch_runs.assign(static_cast<std::size_t>(plan_.max_width) + 1, 0);
@@ -4620,6 +4723,59 @@ private:
         L().mtp_cells = L().state_tokens;
     }
 
+    // Drafter step j of a round's chain: the chain residual and the scratch tail as the previous step
+    // left them (step 0: as mtp_draft's graph copies them), the previous draft (step 0: the anchor).
+    void draft_step(std::int32_t j) {
+        const Tensor chain_tensor(spec_base() + plan_.spec.chain, DType::BF16, {dim(c_.residual_width()), 1});
+        auto call         = draft_call(j);
+        call.residuals    = chain_tensor;
+        call.ids          = j == 0 ? Tensor(static_cast<std::byte*>(io_device_.p) + plan_.io.draft_anchor, DType::I32, {1})
+                                   : spec_word(plan_.spec.w_drafts + static_cast<std::size_t>(j - 1), 1);
+        call.tail         = mtp_scratch_tail();
+        call.kv_only      = false;
+        call.residual_out = chain_tensor;
+        call.drafts       = spec_word(plan_.spec.w_drafts + static_cast<std::size_t>(j), 1);
+        if (options_.mtp_joint_acceptance) {
+            call.probs = Tensor(static_cast<std::byte*>(draft_probs_.p) + 4 * static_cast<std::size_t>(j), DType::FP32, {1});
+        }
+        forward_->run_mtp(call);
+    }
+
+    // --mtp-staged-drafts (with --mtp-joint-acceptance): the round's drafts one step at a time, up
+    // to `limit`. Step 0 is mtp_draft(1)'s graph; step j > 0 continues the chain through its own
+    // single-step graph, so every draft and probability is the full chain's, bit for bit. Drafting
+    // stops once the joint product of the drafts so far is below `threshold`: joint_acceptance_length
+    // breaks at that draft, so no later one could be verified and the window equals the one over
+    // `limit` drafts. The steps a round skips are the work saved; each extra step costs a host sync.
+    std::span<const TokenId> mtp_draft_staged(std::int32_t limit, float threshold) {
+        const cudaStream_t s = device_.stream;
+        stage_draft_words(limit);
+        std::span<const TokenId> first = mtp_draft(1);
+        const auto* probs = static_cast<const float*>(draft_probs_host_.data());
+        std::int32_t made = 1;
+        float joint       = joint_acceptance_table(probs[0]);
+        while (made < limit && joint >= threshold) {
+            const nvtx::ScopedRange range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Decode);
+            const std::int32_t j = made;
+            const auto at        = static_cast<std::size_t>(j);
+            replay(G().draft_step_graphs.at(at), G().draft_step_execs.at(at), G().draft_step_runs.at(at),
+                   [&] { draft_step(j); });
+            CUDA_CHECK(cudaMemcpyAsync(spec_words_host() + plan_.spec.w_drafts + j, spec_words_device() + plan_.spec.w_drafts + j,
+                                       4, cudaMemcpyDeviceToHost, s));
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<float*>(draft_probs_host_.data()) + j,
+                                       static_cast<const float*>(draft_probs_.p) + j, 4, cudaMemcpyDeviceToHost, s));
+            {
+                const nvtx::ScopedRange wait(nvtx::Name::DecodeMtpWait, nvtx::Category::Decode);
+                device_.synchronize();
+            }
+            joint = joint * joint_acceptance_table(probs[j]);
+            ++made;
+        }
+        (void)first;
+        drafts_.assign(spec_words_host() + plan_.spec.w_drafts, spec_words_host() + plan_.spec.w_drafts + made);
+        return drafts_;
+    }
+
     // `steps` chained drafter steps from the saved residual and the anchor (Infernix mtp_draft):
     // step j writes the cell S - 1 + j and drafts the token at S + 1 + j. The steps pool from a copy
     // of the drafter's tail. Returns the drafts on the host (with --mtp-joint-acceptance their
@@ -4636,23 +4792,7 @@ private:
                    CUDA_CHECK(cudaMemcpyAsync(chain, saved_residual().data, column, cudaMemcpyDeviceToDevice, s));
                    const Tensor scratch = mtp_scratch_tail();
                    CUDA_CHECK(cudaMemcpyAsync(scratch.data, mtp_tail_.data, mtp_tail_.bytes(), cudaMemcpyDeviceToDevice, s));
-                   const Tensor chain_tensor(chain, DType::BF16, {dim(c_.residual_width()), 1});
-                   for (std::int32_t j = 0; j < steps; ++j) {
-                       auto call         = draft_call(j);
-                       call.residuals    = chain_tensor;
-                       call.ids          = j == 0 ? Tensor(static_cast<std::byte*>(io_device_.p) + plan_.io.draft_anchor,
-                                                           DType::I32, {1})
-                                                  : spec_word(plan_.spec.w_drafts + static_cast<std::size_t>(j - 1), 1);
-                       call.tail         = scratch;
-                       call.kv_only      = false;
-                       call.residual_out = chain_tensor;
-                       call.drafts       = spec_word(plan_.spec.w_drafts + static_cast<std::size_t>(j), 1);
-                       if (options_.mtp_joint_acceptance) {
-                           call.probs = Tensor(static_cast<std::byte*>(draft_probs_.p) + 4 * static_cast<std::size_t>(j),
-                                               DType::FP32, {1});
-                       }
-                       forward_->run_mtp(call);
-                   }
+                   for (std::int32_t j = 0; j < steps; ++j) { draft_step(j); }
                });
         CUDA_CHECK(cudaMemcpyAsync(spec_words_host() + plan_.spec.w_drafts, spec_words_device() + plan_.spec.w_drafts,
                                    4ULL * steps, cudaMemcpyDeviceToHost, s));
@@ -4699,9 +4839,12 @@ private:
         // --mtp-joint-acceptance (phase A): draft the ceiling, then verify the prefix the joint rule
         // keeps under the request's threshold (at least the first draft). A constrained row's masks
         // are filled for the verified drafts only.
-        const std::int32_t steps = options_.mtp_joint_acceptance ? limit : choose_draft_length(limit);
+        std::int32_t steps = options_.mtp_joint_acceptance ? limit : choose_draft_length(limit);
         if (steps == 0) { return std::nullopt; }
-        auto drafts = mtp_draft(steps);
+        auto drafts = options_.mtp_staged_drafts && options_.mtp_joint_acceptance
+                          ? mtp_draft_staged(steps, L().joint_threshold.current())
+                          : mtp_draft(steps);
+        steps = static_cast<std::int32_t>(drafts.size());
         if (options_.mtp_joint_acceptance) {
             const std::span<const float> probs(static_cast<const float*>(draft_probs_host_.data()),
                                                static_cast<std::size_t>(steps));
@@ -5602,10 +5745,20 @@ private:
             if (source != nullptr) { rate = measure_h2d_bytes_per_second(source, staging_.p, plan_.staging, 32); }
         }
         if (rate > 0.0) { link_ = rate; }
-        char text[160];
-        std::snprintf(text, sizeof(text), "PCIe link to the GPU: %.1f GB/s%s; decode promotes every %llu tokens once full",
-                      link_ / 1e9, options_.link_bytes_per_second > 0.0 ? " (fixed)" : " measured",
-                      static_cast<unsigned long long>(promotion_interval()));
+        // On a slow link a give-back leaves the returned frames free for decode's promotions
+        // instead of refilling them in one burst (ExpertResidency::set_refill_on_return): after an
+        // 8K-token prompt on a 3.3 GB/s link, decode 64.0 -> 75.7-76.9 tok/s at a higher hit rate
+        // (2026-11-18). A fast link refills as before.
+        const bool slow_link = link_ > 0.0 && link_ < kSlowLinkShare * kReferenceLinkBytesPerSecond;
+        residency_->set_refill_on_return(!slow_link);
+        // Wide prefill calls of kWideChunk columns on a slow link only (see kWideChunk).
+        wide_call_ = slow_link ? plan_.wide_chunk : std::min(plan_.wide_chunk, kFastLinkWideChunk);
+        char text[300];
+        std::snprintf(text, sizeof(text),
+                      "PCIe link to the GPU: %.1f GB/s%s; prefill calls of up to %d tokens; decode promotes every %llu tokens once full%s",
+                      link_ / 1e9, options_.link_bytes_per_second > 0.0 ? " (fixed)" : " measured", wide_call(),
+                      static_cast<unsigned long long>(promotion_interval()),
+                      slow_link ? "; frames a prompt lent come back free (decode promotes into them)" : "");
         diagnostic(text);
     }
 
@@ -5694,6 +5847,23 @@ private:
                       std::chrono::duration<double>(Clock::now() - start).count());
         diagnostic(line);
         expert_state_routed_ = residency_->stats().routed;
+    }
+
+    // On a slow link the frames a warm start leaves free fill in the background now, while the
+    // server waits for its first request. Otherwise the first wide prefill's give-back fills them
+    // all (12 GiB for Qwen3.8-Flash-Next on a 32 GB card: ~4 s at 3.3 GB/s, which the next request
+    // waited out), and until then decode promotes them at its own rate (the first requests hit
+    // 80-87% instead of 99%+). A fast link keeps the reference behaviour.
+    void fill_free_frames_on_slow_link() {
+        if (link_ <= 0.0 || link_ >= kSlowLinkShare * kReferenceLinkBytesPerSecond) { return; }
+        const std::uint32_t loads = residency_->fill_free(device_.stream);
+        if (loads == 0) { return; }
+        char line[200];
+        std::snprintf(line, sizeof(line),
+                      "expert cache: filling %u free frames (%.1f GiB) in the background (a %.1f GB/s link)", loads,
+                      static_cast<double>(loads) * static_cast<double>(residency_->frame_stride()) / (1ULL << 30),
+                      link_ / 1e9);
+        diagnostic(line);
     }
 
     void warm_start_experts() {
@@ -5982,7 +6152,7 @@ private:
             std::snprintf(text, sizeof(text),
                           "request: %u prompt + %u generated tokens; prefill %.2f s, decode %.2f s (%.2f tok/s); expert "
                           "cache %u frames, %.1f%% of %llu routed experts hit, %llu promotions; decode %.1f%% of %llu hit, "
-                          "%llu promotions; since start %.1f%%; n-gram rows %llu (%llu cached, %llu block reads, %.2f s; "
+                          "%llu promotions; since start %.1f%%; n-gram rows %llu (%llu cached, %llu from RAM (%.0f%% of the blocks held), %llu block reads, %.2f s; "
                           "decode %llu block reads, %.2f s); VRAM free %zu MiB",
                           L().prompt_tokens, generated, seconds(L().prefill_ns), seconds(L().decode_ns),
                           L().decode_ns ? (generated > 1 ? (generated - 1) / seconds(L().decode_ns) : 0.0) : 0.0,
@@ -5994,6 +6164,10 @@ private:
                           static_cast<unsigned long long>(s.promotions - d.promotions),
                           s.routed ? 100.0 * static_cast<double>(s.hits) / static_cast<double>(s.routed) : 0.0,
                           static_cast<unsigned long long>(n.rows - m.rows), static_cast<unsigned long long>(n.hits - m.hits),
+                          static_cast<unsigned long long>(n.ram - m.ram),
+                          c_.ple.table.blocks ? 100.0 * static_cast<double>(volume_.ram_blocks_loaded()) /
+                                                    static_cast<double>(c_.ple.table.blocks)
+                                              : 0.0,
                           static_cast<unsigned long long>(n.reads - m.reads), seconds(n.read_ns - m.read_ns),
                           static_cast<unsigned long long>(n.reads - L().ngram_at_decode.reads),
                           seconds(n.read_ns - L().ngram_at_decode.read_ns), free_vram >> 20);
@@ -6008,8 +6182,22 @@ private:
                               wide_peak_ >> 20, plan_.wide_work >> 20, static_cast<unsigned long long>(refilled_));
                 diagnostic(text);
             }
+            // The ops library counts linears the sm_70 tensor-core route handed back for want of
+            // workspace (they run the default kernels, more slowly); a rise is a workspace sizing
+            // gap, reported here because the ops library does not log.
+            const std::uint64_t tc_fallbacks = ops::sm70_tensor_core_fallbacks();
+            if (tc_fallbacks > tc_fallbacks_reported_) {
+                std::snprintf(text, sizeof(text),
+                              "sm_70 tensor cores: %llu linear calls since start found too little workspace and ran "
+                              "the default kernels",
+                              static_cast<unsigned long long>(tc_fallbacks));
+                diagnostic(text);
+                tc_fallbacks_reported_ = tc_fallbacks;
+            }
         } catch (...) {}
     }
+
+    mutable std::uint64_t tc_fallbacks_reported_ = 0; // ops::sm70_tensor_core_fallbacks at the last report
 
     const execution::Parameters& parameters_;
     DeviceContext& device_;
@@ -6031,6 +6219,7 @@ private:
     std::uint32_t frames_now_ = 0, startup_frames_ = 0;
     std::uint64_t pool_now_ = 0;
     double link_            = kReferenceLinkBytesPerSecond;
+    std::int32_t wide_call_ = 0; // wide_call(): set by measure_link
 
     DeviceBuffer state_backing_;
     std::unique_ptr<VmmRange> kv_vmm_;
@@ -6105,6 +6294,8 @@ private:
     std::int32_t* stream_tables_ = nullptr;
     std::uint32_t ring_first_ = 0, ring_frames_ = 0;
     std::size_t wide_peak_ = 0;
+    std::size_t lease_work_         = 0; // the held lease's workspace estimate
+    bool lease_work_reported_       = false;
     std::uint64_t leases_ = 0, refilled_ = 0;
     std::uint32_t last_lease_ = 0;
     // The next prefill call's n-gram rows, read while the device runs the current one.
@@ -6128,6 +6319,10 @@ private:
         std::vector<DecodeGraphDefinition> verify_front, verify_back, draft_graphs, catch_graphs, row_catch_graphs;
         std::vector<DecodeGraphExecutable> verify_front_exec, verify_back_exec, draft_execs, catch_execs, row_catch_execs;
         std::vector<std::uint64_t> verify_runs, verify_back_runs, draft_runs, catch_runs, row_catch_runs;
+        // --mtp-staged-drafts: draft step j > 0 alone, continuing the chain (index j).
+        std::vector<DecodeGraphDefinition> draft_step_graphs;
+        std::vector<DecodeGraphExecutable> draft_step_execs;
+        std::vector<std::uint64_t> draft_step_runs;
     };
     std::vector<LaneGraphs> lane_graphs_;
     LaneGraphs& G() noexcept { return lane_graphs_[cur_]; }
@@ -6346,6 +6541,8 @@ CpuMissPlan plan_cpu_misses(const ProgramOptions& options) {
         // work) but its column cap: the widest verification.
         const om::CpuMissService::Options defaults;
         p.verify_jobs    = defaults.max_jobs;
+        // A slow link (startup measures it after this plan) gives the CPU more: the buffers fit both.
+        p.verify_jobs_slow_link = std::max(p.verify_jobs, detail::kSlowLinkVerifyJobs);
         // Under --mtp-rows-verify a genuine batched round calls moe() with T = B * W columns (B up
         // to max_concurrency lanes, W up to 1 + drafts), not just the single-row path's 1 + drafts
         // -- cpu_served() rejects any call past max_columns, so sizing this for the single-row case
@@ -6374,7 +6571,7 @@ CpuMissPlan plan_cpu_misses(const ProgramOptions& options) {
         p.share_num = static_cast<int>(options.prefill_cpu_share_num);
         p.share_den = static_cast<int>(options.prefill_cpu_share_den);
     }
-    p.max_jobs    = std::max(p.verify_jobs, p.prefill_jobs);
+    p.max_jobs    = std::max({p.verify_jobs, p.verify_jobs_slow_link, p.prefill_jobs});
     p.max_columns = std::max(p.verify_columns, p.prefill_columns);
     p.device      = sizeof(std::uint32_t);
     // The service's mapped request, x [H, max_columns], y [H, max_jobs * 8] and its done/heartbeat

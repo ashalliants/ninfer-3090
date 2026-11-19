@@ -15,11 +15,14 @@
 // order (ops/common/canonical_ggml.h), so the outputs equal the CPU engine's bits. Without staging
 // the expert kernels resolve their records themselves and no stage kernel runs.
 
+#include "ops/common/smem_limit.h"
 #include "ninfer/ops/offloaded_sparse_moe.h"
 
 #include "core/device.h"
 
 #include "ops/common/canonical_ggml.h"
+#include "ops/common/memory.cuh"
+#include "ops/common/warp.cuh"
 #include "ops/offloaded_sparse_moe/coresident.h"
 #include "ops/offloaded_sparse_moe/cpu_selection.h"
 #include "ops/offloaded_sparse_moe/cuda/expert_decode.cuh"
@@ -57,7 +60,7 @@ constexpr int kGateUpCtas = moe::kIntermediate / kUnitRows; // 40
 constexpr int kDownCtas   = moe::kHidden / kDownRows;       // 40
 constexpr int kXGroups    = moe::kHidden / canon::kA8Values;       // 80
 constexpr int kHGroups    = moe::kIntermediate / canon::kA8Values; // 20
-constexpr int kMaxDynamicSmem = 99 * 1024;
+constexpr int kMaxDynamicSmem = kMaxDynamicSharedBytes;
 
 // MoeExpertSource::precast_input, gate_up_variant and host_slots lie in the padding after `format`: the kernels
 // taking the source by value keep their parameter layout.
@@ -110,17 +113,16 @@ Geometry device_geometry(const moe::RecordGeometry& g) {
 // read zero-copy over PCIe.
 __device__ __forceinline__ void stage_async(const std::uint8_t* src, std::uint8_t* dst, int bytes) {
     for (int i = static_cast<int>(threadIdx.x) * 16; i < bytes; i += static_cast<int>(blockDim.x) * 16) {
-        const auto s = static_cast<unsigned>(__cvta_generic_to_shared(dst + i));
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(src + i) : "memory");
+        cp_async_mem<16>(dst + i, src + i);
     }
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
+    cp_commit_mem();
 }
 
-__device__ __forceinline__ void stage_wait() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
+__device__ __forceinline__ void stage_wait() { cp_wait_mem<0>(); }
 
 // Waits until at most one issued group is still in flight (the CTA computes the first half of its
 // slice while the second half lands).
-__device__ __forceinline__ void stage_wait_but_one() { asm volatile("cp.async.wait_group 1;\n" ::: "memory"); }
+__device__ __forceinline__ void stage_wait_but_one() { cp_wait_mem<1>(); }
 
 // The distance between device frames (MoeExpertSource::frame_stride, record_stride when zero).
 __device__ __forceinline__ std::uint64_t frame_stride(const MoeExpertSource& source) {
@@ -146,6 +148,47 @@ __device__ __forceinline__ const std::uint8_t* job_record(const MoeExpertSource&
                       : source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride;
 }
 
+// MoeExpertSource::precast_input: the A8 cast of every column of x (BF16 [T][kHidden]) into codes
+// [T][kHidden] and scales [T][kXGroups], one thread per group, with the same cast the gate/up CTAs
+// apply otherwise (quantize_columns_bf16), so the codes are the same bits.
+// Four lanes per group (quantize_q8_1_part, the same bits): the one-thread form unrolls all 32
+// values (~700 instructions, run once per call with cold instruction caches on Volta).
+constexpr int kPrecastLanes = 4;
+
+__device__ __forceinline__ void precast_block(const bf16* __restrict__ x, int groups, std::int8_t* __restrict__ q,
+                                              float* __restrict__ d, int block) {
+    const int t    = block * kThreads + static_cast<int>(threadIdx.x);
+    const int i    = t / kPrecastLanes, part = t % kPrecastLanes;
+    const bool real = i < groups; // every lane of a warp joins the group's shuffles
+    const uint4 raw = real ? *reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(i) * canon::kA8Values + 8 * part)
+                           : make_uint4(0, 0, 0, 0);
+    const std::uint32_t bits[4] = {raw.x, raw.y, raw.z, raw.w};
+    float value[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        value[2 * j]     = __uint_as_float(bits[j] << 16);
+        value[2 * j + 1] = __uint_as_float(bits[j] & 0xFFFF0000U);
+    }
+    int words[2];
+    const float scale = ggml::quantize_q8_1_part<kPrecastLanes>(value, words);
+    if (!real) { return; }
+    *reinterpret_cast<int2*>(q + static_cast<std::size_t>(i) * canon::kA8Values + 8 * part) = make_int2(words[0], words[1]);
+    if (part == 0) { d[i] = scale; }
+}
+
+__global__ void __launch_bounds__(kThreads)
+    precast_kernel(const bf16* __restrict__ x, int groups, std::int8_t* __restrict__ q, float* __restrict__ d) {
+    precast_block(x, groups, q, d, static_cast<int>(blockIdx.x));
+}
+
+// A precast riding a stage launch: its CTAs follow the kStageCtas staging CTAs (groups == 0: none).
+struct PrecastJob {
+    const bf16* x  = nullptr;
+    int groups     = 0;
+    std::int8_t* q = nullptr;
+    float* d       = nullptr;
+};
+
 // ------------------------------------------------------------------------------------- staging
 
 constexpr int kStageCtas   = 16;    // with 16 KiB chunks, a 256 KiB window of host reads in flight
@@ -159,10 +202,14 @@ constexpr int kMaxPassJobs = 512;
 __global__ void __launch_bounds__(kThreads)
     stage_kernel(MoeDispatch dispatch, MoeExpertSource source, std::uint32_t record_bytes, int job_base,
                  int pass_jobs, const std::int32_t* __restrict__ cpu_flags,
-                 const std::uint8_t** __restrict__ job_records) {
+                 const std::uint8_t** __restrict__ job_records, PrecastJob precast = {}) {
     __shared__ int miss_jobs[kMaxPassJobs];
     __shared__ int warp_misses[kWarps];
     __shared__ int misses;
+    if (static_cast<int>(blockIdx.x) >= kStageCtas) {
+        precast_block(precast.x, precast.groups, precast.q, precast.d, static_cast<int>(blockIdx.x) - kStageCtas);
+        return;
+    }
     const int jobs = min(*dispatch.job_count - job_base, pass_jobs);
     if (jobs <= 0) { return; }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
@@ -215,7 +262,7 @@ __global__ void __launch_bounds__(kThreads)
     const int chunks = static_cast<int>((record_bytes + kStageChunk - 1) / kStageChunk);
     constexpr int kVec = kStageChunk / 16;
     const int total    = misses * chunks;
-    for (int c = blockIdx.x; c < total; c += gridDim.x) {
+    for (int c = blockIdx.x; c < total; c += kStageCtas) {
         const int m = c / chunks, offset = (c % chunks) * kStageChunk;
         const int bytes  = min(kStageChunk, static_cast<int>(record_bytes) - offset);
         const int expert = dispatch.jobs[miss_jobs[m]];
@@ -429,34 +476,31 @@ __device__ void quantize_columns_bf16(Base base, int n, int groups, std::int8_t*
 // The same for FP32 columns (h), 16-byte loads.
 template <class Base>
 __device__ void quantize_columns_f32(Base base, int n, int groups, std::int8_t* q, float* d) {
-    for (int i = threadIdx.x; i < n * groups; i += blockDim.x) {
-        const int c = i / groups, g = i % groups;
-        const auto* src = reinterpret_cast<const float4*>(base(c) + canon::kA8Values * g);
-        float v[32];
+    // Four lanes a group (quantize_q8_1_part: the same steps, the amax combined across the lanes),
+    // so a one-column cast keeps 80 threads busy instead of 20 while the rest wait at the barrier.
+    constexpr int kLanes = 4;
+    const int total      = n * groups * kLanes;
+    for (int t0 = 0; t0 < total; t0 += static_cast<int>(blockDim.x)) { // whole warps join the shuffles
+        const int t = t0 + static_cast<int>(threadIdx.x);
+        const int i = t / kLanes, part = t % kLanes;
+        const bool real = t < total;
+        float v[32 / kLanes];
+        if (real) {
+            const int c = i / groups, g = i % groups;
+            const auto* src = reinterpret_cast<const float4*>(base(c) + canon::kA8Values * g + 8 * part);
+            const float4 a = src[0], b = src[1];
+            v[0] = a.x, v[1] = a.y, v[2] = a.z, v[3] = a.w, v[4] = b.x, v[5] = b.y, v[6] = b.z, v[7] = b.w;
+        } else {
 #pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            const float4 f = src[k];
-            v[4 * k]       = f.x;
-            v[4 * k + 1]   = f.y;
-            v[4 * k + 2]   = f.z;
-            v[4 * k + 3]   = f.w;
+            for (int k = 0; k < 32 / kLanes; ++k) { v[k] = 0.0F; }
         }
-        d[i] = canon::a8_quantize_f32(v, q + i * canon::kA8Values);
+        int words[8 / kLanes];
+        const float scale = ggml::quantize_q8_1_part<kLanes>(v, words);
+        if (real) {
+            *reinterpret_cast<int2*>(q + i * canon::kA8Values + 8 * part) = make_int2(words[0], words[1]);
+            if (part == 0) { d[i] = scale; }
+        }
     }
-}
-
-// MoeExpertSource::precast_input: the A8 cast of every column of x (BF16 [T][kHidden]) into codes
-// [T][kHidden] and scales [T][kXGroups], one thread per group, with the same cast the gate/up CTAs
-// apply otherwise (quantize_columns_bf16), so the codes are the same bits.
-__global__ void __launch_bounds__(kThreads)
-    precast_kernel(const bf16* __restrict__ x, int groups, std::int8_t* __restrict__ q, float* __restrict__ d) {
-    const int i = static_cast<int>(blockIdx.x) * kThreads + static_cast<int>(threadIdx.x);
-    if (i >= groups) { return; }
-    int words[8];
-    d[i]      = ggml::quantize_q8_1_group(x + static_cast<std::size_t>(i) * canon::kA8Values, words);
-    auto* dst = reinterpret_cast<int4*>(q + static_cast<std::size_t>(i) * canon::kA8Values);
-    dst[0]    = make_int4(words[0], words[1], words[2], words[3]);
-    dst[1]    = make_int4(words[4], words[5], words[6], words[7]);
 }
 
 // The precast codes and scales of `n` columns (column c is x column column(c)) into the shared
@@ -537,6 +581,18 @@ struct GateUpShared {
     float xd[NC * kXGroups];
     float y[NC][2 * kUnitRows];
 };
+
+// Entries (8 bytes each) of the codebook gate_up_registers_kernel copies to shared memory before
+// decoding: the pointer-table formats on Volta, 0 otherwise. Their decoders gather four codebook
+// entries per sub-block at lane-divergent indices; from global memory those gathers back up the
+// load queue (lg_throttle) on Volta. The entries are the same bits either way.
+template <QType F>
+constexpr int kSharedGridEntries =
+#if defined(NINFER_SM70)
+    F == QType::GGML_IQ2_XXS ? 256 : F == QType::GGML_IQ2_S ? 1024 : F == QType::GGML_IQ1_M ? 2048 : 0;
+#else
+    0;
+#endif
 
 // One CTA per (16 intermediates u, job): gate rows 16u..16u+15 and up rows likewise, SwiGLU, and h
 // in FP32 to the entry's row of h_rows ([entries][kIntermediate]). A warp computes kGateUpRowsPerWarp
@@ -640,6 +696,11 @@ __global__ void __launch_bounds__(kThreads)
 
 constexpr int kRegistersRows      = kWarps;                            // intermediates per item: one a warp
 constexpr int kRegistersRowBlocks = moe::kIntermediate / kRegistersRows; // 80 items per job
+#if defined(NINFER_SM70)
+constexpr bool kSingleColumnJobPath = true;
+#else
+constexpr bool kSingleColumnJobPath = false;
+#endif
 constexpr int kRegistersBlocksPerSm = 2; // the launch bound; the grid follows the measured occupancy
 
 // The exact int32 P of one sub-block against one column's codes (canonical_ggml.h step 3), in
@@ -731,7 +792,13 @@ __global__ void __launch_bounds__(kThreads, kRegistersBlocksPerSm)
     const int jobs = min(*dispatch.job_count - job_base, pass_jobs);
     if (jobs <= 0) { return; }
     const int items   = jobs * kRegistersRowBlocks;
-    const auto grid   = moe::device::ExpertFormat<F>::table();
+    auto grid         = moe::device::ExpertFormat<F>::table();
+    if constexpr (kSharedGridEntries<F> > 0) {
+        __shared__ uint2 grid_s[kSharedGridEntries<F>];
+        for (int e = static_cast<int>(threadIdx.x); e < kSharedGridEntries<F>; e += kThreads) { grid_s[e] = grid[e]; }
+        __syncthreads();
+        grid = grid_s;
+    }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     for (int item = static_cast<int>(blockIdx.x); item < items; item += static_cast<int>(gridDim.x)) {
         const int job = job_base + item / kRegistersRowBlocks;
@@ -753,7 +820,18 @@ __global__ void __launch_bounds__(kThreads, kRegistersBlocksPerSm)
                 cd[c]        = xd + t * kXGroups;
             }
             float gv[NC], uv[NC];
-            gate_up_pair<F, NC>(gate, up, cq, cd, n, gv, uv, grid);
+            if (kSingleColumnJobPath && NC > 1 && n == 1) {
+                // A job of one column (most of a verify round's): the one-column body, without the
+                // multi-column body's per-column guards. The same operations on column 0.
+                float g1[1], u1[1];
+                const std::int8_t* const q1[1] = {cq[0]};
+                const float* const d1[1]       = {cd[0]};
+                gate_up_pair<F, 1>(gate, up, q1, d1, 1, g1, u1, grid);
+                gv[0] = g1[0];
+                uv[0] = u1[0];
+            } else {
+                gate_up_pair<F, NC>(gate, up, cq, cd, n, gv, uv, grid);
+            }
             if (lane < n) { // lane c writes column c (every lane holds every value)
                 float gl = gv[0], ul = uv[0];
 #pragma unroll
@@ -795,6 +873,17 @@ int coresident_grid() {
     return out;
 }
 
+// Volta: down_kernel decodes its rows where the record is instead of staging its slice in shared
+// memory first. The cp.async staging is emulated there as a synchronous copy, so every warp waited
+// at the barrier for the whole slice before any computed (barrier stalls led the kernel's profile);
+// in place, each warp starts on its rows as they arrive, and a warp's small decode loads share L1
+// lines. The rows' bytes, and so the bits, are the same.
+#if defined(NINFER_SM70)
+constexpr bool kDownInPlace = true;
+#else
+constexpr bool kDownInPlace = false;
+#endif
+
 template <int NC>
 struct DownShared {
     alignas(16) std::int8_t hq[NC * moe::kIntermediate];
@@ -811,8 +900,7 @@ __global__ void __launch_bounds__(kThreads)
     extern __shared__ __align__(16) unsigned char smem_raw[];
     constexpr int RD      = kDownRowsPerWarp;
     const int slice_bytes = kDownRows * static_cast<int>(g.down_row_bytes);
-    std::uint8_t* stage   = smem_raw;
-    auto& sm              = *reinterpret_cast<DownShared<NC>*>(smem_raw + slice_bytes);
+    auto& sm = *reinterpret_cast<DownShared<NC>*>(smem_raw + (kDownInPlace ? 0 : slice_bytes));
     const int job         = job_base + static_cast<int>(blockIdx.y);
     if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
     const int expert           = dispatch.jobs[job];
@@ -820,8 +908,11 @@ __global__ void __launch_bounds__(kThreads)
     const std::uint8_t* record = job_record(source, job_records, expert, job);
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
     const std::uint8_t* slice = record + g.down_offset + static_cast<std::size_t>(tile) * slice_bytes;
-    stage_async(slice, stage, slice_bytes / 2);
-    stage_async(slice + slice_bytes / 2, stage + slice_bytes / 2, slice_bytes / 2);
+    const std::uint8_t* stage = kDownInPlace ? slice : smem_raw;
+    if constexpr (!kDownInPlace) {
+        stage_async(slice, smem_raw, slice_bytes / 2);
+        stage_async(slice + slice_bytes / 2, smem_raw + slice_bytes / 2, slice_bytes / 2);
+    }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     constexpr int kSubs = moe::kIntermediate / canon::kA8Values;
     const auto table    = moe::device::ExpertFormat<D>::table();
@@ -832,16 +923,27 @@ __global__ void __launch_bounds__(kThreads)
             [&](int c) { return h_rows + static_cast<std::size_t>(first + pass + c) * moe::kIntermediate; }, n, kHGroups,
             sm.hq, sm.hd);
         for (int half = 0; half < 2; ++half) {
-            if (half == 0) {
-                stage_wait_but_one();
-            } else {
-                stage_wait();
+            if constexpr (!kDownInPlace) {
+                if (half == 0) {
+                    stage_wait_but_one();
+                } else {
+                    stage_wait();
+                }
             }
-            __syncthreads();
+            if (!kDownInPlace || half == 0) { __syncthreads(); } // the cast columns, and the staged half
             for (int row0 = half * kDownRows / 2 + RD * warp; row0 < (half + 1) * kDownRows / 2; row0 += RD * kWarps) {
                 float v[RD][NC];
-                row_dots<D, NC, RD>(stage + static_cast<std::size_t>(row0) * g.down_row_bytes, g.down_row_bytes, kSubs,
-                                    sm.hq, sm.hd, kHGroups, n, v, table);
+                if (kSingleColumnJobPath && NC > 1 && n == 1) {
+                    // One column (most jobs of a verify round): the one-column body, same bits.
+                    float v1[RD][1];
+                    row_dots<D, 1, RD>(stage + static_cast<std::size_t>(row0) * g.down_row_bytes, g.down_row_bytes,
+                                       kSubs, sm.hq, sm.hd, kHGroups, 1, v1, table);
+#pragma unroll
+                    for (int r = 0; r < RD; ++r) { v[r][0] = v1[r][0]; }
+                } else {
+                    row_dots<D, NC, RD>(stage + static_cast<std::size_t>(row0) * g.down_row_bytes, g.down_row_bytes,
+                                        kSubs, sm.hq, sm.hd, kHGroups, n, v, table);
+                }
                 if (lane < n) {
                     const int column = dispatch.entries[first + pass + lane];
 #pragma unroll
@@ -885,7 +987,8 @@ template <QType D, int NC>
 void launch_down(const MoeDispatch& dispatch, const MoeExpertSource& source, const Geometry& g,
                  const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                  const float* h_rows, bf16* outputs, cudaStream_t stream) {
-    const int down_smem = kDownRows * static_cast<int>(g.down_row_bytes) + static_cast<int>(sizeof(DownShared<NC>));
+    const int down_smem =
+        (kDownInPlace ? 0 : kDownRows * static_cast<int>(g.down_row_bytes)) + static_cast<int>(sizeof(DownShared<NC>));
     configure_cuda_device_once([] {
         const void* kernel = reinterpret_cast<const void*>(down_kernel<D, NC>);
         cudaError_t e      = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSmem);
@@ -1023,8 +1126,9 @@ void launch_pass(QType gate_up, QType down, int columns, const bf16* x, const Mo
 // Device bookkeeping of a call's CPU jobs, in the caller's workspace.
 struct CpuCall {
     std::int32_t pending; // the published sequence, 0 when nothing was published
-    std::int32_t jobs;
-    std::int32_t job[moe::kMaxCpuJobs];
+    std::int32_t jobs;    // request slots
+    std::int32_t job[moe::kMaxCpuJobs];    // each slot's job
+    std::int32_t column[moe::kMaxCpuJobs]; // each slot's first column within its job (a multiple of 8)
 };
 
 __device__ __forceinline__ std::uint64_t global_ns() {
@@ -1034,13 +1138,16 @@ __device__ __forceinline__ std::uint64_t global_ns() {
 }
 
 static_assert(moe::kMaxCpuJobColumns == moe::kMaxColumns, "select_cpu_jobs mirrors the CPU job width");
+static_assert(moe::kMaxCpuSplitJobColumns == moe::kMaxCpuSplitColumns, "select_cpu_jobs mirrors the split width");
 // The share fields sit in the channel's tail padding: every kernel's parameter layout is unchanged.
 static_assert(sizeof(MoeCpuChannel) == 6 * sizeof(void*) + 6 * sizeof(std::int32_t),
               "MoeCpuChannel grew: the expert kernels' parameter offsets moved");
 
 // One CTA picks the CPU jobs: of the call's M misses, want = min(max_jobs, M - M / pcie_divisor)
 // (with share_den > 0: min(max_jobs, round(M * share_num / share_den)), halves up) of those with at
-// most max_job_columns columns, the fewest-column ones first and, within a width, in job order
+// most max_job_columns columns, the fewest-column ones first and, within a width, in job order,
+// while their request slots fit in max_jobs (a job of w columns takes ceil(w / 8) consecutive
+// slots, which the CPU computes as separate jobs of the same expert)
 // (offloaded_moe::select_cpu_jobs and, for the share, select_prefill_cpu_jobs state the same rule
 // on the host; jobs are in ascending expert id, so job order is id order). Publishing x is one CTA's
 // copy of the chosen jobs' columns: slow for a call of many columns. Each thread ranks
@@ -1051,7 +1158,7 @@ static_assert(sizeof(MoeCpuChannel) == 6 * sizeof(void*) + 6 * sizeof(std::int32
 __global__ void __launch_bounds__(kThreads)
     cpu_plan_kernel(MoeDispatch dispatch, MoeExpertSource source, const bf16* __restrict__ x, int columns, int top_k,
                     int max_jobs, std::int32_t* __restrict__ cpu_flags, CpuCall* __restrict__ call) {
-    constexpr int kWidths    = moe::kMaxColumns;
+    constexpr int kWidths    = moe::kMaxCpuSplitColumns;
     constexpr int kMaskWords = moe::kMaxCpuCallColumns / 32;
     __shared__ int width_misses[kWidths + 1];
     __shared__ int warp_misses[kWarps][kWidths + 1];
@@ -1082,7 +1189,7 @@ __global__ void __launch_bounds__(kThreads)
         const int count = dispatch.offsets[expert + 1] - dispatch.offsets[expert];
         if (count <= max_width) { atomicAdd(&width_misses[count], 1); }
     }
-    own = __reduce_add_sync(0xFFFFFFFFU, own);
+    own = masked_reduce_add(0xFFFFFFFFU, own);
     if (lane == 0) { atomicAdd(&misses, own); }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -1098,14 +1205,18 @@ __global__ void __launch_bounds__(kThreads)
         } else if (!failed) {
             want = min(cap, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
         }
-        int m          = 0;
+        // Widths ascend, so a width whose next job's slots do not fit leaves no room for a wider one:
+        // the host's take_cpu_slots (cpu_selection.h).
+        int m = 0, slots = 0;
         for (int w = 1; w <= kWidths; ++w) {
-            first_slot[w] = m;
-            take[w]       = min(width_misses[w], want - m);
+            const int per = (w + moe::kMaxColumns - 1) / moe::kMaxColumns;
+            first_slot[w] = slots;
+            take[w]       = w <= max_width ? min(width_misses[w], min(want - m, (cap - slots) / per)) : 0;
             m += take[w];
+            slots += take[w] * per;
         }
-        chosen     = m;
-        call->jobs = m;
+        chosen     = slots;
+        call->jobs = slots;
     }
     __syncthreads();
     if (chosen == 0) {
@@ -1124,8 +1235,7 @@ __global__ void __launch_bounds__(kThreads)
             }
         }
         int rank = 0;
-#pragma unroll
-        for (int w = 1; w <= kWidths; ++w) {
+        for (int w = 1; w <= max_width; ++w) {
             const unsigned ballot = __ballot_sync(0xFFFFFFFFU, width == w);
             if (lane == 0) { warp_misses[warp][w] = __popc(ballot); }
             if (width == w) { rank = __popc(ballot & ((1U << lane) - 1U)); }
@@ -1135,12 +1245,17 @@ __global__ void __launch_bounds__(kThreads)
             rank += carry[width];
             for (int v = 0; v < warp; ++v) { rank += warp_misses[v][width]; }
             if (rank < take[width]) {
-                const int slot                = first_slot[width] + rank;
-                cpu_flags[j]                  = 1;
-                call->job[slot]               = j;
-                channel.request->expert[slot] = expert;
-                channel.request->ncols[slot]  = width;
-                slot_first[slot]              = first;
+                const int per  = (width + moe::kMaxColumns - 1) / moe::kMaxColumns;
+                const int base = first_slot[width] + rank * per;
+                cpu_flags[j]   = 1;
+                for (int part = 0; part < per; ++part) {
+                    const int slot                = base + part;
+                    call->job[slot]               = j;
+                    call->column[slot]            = part * moe::kMaxColumns;
+                    channel.request->expert[slot] = expert;
+                    channel.request->ncols[slot]  = min(moe::kMaxColumns, width - part * moe::kMaxColumns);
+                    slot_first[slot]              = first + part * moe::kMaxColumns;
+                }
                 for (int c = 0; c < width; ++c) {
                     const int column = dispatch.entries[first + c] / top_k;
                     atomicOr(&used[column / 32], 1U << (column % 32));
@@ -1235,8 +1350,11 @@ __global__ void __launch_bounds__(kThreads)
     const int mine = (n - 1 - static_cast<int>(blockIdx.x)) / kWaitCtas + 1;
     if (static_cast<int>(threadIdx.x) < mine) {
         const int k      = threadIdx.x;
-        const int expert = dispatch.jobs[call->job[blockIdx.x + k * kWaitCtas]];
-        const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
+        const int slot   = static_cast<int>(blockIdx.x) + k * kWaitCtas;
+        const int expert = dispatch.jobs[call->job[slot]];
+        // The slot's columns of its job: 8 from its first, or the rest.
+        const int first = dispatch.offsets[expert] + call->column[slot];
+        const int count = min(moe::kMaxColumns, dispatch.offsets[expert + 1] - first);
         for (int c = 0; c < count; ++c) { entries[k * moe::kMaxColumns + c] = dispatch.entries[first + c]; }
     }
     __syncthreads();
@@ -1285,6 +1403,31 @@ __global__ void combine_kernel(const bf16* __restrict__ outputs, const float* __
     }
     sum = __fmaf_rn(shared_gate[t], __bfloat162float(shared[static_cast<std::size_t>(t) * hidden + d]), sum);
     y[static_cast<std::size_t>(t) * hidden + d] = __float2bfloat16_rn(sum);
+}
+
+// combine_kernel followed by hyper_connection_inject's update of every stream with the stored
+// (rounded) y, in one pass: the same y and residual bits as the two kernels.
+__global__ void combine_inject_kernel(const bf16* __restrict__ outputs, const float* __restrict__ weights,
+                                      const float* __restrict__ shared_gate, const bf16* __restrict__ shared,
+                                      int hidden, int top_k, int columns, bf16* __restrict__ y,
+                                      const float* __restrict__ inject, int streams, bf16* __restrict__ residual) {
+    const int d = blockIdx.y * blockDim.x + threadIdx.x;
+    const int t = blockIdx.x;
+    if (d >= hidden || t >= columns) { return; }
+    float sum = 0.0F;
+    for (int k = 0; k < top_k; ++k) { // fixed slot order
+        sum = __fmaf_rn(weights[static_cast<std::size_t>(t) * top_k + k],
+                        __bfloat162float(outputs[(static_cast<std::size_t>(t) * top_k + k) * hidden + d]), sum);
+    }
+    sum = __fmaf_rn(shared_gate[t], __bfloat162float(shared[static_cast<std::size_t>(t) * hidden + d]), sum);
+    const bf16 stored = __float2bfloat16_rn(sum);
+    y[static_cast<std::size_t>(t) * hidden + d] = stored;
+    const float v           = __bfloat162float(stored);
+    const std::size_t width = static_cast<std::size_t>(streams) * hidden;
+    for (int s = 0; s < streams; ++s) {
+        bf16& r = residual[static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d];
+        r       = __float2bfloat16_rn(__bfloat162float(r) + inject[static_cast<std::size_t>(t) * streams + s] * v);
+    }
 }
 
 // ------------------------------------------------------------------------------------ workspace
@@ -1465,7 +1608,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         require(source.cpu.request != nullptr && source.cpu.x != nullptr && source.cpu.y != nullptr &&
                     source.cpu.done != nullptr && source.cpu.sequence != nullptr &&
                     source.cpu.max_jobs <= moe::kMaxCpuJobs && source.cpu.max_columns <= moe::kMaxCpuCallColumns &&
-                    source.cpu.max_job_columns >= 1 && source.cpu.max_job_columns <= moe::kMaxColumns &&
+                    source.cpu.max_job_columns >= 1 && source.cpu.max_job_columns <= moe::kMaxCpuSplitColumns &&
                     source.cpu.pcie_divisor >= 0 && source.cpu.share_den >= 0 && source.cpu.share_num >= 0 &&
                     source.cpu.share_num <= source.cpu.share_den && reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0 &&
                     reinterpret_cast<std::uintptr_t>(source.cpu.x) % 16 == 0,
@@ -1498,6 +1641,8 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     const bool narrow = !wide || !moe::wide::all_wide(x.ne[1]);
     // The input's A8 cast, once for every pass's narrow gate/up CTAs (the wide route casts its own).
     PrecastInput precast;
+    PrecastJob precast_job;
+    int precast_job_ctas = 0;
     if (cast_given && narrow) {
         // The kernels only read the planes (PrecastInput also carries the planes the cast writes).
         precast.q = const_cast<std::int8_t*>(input.codes);
@@ -1506,10 +1651,19 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         require(reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0, "precast input needs 16-byte aligned x");
         const std::int64_t groups = static_cast<std::int64_t>(x.ne[1]) * kXGroups;
         require(groups <= std::numeric_limits<int>::max(), "precast input exceeds INT_MAX groups");
-        precast_kernel<<<grid_blocks(groups, kThreads, kGridMaxX, "precast input exceeds the launch grid"), kThreads, 0,
-                         stream>>>(static_cast<const bf16*>(x.data), static_cast<int>(groups), layout.precast.q,
-                                   layout.precast.d);
-        check_launch("precast");
+        const int precast_ctas =
+            grid_blocks(groups * kPrecastLanes, kThreads, kGridMaxX, "precast input exceeds the launch grid");
+        if (source.staging_slots > 0) {
+            // In the first stage launch's grid (the gate/up kernels read it after that launch).
+            precast_job = PrecastJob{static_cast<const bf16*>(x.data), static_cast<int>(groups), layout.precast.q,
+                                     layout.precast.d};
+            precast_job_ctas = precast_ctas;
+        } else {
+            precast_kernel<<<precast_ctas, kThreads, 0, stream>>>(static_cast<const bf16*>(x.data),
+                                                                  static_cast<int>(groups), layout.precast.q,
+                                                                  layout.precast.d);
+            check_launch("precast");
+        }
         precast = layout.precast;
     }
     for (int base = 0; base < max_jobs; base += pass_jobs) {
@@ -1517,10 +1671,12 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         // Without staging the expert kernels resolve their records themselves.
         const std::uint8_t* const* records = nullptr;
         if (source.staging_slots > 0) {
-            stage_kernel<<<kStageCtas, kThreads, 0, stream>>>(dispatch, stage_source,
-                                                              static_cast<std::uint32_t>(geometry.bytes), base, jobs,
-                                                              flags, layout.job_records);
+            stage_kernel<<<kStageCtas + precast_job_ctas, kThreads, 0, stream>>>(
+                dispatch, stage_source, static_cast<std::uint32_t>(geometry.bytes), base, jobs, flags,
+                layout.job_records, precast_job);
             check_launch("stage");
+            precast_job      = PrecastJob{};
+            precast_job_ctas = 0;
             records = layout.job_records;
         }
         if (narrow) {
@@ -1560,6 +1716,38 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
         static_cast<const float*>(routing.shared_gate.data), static_cast<const bf16*>(shared.data), hidden, top_k,
         columns, static_cast<bf16*>(y.data));
     check_launch("combine");
+}
+
+void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared, Tensor& y,
+                        const Tensor& inject, Tensor& residual, cudaStream_t stream) {
+    require(contiguous(outputs, DType::BF16) && contiguous(shared, DType::BF16) && contiguous(y, DType::BF16) &&
+                contiguous(routing.weights, DType::FP32) && contiguous(routing.shared_gate, DType::FP32) &&
+                contiguous(inject, DType::FP32) && contiguous(residual, DType::BF16),
+            "combine requires contiguous BF16 tensors and FP32 routing");
+    const std::int64_t hidden64 = y.ne[0], columns64 = y.ne[1], top_k64 = routing.weights.ne[0];
+    require(top_k64 >= 1 && top_k64 <= 16, "combine supports top_k in [1, 16]");
+    require(hidden64 > 0 && hidden64 <= std::numeric_limits<int>::max() && columns64 > 0 &&
+                columns64 * top_k64 <= std::numeric_limits<int>::max(),
+            "combine dimensions out of range");
+    const int hidden = static_cast<int>(hidden64), columns = static_cast<int>(columns64),
+              top_k = static_cast<int>(top_k64);
+    require(outputs.ne[0] == hidden && outputs.ne[1] == columns * top_k && shared.ne[0] == hidden &&
+                shared.ne[1] == columns && routing.weights.ne[1] == columns &&
+                routing.shared_gate.numel() == columns,
+            "combine shapes disagree");
+    const std::int64_t streams64 = inject.ne[0];
+    require(streams64 >= 1 && streams64 <= 64 && inject.ne[1] == columns && inject.numel() == streams64 * columns &&
+                residual.ne[0] == streams64 * hidden && residual.ne[1] == columns &&
+                residual.numel() == streams64 * hidden * columns,
+            "combine inject shapes disagree");
+    const dim3 grid(grid_blocks(columns, 1, kGridMaxX, "combine columns exceed the launch grid"),
+                    grid_blocks(hidden, kThreads, kGridMaxY, "combine hidden extent exceeds the launch grid"));
+    combine_inject_kernel<<<grid, kThreads, 0, stream>>>(
+        static_cast<const bf16*>(outputs.data), static_cast<const float*>(routing.weights.data),
+        static_cast<const float*>(routing.shared_gate.data), static_cast<const bf16*>(shared.data), hidden, top_k,
+        columns, static_cast<bf16*>(y.data), static_cast<const float*>(inject.data), static_cast<int>(streams64),
+        static_cast<bf16*>(residual.data));
+    check_launch("combine inject");
 }
 
 } // namespace ninfer::ops

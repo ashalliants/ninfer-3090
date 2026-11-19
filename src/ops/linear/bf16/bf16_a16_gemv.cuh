@@ -208,6 +208,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_g
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
     Epilogue epilogue, int input_rows) {
     const int K = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
+    // The column: blockIdx.y of a columnwise launch (launch_bf16_a16_gemv with columns), else 0.
+    // Each column runs the one-column arithmetic on its own activation.
+    const int column = static_cast<int>(blockIdx.y);
+    x += static_cast<std::size_t>(column) * K;
 
     __shared__ Bf16GemvSharedStorage<Schedule> shared;
     const __nv_bfloat16* activation = x;
@@ -248,7 +252,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_g
 #pragma unroll
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
                 const float values[]{warp_totals[local_row]};
-                linear_finish_row(destination, epilogue, row0 + local_row, 0, values, 1);
+                linear_finish_row(destination, epilogue, row0 + local_row, column, values, 1);
             }
         }
     } else {
@@ -268,7 +272,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_g
                 const float total   = warp_reduce_sum(partial);
                 if (lane == 0) {
                     const float values[]{total};
-                    linear_finish_row(destination, epilogue, row0 + local_row, 0, values, 1);
+                    linear_finish_row(destination, epilogue, row0 + local_row, column, values, 1);
                 }
             }
         }

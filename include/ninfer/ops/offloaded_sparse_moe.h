@@ -107,10 +107,16 @@ namespace offloaded_moe {
 
 inline constexpr int kHidden       = 2560;
 inline constexpr int kIntermediate = 640;
-inline constexpr int kMaxColumns   = 8; // columns of one CPU-served expert
+inline constexpr int kMaxColumns   = 8; // columns of one CPU-served expert (one request slot)
+// The widest job a channel may hand the CPU (MoeCpuChannel::max_job_columns): a job of w > 8
+// columns takes ceil(w / 8) consecutive request slots of the same expert, 8 columns each and the
+// last the rest. Every column's output is the same bits in any grouping.
+inline constexpr int kMaxCpuSplitColumns = 64;
 
 inline constexpr int kMaxCpuJobs        = 512;  // CPU-served experts per layer call
-inline constexpr int kMaxCpuCallColumns = 4096; // columns of a CPU-served call
+// Columns of a CPU-served call: a Qwen3.8-Flash-Next wide prefill call's 8192. cpu_plan_kernel holds
+// two shorts per column in static shared memory (32 KiB at 8192, within the 48 KiB limit).
+inline constexpr int kMaxCpuCallColumns = 8192;
 
 // Device-detected failure code of a call's error word (layer << 16 | code). Host-reported failures
 // carry an errno value, all below 0x8000.
@@ -269,7 +275,9 @@ struct MoeCpuChannel {
     std::int32_t max_jobs               = 0; // 0 disables
     std::int32_t max_columns            = 0;
     std::int32_t pcie_divisor           = 3;
-    std::int32_t max_job_columns        = offloaded_moe::kMaxColumns; // 1..kMaxColumns
+    // 1..kMaxCpuSplitColumns; a job wider than kMaxColumns takes ceil(width / 8) request slots, and
+    // max_jobs bounds the slots.
+    std::int32_t max_job_columns        = offloaded_moe::kMaxColumns;
     // The share rule (prefill calls): 0 <= share_num <= share_den; share_den == 0 keeps the divisor.
     // Two 16-bit words in the struct's tail padding, so its size and every kernel's parameter
     // offsets are unchanged.
@@ -389,6 +397,11 @@ void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const Mo
 /// top_k * T to INT_MAX; larger extents are refused before launch.
 void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared, Tensor& y,
                  cudaStream_t stream);
+
+/// moe_combine, then hyper_connection_inject(y, inject, residual) in the same launch: inject FP32
+/// [S, T], residual BF16 [S*H, T] (S <= 64). The same y and residual bits as the two calls.
+void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared, Tensor& y,
+                        const Tensor& inject, Tensor& residual, cudaStream_t stream);
 
 namespace offloaded_moe {
 

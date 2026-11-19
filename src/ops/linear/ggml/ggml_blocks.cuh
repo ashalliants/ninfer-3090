@@ -147,10 +147,22 @@ struct Format<QType::GGML_IQ4_XS> {
     __device__ static void decode(const std::uint8_t* row, int s, const Tables& t, SubBlock& out) {
         const std::uint8_t* b = row + (s >> 3) * kBlockBytes;
         const int ib          = s & 7;
+#if defined(NINFER_SM70)
+        // The block's 8-byte header (d, scales_h, scales_l) in one load: Volta's load queue
+        // throttled on the three small loads a sub-block issued. Same bytes.
+        const uint2 header    = *reinterpret_cast<const uint2*>(b);
+        const std::uint32_t h = header.x >> 16;
+        const int ls          = ((header.y >> (8 * (ib >> 1) + 4 * (ib & 1))) & 0x0F) |
+                       (static_cast<int>((h >> (2 * ib)) & 3) << 4);
+        out.scale[0] = out.scale[1] =
+            __half2float(__ushort_as_half(static_cast<unsigned short>(header.x & 0xFFFFU))) *
+            static_cast<float>(ls - 32);
+#else
         const std::uint32_t h = load_u16(b + 2);
         const int ls          = ((b[4 + (ib >> 1)] >> (4 * (ib & 1))) & 0x0F) |
                        (static_cast<int>((h >> (2 * ib)) & 3) << 4);
         out.scale[0] = out.scale[1] = load_half(b) * static_cast<float>(ls - 32);
+#endif
         // Blocks are 136 bytes, so the codes of an 8-byte aligned row are 8-byte aligned.
         const auto* qs = reinterpret_cast<const uint2*>(b + 8 + 16 * ib);
         const uint2 q01 = qs[0];
@@ -445,6 +457,39 @@ __device__ __forceinline__ float quantize_q8_1_group(const __nv_bfloat16* x, int
     const float inverse  = canon::a8_inverse(amax);
 #pragma unroll
     for (int w = 0; w < 8; ++w) {
+        std::uint32_t word = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int q = canon::a8_code(value[4 * w + j], prescale, inverse);
+            word |= (static_cast<std::uint32_t>(q) & 0xFFU) << (8 * j);
+        }
+        words[w] = static_cast<int>(word);
+    }
+    return canon::a8_scale(amax);
+}
+
+// quantize_q8_1_group split over Lanes adjacent lanes (an aligned group of a warp): the lane at
+// position p of the group holds values 32 / Lanes * p onward and gets their code words; every lane
+// gets d. amax is the group's maximum of the lanes' a8_amax_step runs (a maximum of non-NaN values,
+// so its bits do not depend on the order), and each code is the same a8_code of the same operands,
+// so the result is the per-thread form's. The per-thread form unrolls all 32 values (~700
+// instructions), which matters to a decode GEMV that runs with cold instruction caches
+// (ggml_mmvq.cuh). Every lane of the warp must call it.
+template <int Lanes>
+__device__ __forceinline__ float quantize_q8_1_part(const float (&value)[32 / Lanes], int (&words)[8 / Lanes]) {
+    static_assert(Lanes == 1 || Lanes == 2 || Lanes == 4 || Lanes == 8);
+    float amax = 0.0F;
+#pragma unroll
+    for (int j = 0; j < 32 / Lanes; ++j) amax = canon::a8_amax_step(amax, value[j]);
+#pragma unroll
+    for (int offset = Lanes / 2; offset > 0; offset >>= 1) {
+        const float other = __shfl_xor_sync(0xFFFFFFFFU, amax, offset);
+        amax              = other > amax ? other : amax;
+    }
+    const float prescale = canon::a8_prescale(amax);
+    const float inverse  = canon::a8_inverse(amax);
+#pragma unroll
+    for (int w = 0; w < 8 / Lanes; ++w) {
         std::uint32_t word = 0;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {

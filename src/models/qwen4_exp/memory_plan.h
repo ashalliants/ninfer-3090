@@ -117,6 +117,14 @@ struct ContextCacheFit {
                                                 std::uint64_t requested, std::uint64_t minimum,
                                                 std::uint64_t granule);
 
+// --ngram-ram-mib: what the n-gram volume's RAM-held blocks (pageable) may take. They come last:
+// the ledger's reserve, every planned allocation, the experts' full need and the context cache
+// (`demand` as planned, its context_cache already fitted) come first, then `margin` more stays free
+// for the system and other programs. At most `requested`; zero when that leaves nothing.
+inline constexpr std::uint64_t kNgramRamMargin = 2 * kLedgerGiB;
+[[nodiscard]] std::uint64_t fit_ngram_ram(const HostMemorySnapshot& snapshot, const HostMemoryDemand& demand,
+                                          std::uint64_t requested, std::uint64_t margin = kNgramRamMargin);
+
 // ---------------------------------------------------------------- partial RAM residency
 
 // --partial-ram-residency (FlashNextOptions::partial_ram_residency; program/ram_slots.h): host RAM

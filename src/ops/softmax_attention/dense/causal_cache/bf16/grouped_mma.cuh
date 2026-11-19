@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/common/smem_limit.h"
 #include "ops/softmax_attention/dense/causal_cache/bf16/epilogue.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/softmax.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/split_policy.h"
@@ -55,7 +56,7 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
     constexpr int NK = N / S::kWarpsKV, QKNt = NK / 8, QKKs = D / 16;
     constexpr int PVNt = D / 8, PVKs = NK / 16;
     using Storage = Bf16KvGroupedStorage<G, S>;
-    static_assert(sizeof(Storage) <= 99 * 1024);
+    static_assert(sizeof(Storage) <= kMaxDynamicSharedBytes);
     Storage* storage;
     if constexpr (sizeof(Storage) <= 48 * 1024) {
         __shared__ Storage fixed;

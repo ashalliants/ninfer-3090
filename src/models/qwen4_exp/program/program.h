@@ -386,6 +386,8 @@ struct ProgramOptions {
     std::filesystem::path ngram_volume;
     // The n-gram volume's keep-alive period in milliseconds (0: off); see FlashNextOptions.
     std::uint32_t ngram_keepalive_ms = 40;
+    // FlashNextOptions::ngram_ram_bytes as the RAM ledger fitted it (0: off).
+    std::uint64_t ngram_ram_bytes = 0;
     // The expert cache's saved state: read at startup to fill the frames (warm start), written at
     // shutdown and, between requests, every 10 minutes. Empty: no warm start. The identity names
     // the artifact the state belongs to.
@@ -429,6 +431,11 @@ struct ProgramOptions {
     // JointAcceptanceThreshold. It replaces the acceptance-estimate policy; with mtp_fixed_drafts
     // it is refused. Off: the drafter graphs, the drafts and the window are as before.
     bool mtp_joint_acceptance = false;
+    // FlashNextOptions::mtp_staged_drafts: with mtp_joint_acceptance, a round drafts one step at a
+    // time (the first through draft_graphs[1], each later one through a single-step continuation
+    // graph) and stops once the joint product of the drafts so far is below the threshold. The
+    // drafts it makes are the full chain's first ones, bit for bit, and the window is the same.
+    bool mtp_staged_drafts = false;
     // FlashNextOptions::mtp_rows_verify: a round with more than one eligible row speculates
     // genuinely in a single batched draft-and-verify (docs/maintainer/mtp-multi-row-lanes-design.md)
     // instead of always falling back to a plain round. Requires mtp_joint_acceptance. Off by
@@ -502,6 +509,11 @@ struct ProgramOptions {
     // once the service thread has failed, prefill stays on the GPU. 0 <= num <= den, 1 <= den <= 32767.
     std::uint32_t prefill_cpu_share_num = 0;
     std::uint32_t prefill_cpu_share_den = 1;
+    // FlashNextOptions::prefill_cpu_all_columns: a cpu_share call of at most this many columns uses
+    // share 1 / 1 instead (the channel's rule, and its stream's cold set). 0: off.
+    std::uint32_t prefill_cpu_all_columns = 0;
+    // FlashNextOptions::prefill_cpu_max_columns: the prefill channel's max_job_columns (1..64).
+    std::uint32_t prefill_cpu_max_columns = 8;
     // FlashNextOptions::gdn_async_commit: a verification commit the row continues from folds its
     // GDN columns on the Program's fold stream (gdn_fold_on_side_stream); every later device use of
     // the state (the next round's front, any other entry point) waits for it. Requires MTP
@@ -601,6 +613,7 @@ struct NgramFlagPlan {
 struct CpuMissPlan {
     int workers = 0, max_jobs = 0, max_columns = 0;
     int verify_jobs = 0, verify_columns = 0, pcie_divisor = 0;
+    int verify_jobs_slow_link = 0; // verify_jobs on a link below half the reference (the CPU takes more)
     int prefill_jobs = 0, prefill_columns = 0, share_num = 0, share_den = 0;
     std::uint64_t device   = 0;
     std::uint64_t pinned   = 0;

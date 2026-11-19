@@ -40,6 +40,14 @@ void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tenso
                               Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
                               cudaStream_t stream);
 
+// causal_conv1d_silu_split and gdn_gating_decay_packed(ab, decay, dt_bias, g, beta) (gdn_gating.h),
+// whose operands must not overlap the convolution's outputs or states: one launch where the
+// small-T route runs the convolution, with the same bits as the two calls.
+void causal_conv1d_silu_split_gated(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
+                                    Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
+                                    const Tensor& ab, const Tensor& decay, const Tensor& dt_bias, Tensor& g,
+                                    Tensor& beta, cudaStream_t stream);
+
 /**
  * Snapshot form for B independent sequences. `x` and `out` are contiguous BF16 [C,W,B],
  * `conv_states` is contiguous BF16 [C,3,Slots], and `initial_state_slots` and

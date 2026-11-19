@@ -225,7 +225,12 @@ int main() {
                         "attn_input_proj.q4_q5.mixed.r32.c32.s2",
                         "attn_input_proj.q4_q5.pair.r32.c64.s3",
                         "attn_input_proj.q4_q5.pair.r32.c64.s4",
-                        "attn_input_proj.q4_q5.parent_split_fixed"}));
+#if !defined(NINFER_SM70)
+                        "attn_input_proj.q4_q5.parent_split_fixed"
+#else
+                        "attn_input_proj.q4_q5.small_t.mma"
+#endif
+                       }));
 
     std::size_t total = 0;
     bool identity_changed = false;
@@ -280,6 +285,10 @@ int main() {
     //                          ParentSplitFixed since 2026-09-11, when the small-T MMA took
     //                          1..8 from it (q4_q5_attn_input_plan.cpp), and upstream's
     //                          MixedR32C32S2 from the 2026-10-09 catch-up, never measured here.
+    //                          On sm_70 ParentSplitFixed is routed again and takes all of 1..32
+    //                          (the streaming GEMV, in passes of eight tokens past eight), and
+    //                          the small-T MMA it replaces -- emulated there -- is unrouted in
+    //                          its place, so the Volta build pins 5 here and 41 as well.
     //
     // All of them are kept on purpose: deleting an upstream schedule costs merge effort at every
     // future catch-up for no measured gain here. The point is that the set is written down.

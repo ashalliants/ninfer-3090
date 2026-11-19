@@ -169,6 +169,7 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
     device.synchronize();
     timing.end_wait();
     control.capture_reservation.reset();
+    control.capture_prefilled = false;
     if (control.capture_pending) { skip_capture(handle); }
     control.recovery.reset();
     if (control.permit) { settle_unit(lane); }
@@ -196,6 +197,7 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
         }
     }
     control.capture_reservation.reset();
+    control.capture_prefilled = false;
     if (control.prefill && control.prefill->vision) {
         control.prefill->retired_vision_seconds += control.prefill->vision->elapsed_seconds();
         control.prefill->vision.reset();

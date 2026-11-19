@@ -360,7 +360,8 @@ std::int32_t t2_a8_min_tokens() {
 
 bool t2_a8_admits(LinearPolicy policy) {
     return policy == LinearPolicy::AllowA8Int || policy == LinearPolicy::AllowA8IntDecode ||
-           policy == LinearPolicy::AllowPrefillCublas;
+           policy == LinearPolicy::AllowPrefillCublas ||
+           policy == LinearPolicy::AllowPrefillCublasNarrow;
 }
 
 bool t2_a8_shape_supported(std::int32_t output_rows, std::int32_t input_rows) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/math.cuh"
+#include "ops/linear/common/stream_gemv_decode.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -41,6 +42,71 @@ struct Q6SimtDecodeAtom {
             weights[pair]         = values.x * scale;
             weights[pair + 4]     = values.y * scale;
         }
+    }
+};
+
+// Q6 for the streaming GEMV (ops/linear/common/stream_gemv.cuh). One lane slice is 16 code bytes
+// (32 weights, nibble i of word w at k offset 8w + i) plus their eight high bytes, two per 8-weight
+// chunk: as a 16-bit word per chunk, weight i's high pair sits at bits 2i (b0) and 2i + 1 (b1),
+// and the value is ((n | (b0 | b1 << 1) << 4) ^ 0x20) - 0x20 = n + 16 b0 - 32 b1.
+// Against x', stream_decode_nibbles8 contributes sum(x') + sum(n x); stream_fold_bits8 adds
+// sum_even(x') + 2 sum_odd(x') + 16 sum(b0 x) and takes away 2 (sum_even(x') + 2 sum_odd(x')) +
+// 32 sum(b1 x). The constant left is -sum_odd(x'), so the correction per weight pair is -16 x_odd,
+// as for Q5.
+struct Q6StreamFormat {
+    static constexpr const char* kName = "q6";
+    static constexpr int kGroupK       = Q6RowSplitStorage::kGroupK;
+
+    struct Planes {
+        const std::uint8_t* codes;
+        const std::uint8_t* high;
+        const std::uint8_t* scales;
+    };
+    struct Row {
+        const uint4* codes;
+        const uint2* high;
+        const std::uint16_t* scales;
+    };
+    struct Slice {
+        uint4 codes;
+        uint2 high;
+        std::uint16_t scale;
+    };
+
+    __device__ static __forceinline__ Row row(const Planes& planes, int row, int padded_k) {
+        const std::int64_t groups = static_cast<std::int64_t>(row) * (padded_k / kGroupK);
+        return {reinterpret_cast<const uint4*>(planes.codes +
+                                               groups * Q6RowSplitStorage::kCodeBytesPerGroup),
+                reinterpret_cast<const uint2*>(planes.high +
+                                               groups * Q6RowSplitStorage::kHighBytesPerGroup),
+                reinterpret_cast<const std::uint16_t*>(
+                    planes.scales + groups * Q6RowSplitStorage::kScaleBytesPerGroup)};
+    }
+    // Slice v covers k 32v .. 32v + 31: code bytes 16v.., high bytes 8v.. (group v / 2).
+    __device__ static __forceinline__ Slice load(const Row& row, int v) {
+        return {__ldg(&row.codes[v]), __ldg(&row.high[v]), __ldg(&row.scales[v >> 1])};
+    }
+    __device__ static __forceinline__ Slice empty() {
+        return {make_uint4(0u, 0u, 0u, 0u), make_uint2(0u, 0u), 0};
+    }
+    __device__ static __forceinline__ float scale(const Slice& slice) {
+        return __half2float(__ushort_as_half(slice.scale));
+    }
+    __device__ static __forceinline__ float correction(float, float x_odd) {
+        return -kStreamOddScale * x_odd;
+    }
+    // The eight operands of packed word W (k offsets 8W .. 8W + 7 of the slice).
+    template <int W>
+    __device__ static __forceinline__ void decode_word(const Slice& slice,
+                                                       const StreamDecodeConstants& c,
+                                                       float (&f)[8]) {
+        const std::uint32_t words[4] = {slice.codes.x, slice.codes.y, slice.codes.z,
+                                        slice.codes.w};
+        const std::uint32_t highs[2] = {slice.high.x, slice.high.y};
+        const std::uint32_t high     = (highs[W >> 1] >> (16 * (W & 1))) & 0xffffu;
+        stream_decode_nibbles8(words[W], c, f);
+        stream_fold_bits8<2, 0, 16, false>(high, c, f);
+        stream_fold_bits8<2, 1, 32, true>(high, c, f);
     }
 };
 

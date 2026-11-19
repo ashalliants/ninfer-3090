@@ -234,10 +234,10 @@ std::string serve_usage_text(const char* argv0) {
            "[--reasoning-loop off|stop|conclude] "
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] "
            "[--no-cuda-graph] [--no-prefix-reuse] [--devices N,M,...] [--stage-layers A,B,...] "
-           "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
-           "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--mtp-rows-verify] [--ngram-prefetch] "
+           "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--ngram-ram-mib N|auto] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
+           "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--mtp-staged-drafts] [--mtp-rows-verify] [--ngram-prefetch] "
            "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
-           "[--moe-fused-route] [--cpu-verify-misses] [--prefill-cpu-share F] [--cpu-verify-workers N] [--gdn-async-commit] [--hc-int8 [--hc-fused-read]] "
+           "[--moe-fused-route] [--cpu-verify-misses] [--prefill-cpu-share F [--prefill-cpu-all-columns N] [--prefill-cpu-max-columns N]] [--cpu-verify-workers N] [--gdn-async-commit] [--hc-int8 [--hc-fused-read]] "
            "[--ngram-flag-wait] [--partial-ram-residency] [--ggml-decode-mma] "
            "[--ram-headroom-mib N] [--allow-unlocked-host-memory] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
@@ -250,7 +250,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--models-dir DIR] [--models-preset FILE] [--models-max N] [--no-models-autoload] "
            "[--unload-idle-seconds N] "
            "[--mlp-a8-decode] [--no-prefill-a8] "
-           "[--prefill-cublas [--no-prefill-cublas-projections]] "
+           "[--prefill-cublas | --no-prefill-cublas] [--no-prefill-cublas-projections] "
            "[--no-thinking] [--preserve-thinking] [--tolerant-tool-calls] "
            "[--graft NAME=PATH]... [--default-graft NAME] "
            "[--reasoning-effort minimal|low|medium|high|xhigh|max] [--cors] "
@@ -346,8 +346,10 @@ std::string serve_usage_text(const char* argv0) {
            "min(0.06 x max_context, N) tokens, at least 1500 (default 8000)\n"
            "       --prefill-cublas hands wide prefill GEMMs to cuBLAS: a large prefill speedup for a "
            "small perplexity cost (docs/performance.md), off by default, and it wants a larger "
-           "--prefill-chunk to pay; --no-prefill-cublas-projections keeps the attention and GDN "
-           "input projections off that route\n"
+           "--prefill-chunk to pay; in sm_70 (Tesla V100) builds it is FP16, exact in its scales, "
+           "and on by default, and --no-prefill-cublas turns it off; "
+           "--no-prefill-cublas-projections keeps the attention and GDN input projections off that "
+           "route\n"
            "       Qwen3.8-Flash-Next (one or two requests at once, --kv-dtype int8; \"the same "
            "output\" below is what an option is designed to keep, not yet checked on a GPU): prefix "
            "reuse keeps "
@@ -357,7 +359,10 @@ std::string serve_usage_text(const char* argv0) {
            "cache (0: disk only); --context-store DIR keeps it across restarts; "
            "--ngram-volume FILE is its n-gram table (default <model>.ngram); --ngram-keepalive-ms N "
            "reads a block from it after N ms of idleness so the drive stays awake (default 40, "
-           "0 turns it off, at most 60000); --expert-state FILE "
+           "0 turns it off, at most 60000); --ngram-ram-mib N|auto holds up to N MiB of the n-gram table in RAM "
+           "(auto: all the RAM ledger spares after the experts, the context cache, the other planned "
+           "allocations, the reserve and 2 GiB more), loaded in the background, so a prompt reads that "
+           "share of its rows from RAM instead of the drive (default 0, off; the same output); --expert-state FILE "
            "keeps the VRAM expert cache's state across restarts (default <model>.expert-state; "
            "--no-expert-state starts it empty and saves nothing); --default-expert-state FILE is a state "
            "shipped for a fresh install, read only when the saved one does not load (missing, another "
@@ -377,7 +382,10 @@ std::string serve_usage_text(const char* argv0) {
            "own grammar mask (off by default: they decode without MTP); --mtp-joint-acceptance "
            "(--spec mtp) drafts --draft-tokens each round and verifies the drafts whose joint chance "
            "of acceptance, estimated from each draft's probability, stays above an adaptive threshold "
-           "(off by default: an acceptance estimate picks the count before drafting); --mtp-rows-verify "
+           "(off by default: an acceptance estimate picks the count before drafting); --mtp-staged-drafts "
+           "(needs --mtp-joint-acceptance) drafts one step at a time and stops once no further draft "
+           "could be verified (the same output; off by default: every round drafts --draft-tokens); "
+           "--mtp-rows-verify "
            "(needs --mtp-joint-acceptance) batches a genuine draft-and-verify across every eligible row "
            "when two or more lanes decode together, instead of always falling back to a plain round "
            "(off by default: a known bug currently leaves one row's acceptance near zero once two rows "
@@ -399,7 +407,14 @@ std::string serve_usage_text(const char* argv0) {
            "computes the share F (0..1, two decimals; Basalt uses 0.6) of each layer's uncached experts of "
            "a prefill call on the same CPU threads, the ones routed fewest tokens first, while the GPU "
            "copies the rest (a call that streams its experts leaves out the least-used ones for it; the "
-           "same output, bit for bit; 0, the default, is off); --gdn-async-commit "
+           "same output, bit for bit; 0, the default, is off); --prefill-cpu-all-columns N (with "
+           "--prefill-cpu-share) gives the CPU every uncached expert it can take (share 1) in prefill calls "
+           "of at most N tokens, whose uncached experts see few tokens each: faster than copying them over "
+           "a slow PCIe link (scripts/run-v100.sh sets 1024; the same output, bit for bit; 0, the default, "
+           "is off); --prefill-cpu-max-columns N (with --prefill-cpu-share, 1..64) lets the CPU take uncached "
+           "experts routed up to N tokens, a wider one as several jobs of 8, so a cold expert routed many "
+           "tokens is computed beside the GPU instead of copied over PCIe inside its layer (scripts/run-v100.sh "
+           "sets 64; the same output, bit for bit; 8, the default, is the CPU job width); --gdn-async-commit "
            "(--spec mtp) folds each verification's accepted columns into the GDN state on a side stream "
            "while the drafter catches up and drafts the next round (the same state, bit for bit; off by "
            "default); --hc-int8 makes int8 copies of the hyper-connection mixers' weights at startup and "
@@ -1060,12 +1075,23 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             }
             options.flash_next.ngram_keepalive_ms     = static_cast<std::uint32_t>(ms);
             options.flash_next.ngram_keepalive_ms_set = true;
+        } else if (arg == "--ngram-ram-mib") {
+            const std::string value = require_value("--ngram-ram-mib");
+            if (value == "auto") {
+                options.flash_next.ngram_ram_bytes = FlashNextOptions::kNgramRamAuto;
+            } else {
+                const std::uint64_t mib = parse_u64(value.c_str(), "ngram-ram-mib");
+                if (mib > (std::uint64_t{1} << 30)) { throw std::invalid_argument("--ngram-ram-mib is too large"); }
+                options.flash_next.ngram_ram_bytes = mib << 20U;
+            }
         } else if (arg == "--shared-expert-stream") {
             options.flash_next.shared_expert_stream = true;
         } else if (arg == "--mtp-constrained") {
             options.flash_next.mtp_constrained = true;
         } else if (arg == "--mtp-joint-acceptance") {
             options.flash_next.mtp_joint_acceptance = true;
+        } else if (arg == "--mtp-staged-drafts") {
+            options.flash_next.mtp_staged_drafts = true;
         } else if (arg == "--mtp-rows-verify") {
             options.flash_next.mtp_rows_verify = true;
         } else if (arg == "--ngram-prefetch") {
@@ -1094,6 +1120,15 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.flash_next.ggml_decode_mma = true;
         } else if (arg == "--prefill-cpu-share") {
             options.flash_next.prefill_cpu_share = parse_share(require_value("--prefill-cpu-share"));
+        } else if (arg == "--prefill-cpu-max-columns") {
+            const int columns = parse_nonnegative_int(require_value("--prefill-cpu-max-columns"), "prefill-cpu-max-columns");
+            if (columns < 1 || columns > 64) { throw std::invalid_argument("--prefill-cpu-max-columns must be 1..64"); }
+            options.flash_next.prefill_cpu_max_columns     = static_cast<std::uint32_t>(columns);
+            options.flash_next.prefill_cpu_max_columns_set = true;
+        } else if (arg == "--prefill-cpu-all-columns") {
+            const int columns = parse_nonnegative_int(require_value("--prefill-cpu-all-columns"), "prefill-cpu-all-columns");
+            if (columns > 65536) { throw std::invalid_argument("--prefill-cpu-all-columns must be at most 65536"); }
+            options.flash_next.prefill_cpu_all_columns = static_cast<std::uint32_t>(columns);
         } else if (arg == "--cpu-verify-workers") {
             const int workers = parse_nonnegative_int(require_value("--cpu-verify-workers"), "cpu-verify-workers");
             if (workers < 1 || workers > 64) { throw std::invalid_argument("--cpu-verify-workers must be in [1, 64]"); }
@@ -1207,6 +1242,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.prefill_a8 = false;
         } else if (arg == "--prefill-cublas") {
             options.prefill_cublas = true;
+        } else if (arg == "--no-prefill-cublas") {
+            options.prefill_cublas = false;
         } else if (arg == "--no-prefill-cublas-projections") {
             options.prefill_cublas_projections = false;
         } else if (arg == "--chat-template") {
@@ -1339,6 +1376,10 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
         throw std::invalid_argument("--mtp-joint-acceptance chooses how many MTP drafts a round verifies and "
                                     "needs --spec mtp");
     }
+    if (options.flash_next.mtp_staged_drafts && !options.flash_next.mtp_joint_acceptance) {
+        throw std::invalid_argument("--mtp-staged-drafts stops drafting by the joint-acceptance window and "
+                                    "needs --mtp-joint-acceptance");
+    }
     if (options.flash_next.mtp_rows_verify && !options.flash_next.mtp_joint_acceptance) {
         throw std::invalid_argument("--mtp-rows-verify batches draft-and-verify across lanes under the same "
                                     "joint-acceptance window and needs --mtp-joint-acceptance");
@@ -1354,6 +1395,14 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
     if (options.flash_next.gdn_async_commit && options.speculative.backend != SpeculativeBackend::Mtp) {
         throw std::invalid_argument("--gdn-async-commit folds MTP verification commits on a side stream and needs "
                                     "--spec mtp");
+    }
+    if (options.flash_next.prefill_cpu_max_columns != 8 && options.flash_next.prefill_cpu_share.num == 0) {
+        throw std::invalid_argument("--prefill-cpu-max-columns widens the CPU share of prefill calls and needs "
+                                    "--prefill-cpu-share");
+    }
+    if (options.flash_next.prefill_cpu_all_columns != 0 && options.flash_next.prefill_cpu_share.num == 0) {
+        throw std::invalid_argument("--prefill-cpu-all-columns widens the CPU share of short prefill calls and needs "
+                                    "--prefill-cpu-share");
     }
     if (cpu_verify_workers_set && !options.flash_next.cpu_verify_misses &&
         options.flash_next.prefill_cpu_share.num == 0) {

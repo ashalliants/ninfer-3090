@@ -33,4 +33,12 @@ void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Ten
 void gdn_gating_decay(const Tensor& a, const Tensor& b, const Tensor& decay, const Tensor& dt_bias,
                       Tensor& g, Tensor& beta, cudaStream_t stream);
 
+/**
+ * gdn_gating_decay with `a` and `b` read as the two halves of one contiguous BF16 [96,T] tensor
+ * `ab` (rows 0..47 are a, rows 48..95 are b: the GDN control projection's output), so no split
+ * is needed. The same results as gdn_gating_decay on the split halves, bit for bit.
+ */
+void gdn_gating_decay_packed(const Tensor& ab, const Tensor& decay, const Tensor& dt_bias, Tensor& g,
+                             Tensor& beta, cudaStream_t stream);
+
 } // namespace ninfer::ops

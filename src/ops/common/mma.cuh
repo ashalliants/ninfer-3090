@@ -1,51 +1,84 @@
 #pragma once
 
 #include "ops/common/memory.cuh"
+#include "ops/common/volta_compat.cuh"
 
 namespace ninfer::ops {
 
 __device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned addr) {
+#if defined(NINFER_VOLTA_EMULATION)
+    r0 = volta::ldmatrix_word(addr, 0);
+    r1 = volta::ldmatrix_word(addr, 1);
+#else
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
                  : "=r"(r0), "=r"(r1)
                  : "r"(addr));
+#endif
 }
 
 __device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
                                             unsigned addr) {
+#if defined(NINFER_VOLTA_EMULATION)
+    r0 = volta::ldmatrix_word(addr, 0);
+    r1 = volta::ldmatrix_word(addr, 1);
+    r2 = volta::ldmatrix_word(addr, 2);
+    r3 = volta::ldmatrix_word(addr, 3);
+#else
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
                  : "r"(addr));
+#endif
 }
 
 __device__ __forceinline__ void ldmatrix_x2_t(unsigned& r0, unsigned& r1, unsigned addr) {
+#if defined(NINFER_VOLTA_EMULATION)
+    r0 = volta::ldmatrix_word_t(addr, 0);
+    r1 = volta::ldmatrix_word_t(addr, 1);
+#else
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
                  : "=r"(r0), "=r"(r1)
                  : "r"(addr));
+#endif
 }
 
 __device__ __forceinline__ void ldmatrix_x4_t(unsigned& r0, unsigned& r1, unsigned& r2,
                                               unsigned& r3, unsigned addr) {
+#if defined(NINFER_VOLTA_EMULATION)
+    r0 = volta::ldmatrix_word_t(addr, 0);
+    r1 = volta::ldmatrix_word_t(addr, 1);
+    r2 = volta::ldmatrix_word_t(addr, 2);
+    r3 = volta::ldmatrix_word_t(addr, 3);
+#else
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
                  : "r"(addr));
+#endif
 }
 
 __device__ __forceinline__ void mma_bf16(float& c0, float& c1, float& c2, float& c3, unsigned a0,
                                          unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                          unsigned b1) {
+#if defined(NINFER_VOLTA_EMULATION)
+    volta::mma_m16n8k16<volta::Bf16Unpack>(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 __device__ __forceinline__ void mma_f16(float& c0, float& c1, float& c2, float& c3, unsigned a0,
                                         unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                         unsigned b1) {
+#if defined(NINFER_VOLTA_EMULATION)
+    volta::mma_m16n8k16<volta::F16Unpack>(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 // FP16 x FP16 with an FP16 accumulator: full rate on GA10x GeForce parts, where the FP32-accumulate
@@ -54,27 +87,48 @@ __device__ __forceinline__ void mma_f16(float& c0, float& c1, float& c2, float& 
 // callers bound the partial range themselves.
 __device__ __forceinline__ void mma_f16_acc16(unsigned& c0, unsigned& c1, unsigned a0, unsigned a1,
                                               unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+#if defined(NINFER_VOLTA_EMULATION)
+    // Accumulate in FP32 and round once: more accurate than the hardware's per-step FP16 rounding,
+    // and the callers only rely on the partial range being bounded.
+    const float2 lo = volta::F16Unpack::apply(c0);
+    const float2 hi = volta::F16Unpack::apply(c1);
+    float d0 = lo.x, d1 = lo.y, d2 = hi.x, d3 = hi.y;
+    volta::mma_m16n8k16<volta::F16Unpack>(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
+    const __half2 r0 = __floats2half2_rn(d0, d1);
+    const __half2 r1 = __floats2half2_rn(d2, d3);
+    c0               = *reinterpret_cast<const unsigned*>(&r0);
+    c1               = *reinterpret_cast<const unsigned*>(&r1);
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
                  "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
                  : "+r"(c0), "+r"(c1)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0, unsigned a1,
                                        unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+#if defined(NINFER_VOLTA_EMULATION)
+    volta::mma_m16n8k32_s8(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 // The k16 int8 shape: A is {a0,a1} (rows g and g+8, k = 4 (lane % 4) + 0..3), B is {b0}.
 __device__ __forceinline__ void mma_s8_k16(int& c0, int& c1, int& c2, int& c3, unsigned a0,
                                            unsigned a1, unsigned b0) {
+#if defined(NINFER_VOLTA_EMULATION)
+    volta::mma_m16n8k16_s8(c0, c1, c2, c3, a0, a1, b0);
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
                  "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
                  : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
                  : "r"(a0), "r"(a1), "r"(b0));
+#endif
 }
 
 // D = A * B + C on s4 operands, sm_80+. Each operand register holds eight consecutive k as 4-bit
@@ -88,11 +142,15 @@ __device__ __forceinline__ void mma_s8_k16(int& c0, int& c1, int& c2, int& c3, u
 __device__ __forceinline__ void mma_s4_m16n8k64(int& d0, int& d1, int& d2, int& d3, unsigned a0,
                                                 unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                                 unsigned b1, int c0, int c1, int c2, int c3) {
+#if defined(NINFER_VOLTA_EMULATION)
+    volta::mma_m16n8k64_s4(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, c0, c1, c2, c3);
+#else
     asm volatile("mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
                  : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(c0), "r"(c1),
                    "r"(c2), "r"(c3));
+#endif
 }
 
 // On RTX 5090, block-scaled FP8 avoids the plain form's half-rate FP32 accumulation.
@@ -117,10 +175,14 @@ __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, fl
 __device__ __forceinline__ void mma_tf32_bits(float& c0, float& c1, float& c2, float& c3,
                                               unsigned a0, unsigned a1, unsigned a2, unsigned a3,
                                               unsigned b0, unsigned b1) {
+#if defined(NINFER_VOLTA_EMULATION)
+    volta::mma_m16n8k8_tf32(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 __device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2, float& c3,

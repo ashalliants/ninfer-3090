@@ -1,7 +1,9 @@
 #pragma once
 #include "core/device.h"
 #include "ops/common/math.h"
+#include "ops/linear/common/stream_gemv.cuh"
 #include "ops/linear/q4/q4_a16_gemv.cuh"
+#include "ops/linear/q4/q4_rowsplit_storage.cuh"
 #include "ops/linear/q4/q4_operands.h"
 
 namespace ninfer::ops::detail {
@@ -14,6 +16,14 @@ void launch_q4_a16_gemv(const Q4LinearOperands& operands, Output output, Epilogu
     if constexpr (Schedule::kStaticGroupsPerRow > 0) {
         if (operands.k != Schedule::kStaticGroupsPerRow * 64)
             throw std::invalid_argument("Q4 GEMV static K differs from operands");
+    }
+    // The streaming GEMV computes the same function with a decode that stays bound by the weight
+    // stream where conversions are slow (sm_70 by default; ops/linear/common/stream_gemv.cuh).
+    // PDL is compiled out on that path's default target, so the flags have nothing to carry.
+    if (try_launch_stream_gemv<Q4StreamFormat>(operands.x, {operands.codes, operands.scales},
+                                               output, epilogue, operands.rows, operands.k,
+                                               operands.padded_k, stream)) {
+        return;
     }
     const dim3 grid(div_up(operands.rows, Schedule::kBlockRows));
     const dim3 block(Schedule::kThreads);

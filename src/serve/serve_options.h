@@ -96,7 +96,7 @@ struct ServeOptions {
     bool admission_affinity  = false;
     bool mlp_a8_decode      = false;
     bool prefill_a8         = true;
-    bool prefill_cublas     = false;
+    bool prefill_cublas     = ninfer::kPrefillCublasDefault;
     bool prefill_cublas_projections = true;
     bool allow_prefix_reuse = true;
     // --model-suspend and its options: the residency API (suspend, resume) over fixed-address device

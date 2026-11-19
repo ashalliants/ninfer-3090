@@ -12,6 +12,7 @@
 #include "core/arena.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
+#include "ops/common/smem_limit.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -60,6 +61,14 @@ inline constexpr double kCausalPromptFa2SplitSweep      = 1.05;
 inline constexpr double kCausalPromptFa2SplitPerRowHead = 1.0 / 24.0;
 inline constexpr double kCausalPromptFa2WholeWaves      = 0.85;
 
+// Whether the eight-warp CTA fits the target's per-block shared memory. INT8 values need 100,352 B
+// and packed INT4 values 84,992 B (prompt_i8_fa2.cuh static_asserts both numbers), so on Volta's
+// 96 KiB limit the INT8-G64 cache has no eight-warp shape and its prompt launches stay one
+// four-warp CTA per 64 columns with no key splits.
+constexpr bool causal_prompt_fa2_eight_warps_fit(bool packed_values) {
+    return (packed_values ? 84992 : 100352) <= kMaxDynamicSharedBytes;
+}
+
 struct CausalPromptFa2Partials {
     Tensor rows;
     Tensor stats;
@@ -94,7 +103,10 @@ inline std::int32_t causal_prompt_fa2_pages(std::uint32_t visible_keys) {
 // every launch in it.
 inline CausalPromptFa2Plan causal_prompt_fa2_plan(std::int32_t q_heads, std::int32_t width,
                                                   std::uint32_t visible_keys,
-                                                  std::int32_t multiprocessor_count) {
+                                                  std::int32_t multiprocessor_count,
+                                                  bool eight_warps_fit = true) {
+    // Only an eight-warp CTA splits, so without that shape the plan is the four-warp launch.
+    if (!eight_warps_fit) return {4, 1};
     const auto waves = [&](std::int64_t ctas) {
         const double whole =
             static_cast<double>((ctas + multiprocessor_count - 1) / multiprocessor_count);

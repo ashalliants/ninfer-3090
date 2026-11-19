@@ -298,6 +298,11 @@ void validate_flash_next_options_unused(const EngineOptions& options) {
     note(set.cpu_verify_misses, "--cpu-verify-misses");
     note(set.cpu_verify_workers_set || set.cpu_verify_workers != unset.cpu_verify_workers, "--cpu-verify-workers");
     note(set.prefill_cpu_share.num != 0, "--prefill-cpu-share");
+    note(set.prefill_cpu_max_columns_set || set.prefill_cpu_max_columns != unset.prefill_cpu_max_columns,
+         "--prefill-cpu-max-columns");
+    note(set.prefill_cpu_all_columns != 0, "--prefill-cpu-all-columns");
+    note(set.ngram_ram_bytes != 0, "--ngram-ram-mib");
+    note(set.mtp_staged_drafts, "--mtp-staged-drafts");
     note(set.gdn_async_commit, "--gdn-async-commit");
     note(set.hc_int8, "--hc-int8");
     note(set.hc_fused_read, "--hc-fused-read");

@@ -8,6 +8,7 @@ run the CLI or HTTP server.
 | Document | Purpose |
 |---|---|
 | [RTX 3090 Linux build](rtx-3090-linux.md) | Docker and native Ubuntu builds for the `sm_86` applications |
+| [Tesla V100](tesla-v100.md) | building and running Qwen3.8-27B and Qwen3.8-Flash-Next on a 32 GB V100 (`sm_70`): requirements, launcher defaults, measured performance, limits |
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
 | [Performance](performance.md) | RTX 5090 measurement coverage, per-model serving results, methodology, and publication rules |

@@ -35,6 +35,18 @@ __device__ __forceinline__ float half_scale(const std::uint8_t* p) {
     return __half2float(*reinterpret_cast<const __half*>(p));
 }
 
+#if defined(NINFER_SM70)
+// Four grid magnitudes g (bytes in 1..127) with sign bits `nibble` (bit j: byte j) applied. The
+// multiply spreads bit j to bit 8 j (the shifted copies are 7 bits apart, so a 4-bit nibble's never
+// overlap or carry), and -g of a byte is ~g + 1, which cannot carry because ~g is at most 0xFE.
+// The same bytes as the __vcmpne4 / __vsub4 form, which Volta emulates in about ten operations
+// per word against seven here.
+__device__ __forceinline__ int apply_signs4(std::uint32_t g, std::uint32_t nibble) {
+    const std::uint32_t lsb = (nibble * 0x00204081U) & 0x01010101U;
+    return static_cast<int>((g ^ (lsb * 0xFFU)) + lsb);
+}
+#endif
+
 template <QType F>
 struct ExpertFormat;
 
@@ -55,11 +67,18 @@ struct ExpertFormat<QType::GGML_IQ2_XXS> {
             const uint2 grid = grid_table[index];
             // ggml::signed_grid's arithmetic written out: calling it compiles these kernels with
             // commuted LOP3 operands, so their SASS would no longer match the shipped build's.
+#if defined(NINFER_SM70)
+            const std::uint32_t v  = (aux32 >> (7 * l)) & 0x7FU;
+            const std::uint32_t sb = v ^ ((__popc(v) & 1U) << 7); // ksigns_word's byte
+            out.v[2 * l]           = apply_signs4(grid.x, sb & 0xFU);
+            out.v[2 * l + 1]       = apply_signs4(grid.y, sb >> 4);
+#else
             const std::uint32_t signs = ggml::ksigns_word(aux32 >> (7 * l));
             const int s0 = static_cast<int>(__vcmpne4(signs & 0x08040201U, 0));
             const int s1 = static_cast<int>(__vcmpne4(signs & 0x80402010U, 0));
             out.v[2 * l]     = static_cast<int>(__vsub4(static_cast<int>(grid.x) ^ s0, s0));
             out.v[2 * l + 1] = static_cast<int>(__vsub4(static_cast<int>(grid.y) ^ s1, s1));
+#endif
         }
         out.m0 = out.m1 = 2 * static_cast<int>(aux32 >> 28) + 1;
         out.c           = __fmul_rn(half_scale(b), 0.125F);
@@ -84,11 +103,17 @@ struct ExpertFormat<QType::GGML_IQ2_S> {
         for (int l = 0; l < 4; ++l) {
             const int index = ((qs_packed >> (8 * l)) & 0xFF) | ((qh << (8 - 2 * l)) & 0x300);
             const uint2 grid = grid_table[index];
+#if defined(NINFER_SM70)
+            const auto signs = static_cast<std::uint32_t>(signs_packed) >> (8 * l);
+            out.v[2 * l]     = apply_signs4(grid.x, signs & 0xFU);
+            out.v[2 * l + 1] = apply_signs4(grid.y, (signs >> 4) & 0xFU);
+#else
             const int sb     = (signs_packed >> (8 * l)) & 0xFF;
             const int s0 = static_cast<int>(__vcmpne4(((sb & 0x03) << 7) | ((sb & 0x0C) << 21), 0));
             const int s1 = static_cast<int>(__vcmpne4(((sb & 0x30) << 3) | ((sb & 0xC0) << 17), 0));
             out.v[2 * l]     = static_cast<int>(__vsub4(static_cast<int>(grid.x) ^ s0, s0));
             out.v[2 * l + 1] = static_cast<int>(__vsub4(static_cast<int>(grid.y) ^ s1, s1));
+#endif
         }
         out.m0 = 2 * (scale & 0xF) + 1;
         out.m1 = 2 * (scale >> 4) + 1;

@@ -11,6 +11,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -21,6 +22,11 @@ namespace ninfer::ops::ggml {
 
 inline constexpr int kMmvqThreads = 256;
 inline constexpr int kMmvqWarps   = kMmvqThreads / 32;
+#if defined(NINFER_SM70)
+inline constexpr int kMmvqMinBlocks = 3;
+#else
+inline constexpr int kMmvqMinBlocks = 1;
+#endif
 
 // Lanes that share one row: the widest power of two that divides the row's sub-block count and
 // still leaves each lane at least four sub-blocks to keep loads in flight.
@@ -74,42 +80,88 @@ __device__ __forceinline__ void mmvq_body(const std::uint8_t* __restrict__ w, co
     load_tables<F>(tables, grid_s);
     if constexpr (kNeedsIq3sGrid<F>) __syncthreads();
 
-    // The first row group's weight loads go out before the cast, so the cast's reads of x overlap
-    // them instead of delaying every CTA's first DRAM request.
+    // One decode site (the decode is most of the kernel's code, and a decode step's kernels run
+    // with cold instruction caches on Volta, so code size is time): each pass first issues the loads
+    // of the group it will compute next, then finishes the previous pass's group (or, on the first
+    // pass, casts x, which overlaps the first group's DRAM trip), then computes the new group. The
+    // order of loads and arithmetic per group is the two-site form's, so the bits are unchanged.
     SubBlockOf<F> sb[kSubsLane];
-    const auto decode = [&](int group) {
-        const std::uint8_t* wrow =
-            w + static_cast<std::size_t>(group * kRowsWarp + lane / kLanes) * kRowBytes;
+    float acc[T];
+    int row = 0;
+    for (bool first = true;; first = false) {
+        if (rg < groups) {
+            const std::uint8_t* wrow =
+                w + static_cast<std::size_t>(rg * kRowsWarp + lane / kLanes) * kRowBytes;
 #pragma unroll
-        for (int i = 0; i < kSubsLane; ++i) Fmt::decode(wrow, sub_lane + kLanes * i, tables, sb[i]);
-    };
-    if (rg < groups) decode(rg);
-
-    for (int g = static_cast<int>(threadIdx.x); g < T * kSubs; g += kMmvqThreads) {
-        const int t  = g / kSubs;
-        const int gi = g - t * kSubs;
-        int words[8];
-        if constexpr (kAffine<F>) {
-            const float xd = quantize_q8_1_group(x + static_cast<std::size_t>(t) * K + kSubValues * gi, words);
-            xd_s[g]        = xd;
-            int sum        = 0;
-#pragma unroll
-            for (int w = 0; w < 8; ++w) sum = __dp4a(words[w], 0x01010101, sum);
-            auto* xm_s = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(grid_s) + (kNeedsIq3sGrid<F> ? 512 * 4 : 0));
-            xm_s[g]    = xd * static_cast<float>(sum);
-        } else {
-            xd_s[g] = quantize_q8_1_group(x + static_cast<std::size_t>(t) * K + kSubValues * gi, words);
+            for (int i = 0; i < kSubsLane; ++i) Fmt::decode(wrow, sub_lane + kLanes * i, tables, sb[i]);
         }
-        *reinterpret_cast<int4*>(xq_s + t * K + 16 * gi) =
-            make_int4(words[0], words[1], words[2], words[3]);
-        *reinterpret_cast<int4*>(xq_s + t * K + K / 2 + 16 * gi) =
-            make_int4(words[4], words[5], words[6], words[7]);
-    }
-    __syncthreads();
-
-    for (; rg < groups; rg += stride) {
-        const int row = rg * kRowsWarp + lane / kLanes;
-        float acc[T];
+        if (first) {
+            // The Q8_1 cast: four lanes per 32-value group (eight values each), eight groups per
+            // warp. The loop is warp-uniform because the cast's shuffles need every lane.
+            constexpr int kCastLanes = 4;
+            const int part           = lane % kCastLanes;
+            for (int base = warp * (32 / kCastLanes); base < T * kSubs; base += kMmvqThreads / kCastLanes) {
+                const int g     = base + lane / kCastLanes;
+                const bool real = g < T * kSubs;
+                const int t     = real ? g / kSubs : 0;
+                const int gi    = real ? g - t * kSubs : 0;
+                float value[32 / kCastLanes];
+                const uint4 raw = real ? *reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * K +
+                                                                         kSubValues * gi + 8 * part)
+                                       : make_uint4(0, 0, 0, 0);
+                const std::uint32_t bits[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    value[2 * i]     = __uint_as_float(bits[i] << 16);
+                    value[2 * i + 1] = __uint_as_float(bits[i] & 0xFFFF0000U);
+                }
+                int words[8 / kCastLanes];
+                const float xd = quantize_q8_1_part<kCastLanes>(value, words);
+                int sum        = 0;
+                if constexpr (kAffine<F>) {
+#pragma unroll
+                    for (int w = 0; w < 8 / kCastLanes; ++w) sum = __dp4a(words[w], 0x01010101, sum);
+#pragma unroll
+                    for (int offset = kCastLanes / 2; offset > 0; offset >>= 1) sum += __shfl_xor_sync(0xFFFFFFFFU, sum, offset);
+                }
+                if (real) {
+                    // Values 8 part .. 8 part + 7: the first or second 16-byte half of the group.
+                    *reinterpret_cast<int2*>(xq_s + t * K + (part < 2 ? 0 : K / 2) + 16 * gi + 8 * (part & 1)) =
+                        make_int2(words[0], words[1]);
+                    if (part == 0) {
+                        xd_s[g] = xd;
+                        if constexpr (kAffine<F>) {
+                            auto* xm_s = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(grid_s) +
+                                                                  (kNeedsIq3sGrid<F> ? 512 * 4 : 0));
+                            xm_s[g]    = xd * static_cast<float>(sum);
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+        } else {
+            // The previous group: reduce and store while this pass's loads are in flight.
+#pragma unroll
+            for (int offset = kLanes / 2; offset > 0; offset >>= 1) {
+#pragma unroll
+                for (int t = 0; t < T; ++t) acc[t] += __shfl_xor_sync(0xFFFFFFFFU, acc[t], offset);
+            }
+#pragma unroll
+            for (int t = 0; t < T; ++t) {
+                if (sub_lane == t % kLanes) {
+                    const std::size_t o = static_cast<std::size_t>(t) * n + row;
+                    float y             = acc[t];
+                    if constexpr (std::is_same_v<Out, float>) {
+                        out[o] = y;
+                    } else {
+                        if constexpr (Residual) y += __bfloat162float(out[o]);
+                        out[o] = __float2bfloat16_rn(y);
+                    }
+                }
+            }
+        }
+        if (rg >= groups) { break; }
+        row = rg * kRowsWarp + lane / kLanes;
 #pragma unroll
         for (int t = 0; t < T; ++t) acc[t] = 0.0F;
 #pragma unroll
@@ -143,50 +195,37 @@ __device__ __forceinline__ void mmvq_body(const std::uint8_t* __restrict__ w, co
                 }
             }
         }
-        // The next group's loads are in flight while this one reduces and stores.
-        if (rg + stride < groups) decode(rg + stride);
-#pragma unroll
-        for (int offset = kLanes / 2; offset > 0; offset >>= 1) {
-#pragma unroll
-            for (int t = 0; t < T; ++t) acc[t] += __shfl_xor_sync(0xFFFFFFFFU, acc[t], offset);
-        }
-#pragma unroll
-        for (int t = 0; t < T; ++t) {
-            if (sub_lane == t % kLanes) {
-                const std::size_t o = static_cast<std::size_t>(t) * n + row;
-                float y             = acc[t];
-                if constexpr (std::is_same_v<Out, float>) {
-                    out[o] = y;
-                } else {
-                    if constexpr (Residual) y += __bfloat162float(out[o]);
-                    out[o] = __float2bfloat16_rn(y);
-                }
-            }
-        }
+        rg += stride;
     }
 }
 
 template <QType F, int K, int T, bool Residual, class Out = __nv_bfloat16>
-__global__ void __launch_bounds__(kMmvqThreads)
+__global__ void __launch_bounds__(kMmvqThreads, kMmvqMinBlocks)
     ggml_mmvq_kernel(const std::uint8_t* __restrict__ w, const __nv_bfloat16* __restrict__ x,
                      Out* __restrict__ out, int n) {
     extern __shared__ __align__(16) unsigned char smem[];
     mmvq_body<F, K, T, Residual, Out>(w, x, out, n, static_cast<int>(blockIdx.x), static_cast<int>(gridDim.x), smem);
 }
 
-// Two matrices of one input in one launch (linear_pair): CTAs [0, first_ctas) compute the first,
-// the rest the second, each with the single kernel's body.
+// Two matrices of one input in one launch (linear_pair): CTAs [0, first_ctas) compute the first
+// ([n1, K]), the rest the second ([n2, K]), each with the single kernel's body.
 template <QType F1, QType F2, int K, int T>
-__global__ void __launch_bounds__(kMmvqThreads)
+__global__ void __launch_bounds__(kMmvqThreads, kMmvqMinBlocks)
     ggml_mmvq_pair_kernel(const std::uint8_t* __restrict__ w1, const std::uint8_t* __restrict__ w2,
                           const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out1,
-                          __nv_bfloat16* __restrict__ out2, int n, int first_ctas) {
+                          __nv_bfloat16* __restrict__ out2, int n1, int n2, int first_ctas) {
     extern __shared__ __align__(16) unsigned char smem[];
     const int cta = static_cast<int>(blockIdx.x);
-    if (cta < first_ctas) {
-        mmvq_body<F1, K, T, false>(w1, x, out1, n, cta, first_ctas, smem);
+    if constexpr (F1 == F2) {
+        // One copy of the body (half the code; see mmvq_body): the CTA picks its matrix's operands.
+        const bool second = cta >= first_ctas;
+        mmvq_body<F1, K, T, false>(second ? w2 : w1, x, second ? out2 : out1, second ? n2 : n1,
+                                   second ? cta - first_ctas : cta,
+                                   second ? static_cast<int>(gridDim.x) - first_ctas : first_ctas, smem);
+    } else if (cta < first_ctas) {
+        mmvq_body<F1, K, T, false>(w1, x, out1, n1, cta, first_ctas, smem);
     } else {
-        mmvq_body<F2, K, T, false>(w2, x, out2, n, cta - first_ctas, static_cast<int>(gridDim.x) - first_ctas, smem);
+        mmvq_body<F2, K, T, false>(w2, x, out2, n2, cta - first_ctas, static_cast<int>(gridDim.x) - first_ctas, smem);
     }
 }
 
@@ -227,11 +266,12 @@ void launch_mmvq_instance(const std::uint8_t* w, const __nv_bfloat16* x, Out* ou
     mmvq_check(cudaGetLastError(), "launch");
 }
 
-// The pair: as many CTAs as fit at once, split evenly between the two matrices (same rows and K),
-// never more than a matrix has row groups.
+// The pair: as many CTAs as fit at once, split between the two matrices (same K) in proportion to
+// their rows (evenly for equal rows), never more than a matrix has row groups. A row's arithmetic
+// does not depend on the CTA that computes it, so the split changes no output.
 template <QType F1, QType F2, int K, int T>
 void launch_mmvq_pair_instance(const std::uint8_t* w1, const std::uint8_t* w2, const __nv_bfloat16* x,
-                               __nv_bfloat16* out1, __nv_bfloat16* out2, int n, cudaStream_t stream) {
+                               __nv_bfloat16* out1, __nv_bfloat16* out2, int n1, int n2, cudaStream_t stream) {
     constexpr std::size_t kShared = mmvq_shared_bytes<F1, K, T>() > mmvq_shared_bytes<F2, K, T>()
                                         ? mmvq_shared_bytes<F1, K, T>()
                                         : mmvq_shared_bytes<F2, K, T>();
@@ -253,10 +293,13 @@ void launch_mmvq_pair_instance(const std::uint8_t* w1, const std::uint8_t* w2, c
                    "occupancy");
         return sms * (per_sm > 0 ? per_sm : 1);
     }();
-    const int ctas_needed = (n + kRowsCta - 1) / kRowsCta;
-    const int half        = resident / 2 > 0 ? resident / 2 : 1;
-    const int each        = ctas_needed < half ? ctas_needed : half;
-    ggml_mmvq_pair_kernel<F1, F2, K, T><<<2 * each, kMmvqThreads, kShared, stream>>>(w1, w2, x, out1, out2, n, each);
+    const int needed1 = (n1 + kRowsCta - 1) / kRowsCta, needed2 = (n2 + kRowsCta - 1) / kRowsCta;
+    const int share1  = n1 == n2 ? std::max(1, resident / 2)
+                                 : static_cast<int>(static_cast<long long>(resident) * n1 / (n1 + n2));
+    const int each1   = std::max(1, std::min(needed1, share1));
+    const int each2   = n1 == n2 ? each1 : std::max(1, std::min(needed2, resident - each1));
+    ggml_mmvq_pair_kernel<F1, F2, K, T>
+        <<<each1 + each2, kMmvqThreads, kShared, stream>>>(w1, w2, x, out1, out2, n1, n2, each1);
     mmvq_check(cudaGetLastError(), "pair launch");
 }
 

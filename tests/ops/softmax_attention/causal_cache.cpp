@@ -121,6 +121,25 @@ constexpr ReductionCriterion kAttentionInt8Criterion{
     /*gross_relative_to_max_reference*/ kBf16GrossRelativeFloor,
 };
 
+// sm_70 serves single-sequence INT8 G64 prompts (W >= 64) with llama.cpp's FP16 tensor-core flash
+// attention over keys dequantized to FP16 (ops/launcher/gqa_attention_volta_flash.cu), which
+// accumulates P*V in FP16 as llama.cpp does on every tensor-core GPU. That adds rounding that grows
+// with the key count. Measured over every such case here (NINFER_OP_REPORT_STATS=1):
+//
+//     keys      max relative_l2   (the INT8 kernel on the same cases: 1.75e-3 at every size)
+//     <= 5K        3.0e-3
+//     ~12K         4.0e-3
+//     ~33K         7.0e-3
+//
+// The gate below admits that with a margin and stays under kAttentionFp8Criterion's 1.2e-2, the
+// error the FP8 KV profile ships with. Perplexity over the 2,292-token sample moved 6.00650 ->
+// 6.00707.
+constexpr ReductionCriterion kAttentionVoltaFlashCriterion{
+    /*relative_l2*/ 8.5e-3,
+    /*gross_absolute*/ 1.1e-3,
+    /*gross_relative_to_max_reference*/ kBf16GrossRelativeFloor,
+};
+
 constexpr ReductionCriterion kAttentionRk8v4Criterion{
     /*relative_l2*/ 3.25e-3,
     /*gross_absolute*/ 1.1e-3,
@@ -2212,6 +2231,17 @@ const char* cache_name(const CachePlan& plan) {
     return "fp8-e4m3fn-row256";
 }
 
+ReductionCriterion attention_criterion(const CachePlan& plan);
+ReductionCriterion attention_criterion(const CachePlan& plan, std::int32_t tokens) {
+#if defined(NINFER_SM70)
+    if (plan.dtype == DType::I8 && !plan.packed_keys && !plan.packed_values() && tokens >= 64) {
+        return kAttentionVoltaFlashCriterion;
+    }
+#endif
+    (void)tokens;
+    return attention_criterion(plan);
+}
+
 ReductionCriterion attention_criterion(const CachePlan& plan) {
     if (plan.dtype == DType::BF16) return kAttentionBf16Criterion;
     if (plan.packed_keys) return kAttentionRk4v4Criterion;
@@ -2239,6 +2269,21 @@ const char* cache_name(KvCacheStorage storage) {
         return "k8v4";
     }
     return "unknown";
+}
+
+// The criterion for one call: on sm_70 a single-sequence INT8 G64 call of 64 or more columns runs
+// the flash route (see kAttentionVoltaFlashCriterion); every other call keeps its storage's gate.
+ReductionCriterion attention_criterion(KvCacheStorage storage);
+ReductionCriterion attention_criterion(KvCacheStorage storage, std::int32_t tokens,
+                                       std::int32_t batch = 1) {
+#if defined(NINFER_SM70)
+    if (storage == KvCacheStorage::Int8Group64 && batch == 1 && tokens >= 64) {
+        return kAttentionVoltaFlashCriterion;
+    }
+#endif
+    (void)tokens;
+    (void)batch;
+    return attention_criterion(storage);
 }
 
 ReductionCriterion attention_criterion(KvCacheStorage storage) {
@@ -2400,7 +2445,7 @@ int run_a1_case(const Geometry& geometry, const CachePlan& plan, const Attention
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
-                                    attention_criterion(plan));
+                                    attention_criterion(plan, test_case.tokens));
     failures += verify_cache(label, cache.snapshot(), expected, plan.dtype == DType::BF16);
     failures += verify_input(label + " q unchanged", dq, q_bits);
     failures += verify_input(label + " k unchanged", dk, k_bits);
@@ -2523,7 +2568,7 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
                 verify_attention("BF16 attention envelope update",
                                  bf16_bits_to_double(select_query_columns(
                                      actual, kHeadDim * geometry.q_heads, oracle_queries)),
-                                 reference, attention_criterion(storage));
+                                 reference, attention_criterion(storage, test_case.tokens));
         }
     }
 
@@ -2535,7 +2580,7 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
                    verify_attention(label,
                                     bf16_bits_to_double(select_query_columns(
                                         output_bits, kHeadDim * geometry.q_heads, oracle_queries)),
-                                    reference, attention_criterion(storage));
+                                    reference, attention_criterion(storage, test_case.tokens));
     failures += verify_cache(label, cache.snapshot(), expected,
                              storage == KvCacheStorage::BFloat16 ||
                                  storage == KvCacheStorage::Nvfp4Group16 ||
@@ -2615,7 +2660,7 @@ int run_a3_case(const Geometry& geometry, const CachePlan& plan, const Attention
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
-                                    attention_criterion(plan));
+                                    attention_criterion(plan, test_case.tokens));
     failures += verify_cache(label + " cache unchanged", cache.snapshot(), cache_host, true);
     failures += verify_input(label + " q unchanged", dq, q_bits);
     failures += verify_positions(label + " positions unchanged", dp, positions);
@@ -2686,7 +2731,7 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     int failures = verify_attention(label,
                                     bf16_bits_to_double(select_query_columns(
                                         output_bits, kHeadDim * geometry.q_heads, oracle_queries)),
-                                    reference, attention_criterion(storage));
+                                    reference, attention_criterion(storage, test_case.tokens));
     failures += verify_cache(label + " cache unchanged", cache.snapshot(), cache_host, true);
     failures += verify_input(label + " q unchanged", dq, q_bits);
     failures += verify_positions(label + " positions unchanged", dp, positions);
@@ -2949,7 +2994,7 @@ int run_batch_case(const Geometry& geometry, const CachePlan& plan, const BatchA
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
-                                    attention_criterion(plan));
+                                    attention_criterion(plan, batch == 1 ? test_case.width : 0));
     failures += verify_invalid_columns_zero(label, output_bits, geometry, test_case.width,
                                             test_case.valid_columns);
     failures += cache.verify(label, expected);
@@ -3091,7 +3136,7 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
-                                    attention_criterion(storage));
+                                    attention_criterion(storage, test_case.width, batch));
     failures += verify_invalid_columns_zero(label, output_bits, geometry, test_case.width,
                                             test_case.valid_columns);
     failures += cache.verify(label, expected);
@@ -3190,6 +3235,16 @@ int run_quantized_batch_cases(KvCacheStorage storage, std::uint32_t seed) {
 
 int run_batch_cases() {
     int failures = 0;
+    // One sequence, INT8 G64, the 24-head geometry and a width of 2048 (two of the Volta flash
+    // route's 1,024-token Q blocks): on sm_70 the shape of that route. Masked with 64 valid columns
+    // and a tight envelope (context + valid): one with fewer visible keys than the width, one with
+    // more, where the valid columns (all in the first Q block) still see more keys than an unmasked
+    // call of this width would give that block. The flash route bounds each block's keys for an
+    // unmasked call; these must take a route that reads the mask, and match the oracle.
+    failures += run_batch_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                               {2048, {100}, {64}, {0}, MappingPattern::Identity, 510u});
+    failures += run_batch_case(kGeometries[0], KvCacheStorage::Int8Group64,
+                               {2048, {2100}, {64}, {0}, MappingPattern::Fragmented, 511u});
     failures += run_batch_case(kGeometries[0], kPlanInt8,
                                {6, {127}, {3}, {0}, MappingPattern::Identity, 499u});
     failures += run_batch_case(kGeometries[0], kPlanBf16,
@@ -3725,6 +3780,10 @@ int run_int8_prompt_cases(KvCacheStorage storage) {
         sweep_progress().note(std::string(cache_name(storage)) + " " + geometry.name +
                               " masked batch row over 33K envelope");
 
+#if defined(NINFER_SM70)
+        // INT8 G64 prompts run the unsplit flash route on sm_70; the packed profiles still split.
+        if (storage == KvCacheStorage::Int8Group64) { split_launches = std::max(split_launches, 1); }
+#endif
         if (split_launches == 0) {
             std::cerr << cache_name(storage) << " prompt cases " << geometry.name
                       << " exercised no split launch\n";
@@ -3800,7 +3859,17 @@ int verify_int8_prompt_split_capacity() {
                             ops::causal_softmax_attention_workspace_capacity_bytes(
                                 op_geometry(geometry), storage, {1, keys}, 1, width, width,
                                 execution);
-                        if (capacity < previous || capacity > (std::size_t{64} << 20) + 512) {
+                        // On sm_70 an INT8 G64 prompt of 64+ columns runs the flash route, whose
+                        // staging holds the visible keys in FP16 (about 6 KB per key), so only
+                        // the monotonicity half of the contract applies to it.
+#if defined(NINFER_SM70)
+                        const bool bounded =
+                            !(storage == KvCacheStorage::Int8Group64 && width >= 64);
+#else
+                        constexpr bool bounded = true;
+#endif
+                        if (capacity < previous ||
+                            (bounded && capacity > (std::size_t{64} << 20) + 512)) {
                             std::cerr << cache_name(storage)
                                       << " prompt split capacity " << geometry.name
                                       << " SM=" << sm_count << " W=" << width << " keys=" << keys

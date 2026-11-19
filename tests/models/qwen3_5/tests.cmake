@@ -242,6 +242,7 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_adaptive_draft_eager_real_test
   ninfer_qwen3_5_ngram_real_test
   ninfer_qwen3_5_logprobs_real_test
+  ninfer_qwen3_5_context_rows_real_test
   ninfer_qwen3_5_dflash_prefill_real_test
   ninfer_qwen3_5_moe_real_test
   ninfer_qwen3_5_dflash_real_test

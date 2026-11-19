@@ -10,6 +10,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 #include <span>
 
 namespace ninfer::ops {
@@ -40,6 +42,14 @@ namespace ninfer::ops {
  * Effects: writes out; it must not overlap x or a weight.
  * Workspace: none. Execution: stream-ordered; graph capturable.
  */
+/// projection_fp32 with each FP32 result rounded to BF16 (round to nearest even, as
+/// cast_fp32_to_bf16 rounds) and the rows split in order: first [N1, T] then second [N2, T],
+/// N1 + N2 the weights' rows. The same bits as projection_fp32, cast_fp32_to_bf16 and split_rows.
+/// T from 1 to 8 (projection_bf16_split_supported); one launch.
+[[nodiscard]] bool projection_bf16_split_supported(std::int32_t columns) noexcept;
+void projection_bf16_split(const Tensor& x, std::span<const Tensor* const> weights, Tensor& first, Tensor& second,
+                           cudaStream_t stream);
+
 void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Tensor& out,
                      cudaStream_t stream);
 

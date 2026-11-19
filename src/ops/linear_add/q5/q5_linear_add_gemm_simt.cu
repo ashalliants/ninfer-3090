@@ -2,7 +2,9 @@
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
 #include "core/device.h"
+#include "ops/linear/common/stream_gemv.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
+#include "ops/linear/q5/q5_rowsplit_storage.cuh"
 
 #include <cuda_bf16.h>
 
@@ -66,8 +68,28 @@ void dispatch_cols(std::int32_t cols, Launch&& launch) {
 
 } // namespace
 
+bool try_q5_linear_add_stream(const Tensor& x, const Weight& w, Tensor& residual_out,
+                              cudaStream_t stream) {
+    // T = 1..32 is a GEMV over a few tokens with the residual added in place: the streaming GEMV
+    // (stream_gemv.cuh) computes it bound by the weight stream where conversions are slow, decoding
+    // each weight once for every token. Each (row, token) is read and written by the one thread
+    // that finishes the row, so in place is safe.
+    if (x.ne[1] < 1 || x.ne[1] > kStreamGemvMaxTokens) return false;
+    auto* residual    = static_cast<__nv_bfloat16*>(residual_out.data);
+    const auto stride = static_cast<std::int64_t>(residual_out.nb[1] / sizeof(__nv_bfloat16));
+    return try_launch_stream_gemv<Q5StreamFormat>(
+        static_cast<const __nv_bfloat16*>(x.data),
+        {static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.qhigh),
+         static_cast<const std::uint8_t*>(w.scales)},
+        LinearBf16StridedOutput{residual, stride, 0},
+        LinearResidualAddEpilogue{{residual, stride, 0}},
+        residual_out.ne[0], x.ne[0], w.padded_shape[1], stream, x.ne[1],
+        static_cast<std::int64_t>(x.nb[1] / sizeof(__nv_bfloat16)));
+}
+
 void q5_linear_add_split2_exact_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                        cudaStream_t stream) {
+    if (try_q5_linear_add_stream(x, w, residual_out, stream)) return;
     dispatch_cols(x.ne[1], [&]<int Cols>() { dispatch_shape<Cols>(x, w, residual_out, stream); });
     CUDA_CHECK(cudaGetLastError());
 }

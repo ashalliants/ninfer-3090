@@ -160,6 +160,15 @@ public:
     // before the prompt), then with the highest-score experts that are not resident. Returns the
     // number of refill loads.
     std::uint32_t give_back(FrameLease& lease, cudaStream_t compute);
+    // Whether give_back refills the returned frames (the default). Off, it issues only the loads
+    // the controller queued and leaves the rest free for decode's promotions: on a slow link a
+    // refill's burst (2.5 GB after an 8K-token prompt, ~0.75 s at 3.3 GB/s) delays the rounds
+    // that follow, and decode promotes the experts it routes into the free frames instead (the
+    // Program turns it off on a slow link).
+    void set_refill_on_return(bool refill) noexcept { refill_on_return_ = refill; }
+    // Fills every free frame with the highest-score experts that are not resident, on the copy
+    // stream behind `compute` (give_back's refill without a lease). Returns the number of loads.
+    std::uint32_t fill_free(cudaStream_t compute);
     [[nodiscard]] std::uint32_t lent_frames() const noexcept;
 
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
@@ -188,7 +197,8 @@ private:
     // After the controller took a run back (commands_ holds the loads that gave back queued): reloads
     // displaced_[displaced_from..] and issues every queued load. The frames are already returned when
     // this runs, so a throw from it leaves them returned.
-    std::uint32_t settle_return(cudaStream_t compute, std::size_t displaced_from);
+    // `refill` false: only the queued loads (set_refill_on_return); lend()'s undo always refills.
+    std::uint32_t settle_return(cudaStream_t compute, std::size_t displaced_from, bool refill);
     void upload_table(cudaStream_t compute);
     // Publishes the promotions whose copies have completed.
     void publish_landed();
@@ -248,6 +258,7 @@ private:
     // steps.
     static constexpr std::size_t kLoadsPerEvent = 64;
     Stats stats_;
+    bool refill_on_return_ = true; // set_refill_on_return
 
     // Partial RAM residency (null/empty otherwise).
     std::unique_ptr<partial::Residency> homes_;

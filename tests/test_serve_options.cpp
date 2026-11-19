@@ -268,7 +268,20 @@ int shipped_profiles_parse() {
                     std::cerr << "shipped profiles: " << name << " sets no option\n";
                     ++failures;
                 }
-                (void)parse({"ninfer-serve", "model.ninfer", "--config", entry.path().string()});
+                // A profile need not choose the speculation backend: the launcher does. The
+                // Flash-Next profile sets MTP options, which are only valid once it has said
+                // --spec mtp, so supply that here.
+                std::vector<std::string> arguments{"ninfer-serve", "model.ninfer", "--config",
+                                                   entry.path().string()};
+                const auto& words = read_serve_config(entry.path()).words;
+                const bool sets_spec = std::find(words.begin(), words.end(), "--spec") != words.end();
+                const bool sets_mtp  = std::any_of(words.begin(), words.end(), [](const std::string& word) {
+                    return word.rfind("--mtp-", 0) == 0;
+                });
+                if (!sets_spec && sets_mtp) {
+                    arguments.insert(arguments.end(), {"--spec", "mtp", "--draft-tokens", "3"});
+                }
+                (void)parse(arguments);
             } catch (const std::invalid_argument& error) {
                 std::cerr << "shipped profiles: " << error.what() << '\n';
                 ++failures;
@@ -759,8 +772,13 @@ int main() {
     // Every one of these parses without error whether or not the service carries it to the Engine,
     // so the mapping from parsed options to Engine options is what has to be checked.
     const ninfer::EngineOptions default_engine = make_engine_options(defaults);
-    failures += check(!default_engine.prefill_cublas && default_engine.prefill_cublas_projections,
-                      "the cuBLAS prefill route is on by default in serving");
+    failures += check(default_engine.prefill_cublas == ninfer::kPrefillCublasDefault &&
+                          default_engine.prefill_cublas_projections,
+                      "the cuBLAS prefill route does not start at the build's default in serving");
+    const ninfer::EngineOptions route_off =
+        make_engine_options(parse({"ninfer-serve", "model.ninfer", "--no-prefill-cublas"}));
+    failures += check(!route_off.prefill_cublas,
+                      "--no-prefill-cublas did not reach the Engine options");
     const ServeOptions route =
         parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
                "--prefill-cublas", "--no-prefill-cublas-projections"});
@@ -770,7 +788,8 @@ int main() {
                       "--spec and --draft-tokens did not reach the Engine options");
     failures += check(route_engine.prefill_cublas && !route_engine.prefill_cublas_projections,
                       "the cuBLAS prefill controls did not reach the Engine options");
-    for (const char* flag : {"--prefill-cublas", "--no-prefill-cublas-projections"}) {
+    for (const char* flag :
+         {"--prefill-cublas", "--no-prefill-cublas", "--no-prefill-cublas-projections"}) {
         failures += check(kv_help.find(flag) != std::string::npos,
                           "serve help omits an accepted prefill control");
     }

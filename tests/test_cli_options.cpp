@@ -173,8 +173,12 @@ int main() {
               "CLI help omits a production KV storage mode");
     const ninfer::cli::Options route_defaults =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"});
-    failures += check(!route_defaults.prefill_cublas && route_defaults.prefill_cublas_projections,
-                      "the cuBLAS prefill route is on by default");
+    failures += check(route_defaults.prefill_cublas == ninfer::kPrefillCublasDefault &&
+                          route_defaults.prefill_cublas_projections,
+                      "the cuBLAS prefill route does not start at the build's default");
+    const ninfer::cli::Options route_off =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--no-prefill-cublas"});
+    failures += check(!route_off.prefill_cublas, "--no-prefill-cublas did not turn the route off");
     const ninfer::cli::Options route =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "mtp", "--draft-tokens",
                "3", "--prefill-cublas", "--no-prefill-cublas-projections"});
@@ -182,7 +186,8 @@ int main() {
                           route.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
                           route.speculative.draft_tokens == 3,
                       "CLI did not parse the cuBLAS prefill and drafting controls");
-    for (const char* flag : {"--prefill-cublas", "--no-prefill-cublas-projections"}) {
+    for (const char* flag :
+         {"--prefill-cublas", "--no-prefill-cublas", "--no-prefill-cublas-projections"}) {
         failures += check(help.find(flag) != std::string::npos,
                           "CLI help omits an accepted prefill control");
     }

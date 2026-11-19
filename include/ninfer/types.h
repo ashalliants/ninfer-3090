@@ -527,6 +527,14 @@ struct FlashNextOptions {
     bool ngram_keepalive_ms_set   = false;
     bool ram_headroom_bytes_set   = false;
     bool cpu_verify_workers_set   = false;
+    bool prefill_cpu_max_columns_set = false;
+    // --ngram-ram-mib N|auto: hold up to this many bytes of the n-gram volume's blocks in RAM, so a
+    // prompt's rows in them are copied instead of read from the drive (a cold prompt's read shrinks
+    // by the held fraction). Only what the RAM ledger spares after the experts, the context cache,
+    // every other planned allocation, the reserve and a further 2 GiB; kNgramRamAuto takes all of
+    // that. 0 (the default) is off. Loaded in the background after startup. The same output.
+    static constexpr std::uint64_t kNgramRamAuto = ~std::uint64_t{0};
+    std::uint64_t ngram_ram_bytes = 0;
     // The VRAM expert cache's saved state: read at startup to fill the cache with the experts the
     // last session used most (warm start), written at shutdown and between requests every 10
     // minutes. Empty uses `<artifact>.expert-state`; `save_expert_state = false` neither reads nor
@@ -583,6 +591,12 @@ struct FlashNextOptions {
     // whole, from each draft's probability, stays above a per-request adaptive threshold. Off: the
     // acceptance-estimate policy picks the count before drafting.
     bool mtp_joint_acceptance = false;
+    // Drafts one step at a time under --mtp-joint-acceptance (--mtp-staged-drafts; needs it): a
+    // round stops drafting once the joint chance of the drafts so far falls below the threshold,
+    // since no later draft could then be verified. The verified drafts, and so the output, are the
+    // same; a round pays a host sync per extra step instead of always running --draft-tokens steps.
+    // Off: every round drafts --draft-tokens in one graph.
+    bool mtp_staged_drafts = false;
     // Batches a genuine draft-and-verify across every eligible row when two or more lanes decode
     // together (--mtp-rows-verify; needs --mtp-joint-acceptance), instead of always falling back to
     // a plain round. Off by default: a known bug (docs/maintainer/mtp-multi-row-lanes-design.md)
@@ -647,6 +661,16 @@ struct FlashNextOptions {
         std::uint32_t den = 1;
     };
     Fraction prefill_cpu_share{};
+    // Prefill calls of at most this many columns hand the CPU every miss it can take (share 1),
+    // whatever prefill_cpu_share is (--prefill-cpu-all-columns; needs a nonzero share). Their
+    // missed experts are routed few tokens each, which the CPU computes faster than a slow PCIe link
+    // copies the experts. 0 (the default) is off. The same output, bit for bit.
+    std::uint32_t prefill_cpu_all_columns = 0;
+    // The widest miss of a prefill call the CPU takes (--prefill-cpu-max-columns, 1..64; needs a
+    // nonzero share). A miss wider than 8 columns goes as ceil(columns / 8) jobs of 8, so a cold
+    // expert routed many tokens is computed beside the GPU instead of copied over PCIe inside its
+    // layer. 8 (the default) keeps the CPU job width. The same output, bit for bit.
+    std::uint32_t prefill_cpu_max_columns = 8;
     // Run an MTP verification commit's GDN replay fold (the accepted columns folded into the
     // recurrent state) on a stream of its own (--gdn-async-commit; needs --spec mtp), beside the
     // drafter's catch-up and next drafts and the host's work; the next round's forward waits for it.
@@ -717,6 +741,17 @@ struct ModelSuspendOptions {
     // resumes the model and then runs, instead of failing as Unavailable.
     bool auto_resume = true;
 };
+
+// Whether EngineOptions::prefill_cublas starts on. On sm_70 builds the route runs in FP16 on the
+// tensor cores with every group scale exact (ops/linear_swiglu/q4cublas/w4_cublas_prefill.cu), so
+// it is not a quality trade there -- +0.007% perplexity against the A16 reference on a V100, 7.6x
+// faster -- and the integer routes it replaces run emulated mma; elsewhere it is the int8 trade
+// and stays opt-in. Keyed on the build's target, which every in-tree consumer of this header shares.
+#if defined(NINFER_SM70)
+inline constexpr bool kPrefillCublasDefault = true;
+#else
+inline constexpr bool kPrefillCublasDefault = false;
+#endif
 
 struct EngineOptions {
     std::filesystem::path artifact_path;
@@ -823,7 +858,8 @@ struct EngineOptions {
     // runs about twice as fast (ops/linear_swiglu/q4cublas/w4_cublas_prefill.h) and is a further
     // quality trade on top of prefill_a8 -- hence off by default. Its dequantise pass is
     // weight-sized, so it wants a large prefill_chunk to amortise; the two belong together.
-    bool prefill_cublas                    = false;
+    // On sm_70 it is FP16, exact in its scales, and on by default: see kPrefillCublasDefault.
+    bool prefill_cublas                    = kPrefillCublasDefault;
     // Extends prefill_cublas to the attention and GDN input projections, which hold about a fifth
     // of the linear parameters. Worth +13% prefill for +0.071% perplexity on top of what the route
     // already costs, the GDN half carrying nearly all of both. Separable because that is a

@@ -194,7 +194,7 @@ std::size_t gated_delta_net_workspace_capacity_bytes(std::int32_t qk_heads,
         throw std::invalid_argument("gated_delta_net workspace: invalid profile or interval");
     }
     namespace chunked = detail::gated_delta_net::chunked;
-    if (max_tokens < chunked::kMinTokens) { return 0; }
+    if (max_tokens < chunked::kPrefillMinTokens) { return 0; }
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc_bytes(
         chunked::workspace_layout(qk_heads, value_heads, max_tokens).total_bytes);
@@ -239,7 +239,7 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
         throw std::invalid_argument("gated_delta_net: invalid SM count");
     }
     namespace chunked = detail::gated_delta_net::chunked;
-    if (q.ne[2] < chunked::kMinTokens) {
+    if (q.ne[2] < chunked::kPrefillMinTokens) {
         detail::gated_delta_net::launch_recurrent_inout(q, k, v, g, beta, scale, normalize_qk,
                                                         ssm_state_in, ssm_state_out, out,
                                                         execution.stream, map);

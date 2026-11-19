@@ -82,7 +82,7 @@ void ExpertStream::begin(const std::int32_t* residency, std::int32_t* tables, st
             std::fill(cold_.begin(), cold_.end(), 0);
             const auto cold = ops::offloaded_moe::select_stream_cold(
                 std::span(frames, experts_), std::span(share.counts + static_cast<std::size_t>(l) * experts_, experts_),
-                static_cast<int>(half_), share.num, share.den);
+                static_cast<int>(experts_), share.num, share.den);
             for (const std::int32_t e : cold) { cold_[static_cast<std::size_t>(e)] = 1; }
             stats_.cold += cold.size();
             g_cold_experts.fetch_add(cold.size(), std::memory_order_relaxed);

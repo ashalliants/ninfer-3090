@@ -4,6 +4,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
+#include "ops/linear/common/stream_gemv.cuh"
 #include "ops/linear/q4/q4_gemv_launch.cuh"
 #include "ops/linear/q4/q4_ksplit_mma.cuh"
 #include "ops/linear/q4/q4_mma_launch.cuh"
@@ -291,6 +292,33 @@ void q4_linear_add_mma_r64_c128_launch(const Tensor& x, const Weight& w, Tensor&
     launch_mma<MmaR64C128>(x, w, r, s);
 }
 
+#if defined(NINFER_SM70)
+namespace {
+// T = 2..32 on sm_70: the streaming GEMV (stream_gemv.cuh) decodes each weight once for every token
+// and adds the residual through the same epilogue; the K-split routes it replaces run mma.sync,
+// which is emulated and compute-bound there. Falls back to them if the streaming GEMV declines.
+void q4_linear_add_stream_launch(const Tensor& x, const Weight& w, Tensor& r, cudaStream_t s) {
+    const std::int64_t x_stride = x.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
+    if (try_launch_stream_gemv<Q4StreamFormat>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            {static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales)},
+            residual_output(r), residual_epilogue(r), r.ne[0], w.k, w.padded_shape[1], s, x.ne[1],
+            x_stride)) {
+        return;
+    }
+    if (x.ne[1] <= 4) {
+        q4_linear_add_ksplit4_launch(x, w, r, s);
+    } else if (x.ne[1] <= 8) {
+        q4_linear_add_ksplit8_launch(x, w, r, s);
+    } else if (x.ne[1] <= 16) {
+        q4_linear_add_small_t_c16_launch(x, w, r, s);
+    } else {
+        q4_linear_add_small_t_c32_launch(x, w, r, s);
+    }
+}
+} // namespace
+#endif
+
 Q4LinearAddLaunch select_q4_linear_add(std::int32_t rows, std::int32_t k, std::int32_t tokens) {
     if (rows != kRows || (k != kMixerCols && k != kDownCols) || tokens <= 0) {
         throw std::invalid_argument("q4 linear_add: unsupported shape or token extent");
@@ -326,6 +354,14 @@ Q4LinearAddLaunch select_q4_linear_add(std::int32_t rows, std::int32_t k, std::i
     // against ksplit24 to 24 and mma_r32_c32 above (median of 15, us):
     //   K=6144   T=17 52.2 vs 69.6   T=24 53.2 vs 71.7   T=25 54.3 vs 100.4  T=32 68.6 vs 94.2
     //   K=17408  T=17 118.8 vs 152.6 T=24 133.1 vs 197.6 T=25 134.1 vs 267.3 T=32 147.5 vs 247.8
+#if defined(NINFER_SM70)
+    // Decode on sm_70. ksplit4 wins T=1 on sm_86 by 18% over the GEMV, but Volta emulates its
+    // mma.sync (ops/common/volta_compat.cuh), and a T=1 tile still pays for 16 padded columns of
+    // that emulation: profiled on a V100-PCIE-32GB (Qwen3.8-27B decode, nsys), ksplit4 took 398 us
+    // per call at K=17408 against the ~56 us its weight stream costs. The GEMV issues no mma.
+    if (tokens == 1) return q4_linear_add_gemv_launch;
+    if (tokens <= kStreamGemvMaxTokens) return q4_linear_add_stream_launch;
+#endif
     if (tokens <= 4) return q4_linear_add_ksplit4_launch;
     if (tokens <= 8) return q4_linear_add_ksplit8_launch;
     if (tokens <= 16) return q4_linear_add_small_t_c16_launch;

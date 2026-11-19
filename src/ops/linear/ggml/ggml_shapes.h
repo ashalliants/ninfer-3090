@@ -83,36 +83,45 @@ inline constexpr std::int32_t kGgmlDecodeMaxTokens = 8;
     return false;
 }
 
-// linear_pair's GGML problems (decode route only): two weights of one of these registered linear
-// shapes, each in one of these formats, over one input. They are the shared-expert gate/up and the
-// attention key/value of Qwen3.8-Flash-Next, whose two weights' formats differ by layer.
+// linear_pair's GGML problems (decode route only): two weights of these registered linear shapes
+// ([n1, k] and [n2, k]), each in one of these formats, over one input. They are the shared-expert
+// gate/up, the attention key/value and the GDN qkv/z of Qwen3.8-Flash-Next, whose two weights'
+// formats differ by layer.
 struct GgmlPairShape {
-    std::int32_t n;
+    std::int32_t n1;
+    std::int32_t n2;
     std::int32_t k;
 };
-inline constexpr GgmlPairShape kGgmlPairShapes[] = {{640, 2560}, {512, 2560}};
+inline constexpr GgmlPairShape kGgmlPairShapes[] = {{640, 640, 2560}, {512, 512, 2560}, {10240, 6144, 2560}};
 // The one K the pair instances are compiled for (ggml_pair.cuh); every pair shape has it.
 inline constexpr std::int32_t kGgmlPairK = 2560;
-static_assert(kGgmlPairShapes[0].k == kGgmlPairK && kGgmlPairShapes[1].k == kGgmlPairK,
+static_assert(kGgmlPairShapes[0].k == kGgmlPairK && kGgmlPairShapes[1].k == kGgmlPairK &&
+                  kGgmlPairShapes[2].k == kGgmlPairK,
               "the pair instances are compiled for K = 2560");
 inline constexpr QType kGgmlPairFormats[] = {QType::GGML_IQ4_XS, QType::GGML_IQ3_S, QType::GGML_Q6_K,
                                              QType::GGML_Q5_K, QType::GGML_Q4_K};
 
-[[nodiscard]] constexpr bool ggml_pair_registered(QType first, QType second, std::int32_t n, std::int32_t k) {
+[[nodiscard]] constexpr bool ggml_pair_registered(QType first, QType second, std::int32_t n1, std::int32_t n2,
+                                                  std::int32_t k) {
     const auto format_ok = [](QType f) {
         for (const QType g : kGgmlPairFormats) {
             if (g == f) { return true; }
         }
         return false;
     };
-    if (!format_ok(first) || !format_ok(second) || !ggml_linear_registered(first, n, k, false) ||
-        !ggml_linear_registered(second, n, k, false)) {
+    if (!format_ok(first) || !format_ok(second) || !ggml_linear_registered(first, n1, k, false) ||
+        !ggml_linear_registered(second, n2, k, false)) {
         return false;
     }
     for (const auto& shape : kGgmlPairShapes) {
-        if (shape.n == n && shape.k == k) { return true; }
+        if (shape.n1 == n1 && shape.n2 == n2 && shape.k == k) { return true; }
     }
     return false;
+}
+
+// Two weights of one shape.
+[[nodiscard]] constexpr bool ggml_pair_registered(QType first, QType second, std::int32_t n, std::int32_t k) {
+    return ggml_pair_registered(first, second, n, n, k);
 }
 
 // projection_fp32's GGML head form (the vocabulary head [V, 2560], FP32 logits): the output head

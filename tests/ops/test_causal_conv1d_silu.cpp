@@ -1,4 +1,5 @@
 #include "ninfer/ops/causal_conv1d_silu.h"
+#include "ninfer/ops/gdn_gating.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -8,6 +9,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <iostream>
 #include <memory>
@@ -695,6 +697,100 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
 
 } // namespace
 
+// causal_conv1d_silu_split_gated against causal_conv1d_silu_split then gdn_gating_decay_packed: the
+// same q/k/v, state and gate bits, on both routes (small T and prefill).
+int split_gated_case(std::int32_t T) {
+    constexpr std::int32_t C = 10240, KD = 2048, VD = 6144, NV = 48;
+    std::uint32_t seed = 0x9e3779b9U ^ static_cast<std::uint32_t>(T);
+    auto next = [&] {
+        seed = seed * 1664525U + 1013904223U;
+        return seed;
+    };
+    auto bf16_bits_of = [&](std::size_t count) {
+        std::vector<std::uint16_t> bits(count);
+        for (auto& b : bits) {
+            const float f = (static_cast<float>(next() >> 8) / 16777216.0F) * 8.0F - 4.0F;
+            std::uint32_t u;
+            std::memcpy(&u, &f, 4);
+            b = static_cast<std::uint16_t>(u >> 16);
+        }
+        return bits;
+    };
+    auto floats = [&](std::size_t count, float lo, float hi) {
+        std::vector<float> v(count);
+        for (auto& f : v) { f = lo + (hi - lo) * (static_cast<float>(next() >> 8) / 16777216.0F); }
+        return v;
+    };
+    const auto x_bits = bf16_bits_of(static_cast<std::size_t>(C) * T), w_bits = bf16_bits_of(C * 4ULL),
+               st_bits = bf16_bits_of(C * 3ULL), ab_bits = bf16_bits_of(2ULL * NV * T);
+    const auto decay = floats(NV, -3.0F, -0.05F), dt_bias = floats(NV, -1.0F, 1.0F);
+    auto up = [](const auto& host) {
+        auto buffer = std::make_unique<GuardedDeviceBuffer>(host.size() * sizeof(host[0]));
+        if (cudaMemcpy(buffer->data(), host.data(), host.size() * sizeof(host[0]), cudaMemcpyHostToDevice) !=
+            cudaSuccess) {
+            throw std::runtime_error("upload");
+        }
+        return buffer;
+    };
+    auto down = [](GuardedDeviceBuffer& buffer, std::size_t bytes) {
+        std::vector<std::uint8_t> host(bytes);
+        if (cudaMemcpy(host.data(), buffer.data(), bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            throw std::runtime_error("download");
+        }
+        return host;
+    };
+    auto x = up(x_bits), w = up(w_bits), st = up(st_bits), ab = up(ab_bits), dec = up(decay), dtb = up(dt_bias);
+    struct Run {
+        std::unique_ptr<GuardedDeviceBuffer> q, k, v, state, g, beta;
+    };
+    auto make = [&] {
+        Run r;
+        r.q     = std::make_unique<GuardedDeviceBuffer>(static_cast<std::size_t>(KD) * T * 2);
+        r.k     = std::make_unique<GuardedDeviceBuffer>(static_cast<std::size_t>(KD) * T * 2);
+        r.v     = std::make_unique<GuardedDeviceBuffer>(static_cast<std::size_t>(VD) * T * 2);
+        r.state = std::make_unique<GuardedDeviceBuffer>(static_cast<std::size_t>(C) * 3 * 2);
+        r.g     = std::make_unique<GuardedDeviceBuffer>(static_cast<std::size_t>(NV) * T * 4);
+        r.beta  = std::make_unique<GuardedDeviceBuffer>(static_cast<std::size_t>(NV) * T * 4);
+        for (auto* b : {r.q.get(), r.k.get(), r.v.get(), r.state.get(), r.g.get(), r.beta.get()}) b->fill(0xff);
+        return r;
+    };
+    Run want = make(), got = make();
+    const Tensor tx(x->data(), DType::BF16, {C, T}), tw(w->data(), DType::BF16, {C, 4}),
+        ts(st->data(), DType::BF16, {C, 3}), tab(ab->data(), DType::BF16, {2 * NV, T}),
+        tdec(dec->data(), DType::FP32, {NV}), tdtb(dtb->data(), DType::FP32, {NV});
+    auto tensors = [&](Run& r) {
+        return std::array<Tensor, 6>{Tensor(r.q->data(), DType::BF16, {KD, T}),
+                                     Tensor(r.k->data(), DType::BF16, {KD, T}),
+                                     Tensor(r.v->data(), DType::BF16, {VD, T}),
+                                     Tensor(r.state->data(), DType::BF16, {C, 3}),
+                                     Tensor(r.g->data(), DType::FP32, {NV, T}),
+                                     Tensor(r.beta->data(), DType::FP32, {NV, T})};
+    };
+    auto tw_ = tensors(want), tg_ = tensors(got);
+    ops::causal_conv1d_silu_split(tx, tw, ts, tw_[3], tw_[0], tw_[1], tw_[2], nullptr);
+    ops::gdn_gating_decay_packed(tab, tdec, tdtb, tw_[4], tw_[5], nullptr);
+    ops::causal_conv1d_silu_split_gated(tx, tw, ts, tg_[3], tg_[0], tg_[1], tg_[2], tab, tdec, tdtb, tg_[4],
+                                        tg_[5], nullptr);
+    if (cudaDeviceSynchronize() != cudaSuccess) { throw std::runtime_error("split gated sync"); }
+    int failures = 0;
+    const std::string label = "causal_conv1d_silu_split_gated T=" + std::to_string(T);
+    const std::size_t sizes[6] = {KD * 2ULL * T, KD * 2ULL * T, VD * 2ULL * T, C * 6ULL, NV * 4ULL * T, NV * 4ULL * T};
+    Run* runs[2]               = {&want, &got};
+    for (int i = 0; i < 6; ++i) {
+        GuardedDeviceBuffer* a = i == 0 ? want.q.get() : i == 1 ? want.k.get() : i == 2 ? want.v.get()
+                               : i == 3 ? want.state.get() : i == 4 ? want.g.get() : want.beta.get();
+        GuardedDeviceBuffer* b = i == 0 ? got.q.get() : i == 1 ? got.k.get() : i == 2 ? got.v.get()
+                               : i == 3 ? got.state.get() : i == 4 ? got.g.get() : got.beta.get();
+        if (down(*a, sizes[i]) != down(*b, sizes[i])) {
+            std::cerr << label << ": output " << i << " differs from the two calls\n";
+            ++failures;
+        }
+        failures += b->verify_guards(label.c_str());
+    }
+    (void)runs;
+    return failures;
+}
+
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
@@ -769,6 +865,7 @@ int main() {
     }
 
     // Argument rejection, on both sides of the route bound.
+    for (std::int32_t T : {1, 2, 3, 4, 7, 32, 33, 64}) { failures += split_gated_case(T); }
     failures += split_rejection_case(16);
     failures += split_rejection_case(128);
     failures += packed_rejection_case(16);

@@ -145,6 +145,10 @@ public:
         return host_ == nullptr ? 0U : host_->occupied();
     }
 
+    [[nodiscard]] std::uint32_t host_capacity() const noexcept {
+        return host_ == nullptr ? 0U : host_->capacity();
+    }
+
     [[nodiscard]] std::optional<StateImageHandle> reserve_destination() noexcept {
         return allocate(StateImageRole::ReservedDestination, true);
     }
@@ -368,6 +372,19 @@ public:
         if (object.role != StateImageRole::ActiveMutable || !object.device_slot ||
             object.source_pins != 0 || object.destination_pinned || has_pending_replica(object)) {
             throw std::logic_error("StateImage active image is not freezable");
+        }
+        object.content_epoch = next_epoch();
+        object.role          = StateImageRole::CheckpointImmutable;
+    }
+
+    // A reserved destination that a prefill call wrote whole (the Program's merged capture split)
+    // becomes a checkpoint image as it stands.
+    void freeze_written_destination(StateImageHandle handle) {
+        Object& object = require(handle);
+        if (object.role != StateImageRole::ReservedDestination || !object.device_slot ||
+            object.host_slot || object.source_pins != 0 || object.destination_pinned ||
+            has_pending_replica(object)) {
+            throw std::logic_error("StateImage written destination is not freezable");
         }
         object.content_epoch = next_epoch();
         object.role          = StateImageRole::CheckpointImmutable;

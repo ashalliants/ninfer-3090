@@ -191,6 +191,10 @@ void validate(const EngineOptions& options) {
         refuse("--mtp-joint-acceptance chooses how many MTP drafts each round verifies and --mtp-fixed "
                "(mtp_fixed_drafts) always verifies --draft-tokens: use one of them");
     }
+    if (next.mtp_staged_drafts && !next.mtp_joint_acceptance) {
+        refuse("--mtp-staged-drafts stops drafting by the joint-acceptance window and needs "
+               "--mtp-joint-acceptance: add --mtp-joint-acceptance or remove --mtp-staged-drafts");
+    }
     if (next.mtp_rows_verify && !next.mtp_joint_acceptance) {
         refuse("--mtp-rows-verify batches draft-and-verify across lanes under the same joint-acceptance "
                "window and needs --mtp-joint-acceptance: add --mtp-joint-acceptance or remove "
@@ -270,7 +274,8 @@ void validate(const EngineOptions& options) {
                "--host-context-mib, or 0 to turn prefix reuse off)");
     }
     if (options.lm_head_q4 || options.lm_head_q6 || options.embedding_q4 || options.embedding_q6 ||
-        options.mtp_experts_q4 || options.mlp_a8_decode || options.prefill_cublas || options.gdn_state_fp16 || !options.prefill_a8 ||
+        options.mtp_experts_q4 || options.mlp_a8_decode ||
+        options.prefill_cublas != ninfer::kPrefillCublasDefault || options.gdn_state_fp16 || !options.prefill_a8 ||
         !options.prefill_cublas_projections) {
         refuse("its weights are the GGUF's, stored exactly: remove the load-time weight flags (--lm-head-q4/q6, "
                "--embedding-q4/q6, --mtp-experts-q4, --mlp-a8-decode, --prefill-cublas, --gdn-state-fp16, "
@@ -372,6 +377,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.mtp_constrained  = next.mtp_constrained;
     program_options.mtp_joint_acceptance = next.mtp_joint_acceptance;
     program_options.mtp_rows_verify      = next.mtp_rows_verify;
+    program_options.mtp_staged_drafts    = next.mtp_staged_drafts;
     program_options.relaxed_drafting     = options.relaxed_drafting.has_value();
     program_options.ngram_prefetch       = next.ngram_prefetch;
     program_options.vision           = vision;
@@ -387,6 +393,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.cpu_verify_workers    = next.cpu_verify_workers;
     program_options.prefill_cpu_share_num = next.prefill_cpu_share.num;
     program_options.prefill_cpu_share_den = next.prefill_cpu_share.den;
+    program_options.prefill_cpu_all_columns = next.prefill_cpu_all_columns;
+    program_options.prefill_cpu_max_columns = next.prefill_cpu_max_columns;
     program_options.gdn_async_commit      = next.gdn_async_commit;
     program_options.hc_int8               = next.hc_int8;
     program_options.hc_fused_read         = next.hc_fused_read;
@@ -565,6 +573,29 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const auto cache_fit = models::qwen4_exp::fit_context_cache(snapshot, demand, requested_cache, kMinimumHostContextBytes,
                                                                 kHostContextGranule);
     demand.context_cache = cache_fit.bytes;
+    // --ngram-ram-mib: the n-gram volume's RAM-held blocks take what is left after everything else
+    // (the context cache included) and a margin, never more than the volume.
+    if (next.ngram_ram_bytes != 0) {
+        const std::uint64_t volume = models::qwen4_exp::NgramVolume::ram_bytes(config.ple.table, ~std::uint64_t{0});
+        const std::uint64_t asked  = std::min(next.ngram_ram_bytes, volume);
+        const std::uint64_t fitted = models::qwen4_exp::NgramVolume::ram_bytes(
+            config.ple.table, models::qwen4_exp::fit_ngram_ram(snapshot, demand, asked));
+        demand.pageable += fitted;
+        program_options.ngram_ram_bytes = fitted;
+        char line[320];
+        std::snprintf(line, sizeof(line),
+                      "n-gram table: %.2f of %.2f GiB held in RAM (%.0f%% of its blocks), loading in the background%s",
+                      static_cast<double>(fitted) / static_cast<double>(1ULL << 30),
+                      static_cast<double>(volume) / static_cast<double>(1ULL << 30),
+                      volume ? 100.0 * static_cast<double>(fitted) / static_cast<double>(volume) : 0.0,
+                      next.ngram_ram_bytes != FlashNextOptions::kNgramRamAuto && fitted < asked
+                          ? "; less than asked: that is what the RAM ledger spares beside the experts, the context "
+                            "cache and a 2 GiB margin"
+                          : "");
+        report(fitted == 0 ? std::string("n-gram table: no RAM to spare for --ngram-ram-mib beside the experts, the "
+                                         "context cache and a 2 GiB margin; rows are read from the drive")
+                           : std::string(line));
+    }
     const auto ledger    = models::qwen4_exp::plan_host_memory(snapshot, demand);
     program_options.context_cache_bytes = cache_fit.bytes;
     program_options.context_nvme_bytes  = nvme_bytes;

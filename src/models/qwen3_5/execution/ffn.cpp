@@ -21,7 +21,10 @@ bool rotated_dense(const DenseParameters& p) {
 // A Hadamard-rotated Dense FFN projects gate/up into one plane from the rotated input; when down
 // is rotated, silu_mul_hadamard writes its input already in the rotated basis.
 std::size_t rotated_dense_workspace_bytes(const DenseParameters& p, std::int32_t first,
-                                          std::int32_t last) {
+                                          std::int32_t last, bool prefill) {
+    const auto policy = [&](ops::LinearPolicy own) {
+        return prefill ? ops::prefill_phase_policy(own) : own;
+    };
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
     WorkspaceLayoutBuilder layout;
@@ -31,16 +34,20 @@ std::size_t rotated_dense_workspace_bytes(const DenseParameters& p, std::int32_t
         (void)layout.alloc_bytes(
             rotated_workspace_bytes(p.gate_up.hadamard_signs, gu.k, last,
                                     ops::linear_workspace_capacity_bytes(
-                                        gu.qtype, gu.n, gu.k, p.gate_up.policy, first, last)));
+                                        gu.qtype, gu.n, gu.k, policy(p.gate_up.policy), first, last)));
     }
     (void)layout.alloc(DType::BF16, {gu.n / 2, last});
-    (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(down.qtype, down.n, down.k,
-                                                                      p.down.policy, first, last));
+    (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
+        down.qtype, down.n, down.k, policy(p.down.policy), first, last));
     return layout.peak_bytes(1);
 }
 
 void rotated_dense_ffn(const Tensor& hidden, const DenseParameters& p, Tensor& residual,
-                       WorkspaceArena& workspace, cudaStream_t stream, InputBasis basis) {
+                       WorkspaceArena& workspace, cudaStream_t stream, InputBasis basis,
+                       bool prefill) {
+    const auto policy = [&](ops::LinearPolicy own) {
+        return prefill ? ops::prefill_phase_policy(own) : own;
+    };
     const auto columns      = hidden.ne[1];
     const auto& gu          = p.gate_up.weight;
     const auto intermediate = gu.n / 2;
@@ -48,7 +55,7 @@ void rotated_dense_ffn(const Tensor& hidden, const DenseParameters& p, Tensor& r
     {
         auto call      = workspace.scope();
         const Tensor x = rotated_input(hidden, p.gate_up.hadamard_signs, workspace, stream, basis);
-        ops::linear(x, gu, plane, p.gate_up.policy, workspace, stream);
+        ops::linear(x, gu, plane, policy(p.gate_up.policy), workspace, stream);
     }
     Tensor activation = workspace.alloc(DType::BF16, {intermediate, columns});
     if (rotated(p.down.hadamard_signs)) {
@@ -57,20 +64,24 @@ void rotated_dense_ffn(const Tensor& hidden, const DenseParameters& p, Tensor& r
         ops::silu_mul(plane.slice(0, 0, intermediate), plane.slice(0, intermediate, intermediate),
                       activation, stream);
     }
-    ops::linear_add(activation, p.down.weight, residual, p.down.policy, workspace, stream);
+    ops::linear_add(activation, p.down.weight, residual, policy(p.down.policy), workspace, stream);
 }
 
 } // namespace
 
 std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
-                                std::int32_t last, bool mtp, bool verify) {
+                                std::int32_t last, bool mtp, bool verify, bool prefill) {
     if (first <= 0 || last < first) { throw std::invalid_argument("FFN: invalid column interval"); }
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {
         return ops::sparse_moe_workspace_capacity_bytes(moe->routed_gate_up.qtype,
                                                         moe->routed_down.qtype, first, last);
     }
     const auto& p = std::get<DenseParameters>(parameters);
-    if (rotated_dense(p)) { return rotated_dense_workspace_bytes(p, first, last); }
+    if (rotated_dense(p)) { return rotated_dense_workspace_bytes(p, first, last, prefill); }
+    // The policies ffn() / rotated_dense_ffn() run with (prefill: ops::prefill_phase_policy).
+    const auto policy = [&](ops::LinearPolicy own) {
+        return prefill ? ops::prefill_phase_policy(own) : own;
+    };
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
     WorkspaceLayoutBuilder layout;
@@ -90,13 +101,13 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
         {
             auto scope = layout.scope();
             (void)layout.alloc_bytes(ops::linear_swiglu_workspace_capacity_bytes(
-                gu.qtype, gu.n, gu.k, verify ? p.verify_gate_up_policy : p.gate_up.policy, first,
-                last));
+                gu.qtype, gu.n, gu.k, verify ? p.verify_gate_up_policy : policy(p.gate_up.policy),
+                first, last));
         }
         {
             auto scope = layout.scope();
             (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
-                down.qtype, down.n, down.k, p.down.policy, first, last));
+                down.qtype, down.n, down.k, policy(p.down.policy), first, last));
         }
     }
     return layout.peak_bytes(1);
@@ -111,7 +122,7 @@ const Tensor* ffn_input_signs(const FfnParameters& parameters) {
 
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, DeviceExecutionView execution,
-         bool mtp, bool verify, InputBasis basis) {
+         bool mtp, bool verify, InputBasis basis, bool prefill) {
     const auto stream  = execution.stream;
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
@@ -125,7 +136,7 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     }
     const auto& p = std::get<DenseParameters>(parameters);
     if (rotated_dense(p)) {
-        rotated_dense_ffn(hidden, p, residual, workspace, stream, basis);
+        rotated_dense_ffn(hidden, p, residual, workspace, stream, basis, prefill);
         return;
     }
     const auto& gu   = p.gate_up.weight;
@@ -147,10 +158,15 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
     {
         auto call = workspace.scope();
-        ops::linear_swiglu(hidden, gu, activation,
-                           verify ? p.verify_gate_up_policy : p.gate_up.policy, workspace, stream);
+        const ops::LinearPolicy gate_up_policy =
+            verify    ? p.verify_gate_up_policy
+            : prefill ? ops::prefill_phase_policy(p.gate_up.policy)
+                      : p.gate_up.policy;
+        ops::linear_swiglu(hidden, gu, activation, gate_up_policy, workspace, stream);
     }
-    ops::linear_add(activation, down, residual, p.down.policy, workspace, stream);
+    ops::linear_add(activation, down, residual,
+                    prefill ? ops::prefill_phase_policy(p.down.policy) : p.down.policy, workspace,
+                    stream);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

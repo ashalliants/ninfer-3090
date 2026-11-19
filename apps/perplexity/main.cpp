@@ -68,7 +68,7 @@ struct Options {
     bool gdn_state_fp16                 = false;
     bool mlp_a8_decode                  = false;
     bool prefill_a8                     = true;
-    bool prefill_cublas                 = false;
+    bool prefill_cublas                 = ninfer::kPrefillCublasDefault;
     bool prefill_cublas_projections     = true;
     ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
 };
@@ -91,10 +91,11 @@ std::string usage_text() {
            "        once --decode-window is wide enough for it)\n"
            "       (--no-prefill-a8 is the opposite: --corpus/--text score the prefill phase, so\n"
            "        this is how the integer prefill routes' perplexity cost is measured)\n"
-           "       [--prefill-cublas [--no-prefill-cublas-projections]]\n"
+           "       [--prefill-cublas | --no-prefill-cublas] [--no-prefill-cublas-projections]\n"
            "       (--prefill-cublas scores through the cuBLAS prefill route, which is how its\n"
            "        perplexity cost is measured; the projections flag keeps the attention and GDN\n"
-           "        input projections off it)\n"
+           "        input projections off it. The route is on by default in sm_70 builds, where it\n"
+           "        is exact FP16; --no-prefill-cublas turns it off)\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
 
@@ -188,6 +189,8 @@ Options parse_options(int argc, char** argv) {
             out.prefill_a8 = false;
         } else if (option == "--prefill-cublas") {
             out.prefill_cublas = true;
+        } else if (option == "--no-prefill-cublas") {
+            out.prefill_cublas = false;
         } else if (option == "--no-prefill-cublas-projections") {
             out.prefill_cublas_projections = false;
         } else if (option == "--log-level") {

@@ -429,11 +429,14 @@ int main() {
         leg.cpu_verify_workers  = 12;
         const q4::CpuMissPlan served = q4::plan_cpu_misses(leg);
         check(served.device == 4, "on plans the service's 4-byte request counter on the device");
-        check(served.pinned == sizeof(om::MissRequest) + 2ULL * 2560 * 8 + 2ULL * 2560 * 4 * 8 + 64 + 64,
-              "on pins the request, x for 8 columns, y for 4 jobs of 8 columns, the done line and the error word");
-        check(served.workers == 12 && served.verify_jobs == 4 && served.verify_columns == 8 &&
-                  served.pcie_divisor == 3 && served.max_jobs == 4 && served.max_columns == 8,
-              "the service takes the worker count, 4 jobs, the verification's 8 columns and divisor 3");
+        check(served.pinned == sizeof(om::MissRequest) + 2ULL * 2560 * 8 + 2ULL * 2560 * 16 * 8 + 64 + 64,
+              "on pins the request, x for 8 columns, y for 16 jobs (a slow link's) of 8 columns, the done line "
+              "and the error word");
+        check(served.workers == 12 && served.verify_jobs == 4 && served.verify_jobs_slow_link == 16 &&
+                  served.verify_columns == 8 && served.pcie_divisor == 3 && served.max_jobs == 16 &&
+                  served.max_columns == 8,
+              "the service takes the worker count, 4 jobs (16 on a slow link), the verification's 8 columns and "
+              "divisor 3");
         check(served.prefill_jobs == 0 && served.prefill_columns == 0 && served.share_den == 0,
               "--cpu-verify-misses alone plans no prefill channel");
         leg.mtp_draft_tokens = 3;
@@ -460,30 +463,31 @@ int main() {
         share.prefill_cpu_share_den = 5;
         const q4::CpuMissPlan prefill = q4::plan_cpu_misses(share);
         check(prefill.device == 4 && prefill.workers == 6, "the share alone starts the service: its counter, 6 threads");
-        check(prefill.prefill_jobs == om::kMaxCpuJobs && prefill.prefill_columns == 4096 && prefill.share_num == 3 &&
+        check(prefill.prefill_jobs == om::kMaxCpuJobs && prefill.prefill_columns == 8192 && prefill.share_num == 3 &&
                   prefill.share_den == 5 && prefill.verify_jobs == 0 && prefill.max_jobs == om::kMaxCpuJobs &&
-                  prefill.max_columns == 4096,
-              "the prefill channel takes up to 512 jobs of calls of up to a streamed call's 4096 columns at 3 / 5");
-        check(prefill.pinned == sizeof(om::MissRequest) + 2ULL * 2560 * 4096 + 2ULL * 2560 * 512 * 8 + 64 + 64,
-              "the share pins x for 4096 columns and y for 512 jobs of 8 columns");
+                  prefill.max_columns == 8192,
+              "the prefill channel takes up to 512 jobs of calls of up to a streamed call's 8192 columns at 3 / 5");
+        check(prefill.pinned == sizeof(om::MissRequest) + 2ULL * 2560 * 8192 + 2ULL * 2560 * 512 * 8 + 64 + 64,
+              "the share pins x for 8192 columns and y for 512 jobs of 8 columns");
         const std::uint64_t per_job = 8ULL * (2560 + 4 * 80 + 640 + 4 * 20) + sizeof(om::RecordGeometry) + sizeof(om::CpuExpertJob);
-        check(prefill.pageable == 512 * per_job && served.pageable == 4 * per_job,
-              "the worker team's buffers for 512 (share) or 4 (verification) jobs are pageable demand");
+        check(prefill.pageable == 512 * per_job && served.pageable == 16 * per_job,
+              "the worker team's buffers for 512 (share) or 16 (verification, a slow link's) jobs are pageable "
+              "demand");
         check(q4::plan_cpu_misses(q4::ProgramOptions{}).pageable == 0, "off plans no pageable buffers");
-        share.prefill_chunk = 8192;
+        share.prefill_chunk = 16384;
         check(q4::plan_cpu_misses(share).prefill_columns == om::kMaxCpuCallColumns,
-              "a chunk above 4096 columns leaves its wider calls on the GPU");
+              "a chunk above 8192 columns leaves its wider calls on the GPU");
         share.prefill_chunk = 512;
-        check(q4::plan_cpu_misses(share).prefill_columns == 4096, "a small chunk still serves streamed calls");
+        check(q4::plan_cpu_misses(share).prefill_columns == 8192, "a small chunk still serves streamed calls");
         // Partial RAM residency streams nothing: the channel is sized for the static chunk only.
         share.partial_ram_residency = true;
         check(q4::plan_cpu_misses(share).prefill_columns == 512 &&
                   q4::plan_cpu_misses(share).pinned ==
                       sizeof(om::MissRequest) + 2ULL * 2560 * 512 + 2ULL * 2560 * 512 * 8 + 64 + 64,
               "without an expert stream the prefill channel holds the chunk's 512 columns");
-        share.prefill_chunk = 8192;
+        share.prefill_chunk = 16384;
         check(q4::plan_cpu_misses(share).prefill_columns == om::kMaxCpuCallColumns,
-              "partial residency: a chunk above 4096 columns still leaves its calls on the GPU");
+              "partial residency: a chunk above 8192 columns still leaves its calls on the GPU");
         share.partial_ram_residency = false;
         share.prefill_chunk = 1024;
         share.max_context   = 300;
@@ -493,7 +497,7 @@ int main() {
         share.mtp_draft_tokens  = 7;
         const q4::CpuMissPlan both_uses = q4::plan_cpu_misses(share);
         check(both_uses.verify_jobs == 4 && both_uses.verify_columns == 8 && both_uses.prefill_jobs == om::kMaxCpuJobs &&
-                  both_uses.max_jobs == om::kMaxCpuJobs && both_uses.max_columns == 4096 && both_uses.pinned == prefill.pinned &&
+                  both_uses.max_jobs == om::kMaxCpuJobs && both_uses.max_columns == 8192 && both_uses.pinned == prefill.pinned &&
                   both_uses.device == 4,
               "both options share one service sized for the larger use");
         const auto refuses = [&](const q4::ProgramOptions& o, const char* flag) {

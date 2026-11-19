@@ -28,8 +28,30 @@ constexpr std::array kShapes{
 };
 } // namespace
 
+#if defined(NINFER_SM70)
+namespace {
+// Decode (T = 1) on sm_70. On sm_86 the attention and GDN projections run T = 1 through the ksplit
+// tensor-core schedule, which beats the one-row-per-CTA GEMV there. Volta emulates mma.sync
+// (ops/common/volta_compat.cuh), and that costs about three times the weight stream those shapes
+// are otherwise bound by, so they go back to the GEMV schedules they used before ksplit. Only the
+// shapes with an instance for their exact K are listed: the other ksplit shapes (K = 4096, 17408,
+// 25600) have no GEMV instance that is valid for them. Unmeasured on hardware; docs/maintainer/
+// volta-port.md says to re-pick these routes with the first V100 sweep.
+Q4Launch volta_decode_launch(std::int32_t n, std::int32_t k) {
+    if (k == 5120 && (n == 4096 || n == 6144 || n == 7168)) return launch_q4_a16_gemv_r1_w8_direct;
+    if (k == 6144 && n == 5120) return launch_q4_a16_gemv_r1_w8_k6144;
+    return nullptr;
+}
+} // namespace
+#endif
+
 Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) throw std::invalid_argument("q4 linear: T must be positive");
+#if defined(NINFER_SM70)
+    if (t == 1) {
+        if (const Q4Launch launch = volta_decode_launch(n, k)) return launch;
+    }
+#endif
     for (const auto& entry : kShapes) {
         if (entry.n == n && entry.k == k) return entry.select(t);
     }

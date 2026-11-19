@@ -349,6 +349,36 @@ void test_ledger_fit() {
     std::printf("ok: RAM ledger sizes the Host tier\n");
 }
 
+// --ngram-ram-mib: the n-gram RAM takes only what is left after the experts, the context cache and
+// everything planned, less a 2 GiB margin, and the ledger with it still fits.
+void test_ngram_ram_fit() {
+    HostMemoryDemand d = flash_next();
+    const auto free_ram = snapshot(56 * kGiB);
+    d.context_cache     = fit_context_cache(free_ram, d, 4 * kGiB, 512 * kMiB, kMiB).bytes;
+    require(d.context_cache == 4 * kGiB, "the context cache is fitted first");
+    const auto ledger = plan_host_memory(free_ram, d);
+    const std::uint64_t spare =
+        free_ram.available_physical - (d.reserve + ledger.planned + ledger.full_need + kNgramRamMargin);
+    require(fit_ngram_ram(free_ram, d, ~std::uint64_t{0}) == spare, "auto takes exactly the spare RAM");
+    require(fit_ngram_ram(free_ram, d, 1 * kGiB) == 1 * kGiB, "a smaller request is granted whole");
+    require(fit_ngram_ram(free_ram, d, 0) == 0, "0 is off");
+    HostMemoryDemand with = d;
+    with.pageable += fit_ngram_ram(free_ram, d, ~std::uint64_t{0});
+    require(plan_host_memory(free_ram, with).fits, "the ledger with the n-gram RAM still fits");
+    // A larger context cache leaves the n-gram RAM less, byte for byte.
+    HostMemoryDemand bigger = d;
+    bigger.context_cache += 2 * kGiB;
+    const std::uint64_t shrunk = fit_ngram_ram(free_ram, bigger, ~std::uint64_t{0});
+    require(spare - shrunk >= 2 * kGiB && spare - shrunk <= 2 * kGiB + 16 * kMiB,
+            "the context cache comes first (" + std::to_string(spare - shrunk) + " bytes)");
+    // With the experts just fitting there is nothing to spare.
+    std::uint64_t edge = 30 * kGiB;
+    while (!plan_host_memory(snapshot(edge), d).fits) { edge += 16 * kMiB; }
+    require(fit_ngram_ram(snapshot(edge + kGiB), d, ~std::uint64_t{0}) == 0, "no n-gram RAM inside the margin");
+    require(fit_ngram_ram(snapshot(edge - kGiB), d, ~std::uint64_t{0}) == 0, "none when the experts do not fit");
+    std::printf("ok: RAM ledger sizes the n-gram RAM after the context cache\n");
+}
+
 void test_free_callback() {
     HostCheckpointStore store(16, kSlab);
     std::vector<std::uint32_t> freed;
@@ -657,6 +687,7 @@ void test_steered_images() {
 int main() {
     try {
         test_slab_pool();
+        test_ngram_ram_fit();
         test_shared_pages_and_release_quotes();
         test_release_sets();
         test_prefix_and_recovery_loss();

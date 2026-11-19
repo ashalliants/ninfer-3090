@@ -11,6 +11,7 @@
 // Q5_K head's bound sums (|d sc q| + |dmin m|) |x| instead of |w x| (projection_fp32.h).
 
 #include "ninfer/ops/projection_fp32.h"
+#include "ninfer/ops/cast.h"
 
 #include "core/arena.h"
 #include "core/weight.h"
@@ -163,6 +164,36 @@ void bf16_case(const std::vector<std::int32_t>& rows, std::int32_t k, std::uint3
                                         wide_values.begin() + static_cast<std::ptrdiff_t>(k) * t);
         verify("bf16 N=" + label + " K=" + std::to_string(k) + " T=" + std::to_string(t), host, w,
                values, n, k, t, {});
+        if (t <= 8 && n >= 2) {
+            // projection_bf16_split: the FP32 results cast to BF16 and split, bit for bit.
+            const std::int32_t n1 = std::max(1, n / 3), n2 = n - n1;
+            std::uint16_t *d1 = nullptr, *d2 = nullptr, *dc = nullptr;
+            cudaMalloc(&d1, 2ULL * n1 * t);
+            cudaMalloc(&d2, 2ULL * n2 * t);
+            cudaMalloc(&dc, 2ULL * n * t);
+            Tensor first(d1, DType::BF16, {n1, t}), second(d2, DType::BF16, {n2, t}), cast(dc, DType::BF16, {n, t});
+            ninfer::ops::projection_bf16_split(x, weights, first, second, nullptr);
+            ninfer::ops::cast_fp32_to_bf16(out, cast, nullptr);
+            if (cudaDeviceSynchronize() != cudaSuccess) { throw std::runtime_error("projection bf16 split failed"); }
+            std::vector<std::uint16_t> h1(static_cast<std::size_t>(n1) * t), h2(static_cast<std::size_t>(n2) * t),
+                hc(static_cast<std::size_t>(n) * t);
+            cudaMemcpy(h1.data(), d1, h1.size() * 2, cudaMemcpyDeviceToHost);
+            cudaMemcpy(h2.data(), d2, h2.size() * 2, cudaMemcpyDeviceToHost);
+            cudaMemcpy(hc.data(), dc, hc.size() * 2, cudaMemcpyDeviceToHost);
+            bool same = true;
+            for (std::int32_t c = 0; c < t; ++c) {
+                for (std::int32_t r = 0; r < n; ++r) {
+                    const std::uint16_t want = hc[static_cast<std::size_t>(c) * n + r];
+                    const std::uint16_t got  = r < n1 ? h1[static_cast<std::size_t>(c) * n1 + r]
+                                                      : h2[static_cast<std::size_t>(c) * n2 + r - n1];
+                    same = same && want == got;
+                }
+            }
+            check(same, "bf16 split N=" + label + " T=" + std::to_string(t) + " equals cast + split");
+            cudaFree(d1);
+            cudaFree(d2);
+            cudaFree(dc);
+        }
         if (t == 1) {
             single = host;
         } else {

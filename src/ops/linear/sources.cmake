@@ -1,5 +1,6 @@
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/linear.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/common/sm70_tensor_core.cu"
 )
 
 include("${CMAKE_CURRENT_LIST_DIR}/bf16/sources.cmake")

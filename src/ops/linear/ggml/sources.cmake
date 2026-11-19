@@ -1,5 +1,6 @@
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/ggml_dispatch.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/ggml_tensor_core_sm70.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_quantize.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_iq4_xs.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_iq3_s.cu"

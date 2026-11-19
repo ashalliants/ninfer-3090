@@ -5,6 +5,7 @@
 // GDN value heads are in tiled order (value head h reads key head h % key_heads), and the indexer
 // projections are BF16 rows projected in FP32.
 
+#include "ops/linear/common/sm70_tensor_core.h"
 #include "models/qwen4_exp/execution/forward.h"
 
 #include "core/side_stream_delay.h"
@@ -436,7 +437,17 @@ std::size_t Forward::shared_expert_workspace_bytes(const TextConfig& c, std::int
     const auto aligned = [](std::size_t n) { return (n + 255) / 256 * 256; };
     const std::size_t t = static_cast<std::size_t>(columns);
     const std::size_t k = std::max(c.hidden_size, c.moe.shared_intermediate);
-    return aligned(k * t) + aligned(k / 32 * t * sizeof(float));
+    // The sm_70 tensor-core route's staging instead, when it is on (ops/linear/common/sm70_tensor_core.h).
+    return std::max(aligned(k * t) + aligned(k / 32 * t * sizeof(float)),
+                    ops::detail::sm70_tensor_core_workspace_bound(static_cast<int>(k), columns));
+}
+
+std::size_t Forward::tensor_core_workspace_bytes(const TextConfig& c, std::int32_t columns) {
+    // The widest prefill linears: the PLE parent [S*H + H, H], the attention's query and gate rows,
+    // the GDN input projection, the hyper-connection [*, S*H] (the MTP drafter's are [H, H]).
+    const std::uint32_t widest = std::max({c.residual_width() + c.hidden_size, 2 * c.attention.query_width(),
+                                           c.gdn.conv_channels(), c.gdn.value_width()});
+    return ops::detail::sm70_tensor_core_workspace_bound(static_cast<int>(widest), columns);
 }
 
 std::size_t Forward::shared_expert_scratch_bytes(const MoeParameters& p, std::int32_t first, std::int32_t last) {
@@ -446,6 +457,178 @@ std::size_t Forward::shared_expert_scratch_bytes(const MoeParameters& p, std::in
                                                                      linear->weight.k, linear->policy, first, last));
     }
     return bytes;
+}
+
+std::size_t Forward::call_workspace_bytes(std::int32_t columns, std::uint32_t max_visible_keys,
+                                          DeviceExecutionView execution) const {
+    const TextConfig& c = config_;
+    const std::size_t bound =
+        workspace_bytes(c, columns, max_visible_keys, execution, moe_precast_input_) +
+        (side_ ? max_shared_expert_scratch_bytes(columns) : 0) + tensor_core_workspace_bytes(c, columns);
+    if (columns <= ops::kHcInt8MaxColumns) { return bound; }
+    // DeviceArena's bump allocation: each block 256-aligned from the arena's (aligned) base.
+    struct Replay {
+        std::size_t off = 0, peak = 0;
+        static std::size_t up(std::size_t n) { return (n + 255) / 256 * 256; }
+        void alloc(std::size_t bytes) {
+            off  = up(off) + bytes;
+            peak = std::max(peak, off);
+        }
+        void scratch(std::size_t bytes) { peak = std::max(peak, up(off) + bytes); } // an Op's, released
+    } r;
+    const std::size_t T = static_cast<std::size_t>(columns), bf = 2, f = 4;
+    const std::size_t H = c.hidden_size, W = c.residual_width(), S = c.hc.streams;
+    const auto linear = [&](const LinearParameters& p, std::int32_t t = 0) {
+        return ops::linear_workspace_capacity_bytes(p.weight.qtype, p.weight.n, p.weight.k,
+                                                    linear_policy(p, ggml_decode_mma_), 1, t > 0 ? t : columns);
+    };
+    const auto mix = [&](const HyperConnectionParameters& p, std::int32_t t = 0) {
+        t = t > 0 ? t : columns;
+        r.alloc(H * static_cast<std::size_t>(t) * bf);
+        r.scratch(ops::hyper_connection_mix_workspace_capacity_bytes(p.down.weight, p.up.weight, p.down.policy,
+                                                                     dim(c.hc.streams), dim(c.hc.rank), t));
+    };
+    // run_front: the residual, then the embedding's scope.
+    r.alloc(W * T * bf);
+    const std::size_t residual_end = r.off;
+    r.scratch(H * T * bf);
+    const auto& g = c.gdn;
+    const std::size_t C = g.conv_channels(), KW = g.key_width(), VW = g.value_width(), NV = g.value_heads;
+    const std::size_t DK = g.key_head_dim, DV = g.value_head_dim;
+    const auto& a = c.attention;
+    const std::size_t D = a.head_dim, NH = a.heads, KVH = a.kv_heads, QW = a.query_width();
+    const std::size_t IH = c.qsa.index_heads, ID = c.qsa.index_head_dim;
+    const auto geometry = qsa_geometry(c);
+    for (std::uint32_t l = 0; l < c.num_hidden_layers; ++l) {
+        const auto& block = parameters_.layers[l];
+        r.off = residual_end; // the layer's scope
+        if (block.ple) {      // ple_inject's own scope
+            r.alloc(std::size_t(c.ple.embed_dim) * T * bf);
+            r.alloc((W + H) * T * bf);
+            r.scratch(linear(block.ple->projection));
+            r.alloc(W * T * bf);
+            r.alloc(H * T * bf);
+            r.alloc(W * T * bf);
+            r.alloc(W * T * bf);
+            r.off = residual_end;
+        }
+        r.alloc(S * T * f); // inject
+        mix(block.attn_hc);
+        if (c.layer_types[l] == MixerKind::Gdn) {
+            const auto& p = std::get<GdnParameters>(block.mixer);
+            r.alloc(C * T * bf);
+            r.alloc(VW * T * bf);
+            r.scratch(std::max(linear(p.qkv), linear(p.z)));
+            r.alloc(2 * NV * T * bf);
+            r.scratch(linear(p.control));
+            r.alloc(NV * T * f);
+            r.alloc(NV * T * f);
+            if (NV != 48) { // gdn(): the gates split out when they are not packed
+                r.alloc(NV * T * bf);
+                r.alloc(NV * T * bf);
+            }
+            r.alloc(KW * T * bf);
+            r.alloc(KW * T * bf);
+            r.alloc(VW * T * bf);
+            if (!gdn_head_map_) {
+                r.alloc(DK * NV * T * bf);
+                r.alloc(DK * NV * T * bf);
+            }
+            r.alloc(DV * NV * T * bf);
+            const auto qk_heads = dim(gdn_head_map_ ? g.key_heads : g.value_heads);
+            r.scratch(ops::gated_delta_net_workspace_capacity_bytes(qk_heads, dim(g.value_heads), 1, columns));
+            r.alloc(DV * NV * T * bf);
+            r.alloc(H * T * bf);
+            r.scratch(linear(p.output));
+        } else {
+            const auto& p = std::get<AttentionParameters>(block.mixer);
+            r.alloc(2 * QW * T * bf);
+            r.scratch(linear(p.query_gate));
+            r.alloc(D * NH * T * bf);
+            r.alloc(D * NH * T * bf);
+            r.alloc(D * KVH * T * bf);
+            r.alloc(D * KVH * T * bf);
+            r.scratch(std::max(linear(p.key), linear(p.value)));
+            r.alloc(ID * IH * T * bf);
+            r.alloc(ID * T * bf);
+            if (!ops::projection_bf16_split_supported(columns)) {
+                r.alloc((IH * ID + ID) * T * f);
+                r.alloc((IH * ID + ID) * T * bf);
+            }
+            r.alloc(D * NH * T * bf);
+            r.alloc(D * KVH * T * bf);
+            r.alloc(std::size_t(c.qsa.budget / c.qsa.compress_ratio) * T * f);
+            r.alloc(T * f);
+            r.scratch(ops::qsa_select_blocks_workspace_capacity_bytes(geometry, {max_visible_keys}, 1, columns, execution));
+            r.alloc(D * NH * T * bf);
+            r.scratch(ops::qsa_attention_workspace_capacity_bytes({dim(a.head_dim), dim(a.heads), dim(a.kv_heads)},
+                                                                  geometry, KvCacheStorage::Int8Group64, 1, columns,
+                                                                  execution));
+            r.alloc(H * T * bf);
+            r.scratch(linear(p.output));
+        }
+        // The MoE (above kHcInt8MaxColumns there is no fused read): its input mix, then moe().
+        mix(block.mlp_hc);
+        const auto& m = c.moe;
+        const std::size_t E = m.experts, K = m.top_k, I = m.shared_intermediate;
+        const auto shared_tensors = [&](bool own_scratch) {
+            const auto& p = block.moe;
+            r.alloc(I * T * bf);
+            r.alloc(I * T * bf);
+            if (own_scratch) { r.scratch(std::max(linear(p.shared_gate), linear(p.shared_up))); }
+            r.alloc(I * T * bf);
+            r.alloc(H * T * bf);
+            if (own_scratch) { r.scratch(linear(p.shared_down)); }
+        };
+        if (side_) {
+            r.alloc(shared_expert_scratch_bytes(block.moe, columns, columns)); // the side stream's carve
+            shared_tensors(false);
+        }
+        r.alloc((E + 1) * T * f);
+        r.alloc(K * T * f);
+        r.alloc(K * T * f);
+        r.alloc(T * f);
+        r.alloc(ops::moe_dispatch_bytes(dim(E), dim(K * T)));
+        r.alloc(H * K * T * bf);
+        const std::int32_t max_jobs = std::min(dim(E), dim(K * T));
+        r.alloc(ops::moe_experts_workspace_bytes(max_jobs, dim(K * T), columns, moe_precast_input_));
+        if (!side_) { shared_tensors(true); }
+        r.alloc(H * T * bf);
+    }
+    // run_back: the drafter's cells (mtp_cells: sub-chunks of at most kMtpChunkColumns of the call's
+    // columns and a prepended cell; mtp_block with kv_only returns after mtp_attention's KV append),
+    // then the final mix and the gathered logit columns.
+    r.off = residual_end;
+    if (parameters_.mtp) {
+        const auto& p         = *parameters_.mtp;
+        const std::int32_t n  = std::min(columns + 1, kMtpChunkColumns);
+        const std::size_t N   = static_cast<std::size_t>(n);
+        const auto rows       = [&](std::size_t width) { // project_rows: FP32 rows, then their BF16 cast
+            r.alloc(width * N * f);
+            r.alloc(width * N * bf);
+        };
+        r.alloc(W * N * bf); // the cells' residual rows
+        r.alloc(H * N * bf); // x0
+        r.alloc(H * N * bf); // e
+        r.alloc(H * N * bf); // ep
+        r.scratch(linear(p.embedding_projection, n));
+        r.alloc(W * N * bf); // hn
+        r.alloc(W * N * bf); // the fused residual
+        r.scratch(linear(p.hidden_projection, dim(S) * n));
+        r.alloc(S * N * f); // inject
+        mix(p.attn_hc, n);
+        rows(2 * D * KVH);
+        r.alloc(D * KVH * N * bf);
+        r.alloc(D * KVH * N * bf);
+        rows(IH * ID + ID);
+        r.alloc(ID * IH * N * bf);
+        r.alloc(ID * N * bf);
+        r.alloc(D * KVH * N * bf);
+        r.off = residual_end;
+    }
+    mix(parameters_.final_mixer);
+    r.alloc(H * T * bf);
+    return std::min(bound, r.peak);
 }
 
 std::size_t Forward::max_shared_expert_scratch_bytes(std::int32_t columns) const {
@@ -572,13 +755,12 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
                                       route_log(layer, static_cast<std::size_t>(config_.moe.top_k) * T));
         xm         = read.x;
         mlp_inject = read.inject;
-        ym         = moe(block.moe, xm, layer, route_tap, cpu_channels(batch), &read);
+        ym         = moe(block.moe, xm, layer, route_tap, cpu_channels(batch), &read, &mlp_inject, &residual);
     } else {
         ops::hyper_connection_inject(y, inject, residual, s);
         xm = mix(block.mlp_hc, residual, &inject);
-        ym = moe(block.moe, xm, layer, route_tap, cpu_channels(batch));
+        ym = moe(block.moe, xm, layer, route_tap, cpu_channels(batch), nullptr, &inject, &residual);
     }
-    ops::hyper_connection_inject(ym, mlp_inject, residual, s);
     steer(layer, residual, batch.steer);
     if (tap != nullptr) {
         copy_tap(tap->mixer_inputs, layer, xa, s);
@@ -700,6 +882,11 @@ void Forward::project_verify(const Tensor& x, const LinearParameters& p, Tensor&
         project(x, p, out, *work_, s, ggml_decode_mma_);
         return;
     }
+    if (ops::linear_columnwise_supported(p.weight)) {
+        // The per-column calls below in one launch (the same bits).
+        ops::linear_columnwise(x, p.weight, out, linear_policy(p, ggml_decode_mma_), s);
+        return;
+    }
     for (std::int32_t t = 0; t < x.ne[1]; ++t) {
         Tensor column = out.slice(1, t, 1);
         project(x.slice(1, t, 1), p, column, *work_, s, ggml_decode_mma_);
@@ -717,20 +904,22 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     GdnReplayRecordLayer records;
     if (batch.verify != nullptr) { records = batch.verify->gdn.layer(static_cast<std::int32_t>(index), 1); }
     Tensor qkv = batch.verify != nullptr ? records.conv.view({C, T}) : work_->alloc(DType::BF16, {C, T});
-    project(x, p.qkv, qkv, *work_, s, ggml_decode_mma_);
-    Tensor z = work_->alloc(DType::BF16, {VW, T});
-    project(x, p.z, z, *work_, s, ggml_decode_mma_);
+    Tensor z   = work_->alloc(DType::BF16, {VW, T});
+    project_pair(x, p.qkv, p.z, qkv, z, *work_, s, ggml_decode_mma_);
     Tensor ab = work_->alloc(DType::BF16, {2 * NV, T});
     project_verify(x, p.control, ab, batch.verify != nullptr);
-    Tensor a = work_->alloc(DType::BF16, {NV, T});
-    Tensor b = work_->alloc(DType::BF16, {NV, T});
-    {
-        Tensor* parts[] = {&a, &b};
-        ops::split_rows(ab, parts, s);
-    }
     Tensor gate = work_->alloc(DType::FP32, {NV, T});
     Tensor beta = work_->alloc(DType::FP32, {NV, T});
-    ops::gdn_gating_decay(a, b, p.decay, p.dt_bias, gate, beta, s);
+    // a and b straight from the control projection's halves (no split); the gates are computed in
+    // the convolution's launch below.
+    const bool packed_gates = NV == 48;
+    if (!packed_gates) {
+        Tensor a = work_->alloc(DType::BF16, {NV, T});
+        Tensor b = work_->alloc(DType::BF16, {NV, T});
+        Tensor* parts[] = {&a, &b};
+        ops::split_rows(ab, parts, s);
+        ops::gdn_gating_decay(a, b, p.decay, p.dt_bias, gate, beta, s);
+    }
 
     Tensor q = work_->alloc(DType::BF16, {KW, T});
     Tensor k = work_->alloc(DType::BF16, {KW, T});
@@ -738,7 +927,12 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     Tensor& conv_state = state_.gdn_conv.at(index);
     // Verification reads the live convolution window and discards the advanced one.
     Tensor conv_out = batch.verify != nullptr ? batch.verify->conv_scratch : conv_state;
-    ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state, conv_out, q, k, v, s);
+    if (packed_gates) {
+        ops::causal_conv1d_silu_split_gated(qkv, p.convolution, conv_state, conv_out, q, k, v, ab, p.decay, p.dt_bias,
+                                            gate, beta, s);
+    } else {
+        ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state, conv_out, q, k, v, s);
+    }
     const GdnQk qk     = gdn_qk(q, k, DK, NK, NV, T, gdn_head_map_, *work_, s);
     const std::int32_t NQ = qk.q.ne[1];
     Tensor o = work_->alloc(DType::BF16, {DV, NV, T});
@@ -791,34 +985,34 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
         project_pair(x, p.key, p.value, kf, vf, *work_, s, ggml_decode_mma_);
     }
     // The indexer's BF16 rows in FP32, then rounded once to BF16 (Linear's BF16 output boundary).
-    Tensor indexed = work_->alloc(DType::FP32, {IH * ID + ID, T});
-    {
-        const Tensor* rows[] = {&p.index_query, &p.index_key};
-        ops::projection_fp32(x, rows, indexed, s);
-    }
-    Tensor index_rows = work_->alloc(DType::BF16, {IH * ID + ID, T});
-    ops::cast_fp32_to_bf16(indexed, index_rows, s);
     Tensor iq = work_->alloc(DType::BF16, {ID, IH, T});
     // A verification call records the raw index keys for the tail commit.
     Tensor ik = batch.verify != nullptr
                     ? batch.verify->qsa_keys.slice(2, static_cast<std::int32_t>(index), 1).view({ID, T})
                     : work_->alloc(DType::BF16, {ID, T});
     {
-        Tensor iqf      = iq.view({IH * ID, T});
-        Tensor* parts[] = {&iqf, &ik};
-        ops::split_rows(index_rows, parts, s);
+        const Tensor* rows[] = {&p.index_query, &p.index_key};
+        Tensor iqf           = iq.view({IH * ID, T});
+        if (ops::projection_bf16_split_supported(T)) {
+            // Rounded and split in the projection's launch (the same bits).
+            ops::projection_bf16_split(x, rows, iqf, ik, s);
+        } else {
+            Tensor indexed = work_->alloc(DType::FP32, {IH * ID + ID, T});
+            ops::projection_fp32(x, rows, indexed, s);
+            Tensor index_rows = work_->alloc(DType::BF16, {IH * ID + ID, T});
+            ops::cast_fp32_to_bf16(indexed, index_rows, s);
+            Tensor* parts[] = {&iqf, &ik};
+            ops::split_rows(index_rows, parts, s);
+        }
     }
     Tensor qn = work_->alloc(DType::BF16, {D, NH, T});
     Tensor kn = work_->alloc(DType::BF16, {D, KVH, T});
-    {
-        Tensor qn_rows = qn.view({D, NH * T}), kn_rows = kn.view({D, KVH * T});
-        ops::rmsnorm(q.view({D, NH * T}), p.query_norm, config_.rms_norm_eps, true, qn_rows, s);
-        ops::rmsnorm(k.view({D, KVH * T}), p.key_norm, config_.rms_norm_eps, true, kn_rows, s);
-    }
-    // Interleaved MRoPE over the three-axis RoPE positions (an image's tokens take the frontend's
-    // grid positions, later tokens their index plus the prompt's rope delta). A text token's equal
-    // axes give the 1-D rotation bit for bit (the kernel computes position[axis] * frequency).
-    ops::rope(batch.rope_positions, dim(config_.rope.rotary_dim), config_.rope.theta, qn, kn, device_.execution_view());
+    // The q/k norms, then interleaved MRoPE over the three-axis RoPE positions (an image's tokens
+    // take the frontend's grid positions, later tokens their index plus the prompt's rope delta; a
+    // text token's equal axes give the 1-D rotation bit for bit, as the kernel computes
+    // position[axis] * frequency), in one launch where the shapes allow.
+    ops::rmsnorm_pair_rope(q, p.query_norm, qn, k, p.key_norm, kn, config_.rms_norm_eps, batch.rope_positions,
+                           dim(config_.rope.rotary_dim), config_.rope.theta, device_.execution_view());
 
     const PagedKVLayerView& cache = kv_.layers.at(index);
     ops::kv_cache_append(kn, v, batch.positions, cache, s);
@@ -852,7 +1046,8 @@ const std::vector<ops::MoeCpuChannel>* Forward::cpu_channels(const ForwardBatch&
 }
 
 Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
-                    const std::vector<ops::MoeCpuChannel>* cpu_leg, const MoeRead* read) {
+                    const std::vector<ops::MoeCpuChannel>* cpu_leg, const MoeRead* read, const Tensor* inject,
+                    Tensor* residual) {
     const cudaStream_t s = device_.stream;
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
@@ -925,11 +1120,19 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     // GPU's experts (and their staging) and the shared expert.
     const bool cpu = cpu_leg != nullptr && !cpu_leg->empty();
     if (cpu) { source.cpu = (*cpu_leg)[layer]; }
+    if (cpu && cpu_leg == &experts_.prefill_cpu && prefill_cpu_all_) { // set_prefill_cpu_all
+        source.cpu.share_num = 1;
+        source.cpu.share_den = 1;
+        // Every miss of a short call goes to the CPU: at most 8 columns each, or the CPU would take
+        // the wide ones too and become the call's bottleneck (308-token prompts: +10%).
+        source.cpu.max_job_columns = std::min(source.cpu.max_job_columns, ops::offloaded_moe::kMaxColumns);
+    }
     ExpertStream* stream = experts_.stream != nullptr && experts_.stream->active() ? experts_.stream : nullptr;
     if (stream != nullptr) {
         source.frames = stream->table(layer);
         // A streamed call's misses are the cold set its stream left out (which already encodes the
-        // prefill share) and any experts beyond the ring: the CPU takes every one of at most 8 columns.
+        // prefill share) and any experts beyond the ring: the CPU takes every one of at most the
+        // channel's max_job_columns (--prefill-cpu-max-columns), slots permitting.
         if (cpu && cpu_leg == &experts_.prefill_cpu) {
             source.cpu.share_num = 1;
             source.cpu.share_den = 1;
@@ -955,7 +1158,11 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     // was allocated before the shared expert's tensors and the scope ends with the layer).
     if (cpu) { ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s); }
     Tensor y = work_->alloc(DType::BF16, {H, T});
-    ops::moe_combine(outputs, routing, shared, y, s);
+    if (inject != nullptr && residual != nullptr) {
+        ops::moe_combine_inject(outputs, routing, shared, y, *inject, *residual, s);
+    } else {
+        ops::moe_combine(outputs, routing, shared, y, s);
+    }
     return y;
 }
 
@@ -1054,15 +1261,13 @@ void Forward::layer_rows(std::uint32_t layer, const ForwardRowsBatch& batch) {
     if (fused_read(block.mlp_hc, B)) {
         const MoeRead read = read_moe(block.mlp_hc, block.moe.router, block.moe.shared_score, residual_, y, inject,
                                       route_log(layer, static_cast<std::size_t>(config_.moe.top_k) * B));
-        Tensor ym          = moe(block.moe, read.x, layer, nullptr, /*cpu=*/nullptr, &read);
-        ops::hyper_connection_inject(ym, read.inject, residual_, s);
+        moe(block.moe, read.x, layer, nullptr, /*cpu=*/nullptr, &read, &read.inject, &residual_);
         steer(layer, residual_, batch.steer);
         return;
     }
     ops::hyper_connection_inject(y, inject, residual_, s);
     Tensor xm = mix(block.mlp_hc, residual_, &inject);
-    Tensor ym = moe(block.moe, xm, layer, nullptr, /*cpu=*/nullptr);
-    ops::hyper_connection_inject(ym, inject, residual_, s);
+    moe(block.moe, xm, layer, nullptr, /*cpu=*/nullptr, nullptr, &inject, &residual_);
     steer(layer, residual_, batch.steer);
 }
 
@@ -1074,20 +1279,22 @@ Tensor Forward::gdn_rows(const GdnParameters& p, const Tensor& x, std::uint32_t 
     const std::int32_t NV = dim(g.value_heads), NK = dim(g.key_heads), DK = dim(g.key_head_dim),
                        DV = dim(g.value_head_dim);
     Tensor qkv = work_->alloc(DType::BF16, {C, B});
-    project(x, p.qkv, qkv, *work_, s, ggml_decode_mma_);
-    Tensor z = work_->alloc(DType::BF16, {VW, B});
-    project(x, p.z, z, *work_, s, ggml_decode_mma_);
+    Tensor z   = work_->alloc(DType::BF16, {VW, B});
+    project_pair(x, p.qkv, p.z, qkv, z, *work_, s, ggml_decode_mma_);
     Tensor ab = work_->alloc(DType::BF16, {2 * NV, B});
     project_verify(x, p.control, ab, /*columnwise=*/true);
-    Tensor a = work_->alloc(DType::BF16, {NV, B});
-    Tensor b = work_->alloc(DType::BF16, {NV, B});
-    {
-        Tensor* parts[] = {&a, &b};
-        ops::split_rows(ab, parts, s);
-    }
     Tensor gate = work_->alloc(DType::FP32, {NV, B});
     Tensor beta = work_->alloc(DType::FP32, {NV, B});
-    ops::gdn_gating_decay(a, b, p.decay, p.dt_bias, gate, beta, s);
+    // a and b straight from the control projection's halves (no split).
+    if (NV == 48) {
+        ops::gdn_gating_decay_packed(ab, p.decay, p.dt_bias, gate, beta, s);
+    } else {
+        Tensor a = work_->alloc(DType::BF16, {NV, B});
+        Tensor b = work_->alloc(DType::BF16, {NV, B});
+        Tensor* parts[] = {&a, &b};
+        ops::split_rows(ab, parts, s);
+        ops::gdn_gating_decay(a, b, p.decay, p.dt_bias, gate, beta, s);
+    }
 
     // Each row's convolution window, read and replaced in its slot (the snapshot form at one column
     // per row: the same arithmetic as the single-sequence split form).
@@ -1161,8 +1368,8 @@ Tensor Forward::attention_rows(const AttentionParameters& p, const Tensor& x, st
     Tensor kn = work_->alloc(DType::BF16, {D, KVH, B});
     {
         Tensor qn_rows = qn.view({D, NH * B}), kn_rows = kn.view({D, KVH * B});
-        ops::rmsnorm(q.view({D, NH * B}), p.query_norm, config_.rms_norm_eps, true, qn_rows, s);
-        ops::rmsnorm(k.view({D, KVH * B}), p.key_norm, config_.rms_norm_eps, true, kn_rows, s);
+        ops::rmsnorm_pair(q.view({D, NH * B}), p.query_norm, qn_rows, k.view({D, KVH * B}), p.key_norm,
+                          kn_rows, config_.rms_norm_eps, true, s);
     }
     ops::rope(batch.rope_positions, dim(config_.rope.rotary_dim), config_.rope.theta, qn, kn, device_.execution_view());
     const auto geometry = qsa_geometry(config_);
@@ -1305,15 +1512,13 @@ void Forward::layer_rows_verify(std::uint32_t layer, const ForwardRowsVerifyBatc
     if (fused_read(block.mlp_hc, T)) {
         const MoeRead read = read_moe(block.mlp_hc, block.moe.router, block.moe.shared_score, residual_, y, inject,
                                       route_log(layer, static_cast<std::size_t>(config_.moe.top_k) * T));
-        Tensor ym          = moe(block.moe, read.x, layer, nullptr, &experts_.cpu, &read);
-        ops::hyper_connection_inject(ym, read.inject, residual_, s);
+        moe(block.moe, read.x, layer, nullptr, &experts_.cpu, &read, &read.inject, &residual_);
         steer(layer, residual_, batch.steer);
         return;
     }
     ops::hyper_connection_inject(y, inject, residual_, s);
     Tensor xm = mix(block.mlp_hc, residual_, &inject);
-    Tensor ym = moe(block.moe, xm, layer, nullptr, &experts_.cpu);
-    ops::hyper_connection_inject(ym, inject, residual_, s);
+    moe(block.moe, xm, layer, nullptr, &experts_.cpu, nullptr, &inject, &residual_);
     steer(layer, residual_, batch.steer);
 }
 
@@ -1329,20 +1534,22 @@ Tensor Forward::gdn_rows_verify(const GdnParameters& p, const Tensor& x, std::ui
     // The round's inputs are projected straight into the replay records (recorded, per row), as the
     // single-row verify path does.
     Tensor qkv = records.conv.view({C, T});
-    project(x, p.qkv, qkv, *work_, s, ggml_decode_mma_);
-    Tensor z = work_->alloc(DType::BF16, {VW, T});
-    project(x, p.z, z, *work_, s, ggml_decode_mma_);
+    Tensor z   = work_->alloc(DType::BF16, {VW, T});
+    project_pair(x, p.qkv, p.z, qkv, z, *work_, s, ggml_decode_mma_);
     Tensor ab = work_->alloc(DType::BF16, {2 * NV, T});
     project_verify(x, p.control, ab, /*columnwise=*/true);
-    Tensor a = work_->alloc(DType::BF16, {NV, T});
-    Tensor b = work_->alloc(DType::BF16, {NV, T});
-    {
-        Tensor* parts[] = {&a, &b};
-        ops::split_rows(ab, parts, s);
-    }
     Tensor gate = work_->alloc(DType::FP32, {NV, T});
     Tensor beta = work_->alloc(DType::FP32, {NV, T});
-    ops::gdn_gating_decay(a, b, p.decay, p.dt_bias, gate, beta, s);
+    // a and b straight from the control projection's halves (no split).
+    if (NV == 48) {
+        ops::gdn_gating_decay_packed(ab, p.decay, p.dt_bias, gate, beta, s);
+    } else {
+        Tensor a = work_->alloc(DType::BF16, {NV, T});
+        Tensor b = work_->alloc(DType::BF16, {NV, T});
+        Tensor* parts[] = {&a, &b};
+        ops::split_rows(ab, parts, s);
+        ops::gdn_gating_decay(a, b, p.decay, p.dt_bias, gate, beta, s);
+    }
 
     Tensor q = work_->alloc(DType::BF16, {KW, T});
     Tensor k = work_->alloc(DType::BF16, {KW, T});
@@ -1415,8 +1622,8 @@ Tensor Forward::attention_rows_verify(const AttentionParameters& p, const Tensor
     Tensor kn = work_->alloc(DType::BF16, {D, KVH, T});
     {
         Tensor qn_rows = qn.view({D, NH * T}), kn_rows = kn.view({D, KVH * T});
-        ops::rmsnorm(q.view({D, NH * T}), p.query_norm, config_.rms_norm_eps, true, qn_rows, s);
-        ops::rmsnorm(k.view({D, KVH * T}), p.key_norm, config_.rms_norm_eps, true, kn_rows, s);
+        ops::rmsnorm_pair(q.view({D, NH * T}), p.query_norm, qn_rows, k.view({D, KVH * T}), p.key_norm,
+                          kn_rows, config_.rms_norm_eps, true, s);
     }
     ops::rope(batch.rope_positions, dim(config_.rope.rotary_dim), config_.rope.theta, qn, kn, device_.execution_view());
     const auto geometry = qsa_geometry(config_);

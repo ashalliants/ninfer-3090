@@ -16,10 +16,12 @@
 // directly. Down: a CTA owns 64 output rows of one job, decodes their whole K = 640 slice (Q2_0 or
 // IQ4_NL) once and keeps it while each column tile's h codes arrive in one piece.
 
+#include "ops/common/smem_limit.h"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 
 #include "core/device.h"
 #include "ops/common/canonical_ggml.h"
+#include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/offloaded_sparse_moe/cuda/expert_decode.cuh"
 
@@ -51,7 +53,7 @@ constexpr int kXRowBytes    = 32 * kLeafBytes; // one token's blocks (32 leaves)
 // and scales (bytes 640..719) instead.
 constexpr int kHRowBytes    = kIntermediate * 4;
 constexpr int kPlanThreads  = 1024;
-constexpr int kMaxDynamicSmem  = 99 * 1024;
+constexpr int kMaxDynamicSmem  = kMaxDynamicSharedBytes;
 // The accumulator's bias: int32 0x4B400000 + S read as binary32 is 1.5 * 2^23 + S for |S| < 2^22.
 constexpr int kBias        = 0x4B400000;
 constexpr float kBiasValue = 12582912.0F;
@@ -138,6 +140,22 @@ __global__ void quantize_x_kernel(const __nv_bfloat16* __restrict__ x, int colum
 // halves, so the eight rows an ldmatrix phase reads fall in distinct banks.
 __device__ __forceinline__ int tile_offset(int r, int h) { return r * 32 + ((h ^ ((r >> 2) & 1)) << 4); }
 
+#if defined(NINFER_SM70)
+// sm_70 has no integer tensor cores: the emulated ldmatrix and mma cost ~4x the dp4a they wrap in
+// shuffles. Instead each thread reads its own rows and columns of a warp's m16n8 tiles (rows
+// row_a[t] + gq + 8 rh, columns cgroup + 8 nt + 2 tig + j: the mma fragment's ownership) and sums
+// them with dp4a. Integer sums are exact in any order, so the results are the mma's bit for bit.
+__device__ __forceinline__ int dot16(int4 a, int4 b, int acc) {
+    acc = __dp4a(a.x, b.x, acc);
+    acc = __dp4a(a.y, b.y, acc);
+    acc = __dp4a(a.z, b.z, acc);
+    return __dp4a(a.w, b.w, acc);
+}
+__device__ __forceinline__ int4 lds_half(const std::uint8_t* tile, int r, int h) {
+    return *reinterpret_cast<const int4*>(tile + tile_offset(r, h));
+}
+#endif
+
 struct alignas(16) Tiles {
     std::uint8_t w[kWStages][kMaxLeafSubs][kRows][32];        // decoded weights per stage and sub-block
     std::uint8_t x[kXStages][kMaxLeafSubs][kTileColumns][32]; // the columns' A8 codes
@@ -148,7 +166,8 @@ struct alignas(16) Tiles {
     const std::int8_t* code[kTileColumns];          // a column's leaf blocks (null past the tile's columns)
 };
 // The gate/up epilogue's h tile [columns][32 intermediates] reuses the activation stages.
-static_assert(sizeof(float) * kTileColumns * 32 <= sizeof(Tiles::x));
+// sm_70's narrowest layout pairs SwiGLU through a second [columns][32] FP32 tile after it.
+static_assert(2 * sizeof(float) * kTileColumns * 32 <= sizeof(Tiles::x));
 
 // A gate/up row's bytes in format F (K = kHidden).
 template <QType F>
@@ -163,23 +182,40 @@ inline constexpr bool kStagedSlice =
     static_cast<int>(sizeof(Tiles)) + kRows * kGateUpRowBytes<F> <= kMaxDynamicSmem;
 
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool valid) {
-    const auto s = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(src), "r"(valid ? 16 : 0) : "memory");
+    cp_async_zfill_mem<16>(dst, src, valid ? 16 : 0);
 }
 
 __device__ __forceinline__ void cp_async4(void* dst, const void* src, bool valid) {
-    const auto s = static_cast<unsigned>(__cvta_generic_to_shared(dst));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(s), "l"(src), "r"(valid ? 4 : 0) : "memory");
+    cp_async_zfill_mem<4, Cache::ca>(dst, src, valid ? 4 : 0);
 }
 
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
-__device__ __forceinline__ void cp_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
+__device__ __forceinline__ void cp_commit() { cp_commit_mem(); }
+__device__ __forceinline__ void cp_wait_all() { cp_wait_mem<0>(); }
 // Every group but the newest kXStages - 2 has landed.
-__device__ __forceinline__ void cp_wait_ahead() { asm volatile("cp.async.wait_group %0;\n" ::"n"(kXStages - 2) : "memory"); }
+__device__ __forceinline__ void cp_wait_ahead() { cp_wait_mem<kXStages - 2>(); }
 
 // A contiguous slice into shared memory, 16 bytes per copy (both ends 16-byte aligned).
 __device__ __forceinline__ void stage_slice(const std::uint8_t* src, std::uint8_t* dst, int bytes) {
+#if defined(NINFER_SM70)
+    // sm_70's cp.async is a synchronous load and store, so a loop of them waits out one global
+    // round trip per copy: issue a batch of loads into registers, then store them.
+    constexpr int kBatch = 8;
+    for (int base = static_cast<int>(threadIdx.x) * 16; base < bytes; base += kThreads * 16 * kBatch) {
+        int4 v[kBatch];
+#pragma unroll
+        for (int j = 0; j < kBatch; ++j) {
+            const int i = base + j * kThreads * 16;
+            if (i < bytes) { v[j] = __ldcg(reinterpret_cast<const int4*>(src + i)); }
+        }
+#pragma unroll
+        for (int j = 0; j < kBatch; ++j) {
+            const int i = base + j * kThreads * 16;
+            if (i < bytes) { *reinterpret_cast<int4*>(dst + i) = v[j]; }
+        }
+    }
+#else
     for (int i = static_cast<int>(threadIdx.x) * 16; i < bytes; i += kThreads * 16) { cp_async16(dst + i, src + i, true); }
+#endif
 }
 
 __device__ __forceinline__ int leaf_of(int n) { return static_cast<int>(__brev(static_cast<unsigned>(n)) >> 27); }
@@ -207,6 +243,55 @@ __device__ __forceinline__ void load_columns(Tiles& sm, int st, int n) {
         }
     }
 }
+
+#if defined(NINFER_SM70)
+// sm_70's cp.async is synchronous, so load_columns stalls each leaf on its global round trips. The
+// same copies split in two instead: fetch_columns issues leaf n's loads into registers (before the
+// current leaf's arithmetic) and store_columns writes them to their stage after it.
+struct ColumnFetch {
+    int4 v[2];
+};
+static_assert(7 * kTileColumns <= 2 * kThreads, "a leaf's parts fit two copies per thread");
+
+template <int kSubs>
+__device__ __forceinline__ ColumnFetch fetch_columns(const Tiles& sm, int n) {
+    ColumnFetch f;
+    f.v[0] = f.v[1] = make_int4(0, 0, 0, 0);
+    if (n >= kLeaves) { return f; }
+    const int leaf = leaf_of(n), subs = leaf_subs<kSubs>(leaf);
+    const int parts = 2 * subs + 1;
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int i = static_cast<int>(threadIdx.x) + j * kThreads;
+        if (i < parts * kTileColumns) {
+            const int c = i / parts, part = i % parts;
+            const std::int8_t* in = sm.code[c];
+            if (in != nullptr) {
+                const std::int8_t* src = in + leaf * kLeafBytes + (part < 2 * subs ? 16 * part : kLeafScales);
+                f.v[j] = __ldcg(reinterpret_cast<const int4*>(src));
+            }
+        }
+    }
+    return f;
+}
+
+template <int kSubs>
+__device__ __forceinline__ void store_columns(Tiles& sm, int st, int n, const ColumnFetch& f) {
+    if (n >= kLeaves) { return; }
+    const int leaf = leaf_of(n), subs = leaf_subs<kSubs>(leaf);
+    const int parts = 2 * subs + 1;
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int i = static_cast<int>(threadIdx.x) + j * kThreads;
+        if (i < parts * kTileColumns) {
+            const int c = i / parts, part = i % parts;
+            void* dst = part < 2 * subs ? static_cast<void*>(&sm.x[st][part / 2][0][0] + tile_offset(c, part % 2))
+                                        : static_cast<void*>(&sm.xd[st][c][0]);
+            *reinterpret_cast<int4*>(dst) = f.v[j];
+        }
+    }
+}
+#endif
 
 // Leaf n's sub-blocks of the unit's rows decoded into weight stage `st`, one (row, sub-block) per
 // thread. Row r is raw + r * row_bytes in the staged slice (gate rows 0..31, then up rows), or, when
@@ -385,6 +470,41 @@ __global__ void __launch_bounds__(kThreads, 1)
         for (int col0 = begin; col0 < end; col0 += kTileColumns) {
             const int count = min(kTileColumns, end - col0);
             __syncthreads(); // decode done (first tile) / the previous tile's reads done
+#if defined(NINFER_SM70)
+            {
+                // The tile's codes and scales, every load issued before any store (see stage_slice).
+                constexpr int kCodes = kDownSubs * kTileColumns * 2 / kThreads; // 10
+                constexpr int kScalesPer = kDownSubs * kTileColumns / kThreads; // 5
+                static_assert(kCodes * kThreads == kDownSubs * kTileColumns * 2 && kScalesPer * kThreads == kDownSubs * kTileColumns);
+                int4 code[kCodes];
+                float scale[kScalesPer];
+#pragma unroll
+                for (int j = 0; j < kCodes; ++j) {
+                    const int i = static_cast<int>(threadIdx.x) + j * kThreads;
+                    const int s = i / (2 * kTileColumns), c = (i / 2) % kTileColumns, h = i % 2;
+                    const auto* row = reinterpret_cast<const std::uint8_t*>(h_rows) + static_cast<std::size_t>(col0 + c) * kHRowBytes;
+                    code[j] = c < count ? __ldcg(reinterpret_cast<const int4*>(row + 32 * s + 16 * h)) : make_int4(0, 0, 0, 0);
+                }
+#pragma unroll
+                for (int j = 0; j < kScalesPer; ++j) {
+                    const int i = static_cast<int>(threadIdx.x) + j * kThreads;
+                    const int s = i / kTileColumns, c = i % kTileColumns;
+                    const auto* row = reinterpret_cast<const std::uint8_t*>(h_rows) + static_cast<std::size_t>(col0 + c) * kHRowBytes;
+                    scale[j] = c < count ? reinterpret_cast<const float*>(row + kIntermediate)[s] : 0.0F;
+                }
+#pragma unroll
+                for (int j = 0; j < kCodes; ++j) {
+                    const int i = static_cast<int>(threadIdx.x) + j * kThreads;
+                    const int s = i / (2 * kTileColumns), c = (i / 2) % kTileColumns, h = i % 2;
+                    *reinterpret_cast<int4*>(&sm.x[s][0][0] + tile_offset(c, h)) = code[j];
+                }
+#pragma unroll
+                for (int j = 0; j < kScalesPer; ++j) {
+                    const int i = static_cast<int>(threadIdx.x) + j * kThreads;
+                    sm.xd[i / kTileColumns][i % kTileColumns] = scale[j];
+                }
+            }
+#else
             for (int i = static_cast<int>(threadIdx.x); i < kDownSubs * kTileColumns * 2; i += kThreads) {
                 const int s = i / (2 * kTileColumns), c = (i / 2) % kTileColumns, h = i % 2;
                 const auto* row = reinterpret_cast<const std::uint8_t*>(h_rows) + static_cast<std::size_t>(col0 + min(c, count - 1)) * kHRowBytes;
@@ -395,6 +515,7 @@ __global__ void __launch_bounds__(kThreads, 1)
                 const auto* row = reinterpret_cast<const std::uint8_t*>(h_rows) + static_cast<std::size_t>(col0 + min(c, count - 1)) * kHRowBytes;
                 cp_async4(&sm.xd[s][c], reinterpret_cast<const float*>(row + kIntermediate) + s, c < count);
             }
+#endif
             cp_commit();
             cp_wait_all();
             __syncthreads();
@@ -404,7 +525,18 @@ __global__ void __launch_bounds__(kThreads, 1)
             for (int n = 0; n < kLeaves; ++n) {
                 const int s = static_cast<int>(__brev(static_cast<unsigned>(n)) >> 27);
                 float v[2][2][4];
-                if (s < kDownSubs) {
+                if (s < kDownSubs && cgroup < count) { // a warp past the tile's columns stores nothing
+#if defined(NINFER_SM70)
+                    int4 wr[2][2][2]; // [t][rh][half]
+#pragma unroll
+                    for (int t = 0; t < 2; ++t) {
+#pragma unroll
+                        for (int rh = 0; rh < 2; ++rh) {
+                            wr[t][rh][0] = lds_half(&sm.w[s][0][0], row_a[t] + gq + 8 * rh, 0);
+                            wr[t][rh][1] = lds_half(&sm.w[s][0][0], row_a[t] + gq + 8 * rh, 1);
+                        }
+                    }
+#else
                     unsigned a[2][4], b[4];
 #pragma unroll
                     for (int t = 0; t < 2; ++t) {
@@ -419,6 +551,7 @@ __global__ void __launch_bounds__(kThreads, 1)
                         ldmatrix_x4(b[0], b[1], b[2], b[3],
                                     static_cast<unsigned>(__cvta_generic_to_shared(&sm.x[s][0][0] + tile_offset(c, m & 1))));
                     }
+#endif
                     float cr[2][2];
 #pragma unroll
                     for (int t = 0; t < 2; ++t) {
@@ -429,10 +562,25 @@ __global__ void __launch_bounds__(kThreads, 1)
                     for (int nt = 0; nt < 2; ++nt) {
                         const int c0     = cgroup + 8 * nt + 2 * tig;
                         const float d[2] = {sm.xd[s][c0], sm.xd[s][c0 + 1]};
+#if defined(NINFER_SM70)
+                        int4 xc[2][2]; // [j][half]
+#pragma unroll
+                        for (int j = 0; j < 2; ++j) {
+                            xc[j][0] = lds_half(&sm.x[s][0][0], c0 + j, 0);
+                            xc[j][1] = lds_half(&sm.x[s][0][0], c0 + j, 1);
+                        }
+#endif
 #pragma unroll
                         for (int t = 0; t < 2; ++t) {
                             int acc[4] = {kBias, kBias, kBias, kBias};
+#if defined(NINFER_SM70)
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) {
+                                acc[i] = dot16(wr[t][i / 2][1], xc[i % 2][1], dot16(wr[t][i / 2][0], xc[i % 2][0], kBias));
+                            }
+#else
                             mma_s8(acc[0], acc[1], acc[2], acc[3], a[t][0], a[t][1], a[t][2], a[t][3], b[2 * nt], b[2 * nt + 1]);
+#endif
 #pragma unroll
                             for (int i = 0; i < 4; ++i) {
                                 const float p = __fsub_rn(__int_as_float(acc[i]), kBiasValue); // m0 = m1 = 1
@@ -483,9 +631,18 @@ __global__ void __launch_bounds__(kThreads, 1)
 // walks the 32 leaves with the weights decoded two leaves ahead and the activations copied
 // kXStages - 1 leaves ahead.
 //
-// Warp w owns two m16 row tiles (gate and up of intermediates 16 (w % 2) ..) times 16 columns (two
-// n8 tiles from 16 (w / 2)): 16 outputs per thread, output (t, nt, i) at 8 t + 4 nt + i.
-template <QType F>
+// Each warp owns kT m16 row tiles times kNt n8 tiles of a column tile; output (t, nt, i) of a thread
+// is at 4 (kNt t + nt) + i. The full layout <kT, kNt> = <2, 2>: warp w has the gate and up tiles of
+// intermediates 16 (w % 2) .. and columns 16 (w / 2) ...
+//
+// kLayout 0 runs every column tile in the full layout. sm_70 launches kLayout 1, 2 and 3 instead,
+// each taking only its tiles: more than 32 columns in <2, 2>; 17..32 in <2, 1> (columns 8 (w / 2)
+// ..); at most 16 in <1, 1> (warp w has the gate (w / 2 even) or up tile, columns 8 (w / 4) ..). A
+// warp's dp4a work is latency-bound, so in the full layout a narrow tile cost nearly a full one: its
+// few busy warps ran a full share while the rest waited at each leaf's barrier. The layouts are
+// separate kernels because in one kernel their bodies share a register allocation and spill. Every
+// output is the same sums and fold in any layout, so the results are bit-identical.
+template <QType F, int kLayout>
 __global__ void __launch_bounds__(kThreads, 1)
     wide_gate_up_kernel(MoeDispatch dispatch, MoeExpertSource source, Geometry g, int top_k,
                    const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ tiles,
@@ -501,14 +658,18 @@ __global__ void __launch_bounds__(kThreads, 1)
     const auto grid      = device::ExpertFormat<F>::table();
     const int lane = static_cast<int>(threadIdx.x) % 32, warp = static_cast<int>(threadIdx.x) / 32;
     const int gq = lane / 4, tig = lane % 4;
-    const int pair = warp % 2, cgroup = 16 * (warp / 2);
-    const int row_a[2] = {16 * pair, 32 + 16 * pair}; // shared-memory rows of the warp's gate and up tiles
 
     for (int tile = first_tile + static_cast<int>(blockIdx.y); tile < end_tile; tile += static_cast<int>(gridDim.y)) {
         if (tiles[2 * tile + 1] != 0) { continue; } // a job's first tile stands for the job
         const int job    = tiles[2 * tile];
         const int expert = dispatch.jobs[job];
         const int begin = dispatch.offsets[expert], end = dispatch.offsets[expert + 1];
+        if constexpr (kLayout != 0) {
+            // Tiles of 64 columns, then the last of `last`: skip a job with none of this layout's.
+            const int last = (end - begin - 1) % kTileColumns + 1;
+            const bool any = kLayout == 1 ? end - begin > 32 : kLayout == 2 ? last > 16 && last <= 32 : last <= 16;
+            if (!any) { continue; }
+        }
         const std::uint8_t* record = resolve_record(source, job_records, job, expert);
         __syncthreads(); // the previous job has finished with shared memory
         // The unit's gate and up rows: the staged slice, or the record itself (kStagedSlice).
@@ -525,6 +686,9 @@ __global__ void __launch_bounds__(kThreads, 1)
         cp_commit();
         for (int first = begin; first < end; first += kTileColumns) {
             const int count = min(kTileColumns, end - first);
+            if constexpr (kLayout != 0) {
+                if (kLayout != (count > 32 ? 1 : count > 16 ? 2 : 3)) { continue; }
+            }
             __syncthreads(); // the previous tile's epilogue has finished with the activation stages
             if (threadIdx.x < kTileColumns) {
                 const int c = static_cast<int>(threadIdx.x);
@@ -545,8 +709,17 @@ __global__ void __launch_bounds__(kThreads, 1)
             decode_rows<F, kSubs>(sm, 1, 1, rows, up, row_bytes, grid);
             __syncthreads();
 
-            float stack[16][5];
-            float root[16];
+            // The rest of the tile in layout <kT, kNt> (body not re-indented).
+            auto run_tile = [&]<int kT, int kNt>() {
+            constexpr int kO = 4 * kT * kNt;
+            const int pair   = warp % 2;
+            const int side   = kT == 2 ? 0 : (warp / 2) % 2; // kT == 1: 0 gate, 1 up
+            const int cgroup = 8 * kNt * (warp / (4 / kT));
+            int row_a[kT]; // shared-memory rows of the warp's tiles
+#pragma unroll
+            for (int t = 0; t < kT; ++t) { row_a[t] = 32 * (kT == 2 ? t : side) + 16 * pair; }
+            float stack[kO][5];
+            float root[kO];
             // Leaves in pairs: an even leaf has three sub-blocks (l < 16), an odd one two, so each
             // half of the pair runs straight-line code.
 #pragma unroll 1
@@ -555,19 +728,37 @@ __global__ void __launch_bounds__(kThreads, 1)
             for (int half = 0; half < 2; ++half) {
                 const int n  = n2 + half;
                 const int xs = n % kXStages, ws = n % kWStages;
+#if defined(NINFER_SM70)
+                const ColumnFetch ahead = fetch_columns<kSubs>(sm, n + kXStages - 1);
+#else
                 load_columns<kSubs>(sm, (n + kXStages - 1) % kXStages, n + kXStages - 1);
                 cp_commit();
+#endif
                 const int subs = half == 0 ? 3 : 2; // leaf_subs<kSubs>(leaf_of(n))
-                float v[16];
+                float v[kO];
 #pragma unroll
-                for (int o = 0; o < 16; ++o) { v[o] = 0.0F; }
+                for (int o = 0; o < kO; ++o) { v[o] = 0.0F; }
 #pragma unroll
                 for (int k = 0; k < kMaxLeafSubs; ++k) {
                     if (k >= subs) { break; }
-                    unsigned a[2][4], b[4];
+                    // A warp whose columns all lie past the tile's columns has nothing to store
+                    // (the epilogue reads only columns < count): its v stays 0.
+                    if (cgroup >= count) { break; }
                     const auto* wbase = &sm.w[ws][k][0][0];
+#if defined(NINFER_SM70)
+                    int4 wr[kT][2][2]; // [t][rh][half]
 #pragma unroll
-                    for (int t = 0; t < 2; ++t) {
+                    for (int t = 0; t < kT; ++t) {
+#pragma unroll
+                        for (int rh = 0; rh < 2; ++rh) {
+                            wr[t][rh][0] = lds_half(wbase, row_a[t] + gq + 8 * rh, 0);
+                            wr[t][rh][1] = lds_half(wbase, row_a[t] + gq + 8 * rh, 1);
+                        }
+                    }
+#else
+                    unsigned a[kT][4], b[4];
+#pragma unroll
+                    for (int t = 0; t < kT; ++t) {
                         const int m = lane / 8;
                         const int r = row_a[t] + lane % 8 + 8 * (m & 1);
                         ldmatrix_x4(a[t][0], a[t][1], a[t][2], a[t][3],
@@ -581,9 +772,10 @@ __global__ void __launch_bounds__(kThreads, 1)
                         ldmatrix_x4(b[0], b[1], b[2], b[3],
                                     static_cast<unsigned>(__cvta_generic_to_shared(&sm.x[xs][k][0][0] + tile_offset(c, m & 1))));
                     }
-                    float cr[2][2], m0[2][2], m1[2][2];
+#endif
+                    float cr[kT][2], m0[kT][2], m1[kT][2];
 #pragma unroll
-                    for (int t = 0; t < 2; ++t) {
+                    for (int t = 0; t < kT; ++t) {
 #pragma unroll
                         for (int rh = 0; rh < 2; ++rh) {
                             const int r = row_a[t] + gq + 8 * rh;
@@ -593,10 +785,31 @@ __global__ void __launch_bounds__(kThreads, 1)
                         }
                     }
 #pragma unroll
-                    for (int nt = 0; nt < 2; ++nt) {
-                        int lo[2][4], hi[2][4];
+                    for (int nt = 0; nt < kNt; ++nt) {
+                        int lo[kT][4], hi[kT][4];
+#if defined(NINFER_SM70)
+                        int4 xc[2][2]; // [j][half]
 #pragma unroll
-                        for (int t = 0; t < 2; ++t) {
+                        for (int j = 0; j < 2; ++j) {
+                            xc[j][0] = lds_half(&sm.x[xs][k][0][0], cgroup + 8 * nt + 2 * tig + j, 0);
+                            xc[j][1] = lds_half(&sm.x[xs][k][0][0], cgroup + 8 * nt + 2 * tig + j, 1);
+                        }
+#pragma unroll
+                        for (int t = 0; t < kT; ++t) {
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) {
+                                const int rh = i / 2, j = i % 2;
+                                if constexpr (kOneMultiplier<F>) {
+                                    lo[t][i] = dot16(wr[t][rh][1], xc[j][1], dot16(wr[t][rh][0], xc[j][0], kBias));
+                                } else {
+                                    lo[t][i] = dot16(wr[t][rh][0], xc[j][0], kBias);
+                                    hi[t][i] = dot16(wr[t][rh][1], xc[j][1], kBias);
+                                }
+                            }
+                        }
+#else
+#pragma unroll
+                        for (int t = 0; t < kT; ++t) {
 #pragma unroll
                             for (int i = 0; i < 4; ++i) { lo[t][i] = hi[t][i] = kBias; }
                             if constexpr (kOneMultiplier<F>) {
@@ -607,10 +820,11 @@ __global__ void __launch_bounds__(kThreads, 1)
                                 mma_s8_k16(hi[t][0], hi[t][1], hi[t][2], hi[t][3], a[t][2], a[t][3], b[2 * nt + 1]);
                             }
                         }
+#endif
                         const int c0     = cgroup + 8 * nt + 2 * tig;
                         const float d[2] = {sm.xd[xs][c0][k], sm.xd[xs][c0 + 1][k]};
 #pragma unroll
-                        for (int t = 0; t < 2; ++t) {
+                        for (int t = 0; t < kT; ++t) {
 #pragma unroll
                             for (int i = 0; i < 4; ++i) {
                                 const int rh      = i / 2;
@@ -623,13 +837,16 @@ __global__ void __launch_bounds__(kThreads, 1)
                                     p = __fmaf_rn(m1[t][rh], b_sum, __fmul_rn(m0[t][rh], a_sum));
                                 }
                                 // canon::accumulate with float(P) exact: fma(c * d, P, partial).
-                                float& out = v[8 * t + 4 * nt + i];
+                                float& out = v[4 * (kNt * t + nt) + i];
                                 out        = __fmaf_rn(__fmul_rn(cr[t][rh], d[i % 2]), p, out);
                             }
                         }
                     }
                 }
                 fold_all(n, v, stack, root);
+#if defined(NINFER_SM70)
+                store_columns<kSubs>(sm, (n + kXStages - 1) % kXStages, n + kXStages - 1, ahead);
+#endif
                 // Two leaves ahead, after this leaf's tensor work in program order.
                 decode_rows<F, kSubs>(sm, (n + 2) % kWStages, n + 2, rows, up, row_bytes, grid);
                 cp_wait_ahead();
@@ -641,15 +858,53 @@ __global__ void __launch_bounds__(kThreads, 1)
             cp_wait_all();
             __syncthreads();
             auto* h = reinterpret_cast<float*>(&sm.x[0][0][0][0]); // [column][32]
+            if constexpr (kT == 2) {
 #pragma unroll
-            for (int nt = 0; nt < 2; ++nt) {
+                for (int nt = 0; nt < kNt; ++nt) {
 #pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    const int c = cgroup + 8 * nt + 2 * tig + i % 2;
-                    h[c * 32 + 16 * pair + gq + 8 * (i / 2)] = canon::swiglu_f32(root[4 * nt + i], root[8 + 4 * nt + i]);
+                    for (int i = 0; i < 4; ++i) {
+                        const int c = cgroup + 8 * nt + 2 * tig + i % 2;
+                        h[c * 32 + 16 * pair + gq + 8 * (i / 2)] =
+                            canon::swiglu_f32(root[4 * nt + i], root[4 * (kNt + nt) + i]);
+                    }
+                }
+            } else {
+                // The gate and up roots are in different warps: the up warps' go through shared
+                // memory after h, then the gate warps pair them.
+                float* up_root = h + kTileColumns * 32;
+                if (side == 1) {
+#pragma unroll
+                    for (int nt = 0; nt < kNt; ++nt) {
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const int c = cgroup + 8 * nt + 2 * tig + i % 2;
+                            up_root[c * 32 + 16 * pair + gq + 8 * (i / 2)] = root[4 * nt + i];
+                        }
+                    }
+                }
+                __syncthreads();
+                if (side == 0) {
+#pragma unroll
+                    for (int nt = 0; nt < kNt; ++nt) {
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const int c  = cgroup + 8 * nt + 2 * tig + i % 2;
+                            const int at = c * 32 + 16 * pair + gq + 8 * (i / 2);
+                            h[at]        = canon::swiglu_f32(root[4 * nt + i], up_root[at]);
+                        }
+                    }
                 }
             }
+            };
+            if constexpr (kLayout == 2) {
+                run_tile.template operator()<2, 1>();
+            } else if constexpr (kLayout == 3) {
+                run_tile.template operator()<1, 1>();
+            } else {
+                run_tile.template operator()<2, 2>();
+            }
             __syncthreads();
+            const float* h = reinterpret_cast<const float*>(&sm.x[0][0][0][0]); // [column][32]
             if (static_cast<int>(threadIdx.x) < count) {
                 const int c = static_cast<int>(threadIdx.x);
                 alignas(16) std::int8_t q[32];
@@ -664,12 +919,12 @@ __global__ void __launch_bounds__(kThreads, 1)
     }
 }
 
-template <QType F>
-void launch_gate_up(const MoeDispatch& dispatch, const MoeExpertSource& source, const Geometry& g, int top_k,
-                    const std::uint8_t* const* job_records, const Workspace& w, int pass, int grid_y, float* h_rows,
-                    cudaStream_t stream) {
+template <QType F, int kLayout>
+void launch_gate_up_layout(const MoeDispatch& dispatch, const MoeExpertSource& source, const Geometry& g, int top_k,
+                           const std::uint8_t* const* job_records, const Workspace& w, int pass, int grid_y,
+                           float* h_rows, cudaStream_t stream) {
     configure_cuda_device_once([] {
-        const void* kernel = reinterpret_cast<const void*>(wide_gate_up_kernel<F>);
+        const void* kernel = reinterpret_cast<const void*>(wide_gate_up_kernel<F, kLayout>);
         cudaError_t e      = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSmem);
         if (e == cudaSuccess) {
             e = cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
@@ -678,9 +933,22 @@ void launch_gate_up(const MoeDispatch& dispatch, const MoeExpertSource& source, 
     });
     const int slice = kStagedSlice<F> ? kRows * static_cast<int>(g.gate_up_row_bytes) : 0;
     const int smem  = static_cast<int>(sizeof(Tiles)) + slice;
-    wide_gate_up_kernel<F><<<dim3(kGateUpUnits, grid_y), kThreads, smem, stream>>>(
+    wide_gate_up_kernel<F, kLayout><<<dim3(kGateUpUnits, grid_y), kThreads, smem, stream>>>(
         dispatch, source, g, top_k, job_records, w.tiles, w.pass_tiles, pass, w.xq, h_rows);
     check_launch("gate/up");
+}
+
+template <QType F>
+void launch_gate_up(const MoeDispatch& dispatch, const MoeExpertSource& source, const Geometry& g, int top_k,
+                    const std::uint8_t* const* job_records, const Workspace& w, int pass, int grid_y, float* h_rows,
+                    cudaStream_t stream) {
+#if defined(NINFER_SM70)
+    launch_gate_up_layout<F, 1>(dispatch, source, g, top_k, job_records, w, pass, grid_y, h_rows, stream);
+    launch_gate_up_layout<F, 2>(dispatch, source, g, top_k, job_records, w, pass, grid_y, h_rows, stream);
+    launch_gate_up_layout<F, 3>(dispatch, source, g, top_k, job_records, w, pass, grid_y, h_rows, stream);
+#else
+    launch_gate_up_layout<F, 0>(dispatch, source, g, top_k, job_records, w, pass, grid_y, h_rows, stream);
+#endif
 }
 
 template <QType D>

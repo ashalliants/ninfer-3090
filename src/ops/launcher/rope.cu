@@ -121,6 +121,25 @@ bool launch_fixed_pair(const Tensor& positions, int rotary_dim, float theta, Ten
     return false;
 }
 
+} // namespace
+
+bool rope_pair_generic_route(const Tensor& positions, int rotary_dim, float theta, const Tensor& q, const Tensor& k) {
+    // launch_fixed_pair's conditions, negated.
+    if (!bf16x2_aligned(q) || !bf16x2_aligned(k)) { return true; }
+    const int axes = positions.ne[1];
+    if (axes == 1 && q.ne[0] == 128 && rotary_dim == 128 && theta == 1.0e7F && q.ne[1] == 32 && k.ne[1] == 8) {
+        return false;
+    }
+    if (rotary_dim == 64 && theta == 1.0e7F && (axes == 1 || axes == 3) &&
+        ((q.ne[1] == 24 && k.ne[1] == 4) || (q.ne[1] == 16 && k.ne[1] == 2))) {
+        return false;
+    }
+    if (axes == 2 && rotary_dim == 72 && theta == 10'000.0F && q.ne[1] == 16 && k.ne[1] == 16) { return false; }
+    return true;
+}
+
+namespace {
+
 template <RopeKernelMode Mode, int Heads>
 void launch_fixed_single(const Tensor& positions, Tensor& x, DeviceExecutionView execution) {
     launch_fixed<Mode, Heads, 0>(positions, &x, nullptr, execution);

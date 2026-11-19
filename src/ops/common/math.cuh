@@ -16,9 +16,14 @@ __device__ __forceinline__ float sigmoid(float x) { return 1.0f / (1.0f + expf(-
 
 // Fast tanh-based profile; saturation and rounding differ from sigmoid's expf path.
 __device__ __forceinline__ float sigmoid_approx(float x) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    // tanh.approx needs sm_75; sigmoid(x) = 1 / (1 + e^-x) is the same function.
+    return 1.0F / (1.0F + __expf(-x));
+#else
     float y;
     asm("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(0.5F * x));
     return 0.5F * y + 0.5F;
+#endif
 }
 
 __device__ __forceinline__ float softplus(float x) { return (x > 20.0f) ? x : log1pf(expf(x)); }
@@ -39,11 +44,16 @@ __device__ __forceinline__ float exp2_approx_ftz(float x) {
 __device__ __forceinline__ float exp_approx_ftz(float x) { return exp2_approx_ftz(x * kLog2E); }
 
 __device__ __forceinline__ std::uint32_t pack_bf16x2(float lo, float hi) {
+#if defined(NINFER_VOLTA_EMULATION)
+    const __nv_bfloat162 packed = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<const std::uint32_t*>(&packed);
+#else
     std::uint32_t out;
     const std::uint32_t lo_bits = __float_as_uint(lo);
     const std::uint32_t hi_bits = __float_as_uint(hi);
     asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(out) : "r"(hi_bits), "r"(lo_bits));
     return out;
+#endif
 }
 
 // Exact BF16 expansion for consumers that need FP32 operand bits, including TF32 MMA.

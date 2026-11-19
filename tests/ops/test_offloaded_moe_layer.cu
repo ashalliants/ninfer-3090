@@ -61,6 +61,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/offloaded_sparse_moe.h"
+#include "ninfer/ops/hyper_connection.h"
 #include "ninfer/ops/silu_mul.h"
 #include "offloaded_moe_fixtures.h"
 #include "ops/offloaded_sparse_moe/cpu_selection.h"
@@ -331,6 +332,29 @@ void test_combine() {
         const auto crit = measure(got, want);
         check(accept(crit), "moe_combine outside the BF16 criterion against FP64");
         std::printf("combine T=%d vs FP64: normwise %.3e, worst %.3e\n", columns, crit.normwise, crit.worst);
+
+        // moe_combine_inject: the same y, and the residual hyper_connection_inject leaves, bit for bit.
+        constexpr int kStreams = 4;
+        std::vector<float> inject(static_cast<std::size_t>(kStreams) * columns);
+        std::uniform_real_distribution<float> spread(-2.0F, 2.0F);
+        for (float& v : inject) { v = spread(rng); }
+        const auto residual = random_x(kStreams * columns, rng);
+        DeviceBuffer d_inject(inject.size() * 4), d_r1(residual.size() * 2), d_r2(residual.size() * 2),
+            d_y2(shared.size() * 2);
+        d_inject.copy_from_host(inject.data(), inject.size() * 4);
+        d_r1.copy_from_host(residual.data(), residual.size() * 2);
+        d_r2.copy_from_host(residual.data(), residual.size() * 2);
+        const Tensor it(d_inject.p, DType::FP32, {kStreams, columns});
+        Tensor r1(d_r1.p, DType::BF16, {kStreams * om::kHidden, columns});
+        Tensor r2(d_r2.p, DType::BF16, {kStreams * om::kHidden, columns});
+        Tensor y2(d_y2.p, DType::BF16, {om::kHidden, columns});
+        ops::hyper_connection_inject(yt, it, r1, nullptr);
+        ops::moe_combine_inject(ot, r.routing, st, y2, it, r2, nullptr);
+        cuda_ok(cudaDeviceSynchronize(), "combine inject");
+        check(download<std::uint16_t>(d_y2.p, shared.size()) == got, "moe_combine_inject y differs from moe_combine");
+        check(download<std::uint16_t>(d_r2.p, residual.size()) == download<std::uint16_t>(d_r1.p, residual.size()),
+              "moe_combine_inject residual differs from hyper_connection_inject");
+        std::printf("combine+inject T=%d: bitwise the two launches\n", columns);
     }
 }
 
@@ -784,7 +808,8 @@ void test_host_silent() {
 // The CPU leg of a verification call (--cpu-verify-misses), in the Forward's order: moe_experts with
 // wait_for_cpu == false, unrelated work on the stream (the shared expert), then moe_experts_cpu_wait.
 // The outputs equal the CPU engine's, eagerly and from a replayed graph; the request the call
-// publishes is select_cpu_jobs of the call's dispatch and residency.
+// publishes is select_cpu_jobs of the call's dispatch and residency, expanded into request slots
+// (cpu_request_slots: a job wider than 8 columns, max_job_columns permitting, takes several).
 void test_cpu_verify_leg() {
     std::mt19937 rng(606);
     constexpr int kExperts = 64, kTopK = 10, kStagingSlots = 4;
@@ -800,11 +825,14 @@ void test_cpu_verify_leg() {
     };
     int published = 0;
     for (const Leg& leg : {Leg{"4 jobs, divisor 3", 3, 4, 3, om::kMaxColumns, 6},
-                           Leg{"every miss", 4, 64, 0, om::kMaxColumns, 6}, Leg{"2-column jobs", 3, 3, 3, 2, 1}}) {
+                           Leg{"every miss", 4, 64, 0, om::kMaxColumns, 6}, Leg{"2-column jobs", 3, 3, 3, 2, 1},
+                           Leg{"split jobs", 4, 256, 0, om::kMaxCpuSplitColumns, 6},
+                           Leg{"split jobs, 9 slots", 5, 9, 0, om::kMaxCpuSplitColumns, 3}}) {
+        const bool split = leg.max_job_columns > om::kMaxColumns;
         om::CpuMissService::Options o;
         o.workers         = leg.workers;
         o.max_jobs        = leg.cap;
-        o.max_columns     = 16;
+        o.max_columns     = split ? 64 : 16;
         o.pcie_divisor    = leg.divisor;
         o.max_job_columns = leg.max_job_columns;
         om::CpuMissService service({{bank.pinned->host, bank.stride, bank.format}}, o);
@@ -820,7 +848,10 @@ void test_cpu_verify_leg() {
         Pinned error(64);
         auto* error_word = reinterpret_cast<volatile std::uint32_t*>(error.host);
         *error_word      = 0;
-        for (const int columns : g_small ? std::vector<int>{2, 8} : std::vector<int>{2, 3, 8, 16}) {
+        // Wide calls route experts more than 8 columns for the split legs.
+        const std::vector<int> widths_of_calls = split ? (g_small ? std::vector<int>{48} : std::vector<int>{16, 48, 64})
+                                                       : (g_small ? std::vector<int>{2, 8} : std::vector<int>{2, 3, 8, 16});
+        for (const int columns : widths_of_calls) {
             const std::string label = std::string(leg.name) + " T=" + std::to_string(columns);
             std::vector<float> f32;
             (void)random_logits(kExperts, columns, rng, f32);
@@ -857,6 +888,7 @@ void test_cpu_verify_leg() {
             std::vector<std::int32_t> widths;
             for (const int e : experts) { widths.push_back(offsets[e + 1] - offsets[e]); }
             const auto chosen = om::select_cpu_jobs(experts, widths, resident, leg.cap, leg.divisor, leg.max_job_columns);
+            const auto slots  = om::cpu_request_slots(chosen, widths);
             std::vector<int> compact(static_cast<std::size_t>(columns), -1);
             {
                 std::vector<bool> used(static_cast<std::size_t>(columns), false);
@@ -876,14 +908,16 @@ void test_cpu_verify_leg() {
                     return;
                 }
                 check(sequence != before, at + ": the call published no request");
-                check(q.layer == 0 && q.jobs == static_cast<int>(chosen.size()),
-                      at + ": the request's job count differs from select_cpu_jobs");
-                for (std::size_t i = 0; i < chosen.size() && i < static_cast<std::size_t>(q.jobs); ++i) {
-                    const int e = experts[static_cast<std::size_t>(chosen[i])];
-                    check(q.expert[i] == e && q.ncols[i] == widths[static_cast<std::size_t>(chosen[i])],
+                check(q.layer == 0 && q.jobs == static_cast<int>(slots.size()),
+                      at + ": the request's slot count differs from select_cpu_jobs");
+                for (std::size_t i = 0; i < slots.size() && i < static_cast<std::size_t>(q.jobs); ++i) {
+                    const int j  = slots[i].job, c0 = slots[i].column;
+                    const int e  = experts[static_cast<std::size_t>(j)];
+                    const int nc = std::min(om::kMaxColumns, widths[static_cast<std::size_t>(j)] - c0);
+                    check(q.expert[i] == e && q.ncols[i] == nc,
                           at + ": slot " + std::to_string(i) + " differs from select_cpu_jobs");
                     for (int c = 0; c < q.ncols[i] && c < om::kMaxColumns; ++c) {
-                        check(q.column[i][c] == compact[static_cast<std::size_t>(entries[offsets[e] + c] / kTopK)],
+                        check(q.column[i][c] == compact[static_cast<std::size_t>(entries[offsets[e] + c0 + c] / kTopK)],
                               at + ": slot " + std::to_string(i) + " column " + std::to_string(c) + " is not compacted");
                     }
                 }
@@ -921,12 +955,14 @@ void test_cpu_verify_leg() {
             cuda_ok(cudaGraphExecDestroy(exec), "destroy exec");
             cuda_ok(cudaGraphDestroy(graph), "destroy graph");
             check(service.failure().empty(), label + ": the CPU service failed: " + service.failure());
-            check(service.served_experts() - served == 3 * chosen.size(),
-                  label + ": the service did not serve select_cpu_jobs' experts on each of the three calls");
+            check(service.served_experts() - served == 3 * slots.size(),
+                  label + ": the service did not serve select_cpu_jobs' slots on each of the three calls");
+            int widest = 0;
+            for (const int j : chosen) { widest = std::max(widest, widths[static_cast<std::size_t>(j)]); }
             published += chosen.empty() ? 0 : 1;
-            std::printf("cpu_verify_leg %s: %zu of %d jobs on the CPU, outputs bit-identical eagerly and in two "
-                        "replays, request = select_cpu_jobs\n",
-                        label.c_str(), chosen.size(), jobs);
+            std::printf("cpu_verify_leg %s: %zu of %d jobs on the CPU in %zu slots (widest %d), outputs "
+                        "bit-identical eagerly and in two replays, request = select_cpu_jobs\n",
+                        label.c_str(), chosen.size(), jobs, slots.size(), widest);
         }
     }
     check(published > 0, "cpu_verify_leg: no call handed the CPU any expert");
@@ -1195,7 +1231,7 @@ void test_precast_read_proof() {
                 cuda_ok(cudaGraphGetRootNodes(graph, &precast, &roots), "root nodes");
                 cudaKernelNodeParams params{};
                 cuda_ok(cudaGraphKernelNodeGetParams(precast, &params), "precast node");
-                check(params.gridDim.x == static_cast<unsigned>((80 * columns + 255) / 256) && params.gridDim.y == 1 &&
+                check(params.gridDim.x == static_cast<unsigned>((4 * 80 * columns + 255) / 256) && params.gridDim.y == 1 && // four lanes a group
                           params.blockDim.x == 256,
                       label + ": the root node is not the precast kernel");
                 cuda_ok(cudaGraphNodeSetEnabled(exec, precast, 0), "disable the precast node");

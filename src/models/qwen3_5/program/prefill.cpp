@@ -85,6 +85,8 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
+    card.set_prefill_state_split(state.state_split_frontier, state.state_split_slot,
+                                 state.state_split_boundaries);
     card.set_layer_ready(state.layer_ready);
     card.set_prefill_slice(slice);
     const std::span<const int> prompt(ids.data(), ids.size());
@@ -655,6 +657,34 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
 
         if (staged.cursor < staged.prompt_tokens) {
             std::uint32_t nominal = std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            // Leave no segment narrower than the floor (the cuBLAS route's width gate when it is
+            // on) before the next point the loop below must stop at: a context-cache capture or a
+            // rewrite frontier, else the prompt's end. Shorten this step so that segment is exactly
+            // the floor, as long as this step stays at least as wide. With a capture four tokens
+            // before the end, 1,150 tokens at chunk 1,024 run as 1,017 + 129 + 4 instead of
+            // 1,024 + 122 + 4, whose 122 would take the narrow routes -- emulated mma on sm_70,
+            // ~8x slower there. The capture's own few tokens go to the small-T routes, as before.
+            // Text-only, exact-phase prompts: media spans and lossy phase boundaries decide their
+            // own steps.
+            if (prefill_tail_floor != 0 && !staged.vision && !request.lossy) {
+                std::uint32_t boundary = staged.prompt_tokens;
+                if (request.next_capture < request.capture_groups.size()) {
+                    const std::uint32_t frontier =
+                        request.capture_groups[request.next_capture].frontier;
+                    if (frontier > staged.cursor) { boundary = std::min(boundary, frontier); }
+                }
+                const auto& rewrites = staged.prompt.identity.rewrite_execution_frontiers;
+                const auto rewrite = std::upper_bound(rewrites.begin(), rewrites.end(), staged.cursor);
+                if (rewrite != rewrites.end()) { boundary = std::min<std::uint32_t>(boundary, *rewrite); }
+                const std::uint32_t span = boundary - staged.cursor;
+                if (nominal < span) {
+                    const std::uint32_t rest = span - nominal;
+                    if (rest < prefill_tail_floor &&
+                        nominal >= prefill_tail_floor + (prefill_tail_floor - rest)) {
+                        nominal -= prefill_tail_floor - rest;
+                    }
+                }
+            }
             // A lossy request's Exact phase stops at M, where its scout begins.
             if (request.lossy) {
                 nominal = std::min(nominal, lossy_step_limit(request.lossy->phase, staged.cursor,
@@ -717,6 +747,28 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     (!split_frontier || *rewrite_split < *split_frontier)) {
                     split_frontier = *rewrite_split;
                 }
+                // The prompt's last call takes its checkpoint without ending there
+                // (merge_capture_split): one pass over the weights instead of one per piece.
+                schedule_state.state_split_frontier   = -1;
+                schedule_state.state_split_boundaries = {};
+                bool merged_capture                   = false;
+                if (final_candidate && capture_frontier && !staged.vision && !sliced_call &&
+                    merge_capture_split(sequence, request, *capture_frontier,
+                                        staged.prompt_tokens)) {
+                    merged_capture = true;
+                    split_frontier.reset();
+                    // The rewrite execution frontiers this call now runs through stay GDN
+                    // decomposition points (TextContext::set_prefill_state_split), so a resumed
+                    // request and a cold one still decompose the recurrent state alike.
+                    schedule_state.state_split_boundaries = std::span<const std::uint32_t>(
+                        rewrite_split, staged.prompt.identity.rewrite_execution_frontiers.end());
+                    const std::int32_t slot =
+                        state_store->physical_slot(request.capture_reservation->state);
+                    schedule_state.state_split_frontier = *capture_frontier;
+                    schedule_state.state_split_slot     = slot;
+                    rewrite_capture_hidden = state_images->continuation_hidden_slot(slot);
+                    schedule_state.rewrite_checkpoint_hidden = &rewrite_capture_hidden;
+                }
                 execution::PrefillChunkResult result;
                 timing.pause();
                 if (staged.vision) {
@@ -778,6 +830,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                           prefill_hidden.slice(
                               1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
                 sequence.tail_hidden_valid = true;
+                if (merged_capture) {
+                    if (staged.cursor <= *capture_frontier) {
+                        throw std::logic_error("merged capture call stopped before its frontier");
+                    }
+                    request.capture_prefilled = true;
+                }
                 const bool reached_capture = capture_frontier && staged.cursor == *capture_frontier;
                 if (reached_capture) {
                     if (result.finalized) {
@@ -905,9 +963,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             staged.vision->retire_handoff();
         }
 
+        // A merged capture (merge_capture_split) is published after the Begin commit too.
         const bool prompt_frontier_capture =
             request.next_capture < request.capture_groups.size() &&
-            request.capture_groups[request.next_capture].frontier == prompt_tokens;
+            (request.capture_groups[request.next_capture].frontier == prompt_tokens ||
+             request.capture_prefilled);
         if (!prompt_frontier_capture) { request.prefill.reset(); }
         request.pending   = PendingCandidate{.kind          = PendingKind::Begin,
                                              .base_E        = 0,

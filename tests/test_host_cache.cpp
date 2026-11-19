@@ -368,6 +368,10 @@ int check_flash_next_options_refused() {
         {"--cpu-verify-misses", [](auto& n) { n.cpu_verify_misses = true; }},
         {"--cpu-verify-workers", [](auto& n) { n.cpu_verify_workers = 8; }},
         {"--prefill-cpu-share", [](auto& n) { n.prefill_cpu_share = {3, 5}; }},
+        {"--prefill-cpu-max-columns", [](auto& n) { n.prefill_cpu_max_columns = 64; }},
+        {"--prefill-cpu-all-columns", [](auto& n) { n.prefill_cpu_all_columns = 1024; }},
+        {"--ngram-ram-mib", [](auto& n) { n.ngram_ram_bytes = ninfer::FlashNextOptions::kNgramRamAuto; }},
+        {"--mtp-staged-drafts", [](auto& n) { n.mtp_staged_drafts = true; }},
         {"--gdn-async-commit", [](auto& n) { n.gdn_async_commit = true; }},
         {"--hc-int8", [](auto& n) { n.hc_int8 = true; }},
         {"--hc-fused-read", [](auto& n) { n.hc_fused_read = true; }},
@@ -390,10 +394,12 @@ int check_flash_next_options_refused() {
         same.flash_next.ngram_keepalive_ms_set = true;
         same.flash_next.ram_headroom_bytes_set = true;
         same.flash_next.cpu_verify_workers_set = true;
+        same.flash_next.prefill_cpu_max_columns_set = true;
         const std::string message = refusal(same);
         failures += check(message.find("--ngram-keepalive-ms") != std::string::npos &&
                               message.find("--ram-headroom-mib") != std::string::npos &&
-                              message.find("--cpu-verify-workers") != std::string::npos,
+                              message.find("--cpu-verify-workers") != std::string::npos &&
+                              message.find("--prefill-cpu-max-columns") != std::string::npos,
                           "default-valued Flash-Next flags were not refused");
     }
     ninfer::EngineOptions several;

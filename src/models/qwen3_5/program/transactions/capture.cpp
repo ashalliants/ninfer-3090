@@ -3,6 +3,7 @@
 #include "core/device.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::detail {
@@ -23,7 +24,8 @@ CaptureReservation::~CaptureReservation() {
 bool ProgramImpl::reclaim_capture_reservation(runtime::ContextResourceUsage shortage) {
     for (auto& request : requests) {
         const auto& ticket = request.capture_reservation;
-        if (!ticket) { continue; }
+        // A prefilled reservation already holds its capture's image (merge_capture_split).
+        if (!ticket || request.capture_prefilled) { continue; }
         const bool relevant =
             (shortage.state_slots && state_store->device_resident(ticket->state)) ||
             (shortage.host_bytes && ticket->host) ||
@@ -58,6 +60,12 @@ bool ProgramImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t 
         ticket->points.emplace_back(*point, role);
     }
     auto destination = state_store->reserve_destination();
+    // A full pool whose other images already have Host copies (an idle engine writes them back,
+    // engine_core start_idle_state_writeback) gives up one of those for free: the capture is then
+    // a Device fork rather than a copy to Host that the prefill waits on.
+    if (!destination && drop_redundant_device_state()) {
+        destination = state_store->reserve_destination();
+    }
     if (!destination && host_context_arena) {
         ticket->host = host_context_arena->allocate(state_images->host_layout().image_bytes);
         if (ticket->host) { destination = state_store->reserve_logical_destination(); }
@@ -94,6 +102,40 @@ bool ProgramImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t 
     return true;
 }
 
+// sm_70: a prefill call re-reads every weight whatever its width (~70 ms for the 27B at 9-12
+// tokens), so a short chat prompt cut at its prompt checkpoint and the rewrite's execution
+// frontiers (11 + 5 + 4 tokens for a 20-token message) paid three passes for one prompt. Its last
+// call now runs whole and writes the checkpoint's state on the way: each GDN layer runs its
+// convolution and recurrence up to the frontier into the reserved slot and on from it -- the same
+// stateful steps as the split calls -- while every projection runs once. Off elsewhere (and with
+// NINFER_MERGE_CAPTURE_SPLIT=0): the projections there have native routes at every width.
+#if defined(NINFER_SM70)
+inline constexpr bool kMergeCaptureSplitDefault = true;
+#else
+inline constexpr bool kMergeCaptureSplitDefault = false;
+#endif
+
+bool ProgramImpl::merge_capture_split(const SequenceState& sequence, RequestControl& request,
+                                      std::uint32_t frontier, std::uint32_t prompt_tokens) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_MERGE_CAPTURE_SPLIT");
+        if (value == nullptr || *value == '\0') { return kMergeCaptureSplitDefault; }
+        return *value != '0';
+    }();
+    if (!enabled || request.lossy || request.capture_prefilled ||
+        is_masked_draft_backend(speculative_backend) || !request.prefill ||
+        frontier <= request.prefill->cursor || frontier >= prompt_tokens ||
+        request.next_capture + 1 != request.capture_groups.size()) {
+        return false;
+    }
+    // A shared point's KV view (start_capture) takes the pages below the frontier and a copy of
+    // its tail page; the copy also holds the columns the call wrote past the frontier, which the
+    // view never reads and a request resuming from it overwrites.
+    if (!reserve_capture_destination(sequence.lane, frontier)) { return false; }
+    // A Host destination is written by a copy of the frozen state after the frontier call.
+    return !request.capture_reservation->host.has_value();
+}
+
 std::optional<CapturePreparation> ProgramImpl::prepare_capture(SequenceHandle handle) {
     if (!valid_sequence(handle)) { throw std::logic_error("capture has a stale lane"); }
     const auto lane = ContractAccess::lane(handle).value;
@@ -106,6 +148,7 @@ std::optional<CapturePreparation> ProgramImpl::prepare_capture(SequenceHandle ha
         // Recovery owns enough resources to regain old progress and execute new work.
         // Optional saves cannot add a State/COW requirement to that finite guarantee.
         request.capture_reservation.reset();
+        request.capture_prefilled = false;
         while (request.next_capture < request.capture_groups.size() &&
                request.capture_groups[request.next_capture].frontier <=
                    request.permit->main_frontier) {
@@ -171,6 +214,7 @@ void ProgramImpl::skip_capture(SequenceHandle handle) {
     if (!valid_sequence(handle)) { throw std::logic_error("capture has a stale lane"); }
     auto& request = requests[ContractAccess::lane(handle).value];
     request.capture_reservation.reset();
+    request.capture_prefilled = false;
     if (!request.capture_pending) {
         if (request.next_capture < request.capture_groups.size()) { ++request.next_capture; }
         return;
@@ -208,8 +252,18 @@ bool ProgramImpl::start_capture(SequenceHandle handle) {
     }
     if (state.state.fork_pending || state.state.read != state.state.write) { return false; }
     const auto frontier = request.capture_groups[request.next_capture].frontier;
-    if (frontier != state.text_kv_valid || !state.tail_hidden_valid) { return false; }
-    if (!reserve_capture_destination(lane, frontier)) { return false; }
+    // A prefilled capture's image is in its reservation already; the lane has moved past it.
+    const bool prefilled = request.capture_prefilled;
+    if (prefilled) {
+        if (frontier >= state.text_kv_valid || !request.capture_reservation ||
+            request.capture_reservation->frontier != frontier ||
+            request.capture_reservation->host) {
+            throw std::logic_error("prefilled capture lost its written destination");
+        }
+    } else {
+        if (frontier != state.text_kv_valid || !state.tail_hidden_valid) { return false; }
+        if (!reserve_capture_destination(lane, frontier)) { return false; }
+    }
     auto ticket = std::move(request.capture_reservation);
     ContextTransaction tx;
     tx.kind           = ContextOperationKind::Capture;
@@ -263,7 +317,11 @@ bool ProgramImpl::start_capture(SequenceHandle handle) {
                     operation.backend_frontier));
             }
         }
-        state_store->freeze(state.state.read);
+        if (prefilled) {
+            state_store->freeze_written_destination(*operation.reserved_state);
+        } else {
+            state_store->freeze(state.state.read);
+        }
         if (host_state) {
             ticket->host.reset();
             auto transfer = state_store->reserve_device_to_host(state.state.read);
@@ -303,7 +361,8 @@ void ProgramImpl::publish_capture(ContextTransaction& tx) {
     auto& state             = sequences[tx.lane];
     auto& request           = requests[tx.lane];
     const auto& group       = request.capture_groups[request.next_capture];
-    const auto source_state = state.state.read;
+    const bool prefilled    = request.capture_prefilled;
+    const auto source_state = prefilled ? *tx.reserved_state : state.state.read;
     if (tx.text_view) {
         text_kv_addresses->commit_active_prefix_view(std::move(*tx.text_view));
         if (tx.backend_view) {
@@ -327,7 +386,9 @@ void ProgramImpl::publish_capture(ContextTransaction& tx) {
             .gap_maps          = gap_maps_through(state.gap_maps, tx.reuse_frontier)};
         checkpoints[handle.index].reserved = false;
     }
-    if (state_store->residency(*tx.reserved_state) == StateReplicaResidency::None) {
+    if (prefilled) {
+        // The lane keeps its own state; the written destination is the checkpoint now.
+    } else if (state_store->residency(*tx.reserved_state) == StateReplicaResidency::None) {
         state_store->split_device_replica_identity(source_state, *tx.reserved_state);
         state.state = {.read = *tx.reserved_state, .write = *tx.reserved_state};
     } else {

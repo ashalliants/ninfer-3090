@@ -210,6 +210,10 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
 } // namespace
 
 void launch_q6_small_t_c8(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+#if defined(NINFER_SM70)
+    // Speculative verification widths: mma.sync is emulated, and compute-bound, on sm_70.
+    if (try_launch_q6_stream(x, w, out, stream)) return;
+#endif
     launch<1>(x, w, out, stream);
 }
 void launch_q6_small_t_c16(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {

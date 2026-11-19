@@ -92,6 +92,7 @@ void validate_policy(LinearPolicy policy) {
     // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
     // one engine-wide setting does not have to be threaded per Op.
     case LinearPolicy::AllowPrefillCublas:
+    case LinearPolicy::AllowPrefillCublasNarrow:
     // The scout's int4 route: AllowA8Int, with int4 activations for Q4 wherever the A8 route runs.
     case LinearPolicy::ScoutA4Int:
     // The GGML block formats' policy only (require_policy_format).
@@ -120,10 +121,10 @@ std::size_t grouped_integer_workspace_bytes(std::size_t a16, std::int32_t output
     if (!allows_a8_int(policy) || !integer_shape) { return a16; }
     // See linear_swiglu: where the cuBLAS route is admitted it is the widest claimant, so any
     // interval reaching its width gate must reserve for it.
-    if (allows_cublas_prefill(policy) && max_tokens >= kCublasPrefillMinTokens) {
+    if (allows_cublas_prefill(policy) && max_tokens >= cublas_prefill_min_tokens(policy)) {
         return std::max(a16, detail::w4_cublas_prefill_workspace_capacity_bytes(
                                  output_rows, input_rows,
-                                 std::max(min_tokens, kCublasPrefillMinTokens), max_tokens));
+                                 std::max(min_tokens, cublas_prefill_min_tokens(policy)), max_tokens));
     }
     if (min_tokens == max_tokens) {
         return detail::a8_add_tokens_supported(min_tokens)
@@ -302,8 +303,9 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             return;
         }
         // The same prefill routes as Q5 below, in the same order.
-        if (allows_cublas_prefill(policy) && t >= kCublasPrefillMinTokens &&
-            detail::w4_cublas_prefill_supported(w, t)) {
+        if (allows_cublas_prefill(policy) && t >= cublas_prefill_min_tokens(policy) &&
+            detail::w4_cublas_prefill_supported(w, t) &&
+            (t >= kCublasPrefillMinTokens || detail::w4_cublas_prefill_fits(ws, w.n, w.k, t))) {
             detail::w4_cublas_add_launch(x, w, residual_out, ws, stream);
             return;
         }
@@ -328,8 +330,9 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         // dequantise pass costs the same whatever the token count. The shape was checked above and
         // the route takes any token count, so unlike the integer route below it is not gated on a
         // 128-token tile -- an unaligned final chunk is where it is furthest ahead.
-        if (allows_cublas_prefill(policy) && t >= kCublasPrefillMinTokens &&
-            detail::w4_cublas_prefill_supported(w, t)) {
+        if (allows_cublas_prefill(policy) && t >= cublas_prefill_min_tokens(policy) &&
+            detail::w4_cublas_prefill_supported(w, t) &&
+            (t >= kCublasPrefillMinTokens || detail::w4_cublas_prefill_fits(ws, w.n, w.k, t))) {
             detail::w4_cublas_add_launch(x, w, residual_out, ws, stream);
             return;
         }

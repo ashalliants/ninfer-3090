@@ -442,6 +442,9 @@ public:
     // The workspace later calls allocate from (a wide prefill call's lent arena, or the static one).
     // Not between run_front and run_back: the front's residual lives in the workspace.
     void use_workspace(WorkspaceArena& work) noexcept { work_ = &work; }
+    // The next prefill calls' CPU share (ForwardBatch::cpu_share) takes every miss of at most 8
+    // columns, as a streamed call's does, instead of the channel's share (--prefill-cpu-all-columns).
+    void set_prefill_cpu_all(bool all) noexcept { prefill_cpu_all_ = all; }
 
     // The same call in two parts: run_front(batch, end) runs the embedding and layers [0, end), at
     // most up to rows_layer(), so it reads no batch.ngram_rows (a caller may still be writing them,
@@ -479,6 +482,9 @@ public:
     // shared_expert_scratch_bytes; a caller checks the loaded weights' need against this plan with
     // max_shared_expert_scratch_bytes.
     [[nodiscard]] static std::size_t shared_expert_workspace_bytes(const TextConfig& config, std::int32_t columns);
+    // A wide call's extra workspace for the sm_70 tensor-core route's staging when it is on (0 otherwise,
+    // and below 64 columns): a bound over the text model's and the drafter's linears.
+    [[nodiscard]] static std::size_t tensor_core_workspace_bytes(const TextConfig& config, std::int32_t columns);
     // The scratch one MoE block's shared expert Linears (gate, up, down) take at calls of `first`
     // to `last` columns: the largest ops::linear_workspace_capacity_bytes of the three, at least 256
     // bytes (the carve is never empty).
@@ -487,6 +493,17 @@ public:
     // The largest shared_expert_scratch_bytes over the text model's layers at calls of 1 to
     // `columns` columns (the drafter's shared expert is BF16 rows projected in FP32: no scratch).
     [[nodiscard]] std::size_t max_shared_expert_scratch_bytes(std::int32_t columns) const;
+    // The workspace a run_front + run_back call of `columns` columns peaks at, from this Forward's
+    // weights and options: the call's allocations replayed on a bump allocator, layer by layer
+    // (the residual, then each layer's held tensors in order, through the MoE's), with each Op's
+    // own scratch (its workspace capacity query) taken at the offset where it runs. A layer's
+    // mixer tensors stay live through its MoE, so it is a sum along the layer, not a max over
+    // blocks as workspace_bytes is. workspace_bytes stays the plan's configuration-only bound
+    // (before the weights load); this is at most it. A call of fewer columns peaks no higher.
+    // Calls of at most kHcInt8MaxColumns columns (the int8 mixers and the fused read) return
+    // workspace_bytes and its additions.
+    [[nodiscard]] std::size_t call_workspace_bytes(std::int32_t columns, std::uint32_t max_visible_keys,
+                                                   DeviceExecutionView execution) const;
     // ForwardOptions::ggml_decode_mma: whether projection `p` can run as it would under the option.
     // The int8 tensor-core decode route stages a GGML weight from the 16-byte unit holding its first
     // byte, so a projection the option moves to it (a GGML weight whose policy admits A8) must start
@@ -544,8 +561,11 @@ private:
     [[nodiscard]] const std::vector<ops::MoeCpuChannel>* cpu_channels(const ForwardBatch& batch) const noexcept;
     // `cpu`: the call's CPU channels (cpu_channels; null or empty: every expert on the GPU). `read`:
     // the block's input as the fused read left it (x is read->x), whose routing it uses.
+    // `inject`/`residual` (both or neither): also hyper_connection_inject(y, *inject, *residual), in
+    // the combine's launch.
     Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
-               const std::vector<ops::MoeCpuChannel>* cpu, const MoeRead* read = nullptr);
+               const std::vector<ops::MoeCpuChannel>* cpu, const MoeRead* read = nullptr,
+               const Tensor* inject = nullptr, Tensor* residual = nullptr);
     // A BF16 Linear of a verification call: one column at a time, so each column takes the
     // one-column route a decode call takes (their T > 1 routes sum in other orders).
     void project_verify(const Tensor& x, const LinearParameters& p, Tensor& out, bool columnwise);
@@ -595,6 +615,7 @@ private:
     ForwardState state_;
     ForwardKV kv_;
     ForwardExperts experts_;
+    bool prefill_cpu_all_ = false;
     std::optional<ForwardMtp> mtp_;
     std::unique_ptr<SideStream> side_; // set with ForwardOptions::shared_expert_stream
     // ForwardOptions::hot_embedding_rows and its planes (0: parameters_.token_embedding).

@@ -211,6 +211,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     : parameters(parameters_in), device(device_in), capacity(plan.capacity),
       kv_capacity(plan.kv_capacity), max_concurrency(plan.max_concurrency),
       context_cache(plan.context_cache), prefill_chunk(plan.prefill_chunk),
+      prefill_tail_floor(plan.prefill_tail_floor),
       progress_anchor_tokens(plan.progress_anchor_tokens),
       progress_anchors_shared(plan.progress_anchors_shared),
       draft_window(plan.draft_window),
