@@ -834,6 +834,25 @@ def test_model_golden_fetch_pins_one_commit_and_is_all_or_nothing():
                 check(False, "a failed fetch must raise")
         check(not other.exists() or not any(other.iterdir()), "a failed fetch leaves no files in the target")
         check(not list(Path(d).glob("*.staging-*")), "a failed fetch removes its staging directory")
+        # A failure at the publishing step (the rename) leaves no destination and no staging either.
+        third = Path(d) / "third"
+        with mock.patch.object(mg.urllib.request, "urlopen", side_effect=urlopen), mock.patch.object(
+            Path, "rename", side_effect=OSError("disk error")
+        ):
+            try:
+                mg.fetch(third)
+            except OSError:
+                pass
+            else:
+                check(False, "a failed publication must raise")
+        check(not third.exists(), "a failed publication leaves no destination directory")
+        check(not list(Path(d).glob("*.staging-*")), "a failed publication removes its staging directory")
+        # An empty existing directory is fine: it is replaced by the staged one.
+        empty = Path(d) / "empty"
+        empty.mkdir()
+        with mock.patch.object(mg.urllib.request, "urlopen", side_effect=urlopen):
+            mg.fetch(empty)
+        check(sorted(f.name for f in empty.iterdir()) == sorted([*mg.FILES, mg.REVISION_FILE]), "an empty target directory is filled whole")
         try:
             mg.revision_of(Path(d) / "nowhere")
         except SystemExit:

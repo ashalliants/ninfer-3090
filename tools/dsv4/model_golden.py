@@ -58,8 +58,10 @@ def revision_of(directory: Path) -> str:
 
 
 def fetch(directory: Path) -> str:
-    """All of FILES at ONE commit of the model repo, staged in a temporary directory and moved into place only
-    when every file arrived, so a failed fetch leaves no mixed revision. Returns the commit."""
+    """All of FILES at ONE commit of the model repo, staged in a sibling directory and published by a single
+    rename only when every file arrived, so a failed or interrupted fetch leaves no mixed or partial directory
+    (an interruption can leave the staging directory, which is never read, and a later fetch refuses to reuse it
+    silently: it names it). Returns the commit."""
     if directory.exists() and any(directory.iterdir()):
         raise SystemExit(f"{directory} is not empty: fetch into a fresh directory")
     with urllib.request.urlopen(f"https://huggingface.co/api/models/{REPO}", timeout=60) as response:  # noqa: S310
@@ -73,13 +75,14 @@ def fetch(directory: Path) -> str:
                 (staging / name).write_bytes(response.read())
             print(f"fetched {name}")
         (staging / REVISION_FILE).write_text(sha + "\n")
-        directory.mkdir(parents=True, exist_ok=True)
-        for item in staging.iterdir():
-            item.replace(directory / item.name)
+        if directory.exists():
+            directory.rmdir()  # empty (checked above); the rename below is then the only step that publishes
+        staging.rename(directory)  # one atomic rename: the directory appears whole or not at all
     finally:
-        for item in staging.iterdir():
-            item.unlink()
-        staging.rmdir()
+        if staging.exists():  # the rename did not happen: remove the staging files
+            for item in staging.iterdir():
+                item.unlink()
+            staging.rmdir()
     print(f"model repo {REPO} at {sha}")
     return sha
 
