@@ -16,6 +16,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import attention as att  # noqa: E402
+import engram_ref as eng  # noqa: E402
 import gguf_headers as gh  # noqa: E402
 import hyper_connection as hcr  # noqa: E402
 import model_golden as mg  # noqa: E402
@@ -916,6 +917,80 @@ def test_moe_clamps_and_shared_expert_are_separate_knobs():
         pass
     else:
         check(False, "a router that scores more experts than there are must be refused")
+
+
+def test_engram_matches_the_model_repos_own_code():
+    """The golden is the repo's EngramLayout, compute_hash_multipliers, NgramHashState and Engram run on CPU
+    (tools/dsv4/model_golden.py): hash ids must match exactly, the gated residual write to float32 rounding."""
+    golden = json.loads((Path(HERE).parent.parent / "tests" / "fixtures" / "dsv4" / "engram_golden.json").read_text())
+    check(golden["seed"] == eng.GOLDEN_SEED, "the golden is for another seed")
+    ids, outputs = eng.run_golden()
+    check(np.array_equal(np.array(golden["hash_ids"]), ids), "hash ids differ from the model repo's")
+    x = eng.golden_case()["x"]
+    for layer, (want, got) in enumerate(zip(golden["outputs"], outputs)):
+        want = np.array(want, np.float32)
+        check(np.allclose(want, got, rtol=2e-6, atol=2e-6 * float(np.abs(want).max())), f"engram layer {layer} differs from the model repo's output")
+        check(float(np.abs(got - x[layer]).max()) > 1.0, "the golden must actually change the stream")
+
+
+def test_engram_hash_ids_structure():
+    case = eng.golden_case()
+    ids, primes, offsets = eng.ngram_hash_ids(case["input_ids"], case["token_map"], case["pad_id"], case["multipliers"], case["primes"], case["offsets"], case["token_mask"]), case["primes"], case["offsets"]
+    flat = primes.reshape(primes.shape[0], -1)  # [layers, cols]: the prime modulus of each (order, head)
+    for layer in range(ids.shape[1]):
+        check(((ids[:, layer] >= offsets[layer]) & (ids[:, layer] < offsets[layer] + flat[layer])).all(), "every id stays inside its (order, head) bucket range")
+        ends = offsets[layer] + flat[layer]
+        check((offsets[layer][1:] == ends[:-1]).all(), "bucket ranges are consecutive and disjoint")
+    allp = primes.reshape(-1).tolist()
+    check(len(set(allp)) == len(allp) and all(eng._is_prime(v) for v in allp), "bucket moduli are distinct primes (never reused across layers)")
+    check((case["multipliers"] % 2 == 1).all(), "multipliers are odd")
+    # A masked token takes part in no n-gram: changing it changes no id, and the n-grams after it see the pad id.
+    changed = case["input_ids"].copy()
+    changed[4] = (changed[4] + 7) % eng.G_VOCAB
+    again = eng.ngram_hash_ids(changed, case["token_map"], case["pad_id"], case["multipliers"], case["primes"], case["offsets"], case["token_mask"])
+    check(np.array_equal(ids, again), "a masked token must not influence any hash id")
+    # Look-back stops at the start of the sequence: position 0 is the 1-gram of its own token against pad slots.
+    one = eng.ngram_hash_ids(case["input_ids"][:1], case["token_map"], case["pad_id"], case["multipliers"], case["primes"], case["offsets"])
+    check(np.array_equal(one[0], eng.ngram_hash_ids(case["input_ids"], case["token_map"], case["pad_id"], case["multipliers"], case["primes"], case["offsets"])[0]), "position 0 sees only itself")
+    # Causal: a prefix gives the same ids as the full sequence.
+    prefix = eng.ngram_hash_ids(case["input_ids"][:7], case["token_map"], case["pad_id"], case["multipliers"], case["primes"], case["offsets"], case["token_mask"][:7])
+    check(np.array_equal(prefix, ids[:7]), "hash ids are causal")
+    # The XOR chain is the hash of the (i+1)-gram: column order 0 uses tokens t and t-1 only.
+    t = case["token_map"][case["input_ids"]]
+    pos = 8  # three tokens past the masked 5, so no look-back of this 2-gram touches a masked token
+    mult = case["multipliers"][0]
+    want = ((t[pos] * mult[0]) ^ (t[pos - 1] * mult[1])) % case["primes"][0, 0, 0] + case["offsets"][0, 0]
+    check(int(ids[pos, 0, 0]) == int(want), "the 2-gram id is (t*m0 xor t-1*m1) mod prime + offset")
+
+
+def test_engram_gate_semantics():
+    rng = np.random.default_rng(2)
+    L, hc, d, cols, row = 4, 2, 8, 3, 4
+    x = rng.standard_normal((L, hc, d)).astype(np.float32)
+    rows = rng.standard_normal((L, cols, row)).astype(np.float32)
+    wkv = rng.standard_normal(((hc + 1) * d, cols * row)).astype(np.float32) * 0.3
+    weight = (1 + 0.1 * rng.standard_normal((hc, d))).astype(np.float32)
+    out = eng.engram_forward(x, rows, wkv, weight, 1e-6)
+    # One token with explicit loops: the gate is the sigmoid of the signed sqrt of the normalised dot, per copy.
+    t = 2
+    kv = wkv @ rows[t].reshape(-1)
+    key, value = kv[: hc * d].reshape(hc, d), kv[hc * d :]
+    for c in range(hc):
+        rstd = 1 / np.sqrt((x[t, c] ** 2).mean() + 1e-6) / np.sqrt((key[c] ** 2).mean() + 1e-6)
+        dot = float((x[t, c] * weight[c] * key[c]).sum() * rstd / np.sqrt(d))
+        gate = 1 / (1 + np.exp(-np.sign(dot) * np.sqrt(max(abs(dot), 1e-6))))
+        check(np.allclose(out[t, c], x[t, c] + gate * value, atol=1e-5), f"copy {c} of token {t}")
+    # The gate is a per-copy statistic: scaling one copy of the stream leaves the other's output increment unchanged.
+    y = x.copy()
+    y[:, 0] *= 5.0
+    b = eng.engram_forward(y, rows, wkv, weight, 1e-6)
+    check(np.allclose(b[:, 1] - y[:, 1], out[:, 1] - x[:, 1], atol=1e-5), "the statistic is per copy, not joint")
+    # A masked token passes through untouched; a zero dot sits at the clamp: sigmoid(sqrt(1e-6)).
+    mask = np.array([True, False, True, True])
+    m = eng.engram_forward(x, rows, wkv, weight, 1e-6, mask)
+    check(np.array_equal(m[1], x[1]) and np.allclose(m[[0, 2, 3]], out[[0, 2, 3]]), "a masked position is unchanged")
+    zero = eng.engram_forward(x, np.zeros_like(rows), wkv, weight, 1e-6)
+    check(np.allclose(zero, x), "zero rows give zero key and value: no change")
 
 
 if __name__ == "__main__":
