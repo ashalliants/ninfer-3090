@@ -148,11 +148,25 @@ def test_every_field_the_runtime_loader_reads_is_validated(metadata, official):
         "integer id and non-empty content": broken(lambda t: t["added_tokens"][0].__setitem__("content", "")),
         "listed twice": broken(lambda t: t["added_tokens"].append(dict(t["added_tokens"][0]))),
         "integer ids": broken(lambda t: t["model"]["vocab"].__setitem__("a", "3")),
+        "decoder must be ByteLevel (null)": broken(lambda t: t.__setitem__("decoder", None)),
+        "ignore_merges (null)": broken(lambda t: t["model"].__setitem__("ignore_merges", None)),
+        "ignore_merges (0)": broken(lambda t: t["model"].__setitem__("ignore_merges", 0)),
+        # (these two also need the GGUF to hold the duplicated string, or the id/content check fires first)
+        "also a vocabulary token": broken(lambda t: t["added_tokens"].__setitem__(3, {**t["added_tokens"][3], "content": "a"})),
+        "same content": broken(lambda t: t["added_tokens"].__setitem__(4, {**t["added_tokens"][4], "content": "<tool>"})),
     }
-    for match, value in cases.items():
-        _refused(metadata, value, match.split(" must")[0] if match.startswith("model") else match)
+    matches = {"decoder must be ByteLevel (null)": "decoder must be ByteLevel", "ignore_merges (null)": "ignore_merges must be false",
+               "ignore_merges (0)": "ignore_merges must be false", "model must be a BPE": "BPE model",
+               "model.merges must be a list": "model.merges", "dropout": "dropout", "integer ids": "integer ids"}
+    duplicated = {"also a vocabulary token": (12, "a"), "same content": (13, "<tool>")}
+    for name, value in cases.items():
+        meta = metadata
+        if name in duplicated:
+            index, text = duplicated[name]
+            meta = {**metadata, "tokenizer.ggml.tokens": [*fixture.TOKENS[:index], text, *fixture.TOKENS[index + 1:]]}
+        _refused(meta, value, matches.get(name, name))
     # What the loader accepts is accepted: null dropout/prefix/suffix, a null post_processor, a missing decoder.
-    accepted = broken(lambda t: t.update(post_processor=None, decoder=None))
+    accepted = broken(lambda t: (t.update(post_processor=None), t.pop("decoder")))
     accepted["model"].update(dropout=None, continuing_subword_prefix=None, end_of_word_suffix=None)
     assert tok.check_tokenizer(accepted, metadata) == fixture.BASE_VOCAB
 

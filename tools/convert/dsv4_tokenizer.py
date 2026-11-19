@@ -70,16 +70,20 @@ def _check_runtime_fields(official: Mapping) -> None:
         raise Dsv4Error("tokenizer.json's pre_tokenizer is not the DeepSeek-V4 pipeline the runtime implements")
     need(official.get("normalizer") in (None, {"type": "Sequence", "normalizers": []}),
          "has a normalizer; the DeepSeek-V4 pipeline has none")
-    decoder, post = official.get("decoder"), official.get("post_processor")
-    need(decoder is None or (isinstance(decoder, dict) and decoder.get("type") == "ByteLevel"), "decoder must be ByteLevel")
+    # The loader tests presence, not value: a decoder key that is present must be ByteLevel (null is refused),
+    # a post_processor key may be null.
+    if "decoder" in official:
+        need(isinstance(official["decoder"], dict) and official["decoder"].get("type") == "ByteLevel", "decoder must be ByteLevel")
+    post = official.get("post_processor")
     need(post is None or (isinstance(post, dict) and post.get("type") == "ByteLevel"), "post_processor must be ByteLevel or null")
     model = official.get("model")
     need(isinstance(model, dict) and model.get("type") == "BPE", "model must be a BPE model")
     need(model.get("dropout") in (None, 0, 0.0) and not isinstance(model.get("dropout"), bool), "model.dropout must be null or 0")
     for field in ("continuing_subword_prefix", "end_of_word_suffix"):
         need(model.get(field) in (None, ""), f"model.{field} must be empty")
-    need(not model.get("ignore_merges", False) and not model.get("byte_fallback", False),
-         "model must not use ignore_merges or byte_fallback")
+    # ignore_merges, if present, must be exactly the boolean false (null and 0 are refused by the loader).
+    need(model.get("ignore_merges", False) is False, "model.ignore_merges must be false")
+    need(not model.get("byte_fallback", False), "model must not use byte_fallback")
     vocab = model.get("vocab")
     need(isinstance(vocab, dict) and all(type(i) is int for i in vocab.values()), "model.vocab must map tokens to integer ids")
     need(sorted(vocab.values()) == list(range(len(vocab))), "the vocabulary ids are not contiguous from 0")
@@ -147,7 +151,14 @@ def check_tokenizer(official: Mapping, metadata: Mapping) -> int:
         index = item["id"]
         if not 0 <= index < len(tokens) or tokens[index] != item["content"]:
             raise Dsv4Error(f"added token {item.get('content')!r} is not the GGUF's token {index}")
+        # load_added_tokens: a content may map to one id only, across the added tokens and the vocabulary (the same
+        # id and content listed in both is the one allowed overlap).
+        if item["content"] in vocab and vocab[item["content"]] != index:
+            raise Dsv4Error(f"added token {item['content']!r} is also a vocabulary token at id {vocab[item['content']]}, not {index}")
         added[index] = item
+    contents = [item["content"] for item in official["added_tokens"]]
+    if len(set(contents)) != len(contents):
+        raise Dsv4Error("two added tokens have the same content, which the runtime rejects as ambiguous")
     _check_membership(metadata, tokens, len(vocab), added)
     for key in ("bos", "eos", "padding"):
         index = metadata.get(f"tokenizer.ggml.{key}_token_id")
