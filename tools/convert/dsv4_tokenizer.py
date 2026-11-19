@@ -54,9 +54,29 @@ def _json_bytes(value) -> bytes:
     return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 
-def _merge_strings(merges) -> list[str]:
-    """Merges as "a b" strings; tokenizers also writes them as [a, b] pairs."""
-    return [m if isinstance(m, str) else " ".join(m) for m in merges]
+def _merge_pairs(merges, vocab: Mapping) -> list[tuple[str, str]]:
+    """The merges as (left, right) pairs, accepted exactly as the runtime loads them (tokenizer.cpp
+    load_bpe_merge_rules): an entry is a list of exactly two strings, or one string of two non-empty symbols
+    separated by a single space; the left symbol, the right one and their concatenation must all be vocabulary
+    tokens; a pair may not repeat."""
+    pairs, seen = [], set()
+    for index, item in enumerate(merges):
+        if isinstance(item, list) and len(item) == 2 and all(isinstance(part, str) for part in item):
+            left, right = item
+        elif isinstance(item, str):
+            parts = item.split(" ")
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                raise Dsv4Error(f"tokenizer.json: malformed merge {index}: {item!r}")
+            left, right = parts
+        else:
+            raise Dsv4Error(f"tokenizer.json: merge {index} must be a pair of symbols, got {item!r}")
+        if left not in vocab or right not in vocab or left + right not in vocab:
+            raise Dsv4Error(f"tokenizer.json: merge {index} ({left!r} + {right!r}) references a symbol outside model.vocab")
+        if (left, right) in seen:
+            raise Dsv4Error(f"tokenizer.json: duplicate merge pair {left!r} + {right!r}")
+        seen.add((left, right))
+        pairs.append((left, right))
+    return pairs
 
 
 def _check_runtime_fields(official: Mapping) -> None:
@@ -88,6 +108,7 @@ def _check_runtime_fields(official: Mapping) -> None:
     need(isinstance(vocab, dict) and all(type(i) is int for i in vocab.values()), "model.vocab must map tokens to integer ids")
     need(sorted(vocab.values()) == list(range(len(vocab))), "the vocabulary ids are not contiguous from 0")
     need(isinstance(model.get("merges"), list), "model.merges must be a list")
+    _merge_pairs(model["merges"], vocab)
     added = official.get("added_tokens")
     need(isinstance(added, list), "added_tokens must be a list")
     seen = set()
@@ -144,7 +165,7 @@ def check_tokenizer(official: Mapping, metadata: Mapping) -> int:
     for token, index in vocab.items():
         if tokens[index] != token:
             raise Dsv4Error(f"token {index} is {token!r} in tokenizer.json but {tokens[index]!r} in the GGUF")
-    if _merge_strings(model["merges"]) != merges:
+    if [f"{left} {right}" for left, right in _merge_pairs(model["merges"], vocab)] != merges:
         raise Dsv4Error("tokenizer.json's merges differ from the GGUF's")
     added = {}
     for item in official["added_tokens"]:

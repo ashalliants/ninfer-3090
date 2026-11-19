@@ -91,7 +91,7 @@ def test_each_mismatch_is_refused(metadata, official):
     big["model"]["vocab"].update({f"z{i}": 12 + i for i in range(10)})
     _refused(metadata, big, "larger than the GGUF's")
 
-    _refused(metadata, {**official, "model": {**official["model"], "merges": ["a c"]}}, "merges differ")
+    _refused({**metadata, "tokenizer.ggml.merges": ["b a"]}, official, "merges differ")
     # tokenizers also writes merges as pairs: that is the same list.
     assert tok.check_tokenizer({**official, "model": {**official["model"], "merges": [["a", "b"]]}}, metadata) == fixture.BASE_VOCAB
 
@@ -165,6 +165,18 @@ def test_every_field_the_runtime_loader_reads_is_validated(metadata, official):
             index, text = duplicated[name]
             meta = {**metadata, "tokenizer.ggml.tokens": [*fixture.TOKENS[:index], text, *fixture.TOKENS[index + 1:]]}
         _refused(meta, value, matches.get(name, name))
+    # Merges: exactly the loader's forms and invariants (a pair of two strings or "a b"; all three symbols in the vocabulary).
+    for name, merges, meta_merges, match in (
+        ("three-item list", [["a", "b", "c"]], ["a b c"], "must be a pair|malformed|merge 0"),
+        ("not a pair", [3], ["3"], "must be a pair of symbols"),
+        ("two spaces", ["a  b"], ["a  b"], "malformed merge"),
+        ("empty side", [" b"], [" b"], "malformed merge"),
+        ("unknown symbol", ["a z"], ["a z"], "outside model.vocab"),
+        ("merged symbol absent", ["b c"], ["b c"], "outside model.vocab"),
+        ("duplicate", ["a b", "a b"], ["a b", "a b"], "duplicate merge pair"),
+    ):
+        value = broken(lambda t, m=merges: t["model"].__setitem__("merges", m))
+        _refused({**metadata, "tokenizer.ggml.merges": meta_merges}, value, match)
     # What the loader accepts is accepted: null dropout/prefix/suffix, a null post_processor, a missing decoder.
     accepted = broken(lambda t: (t.update(post_processor=None), t.pop("decoder")))
     accepted["model"].update(dropout=None, continuing_subword_prefix=None, end_of_word_suffix=None)
