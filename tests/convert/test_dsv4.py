@@ -181,3 +181,23 @@ def test_metadata_is_validated(header):
         dsv4.text_config(metadata, 129280)
     with pytest.raises(dsv4.Dsv4Error, match="swiglu_clamp_exp"):
         dsv4.text_config(bad(swiglu_clamp_exp=[10.0] * 5), 129280)
+
+
+@pytest.mark.parametrize(
+    ("changes", "match"),
+    [
+        ({"attention__output_group_count": 0}, "output_group_count must be positive"),
+        ({"attention__output_group_count": 7}, "must divide"),
+        ({"embedding_length": 0}, "embedding_length must be positive"),
+        ({"attention__head_count_kv": 2}, "head_count_kv must be 1"),
+        ({"expert_shared_count": 2}, "expert_shared_count must be 1"),
+        ({"expert_weights_norm": "false"}, "must be a boolean"),
+        ({"expert_weights_norm": 0}, "must be a boolean"),
+    ],
+)
+def test_malformed_metadata_is_a_converter_error_not_a_crash(header, changes, match):
+    metadata = copy.deepcopy(header["metadata"])
+    for key, value in changes.items():
+        metadata["deepseek41." + key.replace("__", ".")] = value
+    with pytest.raises(dsv4.Dsv4Error, match=match):
+        dsv4.text_config(metadata, 129280)

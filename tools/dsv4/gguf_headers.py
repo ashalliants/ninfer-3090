@@ -7,10 +7,12 @@ that for ISTA-DASLab's GSQ-RCO IQ2_XXS build, so the converter's tensor map is t
 real build holds without downloading 130 GB.
 
     python tools/dsv4/gguf_headers.py ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF \
-        --prefix DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS --out tests/fixtures/dsv4/ista_iq2_xxs_header.json
+        --prefix DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS --extra DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf \\
+        --out tests/fixtures/dsv4/ista_iq2_xxs_header.json
 
 `--prefix` is the build's shard stem (`<prefix>-0000N-of-0000M.gguf`); the repository's extra shard
-(the Engram tables, `--extra`) is read too. The result:
+(the Engram tables, `--extra`) is read too, and the result is refused unless its tensor count is the
+one the metadata advertises (`split.tensors.count`), so a missing `--extra` cannot go unnoticed. The result:
 
     {"repo", "revision", "metadata": {...}, "tensors": [{"name", "ne", "type", "shard"}, ...]}
 
@@ -101,8 +103,12 @@ def parse_header(data: bytes) -> tuple[dict, list[dict]]:
 
 
 def _range_get(url: str) -> bytes:
+    """The first HEADER_BYTES of `url`. A server that ignores the range (a 200) would stream the whole
+    shard, tensor data included, so anything but a 206 starting at byte 0 is refused."""
     request = urllib.request.Request(url, headers={"Range": f"bytes=0-{HEADER_BYTES - 1}"})
     with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310 (https URL built below)
+        if response.status != 206 or not (response.headers.get("Content-Range") or "").startswith("bytes 0-"):
+            raise SystemExit(f"{url}: expected a 206 range response from byte 0, got {response.status}")
         return response.read(HEADER_BYTES)
 
 
@@ -115,23 +121,32 @@ def _revision(repo: str) -> str:
     return sha
 
 
-def fetch(repo: str, prefix: str, extra: str | None) -> dict:
+def fetch(repo: str, prefix: str, extra: str | None, splits: int) -> dict:
+    """The headers of shards 1..splits-1 of `prefix` and, if given, the separate `extra` file (the last
+    split). Refuses a result whose tensor count is not the one the metadata advertises."""
     for part in (repo.replace("/", "-"), prefix, extra or "x"):
         if not _SAFE.match(part):
             raise SystemExit(f"{part!r} is not a plain repository, file or prefix name")
     revision = _revision(repo)
     base = f"https://huggingface.co/{repo}/resolve/{revision}/"
-    first = parse_header(_range_get(base + f"{prefix}-00001-of-00006.gguf"))  # tells split.count below
-    count = first[0]["split.count"]
-    shards = [(f"{prefix}-{i:05d}-of-{count:05d}.gguf", i) for i in range(1, count)]  # the last is the extra
-    metadata, tensors = first[0], []
-    for name, index in shards:
-        meta, items = first if index == 1 else parse_header(_range_get(base + name))
-        for t in items:
-            tensors.append({**t, "shard": name})
+    names = [f"{prefix}-{i:05d}-of-{splits:05d}.gguf" for i in range(1, splits)]  # the last is the extra
+    metadata, tensors = {}, []
+    for index, name in enumerate(names):
+        meta, items = parse_header(_range_get(base + name))
+        if index == 0:
+            metadata = meta
+            if meta.get("split.count") != splits:
+                raise SystemExit(f"{name}: split.count is {meta.get('split.count')}, not {splits}")
+        tensors += [{**t, "shard": name} for t in items]
     if extra:
         _, items = parse_header(_range_get(base + extra))
         tensors += [{**t, "shard": extra} for t in items]
+    advertised = metadata.get("split.tensors.count")
+    if advertised != len(tensors):
+        raise SystemExit(
+            f"read {len(tensors)} tensors but the metadata advertises {advertised}: "
+            "is the separate last shard missing (--extra)?"
+        )
     for t in tensors:
         del t["offset"]  # absolute offsets differ per build; sizes follow from shape and type
     return {"repo": repo, "revision": revision, "metadata": metadata, "tensors": tensors}
@@ -142,9 +157,10 @@ def main() -> int:
     parser.add_argument("repo")
     parser.add_argument("--prefix", required=True)
     parser.add_argument("--extra", help="the file holding the build's last shard (the Engram tables)")
+    parser.add_argument("--splits", type=int, default=6, help="the build's split count (-of-0000N)")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    result = fetch(args.repo, args.prefix, args.extra)
+    result = fetch(args.repo, args.prefix, args.extra, args.splits)
     tensors = ",\n  ".join(json.dumps(t, separators=(",", ":")) for t in result["tensors"])  # one line each
     head = {k: v for k, v in result.items() if k != "tensors"}
     args.out.write_text(json.dumps(head, indent=1)[:-2] + f',\n "tensors": [\n  {tensors}\n ]\n}}\n')

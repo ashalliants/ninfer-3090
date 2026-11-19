@@ -56,12 +56,26 @@ def _int(metadata: Mapping, key: str) -> int:
     return value
 
 
+def _positive(metadata: Mapping, key: str) -> int:
+    value = _int(metadata, key)
+    if value == 0:
+        raise Dsv4Error(f"{_KEY + key} must be positive")
+    return value
+
+
 def _ints(metadata: Mapping, key: str, length: int | None = None) -> list[int]:
     value = _get(metadata, key)
     if not isinstance(value, list) or any(type(v) is not int or v < 0 for v in value):
         raise Dsv4Error(f"{_KEY + key} must be a list of non-negative integers, got {value!r}")
     if length is not None and len(value) != length:
         raise Dsv4Error(f"{_KEY + key} has {len(value)} entries, expected {length}")
+    return value
+
+
+def _boolean(metadata: Mapping, key: str) -> bool:
+    value = _get(metadata, key)
+    if type(value) is not bool:
+        raise Dsv4Error(f"{_KEY + key} must be a boolean, got {value!r}")
     return value
 
 
@@ -79,7 +93,7 @@ def text_config(metadata: Mapping, vocab_size: int) -> dict:
     """
     if metadata.get("general.architecture") != ARCHITECTURE:
         raise Dsv4Error(f"general.architecture is {metadata.get('general.architecture')!r}, not {ARCHITECTURE!r}")
-    layers = _int(metadata, "block_count")
+    layers = _positive(metadata, "block_count")
     if _int(metadata, "hash_layer_count") != 0:
         raise Dsv4Error("hash-routed layers are not supported (hash_layer_count must be 0)")
     ratios = _ints(metadata, "attention.compress_ratios")
@@ -91,30 +105,38 @@ def text_config(metadata: Mapping, vocab_size: int) -> dict:
     for name, ids in (("kv_source_layers", kv_layers), ("indexer.source_layers", indexer_layers), ("ple.layers", engram_layers)):
         if any(i >= layers for i in ids) or len(set(ids)) != len(ids):
             raise Dsv4Error(f"{_KEY}{name} must be distinct layer indices below {layers}, got {ids}")
-    heads = _int(metadata, "ple.heads_per_ngram")
-    ngram = _int(metadata, "ple.ngram_size")
+    heads = _positive(metadata, "ple.heads_per_ngram")
+    ngram = _positive(metadata, "ple.ngram_size")
     head_vocab = _ints(metadata, "ple.head_vocab_sizes", len(engram_layers) * heads * (ngram - 1))  # one set of hashed heads per Engram layer
-    experts = _int(metadata, "expert_count")
+    if _int(metadata, "attention.head_count_kv") != 1:
+        raise Dsv4Error("only one shared KV head is supported (attention.head_count_kv must be 1)")
+    if _int(metadata, "expert_shared_count") != 1:
+        raise Dsv4Error("only one shared expert is supported (expert_shared_count must be 1)")
+    if (_positive(metadata, "attention.head_count") * _positive(metadata, "attention.key_length")) % _positive(
+        metadata, "attention.output_group_count"
+    ):
+        raise Dsv4Error("attention.output_group_count must divide head_count x key_length")
+    experts = _positive(metadata, "expert_count")
     used = _int(metadata, "expert_used_count")
     if not 0 < used <= experts:
         raise Dsv4Error(f"expert_used_count {used} is not in 1..{experts}")
     return {
         "architecture": ARCHITECTURE,
-        "hidden_size": _int(metadata, "embedding_length"),
+        "hidden_size": _positive(metadata, "embedding_length"),
         "num_hidden_layers": layers,
         "vocab_size": vocab_size,
         "max_position_embeddings": _int(metadata, "context_length"),
         "rms_norm_eps": _real(metadata, "attention.layer_norm_rms_epsilon"),
         # Attention: one shared KV head of dim 512, low-rank Q and grouped low-rank output.
-        "num_attention_heads": _int(metadata, "attention.head_count"),
+        "num_attention_heads": _positive(metadata, "attention.head_count"),
         "num_key_value_heads": _int(metadata, "attention.head_count_kv"),
-        "head_dim": _int(metadata, "attention.key_length"),
-        "value_head_dim": _int(metadata, "attention.value_length"),
-        "rope_dim": _int(metadata, "rope.dimension_count"),
-        "q_lora_rank": _int(metadata, "attention.q_lora_rank"),
-        "o_groups": _int(metadata, "attention.output_group_count"),
-        "o_lora_rank": _int(metadata, "attention.output_lora_rank"),
-        "sliding_window": _int(metadata, "attention.sliding_window"),
+        "head_dim": _positive(metadata, "attention.key_length"),
+        "value_head_dim": _positive(metadata, "attention.value_length"),
+        "rope_dim": _positive(metadata, "rope.dimension_count"),
+        "q_lora_rank": _positive(metadata, "attention.q_lora_rank"),
+        "o_groups": _positive(metadata, "attention.output_group_count"),
+        "o_lora_rank": _positive(metadata, "attention.output_lora_rank"),
+        "sliding_window": _positive(metadata, "attention.sliding_window"),
         "rope_theta": _real(metadata, "rope.freq_base"),
         "compress_rope_theta": _real(metadata, "attention.compress_rope_freq_base"),
         "rope_scaling": {
@@ -128,28 +150,28 @@ def text_config(metadata: Mapping, vocab_size: int) -> dict:
         "kv_source_layers": kv_layers,
         # Indexer: top-k compressed positions per query over `indexer_heads` heads of `indexer_head_dim`.
         "indexer_source_layers": indexer_layers,
-        "indexer_heads": _int(metadata, "attention.indexer.head_count"),
-        "indexer_head_dim": _int(metadata, "attention.indexer.key_length"),
-        "indexer_top_k": _int(metadata, "attention.indexer.top_k"),
+        "indexer_heads": _positive(metadata, "attention.indexer.head_count"),
+        "indexer_head_dim": _positive(metadata, "attention.indexer.key_length"),
+        "indexer_top_k": _positive(metadata, "attention.indexer.top_k"),
         # MoE: sqrt-softplus gate (expert_gating_func 4), top-k normalised, scaled; SwiGLU clamps.
         "num_experts": experts,
         "num_experts_per_tok": used,
-        "moe_intermediate_size": _int(metadata, "expert_feed_forward_length"),
+        "moe_intermediate_size": _positive(metadata, "expert_feed_forward_length"),
         "num_shared_experts": _int(metadata, "expert_shared_count"),
         "expert_gating_func": _int(metadata, "expert_gating_func"),
         "routed_scaling_factor": _real(metadata, "expert_weights_scale"),
-        "norm_topk_prob": bool(_get(metadata, "expert_weights_norm")),
+        "norm_topk_prob": _boolean(metadata, "expert_weights_norm"),
         "swiglu_clamp_experts": [_real_item(v) for v in _floats(metadata, "swiglu_clamp_exp", layers)],
         "swiglu_clamp_shared": [_real_item(v) for v in _floats(metadata, "swiglu_clamp_shexp", layers)],
         # Hyper-connections: hc_count residual copies mixed by Sinkhorn normalisation.
-        "hc_count": _int(metadata, "hyper_connection.count"),
+        "hc_count": _positive(metadata, "hyper_connection.count"),
         "hc_sinkhorn_iterations": _int(metadata, "hyper_connection.sinkhorn_iterations"),
         "hc_epsilon": _real(metadata, "hyper_connection.epsilon"),
         # Engram: hashed n-gram rows (the volume), consumed by the layers in engram_layers.
         "engram_layers": engram_layers,
         "engram_ngram_size": ngram,
         "engram_heads_per_ngram": heads,
-        "engram_row_width": _int(metadata, "embedding_length_per_layer_input"),
+        "engram_row_width": _positive(metadata, "embedding_length_per_layer_input"),
         "engram_head_vocab_sizes": head_vocab,
         "engram_pad_token_id": _int(metadata, "engram.pad_token_id"),
     }

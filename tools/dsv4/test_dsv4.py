@@ -466,6 +466,48 @@ def test_gguf_header_parse():
         check(False, "a header cut short must be refused, not parsed")
 
 
+def test_gguf_headers_fetch_refuses_what_could_hide_missing_or_extra_data():
+    """A server that ignores Range (a 200) is refused, and so is an inventory short of split.tensors.count."""
+    from unittest import mock
+
+    class Response:
+        def __init__(self, status, body, content_range):
+            self.status, self._body = status, body
+            self.headers = {"Content-Range": content_range} if content_range else {}
+
+        def read(self, n):
+            return self._body[:n]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    header = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)
+    for response in (Response(200, header, None), Response(206, header, "bytes 5-9/10"), Response(206, header, None)):
+        with mock.patch.object(gh.urllib.request, "urlopen", return_value=response):
+            try:
+                gh._range_get("https://example.invalid/x.gguf")
+            except SystemExit:
+                continue
+        check(False, f"a {response.status} without a range from byte 0 must be refused")
+    with mock.patch.object(gh.urllib.request, "urlopen", return_value=Response(206, header, "bytes 0-12/13")):
+        check(gh._range_get("https://example.invalid/x.gguf") == header, "a 206 from byte 0 must be accepted")
+
+    kv = _gguf_string("split.count") + struct.pack("<II", 4, 3) + _gguf_string("split.tensors.count") + struct.pack("<IQ", 10, 5)
+    first = b"GGUF" + struct.pack("<IQQ", 3, 0, 2) + kv  # advertises 5 tensors, holds none
+    with mock.patch.object(gh, "_revision", return_value="0" * 40), mock.patch.object(
+        gh, "_range_get", return_value=first
+    ):
+        try:
+            gh.fetch("a/b", "stem", None, 3)
+        except SystemExit as error:
+            check("advertises 5" in str(error), f"the count mismatch must be named: {error}")
+        else:
+            check(False, "a tensor inventory short of split.tensors.count must be refused")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
