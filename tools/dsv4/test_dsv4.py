@@ -16,6 +16,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import gguf_headers as gh  # noqa: E402
+import hyper_connection as hcr  # noqa: E402
 import gguf_sizes as gs  # noqa: E402
 import layout as lo  # noqa: E402
 import profile_to_curve as pc  # noqa: E402
@@ -506,6 +507,132 @@ def test_gguf_headers_fetch_refuses_what_could_hide_missing_or_extra_data():
             check("advertises 5" in str(error), f"the count mismatch must be named: {error}")
         else:
             check(False, "a tensor inventory short of split.tensors.count must be refused")
+
+
+def _scalar_sinkhorn(logits, scale, base, hc, iters, eps):
+    """One token, plain Python loops: an independent formulation of the kernel's comb."""
+    import math
+
+    rows = []
+    for j in range(hc):
+        row = [logits[2 * hc + j * hc + k] * scale[2] + base[2 * hc + j * hc + k] for k in range(hc)]
+        top = max(row)
+        e = [math.exp(v - top) for v in row]
+        total = sum(e)
+        rows.append([v / total + eps for v in e])
+    col = [sum(rows[j][k] for j in range(hc)) for k in range(hc)]
+    rows = [[rows[j][k] / (col[k] + eps) for k in range(hc)] for j in range(hc)]
+    for _ in range(iters - 1):
+        rows = [[v / (sum(r) + eps) for v in r] for r in rows]
+        col = [sum(rows[j][k] for j in range(hc)) for k in range(hc)]
+        rows = [[rows[j][k] / (col[k] + eps) for k in range(hc)] for j in range(hc)]
+    return rows
+
+
+def test_hc_sinkhorn_matches_a_scalar_formulation_and_is_doubly_stochastic():
+    rng = np.random.default_rng(3)
+    hc, eps = 4, 1e-6
+    mixes = rng.standard_normal((5, (2 + hc) * hc)).astype(np.float32)
+    scale = np.array([0.7, 0.4, 1.1], np.float32)
+    base = (rng.standard_normal((2 + hc) * hc) * 0.3).astype(np.float32)
+    pre, post, comb = hcr.hc_split_sinkhorn(mixes, scale, base, hc, 20, eps)
+    for t in range(5):
+        want = _scalar_sinkhorn(mixes[t].astype(float).tolist(), scale.astype(float).tolist(), base.astype(float).tolist(), hc, 20, eps)
+        check(np.allclose(comb[t], np.array(want), atol=2e-6), f"comb of token {t} differs from the scalar formulation")
+    check(np.allclose(comb.sum(axis=-2), 1.0, atol=1e-4), "columns of comb must sum to 1 after the last step")
+    check(np.allclose(comb.sum(axis=-1), 1.0, atol=1e-2), "rows of comb must be close to 1 (doubly stochastic)")
+    check((pre > eps).all() and (pre < 1 + eps + 1e-6).all(), "pre is a sigmoid plus eps")
+    check((post > 0).all() and (post < 2).all(), "post is 2 * a sigmoid")
+    # More iterations tighten the rows.
+    _, _, loose = hcr.hc_split_sinkhorn(mixes, scale, base, hc, 1, eps)
+    check(np.abs(loose.sum(axis=-1) - 1).max() > np.abs(comb.sum(axis=-1) - 1).max(), "iterating must tighten the rows")
+    for bad in (lambda: hcr.hc_split_sinkhorn(mixes[:, :5], scale, base, hc, 20, eps),
+                lambda: hcr.hc_split_sinkhorn(mixes, scale, base, hc, 0, eps)):
+        try:
+            bad()
+        except ValueError:
+            continue
+        check(False, "a wrong mixes width and zero iterations must be refused")
+
+
+def test_hc_pre_and_post_semantics():
+    rng = np.random.default_rng(4)
+    n, hc, d = 2, 3, 5
+    x = rng.standard_normal((n, hc, d)).astype(np.float32)
+    pre = np.zeros((n, hc), np.float32)
+    pre[:, 1] = 1.0
+    check(np.array_equal(hcr.hc_pre(x, pre), x[:, 1]), "a one-hot pre must pick that copy")
+    sub = rng.standard_normal((n, d)).astype(np.float32)
+    ident = np.broadcast_to(np.eye(hc, dtype=np.float32), (n, hc, hc))
+    check(np.allclose(hcr.hc_post(sub, x, np.zeros((n, hc), np.float32), ident), x), "comb = I, post = 0 must return the residual")
+    out = hcr.hc_post(sub, x, np.ones((n, hc), np.float32), np.zeros((n, hc, hc), np.float32))
+    check(np.allclose(out, np.broadcast_to(sub[:, None, :], (n, hc, d))), "comb = 0, post = 1 must copy the sublayer output")
+    # comb[i, j] sends copy i of the residual to copy j.
+    comb = np.zeros((n, hc, hc), np.float32)
+    comb[:, 0, 2] = 1.0
+    out = hcr.hc_post(np.zeros((n, d), np.float32), x, np.zeros((n, hc), np.float32), comb)
+    check(np.allclose(out[:, 2], x[:, 0]) and not out[:, [0, 1]].any(), "comb[i, j] must route residual copy i to copy j")
+
+
+def test_hc_mixes_depend_on_the_stream_through_one_flat_statistic():
+    rng = np.random.default_rng(5)
+    hc, d = 4, 8
+    x = rng.standard_normal((2, hc, d)).astype(np.float32)
+    fn = (rng.standard_normal(((2 + hc) * hc, hc * d)) * 0.3).astype(np.float32)
+    scale, base = np.array([1.0, 1.0, 1.0], np.float32), np.zeros((2 + hc) * hc, np.float32)
+    a = hcr.hc_mixes(x, fn, scale, base, 1e-6, 20, 1e-6)
+    b = hcr.hc_mixes(x * 7.0, fn, scale, base, 1e-6, 20, 1e-6)
+    check(all(np.allclose(u, v, atol=1e-4) for u, v in zip(a, b)), "mixes are scale invariant in the stream (RMS-normalised)")
+    # One statistic per token over the whole hc*d stream: scaling one copy changes the mixes.
+    y = x.copy()
+    y[:, 0] *= 3.0
+    c = hcr.hc_mixes(y, fn, scale, base, 1e-6, 20, 1e-6)
+    check(not np.allclose(a[0], c[0]), "the statistic is over the whole stream, not per copy")
+
+
+def test_a_block_chains_each_sublayers_pre_into_the_next_one():
+    rng = np.random.default_rng(6)
+    n, hc, d = 2, 4, 6
+    mix = (2 + hc) * hc
+
+    def params():
+        return ((rng.standard_normal((mix, hc * d)) * 0.3).astype(np.float32), np.array([0.9, 0.6, 1.2], np.float32),
+                (rng.standard_normal(mix) * 0.2).astype(np.float32))
+
+    attn_p, ffn_p = params(), params()
+    x = rng.standard_normal((n, hc, d)).astype(np.float32)
+    pre_mix = rng.random((n, hc)).astype(np.float32)
+    seen = {}
+
+    def attention(h):
+        seen["attn_in"] = h.copy()
+        return h * 2.0
+
+    def ffn(h):
+        seen["ffn_in"] = h.copy()
+        return h - 1.0
+
+    out, next_pre = hcr.block_streams(x, pre_mix, attn_p, ffn_p, attention, ffn, 1e-6, 20, 1e-6)
+    a_pre, a_post, a_comb = hcr.hc_mixes(x, *attn_p, 1e-6, 20, 1e-6)
+    check(np.allclose(seen["attn_in"], hcr.hc_pre(x, pre_mix)), "attention reads the previous layer's pre_mix")
+    after_attn = hcr.hc_post(attention(hcr.hc_pre(x, pre_mix)), x, a_post, a_comb)
+    check(np.allclose(seen["ffn_in"], hcr.hc_pre(after_attn, a_pre)), "the FFN reads the attention's pre, computed from the block input")
+    f_pre, f_post, f_comb = hcr.hc_mixes(after_attn, *ffn_p, 1e-6, 20, 1e-6)
+    check(np.allclose(next_pre, f_pre), "the block returns the next block's pre_mix: its FFN's pre")
+    check(np.allclose(out, hcr.hc_post(ffn(seen["ffn_in"]), after_attn, f_post, f_comb)), "the block output mixes the residual through the FFN's comb")
+
+
+def test_the_committed_hyper_connection_golden_matches_the_reference():
+    golden = json.loads((Path(HERE).parent.parent / "tests" / "fixtures" / "dsv4" / "hyper_connection_golden.json").read_text())
+    x, fn = np.array(golden["x"], np.float32), np.array(golden["hc_fn"], np.float32)
+    scale, base = np.array(golden["hc_scale"], np.float32), np.array(golden["hc_base"], np.float32)
+    pre, post, comb = hcr.hc_mixes(x, fn, scale, base, golden["norm_eps"], golden["sinkhorn_iters"], golden["eps"])
+    for name, got in (("pre", pre), ("post", post), ("comb", comb)):
+        check(np.allclose(got, np.array(golden[name], np.float32), atol=1e-6), f"golden {name} differs from the reference")
+    check(np.allclose(hcr.hc_pre(x, pre), np.array(golden["collapsed"], np.float32), atol=1e-6), "golden collapse differs")
+    check(np.allclose(hcr.hc_post(np.array(golden["sublayer"], np.float32), x, post, comb),
+                      np.array(golden["expanded"], np.float32), atol=1e-6), "golden expansion differs")
+    check(golden == hcr._golden(), "the committed golden is not what --emit-golden produces; regenerate it")
 
 
 if __name__ == "__main__":
