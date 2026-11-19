@@ -489,7 +489,22 @@ void test_hot_embedding_ledgers() {
         refused = std::string(error.what()).find("--hot-embedding-rows") != std::string::npos;
     }
     require(refused, "N above the vocabulary is refused naming --hot-embedding-rows");
-    // The two planes are IQ4_XS rows (embedding_split): an IQ3_S embedding (the GSQ-RCO IQ3_XXS
+    // Unsloth's UD-IQ3_XXS stores the embedding as Q6_K: 10 blocks of 210 bytes a row, 2,100 bytes.
+    constexpr std::uint64_t kQ6Row = 10 * 210;
+    const HotEmbeddingPlan q6 = plan_hot_embedding(kVocab, kHidden, 8192, ninfer::QType::GGML_Q6_K);
+    require(q6.row_bytes == kQ6Row && q6.table == kVocab * kQ6Row && q6.table == 521'472'000ULL,
+            "a Q6_K row is hidden / 256 blocks of 210 bytes and the table moves whole");
+    require(q6.hot == 8192 * kQ6Row && q6.hot == 17'203'200ULL, "the Q6_K hot copy is the first 8192 rows");
+    require(plan_hot_embedding(kVocab, kHidden, 8192, ninfer::QType::GGML_IQ4_XS).table == on.table,
+            "IQ4_XS is the default format");
+    bool format_refused = false;
+    try {
+        (void)plan_hot_embedding(kVocab, kHidden, 8192, ninfer::QType::GGML_IQ3_S);
+    } catch (const std::invalid_argument& error) {
+        format_refused = std::string(error.what()).find("--hot-embedding-rows") != std::string::npos;
+    }
+    require(format_refused, "an IQ3_S table has no hot-embedding plan");
+    // The two planes are IQ4_XS or Q6_K rows (embedding_split): an IQ3_S embedding (the GSQ-RCO IQ3_XXS
     // pack's) is refused with the flag, and accepted without it.
     refused = false;
     try {
@@ -501,6 +516,7 @@ void test_hot_embedding_ledgers() {
     require(refused, "an IQ3_S embedding with --hot-embedding-rows is refused naming the flag and the format");
     require_hot_embedding_format(ninfer::QType::GGML_IQ3_S, 0);
     require_hot_embedding_format(ninfer::QType::GGML_IQ4_XS, 8192);
+    require_hot_embedding_format(ninfer::QType::GGML_Q6_K, 8192);
 
     // Host: the pinned block holds the banks, and with the option the table too; the ledger plans
     // the table as other_pinned and the rest as the banks.

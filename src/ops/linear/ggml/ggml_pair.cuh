@@ -41,6 +41,7 @@ void ggml_mmvq_pair_second(QType second, const std::uint8_t* w1, const std::uint
     case QType::GGML_Q6_K: return ggml_pair_launch_t<F1, QType::GGML_Q6_K>(w1, w2, x, out1, out2, n1, n2, t, stream);
     case QType::GGML_Q5_K: return ggml_pair_launch_t<F1, QType::GGML_Q5_K>(w1, w2, x, out1, out2, n1, n2, t, stream);
     case QType::GGML_Q4_K: return ggml_pair_launch_t<F1, QType::GGML_Q4_K>(w1, w2, x, out1, out2, n1, n2, t, stream);
+    case QType::GGML_Q8_0: return ggml_pair_launch_t<F1, QType::GGML_Q8_0>(w1, w2, x, out1, out2, n1, n2, t, stream);
     default: break;
     }
     throw std::invalid_argument("ggml linear_pair: unsupported second format");

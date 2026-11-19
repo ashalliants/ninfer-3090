@@ -156,25 +156,34 @@ PartialRamPlan plan_partial_ram(const PartialRamDemand& d) {
     return out;
 }
 
-HotEmbeddingPlan plan_hot_embedding(std::uint64_t vocab, std::uint64_t hidden, std::uint32_t hot_rows) {
+HotEmbeddingPlan plan_hot_embedding(std::uint64_t vocab, std::uint64_t hidden, std::uint32_t hot_rows,
+                                    QType format) {
     if (hot_rows == 0) { return {}; }
     if (hot_rows > vocab) {
         throw std::invalid_argument("--hot-embedding-rows " + std::to_string(hot_rows) + " exceeds the model's " +
                                     std::to_string(vocab) + " embedding rows: use at most " + std::to_string(vocab));
     }
+    std::uint64_t block_bytes = 0;
+    if (format == QType::GGML_IQ4_XS) {
+        block_bytes = 136;
+    } else if (format == QType::GGML_Q6_K) {
+        block_bytes = 210;
+    } else {
+        throw std::invalid_argument("--hot-embedding-rows needs IQ4_XS or Q6_K embedding rows");
+    }
     if (hidden == 0 || hidden % 256 != 0) {
-        throw std::invalid_argument("--hot-embedding-rows needs IQ4_XS embedding rows of whole 256-value blocks");
+        throw std::invalid_argument("--hot-embedding-rows needs embedding rows of whole 256-value blocks");
     }
     HotEmbeddingPlan out;
-    out.row_bytes = hidden / 256 * 136;
+    out.row_bytes = hidden / 256 * block_bytes;
     out.table     = vocab * out.row_bytes;
     out.hot       = static_cast<std::uint64_t>(hot_rows) * out.row_bytes;
     return out;
 }
 
 void require_hot_embedding_format(QType embedding, std::uint32_t hot_rows) {
-    if (hot_rows != 0 && embedding != QType::GGML_IQ4_XS) {
-        throw std::invalid_argument("--hot-embedding-rows needs a GGML IQ4_XS token embedding; this model's is " +
+    if (hot_rows != 0 && embedding != QType::GGML_IQ4_XS && embedding != QType::GGML_Q6_K) {
+        throw std::invalid_argument("--hot-embedding-rows needs a GGML IQ4_XS or Q6_K token embedding; this model's is " +
                                     std::string(embedding == QType::GGML_IQ3_S ? "ggml_iq3_s" : "another format") +
                                     " (start without --hot-embedding-rows)");
     }

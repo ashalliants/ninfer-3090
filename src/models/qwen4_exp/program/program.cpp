@@ -659,7 +659,8 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
         throw std::invalid_argument("Qwen3.8-Flash-Next: --hc-fused-read reads the int8 mixer copies that --hc-int8 "
                                     "makes: add --hc-int8 or remove --hc-fused-read");
     }
-    (void)plan_hot_embedding(c.vocab_size, c.hidden_size, o.hot_embedding_rows); // refuses N above the vocabulary
+    (void)plan_hot_embedding(c.vocab_size, c.hidden_size, o.hot_embedding_rows,
+                             o.hot_embedding_format); // refuses N above the vocabulary
     if (o.partial_ram_residency && o.vision) {
         throw std::invalid_argument("Qwen3.8-Flash-Next: --partial-ram-residency lends no expert frames, and images are "
                                     "encoded in lent frames: remove --vision or --partial-ram-residency");
@@ -784,7 +785,8 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.shared_expert_workspace = plan_shared_expert_workspace(o, c);
     b.mtp_constrained_masks   = plan_mtp_constrained_masks(o, public_tokens);
     b.mtp_draft_probs         = plan_mtp_draft_probs(o);
-    b.hot_embedding           = plan_hot_embedding(c.vocab_size, c.hidden_size, o.hot_embedding_rows).hot;
+    b.hot_embedding           = plan_hot_embedding(c.vocab_size, c.hidden_size, o.hot_embedding_rows,
+                                                 o.hot_embedding_format).hot;
     b.cpu_misses              = plan_cpu_misses(o).device;
     b.hc_int8_bytes           = plan_hc_int8(o, c);
     b.steering                = plan_steering(o, c);

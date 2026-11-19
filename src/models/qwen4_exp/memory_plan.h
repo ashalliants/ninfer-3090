@@ -82,9 +82,10 @@ struct HostMemoryLedger {
 [[nodiscard]] HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const HostMemoryDemand& demand);
 
 // --hot-embedding-rows N (FlashNextOptions::hot_embedding_rows): the token embedding, GGML IQ4_XS rows
-// of hidden / 256 blocks of 136 bytes, is loaded whole into the pinned block (mapped, so the GPU reads
-// its rows over PCIe) instead of device memory, and the Program copies its first N rows (the lowest
-// ids, the most frequent tokens) to a device buffer. All zero when N is 0.
+// of hidden / 256 blocks of 136 bytes or GGML Q6_K rows of 210-byte blocks, is loaded whole into the
+// pinned block (mapped, so the GPU reads its rows over PCIe) instead of device memory, and the Program
+// copies its first N rows (the lowest ids, the most frequent tokens) to a device buffer. All zero when
+// N is 0.
 struct HotEmbeddingPlan {
     std::uint64_t row_bytes = 0; // one row
     // The whole table: it leaves the dense device weights (LoadPlan::device_bytes) and joins the
@@ -93,10 +94,12 @@ struct HotEmbeddingPlan {
     // The first N rows' device copy (ProgramDevicePlan::hot_embedding).
     std::uint64_t hot = 0;
 };
-// Refuses (std::invalid_argument naming --hot-embedding-rows) N above the vocabulary, and a hidden
-// size that is not a multiple of 256 when N is nonzero.
-[[nodiscard]] HotEmbeddingPlan plan_hot_embedding(std::uint64_t vocab, std::uint64_t hidden, std::uint32_t hot_rows);
-// The two planes are read by ops::embedding_split, which takes GGML IQ4_XS rows only: refuses
+// Refuses (std::invalid_argument naming --hot-embedding-rows) N above the vocabulary, a hidden
+// size that is not a multiple of 256 when N is nonzero, and a `format` other than GGML IQ4_XS (the
+// default, the IQ2_XS pack's embedding) or GGML Q6_K (Unsloth's UD-IQ3_XXS).
+[[nodiscard]] HotEmbeddingPlan plan_hot_embedding(std::uint64_t vocab, std::uint64_t hidden, std::uint32_t hot_rows,
+                                                  QType format = QType::GGML_IQ4_XS);
+// The two planes are read by ops::embedding_split, which takes GGML IQ4_XS or Q6_K rows: refuses
 // (std::invalid_argument naming --hot-embedding-rows) a token embedding in another format when N is
 // nonzero (the GSQ-RCO IQ3_XXS pack's embedding is IQ3_S).
 void require_hot_embedding_format(QType embedding, std::uint32_t hot_rows);

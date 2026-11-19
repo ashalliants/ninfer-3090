@@ -630,7 +630,7 @@ int admission() {
         (void)ops::linear_workspace_capacity_bytes(QType::GGML_IQ4_XS, 4096, 2560, policy, 1, 1);
     });
     failures += expect_throw("unregistered format at a registered shape", [&] {
-        (void)ops::linear_workspace_capacity_bytes(QType::GGML_Q8_0, 10240, 2560, policy, 1, 1);
+        (void)ops::linear_workspace_capacity_bytes(QType::GGML_Q8_0, 12288, 2560, policy, 1, 1);
     });
     failures += expect_throw("linear_add on a linear-only shape", [&] {
         (void)ops::linear_add_workspace_capacity_bytes(QType::GGML_IQ4_XS, 10240, 2560, policy, 1,
@@ -692,10 +692,10 @@ int pair_admission() {
     DeviceBuffer a(static_cast<std::size_t>(640) * 2560), b(a.bytes);
     const Weight iq4  = device_weight(QType::GGML_IQ4_XS, 640, 2560, a);
     const Weight q6   = device_weight(QType::GGML_Q6_K, 640, 2560, b);
-    const Weight q8_0 = device_weight(QType::GGML_Q8_0, 2560, 640, b);
+    const Weight nl   = device_weight(QType::GGML_IQ4_NL, 640, 2560, b);
     const Weight wide = device_weight(QType::GGML_IQ4_XS, 10240, 2560, b);
     failures += expect_throw("pair beyond the decode route", [&] { (void)ops::linear_pair_workspace_capacity_bytes(iq4, q6, 1, 9); });
-    failures += expect_throw("pair with an unpaired format", [&] { (void)ops::linear_pair_workspace_capacity_bytes(iq4, q8_0, 1, 1); });
+    failures += expect_throw("pair with an unpaired format", [&] { (void)ops::linear_pair_workspace_capacity_bytes(iq4, nl, 1, 1); });
     failures += expect_throw("pair of unregistered different shapes", [&] { (void)ops::linear_pair_workspace_capacity_bytes(iq4, wide, 1, 1); });
     failures += expect_throw("pair at an unregistered pair shape", [&] { (void)ops::linear_pair_workspace_capacity_bytes(wide, wide, 1, 1); });
     return failures;
@@ -818,6 +818,9 @@ int main(int argc, char** argv) {
             for (const auto& shape : ops::detail::kGgmlPairShapes) {
                 for (const QType f1 : ops::detail::kGgmlPairFormats) {
                     for (const QType f2 : ops::detail::kGgmlPairFormats) {
+                        // A format is a pair format wherever it is a registered linear at the shape
+                        // (Q8_0 is, at the shared-expert gate/up and the GDN qkv/z only).
+                        if (!ops::detail::ggml_pair_registered(f1, f2, shape.n1, shape.n2, shape.k)) { continue; }
                         failures += run_pair(f1, f2, shape.n1, shape.n2, shape.k);
                     }
                 }

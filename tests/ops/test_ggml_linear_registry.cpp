@@ -7,7 +7,7 @@
 //
 // The table mirrors the packs' published tensor allocations (ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-
 // RCO-GGUF tensor-allocation/*.rco-allocation.txt for the IQ3_S and IQ3_XXS packs; the IQ2_XS pack
-// NInfer shipped first). Shapes per family come from the GGUF tensor shapes
+// NInfer shipped first) and Unsloth's UD-IQ3_XXS tensor table. Shapes per family come from the GGUF tensor shapes
 // (tools/convert/qwen4_exp.py _check_shapes) at Qwen3.8-Flash-Next's config.
 
 #include "core/weight.h"
@@ -105,6 +105,22 @@ const std::vector<Pack> kPacks = {
       {&kSsmOut, {IQ4XS, IQ3S, Q4K, Q5K, Q6K}}},
      {Q5K},
      {IQ3S}},
+    // Unsloth's UD-IQ3_XXS (Dynamic v3.1): every projection Q6_K except one layer's GDN qkv and z and
+    // shared-expert gate and up in Q8_0, the shared-expert downs Q8_0; Q6_K head and token
+    // embedding. Its tensor table (GGUF headers of unsloth/Qwen3.8-Flash-Next-GGUF).
+    {"UD-IQ3_XXS",
+     {{&kAttnGate, {Q6K, Q80}},
+      {&kAttnK, {Q6K}},
+      {&kAttnOutput, {Q6K}},
+      {&kAttnQ, {Q6K}},
+      {&kAttnQkv, {Q6K, Q80}},
+      {&kAttnV, {Q6K}},
+      {&kDownShexp, {Q80}},
+      {&kGateShexp, {Q6K, Q80}},
+      {&kUpShexp, {Q6K, Q80}},
+      {&kSsmOut, {Q6K}}},
+     {Q6K},
+     {Q6K}},
 };
 
 // The two-projection families the forward runs through one linear_pair at decode width.
@@ -203,8 +219,9 @@ int run() {
     }
     // A format outside the registry is refused at a registered shape.
     if (d::ggml_linear_registered(QType::GGML_IQ2_XS, 640, 2560, false) ||
-        d::ggml_pair_registered(QType::GGML_Q8_0, QType::GGML_Q8_0, 640, 2560) || d::ggml_head_registered(Q80) ||
-        d::ggml_embedding_registered(Q6K)) {
+        d::ggml_linear_registered(Q80, 12288, 2560, false) ||
+        d::ggml_pair_registered(QType::GGML_IQ2_XS, Q80, 640, 2560) || d::ggml_head_registered(Q80) ||
+        d::ggml_embedding_registered(Q80)) {
         fail("an unregistered format is admitted");
     }
     if (failures == 0) {

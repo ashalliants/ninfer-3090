@@ -476,6 +476,8 @@ struct ProgramOptions {
     // forward reads the rest from the pinned block (execution::ForwardOptions::hot_embedding_rows).
     // 0: the embedding is in device memory.
     std::uint32_t hot_embedding_rows = 0;
+    // The token embedding's stored format (LoadPlan::token_embedding_format()): it sizes the hot rows.
+    QType hot_embedding_format = QType::GGML_IQ4_XS;
     // FlashNextOptions::gdn_head_map: the GDN recurrence reads the key heads in place through the
     // tiled head map (execution::ForwardOptions::gdn_head_map) instead of tiled copies; the GDN
     // replay records then hold the key heads only (gdn_records_spec). The same outputs, bit for bit.

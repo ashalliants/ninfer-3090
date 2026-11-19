@@ -299,6 +299,12 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         require_non_empty_tensors(ids, out);
         detail::embed_gather_ggml_iq3_s_launch(ids, table, out, stream);
         break;
+    case QType::GGML_Q6_K:
+        require_ggml_metadata(table, out, "Q6_K", 210);
+        if (is_empty_T(ids, out)) { return; }
+        require_non_empty_tensors(ids, out);
+        detail::embed_gather_ggml_q6_k_launch(ids, table, out, stream);
+        break;
     case QType::FP8_E4M3FN_ROW_BF16:
         require_fp8_metadata(table, out);
         if (is_empty_T(ids, out)) { return; }
@@ -318,17 +324,27 @@ void embedding_split(const Tensor& ids, const Weight& hot, const Weight& cold, s
     (void)numel_allow_zero(out, "out");
     require_ids_shape(ids);
     require_out_shape(ids, out);
-    if (hot.qtype != QType::GGML_IQ4_XS || cold.qtype != QType::GGML_IQ4_XS) {
-        throw std::invalid_argument("embedding_split: both planes must be GGML IQ4_XS");
+    if (hot.qtype != cold.qtype || (cold.qtype != QType::GGML_IQ4_XS && cold.qtype != QType::GGML_Q6_K)) {
+        throw std::invalid_argument("embedding_split: both planes must be GGML IQ4_XS or both GGML Q6_K");
     }
-    require_ggml_iq4_xs_metadata(hot, out);
-    require_ggml_iq4_xs_metadata(cold, out);
+    const bool q6 = cold.qtype == QType::GGML_Q6_K;
+    if (q6) {
+        require_ggml_metadata(hot, out, "Q6_K", 210);
+        require_ggml_metadata(cold, out, "Q6_K", 210);
+    } else {
+        require_ggml_iq4_xs_metadata(hot, out);
+        require_ggml_iq4_xs_metadata(cold, out);
+    }
     if (hot_rows < 1 || hot_rows > cold.shape[0] || hot.shape[0] != hot_rows) {
         throw std::invalid_argument("embedding_split: hot must hold rows [0,hot_rows), 1 <= hot_rows <= vocab");
     }
     if (is_empty_T(ids, out)) { return; }
     require_non_empty_tensors(ids, out);
-    detail::embed_gather_ggml_iq4_xs_split_launch(ids, hot, cold, hot_rows, out, stream);
+    if (q6) {
+        detail::embed_gather_ggml_q6_k_split_launch(ids, hot, cold, hot_rows, out, stream);
+    } else {
+        detail::embed_gather_ggml_iq4_xs_split_launch(ids, hot, cold, hot_rows, out, stream);
+    }
 }
 
 } // namespace ninfer::ops
