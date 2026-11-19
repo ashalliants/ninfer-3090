@@ -44,8 +44,8 @@ def _get(url: str, start: int | None = None, end: int | None = None) -> bytes:
             raise ValueError(f"{url}: expected 206 for bytes {start}-{end}, got HTTP {response.status}")
         want = end - start + 1
         data = response.read(want + 1)
-        if len(data) > want:
-            raise ValueError(f"{url}: the server sent more than the {want} bytes asked for")
+        if len(data) != want:  # callers only ask for ranges inside the file, so anything else is a bad reply
+            raise ValueError(f"{url}: asked for {want} bytes at {start}, the server sent {len(data)}")
         return data
 
 

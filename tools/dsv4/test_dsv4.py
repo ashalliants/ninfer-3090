@@ -339,7 +339,8 @@ def test_range_reads_are_bounded_and_refuse_a_server_that_ignores_range():
         cases = [(Reply(206, b"abcd", "bytes 10-13/99"), b"abcd"),
                  (Reply(200, b"x" * 1000), None),                 # ignored Range: the whole file
                  (Reply(206, b"abcd", "bytes 0-3/99"), None),     # the wrong range
-                 (Reply(206, b"abcdefgh", "bytes 10-13/99"), None)]  # more than asked for
+                 (Reply(206, b"abcdefgh", "bytes 10-13/99"), None),  # more than asked for
+                 (Reply(206, b"ab", "bytes 10-11/99"), None)]        # a body cut short
         for reply, expected in cases:
             fh.urllib.request.urlopen = lambda request, timeout=0, reply=reply: reply
             if expected is None:
