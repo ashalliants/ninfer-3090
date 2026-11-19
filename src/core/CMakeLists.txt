@@ -24,6 +24,7 @@ add_library(ninfer_core STATIC
   host_flag_wait.cu
   side_stream_delay.cu
   copy_batch.cpp
+  expert_extents.cpp
   cgroup_memory.cpp
   host_memory.cpp
   link_probe.cpp
