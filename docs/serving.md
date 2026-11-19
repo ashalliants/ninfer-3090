@@ -613,7 +613,9 @@ can read high or low next to its neighbours.
 it polls needs the key. If the server has one, the page says so: type the key into the field at the
 top and press Enter or **Use key**. The page sends it as `Authorization: Bearer` on its own
 requests and keeps it in the tab's session storage, so it survives a reload of that tab but not
-closing it; **Forget** clears it. The key never appears in the URL. On a server without a key the
+closing it; **Forget** clears it. `scripts/run.sh` and `scripts/run.bat` print a ready-to-open link ending in `#key=...`;
+the part after `#` is never sent to the server, and the page keeps the key for the tab and removes it from the address bar
+right away. The status endpoints still need the key. On a server without a key the
 [Host check](#host-and-origin-checks) applies to the page like every route, so open it by a name
 the server answers to (or an address); its requests go to its own origin, so they pass the Origin
 check.

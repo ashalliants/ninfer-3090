@@ -435,7 +435,7 @@ function onSlots(slots) {
       line.className = 'nw';
       line.textContent = nf0.format(s.prompt_done) + ' / ' + nf0.format(s.prompt_tokens);
       prompt.appendChild(line);
-      if (s.reused > 0 && s.prompt_tokens > 0) {
+      if (s.prompt_tokens > 0) {
         // Share of the prompt served from cache: green >= 70%, yellow >= 30%, else red.
         const pct = 100 * s.reused / s.prompt_tokens;
         const sub = document.createElement('div');
@@ -827,9 +827,10 @@ document.addEventListener('keydown', (e) => {
     try { sessionStorage.setItem(KEY_STORE, apiKey); } catch (e) { /* storage disabled */ }
     $('key').placeholder = 'Key set for this tab';
   }
-  if (q.get('range') === '15m') setRange(900);
+  // Read both values before setRange, whose writeHash would otherwise drop the lane.
   const lane = Number(q.get('lane'));
   if (q.has('lane') && Number.isInteger(lane) && lane >= 0) selectedLane = lane;
+  if (q.get('range') === '15m') setRange(900);
   if (q.has('key')) writeHash();
 }
 
