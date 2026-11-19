@@ -35,6 +35,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import attention as att  # noqa: E402
+import engram_ref as eng  # noqa: E402
 import moe as moe_ref  # noqa: E402
 
 REPO = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
@@ -195,12 +196,76 @@ def run_moe(model_dir: Path) -> list[np.ndarray]:
     return outputs
 
 
+def run_engram(model_dir: Path) -> tuple[np.ndarray, list[np.ndarray]]:
+    """The repo's real `EngramLayout`, `compute_hash_multipliers`, `NgramHashState` and `Engram` on
+    `engram_ref.golden_case()`. Two stand-ins, both outside the maths: `sympy.isprime` (a trial-division
+    one, to avoid the dependency), and the table lookup returns FP32 instead of rounding the dequantised rows to
+    BF16 (the repo's `Linear` then takes BF16 weights; here everything is FP32, as in the other goldens).
+    The compressed-vocabulary map is the case's own: the repo builds it from the tokenizer."""
+    import torch
+
+    _stub_modules(torch)
+    sympy = types.ModuleType("sympy")
+    sympy.isprime = eng._is_prime
+    sys.modules["sympy"] = sympy
+    sys.path.insert(0, str(model_dir))
+    sys.modules.pop("engram", None)  # the real one, not the import-time stub, and a model that binds it
+    sys.modules.pop("model", None)
+    engram = importlib.import_module("engram")
+    model = importlib.import_module("model")
+    model.default_dtype = torch.float32
+
+    def lookup(self, indices):  # ParallelEngramEmbedding.forward without the BF16 cast (world size 1)
+        values = torch.nn.functional.embedding(indices, self.weight).float().unflatten(-1, (-1, self.block_size))
+        scales = torch.nn.functional.embedding(indices, self.scale).float().unsqueeze(-1)
+        return (values * scales).flatten(-2)
+
+    model.ParallelEngramEmbedding.forward = lookup
+    case = eng.golden_case()
+    primes = case["primes"]
+    args = model.ModelArgs(
+        dim=eng.G_DIM, hc_mult=eng.G_HC, norm_eps=eng.G_EPS, max_batch_size=1, max_seq_len=16,
+        engram_layer_ids=eng.G_LAYERS_IDS, engram_num_embeddings=tuple(int(p.sum()) for p in primes),
+        engram_max_ngram_size=eng.G_NGRAM, engram_vocab_size=eng.G_BUCKET_START, engram_n_heads=eng.G_HEADS,
+        engram_head_dim=eng.G_ROW, engram_pad_id=2, engram_compressed_vocab_size=eng.G_COMPRESSED,
+    )
+    layout = engram.EngramLayout.from_args(args)
+    assert np.array_equal(np.array(layout.primes), primes), "bucket primes differ from the repo's"
+    state = engram.NgramHashState.__new__(engram.NgramHashState)
+    torch.nn.Module.__init__(state)
+    state.layout, state.pad_id = layout, int(case["pad_id"])
+    flat = [[p for per_ngram in layer for p in per_ngram] for layer in layout.primes]
+    multipliers = engram.compute_hash_multipliers(layout.layer_ids, layout.max_ngram_size, eng.G_COMPRESSED)
+    assert np.array_equal(multipliers.numpy(), case["multipliers"]), "multipliers differ from the repo's"
+    offsets = np.array([np.cumsum([0, *sizes[:-1]]) for sizes in flat])
+    for name, value in (("primes", torch.tensor(layout.primes)), ("offsets", torch.tensor(offsets)),
+                        ("multipliers", multipliers), ("token_map", torch.tensor(case["token_map"])),
+                        ("cache", torch.empty(1, 16, dtype=torch.int64))):
+        state.register_buffer(name, value, persistent=False)
+    ids_in, mask = torch.tensor(case["input_ids"])[None], torch.tensor(case["token_mask"])[None]
+    hashes = state(ids_in, 0, mask)  # [1, L, layers, cols]
+    outputs = []
+    with torch.no_grad():
+        for index, layer_id in enumerate(eng.G_LAYERS_IDS):
+            layer = model.Engram(args, layer_id, layout)
+            table = case["tables"][index]
+            layer.embed.weight = torch.nn.Parameter(torch.tensor(table["codes"]).view(torch.float8_e4m3fn), requires_grad=False)
+            layer.embed.scale = torch.nn.Parameter(torch.tensor(table["scales"]).view(torch.float8_e8m0fnu), requires_grad=False)
+            layer.wkv.weight = torch.nn.Parameter(torch.tensor(case["wkvs"][index]))
+            layer.q_weight.data = torch.tensor(case["weights"][index])
+            layer.k_weight.data = torch.ones_like(layer.k_weight)
+            out = layer(torch.tensor(case["x"][index])[None], hashes[:, :, index, :], mask)
+            outputs.append(out[0].numpy())
+    return hashes[0].numpy(), outputs
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--fetch", type=Path, metavar="DIR", help="download the repo's inference files into DIR")
     parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--emit", type=Path, help="write the attention stack's outputs")
     parser.add_argument("--emit-moe", type=Path, help="write the MoE layers' outputs")
+    parser.add_argument("--emit-engram", type=Path, help="write the Engram hash ids and layer outputs")
     args = parser.parse_args()
     if args.fetch:
         fetch(args.fetch)
@@ -218,6 +283,15 @@ def main() -> None:
         args.emit_moe.write_text(json.dumps({"model_repo": REPO, "revision": revision_of(args.model_dir), "seed": moe_ref.GOLDEN_SEED,
                                              "outputs": [o.tolist() for o in outputs]}) + "\n")
         print(f"wrote {args.emit_moe} ({len(outputs)} layers)")
+    if args.emit_engram:
+        if not args.model_dir:
+            parser.error("--emit-engram needs --model-dir")
+        ids, outputs = run_engram(args.model_dir)
+        args.emit_engram.write_text(
+            json.dumps({"model_repo": REPO, "revision": revision_of(args.model_dir), "seed": eng.GOLDEN_SEED,
+                        "hash_ids": ids.tolist(), "outputs": [o.tolist() for o in outputs]}) + "\n"
+        )
+        print(f"wrote {args.emit_engram} ({len(outputs)} layers)")
 
 
 if __name__ == "__main__":
