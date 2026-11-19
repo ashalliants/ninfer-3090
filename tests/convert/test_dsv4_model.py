@@ -160,3 +160,32 @@ def test_every_layer_of_the_real_iq2_xxs_build_has_a_record_format():
         record = ggml_record_format(f"ggml_{gate_up.lower()}", f"ggml_{down.lower()}")
         total += ggml_expert_record_geometry(record.name, (384, 5120, 2304)).record_stride * 384
     assert abs(total / 132.1e9 - 1) < 0.005, total
+
+
+def test_the_public_cli_converts_a_deepseek41_gguf(gguf_path, tmp_path):
+    import json
+
+    from tools.convert.__main__ import main
+
+    out = tmp_path / "cli.ninfer"
+    main(["--model", str(gguf_path), "--recipe", "dsv4_gguf", "--device", "cpu", "--out", str(out)])
+    assert out.exists() and not (tmp_path / "cli.ninfer.ngram").exists()  # no n-gram volume
+    report = json.loads((tmp_path / "cli.ninfer.conversion.json").read_text())
+    assert report["provenance"]["recipe"] == "dsv4_gguf"
+    assert report["provenance"]["sources"]["base"]["paths"] == [str(gguf_path)]
+    with GgufModel(gguf_path) as gguf:
+        assert _verify(out, gguf)["banks"] == fixture.LAYERS
+
+
+def test_the_cli_refuses_options_a_deepseek41_gguf_cannot_take(gguf_path, tmp_path):
+    from tools.convert.__main__ import main
+
+    base = ["--model", str(gguf_path), "--recipe", "dsv4_gguf", "--device", "cpu"]
+    for extra in (["--subset", "dev"], ["--ngram-out", str(tmp_path / "v")], ["--mtp-gguf", str(gguf_path)]):
+        with pytest.raises(ValueError, match="takes none of"):
+            main([*base, *extra, "--out", str(tmp_path / "x.ninfer")])
+    assert not (tmp_path / "x.ninfer").exists()
+    # Another model's official recipe is refused for this GGUF, before anything is written.
+    with pytest.raises(ValueError, match="requires the qwen4exp GGUF model"):
+        main(["--model", str(gguf_path), "--recipe", "qwen4_exp_gguf", "--device", "cpu", "--out", str(tmp_path / "y.ninfer")])
+    assert not (tmp_path / "y.ninfer").exists()
