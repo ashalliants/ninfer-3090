@@ -3,7 +3,7 @@
 
 For each (gate/up, down) type pair the build uses, takes the first layer that uses it and writes `count` experts
 of that layer in the artifact's `ggml_expert_record_v1` layout (`tools/artifact`), back to back at the record
-stride, into `OUT/<pair>.bin`, with `OUT/manifest.json` naming the layer, the expert ids, the format and the
+stride, into `OUT/<pair>.bin` (OUT must not exist or be empty; it appears only when the whole set is written), with `OUT/manifest.json` naming the layer, the expert ids, the format and the
 stride. Reads only those experts' rows (a few MB per pair) from the shards, whatever their size.
 
     python tools/dsv4/extract_real_experts.py SHARD_DIR OUT [--count 4]
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -67,8 +68,15 @@ def main() -> None:
     parser.add_argument("--count", type=int, default=4)
     parser.add_argument("--layers", type=int, default=40)
     args = parser.parse_args()
+    if args.out.exists() and any(args.out.iterdir()):
+        raise SystemExit(f"{args.out} is not empty: remove it or pick another directory (a stale record file would be tested as if current)")
     tensors = find_tensors(args.shard_dir)
-    args.out.mkdir(parents=True, exist_ok=True)
+    # Written beside the destination and renamed into place, so a run that fails or is interrupted leaves no
+    # directory a test could pick up.
+    work = args.out.parent / (args.out.name + ".partial")
+    if work.exists():
+        shutil.rmtree(work)
+    work.mkdir(parents=True)
     manifest = {}
     for (gate_up, down), layer in pairs_by_layer(tensors, args.layers).items():
         name = f"ggml_rec_{gate_up.lower()}_{down.lower()}"
@@ -84,11 +92,14 @@ def main() -> None:
             parts["up"].append(read_rows(up, e * inter, inter))
             parts["down"].append(read_rows(dn, e * hidden, hidden))
         records = pack_expert_records(record_format.name, shape, *(np.stack(parts[p]) for p in PARTS))
-        (args.out / f"{name}.bin").write_bytes(records.tobytes())
+        (work / f"{name}.bin").write_bytes(records.tobytes())
         manifest[name] = {"format": name, "layer": layer, "experts": chosen, "stride": int(records.shape[1]),
                           "hidden": hidden, "intermediate": inter}
         print(f"{name}: layer {layer}, experts {chosen}, {records.shape[1]} bytes each")
-    (args.out / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
+    (work / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
+    if args.out.exists():
+        args.out.rmdir()  # empty, checked above
+    work.rename(args.out)
 
 
 if __name__ == "__main__":
