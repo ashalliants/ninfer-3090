@@ -55,6 +55,12 @@
 #   - Flash-Next keeps only the token embedding's first 8192 rows in VRAM (--hot-embedding-rows
 #     8192; NINFER_HOT_EMBEDDING_ROWS=0 keeps the whole table): 216 more expert frames, the same
 #     output, a prompt's first pass +1-1.5%;
+#   - Flash-Next keeps its context cache on disk across restarts (--context-store, run.sh's
+#     NINFER_CONTEXT_STORE) in ${XDG_CACHE_HOME:-~/.cache}/ninfer/context-store/<model>, created
+#     when missing and bounded at 4 GiB (NINFER_CONTEXT_STORE_MAX_GIB; a 128K-token conversation is
+#     ~2 GiB). Without it a restart loses every cached prompt and a long conversation's next turn
+#     prefills from scratch (112K tokens, ~5 minutes). NINFER_CONTEXT_STORE=DIR moves it,
+#     NINFER_CONTEXT_STORE=off keeps the cache in RAM only;
 #   - the memory-lock limit: Flash-Next pins 33 GiB of experts. When `ulimit -l` is below that and
 #     cannot be raised here, NINFER_ALLOW_UNLOCKED_HOST_MEMORY=on is set (the server then continues
 #     and still fails loudly if the pin itself fails). To lift the limit for good, as root:
@@ -152,6 +158,21 @@ case "$model_key" in
     # cores instead of emulated Ampere MMA: a 3.9K-token prompt 6.9 -> 6.0 s, more accurate per op,
     # not bit for bit the same output. NINFER_SM70_TENSOR_CORES=0 turns it off.
     export NINFER_SM70_TENSOR_CORES="${NINFER_SM70_TENSOR_CORES:-1}"
+    # The context cache is kept on disk as well as in RAM, so a restart does not make every
+    # conversation prefill again from scratch (a 112K-token prompt is ~5 minutes on this card).
+    # Each build gets its own directory, created here; NINFER_CONTEXT_STORE=off keeps the cache in
+    # RAM only, and NINFER_CONTEXT_STORE_MAX_GIB bounds the disk it uses (a 128K-token
+    # conversation is ~2 GiB).
+    if [[ "${NINFER_CONTEXT_STORE:-}" == 'off' ]]; then
+      unset NINFER_CONTEXT_STORE NINFER_CONTEXT_STORE_MAX_GIB
+    else
+      export NINFER_CONTEXT_STORE="${NINFER_CONTEXT_STORE:-${XDG_CACHE_HOME:-$HOME/.cache}/ninfer/context-store/$model_key}"
+      export NINFER_CONTEXT_STORE_MAX_GIB="${NINFER_CONTEXT_STORE_MAX_GIB:-4}"
+      if ! mkdir -p -- "$NINFER_CONTEXT_STORE"; then
+        printf 'Cannot create the context store %s (NINFER_CONTEXT_STORE=off skips it).\n' "$NINFER_CONTEXT_STORE" >&2
+        exit 1
+      fi
+    fi
     lock_kib="$(ulimit -l)"
     need_kib=$(( v100_pin_gib * 1024 * 1024 ))
     if [[ "$lock_kib" != 'unlimited' ]] && (( lock_kib < need_kib )); then

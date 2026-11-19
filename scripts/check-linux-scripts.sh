@@ -1176,4 +1176,24 @@ for layout in build-dir home; do
     v100_fail "($layout) started $(cat -- "$tmp/v100.who"), not $v100_tree/apps/ninfer-serve"
 done
 
+# run-v100.sh gives Flash-Next a context store under ~/.cache/ninfer (created) with a 4 GiB bound;
+# NINFER_CONTEXT_STORE=DIR moves it and =off leaves it out.
+v100_home="$tmp/v100-build-dir-home"; v100_tree="$tmp/v100-build-dir-tree"
+v100_store="$v100_home/.cache/ninfer/context-store/qwen38-flash-next"
+run_v100_fn() {
+  clear_env HOME="$v100_home" NINFER_TEST_WHO="$tmp/v100.who" NINFER_TEST_ARGS="$tmp/v100.args" \
+    NINFER_MODEL_DIR="$tmp" BUILD_DIR="$v100_tree" NINFER_ALLOW_UNLOCKED_HOST_MEMORY=on "$@" \
+    "$root/run-v100.sh" qwen38-flash-next >/dev/null 2>&1
+}
+v100_arg_pair() { grep -qxF -- "$1" "$tmp/v100.args" && grep -A1 -xF -- "$1" "$tmp/v100.args" | tail -1; }
+run_v100_fn || v100_fail 'Flash-Next did not start'
+[[ -d "$v100_store" ]] || v100_fail "Flash-Next did not create $v100_store"
+[[ "$(v100_arg_pair --context-store)" == "$v100_store" ]] || v100_fail 'Flash-Next did not pass the default --context-store'
+[[ "$(v100_arg_pair --context-store-max-gib)" == 4 ]] || v100_fail 'Flash-Next did not bound the store at 4 GiB'
+run_v100_fn NINFER_CONTEXT_STORE="$tmp/v100-store/a" NINFER_CONTEXT_STORE_MAX_GIB=9 || v100_fail 'Flash-Next with a store dir did not start'
+[[ -d "$tmp/v100-store/a" && "$(v100_arg_pair --context-store)" == "$tmp/v100-store/a" &&
+   "$(v100_arg_pair --context-store-max-gib)" == 9 ]] || v100_fail 'NINFER_CONTEXT_STORE / _MAX_GIB were not honoured'
+run_v100_fn NINFER_CONTEXT_STORE=off NINFER_CONTEXT_STORE_MAX_GIB=9 || v100_fail 'NINFER_CONTEXT_STORE=off did not start'
+! grep -q -- '--context-store' "$tmp/v100.args" || v100_fail 'NINFER_CONTEXT_STORE=off still passed a store'
+
 printf '%s\n' 'Linux script checks passed.'
