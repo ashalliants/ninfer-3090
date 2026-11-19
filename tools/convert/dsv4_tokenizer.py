@@ -59,6 +59,72 @@ def _merge_strings(merges) -> list[str]:
     return [m if isinstance(m, str) else " ".join(m) for m in merges]
 
 
+def _check_runtime_fields(official: Mapping) -> None:
+    """Every field the runtime's tokenizer loader reads, with the types and values it accepts, so a file that
+    passes here also loads (tokenizer.cpp: validate_pipeline, load_vocab, load_added_tokens)."""
+    def need(ok: bool, what: str) -> None:
+        if not ok:
+            raise Dsv4Error(f"tokenizer.json: {what}")
+
+    if official.get("pre_tokenizer") != PIPELINE:
+        raise Dsv4Error("tokenizer.json's pre_tokenizer is not the DeepSeek-V4 pipeline the runtime implements")
+    need(official.get("normalizer") in (None, {"type": "Sequence", "normalizers": []}),
+         "has a normalizer; the DeepSeek-V4 pipeline has none")
+    decoder, post = official.get("decoder"), official.get("post_processor")
+    need(decoder is None or (isinstance(decoder, dict) and decoder.get("type") == "ByteLevel"), "decoder must be ByteLevel")
+    need(post is None or (isinstance(post, dict) and post.get("type") == "ByteLevel"), "post_processor must be ByteLevel or null")
+    model = official.get("model")
+    need(isinstance(model, dict) and model.get("type") == "BPE", "model must be a BPE model")
+    need(model.get("dropout") in (None, 0, 0.0) and not isinstance(model.get("dropout"), bool), "model.dropout must be null or 0")
+    for field in ("continuing_subword_prefix", "end_of_word_suffix"):
+        need(model.get(field) in (None, ""), f"model.{field} must be empty")
+    need(not model.get("ignore_merges", False) and not model.get("byte_fallback", False),
+         "model must not use ignore_merges or byte_fallback")
+    vocab = model.get("vocab")
+    need(isinstance(vocab, dict) and all(type(i) is int for i in vocab.values()), "model.vocab must map tokens to integer ids")
+    need(sorted(vocab.values()) == list(range(len(vocab))), "the vocabulary ids are not contiguous from 0")
+    need(isinstance(model.get("merges"), list), "model.merges must be a list")
+    added = official.get("added_tokens")
+    need(isinstance(added, list), "added_tokens must be a list")
+    seen = set()
+    for item in added:
+        need(isinstance(item, dict) and type(item.get("id")) is int and isinstance(item.get("content"), str)
+             and item["content"], "each added token needs an integer id and non-empty content")
+        for flag in ("single_word", "lstrip", "rstrip", "normalized", "special"):
+            need(type(item.get(flag)) is bool, f"added token {item['content']!r}: {flag} must be a boolean")
+        need(not (item["single_word"] or item["lstrip"] or item["rstrip"]),
+             f"added token {item['content']!r} strips or matches whole words, which the runtime does not do")
+        need(item["id"] not in seen, f"added token id {item['id']} is listed twice")
+        seen.add(item["id"])
+
+
+# GGUF token types (llama.cpp): the ones this tokenizer uses.
+_NORMAL, _CONTROL, _USER_DEFINED = 1, 3, 4
+
+
+def _check_membership(metadata: Mapping, tokens: list, vocab_size: int, added: Mapping) -> None:
+    """Which tokens are ordinary vocabulary and which are added, from the GGUF's own token types rather than from
+    where tokenizer.json happens to list them: a normal token is in the vocabulary and not added; a control or
+    user-defined token is added (it may also sit in the vocabulary: the real file lists its first three control
+    tokens, BOS, EOS and a pad marker, in both, and the loader treats the same id and content as one token). A tokenizer.json that moves a marker such as the tool-call tokens into the vocabulary
+    would otherwise load but BPE-encode the marker instead of matching it whole."""
+    types = metadata.get("tokenizer.ggml.token_type")
+    if not isinstance(types, list) or len(types) != len(tokens):
+        raise Dsv4Error("tokenizer.ggml.token_type must give one type per token")
+    for index, kind in enumerate(types):
+        in_vocab, is_added = index < vocab_size, index in added  # in_vocab: ids 0..vocab_size-1
+        if kind == _NORMAL:
+            if not in_vocab or is_added:
+                raise Dsv4Error(f"token {index} ({tokens[index]!r}) is a normal token in the GGUF, so it must be in "
+                                "tokenizer.json's vocabulary and not an added token")
+        elif kind in (_CONTROL, _USER_DEFINED):
+            if not is_added:
+                raise Dsv4Error(f"token {index} ({tokens[index]!r}) is a control or user-defined token in the GGUF, so it "
+                                "must be one of tokenizer.json's added tokens")
+        else:
+            raise Dsv4Error(f"token {index} has GGUF token type {kind}, which this tokenizer does not use")
+
+
 def check_tokenizer(official: Mapping, metadata: Mapping) -> int:
     """Refuse a tokenizer.json that is not this GGUF's tokenizer. Returns the base vocabulary size."""
     if metadata.get("tokenizer.ggml.model") != "gpt2" or metadata.get("tokenizer.ggml.pre") != GGUF_PRE:
@@ -66,35 +132,23 @@ def check_tokenizer(official: Mapping, metadata: Mapping) -> int:
     tokens, merges = metadata.get("tokenizer.ggml.tokens"), metadata.get("tokenizer.ggml.merges")
     if not isinstance(tokens, list) or not isinstance(merges, list):
         raise Dsv4Error("tokenizer.ggml tokens and merges are required")
-    if official.get("pre_tokenizer") != PIPELINE:
-        raise Dsv4Error("tokenizer.json's pre_tokenizer is not the DeepSeek-V4 pipeline the runtime implements")
-    normalizer = official.get("normalizer")
-    if normalizer not in (None, {"type": "Sequence", "normalizers": []}):
-        raise Dsv4Error("tokenizer.json has a normalizer; the DeepSeek-V4 pipeline has none")
-    model = official.get("model", {})
-    if model.get("type") != "BPE" or model.get("ignore_merges") or model.get("byte_fallback"):
-        raise Dsv4Error("tokenizer.json's model is not a plain byte-level BPE")
-    vocab = model.get("vocab")
-    if not isinstance(vocab, dict) or sorted(vocab.values()) != list(range(len(vocab))):
-        raise Dsv4Error("tokenizer.json's vocabulary ids are not contiguous from 0")
+    _check_runtime_fields(official)
+    model = official["model"]
+    vocab = model["vocab"]
     if len(vocab) > len(tokens):
         raise Dsv4Error("tokenizer.json's vocabulary is larger than the GGUF's")
     for token, index in vocab.items():
         if tokens[index] != token:
             raise Dsv4Error(f"token {index} is {token!r} in tokenizer.json but {tokens[index]!r} in the GGUF")
-    if _merge_strings(model.get("merges", [])) != merges:
+    if _merge_strings(model["merges"]) != merges:
         raise Dsv4Error("tokenizer.json's merges differ from the GGUF's")
     added = {}
-    for item in official.get("added_tokens", []):
+    for item in official["added_tokens"]:
         index = item["id"]
-        if type(index) is not int or not 0 <= index < len(tokens) or tokens[index] != item["content"]:
+        if not 0 <= index < len(tokens) or tokens[index] != item["content"]:
             raise Dsv4Error(f"added token {item.get('content')!r} is not the GGUF's token {index}")
-        if item.get("single_word") or item.get("lstrip") or item.get("rstrip"):
-            raise Dsv4Error(f"added token {item['content']!r} strips or matches whole words, which the runtime does not do")
         added[index] = item
-    missing = [i for i in range(len(vocab), len(tokens)) if i not in added]
-    if missing:
-        raise Dsv4Error(f"GGUF tokens {missing[:5]} are in neither tokenizer.json's vocabulary nor its added tokens")
+    _check_membership(metadata, tokens, len(vocab), added)
     for key in ("bos", "eos", "padding"):
         index = metadata.get(f"tokenizer.ggml.{key}_token_id")
         if type(index) is not int or not 0 <= index < len(tokens):

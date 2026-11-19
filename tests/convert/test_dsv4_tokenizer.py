@@ -103,11 +103,58 @@ def test_each_mismatch_is_refused(metadata, official):
     _refused(metadata, stripped, "strips or matches whole words")
     short = copy.deepcopy(official)
     short["added_tokens"] = short["added_tokens"][:-1]
-    _refused(metadata, short, "in neither tokenizer.json's vocabulary nor its added tokens")
+    _refused(metadata, short, "control or user-defined token in the GGUF, so it must be one of tokenizer.json's added tokens")
 
     _refused({k: v for k, v in metadata.items() if k != "tokenizer.ggml.eos_token_id"}, official, "eos_token_id")
     _refused({**metadata, "tokenizer.ggml.add_bos_token": True}, official, "adds no BOS")
     _refused({k: v for k, v in metadata.items() if k != "tokenizer.ggml.merges"}, official, "tokens and merges are required")
+
+
+def test_membership_follows_the_ggufs_token_types(metadata, official):
+    # Moving the non-special <tool> marker from the added tokens into the vocabulary keeps every id contiguous and
+    # every string equal, but the runtime would then BPE-encode the marker instead of matching it whole: refused.
+    moved = copy.deepcopy(official)
+    moved["model"]["vocab"]["<tool>"] = 12
+    moved["added_tokens"] = [a for a in moved["added_tokens"] if a["id"] != 12]
+    _refused(metadata, moved, "token 12 .*control or user-defined token in the GGUF")
+    # (A control token listed in both the vocabulary and the added tokens is fine: the baseline does it for ids 0-2, as the real file does.)
+    # A normal token must be in the vocabulary and not added.
+    added_normal = copy.deepcopy(official)
+    added_normal["added_tokens"].append({"id": 3, "content": "a", "single_word": False, "lstrip": False,
+                                         "rstrip": False, "normalized": False, "special": False})
+    _refused(metadata, added_normal, "normal token in the GGUF")
+    _refused({**metadata, "tokenizer.ggml.token_type": [*fixture.TOKEN_TYPES[:-1], 5]}, official, "token type 5")
+    _refused({**metadata, "tokenizer.ggml.token_type": fixture.TOKEN_TYPES[:-1]}, official, "one type per token")
+
+
+def test_every_field_the_runtime_loader_reads_is_validated(metadata, official):
+    """A file that passes check_tokenizer must load: these are the loader's refusals (tokenizer.cpp)."""
+    def broken(mutate):
+        value = copy.deepcopy(official)
+        mutate(value)
+        return value
+
+    cases = {
+        "dropout": broken(lambda t: t["model"].__setitem__("dropout", 0.1)),
+        "continuing_subword_prefix": broken(lambda t: t["model"].__setitem__("continuing_subword_prefix", "##")),
+        "end_of_word_suffix": broken(lambda t: t["model"].__setitem__("end_of_word_suffix", "</w>")),
+        "ignore_merges": broken(lambda t: t["model"].__setitem__("ignore_merges", True)),
+        "model must be a BPE": broken(lambda t: t["model"].__setitem__("type", "WordPiece")),
+        "model.merges must be a list": broken(lambda t: t["model"].pop("merges")),
+        "added_tokens must be a list": broken(lambda t: t.pop("added_tokens")),
+        "decoder must be ByteLevel": broken(lambda t: t.__setitem__("decoder", {"type": "WordPiece"})),
+        "post_processor must be ByteLevel": broken(lambda t: t.__setitem__("post_processor", {"type": "TemplateProcessing"})),
+        "must be a boolean": broken(lambda t: t["added_tokens"][0].pop("special")),
+        "integer id and non-empty content": broken(lambda t: t["added_tokens"][0].__setitem__("content", "")),
+        "listed twice": broken(lambda t: t["added_tokens"].append(dict(t["added_tokens"][0]))),
+        "integer ids": broken(lambda t: t["model"]["vocab"].__setitem__("a", "3")),
+    }
+    for match, value in cases.items():
+        _refused(metadata, value, match.split(" must")[0] if match.startswith("model") else match)
+    # What the loader accepts is accepted: null dropout/prefix/suffix, a null post_processor, a missing decoder.
+    accepted = broken(lambda t: t.update(post_processor=None, decoder=None))
+    accepted["model"].update(dropout=None, continuing_subword_prefix=None, end_of_word_suffix=None)
+    assert tok.check_tokenizer(accepted, metadata) == fixture.BASE_VOCAB
 
 
 def test_build_model_carries_the_resources_into_the_artifact(tmp_path):

@@ -463,6 +463,36 @@ the synthesized `tokenizer.json` marks the FIM and repository tokens special. To
 Hugging Face flags, pass the original file with `--resource tokenizer.json=PATH`; the converter
 accepts it only if its vocabulary, merges and added tokens equal the GGUF's.
 
+### DeepSeek-V4.1-Flash
+
+A GGUF whose `general.architecture` is `deepseek41` (ISTA-DASLab's GSQ-RCO builds of
+DeepSeek-V4.1-Flash-1017) takes the `dsv4_gguf` recipe. Like the Qwen route it stores every tensor exactly:
+block tensors keep their GGML blocks, BF16 and F32 keep their words, and each layer's routed experts become
+one `ggml_expert_record_v1` bank in that layer's own pair of GGML types (GSQ-RCO picks them per layer; the
+IQ2_XXS build uses eight pairs, see [tensor formats](maintainer/tensor-formats.md)). Name the first file of the
+split GGUF. The converter checks the whole tensor list against the architecture (an unknown, missing,
+misplaced or mis-shaped tensor is refused) and writes no n-gram volume.
+
+**The checkpoint's `tokenizer.json` is required**, because the GGUF alone does not say which added tokens are
+special (49 of its control tokens, the tool-call and role markers, are not) or what the pre-tokenizer is. Get it
+from `deepseek-ai/DeepSeek-V4.1-Flash-1017` and pass it with `--resource`; the converter accepts it only if the
+pipeline is the one the runtime implements and its vocabulary, merges and added tokens agree with the GGUF's
+token types. The chat template defaults to the GGUF's; `--resource chat_template.jinja=PATH` (only together
+with `tokenizer.json`) replaces it with the checkpoint's. `tokenizer_config.json` and `generation_config.json`
+are derived. `--subset`, `--ngram-out`, `--ngram-reuse`, `--mtp-gguf` and `--mmproj` do not apply and are
+refused.
+
+```bash
+python -m tools.convert \
+  --model /models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00006.gguf \
+  --recipe dsv4_gguf --device cpu --out out/dsv4-flash.ninfer \
+  --resource tokenizer.json=/models/DeepSeek-V4.1-Flash-1017/tokenizer.json
+```
+
+The Engram table (`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`, the build's last shard) is not part of the
+artifact yet, and nothing loads the artifact until the model's runtime lands (milestone 4 of the
+[DSV4 plan](maintainer/dsv4-flash-plan.md)).
+
 ## Write a conversion method
 
 A method receives a `PrepareRequest` and returns `request.job(produce=...)`. Preparation validates
@@ -524,7 +554,9 @@ working set. `--rows-per-chunk` defaults to 512; custom methods own how they use
 
 Text includes `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and
 `generation_config.json`. Vision adds its image and video processor configs. Resources come from
-`--model`; `--resource ROLE=PATH` replaces a selected resource:
+`--model`, except on the GGUF routes, where they come from the GGUF (Qwen3.8-Flash-Next) or, for
+DeepSeek-V4.1-Flash, from the required `--resource tokenizer.json=PATH` (see above); `--resource ROLE=PATH`
+replaces a selected resource:
 
 ```text
 --resource chat_template.jinja=/path/to/chat_template.jinja
