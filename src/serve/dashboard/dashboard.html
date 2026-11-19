@@ -184,13 +184,23 @@ function show(id, text) { $(id).textContent = text; }
 const orDash = (v, fmt) => (v === null || v === undefined || !isFinite(v) ? '-' : fmt(v));
 const gib = (b) => nf1.format(b / 1073741824) + ' GiB';
 
+let lastPrefill = null;
 function onMetrics(text, now) {
   const m = parseMetrics(text);
   let decode = null, prefill = null, accept = null;
   if (previous) {
     const dt = (now - previous.t) / 1000;
     decode = rate(m, previous.m, 'ninfer_decode_tokens_total', dt);
-    prefill = rate(m, previous.m, 'ninfer_prefill_tokens_total', dt);
+    // The counters advance once per prefill unit (a chunk of thousands of tokens), so a plain
+    // tokens/dt reads 0 between units and spikes when one lands. Tokens over the prefill time
+    // spent is the real throughput; between units, hold it while a prefill is still running.
+    const ptok = rate(m, previous.m, 'ninfer_prefill_tokens_total', 1);
+    const psec = rate(m, previous.m, 'ninfer_prefill_seconds_total', 1);
+    // psec can advance for partial progress before ptok does, so test ptok first.
+    if (ptok !== null && psec !== null && ptok > 0 && psec > 0) prefill = ptok / psec;
+    else if (ptok === 0 && m.get('ninfer_requests_prefilling') > 0) prefill = lastPrefill;
+    else if (ptok !== null) prefill = 0;
+    lastPrefill = prefill;
     const drafted = rate(m, previous.m, 'ninfer_spec_decode_draft_tokens_total', dt);
     const accepted = rate(m, previous.m, 'ninfer_spec_decode_accepted_tokens_total', dt);
     if (drafted > 0 && accepted !== null) accept = 100 * accepted / drafted;
