@@ -632,7 +632,14 @@ def test_the_committed_hyper_connection_golden_matches_the_reference():
     check(np.allclose(hcr.hc_pre(x, pre), np.array(golden["collapsed"], np.float32), atol=1e-6), "golden collapse differs")
     check(np.allclose(hcr.hc_post(np.array(golden["sublayer"], np.float32), x, post, comb),
                       np.array(golden["expanded"], np.float32), atol=1e-6), "golden expansion differs")
-    check(golden == hcr._golden(), "the committed golden is not what --emit-golden produces; regenerate it")
+    fresh = hcr._golden()
+    same_shape = golden.keys() == fresh.keys() and all(
+        golden[k] == fresh[k] for k in ("hc", "d", "n", "sinkhorn_iters", "eps", "norm_eps")
+    )
+    close = all(np.allclose(np.array(golden[k], np.float32), np.array(fresh[k], np.float32), atol=1e-6)
+                for k in ("x", "hc_fn", "hc_scale", "hc_base", "pre", "post", "comb", "collapsed", "sublayer", "expanded"))
+    # Not exact equality: the matmul and exp of another BLAS or CPU differ in the last float32 bits.
+    check(same_shape and close, "the committed golden is not what --emit-golden produces; regenerate it")
 
 
 if __name__ == "__main__":
