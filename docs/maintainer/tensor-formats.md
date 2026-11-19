@@ -76,10 +76,20 @@ formats (Section 3.6):
 | `ggml_rec_iq3_s_q2_0` | `ggml_iq3_s` | `ggml_q2_0` |
 | `ggml_rec_iq3_s_iq4_nl` | `ggml_iq3_s` | `ggml_iq4_nl` |
 | `ggml_rec_iq4_xs_iq4_nl` | `ggml_iq4_xs` | `ggml_iq4_nl` |
+| `ggml_rec_iq1_m_iq1_m` | `ggml_iq1_m` | `ggml_iq1_m` |
+| `ggml_rec_iq2_xxs_iq1_m` | `ggml_iq2_xxs` | `ggml_iq1_m` |
+| `ggml_rec_iq2_xxs_iq2_xxs` | `ggml_iq2_xxs` | `ggml_iq2_xxs` |
+| `ggml_rec_iq2_xs_iq1_m` | `ggml_iq2_xs` | `ggml_iq1_m` |
+| `ggml_rec_iq2_xxs_iq2_xs` | `ggml_iq2_xxs` | `ggml_iq2_xs` |
+| `ggml_rec_iq1_m_iq2_xxs` | `ggml_iq1_m` | `ggml_iq2_xxs` |
+| `ggml_rec_iq2_xs_iq2_xxs` | `ggml_iq2_xs` | `ggml_iq2_xxs` |
+| `ggml_rec_iq2_xs_iq2_xs` | `ggml_iq2_xs` | `ggml_iq2_xs` |
 
 `ggml_rec_q2_0_q2_0` holds the Qwen3.8-Flash-Next MTP drafter's experts (Strata's
 `mtp-q2_0.gguf`, whose fused `gate_up_proj` the converter splits into each record's gate and up
-rows).
+rows). The last eight pairs are the ones ISTA-DASLab's GSQ-RCO V4.1-Flash IQ2_XXS build picks per layer;
+their down rows are K-quant blocks, so the intermediate size must be a multiple of 256 (V4.1-Flash's is 2,304).
+The expert kernels do not run them yet.
 
 The C++ registry accepts the GGML block and expert record formats and materializes them to Device,
 Host or Pinned memory unchanged. Linear and LinearAdd consume `ggml_iq4_xs`, `ggml_iq3_s`, `ggml_q6_k`,
