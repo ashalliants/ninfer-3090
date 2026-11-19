@@ -215,7 +215,8 @@ def main() -> None:
         if not args.model_dir:
             parser.error("--emit-moe needs --model-dir")
         outputs = run_moe(args.model_dir)
-        args.emit_moe.write_text(json.dumps({"seed": moe_ref.GOLDEN_SEED, "outputs": [o.tolist() for o in outputs]}) + "\n")
+        args.emit_moe.write_text(json.dumps({"model_repo": REPO, "revision": revision_of(args.model_dir), "seed": moe_ref.GOLDEN_SEED,
+                                             "outputs": [o.tolist() for o in outputs]}) + "\n")
         print(f"wrote {args.emit_moe} ({len(outputs)} layers)")
 
 

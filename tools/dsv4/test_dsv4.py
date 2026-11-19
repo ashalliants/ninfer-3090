@@ -869,6 +869,7 @@ def test_moe_matches_the_model_repos_own_code():
     one layer with swiglu clamps, top-2 and a route scale; one without clamps, top-3 and no normalisation."""
     golden = json.loads((Path(HERE).parent.parent / "tests" / "fixtures" / "dsv4" / "moe_golden.json").read_text())
     check(golden["seed"] == moe_ref.GOLDEN_SEED, "the golden is for another seed")
+    check(golden["model_repo"] == mg.REPO and len(golden["revision"]) == 40, "the golden must record the model repo commit")
     for layer, (want, got) in enumerate(zip(golden["outputs"], moe_ref.run_golden())):
         want = np.array(want, np.float32)
         check(np.allclose(want, got, rtol=2e-6, atol=2e-6 * float(np.abs(want).max())), f"moe layer {layer} differs from the model repo's output")
