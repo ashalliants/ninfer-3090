@@ -34,6 +34,53 @@ NGRAM, ENGRAM_HEADS, ENGRAM_ROW = 3, 2, 32
 HEAD_VOCAB = [101, 103, 107, 109]  # one Engram layer x 2 heads x (3 - 1) orders
 ENGRAM_ROWS = sum(HEAD_VOCAB)
 
+# A tiny tokenizer shaped like the real one: the first control tokens (BOS, EOS, pad) are in the vocabulary AND the
+# added tokens; further added tokens follow the 12-token base vocabulary. Tokens are byte-level strings.
+TOKENS = ["<bos>", "<eos>", "<pad>", "a", "b", "c", "d", "e", "f", "g", "h", "ab", "<tool>", "<end>", "<think>", "<x>"]
+TOKEN_TYPES = [3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 4, 3, 3, 3]
+BASE_VOCAB = 12
+MERGES = ["a b"]
+CHAT_TEMPLATE = "{{ messages }}"
+assert len(TOKENS) == VOCAB == len(TOKEN_TYPES)
+
+# What tokenizer.json's pre_tokenizer must be (tools.convert.dsv4_tokenizer.PIPELINE), spelled out here so the
+# fixture does not import the code it tests.
+_REGEX = (
+    "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+"
+    "| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"
+)
+PRE_TOKENIZER = {
+    "type": "Sequence",
+    "pretokenizers": [
+        {"type": "Split", "pattern": {"Regex": "\\p{N}{1,3}"}, "behavior": "Isolated", "invert": False},
+        {"type": "Split", "pattern": {"Regex": "[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+"}, "behavior": "Isolated", "invert": False},
+        {"type": "Split", "pattern": {"Regex": _REGEX}, "behavior": "Isolated", "invert": False},
+        {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": True, "use_regex": False},
+    ],
+}
+
+
+def official_tokenizer(**changes) -> dict:
+    """The checkpoint's tokenizer.json for the tiny tokenizer: BOS/EOS/pad in the vocabulary and the added tokens,
+    <tool> an ordinary (not special) added token flagged normalized as 47 of the real file's are."""
+    def added(index, **flags):
+        return {"id": index, "content": TOKENS[index], "single_word": False, "lstrip": False, "rstrip": False,
+                "normalized": False, "special": True, **flags}
+
+    tokenizer = {
+        "version": "1.0", "truncation": None, "padding": None,
+        "added_tokens": [added(0), added(1), added(2), added(12, special=False, normalized=True), added(13), added(14), added(15)],
+        "normalizer": {"type": "Sequence", "normalizers": []},
+        "pre_tokenizer": PRE_TOKENIZER,
+        "post_processor": {"type": "ByteLevel", "add_prefix_space": True, "trim_offsets": False, "use_regex": True},
+        "decoder": {"type": "ByteLevel", "add_prefix_space": True, "trim_offsets": True, "use_regex": True},
+        "model": {"type": "BPE", "dropout": None, "unk_token": None, "continuing_subword_prefix": "", "end_of_word_suffix": "",
+                  "fuse_unk": False, "byte_fallback": False, "ignore_merges": False,
+                  "vocab": {TOKENS[i]: i for i in range(BASE_VOCAB)}, "merges": list(MERGES)},
+    }
+    tokenizer.update(changes)
+    return tokenizer
+
 
 def _value(value):
     if isinstance(value, bool):
@@ -44,6 +91,8 @@ def _value(value):
         return 6, value
     if isinstance(value, str):
         return 8, value
+    if value and all(isinstance(v, str) for v in value):
+        return 9, (8, value)
     return 9, ((6, value) if any(isinstance(v, float) for v in value) else (4, value))
 
 
@@ -96,6 +145,16 @@ def metadata(**changes) -> list[tuple[str, int, object]]:
         a + "embedding_length_per_layer_input": ENGRAM_ROW,
         a + "ple.head_vocab_sizes": HEAD_VOCAB,
         a + "engram.pad_token_id": 2,
+        "tokenizer.ggml.model": "gpt2",
+        "tokenizer.ggml.pre": "joyai-llm",
+        "tokenizer.ggml.tokens": TOKENS,
+        "tokenizer.ggml.token_type": TOKEN_TYPES,
+        "tokenizer.ggml.merges": MERGES,
+        "tokenizer.ggml.bos_token_id": 0,
+        "tokenizer.ggml.eos_token_id": 1,
+        "tokenizer.ggml.padding_token_id": 2,
+        "tokenizer.ggml.add_bos_token": False,
+        "tokenizer.chat_template": CHAT_TEMPLATE,
     }
     items.update({a + k.replace("__", "."): v for k, v in changes.items()})
     return [(key, *_value(value)) for key, value in items.items() if value is not None]

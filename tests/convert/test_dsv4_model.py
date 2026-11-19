@@ -31,8 +31,15 @@ def gguf_path(tmp_path):
     return fixture.write(tmp_path / "tiny.gguf")
 
 
+def tokenizer_file(directory: Path) -> Path:
+    """The tiny checkpoint's tokenizer.json, as `--resource tokenizer.json=PATH` takes it."""
+    path = directory / "tokenizer.json"
+    path.write_text(json.dumps(fixture.official_tokenizer(), ensure_ascii=False))
+    return path
+
+
 def _convert(gguf, out):
-    model = dsv4_model.build_model(gguf)
+    model = dsv4_model.build_model(gguf, resource_overrides={"tokenizer.json": tokenizer_file(Path(out).parent)})
     recipe = Recipe(model)
     RECIPES["dsv4_gguf"](model, recipe, {"base": gguf})
     return model, convert(model, recipe, out, device="cpu")
@@ -168,7 +175,8 @@ def test_the_public_cli_converts_a_deepseek41_gguf(gguf_path, tmp_path):
     from tools.convert.__main__ import main
 
     out = tmp_path / "cli.ninfer"
-    main(["--model", str(gguf_path), "--recipe", "dsv4_gguf", "--device", "cpu", "--out", str(out)])
+    main(["--model", str(gguf_path), "--recipe", "dsv4_gguf", "--device", "cpu", "--out", str(out),
+          "--resource", f"tokenizer.json={tokenizer_file(tmp_path)}"])
     assert out.exists() and not (tmp_path / "cli.ninfer.ngram").exists()  # no n-gram volume
     report = json.loads((tmp_path / "cli.ninfer.conversion.json").read_text())
     assert report["provenance"]["recipe"] == "dsv4_gguf"
@@ -184,8 +192,11 @@ def test_the_cli_refuses_options_a_deepseek41_gguf_cannot_take(gguf_path, tmp_pa
     for extra in (["--subset", "dev"], ["--ngram-out", str(tmp_path / "v")], ["--mtp-gguf", str(gguf_path)]):
         with pytest.raises(ValueError, match="takes none of"):
             main([*base, *extra, "--out", str(tmp_path / "x.ninfer")])
+    with pytest.raises(ValueError, match="needs the checkpoint's tokenizer"):
+        main([*base, "--out", str(tmp_path / "x.ninfer")])
     assert not (tmp_path / "x.ninfer").exists()
     # Another model's official recipe is refused for this GGUF, before anything is written.
     with pytest.raises(ValueError, match="requires the qwen4exp GGUF model"):
-        main(["--model", str(gguf_path), "--recipe", "qwen4_exp_gguf", "--device", "cpu", "--out", str(tmp_path / "y.ninfer")])
+        main(["--model", str(gguf_path), "--recipe", "qwen4_exp_gguf", "--device", "cpu", "--out", str(tmp_path / "y.ninfer"),
+              "--resource", f"tokenizer.json={tokenizer_file(tmp_path)}"])
     assert not (tmp_path / "y.ninfer").exists()

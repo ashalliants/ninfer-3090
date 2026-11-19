@@ -30,7 +30,14 @@ constexpr std::int64_t kMaxTokenId = 1'000'000;
 constexpr std::string_view kQwenSplitPattern =
     R"qwen((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)qwen";
 
-void validate_pipeline(const Json& root, const Json& model) {
+// The DeepSeek-V4 pre-tokenizer, as tokenizer.json spells it (Hugging Face Split patterns, Oniguruma syntax).
+constexpr std::string_view kDsv4DigitsPattern = "\\p{N}{1,3}";
+constexpr std::string_view kDsv4CjkPattern    = "[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+";
+constexpr std::string_view kDsv4WordPattern =
+    "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| "
+    "?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
+
+Pipeline validate_pipeline(const Json& root, const Json& model) {
     const auto require = [](bool valid, const char* field) {
         if (!valid) {
             throw std::invalid_argument(std::string("tokenizer.json ") + field +
@@ -40,24 +47,45 @@ void validate_pipeline(const Json& root, const Json& model) {
     const auto type = [](const Json& value, const char* name) {
         return value.is_object() && value.contains("type") && value["type"] == name;
     };
+    const auto is_split = [&](const Json& split, std::string_view pattern) {
+        return type(split, "Split") && split.contains("pattern") && split["pattern"].is_object() &&
+               split["pattern"].value("Regex", std::string{}) == pattern &&
+               split.value("behavior", std::string{}) == "Isolated" &&
+               split.value("invert", Json(false)) == false;
+    };
+    const auto is_plain_byte_level = [&](const Json& bytes) {
+        return type(bytes, "ByteLevel") && bytes.value("add_prefix_space", Json(true)) == false &&
+               bytes.value("use_regex", Json(true)) == false;
+    };
     // Omitted pipeline descriptions use the architecture's fixed tokenizer semantics.
     // An explicit description must agree with the implemented transformations.
-    if (root.contains("normalizer")) { require(type(root["normalizer"], "NFC"), "normalizer"); }
-    if (root.contains("pre_tokenizer")) {
-        const auto& pre = root["pre_tokenizer"];
-        require(type(pre, "Sequence") && pre.contains("pretokenizers") &&
-                    pre["pretokenizers"].is_array() && pre["pretokenizers"].size() == 2,
+    Pipeline pipeline = Pipeline::Qwen;
+    if (root.contains("pre_tokenizer") && root["pre_tokenizer"].is_object() &&
+        root["pre_tokenizer"].contains("pretokenizers") &&
+        root["pre_tokenizer"]["pretokenizers"].is_array() &&
+        root["pre_tokenizer"]["pretokenizers"].size() == 4) {
+        const auto& stages = root["pre_tokenizer"]["pretokenizers"];
+        require(type(root["pre_tokenizer"], "Sequence") && is_split(stages[0], kDsv4DigitsPattern) &&
+                    is_split(stages[1], kDsv4CjkPattern) && is_split(stages[2], kDsv4WordPattern) &&
+                    is_plain_byte_level(stages[3]),
                 "pre_tokenizer");
-        const auto& split = pre["pretokenizers"][0];
-        const auto& bytes = pre["pretokenizers"][1];
-        require(type(split, "Split") && split.contains("pattern") && split["pattern"].is_object() &&
-                    split["pattern"].value("Regex", std::string{}) == kQwenSplitPattern &&
-                    split.value("behavior", std::string{}) == "Isolated" &&
-                    split.value("invert", Json(false)) == false,
-                "pre_tokenizer.Split");
-        require(type(bytes, "ByteLevel") && bytes.value("add_prefix_space", Json(true)) == false &&
-                    bytes.value("use_regex", Json(true)) == false,
-                "pre_tokenizer.ByteLevel");
+        // No normalizer: text reaches the pre-tokenizer unchanged (an empty Sequence or null is the same).
+        const bool no_normalizer =
+            !root.contains("normalizer") || root["normalizer"].is_null() ||
+            (type(root["normalizer"], "Sequence") && root["normalizer"].contains("normalizers") &&
+             root["normalizer"]["normalizers"].is_array() && root["normalizer"]["normalizers"].empty());
+        require(no_normalizer, "normalizer");
+        pipeline = Pipeline::Dsv4;
+    } else {
+        if (root.contains("normalizer")) { require(type(root["normalizer"], "NFC"), "normalizer"); }
+        if (root.contains("pre_tokenizer")) {
+            const auto& pre = root["pre_tokenizer"];
+            require(type(pre, "Sequence") && pre.contains("pretokenizers") &&
+                        pre["pretokenizers"].is_array() && pre["pretokenizers"].size() == 2,
+                    "pre_tokenizer");
+            require(is_split(pre["pretokenizers"][0], kQwenSplitPattern), "pre_tokenizer.Split");
+            require(is_plain_byte_level(pre["pretokenizers"][1]), "pre_tokenizer.ByteLevel");
+        }
     }
     if (root.contains("decoder")) { require(type(root["decoder"], "ByteLevel"), "decoder"); }
     if (root.contains("post_processor") && !root["post_processor"].is_null()) {
@@ -70,6 +98,7 @@ void validate_pipeline(const Json& root, const Json& model) {
         require(!model.contains(field) || model[field].is_null() || model[field] == "", field);
     }
     require(model.value("ignore_merges", Json(false)) == false, "model.ignore_merges");
+    return pipeline;
 }
 
 struct VocabMetadata {
@@ -219,12 +248,15 @@ AddedToken parse_added_token_decoder_entry(int id, const Json& item, std::string
     return token;
 }
 
-void validate_supported_added_token(const AddedToken& token, std::string_view label) {
+// `normalized` asks for the normalizer to run over the token before matching; a pipeline without one (Dsv4)
+// makes it irrelevant, so it is accepted there.
+void validate_supported_added_token(const AddedToken& token, std::string_view label, Pipeline pipeline) {
     if (token.content.empty()) {
         throw std::invalid_argument("added token content must not be empty in " +
                                     std::string(label));
     }
-    if (token.single_word || token.lstrip || token.rstrip || token.normalized) {
+    if (token.single_word || token.lstrip || token.rstrip ||
+        (token.normalized && pipeline != Pipeline::Dsv4)) {
         throw std::invalid_argument("Tokenizer only supports added tokens with single_word=false, "
                                     "lstrip=false, rstrip=false, and normalized=false in " +
                                     std::string(label));
@@ -251,7 +283,7 @@ int parse_added_token_decoder_id(std::string_view key, std::string_view label) {
 std::vector<AddedToken>
 load_added_tokens(const Json& root, std::string_view label, std::vector<std::string>& id_to_token,
                   const std::unordered_set<int>& occupied_vocab_ids,
-                  const std::unordered_map<std::string, int>& occupied_vocab_tokens) {
+                  const std::unordered_map<std::string, int>& occupied_vocab_tokens, Pipeline pipeline) {
     const Json& added = require_array_field(root, "added_tokens", label);
     std::vector<AddedToken> tokens;
     tokens.reserve(added.size());
@@ -259,9 +291,14 @@ load_added_tokens(const Json& root, std::string_view label, std::vector<std::str
     std::unordered_map<std::string, int> seen_added_contents;
     for (const Json& item : added) {
         AddedToken token = parse_added_token(item, label);
-        validate_supported_added_token(token, label);
+        validate_supported_added_token(token, label, pipeline);
         const auto index = static_cast<std::size_t>(token.id);
-        if (occupied_vocab_ids.contains(token.id)) {
+        // DeepSeek-V4's tokenizer.json lists its first control tokens (BOS, EOS, pad) in the vocabulary too,
+        // with the same id and content: that is the same token twice, not a clash.
+        const auto in_vocab = occupied_vocab_tokens.find(token.content);
+        const bool same_as_vocab_entry = pipeline == Pipeline::Dsv4 && in_vocab != occupied_vocab_tokens.end() &&
+                                         in_vocab->second == token.id;
+        if (occupied_vocab_ids.contains(token.id) && !same_as_vocab_entry) {
             throw std::invalid_argument("field added_tokens overlaps existing id in " +
                                         std::string(label));
         }
@@ -269,7 +306,7 @@ load_added_tokens(const Json& root, std::string_view label, std::vector<std::str
             throw std::invalid_argument("field added_tokens has duplicate id in " +
                                         std::string(label));
         }
-        if (occupied_vocab_tokens.contains(token.content) ||
+        if ((occupied_vocab_tokens.contains(token.content) && !same_as_vocab_entry) ||
             !seen_added_contents.emplace(token.content, token.id).second) {
             throw std::invalid_argument("field added_tokens has duplicate content mapping in " +
                                         std::string(label));
@@ -285,7 +322,7 @@ void merge_added_tokens_decoder(const Json& root, std::string_view label,
                                 std::vector<std::string>& id_to_token,
                                 const std::unordered_set<int>& occupied_vocab_ids,
                                 const std::unordered_map<std::string, int>& occupied_vocab_tokens,
-                                std::vector<AddedToken>& tokens) {
+                                std::vector<AddedToken>& tokens, Pipeline pipeline) {
     const Json& decoder = require_object_field(root, "added_tokens_decoder", label);
     std::unordered_map<int, std::size_t> token_by_id;
     std::unordered_map<std::string, int> token_by_content;
@@ -304,7 +341,7 @@ void merge_added_tokens_decoder(const Json& root, std::string_view label,
                                         std::string(label));
         }
         AddedToken token = parse_added_token_decoder_entry(id, item.value(), label);
-        validate_supported_added_token(token, label);
+        validate_supported_added_token(token, label, pipeline);
 
         const auto existing_id = token_by_id.find(id);
         if (existing_id != token_by_id.end()) {
@@ -548,6 +585,152 @@ std::size_t qwen_word_end(std::string_view text, std::size_t begin) {
     return after_first;
 }
 
+// ---------------------------------------------------------------- DeepSeek-V4 pre-tokenizer
+//
+// tokenizer.json's three Splits (behaviour Isolated: every match and every gap between matches is a piece),
+// applied one after another to the pieces the previous one made:
+//   1. \p{N}{1,3}                       digits, in runs of up to three;
+//   2. [一-龥぀-ゟ゠-ヿ]+   runs of CJK ideographs and kana;
+//   3. the word regex, once per piece the first two leave (its end-of-text is the end of that piece).
+// `dsv4_word_end` returns where the piece starting at `begin` (always a piece start) ends.
+
+bool dsv4_is_cjk(std::int32_t cp) noexcept {
+    return (cp >= 0x4e00 && cp <= 0x9fa5) || (cp >= 0x3040 && cp <= 0x309f) || (cp >= 0x30a0 && cp <= 0x30ff);
+}
+
+// Oniguruma's \s over UTF-8: Unicode White_Space.
+bool dsv4_is_space(std::int32_t cp) noexcept { return uni::is_whitespace(cp) || cp == 0x85; }
+
+bool dsv4_is_ascii_punct(std::int32_t cp) noexcept {
+    constexpr std::string_view set = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+    return cp > 0 && cp < 0x80 && set.find(static_cast<char>(cp)) != std::string_view::npos;
+}
+
+bool dsv4_is_ascii_letter(std::int32_t cp) noexcept { return (cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z'); }
+
+bool dsv4_is_punct_or_symbol(std::int32_t cp) noexcept { return uni::is_punctuation(cp) || uni::is_symbol(cp); }
+
+// [^\r\n\p{L}\p{P}\p{S}]
+bool dsv4_is_prefix_char(std::int32_t cp) noexcept {
+    return !is_newline(cp) && !uni::is_letter(cp) && !dsv4_is_punct_or_symbol(cp);
+}
+
+// The word regex's alternatives tried at `at` in order, over text[0, limit): the end of the first that matches,
+// or npos when none does (the position then belongs to a gap).
+std::size_t dsv4_match_at(std::string_view text, std::size_t at, std::size_t limit) {
+    const auto codepoint = [&](std::size_t offset) { return qwen_codepoint_at(text, offset); };
+    const uni::CodepointSpan first = codepoint(at);
+    const std::size_t after_first  = at + first.length;
+    const bool has_next            = after_first < limit;
+    const std::int32_t next        = has_next ? codepoint(after_first).value : 0;
+    const std::int32_t cp          = first.value;
+    const auto run_end = [&](std::size_t from, auto&& in_class) {
+        std::size_t end = from;
+        while (end < limit) {
+            const uni::CodepointSpan value = codepoint(end);
+            if (!in_class(value.value)) { break; }
+            end += value.length;
+        }
+        return end;
+    };
+
+    // 1. [ASCII punctuation][A-Za-z]+
+    if (dsv4_is_ascii_punct(cp) && has_next && dsv4_is_ascii_letter(next)) {
+        return run_end(after_first, dsv4_is_ascii_letter);
+    }
+    // 2. [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
+    if (dsv4_is_prefix_char(cp) && has_next && is_letter_or_mark(next)) {
+        return run_end(after_first, is_letter_or_mark);
+    }
+    if (is_letter_or_mark(cp)) { return run_end(at, is_letter_or_mark); }
+    // 3.  ?[\p{P}\p{S}]+[\r\n]*
+    {
+        std::size_t from = at;
+        if (cp == ' ' && has_next && dsv4_is_punct_or_symbol(next)) {
+            from = after_first;
+        } else if (!dsv4_is_punct_or_symbol(cp)) {
+            from = std::string_view::npos;
+        }
+        if (from != std::string_view::npos) {
+            return run_end(run_end(from, dsv4_is_punct_or_symbol), is_newline);
+        }
+    }
+    if (!dsv4_is_space(cp)) { return std::string_view::npos; }
+    // 4-6. whitespace: \s*[\r\n]+ | \s+(?!\S) | \s+
+    std::size_t end              = at;
+    std::size_t last_begin       = at;
+    std::size_t last_newline_end = std::string_view::npos;
+    std::size_t count            = 0;
+    while (end < limit) {
+        const uni::CodepointSpan value = codepoint(end);
+        if (!dsv4_is_space(value.value)) { break; }
+        last_begin = end;
+        end += value.length;
+        ++count;
+        if (is_newline(value.value)) { last_newline_end = end; }
+    }
+    if (last_newline_end != std::string_view::npos) { return last_newline_end; }
+    if (end == limit) { return end; }
+    return count >= 2 ? last_begin : end;
+}
+
+// `limit` is the end of the stage 1/2 piece the previous call was inside (0 at the start): a word that ends before
+// it starts inside the same piece, so the piece's end is found once per piece, not once per word (a long run of
+// ordinary text would otherwise be rescanned to its end for every word: quadratic in the prompt).
+std::size_t dsv4_word_end(std::string_view text, std::size_t begin, std::size_t& limit) {
+    if (begin >= limit) {
+        const uni::CodepointSpan first = qwen_codepoint_at(text, begin);
+        const std::int32_t cp          = first.value;
+        if (uni::is_number(cp)) {  // stage 1: up to three digits, and nothing else matches a digit piece
+            std::size_t end = begin;
+            for (int count = 0; count < 3 && end < text.size(); ++count) {
+                const uni::CodepointSpan value = qwen_codepoint_at(text, end);
+                if (!uni::is_number(value.value)) { break; }
+                end += value.length;
+            }
+            limit = end;
+            return end;
+        }
+        // The piece stages 1 and 2 leave from `begin`: a CJK run, or the text up to the next digit or CJK char.
+        const bool cjk = dsv4_is_cjk(cp);
+        limit          = begin;
+        while (limit < text.size()) {
+            const uni::CodepointSpan value = qwen_codepoint_at(text, limit);
+            if (cjk ? !dsv4_is_cjk(value.value) : (uni::is_number(value.value) || dsv4_is_cjk(value.value))) { break; }
+            limit += value.length;
+        }
+    }
+    // Stage 3 within [begin, limit): a match starting here is the word; otherwise the gap up to the next match.
+    std::size_t at = begin;
+    while (at < limit) {
+        const std::size_t matched = dsv4_match_at(text, at, limit);
+        if (matched != std::string_view::npos) { return at == begin ? matched : at; }
+        at += qwen_codepoint_at(text, at).length;
+    }
+    return limit;
+}
+
+// Walks a text word by word. Stateful for DeepSeek-V4 (the stage 1/2 piece end, see dsv4_word_end); Qwen's
+// splitter looks at one word at a time.
+class WordCursor {
+public:
+    WordCursor(Pipeline pipeline, std::string_view text) : pipeline_(pipeline), text_(text) {}
+    // The end of the word starting at `begin`; words must be asked for in order, each starting where the last ended.
+    std::size_t next(std::size_t begin) {
+        return pipeline_ == Pipeline::Dsv4 ? dsv4_word_end(text_, begin, limit_) : qwen_word_end(text_, begin);
+    }
+
+private:
+    Pipeline pipeline_;
+    std::string_view text_;
+    std::size_t limit_ = 0;
+};
+
+// NFC for Qwen; DeepSeek-V4 has no normalizer, so its text passes through unchanged.
+std::string normalize_text(Pipeline pipeline, std::string_view text) {
+    return pipeline == Pipeline::Dsv4 ? std::string(text) : uni::normalize_nfc(text);
+}
+
 bool is_stop_token_id(std::span<const int> stop_token_ids, int id) {
     return std::find(stop_token_ids.begin(), stop_token_ids.end(), id) != stop_token_ids.end();
 }
@@ -599,7 +782,7 @@ std::array<int, 256> load_byte_token_ids(const std::unordered_map<std::string, i
     return ids;
 }
 
-bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalized,
+bool append_normalized_bpe_ids(Pipeline pipeline, std::vector<int>& ids, std::string_view normalized,
                                const BpeMergeTable& merge_rules,
                                const std::array<int, 256>& byte_token_ids, std::size_t max_tokens,
                                BpeScratch& scratch, std::vector<std::size_t>* token_ends = nullptr,
@@ -607,8 +790,9 @@ bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalize
     if (normalized.empty()) { return true; }
     if (ids.size() == max_tokens) { return false; }
 
+    WordCursor words(pipeline, normalized);
     for (std::size_t begin = 0; begin < normalized.size();) {
-        const std::size_t end = qwen_word_end(normalized, begin);
+        const std::size_t end = words.next(begin);
         const std::string_view word(normalized.data() + begin, end - begin);
         auto& nodes = scratch.nodes;
         nodes.clear();
@@ -696,7 +880,7 @@ struct IndexedByteBoundary {
     std::size_t index  = 0;
 };
 
-bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
+bool append_ordinary_text(Pipeline pipeline, BoundaryEncodedText& encoded, std::string_view text,
                           std::size_t text_offset, std::span<const IndexedByteBoundary> boundaries,
                           const BpeMergeTable& merge_rules,
                           const std::array<int, 256>& byte_token_ids, std::size_t max_tokens,
@@ -710,7 +894,7 @@ bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
         return true;
     }
 
-    const std::string normalized = uni::normalize_nfc(text);
+    const std::string normalized = normalize_text(pipeline, text);
     const bool has_internal_boundary =
         std::any_of(boundaries.begin(), boundaries.end(), [&](IndexedByteBoundary boundary) {
             const std::size_t local = boundary.offset - text_offset;
@@ -719,7 +903,7 @@ bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
     std::vector<std::size_t> token_ends;
     std::vector<BpeWordEnd> word_ends;
     if (has_internal_boundary) { token_ends.reserve(normalized.size()); }
-    if (!append_normalized_bpe_ids(encoded.input_ids, normalized, merge_rules, byte_token_ids,
+    if (!append_normalized_bpe_ids(pipeline, encoded.input_ids, normalized, merge_rules, byte_token_ids,
                                    max_tokens, scratch,
                                    has_internal_boundary ? &token_ends : nullptr,
                                    has_internal_boundary ? &word_ends : nullptr)) {
@@ -743,13 +927,13 @@ bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
         const std::size_t raw_end = boundaries[request].offset - text_offset;
         if (raw_end != raw_begin) {
             independently_normalized +=
-                uni::normalize_nfc(text.substr(raw_begin, raw_end - raw_begin));
+                normalize_text(pipeline, text.substr(raw_begin, raw_end - raw_begin));
             raw_begin = raw_end;
         }
         normalized_boundaries[request] = independently_normalized.size();
     }
     if (raw_begin != text.size()) {
-        independently_normalized += uni::normalize_nfc(text.substr(raw_begin));
+        independently_normalized += normalize_text(pipeline, text.substr(raw_begin));
     }
 
     if (independently_normalized != normalized) {
@@ -796,6 +980,16 @@ bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
 
 } // namespace
 
+std::vector<std::size_t> pre_tokenize_ends(Pipeline pipeline, std::string_view text) {
+    std::vector<std::size_t> ends;
+    WordCursor words(pipeline, text);
+    for (std::size_t begin = 0; begin < text.size();) {
+        begin = words.next(begin);
+        ends.push_back(begin);
+    }
+    return ends;
+}
+
 Tokenizer::Tokenizer(TokenizerResources resources) {
     if (resources.tokenizer_json.empty() || resources.tokenizer_config_json.empty() ||
         resources.generation_config_json.empty()) {
@@ -807,7 +1001,7 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     const Json tokenizer_config =
         read_json_asset(resources.tokenizer_config_json, tokenizer_config_label);
     const Json& model = require_object_field(root, "model", tokenizer_label);
-    validate_pipeline(root, model);
+    pipeline_ = validate_pipeline(root, model);
 
     VocabMetadata vocab_metadata = load_vocab(model, tokenizer_label);
     decoded_token_bytes_         = std::move(vocab_metadata.id_to_token);
@@ -817,9 +1011,9 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
         valid_token_ids_.at(static_cast<std::size_t>(id)) = true;
     }
     added_tokens_ = load_added_tokens(root, tokenizer_label, decoded_token_bytes_,
-                                      vocab_metadata.occupied_ids, vocab_token_to_id_);
+                                      vocab_metadata.occupied_ids, vocab_token_to_id_, pipeline_);
     merge_added_tokens_decoder(tokenizer_config, tokenizer_config_label, decoded_token_bytes_,
-                               vocab_metadata.occupied_ids, vocab_token_to_id_, added_tokens_);
+                               vocab_metadata.occupied_ids, vocab_token_to_id_, added_tokens_, pipeline_);
     for (std::size_t index = 0; index < added_tokens_.size(); ++index) {
         const std::string& content = added_tokens_[index].content;
         if (!content.empty()) {
@@ -888,7 +1082,7 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(
     const auto append_ordinary = [&](std::size_t begin, std::size_t end) {
         const std::size_t request_end = boundary_end_through(end);
         const bool complete =
-            append_ordinary_text(encoded, text.substr(begin, end - begin), begin,
+            append_ordinary_text(pipeline_, encoded, text.substr(begin, end - begin), begin,
                                  std::span<const IndexedByteBoundary>(boundaries)
                                      .subspan(boundary_cursor, request_end - boundary_cursor),
                                  bpe_merge_rules_, byte_token_ids_, options.max_tokens, scratch);
