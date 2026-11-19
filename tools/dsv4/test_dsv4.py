@@ -15,8 +15,10 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import attention as att  # noqa: E402
 import gguf_headers as gh  # noqa: E402
 import hyper_connection as hcr  # noqa: E402
+import model_golden as mg  # noqa: E402
 import gguf_sizes as gs  # noqa: E402
 import layout as lo  # noqa: E402
 import profile_to_curve as pc  # noqa: E402
@@ -640,6 +642,223 @@ def test_the_committed_hyper_connection_golden_matches_the_reference():
                 for k in ("x", "hc_fn", "hc_scale", "hc_base", "pre", "post", "comb", "collapsed", "sublayer", "expanded"))
     # Not exact equality: the matmul and exp of another BLAS or CPU differ in the last float32 bits.
     check(same_shape and close, "the committed golden is not what --emit-golden produces; regenerate it")
+
+
+def test_attention_stack_matches_the_model_repos_own_code():
+    """The golden is the model repo's Attention/Compressor/Indexer run on CPU (tools/dsv4/model_golden.py):
+    window-only layers, a gated ratio-2 compressor, ratio-1 layers, kv and index sources, a candidate source
+    with two later layers searching inside its blocks, YaRN active."""
+    golden = json.loads((Path(HERE).parent.parent / "tests" / "fixtures" / "dsv4" / "attention_golden.json").read_text())
+    check(golden["seed"] == att.STACK_SEED and golden["seq"] == att.STACK_SEQ, "the golden is for another seed or length")
+    check(golden["model_repo"] == mg.REPO and len(golden["revision"]) == 40 and set(golden["revision"]) <= set("0123456789abcdef"),
+          "the golden must record the commit of the model repo it was produced from")
+    mine = att.run_stack()
+    check(len(mine) == len(golden["outputs"]) == att.STACK_LAYERS, "layer count")
+    for layer, (want, got) in enumerate(zip(golden["outputs"], mine)):
+        err = float(np.abs(np.array(want, np.float32) - got).max())
+        check(err < 5e-6, f"layer {layer} differs from the model repo's output by {err}")
+
+
+def test_attention_is_causal_row_by_row():
+    """Row i of a longer sequence equals the last row of its length-(i+1) prefix: decode is this function
+    applied to the prefix. It includes the compressor's groups, the indexer's reachability and the candidate blocks."""
+    full = att.run_stack()
+    for n in (1, 2, 3, 5, 8, 10):
+        prefix = att.run_stack(tokens=n)
+        for layer, (a, b) in enumerate(zip(prefix, full)):
+            check(np.allclose(a, b[:n], atol=2e-6), f"layer {layer}: a {n}-token prefix differs from the first {n} rows of the full run")
+
+
+def test_rope_is_a_rotation_and_yarn_only_slows_the_low_frequencies():
+    import math
+
+    f = att.rope_freqs(8, 6, 0, 10000.0, 4.0, 32, 1)
+    check(np.allclose(f[0], 1.0) and np.allclose(np.abs(f), 1.0, atol=1e-6), "position 0 is the identity and every rotation has modulus 1")
+    x = np.random.default_rng(0).standard_normal((6, 8)).astype(np.float32)
+    r = att.apply_rope(x, f)
+    check(np.allclose(np.linalg.norm(r, axis=-1), np.linalg.norm(x, axis=-1), atol=1e-5), "a rotation preserves the norm")
+    check(np.allclose(att.apply_rope(r, f, inverse=True), x, atol=1e-5), "the inverse undoes the rotation")
+    # adjacent pairs: position 1, pair 0 rotates by angle 1 (theta^0), which is cos/sin on elements 0 and 1
+    check(np.allclose(r[1, :2], [x[1, 0] * math.cos(1) - x[1, 1] * math.sin(1), x[1, 0] * math.sin(1) + x[1, 1] * math.cos(1)], atol=1e-5), "pair order")
+    # YaRN for dim 8, base 10000, a context of 8 turns and factor 4: low = 0, high = 1, so the ramp is
+    # [0, 1, 1, 1]: the first (fastest) dimension keeps its frequency, the other three are divided by 4.
+    y = att.rope_freqs(8, 6, 8, 10000.0, 4.0, 32, 1)
+    check(np.allclose(np.angle(y[1])[0], np.angle(f[1])[0], atol=1e-5), "the fastest dimension is unchanged by YaRN")
+    check(np.allclose(np.angle(y[1])[1:], np.angle(f[1])[1:] / 4, atol=1e-5), "the slower dimensions are divided by the factor")
+
+
+def test_sparse_attention_matches_a_dense_formulation():
+    rng = np.random.default_rng(8)
+    s, h, d, n = 4, 3, 5, 6
+    q = rng.standard_normal((s, h, d)).astype(np.float32)
+    kv = rng.standard_normal((n, d)).astype(np.float32)
+    sink = rng.standard_normal(h).astype(np.float32)
+    idxs = np.array([[0, 2, 5, -1], [1, 3, -1, -1], [-1, -1, -1, -1], [4, 0, 1, 2]])
+    out = att.sparse_attention(q, kv, sink, idxs, 0.4)
+    for i in range(s):
+        rows = [j for j in idxs[i] if j >= 0]
+        if not rows:
+            check(not out[i].any(), "a query with no valid row gets zeros")
+            continue
+        for hh in range(h):
+            logits = np.append((kv[rows] @ q[i, hh]) * 0.4, sink[hh])  # the sink is one more logit with no value
+            p = np.exp(logits - logits.max())
+            p /= p.sum()
+            check(np.allclose(out[i, hh], p[:-1] @ kv[rows], atol=1e-5), f"query {i} head {hh} differs from softmax over rows + sink")
+    big = att.sparse_attention(q, kv, np.full(h, 60.0, np.float32), idxs, 0.4)
+    check(np.abs(big).max() < 1e-6, "a huge sink absorbs the attention: the output tends to zero")
+
+
+def test_window_attention_equals_dense_sliding_window_attention():
+    """A window-only layer, written out with explicit loops from the pieces (RoPE, shared kv, grouped output)."""
+    cfgs, weights, inputs = att.stack_inputs()
+    cfg, w, x = cfgs[0], weights[0], inputs[0]
+    got = att.attention(x, w, cfg, att.Shared())
+    s, h, hd, rd = x.shape[0], cfg.n_heads, cfg.head_dim, cfg.rope_dim
+    freqs = att.rope_freqs(rd, s, 0, cfg.rope_theta, cfg.rope_factor, cfg.beta_fast, cfg.beta_slow)
+    qr = att.rms_norm(x @ w.wq_a.T, w.q_norm, cfg.norm_eps)
+    q = att._rope_tail((qr @ w.wq_b.T).reshape(s, h, hd), freqs, rd)
+    kv = att._rope_tail(att.rms_norm(x @ w.wkv.T, w.kv_norm, cfg.norm_eps), freqs, rd)
+    o = np.zeros((s, h, hd), np.float32)
+    for i in range(s):
+        lo = max(0, i - cfg.window + 1)
+        for hh in range(h):
+            logits = np.append((kv[lo : i + 1] @ q[i, hh]) * hd ** -0.5, w.attn_sink[hh])
+            p = np.exp(logits - logits.max())
+            p /= p.sum()
+            o[i, hh] = p[:-1] @ kv[lo : i + 1]
+    o = att._rope_tail(o, freqs, rd, inverse=True)
+    g = cfg.o_groups
+    group_out = [o[:, k * (h // g) : (k + 1) * (h // g)].reshape(s, -1) @ w.wo_a.reshape(g, cfg.o_lora_rank, -1)[k].T for k in range(g)]
+    want = np.concatenate(group_out, axis=1) @ w.wo_b.T
+    check(np.allclose(got, want, atol=2e-5), "the window-only layer differs from the loop formulation")
+
+
+def test_compressor_pools_complete_groups_with_a_per_channel_softmax():
+    cfgs, weights, inputs = att.stack_inputs()
+    cfg, w, x = cfgs[2], weights[2], inputs[2]  # ratio 2, with a gate
+    latent = att.compressor(x, w, cfg)
+    check(latent.shape == (5, cfg.head_dim), "11 tokens at ratio 2 give 5 groups; the trailing token is dropped")
+    kv, gate = x @ w.comp_wkv.T, x @ w.comp_wgate.T
+    for g in range(5):
+        a, b = 2 * g, 2 * g + 1
+        e = np.exp(np.stack([gate[a], gate[b]]) - np.maximum(gate[a], gate[b]))
+        pooled = (kv[a] * e[0] + kv[b] * e[1]) / (e[0] + e[1])  # softmax over the two tokens, per channel
+        check(np.allclose(latent[g], att.rms_norm(pooled, w.comp_norm, cfg.norm_eps), atol=1e-5), f"group {g}")
+    check(att.compressor(x[:1], w, cfg) is None, "fewer tokens than the ratio give no latent")
+    one = cfgs[4]  # ratio 1: a plain projection and norm, one latent per token
+    check(np.allclose(att.compressor(inputs[4], weights[4], one), att.rms_norm(inputs[4] @ weights[4].comp_wkv.T, weights[4].comp_norm, one.norm_eps), atol=1e-6), "ratio 1 is a projection")
+
+
+def test_indexer_selection_is_reachable_ordered_and_padded():
+    cfgs, weights, inputs = att.stack_inputs()
+    shared = att.Shared()
+    for i in range(3):
+        att.attention(inputs[i], weights[i], cfgs[i], shared)
+    idxs, s, ratio, offset = shared.topk_idxs, att.STACK_SEQ, 2, att.STACK_SEQ
+    check(idxs.shape == (s, 3), "index_topk columns")
+    for i in range(s):
+        row = idxs[i][idxs[i] >= 0]
+        check((np.diff(row) > 0).all(), "selected positions are in increasing order")
+        check(((row - offset) < (i + 1) // ratio).all(), f"query {i} selects a group that is not complete yet")
+        check(len(row) == min(3, (i + 1) // ratio), f"query {i} selects min(top-k, reachable groups) positions")
+        check((idxs[i][len(row):] == -1).all(), "unreachable slots are -1, after the real ones")
+    # The candidate source keeps whole blocks: a later layer's selection stays inside them.
+    for i in range(3, 5):
+        att.attention(inputs[i], weights[i], cfgs[i], shared)
+    cand = shared.candidates
+    check(cand.shape == (s, s) and cand.dtype == bool, "candidate mask is [queries, groups]")
+    for i in range(s):
+        blocks = {j // 2 for j in np.flatnonzero(cand[i])}
+        check(len(blocks) <= 2 and (i // 2) in blocks, "at most topk_blocks blocks, and the one holding the newest position")
+    att.attention(inputs[5], weights[5], cfgs[5], shared)
+    row = shared.topk_idxs
+    for i in range(s):
+        for j in row[i][row[i] >= 0] - s:
+            check(cand[i, j], f"layer 5 query {i} selected group {j} outside the candidate blocks")
+
+
+def test_model_golden_fetch_pins_one_commit_and_is_all_or_nothing():
+    import io
+    import tempfile
+    from unittest import mock
+
+    sha = "ab" * 20
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    urls = []
+
+    def urlopen(url, timeout=0):
+        urls.append(url)
+        if url.endswith("/api/models/" + mg.REPO):
+            return Response(json.dumps({"sha": sha}).encode())
+        return Response(b"# " + url.encode())
+
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "inference"
+        with mock.patch.object(mg.urllib.request, "urlopen", side_effect=urlopen):
+            check(mg.fetch(target) == sha, "fetch returns the commit")
+        files = sorted(f.name for f in target.iterdir())
+        check(files == sorted([*mg.FILES, mg.REVISION_FILE]), f"fetch writes every file and the revision: {files}")
+        check("engram.py" in mg.FILES, "engram.py is imported by --emit-engram and --emit-model, so it must be fetched")
+        check(all(f"/resolve/{sha}/inference/" in u for u in urls if "/resolve/" in u), "every file is fetched at the pinned commit, not main")
+        check(mg.revision_of(target) == sha, "the directory records its commit")
+        try:
+            mg.fetch(target)
+        except SystemExit:
+            pass
+        else:
+            check(False, "fetching into a non-empty directory must be refused")
+        # A fetch that fails part-way leaves nothing behind: no mixed revision, no staging directory.
+        other = Path(d) / "other"
+        calls = {"n": 0}
+
+        def flaky(url, timeout=0):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise OSError("network down")
+            return urlopen(url, timeout)
+
+        with mock.patch.object(mg.urllib.request, "urlopen", side_effect=flaky):
+            try:
+                mg.fetch(other)
+            except OSError:
+                pass
+            else:
+                check(False, "a failed fetch must raise")
+        check(not other.exists() or not any(other.iterdir()), "a failed fetch leaves no files in the target")
+        check(not list(Path(d).glob("*.staging-*")), "a failed fetch removes its staging directory")
+        # A failure at the publishing step (the rename) leaves no destination and no staging either.
+        third = Path(d) / "third"
+        with mock.patch.object(mg.urllib.request, "urlopen", side_effect=urlopen), mock.patch.object(
+            Path, "rename", side_effect=OSError("disk error")
+        ):
+            try:
+                mg.fetch(third)
+            except OSError:
+                pass
+            else:
+                check(False, "a failed publication must raise")
+        check(not third.exists(), "a failed publication leaves no destination directory")
+        check(not list(Path(d).glob("*.staging-*")), "a failed publication removes its staging directory")
+        # An empty existing directory is fine: it is replaced by the staged one.
+        empty = Path(d) / "empty"
+        empty.mkdir()
+        with mock.patch.object(mg.urllib.request, "urlopen", side_effect=urlopen):
+            mg.fetch(empty)
+        check(sorted(f.name for f in empty.iterdir()) == sorted([*mg.FILES, mg.REVISION_FILE]), "an empty target directory is filled whole")
+        try:
+            mg.revision_of(Path(d) / "nowhere")
+        except SystemExit:
+            pass
+        else:
+            check(False, "a directory without a recorded commit must be refused")
 
 
 if __name__ == "__main__":
