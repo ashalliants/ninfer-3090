@@ -346,10 +346,19 @@ void test_refusals(std::mt19937& rng) {
     cpu.cpu.x       = cpu_x;
     cpu.cpu.max_jobs = 1;
     check(refuses([&] { call(om::kDsv4Shape, cpu, xt, out); }), "a CPU channel is refused");
-    // A Qwen record format (Q2_0 down, a valid geometry at this shape) has no down kernel here.
+    // A Qwen record format (Q2_0 down, a valid geometry at this shape) has no down kernel here. The refusal comes
+    // before any launch: the caller's workspace and outputs, poisoned first, are untouched after it.
     ops::MoeExpertSource qwen_format = source;
     qwen_format.format               = QType::GGML_REC_IQ2_XXS_Q2_0;
+    cuda_ok(cudaMemset(workspace.p, 0xA5, workspace.bytes), "poison the workspace");
+    cuda_ok(cudaMemset(outputs.p, 0xA5, outputs.bytes), "poison the outputs");
+    cuda_ok(cudaDeviceSynchronize(), "poison");
     check(refuses([&] { call(om::kDsv4Shape, qwen_format, xt, out); }), "a Q2_0 down is refused at the V4 shape");
+    check(refuses([&] { call(om::kDsv4Shape, [&] { auto f = source; f.format = QType::GGML_REC_IQ3_XXS_IQ4_NL; return f; }(), xt, out); }),
+          "an IQ3_XXS gate/up with an IQ4_NL down is refused at the V4 shape");
+    cuda_ok(cudaDeviceSynchronize(), "after the refusals");
+    for (const auto word : download<std::uint8_t>(workspace.p, workspace.bytes)) { check(word == 0xA5, "a refused call wrote the workspace"); }
+    for (const auto word : download<std::uint8_t>(outputs.p, outputs.bytes)) { check(word == 0xA5, "a refused call wrote the outputs"); }
     // An x of the wrong hidden size.
     const Tensor narrow_x(x_dev.p, DType::BF16, {2560, 1});
     check(refuses([&] { call(om::kDsv4Shape, source, narrow_x, out); }), "an x of another hidden size is refused");

@@ -1801,9 +1801,25 @@ void moe_experts_narrow(moe::MoeShape shape, const Tensor& x, const MoeDispatch&
             "experts source is incomplete");
     require(source.cpu.max_jobs == 0, "this narrow route has no CPU-served misses");
     require(source.gate_up_variant == GateUpVariant::Staged, "this narrow route has the staged gate/up kernel only");
+    // Everything that can refuse the call is checked here, before the first launch: launches are asynchronous, so a
+    // refusal after one would leave queued writes to the caller's workspace and staging memory behind an exception.
+    const auto k_quant = [](QType f) {
+        return f == QType::GGML_IQ1_M || f == QType::GGML_IQ2_XXS || f == QType::GGML_IQ2_XS;
+    };
+    require(k_quant(geometry.gate_up) && k_quant(geometry.down),
+            "this narrow route serves record parts of IQ1_M, IQ2_XXS and IQ2_XS blocks only");
+    const Geometry g = device_geometry(geometry);
+    // The staged kernels' shared memory at the widest column count must fit the device's per-block limit.
+    require(2 * kUnitRows * static_cast<int>(g.gate_up_row_bytes) + static_cast<int>(sizeof(GateUpShared<Dsv4Dims, 8>)) <=
+                    kMaxDynamicSmem &&
+                kDownRows * static_cast<int>(g.down_row_bytes) + static_cast<int>(sizeof(DownShared<Dsv4Dims, 8>)) <=
+                    kMaxDynamicSmem,
+            "a slice of this record format does not fit one block's shared memory");
+    if (source.precast_input) {
+        require(reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0, "precast input needs 16-byte aligned x");
+    }
     const auto layout = carve_workspace(workspace, max_jobs, outputs.ne[1], source.precast_input ? x.ne[1] : 0,
                                         shape.hidden, shape.intermediate);
-    const Geometry g  = device_geometry(geometry);
     const int pass_jobs = source.staging_slots > 0 ? std::min(source.staging_slots, kMaxPassJobs) : max_jobs;
     MoeExpertSource stage_source = source;
     if (x.ne[1] != 1) { stage_source.zero_copy_misses = 0; } // the zero-copy rule was measured on decode only
@@ -1811,7 +1827,6 @@ void moe_experts_narrow(moe::MoeShape shape, const Tensor& x, const MoeDispatch&
     PrecastJob precast_job;
     int precast_job_ctas = 0;
     if (source.precast_input) {
-        require(reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0, "precast input needs 16-byte aligned x");
         const std::int64_t groups = static_cast<std::int64_t>(x.ne[1]) * Dsv4Dims::kXGroups;
         require(groups <= std::numeric_limits<int>::max(), "precast input exceeds INT_MAX groups");
         const int precast_ctas =
@@ -1827,12 +1842,6 @@ void moe_experts_narrow(moe::MoeShape shape, const Tensor& x, const MoeDispatch&
         }
         precast = layout.precast;
     }
-    // The staged kernels' shared memory at the widest column count must fit the device's per-block limit.
-    require(2 * kUnitRows * static_cast<int>(g.gate_up_row_bytes) + static_cast<int>(sizeof(GateUpShared<Dsv4Dims, 8>)) <=
-                    kMaxDynamicSmem &&
-                kDownRows * static_cast<int>(g.down_row_bytes) + static_cast<int>(sizeof(DownShared<Dsv4Dims, 8>)) <=
-                    kMaxDynamicSmem,
-            "a slice of this record format does not fit one block's shared memory");
     for (int base = 0; base < max_jobs; base += pass_jobs) {
         const int jobs = std::min(pass_jobs, max_jobs - base);
         const std::uint8_t* const* records = nullptr;
