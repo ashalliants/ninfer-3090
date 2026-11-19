@@ -43,8 +43,9 @@ def kernels(path):
             continue
         if name is None:
             continue
-        # keep the instruction text, drop the address comments and encodings
-        text = re.sub(r"/\*[0-9a-fx]+\*/", "", line).strip()
+        # keep the instruction text: drop every comment (addresses, and on older architectures the instruction
+        # encodings, which are padded to the widest line of the whole dump and so differ between dumps)
+        text = re.sub(r"/\*.*?\*/", "", line).strip()
         if text:
             lines.append(text)
     flush()
