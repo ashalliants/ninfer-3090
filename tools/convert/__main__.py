@@ -190,12 +190,17 @@ def main(argv=None):
             architecture = base.metadata.get("general.architecture")
             if architecture == dsv4.ARCHITECTURE:
                 # DeepSeek-V4.1-Flash: no n-gram volume, tokenizer or optional components yet.
-                if args.subset or args.ngram_out or args.ngram_reuse or args.mtp_gguf or args.mmproj or overrides:
+                if args.subset or args.ngram_out or args.ngram_reuse or args.mtp_gguf or args.mmproj:
                     raise ValueError(
                         "a deepseek41 GGUF takes none of --subset, --ngram-out, --ngram-reuse, "
-                        "--mtp-gguf, --mmproj and --resource"
+                        "--mtp-gguf and --mmproj"
                     )
-                model = dsv4_model.build_model(base)
+                if "tokenizer.json" not in overrides:
+                    raise ValueError(
+                        "a deepseek41 GGUF needs the checkpoint's tokenizer: --resource tokenizer.json=PATH "
+                        "(the GGUF alone does not say which added tokens are special)"
+                    )
+                model = dsv4_model.build_model(base, resource_overrides=overrides)
             else:
                 mtp = stack.enter_context(GgufModel(args.mtp_gguf)) if args.mtp_gguf else None
                 mmproj = stack.enter_context(GgufModel(args.mmproj)) if args.mmproj else None

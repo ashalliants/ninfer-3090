@@ -52,5 +52,8 @@ bool is_letter(std::int32_t codepoint) noexcept;
 bool is_mark(std::int32_t codepoint) noexcept;
 bool is_number(std::int32_t codepoint) noexcept;
 bool is_whitespace(std::int32_t codepoint) noexcept;
+// Unicode general categories P* (punctuation) and S* (symbol): the regex classes \p{P} and \p{S}.
+bool is_punctuation(std::int32_t codepoint) noexcept;
+bool is_symbol(std::int32_t codepoint) noexcept;
 
 } // namespace ninfer::text::unicode_internal

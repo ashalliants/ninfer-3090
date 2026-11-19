@@ -134,4 +134,31 @@ bool is_whitespace(std::int32_t codepoint) noexcept {
     }
 }
 
+bool is_punctuation(std::int32_t codepoint) noexcept {
+    switch (utf8proc_category(codepoint)) {
+    case UTF8PROC_CATEGORY_PC:
+    case UTF8PROC_CATEGORY_PD:
+    case UTF8PROC_CATEGORY_PS:
+    case UTF8PROC_CATEGORY_PE:
+    case UTF8PROC_CATEGORY_PI:
+    case UTF8PROC_CATEGORY_PF:
+    case UTF8PROC_CATEGORY_PO:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool is_symbol(std::int32_t codepoint) noexcept {
+    switch (utf8proc_category(codepoint)) {
+    case UTF8PROC_CATEGORY_SM:
+    case UTF8PROC_CATEGORY_SC:
+    case UTF8PROC_CATEGORY_SK:
+    case UTF8PROC_CATEGORY_SO:
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // namespace ninfer::text::unicode_internal

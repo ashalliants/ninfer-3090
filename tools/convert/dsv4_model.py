@@ -12,22 +12,27 @@ Not in the artifact yet, by decision (see docs/maintainer/dsv4-flash-plan.md, mi
 
 - **The Engram table** (``per_layer_token_embd.weight``, 110 GB): a separate volume, as the n-gram
   table is for Flash-Next. The model is built without it and the volume is a later piece.
-- **The tokenizer**: the build's ``joyai-llm`` pre-tokenizer has to be pinned down against the
-  checkpoint's own ``tokenizer.json`` first, so the model carries no resources.
+
+The tokenizer resources are optional here and required by the command line: ``resource_overrides`` supplies
+the checkpoint's ``tokenizer.json`` (and optionally its ``chat_template.jinja``), checked against the GGUF by
+:mod:`tools.convert.dsv4_tokenizer`. Without them the model carries no resources.
 """
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Mapping
 
 from tools.artifact.formats import ggml_record_format
 
-from . import dsv4
+from . import dsv4, dsv4_tokenizer
 from .dsv4 import Dsv4Error
 from .methods import import_encoded
 from .model import Model, Parameter
 from .qwen4_exp import ExpertRecordSource, encoded_format, expert_record_source, import_expert_records
 from .recipe import Recipe
+from .resources import token_domain
 from .sources.gguf import GgufModel, tensor_source
 
 MODEL_TYPE = "deepseek41_text"
@@ -66,14 +71,37 @@ def _inputs(parameter: str) -> tuple[str, ...]:
     return ()
 
 
-def build_model(gguf: GgufModel) -> Model:
-    """The logical model of a V4.1-Flash GGUF, without the Engram volume or a tokenizer."""
+def build_model(gguf: GgufModel, *, resource_overrides: Mapping[str, str | Path] | None = None) -> Model:
+    """The logical model of a V4.1-Flash GGUF, without the Engram volume.
+
+    ``resource_overrides`` maps ``tokenizer.json`` (required to get a tokenizer) and ``chat_template.jinja``
+    (optional: the GGUF's is the default) to files of the checkpoint."""
+    overrides = dict(resource_overrides or {})
+    unknown = overrides.keys() - {"tokenizer.json", "chat_template.jinja"}
+    if unknown:
+        raise ValueError(f"resource overrides have no consumer for a deepseek41 GGUF: {sorted(unknown)}")
+    if "chat_template.jinja" in overrides and "tokenizer.json" not in overrides:
+        raise ValueError("--resource chat_template.jinja needs --resource tokenizer.json: they are one tokenizer")
     vocab = gguf.tensor("token_embd.weight").shape[0] if "token_embd.weight" in gguf.tensors else None
     if vocab is None:
         raise Dsv4Error("GGUF tensor 'token_embd.weight' is missing")
     config = {**dsv4.text_config(gguf.metadata, vocab), "model_type": MODEL_TYPE}
     mappings = dsv4.name_map(gguf.tensors, config)
-    model = Model({"text": {"config": config, "resources": {}}})
+    resources: dict[str, bytes] = {}
+    if "tokenizer.json" in overrides:
+        template = Path(overrides["chat_template.jinja"]).read_bytes() if "chat_template.jinja" in overrides else None
+        resources = dsv4_tokenizer.resources(
+            gguf.metadata, config, Path(overrides["tokenizer.json"]).read_bytes(), template
+        )
+    references = {role: f"resource/text/{role}" for role in resources}
+    model = Model(
+        {"text": {"config": config, "resources": references}},
+        resources={references[role]: data for role, data in resources.items()},
+    )
+    if resources:
+        model.token_count, model.special_token_ids = token_domain(
+            json.loads(resources["tokenizer.json"]), json.loads(resources["tokenizer_config.json"]), len(gguf.metadata["tokenizer.ggml.tokens"])
+        )
     types = {name: tensor.type.name for name, tensor in gguf.tensors.items()}
     banks: dict[str, dict[str, dsv4.TensorMapping]] = {}
     for item in mappings:

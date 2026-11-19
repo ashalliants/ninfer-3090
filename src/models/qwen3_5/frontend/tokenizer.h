@@ -127,6 +127,15 @@ struct BoundaryEncodedText {
     std::vector<TokenBoundaryResult> boundaries;
 };
 
+// The text pipeline a tokenizer.json describes. Qwen: NFC, then one Split with the Qwen regex, then byte
+// level. Dsv4 (DeepSeek-V4): no normalizer, then three Splits (runs of up to three digits, runs of CJK and
+// kana, a word regex) and byte level. Anything else is refused when the tokenizer is loaded.
+enum class Pipeline : std::uint8_t { Qwen, Dsv4 };
+
+// Where the pipeline's pre-tokenizer ends each piece of `text` (byte offsets, increasing, the last is
+// text.size()); the encoder runs BPE inside each piece. NFC is NOT applied first. Public for tests.
+[[nodiscard]] std::vector<std::size_t> pre_tokenize_ends(Pipeline pipeline, std::string_view text);
+
 class Tokenizer {
 public:
     explicit Tokenizer(TokenizerResources resources);
@@ -156,6 +165,7 @@ public:
     // Every added token's id (special or not: control tokens, think and tool tags), unordered.
     [[nodiscard]] std::vector<int> added_token_ids() const;
     [[nodiscard]] bool has_exact_token_domain(std::size_t size) const noexcept;
+    [[nodiscard]] Pipeline pipeline() const noexcept { return pipeline_; }
 
 private:
     std::vector<std::string> decoded_token_bytes_;
@@ -167,6 +177,7 @@ private:
     std::vector<AddedToken> added_tokens_;
     std::array<std::vector<std::size_t>, 256> added_token_candidates_;
     std::vector<int> default_stop_token_ids_;
+    Pipeline pipeline_ = Pipeline::Qwen;
 };
 
 // The token facts relaxed drafting (--relaxed-drafting) reads, found once at startup: the lowest
