@@ -15,6 +15,7 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import gguf_headers as gh  # noqa: E402
 import gguf_sizes as gs  # noqa: E402
 import layout as lo  # noqa: E402
 import profile_to_curve as pc  # noqa: E402
@@ -425,6 +426,86 @@ def test_read_tensor_requires_the_matching_stamp():
             except SystemExit:
                 continue
             check(False, f"stamp {stamp!r} must be refused before any read")
+
+
+def _gguf_string(text):
+    raw = text.encode()
+    return struct.pack("<Q", len(raw)) + raw
+
+
+def test_gguf_header_parse():
+    """A synthetic header: a scalar, a string, a short array, a long array (recorded by length) and two tensors."""
+    kv = [
+        (_gguf_string("a.count") + struct.pack("<II", 4, 40)),
+        (_gguf_string("a.name") + struct.pack("<I", 8) + _gguf_string("hi")),
+        (_gguf_string("a.list") + struct.pack("<IIQ", 9, 5, 3) + struct.pack("<3i", 1, 2, 3)),
+        (_gguf_string("a.tokens") + struct.pack("<IIQ", 9, 8, 100) + b"".join(_gguf_string("t%d" % i) for i in range(100))),
+        (_gguf_string("a.floats") + struct.pack("<IIQ", 9, 6, 100) + struct.pack("<100f", *range(100))),
+    ]
+    tensors = [
+        _gguf_string("blk.0.w") + struct.pack("<I", 2) + struct.pack("<QQ", 5120, 384) + struct.pack("<IQ", 13, 0),
+        _gguf_string("norm") + struct.pack("<I", 1) + struct.pack("<Q", 64) + struct.pack("<IQ", 0, 32),
+    ]
+    data = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(kv)) + b"".join(kv) + b"".join(tensors)
+    meta, ts = gh.parse_header(data)
+    check(meta == {"a.count": 40, "a.name": "hi", "a.list": [1, 2, 3], "a.tokens": {"array_length": 100},
+                   "a.floats": {"array_length": 100}}, f"metadata parsed wrongly: {meta}")
+    check(ts == [{"name": "blk.0.w", "ne": [5120, 384], "type": 13, "offset": 0},
+                 {"name": "norm", "ne": [64], "type": 0, "offset": 32}], f"tensors parsed wrongly: {ts}")
+    for bad in (b"GGUX" + data[4:], data[:4] + struct.pack("<I", 2) + data[8:]):
+        try:
+            gh.parse_header(bad)
+        except gh.HeaderError:
+            continue
+        check(False, "a bad magic or version must be refused")
+    try:
+        gh.parse_header(data[:-3])
+    except gh.HeaderError:
+        pass
+    else:
+        check(False, "a header cut short must be refused, not parsed")
+
+
+def test_gguf_headers_fetch_refuses_what_could_hide_missing_or_extra_data():
+    """A server that ignores Range (a 200) is refused, and so is an inventory short of split.tensors.count."""
+    from unittest import mock
+
+    class Response:
+        def __init__(self, status, body, content_range):
+            self.status, self._body = status, body
+            self.headers = {"Content-Range": content_range} if content_range else {}
+
+        def read(self, n):
+            return self._body[:n]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    header = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)
+    for response in (Response(200, header, None), Response(206, header, "bytes 5-9/10"), Response(206, header, None)):
+        with mock.patch.object(gh.urllib.request, "urlopen", return_value=response):
+            try:
+                gh._range_get("https://example.invalid/x.gguf")
+            except SystemExit:
+                continue
+        check(False, f"a {response.status} without a range from byte 0 must be refused")
+    with mock.patch.object(gh.urllib.request, "urlopen", return_value=Response(206, header, "bytes 0-12/13")):
+        check(gh._range_get("https://example.invalid/x.gguf") == header, "a 206 from byte 0 must be accepted")
+
+    kv = _gguf_string("split.count") + struct.pack("<II", 4, 3) + _gguf_string("split.tensors.count") + struct.pack("<IQ", 10, 5)
+    first = b"GGUF" + struct.pack("<IQQ", 3, 0, 2) + kv  # advertises 5 tensors, holds none
+    with mock.patch.object(gh, "_revision", return_value="0" * 40), mock.patch.object(
+        gh, "_range_get", return_value=first
+    ):
+        try:
+            gh.fetch("a/b", "stem", None, 3)
+        except SystemExit as error:
+            check("advertises 5" in str(error), f"the count mismatch must be named: {error}")
+        else:
+            check(False, "a tensor inventory short of split.tensors.count must be refused")
 
 
 if __name__ == "__main__":
