@@ -4,7 +4,8 @@
 // and bit for bit between placements (resident, staged, zero-copy, with the precast input): the route and the
 // placement are invisible in the outputs. Plus the refusals.
 //
-// --small: three formats and fewer column counts (a few seconds).
+// --small: three formats and fewer column counts (a few seconds). NINFER_DSV4_REAL_RECORDS=DIR (written by
+// tools/dsv4/extract_real_experts.py): also the real experts of the published build, all eight record pairs.
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -253,13 +254,16 @@ std::vector<std::uint16_t> run(const Bank& bank, const Placement& p, const Route
     return download<std::uint16_t>(outputs.p, static_cast<std::size_t>(k) * columns * kH);
 }
 
-void test_format(QType format, std::mt19937& rng) {
-    constexpr int kExperts = 12, kTopK = 6;
-    const Bank bank = make_bank(format, kExperts, rng);
-    for (const int columns : g_small ? std::vector<int>{1, 3} : std::vector<int>{1, 3, 8, 11}) {
+// One bank through the narrow route in every placement and column count: bit-identical across placements, and a
+// sample of entries against the FP64 oracle. `sigma` scales the activations (large enough that the clamp bites
+// when `expect_clamp`).
+void check_bank(const Bank& bank, int kTopK, const std::vector<int>& column_counts, float sigma, bool expect_clamp,
+                std::mt19937& rng) {
+    const QType format = bank.format;
+    const int kExperts = bank.experts;
+    for (const int columns : column_counts) {
         const Routed r(kExperts, kTopK, columns, rng);
-        // Activations large enough that the clamp bites on part of the rows (|gate| or |up| above 10).
-        const auto x = random_dsv4_x(columns, rng, 6.0F);
+        const auto x = random_dsv4_x(columns, rng, sigma);
         DeviceBuffer x_dev(x.size() * 2);
         x_dev.copy_from_host(x.data(), x.size() * 2);
         std::vector<std::vector<std::uint16_t>> results;
@@ -293,9 +297,49 @@ void test_format(QType format, std::mt19937& rng) {
         std::printf("%-16s T=%-2d %zu placements bit-identical; %zu entries vs FP64 (clamped): normwise %.2e, worst %.2e; "
                     "the clamp changes %d of them\n",
                     record_name(format), columns, results.size(), sample.size(), worst_norm, worst_elem, clamped_entries);
-        if (format == kFormats[0] && columns == 1) {
+        if (expect_clamp && columns == 1) {
             check(clamped_entries > 0, "the test data never reaches the clamp: raise the activation scale");
         }
+    }
+}
+
+void test_format(QType format, std::mt19937& rng) {
+    const Bank bank = make_bank(format, 12, rng);
+    check_bank(bank, 6, g_small ? std::vector<int>{1, 3} : std::vector<int>{1, 3, 8, 11}, 6.0F, format == kFormats[0], rng);
+}
+
+// Real experts of the published IQ2_XXS build (tools/dsv4/extract_real_experts.py): <dir>/<record format>.bin holds
+// some of one layer's experts as records, back to back at the 256-byte-aligned record stride.
+void test_real_records(const char* dir) {
+    std::mt19937 rng(777);
+    for (const QType format : kFormats) {
+        const std::string path = std::string(dir) + "/ggml_rec_" + record_name(format) + ".bin";
+        std::string file_name = path;
+        for (char& c : file_name) { if (c == '+') { c = '_'; } }
+        std::FILE* f = std::fopen(file_name.c_str(), "rb");
+        check(f != nullptr, "cannot open " + file_name);
+        std::fseek(f, 0, SEEK_END);
+        const long size = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        const std::uint64_t stride = (om::record_geometry(format, om::kDsv4Shape).bytes + 255) / 256 * 256;
+        check(size > 0 && static_cast<std::uint64_t>(size) % stride == 0, file_name + ": not a whole number of records");
+        const int count = static_cast<int>(static_cast<std::uint64_t>(size) / stride);
+        Bank bank{format, count, stride, {}, nullptr, nullptr};
+        std::vector<std::uint8_t> flat(static_cast<std::size_t>(size));
+        check(std::fread(flat.data(), 1, flat.size(), f) == flat.size(), "short read of " + file_name);
+        std::fclose(f);
+        for (int e = 0; e < count; ++e) {
+            bank.records.emplace_back(flat.begin() + static_cast<std::ptrdiff_t>(e * stride),
+                                      flat.begin() + static_cast<std::ptrdiff_t>((e + 1) * stride));
+        }
+        bank.pinned = std::make_unique<Pinned>(flat.size());
+        std::memcpy(bank.pinned->host, flat.data(), flat.size());
+        bank.frames = std::make_unique<DeviceBuffer>(flat.size());
+        bank.frames->copy_from_host(flat.data(), flat.size());
+        std::printf("real %s: %d experts\n", record_name(format), count);
+        // Unit-scale activations (a normed hidden state), then larger ones that reach the clamp.
+        check_bank(bank, std::min(2, count), {1, 3, 8}, 1.0F, false, rng);
+        check_bank(bank, std::min(2, count), {1, 3}, 6.0F, true, rng);
     }
 }
 
@@ -387,6 +431,11 @@ int main(int argc, char** argv) {
     const std::vector<QType> formats = g_small ? std::vector<QType>{kFormats[0], kFormats[2], kFormats[7]}
                                                : std::vector<QType>(std::begin(kFormats), std::end(kFormats));
     for (const QType format : formats) { test_format(format, rng); }
+    if (const char* real = std::getenv("NINFER_DSV4_REAL_RECORDS"); real != nullptr && *real != '\0') {
+        test_real_records(real);
+    } else {
+        std::printf("NINFER_DSV4_REAL_RECORDS not set: the real-weights check is skipped\n");
+    }
     std::printf("offloaded_moe_dsv4: passed\n");
     return 0;
 }
