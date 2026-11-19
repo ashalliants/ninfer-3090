@@ -30,12 +30,24 @@ RecordGeometry record_geometry(QType format) {
     if (!is_ggml_record(format)) {
         throw std::invalid_argument("offloaded_sparse_moe: not a GGML expert record format");
     }
-    const std::array<std::uint64_t, 3> shape = {1, kHidden, kIntermediate};
-    const auto g     = weight_geometry(format, QuantLayout::GgmlExpertRecord, shape);
     const auto parts = ggml_record_parts(format);
     if (parts.down != QType::GGML_Q2_0 && parts.down != QType::GGML_IQ4_NL) {
         throw std::invalid_argument("offloaded_sparse_moe: record down part must be Q2_0 or IQ4_NL");
     }
+    return record_geometry(format, MoeShape{});
+}
+
+RecordGeometry record_geometry(QType format, MoeShape shape) {
+    if (!is_ggml_record(format)) {
+        throw std::invalid_argument("offloaded_sparse_moe: not a GGML expert record format");
+    }
+    if (shape.hidden <= 0 || shape.intermediate <= 0) {
+        throw std::invalid_argument("offloaded_sparse_moe: an expert shape needs positive dimensions");
+    }
+    const std::array<std::uint64_t, 3> record_shape = {1, static_cast<std::uint64_t>(shape.hidden),
+                                                       static_cast<std::uint64_t>(shape.intermediate)};
+    const auto g     = weight_geometry(format, QuantLayout::GgmlExpertRecord, record_shape);
+    const auto parts = ggml_record_parts(format);
     RecordGeometry out;
     out.format            = format;
     out.gate_up           = parts.gate_up;

@@ -38,6 +38,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 
 namespace ninfer::ops {
@@ -61,7 +62,7 @@ constexpr int kRegistersRows = kWarps; // intermediates per register-kernel item
 // The narrow route's shape: hidden size H and intermediate size I of one expert record. Everything the kernels
 // derive from them is here, so a model with other dimensions is another instantiation, not another kernel.
 // QwenDims (Qwen3.8-Flash-Next: [E, 2560, 640]) is the only one built so far.
-template <int H, int I>
+template <int H, int I, bool KQuantDowns = false>
 struct Dims {
     static constexpr int kHidden             = H;
     static constexpr int kIntermediate       = I;
@@ -69,7 +70,11 @@ struct Dims {
     static constexpr int kDownCtas           = H / kDownRows;                  // 40
     static constexpr int kXGroups            = H / canon::kA8Values;           // 80
     static constexpr int kHGroups            = I / canon::kA8Values;           // 20
-    static constexpr int kRegistersRowBlocks = I / kRegistersRows;             // 80 items per job
+    __host__ __device__ static constexpr int registers_row_blocks() { return I / kRegistersRows; } // 80 items per job (the register variant)
+    // The expert's activation between gate/up and down, and which down formats the model's records use: Qwen's
+    // records have Q2_0 or IQ4_NL downs (32- and 64-value blocks) and a plain SwiGLU.
+    static constexpr bool kKQuantDowns = KQuantDowns;
+    __device__ __forceinline__ static float swiglu(float g, float u) { return canon::swiglu_f32(g, u); }
     static_assert(H % kDownRows == 0 && I % kUnitRows == 0 && H % canon::kA8Values == 0 && I % canon::kA8Values == 0,
                   "an expert's dimensions must tile the kernels' units");
     // copy_precast_columns moves the codes in 16-byte vectors and the scales (kXGroups floats a column) in 16-byte
@@ -77,6 +82,17 @@ struct Dims {
     static_assert(kXGroups % 4 == 0, "a column's A8 scales must fill whole 16-byte vectors");
 };
 using QwenDims = Dims<moe::kHidden, moe::kIntermediate>;
+
+// DeepSeek-V4.1-Flash: [E, 5120, 2304] records whose gate/up and down parts are IQ1_M, IQ2_XXS or IQ2_XS blocks
+// (256 values), and a SwiGLU clamped as in training: the up branch to [-10, 10], the gate branch from above. The
+// limit is the GGUF's `swiglu_clamp_exp` of every layer of the published builds; a model with another limit needs
+// its own instantiation (moe_experts_narrow refuses a shape it does not know).
+struct Dsv4Dims : Dims<5120, 2304, true> {
+    static constexpr float kSwigluLimit = 10.0F;
+    __device__ __forceinline__ static float swiglu(float g, float u) {
+        return canon::swiglu_f32(fminf(g, kSwigluLimit), fminf(fmaxf(u, -kSwigluLimit), kSwigluLimit));
+    }
+};
 constexpr int kMaxDynamicSmem = kMaxDynamicSharedBytes;
 
 // MoeExpertSource::precast_input, gate_up_variant and host_slots lie in the padding after `format`: the kernels
@@ -678,7 +694,7 @@ __global__ void __launch_bounds__(kThreads)
         for (int i = threadIdx.x; i < U * n; i += blockDim.x) {
             const int k = i % U, c = i / U;
             h_rows[static_cast<std::size_t>(first + pass + c) * Dm::kIntermediate + U * u + k] =
-                canon::swiglu_f32(sm.y[c][k], sm.y[c][U + k]);
+                Dm::swiglu(sm.y[c][k], sm.y[c][U + k]);
         }
     }
 }
@@ -806,7 +822,7 @@ __global__ void __launch_bounds__(kThreads, kRegistersBlocksPerSm)
                              const float* __restrict__ xd) {
     const int jobs = min(*dispatch.job_count - job_base, pass_jobs);
     if (jobs <= 0) { return; }
-    const int items   = jobs * Dm::kRegistersRowBlocks;
+    const int items   = jobs * Dm::registers_row_blocks();
     auto grid         = moe::device::ExpertFormat<F>::table();
     if constexpr (kSharedGridEntries<F> > 0) {
         __shared__ uint2 grid_s[kSharedGridEntries<F>];
@@ -816,10 +832,10 @@ __global__ void __launch_bounds__(kThreads, kRegistersBlocksPerSm)
     }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     for (int item = static_cast<int>(blockIdx.x); item < items; item += static_cast<int>(gridDim.x)) {
-        const int job = job_base + item / Dm::kRegistersRowBlocks;
+        const int job = job_base + item / Dm::registers_row_blocks();
         if (cpu_flags != nullptr && cpu_flags[job] != 0) { continue; }
         const int expert           = dispatch.jobs[job];
-        const int i                = (item % Dm::kRegistersRowBlocks) * kRegistersRows + warp;
+        const int i                = (item % Dm::registers_row_blocks()) * kRegistersRows + warp;
         const std::uint8_t* record = job_record(source, job_records, expert, job);
         const std::uint8_t* gate   = record + static_cast<std::size_t>(i) * g.gate_up_row_bytes;
         const std::uint8_t* up     = gate + g.up_offset;
@@ -857,7 +873,7 @@ __global__ void __launch_bounds__(kThreads, kRegistersBlocksPerSm)
                     }
                 }
                 h_rows[static_cast<std::size_t>(first + pass + lane) * Dm::kIntermediate + i] =
-                    canon::swiglu_f32(gl, ul);
+                    Dm::swiglu(gl, ul);
             }
         }
     }
@@ -991,7 +1007,7 @@ void launch_gate_up_registers(const MoeDispatch& dispatch, const MoeExpertSource
                               const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                               float* h_rows, const PrecastInput& precast, cudaStream_t stream) {
     const int blocks = static_cast<int>(
-        std::min<std::int64_t>(coresident_grid<Dm, F, NC>(), static_cast<std::int64_t>(jobs) * Dm::kRegistersRowBlocks));
+        std::min<std::int64_t>(coresident_grid<Dm, F, NC>(), static_cast<std::int64_t>(jobs) * Dm::registers_row_blocks()));
     gate_up_registers_kernel<Dm, F, NC><<<blocks, kThreads, 0, stream>>>(dispatch, source, g, top_k, job_records, flags,
                                                                      base, jobs, h_rows, precast.q, precast.d);
     check_launch("gate/up registers");
@@ -1017,6 +1033,33 @@ void launch_down(const MoeDispatch& dispatch, const MoeExpertSource& source, con
     check_launch("down");
 }
 
+// The down half of a pass for the record's down format. Qwen's records: Q2_0 and IQ4_NL; DeepSeek-V4's: the
+// 256-value K-quant blocks (their decoders are the gate/up ones, down_kernel reads any format by sub-block).
+template <class Dm, int NC>
+void launch_down_format(QType down, const MoeDispatch& dispatch, const MoeExpertSource& source, const Geometry& g,
+                        const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
+                        const float* h_rows, bf16* outputs, cudaStream_t stream) {
+    const auto run = [&](auto format_tag) {
+        launch_down<Dm, decltype(format_tag)::value, NC>(dispatch, source, g, job_records, flags, base, jobs, h_rows,
+                                                         outputs, stream);
+    };
+    if constexpr (!Dm::kKQuantDowns) {
+        switch (down) {
+        case QType::GGML_Q2_0: run(std::integral_constant<QType, QType::GGML_Q2_0>{}); return;
+        case QType::GGML_IQ4_NL: run(std::integral_constant<QType, QType::GGML_IQ4_NL>{}); return;
+        default: break;
+        }
+    } else {
+        switch (down) {
+        case QType::GGML_IQ1_M: run(std::integral_constant<QType, QType::GGML_IQ1_M>{}); return;
+        case QType::GGML_IQ2_XXS: run(std::integral_constant<QType, QType::GGML_IQ2_XXS>{}); return;
+        case QType::GGML_IQ2_XS: run(std::integral_constant<QType, QType::GGML_IQ2_XS>{}); return;
+        default: break;
+        }
+    }
+    require(false, "unsupported down format");
+}
+
 // `registers`: GateUpVariant::Registers, which needs the precast planes (P); the down kernel is the
 // same either way.
 template <class Dm, QType F, int NC, bool P>
@@ -1035,27 +1078,21 @@ void launch_pass_nc(QType down, const bf16* x, const MoeDispatch& dispatch, cons
         return e;
     });
     bool staged = true;
-    if constexpr (P) {
+    if constexpr (P && Dm::kXGroups == 2 * 32 + 16) { // the register variant's passes assume 80 sub-blocks a row
         if (registers) {
             launch_gate_up_registers<Dm, F, NC>(dispatch, source, g, top_k, job_records, flags, base, jobs, h_rows, precast,
                                             stream);
             staged = false;
         }
+    } else {
+        require(!registers, "the register gate/up variant is built for 80 sub-blocks a row only");
     }
     if (staged) {
         gate_up_kernel<Dm, F, NC, P><<<dim3(Dm::kGateUpCtas, jobs), kThreads, gate_up_smem, stream>>>(
             x, dispatch, source, g, top_k, job_records, flags, base, h_rows, precast.q, precast.d);
         check_launch("gate/up");
     }
-    switch (down) {
-    case QType::GGML_Q2_0:
-        launch_down<Dm, QType::GGML_Q2_0, NC>(dispatch, source, g, job_records, flags, base, jobs, h_rows, outputs, stream);
-        return;
-    case QType::GGML_IQ4_NL:
-        launch_down<Dm, QType::GGML_IQ4_NL, NC>(dispatch, source, g, job_records, flags, base, jobs, h_rows, outputs, stream);
-        return;
-    default: require(false, "unsupported down format");
-    }
+    launch_down_format<Dm, NC>(down, dispatch, source, g, job_records, flags, base, jobs, h_rows, outputs, stream);
 }
 
 template <class Dm, QType F, bool P>
@@ -1100,6 +1137,24 @@ void launch_pass(QType gate_up, QType down, int columns, const bf16* x, const Mo
                  const MoeExpertSource& source, const Geometry& g, int top_k, const std::uint8_t* const* job_records,
                  const std::int32_t* flags, int base, int jobs, float* h_rows, bf16* outputs,
                  const PrecastInput& precast, cudaStream_t stream) {
+    if constexpr (Dm::kKQuantDowns) {
+        switch (gate_up) {
+        case QType::GGML_IQ2_XXS:
+            launch_pass_format<Dm, QType::GGML_IQ2_XXS>(columns, down, x, dispatch, source, g, top_k, job_records, flags, base,
+                                                        jobs, h_rows, outputs, precast, stream);
+            return;
+        case QType::GGML_IQ1_M:
+            launch_pass_format<Dm, QType::GGML_IQ1_M>(columns, down, x, dispatch, source, g, top_k, job_records, flags, base,
+                                                      jobs, h_rows, outputs, precast, stream);
+            return;
+        case QType::GGML_IQ2_XS:
+            launch_pass_format<Dm, QType::GGML_IQ2_XS>(columns, down, x, dispatch, source, g, top_k, job_records, flags, base,
+                                                       jobs, h_rows, outputs, precast, stream);
+            return;
+        default: require(false, "unsupported gate/up format");
+        }
+        return;
+    }
     switch (gate_up) {
     case QType::GGML_IQ2_S:
         launch_pass_format<Dm, QType::GGML_IQ2_S>(columns, down, x, dispatch, source, g, top_k, job_records, flags, base,
@@ -1462,7 +1517,8 @@ constexpr std::size_t align256(std::size_t v) { return (v + 255) / 256 * 256; }
 // precast_columns: the columns of the call's precast A8 input (MoeExpertSource::precast_input), 0
 // without it; its planes follow the others, so the other offsets do not depend on it.
 ExpertsWorkspace carve_workspace(void* base, std::int32_t max_jobs, std::int32_t entries,
-                                 std::int32_t precast_columns = 0) {
+                                 std::int32_t precast_columns = 0, std::int32_t hidden = QwenDims::kHidden,
+                                 std::int32_t intermediate = QwenDims::kIntermediate) {
     ExpertsWorkspace out;
     auto* p          = static_cast<std::uint8_t*>(base);
     std::size_t at   = 0;
@@ -1474,11 +1530,12 @@ ExpertsWorkspace carve_workspace(void* base, std::int32_t max_jobs, std::int32_t
     out.job_records = reinterpret_cast<const std::uint8_t**>(take(sizeof(void*) * static_cast<std::size_t>(max_jobs)));
     out.cpu_flags   = reinterpret_cast<std::int32_t*>(take(sizeof(std::int32_t) * static_cast<std::size_t>(max_jobs)));
     out.cpu_call    = reinterpret_cast<CpuCall*>(take(sizeof(CpuCall)));
-    out.h_rows = reinterpret_cast<float*>(take(sizeof(float) * QwenDims::kIntermediate * static_cast<std::size_t>(entries)));
+    out.h_rows = reinterpret_cast<float*>(take(sizeof(float) * static_cast<std::size_t>(intermediate) * static_cast<std::size_t>(entries)));
     if (precast_columns > 0) {
         const auto columns = static_cast<std::size_t>(precast_columns);
-        out.precast.q      = reinterpret_cast<std::int8_t*>(take(QwenDims::kHidden * columns));
-        out.precast.d      = reinterpret_cast<float*>(take(sizeof(float) * QwenDims::kXGroups * columns));
+        out.precast.q      = reinterpret_cast<std::int8_t*>(take(static_cast<std::size_t>(hidden) * columns));
+        out.precast.d      = reinterpret_cast<float*>(
+            take(sizeof(float) * static_cast<std::size_t>(hidden / canon::kA8Values) * columns));
     }
     out.bytes  = at;
     return out;
@@ -1707,6 +1764,91 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         }
     }
     if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
+}
+
+// ------------------------------------------------------------------------- other expert shapes
+
+namespace {
+
+bool known_shape(moe::MoeShape shape) noexcept {
+    return shape.hidden == Dsv4Dims::kHidden && shape.intermediate == Dsv4Dims::kIntermediate;
+}
+
+} // namespace
+
+std::size_t moe_experts_narrow_workspace_bytes(moe::MoeShape shape, std::int32_t max_jobs, std::int32_t entries,
+                                               std::int32_t columns, bool precast_input) {
+    require(known_shape(shape), "no narrow route is built for this expert shape");
+    require(max_jobs > 0 && entries > 0 && columns > 0, "experts workspace needs positive extents");
+    return carve_workspace(nullptr, max_jobs, entries, precast_input ? columns : 0, shape.hidden, shape.intermediate).bytes;
+}
+
+void moe_experts_narrow(moe::MoeShape shape, const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
+                        std::int32_t top_k, std::int32_t max_jobs, void* workspace, Tensor& outputs, cudaStream_t stream) {
+    require(known_shape(shape), "no narrow route is built for this expert shape");
+    require(contiguous(x, DType::BF16) && contiguous(outputs, DType::BF16), "experts need BF16 x and outputs");
+    require(x.ne[0] == shape.hidden && outputs.ne[0] == shape.hidden && outputs.ne[1] == x.ne[1] * top_k && top_k > 0,
+            "experts geometry differs from the expert shape");
+    const moe::RecordGeometry geometry = moe::record_geometry(source.format, shape);
+    require(max_jobs > 0 && max_jobs <= 65535 && source.frames != nullptr && source.host_records != nullptr &&
+                source.record_stride >= geometry.bytes && source.record_stride % 16 == 0 &&
+                (source.frame_stride == 0 ||
+                 (source.frame_stride >= source.record_stride && source.frame_stride % 16 == 0)) &&
+                reinterpret_cast<std::uintptr_t>(source.host_records) % (source.host_slots ? 8 : 16) == 0 &&
+                (source.frame_base == nullptr || reinterpret_cast<std::uintptr_t>(source.frame_base) % 16 == 0) &&
+                source.staging_slots >= 0 && (source.staging_slots == 0 || source.staging_base != nullptr) &&
+                (!source.host_slots || source.staging_slots > 0) && workspace != nullptr,
+            "experts source is incomplete");
+    require(source.cpu.max_jobs == 0, "this narrow route has no CPU-served misses");
+    require(source.gate_up_variant == GateUpVariant::Staged, "this narrow route has the staged gate/up kernel only");
+    const auto layout = carve_workspace(workspace, max_jobs, outputs.ne[1], source.precast_input ? x.ne[1] : 0,
+                                        shape.hidden, shape.intermediate);
+    const Geometry g  = device_geometry(geometry);
+    const int pass_jobs = source.staging_slots > 0 ? std::min(source.staging_slots, kMaxPassJobs) : max_jobs;
+    MoeExpertSource stage_source = source;
+    if (x.ne[1] != 1) { stage_source.zero_copy_misses = 0; } // the zero-copy rule was measured on decode only
+    PrecastInput precast;
+    PrecastJob precast_job;
+    int precast_job_ctas = 0;
+    if (source.precast_input) {
+        require(reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0, "precast input needs 16-byte aligned x");
+        const std::int64_t groups = static_cast<std::int64_t>(x.ne[1]) * Dsv4Dims::kXGroups;
+        require(groups <= std::numeric_limits<int>::max(), "precast input exceeds INT_MAX groups");
+        const int precast_ctas =
+            grid_blocks(groups * kPrecastLanes, kThreads, kGridMaxX, "precast input exceeds the launch grid");
+        if (source.staging_slots > 0) {
+            precast_job = PrecastJob{static_cast<const bf16*>(x.data), static_cast<int>(groups), layout.precast.q,
+                                     layout.precast.d};
+            precast_job_ctas = precast_ctas;
+        } else {
+            precast_kernel<<<precast_ctas, kThreads, 0, stream>>>(static_cast<const bf16*>(x.data), static_cast<int>(groups),
+                                                                  layout.precast.q, layout.precast.d);
+            check_launch("precast");
+        }
+        precast = layout.precast;
+    }
+    // The staged kernels' shared memory at the widest column count must fit the device's per-block limit.
+    require(2 * kUnitRows * static_cast<int>(g.gate_up_row_bytes) + static_cast<int>(sizeof(GateUpShared<Dsv4Dims, 8>)) <=
+                    kMaxDynamicSmem &&
+                kDownRows * static_cast<int>(g.down_row_bytes) + static_cast<int>(sizeof(DownShared<Dsv4Dims, 8>)) <=
+                    kMaxDynamicSmem,
+            "a slice of this record format does not fit one block's shared memory");
+    for (int base = 0; base < max_jobs; base += pass_jobs) {
+        const int jobs = std::min(pass_jobs, max_jobs - base);
+        const std::uint8_t* const* records = nullptr;
+        if (source.staging_slots > 0) {
+            stage_kernel<<<kStageCtas + precast_job_ctas, kThreads, 0, stream>>>(
+                dispatch, stage_source, static_cast<std::uint32_t>(geometry.bytes), base, jobs, nullptr,
+                layout.job_records, precast_job);
+            check_launch("stage");
+            precast_job      = PrecastJob{};
+            precast_job_ctas = 0;
+            records          = layout.job_records;
+        }
+        launch_pass<Dsv4Dims>(geometry.gate_up, geometry.down, x.ne[1], static_cast<const bf16*>(x.data), dispatch, source, g,
+                              top_k, records, nullptr, base, jobs, layout.h_rows, static_cast<bf16*>(outputs.data), precast,
+                              stream);
+    }
 }
 
 void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared, Tensor& y,

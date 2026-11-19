@@ -94,6 +94,11 @@ ninfer_add_op_test(ninfer_moe_cpu_selection_test
 ninfer_add_op_test(ninfer_offloaded_moe_layer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_layer.cu"
   LIBRARIES ninfer_ops ninfer_artifact)
+# moe_experts_narrow at DeepSeek-V4.1-Flash's [5120, 2304]: the eight K-quant record pairs against FP64 and
+# bit for bit between placements, plus the refusals.
+ninfer_add_op_test(ninfer_offloaded_moe_dsv4_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_dsv4.cu"
+  LIBRARIES ninfer_ops)
 # The wide expert route (experts with more than 8 columns in a call): bit for bit against the CPU
 # engine at T in {9, 64, 65, 2048, 4096} in every placement, FP64 on a sample of entries, and with
 # NINFER_TEST_ARTIFACT the real expert banks.

@@ -153,6 +153,20 @@ struct RecordGeometry {
 // Throws std::invalid_argument for a format this Op does not support.
 [[nodiscard]] RecordGeometry record_geometry(QType format);
 
+/// The size of one expert: hidden size H and intermediate size I of a [E, H, I] bank. The Op's original
+/// geometry is [2560, 640] (kHidden, kIntermediate, Qwen3.8-Flash-Next); moe_experts_narrow serves
+/// kDsv4Shape too.
+struct MoeShape {
+    std::int32_t hidden       = kHidden;
+    std::int32_t intermediate = kIntermediate;
+};
+inline constexpr MoeShape kDsv4Shape{5120, 2304}; // DeepSeek-V4.1-Flash
+
+/// record_geometry for a bank of this shape. Unlike record_geometry(format), which keeps to the Qwen3.8 formats
+/// (Q2_0 and IQ4_NL downs), this accepts every registered record format whose parts tile the shape (hidden a
+/// multiple of the gate/up block, intermediate of the down block), the K-quant down pairs among them.
+[[nodiscard]] RecordGeometry record_geometry(QType format, MoeShape shape);
+
 enum class CpuIsa : std::uint8_t { kScalar, kAvx2 };
 
 [[nodiscard]] const char* cpu_isa_name(CpuIsa isa);
@@ -386,6 +400,23 @@ struct MoeA8Input {
 void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                  std::int32_t top_k, std::int32_t max_jobs, void* workspace, Tensor& outputs,
                  cudaStream_t stream, bool wait_for_cpu = true, MoeA8Input input = {});
+
+/// The narrow route (dp4a rowdots, the staged gate/up kernel) for experts of another shape than
+/// [2560, 640]: DeepSeek-V4.1-Flash's kDsv4Shape [5120, 2304], whose records pair IQ1_M, IQ2_XXS and IQ2_XS blocks
+/// (ggml_rec_iq1_m_iq1_m ... ggml_rec_iq2_xs_iq2_xs) and whose SwiGLU is clamped to [-10, 10] (up) and
+/// below 10 (gate), as in training. Same contract as moe_experts (the staged/zero-copy placement of misses, the
+/// precast input, the canonical A8 arithmetic: the outputs are the bits the host decoder would give), without what
+/// DeepSeek-V4 does not use yet: CPU-served misses, the wide (prefill) route, the register gate/up variant and a
+/// caller-supplied A8 input; each is refused. Any number of columns is served (an expert with more than 8 takes
+/// several passes over its weights), only slowly past 8. `outputs` are BF16 [H, k*T] per expert entry, unweighted: the
+/// routing weight and the shared expert are the caller's (moe_combine does not fit DeepSeek-V4's mixing).
+/// Throws std::invalid_argument for a shape or record format it does not serve.
+[[nodiscard]] std::size_t moe_experts_narrow_workspace_bytes(offloaded_moe::MoeShape shape, std::int32_t max_jobs,
+                                                             std::int32_t entries, std::int32_t columns,
+                                                             bool precast_input = false);
+void moe_experts_narrow(offloaded_moe::MoeShape shape, const Tensor& x, const MoeDispatch& dispatch,
+                        const MoeExpertSource& source, std::int32_t top_k, std::int32_t max_jobs, void* workspace,
+                        Tensor& outputs, cudaStream_t stream);
 
 /// Waits for the host's answer to a moe_experts call made with wait_for_cpu == false and places
 /// its outputs; a no-op when that call published no request.
