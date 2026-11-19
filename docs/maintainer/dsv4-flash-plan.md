@@ -189,6 +189,7 @@ Design rules so that the lane count is never a corner:
 |---|---|---|
 | 0 | **This PR**: the scoping tools, the CPU reference and golden vectors, the perf model, this plan | Mac |
 | 1 | `dsv4` config and tensor-name map from the GGUF metadata; per-layer expert record layout and a repack of an ISTA GGUF into the artifact, with a tiny synthetic round-trip test | Mac, real GGUF shard headers |
+|   | *1a, done:* `tools/convert/dsv4.py` reads the GGUF metadata into the text config and maps all 1,043 tensors of ISTA's IQ2_XXS build (checked against its real headers, `tests/fixtures/dsv4/ista_iq2_xxs_header.json`), refusing anything unknown, missing, misplaced or mis-shaped. *1b, next:* the expert record formats: GSQ-RCO picks a type per layer and this build mixes eight (gate/up, down) pairs (IQ1_M, IQ2_XXS, IQ2_XS gate/up with IQ1_M, IQ2_XXS or IQ2_XS down), none of which the closed record set holds yet. *1c:* the repack itself. | |
 | 2 | Host-only three-tier memory plan (VRAM / RAM / SSD ledgers) and an SSD extent reader with tests; refuses nothing a 64 GB box can run | Mac (CUDA-free build) |
 | 3 | CPU reference forward of one block (router, hyper-connections, attention, MoE) in C++ or NumPy against `tools/dsv4/reference.py`, so GPU kernels have an oracle | Mac |
 | 4 | Dense path on the card: attention, shared experts, head; layer-by-layer parity against the reference | 3090 or Vast |

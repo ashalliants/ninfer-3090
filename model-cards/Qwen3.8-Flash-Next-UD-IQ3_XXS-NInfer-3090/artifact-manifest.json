@@ -91,8 +91,8 @@
   "conversion": {
     "recipe_id": "qwen4_exp_gguf",
     "converter_repository": "https://github.com/ashalliants/ninfer-3090",
-    "converter_commit": "526c268f2",
-    "converter_branch": "feat/flash-next-ud-iq3xxs",
+    "converter_commit": "848cbe3f8",
+    "converter_branch": "master",
     "command": "python -m tools.convert --model Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf --mtp-gguf mtp-q2_0.gguf --mmproj mmproj-BF16.gguf --recipe qwen4_exp_gguf --device cpu --out qwen4exp-ud-iq3xxs-mtp-vision.ninfer --ngram-reuse qwen4exp-iq2xs.ninfer.ngram",
     "report": {
       "filename": "qwen4exp-ud-iq3xxs-mtp-vision.ninfer.conversion.json",

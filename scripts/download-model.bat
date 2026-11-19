@@ -184,7 +184,7 @@ rem volume of the IQ2_XS repo above: one 27.1 GiB file serves both builds.
 set "ARTIFACT=qwen4exp-ud-iq3xxs-mtp-vision.ninfer"
 set "OWNER=WarlaxZ"
 set "REPO=Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090"
-set "REVISION=38039dacc0e9ced2f4a8d233b44d33d8a663f933"
+set "REVISION=196f11834dfe4fc21342f0255bcee034a5120ae7"
 set "EXPECTED_SIZE=32000000000"
 set "EXPECTED_SHA256=0edec1ba7ba56e3cf0a0a2b3bfa990a7a645243c649265e507cdfa78c37a2fe6"
 set "PART_COUNT=1"
