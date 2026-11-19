@@ -2,7 +2,7 @@
 
 // Which tier each routed expert of an offloaded MoE lives in: the VRAM cache, pinned host RAM or the
 // SSD. Pure arithmetic over a list of experts, so it is tested without a device and shared by any
-// model whose experts outnumber VRAM + RAM (docs/maintainer/dsv4-flash-plan.md, sections 3 and 7).
+// model whose experts outnumber VRAM + RAM (the DSV4-Flash scoping plan, PR 449).
 //
 // Experts are placed greedily by routing score per byte, so a popular expert earns the fast tier
 // and a large expert pays for what it takes (quantisation can differ by layer, so sizes do too).
@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <span>
 #include <stdexcept>
@@ -43,6 +44,10 @@ struct ExpertTierPlan {
     std::array<double, kExpertTierCount> score_share{};
 };
 
+// Totals are checked: a tier whose experts add up past 2^64 bytes throws std::overflow_error (a layout no
+// machine holds), and score shares are summed relative to the largest score, so huge finite scores
+// cannot overflow into a wrong share.
+//
 // Places every expert. An expert that does not fit the remaining VRAM goes to RAM, and one that does
 // not fit that goes to the SSD, so a small expert can still take space a large one could not. Ties
 // in score per byte break by (layer, expert), so the plan is deterministic.
@@ -64,6 +69,9 @@ struct ExpertTierPlan {
         return experts[a].expert < experts[b].expert;
     });
 
+    double max_score = 0.0;
+    for (const auto& e : experts) { max_score = std::max(max_score, e.score); }
+
     ExpertTierPlan plan;
     plan.tier.assign(experts.size(), ExpertTier::Ssd);
     std::uint64_t vram_left = budget.vram_bytes, ram_left = budget.ram_bytes;
@@ -82,9 +90,13 @@ struct ExpertTierPlan {
         plan.tier[i] = t;
         const auto k = static_cast<std::size_t>(t);
         ++plan.count[k];
+        if (e.bytes > std::numeric_limits<std::uint64_t>::max() - plan.bytes[k]) {
+            throw std::overflow_error("expert tier plan: a tier's bytes overflow 64 bits");
+        }
         plan.bytes[k] += e.bytes;
-        score[k] += e.score;
-        total += e.score;
+        const double relative = max_score > 0.0 ? e.score / max_score : 0.0; // at most 1, so a sum of N is at most N
+        score[k] += relative;
+        total += relative;
     }
     if (total > 0.0) {
         for (std::size_t k = 0; k < kExpertTierCount; ++k) { plan.score_share[k] = score[k] / total; }

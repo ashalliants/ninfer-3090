@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -95,6 +96,28 @@ void bad_input_is_refused() {
     expect(throws({{0, 0, 10, std::nan("")}}), "NaN score");
     expect(throws({{0, 0, 10, INFINITY}}), "infinite score");
 }
+
+void aggregates_that_overflow_are_not_reported_wrongly() {
+    // Two huge experts on the SSD: their bytes do not fit 64 bits, so it is refused, not wrapped.
+    const std::uint64_t huge = std::numeric_limits<std::uint64_t>::max() / 2 + 1;
+    const std::vector<TierExpert> two{{0, 0, huge, 1.0}, {0, 1, huge, 1.0}};
+    bool refused = false;
+    try {
+        (void)ninfer::plan_expert_tiers(two, {});
+    } catch (const std::overflow_error&) { refused = true; }
+    expect(refused, "bytes past 2^64 in one tier are refused");
+    // The same two experts split across tiers add up fine.
+    const auto split = ninfer::plan_expert_tiers(two, {huge, 0});
+    expect(split.bytes[0] == huge && split.bytes[2] == huge, "huge experts in different tiers are fine");
+
+    // Finite scores whose sum overflows double still give the right shares.
+    const double big = std::numeric_limits<double>::max();
+    const std::vector<TierExpert> scores{{0, 0, 10, big}, {0, 1, 10, big}, {0, 2, 10, big}, {0, 3, 10, big}};
+    const auto plan = ninfer::plan_expert_tiers(scores, {20, 10});
+    expect(std::abs(plan.score_share[0] - 0.5) < 1e-12 && std::abs(plan.score_share[1] - 0.25) < 1e-12 &&
+               std::abs(plan.score_share[2] - 0.25) < 1e-12,
+           "DBL_MAX scores give exact shares");
+}
 } // namespace
 
 int main() {
@@ -105,6 +128,7 @@ int main() {
     budgets_are_exact_and_empty_input_is_fine();
     unscored_experts_have_no_hit_rate_but_are_still_placed();
     bad_input_is_refused();
+    aggregates_that_overflow_are_not_reported_wrongly();
     if (failures == 0) { std::cout << "expert_tier_plan: all tests passed\n"; }
     return failures == 0 ? 0 : 1;
 }
