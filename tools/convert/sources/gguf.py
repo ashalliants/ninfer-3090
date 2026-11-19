@@ -213,7 +213,9 @@ class GgufFile:
             ne = tuple(cursor.scalar("Q", 8) for _ in range(dims))
             infos.append((name, ne, cursor.scalar("I", 4), cursor.scalar("Q", 8)))
         self.data_start = -(-cursor.pos // alignment) * alignment
-        if self.data_start > self.size:
+        # A split GGUF's first shard may hold only metadata (Unsloth's do): with no tensors the
+        # aligned data start can fall past the end of the file, and nothing reads it.
+        if tensor_count and self.data_start > self.size:
             raise GgufError(f"{self.path}: tensor data starts beyond the end of the file")
         return infos
 

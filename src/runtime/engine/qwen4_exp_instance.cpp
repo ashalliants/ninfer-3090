@@ -357,8 +357,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
             models::qwen4_exp::load_steering_vector(source, static_cast<std::int32_t>(config.hidden_size),
                                                     static_cast<std::int32_t>(config.num_hidden_layers))));
     }
-    const auto hot_embedding =
-        models::qwen4_exp::plan_hot_embedding(config.vocab_size, config.hidden_size, next.hot_embedding_rows);
+    const auto hot_embedding = models::qwen4_exp::plan_hot_embedding(config.vocab_size, config.hidden_size,
+                                                                     next.hot_embedding_rows,
+                                                                     plan.token_embedding_format());
 
     // The Program's options (the context cache's Host tier is set once the RAM ledger sized it).
     models::qwen4_exp::ProgramOptions program_options;
@@ -385,6 +386,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.ngram_keepalive_ms = next.ngram_keepalive_ms;
     program_options.shared_expert_stream = next.shared_expert_stream;
     program_options.hot_embedding_rows   = next.hot_embedding_rows;
+    program_options.hot_embedding_format = plan.token_embedding_format();
     program_options.gdn_head_map         = next.gdn_head_map;
     program_options.moe_precast_input    = next.moe_precast_input;
     program_options.moe_gate_up_registers = next.moe_gate_up_registers;

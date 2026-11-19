@@ -17,8 +17,9 @@ struct GgmlLinearShape {
     bool linear_add; // also registered for LinearAdd (the residual-producing projections)
 };
 
-// Every (format, shape) of the dense tensors of the IQ2_XS, IQ3_S and IQ3_XXS packs (their
-// published tensor allocations; tests/ops/test_ggml_linear_registry.cpp mirrors them).
+// Every (format, shape) of the dense tensors of the IQ2_XS, IQ3_S and IQ3_XXS GSQ-RCO packs and of
+// Unsloth's UD-IQ3_XXS (their published tensor allocations and tensor tables;
+// tests/ops/test_ggml_linear_registry.cpp mirrors them).
 inline constexpr GgmlLinearShape kGgmlLinearShapes[] = {
     // GDN qkv
     {QType::GGML_IQ4_XS, 10240, 2560, false},
@@ -26,12 +27,14 @@ inline constexpr GgmlLinearShape kGgmlLinearShapes[] = {
     {QType::GGML_Q6_K, 10240, 2560, false},
     {QType::GGML_Q5_K, 10240, 2560, false},
     {QType::GGML_Q4_K, 10240, 2560, false},
+    {QType::GGML_Q8_0, 10240, 2560, false},
     // GDN z (GGUF attn_gate)
     {QType::GGML_IQ4_XS, 6144, 2560, false},
     {QType::GGML_IQ3_S, 6144, 2560, false},
     {QType::GGML_Q6_K, 6144, 2560, false},
     {QType::GGML_Q5_K, 6144, 2560, false},
     {QType::GGML_Q4_K, 6144, 2560, false},
+    {QType::GGML_Q8_0, 6144, 2560, false},
     // attention query + gate
     {QType::GGML_IQ4_XS, 12288, 2560, false},
     {QType::GGML_IQ3_S, 12288, 2560, false},
@@ -56,6 +59,7 @@ inline constexpr GgmlLinearShape kGgmlLinearShapes[] = {
     {QType::GGML_Q6_K, 640, 2560, false},
     {QType::GGML_Q5_K, 640, 2560, false},
     {QType::GGML_Q4_K, 640, 2560, false},
+    {QType::GGML_Q8_0, 640, 2560, false},
     // shared-expert down
     {QType::GGML_IQ4_NL, 2560, 640, true},
     {QType::GGML_Q8_0, 2560, 640, true},
@@ -99,7 +103,7 @@ static_assert(kGgmlPairShapes[0].k == kGgmlPairK && kGgmlPairShapes[1].k == kGgm
                   kGgmlPairShapes[2].k == kGgmlPairK,
               "the pair instances are compiled for K = 2560");
 inline constexpr QType kGgmlPairFormats[] = {QType::GGML_IQ4_XS, QType::GGML_IQ3_S, QType::GGML_Q6_K,
-                                             QType::GGML_Q5_K, QType::GGML_Q4_K};
+                                             QType::GGML_Q5_K, QType::GGML_Q4_K, QType::GGML_Q8_0};
 
 [[nodiscard]] constexpr bool ggml_pair_registered(QType first, QType second, std::int32_t n1, std::int32_t n2,
                                                   std::int32_t k) {
@@ -138,7 +142,7 @@ inline constexpr QType kGgmlHeadFormats[] = {QType::GGML_IQ4_XS, QType::GGML_Q6_
 
 // ops::embedding's GGML table formats (src/ops/wrapper/embedding.cpp, its GGML cases): the packs'
 // token embeddings.
-inline constexpr QType kGgmlEmbeddingFormats[] = {QType::GGML_IQ4_XS, QType::GGML_IQ3_S};
+inline constexpr QType kGgmlEmbeddingFormats[] = {QType::GGML_IQ4_XS, QType::GGML_IQ3_S, QType::GGML_Q6_K};
 
 [[nodiscard]] constexpr bool ggml_embedding_registered(QType format) {
     for (const QType f : kGgmlEmbeddingFormats) {

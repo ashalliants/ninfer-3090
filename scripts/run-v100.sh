@@ -18,6 +18,13 @@
 #     against 63 tok/s, a 2K-token prefill 293 against 251 tok/s), and leaving out any one of its
 #     flags is neutral or slower (MTP joint acceptance -4 tok/s, the shared-expert stream -1.7, CPU
 #     prefill share 0 -> 226 tok/s prefill, 0.6 -> 285);
+#   - Qwen3.8-Flash-Next from Unsloth's UD-IQ3_XXS (qwen38-flash-next-iq3): the same flags, with its own
+#     limits. It runs with --partial-ram-residency by default (the launcher's setting: its 42 GiB of
+#     experts pin only what the VRAM cache does not hold, and the mode takes no images and no elastic KV
+#     pool), so its context defaults to 32,768 tokens instead of 262,144. NINFER_PARTIAL_RAM_RESIDENCY=off
+#     pins every expert (about 50 GiB of available RAM; the test host has 59 GiB) and brings back the
+#     full context and images. Not run on a V100: its kernels compile for sm_70 and its op tests are
+#     the ones scripts/v100_validate.sh --tests runs (docs/tesla-v100.md, "Qwen3.8-Flash-Next, UD-IQ3_XXS");
 #   - Qwen3.8-27B: MTP3 with INT8 KV (NINFER_SPEC=mtp, NINFER_KV_DTYPE=int8) instead of run.sh's
 #     DFlash2 with rk4v4. On the V100 MTP3 decodes 76 tok/s against DFlash2's 66 (code), and INT8
 #     KV is the cache validated on the card;
@@ -100,7 +107,7 @@ case "$model_key" in
   qwen38-27b)
     export NINFER_SPEC="${NINFER_SPEC:-mtp}"
     export NINFER_KV_DTYPE="${NINFER_KV_DTYPE:-int8}" ;;
-  qwen38-flash-next)
+  qwen38-flash-next|qwen38-flash-next-iq3)
     # The tuned profile's CPU share (0.4) suits long prompts; calls of up to 1024 tokens give the CPU
     # every miss it can take instead, since their missed experts see a few tokens each and the CPU
     # computes them faster than this link copies them (TTFT of a short prompt ~300 -> ~250 ms, a
@@ -116,7 +123,17 @@ case "$model_key" in
     export NINFER_NGRAM_RAM_MIB="${NINFER_NGRAM_RAM_MIB:-auto}"
     # The model's full 262,144-token context: the KV pool is backed as it fills, borrowing expert
     # frames only then (run.sh's Flash-Next default is 32,768).
-    export NINFER_CONTEXT="${NINFER_CONTEXT:-262144}"
+    v100_context=262144
+    v100_pin_gib=36 # the 33 GiB expert pin and its neighbours
+    v100_experts_gib=33
+    if [[ "$model_key" == 'qwen38-flash-next-iq3' ]]; then
+      # --partial-ram-residency (run.sh's default for this build) refuses the elastic KV pool the full
+      # context needs; with it off every expert is pinned (42.3 GiB bank) beside the n-gram RAM and cache.
+      v100_experts_gib=42
+      if [[ "${NINFER_PARTIAL_RAM_RESIDENCY:-on}" == 'on' ]]; then v100_context=32768; v100_pin_gib=42
+      else v100_pin_gib=46; fi
+    fi
+    export NINFER_CONTEXT="${NINFER_CONTEXT:-$v100_context}"
     # MTP drafts one step at a time and stops once no further draft could be verified (the same
     # output): a round mostly needs one or two of the three drafts, and a step is ~1.2 ms here.
     export NINFER_MTP_STAGED_DRAFTS="${NINFER_MTP_STAGED_DRAFTS:-on}"
@@ -128,19 +145,20 @@ case "$model_key" in
       workers=$(( threads - 6 )); (( workers < 6 )) && workers=6; (( workers > 10 )) && workers=10
       export NINFER_CPU_VERIFY_WORKERS="$workers"
     fi
-    # The embedding's rare rows are read from pinned RAM, giving their VRAM to the expert cache.
+    # The embedding's rare rows are read from pinned RAM, giving their VRAM to the expert cache (the
+    # UD-IQ3_XXS build's Q6_K embedding too: 480 MiB freed at 8192 rows instead of 311).
     export NINFER_HOT_EMBEDDING_ROWS="${NINFER_HOT_EMBEDDING_ROWS:-8192}"
     # Prefill's BF16 and GGML linears (cuBLAS) and prompt attention (native m8n8k4) on the FP16 tensor
     # cores instead of emulated Ampere MMA: a 3.9K-token prompt 6.9 -> 6.0 s, more accurate per op,
     # not bit for bit the same output. NINFER_SM70_TENSOR_CORES=0 turns it off.
     export NINFER_SM70_TENSOR_CORES="${NINFER_SM70_TENSOR_CORES:-1}"
     lock_kib="$(ulimit -l)"
-    need_kib=$(( 36 * 1024 * 1024 )) # the 33 GiB expert pin and its neighbours
+    need_kib=$(( v100_pin_gib * 1024 * 1024 ))
     if [[ "$lock_kib" != 'unlimited' ]] && (( lock_kib < need_kib )); then
       if ulimit -l unlimited 2>/dev/null || ulimit -l "$need_kib" 2>/dev/null; then
         :
       elif [[ -z "${NINFER_ALLOW_UNLOCKED_HOST_MEMORY:-}" ]]; then
-        printf 'Memory-lock limit is %s KiB, below the 33 GiB Flash-Next pins; continuing with\n' "$lock_kib"
+        printf 'Memory-lock limit is %s KiB, below the %s GiB Flash-Next pins; continuing with\n' "$lock_kib" "$v100_experts_gib"
         printf 'NINFER_ALLOW_UNLOCKED_HOST_MEMORY=on (see the top of this script to lift the limit).\n'
         export NINFER_ALLOW_UNLOCKED_HOST_MEMORY=on
       fi

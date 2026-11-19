@@ -42,6 +42,21 @@ def _verify_bank(artifact: Artifact, obj: TensorObject, gguf: GgufModel, tensors
             )
 
 
+def _bf16_words(gguf: GgufModel, tensor) -> bytes:
+    """The BF16 words a tensor read as BF16 is stored as: its exact FP32 values, an F32 source
+    required to be BF16 words already, any other rounded once to nearest even (integer arithmetic,
+    not the converter's torch cast)."""
+    wide = gguf.read_values(tensor, 0, tensor.elements).to("cpu").numpy().astype(np.float32, copy=False)
+    bits = wide.view(np.uint32).astype(np.uint64)
+    if tensor.type.name == "F32":
+        assert not (bits & 0xFFFF).any(), f"{tensor.name}: F32 values that are not BF16 words"
+        words = bits >> 16
+    else:
+        assert np.isfinite(wide).all(), tensor.name
+        words = (bits + 0x7FFF + ((bits >> 16) & 1)) >> 16
+    return words.astype("<u2").tobytes()
+
+
 def verify_volume(path, gguf: GgufModel, table: dict) -> int:
     """The volume's header equals the artifact's ``ngram_table`` and its rows the GGUF's rows.
 
@@ -247,6 +262,11 @@ def verify(path, gguf: GgufModel, subset: qwen4_exp.Subset | None = None, volume
                     source = gguf.read_range(tensor, 0, tensor.bytes)
                     assert obj.format == "bf16" and stored.tobytes() == source, obj.id
                     summary["narrowed"] += 1
+                elif (obj.format == "bf16" and tensors[0].type.name != "BF16"
+                      and qwen4_exp.layer_suffix(tensors[0].name) in qwen4_exp.BF16_PARAMETERS):
+                    expected = b"".join(_bf16_words(gguf, tensor) for tensor in tensors)
+                    assert artifact.read_object(obj.id) == expected, obj.id
+                    summary[f"bf16_from_{tensors[0].type.name.lower()}"] += 1
                 elif obj.format == "fp32" and tensors[0].type.name == "F16":
                     (tensor,) = tensors
                     source = gguf.read_range(tensor, 0, tensor.bytes)

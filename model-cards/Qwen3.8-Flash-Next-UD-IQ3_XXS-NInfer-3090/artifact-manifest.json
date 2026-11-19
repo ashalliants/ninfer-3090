@@ -1,0 +1,141 @@
+{
+  "schema": "ninfer.artifact-manifest",
+  "schema_version": 2,
+  "artifact": {
+    "filename": "qwen4exp-ud-iq3xxs-mtp-vision.ninfer",
+    "bytes": 32000000000,
+    "sha256": "0edec1ba7ba56e3cf0a0a2b3bfa990a7a645243c649265e507cdfa78c37a2fe6",
+    "parts": [
+      {
+        "filename": "qwen4exp-ud-iq3xxs-mtp-vision.ninfer.part-0001",
+        "bytes": 25087457792,
+        "sha256": "f971f41af085d3e40cd3ef6658f34d09871f3e7145d328c18df1ec3010a021f7"
+      }
+    ],
+    "container_version": 3,
+    "artifact_id": "fa9dd32ccdad435e8123ab8fa8418e64",
+    "architecture": "Qwen4ExpForCausalLM",
+    "components": [
+      "text",
+      "mtp",
+      "vision"
+    ]
+  },
+  "ngram_volume": {
+    "filename": "qwen4exp-iq2xs-mtp-vision.ninfer.ngram",
+    "bytes": 29127258112,
+    "sha256": "7623459b2385eef4505891c2ff133b3dd8ad4ecd0ad334c901878f3fa1d1b051",
+    "format": "NINFERNG",
+    "format_version": 2,
+    "volume_id": "1604acb23af5cb05f001e2ce3a8c0f12",
+    "row_format": "ggml_iq4_nl",
+    "rows": 320001536,
+    "row_bytes": 90,
+    "rows_per_block": 45,
+    "block_bytes": 4096,
+    "blocks": 7111146,
+    "shared_with": {
+      "repo_id": "WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090",
+      "revision": "95b1b0169bd25db96ceb772a8a67cc6e87088a1f",
+      "note": "not in this repository: the same table as the IQ2_XS build, one file for both"
+    }
+  },
+  "source": {
+    "base_model": {
+      "repo_id": "Qwen/Qwen3.8-Flash-Next",
+      "license": "qwen-community-1.0"
+    },
+    "base": {
+      "repo_id": "unsloth/Qwen3.8-Flash-Next-GGUF",
+      "revision": "f5d175de2cf7f720d45d6064019a81fcf056e986",
+      "files": [
+        {
+          "filename": "UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf",
+          "bytes": 10946618,
+          "sha256": "9d5644b371ffac921427c8021cc7242dab8e3ba37d7b48d1e79fe3770fbf9915"
+        },
+        {
+          "filename": "UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00002-of-00004.gguf",
+          "bytes": 49946027488,
+          "sha256": "aacaff3bdb9032c2c3be428167930809735f65d3cfb204eba07d85e421e7ddf4"
+        },
+        {
+          "filename": "UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00003-of-00004.gguf",
+          "bytes": 4869325888,
+          "sha256": "ef8f14e790ab471b363f146d5e8664eefbaf03e5776f317a1fb96a2bc7707b07"
+        },
+        {
+          "filename": "UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00004-of-00004.gguf",
+          "bytes": 28800138432,
+          "sha256": "5de8b5dbf89409acc39468decafd4a4a95b13c29d88a14b0356107897829ec36"
+        }
+      ],
+      "declared_license": "qwen-community-1.0"
+    },
+    "vision": {
+      "repo_id": "unsloth/Qwen3.8-Flash-Next-GGUF",
+      "revision": "f5d175de2cf7f720d45d6064019a81fcf056e986",
+      "filename": "mmproj-BF16.gguf",
+      "bytes": 907542944,
+      "sha256": "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355",
+      "declared_license": "qwen-community-1.0"
+    },
+    "mtp": {
+      "filename": "mtp-q2_0.gguf",
+      "obtained_from": "Strata 0.1.38 installation",
+      "bytes": 889017216,
+      "sha256": "a22206a4d74eafbf31063a84610292535fb3b49af9a339963817fd04aed81e4d",
+      "declared_license": null
+    }
+  },
+  "conversion": {
+    "recipe_id": "qwen4_exp_gguf",
+    "converter_repository": "https://github.com/ashalliants/ninfer-3090",
+    "converter_commit": "526c268f2",
+    "converter_branch": "feat/flash-next-ud-iq3xxs",
+    "command": "python -m tools.convert --model Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf --mtp-gguf mtp-q2_0.gguf --mmproj mmproj-BF16.gguf --recipe qwen4_exp_gguf --device cpu --out qwen4exp-ud-iq3xxs-mtp-vision.ninfer --ngram-reuse qwen4exp-iq2xs.ninfer.ngram",
+    "report": {
+      "filename": "qwen4exp-ud-iq3xxs-mtp-vision.ninfer.conversion.json",
+      "bytes": 504011,
+      "sha256": "8b215e892702678c3f306c346c13fdf049ab0b4ecfd6d425561781582351c273"
+    },
+    "rounded_to_bf16": {
+      "tensors": 196,
+      "values": 642735924,
+      "source_type": "Q8_0"
+    },
+    "verification": "tests/convert/qwen4_exp_verify.py: 1,356 tensor objects and every n-gram volume row exact against the source GGUFs (Q8_0-sourced BF16 objects against the checker's own rounding); the source GGUFs hash-match the published SHA-256 values"
+  },
+  "runtime": {
+    "repository": "https://github.com/ashalliants/ninfer-3090",
+    "cuda_architecture": "sm_86",
+    "platform": "windows",
+    "launcher": "scripts\\run.bat qwen38-flash-next-iq3",
+    "host_ram_gib": 64,
+    "flags": "--partial-ram-residency (vision not available with it)"
+  },
+  "inventory": {
+    "objects": 1362,
+    "tensors": 1356,
+    "resources": 6,
+    "bindings": 1599,
+    "uses": 1021,
+    "formats": {
+      "bf16": 829,
+      "fp32": 176,
+      "ggml_q6_k": 250,
+      "ggml_q8_0": 52,
+      "ggml_rec_iq2_s_iq4_nl": 23,
+      "ggml_rec_iq2_s_q2_0": 3,
+      "ggml_rec_iq3_xxs_iq4_nl": 21,
+      "ggml_rec_iq4_xs_iq4_nl": 1,
+      "ggml_rec_q2_0_q2_0": 1
+    },
+    "layouts": {
+      "contiguous_le_v1": 1005,
+      "ggml_blocks_v1": 302,
+      "ggml_expert_record_v1": 49
+    },
+    "payload_bytes": 57087035904
+  }
+}

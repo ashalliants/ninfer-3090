@@ -24,6 +24,11 @@ Export conventions of the GGUF (evidence in docs/maintainer/flash-next-plan.md):
   FP32 gain ``1 + gamma`` is the stored ``v`` bit for bit. ``gdn/norm`` (a plain multiplier) and
   ``gdn/convolution`` are F32 words that are all BF16 words; they are stored as BF16 after the
   same refusal check. Nothing is rounded.
+- The tensors in ``BF16_PARAMETERS`` (hyper-connection mixers, GDN ``a``/``b`` projections, router,
+  shared-expert score, PLE ``key``/``value``) are read as BF16. A BF16 source is stored as is. An F32
+  source (Unsloth's GGUFs) is narrowed only if every value is a BF16 word, else refused. A Q8_0
+  source (their mixers and PLE projections) is decoded exactly to FP32 and rounded once to nearest
+  even: the converter's only rounding, counted in the conversion output.
 - ``gdn/convolution`` is stored ``[K, C]`` (tap-major), the GDN convolution Op's operand and
   Qwen3.5's logical shape; the GGUF holds ``[C, K]``. The transpose moves words, not values.
 - BF16 projections over one input are packed into one parent (``PACKED``): each hyper-connection
@@ -400,6 +405,33 @@ NARROWED = {
 }
 # Direct tensors whose logical shape is the GGUF matrix transposed (see the module docstring).
 TRANSPOSED = {"ssm_conv1d.weight"}
+# Tensors the model reads as BF16 (src/models/qwen4_exp/load.cpp). The GSQ-RCO GGUFs store them as
+# BF16, which is kept byte for byte. Unsloth's store some as F32 (narrowed only when every value is
+# a BF16 word, else refused) and the hyper-connection mixers and the PLE projections as Q8_0
+# (decoded exactly to FP32, then rounded once to BF16: the only rounding this converter makes).
+BF16_PARAMETERS = frozenset(
+    {
+        "hc_attn_down.weight", "hc_attn_up.weight", "hc_attn_inject.weight",
+        "hc_ffn_down.weight", "hc_ffn_up.weight", "hc_ffn_inject.weight",
+        "output_hc_down.weight", "output_hc_up.weight",
+        "ssm_alpha.weight", "ssm_beta.weight",
+        "ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight",
+        "ple_key.weight", "ple_value.weight",
+    }
+)
+
+
+def bf16_for_model(name: str, values: torch.Tensor, *, exact_only: bool) -> tuple[torch.Tensor, int]:
+    """*values* as BF16 and how many of them rounded; *exact_only* refuses any rounding."""
+    wide = values.to(torch.float32)
+    narrow = wide.to(torch.bfloat16)
+    rounded = int((narrow.to(torch.float32) != wide).sum())
+    if rounded and exact_only:
+        first = int((narrow.to(torch.float32) != wide).reshape(-1).nonzero()[0])
+        raise GgufError(
+            f"{name}: {rounded} values are not BF16 words (value {first}: {wide.reshape(-1)[first].item()!r})"
+        )
+    return narrow, rounded
 # Per-layer BF16 projections over one input that share one parent, rows in this order (the
 # operands the model's Ops and registered Linear shapes take): each mixer's down then inject rows,
 # the GDN a then b rows, and the PLE key then value rows.
@@ -887,6 +919,8 @@ def build_model(
         special_token_ids=special,
     )
     banks: dict[str, dict[str, TensorMapping]] = {}
+    rounded_bf16: dict[str, int] = {}  # source type -> values rounded to BF16 (BF16_PARAMETERS)
+    rounded_tensors = 0
     for item in mappings:
         if item.parameter is None or (subset is not None and not subset.keeps(gguf, item.gguf)):
             continue
@@ -907,6 +941,15 @@ def build_model(
             values = source.values().reshape(source.shape)
             narrowed = narrow_exactly(item.gguf, values.T.contiguous() if transposed else values, rule)
             source, direct_format = array_source(narrowed, item.gguf), "bf16"
+        elif layer_suffix(item.gguf) in BF16_PARAMETERS and tensor.type.format != "bf16":
+            values = source.values().reshape(source.shape)
+            narrowed, n_rounded = bf16_for_model(
+                item.gguf, values, exact_only=tensor.type.dtype is not None
+            )
+            if n_rounded:
+                rounded_bf16[tensor.type.name] = rounded_bf16.get(tensor.type.name, 0) + n_rounded
+                rounded_tensors += 1
+            source, direct_format = array_source(narrowed, item.gguf), "bf16"
         elif transposed:
             raise GgufError(f"{item.gguf}: a transposed tensor must be narrowed")
         model.add(
@@ -918,6 +961,10 @@ def build_model(
                 direct_format=direct_format,
             )
         )
+    if rounded_bf16:
+        detail = ", ".join(f"{name}: {n:,} values" for name, n in sorted(rounded_bf16.items()))
+        print(f"rounded to BF16 (the model reads these tensors as BF16): {rounded_tensors} tensors ({detail})",
+              flush=True)
     for layer in range(config["num_hidden_layers"]):
         for packed in PACKED:
             group = tuple(f"text/layers/{layer}/{name}" for name in packed)

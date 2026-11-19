@@ -431,6 +431,35 @@ expect_flags 'Flash-Next NINFER_PRESENCE_PENALTY and NINFER_MIN_P' \
   '--presence-penalty 1.0' '--min-p 0.05'
 refuse_flag 'Flash-Next NINFER_PRESENCE_PENALTY=default' \
   "$(record fn_sampling_default NINFER_PRESENCE_PENALTY=default -- qwen38-flash-next)" '--presence-penalty'
+
+# The Unsloth UD-IQ3_XXS build (qwen38-flash-next-iq3) runs with --partial-ram-residency, which refuses
+# --vision: images are off then and asking for them is an error, a mistyped NINFER_VISION fails in
+# either mode (as in run.bat), and NINFER_PARTIAL_RAM_RESIDENCY=off brings the file's vision tower back.
+touch "$tmp/qwen4exp-ud-iq3xxs-mtp-vision.ninfer" "$tmp/qwen4exp-ud-iq3xxs.ninfer"
+iq3_env=(NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$tmp/iq3.args" NINFER_MODEL_DIR="$tmp")
+expect_flags 'IQ3 build default' "$(record iq3_default -- qwen38-flash-next-iq3)" '--partial-ram-residency' '--spec mtp'
+refuse_flag 'IQ3 build default' "$(record iq3_default_vision -- qwen38-flash-next-iq3)" '--vision'
+expect_exit 2 'IQ3 build NINFER_VISION=on with partial residency' \
+  clear_env "${iq3_env[@]}" NINFER_VISION=on "$root/run.sh" qwen38-flash-next-iq3
+expect_exit 2 'IQ3 build mistyped NINFER_VISION with partial residency' \
+  clear_env "${iq3_env[@]}" NINFER_VISION=typo "$root/run.sh" qwen38-flash-next-iq3
+expect_exit 2 'IQ3 build mistyped NINFER_VISION without partial residency' \
+  clear_env "${iq3_env[@]}" NINFER_PARTIAL_RAM_RESIDENCY=off NINFER_VISION=typo "$root/run.sh" qwen38-flash-next-iq3
+expect_exit 2 'IQ3 build mistyped NINFER_PARTIAL_RAM_RESIDENCY' \
+  clear_env "${iq3_env[@]}" NINFER_PARTIAL_RAM_RESIDENCY=maybe "$root/run.sh" qwen38-flash-next-iq3
+expect_exit 0 'IQ3 build NINFER_VISION=off with partial residency' \
+  clear_env "${iq3_env[@]}" NINFER_VISION=off "$root/run.sh" qwen38-flash-next-iq3
+expect_flags 'IQ3 build without partial residency' \
+  "$(record iq3_full NINFER_PARTIAL_RAM_RESIDENCY=off -- qwen38-flash-next-iq3)" '--vision' '--spec mtp'
+refuse_flag 'IQ3 build without partial residency' \
+  "$(record iq3_full_partial NINFER_PARTIAL_RAM_RESIDENCY=off -- qwen38-flash-next-iq3)" '--partial-ram-residency'
+# Its hints name its own files, not the first build's.
+banner="$(clear_env "${iq3_env[@]}" NINFER_MODEL="$tmp/qwen4exp-ud-iq3xxs.ninfer" NINFER_PARTIAL_RAM_RESIDENCY=off \
+  "$root/run.sh" qwen38-flash-next-iq3)"
+[[ "$banner" == *'qwen4exp-ud-iq3xxs-mtp.ninfer'* && "$banner" != *'qwen4exp-iq2xs'* ]] || {
+  printf 'run.sh (IQ3 build) hints do not name the IQ3 files: %s\n' "$banner" >&2
+  exit 1
+}
 banner="$(clear_env NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$tmp/unused.args" NINFER_MODEL_DIR="$tmp" \
   NINFER_REASONING_LOOP=stop NINFER_PRESENCE_PENALTY=1.0 "$root/run.sh" qwen38-flash-next)"
 [[ "$banner" == *'Reasoning-loop guard: stop'* && "$banner" == *'Sampling: --presence-penalty 1.0'* ]] || {

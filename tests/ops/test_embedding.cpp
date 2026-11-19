@@ -1015,6 +1015,136 @@ int test_ggml_iq3_s() {
     return failures;
 }
 
+// GGML Q6_K ggml_blocks_v1 table (Unsloth's UD-IQ3_XXS token embedding, D = 2560): every output is
+// exactly the BF16 rounding of the host decoder's value (dequantize_row_q6_K). Random bytes cover
+// the nibbles, high bits and int8 scales of every sub-block; the FP16 scale is finite.
+int test_ggml_q6_k() {
+    constexpr std::int32_t kVocab = 1000, kD = 2560, kBlock = 210;
+    std::vector<std::uint8_t> table_bytes(static_cast<std::size_t>(kVocab) * (kD / 256) * kBlock);
+    std::uint32_t state = 0x13579BDU;
+    const auto next = [&] {
+        state = state * 1664525U + 1013904223U;
+        return state >> 8;
+    };
+    for (auto& b : table_bytes) { b = static_cast<std::uint8_t>(next() & 0xFF); }
+    for (std::size_t block = 0; block < table_bytes.size() / kBlock; ++block) {
+        const std::uint16_t bits = static_cast<std::uint16_t>((next() & 0x83FF) | ((next() % 31) << 10));
+        table_bytes[block * kBlock + 208] = static_cast<std::uint8_t>(bits & 0xFF);
+        table_bytes[block * kBlock + 209] = static_cast<std::uint8_t>(bits >> 8);
+    }
+    const std::vector<std::int32_t> ids = {0, kVocab - 1, 17, 17, 523, 2, 999, 400, 401};
+    const std::size_t row_bytes         = static_cast<std::size_t>(kD / 256) * kBlock;
+    std::vector<std::uint16_t> expected(static_cast<std::size_t>(kD) * ids.size());
+    for (std::size_t t = 0; t < ids.size(); ++t) {
+        const auto row = std::as_bytes(std::span<const std::uint8_t>(table_bytes))
+                             .subspan(static_cast<std::size_t>(ids[t]) * row_bytes, row_bytes);
+        const std::vector<float> values = ninfer::test::ggml::decode_blocks(QType::GGML_Q6_K, row);
+        for (std::int32_t v = 0; v < kD; ++v) { expected[t * kD + v] = f32_to_bf16(values[v]); }
+    }
+    GuardedDeviceBuffer device_table(table_bytes.size());
+    device_table.copy_from_host(table_bytes.data(), table_bytes.size());
+    GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
+    device_ids.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer output(expected.size() * sizeof(std::uint16_t));
+    output.fill(0xff);
+    Weight weight        = iq4_xs_weight(device_table.data(), kVocab, kD);
+    weight.qtype         = QType::GGML_Q6_K;
+    weight.payload_bytes = table_bytes.size();
+    Tensor input(device_ids.data(), DType::I32, {static_cast<std::int32_t>(ids.size())});
+    Tensor result(output.data(), DType::BF16, {kD, static_cast<std::int32_t>(ids.size())});
+    ops::embedding(input, weight, result, nullptr);
+    cuda_synchronize();
+    int failures = verify_exact("embedding GGML Q6_K [1000,2560]",
+                                guarded_to_host<std::uint16_t>(output, expected.size()), expected);
+    failures += output.verify_guards("embedding GGML Q6_K output");
+    failures += device_table.verify_guards("embedding GGML Q6_K table");
+    return failures;
+}
+
+// Random GGML Q6_K blocks for `vocab` rows of `d` values: random bytes under finite FP16 scales.
+std::vector<std::uint8_t> q6_k_table(std::int32_t vocab, std::int32_t d, std::uint32_t seed) {
+    constexpr std::int32_t kBlock = 210;
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(vocab) * (d / 256) * kBlock);
+    std::uint32_t state = seed;
+    const auto next = [&] {
+        state = state * 1664525U + 1013904223U;
+        return state >> 8;
+    };
+    for (auto& b : bytes) { b = static_cast<std::uint8_t>(next() & 0xFF); }
+    for (std::size_t block = 0; block < bytes.size() / kBlock; ++block) {
+        const std::uint16_t bits = static_cast<std::uint16_t>((next() & 0x83FF) | ((next() % 31) << 10));
+        bytes[block * kBlock + 208] = static_cast<std::uint8_t>(bits & 0xFF);
+        bytes[block * kBlock + 209] = static_cast<std::uint8_t>(bits >> 8);
+    }
+    return bytes;
+}
+
+// embedding_split over GGML Q6_K planes (Unsloth's UD-IQ3_XXS token embedding with --hot-embedding-rows):
+// the first kHot rows in a device plane, the whole table in mapped page-locked host memory (its hot
+// rows overwritten, so reading one from there is caught). Bitwise the host decoder's rows and
+// ops::embedding over the unsplit table.
+int test_embedding_split_q6_k() {
+    constexpr std::int32_t kVocab = 1000, kD = 2560, kHot = 300, kBlock = 210;
+    const std::size_t row_bytes = static_cast<std::size_t>(kD / 256) * kBlock;
+    const std::vector<std::uint8_t> table_bytes = q6_k_table(kVocab, kD, 0x2468ACEU);
+    const std::vector<std::int32_t> ids = {0, kHot - 1, kHot, kVocab - 1, 17, 17, kHot, kHot, kHot - 1,
+                                           0, kVocab - 1, 523, kHot + 1, 2, 999, kHot - 2};
+    std::vector<std::uint16_t> expected(static_cast<std::size_t>(kD) * ids.size());
+    for (std::size_t t = 0; t < ids.size(); ++t) {
+        const auto row = std::as_bytes(std::span<const std::uint8_t>(table_bytes))
+                             .subspan(static_cast<std::size_t>(ids[t]) * row_bytes, row_bytes);
+        const std::vector<float> values = ninfer::test::ggml::decode_blocks(QType::GGML_Q6_K, row);
+        for (std::int32_t v = 0; v < kD; ++v) { expected[t * kD + v] = f32_to_bf16(values[v]); }
+    }
+    GuardedDeviceBuffer device_table(table_bytes.size());
+    device_table.copy_from_host(table_bytes.data(), table_bytes.size());
+    GuardedDeviceBuffer hot(kHot * row_bytes);
+    hot.copy_from_host(table_bytes.data(), kHot * row_bytes);
+    PinnedHostBuffer cold(table_bytes.size());
+    std::memcpy(cold.data(), table_bytes.data(), table_bytes.size());
+    const std::vector<std::uint8_t> other = q6_k_table(kHot, kD, 0x0BADF00DU);
+    std::memcpy(cold.data(), other.data(), other.size());
+    void* cold_device = nullptr;
+    cuda_check(cudaHostGetDevicePointer(&cold_device, cold.data(), 0), "cudaHostGetDevicePointer");
+
+    GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
+    device_ids.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer reference(expected.size() * sizeof(std::uint16_t));
+    reference.fill(0xff);
+    GuardedDeviceBuffer output(expected.size() * sizeof(std::uint16_t));
+    output.fill(0xff);
+    const auto T = static_cast<std::int32_t>(ids.size());
+    Tensor input(device_ids.data(), DType::I32, {T});
+    Tensor reference_out(reference.data(), DType::BF16, {kD, T});
+    Tensor result(output.data(), DType::BF16, {kD, T});
+    const auto plane = [&](void* data, std::int32_t rows) {
+        Weight w         = iq4_xs_weight(data, rows, kD);
+        w.qtype          = QType::GGML_Q6_K;
+        w.payload_bytes  = static_cast<std::size_t>(rows) * row_bytes;
+        return w;
+    };
+    ops::embedding(input, plane(device_table.data(), kVocab), reference_out, nullptr);
+    ops::embedding_split(input, plane(hot.data(), kHot), plane(cold_device, kVocab), kHot, result, nullptr);
+    cuda_synchronize();
+    const std::vector<std::uint16_t> got = guarded_to_host<std::uint16_t>(output, expected.size());
+    int failures = verify_exact("embedding_split GGML Q6_K [1000,2560] hot 300", got, expected);
+    failures += verify_exact("embedding_split Q6_K equals embedding bitwise", got,
+                             guarded_to_host<std::uint16_t>(reference, expected.size()));
+    failures += output.verify_guards("embedding_split Q6_K output");
+    failures += hot.verify_guards("embedding_split Q6_K hot plane");
+    // Planes of two formats are refused.
+    bool refused = false;
+    try {
+        ops::embedding_split(input, plane(hot.data(), kHot), iq4_xs_weight(cold_device, kVocab, kD), kHot, result,
+                             nullptr);
+    } catch (const std::invalid_argument&) { refused = true; }
+    if (!refused) {
+        std::cerr << "embedding_split accepted a Q6_K hot plane with an IQ4_XS cold plane\n";
+        ++failures;
+    }
+    return failures;
+}
+
 // embedding_split_matches_embedding: the Flash-Next table (D = 2560) with its first hot_rows rows in
 // a device plane and the whole table in mapped page-locked host memory, read through its device
 // pointer (--hot-embedding-rows). Ids across the boundary (0, N - 1, N, V - 1, repeated ids) give
@@ -1117,6 +1247,8 @@ int main() {
         failures += test_fp8();
         failures += test_ggml_iq4_xs();
         failures += test_ggml_iq3_s();
+        failures += test_ggml_q6_k();
+        failures += test_embedding_split_q6_k();
         failures += test_embedding_split_matches_embedding();
     } catch (const std::exception& error) {
         std::cerr << "embedding test exception: " << error.what() << '\n';

@@ -17,6 +17,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/ggml_pair_q6_k.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_pair_q5_k.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_pair_q4_k.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/ggml_pair_q8_0.cu"
 )
 # ggml's lookup tables (third_party/ggml/ggml-common-tables.h), shared with the test decoder.
 target_include_directories(ninfer_ops PRIVATE "${PROJECT_SOURCE_DIR}/third_party/ggml")

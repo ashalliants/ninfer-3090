@@ -26,8 +26,9 @@ namespace ninfer::ops {
  *     every positive T;
  *   - ggml_blocks_v1 weights of [640,2560] or [512,2560] (Qwen3.8-Flash-Next's shared-expert
  *     gate/up and attention key/value), or a [10240,2560] first and a [6144,2560] second (its
- *     GDN qkv and z), each in GGML_IQ4_XS, GGML_IQ3_S, GGML_Q6_K, GGML_Q5_K or GGML_Q4_K (the two
- *     may differ), for 1 <= T <= 8. They take linear()'s Q8_1 (A8) profile, the only one GGML
+ *     GDN qkv and z), each in GGML_IQ4_XS, GGML_IQ3_S, GGML_Q6_K, GGML_Q5_K or GGML_Q4_K, or in
+ *     GGML_Q8_0 at the shapes where linear.h registers it ([640,2560], and the [10240,2560] and
+ *     [6144,2560] GDN pair; not [512,2560]) (the two may differ), for 1 <= T <= 8. They take linear()'s Q8_1 (A8) profile, the only one GGML
  *     formats register, and every output equals linear()'s bit for bit.
  * Numeric semantics are those of linear(). Inputs, outputs, and weight planes must be mutually
  * non-overlapping. The Op requires no caller-owned transient storage and has no persistent state

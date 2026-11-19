@@ -44,7 +44,8 @@ Qwen3.8-27B and Qwen3.8-Flash-Next too: [V100 guide](docs/tesla-v100.md).
 
 **Qwen3.8-Flash-Next (preview, Windows)** runs on the same card too: a 512-expert MoE at 2 bits per
 weight with its experts pinned in host RAM, at **1.15-1.18x Strata's plain decode** and
-**109-113 tok/s with MTP**. [Details](#qwen38-flash-next-preview) · [every re-measurement](#latest-benchmarks)
+**109-113 tok/s with MTP**. A second, 3-bit build (Unsloth's UD-IQ3_XXS) reads about 7% better by perplexity at
+roughly half the speed, so you can pick. [Details](#qwen38-flash-next-preview) · [every re-measurement](#latest-benchmarks)
 
 **On a Tesla V100-32GB** ([guide](docs/tesla-v100.md); built from source, `scripts/run-v100.sh`):
 
@@ -138,6 +139,7 @@ The platform guides cover GPU checks, Docker, native builds and model mounts:
 | `run qwen38-27b int8` | Reference profile: one user, INT8 KV (the quality default), 64K context |
 | `run qwen38-27b c8` | Reference profile: eight lanes at 8K, highest aggregate throughput |
 | `run.bat qwen38-flash-next` | **Preview, Windows.** Qwen3.8-Flash-Next from the IQ2_XS GGUF: one user, 32K, MTP speculation with the drafter artifact, images with the vision artifact; needs ~38 GiB of free host RAM (~40 with images). See [Qwen3.8-Flash-Next](#qwen38-flash-next-preview) |
+| `run.bat qwen38-flash-next-iq3` | **Preview, Windows.** The same model from Unsloth's UD-IQ3_XXS GGUF: better text quality, about half the speed, text only; needs ~42 GiB of available host RAM and runs with `--partial-ram-residency`. See [which build](#which-flash-next-build) |
 
 Every default profile serves images (vision in overlay residency, which costs about 10 MiB of
 device reservation), uses `rk4v4` KV, and backs the context cache with 8 GiB of pinned host RAM
@@ -303,7 +305,8 @@ ran one user at 147,456 tokens; `rk4v4` stores the same context in 31% less memo
 
 ### Qwen3.8-Flash-Next (preview)
 
-The 48-layer, 512-expert Qwen3.8-Flash-Next runs from the ISTA DASLab GSQ-RCO IQ2_XS GGUF,
+The 48-layer, 512-expert Qwen3.8-Flash-Next runs in two builds that you choose between (below). The
+first is the ISTA DASLab GSQ-RCO IQ2_XS GGUF,
 converted exactly (no re-quantization) into a 39.2 GB `.ninfer` plus a 29.1 GB n-gram volume
 beside it (`tools/convert/qwen4_exp.py`; [plan](docs/maintainer/flash-next-plan.md)). It also runs
 on a 32 GB Tesla V100 under Linux with its full 262,144-token context
@@ -341,6 +344,30 @@ summaries rather than the earlier prompt set) was 96-98 tok/s, 1.16-1.22x plain,
 speculation pays off less on text that is harder to predict. Decode speed and its breakdown are in
 [the plan](docs/maintainer/flash-next-plan.md#pr-13-measurements); the server reference is
 [docs/serving.md](docs/serving.md#qwen38-flash-next-preview).
+
+#### Which Flash-Next build?
+
+`run.bat qwen38-flash-next-iq3` serves the same model from Unsloth's Dynamic v3.1 `UD-IQ3_XXS` GGUF
+(about 3.0 bits per routed weight against 2.35 for the IQ2_XS build). It reads better and runs
+slower, and it cannot take images. Measured on this RTX 3090 with a warm expert cache, the model and the
+n-gram volume on one SATA SSD, 512 generated tokens, medians of 5 requests after a 1K / 8K / 30K prompt
+([model card](model-cards/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090/README.md) has the ranges):
+
+| | IQ2_XS (`qwen38-flash-next`) | UD-IQ3_XXS (`qwen38-flash-next-iq3`) |
+|---|---:|---:|
+| Perplexity, six fixed texts, 5,114 positions (lower is better) | 6.315 | **5.859** (-7.2%; paired -0.075 +- 0.012 nats) |
+| Decode with MTP, tok/s | **115 / 111 / 106** | 61 / 62 / 64 |
+| Decode without MTP, tok/s | **84 / 86 / 83** | 46 / 55 / 56 |
+| Prefill, tok/s | **1,142 / 2,225 / 2,293** | 650 / 894 / 905 |
+| Images | yes | no |
+| Available RAM needed to start | about 40 GiB | about 42 GiB |
+
+Pick IQ2_XS for speed and images, UD-IQ3_XXS for the best text quality. The UD-IQ3_XXS build keeps its
+experts partly in VRAM and partly in pinned host RAM (`--partial-ram-residency`, on in the launcher),
+which is why it takes no images and prefills slower. Both read one n-gram volume, downloaded once by
+`download-model`. The quality figures compare the two builds with each other on short fixed texts, not
+with the unquantized model. How its files are made, including the one place the converter rounds, is in
+[weight conversion](docs/weight-conversion.md#convert-a-gguf).
 
 A later session measured a batch of opt-in speed options from #383 ("Basalt learnings") against
 off, each on an RTX 3090, ABBA A/B, 12 repetitions: `--prefill-cpu-share 0.4` is the clear win on
@@ -509,10 +536,12 @@ a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding wor
 | Qwen3.6-35B-A3B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/ee4495803bc4f8015b8a7e22d4cf9b67de8e27c6) | 21.23 GiB | Carries the DFlash bundle for `--spec dflash` |
 | Qwen3.6-27B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-27B-NInfer/tree/3e3d9a3951c452c1ca80bd7a2860c7f3bfc5a829) | 16.29 GiB | Supported with more runtime headroom |
 | Qwen3.8-Flash-Next (preview) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090/tree/c7dfb9694fc3cb3d40298afbfe2e3a8c172241fa) | 38.20 GiB in two files + 27.13 GiB n-gram volume | Windows, one request at a time (two lanes opt-in), 64 GB RAM. This fork's [exact conversion](model-cards/Qwen3.8-Flash-Next-NInfer-3090/README.md) of the GSQ-RCO IQ2_XS GGUF with the MTP drafter and vision tower. Keep the n-gram volume on NVMe |
+| Qwen3.8-Flash-Next, UD-IQ3_XXS (preview) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090/tree/38039dacc0e9ced2f4a8d233b44d33d8a663f933) | 53.17 GiB in two files + the 27.13 GiB n-gram volume of the row above | Windows, one request at a time, 64 GB RAM (about 42 GiB available), text only. This fork's [conversion](model-cards/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090/README.md) of Unsloth's Dynamic v3.1 UD-IQ3_XXS GGUF with the MTP drafter: lower perplexity than the row above, about half the speed |
 
 `download-model qwen38-27b`, `bonsai2-27b`, `qwen36-35b-a3b` or `qwen36-27b` (`.bat` on Windows, `.sh` on Linux)
 fetches the pinned revision into `models/` and verifies it. `download-model qwen38-flash-next`
-fetches the Flash-Next model, its second file and the n-gram volume the same way; it asks which folder the volume goes in (`NINFER_NGRAM_DIR` answers in advance), because the volume is
+fetches the Flash-Next model, its second file and the n-gram volume the same way (`qwen38-flash-next-iq3`
+fetches the UD-IQ3_XXS build, which reuses the same volume if it is already there); it asks which folder the volume goes in (`NINFER_NGRAM_DIR` answers in advance), because the volume is
 read on every prompt and an NVMe drive prefills 1.1-1.4x faster than a SATA SSD. **Optional bundles cost nothing in VRAM
 unless selected**: the DFlash and DFlash2 weights are bound only with `--spec dflash`/`--spec
 dflash2`.

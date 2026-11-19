@@ -23,6 +23,7 @@ void ggml_mmvq_pair_launch(QType first, QType second, const std::uint8_t* w1, co
     case QType::GGML_Q6_K: return ggml_mmvq_pair_second<QType::GGML_Q6_K>(second, w1, w2, x, out1, out2, n1, n2, t, stream);
     case QType::GGML_Q5_K: return ggml_mmvq_pair_second<QType::GGML_Q5_K>(second, w1, w2, x, out1, out2, n1, n2, t, stream);
     case QType::GGML_Q4_K: return ggml_mmvq_pair_second<QType::GGML_Q4_K>(second, w1, w2, x, out1, out2, n1, n2, t, stream);
+    case QType::GGML_Q8_0: return ggml_mmvq_pair_second<QType::GGML_Q8_0>(second, w1, w2, x, out1, out2, n1, n2, t, stream);
     default: break;
     }
     throw std::invalid_argument("ggml linear_pair: unsupported first format");

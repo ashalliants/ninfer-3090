@@ -1201,6 +1201,42 @@ None has been measured on the RTX 3090 yet.
     bit against the emulation), `ninfer_linear_ggml_device_decode_test`,
     `ninfer_projection_fp32_test` (Q6_K and Q5_K heads) and `ninfer_embedding_test` (IQ3_S); the
     decode and prefill speed of the K-quant projections is unmeasured.
+- **Unsloth's UD-IQ3_XXS (Dynamic v3.1)** (`unsloth/Qwen3.8-Flash-Next-GGUF` @ f5d175de, second Flash-Next
+  build; the model card is `model-cards/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090`). Its tensor table
+  differs from the GSQ-RCO packs' where the engine cared:
+  - Experts: gate/up IQ2_S, IQ3_XXS or IQ4_XS, down Q2_0 or IQ4_NL: record formats the IQ3 packs already
+    added (`ggml_rec_iq2_s_iq4_nl`, `_iq2_s_q2_0`, `_iq3_xxs_iq4_nl`, `_iq4_xs_iq4_nl`). 23 + 3 + 21 + 1 layers.
+    The bank is 42.3 GiB (the IQ2_XS pack's is 33.0), so it needs `--partial-ram-residency` on 64 GB: 36.5 GiB
+    of RAM slots and about 5,900-6,400 experts in VRAM.
+  - Dense: Q6_K everywhere, with one layer's GDN qkv and z and shared-expert gate and up in Q8_0 and the
+    shared-expert downs in Q8_0. Added: Q8_0 at [10240,2560], [6144,2560] and [640,2560] in
+    `ggml_shapes.h`, Q8_0 as a `linear_pair` format (`ggml_pair_q8_0.cu`; the K = 2560 instances are
+    the existing generic Q8_0 kernels). `ninfer_ggml_linear_registry_test` mirrors the new pack
+    (`UD-IQ3_XXS`).
+  - Token embedding and head Q6_K: `ops::embedding` gained a GGML Q6_K row gather (ggml's
+    `dequantize_row_q6_K`, `(d * scale) * (q - 32)` in FP32, one BF16 rounding), checked bit for bit
+    against the host decoder in `ninfer_embedding_test`. The head was already registered.
+  - BF16 tensors: the model reads the hyper-connection mixers, router, shared-expert score, GDN a/b and
+    PLE key/value as BF16 (`load.cpp`). Unsloth stores the first and last as Q8_0 and the others as F32,
+    so the converter stores them as BF16 (`BF16_PARAMETERS`): F32 must already hold BF16 words, Q8_0 is
+    decoded exactly and rounded once (196 tensors, 642,735,924 values). The independent verifier
+    checks them with its own integer rounding.
+  - Its first GGUF shard holds metadata only; `GgufFile` accepts a tensor-less file that ends before
+    its alignment padding.
+  - Its n-gram table is DASLab's, row for row (all 320,001,536 rows checked), so the artifact binds
+    to the IQ2_XS build's volume with `--ngram-reuse`.
+  - Quality (NInfer against NInfer, the six fixed texts of the Strata comparison above, 5,114
+    positions): perplexity 5.859 against IQ2_XS's 6.315, paired dNLL -0.075 +- 0.012 nats. No
+    full-precision reference was available, so this ranks the two builds only.
+  - Speed on the RTX 3090 (warm, medians of five, volume on the SATA drive, 512 generated tokens after a
+    1K / 8K / 30K prompt): decode 61 / 62 / 64 tok/s with MTP and 46 / 55 / 56 plain, against 115 / 111 / 106
+    and 84 / 86 / 83 for IQ2_XS; prefill 650 / 894 / 905 against 1,142 / 2,225 / 2,293 tok/s. Not
+    explained: the VRAM cache holds about 6,000 experts against 11,000-12,500 and the dense weights are
+    0.7 GiB larger, and partial residency prefills without the expert stream, which would account for
+    part of the gap; none of it was profiled.
+  - Found on the way: the shipped `qwen38-flash-next-tuned.json` carries `mtp-joint-acceptance` and
+    `gdn-async-commit`, which the server refuses without `--spec mtp`, so the launcher's
+    `NINFER_SPEC=none` and a non-MTP artifact do not start with it. Not changed here.
 - **Partial RAM residency** (`--partial-ram-residency`, F8 part 3; Basalt's resident RAM mode,
   `expert_source.hpp`). Host RAM holds only the routed experts the VRAM cache does not, plus
   spares, instead of every bank pinned whole.

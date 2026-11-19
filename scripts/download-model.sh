@@ -52,12 +52,12 @@ set -euo pipefail
 # otherwise. `apt-get install aria2` / `brew install aria2` to opt in.
 
 usage() {
-  printf 'usage: %s <model>\n\n  qwen38-27b (recommended)\n  bonsai2-27b\n  qwen36-27b\n  qwen36-35b-a3b\n  qwen38-flash-next (preview)\n' \
+  printf 'usage: %s <model>\n\n  qwen38-27b (recommended)\n  bonsai2-27b\n  qwen36-27b\n  qwen36-35b-a3b\n  qwen38-flash-next (preview)\n  qwen38-flash-next-iq3 (preview, Unsloth UD-IQ3_XXS)\n' \
     "${0##*/}" >&2
 }
 
-# Only qwen38-flash-next has continuation parts and an n-gram volume.
-part_sizes=() part_sha256s=() ngram_name=''
+# Only the qwen38-flash-next models have continuation parts and an n-gram volume.
+part_sizes=() part_sha256s=() ngram_name='' ngram_repo=''
 case "${1:-}" in
   qwen38-27b)
     artifact='qwen3_8_27b.ninfer'
@@ -115,6 +115,25 @@ case "${1:-}" in
     ngram_size=29127258112
     ngram_sha256='7623459b2385eef4505891c2ff133b3dd8ad4ecd0ad334c901878f3fa1d1b051'
     label='the Qwen3.8-Flash-Next model (38.2 GiB in two files)'
+    tests_variable='NINFER_TEST_QWEN4EXP_ARTIFACT'
+    ;;
+  # The Unsloth UD-IQ3_XXS build (3.0 bits per routed weight) of the same model. Its n-gram table is the
+  # same table, so it reads the volume of the IQ2_XS repo above: one 27.1 GiB file serves both builds.
+  qwen38-flash-next-iq3)
+    artifact='qwen4exp-ud-iq3xxs-mtp-vision.ninfer'
+    owner='WarlaxZ'
+    repo='Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090'
+    revision='38039dacc0e9ced2f4a8d233b44d33d8a663f933'
+    expected_size=32000000000
+    expected_sha256='0edec1ba7ba56e3cf0a0a2b3bfa990a7a645243c649265e507cdfa78c37a2fe6'
+    part_sizes=(25087457792)
+    part_sha256s=('f971f41af085d3e40cd3ef6658f34d09871f3e7145d328c18df1ec3010a021f7')
+    ngram_name='qwen4exp-iq2xs-mtp-vision.ninfer.ngram'
+    ngram_repo='Qwen3.8-Flash-Next-NInfer-3090'
+    ngram_revision='95b1b0169bd25db96ceb772a8a67cc6e87088a1f'
+    ngram_size=29127258112
+    ngram_sha256='7623459b2385eef4505891c2ff133b3dd8ad4ecd0ad334c901878f3fa1d1b051'
+    label='the Qwen3.8-Flash-Next UD-IQ3_XXS model (53.17 GiB in two files)'
     tests_variable='NINFER_TEST_QWEN4EXP_ARTIFACT'
     ;;
   -h|--help) usage; exit 0 ;;
@@ -269,7 +288,10 @@ fetch_file() {
   fi
 
   printf '%s\n' "Downloading $what..."
-  url="https://huggingface.co/$owner/$repo/resolve/$rev/$name"
+  # The shared n-gram volume lives in another repo (ngram_repo) for the IQ3 build.
+  local from_repo="$repo"
+  if [ "$kind" = volume ] && [ -n "$ngram_repo" ]; then from_repo="$ngram_repo"; fi
+  url="https://huggingface.co/$owner/$from_repo/resolve/$rev/$name"
   if command -v aria2c >/dev/null 2>&1; then
     # 16 parallel ranges over one file, not single-stream curl. On the Vast rental boxes this repo
     # downloads at ~98 MB/s over aria2c against the same throttled-to-~1MB/s (and once outright

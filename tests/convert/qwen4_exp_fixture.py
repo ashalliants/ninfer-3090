@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from tools.convert.qwen4_exp import NARROWED, head_tables, layer_multipliers
+from tools.convert.qwen4_exp import BF16_PARAMETERS, NARROWED, head_tables, layer_multipliers
 
 from .gguf_writer import tensor_bytes, write_gguf
 
@@ -15,7 +15,7 @@ from .gguf_writer import tensor_bytes, write_gguf
 H, F, E, HC, LOW = 256, 128, 4, 2, 8
 F32, F16, Q8_0, IQ2_XXS, IQ4_NL, IQ2_S, IQ1_M, BF16, Q2_0 = 0, 1, 8, 16, 20, 22, 29, 30, 42
 IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS = 17, 18, 21, 23
-Q4_K, Q5_K = 12, 13
+Q4_K, Q5_K, Q6_K = 12, 13, 14
 # (gate/up, down) types of each layer's experts: the IQ2_XS pack's three record formats. The
 # GSQ-RCO IQ3 packs mix other pairs, and downs, across layers (``write(experts=...)``).
 EXPERT_TYPES = ((IQ2_S, Q2_0), (IQ2_XXS, Q2_0), (IQ1_M, Q2_0), (IQ2_S, Q2_0))
@@ -167,7 +167,18 @@ def tensors(
 def _bytes(name: str, kind: int, ne: tuple[int, ...], seed: int) -> bytes:
     """Random tensor bytes; the narrowed F32 tensors hold values with exact BF16 forms, as the
     real GGUF's do: BF16 words, or ``fl32(1 + gamma)`` of a BF16 gamma for the q/k norms."""
-    rule = NARROWED.get(name.split(".", 2)[-1]) if name.startswith("blk.") else None
+    suffix = name.split(".", 2)[-1] if name.startswith("blk.") else name
+    if kind == Q8_0:
+        # Random int8 quants under finite FP16 scales (random scale bytes could be inf or NaN).
+        blocks = np.frombuffer(bytearray(tensor_bytes(kind, ne, seed=seed)), dtype=np.uint8).reshape(-1, 34)
+        scales = np.random.default_rng(seed + 1).uniform(-1, 1, len(blocks)).astype("<f2")
+        blocks[:, :2] = scales.view(np.uint8).reshape(-1, 2)
+        return blocks.tobytes()
+    if kind == F32 and suffix in BF16_PARAMETERS:
+        # Tensors the model reads as BF16: an F32 GGUF holds BF16 words there.
+        words = np.random.default_rng(seed).uniform(-0.5, 0.5, prod(ne)).astype(np.float32)
+        return ((words.view(np.uint32) >> 16) << 16).view(np.float32).astype("<f4").tobytes()
+    rule = NARROWED.get(suffix) if name.startswith("blk.") else None
     if rule is None or kind != F32:
         return tensor_bytes(kind, ne, seed=seed)
     rng = np.random.default_rng(seed)

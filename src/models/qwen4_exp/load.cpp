@@ -356,8 +356,8 @@ QType bound_format(const artifact::Reader& reader, const PendingWeight& weight) 
 void require_text_formats(const artifact::Reader& reader, const std::vector<PendingWeight>& pending,
                           const TextWeights& text, bool hot_embedding) {
     const QType embedding = bound_format(reader, pending.at(text.token_embedding.index));
-    if (embedding != QType::GGML_IQ4_XS && embedding != QType::GGML_IQ3_S) {
-        throw ArtifactError("text/token_embedding: expected ggml_iq4_xs or ggml_iq3_s rows, got " +
+    if (embedding != QType::GGML_IQ4_XS && embedding != QType::GGML_IQ3_S && embedding != QType::GGML_Q6_K) {
+        throw ArtifactError("text/token_embedding: expected ggml_iq4_xs, ggml_iq3_s or ggml_q6_k rows, got " +
                             std::string(artifact::format_name(embedding)));
     }
     require_hot_embedding_format(embedding, hot_embedding ? 1U : 0U);
@@ -454,6 +454,7 @@ struct LoadPlan::Impl {
     FrontendResources resources;
     InstanceInfo info;
     std::vector<std::uint64_t> strides;
+    QType token_embedding = QType::GGML_IQ4_XS;
     // Partial RAM residency: the text banks, left in the file (empty otherwise).
     std::vector<ExpertBank> file_banks;
 };
@@ -468,6 +469,7 @@ const FrontendResources& LoadPlan::resources() const { return impl_->resources; 
 std::uint64_t LoadPlan::device_bytes() const { return impl_->materialization.device_capacity(0); }
 std::uint64_t LoadPlan::pinned_bytes() const { return impl_->materialization.pinned_capacity_bytes; }
 const std::vector<std::uint64_t>& LoadPlan::expert_record_strides() const { return impl_->strides; }
+QType LoadPlan::token_embedding_format() const { return impl_->token_embedding; }
 
 Model::Model(TextConfig config, TextWeights weights, std::optional<MtpWeights> mtp, std::vector<BoundWeight> bound,
              std::vector<ExpertBank> banks, std::optional<ExpertBank> mtp_bank, std::optional<VisionWeights> vision,
@@ -508,6 +510,7 @@ LoadPlan plan_load(const artifact::Reader& reader, bool mtp, bool vision, bool h
     if (vision) { out->vision = bind_vision(bindings, *out->vision_config, out->config); }
     out->pending         = std::move(bindings.weights);
     require_text_formats(reader, out->pending, out->weights, hot_embedding);
+    out->token_embedding = bound_format(reader, out->pending.at(out->weights.token_embedding.index));
     for (const auto& layer : out->weights.layers) {
         const auto& parts = out->pending.at(layer.moe.experts.index).reference.binding.parts;
         if (parts.size() != 1) { throw ArtifactError("an expert bank must be one complete parent"); }

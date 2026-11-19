@@ -61,6 +61,8 @@ public:
     [[nodiscard]] std::uint64_t pinned_bytes() const;
     // Each layer's expert record stride (the bank's record format).
     [[nodiscard]] const std::vector<std::uint64_t>& expert_record_strides() const;
+    // The token embedding's stored format (GGML IQ4_XS, IQ3_S or Q6_K): --hot-embedding-rows reads it.
+    [[nodiscard]] QType token_embedding_format() const;
 
     struct Impl;
 

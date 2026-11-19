@@ -230,7 +230,58 @@ __global__ void embed_gather_iq3_s_kernel(const std::int32_t* __restrict__ ids, 
     out[static_cast<std::size_t>(t) * d + v] = __float2bfloat16_rn(value);
 }
 
+// Q6_K: {u8 ql[128]; u8 qh[64]; int8 scales[16]; fp16 d} per 256 values. One thread per output
+// value, in ggml's operation order (dequantize_row_q6_K): (d * scale) * (q - 32), FP32 products.
+// Value i of a block (h = i / 128, qd = (i % 128) / 32, l = i % 32) takes the nibble qd >> 1 of
+// ql[64 h + 32 (qd & 1) + l], two high bits (2 qd) of qh[32 h + l], and scales[i / 16].
+constexpr int kQ6kBlockBytes = 210;
+// Split: rows below hot_rows come from `hot`, the rest from `table` (embedding_split); otherwise every
+// row comes from `table`.
+template <bool Split>
+__global__ void embed_gather_q6_k_kernel(const std::int32_t* __restrict__ ids, const std::uint8_t* __restrict__ table,
+                                         const std::uint8_t* __restrict__ hot, std::int32_t hot_rows,
+                                         std::int64_t row_bytes, int d, __nv_bfloat16* __restrict__ out) {
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (v >= d) { return; }
+    const std::int32_t id     = ids[t];
+    const std::uint8_t* plane = table;
+    if constexpr (Split) {
+        if (id < hot_rows) { plane = hot; }
+    }
+    const std::uint8_t* block = plane + static_cast<std::int64_t>(id) * row_bytes +
+                                static_cast<std::int64_t>(v / 256) * kQ6kBlockBytes;
+    const int i = v % 256, h = i / 128, qd = (i % 128) / 32, l = i % 32;
+    const int ql   = block[64 * h + 32 * (qd & 1) + l];
+    const int low  = (qd >> 1) ? (ql >> 4) : (ql & 0xF);
+    const int high = (block[128 + 32 * h + l] >> (2 * qd)) & 3;
+    const int q    = (low | (high << 4)) - 32;
+    const auto d_bits = static_cast<unsigned short>(block[208] | (static_cast<unsigned>(block[209]) << 8));
+    const float scale = __fmul_rn(__half2float(__ushort_as_half(d_bits)),
+                                  static_cast<float>(static_cast<std::int8_t>(block[192 + i / 16])));
+    out[static_cast<std::size_t>(t) * d + v] = __float2bfloat16_rn(__fmul_rn(scale, static_cast<float>(q)));
+}
+
 } // namespace
+
+void embed_gather_ggml_q6_k_launch(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
+    const int d = out.ne[0];
+    const std::int64_t row_bytes = static_cast<std::int64_t>(d / 256) * kQ6kBlockBytes;
+    embed_gather_q6_k_kernel<false><<<dim3((d + 255) / 256, ids.ne[0]), 256, 0, stream>>>(
+        static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(table.qdata), nullptr, 0,
+        row_bytes, d, static_cast<__nv_bfloat16*>(out.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void embed_gather_ggml_q6_k_split_launch(const Tensor& ids, const Weight& hot, const Weight& cold,
+                                         std::int32_t hot_rows, Tensor& out, cudaStream_t stream) {
+    const int d = out.ne[0];
+    const std::int64_t row_bytes = static_cast<std::int64_t>(d / 256) * kQ6kBlockBytes;
+    embed_gather_q6_k_kernel<true><<<dim3((d + 255) / 256, ids.ne[0]), 256, 0, stream>>>(
+        static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(cold.qdata),
+        static_cast<const std::uint8_t*>(hot.qdata), hot_rows, row_bytes, d, static_cast<__nv_bfloat16*>(out.data));
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void embed_gather_ggml_iq3_s_launch(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
     const int d = out.ne[0];
