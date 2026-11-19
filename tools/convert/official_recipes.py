@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .dsv4_model import dsv4_gguf
 from .methods import cast_direct, fp8_row_maxabs, grouped_absmax, import_encoded
 from .qwen4_exp import (
     bound_volume_id,
@@ -301,4 +302,5 @@ RECIPES = {
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
     "qwen4_exp_gguf": qwen4_exp_gguf,
+    "dsv4_gguf": dsv4_gguf,
 }
