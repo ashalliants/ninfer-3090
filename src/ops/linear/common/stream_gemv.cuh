@@ -428,12 +428,24 @@ bool try_launch_stream_gemv_rows(const __nv_bfloat16* x, std::int64_t x_stride,
                                                                      shared_bytes));
             blocks = std::max(1, std::min(div_up(items, Warps), sms * std::max(per_sm, 1)));
         } else {
-            // K-chunked: one CTA per SM; the partials take what the chunk leaves.
-            blocks = std::max(1, std::min(div_up(items, Warps), sms));
-            const std::size_t partial_bytes =
-                static_cast<std::size_t>(div_up(items, blocks * Warps)) * Warps * Rows * Cols *
-                sizeof(float);
+            // K-chunked: one CTA per SM; the partials take what the chunk leaves. A matrix with
+            // too many rows for one wave's partials (the 248320-row Q6 head at eight tokens:
+            // ~97 KB a CTA, past the whole budget) runs further waves of CTAs until a CTA's
+            // partials take at most half of shared memory; each CTA restages the chunks of x, a
+            // few hundred KB from L2.
             const std::size_t budget = static_cast<std::size_t>(kMaxDynamicSharedBytes);
+            const auto partial_for = [&](int b) {
+                return static_cast<std::size_t>(div_up(items, b * Warps)) * Warps * Rows * Cols *
+                       sizeof(float);
+            };
+            const int max_blocks = std::max(1, div_up(items, Warps));
+            blocks               = std::max(1, std::min(max_blocks, sms));
+            if (partial_for(blocks) + stream_gemv_stage_bytes(256, Cols) > budget) {
+                while (partial_for(blocks) > budget / 2 && blocks < max_blocks) {
+                    blocks = std::min(max_blocks, blocks + sms);
+                }
+            }
+            const std::size_t partial_bytes = partial_for(blocks);
             if (partial_bytes + stream_gemv_stage_bytes(256, Cols) > budget) return false;
             chunk_k = static_cast<std::int32_t>(
                 (budget - partial_bytes) / stream_gemv_stage_bytes(256, Cols) * 256);

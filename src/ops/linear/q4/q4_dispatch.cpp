@@ -1,5 +1,6 @@
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q4/q4_shapes.h"
+#include "ops/linear/common/stream_tokens_sm70.h"
 #include <array>
 #include <stdexcept>
 
@@ -65,6 +66,12 @@ Q4Launch select_q4_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 
 void q4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                  cudaStream_t stream) {
-    select_q4_launch(weight.n, weight.k, x.ne[1], policy)(x, weight, out, stream);
+    // The table admits the shape and policy whichever kernel runs.
+    const auto launch = select_q4_launch(weight.n, weight.k, x.ne[1], policy);
+#if defined(NINFER_SM70)
+    // 2..64 tokens: the streaming GEMV, not the tables' emulated small-T mma (stream_tokens_sm70.h).
+    if (try_launch_q4_stream_tokens(x, weight, out, stream)) return;
+#endif
+    launch(x, weight, out, stream);
 }
 } // namespace ninfer::ops::detail
