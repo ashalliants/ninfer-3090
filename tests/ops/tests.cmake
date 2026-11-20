@@ -133,6 +133,10 @@ ninfer_add_op_test(ninfer_moe_route_sqrt_softplus_test
 ninfer_add_op_test(ninfer_gathered_sink_attention_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gathered_sink_attention.cpp"
   LIBRARIES ninfer_ops)
+# DeepSeek-V4's rotary embedding (adjacent pairs, tail of the head, table frequencies, inverse) against an FP64 oracle.
+ninfer_add_op_test(ninfer_rope_pairs_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rope_pairs.cpp"
+  LIBRARIES ninfer_ops)
 # Host-only: the int8 hyper-connection codec (--hc-int8): the group rule the quantize kernel runs,
 # against exact FP64 checks and an independent re-implementation of Basalt's rule.
 ninfer_add_op_test(ninfer_hc_int8_codec_test
