@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -115,10 +116,9 @@ def main() -> int:
     if final.exists() and any(final.iterdir()):
         parser.error(f"{final} is not empty")
     # Written beside the target and renamed once complete, so a failed export never leaves a half fixture there.
-    args.out = final.with_name(final.name + ".partial")
-    if args.out.exists():
-        shutil.rmtree(args.out)
-    args.out.mkdir(parents=True)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    args.out = Path(tempfile.mkdtemp(prefix=final.name + ".partial-", dir=final.parent))  # unique, owned by this run
+    _OWNED.append(args.out)
 
     config: dict = {"layer": args.layer, "tokens": args.tokens}
     with GgufModel(args.gguf) as gguf:
@@ -199,5 +199,13 @@ def main() -> int:
     return 0
 
 
+_OWNED: list[Path] = []  # the temporary directories this run created; removed if the export fails
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except BaseException:
+        for path in _OWNED:
+            if path.exists():
+                shutil.rmtree(path, ignore_errors=True)
+        raise
