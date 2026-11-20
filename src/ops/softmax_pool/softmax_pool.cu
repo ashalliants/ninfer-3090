@@ -5,6 +5,7 @@
 
 #include <cuda_bf16.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -22,28 +23,31 @@ void require(bool condition, const char* message) {
 }
 
 // One thread per (channel, group); consecutive threads take consecutive channels, so every token's
-// loads are contiguous across the warp. The block index flattens (group, channel tile) so neither
-// extent meets a grid-dimension limit. The group is pooled as a running convex combination
+// loads are contiguous across the warp. The blocks flatten (group, channel tile) and a grid-stride
+// loop covers them, so no extent meets a grid-dimension limit. The group is pooled as a running convex combination
 // (mean = mean * (1 - w) + w * kv with w = e / (sum so far)), so finite inputs of any size give a
 // finite output: a plain sum of e * kv overflows FP32 for kv near the BF16 maximum.
 __global__ void __launch_bounds__(kThreads)
 softmax_pool_kernel(const __nv_bfloat16* __restrict__ kv, const __nv_bfloat16* __restrict__ score, int dim, int ratio,
-                    int tiles, __nv_bfloat16* __restrict__ out) {
-    const int g    = blockIdx.x / tiles;
-    const int d    = (blockIdx.x % tiles) * kThreads + threadIdx.x;
-    if (d >= dim) { return; }
-    const std::size_t first = static_cast<std::size_t>(g) * ratio;
-    float m = -INFINITY;
-    for (int i = 0; i < ratio; ++i) { m = fmaxf(m, __bfloat162float(score[(first + i) * dim + d])); }
-    float denom = 0.0F, pooled = 0.0F;
-    for (int i = 0; i < ratio; ++i) {
-        const float e = expf(__bfloat162float(score[(first + i) * dim + d]) - m);
-        if (e == 0.0F) { continue; } // contributes nothing (and must not make the first weight 0 / 0)
-        denom += e;
-        const float w = e / denom;
-        pooled        = fmaf(w, __bfloat162float(kv[(first + i) * dim + d]), pooled * (1.0F - w));
+                    long long tiles, long long total_blocks, __nv_bfloat16* __restrict__ out) {
+    // A grid-stride loop over the flattened (group, channel tile) blocks: any extent is served whatever the grid holds.
+    for (long long block = blockIdx.x; block < total_blocks; block += gridDim.x) {
+        const long long g = block / tiles;
+        const int d       = static_cast<int>(block % tiles) * kThreads + threadIdx.x;
+        if (d >= dim) { continue; }
+        const std::size_t first = static_cast<std::size_t>(g) * ratio;
+        float m = -INFINITY;
+        for (int i = 0; i < ratio; ++i) { m = fmaxf(m, __bfloat162float(score[(first + i) * dim + d])); }
+        float denom = 0.0F, pooled = 0.0F;
+        for (int i = 0; i < ratio; ++i) {
+            const float e = expf(__bfloat162float(score[(first + i) * dim + d]) - m);
+            if (e == 0.0F) { continue; } // contributes nothing (and must not make the first weight 0 / 0)
+            denom += e;
+            const float w = e / denom;
+            pooled        = fmaf(w, __bfloat162float(kv[(first + i) * dim + d]), pooled * (1.0F - w));
+        }
+        out[static_cast<std::size_t>(g) * dim + d] = __float2bfloat16_rn(pooled);
     }
-    out[static_cast<std::size_t>(g) * dim + d] = __float2bfloat16_rn(pooled);
 }
 
 bool overlaps(const Tensor& a, const Tensor& b) {
@@ -66,10 +70,11 @@ void softmax_pool(const Tensor& kv, const Tensor& score, int ratio, Tensor& out,
     require(score.ne[0] == dim && score.ne[1] == tokens && out.ne[0] == dim, "shapes disagree");
     require(!overlaps(out, kv) && !overlaps(out, score), "out overlaps an input");
     const long long tiles = (static_cast<long long>(dim) + kThreads - 1) / kThreads;
-    require(static_cast<long long>(groups) * tiles <= 2147483647LL, "too many groups of channels for one launch");
-    softmax_pool_kernel<<<static_cast<unsigned>(static_cast<long long>(groups) * tiles), kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(kv.data), static_cast<const __nv_bfloat16*>(score.data), dim, ratio,
-        static_cast<int>(tiles), static_cast<__nv_bfloat16*>(out.data));
+    const long long total = static_cast<long long>(groups) * tiles;
+    const unsigned grid   = static_cast<unsigned>(std::min<long long>(total, 2147483647LL));
+    softmax_pool_kernel<<<grid, kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(kv.data),
+                                                       static_cast<const __nv_bfloat16*>(score.data), dim, ratio, tiles, total,
+                                                       static_cast<__nv_bfloat16*>(out.data));
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) { throw std::runtime_error(std::string("softmax_pool: ") + cudaGetErrorString(error)); }
 }
