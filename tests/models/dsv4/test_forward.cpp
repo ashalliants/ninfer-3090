@@ -60,7 +60,7 @@ int main() {
     const char* path = std::getenv("NINFER_TEST_DSV4_ARTIFACT");
     if (path == nullptr) {
         std::printf("SKIP: NINFER_TEST_DSV4_ARTIFACT is not set\n");
-        return 0;
+        return 77; // the SKIP_RETURN_CODE the registration declares
     }
     std::vector<std::int32_t> prompt{0, 671, 6102, 294, 8760, 344};
     if (const char* env = std::getenv("NINFER_DSV4_TOKENS")) {
@@ -131,6 +131,28 @@ int main() {
     const double decode_seconds = seconds_since(t0);
     std::printf("generated ids:");
     for (const auto id : generated) { std::printf(" %d", id); }
+    // Decode must equal prefill: running prompt + generated[:-1] as ONE chunk gives, at its last position, the
+    // token greedy decoding produced last. (Starting at position 0 begins a new sequence over the earlier state.)
+    if (generated.size() >= 2) {
+        std::vector<std::int32_t> all(prompt);
+        all.insert(all.end(), generated.begin(), generated.end() - 1);
+        if (all.size() <= forward_options.limits.max_chunk) {
+            forward.run(all, 0);
+            const std::int32_t again = forward.argmax();
+            std::printf("decode equals prefill: %d vs %d\n", static_cast<int>(again), static_cast<int>(generated.back()));
+            check(again == generated.back(), "the last greedy token equals the prefill's argmax over the same tokens");
+            // Rebuild the decode state the loop left, so the warm probe below runs as before.
+            forward.run(prompt, 0);
+            for (std::size_t i = 0; i + 1 < generated.size(); ++i) {
+                forward.run(std::span<const std::int32_t>(&generated[i], 1), static_cast<std::int32_t>(prompt.size() + i));
+            }
+            next     = generated.back();
+            position = static_cast<std::int32_t>(prompt.size() + generated.size() - 1);
+        }
+    }
+    if (std::getenv("NINFER_DSV4_TOKENS") == nullptr && generated.size() >= 2) {
+        check(generated[0] == 11111 && generated[1] == 16, "the default prompt continues with ' Paris' and '.'");
+    }
     std::printf("\ndecode: %d tokens in %.2f s (%.2f s/token)\n", new_tokens, decode_seconds, decode_seconds / std::max(new_tokens, 1));
     const auto& stats = experts.stats();
     std::printf("expert cache: %llu hits, %llu misses, %.1f GB read\n", static_cast<unsigned long long>(stats.hits),
@@ -151,6 +173,7 @@ int main() {
         std::printf("warm decode probe: %d steps in %.3f s (%.1f ms/token), %llu hits, %llu misses\n", warm_steps, warm,
                     1000.0 * warm / warm_steps, static_cast<unsigned long long>(w.hits), static_cast<unsigned long long>(w.misses));
     }
+    std::printf("%s", forward.profile_report().c_str());
     if (failures == 0) { std::printf("PASS\n"); }
     return failures == 0 ? 0 : 1;
 }

@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::models::dsv4 {
 namespace {
@@ -46,11 +47,16 @@ struct Forward::Impl {
     Tensor identity_pre;
     DeviceArena workspace;
     Tensor residual_view;
+    Tensor residual_last;
     Tensor logits;
     std::int32_t position = 0;
+    std::int32_t last_columns = 0; // the last call's token count: what residual() exposes
     // NINFER_DSV4_PROFILE=1: each stage is timed on the host between stream synchronizations (slows the run
-    // down; the report goes to stderr from the destructor).
-    bool profile = std::getenv("NINFER_DSV4_PROFILE") != nullptr;
+    // down; profile_report() returns the numbers).
+    bool profile = [] {
+        const char* v = std::getenv("NINFER_DSV4_PROFILE");
+        return v != nullptr && v[0] != '\0' && std::string(v) != "0";
+    }();
     bool recording = false; // only decode steps from position 16 on (the warm ones) are recorded
     double stage_seconds[6] = {};
     std::int64_t stage_calls = 0;
@@ -138,14 +144,20 @@ struct Forward::Impl {
 Forward::Forward(const Model& model, ExpertSource& experts, ForwardOptions options, cudaStream_t stream)
     : impl_(std::make_unique<Impl>(model, experts, options, stream)) {}
 
-Forward::~Forward() {
+Forward::~Forward() = default;
+
+std::string Forward::profile_report() const {
     const Impl& s = *impl_;
-    if (s.profile && s.stage_calls > 0) {
-        static const char* names[6] = {"embedding", "attention mixes+collapse+norm", "attention layer", "attention expand", "ffn sublayer", "head"};
-        for (int i = 0; i < 6; ++i) {
-            std::fprintf(stderr, "dsv4 profile: %-30s %9.3f ms per call\n", names[i], 1000.0 * s.stage_seconds[i] / double(s.stage_calls));
-        }
+    std::string out;
+    if (!s.profile || s.stage_calls == 0) { return out; }
+    static const char* names[6] = {"embedding", "attention mixes+collapse+norm", "attention layer", "attention expand", "ffn sublayer", "head"};
+    for (int i = 0; i < 6; ++i) {
+        char line[160];
+        std::snprintf(line, sizeof line, "dsv4 profile: %-30s %9.3f ms per decoded token\n", names[i],
+                      1000.0 * s.stage_seconds[i] / double(s.stage_calls));
+        out += line;
     }
+    return out;
 }
 
 std::size_t Forward::device_bytes() const noexcept {
@@ -153,7 +165,13 @@ std::size_t Forward::device_bytes() const noexcept {
     return i.state.device_bytes() + i.residual_buffer.bytes + i.mixes_buffer.bytes + i.logits_buffer.bytes + i.workspace.capacity();
 }
 
-const Tensor& Forward::residual() const { return impl_->residual_view; }
+const Tensor& Forward::residual() const {
+    // The buffer holds max_chunk columns; the view is the last call's.
+    Impl& s = *impl_;
+    s.residual_last = s.residual_view;
+    s.residual_last.ne[1] = std::max(s.last_columns, 1);
+    return s.residual_last;
+}
 
 const Tensor& Forward::run(std::span<const std::int32_t> tokens, std::int32_t start) {
     Impl& s              = *impl_;
@@ -237,7 +255,8 @@ const Tensor& Forward::run(std::span<const std::int32_t> tokens, std::int32_t st
     }
     s.end(5);
     if (s.recording) { ++s.stage_calls; }
-    s.position = start + T;
+    s.position     = start + T;
+    s.last_columns = T;
     return s.logits;
 }
 

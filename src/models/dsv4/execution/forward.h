@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace ninfer::models::dsv4 {
@@ -52,6 +53,9 @@ public:
     [[nodiscard]] const Tensor& residual() const;
     // Greedy token of the last call's logits (synchronizes the stream).
     [[nodiscard]] std::int32_t argmax();
+
+    // NINFER_DSV4_PROFILE=1: per-stage host timing of the decode steps from position 16 on (empty otherwise).
+    [[nodiscard]] std::string profile_report() const;
 
     [[nodiscard]] bool engram_applied() const noexcept { return false; }
     [[nodiscard]] std::size_t device_bytes() const noexcept;
