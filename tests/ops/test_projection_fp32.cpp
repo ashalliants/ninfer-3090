@@ -332,8 +332,7 @@ ninfer::Weight head_weight(QType format, std::int32_t n, std::int32_t k, void* d
 
 // N rows of K = 2560; `sampled` checks every 977th row and the last against FP64 (the vocabulary
 // head's 248,320 rows), otherwise every row.
-void head_case(QType format, std::int32_t n, std::uint32_t seed, bool sampled) {
-    constexpr std::int32_t k = 2560;
+void head_case(QType format, std::int32_t n, std::uint32_t seed, bool sampled, std::int32_t k = 2560) {
     const std::string name   = head_name(format);
     const auto bytes         = head_blocks(format, n, k, seed);
     auto* dw                 = device(bytes);
@@ -416,7 +415,10 @@ void head_case(QType format, std::int32_t n, std::uint32_t seed, bool sampled) {
         cudaFree(dout);
     }
     // An odd N and another K are refused.
-    for (const auto& [bad_n, bad_k] : {std::pair{n - 1, k}, std::pair{n, 6144}}) {
+    // (the K = 5120 form takes any N, so only the other K is refused there)
+    std::vector<std::pair<std::int32_t, std::int32_t>> refused{{n, 6144}};
+    if (k == 2560) { refused.push_back({n - 1, k}); }
+    for (const auto& [bad_n, bad_k] : refused) {
         bool threw = false;
         try {
             auto* dx = device(std::vector<std::uint16_t>(static_cast<std::size_t>(bad_k), 0));
@@ -534,6 +536,7 @@ int main() {
             head_case(format, 1000, 51, false);
             head_case(format, 248320, 53, true); // the Flash-Next LM head, sampled rows
         }
+        head_case(QType::GGML_Q5_K, 129280, 57, true, 5120); // DeepSeek-V4.1-Flash's head, sampled rows
         // A head format outside the registry (Q4_K) is refused.
         {
             bool threw = false;

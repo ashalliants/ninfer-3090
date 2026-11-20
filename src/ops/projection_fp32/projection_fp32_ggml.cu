@@ -1,4 +1,4 @@
-// projection_fp32 with a GGML weight (the GGUF LM head: IQ4_XS, Q6_K or Q5_K, ggml_shapes.h
+// projection_fp32 with a GGML weight (the GGUF LM head: IQ4_XS, Q6_K or Q5_K, K = 2560 or Q5_K at 5120, ggml_shapes.h
 // kGgmlHeadFormats): the GGML linears' decode route (ops/linear/ggml/ggml_mmvq.cuh: the Q8_1 cast
 // in shared memory, then a dp4a GEMV) with an FP32 store instead of BF16. New for NInfer-3090;
 // Infernix's heads are BF16 or q8_g32_fp16.
@@ -23,6 +23,8 @@ namespace ninfer::ops {
 namespace {
 
 constexpr int kHeadK = detail::kGgmlHeadK;
+// DeepSeek-V4.1-Flash's Q5_K head [129280, 5120] (hidden size 5120); the 2560 form serves Qwen's heads.
+constexpr int kHeadKWide = 5120;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("projection_fp32: ") + message); }
@@ -34,13 +36,13 @@ std::uintptr_t head_alignment(QType format) {
     return format == QType::GGML_IQ4_XS ? 8 : format == QType::GGML_Q5_K ? 16 : 2;
 }
 
-template <QType F>
+template <QType F, int K = kHeadK>
 void run(const std::uint8_t* codes, const __nv_bfloat16* x, float* logits, std::int32_t rows, std::int32_t columns,
          cudaStream_t stream) {
-    static_assert(detail::ggml_k_registered(F, kHeadK), "the decode route compiles every head format at K = 2560");
+    static_assert(detail::ggml_k_registered(F, K), "the decode route compiles this head format at this K");
     for (std::int32_t first = 0; first < columns; first += detail::kGgmlDecodeMaxTokens) {
         const std::int32_t width = std::min(detail::kGgmlDecodeMaxTokens, columns - first);
-        ggml::launch_mmvq_k<F, kHeadK, false, float>(codes, x + static_cast<std::size_t>(first) * kHeadK,
+        ggml::launch_mmvq_k<F, K, false, float>(codes, x + static_cast<std::size_t>(first) * K,
                                                      logits + static_cast<std::size_t>(first) * rows, rows, width,
                                                      stream);
     }
@@ -66,15 +68,18 @@ void projection_fp32(const Tensor& x, const Weight& weight, Tensor& out, cudaStr
             "the weight must be a ggml_blocks_v1 IQ4_XS (8-byte aligned), Q5_K (16-byte aligned) or Q6_K "
             "(2-byte aligned) matrix");
     const std::int32_t k = x.ne[0], columns = x.ne[1], rows = weight.n;
-    require(weight.k == kHeadK && k == kHeadK && rows > 0 && columns > 0, "the GGML head form serves K = 2560");
+    const bool wide = weight.k == kHeadKWide;
+    require((weight.k == kHeadK || (wide && weight.qtype == QType::GGML_Q5_K)) && k == weight.k && rows > 0 && columns > 0,
+            "the GGML head form serves K = 2560, and K = 5120 for Q5_K");
     // The decode kernel gives a warp whole groups of rows.
     constexpr int kRowsPerWarp = 32 / ggml::mmvq_lanes_per_row(kHeadK / ggml::kSubValues);
     static_assert(kRowsPerWarp == 2);
-    require(rows % kRowsPerWarp == 0, "the GGML head form needs an even N");
+    require(wide || rows % kRowsPerWarp == 0, "the GGML head form needs an even N");
     require(out.ne[0] == rows && out.ne[1] == columns, "out must be FP32 [N, T]");
     const auto* codes = static_cast<const std::uint8_t*>(weight.qdata);
     const auto* xb    = static_cast<const __nv_bfloat16*>(x.data);
     auto* logits      = static_cast<float*>(out.data);
+    if (wide) { return run<QType::GGML_Q5_K, kHeadKWide>(codes, xb, logits, rows, columns, stream); }
     switch (weight.qtype) {
     case QType::GGML_IQ4_XS: return run<QType::GGML_IQ4_XS>(codes, xb, logits, rows, columns, stream);
     case QType::GGML_Q6_K: return run<QType::GGML_Q6_K>(codes, xb, logits, rows, columns, stream);
