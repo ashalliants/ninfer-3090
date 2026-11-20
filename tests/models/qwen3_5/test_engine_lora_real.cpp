@@ -5,8 +5,9 @@
 //             selecting it must produce the base model's tokens bit for bit (the adapter's update
 //             is exactly zero), and a base request on an Engine holding it must match an Engine with
 //             no adapters (base rounds keep their graphs and arithmetic).
-//   real      NINFER_TEST_LORA=<PEFT adapter dir> (Qwen3.8-27B-pi-adapted): the adapted greedy
-//             output differs from the base; it is the same with CUDA graphs on or off, under MTP,
+//   real      NINFER_TEST_LORA=<PEFT adapter dir> (Qwen3.8-27B-pi-adapted): the adapter changes
+//             the output (a greedy token, or a token's log-probability by >= 0.08 nats); the adapted
+//             greedy output is the same with CUDA graphs on or off, under MTP,
 //             and beside a concurrent base request in the same rounds; the base and the adapter
 //             never share cached context. NINFER_TEST_LORA_REFERENCE=<json> also compares with
 //             {"prompt": "...", "tokens": [ids]}: the greedy continuation a PEFT/transformers run
@@ -15,6 +16,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -80,6 +82,38 @@ std::vector<ninfer::TokenId> run(ninfer::Engine& engine, const std::string& text
     return engine.generate(engine.prepare(prompt(text, lora)), greedy(tokens)).generated_token_ids;
 }
 
+const std::string kPrompt = "Write a short Python function that returns the n-th Fibonacci number.";
+
+// Whether selecting the adapter changes what the model computes. The greedy tokens alone are too
+// weak a signal: on short prompts the pi adapter moves the chosen tokens' log-probabilities by
+// tenths of a nat without flipping an argmax (Fibonacci prompt, 64 tokens, on a V100: the same 64
+// tokens, the largest shift 0.31 nats). So the adapter passes when it changes a greedy token,
+// or when it moves a shared-prefix token's log-probability by at least kAdapterShift. An adapter
+// that is never applied moves nothing (an unadapted pass is the base pass bit for bit); one whose
+// FFN update is lost only shows the unfused FFN route's rounding, which is at most 0.04 nats on
+// the same prompt (measured with the pi adapter's B matrices zeroed).
+constexpr float kAdapterShift = 0.08F;
+
+bool adapter_changes_output(ninfer::Engine& engine) {
+    auto request                              = greedy(64);
+    request.execution.logprobs_top_k          = 0;
+    const auto base    = engine.generate(engine.prepare(prompt(kPrompt, "")), request);
+    const auto adapted = engine.generate(engine.prepare(prompt(kPrompt, "pi")), request);
+    const std::size_t n = std::min(base.token_logprobs.size(), adapted.token_logprobs.size());
+    float shift         = 0.0F;
+    std::size_t shared  = 0;
+    for (; shared < n && base.generated_token_ids[shared] == adapted.generated_token_ids[shared]; ++shared) {
+        shift = std::max(shift, std::abs(base.token_logprobs[shared].sampled.logprob -
+                                         adapted.token_logprobs[shared].sampled.logprob));
+    }
+    const bool diverged = base.generated_token_ids != adapted.generated_token_ids;
+    std::cout << "adapter effect: " << (diverged ? "tokens differ from " + std::to_string(shared)
+                                                 : std::string("same tokens"))
+              << ", largest log-probability shift on the " << shared << " shared tokens " << shift
+              << " nats\n";
+    return diverged || shift >= kAdapterShift;
+}
+
 int check(bool condition, const std::string& message) {
     if (condition) { return 0; }
     std::cerr << "FAIL: " << message << '\n';
@@ -127,8 +161,6 @@ void write_zero_adapter(const fs::path& dir) {
     }
 }
 
-const std::string kPrompt = "Write a short Python function that returns the n-th Fibonacci number.";
-
 int zero_scenario(const char* artifact) {
     const fs::path dir = fs::temp_directory_path() / ("ninfer_lora_zero_" + std::to_string(::getpid()));
     write_zero_adapter(dir);
@@ -160,7 +192,7 @@ int real_scenario(const char* artifact, const char* adapter) {
         ninfer::Engine engine(options(artifact, loras));
         base    = run(engine, kPrompt, "");
         adapted = run(engine, kPrompt, "pi");
-        failures += check(base != adapted, "the adapter did not change the greedy output");
+        failures += check(adapter_changes_output(engine), "the adapter did not change the model's output");
 
         // The base and the adapter never share cached context; the adapter shares with itself.
         const auto request = greedy(4, true);
