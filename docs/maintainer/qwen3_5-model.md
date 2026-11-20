@@ -265,8 +265,13 @@ carries.
 - `alpha / r` is folded into `B` at load. Matrices are uploaded once, BF16, into one buffer.
 - The dense FFN of a pass that selects an adapter takes the unfused route (`lora_ffn`: gate/up
   plane, LoRA on the plane, `silu_mul(_hadamard)`, `linear_add` down, LoRA on the residual), since
-  `linear_swiglu` never materializes the pre-activation. The workspace plan adds that route's peak
-  and each site's Op scratch when adapters are loaded.
+  `linear_swiglu` never materializes the pre-activation. The plane comes from
+  `ops::linear_swiglu_plane`, which takes the fused op's own routes up to the pre-activation (the
+  cuBLAS prefill GEMM, sm_70's streaming GEMV) with the base route's policy, so the adapted
+  projection is as fast as the base one and differs from it only by the plane's BF16 rounding;
+  plain `ops::linear` would land on sm_70's emulated MMA kernels (5x slower prefill, half-speed
+  decode on a V100). The workspace plan adds that route's peak and each site's Op scratch when
+  adapters are loaded.
 - Selection is per sequence: `PreparedPromptData::lora` (the frontend resolves the name) becomes
   `SequenceState::lora`, and each pass's `ExecutionCore::lora` (`ops::LoraColumns`, one slot per
   row) reaches `TextContext::set_lora`. The kernels take the selection by value, so a decode, MTP

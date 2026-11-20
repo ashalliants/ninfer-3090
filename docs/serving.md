@@ -2459,6 +2459,12 @@ selects an adapter runs eagerly (as `--no-cuda-graph` does) and costs the launch
 save; rounds of base-model requests replay the graphs and are bit-for-bit those of a server with no
 `--lora`. Prefill always runs eagerly.
 
+**Speed.** Measured on a Tesla V100 with Qwen3.8-27B (MTP3, INT8 KV, `--prefill-cublas`) and the
+pi adapter (r=32, MLP on all 64 layers, attention on 16): adapted decode 59 tok/s against the base
+model's 65 (MTP acceptance unchanged, 54-55%), adapted prefill of a 3,066-token prompt 1,030 tok/s
+against 1,150. The difference is the adapter's own kernels (about 7% of an adapted decode round)
+and the eager rounds (about 1.5%).
+
 **Context cache.** An adapter changes every activation, so its requests have their own cache
 identity, the base identity mixed with a digest of the adapter's tensors and scale: they reuse only
 checkpoints computed under the same adapter, never the base model's or another adapter's, and
