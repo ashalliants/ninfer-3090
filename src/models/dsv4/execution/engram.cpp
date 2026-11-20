@@ -208,6 +208,8 @@ Engram::Engram(const TextConfig& config, EngramHashParams params,
 }
 
 Engram::~Engram() {
+    // Pending copies out of pinned_ must finish before it is freed (errors are ignored: a destructor must not throw).
+    if (stream_bound_) { (void)cudaStreamSynchronize(stream_); }
     if (copied_ != nullptr) { cudaEventDestroy(copied_); }
     if (pinned_ != nullptr) { cudaFreeHost(pinned_); }
 }
