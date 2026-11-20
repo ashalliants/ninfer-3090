@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
+from tools.inkling2 import compare_golden
 from tools.inkling2 import reference as ref
 
 
@@ -134,6 +137,17 @@ def test_chunked_forward_equals_whole(model):
     assert whole.shape == (8, 21) and np.abs(whole).max() < 30
 
 
+def test_local_visits_keep_a_window_and_global_visits_everything(model):
+    state = model.new_state()
+    for start in range(0, 8, 2):
+        model.forward(np.array([1, 2]), state, start)
+    window = model.config["window"]
+    for visit, st in enumerate(state):
+        local = model.physical(visit) in model.config["local_layers"]
+        assert st.positions == (list(range(8 - window + 1, 8)) if local else list(range(8))), visit
+        assert len(st.keys) == len(st.values) == len(st.positions)
+
+
 def test_every_pass_restarts_from_the_prelude(model):
     _, taps = model.forward(np.array([2, 7, 1]), model.new_state(), 0)
     np.testing.assert_array_equal(taps[4], taps[2])  # cur entering the core, passes 1 and 2
@@ -151,3 +165,33 @@ def test_the_loop_messages_matter(model):
 
 def test_golden_is_deterministic():
     assert ref.golden() == ref.golden()
+
+
+def _toy_golden(model, directory, tokens):
+    """A golden directory in llama_golden.cpp's layout, written from the reference itself."""
+    import json
+
+    trace = {}
+    logits, _ = model.forward(tokens, model.new_state(), 0, trace)
+    directory.mkdir()
+    (directory / "tokens.json").write_text(json.dumps({"tokens": tokens.tolist(), "n_vocab": logits.shape[1]}))
+    logits.astype(np.float32).tofile(directory / "logits.f32")
+    for name in compare_golden.expected_traces(model):
+        trace[name].astype(np.float32).tofile(directory / f"{name}.f32")
+
+
+def test_compare_golden_requires_every_trace(model, tmp_path, monkeypatch):
+    monkeypatch.setattr(compare_golden, "load", lambda path: (model.weights, model.config))
+    names = compare_golden.expected_traces(model)
+    # 10 visits [0 1 2 3 2 3 2 3 4 5]; the 5 of even physical layers start residual blocks (attn_out is ffn_inp).
+    assert len(names) == 10 * 2 + 10 - 5 + 1 and "attn_out-0" not in names and "attn_out-1" in names
+    golden = tmp_path / "p0"
+    _toy_golden(model, golden, np.array([4, 2, 7, 1, 3]))
+    report = compare_golden.compare(Path("unused.gguf"), golden)
+    assert all(r["rel"] < 1e-6 for r in report["tensors"].values()) and all(report["logits"]["argmax_agree"])
+    (golden / "l_out-7.f32").unlink()
+    with pytest.raises(ValueError, match="no l_out-7"):
+        compare_golden.compare(Path("unused.gguf"), golden)
+    np.zeros(3, np.float32).tofile(golden / "l_out-7.f32")
+    with pytest.raises(ValueError, match="values, expected"):
+        compare_golden.compare(Path("unused.gguf"), golden)

@@ -244,7 +244,8 @@ def moe(z: np.ndarray, layer: dict, config: dict) -> np.ndarray:
 
 @dataclass
 class VisitState:
-    """What one layer visit keeps across chunks: its K/V rows with positions, and four convolution histories."""
+    """What one layer visit keeps across chunks: its K/V rows with positions (a local visit keeps only the rows a
+    later query can still see), and four convolution histories."""
 
     positions: list = field(default_factory=list)
     keys: list = field(default_factory=list)
@@ -368,6 +369,11 @@ class Model:
                 visible &= dist < c["window"]
             o = attention(q[t], keys, values, relative_bias(r[t], layer["rel_bias"], dist), sink[t], visible)
             out[t] = o.reshape(-1)
+        if local:
+            # A ring of the last `window - 1` positions: the next query (positions[-1] + 1) sees a key only at
+            # distance < window. Positions are ascending, so the expired keys are a prefix.
+            drop = sum(1 for pos in st.positions if positions[-1] + 1 - pos >= c["window"])
+            del st.positions[:drop], st.keys[:drop], st.values[:drop]
         a = (out / (1.0 + np.exp(-gate))) @ layer["wo"].T
         a, hist_a = short_conv(a, hist.get("attn", zeros(c["hidden"])), layer["post_conv"])
 

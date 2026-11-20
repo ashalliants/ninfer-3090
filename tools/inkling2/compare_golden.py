@@ -4,7 +4,8 @@
 
     python -m tools.inkling2.compare_golden model.gguf golden_dir/p0 [--chunk 4] [--json out.json]
 
-For every traced tensor (``attn_out-v``, ``ffn_inp-v``, ``l_out-v`` per layer visit v, ``result_norm``) it
+For every traced tensor (``attn_out-v``, ``ffn_inp-v``, ``l_out-v`` per layer visit v, ``result_norm``; all are
+required, see :func:`expected_traces`) it
 prints the relative error ||ref - llama|| / ||llama|| and the cosine; for the logits, the largest absolute
 difference, the per-position KL divergence KL(llama || ref) and whether the argmax agrees. The reference is
 FP64 on the stored weights; llama.cpp's CPU path rounds activations (BF16 for BF16 weights, Q8 blocks for
@@ -31,6 +32,18 @@ def _log_softmax(x: np.ndarray) -> np.ndarray:
     return x - np.log(np.exp(x).sum(axis=-1, keepdims=True))
 
 
+def expected_traces(model: reference.Model) -> list[str]:
+    """Every activation the golden must hold: ``ffn_inp`` and ``l_out`` of each visit, ``attn_out`` of each visit
+    that does not start a residual block (there the attention output *is* ``ffn_inp``, and llama.cpp's callback
+    names the one tensor ``ffn_inp``), and ``result_norm``."""
+    names = []
+    for visit in range(model.visits):
+        if model.physical(visit) % model.config["block"]:
+            names.append(f"attn_out-{visit}")
+        names += [f"ffn_inp-{visit}", f"l_out-{visit}"]
+    return names + ["result_norm"]
+
+
 def compare(model_path: Path, golden: Path, chunk: int = 0) -> dict:
     meta = json.loads((golden / "tokens.json").read_text())
     tokens = np.asarray(meta["tokens"])
@@ -50,17 +63,23 @@ def compare(model_path: Path, golden: Path, chunk: int = 0) -> dict:
     ref_logits = np.concatenate(logits)
     report = {"tokens": len(tokens), "chunk": chunk, "seconds": round(time.time() - began, 1), "tensors": {}}
     H = config["hidden"]
-    for name, parts in traces.items():
+    for name in expected_traces(model):
         path = golden / f"{name}.f32"
         if not path.exists():
-            continue
-        ours = np.concatenate(parts)
-        theirs = np.fromfile(path, np.float32).astype(np.float64).reshape(-1, H)
+            raise ValueError(f"{golden}: the golden has no {name} (llama_golden.cpp captures it)")
+        theirs = np.fromfile(path, np.float32).astype(np.float64)
+        if theirs.size != len(tokens) * H:
+            raise ValueError(f"{path}: {theirs.size} values, expected {len(tokens)} x {H}")
+        theirs = theirs.reshape(-1, H)
+        ours = np.concatenate(traces[name])
         rel = float(np.linalg.norm(ours - theirs) / np.linalg.norm(theirs))
         cos = float(np.sum(ours * theirs) / (np.linalg.norm(ours) * np.linalg.norm(theirs)))
         per_token = np.linalg.norm(ours - theirs, axis=1) / np.linalg.norm(theirs, axis=1)
         report["tensors"][name] = {"rel": rel, "cos": cos, "rel_per_token": per_token.round(5).tolist()}
-    theirs = np.fromfile(golden / "logits.f32", np.float32).astype(np.float64).reshape(len(tokens), -1)
+    theirs = np.fromfile(golden / "logits.f32", np.float32).astype(np.float64)
+    if theirs.size != len(tokens) * ref_logits.shape[1]:
+        raise ValueError(f"{golden}/logits.f32: {theirs.size} values, expected {len(tokens)} x {ref_logits.shape[1]}")
+    theirs = theirs.reshape(len(tokens), -1)
     p_log, q_log = _log_softmax(theirs), _log_softmax(ref_logits)
     kld = np.sum(np.exp(p_log) * (p_log - q_log), axis=-1)
     report["logits"] = {

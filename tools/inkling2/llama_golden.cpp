@@ -3,8 +3,8 @@
 // writes, per prompt, the logits of every position and the named per-visit activations, as raw float32.
 //
 // Build against a CPU build of that llama.cpp checkout:
-//   g++ -std=c++17 -O2 tools/inkling2/llama_golden.cpp -I $LLAMA/include -I $LLAMA/ggml/include \
-//       -L $LLAMA/build/bin -lllama -lggml -lggml-base -Wl,-rpath,$LLAMA/build/bin -o llama_golden
+//   g++ -std=c++17 -O2 tools/inkling2/llama_golden.cpp -I $LLAMA/include -I $LLAMA/ggml/include  (one line)
+//     -L $LLAMA/build/bin -lllama -lggml -lggml-base -Wl,-rpath,$LLAMA/build/bin -o llama_golden
 //   llama_golden model.gguf prompts.txt out_dir [chunk] [threads]
 //
 // prompts.txt holds one prompt per line; "\n" in a line is a newline; special tokens are parsed. The prompt is fed
@@ -18,7 +18,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <stdexcept>
 #include <map>
 #include <string>
 #include <vector>
@@ -51,9 +53,11 @@ bool callback(ggml_tensor* t, bool ask, void* user) {
     return true;
 }
 
-void write_raw(const std::string& path, const float* data, size_t n) {
+void write_raw(const std::filesystem::path& path, const float* data, size_t n) {
     std::ofstream out(path, std::ios::binary);
     out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n * sizeof(float)));
+    out.close();
+    if (!out) throw std::runtime_error("cannot write " + path.string());
 }
 
 std::string unescape(const std::string& line) {
@@ -131,14 +135,16 @@ int main(int argc, char** argv) {
             llama_batch_free(batch);
         }
 
-        const std::string dir = out_dir + "/p" + std::to_string(index);
-        std::system(("mkdir -p '" + dir + "'").c_str());
-        write_raw(dir + "/logits.f32", logits.data(), logits.size());
-        for (const auto& [name, rows] : cap.rows) write_raw(dir + "/" + name + ".f32", rows.data(), rows.size());
-        std::ofstream meta(dir + "/tokens.json");
+        const std::filesystem::path dir = std::filesystem::path(out_dir) / ("p" + std::to_string(index));
+        std::filesystem::create_directories(dir);  // throws on failure
+        write_raw(dir / "logits.f32", logits.data(), logits.size());
+        for (const auto& [name, rows] : cap.rows) write_raw(dir / (name + ".f32"), rows.data(), rows.size());
+        std::ofstream meta(dir / "tokens.json");
         meta << "{\"n_vocab\":" << n_vocab << ",\"chunk\":" << chunk << ",\"tokens\":[";
         for (int i = 0; i < n; ++i) meta << (i ? "," : "") << tokens[i];
         meta << "]}\n";
+        meta.close();
+        if (!meta) throw std::runtime_error("cannot write " + (dir / "tokens.json").string());
         std::fprintf(stderr, "prompt %d: %d tokens, %zu tensors\n", index, n, cap.rows.size());
         llama_free(ctx);
         ++index;
