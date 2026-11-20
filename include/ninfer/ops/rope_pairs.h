@@ -27,7 +27,7 @@ namespace ninfer::ops {
  *
  * Logical shapes:
  *   x BF16 [D, H, T] (updated in place); positions I32 [T]; inv_freq FP32 [R/2]. R even,
- *   2 <= R <= D, D <= 1024; H >= 1; T >= 1; positions >= 0.
+ *   2 <= R <= D, D even and <= 1024 (each pair is read as one 4-byte unit); H >= 1; T >= 1; positions >= 0.
  *
  * Supported domain:
  *   Contiguous tensors with 4-byte aligned data; finite inv_freq >= 0.

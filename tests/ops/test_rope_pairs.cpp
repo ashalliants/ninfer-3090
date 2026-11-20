@@ -56,13 +56,15 @@ struct Device {
     void put(const V& v) { t::cuda_check(cudaMemcpy(p, v.data(), v.size() * sizeof(typename V::value_type), cudaMemcpyHostToDevice), "put"); }
 };
 
+constexpr double kPi = 3.141592653589793238462643383279502884;
+
 // The model repo's `precompute_freqs_cis` frequencies (inference/model.py) in double: plain, or YaRN when original_len > 0.
 std::vector<float> frequencies(int rotary, double base, double factor, int original_len, double beta_fast, double beta_slow) {
     std::vector<double> f(rotary / 2);
     for (int i = 0; i < rotary / 2; ++i) { f[i] = 1.0 / std::pow(base, 2.0 * i / rotary); }
     if (original_len > 0) {
         const auto corrected = [&](double rotations) {
-            return rotary * std::log(original_len / (rotations * 2 * M_PI)) / (2 * std::log(base));
+            return rotary * std::log(original_len / (rotations * 2 * kPi)) / (2 * std::log(base));
         };
         const double low  = std::max(std::floor(corrected(beta_fast)), 0.0);
         const double high = std::min(std::ceil(corrected(beta_slow)), static_cast<double>(rotary - 1));
@@ -230,6 +232,11 @@ int main() {
             check(refuses([&] { o::rope_pairs(positions, short_freq, 64, false, x, stream); }), "a frequency table of the wrong length is refused");
             const Tensor wrong_positions(pd.p, DType::I32, {1});
             check(refuses([&] { o::rope_pairs(wrong_positions, freq, 64, false, x, stream); }), "positions for another column count are refused");
+            {
+                Device odd_x(63 * 2 * 2 * 2);
+                Tensor odd(odd_x.p, DType::BF16, {63, 2, 2});
+                check(refuses([&] { o::rope_pairs(positions, freq, 62, false, odd, stream); }), "an odd head dimension is refused");
+            }
             const Tensor float_positions(pd.p, DType::FP32, {2});
             check(refuses([&] { o::rope_pairs(float_positions, freq, 64, false, x, stream); }), "non-I32 positions are refused");
             Tensor aliased(pd.p, DType::BF16, {2, 1, 2});

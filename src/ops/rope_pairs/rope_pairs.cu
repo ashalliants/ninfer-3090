@@ -39,9 +39,11 @@ rope_pairs_kernel(const std::int32_t* __restrict__ positions, const float* __res
     __syncthreads();
     const int base        = dim - rotary;
     __nv_bfloat16* column = x + static_cast<std::size_t>(t) * heads * dim + base;
-    for (int k = threadIdx.x; k < heads * pairs; k += blockDim.x) {
-        const int h = k / pairs, i = k % pairs;
-        __nv_bfloat162* pair = reinterpret_cast<__nv_bfloat162*>(column + static_cast<std::size_t>(h) * dim + 2 * i);
+    const std::size_t work = static_cast<std::size_t>(heads) * pairs; // 64-bit: heads is not bounded by the contract
+    for (std::size_t k = threadIdx.x; k < work; k += blockDim.x) {
+        const std::size_t h = k / pairs;
+        const int i         = static_cast<int>(k % pairs);
+        __nv_bfloat162* pair = reinterpret_cast<__nv_bfloat162*>(column + h * dim + 2 * i);
         const float2 v       = __bfloat1622float2(*pair);
         *pair = __floats2bfloat162_rn(v.x * cos_table[i] - v.y * sin_table[i], v.x * sin_table[i] + v.y * cos_table[i]);
     }
@@ -64,7 +66,8 @@ void rope_pairs(const Tensor& positions, const Tensor& inv_freq, int rotary_dim,
     require(plain(x, DType::BF16) && plain(positions, DType::I32) && plain(inv_freq, DType::FP32),
             "contiguous, 4-byte aligned BF16 x, I32 positions and FP32 inv_freq are required");
     const int dim = x.ne[0], heads = x.ne[1], columns = x.ne[2];
-    require(dim >= 2 && dim <= 1024 && heads >= 1 && columns >= 1, "x extent out of range");
+    require(dim >= 2 && dim % 2 == 0 && dim <= 1024 && heads >= 1 && columns >= 1,
+            "D must be even and at most 1024 (pairs are read as 4-byte units), with H and T at least 1");
     require(rotary_dim >= 2 && rotary_dim % 2 == 0 && rotary_dim <= dim, "rotary_dim must be even, in [2, D]");
     require(positions.numel() == columns && inv_freq.numel() == rotary_dim / 2, "positions or inv_freq length disagrees");
     require(!overlaps(x, positions) && !overlaps(x, inv_freq), "x overlaps an input");
