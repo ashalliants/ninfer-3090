@@ -142,6 +142,13 @@ public:
     // Debug probes for NaN/Inf/overflow (--numeric-tripwire). Null, the default, launches nothing.
     void set_tripwire(NumericTripwire* tripwire) noexcept { tripwire_ = tripwire; }
 
+    // The control vector of each sequence row of the next target passes (Parameters::steering):
+    // device I32 [R], a set or -1, with a pass's T columns grouped into R rows of T / R
+    // consecutive columns (a prefill chunk is one row; a decode or verification round has one row
+    // per sequence). The kernels read it from device memory, so a captured graph sees each replay's
+    // selection. Unset (no data), or a model without vectors, launches no steering at all.
+    void set_steering(const Tensor& rows) noexcept { steering_rows_ = rows; }
+
     void set_prefill_gpu_timer(CudaEventTimer* timer) noexcept { prefill_gpu_timer_ = timer; }
 
     // The LoRA adapter slot of each sequence of the next target passes (Parameters::lora): a
@@ -409,6 +416,8 @@ private:
     // map of a T-column call.
     [[nodiscard]] const LoraBlock* lora_block() const;
     [[nodiscard]] ops::LoraColumns lora_columns(std::int32_t columns) const;
+    // set_steering's selection.
+    Tensor steering_rows_{};
     PrefillSliceState* prefill_slice_         = nullptr;
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;

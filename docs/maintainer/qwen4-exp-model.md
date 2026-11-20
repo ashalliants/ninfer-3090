@@ -87,6 +87,10 @@ before the first steered request must already contain it).
   Tokens, positions and digests stay the prompt's own.
 - **The drafter** (`run_mtp`) does not steer. Verification does, so a steered request's tokens are
   the target's and only its acceptance rate can fall.
+- **The Op.** `ops::direction_project` is shared with the dense models' control vectors, which pass
+  per-set `(project, add)` coefficients and one selector per row of columns. Flash-Next passes no
+  coefficients (pure projection, `(1, 0)`) and one selector per column, which is bit-for-bit the
+  projection it ran before the dense models shared it.
 
 ## MTP drafter
 

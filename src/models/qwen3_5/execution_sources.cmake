@@ -7,6 +7,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/mtp.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/numeric_tripwire.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/text.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/execution/steering.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/vision.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/vision_overlay.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/draft.cpp"

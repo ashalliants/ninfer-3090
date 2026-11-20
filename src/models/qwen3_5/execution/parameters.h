@@ -5,6 +5,8 @@
 #include <ninfer/types.h>
 #include "ninfer/ops/weight_input.h"
 
+#include <ninfer/types.h> // GraftSource
+
 #include <array>
 #include <memory>
 #include <limits>
@@ -16,6 +18,7 @@
 namespace ninfer::models::qwen3_5::execution {
 
 struct LoraParameters; // execution/lora.h
+struct SteeringParameters; // execution/steering.h
 
 using LinearParameters = ops::SingleProjectionWeight;
 
@@ -172,8 +175,11 @@ struct ProposalParameters {
 class Parameters {
 public:
     explicit Parameters(const Model& source);
-    // With the LoRA adapters `loras` loaded (load_lora_parameters), or none when it is empty.
-    Parameters(const Model& source, const std::vector<LoraSource>& loras);
+    // With the LoRA adapters `loras` loaded (load_lora_parameters) and the control vectors
+    // `control_vectors` (--graft NAME=PATH whose file is GGUF) read, checked against the model
+    // and uploaded; either may be empty.
+    Parameters(const Model& source, const std::vector<LoraSource>& loras,
+               const std::vector<GraftSource>& control_vectors);
     Parameters(const Parameters&)            = delete;
     Parameters& operator=(const Parameters&) = delete;
     Parameters(Parameters&&)                 = delete;
@@ -187,6 +193,8 @@ public:
     std::optional<ProposalParameters> proposal;
     // The loaded LoRA adapters (EngineOptions::loras), or null.
     std::shared_ptr<const LoraParameters> lora;
+    // The loaded control vectors, or null: a pass then launches no steering at all.
+    std::shared_ptr<const SteeringParameters> steering;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

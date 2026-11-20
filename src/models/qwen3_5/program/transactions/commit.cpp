@@ -289,6 +289,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     dflash_prefill_host_ingress,
                     sequence.rope_delta};
                 schedule_state.prefill_gpu_timer = &prefill_gpu_timer_;
+                schedule_state.execution.steering = steering_rows(sequence);
                 mark_workspace_usage(speculative_backend == SpeculativeBackend::Mtp
                                          ? workspace_plan.mtp_prefill
                                          : workspace_plan.text_prefill);

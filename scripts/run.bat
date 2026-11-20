@@ -80,7 +80,10 @@ rem NINFER_SERVER, NINFER_HOST, NINFER_PORT, NINFER_ALLOWED_HOST (more names the
 rem without a key, e.g. "gpubox.lan,ninfer.example", comma- or space-separated; each becomes
 rem --allowed-host), NINFER_GRAFT_DIR (phantom-kv graft directory),
 rem NINFER_GRAFTS (set to "off" to disable graft loading), NINFER_DEFAULT_GRAFT (set to "on" to
-rem apply the loaded graft to every request that names none), NINFER_LORA (a PEFT LoRA adapter as
+rem apply the loaded graft to every request that names none, or to a graft selection, NAME or
+rem NAME+NAME, passed as --default-graft), NINFER_GRAFT (one more graft as NAME=PATH, passed as
+rem --graft: a GGUF control vector such as a refusal-direction vector, or a phantom-kv graft),
+rem NINFER_LORA (a PEFT LoRA adapter as
 rem NAME=PATH, PATH an adapter directory; passed as --lora, dense models only), NINFER_DEFAULT_LORA
 rem (adapter name requests get when they state none, --default-lora), NINFER_CHAT_TEMPLATE (path to a local
 rem Jinja file, passed straight to --chat-template; overrides the artifact's built-in template).
@@ -136,7 +139,7 @@ rem           NO_PREFIX_REUSE NO_PREFILL_A8 NO_PREFILL_CUBLAS NO_PREFILL_CUBLAS_
 rem           NO_EXIT_ON_ENGINE_FAILURE ADMISSION_FIT_CHECK PROGRESS_ANCHORS_SHARED MODEL_SUSPEND
 rem           NO_AUTO_RESUME LM_HEAD_Q4 LM_HEAD_Q6 EMBEDDING_Q4 EMBEDDING_Q6 NO_EXPERT_STATE LOSSY_PREFILL_SCOUT_A4
 rem           REQUEST_LOG_LOSSY_DETAIL
-rem Not here: the repeatable --graft (see NINFER_GRAFTS), --lora (see NINFER_LORA) and --context-store-peer, and router mode
+rem Not here: the repeatable --graft (see NINFER_GRAFTS, NINFER_GRAFT), --lora (see NINFER_LORA) and --context-store-peer, and router mode
 rem (--models-*). The S3 store reads its credentials from the environment
 rem (NINFER_S3_ACCESS_KEY_ID, NINFER_S3_SECRET_ACCESS_KEY), never from a flag.
 rem Values are passed literally (percent signs, carets, ampersands and parentheses are safe); a value may
@@ -821,6 +824,17 @@ rem CHAT_TEMPLATE_ARGS. NINFER_DEFAULT_LORA names the adapter a request gets whe
 set "LORA_ARGS="
 if not "%NINFER_LORA%"=="" set LORA_ARGS=--lora "%NINFER_LORA%"
 if not "%NINFER_DEFAULT_LORA%"=="" set LORA_ARGS=%LORA_ARGS% --default-lora "%NINFER_DEFAULT_LORA%"
+rem NINFER_GRAFT: one more graft as NAME=PATH (a GGUF control vector, or a phantom-kv graft), quoted
+rem the same way as CHAT_TEMPLATE_ARGS. NINFER_DEFAULT_GRAFT other than "on" is the selection
+rem requests get when they state none (--default-graft): one name, or a prompt graft and a vector
+rem joined by "+"; a request opts out with "graft": "". NINFER_GRAFTS=off drops both, with godmode.
+set "USER_GRAFT_ARGS="
+if /i "%NINFER_GRAFTS%"=="off" goto :user_graft_done
+if not "%NINFER_GRAFT%"=="" set USER_GRAFT_ARGS=--graft "%NINFER_GRAFT%"
+if "%NINFER_DEFAULT_GRAFT%"=="" goto :user_graft_done
+if /i "%NINFER_DEFAULT_GRAFT%"=="on" goto :user_graft_done
+set USER_GRAFT_ARGS=%USER_GRAFT_ARGS% --default-graft "%NINFER_DEFAULT_GRAFT%"
+:user_graft_done
 if not exist "%SERVER%" (
   echo Missing %SERVER%
   echo Build it first:  .\scripts\build.ps1
@@ -844,11 +858,12 @@ rem string comparison here garbles the quoting and breaks the if statement. `def
 rem that: it tests the variable directly, with no substitution.
 if defined GRAFT_ARGS echo Graft: godmode = %GRAFT_FILE%
 if defined CHAT_TEMPLATE_ARGS echo Chat template: "%NINFER_CHAT_TEMPLATE%"
+if defined USER_GRAFT_ARGS echo Graft: %USER_GRAFT_ARGS%
 if defined LORA_ARGS echo LoRA: "%NINFER_LORA%"
 if defined ALLOWED_HOST_ARGS echo Allowed host names: %NINFER_ALLOWED_HOST%
 if not "%HINT%"=="" echo %HINT%
 rem The exact command, so a tuned setup can be copied into another launcher (llama-swap, a service).
-echo Command: "%SERVER%" "%MODEL%" --host %HOST% --port %PORT% --config "%PROFILE_FILE%" %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %LORA_ARGS% %CHAT_TEMPLATE_ARGS% %ALLOWED_HOST_ARGS% %EXTRA_ARGS%
+echo Command: "%SERVER%" "%MODEL%" --host %HOST% --port %PORT% --config "%PROFILE_FILE%" %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %USER_GRAFT_ARGS% %LORA_ARGS% %CHAT_TEMPLATE_ARGS% %ALLOWED_HOST_ARGS% %EXTRA_ARGS%
 echo API: http://%HOST%:%PORT%/v1
 rem The live dashboard (speed, lanes, memory, GPU). The key, when there is one, rides after the #, which
 rem the browser never sends to the server, so the page opens already signed in. PowerShell percent-encodes
@@ -871,7 +886,7 @@ rem "( ... )" command group, that character can be taken as the group's own clos
 rem break the batch parse, quoting notwithstanding -- so this invocation runs unparenthesised, with
 rem goto standing in for the logged/unlogged branch instead.
 if /i "%PROFILE%"=="tuned" goto :launch_logged
-"%SERVER%" "%MODEL%" --host %HOST% --port %PORT% --config "%PROFILE_FILE%" %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %LORA_ARGS% %CHAT_TEMPLATE_ARGS% %ALLOWED_HOST_ARGS% %EXTRA_ARGS%
+"%SERVER%" "%MODEL%" --host %HOST% --port %PORT% --config "%PROFILE_FILE%" %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %USER_GRAFT_ARGS% %LORA_ARGS% %CHAT_TEMPLATE_ARGS% %ALLOWED_HOST_ARGS% %EXTRA_ARGS%
 endlocal
 exit /b %ERRORLEVEL%
 
@@ -880,7 +895,7 @@ rem Run the server with its output shown and kept, so a failure the launcher can
 rem told apart from any other. Only a failed host pin retries; a crash or a bad artifact does not.
 rem The log is written as ASCII on purpose: Tee-Object writes UTF-16, which findstr cannot search.
 set "SERVER_LOG=%TEMP%\ninfer-run-%RANDOM%%RANDOM%.log"
-"%SERVER%" "%MODEL%" --host %HOST% --port %PORT% --config "%PROFILE_FILE%" %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %LORA_ARGS% %CHAT_TEMPLATE_ARGS% %ALLOWED_HOST_ARGS% %EXTRA_ARGS% 2>&1 | powershell -NoProfile -Command "$input | ForEach-Object { $_; Add-Content -LiteralPath '%SERVER_LOG%' -Value $_ -Encoding Ascii }"
+"%SERVER%" "%MODEL%" --host %HOST% --port %PORT% --config "%PROFILE_FILE%" %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %USER_GRAFT_ARGS% %LORA_ARGS% %CHAT_TEMPLATE_ARGS% %ALLOWED_HOST_ARGS% %EXTRA_ARGS% 2>&1 | powershell -NoProfile -Command "$input | ForEach-Object { $_; Add-Content -LiteralPath '%SERVER_LOG%' -Value $_ -Encoding Ascii }"
 findstr /c:"not enough free GPU memory" "%SERVER_LOG%" >nul 2>&1
 if not errorlevel 1 goto :memory_advice
 if not "%HOST_RETRY%"=="1" goto :server_done

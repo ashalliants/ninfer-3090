@@ -779,7 +779,8 @@ void Forward::steer(std::uint32_t layer, Tensor& residual, const Tensor& select)
     const std::int64_t set_stride = static_cast<std::int64_t>(steering_->layers) * steering_->hidden;
     ops::direction_project(residual, dim(config_.hc.streams),
                            steering_->directions + static_cast<std::int64_t>(layer) * steering_->hidden, set_stride,
-                           static_cast<const std::int32_t*>(select.data), device_.stream);
+                           /*coefficients=*/nullptr, 0, static_cast<const std::int32_t*>(select.data),
+                           /*row_columns=*/1, device_.stream);
 }
 
 Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject) {

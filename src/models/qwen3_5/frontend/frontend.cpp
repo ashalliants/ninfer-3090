@@ -756,10 +756,9 @@ public:
         }
     }
 
-    // The steering vector a request names (an index into steering_names), or -1 for none. An empty
-    // name is the opt-out / no selection, whatever the table holds.
-    [[nodiscard]] std::int32_t find_steering(const std::string& name) const {
-        if (name.empty()) { return -1; }
+    // The steering vector named `name` (an index into steering_names), or -1 when no vector has
+    // that name.
+    [[nodiscard]] std::int32_t find_steering(std::string_view name) const {
         for (std::size_t i = 0; i < steering_names.size(); ++i) {
             if (steering_names[i] == name) { return static_cast<std::int32_t>(i); }
         }
@@ -791,13 +790,55 @@ public:
         return lora;
     }
 
-    // The graft a request names, or null for none (a steering vector is not a prompt graft).
-    [[nodiscard]] const PromptGraft* find_graft(const std::string& name) const {
-        if (name.empty() || find_steering(name) >= 0) { return nullptr; }
-        for (const PromptGraft& graft : grafts) {
-            if (graft.name == name) { return &graft; }
+    // What a request's PromptOptions::graft selects: one loaded name, or several joined by '+',
+    // at most one of them a prompt graft and at most one a control vector. Empty selects nothing.
+    struct GraftSelection {
+        const PromptGraft* graft = nullptr;
+        std::int32_t steering    = -1;
+    };
+
+    [[nodiscard]] GraftSelection select_grafts(const std::string& spec) const {
+        GraftSelection out;
+        if (spec.empty()) { return out; }
+        std::size_t begin = 0;
+        while (true) {
+            const std::size_t plus      = spec.find('+', begin);
+            const std::string_view name = std::string_view(spec).substr(
+                begin, plus == std::string::npos ? std::string::npos : plus - begin);
+            if (name.empty()) {
+                throw std::invalid_argument("graft selection '" + spec + "' has an empty name");
+            }
+            if (const std::int32_t steering = find_steering(name); steering >= 0) {
+                if (out.steering >= 0) {
+                    throw std::invalid_argument("graft selection '" + spec +
+                                                "' names two control vectors; a request runs at most one");
+                }
+                out.steering = steering;
+            } else {
+                const auto graft = std::find_if(grafts.begin(), grafts.end(),
+                                                [&](const PromptGraft& g) { return g.name == name; });
+                if (graft == grafts.end()) {
+                    throw std::invalid_argument("unknown graft '" + std::string(name) + "'");
+                }
+                if (out.graft != nullptr) {
+                    throw std::invalid_argument("graft selection '" + spec +
+                                                "' names two prompt grafts; a request runs at most one");
+                }
+                out.graft = &*graft;
+            }
+            if (plus == std::string::npos) { break; }
+            begin = plus + 1;
         }
-        throw std::invalid_argument("unknown graft '" + name + "'");
+        // An installed graft is the base model's K/V and recurrent state; under a control vector
+        // every layer past the first steered one computes differently, so it would be the wrong
+        // context. A prefill_kv graft is replayed, and so computed with the vector like any prompt.
+        if (out.graft != nullptr && out.steering >= 0 && out.graft->kind != GraftKind::PrefillKV) {
+            throw std::invalid_argument("graft '" + out.graft->name +
+                                        "' holds base-model state and cannot be combined with "
+                                        "control vector '" +
+                                        steering_names[static_cast<std::size_t>(out.steering)] + "'");
+        }
+        return out;
     }
 
     fi::CompiledChatTemplate chat_template;
@@ -935,8 +976,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     if (cache_hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
     }
-    const PromptGraft* graft = impl_->find_graft(options.graft);
-    const std::int32_t lora  = impl_->find_lora_for(options, graft);
+    const Impl::GraftSelection selection = impl_->select_grafts(options.graft);
+    const PromptGraft* graft             = selection.graft;
+    const std::int32_t lora              = impl_->find_lora_for(options, graft);
     // The rendered prompt gets whatever context the graft leaves.
     const std::uint32_t prompt_context =
         impl_->max_context - (graft ? graft_context_slots(*graft) : 0U);
@@ -1067,7 +1109,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     }
     (void)checked_token_count(result.token_ids.size());
     if (graft) { prepend_graft(*graft, result, message_boundaries, cache_boundaries); }
-    result.steering          = impl_->find_steering(options.graft);
+    result.steering          = selection.steering;
     result.lora              = lora;
     result.identity.reusable = true;
     // A replayed graft's end is published as a shared prefix, so the graft is prefilled once. A
@@ -1087,7 +1129,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
 std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl& control) const {
     fi::check_preparation_control(control);
     const PromptOptions options           = input.options;
-    const PromptGraft* graft              = impl_->find_graft(options.graft);
+    const PromptGraft* graft              = impl_->select_grafts(options.graft).graft;
     (void)impl_->find_lora_for(options, graft);
     const std::size_t graft_tokens        = graft ? graft_context_slots(*graft) : 0U;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));

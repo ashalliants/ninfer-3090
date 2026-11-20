@@ -227,6 +227,9 @@ struct SequenceState {
     // The LoRA adapter slot every target pass of this sequence runs with (PreparedPromptData::
     // lora), -1 for the base model. Fixed for the sequence's life: its identity tag carries it.
     std::int32_t lora = -1;
+    // The control vector every target pass of this sequence runs with (PreparedPromptData::
+    // steering), -1 for none. Fixed for the sequence's life: its identity tag carries it.
+    std::int32_t steering = -1;
 };
 
 struct CaptureReservation {
@@ -354,6 +357,13 @@ public:
     // every activation, so its requests share cached context only with requests of the same
     // adapter: the base tag mixed with the adapter's content digest, never equal to the base tag.
     [[nodiscard]] std::uint32_t prefix_identity_tag(std::int32_t lora) const;
+    // The tag of a request that runs control vector `steering` on top of `tag` (-1: `tag` itself).
+    // A vector changes every activation after its first steered layer, so its requests share
+    // cached context only with requests of the same vector: the tag mixed with the vector's
+    // content digest, never equal to `tag`.
+    [[nodiscard]] std::uint32_t steered_identity_tag(std::uint32_t tag, std::int32_t steering) const;
+    // The control-vector selection of one sequence's prefill call (ExecutionCore::steering).
+    [[nodiscard]] Tensor steering_rows(const SequenceState& sequence) const;
     [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&&, std::uint32_t first_target,
                                                   const ScoringOptions& options,
                                                   ScoreRowSink* sink);

@@ -198,12 +198,15 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     // An unset request field takes the server default; an explicit empty name opts out of it.
     const std::string& graft = request.graft ? *request.graft : server.default_graft;
     if (!graft.empty()) {
-        const bool loaded = std::any_of(
-            server.grafts.begin(), server.grafts.end(),
-            [&](const ninfer::GraftSource& source) { return source.name == graft; });
-        if (!loaded) {
-            invalid_prompt_option("graft '" + graft + "' is not loaded on this server", "graft",
-                                  "unknown_graft");
+        // One name, or several joined by '+'; which kinds may combine is the model's to decide.
+        for (const std::string& name : graft_selection_names(graft)) {
+            const bool loaded = std::any_of(
+                server.grafts.begin(), server.grafts.end(),
+                [&](const ninfer::GraftSource& source) { return source.name == name; });
+            if (!loaded) {
+                invalid_prompt_option("graft '" + name + "' is not loaded on this server", "graft",
+                                      "unknown_graft");
+            }
         }
         result.graft = graft;
     }

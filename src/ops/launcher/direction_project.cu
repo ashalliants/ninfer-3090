@@ -10,14 +10,15 @@
 namespace ninfer::ops::detail {
 
 void direction_project_launch(Tensor& residual, std::int32_t streams, const float* directions,
-                              std::int64_t set_stride, const std::int32_t* row_select,
-                              cudaStream_t stream) {
+                              std::int64_t set_stride, const float* coefficients,
+                              std::int64_t coefficient_stride, const std::int32_t* row_select,
+                              std::int32_t row_columns, cudaStream_t stream) {
     const std::int32_t width   = static_cast<std::int32_t>(residual.ne[0] / streams);
     const std::int32_t columns = static_cast<std::int32_t>(residual.ne[1]);
     const dim3 grid(static_cast<unsigned>(columns), static_cast<unsigned>(streams));
     direction_project_kernel<<<grid, kDirectionProjectThreads, 0, stream>>>(
         static_cast<__nv_bfloat16*>(residual.data), width, streams, directions, set_stride,
-        row_select);
+        coefficients, coefficient_stride, row_select, row_columns);
     CUDA_CHECK(cudaGetLastError());
 }
 

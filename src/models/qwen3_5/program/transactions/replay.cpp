@@ -220,6 +220,7 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
             dflash_prefill_host_ingress,
             sequence.rope_delta};
         context.prefill_gpu_timer = &prefill_gpu_timer_;
+        context.execution.steering = steering_rows(sequence);
         mark_workspace_usage(speculative_backend == SpeculativeBackend::Mtp
                                  ? workspace_plan.mtp_prefill
                                  : workspace_plan.text_prefill);

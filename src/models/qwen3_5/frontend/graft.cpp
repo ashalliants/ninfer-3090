@@ -1,5 +1,7 @@
 #include "models/qwen3_5/frontend/graft.h"
 
+#include "models/qwen3_5/frontend/control_vector.h"
+
 #include "models/qwen3_5/frontend/digest.h"
 
 #include <nlohmann/json.hpp>
@@ -347,6 +349,7 @@ PromptGraft load_prompt_graft(const GraftSource& source, const TextConfig& text)
 std::vector<std::uint32_t> direct_graft_slots(const std::vector<GraftSource>& sources) {
     std::vector<std::uint32_t> direct;
     for (const GraftSource& source : sources) {
+        if (is_control_vector_file(source.path)) { continue; } // a control vector holds no state
         const GraftError error(source);
         std::filesystem::path sidecar_path = source.path;
         sidecar_path.replace_extension(".json");
@@ -374,9 +377,17 @@ std::vector<PromptGraft> load_prompt_grafts(const std::vector<GraftSource>& sour
     grafts.reserve(sources.size());
     std::unordered_set<std::string> names;
     for (const GraftSource& source : sources) {
+        // A request names several grafts joined by '+' (FrontendOptions::steering_names).
+        if (source.name.empty() || source.name.find('+') != std::string::npos) {
+            throw std::invalid_argument("graft name '" + source.name +
+                                        "' must be non-empty and contain no '+'");
+        }
         if (!names.insert(source.name).second) {
             throw std::invalid_argument("graft '" + source.name + "' is configured twice");
         }
+        // A GGUF file is a control vector (frontend/control_vector.h), loaded with the model's
+        // parameters rather than as a prompt.
+        if (is_control_vector_file(source.path)) { continue; }
         grafts.push_back(load_prompt_graft(source, text));
     }
     return grafts;

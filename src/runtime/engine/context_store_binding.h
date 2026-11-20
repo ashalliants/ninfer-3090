@@ -1,5 +1,6 @@
 #pragma once
 
+#include "models/qwen3_5/frontend/control_vector.h"
 #include "ninfer/types.h"
 
 #include <cstdint>
@@ -46,7 +47,11 @@ inline std::string context_store_binding(const EngineOptions& options, const Loa
     // Prompt grafts: a stored session that starts from a graft holds that graft's installed K/V and
     // state under its placeholder ids, so a changed graft file must not match it. Any change to
     // the configured grafts makes the store's images misses.
+    // A control vector (a GGUF --graft) is not part of the binding: a steered checkpoint's identity
+    // tag is derived from the vector's content digest, so a changed vector's images are misses and
+    // the unsteered ones stay valid.
     for (const GraftSource& graft : options.grafts) {
+        if (models::qwen3_5::is_control_vector_file(graft.path)) { continue; }
         std::error_code graft_size_error;
         std::error_code graft_time_error;
         const std::uintmax_t graft_size = std::filesystem::file_size(graft.path, graft_size_error);

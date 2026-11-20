@@ -1,6 +1,7 @@
 #include "ninfer/ops/direction_project.h"
 #include "ops/op_tester.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -39,9 +40,12 @@ std::vector<float> make_directions(int sets, int width, std::uint32_t seed, std:
     return all;
 }
 
+// `select` holds one entry per row of `row_columns` columns. `coefficients`, when not empty, holds
+// (project, add) per set at a stride of 2; empty passes null, the plain projection.
 int run_case(const char* label, int streams, int width, int columns,
              const std::vector<std::int32_t>& select, int sets, std::int64_t stride,
-             std::uint32_t seed) {
+             std::uint32_t seed, int row_columns = 1,
+             const std::vector<float>& coefficients = {}) {
     const int rows          = streams * width;
     const std::size_t count = static_cast<std::size_t>(rows) * columns;
     std::vector<float> x(count);
@@ -54,17 +58,21 @@ int run_case(const char* label, int streams, int width, int columns,
     for (int t = 0; t < columns; ++t) {
         for (int s = 0; s < streams; ++s) {
             const std::size_t base = (static_cast<std::size_t>(t) * streams + s) * width;
-            const int k            = select[t];
-            double dot             = 0.0;
+            const int k            = select[t / row_columns];
+            double project = 1.0, add = 0.0;
+            if (k >= 0 && !coefficients.empty()) {
+                project = coefficients[2 * static_cast<std::size_t>(k)];
+                add     = coefficients[2 * static_cast<std::size_t>(k) + 1];
+            }
+            double dot = 0.0;
             if (k >= 0) {
                 for (int i = 0; i < width; ++i)
                     dot += static_cast<double>(x[base + i]) *
                            dirs[static_cast<std::size_t>(k) * stride + i];
             }
             for (int i = 0; i < width; ++i) {
-                expected[base + i] =
-                    k >= 0 ? x[base + i] - dot * dirs[static_cast<std::size_t>(k) * stride + i]
-                           : x[base + i];
+                const double v = k >= 0 ? dirs[static_cast<std::size_t>(k) * stride + i] : 0.0;
+                expected[base + i] = k >= 0 ? x[base + i] - project * dot * v + add * v : x[base + i];
             }
         }
     }
@@ -76,18 +84,29 @@ int run_case(const char* label, int streams, int width, int columns,
     device_x.copy_from_host(x_bits.data(), device_x.bytes());
     device_dirs.copy_from_host(dirs.data(), device_dirs.bytes());
     device_select.copy_from_host(select.data(), device_select.bytes());
+    GuardedDeviceBuffer device_coefficients(std::max<std::size_t>(coefficients.size(), 1) *
+                                            sizeof(float));
+    if (!coefficients.empty()) {
+        device_coefficients.copy_from_host(coefficients.data(), coefficients.size() * sizeof(float));
+    }
 
     Tensor residual(device_x.data(), DType::BF16, {rows, columns});
-    ops::direction_project(residual, streams, static_cast<const float*>(device_dirs.data()), stride,
-                           static_cast<const std::int32_t*>(device_select.data()), nullptr);
+    ops::direction_project(
+        residual, streams, static_cast<const float*>(device_dirs.data()), stride,
+        coefficients.empty() ? nullptr : static_cast<const float*>(device_coefficients.data()), 2,
+        static_cast<const std::int32_t*>(device_select.data()), row_columns, nullptr);
     cuda_synchronize();
 
     const auto got = from_device<std::uint16_t>(device_x.data(), count);
     int failures   = verify_pointwise(label, from_device_bf16(device_x.data(), count), expected,
                                       direction_project_criterion());
-    // Unselected columns must be untouched to the bit, not merely close.
+    // Unselected columns, and columns of a set with p = a = 0, must be untouched to the bit.
     for (int t = 0; t < columns; ++t) {
-        if (select[t] >= 0) continue;
+        const int k = select[t / row_columns];
+        if (k >= 0 && (coefficients.empty() || coefficients[2 * static_cast<std::size_t>(k)] != 0.0f ||
+                       coefficients[2 * static_cast<std::size_t>(k) + 1] != 0.0f)) {
+            continue;
+        }
         for (int i = 0; i < rows; ++i) {
             if (got[static_cast<std::size_t>(t) * rows + i] !=
                 x_bits[static_cast<std::size_t>(t) * rows + i]) {
@@ -121,7 +140,8 @@ int run_orthogonality_case() {
     device_select.copy_from_host(select.data(), device_select.bytes());
     Tensor residual(device_x.data(), DType::BF16, {rows, columns});
     ops::direction_project(residual, streams, static_cast<const float*>(device_dirs.data()), width,
-                           static_cast<const std::int32_t*>(device_select.data()), nullptr);
+                           nullptr, 0, static_cast<const std::int32_t*>(device_select.data()), 1,
+                           nullptr);
     cuda_synchronize();
     const auto out = from_device_bf16(device_x.data(), count);
     int failures   = 0;
@@ -172,6 +192,19 @@ int main() {
                          1536, 15u);
     failures +=
         run_case("direction_project S3 H33 T4 odd width", 3, 33, 4, {0, 0, -1, 0}, 1, 64, 16u);
+    // The dense Qwen3.5 / 3.6 / 3.8 shape: one stream of 5120 (Qwen3.8-27B), steered per row.
+    // Decode: one column per row, sets with GLP alphas (1, 0.5, 2) and an additive set.
+    failures += run_case("direction_project S1 H5120 T4 coefficients", 1, 5120, 4, {0, 1, 2, 3}, 4,
+                         5120, 17u, 1, {1.0f, 0.0f, 0.5f, 0.0f, 2.0f, 0.0f, 0.0f, 1.5f});
+    // Verification: rows of 4 columns (an MTP window), one row unselected.
+    failures += run_case("direction_project S1 H5120 T12 rows of 4", 1, 5120, 12, {0, -1, 1}, 2,
+                         5120, 18u, 4, {1.0f, 0.0f, 0.0f, 1.0f});
+    // A prefill chunk: one row of 257 columns.
+    failures += run_case("direction_project S1 H5120 T257 one row", 1, 5120, 257, {0}, 1, 5120,
+                         19u, 257, {1.0f, 0.0f});
+    // A set this layer does not steer (p = a = 0): untouched to the bit beside a steered one.
+    failures += run_case("direction_project S1 H5120 T3 inactive set", 1, 5120, 3, {0, 1, 0}, 2,
+                         5120, 20u, 1, {0.0f, 0.0f, 1.0f, 0.0f});
     failures += run_orthogonality_case();
     std::cout << (failures ? "FAIL" : "OK") << " direction_project\n";
     return failures ? 1 : 0;

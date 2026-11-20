@@ -3,6 +3,7 @@
 #include "artifact/formats.h"
 #include "core/paged_kv_cache.h"
 #include "core/startup.h"
+#include "models/qwen3_5/frontend/control_vector.h"
 #include "models/qwen3_5/frontend/graft.h"
 #include "runtime/engine/qwen4_exp_instance.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
@@ -381,6 +382,12 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     }
     // The CLI checks these too, but a caller building EngineOptions directly does not go through it.
     models::qwen3_5::validate_lossy_prefill_options(options.lossy_prefill);
+    // Control vectors (GGUF --graft files) steer the residual on the device that holds their table.
+    if (!artifact_is_qwen4_exp(options.artifact_path) && options.devices.size() > 1 &&
+        !models::qwen3_5::control_vector_sources(options.grafts).empty()) {
+        throw std::invalid_argument(
+            "control vectors (GGUF --graft files) run on one GPU: drop the pipeline device list");
+    }
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
     // Each direct graft is installed as a pinned context-cache checkpoint that holds one StateImage
@@ -428,6 +435,16 @@ std::vector<std::string> lora_names(const std::vector<LoraSource>& loras) {
     return names;
 }
 
+// The names of the --graft entries that are control vectors (GGUF files), in order: the sets of
+// Parameters::steering, which a request selects through PromptOptions::graft.
+std::vector<std::string> control_vector_names(const std::vector<GraftSource>& grafts) {
+    std::vector<std::string> names;
+    for (const GraftSource& source : models::qwen3_5::control_vector_sources(grafts)) {
+        names.push_back(source.name);
+    }
+    return names;
+}
+
 models::qwen3_5::Frontend make_instance_frontend(const models::qwen3_5::Model& model,
                                                  const EngineOptions& options) {
     return models::qwen3_5::make_frontend(
@@ -442,7 +459,8 @@ models::qwen3_5::Frontend make_instance_frontend(const models::qwen3_5::Model& m
                             .vision_max_merged_tokens = options.vision_max_merged_tokens,
                             .grafts                   = models::qwen3_5::load_prompt_grafts(
                                 options.grafts, model.config().text),
-                            .lora_names  = lora_names(options.loras),
+                            .steering_names           = control_vector_names(options.grafts),
+                            .lora_names               = lora_names(options.loras),
                             .ngram_index = options.speculative.ngram_draft_tokens != 0});
 }
 
@@ -450,7 +468,8 @@ models::qwen3_5::Frontend make_instance_frontend(const models::qwen3_5::Model& m
 
 ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                              const EngineOptions& options)
-    : model(std::move(source)), parameters(*model, options.loras),
+    : model(std::move(source)),
+      parameters(*model, options.loras, models::qwen3_5::control_vector_sources(options.grafts)),
       frontend(make_instance_frontend(*model, options)), capacity(options.max_context) {}
 
 void ModelInstance::refit_context(const EngineOptions& options) {

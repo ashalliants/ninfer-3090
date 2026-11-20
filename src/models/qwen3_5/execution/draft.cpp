@@ -757,6 +757,9 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         card.set_lora(state.execution.lora_round
                           ? lora_round_columns(frame.lora.slice(0, 0, batch_size))
                           : state.execution.lora);
+        if (state.execution.parameters.steering != nullptr) {
+            card.set_steering(frame.steering.slice(0, 0, batch_size));
+        }
         // pending_features stays allocated at the widest round (catch-up reads it at that width);
         // a narrower round captures into the leading `width` columns of each lane.
         Tensor pending_features = dflash_state(state).pending_features.slice(1, 0, width);

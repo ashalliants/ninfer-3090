@@ -1915,7 +1915,7 @@ wire response contains typed `output` Items.
 | `reasoning.summary`, `reasoning.generate_summary` | `auto`, `concise` or `detailed` (other values are rejected, and the two must agree when both are sent); accepted as a hint only. NInfer produces no reasoning summaries, so the response reports `reasoning.summary: null` and an empty `summary` on reasoning Items. `reasoning.context` and `reasoning.mode` are rejected with `reasoning_option_not_supported` |
 | `chat_template_kwargs` | template parameters as a JSON object; standard options merge with typed fields |
 | `preserve_thinking` | alias for `chat_template_kwargs.preserve_thinking`; conflicting values are rejected |
-| `graft` | NInfer extension: name of a [prompt graft](#prompt-grafts), or `null`; also accepted by input token count |
+| `graft` | NInfer extension: name of a [prompt graft](#prompt-grafts) or control vector (two joined by `+`), or `null`; also accepted by input token count |
 | `thinking_budget` | NInfer extension: positive per-request [thinking cap](#openai-chat-completions), or `null`; rejected by input token count, which does not generate |
 | `relaxed_drafting` | NInfer extension: this request's [relaxed drafting](#relaxed-drafting) threshold, a number in `[0,1]`, `true` (0.5), `false` (exact) or `null` (the server default); CHANGES THE OUTPUT DISTRIBUTION |
 | `text.format` | `text` (default), `json_object`, or `json_schema`; see [Output constraints](#output-constraints) |
@@ -2324,11 +2324,18 @@ fails with `400 unknown_graft`, and a non-string value fails as a malformed `gra
 `--default-graft NAME` makes one loaded graft the default for requests that state none. It must
 name a `--graft`, or the server refuses to start.
 
+A `--graft` whose file is a GGUF file is a [control vector](#control-vectors-on-the-dense-models)
+rather than a prompt; both kinds share the names and the `graft` field. A selection may name one
+prompt graft and one control vector joined by `+` (`"graft": "persona+uncensored"`, in either
+order), and `--default-graft` takes the same form. Graft names cannot contain `+`, and each must be
+unique.
+
 | request `graft` | without `--default-graft` | with `--default-graft D` |
 |---|---|---|
 | absent or `null` | none | `D` |
 | `""` | none | none (explicit opt-out) |
 | `"X"` | `X` | `X` |
+| `"X+Y"` | `X` and `Y` | `X` and `Y` (a stated selection replaces `D` whole) |
 
 A grafted request runs exactly as if the graft's hidden turns preceded its own messages. The
 graft's tokens occupy positions `[0, n)` and the request's own rendered prompt starts at `n`. With
@@ -2365,6 +2372,68 @@ evicted, and later turns and shared prefixes are captured after it. In the promp
 positions are held by ids derived from the container's sha256, so the checkpoint is only ever
 matched by requests using the same graft.
 
+### Control vectors on the dense models
+
+On the dense Qwen3.5 / 3.6 / 3.8 models (and their MoE siblings) a `--graft NAME=PATH` whose file
+starts with the GGUF magic is a **control vector**: one direction per steered layer, applied to the
+residual stream at the output of that layer's block, after its MLP has been added. Two layouts are
+read:
+
+- **GLP** ([GGUF Layer Projection](https://github.com/msuiche/weightless/blob/main/docs/spec/GLP.md),
+  any `glp.*` key present). `glp.mode` says what the file does: `project` removes the component
+  along the unit direction, `h <- h - alpha_L (h . d) d`; `add` adds it, `h <- h + alpha_L v`; no
+  `glp.mode` means `add`. `alpha_L` is `glp.alpha_default` (default 1) times `glp.dir_scales` times
+  `glp.layer_scales[L]` (spec version 2; both default 1). Project directions are normalised to unit
+  length at startup.
+- **llama.cpp** (no `glp.*` key): an additive vector, `h <- h + v`, as llama.cpp's
+  `--control-vector` applies it at strength 1.
+
+Tensor `direction.N` applies at zero-based block `N` (`direction.0` does not exist in the format).
+The published refusal vector for Qwen3.8-27B is
+[`BlivionIaG/Qwen3.8-27B-refusal-cvec-GLP-49`](https://huggingface.co/BlivionIaG/Qwen3.8-27B-refusal-cvec-GLP-49)
+(`...-L10-58-a1.gguf`: GLP project, layers 10-58, alpha 1):
+
+```bash
+ninfer-serve qwen3_8_27b.ninfer --graft uncensored=/models/vectors/Qwen3.8-27B-refusal-cvec-GLP-49-L10-58-a1.gguf
+```
+
+A request selects it with `"graft": "uncensored"`; the selection table above applies unchanged.
+The file's alpha is used as written: NInfer has no strength override, so a different alpha is a
+different file (the model card reports alpha 0.5-3 as usable and empty replies at 4).
+
+- **Startup refuses** a file it cannot apply as written, naming the graft: an unknown `glp.mode` or
+  `glp.spec_version`, a `glp.hook_point` other than `residual_stream_post_layer`, rank > 1
+  (subspace) files, version-1 files carrying `glp.dir_scales` or `glp.layer_scales`, a
+  `glp.content_sha256` or `glp.layer_ids_zero_based` that disagrees with the tensors, a
+  `controlvector.model_hint` naming another architecture (the dense models accept `qwen3_5`,
+  `qwen3_5_text`, `qwen35`; MoE `qwen3_5_moe`, `qwen3_5_moe_text`, `qwen35moe`), a width other than
+  the hidden size, a layer past the last block, non-finite values, and a zero direction in project
+  mode. Up to 16 vectors may be loaded; each takes `layers x hidden x 4` bytes of device memory
+  (1.3 MiB on the 27B). A multi-GPU pipeline (`--devices` with more than one GPU) refuses vectors.
+- **Combining.** A request may select one prompt graft and one vector, `"graft": "persona+uncensored"`.
+  A `prefill_kv` graft is replayed under the vector, so it is exactly that graft's turns run on the
+  steered model. A `direct_kv` or `softprompt_kv` graft is base-model state installed at startup, which
+  a vector would contradict; combining one with a vector fails with `400`. A LoRA adapter (the
+  separate `lora` field, where the build has adapters) combines with a vector freely: the adapter
+  changes the weights, the vector the residual stream after them.
+- **Context cache.** A vector changes the activations, so a steered request has its own cache
+  identity (derived from the file's SHA-256): it reuses only checkpoints computed under the same
+  vector, and requests without it never resume from them. Context-store images carry that identity,
+  so changing a vector file only makes its own images misses.
+- **Lanes and graphs.** Each lane's selection travels in the decode round's ingress, so steered and
+  unsteered requests decode in the same rounds and CUDA graphs stay on. While a vector is loaded,
+  every steered layer launches one small kernel per decode step whatever the selection; an
+  unselected row returns at once and is left bit-for-bit untouched. A prefill with no vector
+  launches nothing.
+- **Speculation.** `--spec mtp|dflash|dflash2` verifies with the vector on, so the tokens are the
+  steered target's. The drafters do not steer, which can lower the acceptance rate of a steered
+  request, never change its tokens. The lossy-prefill scout does not steer either.
+- **Thinking.** On a prompt the base model refuses, a steered request with thinking on can reason
+  at length instead of answering: the published 27B vector reasoned past 6,000 tokens without an
+  answer on a hotwiring prompt, at temperature 0 and 0.6 (no repeated passage: it kept trying to
+  recall details). A thinking budget bounds it (`--default-thinking-budget`, or the request's
+  `thinking_budget`); see [the V100 notes](tesla-v100.md#refusal-steering-qwen38-27b).
+
 ### Refusal steering on Qwen3.8-Flash-Next
 
 Qwen3.8-Flash-Next has no hidden prompts. On it `--graft NAME=PATH` loads a **refusal-direction
@@ -2382,6 +2451,9 @@ copy to load. The launchers take `NINFER_GRAFT=NAME=PATH` (several separated by 
 ```bash
 ninfer-serve qwen4exp.ninfer --graft uncensored=C:/vectors/orcarouter.gguf
 ```
+
+Unlike the dense models, Flash-Next applies every control vector in project mode (it reads the
+llama.cpp layout only, and treats a plain file as a direction to remove).
 
 A request selects it exactly as it selects a 27B graft, with `"graft": "NAME"` on Chat Completions,
 Responses and Anthropic Messages. `--default-graft NAME` turns it on for every request that states
@@ -2706,8 +2778,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--tolerant-tool-calls` | repair broken tool-call markup on `tool_constraints:"auto"` requests instead of returning it as text; never keeps a call whose argument was cut. See [Tolerant tool calls](#tolerant-tool-calls) | off |
-| `--graft NAME=PATH` | load a [prompt graft](#prompt-grafts) a request may select by name; repeatable | none |
-| `--default-graft NAME` | apply a loaded graft to requests that state none; `"graft": ""` opts out | none |
+| `--graft NAME=PATH` | load a [prompt graft](#prompt-grafts), or from a GGUF file a [control vector](#control-vectors-on-the-dense-models) (on Qwen3.8-Flash-Next a refusal direction), that a request may select by name; repeatable | none |
+| `--default-graft NAME[+NAME]` | apply loaded grafts (one prompt graft and one vector at most) to requests that state none; `"graft": ""` opts out | none |
 | `--reasoning-effort minimal\|low\|medium\|high\|xhigh\|max` | effort for thinking-enabled requests that state none | template default |
 | `--cors` | permissive browser CORS headers | off |
 | `--temperature F` | process-level temperature override | unset |

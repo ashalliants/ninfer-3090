@@ -85,10 +85,12 @@ struct PromptGraft {
 [[nodiscard]] PromptGraft load_prompt_graft(const GraftSource& source, const TextConfig& text);
 
 // The slot count of each of `sources` that is direct_kv or softprompt_kv, in order, from their
-// sidecars alone. Each one permanently holds a StateImage and its Main KV pages once installed, so
+// sidecars alone (a control vector, a GGUF file, has none and is skipped). Each one permanently holds a StateImage and its Main KV pages once installed, so
 // option normalization and KV planning size those pools before the containers are loaded.
 [[nodiscard]] std::vector<std::uint32_t> direct_graft_slots(const std::vector<GraftSource>& sources);
 
+// Every prompt graft among `sources`, in order. Control vectors (GGUF files, frontend/
+// control_vector.h) are skipped; every name is checked, unique, non-empty and free of '+'.
 [[nodiscard]] std::vector<PromptGraft> load_prompt_grafts(const std::vector<GraftSource>& sources,
                                                          const TextConfig& text);
 
