@@ -10,4 +10,5 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/attention.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/expert_source.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/ffn.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/execution/forward.cpp"
 )
