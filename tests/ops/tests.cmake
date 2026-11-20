@@ -145,6 +145,10 @@ ninfer_add_op_test(ninfer_softmax_pool_test
 ninfer_add_op_test(ninfer_position_selection_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_position_selection.cpp"
   LIBRARIES ninfer_ops)
+# DeepSeek-V4's MoE mixing (clamped SwiGLU, weighted slot sum) against FP64 oracles.
+ninfer_add_op_test(ninfer_moe_mix_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_mix.cpp"
+  LIBRARIES ninfer_ops)
 # Host-only: the int8 hyper-connection codec (--hc-int8): the group rule the quantize kernel runs,
 # against exact FP64 checks and an independent re-implementation of Basalt's rule.
 ninfer_add_op_test(ninfer_hc_int8_codec_test
