@@ -69,6 +69,28 @@ StateImageSelectors ProgramImpl::state_selectors(const SequenceState& sequence) 
             state_store->physical_slot(sequence.state.write)};
 }
 
+ops::LoraColumns ProgramImpl::lora_columns(const SequenceState& sequence) noexcept {
+    ops::LoraColumns out;
+    out.rows    = 1;
+    out.width   = 1;
+    out.slot[0] = sequence.lora;
+    return out;
+}
+
+ops::LoraColumns ProgramImpl::lora_columns(std::span<const std::uint32_t> lanes) const {
+    if (parameters.lora == nullptr) { return {}; }
+    if (lanes.size() > static_cast<std::size_t>(ops::kLoraMaxRows)) {
+        throw std::logic_error("a round has more rows than a LoRA selection holds");
+    }
+    ops::LoraColumns out;
+    out.rows  = static_cast<std::int32_t>(lanes.size());
+    out.width = 1;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        out.slot[row] = active_sequence(lanes[row]).lora;
+    }
+    return out;
+}
+
 void ProgramImpl::refresh_state_views(SequenceState& sequence) {
     sequence.tail_hidden =
         state_images->continuation_hidden_slot(state_store->physical_slot(sequence.state.read));

@@ -20,6 +20,12 @@ ninfer_add_test(ninfer_qwen3_5_graft_loader_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_graft_loader.cpp"
   LIBRARIES ninfer_engine ninfer_core ninfer::json)
 
+# PEFT LoRA adapter loading: name mapping, scale, dtypes, refusals, q_proj split, rotated basis
+# (CPU only).
+ninfer_add_test(ninfer_qwen3_5_lora_loader_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lora_loader.cpp"
+  LIBRARIES ninfer_model_loading ninfer::json)
+
 # The reasoning-loop guard's repeated-passage measure (CPU only).
 ninfer_add_test(ninfer_qwen3_5_reasoning_loop_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_reasoning_loop.cpp"
@@ -142,6 +148,12 @@ ninfer_add_test(ninfer_qwen3_5_context_rows_real_test
 ninfer_add_test(ninfer_qwen3_5_graft_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_graft_real.cpp"
   LIBRARIES ninfer_engine ninfer_model_runtime ninfer_model_loading ninfer_core ninfer::json)
+# LoRA adapters on the 27B: a zero-B adapter is exact, base rounds are unchanged, and with
+# NINFER_TEST_LORA a real adapter is stable across graphs, MTP and mixed rounds and keeps its own
+# cache identity (NINFER_TEST_LORA_REFERENCE compares with a PEFT run).
+ninfer_add_test(ninfer_qwen3_5_lora_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_lora_real.cpp"
+  LIBRARIES ninfer_engine ninfer::json)
 ninfer_add_test(ninfer_qwen3_5_stages_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_stages_real.cpp"
   LIBRARIES ninfer_engine)
@@ -252,6 +264,7 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_moe_real_test
   ninfer_qwen3_5_dflash_real_test
   ninfer_qwen3_5_graft_real_test
+  ninfer_qwen3_5_lora_real_test
   ninfer_qwen3_5_stages_real_test
   ninfer_qwen3_5_suspend_real_test)
 set_tests_properties(${ninfer_qwen3_5_real_tests} PROPERTIES

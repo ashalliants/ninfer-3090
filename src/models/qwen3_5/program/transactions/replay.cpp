@@ -204,7 +204,7 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
         execution::PrefillContext context{
             {device, parameters, work, state_images->linear(0),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, stage_runtime.get()},
+             proposal_head, stage_runtime.get(), nullptr, lora_columns(sequence)},
             text_kv_view(sequence),
             skip_mtp_alignment ? PagedKVCacheView{} : mtp_kv_view(sequence),
             decoder->text_kv,

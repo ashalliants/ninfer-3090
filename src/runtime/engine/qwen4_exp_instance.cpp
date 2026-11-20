@@ -249,6 +249,9 @@ void validate(const EngineOptions& options) {
             }
         }
     }
+    if (!options.loras.empty()) {
+        refuse("has no LoRA route: --lora adapters are for the dense Qwen3.5 / 3.6 / 3.8 models");
+    }
     // A single --devices entry selects the card (Engine builds its DeviceContext from it), so it is
     // honored; more than one entry, or per-stage layer counts, would need pipeline stages.
     if (options.devices.size() > 1) { refuse("runs on one GPU: pass a single id to --devices"); }

@@ -137,7 +137,9 @@ ProgramImpl::ScoutStep ProgramImpl::advance_scout(SequenceHandle handle, std::ui
                                   prefill_hidden,
                                   prefill_chunk,
                                   proposal_head,
-                                  stage_runtime.get()};
+                                  stage_runtime.get(),
+                                  nullptr,
+                                  lora_columns(sequence)};
     execution::TextContext card(device, parameters, work, text_kv_view(sequence),
                                 state_images->linear(0), io, prefill_hidden, prefill_chunk,
                                 session.cursor, mtp_kv_view(sequence), &decoder->text_kv,

@@ -221,6 +221,9 @@ struct SequenceState {
     // The lossy lineage of the ledger (lineage order): the maps from the original prompts to it.
     // Every checkpoint taken from the sequence past a map's begin carries that map.
     GapMapSet gap_maps;
+    // The LoRA adapter slot every target pass of this sequence runs with (PreparedPromptData::
+    // lora), -1 for the base model. Fixed for the sequence's life: its identity tag carries it.
+    std::int32_t lora = -1;
 };
 
 struct CaptureReservation {
@@ -344,6 +347,10 @@ public:
                                                const runtime::ResolvedExecutionOptions&);
     [[nodiscard]] CheckpointHandle install_external_checkpoint(const PromptGraft&);
     [[nodiscard]] std::uint32_t prefix_identity_tag() const noexcept;
+    // The tag of a request that runs LoRA slot `lora` (-1: the base tag above). An adapter changes
+    // every activation, so its requests share cached context only with requests of the same
+    // adapter: the base tag mixed with the adapter's content digest, never equal to the base tag.
+    [[nodiscard]] std::uint32_t prefix_identity_tag(std::int32_t lora) const;
     [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&&, std::uint32_t first_target,
                                                   const ScoringOptions& options,
                                                   ScoreRowSink* sink);
@@ -944,6 +951,9 @@ public:
     void ordered_reset(SequenceState&);
     void refresh_state_views(SequenceState&);
     [[nodiscard]] StateImageSelectors state_selectors(const SequenceState&) const;
+    // The LoRA adapter selection of one sequence's prefill call, or of a round's rows in order.
+    [[nodiscard]] static ops::LoraColumns lora_columns(const SequenceState& sequence) noexcept;
+    [[nodiscard]] ops::LoraColumns lora_columns(std::span<const std::uint32_t> lanes) const;
     void settle_state_fork(SequenceState&);
     void release_sequence_state(SequenceState&) noexcept;
     void release_sequence_kv(SequenceState&) noexcept;

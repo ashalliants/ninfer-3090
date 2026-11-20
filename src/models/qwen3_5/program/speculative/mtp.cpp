@@ -92,6 +92,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                          &state.text_cache, &state.mtp_cache);
         card.set_stage_runtime(state.execution.stages);
         card.set_tripwire(state.execution.tripwire);
+        card.set_lora(state.execution.lora);
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers          = frame.base_frontiers.slice(0, 0, batch_size);
         Tensor budgets            = frame.remaining_budgets.slice(0, 0, batch_size);

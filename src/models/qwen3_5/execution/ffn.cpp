@@ -1,4 +1,5 @@
 #include "models/qwen3_5/execution/ffn.h"
+#include "models/qwen3_5/execution/lora.h"
 #include "models/qwen3_5/execution/rotation.h"
 
 #include "core/layout.h"
@@ -9,6 +10,7 @@
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/silu_mul.h"
 
+#include <array>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::execution {
@@ -68,6 +70,72 @@ void rotated_dense_ffn(const Tensor& hidden, const DenseParameters& p, Tensor& r
 }
 
 } // namespace
+
+std::size_t lora_ffn_workspace_bytes(const DenseParameters& p, const LoraParameters& lora,
+                                     std::int32_t first, std::int32_t last, bool prefill) {
+    const auto policy = [&](ops::LinearPolicy own) {
+        return prefill ? ops::prefill_phase_policy(own) : own;
+    };
+    const auto& gu   = p.gate_up.weight;
+    const auto& down = p.down.weight;
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::BF16, {gu.n, last});
+    {
+        auto scope = layout.scope();
+        if (rotated(p.gate_up.hadamard_signs)) { (void)layout.alloc(DType::BF16, {gu.k, last}); }
+        {
+            auto call = layout.scope();
+            (void)layout.alloc_bytes(ops::linear_workspace_capacity_bytes(
+                gu.qtype, gu.n, gu.k, policy(p.gate_up.policy), first, last));
+        }
+        (void)layout.alloc_bytes(ops::lora_workspace_bytes(2 * lora.rank, gu.k, last));
+    }
+    (void)layout.alloc(DType::BF16, {gu.n / 2, last});
+    {
+        auto call = layout.scope();
+        (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
+            down.qtype, down.n, down.k, policy(p.down.policy), first, last));
+    }
+    (void)layout.alloc_bytes(ops::lora_workspace_bytes(lora.rank, down.k, last));
+    return layout.peak_bytes(1);
+}
+
+void lora_ffn(const Tensor& hidden, const DenseParameters& p, const LoraBlock& lora,
+              const ops::LoraColumns& columns, Tensor& residual, WorkspaceArena& workspace,
+              cudaStream_t stream, InputBasis basis, bool prefill) {
+    const auto policy = [&](ops::LinearPolicy own) {
+        return prefill ? ops::prefill_phase_policy(own) : own;
+    };
+    auto scope              = workspace.scope();
+    const auto count        = hidden.ne[1];
+    const auto& gu          = p.gate_up.weight;
+    const auto intermediate = gu.n / 2;
+    Tensor plane            = workspace.alloc(DType::BF16, {gu.n, count});
+    {
+        auto call      = workspace.scope();
+        const Tensor x = rotated_input(hidden, p.gate_up.hadamard_signs, workspace, stream, basis);
+        {
+            auto linear_scope = workspace.scope();
+            ops::linear(x, gu, plane, policy(p.gate_up.policy), workspace, stream);
+        }
+        std::array<Tensor, 2> halves{plane.slice(0, 0, intermediate),
+                                     plane.slice(0, intermediate, intermediate)};
+        apply_lora_site(lora.ffn_input, x, halves, columns, workspace, stream);
+    }
+    Tensor activation = workspace.alloc(DType::BF16, {intermediate, count});
+    if (rotated(p.down.hadamard_signs)) {
+        ops::silu_mul_hadamard(plane, p.down.hadamard_signs, activation, stream);
+    } else {
+        ops::silu_mul(plane.slice(0, 0, intermediate), plane.slice(0, intermediate, intermediate),
+                      activation, stream);
+    }
+    {
+        auto call = workspace.scope();
+        ops::linear_add(activation, p.down.weight, residual, policy(p.down.policy), workspace, stream);
+    }
+    std::array<Tensor, 1> out{residual};
+    apply_lora_site(lora.ffn_output, activation, out, columns, workspace, stream);
+}
 
 std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
                                 std::int32_t last, bool mtp, bool verify, bool prefill) {

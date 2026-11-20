@@ -17,6 +17,7 @@
 // The checkpoint is pinned for the Program's life (a permanent lease): it cannot be released,
 // demoted or chosen by a reclaim plan, and no binding may consume it.
 
+#include "models/qwen3_5/execution/lora.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "ninfer/ops/kv_cache_append.h"
@@ -110,6 +111,24 @@ std::uint32_t ProgramImpl::prefix_identity_tag() const noexcept {
     return static_cast<std::uint32_t>(speculative_backend) |
            (static_cast<std::uint32_t>(proposal_head) << 8U) |
            (static_cast<std::uint32_t>(kv_storage) << 16U);
+}
+
+std::uint32_t ProgramImpl::prefix_identity_tag(std::int32_t lora) const {
+    const std::uint32_t base = prefix_identity_tag();
+    if (lora < 0) { return base; }
+    if (parameters.lora == nullptr ||
+        static_cast<std::size_t>(lora) >= parameters.lora->adapters.size()) {
+        throw std::logic_error("a request selected a LoRA slot the Program has not loaded");
+    }
+    std::uint64_t mixed =
+        (static_cast<std::uint64_t>(base) ^ parameters.lora->adapters[static_cast<std::size_t>(lora)].digest) *
+        1099511628211ULL;
+    auto tag = static_cast<std::uint32_t>(mixed ^ (mixed >> 32U));
+    while (tag == base) {
+        mixed = (mixed + 0x9e3779b97f4a7c15ULL) * 1099511628211ULL;
+        tag   = static_cast<std::uint32_t>(mixed ^ (mixed >> 32U));
+    }
+    return tag;
 }
 
 CheckpointHandle ProgramImpl::install_external_checkpoint(const PromptGraft& graft) {

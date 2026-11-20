@@ -15,6 +15,7 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/round_buffers.h"
 #include "models/qwen3_5/execution/stage_runtime.h"
+#include "ninfer/ops/lora.h"
 
 #include <array>
 #include <cstddef>
@@ -96,6 +97,7 @@ struct ScoutScratch {
 
 class VisionPrefillSession;
 class NumericTripwire;
+struct LoraBlock; // execution/lora.h
 
 class TextContext {
 public:
@@ -141,6 +143,13 @@ public:
     void set_tripwire(NumericTripwire* tripwire) noexcept { tripwire_ = tripwire; }
 
     void set_prefill_gpu_timer(CudaEventTimer* timer) noexcept { prefill_gpu_timer_ = timer; }
+
+    // The LoRA adapter slot of each sequence of the next target passes (Parameters::lora): a
+    // prefill chunk is one row; a decode or verify batch is one row per sequence, in batch order.
+    // Unset, or a model without adapters, runs no LoRA work at all. The selection is passed to
+    // the kernels by value, so a pass that selects an adapter must not be captured into a graph
+    // that is replayed for other selections; the Program runs those passes eagerly.
+    void set_lora(const ops::LoraColumns& columns) noexcept { lora_ = columns; }
 
     // One event per full-attention layer (compact index) of a Host restore still landing. The next
     // layer pass waits for each one just before that layer's attention; later passes are
@@ -391,6 +400,13 @@ private:
     // The int4 scout's layer parameters while scout_chunk runs (ScoutScratch::a4_layers); empty
     // everywhere else, so every other pass reads the model's own parameters.
     std::span<const BlockParameters> scout_layers_{};
+    // set_lora's selection, and the text layer the current mixer / FFN call belongs to.
+    ops::LoraColumns lora_{};
+    std::uint32_t lora_layer_ = 0;
+    // The LoRA block of lora_layer_ when this pass applies an adapter, else null; and the column
+    // map of a T-column call.
+    [[nodiscard]] const LoraBlock* lora_block() const;
+    [[nodiscard]] ops::LoraColumns lora_columns(std::int32_t columns) const;
     PrefillSliceState* prefill_slice_         = nullptr;
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;

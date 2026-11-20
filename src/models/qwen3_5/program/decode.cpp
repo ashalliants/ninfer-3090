@@ -46,6 +46,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          &state.text_cache);
         card.set_stage_runtime(state.execution.stages);
         card.set_tripwire(state.execution.tripwire);
+        card.set_lora(state.execution.lora);
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);
@@ -408,7 +409,9 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
         ops::CausalAttentionExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
-        if (use_cuda_graph) {
+        // A round with a LoRA row runs eagerly: the captured graphs carry no adapter selection.
+        const ops::LoraColumns lora = lora_columns(lanes);
+        if (use_cuda_graph && !lora.any()) {
             DecodeGraphProfile& profile =
                 ordinary_graphs.select(static_cast<std::uint32_t>(lanes.size()), maximum_frontier);
             executable = &ordinary_graphs.install(profile);
@@ -437,7 +440,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
         execution::OrdinaryBatchContext schedule_state{
             {device, parameters, work, state_images->linear(0),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, stage_runtime.get(), tripwire.get()},
+             proposal_head, stage_runtime.get(), tripwire.get(), lora},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -558,7 +561,9 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         DecodeGraphExecutable* finish  = nullptr;
         execution::MtpCausalAttentionEnvelopes envelopes =
             mtp_causal_attention_envelopes(maximum_frontier, draft_window, capacity);
-        if (use_cuda_graph) {
+        // A round with a LoRA row runs eagerly: the captured graphs carry no adapter selection.
+        const ops::LoraColumns lora = lora_columns(lanes);
+        if (use_cuda_graph && !lora.any()) {
             // An MTP round verifies its own proposal: the neural family at the draft window.
             SpeculativeRoundFamily& family =
                 round_family(SpeculativeRoundKind::Neural, draft_window);
@@ -616,7 +621,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         execution::MtpBatchContext schedule_state{{device, parameters, work, state_images->linear(0),
                                                    replay_records ? &*replay_records : nullptr, io,
                                                    prefill_hidden, prefill_chunk, proposal_head, stage_runtime.get(),
-                                                   tripwire.get()},
+                                                   tripwire.get(), lora},
                                                   decoder->text_kv,
                                                   *decoder->mtp_cache(),
                                                   *io.mtp_decode,
@@ -918,7 +923,9 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         DecodeGraphExecutable* finish        = nullptr;
         execution::DFlashEnvelopes envelopes = dflash_envelopes(maximum_frontier, verify_drafts);
         ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
-        if (use_cuda_graph) {
+        // A round with a LoRA row runs eagerly: the captured graphs carry no adapter selection.
+        const ops::LoraColumns lora = lora_columns(lanes);
+        if (use_cuda_graph && !lora.any()) {
             const auto batch = static_cast<std::uint32_t>(lanes.size());
             auto& profile    = family.forward.select(batch, maximum_frontier);
             auto& completion = family.finish.select(batch, maximum_frontier);
@@ -982,7 +989,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         execution::DFlashBatchContext schedule_state{
             {device, parameters, work, state_images->linear(0), round_replay_records(verify_drafts),
              io, prefill_hidden, prefill_chunk, proposal_head, stage_runtime.get(),
-             tripwire.get()},
+             tripwire.get(), lora},
             decoder->text_kv,
             *dflash,
             *io.dflash_decode,
