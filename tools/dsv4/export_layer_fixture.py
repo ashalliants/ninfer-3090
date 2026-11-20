@@ -26,6 +26,7 @@ difference the test's criterion allows for.
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
@@ -90,9 +91,14 @@ def main() -> int:
     parser.add_argument("--tokens", type=int, default=200)
     parser.add_argument("--seed", type=int, default=1)
     args = parser.parse_args()
-    if args.out.exists() and any(args.out.iterdir()):
-        parser.error(f"{args.out} is not empty")
-    args.out.mkdir(parents=True, exist_ok=True)
+    final = args.out
+    if final.exists() and any(final.iterdir()):
+        parser.error(f"{final} is not empty")
+    # Written beside the target and renamed once complete, so a failed export never leaves a half fixture there.
+    args.out = final.with_name(final.name + ".partial")
+    if args.out.exists():
+        shutil.rmtree(args.out)
+    args.out.mkdir(parents=True)
 
     weights: dict[str, np.ndarray] = {}
     config: dict = {"layer": args.layer, "tokens": args.tokens}
@@ -200,7 +206,10 @@ def main() -> int:
     for name, value in stages.items():
         np.ascontiguousarray(value, "<f4").tofile(args.out / f"{name}.bin")
     (args.out / "config.txt").write_text("".join(f"{k} {v}\n" for k, v in config.items()))
-    print(f"wrote {args.out}", flush=True)
+    if final.exists():
+        final.rmdir()  # empty, checked above
+    args.out.rename(final)
+    print(f"wrote {final}", flush=True)
     return 0
 
 
