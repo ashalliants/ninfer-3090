@@ -136,6 +136,21 @@ int main() {
     std::printf("expert cache: %llu hits, %llu misses, %.1f GB read\n", static_cast<unsigned long long>(stats.hits),
                 static_cast<unsigned long long>(stats.misses), static_cast<double>(stats.bytes_read) / 1e9);
 
+    // Warm-cache decode speed: the same token fed again for several steps routes to the experts just used,
+    // so the steps are served from the cache and the time is the compute and the per-layer host sync.
+    {
+        const int warm_steps = 8;
+        for (int i = 0; i < 8; ++i) { forward.run(std::span<const std::int32_t>(&next, 1), position++); } // fill the cache
+        experts.reset_stats();
+        cudaStreamSynchronize(stream);
+        const auto warm_start = std::chrono::steady_clock::now();
+        for (int i = 0; i < warm_steps; ++i) { forward.run(std::span<const std::int32_t>(&next, 1), position++); }
+        cudaStreamSynchronize(stream);
+        const double warm = seconds_since(warm_start);
+        const auto& w = experts.stats();
+        std::printf("warm decode probe: %d steps in %.3f s (%.1f ms/token), %llu hits, %llu misses\n", warm_steps, warm,
+                    1000.0 * warm / warm_steps, static_cast<unsigned long long>(w.hits), static_cast<unsigned long long>(w.misses));
+    }
     if (failures == 0) { std::printf("PASS\n"); }
     return failures == 0 ? 0 : 1;
 }

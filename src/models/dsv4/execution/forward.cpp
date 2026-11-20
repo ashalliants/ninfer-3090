@@ -10,6 +10,9 @@
 #include "ninfer/ops/rmsnorm.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::models::dsv4 {
@@ -45,6 +48,23 @@ struct Forward::Impl {
     Tensor residual_view;
     Tensor logits;
     std::int32_t position = 0;
+    // NINFER_DSV4_PROFILE=1: each stage is timed on the host between stream synchronizations (slows the run
+    // down; the report goes to stderr from the destructor).
+    bool profile = std::getenv("NINFER_DSV4_PROFILE") != nullptr;
+    bool recording = false; // only decode steps from position 16 on (the warm ones) are recorded
+    double stage_seconds[6] = {};
+    std::int64_t stage_calls = 0;
+    std::chrono::steady_clock::time_point mark;
+    void begin() {
+        if (!recording) { return; }
+        cudaStreamSynchronize(stream);
+        mark = std::chrono::steady_clock::now();
+    }
+    void end(int stage) {
+        if (!recording) { return; }
+        cudaStreamSynchronize(stream);
+        stage_seconds[stage] += std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
+    }
 
     static std::size_t workspace_bytes(const Model& model, const ForwardOptions& options) {
         const TextConfig& c = model.config();
@@ -118,7 +138,15 @@ struct Forward::Impl {
 Forward::Forward(const Model& model, ExpertSource& experts, ForwardOptions options, cudaStream_t stream)
     : impl_(std::make_unique<Impl>(model, experts, options, stream)) {}
 
-Forward::~Forward() = default;
+Forward::~Forward() {
+    const Impl& s = *impl_;
+    if (s.profile && s.stage_calls > 0) {
+        static const char* names[6] = {"embedding", "attention mixes+collapse+norm", "attention layer", "attention expand", "ffn sublayer", "head"};
+        for (int i = 0; i < 6; ++i) {
+            std::fprintf(stderr, "dsv4 profile: %-30s %9.3f ms per call\n", names[i], 1000.0 * s.stage_seconds[i] / double(s.stage_calls));
+        }
+    }
+}
 
 std::size_t Forward::device_bytes() const noexcept {
     const Impl& i = *impl_;
@@ -138,6 +166,8 @@ const Tensor& Forward::run(std::span<const std::int32_t> tokens, std::int32_t st
     cudaStream_t stream = s.stream;
 
     // Embedding into one stream, then copied into the others.
+    s.recording = s.profile && T == 1 && start >= 16;
+    s.begin();
     cuda_ok(cudaMemcpyAsync(s.tokens_buffer.p, tokens.data(), std::size_t(T) * 4, cudaMemcpyHostToDevice, stream), "token upload");
     Tensor ids(s.tokens_buffer.p, DType::I32, {T});
     Tensor residual = s.columns(s.residual_view, T);
@@ -154,6 +184,8 @@ const Tensor& Forward::run(std::span<const std::int32_t> tokens, std::int32_t st
         }
     }
 
+    s.end(0);
+    s.begin();
     HcMixes attn_mixes = s.mixes(0, T);
     HcMixes ffn_mixes[2] = {s.mixes(1, T), s.mixes(2, T)};
     const Tensor* pre    = &s.identity_pre;
@@ -175,14 +207,22 @@ const Tensor& Forward::run(std::span<const std::int32_t> tokens, std::int32_t st
             Tensor out       = s.workspace.alloc(DType::BF16, {H, T});
             ops::hc_collapse(residual, *pre, collapsed, stream);
             ops::rmsnorm(collapsed, s.attention[l].views.attn_norm, c.rms_norm_eps, false, x, stream);
+            s.end(1);
+            s.begin();
             attention_layer(c, l, s.attention[l].views, s.state, x, start, out, s.workspace, stream);
+            s.end(2);
+            s.begin();
             ops::hc_expand_mix(out, attn_mixes.post, attn_mixes.comb, residual, stream);
         }
         // FFN sublayer; its mixes alternate between two buffers so the next block can collapse with them.
+        s.end(3);
+        s.begin();
         HcMixes& mixes = ffn_mixes[l & 1];
         FfnInput input{residual, &attn_mixes.pre, mixes};
         ffn_forward(ffn_params(c, l), s.ffn[l], l, s.experts, input, s.workspace, stream);
+        s.end(4);
         pre = &mixes.pre;
+        s.begin();
     }
 
     // Final collapse with the last FFN's pre, then the last position only through norm and head.
@@ -195,6 +235,8 @@ const Tensor& Forward::run(std::span<const std::int32_t> tokens, std::int32_t st
         ops::rmsnorm(last, s.output_norm, c.rms_norm_eps, false, normed, stream);
         ops::projection_fp32(normed, s.head, s.logits, stream);
     }
+    s.end(5);
+    if (s.recording) { ++s.stage_calls; }
     s.position = start + T;
     return s.logits;
 }
