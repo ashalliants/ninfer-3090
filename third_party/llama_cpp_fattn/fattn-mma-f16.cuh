@@ -690,6 +690,20 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 KQ_C[i].x[l] = logit_softcap*tanhf(KQ_C[i].x[l]);
             }
         }
+    } else if (logit_softcap != 0.0f) {
+        // ninfer: without use_logit_softcap a nonzero logit_softcap is a KQ scale applied here in
+        // FP32, so the caller can pass scale = 1 and an unscaled Q: the Q load rounds Q x scale to
+        // FP16 (twice: the scale itself is half), which on sharp attention rows moved outputs by
+        // ~3%. Upstream callers pass 0 when use_logit_softcap is false.
+        constexpr int stride = cols_per_warp == 8 ? np*T_C_KQ::I : np*T_C_KQ::J;
+        static_assert(nbatch_fa % stride == 0, "bad loop size");
+#pragma unroll
+        for (int i = 0; i < nbatch_fa/stride; ++i) {
+#pragma unroll
+            for (int l = 0; l < T_C_KQ::ne; ++l) {
+                KQ_C[i].x[l] *= logit_softcap;
+            }
+        }
     }
 
     float KQ_max_new[cols_per_thread];

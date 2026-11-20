@@ -151,7 +151,14 @@ VisionWorkspaceLayout build_workspace_layout(const VisionConfig& config,
             out.attention_norm     = add(DType::BF16, {dimension(config.hidden_size), patches},
                                          "vision attention norm/attended");
             out.attended           = out.attention_norm;
-            out.qkv_scratch        = scratch(qkv_bytes, "QKV scratch");
+            // The QKV projection's scratch also serves the attention after it.
+            out.qkv_scratch = scratch(
+                std::max(qkv_bytes,
+                         ops::packed_softmax_attention_uniform_workspace_capacity_bytes(
+                             {dimension(config.hidden_size / config.num_heads),
+                              dimension(config.num_heads), dimension(config.num_heads)},
+                             patches)),
+                "QKV / attention scratch");
             out.projection_scratch = scratch(projection_bytes, "attention output scratch");
             out.projected =
                 alias_tensor(out.qkv, DType::BF16, {dimension(config.hidden_size), patches},
@@ -381,13 +388,14 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
                 Tensor attended_heads =
                     attended.view({dimension(config_.hidden_size / config_.num_heads),
                                    dimension(config_.num_heads), patches});
+                WorkspaceArena attention_scratch(layout.qkv_scratch.bind(backing));
                 ops::packed_softmax_attention(
                     q, k, v,
                     {dimension(config_.hidden_size / config_.num_heads),
                      dimension(config_.num_heads), dimension(config_.num_heads)},
                     static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.hidden_size /
                                                                            config_.num_heads))),
-                    control.segment_length, attended_heads, stream);
+                    control.segment_length, attention_scratch, attended_heads, stream);
             }
             Tensor projected = layout.projected.bind(backing);
             project(attended, block.output, projected, layout.projection_scratch);

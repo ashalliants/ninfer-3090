@@ -38,6 +38,18 @@ std::int32_t scratch_tiles(std::int32_t tokens, std::int32_t segments) {
     return static_cast<std::int32_t>(tiles);
 }
 
+#if defined(NINFER_SM70)
+// The sm_70 flash route's staging (launch.h) for any call of up to `tokens` tokens.
+template <class Allocator>
+void* allocate_volta_staging(Allocator& allocator, std::int32_t tokens) {
+    const std::size_t bytes = detail::packed_attention_volta_workspace_bytes(tokens);
+    if (bytes > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::overflow_error("packed_softmax_attention: sm_70 staging exceeds int32 bytes");
+    }
+    return allocator.alloc(DType::U8, {static_cast<std::int32_t>(bytes)}).data;
+}
+#endif
+
 template <class Allocator>
 Tensor allocate_workspace(Allocator& allocator, std::int32_t tokens, std::int32_t segments) {
     const std::int32_t tiles = scratch_tiles(tokens, segments);
@@ -93,6 +105,22 @@ std::size_t packed_softmax_attention_workspace_capacity_bytes(AttentionHeadGeome
     return layout.peak_bytes(1);
 }
 
+std::size_t packed_softmax_attention_uniform_workspace_capacity_bytes(
+    AttentionHeadGeometry geometry, std::int32_t max_tokens) {
+    require_profile(geometry, kExpectedScale, "packed_softmax_attention uniform workspace");
+    if (max_tokens <= 0) {
+        throw std::invalid_argument(
+            "packed_softmax_attention uniform workspace: max_tokens must be positive");
+    }
+#if defined(NINFER_SM70)
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_volta_staging(layout, max_tokens);
+    return layout.peak_bytes(1);
+#else
+    return 0;
+#endif
+}
+
 void softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                        AttentionHeadGeometry geometry, float scale, WorkspaceArena& workspace,
                        Tensor& out, cudaStream_t stream) {
@@ -128,6 +156,27 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         throw std::invalid_argument("packed_softmax_attention: invalid uniform segment length");
     }
     detail::packed_attention_uniform_launch(q, k, v, segment_length, out, stream);
+}
+
+void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                              AttentionHeadGeometry geometry, float scale,
+                              std::int32_t segment_length, WorkspaceArena& workspace, Tensor& out,
+                              cudaStream_t stream) {
+    const std::int32_t tokens =
+        validate_qkv(q, k, v, out, geometry, scale, "packed_softmax_attention");
+    if (segment_length <= 0 || tokens % segment_length != 0) {
+        throw std::invalid_argument("packed_softmax_attention: invalid uniform segment length");
+    }
+#if defined(NINFER_SM70)
+    // The BF16 kernel is Ampere mma.sync, emulated on Volta: take the FP16 flash route.
+    auto scope           = workspace.scope();
+    void* staging        = allocate_volta_staging(workspace, tokens);
+    detail::packed_attention_volta_flash_launch(q, k, v, segment_length, scale, staging, out,
+                                                stream);
+#else
+    (void)workspace;
+    detail::packed_attention_uniform_launch(q, k, v, segment_length, out, stream);
+#endif
 }
 
 } // namespace ninfer::ops

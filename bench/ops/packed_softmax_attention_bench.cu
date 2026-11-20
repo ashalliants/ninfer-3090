@@ -210,7 +210,9 @@ public:
           workspace_bytes_(ops::packed_softmax_attention_workspace_capacity_bytes(
               kGeometry, tokens_, tokens_, static_cast<std::int32_t>(segment_lengths_.size()),
               static_cast<std::int32_t>(segment_lengths_.size()))),
-          workspace_(std::max<std::size_t>(workspace_bytes_, 1)),
+          uniform_workspace_bytes_(
+              ops::packed_softmax_attention_uniform_workspace_capacity_bytes(kGeometry, tokens_)),
+          workspace_(std::max<std::size_t>({workspace_bytes_, uniform_workspace_bytes_, 1})),
           q_tensor_(q_.p, DType::BF16, {kHeadDim, kHeads, tokens_}),
           k_tensor_(k_.p, DType::BF16, {kHeadDim, kHeads, tokens_}),
           v_tensor_(v_.p, DType::BF16, {kHeadDim, kHeads, tokens_}),
@@ -227,13 +229,11 @@ public:
 
     void launch(Entry entry, cudaStream_t stream) {
         if (entry == Entry::Uniform) {
-            if (segment_lengths_.size() == 1) {
-                ops::softmax_attention(q_tensor_, k_tensor_, v_tensor_, kGeometry, kScale,
-                                       workspace_, output_tensor_, stream);
-            } else {
-                ops::packed_softmax_attention(q_tensor_, k_tensor_, v_tensor_, kGeometry, kScale,
-                                              segment_lengths_.front(), output_tensor_, stream);
-            }
+            // The equal-length form with a workspace, as the vision tower calls it (on sm_70 the
+            // FP16 flash route).
+            ops::packed_softmax_attention(q_tensor_, k_tensor_, v_tensor_, kGeometry, kScale,
+                                          segment_lengths_.front(), workspace_, output_tensor_,
+                                          stream);
         } else {
             ops::packed_softmax_attention(q_tensor_, k_tensor_, v_tensor_, kGeometry, kScale,
                                           cu_tensor_, workspace_, output_tensor_, stream);
@@ -247,7 +247,7 @@ public:
     }
 
     [[nodiscard]] std::size_t workspace_bytes(Entry entry) const noexcept {
-        return entry == Entry::Packed ? workspace_bytes_ : 0;
+        return entry == Entry::Packed ? workspace_bytes_ : uniform_workspace_bytes_;
     }
 
     [[nodiscard]] double useful_flops() const noexcept {
@@ -271,6 +271,7 @@ private:
     DeviceBuffer cu_seqlens_;
     DeviceBuffer output_;
     std::size_t workspace_bytes_;
+    std::size_t uniform_workspace_bytes_;
     WorkspaceArena workspace_;
     Tensor q_tensor_;
     Tensor k_tensor_;

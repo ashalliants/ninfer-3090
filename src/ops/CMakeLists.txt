@@ -22,13 +22,16 @@ endif()
 
 include(basic_sources.cmake)
 
-# The sm_70 prompt flash-attention route drives a vendored llama.cpp kernel (MIT,
+# The sm_70 prompt and vision flash-attention routes drive a vendored llama.cpp kernel (MIT,
 # third_party/llama_cpp_fattn). Its headers are named common.cuh / mma.cuh like ours, so the
-# vendored include directory is scoped to the one translation unit that uses it.
+# vendored include directory is scoped to the translation units that use it.
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
-  target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/launcher/gqa_attention_volta_flash.cu")
+  target_sources(ninfer_ops PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/launcher/gqa_attention_volta_flash.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/launcher/packed_attention_volta_flash.cu")
   set_source_files_properties(
     "${CMAKE_CURRENT_LIST_DIR}/launcher/gqa_attention_volta_flash.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/launcher/packed_attention_volta_flash.cu"
     TARGET_DIRECTORY ninfer_ops
     PROPERTIES
       INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/llama_cpp_fattn"
