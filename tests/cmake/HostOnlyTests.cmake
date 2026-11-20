@@ -38,6 +38,7 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_host_arena_replay_test
   ninfer_host_timing_test
   ninfer_http_security_test
+  ninfer_inkling2_reference_test
   ninfer_interleaved_ab_test
   ninfer_jinja_test
   ninfer_json_schema_oracle_test

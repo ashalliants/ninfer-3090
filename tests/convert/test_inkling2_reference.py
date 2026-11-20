@@ -14,6 +14,7 @@ from tools.inkling2 import reference as ref
 def test_ue4m3_half_special_bytes():
     assert ref.ue4m3_half(np.array([0x00, 0x7F, 0x38, 0x01, 0x7E])).tolist() == [0.0, 0.0, 0.5, 2.0**-10, 224.0]
     assert ref.ue4m3_half(np.array([0xB8]))[0] == 0.5  # the sign bit is ignored
+    assert ref.ue4m3_half(np.array([0x80, 0xFF])).tolist() == [0.0, 240.0]  # as ggml: only 0x00 and 0x7F are zero
 
 
 def test_checkpoint_repack_is_bit_exact():

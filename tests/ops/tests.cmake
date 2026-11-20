@@ -45,6 +45,11 @@ ninfer_add_op_test(ninfer_ggml_blocks_decode_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_blocks_decode.cpp"
   LIBRARIES ninfer_core)
 
+# Host-only: Inkling-2's FP64 op oracles (inkling2_reference.h) against the NumPy reference's golden vectors.
+ninfer_add_op_test(ninfer_inkling2_reference_test NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/inkling2_reference_test.cpp"
+  LIBRARIES ninfer::json)
+
 # Host-only: the GGML linear registry against the dense tensors, heads and two-projection pairs of
 # the Qwen3.8-Flash-Next GGUF packs (a table in the test mirrors their tensor allocations).
 ninfer_add_op_test(ninfer_ggml_linear_registry_test

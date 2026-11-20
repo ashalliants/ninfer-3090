@@ -412,7 +412,7 @@ Sizes are rough engineer-days for a person or agent who knows the codebase, incl
 | Phase | Content | Size |
 |---|---|---|
 | 0 (done) | this spec; header fixtures of three GGUFs and the drafter; converter config, visit schedule and tensor map (`tools/convert/inkling2.py`); NumPy reference with the GGML NVFP4 decoder and checkpoint repack (`tools/inkling2/reference.py`); C++ FP64 op oracles (`tests/ops/inkling2_reference.h`, host-only, not yet in CMake); tokenizer contract check. **Not** done: the `ggml_nvfp4` artifact format (Python and C++ registries must land together), the artifact writer, any engine code | -- |
-| 1. Golden | CPU llama.cpp (Unsloth SHA above) on the chosen GGUF: logits for a few prompts, plus per-visit `l_out` dumps. Run the NumPy reference with the real weights of one layer against them | 1-2 |
+| 1. Golden (done) | CPU llama.cpp (Unsloth SHA above) on UD-Q8_K_XL: logits and per-visit activations for four prompts; the NumPy reference on the real weights against them (see "Validation") | -- |
 | 2. Converter | `inkling2_gguf` recipe writes the artifact: C++ format registry for `ggml_nvfp4` and the new records, per-expert scales, padded vocab, tokenizer and chat resources. Reader test on the real file | 2-3 |
 | 3. Text MVP, correctness first | Model, config and binding. Program with the 48-visit schedule. New Ops with naive FP32 kernels qualified against the oracles: rel-bias sink attention (decode and prefill), conv streams, MIX, CTRL, clips, sigmoid router, resident NVFP4/Q8_0/BF16 MoE. Linear problem registrations. Tokenizer matcher. Greedy text equals the golden | 8-12 |
 | 4. V100 decode performance | Fused decode kernels (MIX, CTRL, conv and norms), expert GEMV for NVFP4 via dp4a, global attention on FP16 KV, CUDA Graph per decode width; measure against the bandwidth floor | 5-8 |
@@ -448,9 +448,29 @@ The MVP (phases 1-3) is about 2.5 weeks. Everything after it is optional orderin
 
 ## Validation
 
-1. NumPy reference against the C++ oracles (done in phase 1 on synthetic weights).
-2. CPU llama.cpp at [L]'s SHA as the end-to-end golden: KLD and top-1 on fixed prompts, and the
-   per-visit `l_out` with `GGML_SCHED` callbacks.
-3. Each new Op qualified against its oracle on the real shapes (op-development.md).
-4. Engine greedy text and perplexity against the golden. The acceptance bar is KLD at most
-   0.002 against llama.cpp on the same GGUF.
+1. NumPy reference against the C++ oracles: `ninfer_inkling2_reference_test` (host only) checks
+   `tests/ops/inkling2_reference.h` against `tests/fixtures/inkling2/golden.json`.
+2. CPU llama.cpp at [L]'s SHA as the end-to-end golden. `tools/inkling2/llama_golden.cpp` runs a GGUF
+   and writes every position's logits plus `attn_out`, `ffn_inp` and `l_out` per layer visit and
+   `result_norm`, through the scheduler's eval callback. Feeding the prompts whole or in chunks of 5
+   gives bit-identical logits. `tests/fixtures/inkling2/llama_golden_topk.json` keeps the top 20
+   logits of four prompts on UD-Q8_K_XL (`unsloth/Inkling-2-Mini-GGUF@29eac40c`), for the engine.
+3. `tools/inkling2/compare_golden.py` runs the NumPy reference on the real weights (decoded lazily
+   by `tools/inkling2/gguf_weights.py`) against that golden. Result on UD-Q8_K_XL, 2026-11-20:
+
+   | Prompt | Tokens | Per-visit relative error (all 48 visits) | Logit KLD per position | Top-1 |
+   |---|---|---|---|---|
+   | "The capital of France is" | 5 | 3e-3 to 6.4e-2, cosine >= 0.9979 | 8e-6 to 7e-4 | 5/5 |
+   | chat turn ("why the sky is blue") | 13 (also in chunks of 4) | mostly 1e-2; single tokens to 1e-1 | up to 2.6e-2 | 13/13 |
+
+   The larger per-token errors are not position dependent: they start in one layer visit's MoE for
+   one token, where the router's 8th and 9th scores are nearly tied (visit 16, token 6: a margin of
+   0.0015), so llama.cpp's activation rounding (BF16 and Q8 blocks on the CPU path) picks another
+   expert than the FP64 reference. The reference therefore agrees with [L] to rounding, loop
+   included. This shows the spec transcribes [L] faithfully. It does not resolve A1: both are still
+   one source's reading of the loop. The outputs are sensible (" Paris"; a French continuation;
+   `<|content_thinking|>` opening a chat answer), which is the evidence available that [L] is right.
+4. Each new Op qualified against its oracle on the real shapes (op-development.md).
+5. Engine greedy text and perplexity against the golden. The acceptance bar is KLD at most
+   0.002 against llama.cpp on the same GGUF, measured on prompts without near-tied routing, and
+   the same top-1 token at every position of the golden prompts.

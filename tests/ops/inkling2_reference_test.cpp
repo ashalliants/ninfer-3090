@@ -1,13 +1,14 @@
 // Checks the C++ FP64 oracles (inkling2_reference.h) against the NumPy reference's golden vectors
 // (tests/fixtures/inkling2/golden.json, written by tools/inkling2/reference.py --emit-golden).
-// Host-only. Not yet in CMake (the Inkling-2 bring-up adds it with the first Op); build by hand:
-//   g++ -std=c++20 -O1 -I third_party tests/ops/inkling2_reference_test.cpp -o /tmp/t && /tmp/t tests/fixtures/inkling2/golden.json
+// Host-only (ninfer_inkling2_reference_test). It also builds alone:
+//   g++ -std=c++20 -I third_party tests/ops/inkling2_reference_test.cpp -o t && ./t tests/fixtures/inkling2/golden.json
 
 #include "inkling2_reference.h"
 
 #include <nlohmann/json.hpp>
 
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <string>
 
@@ -49,11 +50,21 @@ void expect(const char* what, const ref::Vec& got, const ref::Vec& want, double 
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
+#ifdef NINFER_SOURCE_DIR
+    const std::filesystem::path fallback =
+        std::filesystem::path(NINFER_SOURCE_DIR) / "tests" / "fixtures" / "inkling2" / "golden.json";
+#else
+    const std::filesystem::path fallback;
+#endif
+    if (argc > 2 || (argc == 1 && fallback.empty())) {
         std::fprintf(stderr, "usage: %s golden.json\n", argv[0]);
         return 2;
     }
-    std::ifstream in(argv[1]);
+    std::ifstream in(argc == 2 ? std::filesystem::path(argv[1]) : fallback);
+    if (!in) {
+        std::fprintf(stderr, "cannot open the golden vectors\n");
+        return 2;
+    }
     const json g = json::parse(in);
 
     {

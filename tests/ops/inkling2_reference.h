@@ -19,11 +19,11 @@ using Vec = std::vector<double>;
 
 inline constexpr double kEps = 1e-6;
 
-// ggml_ue4m3_to_fp32: unsigned E4M3 times 0.5; bytes 0x00 and 0x7F decode to 0; the sign bit is ignored.
+// ggml_ue4m3_to_fp32: bytes 0x00 and 0x7F decode to 0; otherwise bits 6..0 as E4M3 (no NaN), times 0.5.
+// The sign bit is ignored: 0x80 is 0 and 0xFF is 240.
 inline double ue4m3_half(std::uint8_t byte) {
-    const int b = byte & 0x7F;
-    if (b == 0 || b == 0x7F) return 0.0;
-    const int exponent = b >> 3, mantissa = b & 7;
+    if (byte == 0 || byte == 0x7F) return 0.0;
+    const int exponent = (byte >> 3) & 0xF, mantissa = byte & 7;
     const double v = exponent == 0 ? mantissa * std::ldexp(1.0, -9)
                                    : (1.0 + mantissa / 8.0) * std::ldexp(1.0, exponent - 7);
     return v * 0.5;

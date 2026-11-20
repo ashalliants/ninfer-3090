@@ -53,6 +53,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_http_residency_routes_test
   ninfer_http_security_test
   ninfer_http_transport_test
+  ninfer_inkling2_reference_test
   ninfer_interleaved_ab_test
   ninfer_jinja_test
   ninfer_json_schema_oracle_test

@@ -46,9 +46,13 @@ def e4m3(byte: np.ndarray) -> np.ndarray:
 
 
 def ue4m3_half(byte: np.ndarray) -> np.ndarray:
-    """ggml_ue4m3_to_fp32: the unsigned E4M3 scale times 0.5; 0x00 and 0x7F decode to 0, the sign bit is ignored."""
+    """ggml_ue4m3_to_fp32: bytes 0x00 and 0x7F decode to 0; otherwise bits 6..0 as E4M3 (no NaN), times 0.5.
+
+    The sign bit is ignored, so 0x80 is 0 and 0xFF is 240 (ggml decodes rather than rejects them).
+    """
     b = np.asarray(byte, dtype=np.int64)
-    value = e4m3(b & 0x7F) * 0.5
+    exponent, mantissa = (b >> 3) & 0xF, b & 7
+    value = np.where(exponent == 0, mantissa * 2.0**-9, (1 + mantissa / 8.0) * np.exp2(exponent - 7.0)) * 0.5
     return np.where((b == 0) | (b == 0x7F), 0.0, value)
 
 
@@ -214,15 +218,24 @@ def situ(gate: np.ndarray, up: np.ndarray, gate_cap: float, up_cap: float) -> np
 
 
 def moe(z: np.ndarray, layer: dict, config: dict) -> np.ndarray:
-    """Routed experts; gate_up [E, 2I, H] (gate rows first), down [E, H, I], optional per-expert multipliers."""
+    """Routed experts; gate_up [E, 2I, H] (gate rows first), down [E, H, I], optional per-expert multipliers.
+
+    Each chosen expert is read once (``layer["gate_up"][e]``), so a bank may decode experts lazily.
+    """
     ids, weights = route(z, layer["router"], layer["router_bias"], config["top_k"], config["route_scale"])
-    inter = layer["down"].shape[2]
+    inter = config["inter"]
+    gu_scale, down_scale = layer.get("gate_up_scale"), layer.get("down_scale")
     out = np.zeros_like(z)
-    for t in range(z.shape[0]):
-        for e, w in zip(ids[t], weights[t]):
-            gu = layer["gate_up"][e] @ z[t] * layer.get("gate_up_scale", np.ones(len(layer["gate_up"])))[e]
-            h = situ(gu[:inter], gu[inter:], config["gate_cap"], config["up_cap"])
-            out[t] += w * (layer["down"][e] @ h) * layer.get("down_scale", np.ones(len(layer["down"])))[e]
+    for e in np.unique(ids):
+        rows, slots = np.nonzero(ids == e)
+        gu = z[rows] @ np.asarray(layer["gate_up"][e], dtype=np.float64).T
+        if gu_scale is not None:
+            gu = gu * gu_scale[e]
+        h = situ(gu[:, :inter], gu[:, inter:], config["gate_cap"], config["up_cap"])
+        y = h @ np.asarray(layer["down"][e], dtype=np.float64).T
+        if down_scale is not None:
+            y = y * down_scale[e]
+        out[rows] += weights[rows, slots][:, None] * y
     return out
 
 
@@ -261,8 +274,13 @@ class Model:
     def new_state(self) -> list[VisitState]:
         return [VisitState() for _ in range(self.visits)]
 
-    def forward(self, tokens: np.ndarray, state: list[VisitState], start: int) -> tuple[np.ndarray, dict]:
-        """Tokens at positions start.. -> (logits [T, unpadded vocab], taps {visit: cur at the visit's input})."""
+    def forward(self, tokens: np.ndarray, state: list[VisitState], start: int,
+                trace: dict | None = None) -> tuple[np.ndarray, dict]:
+        """Tokens at positions start.. -> (logits [T, unpadded vocab], taps {visit: cur at the visit's input}).
+
+        ``trace``, when given, receives llama.cpp's callback names per visit v: ``attn_out-v`` (after the output
+        convolution), ``ffn_inp-v`` and ``l_out-v``, and ``result_norm``; each is [T, H].
+        """
         c, w = self.config, self.weights
         tokens = np.asarray(tokens)
         positions = np.arange(start, start + len(tokens))
@@ -291,14 +309,18 @@ class Model:
                 m_kv = mix(bank + [bank_last], w["loop_kv_query"][2 * j: 2 * j + 2])
                 messages = {"attn": m_attn[0], "mlp": m_attn[1], "k": m_kv[0], "v": m_kv[1]}
             taps[visit] = cur
-            cur, blocks = self._visit(visit, p, layer, cur, blocks, messages, positions, state[visit])
+            cur, blocks = self._visit(visit, p, layer, cur, blocks, messages, positions, state[visit], trace)
+            if trace is not None:
+                trace[f"l_out-{visit}"] = cur
         x = rms(mix(blocks + [cur], w["output_query"][None, :])[0], w["output_norm"])
         cap = c["final_softcap"]
         logits = cap * np.tanh((x @ w["head"].T) / cap)
         taps[self.visits] = x
+        if trace is not None:
+            trace["result_norm"] = x
         return logits[:, : c["unpadded_vocab"]], taps
 
-    def _visit(self, visit, p, layer, cur, blocks, messages, positions, st: VisitState):
+    def _visit(self, visit, p, layer, cur, blocks, messages, positions, st: VisitState, trace=None):
         c = self.config
         local = p in c["local_layers"]
         if p == 0:
@@ -354,6 +376,8 @@ class Model:
             ffn_inp = a
         else:
             ffn_inp = cur + a
+        if trace is not None:
+            trace[f"attn_out-{visit}"], trace[f"ffn_inp-{visit}"] = a, ffn_inp
         z = mix(blocks + [ffn_inp], layer["ffn_query"][None, :])[0]
         if messages is not None:
             z = control(z, messages["mlp"], *layer["loop"]["mlp"])
