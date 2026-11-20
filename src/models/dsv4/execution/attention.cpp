@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <memory>
+#include <numbers>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -132,7 +133,7 @@ std::vector<float> rope_inv_freqs(const TextConfig& c, std::uint32_t layer) {
         c.yarn.original_context >
             0) { // YaRN: long wavelengths are divided by the factor, a linear ramp between
         const auto corrected = [&](double rotations) {
-            return dim * std::log(c.yarn.original_context / (rotations * 2 * M_PI)) /
+            return dim * std::log(c.yarn.original_context / (rotations * 2 * std::numbers::pi)) /
                    (2 * std::log(base));
         };
         const double low = std::max(std::floor(corrected(c.yarn.beta_fast)), 0.0);
@@ -239,6 +240,7 @@ AttentionState::AttentionState(const TextConfig& c, AttentionLimits limits)
         s.layers[i].inv_freq_comp = DeviceBuffer(f.size() * 4);
         s.layers[i].inv_freq.copy_from_host(f.data(), f.size() * 4);
         s.layers[i].inv_freq_comp.copy_from_host(scaled.data(), scaled.size() * 4);
+        s.total_bytes += 2 * f.size() * 4;
     }
     if (any_index) {
         s.topk        = static_cast<std::int32_t>(c.indexer_top_k);
