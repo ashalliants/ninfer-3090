@@ -775,6 +775,22 @@ public:
         throw std::invalid_argument("unknown LoRA adapter '" + name + "'");
     }
 
+    // The LoRA slot a request names (find_lora), after checking it may be combined with the
+    // request's graft. prepare() and count_tokens() both resolve it here, so a count is refused
+    // exactly when generation would be. An installed graft is the base model's K/V and recurrent
+    // state; under an adapter every layer computes differently, so it would be the wrong context.
+    // A prefill_kv graft is replayed and so computed with the adapter like any prompt text.
+    [[nodiscard]] std::int32_t find_lora_for(const PromptOptions& options,
+                                             const PromptGraft* graft) const {
+        const std::int32_t lora = find_lora(options.lora);
+        if (lora >= 0 && graft && graft->kind != GraftKind::PrefillKV) {
+            throw std::invalid_argument("graft '" + graft->name +
+                                        "' holds base-model state and cannot be combined with LoRA "
+                                        "adapter '" + options.lora + "'");
+        }
+        return lora;
+    }
+
     // The graft a request names, or null for none (a steering vector is not a prompt graft).
     [[nodiscard]] const PromptGraft* find_graft(const std::string& name) const {
         if (name.empty() || find_steering(name) >= 0) { return nullptr; }
@@ -920,15 +936,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
     }
     const PromptGraft* graft = impl_->find_graft(options.graft);
-    const std::int32_t lora  = impl_->find_lora(options.lora);
-    // An installed graft is the base model's K/V and recurrent state; under an adapter every layer
-    // computes differently, so it would be the wrong context. A prefill_kv graft is replayed and so
-    // computed with the adapter like any prompt text.
-    if (lora >= 0 && graft && graft->kind != GraftKind::PrefillKV) {
-        throw std::invalid_argument("graft '" + graft->name +
-                                    "' holds base-model state and cannot be combined with LoRA "
-                                    "adapter '" + options.lora + "'");
-    }
+    const std::int32_t lora  = impl_->find_lora_for(options, graft);
     // The rendered prompt gets whatever context the graft leaves.
     const std::uint32_t prompt_context =
         impl_->max_context - (graft ? graft_context_slots(*graft) : 0U);
@@ -1080,7 +1088,7 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
     fi::check_preparation_control(control);
     const PromptOptions options           = input.options;
     const PromptGraft* graft              = impl_->find_graft(options.graft);
-    (void)impl_->find_lora(options.lora);
+    (void)impl_->find_lora_for(options, graft);
     const std::size_t graft_tokens        = graft ? graft_context_slots(*graft) : 0U;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
     const bool has_media =
