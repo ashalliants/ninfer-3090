@@ -59,6 +59,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/rmsnorm_rope/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/rope_pairs/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/rows/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/softmax_attention/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/softmax_pool/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/sparse_moe/sources.cmake")
 
 if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|80|86|89)$")
