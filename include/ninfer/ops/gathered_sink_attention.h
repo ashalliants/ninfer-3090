@@ -14,6 +14,9 @@
 
 namespace ninfer::ops {
 
+/// The most query heads `gathered_sink_attention` serves (the head index is a grid dimension).
+inline constexpr int kGatheredSinkAttentionMaxHeads = 1024;
+
 /**
  * Op: gathered_sink_attention
  *
@@ -29,7 +32,7 @@ namespace ninfer::ops {
  *
  * Logical shapes:
  *   q BF16 [D, H, T]; kv BF16 [D, N] (N >= 1); idx I32 [K, T] (K >= 1, slot j of column t at
- *   j + K * t); sink FP32 [H]; out BF16 [D, H, T]. D in {64, 128, 256, 512}; H >= 1; T >= 1.
+ *   j + K * t); sink FP32 [H]; out BF16 [D, H, T]. D in {64, 128, 256, 512}; 1 <= H <= kGatheredSinkAttentionMaxHeads; T >= 1.
  *
  * Supported domain:
  *   Contiguous tensors with 4-byte aligned data; finite q and kv and sink; scale positive and finite.

@@ -210,7 +210,8 @@ void gathered_sink_attention(const Tensor& q, const Tensor& kv, const Tensor& id
             "contiguous, 4-byte aligned BF16 q, kv and out, I32 idx and FP32 sink are required");
     const int dim = q.ne[0], heads = q.ne[1], columns = q.ne[2];
     require(q.ne[3] == 1 && (dim == 64 || dim == 128 || dim == 256 || dim == 512), "head dimension must be 64, 128, 256 or 512");
-    require(heads >= 1 && columns >= 1 && kv.ne[1] >= 1 && idx.ne[0] >= 1, "empty extent");
+    require(heads >= 1 && heads <= kGatheredSinkAttentionMaxHeads && columns >= 1 && kv.ne[1] >= 1 && idx.ne[0] >= 1,
+            "head count must be in [1, kGatheredSinkAttentionMaxHeads] and no extent may be empty");
     require(kv.ne[0] == dim && kv.ne[2] == 1 && idx.ne[1] == columns && idx.ne[2] == 1 && sink.numel() == heads &&
                 out.ne[0] == dim && out.ne[1] == heads && out.ne[2] == columns,
             "shapes disagree");

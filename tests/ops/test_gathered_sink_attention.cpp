@@ -303,6 +303,14 @@ int main() {
             check(refuses([&] { o::gathered_sink_attention(Q, KV, wrong_idx, S, 0.1F, out, stream); }), "an index list for another column count is refused");
             const Tensor wrong_sink(sd.p, DType::FP32, {7});
             check(refuses([&] { o::gathered_sink_attention(Q, KV, I, wrong_sink, 0.1F, out, stream); }), "a sink of the wrong length is refused");
+            {
+                // More heads than the grid serves: refused before any launch (the buffers are large enough for the shapes).
+                Device big_q(512 * 1025 * 2 * 2), big_out(512 * 1025 * 2 * 2), big_sink(1025 * 4);
+                const Tensor many_q(big_q.p, DType::BF16, {512, 1025, 2}), many_sink(big_sink.p, DType::FP32, {1025});
+                Tensor many_out(big_out.p, DType::BF16, {512, 1025, 2});
+                check(refuses([&] { o::gathered_sink_attention(many_q, KV, I, many_sink, 0.1F, many_out, stream); }),
+                      "more than 1,024 heads are refused");
+            }
             Tensor aliased(qd.p, DType::BF16, {512, 8, 2});
             check(refuses([&] { o::gathered_sink_attention(Q, KV, I, S, 0.1F, aliased, stream); }), "an output overlapping q is refused");
             const Tensor float_idx(id.p, DType::FP32, {16, 2});
