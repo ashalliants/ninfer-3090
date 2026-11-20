@@ -11,6 +11,7 @@
 #include "ninfer/ops/rmsnorm.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <vector>
 #include <stdexcept>
@@ -34,6 +35,12 @@ std::size_t linear_scratch(const FfnWeights& w, std::int32_t columns) {
 std::int32_t max_jobs(const FfnParams& p, std::int32_t columns) { return std::min(p.experts, p.top_k * columns); }
 
 ops::offloaded_moe::MoeShape shape_of(const FfnParams& p) { return {p.hidden, p.intermediate}; }
+
+// Whether two tensors' byte ranges intersect (a view into the middle of a buffer counts).
+bool overlaps(const Tensor& a, const Tensor& b) {
+    const auto begin_a = reinterpret_cast<std::uintptr_t>(a.data), begin_b = reinterpret_cast<std::uintptr_t>(b.data);
+    return begin_a < begin_b + b.bytes() && begin_b < begin_a + a.bytes();
+}
 
 void require_supported(const FfnParams& p) {
     if (p.streams != ops::kHcSinkhornStreams) { throw std::invalid_argument("dsv4 ffn: the hyper-connection ops serve four streams"); }
@@ -137,9 +144,9 @@ void ffn_forward(const FfnParams& p, const FfnWeights& w, std::uint32_t layer, E
     Tensor& residual = in.residual;
     const std::int32_t T = residual.ne[1];
     if (residual.ne[0] != p.streams * p.hidden) { throw std::invalid_argument("dsv4 ffn: residual is not [streams * hidden, T]"); }
-    if (in.collapse_pre != nullptr && (in.collapse_pre->data == in.mixes.pre.data || in.collapse_pre->data == in.mixes.post.data ||
-                                       in.collapse_pre->data == in.mixes.comb.data)) {
-        throw std::invalid_argument("dsv4 ffn: collapse_pre must not be one of this call's own mixes buffers (double-buffer the mixes)");
+    if (in.collapse_pre != nullptr && (overlaps(*in.collapse_pre, in.mixes.pre) || overlaps(*in.collapse_pre, in.mixes.post) ||
+                                       overlaps(*in.collapse_pre, in.mixes.comb))) {
+        throw std::invalid_argument("dsv4 ffn: collapse_pre must not overlap any of this call's own mixes buffers (double-buffer the mixes)");
     }
     const auto scope     = arena.scope();
     const std::int32_t K = p.top_k, E = p.experts, entries = K * T, jobs = max_jobs(p, T);

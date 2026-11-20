@@ -38,6 +38,7 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <stdexcept>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -304,6 +305,16 @@ int main() {
             const Tensor other_pre(other_d.p, DType::FP32, {kS, T});
             run_all(resident_device, &other_pre, mixes_b);
             check(download_out() != out_device, "a different collapse_pre changes the output");
+        }
+
+        // A collapse_pre that overlaps this call's own mixes (here a view starting inside `post`) is refused.
+        {
+            const Tensor inside_post(static_cast<std::uint8_t*>(mixes.post.data) + 16, DType::FP32, {kS, T});
+            bool refused = false;
+            try {
+                run_all(resident_device, &inside_post, mixes);
+            } catch (const std::invalid_argument&) { refused = true; }
+            check(refused, "a collapse_pre overlapping the call's own post buffer is refused");
         }
 
         // 3. Column by column (decode, T = 1) equals the 8-column result.
