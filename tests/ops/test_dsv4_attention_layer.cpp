@@ -373,13 +373,27 @@ int main() {
             check(want_width == topk, "the oracle's selection has the same width");
             std::size_t hits = 0, total = 0;
             for (int s = 0; s < T; ++s) {
-                const std::set<std::int32_t> expected(want.begin() + static_cast<std::size_t>(s) * want_width,
-                                                      want.begin() + static_cast<std::size_t>(s + 1) * want_width);
+                // Only real selections count toward recall; the -1 padding must agree in number, and the
+                // device's row must be strictly ascending (unique) over its real entries.
+                std::set<std::int32_t> expected;
+                std::size_t expected_pad = 0, got_pad = 0;
+                for (int j = 0; j < want_width; ++j) {
+                    const std::int32_t v = want[static_cast<std::size_t>(s) * want_width + j];
+                    if (v >= 0) { expected.insert(v); } else { ++expected_pad; }
+                }
+                std::int32_t previous = -1;
                 for (int j = 0; j < topk; ++j) {
                     const std::int32_t v = got[static_cast<std::size_t>(s) * topk + j];
-                    ++total;
+                    if (v < 0) {
+                        ++got_pad;
+                        continue;
+                    }
+                    check(v > previous, "the selection is strictly ascending");
+                    previous = v;
                     hits += expected.count(v) != 0 ? 1 : 0;
                 }
+                total += expected.size();
+                check(got_pad == expected_pad, "the selection pads with -1 exactly where the oracle does");
             }
             const double recall = static_cast<double>(hits) / static_cast<double>(total);
             std::printf("%-10s recall of the oracle's selection %.5f over %zu entries\n", "topk", recall, total);
