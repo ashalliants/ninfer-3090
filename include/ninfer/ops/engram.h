@@ -31,7 +31,7 @@ namespace ninfer::ops {
  *
  * Logical shapes:
  *   residual BF16 [S*H, T] (updated in place); kv BF16 [(S + 1)*H, T]; w BF16 or FP32 with S*H
- *   elements, stream-major. S >= 1, H a positive multiple of 8 up to 16384, T >= 1, eps > 0.
+ *   elements, stream-major. S >= 1, H a positive multiple of 8 up to 16384, T >= 1 with S * T at most 2^31 - 1, eps > 0.
  *
  * Supported domain:
  *   Contiguous tensors; kv and residual 16-byte aligned, w 4-byte aligned; finite inputs.

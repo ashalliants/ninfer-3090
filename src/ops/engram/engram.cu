@@ -48,8 +48,9 @@ __global__ void __launch_bounds__(kThreads)
     engram_gate_inject_kernel(const __nv_bfloat16* __restrict__ kv, const W* __restrict__ w,
                               int streams, int h, float eps, __nv_bfloat16* __restrict__ residual) {
     __shared__ float shared[kWarps];
-    const int s                  = blockIdx.x;
-    const long long t            = blockIdx.y;
+    // One flat grid dimension (x allows 2^31 - 1 blocks; y would stop at 65,535 columns).
+    const int s                  = static_cast<int>(blockIdx.x % streams);
+    const long long t            = blockIdx.x / streams;
     const std::size_t kv_stride  = static_cast<std::size_t>(streams + 1) * h;
     const std::size_t res_stride = static_cast<std::size_t>(streams) * h;
     const __nv_bfloat16* key     = kv + t * kv_stride + static_cast<std::size_t>(s) * h;
@@ -109,14 +110,15 @@ void engram_gate_inject(const Tensor& kv, const Tensor& w, std::int32_t streams,
     require(h >= 8 && h % 8 == 0 && h <= kMaxH,
             "the stream width must be a multiple of 8 up to 16384");
     const std::int64_t tokens = residual.ne[1];
-    require(tokens >= 1 && tokens <= 2147483647LL, "the token count is out of range");
+    require(tokens >= 1 && tokens * streams <= 2147483647LL,
+            "streams * tokens must be at most 2^31 - 1");
     require(kv.ne[0] == static_cast<std::int64_t>(streams + 1) * h && kv.ne[1] == tokens,
             "kv must be [(streams + 1) * H, T]");
     require(static_cast<std::int64_t>(w.ne[0]) * w.ne[1] * w.ne[2] * w.ne[3] ==
                 static_cast<std::int64_t>(streams) * h,
             "the gate weight must hold streams * H elements");
     require(!overlaps(residual, kv) && !overlaps(residual, w), "the residual overlaps an input");
-    const dim3 grid(static_cast<unsigned>(streams), static_cast<unsigned>(tokens));
+    const unsigned grid = static_cast<unsigned>(tokens * streams);
     const auto* kv_data = static_cast<const __nv_bfloat16*>(kv.data);
     auto* res           = static_cast<__nv_bfloat16*>(residual.data);
     if (w.dtype == DType::BF16) {

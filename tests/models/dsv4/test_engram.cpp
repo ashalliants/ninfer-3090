@@ -727,6 +727,15 @@ void test_synthetic(cudaStream_t stream) {
                                          ninfer::ops::LinearPolicy::AllowA8, arena, stream);
                   }),
                   "a residual of another column count than the staged call is refused");
+            cudaStream_t other = nullptr;
+            t::cuda_check(cudaStreamCreate(&other), "stream");
+            Tensor ok3(d_x.p, DType::BF16, {static_cast<std::int32_t>(kStreams * kHidden), 3});
+            check(throws([&] {
+                      (void)engram.apply(0, weight, gate, ok3, ninfer::ops::LinearPolicy::AllowA8,
+                                         arena, other);
+                  }),
+                  "a second stream is refused (one copy fence per instance)");
+            cudaStreamDestroy(other);
             Tensor ok(d_x.p, DType::BF16, {static_cast<std::int32_t>(kStreams * kHidden), 3});
             check(throws([&] {
                       (void)engram.apply(2, weight, gate, ok, ninfer::ops::LinearPolicy::AllowA8,
@@ -763,6 +772,10 @@ void test_synthetic(cudaStream_t stream) {
         unbound["volume_id"] = nullptr;
         check(throws([&] { (void)dsv4::parse_engram_table(unbound, 256); }),
               "an unbound volume_id is refused");
+        Json malformed         = record;
+        malformed["volume_id"] = "zz02030405060708090a0b0c0d0e0f10";
+        check(throws([&] { (void)dsv4::parse_engram_table(malformed, 256); }),
+              "a volume_id with non-hex characters is refused");
         Json wrong         = record;
         wrong["row_bytes"] = 90;
         check(throws([&] { (void)dsv4::parse_engram_table(wrong, 256); }),

@@ -148,7 +148,11 @@ private:
     QType format_;
     std::uint32_t staged_ = 0;
     std::vector<std::uint32_t> ids_;
-    std::byte* pinned_  = nullptr; // [layer][max_tokens][column][row_bytes]
+    std::byte* pinned_ = nullptr; // [layer][max_tokens][column][row_bytes]
+    cudaStream_t stream_ =
+        nullptr; // the one stream apply/copy_issued may use (bound by the first call)
+    bool stream_bound_ = false;
+    void bind_stream(cudaStream_t stream);
     cudaEvent_t copied_ = nullptr; // the last apply's copy out of pinned_
 };
 

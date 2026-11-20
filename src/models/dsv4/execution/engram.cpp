@@ -12,6 +12,7 @@
 #include "ninfer/ops/ple.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -162,6 +163,11 @@ qwen4_exp::NgramTableConfig parse_engram_table(const artifact::Json& value,
             "the Engram volume_id must be 32 hex digits (write or reuse a volume when converting)");
     }
     const std::string hex = id.get<std::string>();
+    for (const char ch : hex) {
+        if (std::isxdigit(static_cast<unsigned char>(ch)) == 0) {
+            throw ArtifactError("the Engram volume_id must be 32 hexadecimal digits");
+        }
+    }
     for (std::size_t i = 0; i < 16; ++i) {
         out.volume_id[i] = static_cast<std::uint8_t>(std::stoul(hex.substr(2 * i, 2), nullptr, 16));
     }
@@ -229,6 +235,7 @@ void Engram::stage(std::span<const Run> runs) {
     // Nothing is committed (histories, ids, staged_) until the rows are read: a failed stage leaves
     // the caller's histories untouched and the Engram with no staged call.
     staged_ = 0;
+    ids_.clear();
     std::vector<std::pair<EngramHasher::History*, EngramHasher::History>> working;
     const auto working_history = [&](EngramHasher::History* h) -> EngramHasher::History& {
         for (auto& entry : working) {
@@ -237,28 +244,42 @@ void Engram::stage(std::span<const Run> runs) {
         working.emplace_back(h, *h);
         return working.back().second;
     };
-    ids_.resize(total * layers * cols);
+    std::vector<std::uint32_t> ids(total * layers * cols);
     std::size_t at = 0;
     for (const Run& run : runs) {
         hasher_.append(
             working_history(run.history), run.tokens,
-            std::span<std::uint32_t>(ids_).subspan(at, run.tokens.size() * layers * cols));
+            std::span<std::uint32_t>(ids).subspan(at, run.tokens.size() * layers * cols));
         at += run.tokens.size() * layers * cols;
     }
     // One read call for every layer's rows, ordered [layer][token][column] as ple_embed takes them.
-    std::vector<std::uint32_t> ordered(ids_.size());
+    std::vector<std::uint32_t> ordered(ids.size());
     for (std::size_t t = 0; t < total; ++t) {
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
-            std::copy_n(&ids_[(t * layers + layer) * cols], cols,
+            std::copy_n(&ids[(t * layers + layer) * cols], cols,
                         &ordered[(static_cast<std::size_t>(layer) * total + t) * cols]);
         }
     }
     volume_.read_rows(ordered, std::span<std::byte>(pinned_, ordered.size() * row_bytes_));
     for (auto& entry : working) { *entry.first = entry.second; }
+    ids_    = std::move(ids);
     staged_ = static_cast<std::uint32_t>(total);
 }
 
-void Engram::copy_issued(cudaStream_t stream) { CUDA_CHECK(cudaEventRecord(copied_, stream)); }
+void Engram::bind_stream(cudaStream_t stream) {
+    if (!stream_bound_) {
+        stream_       = stream;
+        stream_bound_ = true;
+    } else if (stream != stream_) {
+        throw std::invalid_argument(
+            "Engram: one staging buffer serves one stream (the copy fence is a single event)");
+    }
+}
+
+void Engram::copy_issued(cudaStream_t stream) {
+    bind_stream(stream);
+    CUDA_CHECK(cudaEventRecord(copied_, stream));
+}
 
 std::size_t Engram::apply_workspace_bytes(std::uint32_t tokens, ops::LinearPolicy policy) const {
     const std::int32_t t       = static_cast<std::int32_t>(tokens);
@@ -275,6 +296,7 @@ std::size_t Engram::apply_workspace_bytes(std::uint32_t tokens, ops::LinearPolic
 Tensor Engram::apply(std::uint32_t layer, const Weight& kv, const Tensor& gate, Tensor& residual,
                      ops::LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
     if (layer >= hasher_.layers()) { throw std::out_of_range("Engram: no such Engram layer"); }
+    bind_stream(stream);
     if (staged_ == 0 || residual.ne[1] != static_cast<std::int32_t>(staged_)) {
         throw std::invalid_argument("Engram: the residual's columns differ from the staged call's");
     }

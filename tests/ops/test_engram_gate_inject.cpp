@@ -223,6 +223,8 @@ int main() {
         test_case("S=4 H=648 T=5 (off the block size)",
                   make_problem(4, 648, 5, true, 1.0F, 1.0F, 4U), stream);
         test_case("S=1 H=8 T=9", make_problem(1, 8, 9, true, 1.0F, 1.0F, 5U), stream);
+        test_case("S=2 H=8 T=70000 (past grid.y)", make_problem(2, 8, 70000, true, 1.0F, 1.0F, 13U),
+                  stream);
         test_case("S=2 H=16384 T=2 (the widest)", make_problem(2, 16384, 2, true, 1.0F, 1.0F, 6U),
                   stream);
         test_case("S=4 H=5120 T=2, streams 1e3 and keys 1e-3 (the norms divide them out)",
