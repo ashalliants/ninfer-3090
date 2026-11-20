@@ -13,6 +13,7 @@
 #include "runtime/engine/inkling2_core.h"
 #include "runtime/engine/model_instance.h"
 #include "runtime/engine/validate_options.h"
+#include "runtime/engine/dsv4_instance.h"
 #include "runtime/engine/qwen4_exp_instance.h"
 
 #include <algorithm>
@@ -298,9 +299,13 @@ public:
     static_assert(!Qwen4ExpCore::kLogprobsCapable);
     // Inkling-2: its own core and frontend (runtime/engine/inkling2_core.h).
     using Inkling2Core = runtime::Inkling2Core;
+    // DeepSeek-V4.1-Flash: the common core over its own (minimal) Program; neither is provided.
+    using Dsv4Core = runtime::EngineCore<runtime::Dsv4Instance>;
+    static_assert(!Dsv4Core::kLossyCapable);
+    static_assert(!Dsv4Core::kLogprobsCapable);
     using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
                               std::unique_ptr<ScoringCore>, std::unique_ptr<Qwen4ExpCore>,
-                              std::unique_ptr<Inkling2Core>>;
+                              std::unique_ptr<Inkling2Core>, std::unique_ptr<Dsv4Core>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(refuse_inkling2_cache_tiers(std::move(engine_options)))),
@@ -312,6 +317,10 @@ public:
         }
         if (runtime::artifact_is_inkling2(options.artifact_path)) {
             construct_inkling2();
+            return;
+        }
+        if (runtime::artifact_is_dsv4(options.artifact_path)) {
+            construct_dsv4();
             return;
         }
         auto constructed    = runtime::construct_model(options, device);
@@ -420,13 +429,15 @@ public:
 
     [[nodiscard]] const models::qwen3_5::Frontend& frontend() const {
         if (inkling2 != nullptr) { throw std::logic_error("an Inkling-2 Engine has no Qwen3.5 frontend"); }
+        if (dsv4 != nullptr) { return dsv4->frontend; }
         return qwen4 != nullptr ? qwen4->frontend : active->frontend;
     }
 
-    [[nodiscard]] bool returns_logprobs() const { return qwen4 == nullptr && inkling2 == nullptr; }
+    [[nodiscard]] bool returns_logprobs() const { return qwen4 == nullptr && inkling2 == nullptr && dsv4 == nullptr; }
 
     [[nodiscard]] std::uint32_t capacity() const {
         if (inkling2 != nullptr) { return options.max_context; }
+        if (dsv4 != nullptr) { return dsv4->capacity; }
         return qwen4 != nullptr ? qwen4->capacity : active->capacity;
     }
 
@@ -499,6 +510,8 @@ public:
     std::unique_ptr<runtime::Qwen4ExpInstance> qwen4;
     // Set (and owned by `core`) instead of either for an Inkling-2 artifact.
     runtime::Inkling2Core* inkling2 = nullptr;
+    // Set instead of `active` for a DeepSeek-V4.1-Flash artifact.
+    std::unique_ptr<runtime::Dsv4Instance> dsv4;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
     // Declared before `core`: the worker holds hooks that reach the store and the writer queue,
@@ -713,6 +726,28 @@ private:
         finalize_phase.complete();
     }
 
+    // DeepSeek-V4.1-Flash (models/dsv4): the common EngineCore over its minimal Program. It has no
+    // context cache, so nothing is ever checkpointed and the context store cannot be used.
+    void construct_dsv4() {
+        auto constructed    = runtime::construct_dsv4(options, device);
+        dsv4                = std::move(constructed.instance);
+        load                = std::move(constructed.load);
+        load.cuda_sync_mode = device.sync_mode();
+        sampling_defaults   = dsv4->frontend.sampling_defaults();
+        StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
+        options.context_cache.auto_host_cache     = false;
+        options.context_cache.host_capacity_bytes = 0;
+        options.context_cache.enabled             = false;
+        auto context_cost = runtime::resolve_context_machine_cost(
+            {.hardware_class    = runtime::context_cost_hardware_class(device.props.name, device.props.major,
+                                                                       device.props.minor),
+             .prefill_signature = "dsv4"},
+            options.context_cost.preset_path);
+        load.context_cost = std::move(context_cost.summary);
+        core              = std::make_unique<Dsv4Core>(*dsv4, device, options, std::move(context_cost.model));
+        finalize_phase.complete();
+    }
+
     // Opens the context store and hands the generation core its hooks (both cores: the Qwen3.5
     // models' and Qwen3.8-Flash-Next's).
     template <class GenerationCoreT>
@@ -757,6 +792,8 @@ private:
             f(**generation);
         } else if (auto* next = std::get_if<std::unique_ptr<Qwen4ExpCore>>(&core); next && *next) {
             f(**next);
+        } else if (auto* v4 = std::get_if<std::unique_ptr<Dsv4Core>>(&core); v4 && *v4) {
+            f(**v4);
         }
     }
 

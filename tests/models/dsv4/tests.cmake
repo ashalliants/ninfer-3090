@@ -31,3 +31,12 @@ set_tests_properties(ninfer_dsv4_forward_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_dsv4_engram_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engram.cpp"
   LIBRARIES ninfer_model_runtime)
+
+
+# The Engine path (Engine -> EngineCore -> the DSV4 Program) on the real artifact: a streamed greedy
+# chat answer, a sampled request, a cancelled one (needs NINFER_TEST_DSV4_ARTIFACT; skips with 77).
+# Cold, it reads experts from the artifact file and takes minutes.
+ninfer_add_test(ninfer_dsv4_engine_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_real.cpp"
+  LIBRARIES ninfer_engine ninfer_model_loading ninfer_core)
+set_tests_properties(ninfer_dsv4_engine_real_test PROPERTIES SKIP_RETURN_CODE 77)

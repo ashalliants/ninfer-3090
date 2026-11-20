@@ -27,6 +27,8 @@ std::string_view architecture_name(Architecture architecture) noexcept {
         return "Qwen3_5MoeForCausalLM";
     case Architecture::Qwen4Exp:
         return "Qwen4ExpForCausalLM";
+    case Architecture::Dsv4:
+        return "deepseek41";
     }
     return {};
 }

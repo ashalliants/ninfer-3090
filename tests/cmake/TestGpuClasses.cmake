@@ -31,6 +31,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_device_sync_invalid_test
   ninfer_effective_thinking_budget_test
   ninfer_engine_scheduling_test
+  ninfer_dsv4_engine_plan_test
   ninfer_dsv4_perf_model_test
   ninfer_qwen3_5_dsv4_tokenizer_test
   ninfer_qwen3_5_inkling2_tokenizer_test
