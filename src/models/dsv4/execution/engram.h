@@ -131,11 +131,6 @@ public:
     Tensor apply(std::uint32_t layer, const Weight& kv, const Tensor& gate, Tensor& residual,
                  ops::LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
 
-    // After launching a graph that captured apply calls: records the copies out of the staging
-    // buffer as issued, so the next `stage` waits for them. (Outside capture apply does this
-    // itself.)
-    void copy_issued(cudaStream_t stream);
-
     // The arena bytes apply needs for T columns (scratch plus the projection's workspace).
     [[nodiscard]] std::size_t apply_workspace_bytes(std::uint32_t tokens,
                                                     ops::LinearPolicy policy) const;
@@ -148,10 +143,9 @@ private:
     QType format_;
     std::uint32_t staged_ = 0;
     std::vector<std::uint32_t> ids_;
-    std::byte* pinned_ = nullptr; // [layer][max_tokens][column][row_bytes]
-    cudaStream_t stream_ =
-        nullptr; // the one stream apply/copy_issued may use (bound by the first call)
-    bool stream_bound_ = false;
+    std::byte* pinned_   = nullptr; // [layer][max_tokens][column][row_bytes]
+    cudaStream_t stream_ = nullptr; // the one stream apply may use (bound by the first call)
+    bool stream_bound_   = false;
     void bind_stream(cudaStream_t stream);
     cudaEvent_t copied_ = nullptr; // the last apply's copy out of pinned_
 };

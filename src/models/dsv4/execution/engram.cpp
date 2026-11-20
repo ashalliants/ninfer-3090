@@ -208,7 +208,8 @@ Engram::Engram(const TextConfig& config, EngramHashParams params,
 }
 
 Engram::~Engram() {
-    // Pending copies out of pinned_ must finish before it is freed (errors are ignored: a destructor must not throw).
+    // Pending copies out of pinned_ must finish before it is freed (errors are ignored: a
+    // destructor must not throw).
     if (stream_bound_) { (void)cudaStreamSynchronize(stream_); }
     if (copied_ != nullptr) { cudaEventDestroy(copied_); }
     if (pinned_ != nullptr) { cudaFreeHost(pinned_); }
@@ -278,11 +279,6 @@ void Engram::bind_stream(cudaStream_t stream) {
     }
 }
 
-void Engram::copy_issued(cudaStream_t stream) {
-    bind_stream(stream);
-    CUDA_CHECK(cudaEventRecord(copied_, stream));
-}
-
 std::size_t Engram::apply_workspace_bytes(std::uint32_t tokens, ops::LinearPolicy policy) const {
     const std::int32_t t       = static_cast<std::int32_t>(tokens);
     const std::int32_t width   = static_cast<std::int32_t>(hasher_.columns() * row_width_);
@@ -298,10 +294,14 @@ std::size_t Engram::apply_workspace_bytes(std::uint32_t tokens, ops::LinearPolic
 Tensor Engram::apply(std::uint32_t layer, const Weight& kv, const Tensor& gate, Tensor& residual,
                      ops::LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
     if (layer >= hasher_.layers()) { throw std::out_of_range("Engram: no such Engram layer"); }
-    bind_stream(stream);
+    if (stream_bound_ && stream != stream_) {
+        throw std::invalid_argument(
+            "Engram: one staging buffer serves one stream (the copy fence is a single event)");
+    }
     if (staged_ == 0 || residual.ne[1] != static_cast<std::int32_t>(staged_)) {
         throw std::invalid_argument("Engram: the residual's columns differ from the staged call's");
     }
+    bind_stream(stream); // only a call that passed validation binds the instance
     const std::int32_t T     = static_cast<std::int32_t>(staged_);
     const std::int32_t cols  = static_cast<std::int32_t>(hasher_.columns());
     const std::int32_t width = cols * static_cast<std::int32_t>(row_width_);
@@ -310,11 +310,12 @@ Tensor Engram::apply(std::uint32_t layer, const Weight& kv, const Tensor& gate, 
     const std::size_t bytes = std::size_t{row_bytes_} * cols * T;
     CUDA_CHECK(cudaMemcpyAsync(rows.data, pinned_ + static_cast<std::size_t>(layer) * bytes, bytes,
                                cudaMemcpyHostToDevice, stream));
-    // Under graph capture the copy is a graph node: the event cannot be recorded (or waited on)
-    // then, so a caller that replays the graph calls `copy_issued` after each launch instead.
+    // The fence is recorded right after the copy. Under graph capture it becomes an external event
+    // record node, so it signals when the copy has run, not when the whole graph has finished.
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
-    if (capture == cudaStreamCaptureStatusNone) { CUDA_CHECK(cudaEventRecord(copied_, stream)); }
+    CUDA_CHECK(cudaEventRecordWithFlags(
+        copied_, stream, capture == cudaStreamCaptureStatusNone ? 0U : cudaEventRecordExternal));
     Tensor embedded = workspace.alloc(DType::BF16, {width, T});
     ops::ple_embed(rows, format_, embedded, stream);
     Tensor projected =

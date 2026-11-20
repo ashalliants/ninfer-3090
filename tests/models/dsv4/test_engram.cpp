@@ -437,7 +437,6 @@ Applied apply_once(dsv4::Engram& engram, std::uint32_t layer, const Weight& weig
         t::cuda_check(cudaStreamEndCapture(stream, &g), "end capture");
         t::cuda_check(cudaGraphInstantiate(&exec, g, 0), "instantiate");
         t::cuda_check(cudaGraphLaunch(exec, stream), "launch");
-        engram.copy_issued(stream);
         cudaGraphExecDestroy(exec);
         cudaGraphDestroy(g);
     } else {
@@ -592,7 +591,6 @@ void run_sequence(const std::string& label, dsv4::Engram& engram, const dsv4::Te
         std::printf("%s: one captured T = 1 layer: %.1f us (rows copy + decode + projection + "
                     "gated write)\n",
                     label.c_str(), ms * 1000.0F / 200.0F);
-        engram.copy_issued(stream);
         cudaEventDestroy(e0);
         cudaEventDestroy(e1);
         cudaGraphExecDestroy(exec);
