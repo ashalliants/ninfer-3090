@@ -174,6 +174,11 @@ ninfer_add_op_test(ninfer_relaxed_accept_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_relaxed_accept.cpp"
   LIBRARIES ninfer_core)
 
+# DeepSeek-V4's Engram gate and the write of the n-gram value into the hyper-connection streams, against an FP64 oracle.
+ninfer_add_op_test(ninfer_engram_gate_inject_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engram_gate_inject.cpp"
+  LIBRARIES ninfer_ops)
+
 foreach(op IN ITEMS ple projection_fp32 rows)
   ninfer_add_op_test(ninfer_${op}_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_${op}.cpp"
