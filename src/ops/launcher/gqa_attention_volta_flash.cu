@@ -344,6 +344,9 @@ struct FlashLaunchConfig {
     size_t nbytes_shared  = 0;
     int    blocks_per_sm  = 0;
     int    nsm            = 0;
+    // The most blocks per SM the device could ever run of this kernel (its thread, shared-memory
+    // and block limits; registers can only lower it): blocks_per_sm <= this, on any sm_70 plan.
+    int    blocks_per_sm_bound = 0;
 };
 
 // The shared-memory and occupancy figures for one geometry: they depend only on the tiling and
@@ -380,6 +383,11 @@ FlashLaunchConfig make_flash_launch_config(const cudaDeviceProp& prop, bool on_d
         ? std::max(shared_Q, shared_KV + shared_mask)
         :          shared_Q + shared_KV + shared_mask);
 
+    const int smem_per_sm = static_cast<int>(prop.sharedMemPerMultiprocessor);
+    c.blocks_per_sm_bound = std::max(1, std::min({prop.maxBlocksPerMultiProcessor,
+                                                  prop.maxThreadsPerMultiProcessor / c.nthreads,
+                                                  smem_per_sm / static_cast<int>(c.nbytes_shared)}));
+
     c.blocks_per_sm = 1;
     if (on_device) {
         auto kernel = flash_attn_ext_f16<kDKQ, kDV, P::kNcols1, P::kNcols2, false, false>;
@@ -391,6 +399,7 @@ FlashLaunchConfig make_flash_launch_config(const cudaDeviceProp& prop, bool on_d
             (void)cudaGetLastError();
             c.blocks_per_sm = 1;
         }
+        c.blocks_per_sm = std::min(c.blocks_per_sm, c.blocks_per_sm_bound);
     }
     return c;
 }
@@ -420,9 +429,12 @@ const FlashLaunchConfig& flash_launch_config() {
     // This TU is built for sm_70 only; plan for a V100.
     static const FlashLaunchConfig host_plan = [] {
         cudaDeviceProp v100{};
-        v100.major               = 7;
-        v100.minor               = 0;
-        v100.multiProcessorCount = 80;
+        v100.major                       = 7;
+        v100.minor                       = 0;
+        v100.multiProcessorCount         = 80;
+        v100.maxBlocksPerMultiProcessor  = 32;
+        v100.maxThreadsPerMultiProcessor = 2048;
+        v100.sharedMemPerMultiprocessor  = 96 * 1024;
         return make_flash_launch_config<Geometry>(v100, false);
     }();
     return host_plan;
@@ -542,8 +554,10 @@ std::size_t meta_elements_impl(std::int32_t tokens) {
     const FlashLaunchConfig& c = flash_launch_config<Geometry>();
     const int ntiles_x         = (tokens + P::kNcols1 - 1) / P::kNcols1;
     const int ntiles_dst = ntiles_x * ((P::kGroup + P::kNcols2 - 1) / P::kNcols2) * P::kKVHeads;
-    const int max_blocks = c.blocks_per_sm * c.nsm;
-    // Upper bound: the launch never uses more blocks than this.
+    // Upper bound: the launch never uses more blocks than this. Sized by the occupancy bound, not
+    // the queried occupancy, so a workspace planned before the process has a device (the V100
+    // plan, one block per SM) still holds the metadata of any launch on one (sm_70: 80 SMs).
+    const int max_blocks = c.blocks_per_sm_bound * std::max(c.nsm, 80);
     const int nblocks = std::max(max_blocks, ntiles_dst);
     return static_cast<std::size_t>(nblocks) * P::kNcols * (2 + kDV / 2);
 }
