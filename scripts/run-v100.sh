@@ -162,8 +162,9 @@ case "$model_key" in
     # conversation prefill again from scratch (a 112K-token prompt is ~5 minutes on this card).
     # Each build gets its own directory, created here; NINFER_CONTEXT_STORE=off keeps the cache in
     # RAM only, and NINFER_CONTEXT_STORE_MAX_GIB bounds the disk it uses (a 128K-token
-    # conversation is ~2 GiB).
-    if [[ "${NINFER_CONTEXT_STORE:-}" == 'off' ]]; then
+    # conversation is ~2 GiB). With NINFER_PREFIX_CACHE=off there is no cache to keep, so no store
+    # is chosen or created (run.sh passes none then either).
+    if [[ "${NINFER_CONTEXT_STORE:-}" == 'off' || "${NINFER_PREFIX_CACHE:-on}" == 'off' ]]; then
       unset NINFER_CONTEXT_STORE NINFER_CONTEXT_STORE_MAX_GIB
     else
       export NINFER_CONTEXT_STORE="${NINFER_CONTEXT_STORE:-${XDG_CACHE_HOME:-$HOME/.cache}/ninfer/context-store/$model_key}"

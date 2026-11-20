@@ -1177,7 +1177,7 @@ for layout in build-dir home; do
 done
 
 # run-v100.sh gives Flash-Next a context store under ~/.cache/ninfer (created) with a 4 GiB bound;
-# NINFER_CONTEXT_STORE=DIR moves it and =off leaves it out.
+# NINFER_CONTEXT_STORE=DIR moves it; =off, or NINFER_PREFIX_CACHE=off, leaves it out (nothing created).
 v100_home="$tmp/v100-build-dir-home"; v100_tree="$tmp/v100-build-dir-tree"
 v100_store="$v100_home/.cache/ninfer/context-store/qwen38-flash-next"
 run_v100_fn() {
@@ -1195,5 +1195,9 @@ run_v100_fn NINFER_CONTEXT_STORE="$tmp/v100-store/a" NINFER_CONTEXT_STORE_MAX_GI
    "$(v100_arg_pair --context-store-max-gib)" == 9 ]] || v100_fail 'NINFER_CONTEXT_STORE / _MAX_GIB were not honoured'
 run_v100_fn NINFER_CONTEXT_STORE=off NINFER_CONTEXT_STORE_MAX_GIB=9 || v100_fail 'NINFER_CONTEXT_STORE=off did not start'
 ! grep -q -- '--context-store' "$tmp/v100.args" || v100_fail 'NINFER_CONTEXT_STORE=off still passed a store'
+rm -rf -- "$v100_home/.cache"
+run_v100_fn NINFER_PREFIX_CACHE=off || v100_fail 'NINFER_PREFIX_CACHE=off did not start'
+! grep -q -- '--context-store' "$tmp/v100.args" || v100_fail 'NINFER_PREFIX_CACHE=off still passed a store'
+[[ ! -e "$v100_home/.cache/ninfer/context-store" ]] || v100_fail 'NINFER_PREFIX_CACHE=off still created the store'
 
 printf '%s\n' 'Linux script checks passed.'
