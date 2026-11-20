@@ -299,6 +299,12 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         require_non_empty_tensors(ids, out);
         detail::embed_gather_ggml_iq3_s_launch(ids, table, out, stream);
         break;
+    case QType::GGML_Q5_K:
+        require_ggml_metadata(table, out, "Q5_K", 176);
+        if (is_empty_T(ids, out)) { return; }
+        require_non_empty_tensors(ids, out);
+        detail::embed_gather_ggml_q5_k_launch(ids, table, out, stream);
+        break;
     case QType::GGML_Q6_K:
         require_ggml_metadata(table, out, "Q6_K", 210);
         if (is_empty_T(ids, out)) { return; }

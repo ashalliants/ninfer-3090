@@ -262,7 +262,47 @@ __global__ void embed_gather_q6_k_kernel(const std::int32_t* __restrict__ ids, c
     out[static_cast<std::size_t>(t) * d + v] = __float2bfloat16_rn(__fmul_rn(scale, static_cast<float>(q)));
 }
 
+// Q5_K: {fp16 d; fp16 dmin; u8 scales[12]; u8 qh[32]; u8 qs[128]} per 256 values. One thread per
+// output value, in ggml's operation order (dequantize_row_q5_K): sub-block j (32 values) is
+// d1 * q - m1 with d1 = d * sc_j and m1 = dmin * m_j, FP32, two roundings. Value v takes the low
+// nibble (j even) or high nibble (j odd) of qs[32 (j / 2) + l] and bit j of qh[l] as its fifth bit.
+constexpr int kQ5kBlockBytes = 176;
+__global__ void embed_gather_q5_k_kernel(const std::int32_t* __restrict__ ids, const std::uint8_t* __restrict__ table,
+                                         std::int64_t row_bytes, int d, __nv_bfloat16* __restrict__ out) {
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (v >= d) { return; }
+    const std::uint8_t* block = table + static_cast<std::int64_t>(ids[t]) * row_bytes +
+                                static_cast<std::int64_t>(v / 256) * kQ5kBlockBytes;
+    const int i = v % 256, j = i / 32, l = i % 32;
+    const auto packed = [&](int n) { return static_cast<int>(block[4 + n]); };
+    int sc, m;
+    if (j < 4) {
+        sc = packed(j) & 63;
+        m  = packed(j + 4) & 63;
+    } else {
+        sc = (packed(j + 4) & 0xF) | ((packed(j - 4) >> 6) << 4);
+        m  = (packed(j + 4) >> 4) | ((packed(j) >> 6) << 4);
+    }
+    const auto d_bits    = static_cast<unsigned short>(block[0] | (static_cast<unsigned>(block[1]) << 8));
+    const auto dmin_bits = static_cast<unsigned short>(block[2] | (static_cast<unsigned>(block[3]) << 8));
+    const float d1       = __fmul_rn(__half2float(__ushort_as_half(d_bits)), static_cast<float>(sc));
+    const float m1       = __fmul_rn(__half2float(__ushort_as_half(dmin_bits)), static_cast<float>(m));
+    const int ql         = block[48 + 32 * (j / 2) + l];
+    const int q          = ((j & 1) ? (ql >> 4) : (ql & 0xF)) + (((block[16 + l] >> j) & 1) << 4);
+    out[static_cast<std::size_t>(t) * d + v] = __float2bfloat16_rn(__fsub_rn(__fmul_rn(d1, static_cast<float>(q)), m1));
+}
+
 } // namespace
+
+void embed_gather_ggml_q5_k_launch(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
+    const int d = out.ne[0];
+    const std::int64_t row_bytes = static_cast<std::int64_t>(d / 256) * kQ5kBlockBytes;
+    embed_gather_q5_k_kernel<<<dim3((d + 255) / 256, ids.ne[0]), 256, 0, stream>>>(
+        static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(table.qdata), row_bytes, d,
+        static_cast<__nv_bfloat16*>(out.data));
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void embed_gather_ggml_q6_k_launch(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
     const int d = out.ne[0];
