@@ -47,10 +47,16 @@ struct Case {
     std::vector<OutputSpec> outputs;
     ops::LoraColumns columns;
     std::uint32_t seed;
+    // All outputs are row slices of one plane (outputs[0]'s plane), as the FFN's gate and up are in
+    // the model: their views interleave column by column.
+    bool shared_plane = false;
 };
 
 int run_case(const Case& c) {
     const std::int32_t T = c.columns.rows * c.columns.width;
+    // The plane output o writes into.
+    const auto pl = [&](std::size_t o) { return c.shared_plane ? std::size_t{0} : o; };
+    const std::size_t plane_count = c.shared_plane ? 1 : c.outputs.size();
     std::vector<float> x(static_cast<std::size_t>(c.k) * T);
     fill_uniform(x, c.seed, -3.0f, 3.0f);
     round_to_bf16(x);
@@ -63,7 +69,7 @@ int run_case(const Case& c) {
         round_to_bf16(a[s]);
     }
     std::vector<std::vector<std::vector<float>>> b(c.outputs.size());
-    std::vector<std::vector<float>> planes(c.outputs.size());
+    std::vector<std::vector<float>> planes(plane_count);
     for (std::size_t o = 0; o < c.outputs.size(); ++o) {
         const OutputSpec& spec = c.outputs[o];
         b[o].resize(c.adapters);
@@ -72,6 +78,7 @@ int run_case(const Case& c) {
             fill_uniform(b[o][s], c.seed + 100u + 17u * o + s, -0.05f, 0.05f);
             round_to_bf16(b[o][s]);
         }
+        if (pl(o) != o) continue;
         planes[o].resize(static_cast<std::size_t>(spec.plane_rows) * T);
         fill_uniform(planes[o], c.seed + 300u + o, -2.0f, 2.0f);
         round_to_bf16(planes[o]);
@@ -79,10 +86,10 @@ int run_case(const Case& c) {
 
     // FP64 oracle.
     const auto slot_of = [&](std::int32_t t) { return c.columns.slot[t / c.columns.width]; };
-    std::vector<std::vector<double>> expected(c.outputs.size());
+    std::vector<std::vector<double>> expected(plane_count);
+    for (std::size_t p = 0; p < plane_count; ++p) expected[p].assign(planes[p].begin(), planes[p].end());
     for (std::size_t o = 0; o < c.outputs.size(); ++o) {
         const OutputSpec& spec = c.outputs[o];
-        expected[o].assign(planes[o].begin(), planes[o].end());
         for (std::int32_t t = 0; t < T; ++t) {
             const std::int32_t s = slot_of(t);
             if (s < 0 || !c.a_present[s] || !spec.present[s]) continue;
@@ -96,7 +103,7 @@ int run_case(const Case& c) {
                 double add = 0.0;
                 for (std::int32_t i = 0; i < spec.rank_count; ++i)
                     add += static_cast<double>(b[o][s][static_cast<std::size_t>(n) * spec.rank_count + i]) * u[i];
-                expected[o][static_cast<std::size_t>(t) * spec.plane_rows + spec.plane_first + n] += add;
+                expected[pl(o)][static_cast<std::size_t>(t) * spec.plane_rows + spec.plane_first + n] += add;
             }
         }
     }
@@ -115,15 +122,17 @@ int run_case(const Case& c) {
     }
     std::vector<GuardedDeviceBuffer> device_planes;
     std::vector<std::vector<GuardedDeviceBuffer>> device_b(c.outputs.size());
-    device_planes.reserve(c.outputs.size());
+    device_planes.reserve(plane_count);
     std::vector<ops::LoraUp> up(c.outputs.size());
-    std::vector<std::vector<std::uint16_t>> plane_bits(c.outputs.size());
+    std::vector<std::vector<std::uint16_t>> plane_bits(plane_count);
+    for (std::size_t p = 0; p < plane_count; ++p) {
+        plane_bits[p] = encode_bf16(planes[p]);
+        device_planes.emplace_back(planes[p].size() * 2);
+        device_planes.back().copy_from_host(plane_bits[p].data(), device_planes.back().bytes());
+    }
     for (std::size_t o = 0; o < c.outputs.size(); ++o) {
         const OutputSpec& spec = c.outputs[o];
-        plane_bits[o] = encode_bf16(planes[o]);
-        device_planes.emplace_back(planes[o].size() * 2);
-        device_planes.back().copy_from_host(plane_bits[o].data(), device_planes.back().bytes());
-        Tensor plane(device_planes.back().data(), DType::BF16, {spec.plane_rows, T});
+        Tensor plane(device_planes[pl(o)].data(), DType::BF16, {spec.plane_rows, T});
         up[o].output      = plane.slice(0, spec.plane_first, spec.n);
         up[o].rank_offset = spec.rank_offset;
         up[o].rank_count  = spec.rank_count;
@@ -140,20 +149,25 @@ int run_case(const Case& c) {
     cuda_synchronize();
 
     int failures = 0;
-    for (std::size_t o = 0; o < c.outputs.size(); ++o) {
-        const OutputSpec& spec = c.outputs[o];
-        const std::string label = c.label + " output " + std::to_string(o);
-        const auto got_bits = from_device<std::uint16_t>(device_planes[o].data(), planes[o].size());
-        failures += verify_pointwise(label, from_device_bf16(device_planes[o].data(), planes[o].size()),
-                                     expected[o], lora_criterion());
-        // Rows outside the slice, and columns the update skips, keep their bits.
+    for (std::size_t p = 0; p < plane_count; ++p) {
+        const std::int32_t plane_rows = c.outputs[p].plane_rows;
+        const std::string label = c.label + (c.shared_plane ? " shared plane" : " output " + std::to_string(p));
+        const auto got_bits = from_device<std::uint16_t>(device_planes[p].data(), planes[p].size());
+        failures += verify_pointwise(label, from_device_bf16(device_planes[p].data(), planes[p].size()),
+                                     expected[p], lora_criterion());
+        // Rows outside every slice written into this plane, and columns the update skips, keep
+        // their bits.
         for (std::int32_t t = 0; t < T; ++t) {
             const std::int32_t s = slot_of(t);
-            const bool touched   = s >= 0 && c.a_present[s] && spec.present[s];
-            for (std::int32_t r = 0; r < spec.plane_rows; ++r) {
-                const bool inside = r >= spec.plane_first && r < spec.plane_first + spec.n;
-                const std::size_t at = static_cast<std::size_t>(t) * spec.plane_rows + r;
-                if ((!touched || !inside) && got_bits[at] != plane_bits[o][at]) {
+            for (std::int32_t r = 0; r < plane_rows; ++r) {
+                bool written = false;
+                for (std::size_t o = 0; o < c.outputs.size(); ++o) {
+                    const OutputSpec& spec = c.outputs[o];
+                    written = written || (pl(o) == p && s >= 0 && c.a_present[s] && spec.present[s] &&
+                                          r >= spec.plane_first && r < spec.plane_first + spec.n);
+                }
+                const std::size_t at = static_cast<std::size_t>(t) * plane_rows + r;
+                if (!written && got_bits[at] != plane_bits[p][at]) {
                     std::cout << "FAIL " << label << ": untouched value changed at column " << t
                               << " row " << r << "\n";
                     ++failures;
@@ -162,7 +176,7 @@ int run_case(const Case& c) {
                 }
             }
         }
-        failures += device_planes[o].verify_guards(label.c_str());
+        failures += device_planes[p].verify_guards(label.c_str());
     }
     failures += device_x.verify_guards(c.label.c_str());
     return failures;
@@ -266,6 +280,16 @@ int main() {
     failures += run_case({"lora gate/up plane B2 W2", 5120, 64, 2, both,
                           {{17408, 0, 32, 34816, 0, both}, {17408, 32, 32, 34816, 17408, both}},
                           map({0, 1}, 2), 31u});
+    // The same, as the model lays it out: gate and up in one [2I, T] plane, interleaved by column
+    // (decode, MTP verify and prefill widths; a byte-extent check wrongly called these overlapping).
+    for (const auto& [label, columns] :
+         {std::pair{std::string("lora shared gate/up plane decode B2"), map({0, 1}, 1)},
+          std::pair{std::string("lora shared gate/up plane verify B2 W4"), map({1, 0}, 4)},
+          std::pair{std::string("lora shared gate/up plane prefill T21"), map({0}, 21)}}) {
+        failures += run_case({label, 5120, 64, 2, both,
+                              {{17408, 0, 32, 34816, 0, both}, {17408, 32, 32, 34816, 17408, both}},
+                              columns, 37u, /*shared_plane*/ true});
+    }
     // o_proj and down_proj into the residual stream; adapter 1 has no A for this input.
     failures += run_case({"lora o_proj B4", 6144, 32, 2, present({true, false}),
                           {{5120, 0, 32, 5120, 0, both}}, map({0, 1, -1, 0}, 1), 41u});

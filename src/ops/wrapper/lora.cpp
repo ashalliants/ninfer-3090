@@ -36,6 +36,27 @@ Extent extent(const Tensor& t) {
 
 bool overlaps(Extent a, Extent b) { return a.begin < b.end && b.begin < a.end; }
 
+// Whether two [rows, columns] BF16 views share an element. Row slices of one plane (the FFN's
+// [gate | up] columns) interleave, so their byte extents always intersect although no element is
+// shared: when both views step columns by the same stride and each column's run fits in it, they are
+// disjoint exactly when one run sits beside the other within the stride (modulo the stride, since
+// their columns start a whole number of strides apart only when the offsets say so).
+bool views_overlap(const Tensor& a, const Tensor& b) {
+    if (!overlaps(extent(a), extent(b))) { return false; }
+    const auto stride = static_cast<std::uint64_t>(a.nb[1]);
+    const auto run_a  = static_cast<std::uint64_t>(a.ne[0]) * sizeof(std::uint16_t);
+    const auto run_b  = static_cast<std::uint64_t>(b.ne[0]) * sizeof(std::uint16_t);
+    if (a.ne[1] <= 1 || b.ne[1] <= 1 || a.nb[1] != b.nb[1] || stride == 0 || run_a > stride ||
+        run_b > stride) {
+        return true;
+    }
+    const auto pa = reinterpret_cast<std::uintptr_t>(a.data);
+    const auto pb = reinterpret_cast<std::uintptr_t>(b.data);
+    // b's runs start at offset d past a's within every stride-wide window.
+    const auto d = static_cast<std::uint64_t>(pb >= pa ? (pb - pa) % stride : (stride - (pa - pb) % stride) % stride);
+    return !(d >= run_a && d + run_b <= stride);
+}
+
 // A [rows, T] BF16 matrix view whose columns are contiguous runs of `rows` values.
 void require_matrix(const Tensor& t, std::int32_t columns, const char* what) {
     if (t.dtype != DType::BF16 || t.data == nullptr) {
@@ -99,7 +120,7 @@ void lora_apply(const Tensor& x, const LoraDown& down, std::span<const LoraUp> u
         }
         if (overlaps(extent(output.output), extent(x))) { reject("an output overlaps x"); }
         for (std::size_t other = 0; other < o; ++other) {
-            if (overlaps(extent(output.output), extent(up[other].output))) {
+            if (views_overlap(output.output, up[other].output)) {
                 reject("two outputs overlap");
             }
         }
