@@ -937,6 +937,18 @@ def test_engram_matches_the_model_repos_own_code():
         check(float(np.abs(got - x[layer]).max()) > 1.0, "the golden must actually change the stream")
 
 
+def test_engram_hash_golden_is_what_the_oracle_computes():
+    """tests/fixtures/dsv4/engram_hash_golden.json (the C++ EngramHasher's test) at V4.1-Flash's geometry: its
+    bucket counts are the real model's (the oracle's primes reproduce the GGUF's head_vocab_sizes, 768,022,850 rows)."""
+    import engram_hash_golden as hg
+
+    path = Path(HERE).parent.parent / "tests" / "fixtures" / "dsv4" / "engram_hash_golden.json"
+    check(json.loads(path.read_text()) == json.loads(json.dumps(hg.golden())), f"{path} is stale: rerun engram_hash_golden.py")
+    golden = hg.golden()
+    check(sum(golden["head_vocab_sizes"]) == 768_022_850 and golden["head_vocab_sizes"][:3] == [16000057, 16000079, 16000081],
+          "the oracle's bucket primes must reproduce the real model's head_vocab_sizes")
+
+
 def test_engram_hash_ids_structure():
     case = eng.golden_case()
     ids, primes, offsets = eng.ngram_hash_ids(case["input_ids"], case["token_map"], case["pad_id"], case["multipliers"], case["primes"], case["offsets"], case["token_mask"]), case["primes"], case["offsets"]
