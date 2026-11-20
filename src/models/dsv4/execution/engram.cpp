@@ -15,6 +15,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace ninfer::models::dsv4 {
 
@@ -225,11 +226,22 @@ void Engram::stage(std::span<const Run> runs) {
     const std::uint32_t layers = hasher_.layers(), cols = hasher_.columns();
     // The previous call's copies out of the pinned buffer must be done before it is overwritten.
     CUDA_CHECK(cudaEventSynchronize(copied_));
+    // Nothing is committed (histories, ids, staged_) until the rows are read: a failed stage leaves
+    // the caller's histories untouched and the Engram with no staged call.
+    staged_ = 0;
+    std::vector<std::pair<EngramHasher::History*, EngramHasher::History>> working;
+    const auto working_history = [&](EngramHasher::History* h) -> EngramHasher::History& {
+        for (auto& entry : working) {
+            if (entry.first == h) { return entry.second; }
+        }
+        working.emplace_back(h, *h);
+        return working.back().second;
+    };
     ids_.resize(total * layers * cols);
     std::size_t at = 0;
     for (const Run& run : runs) {
         hasher_.append(
-            *run.history, run.tokens,
+            working_history(run.history), run.tokens,
             std::span<std::uint32_t>(ids_).subspan(at, run.tokens.size() * layers * cols));
         at += run.tokens.size() * layers * cols;
     }
@@ -241,8 +253,9 @@ void Engram::stage(std::span<const Run> runs) {
                         &ordered[(static_cast<std::size_t>(layer) * total + t) * cols]);
         }
     }
-    staged_ = static_cast<std::uint32_t>(total);
     volume_.read_rows(ordered, std::span<std::byte>(pinned_, ordered.size() * row_bytes_));
+    for (auto& entry : working) { *entry.first = entry.second; }
+    staged_ = static_cast<std::uint32_t>(total);
 }
 
 void Engram::copy_issued(cudaStream_t stream) { CUDA_CHECK(cudaEventRecord(copied_, stream)); }

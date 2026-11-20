@@ -703,6 +703,18 @@ void test_synthetic(cudaStream_t stream) {
             const dsv4::Engram::Run too_many{&history, many};
             check(throws([&] { engram.stage(std::span<const dsv4::Engram::Run>(&too_many, 1)); }),
                   "staging more than max_tokens is refused");
+            {
+                // A failing stage (a bad token after valid ones) leaves the history and the staged
+                // call untouched.
+                auto before = engram.hasher().start();
+                auto h2     = before;
+                std::vector<std::int32_t> mixed{3, 4, 1 << 30};
+                const dsv4::Engram::Run bad{&h2, mixed};
+                check(throws([&] { engram.stage(std::span<const dsv4::Engram::Run>(&bad, 1)); }),
+                      "a stage with a bad token is refused");
+                check(h2.tail == before.tail && engram.staged_tokens() == 0,
+                      "a failed stage leaves the history and the staged call untouched");
+            }
             const dsv4::Engram::Run nohistory{nullptr, tokens};
             check(throws([&] { engram.stage(std::span<const dsv4::Engram::Run>(&nohistory, 1)); }),
                   "a run without a history is refused");
