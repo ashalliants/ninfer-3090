@@ -6,10 +6,13 @@
 //             is exactly zero), and a base request on an Engine holding it must match an Engine with
 //             no adapters (base rounds keep their graphs and arithmetic).
 //   real      NINFER_TEST_LORA=<PEFT adapter dir> (Qwen3.8-27B-pi-adapted): the adapter changes
-//             the output (a greedy token, or a token's log-probability by >= 0.08 nats); the adapted
-//             greedy output is the same with CUDA graphs on or off, under MTP,
-//             and beside a concurrent base request in the same rounds; the base and the adapter
-//             never share cached context. NINFER_TEST_LORA_REFERENCE=<json> also compares with
+//             the output (a greedy token, or a token's log-probability by >= 0.08 nats); adapted
+//             rounds run as CUDA graphs that read each row's adapter slot from device memory, so
+//             the adapted tokens and log-probabilities are bit-identical with graphs on or off,
+//             ordinary and under MTP; the greedy output is the same under MTP, beside a concurrent
+//             base request in the same rounds, and under a second name for the same adapter (slot
+//             1) beside the first (one captured graph serving several selections); the base and
+//             the adapter never share cached context. NINFER_TEST_LORA_REFERENCE=<json> also compares with
 //             {"prompt": "...", "tokens": [ids]}: the greedy continuation a PEFT/transformers run
 //             of base + adapter produced for the same rendered prompt (thinking off).
 #include "ninfer/engine.h"
@@ -83,6 +86,38 @@ std::vector<ninfer::TokenId> run(ninfer::Engine& engine, const std::string& text
 }
 
 const std::string kPrompt = "Write a short Python function that returns the n-th Fibonacci number.";
+
+// Greedy tokens with each one's log-probability: a graph and an eager round must agree to the bit.
+struct Scored {
+    std::vector<ninfer::TokenId> tokens;
+    std::vector<float> logprobs;
+};
+
+Scored run_scored(ninfer::Engine& engine, const std::string& text, const std::string& lora,
+                  std::uint32_t tokens = 48) {
+    auto request                     = greedy(tokens);
+    request.execution.logprobs_top_k = 0;
+    const auto result                = engine.generate(engine.prepare(prompt(text, lora)), request);
+    Scored out{result.generated_token_ids, {}};
+    for (const auto& entry : result.token_logprobs) { out.logprobs.push_back(entry.sampled.logprob); }
+    return out;
+}
+
+bool starts_with(const std::vector<ninfer::TokenId>& tokens, const std::vector<ninfer::TokenId>& prefix) {
+    return tokens.size() >= prefix.size() && std::equal(prefix.begin(), prefix.end(), tokens.begin());
+}
+
+bool identical(const Scored& a, const Scored& b) {
+    if (a.tokens != b.tokens || a.logprobs.size() != b.logprobs.size()) { return false; }
+    for (std::size_t i = 0; i < a.logprobs.size(); ++i) {
+        if (std::memcmp(&a.logprobs[i], &b.logprobs[i], sizeof(float)) != 0) {
+            std::cerr << "log-probability " << i << " differs: " << a.logprobs[i] << " vs " << b.logprobs[i]
+                      << '\n';
+            return false;
+        }
+    }
+    return true;
+}
 
 // Whether selecting the adapter changes what the model computes. The greedy tokens alone are too
 // weak a signal: on short prompts the pi adapter moves the chosen tokens' log-probabilities by
@@ -214,15 +249,27 @@ int real_scenario(const char* artifact, const char* adapter) {
                               "the adapted output diverges from the PEFT reference within 8 tokens");
         }
     }
-    {
-        ninfer::Engine engine(options(artifact, loras, false, false));
-        failures += check(run(engine, kPrompt, "pi") == adapted, "adapted tokens changed without CUDA graphs");
-        failures += check(run(engine, kPrompt, "") == base, "base tokens changed without CUDA graphs");
-    }
-    {
-        ninfer::Engine engine(options(artifact, loras, true));
-        failures += check(run(engine, kPrompt, "pi") == adapted, "adapted tokens changed under MTP");
-        failures += check(run(engine, kPrompt, "") == base, "base tokens changed under MTP");
+    // Adapted graphs against eager adapted rounds, to the bit: ordinary decode, then MTP verify.
+    for (const bool mtp : {false, true}) {
+        const std::string mode = mtp ? " under MTP" : "";
+        Scored graphed, eager, graphed_base, eager_base;
+        {
+            ninfer::Engine engine(options(artifact, loras, mtp, true));
+            graphed      = run_scored(engine, kPrompt, "pi");
+            graphed_base = run_scored(engine, kPrompt, "");
+            // The 24-token runs above are the prefixes of these 48-token ones.
+            failures += check(starts_with(graphed.tokens, adapted), "adapted tokens changed" + mode);
+            failures += check(starts_with(graphed_base.tokens, base), "base tokens changed" + mode);
+        }
+        {
+            ninfer::Engine engine(options(artifact, loras, mtp, false));
+            eager      = run_scored(engine, kPrompt, "pi");
+            eager_base = run_scored(engine, kPrompt, "");
+        }
+        failures += check(identical(graphed, eager),
+                          "adapted rounds under CUDA graphs differ from eager adapted rounds" + mode);
+        failures += check(identical(graphed_base, eager_base),
+                          "base rounds under CUDA graphs differ from eager base rounds" + mode);
     }
     {
         ninfer::Engine engine(options(artifact, loras, true, true, 2));
@@ -232,6 +279,26 @@ int real_scenario(const char* artifact, const char* adapter) {
                           "adapted tokens changed beside a concurrent base request");
         failures += check(second.wait().generated_token_ids == base,
                           "base tokens changed beside a concurrent adapted request");
+    }
+    {
+        // The same adapter in slots 0 and 1: every selection of a two-row round ([0, 1], [1, -1],
+        // [1] alone) replays the one adapted graph of its batch size and must give pi's tokens.
+        const std::vector<ninfer::LoraSource> twice{{.name = "pi", .path = adapter},
+                                                    {.name = "pi2", .path = adapter}};
+        ninfer::Engine engine(options(artifact, twice, false, true, 2));
+        failures += check(run(engine, kPrompt, "pi2") == adapted, "the adapter in slot 1 changed its tokens");
+        auto first  = engine.submit(engine.prepare(prompt(kPrompt, "pi")), greedy(24));
+        auto second = engine.submit(engine.prepare(prompt(kPrompt, "pi2")), greedy(24));
+        failures += check(first.wait().generated_token_ids == adapted,
+                          "slot 0 changed its tokens beside slot 1 in the same rounds");
+        failures += check(second.wait().generated_token_ids == adapted,
+                          "slot 1 changed its tokens beside slot 0 in the same rounds");
+        auto third  = engine.submit(engine.prepare(prompt(kPrompt, "pi2")), greedy(24));
+        auto fourth = engine.submit(engine.prepare(prompt(kPrompt, "")), greedy(24));
+        failures += check(third.wait().generated_token_ids == adapted,
+                          "slot 1 changed its tokens beside a base request");
+        failures += check(fourth.wait().generated_token_ids == base,
+                          "base tokens changed beside slot 1");
     }
     return failures;
 }

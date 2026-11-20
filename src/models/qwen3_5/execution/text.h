@@ -146,9 +146,11 @@ public:
 
     // The LoRA adapter slot of each sequence of the next target passes (Parameters::lora): a
     // prefill chunk is one row; a decode or verify batch is one row per sequence, in batch order.
-    // Unset, or a model without adapters, runs no LoRA work at all. The selection is passed to
-    // the kernels by value, so a pass that selects an adapter must not be captured into a graph
-    // that is replayed for other selections; the Program runs those passes eagerly.
+    // Unset, or a model without adapters, runs no LoRA work at all. A host selection (prefill) is
+    // passed to the kernels by value and skips every site its adapters leave alone. A device
+    // selection (lora_round_columns: a decode round's ingress) is read by the kernels, so a graph
+    // captured with it serves any selection; it runs every site some loaded adapter adapts, and
+    // the adapted FFN route wherever one adapts the FFN, for all rows of the pass.
     void set_lora(const ops::LoraColumns& columns) noexcept { lora_ = columns; }
 
     // One event per full-attention layer (compact index) of a Host restore still landing. The next

@@ -273,10 +273,23 @@ carries.
   decode on a V100). The workspace plan adds that route's peak and each site's Op scratch when
   adapters are loaded.
 - Selection is per sequence: `PreparedPromptData::lora` (the frontend resolves the name) becomes
-  `SequenceState::lora`, and each pass's `ExecutionCore::lora` (`ops::LoraColumns`, one slot per
-  row) reaches `TextContext::set_lora`. The kernels take the selection by value, so a decode, MTP
-  or DFlash round with an adapter row runs eagerly and the captured graphs stay adapter-free; the
-  MTP head, the DFlash drafter and the lossy scout's int4 pass are never adapted.
+  `SequenceState::lora`. A prefill call passes it by value (`ExecutionCore::lora`, an
+  `ops::LoraColumns` of one row) to `TextContext::set_lora`, and only the sites that adapter adapts
+  run. A decode, MTP or DFlash round carries each row's slot in its ingress (`lora`, -1 for none,
+  the same per-row pattern as the other ingress selections); a round with an adapted row
+  (`adapted_round`, `ExecutionCore::lora_round`) hands the kernels a pointer to it
+  (`lora_round_columns`, `LoraColumns::device_slot`), so they read the selection when they run.
+  Such a pass runs every site some loaded adapter adapts, and the unfused FFN route wherever one
+  adapts the FFN, for every row of the round (the rows that select nothing are left untouched by
+  the update but share the route), so the launches depend only on the loaded adapters, never on
+  the selection. The MTP head, the DFlash drafter and the lossy scout's int4 pass are never adapted.
+- CUDA graphs: with adapters loaded, `prepare_graphs` captures every target-running family twice:
+  the base graphs (no LoRA work; base rounds replay them unchanged) and the adapted graphs
+  (`ordinary_lora_graphs`, `SpeculativeRoundFamily::lora_forward`) at the same profiles. One
+  adapted graph serves any selection of its batch size. Finish runs no target layer, so both
+  Forward variants pair with the one Finish family. The graph allowance charges the adapted
+  executables like the base ones. An eager adapted round (`--no-cuda-graph`) issues the same
+  launches as the graph and is bit-for-bit equal to it.
 - The request's prefix identity tag is `prefix_identity_tag(lora)`: the base tag mixed with the
   adapter digest (`LoraAdapter::digest`, FNV-1a over names, shapes, raw bytes and the scale).
 

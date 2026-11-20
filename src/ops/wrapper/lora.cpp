@@ -89,9 +89,16 @@ void lora_apply(const Tensor& x, const LoraDown& down, std::span<const LoraUp> u
         reject("too many columns");
     }
     const std::int32_t total = columns.rows * columns.width;
-    for (std::int32_t row = 0; row < columns.rows; ++row) {
-        const std::int32_t slot = columns.slot[static_cast<std::size_t>(row)];
-        if (slot < -1 || slot >= kLoraMaxAdapters) { reject("a column slot is out of range"); }
+    if (columns.device_slot != nullptr) {
+        // Read on the device when the kernels run; out-of-range slots select no adapter there.
+        if ((reinterpret_cast<std::uintptr_t>(columns.device_slot) & 3U) != 0) {
+            reject("the device column map must be 4-byte aligned");
+        }
+    } else {
+        for (std::int32_t row = 0; row < columns.rows; ++row) {
+            const std::int32_t slot = columns.slot[static_cast<std::size_t>(row)];
+            if (slot < -1 || slot >= kLoraMaxAdapters) { reject("a column slot is out of range"); }
+        }
     }
     require_matrix(x, total, "x");
     if (x.ne[0] % 8 != 0) { reject("K must be a multiple of 8"); }
@@ -125,6 +132,7 @@ void lora_apply(const Tensor& x, const LoraDown& down, std::span<const LoraUp> u
             }
         }
     }
+    // A host map that selects nothing launches nothing; a device map always launches (any()).
     if (!columns.any()) { return; }
 
     auto scope   = workspace.scope();

@@ -45,9 +45,13 @@ struct ExecutionCore {
     // Numeric tripwire probes and the drain that hands their record to the host; set only for the
     // decode rounds (ordinary, MTP, DFlash) and their graphs, and only under --numeric-tripwire.
     NumericTripwire* tripwire = nullptr;
-    // The LoRA adapter slot of each sequence the call runs (TextContext::set_lora): one row for a
-    // prefill call, one per batch row for a round. Rows with slot -1 run the base model.
+    // The LoRA adapter slot of the sequence a prefill call runs (TextContext::set_lora); slot -1
+    // runs the base model. Decode rounds leave it empty and set lora_round instead.
     ops::LoraColumns lora{};
+    // A decode, MTP or DFlash round with an adapted row: its target passes read each row's slot
+    // from the round frame's ingress `lora` (execution::lora_round_columns), which is what lets
+    // the round run as a captured graph. False runs the round without any LoRA work.
+    bool lora_round = false;
 };
 
 struct PrefillContext {

@@ -171,11 +171,14 @@ struct DecodeGraphFamily {
 };
 
 // A speculative round family (see SpeculativeRoundShape) and its captured Forward/Finish graphs,
-// which are empty without CUDA Graphs.
+// which are empty without CUDA Graphs. With LoRA adapters loaded, lora_forward holds the Forward
+// graphs of rounds with an adapted row (ExecutionCore::lora_round), at the same profiles; Finish
+// runs no target layer, so both Forward variants pair with the one Finish family.
 struct SpeculativeRoundFamily {
     SpeculativeRoundShape shape;
     DecodeGraphFamily forward;
     DecodeGraphFamily finish;
+    DecodeGraphFamily lora_forward;
 };
 
 // ReplaySSM records viewed densely at a family narrower than the widest, with the fold that reads
@@ -883,6 +886,8 @@ public:
     // Captured transfers and external events reference the buffers and events declared above.
     // Families are destroyed first, including when startup throws.
     DecodeGraphFamily ordinary_graphs;
+    // The ordinary rounds with an adapted row (ExecutionCore::lora_round); empty without adapters.
+    DecodeGraphFamily ordinary_lora_graphs;
     std::vector<SpeculativeRoundFamily> round_families;
     // Chooses the neural family of each round (always the wide one when adaptation is off), with
     // the measured round time of each family by batch size, which refines its cost prior.
@@ -951,9 +956,11 @@ public:
     void ordered_reset(SequenceState&);
     void refresh_state_views(SequenceState&);
     [[nodiscard]] StateImageSelectors state_selectors(const SequenceState&) const;
-    // The LoRA adapter selection of one sequence's prefill call, or of a round's rows in order.
+    // The LoRA adapter selection of one sequence's prefill call.
     [[nodiscard]] static ops::LoraColumns lora_columns(const SequenceState& sequence) noexcept;
-    [[nodiscard]] ops::LoraColumns lora_columns(std::span<const std::uint32_t> lanes) const;
+    // Whether some row of a round selects an adapter: the round then runs its adapted variant
+    // (ExecutionCore::lora_round), which reads each row's slot from the round's ingress.
+    [[nodiscard]] bool adapted_round(std::span<const std::uint32_t> lanes) const;
     void settle_state_fork(SequenceState&);
     void release_sequence_state(SequenceState&) noexcept;
     void release_sequence_kv(SequenceState&) noexcept;

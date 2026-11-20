@@ -2454,16 +2454,21 @@ to keep in step. A GGUF copy is still useful to check NInfer's output against ll
 them). The target verifies every proposal with the adapter on, so the tokens are the adapted
 model's; only the acceptance rate can fall.
 
-**CUDA graphs.** The captured decode graphs carry no adapter selection, so a round in which any row
-selects an adapter runs eagerly (as `--no-cuda-graph` does) and costs the launch overhead the graphs
-save; rounds of base-model requests replay the graphs and are bit-for-bit those of a server with no
-`--lora`. Prefill always runs eagerly.
+**CUDA graphs.** Adapted decode, MTP and DFlash rounds run as CUDA graphs too. With `--lora`, the
+server captures a second, adapted set of decode graphs that reads each request's adapter from device
+memory, so one set serves every mix of adapters and base requests in a round; a round with no
+adapted request replays the ordinary graphs and is bit-for-bit that of a server with no `--lora`.
+An adapted round's output is bit-for-bit the same with `--no-cuda-graph`. The second set costs
+startup time and device memory (it is charged like the first; TODO: measured figures). In a round
+that mixes adapted and base requests, the base requests take the adapted FFN route (the update
+itself skips them), as they did before; their tokens matched the base model's in the tests but are
+not guaranteed bit-for-bit. Prefill always runs eagerly.
 
 **Speed.** Measured on a Tesla V100 with Qwen3.8-27B (MTP3, INT8 KV, `--prefill-cublas`) and the
 pi adapter (r=32, MLP on all 64 layers, attention on 16): adapted decode 59 tok/s against the base
 model's 65 (MTP acceptance unchanged, 54-55%), adapted prefill of a 3,066-token prompt 1,030 tok/s
 against 1,150. The difference is the adapter's own kernels (about 7% of an adapted decode round)
-and the eager rounds (about 1.5%).
+and, before adapted rounds ran as graphs, the eager rounds (about 1.5%; TODO: remeasure).
 
 **Context cache.** An adapter changes every activation, so its requests have their own cache
 identity, the base identity mixed with a digest of the adapter's tensors and scale: they reuse only

@@ -1,5 +1,6 @@
 // Implements: include/ninfer/ops/lora.h
 // Single variant: a split-K shrink into FP32 partials, then a per-output expand (kernel/lora.cuh).
+// The column map travels by value (`slot`) or, for a device map, as a pointer the kernels read.
 #include "ops/launcher/lora.h"
 
 #include "core/device.h" // CUDA_CHECK
@@ -31,6 +32,7 @@ void lora_apply_launch(const Tensor& x, const LoraDown& down, std::span<const Lo
         shrink.slot[row] = static_cast<std::int8_t>(
             row < columns.rows ? columns.slot[static_cast<std::size_t>(row)] : -1);
     }
+    shrink.slot_map = columns.device_slot;
     shrink.rank    = down.rank;
     shrink.k       = k;
     shrink.columns = total;
@@ -73,6 +75,7 @@ void lora_apply_launch(const Tensor& x, const LoraDown& down, std::span<const Lo
         deepest         = std::max(deepest, out.rank_count);
     }
     for (int row = 0; row < kLoraKernelRows; ++row) { expand.slot[row] = shrink.slot[row]; }
+    expand.slot_map = columns.device_slot;
     expand.rank    = down.rank;
     expand.columns = total;
     expand.width   = columns.width;

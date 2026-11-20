@@ -72,6 +72,10 @@ struct Fixup {
 } // namespace
 
 bool LoraSite::applies(const ops::LoraColumns& columns) const noexcept {
+    if (columns.device_slot != nullptr) {
+        return columns.rows > 0 &&
+               std::any_of(down.a.begin(), down.a.end(), [](const void* a) { return a != nullptr; });
+    }
     for (std::int32_t row = 0; row < columns.rows; ++row) {
         const std::int32_t slot = columns.slot[static_cast<std::size_t>(row)];
         if (slot >= 0 && down.a[static_cast<std::size_t>(slot)] != nullptr) { return true; }
@@ -228,6 +232,18 @@ std::shared_ptr<const LoraParameters> load_lora_parameters(const std::vector<Lor
     if (!data.empty()) { out->storage.copy_from_host(data.data(), data.size() * sizeof(std::uint16_t)); }
     auto* base = static_cast<std::uint16_t*>(out->storage.p);
     for (const Fixup& fixup : fixups) { *fixup.slot = base + fixup.offset; }
+    return out;
+}
+
+ops::LoraColumns lora_round_columns(const Tensor& rows) {
+    if (rows.dtype != DType::I32 || rows.data == nullptr || rows.ne[0] < 1 ||
+        rows.ne[0] > ops::kLoraMaxRows || rows.numel() != rows.ne[0]) {
+        throw std::logic_error("a round's LoRA selection must be a non-empty device I32 [B]");
+    }
+    ops::LoraColumns out;
+    out.rows        = rows.ne[0];
+    out.width       = 1;
+    out.device_slot = static_cast<const std::int32_t*>(rows.data);
     return out;
 }
 

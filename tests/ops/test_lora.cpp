@@ -1,9 +1,13 @@
 // lora_apply against an FP64 oracle at the Qwen3.8-27B adapter shapes (harness-hub's r=32 PEFT
 // adapters): the stacked attention input (q/gate/k/v), the FFN gate/up plane (a strided row slice),
 // o_proj and down_proj, with mixed adapter slots per row, null matrices, and the batch-invariance
-// and untouched-column guarantees of the contract.
+// and untouched-column guarantees of the contract. A device column map (the decode rounds' graphs)
+// must give the host map's bits, eagerly and from one captured graph replayed for many selections.
+#include "core/device.h"
 #include "ninfer/ops/lora.h"
 #include "ops/op_tester.h"
+
+#include <cuda_runtime.h>
 
 #include <array>
 #include <cmath>
@@ -238,6 +242,149 @@ int run_batch_invariance() {
     return failures;
 }
 
+// A device column map (LoraColumns::device_slot) against the host map, bit for bit: eagerly, and
+// from one graph captured once and replayed with the map rewritten before each replay. Two outputs
+// share the down-projection (an attention-input-like site); adapter 1 has no B for the second
+// output and adapter 2 no A at all. Device slots outside [0, 8) must select nothing.
+int run_device_map(std::int32_t rows, std::int32_t width, std::uint32_t seed) {
+    const std::int32_t k = 5120, rank = 64, T = rows * width;
+    const std::array<std::int32_t, 2> n{1024, 512};
+    const int adapters = 3;
+    const std::string label = "lora device map B" + std::to_string(rows) + " W" + std::to_string(width);
+
+    std::vector<float> x(static_cast<std::size_t>(k) * T);
+    fill_uniform(x, seed, -3.0f, 3.0f);
+    GuardedDeviceBuffer dx(x.size() * 2);
+    dx.copy_from_host(encode_bf16(x).data(), dx.bytes());
+    std::vector<GuardedDeviceBuffer> da, db;
+    da.reserve(adapters);
+    db.reserve(adapters * n.size());
+    ops::LoraDown down;
+    down.rank = rank;
+    std::array<ops::LoraUp, 2> up{};
+    std::vector<GuardedDeviceBuffer> dy;
+    dy.reserve(n.size());
+    std::vector<std::vector<std::uint16_t>> original(n.size());
+    for (int s = 0; s < adapters; ++s) {
+        std::vector<float> a(static_cast<std::size_t>(rank) * k);
+        fill_uniform(a, seed + 10u + s, -0.02f, 0.02f);
+        da.emplace_back(a.size() * 2);
+        da.back().copy_from_host(encode_bf16(a).data(), da.back().bytes());
+        down.a[s] = s == 2 ? nullptr : da.back().data();
+    }
+    for (std::size_t o = 0; o < n.size(); ++o) {
+        std::vector<float> y(static_cast<std::size_t>(n[o]) * T);
+        fill_uniform(y, seed + 50u + static_cast<std::uint32_t>(o), -2.0f, 2.0f);
+        original[o] = encode_bf16(y);
+        dy.emplace_back(y.size() * 2);
+        up[o].output      = Tensor(dy.back().data(), DType::BF16, {n[o], T});
+        up[o].rank_offset = static_cast<std::int32_t>(o) * 32;
+        up[o].rank_count  = 32;
+        for (int s = 0; s < adapters; ++s) {
+            std::vector<float> b(static_cast<std::size_t>(n[o]) * 32);
+            fill_uniform(b, seed + 100u + 7u * static_cast<std::uint32_t>(o) + s, -0.05f, 0.05f);
+            db.emplace_back(b.size() * 2);
+            db.back().copy_from_host(encode_bf16(b).data(), db.back().bytes());
+            up[o].b[s] = (s == 1 && o == 1) ? nullptr : db.back().data();
+        }
+    }
+    const auto reset_outputs = [&] {
+        for (std::size_t o = 0; o < n.size(); ++o) dy[o].copy_from_host(original[o].data(), dy[o].bytes());
+    };
+    const auto read_outputs = [&] {
+        std::vector<std::vector<std::uint16_t>> out(n.size());
+        for (std::size_t o = 0; o < n.size(); ++o)
+            out[o] = from_device<std::uint16_t>(dy[o].data(), original[o].size());
+        return out;
+    };
+    const Tensor input(dx.data(), DType::BF16, {k, T});
+    DeviceArena workspace(ops::lora_workspace_bytes(rank, k, T) + 4096);
+    GuardedDeviceBuffer device_map(static_cast<std::size_t>(ops::kLoraMaxRows) * sizeof(std::int32_t));
+
+    // Each selection: the device map's values, and the host map they mean (out of range: none).
+    std::vector<std::vector<std::int32_t>> selections;
+    selections.push_back(std::vector<std::int32_t>(static_cast<std::size_t>(rows), -1));
+    selections.push_back(std::vector<std::int32_t>(static_cast<std::size_t>(rows), 0));
+    {
+        std::vector<std::int32_t> mixed(static_cast<std::size_t>(rows));
+        for (std::int32_t r = 0; r < rows; ++r) mixed[r] = (r % 4 == 3) ? -1 : r % 3;
+        selections.push_back(mixed);
+        for (std::int32_t r = 0; r < rows; ++r) mixed[r] = r % 2 == 0 ? 1 : (r % 3 == 1 ? 9 : -7);
+        selections.push_back(mixed);
+    }
+    const auto host_columns = [&](const std::vector<std::int32_t>& slots) {
+        ops::LoraColumns c;
+        c.rows  = rows;
+        c.width = width;
+        for (std::int32_t r = 0; r < rows; ++r)
+            c.slot[r] = slots[r] >= 0 && slots[r] < ops::kLoraMaxAdapters ? slots[r] : -1;
+        return c;
+    };
+    ops::LoraColumns device_columns;
+    device_columns.rows        = rows;
+    device_columns.width       = width;
+    device_columns.device_slot = static_cast<const std::int32_t*>(device_map.data());
+
+    int failures = 0;
+    const auto compare = [&](const std::string& what, const std::vector<std::vector<std::uint16_t>>& expected,
+                             const std::vector<std::vector<std::uint16_t>>& got) {
+        for (std::size_t o = 0; o < n.size(); ++o) {
+            for (std::size_t i = 0; i < expected[o].size(); ++i) {
+                if (expected[o][i] != got[o][i]) {
+                    std::cout << "FAIL " << label << " " << what << ": output " << o << " value " << i
+                              << " differs from the host map's\n";
+                    ++failures;
+                    return;
+                }
+            }
+        }
+    };
+
+    std::vector<std::vector<std::vector<std::uint16_t>>> expected;
+    for (const auto& slots : selections) {
+        reset_outputs();
+        ops::lora_apply(input, down, up, host_columns(slots), workspace, nullptr);
+        cuda_synchronize();
+        expected.push_back(read_outputs());
+    }
+    // Nothing selected: the host map launches nothing, so these are the original bits.
+    compare("host map, no selection", {original[0], original[1]}, expected[0]);
+
+    for (std::size_t i = 0; i < selections.size(); ++i) {
+        reset_outputs();
+        device_map.copy_from_host(selections[i].data(), selections[i].size() * sizeof(std::int32_t));
+        ops::lora_apply(input, down, up, device_columns, workspace, nullptr);
+        cuda_synchronize();
+        compare("eager selection " + std::to_string(i), expected[i], read_outputs());
+    }
+
+    cudaStream_t stream;
+    cudaGraph_t captured;
+    cudaGraphExec_t executable;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    ops::lora_apply(input, down, up, device_columns, workspace, stream);
+    CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
+    CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
+    // Replayed in a different order than captured or run above, twice over.
+    for (int pass = 0; pass < 2; ++pass) {
+        for (std::size_t j = 0; j < selections.size(); ++j) {
+            const std::size_t i = selections.size() - 1 - j;
+            reset_outputs();
+            device_map.copy_from_host(selections[i].data(), selections[i].size() * sizeof(std::int32_t));
+            CUDA_CHECK(cudaGraphLaunch(executable, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            compare("graph replay of selection " + std::to_string(i), expected[i], read_outputs());
+        }
+    }
+    CUDA_CHECK(cudaGraphExecDestroy(executable));
+    CUDA_CHECK(cudaGraphDestroy(captured));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    for (std::size_t o = 0; o < n.size(); ++o) failures += dy[o].verify_guards(label.c_str());
+    failures += device_map.verify_guards(label.c_str());
+    return failures;
+}
+
 ops::LoraColumns map(std::initializer_list<std::int32_t> slots, std::int32_t width) {
     ops::LoraColumns out;
     out.rows  = static_cast<std::int32_t>(slots.size());
@@ -302,6 +449,12 @@ int main() {
     failures += run_case({"lora K=1032 rank16 B3 W5", 1032, 16, 3, present({true, true, true}),
                           {{40, 0, 16, 40, 0, present({true, true, true})}}, map({2, 0, 1}, 5), 61u});
     failures += run_batch_invariance();
+    // The decode rounds' device selection: ordinary decode (W1, up to 8 rows), MTP/DFlash verify.
+    failures += run_device_map(1, 1, 71u);
+    failures += run_device_map(4, 1, 73u);
+    failures += run_device_map(8, 1, 75u);
+    failures += run_device_map(3, 4, 77u);
+    failures += run_device_map(2, 16, 79u);
     std::cout << (failures ? "FAIL" : "OK") << " lora\n";
     return failures ? 1 : 0;
 }

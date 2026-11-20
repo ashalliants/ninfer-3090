@@ -133,6 +133,7 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
         ingress_tensor(offsetof(OrdinaryDecodeIngress, state_source_slots), DType::I32);
     state_destination_slots =
         ingress_tensor(offsetof(OrdinaryDecodeIngress, state_destination_slots), DType::I32);
+    lora = ingress_tensor(offsetof(OrdinaryDecodeIngress, lora), DType::I32);
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) +
         offsetof(OrdinaryDecodeIngress, sampling));
@@ -339,6 +340,7 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     state_destination_slots =
         ingress_tensor(offsetof(MtpDecodeIngress, state_destination_slots), DType::I32, {batch});
     rope_deltas = ingress_tensor(offsetof(MtpDecodeIngress, rope_deltas), DType::I32, {batch});
+    lora        = ingress_tensor(offsetof(MtpDecodeIngress, lora), DType::I32, {batch});
     sampling    = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(MtpDecodeIngress, sampling));
 
@@ -418,6 +420,7 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
         ingress_tensor(offsetof(DFlashDecodeIngress, state_source_slots), DType::I32, {batch});
     state_destination_slots =
         ingress_tensor(offsetof(DFlashDecodeIngress, state_destination_slots), DType::I32, {batch});
+    lora = ingress_tensor(offsetof(DFlashDecodeIngress, lora), DType::I32, {batch});
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(DFlashDecodeIngress, sampling));
     copy_rows = ingress_tensor(offsetof(DFlashDecodeIngress, copy_rows), DType::I32, {batch});

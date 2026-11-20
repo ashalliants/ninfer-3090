@@ -23,12 +23,20 @@ inline constexpr int kLoraMaxOutputRank = 256;
 // Which adapter each column of a call uses. The T columns are `rows` consecutive groups of `width`
 // columns; column t belongs to group t / width and uses adapter slot `slot[t / width]`, or none
 // when that slot is negative.
+//
+// `device_slot`, when set, replaces `slot`: a device I32 [rows] array the kernels read when they
+// run, so a captured graph sees the slots of each replay (the decode rounds' ingress). A slot read
+// there outside [0, kLoraMaxAdapters) selects no adapter.
 struct LoraColumns {
     std::array<std::int32_t, kLoraMaxRows> slot{};
     std::int32_t rows  = 0;
     std::int32_t width = 0;
+    const std::int32_t* device_slot = nullptr;
 
+    // Whether some row may select an adapter: always, for a device selection (the host cannot see
+    // it), and for a host selection, whether some row's slot is non-negative.
     [[nodiscard]] bool any() const noexcept {
+        if (device_slot != nullptr) { return rows > 0; }
         for (std::int32_t row = 0; row < rows; ++row) {
             if (slot[static_cast<std::size_t>(row)] >= 0) { return true; }
         }
@@ -74,7 +82,7 @@ struct LoraUp {
  *   K a positive multiple of 8; down.rank in [8, kLoraMaxRank] and a multiple of 8; every
  *   rank_count a positive multiple of 8, at most kLoraMaxOutputRank, with rank_offset a multiple
  *   of 8 and rank_offset + rank_count <= down.rank; 1 to kLoraMaxOutputs outputs; slots in
- *   [-1, kLoraMaxAdapters). x, the A and B matrices are 16-byte aligned and x's column stride is a
+ *   [-1, kLoraMaxAdapters) (host slots; device slots out of range select none). x, the A and B matrices are 16-byte aligned and x's column stride is a
  *   multiple of 16 bytes; outputs are 2-byte aligned. Outputs do not overlap x or each other.
  *
  * Numeric:
@@ -91,8 +99,11 @@ struct LoraUp {
  *   call.
  *
  * Execution:
- *   The adapter pointers and the column map are launch arguments, so a captured graph replays the
- *   selection it was captured with.
+ *   The adapter pointers are launch arguments. A host column map (`slot`) is one too, so a captured
+ *   graph replays the selection it was captured with, and a call whose map selects nothing launches
+ *   nothing. A device column map (`device_slot`) is read by the kernels, so a captured graph reads
+ *   each replay's selection; such a call always launches (columns that select nothing are left
+ *   untouched as above), and its arithmetic for each column is the host map's, bit for bit.
  */
 void lora_apply(const Tensor& x, const LoraDown& down, std::span<const LoraUp> up,
                 const LoraColumns& columns, WorkspaceArena& workspace, cudaStream_t stream);

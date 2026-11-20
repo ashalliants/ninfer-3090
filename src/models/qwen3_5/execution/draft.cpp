@@ -6,6 +6,7 @@
 #include "models/qwen3_5/execution/workspace.h"
 
 #include "core/nvtx.h"
+#include "models/qwen3_5/execution/lora.h"
 #include "models/qwen3_5/execution/numeric_tripwire.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
@@ -752,7 +753,10 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                          &state.text_cache);
         card.set_stage_runtime(state.execution.stages);
         card.set_tripwire(state.execution.tripwire);
-        card.set_lora(state.execution.lora);
+        // An adapted round reads each row's slot from the ingress, so its graph serves any selection.
+        card.set_lora(state.execution.lora_round
+                          ? lora_round_columns(frame.lora.slice(0, 0, batch_size))
+                          : state.execution.lora);
         // pending_features stays allocated at the widest round (catch-up reads it at that width);
         // a narrower round captures into the leading `width` columns of each lane.
         Tensor pending_features = dflash_state(state).pending_features.slice(1, 0, width);

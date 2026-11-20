@@ -1248,9 +1248,14 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                      dimension(attention.num_key_value_heads)},
             .storage              = impl->kv_storage,
             .multiprocessor_count = impl->multiprocessor_count};
+        // LoRA adapters capture every target-running family twice (prepare_graphs: the base
+        // graphs and the adapted ones); the adapted executables are charged like the base ones.
+        // Not measured yet: an adapted graph adds ~5 nodes per adapted site to the same topology.
+        const std::uint64_t lora_variants = impl->parameters->lora != nullptr ? 2 : 1;
         if (impl->speculative_backend == SpeculativeBackend::None) {
-            impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
-                                                      "ordinary exact-b graph allowance");
+            impl->graph_allowance_bytes =
+                checked_mul(12ULL * kMiB * lora_variants, impl->max_concurrency,
+                            "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             const auto profiles =
                 mtp_graph_profiles(impl->capacity, impl->draft_window, target_attention);
@@ -1273,8 +1278,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 #endif
                 },
                 "MTP graph allowance");
-            impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
-                                                      "MTP exact-b graph allowance");
+            impl->graph_allowance_bytes =
+                checked_mul(per_batch_allowance * lora_variants, impl->max_concurrency,
+                            "MTP exact-b graph allowance");
         } else {
             const auto class_allowance = [&](const SpeculativeRoundShape& shape,
                                              std::uint32_t batch_size) {
@@ -1315,7 +1321,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 for (std::uint32_t batch_size = 1; batch_size <= batch_limit; ++batch_size) {
                     impl->graph_allowance_bytes =
                         checked_add(impl->graph_allowance_bytes,
-                                    class_allowance(shape, batch_size) + 8ULL * kMiB,
+                                    class_allowance(shape, batch_size) * lora_variants + 8ULL * kMiB,
                                     "DFlash exact-b graph allowance");
                 }
             }

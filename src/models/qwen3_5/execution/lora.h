@@ -43,7 +43,9 @@ struct LoraSite {
     std::array<LoraSiteOutput, ops::kLoraMaxOutputs> outputs{};
     std::int32_t output_count = 0;
 
-    // Whether some adapter in `columns` adapts this site.
+    // Whether some adapter in `columns` adapts this site. For a device selection (a decode round's
+    // ingress, unknown on the host) whether any loaded adapter does: the decision then depends only
+    // on the loaded adapters, so one captured graph serves every selection.
     [[nodiscard]] bool applies(const ops::LoraColumns& columns) const noexcept;
 };
 
@@ -76,6 +78,12 @@ struct LoraParameters {
 // std::invalid_argument for an invalid adapter, more than eight, or a duplicate or empty name.
 [[nodiscard]] std::shared_ptr<const LoraParameters>
 load_lora_parameters(const std::vector<LoraSource>& sources, const Parameters& parameters);
+
+// The selection of a decode or verify round whose rows' slots are the device I32 [B] tensor `rows`
+// (the round frame's ingress `lora`, one slot or -1 per batch row): the kernels read it when they
+// run, so a graph captured with it serves any adapter selection. Width is set per call
+// (TextContext::lora_columns).
+[[nodiscard]] ops::LoraColumns lora_round_columns(const Tensor& rows);
 
 // Applies one site to `outputs` (one per LoraSite output, in order) for the columns' slots.
 void apply_lora_site(const LoraSite& site, const Tensor& x, std::span<Tensor> outputs,

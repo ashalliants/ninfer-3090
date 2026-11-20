@@ -40,6 +40,7 @@ struct LoraShrinkParams {
     std::int64_t x_ld; // elements between columns
     const __nv_bfloat16* a[kLoraKernelAdapters];
     std::int8_t slot[kLoraKernelRows];
+    const std::int32_t* slot_map; // device I32 [rows] replacing `slot`, or null
     std::int32_t rank;
     std::int32_t k;
     std::int32_t columns;
@@ -59,12 +60,22 @@ struct LoraExpandOutput {
 struct LoraExpandParams {
     LoraExpandOutput outputs[kLoraKernelOutputs];
     std::int8_t slot[kLoraKernelRows];
+    const std::int32_t* slot_map; // device I32 [rows] replacing `slot`, or null
     std::int32_t rank;
     std::int32_t columns;
     std::int32_t width;
     std::int32_t splits;
     const float* partial;
 };
+
+// The adapter slot of column group `row`: the launch argument, or the device map a captured graph
+// reads at each replay. A device slot outside the loaded range selects nothing (the host map is
+// validated by the wrapper). Only where the slot comes from differs: the arithmetic does not.
+template <class Params>
+__device__ __forceinline__ int lora_slot(const Params& p, int row) {
+    const int s = p.slot_map != nullptr ? p.slot_map[row] : static_cast<int>(p.slot[row]);
+    return s >= 0 && s < kLoraKernelAdapters ? s : -1;
+}
 
 __device__ __forceinline__ void lora_unpack8(const uint4 v, float out[8]) {
     const std::uint32_t w[4] = {v.x, v.y, v.z, v.w};
@@ -116,7 +127,7 @@ __global__ __launch_bounds__(kLoraThreads) void lora_shrink_kernel(const LoraShr
         const int col = col0 + c;
         a_base[c]     = nullptr;
         if (col < p.columns) {
-            const int s = p.slot[col / p.width];
+            const int s = lora_slot(p, col / p.width);
             if (s >= 0 && p.a[s] != nullptr) { a_base[c] = p.a[s] + static_cast<std::int64_t>(row0) * p.k; }
         }
     }
@@ -194,7 +205,7 @@ __global__ __launch_bounds__(kLoraThreads) void lora_expand_kernel(const LoraExp
         const int col = col0 + c;
         b_row[c]      = nullptr;
         if (col < p.columns) {
-            const int s = p.slot[col / p.width];
+            const int s = lora_slot(p, col / p.width);
             if (s >= 0 && o.b[s] != nullptr) {
                 b_row[c] = o.b[s] + static_cast<std::int64_t>(n) * o.rank_count;
             }
@@ -270,7 +281,7 @@ __global__ __launch_bounds__(kLoraThreads) void lora_expand_rows_kernel(const Lo
         const int col = col0 + c;
         b_base[c]     = nullptr;
         if (col < p.columns) {
-            const int s = p.slot[col / p.width];
+            const int s = lora_slot(p, col / p.width);
             if (s >= 0 && o.b[s] != nullptr) { b_base[c] = o.b[s]; }
         }
     }

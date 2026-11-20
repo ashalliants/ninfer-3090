@@ -868,6 +868,8 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
 
 const LoraBlock* TextContext::lora_block() const {
     // The scout's int4 layers rank prompt tokens for lossy prefill only; they run unadapted.
+    // A device selection (a decode round's ingress) is not visible here: any() is then true and
+    // each site applies when some loaded adapter adapts it (LoraSite::applies).
     if (parameters_.lora == nullptr || !lora_.any() || !scout_layers_.empty()) { return nullptr; }
     return &parameters_.lora->layers.at(lora_layer_);
 }
