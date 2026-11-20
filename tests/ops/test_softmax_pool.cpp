@@ -161,6 +161,15 @@ int main() {
         test_case("D=100 ratio 4 (a width off the block size)", make_problem(100, 41, 4, 1.0F, 15U, true), stream);
         test_case("D=512 ratio 4, scores far apart", make_problem(512, 64, 4, 40.0F, 16U), stream);
         test_case("D=512 ratio 8, equal scores (a mean)", make_problem(512, 64, 8, 0.0F, 17U), stream);
+        {
+            // Finite BF16 inputs near the format's maximum (3.39e38): a plain sum of weight * value would overflow FP32.
+            Problem p = make_problem(64, 16, 4, 1.0F, 19U);
+            for (std::size_t i = 0; i < p.kv.size(); ++i) { p.kv[i] = t::f32_to_bf16(((i / 64) % 2 == 0 ? 1.0F : -1.0F) * 3.0e38F); }
+            test_case("D=64 ratio 4, kv near the BF16 maximum", p, stream);
+            Problem q = make_problem(64, 16, 4, 0.0F, 20U);
+            for (auto& v : q.kv) { v = t::f32_to_bf16(3.3e38F); }
+            test_case("D=64 ratio 4, equal large kv and equal scores", q, stream);
+        }
         test_case("D=16 ratio 4, 70,000 groups (past grid.y)", make_problem(16, 280000, 4, 1.0F, 18U), stream);
         {
             const Problem p = make_problem(512, 1003, 4, 1.0F, 21U);

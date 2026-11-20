@@ -34,7 +34,8 @@ inline constexpr int kSoftmaxPoolMaxRatio = 256;
  * Numeric:
  *   FP32 arithmetic on the BF16 inputs; one BF16 rounding of the result. Against the FP64 oracle on
  *   the represented inputs: half a BF16 ulp plus FP32 evaluation error (a few ulps of the group's
- *   largest |kv|).
+ *   largest |kv|). The group is pooled as a running convex combination, so finite inputs of any
+ *   magnitude (up to the BF16 maximum) give a finite output.
  *
  * Effects:
  *   Writes out. Inputs are read only; out must not overlap an input.
