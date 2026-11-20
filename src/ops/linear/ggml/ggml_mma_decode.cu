@@ -33,8 +33,13 @@ void ggml_mma_decode_launch(const std::uint8_t* w, const __nv_bfloat16* x, __nv_
                             std::int32_t k, std::int32_t t, bool residual, cudaStream_t stream) {
     if (n % ggml::kMmaRows != 0) { throw std::invalid_argument("ggml mma decode: N must be a multiple of 16"); }
     const bool launched = ggml_mma_try_k<F, 640>(w, x, out, n, k, t, residual, stream) ||
+                          ggml_mma_try_k<F, 1280>(w, x, out, n, k, t, residual, stream) ||
+                          ggml_mma_try_k<F, 2304>(w, x, out, n, k, t, residual, stream) ||
                           ggml_mma_try_k<F, 2560>(w, x, out, n, k, t, residual, stream) ||
-                          ggml_mma_try_k<F, 6144>(w, x, out, n, k, t, residual, stream);
+                          ggml_mma_try_k<F, 4096>(w, x, out, n, k, t, residual, stream) ||
+                          ggml_mma_try_k<F, 5120>(w, x, out, n, k, t, residual, stream) ||
+                          ggml_mma_try_k<F, 6144>(w, x, out, n, k, t, residual, stream) ||
+                          ggml_mma_try_k<F, 8192>(w, x, out, n, k, t, residual, stream);
     if (!launched) { throw std::invalid_argument("ggml mma decode: K has no compiled instance"); }
 }
 

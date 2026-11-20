@@ -35,8 +35,13 @@ void ggml_mmvq_launch(const std::uint8_t* w, const __nv_bfloat16* x, __nv_bfloat
                       std::int32_t n, std::int32_t k, std::int32_t t, bool residual,
                       cudaStream_t stream) {
     const bool launched = ggml_mmvq_try_k<F, 640>(w, x, out, n, k, t, residual, stream) ||
+                          ggml_mmvq_try_k<F, 1280>(w, x, out, n, k, t, residual, stream) ||
+                          ggml_mmvq_try_k<F, 2304>(w, x, out, n, k, t, residual, stream) ||
                           ggml_mmvq_try_k<F, 2560>(w, x, out, n, k, t, residual, stream) ||
-                          ggml_mmvq_try_k<F, 6144>(w, x, out, n, k, t, residual, stream);
+                          ggml_mmvq_try_k<F, 4096>(w, x, out, n, k, t, residual, stream) ||
+                          ggml_mmvq_try_k<F, 5120>(w, x, out, n, k, t, residual, stream) ||
+                          ggml_mmvq_try_k<F, 6144>(w, x, out, n, k, t, residual, stream) ||
+                          ggml_mmvq_try_k<F, 8192>(w, x, out, n, k, t, residual, stream);
     if (!launched) { throw std::invalid_argument("ggml mmvq: K has no compiled instance"); }
 }
 

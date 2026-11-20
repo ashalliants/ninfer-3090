@@ -62,6 +62,10 @@ struct Pack {
     std::vector<Entry> dense;
     std::vector<QType> output;
     std::vector<QType> token_embedding;
+    // Whether the pack's two-projection families, output head and token embedding are served too
+    // (Qwen3.8-Flash-Next's are). DeepSeek-V4's dense Linear problems are registered first; its head
+    // and embedding follow in their own changes.
+    bool complete = true;
 };
 
 // iq3-pack-inventory.md, one row per family.
@@ -123,6 +127,35 @@ const std::vector<Pack> kPacks = {
      {Q6K}},
 };
 
+// DeepSeek-V4.1-Flash, ISTA's IQ2_XXS build (tests/fixtures/dsv4/ista_iq2_xxs_header.json): hidden 5120,
+// every layer's dense tensors in the same format. The compressor, indexer and router weights are BF16
+// and not GGML problems.
+constexpr Family kV4QA{"attn_q_a", 1280, 5120, false};
+constexpr Family kV4KV{"attn_kv", 512, 5120, false};
+constexpr Family kV4QB{"attn_q_b", 32768, 1280, false};
+constexpr Family kV4OutA{"attn_output_a", 8192, 4096, false};
+// One of the eight groups of attn_output_a as its own matrix (a row slice of the tensor), for the
+// grouped projection's per-group calls.
+constexpr Family kV4OutAGroup{"attn_output_a, one group", 1024, 4096, false};
+constexpr Family kV4OutB{"attn_output_b", 5120, 8192, true};
+constexpr Family kV4Gate{"ffn_gate_shexp", 2304, 5120, false};
+constexpr Family kV4Up{"ffn_up_shexp", 2304, 5120, false};
+constexpr Family kV4Down{"ffn_down_shexp", 5120, 2304, true};
+
+const Pack kV4Pack{"DeepSeek-V4.1-Flash IQ2_XXS",
+                   {{&kV4QA, {Q80}},
+                    {&kV4KV, {Q80}},
+                    {&kV4QB, {Q5K}},
+                    {&kV4OutA, {Q5K}},
+                    {&kV4OutAGroup, {Q5K}},
+                    {&kV4OutB, {Q5K}},
+                    {&kV4Gate, {Q5K}},
+                    {&kV4Up, {Q5K}},
+                    {&kV4Down, {Q5K}}},
+                   {},
+                   {},
+                   false};
+
 // The two-projection families the forward runs through one linear_pair at decode width.
 constexpr std::pair<const Family*, const Family*> kPairs[] = {
     {&kGateShexp, &kUpShexp}, {&kAttnK, &kAttnV}, {&kAttnQkv, &kAttnGate}};
@@ -145,7 +178,9 @@ int run() {
         ++failures;
     };
     std::size_t linear = 0, pairs = 0;
-    for (const auto& pack : kPacks) {
+    std::vector<Pack> packs = kPacks;
+    packs.push_back(kV4Pack);
+    for (const auto& pack : packs) {
         for (const auto& entry : pack.dense) {
             const Family& f = *entry.family;
             for (const QType format : entry.formats) {
@@ -156,6 +191,7 @@ int run() {
                 }
             }
         }
+        if (!pack.complete) { continue; }
         for (const auto& [first, second] : kPairs) {
             for (const QType a : formats_of(pack, first)) {
                 for (const QType b : formats_of(pack, second)) {
@@ -184,7 +220,7 @@ int run() {
     // Closed in the other direction: every registered problem is some pack's tensor.
     for (const auto& shape : d::kGgmlLinearShapes) {
         bool used = false, used_add = false;
-        for (const auto& pack : kPacks) {
+        for (const auto& pack : packs) {
             for (const auto& entry : pack.dense) {
                 if (entry.family->n != shape.n || entry.family->k != shape.k) { continue; }
                 for (const QType format : entry.formats) {
@@ -226,7 +262,7 @@ int run() {
     }
     if (failures == 0) {
         std::cout << "GGML registry: " << linear << " (pack, family, format) Linear problems and " << pairs
-                  << " linear_pair format pairs of " << kPacks.size() << " packs registered; "
+                  << " linear_pair format pairs of " << packs.size() << " packs registered; "
                   << std::size(d::kGgmlLinearShapes) << " registered problems, each used\n";
     }
     return failures;

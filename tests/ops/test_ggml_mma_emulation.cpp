@@ -241,8 +241,9 @@ void problem(QType format, std::int32_t n, std::int32_t k, bool residual) {
 }
 
 void emulation_within_fp64() {
-    std::size_t count = 0;
+    std::size_t count = 0, expected = std::size(ops::detail::kGgmlLinearShapes);
     for (const auto& shape : ops::detail::kGgmlLinearShapes) {
+        expected += shape.linear_add ? 1 : 0;
         check(mma::supported(shape.format), std::string("registered format ") + name_of(shape.format) + " has an emulation");
         problem(shape.format, shape.n, shape.k, false);
         ++count;
@@ -251,13 +252,13 @@ void emulation_within_fp64() {
             ++count;
         }
     }
-    check(count == std::size(ops::detail::kGgmlLinearShapes) + 8, "every registered Linear and LinearAdd problem was checked");
+    check(count == expected, "every registered Linear and LinearAdd problem was checked");
 }
 
 // 3. The tile distribution equals the row order, for every T and column position.
 void emulation_column_invariant() {
     for (const QType format : kFormats) {
-        for (const std::int32_t k : {640, 2560, 6144}) {
+        for (const std::int32_t k : {640, 1280, 2304, 2560, 4096, 5120, 6144, 8192}) {
             if (!ops::detail::ggml_k_registered(format, k)) { continue; }
             const std::uint32_t seed = static_cast<std::uint32_t>(k * 17 + static_cast<int>(format));
             const auto blocks = random_blocks(format, static_cast<std::size_t>(mma::kRows) * (k / ggml_block(format).values), seed);

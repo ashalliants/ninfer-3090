@@ -18,8 +18,9 @@ struct GgmlLinearShape {
 };
 
 // Every (format, shape) of the dense tensors of the IQ2_XS, IQ3_S and IQ3_XXS GSQ-RCO packs and of
-// Unsloth's UD-IQ3_XXS (their published tensor allocations and tensor tables;
-// tests/ops/test_ggml_linear_registry.cpp mirrors them).
+// Unsloth's UD-IQ3_XXS (their published tensor allocations and tensor tables), then of ISTA's
+// DeepSeek-V4.1-Flash IQ2_XXS pack (tests/fixtures/dsv4/ista_iq2_xxs_header.json);
+// tests/ops/test_ggml_linear_registry.cpp mirrors them.
 inline constexpr GgmlLinearShape kGgmlLinearShapes[] = {
     // GDN qkv
     {QType::GGML_IQ4_XS, 10240, 2560, false},
@@ -64,7 +65,38 @@ inline constexpr GgmlLinearShape kGgmlLinearShapes[] = {
     {QType::GGML_IQ4_NL, 2560, 640, true},
     {QType::GGML_Q8_0, 2560, 640, true},
     {QType::GGML_Q2_0, 2560, 640, true},
+    // DeepSeek-V4.1-Flash (hidden 5120) in ISTA's IQ2_XXS build: the Q8_0 projections of the
+    // attention's low-rank query (q_a, 5120 -> 1280) and its one shared KV head (5120 -> 512) ...
+    {QType::GGML_Q8_0, 1280, 5120, false},
+    {QType::GGML_Q8_0, 512, 5120, false},
+    // ... and the Q5_K ones: q_b (1280 -> 64 heads x 512), the two stages of the grouped output
+    // projection (a_proj: each of 8 groups takes 4096 values to 1024, as one [8192, 4096] matrix or
+    // one [1024, 4096] slice per group; b_proj 8192 -> 5120), and the shared expert (gate/up
+    // 5120 -> 2304, down 2304 -> 5120).
+    {QType::GGML_Q5_K, 32768, 1280, false},
+    {QType::GGML_Q5_K, 8192, 4096, false},
+    {QType::GGML_Q5_K, 1024, 4096, false},
+    {QType::GGML_Q5_K, 5120, 8192, true},
+    {QType::GGML_Q5_K, 2304, 5120, false},
+    {QType::GGML_Q5_K, 5120, 2304, true},
 };
+
+// The K values the decode kernels (ggml_mmvq_launch, ggml_mma_decode_launch) compile instances for:
+// both chains list exactly these. A registered shape whose K is missing is a compile error here
+// rather than a runtime refusal.
+inline constexpr std::int32_t kGgmlCompiledKs[] = {640, 1280, 2304, 2560, 4096, 5120, 6144, 8192};
+
+[[nodiscard]] constexpr bool ggml_every_registered_k_is_compiled() {
+    for (const auto& shape : kGgmlLinearShapes) {
+        bool found = false;
+        for (const std::int32_t k : kGgmlCompiledKs) { found = found || k == shape.k; }
+        if (!found) { return false; }
+    }
+    return true;
+}
+static_assert(ggml_every_registered_k_is_compiled(),
+              "a registered GGML linear shape has a K with no compiled decode instance: add it to "
+              "kGgmlCompiledKs and to the chains in ggml_instances.cuh and ggml_mma_decode.cu");
 
 // The decode route covers 1 <= T <= this; wider calls take the int8 MMA route.
 inline constexpr std::int32_t kGgmlDecodeMaxTokens = 8;

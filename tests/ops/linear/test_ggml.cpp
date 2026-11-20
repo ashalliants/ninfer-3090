@@ -825,7 +825,7 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            for (const std::int32_t kk : {640, 2560, 6144}) failures += cast_exact(kk, 300);
+            for (const std::int32_t kk : {640, 1280, 2304, 2560, 4096, 5120, 6144, 8192}) failures += cast_exact(kk, 300);
             failures += cast_probe();
         }
         for (const auto& shape : ops::detail::kGgmlLinearShapes) {
