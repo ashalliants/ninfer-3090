@@ -36,6 +36,8 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -344,65 +346,86 @@ struct FlashLaunchConfig {
     int    nsm            = 0;
 };
 
-// One cached config per geometry: the shared-memory and occupancy figures depend
-// only on the tiling, so they are resolved once per instantiation.
+// The shared-memory and occupancy figures for one geometry: they depend only on the tiling and
+// the device. on_device = false is a host-only planning query (no CUDA calls; one block per SM).
 template <typename Geometry>
-const FlashLaunchConfig& flash_launch_config() {
+FlashLaunchConfig make_flash_launch_config(const cudaDeviceProp& prop, bool on_device) {
     using P = VoltaFlashParams<Geometry>;
 
-    static const FlashLaunchConfig config = [] {
-        FlashLaunchConfig c;
+    FlashLaunchConfig c;
+    c.nsm = prop.multiProcessorCount;
 
-        int device = 0;
-        cudaDeviceProp prop{};
-        if (cudaGetDevice(&device) != cudaSuccess ||
-            cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
-            // No device: a host-only planning query (the CPU-labelled graph-profile tests sweep
-            // widths that reach this route). This TU is built for sm_70 only; plan for a V100.
-            (void)cudaGetLastError();
-            prop.major               = 7;
-            prop.minor               = 0;
-            prop.multiProcessorCount = 80;
-        }
-        c.nsm = prop.multiProcessorCount;
+    const int cc = prop.major * 100 + prop.minor * 10;
 
-        const int cc = prop.major * 100 + prop.minor * 10;
+    const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (kDKQ, kDV, P::kNcols, cc);
+    const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (kDKQ, kDV, P::kNcols, cc);
+    const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(kDKQ, kDV, P::kNcols, cc);
+    const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (kDKQ, kDV, P::kNcols, cc);
+    const int  nstages        = ggml_cuda_fattn_mma_get_nstages       (kDKQ, kDV, P::kNcols1, P::kNcols2, cc);
 
-        const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (kDKQ, kDV, P::kNcols, cc);
-        const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (kDKQ, kDV, P::kNcols, cc);
-        const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(kDKQ, kDV, P::kNcols, cc);
-        const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (kDKQ, kDV, P::kNcols, cc);
-        const int  nstages        = ggml_cuda_fattn_mma_get_nstages       (kDKQ, kDV, P::kNcols1, P::kNcols2, cc);
+    c.nthreads  = ggml_cuda_fattn_mma_get_nthreads (kDKQ, kDV, P::kNcols, cc);
+    c.nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(kDKQ, kDV, P::kNcols, cc);
+    c.nwarps    = c.nthreads / WARP_SIZE;
 
-        c.nthreads  = ggml_cuda_fattn_mma_get_nthreads (kDKQ, kDV, P::kNcols, cc);
-        c.nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(kDKQ, kDV, P::kNcols, cc);
-        c.nwarps    = c.nthreads / WARP_SIZE;
+    const int cols_per_warp = std::min(P::kNcols, get_cols_per_warp(cc));
 
-        const int cols_per_warp = std::min(P::kNcols, get_cols_per_warp(cc));
+    const size_t shared_KV_1stage = size_t(c.nbatch_fa) * std::max(nbatch_K2 + 4, nbatch_V2 + 4) * sizeof(half2);
+    const size_t shared_KV_2stage = size_t(c.nbatch_fa) *         (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);
+    const size_t shared_Q         = size_t(P::kNcols)      * (kDKQ/2 + 4)                            * sizeof(half2);
+    const size_t shared_mask      = size_t(P::kNcols1)     * (c.nbatch_fa/2 + 4)                     * sizeof(half2);
+    const size_t shared_combine   = size_t(c.nwarps)*cols_per_warp * (nbatch_combine + 4)         * sizeof(half2);
+    const size_t shared_KV        = nstages <= 1 ? shared_KV_1stage : shared_KV_2stage;
 
-        const size_t shared_KV_1stage = size_t(c.nbatch_fa) * std::max(nbatch_K2 + 4, nbatch_V2 + 4) * sizeof(half2);
-        const size_t shared_KV_2stage = size_t(c.nbatch_fa) *         (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);
-        const size_t shared_Q         = size_t(P::kNcols)      * (kDKQ/2 + 4)                            * sizeof(half2);
-        const size_t shared_mask      = size_t(P::kNcols1)     * (c.nbatch_fa/2 + 4)                     * sizeof(half2);
-        const size_t shared_combine   = size_t(c.nwarps)*cols_per_warp * (nbatch_combine + 4)         * sizeof(half2);
-        const size_t shared_KV        = nstages <= 1 ? shared_KV_1stage : shared_KV_2stage;
+    c.nbytes_shared = std::max(shared_combine, Q_in_reg
+        ? std::max(shared_Q, shared_KV + shared_mask)
+        :          shared_Q + shared_KV + shared_mask);
 
-        c.nbytes_shared = std::max(shared_combine, Q_in_reg
-            ? std::max(shared_Q, shared_KV + shared_mask)
-            :          shared_Q + shared_KV + shared_mask);
-
+    c.blocks_per_sm = 1;
+    if (on_device) {
         auto kernel = flash_attn_ext_f16<kDKQ, kDV, P::kNcols1, P::kNcols2, false, false>;
         cudaFuncSetAttribute(reinterpret_cast<const void *>(kernel),
                              cudaFuncAttributeMaxDynamicSharedMemorySize, c.nbytes_shared);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &c.blocks_per_sm, reinterpret_cast<const void *>(kernel), c.nthreads, c.nbytes_shared);
         if (c.blocks_per_sm <= 0) {
-            (void)cudaGetLastError(); // the host-only case above: no attribute or occupancy query
+            (void)cudaGetLastError();
             c.blocks_per_sm = 1;
         }
-        return c;
+    }
+    return c;
+}
+
+// One config per geometry, cached once a device answers. Without one (a host-only planning query:
+// the CPU-labelled graph-profile tests sweep widths that reach this route) a V100 plan is returned
+// from a separate cache, and the device query is retried on the next call, so a process that plans
+// before it has a device still sets the kernel's shared-memory limit and occupancy on the device.
+template <typename Geometry>
+const FlashLaunchConfig& flash_launch_config() {
+    static std::atomic<bool> device_ready{false};
+    static FlashLaunchConfig device_config;
+    if (device_ready.load(std::memory_order_acquire)) return device_config;
+
+    static std::mutex init_mutex;
+    std::lock_guard<std::mutex> lock(init_mutex);
+    if (device_ready.load(std::memory_order_relaxed)) return device_config;
+
+    int device = 0;
+    cudaDeviceProp prop{};
+    if (cudaGetDevice(&device) == cudaSuccess && cudaGetDeviceProperties(&prop, device) == cudaSuccess) {
+        device_config = make_flash_launch_config<Geometry>(prop, true);
+        device_ready.store(true, std::memory_order_release);
+        return device_config;
+    }
+    (void)cudaGetLastError();
+    // This TU is built for sm_70 only; plan for a V100.
+    static const FlashLaunchConfig host_plan = [] {
+        cudaDeviceProp v100{};
+        v100.major               = 7;
+        v100.minor               = 0;
+        v100.multiProcessorCount = 80;
+        return make_flash_launch_config<Geometry>(v100, false);
     }();
-    return config;
+    return host_plan;
 }
 
 // One Q-block through the vendored kernel plus its stream-K fixup.
