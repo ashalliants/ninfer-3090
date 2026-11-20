@@ -270,4 +270,73 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
     linear_swiglu(x, gate_up_weight, out, LinearPolicy::A16Only, ws, stream);
 }
 
+namespace {
+
+// The routes linear_swiglu takes that can hand out the gate/up plane: the cuBLAS prefill route
+// for a Q4 or Q5 row-split weight, admitted exactly as linear_swiglu admits it.
+bool plane_takes_cublas(const Weight& w, LinearPolicy policy, std::int32_t t,
+                        const WorkspaceArena* ws) {
+    return allows_cublas_prefill(policy) && t >= cublas_prefill_min_tokens(policy) &&
+           w.qtype == QType::Q4_G64_FP16 && detail::w4_cublas_prefill_supported(w, t) &&
+           (t >= kCublasPrefillMinTokens || ws == nullptr ||
+            detail::w4_cublas_prefill_fits(*ws, w.n, w.k, t));
+}
+
+} // namespace
+
+std::size_t linear_swiglu_plane_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
+                                                         std::int32_t input_rows,
+                                                         LinearPolicy policy,
+                                                         std::int32_t min_tokens,
+                                                         std::int32_t max_tokens) {
+    validate_policy(policy);
+    if (min_tokens <= 0 || max_tokens < min_tokens || (gate_up_rows % 2) != 0) {
+        throw std::invalid_argument("linear_swiglu_plane workspace: invalid profile or token interval");
+    }
+    const std::size_t linear_bytes = linear_workspace_capacity_bytes(
+        qtype, gate_up_rows, input_rows, policy, min_tokens, max_tokens);
+    if (qtype == QType::Q4_G64_FP16 && allows_cublas_prefill(policy) &&
+        max_tokens >= cublas_prefill_min_tokens(policy)) {
+        return std::max(linear_bytes,
+                        detail::w4_cublas_prefill_workspace_capacity_bytes(
+                            gate_up_rows, input_rows,
+                            std::max(min_tokens, cublas_prefill_min_tokens(policy)), max_tokens));
+    }
+    return linear_bytes;
+}
+
+void linear_swiglu_plane(const Tensor& x, const Weight& gate_up_weight, Tensor& plane,
+                         LinearPolicy policy, WorkspaceArena& ws, cudaStream_t stream) {
+    validate_policy(policy);
+    const std::int32_t t = x.ne[1];
+    if (x.dtype != DType::BF16 || plane.dtype != DType::BF16 || plane.ne[0] != gate_up_weight.n ||
+        plane.ne[1] != t || !x.is_contiguous() || !plane.is_contiguous()) {
+        throw std::invalid_argument("linear_swiglu_plane: x/plane must be contiguous BF16 [*, T]");
+    }
+    if (plane_takes_cublas(gate_up_weight, policy, t, &ws)) {
+        const detail::CublasProjectionDestination destination{
+            plane.data, 0, gate_up_weight.n, gate_up_weight.n, 0};
+        const detail::CublasProjection parent{&gate_up_weight, &destination, 1};
+        detail::w4_cublas_projection_launch(x, &parent, 1, ws, stream);
+        return;
+    }
+    if (gate_up_weight.qtype == QType::Q4_G64_FP16 && x.ne[0] == 5120 &&
+        gate_up_weight.n == 34816 && gate_up_weight.k == 5120 &&
+        gate_up_weight.padded_shape[0] == 34816 && gate_up_weight.padded_shape[1] == 5120 &&
+        gate_up_weight.layout == QuantLayout::RowSplit && gate_up_weight.group == 64 &&
+        gate_up_weight.scale_dtype == DType::FP16 && aligned_to(x.data, 16) &&
+        aligned_to(gate_up_weight.qdata, 16) && aligned_to(gate_up_weight.scales, 4)) {
+#if defined(NINFER_SM70)
+        // linear_swiglu's sm_70 route for 1..64 tokens (q4_linear_swiglu_execute_schedule).
+        if (!(policy == LinearPolicy::AllowA8IntDecode &&
+              detail::q4_linear_swiglu_small_t_i8_supported(t)) &&
+            !(allows_a8_int(policy) && detail::q4a8_swiglu_supported(gate_up_weight, t)) &&
+            detail::q4_linear_swiglu_try_stream_plane(x, gate_up_weight, plane, stream)) {
+            return;
+        }
+#endif
+    }
+    linear(x, gate_up_weight, plane, policy, ws, stream);
+}
+
 } // namespace ninfer::ops

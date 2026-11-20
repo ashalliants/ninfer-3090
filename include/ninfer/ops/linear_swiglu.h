@@ -84,4 +84,27 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
                    cudaStream_t stream);
 
+/**
+ * Op: linear_swiglu_plane (the gate/up projection linear_swiglu fuses, without the SwiGLU)
+ *
+ * Math: plane[i, t] = sum_k W[i, k] * x[k, t] for every gate_up row i, i.e. ops::linear into the
+ * whole [gate; up] plane. A caller that has to change the pre-activation (a LoRA update of the
+ * gate and up halves) runs this, then silu_mul over the two halves.
+ *
+ * Route: the one linear_swiglu takes for the same policy and width wherever that route can hand
+ * out its pre-activation -- the cuBLAS prefill route (one GEMM, a store epilogue) and sm_70's
+ * streaming GEMV (the same kernel and accumulation order, a plane sink) -- so the plane is the
+ * values the fused route combines, each rounded once to BF16. Everywhere else it is ops::linear.
+ * Shapes, dtypes and alignment as linear_swiglu, with plane BF16 [gate_up_rows, T] contiguous.
+ *
+ * Workspace: linear_swiglu_plane_workspace_capacity_bytes over the call's width.
+ */
+void linear_swiglu_plane(const Tensor& x, const Weight& gate_up_weight, Tensor& plane,
+                         LinearPolicy policy, WorkspaceArena& ws, cudaStream_t stream);
+
+[[nodiscard]] std::size_t
+linear_swiglu_plane_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
+                                             std::int32_t input_rows, LinearPolicy policy,
+                                             std::int32_t min_tokens, std::int32_t max_tokens);
+
 } // namespace ninfer::ops

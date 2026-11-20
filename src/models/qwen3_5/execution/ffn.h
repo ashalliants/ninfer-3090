@@ -29,7 +29,7 @@ struct LoraParameters;
                                                    std::int32_t last, bool prefill);
 void lora_ffn(const Tensor& hidden, const DenseParameters& parameters, const LoraBlock& lora,
               const ops::LoraColumns& columns, Tensor& residual, WorkspaceArena& workspace,
-              cudaStream_t stream, InputBasis basis, bool prefill);
+              cudaStream_t stream, InputBasis basis, bool verify, bool prefill);
 
 // The sign vector of a rotated Dense FFN's input projection, or null.
 [[nodiscard]] const Tensor* ffn_input_signs(const FfnParameters& parameters);

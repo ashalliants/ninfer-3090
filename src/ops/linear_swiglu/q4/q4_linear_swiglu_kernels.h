@@ -42,6 +42,11 @@ void q4_linear_swiglu_small_t_tiled_masked_launch(const Tensor& x, const Weight&
 // (ops/linear/common/stream_gemv.cuh); false, with nothing launched, where it does not apply.
 [[nodiscard]] bool q4_linear_swiglu_try_stream(const Tensor& x, const Weight& w, Tensor& out,
                                                cudaStream_t stream);
+// The same streaming GEMV writing the gate/up plane [34816, T] instead of SwiGLU of it: the values
+// the fused route combines, each rounded once to BF16. False, with nothing launched, where the
+// streaming GEMV does not apply.
+[[nodiscard]] bool q4_linear_swiglu_try_stream_plane(const Tensor& x, const Weight& w,
+                                                     Tensor& plane, cudaStream_t stream);
 [[nodiscard]] std::size_t q4_linear_swiglu_small_t_tiled_i8_workspace_bytes(std::int32_t tokens);
 void q4_linear_swiglu_small_t_tiled_i8_launch(const Tensor& x, const Weight& w, Tensor& out,
                                               WorkspaceArena& workspace, cudaStream_t stream);

@@ -69,6 +69,17 @@ void rotated_dense_ffn(const Tensor& hidden, const DenseParameters& p, Tensor& r
     ops::linear_add(activation, p.down.weight, residual, policy(p.down.policy), workspace, stream);
 }
 
+// The gate/up policy of the base route lora_ffn stands in for: ffn()'s linear_swiglu policy on an
+// ordinary model, rotated_dense_ffn()'s linear policy on a rotated one.
+ops::LinearPolicy lora_gate_up_policy(const DenseParameters& p, bool verify, bool prefill) {
+    if (rotated_dense(p)) {
+        return prefill ? ops::prefill_phase_policy(p.gate_up.policy) : p.gate_up.policy;
+    }
+    return verify    ? p.verify_gate_up_policy
+           : prefill ? ops::prefill_phase_policy(p.gate_up.policy)
+                     : p.gate_up.policy;
+}
+
 } // namespace
 
 std::size_t lora_ffn_workspace_bytes(const DenseParameters& p, const LoraParameters& lora,
@@ -85,8 +96,17 @@ std::size_t lora_ffn_workspace_bytes(const DenseParameters& p, const LoraParamet
         if (rotated(p.gate_up.hadamard_signs)) { (void)layout.alloc(DType::BF16, {gu.k, last}); }
         {
             auto call = layout.scope();
-            (void)layout.alloc_bytes(ops::linear_workspace_capacity_bytes(
-                gu.qtype, gu.n, gu.k, policy(p.gate_up.policy), first, last));
+            // Either phase's gate/up policy (decode and verify share a plan, so both are covered).
+            std::size_t bytes = 0;
+            for (const bool verify : {false, true}) {
+                const ops::LinearPolicy own = lora_gate_up_policy(p, verify && !prefill, prefill);
+                bytes = std::max(bytes, rotated_dense(p)
+                                            ? ops::linear_workspace_capacity_bytes(
+                                                  gu.qtype, gu.n, gu.k, own, first, last)
+                                            : ops::linear_swiglu_plane_workspace_capacity_bytes(
+                                                  gu.qtype, gu.n, gu.k, own, first, last));
+            }
+            (void)layout.alloc_bytes(bytes);
         }
         (void)layout.alloc_bytes(ops::lora_workspace_bytes(2 * lora.rank, gu.k, last));
     }
@@ -102,7 +122,7 @@ std::size_t lora_ffn_workspace_bytes(const DenseParameters& p, const LoraParamet
 
 void lora_ffn(const Tensor& hidden, const DenseParameters& p, const LoraBlock& lora,
               const ops::LoraColumns& columns, Tensor& residual, WorkspaceArena& workspace,
-              cudaStream_t stream, InputBasis basis, bool prefill) {
+              cudaStream_t stream, InputBasis basis, bool verify, bool prefill) {
     const auto policy = [&](ops::LinearPolicy own) {
         return prefill ? ops::prefill_phase_policy(own) : own;
     };
@@ -115,8 +135,16 @@ void lora_ffn(const Tensor& hidden, const DenseParameters& p, const LoraBlock& l
         auto call      = workspace.scope();
         const Tensor x = rotated_input(hidden, p.gate_up.hadamard_signs, workspace, stream, basis);
         {
-            auto linear_scope = workspace.scope();
-            ops::linear(x, gu, plane, policy(p.gate_up.policy), workspace, stream);
+            // The base route's projection: an ordinary model's fused linear_swiglu runs its own
+            // routes (sm_70's streaming GEMV, the cuBLAS prefill GEMM), and linear_swiglu_plane
+            // takes the same ones up to the plane; a rotated model's base route is ops::linear.
+            auto linear_scope               = workspace.scope();
+            const ops::LinearPolicy own     = lora_gate_up_policy(p, verify, prefill);
+            if (rotated_dense(p)) {
+                ops::linear(x, gu, plane, own, workspace, stream);
+            } else {
+                ops::linear_swiglu_plane(x, gu, plane, own, workspace, stream);
+            }
         }
         std::array<Tensor, 2> halves{plane.slice(0, 0, intermediate),
                                      plane.slice(0, intermediate, intermediate)};

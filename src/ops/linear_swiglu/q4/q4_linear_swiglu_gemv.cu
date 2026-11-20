@@ -367,7 +367,41 @@ bool try_launch_swiglu_stream(const Tensor& x, const Weight& w, Tensor& out, cud
                                                             stream, x.ne[1]);
 }
 
+// The same pairs with the pre-activation kept: gate row r to plane row r, up row r + kIntermediate
+// to plane row r + kIntermediate, each rounded once to BF16. The accumulation is the fused sink's
+// (the same kernel and item order), so plane[r] and plane[r + kIntermediate] are exactly the gate
+// and up values Q4SwiGluStreamSink combines.
+struct Q4GateUpPlaneStreamSink {
+    __nv_bfloat16* plane;
+    std::int64_t plane_stride;
+
+    template <int Cols>
+    __device__ __forceinline__ void finish(int row, const float (&acc)[2][Cols]) const {
+#pragma unroll
+        for (int t = 0; t < Cols; ++t) {
+            plane[t * plane_stride + row]                 = __float2bfloat16(acc[0][t]);
+            plane[t * plane_stride + row + kIntermediate] = __float2bfloat16(acc[1][t]);
+        }
+    }
+    Q4GateUpPlaneStreamSink with_token_offset(std::int32_t begin) const {
+        return {plane + begin * plane_stride, plane_stride};
+    }
+};
+
 } // namespace
+
+bool q4_linear_swiglu_try_stream_plane(const Tensor& x, const Weight& w, Tensor& plane,
+                                       cudaStream_t stream) {
+    if (w.n != kN || w.k != kK || w.padded_shape[1] != kK || plane.ne[0] != kN) { return false; }
+    const std::int64_t x_stride     = x.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
+    const std::int64_t plane_stride = plane.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
+    const Q4StreamFormat::Planes planes{static_cast<const std::uint8_t*>(w.qdata),
+                                        static_cast<const std::uint8_t*>(w.scales)};
+    const Q4GateUpPlaneStreamSink sink{static_cast<__nv_bfloat16*>(plane.data), plane_stride};
+    return try_launch_stream_gemv_passes<Q4StreamFormat, 2>(
+        static_cast<const __nv_bfloat16*>(x.data), x_stride, planes, sink, kIntermediate,
+        kIntermediate, kK, kK, stream, x.ne[1]);
+}
 
 bool q4_linear_swiglu_try_stream(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream) {

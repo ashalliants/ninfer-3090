@@ -1209,7 +1209,8 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase phas
             } else {
                 ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
             }
-            lora_ffn(h, dense, *lora, columns, x, work_, ctx_.stream, basis, phase == Phase::Prefill);
+            lora_ffn(h, dense, *lora, columns, x, work_, ctx_.stream, basis, phase == Phase::Verify,
+                     phase == Phase::Prefill);
             return;
         }
     }
