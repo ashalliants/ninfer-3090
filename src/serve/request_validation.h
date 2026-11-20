@@ -45,4 +45,15 @@ std::optional<double> parse_relaxed_drafting_field(const RequestJson& body);
 
 [[nodiscard]] bool valid_tool_name(std::string_view name, std::size_t maximum_length) noexcept;
 
+// The longest tool or namespace name a client may declare. Clients such as Codex build names out of
+// MCP server and tool names, so they use dots, colons and long prefixes the Engine cannot carry.
+inline constexpr std::size_t kMaxClientToolNameBytes = 512;
+
+// Maps a client's tool name to one the Engine accepts, [A-Za-z0-9_-]{1,64}. A name that already
+// fits is returned unchanged. Otherwise bytes outside the set become '_', the result is cut to
+// leave room for '_' plus an 8-digit hash of the original, and the hash is appended, so two
+// different originals do not share an Engine name. Deterministic: history replays and later
+// requests produce the same name. The caller keeps the original to restore on the wire.
+[[nodiscard]] std::string engine_tool_name(std::string_view client_name);
+
 } // namespace ninfer::serve
