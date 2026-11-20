@@ -7,6 +7,7 @@
 #include <cmath>
 #include <limits>
 #include <string>
+#include <utility>
 
 namespace ninfer::models::dsv4 {
 namespace {
@@ -109,6 +110,16 @@ TextConfig text(const Json& value) {
     const auto& clamp_e = value.at("swiglu_clamp_experts");
     const auto& clamp_s = value.at("swiglu_clamp_shared");
     const std::size_t n = out.num_hidden_layers;
+    for (const auto& [name, ids] : {std::pair<const char*, const std::vector<std::uint32_t>*>{"kv_source_layers", &kv_src},
+                                    {"indexer_source_layers", &idx_src},
+                                    {"engram_layers", &engram}}) {
+        for (std::size_t a = 0; a < ids->size(); ++a) {
+            if ((*ids)[a] >= n) { throw ArtifactError(std::string(name) + " names a layer past the last one"); }
+            for (std::size_t b = 0; b < a; ++b) {
+                if ((*ids)[a] == (*ids)[b]) { throw ArtifactError(std::string(name) + " lists a layer twice"); }
+            }
+        }
+    }
     if (ratios.size() != n || clamp_e.size() != n || clamp_s.size() != n) {
         throw ArtifactError("per-layer lists must cover every layer");
     }

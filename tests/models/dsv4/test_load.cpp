@@ -126,6 +126,12 @@ void check_refusals() {
     auto no_ratio = base;
     no_ratio["indexer_source_layers"] = {0};
     refuses(no_ratio, "an index source without a compress ratio");
+    auto out_of_range = base;
+    out_of_range["kv_source_layers"] = {2, 8, 14, 20, 40};
+    refuses(out_of_range, "a kv source past the last layer");
+    auto repeated = base;
+    repeated["indexer_source_layers"] = {2, 2, 8, 14, 20};
+    refuses(repeated, "a repeated index source");
     auto hash_heads = base;
     hash_heads["engram_head_vocab_sizes"].erase(hash_heads["engram_head_vocab_sizes"].end() - 1);
     refuses(hash_heads, "missing Engram heads");
