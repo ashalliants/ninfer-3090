@@ -608,6 +608,38 @@ expert's carve. The static workspace is not grown, so decode keeps its expert fr
 (a prompt or tail under 512 tokens) takes the route when its arena has room and otherwise keeps
 the default kernels, which the server reports once on stderr.
 
+### Vision attention
+
+The vision tower's attention (27 blocks, 16 heads of size 72, full attention within each image)
+ran `packed_attention_flash_kernel`, BF16 `mma.sync` and `ldmatrix` on the emulation: 0.51 s of a
+1-megapixel image and 7.6 s of a 4-megapixel one (283 ms a block), growing with the square of the
+patch count. On sm_70 the equal-length form of `packed_softmax_attention` with a workspace (the one
+`vision.cpp` calls) now runs the vendored llama.cpp FP16 flash kernel instead
+(`ops/launcher/packed_attention_volta_flash.cu`):
+
+- head size 72 is zero-padded to 80, the nearest instantiated size (exact);
+- Q, K and V are staged unscaled (BF16 converts to FP16 exactly) and the 1/sqrt(72) scale is
+  applied to the FP32 Q.K sums. The kernel's own `scale` rounds Q x scale to FP16, which moved
+  outputs of sharp attention rows by up to 3%. A small ninfer patch in the vendored kernel makes a
+  nonzero `logit_softcap` without `use_logit_softcap` an FP32 KQ scale; the text route passes 0;
+- P x V accumulates in FP16 on Volta, so a segment longer than 1,024 keys is split along the keys
+  across CTAs and merged in FP32 by the stream-K fixup: over a 16K-patch image the relative L2
+  error is 1.9e-3 (1.8e-3 for the BF16 kernel, 4.3e-3 unsplit);
+- a Q, K or V value past FP16's range sets a device flag, and the BF16 kernel then reruns the call
+  (it is always launched and returns at once unless the flag is set);
+- the staging (FP32 Q and output, FP16 K and V, the split partials) goes through heads in passes of
+  at most 64 MiB and comes from the QKV projection's scratch, which the vision workspace plan sizes
+  for it.
+
+`ninfer_packed_softmax_attention_bench`, one segment (BF16 kernel -> FP16 flash): 1,024 patches
+1.55 -> 0.36 ms, 4,096 patches 19.5 -> 4.3 ms, 16,384 patches 283 -> 58 ms. Prompt time of an image
+request (encode and prefill, thinking off):
+
+| | 1 MP (1,051 tokens) | 4 MP (4,123 tokens) |
+|---|---|---|
+| Qwen3.8-27B | 2.40 -> 2.01 s | 14.46 -> 8.40 s |
+| Flash-Next | 3.42 -> 3.14 s | 12.79 -> 6.67 s |
+
 ### The routed experts' wide gate/up
 
 `wide_gate_up_kernel` (the wide route, one CTA per 32 intermediates and job) stays on dp4a: each

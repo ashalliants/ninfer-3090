@@ -106,8 +106,10 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void packed_attention_flash_kerne
     std::int32_t tokens, std::int32_t uniform_segment_length, __nv_bfloat16* __restrict__ out,
     std::int64_t q_stride_d, std::int64_t q_stride_h, std::int64_t q_stride_t,
     std::int64_t k_stride_d, std::int64_t k_stride_h, std::int64_t k_stride_t,
-    std::int64_t v_stride_d, std::int64_t v_stride_h, std::int64_t v_stride_t) {
+    std::int64_t v_stride_d, std::int64_t v_stride_h, std::int64_t v_stride_t,
+    const int* __restrict__ run_if) {
     static_assert(Br == 16 || Br == 32 || Br == 64);
+    if (run_if != nullptr && *run_if == 0) { return; }
     static_assert(Bc == 16 || Bc == 32 || Bc == 64);
     constexpr int D             = kPackedAttentionHeadDim;
     constexpr int Dp            = kPackedAttentionPaddedD;

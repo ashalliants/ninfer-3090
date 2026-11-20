@@ -120,6 +120,21 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               std::int32_t segment_length, Tensor& out, cudaStream_t stream);
 
 /**
+ * Equal-length form with a workspace. Same contract as the form above; on sm_70 it runs an FP16
+ * flash-attention route whose staging comes from workspace (at most
+ * packed_softmax_attention_uniform_workspace_capacity_bytes(geometry, T) bytes); elsewhere it uses
+ * no workspace.
+ */
+void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                              AttentionHeadGeometry geometry, float scale,
+                              std::int32_t segment_length, WorkspaceArena& workspace, Tensor& out,
+                              cudaStream_t stream);
+
+/** Workspace the equal-length workspace form needs for any T in [1, max_tokens]. */
+[[nodiscard]] std::size_t packed_softmax_attention_uniform_workspace_capacity_bytes(
+    AttentionHeadGeometry geometry, std::int32_t max_tokens);
+
+/**
  * Return caller-owned transient capacity for every legal (T,S) pair in the inclusive envelope.
  * A pair is legal when 1 <= S <= T. An envelope with no legal pair throws; a legal single-segment
  * envelope may return zero.
