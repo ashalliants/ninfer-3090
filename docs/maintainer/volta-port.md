@@ -604,6 +604,21 @@ under a per-tile power of two). `ninfer_qsa_test` with the variable set: relativ
 cases do not take it). The 12 attention calls of the 3,935-token prompt: 715 -> 172 ms; the prompt
 6.40 -> 5.97 s (6.90 s with the variable unset).
 
+The route's side passes are bandwidth-bound passes over the activations and the FP32 product.
+`tokens_to_f16` reads 16 bytes at a time and keeps up to 64 values per thread in registers between
+the absmax and the conversion. `finish` runs a 2D grid (four rows of one token per thread, `float4`
+loads), where it used to do a 64-bit divide and modulo per element. Both do the same arithmetic as
+before, so outputs are bit-identical (Flash-Next greedy text and vision outputs unchanged). Over four
+5,230-token prompts (nsys), they take 802 -> 696 ms and 859 -> 749 ms, and the prompt time goes
+5,131 -> 5,061 ms (-1.4%). Removing the passes would take an epilogue fused into the GEMM, which
+cuBLAS does not offer for FP16 in and BF16 out with per-row and per-token scales.
+
+The BF16 sliced-K kernel (`bf16_a16_sliced_k_mma.cuh`) takes the same sm_70 FFMA branch as the
+tile kernels (`bf16_mma_common.cuh`): each lane reads its own fragment rows and tokens and runs the
+emulated m16n8k16's FMAs in its order, so it too is bit-identical. Flash-Next's row-tail
+instance goes 392 -> 254 us per call, the others 47 -> 41 and 74 -> 52 us; this is a few ms per
+request.
+
 Every staging buffer, cuBLAS's workspace included (set per call), comes from the call's
 `WorkspaceArena`, so the shared expert's side stream and the device stream never share scratch.
 `linear_workspace_capacity_bytes` (BF16) and the GGML capacity queries include
