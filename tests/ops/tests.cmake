@@ -153,6 +153,10 @@ ninfer_add_op_test(ninfer_moe_mix_test
 ninfer_add_op_test(ninfer_dsv4_ffn_layer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dsv4_ffn_layer.cpp"
   LIBRARIES ninfer_ops)
+# One real DeepSeek-V4.1-Flash attention layer through the Ops against the NumPy oracle (needs NINFER_DSV4_LAYER_FIXTURE).
+ninfer_add_op_test(ninfer_dsv4_attention_layer_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dsv4_attention_layer.cpp"
+  LIBRARIES ninfer_ops)
 # Host-only: the int8 hyper-connection codec (--hc-int8): the group rule the quantize kernel runs,
 # against exact FP64 checks and an independent re-implementation of Basalt's rule.
 ninfer_add_op_test(ninfer_hc_int8_codec_test

@@ -106,8 +106,8 @@ def rms_norm(x: np.ndarray, weight: np.ndarray, eps: float) -> np.ndarray:
     return (weight * (x / np.sqrt(var + eps))).astype(np.float32)
 
 
-def rope_freqs(dim: int, seqlen: int, original_seq_len: int, base: float, factor: float, beta_fast: float, beta_slow: float) -> np.ndarray:
-    """Complex rotations [seqlen, dim/2]. With original_seq_len > 0, YaRN: dimensions whose wavelength fits the
+def rope_inv_freqs(dim: int, original_seq_len: int, base: float, factor: float, beta_fast: float, beta_slow: float) -> np.ndarray:
+    """The per-pair frequencies [dim/2] (FP32). With original_seq_len > 0, YaRN: dimensions whose wavelength fits the
     training context keep their frequency, far longer ones are divided by `factor`, a linear ramp between."""
     freqs = 1.0 / (base ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
     if original_seq_len > 0:
@@ -119,7 +119,13 @@ def rope_freqs(dim: int, seqlen: int, original_seq_len: int, base: float, factor
         ramp = np.clip((np.arange(dim // 2, dtype=np.float32) - low) / max(high - low, 1e-3), 0, 1)
         smooth = 1 - ramp
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
-    angles = np.outer(np.arange(seqlen, dtype=np.float32), freqs.astype(np.float32))
+    return freqs.astype(np.float32)
+
+
+def rope_freqs(dim: int, seqlen: int, original_seq_len: int, base: float, factor: float, beta_fast: float, beta_slow: float) -> np.ndarray:
+    """Complex rotations [seqlen, dim/2] by position * rope_inv_freqs."""
+    freqs = rope_inv_freqs(dim, original_seq_len, base, factor, beta_fast, beta_slow)
+    angles = np.outer(np.arange(seqlen, dtype=np.float32), freqs)
     return (np.cos(angles) + 1j * np.sin(angles)).astype(np.complex64)
 
 
