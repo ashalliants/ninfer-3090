@@ -213,6 +213,9 @@ struct GenerationRequest {
     // NInfer extension: name of a phantom-kv graft loaded with --graft. Unset => use the server's
     // --default-graft (if any); an empty name explicitly selects no graft.
     std::optional<std::string> graft;
+    // NInfer extension: name of a LoRA adapter loaded with --lora. Unset => the server's
+    // --default-lora (if any); an empty name explicitly selects the base model.
+    std::optional<std::string> lora;
     ninfer::PromptContinuationMode continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
     bool private_cache_boundary_at_prompt_end   = false;
     bool allow_engine_automatic_shared_prefixes = true;

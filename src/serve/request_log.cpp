@@ -849,7 +849,9 @@ std::string format_server_start_json(
               options.preserve_thinking ? Json(*options.preserve_thinking) : Json(nullptr)},
              {"tolerant_tool_calls", options.tolerant_tool_calls},
              {"default_graft",
-              options.default_graft.empty() ? Json(nullptr) : Json(options.default_graft)}};
+              options.default_graft.empty() ? Json(nullptr) : Json(options.default_graft)},
+             {"default_lora",
+              options.default_lora.empty() ? Json(nullptr) : Json(options.default_lora)}};
     record["artifact"]                             = Json{{"path", options.artifact_path},
                                                           {"size_bytes", std::move(artifact_size)},
                                                           {"architecture", load.architecture},

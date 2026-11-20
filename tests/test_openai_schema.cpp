@@ -1691,11 +1691,27 @@ int test_graft_extension() {
     return failures;
 }
 
+int test_lora_extension() {
+    Json body    = base_request();
+    int failures = check(!parse(body).generation.lora, "absent lora was not left unset");
+    body["lora"] = nullptr;
+    failures += check(!parse(body).generation.lora, "null lora was not left unset");
+    body["lora"] = "";
+    failures += check(parse(body).generation.lora == "", "empty lora did not select the base model");
+    body["lora"] = "pi";
+    failures += check(parse(body).generation.lora == "pi", "lora name was not parsed");
+    body["lora"] = 5;
+    failures += check(api_error([&] { (void)parse(body); }).param == "lora",
+                      "non-string lora was accepted");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
     failures += test_graft_extension();
+    failures += test_lora_extension();
     failures += test_thinking_budget_extension();
     failures += test_relaxed_drafting_extension();
     failures += test_request_envelope_and_sampling();

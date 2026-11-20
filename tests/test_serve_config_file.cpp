@@ -7,7 +7,7 @@
 //   - config_refuses_shapes: config inside a config, a nested object, a null, leading dashes, an
 //     empty key, an array of objects, an array for an option that keeps its last value, a file
 //     that is not an object, invalid JSON and a missing file are refused, each naming the file;
-//   - repeatable_options: --graft, --allowed-host and --context-store-peer collect, others not.
+//   - repeatable_options: --graft, --lora, --allowed-host and --context-store-peer collect, others not.
 
 #include "serve/serve_config_file.h"
 
@@ -123,10 +123,10 @@ void config_refuses_shapes() {
 }
 
 void repeatable_options() {
-    for (const char* key : {"graft", "allowed-host", "context-store-peer"}) {
+    for (const char* key : {"graft", "lora", "allowed-host", "context-store-peer"}) {
         check(repeatable_serve_option(key), std::string(key) + " is not repeatable");
     }
-    for (const char* key : {"port", "default-graft", "context-store", "--graft", ""}) {
+    for (const char* key : {"port", "default-graft", "default-lora", "context-store", "--graft", ""}) {
         check(!repeatable_serve_option(key), std::string(key) + " is repeatable");
     }
 }

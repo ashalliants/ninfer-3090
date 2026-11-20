@@ -1924,6 +1924,66 @@ int main() {
     }
 
     {
+        // --lora NAME=PATH (repeatable) and --default-lora, resolved like grafts.
+        const ServeOptions adapted =
+            parse({"ninfer-serve", "model.ninfer", "--default-lora", "pi", "--lora",
+                   "pi=/m/loras/pi", "--lora", "other=o"});
+        failures += check(adapted.loras.size() == 2 && adapted.loras[0].name == "pi" &&
+                              adapted.loras[0].path == "/m/loras/pi" &&
+                              adapted.loras[1].name == "other" && adapted.default_lora == "pi",
+                          "--lora NAME=PATH / --default-lora were not parsed in order");
+        for (const std::vector<std::string>& invalid : {
+                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--lora", "pi"},
+                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--lora", "=p"},
+                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--lora", "pi="},
+                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--lora", "a=a", "--lora",
+                                          "a=b"},
+                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--default-lora", "pi"},
+                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--lora", "a=a",
+                                          "--default-lora", ""}}) {
+            bool rejected = false;
+            try {
+                (void)parse(invalid);
+            } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "an invalid --lora / --default-lora was accepted");
+        }
+        {
+            std::vector<std::string> nine{"ninfer-serve", "model.ninfer"};
+            for (int i = 0; i < 9; ++i) {
+                nine.push_back("--lora");
+                nine.push_back("a" + std::to_string(i) + "=p");
+            }
+            bool rejected = false;
+            try {
+                (void)parse(nine);
+            } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "a ninth --lora was accepted");
+        }
+
+        GenerationRequest request;
+        request.max_tokens = 1;
+        failures += check(resolve_prompt_semantics(request, adapted).lora == "pi" &&
+                              to_prompt_input(request, resolve_prompt_semantics(request, adapted), {})
+                                      .options.lora == "pi",
+                          "a request without a lora did not take the server default to the Engine");
+        request.lora = std::string{};
+        failures += check(resolve_prompt_semantics(request, adapted).lora.empty(),
+                          "an empty lora did not opt out of the server default");
+        request.lora = "other";
+        failures += check(resolve_prompt_semantics(request, adapted).lora == "other",
+                          "an explicit lora did not override the server default");
+        request.lora = "missing";
+        std::string unknown_code;
+        try {
+            (void)resolve_prompt_semantics(request, adapted);
+        } catch (const ApiException& error) { unknown_code = error.error().code; }
+        failures += check(unknown_code == "unknown_lora", "an unknown lora was accepted");
+        request.lora.reset();
+        failures += check(resolve_prompt_semantics(request, defaults).lora.empty(),
+                          "a server without adapters selected one");
+    }
+
+    {
         // /props reports what a request that states nothing actually inherits.
         const ninfer::ModelSamplingDefaults presets{
             .thinking     = {.temperature = 1.0F, .top_k = 20, .top_p = 0.95F},

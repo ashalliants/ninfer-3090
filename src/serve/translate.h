@@ -30,6 +30,7 @@ struct ResolvedPromptSemantics {
     std::optional<bool> requested_preserve_thinking;
     std::string chat_template_kwargs_json;
     std::string graft;
+    std::string lora;
 };
 
 // The JSON declaration the model sees for one tool: the entry of the system-prompt tool block, and

@@ -38,7 +38,7 @@ std::string value_word(const Json& value) {
 bool repeatable_serve_option(std::string_view key) {
     // The flags parse_serve_options appends to a list on every occurrence. A flag missing here
     // cannot take an array, which fails loudly rather than dropping values.
-    return key == "graft" || key == "allowed-host" || key == "context-store-peer";
+    return key == "graft" || key == "lora" || key == "allowed-host" || key == "context-store-peer";
 }
 
 ConfigWords read_serve_config(const std::filesystem::path& path) {

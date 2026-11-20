@@ -32,7 +32,7 @@ struct ConfigWords {
 // belongs on the command line or in the environment, not in a file) and config (no nesting).
 [[nodiscard]] ConfigWords read_serve_config(const std::filesystem::path& path);
 
-// The serve options that collect every occurrence instead of keeping the last (--graft,
+// The serve options that collect every occurrence instead of keeping the last (--graft, --lora,
 // --allowed-host, --context-store-peer), named without dashes: the only keys an array may set.
 [[nodiscard]] bool repeatable_serve_option(std::string_view key);
 

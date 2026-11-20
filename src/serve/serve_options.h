@@ -158,6 +158,11 @@ struct ServeOptions {
     // --default-graft NAME: graft applied to a request that states none ("graft": "" opts out).
     // Empty means no default; otherwise it names an entry of `grafts`.
     std::string default_graft;
+    // --lora NAME=PATH, repeatable: PEFT LoRA adapters a request may select with "lora": NAME.
+    std::vector<LoraSource> loras;
+    // --default-lora NAME: adapter applied to a request that states none ("lora": "" opts out).
+    // Empty means the base model; otherwise it names an entry of `loras`.
+    std::string default_lora;
     std::optional<std::uint32_t> default_thinking_budget;
     // --reasoning-loop off|stop|conclude: the reasoning-loop guard for every thinking request,
     // constrained ones included (off by default).
