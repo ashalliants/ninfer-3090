@@ -113,6 +113,8 @@ def main() -> int:
     parser.add_argument("--tokens", type=int, default=8)
     parser.add_argument("--seed", type=int, default=1)
     args = parser.parse_args()
+    if args.tokens < 1:
+        parser.error("--tokens must be at least 1")
     final = args.out
     if final.exists() and any(final.iterdir()):
         parser.error(f"{final} is not empty")
