@@ -288,7 +288,8 @@ carries.
   (`ordinary_lora_graphs`, `SpeculativeRoundFamily::lora_forward`) at the same profiles. One
   adapted graph serves any selection of its batch size. Finish runs no target layer, so both
   Forward variants pair with the one Finish family. The graph allowance charges the adapted
-  executables like the base ones. An eager adapted round (`--no-cuda-graph`) issues the same
+  executables like the base ones (V100, 27B MTP3, two lanes: 16 MiB measured for the adapted set,
+  12 MiB for the base set, against 172 MiB charged for each; capture 0.74 s against 0.51 s). An eager adapted round (`--no-cuda-graph`) issues the same
   launches as the graph and is bit-for-bit equal to it.
 - The request's prefix identity tag is `prefix_identity_tag(lora)`: the base tag mixed with the
   adapter digest (`LoraAdapter::digest`, FNV-1a over names, shapes, raw bytes and the scale).

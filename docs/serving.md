@@ -2459,7 +2459,9 @@ server captures a second, adapted set of decode graphs that reads each request's
 memory, so one set serves every mix of adapters and base requests in a round; a round with no
 adapted request replays the ordinary graphs and is bit-for-bit that of a server with no `--lora`.
 An adapted round's output is bit-for-bit the same with `--no-cuda-graph`. The second set costs
-startup time and device memory (it is charged like the first; TODO: measured figures). In a round
+startup time and device memory: on a V100 (27B, MTP3, two lanes, 32K or 128K context) graph
+preparation takes 0.74 s instead of 0.51 s and the graphs hold 28 MiB instead of 12 MiB; the
+memory plan charges the second set like the first (about 0.17 GiB more reserved). In a round
 that mixes adapted and base requests, the base requests take the adapted FFN route (the update
 itself skips them), as they did before; their tokens matched the base model's in the tests but are
 not guaranteed bit-for-bit. Prefill always runs eagerly.
@@ -2467,8 +2469,10 @@ not guaranteed bit-for-bit. Prefill always runs eagerly.
 **Speed.** Measured on a Tesla V100 with Qwen3.8-27B (MTP3, INT8 KV, `--prefill-cublas`) and the
 pi adapter (r=32, MLP on all 64 layers, attention on 16): adapted decode 59 tok/s against the base
 model's 65 (MTP acceptance unchanged, 54-55%), adapted prefill of a 3,066-token prompt 1,030 tok/s
-against 1,150. The difference is the adapter's own kernels (about 7% of an adapted decode round)
-and, before adapted rounds ran as graphs, the eager rounds (about 1.5%; TODO: remeasure).
+against 1,150. The difference is the adapter's own kernels (about 7% of an adapted decode round).
+Running adapted rounds as graphs cut the GPU's idle time in adapted decode from 0.100 s to 0.066 s
+over 90 MTP rounds (nsys), but moved decode speed only from 73.9 to 74.1 tok/s (+0.3%, a 300-token
+code answer, base 81.8 tok/s): on this machine the eager launches mostly overlap the GPU's work.
 
 **Context cache.** An adapter changes every activation, so its requests have their own cache
 identity, the base identity mixed with a digest of the adapter's tensors and scale: they reuse only

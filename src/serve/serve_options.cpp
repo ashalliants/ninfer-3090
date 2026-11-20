@@ -538,7 +538,7 @@ std::string serve_usage_text(const char* argv0) {
            "and adapter_model.safetensors) for the dense Qwen3.5 / 3.6 / 3.8 models; a request "
            "selecting it with \"lora\": \"NAME\" runs with it, others run the base model. Targets "
            "the full-attention q/k/v/o_proj and the MLP gate/up/down_proj. Repeatable, at most 8; "
-           "rounds with an adapter row run without CUDA graphs\n"
+           "adapted decode rounds run as a second set of CUDA graphs\n"
            "       --default-lora NAME applies a loaded adapter to every request that states none; "
            "a request opts out with \"lora\": \"\"\n"
            "       --reasoning-effort is the effort of thinking-enabled requests that state none; "
