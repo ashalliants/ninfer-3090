@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import signal
 import sys
 import tempfile
 from pathlib import Path
@@ -202,6 +203,7 @@ def main() -> int:
 _OWNED: list[Path] = []  # the temporary directories this run created; removed if the export fails
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))  # run the cleanup below on termination too
     try:
         raise SystemExit(main())
     except BaseException:
