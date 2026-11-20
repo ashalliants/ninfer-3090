@@ -141,6 +141,10 @@ ninfer_add_op_test(ninfer_rope_pairs_test
 ninfer_add_op_test(ninfer_softmax_pool_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_softmax_pool.cpp"
   LIBRARIES ninfer_ops)
+# DeepSeek-V4's indexer: relu-weighted head scores and the exact top-k of the reachable positions, against FP64 / exact oracles.
+ninfer_add_op_test(ninfer_position_selection_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_position_selection.cpp"
+  LIBRARIES ninfer_ops)
 # Host-only: the int8 hyper-connection codec (--hc-int8): the group rule the quantize kernel runs,
 # against exact FP64 checks and an independent re-implementation of Basalt's rule.
 ninfer_add_op_test(ninfer_hc_int8_codec_test
