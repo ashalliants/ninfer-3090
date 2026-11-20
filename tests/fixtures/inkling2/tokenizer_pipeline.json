@@ -1,0 +1,634 @@
+{
+ "source": "thinkingmachines/Inkling-2-Mini@6e7c8248f75265bdd4fbab5273304243b5d8c2cb tokenizer.json (vocab and merges omitted)",
+ "normalizer": null,
+ "pre_tokenizer": {
+  "type": "Sequence",
+  "pretokenizers": [
+   {
+    "type": "Split",
+    "pattern": {
+     "Regex": "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+    },
+    "behavior": "Isolated",
+    "invert": false
+   },
+   {
+    "type": "ByteLevel",
+    "add_prefix_space": false,
+    "trim_offsets": true,
+    "use_regex": false
+   }
+  ]
+ },
+ "decoder": {
+  "type": "ByteLevel",
+  "add_prefix_space": true,
+  "trim_offsets": true,
+  "use_regex": true
+ },
+ "post_processor": {
+  "type": "ByteLevel",
+  "add_prefix_space": true,
+  "trim_offsets": false,
+  "use_regex": true
+ },
+ "model": {
+  "type": "BPE",
+  "dropout": null,
+  "unk_token": null,
+  "continuing_subword_prefix": null,
+  "end_of_word_suffix": null,
+  "fuse_unk": false,
+  "byte_fallback": false,
+  "ignore_merges": true
+ },
+ "vocab_size": 199998,
+ "merges": 424413,
+ "vocab_head": [
+  [
+   "!",
+   0
+  ],
+  [
+   "\"",
+   1
+  ],
+  [
+   "#",
+   2
+  ],
+  [
+   "$",
+   3
+  ],
+  [
+   "%",
+   4
+  ],
+  [
+   "&",
+   5
+  ],
+  [
+   "'",
+   6
+  ],
+  [
+   "(",
+   7
+  ]
+ ],
+ "merges_head": [
+  "i n",
+  "e r",
+  "t h",
+  "a n",
+  "o n",
+  "r e",
+  "e n",
+  "a t"
+ ],
+ "added_tokens": [
+  {
+   "id": 199998,
+   "content": "<|unused|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 199999,
+   "content": "<|endoftext|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200000,
+   "content": "<|message_user|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200001,
+   "content": "<|message_model|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200002,
+   "content": "<|message_system|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200003,
+   "content": "<|message_tool|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200004,
+   "content": "<|content_text|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200005,
+   "content": "<|content_image|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200006,
+   "content": "<|content_model_end_sampling|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200007,
+   "content": "<|unused_200007|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200008,
+   "content": "<|content_thinking|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200009,
+   "content": "<|unused_200009|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200010,
+   "content": "<|end_message|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200011,
+   "content": "<|unused_200011|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200012,
+   "content": "<|unused_200012|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200013,
+   "content": "<|unused_200013|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200014,
+   "content": "<|unused_200014|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200015,
+   "content": "<|unused_200015|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200016,
+   "content": "<|unused_200016|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200017,
+   "content": "<|unused_200017|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200018,
+   "content": "<|unused_200018|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200019,
+   "content": "<|unused_200019|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200020,
+   "content": "<|unused_200020|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200021,
+   "content": "<|unused_200021|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200022,
+   "content": "<|content_tool_error|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200023,
+   "content": "<|unused_200023|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200024,
+   "content": "<|content_xml|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200025,
+   "content": "<|unused_200025|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200026,
+   "content": "<|unused_200026|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200027,
+   "content": "<|unused_200027|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200028,
+   "content": "<|begin_of_text|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200029,
+   "content": "<|unused_200029|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200030,
+   "content": "<|unused_200030|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200031,
+   "content": "<|unused_200031|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200032,
+   "content": "<|unused_200032|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200033,
+   "content": "<|unused_200033|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200034,
+   "content": "<|unused_200034|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200035,
+   "content": "<|unused_200035|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200036,
+   "content": "<|unused_200036|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200037,
+   "content": "<|unused_200037|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200038,
+   "content": "<|unused_200038|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200039,
+   "content": "<|unused_200039|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200040,
+   "content": "<|unused_200040|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200041,
+   "content": "<|unused_200041|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200042,
+   "content": "<|unused_200042|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200043,
+   "content": "<|unused_200043|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200044,
+   "content": "<|unused_200044|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200045,
+   "content": "<|unused_200045|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200046,
+   "content": "<|unused_200046|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200047,
+   "content": "<|unused_200047|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200048,
+   "content": "<|unused_200048|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200049,
+   "content": "<|content_invoke_tool_json|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200050,
+   "content": "<|unused_200050|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200051,
+   "content": "<|unused_200051|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200052,
+   "content": "<|unused_200052|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200053,
+   "content": "<|unused_200053|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200054,
+   "content": "<|unused_200054|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200055,
+   "content": "<|unused_200055|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200056,
+   "content": "<|unused_200056|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 200057,
+   "content": "<|content_invoke_tool_text|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  }
+ ],
+ "chat_template_sha256": "53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc"
+}

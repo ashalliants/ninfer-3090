@@ -1,0 +1,590 @@
+{
+ "repo": "unsloth/Inkling-2-Mini-GGUF",
+ "revision": "c4eb598a3f7bb5cd68652ed86e5cd884e02cdd00",
+ "metadata": {
+  "general.architecture": "dflash",
+  "general.type": "model",
+  "general.name": "Inkling-2-Mini",
+  "general.size_label": "318M",
+  "dflash.block_count": 3,
+  "dflash.context_length": 1048576,
+  "dflash.embedding_length": 2304,
+  "dflash.feed_forward_length": 9216,
+  "dflash.attention.head_count": 24,
+  "dflash.attention.head_count_kv": 8,
+  "dflash.rope.freq_base": 1000000.0,
+  "dflash.attention.layer_norm_rms_epsilon": 9.999999974752427e-07,
+  "dflash.attention.key_length": 128,
+  "dflash.attention.value_length": 128,
+  "dflash.vocab_size": 201024,
+  "dflash.vocab_size_unpadded": 200058,
+  "dflash.block_size": 8,
+  "dflash.target_layers": [
+   5,
+   23,
+   41,
+   48
+  ],
+  "dflash.dspark.markov_rank": 256,
+  "dflash.sample_from_anchor": false,
+  "dflash.has_confidence_head": false,
+  "dflash.attention.causal": false,
+  "dflash.attention.sliding_window": 1024,
+  "dflash.attention.sliding_window_pattern": [
+   true,
+   false,
+   true
+  ],
+  "dflash.rope.dimension_count": 128,
+  "dflash.final_logit_softcapping": 30.0,
+  "tokenizer.ggml.model": "gpt2",
+  "tokenizer.ggml.pre": "inkling2",
+  "tokenizer.ggml.tokens": {
+   "length": 200058,
+   "head": [
+    "!",
+    "\"",
+    "#",
+    "$",
+    "%",
+    "&",
+    "'",
+    "("
+   ],
+   "tail": [
+    "<|unused_200050|>",
+    "<|unused_200051|>",
+    "<|unused_200052|>",
+    "<|unused_200053|>",
+    "<|unused_200054|>",
+    "<|unused_200055|>",
+    "<|unused_200056|>",
+    "<|content_invoke_tool_text|>"
+   ]
+  },
+  "tokenizer.ggml.token_type": {
+   "length": 200058,
+   "head": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "tail": [
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3
+   ]
+  },
+  "tokenizer.ggml.merges": {
+   "length": 424413,
+   "head": [
+    "i n",
+    "e r",
+    "t h",
+    "a n",
+    "o n",
+    "r e",
+    "e n",
+    "a t"
+   ],
+   "tail": [
+    "Ġ UB",
+    "ĠU B",
+    "Ġ NAN",
+    "ĠN AN",
+    "ĠNA N",
+    "ĠS CHO",
+    "ĠSC HO",
+    "ĠSCH O"
+   ]
+  },
+  "tokenizer.ggml.eos_token_id": 200006,
+  "tokenizer.ggml.eot_token_id": 200006,
+  "tokenizer.ggml.add_bos_token": false,
+  "tokenizer.ggml.add_eos_token": false,
+  "tokenizer.chat_template": {
+   "length": 6657,
+   "sha256": "e9cfd8e75d1272633c2e72b3cc76e99567e2bc8912b960483aed483ad35d54c7"
+  },
+  "tokenizer.ggml.clean_spaces": false,
+  "tokenizer.ggml.mask_token_id": 0,
+  "general.basename": "Inkling-2-Mini",
+  "general.quantization_version": 2,
+  "general.file_type": 7
+ },
+ "tensors": [
+  {
+   "name": "dspark_fuse.weight",
+   "ne": [
+    4,
+    4
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "dspark_hidden_out.bias",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "dspark_hidden_out.weight",
+   "ne": [
+    256,
+    2304
+   ],
+   "type": 30,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "dspark_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "joint_proj.bias",
+   "ne": [
+    768
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "joint_proj.weight",
+   "ne": [
+    5120,
+    768
+   ],
+   "type": 30,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "markov_w1.weight",
+   "ne": [
+    256,
+    201024
+   ],
+   "type": 30,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "mask_embd.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "output_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.0.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.0.attn_k_ctx.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.0.attn_k_ctx_norm.weight",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.0.attn_k_norm.weight",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.0.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.0.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.0.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.0.attn_q_norm.weight",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.0.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.0.attn_v_ctx.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.0.dflare_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.0.ffn_down.weight",
+   "ne": [
+    9216,
+    2304
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.0.ffn_gate.weight",
+   "ne": [
+    2304,
+    9216
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.0.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.0.ffn_up.weight",
+   "ne": [
+    2304,
+    9216
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.1.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.1.attn_k_ctx.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.1.attn_k_ctx_norm.weight",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.1.attn_k_norm.weight",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.1.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.1.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.1.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.1.attn_q_norm.weight",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.1.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.1.attn_v_ctx.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.1.dflare_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.1.ffn_down.weight",
+   "ne": [
+    9216,
+    2304
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.1.ffn_gate.weight",
+   "ne": [
+    2304,
+    9216
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.1.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.1.ffn_up.weight",
+   "ne": [
+    2304,
+    9216
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.2.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.2.attn_k_ctx.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.2.attn_k_ctx_norm.weight",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.2.attn_k_norm.weight",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.2.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.2.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.2.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.2.attn_q_norm.weight",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.2.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.2.attn_v_ctx.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.2.dflare_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.2.ffn_down.weight",
+   "ne": [
+    9216,
+    2304
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.2.ffn_gate.weight",
+   "ne": [
+    2304,
+    9216
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.2.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  },
+  {
+   "name": "blk.2.ffn_up.weight",
+   "ne": [
+    2304,
+    9216
+   ],
+   "type": 8,
+   "shard": "dspark-Inkling-2-Mini-Q8_0.gguf"
+  }
+ ]
+}
