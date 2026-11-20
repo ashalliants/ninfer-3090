@@ -1,6 +1,7 @@
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/execution/rotation.h"
 #include "models/qwen3_5/execution/lora.h"
+#include "models/qwen3_5/execution/steering.h"
 
 #include "core/weight_view.h"
 
@@ -414,9 +415,21 @@ Parameters::Parameters(const Model& source) : model(source) {
     }
 }
 
-Parameters::Parameters(const Model& source, const std::vector<LoraSource>& loras)
+Parameters::Parameters(const Model& source, const std::vector<LoraSource>& loras,
+                       const std::vector<GraftSource>& control_vectors)
     : Parameters(source) {
     lora = load_lora_parameters(loras, *this);
+    if (control_vectors.empty()) { return; }
+    const TextConfig& config = source.config().text;
+    const ControlVectorTarget target{.architecture = config.architecture,
+                                     .hidden       = dimension(config.hidden_size),
+                                     .layers       = dimension(config.num_hidden_layers)};
+    std::vector<ControlVector> vectors;
+    vectors.reserve(control_vectors.size());
+    for (const GraftSource& graft : control_vectors) {
+        vectors.push_back(load_control_vector(graft, target));
+    }
+    steering = make_steering_parameters(vectors);
 }
 
 namespace {

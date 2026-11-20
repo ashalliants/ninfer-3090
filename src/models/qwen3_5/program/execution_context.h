@@ -52,6 +52,9 @@ struct ExecutionCore {
     // from the round frame's ingress `lora` (execution::lora_round_columns), which is what lets
     // the round run as a captured graph. False runs the round without any LoRA work.
     bool lora_round = false;
+    // The control-vector selection of a prefill call (TextContext::set_steering): an I32 [1] view
+    // of Parameters::steering's selector for the sequence's vector, or empty (no data) for none.
+    Tensor steering{};
 };
 
 struct PrefillContext {

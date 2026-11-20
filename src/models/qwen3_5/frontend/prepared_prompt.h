@@ -191,10 +191,11 @@ struct PreparedPromptData {
     // start from a checkpoint that covers at least this prefix; prefilling the placeholders would
     // compute a different context.
     std::uint32_t external_prefix_tokens = 0;
-    // Qwen3.8-Flash-Next refusal steering: the index (into the Program's steering vectors, the
-    // order of FrontendOptions::steering_names) of the vector the request selected through
-    // PromptOptions::graft, or -1 for none. It changes the model's activations, so a request that
-    // selects a vector has its own context-cache identity (the Program's identity tag).
+    // Control-vector steering (Qwen3.8-Flash-Next, and GGUF grafts of the dense models): the
+    // index (into the Program's vectors, the order of FrontendOptions::steering_names) of the
+    // vector the request selected through PromptOptions::graft, or -1 for none. It changes the
+    // model's activations, so a request that selects a vector has its own context-cache identity
+    // (the Program's identity tag).
     std::int32_t steering = -1;
     // The LoRA adapter the request selected through PromptOptions::lora: its slot (the order of
     // FrontendOptions::lora_names, which is the Program's adapter order), or -1 for the base model.

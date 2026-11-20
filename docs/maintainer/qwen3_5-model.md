@@ -334,6 +334,34 @@ An optional proposal head supplies an indexed vocabulary subset for draft predic
 converts proposal rows to actual token IDs. Full target verification continues to use the full
 output head. Backend selection, draft width and proposal-head choice are fixed at startup.
 
+## Control vectors
+
+A GGUF `--graft` is a control vector (`frontend/control_vector.h` reads and checks it; the serving
+side is in [serving.md](../serving.md#control-vectors-on-the-dense-models)). `Parameters` loads every
+one into `SteeringParameters` (`execution/steering.h`): one device table of FP32 directions
+`[set][layer][hidden]`, per-layer `(project, add)` coefficients `[set][layer][2]` and constant I32
+selectors `0..sets-1`. `TextContext::run_stage_layers` calls `steer_residual` after each block's
+`mlp_tail`, on the BF16 residual `x [H, T]`, so `direction.N` lands at the output of zero-based block
+N as GLP's `residual_stream_post_layer` and llama.cpp's `build_cvec` place it. The Op
+(`ops::direction_project`) computes, per column, `x - p (x . v) v + a v` in FP32 with one BF16
+rounding; `(p, a)` is `(alpha_L, 0)` for project and `(0, alpha_L)` for add, and an unselected
+column (selector -1) or a layer whose coefficients are both 0 returns before touching memory.
+
+- **Selection.** `PreparedPromptData::steering` (the frontend's resolution of a `+` selection) becomes
+  `SequenceState::steering`. Prefill calls (`ExecutionCore::steering`) point at the vector's constant
+  selector, or at nothing, in which case no kernel is launched. Decode rounds stage one I32 per row
+  in the round ingress (`OrdinaryDecodeIngress`, `MtpDecodeIngress`, `DFlashDecodeIngress`), which
+  the graph body copies in, so a captured graph reads each replay's selection; verify columns map
+  to rows by `row_columns = T / rows` (row-major `(k+1)` columns per row).
+- **Graphs.** While any vector is loaded, every layer some vector steers launches the Op in every
+  decode body, selected or not: a graph captured before the first steered request must already
+  contain it.
+- **Identity.** `ProgramImpl::steered_identity_tag` mixes the vector's content digest into the
+  request's prefix identity tag (never equal to the unsteered tag), so steered and unsteered
+  requests share no checkpoints.
+- **Not steered.** The MTP and DFlash drafters, the lossy-prefill scout and causal scoring. A
+  multi-device pipeline refuses vectors (`TextContext` throws if a staged run selects one).
+
 ## Vision and multimodal positions
 
 The current native processor uses 16×16 spatial patches, pairs of frames, and 2×2 spatial merge.

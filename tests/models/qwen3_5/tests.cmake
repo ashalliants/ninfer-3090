@@ -25,6 +25,11 @@ ninfer_add_test(ninfer_qwen3_5_graft_loader_test
 ninfer_add_test(ninfer_qwen3_5_lora_loader_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lora_loader.cpp"
   LIBRARIES ninfer_model_loading ninfer::json)
+# The dense-model control-vector reader (GLP and llama.cpp layouts): CPU only. With
+# NINFER_TEST_CONTROL_VECTOR set it also reads that real file against Qwen3.8-27B's shape.
+ninfer_add_test(ninfer_qwen3_5_control_vector_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_control_vector.cpp"
+  LIBRARIES ninfer_engine ninfer_core)
 
 # The reasoning-loop guard's repeated-passage measure (CPU only).
 ninfer_add_test(ninfer_qwen3_5_reasoning_loop_test
@@ -154,6 +159,13 @@ ninfer_add_test(ninfer_qwen3_5_graft_real_test
 ninfer_add_test(ninfer_qwen3_5_lora_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_lora_real.cpp"
   LIBRARIES ninfer_engine ninfer::json)
+
+# Control vectors (GGUF --graft) on the 27B: a zero additive vector selected is bit-identical to the
+# base, and a loaded but unselected vector changes nothing. NINFER_TEST_CONTROL_VECTOR=<GGUF> also
+# checks the real vector's output under graphs on/off, MTP and a concurrent base request.
+ninfer_add_test(ninfer_qwen3_5_control_vector_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_control_vector_real.cpp"
+  LIBRARIES ninfer_engine)
 ninfer_add_test(ninfer_qwen3_5_stages_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_stages_real.cpp"
   LIBRARIES ninfer_engine)
@@ -265,6 +277,7 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_dflash_real_test
   ninfer_qwen3_5_graft_real_test
   ninfer_qwen3_5_lora_real_test
+  ninfer_qwen3_5_control_vector_real_test
   ninfer_qwen3_5_stages_real_test
   ninfer_qwen3_5_suspend_real_test)
 set_tests_properties(${ninfer_qwen3_5_real_tests} PROPERTIES

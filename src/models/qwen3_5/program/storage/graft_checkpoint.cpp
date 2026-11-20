@@ -18,6 +18,7 @@
 // demoted or chosen by a reclaim plan, and no binding may consume it.
 
 #include "models/qwen3_5/execution/lora.h"
+#include "models/qwen3_5/execution/steering.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "ninfer/ops/kv_cache_append.h"
@@ -129,6 +130,38 @@ std::uint32_t ProgramImpl::prefix_identity_tag(std::int32_t lora) const {
         tag   = static_cast<std::uint32_t>(mixed ^ (mixed >> 32U));
     }
     return tag;
+}
+
+std::uint32_t ProgramImpl::steered_identity_tag(std::uint32_t tag, std::int32_t steering) const {
+    if (steering < 0) { return tag; }
+    if (parameters.steering == nullptr ||
+        static_cast<std::size_t>(steering) >= parameters.steering->vectors.size()) {
+        throw std::logic_error("a request selected a control vector the Program has not loaded");
+    }
+    // Vector i's tag mixes the base tag with its digest, re-mixed past the unsteered tag and every
+    // earlier vector's tag, so no two selections share a cache identity (the tag and the prompt
+    // digest are all a cached checkpoint is matched by). It depends only on the base tag and the
+    // digests of vectors 0..i, so it is the same on every call and, without a collision, the plain
+    // mix of the vector's own digest.
+    const auto& vectors = parameters.steering->vectors;
+    std::vector<std::uint32_t> taken{tag};
+    taken.reserve(static_cast<std::size_t>(steering) + 2U);
+    std::uint32_t steered = tag;
+    for (std::size_t i = 0; i <= static_cast<std::size_t>(steering); ++i) {
+        std::uint64_t mixed = (static_cast<std::uint64_t>(tag) ^ vectors[i].digest) * 1099511628211ULL;
+        steered             = static_cast<std::uint32_t>(mixed ^ (mixed >> 32U));
+        while (std::find(taken.begin(), taken.end(), steered) != taken.end()) {
+            mixed   = (mixed + 0x9e3779b97f4a7c15ULL) * 1099511628211ULL;
+            steered = static_cast<std::uint32_t>(mixed ^ (mixed >> 32U));
+        }
+        taken.push_back(steered);
+    }
+    return steered;
+}
+
+Tensor ProgramImpl::steering_rows(const SequenceState& sequence) const {
+    if (parameters.steering == nullptr) { return {}; }
+    return parameters.steering->selector(sequence.steering);
 }
 
 CheckpointHandle ProgramImpl::install_external_checkpoint(const PromptGraft& graft) {

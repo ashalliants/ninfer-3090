@@ -1315,6 +1315,47 @@ int test_steering_selection() {
     failures += check(FrontendFactory::inspect(none).steering == -1,
                       "an empty request graft selected an empty-named steering vector");
     failures += check(FrontendFactory::inspect(named).steering == 1, "a name beside an empty-named entry lost its index");
+
+    // '+' joins one prompt graft and one vector, in either order: the prompt is the grafted one and
+    // the vector is selected.
+    const auto both    = frontend.prepare(text_input("product+blue"));
+    const auto swapped = frontend.prepare(text_input("blue+product"));
+    failures += check(FrontendFactory::inspect(both).steering == 1 &&
+                          FrontendFactory::inspect(both).token_ids == g.token_ids,
+                      "'product+blue' did not run the graft's prompt under vector blue");
+    failures += check(FrontendFactory::inspect(swapped).steering == 1 &&
+                          FrontendFactory::inspect(swapped).token_ids == g.token_ids,
+                      "the order of a '+' selection mattered");
+    failures += check(frontend.count_tokens(text_input("product+blue")) ==
+                          frontend.count_tokens(text_input("product")),
+                      "token counting of a combined selection differs from the graft alone");
+    const auto refused = [&](const Frontend& f, const std::string& spec) {
+        try {
+            (void)f.prepare(text_input(spec));
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    failures += check(refused(frontend, "red+blue"), "two vectors were combined");
+    failures += check(refused(frontend, "product+product"), "two prompt grafts were combined");
+    failures += check(refused(frontend, "red+"), "a selection with an empty name was accepted");
+    failures += check(refused(frontend, "+red"), "a selection with an empty leading name was accepted");
+    failures += check(refused(frontend, "red+green"), "a selection with an unknown name was accepted");
+
+    // An installed (direct or softprompt) graft is base-model state: never combined with a vector.
+    using ninfer::models::qwen3_5::GraftKind;
+    for (const GraftKind kind : {GraftKind::DirectKV, GraftKind::SoftpromptKV}) {
+        ninfer::models::qwen3_5::PromptGraft direct;
+        direct.name            = "direct";
+        direct.kind            = kind;
+        direct.n_slots         = 2;
+        direct.placeholder_ids = {fixture_byte_token('p'), fixture_byte_token('q')};
+        auto with_direct       = options;
+        with_direct.grafts     = {direct};
+        const Frontend installed = make_frontend(resources(), with_direct);
+        failures += check(refused(installed, "direct+red"), "an installed graft was combined with a vector");
+        failures += check(!refused(installed, "direct") && !refused(installed, "red"),
+                          "an installed graft or a vector alone was refused");
+    }
     return failures;
 }
 

@@ -13,7 +13,8 @@ namespace ninfer::ops::detail {
 
 // Host entry; assumes inputs already validated by the wrapper.
 void direction_project_launch(Tensor& residual, std::int32_t streams, const float* directions,
-                              std::int64_t set_stride, const std::int32_t* row_select,
-                              cudaStream_t stream);
+                              std::int64_t set_stride, const float* coefficients,
+                              std::int64_t coefficient_stride, const std::int32_t* row_select,
+                              std::int32_t row_columns, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

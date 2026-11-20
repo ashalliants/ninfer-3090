@@ -130,6 +130,36 @@ NINFER_PRESENCE_PENALTY=1.0 NINFER_DEFAULT_THINKING_BUDGET=1024 NINFER_REASONING
 NINFER_TEMPERATURE=0.6 NINFER_TOP_P=0.95 NINFER_TOP_K=20 scripts/run-v100.sh qwen38-flash-next
 ```
 
+### Refusal steering (Qwen3.8-27B)
+
+The 27B loads the GLP control vector
+[`BlivionIaG/Qwen3.8-27B-refusal-cvec-GLP-49`](https://huggingface.co/BlivionIaG/Qwen3.8-27B-refusal-cvec-GLP-49)
+(`Qwen3.8-27B-refusal-cvec-GLP-49-L10-58-a1.gguf`, 1 MB: project mode, layers 10-58, alpha 1) as a
+`--graft` ([serving.md](serving.md#control-vectors-on-the-dense-models)); it combines with the pi
+LoRA (`"graft": "uncensored", "lora": "pi"`). Measured on the V100 (2026-11-20, `--spec mtp`,
+INT8 KV, greedy unless stated):
+
+- **Refusals.** Four prompts the base model refuses outright (hotwiring a 1992 Civic, defeating
+  supermarket security tags, cheating on an exam, a news paywall): with the vector none opens with
+  a refusal. The hotwiring prompt gets step-by-step instructions; the paywall prompt mostly legal
+  routes (with pi, also a cookie-clearing tip); the tag and exam prompts are redirected to the
+  legitimate process or to preparation rather than refused. The pi adapter alone changes none of the
+  refusals, and vector + pi behaves like the vector. A benign prompt (how a fridge works) stays
+  coherent in every combination.
+- **Thinking.** With thinking on, the steered hotwiring prompt reasoned to a 6,000-token limit
+  without answering at temperature 0 and 0.6 (no verbatim loop; with or without pi). With the
+  router's 27B sampling (presence penalty 0.5, min-p 0.03) and `thinking_budget` 2048 it answered
+  with steps in 47-55 s at both temperatures; the tag prompt answered in 30-38 s.
+- **Speed** (300-token decode, 3,067-token prefill, three cooled repetitions): base 65.2 tok/s
+  decode, 1,150 tok/s prefill on a server without the vector; base 64.9 / 1,150 with the vector
+  loaded (the same tokens and MTP acceptance); steered 62.1 / 1,145 (MTP acceptance 0.51 against
+  the base's 0.55 on its different text); pi 58.8 / 1,035; vector + pi 57.3-60.4 / 1,030.
+
+```bash
+NINFER_GRAFT="uncensored=$HOME/models/vectors/Qwen3.8-27B-refusal-cvec-GLP-49-L10-58-a1.gguf" \
+NINFER_DEFAULT_THINKING_BUDGET=2048 scripts/run-v100.sh qwen38-27b
+```
+
 ## Performance
 
 ### Qwen3.8-27B

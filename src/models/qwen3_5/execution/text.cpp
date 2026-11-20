@@ -5,6 +5,7 @@
 #include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/lora.h"
+#include "models/qwen3_5/execution/steering.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/execution/numeric_tripwire.h"
 #include "models/qwen3_5/execution/numeric_tripwire_report.h"
@@ -1304,6 +1305,14 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
                 mlp_tail(block, x, ph,
                          layer + 1 < end ? next_projection_hints(static_cast<int>(layer))
                                          : ops::SparseMoeHints{});
+            }
+            // Control vectors act on the post-layer residual stream (the block's attention and
+            // MLP writes both added). The scout's int4 ranking pass runs unsteered.
+            if (parameters_.steering != nullptr && scout_layers_.empty()) {
+                if (stage_runtime_ != nullptr && steering_rows_.data != nullptr) {
+                    throw std::logic_error("control vectors run on one device");
+                }
+                steer_residual(*parameters_.steering, layer, x, steering_rows_, ctx_.stream);
             }
             if constexpr (Tap::enabled) {
                 tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);

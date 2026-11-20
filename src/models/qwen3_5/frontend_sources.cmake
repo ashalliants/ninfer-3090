@@ -6,6 +6,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/frontend/prompt_layout.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/digest.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/graft.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/frontend/control_vector.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/processor.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/media_cache.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/tool_call_parser.cpp"

@@ -194,6 +194,18 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 
 } // namespace
 
+std::vector<std::string> graft_selection_names(const std::string& selection) {
+    std::vector<std::string> names;
+    if (selection.empty()) { return names; }
+    std::size_t begin = 0;
+    while (true) {
+        const std::size_t plus = selection.find('+', begin);
+        names.push_back(selection.substr(begin, plus == std::string::npos ? std::string::npos : plus - begin));
+        if (plus == std::string::npos) { return names; }
+        begin = plus + 1;
+    }
+}
+
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " (--models-dir DIR | --models-preset FILE) [--models-max N] [--no-models-autoload] "
@@ -529,11 +541,15 @@ std::string serve_usage_text(const char* argv0) {
            "closing tags only when the model ended its turn itself. Off by default\n"
            "       --graft NAME=PATH loads a phantom-kv prefill graft (a safetensors container with a "
            ".json sidecar beside it); a request selecting it with \"graft\": \"NAME\" runs as if the "
-           "graft's hidden turn preceded its own messages. On Qwen3.8-Flash-Next PATH is a GGUF "
-           "refusal-direction control vector instead, and a request selecting it runs with that "
-           "direction removed from the model's activations. Repeatable\n"
-           "       --default-graft NAME applies a loaded graft to every request that states none; "
-           "a request opts out with \"graft\": \"\"\n"
+           "graft's hidden turn preceded its own messages. On the dense Qwen models a GGUF PATH is a "
+           "control vector instead (GLP or llama.cpp layout, e.g. a refusal-direction vector, with "
+           "GLP's mode and scales), and a request selecting it runs with the vector applied to the "
+           "model's residual stream after each layer it names. On Qwen3.8-Flash-Next every PATH is "
+           "a refusal direction: each direction.N is normalised and projected out after block N, "
+           "and GLP keys (mode, alpha, scales) are not read. A request may join one prompt "
+           "graft and one vector with '+' (\"graft\": \"persona+uncensored\"). Repeatable\n"
+           "       --default-graft NAME[+NAME] applies loaded grafts to every request that states "
+           "none; a request opts out with \"graft\": \"\"\n"
            "       --lora NAME=PATH loads a PEFT LoRA adapter (a directory with adapter_config.json "
            "and adapter_model.safetensors) for the dense Qwen3.5 / 3.6 / 3.8 models; a request "
            "selecting it with \"lora\": \"NAME\" runs with it, others run the base model. Targets "
@@ -1267,6 +1283,15 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             if (equals == 0 || equals == std::string_view::npos || equals + 1 == spec.size()) {
                 throw std::invalid_argument("--graft must be NAME=PATH");
             }
+            const std::string_view name = spec.substr(0, equals);
+            if (name.find('+') != std::string_view::npos) {
+                throw std::invalid_argument("--graft name '" + std::string(name) +
+                                            "' contains '+', which joins graft names in a selection");
+            }
+            if (std::any_of(options.grafts.begin(), options.grafts.end(),
+                            [&](const GraftSource& source) { return source.name == name; })) {
+                throw std::invalid_argument("--graft '" + std::string(name) + "' is given twice");
+            }
             options.grafts.push_back(GraftSource{.name = std::string(spec.substr(0, equals)),
                                                  .path = std::string(spec.substr(equals + 1))});
         } else if (arg == "--lora") {
@@ -1347,12 +1372,12 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
         }
     }
     current = std::string::npos;
-    if (!options.default_graft.empty() &&
-        std::none_of(options.grafts.begin(), options.grafts.end(), [&](const GraftSource& source) {
-            return source.name == options.default_graft;
-        })) {
-        throw std::invalid_argument("--default-graft '" + options.default_graft +
-                                    "' does not name a --graft");
+    for (const std::string& name : graft_selection_names(options.default_graft)) {
+        if (std::none_of(options.grafts.begin(), options.grafts.end(),
+                         [&](const GraftSource& source) { return source.name == name; })) {
+            throw std::invalid_argument("--default-graft '" + options.default_graft + "': '" + name +
+                                        "' does not name a --graft");
+        }
     }
     if (!options.default_lora.empty() &&
         std::none_of(options.loras.begin(), options.loras.end(), [&](const LoraSource& source) {

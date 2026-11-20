@@ -51,6 +51,9 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         card.set_lora(state.execution.lora_round
                           ? lora_round_columns(ordinary.lora.slice(0, 0, batch_size))
                           : state.execution.lora);
+        if (state.execution.parameters.steering != nullptr) {
+            card.set_steering(ordinary.steering.slice(0, 0, batch_size));
+        }
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);
@@ -290,6 +293,7 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
             throw std::logic_error("DFlash context append contains an invalid row");
         }
         SequenceState& sequence   = active_sequence(lane);
+        dflash_host_ingress->steering[row] = sequence.steering;
         const std::uint32_t start = starts[row];
         const std::uint64_t end64 = static_cast<std::uint64_t>(start) + counts[row];
         const std::uint32_t end   = static_cast<std::uint32_t>(end64);
@@ -439,6 +443,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             ordinary_host_ingress->state_source_slots[row]      = selectors.source;
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
             ordinary_host_ingress->lora[row]                    = sequence.lora;
+            ordinary_host_ingress->steering[row]                = sequence.steering;
             ordinary_host_ingress->sampling[row]                = request.sampling_host;
             ordinary_host_ingress->sampling[row].mask           = fill_grammar_mask(masks, row, {});
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
@@ -619,6 +624,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             mtp_host_ingress->state_destination_slots[row] = selectors.destination;
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->lora[row]                    = sequence.lora;
+            mtp_host_ingress->steering[row]                = sequence.steering;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
             mtp_host_ingress->sampling[row].mask           = bind_grammar_mask(masks, row);
             mtp_host_ingress->sampling[row].relaxed_threshold =
@@ -980,6 +986,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             dflash_host_ingress->state_source_slots[row] = selectors.source;
             dflash_host_ingress->state_destination_slots[row] = selectors.destination;
             dflash_host_ingress->lora[row]                    = sequence.lora;
+            dflash_host_ingress->steering[row]                = sequence.steering;
             dflash_host_ingress->sampling[row]                = request.sampling_host;
             dflash_host_ingress->sampling[row].mask           = bind_grammar_mask(masks, row);
             dflash_host_ingress->sampling[row].relaxed_threshold = round_relaxed_threshold(

@@ -153,10 +153,12 @@ struct ServeOptions {
     // --tolerant-tool-calls: repair free (`tool_constraints:"auto"`) tool-call markup the strict
     // parser returns as text. Off keeps the strict all-or-nothing parse.
     bool tolerant_tool_calls = false;
-    // --graft NAME=PATH, repeatable: phantom-kv grafts a request may select with "graft": NAME.
+    // --graft NAME=PATH, repeatable: grafts a request may select with "graft": NAME. A GGUF file is
+    // a control vector, any other file a phantom-kv prompt graft (the model decides; see
+    // docs/serving.md). Names are unique and contain no '+'.
     std::vector<GraftSource> grafts;
-    // --default-graft NAME: graft applied to a request that states none ("graft": "" opts out).
-    // Empty means no default; otherwise it names an entry of `grafts`.
+    // --default-graft NAME[+NAME]: the graft selection of a request that states none ("graft": ""
+    // opts out). Empty means no default; otherwise every name is an entry of `grafts`.
     std::string default_graft;
     // --lora NAME=PATH, repeatable: PEFT LoRA adapters a request may select with "lora": NAME.
     std::vector<LoraSource> loras;
@@ -215,5 +217,9 @@ ServeOptions parse_serve_options(int argc, char** argv);
 std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view artifact_model_name);
 std::string serve_usage_text(const char* argv0);
+
+// The names of a graft selection: one name, or several joined by '+' ("persona+uncensored"). An
+// empty selection has none; an empty name between separators is returned as such.
+[[nodiscard]] std::vector<std::string> graft_selection_names(const std::string& selection);
 
 } // namespace ninfer::serve

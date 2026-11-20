@@ -32,9 +32,11 @@ struct FrontendOptions {
     std::uint32_t vision_max_merged_tokens = 16384;
     // Hidden prompt prefixes a request may select through PromptOptions::graft.
     std::vector<PromptGraft> grafts;
-    // Names a request may select through PromptOptions::graft that name a refusal-steering vector
-    // rather than a prompt (Qwen3.8-Flash-Next): a request's selection becomes
-    // PreparedPromptData::steering, the name's index here. Disjoint from `grafts`' names.
+    // Names a request may select through PromptOptions::graft that name a control vector rather
+    // than a prompt (every --graft of Qwen3.8-Flash-Next; a GGUF --graft of a dense model): a
+    // request's selection becomes PreparedPromptData::steering, the name's index here. Disjoint
+    // from `grafts`' names. PromptOptions::graft names one entry of either list, or one of each
+    // joined by '+' (a prompt graft other than prefill_kv cannot be combined with a vector).
     std::vector<std::string> steering_names;
     // The loaded LoRA adapters' names in slot order (EngineOptions::loras): a request's
     // PromptOptions::lora becomes PreparedPromptData::lora, the name's index here.

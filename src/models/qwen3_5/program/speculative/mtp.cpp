@@ -97,6 +97,9 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         card.set_lora(state.execution.lora_round
                           ? lora_round_columns(frame.lora.slice(0, 0, batch_size))
                           : state.execution.lora);
+        if (state.execution.parameters.steering != nullptr) {
+            card.set_steering(frame.steering.slice(0, 0, batch_size));
+        }
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers          = frame.base_frontiers.slice(0, 0, batch_size);
         Tensor budgets            = frame.remaining_budgets.slice(0, 0, batch_size);

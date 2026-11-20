@@ -56,6 +56,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent) {
     card.set_stage_runtime(execution.stages);
     card.set_lora(execution.lora);
+    card.set_steering(execution.steering);
     card.set_sampling(sampling);
     card.set_linear_state_slots(state_source_slot, state_destination_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
@@ -611,6 +612,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             dflash_prefill_host_ingress,
             sequence.rope_delta};
         schedule_state.prefill_gpu_timer = &prefill_gpu_timer_;
+        schedule_state.execution.steering = steering_rows(sequence);
         schedule_state.layer_ready       = take_restore_layers(sequence.lane);
         // The first token's log-probabilities, for a request that asked: the sampling sites write
         // them to the Program's one scratch buffer and they are read back once the step has

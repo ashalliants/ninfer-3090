@@ -1922,6 +1922,49 @@ int main() {
             failures += check(rejected, "--default-graft naming no loaded graft was accepted");
         }
     }
+    {
+        // '+' joins graft names (a prompt graft and a control vector): every name must be loaded;
+        // which kinds may combine is the model's to decide. '+' is never part of a name.
+        const ServeOptions joined =
+            parse({"ninfer-serve", "model.ninfer", "--graft", "persona=p.bin", "--graft",
+                   "uncensored=u.gguf", "--default-graft", "persona+uncensored"});
+        failures += check(joined.default_graft == "persona+uncensored",
+                          "a '+' --default-graft was not kept as given");
+        GenerationRequest request;
+        request.max_tokens = 1;
+        failures += check(resolve_prompt_semantics(request, joined).graft == "persona+uncensored",
+                          "a request without a graft did not take a '+' server default");
+        request.graft = "uncensored+persona";
+        failures += check(resolve_prompt_semantics(request, joined).graft == "uncensored+persona",
+                          "a '+' request selection did not reach the Engine");
+        request.graft = "persona+missing";
+        std::string unknown_code;
+        try {
+            (void)resolve_prompt_semantics(request, joined);
+        } catch (const ApiException& error) { unknown_code = error.error().code; }
+        failures += check(unknown_code == "unknown_graft",
+                          "a '+' selection with an unloaded name was accepted");
+        failures += check(graft_selection_names("a+b") == std::vector<std::string>{"a", "b"} &&
+                              graft_selection_names("a") == std::vector<std::string>{"a"} &&
+                              graft_selection_names("").empty() &&
+                              graft_selection_names("a+") == std::vector<std::string>{"a", ""},
+                          "graft_selection_names split wrongly");
+        for (const std::vector<std::string>& invalid : {
+                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--graft", "a+b=a.bin"},
+                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--graft", "a=a.bin",
+                                          "--graft", "a=b.gguf"},
+                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--graft", "a=a.bin",
+                                          "--default-graft", "a+"},
+                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--graft", "a=a.bin",
+                                          "--default-graft", "a+b"}}) {
+            bool rejected = false;
+            try {
+                (void)parse(invalid);
+            } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "a '+' graft name, a duplicate --graft or a bad '+' default was accepted");
+        }
+    }
+
 
     {
         // --lora NAME=PATH (repeatable) and --default-lora, resolved like grafts.

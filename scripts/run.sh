@@ -145,7 +145,8 @@
 #           NO_EXIT_ON_ENGINE_FAILURE ADMISSION_FIT_CHECK PROGRESS_ANCHORS_SHARED MODEL_SUSPEND
 #           NO_AUTO_RESUME LM_HEAD_Q4 LM_HEAD_Q6 EMBEDDING_Q4 EMBEDDING_Q6 NO_EXPERT_STATE
 #           LOSSY_PREFILL_SCOUT_A4 REQUEST_LOG_LOSSY_DETAIL
-# NINFER_GRAFT (NAME=PATH;NAME=PATH, each --graft) and NINFER_DEFAULT_GRAFT (--default-graft).
+# NINFER_GRAFT (NAME=PATH;NAME=PATH, each --graft: prompt grafts and GGUF control vectors) and
+# NINFER_DEFAULT_GRAFT (--default-graft, NAME or NAME+NAME).
 # NINFER_LORA (NAME=PATH;NAME=PATH, each --lora) and NINFER_DEFAULT_LORA (--default-lora).
 # Not here: the repeatable --context-store-peer, router mode (--models-*), and
 # --allow-unlocked-host-memory (NINFER_ALLOW_UNLOCKED_HOST_MEMORY, Flash-Next only, above). The S3
@@ -700,9 +701,11 @@ if [[ -n "${NINFER_CHAT_TEMPLATE:-}" ]]; then
   profile_args+=(--chat-template "$NINFER_CHAT_TEMPLATE")
 fi
 # Grafts: NINFER_GRAFT is one or more NAME=PATH entries separated by ';' (a path may hold spaces
-# or commas), each passed as --graft; NINFER_DEFAULT_GRAFT names the one requests get when they
-# state none (--default-graft). On Qwen3.8-Flash-Next a graft is a refusal-steering vector
-# (docs/serving.md, "Refusal steering on Qwen3.8-Flash-Next"); ninfer-serve checks each entry.
+# or commas), each passed as --graft; NINFER_DEFAULT_GRAFT is the selection requests get when they
+# state none (--default-graft): one name, or a prompt graft and a control vector joined by '+'. A
+# GGUF PATH is a control vector (a refusal-direction vector, say; on Qwen3.8-Flash-Next every
+# graft is one), any other a phantom-kv prompt graft (docs/serving.md, "Control vectors");
+# ninfer-serve checks each entry.
 if [[ -n "${NINFER_GRAFT:-}" ]]; then
   IFS=';' read -r -a graft_entries <<< "$NINFER_GRAFT"
   for graft_entry in ${graft_entries[@]+"${graft_entries[@]}"}; do
