@@ -3,10 +3,19 @@
 
 #include "core/device.h" // CUDA_CHECK
 #include "ops/linear/common/sm70_tensor_core.h"
+#include "ops/linear/q4/q4_dispatch.h"
+#include "ops/linear/q4/q4_operands.h"
+#include "ops/linear/q5/q5_dispatch.h"
+#include "ops/linear/q5/q5_operands.h"
+#include "ops/linear/q6/q6_dispatch.h"
+#include "ops/linear/q6/q6_operands.h"
+#include "ops/linear/q8/q8_dispatch.h"
+#include "ops/linear/q8/q8_operands.h"
 
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -125,6 +134,17 @@ bool rowsplit_format(QType qtype) noexcept {
 // 1-megapixel image; they keep the default kernels.
 constexpr long long kRowsplitMaxWeight = 8LL << 20;
 
+// The format dispatcher's shape and policy admission (it throws std::invalid_argument outside its
+// registered table, as q*_dispatch does).
+static void select_format_launch(QType qtype, LinearPolicy policy, int rows, int k, int tokens) {
+    switch (qtype) {
+    case QType::Q4_G64_FP16: (void)select_q4_launch(rows, k, tokens, policy); return;
+    case QType::Q5_G64_FP16: (void)select_q5_launch(rows, k, tokens, policy); return;
+    case QType::Q6_G64_FP16: (void)select_q6_launch(rows, k, tokens, policy); return;
+    default:                 (void)select_q8_launch(rows, k, tokens, policy); return;
+    }
+}
+
 bool rowsplit_tensor_core_admits(QType qtype, LinearPolicy policy, int rows, int k, int tokens) noexcept {
     return rowsplit_format(qtype) && policy == LinearPolicy::A16Only &&
            static_cast<long long>(rows) * k <= kRowsplitMaxWeight &&
@@ -133,17 +153,30 @@ bool rowsplit_tensor_core_admits(QType qtype, LinearPolicy policy, int rows, int
 
 std::size_t rowsplit_tensor_core_workspace_bytes(QType qtype, LinearPolicy policy, int rows, int k,
                                                  int max_tokens) noexcept {
-    return rowsplit_tensor_core_admits(qtype, policy, rows, k, max_tokens)
-               ? sm70_tensor_core_workspace_bytes(rows, k, max_tokens)
-               : 0;
+    if (!rowsplit_tensor_core_admits(qtype, policy, rows, k, max_tokens)) { return 0; }
+    // Only a shape the format registers reaches the route (rowsplit_tensor_core_linear).
+    try {
+        select_format_launch(qtype, policy, rows, k, max_tokens);
+    } catch (const std::invalid_argument&) {
+        return 0;
+    }
+    return sm70_tensor_core_workspace_bytes(rows, k, max_tokens);
 }
 
 bool rowsplit_tensor_core_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                                  WorkspaceArena* workspace, cudaStream_t stream) {
-    if (!rowsplit_tensor_core_admits(w.qtype, policy, w.n, w.k, x.ne[1]) ||
-        !sm70_tensor_core_can_launch(stream)) {
-        return false;
+    if (!rowsplit_tensor_core_admits(w.qtype, policy, w.n, w.k, x.ne[1])) { return false; }
+    // The format's own domain first, as its dispatcher would check it: the registered shape table
+    // and policy (select_*_launch throws outside them) and the physical row-split operands. This
+    // route only replaces the kernel for a call the format already accepts.
+    select_format_launch(w.qtype, policy, w.n, w.k, x.ne[1]);
+    switch (w.qtype) {
+    case QType::Q4_G64_FP16: validate_q4_operands(q4_linear_operands(x, w)); break;
+    case QType::Q5_G64_FP16: validate_q5_operands(q5_linear_operands(x, w)); break;
+    case QType::Q6_G64_FP16: validate_q6_operands(q6_linear_operands(x, w)); break;
+    default:                 validate_q8_operands(q8_linear_operands(x, w)); break;
     }
+    if (!sm70_tensor_core_can_launch(stream)) { return false; }
     Sm70Staging st{};
     if (workspace == nullptr) { return sm70_staging(nullptr, w.n, w.k, x.ne[1], st); } // false, reported
     const auto scope = workspace->scope();
