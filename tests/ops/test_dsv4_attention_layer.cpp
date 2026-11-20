@@ -385,6 +385,7 @@ int main() {
                 for (int j = 0; j < topk; ++j) {
                     const std::int32_t v = got[static_cast<std::size_t>(s) * topk + j];
                     if (v < 0) {
+                        check(v == -1, "the selection's only negative value is the -1 padding");
                         ++got_pad;
                         continue;
                     }
