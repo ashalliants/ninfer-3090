@@ -121,9 +121,9 @@ constexpr ReductionCriterion kAttentionInt8Criterion{
     /*gross_relative_to_max_reference*/ kBf16GrossRelativeFloor,
 };
 
-// sm_70 serves single-sequence INT8 G64 prompts (W >= 64) with llama.cpp's FP16 tensor-core flash
-// attention over keys dequantized to FP16 (ops/launcher/gqa_attention_volta_flash.cu), which
-// accumulates P*V in FP16 as llama.cpp does on every tensor-core GPU. That adds rounding that grows
+// sm_70 serves single-sequence INT8 G64 prompts (W >= 17, every width past the verify widths) with
+// llama.cpp's FP16 tensor-core flash attention over keys dequantized to FP16
+// (ops/launcher/gqa_attention_volta_flash.cu), which accumulates P*V in FP16 as llama.cpp does on every tensor-core GPU. That adds rounding that grows
 // with the key count. Measured over every such case here (NINFER_OP_REPORT_STATS=1):
 //
 //     keys      max relative_l2   (the INT8 kernel on the same cases: 1.75e-3 at every size)
@@ -134,6 +134,8 @@ constexpr ReductionCriterion kAttentionInt8Criterion{
 // The gate below admits that with a margin and stays under kAttentionFp8Criterion's 1.2e-2, the
 // error the FP8 KV profile ships with. Perplexity over the 2,292-token sample moved 6.00650 ->
 // 6.00707.
+// The narrowest single-sequence INT8 G64 call the sm_70 flash route takes: one past the verify widths.
+[[maybe_unused]] constexpr std::int32_t kVoltaFlashMinimumWidth = 17;
 constexpr ReductionCriterion kAttentionVoltaFlashCriterion{
     /*relative_l2*/ 8.5e-3,
     /*gross_absolute*/ 1.1e-3,
@@ -2234,7 +2236,8 @@ const char* cache_name(const CachePlan& plan) {
 ReductionCriterion attention_criterion(const CachePlan& plan);
 ReductionCriterion attention_criterion(const CachePlan& plan, std::int32_t tokens) {
 #if defined(NINFER_SM70)
-    if (plan.dtype == DType::I8 && !plan.packed_keys && !plan.packed_values() && tokens >= 64) {
+    if (plan.dtype == DType::I8 && !plan.packed_keys && !plan.packed_values() &&
+        tokens >= kVoltaFlashMinimumWidth) {
         return kAttentionVoltaFlashCriterion;
     }
 #endif
@@ -2271,13 +2274,13 @@ const char* cache_name(KvCacheStorage storage) {
     return "unknown";
 }
 
-// The criterion for one call: on sm_70 a single-sequence INT8 G64 call of 64 or more columns runs
+// The criterion for one call: on sm_70 a single-sequence INT8 G64 call of 17 or more columns runs
 // the flash route (see kAttentionVoltaFlashCriterion); every other call keeps its storage's gate.
 ReductionCriterion attention_criterion(KvCacheStorage storage);
 ReductionCriterion attention_criterion(KvCacheStorage storage, std::int32_t tokens,
                                        std::int32_t batch = 1) {
 #if defined(NINFER_SM70)
-    if (storage == KvCacheStorage::Int8Group64 && batch == 1 && tokens >= 64) {
+    if (storage == KvCacheStorage::Int8Group64 && batch == 1 && tokens >= kVoltaFlashMinimumWidth) {
         return kAttentionVoltaFlashCriterion;
     }
 #endif
@@ -3864,12 +3867,12 @@ int verify_int8_prompt_split_capacity() {
                             ops::causal_softmax_attention_workspace_capacity_bytes(
                                 op_geometry(geometry), storage, {1, keys}, 1, width, width,
                                 execution);
-                        // On sm_70 an INT8 G64 prompt of 64+ columns runs the flash route, whose
+                        // On sm_70 an INT8 G64 prompt of 17+ columns runs the flash route, whose
                         // staging holds the visible keys in FP16 (about 6 KB per key), so only
                         // the monotonicity half of the contract applies to it.
 #if defined(NINFER_SM70)
-                        const bool bounded =
-                            !(storage == KvCacheStorage::Int8Group64 && width >= 64);
+                        const bool bounded = !(storage == KvCacheStorage::Int8Group64 &&
+                                               width >= kVoltaFlashMinimumWidth);
 #else
                         constexpr bool bounded = true;
 #endif

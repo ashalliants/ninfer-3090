@@ -394,7 +394,10 @@ struct SmallTWorkspace {
 
 #if defined(NINFER_SM70)
 // The prompt route on sm_70 (launch.h, kVoltaFlash*): FP16 tensor-core flash attention where the
-// INT8 prompt kernel would run emulated mma. One sequence, the two shipped geometries, INT8 G64 KV.
+// INT8 prompt kernel would run emulated mma. One sequence, the two shipped geometries, INT8 G64 KV,
+// every width past the verify widths (graph profiles, which count kernel nodes per route, never
+// reach it).
+static_assert(detail::kVoltaFlashMinimumWidth == kMaximumVerifyTokens + 1);
 bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width, std::int32_t batch_size,
                                 KvCacheStorage cache_storage) {
     // The two geometries the launcher instantiates (geometry.cuh: CausalD256H24Kv4,
