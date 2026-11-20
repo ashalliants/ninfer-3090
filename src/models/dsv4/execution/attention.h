@@ -71,6 +71,7 @@ struct IndexerViews {
 struct AttentionLayerViews {
     Weight q_a, q_b, kv, out_a, out_b;
     Tensor q_a_norm, kv_norm, sinks;
+    Tensor attn_norm; // the block's pre-attention RMSNorm weight BF16 [hidden], for the block runner (not used by attention_layer)
     std::optional<CompressorViews> compressor; // kv source layers
     std::optional<IndexerViews> indexer;       // index source layers
     ops::LinearPolicy policy = ops::LinearPolicy::AllowA8;

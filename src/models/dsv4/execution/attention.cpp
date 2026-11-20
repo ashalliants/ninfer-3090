@@ -321,6 +321,7 @@ AttentionBinding bind_attention_views(const Model& model, const AttentionWeights
     v.out_a                 = ggml(ids.output_a);
     v.out_b                 = ggml(ids.output_b);
     v.q_a_norm              = norm(ids.q_a_norm, rank);
+    v.attn_norm             = norm(ids.norm, h);
     v.kv_norm               = norm(ids.kv_norm, d);
     v.sinks                 = dense(ids.sinks, {static_cast<std::int32_t>(c.heads)});
     require(v.sinks.dtype == DType::FP32, "the attention sinks must be stored FP32");

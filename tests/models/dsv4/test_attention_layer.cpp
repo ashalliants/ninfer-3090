@@ -525,7 +525,7 @@ void test_bound_views(const char* path, cudaStream_t stream) {
         check(views.q_a.n == kQLora && views.q_a.k == kHidden && views.out_a.n == 8192 &&
                   views.out_b.n == kHidden,
               "bound GGML shapes");
-        check(views.q_a_norm.dtype == DType::BF16 && views.sinks.dtype == DType::FP32 &&
+        check(views.attn_norm.dtype == DType::BF16 && views.attn_norm.ne[0] == kHidden && views.q_a_norm.dtype == DType::BF16 && views.sinks.dtype == DType::FP32 &&
                   views.sinks.ne[0] == 64,
               "bound norm and sink types");
         const Tensor in(x.p, DType::BF16, {kHidden, T});
