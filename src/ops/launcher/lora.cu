@@ -36,10 +36,25 @@ void lora_apply_launch(const Tensor& x, const LoraDown& down, std::span<const Lo
     shrink.columns = total;
     shrink.width   = columns.width;
     shrink.partial = partial;
-    const dim3 shrink_grid(static_cast<unsigned>((total + kLoraShrinkColumns - 1) / kLoraShrinkColumns),
-                           static_cast<unsigned>(down.rank / kLoraShrinkRows),
-                           static_cast<unsigned>(splits));
-    lora_shrink_kernel<<<shrink_grid, kLoraThreads, 0, stream>>>(shrink);
+    // The narrowest tile that holds the call (decode and verify widths), else the widest, with two
+    // rank rows per warp past eight columns where the rank allows (kernel/lora.cuh).
+    const auto launch_shrink = [&]<int Cols, int RowsPerWarp>() {
+        const dim3 grid(static_cast<unsigned>((total + Cols - 1) / Cols),
+                        static_cast<unsigned>(down.rank / (kLoraShrinkRows * RowsPerWarp)),
+                        static_cast<unsigned>(splits));
+        lora_shrink_kernel<Cols, RowsPerWarp><<<grid, kLoraThreads, 0, stream>>>(shrink);
+    };
+    if (total <= 1) {
+        launch_shrink.template operator()<1, 1>();
+    } else if (total <= 2) {
+        launch_shrink.template operator()<2, 1>();
+    } else if (total <= 4) {
+        launch_shrink.template operator()<4, 1>();
+    } else if (total <= kLoraShrinkColumns || down.rank % (2 * kLoraShrinkRows) != 0) {
+        launch_shrink.template operator()<kLoraShrinkColumns, 1>();
+    } else {
+        launch_shrink.template operator()<kLoraShrinkColumns, 2>();
+    }
     CUDA_CHECK(cudaGetLastError());
 
     LoraExpandParams expand{};
@@ -63,11 +78,31 @@ void lora_apply_launch(const Tensor& x, const LoraDown& down, std::span<const Lo
     expand.width   = columns.width;
     expand.splits  = splits;
     expand.partial = partial;
-    const dim3 expand_grid(static_cast<unsigned>((widest + kLoraThreads - 1) / kLoraThreads),
-                           static_cast<unsigned>((total + kLoraExpandColumns - 1) / kLoraExpandColumns),
-                           static_cast<unsigned>(up.size()));
-    const std::size_t shared = static_cast<std::size_t>(deepest) * kLoraExpandColumns * sizeof(float);
-    lora_expand_kernel<<<expand_grid, kLoraThreads, shared, stream>>>(expand);
+    const auto launch_expand = [&]<int Cols>() {
+        const dim3 grid(static_cast<unsigned>((widest + kLoraThreads - 1) / kLoraThreads),
+                        static_cast<unsigned>((total + Cols - 1) / Cols),
+                        static_cast<unsigned>(up.size()));
+        const std::size_t shared = static_cast<std::size_t>(deepest) * Cols * sizeof(float);
+        lora_expand_kernel<Cols><<<grid, kLoraThreads, shared, stream>>>(expand);
+    };
+    if (total <= 1) {
+        launch_expand.template operator()<1>();
+    } else if (total <= 2) {
+        launch_expand.template operator()<2>();
+    } else if (total <= 4) {
+        launch_expand.template operator()<4>();
+    } else if (total <= kLoraExpandColumns) {
+        launch_expand.template operator()<kLoraExpandColumns>();
+    } else {
+        constexpr int rows_per_block = kLoraThreads * kLoraExpandRows;
+        const dim3 grid(static_cast<unsigned>((widest + rows_per_block - 1) / rows_per_block),
+                        static_cast<unsigned>((total + kLoraExpandColumns - 1) / kLoraExpandColumns),
+                        static_cast<unsigned>(up.size()));
+        const std::size_t shared =
+            static_cast<std::size_t>(deepest) * kLoraExpandColumns * sizeof(float);
+        lora_expand_rows_kernel<kLoraExpandColumns, kLoraExpandRows>
+            <<<grid, kLoraThreads, shared, stream>>>(expand);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

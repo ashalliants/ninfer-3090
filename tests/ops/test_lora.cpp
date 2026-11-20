@@ -293,6 +293,9 @@ int main() {
     // o_proj and down_proj into the residual stream; adapter 1 has no A for this input.
     failures += run_case({"lora o_proj B4", 6144, 32, 2, present({true, false}),
                           {{5120, 0, 32, 5120, 0, both}}, map({0, 1, -1, 0}, 1), 41u});
+    // One column (single-lane decode): the launcher's narrowest tiles.
+    failures += run_case({"lora o_proj decode B1", 6144, 32, 2, present({true, false}),
+                          {{5120, 0, 32, 5120, 0, both}}, map({0}, 1), 43u});
     failures += run_case({"lora down_proj prefill T129", 17408, 32, 1, present({true}),
                           {{5120, 0, 32, 5120, 0, present({true})}}, map({0}, 129), 51u});
     // A small odd geometry: K not a multiple of the split, a 16-wide rank.
