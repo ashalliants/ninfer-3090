@@ -31,7 +31,9 @@ namespace ninfer::ops {
  *   [sum N_i, T]. T >= 1.
  *
  * Supported domain:
- *   K a multiple of 8 and at most 3072; one to four weights; every operand contiguous and
+ *   K a multiple of 8 and at most 8192 (a K above 3072, DeepSeek-V4's hidden size of 5120 among
+ *   them, always takes the wide mapping, which gives the same bits as the narrow one; the BF16
+ *   split form below keeps the limit of 3072); one to four weights; every operand contiguous and
  *   16-byte aligned.
  *
  * Numeric:

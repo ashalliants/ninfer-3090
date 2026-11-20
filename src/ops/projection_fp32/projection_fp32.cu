@@ -24,8 +24,13 @@ constexpr int kRowsPerWarp   = 4;
 constexpr int kRowsPerCta    = kThreads / 32 * kRowsPerWarp;
 constexpr int kColumns       = 8; // columns staged per CTA
 constexpr int kMaxSegments   = 4;
-constexpr int kMaxK          = 3072;
-constexpr int kMaxLaneChunks = kMaxK / 8 / 32; // 8-element chunks one lane reads per row
+constexpr int kMaxK          = 3072; // the narrow kernels' (register arrays and staging are sized by it)
+// The longest K projection_fp32 serves: beyond kMaxK only the wide mapping (it walks K in slices and has no
+// K-sized state), which gives the same bits as the narrow ones.
+constexpr int kMaxLongK      = 8192;
+// The narrow kernels' second size: K up to DeepSeek-V4's hidden size (5120, 20 chunks a lane), which
+// needs more registers and shared memory than the K <= 3072 instances, so it is a separate instantiation.
+constexpr int kMaxMidK       = 5120;
 
 struct Segments {
     const bf16* data[kMaxSegments];
@@ -62,11 +67,12 @@ __device__ __forceinline__ const uint4* row_chunk(const Segments& segments, int 
 }
 
 // Issues lane `lane`'s chunk loads of `row` (chunks lane, lane + 32, ...) into `loaded`.
+template <int LaneChunks>
 __device__ __forceinline__ void load_row(const Segments& segments, int row, int k, int chunks,
-                                         int lane, uint4 (&loaded)[kMaxLaneChunks]) {
+                                         int lane, uint4 (&loaded)[LaneChunks]) {
     const uint4* w = row_chunk(segments, row, k, 0);
 #pragma unroll
-    for (int i = 0; i < kMaxLaneChunks; ++i) {
+    for (int i = 0; i < LaneChunks; ++i) {
         const int chunk = lane + 32 * i;
         if (chunk < chunks) { loaded[i] = w[chunk]; }
     }
@@ -105,12 +111,13 @@ struct Bf16SplitOut {
     }
 };
 
-template <int Threads, int RowsPerWarp, int Columns = kColumns, class Out = Fp32Out>
+template <int Threads, int RowsPerWarp, int Columns = kColumns, class Out = Fp32Out, int MaxK = kMaxK>
 __global__ void __launch_bounds__(Threads)
     projection_kernel(const bf16* __restrict__ x, int k, int columns, Segments segments, Out out) {
-    constexpr int Warps = Threads / 32;
+    constexpr int Warps          = Threads / 32;
+    constexpr int kMaxLaneChunks = MaxK / 8 / 32; // 8-element chunks one lane reads per row
     // 16-byte x chunks of the CTA's columns, as one unrolled batch of at most this many per thread.
-    constexpr int kStagePerThread = (Columns * kMaxK / 8 + Threads - 1) / Threads;
+    constexpr int kStagePerThread = (Columns * MaxK / 8 + Threads - 1) / Threads;
     extern __shared__ uint4 staged[];
     const int first_column = blockIdx.y * kColumns;
     const int count        = min(Columns, columns - first_column);
@@ -119,7 +126,7 @@ __global__ void __launch_bounds__(Threads)
     const int lane         = threadIdx.x % 32;
     const int first_row    = blockIdx.x * (Warps * RowsPerWarp) + threadIdx.x / 32;
     uint4 loaded[kMaxLaneChunks];
-    if (first_row < rows) { load_row(segments, first_row, k, chunks, lane, loaded); }
+    if (first_row < rows) { load_row<kMaxLaneChunks>(segments, first_row, k, chunks, lane, loaded); }
     // The CTA's columns of x are contiguous, so chunk i of the staging is chunk i of x from there.
     const auto* xs = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(first_column) * k);
 #pragma unroll
@@ -135,7 +142,7 @@ __global__ void __launch_bounds__(Threads)
     for (int r = 0; r < RowsPerWarp; ++r) {
         const int row = first_row + r * Warps;
         if (row >= rows) { return; }
-        if (r > 0) { load_row(segments, row, k, chunks, lane, loaded); }
+        if (r > 0) { load_row<kMaxLaneChunks>(segments, row, k, chunks, lane, loaded); }
         float sums[Columns] = {};
 #pragma unroll
         for (int i = 0; i < kMaxLaneChunks; ++i) {
@@ -282,12 +289,13 @@ __global__ void __launch_bounds__(kWideThreads, 1)
 }
 
 // x's and the weights' checks, and the weights bound as segments (rows: their total).
-Segments bind_segments(const Tensor& x, std::span<const Tensor* const> weights, int& rows) {
+Segments bind_segments(const Tensor& x, std::span<const Tensor* const> weights, int& rows, int max_k) {
     require(x.data != nullptr && x.dtype == DType::BF16 && x.is_contiguous() && x.ne[2] == 1 &&
                 x.ne[3] == 1,
             "x must be contiguous BF16 [K, T]");
     const int k = x.ne[0], columns = x.ne[1];
-    require(k > 0 && k % 8 == 0 && k <= kMaxK && columns > 0, "K must be a multiple of 8 up to 3072");
+    require(k > 0 && k % 8 == 0 && k <= max_k && columns > 0,
+            max_k == kMaxK ? "K must be a multiple of 8 up to 3072" : "K must be a multiple of 8 up to 8192");
     require(!weights.empty() && weights.size() <= kMaxSegments, "between one and four weights");
     require(aligned16(x.data), "x must be 16-byte aligned");
     Segments segments{};
@@ -314,7 +322,7 @@ bool projection_bf16_split_supported(std::int32_t columns) noexcept { return col
 void projection_bf16_split(const Tensor& x, std::span<const Tensor* const> weights, Tensor& first, Tensor& second,
                            cudaStream_t stream) {
     int rows                = 0;
-    const Segments segments = bind_segments(x, weights, rows);
+    const Segments segments = bind_segments(x, weights, rows, kMaxK);
     const int k = x.ne[0], columns = x.ne[1];
     require(projection_bf16_split_supported(columns), "the BF16 split form serves 1 to 8 columns");
     for (const Tensor* t : {&first, &second}) {
@@ -344,14 +352,31 @@ void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Te
     require(out.data != nullptr && out.dtype == DType::FP32 && out.is_contiguous(),
             "out must be contiguous FP32");
     int rows                = 0;
-    const Segments segments = bind_segments(x, weights, rows);
+    const Segments segments = bind_segments(x, weights, rows, kMaxLongK);
     const int k = x.ne[0], columns = x.ne[1];
     require(out.ne[0] == rows && out.ne[1] == columns && out.ne[2] == 1 && out.ne[3] == 1,
             "out must be FP32 [sum N, T]");
     const std::size_t staged =
         static_cast<std::size_t>(std::min(kColumns, columns)) * k * sizeof(bf16);
     const int column_groups = (columns + kColumns - 1) / kColumns;
-    if (columns >= kWideMinColumns) {
+    if (k > kMaxK && k <= kMaxMidK && columns <= kColumns) {
+        // DeepSeek-V4's K = 5120 projections at decode widths: the narrow mapping at its larger size.
+        constexpr int threads = 128, rows_per_warp = 1, rows_per_cta = threads / 32 * rows_per_warp;
+        auto* kernel = columns == 1   ? projection_kernel<threads, rows_per_warp, 1, Fp32Out, kMaxMidK>
+                       : columns <= 2 ? projection_kernel<threads, rows_per_warp, 2, Fp32Out, kMaxMidK>
+                       : columns <= 4 ? projection_kernel<threads, rows_per_warp, 4, Fp32Out, kMaxMidK>
+                                      : projection_kernel<threads, rows_per_warp, kColumns, Fp32Out, kMaxMidK>;
+        if (staged > 48 * 1024) {
+            static const bool configured = [] {
+                return cudaFuncSetAttribute(projection_kernel<threads, rows_per_warp, kColumns, Fp32Out, kMaxMidK>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            kColumns * kMaxMidK * static_cast<int>(sizeof(bf16))) == cudaSuccess;
+            }();
+            require(configured, "the narrow kernel's shared memory could not be configured");
+        }
+        kernel<<<dim3((rows + rows_per_cta - 1) / rows_per_cta, column_groups), threads, staged, stream>>>(
+            static_cast<const bf16*>(x.data), k, columns, segments, Fp32Out{static_cast<float*>(out.data)});
+    } else if (columns >= kWideMinColumns || k > kMaxK) {
         static_assert(kWideSharedBytes <= kMaxDynamicSharedBytes);
         static const bool configured = [] {
             return cudaFuncSetAttribute(projection_wide_kernel,
