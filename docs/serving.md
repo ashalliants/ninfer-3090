@@ -2409,6 +2409,74 @@ are bit-for-bit those of a server with no vector. With no `--graft`, nothing cha
   layer in `[1, 47]`) and normalised to unit length at startup; anything else refuses to start,
   naming the graft. Up to 16 vectors may be loaded, 0.5 MiB of device memory each.
 
+## LoRA adapters
+
+`--lora NAME=PATH` loads a [PEFT](https://github.com/huggingface/peft) LoRA adapter for the dense
+Qwen3.5 / 3.6 / 3.8 text models (Qwen3.8-27B and the other dense artifacts). `PATH` is the adapter
+directory as PEFT saves it: `adapter_config.json` plus `adapter_model.safetensors` (F32, BF16 or
+F16). The flag repeats, up to eight adapters. A request selects one with the top-level
+`"lora": "NAME"` field on Chat Completions, Responses (create and input token count) and Anthropic
+Messages; every other request runs the base model, so one server serves the base model and each
+adapter side by side, in the same decode rounds.
+
+```bash
+ninfer-serve qwen38-27b.ninfer --lora pi=/models/loras/qwen38-27b-pi-adapted
+curl http://127.0.0.1:8080/v1/chat/completions -d '{"model": "m", "lora": "pi",
+  "chat_template_kwargs": {"enable_thinking": false},
+  "messages": [{"role": "user", "content": "hello"}]}'
+```
+
+`--default-lora NAME` applies a loaded adapter to every request that states none, with the same
+table as grafts: absent or `null` takes the default, `""` is the base model, `"X"` is `X`. A name the
+server did not load fails with `400 unknown_lora`; a non-string value fails as a malformed `lora`
+field. The launchers take `NINFER_LORA=NAME=PATH` (`run.sh`: several separated by `;`) and
+`NINFER_DEFAULT_LORA`. A `lora` selection combines with a `prefill_kv` graft (the graft is replayed
+under the adapter) but not with a `direct_kv` or `softprompt_kv` graft, whose installed state is the
+base model's; that combination fails with `400`.
+
+**What is applied.** The adapter runs unmerged: each adapted projection computes
+`y = W x + (alpha / r) * B (A x)` (`use_rslora`: `alpha / sqrt(r)`), with `A` and `B` in BF16 and
+the low-rank product accumulated in FP32. The supported targets are the full-attention `q_proj`,
+`k_proj`, `v_proj`, `o_proj` and the MLP `gate_proj`, `up_proj`, `down_proj` of the text layers,
+which is what a `target_modules: [q,k,v,o,gate,up,down]_proj` adapter trains on these models (PEFT
+matches `q_proj` only in the full-attention layers; the Gated DeltaNet layers have no such module).
+Startup refuses, naming the adapter and the problem: a Gated DeltaNet (`linear_attn.*`), Vision, MTP,
+embedding, head or MoE expert target; DoRA, `rank_pattern`/`alpha_pattern`, LoRA bias, trained
+biases, `modules_to_save`, trainable tokens or aLoRA; a module with only one of `lora_A`/`lora_B`;
+another model's shapes; non-finite values; and a pickled `adapter_model.bin`. Qwen3.8-Flash-Next,
+pipeline (multi-GPU) runs and `--purpose score` refuse `--lora`.
+
+**GGUF LoRA files** (llama.cpp `convert_lora_to_gguf.py` output) are not loaded: the PEFT directory
+is what trainers publish, holds the exact trained values and the scale, and needs no second converter
+to keep in step. A GGUF copy is still useful to check NInfer's output against llama.cpp.
+
+**Speculation.** The MTP head and the DFlash drafter run unadapted (an adapter has no tensors for
+them). The target verifies every proposal with the adapter on, so the tokens are the adapted
+model's; only the acceptance rate can fall.
+
+**CUDA graphs.** The captured decode graphs carry no adapter selection, so a round in which any row
+selects an adapter runs eagerly (as `--no-cuda-graph` does) and costs the launch overhead the graphs
+save; rounds of base-model requests replay the graphs and are bit-for-bit those of a server with no
+`--lora`. Prefill always runs eagerly.
+
+**Context cache.** An adapter changes every activation, so its requests have their own cache
+identity, the base identity mixed with a digest of the adapter's tensors and scale: they reuse only
+checkpoints computed under the same adapter, never the base model's or another adapter's, and
+persisted checkpoint images carry that identity across restarts.
+
+**Memory.** The adapters stay on the GPU for the server's life (also across `--model-suspend`):
+`A` and `B` in BF16, every adapter padded to the largest rank rounded up to 8. The
+`Qwen3.8-27B-pi-adapted` adapter (r=32, 159 M parameters) takes about 320 MiB, which the context fit
+sees as used memory. The FFN of an adapted request runs gate/up and down as separate projections so
+the adapter can update the SwiGLU input, and the workspace plan reserves that route's plane.
+
+**Chat template and thinking.** An adapter reuses the model's tokenizer and chat template. Check
+that its `chat_template.jinja` and tokenizer match the base model's: the `Qwen3.8-27B-pi-adapted`
+template is byte-identical to the official Qwen3.8-27B one (NInfer's template is derived from it),
+and its tokenizer has the same vocabulary, merges and added tokens. That adapter was trained with
+thinking off, so serve it with `--no-thinking` or send
+`"chat_template_kwargs": {"enable_thinking": false}`.
+
 ## Authentication and CORS
 
 Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or Anthropic

@@ -241,6 +241,40 @@ stored rotated is not converted by the converter: it stays T2, inverse-rotated, 
 gathers each row and restores it to the primal basis with the hidden-width signs that the output head
 carries.
 
+## LoRA adapters
+
+`--lora` (`EngineOptions::loras`) loads PEFT adapters (`src/models/qwen3_5/load/lora.{h,cpp}`) into
+`execution::Parameters::lora` (`execution/lora.{h,cpp}`); the user-facing contract is in
+[serving.md](../serving.md#lora-adapters). The mapping onto this model:
+
+| PEFT module | site (`LoraBlock`) | input | updated output |
+|---|---|---|---|
+| `self_attn.q_proj` | attention input | normalized mixer input | `query` and output `gate` |
+| `self_attn.k_proj`, `v_proj` | attention input | same | `key`, `value` |
+| `self_attn.o_proj` | attention output | gated attention output | residual |
+| `mlp.gate_proj`, `up_proj` | FFN input | normalized FFN input | gate and up halves of the SwiGLU plane |
+| `mlp.down_proj` | FFN output | SwiGLU activation | residual |
+
+- `q_proj`'s rows interleave per head `[query D | gate D]` (the converter's split), so its `B` is
+  split into a query `B` and a gate `B` sharing one `A` (`lora_split_query_gate`).
+- One `ops::lora_apply` call per site and input: the `A` matrices of a site are stacked
+  (`[A_q; A_k; A_v]`, `[A_gate; A_up]`), so the input is read once and each output's `B` reads its
+  rank section. Every adapter is zero-padded to the largest rank rounded up to 8 (`R`).
+- A Hadamard-rotated Use reads `x_r = H diag(s) x`, so the stored `A` is `A diag(s) H`
+  (`lora_rotate_rows`) and the site reads the same rotated input as the base projection.
+- `alpha / r` is folded into `B` at load. Matrices are uploaded once, BF16, into one buffer.
+- The dense FFN of a pass that selects an adapter takes the unfused route (`lora_ffn`: gate/up
+  plane, LoRA on the plane, `silu_mul(_hadamard)`, `linear_add` down, LoRA on the residual), since
+  `linear_swiglu` never materializes the pre-activation. The workspace plan adds that route's peak
+  and each site's Op scratch when adapters are loaded.
+- Selection is per sequence: `PreparedPromptData::lora` (the frontend resolves the name) becomes
+  `SequenceState::lora`, and each pass's `ExecutionCore::lora` (`ops::LoraColumns`, one slot per
+  row) reaches `TextContext::set_lora`. The kernels take the selection by value, so a decode, MTP
+  or DFlash round with an adapter row runs eagerly and the captured graphs stay adapter-free; the
+  MTP head, the DFlash drafter and the lossy scout's int4 pass are never adapted.
+- The request's prefix identity tag is `prefix_identity_tag(lora)`: the base tag mixed with the
+  adapter digest (`LoraAdapter::digest`, FNV-1a over names, shapes, raw bytes and the scale).
+
 ## Prefill, decode and MTP
 
 Text prefill gathers embedding columns, replaces media placeholders with Vision outputs, and runs
