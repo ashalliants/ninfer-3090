@@ -44,6 +44,16 @@ int q5_a16_conformance() {
             "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
             ShapeCase{5120, k, 401U, no_starts, full, {}, true, 0});
     }
+    // The verify widths around the sm_70 tensor-core form's start (NINFER_STREAM_HMMA_Q5=1:
+    // Q5StreamFormat::kHmmaMinCols = 6 for K <= 6144, eight tokens for longer rows), every
+    // column through the public Op: b-1/b/b+1 at both K. Without the opt-in (or off sm_70) the
+    // same widths check the SIMT route.
+    constexpr std::array<std::int32_t, 5> verify_widths{5, 6, 7, 8, 9};
+    for (const auto k : {6144, 17408}) {
+        failures += ninfer::test::linear_add::run_shape(
+            "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
+            ShapeCase{5120, k, 405U, no_starts, verify_widths, {}, true, 0});
+    }
     // T = 8 alone, so the activation ends where the last token's row does: the K-chunked
     // streaming GEMV (sm_70 decode/verify, T >= 2) stages K = 17408 in chunks that do not divide
     // it, and its last chunk must stage only the K that is left. Reading a full chunk there runs
