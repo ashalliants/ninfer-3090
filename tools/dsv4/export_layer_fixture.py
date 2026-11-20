@@ -91,6 +91,8 @@ def main() -> int:
     parser.add_argument("--tokens", type=int, default=200)
     parser.add_argument("--seed", type=int, default=1)
     args = parser.parse_args()
+    if args.tokens < 1:
+        parser.error("--tokens must be at least 1")
     final = args.out
     if final.exists() and any(final.iterdir()):
         parser.error(f"{final} is not empty")
@@ -110,6 +112,8 @@ def main() -> int:
         index_source = args.layer in [int(v) for v in meta[key + "attention.indexer.source_layers"]]
         if ratio not in (0, 2) or (ratio and not (kv_source and index_source)):
             parser.error(f"layer {args.layer} (ratio {ratio}, kv source {kv_source}, index source {index_source}) is not exportable")
+        if ratio and args.tokens < ratio:
+            parser.error(f"--tokens {args.tokens} is below the compress ratio {ratio}: the compressor would produce no latents")
         cfg = att.AttentionConfig(
             dim=int(meta[key + "embedding_length"]),
             n_heads=int(meta[key + "attention.head_count"]),
