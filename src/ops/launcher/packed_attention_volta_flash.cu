@@ -149,7 +149,7 @@ __global__ void stage_kernel(const __nv_bfloat16* __restrict__ q, const __nv_bfl
         vv = __bfloat162float(v[t * v_token + head * kHeadDim + d]);
         constexpr float kMax = 65504.0f;
         if (!(fabsf(kv) <= kMax && fabsf(vv) <= kMax && fabsf(qv) <= kMax)) {
-            *overflow = 1;
+            atomicOr(overflow, 1); // many threads may see one; only on the rare overflow path
         }
     }
     q_out[i] = qv;

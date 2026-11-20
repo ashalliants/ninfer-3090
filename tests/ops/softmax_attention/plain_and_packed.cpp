@@ -86,6 +86,8 @@ enum class InputProfile {
     // One V value past FP16's range: the sm_70 flash route stages K/V in FP16, so this call
     // must fall back to the BF16 kernel.
     Fp16Overflow,
+    // The same in every token's V (and one Q value): many staging threads flag it at once.
+    Fp16OverflowEverywhere,
     // Q and K eight times wider: sharp, near one-hot attention rows, where the FP16 route's
     // rounding of P matters most.
     Peaked,
@@ -136,6 +138,12 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
         for (float& value : k) { value *= 8.0f; }
     }
     if (input_profile == InputProfile::Fp16Overflow) { v[token_plane * (tokens / 2) + 5] = 1.0e5f; }
+    if (input_profile == InputProfile::Fp16OverflowEverywhere) {
+        for (int token = 0; token < tokens; ++token) {
+            v[token_plane * static_cast<std::size_t>(token) + 5] = 1.0e5f;
+        }
+        q[token_plane * static_cast<std::size_t>(tokens / 3) + 7] = -7.0e4f;
+    }
     round_to_bf16(q);
     round_to_bf16(k);
     round_to_bf16(v);
@@ -233,6 +241,7 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
     const std::string qualified_label =
         input_profile == InputProfile::SegmentIsolation ? label + " segment-isolation"
         : input_profile == InputProfile::Fp16Overflow   ? label + " fp16-overflow"
+        : input_profile == InputProfile::Fp16OverflowEverywhere ? label + " fp16-overflow-everywhere"
         : input_profile == InputProfile::Peaked         ? label + " peaked"
                                                         : label;
     int failures =
@@ -394,6 +403,8 @@ int run_softmax_attention_plain_and_packed_tests() {
     failures += run_case({0, 1}, 9u, StorageProfile::Contiguous, PublicEntry::UniformArena);
     failures += run_case({0, 100, 200}, 103u, StorageProfile::Contiguous,
                          PublicEntry::UniformArena, InputProfile::Fp16Overflow);
+    failures += run_case({0, 100, 200}, 107u, StorageProfile::InterleavedQkv,
+                         PublicEntry::UniformArena, InputProfile::Fp16OverflowEverywhere);
     // Sharp attention through both kernels (the BF16 one by cu_seqlens), the same inputs.
     failures += run_case({0, 1024, 2048}, 105u, StorageProfile::InterleavedQkv,
                          PublicEntry::CuSeqlensArena, InputProfile::Peaked);
