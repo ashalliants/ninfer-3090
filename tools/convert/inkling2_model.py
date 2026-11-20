@@ -94,10 +94,9 @@ def resources(metadata: Mapping, config: Mapping, overrides: Mapping[str, str | 
         raise Inkling2Error(f"an inkling2 GGUF needs the checkpoint's {sorted(missing)} (--resource NAME=PATH)")
     tokenizer_json = Path(overrides["tokenizer.json"]).read_bytes()
     tokenizer_config_json = Path(overrides["tokenizer_config.json"]).read_bytes()
-    inkling2_tokenizer.check_tokenizer_json(json.loads(tokenizer_json))
-    inkling2_tokenizer.check_gguf(metadata, config["unpadded_vocab_size"])
+    inkling2_tokenizer.check_tokenizer(json.loads(tokenizer_json), metadata, config["unpadded_vocab_size"])
     tokenizer_config = json.loads(tokenizer_config_json)
-    for key, (_, text) in (("eos_token", inkling2_tokenizer.EOS), ("pad_token", inkling2_tokenizer.PAD)):
+    for key, text in (("eos_token", inkling2_tokenizer.EOS), ("pad_token", inkling2_tokenizer.PAD)):
         if tokenizer_config.get(key) != text:
             raise Inkling2Error(f"tokenizer_config.json: {key} is {tokenizer_config.get(key)!r}, expected {text!r}")
     if "chat_template.jinja" in overrides:
@@ -108,8 +107,8 @@ def resources(metadata: Mapping, config: Mapping, overrides: Mapping[str, str | 
         raise Inkling2Error("a chat template is required: the GGUF has none, so supply the checkpoint's")
     generation = {
         "do_sample": True,
-        "eos_token_id": [inkling2_tokenizer.EOS[0]],
-        "pad_token_id": inkling2_tokenizer.PAD[0],
+        "eos_token_id": [metadata["tokenizer.ggml.eos_token_id"]],
+        "pad_token_id": metadata["tokenizer.ggml.padding_token_id"],
         "temperature": 1.0,
     }
     return {

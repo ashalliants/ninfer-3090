@@ -2,11 +2,14 @@
 
 Six physical layers with the loop core [2, 4) run three times (10 visits) and residual blocks of 2. Experts: layers
 0-3 NVFP4 with per-expert scales (as every Unsloth build's layers 0-19), layers 4-5 BF16 (UD-Q8_K_XL's 20-23).
-Dense weights mix BF16 and Q8_0; the embedding and head are Q8_0.
+Dense weights mix BF16 and Q8_0; the embedding and head are Q8_0. The tokenizer is the real pipeline and 60 added
+tokens over a 30-token base vocabulary; :func:`tokenizer_files` writes the matching tokenizer.json and
+tokenizer_config.json.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +27,7 @@ LAYERS = 6
 VISITS = LAYERS + (PASSES - 1) * (CORE[1] - CORE[0])
 LOCAL = (0, 2, 4)
 VOCAB, UNPADDED = 96, 90
+_PIPELINE = Path(__file__).resolve().parents[1] / "fixtures" / "inkling2" / "tokenizer_pipeline.json"
 EXPERT_TYPES = {0: NVFP4, 1: NVFP4, 2: NVFP4, 3: NVFP4, 4: BF16, 5: BF16}
 
 
@@ -34,6 +38,43 @@ def _physical(v: int) -> int:
     if v < CORE[0] + PASSES * core:
         return CORE[0] + (v - CORE[0]) % core
     return v - (PASSES - 1) * core
+
+
+def tokenizer() -> dict:
+    """A tokenizer.json with the real pipeline and added tokens, renumbered after a base of UNPADDED - 60."""
+    pipeline = json.loads(_PIPELINE.read_text())
+    base = UNPADDED - len(pipeline["added_tokens"])
+    added = [dict(item, id=base + i) for i, item in enumerate(pipeline["added_tokens"])]
+    return {"normalizer": None, "pre_tokenizer": pipeline["pre_tokenizer"],
+            "model": pipeline["model"] | {"vocab": {f"t{i}": i for i in range(base)}, "merges": [["t", "1"]]},
+            "added_tokens": added}
+
+
+def tokenizer_files(directory: Path) -> dict[str, Path]:
+    files = {"tokenizer.json": directory / "tokenizer.json", "tokenizer_config.json": directory / "tokenizer_config.json"}
+    files["tokenizer.json"].write_text(json.dumps(tokenizer()))
+    files["tokenizer_config.json"].write_text(json.dumps(
+        {"eos_token": "<|content_model_end_sampling|>", "pad_token": "<|endoftext|>",
+         "tokenizer_class": "PreTrainedTokenizerFast"}))
+    return files
+
+
+def _tokenizer_metadata() -> list[tuple[str, int, object]]:
+    t = tokenizer()
+    tokens = list(t["model"]["vocab"]) + [item["content"] for item in t["added_tokens"]]
+    base = len(t["model"]["vocab"])
+    return [
+        ("tokenizer.ggml.model", STRING, "gpt2"),
+        ("tokenizer.ggml.pre", STRING, "inkling2"),
+        ("tokenizer.ggml.tokens", ARRAY, (STRING, tokens)),
+        ("tokenizer.ggml.token_type", ARRAY, (I32, [1] * base + [3] * (len(tokens) - base))),
+        ("tokenizer.ggml.merges", ARRAY, (STRING, ["t 1"])),
+        ("tokenizer.ggml.eos_token_id", U32, tokens.index("<|content_model_end_sampling|>")),
+        ("tokenizer.ggml.padding_token_id", U32, tokens.index("<|endoftext|>")),
+        ("tokenizer.ggml.add_bos_token", BOOL, False),
+        ("tokenizer.ggml.add_eos_token", BOOL, False),
+        ("tokenizer.chat_template", STRING, "{{ messages }}"),
+    ]
 
 
 def metadata() -> list[tuple[str, int, object]]:
@@ -75,7 +116,7 @@ def metadata() -> list[tuple[str, int, object]]:
         (k + "activation.situ_beta", F32V, 4.0),
         (k + "activation.situ_linear_beta", F32V, 25.0),
         (k + "final_logit_softcapping", F32V, 30.0),
-    ]
+    ] + _tokenizer_metadata()
 
 
 def _nvfp4(ne: tuple[int, ...], seed: int) -> bytes:
@@ -86,7 +127,7 @@ def _nvfp4(ne: tuple[int, ...], seed: int) -> bytes:
     return b.tobytes()
 
 
-def tensors(expert_types: dict[int, int] = EXPERT_TYPES) -> list[tuple[str, int, tuple[int, ...], bytes]]:
+def tensors(expert_types: dict[int, int] = EXPERT_TYPES, scale_type: int = F32) -> list[tuple[str, int, tuple[int, ...], bytes]]:
     from tools.convert.inkling2 import text_config
 
     config = text_config({key: (value[1] if kind == ARRAY else value) for key, kind, value in metadata()})
@@ -125,9 +166,10 @@ def tensors(expert_types: dict[int, int] = EXPERT_TYPES) -> list[tuple[str, int,
         add(f"blk.{layer}.ffn_down_exps.weight", kind, (EXPERTS, HIDDEN, INTER))
         if kind == NVFP4:
             add(f"blk.{layer}.ffn_gate_up_exps.scale", F32, (EXPERTS,))
-            add(f"blk.{layer}.ffn_down_exps.scale", F32, (EXPERTS,))
+            add(f"blk.{layer}.ffn_down_exps.scale", scale_type if layer == 1 else F32, (EXPERTS,))
     return out
 
 
-def write(path: Path, expert_types: dict[int, int] = EXPERT_TYPES) -> Path:
-    return write_gguf(path, metadata(), tensors(expert_types))
+def write(path: Path, expert_types: dict[int, int] = EXPERT_TYPES, scale_type: int = F32) -> Path:
+    """``scale_type`` sets the type of layer 1's down-projection scales (F32 in every real build)."""
+    return write_gguf(path, metadata(), tensors(expert_types, scale_type))

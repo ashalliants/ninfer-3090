@@ -299,7 +299,8 @@ def test_v41_flash_expert_records_at_the_real_shapes():
         ("iq2_xxs", "iq2_xs"), ("iq1_m", "iq2_xxs"), ("iq2_xs", "iq2_xxs"), ("iq2_xs", "iq2_xs"),
     ]
     assert {f"ggml_rec_{a}_{b}" for a, b in pairs} <= set(GGML_RECORD_FORMATS)
-    assert len(GGML_RECORD_FORMATS) == 13 + len(pairs)  # the earlier thirteen are tested above
+    # The earlier thirteen are tested above, and Inkling-2's NVFP4 record below.
+    assert len(GGML_RECORD_FORMATS) == 13 + len(pairs) + 1
     for gate_up, down in pairs:
         name = f"ggml_rec_{gate_up}_{down}"
         g = ggml_expert_record_geometry(name, shape)
@@ -311,3 +312,14 @@ def test_v41_flash_expert_records_at_the_real_shapes():
         assert encoded_size("ggml_expert_record_v1", name, shape) == 384 * g.record_stride, name
     # The published layer-0 expert of the IQ2_XXS build (IQ1_M everywhere) is 7.74 MB, the smallest.
     assert ggml_expert_record_geometry("ggml_rec_iq1_m_iq1_m", shape).record_bytes == 7_741_440
+
+
+def test_inkling2_nvfp4_expert_records_at_the_real_shapes():
+    # Inkling-2-Mini banks [128 experts, hidden 2304, intermediate 1152], NVFP4 (64 values in 36 bytes) in both
+    # parts: a part is rows x (K / 64) x 36.
+    shape = (128, 2304, 1152)
+    g = ggml_expert_record_geometry("ggml_rec_nvfp4_nvfp4", shape)
+    assert (g.gate_bytes, g.down_bytes) == (1152 * 36 * 36, 2304 * 18 * 36) == (1_492_992, 1_492_992)
+    assert (g.down_row_bytes, g.up_offset) == (18 * 36, 1_492_992)
+    assert g.record_bytes == g.record_stride == 4_478_976  # already a multiple of 256
+    assert encoded_size("ggml_expert_record_v1", "ggml_rec_nvfp4_nvfp4", shape) == 128 * 4_478_976

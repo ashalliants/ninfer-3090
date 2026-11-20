@@ -111,6 +111,12 @@ def test_block_experts_without_a_record_format_are_refused(tmp_path):
         inkling2_model.build_model(gguf)
 
 
+def test_expert_scales_must_be_f32(tmp_path):
+    path = fixture.write(tmp_path / "bf16_scale.gguf", scale_type=fixture.BF16)
+    with GgufModel(path) as gguf, pytest.raises(Inkling2Error, match="ffn_down_exps.scale: type BF16, expected F32"):
+        inkling2_model.build_model(gguf)
+
+
 def test_nvfp4_values_survive(gguf_path, tmp_path):
     """The stored NVFP4 blocks decode to ggml's values (the codec is checked against ggml separately)."""
     out = tmp_path / "tiny.ninfer"
@@ -127,32 +133,30 @@ def test_nvfp4_values_survive(gguf_path, tmp_path):
     raise AssertionError("no layer-0 bank")
 
 
-def _tokenizer_files(directory: Path) -> dict[str, Path]:
-    pipeline = json.loads((FIXTURES / "tokenizer_pipeline.json").read_text())
-    tokenizer = {"normalizer": None, "pre_tokenizer": pipeline["pre_tokenizer"],
-                 "model": pipeline["model"] | {"vocab": {f"t{i}": i for i in range(pipeline["vocab_size"])}, "merges": []},
-                 "added_tokens": pipeline["added_tokens"]}
-    files = {"tokenizer.json": directory / "tokenizer.json", "tokenizer_config.json": directory / "tokenizer_config.json"}
-    files["tokenizer.json"].write_text(json.dumps(tokenizer))
-    files["tokenizer_config.json"].write_text(json.dumps(
-        {"eos_token": "<|content_model_end_sampling|>", "pad_token": "<|endoftext|>", "tokenizer_class": "PreTrainedTokenizerFast"}))
-    return files
-
-
-def test_resources_from_the_checkpoint_tokenizer(tmp_path):
-    metadata = json.loads((FIXTURES / "ud_q8_k_xl_header.json").read_text())["metadata"]
-    metadata["tokenizer.chat_template"] = "{{ messages }}"
-    config = {"unpadded_vocab_size": 200058}
-    files = _tokenizer_files(tmp_path)
+def test_resources_from_the_checkpoint_tokenizer(gguf_path, tmp_path):
+    with GgufModel(gguf_path) as gguf:
+        metadata = dict(gguf.metadata)
+    config = {"unpadded_vocab_size": fixture.UNPADDED}
+    files = fixture.tokenizer_files(tmp_path)
     out = inkling2_model.resources(metadata, config, files)
     assert set(out) == {"tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json"}
     assert out["tokenizer.json"] == files["tokenizer.json"].read_bytes()
     assert out["chat_template.jinja"] == b"{{ messages }}"
-    assert json.loads(out["generation_config.json"])["eos_token_id"] == [200006]
+    generation = json.loads(out["generation_config.json"])
+    tokens = metadata["tokenizer.ggml.tokens"]
+    assert tokens[generation["eos_token_id"][0]] == "<|content_model_end_sampling|>"
+    assert tokens[generation["pad_token_id"]] == "<|endoftext|>"
     with pytest.raises(Inkling2Error, match="tokenizer_config.json"):
         inkling2_model.resources(metadata, config, {"tokenizer.json": files["tokenizer.json"]})
     files["tokenizer_config.json"].write_text(json.dumps({"eos_token": "<|endoftext|>", "pad_token": "<|endoftext|>"}))
     with pytest.raises(Inkling2Error, match="eos_token"):
+        inkling2_model.resources(metadata, config, files)
+    swapped = fixture.tokenizer()
+    swapped["model"]["vocab"].update(t3=4, t4=3)
+    files["tokenizer.json"].write_text(json.dumps(swapped))
+    files["tokenizer_config.json"].write_text(json.dumps({"eos_token": "<|content_model_end_sampling|>",
+                                                          "pad_token": "<|endoftext|>"}))
+    with pytest.raises(Inkling2Error, match="in tokenizer.json but"):
         inkling2_model.resources(metadata, config, files)
 
 
@@ -172,10 +176,18 @@ def test_the_recipe_refuses_another_model(gguf_path):
 def test_the_public_cli_converts_an_inkling2_gguf(gguf_path, tmp_path):
     from tools.convert.__main__ import main
 
+    files = fixture.tokenizer_files(tmp_path)
+    resources = [arg for name, path in files.items() for arg in ("--resource", f"{name}={path}")]
     out = tmp_path / "cli.ninfer"
-    main(["--model", str(gguf_path), "--recipe", "inkling2_gguf", "--device", "cpu", "--out", str(out)])
+    main(["--model", str(gguf_path), "--recipe", "inkling2_gguf", "--device", "cpu", "--out", str(out), *resources])
     report = json.loads((tmp_path / "cli.ninfer.conversion.json").read_text())
     assert report["provenance"]["recipe"] == "inkling2_gguf" and report["formats"]["ggml_rec_nvfp4_nvfp4"] == 4
+    with Artifact(out) as artifact:
+        stored = {artifact.read_object(obj.id) for obj in artifact.directory.objects if obj.kind == "resource"}
+    assert len(stored) == 4 and files["tokenizer.json"].read_bytes() in stored
+    with pytest.raises(ValueError, match="tokenizer_config.json"):
+        main(["--model", str(gguf_path), "--recipe", "inkling2_gguf", "--device", "cpu",
+              "--out", str(tmp_path / "y.ninfer"), *resources[:2]])
     with pytest.raises(ValueError, match="takes none of"):
         main(["--model", str(gguf_path), "--recipe", "inkling2_gguf", "--device", "cpu", "--mmproj", str(gguf_path),
               "--out", str(tmp_path / "x.ninfer")])

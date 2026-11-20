@@ -213,6 +213,12 @@ def main(argv=None):
                 # Inkling-2-Mini: text only for now; the drafter (dspark) and vision GGUFs are later components.
                 if args.subset or args.mtp_gguf or args.mmproj or args.ngram_out or args.ngram_reuse:
                     raise ValueError("an inkling2 GGUF takes none of --subset, --mtp-gguf, --mmproj and --ngram-*")
+                missing = sorted({"tokenizer.json", "tokenizer_config.json"} - overrides.keys())
+                if missing:
+                    raise ValueError(
+                        f"an inkling2 GGUF needs the checkpoint's {missing}: --resource NAME=PATH "
+                        "(the artifact's tokenizer and generation resources come from them)"
+                    )
                 model = inkling2_model.build_model(base, resource_overrides=overrides)
             else:
                 mtp = stack.enter_context(GgufModel(args.mtp_gguf)) if args.mtp_gguf else None
