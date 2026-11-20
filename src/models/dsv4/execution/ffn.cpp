@@ -11,6 +11,8 @@
 #include "ninfer/ops/rmsnorm.h"
 
 #include <algorithm>
+#include <cstring>
+#include <vector>
 #include <stdexcept>
 
 namespace ninfer::models::dsv4 {
@@ -53,10 +55,14 @@ FfnParams ffn_params(const TextConfig& config, std::uint32_t layer) {
     p.route_scale   = config.route_scale;
     p.norm_topk     = config.norm_topk;
     p.clamp_shared  = config.layers.at(layer).clamp_shared;
+    // moe_experts_narrow clamps the routed experts' SwiGLU at the constant 10 (Dsv4Dims); another limit has no route yet.
+    if (config.layers.at(layer).clamp_experts != 10.0F) {
+        throw std::invalid_argument("dsv4 ffn: the routed experts' SwiGLU clamp must be 10 (the narrow Op's constant)");
+    }
     return p;
 }
 
-FfnWeights bind_ffn_weights(const Model& model, std::uint32_t layer) {
+FfnWeights bind_ffn_weights(const Model& model, std::uint32_t layer, DeviceBuffer& norm_owner) {
     const TextConfig& c   = model.config();
     const BlockWeights& b = model.weights().layers.at(layer);
     const std::int32_t H = static_cast<std::int32_t>(c.hidden_size), S = static_cast<std::int32_t>(c.hc_streams),
@@ -65,13 +71,36 @@ FfnWeights bind_ffn_weights(const Model& model, std::uint32_t layer) {
     w.hc_fn        = weight_tensor(model.weight(b.ffn_hc.fn).view, {S * H, mix});
     w.hc_scale     = weight_tensor(model.weight(b.ffn_hc.scale).view, {3});
     w.hc_base      = weight_tensor(model.weight(b.ffn_hc.base).view, {mix});
-    w.norm         = weight_tensor(model.weight(b.moe.norm).view, {H});
+    {
+        const Tensor stored = weight_tensor(model.weight(b.moe.norm).view, {H});
+        if (stored.dtype == DType::BF16) {
+            w.norm = stored;
+        } else {
+            std::vector<float> values(static_cast<std::size_t>(H));
+            if (cudaMemcpy(values.data(), stored.data, values.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+                throw std::runtime_error("dsv4 ffn: cannot read the stored norm");
+            }
+            std::vector<std::uint16_t> bits(values.size());
+            for (std::size_t i = 0; i < values.size(); ++i) {
+                std::uint32_t u;
+                std::memcpy(&u, &values[i], 4);
+                u += 0x7fffU + ((u >> 16) & 1U); // round to nearest even (norm weights are finite)
+                bits[i] = static_cast<std::uint16_t>(u >> 16);
+            }
+            norm_owner = DeviceBuffer(bits.size() * 2);
+            norm_owner.copy_from_host(bits.data(), bits.size() * 2);
+            w.norm = Tensor(norm_owner.p, DType::BF16, {H});
+        }
+    }
     w.router       = weight_tensor(model.weight(b.moe.router).view, {H, E});
     w.router_bias  = weight_tensor(model.weight(b.moe.router_bias).view, {E});
     w.shared_gate  = native_weight(model.weight(b.moe.shared.gate).view);
     w.shared_up    = native_weight(model.weight(b.moe.shared.up).view);
     w.shared_down  = native_weight(model.weight(b.moe.shared.down).view);
     w.shared_policy = model.weight(b.moe.shared.gate).policy;
+    if (model.weight(b.moe.shared.up).policy != w.shared_policy || model.weight(b.moe.shared.down).policy != w.shared_policy) {
+        throw std::invalid_argument("dsv4 ffn: the shared expert's three projections must share one activation policy");
+    }
     return w;
 }
 
@@ -108,8 +137,9 @@ void ffn_forward(const FfnParams& p, const FfnWeights& w, std::uint32_t layer, E
     Tensor& residual = in.residual;
     const std::int32_t T = residual.ne[1];
     if (residual.ne[0] != p.streams * p.hidden) { throw std::invalid_argument("dsv4 ffn: residual is not [streams * hidden, T]"); }
-    if (in.collapse_pre != nullptr && in.collapse_pre->data == in.mixes.pre.data) {
-        throw std::invalid_argument("dsv4 ffn: collapse_pre must not be this call's own mixes buffer (double-buffer the mixes)");
+    if (in.collapse_pre != nullptr && (in.collapse_pre->data == in.mixes.pre.data || in.collapse_pre->data == in.mixes.post.data ||
+                                       in.collapse_pre->data == in.mixes.comb.data)) {
+        throw std::invalid_argument("dsv4 ffn: collapse_pre must not be one of this call's own mixes buffers (double-buffer the mixes)");
     }
     const auto scope     = arena.scope();
     const std::int32_t K = p.top_k, E = p.experts, entries = K * T, jobs = max_jobs(p, T);

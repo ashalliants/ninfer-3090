@@ -369,8 +369,8 @@ int main() {
             std::printf("SKIP file-backed cases: NINFER_TEST_DSV4_ARTIFACT is not set\n");
         } else {
             ninfer::artifact::Reader reader(artifact_env);
-            const d4::LoadPlan plan = d4::plan_load(reader, true);
-            const auto& banks       = plan.file_banks();
+            d4::LoadPlan plan = d4::plan_load(reader, true);
+            const std::vector<d4::ExpertBank> banks = plan.file_banks();
             check(banks.size() == 40 && banks[0].record_stride == stride && banks[0].format == format,
                   "the artifact's layer 0 bank has the fixture's record format and stride");
             d4::FileExpertSource file(reader, banks, kExperts); // the defaults: a 4 GiB cache, a call of up to 2048 columns
@@ -422,6 +422,22 @@ int main() {
             const double wide_file_ms = wide_run(file, wide_file);
             std::printf("T=%d prefill chunk, file-backed (warm): %.2f ms per layer\n", kWide, wide_file_ms);
             check(wide_file == wide_device, "file-backed T=512 equals the resident result bit for bit");
+
+            // The Model-bound path: the artifact's own dense weights (the stored FP32 norm rounded once to BF16 by
+            // bind_ffn_weights) and the file-backed experts give the fixture-weight result bit for bit.
+            ninfer::DeviceContext device_context(0);
+            const auto model = d4::materialize_model(std::move(plan), device_context);
+            ninfer::DeviceBuffer norm_owner;
+            const d4::FfnWeights bound = d4::bind_ffn_weights(*model, 0, norm_owner);
+            check(download_u16(bound.norm.data, kH) == norm_bits, "the model-bound norm is the fixture's norm rounded to BF16");
+            const d4::FfnParams bound_params = d4::ffn_params(model->config(), 0);
+            reset();
+            {
+                Tensor R(residual.p, DType::BF16, {kS * kH, T});
+                d4::ffn_forward(bound_params, bound, 0, file, {R, nullptr, mixes}, arena, stream);
+                t::cuda_check(cudaStreamSynchronize(stream), "ffn bound");
+            }
+            check(download_out() == out_device, "the Model-bound FFN (artifact weights, file-backed experts) equals the fixture-weight result bit for bit");
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "EXCEPTION: %s\n", e.what());

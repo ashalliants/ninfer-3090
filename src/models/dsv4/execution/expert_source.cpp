@@ -62,29 +62,37 @@ FileExpertSource::FileExpertSource(const artifact::Reader& reader, std::span<con
         throw std::invalid_argument("FileExpertSource: cache_bytes holds " + std::to_string(slots_) + " records of " + std::to_string(slot_bytes_) +
                                     " bytes; one call can route " + std::to_string(need) + " distinct experts");
     }
-    cuda_require(cudaHostAlloc(reinterpret_cast<void**>(&cache_host_), static_cast<std::size_t>(slots_) * slot_bytes_,
-                               cudaHostAllocMapped | cudaHostAllocPortable),
-                 "cudaHostAlloc (record cache)");
-    void* device = nullptr;
-    cuda_require(cudaHostGetDevicePointer(&device, cache_host_, 0), "cudaHostGetDevicePointer");
-    cache_device_ = static_cast<std::uint8_t*>(device);
-    slot_.assign(slots_, Slot{});
-    slot_of_.assign(static_cast<std::size_t>(banks_.size()) * experts_, -1);
-    staging_   = DeviceBuffer(static_cast<std::size_t>(options_.staging_slots) * slot_bytes_);
-    no_frames_ = device_minus_ones(experts_);
-    cuda_require(cudaMalloc(reinterpret_cast<void**>(&table_device_), experts_ * sizeof(void*)), "cudaMalloc");
-    cuda_require(cudaHostAlloc(reinterpret_cast<void**>(&table_host_), experts_ * sizeof(void*), cudaHostAllocPortable), "cudaHostAlloc");
-    cuda_require(cudaHostAlloc(reinterpret_cast<void**>(&ids_host_), static_cast<std::size_t>(options_.max_entries) * sizeof(std::int32_t),
-                               cudaHostAllocPortable),
-                 "cudaHostAlloc");
+    try {
+        cuda_require(cudaHostAlloc(reinterpret_cast<void**>(&cache_host_), static_cast<std::size_t>(slots_) * slot_bytes_,
+                                   cudaHostAllocMapped | cudaHostAllocPortable),
+                     "cudaHostAlloc (record cache)");
+        void* device = nullptr;
+        cuda_require(cudaHostGetDevicePointer(&device, cache_host_, 0), "cudaHostGetDevicePointer");
+        cache_device_ = static_cast<std::uint8_t*>(device);
+        slot_.assign(slots_, Slot{});
+        slot_of_.assign(static_cast<std::size_t>(banks_.size()) * experts_, -1);
+        staging_   = DeviceBuffer(static_cast<std::size_t>(options_.staging_slots) * slot_bytes_);
+        no_frames_ = device_minus_ones(experts_);
+        cuda_require(cudaMalloc(reinterpret_cast<void**>(&table_device_), experts_ * sizeof(void*)), "cudaMalloc");
+        cuda_require(cudaHostAlloc(reinterpret_cast<void**>(&table_host_), experts_ * sizeof(void*), cudaHostAllocPortable), "cudaHostAlloc");
+        cuda_require(cudaHostAlloc(reinterpret_cast<void**>(&ids_host_), static_cast<std::size_t>(options_.max_entries) * sizeof(std::int32_t),
+                                   cudaHostAllocPortable),
+                     "cudaHostAlloc");
+    } catch (...) { // the destructor does not run for a constructor that throws
+        release();
+        throw;
+    }
 }
 
-FileExpertSource::~FileExpertSource() {
+FileExpertSource::~FileExpertSource() { release(); }
+
+void FileExpertSource::release() noexcept {
     cudaFree(no_frames_);
     cudaFree(table_device_);
     cudaFreeHost(table_host_);
     cudaFreeHost(ids_host_);
     cudaFreeHost(cache_host_);
+    no_frames_ = nullptr, table_device_ = nullptr, table_host_ = nullptr, ids_host_ = nullptr, cache_host_ = nullptr;
 }
 
 void FileExpertSource::clear_cache() {

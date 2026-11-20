@@ -14,6 +14,6 @@ set_tests_properties(ninfer_dsv4_attention_block_test PROPERTIES SKIP_RETURN_COD
 # The FFN sublayer of a V4 block on the real layer-0 weights: against the NumPy oracle, T = 1 against T = 8, and
 # the experts served from a resident bank and from the artifact file (needs NINFER_DSV4_FFN_FIXTURE; the
 # file-backed cases also NINFER_TEST_DSV4_ARTIFACT).
-ninfer_add_op_test(ninfer_dsv4_ffn_layer_test
+ninfer_add_op_test(ninfer_dsv4_ffn_block_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ffn_layer.cpp"
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_ops ninfer_core)

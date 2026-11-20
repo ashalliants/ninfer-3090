@@ -70,8 +70,9 @@ struct FfnInput {
 };
 
 [[nodiscard]] FfnParams ffn_params(const TextConfig& config, std::uint32_t layer);
-// Binds layer `layer` of a loaded model (device views; no copies).
-[[nodiscard]] FfnWeights bind_ffn_weights(const Model& model, std::uint32_t layer);
+// Binds layer `layer` of a loaded model (device views). The artifact stores the norm in FP32 but rmsnorm
+// reads BF16, so the norm is rounded once into `norm_owner` (which must outlive the weights).
+[[nodiscard]] FfnWeights bind_ffn_weights(const Model& model, std::uint32_t layer, DeviceBuffer& norm_owner);
 // The mixes' tensors for T columns, carved from `arena` (they outlive the FFN call: the caller chains them).
 [[nodiscard]] HcMixes alloc_hc_mixes(DeviceArena& arena, const FfnParams& params, std::int32_t columns);
 

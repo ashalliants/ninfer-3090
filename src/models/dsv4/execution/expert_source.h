@@ -106,6 +106,8 @@ private:
         std::uint64_t last_used = 0;  // call number that last used it
     };
 
+    void release() noexcept; // frees the pinned and device allocations (also on a failed construction)
+
     const artifact::Reader& reader_;
     std::vector<ExpertBank> banks_;
     std::uint32_t experts_ = 0;
