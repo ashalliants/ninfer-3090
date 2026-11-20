@@ -181,6 +181,26 @@ round spent ~26 ms of ~50 in it against a ~19 ms read. Two changes:
 | + input projections on the streaming GEMV | 82.3 | 75.6 | 72.5 | 72.3 |
 | + tensor-core verify GEMV | 86.3 | 85.9 | 85.4 | 84.2 |
 
+**Two lanes (`--max-concurrency 2`).** Two lanes widen what one lane runs on the streaming
+kernels into calls the shape tables still sent to emulated Ampere mma: the MTP proposal head (Q4
+131072 x 5120 under `--lm-head-draft`) at T = 2 on `q4_ksplit_mma`, 2.8 ms a call; the Q6 LM head
+at T = 8 on `q6_small_t_mma`, 5.7 ms a call; and verify attention for B = 2, T = 4 on the 4-token
+mma tile. Now:
+
+- every Q4 and Q5 linear of 2..64 tokens tries the streaming GEMV (its tile GEMM past eight
+  tokens) before the tables (`ops/linear/common/stream_tokens_sm70.h`): the proposal head 2.8 ->
+  0.40 ms a call;
+- the K-chunked streaming GEMV runs further waves of CTAs when one wave's partial sums would not
+  fit in shared memory (the 248320-row head at T = 8 needed ~97 KB a CTA), so the Q6 head takes it
+  at T = 8: 5.7 -> 3.7 ms a call;
+- INT8-family verify attention chunks batched rows two tokens at a time, as one lane does, onto
+  the CUDA-core `SimtDecode` path.
+
+Qwen3.8-27B, MTP3, two 256-token greedy requests at once: 70.9 -> 79.2 tok/s in total (one lane
+alone runs 65-71). One lane's output is bit-identical. The changes also make a request's tokens
+depend less on whether a second lane is running: the two prompts matched their one-lane output for
+the first 42 and 123 of 256 tokens before, 243 and 256 after.
+
 ### Decode: Qwen3.8-Flash-Next
 
 Same card at 250 W, Flash-Next IQ2_XS (`qwen4exp-iq2xs-mtp-vision.ninfer`), INT8 KV, 8K context,

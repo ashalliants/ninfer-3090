@@ -3247,6 +3247,11 @@ int run_batch_cases() {
                                {2048, {2100}, {64}, {0}, MappingPattern::Fragmented, 511u});
     failures += run_batch_case(kGeometries[0], kPlanInt8,
                                {6, {127}, {3}, {0}, MappingPattern::Identity, 499u});
+    // Two MTP3 lanes verifying at once (B=2, T=4) over histories in different key tiers, one row
+    // masked: on sm_70 each row runs as two-token chunks on the CUDA-core small-T path, as one
+    // lane does.
+    failures += run_batch_case(kGeometries[0], kPlanInt8,
+                               {4, {2100, 9000}, {4, 3}, {1, 0}, MappingPattern::Fragmented, 512u});
     failures += run_batch_case(kGeometries[0], kPlanBf16,
                                {16, {49}, {7}, {0}, MappingPattern::Identity, 500u});
     failures += run_batch_case(kGeometries[0], kPlanBf16,
