@@ -31,8 +31,10 @@ namespace ninfer::ops {
  *   [sum N_i, T]. T >= 1.
  *
  * Supported domain:
- *   K a multiple of 8 and at most 3072; one to four weights; every operand contiguous and
- *   16-byte aligned.
+ *   K a multiple of 8 and at most 8192 (K up to 5120, DeepSeek-V4's hidden size among them, takes
+ *   the narrow mapping at one to eight columns; wider calls and K above 5120 take the wide
+ *   mapping; both give the same bits; the BF16 split form below keeps the limit of 3072); one to
+ *   four weights; every operand contiguous and 16-byte aligned.
  *
  * Numeric:
  *   Each output is one FP32 dot product whose summation order depends only on K, so a column's

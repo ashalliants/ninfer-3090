@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -164,7 +165,7 @@ void bf16_case(const std::vector<std::int32_t>& rows, std::int32_t k, std::uint3
                                         wide_values.begin() + static_cast<std::ptrdiff_t>(k) * t);
         verify("bf16 N=" + label + " K=" + std::to_string(k) + " T=" + std::to_string(t), host, w,
                values, n, k, t, {});
-        if (t <= 8 && n >= 2) {
+        if (t <= 8 && n >= 2 && k <= 3072) {
             // projection_bf16_split: the FP32 results cast to BF16 and split, bit for bit.
             const std::int32_t n1 = std::max(1, n / 3), n2 = n - n1;
             std::uint16_t *d1 = nullptr, *d2 = nullptr, *dc = nullptr;
@@ -448,6 +449,34 @@ void head_case(QType format, std::int32_t n, std::uint32_t seed, bool sampled) {
     cudaFree(dw);
 }
 
+// NINFER_BENCH=1: time a BF16 projection (not a pass/fail criterion).
+void bench_bf16(std::int32_t n, std::int32_t k, std::int32_t t) {
+    auto* dw = device(std::vector<std::uint16_t>(static_cast<std::size_t>(n) * k, 0x3C00));
+    auto* dx = device(std::vector<std::uint16_t>(static_cast<std::size_t>(k) * t, 0x3C00));
+    float* dout = nullptr;
+    cudaMalloc(&dout, sizeof(float) * n * t);
+    const Tensor w(dw, DType::BF16, {k, n}), x(dx, DType::BF16, {k, t});
+    Tensor out(dout, DType::FP32, {n, t});
+    const Tensor* weights[] = {&w};
+    cudaEvent_t a = nullptr, b = nullptr;
+    cudaEventCreate(&a);
+    cudaEventCreate(&b);
+    for (int i = 0; i < 3; ++i) { ninfer::ops::projection_fp32(x, weights, out, nullptr); }
+    constexpr int kIters = 50;
+    cudaEventRecord(a);
+    for (int i = 0; i < kIters; ++i) { ninfer::ops::projection_fp32(x, weights, out, nullptr); }
+    cudaEventRecord(b);
+    cudaEventSynchronize(b);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, a, b);
+    std::cout << "bench bf16 N=" << n << " K=" << k << " T=" << t << ": " << 1000.0 * ms / kIters << " us per call\n";
+    cudaEventDestroy(a);
+    cudaEventDestroy(b);
+    cudaFree(dw);
+    cudaFree(dx);
+    cudaFree(dout);
+}
+
 } // namespace
 
 int main() {
@@ -464,6 +493,43 @@ int main() {
         bf16_wide_case({512, 1}, 2560, 4096, 37);       // a 4096-token prefill chunk's router
         bf16_wide_case({7, 300, 1, 64}, 3072, 301, 41); // K at its limit, partial CTA range and pass
         bf16_wide_case({129}, 1024, 135, 43);
+        // DeepSeek-V4.1-Flash (hidden 5120): the router, the compressor's two projections, the indexer's weights.
+        // K above 3072 takes the wide mapping at every width.
+        bf16_case({384}, 5120, 61);
+        bf16_case({512, 512}, 5120, 62);
+        bf16_case({32}, 5120, 63);
+        bf16_case({4096}, 1280, 64);
+        bf16_case({7, 300}, 8192, 65); // K at its limit
+        bf16_wide_case({384}, 5120, 4096, 66);
+        bf16_wide_case({7, 300}, 8192, 70, 67);
+        {
+            // A K past 8192 is refused.
+            const std::int32_t k_bad = 8200;
+            auto* dw = device(std::vector<std::uint16_t>(static_cast<std::size_t>(k_bad) * 4, 0));
+            auto* dx = device(std::vector<std::uint16_t>(static_cast<std::size_t>(k_bad), 0));
+            float* dout = nullptr;
+            cudaMalloc(&dout, sizeof(float) * 4);
+            const Tensor w(dw, DType::BF16, {k_bad, 4}), x(dx, DType::BF16, {k_bad, 1});
+            Tensor out(dout, DType::FP32, {4, 1});
+            const Tensor* weights[] = {&w};
+            bool threw = false;
+            try {
+                ninfer::ops::projection_fp32(x, weights, out, nullptr);
+            } catch (const std::invalid_argument&) { threw = true; }
+            check(threw, "K = 8200 is refused");
+            cudaFree(dw);
+            cudaFree(dx);
+            cudaFree(dout);
+        }
+        if (std::getenv("NINFER_BENCH") != nullptr) {
+            for (const std::int32_t t : {1, 8, 512}) {
+                bench_bf16(384, 5120, t);   // V4's router
+                bench_bf16(512, 5120, t);   // a compressor projection
+                bench_bf16(32, 5120, t);    // the indexer's weights projection
+                bench_bf16(4096, 1280, t);  // the indexer's query projection
+                bench_bf16(384, 2560, t);   // (Flash-Next's router, narrow mapping at T < 64, for scale)
+            }
+        }
         for (const QType format : {QType::GGML_IQ4_XS, QType::GGML_Q6_K, QType::GGML_Q5_K}) {
             head_case(format, 1000, 51, false);
             head_case(format, 248320, 53, true); // the Flash-Next LM head, sampled rows
