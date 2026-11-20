@@ -202,9 +202,12 @@ void ProgramImpl::prepare_graphs() {
             cache.page_pool().zero_pages(pages, compute_streams);
         };
     // `verify_drafts` and `copy_round` describe the captured DFlash round family; ordinary and MTP
-    // rounds ignore them.
+    // rounds ignore them. An `adapted` representative selects LoRA slot 0 in every row, so the
+    // warm-up launches of the adapted graphs run the adapter kernels; any other selects none.
     const auto prepare_representative = [&](std::uint32_t frontier, std::uint32_t batch_size,
-                                            std::uint32_t verify_drafts, bool copy_round) {
+                                            std::uint32_t verify_drafts, bool copy_round,
+                                            bool adapted) {
+        const std::int32_t lora_slot = adapted ? 0 : -1;
         if (batch_size == 0 || batch_size > max_concurrency) {
             throw std::logic_error("CUDA Graph representative batch is invalid");
         }
@@ -266,6 +269,7 @@ void ProgramImpl::prepare_graphs() {
                 dflash_host_ingress->state_destination_slots[row] = capture_state_slot(row);
                 dflash_host_ingress->sampling[row]                = {};
                 dflash_host_ingress->copy_rows[row]               = copies ? 1 : 0;
+                dflash_host_ingress->lora[row]                    = lora_slot;
             }
         }
         if (io.mtp_decode) {
@@ -295,6 +299,7 @@ void ProgramImpl::prepare_graphs() {
                 mtp_host_ingress->state_source_slots[row]      = capture_state_slot(row);
                 mtp_host_ingress->state_destination_slots[row] = capture_state_slot(row);
                 mtp_host_ingress->rope_deltas[row]             = 0;
+                mtp_host_ingress->lora[row]                    = lora_slot;
                 mtp_host_ingress->sampling[row]                = {};
             }
         }
@@ -310,10 +315,15 @@ void ProgramImpl::prepare_graphs() {
                 ordinary_host_ingress->text_kv_table_rows[row] = static_cast<std::int32_t>(row);
                 ordinary_host_ingress->state_source_slots[row] = capture_state_slot(row);
                 ordinary_host_ingress->state_destination_slots[row] = capture_state_slot(row);
+                ordinary_host_ingress->lora[row]                    = lora_slot;
                 ordinary_host_ingress->sampling[row]                = {};
             }
         }
     };
+    // With LoRA adapters loaded every decode round family is captured twice: the base graphs, which
+    // carry no LoRA work, and the adapted graphs (ExecutionCore::lora_round), which read each row's
+    // adapter slot from the round's ingress and so serve any selection.
+    const bool lora_graphs   = parameters.lora != nullptr;
     const auto execution_core = [&] {
         return execution::ExecutionCore{device,
                                         parameters,
@@ -337,36 +347,44 @@ void ProgramImpl::prepare_graphs() {
             *io.ordinary,          *ordinary_host_ingress,
             *ordinary_host_egress, state_images->continuation_hidden_store()};
         const GraphExecutionProfile code_warm = ordinary_profiles.front();
-        prepare_representative(code_warm.min, 1, 0, false);
-        device.synchronize();
-        execution::ordinary_decode_batch(ordinary_state, 1, {code_warm.min + 1, code_warm.max + 1},
-                                         nullptr);
-        device.synchronize();
+        for (const bool adapted : {false, true}) {
+            if (adapted && !lora_graphs) { continue; }
+            DecodeGraphFamily& graphs          = adapted ? ordinary_lora_graphs : ordinary_graphs;
+            ordinary_state.execution.lora_round = adapted;
+            prepare_representative(code_warm.min, 1, 0, false, adapted);
+            device.synchronize();
+            execution::ordinary_decode_batch(ordinary_state, 1,
+                                             {code_warm.min + 1, code_warm.max + 1}, nullptr);
+            device.synchronize();
 
-        ordinary_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
-        for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
-            for (const GraphExecutionProfile planned : ordinary_profiles) {
-                ordinary_graphs.profiles.emplace_back();
-                DecodeGraphProfile& profile    = ordinary_graphs.profiles.back();
-                profile.batch_size             = batch_size;
-                profile.min_execution_frontier = planned.min;
-                profile.max_execution_frontier = planned.max;
-                profile.topology_class =
-                    planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
-                const ops::CausalAttentionExecutionEnvelope envelope{planned.min + 1,
-                                                                     planned.max + 1};
-                execution::capture_ordinary_decode_batch(ordinary_state,
-                                                         static_cast<std::int32_t>(batch_size),
-                                                         envelope, profile.definition);
+            graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
+            for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
+                for (const GraphExecutionProfile planned : ordinary_profiles) {
+                    graphs.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = graphs.profiles.back();
+                    profile.batch_size             = batch_size;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.topology_class =
+                        planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
+                    const ops::CausalAttentionExecutionEnvelope envelope{planned.min + 1,
+                                                                         planned.max + 1};
+                    execution::capture_ordinary_decode_batch(
+                        ordinary_state, static_cast<std::int32_t>(batch_size), envelope,
+                        profile.definition);
+                }
             }
         }
     }
 
-    if (!ordinary_graphs.profiles.empty()) {
-        instantiate_graph_family(ordinary_graphs, "ordinary", device);
-        for (auto& topology : ordinary_graphs.topologies) {
-            const auto& profile = ordinary_graphs.profiles[*topology.installed_profile];
-            prepare_representative(profile.min_execution_frontier, profile.batch_size, 0, false);
+    for (const bool adapted : {false, true}) {
+        DecodeGraphFamily& graphs = adapted ? ordinary_lora_graphs : ordinary_graphs;
+        if (graphs.profiles.empty()) { continue; }
+        instantiate_graph_family(graphs, adapted ? "adapted ordinary" : "ordinary", device);
+        for (auto& topology : graphs.topologies) {
+            const auto& profile = graphs.profiles[*topology.installed_profile];
+            prepare_representative(profile.min_execution_frontier, profile.batch_size, 0, false,
+                                   adapted);
             device.synchronize();
             topology.executable.launch(device.stream);
             device.synchronize();
@@ -405,13 +423,14 @@ void ProgramImpl::prepare_graphs() {
         const auto finish_profiles =
             mtp ? forward_profiles : std::vector<GraphExecutionProfile>{{0, capacity - 1}};
         validate_graph_profiles(finish_profiles, capacity - 1, "speculative finish");
-        const auto round_core = [&] {
+        const auto round_core = [&](bool adapted) {
             execution::ExecutionCore core = execution_core();
             core.replay_records           = round_replay_records(verify_drafts);
+            core.lora_round               = adapted;
             return core;
         };
-        const auto mtp_context = [&] {
-            return execution::MtpBatchContext{round_core(),
+        const auto mtp_context = [&](bool adapted) {
+            return execution::MtpBatchContext{round_core(adapted),
                                               decoder->text_kv,
                                               *decoder->mtp_cache(),
                                               *io.mtp_decode,
@@ -419,8 +438,8 @@ void ProgramImpl::prepare_graphs() {
                                               *mtp_host_egress,
                                               state_images->continuation_hidden_store()};
         };
-        const auto dflash_context = [&] {
-            return execution::DFlashBatchContext{round_core(),
+        const auto dflash_context = [&](bool adapted) {
+            return execution::DFlashBatchContext{round_core(adapted),
                                                  decoder->text_kv,
                                                  *dflash,
                                                  *io.dflash_decode,
@@ -438,31 +457,32 @@ void ProgramImpl::prepare_graphs() {
                        capacity, static_cast<std::uint64_t>(frontier) + verify_drafts + 1ULL))};
         };
         const auto run = [&](SpeculativePhase phase, std::int32_t batch, std::uint32_t frontier,
-                             DecodeGraphExecutable* executable) {
+                             DecodeGraphExecutable* executable, bool adapted) {
             if (mtp) {
-                auto state = mtp_context();
+                auto state = mtp_context(adapted);
                 execution::mtp_decode_batch(
                     state, batch, draft_window,
                     mtp_causal_attention_envelopes(frontier, draft_window, capacity), executable,
                     phase);
             } else {
-                auto state = dflash_context();
+                auto state = dflash_context(adapted);
                 execution::dflash_decode_batch(state, batch, verify_drafts,
                                                dflash_envelopes(frontier, verify_drafts),
                                                target_envelope(frontier), executable, phase);
             }
         };
-        const auto capture = [&](SpeculativePhase phase, DecodeGraphProfile& profile) {
+        const auto capture = [&](SpeculativePhase phase, DecodeGraphProfile& profile,
+                                 bool adapted) {
             const auto batch    = static_cast<std::int32_t>(profile.batch_size);
             const auto frontier = profile.max_execution_frontier;
             if (mtp) {
-                auto state = mtp_context();
+                auto state = mtp_context(adapted);
                 execution::capture_mtp_decode_batch(
                     state, batch, draft_window,
                     mtp_causal_attention_envelopes(frontier, draft_window, capacity),
                     profile.definition, phase);
             } else {
-                auto state = dflash_context();
+                auto state = dflash_context(adapted);
                 execution::capture_dflash_decode_batch(
                     state, batch, verify_drafts, dflash_envelopes(frontier, verify_drafts),
                     target_envelope(frontier), profile.definition, phase);
@@ -470,15 +490,31 @@ void ProgramImpl::prepare_graphs() {
         };
 
         const auto code_warm = forward_profiles.front();
-        prepare_representative(code_warm.min, 1, verify_drafts, copy_round);
+        prepare_representative(code_warm.min, 1, verify_drafts, copy_round, false);
         device.synchronize();
-        run(SpeculativePhase::Forward, 1, code_warm.max, nullptr);
-        run(SpeculativePhase::Finish, 1, code_warm.max, nullptr);
+        run(SpeculativePhase::Forward, 1, code_warm.max, nullptr, false);
+        run(SpeculativePhase::Finish, 1, code_warm.max, nullptr, false);
         device.synchronize();
+        if (lora_graphs) {
+            prepare_representative(code_warm.min, 1, verify_drafts, copy_round, true);
+            device.synchronize();
+            run(SpeculativePhase::Forward, 1, code_warm.max, nullptr, true);
+            run(SpeculativePhase::Finish, 1, code_warm.max, nullptr, true);
+            device.synchronize();
+        }
 
-        for (const auto phase : {SpeculativePhase::Forward, SpeculativePhase::Finish}) {
-            const bool forward = phase == SpeculativePhase::Forward;
-            auto& family       = forward ? round.forward : round.finish;
+        // Finish runs no target layer, so only Forward has an adapted variant.
+        struct Variant {
+            SpeculativePhase phase;
+            bool adapted;
+        };
+        for (const Variant variant : {Variant{SpeculativePhase::Forward, false},
+                                      Variant{SpeculativePhase::Forward, true},
+                                      Variant{SpeculativePhase::Finish, false}}) {
+            if (variant.adapted && !lora_graphs) { continue; }
+            const SpeculativePhase phase = variant.phase;
+            const bool forward           = phase == SpeculativePhase::Forward;
+            auto& family = !forward ? round.finish : variant.adapted ? round.lora_forward : round.forward;
             family.profiles.reserve((forward ? forward_profiles : finish_profiles).size() *
                                     max_concurrency);
             const std::uint32_t batch_limit =
@@ -495,24 +531,32 @@ void ProgramImpl::prepare_graphs() {
                     profile.min_execution_frontier = planned.min;
                     profile.max_execution_frontier = planned.max;
                     profile.topology_class = planned.topology_class * max_concurrency + batch - 1U;
-                    capture(phase, profile);
+                    capture(phase, profile, variant.adapted);
                 }
             }
-            instantiate_graph_family(family, forward ? "speculative forward" : "speculative finish",
+            instantiate_graph_family(family,
+                                     !forward          ? "speculative finish"
+                                     : variant.adapted ? "adapted speculative forward"
+                                                       : "speculative forward",
                                      device);
         }
 
         // Warm complete transactions: finish consumes persistent outputs of its paired forward.
-        for (auto& topology : round.forward.topologies) {
-            auto& forward = round.forward.profiles[*topology.installed_profile];
-            auto& finish  = round.finish.select(forward.batch_size, forward.min_execution_frontier);
-            auto& finish_exec = round.finish.install(finish);
-            prepare_representative(forward.min_execution_frontier, forward.batch_size,
-                                   verify_drafts, copy_round);
-            device.synchronize();
-            topology.executable.launch(device.stream);
-            finish_exec.launch(device.stream);
-            device.synchronize();
+        for (const bool adapted : {false, true}) {
+            if (adapted && !lora_graphs) { continue; }
+            auto& forwards = adapted ? round.lora_forward : round.forward;
+            for (auto& topology : forwards.topologies) {
+                auto& forward = forwards.profiles[*topology.installed_profile];
+                auto& finish =
+                    round.finish.select(forward.batch_size, forward.min_execution_frontier);
+                auto& finish_exec = round.finish.install(finish);
+                prepare_representative(forward.min_execution_frontier, forward.batch_size,
+                                       verify_drafts, copy_round, adapted);
+                device.synchronize();
+                topology.executable.launch(device.stream);
+                finish_exec.launch(device.stream);
+                device.synchronize();
+            }
         }
     }
 

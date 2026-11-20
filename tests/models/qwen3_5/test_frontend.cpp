@@ -1483,6 +1483,47 @@ int test_direct_graft_prepare() {
         failures += check(frontend.count_tokens(input("direct")) ==
                               frontend.count_tokens(input("")) + 4,
                           "token counting ignored the direct graft");
+
+        // Under a LoRA adapter the graft's base-model state is the wrong context: generation and
+        // token counting both refuse the pair (a prefill_kv graft is replayed, so it is allowed).
+        options.lora_names         = {"pi"};
+        const Frontend with_lora   = make_frontend(resources(), options);
+        const auto adapted         = [&](std::string graft_name) {
+            ninfer::PromptInput prompt = input(std::move(graft_name));
+            prompt.options.lora        = "pi";
+            return prompt;
+        };
+        failures += check(throws_invalid_argument([&] { (void)with_lora.prepare(adapted("direct")); }),
+                          "a LoRA request with a direct graft was prepared");
+        failures += check(throws_invalid_argument([&] { (void)with_lora.count_tokens(adapted("direct")); }),
+                          "a LoRA request with a direct graft was counted");
+        failures += check(with_lora.count_tokens(adapted("")) == frontend.count_tokens(input("")),
+                          "a LoRA request without a graft was not counted");
+    }
+    {
+        ninfer::models::qwen3_5::PromptGraft graft;
+        graft.name   = "replayed";
+        graft.kind   = GraftKind::PrefillKV;
+        graft.tokens = {248045, fixture_byte_token('s'), 248046};
+        ninfer::models::qwen3_5::FrontendOptions options;
+        options.max_context     = std::numeric_limits<std::uint32_t>::max();
+        options.grafts          = {graft};
+        options.lora_names      = {"pi"};
+        const Frontend frontend = make_frontend(resources(), options);
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(
+            ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+        ninfer::PromptInput prompt;
+        prompt.messages.push_back(std::move(message));
+        prompt.options.graft = "replayed";
+        prompt.options.lora  = "pi";
+        bool accepted        = true;
+        try {
+            (void)frontend.prepare(prompt);
+            (void)frontend.count_tokens(prompt);
+        } catch (const std::invalid_argument&) { accepted = false; }
+        failures += check(accepted, "a LoRA request with a prefill_kv graft was refused");
     }
     {
         ninfer::models::qwen3_5::PromptGraft graft;

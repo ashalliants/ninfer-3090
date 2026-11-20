@@ -451,6 +451,9 @@ On Bazzite and other distributions the Dockerfile is the shortest path:
   A4000 hardware.
 - Per-request prompt grafts: named phantom-KV prefixes injected by token replay or direct KV
   injection, including under MTP and DFlash2 speculation.
+- Per-request LoRA adapters on the dense models: PEFT adapters loaded with `--lora NAME=PATH` and
+  selected with `"lora": "NAME"`, served beside the base model
+  ([LoRA adapters](docs/serving.md#lora-adapters)).
 
 ## Serving APIs
 

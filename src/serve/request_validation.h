@@ -31,6 +31,9 @@ void parse_structured_outputs(const RequestJson& body, GenerationRequest& reques
 // to take the server's default graft. Whether the name is loaded is checked against the server's
 // grafts during translation.
 std::optional<std::string> parse_graft_field(const RequestJson& body);
+// The NInfer `lora` extension field, read like `graft`: an adapter name loaded with --lora, "" for
+// the base model, or absent/null (nullopt) to take the server's --default-lora.
+std::optional<std::string> parse_lora_field(const RequestJson& body);
 
 // The NInfer `thinking_budget` extension field: a positive cap on model-origin thinking tokens for
 // this request, or absent/null (nullopt) to take the server default. Ignored when the request does

@@ -125,7 +125,7 @@ while at < len(words):
         unit += ' ' + words[at + 1]
         at += 1
     at += 1
-    if flag in ('--graft', '--allowed-host', '--context-store-peer'):
+    if flag in ('--graft', '--lora', '--allowed-host', '--context-store-peer'):
         options.setdefault(flag, []).append(unit)
     else:
         options[flag] = [unit]
@@ -390,6 +390,20 @@ grep -Fxq -- '--graft uncensored=/v/a b,c.gguf' "$recorded" && grep -Fxq -- '--g
 recorded="$(record graft_none -- qwen38-27b)"
 refuse_flag '27B default' "$recorded" '--graft'
 refuse_flag '27B default' "$recorded" '--default-graft'
+
+# NINFER_LORA: each ';'-separated NAME=PATH (a path may hold spaces or commas) becomes one --lora;
+# NINFER_DEFAULT_LORA passes --default-lora; unset, there is neither.
+recorded="$(record lora NINFER_LORA='pi=/m/loras/pi adapted,1;;other=/m/o' \
+  NINFER_DEFAULT_LORA=pi -- qwen38-27b)"
+expect_flags '27B NINFER_LORA' "$recorded" '--default-lora pi'
+grep -Fxq -- '--lora pi=/m/loras/pi adapted,1' "$recorded" && grep -Fxq -- '--lora other=/m/o' "$recorded" &&
+  [[ "$(grep -c -- '^--lora ' "$recorded")" == 2 ]] || {
+  printf 'run.sh did not pass NINFER_LORA as two --lora entries:\n%s\n' "$(cat -- "$recorded")" >&2
+  exit 1
+}
+recorded="$(record lora_none -- qwen38-27b)"
+refuse_flag '27B default' "$recorded" '--lora'
+refuse_flag '27B default' "$recorded" '--default-lora'
 
 # An explicit override beats the profile's default; vision can be turned off.
 recorded="$(record override NINFER_CONTEXT=65536 NINFER_PREFILL_CHUNK=1024 NINFER_CONCURRENCY=2 \

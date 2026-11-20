@@ -1,6 +1,8 @@
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/rotation.h"
 #include "models/qwen3_5/execution/ffn.h"
+#include "models/qwen3_5/execution/lora.h"
+#include "ninfer/ops/lora.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/frontend/graft.h"
@@ -431,6 +433,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                             ops::linear_add_workspace_capacity_bytes(
                                 p.weight.qtype, p.weight.n, p.weight.k, policy, first, last)));
     };
+    // LoRA adapters (Parameters::lora): each site's Op scratch, taken while its projection's
+    // outputs are alive and after the projection's own workspace is released.
+    const execution::LoraParameters* lora = parameters.lora.get();
+    const auto lora_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t sections,
+                                  std::uint64_t k, std::int32_t last) {
+        if (lora == nullptr) { return; }
+        scratch(layout, ops::lora_workspace_bytes(sections * lora->rank, dimension(k), last));
+    };
     // `layers` is the model's own parameters everywhere but the int4 scout (scout_a4_layers).
     const auto target_layers = [&](WorkspaceLayoutBuilder& layout,
                                    std::span<const execution::BlockParameters> layers,
@@ -450,6 +460,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     (void)workspace::text_attention_projection(layout, config, last);
                     scratch(layout, execution::attention_projection_workspace_bytes(
                                         *attention, first, last, prefill));
+                    lora_scratch(layout, 3, config.hidden_size, last);
                     (void)workspace::text_attention_results(layout, config, last);
                     scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
                                         {dimension(config.attention->head_dim),
@@ -458,6 +469,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                         plan.kv_storage, envelope, batch_size, min_width, max_width,
                                         device_execution));
                     add_scratch(layout, attention->output, first, last, prefill);
+                    lora_scratch(layout, 1, config.attention->query_width(), last);
                 } else {
                     const auto& gdn = std::get<execution::GdnParameters>(block.mixer);
                     (void)workspace::gdn_control(layout, config, last);
@@ -491,6 +503,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             (void)workspace::post_mixer_hidden(layout, config, last);
             scratch(layout, execution::ffn_workspace_bytes(block.ffn, first, last, false,
                                                            phase == TextPhase::Verify, prefill));
+            if (lora != nullptr) {
+                scratch(layout, execution::lora_ffn_workspace_bytes(
+                                    std::get<execution::DenseParameters>(block.ffn), *lora, first,
+                                    last, prefill));
+            }
         }
         if (!plan.causal_scoring) {
             linear_scratch(layout, parameters.text.output_head, first, last);
@@ -922,6 +939,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 (void)workspace::text_attention_projection(scout, config, chunk);
                 scratch(scout,
                         execution::attention_projection_workspace_bytes(filter_attention, 1, chunk));
+                lora_scratch(scout, 3, config.hidden_size, chunk);
                 (void)workspace::text_attention_results(scout, config, chunk);
                 scratch(scout, ops::attention_key_mass_workspace_capacity_bytes(
                                    dimension(config.attention->num_attention_heads),
@@ -1230,9 +1248,14 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                      dimension(attention.num_key_value_heads)},
             .storage              = impl->kv_storage,
             .multiprocessor_count = impl->multiprocessor_count};
+        // LoRA adapters capture every target-running family twice (prepare_graphs: the base
+        // graphs and the adapted ones); the adapted executables are charged like the base ones.
+        // Not measured yet: an adapted graph adds ~5 nodes per adapted site to the same topology.
+        const std::uint64_t lora_variants = impl->parameters->lora != nullptr ? 2 : 1;
         if (impl->speculative_backend == SpeculativeBackend::None) {
-            impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
-                                                      "ordinary exact-b graph allowance");
+            impl->graph_allowance_bytes =
+                checked_mul(12ULL * kMiB * lora_variants, impl->max_concurrency,
+                            "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             const auto profiles =
                 mtp_graph_profiles(impl->capacity, impl->draft_window, target_attention);
@@ -1255,8 +1278,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 #endif
                 },
                 "MTP graph allowance");
-            impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
-                                                      "MTP exact-b graph allowance");
+            impl->graph_allowance_bytes =
+                checked_mul(per_batch_allowance * lora_variants, impl->max_concurrency,
+                            "MTP exact-b graph allowance");
         } else {
             const auto class_allowance = [&](const SpeculativeRoundShape& shape,
                                              std::uint32_t batch_size) {
@@ -1297,7 +1321,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 for (std::uint32_t batch_size = 1; batch_size <= batch_limit; ++batch_size) {
                     impl->graph_allowance_bytes =
                         checked_add(impl->graph_allowance_bytes,
-                                    class_allowance(shape, batch_size) + 8ULL * kMiB,
+                                    class_allowance(shape, batch_size) * lora_variants + 8ULL * kMiB,
                                     "DFlash exact-b graph allowance");
                 }
             }

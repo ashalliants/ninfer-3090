@@ -54,6 +54,14 @@ struct PrefillRoundHost {
     ops::SamplingConfig sampling;
 };
 
+// -1 in every row: the per-row selections a round carries in its ingress (a LoRA adapter slot)
+// default to none, so a reset ingress (`= {}`) or a capture representative never selects slot 0.
+constexpr std::array<std::int32_t, kMaximumConcurrency> unselected_rows() {
+    std::array<std::int32_t, kMaximumConcurrency> rows{};
+    for (std::int32_t& row : rows) { row = -1; }
+    return rows;
+}
+
 // Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied
 // once per round; only its exact-B prefixes are consumed by the model schedule.
 struct OrdinaryDecodeIngress {
@@ -63,6 +71,9 @@ struct OrdinaryDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
+    // Each row's LoRA adapter slot (Parameters::lora), or -1 for the base model. Read only by a
+    // round with an adapted row (ExecutionCore::lora_round), through its graph or eagerly.
+    std::array<std::int32_t, kMaximumConcurrency> lora = unselected_rows();
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -85,6 +96,9 @@ struct MtpDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
     std::array<std::int32_t, kMaximumConcurrency> rope_deltas{};
+    // Each row's LoRA adapter slot (Parameters::lora), or -1 for the base model. Read only by a
+    // round with an adapted row (ExecutionCore::lora_round), through its graph or eagerly.
+    std::array<std::int32_t, kMaximumConcurrency> lora = unselected_rows();
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -124,6 +138,9 @@ struct DFlashDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> active_lanes{};
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
+    // Each row's LoRA adapter slot (Parameters::lora), or -1 for the base model. Read only by a
+    // round with an adapted row (ExecutionCore::lora_round), through its graph or eagerly.
+    std::array<std::int32_t, kMaximumConcurrency> lora = unselected_rows();
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
     // N-gram copy rounds only; the other rounds transfer the fields above and stop here. Rows
     // flagged in copy_rows verify copy_drafts, laid out [k, B] at the round's k, instead of a
@@ -239,6 +256,7 @@ struct OrdinaryDecodeState {
     Tensor text_kv_table_rows;
     Tensor state_source_slots;
     Tensor state_destination_slots;
+    Tensor lora; // the ingress `lora` [B]
     const ops::SamplingConfig* sampling = nullptr;
     Tensor sampled_tokens;
     Tensor logits;
@@ -316,6 +334,7 @@ struct MtpDecodeState {
     Tensor state_source_slots;
     Tensor state_destination_slots;
     Tensor rope_deltas;
+    Tensor lora; // the ingress `lora` [B]
     const ops::SamplingConfig* sampling = nullptr;
     Tensor licensed_tokens;
     Tensor licensed_counts;
@@ -359,6 +378,7 @@ struct DFlashDecodeState {
     Tensor active_lanes;
     Tensor state_source_slots;
     Tensor state_destination_slots;
+    Tensor lora; // the ingress `lora` [B]
     const ops::SamplingConfig* sampling = nullptr;
     Tensor copy_rows;
     Tensor copy_drafts;

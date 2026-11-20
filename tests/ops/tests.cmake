@@ -6,6 +6,7 @@ set(ninfer_op_tests
   silu_mul
   residual_add
   direction_project
+  lora
   sigmoid_mul
   rmsnorm
   rmsnorm_pack_tail

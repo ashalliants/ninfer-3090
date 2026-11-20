@@ -241,6 +241,59 @@ stored rotated is not converted by the converter: it stays T2, inverse-rotated, 
 gathers each row and restores it to the primal basis with the hidden-width signs that the output head
 carries.
 
+## LoRA adapters
+
+`--lora` (`EngineOptions::loras`) loads PEFT adapters (`src/models/qwen3_5/load/lora.{h,cpp}`) into
+`execution::Parameters::lora` (`execution/lora.{h,cpp}`); the user-facing contract is in
+[serving.md](../serving.md#lora-adapters). The mapping onto this model:
+
+| PEFT module | site (`LoraBlock`) | input | updated output |
+|---|---|---|---|
+| `self_attn.q_proj` | attention input | normalized mixer input | `query` and output `gate` |
+| `self_attn.k_proj`, `v_proj` | attention input | same | `key`, `value` |
+| `self_attn.o_proj` | attention output | gated attention output | residual |
+| `mlp.gate_proj`, `up_proj` | FFN input | normalized FFN input | gate and up halves of the SwiGLU plane |
+| `mlp.down_proj` | FFN output | SwiGLU activation | residual |
+
+- `q_proj`'s rows interleave per head `[query D | gate D]` (the converter's split), so its `B` is
+  split into a query `B` and a gate `B` sharing one `A` (`lora_split_query_gate`).
+- One `ops::lora_apply` call per site and input: the `A` matrices of a site are stacked
+  (`[A_q; A_k; A_v]`, `[A_gate; A_up]`), so the input is read once and each output's `B` reads its
+  rank section. Every adapter is zero-padded to the largest rank rounded up to 8 (`R`).
+- A Hadamard-rotated Use reads `x_r = H diag(s) x`, so the stored `A` is `A diag(s) H`
+  (`lora_rotate_rows`) and the site reads the same rotated input as the base projection.
+- `alpha / r` is folded into `B` at load. Matrices are uploaded once, BF16, into one buffer.
+- The dense FFN of a pass that selects an adapter takes the unfused route (`lora_ffn`: gate/up
+  plane, LoRA on the plane, `silu_mul(_hadamard)`, `linear_add` down, LoRA on the residual), since
+  `linear_swiglu` never materializes the pre-activation. The plane comes from
+  `ops::linear_swiglu_plane`, which takes the fused op's own routes up to the pre-activation (the
+  cuBLAS prefill GEMM, sm_70's streaming GEMV) with the base route's policy, so the adapted
+  projection is as fast as the base one and differs from it only by the plane's BF16 rounding;
+  plain `ops::linear` would land on sm_70's emulated MMA kernels (5x slower prefill, half-speed
+  decode on a V100). The workspace plan adds that route's peak and each site's Op scratch when
+  adapters are loaded.
+- Selection is per sequence: `PreparedPromptData::lora` (the frontend resolves the name) becomes
+  `SequenceState::lora`. A prefill call passes it by value (`ExecutionCore::lora`, an
+  `ops::LoraColumns` of one row) to `TextContext::set_lora`, and only the sites that adapter adapts
+  run. A decode, MTP or DFlash round carries each row's slot in its ingress (`lora`, -1 for none,
+  the same per-row pattern as the other ingress selections); a round with an adapted row
+  (`adapted_round`, `ExecutionCore::lora_round`) hands the kernels a pointer to it
+  (`lora_round_columns`, `LoraColumns::device_slot`), so they read the selection when they run.
+  Such a pass runs every site some loaded adapter adapts, and the unfused FFN route wherever one
+  adapts the FFN, for every row of the round (the rows that select nothing are left untouched by
+  the update but share the route), so the launches depend only on the loaded adapters, never on
+  the selection. The MTP head, the DFlash drafter and the lossy scout's int4 pass are never adapted.
+- CUDA graphs: with adapters loaded, `prepare_graphs` captures every target-running family twice:
+  the base graphs (no LoRA work; base rounds replay them unchanged) and the adapted graphs
+  (`ordinary_lora_graphs`, `SpeculativeRoundFamily::lora_forward`) at the same profiles. One
+  adapted graph serves any selection of its batch size. Finish runs no target layer, so both
+  Forward variants pair with the one Finish family. The graph allowance charges the adapted
+  executables like the base ones (V100, 27B MTP3, two lanes: 16 MiB measured for the adapted set,
+  12 MiB for the base set, against 172 MiB charged for each; capture 0.74 s against 0.51 s). An eager adapted round (`--no-cuda-graph`) issues the same
+  launches as the graph and is bit-for-bit equal to it.
+- The request's prefix identity tag is `prefix_identity_tag(lora)`: the base tag mixed with the
+  adapter digest (`LoraAdapter::digest`, FNV-1a over names, shapes, raw bytes and the scale).
+
 ## Prefill, decode and MTP
 
 Text prefill gathers embedding columns, replaces media placeholders with Vision outputs, and runs

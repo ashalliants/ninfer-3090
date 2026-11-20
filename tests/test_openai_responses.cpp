@@ -1920,6 +1920,26 @@ int test_graft_extension() {
     return failures;
 }
 
+int test_lora_extension() {
+    Json body = {{"model", "m"}, {"input", "hello"}, {"lora", "pi"}};
+    int failures =
+        check(parse_openai_responses_create_request(body, limits()).prompt.generation.lora == "pi",
+              "Responses lora name was not parsed");
+    body["lora"] = "";
+    failures += check(parse_openai_responses_create_request(body, limits()).prompt.generation.lora ==
+                          "",
+                      "empty Responses lora did not select the base model");
+    body["lora"] = nullptr;
+    failures += check(!parse_openai_responses_create_request(body, limits()).prompt.generation.lora,
+                      "null Responses lora was not left unset");
+    body["lora"] = true;
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(body, limits());
+                      }).param == "lora",
+                      "non-string Responses lora was accepted");
+    return failures;
+}
+
 int test_constrained_decoding() {
     int failures = 0;
     Json body{{"model", "qwen"},
@@ -1992,6 +2012,7 @@ int test_constrained_decoding() {
 int main() {
     int failures = 0;
     failures += test_graft_extension();
+    failures += test_lora_extension();
     failures += test_thinking_budget_extension();
     failures += test_relaxed_drafting_extension();
     failures += test_constrained_decoding();

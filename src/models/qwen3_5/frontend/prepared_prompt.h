@@ -196,6 +196,10 @@ struct PreparedPromptData {
     // PromptOptions::graft, or -1 for none. It changes the model's activations, so a request that
     // selects a vector has its own context-cache identity (the Program's identity tag).
     std::int32_t steering = -1;
+    // The LoRA adapter the request selected through PromptOptions::lora: its slot (the order of
+    // FrontendOptions::lora_names, which is the Program's adapter order), or -1 for the base model.
+    // It changes every target activation, so it is part of the request's context-cache identity.
+    std::int32_t lora = -1;
     std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output;
     bool starts_in_reasoning = false;
     std::string continuation_content;

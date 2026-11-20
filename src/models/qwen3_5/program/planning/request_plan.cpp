@@ -193,7 +193,7 @@ GapMapSet ProgramImpl::live_gap_maps() {
 void ProgramImpl::finish_request_plan(RequestBasePlanImpl& plan, PreparedPromptData&& prompt) const {
     auto* const base = &plan;
     base->prefix_digests.assign(prompt);
-    base->prefix_identity_tag = prefix_identity_tag();
+    base->prefix_identity_tag = prefix_identity_tag(prompt.lora);
     std::uint32_t previous = 0;
     for (const auto frontier : prompt.identity.rewrite_execution_frontiers) {
         if (frontier <= previous || frontier > base->summary.prompt_tokens) {

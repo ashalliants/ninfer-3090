@@ -5,6 +5,7 @@
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "ninfer/ops/kv_cache_append.h"
+#include "ninfer/ops/lora.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
@@ -44,6 +45,13 @@ struct ExecutionCore {
     // Numeric tripwire probes and the drain that hands their record to the host; set only for the
     // decode rounds (ordinary, MTP, DFlash) and their graphs, and only under --numeric-tripwire.
     NumericTripwire* tripwire = nullptr;
+    // The LoRA adapter slot of the sequence a prefill call runs (TextContext::set_lora); slot -1
+    // runs the base model. Decode rounds leave it empty and set lora_round instead.
+    ops::LoraColumns lora{};
+    // A decode, MTP or DFlash round with an adapted row: its target passes read each row's slot
+    // from the round frame's ingress `lora` (execution::lora_round_columns), which is what lets
+    // the round run as a captured graph. False runs the round without any LoRA work.
+    bool lora_round = false;
 };
 
 struct PrefillContext {

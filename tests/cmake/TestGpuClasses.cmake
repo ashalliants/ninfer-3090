@@ -85,6 +85,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_qwen3_5_frontend_test
   ninfer_qwen3_5_context_rows_test
   ninfer_qwen3_5_graft_loader_test
+  ninfer_qwen3_5_lora_loader_test
   ninfer_qwen3_5_draft_window_policy_test
   ninfer_qwen3_5_loading_test
   ninfer_qwen3_5_lossy_exact_end_test

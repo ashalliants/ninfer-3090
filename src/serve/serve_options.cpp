@@ -252,7 +252,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--mlp-a8-decode] [--no-prefill-a8] "
            "[--prefill-cublas | --no-prefill-cublas] [--no-prefill-cublas-projections] "
            "[--no-thinking] [--preserve-thinking] [--tolerant-tool-calls] "
-           "[--graft NAME=PATH]... [--default-graft NAME] "
+           "[--graft NAME=PATH]... [--default-graft NAME] [--lora NAME=PATH]... [--default-lora NAME] "
            "[--reasoning-effort minimal|low|medium|high|xhigh|max] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -260,8 +260,8 @@ std::string serve_usage_text(const char* argv0) {
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
            "       --config FILE reads options from a JSON object of flag names without dashes "
            "(\"max-context\": 65536, \"vision\": true; an array repeats a repeatable flag); the "
-           "command line wins over the file, except that a repeatable flag (--graft, --allowed-host, "
-           "--context-store-peer) keeps the file's entries and adds the command line's. Not "
+           "command line wins over the file, except that a repeatable flag (--graft, --lora, "
+           "--allowed-host, --context-store-peer) keeps the file's entries and adds the command line's. Not "
            "--api-key\n"
            "       --default-max-tokens fixes the output budget of requests that omit a limit; "
            "unset, such a request may run to the end of its context\n"
@@ -534,6 +534,13 @@ std::string serve_usage_text(const char* argv0) {
            "direction removed from the model's activations. Repeatable\n"
            "       --default-graft NAME applies a loaded graft to every request that states none; "
            "a request opts out with \"graft\": \"\"\n"
+           "       --lora NAME=PATH loads a PEFT LoRA adapter (a directory with adapter_config.json "
+           "and adapter_model.safetensors) for the dense Qwen3.5 / 3.6 / 3.8 models; a request "
+           "selecting it with \"lora\": \"NAME\" runs with it, others run the base model. Targets "
+           "the full-attention q/k/v/o_proj and the MLP gate/up/down_proj. Repeatable, at most 8; "
+           "adapted decode rounds run as a second set of CUDA graphs\n"
+           "       --default-lora NAME applies a loaded adapter to every request that states none; "
+           "a request opts out with \"lora\": \"\"\n"
            "       --reasoning-effort is the effort of thinking-enabled requests that state none; "
            "request values override it; like request values, minimal runs as low and high/max as "
            "xhigh\n"
@@ -1262,6 +1269,24 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             }
             options.grafts.push_back(GraftSource{.name = std::string(spec.substr(0, equals)),
                                                  .path = std::string(spec.substr(equals + 1))});
+        } else if (arg == "--lora") {
+            const std::string_view spec = require_value("--lora");
+            const std::size_t equals    = spec.find('=');
+            if (equals == 0 || equals == std::string_view::npos || equals + 1 == spec.size()) {
+                throw std::invalid_argument("--lora must be NAME=PATH");
+            }
+            const std::string name(spec.substr(0, equals));
+            if (std::any_of(options.loras.begin(), options.loras.end(),
+                            [&](const LoraSource& source) { return source.name == name; })) {
+                throw std::invalid_argument("--lora names '" + name + "' twice");
+            }
+            options.loras.push_back(
+                LoraSource{.name = name, .path = std::string(spec.substr(equals + 1))});
+        } else if (arg == "--default-lora") {
+            options.default_lora = require_value("--default-lora");
+            if (options.default_lora.empty()) {
+                throw std::invalid_argument("--default-lora needs an adapter name");
+            }
         } else if (arg == "--default-graft") {
             options.default_graft = require_value("--default-graft");
             if (options.default_graft.empty()) {
@@ -1328,6 +1353,16 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
         })) {
         throw std::invalid_argument("--default-graft '" + options.default_graft +
                                     "' does not name a --graft");
+    }
+    if (!options.default_lora.empty() &&
+        std::none_of(options.loras.begin(), options.loras.end(), [&](const LoraSource& source) {
+            return source.name == options.default_lora;
+        })) {
+        throw std::invalid_argument("--default-lora '" + options.default_lora +
+                                    "' does not name a --lora");
+    }
+    if (options.loras.size() > 8) {
+        throw std::invalid_argument("at most 8 --lora adapters can be loaded");
     }
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);

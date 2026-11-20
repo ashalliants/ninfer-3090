@@ -333,6 +333,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         if (!options.grafts.empty()) {
             throw std::invalid_argument("a CausalScoring Engine takes no prompt grafts");
         }
+        if (!options.loras.empty()) {
+            throw std::invalid_argument("a CausalScoring Engine takes no LoRA adapters");
+        }
         options.max_concurrency      = 1;
         options.max_pending_requests = 1;
         options.prefill_chunk        = 1024;
@@ -418,6 +421,13 @@ EngineOptions normalize_engine_options(EngineOptions options) {
 
 namespace {
 
+std::vector<std::string> lora_names(const std::vector<LoraSource>& loras) {
+    std::vector<std::string> names;
+    names.reserve(loras.size());
+    for (const LoraSource& source : loras) { names.push_back(source.name); }
+    return names;
+}
+
 models::qwen3_5::Frontend make_instance_frontend(const models::qwen3_5::Model& model,
                                                  const EngineOptions& options) {
     return models::qwen3_5::make_frontend(
@@ -432,6 +442,7 @@ models::qwen3_5::Frontend make_instance_frontend(const models::qwen3_5::Model& m
                             .vision_max_merged_tokens = options.vision_max_merged_tokens,
                             .grafts                   = models::qwen3_5::load_prompt_grafts(
                                 options.grafts, model.config().text),
+                            .lora_names  = lora_names(options.loras),
                             .ngram_index = options.speculative.ngram_draft_tokens != 0});
 }
 
@@ -439,7 +450,7 @@ models::qwen3_5::Frontend make_instance_frontend(const models::qwen3_5::Model& m
 
 ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                              const EngineOptions& options)
-    : model(std::move(source)), parameters(*model),
+    : model(std::move(source)), parameters(*model, options.loras),
       frontend(make_instance_frontend(*model, options)), capacity(options.max_context) {}
 
 void ModelInstance::refit_context(const EngineOptions& options) {

@@ -1149,6 +1149,7 @@ bool parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurp
         request.preserve_thinking = body.at("preserve_thinking").get<bool>();
     }
     request.graft = parse_graft_field(body);
+    request.lora  = parse_lora_field(body);
     return display_omitted;
 }
 

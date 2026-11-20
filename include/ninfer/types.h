@@ -512,6 +512,16 @@ struct GraftSource {
     std::filesystem::path path;
 };
 
+// A LoRA adapter (PEFT format) a request may select by name through PromptOptions::lora. `path`
+// is the adapter directory holding adapter_config.json and adapter_model.safetensors (either file
+// inside it is accepted too). The adapter is applied unmerged, y += (alpha / r) * B(A x), to the
+// projections it targets, so one Engine serves the base model and every loaded adapter. Qwen3.5 /
+// 3.6 / 3.8 dense text models only.
+struct LoraSource {
+    std::string name;
+    std::filesystem::path path;
+};
+
 // Qwen3.8-Flash-Next (Qwen4ExpForCausalLM) only; a dense model refuses any of these that is set
 // (runtime::validate_flash_next_options_unused) rather than ignoring it.
 struct FlashNextOptions {
@@ -881,6 +891,9 @@ struct EngineOptions {
     // Prompt grafts a request may select by name through PromptOptions::graft. Each is loaded and
     // validated against the resident model at construction.
     std::vector<GraftSource> grafts;
+    // LoRA adapters a request may select by name through PromptOptions::lora (at most eight). Each
+    // is loaded, checked against the resident model and uploaded at construction.
+    std::vector<LoraSource> loras;
     // Model suspend (Engine::suspend / Engine::resume). Off by default: a model that never suspends
     // keeps its ordinary device allocations.
     ModelSuspendOptions suspend;
@@ -1248,6 +1261,9 @@ struct PromptOptions {
     // Name of an EngineOptions::grafts entry to place in front of the rendered prompt; empty for
     // none. The rendered prompt should carry no system turn of its own: the graft already holds one.
     std::string graft;
+    // Name of an EngineOptions::loras entry whose adapter this request runs with; empty for the base
+    // model. Cached context computed with one adapter (or none) never serves another.
+    std::string lora;
 };
 
 enum class PromptCacheMarkerKind : std::uint8_t {

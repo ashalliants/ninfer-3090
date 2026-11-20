@@ -4,6 +4,7 @@
 #include "models/qwen3_5/program/graph_execution.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "core/nvtx.h"
+#include "models/qwen3_5/execution/lora.h"
 #include "models/qwen3_5/execution/numeric_tripwire.h"
 #include "models/qwen3_5/execution/numeric_tripwire_report.h"
 #include "core/device.h"
@@ -46,6 +47,10 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          &state.text_cache);
         card.set_stage_runtime(state.execution.stages);
         card.set_tripwire(state.execution.tripwire);
+        // An adapted round reads each row's slot from the ingress, so its graph serves any selection.
+        card.set_lora(state.execution.lora_round
+                          ? lora_round_columns(ordinary.lora.slice(0, 0, batch_size))
+                          : state.execution.lora);
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);
@@ -408,10 +413,14 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
         ops::CausalAttentionExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
+        // A round with an adapted row runs the adapted graphs, which read each row's slot from
+        // the ingress; a base round runs the base graphs, which carry no LoRA work.
+        const bool adapted = adapted_round(lanes);
         if (use_cuda_graph) {
+            DecodeGraphFamily& graphs = adapted ? ordinary_lora_graphs : ordinary_graphs;
             DecodeGraphProfile& profile =
-                ordinary_graphs.select(static_cast<std::uint32_t>(lanes.size()), maximum_frontier);
-            executable = &ordinary_graphs.install(profile);
+                graphs.select(static_cast<std::uint32_t>(lanes.size()), maximum_frontier);
+            executable = &graphs.install(profile);
             envelope   = {profile.min_execution_frontier + 1, profile.max_execution_frontier + 1};
         }
 
@@ -429,6 +438,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             const StateImageSelectors selectors                 = state_selectors(sequence);
             ordinary_host_ingress->state_source_slots[row]      = selectors.source;
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
+            ordinary_host_ingress->lora[row]                    = sequence.lora;
             ordinary_host_ingress->sampling[row]                = request.sampling_host;
             ordinary_host_ingress->sampling[row].mask           = fill_grammar_mask(masks, row, {});
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
@@ -437,7 +447,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
         execution::OrdinaryBatchContext schedule_state{
             {device, parameters, work, state_images->linear(0),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, stage_runtime.get(), tripwire.get()},
+             proposal_head, stage_runtime.get(), tripwire.get(), {}, adapted},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -558,14 +568,18 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         DecodeGraphExecutable* finish  = nullptr;
         execution::MtpCausalAttentionEnvelopes envelopes =
             mtp_causal_attention_envelopes(maximum_frontier, draft_window, capacity);
+        // A round with an adapted row runs the adapted Forward graphs (the target verification
+        // reads each row's slot from the ingress); Finish runs no target layer and is shared.
+        const bool adapted = adapted_round(lanes);
         if (use_cuda_graph) {
             // An MTP round verifies its own proposal: the neural family at the draft window.
             SpeculativeRoundFamily& family =
                 round_family(SpeculativeRoundKind::Neural, draft_window);
+            DecodeGraphFamily& forwards = adapted ? family.lora_forward : family.forward;
             const auto batch = static_cast<std::uint32_t>(lanes.size());
-            auto& profile    = family.forward.select(batch, maximum_frontier);
+            auto& profile    = forwards.select(batch, maximum_frontier);
             auto& completion = family.finish.select(batch, maximum_frontier);
-            forward          = &family.forward.install(profile);
+            forward          = &forwards.install(profile);
             finish           = &family.finish.install(completion);
             envelopes = mtp_causal_attention_envelopes(profile.max_execution_frontier, draft_window,
                                                        capacity);
@@ -604,6 +618,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             mtp_host_ingress->state_source_slots[row]      = selectors.source;
             mtp_host_ingress->state_destination_slots[row] = selectors.destination;
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
+            mtp_host_ingress->lora[row]                    = sequence.lora;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
             mtp_host_ingress->sampling[row].mask           = bind_grammar_mask(masks, row);
             mtp_host_ingress->sampling[row].relaxed_threshold =
@@ -616,7 +631,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         execution::MtpBatchContext schedule_state{{device, parameters, work, state_images->linear(0),
                                                    replay_records ? &*replay_records : nullptr, io,
                                                    prefill_hidden, prefill_chunk, proposal_head, stage_runtime.get(),
-                                                   tripwire.get()},
+                                                   tripwire.get(), {}, adapted},
                                                   decoder->text_kv,
                                                   *decoder->mtp_cache(),
                                                   *io.mtp_decode,
@@ -918,11 +933,15 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         DecodeGraphExecutable* finish        = nullptr;
         execution::DFlashEnvelopes envelopes = dflash_envelopes(maximum_frontier, verify_drafts);
         ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
+        // A round with an adapted row runs the adapted Forward graphs (the target verification
+        // reads each row's slot from the ingress); Finish runs no target layer and is shared.
+        const bool adapted = adapted_round(lanes);
         if (use_cuda_graph) {
+            DecodeGraphFamily& forwards = adapted ? family.lora_forward : family.forward;
             const auto batch = static_cast<std::uint32_t>(lanes.size());
-            auto& profile    = family.forward.select(batch, maximum_frontier);
+            auto& profile    = forwards.select(batch, maximum_frontier);
             auto& completion = family.finish.select(batch, maximum_frontier);
-            forward          = &family.forward.install(profile);
+            forward          = &forwards.install(profile);
             finish           = &family.finish.install(completion);
             envelopes        = dflash_envelopes(profile.max_execution_frontier, verify_drafts);
             target_envelope = {
@@ -960,6 +979,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             const StateImageSelectors selectors          = state_selectors(sequence);
             dflash_host_ingress->state_source_slots[row] = selectors.source;
             dflash_host_ingress->state_destination_slots[row] = selectors.destination;
+            dflash_host_ingress->lora[row]                    = sequence.lora;
             dflash_host_ingress->sampling[row]                = request.sampling_host;
             dflash_host_ingress->sampling[row].mask           = bind_grammar_mask(masks, row);
             dflash_host_ingress->sampling[row].relaxed_threshold = round_relaxed_threshold(
@@ -982,7 +1002,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         execution::DFlashBatchContext schedule_state{
             {device, parameters, work, state_images->linear(0), round_replay_records(verify_drafts),
              io, prefill_hidden, prefill_chunk, proposal_head, stage_runtime.get(),
-             tripwire.get()},
+             tripwire.get(), {}, adapted},
             decoder->text_kv,
             *dflash,
             *io.dflash_decode,

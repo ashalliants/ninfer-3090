@@ -1,5 +1,6 @@
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/execution/rotation.h"
+#include "models/qwen3_5/execution/lora.h"
 
 #include "core/weight_view.h"
 
@@ -411,6 +412,11 @@ Parameters::Parameters(const Model& source) : model(source) {
             throw std::logic_error("the model's own layer parameters hold the scout's int4 policy");
         }
     }
+}
+
+Parameters::Parameters(const Model& source, const std::vector<LoraSource>& loras)
+    : Parameters(source) {
+    lora = load_lora_parameters(loras, *this);
 }
 
 namespace {

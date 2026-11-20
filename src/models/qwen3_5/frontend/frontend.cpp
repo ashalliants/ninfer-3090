@@ -674,7 +674,8 @@ public:
           tokenizer(resources.tokenizer),
           processor(options.vision_enabled ? processor_options(resources) : fi::ProcessorOptions{}),
           vision_enabled(options.vision_enabled), max_context(options.max_context),
-          grafts(std::move(options.grafts)), steering_names(std::move(options.steering_names)) {
+          grafts(std::move(options.grafts)), steering_names(std::move(options.steering_names)),
+          lora_names(std::move(options.lora_names)) {
         fi::bound_merged_tokens(processor, options.vision_max_merged_tokens);
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
@@ -765,6 +766,31 @@ public:
         return -1;
     }
 
+    // The LoRA slot a request names, or -1 for the base model (an empty name).
+    [[nodiscard]] std::int32_t find_lora(const std::string& name) const {
+        if (name.empty()) { return -1; }
+        for (std::size_t i = 0; i < lora_names.size(); ++i) {
+            if (lora_names[i] == name) { return static_cast<std::int32_t>(i); }
+        }
+        throw std::invalid_argument("unknown LoRA adapter '" + name + "'");
+    }
+
+    // The LoRA slot a request names (find_lora), after checking it may be combined with the
+    // request's graft. prepare() and count_tokens() both resolve it here, so a count is refused
+    // exactly when generation would be. An installed graft is the base model's K/V and recurrent
+    // state; under an adapter every layer computes differently, so it would be the wrong context.
+    // A prefill_kv graft is replayed and so computed with the adapter like any prompt text.
+    [[nodiscard]] std::int32_t find_lora_for(const PromptOptions& options,
+                                             const PromptGraft* graft) const {
+        const std::int32_t lora = find_lora(options.lora);
+        if (lora >= 0 && graft && graft->kind != GraftKind::PrefillKV) {
+            throw std::invalid_argument("graft '" + graft->name +
+                                        "' holds base-model state and cannot be combined with LoRA "
+                                        "adapter '" + options.lora + "'");
+        }
+        return lora;
+    }
+
     // The graft a request names, or null for none (a steering vector is not a prompt graft).
     [[nodiscard]] const PromptGraft* find_graft(const std::string& name) const {
         if (name.empty() || find_steering(name) >= 0) { return nullptr; }
@@ -786,6 +812,7 @@ public:
     std::size_t grammar_cache_bytes = 0;
     std::vector<PromptGraft> grafts;
     std::vector<std::string> steering_names;
+    std::vector<std::string> lora_names;
     bool ngram_index = false;
     // Special tokens: n-gram copy spans end at them.
     std::vector<TokenId> ngram_boundaries;
@@ -909,6 +936,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
     }
     const PromptGraft* graft = impl_->find_graft(options.graft);
+    const std::int32_t lora  = impl_->find_lora_for(options, graft);
     // The rendered prompt gets whatever context the graft leaves.
     const std::uint32_t prompt_context =
         impl_->max_context - (graft ? graft_context_slots(*graft) : 0U);
@@ -1040,6 +1068,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     (void)checked_token_count(result.token_ids.size());
     if (graft) { prepend_graft(*graft, result, message_boundaries, cache_boundaries); }
     result.steering          = impl_->find_steering(options.graft);
+    result.lora              = lora;
     result.identity.reusable = true;
     // A replayed graft's end is published as a shared prefix, so the graft is prefilled once. A
     // direct graft already is a pinned checkpoint at that frontier and publishes nothing there.
@@ -1059,6 +1088,7 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
     fi::check_preparation_control(control);
     const PromptOptions options           = input.options;
     const PromptGraft* graft              = impl_->find_graft(options.graft);
+    (void)impl_->find_lora_for(options, graft);
     const std::size_t graft_tokens        = graft ? graft_context_slots(*graft) : 0U;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
     const bool has_media =

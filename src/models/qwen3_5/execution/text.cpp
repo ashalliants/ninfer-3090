@@ -4,6 +4,7 @@
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/ffn.h"
+#include "models/qwen3_5/execution/lora.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/execution/numeric_tripwire.h"
 #include "models/qwen3_5/execution/numeric_tripwire_report.h"
@@ -865,6 +866,23 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
+const LoraBlock* TextContext::lora_block() const {
+    // The scout's int4 layers rank prompt tokens for lossy prefill only; they run unadapted.
+    // A device selection (a decode round's ingress) is not visible here: any() is then true and
+    // each site applies when some loaded adapter adapts it (LoraSite::applies).
+    if (parameters_.lora == nullptr || !lora_.any() || !scout_layers_.empty()) { return nullptr; }
+    return &parameters_.lora->layers.at(lora_layer_);
+}
+
+ops::LoraColumns TextContext::lora_columns(std::int32_t columns) const {
+    ops::LoraColumns out = lora_;
+    if (out.rows <= 0 || columns % out.rows != 0) {
+        throw std::logic_error("the LoRA selection does not match the pass's columns");
+    }
+    out.width = columns / out.rows;
+    return out;
+}
+
 TextContext::AttentionInputs TextContext::attention_inputs(const BlockParameters& w, Tensor& x,
                                                           bool prefill) {
     const auto& p  = std::get<AttentionParameters>(w.mixer);
@@ -894,6 +912,10 @@ TextContext::AttentionInputs TextContext::attention_inputs(const BlockParameters
     Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
     Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
     attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s, input_basis, prefill);
+    if (const LoraBlock* lora = lora_block()) {
+        std::array<Tensor, 4> outputs{q_flat, gate_flat, k_flat, v_flat};
+        apply_lora_site(lora->attention_input, h, outputs, lora_columns(T), work_, s);
+    }
 
     const auto results = workspace::text_attention_results(work_, config_, T);
     Tensor qn =
@@ -970,10 +992,14 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     if (rotated(p.output.hadamard_signs)) {
         ops::sigmoid_mul_hadamard(gate, a, p.output.hadamard_signs, gated, s);
         project_add(gated, p.output, x, work_, s, InputBasis::Rotated, ph == Phase::Prefill);
-        return;
+    } else {
+        ops::sigmoid_mul(gate, a, s);
+        project_add(gated, p.output, x, work_, s, InputBasis::Primal, ph == Phase::Prefill);
     }
-    ops::sigmoid_mul(gate, a, s);
-    project_add(gated, p.output, x, work_, s, InputBasis::Primal, ph == Phase::Prefill);
+    if (const LoraBlock* lora = lora_block()) {
+        std::array<Tensor, 1> residual{x};
+        apply_lora_site(lora->attention_output, gated, residual, lora_columns(T), work_, s);
+    }
 }
 
 void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
@@ -1173,6 +1199,23 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
 void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                            const ops::SparseMoeHints& hints) {
     Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
+    if (const LoraBlock* lora = lora_block()) {
+        const ops::LoraColumns columns = lora_columns(x.ne[1]);
+        if (lora->ffn_input.applies(columns) || lora->ffn_output.applies(columns)) {
+            const auto& dense = std::get<DenseParameters>(weights.ffn);
+            InputBasis basis  = InputBasis::Primal;
+            if (const Tensor* signs = ffn_input_signs(weights.ffn)) {
+                ops::rmsnorm_hadamard(x, weights.post_attention_norm, config_.rms_norm_eps, true,
+                                      *signs, h, ctx_.stream);
+                basis = InputBasis::Rotated;
+            } else {
+                ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
+            }
+            lora_ffn(h, dense, *lora, columns, x, work_, ctx_.stream, basis, phase == Phase::Verify,
+                     phase == Phase::Prefill);
+            return;
+        }
+    }
     if (const Tensor* signs = ffn_input_signs(weights.ffn)) {
         ops::rmsnorm_hadamard(x, weights.post_attention_norm, config_.rms_norm_eps, true, *signs, h,
                               ctx_.stream);
@@ -1228,6 +1271,7 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
                                                    : scout_layers_[layer];
         const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
         const auto compact = dimension(config_.compact_layer_indices[layer]);
+        lora_layer_        = layer;
         nvtx::ScopedRange layer_range(
             full ? (prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull)
                  : (prefill ? nvtx::Name::PrefillLayerGdn : nvtx::Name::VerifyLayerGdn),
@@ -2097,6 +2141,7 @@ PrefillChunkResult TextContext::scout_chunk(const TextPrefill& prompt, std::uint
                                        filter_layer);
         try {
             auto scope                   = work_.scope();
+            lora_layer_                  = filter_layer;
             const AttentionInputs inputs = attention_inputs(filter_block, x);
             Tensor keys = keys_root.slice(2, static_cast<std::int32_t>(begin - u_begin), T);
             if (!inputs.key.is_contiguous() || inputs.key.bytes() != keys.bytes()) {

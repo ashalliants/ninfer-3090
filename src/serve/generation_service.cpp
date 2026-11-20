@@ -343,6 +343,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.kv_cache                = options.kv_cache;
     engine_options.enable_vision            = options.enable_vision;
     engine_options.grafts                   = options.grafts;
+    engine_options.loras                    = options.loras;
     engine_options.vision_residency         = options.vision_residency;
     engine_options.vision_max_merged_tokens = options.vision_max_merged_tokens;
     engine_options.use_cuda_graph           = options.use_cuda_graph;
@@ -849,6 +850,8 @@ void GenerationService::warmup() {
     // Warmup runs outside the context cache, and a direct --default-graft exists only as a cached
     // checkpoint, so it opts out of the default graft.
     request.graft = std::string();
+    // Warmup exercises the base model's graphs; a --default-lora would make it run eagerly.
+    request.lora = std::string();
     PreparedRequest prepared =
         prepare_impl(request, GenerationConsumerMode::Aggregate, {}, {}, {},
                      CacheParticipation::Disabled, DeadlinePolicy::UnboundedStartup);

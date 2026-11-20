@@ -3,6 +3,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "core/nvtx.h"
+#include "models/qwen3_5/execution/lora.h"
 #include "models/qwen3_5/execution/numeric_tripwire.h"
 #include "ninfer/ops/mtp_round.h"
 #include "ninfer/ops/scatter.h"
@@ -92,6 +93,10 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                          &state.text_cache, &state.mtp_cache);
         card.set_stage_runtime(state.execution.stages);
         card.set_tripwire(state.execution.tripwire);
+        // An adapted round reads each row's slot from the ingress, so its graph serves any selection.
+        card.set_lora(state.execution.lora_round
+                          ? lora_round_columns(frame.lora.slice(0, 0, batch_size))
+                          : state.execution.lora);
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers          = frame.base_frontiers.slice(0, 0, batch_size);
         Tensor budgets            = frame.remaining_budgets.slice(0, 0, batch_size);

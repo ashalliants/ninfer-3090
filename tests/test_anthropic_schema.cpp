@@ -1197,6 +1197,21 @@ int test_graft_extension() {
     return failures;
 }
 
+int test_lora_extension() {
+    Json body    = base_request();
+    body["lora"] = "pi";
+    int failures = check(parse(body).generation.lora == "pi", "Messages lora name was not parsed");
+    body["lora"] = "";
+    failures += check(parse(body).generation.lora == "",
+                      "empty Messages lora did not select the base model");
+    body["lora"] = nullptr;
+    failures += check(!parse(body).generation.lora, "null Messages lora was not left unset");
+    body["lora"] = Json::array();
+    failures += check(api_param([&] { (void)parse(body); }) == "lora",
+                      "non-string Messages lora was accepted");
+    return failures;
+}
+
 int test_constrained_decoding() {
     int failures = 0;
     auto body    = base_request();
@@ -1248,6 +1263,7 @@ int test_constrained_decoding() {
 int main() {
     int failures = 0;
     failures += test_graft_extension();
+    failures += test_lora_extension();
     failures += test_constrained_decoding();
     failures += test_envelope_and_field_policy();
     failures += test_relaxed_drafting_extension();

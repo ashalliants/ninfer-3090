@@ -207,6 +207,17 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         }
         result.graft = graft;
     }
+    const std::string& lora = request.lora ? *request.lora : server.default_lora;
+    if (!lora.empty()) {
+        const bool loaded =
+            std::any_of(server.loras.begin(), server.loras.end(),
+                        [&](const ninfer::LoraSource& source) { return source.name == lora; });
+        if (!loaded) {
+            invalid_prompt_option("LoRA adapter '" + lora + "' is not loaded on this server",
+                                  "lora", "unknown_lora");
+        }
+        result.lora = lora;
+    }
     if (request.continuation == ninfer::PromptContinuationMode::ContinueFinalAssistant &&
         result.enable_thinking == true) {
         invalid_prompt_option("assistant prefill cannot be combined with enabled thinking",
@@ -311,6 +322,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.preserve_thinking         = semantics.preserve_thinking;
     input.options.chat_template_kwargs_json = semantics.chat_template_kwargs_json;
     input.options.graft                     = semantics.graft;
+    input.options.lora                      = semantics.lora;
     input.options.add_vision_id             = false;
     const auto& tools                       = request.tools;
     input.options.tool_jsons.reserve(tools.size());

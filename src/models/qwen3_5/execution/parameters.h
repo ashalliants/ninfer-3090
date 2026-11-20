@@ -1,6 +1,8 @@
 #pragma once
 
 #include "models/qwen3_5/model.h"
+
+#include <ninfer/types.h>
 #include "ninfer/ops/weight_input.h"
 
 #include <array>
@@ -12,6 +14,8 @@
 #include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
+
+struct LoraParameters; // execution/lora.h
 
 using LinearParameters = ops::SingleProjectionWeight;
 
@@ -168,6 +172,8 @@ struct ProposalParameters {
 class Parameters {
 public:
     explicit Parameters(const Model& source);
+    // With the LoRA adapters `loras` loaded (load_lora_parameters), or none when it is empty.
+    Parameters(const Model& source, const std::vector<LoraSource>& loras);
     Parameters(const Parameters&)            = delete;
     Parameters& operator=(const Parameters&) = delete;
     Parameters(Parameters&&)                 = delete;
@@ -179,6 +185,8 @@ public:
     std::optional<VisionParameters> vision;
     std::optional<DraftParameters> draft;
     std::optional<ProposalParameters> proposal;
+    // The loaded LoRA adapters (EngineOptions::loras), or null.
+    std::shared_ptr<const LoraParameters> lora;
 };
 
 } // namespace ninfer::models::qwen3_5::execution
