@@ -13,20 +13,25 @@
 //                         staging pass copies them into a small device ring. The outputs equal the
 //                         resident ones bit for bit (the Op's results do not depend on where a record lives).
 //
-// qwen4_exp's expert cache and RAM slots (program/expert_cache, program/ram_slots.h) were not reused: they
-// are one global LFRU policy over layer x expert keys with per-layer slot pools, VRAM frames with promotion
-// and write-back, and a prefill stream, all driven by the Program's step loop. This source needs a single
-// LRU over a flat pinned pool and nothing else, and it can be replaced by the Program's tiers later
-// without touching the FFN, which sees only prepare().
+// Tiers (FileExpertSource): a pinned RAM pool (LRU) above the file and, when device_cache_bytes is set, a
+// pool of device frames above that (frequency first, expert_tiers.h). Records in a frame are read by the Op
+// in place; a record the policy wants in a frame is copied there from its RAM slot on a copy stream while the
+// call's own Op reads it from RAM, and is usable from the next call. The file reads of a call run on a small
+// thread pool, in file order. qwen4_exp's expert cache (program/expert_cache, program/ram_slots.h) was not
+// reused: it is one global policy with per-layer slot pools, write-back and a prefill stream, all driven by the
+// Program's step loop; this source is the same idea at the size one sequence needs, and the Program's tiers can
+// replace it without touching the FFN, which sees only begin() and prepare().
 
 #include "artifact/reader.h"
 #include "core/arena.h"
+#include "models/dsv4/execution/expert_tiers.h"
 #include "models/dsv4/model.h"
 #include "ninfer/ops/offloaded_sparse_moe.h"
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -42,6 +47,10 @@ public:
     // is ordered before the caller's moe_experts_narrow.
     [[nodiscard]] virtual ops::MoeExpertSource prepare(std::uint32_t layer, const std::int32_t* ids_device,
                                                        std::int32_t count, cudaStream_t stream) = 0;
+    // Optional: starts the copy of the ids to the host right after the router, so work enqueued between
+    // begin() and prepare() (the shared expert) runs while prepare() reads records from the file. The same
+    // arguments as the prepare() that follows it.
+    virtual void begin(std::uint32_t /*layer*/, const std::int32_t* /*ids_device*/, std::int32_t /*count*/, cudaStream_t /*stream*/) {}
     // Whether prepare() only enqueues work (no host synchronization), so a decode step can be captured.
     [[nodiscard]] virtual bool graph_capturable() const noexcept = 0;
 };
@@ -71,12 +80,26 @@ struct FileExpertOptions {
     std::int32_t staging_slots = 64;
     // The most routed entries (k * T) of one call.
     std::int32_t max_entries = 6 * 2048;
+    // Device memory for the VRAM tier: whole frames of the largest layer's record stride; 0 has no VRAM tier.
+    std::uint64_t device_cache_bytes = 0;
+    // Threads that pread the missing records of a call (the calling thread is one of them): a drive that
+    // serves several requests at once (an SSD) wants 8 or more, a hard disk 1.
+    std::uint32_t read_threads = 1;
+    // Misses of a one-column call the Op reads zero-copy over PCIe instead of staging them (the Op's
+    // zero_copy_misses); 0 stages every miss.
+    std::int32_t zero_copy_misses = 0;
+    // At most this many records are promoted to the VRAM tier per call (a prefill chunk routes most of the
+    // experts, which would otherwise be copied in whole).
+    std::uint32_t max_promotions = 16;
+    // The use counts of the VRAM policy are halved every this many calls.
+    std::uint32_t age_period = 1U << 14;
 };
 
 class FileExpertSource final : public ExpertSource {
 public:
     struct Stats {
-        std::uint64_t calls = 0, hits = 0, misses = 0, bytes_read = 0;
+        std::uint64_t calls = 0, hits = 0, misses = 0, bytes_read = 0; // hits = vram_hits + ram_hits
+        std::uint64_t vram_hits = 0, ram_hits = 0, promotions = 0;
         double read_seconds = 0; // host time in preads
         double sync_seconds = 0; // host time waiting for the ids (includes the GPU work queued before them)
     };
@@ -92,6 +115,7 @@ public:
 
     [[nodiscard]] ops::MoeExpertSource prepare(std::uint32_t layer, const std::int32_t* ids_device, std::int32_t count,
                                                cudaStream_t stream) override;
+    void begin(std::uint32_t layer, const std::int32_t* ids_device, std::int32_t count, cudaStream_t stream) override;
     [[nodiscard]] bool graph_capturable() const noexcept override { return false; }
 
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
@@ -99,18 +123,17 @@ public:
     // Forgets every cached record (a cold cache again).
     void clear_cache();
     [[nodiscard]] std::uint32_t cache_slots() const noexcept { return slots_; }
-    // Device bytes this source holds: the record staging ring, the no-frame table and the record address table.
+    // Device bytes this source holds: the frame pool, the record staging ring, the frame table and the record address table.
     [[nodiscard]] std::uint64_t device_bytes() const noexcept {
-        return staging_.bytes + static_cast<std::uint64_t>(experts_) * (sizeof(std::int32_t) + sizeof(void*));
+        return frame_pool_.bytes + staging_.bytes + static_cast<std::uint64_t>(experts_) * (sizeof(std::int32_t) + sizeof(void*));
     }
+    [[nodiscard]] std::uint32_t device_frames() const noexcept { return frames_; }
 
 private:
-    struct Slot {
-        std::int64_t key        = -1; // layer * experts + expert, or -1 when free
-        std::uint64_t last_used = 0;  // call number that last used it
-    };
-
+    class ReadPool;
     void release() noexcept; // frees the pinned and device allocations (also on a failed construction)
+    void issue_ids_copy(const std::int32_t* ids_device, std::int32_t count, cudaStream_t stream);
+    void poll_copies();
 
     const artifact::Reader& reader_;
     std::vector<ExpertBank> banks_;
@@ -120,11 +143,23 @@ private:
     std::uint32_t slots_        = 0;
     std::uint8_t* cache_host_   = nullptr; // pinned, mapped
     std::uint8_t* cache_device_ = nullptr;
-    std::vector<Slot> slot_;
-    std::vector<std::int32_t> slot_of_; // per key: its slot or -1
-    std::uint64_t call_ = 0;
+    std::uint32_t frames_ = 0;
+    ExpertTierPolicy policy_;
+    DeviceBuffer frame_pool_;
     DeviceBuffer staging_;
-    std::int32_t* no_frames_           = nullptr; // device [E], all -1
+    std::int32_t* frames_device_ = nullptr; // device [E]: the call's frame per expert, -1 for none
+    std::int32_t* frames_host_   = nullptr; // pinned [E]
+    cudaStream_t copy_stream_    = nullptr; // promotions RAM -> VRAM
+    cudaEvent_t ids_event_       = nullptr;
+    struct Batch {
+        std::uint64_t id;
+        cudaEvent_t event;
+    };
+    std::vector<Batch> batches_;   // in flight, oldest first
+    std::vector<cudaEvent_t> free_events_;
+    std::uint64_t batch_id_ = 0, waited_batch_ = 0;
+    bool ids_pending_       = false;
+    std::unique_ptr<ReadPool> pool_;
     const std::uint8_t** table_device_ = nullptr; // device [E]: the call's record addresses
     const std::uint8_t** table_host_   = nullptr; // pinned [E]
     std::int32_t* ids_host_            = nullptr; // pinned [max_entries]
