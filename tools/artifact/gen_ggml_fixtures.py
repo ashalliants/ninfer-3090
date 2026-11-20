@@ -3,7 +3,7 @@
 Usage: python -m tools.artifact.gen_ggml_fixtures [--dll PATH] [--out tests/fixtures/ggml]
 
 The oracle is ``dequantize_row_<type>`` exported by ggml-base.dll (or libggml-base.so) of llama.cpp
-release b11316; the path comes from ``--dll`` or ``NINFER_GGML_BASE_DLL``. Each fixture is a
+release b11316 (ggml_nvfp4: unslothai/llama.cpp 8aa2f23f; regenerate it with `--only ggml_nvfp4`); the path comes from ``--dll`` or ``NINFER_GGML_BASE_DLL``. Each fixture is a
 pair of raw files that the Python and C++ tests both read: ``<format>.blocks`` holds n whole
 blocks, and ``<format>.f32`` the oracle's n * block_elems FP32 results as little-endian bit
 patterns. Blocks are random bytes with structured fields overwritten so
@@ -39,6 +39,7 @@ GGML_NAMES = {
     "ggml_iq4_xs": "iq4_xs",
     "ggml_iq1_m": "iq1_m",
     "ggml_q2_0": "q2_0",
+    "ggml_nvfp4": "nvfp4",
 }
 # Binary16 scale words: signed zeros, unit, subnormal extremes, normal extremes, inf, NaNs.
 SPECIAL_SCALES = (
@@ -99,6 +100,8 @@ def structured_blocks(spec: GgmlBlockFormat, count: int, seed: int = 0) -> np.nd
         _put_u16(b, 208, d)
         b[0, 192:208] = 0x80  # int8 -128 scales
         b[1, 192:208] = 0x7F  # int8 127 scales
+    elif name == "ggml_nvfp4":
+        b[:, 0:4] = (4 * n[:, None] + np.arange(4)) % 256  # every UE4M3 scale byte, 0x7F and signed ones included
     elif name != "ggml_iq1_m":
         _put_u16(b, 0, d)
     if name in ("ggml_q4_k", "ggml_q5_k"):
@@ -193,12 +196,15 @@ def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dll", default=os.environ.get("NINFER_GGML_BASE_DLL"))
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--only", nargs="+", metavar="FORMAT", help="regenerate just these formats")
     args = parser.parse_args(argv)
     if not args.dll:
         parser.error("provide --dll or NINFER_GGML_BASE_DLL")
     oracle = Oracle(args.dll)
     args.out.mkdir(parents=True, exist_ok=True)
     for spec in GGML_BLOCK_FORMATS.values():
+        if args.only and spec.name not in args.only:
+            continue
         if oracle.geometry(spec) != (spec.block_elems, spec.block_bytes):
             raise SystemExit(f"{spec.name}: oracle geometry {oracle.geometry(spec)} differs")
         count = 256 if spec.block_elems <= 64 else 64

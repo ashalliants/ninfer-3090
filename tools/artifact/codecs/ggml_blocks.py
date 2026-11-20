@@ -64,6 +64,29 @@ def _q2_0(b: np.ndarray) -> np.ndarray:
     return (q.reshape(-1, 64).astype(np.int32) - 1).astype(_F32) * d[:, None]
 
 
+_KVALUES_MXFP4 = np.asarray((0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12), dtype=_F32)
+
+
+def _ue4m3_table() -> np.ndarray:
+    """ggml_ue4m3_to_fp32 of every byte: 0x00 and 0x7F are 0, the sign bit is ignored, the rest E4M3 * 0.5."""
+    x = np.arange(256)
+    exponent, mantissa = (x >> 3) & 0xF, x & 7
+    raw = np.where(exponent == 0, np.ldexp(mantissa.astype(_F32), -9),
+                   np.ldexp(_F32(1) + mantissa.astype(_F32) / _F32(8), exponent - 7)).astype(_F32)
+    raw = raw * _F32(0.5)
+    raw[(x == 0) | (x == 0x7F)] = 0
+    return raw
+
+
+_UE4M3 = _ue4m3_table()
+
+
+def _nvfp4(b: np.ndarray) -> np.ndarray:
+    d = _UE4M3[b[:, 0:4]][:, :, None]  # [block, sub-block, 1]
+    qs = b[:, 4:36].reshape(-1, 4, 8)
+    return np.concatenate((_KVALUES_MXFP4[qs & 0xF] * d, _KVALUES_MXFP4[qs >> 4] * d), axis=2).reshape(-1, 64)
+
+
 def _iq4_nl(b: np.ndarray) -> np.ndarray:
     d = _fp16(b[:, 0:2])[:, None]
     qs = b[:, 2:18]
@@ -264,6 +287,7 @@ def _iq1_m(b: np.ndarray) -> np.ndarray:
 _DECODERS = {
     "ggml_q8_0": _q8_0,
     "ggml_q2_0": _q2_0,
+    "ggml_nvfp4": _nvfp4,
     "ggml_iq4_nl": _iq4_nl,
     "ggml_iq4_xs": _iq4_xs,
     "ggml_q4_k": _q4_k,

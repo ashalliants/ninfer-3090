@@ -289,10 +289,10 @@ void ggml_writer_residencies(DeviceContext& device, const std::filesystem::path&
     Reader reader(path);
     const auto objects = ggml_objects(reader);
     // writer_interop.py writes one object per GGML block format and per record format, from
-    // tools/artifact/formats.py's GGML_BLOCK_FORMATS and GGML_RECORD_FORMATS: 13 block formats plus
-    // 21 record formats (13 from the Qwen3.8 packs, 8 from the V4.1-Flash IQ2_XXS build) = 34.
+    // tools/artifact/formats.py's GGML_BLOCK_FORMATS and GGML_RECORD_FORMATS: 14 block formats plus
+    // 22 record formats (13 from the Qwen3.8 packs, 8 from the V4.1-Flash IQ2_XXS build, 1 from Inkling-2) = 36.
     // Update this alongside formats.py when a format is added or removed, or the two drift again.
-    require(objects.size() == 34, "writer fixture lost a GGML format or layout");
+    require(objects.size() == 36, "writer fixture lost a GGML format or layout");
     for (const auto residency : {Residency::Pinned, Residency::Host}) {
         Binder binder(reader);
         for (const auto object : objects) {

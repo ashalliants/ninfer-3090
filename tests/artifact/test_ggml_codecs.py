@@ -45,15 +45,23 @@ def test_decoder_matches_ggml_reference_bit_for_bit(name):
     assert mismatch.size == 0, f"first mismatch at block/element {mismatch[0].tolist()}"
 
 
+FINITE_SCALE_FORMATS = {"ggml_nvfp4"}
+
+
 @pytest.mark.parametrize("name", FORMATS)
 def test_fixture_stays_small_and_covers_special_scales(name):
     stem = FIXTURES / name
     assert stem.with_suffix(".blocks").stat().st_size + stem.with_suffix(".f32").stat().st_size <= 80_000
     _, expected = _fixture(name)
     values = expected.view(np.float32)
+    assert ((expected == 0x80000000).any() and (expected == 0).any())
+    if name in FINITE_SCALE_FORMATS:
+        # UE4M3 scales are finite by construction (ggml decodes 0x7F as 0): every scale byte occurs instead.
+        blocks, _ = _fixture(name)
+        assert np.isfinite(values).all() and set(np.unique(blocks[:, 0:4])) == set(range(256))
+        return
     # Signed zeros, infinities and NaNs from the special binary16 scales reach the output.
     assert np.isnan(values).any() and np.isinf(values).any()
-    assert ((expected == 0x80000000).any() and (expected == 0).any())
 
 
 def _iq2_xxs_fields(blocks):

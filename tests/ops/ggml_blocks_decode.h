@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -76,6 +77,28 @@ inline void q2_0(const std::byte* b, float* y) {
     for (int j = 0; j < 64; ++j) {
         const int q = (u8(b, 2 + j / 4) >> ((j % 4) * 2)) & 3;
         y[j]        = static_cast<float>(q - 1) * d;
+    }
+}
+
+// ggml_ue4m3_to_fp32: 0x00 and 0x7F are 0; bits 6..0 otherwise as E4M3 (the sign bit ignored), times 0.5.
+[[nodiscard]] inline float ue4m3_half(std::uint8_t x) {
+    if (x == 0 || x == 0x7F) { return 0.0f; }
+    const int exp = (x >> 3) & 0xF;
+    const int man = x & 0x7;
+    const float raw = exp == 0 ? std::ldexp(static_cast<float>(man), -9)
+                               : std::ldexp(1.0f + static_cast<float>(man) / 8.0f, exp - 7);
+    return raw * 0.5f;
+}
+
+inline void nvfp4(const std::byte* b, float* y) {
+    static constexpr std::int8_t kvalues_mxfp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    for (int s = 0; s < 4; ++s) {
+        const float d = ue4m3_half(u8(b, s));
+        for (int j = 0; j < 8; ++j) {
+            const auto q      = u8(b, 4 + 8 * s + j);
+            y[16 * s + j]     = static_cast<float>(kvalues_mxfp4[q & 0xF]) * d;
+            y[16 * s + j + 8] = static_cast<float>(kvalues_mxfp4[q >> 4]) * d;
+        }
     }
 }
 
@@ -341,6 +364,8 @@ inline void decode_blocks(QType format, std::span<const std::byte> blocks, std::
             return detail::iq1_m;
         case QType::GGML_Q2_0:
             return detail::q2_0;
+        case QType::GGML_NVFP4:
+            return detail::nvfp4;
         default:
             throw std::invalid_argument("not a GGML block format");
         }

@@ -106,6 +106,9 @@ GGML_IQ2_S = GgmlBlockFormat("ggml_iq2_s", 22, 256, 82)
 GGML_IQ4_XS = GgmlBlockFormat("ggml_iq4_xs", 23, 256, 136)
 GGML_IQ1_M = GgmlBlockFormat("ggml_iq1_m", 29, 256, 56)
 GGML_Q2_0 = GgmlBlockFormat("ggml_q2_0", 42, 64, 18)
+# ggml's NVFP4 (type 40): four UE4M3 scales, one per 16 values, then 32 bytes of E2M1 nibbles. Not the native
+# `nvfp4` format above, which has another layout and a per-tensor divisor.
+GGML_NVFP4 = GgmlBlockFormat("ggml_nvfp4", 40, 64, 36)
 
 # The closed set of expert records: every (gate/up, down) type pair of the qwen4exp GGUFs' routed
 # experts. The IQ2_XS pack's three, with Q2_0 down:
@@ -140,6 +143,9 @@ GGML_REC_IQ2_XXS_IQ2_XS = GgmlExpertRecordFormat("ggml_rec_iq2_xxs_iq2_xs", GGML
 GGML_REC_IQ1_M_IQ2_XXS = GgmlExpertRecordFormat("ggml_rec_iq1_m_iq2_xxs", GGML_IQ1_M, GGML_IQ2_XXS)
 GGML_REC_IQ2_XS_IQ2_XXS = GgmlExpertRecordFormat("ggml_rec_iq2_xs_iq2_xxs", GGML_IQ2_XS, GGML_IQ2_XXS)
 GGML_REC_IQ2_XS_IQ2_XS = GgmlExpertRecordFormat("ggml_rec_iq2_xs_iq2_xs", GGML_IQ2_XS, GGML_IQ2_XS)
+# Inkling-2-Mini's checkpoint experts of layers 0-19 (docs/maintainer/inkling2-model.md); each expert part also has
+# an FP32 multiplier, stored beside the bank.
+GGML_REC_NVFP4_NVFP4 = GgmlExpertRecordFormat("ggml_rec_nvfp4_nvfp4", GGML_NVFP4, GGML_NVFP4)
 
 
 DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT32)})
@@ -168,6 +174,7 @@ GGML_BLOCK_FORMATS = MappingProxyType(
             GGML_IQ4_XS,
             GGML_IQ1_M,
             GGML_Q2_0,
+            GGML_NVFP4,
         )
     }
 )
@@ -196,6 +203,7 @@ GGML_RECORD_FORMATS = MappingProxyType(
             GGML_REC_IQ1_M_IQ2_XXS,
             GGML_REC_IQ2_XS_IQ2_XXS,
             GGML_REC_IQ2_XS_IQ2_XS,
+            GGML_REC_NVFP4_NVFP4,
         )
     }
 )
