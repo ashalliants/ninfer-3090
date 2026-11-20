@@ -417,7 +417,12 @@ ControlVector load_control_vector(const GraftSource& source, const ControlVector
         } else {
             refuse("glp.mode '" + mode + "' is not one this reader implements (project, add)");
         }
-        const std::int64_t spec = integer("glp.spec_version", 1);
+        // glp.spec_version is required: it says which rank, scaling and hook rules the other keys
+        // follow, so a file without it is refused rather than read as version 1.
+        if (meta.count("glp.spec_version") == 0) {
+            refuse("glp.spec_version is missing; a GLP file must say which version it follows");
+        }
+        const std::int64_t spec = integer("glp.spec_version", 0);
         if (spec < 1 || spec > 3) {
             refuse("glp.spec_version " + std::to_string(spec) + " is not one this reader implements (1-3)");
         }

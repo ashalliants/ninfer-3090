@@ -2401,8 +2401,8 @@ A request selects it with `"graft": "uncensored"`; the selection table above app
 The file's alpha is used as written: NInfer has no strength override, so a different alpha is a
 different file (the model card reports alpha 0.5-3 as usable and empty replies at 4).
 
-- **Startup refuses** a file it cannot apply as written, naming the graft: an unknown `glp.mode` or
-  `glp.spec_version`, a `glp.hook_point` other than `residual_stream_post_layer`, rank > 1
+- **Startup refuses** a file it cannot apply as written, naming the graft: an unknown `glp.mode`, a
+  missing or unknown `glp.spec_version`, a `glp.hook_point` other than `residual_stream_post_layer`, rank > 1
   (subspace) files, version-1 files carrying `glp.dir_scales` or `glp.layer_scales`, a
   `glp.content_sha256` or `glp.layer_ids_zero_based` that disagrees with the tensors, a
   `controlvector.model_hint` naming another architecture (the dense models accept `qwen3_5`,

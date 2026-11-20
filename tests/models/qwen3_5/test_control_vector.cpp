@@ -284,6 +284,7 @@ int test_refusals() {
     refuse(glp_project().set("controlvector.model_hint", std::string("qwen4exp")), "another model's hint", "made for");
     refuse(glp_project().set("glp.mode", std::string("ablate")), "an unknown mode", "glp.mode");
     refuse(glp_project().set("glp.spec_version", std::uint32_t{4}), "an unknown spec version", "spec_version");
+    refuse(glp_project().erase("glp.spec_version"), "a missing spec version", "spec_version");
     refuse(glp_project().set("glp.hook_point", std::string("attn_out")), "another hook point", "hook_point");
     refuse(glp_project().set("glp.rank", std::uint32_t{2}), "a rank-2 file", "rank");
     refuse(glp_project().set("glp.dir_scales", std::string("2")), "version-2 keys in version 1", "spec_version 2");
