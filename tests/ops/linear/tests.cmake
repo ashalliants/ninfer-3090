@@ -20,6 +20,17 @@ ninfer_add_op_test(ninfer_linear_q8_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q8_a16.cpp"
   LIBRARIES ninfer_linear_test_support)
 
+# sm_70: the same four group formats with NINFER_SM70_TENSOR_CORES=1, where their A16 calls of 64+
+# tokens take the FP16 tensor-core route (ops/linear/common/rowsplit_tensor_core_sm70.h).
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  foreach(format q4 q5 q6 q8)
+    add_test(NAME ninfer_linear_${format}_a16_tensor_cores_test
+      COMMAND ninfer_tests ninfer_linear_${format}_a16_test)
+    set_tests_properties(ninfer_linear_${format}_a16_tensor_cores_test PROPERTIES
+      ENVIRONMENT "NINFER_SM70_TENSOR_CORES=1" SKIP_RETURN_CODE 77)
+  endforeach()
+endif()
+
 ninfer_add_op_test(ninfer_linear_t2_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_t2_a16.cpp"
   LIBRARIES ninfer_linear_test_support)

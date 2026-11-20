@@ -646,6 +646,36 @@ request (encode and prefill, thinking off):
 | Qwen3.8-27B | 2.40 -> 2.01 s | 14.46 -> 8.40 s |
 | Flash-Next | 3.42 -> 3.14 s | 12.79 -> 6.67 s |
 
+#### Vision linears on the tensor cores (Qwen3.8-27B)
+
+The 27B stores its vision blocks' linears as group-quantized Q4/Q5/Q6 (qkv 3456x1152, fc1
+4304x1152, attention out 1152x1152, fc2 1152x4304), and those calls of hundreds to thousands of
+patches ran the emulated BF16 `mma.sync` tile GEMMs. With `NINFER_SM70_TENSOR_CORES=1`, an A16 call
+of 64+ tokens on a Q4/Q5/Q6/Q8 weight of at most 8M elements decodes the weight once per call to
+per-row power-of-two FP16 (`ops/linear/common/rowsplit_tensor_core_sm70.cu`) and takes the same
+cuBLAS FP16 route as BF16 (FP32 accumulation, per-token power-of-two activations). Products stay
+exact, so only the summation order changes. The size bound keeps the text model's linears (all
+larger) and the vision mergers on their kernels: the mergers' staging would push the 27B's
+`--vision-residency overlay` encode window past what it can evict. The route admits K % 8 (it was
+K % 32), which lets fc2's K = 4304 in. On Flash-Next that moves the BF16 vision fc2 onto the route,
+the only change there.
+
+`cublasCreate` cannot run inside a stream capture. If the route has not yet created its handle when
+a capture reaches it, it declines (`sm70_tensor_core_can_launch`), and the call keeps the default
+kernels.
+
+Image prompt time (encode and prefill), measured on top of the FP16 vision attention route (#517):
+
+| | 1 MP | 4 MP |
+|---|---|---|
+| Qwen3.8-27B | 2.01 -> 1.36 s | 8.40 -> 5.87 s |
+| Flash-Next (fc2 only) | 3.17 -> 3.02 s | 6.67 -> 6.14 s |
+
+Flash-Next's vision tower against its FP64 oracle (`ninfer_qwen4_exp_vision_real_test`) has
+normwise error 2.4-7.1e-2 across six images, against 2.7-7.6e-2 before. It is lower on five of the
+six, all at the test's BF16-storage estimate. `ninfer_linear_q{4,5,6,8}_a16_tensor_cores_test`
+reruns the Q format conformance tests with the variable set.
+
 ### The routed experts' wide gate/up
 
 `wide_gate_up_kernel` (the wide route, one CTA per 32 intermediates and job) stays on dp4a: each

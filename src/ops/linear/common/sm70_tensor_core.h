@@ -44,7 +44,8 @@ bool sm70_tensor_cores_enabled() noexcept;
 
 // Whether a call of `tokens` tokens on a [rows, k] weight takes the route (ignoring the arena).
 inline bool sm70_tensor_core_admits(int rows, int k, int tokens) noexcept {
-    return tokens >= kSm70TensorCoreMinTokens && k % 32 == 0 &&
+    // k % 8: FP16 rows on 16-byte boundaries for cuBLAS (the vision fc2's K is 4304).
+    return tokens >= kSm70TensorCoreMinTokens && k % 8 == 0 &&
            static_cast<long long>(rows) * k <= kSm70TensorCoreMaxWeight && sm70_tensor_cores_enabled();
 }
 
@@ -77,6 +78,11 @@ struct Sm70Staging {
     float* token_inverse;   // slice
     void* cublas_workspace; // kSm70CublasWorkspaceBytes
 };
+
+// Whether the route can launch on `stream` now: false only while the stream is capturing a graph
+// and cuBLAS's handle does not exist yet (cublasCreate cannot run under capture). Creates the
+// handle otherwise.
+bool sm70_tensor_core_can_launch(cudaStream_t stream);
 
 // Carves the staging for a [rows, k] call of `tokens`, or returns false (allocating nothing) when the
 // arena's remaining room is below sm70_tensor_core_workspace_bytes. `arena` may be null (false).

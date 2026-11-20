@@ -24,8 +24,10 @@ void check_blas(cublasStatus_t status, const char* what) {
     }
 }
 
+cublasHandle_t g_handle = nullptr;
+
 cublasHandle_t handle() {
-    static cublasHandle_t h = nullptr;
+    cublasHandle_t& h = g_handle;
     if (h == nullptr) {
         check_blas(cublasCreate(&h), "cublasCreate");
         check_blas(cublasSetMathMode(h, CUBLAS_TENSOR_OP_MATH), "cublasSetMathMode");
@@ -98,6 +100,15 @@ bool sm70_tensor_cores_enabled() noexcept {
 namespace {
 std::atomic<std::uint64_t> g_sm70_fallbacks{0};
 } // namespace
+
+bool sm70_tensor_core_can_launch(cudaStream_t stream) {
+    if (g_handle != nullptr) { return true; }
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &status));
+    if (status != cudaStreamCaptureStatusNone) { return false; }
+    (void)handle();
+    return true;
+}
 
 bool sm70_staging(WorkspaceArena* arena, int rows, int k, int tokens, Sm70Staging& out) {
     const std::size_t need = sm70_tensor_core_workspace_bytes(rows, k, tokens);
