@@ -504,7 +504,7 @@ tok/s, 125-token prompt 86 -> 268 tok/s, same outputs; decode unchanged.
 
 **Prompt attention.** The INT8 prompt kernel (`causal_attention_prompt_i8_fa2`) runs its `mma` on
 the emulation, and after the GEMMs moved it was ~30% of a 4k-token prefill. On sm_70 a
-single-sequence INT8 G64 call of 64 or more columns (and `causal_softmax_attention_cached` over
+single-sequence INT8 G64 call of 17 or more columns (and `causal_softmax_attention_cached` over
 the same) instead takes llama.cpp's FP16 tensor-core flash attention
 (`third_party/llama_cpp_fattn`, MIT, pinned at 62bf73d25), driven by
 `ops/launcher/gqa_attention_volta_flash.cu` -- both adapted from geoffwatts/ninfer-v100
@@ -512,6 +512,17 @@ the same) instead takes llama.cpp's FP16 tensor-core flash attention
 into contiguous FP16 once per layer, and runs Q in blocks of `kVoltaFlashQBlockTokens` under a
 causal mask. Qwen3.8-27B: 1,150 / 2,186 / 4,392-token prompts 783 -> 868, 834 -> 959, 778 ->
 1,020 tok/s, same greedy output; perplexity 6.00650 -> 6.00707.
+
+The route starts at 17 columns, one past the widest verify width (`kMaximumVerifyTokens`, so the
+graphed verify and draft widths never take it); at first it started at 64, which left short
+prompts over a long history on the emulated INT8 kernel. That kernel's cost grows with the history
+and the flash route's barely does (`ninfer_causal_softmax_attention_bench`, append, 24 heads, one
+layer, W = 17..63): no history 203-220 -> 80-111 us, 1K keys 2.05-2.25 ms -> 132-179 us, 4K
+7.5 ms -> 231-366 us, 16K 29.5 ms -> 0.65-1.16 ms, 37K 66.3-66.7 ms -> 1.3-2.5 ms. A 24-35-token
+follow-up question to a 37K-token conversation (Qwen3.8-27B, MTP3, INT8 KV) went from a TTFT of
+1.15-1.28 s to 0.11-0.24 s; greedy answers matched in four of five follow-ups (the fifth diverged
+at its third token, a near tie: -1.38 against -1.47), and the matched tokens' logprobs moved by at
+most 0.068.
 
 Two costs come with it, both measured in the op suite. The kernel accumulates P x V in FP16 (as
 llama.cpp does on every tensor-core GPU), so its error grows with the key count: relative L2

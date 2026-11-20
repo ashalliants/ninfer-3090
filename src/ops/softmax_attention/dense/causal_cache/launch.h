@@ -156,8 +156,16 @@ void causal_attention_prompt_k8v4_attention_launch(const Tensor& q, const Tensor
 // (third_party/llama_cpp_fattn) over K/V gathered from the paged cache into contiguous FP16 once per
 // layer, Q in blocks of kVoltaFlashQBlockTokens (ops/launcher/gqa_attention_volta_flash.cu,
 // adapted from geoffwatts/ninfer-v100).
+//
+// It takes every single-sequence call wider than the verify widths (16): below 64 columns the INT8
+// prompt kernel launches no key split, so one CTA per row tile walks every key on emulated mma.
+// Qwen3.8-27B geometry on a V100, us (INT8 kernel at W = 17..63 / flash at W = 64):
+//   keys      0      256    1K     4K      16K      37K
+//   INT8    203-220  711-729 2.05-2.25K 7.5K 29.5K  66.3-66.7K
+//   flash   110      132    166    338     990      2105
+// so there is no crossover to keep: a 40-token follow-up over 37K keys spent 68 ms per layer there.
 inline constexpr std::int32_t kVoltaFlashQBlockTokens = 1024;
-inline constexpr std::int32_t kVoltaFlashMinimumWidth = 64;
+inline constexpr std::int32_t kVoltaFlashMinimumWidth = 17;
 inline constexpr std::int32_t kVoltaFlashMaskRowPad   = 64;
 inline constexpr std::int32_t kVoltaFlashKeyPad       = 256;
 

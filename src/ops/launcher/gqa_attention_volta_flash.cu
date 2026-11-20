@@ -354,9 +354,16 @@ const FlashLaunchConfig& flash_launch_config() {
         FlashLaunchConfig c;
 
         int device = 0;
-        cudaGetDevice(&device);
         cudaDeviceProp prop{};
-        cudaGetDeviceProperties(&prop, device);
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
+            // No device: a host-only planning query (the CPU-labelled graph-profile tests sweep
+            // widths that reach this route). This TU is built for sm_70 only; plan for a V100.
+            (void)cudaGetLastError();
+            prop.major               = 7;
+            prop.minor               = 0;
+            prop.multiProcessorCount = 80;
+        }
         c.nsm = prop.multiProcessorCount;
 
         const int cc = prop.major * 100 + prop.minor * 10;
@@ -389,7 +396,10 @@ const FlashLaunchConfig& flash_launch_config() {
                              cudaFuncAttributeMaxDynamicSharedMemorySize, c.nbytes_shared);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &c.blocks_per_sm, reinterpret_cast<const void *>(kernel), c.nthreads, c.nbytes_shared);
-        if (c.blocks_per_sm <= 0) { c.blocks_per_sm = 1; }
+        if (c.blocks_per_sm <= 0) {
+            (void)cudaGetLastError(); // the host-only case above: no attribute or occupancy query
+            c.blocks_per_sm = 1;
+        }
         return c;
     }();
     return config;
@@ -587,8 +597,8 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
     //    negative: every block of a masked call attends over the whole gathered range instead
     //    (n_kv_alloc, what the gather and mask buffers are sized for), and the position mask
     //    limits each row as before. The same workspace either way. kernel_nodes_impl counts an
-    //    unmasked call: graph profiles record only verify and draft widths, below
-    //    kVoltaFlashMinimumWidth.
+    //    unmasked call: graph profiles record only verify and draft widths (at most 16 columns),
+    //    below kVoltaFlashMinimumWidth.
     const std::int32_t base = n_kv_total - width;
     const bool masked       = valid_ptr != nullptr;
     for (std::int32_t begin = 0; begin < width; begin += q_block_tokens) {
