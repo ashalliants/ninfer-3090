@@ -312,6 +312,9 @@ __global__ __launch_bounds__(kLoraThreads) void lora_expand_rows_kernel(const Lo
         if (lead == nullptr) { lead = b_base[c]; }
         uniform = uniform && b_base[c] == lead;
     }
+    // No column of the tile has a B for this output (unadapted rows, or adapters without this
+    // output): nothing to add, and `lead` would be null.
+    if (lead == nullptr) { return; }
     if (uniform && Cols % 4 == 0) {
         for (int i0 = 0; i0 < o.rank_count; i0 += 8) {
             float bv[Rows][8];

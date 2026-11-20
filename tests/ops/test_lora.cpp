@@ -415,7 +415,9 @@ int main() {
     for (const auto& [label, columns] :
          {std::pair{std::string("lora attention input decode B3"), map({0, -1, 1}, 1)},
           std::pair{std::string("lora attention input verify B2 W4"), map({1, 0}, 4)},
-          std::pair{std::string("lora attention input prefill T300"), map({0}, 300)}}) {
+          std::pair{std::string("lora attention input prefill T300"), map({0}, 300)},
+          // Adapter 1 has no value B: the prefill expand must skip tiles with no B at all.
+          std::pair{std::string("lora attention input prefill T64 slot 1"), map({1}, 64)}}) {
         failures += run_case({label, 5120, 96, 2, both,
                               {{6144, 0, 32, 6144, 0, both},
                                {6144, 0, 32, 6144, 0, both},
