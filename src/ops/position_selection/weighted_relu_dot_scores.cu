@@ -122,7 +122,7 @@ void weighted_relu_dot_scores(const Tensor& q, const Tensor& k, const Tensor& we
     require(q.ne[3] == 1 && k.ne[2] == 1 && weights.ne[2] == 1 && scores.ne[2] == 1, "unexpected extra dimensions");
     require(heads == 8 || heads == 16 || heads == 32 || heads == 64, "head count must be 8, 16, 32 or 64");
     require(dim >= 8 && dim % 8 == 0 && dim <= kScoreMaxHeadDim && dim * heads <= 8192, "head dimension out of range");
-    require(columns >= 1 && n >= 1, "empty extent");
+    require(columns >= 1 && n >= 1 && n <= kScoreMaxPositions, "extent out of range (N is at most kScoreMaxPositions)");
     require(k.ne[0] == dim && weights.ne[0] == heads && weights.ne[1] == columns && valid.numel() == columns &&
                 scores.ne[0] == n && scores.ne[1] == columns,
             "shapes disagree");

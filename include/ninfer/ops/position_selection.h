@@ -15,8 +15,10 @@
 
 namespace ninfer::ops {
 
-/// Head counts `weighted_relu_dot_scores` serves, and the largest head dimension.
-inline constexpr std::int32_t kScoreMaxHeadDim = 256;
+/// The largest head dimension `weighted_relu_dot_scores` serves, and the most positions (the position
+/// axis is tiled over a grid dimension, 65,535 tiles of 128).
+inline constexpr std::int32_t kScoreMaxHeadDim  = 256;
+inline constexpr std::int32_t kScoreMaxPositions = 65535 * 128;
 
 /**
  * Op: weighted_relu_dot_scores
@@ -30,7 +32,7 @@ inline constexpr std::int32_t kScoreMaxHeadDim = 256;
  * Logical shapes:
  *   q BF16 [D, H, T]; k BF16 [D, N]; weights BF16 [H, T]; valid I32 [T] (any value; clamped to
  *   [0, N]); scores FP32 [N, T] (position t of column s at t + N * s). H in {8, 16, 32, 64};
- *   D a multiple of 8 with D <= kScoreMaxHeadDim and D * H <= 8192; N >= 1; T >= 1.
+ *   D a multiple of 8 with D <= kScoreMaxHeadDim and D * H <= 8192; 1 <= N <= kScoreMaxPositions; T >= 1.
  *
  * Supported domain:
  *   Contiguous tensors with 16-byte aligned q and k; finite q, k and weights; finite weight_scale.
@@ -64,7 +66,7 @@ inline constexpr std::int32_t kTopKPositionsMax = 4096;
  *
  * Logical shapes:
  *   scores FP32 [N, T]; valid I32 [T]; out I32 [k, T]. 1 <= k <= kTopKPositionsMax; N >= 1; T >= 1;
- *   offset >= 0.
+ *   offset >= 0 and offset + N - 1 <= INT32_MAX (every emitted position fits the I32 output).
  *
  * Supported domain:
  *   Contiguous tensors; no NaN among the reachable scores (-inf is allowed).

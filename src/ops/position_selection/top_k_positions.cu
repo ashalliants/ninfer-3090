@@ -126,6 +126,7 @@ void top_k_positions(const Tensor& scores, const Tensor& valid, std::int32_t k, 
     const int n = scores.ne[0], columns = scores.ne[1];
     require(k >= 1 && k <= kTopKPositionsMax, "k out of range");
     require(n >= 1 && columns >= 1 && offset >= 0, "extent or offset out of range");
+    require(static_cast<long long>(offset) + n - 1 <= 2147483647LL, "offset + N - 1 must fit the I32 output");
     require(valid.numel() == columns && out.ne[0] == k && out.ne[1] == columns, "shapes disagree");
     require(!overlaps(out, scores) && !overlaps(out, valid), "out overlaps an input");
     top_k_kernel<<<columns, kThreads, 0, stream>>>(static_cast<const float*>(scores.data),

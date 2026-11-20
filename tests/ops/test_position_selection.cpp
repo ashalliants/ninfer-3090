@@ -356,6 +356,18 @@ int main() {
             check(refuses([&] { o::top_k_positions(top_scores, V, 0, 0, out, stream); }), "k = 0 is refused");
             check(refuses([&] { o::top_k_positions(top_scores, V, 4097, 0, out, stream); }), "k past 4,096 is refused");
             check(refuses([&] { o::top_k_positions(top_scores, V, 512, -1, out, stream); }), "a negative offset is refused");
+            check(refuses([&] { o::top_k_positions(top_scores, V, 512, 2147483647 - 98, out, stream); }),
+                  "an offset that overflows the I32 output with N = 100 is refused");
+            check(!refuses([&] { o::top_k_positions(top_scores, V, 512, 2147483647 - 99, out, stream); }),
+                  "the largest offset that fits (offset + N - 1 = INT32_MAX) is served");
+            {
+                // More positions than the grid serves: refused before any launch (the shapes are larger than the buffers).
+                const int too_many = 65535 * 128 + 1;
+                const Tensor big_k(kd.p, DType::BF16, {128, too_many});
+                Tensor big_scores(sd.p, DType::FP32, {too_many, 2});
+                check(refuses([&] { o::weighted_relu_dot_scores(Q, big_k, W, V, 0.1F, big_scores, stream); }),
+                      "more than 65,535 tiles of positions are refused");
+            }
             Tensor wrong_out(id.p, DType::I32, {256, 2});
             check(refuses([&] { o::top_k_positions(top_scores, V, 512, 0, wrong_out, stream); }), "an output of another width is refused");
             Tensor aliased_out(sd.p, DType::I32, {100, 2});
