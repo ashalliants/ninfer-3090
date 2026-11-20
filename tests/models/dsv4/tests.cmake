@@ -40,3 +40,10 @@ ninfer_add_test(ninfer_dsv4_engine_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_real.cpp"
   LIBRARIES ninfer_engine ninfer_model_loading ninfer_core)
 set_tests_properties(ninfer_dsv4_engine_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# The chat frontend over the real artifact tokenizer and template: CPU only, no GPU lock (needs
+# NINFER_TEST_DSV4_ARTIFACT; skips with 77).
+ninfer_add_test(ninfer_dsv4_frontend_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_frontend_real.cpp"
+  LIBRARIES ninfer_model_loading ninfer_core)
+set_tests_properties(ninfer_dsv4_frontend_real_test PROPERTIES SKIP_RETURN_CODE 77)

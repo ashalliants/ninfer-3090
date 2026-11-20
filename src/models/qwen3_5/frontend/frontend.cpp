@@ -183,9 +183,16 @@ fi::ProcessorOptions processor_options(const FrontendResources& resources) {
     return options;
 }
 
-void validate_tokenizer_config(const FrontendResources& resources) {
+void validate_tokenizer_config(const FrontendResources& resources, Architecture architecture) {
     const Json tokenizer_config =
         parse_resource_json(resources.tokenizer_config_json, "tokenizer_config.json");
+    if (architecture == Architecture::Dsv4) {
+        // DeepSeek-V4: its template writes the BOS itself and its byte-level pipeline has no prefix space.
+        if (tokenizer_config.value("add_bos_token", true)) {
+            throw std::invalid_argument("tokenizer_config.json must set add_bos_token false: the chat template writes the BOS");
+        }
+        return;
+    }
     if (tokenizer_config.value("add_bos_token", true) ||
         tokenizer_config.value("add_prefix_space", true)) {
         throw std::invalid_argument(
@@ -199,8 +206,8 @@ void validate_tokenizer_config(const FrontendResources& resources) {
 }
 
 fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources,
-                                               const std::filesystem::path& override_path) {
-    validate_tokenizer_config(resources);
+                                               const std::filesystem::path& override_path, Architecture architecture) {
+    validate_tokenizer_config(resources, architecture);
     nlohmann::ordered_json tokens = nlohmann::ordered_json::object();
     const auto config             = nlohmann::ordered_json::parse(resources.tokenizer_config_json);
     for (const char* key : {"bos_token", "eos_token", "pad_token", "unk_token", "sep_token",
@@ -676,7 +683,7 @@ ModelSamplingDefaults default_sampling(Architecture architecture) {
 class Frontend::Impl {
 public:
     Impl(const FrontendResources& resources, FrontendOptions options)
-        : chat_template(compile_chat_template(resources, options.chat_template_path)),
+        : chat_template(compile_chat_template(resources, options.chat_template_path, options.architecture)),
           tokenizer(resources.tokenizer),
           processor(options.vision_enabled ? processor_options(resources) : fi::ProcessorOptions{}),
           vision_enabled(options.vision_enabled), max_context(options.max_context),
