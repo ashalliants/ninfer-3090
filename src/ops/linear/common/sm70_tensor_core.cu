@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -24,11 +25,42 @@ void check_blas(cublasStatus_t status, const char* what) {
     }
 }
 
+// One cuBLAS handle per device (a handle belongs to the device current when it was created),
+// created on first use there. Each is published only once fully configured, and created under a
+// mutex, so threads racing to a device's first call share one handle.
+constexpr int kMaxDevices = 64;
+std::atomic<cublasHandle_t> g_handles[kMaxDevices]{};
+std::mutex g_handle_mutex;
+
+int current_device() {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    if (device < 0 || device >= kMaxDevices) {
+        throw std::runtime_error("sm_70 tensor-core route: device " + std::to_string(device) +
+                                 " is past the route's handle table");
+    }
+    return device;
+}
+
+// The current device's handle, or null before its first create.
+cublasHandle_t existing_handle(int device) {
+    return g_handles[device].load(std::memory_order_acquire);
+}
+
 cublasHandle_t handle() {
-    static cublasHandle_t h = nullptr;
+    const int device = current_device();
+    cublasHandle_t h = existing_handle(device);
+    if (h != nullptr) { return h; }
+    std::lock_guard<std::mutex> lock(g_handle_mutex);
+    h = g_handles[device].load(std::memory_order_relaxed);
     if (h == nullptr) {
         check_blas(cublasCreate(&h), "cublasCreate");
-        check_blas(cublasSetMathMode(h, CUBLAS_TENSOR_OP_MATH), "cublasSetMathMode");
+        const cublasStatus_t mode = cublasSetMathMode(h, CUBLAS_TENSOR_OP_MATH);
+        if (mode != CUBLAS_STATUS_SUCCESS) {
+            cublasDestroy(h);
+            check_blas(mode, "cublasSetMathMode");
+        }
+        g_handles[device].store(h, std::memory_order_release);
     }
     return h;
 }
@@ -98,6 +130,16 @@ bool sm70_tensor_cores_enabled() noexcept {
 namespace {
 std::atomic<std::uint64_t> g_sm70_fallbacks{0};
 } // namespace
+
+bool sm70_tensor_core_can_launch(cudaStream_t stream) {
+    // The handle of the device this call runs on: another device's handle cannot serve it.
+    if (existing_handle(current_device()) != nullptr) { return true; }
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &status));
+    if (status != cudaStreamCaptureStatusNone) { return false; }
+    (void)handle();
+    return true;
+}
 
 bool sm70_staging(WorkspaceArena* arena, int rows, int k, int tokens, Sm70Staging& out) {
     const std::size_t need = sm70_tensor_core_workspace_bytes(rows, k, tokens);

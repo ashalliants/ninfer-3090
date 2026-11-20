@@ -3,6 +3,7 @@
 
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/bf16/bf16_tensor_core_sm70.h"
+#include "ops/linear/common/rowsplit_tensor_core_sm70.h"
 #include "ops/linear/common/sm70_tensor_core.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear/ggml/ggml_dispatch.h"
@@ -89,6 +90,9 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
+    // sm_70 opt-in (NINFER_SM70_TENSOR_CORES=1): A16 group-format linears of 64+ tokens on the FP16
+    // tensor cores instead of the emulated BF16 mma (rowsplit_tensor_core_sm70.h).
+    if (detail::rowsplit_tensor_core_linear(x, w, out, policy, workspace, stream)) { return; }
     switch (w.qtype) {
     case QType::Q4_G64_FP16:
         detail::q4_dispatch(x, w, out, policy, stream);
@@ -152,19 +156,23 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::Q4_G64_FP16:
         (void)detail::select_q4_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q4_launch(output_rows, input_rows, max_tokens, policy);
-        return 0;
+        return detail::rowsplit_tensor_core_workspace_bytes(qtype, policy, output_rows, input_rows,
+                                                            max_tokens);
     case QType::Q5_G64_FP16:
         (void)detail::select_q5_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q5_launch(output_rows, input_rows, max_tokens, policy);
-        return 0;
+        return detail::rowsplit_tensor_core_workspace_bytes(qtype, policy, output_rows, input_rows,
+                                                            max_tokens);
     case QType::Q6_G64_FP16:
         (void)detail::select_q6_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q6_launch(output_rows, input_rows, max_tokens, policy);
-        return 0;
+        return detail::rowsplit_tensor_core_workspace_bytes(qtype, policy, output_rows, input_rows,
+                                                            max_tokens);
     case QType::Q8_G32_FP16:
         (void)detail::select_q8_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q8_launch(output_rows, input_rows, max_tokens, policy);
-        return 0;
+        return detail::rowsplit_tensor_core_workspace_bytes(qtype, policy, output_rows, input_rows,
+                                                            max_tokens);
     case QType::T2_G128_FP16:
         (void)detail::select_t2_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_t2_launch(output_rows, input_rows, max_tokens, policy);

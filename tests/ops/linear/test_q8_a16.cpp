@@ -1,3 +1,4 @@
+#include "ops/linear/common/sm70_tensor_core.h"
 #include "ops/linear/linear_test_common.h"
 
 #include <algorithm>
@@ -34,7 +35,10 @@ int q8_workspace_domain(std::int32_t n, std::int32_t k) {
     int failures = 0;
     for (auto policy : {ninfer::ops::LinearPolicy::A16Only, ninfer::ops::LinearPolicy::AllowA8,
                         ninfer::ops::LinearPolicy::AllowA4}) {
-        if (ninfer::ops::linear_workspace_capacity_bytes(
+        // (The sm_70 tensor-core route, when NINFER_SM70_TENSOR_CORES=1, stages A16 calls from the
+        // workspace.)
+        if (!ninfer::ops::detail::sm70_tensor_cores_enabled() &&
+            ninfer::ops::linear_workspace_capacity_bytes(
                 ninfer::QType::Q8_G32_FP16, n, k, policy, 1,
                 std::numeric_limits<std::int32_t>::max()) != 0) {
             std::cerr << "Q8 [" << n << ',' << k
