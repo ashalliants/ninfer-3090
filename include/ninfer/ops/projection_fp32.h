@@ -71,7 +71,8 @@ void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Te
  *
  * Supported domain:
  *   QType::GGML_IQ4_XS (8-byte aligned rows), GGML_Q5_K (16-byte aligned rows) or GGML_Q6_K
- *   (2-byte aligned rows) in the ggml_blocks_v1 layout with K = 2560 and N even;
+ *   (2-byte aligned rows) in the ggml_blocks_v1 layout with K = 2560 and N even, or GGML_Q5_K with
+ *   K = 5120 (DeepSeek-V4.1-Flash's head, any N);
  *   x and out contiguous, x 16-byte aligned.
  *
  * Numeric:
