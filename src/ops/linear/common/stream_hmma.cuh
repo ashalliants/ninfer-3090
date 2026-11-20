@@ -354,8 +354,18 @@ bool try_launch_stream_hmma_rows(const __nv_bfloat16* x, std::int64_t x_stride,
         // barely does, but it reads each row from one lane, so it needs many rows in flight: the
         // long, few-row down projection only pays from seven tokens, and 4096 rows from five.
         const std::int64_t rows_total = static_cast<std::int64_t>(items) * Rows;
-        const bool wins = Cols >= 7 || (k <= 6144 && (rows_total >= 6144 ||
-                                                      (Cols >= 5 && rows_total >= 4096)));
+        bool wins = Cols >= 7 || (k <= 6144 && (rows_total >= 6144 ||
+                                                (Cols >= 5 && rows_total >= 4096)));
+        // A format whose decode costs more per weight (Q5's high plane) sets its own narrowest
+        // winning width for K <= 6144 (longer rows take it at eight tokens only), and takes it only
+        // when NINFER_STREAM_HMMA_Q5=1 asks: see Q5RowSplitStorage::kHmmaMinCols for why it is off.
+        if constexpr (requires { Format::kHmmaMinCols; }) {
+            static const bool opted_in = [] {
+                const char* value = std::getenv("NINFER_STREAM_HMMA_Q5");
+                return value != nullptr && value[0] == '1';
+            }();
+            wins = opted_in && (Cols >= 8 || (Cols >= Format::kHmmaMinCols && k <= 6144));
+        }
         if (stream_hmma_mode() != 2 && !wins) {
             return false;
         }

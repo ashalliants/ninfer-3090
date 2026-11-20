@@ -31,3 +31,13 @@ ninfer_add_op_test(ninfer_linear_add_nvfp4_test
 ninfer_add_op_test(ninfer_linear_add_fp8_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8.cpp"
   LIBRARIES ninfer_ops)
+
+# sm_70: the Q5 residual linear's verify widths with the opt-in tensor-core form
+# (NINFER_STREAM_HMMA_Q5=1, ops/linear/common/stream_hmma.cuh).
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  foreach(test ninfer_linear_add_q5_a16_test ninfer_linear_add_q5_small_t_test)
+    add_test(NAME ${test}_hmma COMMAND ninfer_tests ${test})
+    set_tests_properties(${test}_hmma PROPERTIES
+      ENVIRONMENT "NINFER_STREAM_HMMA_Q5=1" SKIP_RETURN_CODE 77)
+  endforeach()
+endif()

@@ -170,8 +170,14 @@ round spent ~26 ms of ~50 in it against a ~19 ms read. Two changes:
   from 32 rows at once cost 2-3x the bytes in DRAM). It sits behind `try_launch_stream_gemv`, so
   every Output / Epilogue works unchanged, and takes Q4 rows of K <= 6144 at T >= 5, or T = 4 on
   the SwiGLU-sized matrices; its cost barely grows with T, the SIMT kernel's does (table in
-  `try_launch_stream_hmma_rows`). Q5 measured slower at every width and stays on SIMT.
-  `NINFER_STREAM_HMMA=0` turns it off.
+  `try_launch_stream_hmma_rows`). `NINFER_STREAM_HMMA=0` turns it off.
+- Q5's form (its high plane spread into the FP16 magic with one multiply per four weights) loses
+  at T = 4 (6144 x 5120: 66 SIMT vs 75 us; 5120 x 17408: 150 vs 266 us) and wins from T = 6 at
+  K <= 6144 and at T = 8 on the down projection (117 -> 96, 103 -> 80, 259 -> 230 us at T = 8).
+  So it can only help the two-lane verify (T = 8). There, Qwen3.8-27B goes 78.6 -> 79.5-80.8 tok/s
+  in total, but a lane's T = 8 verify then sums differently from its T = 4 one. The greedy outputs
+  of a prompt alone and in a pair part sooner: 243 -> 69 shared tokens of 256 on one of two
+  prompts, a near tie (logprob -0.80 vs -0.73). It is opt-in, `NINFER_STREAM_HMMA_Q5=1`.
 
 `ninfer_bench -pg 2048,256`, bench corpus, optimized proposal head (tok/s):
 
@@ -655,9 +661,13 @@ Qwen3.8-Flash-Next. A 32 GB V100 holds the 27B (19 GiB) with room for KV; the Bo
 3. Verify widths on the few-row matrices: the out projections (5120 x 6144) and the long down
    projection (5120 x 17408) run at 35-55% of the weight stream at T = 4 in both streaming GEMVs
    (the SIMT one stages K = 6144 in two chunks at four tokens; the tensor-core one has too few
-   rows in flight). A K-split across CTAs would fill the card. Q5 on the tensor-core form needs
-   its high plane decoded more cheaply first, and Q6 (the verify LM head, 2 ms of an MTP3 round)
-   has no tensor-core form yet.
+   rows in flight). At T = 4 the SIMT kernel is instruction-bound rather than short of loads in
+   flight: two slices in flight (`Unroll` 2) and 32-warp CTAs both measured slower (5120 x 17408
+   Q5: 150 -> 153 and 182 us; Q4: 119 -> 122 and 127 us), so a K-split, which only adds
+   parallelism, is not expected to help. The win would have to come from fewer instructions per
+   weight and token. Q5 on the tensor cores loses at T = 4 (above). Q6 (the verify LM head, 2 ms
+   of an MTP3 round) has no tensor-core form, and given Q5's result one is not expected to win
+   at T = 4.
 4. Kernel count: a plain decode step is ~700 kernels, and each short GEMV loses ~8 us to fill and
    drain between dependent kernels (Volta has no programmatic dependent launch), ~1-2 ms a token.
    Fusing the norms and small element-wise steps into their neighbours is the remaining decode

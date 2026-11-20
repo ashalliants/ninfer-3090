@@ -189,13 +189,20 @@ struct Q5StreamFormat {
     // Tensor-core form (ops/linear/common/stream_hmma.cuh). A step is two groups (128 k) of one
     // row: 64 code bytes and 16 high bytes, both read by lane pairs, and the two scales.
     //
-    // Off (kHmma = false): correct, but slower than the SIMT kernel at every verify width on a
-    // V100 (us SIMT / tensor cores; NINFER_STREAM_HMMA=0 against =2 with this set to true):
-    //   12288 x 5120   T=4 103 / 158   T=6 156 / 205   T=8 188 / 203
-    //   5120 x 6144    T=4  67 /  93   T=6  83 /  95   T=8 104 / 102
     // The high-bit spread costs ~1 instruction per weight on top of Q4's decode, and the half-
-    // sector high-plane reads cost bandwidth.
-    static constexpr bool kHmma      = false;
+    // sector high-plane reads cost bandwidth, so it wins only at wider verify widths than Q4
+    // (V100-PCIE-32GB, us SIMT / tensor cores; NINFER_STREAM_HMMA=0 against =2):
+    //   shape (rows x K)   T=4        T=5        T=6        T=7        T=8
+    //   6144 x 5120      66 /  75   90 /  93  100 /  93   96 /  94  117 /  96
+    //   5120 x 6144      68 /  77   75 /  79   84 /  79   93 /  85  103 /  80
+    //   5120 x 17408    150 / 266  181 / 261  200 / 256  255 / 258  259 / 230
+    // so from six tokens for K <= 6144 and at eight for longer rows (try_launch_stream_hmma_rows):
+    // the two-lane MTP3 verify (T = 8), not the one-lane one (T = 4). Opt-in only
+    // (NINFER_STREAM_HMMA_Q5=1): on Qwen3.8-27B two lanes gain 1-3% (78.6 -> 79.5-80.8 tok/s), but
+    // a lane's T = 8 verify then sums differently from its T = 4 one, and the one-lane and two-lane
+    // greedy outputs of a prompt part sooner (243 -> 69 shared tokens on one of two prompts).
+    static constexpr bool kHmma       = true;
+    static constexpr int kHmmaMinCols = 6;
     static constexpr int kHmmaGroups = 2;
     struct HmmaStep {
         uint4 codes[4]; // slice s: k 32s .. 32s + 31
