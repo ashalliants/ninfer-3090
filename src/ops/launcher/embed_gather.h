@@ -35,6 +35,9 @@ void embed_gather_ggml_iq4_xs_launch(const Tensor& ids, const Weight& table, Ten
 // GGML IQ3_S rows (ggml_blocks_v1): ggml's dequantize_row_iq3_s of each row, rounded to BF16.
 void embed_gather_ggml_iq3_s_launch(const Tensor& ids, const Weight& table, Tensor& out,
                                     cudaStream_t stream);
+// GGML Q5_K rows (ggml_blocks_v1): ggml's dequantize_row_q5_K of each row, rounded to BF16.
+void embed_gather_ggml_q5_k_launch(const Tensor& ids, const Weight& table, Tensor& out,
+                                   cudaStream_t stream);
 // GGML Q6_K rows (ggml_blocks_v1): ggml's dequantize_row_q6_K of each row, rounded to BF16.
 void embed_gather_ggml_q6_k_launch(const Tensor& ids, const Weight& table, Tensor& out,
                                    cudaStream_t stream);

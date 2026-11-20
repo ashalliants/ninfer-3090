@@ -1015,6 +1015,54 @@ int test_ggml_iq3_s() {
     return failures;
 }
 
+// GGML Q5_K ggml_blocks_v1 table (DeepSeek-V4.1-Flash's token embedding, D = 5120): every output is
+// exactly the BF16 rounding of the host decoder's value (dequantize_row_q5_K). Random bytes cover
+// the packed scales and mins, both nibbles and the fifth bits; the FP16 d and dmin are finite.
+int test_ggml_q5_k() {
+    constexpr std::int32_t kVocab = 600, kD = 5120, kBlock = 176;
+    std::vector<std::uint8_t> table_bytes(static_cast<std::size_t>(kVocab) * (kD / 256) * kBlock);
+    std::uint32_t state = 0x2468ACFU;
+    const auto next = [&] {
+        state = state * 1664525U + 1013904223U;
+        return state >> 8;
+    };
+    for (auto& b : table_bytes) { b = static_cast<std::uint8_t>(next() & 0xFF); }
+    for (std::size_t block = 0; block < table_bytes.size() / kBlock; ++block) {
+        for (const std::size_t at : {std::size_t{0}, std::size_t{2}}) {
+            const std::uint16_t bits = static_cast<std::uint16_t>((next() & 0x83FF) | ((next() % 31) << 10));
+            table_bytes[block * kBlock + at]     = static_cast<std::uint8_t>(bits & 0xFF);
+            table_bytes[block * kBlock + at + 1] = static_cast<std::uint8_t>(bits >> 8);
+        }
+    }
+    const std::vector<std::int32_t> ids = {0, kVocab - 1, 17, 17, 523, 2, 399, 400, 401};
+    const std::size_t row_bytes         = static_cast<std::size_t>(kD / 256) * kBlock;
+    std::vector<std::uint16_t> expected(static_cast<std::size_t>(kD) * ids.size());
+    for (std::size_t t = 0; t < ids.size(); ++t) {
+        const auto row = std::as_bytes(std::span<const std::uint8_t>(table_bytes))
+                             .subspan(static_cast<std::size_t>(ids[t]) * row_bytes, row_bytes);
+        const std::vector<float> values = ninfer::test::ggml::decode_blocks(QType::GGML_Q5_K, row);
+        for (std::int32_t v = 0; v < kD; ++v) { expected[t * kD + v] = f32_to_bf16(values[v]); }
+    }
+    GuardedDeviceBuffer device_table(table_bytes.size());
+    device_table.copy_from_host(table_bytes.data(), table_bytes.size());
+    GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
+    device_ids.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer output(expected.size() * sizeof(std::uint16_t));
+    output.fill(0xff);
+    Weight weight        = iq4_xs_weight(device_table.data(), kVocab, kD);
+    weight.qtype         = QType::GGML_Q5_K;
+    weight.payload_bytes = table_bytes.size();
+    Tensor input(device_ids.data(), DType::I32, {static_cast<std::int32_t>(ids.size())});
+    Tensor result(output.data(), DType::BF16, {kD, static_cast<std::int32_t>(ids.size())});
+    ops::embedding(input, weight, result, nullptr);
+    cuda_synchronize();
+    int failures = verify_exact("embedding GGML Q5_K [600,5120]",
+                                guarded_to_host<std::uint16_t>(output, expected.size()), expected);
+    failures += output.verify_guards("embedding GGML Q5_K output");
+    failures += device_table.verify_guards("embedding GGML Q5_K table");
+    return failures;
+}
+
 // GGML Q6_K ggml_blocks_v1 table (Unsloth's UD-IQ3_XXS token embedding, D = 2560): every output is
 // exactly the BF16 rounding of the host decoder's value (dequantize_row_q6_K). Random bytes cover
 // the nibbles, high bits and int8 scales of every sub-block; the FP16 scale is finite.
@@ -1247,6 +1295,7 @@ int main() {
         failures += test_fp8();
         failures += test_ggml_iq4_xs();
         failures += test_ggml_iq3_s();
+        failures += test_ggml_q5_k();
         failures += test_ggml_q6_k();
         failures += test_embedding_split_q6_k();
         failures += test_embedding_split_matches_embedding();
