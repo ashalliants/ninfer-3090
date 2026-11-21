@@ -27,10 +27,12 @@ namespace ninfer::ops {
  * Supported domain: E at most 256, 1 <= top_k <= min(E, 16).
  * Numeric: FP32 logits; oracle FP64 (inkling2_reference.h route). A near tie at the k-th place may select
  *   differently from the oracle; the test accepts that only within the FP32 bound of the two scores.
- * Workspace: none. Execution: graph capturable.
+ * Workspace: moe_route_sigmoid_topk_workspace_bytes(E, T) from `workspace`, released on return.
+ * Execution: graph capturable.
  */
-void moe_route_sigmoid_topk(const Tensor& z, const Tensor& router, const Tensor& bias, int top_k, float scale, Tensor& ids,
-                            Tensor& weights, cudaStream_t stream);
+[[nodiscard]] std::size_t moe_route_sigmoid_topk_workspace_bytes(std::int32_t experts, std::int64_t columns);
+void moe_route_sigmoid_topk(const Tensor& z, const Tensor& router, const Tensor& bias, int top_k, float scale, DeviceArena& workspace,
+                            Tensor& ids, Tensor& weights, cudaStream_t stream);
 
 /// A layer's routed experts, resident in device memory. Either a ggml_expert_record_v1 bank
 /// (`records`, `format` GGML_REC_NVFP4_NVFP4: gate [I, H], up [I, H] and down [H, I] per record,
@@ -60,7 +62,8 @@ struct SituExpertBank {
  *
  * Logical shapes: z FP32 [H, T] (any column stride); ids I32 [k, T], weights FP32 [k, T] contiguous; out FP32
  *   [H, T] contiguous.
- * Supported domain: format GGML_REC_NVFP4_NVFP4 (H and I multiples of 64) or BF16; H and I at most 8192.
+ * Supported domain: format GGML_REC_NVFP4_NVFP4 (H and I multiples of 64) or BF16 (H and I multiples of 8, banks
+ *   16-byte aligned); H and I at most 8192.
  * Numeric: FP32 activations and accumulation (no activation quantization); oracle FP64 over the decoded
  *   weights (inkling2_reference.h decode_nvfp4, situ).
  * Effects: writes out; it must not overlap z.

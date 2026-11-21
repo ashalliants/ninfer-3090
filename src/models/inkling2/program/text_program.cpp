@@ -35,7 +35,8 @@ std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk) {
     const std::size_t per_visit_kept = 6 * h * 4; // ffn_inp, the output and a core visit's four loop messages
     const std::size_t per_visit_temp = 12 * h * 4 + 3 * h * 2 + (2 * q + std::size_t(c.heads) * (c.d_rel + 1)) * 4 +
                                        4 * (kv + 64) * 4 + 2 * q * 4 + q * 2 + 4 * h * 2 + 4 * h * 4 + 64 * 4 * 2 +
-                                       std::size_t(c.experts_per_token) * (c.moe_intermediate + h) * 4 + 4 * c.experts_per_token * 4;
+                                       std::size_t(c.experts_per_token) * (c.moe_intermediate + h) * 4 + 4 * c.experts_per_token * 4 +
+                                       ops::moe_route_sigmoid_topk_workspace_bytes(i32(c.experts), 1);
     const std::size_t output = std::size_t(c.vocab_size) * 4 + 4 * h * 4;
     const std::size_t per_token = c.num_layer_visits * per_visit_kept + per_visit_temp + output;
     // Each allocation pads to 256 bytes; a visit makes about 60.
@@ -257,7 +258,7 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     const std::int32_t top_k = i32(c.experts_per_token);
     Tensor ids = workspace_.alloc(DType::I32, {top_k, cols}), weights = workspace_.alloc(DType::FP32, {top_k, cols});
     ops::moe_route_sigmoid_topk(z, model_.tensor(w.router, {h, i32(c.experts)}), model_.tensor(w.router_bias, {i32(c.experts)}), top_k,
-                                c.route_scale, ids, weights, stream_);
+                                c.route_scale, workspace_, ids, weights, stream_);
     Tensor y = workspace_.alloc(DType::FP32, {h, cols});
     ops::moe_situ_experts(model_.expert_bank(p), z, ids, weights, c.gate_softcap, c.up_softcap, workspace_, y, stream_);
     Tensor mo = workspace_.alloc(DType::FP32, {h, cols});
@@ -337,7 +338,8 @@ Tensor TextProgram::forward(std::span<const std::int32_t> tokens, const Trace* t
     Tensor x = workspace_.alloc(DType::FP32, {h, cols});
     {
         Tensor* outs[] = {&x};
-        ops::depth_attention_mix(sources, model_.tensor(model_.weights().output_res_query, {h, 1}), c.rms_norm_eps, outs, stream_);
+        const Tensor output_query = model_.tensor(model_.weights().output_res_query, {h, 1});
+        ops::depth_attention_mix(sources, output_query, c.rms_norm_eps, outs, stream_);
     }
     const Tensor out_norm = model_.tensor(model_.weights().output_norm, {h});
     ops::rmsnorm_fp32(x, &out_norm, c.rms_norm_eps, x, stream_);

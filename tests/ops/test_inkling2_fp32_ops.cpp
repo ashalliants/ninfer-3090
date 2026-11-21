@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -290,7 +291,8 @@ void test_route() {
     auto z = randoms(h * cols), router = randoms(e * h, -0.05F, 0.05F), bias = randoms(e, -0.01F, 0.01F);
     Buf dz(z), dr(router), db(bias), ids(static_cast<std::size_t>(k * cols)), w(static_cast<std::size_t>(k * cols));
     Tensor tid = ids.tensor({k, cols}, DType::I32), tw = w.tensor({k, cols});
-    ninfer::ops::moe_route_sigmoid_topk(dz.tensor({h, cols}), dr.tensor({h, e}), db.tensor({e}), k, 8.0F, tid, tw, nullptr);
+    ninfer::DeviceArena arena(ninfer::ops::moe_route_sigmoid_topk_workspace_bytes(e, cols) + 4096);
+    ninfer::ops::moe_route_sigmoid_topk(dz.tensor({h, cols}), dr.tensor({h, e}), db.tensor({e}), k, 8.0F, arena, tid, tw, nullptr);
     const auto got_ids = t::from_device<std::int32_t>(ids.b, k * cols);
     Vec want_w;
     bool same = true;
@@ -302,6 +304,27 @@ void test_route() {
     check(same, "moe_route_sigmoid_topk: selected experts differ from the oracle (random scores have no tie within 1e-6)");
     std::printf("%-44s experts %s\n", "moe_route_sigmoid_topk", same ? "equal" : "DIFFER");
     compare("moe_route_sigmoid_topk weights", w.get(k * cols), want_w, 2e-6);
+
+    // Exact ties (a zero router: every score 1/2) among 40 experts, bias steering two of them: the steered two
+    // first, then the lowest ids.
+    const int few = 40, picks = 5;
+    std::vector<float> zero(static_cast<std::size_t>(few) * h, 0.0F), steer(few, 0.0F);
+    steer[33] = 0.5F;
+    steer[7]  = 0.25F;
+    Buf dzero(zero), dsteer(steer), tie_ids(static_cast<std::size_t>(picks * cols)), tie_w(static_cast<std::size_t>(picks * cols));
+    Tensor tti = tie_ids.tensor({picks, cols}, DType::I32), ttw = tie_w.tensor({picks, cols});
+    ninfer::DeviceArena tie_arena(ninfer::ops::moe_route_sigmoid_topk_workspace_bytes(few, cols) + 4096);
+    ninfer::ops::moe_route_sigmoid_topk(dz.tensor({h, cols}), dzero.tensor({h, few}), dsteer.tensor({few}), picks, 8.0F,
+                                        tie_arena, tti, ttw, nullptr);
+    const auto tied = t::from_device<std::int32_t>(tie_ids.b, picks * cols);
+    bool order = true;
+    for (int c = 0; c < cols; ++c) {
+        const std::int32_t want[] = {33, 7, 0, 1, 2};
+        for (int i = 0; i < picks; ++i) { order &= tied[c * picks + i] == want[i]; }
+    }
+    check(order, "moe_route_sigmoid_topk: ties go to the lower id, after the bias-steered experts");
+    const auto tw_got = tie_w.get(picks * cols);
+    check(std::all_of(tw_got.begin(), tw_got.end(), [](float x) { return std::fabs(x - 1.6F) < 1e-6F; }), "tied weights are 8 / 5");
 }
 
 std::uint64_t align256(std::uint64_t v) { return (v + 255) / 256 * 256; }
@@ -404,6 +427,69 @@ void test_experts(bool nvfp4, int h, int inter, int experts, const std::string& 
     compare(label, got_scaled, scaled, 1e-5);
 }
 
+// NINFER_INKLING2_OP_BENCH=1: decode-shaped timing (T = 1, top 8 of 32 resident experts at the model's shape, each
+// call a different 8 so nothing stays in L2), printed as microseconds and effective weight bandwidth. Not a criterion.
+void bench_experts(bool nvfp4) {
+    const int h = 2304, inter = 1152, experts = 32, k = 8, iters = 40;
+    ninfer::ops::SituExpertBank bank;
+    bank.experts = experts;
+    bank.hidden = h;
+    bank.intermediate = inter;
+    ninfer::DeviceBuffer records, bgu, bd, scales;
+    std::uint64_t per_expert = 0;
+    if (nvfp4) {
+        const std::uint64_t gate_row = h / 64 * 36, down_row = inter / 64 * 36, gate_bytes = gate_row * inter;
+        const std::uint64_t up_off = align256(gate_bytes), down_off = align256(up_off + gate_bytes),
+                            stride = align256(down_off + down_row * h);
+        std::vector<std::uint8_t> host(stride * experts, 0);
+        for (int e = 0; e < experts; ++e) {
+            const auto blocks = nvfp4_blocks(stride / 36);
+            std::copy(blocks.begin(), blocks.end(), host.begin() + e * stride);
+        }
+        records = t::to_device(host);
+        scales  = t::to_device(std::vector<float>(2 * experts, 1.0F));
+        bank.format        = ninfer::QType::GGML_REC_NVFP4_NVFP4;
+        bank.records       = static_cast<const std::uint8_t*>(records.p);
+        bank.record_stride = stride;
+        bank.gate_up_scale = static_cast<const float*>(scales.p);
+        bank.down_scale    = static_cast<const float*>(scales.p) + experts;
+        per_expert         = 2 * gate_bytes + down_row * h;
+    } else {
+        bgu = t::to_device_bf16(randoms(static_cast<std::size_t>(experts) * 2 * inter * h, -0.05F, 0.05F));
+        bd  = t::to_device_bf16(randoms(static_cast<std::size_t>(experts) * h * inter, -0.05F, 0.05F));
+        bank.format  = ninfer::QType::BF16;
+        bank.gate_up = bgu.p;
+        bank.down    = bd.p;
+        per_expert   = 3ULL * inter * h * 2;
+    }
+    std::vector<int> ids(static_cast<std::size_t>(k) * iters);
+    for (int i = 0; i < iters; ++i)
+        for (int j = 0; j < k; ++j) { ids[i * k + j] = (i * k + j) % experts; }
+    Buf dz(randoms(h)), dw(std::vector<float>(k, 1.0F)), dout(static_cast<std::size_t>(h));
+    ninfer::DeviceBuffer did = t::to_device_i32(ids);
+    ninfer::DeviceArena arena(ninfer::ops::moe_situ_experts_workspace_bytes(bank, k) + 4096);
+    Tensor tout = dout.tensor({h, 1});
+    const auto run = [&](int i) {
+        ninfer::ops::moe_situ_experts(bank, dz.tensor({h, 1}), Tensor(static_cast<std::int32_t*>(did.p) + i * k, DType::I32, {k, 1}),
+                                      dw.tensor({k, 1}), 4.0F, 25.0F, arena, tout, nullptr);
+    };
+    run(0);
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+    for (int i = 0; i < iters; ++i) { run(i); }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, start, stop);
+    const double us = 1e3 * ms / iters;
+    std::printf("bench moe_situ_experts %s T=1 top 8: %.1f us, %.0f GB/s of expert weights\n", nvfp4 ? "NVFP4" : "BF16 ", us,
+                k * per_expert / (us * 1e3));
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+}
+
 } // namespace
 
 int main() {
@@ -425,6 +511,10 @@ int main() {
         test_experts(true, 128, 64, 3, "moe_situ_experts NVFP4 small");
         test_experts(true, 2304, 1152, 3, "moe_situ_experts NVFP4 [3, 2304, 1152]");
         test_experts(false, 2304, 1152, 3, "moe_situ_experts BF16 [3, 2304, 1152]");
+        if (const char* bench = std::getenv("NINFER_INKLING2_OP_BENCH"); bench != nullptr && *bench == '1') {
+            bench_experts(true);
+            bench_experts(false);
+        }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
