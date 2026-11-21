@@ -46,9 +46,8 @@ std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk) {
 
 // The limits, validated before anything is sized from them.
 ProgramLimits checked(ProgramLimits limits) {
-    // A chunk is one call of every Op; MIX and the route take at most 65535 columns (their grids' y).
-    if (limits.max_chunk < 1 || limits.max_chunk > 65535 || limits.max_context < limits.max_chunk) {
-        throw std::invalid_argument("inkling2: invalid program limits (max_chunk 1..65535, at most max_context)");
+    if (limits.max_chunk < 1 || limits.max_context < limits.max_chunk) {
+        throw std::invalid_argument("inkling2: invalid program limits (max_chunk positive, at most max_context)");
     }
     return limits;
 }
@@ -337,16 +336,25 @@ Tensor TextProgram::forward_graph(std::int32_t token) {
             throw std::runtime_error("inkling2: cannot capture the decode graph");
         }
         start_offset_ = static_cast<const std::int64_t*>(step_.p);
-        cudaGraph_t graph = nullptr;
+        // Ends the capture and returns its graph; a graph handle is destroyed whatever the capture's result.
+        const auto end_capture = [&]() -> cudaGraph_t {
+            start_offset_ = nullptr;
+            cudaGraph_t graph = nullptr;
+            const cudaError_t ended = cudaStreamEndCapture(stream_, &graph);
+            if (ended != cudaSuccess) {
+                if (graph != nullptr) { cudaGraphDestroy(graph); }
+                return nullptr;
+            }
+            return graph;
+        };
         try {
             graph_logits_ = run(ids, 0, nullptr);
         } catch (...) {
-            start_offset_ = nullptr;
-            if (cudaStreamEndCapture(stream_, &graph) == cudaSuccess && graph != nullptr) { cudaGraphDestroy(graph); }
+            if (cudaGraph_t graph = end_capture()) { cudaGraphDestroy(graph); }
             throw;
         }
-        start_offset_ = nullptr;
-        if (cudaStreamEndCapture(stream_, &graph) != cudaSuccess) { throw std::runtime_error("inkling2: decode graph capture failed"); }
+        cudaGraph_t graph = end_capture();
+        if (graph == nullptr) { throw std::runtime_error("inkling2: decode graph capture failed"); }
         const cudaError_t made = cudaGraphInstantiate(&decode_graph_, graph, 0);
         cudaGraphDestroy(graph);
         if (made != cudaSuccess) {
