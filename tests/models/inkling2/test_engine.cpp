@@ -178,6 +178,27 @@ int main() {
             check(open.generated_token_ids.size() <= 4 && !open.thinking.applied && !open.thinking.effective_budget,
                   "no close past the limit");
         }
+        {
+            // At the context's end: a prompt of max_context - 1 tokens yields max_context - prompt + 1 = 2 tokens.
+            const auto filler = engine.tokenize_text(" the");
+            std::vector<ninfer::TokenId> full(static_cast<std::size_t>(options.max_context - 1), filler.at(0));
+            const auto edge = engine.generate(engine.prepare_tokens(full), greedy(10));
+            check(edge.generated_token_ids.size() == 2 && edge.finish_reason == ninfer::FinishReason::ContextCapacity,
+                  "the last context position still yields a token: " + std::to_string(edge.generated_token_ids.size()));
+        }
+        {
+            // A wrong sink is refused, and the request it was for is cancelled, not run to its limit.
+            auto handle  = engine.submit(engine.prepare(question()), greedy(2000), ninfer::OutputConsumerMode::Aggregate, {});
+            const auto t = Clock::now();
+            Collect wrong;
+            try {
+                (void)handle.wait(&wrong);
+                check(false, "a sink for an aggregate request is refused");
+            } catch (const std::invalid_argument&) {}
+            const auto next = engine.generate(engine.prepare(question()), greedy(4));
+            check(next.generated_token_ids.size() == 4 && std::chrono::duration<double>(Clock::now() - t).count() < 10.0,
+                  "a refused sink's request is cancelled");
+        }
         // A dropped handle is abandoned; the next request runs.
         {
             const auto t = Clock::now();

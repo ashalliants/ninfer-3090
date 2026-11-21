@@ -134,10 +134,11 @@ struct Inkling2Core::Job {
 
 GenerationResult Inkling2Core::Submission::wait(OutputSink* sink, const CancellationView& cancellation) {
     if (!job_) { throw std::logic_error("inkling2 submission already waited"); }
-    const std::shared_ptr<Job> job = std::move(job_);
-    if ((job->mode == OutputConsumerMode::Streaming) != (sink != nullptr)) {
+    if ((job_->mode == OutputConsumerMode::Streaming) != (sink != nullptr)) {
+        // The handle keeps the job, so dropping it still cancels the request.
         throw std::invalid_argument("GenerationHandle wait sink does not match its submitted consumer mode");
     }
+    const std::shared_ptr<Job> job = std::move(job_);
     for (;;) {
         if (cancellation.requested()) { job->cancelled = true; }
         std::deque<Job::Event> events;
@@ -472,7 +473,8 @@ void Inkling2Core::run(Job& job) {
         const bool no_room = out.generated_token_ids.size() + kCloseTokens + 1 >= exec.requested_output_tokens;
         if (exec.thinking.effective_budget && decoder.in_reasoning() && forced.empty() && !out.thinking.applied &&
             (thinking_tokens >= *exec.thinking.effective_budget || no_room) &&
-            program.position() + 2 + kCloseTokens < static_cast<std::int64_t>(options_.max_context)) {
+            // Forwarding this token and the close must fit; the answer token after them is only sampled.
+            program.position() + 1 + kCloseTokens <= static_cast<std::int64_t>(options_.max_context)) {
             forced                    = {ink::token::kEndMessage, ink::token::kMessageModel, ink::token::kContentText};
             out.thinking.applied      = true;
             out.thinking.injected_tokens += kCloseTokens;
@@ -485,7 +487,8 @@ void Inkling2Core::run(Job& job) {
                 .generation_elapsed_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - first_token).count())});
         }
         if (out.generated_token_ids.size() >= exec.requested_output_tokens) { break; }
-        if (program.position() + 1 >= static_cast<std::int64_t>(options_.max_context)) {
+        // Forwarding `next` needs one more position; a full context still yields the token sampled from it.
+        if (program.position() + 1 > static_cast<std::int64_t>(options_.max_context)) {
             out.finish_reason = FinishReason::ContextCapacity;
             break;
         }
