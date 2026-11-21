@@ -266,7 +266,7 @@ The DSpark drafter runs greedy speculative decoding (see "DSpark drafter").
 | Element-wise and norms | `ops/fp32_rows.h` | FP32 RMSNorm (weighted or unit), add, sigmoid gate, tanh softcap, BF16 embedding gather |
 | MIX, CTRL | `ops/depth_attention.h` | depth attention over at most 8 sources and 4 queries; the controller's combine `(1 - tanh f) c + tanh(g) m` (D, G, F are `projection_fp32`) |
 | Short convolutions | `ops/short_conv.h` | static and per-head dynamic taps, FP32 history per visit and stream |
-| Attention | `ops/relative_bias_attention.h` | per-head L2 clips and log scale, V unit norm, relative-bias sink attention over an FP32 KV ring per visit (local capacity window - 1 + max_chunk, global max_context) |
+| Attention | `ops/relative_bias_attention.h` | per-head L2 clips and log scale, V unit norm, relative-bias sink attention over an FP32 KV ring per visit (local capacity window - 1 + max_chunk, global max_context); calls of at most 8 columns split their keys across blocks ([Split decode attention](#split-decode-attention)) |
 | MoE | `ops/moe_situ.h` | sigmoid top-8 route with bias steering; SITU experts from `ggml_rec_nvfp4_nvfp4` records (layers 0-19) or the BF16 banks (20-23), with the per-expert multipliers |
 | Vision | `program/vision_program.{h,cpp}`, `ops/vit_fp32.h` | `prepare_image` (pad, normalize, resize above 4096 tokens) and `VisionEncoder::encode`; `TextProgram::forward(tokens, embeddings)` puts an image's rows in place of its placeholder tokens (see "Vision tower") |
 | Frontend | `frontend/frontend.{h,cpp}` | the chat template and tokenizer, images to prepared pixels, and the output decoder (see "Serving") |
@@ -574,6 +574,86 @@ Re-encoding any one attention group alone (q-side, k/v or output) already gives 
 visits compound it). With `all`, one golden prompt's argmax differs from llama.cpp's. The Q8 kernels reach
 550-850 GB/s against BF16's 610-870 GB/s, because a call costs about 5 us whatever its size, so `all` gains less
 than its byte count suggests (1.35 ms of the 1.65 GB saved per token).
+
+## Split decode attention
+
+On by default; `--no-split-attention` (`EngineOptions::split_attention`, `ProgramLimits::split_attention`) turns it
+off. A forward of at most `ops::kSplitMaxColumns` (8) tokens (decode, DSpark verification) gives each attention
+column's visible keys to blocks of 256, one CUDA block each, with the sink in the first. The last of a column's blocks
+to finish (an atomic counter per column and head) merges the blocks' maxima, denominators and sums in order, each
+weighted by e^{m_z - max m}. It applies only once a column can see more than `ops::kSplitMinKeys` (512) keys: below
+that the extra blocks cost more than they save. Decode replays one CUDA graph for positions up to 512 (the single
+block) and another past them (split; its grid is sized for the whole ring, and the blocks past a column's keys return
+at once). The single-block kernel walks
+every key of a column in one block of 128 threads, so a decode step ran 24 blocks per visit on 80 SMs and was
+latency-bound. At 16K context, 70% of the step was attention.
+
+It is FP32 all the way, with no quantisation. Only the order of the softmax sums changes, so a column that sees more
+than 256 keys gets other bits than the single-block kernel. A column of at most 256 keys gets the same bits: the
+golden test is byte-identical (781 dumped tensors, 0 differ). Prefill chunks (more than 8 columns) keep the single
+block. `--no-split-attention` reproduces the earlier builds exactly.
+
+Measured on the V100 (2026-11-21), `ninfer_inkling2_golden_test` with `NINFER_INKLING2_DECODE_BENCH`
+(`NINFER_INKLING2_SINGLE_BLOCK=1` for the single block). The text is
+30,840 tokens of docs and C++, prefilled to the context in chunks of 256, then 64 single-token graph steps (one
+warm-up step first). Each context is A B B A in one hold.
+
+| Context | Decode, single block (tok/s) | Decode, split (tok/s) | Speedup |
+|---|---|---|---|
+| 1,024 | 47.1 | 67.7 | 1.44x |
+| 16,384 | 25.1 | 61.0 | 2.43x |
+| 30,775 | 17.4 | 56.0 | 3.22x |
+
+KLD(single block || split) is teacher-forced over the same text (`NINFER_INKLING2_ATTENTION_KLD`), through
+8-column calls in three ranges. These are
+the numbers of an FP32 reordering on this model. Near-tied MoE routing turns last-bit differences into flipped
+experts, and the loop compounds them. For comparison, the FP32 program against the FP64 golden oracle reaches a KLD
+max of 1.1e-2.
+
+| Positions | KLD mean | KLD median | KLD p99 | KLD max | Argmax agrees |
+|---|---|---|---|---|---|
+| [0, 1024) | 1.66e-3 | 1.57e-4 | 2.31e-2 | 5.91e-2 | 97.95% |
+| [1024, 4096), first 1,024 | 3.58e-3 | 1.27e-3 | 3.23e-2 | 2.04e-1 | 97.75% |
+| [16384, 30840), first 1,024 | 2.45e-3 | 4.69e-4 | 2.33e-2 | 1.37e-1 | 98.63% |
+
+The split parts take `relative_bias_attention_split_bytes`: 8 columns × 24 heads × (d + 2) floats per 256 keys of
+the longest ring. That is about 25 MB of workspace at 65,536 context.
+
+## FP16 KV rings
+
+**Lossy, on by default.** The target's and the drafter's KV rings hold FP16 (`EngineOptions::kv_rings`,
+`ProgramLimits::kv_fp16`); `--kv-dtype fp32` keeps the exact FP32 program, for reproduction. With FP16 rings the
+head norms' append rounds each normalized K and V value to nearest FP16, and the attention widens the values back to
+FP32 as it reads them. Scores, softmax and sums stay FP32. A position costs 32 KiB across the 8 global visits
+instead of 64 KiB, so about twice the context fits. Inkling-2 refuses every other `--kv-dtype` form.
+
+The values suit FP16: the head norms bound them (K is clipped per head, V has unit norm). Over the 30,840-token
+prompt below (1.5e9 values each of K and V), max |K| is 21.7 and max |V| 11.3, none overflows, and 60,305 K and
+102,465 V values (under 0.01%) fall in FP16's subnormal range, 31 and 54 of them to zero. The mean relative
+rounding is 1.76e-4, against BF16's 1.41e-3 (also printed by `NINFER_INKLING2_KV_FP16_KLD`).
+
+It is not a speed option. Decode attention is latency-bound, not bandwidth-bound, so halving the bytes changes
+little.
+
+Measured on the V100 (2026-11-21), `ninfer_inkling2_golden_test`, split attention on, A B B A in one hold per
+context. The numbers are the mean of the two runs of each form.
+
+| Context | Prefill FP32 / FP16 (tok/s) | Decode FP32 / FP16 (tok/s) |
+|---|---|---|
+| 1,024 | 370.6 / 377.7 | 67.80 / 68.11 |
+| 16,384 | 288.3 / 309.6 | 61.07 / 62.68 |
+
+KLD(FP32 rings || FP16 rings) is teacher-forced over 30,840 tokens of docs and C++ in chunks of 256
+(`NINFER_INKLING2_KV_FP16_KLD`). It is the same size as an FP32 reordering of the attention sums on this model
+([Split decode attention](#split-decode-attention)): near-tied MoE routing turns any small change into flipped
+experts.
+
+| Positions | KLD mean | KLD median | KLD p99 | KLD max | Argmax agrees |
+|---|---|---|---|---|---|
+| [0, 1024) | 2.70e-3 | 8.52e-4 | 2.38e-2 | 6.44e-2 | 97.36% |
+| [1024, 4096) | 3.65e-3 | 1.41e-3 | 3.24e-2 | 3.98e-1 | 97.07% |
+| [4096, 16384) | 3.47e-3 | 1.27e-3 | 3.14e-2 | 4.50e-1 | 97.78% |
+| [16384, 30840) | 3.49e-3 | 1.33e-3 | 3.14e-2 | 1.91e-1 | 97.36% |
 
 ## GGUF mapping (Unsloth `unsloth/Inkling-2-Mini-GGUF`)
 

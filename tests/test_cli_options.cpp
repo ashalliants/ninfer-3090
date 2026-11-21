@@ -162,6 +162,25 @@ int main() {
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--dense-q8", "all"}).dense_q8 == ninfer::DenseQ8::All &&
                           parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--dense-q8", "head"}).dense_q8 == ninfer::DenseQ8::Head,
                       "CLI --dense-q8 was not parsed");
+    failures += check(!parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--no-split-attention"}).split_attention &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"}).split_attention,
+                      "CLI --no-split-attention was not parsed");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "fp16"}).kv_rings == ninfer::KvRings::FP16 &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "fp32"}).kv_rings == ninfer::KvRings::FP32 &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"}).kv_rings == ninfer::KvRings::Default,
+                      "CLI --kv-dtype fp16|fp32 was not parsed");
+    {
+        // The last --kv-dtype wins, and an explicit bf16 is marked as such (Inkling-2 refuses it).
+        const auto bf16    = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "bf16"});
+        const auto to_int8 = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "fp32", "--kv-dtype", "int8"});
+        const auto to_fp16 = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "int8", "--kv-dtype", "fp16"});
+        failures += check(bf16.kv_cache_explicit && bf16.kv_rings == ninfer::KvRings::Default &&
+                              !parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"}).kv_cache_explicit &&
+                              to_int8.kv_rings == ninfer::KvRings::Default && to_int8.kv_cache == ninfer::KvCacheStorage::Int8Group64 &&
+                              to_int8.kv_cache_explicit && to_fp16.kv_rings == ninfer::KvRings::FP16 &&
+                              to_fp16.kv_cache == ninfer::KvCacheStorage::BFloat16 && !to_fp16.kv_cache_explicit,
+                          "CLI --kv-dtype: the last form does not win, or an explicit bf16 is not marked");
+    }
     failures += check(rejects([&] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--dense-q8", "q4"}); }),
                       "CLI accepted an unknown --dense-q8 form");
     // --spec dspark: an omitted --draft-tokens takes 3; an explicit one is kept and must be in [1,7].

@@ -18,6 +18,7 @@
 #include <functional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ninfer::models::inkling2 {
@@ -36,6 +37,19 @@ struct ProgramLimits {
     // Opt-in, lossy: the 8-bit re-encodings (DenseWeightsQ8) the dense projections that have one run over, at every width;
     // null: the artifact's BF16 weights. Not owned: it must outlive the Program.
     const DenseWeightsQ8* dense = nullptr;
+    // A forward of at most ops::kSplitMaxColumns tokens (decode, verification) splits each attention column's keys
+    // into blocks of 256 (ops::relative_bias_sink_attention's split workspace) once a column can see more than
+    // ops::kSplitMinKeys of them. FP32, but the softmax sums run in
+    // another order, so past 256 visible keys the logits differ from the single-block kernel's in the last bits.
+    // false: the single block per column and head (bit-exact with earlier builds).
+    bool split_attention = true;
+    // Opt-in, lossy: the KV rings hold FP16 (round to nearest) rather than FP32, half the bytes per position, so
+    // about twice the context fits. The attention widens them to FP32 as it reads them.
+    bool kv_fp16 = false;
+    // A forward of more than max(1, max_rollback) tokens (a prefill chunk) returns its last column's logits only,
+    // FP32 [vocab_size, 1], the same bits as that column of all of them; saves vocab_size * 4 bytes per chunk column
+    // of workspace. false: every column's.
+    bool last_logits = false;
 };
 
 // Columns [column, column + values.ne[1]) of a forward that take `values` as their input in place of their tokens'
@@ -58,6 +72,10 @@ public:
     ~TextProgram();
     TextProgram(const TextProgram&)            = delete;
     TextProgram& operator=(const TextProgram&) = delete;
+
+    // Layer visit v's K and V rings (diagnostics): [kv_heads * head_dim, capacity], FP32 or FP16 (ProgramLimits::kv_fp16),
+    // position p in column p % capacity.
+    [[nodiscard]] std::pair<Tensor, Tensor> kv_rings(std::uint32_t v) const { return {state_.at(v).k_cache, state_.at(v).v_cache}; }
 
     // Forgets the sequence: position 0, zero convolution histories (the KV rings need no clearing).
     void reset();
@@ -87,7 +105,8 @@ public:
     // sequence continues from position() = its start + n with every state as if only those tokens had been given.
     void keep(std::int32_t n);
 
-    // Appends tokens at position() and returns their logits: FP32 [vocab_size, T] on the device (rows past
+    // Appends tokens at position() and returns their logits: FP32 [vocab_size, T] on the device ([vocab_size, 1], the
+    // last column's, for a prefill chunk with ProgramLimits::last_logits) (rows past
     // unpadded_vocab_size are padding and never sampled), softcapped. Valid until the next call.
     Tensor forward(std::span<const std::int32_t> tokens, const Trace* trace = nullptr) { return forward(tokens, {}, trace); }
     // As above, with some columns' inputs given as embeddings (ascending, non-overlapping ranges within the chunk).
@@ -95,7 +114,7 @@ public:
 
 private:
     struct VisitState {
-        Tensor k_cache, v_cache;                       // FP32 [kv_heads * head_dim, capacity]
+        Tensor k_cache, v_cache;                       // FP32 (FP16 with limits.kv_fp16) [kv_heads * head_dim, capacity]
         Tensor k_hist, v_hist, attn_hist, mlp_hist;    // FP32 [C, K - 1]
         // With max_rollback: each history's state before the forward, then the forward's inputs: [C, K - 1 + T].
         Tensor k_saved, v_saved, attn_saved, mlp_saved;
@@ -120,6 +139,7 @@ private:
     ProgramLimits limits_;
     cudaStream_t stream_;
     DeviceBuffer state_memory_;
+    DeviceBuffer split_counters_; // the split attention's counters (ops::relative_bias_sink_attention), zero between calls
     DeviceArena workspace_;
     std::vector<VisitState> state_;
     std::int64_t position_ = 0;
@@ -132,9 +152,11 @@ private:
     // The decode graph: step_ holds {int64 position, int32 token} it reads; start_offset_ points at that position
     // while the graph is captured (the Ops add it to their host start of 0), and is null otherwise.
     DeviceBuffer step_;
-    // The decode graphs, without and with the tap copies (each captured on its first use), and their logits.
-    cudaGraphExec_t decode_graph_[2] = {nullptr, nullptr};
-    Tensor graph_logits_[2];
+    // The decode graphs (each captured on its first use) and their logits: index 2 * taps + split, taps the tap copies,
+    // split the split attention (positions past ops::kSplitMinKeys; the single block before).
+    cudaGraphExec_t decode_graph_[4] = {nullptr, nullptr, nullptr, nullptr};
+    Tensor graph_logits_[4];
+    bool graph_split_ = true; // the graph in capture passes the split workspace (eager forwards always do)
     const std::int64_t* start_offset_ = nullptr;
 };
 

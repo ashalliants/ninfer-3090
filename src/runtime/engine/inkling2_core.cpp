@@ -273,6 +273,9 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         ink::ProgramLimits limits;
         limits.max_context = static_cast<std::int32_t>(options_.max_context);
         limits.max_chunk   = kChunk;
+        limits.last_logits = true; // prefill reads only the last column (decode below)
+        limits.split_attention = options_.split_attention;
+        limits.kv_fp16         = options_.kv_rings != KvRings::FP32; // FP16 by default
         const bool dspark  = options_.speculative.backend == SpeculativeBackend::DSpark;
         if (dspark) {
             const ink::DSparkConfig* dc = model_->dspark_config();
@@ -292,7 +295,8 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         if (dspark) {
             // With --dense-q8 the drafter proposes from the target's re-encoded head, the one it verifies against.
             programs_->drafter = std::make_unique<ink::DSparkProgram>(*model_, static_cast<std::int32_t>(options_.max_context), kChunk,
-                                                                      stream_, programs_->dense ? &programs_->dense->head() : nullptr);
+                                                                      stream_, programs_->dense ? &programs_->dense->head() : nullptr,
+                                                                      limits.kv_fp16);
             const std::int32_t hidden = static_cast<std::int32_t>(model_->config().hidden_size);
             for (std::size_t i = 0; i < limits.tap_visits.size(); ++i) {
                 programs_->held_memory.emplace_back(static_cast<std::size_t>(hidden) * kChunk * 4);
