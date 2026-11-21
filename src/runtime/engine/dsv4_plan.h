@@ -28,6 +28,11 @@ inline constexpr std::uint64_t kDsv4HostReserveBytes = 4ULL << 30;
 // Device memory left free beside the weights, the forward's state and workspace (CUDA context,
 // display, kernels' scratch).
 inline constexpr std::uint64_t kDsv4DeviceReserveBytes = 1ULL << 30;
+// The expert records' device tier takes the device memory left after the weights, less this reserve for the
+// forward's state and workspace, the KV and the CUDA context, up to the cap (about 1500 records of the
+// IQ2_XXS build at 12 GiB). Nothing is taken when less than the reserve is free.
+inline constexpr std::uint64_t kDsv4ExpertVramReserveBytes = 5ULL << 30;
+inline constexpr std::uint64_t kDsv4ExpertVramMaxBytes     = 16ULL << 30;
 // The largest prompt chunk one forward call takes; it sizes the call's workspace.
 inline constexpr std::uint32_t kDsv4MaxPrefillChunk = 2048;
 
