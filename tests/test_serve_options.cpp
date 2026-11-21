@@ -793,6 +793,13 @@ int main() {
         failures += check(kv_help.find(flag) != std::string::npos,
                           "serve help omits an accepted prefill control");
     }
+    // --spec dspark drafts 3 per round unless --draft-tokens says otherwise (1..7).
+    const ninfer::EngineOptions dspark = make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "dspark"}));
+    failures += check(dspark.speculative.backend == ninfer::SpeculativeBackend::DSpark && dspark.speculative.draft_tokens == 3,
+                      "--spec dspark does not default to 3 drafts");
+    const ninfer::EngineOptions dspark2 =
+        make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-tokens", "2"}));
+    failures += check(dspark2.speculative.draft_tokens == 2, "--spec dspark --draft-tokens 2 did not reach the Engine options");
     // N-gram copy drafting: 0 or 15 beside DFlash2 at one lane, carried into the Engine options.
     const ServeOptions ngram =
         parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
@@ -823,6 +830,8 @@ int main() {
         }
         return false;
     };
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-tokens", "8"}, "[1,7]"),
+                      "--spec dspark accepted 8 drafts");
     failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "dflash2",
                                      "--draft-tokens", "7", "--ngram-draft-tokens", "31"},
                                     "31, 63"),

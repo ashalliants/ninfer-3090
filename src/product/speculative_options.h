@@ -81,6 +81,16 @@ inline void validate_ngram_cli_options(const SpeculativeOptions& options) {
     }
 }
 
+// --spec dspark without --draft-tokens drafts 3 per round, the measured best on a V100 (1.28x plain greedy over
+// chat prompts; 2 and 4 drafts 1.24x and 1.26x).
+inline constexpr std::uint32_t kDSparkDefaultDraftTokens = 3;
+
+inline void apply_speculative_cli_defaults(SpeculativeOptions& options) {
+    if (options.backend == SpeculativeBackend::DSpark && options.draft_tokens == 0) {
+        options.draft_tokens = kDSparkDefaultDraftTokens;
+    }
+}
+
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
     validate_ngram_cli_options(options);
     validate_adaptive_cli_options(options);
@@ -108,7 +118,7 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         return;
     case SpeculativeBackend::DSpark:
         if (options.draft_tokens == 0 || options.draft_tokens > 7) {
-            throw std::invalid_argument("--spec dspark requires --draft-tokens in [1,7] (3 is the measured best on a V100)");
+            throw std::invalid_argument("--spec dspark takes --draft-tokens in [1,7] (default 3)");
         }
         if (options.ngram_draft_tokens != 0 || options.adaptive_draft_tokens != 0) {
             throw std::invalid_argument("--spec dspark takes no n-gram or adaptive draft windows");

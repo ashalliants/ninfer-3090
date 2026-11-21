@@ -239,7 +239,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--no-exit-on-engine-failure] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] "
-           "[--spec mtp|dflash|dflash2|dspark --draft-tokens N] "
+           "[--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N]] "
            "[--ngram-draft-tokens 0|15] [--ngram-min-match N] [--adaptive-draft-tokens 0|3] "
            "[--relaxed-drafting [P]] [--draft-context-rows N] "
            "[--default-max-tokens N] [--max-output-tokens N] [--default-thinking-budget N] "
@@ -1570,6 +1570,7 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
     }
     models::qwen3_5::validate_lossy_prefill_options(options.lossy_prefill);
     product::apply_speculative_defaults(options.speculative);
+    product::apply_speculative_cli_defaults(options.speculative);
     product::validate_speculative_cli_options(options.speculative);
     if (options.flash_next.moe_gate_up_registers && !options.flash_next.moe_precast_input) {
         throw std::invalid_argument("--moe-gate-up-registers reads the input that --moe-precast-input casts once "
