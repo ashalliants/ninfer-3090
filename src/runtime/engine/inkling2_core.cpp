@@ -681,6 +681,7 @@ void Inkling2Core::run(Job& job) {
     bool argmax_stale = true;
     std::int32_t col     = static_cast<std::int32_t>(logits.ne[1]) - 1; // the column the next token is read from
     bool in_round        = false;
+    std::int32_t round_drafts = 0; // the drafts the current round forwards (fewer than n_drafts near the output limit)
     std::int32_t held_n  = 0;
     double accept_ema = 1.0, round_seconds = 0.0, plain_seconds = 0.0;
     int since_probe = 0, probe_interval = 8;
@@ -704,7 +705,7 @@ void Inkling2Core::run(Job& job) {
     };
     const auto count_round = [&] {
         ++out.speculative.rounds;
-        out.speculative.drafted_tokens += static_cast<std::uint64_t>(n_drafts);
+        out.speculative.drafted_tokens += static_cast<std::uint64_t>(round_drafts);
         out.speculative.accepted_tokens += static_cast<std::uint64_t>(col);
         for (std::int32_t i = 0; i < col; ++i) { ++out.speculative.accepted_per_position[static_cast<std::size_t>(i)]; }
     };
@@ -731,7 +732,12 @@ void Inkling2Core::run(Job& job) {
         }
         // The first step runs plain and the next as a round, so both costs are measured before they are compared.
         const bool pays = plain_seconds != 0.0 && (round_seconds == 0.0 || (1.0 + accept_ema) * plain_seconds >= round_seconds);
-        bool round = speculate && forced.empty() && program.position() + 1 + n_drafts <= static_cast<std::int64_t>(options_.max_context);
+        // A round's n drafts yield n + 1 tokens, so it drafts no more than the output budget left after `next` can
+        // take: a round whose drafts could not be emitted would pay the draft and verify cost for nothing.
+        const auto budget_left = static_cast<std::int64_t>(exec.requested_output_tokens) - static_cast<std::int64_t>(out.generated_token_ids.size());
+        const auto drafts = static_cast<std::int32_t>(std::min<std::int64_t>(n_drafts, budget_left - 1));
+        bool round = speculate && forced.empty() && drafts >= 1 &&
+                     program.position() + 1 + drafts <= static_cast<std::int64_t>(options_.max_context);
         if (round && plain_seconds == 0.0) { round = false; }
         if (round && !pays) {
             round = ++since_probe >= probe_interval;
@@ -747,7 +753,8 @@ void Inkling2Core::run(Job& job) {
         }
         if (round) {
             flush_held();
-            drafted = drafter->draft(next, n_drafts);
+            round_drafts = drafts;
+            drafted      = drafter->draft(next, round_drafts);
             std::vector<std::int32_t> in{next};
             in.insert(in.end(), drafted.begin(), drafted.end());
             logits   = program.forward(in);
@@ -891,7 +898,15 @@ void Inkling2Core::run(Job& job) {
         }
         advance(next);
     }
-    if (in_round) { count_round(); } // the request ended inside a round: its drafts consumed so far count
+    if (in_round) {
+        // The request ended inside a round: its drafts consumed so far count. Every exit but cancellation comes after
+        // emitting a token and before advance(), so a last token equal to its column's draft is one more accepted.
+        if (out.finish_reason != FinishReason::Cancelled && !out.generated_token_ids.empty() && col + 1 < logits.ne[1] &&
+            drafted[static_cast<std::size_t>(col)] == out.generated_token_ids.back()) {
+            ++col;
+        }
+        count_round();
+    }
     emit(decoder.finish());
     if (decoder.matched_stop() && out.finish_reason != FinishReason::StopString) {
         // A stop string inside an unfinished call's text, which finish() publishes as content.

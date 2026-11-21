@@ -479,6 +479,8 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
     whose input is the token the previous column chose; the first that differs ends the round, and
     `keep()` cuts the target back. Every token still goes through the plain loop, so the output is
     plain greedy decoding's.
+  - A round drafts at most the output budget left after the anchor minus one (n drafts yield n + 1 tokens), so a
+    round near `max_tokens` drafts fewer and none runs when one token is left; `drafted_tokens` counts what was drafted.
   - A round runs only while its cost (EMA) is below (1 + accepted drafts EMA) plain steps; plain steps
     hold their taps on the device for one deferred drafter extend, and a probe round follows 8, 16, ..
     64 plain steps.

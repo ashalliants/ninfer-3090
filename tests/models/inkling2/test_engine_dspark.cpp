@@ -3,6 +3,7 @@
 // --spec dspark through the public Engine (runtime/engine/inkling2_core.h) on real chat prompts:
 // - greedy output equals a plain Engine's, token for token, for every prompt, also under a thinking budget and a
 //   stop string (each token still goes through the plain loop; a round only saves forwards);
+// - a short output budget yields plain greedy's first tokens, and no round drafts more than the budget can emit;
 // - a sampled request runs plain (no rounds, no fallback steps) and repeats under a fixed seed;
 // - relaxed drafting, which DSpark does not implement, and draft counts outside 1..7 are refused;
 // - reported, not judged: rounds, drafts accepted, plain fallback steps, and decode tok/s of both Engines.
@@ -11,6 +12,7 @@
 
 #include "ninfer/engine.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -137,7 +139,18 @@ int main() {
             check(x == y, "prompt " + std::to_string(i) + ": the speculative tokens differ from plain greedy at " + std::to_string(at) +
                               " (" + std::to_string(x.size()) + " against " + std::to_string(y.size()) + " tokens)");
         }
-        check(spec.rounds > 0 && spec.drafted == spec.rounds * drafts && spec.accepted <= spec.drafted, "rounds ran and are counted");
+        // A round drafts fewer than `drafts` only when the output budget is that close.
+        check(spec.rounds > 0 && spec.drafted <= spec.rounds * drafts && spec.accepted <= spec.drafted,
+              "rounds ran and are counted");
+        for (std::uint32_t limit = 1; limit <= drafts + 3; ++limit) {
+            // The first token comes from the prefill and the second from a plain step, so a round starts after two
+            // tokens at the earliest and drafts at most limit - 3 (its n drafts yield n + 1 tokens).
+            const auto r = engine.generate(engine.prepare(user_turn(kPrompts[0])), greedy(limit));
+            const std::vector<ninfer::TokenId> want(plain.tokens[0].begin(), plain.tokens[0].begin() + std::min<std::size_t>(limit, plain.tokens[0].size()));
+            check(r.generated_token_ids == want, "an output budget of " + std::to_string(limit) + " yields plain greedy's first tokens");
+            check(r.speculative.drafted_tokens <= r.speculative.rounds * (limit > 3 ? limit - 3 : 0) && r.speculative.accepted_tokens <= r.speculative.drafted_tokens,
+                  "an output budget of " + std::to_string(limit) + " drafts no more than it can emit");
+        }
         auto budget                      = greedy(96);
         budget.execution.thinking.budget = 24;
         const auto b = engine.generate(engine.prepare(user_turn(kPrompts[0])), budget);
