@@ -300,6 +300,13 @@ int main() {
             check(prepared.tools && prepared.tools->size() == 1 && (*prepared.tools)[0].name == "get_weather" &&
                       (*prepared.tools)[0].parameters_json == R"({"type":"object"})",
                   "prepare() records the declared tools");
+            // A tool loaded on demand is callable but not rendered: the decoder knows it, the prompt does not change.
+            auto loaded = input;
+            loaded.options.loaded_tool_jsons.push_back(R"({"name":"send_email","parameters":{"type":"object"}})");
+            const auto with_loaded = frontend.prepare(loaded);
+            check(with_loaded.tools && with_loaded.tools->size() == 2 && (*with_loaded.tools)[1].name == "send_email" &&
+                      with_loaded.tokens == prepared.tokens,
+                  "prepare() records loaded tools after the rendered ones without rendering them");
         }
         // tool_choice none: a call stays text.
         {

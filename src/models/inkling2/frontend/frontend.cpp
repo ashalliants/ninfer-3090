@@ -296,9 +296,14 @@ PreparedPrompt Frontend::build(PromptInput input, const PreparationControl& cont
         throw std::invalid_argument("reasoning_effort conflicts with enable_thinking");
     }
     PreparedPrompt out;
-    // The declared tools (OpenAI's {"type": "function", "function": {...}} or the bare function object).
+    // The declared tools (OpenAI's {"type": "function", "function": {...}} or the bare function object): the rendered
+    // ones, then those loaded on demand (loaded_tool_jsons: callable, never rendered).
     out.tools.emplace();
-    for (const std::string& text : input.options.tool_jsons) {
+    std::vector<const std::string*> declared;
+    for (const std::string& text : input.options.tool_jsons) { declared.push_back(&text); }
+    for (const std::string& text : input.options.loaded_tool_jsons) { declared.push_back(&text); }
+    for (const std::string* entry : declared) {
+        const std::string& text = *entry;
         const Json tool = parse_object(text, "a tool");
         const Json& f   = tool.contains("function") && tool["function"].is_object() ? tool["function"] : tool;
         if (!f.contains("name") || !f["name"].is_string()) { throw std::invalid_argument("a tool has no name"); }
