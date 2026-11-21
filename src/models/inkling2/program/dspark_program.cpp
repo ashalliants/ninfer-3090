@@ -181,8 +181,26 @@ void DSparkProgram::extend(std::span<const Tensor> taps, std::int32_t n) {
         ops::dense_projection_fp32(ctx, matrix(model_.matrix(l.context_v)), nullptr, v, stream_);
         ops::head_rmsnorm_rope_fp32(k, i32(c.head_dim), model_.tensor(l.context_k_norm, {i32(c.head_dim)}), c.rms_norm_eps, true,
                                     position_, c.rope_theta, stream_);
-        ops::dspark_ring_write(k, layers_[i].k_ring, position_, stream_);
-        ops::dspark_ring_write(v, layers_[i].v_ring, position_, stream_);
+        // Columns into the ring slots (position mod capacity). FP16 rings round through dspark_ring_write; FP32 rings
+        // take the columns as they are, in at most two contiguous async copies (no kernel).
+        Layer& layer = layers_[i];
+        if (layer.k_ring.dtype != DType::FP32) {
+            ops::dspark_ring_write(k, layer.k_ring, position_, stream_);
+            ops::dspark_ring_write(v, layer.v_ring, position_, stream_);
+            continue;
+        }
+        const std::int64_t capacity = layer.k_ring.ne[1];
+        const std::size_t column    = static_cast<std::size_t>(kv) * 4;
+        for (std::int32_t done = 0; done < n;) {
+            const std::int64_t slot = (position_ + done) % capacity;
+            const std::int32_t run  = static_cast<std::int32_t>(std::min<std::int64_t>(n - done, capacity - slot));
+            for (auto [ring, src] : {std::pair{&layer.k_ring, &k}, std::pair{&layer.v_ring, &v}}) {
+                cuda(cudaMemcpyAsync(static_cast<std::byte*>(ring->data) + slot * column, static_cast<const std::byte*>(src->data) + done * column,
+                                     run * column, cudaMemcpyDeviceToDevice, stream_),
+                     "ring write");
+            }
+            done += run;
+        }
     }
     // The Markov head's context: the last committed position's fused taps (row `layers`, its own norm).
     std::vector<Tensor> last;
