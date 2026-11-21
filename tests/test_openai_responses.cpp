@@ -883,6 +883,24 @@ int test_namespace_tools() {
                               .name == engine_name,
                       "shortening is deterministic");
 
+    // A continuation cannot reuse the Engine name its parent chain bound to another client tool.
+    const OpenAIResponsesFunctionIdentity long_identity{.name           = long_name,
+                                                       .wire_namespace = long_namespace};
+    const OpenAIResponsesFunctionIdentity direct_identity{.name = engine_name};
+    const std::unordered_map<std::string, OpenAIResponsesFunctionIdentity> parent_map{
+        {engine_name, long_identity}};
+    failures += check(merge_openai_responses_tool_identities(parent_map, parent_map).size() == 1,
+                      "a continuation may redeclare the same tool the parent chain used");
+    bool collided = false;
+    try {
+        (void)merge_openai_responses_tool_identities(parent_map, {{engine_name, direct_identity}});
+    } catch (const ApiException& exception) {
+        collided = exception.error().code == "duplicate_tool_name";
+    }
+    failures += check(collided,
+                      "a continuation cannot declare a different client tool under an Engine name "
+                      "the parent chain already bound");
+
     // A name with characters outside [A-Za-z0-9_-] is sanitised the same way.
     Json dotted             = body;
     dotted["tool_choice"]   = "auto";
