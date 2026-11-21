@@ -46,6 +46,8 @@ EngineOptions valid() {
     options.artifact_path = "model.ninfer";
     options.max_context   = 8192;
     options.kv_capacity   = KvCapacityPolicy::explicit_capacity(8192);
+    // The Engine normalizes the options before this route sees them: it fills in the device state slots.
+    options.context_cache.device_state_slots = 1;
     return options;
 }
 

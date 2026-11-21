@@ -71,7 +71,6 @@ inline Dsv4Plan plan_dsv4_options(const EngineOptions& options) {
     note(options.numeric_tripwire.enabled, "--numeric-tripwire");
     note(options.context_cache.host_capacity_bytes.has_value(), "--host-context-mib");
     note(options.context_cache.auto_host_cache, "--auto-host-cache");
-    note(options.context_cache.device_state_slots.has_value(), "--device-state-slots");
     note(options.mlp_a8_decode || !options.prefill_a8 || options.prefill_cublas != EngineOptions{}.prefill_cublas ||
              !options.prefill_cublas_projections,
          "--mlp-a8-decode, --no-prefill-a8 and the prefill cuBLAS options");
