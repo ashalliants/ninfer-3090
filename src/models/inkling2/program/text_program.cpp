@@ -403,8 +403,10 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         jobs[0].log_scale = local ? nullptr : &tau;
         jobs[1].x = &r_t, jobs[1].head_dim = i32(c.d_rel), jobs[1].scale = &rel_clip, jobs[1].threshold = c.rel_clip;
         jobs[1].log_scale = local ? nullptr : &tau;
-        jobs[2].x = &kconv, jobs[2].head_dim = d, jobs[2].threshold = c.qk_clip;
-        jobs[3].x = &vconv, jobs[3].head_dim = d, jobs[3].unit_rms = true, jobs[3].eps = eps;
+        // The k and v norms also append the normalized columns to the visit's ring (the attention then does not).
+        const ops::KvAppend k_append{&st.k_cache, start, start_offset_}, v_append{&st.v_cache, start, start_offset_};
+        jobs[2].x = &kconv, jobs[2].head_dim = d, jobs[2].threshold = c.qk_clip, jobs[2].append = &k_append;
+        jobs[3].x = &vconv, jobs[3].head_dim = d, jobs[3].unit_rms = true, jobs[3].eps = eps, jobs[3].append = &v_append;
         ops::head_norms_fp32(jobs, stream_);
     }
 
@@ -412,7 +414,7 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     ops::RelativeBiasAttentionShape shape{heads, i32(c.kv_heads), d, i32(c.d_rel), local ? i32(c.sliding_window) : 0};
     const Tensor rel_bias = model_.tensor(w.rel_bias, {i32(c.d_rel), i32(c.rel_extent_of(p))});
     Tensor gated = workspace_.alloc(DType::BF16, {q, cols}); // the attention output times sigmoid(gate)
-    ops::relative_bias_sink_attention(shape, q_t, r_t, sink, kconv, vconv, rel_bias, st.k_cache, st.v_cache, start, start_offset_, &gate,
+    ops::relative_bias_sink_attention(shape, q_t, r_t, sink, nullptr, nullptr, rel_bias, st.k_cache, st.v_cache, start, start_offset_, &gate,
                                       gated, stream_);
     const WeightId ow[] = {w.output};
     const std::int32_t orows[] = {h};
@@ -462,14 +464,18 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     Tensor ids = workspace_.alloc(DType::I32, {top_k, cols}), weights = workspace_.alloc(DType::FP32, {top_k, cols});
     ops::moe_route_sigmoid_topk(z, &norm, model_.tensor(w.router, {h, i32(c.experts)}), model_.tensor(w.router_bias, {i32(c.experts)}),
                                 top_k, c.route_scale, workspace_, ids, weights, stream_);
-    Tensor y = workspace_.alloc(DType::FP32, {h, cols});
-    ops::moe_situ_experts(model_.expert_bank(p), zn, ids, weights, c.gate_softcap, c.up_softcap, workspace_, y, stream_);
+    // The experts' outputs are combined by the output convolution's launch (the same FMAs as the experts' own
+    // combine); the combined y is written out only when the convolution inputs are being saved.
+    Tensor entries = workspace_.alloc(DType::FP32, {h, top_k * cols});
+    ops::moe_situ_experts(model_.expert_bank(p), zn, ids, nullptr, c.gate_softcap, c.up_softcap, workspace_, entries, stream_);
     {
+        Tensor y = saving_ ? workspace_.alloc(DType::FP32, {h, cols}) : Tensor();
+        const ops::ConvCombine combine{&entries, &weights, saving_ ? &y : nullptr};
         const Tensor mlp_taps = model_.tensor(w.mlp_post_conv, {k, h});
         ops::ShortConvJob job;
-        job.x = &y, job.taps = &mlp_taps, job.history = &st.mlp_hist, job.residual = &ffn_inp, job.sum = &next;
-        save_input(st.mlp_saved, y);
+        job.combine = &combine, job.taps = &mlp_taps, job.history = &st.mlp_hist, job.residual = &ffn_inp, job.sum = &next;
         ops::short_conv_fp32_batch(std::span<const ops::ShortConvJob>(&job, 1), 1, stream_);
+        save_input(st.mlp_saved, y);
     }
 
     if (trace != nullptr && *trace) {
