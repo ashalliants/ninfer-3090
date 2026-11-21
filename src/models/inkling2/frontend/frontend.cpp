@@ -186,16 +186,23 @@ Frontend::Frontend(const Model::Resources& resources, FrontendOptions options)
     sampling_.non_thinking = sampling_.thinking;
 }
 
+namespace {
+
+// A request's cancellation and deadline, checked through every host-side stage of its preparation.
+void check_control(const PreparationControl& control) {
+    if (control.cancellation.requested()) { throw RequestError(RequestErrorKind::Cancelled, "preparation cancelled"); }
+    if (control.deadline != Clock::time_point{} && Clock::now() > control.deadline) {
+        throw RequestError(RequestErrorKind::QueueTimeout, "preparation passed its deadline");
+    }
+}
+
+} // namespace
+
 text::TemplateOutput Frontend::render(const PromptInput& input, const PreparationControl& control) const {
     std::size_t images = 0;
     const Json context = template_context(input, images);
     text::TemplateRenderOptions render_options;
-    render_options.checkpoint = [&] {
-        if (control.cancellation.requested()) { throw RequestError(RequestErrorKind::Cancelled, "preparation cancelled"); }
-        if (control.deadline != Clock::time_point{} && Clock::now() > control.deadline) {
-            throw RequestError(RequestErrorKind::QueueTimeout, "preparation passed its deadline");
-        }
-    };
+    render_options.checkpoint = [&] { check_control(control); };
     try {
         return template_->render(context, render_options);
     } catch (const RequestError&) {
@@ -232,12 +239,15 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             }
             media::decode::Image rgb;
             try {
-                rgb = media::decode::decode_image(part.media.bytes, {});
+                media::decode::Policy policy;
+                policy.checkpoint = [&] { check_control(control); };
+                rgb = media::decode::decode_image(part.media.bytes, policy);
             } catch (const media::decode::Error& error) {
                 throw RequestError(error.kind() == media::decode::ErrorKind::BudgetExceeded ? RequestErrorKind::MediaBudgetExceeded
                                                                                            : RequestErrorKind::InvalidMedia,
                                    error.what());
             }
+            check_control(control);
             images.push_back(prepare_image(*options_.vision, rgb.width, rgb.height, rgb.rgb));
             out.stats.media_bytes += part.media.bytes.size();
         }

@@ -15,6 +15,7 @@
 #include "models/inkling2/config.h"
 #include "models/inkling2/frontend/frontend.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -154,6 +155,15 @@ int main() {
                 image.media.media_type = "image/jpeg";
                 const auto prompt      = frontend.prepare(user_turn({image, text(question)}));
                 check(prompt.images.size() == 1, "one image");
+                try {
+                    // A passed deadline stops the image decode (its first checkpoint), before any template work.
+                    ninfer::PreparationControl late;
+                    late.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+                    (void)frontend.prepare(user_turn({image, text(question)}), late);
+                    check(false, "an image prompt past its deadline is refused");
+                } catch (const ninfer::RequestError& error) {
+                    check(error.kind() == ninfer::RequestErrorKind::QueueTimeout, "a passed deadline is a timeout");
+                }
                 if (prompt.images.size() == 1) {
                     const auto& img = prompt.images[0];
                     std::vector<TokenId> want = before;

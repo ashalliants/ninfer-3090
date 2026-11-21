@@ -179,6 +179,12 @@ int main() {
             (void)engine.prepare_tokens({});
             check(false, "an empty token prompt is refused");
         } catch (const std::invalid_argument&) {}
+        try {
+            auto looped                         = greedy(8);
+            looped.execution.thinking.loop      = ninfer::ReasoningLoopAction::Conclude;
+            (void)engine.generate(engine.prepare(question()), looped);
+            check(false, "a reasoning-loop guard is refused");
+        } catch (const std::invalid_argument&) {}
 
         // The image prompt.
         if (const char* root = std::getenv("NINFER_INKLING2_VISION"); root != nullptr && fs::exists(fs::path(root) / "test1.jpeg")) {

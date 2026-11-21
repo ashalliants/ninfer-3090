@@ -232,6 +232,10 @@ Inkling2Core::Submission Inkling2Core::submit(ink::PreparedPrompt prompt, Prompt
     if (options.tool_choice.mode == ToolChoiceMode::Required || options.tool_choice.allowed_names) {
         throw std::invalid_argument("Inkling-2 serves tool_choice auto or none only");
     }
+    if (options.execution.thinking.loop != ReasoningLoopAction::Off) {
+        throw std::invalid_argument("Inkling-2 has no reasoning-loop guard: run without --reasoning-loop");
+    }
+    // allow_prefix_reuse only permits reuse: with no context cache every request runs from position 0, which honours it.
     const auto submitted = Clock::now();
     if (pending_deadline == Clock::time_point{}) {
         pending_deadline = submitted + std::chrono::milliseconds(options_.pending_timeout_ms);
