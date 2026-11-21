@@ -7,11 +7,13 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "models/inkling2/model.h"
+#include "ninfer/ops/dspark_fp32.h"
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace ninfer::models::inkling2 {
@@ -34,8 +36,10 @@ public:
     // head's context (the last position's).
     void extend(std::span<const Tensor> taps, std::int32_t n);
 
-    // The block_size - 1 tokens drafted after `anchor`, the target's next token at position() (>= 1).
-    std::vector<std::int32_t> draft(std::int32_t anchor);
+    // The first `n` (1 .. block_size - 1) tokens drafted after `anchor`, the target's next token at position() (>= 1).
+    // The block forward always takes all block_size positions (its attention is non-causal); only the Markov chain
+    // and the head stop at n, which leaves the n drafts the same as the full block's first n.
+    std::vector<std::int32_t> draft(std::int32_t anchor, std::int32_t n);
 
 private:
     struct Layer {
@@ -55,6 +59,10 @@ private:
     Tensor pt_, hb_;    // FP32 [V, R] (ne[0] = V) = W_head W_o, and FP32 [V] = W_head b_o
     Tensor ids_;        // I32 [block]: the anchor, then the drafts
     std::int64_t position_ = 0;
+    // The Q8_0 matrices in the split form (same values; a faster projection kernel), by their artifact address.
+    DeviceBuffer split_memory_;
+    std::unordered_map<const void*, ops::DenseMatrix> split_;
+    [[nodiscard]] ops::DenseMatrix matrix(const Model::Matrix& m) const;
 };
 
 } // namespace ninfer::models::inkling2

@@ -24,6 +24,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -72,6 +73,11 @@ int main() {
         return 77;
     }
     const int n_tokens = std::getenv("NINFER_INKLING2_SPEC_TOKENS") ? std::atoi(std::getenv("NINFER_INKLING2_SPEC_TOKENS")) : 64;
+    // NINFER_INKLING2_SPEC_DRAFTS: drafts per round (default all block_size - 1).
+    const bool adaptive    = std::getenv("NINFER_INKLING2_SPEC_ADAPTIVE") != nullptr;
+    const double threshold = adaptive ? std::atof(std::getenv("NINFER_INKLING2_SPEC_ADAPTIVE")) : 0.0;
+    const double ema_weight = std::getenv("NINFER_INKLING2_SPEC_EMA") ? std::atof(std::getenv("NINFER_INKLING2_SPEC_EMA")) : 0.3;
+    const int max_drafts = std::getenv("NINFER_INKLING2_SPEC_DRAFTS") ? std::atoi(std::getenv("NINFER_INKLING2_SPEC_DRAFTS")) : 1 << 30;
     try {
         ninfer::artifact::Reader reader(artifact_path);
         ninfer::DeviceContext device(0);
@@ -83,7 +89,9 @@ int main() {
         cudaStream_t stream = nullptr;
         if (cudaStreamCreate(&stream) != cudaSuccess) { throw std::runtime_error("cannot create a stream"); }
         constexpr std::int32_t kContext = 4096, kChunk = 64;
-        ink::TextProgram plain(*model, {kContext, kChunk}, stream);
+        ink::ProgramLimits plain_limits{kContext, kChunk};
+        plain_limits.decode_graph = std::getenv("NINFER_INKLING2_PLAIN_EAGER") == nullptr;
+        ink::TextProgram plain(*model, plain_limits, stream);
         ink::ProgramLimits limits{kContext, kChunk};
         limits.tap_visits   = dc.target_visits;
         limits.max_rollback = block;
@@ -93,8 +101,16 @@ int main() {
         std::printf("drafter ready in %.2f s (taps at visits %s)\n", since(p0),
                     join(std::vector<std::int32_t>(dc.target_visits.begin(), dc.target_visits.end()), 8).c_str());
         ninfer::DeviceBuffer ids(64 * 4);
+        // Plain steps' taps, held until the drafter next runs (one extend for the stretch).
+        const auto hidden = static_cast<std::int32_t>(model->config().hidden_size);
+        std::vector<ninfer::DeviceBuffer> held_memory;
+        std::vector<ninfer::Tensor> held;
+        for (std::size_t i = 0; i < dc.target_visits.size(); ++i) {
+            held_memory.emplace_back(static_cast<std::size_t>(hidden) * kChunk * 4);
+            held.emplace_back(held_memory.back().p, ninfer::DType::FP32, std::initializer_list<std::int32_t>{hidden, kChunk});
+        }
 
-        double plain_seconds = 0, spec_seconds = 0, draft_seconds = 0;
+        double plain_seconds = 0, spec_seconds = 0, draft_seconds = 0, verify_seconds = 0;
         long rounds = 0, accepted = 0, generated = 0;
         for (int index = 0;; ++index) {
             const fs::path dir = fs::path(golden_root) / ("p" + std::to_string(index));
@@ -113,7 +129,8 @@ int main() {
                 const std::int32_t one[] = {want.back()};
                 want.push_back(greedy(plain.forward(one), vocab, ids, stream).back());
             }
-            plain_seconds += since(t);
+            const double prompt_plain = since(t);
+            plain_seconds += prompt_plain;
 
             // Speculative greedy.
             target.reset();
@@ -124,18 +141,44 @@ int main() {
                 for (std::size_t i = 0; i < dc.target_visits.size(); ++i) { taps.push_back(target.tap(i)); }
                 drafter.extend(taps, static_cast<std::int32_t>(prompt.size()));
             }
-            long prompt_rounds = 0, prompt_accepted = 0;
+            long prompt_rounds = 0, prompt_accepted = 0, plain_steps = 0;
+            // Adaptive (NINFER_INKLING2_SPEC_ADAPTIVE): an EMA of drafts accepted per round; below the break-even the
+            // next rounds are plain steps (the drafter still takes their taps), with a speculative probe every 8.
+            double ema = 1.0;
+            int since_probe = 0, interval = 8, held_n = 0;
             t = Clock::now();
             while (static_cast<int>(got.size()) < n_tokens) {
                 const std::int32_t anchor = got.back();
+                if (adaptive && ema < threshold && ++since_probe < interval && held_n < kChunk) {
+                    const std::int32_t one[] = {anchor};
+                    const auto next          = greedy(target.forward(one), vocab, ids, stream).back();
+                    for (std::size_t i = 0; i < dc.target_visits.size(); ++i) {
+                        const ninfer::Tensor tap = target.tap(i);
+                        if (cudaMemcpyAsync(static_cast<float*>(held[i].data) + static_cast<std::size_t>(held_n) * hidden, tap.data,
+                                            static_cast<std::size_t>(hidden) * 4, cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
+                            throw std::runtime_error("tap hold failed");
+                        }
+                    }
+                    ++held_n;
+                    got.push_back(next);
+                    ++plain_steps;
+                    continue;
+                }
+                if (held_n > 0) {
+                    drafter.extend(held, held_n);
+                    held_n = 0;
+                }
+                since_probe               = 0;
                 const auto d0             = Clock::now();
-                const auto drafts         = drafter.draft(anchor);
+                const auto drafts         = drafter.draft(anchor, std::min(max_drafts, block - 1));
                 draft_seconds += since(d0);
                 std::vector<std::int32_t> verify{anchor};
                 verify.insert(verify.end(), drafts.begin(), drafts.end());
+                const auto v0     = Clock::now();
                 const auto choice = greedy(target.forward(verify), vocab, ids, stream);
+                verify_seconds += since(v0);
                 std::int32_t n = 0; // drafts accepted
-                while (n < block - 1 && drafts[n] == choice[n]) { ++n; }
+                while (n < static_cast<std::int32_t>(drafts.size()) && drafts[n] == choice[n]) { ++n; }
                 target.keep(n + 1);
                 std::vector<ninfer::Tensor> taps;
                 for (std::size_t i = 0; i < dc.target_visits.size(); ++i) { taps.push_back(target.tap(i)); }
@@ -144,15 +187,22 @@ int main() {
                 got.push_back(choice[n]);
                 ++prompt_rounds;
                 prompt_accepted += n;
+                ema = (1 - ema_weight) * ema + ema_weight * n;
+                // A probe that fails doubles the wait before the next (to 64 plain steps); a good round resets it.
+                interval = ema < threshold ? std::min(2 * interval, 64) : 8;
             }
-            spec_seconds += since(t);
+            const double prompt_spec = since(t);
+            spec_seconds += prompt_spec;
             rounds += prompt_rounds;
             accepted += prompt_accepted;
             generated += n_tokens - 1;
             bool same = true;
             for (int i = 0; i < n_tokens; ++i) { same = same && got[i] == want[i]; }
-            std::printf("p%d (%zu prompt tokens): %ld rounds, %.2f drafts accepted per round; %s\n", index, prompt.size(), prompt_rounds,
-                        double(prompt_accepted) / prompt_rounds, same ? "same tokens as plain greedy" : "DIFFERENT tokens");
+            std::printf("p%d (%zu prompt tokens): %.1f vs %.1f tok/s; ", index, prompt.size(), (n_tokens - 1) / prompt_spec,
+                        (n_tokens - 1) / prompt_plain);
+            std::printf("%ld rounds, %.2f drafts accepted per round, %ld plain steps; %s\n",
+                        prompt_rounds, double(prompt_accepted) / std::max(prompt_rounds, 1L), plain_steps,
+                        same ? "same tokens as plain greedy" : "DIFFERENT tokens");
             if (!same) {
                 std::fprintf(stderr, "FAIL: p%d speculative tokens differ\n  plain: %s\n  spec:  %s\n", index,
                              join(want, n_tokens).c_str(), join(got, n_tokens).c_str());
@@ -162,6 +212,8 @@ int main() {
         if (rounds == 0) { throw std::runtime_error("no prompts"); }
         std::printf("plain greedy: %.2f tok/s; speculative: %.2f tok/s (%.2f drafts accepted per round, %.1f%% of the time drafting)\n",
                     generated / plain_seconds, generated / spec_seconds, double(accepted) / rounds, 100 * draft_seconds / spec_seconds);
+        std::printf("per round: draft %.2f ms, verify %.2f ms; plain step %.2f ms\n", 1e3 * draft_seconds / rounds,
+                    1e3 * verify_seconds / rounds, 1e3 * plain_seconds / generated);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
