@@ -853,7 +853,14 @@ void test_sidecar() {
          {{"layers", {1, 14}}, {"ngram_size", 4}, {"heads", 8}, {"row_width", 256}, {"pad_token_id", 2}, {"head_vocab_sizes", sizes},
           {"multipliers", multipliers}, {"token_map_count", token_map.size()},
           {"token_map", {{"file", "engram.token_map.i32"}, {"sha256", sha_hex(token_map.data(), token_map.size() * 4)}}}}}};
-    const auto write_manifest = [&](const Json& m) { std::ofstream(dir / "engram.json") << m.dump(); };
+    // The writer's digest: sha256 of the manifest without it, canonical JSON.
+    const auto sealed = [&](Json m) {
+        m.erase("digest");
+        const std::string text = m.dump();
+        m["digest"]            = sha_hex(text.data(), text.size());
+        return m;
+    };
+    const auto write_manifest = [&](const Json& m) { std::ofstream(dir / "engram.json") << sealed(m).dump(); };
     write_manifest(manifest);
 
     const dsv4::EngramSidecar loaded = dsv4::load_engram_sidecar(dir, config);
@@ -881,6 +888,13 @@ void test_sidecar() {
     bad = manifest;
     bad["volume"]["header_sha256"] = std::string(64, '0');
     refused("a volume header that is not the manifest's is refused", bad, config);
+    {
+        // Edited after sealing: the digest no longer matches (the multipliers are covered by nothing else).
+        Json tampered                 = sealed(manifest);
+        tampered["hash"]["multipliers"][0] = 5;
+        std::ofstream(dir / "engram.json") << tampered.dump();
+        check(throws([&] { (void)dsv4::load_engram_sidecar(dir, config); }), "a manifest edited after it was written is refused");
+    }
     bad = manifest;
     bad["version"] = 2;
     refused("another manifest version is refused", bad, config);

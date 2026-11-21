@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::models::dsv4 {
@@ -39,6 +40,8 @@ std::vector<std::uint8_t> read_prefix(const std::filesystem::path& path, std::si
     if (static_cast<std::size_t>(stream.gcount()) != count) { throw ArtifactError("Engram volume: " + path.string() + " is shorter than its header"); }
     return bytes;
 }
+
+std::string sha256_of(std::string_view text) { return qwen3_5::frontend::sha256_hex(qwen3_5::frontend::sha256(text)); }
 
 std::string sha256_of(const std::vector<std::uint8_t>& bytes) {
     return qwen3_5::frontend::sha256_hex(qwen3_5::frontend::sha256(std::span<const std::uint8_t>(bytes)));
@@ -74,6 +77,13 @@ EngramSidecar load_engram_sidecar(const std::filesystem::path& directory, const 
     }
     EngramSidecar out;
     try {
+        // The digest covers everything the checksums below do not (the multipliers, bucket counts, layers): it is the sha256
+        // of the manifest without its own "digest", in the canonical form the writer used (sorted keys, no whitespace).
+        Json body = manifest;
+        body.erase("digest");
+        if (manifest.at("digest").get<std::string>() != sha256_of(std::string_view(body.dump()))) {
+            throw fail("the manifest's digest does not match its contents (edited or damaged)");
+        }
         if (manifest.at("format").get<std::string>() != kFormat || manifest.at("version").get<std::uint32_t>() != kVersion) {
             throw fail(std::string("the manifest is not a version ") + std::to_string(kVersion) + " " + kFormat + " manifest");
         }
