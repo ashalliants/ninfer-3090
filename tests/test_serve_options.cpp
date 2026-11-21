@@ -793,6 +793,11 @@ int main() {
         failures += check(kv_help.find(flag) != std::string::npos,
                           "serve help omits an accepted prefill control");
     }
+    // --dense-q8 head|all reaches the Engine options (Inkling-2's opt-in 8-bit dense re-encoding).
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--dense-q8", "head"})).dense_q8 == ninfer::DenseQ8::Head &&
+                          make_engine_options(parse({"ninfer-serve", "model.ninfer", "--dense-q8", "all"})).dense_q8 == ninfer::DenseQ8::All &&
+                          make_engine_options(parse({"ninfer-serve", "model.ninfer"})).dense_q8 == ninfer::DenseQ8::Off,
+                      "--dense-q8 did not reach the Engine options");
     // --spec dspark drafts 3 per round unless --draft-tokens says otherwise (1..7).
     const ninfer::EngineOptions dspark = make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "dspark"}));
     failures += check(dspark.speculative.backend == ninfer::SpeculativeBackend::DSpark && dspark.speculative.draft_tokens == 3,

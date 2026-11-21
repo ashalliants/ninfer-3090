@@ -179,7 +179,7 @@ ninfer_add_op_test(ninfer_engram_gate_inject_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engram_gate_inject.cpp"
   LIBRARIES ninfer_ops)
 
-foreach(op IN ITEMS ple projection_fp32 rows)
+foreach(op IN ITEMS ple projection_fp32 projection_q8 rows)
   ninfer_add_op_test(ninfer_${op}_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_${op}.cpp"
     LIBRARIES ninfer_ops)

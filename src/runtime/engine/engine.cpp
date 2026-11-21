@@ -311,6 +311,9 @@ public:
         : options(runtime::normalize_engine_options(refuse_inkling2_cache_tiers(std::move(engine_options)))),
           device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
+        if (options.dense_q8 != DenseQ8::Off && !runtime::artifact_is_inkling2(options.artifact_path)) {
+            throw std::invalid_argument("--dense-q8 re-encodes Inkling-2's dense weights; this model has its own weight options");
+        }
         if (runtime::artifact_is_qwen4_exp(options.artifact_path)) {
             construct_qwen4_exp();
             return;

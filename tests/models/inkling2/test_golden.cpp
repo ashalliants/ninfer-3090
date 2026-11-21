@@ -35,6 +35,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -142,7 +143,53 @@ int main() {
         const auto vocab = static_cast<std::int32_t>(c.unpadded_vocab_size);
         cudaStream_t stream = nullptr;
         if (cudaStreamCreate(&stream) != cudaSuccess) { throw std::runtime_error("cannot create a stream"); }
-        ink::TextProgram program(*model, {4096, 64}, stream);
+        // NINFER_INKLING2_DENSE=head|all runs the main and eager programs over the 8-bit dense re-encoding of the head
+        // or of every dense projection (the KLDs below are then those of the lossy form against llama.cpp's BF16).
+        const std::string dense_env = std::getenv("NINFER_INKLING2_DENSE") ? std::getenv("NINFER_INKLING2_DENSE") : "";
+        std::unique_ptr<ink::DenseWeightsQ8> dense_q8;
+        if (dense_env == "all" || dense_env == "head") {
+            dense_q8 = std::make_unique<ink::DenseWeightsQ8>(*model, dense_env == "all" ? ink::DenseForm::Q8All : ink::DenseForm::Q8Head, stream);
+        }
+        const ink::DenseWeightsQ8* dense = dense_q8.get();
+        ink::ProgramLimits main_limits{4096, 64};
+        main_limits.dense = dense;
+        ink::TextProgram program(*model, main_limits, stream);
+        if (dense != nullptr) { std::printf("dense projections: 8-bit re-encoding (%s)\n", dense_env.c_str()); }
+
+        // NINFER_INKLING2_DENSE_KLD=<file of token ids>: the 8-bit dense forms against the BF16 one over that text,
+        // teacher-forced in chunks of 256: KLD(BF16 || Q8) per position and the argmax agreement.
+        if (const char* kld_ids = std::getenv("NINFER_INKLING2_DENSE_KLD"); kld_ids != nullptr) {
+            std::ifstream in(kld_ids);
+            std::vector<std::int32_t> text_ids;
+            for (std::int32_t id; in >> id;) { text_ids.push_back(id); }
+            constexpr std::int32_t kChunk = 256;
+            const auto n = static_cast<std::int32_t>(text_ids.size());
+            ink::ProgramLimits limits{n + kChunk, kChunk};
+            ink::TextProgram exact(*model, limits, stream);
+            std::unique_ptr<ink::DenseWeightsQ8> all;
+            if (dense == nullptr) { all = std::make_unique<ink::DenseWeightsQ8>(*model, ink::DenseForm::Q8All, stream); }
+            limits.dense = dense != nullptr ? dense : all.get();
+            ink::TextProgram eight(*model, limits, stream);
+            std::vector<double> klds;
+            int agree = 0;
+            for (std::int32_t s = 0; s < n; s += kChunk) {
+                const std::int32_t len = std::min(kChunk, n - s);
+                const auto ids = std::span(text_ids).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(len));
+                const auto a = logit_columns(exact.forward(ids), vocab);
+                const auto b = logit_columns(eight.forward(ids), vocab);
+                for (std::int32_t t = 0; t < len; ++t) {
+                    klds.push_back(kld(a[t].data(), b[t].data(), vocab));
+                    agree += argmax(a[t].data(), vocab) == argmax(b[t].data(), vocab);
+                }
+            }
+            std::vector<double> sorted = klds;
+            std::sort(sorted.begin(), sorted.end());
+            double mean = 0;
+            for (double k : klds) { mean += k; }
+            mean /= static_cast<double>(klds.size());
+            std::printf("dense Q8 (%s) vs BF16 over %d tokens: KLD mean %.3e median %.3e p99 %.3e max %.3e; argmax agrees %d/%d (%.2f%%)\n",
+                        limits.dense->form() == ink::DenseForm::Q8All ? "all" : "head", n, mean, sorted[sorted.size() / 2], sorted[sorted.size() * 99 / 100], sorted.back(), agree, n, 100.0 * agree / n);
+        }
 
         std::vector<std::int32_t> first_prompt;
         for (int index = 0;; ++index) {
@@ -300,6 +347,7 @@ int main() {
             };
             const auto graphed = replay(program);
             ink::ProgramLimits eager_limits{4096, 64};
+            eager_limits.dense        = dense;
             eager_limits.decode_graph = false;
             ink::TextProgram eager(*model, eager_limits, stream);
             const auto plain = replay(eager);

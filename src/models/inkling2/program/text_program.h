@@ -9,6 +9,8 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "models/inkling2/model.h"
+#include "models/inkling2/program/dense_q8.h"
+#include "ninfer/ops/projection_fp32.h"
 
 #include <cuda_runtime.h>
 
@@ -31,6 +33,9 @@ struct ProgramLimits {
     std::vector<std::uint32_t> tap_visits;
     // A forward of 2..max_rollback tokens can be cut back afterwards by keep() (speculative verification).
     std::int32_t max_rollback = 0;
+    // Opt-in, lossy: the 8-bit re-encodings (DenseWeightsQ8) the dense projections that have one run over, at every width;
+    // null: the artifact's BF16 weights. Not owned: it must outlive the Program.
+    const DenseWeightsQ8* dense = nullptr;
 };
 
 // Columns [column, column + values.ne[1]) of a forward that take `values` as their input in place of their tokens'

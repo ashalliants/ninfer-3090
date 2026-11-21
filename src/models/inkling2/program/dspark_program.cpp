@@ -40,7 +40,8 @@ const DSparkConfig& require_dspark(const Model& model) {
 
 } // namespace
 
-DSparkProgram::DSparkProgram(const Model& model, std::int32_t max_context, std::int32_t max_chunk, cudaStream_t stream)
+DSparkProgram::DSparkProgram(const Model& model, std::int32_t max_context, std::int32_t max_chunk, cudaStream_t stream,
+                             const ops::Q8Weight* head_q8)
     : model_(model), config_(require_dspark(model)), text_(model.config()), max_context_(max_context), max_chunk_(max_chunk),
       stream_(stream),
       workspace_((std::size_t(model.config().vocab_size) * require_dspark(model).block_size * 4) +
@@ -93,7 +94,10 @@ DSparkProgram::DSparkProgram(const Model& model, std::int32_t max_context, std::
     DeviceBuffer wo_t(transposed.size() * 4);
     cuda(cudaMemcpyAsync(wo_t.p, transposed.data(), transposed.size() * 4, cudaMemcpyHostToDevice, stream_), "W_o upload");
     const Tensor head = model_.tensor(model_.weights().head, {i32(h), i32(v)});
-    const ops::DenseMatrix head_matrix{head.data, QType::BF16, i32(v), i32(h)};
+    if (head_q8 != nullptr) { head_q8_ = *head_q8; }
+    // The head the target reads: BF16, or its Q8_G32_FP16 re-encoding (values [V, H], scales [V, H / 32]).
+    const ops::DenseMatrix head_matrix = head_q8_ ? ops::DenseMatrix{head_q8_->values, QType::Q8_G32_FP16, i32(v), i32(h), head_q8_->scales}
+                                                  : ops::DenseMatrix{head.data, QType::BF16, i32(v), i32(h)};
     const Tensor wo_tensor(wo_t.p, DType::FP32, {i32(h), i32(r)});
     ops::dense_projection_fp32(wo_tensor, head_matrix, nullptr, pt_, stream_);
     const Tensor bo = model_.tensor(w.hidden_out_bias, {i32(h), 1});
@@ -234,7 +238,9 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t
     Tensor xb = workspace_.alloc(DType::BF16, {h, n_drafts});
     ops::cast_fp32_to_bf16(x.slice(1, 1, n_drafts), xb, stream_);
     Tensor base = workspace_.alloc(DType::FP32, {vocab, n_drafts});
-    {
+    if (head_q8_) {
+        ops::projection_q8_fp32(xb, std::span<const ops::Q8Weight>(&*head_q8_, 1), base, stream_);
+    } else {
         const Tensor head      = model_.tensor(model_.weights().head, {h, vocab});
         const Tensor* heads[] = {&head};
         ops::projection_fp32(xb, heads, base, stream_);

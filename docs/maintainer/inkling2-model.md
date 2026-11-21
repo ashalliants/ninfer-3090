@@ -509,6 +509,34 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
   - streaming sends reasoning deltas, then content;
   - the image request describes "MEN WALK ON MOON".
 
+## Dense 8-bit re-encoding
+
+**Lossy.** `--dense-q8 head|all` (`EngineOptions::dense_q8`, `ProgramLimits::dense`; opt-in, off by default: the
+default runs the BF16 weights exactly) changes the target's logits (KLD below), so greedy output can differ from the
+default's. It re-encodes BF16
+dense weights at load with Q8_0's values (`ops::quantize_q8_g32`: per 32 values of a row d = amax / 127 as FP16 and
+int8 codes, ggml's `quantize_row_q8_0_ref` rounding; 8.5 bits a weight; the artifact is unchanged).
+`ops::projection_q8_fp32` runs them with BF16 activations and FP32 sums (oracle `ninfer_projection_q8_test`). `head`
+re-encodes the LM head (926 MB of BF16 read per token becomes 492 MB); `all` also re-encodes every attention
+projection (q, rel, gate, sink, k, v, the dynamic-tap projections and the output; 3.52 GB a token becomes 1.87 GB).
+The experts are NVFP4 already, and the controllers, router and convolutions stay as they are.
+
+Measured on the V100 (2026-11-21). KLD(BF16 || Q8) per position is teacher-forced over 3072 tokens of English
+prose, Markdown and C++ (`ninfer_inkling2_golden_test` with `NINFER_INKLING2_DENSE_KLD`). "Program" is the golden
+test's 127-step decode (three ABBA rounds). "Serve" is the mean over four greedy chat requests of 300 tokens through
+`ninfer-serve` (ABBA, `predicted_per_second`).
+
+| Form | KLD mean | median | p99 | max | argmax agrees | program tok/s | serve tok/s | serve, `--spec dspark` |
+|---|---|---|---|---|---|---|---|---|
+| BF16 (default) | 0 | 0 | 0 | 0 | 100% | 69.9 | 64.7 | 75.5 |
+| `head` | 8.8e-6 | 3.9e-6 | 5.3e-5 | 1.2e-4 | 99.77% | 72.3 (+3.4%) | 66.7 (+3.1%) | |
+| `all` | 6.3e-3 | 1.6e-3 | 7.6e-2 | 0.32 | 96.2% | 77.2 (+10.4%) | 71.0 (+9.7%) | 82.4 (+9.1%) |
+
+Re-encoding any one attention group alone (q-side, k/v or output) already gives a KLD mean of 5-6e-3 (the loop
+visits compound it). With `all`, one golden prompt's argmax differs from llama.cpp's. The Q8 kernels reach
+550-850 GB/s against BF16's 610-870 GB/s, because a call costs about 5 us whatever its size, so `all` gains less
+than its byte count suggests (1.35 ms of the 1.65 GB saved per token).
+
 ## GGUF mapping (Unsloth `unsloth/Inkling-2-Mini-GGUF`)
 
 Every UD quant has 734 tensors and the same keys. Read from 20 MB header range reads

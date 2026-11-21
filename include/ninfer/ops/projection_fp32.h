@@ -87,4 +87,38 @@ void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Te
  */
 void projection_fp32(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 
+/// A BF16 weight [K, N] re-encoded with Q8_0's values (an opt-in, lossy dense form): per 32 consecutive values of
+/// a row an FP16 scale d and int8 codes q, stored split: values int8 [N, K] (row n's K codes contiguous, 16-byte
+/// aligned rows) and scales FP16 [N, K / 32]. w[n, k] = FP32(d[n, k / 32]) * q[n, k], exact in FP32.
+struct Q8Weight {
+    const std::int8_t* values = nullptr;
+    const void* scales        = nullptr; // __half
+    std::int32_t k = 0, rows = 0;
+};
+
+/**
+ * Op: quantize_q8_g32 (BF16 weight rows to Q8Weight, ggml's quantize_row_q8_0_ref rounding)
+ *
+ *   amax = max |w| over the 32 values; d = amax / 127 (FP32); q = roundf(w * (d ? 1 / d : 0)); the stored scale
+ *   is FP16(d) (round to nearest even).
+ *
+ * w BF16 [K, N] contiguous with K a multiple of 32; values int8 [N, K] and scales FP16 [N, K / 32] device memory,
+ * values 16-byte aligned with K a multiple of 16. Stream-ordered.
+ */
+void quantize_q8_g32(const Tensor& w, std::int8_t* values, void* scales, cudaStream_t stream);
+
+/**
+ * Op: projection_q8_fp32 (BF16 activations by Q8Weight rows, FP32 outputs)
+ *
+ *   out[n, t] = sum_k w[n, k] * FP32(x[k, t]) for the rows n of `weights` concatenated in order.
+ *
+ * x BF16 [K, T] contiguous, 16-byte aligned; one to four weights of that K; out FP32 [sum N, T] contiguous. K a
+ * multiple of 32 and at most 3072; T >= 1. Per 16 values of a row the products q x (exact) are summed in FP32 and
+ * the partial is scaled by d into the FP32 sum, in an order that depends only on K, so a column's results are bitwise
+ * the same at every T and column position. Oracle: the FP64 dot product of the decoded weights and x, within
+ * sum_k |w x| * K * 2^-24.
+ * Effects: writes out; it must not overlap x or a weight. Workspace: none. Graph capturable.
+ */
+void projection_q8_fp32(const Tensor& x, std::span<const Q8Weight> weights, Tensor& out, cudaStream_t stream);
+
 } // namespace ninfer::ops

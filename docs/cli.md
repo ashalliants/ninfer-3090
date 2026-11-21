@@ -211,6 +211,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8, Linux; see the [README](../README.md#several-gpus-pipeline-stages---devices-ab)); overrides `--device` | none |
 | `--stage-layers A,B,...` | layers per stage, in `--devices` order; omitted means a split chosen from each device's free memory | memory-balanced |
 | `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|nvfp4\|k8v4` | KV-cache storage; see [Context and memory](#context-and-memory). `rk8v4` is opt-in RotorQuant and `rk4v4` opt-in Lloyd-Max 4-bit keys; all seven are accepted on this fork's sm_86/sm_89 targets | `bf16` |
+| `--dense-q8 head\|all` | Inkling-2 only. **Lossy**, opt-in: the output can differ from the default's, token for token. Re-encodes the BF16 LM head (`head`) or the head and every attention projection (`all`) to 8 bits at load (the artifact is unchanged). The default keeps the BF16 weights, exact; see [the Inkling-2 notes](maintainer/inkling2-model.md#dense-8-bit-re-encoding) for the measured KLD and speed | off (BF16) |
 | `--spec mtp\|dflash\|dflash2\|dspark` | speculative backend; see [Speculative decoding](#speculative-decoding) (`dspark`: Inkling-2, greedy requests, `--draft-tokens` default 3) | off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--lm-head-draft` | optimized proposal head; implied by `--spec`, accepted for compatibility | on with `--spec` |
