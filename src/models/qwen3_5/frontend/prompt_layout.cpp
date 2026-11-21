@@ -10,6 +10,9 @@ constexpr std::string_view kStart       = "<|im_start|>";
 constexpr std::string_view kEnd         = "<|im_end|>";
 constexpr std::string_view kVisionStart = "<|vision_start|>";
 constexpr std::string_view kVisionEnd   = "<|vision_end|>";
+// DeepSeek-V4 templates open the model's turn with the assistant marker and, in thinking mode, `<think>`
+// (no ChatML markers anywhere), so the opener is the last bytes of the prompt.
+constexpr std::string_view kDeepseekAssistant = "<｜Assistant｜><think>";
 
 bool template_bytes(const text::TemplateOutput& output, std::size_t begin, std::size_t end) {
     return !text::overlaps(output.literal_spans, begin, end);
@@ -117,6 +120,11 @@ PromptLayout inspect_prompt_layout(const text::TemplateOutput& output,
             }
         }
         pos = next;
+    }
+
+    if (result.messages.empty() && source.ends_with(kDeepseekAssistant) &&
+        template_bytes(output, source.size() - kDeepseekAssistant.size(), source.size())) {
+        result.starts_in_reasoning = true;
     }
 
     // Each media input contributes one complete Qwen placeholder in input order.
