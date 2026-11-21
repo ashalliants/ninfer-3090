@@ -372,3 +372,8 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/tests.cmake")
 ninfer_add_op_test(ninfer_attention_rows_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attention_rows.cpp"
   LIBRARIES ninfer_ops)
+# Inkling-2-Mini's FP32 Ops (fp32_rows, depth_attention, short_conv, relative_bias_attention, moe_situ) against the
+# FP64 oracles of inkling2_reference.h at the model's shapes; stateful Ops over several calls.
+ninfer_add_op_test(ninfer_inkling2_fp32_ops_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_fp32_ops.cpp"
+  LIBRARIES ninfer_ops)
