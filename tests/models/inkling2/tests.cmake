@@ -23,3 +23,8 @@ ninfer_add_op_test(ninfer_inkling2_frontend_test
 ninfer_add_op_test(ninfer_inkling2_engine_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine.cpp"
   LIBRARIES ninfer_engine ninfer_core)
+# --spec dspark through the public Engine: greedy output equals a plain Engine's on chat prompts, with a thinking
+# budget and a stop string; sampled requests run plain. Reports tok/s and acceptance (skips without the artifact).
+ninfer_add_op_test(ninfer_inkling2_engine_dspark_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dspark.cpp"
+  LIBRARIES ninfer_engine ninfer_core)

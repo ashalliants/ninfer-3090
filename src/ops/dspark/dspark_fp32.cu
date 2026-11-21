@@ -78,21 +78,28 @@ __device__ float block_max(float v, float* scratch) {
 
 // ----------------------------------------------------------------------------------------------- projection
 
-constexpr int kProjWarps = 8, kProjCols = 8, kProjChunk = 1024;
+constexpr int kProjWarps = 8, kProjCols = 8, kProjChunk = 1024, kProjRows = 4;
 
-// grid (ceil(N / 8), ceil(T / 8)): warp w of block (b, c) takes row 8b + w over columns [8c, 8c + 8). Lane l
-// takes value l of every 32-value block; the staged activations are read without bank conflicts.
+// grid (ceil(N / 32), ceil(T / 8)): warp w of block (b, c) takes rows 32b + 4w .. + 3 over columns [8c, 8c + 8).
+// Lane l takes the value pair 2 (l % 16) of 32-value block l / 16 of every two blocks (a 2-byte load of Q8_0 or
+// one 4-byte load of BF16), so a warp reads 64 contiguous values of a row per load and its four rows' loads are
+// in flight together; the staged activations are read as float2 without bank conflicts.
 template <bool kQ8>
 __global__ void __launch_bounds__(kProjWarps * 32)
 dense_projection_kernel(const float* __restrict__ x, std::int64_t xs, const std::uint8_t* __restrict__ w, const float* __restrict__ bias,
                         float* __restrict__ out, int n_rows, int k_cols, int t_cols) {
-    __shared__ float stage[kProjCols * kProjChunk];
+    __shared__ __align__(16) float stage[kProjCols * kProjChunk];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int n = blockIdx.x * kProjWarps + warp, t0 = blockIdx.y * kProjCols;
+    const int n0 = (blockIdx.x * kProjWarps + warp) * kProjRows, t0 = blockIdx.y * kProjCols;
     const int cols = min(kProjCols, t_cols - t0);
-    float acc[kProjCols];
+    const int half = lane >> 4, pair = lane & 15;
+    float acc[kProjRows][kProjCols];
 #pragma unroll
-    for (int c = 0; c < kProjCols; ++c) { acc[c] = 0.0F; }
+    for (int r = 0; r < kProjRows; ++r) {
+#pragma unroll
+        for (int c = 0; c < kProjCols; ++c) { acc[r][c] = 0.0F; }
+    }
+    const std::int64_t blocks_per_row = k_cols / 32;
     for (int k0 = 0; k0 < k_cols; k0 += kProjChunk) {
         const int chunk = min(kProjChunk, k_cols - k0);
         __syncthreads();
@@ -101,30 +108,119 @@ dense_projection_kernel(const float* __restrict__ x, std::int64_t xs, const std:
             stage[c * kProjChunk + k] = c < cols ? x[(t0 + c) * xs + k0 + k] : 0.0F;
         }
         __syncthreads();
-        if (n < n_rows) {
-            for (int b = 0; b < chunk / 32; ++b) {
-                const int k = k0 + 32 * b + lane;
-                float value;
-                if constexpr (kQ8) {
-                    const std::uint8_t* blk = w + (static_cast<std::int64_t>(n) * (k_cols / 32) + k / 32) * 34;
-                    const float d           = __half2float(__ushort_as_half(static_cast<unsigned short>(blk[0] | (blk[1] << 8))));
-                    value                   = d * static_cast<float>(static_cast<std::int8_t>(blk[2 + lane]));
-                } else {
-                    const unsigned short word = reinterpret_cast<const unsigned short*>(w)[static_cast<std::int64_t>(n) * k_cols + k];
-                    value                     = __uint_as_float(static_cast<std::uint32_t>(word) << 16);
-                }
-                const float* xk = stage + 32 * b + lane;
+        // chunk is a multiple of 32; an odd last block is taken by the first half-warp alone.
+        for (int b = 0; b < chunk / 32; b += 2) {
+            const int blk = b + half;
+            if (blk >= chunk / 32) { break; }
+            const int k = 32 * blk + 2 * pair; // within the chunk
+            float v0[kProjRows], v1[kProjRows];
 #pragma unroll
-                for (int c = 0; c < kProjCols; ++c) { acc[c] = fmaf(value, xk[c * kProjChunk], acc[c]); }
+            for (int r = 0; r < kProjRows; ++r) {
+                const int n = min(n0 + r, n_rows - 1);
+                if constexpr (kQ8) {
+                    const std::uint8_t* q = w + (static_cast<std::int64_t>(n) * blocks_per_row + (k0 + 32 * blk) / 32) * 34;
+                    const float d         = __half2float(__ushort_as_half(*reinterpret_cast<const unsigned short*>(q)));
+                    const unsigned short two = *reinterpret_cast<const unsigned short*>(q + 2 + 2 * pair);
+                    v0[r] = d * static_cast<float>(static_cast<std::int8_t>(two & 0xFF));
+                    v1[r] = d * static_cast<float>(static_cast<std::int8_t>(two >> 8));
+                } else {
+                    const std::uint32_t two = reinterpret_cast<const std::uint32_t*>(w)[(static_cast<std::int64_t>(n) * k_cols + k0 + k) / 2];
+                    v0[r] = __uint_as_float(two << 16);
+                    v1[r] = __uint_as_float(two & 0xFFFF0000U);
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < kProjCols; ++c) {
+                const float2 xv = *reinterpret_cast<const float2*>(stage + c * kProjChunk + k);
+#pragma unroll
+                for (int r = 0; r < kProjRows; ++r) { acc[r][c] = fmaf(v1[r], xv.y, fmaf(v0[r], xv.x, acc[r][c])); }
             }
         }
     }
-    if (n >= n_rows) { return; }
 #pragma unroll
-    for (int c = 0; c < kProjCols; ++c) {
-        const float s = warp_sum(acc[c]);
-        if (lane == 0 && c < cols) { out[static_cast<std::int64_t>(t0 + c) * n_rows + n] = s + (bias ? bias[n] : 0.0F); }
+    for (int r = 0; r < kProjRows; ++r) {
+        const int n = n0 + r;
+#pragma unroll
+        for (int c = 0; c < kProjCols; ++c) {
+            const float s = warp_sum(acc[r][c]);
+            if (lane == 0 && n < n_rows && c < cols) { out[static_cast<std::int64_t>(t0 + c) * n_rows + n] = s + (bias ? bias[n] : 0.0F); }
+        }
     }
+}
+
+// The split Q8_0 form (int8 values and FP16 scales apart). grid (ceil(N / 32), ceil(T / 8)): warp w of block (b, c)
+// takes rows 32b + 4w .. + 3 over columns [8c, 8c + 8); lane l takes the 4 values 4l + 128i of the chunk, so a warp
+// reads 128 contiguous values of a row in one 4-byte load per lane, and the staged activations as float4.
+__global__ void __launch_bounds__(kProjWarps * 32)
+dense_projection_split_kernel(const float* __restrict__ x, std::int64_t xs, const std::int8_t* __restrict__ w,
+                              const __half* __restrict__ scales, const float* __restrict__ bias, float* __restrict__ out, int n_rows,
+                              int k_cols, int t_cols) {
+    __shared__ __align__(16) float stage[kProjCols * kProjChunk];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int n0 = (blockIdx.x * kProjWarps + warp) * kProjRows, t0 = blockIdx.y * kProjCols;
+    const int cols = min(kProjCols, t_cols - t0);
+    float acc[kProjRows][kProjCols];
+#pragma unroll
+    for (int r = 0; r < kProjRows; ++r) {
+#pragma unroll
+        for (int c = 0; c < kProjCols; ++c) { acc[r][c] = 0.0F; }
+    }
+    const std::int8_t* rows[kProjRows];
+    const __half* row_scales[kProjRows];
+#pragma unroll
+    for (int r = 0; r < kProjRows; ++r) {
+        const int n   = min(n0 + r, n_rows - 1);
+        rows[r]       = w + static_cast<std::int64_t>(n) * k_cols;
+        row_scales[r] = scales + static_cast<std::int64_t>(n) * (k_cols / 32);
+    }
+    for (int k0 = 0; k0 < k_cols; k0 += kProjChunk) {
+        const int chunk = min(kProjChunk, k_cols - k0);
+        __syncthreads();
+        for (int i = threadIdx.x; i < kProjCols * chunk; i += blockDim.x) {
+            const int c = i / chunk, k = i % chunk;
+            stage[c * kProjChunk + k] = c < cols ? x[(t0 + c) * xs + k0 + k] : 0.0F;
+        }
+        __syncthreads();
+#pragma unroll 2
+        for (int k = 4 * lane; k < chunk; k += 128) {
+            float v[kProjRows][4];
+#pragma unroll
+            for (int r = 0; r < kProjRows; ++r) {
+                const char4 q = *reinterpret_cast<const char4*>(rows[r] + k0 + k);
+                const float d = __half2float(row_scales[r][(k0 + k) / 32]);
+                v[r][0] = d * static_cast<float>(q.x), v[r][1] = d * static_cast<float>(q.y);
+                v[r][2] = d * static_cast<float>(q.z), v[r][3] = d * static_cast<float>(q.w);
+            }
+#pragma unroll
+            for (int c = 0; c < kProjCols; ++c) {
+                const float4 xv = *reinterpret_cast<const float4*>(stage + c * kProjChunk + k);
+#pragma unroll
+                for (int r = 0; r < kProjRows; ++r) {
+                    acc[r][c] = fmaf(v[r][3], xv.w, fmaf(v[r][2], xv.z, fmaf(v[r][1], xv.y, fmaf(v[r][0], xv.x, acc[r][c]))));
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < kProjRows; ++r) {
+        const int n = n0 + r;
+#pragma unroll
+        for (int c = 0; c < kProjCols; ++c) {
+            const float s = warp_sum(acc[r][c]);
+            if (lane == 0 && n < n_rows && c < cols) { out[static_cast<std::int64_t>(t0 + c) * n_rows + n] = s + (bias ? bias[n] : 0.0F); }
+        }
+    }
+}
+
+// grid (rows, cols / 32 / 8): thread j of block (n, b) copies block 8b + j's scale and its 32 values.
+__global__ void split_q8_0_kernel(const std::uint8_t* __restrict__ blocks, int cols, std::int8_t* __restrict__ values,
+                                  __half* __restrict__ scales) {
+    const int n = blockIdx.x, j = blockIdx.y * blockDim.x + threadIdx.x, per_row = cols / 32;
+    if (j >= per_row) { return; }
+    const std::uint8_t* blk = blocks + (static_cast<std::int64_t>(n) * per_row + j) * 34;
+    scales[static_cast<std::int64_t>(n) * per_row + j] = __ushort_as_half(static_cast<unsigned short>(blk[0] | (blk[1] << 8)));
+    std::int8_t* dst = values + static_cast<std::int64_t>(n) * cols + 32 * j;
+    for (int i = 0; i < 32; ++i) { dst[i] = static_cast<std::int8_t>(blk[2 + i]); }
 }
 
 // --------------------------------------------------------------------------------------- head norm + rope
@@ -270,7 +366,7 @@ markov_logits_kernel(const float* base, const float* __restrict__ hb, const floa
 }
 
 // grid (T), block 1024.
-__global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ logits, std::int64_t stride, int valid, int* __restrict__ out) {
+__global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ logits, std::int64_t stride, int valid, int non_finite, int* __restrict__ out) {
     __shared__ float best_v[32];
     __shared__ int best_i[32];
     const float* col = logits + blockIdx.x * stride;
@@ -295,7 +391,7 @@ __global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ 
             const int oi   = best_i[w];
             if (oi != valid && (bi == valid || ov > bv || (ov == bv && oi < bi))) { bv = ov, bi = oi; }
         }
-        out[blockIdx.x] = bi == valid ? 0 : bi;
+        out[blockIdx.x] = bi == valid || !isfinite(bv) ? non_finite : bi;
     }
 }
 
@@ -305,20 +401,41 @@ void dense_projection_fp32(const Tensor& x, const DenseMatrix& w, const Tensor* 
     constexpr const char* op = "dense_projection_fp32";
     const Columns xc = columns(x, op, "x"), oc = columns(out, op, "out", true);
     require(w.data != nullptr && w.rows > 0 && w.cols > 0 && w.cols % 32 == 0, op, "W must be a non-empty matrix of 32-value blocks");
-    require(w.format == QType::GGML_Q8_0 || w.format == QType::BF16, op, "W must be Q8_0 or BF16");
+    require(w.format == QType::GGML_Q8_0 || w.format == QType::BF16 || w.format == QType::Q8_G32_FP16, op,
+            "W must be Q8_0, split Q8_0 or BF16");
+    if (w.format == QType::Q8_G32_FP16) {
+        require(w.cols % 128 == 0 && w.scales != nullptr && reinterpret_cast<std::uintptr_t>(w.data) % 16 == 0, op,
+                "split Q8_0 needs cols a multiple of 128, scales and 16-byte aligned values");
+    }
     require(xc.rows == w.cols && oc.rows == w.rows && oc.cols == xc.cols, op, "shapes differ");
     if (bias != nullptr) { require(columns(*bias, op, "bias", true).rows == w.rows && bias->ne[1] == 1, op, "bias must be [N]"); }
-    const dim3 grid((w.rows + kProjWarps - 1) / kProjWarps, (xc.cols + kProjCols - 1) / kProjCols);
+    const dim3 grid((w.rows + kProjWarps * kProjRows - 1) / (kProjWarps * kProjRows), (xc.cols + kProjCols - 1) / kProjCols);
     require(grid.y <= 65535, op, "too many columns");
     const auto* xp = static_cast<const float*>(x.data);
     const auto* wp = static_cast<const std::uint8_t*>(w.data);
     const auto* bp = bias ? static_cast<const float*>(bias->data) : nullptr;
     auto* op_out   = static_cast<float*>(out.data);
-    if (w.format == QType::GGML_Q8_0) {
+    if (w.format == QType::Q8_G32_FP16) {
+        dense_projection_split_kernel<<<grid, kProjWarps * 32, 0, stream>>>(xp, xc.stride, static_cast<const std::int8_t*>(w.data),
+                                                                            static_cast<const __half*>(w.scales), bp, op_out, w.rows,
+                                                                            w.cols, xc.cols);
+    } else if (w.format == QType::GGML_Q8_0) {
         dense_projection_kernel<true><<<grid, kProjWarps * 32, 0, stream>>>(xp, xc.stride, wp, bp, op_out, w.rows, w.cols, xc.cols);
     } else {
         dense_projection_kernel<false><<<grid, kProjWarps * 32, 0, stream>>>(xp, xc.stride, wp, bp, op_out, w.rows, w.cols, xc.cols);
     }
+    check_launch(op);
+}
+
+void split_q8_0(const void* blocks, std::int32_t rows, std::int32_t cols, void* values, void* scales, cudaStream_t stream) {
+    constexpr const char* op = "split_q8_0";
+    require(blocks != nullptr && values != nullptr && scales != nullptr && rows > 0 && cols > 0 && cols % 128 == 0, op,
+            "rows > 0 and cols a multiple of 128, with blocks, values and scales");
+    require(reinterpret_cast<std::uintptr_t>(values) % 16 == 0 && reinterpret_cast<std::uintptr_t>(scales) % 16 == 0, op,
+            "values and scales must be 16-byte aligned");
+    const int per_row = cols / 32;
+    split_q8_0_kernel<<<dim3(rows, (per_row + 31) / 32), 32, 0, stream>>>(static_cast<const std::uint8_t*>(blocks), cols,
+                                                                         static_cast<std::int8_t*>(values), static_cast<__half*>(scales));
     check_launch(op);
 }
 
@@ -413,12 +530,12 @@ void dspark_markov_logits_fp32(const Tensor& base, const Tensor& hb, const Tenso
     check_launch(op);
 }
 
-void argmax_fp32(const Tensor& logits, std::int32_t valid_rows, Tensor& out, cudaStream_t stream) {
+void argmax_fp32(const Tensor& logits, std::int32_t valid_rows, Tensor& out, cudaStream_t stream, std::int32_t non_finite) {
     constexpr const char* op = "argmax_fp32";
     const Columns c = columns(logits, op, "logits");
     require(valid_rows >= 1 && valid_rows <= c.rows, op, "bad valid_rows");
     require(out.dtype == DType::I32 && out.numel() == c.cols && out.data != nullptr, op, "out must be I32 [T]");
-    argmax_kernel<<<c.cols, 1024, 0, stream>>>(static_cast<const float*>(logits.data), c.stride, valid_rows, static_cast<int*>(out.data));
+    argmax_kernel<<<c.cols, 1024, 0, stream>>>(static_cast<const float*>(logits.data), c.stride, valid_rows, non_finite, static_cast<int*>(out.data));
     check_launch(op);
 }
 

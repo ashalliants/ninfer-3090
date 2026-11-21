@@ -211,7 +211,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8, Linux; see the [README](../README.md#several-gpus-pipeline-stages---devices-ab)); overrides `--device` | none |
 | `--stage-layers A,B,...` | layers per stage, in `--devices` order; omitted means a split chosen from each device's free memory | memory-balanced |
 | `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|nvfp4\|k8v4` | KV-cache storage; see [Context and memory](#context-and-memory). `rk8v4` is opt-in RotorQuant and `rk4v4` opt-in Lloyd-Max 4-bit keys; all seven are accepted on this fork's sm_86/sm_89 targets | `bf16` |
-| `--spec mtp\|dflash\|dflash2` | speculative backend; see [Speculative decoding](#speculative-decoding) | off |
+| `--spec mtp\|dflash\|dflash2\|dspark` | speculative backend; see [Speculative decoding](#speculative-decoding) (`dspark`: Inkling-2, greedy requests, `--draft-tokens` default 3) | off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--lm-head-draft` | optimized proposal head; implied by `--spec`, accepted for compatibility | on with `--spec` |
 | `--ngram-draft-tokens 0\|15` | n-gram copy drafting beside `--spec dflash2`: when the text being written already appeared in the request (the prompt, a tool result -- including `cat -n` numbered ones -- or the output so far), a round verifies up to 15 copied tokens instead of the draft model's proposal; verification licenses every token, so a wrong copy costs speed, never output. Copies run at one or two lanes in a round; see [Speculative decoding](#n-gram-copy-drafting) | `0` (off) |
@@ -304,6 +304,16 @@ the launchers pass. DFlash2 accepts every draft count from 1 through 15. Both `g
 penalties, and prefix reuse. An artifact without the companion weights reports a missing DFlash2
 component when selected. Vision, MTP and DFlash follow the same rule: their weights are required
 only when that component is enabled at startup.
+
+`--spec dspark` runs Inkling-2's DSpark block drafter (Inkling-2 artifacts only; the drafter ships in the
+artifact). `--draft-tokens` is optional, 1 through 7, default 3. Only greedy requests (temperature 0)
+speculate; sampled requests decode plainly. A greedy request's output is the same as without it, token
+for token, including stop strings, the thinking budget's forced close and the context limit. A round
+runs only while its measured cost beats the plain steps it replaces at the request's recent
+acceptance; otherwise the request decodes plainly and probes again after 8 to 64 steps. Relaxed
+drafting, `--draft-context-rows`, `--ngram-draft-tokens` and `--adaptive-draft-tokens` are refused.
+Measured on a Tesla V100 over five chat prompts of 256 tokens: 1.28x plain greedy at 3 drafts
+(1.13x, 1.24x, 1.26x at 1, 2, 4), from no gain on a list or a story to 1.8x on code.
 
 ### Choosing a draft count
 

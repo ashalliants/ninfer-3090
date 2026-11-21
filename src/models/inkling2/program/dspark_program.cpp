@@ -3,6 +3,7 @@
 
 #include "models/inkling2/program/dspark_program.h"
 
+#include "core/copy_batch.h"
 #include "ninfer/ops/cast.h"
 #include "ninfer/ops/dspark_fp32.h"
 #include "ninfer/ops/fp32_rows.h"
@@ -97,7 +98,34 @@ DSparkProgram::DSparkProgram(const Model& model, std::int32_t max_context, std::
     ops::dense_projection_fp32(wo_tensor, head_matrix, nullptr, pt_, stream_);
     const Tensor bo = model_.tensor(w.hidden_out_bias, {i32(h), 1});
     ops::dense_projection_fp32(bo, head_matrix, nullptr, hb_, stream_);
+    // The Q8_0 matrices the block and the context read, split once.
+    std::vector<Model::Matrix> q8;
+    const auto want = [&](WeightId id) {
+        const Model::Matrix m = model_.matrix(id);
+        if (m.format == QType::GGML_Q8_0 && m.cols % 128 == 0) { q8.push_back(m); }
+    };
+    for (const DSparkLayerWeights& l : w.layers) {
+        for (const WeightId id : {l.q, l.k, l.v, l.output, l.gate, l.up, l.down, l.context_k, l.context_v}) { want(id); }
+    }
+    want(w.joint);
+    std::size_t split_bytes = 0;
+    for (const Model::Matrix& m : q8) { split_bytes += padded(std::size_t(m.rows) * m.cols) + padded(std::size_t(m.rows) * m.cols / 16); }
+    split_memory_ = DeviceBuffer(std::max<std::size_t>(split_bytes, 1));
+    std::size_t at = 0;
+    for (const Model::Matrix& m : q8) {
+        auto* values = static_cast<std::byte*>(split_memory_.p) + at;
+        at += padded(std::size_t(m.rows) * m.cols);
+        auto* scales = static_cast<std::byte*>(split_memory_.p) + at;
+        at += padded(std::size_t(m.rows) * m.cols / 16);
+        ops::split_q8_0(m.data, m.rows, m.cols, values, scales, stream_);
+        split_.emplace(m.data, ops::DenseMatrix{values, QType::Q8_G32_FP16, m.rows, m.cols, scales});
+    }
     cuda(cudaStreamSynchronize(stream_), "precompute");
+}
+
+ops::DenseMatrix DSparkProgram::matrix(const Model::Matrix& m) const {
+    const auto it = split_.find(m.data);
+    return it != split_.end() ? it->second : dense(m);
 }
 
 void DSparkProgram::extend(std::span<const Tensor> taps, std::int32_t n) {
@@ -121,8 +149,8 @@ void DSparkProgram::extend(std::span<const Tensor> taps, std::int32_t n) {
         const Tensor norm           = model_.tensor(l.context_norm, {h});
         ops::dspark_fuse_taps_fp32(pointers, fuse, static_cast<int>(i), norm, c.rms_norm_eps, ctx, stream_);
         Tensor k = workspace_.alloc(DType::FP32, {kv, n}), v = workspace_.alloc(DType::FP32, {kv, n});
-        ops::dense_projection_fp32(ctx, dense(model_.matrix(l.context_k)), nullptr, k, stream_);
-        ops::dense_projection_fp32(ctx, dense(model_.matrix(l.context_v)), nullptr, v, stream_);
+        ops::dense_projection_fp32(ctx, matrix(model_.matrix(l.context_k)), nullptr, k, stream_);
+        ops::dense_projection_fp32(ctx, matrix(model_.matrix(l.context_v)), nullptr, v, stream_);
         ops::head_rmsnorm_rope_fp32(k, i32(c.head_dim), model_.tensor(l.context_k_norm, {i32(c.head_dim)}), c.rms_norm_eps, true,
                                     position_, c.rope_theta, stream_);
         // Columns into the ring slots (position mod capacity): at most two contiguous runs.
@@ -151,12 +179,13 @@ void DSparkProgram::extend(std::span<const Tensor> taps, std::int32_t n) {
     position_ += n;
 }
 
-std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor) {
+std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t n_drafts) {
     const DSparkConfig& c = config_;
     if (position_ < 1) { throw std::invalid_argument("inkling2 dspark: drafting needs a committed context"); }
     if (anchor < 0 || static_cast<std::uint32_t>(anchor) >= text_.unpadded_vocab_size) { throw std::invalid_argument("inkling2 dspark: bad anchor"); }
     const std::int32_t h = i32(c.hidden_size), kv = i32(std::size_t(c.kv_heads) * c.head_dim), q = i32(std::size_t(c.heads) * c.head_dim);
     const std::int32_t b = i32(c.block_size), r = i32(c.markov_rank), vocab = i32(text_.vocab_size), f = i32(c.intermediate_size);
+    if (n_drafts < 1 || n_drafts > b - 1) { throw std::invalid_argument("inkling2 dspark: 1 to block_size - 1 drafts"); }
     const DSparkWeights& w = model_.dspark_weights();
     workspace_.reset();
     cuda(cudaMemcpyAsync(ids_.data, &anchor, 4, cudaMemcpyHostToDevice, stream_), "anchor upload");
@@ -176,9 +205,9 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor) {
         Tensor n                    = workspace_.alloc(DType::FP32, {h, b});
         ops::rmsnorm_fp32(x, &attn_norm, c.rms_norm_eps, n, stream_);
         Tensor qt = workspace_.alloc(DType::FP32, {q, b}), kt = workspace_.alloc(DType::FP32, {kv, b}), vt = workspace_.alloc(DType::FP32, {kv, b});
-        ops::dense_projection_fp32(n, dense(model_.matrix(l.q)), nullptr, qt, stream_);
-        ops::dense_projection_fp32(n, dense(model_.matrix(l.k)), nullptr, kt, stream_);
-        ops::dense_projection_fp32(n, dense(model_.matrix(l.v)), nullptr, vt, stream_);
+        ops::dense_projection_fp32(n, matrix(model_.matrix(l.q)), nullptr, qt, stream_);
+        ops::dense_projection_fp32(n, matrix(model_.matrix(l.k)), nullptr, kt, stream_);
+        ops::dense_projection_fp32(n, matrix(model_.matrix(l.v)), nullptr, vt, stream_);
         ops::head_rmsnorm_rope_fp32(qt, i32(c.head_dim), model_.tensor(l.q_norm, {i32(c.head_dim)}), c.rms_norm_eps, true, position_,
                                     c.rope_theta, stream_);
         ops::head_rmsnorm_rope_fp32(kt, i32(c.head_dim), model_.tensor(l.k_norm, {i32(c.head_dim)}), c.rms_norm_eps, true, position_,
@@ -187,23 +216,24 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor) {
         const ops::DSparkAttentionShape shape{i32(c.heads), i32(c.kv_heads), i32(c.head_dim), c.local[i] ? i32(c.sliding_window) : 0};
         ops::dspark_block_attention_fp32(qt, layers_[i].k_ring, layers_[i].v_ring, kt, vt, position_, shape, attn, stream_);
         Tensor o = workspace_.alloc(DType::FP32, {h, b});
-        ops::dense_projection_fp32(attn, dense(model_.matrix(l.output)), nullptr, o, stream_);
+        ops::dense_projection_fp32(attn, matrix(model_.matrix(l.output)), nullptr, o, stream_);
         ops::add_fp32(x, o, x, stream_);
         const Tensor ffn_norm = model_.tensor(l.ffn_norm, {h});
         ops::rmsnorm_fp32(x, &ffn_norm, c.rms_norm_eps, n, stream_);
         Tensor g = workspace_.alloc(DType::FP32, {f, b}), u = workspace_.alloc(DType::FP32, {f, b});
-        ops::dense_projection_fp32(n, dense(model_.matrix(l.gate)), nullptr, g, stream_);
-        ops::dense_projection_fp32(n, dense(model_.matrix(l.up)), nullptr, u, stream_);
+        ops::dense_projection_fp32(n, matrix(model_.matrix(l.gate)), nullptr, g, stream_);
+        ops::dense_projection_fp32(n, matrix(model_.matrix(l.up)), nullptr, u, stream_);
         ops::silu_mul_fp32(g, u, g, stream_);
-        ops::dense_projection_fp32(g, dense(model_.matrix(l.down)), nullptr, o, stream_);
+        ops::dense_projection_fp32(g, matrix(model_.matrix(l.down)), nullptr, o, stream_);
         ops::add_fp32(x, o, x, stream_);
     }
     const Tensor out_norm = model_.tensor(w.output_norm, {h});
     ops::rmsnorm_fp32(x, &out_norm, c.rms_norm_eps, x, stream_);
-    // The base logits through the text head, as the target computes its own (BF16 activations, FP32 sums).
-    Tensor xb = workspace_.alloc(DType::BF16, {h, b});
-    ops::cast_fp32_to_bf16(x, xb, stream_);
-    Tensor base = workspace_.alloc(DType::FP32, {vocab, b});
+    // The base logits of the drafted columns 1 .. n through the text head, as the target computes its own (BF16
+    // activations, FP32 sums); column i of `base` is block position i + 1.
+    Tensor xb = workspace_.alloc(DType::BF16, {h, n_drafts});
+    ops::cast_fp32_to_bf16(x.slice(1, 1, n_drafts), xb, stream_);
+    Tensor base = workspace_.alloc(DType::FP32, {vocab, n_drafts});
     {
         const Tensor head      = model_.tensor(model_.weights().head, {h, vocab});
         const Tensor* heads[] = {&head};
@@ -218,23 +248,65 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor) {
     const Tensor joint_bias = model_.tensor(w.joint_bias, {3 * r});
     const Tensor joint_in   = joint_in_.reshape({i32(joint_in_.numel()), 1});
     Tensor joint_out        = joint.reshape({3 * r, 1});
-    for (std::int32_t i = 1; i < b; ++i) {
+    for (std::int32_t i = 1; i <= n_drafts; ++i) {
         ops::embedding_bf16_fp32(ids_.slice(0, i - 1, 1), w1, prev_row, stream_);
         cuda(cudaMemcpyAsync(static_cast<float*>(joint_in_.data) + 2 * r, static_cast<const float*>(x.data) + std::size_t(i) * h,
                              std::size_t(h) * 4, cudaMemcpyDeviceToDevice, stream_),
              "x_i");
-        ops::dense_projection_fp32(joint_in, dense(model_.matrix(w.joint)), &joint_bias, joint_out, stream_);
+        ops::dense_projection_fp32(joint_in, matrix(model_.matrix(w.joint)), &joint_bias, joint_out, stream_);
         ops::dspark_markov_update_fp32(joint, state, latent, stream_);
-        Tensor logits = base.slice(1, i, 1).reshape({vocab});
+        Tensor logits = base.slice(1, i - 1, 1).reshape({vocab});
         ops::dspark_markov_logits_fp32(logits, hb_, pt_, latent, c.final_logit_softcap, logits, stream_);
         Tensor next = ids_.slice(0, i, 1);
         ops::argmax_fp32(logits.reshape({vocab, 1}), i32(text_.unpadded_vocab_size), next, stream_);
     }
-    std::vector<std::int32_t> drafts(b - 1);
+    std::vector<std::int32_t> drafts(static_cast<std::size_t>(n_drafts));
     cuda(cudaMemcpyAsync(drafts.data(), static_cast<const std::int32_t*>(ids_.data) + 1, drafts.size() * 4, cudaMemcpyDeviceToHost, stream_),
          "drafts");
     cuda(cudaStreamSynchronize(stream_), "draft");
     return drafts;
+}
+
+std::size_t DSparkProgram::snapshot_bytes() const {
+    std::size_t total = joint_in_.bytes();
+    for (std::size_t i = 0; i < layers_.size(); ++i) {
+        if (config_.local[i]) { total += layers_[i].k_ring.bytes() + layers_[i].v_ring.bytes(); }
+    }
+    return total;
+}
+
+void DSparkProgram::save(Snapshot& snapshot) const {
+    if (snapshot.memory.bytes < snapshot_bytes()) { throw std::invalid_argument("dspark: the snapshot is too small"); }
+    auto* out = static_cast<std::byte*>(snapshot.memory.p);
+    CopyBatch copies(stream_);
+    copies.add(out, joint_in_.data, joint_in_.bytes());
+    out += joint_in_.bytes();
+    for (std::size_t i = 0; i < layers_.size(); ++i) {
+        if (!config_.local[i]) { continue; }
+        for (const Tensor* t : {&layers_[i].k_ring, &layers_[i].v_ring}) {
+            copies.add(out, t->data, t->bytes());
+            out += t->bytes();
+        }
+    }
+    copies.flush();
+    snapshot.position = position_;
+}
+
+void DSparkProgram::restore(const Snapshot& snapshot) {
+    if (snapshot.position < 0) { throw std::invalid_argument("dspark: an empty snapshot"); }
+    const auto* in = static_cast<const std::byte*>(snapshot.memory.p);
+    CopyBatch copies(stream_);
+    copies.add(joint_in_.data, in, joint_in_.bytes());
+    in += joint_in_.bytes();
+    for (std::size_t i = 0; i < layers_.size(); ++i) {
+        if (!config_.local[i]) { continue; }
+        for (const Tensor* t : {&layers_[i].k_ring, &layers_[i].v_ring}) {
+            copies.add(t->data, in, t->bytes());
+            in += t->bytes();
+        }
+    }
+    copies.flush();
+    position_ = snapshot.position;
 }
 
 } // namespace ninfer::models::inkling2

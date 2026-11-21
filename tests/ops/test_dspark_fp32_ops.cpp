@@ -121,8 +121,9 @@ Matrix make_matrix(bool q8, int n, int k) {
     return m;
 }
 
-void test_projection(bool q8, int n, int k, int cols, bool bias, double tol) {
-    const std::string label = std::string("dense_projection_fp32 ") + (q8 ? "Q8_0" : "BF16") + " [" + std::to_string(n) + ", " +
+// split: the Q8_0 blocks through split_q8_0 into the Q8_G32_FP16 form first (same values, so the same oracle).
+void test_projection(bool q8, int n, int k, int cols, bool bias, double tol, bool split = false) {
+    const std::string label = std::string("dense_projection_fp32 ") + (split ? "split Q8_0" : q8 ? "Q8_0" : "BF16") + " [" + std::to_string(n) + ", " +
                               std::to_string(k) + "] T " + std::to_string(cols) + (bias ? " + bias" : "");
     const Matrix m = make_matrix(q8, n, k);
     // x as a strided view: columns k + 32 floats apart.
@@ -133,8 +134,14 @@ void test_projection(bool q8, int n, int k, int cols, bool bias, double tol) {
     Buf dx(x), db(b), out(static_cast<std::size_t>(n) * cols * 4);
     Tensor tx = dx.tensor({stride, cols}).slice(0, 0, k);
     Tensor tb = db.tensor({n}), to = out.tensor({n, cols});
-    ninfer::ops::dense_projection_fp32(tx, {dw.p, q8 ? ninfer::QType::GGML_Q8_0 : ninfer::QType::BF16, n, k}, bias ? &tb : nullptr, to,
-                                      nullptr);
+    ninfer::DeviceBuffer values(split ? static_cast<std::size_t>(n) * k : 1), scales(split ? static_cast<std::size_t>(n) * k / 32 * 2 : 1);
+    if (split) {
+        ninfer::ops::split_q8_0(dw.p, n, k, values.p, scales.p, nullptr);
+        ninfer::ops::dense_projection_fp32(tx, {values.p, ninfer::QType::Q8_G32_FP16, n, k, scales.p}, bias ? &tb : nullptr, to, nullptr);
+    } else {
+        ninfer::ops::dense_projection_fp32(tx, {dw.p, q8 ? ninfer::QType::GGML_Q8_0 : ninfer::QType::BF16, n, k}, bias ? &tb : nullptr, to,
+                                          nullptr);
+    }
     Vec want(static_cast<std::size_t>(n) * cols), magnitude(want.size());
     for (int c = 0; c < cols; ++c) {
         for (int r = 0; r < n; ++r) {
@@ -330,6 +337,18 @@ void test_argmax() {
     }
     std::printf("argmax_fp32 got %d %d %d %d, want %d %d %d %d\n", got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
     check(got == want && want[0] == 17 && want[2] == 123456 && want[3] == 0, "argmax_fp32");
+    // No finite maximum: every value NaN (column 0), or an infinite one (column 1); column 2 is ordinary.
+    for (int i = 0; i < rows; ++i) { x[i] = std::numeric_limits<float>::quiet_NaN(); }
+    x[rows + 9] = std::numeric_limits<float>::infinity();
+    Buf dy(x);
+    Tensor ty = dy.tensor({rows, cols});
+    ninfer::ops::argmax_fp32(ty, valid, to, nullptr, -1);
+    const auto flagged = t::from_device<std::int32_t>(out.b, cols);
+    ninfer::ops::argmax_fp32(ty, valid, to, nullptr);
+    const auto defaulted = t::from_device<std::int32_t>(out.b, cols);
+    std::printf("argmax_fp32 non-finite: got %d %d %d, default %d %d\n", flagged[0], flagged[1], flagged[2], defaulted[0], defaulted[1]);
+    check(flagged[0] == -1 && flagged[1] == -1 && flagged[2] == 123456 && defaulted[0] == 0 && defaulted[1] == 0,
+          "argmax_fp32 reports a column with no finite maximum");
 }
 
 } // namespace
@@ -341,6 +360,10 @@ int main() {
         test_projection(true, 1000, 64, 3, true, 1e-7); // rows not a multiple of the block's 8
         test_projection(false, 768, 5120, 1, true, 1e-7);
         test_projection(false, 2304, 256, 20, true, 1e-7); // 3 column tiles
+        test_projection(true, 3072, 2304, 8, false, 1e-7, true);
+        test_projection(true, 2304, 9216, 8, false, 1e-7, true);
+        test_projection(true, 1000, 128, 3, true, 1e-7, true);  // rows not a multiple of the block's 32
+        test_projection(true, 768, 5120, 20, true, 1e-7, true); // 3 column tiles
         test_head_norm_rope();
         test_silu();
         test_fuse_taps();

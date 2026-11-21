@@ -13,13 +13,29 @@
 
 namespace ninfer::ops {
 
-/// A resident matrix of `rows` rows of `cols` values: GGML Q8_0 blocks (cols a multiple of 32; block j of row n
-/// at data + (n * cols / 32 + j) * 34: an FP16 scale, then 32 int8 values) or BF16 words, rows in C order.
+/// A resident matrix of `rows` rows of `cols` values, rows in C order, as one of:
+/// - GGML_Q8_0: ggml's blocks (cols a multiple of 32; block j of row n at data + (n * cols / 32 + j) * 34: an FP16
+///   scale, then 32 int8 values);
+/// - Q8_G32_FP16: the same values split (cols a multiple of 128): int8 [rows, cols] at data, 16-byte aligned, and
+///   the FP16 scale of each 32 at scales [rows, cols / 32] (split_q8_0 makes it from GGML_Q8_0);
+/// - BF16 words.
 struct DenseMatrix {
-    const void* data  = nullptr;
-    QType format      = QType::BF16;
-    std::int32_t rows = 0, cols = 0;
+    const void* data   = nullptr;
+    QType format       = QType::BF16;
+    std::int32_t rows  = 0, cols = 0;
+    const void* scales = nullptr; // Q8_G32_FP16 only
 };
+
+/**
+ * Op: split_q8_0 (a layout change; every value is kept)
+ *
+ *   values[n, k] = q of block (n, k / 32) at k % 32,  scales[n, j] = d of block (n, j)
+ *
+ * blocks GGML_Q8_0 [rows, cols] (cols a multiple of 128), values int8 [rows, cols] and scales FP16 [rows, cols / 32]
+ * device memory, 16-byte aligned. dense_projection_fp32 over the split matrix gives the same values as over the
+ * blocks; its Q8_G32_FP16 kernel reads 4 values a lane in one load.
+ */
+void split_q8_0(const void* blocks, std::int32_t rows, std::int32_t cols, void* values, void* scales, cudaStream_t stream);
 
 /**
  * Op: dense_projection_fp32
@@ -28,7 +44,7 @@ struct DenseMatrix {
  *
  * x FP32 [K, T] (columns at any stride, ne[0] contiguous), W [N, K] as above, bias FP32 [N] or null, out FP32
  * [N, T] contiguous; 1 <= T. Every weight is exact in FP32 (an FP16 scale times an int8 is), the sums are FP32
- * (oracle FP64). out must not overlap x or bias.
+ * (oracle FP64). out must not overlap x or bias. W may also be Q8_G32_FP16 (see DenseMatrix).
  */
 void dense_projection_fp32(const Tensor& x, const DenseMatrix& w, const Tensor* bias, Tensor& out, cudaStream_t stream);
 
@@ -100,10 +116,12 @@ void dspark_markov_logits_fp32(const Tensor& base, const Tensor& hb, const Tenso
                                Tensor& logits, cudaStream_t stream);
 
 /**
- * Op: argmax_fp32: out[t] = the lowest v < valid_rows with logits[v, t] maximal (NaN never wins over a number).
+ * Op: argmax_fp32: out[t] = the lowest v < valid_rows with logits[v, t] maximal (NaN never wins over a number), or
+ * `non_finite` when that maximum is not finite (every value NaN, or the maximum infinite): a diverged forward, which
+ * a sampler refuses (kSamplerNonFiniteToken) and a drafter may just draft a token from.
  *
  * logits FP32 [rows, T] (columns at any stride), out I32 [T]. Exact.
  */
-void argmax_fp32(const Tensor& logits, std::int32_t valid_rows, Tensor& out, cudaStream_t stream);
+void argmax_fp32(const Tensor& logits, std::int32_t valid_rows, Tensor& out, cudaStream_t stream, std::int32_t non_finite = 0);
 
 } // namespace ninfer::ops
