@@ -111,6 +111,13 @@ void options_refusals() {
     EngineOptions reserve = valid();
     reserve.context_cache.host_pause_reserve_bytes = 1;
     check(names(refusal([&] { (void)plan_dsv4_options(reserve); }), "host context cache"), "host cache sizing options are refused");
+    EngineOptions direct = valid();
+    direct.flash_next.cpu_verify_workers = 12;
+    direct.flash_next.mtp_width_cost     = 0.5;
+    direct.flash_next.prefill_cpu_max_columns = 16;
+    direct.flash_next.mtp_fixed_drafts   = true;
+    const std::string direct_message = refusal([&] { (void)plan_dsv4_options(direct); });
+    check(names(direct_message, "--mtp-*") && names(direct_message, "CPU-miss"), "values set through the API without the CLI's presence bits are refused");
     EngineOptions flash = valid();
     flash.flash_next.hc_int8 = true;
     flash.flash_next.ngram_keepalive_ms_set = true;

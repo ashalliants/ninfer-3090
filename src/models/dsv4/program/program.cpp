@@ -218,12 +218,9 @@ TokenId Program::sample_next(runtime::TokenMaskProvider* masks, bool& constraint
         return 0;
     }
     if (token < 0) {
-        // Nothing licensed: a grammar dead end (without a mask every logit was -infinity: a fault).
-        if (mask.empty()) {
-            numerical_failure = true;
-        } else {
-            constraint_failed = true;
-        }
+        // Nothing licensed. The grammar's own dead-end bit (already in constraint_failed) says the mask left no
+        // legal token; otherwise a legal token existed and every licensed logit was -infinity: a numerical fault.
+        if (!constraint_failed) { numerical_failure = true; }
         return 0;
     }
     return token;

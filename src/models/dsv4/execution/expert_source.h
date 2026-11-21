@@ -99,6 +99,10 @@ public:
     // Forgets every cached record (a cold cache again).
     void clear_cache();
     [[nodiscard]] std::uint32_t cache_slots() const noexcept { return slots_; }
+    // Device bytes this source holds: the record staging ring, the no-frame table and the record address table.
+    [[nodiscard]] std::uint64_t device_bytes() const noexcept {
+        return staging_.bytes + static_cast<std::uint64_t>(experts_) * (sizeof(std::int32_t) + sizeof(void*));
+    }
 
 private:
     struct Slot {

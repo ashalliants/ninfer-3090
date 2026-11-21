@@ -102,13 +102,18 @@ inline Dsv4Plan plan_dsv4_options(const EngineOptions& options) {
     note(next.ram_headroom_bytes_set || next.ram_headroom_bytes != unset.ram_headroom_bytes, "--ram-headroom-mib");
     note(next.allow_unlocked_host_memory, "--allow-unlocked-host-memory");
     note(next.partial_ram_residency, "--partial-ram-residency");
-    note(next.mtp_constrained || next.mtp_joint_acceptance || next.mtp_rows_verify || next.mtp_staged_drafts, "the --mtp-* options");
+    note(next.mtp_constrained || next.mtp_joint_acceptance || next.mtp_rows_verify || next.mtp_staged_drafts || next.mtp_fixed_drafts ||
+             next.mtp_width_cost != unset.mtp_width_cost,
+         "the --mtp-* options");
+    note(next.kv_base_tokens != unset.kv_base_tokens, "--kv-base-tokens");
     note(next.ngram_prefetch || next.ngram_ram_bytes != 0 || next.ngram_flag_wait, "the --ngram-* options");
     note(next.shared_expert_stream, "--shared-expert-stream");
     note(next.hot_embedding_rows != 0, "--hot-embedding-rows");
     note(next.gdn_head_map, "--gdn-head-map");
     note(next.moe_precast_input || next.moe_gate_up_registers || next.moe_fused_route, "the --moe-* options");
-    note(next.cpu_verify_misses || next.cpu_verify_workers_set || next.prefill_cpu_share.num != 0 || next.prefill_cpu_max_columns_set ||
+    note(next.cpu_verify_misses || next.cpu_verify_workers_set || next.cpu_verify_workers != unset.cpu_verify_workers ||
+             next.prefill_cpu_share.num != 0 || next.prefill_cpu_share.den != unset.prefill_cpu_share.den ||
+             next.prefill_cpu_max_columns_set || next.prefill_cpu_max_columns != unset.prefill_cpu_max_columns ||
              next.prefill_cpu_all_columns != 0,
          "the CPU-miss options (--cpu-verify-misses, --prefill-cpu-*)");
     note(next.gdn_async_commit || next.hc_int8 || next.hc_fused_read || next.ggml_decode_mma, "--gdn-async-commit, --hc-int8, --hc-fused-read, --ggml-decode-mma");

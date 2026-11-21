@@ -118,7 +118,7 @@ ConstructedDsv4 construct_dsv4(const EngineOptions& options, DeviceContext& devi
     resolution.main_page_groups      = instance->program->memory_summary().kv_capacity_page_groups;
     resolution.maximum_main_page_groups = resolution.main_page_groups;
     resolution.resolved_tokens       = options.max_context;
-    resolution.runtime_reservation_bytes = instance->forward->device_bytes();
+    resolution.runtime_reservation_bytes = instance->forward->device_bytes() + instance->experts->device_bytes();
     resolution.available_after_weights_bytes = after_weights;
     resolution.available_after_startup_bytes = device_free();
     resolution.planned_slack_bytes = after_weights > resolution.runtime_reservation_bytes ? after_weights - resolution.runtime_reservation_bytes : 0;
