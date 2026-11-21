@@ -152,6 +152,54 @@ void run(int k, std::vector<int> rows, int columns, std::uint32_t seed) {
     for (auto* p : dd) { cudaFree(p); }
 }
 
+// T past one launch's 65535 * 8 columns: the columns either side of the split match a one-column call bit for bit
+// and the FP64 dot product within the FP32 bound.
+void run_wide() {
+    const int k = 32, rows = 5, columns = 65535 * 8 + 3;
+    std::mt19937 rng(6);
+    std::normal_distribution<float> normal(0.0F, 1.0F);
+    std::vector<std::uint16_t> w(static_cast<std::size_t>(k) * rows), x(static_cast<std::size_t>(k) * columns);
+    for (auto& v : w) { v = f32_to_bf16(normal(rng) * 0.05F); }
+    for (auto& v : x) { v = f32_to_bf16(normal(rng)); }
+    auto* dw = device(w);
+    std::int8_t* values = nullptr;
+    __half* scales      = nullptr;
+    cudaMalloc(&values, w.size());
+    cudaMalloc(&scales, w.size() / 32 * 2);
+    ninfer::ops::quantize_q8_g32(Tensor(dw, DType::BF16, {k, rows}), values, scales, nullptr);
+    const auto e = encode(w, k, rows);
+    const ninfer::ops::Q8Weight q8{values, scales, k, rows};
+    auto* dx    = device(x);
+    float* dout = nullptr;
+    cudaMalloc(&dout, static_cast<std::size_t>(rows) * columns * 4);
+    Tensor tx(dx, DType::BF16, {k, columns}), tout(dout, DType::FP32, {rows, columns});
+    ninfer::ops::projection_q8_fp32(tx, std::span(&q8, 1), tout, nullptr);
+    const auto out = host(dout, static_cast<std::size_t>(rows) * columns);
+    bool same = true;
+    double worst = 0.0;
+    float* single = nullptr;
+    cudaMalloc(&single, static_cast<std::size_t>(rows) * 4);
+    for (const int t : {0, 65535 * 8 - 1, 65535 * 8, columns - 1}) {
+        Tensor one(dx + static_cast<std::size_t>(t) * k, DType::BF16, {k, 1}), to(single, DType::FP32, {rows, 1});
+        ninfer::ops::projection_q8_fp32(one, std::span(&q8, 1), to, nullptr);
+        const auto got = host(single, static_cast<std::size_t>(rows));
+        same = same && std::memcmp(got.data(), out.data() + static_cast<std::size_t>(t) * rows, got.size() * 4) == 0;
+        for (int n = 0; n < rows; ++n) {
+            double exact = 0.0, bound = 0.0;
+            for (int i = 0; i < k; ++i) {
+                const double p = e.w[static_cast<std::size_t>(n) * k + i] * bf16_to_f32(x[static_cast<std::size_t>(t) * k + i]);
+                exact += p, bound += std::fabs(p);
+            }
+            bound = bound * k * std::ldexp(1.0, -24) + 1e-30;
+            worst = std::max(worst, std::fabs(out[static_cast<std::size_t>(t) * rows + n] - exact) / bound);
+        }
+    }
+    check(same && worst <= 1.0, "projection_q8_fp32 past one launch's columns (T " + std::to_string(columns) + ")");
+    std::cout << "projection_q8_fp32 T " << columns << " (two launches): the split's columns are a single call's bits, worst error "
+              << worst << " of the bound\n";
+    cudaFree(dw), cudaFree(values), cudaFree(scales), cudaFree(dx), cudaFree(dout), cudaFree(single);
+}
+
 // NINFER_Q8_BENCH: T = 1 timings of Inkling-2's decode shapes (BF16 projection_fp32 against projection_q8_fp32).
 void bench() {
     const int shapes[][2] = {{2304, 6562}, {2304, 2048}, {2304, 1024}, {3072, 2304}, {2304, 201024}};
@@ -200,6 +248,7 @@ int main() {
         run(3072, {70}, 8, 3);
         run(2304, {29, 40}, 19, 4); // past one CTA's 8 columns
         run(32, {5}, 2, 5);
+        run_wide();
         // Refusals.
         bool refused = false;
         try {

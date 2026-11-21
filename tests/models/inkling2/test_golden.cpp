@@ -35,6 +35,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -145,11 +146,15 @@ int main() {
         // NINFER_INKLING2_DENSE=head|all runs the main and eager programs over the 8-bit dense re-encoding of the head
         // or of every dense projection (the KLDs below are then those of the lossy form against llama.cpp's BF16).
         const std::string dense_env = std::getenv("NINFER_INKLING2_DENSE") ? std::getenv("NINFER_INKLING2_DENSE") : "";
-        const ink::DenseForm dense = dense_env == "all" ? ink::DenseForm::Q8All : dense_env == "head" ? ink::DenseForm::Q8Head : ink::DenseForm::BF16;
+        std::unique_ptr<ink::DenseWeightsQ8> dense_q8;
+        if (dense_env == "all" || dense_env == "head") {
+            dense_q8 = std::make_unique<ink::DenseWeightsQ8>(*model, dense_env == "all" ? ink::DenseForm::Q8All : ink::DenseForm::Q8Head, stream);
+        }
+        const ink::DenseWeightsQ8* dense = dense_q8.get();
         ink::ProgramLimits main_limits{4096, 64};
         main_limits.dense = dense;
         ink::TextProgram program(*model, main_limits, stream);
-        if (dense != ink::DenseForm::BF16) { std::printf("dense projections: 8-bit re-encoding (%s)\n", dense_env.c_str()); }
+        if (dense != nullptr) { std::printf("dense projections: 8-bit re-encoding (%s)\n", dense_env.c_str()); }
 
         // NINFER_INKLING2_DENSE_KLD=<file of token ids>: the 8-bit dense forms against the BF16 one over that text,
         // teacher-forced in chunks of 256: KLD(BF16 || Q8) per position and the argmax agreement.
@@ -161,7 +166,9 @@ int main() {
             const auto n = static_cast<std::int32_t>(text_ids.size());
             ink::ProgramLimits limits{n + kChunk, kChunk};
             ink::TextProgram exact(*model, limits, stream);
-            limits.dense = dense == ink::DenseForm::BF16 ? ink::DenseForm::Q8All : dense;
+            std::unique_ptr<ink::DenseWeightsQ8> all;
+            if (dense == nullptr) { all = std::make_unique<ink::DenseWeightsQ8>(*model, ink::DenseForm::Q8All, stream); }
+            limits.dense = dense != nullptr ? dense : all.get();
             ink::TextProgram eight(*model, limits, stream);
             std::vector<double> klds;
             int agree = 0;
@@ -181,7 +188,7 @@ int main() {
             for (double k : klds) { mean += k; }
             mean /= static_cast<double>(klds.size());
             std::printf("dense Q8 (%s) vs BF16 over %d tokens: KLD mean %.3e median %.3e p99 %.3e max %.3e; argmax agrees %d/%d (%.2f%%)\n",
-                        limits.dense == ink::DenseForm::Q8All ? "all" : "head", n, mean, sorted[sorted.size() / 2], sorted[sorted.size() * 99 / 100], sorted.back(), agree, n, 100.0 * agree / n);
+                        limits.dense->form() == ink::DenseForm::Q8All ? "all" : "head", n, mean, sorted[sorted.size() / 2], sorted[sorted.size() * 99 / 100], sorted.back(), agree, n, 100.0 * agree / n);
         }
 
         std::vector<std::int32_t> first_prompt;

@@ -9,6 +9,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "models/inkling2/model.h"
+#include "models/inkling2/program/dense_q8.h"
 #include "ninfer/ops/projection_fp32.h"
 
 #include <cuda_runtime.h>
@@ -17,14 +18,9 @@
 #include <functional>
 #include <span>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace ninfer::models::inkling2 {
-
-// BF16: the artifact's weights. Q8Head: the LM head re-encoded (about 0.5 GB less read per token). Q8All: the head
-// and every attention projection (q, rel, gate, sink, k, v, the dynamic-tap projections and the output).
-enum class DenseForm : std::uint8_t { BF16, Q8Head, Q8All };
 
 struct ProgramLimits {
     std::int32_t max_context = 8192; // positions a sequence may reach (sizes the global KV rings)
@@ -37,9 +33,9 @@ struct ProgramLimits {
     std::vector<std::uint32_t> tap_visits;
     // A forward of 2..max_rollback tokens can be cut back afterwards by keep() (speculative verification).
     std::int32_t max_rollback = 0;
-    // Opt-in, lossy: which BF16 dense projections run over an 8-bit re-encoding made at construction
-    // (ops::quantize_q8_g32: Q8_0's values, 8.5 bits a weight), at every width.
-    DenseForm dense = DenseForm::BF16;
+    // Opt-in, lossy: the 8-bit re-encodings (DenseWeightsQ8) the dense projections that have one run over, at every width;
+    // null: the artifact's BF16 weights. Not owned: it must outlive the Program.
+    const DenseWeightsQ8* dense = nullptr;
 };
 
 // Columns [column, column + values.ne[1]) of a forward that take `values` as their input in place of their tokens'
@@ -70,10 +66,6 @@ public:
     // Tap i of the last forward: FP32 [hidden, T] on the device, valid until the next forward. Refused when that
     // forward ran with the taps off.
     [[nodiscard]] Tensor tap(std::size_t i) const;
-    // With ProgramLimits::dense: the text head's 8-bit re-encoding (the drafter's base logits read it too), or null.
-    [[nodiscard]] const ops::Q8Weight* q8_head() const;
-    // The device bytes the dense re-encodings hold, beside the artifact's weights (0 with DenseForm::BF16).
-    [[nodiscard]] std::size_t dense_q8_bytes() const noexcept;
     // Whether forwards copy the taps (on by default): a request that never drafts turns them off and saves the copies.
     void set_taps(bool on) noexcept { taps_on_ = on; }
 
@@ -120,12 +112,6 @@ private:
     // With rollback saving on: x (a convolution's input [C, T]) after the saved history.
     void save_input(Tensor& saved, const Tensor& x);
     void copy_tap(std::uint32_t visit, const Tensor& value);
-
-    // dense: the re-encoded weights by their BF16 data.
-    void encode_q8(WeightId id, std::int32_t k, std::int32_t rows);
-    static std::size_t q8_bytes(std::int32_t k, std::int32_t rows) noexcept; // one re-encoding's allocation
-    std::vector<DeviceBuffer> q8_memory_;
-    std::unordered_map<const void*, ops::Q8Weight> q8_;
 
     const Model& model_;
     const TextConfig& config_;

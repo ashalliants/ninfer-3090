@@ -176,19 +176,25 @@ void projection_q8_fp32(const Tensor& x, std::span<const Q8Weight> weights, Tens
     require(out.data != nullptr && out.dtype == DType::FP32 && out.is_contiguous() && out.ne[0] == segments.rows && out.ne[1] == columns &&
                 out.ne[2] == 1 && out.ne[3] == 1,
             "out must be contiguous FP32 [sum N, T]");
-    const std::size_t staged = static_cast<std::size_t>(std::min(kColumns, columns)) * k * sizeof(bf16);
     // Eight warps a CTA, one row a warp: measured best on the V100 at every Inkling-2 shape (more rows a warp
     // staged x fewer times but ran slower; a persistent, prefetching form gained nothing).
     constexpr int threads = 256, rows_per_cta = threads / 32;
-    const dim3 grid((segments.rows + rows_per_cta - 1) / rows_per_cta, (columns + kColumns - 1) / kColumns);
-    require(grid.y <= 65535, "too many columns");
-    auto* kernel = columns == 1   ? projection_q8_kernel<1, 1, threads>
-                   : columns <= 2 ? projection_q8_kernel<2, 1, threads>
-                   : columns <= 4 ? projection_q8_kernel<4, 1, threads>
-                                  : projection_q8_kernel<kColumns, 1, threads>;
-    kernel<<<grid, threads, staged, stream>>>(static_cast<const bf16*>(x.data), k, columns, segments, static_cast<float*>(out.data));
-    const cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) { throw std::runtime_error(std::string("projection_q8_fp32: ") + cudaGetErrorString(error)); }
+    // Grid y walks the columns kColumns at a time; past its 65535 the columns go in further launches, each over
+    // whole columns of x and out (a column's bits do not depend on its position, so the split changes none).
+    constexpr int kLaunchColumns = 65535 * kColumns;
+    for (int first = 0; first < columns; first += kLaunchColumns) {
+        const int n              = std::min(kLaunchColumns, columns - first);
+        const std::size_t staged = static_cast<std::size_t>(std::min(kColumns, n)) * k * sizeof(bf16);
+        const dim3 grid((segments.rows + rows_per_cta - 1) / rows_per_cta, (n + kColumns - 1) / kColumns);
+        auto* kernel = n == 1   ? projection_q8_kernel<1, 1, threads>
+                       : n <= 2 ? projection_q8_kernel<2, 1, threads>
+                       : n <= 4 ? projection_q8_kernel<4, 1, threads>
+                                : projection_q8_kernel<kColumns, 1, threads>;
+        kernel<<<grid, threads, staged, stream>>>(static_cast<const bf16*>(x.data) + static_cast<std::size_t>(first) * k, k, n, segments,
+                                                  static_cast<float*>(out.data) + static_cast<std::size_t>(first) * segments.rows);
+        const cudaError_t error = cudaGetLastError();
+        if (error != cudaSuccess) { throw std::runtime_error(std::string("projection_q8_fp32: ") + cudaGetErrorString(error)); }
+    }
 }
 
 } // namespace ninfer::ops

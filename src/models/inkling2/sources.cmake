@@ -6,6 +6,7 @@ target_sources(ninfer_model_loading PRIVATE
 )
 target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/frontend/frontend.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/dense_q8.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/dspark_program.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/text_program.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/vision_program.cpp"

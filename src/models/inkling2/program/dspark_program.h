@@ -23,8 +23,9 @@ namespace ninfer::models::inkling2 {
 class DSparkProgram {
 public:
     // max_context sizes the global layer's ring; max_chunk is the most positions one extend() takes. head_q8, when
-    // the target runs its head over an 8-bit re-encoding (TextProgram::q8_head), is read in place of the BF16 head
-    // so the drafts are proposed from the logits the target verifies them with; it must outlive the drafter.
+    // the target runs its head over an 8-bit re-encoding (DenseWeightsQ8::head, a view of the owner both Programs read), is
+    // read in place of the BF16 head so the drafts are proposed from the logits the target verifies them with; its
+    // owner must outlive the drafter.
     DSparkProgram(const Model& model, std::int32_t max_context, std::int32_t max_chunk, cudaStream_t stream,
                   const ops::Q8Weight* head_q8 = nullptr);
     DSparkProgram(const DSparkProgram&)            = delete;
