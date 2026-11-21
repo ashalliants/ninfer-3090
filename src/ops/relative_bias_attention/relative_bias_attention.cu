@@ -1,0 +1,218 @@
+// Written for NInfer-3090. The contract is include/ninfer/ops/relative_bias_attention.h.
+
+#include "ninfer/ops/relative_bias_attention.h"
+
+#include <cmath>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+
+namespace ninfer::ops {
+namespace {
+
+constexpr int kHeadDim = 128;
+constexpr int kMaxRel  = 32;
+constexpr int kWarps   = 4;
+constexpr int kThreads = kWarps * 32;
+constexpr int kTile    = 1024;
+
+void require(bool condition, const char* op, const char* message) {
+    if (!condition) { throw std::invalid_argument(std::string(op) + ": " + message); }
+}
+
+void check_launch(const char* op) {
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) { throw std::runtime_error(std::string(op) + ": launch failed: " + cudaGetErrorString(error)); }
+}
+
+std::int64_t column_stride(const Tensor& t, std::int32_t rows, std::int32_t cols, const char* op, const char* name) {
+    require(t.data != nullptr && t.dtype == DType::FP32, op, (std::string(name) + " must be FP32").c_str());
+    require(t.ne[0] == rows && t.ne[1] == cols && t.ne[2] == 1 && t.ne[3] == 1, op, (std::string(name) + " has the wrong shape").c_str());
+    require(t.nb[0] == 4 && t.nb[1] % 4 == 0 && (cols == 1 || t.nb[1] >= rows * 4), op, (std::string(name) + ": bad layout").c_str());
+    return cols == 1 ? rows : t.nb[1] / 4;
+}
+
+__device__ float warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) { v += __shfl_xor_sync(0xffffffffU, v, o); }
+    return v;
+}
+
+// One warp per (head, column).
+__global__ void clip_kernel(float* x, std::int64_t xs, int head_dim, int heads, const float* __restrict__ scale, float threshold,
+                            std::int64_t start, std::int64_t floor, float alpha, bool log_scale) {
+    const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
+    float* v = x + t * xs + static_cast<std::int64_t>(h) * head_dim;
+    float local[8];
+    float ss = 0.0F;
+    for (int i = 0; i < 8; ++i) {
+        const int d = lane + 32 * i;
+        local[i] = 0.0F;
+        if (d < head_dim) {
+            local[i] = v[d] * (scale != nullptr ? scale[static_cast<std::int64_t>(h) * head_dim + d] : 1.0F);
+            ss = fmaf(local[i], local[i], ss);
+        }
+    }
+    float f = fminf(1.0F, threshold / (sqrtf(warp_sum(ss)) + 1e-6F));
+    if (log_scale) {
+        const double pos = static_cast<double>(start + t);
+        f *= static_cast<float>(1.0 + alpha * log(fmax(1.0, (pos + 1.0) / static_cast<double>(floor))));
+    }
+    for (int i = 0; i < 8; ++i) {
+        const int d = lane + 32 * i;
+        if (d < head_dim) { v[d] = local[i] * f; }
+    }
+}
+
+__global__ void unit_rms_kernel(float* x, std::int64_t xs, int head_dim, float eps) {
+    const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
+    float* v = x + t * xs + static_cast<std::int64_t>(h) * head_dim;
+    float ss = 0.0F;
+    for (int d = lane; d < head_dim; d += 32) { ss = fmaf(v[d], v[d], ss); }
+    const float inv = rsqrtf(warp_sum(ss) / static_cast<float>(head_dim) + eps);
+    for (int d = lane; d < head_dim; d += 32) { v[d] *= inv; }
+}
+
+__global__ void append_kernel(const float* __restrict__ src, std::int64_t ss, int rows, std::int64_t start, std::int64_t capacity,
+                              float* __restrict__ cache) {
+    const int t = blockIdx.y, d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= rows) { return; }
+    cache[((start + t) % capacity) * rows + d] = src[t * ss + d];
+}
+
+struct AttentionArgs {
+    const float *q, *r, *sink, *table, *k, *v;
+    std::int64_t qs, rs, ss, os;
+    float* out;
+    int heads, group, d_rel, extent, window;
+    std::int64_t start, capacity, kv_width;
+};
+
+// One block per (head, column): four warps score a tile of keys into shared memory, then every thread folds
+// the tile into its output dimension with the online-softmax rescale.
+__global__ void __launch_bounds__(kThreads) attention_kernel(AttentionArgs a) {
+    __shared__ float q[kHeadDim];
+    __shared__ float r[kMaxRel];
+    __shared__ float scores[kTile];
+    const int h = blockIdx.x, t = blockIdx.y, g = h / a.group;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    q[threadIdx.x] = a.q[t * a.qs + static_cast<std::int64_t>(h) * kHeadDim + threadIdx.x];
+    if (threadIdx.x < a.d_rel) { r[threadIdx.x] = a.r[t * a.rs + static_cast<std::int64_t>(h) * a.d_rel + threadIdx.x]; }
+    __syncthreads();
+    const std::int64_t pos = a.start + t;
+    const std::int64_t lo  = a.window > 0 ? (pos - a.window + 1 > 0 ? pos - a.window + 1 : 0) : 0;
+    const float inv_sqrt_d = rsqrtf(static_cast<float>(kHeadDim));
+    float m     = a.sink[t * a.ss + h];
+    float denom = 1.0F; // e^{sink - m}
+    float acc   = 0.0F;
+    const std::int64_t col = static_cast<std::int64_t>(g) * kHeadDim + threadIdx.x;
+    for (std::int64_t base = lo; base <= pos; base += kTile) {
+        const int n = static_cast<int>(pos - base + 1 < kTile ? pos - base + 1 : kTile);
+        for (int i = warp; i < n; i += kWarps) {
+            const std::int64_t j = base + i, slot = j % a.capacity;
+            const float* key = a.k + slot * a.kv_width + static_cast<std::int64_t>(g) * kHeadDim;
+            float dot = 0.0F;
+            for (int d = lane; d < kHeadDim; d += 32) { dot = fmaf(q[d], key[d], dot); }
+            dot = warp_sum(dot) * inv_sqrt_d;
+            const std::int64_t dist = pos - j;
+            float bias = 0.0F;
+            if (dist < a.extent && lane < a.d_rel) { bias = r[lane] * a.table[dist * a.d_rel + lane]; }
+            bias = warp_sum(bias);
+            if (lane == 0) { scores[i] = dot + bias; }
+        }
+        __syncthreads();
+        float top = m;
+        for (int i = 0; i < n; ++i) { top = fmaxf(top, scores[i]); }
+        const float rescale = expf(m - top);
+        denom *= rescale;
+        acc *= rescale;
+        for (int i = 0; i < n; ++i) {
+            const float e = expf(scores[i] - top);
+            denom += e;
+            acc = fmaf(e, a.v[((base + i) % a.capacity) * a.kv_width + col], acc);
+        }
+        m = top;
+        __syncthreads();
+    }
+    a.out[t * a.os + static_cast<std::int64_t>(h) * kHeadDim + threadIdx.x] = acc / denom;
+}
+
+} // namespace
+
+void head_l2_clip_fp32(Tensor& x, int head_dim, const Tensor* scale, float threshold, const PositionLogScale* log_scale,
+                       cudaStream_t stream) {
+    const char* op = "head_l2_clip_fp32";
+    require(head_dim > 0 && head_dim <= 256 && x.ne[0] % head_dim == 0, op, "rows must be whole heads of at most 256");
+    const int heads = x.ne[0] / head_dim;
+    const std::int64_t xs = column_stride(x, x.ne[0], x.ne[1], op, "x");
+    if (scale != nullptr) {
+        require(scale->dtype == DType::FP32 && scale->is_contiguous() && scale->numel() == x.ne[0], op, "scale must be FP32 [d, heads]");
+    }
+    require(threshold > 0.0F, op, "threshold must be positive");
+    if (log_scale != nullptr) { require(log_scale->floor > 0 && log_scale->start >= 0, op, "invalid log scale"); }
+    const dim3 grid(heads, x.ne[1]);
+    clip_kernel<<<grid, 32, 0, stream>>>(static_cast<float*>(x.data), xs, head_dim, heads,
+                                         scale != nullptr ? static_cast<const float*>(scale->data) : nullptr, threshold,
+                                         log_scale != nullptr ? log_scale->start : 0, log_scale != nullptr ? log_scale->floor : 1,
+                                         log_scale != nullptr ? log_scale->alpha : 0.0F, log_scale != nullptr);
+    check_launch(op);
+}
+
+void head_unit_rms_fp32(Tensor& x, int head_dim, float eps, cudaStream_t stream) {
+    const char* op = "head_unit_rms_fp32";
+    require(head_dim > 0 && head_dim <= 256 && x.ne[0] % head_dim == 0, op, "rows must be whole heads of at most 256");
+    require(eps > 0.0F, op, "eps must be positive");
+    const std::int64_t xs = column_stride(x, x.ne[0], x.ne[1], op, "x");
+    const dim3 grid(x.ne[0] / head_dim, x.ne[1]);
+    unit_rms_kernel<<<grid, 32, 0, stream>>>(static_cast<float*>(x.data), xs, head_dim, eps);
+    check_launch(op);
+}
+
+void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Tensor& q, const Tensor& r, const Tensor& sink,
+                                  const Tensor& k_new, const Tensor& v_new, const Tensor& table, Tensor& k_cache, Tensor& v_cache,
+                                  std::int64_t start, Tensor& out, cudaStream_t stream) {
+    const char* op = "relative_bias_sink_attention";
+    require(s.head_dim == kHeadDim, op, "head_dim must be 128");
+    require(s.d_rel > 0 && s.d_rel <= kMaxRel, op, "d_rel must be 1..32");
+    require(s.heads > 0 && s.kv_heads > 0 && s.heads % s.kv_heads == 0, op, "heads must be a multiple of kv_heads");
+    require(s.window >= 0 && start >= 0, op, "negative window or start");
+    const std::int32_t cols = q.ne[1];
+    const std::int32_t width = s.heads * kHeadDim, kv_width = s.kv_heads * kHeadDim;
+    AttentionArgs a{};
+    a.qs = column_stride(q, width, cols, op, "q");
+    a.rs = column_stride(r, s.heads * s.d_rel, cols, op, "r");
+    a.ss = column_stride(sink, s.heads, cols, op, "sink");
+    a.os = column_stride(out, width, cols, op, "out");
+    const std::int64_t ks = column_stride(k_new, kv_width, cols, op, "k_new"), vs = column_stride(v_new, kv_width, cols, op, "v_new");
+    require(table.dtype == DType::FP32 && table.is_contiguous() && table.ne[0] == s.d_rel && table.ne[1] > 0, op,
+            "table must be contiguous FP32 [d_rel, E]");
+    require(k_cache.dtype == DType::FP32 && v_cache.dtype == DType::FP32 && k_cache.is_contiguous() && v_cache.is_contiguous() &&
+                k_cache.ne[0] == kv_width && v_cache.ne[0] == kv_width && k_cache.ne[1] == v_cache.ne[1],
+            op, "caches must be contiguous FP32 [kv_heads * d, capacity]");
+    const std::int64_t capacity = k_cache.ne[1];
+    require(s.window > 0 ? capacity >= s.window - 1 + cols : capacity >= start + cols, op, "the KV ring cannot hold the visible keys");
+    const dim3 append_grid((kv_width + 255) / 256, cols);
+    append_kernel<<<append_grid, 256, 0, stream>>>(static_cast<const float*>(k_new.data), ks, kv_width, start, capacity,
+                                                   static_cast<float*>(k_cache.data));
+    append_kernel<<<append_grid, 256, 0, stream>>>(static_cast<const float*>(v_new.data), vs, kv_width, start, capacity,
+                                                   static_cast<float*>(v_cache.data));
+    check_launch(op);
+    a.q = static_cast<const float*>(q.data);
+    a.r = static_cast<const float*>(r.data);
+    a.sink = static_cast<const float*>(sink.data);
+    a.table = static_cast<const float*>(table.data);
+    a.k = static_cast<const float*>(k_cache.data);
+    a.v = static_cast<const float*>(v_cache.data);
+    a.out = static_cast<float*>(out.data);
+    a.heads = s.heads;
+    a.group = s.heads / s.kv_heads;
+    a.d_rel = s.d_rel;
+    a.extent = table.ne[1];
+    a.window = s.window;
+    a.start = start;
+    a.capacity = capacity;
+    a.kv_width = kv_width;
+    attention_kernel<<<dim3(s.heads, cols), kThreads, 0, stream>>>(a);
+    check_launch(op);
+}
+
+} // namespace ninfer::ops

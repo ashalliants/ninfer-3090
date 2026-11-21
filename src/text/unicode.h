@@ -55,5 +55,8 @@ bool is_whitespace(std::int32_t codepoint) noexcept;
 // Unicode general categories P* (punctuation) and S* (symbol): the regex classes \p{P} and \p{S}.
 bool is_punctuation(std::int32_t codepoint) noexcept;
 bool is_symbol(std::int32_t codepoint) noexcept;
+// The cased letter categories: Lu or Lt (\p{Lu}, \p{Lt}) and Ll (\p{Ll}). A letter that is neither is Lm or Lo.
+bool is_upper_or_title_letter(std::int32_t codepoint) noexcept;
+bool is_lower_letter(std::int32_t codepoint) noexcept;
 
 } // namespace ninfer::text::unicode_internal

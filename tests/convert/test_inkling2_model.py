@@ -191,3 +191,34 @@ def test_the_public_cli_converts_an_inkling2_gguf(gguf_path, tmp_path):
     with pytest.raises(ValueError, match="takes none of"):
         main(["--model", str(gguf_path), "--recipe", "inkling2_gguf", "--device", "cpu", "--mmproj", str(gguf_path),
               "--out", str(tmp_path / "x.ninfer")])
+
+
+def test_the_reference_reads_the_same_weights_from_the_artifact(gguf_path, tmp_path):
+    """tools/inkling2/artifact_weights.py gives the NumPy reference every value the GGUF loader gives it (NVFP4
+    records, BF16 banks, loop controllers, the shared tensors), so the reference computes the same on either. (The
+    fixture's Q8_0 blocks are random bytes, some with NaN scales, so a forward pass on it is not finite; the values
+    are compared instead, NaN where the GGUF has NaN.)"""
+    from tools.inkling2 import artifact_weights, gguf_weights
+
+    out = tmp_path / "tiny.ninfer"
+    _convert(GgufModel(gguf_path), out)
+    from_gguf, config = gguf_weights.load(gguf_path)
+    from_artifact, artifact_config = artifact_weights.load(out)
+    assert artifact_config == config
+    for p, (a, b) in enumerate(zip(from_artifact["layers"], from_gguf["layers"])):
+        assert set(a.names) == set(b.names), p
+        for key in b.names:
+            if key in ("gate_up", "down"):
+                for e in range(fixture.EXPERTS):
+                    np.testing.assert_array_equal(a[key][e], b[key][e], err_msg=f"{p} {key} {e}")
+            elif key == "loop":
+                for m, weights in b["loop"].items():
+                    for x, y in zip(a["loop"][m], weights):
+                        np.testing.assert_array_equal(x, y)
+            else:
+                np.testing.assert_array_equal(a[key], b[key], err_msg=f"{p} {key}")
+    tokens = np.arange(fixture.VOCAB)
+    np.testing.assert_array_equal(from_artifact["embed"][tokens], from_gguf["embed"][tokens])
+    assert set(from_artifact) == set(from_gguf)
+    for key in set(from_gguf) - {"embed", "layers"}:
+        np.testing.assert_array_equal(from_artifact[key], from_gguf[key], err_msg=key)

@@ -1,7 +1,10 @@
 # Inkling-2-Mini (`inkling2`, looped) model
 
-Status: **design and phase-1 tooling only**. Nothing in the engine runs this model yet. This page is
-the mathematical authority for the work, plus the GGUF mapping, reuse map and V100 plan. The
+Status: **text MVP, correctness first**. `src/models/inkling2` runs the text model on the GPU with
+naive FP32 kernels and matches the llama.cpp golden ("Engine (text MVP, correctness first)" and
+"Validation" below); it is not yet wired into the Engine or `ninfer-serve`, and has no chat template,
+sampling, vision or DSpark. This page is the mathematical authority for the work, plus the GGUF
+mapping, reuse map and V100 plan. The
 converter's config and tensor map are `tools/convert/inkling2.py`, the NumPy reference is
 `tools/inkling2/reference.py`, and the C++ op oracles are `tests/ops/inkling2_reference.h`.
 
@@ -245,6 +248,31 @@ third pass's block entering physical 12, and the third pass's output pushed at p
 There is no recurrent state other than the convolutions, so Snapshot/Replay works like the
 Qwen3.5 GDN conv state, only smaller.
 
+## Engine (text MVP, correctness first)
+
+`src/models/inkling2` binds a converted artifact (`inkling2_gguf` recipe, UD-Q8_K_XL) and runs the
+48-visit schedule for one sequence. It is the correctness baseline the V100 kernels of phase 4 are
+measured against, not a serving route: there is no Engine/serve integration, chat template, sampling
+or DSpark yet.
+
+| Piece | Where | What it does now |
+|---|---|---|
+| Config, binding | `config.{h,cpp}`, `model.h`, `load.cpp` | `inkling2_text` config, every parameter by name, all device resident (22.9 GB, 8.6 s on the V100) |
+| Program | `program/text_program.{h,cpp}` | `TextProgram::forward(tokens)`: the visit order, loop restarts and messages of "Forward, in order", any chunk size up to `max_chunk` (256), positions up to `max_context` (8192); optional per-visit trace hook with llama.cpp's names |
+| Dense projections | `ops/projection_fp32.h` | BF16 activations x BF16 weights, FP32 out; the head too |
+| Element-wise and norms | `ops/fp32_rows.h` | FP32 RMSNorm (weighted or unit), add, sigmoid gate, tanh softcap, BF16 embedding gather |
+| MIX, CTRL | `ops/depth_attention.h` | depth attention over at most 8 sources and 4 queries; the controller's combine `(1 - tanh f) c + tanh(g) m` (D, G, F are `projection_fp32`) |
+| Short convolutions | `ops/short_conv.h` | static and per-head dynamic taps, FP32 history per visit and stream |
+| Attention | `ops/relative_bias_attention.h` | per-head L2 clips and log scale, V unit norm, relative-bias sink attention over an FP32 KV ring per visit (local capacity window - 1 + max_chunk, global max_context) |
+| MoE | `ops/moe_situ.h` | sigmoid top-8 route with bias steering; SITU experts from `ggml_rec_nvfp4_nvfp4` records (layers 0-19) or the BF16 banks (20-23), with the per-expert multipliers |
+| Tokenizer | `qwen3_5/frontend/tokenizer.{h,cpp}` `Pipeline::Inkling2` | the word regex as a hand-written matcher, no normalizer, BPE with `ignore_merges` |
+
+All Ops are naive FP32 kernels qualified against `tests/ops/inkling2_reference.h`. The KV rings are
+FP32 (8 KiB per token per global visit, twice the FP16 figure above); the KV codec is phase 4.
+Q8_0 experts (UD-Q4_K_XL) are not bound yet. Decode on the V100 runs at 20.6 tokens/s
+(2026-11-20, 15 greedy steps at contexts 6 to 20), against a weight-streaming floor of about 155 tokens/s
+(5.78 GB per token at the nominal 900 GB/s): phase 4 starts from there.
+
 ## DSpark drafter ([Ld], `dspark-Inkling-2-Mini-Q8_0.gguf`, `general.architecture = dflash`)
 
 Three dense layers (H 2304, 24/8 heads of 128, SiLU MLP of 9216). Each layer has query and key norms
@@ -414,7 +442,7 @@ Sizes are rough engineer-days for a person or agent who knows the codebase, incl
 | 0 (done) | this spec; header fixtures of three GGUFs and the drafter; converter config, visit schedule and tensor map (`tools/convert/inkling2.py`); NumPy reference with the GGML NVFP4 decoder and checkpoint repack (`tools/inkling2/reference.py`); C++ FP64 op oracles (`tests/ops/inkling2_reference.h`, checked by the host-only `ninfer_inkling2_reference_test`); the tokenizer contract, checked token by token against the GGUF (`tools/convert/inkling2_tokenizer.py`). **Not** in this phase: the `ggml_nvfp4` artifact format and the converter (phase 2), any engine code | -- |
 | 1. Golden (done) | CPU llama.cpp (Unsloth SHA above) on UD-Q8_K_XL: logits and per-visit activations for four prompts; the NumPy reference on the real weights against them (see "Validation") | -- |
 | 2. Converter | `inkling2_gguf` recipe writes the artifact: C++ format registry for `ggml_nvfp4` and the new records, per-expert scales, padded vocab, tokenizer and chat resources. Reader test on the real file | 2-3 |
-| 3. Text MVP, correctness first | Model, config and binding. Program with the 48-visit schedule. New Ops with naive FP32 kernels qualified against the oracles: rel-bias sink attention (decode and prefill), conv streams, MIX, CTRL, clips, sigmoid router, resident NVFP4/Q8_0/BF16 MoE. Linear problem registrations. Tokenizer matcher. Greedy text equals the golden | 8-12 |
+| 3. Text MVP, correctness first (done, see "Engine") | Model, config and binding. Program with the 48-visit schedule. New Ops with naive FP32 kernels qualified against the oracles: rel-bias sink attention (decode and prefill), conv streams, MIX, CTRL, clips, sigmoid router, resident NVFP4/Q8_0/BF16 MoE. Linear problem registrations. Tokenizer matcher. Greedy text equals the golden. Done except Q8_0 experts and the Linear registrations (the MVP uses `projection_fp32`), which move to phase 4 | 8-12 |
 | 4. V100 decode performance | Fused decode kernels (MIX, CTRL, conv and norms), expert GEMV for NVFP4 via dp4a, global attention on FP16 KV, CUDA Graph per decode width; measure against the bandwidth floor | 5-8 |
 | 5. Prefill | cuBLAS HMMA for the dense and expert GEMMs (dequantize tiles to FP16), flash prefill with the relative bias and sink (extend the vendored `fattn` like [L]'s banded op) | 4-6 |
 | 6. DSpark | Drafter binding, tap capture at visits 5/23/41/48, Markov chain with the precomputed `W_head Wo`, verify widths 2..8 | 4-6 |
@@ -456,7 +484,9 @@ The MVP (phases 1-3) is about 2.5 weeks. Everything after it is optional orderin
    gives bit-identical logits. `tests/fixtures/inkling2/llama_golden_topk.json` keeps the top 20
    logits of four prompts on UD-Q8_K_XL (`unsloth/Inkling-2-Mini-GGUF@29eac40c`), for the engine.
 3. `tools/inkling2/compare_golden.py` runs the NumPy reference on the real weights (decoded lazily
-   by `tools/inkling2/gguf_weights.py`) against that golden. Result on UD-Q8_K_XL, 2026-11-20:
+   by `tools/inkling2/gguf_weights.py` from the GGUF, or by `tools/inkling2/artifact_weights.py`
+   from the converted artifact, which holds the same bytes) against that golden. Result on
+   UD-Q8_K_XL, 2026-11-20:
 
    | Prompt | Tokens | Per-visit relative error (all 48 visits) | Logit KLD per position | Top-1 |
    |---|---|---|---|---|
@@ -470,7 +500,57 @@ The MVP (phases 1-3) is about 2.5 weeks. Everything after it is optional orderin
    included. This shows the spec transcribes [L] faithfully. It does not resolve A1: both are still
    one source's reading of the loop. The outputs are sensible (" Paris"; a French continuation;
    `<|content_thinking|>` opening a chat answer), which is the evidence available that [L] is right.
-4. Each new Op qualified against its oracle on the real shapes (op-development.md).
-5. Engine greedy text and perplexity against the golden. The acceptance bar is KLD at most
-   0.002 against llama.cpp on the same GGUF, measured on prompts without near-tied routing, and
-   the same top-1 token at every position of the golden prompts.
+4. Each new Op qualified against its oracle on the real shapes (op-development.md):
+   `ninfer_inkling2_fp32_ops_test` (`tests/ops/test_inkling2_fp32_ops.cpp`) runs every entry of the
+   five families above against the FP64 oracles of `tests/ops/inkling2_reference.h` at H 2304,
+   24/8 heads of 128, d_rel 16, 128 experts of 1152, top 8, with the stateful ones (convolution
+   history, KV ring) over several calls, a ring that wraps and single-token decode steps. On the
+   V100 the largest error is 2.0e-7 of `1 + |ref|` (bound 2e-6), and 6.7e-7 of the output's
+   largest magnitude for the NVFP4 and BF16 experts (bound 1e-5).
+5. Engine against the golden: `ninfer_inkling2_golden_test` (`tests/models/inkling2/test_golden.cpp`,
+   with `NINFER_TEST_INKLING2_ARTIFACT` and `NINFER_INKLING2_GOLDEN`). The acceptance bar is KLD
+   at most 0.002 against llama.cpp on the same GGUF, measured on prompts without near-tied
+   routing, and the same top-1 token at every position of the golden prompts. Result on the
+   V100, 2026-11-20:
+
+   | Prompt | Tokens | Per-visit relative error, worst | KLD mean / max | Top-1 |
+   |---|---|---|---|---|
+   | p0 "The capital of France is" | 5 | 5.5e-2 | 3.4e-4 / 8.2e-4 | 5/5 |
+   | p1 Python docstring | 20 | 7.2e-2 | 1.8e-4 / 1.5e-3 | 20/20 |
+   | p2 chat turn | 13 | 8.8e-2 | 5.7e-3 / **2.1e-2** | 13/13 |
+   | p3 French | 20 | 6.4e-2 | 4.8e-4 / 2.4e-3 | 20/20 |
+
+   Chunks of 3 give the whole run's logits bit for bit. Greedy from p0: " Paris.\n\nA. Noun
+   clause\n\nB. Adjective clause".
+
+   p2 is above the bar, and p1 and p3 at their worst position too. Whether that is llama.cpp's
+   rounding or an engine error was settled without a new golden, by comparing the engine with the
+   FP64 reference directly: the test's `NINFER_INKLING2_DUMP` writes the engine's logits, traces
+   and chosen experts per visit (`route_ids-v`), and `compare_golden.py --routes` makes the
+   reference use those experts. On p2:
+
+   | Comparison | KLD max | Per-visit relative error, worst | result_norm |
+   |---|---|---|---|
+   | engine vs llama.cpp | 2.1e-2 | 8.8e-2 | 7.6e-2 |
+   | FP64 reference vs llama.cpp (as item 3) | 2.6e-2 | 6.7e-2 | 6.1e-2 |
+   | FP64 reference with the engine's experts vs llama.cpp | 2.1e-2 | 8.9e-2 | 7.6e-2 |
+   | engine vs FP64 reference, each routing itself | 1.1e-2 | 5.9e-2 | 4.8e-2 |
+   | **engine vs FP64 reference, same experts** | **3.4e-5** | **4.3e-3** | **2.3e-3** |
+
+   With the same experts the engine is the FP64 reference to FP32 and BF16-activation rounding,
+   loop included; the whole gap is expert selection at near-tied router scores, where each of the
+   three implementations' rounding picks differently. The same holds on every prompt: with
+   the engine's experts the FP64 reference is within KLD 2.6e-6 (p0), 3.8e-6 (p1), 3.4e-5 (p2) and
+   9.6e-6 (p3) of the engine at every position, every visit within 1e-2 relative (4.7e-3 except
+   one attention output of p0, visit 21, at 9.7e-3) and `result_norm` within 2.3e-3. So the engine has no
+   error the golden can show, and the 0.002 bar cannot be met on these prompts by any of the three
+   against another: it needs prompts without near ties, or a statistic over many tokens
+   (perplexity) rather than a per-position maximum.
+
+   Where the engine and the FP64 reference part ways (`compare_golden.py` with an engine golden
+   reports every (visit, token) whose expert set differs, with the reference's margin of its 8th
+   over its 9th steered score): p0 11 of 240 decisions, p1 91 of 960, p2 42 of 624, p3 5 of 960.
+   The first difference in visit order, the seed of the rest, is at a margin of 7.9e-6 (p0, visit
+   3), 1.4e-4 (p1, visit 1), 1.8e-4 (p2, visit 12) and 5.5e-4 (p3, visit 34): within what FP32
+   accumulation and BF16 activations move a router score. Later differences also follow from earlier
+   ones, through attention and the convolutions.
