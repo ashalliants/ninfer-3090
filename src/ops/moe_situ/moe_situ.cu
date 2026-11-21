@@ -4,6 +4,8 @@
 
 #include <cuda_bf16.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -534,6 +536,7 @@ down_kernel(BankArgs b, const std::int32_t* __restrict__ ids, const float* __res
 
 constexpr int kGroupTokens      = 4;  // entries staged together (their activations share the weight decode)
 constexpr int kGroupPlanes      = 2;  // row planes a warp takes (they share the activation loads)
+constexpr std::size_t kGroupMaxShared = 96 * 1024; // the most dynamic shared memory a block may have on sm_70
 constexpr int kGroupMinEntries  = 64; // fewer entries take the per-entry kernels (the same bits either way)
 
 // One warp: counts[e] and offsets[e] (exclusive scan) of the entries per expert, and order[], the entries sorted by
@@ -882,9 +885,16 @@ void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor&
     const dim3 gate_grid(entries, (bank.intermediate + gate_per_block - 1) / gate_per_block);
     const dim3 down_grid(entries, (bank.hidden + down_per_block - 1) / down_per_block);
     const auto* zp = static_cast<const float*>(z.data);
-    // (Whole planes: I and H multiples of the grouped kernels' rows per warp.)
+    // The grouped kernels need whole planes (I and H multiples of their rows per warp) and their staged
+    // activations within the shared memory a block may have; otherwise every entry runs alone.
     const bool whole_planes = !b.nvfp4 || (bank.intermediate % (kGroupPlanes * kGateRows) == 0 && bank.hidden % (kGroupPlanes * kDownRows) == 0);
-    if (entries >= kGroupMinEntries && bank.experts <= kMaxExperts && whole_planes) {
+    const std::size_t planes = (kGroupPlanes - 1) * kWarps * kStageWords * sizeof(std::uint32_t);
+    const std::size_t group_gate_shared = b.nvfp4 ? staged(bank.hidden, kGroupTokens) + planes
+                                                  : static_cast<std::size_t>(kGroupTokens) * bank.hidden * 4;
+    const std::size_t group_down_shared = b.nvfp4 ? staged(bank.intermediate, kGroupTokens) + planes
+                                                  : static_cast<std::size_t>(kGroupTokens) * bank.intermediate * 4;
+    const bool group_fits = std::max(group_gate_shared, group_down_shared) <= kGroupMaxShared;
+    if (entries >= kGroupMinEntries && bank.experts <= kMaxExperts && whole_planes && group_fits) {
         // Group the entries by expert, then run each expert's rows over its entries.
         int* counts  = static_cast<int*>(workspace.alloc_bytes(static_cast<std::size_t>(2 * bank.experts + entries) * 4).data);
         int* offsets = counts + bank.experts;
@@ -892,10 +902,10 @@ void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor&
         group_kernel<<<1, 32, 0, stream>>>(id, entries, bank.experts, counts, offsets, order);
         check_launch(op);
         if (!b.nvfp4) {
-            const std::size_t gs = static_cast<std::size_t>(kGroupTokens) * bank.hidden * 4, ds = static_cast<std::size_t>(kGroupTokens) * bank.intermediate * 4;
+            const std::size_t gs = group_gate_shared, ds = group_down_shared;
             static const bool bf16_configured =
-                cudaFuncSetAttribute(gate_up_grouped_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024) == cudaSuccess &&
-                cudaFuncSetAttribute(down_grouped_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024) == cudaSuccess;
+                cudaFuncSetAttribute(gate_up_grouped_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kGroupMaxShared)) == cudaSuccess &&
+                cudaFuncSetAttribute(down_grouped_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kGroupMaxShared)) == cudaSuccess;
             require(bf16_configured, op, "the grouped kernels' shared memory could not be configured");
             gate_up_grouped_bf16_kernel<<<dim3((bank.intermediate + kWarps * kBf16Rows - 1) / (kWarps * kBf16Rows), bank.experts), kThreads,
                                           gs, stream>>>(
@@ -911,14 +921,13 @@ void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor&
         }
         const int gate_rows = kWarps * kGroupPlanes * kGateRows, down_rows = kWarps * kGroupPlanes * kDownRows;
         const dim3 gg((bank.intermediate + gate_rows - 1) / gate_rows, bank.experts), dg((bank.hidden + down_rows - 1) / down_rows, bank.experts);
-        const std::size_t planes = (kGroupPlanes - 1) * kWarps * kStageWords * sizeof(std::uint32_t);
-        const std::size_t gs = staged(bank.hidden, kGroupTokens) + planes, ds = staged(bank.intermediate, kGroupTokens) + planes;
+        const std::size_t gs = group_gate_shared, ds = group_down_shared;
         static const bool configured = [] {
             bool ok = true;
             for (const void* k : {reinterpret_cast<const void*>(gate_up_grouped_kernel<1>), reinterpret_cast<const void*>(gate_up_grouped_kernel<2>),
                                   reinterpret_cast<const void*>(gate_up_grouped_kernel<4>), reinterpret_cast<const void*>(down_grouped_kernel<1>),
                                   reinterpret_cast<const void*>(down_grouped_kernel<2>), reinterpret_cast<const void*>(down_grouped_kernel<4>)}) {
-                ok = ok && cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024) == cudaSuccess;
+                ok = ok && cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kGroupMaxShared)) == cudaSuccess;
             }
             return ok;
         }();

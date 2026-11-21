@@ -848,6 +848,9 @@ int main() {
         test_experts(true, 128, 64, 8, "moe_situ_experts NVFP4 small, T 24 grouped", 24);
         test_experts(true, 2304, 1152, 16, "moe_situ_experts NVFP4 [16, 2304, 1152] T 17 grouped", 17);
         test_experts(false, 2304, 1152, 8, "moe_situ_experts BF16 [8, 2304, 1152] T 17 grouped", 17);
+        // H = 8192: the grouped kernels' staged activations exceed shared memory, so every entry runs alone.
+        test_experts(true, 8192, 128, 4, "moe_situ_experts NVFP4 [4, 8192, 128] T 17 per entry", 17);
+        test_experts(false, 8192, 128, 4, "moe_situ_experts BF16 [4, 8192, 128] T 17 per entry", 17);
         if (const char* bench = std::getenv("NINFER_INKLING2_OP_BENCH"); bench != nullptr && *bench == '1') {
             bench_experts(true);
             bench_experts(false);
