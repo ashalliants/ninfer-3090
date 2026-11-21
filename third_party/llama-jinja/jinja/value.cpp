@@ -276,6 +276,25 @@ const func_builtins& global_builtins() {
              }
              return out;
          }},
+        // dict(base, key=value, ...): a copy of the optional positional object with the keyword
+        // arguments added (DeepSeek-V4's chat template builds its messages with it).
+        {"dict",
+         [](const func_args& args) -> value {
+             auto out = mk_val<value_object>();
+             bool seen_positional = false;
+             for (const auto& arg : args.get_args()) {
+                 if (is_val<value_kwarg>(arg)) {
+                     auto kwarg = cast_val<value_kwarg>(arg);
+                     out->insert(kwarg->key, kwarg->val);
+                 } else if (!seen_positional && is_val<value_object>(arg)) {
+                     seen_positional = true;
+                     for (const auto& [key, val] : arg->as_ordered_object()) { out->insert(key, val); }
+                 } else {
+                     throw raised_exception("dict() takes at most one object and keyword arguments");
+                 }
+             }
+             return out;
+         }},
         {"strftime_now",
          [](const func_args& args) -> value {
              args.ensure_vals<value_string>();

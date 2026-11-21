@@ -39,6 +39,13 @@ int main() {
     int failures     = 0;
     const auto dense = default_sampling(Architecture::Qwen3_5);
     const auto moe   = default_sampling(Architecture::Qwen3_5Moe);
+    const auto dsv4  = default_sampling(Architecture::Dsv4);
+    // DeepSeek-V4: temperature 1, top-20 (the pipeline's candidate cap, stated), no nucleus cut or penalties.
+    if (dsv4.thinking.temperature != 1.0F || dsv4.thinking.top_k != 20 || dsv4.thinking.top_p != 1.0F ||
+        dsv4.thinking.presence_penalty != 0.0F || dsv4.non_thinking.top_k != 20 || dsv4.non_thinking.presence_penalty != 0.0F) {
+        std::cerr << "FAILED: DeepSeek-V4 sampling defaults\n";
+        return 1;
+    }
 
     const ninfer::SamplingPreset dense_thinking{
         .temperature = 1.0F, .top_k = 20, .top_p = 0.95F, .min_p = 0.0F};

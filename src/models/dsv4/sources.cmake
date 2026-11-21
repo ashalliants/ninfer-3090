@@ -11,6 +11,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/expert_source.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/ffn.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/forward.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/program.cpp"
 )
 
 # The Engram injection of layers 1 and 14: the n-gram hash, the row reader over the Engram volume
