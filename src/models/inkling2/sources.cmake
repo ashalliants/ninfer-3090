@@ -5,5 +5,6 @@ target_sources(ninfer_model_loading PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/load.cpp"
 )
 target_sources(ninfer_model_runtime PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/program/dspark_program.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/text_program.cpp"
 )

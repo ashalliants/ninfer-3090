@@ -11,11 +11,14 @@
 #include "ninfer/ops/relative_bias_attention.h"
 #include "ninfer/ops/short_conv.h"
 
+#include "core/copy_batch.h"
+
 #include <array>
 #include <cstddef>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace ninfer::models::inkling2 {
 namespace {
@@ -52,6 +55,9 @@ ProgramLimits checked(ProgramLimits limits) {
     if (limits.max_chunk < 1 || limits.max_context < limits.max_chunk) {
         throw std::invalid_argument("inkling2: invalid program limits (max_chunk positive, at most max_context)");
     }
+    if (limits.max_rollback < 0 || limits.max_rollback > limits.max_chunk) {
+        throw std::invalid_argument("inkling2: max_rollback must be in 0..max_chunk");
+    }
     return limits;
 }
 
@@ -68,6 +74,14 @@ TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t 
     for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
         capacity[v] = c.local[c.physical(v)] ? local_cap : static_cast<std::size_t>(limits.max_context);
         total += 2 * padded(kv * capacity[v] * 4) + 2 * padded(kv * taps * 4) + 2 * padded(std::size_t(c.hidden_size) * taps * 4);
+        if (limits.max_rollback > 0) {
+            const std::size_t saved = taps + static_cast<std::size_t>(limits.max_rollback);
+            total += 2 * padded(kv * saved * 4) + 2 * padded(std::size_t(c.hidden_size) * saved * 4);
+        }
+    }
+    for (const auto tap : limits.tap_visits) {
+        if (tap > c.num_layer_visits) { throw std::invalid_argument("inkling2: a tap visit past the final state"); }
+        total += padded(std::size_t(c.hidden_size) * static_cast<std::size_t>(limits.max_chunk) * 4);
     }
     state_memory_ = DeviceBuffer(total);
     auto* base = static_cast<std::byte*>(state_memory_.p);
@@ -85,8 +99,16 @@ TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t 
         s.v_hist    = carve(i32(kv), i32(taps));
         s.attn_hist = carve(i32(c.hidden_size), i32(taps));
         s.mlp_hist  = carve(i32(c.hidden_size), i32(taps));
+        if (limits.max_rollback > 0) {
+            const std::int32_t saved = i32(taps) + limits.max_rollback;
+            s.k_saved    = carve(i32(kv), saved);
+            s.v_saved    = carve(i32(kv), saved);
+            s.attn_saved = carve(i32(c.hidden_size), saved);
+            s.mlp_saved  = carve(i32(c.hidden_size), saved);
+        }
         state_.push_back(s);
     }
+    for (std::size_t i = 0; i < limits.tap_visits.size(); ++i) { taps_.push_back(carve(i32(c.hidden_size), limits.max_chunk)); }
     reset();
 }
 
@@ -100,7 +122,51 @@ void TextProgram::reset() {
             if (cudaMemsetAsync(t->data, 0, t->bytes(), stream_) != cudaSuccess) { throw std::runtime_error("inkling2: cannot clear state"); }
         }
     }
-    position_ = 0;
+    position_  = 0;
+    last_cols_ = 0;
+}
+
+Tensor TextProgram::tap(std::size_t i) const {
+    if (i >= taps_.size() || last_cols_ < 1) { throw std::out_of_range("inkling2: no such tap"); }
+    return taps_[i].slice(1, 0, last_cols_);
+}
+
+void TextProgram::copy_tap(std::uint32_t visit, const Tensor& value) {
+    for (std::size_t i = 0; i < taps_.size(); ++i) {
+        if (limits_.tap_visits[i] != visit) { continue; }
+        const std::size_t column = std::size_t(config_.hidden_size) * 4;
+        if (cudaMemcpy2DAsync(taps_[i].data, column, value.data, static_cast<std::size_t>(value.nb[1]), column, value.ne[1],
+                              cudaMemcpyDeviceToDevice, stream_) != cudaSuccess) {
+            throw std::runtime_error("inkling2: tap copy failed");
+        }
+    }
+}
+
+void TextProgram::save_input(Tensor& saved, const Tensor& x) {
+    if (!saving_) { return; }
+    const std::size_t column = static_cast<std::size_t>(x.ne[0]) * 4, taps = config_.conv_kernel_size - 1;
+    if (cudaMemcpy2DAsync(static_cast<std::byte*>(saved.data) + taps * column, column, x.data, static_cast<std::size_t>(x.nb[1]),
+                          column, x.ne[1], cudaMemcpyDeviceToDevice, stream_) != cudaSuccess) {
+        throw std::runtime_error("inkling2: cannot save a convolution input");
+    }
+}
+
+void TextProgram::keep(std::int32_t n) {
+    if (n < 1 || n > last_cols_) { throw std::invalid_argument("inkling2: keep() outside 1..the last forward's tokens"); }
+    if (n == last_cols_) { return; }
+    if (last_cols_ > limits_.max_rollback) { throw std::invalid_argument("inkling2: the last forward cannot be cut back"); }
+    // History after the first n inputs: columns n .. n + K - 2 of [old history | inputs].
+    CopyBatch copies(stream_);
+    for (auto& s : state_) {
+        for (auto [hist, saved] : {std::pair{&s.k_hist, &s.k_saved}, std::pair{&s.v_hist, &s.v_saved},
+                                   std::pair{&s.attn_hist, &s.attn_saved}, std::pair{&s.mlp_hist, &s.mlp_saved}}) {
+            const std::size_t column = static_cast<std::size_t>(hist->ne[0]) * 4;
+            copies.add(hist->data, static_cast<const std::byte*>(saved->data) + static_cast<std::size_t>(n) * column, hist->bytes());
+        }
+    }
+    copies.flush();
+    position_ -= last_cols_ - n;
+    last_cols_ = n;
 }
 
 Tensor TextProgram::project(const Tensor& x, std::span<const WeightId> weights, std::span<const std::int32_t> rows) {
@@ -218,6 +284,8 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         ops::ShortConvJob jobs[2];
         jobs[0].x = &pk, jobs[0].taps = &kt, jobs[0].history = &st.k_hist, jobs[0].out = &kconv;
         jobs[1].x = &pv, jobs[1].taps = &vt, jobs[1].history = &st.v_hist, jobs[1].out = &vconv;
+        save_input(st.k_saved, pk);
+        save_input(st.v_saved, pv);
         ops::short_conv_fp32_batch(jobs, d, stream_);
     } else {
         const WeightId kw[] = {w.k, w.k_conv_proj}, vw[] = {w.v, w.v_conv_proj};
@@ -229,6 +297,8 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         ops::ShortConvJob jobs[2];
         jobs[0].x = &kx, jobs[0].taps = &kt, jobs[0].dynamic = &kd, jobs[0].history = &st.k_hist, jobs[0].out = &kconv;
         jobs[1].x = &vx, jobs[1].taps = &vt, jobs[1].dynamic = &vd, jobs[1].history = &st.v_hist, jobs[1].out = &vconv;
+        save_input(st.k_saved, kx);
+        save_input(st.v_saved, vx);
         ops::short_conv_fp32_batch(jobs, d, stream_);
     }
 
@@ -265,6 +335,7 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         if (boundary) { blocks.push_back(cur); }
         ops::ShortConvJob job;
         job.x = &a_in, job.taps = &post_taps, job.history = &st.attn_hist;
+        save_input(st.attn_saved, a_in);
         if (boundary) {
             job.out = &ffn_inp;
         } else {
@@ -304,6 +375,7 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         const Tensor mlp_taps = model_.tensor(w.mlp_post_conv, {k, h});
         ops::ShortConvJob job;
         job.x = &y, job.taps = &mlp_taps, job.history = &st.mlp_hist, job.residual = &ffn_inp, job.sum = &next;
+        save_input(st.mlp_saved, y);
         ops::short_conv_fp32_batch(std::span<const ops::ShortConvJob>(&job, 1), 1, stream_);
     }
 
@@ -332,8 +404,29 @@ Tensor TextProgram::forward(std::span<const std::int32_t> tokens, const Trace* t
     if (cudaMemcpyAsync(ids.data, tokens.data(), tokens.size_bytes(), cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
         throw std::runtime_error("inkling2: token upload failed");
     }
-    Tensor logits = run(ids, position_, trace);
+    saving_ = cols >= 2 && cols <= limits_.max_rollback;
+    if (saving_) {
+        // Each history before the forward, ahead of the inputs save_input() appends.
+        CopyBatch copies(stream_);
+        for (auto& s : state_) {
+            for (auto [hist, saved] : {std::pair{&s.k_hist, &s.k_saved}, std::pair{&s.v_hist, &s.v_saved},
+                                       std::pair{&s.attn_hist, &s.attn_saved}, std::pair{&s.mlp_hist, &s.mlp_saved}}) {
+                copies.add(saved->data, hist->data, hist->bytes());
+            }
+        }
+        copies.flush();
+    }
+    last_cols_ = 0;
+    Tensor logits;
+    try {
+        logits = run(ids, position_, trace);
+    } catch (...) {
+        saving_ = false;
+        throw;
+    }
+    saving_ = false;
     position_ += cols;
+    last_cols_ = cols;
     return logits;
 }
 
@@ -383,6 +476,7 @@ Tensor TextProgram::forward_graph(std::int32_t token) {
     }
     if (cudaGraphLaunch(decode_graph_, stream_) != cudaSuccess) { throw std::runtime_error("inkling2: decode graph launch failed"); }
     position_ += 1;
+    last_cols_ = 1;
     return graph_logits_;
 }
 
@@ -428,6 +522,7 @@ Tensor TextProgram::run(const Tensor& ids, std::int64_t start, const Trace* trac
             ops::depth_attention_mix(sources, loop_q.slice(1, 2 * j, 2), c.rms_norm_eps, workspace_, attn_mlp, stream_);
             ops::depth_attention_mix(sources, loop_kv.slice(1, 2 * j, 2), c.rms_norm_eps, workspace_, k_v, stream_);
         }
+        copy_tap(v, cur);
         cur = visit(v, cur, blocks, has_messages ? messages.data() : nullptr, start, trace);
     }
 
@@ -443,6 +538,7 @@ Tensor TextProgram::run(const Tensor& ids, std::int64_t start, const Trace* trac
     }
     const Tensor out_norm = model_.tensor(model_.weights().output_norm, {h});
     ops::rmsnorm_fp32(x, &out_norm, c.rms_norm_eps, x, stream_);
+    copy_tap(c.num_layer_visits, x);
     if (trace != nullptr && *trace) {
         sync(stream_);
         (*trace)("result_norm", x);

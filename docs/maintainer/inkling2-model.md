@@ -252,13 +252,14 @@ Qwen3.5 GDN conv state, only smaller.
 
 `src/models/inkling2` binds a converted artifact (`inkling2_gguf` recipe, UD-Q8_K_XL) and runs the
 48-visit schedule for one sequence. It is the correctness baseline the V100 kernels of phase 4 are
-measured against, not a serving route: there is no Engine/serve integration, chat template, sampling
-or DSpark yet.
+measured against, not a serving route: there is no Engine/serve integration, chat template or sampling
+yet. The DSpark drafter runs greedy speculative decoding (see "DSpark drafter").
 
 | Piece | Where | What it does now |
 |---|---|---|
 | Config, binding | `config.{h,cpp}`, `model.h`, `load.cpp` | `inkling2_text` config, every parameter by name, all device resident (22.9 GB, 8.6 s on the V100) |
-| Program | `program/text_program.{h,cpp}` | `TextProgram::forward(tokens)`: the visit order, loop restarts and messages of "Forward, in order", any chunk size up to `max_chunk` (256), positions up to `max_context` (8192); optional per-visit trace hook with llama.cpp's names |
+| Program | `program/text_program.{h,cpp}` | `TextProgram::forward(tokens)`: the visit order, loop restarts and messages of "Forward, in order", any chunk size up to `max_chunk` (256), positions up to `max_context` (8192); optional per-visit trace hook with llama.cpp's names; optional taps (`tap_visits`) and `keep(n)`, which cuts a forward of up to `max_rollback` tokens back to its first n |
+| Drafter | `program/dspark_program.{h,cpp}`, `ops/dspark_fp32.h` | `DSparkProgram::extend(taps, n)` writes the context K/V of committed positions; `draft(anchor)` runs the block and the Markov chain (W_head W_o precomputed in FP32 at start, 0.14 s) |
 | Dense projections | `ops/projection_fp32.h` | BF16 activations x BF16 weights, FP32 out; the head too |
 | Element-wise and norms | `ops/fp32_rows.h` | FP32 RMSNorm (weighted or unit), add, sigmoid gate, tanh softcap, BF16 embedding gather |
 | MIX, CTRL | `ops/depth_attention.h` | depth attention over at most 8 sources and 4 queries; the controller's combine `(1 - tanh f) c + tanh(g) m` (D, G, F are `projection_fp32`) |
@@ -302,6 +303,20 @@ size is 8, made of one anchor plus 7 drafts. The drafter borrows the target's `t
   This chain is sequential: 7 dependent steps, each reading `W_head`. Precompute
   `W_head Wo` ([201024 x 256]) and `W_head bo` once. That is exact in real arithmetic and turns
   each step's head read from H = 2304 columns into 256.
+
+**Status (2026-11-21, V100, FP32 kernels).** `ninfer_inkling2_dspark_test` checks that greedy speculative tokens
+equal plain greedy tokens on the four golden prompts (64 tokens each), and they do. Drafts accepted per block of 7
+match CPU llama.cpp at the same revision (`llama-speculative-simple --spec-type draft-dspark`):
+
+| prompt | ninfer | llama.cpp |
+|---|---|---|
+| p0 "The capital of France is" | 15.7% | 10.1% |
+| p1 Fibonacci docstring | 48.6% | 48.1% |
+| p3 French narrative | 1.6% | 1.8% |
+
+p2 is the chat prompt (13.9% in ninfer). The two greedy paths differ slightly, so the rates do too. On these
+prompts speculative decoding is slower than plain decoding (36 against 74 tokens/s). A round accepts about one
+draft. Verifying 8 tokens costs about 3 decode steps (43 ms), and drafting takes 9 ms.
 
 ninfer's DFlash ([dflash.md](dflash.md)) already has the masked-block, non-causal, context-K/V shape
 with separate context roles. What is new: per-layer softmax tap fusion instead of one feature
@@ -445,7 +460,7 @@ Sizes are rough engineer-days for a person or agent who knows the codebase, incl
 | 3. Text MVP, correctness first (done, see "Engine") | Model, config and binding. Program with the 48-visit schedule. New Ops with naive FP32 kernels qualified against the oracles: rel-bias sink attention (decode and prefill), conv streams, MIX, CTRL, clips, sigmoid router, resident NVFP4/Q8_0/BF16 MoE. Linear problem registrations. Tokenizer matcher. Greedy text equals the golden. Done except Q8_0 experts and the Linear registrations (the MVP uses `projection_fp32`), which move to phase 4 | 8-12 |
 | 4. V100 decode performance | Fused decode kernels (MIX, CTRL, conv and norms), expert GEMV for NVFP4 via dp4a, global attention on FP16 KV, CUDA Graph per decode width; measure against the bandwidth floor | 5-8 |
 | 5. Prefill | cuBLAS HMMA for the dense and expert GEMMs (dequantize tiles to FP16), flash prefill with the relative bias and sink (extend the vendored `fattn` like [L]'s banded op) | 4-6 |
-| 6. DSpark | Drafter binding, tap capture at visits 5/23/41/48, Markov chain with the precomputed `W_head Wo`, verify widths 2..8 | 4-6 |
+| 6. DSpark (done, greedy, correctness first) | Drafter binding, tap capture at visits 5/23/41/48, Markov chain with the precomputed `W_head Wo`, verify of the full block (8) with `keep()` | 4-6 |
 | 7. Vision | mmproj conversion and the ViT | 4-6 |
 | 8. Chat/serving | template, reasoning and tool parsers, effort control | 2-3 |
 
