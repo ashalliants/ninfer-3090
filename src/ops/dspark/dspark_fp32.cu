@@ -65,17 +65,6 @@ __device__ float block_sum(float v, float* scratch) {
     return total;
 }
 
-__device__ float block_max(float v, float* scratch) {
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
-    v = warp_max(v);
-    __syncthreads();
-    if (lane == 0) { scratch[warp] = v; }
-    __syncthreads();
-    float m = scratch[0];
-    for (int w = 1; w < warps; ++w) { m = fmaxf(m, scratch[w]); }
-    return m;
-}
-
 // ----------------------------------------------------------------------------------------------- projection
 
 constexpr int kProjWarps = 8, kProjCols = 8, kProjChunk = 1024, kProjRows = 4;
@@ -299,45 +288,138 @@ __global__ void __launch_bounds__(256) fuse_taps_kernel(TapArgs a, const float* 
 
 // ------------------------------------------------------------------------------------------ attention
 
-// grid (heads, W), block 128 (one thread per head dimension), scores in dynamic shared memory.
-__global__ void __launch_bounds__(128)
-block_attention_kernel(const float* __restrict__ q, const float* __restrict__ k_ring, const float* __restrict__ v_ring, int capacity,
-                       const float* __restrict__ k_block, const float* __restrict__ v_block, std::int64_t lo, int n_ctx, int group,
-                       int kv_heads, float scale, float* __restrict__ out) {
-    extern __shared__ float scores[];
-    __shared__ float scratch[32];
-    constexpr int kD = 128;
-    const int h = blockIdx.x, t = blockIdx.y, w_cols = gridDim.y, g = h / group;
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int heads = gridDim.x, kv = kv_heads * kD;
-    const float4 qv = reinterpret_cast<const float4*>(q + (static_cast<std::int64_t>(t) * heads + h) * kD)[lane];
-    const int n = n_ctx + w_cols;
-    auto key = [&](const float* ring, const float* block, int j) {
-        if (j < n_ctx) { return ring + static_cast<std::int64_t>((lo + j) % capacity) * kv + g * kD; }
-        return block + static_cast<std::int64_t>(j - n_ctx) * kv + g * kD;
-    };
-    float m = -INFINITY;
-    for (int j = warp; j < n; j += 4) {
-        const float4 kk = reinterpret_cast<const float4*>(key(k_ring, k_block, j))[lane];
-        float s = qv.x * kk.x;
-        s       = fmaf(qv.y, kk.y, s);
-        s       = fmaf(qv.z, kk.z, s);
-        s       = fmaf(qv.w, kk.w, s);
-        s       = warp_sum(s) * scale;
-        if (lane == 0) { scores[j] = s; }
-        m = fmaxf(m, s);
+constexpr int kAttnQueries = 16, kAttnKeys = 32, kAttnStride = 129, kAttnThreads = 256, kAttnD = 128;
+
+struct BlockAttentionArgs {
+    const float* q;
+    const float *k_ring, *v_ring;
+    const float *k_block, *v_block;
+    std::int64_t lo;
+    int capacity, n_ctx, w, group, heads, kv, run_keys, splits;
+    float scale;
+    float* out;
+    float* parts; // [W, heads, splits, 2 + D] with splits > 1
+};
+
+// grid (kv_heads, query tiles, runs), 256 threads. Query i of kv head g: head g * group + i / W, column i % W. Run z
+// takes keys [z * run_keys, min(n, (z + 1) * run_keys)) of the n = n_ctx + W, 32 at a time staged in shared memory.
+__global__ void __launch_bounds__(kAttnThreads) block_attention_kernel(BlockAttentionArgs a) {
+    __shared__ float qs[kAttnQueries][kAttnStride];
+    __shared__ float ks[kAttnKeys][kAttnStride];
+    __shared__ __align__(16) float vs[kAttnKeys][kAttnD]; // read as float4
+    __shared__ float ps[kAttnQueries][kAttnKeys + 1];
+    __shared__ float row_m[kAttnQueries], row_l[kAttnQueries], row_scale[kAttnQueries];
+    const int g = blockIdx.x, q0 = blockIdx.y * kAttnQueries, z = blockIdx.z, tid = threadIdx.x;
+    const int nq = min(kAttnQueries, a.group * a.w - q0);
+    const int n = a.n_ctx + a.w;
+    const int k_first = z * a.run_keys, k_end = min(n, k_first + a.run_keys);
+    const auto head_of = [&](int i) { return g * a.group + i / a.w; };
+    const auto col_of  = [&](int i) { return i % a.w; };
+    for (int i = tid; i < kAttnQueries * kAttnD; i += kAttnThreads) {
+        const int qi = i / kAttnD, d = i % kAttnD;
+        qs[qi][d] = qi < nq ? a.q[(static_cast<std::int64_t>(col_of(q0 + qi)) * a.heads + head_of(q0 + qi)) * kAttnD + d] : 0.0F;
     }
-    m = block_max(m, scratch);
-    float sum = 0.0F;
-    for (int j = threadIdx.x; j < n; j += blockDim.x) {
-        const float e = expf(scores[j] - m);
-        scores[j]     = e;
-        sum += e;
+    if (tid < kAttnQueries) { row_m[tid] = -INFINITY, row_l[tid] = 0.0F; }
+    const int sq = tid >> 4, sj = tid & 15;        // scores: query sq, keys sj and sj + 16 of the tile
+    const int vq = tid >> 4, vd = (tid & 15) * 8;  // values: query vq, dimensions vd .. vd + 7
+    static_assert(kAttnQueries * 16 == kAttnThreads && kAttnKeys == 32, "the thread maps");
+    float acc[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { acc[i] = 0.0F; }
+    __syncthreads();
+    for (int k0 = k_first; k0 < k_end; k0 += kAttnKeys) {
+        const int nk = min(kAttnKeys, k_end - k0);
+        for (int i = tid; i < kAttnKeys * kAttnD; i += kAttnThreads) {
+            const int j = i / kAttnD, d = i % kAttnD, key = k0 + j;
+            float kv = 0.0F, vv = 0.0F;
+            if (j < nk) {
+                const std::int64_t at = key < a.n_ctx ? ((a.lo + key) % a.capacity) * a.kv : std::int64_t(key - a.n_ctx) * a.kv;
+                const float* kp = key < a.n_ctx ? a.k_ring : a.k_block;
+                const float* vp = key < a.n_ctx ? a.v_ring : a.v_block;
+                kv = kp[at + g * kAttnD + d], vv = vp[at + g * kAttnD + d];
+            }
+            ks[j][d] = kv, vs[j][d] = vv;
+        }
+        __syncthreads();
+        {
+            float dot[2] = {0.0F, 0.0F};
+            for (int d = 0; d < kAttnD; ++d) {
+                const float qv = qs[sq][d];
+#pragma unroll
+                for (int u = 0; u < 2; ++u) { dot[u] = fmaf(qv, ks[sj + 16 * u][d], dot[u]); }
+            }
+#pragma unroll
+            for (int u = 0; u < 2; ++u) { ps[sq][sj + 16 * u] = sj + 16 * u < nk ? dot[u] * a.scale : -INFINITY; }
+        }
+        __syncthreads();
+        { // online softmax: warp w takes queries 2w and 2w + 1, lane = key (every tile has a key, so the maxima are finite)
+            const int warp = tid >> 5, lane = tid & 31;
+            for (int qi = warp * 2; qi < warp * 2 + 2; ++qi) {
+                const float sv  = ps[qi][lane];
+                const float top = fmaxf(warp_max(sv), row_m[qi]);
+                const float e   = expf(sv - top);
+                const float sum = warp_sum(e);
+                ps[qi][lane] = e;
+                __syncwarp();
+                if (lane == 0) {
+                    const float rescale = expf(row_m[qi] - top);
+                    row_scale[qi] = rescale;
+                    row_l[qi]     = fmaf(row_l[qi], rescale, sum);
+                    row_m[qi]     = top;
+                }
+            }
+        }
+        __syncthreads();
+        {
+            const float rescale = row_scale[vq];
+            float part[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { part[i] = 0.0F; }
+            for (int j = 0; j < nk; ++j) {
+                const float pj = ps[vq][j];
+                const float4* v4 = reinterpret_cast<const float4*>(&vs[j][vd]);
+#pragma unroll
+                for (int m = 0; m < 2; ++m) {
+                    const float4 v = v4[m];
+                    part[4 * m]     = fmaf(pj, v.x, part[4 * m]);
+                    part[4 * m + 1] = fmaf(pj, v.y, part[4 * m + 1]);
+                    part[4 * m + 2] = fmaf(pj, v.z, part[4 * m + 2]);
+                    part[4 * m + 3] = fmaf(pj, v.w, part[4 * m + 3]);
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { acc[i] = fmaf(acc[i], rescale, part[i]); }
+        }
+        __syncthreads();
     }
-    sum = block_sum(sum, scratch); // its barriers also order the exponentials before the reads below
-    float acc = 0.0F;
-    for (int j = 0; j < n; ++j) { acc = fmaf(scores[j], key(v_ring, v_block, j)[threadIdx.x], acc); }
-    out[(static_cast<std::int64_t>(t) * heads + h) * kD + threadIdx.x] = acc / sum;
+    if (vq >= nq) { return; }
+    const std::int64_t row = static_cast<std::int64_t>(col_of(q0 + vq)) * a.heads + head_of(q0 + vq);
+    if (a.splits == 1) {
+        const float l = row_l[vq];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { a.out[row * kAttnD + vd + i] = acc[i] / l; }
+        return;
+    }
+    float* part = a.parts + (row * a.splits + z) * (kAttnD + 2);
+    if ((tid & 15) == 0) { part[0] = row_m[vq], part[1] = row_l[vq]; }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { part[2 + vd + i] = acc[i]; }
+}
+
+// grid (heads, W), 128 threads: the runs of one query in order, each weighted by e^{m_z - M} (M the largest m_z).
+__global__ void __launch_bounds__(kAttnD) block_attention_combine_kernel(BlockAttentionArgs a) {
+    const std::int64_t row = static_cast<std::int64_t>(blockIdx.y) * a.heads + blockIdx.x;
+    const float* parts = a.parts + row * a.splits * (kAttnD + 2);
+    float top = -INFINITY;
+    for (int z = 0; z < a.splits; ++z) { top = fmaxf(top, parts[z * (kAttnD + 2)]); }
+    float denom = 0.0F, acc = 0.0F;
+    for (int z = 0; z < a.splits; ++z) {
+        const float* part = parts + z * (kAttnD + 2);
+        const float w = expf(part[0] - top);
+        denom = fmaf(part[1], w, denom);
+        acc   = fmaf(part[2 + threadIdx.x], w, acc);
+    }
+    a.out[row * kAttnD + threadIdx.x] = acc / denom;
 }
 
 // --------------------------------------------------------------------------------------------- Markov
@@ -562,10 +644,15 @@ void dspark_fuse_taps_fp32(std::span<const Tensor* const> taps, const Tensor& fu
     check_launch(op);
 }
 
+std::size_t dspark_block_attention_workspace_bytes(const DSparkAttentionShape& s, int w) {
+    return static_cast<std::size_t>(std::max(w, 0)) * std::max(s.heads, 0) * kDSparkAttentionMaxSplits * (kAttnD + 2) * 4;
+}
+
 void dspark_block_attention_fp32(const Tensor& q, const Tensor& k_ring, const Tensor& v_ring, const Tensor& k_block, const Tensor& v_block,
-                                 std::int64_t anchor, const DSparkAttentionShape& s, Tensor& out, cudaStream_t stream) {
+                                 std::int64_t anchor, const DSparkAttentionShape& s, Tensor& out, const Tensor& workspace,
+                                 cudaStream_t stream) {
     constexpr const char* op = "dspark_block_attention_fp32";
-    require(s.head_dim == 128 && s.kv_heads > 0 && s.heads % s.kv_heads == 0 && s.window >= 0 && anchor >= 0, op, "bad shape");
+    require(s.head_dim == kAttnD && s.kv_heads > 0 && s.heads % s.kv_heads == 0 && s.window >= 0 && anchor >= 0, op, "bad shape");
     const Columns qc = columns(q, op, "q", true), oc = columns(out, op, "out", true);
     const Columns kr = columns(k_ring, op, "k_ring", true), vr = columns(v_ring, op, "v_ring", true);
     const Columns kb = columns(k_block, op, "k_block", true), vb = columns(v_block, op, "v_block", true);
@@ -576,16 +663,30 @@ void dspark_block_attention_fp32(const Tensor& q, const Tensor& k_ring, const Te
     const std::int64_t lo = s.window > 0 ? std::max<std::int64_t>(0, anchor - s.window) : 0;
     const std::int64_t n_ctx = anchor - lo;
     require(n_ctx <= kr.cols, op, "the visible context exceeds the ring");
-    const std::size_t smem = static_cast<std::size_t>(n_ctx + qc.cols) * 4;
-    require(smem <= 90 * 1024, op, "too many keys");
-    static const bool configured =
-        cudaFuncSetAttribute(block_attention_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 90 * 1024) == cudaSuccess;
-    require(configured, op, "could not configure shared memory");
-    block_attention_kernel<<<dim3(s.heads, qc.cols), 128, smem, stream>>>(
-        static_cast<const float*>(q.data), static_cast<const float*>(k_ring.data), static_cast<const float*>(v_ring.data), kr.cols,
-        static_cast<const float*>(k_block.data), static_cast<const float*>(v_block.data), lo, static_cast<int>(n_ctx),
-        s.heads / s.kv_heads, s.kv_heads, 1.0F / std::sqrt(static_cast<float>(s.head_dim)), static_cast<float*>(out.data));
+    require(n_ctx + qc.cols <= INT32_MAX, op, "too many keys");
+    require(workspace.data != nullptr && workspace.dtype == DType::FP32 && workspace.is_contiguous() &&
+                workspace.bytes() >= dspark_block_attention_workspace_bytes(s, static_cast<int>(qc.cols)),
+            op, "workspace must be contiguous FP32 storage of dspark_block_attention_workspace_bytes");
+    const auto n = static_cast<int>(n_ctx + qc.cols);
+    // Runs of whole tiles, as few as give every run kAttnKeys or more, at most kDSparkAttentionMaxSplits.
+    const int tiles = (n + kAttnKeys - 1) / kAttnKeys;
+    const int run_tiles = (tiles + kDSparkAttentionMaxSplits - 1) / kDSparkAttentionMaxSplits;
+    const int splits = (tiles + run_tiles - 1) / run_tiles;
+    BlockAttentionArgs a{};
+    a.q = static_cast<const float*>(q.data);
+    a.k_ring = static_cast<const float*>(k_ring.data), a.v_ring = static_cast<const float*>(v_ring.data);
+    a.k_block = static_cast<const float*>(k_block.data), a.v_block = static_cast<const float*>(v_block.data);
+    a.lo = lo, a.capacity = static_cast<int>(kr.cols), a.n_ctx = static_cast<int>(n_ctx), a.w = static_cast<int>(qc.cols);
+    a.group = s.heads / s.kv_heads, a.heads = s.heads, a.kv = kv, a.run_keys = run_tiles * kAttnKeys, a.splits = splits;
+    a.scale = 1.0F / std::sqrt(static_cast<float>(s.head_dim));
+    a.out = static_cast<float*>(out.data), a.parts = static_cast<float*>(workspace.data);
+    const int query_tiles = (a.group * a.w + kAttnQueries - 1) / kAttnQueries;
+    block_attention_kernel<<<dim3(s.kv_heads, query_tiles, splits), kAttnThreads, 0, stream>>>(a);
     check_launch(op);
+    if (splits > 1) {
+        block_attention_combine_kernel<<<dim3(s.heads, a.w), kAttnD, 0, stream>>>(a);
+        check_launch(op);
+    }
 }
 
 void dspark_markov_update_fp32(const Tensor& joint, Tensor& state, Tensor& latent, cudaStream_t stream) {
