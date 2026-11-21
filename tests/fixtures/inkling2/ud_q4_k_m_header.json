@@ -1,0 +1,6770 @@
+{
+ "repo": "unsloth/Inkling-2-Mini-GGUF",
+ "revision": "c4eb598a3f7bb5cd68652ed86e5cd884e02cdd00",
+ "metadata": {
+  "general.architecture": "inkling2",
+  "general.type": "model",
+  "general.name": "Inkling-2-Mini",
+  "general.size_label": "128x1.8B",
+  "inkling2.block_count": 48,
+  "inkling2.context_length": 1048576,
+  "inkling2.embedding_length": 2304,
+  "inkling2.feed_forward_length": 1152,
+  "inkling2.attention.head_count": [
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24,
+   24
+  ],
+  "inkling2.attention.head_count_kv": [
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8,
+   8
+  ],
+  "inkling2.attention.layer_norm_rms_epsilon": 9.999999974752427e-07,
+  "inkling2.expert_count": 128,
+  "inkling2.expert_used_count": 8,
+  "inkling2.attention.key_length": 128,
+  "inkling2.attention.value_length": 128,
+  "inkling2.num_loops": 3,
+  "inkling2.loop.core_start": 6,
+  "inkling2.loop.core_end": 18,
+  "inkling2.loop.gate_rank": 64,
+  "inkling2.vocab_size": 201024,
+  "inkling2.vocab_size_unpadded": 200058,
+  "inkling2.expert_feed_forward_length": 1152,
+  "inkling2.attention.key_length_swa": 128,
+  "inkling2.attention.value_length_swa": 128,
+  "inkling2.rope.dimension_count": 0,
+  "inkling2.attention.sliding_window": 1024,
+  "inkling2.attention.sliding_window_pattern": [
+   true,
+   true,
+   true,
+   true,
+   true,
+   false,
+   true,
+   true,
+   true,
+   true,
+   true,
+   false,
+   true,
+   true,
+   true,
+   true,
+   true,
+   false,
+   true,
+   true,
+   true,
+   true,
+   true,
+   false,
+   true,
+   true,
+   true,
+   true,
+   true,
+   false,
+   true,
+   true,
+   true,
+   true,
+   true,
+   false,
+   true,
+   true,
+   true,
+   true,
+   true,
+   false,
+   true,
+   true,
+   true,
+   true,
+   true,
+   false
+  ],
+  "inkling2.shortconv.l_cache": 4,
+  "inkling2.expert_weights_scale": 8.0,
+  "inkling2.activation.situ_beta": 4.0,
+  "inkling2.activation.situ_linear_beta": 25.0,
+  "inkling2.attn_res.block_size": 6,
+  "inkling2.final_logit_softcapping": 30.0,
+  "inkling2.attention.relative_length": 16,
+  "inkling2.attention.relative_extent": 1024,
+  "inkling2.attention.qk_clip": 22.627416610717773,
+  "inkling2.attention.relative_clip": 8.0,
+  "inkling2.attention.log_scale_floor": 8192,
+  "inkling2.attention.log_scale_alpha": 0.10000000149011612,
+  "tokenizer.ggml.model": "gpt2",
+  "tokenizer.ggml.pre": "inkling2",
+  "tokenizer.ggml.tokens": {
+   "length": 200058,
+   "head": [
+    "!",
+    "\"",
+    "#",
+    "$",
+    "%",
+    "&",
+    "'",
+    "("
+   ],
+   "tail": [
+    "<|unused_200050|>",
+    "<|unused_200051|>",
+    "<|unused_200052|>",
+    "<|unused_200053|>",
+    "<|unused_200054|>",
+    "<|unused_200055|>",
+    "<|unused_200056|>",
+    "<|content_invoke_tool_text|>"
+   ]
+  },
+  "tokenizer.ggml.token_type": {
+   "length": 200058,
+   "head": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "tail": [
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3
+   ]
+  },
+  "tokenizer.ggml.merges": {
+   "length": 424413,
+   "head": [
+    "i n",
+    "e r",
+    "t h",
+    "a n",
+    "o n",
+    "r e",
+    "e n",
+    "a t"
+   ],
+   "tail": [
+    "Ġ UB",
+    "ĠU B",
+    "Ġ NAN",
+    "ĠN AN",
+    "ĠNA N",
+    "ĠS CHO",
+    "ĠSC HO",
+    "ĠSCH O"
+   ]
+  },
+  "tokenizer.ggml.eos_token_id": 200006,
+  "tokenizer.ggml.eot_token_id": 200006,
+  "tokenizer.ggml.add_bos_token": false,
+  "tokenizer.ggml.add_eos_token": false,
+  "tokenizer.ggml.clean_spaces": false,
+  "general.quantization_version": 2,
+  "general.file_type": 15,
+  "tokenizer.chat_template": {
+   "length": 6868,
+   "sha256": "53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc"
+  },
+  "general.basename": "Inkling-2-Mini",
+  "tokenizer.ggml.padding_token_id": 199999,
+  "general.sampling.temp": 1.0,
+  "general.sampling.top_k": 0,
+  "general.sampling.top_p": 1.0,
+  "general.sampling.min_p": 0.0
+ },
+ "tensors": [
+  {
+   "name": "loop_kv_res_query.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "loop_res_query.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "output.weight",
+   "ne": [
+    2304,
+    201024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "output_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "output_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "token_embd.weight",
+   "ne": [
+    2304,
+    201024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "token_embd_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.0.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.attn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.1.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.attn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.2.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.attn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.3.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.attn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.4.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.attn_k_conv_proj.weight",
+   "ne": [
+    2304,
+    32
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.attn_k_inp_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.attn_q_inp_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.attn_res_query.weight",
+   "ne": [
+    2304,
+    3
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.attn_v_conv_proj.weight",
+   "ne": [
+    2304,
+    32
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.attn_v_inp_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.5.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.attn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.loop_attn_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.loop_attn_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.loop_attn_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.loop_k_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.loop_k_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.loop_k_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.loop_mlp_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.loop_mlp_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.loop_mlp_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.loop_v_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.loop_v_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.6.loop_v_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.attn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.loop_attn_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.loop_attn_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.loop_attn_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.loop_k_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.loop_k_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.loop_k_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.loop_mlp_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.loop_mlp_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.loop_mlp_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.loop_v_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.loop_v_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.7.loop_v_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.attn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.loop_attn_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.loop_attn_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.loop_attn_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.loop_k_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.loop_k_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.loop_k_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.loop_mlp_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.loop_mlp_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.loop_mlp_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.loop_v_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.loop_v_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.8.loop_v_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.attn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.loop_attn_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.loop_attn_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.loop_attn_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.loop_k_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.loop_k_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.loop_k_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.loop_mlp_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.loop_mlp_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.loop_mlp_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.loop_v_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.loop_v_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.9.loop_v_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.attn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.loop_attn_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.loop_attn_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.loop_attn_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.loop_k_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.loop_k_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.loop_k_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.loop_mlp_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.loop_mlp_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.loop_mlp_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.loop_v_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.loop_v_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.10.loop_v_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.attn_k_conv_proj.weight",
+   "ne": [
+    2304,
+    32
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.attn_k_inp_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.attn_q_inp_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.attn_res_query.weight",
+   "ne": [
+    2304,
+    3
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.attn_v_conv_proj.weight",
+   "ne": [
+    2304,
+    32
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.attn_v_inp_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.loop_attn_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.loop_attn_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.loop_attn_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.loop_k_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.loop_k_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.loop_k_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.loop_mlp_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.loop_mlp_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.loop_mlp_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.loop_v_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.loop_v_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.11.loop_v_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.attn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.loop_attn_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.loop_attn_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.loop_attn_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.loop_k_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.loop_k_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.loop_k_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.loop_mlp_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.loop_mlp_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.loop_mlp_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.loop_v_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.loop_v_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.12.loop_v_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.attn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.loop_attn_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.loop_attn_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.loop_attn_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.loop_k_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.loop_k_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.loop_k_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.loop_mlp_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.loop_mlp_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.loop_mlp_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.loop_v_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.loop_v_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.13.loop_v_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.attn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.loop_attn_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.loop_attn_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.loop_attn_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.loop_k_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.loop_k_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.loop_k_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.loop_mlp_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.loop_mlp_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.loop_mlp_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.loop_v_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.loop_v_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.14.loop_v_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.attn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.loop_attn_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.loop_attn_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.loop_attn_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.loop_k_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.loop_k_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.loop_k_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.loop_mlp_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.loop_mlp_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.loop_mlp_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.loop_v_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.loop_v_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.15.loop_v_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.attn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.loop_attn_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.loop_attn_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.loop_attn_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.loop_k_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.loop_k_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.loop_k_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.loop_mlp_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.loop_mlp_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.loop_mlp_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.loop_v_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.loop_v_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.16.loop_v_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.attn_k_conv_proj.weight",
+   "ne": [
+    2304,
+    32
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.attn_k_inp_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.attn_q_inp_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.attn_res_query.weight",
+   "ne": [
+    2304,
+    3
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.attn_v_conv_proj.weight",
+   "ne": [
+    2304,
+    32
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.attn_v_inp_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.loop_attn_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.loop_attn_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.loop_attn_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.loop_k_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.loop_k_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.loop_k_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.loop_mlp_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.loop_mlp_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.loop_mlp_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.loop_v_down.weight",
+   "ne": [
+    4608,
+    64
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.loop_v_forget.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.17.loop_v_gain.weight",
+   "ne": [
+    64,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.attn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.18.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.attn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.ffn_down_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.ffn_gate_up_exps.scale",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 40,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.19.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.attn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 13,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.20.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.attn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 13,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.21.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.attn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.attn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 13,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.22.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.attn_gate.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.attn_k.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.attn_k_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.attn_k_conv_proj.weight",
+   "ne": [
+    2304,
+    32
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.attn_k_inp_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.attn_output.weight",
+   "ne": [
+    3072,
+    2304
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.attn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.attn_q.weight",
+   "ne": [
+    2304,
+    3072
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.attn_q_clip.weight",
+   "ne": [
+    128,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.attn_q_inp_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.attn_rel.weight",
+   "ne": [
+    2304,
+    384
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.attn_rel_bias.weight",
+   "ne": [
+    16,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.attn_rel_clip.weight",
+   "ne": [
+    16,
+    24
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.attn_res_query.weight",
+   "ne": [
+    2304,
+    3
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.attn_sink_proj.weight",
+   "ne": [
+    2304,
+    24
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.attn_v.weight",
+   "ne": [
+    2304,
+    1024
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.attn_v_conv.weight",
+   "ne": [
+    4,
+    1024
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.attn_v_conv_proj.weight",
+   "ne": [
+    2304,
+    32
+   ],
+   "type": 30,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.attn_v_inp_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.exp_probs_b.bias",
+   "ne": [
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.ffn_down_exps.weight",
+   "ne": [
+    1152,
+    2304,
+    128
+   ],
+   "type": 8,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.ffn_gate_inp.weight",
+   "ne": [
+    2304,
+    128
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.ffn_gate_up_exps.weight",
+   "ne": [
+    2304,
+    2304,
+    128
+   ],
+   "type": 13,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.ffn_norm.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.ffn_post_conv.weight",
+   "ne": [
+    4,
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  },
+  {
+   "name": "blk.23.ffn_res_query.weight",
+   "ne": [
+    2304
+   ],
+   "type": 0,
+   "shard": "Inkling-2-Mini-UD-Q4_K_M.gguf"
+  }
+ ]
+}
