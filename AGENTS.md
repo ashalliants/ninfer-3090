@@ -48,8 +48,10 @@ route tables and published measurements come from, and none of it is authoritati
 route table this fork inherited and re-measured on sm_86 turned out to be wrong by 12-41%. Treat an
 upstream tuning constant as a hypothesis until measured on this card. The build environment and the
 compatibility constraints are in "Windows build environment (RTX 3090 fork host)" below. `sm_70`
-(Tesla V100) is a compile-qualified, emulated, never-run target; its design and status are in
-`docs/maintainer/volta-port.md`.
+(Tesla V100) is built and run on a physical Tesla V100-PCIE-32GB: results labelled sm_70 are
+measurements on that card, with Ampere-only instructions emulated by `volta_compat.cuh` where no
+Volta route exists. Its design and status are in `docs/maintainer/volta-port.md`, and its user
+guide and measurements in `docs/tesla-v100.md`.
 
 Generation uses one resident model on one GPU, one to eight resident execution lanes fixed at
 startup, bounded FIFO ingress with finite bypass (plus an opt-in, bounded cache-affinity overtake),
