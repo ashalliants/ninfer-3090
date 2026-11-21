@@ -235,15 +235,18 @@ void test_fuse_taps() {
     }
 }
 
-void test_attention(std::int64_t anchor, int capacity, int window, const std::string& label) {
-    const int d = 128, heads = 24, kv_heads = 8, w = 8, kv = kv_heads * d;
+void test_attention(std::int64_t anchor, int capacity, int window, const std::string& label, int w = 8) {
+    const int d = 128, heads = 24, kv_heads = 8, kv = kv_heads * d;
     const auto q = randoms(static_cast<std::size_t>(heads) * d * w, -1, 1);
     const auto kr = randoms(static_cast<std::size_t>(kv) * capacity, -1, 1), vr = randoms(static_cast<std::size_t>(kv) * capacity, -2, 2);
     const auto kb = randoms(static_cast<std::size_t>(kv) * w, -1, 1), vb = randoms(static_cast<std::size_t>(kv) * w, -2, 2);
     Buf dq(q), dkr(kr), dvr(vr), dkb(kb), dvb(vb), out(q.size() * 4);
     Tensor tq = dq.tensor({heads * d, w}), tkr = dkr.tensor({kv, capacity}), tvr = dvr.tensor({kv, capacity});
     Tensor tkb = dkb.tensor({kv, w}), tvb = dvb.tensor({kv, w}), to = out.tensor({heads * d, w});
-    ninfer::ops::dspark_block_attention_fp32(tq, tkr, tvr, tkb, tvb, anchor, {heads, kv_heads, d, window}, to, nullptr);
+    const ninfer::ops::DSparkAttentionShape shape{heads, kv_heads, d, window};
+    Buf ws(ninfer::ops::dspark_block_attention_workspace_bytes(shape, w));
+    Tensor tws = ws.tensor({static_cast<std::int32_t>(ninfer::ops::dspark_block_attention_workspace_bytes(shape, w) / 4)});
+    ninfer::ops::dspark_block_attention_fp32(tq, tkr, tvr, tkb, tvb, anchor, shape, to, tws, nullptr);
     const std::int64_t lo = window > 0 ? std::max<std::int64_t>(0, anchor - window) : 0;
     Vec want(q.size());
     for (int t = 0; t < w; ++t) {
@@ -472,6 +475,11 @@ int main() {
         test_attention(700, 1024, 1024, "local, short context");
         test_attention(5000, 1024, 1024, "local, wrapped ring");
         test_attention(3000, 4096, 0, "global");
+        test_attention(24, 1024, 0, "global, 32 keys (one run, no combine)");
+        test_attention(33, 1024, 0, "global, 41 keys (two runs, a partial tile)");
+        test_attention(3000, 4096, 0, "global, W 16", 16);
+        // Past 23,040 keys, the most the single-block form held in shared memory.
+        test_attention(30000, 30720, 0, "global, 30,008 keys", 16);
         test_markov();
         test_markov_compact();
         test_argmax();
