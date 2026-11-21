@@ -59,7 +59,9 @@ private:
     Tensor forward_graph(std::int32_t token);
     Tensor visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor>& blocks, const Tensor* messages, std::int64_t start,
                  const Trace* trace);
-    void control(const ControllerWeights& w, const Tensor& c, const Tensor& m, Tensor& out);
+    // The loop controllers of one site (q, k and v at once, or the FFN input): out[j] = controller w[j] of (c[j], m[j]).
+    void control(std::span<const ControllerWeights* const> w, std::span<const Tensor* const> c, std::span<const Tensor* const> m,
+                 std::span<Tensor* const> out);
     Tensor project(const Tensor& x_bf16, std::span<const WeightId> weights, std::span<const std::int32_t> rows);
 
     const Model& model_;

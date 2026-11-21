@@ -1,7 +1,7 @@
 #pragma once
 
 // Written for NInfer-3090. Depth attention over a short list of residual states, and the gated message
-// combine of a loop controller (Inkling-2-Mini's attention residuals and loop messages,
+// controller of the loop (Inkling-2-Mini's attention residuals and loop messages,
 // docs/maintainer/inkling2-model.md 3b, 3c, 3i and 4). Columns follow fp32_rows.h: [D, T], ne[0]
 // contiguous, any column stride.
 
@@ -46,17 +46,41 @@ inline constexpr int kDepthAttentionMaxQueries = 4;
 void depth_attention_mix(std::span<const Tensor* const> sources, const Tensor& queries, float eps, DeviceArena& workspace,
                          std::span<Tensor* const> outputs, cudaStream_t stream);
 
+/// One gated message controller of a loop_controller_fp32 batch.
+struct LoopControllerJob {
+    const Tensor* c      = nullptr; // FP32 [H, T]
+    const Tensor* m      = nullptr; // FP32 [H, T]
+    const Tensor* down   = nullptr; // BF16 [2H, R]: row r holds the 2H inputs' weights
+    const Tensor* gain   = nullptr; // BF16 [R, H]: row d holds the R hidden values' weights
+    const Tensor* forget = nullptr; // BF16 [R, H]
+    Tensor* out          = nullptr; // FP32 [H, T]
+};
+inline constexpr int kLoopControllerMaxJobs = 3;
+inline constexpr int kLoopControllerMaxRank = 64;
+
 /**
- * Op: forget_gain_combine (the output of a gated message controller)
+ * Op: loop_controller_fp32 (Inkling-2's gated message controller, 1 to kLoopControllerMaxJobs at once)
  *
- * Math / indexing:
- *   out[d, t] = (1 - tanh(gf[D + d, t])) * c[d, t] + tanh(gf[d, t]) * m[d, t]
- *   (gf holds the gain pre-activations in rows 0..D-1 and the forget pre-activations in rows D..2D-1)
+ * Math / indexing (each job, each column t):
+ *   z = down [u(c); u(m)], u(x) = x / sqrt(mean(x^2) + eps)   (R values)
+ *   out[d, t] = (1 - tanh(forget[d] . z)) * c[d, t] + tanh(gain[d] . z) * m[d, t]
  *
- * Logical shapes: c, m, out FP32 [D, T]; gf FP32 [2D, T].
- * Numeric: FP32 tanh; oracle FP64 (inkling2_reference.h control, given the same gf).
- * Effects: writes out, which may equal c or m. Workspace: none. Execution: graph capturable.
+ * Logical shapes: per job as LoopControllerJob; every job has the same H, R and T.
+ *
+ * Supported domain:
+ *   H a multiple of 256; R a multiple of 8, at most kLoopControllerMaxRank; T >= 1; c, m and out at any
+ *   column stride (ne[0] contiguous); the weights contiguous and 16-byte aligned.
+ *
+ * Numeric:
+ *   FP32 throughout, nothing rounded to BF16: since u is a per-column scale, down [u(c); u(m)] is formed as
+ *   (down_c . c) / rms(c) + (down_m . m) / rms(m), each dot product summed in 256-input slices (8 inputs a
+ *   lane, a fixed butterfly) and the slices added in order; the sums of squares likewise. Oracle FP64
+ *   (inkling2_reference.h control) over the BF16 weights.
+ *
+ * Effects: writes out, which may equal its job's c or m but no other job's operands.
+ * Workspace: loop_controller_workspace_bytes(H, R, T, jobs). Execution: two launches; graph capturable.
  */
-void forget_gain_combine(const Tensor& c, const Tensor& m, const Tensor& gf, Tensor& out, cudaStream_t stream);
+[[nodiscard]] std::size_t loop_controller_workspace_bytes(int hidden, int rank, int cols, int jobs);
+void loop_controller_fp32(std::span<const LoopControllerJob> jobs, float eps, DeviceArena& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops

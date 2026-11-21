@@ -15,6 +15,7 @@
 #include "ninfer/ops/depth_attention.h"
 #include "ninfer/ops/fp32_rows.h"
 #include "ninfer/ops/moe_situ.h"
+#include "ninfer/ops/projection_fp32.h"
 #include "ninfer/ops/relative_bias_attention.h"
 #include "ninfer/ops/short_conv.h"
 
@@ -173,36 +174,53 @@ void test_mix_and_control() {
         compare("depth_attention_mix query " + std::to_string(i), outs[i].get(h * cols), want, 2e-6);
     }
 
-    // The controller's combine given gf; the oracle's control() computes gf itself from D, G, F, so it is formed
-    // here in FP64 and handed to both.
-    auto cc = randoms(h * cols), mm = randoms(h * cols), down = randoms(rank * 2 * h, -0.02F, 0.02F),
-         gain = randoms(h * rank, -0.1F, 0.1F), forget = randoms(h * rank, -0.1F, 0.1F);
-    std::vector<float> gf(2 * h * cols);
-    Vec want;
-    for (int c = 0; c < cols; ++c) {
-        const Vec vc(cc.begin() + c * h, cc.begin() + (c + 1) * h), vm(mm.begin() + c * h, mm.begin() + (c + 1) * h);
-        Vec in = ref::unit_rms(vc);
-        const Vec um = ref::unit_rms(vm);
-        in.insert(in.end(), um.begin(), um.end());
-        Vec z(rank, 0.0);
-        for (int r = 0; r < rank; ++r)
-            for (int j = 0; j < 2 * h; ++j) { z[r] += down[r * 2 * h + j] * in[j]; }
-        for (int d = 0; d < h; ++d) {
-            double g = 0, f = 0;
-            for (int r = 0; r < rank; ++r) {
-                g += gain[d * rank + r] * z[r];
-                f += forget[d * rank + r] * z[r];
-            }
-            gf[c * 2 * h + d]     = static_cast<float>(g);
-            gf[c * 2 * h + h + d] = static_cast<float>(f);
-        }
-        const Vec y = ref::control(vc, vm, widen(down), widen(gain), widen(forget));
-        want.insert(want.end(), y.begin(), y.end());
+    // Three controllers in one call against the FP64 oracle over the same BF16 weights: job 1 writes over its c,
+    // job 2 over its m.
+    struct Job {
+        std::vector<float> c, m, down, gain, forget;
+    };
+    std::vector<Job> host(3);
+    std::vector<Buf> cs, ms, outs_c;
+    std::vector<ninfer::DeviceBuffer> wd, wg, wf;
+    cs.reserve(3), ms.reserve(3), outs_c.reserve(3);
+    for (int j = 0; j < 3; ++j) {
+        Job& job = host[j];
+        job.c = randoms(h * cols, -1.0F - j, 1.0F + j), job.m = randoms(h * cols);
+        job.down = randoms(rank * 2 * h, -0.02F, 0.02F), job.gain = randoms(h * rank, -0.1F, 0.1F), job.forget = randoms(h * rank, -0.1F, 0.1F);
+        t::round_to_bf16(job.down), t::round_to_bf16(job.gain), t::round_to_bf16(job.forget);
+        cs.emplace_back(job.c), ms.emplace_back(job.m), outs_c.emplace_back(static_cast<std::size_t>(h * cols));
+        wd.push_back(t::to_device_bf16(job.down)), wg.push_back(t::to_device_bf16(job.gain)), wf.push_back(t::to_device_bf16(job.forget));
     }
-    Buf dc(cc), dm(mm), dgf(gf), dout(static_cast<std::size_t>(h * cols));
-    Tensor tout = dout.tensor({h, cols});
-    ninfer::ops::forget_gain_combine(dc.tensor({h, cols}), dm.tensor({h, cols}), dgf.tensor({2 * h, cols}), tout, nullptr);
-    compare("forget_gain_combine (vs control oracle)", dout.get(h * cols), want, 2e-6);
+    std::vector<Tensor> tc, tm, tout, tdown, tgain, tforget;
+    for (int j = 0; j < 3; ++j) {
+        tc.push_back(cs[j].tensor({h, cols})), tm.push_back(ms[j].tensor({h, cols})), tout.push_back(outs_c[j].tensor({h, cols}));
+        tdown.emplace_back(wd[j].p, DType::BF16, std::initializer_list<std::int32_t>{2 * h, rank});
+        tgain.emplace_back(wg[j].p, DType::BF16, std::initializer_list<std::int32_t>{rank, h});
+        tforget.emplace_back(wf[j].p, DType::BF16, std::initializer_list<std::int32_t>{rank, h});
+    }
+    ninfer::ops::LoopControllerJob jobs[3];
+    for (int j = 0; j < 3; ++j) {
+        Tensor* target = j == 1 ? &tc[j] : j == 2 ? &tm[j] : &tout[j];
+        jobs[j] = {&tc[j], &tm[j], &tdown[j], &tgain[j], &tforget[j], target};
+    }
+    ninfer::DeviceArena control_arena(ninfer::ops::loop_controller_workspace_bytes(h, rank, cols, 3));
+    ninfer::ops::loop_controller_fp32(jobs, 1e-6F, control_arena, nullptr);
+    for (int j = 0; j < 3; ++j) {
+        Vec want;
+        for (int c = 0; c < cols; ++c) {
+            const Vec vc(host[j].c.begin() + c * h, host[j].c.begin() + (c + 1) * h), vm(host[j].m.begin() + c * h, host[j].m.begin() + (c + 1) * h);
+            const Vec y = ref::control(vc, vm, widen(host[j].down), widen(host[j].gain), widen(host[j].forget));
+            want.insert(want.end(), y.begin(), y.end());
+        }
+        Buf& got = j == 1 ? cs[j] : j == 2 ? ms[j] : outs_c[j];
+        compare("loop_controller_fp32 job " + std::to_string(j) + (j == 1 ? " (out = c)" : j == 2 ? " (out = m)" : ""), got.get(h * cols),
+                want, 2e-6);
+    }
+    bool threw = false;
+    try {
+        (void)ninfer::ops::loop_controller_workspace_bytes(2300, rank, cols, 1);
+    } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "loop_controller_workspace_bytes accepted H = 2300");
 }
 
 void test_short_conv(bool dynamic) {
@@ -664,6 +682,45 @@ void bench_experts(bool nvfp4) {
     cudaEventDestroy(stop);
 }
 
+// projection_fp32 at Inkling-2's decode shapes (T = 1): time per call and weight bandwidth.
+void bench_projection() {
+    struct Shape {
+        int k, n;
+        const char* what;
+    };
+    const Shape shapes[] = {{2304, 6552, "q|rel|gate|sink"}, {2304, 2048, "local k|v"}, {2304, 1056, "global k|dyn"},
+                            {3072, 2304, "output"},          {4608, 64, "control down"}, {64, 4608, "control gates"},
+                            {2304, 201024, "head"}};
+    for (const Shape& shape : shapes) {
+        const int iters = shape.n > 100000 ? 10 : 50, copies = shape.n > 100000 ? 1 : 8; // rotate copies past the L2
+        ninfer::DeviceBuffer w = t::to_device_bf16(randoms(static_cast<std::size_t>(shape.k) * shape.n * copies, -0.05F, 0.05F));
+        ninfer::DeviceBuffer x = t::to_device_bf16(randoms(static_cast<std::size_t>(shape.k)));
+        Buf out(static_cast<std::size_t>(shape.n));
+        Tensor tx(x.p, DType::BF16, {shape.k, 1}), to = out.tensor({shape.n, 1});
+        const auto run = [&](int i) {
+            const Tensor tw(static_cast<char*>(w.p) + static_cast<std::size_t>(i % copies) * shape.k * shape.n * 2, DType::BF16,
+                            {shape.k, shape.n});
+            const Tensor* ws[] = {&tw};
+            ninfer::ops::projection_fp32(tx, ws, to, nullptr);
+        };
+        run(0);
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+        cudaEventRecord(start);
+        for (int i = 0; i < iters; ++i) { run(i); }
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, start, stop);
+        const double us = 1e3 * ms / iters;
+        std::printf("bench projection_fp32 K %5d N %6d T 1 %-16s %8.1f us, %4.0f GB/s\n", shape.k, shape.n, shape.what, us,
+                    2.0 * shape.k * shape.n / (us * 1e3));
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+    }
+}
+
 } // namespace
 
 // More columns than a grid's y holds (70000 > 65535): every column is the same, so each must give the first
@@ -760,6 +817,7 @@ int main() {
         if (const char* bench = std::getenv("NINFER_INKLING2_OP_BENCH"); bench != nullptr && *bench == '1') {
             bench_experts(true);
             bench_experts(false);
+            bench_projection();
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

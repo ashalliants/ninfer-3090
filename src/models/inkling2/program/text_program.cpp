@@ -38,7 +38,9 @@ std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk) {
                                        4 * (kv + 64) * 4 + 2 * q * 4 + q * 2 + 4 * h * 2 + 4 * h * 4 + 64 * 4 * 2 +
                                        std::size_t(c.experts_per_token) * (c.moe_intermediate + h) * 4 + 4 * c.experts_per_token * 4 +
                                        ops::moe_route_sigmoid_topk_workspace_bytes(i32(c.experts), 1) +
-                                       ops::depth_attention_mix_workspace_bytes(i32(c.hidden_size), 1, ops::kDepthAttentionMaxSources);
+                                       ops::depth_attention_mix_workspace_bytes(i32(c.hidden_size), 1, ops::kDepthAttentionMaxSources) +
+                                       ops::loop_controller_workspace_bytes(i32(c.hidden_size), i32(c.loop_gate_rank), 1,
+                                                                            ops::kLoopControllerMaxJobs);
     const std::size_t output = std::size_t(c.vocab_size) * 4 + 4 * h * 4;
     const std::size_t per_token = c.num_layer_visits * per_visit_kept + per_visit_temp + output;
     // Each allocation pads to 256 bytes; a visit makes about 60.
@@ -116,22 +118,18 @@ Tensor TextProgram::project(const Tensor& x, std::span<const WeightId> weights, 
     return out;
 }
 
-void TextProgram::control(const ControllerWeights& w, const Tensor& c, const Tensor& m, Tensor& out) {
-    const std::int32_t h = c.ne[0], cols = c.ne[1], rank = i32(config_.loop_gate_rank);
-    const auto scope = workspace_.scope();
-    Tensor both = workspace_.alloc(DType::BF16, {2 * h, cols});
-    Tensor first = both.slice(0, 0, h), second = both.slice(0, h, h);
-    const ops::RmsNormJob norms[] = {{&c, nullptr, &first}, {&m, nullptr, &second}};
-    ops::rmsnorm_fp32_batch(norms, config_.rms_norm_eps, stream_);
-    const WeightId down[] = {w.down};
-    const std::int32_t down_rows[] = {rank};
-    Tensor hidden = project(both, down, down_rows);
-    Tensor hidden_bf16 = workspace_.alloc(DType::BF16, {rank, cols});
-    ops::cast_fp32_to_bf16(hidden, hidden_bf16, stream_);
-    const WeightId gates[] = {w.gain, w.forget};
-    const std::int32_t gate_rows[] = {h, h};
-    Tensor gf = project(hidden_bf16, gates, gate_rows);
-    ops::forget_gain_combine(c, m, gf, out, stream_);
+void TextProgram::control(std::span<const ControllerWeights* const> w, std::span<const Tensor* const> c,
+                          std::span<const Tensor* const> m, std::span<Tensor* const> out) {
+    const std::int32_t h = i32(config_.hidden_size), rank = i32(config_.loop_gate_rank);
+    std::array<Tensor, 3 * ops::kLoopControllerMaxJobs> views;
+    std::array<ops::LoopControllerJob, ops::kLoopControllerMaxJobs> jobs;
+    for (std::size_t j = 0; j < w.size(); ++j) {
+        views[3 * j]     = model_.tensor(w[j]->down, {2 * h, rank});
+        views[3 * j + 1] = model_.tensor(w[j]->gain, {rank, h});
+        views[3 * j + 2] = model_.tensor(w[j]->forget, {rank, h});
+        jobs[j] = {c[j], m[j], &views[3 * j], &views[3 * j + 1], &views[3 * j + 2], out[j]};
+    }
+    ops::loop_controller_fp32(std::span<const ops::LoopControllerJob>(jobs.data(), w.size()), config_.rms_norm_eps, workspace_, stream_);
 }
 
 Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor>& blocks, const Tensor* messages, std::int64_t start,
@@ -171,9 +169,11 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     if (messages != nullptr) {
         Tensor cq = workspace_.alloc(DType::FP32, {h, cols}), ck = workspace_.alloc(DType::FP32, {h, cols}),
                cv = workspace_.alloc(DType::FP32, {h, cols});
-        control(w.loop[0], xq, messages[0], cq);
-        control(w.loop[1], xk, messages[1], ck);
-        control(w.loop[2], xv, messages[2], cv);
+        const ControllerWeights* cw[] = {&w.loop[0], &w.loop[1], &w.loop[2]};
+        const Tensor* cin[] = {&xq, &xk, &xv};
+        const Tensor* min[] = {&messages[0], &messages[1], &messages[2]};
+        Tensor* cout[] = {&cq, &ck, &cv};
+        control(cw, cin, min, cout);
         xq = cq;
         xk = ck;
         xv = cv;
@@ -285,7 +285,11 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     }
     if (messages != nullptr) {
         Tensor zc = workspace_.alloc(DType::FP32, {h, cols});
-        control(w.loop[3], z, messages[3], zc);
+        const ControllerWeights* cw[] = {&w.loop[3]};
+        const Tensor* cin[] = {&z};
+        const Tensor* min[] = {&messages[3]};
+        Tensor* cout[] = {&zc};
+        control(cw, cin, min, cout);
         z = zc;
     }
     const Tensor ffn_norm = model_.tensor(w.ffn_norm, {h});
