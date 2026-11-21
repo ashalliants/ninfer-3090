@@ -130,29 +130,18 @@ __device__ __forceinline__ int quotient(int n, std::uint32_t magic) {
 }
 __device__ __forceinline__ std::uint32_t magic_for(int d) { return d == 1 ? 0U : 0xFFFFFFFFU / static_cast<std::uint32_t>(d) + 1U; }
 
-// E2M1 code n (sign bit 3) -> 2x its value, an integer in -12..12: magnitudes 0 1 2 3 4 6 8 12 packed by nibble.
-__device__ __forceinline__ float e2m1_twice(std::uint32_t n) {
-    const float magnitude = static_cast<float>((0xC8643210U >> (4 * (n & 7))) & 0xF);
-    return (n & 8) ? -magnitude : magnitude;
-}
-
 // Activations in shared memory are stored with four pad floats after every 64 values: 16-byte aligned, and lanes
 // reading different 64-value blocks with 128-bit loads hit different banks.
 constexpr int kPaddedBlock = kNvfp4Values + 4;
 constexpr int kLutEntries  = 256;
 
-// The shared tables: byte q -> (2 x E2M1 of its low nibble, 2 x E2M1 of its high nibble), and scale byte q -> half
-// its ue4m3 value.
+// The shared table: scale byte q -> half its ue4m3 value (the e2m1 values come out doubled, e2m1_twice8).
 struct Tables {
-    float2 values[kLutEntries];
     float scales[kLutEntries];
 };
 
 __device__ __forceinline__ void fill_tables(Tables* t) {
-    for (int q = threadIdx.x; q < kLutEntries; q += blockDim.x) {
-        t->values[q] = make_float2(e2m1_twice(q & 0xF), e2m1_twice(q >> 4));
-        t->scales[q] = ue4m3_half(q);
-    }
+    for (int q = threadIdx.x; q < kLutEntries; q += blockDim.x) { t->scales[q] = ue4m3_half(q); }
 }
 
 __device__ __forceinline__ void stage_padded(const float* __restrict__ src, int n, float* dst) {
@@ -163,23 +152,47 @@ __device__ __forceinline__ float lane_of(const float4& v, int i) { return i == 0
 
 // One 36-byte NVFP4 block (4 ue4m3 half-scales, then 32 bytes of nibbles; byte j of sub-block s holds values j and
 // j + 8), as 9 words in shared memory, dotted with 64 staged activations.
+// The e2m1 values of eight nibbles, decoded in registers (no table loads): each nibble picks one byte of a 16-byte
+// table of 2 * value + 12 (0..24) with __byte_perm, and a byte b becomes the float 2^23 + b by placing it under the
+// exponent of 2^23, so 2 * value = that float - (2^23 + 12), exactly. out[0..3] are the values of the low nibble,
+// high nibble, low, high of bytes 0 and 1 of `q`; out[4..7] the same for bytes 2 and 3.
+__device__ __forceinline__ void e2m1_twice8(std::uint32_t q, float (&out)[8]) {
+    constexpr std::uint32_t kPos0 = 0x0F0E0D0CU, kPos1 = 0x18141210U; // nibbles 0..7: 2v + 12 = 12 13 14 15 16 18 20 24
+    constexpr std::uint32_t kNeg0 = 0x090A0B0CU, kNeg1 = 0x00040608U; // nibbles 8..15: 12 11 10 9 8 6 4 0
+    const std::uint32_t index = q & 0x77777777U, pick = 0x32103210U | ((q & 0x88888888U) >> 1);
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const std::uint32_t pos = __byte_perm(kPos0, kPos1, index >> (16 * i));
+        const std::uint32_t neg = __byte_perm(kNeg0, kNeg1, index >> (16 * i));
+        const std::uint32_t biased = __byte_perm(pos, neg, pick >> (16 * i));
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            out[4 * i + k] = __uint_as_float(__byte_perm(biased, 0x4B000000U, 0x7540U | k)) - 8388620.0F; // 2^23 + 12
+        }
+    }
+}
+
 __device__ __forceinline__ float nvfp4_block_dot(const std::uint32_t* blk, const float* x, const Tables* t) {
     const std::uint32_t scales = blk[0];
     float acc = 0.0F;
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
-        const std::uint32_t words[2] = {blk[1 + 2 * s], blk[2 + 2 * s]};
         const float4* xs = reinterpret_cast<const float4*>(x + 16 * s);
-        const float4 x0 = xs[0], x1 = xs[1], x2 = xs[2], x3 = xs[3];
         float even = 0.0F, odd = 0.0F;
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const std::uint32_t byte = __byte_perm(words[j >> 2], 0, 0x4440 | (j & 3));
-            const float2 v = t->values[byte];
-            const float lo_x = j < 4 ? lane_of(x0, j & 3) : lane_of(x1, j & 3);
-            const float hi_x = j < 4 ? lane_of(x2, j & 3) : lane_of(x3, j & 3);
-            even = fmaf(v.x, lo_x, even);
-            odd  = fmaf(v.y, hi_x, odd);
+        for (int w = 0; w < 2; ++w) {
+            // Byte j of the sub-block holds value j (low nibble) and j + 8 (high nibble); this word is bytes 4w..4w+3.
+            float v[8];
+            e2m1_twice8(blk[1 + 2 * s + w], v);
+            const float4 lo = xs[w], hi = xs[2 + w];
+            even = fmaf(v[0], lo.x, even);
+            odd  = fmaf(v[1], hi.x, odd);
+            even = fmaf(v[2], lo.y, even);
+            odd  = fmaf(v[3], hi.y, odd);
+            even = fmaf(v[4], lo.z, even);
+            odd  = fmaf(v[5], hi.z, odd);
+            even = fmaf(v[6], lo.w, even);
+            odd  = fmaf(v[7], hi.w, odd);
         }
         acc = fmaf(even + odd, t->scales[__byte_perm(scales, 0, 0x4440 | s)], acc);
     }
