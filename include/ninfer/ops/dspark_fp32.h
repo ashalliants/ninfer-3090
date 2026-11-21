@@ -92,7 +92,8 @@ void dspark_fuse_taps_fp32(std::span<const Tensor* const> taps, const Tensor& fu
  *
  * q FP32 [D * heads, W]; k_ring, v_ring FP32 [D * kv_heads, capacity] (a - lo <= capacity); k_block, v_block FP32
  * [D * kv_heads, W]; out FP32 [D * heads, W]; all contiguous. D = 128. Oracle FP64.
- * Workspace: `workspace` FP32 contiguous of dspark_block_attention_workspace_bytes(shape, W) bytes or more.
+ * Workspace: `workspace` FP32 contiguous device storage (non-null, refused otherwise) of
+ * dspark_block_attention_workspace_bytes(shape, W) bytes or more.
  */
 struct DSparkAttentionShape {
     int heads = 0, kv_heads = 0, head_dim = 0, window = 0;
