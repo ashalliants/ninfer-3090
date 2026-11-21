@@ -684,6 +684,8 @@ private:
         // The context cache is one device snapshot of the last prompt (Inkling2Core, "Prefix reuse"; the host-tier
         // options were refused before normalization): one extra state when it is on, none when it is off.
         options.context_cache.device_state_slots = options.context_cache.enabled ? 1U : 0U;
+        // Resolved like every other route's options (the request log's server-start record reads it): no Host tier.
+        options.context_cache.host_capacity_bytes = 0;
         // One worker runs one request at a time; the rest wait in its max_pending_requests queue.
         options.max_concurrency = 1;
         auto generation   = std::make_unique<Inkling2Core>(options, device);

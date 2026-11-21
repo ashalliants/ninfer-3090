@@ -12,11 +12,13 @@
 #include "ninfer/engine.h"
 
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -138,6 +140,8 @@ int main() {
         check(engine.options().context_cache.enabled && engine.options().context_cache.device_state_slots == 1U &&
                   !engine.load_summary().takes_video && engine.options().max_concurrency == 1,
               "a one-snapshot context cache, no video and one request at a time is reported");
+        check(engine.options().context_cache.host_capacity_bytes == std::optional<std::size_t>{0},
+              "a resolved zero-byte Host tier is reported");
 
         const auto question = [] { return user_turn({text("Name three primary colours.")}); };
         // Aggregate, twice, and streaming.
