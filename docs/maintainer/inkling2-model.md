@@ -3,8 +3,8 @@
 Status: **text MVP, correctness first**. `src/models/inkling2` runs the text model on the GPU with
 naive FP32 kernels and matches the llama.cpp golden ("Engine (text MVP, correctness first)" and
 "Validation" below); the DSpark drafter and greedy speculative decoding are in ("DSpark drafter" below, measured on
-a physical Tesla V100); it is not yet wired into the Engine or `ninfer-serve`, and has no chat
-template, sampling or vision. This page is the mathematical authority for the work, plus the GGUF
+a physical Tesla V100); so is the vision tower and image prompts ("Vision tower" below); it is not yet wired into
+the Engine or `ninfer-serve`, and has no chat template or sampling. This page is the mathematical authority for the work, plus the GGUF
 mapping, reuse map and V100 plan. The
 converter's config and tensor map are `tools/convert/inkling2.py`, the NumPy reference is
 `tools/inkling2/reference.py`, and the C++ op oracles are `tests/ops/inkling2_reference.h`.
