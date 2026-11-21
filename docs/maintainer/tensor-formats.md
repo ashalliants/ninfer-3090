@@ -93,7 +93,8 @@ rows). The last eight pairs are the ones ISTA-DASLab's GSQ-RCO V4.1-Flash IQ2_XX
 their down rows are K-quant blocks, so the intermediate size must be a multiple of 256 (V4.1-Flash's is 2,304).
 The expert kernels do not run them yet. `ggml_rec_nvfp4_nvfp4` holds Inkling-2-Mini's experts of
 layers 0-19 ([inkling2-model.md](inkling2-model.md)); each expert's gate/up and down products also have an
-FP32 multiplier, which the converter stores as separate tensors beside the bank. No kernel consumes it yet.
+FP32 multiplier, which the converter stores as separate tensors beside the bank. Inkling-2's `moe_situ_experts`
+(`include/ninfer/ops/moe_situ.h`) consumes it; the shared expert kernels do not.
 
 The C++ registry accepts the GGML block and expert record formats and materializes them to Device,
 Host or Pinned memory unchanged. Linear and LinearAdd consume `ggml_iq4_xs`, `ggml_iq3_s`, `ggml_q6_k`,
