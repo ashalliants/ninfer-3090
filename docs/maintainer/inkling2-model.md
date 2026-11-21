@@ -254,8 +254,8 @@ Qwen3.5 GDN conv state, only smaller.
 
 `src/models/inkling2` binds a converted artifact (`inkling2_gguf` recipe, UD-Q8_K_XL) and runs the
 48-visit schedule for one sequence. It is the correctness baseline the V100 kernels of phase 4 are
-measured against, not a serving route: there is no Engine/serve integration, chat template or sampling
-yet. The DSpark drafter runs greedy speculative decoding (see "DSpark drafter").
+measured against. The public Engine and `ninfer-serve` run it one request at a time (see "Serving").
+The DSpark drafter runs greedy speculative decoding (see "DSpark drafter").
 
 | Piece | Where | What it does now |
 |---|---|---|
@@ -269,6 +269,8 @@ yet. The DSpark drafter runs greedy speculative decoding (see "DSpark drafter").
 | Attention | `ops/relative_bias_attention.h` | per-head L2 clips and log scale, V unit norm, relative-bias sink attention over an FP32 KV ring per visit (local capacity window - 1 + max_chunk, global max_context) |
 | MoE | `ops/moe_situ.h` | sigmoid top-8 route with bias steering; SITU experts from `ggml_rec_nvfp4_nvfp4` records (layers 0-19) or the BF16 banks (20-23), with the per-expert multipliers |
 | Vision | `program/vision_program.{h,cpp}`, `ops/vit_fp32.h` | `prepare_image` (pad, normalize, resize above 4096 tokens) and `VisionEncoder::encode`; `TextProgram::forward(tokens, embeddings)` puts an image's rows in place of its placeholder tokens (see "Vision tower") |
+| Frontend | `frontend/frontend.{h,cpp}` | the chat template and tokenizer, images to prepared pixels, and the output decoder (see "Serving") |
+| Engine core | `runtime/engine/inkling2_core.{h,cpp}` | one worker thread; requests one at a time from position 0; host sampling (see "Serving") |
 | Tokenizer | `qwen3_5/frontend/tokenizer.{h,cpp}` `Pipeline::Inkling2` | the word regex as a hand-written matcher, no normalizer, BPE with `ignore_merges` |
 
 All Ops are naive FP32 kernels qualified against `tests/ops/inkling2_reference.h`. The KV rings are
@@ -399,6 +401,84 @@ The greedy continuations are llama.cpp's `llama-mtmd-cli` outputs, tokenized aga
 `<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_image|>`, then the
 image, then `<|end_message|><|message_user|><|content_text|>Describe this image in one paragraph.<|end_message|>`. The
 model reads the newspaper's front page: "The New York Times ... July 20, 1969 ...".
+
+## Serving
+
+`ninfer-serve model.ninfer [--vision]` serves an Inkling-2 artifact through the public Engine. The OpenAI,
+Anthropic and Responses routes, streaming and usage are the server's own. The Engine picks the model's own
+core when `models::inkling2::is_inkling2` accepts the artifact (`runtime/engine/inkling2_core.h`). The core
+does not use the Qwen3.5 frontend, Program contract or scheduler.
+
+**Prompt** (`models/inkling2/frontend`).
+- The artifact's `chat_template.jinja` renders the conversation in the Hugging Face chat format.
+  - Content is a string, or a list of text and image parts.
+  - Tool calls carry parsed arguments, and tools are given as parsed JSON.
+  - `chat_template_kwargs` are template variables, and `reasoning_effort` maps to the template's names.
+  - Thinking off is effort `none`, which the template renders as "Thinking effort level: 0".
+- The template renders no generation prompt; the model writes its own `<|message_model|>`.
+- The Inkling-2 tokenizer encodes the text. The template's literal spans (the conversation's own strings) are
+  never parsed as control tokens, so user text that spells `<|end_message|>` stays text.
+- Each image's `<|unused_200054|>` becomes `PreparedImage::tokens()` copies, and the image is recorded at
+  that column.
+- Images are decoded by `media::decode` (FFmpeg) and prepared by `prepare_image`. They need `--vision` and
+  an artifact converted with `--mmproj`.
+- Refused requests:
+  - continuing a final assistant message;
+  - grafts and LoRA adapters;
+  - video;
+  - output constraints (grammar, JSON schema) and `tool_choice` required or named;
+  - logprobs;
+  - a prompt that leaves no room for one output token.
+
+**Output.** Control tokens switch the channel, as `tokenizer_config.json`'s `response_template` describes:
+
+| Token | Effect |
+|---|---|
+| `<|content_thinking|>` | reasoning |
+| `<|content_text|>`, `<|content_tool_error|>`, `<|content_invoke_tool_text|>` | content |
+| `<|content_invoke_tool_json|>` | a tool call: `{"name", "args"}`, parsed at `<|end_message|>`; malformed JSON is kept as content |
+| `<|message_model|>` | opens a header; its text, such as a tool's name, is not output |
+| `<|content_model_end_sampling|>` | the default stop token |
+
+- Text is published in whole UTF-8 characters.
+- Text that could still become a caller's stop string is held back.
+- A thinking budget closes the reasoning by injecting `<|end_message|><|message_model|><|content_text|>`.
+
+**Execution** (`Inkling2Core`).
+- One worker thread takes requests in submission order. Each request:
+  - resets the `TextProgram`;
+  - encodes its images, copying each encoding out, since a chunk can need the end of one image and the
+    start of the next;
+  - prefills in chunks of 256;
+  - decodes with the decode graph.
+- Sampling runs on the host from the last column's FP32 logits (`unpadded_vocab_size`). It applies, in
+  order: presence and frequency penalties, temperature, top-k (at most 20, as everywhere in the Engine),
+  min-p, then top-p. Temperature 0 is argmax, lowest id first. A seed repeats its output.
+- The defaults follow `generation_config.json`: temperature 1, top-p 1. Top-k is 20.
+- `max_pending_requests` bounds the queue, and `pending_timeout` refuses a request that waited too long.
+- There is no prefix reuse, batching, context store, suspend or speculative decoding.
+  - DSpark is 2.2x slower than plain decode in the correctness-first build (see "DSpark drafter"), so the
+    server does not use it.
+
+**Measured** on the V100, 2026-11-21:
+
+| What | Result |
+|---|---|
+| Load | 9.1 s, with the vision tower |
+| Decode | 71.3 tokens/s greedy, through the Engine |
+| Image prompt, llama.cpp's `test-1.jpeg`, 234 tokens | vision 0.088 s, prefill 0.58 s |
+
+- `ninfer_inkling2_frontend_test` checks that a text turn and the image turn tokenize to llama.cpp's own
+  prompt ids.
+- Through the Engine, greedy on the image matches llama.cpp's continuation for 16 of 48 tokens. The same
+  text Program matches it for 48 of 48 when it gets the vision test's pixels (`test1.rgb`). The difference
+  is the JPEG decoder:
+  - FFmpeg's pixels differ from `test1.rgb` by 0.73 levels on average and 14 at most;
+  - the two continuations part ways after 16 tokens, and both describe the same front page.
+- `curl` against `ninfer-serve`:
+  - a greedy chat returns `"content": "Paris"`, with the reasoning in `reasoning_content`;
+  - streaming sends reasoning deltas, then content;
+  - the image request describes "MEN WALK ON MOON".
 
 ## GGUF mapping (Unsloth `unsloth/Inkling-2-Mini-GGUF`)
 
@@ -531,8 +611,8 @@ Sizes are rough engineer-days for a person or agent who knows the codebase, incl
 | 4. V100 decode performance | Fused decode kernels (MIX, CTRL, conv and norms), expert GEMV for NVFP4 via dp4a, global attention on FP16 KV, CUDA Graph per decode width; measure against the bandwidth floor | 5-8 |
 | 5. Prefill | cuBLAS HMMA for the dense and expert GEMMs (dequantize tiles to FP16), flash prefill with the relative bias and sink (extend the vendored `fattn` like [L]'s banded op) | 4-6 |
 | 6. DSpark (done, greedy, correctness first) | Drafter binding, tap capture at visits 5/23/41/48, Markov chain with the precomputed `W_head Wo`, verify of the full block (8) with `keep()` | 4-6 |
-| 7. Vision | mmproj conversion and the ViT | 4-6 |
-| 8. Chat/serving | template, reasoning and tool parsers, effort control | 2-3 |
+| 7. Vision (done, correctness first) | mmproj conversion and the ViT (see "Vision tower") | 4-6 |
+| 8. Chat/serving (MVP done) | template, reasoning and tool parsers, effort control (see "Serving") | 2-3 |
 
 The MVP (phases 1-3) is about 2.5 weeks. Everything after it is optional ordering.
 

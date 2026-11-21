@@ -18,3 +18,8 @@ ninfer_add_op_test(ninfer_inkling2_vision_test
 ninfer_add_op_test(ninfer_inkling2_frontend_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_frontend.cpp"
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_artifact ninfer_media_decode ninfer_core)
+# The public Engine on the real artifact: aggregate and streaming agree, seeds repeat, finish reasons, and the
+# vision test's image prompt (skips without the artifact).
+ninfer_add_op_test(ninfer_inkling2_engine_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine.cpp"
+  LIBRARIES ninfer_engine ninfer_core)
