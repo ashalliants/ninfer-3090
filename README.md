@@ -31,31 +31,44 @@ runtime loads the official groupwise `.ninfer` artifacts, serves OpenAI- and Ant
 APIs, and supports paged KV, compatible-prefix reuse, structured JSON output, CUDA Graphs, MTP and
 DFlash2 speculative decoding, vision, reasoning-effort control, ReplaySSM state transactions, and
 concurrent cohorts through **C8**. A 32 GB **Tesla V100** (`sm_70`, built from source on Linux) runs
-Qwen3.8-27B and Qwen3.8-Flash-Next too: [V100 guide](docs/tesla-v100.md).
+Qwen3.8-27B and Qwen3.8-Flash-Next too, and is the first home of **Inkling-2-Mini**: [V100 guide](docs/tesla-v100.md).
 
-**One RTX 3090, Linux launcher defaults (`rk4v4` KV):**
+> **Two cards, both first class: the RTX 3090 (24 GB, `sm_86`) and the Tesla V100 32 GB (`sm_70`).**
+> This project is built for, and tuned on, exactly these two GPUs. Every kernel route, schedule,
+> launcher default and published figure is measured on a physical 3090 or V100, never carried over
+> from another card or estimated. Other NVIDIA GPUs may build and run, but they are not targets:
+> no tuning, no published numbers, no guarantees.
 
-| | Qwen3.8-27B (dense) | Qwen3.6-35B-A3B (MoE) |
-|---|---:|---:|
-| **Max context** | **262,144** tokens (native) | **262,144** tokens (native), shared by 3 lanes |
-| **Prefill**, 4K prompt | **3,222 tok/s** | **8,848 tok/s** |
-| **Decode**, one stream | **140 tok/s** (DFlash2) | **313 tok/s** (MTP3 + draft head) |
-| **Decode**, all lanes | **477 tok/s** at C8 (MTP3) | **453 tok/s** at C6 (MTP3) |
+> **New: Inkling-2-Mini** (Thinking Machines, 2026-11-20), a 26B-total, 3.4B-active looped MoE with
+> 128 experts, now runs on one Tesla V100 with images and its own DSpark speculative drafter, served
+> over the same OpenAI and Anthropic APIs. See [Inkling-2-Mini](#inkling-2-mini-new-v100).
+
+### Performance by model and card
+
+Every figure below was measured on the card in its row: one GPU, one model, defaults unless noted.
+Decode is one stream unless the column says otherwise.
+
+| Model | Card | Max context | Prefill | Decode, one stream | Decode, all lanes |
+|---|---|---:|---:|---:|---:|
+| **Qwen3.8-27B** (dense) | RTX 3090 | **262,144** | **3,222 tok/s** at 4K | **140 tok/s** (DFlash2) | **477 tok/s** at C8 (MTP3) |
+| Qwen3.6-35B-A3B (MoE) | RTX 3090 | 262,144, shared by 3 lanes | 8,848 tok/s at 4K | 313 tok/s (MTP3 + draft head) | 453 tok/s at C6 (MTP3) |
+| Ternary Bonsai 2 27B | RTX 3090 | | 2.8-2.9K tok/s | 88 plain, 250-300 (DFlash2, 7 drafts) | |
+| Qwen3.8-Flash-Next (preview, Windows) | RTX 3090 | 32K default | 2,345-2,422 tok/s at 4K-128K | 108-113 tok/s (MTP), 78-81 plain | |
+| **Qwen3.8-27B** | Tesla V100 32 GB | 262,144 | ~1,020 tok/s at 4.4K | 76-86 tok/s (MTP3) | 79 tok/s at C2 (MTP3) |
+| Qwen3.8-Flash-Next | Tesla V100 32 GB | 262,144 | ~990 tok/s at 3.8K | 72-96 tok/s (MTP3), flat from 10K to 221K context | |
+| **Inkling-2-Mini** (new) | Tesla V100 32 GB | set by `--max-context` | ~377 tok/s at 1K | 65-73 tok/s plain, **83 tok/s average with DSpark** (67-121 by prompt) | one request at a time |
+
+RTX 3090 rows use the Linux launcher defaults (`rk4v4` KV) unless marked Windows. The V100 was
+measured over a 3.3 GB/s eGPU link (PCIe Gen3 x4) on a 59 GiB host: Qwen rows on 2026-11-18 (the
+two-lane figure 2026-11-20), Inkling-2-Mini on 2026-11-21. A blank cell has not been measured.
+Full methods: [RTX 3090 benchmarks](#performance-on-an-rtx-3090), [V100 guide](docs/tesla-v100.md),
+[Inkling-2-Mini spec](docs/maintainer/inkling2-model.md).
 
 **Qwen3.8-Flash-Next (preview, Windows)** runs on the same card too: a 512-expert MoE at 2 bits per
 weight with its experts pinned in host RAM, at **1.15-1.18x Strata's plain decode** and
 **109-113 tok/s with MTP**. A second, 3-bit build (Unsloth's UD-IQ3_XXS) reads about 7% better by perplexity at
 roughly half the speed, so you can pick. [Details](#qwen38-flash-next-preview) · [every re-measurement](#latest-benchmarks)
 
-**On a Tesla V100-32GB** ([guide](docs/tesla-v100.md); built from source, `scripts/run-v100.sh`):
-
-| | Qwen3.8-27B | Qwen3.8-Flash-Next |
-|---|---:|---:|
-| **Max context** | 262,144 tokens | 262,144 tokens |
-| **Prefill** | ~1,020 tok/s at 4.4K tokens | ~990 tok/s at 3.8K, a 38K-token prompt in 38 s |
-| **Decode**, one stream, MTP3 | 76-86 tok/s | 72-96 tok/s, flat from 10K to 221K tokens of context |
-
-Measured over a 3.3 GB/s eGPU link (PCIe Gen3 x4) on a 59 GiB host, 2026-11-18.
 
 ![Qwen3.8-27B on one RTX 3090: llama.cpp against NInfer-3090 (llama.cpp figures from a third party's published run)](docs/assets/llamacpp-vs-ninfer-27b.svg)
 
@@ -84,7 +97,7 @@ requests are not guaranteed.
 - [Quick start](#quick-start) — download, fetch a model, run
 - [Building from source](#building-from-source)
 - [Features](#features) and [serving APIs](#serving-apis)
-- [Models](#models)
+- [Models](#models), including [Inkling-2-Mini](#inkling-2-mini-new-v100) (new, V100)
 - [Performance on an RTX 3090](#performance-on-an-rtx-3090), starting with the [latest benchmarks](#latest-benchmarks)
 - [Tesla V100](docs/tesla-v100.md) — building, running and measured performance on `sm_70`
 - [Choosing a KV format](#choosing-a-kv-format)
@@ -539,6 +552,7 @@ a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding wor
 | Qwen3.6-35B-A3B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/ee4495803bc4f8015b8a7e22d4cf9b67de8e27c6) | 21.23 GiB | Carries the DFlash bundle for `--spec dflash` |
 | Qwen3.6-27B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-27B-NInfer/tree/3e3d9a3951c452c1ca80bd7a2860c7f3bfc5a829) | 16.29 GiB | Supported with more runtime headroom |
 | Qwen3.8-Flash-Next (preview) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090/tree/c7dfb9694fc3cb3d40298afbfe2e3a8c172241fa) | 38.20 GiB in two files + 27.13 GiB n-gram volume | Windows, one request at a time (two lanes opt-in), 64 GB RAM. This fork's [exact conversion](model-cards/Qwen3.8-Flash-Next-NInfer-3090/README.md) of the GSQ-RCO IQ2_XS GGUF with the MTP drafter and vision tower. Keep the n-gram volume on NVMe |
+| **Inkling-2-Mini** (new, V100) | converted locally from [Unsloth's UD-Q8_K_XL GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) | 22.27 GiB with DSpark and vision | Tesla V100 32 GB, Linux, one request at a time. An exact conversion: every tensor byte-identical to the GGUFs. See [Inkling-2-Mini](#inkling-2-mini-new-v100) |
 | Qwen3.8-Flash-Next, UD-IQ3_XXS (preview) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090/tree/196f11834dfe4fc21342f0255bcee034a5120ae7) | 53.17 GiB in two files + the 27.13 GiB n-gram volume of the row above | Windows, one request at a time, 64 GB RAM (about 42 GiB available), text only. This fork's [conversion](model-cards/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090/README.md) of Unsloth's Dynamic v3.1 UD-IQ3_XXS GGUF with the MTP drafter: lower perplexity than the row above, about half the speed |
 
 `download-model qwen38-27b`, `bonsai2-27b`, `qwen36-35b-a3b` or `qwen36-27b` (`.bat` on Windows, `.sh` on Linux)
@@ -569,6 +583,30 @@ pin is a different encoding with fewer weight bytes per token and needs this for
 app `download-qwen36-35b-v2` tracks upstream `main` to try a newer artifact than the measured one,
 so it has no size or hash to check and cannot safely resume. It writes to its own filename, refuses
 to resume, and is not the artifact the tests or the published figures use.
+
+### Inkling-2-Mini (new, V100)
+
+[Inkling-2-Mini](https://thinkingmachines.ai/model-card/inkling-2-mini/) is Thinking Machines'
+26.2B-total, 3.4B-active MoE: 24 layers, of which the middle 12 run three times per token (48 layer
+visits), 128 experts with top-8 sigmoid routing, NVFP4 experts on layers 0-19, and a learned
+relative attention bias instead of RoPE. It takes text and images; it has no video input.
+
+On one Tesla V100 32 GB, `ninfer-serve` serves it over the OpenAI chat, Anthropic messages and
+Responses routes, with streaming, tool calls, reasoning and thinking budgets, and images with
+`--vision`. Its own trained block drafter, DSpark, runs greedy speculative decoding
+(`--spec dspark`) with output identical to plain decode.
+
+- **Decode:** 65-73 tok/s plain; with DSpark at 3 drafts, 83 tok/s on average over five chat
+  prompts (code 121, arithmetic 106, explanation 77, story 70, list 67), never slower than plain.
+- **Prefill:** ~377 tok/s at 1K tokens. A 234-token image prompt takes 0.09 s of vision and 0.58 s of prefill.
+- **Accuracy:** greedy text matches CPU llama.cpp (Unsloth's PR at the same revision) on 58 of 58
+  checked positions, and image prompts on 48 of 48 tokens from identical pixels.
+- **Not yet:** prefix reuse, more than one lane, the context store, JSON-schema output and logprobs.
+  The server refuses requests that need them. Not measured on an RTX 3090.
+
+Convert it from Unsloth's UD-Q8_K_XL GGUF with `tools/convert/inkling2.py` (add the DSpark drafter
+and the `mmproj` vision tower with `--mtp-gguf` and `--mmproj`); the design, the conversion map and
+every measurement are in [docs/maintainer/inkling2-model.md](docs/maintainer/inkling2-model.md).
 
 ## Performance on an RTX 3090
 
@@ -886,11 +924,11 @@ and the design are in `docs/maintainer/pipeline-parallel-plan.md`.
 - `sm_80` (Ampere GA100, e.g. an unlocked NVIDIA CMP 170HX) is an added but **unmeasured**
   compatibility target: it shares sm_86's instruction set and runs Qwen3.8-27B correctly at roughly
   3090-like speed with no route tables tuned for it yet.
-- `sm_70` (Tesla V100) is an **experimental, never-run** target: it compiles and links, emulating
-  the Ampere instructions the kernels use, and has not been executed on a card. Qwen3.8-27B, Ternary
-  Bonsai 2 27B, Qwen3.6-35B-A3B and Flash-Next are the intended models. See
-  [the Volta port notes](docs/maintainer/volta-port.md) for what it changes, the expected
-  performance and how to validate it.
+- `sm_70` (Tesla V100 32 GB) is a **first-class, measured** target alongside the RTX 3090: it is
+  built and run on a physical V100-PCIE-32GB, where Qwen3.8-27B, Qwen3.8-Flash-Next and
+  Inkling-2-Mini are tuned and measured. Ampere-only instructions are emulated only where no Volta
+  route exists. It builds from source on Linux; see the [V100 guide](docs/tesla-v100.md) and
+  [the Volta port notes](docs/maintainer/volta-port.md).
 
 ## Release history
 

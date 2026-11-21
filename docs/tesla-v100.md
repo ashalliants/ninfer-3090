@@ -1,8 +1,10 @@
 # NInfer on a Tesla V100
 
-NInfer runs on a 32 GB Tesla V100 (Volta, `sm_70`). Two models are supported and tuned there:
-**Qwen3.8-27B**, and **Qwen3.8-Flash-Next**, the 512-expert MoE with the full 262,144-token
-context. This page covers what you need, how to build and run it, the measured performance, and
+NInfer runs on a 32 GB Tesla V100 (Volta, `sm_70`), one of the project's two first-class cards
+alongside the RTX 3090. Three models are supported and tuned there: **Qwen3.8-27B**,
+**Qwen3.8-Flash-Next**, the 512-expert MoE with the full 262,144-token context, and
+**Inkling-2-Mini**, the looped 128-expert MoE with images and DSpark speculative decoding
+([spec and measurements](maintainer/inkling2-model.md)). This page covers what you need, how to build and run it, the measured performance, and
 the limits. How the port works, and every measurement behind it, is in
 [docs/maintainer/volta-port.md](maintainer/volta-port.md).
 
