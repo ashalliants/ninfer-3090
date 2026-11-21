@@ -34,10 +34,12 @@ concurrent cohorts through **C8**. A 32 GB **Tesla V100** (`sm_70`, built from s
 Qwen3.8-27B and Qwen3.8-Flash-Next too, and is the first home of **Inkling-2-Mini**: [V100 guide](docs/tesla-v100.md).
 
 > **Two cards, both first class: the RTX 3090 (24 GB, `sm_86`) and the Tesla V100 32 GB (`sm_70`).**
-> This project is built for, and tuned on, exactly these two GPUs. Every kernel route, schedule,
-> launcher default and published figure is measured on a physical 3090 or V100, never carried over
-> from another card or estimated. Other NVIDIA GPUs may build and run, but they are not targets:
-> no tuning, no published numbers, no guarantees.
+> This project is built for, and tuned on, exactly these two GPUs. Every kernel route, schedule and
+> launcher default, and every NInfer figure published here, is measured on a physical 3090 or V100,
+> never carried over from another card. The exceptions are stated where they appear: the
+> third-party llama.cpp baseline in the animation above, and the 27B's 262,144-token context under
+> the default profile, which is extrapolated. Other NVIDIA GPUs may build and run, but they are not
+> targets: no tuning, no published numbers, no guarantees.
 
 > **New: Inkling-2-Mini** (Thinking Machines, 2026-11-20), a 26B-total looped MoE (5.4B active per token) with
 > 128 experts, now runs on one Tesla V100 with images and its own DSpark speculative drafter, served
