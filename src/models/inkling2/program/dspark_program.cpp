@@ -283,18 +283,26 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t
     const Tensor joint_bias = model_.tensor(w.joint_bias, {3 * r});
     const Tensor joint_in   = joint_in_.reshape({i32(joint_in_.numel()), 1});
     Tensor joint_out        = joint.reshape({3 * r, 1});
-    const Tensor joint_weight = model_.tensor(w.joint, {i32(joint_in_.numel()), 3 * r});
+    // A BF16 joint runs by BF16 inputs into projection_fp32 (its 768 rows in enough blocks); a Q8_0 one (the converter
+    // admits either) by dense_projection_fp32 over its own format, as before.
+    const ops::DenseMatrix joint_matrix = matrix(model_.matrix(w.joint));
+    const bool joint_bf16               = joint_matrix.format == QType::BF16;
+    Tensor joint_weight;
+    if (joint_bf16) { joint_weight = model_.tensor(w.joint, {i32(joint_in_.numel()), 3 * r}); }
     const Tensor* joint_weights[] = {&joint_weight};
     for (std::int32_t i = 1; i <= n_drafts; ++i) {
         ops::embedding_bf16_fp32(ids_.slice(0, i - 1, 1), w1, prev_row, stream_);
         cuda(cudaMemcpyAsync(static_cast<float*>(joint_in_.data) + 2 * r, static_cast<const float*>(x.data) + std::size_t(i) * h,
                              std::size_t(h) * 4, cudaMemcpyDeviceToDevice, stream_),
              "x_i");
-        // The joint by BF16 inputs into projection_fp32 (its 768 rows in enough blocks), then its bias.
-        Tensor jb = workspace_.alloc(DType::BF16, {i32(joint_in_.numel()), 1});
-        ops::cast_fp32_to_bf16(joint_in, jb, stream_);
-        ops::projection_fp32(jb, joint_weights, joint_out, stream_);
-        ops::add_fp32(joint, joint_bias, joint, stream_);
+        if (joint_bf16) {
+            Tensor jb = workspace_.alloc(DType::BF16, {i32(joint_in_.numel()), 1});
+            ops::cast_fp32_to_bf16(joint_in, jb, stream_);
+            ops::projection_fp32(jb, joint_weights, joint_out, stream_);
+            ops::add_fp32(joint, joint_bias, joint, stream_);
+        } else {
+            ops::dense_projection_fp32(joint_in, joint_matrix, &joint_bias, joint_out, stream_);
+        }
         ops::dspark_markov_update_fp32(joint, state, latent, stream_);
         Tensor logits = base.slice(1, i - 1, 1).reshape({vocab});
         ops::dspark_markov_logits(logits, hb_, markov_, latent, c.final_logit_softcap, logits, stream_);
