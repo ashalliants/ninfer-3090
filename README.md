@@ -616,6 +616,7 @@ convert it yourself, take the three GGUFs from `unsloth/Inkling-2-Mini-GGUF` and
 chat template from the `thinkingmachines/Inkling-2-Mini` checkpoint (`CKPT` below), then:
 
 ```bash
+CKPT=/path/to/Inkling-2-Mini   # the thinkingmachines/Inkling-2-Mini checkpoint directory
 python3 -m tools.convert --recipe inkling2_gguf --device cpu \
   --model Inkling-2-Mini-UD-Q8_K_XL.gguf \
   --mtp-gguf dspark-Inkling-2-Mini-Q8_0.gguf \
