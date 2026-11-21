@@ -625,7 +625,8 @@ the longest ring. That is about 25 MB of workspace at 65,536 context.
 ## FP16 KV rings
 
 **Lossy, on by default.** The target's and the drafter's KV rings hold FP16 (`EngineOptions::kv_rings`,
-`ProgramLimits::kv_fp16`); `--kv-dtype fp32` keeps the exact FP32 program, for reproduction. With FP16 rings the
+`ProgramLimits::kv_fp16`); `--kv-dtype fp32` keeps the exact FP32 program, for reproduction (it also resolves an unset `--prefill-math` to
+`fp32`; an explicit `--prefill-math tc` beside it runs the tensor cores and is not exact). With FP16 rings the
 head norms' append rounds each normalized K and V value to nearest FP16, and the attention widens the values back to
 FP32 as it reads them. Scores, softmax and sums stay FP32. A position costs 32 KiB across the 8 global visits
 instead of 64 KiB, so about twice the context fits. Inkling-2 refuses every other `--kv-dtype` form.

@@ -39,7 +39,8 @@ enum class DenseQ8 : std::uint8_t { Off, Head, All };
 
 // Inkling-2's KV rings (--kv-dtype fp16|fp32): Default is FP16; FP32 reproduces the exact FP32 program.
 enum class KvRings : std::uint8_t { Default, FP16, FP32 };
-// Inkling-2's prefill arithmetic (--prefill-math tc|fp32): Default is TensorCores; FP32 is the exact FP32 program.
+// Inkling-2's prefill arithmetic (--prefill-math tc|fp32): Default is TensorCores, or FP32 with KvRings::FP32 (so
+// --kv-dtype fp32 alone stays the exact FP32 program); FP32 is the exact FP32 program.
 enum class PrefillMath : std::uint8_t { Default, TensorCores, FP32 };
 
 enum class KvCacheStorage : std::uint8_t {
@@ -887,9 +888,10 @@ struct EngineOptions {
     // refuses it rather than reading the default BF16 as "unset".
     bool kv_cache_explicit                 = false;
     // Inkling-2 only (other models refuse anything but Default): its prefill forwards of 64 or more columns. Default
-    // and TensorCores (--prefill-math tc) run the projections, the experts and the attention on the FP16 tensor
-    // cores with FP32 accumulation (lossy, at the noise floor of an FP32 reordering; about five times the speed);
-    // FP32 (--prefill-math fp32) keeps the exact FP32 program. Decode and DSpark's verify are FP32 either way.
+    // (except with kv_rings FP32, where it means FP32) and TensorCores (--prefill-math tc) run the projections, the
+    // experts and the attention on the FP16 tensor cores with FP32 accumulation (lossy, at the noise floor of an FP32
+    // reordering; about five times the speed); FP32 (--prefill-math fp32) keeps the exact FP32 program. An explicit
+    // TensorCores with kv_rings FP32 is allowed and is not exact. Decode and DSpark's verify are FP32 either way.
     PrefillMath prefill_math               = PrefillMath::Default;
     // Qwen3.6-35B-A3B only: the MTP draft layer's routed experts are stored W8 in the artifact;
     // transcode them to the text layers' formats (Q4 gate_up, Q6 down) at load. Drafts are

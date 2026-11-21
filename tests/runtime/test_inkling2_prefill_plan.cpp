@@ -14,6 +14,7 @@
 namespace {
 
 using ninfer::runtime::inkling2::prefill_call_width;
+using ninfer::runtime::inkling2::prefill_is_fp32;
 using ninfer::runtime::inkling2::prefill_snapshot_at;
 
 using Calls = std::vector<std::pair<std::int32_t, std::int32_t>>; // (start, width)
@@ -59,6 +60,12 @@ int main() {
     // resume [256,768) where a cold 1024-token prefill runs [0,512) [512,768) [768,1024)), and a 513-token one leaves 512.
     check(prefill_snapshot_at(512, 512) == 0 && prefill_snapshot_at(513, 512) == 512, "chunk 512 snapshots at 0 and 512", 512, 512, 1024);
     check(plan(0, 1024, 512) == Calls{{0, 512}, {512, 512}}, "a cold 1024-token prefill at chunk 512 runs two whole chunks", 512, 0, 1024);
+    // --kv-dtype fp32 alone stays the exact FP32 program; an explicit --prefill-math decides otherwise.
+    using ninfer::KvRings, ninfer::PrefillMath;
+    static_assert(prefill_is_fp32(KvRings::FP32, PrefillMath::Default) && prefill_is_fp32(KvRings::Default, PrefillMath::FP32) &&
+                  prefill_is_fp32(KvRings::FP16, PrefillMath::FP32));
+    static_assert(!prefill_is_fp32(KvRings::FP32, PrefillMath::TensorCores) && !prefill_is_fp32(KvRings::Default, PrefillMath::Default) &&
+                  !prefill_is_fp32(KvRings::FP16, PrefillMath::Default));
     if (failures != 0) {
         std::fprintf(stderr, "FAIL: %d checks\n", failures);
         return 1;

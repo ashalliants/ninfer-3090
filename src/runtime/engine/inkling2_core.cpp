@@ -34,6 +34,7 @@ namespace {
 namespace ink = models::inkling2;
 using Clock   = std::chrono::steady_clock;
 using inkling2::prefill_call_width;
+using inkling2::prefill_is_fp32;
 using inkling2::prefill_snapshot_at;
 
 double seconds_between(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double>(b - a).count(); }
@@ -322,7 +323,7 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         limits.last_logits = true; // prefill reads only the last column (decode below)
         limits.split_attention = options_.split_attention;
         limits.kv_fp16         = options_.kv_rings != KvRings::FP32; // FP16 by default
-        if (options_.prefill_math != PrefillMath::FP32) { limits.prefill_tc = ink::ProgramLimits::TensorCoreParts::all(); }
+        if (!prefill_is_fp32(options_.kv_rings, options_.prefill_math)) { limits.prefill_tc = ink::ProgramLimits::TensorCoreParts::all(); }
         const bool dspark  = options_.speculative.backend == SpeculativeBackend::DSpark;
         if (dspark) {
             const ink::DSparkConfig* dc = model_->dspark_config();
@@ -379,9 +380,10 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     load_.artifact_id         = artifact::artifact_id_hex(reader.artifact_id());
     load_.weight_formats      = {"bf16", "ggml_q8_0", "ggml_rec_nvfp4_nvfp4", "fp32"};
     if (options_.dense_q8 != DenseQ8::Off) { load_.weight_formats.push_back("q8_g32_fp16 (re-encoded at load)"); }
-    load_.prefill_signature   = options_.prefill_math == PrefillMath::FP32 ? "inkling2-fp32" : "inkling2-tc";
+    const bool fp32_prefill   = prefill_is_fp32(options_.kv_rings, options_.prefill_math);
+    load_.prefill_signature   = fp32_prefill ? "inkling2-fp32" : "inkling2-tc";
     load_.notes.push_back("prefill | chunk " + std::to_string(chunk_) + (options_.prefill_chunk_auto ? " (widest that fits)" : " (--prefill-chunk)") +
-                          " | " + (options_.prefill_math == PrefillMath::FP32 ? "FP32" : "tensor cores (--prefill-math fp32: the exact FP32 prefill)"));
+                          " | " + (fp32_prefill ? "FP32" : "tensor cores (--prefill-math fp32: the exact FP32 prefill)"));
     load_.takes_video         = false;
     load_.load_seconds        = seconds_between(start, Clock::now());
     load_.upload_seconds       = stats.upload_seconds;

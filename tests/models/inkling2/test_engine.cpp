@@ -153,12 +153,16 @@ int main() {
             } catch (const std::invalid_argument&) {}
         }
         {
-            // Prefix reuse off: no snapshot, so no extra device state is reported.
+            // Prefix reuse off: no snapshot, so no extra device state is reported. With FP32 rings and --prefill-math
+            // unset, the prefill is the exact FP32 one too.
             ninfer::EngineOptions uncached = options;
             uncached.context_cache.enabled = false;
+            uncached.kv_rings              = ninfer::KvRings::FP32;
             ninfer::Engine engine(uncached);
             check(!engine.options().context_cache.enabled && engine.options().context_cache.device_state_slots == 0U,
                   "no extra device state without prefix reuse");
+            check(engine.load_summary().prefill_signature == "inkling2-fp32",
+                  "--kv-dtype fp32 alone runs the exact FP32 prefill: " + engine.load_summary().prefill_signature);
         }
         {
             // Prefix reuse at --prefill-chunk 512 under the tensor-core default: every cut and snapshot is a multiple of
