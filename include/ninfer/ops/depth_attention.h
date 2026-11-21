@@ -5,10 +5,13 @@
 // docs/maintainer/inkling2-model.md 3b, 3c, 3i and 4). Columns follow fp32_rows.h: [D, T], ne[0]
 // contiguous, any column stride.
 
+#include "core/arena.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <span>
 
 namespace ninfer::ops {
@@ -35,9 +38,12 @@ inline constexpr int kDepthAttentionMaxQueries = 4;
  *   FP32 reductions, max-subtracted softmax; oracle FP64 (tests/ops/inkling2_reference.h mix).
  *
  * Effects: writes the outputs, which must not overlap a source or each other.
- * Workspace: none. Execution: stream-ordered; graph capturable.
+ * Workspace: depth_attention_mix_workspace_bytes(D, T, S) from `workspace`, released on return; the query
+ *   throws std::invalid_argument outside the supported domain.
+ * Execution: stream-ordered; graph capturable.
  */
-void depth_attention_mix(std::span<const Tensor* const> sources, const Tensor& queries, float eps,
+[[nodiscard]] std::size_t depth_attention_mix_workspace_bytes(std::int32_t rows, std::int64_t columns, int sources);
+void depth_attention_mix(std::span<const Tensor* const> sources, const Tensor& queries, float eps, DeviceArena& workspace,
                          std::span<Tensor* const> outputs, cudaStream_t stream);
 
 /**

@@ -28,6 +28,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -156,7 +158,8 @@ void test_mix_and_control() {
     std::vector<Tensor*> op;
     for (auto& s : st) { sp.push_back(&s); }
     for (auto& o : ot) { op.push_back(&o); }
-    ninfer::ops::depth_attention_mix(sp, dq.tensor({h, queries}), 1e-6F, op, nullptr);
+    ninfer::DeviceArena mix_arena(ninfer::ops::depth_attention_mix_workspace_bytes(h, cols, sources) + 4096);
+    ninfer::ops::depth_attention_mix(sp, dq.tensor({h, queries}), 1e-6F, mix_arena, op, nullptr);
     for (int i = 0; i < queries; ++i) {
         Vec want;
         for (int c = 0; c < cols; ++c) {
@@ -227,7 +230,11 @@ void test_clips() {
     Buf dx(x), ds(scale);
     Tensor tx = dx.tensor({heads * d, cols});
     const Tensor ts = ds.tensor({d, heads});
-    const ninfer::ops::PositionLogScale tau{20000, 8192, 0.1F};
+    // Position 20000 as a host start of 19000 plus a device offset of 1000.
+    const std::int64_t offset = 1000;
+    ninfer::DeviceBuffer doff(sizeof offset);
+    check(cudaMemcpy(doff.p, &offset, sizeof offset, cudaMemcpyHostToDevice) == cudaSuccess, "offset upload");
+    const ninfer::ops::PositionLogScale tau{19000, 8192, 0.1F, static_cast<const std::int64_t*>(doff.p)};
     ninfer::ops::head_l2_clip_fp32(tx, d, &ts, 16.0F * std::sqrt(2.0F), &tau, nullptr);
     Vec want;
     for (int c = 0; c < cols; ++c)
@@ -251,7 +258,10 @@ void test_clips() {
 }
 
 // Positions 0..n-1 through relative_bias_sink_attention in calls of `chunk`, against the oracle over the whole sequence.
-void test_attention(int window, int extent, int n, int chunk, const std::string& label) {
+// With device_start each call passes start 0 and the position as the device offset (how a decode graph runs).
+// Only positions from check_from on are compared (the FP64 oracle is quadratic in n).
+void test_attention(int window, int extent, int n, int chunk, const std::string& label, bool device_start = false,
+                    int check_from = 0) {
     const int heads = 24, kvh = 8, d = 128, rel = 16, qw = heads * d, kvw = kvh * d;
     auto q = randoms(qw * n, -0.3F, 0.3F), r = randoms(heads * rel * n), sink = randoms(heads * n, -2, 2), k = randoms(kvw * n),
          v = randoms(kvw * n), table = randoms(extent * rel, -0.5, 0.5);
@@ -259,16 +269,22 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
     Buf dq(q), dr(r), ds(sink), dk(k), dv(v), dt(table), kc(static_cast<std::size_t>(kvw * capacity)),
         vc(static_cast<std::size_t>(kvw * capacity)), out(static_cast<std::size_t>(qw * n));
     Tensor tkc = kc.tensor({kvw, capacity}), tvc = vc.tensor({kvw, capacity});
+    ninfer::DeviceBuffer doff(sizeof(std::int64_t));
     for (int s = 0; s < n; s += chunk) {
         const int len = std::min(chunk, n - s);
+        const std::int64_t position = s;
+        if (device_start) {
+            check(cudaMemcpy(doff.p, &position, sizeof position, cudaMemcpyHostToDevice) == cudaSuccess, "offset upload");
+        }
         Tensor to = out.tensor({qw, n}).slice(1, s, len);
         ninfer::ops::relative_bias_sink_attention({heads, kvh, d, rel, window}, dq.tensor({qw, n}).slice(1, s, len),
                                                   dr.tensor({heads * rel, n}).slice(1, s, len), ds.tensor({heads, n}).slice(1, s, len),
                                                   dk.tensor({kvw, n}).slice(1, s, len), dv.tensor({kvw, n}).slice(1, s, len),
-                                                  dt.tensor({rel, extent}), tkc, tvc, s, to, nullptr);
+                                                  dt.tensor({rel, extent}), tkc, tvc, device_start ? 0 : s,
+                                                  device_start ? static_cast<const std::int64_t*>(doff.p) : nullptr, to, nullptr);
     }
     Vec want;
-    for (int p = 0; p < n; ++p) {
+    for (int p = check_from; p < n; ++p) {
         std::vector<bool> visible(n);
         Vec bias(static_cast<std::size_t>(heads) * n, 0.0);
         for (int j = 0; j < n; ++j) {
@@ -282,7 +298,8 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
                                      Vec(sink.begin() + p * heads, sink.begin() + (p + 1) * heads), visible, heads, kvh, d);
         want.insert(want.end(), o.begin(), o.end());
     }
-    compare(label, out.get(qw * n), want, 2e-6);
+    const auto got = out.get(qw * n);
+    compare(label, std::vector<float>(got.begin() + static_cast<std::ptrdiff_t>(check_from) * qw, got.end()), want, 2e-6);
 }
 
 void test_route() {
@@ -290,7 +307,8 @@ void test_route() {
     auto z = randoms(h * cols), router = randoms(e * h, -0.05F, 0.05F), bias = randoms(e, -0.01F, 0.01F);
     Buf dz(z), dr(router), db(bias), ids(static_cast<std::size_t>(k * cols)), w(static_cast<std::size_t>(k * cols));
     Tensor tid = ids.tensor({k, cols}, DType::I32), tw = w.tensor({k, cols});
-    ninfer::ops::moe_route_sigmoid_topk(dz.tensor({h, cols}), dr.tensor({h, e}), db.tensor({e}), k, 8.0F, tid, tw, nullptr);
+    ninfer::DeviceArena arena(ninfer::ops::moe_route_sigmoid_topk_workspace_bytes(e, cols) + 4096);
+    ninfer::ops::moe_route_sigmoid_topk(dz.tensor({h, cols}), dr.tensor({h, e}), db.tensor({e}), k, 8.0F, arena, tid, tw, nullptr);
     const auto got_ids = t::from_device<std::int32_t>(ids.b, k * cols);
     Vec want_w;
     bool same = true;
@@ -302,6 +320,27 @@ void test_route() {
     check(same, "moe_route_sigmoid_topk: selected experts differ from the oracle (random scores have no tie within 1e-6)");
     std::printf("%-44s experts %s\n", "moe_route_sigmoid_topk", same ? "equal" : "DIFFER");
     compare("moe_route_sigmoid_topk weights", w.get(k * cols), want_w, 2e-6);
+
+    // Exact ties (a zero router: every score 1/2) among 40 experts, bias steering two of them: the steered two
+    // first, then the lowest ids.
+    const int few = 40, picks = 5;
+    std::vector<float> zero(static_cast<std::size_t>(few) * h, 0.0F), steer(few, 0.0F);
+    steer[33] = 0.5F;
+    steer[7]  = 0.25F;
+    Buf dzero(zero), dsteer(steer), tie_ids(static_cast<std::size_t>(picks * cols)), tie_w(static_cast<std::size_t>(picks * cols));
+    Tensor tti = tie_ids.tensor({picks, cols}, DType::I32), ttw = tie_w.tensor({picks, cols});
+    ninfer::DeviceArena tie_arena(ninfer::ops::moe_route_sigmoid_topk_workspace_bytes(few, cols) + 4096);
+    ninfer::ops::moe_route_sigmoid_topk(dz.tensor({h, cols}), dzero.tensor({h, few}), dsteer.tensor({few}), picks, 8.0F,
+                                        tie_arena, tti, ttw, nullptr);
+    const auto tied = t::from_device<std::int32_t>(tie_ids.b, picks * cols);
+    bool order = true;
+    for (int c = 0; c < cols; ++c) {
+        const std::int32_t want[] = {33, 7, 0, 1, 2};
+        for (int i = 0; i < picks; ++i) { order &= tied[c * picks + i] == want[i]; }
+    }
+    check(order, "moe_route_sigmoid_topk: ties go to the lower id, after the bias-steered experts");
+    const auto tw_got = tie_w.get(picks * cols);
+    check(std::all_of(tw_got.begin(), tw_got.end(), [](float x) { return std::fabs(x - 1.6F) < 1e-6F; }), "tied weights are 8 / 5");
 }
 
 std::uint64_t align256(std::uint64_t v) { return (v + 255) / 256 * 256; }
@@ -391,6 +430,16 @@ void test_experts(bool nvfp4, int h, int inter, int experts, const std::string& 
     Tensor tout = dout.tensor({h, cols});
     ninfer::ops::moe_situ_experts(bank, dz.tensor({h, cols}), Tensor(did.p, DType::I32, {k, cols}), dw.tensor({k, cols}), 4.0F, 25.0F,
                                   arena, tout, nullptr);
+    if (nvfp4) { // the vector loads need 16-byte aligned records: an offset base is refused, not read
+        auto shifted = bank;
+        shifted.records += 4;
+        bool refused = false;
+        try {
+            ninfer::ops::moe_situ_experts(shifted, dz.tensor({h, cols}), Tensor(did.p, DType::I32, {k, cols}), dw.tensor({k, cols}), 4.0F,
+                                          25.0F, arena, tout, nullptr);
+        } catch (const std::invalid_argument&) { refused = true; }
+        check(refused, label + ": unaligned NVFP4 records were accepted");
+    }
     double scale = 0;
     for (double x : want) { scale = std::max(scale, std::fabs(x)); }
     Vec scaled(want.size());
@@ -404,7 +453,134 @@ void test_experts(bool nvfp4, int h, int inter, int experts, const std::string& 
     compare(label, got_scaled, scaled, 1e-5);
 }
 
+// NINFER_INKLING2_OP_BENCH=1: decode-shaped timing (T = 1, top 8 of 32 resident experts at the model's shape, each
+// call a different 8 so nothing stays in L2), printed as microseconds and effective weight bandwidth. Not a criterion.
+void bench_experts(bool nvfp4) {
+    const int h = 2304, inter = 1152, experts = 32, k = 8, iters = 40;
+    ninfer::ops::SituExpertBank bank;
+    bank.experts = experts;
+    bank.hidden = h;
+    bank.intermediate = inter;
+    ninfer::DeviceBuffer records, bgu, bd, scales;
+    std::uint64_t per_expert = 0;
+    if (nvfp4) {
+        const std::uint64_t gate_row = h / 64 * 36, down_row = inter / 64 * 36, gate_bytes = gate_row * inter;
+        const std::uint64_t up_off = align256(gate_bytes), down_off = align256(up_off + gate_bytes),
+                            stride = align256(down_off + down_row * h);
+        std::vector<std::uint8_t> host(stride * experts, 0);
+        for (int e = 0; e < experts; ++e) {
+            const auto blocks = nvfp4_blocks(stride / 36);
+            std::copy(blocks.begin(), blocks.end(), host.begin() + e * stride);
+        }
+        records = t::to_device(host);
+        scales  = t::to_device(std::vector<float>(2 * experts, 1.0F));
+        bank.format        = ninfer::QType::GGML_REC_NVFP4_NVFP4;
+        bank.records       = static_cast<const std::uint8_t*>(records.p);
+        bank.record_stride = stride;
+        bank.gate_up_scale = static_cast<const float*>(scales.p);
+        bank.down_scale    = static_cast<const float*>(scales.p) + experts;
+        per_expert         = 2 * gate_bytes + down_row * h;
+    } else {
+        bgu = t::to_device_bf16(randoms(static_cast<std::size_t>(experts) * 2 * inter * h, -0.05F, 0.05F));
+        bd  = t::to_device_bf16(randoms(static_cast<std::size_t>(experts) * h * inter, -0.05F, 0.05F));
+        bank.format  = ninfer::QType::BF16;
+        bank.gate_up = bgu.p;
+        bank.down    = bd.p;
+        per_expert   = 3ULL * inter * h * 2;
+    }
+    std::vector<int> ids(static_cast<std::size_t>(k) * iters);
+    for (int i = 0; i < iters; ++i)
+        for (int j = 0; j < k; ++j) { ids[i * k + j] = (i * k + j) % experts; }
+    Buf dz(randoms(h)), dw(std::vector<float>(k, 1.0F)), dout(static_cast<std::size_t>(h));
+    ninfer::DeviceBuffer did = t::to_device_i32(ids);
+    ninfer::DeviceArena arena(ninfer::ops::moe_situ_experts_workspace_bytes(bank, k) + 4096);
+    Tensor tout = dout.tensor({h, 1});
+    const auto run = [&](int i) {
+        ninfer::ops::moe_situ_experts(bank, dz.tensor({h, 1}), Tensor(static_cast<std::int32_t*>(did.p) + i * k, DType::I32, {k, 1}),
+                                      dw.tensor({k, 1}), 4.0F, 25.0F, arena, tout, nullptr);
+    };
+    run(0);
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+    for (int i = 0; i < iters; ++i) { run(i); }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, start, stop);
+    const double us = 1e3 * ms / iters;
+    std::printf("bench moe_situ_experts %s T=1 top 8: %.1f us, %.0f GB/s of expert weights\n", nvfp4 ? "NVFP4" : "BF16 ", us,
+                k * per_expert / (us * 1e3));
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+}
+
 } // namespace
+
+// More columns than a grid's y holds (70000 > 65535): every column is the same, so each must give the first
+// column's bits, and the first must meet the oracle.
+void test_many_columns() {
+    const int h = 64, cols = 70000, e = 16, k = 2;
+    const auto col0 = randoms(h, -1, 1), col1 = randoms(h, -2, 2), q = randoms(h, -0.3F, 0.3F);
+    std::vector<float> a, b;
+    for (int c = 0; c < cols; ++c) {
+        a.insert(a.end(), col0.begin(), col0.end());
+        b.insert(b.end(), col1.begin(), col1.end());
+    }
+    Buf da(a), db(b), dq(q), out(static_cast<std::size_t>(h) * cols);
+    const Tensor ta = da.tensor({h, cols}), tb = db.tensor({h, cols});
+    Tensor to = out.tensor({h, cols});
+    const Tensor* sources[] = {&ta, &tb};
+    Tensor* outs[] = {&to};
+    ninfer::DeviceArena arena(ninfer::ops::depth_attention_mix_workspace_bytes(h, cols, 2) + 4096);
+    ninfer::ops::depth_attention_mix(sources, dq.tensor({h, 1}), 1e-6F, arena, outs, nullptr);
+    const auto got = out.get(static_cast<std::size_t>(h) * cols);
+    bool same = true;
+    for (int c = 1; c < cols && same; ++c) { same = std::equal(got.begin(), got.begin() + h, got.begin() + static_cast<std::ptrdiff_t>(c) * h); }
+    check(same, "MIX over 70000 columns: a column differs from the first");
+    compare("depth_attention_mix T = 70000, column 0", std::vector<float>(got.begin(), got.begin() + h),
+            ref::mix({widen(col0), widen(col1)}, widen(q), h), 2e-6);
+
+    const auto router = randoms(e * h, -0.5F, 0.5F), bias = randoms(e, -0.01F, 0.01F);
+    Buf dr(router), dbias(bias), ids(static_cast<std::size_t>(k) * cols), w(static_cast<std::size_t>(k) * cols);
+    Tensor tid = ids.tensor({k, cols}, DType::I32), tw = w.tensor({k, cols});
+    ninfer::DeviceArena route_arena(ninfer::ops::moe_route_sigmoid_topk_workspace_bytes(e, cols) + 4096);
+    ninfer::ops::moe_route_sigmoid_topk(ta, dr.tensor({h, e}), dbias.tensor({e}), k, 8.0F, route_arena, tid, tw, nullptr);
+    const auto got_ids = t::from_device<std::int32_t>(ids.b, static_cast<std::size_t>(k) * cols);
+    const auto got_w = w.get(static_cast<std::size_t>(k) * cols);
+    bool same_route = true;
+    for (int c = 1; c < cols && same_route; ++c) {
+        for (int i = 0; i < k; ++i) { same_route = same_route && got_ids[c * k + i] == got_ids[i] && got_w[c * k + i] == got_w[i]; }
+    }
+    check(same_route, "route over 70000 columns: a column differs from the first");
+    const ref::Route want = ref::route(widen(col0), widen(router), widen(bias), k, 8.0);
+    bool ids_match = true;
+    for (int i = 0; i < k; ++i) { ids_match = ids_match && got_ids[i] == want.ids[i]; }
+    check(ids_match, "route T = 70000: column 0's experts differ from the oracle");
+    std::printf("T = 70000 (past a grid's y): MIX and route give every column the first one's bits\n");
+}
+
+// The workspace queries refuse what the Ops refuse.
+void test_workspace_queries() {
+    const auto refuses = [](auto query) {
+        try {
+            (void)query();
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    namespace o = ninfer::ops;
+    check(refuses([] { return o::depth_attention_mix_workspace_bytes(2304, 0, 2); }), "MIX query takes T = 0");
+    check(refuses([] { return o::depth_attention_mix_workspace_bytes(2304, -1, 2); }), "MIX query takes T < 0");
+    check(refuses([] { return o::depth_attention_mix_workspace_bytes(0, 1, 2); }), "MIX query takes D = 0");
+    check(refuses([] { return o::depth_attention_mix_workspace_bytes(2304, 1, 9); }), "MIX query takes 9 sources");
+    check(refuses([] { return o::moe_route_sigmoid_topk_workspace_bytes(0, 1); }), "route query takes E = 0");
+    check(refuses([] { return o::moe_route_sigmoid_topk_workspace_bytes(257, 1); }), "route query takes E > 256");
+    check(refuses([] { return o::moe_route_sigmoid_topk_workspace_bytes(128, 0); }), "route query takes T = 0");
+    check(!refuses([] { return o::depth_attention_mix_workspace_bytes(2304, 70000, 8); }), "MIX query refuses T > 65535");
+    check(!refuses([] { return o::moe_route_sigmoid_topk_workspace_bytes(256, 70000); }), "route query refuses T > 65535");
+    std::printf("workspace queries refuse outside the domain\n");
+}
 
 int main() {
     if (t::cuda_unavailable()) {
@@ -412,6 +588,8 @@ int main() {
         return 77;
     }
     try {
+        test_workspace_queries();
+        test_many_columns();
         test_rows();
         test_mix_and_control();
         test_short_conv(false);
@@ -421,10 +599,19 @@ int main() {
         test_attention(0, 4, 12, 5, "attention global, extent 4 < context");
         test_attention(4, 4, 13, 3, "attention local window 4, ring wraps");
         test_attention(4, 4, 13, 1, "attention local window 4, decode steps");
+        test_attention(4, 4, 13, 1, "attention local window 4, decode, device start", true);
+        test_attention(0, 4, 12, 1, "attention global, decode, device start", true);
+        test_attention(0, 1024, 1030, 515, "attention global, two key tiles (last 6 of 1030)", false, 1024);
+        // Every key of a tile scored: one query sees 40 keys (16-key steps, a partial last one), all compared.
+        test_attention(0, 64, 40, 40, "attention global, 40 keys in one call");
         test_route();
         test_experts(true, 128, 64, 3, "moe_situ_experts NVFP4 small");
         test_experts(true, 2304, 1152, 3, "moe_situ_experts NVFP4 [3, 2304, 1152]");
         test_experts(false, 2304, 1152, 3, "moe_situ_experts BF16 [3, 2304, 1152]");
+        if (const char* bench = std::getenv("NINFER_INKLING2_OP_BENCH"); bench != nullptr && *bench == '1') {
+            bench_experts(true);
+            bench_experts(false);
+        }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

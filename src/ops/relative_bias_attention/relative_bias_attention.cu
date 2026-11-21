@@ -15,6 +15,8 @@ constexpr int kMaxRel  = 32;
 constexpr int kWarps   = 4;
 constexpr int kThreads = kWarps * 32;
 constexpr int kTile    = 1024;
+constexpr int kKeyLanes = 8; // lanes that score one key together
+constexpr int kKeysPerStep = kThreads / kKeyLanes; // keys the block scores at once (16)
 
 void require(bool condition, const char* op, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string(op) + ": " + message); }
@@ -39,8 +41,9 @@ __device__ float warp_sum(float v) {
 
 // One warp per (head, column).
 __global__ void clip_kernel(float* x, std::int64_t xs, int head_dim, int heads, const float* __restrict__ scale, float threshold,
-                            std::int64_t start, std::int64_t floor, float alpha, bool log_scale) {
-    const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
+                            std::int64_t start, const std::int64_t* start_offset, std::int64_t floor, float alpha,
+                            bool log_scale) {
+    const int t = blockIdx.x, h = blockIdx.y, lane = threadIdx.x; // T on x: no 65535 cap
     float* v = x + t * xs + static_cast<std::int64_t>(h) * head_dim;
     float local[8];
     float ss = 0.0F;
@@ -54,7 +57,7 @@ __global__ void clip_kernel(float* x, std::int64_t xs, int head_dim, int heads, 
     }
     float f = fminf(1.0F, threshold / (sqrtf(warp_sum(ss)) + 1e-6F));
     if (log_scale) {
-        const double pos = static_cast<double>(start + t);
+        const double pos = static_cast<double>(start + (start_offset != nullptr ? *start_offset : 0) + t);
         f *= static_cast<float>(1.0 + alpha * log(fmax(1.0, (pos + 1.0) / static_cast<double>(floor))));
     }
     for (int i = 0; i < 8; ++i) {
@@ -64,7 +67,7 @@ __global__ void clip_kernel(float* x, std::int64_t xs, int head_dim, int heads, 
 }
 
 __global__ void unit_rms_kernel(float* x, std::int64_t xs, int head_dim, float eps) {
-    const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
+    const int t = blockIdx.x, h = blockIdx.y, lane = threadIdx.x; // T on x: no 65535 cap
     float* v = x + t * xs + static_cast<std::int64_t>(h) * head_dim;
     float ss = 0.0F;
     for (int d = lane; d < head_dim; d += 32) { ss = fmaf(v[d], v[d], ss); }
@@ -72,11 +75,12 @@ __global__ void unit_rms_kernel(float* x, std::int64_t xs, int head_dim, float e
     for (int d = lane; d < head_dim; d += 32) { v[d] *= inv; }
 }
 
-__global__ void append_kernel(const float* __restrict__ src, std::int64_t ss, int rows, std::int64_t start, std::int64_t capacity,
-                              float* __restrict__ cache) {
-    const int t = blockIdx.y, d = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void append_kernel(const float* __restrict__ src, std::int64_t ss, int rows, std::int64_t start,
+                              const std::int64_t* start_offset, std::int64_t capacity, float* __restrict__ cache) {
+    const int t = blockIdx.x, d = blockIdx.y * blockDim.x + threadIdx.x;
     if (d >= rows) { return; }
-    cache[((start + t) % capacity) * rows + d] = src[t * ss + d];
+    const std::int64_t first = start + (start_offset != nullptr ? *start_offset : 0);
+    cache[((first + t) % capacity) * rows + d] = src[t * ss + d];
 }
 
 struct AttentionArgs {
@@ -85,7 +89,24 @@ struct AttentionArgs {
     float* out;
     int heads, group, d_rel, extent, window;
     std::int64_t start, capacity, kv_width;
+    const std::int64_t* start_offset;
 };
+
+// The block's maximum (kMax) or sum of v; every thread gets it. `scratch` holds kWarps floats.
+template <bool kMax>
+__device__ float block_reduce(float v, float* scratch) {
+    for (int o = 16; o > 0; o >>= 1) {
+        const float other = __shfl_xor_sync(0xffffffffU, v, o);
+        v = kMax ? fmaxf(v, other) : v + other;
+    }
+    __syncthreads(); // scratch reuse across calls
+    if ((threadIdx.x & 31) == 0) { scratch[threadIdx.x >> 5] = v; }
+    __syncthreads();
+    float total = scratch[0];
+#pragma unroll
+    for (int w = 1; w < kWarps; ++w) { total = kMax ? fmaxf(total, scratch[w]) : total + scratch[w]; }
+    return total;
+}
 
 // One block per (head, column): four warps score a tile of keys into shared memory, then every thread folds
 // the tile into its output dimension with the online-softmax rescale.
@@ -93,43 +114,80 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(AttentionArgs a) {
     __shared__ float q[kHeadDim];
     __shared__ float r[kMaxRel];
     __shared__ float scores[kTile];
-    const int h = blockIdx.x, t = blockIdx.y, g = h / a.group;
+    __shared__ float reduce[kWarps];
+    const int t = blockIdx.x, h = blockIdx.y, g = h / a.group;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     q[threadIdx.x] = a.q[t * a.qs + static_cast<std::int64_t>(h) * kHeadDim + threadIdx.x];
     if (threadIdx.x < a.d_rel) { r[threadIdx.x] = a.r[t * a.rs + static_cast<std::int64_t>(h) * a.d_rel + threadIdx.x]; }
     __syncthreads();
-    const std::int64_t pos = a.start + t;
+    const std::int64_t pos = a.start + (a.start_offset != nullptr ? *a.start_offset : 0) + t;
     const std::int64_t lo  = a.window > 0 ? (pos - a.window + 1 > 0 ? pos - a.window + 1 : 0) : 0;
     const float inv_sqrt_d = rsqrtf(static_cast<float>(kHeadDim));
     float m     = a.sink[t * a.ss + h];
     float denom = 1.0F; // e^{sink - m}
     float acc   = 0.0F;
     const std::int64_t col = static_cast<std::int64_t>(g) * kHeadDim + threadIdx.x;
+    const float4* q4 = reinterpret_cast<const float4*>(q);
+    const int sub = lane & (kKeyLanes - 1);
     for (std::int64_t base = lo; base <= pos; base += kTile) {
         const int n = static_cast<int>(pos - base + 1 < kTile ? pos - base + 1 : kTile);
-        for (int i = warp; i < n; i += kWarps) {
-            const std::int64_t j = base + i, slot = j % a.capacity;
-            const float* key = a.k + slot * a.kv_width + static_cast<std::int64_t>(g) * kHeadDim;
+        // Key j of the tile sits in ring slot base_slot + i, less one capacity when it wraps (i < n <= capacity).
+        const std::int64_t base_slot = base % a.capacity;
+        // kKeyLanes lanes per key, kThreads / kKeyLanes keys at a time: lane `sub` dots four float4 of the key.
+        // The loop bound is uniform per warp (the shuffles need every lane); keys past n score nothing.
+        // Warp w takes keys 4w..4w+3 of every group of kKeysPerStep = kWarps * 32 / kKeyLanes = 16, so the
+        // four warps cover each group exactly once.
+        static_assert(kKeysPerStep == kWarps * (32 / kKeyLanes), "every key of a step has one 8-lane group");
+        for (int i0 = warp * (32 / kKeyLanes); i0 < n; i0 += kKeysPerStep) {
+            const int i = i0 + lane / kKeyLanes;
+            const bool valid = i < n;
+            std::int64_t slot = base_slot + (valid ? i : 0);
+            slot -= slot >= a.capacity ? a.capacity : 0;
+            const float4* key = reinterpret_cast<const float4*>(a.k + slot * a.kv_width + static_cast<std::int64_t>(g) * kHeadDim);
             float dot = 0.0F;
-            for (int d = lane; d < kHeadDim; d += 32) { dot = fmaf(q[d], key[d], dot); }
-            dot = warp_sum(dot) * inv_sqrt_d;
-            const std::int64_t dist = pos - j;
+#pragma unroll
+            for (int m = 0; m < kHeadDim / (4 * kKeyLanes); ++m) {
+                const float4 kv = __ldg(key + sub + kKeyLanes * m), qv = q4[sub + kKeyLanes * m];
+                dot = fmaf(qv.x, kv.x, fmaf(qv.y, kv.y, fmaf(qv.z, kv.z, fmaf(qv.w, kv.w, dot))));
+            }
+            const std::int64_t dist = pos - (base + i);
             float bias = 0.0F;
-            if (dist < a.extent && lane < a.d_rel) { bias = r[lane] * a.table[dist * a.d_rel + lane]; }
-            bias = warp_sum(bias);
-            if (lane == 0) { scores[i] = dot + bias; }
+            if (valid && dist < a.extent) {
+                for (int c = sub; c < a.d_rel; c += kKeyLanes) { bias = fmaf(r[c], a.table[dist * a.d_rel + c], bias); }
+            }
+            for (int o = kKeyLanes / 2; o > 0; o >>= 1) {
+                dot += __shfl_xor_sync(0xffffffffU, dot, o);
+                bias += __shfl_xor_sync(0xffffffffU, bias, o);
+            }
+            if (valid && sub == 0) { scores[i] = dot * inv_sqrt_d + bias; }
         }
         __syncthreads();
-        float top = m;
-        for (int i = 0; i < n; ++i) { top = fmaxf(top, scores[i]); }
+        // The tile's maximum, its exponentials and their sum in parallel; then every thread folds its value
+        // dimension over the tile with four independent accumulators (the loads of a step do not wait on each other).
+        float top = -INFINITY;
+        for (int i = threadIdx.x; i < n; i += kThreads) { top = fmaxf(top, scores[i]); }
+        top = fmaxf(m, block_reduce<true>(top, reduce));
         const float rescale = expf(m - top);
-        denom *= rescale;
-        acc *= rescale;
-        for (int i = 0; i < n; ++i) {
-            const float e = expf(scores[i] - top);
-            denom += e;
-            acc = fmaf(e, a.v[((base + i) % a.capacity) * a.kv_width + col], acc);
+        float sum = 0.0F;
+        for (int i = threadIdx.x; i < n; i += kThreads) { sum += (scores[i] = expf(scores[i] - top)); }
+        sum = block_reduce<false>(sum, reduce); // its barriers also publish the exponentials
+        denom = fmaf(denom, rescale, sum);
+        float part[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+        int i = 0;
+        for (; i + 4 <= n; i += 4) {
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                std::int64_t slot = base_slot + i + u;
+                slot -= slot >= a.capacity ? a.capacity : 0;
+                part[u] = fmaf(scores[i + u], a.v[slot * a.kv_width + col], part[u]);
+            }
         }
+        for (; i < n; ++i) {
+            std::int64_t slot = base_slot + i;
+            slot -= slot >= a.capacity ? a.capacity : 0;
+            part[0] = fmaf(scores[i], a.v[slot * a.kv_width + col], part[0]);
+        }
+        acc = fmaf(acc, rescale, (part[0] + part[1]) + (part[2] + part[3]));
         m = top;
         __syncthreads();
     }
@@ -149,10 +207,12 @@ void head_l2_clip_fp32(Tensor& x, int head_dim, const Tensor* scale, float thres
     }
     require(threshold > 0.0F, op, "threshold must be positive");
     if (log_scale != nullptr) { require(log_scale->floor > 0 && log_scale->start >= 0, op, "invalid log scale"); }
-    const dim3 grid(heads, x.ne[1]);
+    const dim3 grid(x.ne[1], heads);
     clip_kernel<<<grid, 32, 0, stream>>>(static_cast<float*>(x.data), xs, head_dim, heads,
                                          scale != nullptr ? static_cast<const float*>(scale->data) : nullptr, threshold,
-                                         log_scale != nullptr ? log_scale->start : 0, log_scale != nullptr ? log_scale->floor : 1,
+                                         log_scale != nullptr ? log_scale->start : 0,
+                                         log_scale != nullptr ? log_scale->start_offset : nullptr,
+                                         log_scale != nullptr ? log_scale->floor : 1,
                                          log_scale != nullptr ? log_scale->alpha : 0.0F, log_scale != nullptr);
     check_launch(op);
 }
@@ -162,14 +222,14 @@ void head_unit_rms_fp32(Tensor& x, int head_dim, float eps, cudaStream_t stream)
     require(head_dim > 0 && head_dim <= 256 && x.ne[0] % head_dim == 0, op, "rows must be whole heads of at most 256");
     require(eps > 0.0F, op, "eps must be positive");
     const std::int64_t xs = column_stride(x, x.ne[0], x.ne[1], op, "x");
-    const dim3 grid(x.ne[0] / head_dim, x.ne[1]);
+    const dim3 grid(x.ne[1], x.ne[0] / head_dim);
     unit_rms_kernel<<<grid, 32, 0, stream>>>(static_cast<float*>(x.data), xs, head_dim, eps);
     check_launch(op);
 }
 
 void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Tensor& q, const Tensor& r, const Tensor& sink,
                                   const Tensor& k_new, const Tensor& v_new, const Tensor& table, Tensor& k_cache, Tensor& v_cache,
-                                  std::int64_t start, Tensor& out, cudaStream_t stream) {
+                                  std::int64_t start, const std::int64_t* start_offset, Tensor& out, cudaStream_t stream) {
     const char* op = "relative_bias_sink_attention";
     require(s.head_dim == kHeadDim, op, "head_dim must be 128");
     require(s.d_rel > 0 && s.d_rel <= kMaxRel, op, "d_rel must be 1..32");
@@ -188,12 +248,13 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     require(k_cache.dtype == DType::FP32 && v_cache.dtype == DType::FP32 && k_cache.is_contiguous() && v_cache.is_contiguous() &&
                 k_cache.ne[0] == kv_width && v_cache.ne[0] == kv_width && k_cache.ne[1] == v_cache.ne[1],
             op, "caches must be contiguous FP32 [kv_heads * d, capacity]");
+    require(reinterpret_cast<std::uintptr_t>(k_cache.data) % 16 == 0, op, "k_cache must be 16-byte aligned (float4 key loads)");
     const std::int64_t capacity = k_cache.ne[1];
     require(s.window > 0 ? capacity >= s.window - 1 + cols : capacity >= start + cols, op, "the KV ring cannot hold the visible keys");
-    const dim3 append_grid((kv_width + 255) / 256, cols);
-    append_kernel<<<append_grid, 256, 0, stream>>>(static_cast<const float*>(k_new.data), ks, kv_width, start, capacity,
+    const dim3 append_grid(cols, (kv_width + 255) / 256);
+    append_kernel<<<append_grid, 256, 0, stream>>>(static_cast<const float*>(k_new.data), ks, kv_width, start, start_offset, capacity,
                                                    static_cast<float*>(k_cache.data));
-    append_kernel<<<append_grid, 256, 0, stream>>>(static_cast<const float*>(v_new.data), vs, kv_width, start, capacity,
+    append_kernel<<<append_grid, 256, 0, stream>>>(static_cast<const float*>(v_new.data), vs, kv_width, start, start_offset, capacity,
                                                    static_cast<float*>(v_cache.data));
     check_launch(op);
     a.q = static_cast<const float*>(q.data);
@@ -209,9 +270,10 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     a.extent = table.ne[1];
     a.window = s.window;
     a.start = start;
+    a.start_offset = start_offset;
     a.capacity = capacity;
     a.kv_width = kv_width;
-    attention_kernel<<<dim3(s.heads, cols), kThreads, 0, stream>>>(a);
+    attention_kernel<<<dim3(cols, s.heads), kThreads, 0, stream>>>(a);
     check_launch(op);
 }
 

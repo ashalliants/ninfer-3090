@@ -37,6 +37,10 @@ struct MixArgs {
     float eps;
 };
 
+constexpr int kS = kDepthAttentionMaxSources, kQ = kDepthAttentionMaxQueries;
+constexpr int kChunk = kThreads;      // rows per block in both phases
+constexpr int kPartials = 1 + kQ;     // per (column, source, chunk): sum of squares, then the dot with each query
+
 __device__ float block_sum(float v, float* scratch) {
     for (int o = 16; o > 0; o >>= 1) { v += __shfl_xor_sync(0xffffffffU, v, o); }
     __syncthreads(); // scratch reuse across calls
@@ -47,44 +51,98 @@ __device__ float block_sum(float v, float* scratch) {
     return total;
 }
 
-// One block per column t.
-__global__ void __launch_bounds__(kThreads) mix_kernel(MixArgs a) {
+// Phase 1, grid (T, chunks, S): block (c, j, t) sums source j's squares and its dot with every query over rows
+// [c * kChunk, (c + 1) * kChunk) of column t into partial[((t * S + j) * chunks + c) * kPartials + ...].
+__global__ void __launch_bounds__(kThreads) mix_partial_kernel(MixArgs a, float* __restrict__ partial) {
     __shared__ float scratch[kThreads / 32];
+    const int c = blockIdx.y, j = blockIdx.z, chunks = gridDim.y;
+    const std::int64_t t = blockIdx.x; // columns on x: the grid's long axis, so T has no 65535 cap
+    const int d = c * kChunk + threadIdx.x;
+    float v = 0.0F;
+    const float* src = a.src[0];
+    std::int64_t stride = a.src_stride[0];
+#pragma unroll
+    for (int i = 1; i < kS; ++i) {
+        src    = j == i ? a.src[i] : src;
+        stride = j == i ? a.src_stride[i] : stride;
+    }
+    if (d < a.rows) { v = src[t * stride + d]; }
+    float* out = partial + ((t * a.sources + j) * chunks + c) * kPartials;
+    const float ss = block_sum(v * v, scratch);
+    if (threadIdx.x == 0) { out[0] = ss; }
+#pragma unroll
+    for (int i = 0; i < kQ; ++i) {
+        if (i >= a.query_count) { break; }
+        const float q   = d < a.rows ? __ldg(a.queries + static_cast<std::int64_t>(i) * a.rows + d) : 0.0F;
+        const float dot = block_sum(q * v, scratch);
+        if (threadIdx.x == 0) { out[1 + i] = dot; }
+    }
+}
+
+// Phase 2, grid (T, chunks): every block reduces the column's partials (a few hundred floats), forms the softmax
+// weights and writes its rows of each output.
+__global__ void __launch_bounds__(kThreads) mix_apply_kernel(MixArgs a, const float* __restrict__ partial, int chunks) {
+    __shared__ float sums[kS][kPartials];
     const std::int64_t t = blockIdx.x;
-    float inv[kDepthAttentionMaxSources];
-    float logit[kDepthAttentionMaxQueries][kDepthAttentionMaxSources];
-    for (int j = 0; j < a.sources; ++j) {
-        const float* s = a.src[j] + t * a.src_stride[j];
-        float ss = 0.0F;
-        for (int d = threadIdx.x; d < a.rows; d += kThreads) { ss = fmaf(s[d], s[d], ss); }
-        inv[j] = rsqrtf(block_sum(ss, scratch) / static_cast<float>(a.rows) + a.eps);
-        for (int i = 0; i < a.query_count; ++i) {
-            const float* q = a.queries + static_cast<std::int64_t>(i) * a.rows;
-            float dot = 0.0F;
-            for (int d = threadIdx.x; d < a.rows; d += kThreads) { dot = fmaf(q[d], s[d], dot); }
-            logit[i][j] = block_sum(dot, scratch) * inv[j] * rsqrtf(static_cast<float>(a.rows));
-        }
+    const int d = blockIdx.y * kChunk + threadIdx.x;
+    if (threadIdx.x < a.sources * kPartials) {
+        const int j = threadIdx.x / kPartials, k = threadIdx.x % kPartials;
+        const float* in = partial + (t * a.sources + j) * chunks * kPartials + k;
+        float v = 0.0F;
+        for (int c = 0; c < chunks; ++c) { v += in[c * kPartials]; }
+        sums[j][k] = v;
     }
+    __syncthreads();
+    float inv[kS], value[kS];
+#pragma unroll
+    for (int j = 0; j < kS; ++j) {
+        inv[j]   = j < a.sources ? rsqrtf(sums[j][0] / static_cast<float>(a.rows) + a.eps) : 0.0F;
+        value[j] = j < a.sources && d < a.rows ? a.src[j][t * a.src_stride[j] + d] : 0.0F;
+    }
+    const float scale = rsqrtf(static_cast<float>(a.rows));
+#pragma unroll 1
     for (int i = 0; i < a.query_count; ++i) {
-        float top = logit[i][0];
-        for (int j = 1; j < a.sources; ++j) { top = fmaxf(top, logit[i][j]); }
-        float sum = 0.0F;
-        for (int j = 0; j < a.sources; ++j) { sum += (logit[i][j] = expf(logit[i][j] - top)); }
-        for (int j = 0; j < a.sources; ++j) { logit[i][j] = logit[i][j] / sum * inv[j]; }
-        float* out = a.out[i] + t * a.out_stride[i];
-        for (int d = threadIdx.x; d < a.rows; d += kThreads) {
-            float acc = 0.0F;
-            for (int j = 0; j < a.sources; ++j) { acc = fmaf(logit[i][j], a.src[j][t * a.src_stride[j] + d], acc); }
-            out[d] = acc;
+        // The output by compile-time compares (a runtime index into the parameters would copy them to local memory).
+        float* out = a.out[0];
+        std::int64_t out_stride = a.out_stride[0];
+#pragma unroll
+        for (int c = 1; c < kQ; ++c) {
+            out        = i == c ? a.out[c] : out;
+            out_stride = i == c ? a.out_stride[c] : out_stride;
         }
+        float weight[kS];
+        float top = -INFINITY;
+#pragma unroll
+        for (int j = 0; j < kS; ++j) {
+            weight[j] = j < a.sources ? sums[j][1 + i] * inv[j] * scale : -INFINITY;
+            top       = fmaxf(top, weight[j]);
+        }
+        float sum = 0.0F;
+#pragma unroll
+        for (int j = 0; j < kS; ++j) {
+            weight[j] = j < a.sources ? expf(weight[j] - top) : 0.0F;
+            sum += weight[j];
+        }
+        const float to_unit = 1.0F / sum; // one division per query, not one per source (smaller code: Volta's
+                                          // instruction cache missed on this kernel more than anything else)
+        float o = 0.0F;
+#pragma unroll
+        for (int j = 0; j < kS; ++j) { o = fmaf(weight[j] * to_unit * inv[j], value[j], o); }
+        if (d < a.rows) { out[t * out_stride + d] = o; }
     }
+}
+
+int mix_chunks(std::int32_t rows) { return (rows + kChunk - 1) / kChunk; }
+
+std::size_t partial_floats(std::int32_t rows, std::int64_t columns, int sources) {
+    return static_cast<std::size_t>(columns) * sources * mix_chunks(rows) * kPartials;
 }
 
 __global__ void __launch_bounds__(kThreads)
 combine_kernel(const float* c, std::int64_t cs, const float* m, std::int64_t ms, const float* __restrict__ gf, std::int64_t gs,
                int rows, float* out, std::int64_t os) {
-    const std::int64_t t = blockIdx.y;
-    const int d = blockIdx.x * kThreads + threadIdx.x;
+    const std::int64_t t = blockIdx.x;
+    const int d = blockIdx.y * kThreads + threadIdx.x;
     if (d >= rows) { return; }
     const float gain = tanhf(gf[t * gs + d]), forget = tanhf(gf[t * gs + rows + d]);
     out[t * os + d] = (1.0F - forget) * c[t * cs + d] + gain * m[t * ms + d];
@@ -92,13 +150,19 @@ combine_kernel(const float* c, std::int64_t cs, const float* m, std::int64_t ms,
 
 } // namespace
 
-void depth_attention_mix(std::span<const Tensor* const> sources, const Tensor& queries, float eps,
+std::size_t depth_attention_mix_workspace_bytes(std::int32_t rows, std::int64_t columns, int sources) {
+    require(sources >= 1 && sources <= kDepthAttentionMaxSources, "1 to 8 sources");
+    require(rows > 0 && rows <= 8192 && columns > 0, "D must be 1..8192 and T positive");
+    return partial_floats(rows, columns, sources) * sizeof(float) + 256; // + the arena's alignment
+}
+
+void depth_attention_mix(std::span<const Tensor* const> sources, const Tensor& queries, float eps, DeviceArena& workspace,
                          std::span<Tensor* const> outputs, cudaStream_t stream) {
     require(!sources.empty() && sources.size() <= kDepthAttentionMaxSources, "1 to 8 sources");
     require(!outputs.empty() && outputs.size() <= kDepthAttentionMaxQueries, "1 to 4 queries");
     require(eps > 0.0F, "eps must be positive");
     const std::int32_t rows = sources[0]->ne[0], cols = sources[0]->ne[1];
-    require(rows > 0 && rows <= 8192 && cols > 0, "D must be 1..8192");
+    require(rows > 0 && rows <= 8192 && cols > 0, "D must be 1..8192 and T positive");
     require(queries.dtype == DType::FP32 && queries.is_contiguous() && queries.ne[0] == rows &&
                 queries.numel() == static_cast<std::int64_t>(rows) * static_cast<std::int64_t>(outputs.size()),
             "queries must be contiguous FP32 [D, Q]");
@@ -116,7 +180,12 @@ void depth_attention_mix(std::span<const Tensor* const> sources, const Tensor& q
         a.out_stride[i] = column_stride(*outputs[i], rows, cols, "output");
         a.out[i] = static_cast<float*>(outputs[i]->data);
     }
-    mix_kernel<<<cols, kThreads, 0, stream>>>(a);
+    const int chunks = mix_chunks(rows);
+    const auto scope = workspace.scope();
+    float* partial = static_cast<float*>(workspace.alloc_bytes(partial_floats(rows, cols, a.sources) * sizeof(float)).data);
+    mix_partial_kernel<<<dim3(cols, chunks, a.sources), kThreads, 0, stream>>>(a, partial);
+    check_launch();
+    mix_apply_kernel<<<dim3(cols, chunks), kThreads, 0, stream>>>(a, partial, chunks);
     check_launch();
 }
 
@@ -124,7 +193,7 @@ void forget_gain_combine(const Tensor& c, const Tensor& m, const Tensor& gf, Ten
     const std::int32_t rows = c.ne[0], cols = c.ne[1];
     const std::int64_t cs = column_stride(c, rows, cols, "c"), ms = column_stride(m, rows, cols, "m"),
                        gs = column_stride(gf, 2 * rows, cols, "gf"), os = column_stride(out, rows, cols, "out");
-    const dim3 grid((rows + kThreads - 1) / kThreads, cols);
+    const dim3 grid(cols, (rows + kThreads - 1) / kThreads);
     combine_kernel<<<grid, kThreads, 0, stream>>>(static_cast<const float*>(c.data), cs, static_cast<const float*>(m.data), ms,
                                                   static_cast<const float*>(gf.data), gs, rows, static_cast<float*>(out.data), os);
     check_launch();

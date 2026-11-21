@@ -35,7 +35,9 @@ std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk) {
     const std::size_t per_visit_kept = 6 * h * 4; // ffn_inp, the output and a core visit's four loop messages
     const std::size_t per_visit_temp = 12 * h * 4 + 3 * h * 2 + (2 * q + std::size_t(c.heads) * (c.d_rel + 1)) * 4 +
                                        4 * (kv + 64) * 4 + 2 * q * 4 + q * 2 + 4 * h * 2 + 4 * h * 4 + 64 * 4 * 2 +
-                                       std::size_t(c.experts_per_token) * (c.moe_intermediate + h) * 4 + 4 * c.experts_per_token * 4;
+                                       std::size_t(c.experts_per_token) * (c.moe_intermediate + h) * 4 + 4 * c.experts_per_token * 4 +
+                                       ops::moe_route_sigmoid_topk_workspace_bytes(i32(c.experts), 1) +
+                                       ops::depth_attention_mix_workspace_bytes(i32(c.hidden_size), 1, ops::kDepthAttentionMaxSources);
     const std::size_t output = std::size_t(c.vocab_size) * 4 + 4 * h * 4;
     const std::size_t per_token = c.num_layer_visits * per_visit_kept + per_visit_temp + output;
     // Each allocation pads to 256 bytes; a visit makes about 60.
@@ -44,7 +46,9 @@ std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk) {
 
 // The limits, validated before anything is sized from them.
 ProgramLimits checked(ProgramLimits limits) {
-    if (limits.max_chunk < 1 || limits.max_context < limits.max_chunk) { throw std::invalid_argument("inkling2: invalid program limits"); }
+    if (limits.max_chunk < 1 || limits.max_context < limits.max_chunk) {
+        throw std::invalid_argument("inkling2: invalid program limits (max_chunk positive, at most max_context)");
+    }
     return limits;
 }
 
@@ -83,7 +87,9 @@ TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t 
     reset();
 }
 
-TextProgram::~TextProgram() = default;
+TextProgram::~TextProgram() {
+    if (decode_graph_ != nullptr) { cudaGraphExecDestroy(decode_graph_); }
+}
 
 void TextProgram::reset() {
     for (auto& s : state_) {
@@ -152,13 +158,13 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         if (local) {
             xq = xk = xv = workspace_.alloc(DType::FP32, {h, cols});
             Tensor* outs[] = {&xq};
-            ops::depth_attention_mix(sources, model_.tensor(w.res_query, {h, 1}), eps, outs, stream_);
+            ops::depth_attention_mix(sources, model_.tensor(w.res_query, {h, 1}), eps, workspace_, outs, stream_);
         } else {
             xq = workspace_.alloc(DType::FP32, {h, cols});
             xk = workspace_.alloc(DType::FP32, {h, cols});
             xv = workspace_.alloc(DType::FP32, {h, cols});
             Tensor* outs[] = {&xq, &xk, &xv};
-            ops::depth_attention_mix(sources, model_.tensor(w.res_query, {h, 3}), eps, outs, stream_);
+            ops::depth_attention_mix(sources, model_.tensor(w.res_query, {h, 3}), eps, workspace_, outs, stream_);
         }
     }
     if (messages != nullptr) {
@@ -171,13 +177,21 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         xk = ck;
         xv = cv;
     }
-    Tensor nq = workspace_.alloc(DType::BF16, {h, cols}), nk = workspace_.alloc(DType::BF16, {h, cols}),
-           nv = workspace_.alloc(DType::BF16, {h, cols});
+    // A local visit without loop messages has one input for q, k and v (one MIX query, one norm): normalize it once
+    // and project k and v in one call.
+    const bool one_input = local && messages == nullptr;
+    Tensor nq = workspace_.alloc(DType::BF16, {h, cols}), nk = nq, nv = nq;
+    if (!one_input) {
+        nk = workspace_.alloc(DType::BF16, {h, cols});
+        nv = workspace_.alloc(DType::BF16, {h, cols});
+    }
     if (local) {
         const Tensor gamma = model_.tensor(w.norm, {h});
         ops::rmsnorm_fp32(xq, &gamma, eps, nq, stream_);
-        ops::rmsnorm_fp32(xk, &gamma, eps, nk, stream_);
-        ops::rmsnorm_fp32(xv, &gamma, eps, nv, stream_);
+        if (!one_input) {
+            ops::rmsnorm_fp32(xk, &gamma, eps, nk, stream_);
+            ops::rmsnorm_fp32(xv, &gamma, eps, nv, stream_);
+        }
     } else {
         const Tensor gq = model_.tensor(w.q_norm, {h}), gk = model_.tensor(w.k_norm, {h}), gv = model_.tensor(w.v_norm, {h});
         ops::rmsnorm_fp32(xq, &gq, eps, nq, stream_);
@@ -193,9 +207,19 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     const std::int32_t dyn_rows = i32(c.kv_heads) * k;
     Tensor kconv = workspace_.alloc(DType::FP32, {kv, cols}), vconv = workspace_.alloc(DType::FP32, {kv, cols});
     if (local) {
-        const WeightId kw[] = {w.k}, vw[] = {w.v};
-        const std::int32_t kr[] = {kv};
-        Tensor pk = project(nk, kw, kr), pv = project(nv, vw, kr);
+        Tensor pk, pv;
+        if (one_input) {
+            const WeightId kvw[] = {w.k, w.v};
+            const std::int32_t kvr[] = {kv, kv};
+            const Tensor both = project(nk, kvw, kvr);
+            pk = both.slice(0, 0, kv);
+            pv = both.slice(0, kv, kv);
+        } else {
+            const WeightId kw[] = {w.k}, vw[] = {w.v};
+            const std::int32_t kr[] = {kv};
+            pk = project(nk, kw, kr);
+            pv = project(nv, vw, kr);
+        }
         ops::short_conv_fp32(pk, model_.tensor(w.k_conv, {k, kv}), nullptr, d, st.k_hist, kconv, stream_);
         ops::short_conv_fp32(pv, model_.tensor(w.v_conv, {k, kv}), nullptr, d, st.v_hist, vconv, stream_);
     } else {
@@ -208,7 +232,7 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     }
 
     // 3f: clips, value norm, log scaling of the global layers' q and r.
-    const ops::PositionLogScale tau{start, c.log_scaling_n_floor, c.log_scaling_alpha};
+    const ops::PositionLogScale tau{start, c.log_scaling_n_floor, c.log_scaling_alpha, start_offset_};
     const Tensor q_clip = model_.tensor(w.q_clip, {d, heads}), rel_clip = model_.tensor(w.rel_clip, {i32(c.d_rel), heads});
     ops::head_l2_clip_fp32(q_t, d, &q_clip, c.qk_clip, local ? nullptr : &tau, stream_);
     ops::head_l2_clip_fp32(r_t, i32(c.d_rel), &rel_clip, c.rel_clip, local ? nullptr : &tau, stream_);
@@ -219,7 +243,7 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     ops::RelativeBiasAttentionShape shape{heads, i32(c.kv_heads), d, i32(c.d_rel), local ? i32(c.sliding_window) : 0};
     Tensor o = workspace_.alloc(DType::FP32, {q, cols});
     const Tensor rel_bias = model_.tensor(w.rel_bias, {i32(c.d_rel), i32(c.rel_extent_of(p))});
-    ops::relative_bias_sink_attention(shape, q_t, r_t, sink, kconv, vconv, rel_bias, st.k_cache, st.v_cache, start, o, stream_);
+    ops::relative_bias_sink_attention(shape, q_t, r_t, sink, kconv, vconv, rel_bias, st.k_cache, st.v_cache, start, start_offset_, o, stream_);
     Tensor gated = workspace_.alloc(DType::BF16, {q, cols});
     ops::sigmoid_gate_fp32(o, gate, gated, stream_);
     const WeightId ow[] = {w.output};
@@ -245,7 +269,7 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     Tensor z = workspace_.alloc(DType::FP32, {h, cols});
     {
         Tensor* outs[] = {&z};
-        ops::depth_attention_mix(sources, model_.tensor(w.ffn_res_query, {h, 1}), eps, outs, stream_);
+        ops::depth_attention_mix(sources, model_.tensor(w.ffn_res_query, {h, 1}), eps, workspace_, outs, stream_);
     }
     if (messages != nullptr) {
         Tensor zc = workspace_.alloc(DType::FP32, {h, cols});
@@ -257,7 +281,7 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     const std::int32_t top_k = i32(c.experts_per_token);
     Tensor ids = workspace_.alloc(DType::I32, {top_k, cols}), weights = workspace_.alloc(DType::FP32, {top_k, cols});
     ops::moe_route_sigmoid_topk(z, model_.tensor(w.router, {h, i32(c.experts)}), model_.tensor(w.router_bias, {i32(c.experts)}), top_k,
-                                c.route_scale, ids, weights, stream_);
+                                c.route_scale, workspace_, ids, weights, stream_);
     Tensor y = workspace_.alloc(DType::FP32, {h, cols});
     ops::moe_situ_experts(model_.expert_bank(p), z, ids, weights, c.gate_softcap, c.up_softcap, workspace_, y, stream_);
     Tensor mo = workspace_.alloc(DType::FP32, {h, cols});
@@ -282,14 +306,72 @@ Tensor TextProgram::forward(std::span<const std::int32_t> tokens, const Trace* t
     for (const auto token : tokens) {
         if (token < 0 || static_cast<std::uint32_t>(token) >= c.unpadded_vocab_size) { throw std::invalid_argument("inkling2: token id out of range"); }
     }
+    const bool tracing = trace != nullptr && *trace;
+    if (cols == 1 && !tracing && limits_.decode_graph && stream_ != nullptr) { return forward_graph(tokens[0]); }
     workspace_.reset();
-    const std::int64_t start = position_;
-
-    // 1: embedding and its norm.
     Tensor ids = workspace_.alloc(DType::I32, {cols});
     if (cudaMemcpyAsync(ids.data, tokens.data(), tokens.size_bytes(), cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
         throw std::runtime_error("inkling2: token upload failed");
     }
+    Tensor logits = run(ids, position_, trace);
+    position_ += cols;
+    return logits;
+}
+
+Tensor TextProgram::forward_graph(std::int32_t token) {
+    struct Step {
+        std::int64_t position;
+        std::int32_t token, pad;
+    };
+    const Step host{position_, token, 0};
+    if (step_.bytes == 0) { step_ = DeviceBuffer(sizeof(Step)); }
+    // From pageable memory: the copy is staged before the call returns, so `host` may go out of scope.
+    if (cudaMemcpyAsync(step_.p, &host, sizeof host, cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
+        throw std::runtime_error("inkling2: step upload failed");
+    }
+    if (decode_graph_ == nullptr) {
+        workspace_.reset();
+        const Tensor ids(static_cast<char*>(step_.p) + offsetof(Step, token), DType::I32, {1});
+        if (cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+            throw std::runtime_error("inkling2: cannot capture the decode graph");
+        }
+        start_offset_ = static_cast<const std::int64_t*>(step_.p);
+        // Ends the capture and returns its graph; a graph handle is destroyed whatever the capture's result.
+        const auto end_capture = [&]() -> cudaGraph_t {
+            start_offset_ = nullptr;
+            cudaGraph_t graph = nullptr;
+            const cudaError_t ended = cudaStreamEndCapture(stream_, &graph);
+            if (ended != cudaSuccess) {
+                if (graph != nullptr) { cudaGraphDestroy(graph); }
+                return nullptr;
+            }
+            return graph;
+        };
+        try {
+            graph_logits_ = run(ids, 0, nullptr);
+        } catch (...) {
+            if (cudaGraph_t graph = end_capture()) { cudaGraphDestroy(graph); }
+            throw;
+        }
+        cudaGraph_t graph = end_capture();
+        if (graph == nullptr) { throw std::runtime_error("inkling2: decode graph capture failed"); }
+        const cudaError_t made = cudaGraphInstantiate(&decode_graph_, graph, 0);
+        cudaGraphDestroy(graph);
+        if (made != cudaSuccess) {
+            decode_graph_ = nullptr;
+            throw std::runtime_error(std::string("inkling2: cannot instantiate the decode graph: ") + cudaGetErrorString(made));
+        }
+    }
+    if (cudaGraphLaunch(decode_graph_, stream_) != cudaSuccess) { throw std::runtime_error("inkling2: decode graph launch failed"); }
+    position_ += 1;
+    return graph_logits_;
+}
+
+Tensor TextProgram::run(const Tensor& ids, std::int64_t start, const Trace* trace) {
+    const TextConfig& c = config_;
+    const std::int32_t cols = ids.ne[0], h = i32(c.hidden_size);
+
+    // 1: embedding and its norm.
     Tensor cur = workspace_.alloc(DType::FP32, {h, cols});
     ops::embedding_bf16_fp32(ids, model_.tensor(model_.weights().embedding, {h, i32(c.vocab_size)}), cur, stream_);
     const Tensor embed_norm = model_.tensor(model_.weights().embedding_norm, {h});
@@ -324,8 +406,8 @@ Tensor TextProgram::forward(std::span<const std::int32_t> tokens, const Trace* t
             sources.push_back(&bank_last);
             Tensor* attn_mlp[] = {&messages[0], &messages[3]};
             Tensor* k_v[]      = {&messages[1], &messages[2]};
-            ops::depth_attention_mix(sources, loop_q.slice(1, 2 * j, 2), c.rms_norm_eps, attn_mlp, stream_);
-            ops::depth_attention_mix(sources, loop_kv.slice(1, 2 * j, 2), c.rms_norm_eps, k_v, stream_);
+            ops::depth_attention_mix(sources, loop_q.slice(1, 2 * j, 2), c.rms_norm_eps, workspace_, attn_mlp, stream_);
+            ops::depth_attention_mix(sources, loop_kv.slice(1, 2 * j, 2), c.rms_norm_eps, workspace_, k_v, stream_);
         }
         cur = visit(v, cur, blocks, has_messages ? messages.data() : nullptr, start, trace);
     }
@@ -337,7 +419,8 @@ Tensor TextProgram::forward(std::span<const std::int32_t> tokens, const Trace* t
     Tensor x = workspace_.alloc(DType::FP32, {h, cols});
     {
         Tensor* outs[] = {&x};
-        ops::depth_attention_mix(sources, model_.tensor(model_.weights().output_res_query, {h, 1}), c.rms_norm_eps, outs, stream_);
+        const Tensor output_query = model_.tensor(model_.weights().output_res_query, {h, 1});
+        ops::depth_attention_mix(sources, output_query, c.rms_norm_eps, workspace_, outs, stream_);
     }
     const Tensor out_norm = model_.tensor(model_.weights().output_norm, {h});
     ops::rmsnorm_fp32(x, &out_norm, c.rms_norm_eps, x, stream_);
@@ -351,7 +434,6 @@ Tensor TextProgram::forward(std::span<const std::int32_t> tokens, const Trace* t
     const std::int32_t head_rows[] = {i32(c.vocab_size)};
     Tensor logits = project(xb, head, head_rows);
     ops::tanh_softcap_fp32(logits, c.final_logit_softcap, logits, stream_);
-    position_ += cols;
     return logits;
 }
 

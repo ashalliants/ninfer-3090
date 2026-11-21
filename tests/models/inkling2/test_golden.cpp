@@ -139,6 +139,7 @@ int main() {
         const auto& c = model->config();
         const auto vocab = static_cast<std::int32_t>(c.unpadded_vocab_size);
         cudaStream_t stream = nullptr;
+        if (cudaStreamCreate(&stream) != cudaSuccess) { throw std::runtime_error("cannot create a stream"); }
         ink::TextProgram program(*model, {4096, 64}, stream);
 
         std::vector<std::int32_t> first_prompt;
@@ -252,6 +253,38 @@ int main() {
             std::printf("greedy continuation of p0: %s\n", ids.c_str());
             std::printf("decode: %d steps in %.2f s = %.2f tok/s (FP32 correctness kernels, logits copied to the host each step)\n",
                         decode_tokens - 1, seconds, (decode_tokens - 1) / seconds);
+
+            // The decode graph against eager single-token calls: the same tokens give the same bits.
+            std::vector<std::int32_t> steps;
+            {
+                std::istringstream in(ids);
+                for (std::int32_t id; in >> id;) { steps.push_back(id); }
+            }
+            const std::size_t compare_steps = std::min<std::size_t>(steps.size(), 8);
+            auto replay = [&](ink::TextProgram& p) {
+                std::vector<std::vector<float>> out;
+                p.reset();
+                (void)p.forward(first_prompt);
+                for (std::size_t i = 0; i < compare_steps; ++i) {
+                    const std::int32_t one[] = {steps[i]};
+                    out.push_back(logit_columns(p.forward(one), vocab).back());
+                }
+                return out;
+            };
+            const auto graphed = replay(program);
+            ink::ProgramLimits eager_limits{4096, 64};
+            eager_limits.decode_graph = false;
+            ink::TextProgram eager(*model, eager_limits, stream);
+            const auto plain = replay(eager);
+            float worst = 0.0F;
+            for (std::size_t i = 0; i < compare_steps; ++i) {
+                for (std::int32_t j = 0; j < vocab; ++j) { worst = std::max(worst, std::fabs(graphed[i][j] - plain[i][j])); }
+            }
+            std::printf("decode graph vs eager over %zu steps: max |logit difference| %.2e\n", compare_steps, worst);
+            if (worst != 0.0F) {
+                std::fprintf(stderr, "FAIL: the decode graph differs from eager calls\n");
+                ++failures;
+            }
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
