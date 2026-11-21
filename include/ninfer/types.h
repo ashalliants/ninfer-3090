@@ -877,6 +877,9 @@ struct EngineOptions {
     // FP32, so about twice the context fits); FP32 (--kv-dtype fp32) keeps the exact FP32 program. Inkling-2
     // refuses every other kv_cache form.
     KvRings kv_rings                       = KvRings::Default;
+    // kv_cache was chosen explicitly (--kv-dtype bf16|int8|...), BF16 included: Inkling-2, which has no BF16 rings,
+    // refuses it rather than reading the default BF16 as "unset".
+    bool kv_cache_explicit                 = false;
     // Qwen3.6-35B-A3B only: the MTP draft layer's routed experts are stored W8 in the artifact;
     // transcode them to the text layers' formats (Q4 gate_up, Q6 down) at load. Drafts are
     // verified exactly, so this can change acceptance but never the output distribution.

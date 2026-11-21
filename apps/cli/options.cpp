@@ -270,10 +270,15 @@ Options parse_options(int argc, char** argv) {
             options.stage_layers = parse_stage_layers(value(arg));
         } else if (arg == "--kv-dtype") {
             const std::string_view form = value(arg);
+            // The last --kv-dtype wins: each form resets the other field.
             if (form == "fp16" || form == "fp32") { // Inkling-2's KV rings
-                options.kv_rings = form == "fp16" ? KvRings::FP16 : KvRings::FP32;
+                options.kv_rings          = form == "fp16" ? KvRings::FP16 : KvRings::FP32;
+                options.kv_cache          = KvCacheStorage::BFloat16;
+                options.kv_cache_explicit = false;
             } else {
-                options.kv_cache = parse_kv_cache(form);
+                options.kv_cache          = parse_kv_cache(form);
+                options.kv_rings          = KvRings::Default;
+                options.kv_cache_explicit = true;
             }
         } else if (arg == "--dense-q8") {
             const std::string_view form = value(arg);

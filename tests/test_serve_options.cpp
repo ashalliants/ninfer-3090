@@ -812,6 +812,15 @@ int main() {
                               make_engine_options(parse({"ninfer-serve", "model.ninfer"})).kv_rings == KvRings::Default &&
                               make_engine_options(parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "int8"})).kv_rings == KvRings::Default,
                           "--kv-dtype fp16|fp32 did not reach the Engine options");
+        // The last --kv-dtype wins, and an explicit bf16 is marked as such (Inkling-2 refuses it).
+        const auto bf16      = make_engine_options(parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "bf16"}));
+        const auto to_int8   = make_engine_options(parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "fp32", "--kv-dtype", "int8"}));
+        const auto to_fp16   = make_engine_options(parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "int8", "--kv-dtype", "fp16"}));
+        failures += check(bf16.kv_cache_explicit && bf16.kv_rings == KvRings::Default && !fp16.kv_cache_explicit &&
+                              !make_engine_options(parse({"ninfer-serve", "model.ninfer"})).kv_cache_explicit &&
+                              to_int8.kv_rings == KvRings::Default && to_int8.kv_cache == ninfer::KvCacheStorage::Int8Group64 && to_int8.kv_cache_explicit &&
+                              to_fp16.kv_rings == KvRings::FP16 && to_fp16.kv_cache == ninfer::KvCacheStorage::BFloat16 && !to_fp16.kv_cache_explicit,
+                          "--kv-dtype: the last form does not win, or an explicit bf16 is not marked");
     }
     // --spec dspark drafts 3 per round unless --draft-tokens says otherwise (1..7).
     const ninfer::EngineOptions dspark = make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "dspark"}));

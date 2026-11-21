@@ -1026,10 +1026,15 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.stage_layers = parse_stage_layers(require_value("--stage-layers"));
         } else if (arg == "--kv-dtype") {
             const char* form = require_value("--kv-dtype");
+            // The last --kv-dtype wins: each form resets the other field.
             if (std::string_view(form) == "fp16" || std::string_view(form) == "fp32") { // Inkling-2's KV rings
-                options.kv_rings = std::string_view(form) == "fp16" ? KvRings::FP16 : KvRings::FP32;
+                options.kv_rings          = std::string_view(form) == "fp16" ? KvRings::FP16 : KvRings::FP32;
+                options.kv_cache          = KvCacheStorage::BFloat16;
+                options.kv_cache_explicit = false;
             } else {
-                options.kv_cache = parse_kv_dtype(form);
+                options.kv_cache          = parse_kv_dtype(form);
+                options.kv_rings          = KvRings::Default;
+                options.kv_cache_explicit = true;
             }
         } else if (arg == "--dense-q8") {
             options.dense_q8 = parse_dense_q8(require_value("--dense-q8"));

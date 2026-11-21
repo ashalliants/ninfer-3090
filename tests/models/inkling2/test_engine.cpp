@@ -104,6 +104,15 @@ int main() {
                 check(false, "model suspend is refused");
             } catch (const std::invalid_argument&) {}
         }
+        {
+            // An explicit --kv-dtype bf16 (or any kv_cache form) is refused: Inkling-2's rings are FP16 or FP32.
+            ninfer::EngineOptions bf16 = options;
+            bf16.kv_cache_explicit     = true;
+            try {
+                ninfer::Engine refused(bf16);
+                check(false, "an explicit --kv-dtype bf16 is refused");
+            } catch (const std::invalid_argument&) {}
+        }
         for (const auto set : {+[](ninfer::ContextCacheOptions& c) { c.auto_host_cache = true; },
                                +[](ninfer::ContextCacheOptions& c) { c.device_state_slots = 2U; },
                                +[](ninfer::ContextCacheOptions& c) { c.host_capacity_bytes = std::size_t{1} << 30; }}) {
