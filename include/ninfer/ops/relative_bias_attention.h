@@ -92,7 +92,8 @@ struct RelativeBiasAttentionShape {
  *
  * Logical shapes:
  *   q FP32 [heads * d, T]; r FP32 [heads * d_rel, T]; sink FP32 [heads, T]; k_new, v_new FP32 [kv_heads * d, T];
- *   table FP32 [d_rel, E] contiguous; k_cache, v_cache FP32 [kv_heads * d, capacity] contiguous; gate FP32
+ *   table FP32 [d_rel, E] contiguous; k_cache, v_cache FP32 [kv_heads * d, capacity] contiguous, with storage on
+ *   both paths (refused otherwise, before any launch); gate FP32
  *   [heads * d, T] or null; out FP32 [heads * d, T], or BF16 with a gate.
  *
  * Supported domain:

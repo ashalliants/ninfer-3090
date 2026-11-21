@@ -476,6 +476,20 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
                                                       &kn, &vn, dt.tensor({rel, extent}), tkc2, tvc2, 0, nullptr, &gate, no_out, nullptr);
         } catch (const std::invalid_argument&) { refused = true; }
         check(refused, "relative_bias_sink_attention takes a BF16 out without storage");
+        // The pre-appended path (no k_new, v_new) over caches without storage is refused too, before the launch.
+        Tensor no_k(nullptr, DType::FP32, {kvw, tkc2.ne[1]}), no_v(nullptr, DType::FP32, {kvw, tkc2.ne[1]});
+        Tensor fp32_out = out.tensor({qw, n}).slice(1, 0, len);
+        for (const bool k_missing : {true, false}) {
+            bool no_cache = false;
+            try {
+                ninfer::ops::relative_bias_sink_attention({heads, kvh, d, rel, window}, dq.tensor({qw, n}).slice(1, 0, len),
+                                                          dr.tensor({heads * rel, n}).slice(1, 0, len), ds.tensor({heads, n}).slice(1, 0, len),
+                                                          nullptr, nullptr, dt.tensor({rel, extent}), k_missing ? no_k : tkc2,
+                                                          k_missing ? tvc2 : no_v, 0, nullptr, nullptr, fp32_out, nullptr);
+            } catch (const std::invalid_argument&) { no_cache = true; }
+            check(no_cache, std::string("relative_bias_sink_attention reads a pre-appended ") + (k_missing ? "k_cache" : "v_cache") +
+                                " without storage");
+        }
     }
     {
         Tensor tw(want_gated.p, DType::BF16, {qw, n});
