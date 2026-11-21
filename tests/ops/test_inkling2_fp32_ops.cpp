@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -258,7 +259,9 @@ void test_clips() {
 
 // Positions 0..n-1 through relative_bias_sink_attention in calls of `chunk`, against the oracle over the whole sequence.
 // With device_start each call passes start 0 and the position as the device offset (how a decode graph runs).
-void test_attention(int window, int extent, int n, int chunk, const std::string& label, bool device_start = false) {
+// Only positions from check_from on are compared (the FP64 oracle is quadratic in n).
+void test_attention(int window, int extent, int n, int chunk, const std::string& label, bool device_start = false,
+                    int check_from = 0) {
     const int heads = 24, kvh = 8, d = 128, rel = 16, qw = heads * d, kvw = kvh * d;
     auto q = randoms(qw * n, -0.3F, 0.3F), r = randoms(heads * rel * n), sink = randoms(heads * n, -2, 2), k = randoms(kvw * n),
          v = randoms(kvw * n), table = randoms(extent * rel, -0.5, 0.5);
@@ -281,7 +284,7 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
                                                   device_start ? static_cast<const std::int64_t*>(doff.p) : nullptr, to, nullptr);
     }
     Vec want;
-    for (int p = 0; p < n; ++p) {
+    for (int p = check_from; p < n; ++p) {
         std::vector<bool> visible(n);
         Vec bias(static_cast<std::size_t>(heads) * n, 0.0);
         for (int j = 0; j < n; ++j) {
@@ -295,7 +298,8 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
                                      Vec(sink.begin() + p * heads, sink.begin() + (p + 1) * heads), visible, heads, kvh, d);
         want.insert(want.end(), o.begin(), o.end());
     }
-    compare(label, out.get(qw * n), want, 2e-6);
+    const auto got = out.get(qw * n);
+    compare(label, std::vector<float>(got.begin() + static_cast<std::ptrdiff_t>(check_from) * qw, got.end()), want, 2e-6);
 }
 
 void test_route() {
@@ -504,12 +508,36 @@ void bench_experts(bool nvfp4) {
 
 } // namespace
 
+// The workspace queries refuse what the Ops refuse.
+void test_workspace_queries() {
+    const auto refuses = [](auto query) {
+        try {
+            (void)query();
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    namespace o = ninfer::ops;
+    check(refuses([] { return o::depth_attention_mix_workspace_bytes(2304, 0, 2); }), "MIX query takes T = 0");
+    check(refuses([] { return o::depth_attention_mix_workspace_bytes(2304, -1, 2); }), "MIX query takes T < 0");
+    check(refuses([] { return o::depth_attention_mix_workspace_bytes(2304, 65536, 2); }), "MIX query takes T > 65535");
+    check(refuses([] { return o::depth_attention_mix_workspace_bytes(0, 1, 2); }), "MIX query takes D = 0");
+    check(refuses([] { return o::depth_attention_mix_workspace_bytes(2304, 1, 9); }), "MIX query takes 9 sources");
+    check(refuses([] { return o::moe_route_sigmoid_topk_workspace_bytes(0, 1); }), "route query takes E = 0");
+    check(refuses([] { return o::moe_route_sigmoid_topk_workspace_bytes(257, 1); }), "route query takes E > 256");
+    check(refuses([] { return o::moe_route_sigmoid_topk_workspace_bytes(128, 0); }), "route query takes T = 0");
+    check(refuses([] { return o::moe_route_sigmoid_topk_workspace_bytes(128, 65536); }), "route query takes T > 65535");
+    check(!refuses([] { return o::depth_attention_mix_workspace_bytes(2304, 65535, 8); }), "MIX query refuses its domain");
+    check(!refuses([] { return o::moe_route_sigmoid_topk_workspace_bytes(256, 65535); }), "route query refuses its domain");
+    std::printf("workspace queries refuse outside the domain\n");
+}
+
 int main() {
     if (t::cuda_unavailable()) {
         std::printf("SKIP: no usable CUDA device\n");
         return 77;
     }
     try {
+        test_workspace_queries();
         test_rows();
         test_mix_and_control();
         test_short_conv(false);
@@ -521,6 +549,7 @@ int main() {
         test_attention(4, 4, 13, 1, "attention local window 4, decode steps");
         test_attention(4, 4, 13, 1, "attention local window 4, decode, device start", true);
         test_attention(0, 4, 12, 1, "attention global, decode, device start", true);
+        test_attention(0, 1024, 1030, 515, "attention global, two key tiles (last 6 of 1030)", false, 1024);
         test_route();
         test_experts(true, 128, 64, 3, "moe_situ_experts NVFP4 small");
         test_experts(true, 2304, 1152, 3, "moe_situ_experts NVFP4 [3, 2304, 1152]");

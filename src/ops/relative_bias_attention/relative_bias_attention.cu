@@ -15,6 +15,7 @@ constexpr int kMaxRel  = 32;
 constexpr int kWarps   = 4;
 constexpr int kThreads = kWarps * 32;
 constexpr int kTile    = 1024;
+constexpr int kKeyLanes = 8; // lanes that score one key together
 
 void require(bool condition, const char* op, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string(op) + ": " + message); }
@@ -90,12 +91,29 @@ struct AttentionArgs {
     const std::int64_t* start_offset;
 };
 
+// The block's maximum (kMax) or sum of v; every thread gets it. `scratch` holds kWarps floats.
+template <bool kMax>
+__device__ float block_reduce(float v, float* scratch) {
+    for (int o = 16; o > 0; o >>= 1) {
+        const float other = __shfl_xor_sync(0xffffffffU, v, o);
+        v = kMax ? fmaxf(v, other) : v + other;
+    }
+    __syncthreads(); // scratch reuse across calls
+    if ((threadIdx.x & 31) == 0) { scratch[threadIdx.x >> 5] = v; }
+    __syncthreads();
+    float total = scratch[0];
+#pragma unroll
+    for (int w = 1; w < kWarps; ++w) { total = kMax ? fmaxf(total, scratch[w]) : total + scratch[w]; }
+    return total;
+}
+
 // One block per (head, column): four warps score a tile of keys into shared memory, then every thread folds
 // the tile into its output dimension with the online-softmax rescale.
 __global__ void __launch_bounds__(kThreads) attention_kernel(AttentionArgs a) {
     __shared__ float q[kHeadDim];
     __shared__ float r[kMaxRel];
     __shared__ float scores[kTile];
+    __shared__ float reduce[kWarps];
     const int h = blockIdx.x, t = blockIdx.y, g = h / a.group;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     q[threadIdx.x] = a.q[t * a.qs + static_cast<std::int64_t>(h) * kHeadDim + threadIdx.x];
@@ -108,31 +126,64 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(AttentionArgs a) {
     float denom = 1.0F; // e^{sink - m}
     float acc   = 0.0F;
     const std::int64_t col = static_cast<std::int64_t>(g) * kHeadDim + threadIdx.x;
+    const float4* q4 = reinterpret_cast<const float4*>(q);
+    const int sub = lane & (kKeyLanes - 1);
     for (std::int64_t base = lo; base <= pos; base += kTile) {
         const int n = static_cast<int>(pos - base + 1 < kTile ? pos - base + 1 : kTile);
-        for (int i = warp; i < n; i += kWarps) {
-            const std::int64_t j = base + i, slot = j % a.capacity;
-            const float* key = a.k + slot * a.kv_width + static_cast<std::int64_t>(g) * kHeadDim;
+        // Key j of the tile sits in ring slot base_slot + i, less one capacity when it wraps (i < n <= capacity).
+        const std::int64_t base_slot = base % a.capacity;
+        // kKeyLanes lanes per key, kThreads / kKeyLanes keys at a time: lane `sub` dots four float4 of the key.
+        // The loop bound is uniform per warp (the shuffles need every lane); keys past n score nothing.
+        for (int i0 = warp * (32 / kKeyLanes); i0 < n; i0 += kThreads / kKeyLanes) {
+            const int i = i0 + lane / kKeyLanes;
+            const bool valid = i < n;
+            std::int64_t slot = base_slot + (valid ? i : 0);
+            slot -= slot >= a.capacity ? a.capacity : 0;
+            const float4* key = reinterpret_cast<const float4*>(a.k + slot * a.kv_width + static_cast<std::int64_t>(g) * kHeadDim);
             float dot = 0.0F;
-            for (int d = lane; d < kHeadDim; d += 32) { dot = fmaf(q[d], key[d], dot); }
-            dot = warp_sum(dot) * inv_sqrt_d;
-            const std::int64_t dist = pos - j;
+#pragma unroll
+            for (int m = 0; m < kHeadDim / (4 * kKeyLanes); ++m) {
+                const float4 kv = __ldg(key + sub + kKeyLanes * m), qv = q4[sub + kKeyLanes * m];
+                dot = fmaf(qv.x, kv.x, fmaf(qv.y, kv.y, fmaf(qv.z, kv.z, fmaf(qv.w, kv.w, dot))));
+            }
+            const std::int64_t dist = pos - (base + i);
             float bias = 0.0F;
-            if (dist < a.extent && lane < a.d_rel) { bias = r[lane] * a.table[dist * a.d_rel + lane]; }
-            bias = warp_sum(bias);
-            if (lane == 0) { scores[i] = dot + bias; }
+            if (valid && dist < a.extent) {
+                for (int c = sub; c < a.d_rel; c += kKeyLanes) { bias = fmaf(r[c], a.table[dist * a.d_rel + c], bias); }
+            }
+            for (int o = kKeyLanes / 2; o > 0; o >>= 1) {
+                dot += __shfl_xor_sync(0xffffffffU, dot, o);
+                bias += __shfl_xor_sync(0xffffffffU, bias, o);
+            }
+            if (valid && sub == 0) { scores[i] = dot * inv_sqrt_d + bias; }
         }
         __syncthreads();
-        float top = m;
-        for (int i = 0; i < n; ++i) { top = fmaxf(top, scores[i]); }
+        // The tile's maximum, its exponentials and their sum in parallel; then every thread folds its value
+        // dimension over the tile with four independent accumulators (the loads of a step do not wait on each other).
+        float top = -INFINITY;
+        for (int i = threadIdx.x; i < n; i += kThreads) { top = fmaxf(top, scores[i]); }
+        top = fmaxf(m, block_reduce<true>(top, reduce));
         const float rescale = expf(m - top);
-        denom *= rescale;
-        acc *= rescale;
-        for (int i = 0; i < n; ++i) {
-            const float e = expf(scores[i] - top);
-            denom += e;
-            acc = fmaf(e, a.v[((base + i) % a.capacity) * a.kv_width + col], acc);
+        float sum = 0.0F;
+        for (int i = threadIdx.x; i < n; i += kThreads) { sum += (scores[i] = expf(scores[i] - top)); }
+        sum = block_reduce<false>(sum, reduce); // its barriers also publish the exponentials
+        denom = fmaf(denom, rescale, sum);
+        float part[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+        int i = 0;
+        for (; i + 4 <= n; i += 4) {
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                std::int64_t slot = base_slot + i + u;
+                slot -= slot >= a.capacity ? a.capacity : 0;
+                part[u] = fmaf(scores[i + u], a.v[slot * a.kv_width + col], part[u]);
+            }
         }
+        for (; i < n; ++i) {
+            std::int64_t slot = base_slot + i;
+            slot -= slot >= a.capacity ? a.capacity : 0;
+            part[0] = fmaf(scores[i], a.v[slot * a.kv_width + col], part[0]);
+        }
+        acc = fmaf(acc, rescale, (part[0] + part[1]) + (part[2] + part[3]));
         m = top;
         __syncthreads();
     }
