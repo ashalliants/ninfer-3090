@@ -44,10 +44,24 @@ struct DSparkConfig {
     std::vector<std::uint32_t> target_visits; // tap v < visits: the input of visit v; v == visits: the final normed state
 };
 
+// The vision tower (component vision; tools/convert/inkling2_vision.py vision_config).
+struct VisionConfig {
+    std::uint32_t depth = 0, hidden_size = 0, intermediate_size = 0, heads = 0, patch_size = 0, position_grid = 0;
+    std::uint32_t merge = 0, projection_size = 0, max_image_tokens = 0;
+    float layer_norm_eps = 0, rope_theta = 0;
+    float image_mean[3] = {}, image_std[3] = {};
+
+    [[nodiscard]] std::uint32_t head_dim() const noexcept { return hidden_size / heads; }
+    // The image side an image is padded to a multiple of: one merged token's square.
+    [[nodiscard]] std::uint32_t align() const noexcept { return patch_size * merge; }
+};
+
 [[nodiscard]] bool is_inkling2_config(const artifact::Directory& directory);
 [[nodiscard]] TextConfig parse_config(const artifact::Json& config);
 [[nodiscard]] TextConfig parse_config(const artifact::Directory& directory);
 // Checked against the text config whose embedding, embedding norm and head the drafter borrows.
 [[nodiscard]] DSparkConfig parse_dspark_config(const artifact::Json& config, const TextConfig& text);
+// Checked against the text config it projects into.
+[[nodiscard]] VisionConfig parse_vision_config(const artifact::Json& config, const TextConfig& text);
 
 } // namespace ninfer::models::inkling2

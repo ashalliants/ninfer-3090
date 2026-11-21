@@ -26,6 +26,7 @@ Line numbers below refer to these exact revisions. Everything was read, nothing 
 | **[Ld]** | same revision, `src/models/dspark.cpp:946-1125` | DSpark drafter |
 | **[H]** | `huggingface/transformers` @ `4d9ef623e3b0a1fb6c12891a907e0e50d41f0af8`, `src/transformers/models/inkling2/modeling_inkling2.py` | every non-loop op; has **no** loop |
 | **[Q]** | `thinkingmachines/Inkling-2-Mini` `config.json`, `hf_quant_config.json`, `tokenizer.json` | dimensions, stored precisions, tokenizer |
+| **[Lv]** | same revision, `tools/mtmd/models/inkling2v.cpp`, `tools/mtmd/mtmd-graph.cpp` (`build_vit`, `build_rope_2d`, `build_patch_merge_permute`, `resize_position_embeddings`), `tools/mtmd/mtmd-image.cpp` and `mtmd-model.cpp` (`inkling2v`) | the vision tower and its preprocessing |
 | **[V]** | `vllm-project/vllm` `recipes/models/thinkingmachines/Inkling-2-Mini.yaml` | prose confirmation: "12 middle layers run three passes per token, each with its own KV cache and gated messages from the previous pass" |
 
 sglang's `inkling2.py` and the HF code have no loop. vLLM's loop implementation is only in its
@@ -267,6 +268,7 @@ yet. The DSpark drafter runs greedy speculative decoding (see "DSpark drafter").
 | Short convolutions | `ops/short_conv.h` | static and per-head dynamic taps, FP32 history per visit and stream |
 | Attention | `ops/relative_bias_attention.h` | per-head L2 clips and log scale, V unit norm, relative-bias sink attention over an FP32 KV ring per visit (local capacity window - 1 + max_chunk, global max_context) |
 | MoE | `ops/moe_situ.h` | sigmoid top-8 route with bias steering; SITU experts from `ggml_rec_nvfp4_nvfp4` records (layers 0-19) or the BF16 banks (20-23), with the per-expert multipliers |
+| Vision | `program/vision_program.{h,cpp}`, `ops/vit_fp32.h` | `prepare_image` (pad, normalize, resize above 4096 tokens) and `VisionEncoder::encode`; `TextProgram::forward(tokens, embeddings)` puts an image's rows in place of its placeholder tokens (see "Vision tower") |
 | Tokenizer | `qwen3_5/frontend/tokenizer.{h,cpp}` `Pipeline::Inkling2` | the word regex as a hand-written matcher, no normalizer, BPE with `ignore_merges` |
 
 All Ops are naive FP32 kernels qualified against `tests/ops/inkling2_reference.h`. The KV rings are
@@ -324,12 +326,79 @@ with separate context roles. What is new: per-layer softmax tap fusion instead o
 projection, taps counted in visits, the Markov RNN chain instead of per-column argmax, and global
 attention in a draft layer.
 
-## Vision (`mmproj-*.gguf`, `clip`, projector `inkling2v`)
+## Vision tower (`mmproj-BF16.gguf`, `clip`, projector `inkling2v`)
 
-A ViT: 23 layers, width 1024, 16 heads, MLP 4096 with exact GELU, LayerNorm eps 1e-5, axial 2-D RoPE
-with theta 10000, native patch 20, temporal patch 2. Patch embedding is linear (HWC). A 2x2
-adapter merge, then `proj_in` / `proj_out` up to H 2304 (projection hidden 4096). Mean and std are
-0.5. The tower is about 0.6 GiB in F16/BF16. Details are deferred to the vision phase.
+Sources: llama.cpp at the [L] revision, `tools/mtmd/models/inkling2v.cpp`, `mtmd_graph::build_vit`, and the
+`inkling2v` preprocessor and loader in `tools/mtmd/mtmd-image.cpp` and `mtmd-model.cpp` ([Lv]). Also [H]
+`Inkling2VisionModel` with its embeddings, rotary embedding and merger, at lines 858-1450. The two agree on every
+step below. The tower is a ViT: 23 layers, width D 1024, 16 heads of 64, an MLP of 4096 with exact (erf) GELU,
+and LayerNorm with eps 1e-5. All its weights take 0.6 GiB as BF16 matrices plus F32 vectors.
+
+1. **Preprocess.** Pad the image at the bottom and right to multiples of 40 (patch 20 times merge 2).
+   - The padding holds -1 before normalization. Every value then becomes `(v - 127.5) / 127.5` in FP32, so the
+     padding ends up at -1.0078.
+   - An image is resized only when its padded area is above 4096 merged tokens (6.55 MP). Its size then comes
+     from llama.cpp's `calc_size_preserved_ratio`. llama.cpp resizes bicubically; ninfer resizes bilinearly.
+2. **Patches.** The patches are 20 x 20 in raster order. Each is projected by the F32 kernel
+   `v.patch_embd [1024, 3, 20, 20]`, with no bias. llama.cpp folded the checkpoint's two temporal slices into this
+   one kernel, which is why it is F32.
+3. **Positions and CLS.**
+   - The learned table is a 32 x 32 grid. It is resized to the image's gw x gh patch grid bilinearly, with
+     half-pixel centres and clamped edges (ggml `GGML_SCALE_MODE_BILINEAR`; [H] `align_corners=False`), and added.
+   - The CLS token `class_embd + class_position_embd` goes in front.
+   - Then comes `pre_ln`.
+4. **Each layer:**
+   ```text
+   y = LN1(h);  q, k, v = W y + b
+   q, k = rope2d(q, k)
+   h += ls1 * (Wo attn(q, k, v) + bo)
+   h += ls2 * (W2 gelu(W1 LN2(h) + b1) + b2)
+   ```
+   - `rope2d` works per head of 64. Dims 0..31 rotate by the token's x position and dims 32..63 by its y position.
+     Each rotation is ggml's normal (pair-interleaved) RoPE over 32 dims, with theta 10000: pair i turns by
+     `p * 10000^(-2i/32)`.
+   - Patch (px, py) sits at (px + 1, py + 1) and CLS at (0, 0).
+   - Attention is full (non-causal) with scale 1/8.
+   - There is no post-norm.
+5. **Merge and project.**
+   - Drop CLS. Each 2 x 2 square becomes one token of 4096: value `e + D dx + 2 D dy` is patch
+     (2X + dx, 2Y + dy).
+   - Tokens are in raster order of the merged grid.
+   - Then `mm.1` (4096 x 4096), GELU, and `mm.2` (2304 x 4096). Neither has a bias.
+6. **Into the text model.** Each image token's embedding replaces the input row of one placeholder token.
+   - The placeholder is `<|unused_200054|>`, [H] `image_token_id`.
+   - The embedding norm does **not** apply to these rows: [H] scatters the image rows after `Inkling2NormedEmbedding`,
+     and [L] normalizes token rows only.
+   - Each image token takes one position.
+   - The chat template writes `<|content_image|><|unused_200054|><|end_message|>`, and the processor expands the
+     placeholder to the image's tokens. llama.cpp's mtmd writes the same block, with `<|content_image|>` and then the
+     embeddings.
+   - The GGUF records no RoPE base and no token limit. Both come from llama.cpp's loader (10000; 1 to 4096 tokens),
+     and the converter writes them into the component config.
+
+**Engine (FP32 kernels, `include/ninfer/ops/vit_fp32.h`, `program/vision_program.{h,cpp}`).**
+- `prepare_image` does step 1 on the host.
+- `VisionEncoder::encode` runs steps 2-5 with `vit_linear_fp32`, a 64 x 64-tiled GEMM over BF16 or F32 words that
+  sums in K order, so each column is exact whatever T is.
+- `TextProgram::forward(tokens, embeddings)` takes the image rows for step 6, and a chunk may split them.
+
+**Status (2026-11-21, V100).** `ninfer_inkling2_vision_test` checks two images: llama.cpp's `test-1.jpeg`, decoded
+to PNG (640 x 488, 208 tokens), and a synthetic 300 x 170 one (40 tokens).
+- Embeddings: compared with an FP64 reference of the tower (`tools/inkling2/vision_reference.py`).
+- The reference itself is within 0.6% mean (3.8% worst) relative error per token of llama.cpp's CPU embeddings,
+  which pass BF16 activations to its matmuls. Swapping the RoPE to split-half gives errors of order 1, so this
+  comparison does tell the variants apart.
+- Prefill of an image prompt in chunks of 50 gives the same bits as one whole forward.
+
+| image | tokens | encode | vs FP64, worst / mean token | vs llama.cpp, worst / mean | greedy = llama.cpp |
+|---|---|---|---|---|---|
+| test-1 640 x 488 | 208 | 0.091 s | 8.1e-5 / 6.8e-6 | 3.7e-2 / 6.7e-3 | 48 of 48 tokens |
+| synthetic 300 x 170 | 40 | 0.034 s | 1.5e-5 / 4.1e-6 | 2.2e-2 / 6.1e-3 | 48 of 48 tokens |
+
+The greedy continuations are llama.cpp's `llama-mtmd-cli` outputs, tokenized again. The prompt is
+`<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_image|>`, then the
+image, then `<|end_message|><|message_user|><|content_text|>Describe this image in one paragraph.<|end_message|>`. The
+model reads the newspaper's front page: "The New York Times ... July 20, 1969 ...".
 
 ## GGUF mapping (Unsloth `unsloth/Inkling-2-Mini-GGUF`)
 
