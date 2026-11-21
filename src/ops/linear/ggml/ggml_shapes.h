@@ -79,6 +79,9 @@ inline constexpr GgmlLinearShape kGgmlLinearShapes[] = {
     {QType::GGML_Q5_K, 5120, 8192, true},
     {QType::GGML_Q5_K, 2304, 5120, false},
     {QType::GGML_Q5_K, 5120, 2304, true},
+    // ... and the Engram's engram_kv: the 24 decoded n-gram rows (6144 values) to a key per
+    // hyper-connection stream and one shared value (4 + 1 streams of 5120).
+    {QType::GGML_Q5_K, 25600, 6144, false},
 };
 
 // The K values the decode kernels (ggml_mmvq_launch, ggml_mma_decode_launch) compile instances for:

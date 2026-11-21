@@ -141,6 +141,8 @@ constexpr Family kV4OutB{"attn_output_b", 5120, 8192, true};
 constexpr Family kV4Gate{"ffn_gate_shexp", 2304, 5120, false};
 constexpr Family kV4Up{"ffn_up_shexp", 2304, 5120, false};
 constexpr Family kV4Down{"ffn_down_shexp", 5120, 2304, true};
+// Layers 1 and 14's Engram: the 24 decoded rows (8 heads x 3 orders x 256) to 5 x 5120 (a key per stream and the value).
+constexpr Family kV4EngramKv{"engram_kv", 25600, 6144, false};
 
 const Pack kV4Pack{"DeepSeek-V4.1-Flash IQ2_XXS",
                    {{&kV4QA, {Q80}},
@@ -151,7 +153,8 @@ const Pack kV4Pack{"DeepSeek-V4.1-Flash IQ2_XXS",
                     {&kV4OutB, {Q5K}},
                     {&kV4Gate, {Q5K}},
                     {&kV4Up, {Q5K}},
-                    {&kV4Down, {Q5K}}},
+                    {&kV4Down, {Q5K}},
+                    {&kV4EngramKv, {Q5K}}},
                    {},
                    {},
                    false};

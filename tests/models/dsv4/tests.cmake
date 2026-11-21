@@ -24,3 +24,10 @@ ninfer_add_test(ninfer_dsv4_forward_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_forward.cpp"
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_ops ninfer_core)
 set_tests_properties(ninfer_dsv4_forward_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# DeepSeek-V4.1-Flash's Engram injection: the n-gram hash against the oracle's golden, the device sequence (volume
+# rows, IQ4_NL decode, the Q5_K projection, the gated write) on a synthetic volume, and with
+# NINFER_DSV4_ENGRAM_FIXTURE (tools/dsv4/export_engram_fixture.py) layer 1's real weights and rows.
+ninfer_add_test(ninfer_dsv4_engram_test NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engram.cpp"
+  LIBRARIES ninfer_model_runtime)
