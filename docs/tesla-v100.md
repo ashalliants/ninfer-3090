@@ -4,9 +4,10 @@ NInfer runs on a 32 GB Tesla V100 (Volta, `sm_70`), one of the project's two fir
 alongside the RTX 3090. Three models are supported and tuned there: **Qwen3.8-27B**,
 **Qwen3.8-Flash-Next**, the 512-expert MoE with the full 262,144-token context, and
 **Inkling-2-Mini**, the looped 128-expert MoE with images and DSpark speculative decoding
-([spec and measurements](maintainer/inkling2-model.md)). This page covers what you need, how to build and run it, the measured performance, and
-the limits. How the port works, and every measurement behind it, is in
-[docs/maintainer/volta-port.md](maintainer/volta-port.md).
+([spec and measurements](maintainer/inkling2-model.md)). This page covers what you need, how to build and run
+the two Qwen models, their measured performance, and the limits; Inkling-2-Mini's run command and measurements
+are in its [model card](../model-cards/Inkling-2-Mini-NInfer-V100/README.md) and its spec.
+How the port works, and every measurement behind it, is in [docs/maintainer/volta-port.md](maintainer/volta-port.md).
 
 There are no prebuilt V100 archives: the release binaries are `sm_86`. You build from source on
 Linux.
