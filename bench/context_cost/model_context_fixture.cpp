@@ -501,6 +501,7 @@ PrefillSuiteResult measure_prefill(const ArtifactProfile& artifact,
     engine_options.max_concurrency       = 1;
     engine_options.max_pending_requests  = 1;
     engine_options.prefill_chunk         = options.prefill_chunk;
+    engine_options.prefill_chunk_explicit = true; // the cases' chunk counts assume this chunk on every route
     engine_options.kv_cache              = options.kv_cache;
     engine_options.prefill_cublas        = options.prefill_cublas;
     engine_options.gdn_state_fp16        = options.gdn_state_fp16;

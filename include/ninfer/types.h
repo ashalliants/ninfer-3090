@@ -816,8 +816,9 @@ struct EngineOptions {
     bool admission_affinity            = false;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
-    // Whether prefill_chunk was given (--prefill-chunk): Inkling-2 otherwise picks the widest of 2048, 1024, 512 and
-    // 256 whose programs fit beside max_context.
+    // Whether prefill_chunk was given (--prefill-chunk): Inkling-2 otherwise ignores prefill_chunk and picks the widest
+    // of 2048, 1024, 512 and 256 whose programs fit beside max_context. A direct EngineOptions caller that wants its
+    // prefill_chunk to run on Inkling-2 sets this (ninfer_bench and the context-cost fixture do).
     bool prefill_chunk_explicit        = false;
     // Zero (off), or a multiple of prefill_chunk: a long prefill leaves a private LongAnchor
     // checkpoint every this many tokens, so a request that loses its pause snapshot replays from

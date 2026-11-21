@@ -68,7 +68,8 @@ std::int32_t max_live_outputs(const TextConfig& c) {
 
 // Every allocation one token costs in a forward call (persistent across visits and per visit), with slack.
 std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk, std::int32_t max_context, bool split_attention,
-                            std::int32_t logit_columns, const ProgramLimits::TensorCoreParts& tc, QType expert_format) {
+                            std::int32_t logit_columns, const ProgramLimits::TensorCoreParts& tc, QType expert_format,
+                            const DenseWeightsQ8* dense) {
     const std::size_t h = c.hidden_size, q = std::size_t(c.heads) * c.head_dim, kv = std::size_t(c.kv_heads) * c.head_dim;
     const std::size_t kept = static_cast<std::size_t>(max_live_outputs(c)) * h * 4; // the pooled visit outputs
     // A visit's own (ffn_inp and the four loop messages among them) are released when it returns.
@@ -91,13 +92,16 @@ std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk, std::int32_
         split_attention ? ops::relative_bias_attention_split_bytes(global, std::min(chunk, ops::kSplitMaxColumns), keys) : 0;
     // The tensor-core route's staging: the widest dense weight and the chunk in FP16, or the experts' entries. The
     // head goes through project() too: when its call is wide enough for the tensor cores (every column's logits kept,
-    // last_logits off), its vocab_size rows are the widest weight.
+    // last_logits off), its vocab_size rows are the widest weight. A re-encoded weight runs over its Q8 copy instead
+    // (project() takes it first): either --dense-q8 form re-encodes the head, and Q8All every dense projection, so
+    // nothing dense is staged.
     ops::SituExpertBank bank;
     bank.format = expert_format, bank.hidden = i32(h), bank.intermediate = i32(c.moe_intermediate), bank.experts = i32(c.experts);
-    const std::size_t widest =
-        std::max({q, h, logit_columns >= kTensorCoreMinColumns ? static_cast<std::size_t>(c.vocab_size) : std::size_t{0}});
+    const bool head_tc  = logit_columns >= kTensorCoreMinColumns && dense == nullptr;
+    const bool dense_tc = tc.dense && (dense == nullptr || dense->form() != DenseForm::Q8All);
+    const std::size_t widest = std::max({q, h, head_tc ? static_cast<std::size_t>(c.vocab_size) : std::size_t{0}});
     const std::size_t staging =
-        std::max(tc.dense ? ops::projection_tc_workspace_bytes(i32(std::max(q, h)), i32(widest), chunk) : 0,
+        std::max(dense_tc ? ops::projection_tc_workspace_bytes(i32(std::max(q, h)), i32(widest), chunk) : 0,
                  tc.experts ? ops::moe_situ_experts_tc_workspace_bytes(bank, std::int64_t(c.experts_per_token) * chunk) : 0);
     return per_token * static_cast<std::size_t>(chunk) + logits + split + staging + (c.num_layer_visits * 2 + 64) * kAlign * 4 +
            (64U << 20);
@@ -129,7 +133,7 @@ TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t 
     : model_(model), config_(model.config()), limits_(limits), stream_(stream),
       workspace_(workspace_bytes(model.config(), checked(limits).max_chunk, limits.max_context, limits.split_attention,
                                  limits.last_logits ? std::max(1, limits.max_rollback) : limits.max_chunk, limits.prefill_tc,
-                                 widest_expert_format(model))) {
+                                 widest_expert_format(model), limits.dense)) {
     const TextConfig& c = config_;
     const std::size_t kv = std::size_t(c.kv_heads) * c.head_dim, taps = c.conv_kernel_size - 1;
     const std::size_t local_cap = c.sliding_window - 1 + static_cast<std::size_t>(limits.max_chunk);
