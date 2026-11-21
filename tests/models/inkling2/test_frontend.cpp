@@ -15,6 +15,7 @@
 #include "models/inkling2/config.h"
 #include "models/inkling2/frontend/frontend.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -344,6 +345,23 @@ int main() {
             check(false, "an empty token prompt is refused");
         } catch (const std::invalid_argument&) {}
 
+        // preserve_thinking: the history's reasoning renders by default and with true, and false drops it.
+        {
+            const auto history = [&](std::optional<bool> preserve) {
+                auto input = user_turn({text("hi")});
+                ninfer::ChatMessage reply{.role = ninfer::ChatRole::Assistant, .parts = {text("Hello.")}};
+                reply.reasoning_content = "The user greets me.";
+                input.messages.push_back(std::move(reply));
+                input.messages.push_back({.role = ninfer::ChatRole::User, .parts = {text("Again.")}});
+                input.options.preserve_thinking = preserve;
+                const auto tokens = frontend.prepare(std::move(input)).tokens;
+                return std::count(tokens.begin(), tokens.end(), ink::token::kContentThinking);
+            };
+            const auto kept = history(std::nullopt);
+            check(history(true) == kept && history(false) == kept - 1,
+                  "preserve_thinking false drops the history's reasoning, unset and true keep it");
+        }
+
         // Refusals.
         const auto refused = [&](const ink::Frontend& f, ninfer::PromptInput input, const std::string& what) {
             try {
@@ -368,7 +386,8 @@ int main() {
                 conflict.options.reasoning_effort = ninfer::ReasoningEffort::High;
                 refused(frontend, conflict, "enable_thinking false with a reasoning effort");
             }
-            for (const char* key : {"tools", "messages", "bos_token", "add_generation_prompt", "reasoning_effort", "enable_thinking"}) {
+            for (const char* key : {"tools", "messages", "bos_token", "add_generation_prompt", "reasoning_effort", "enable_thinking",
+                                    "preserve_thinking"}) {
                 auto kwargs = user_turn({text("hi")});
                 kwargs.options.chat_template_kwargs_json = std::string("{\"") + key + "\": []}";
                 refused(frontend, kwargs, std::string("chat_template_kwargs setting ") + key);

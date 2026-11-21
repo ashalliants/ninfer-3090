@@ -132,7 +132,11 @@ Json template_context(const PromptInput& input, std::size_t& images) {
             }
             m["content"] = std::move(parts);
         }
-        if (!message.reasoning_content.empty()) { m["reasoning_content"] = message.reasoning_content; }
+        // The template renders every assistant turn's reasoning; preserve_thinking false drops it from the history
+        // (unset and true keep the template's default).
+        if (!message.reasoning_content.empty() && input.options.preserve_thinking != std::optional<bool>(false)) {
+            m["reasoning_content"] = message.reasoning_content;
+        }
         if (!message.tool_calls.empty()) {
             Json calls = Json::array();
             for (const ToolCall& call : message.tool_calls) {
@@ -151,8 +155,9 @@ Json template_context(const PromptInput& input, std::size_t& images) {
         const std::string& key = item.key();
         if (key == "messages" || key == "tools" || key == "add_generation_prompt" || key == "continue_final_message" ||
             key.ends_with("_token") || key == "additional_special_tokens" || key == "reasoning_effort" ||
-            key == "enable_thinking") {
-            // reasoning_effort and enable_thinking come typed (PromptOptions), so the prompt and its summary agree.
+            key == "enable_thinking" || key == "preserve_thinking") {
+            // reasoning_effort, enable_thinking and preserve_thinking come typed (PromptOptions), so the prompt and its
+            // summary agree.
             throw std::invalid_argument("chat_template_kwargs cannot override " + key);
         }
     }
