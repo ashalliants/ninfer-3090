@@ -111,6 +111,25 @@ int main() {
                 check(false, "a host-tier context cache option is refused");
             } catch (const std::invalid_argument&) {}
         }
+        for (const auto set : {+[](ninfer::EngineOptions& o) { o.speculative.backend = ninfer::SpeculativeBackend::Mtp; },
+                               +[](ninfer::EngineOptions& o) { o.speculative.draft_tokens = 3; },
+                               +[](ninfer::EngineOptions& o) { o.relaxed_drafting = 0.5F; },
+                               +[](ninfer::EngineOptions& o) { o.draft_context_rows = 64; }}) {
+            ninfer::EngineOptions speculative = options;
+            set(speculative);
+            try {
+                ninfer::Engine refused(speculative);
+                check(false, "a speculative option is refused");
+            } catch (const std::invalid_argument&) {}
+        }
+        {
+            // Prefix reuse off: no snapshot, so no extra device state is reported.
+            ninfer::EngineOptions uncached = options;
+            uncached.context_cache.enabled = false;
+            ninfer::Engine engine(uncached);
+            check(!engine.options().context_cache.enabled && engine.options().context_cache.device_state_slots == 0U,
+                  "no extra device state without prefix reuse");
+        }
         const auto t0         = Clock::now();
         ninfer::Engine engine(options);
         std::printf("engine ready in %.1f s (%s)\n", std::chrono::duration<double>(Clock::now() - t0).count(),

@@ -673,9 +673,17 @@ private:
             throw std::invalid_argument(
                 "Inkling-2 runs on one device with no context store, model suspend, LoRA adapters or grafts");
         }
+        // This core decodes plainly: a speculative setting is refused, not ignored.
+        const SpeculativeOptions plain;
+        const auto& spec = options.speculative;
+        if (spec.backend != SpeculativeBackend::None || spec.draft_tokens != 0 || spec.ngram_draft_tokens != 0 ||
+            spec.adaptive_draft_tokens != 0 || spec.ngram_min_match != plain.ngram_min_match ||
+            spec.proposal_head != plain.proposal_head || options.relaxed_drafting || options.draft_context_rows != 0) {
+            throw std::invalid_argument("Inkling-2 decodes without speculation: no --spec or drafting options");
+        }
         // The context cache is one device snapshot of the last prompt (Inkling2Core, "Prefix reuse"; the host-tier
-        // options were refused before normalization): it holds one state, the request's own.
-        options.context_cache.device_state_slots = 1;
+        // options were refused before normalization): one extra state when it is on, none when it is off.
+        options.context_cache.device_state_slots = options.context_cache.enabled ? 1U : 0U;
         // One worker runs one request at a time; the rest wait in its max_pending_requests queue.
         options.max_concurrency = 1;
         auto generation   = std::make_unique<Inkling2Core>(options, device);
