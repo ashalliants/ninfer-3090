@@ -110,9 +110,11 @@ public:
 
 private:
     enum class Channel : std::uint8_t { Content, Reasoning, ToolJson, Header, None };
-    void append(std::size_t channel, std::string_view bytes, Step& step);
+    // Every byte of text goes through here, so a stop string is matched wherever it appears; `final` ends any
+    // open character.
+    void append(std::size_t channel, std::string_view bytes, Step& step, bool final = false);
     void publish(std::size_t channel, bool all, std::vector<OutputDelta>& out);
-    void close_tool_call();
+    void close_tool_call(Step& step);
 
     const Frontend& frontend_;
     std::vector<StopString> stops_;

@@ -479,6 +479,11 @@ void Inkling2Core::run(Job& job) {
         logits = program.forward(one);
     }
     emit(decoder.finish());
+    if (decoder.matched_stop() && out.finish_reason != FinishReason::StopString) {
+        // A stop string inside an unfinished call's text, which finish() publishes as content.
+        out.finish_reason       = FinishReason::StopString;
+        out.matched_stop_string = decoder.matched_stop();
+    }
     out.content                 = decoder.content();
     out.reasoning               = decoder.reasoning();
     out.tool_calls              = decoder.tool_calls();

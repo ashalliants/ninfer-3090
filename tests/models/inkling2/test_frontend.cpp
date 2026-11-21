@@ -265,6 +265,27 @@ int main() {
             (void)decoder.finish();
             check(decoder.tool_calls().empty() && decoder.content() == call, "tool_choice none keeps a call as text");
         }
+        // A stop string inside a call kept as text still ends the request: tool_choice none, malformed, unfinished.
+        {
+            const std::vector<ninfer::StopString> stops{{.text = "weather"}};
+            const std::string call = R"({"name":"get_weather","args":{}})";
+            const std::string bad  = R"({"name":"get_weather","args":[]})";
+            const auto opened      = cat({{ink::token::kMessageModel, ink::token::kInvokeToolJson}, words(call)});
+            ink::OutputDecoder none(frontend, stops, false);
+            bool stopped = false;
+            for (const TokenId id : cat({opened, {ink::token::kEndMessage}})) { stopped = none.push(id).stop || stopped; }
+            check(stopped && none.content() == R"({"name":"get_)", "a stop string in a tool_choice none call");
+            ink::OutputDecoder malformed(frontend, stops, true);
+            stopped = false;
+            for (const TokenId id : cat({{ink::token::kMessageModel, ink::token::kInvokeToolJson}, words(bad), {ink::token::kEndMessage}})) {
+                stopped = malformed.push(id).stop || stopped;
+            }
+            check(stopped && malformed.content() == R"({"name":"get_)", "a stop string in a malformed call");
+            ink::OutputDecoder open(frontend, stops, true);
+            for (const TokenId id : opened) { (void)open.push(id); }
+            (void)open.finish();
+            check(open.matched_stop() && open.content() == R"({"name":"get_)", "a stop string in an unfinished call");
+        }
         try {
             (void)frontend.prepare_tokens({});
             check(false, "an empty token prompt is refused");

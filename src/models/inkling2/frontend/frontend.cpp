@@ -321,11 +321,11 @@ OutputDecoder::OutputDecoder(const Frontend& frontend, std::vector<StopString> s
     std::erase_if(stops_, [](const StopString& s) { return s.text.empty(); });
 }
 
-void OutputDecoder::close_tool_call() {
+void OutputDecoder::close_tool_call(Step& step) {
     parse_.marker_seen = true;
     if (!tools_) {
         // tool_choice none: a call the request does not allow stays text.
-        text_[0] += take_utf8(tool_json_, true);
+        append(0, tool_json_, step, true);
         tool_json_.clear();
         return;
     }
@@ -337,7 +337,7 @@ void OutputDecoder::close_tool_call() {
     } else {
         // Malformed: kept as text, as a free parser does.
         parse_.fallback_reason = ToolCallParseFallbackReason::MalformedStructure;
-        text_[0] += take_utf8(tool_json_, true);
+        append(0, tool_json_, step, true);
     }
     tool_json_.clear();
 }
@@ -357,7 +357,7 @@ OutputDecoder::Step OutputDecoder::push(TokenId id) {
     case token::kInvokeToolText: channel_ = Channel::Content; break;
     case token::kInvokeToolJson: channel_ = Channel::ToolJson; break;
     case token::kEndMessage:
-        if (channel_ == Channel::ToolJson) { close_tool_call(); }
+        if (channel_ == Channel::ToolJson) { close_tool_call(step); }
         channel_ = Channel::None;
         break;
     default:
@@ -379,11 +379,11 @@ OutputDecoder::Step OutputDecoder::push(TokenId id) {
     return step;
 }
 
-void OutputDecoder::append(std::size_t channel, std::string_view bytes, Step& step) {
+void OutputDecoder::append(std::size_t channel, std::string_view bytes, Step& step, bool final) {
     std::string& text      = text_[channel];
     const std::size_t from = text.size();
     raw_[channel] += bytes;
-    text += take_utf8(raw_[channel], false);
+    text += take_utf8(raw_[channel], final);
     const OutputChannel which = channel == 0 ? OutputChannel::Content : OutputChannel::Reasoning;
     for (const StopString& stop : stops_) {
         if (stop.channel != which) { continue; }
@@ -422,19 +422,20 @@ void OutputDecoder::publish(std::size_t channel, bool all, std::vector<OutputDel
 }
 
 std::vector<OutputDelta> OutputDecoder::finish() {
-    if (channel_ == Channel::ToolJson) {
+    Step step;
+    if (channel_ == Channel::ToolJson && !matched_) {
         // A call the turn did not close is not a call.
         parse_.marker_seen     = true;
         parse_.fallback_reason = ToolCallParseFallbackReason::MalformedStructure;
-        text_[0] += take_utf8(tool_json_, true);
-        tool_json_.clear();
+        append(0, tool_json_, step, true);
     }
-    for (std::size_t c = 0; c < 2; ++c) { text_[c] += take_utf8(raw_[c], true); }
+    tool_json_.clear();
     channel_ = Channel::None;
-    std::vector<OutputDelta> out;
-    publish(1, true, out);
-    publish(0, true, out);
-    return out;
+    if (step.stop) { return std::move(step.deltas); }
+    for (std::size_t c = 0; c < 2; ++c) { text_[c] += take_utf8(raw_[c], true); }
+    publish(1, true, step.deltas);
+    publish(0, true, step.deltas);
+    return std::move(step.deltas);
 }
 
 } // namespace ninfer::models::inkling2
