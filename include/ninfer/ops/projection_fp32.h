@@ -16,6 +16,9 @@
 
 namespace ninfer::ops {
 
+/// The most weights (row segments) one projection call takes: a visit's projections of one input in one launch.
+inline constexpr int kProjectionMaxWeights = 8;
+
 /**
  * Op: projection_fp32 (BF16 activations by BF16 weight rows, FP32 outputs)
  *
@@ -34,7 +37,7 @@ namespace ninfer::ops {
  *   K a multiple of 8 and at most 8192 (K up to 5120, DeepSeek-V4's hidden size among them, takes
  *   the narrow mapping at one to eight columns; wider calls and K above 5120 take the wide
  *   mapping; both give the same bits; the BF16 split form below keeps the limit of 3072); one to
- *   four weights; every operand contiguous and 16-byte aligned.
+ *   kProjectionMaxWeights weights; every operand contiguous and 16-byte aligned.
  *
  * Numeric:
  *   Each output is one FP32 dot product whose summation order depends only on K, so a column's
@@ -54,6 +57,13 @@ void projection_bf16_split(const Tensor& x, std::span<const Tensor* const> weigh
 
 void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Tensor& out,
                      cudaStream_t stream);
+
+/// projection_fp32 with an input per weight: out's rows of weight i are weight i by inputs[i], each the same bits as
+/// projection_fp32(inputs[i], weight i). One launch for a layer's projections of different inputs. Every input has
+/// the same K and T, with T from 1 to 8 (projection_bf16_split_supported) and K at most 3072; with more than one
+/// distinct input every weight's N is a multiple of 4 (a CTA's rows come from one input).
+void projection_fp32_inputs(std::span<const Tensor* const> inputs, std::span<const Tensor* const> weights, Tensor& out,
+                            cudaStream_t stream);
 
 /**
  * Op: projection_fp32, GGML block-format weight (an LM head stored as GGUF IQ4_XS, Q6_K or Q5_K)
@@ -112,7 +122,7 @@ void quantize_q8_g32(const Tensor& w, std::int8_t* values, void* scales, cudaStr
  *
  *   out[n, t] = sum_k w[n, k] * FP32(x[k, t]) for the rows n of `weights` concatenated in order.
  *
- * x BF16 [K, T] contiguous, 16-byte aligned; one to four weights of that K; out FP32 [sum N, T] contiguous. K a
+ * x BF16 [K, T] contiguous, 16-byte aligned; one to kProjectionMaxWeights weights of that K; out FP32 [sum N, T] contiguous. K a
  * multiple of 32 and at most 3072; T >= 1. Per 16 values of a row the products q x (exact) are summed in FP32 and
  * the partial is scaled by d into the FP32 sum, in an order that depends only on K, so a column's results are bitwise
  * the same at every T and column position. Oracle: the FP64 dot product of the decoded weights and x, within

@@ -23,7 +23,7 @@ constexpr int kThreads       = 256;
 constexpr int kRowsPerWarp   = 4;
 constexpr int kRowsPerCta    = kThreads / 32 * kRowsPerWarp;
 constexpr int kColumns       = 8; // columns staged per CTA
-constexpr int kMaxSegments   = 4;
+constexpr int kMaxSegments   = kProjectionMaxWeights;
 constexpr int kMaxK          = 3072; // the narrow kernels' (register arrays and staging are sized by it)
 // The longest K projection_fp32 serves: beyond kMaxK only the wide mapping (it walks K in slices and has no
 // K-sized state), which gives the same bits as the narrow ones.
@@ -34,6 +34,7 @@ constexpr int kMaxMidK       = 5120;
 
 struct Segments {
     const bf16* data[kMaxSegments];
+    const bf16* x[kMaxSegments]; // projection_fp32_inputs: segment s's input (null: the kernel's x)
     int begin[kMaxSegments + 1]; // first output row of each segment, then the total
     int count;
     int rows; // the total again, at a fixed offset (see total_rows)
@@ -128,7 +129,14 @@ __global__ void __launch_bounds__(Threads)
     uint4 loaded[kMaxLaneChunks];
     if (first_row < rows) { load_row<kMaxLaneChunks>(segments, first_row, k, chunks, lane, loaded); }
     // The CTA's columns of x are contiguous, so chunk i of the staging is chunk i of x from there.
-    const auto* xs = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(first_column) * k);
+    // projection_fp32_inputs: the CTA's rows are of one segment (the host checks), whose input it stages.
+    const bf16* input = x;
+#pragma unroll
+    for (int s = 0; s < kMaxSegments; ++s) {
+        const int cta_row = blockIdx.x * (Warps * RowsPerWarp);
+        if (s < segments.count && segments.x[s] != nullptr && cta_row >= segments.begin[s]) { input = segments.x[s]; }
+    }
+    const auto* xs = reinterpret_cast<const uint4*>(input + static_cast<std::size_t>(first_column) * k);
 #pragma unroll
     for (int u = 0; u < kStagePerThread; ++u) {
         const int i = static_cast<int>(threadIdx.x) + u * Threads;
@@ -296,7 +304,7 @@ Segments bind_segments(const Tensor& x, std::span<const Tensor* const> weights, 
     const int k = x.ne[0], columns = x.ne[1];
     require(k > 0 && k % 8 == 0 && k <= max_k && columns > 0,
             max_k == kMaxK ? "K must be a multiple of 8 up to 3072" : "K must be a multiple of 8 up to 8192");
-    require(!weights.empty() && weights.size() <= kMaxSegments, "between one and four weights");
+    require(!weights.empty() && weights.size() <= kMaxSegments, "1 to kProjectionMaxWeights (6) weights");
     require(aligned16(x.data), "x must be 16-byte aligned");
     Segments segments{};
     segments.count = static_cast<int>(weights.size());
@@ -345,6 +353,39 @@ void projection_bf16_split(const Tensor& x, std::span<const Tensor* const> weigh
     if (error != cudaSuccess) {
         throw std::runtime_error(std::string("projection_bf16_split: ") + cudaGetErrorString(error));
     }
+}
+
+void projection_fp32_inputs(std::span<const Tensor* const> inputs, std::span<const Tensor* const> weights, Tensor& out,
+                            cudaStream_t stream) {
+    require(!inputs.empty() && inputs.size() == weights.size(), "one input per weight");
+    require(out.data != nullptr && out.dtype == DType::FP32 && out.is_contiguous(), "out must be contiguous FP32");
+    int rows                = 0;
+    Segments segments       = bind_segments(*inputs[0], weights, rows, kMaxK);
+    const int k = inputs[0]->ne[0], columns = inputs[0]->ne[1];
+    require(columns <= kColumns, "projection_fp32_inputs serves 1 to 8 columns");
+    require(out.ne[0] == rows && out.ne[1] == columns && out.ne[2] == 1 && out.ne[3] == 1, "out must be FP32 [sum N, T]");
+    constexpr int threads = 128, rows_per_warp = 1, rows_per_cta = threads / 32 * rows_per_warp;
+    bool distinct = false;
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        const Tensor& x = *inputs[i];
+        require(x.data != nullptr && x.dtype == DType::BF16 && x.is_contiguous() && x.ne[0] == k && x.ne[1] == columns && x.ne[2] == 1 &&
+                    x.ne[3] == 1 && aligned16(x.data),
+                "every input must be contiguous, 16-byte aligned BF16 [K, T] of one K and T");
+        distinct = distinct || x.data != inputs[0]->data;
+        segments.x[i] = static_cast<const bf16*>(x.data);
+    }
+    if (distinct) {
+        for (const Tensor* w : weights) { require(w->ne[1] % rows_per_cta == 0, "with distinct inputs every N must be a multiple of 4"); }
+    }
+    const std::size_t staged = static_cast<std::size_t>(columns) * k * sizeof(bf16);
+    auto* kernel = columns == 1   ? projection_kernel<threads, rows_per_warp, 1>
+                   : columns <= 2 ? projection_kernel<threads, rows_per_warp, 2>
+                   : columns <= 4 ? projection_kernel<threads, rows_per_warp, 4>
+                                  : projection_kernel<threads, rows_per_warp>;
+    kernel<<<dim3((rows + rows_per_cta - 1) / rows_per_cta, 1), threads, staged, stream>>>(
+        static_cast<const bf16*>(inputs[0]->data), k, columns, segments, Fp32Out{static_cast<float*>(out.data)});
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) { throw std::runtime_error(std::string("projection_fp32_inputs: ") + cudaGetErrorString(error)); }
 }
 
 void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Tensor& out,
