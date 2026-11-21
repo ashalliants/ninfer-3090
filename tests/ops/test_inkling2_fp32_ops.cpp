@@ -26,6 +26,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <iterator>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -560,6 +561,103 @@ void test_head_norm_append() {
     std::printf("head_norms_fp32 with a KvAppend: the plain call's bits, in the wrapped ring slots too\n");
 }
 
+// projection_fp32_inputs: each weight's rows by its own input, the bits of projection_fp32 on that input alone.
+void test_projection_inputs() {
+    const int k = 2304, ns[] = {64, 8, 32, 12};
+    for (const int cols : {1, 3, 8}) {
+        std::vector<ninfer::DeviceBuffer> xb, wb;
+        std::vector<Tensor> xs, ws;
+        for (int i = 0; i < 3; ++i) { xb.push_back(t::to_device_bf16(randoms(k * cols))); }
+        for (int n : ns) { wb.push_back(t::to_device_bf16(randoms(k * n, -0.05F, 0.05F))); }
+        for (int i = 0; i < 3; ++i) { xs.emplace_back(xb[i].p, DType::BF16, std::initializer_list<std::int32_t>{k, cols}); }
+        for (int i = 0; i < 4; ++i) { ws.emplace_back(wb[i].p, DType::BF16, std::initializer_list<std::int32_t>{k, ns[i]}); }
+        const Tensor* inputs[] = {&xs[0], &xs[1], &xs[1], &xs[2]};
+        const Tensor* weights[] = {&ws[0], &ws[1], &ws[2], &ws[3]};
+        const int total = 64 + 8 + 32 + 12;
+        Buf joint(static_cast<std::size_t>(total) * cols);
+        Tensor tj = joint.tensor({total, cols});
+        ninfer::ops::projection_fp32_inputs(inputs, weights, tj, nullptr);
+        const auto got = joint.get(static_cast<std::size_t>(total) * cols);
+        bool same = true;
+        int row = 0;
+        for (int i = 0; i < 4; ++i) {
+            Buf one(static_cast<std::size_t>(ns[i]) * cols);
+            Tensor to = one.tensor({ns[i], cols});
+            const Tensor* w1[] = {weights[i]};
+            ninfer::ops::projection_fp32(*inputs[i], w1, to, nullptr);
+            const auto want = one.get(static_cast<std::size_t>(ns[i]) * cols);
+            for (int c = 0; c < cols; ++c) {
+                same &= std::memcmp(got.data() + static_cast<std::size_t>(c) * total + row, want.data() + static_cast<std::size_t>(c) * ns[i],
+                                    ns[i] * 4) == 0;
+            }
+            row += ns[i];
+        }
+        check(same, "projection_fp32_inputs differs from projection_fp32 per input");
+    }
+    std::printf("projection_fp32_inputs: each weight's rows the bits of its own projection_fp32 (T 1, 3, 8)\n");
+
+    // The FP64 oracle, independent of the projection kernels: kProjectionMaxWeights segments (every N a multiple of
+    // 4, so each CTA's four rows come from one input) over five distinct inputs, each output the FP64 dot product of
+    // its BF16 weight row and BF16 input column within the FP32 bound sum_k |w x| * K * 2^-24.
+    const int ks[]   = {2304, 3072};
+    const int segs[] = {64, 8, 32, 12, 4, 16, 8, 20};
+    static_assert(std::size(segs) == ninfer::ops::kProjectionMaxWeights);
+    const int which[] = {0, 1, 1, 2, 3, 0, 4, 2}; // the input of each segment
+    const auto bf16 = [](std::vector<float> v) {
+        for (float& x : v) { x = t::bf16_to_f32(t::f32_to_bf16(x)); }
+        return v;
+    };
+    for (const int kk : ks) {
+        for (const int cols : {1, 5, 8}) {
+            std::vector<std::vector<float>> xh, wh;
+            std::vector<ninfer::DeviceBuffer> xb, wb;
+            std::vector<Tensor> xs, ws;
+            for (int i = 0; i < 5; ++i) {
+                xh.push_back(bf16(randoms(static_cast<std::size_t>(kk) * cols)));
+                xb.push_back(t::to_device_bf16(xh.back()));
+                xs.emplace_back(xb.back().p, DType::BF16, std::initializer_list<std::int32_t>{kk, cols});
+            }
+            int total = 0;
+            for (const int n : segs) {
+                wh.push_back(bf16(randoms(static_cast<std::size_t>(kk) * n, -0.05F, 0.05F)));
+                wb.push_back(t::to_device_bf16(wh.back()));
+                ws.emplace_back(wb.back().p, DType::BF16, std::initializer_list<std::int32_t>{kk, n});
+                total += n;
+            }
+            std::vector<const Tensor*> inputs, weights;
+            for (std::size_t i = 0; i < std::size(segs); ++i) {
+                inputs.push_back(&xs[static_cast<std::size_t>(which[i])]);
+                weights.push_back(&ws[i]);
+            }
+            Buf out(static_cast<std::size_t>(total) * cols);
+            Tensor to = out.tensor({total, cols});
+            ninfer::ops::projection_fp32_inputs(inputs, weights, to, nullptr);
+            const auto got = out.get(static_cast<std::size_t>(total) * cols);
+            int worst_row = -1;
+            int row = 0;
+            for (std::size_t i = 0; i < std::size(segs); ++i) {
+                const auto& x = xh[static_cast<std::size_t>(which[i])];
+                for (int n = 0; n < segs[i]; ++n, ++row) {
+                    for (int c = 0; c < cols; ++c) {
+                        double dot = 0.0, magnitude = 0.0;
+                        for (int k = 0; k < kk; ++k) {
+                            const double product = double(wh[i][static_cast<std::size_t>(n) * kk + k]) * double(x[static_cast<std::size_t>(c) * kk + k]);
+                            dot += product;
+                            magnitude += std::abs(product);
+                        }
+                        const double bound = magnitude * kk * std::ldexp(1.0, -24);
+                        if (std::abs(double(got[static_cast<std::size_t>(c) * total + row]) - dot) > bound) { worst_row = row; }
+                    }
+                }
+            }
+            check(worst_row < 0, "projection_fp32_inputs departs from the FP64 oracle at K " + std::to_string(kk) + ", T " +
+                                     std::to_string(cols) + " (row " + std::to_string(worst_row) + ")");
+        }
+    }
+    std::printf("projection_fp32_inputs: %zu segments over 5 inputs within the FP64 oracle's bound (K 2304, 3072; T 1, 5, 8)\n",
+                std::size(segs));
+}
+
 void test_route() {
     const int h = 2304, e = 128, k = 8, cols = 4;
     auto z = randoms(h * cols), router = randoms(e * h, -0.05F, 0.05F), bias = randoms(e, -0.01F, 0.01F);
@@ -1034,6 +1132,7 @@ int main() {
         // Every key of a tile scored: one query sees 40 keys (16-key steps, a partial last one), all compared.
         test_attention(0, 64, 40, 40, "attention global, 40 keys in one call");
         test_head_norm_append();
+        test_projection_inputs();
         test_route();
         test_experts(true, 128, 64, 3, "moe_situ_experts NVFP4 small");
         test_experts(true, 2304, 1152, 3, "moe_situ_experts NVFP4 [3, 2304, 1152]");

@@ -250,10 +250,26 @@ void TextProgram::keep(std::int32_t n) {
     last_cols_ = n;
 }
 
+Tensor TextProgram::project_inputs(std::span<const Tensor* const> inputs, std::span<const WeightId> weights,
+                                  std::span<const std::int32_t> rows) {
+    const std::int32_t k = inputs[0]->ne[0], cols = inputs[0]->ne[1];
+    std::array<Tensor, ops::kProjectionMaxWeights> views;
+    std::array<const Tensor*, ops::kProjectionMaxWeights> pointers{};
+    std::int32_t total = 0;
+    for (std::size_t i = 0; i < weights.size(); ++i) {
+        views[i]    = model_.tensor(weights[i], {k, rows[i]});
+        pointers[i] = &views[i];
+        total += rows[i];
+    }
+    Tensor out = workspace_.alloc(DType::FP32, {total, cols});
+    ops::projection_fp32_inputs(inputs, std::span<const Tensor* const>(pointers.data(), weights.size()), out, stream_);
+    return out;
+}
+
 Tensor TextProgram::project(const Tensor& x, std::span<const WeightId> weights, std::span<const std::int32_t> rows) {
     const std::int32_t k = x.ne[0], cols = x.ne[1];
-    std::array<Tensor, 4> views;
-    std::array<const Tensor*, 4> pointers{};
+    std::array<Tensor, ops::kProjectionMaxWeights> views;
+    std::array<const Tensor*, ops::kProjectionMaxWeights> pointers{};
     std::int32_t total = 0;
     for (std::size_t i = 0; i < weights.size(); ++i) {
         views[i]    = model_.tensor(weights[i], {k, rows[i]});
@@ -263,7 +279,7 @@ Tensor TextProgram::project(const Tensor& x, std::span<const WeightId> weights, 
     Tensor out = workspace_.alloc(DType::FP32, {total, cols});
     // A call runs over the re-encoding when every one of its weights has one (all or none, as the forms are made).
     if (limits_.dense != nullptr && limits_.dense->find(views[0].data) != nullptr) {
-        std::array<ops::Q8Weight, 4> q8;
+        std::array<ops::Q8Weight, ops::kProjectionMaxWeights> q8;
         for (std::size_t i = 0; i < weights.size(); ++i) {
             const ops::Q8Weight* found = limits_.dense->find(views[i].data);
             if (found == nullptr) { throw std::logic_error("inkling2: a projection call mixes re-encoded and BF16 weights"); }
@@ -352,20 +368,32 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     }
 
     // 3e: projections and short convolutions.
-    const WeightId q_weights[] = {w.q, w.rel, w.gate, w.sink};
-    const std::int32_t q_rows[] = {q, rel, q, heads};
-    Tensor pq = project(nq, q_weights, q_rows);
-    Tensor q_t = pq.slice(0, 0, q), r_t = pq.slice(0, q, rel), gate = pq.slice(0, q + rel, q), sink = pq.slice(0, 2 * q + rel, heads);
+    // One input for q, k and v: k and v ride in the q call (one launch, one longer read; a row's bits depend only on K).
+    const WeightId q_weights[] = {w.q, w.rel, w.gate, w.sink, w.k, w.v};
+    const std::int32_t q_rows[] = {q, rel, q, heads, kv, kv};
     const std::int32_t dyn_rows = i32(c.kv_heads) * k;
+    // Separate k and v inputs at decode widths: every projection of the visit in one launch too (each row by its own
+    // input, the same bits), unless the weights run over the 8-bit re-encoding.
+    const bool reencoded = limits_.dense != nullptr && limits_.dense->find(model_.tensor(w.q, {h, q}).data) != nullptr;
+    const bool joint     = !one_input && cols <= 8 && !reencoded;
+    Tensor pq;
+    if (joint) {
+        const WeightId all[] = {w.q, w.rel, w.gate, w.sink, w.k, local ? w.v : w.k_conv_proj, w.v, w.v_conv_proj};
+        const std::int32_t all_rows[] = {q, rel, q, heads, kv, local ? kv : dyn_rows, kv, dyn_rows};
+        const Tensor* inputs[] = {&nq, &nq, &nq, &nq, &nk, local ? &nv : &nk, &nv, &nv};
+        pq = project_inputs(std::span<const Tensor* const>(inputs, local ? 6 : 8), std::span<const WeightId>(all, local ? 6 : 8),
+                            std::span<const std::int32_t>(all_rows, local ? 6 : 8));
+    } else {
+        pq = project(nq, std::span<const WeightId>(q_weights, one_input ? 6 : 4), std::span<const std::int32_t>(q_rows, one_input ? 6 : 4));
+    }
+    Tensor q_t = pq.slice(0, 0, q), r_t = pq.slice(0, q, rel), gate = pq.slice(0, q + rel, q), sink = pq.slice(0, 2 * q + rel, heads);
+    const std::int32_t tail = 2 * q + rel + heads; // the first row after the q group
     Tensor kconv = workspace_.alloc(DType::FP32, {kv, cols}), vconv = workspace_.alloc(DType::FP32, {kv, cols});
     if (local) {
         Tensor pk, pv;
-        if (one_input) {
-            const WeightId kvw[] = {w.k, w.v};
-            const std::int32_t kvr[] = {kv, kv};
-            const Tensor both = project(nk, kvw, kvr);
-            pk = both.slice(0, 0, kv);
-            pv = both.slice(0, kv, kv);
+        if (one_input || joint) {
+            pk = pq.slice(0, tail, kv);
+            pv = pq.slice(0, tail + kv, kv);
         } else {
             const WeightId kw[] = {w.k}, vw[] = {w.v};
             const std::int32_t kr[] = {kv};
@@ -380,9 +408,16 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         save_input(st.v_saved, pv);
         ops::short_conv_fp32_batch(jobs, d, stream_);
     } else {
-        const WeightId kw[] = {w.k, w.k_conv_proj}, vw[] = {w.v, w.v_conv_proj};
-        const std::int32_t kr[] = {kv, dyn_rows};
-        Tensor pk = project(nk, kw, kr), pv = project(nv, vw, kr);
+        Tensor pk, pv;
+        if (joint) {
+            pk = pq.slice(0, tail, kv + dyn_rows);
+            pv = pq.slice(0, tail + kv + dyn_rows, kv + dyn_rows);
+        } else {
+            const WeightId kw[] = {w.k, w.k_conv_proj}, vw[] = {w.v, w.v_conv_proj};
+            const std::int32_t kr[] = {kv, dyn_rows};
+            pk = project(nk, kw, kr);
+            pv = project(nv, vw, kr);
+        }
         const Tensor kd = pk.slice(0, kv, dyn_rows), vd = pv.slice(0, kv, dyn_rows);
         const Tensor kx = pk.slice(0, 0, kv), vx = pv.slice(0, 0, kv);
         const Tensor kt = model_.tensor(w.k_conv, {k, kv}), vt = model_.tensor(w.v_conv, {k, kv});
