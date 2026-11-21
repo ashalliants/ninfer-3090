@@ -392,6 +392,20 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     }
     // The adapters are read (and any unsupported one refused) before the weights load; uploaded after it.
     if (options_.loras.size() > 8) { throw std::invalid_argument("Inkling-2 loads at most eight LoRA adapters"); }
+    // A request selects an adapter by name, so each one needs a name of its own: an empty or repeated one would be
+    // uploaded yet never selectable. Checked here too, since EngineOptions reaches this without the CLI parser.
+    const auto check_names = [](const auto& sources, const char* what) {
+        for (std::size_t i = 0; i < sources.size(); ++i) {
+            if (sources[i].name.empty()) { throw std::invalid_argument(std::string("a ") + what + " needs a name"); }
+            for (std::size_t j = 0; j < i; ++j) {
+                if (sources[j].name == sources[i].name) {
+                    throw std::invalid_argument(std::string("two ") + what + "s are named '" + sources[i].name + "'");
+                }
+            }
+        }
+    };
+    check_names(options_.loras, "LoRA adapter");
+    check_names(options_.grafts, "graft");
     std::vector<ink::LoraAdapter> loras;
     std::vector<ink::VisitAblation> grafts;
     {

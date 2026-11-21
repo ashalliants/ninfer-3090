@@ -164,6 +164,24 @@ int main() {
                   "a CausalScoring Engine refuses DSpark's options instead of clearing them");
         }
         {
+            // Adapters are selected by name: an empty or repeated name is refused by name, before anything loads (with
+            // NINFER_INKLING2_LORA / NINFER_INKLING2_ABLATION, real adapter files that would otherwise load).
+            const auto refuses_by_name = [&](const ninfer::EngineOptions& o) {
+                try {
+                    ninfer::Engine refused(o);
+                } catch (const std::invalid_argument& error) { return std::string(error.what()).find("name") != std::string::npos; }
+                return false;
+            };
+            const char* lora_path = std::getenv("NINFER_INKLING2_LORA");
+            const char* graft_path = std::getenv("NINFER_INKLING2_ABLATION");
+            ninfer::EngineOptions unnamed = options, twice = options;
+            unnamed.loras.push_back({"", lora_path != nullptr ? lora_path : "missing-adapter"});
+            twice.grafts.push_back({"g", graft_path != nullptr ? graft_path : "missing-a.safetensors"});
+            twice.grafts.push_back({"g", graft_path != nullptr ? graft_path : "missing-b.safetensors"});
+            check(refuses_by_name(unnamed), "a LoRA adapter without a name is refused");
+            check(refuses_by_name(twice), "two grafts of one name are refused");
+        }
+        {
             // An explicit --kv-dtype bf16 (or any kv_cache form) is refused: Inkling-2's rings are FP16 or FP32.
             ninfer::EngineOptions bf16 = options;
             bf16.kv_cache_explicit     = true;

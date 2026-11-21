@@ -47,8 +47,6 @@
 #include <string>
 #include <vector>
 
-#include <unistd.h>
-
 namespace {
 
 namespace ink = ninfer::models::inkling2;
@@ -179,7 +177,7 @@ int main() {
               "the OpenUncensored LoRA: r 2, alpha 2, wo_ud of layers 4..23");
         check(ablation.visits == config.num_layer_visits, "the ablation has one direction pair per visit");
         {
-            const fs::path tmp = fs::temp_directory_path() / ("ninfer-inkling2-adapters-" + std::to_string(::getpid()));
+            const fs::path tmp = fs::temp_directory_path() / ("ninfer-inkling2-adapters-" + std::to_string(std::random_device{}()));
             fs::create_directories(tmp);
             write(tmp / "cv.gguf", std::string("GGUF\3\0\0\0", 8) + std::string(64, '\0'));
             check(refused([&] { (void)ink::load_visit_ablation({"cv", tmp / "cv.gguf"}, config); }, "GGUF"), "a GGUF graft is refused");
