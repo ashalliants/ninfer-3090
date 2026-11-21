@@ -435,6 +435,10 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
     Buf dq(q), dr(r), ds(sink), dk(k), dv(v), dt(table), kc(static_cast<std::size_t>(kvw * capacity)),
         vc(static_cast<std::size_t>(kvw * capacity)), out(static_cast<std::size_t>(qw * n));
     Tensor tkc = kc.tensor({kvw, capacity}), tvc = vc.tensor({kvw, capacity});
+    // The same calls with a sigmoid gate into BF16 (own caches): the bits of sigmoid_gate_fp32 of the ungated out.
+    Buf dg(randoms(qw * n, -3, 3)), kc2(static_cast<std::size_t>(kvw * capacity)), vc2(static_cast<std::size_t>(kvw * capacity));
+    Tensor tkc2 = kc2.tensor({kvw, capacity}), tvc2 = vc2.tensor({kvw, capacity});
+    ninfer::DeviceBuffer gated(static_cast<std::size_t>(qw) * n * 2), want_gated(static_cast<std::size_t>(qw) * n * 2);
     ninfer::DeviceBuffer doff(sizeof(std::int64_t));
     for (int s = 0; s < n; s += chunk) {
         const int len = std::min(chunk, n - s);
@@ -447,7 +451,39 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
                                                   dr.tensor({heads * rel, n}).slice(1, s, len), ds.tensor({heads, n}).slice(1, s, len),
                                                   dk.tensor({kvw, n}).slice(1, s, len), dv.tensor({kvw, n}).slice(1, s, len),
                                                   dt.tensor({rel, extent}), tkc, tvc, device_start ? 0 : s,
-                                                  device_start ? static_cast<const std::int64_t*>(doff.p) : nullptr, to, nullptr);
+                                                  device_start ? static_cast<const std::int64_t*>(doff.p) : nullptr, nullptr, to,
+                                                  nullptr);
+        Tensor tg = Tensor(gated.p, DType::BF16, {qw, n}).slice(1, s, len);
+        const Tensor gate = dg.tensor({qw, n}).slice(1, s, len);
+        ninfer::ops::relative_bias_sink_attention({heads, kvh, d, rel, window}, dq.tensor({qw, n}).slice(1, s, len),
+                                                  dr.tensor({heads * rel, n}).slice(1, s, len), ds.tensor({heads, n}).slice(1, s, len),
+                                                  dk.tensor({kvw, n}).slice(1, s, len), dv.tensor({kvw, n}).slice(1, s, len),
+                                                  dt.tensor({rel, extent}), tkc2, tvc2, device_start ? 0 : s,
+                                                  device_start ? static_cast<const std::int64_t*>(doff.p) : nullptr, &gate, tg,
+                                                  nullptr);
+    }
+    {
+        // A gated BF16 out without storage is refused before the launch (the caches are not appended to).
+        const int len  = std::min(chunk, n);
+        const Tensor gate = dg.tensor({qw, n}).slice(1, 0, len);
+        Tensor no_out(nullptr, DType::BF16, {qw, len});
+        bool refused = false;
+        try {
+            ninfer::ops::relative_bias_sink_attention({heads, kvh, d, rel, window}, dq.tensor({qw, n}).slice(1, 0, len),
+                                                      dr.tensor({heads * rel, n}).slice(1, 0, len), ds.tensor({heads, n}).slice(1, 0, len),
+                                                      dk.tensor({kvw, n}).slice(1, 0, len), dv.tensor({kvw, n}).slice(1, 0, len),
+                                                      dt.tensor({rel, extent}), tkc2, tvc2, 0, nullptr, &gate, no_out, nullptr);
+        } catch (const std::invalid_argument&) { refused = true; }
+        check(refused, "relative_bias_sink_attention takes a BF16 out without storage");
+    }
+    {
+        Tensor tw(want_gated.p, DType::BF16, {qw, n});
+        ninfer::ops::sigmoid_gate_fp32(out.tensor({qw, n}), dg.tensor({qw, n}), tw, nullptr);
+        std::vector<std::uint16_t> a(static_cast<std::size_t>(qw) * n), b(a.size());
+        check(cudaMemcpy(a.data(), gated.p, a.size() * 2, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                  cudaMemcpy(b.data(), want_gated.p, b.size() * 2, cudaMemcpyDeviceToHost) == cudaSuccess,
+              "gated download");
+        check(a == b, label + ": the gated BF16 out differs from sigmoid_gate_fp32 of the ungated one");
     }
     Vec want;
     for (int p = check_from; p < n; ++p) {
@@ -474,7 +510,7 @@ void test_route() {
     Buf dz(z), dr(router), db(bias), ids(static_cast<std::size_t>(k * cols)), w(static_cast<std::size_t>(k * cols));
     Tensor tid = ids.tensor({k, cols}, DType::I32), tw = w.tensor({k, cols});
     ninfer::DeviceArena arena(ninfer::ops::moe_route_sigmoid_topk_workspace_bytes(e, cols) + 4096);
-    ninfer::ops::moe_route_sigmoid_topk(dz.tensor({h, cols}), dr.tensor({h, e}), db.tensor({e}), k, 8.0F, arena, tid, tw, nullptr);
+    ninfer::ops::moe_route_sigmoid_topk(dz.tensor({h, cols}), nullptr, dr.tensor({h, e}), db.tensor({e}), k, 8.0F, arena, tid, tw, nullptr);
     const auto got_ids = t::from_device<std::int32_t>(ids.b, k * cols);
     Vec want_w;
     bool same = true;
@@ -487,6 +523,68 @@ void test_route() {
     std::printf("%-44s experts %s\n", "moe_route_sigmoid_topk", same ? "equal" : "DIFFER");
     compare("moe_route_sigmoid_topk weights", w.get(k * cols), want_w, 2e-6);
 
+    // The input norm in the routing launch: z the bits of rmsnorm_fp32, ids and weights those of routing it. D = 2240
+    // is not a multiple of 256 (the norm's thread split) and E = 8 makes each block write several passes of z.
+    for (const auto [rows, experts] : {std::pair{2304, 128}, std::pair{2240, 8}}) {
+        auto x = randoms(rows * cols, -2, 2), gain = randoms(rows, 0.5F, 1.5F), rt = randoms(experts * rows, -0.05F, 0.05F),
+             bs = randoms(experts, -0.01F, 0.01F);
+        const int kk = std::min(k, experts);
+        Buf dx(x), dgain(gain), drt(rt), dbs(bs), zn(static_cast<std::size_t>(rows) * cols), zr(static_cast<std::size_t>(rows) * cols),
+            ids2(static_cast<std::size_t>(kk * cols)), w2(static_cast<std::size_t>(kk * cols)), ids3(static_cast<std::size_t>(kk * cols)),
+            w3(static_cast<std::size_t>(kk * cols));
+        ninfer::DeviceArena arena2(ninfer::ops::moe_route_sigmoid_topk_workspace_bytes(experts, cols) + 4096);
+        Tensor tzn = zn.tensor({rows, cols}), tzr = zr.tensor({rows, cols}), tg = dgain.tensor({rows});
+        Tensor ti2 = ids2.tensor({kk, cols}, DType::I32), tw2 = w2.tensor({kk, cols}), ti3 = ids3.tensor({kk, cols}, DType::I32),
+               tw3 = w3.tensor({kk, cols});
+        const ninfer::ops::RouteInputNorm norm{&tg, 1e-6F, &tzn};
+        ninfer::ops::moe_route_sigmoid_topk(dx.tensor({rows, cols}), &norm, drt.tensor({rows, experts}), dbs.tensor({experts}), kk, 8.0F,
+                                            arena2, ti2, tw2, nullptr);
+        ninfer::ops::rmsnorm_fp32(dx.tensor({rows, cols}), &tg, 1e-6F, tzr, nullptr);
+        ninfer::ops::moe_route_sigmoid_topk(tzr, nullptr, drt.tensor({rows, experts}), dbs.tensor({experts}), kk, 8.0F, arena2, ti3, tw3,
+                                            nullptr);
+        const auto a = zn.get(rows * cols), b = zr.get(rows * cols), wa = w2.get(kk * cols), wb = w3.get(kk * cols);
+        const bool z_same = std::memcmp(a.data(), b.data(), a.size() * 4) == 0, w_same = std::memcmp(wa.data(), wb.data(), wa.size() * 4) == 0;
+        const bool ids_same = t::from_device<std::int32_t>(ids2.b, kk * cols) == t::from_device<std::int32_t>(ids3.b, kk * cols);
+        check(z_same && w_same && ids_same, "moe_route_sigmoid_topk with its input norm differs from rmsnorm_fp32 then routing");
+        // Refused before any launch: a norm weight without storage, and a normalized z that partly overlaps z.
+        const auto route_refuses = [&](const Tensor& in, const ninfer::ops::RouteInputNorm& bad) {
+            try {
+                ninfer::ops::moe_route_sigmoid_topk(in, &bad, drt.tensor({rows, experts}), dbs.tensor({experts}), kk, 8.0F, arena2, ti2,
+                                                    tw2, nullptr);
+            } catch (const std::invalid_argument&) { return true; }
+            return false;
+        };
+        const Tensor no_gain(nullptr, DType::FP32, {rows});
+        check(route_refuses(dx.tensor({rows, cols}), {&no_gain, 1e-6F, &tzn}), "moe_route_sigmoid_topk takes a null norm weight");
+        Tensor shifted = tzn;
+        shifted.data   = static_cast<float*>(zn.b.p) + 1; // one element into z: never read, the Op refuses first
+        check(route_refuses(tzn, {&tg, 1e-6F, &shifted}), "moe_route_sigmoid_topk takes a normalized z overlapping z");
+        if (experts >= cols) { // the router's first columns as the normalized z (never written: the Op refuses first)
+            Tensor on_router = drt.tensor({rows, experts}).slice(1, 0, cols);
+            check(route_refuses(dx.tensor({rows, cols}), {&tg, 1e-6F, &on_router}), "moe_route_sigmoid_topk takes a normalized z on the router");
+        }
+        {
+            // z and the normalized z interleaved in one allocation, column by column: their bounding spans overlap but
+            // no byte is shared, so the Op runs, and routes as with separate buffers.
+            Buf both(static_cast<std::size_t>(2 * rows) * cols);
+            check(cudaMemcpy2D(both.b.p, static_cast<std::size_t>(2 * rows) * 4, dx.b.p, static_cast<std::size_t>(rows) * 4,
+                               static_cast<std::size_t>(rows) * 4, cols, cudaMemcpyDeviceToDevice) == cudaSuccess,
+                  "interleave z");
+            const Tensor whole = both.tensor({2 * rows, cols});
+            Tensor zi = whole.slice(0, 0, rows), zo = whole.slice(0, rows, rows);
+            const ninfer::ops::RouteInputNorm interleaved{&tg, 1e-6F, &zo};
+            bool ran = true;
+            try {
+                ninfer::ops::moe_route_sigmoid_topk(zi, &interleaved, drt.tensor({rows, experts}), dbs.tensor({experts}), kk, 8.0F, arena2,
+                                                    ti2, tw2, nullptr);
+            } catch (const std::invalid_argument&) { ran = false; }
+            const bool same = ran && std::memcmp(w2.get(kk * cols).data(), w3.get(kk * cols).data(), static_cast<std::size_t>(kk) * cols * 4) == 0 &&
+                              t::from_device<std::int32_t>(ids2.b, kk * cols) == t::from_device<std::int32_t>(ids3.b, kk * cols);
+            check(same, "moe_route_sigmoid_topk refuses or misroutes a normalized z interleaved with z");
+        }
+        std::printf("moe_route_sigmoid_topk D %d E %d with the input norm: the bits of rmsnorm_fp32, then routing\n", rows, experts);
+    }
+
     // Exact ties (a zero router: every score 1/2) among 40 experts, bias steering two of them: the steered two
     // first, then the lowest ids.
     const int few = 40, picks = 5;
@@ -496,7 +594,7 @@ void test_route() {
     Buf dzero(zero), dsteer(steer), tie_ids(static_cast<std::size_t>(picks * cols)), tie_w(static_cast<std::size_t>(picks * cols));
     Tensor tti = tie_ids.tensor({picks, cols}, DType::I32), ttw = tie_w.tensor({picks, cols});
     ninfer::DeviceArena tie_arena(ninfer::ops::moe_route_sigmoid_topk_workspace_bytes(few, cols) + 4096);
-    ninfer::ops::moe_route_sigmoid_topk(dz.tensor({h, cols}), dzero.tensor({h, few}), dsteer.tensor({few}), picks, 8.0F,
+    ninfer::ops::moe_route_sigmoid_topk(dz.tensor({h, cols}), nullptr, dzero.tensor({h, few}), dsteer.tensor({few}), picks, 8.0F,
                                         tie_arena, tti, ttw, nullptr);
     const auto tied = t::from_device<std::int32_t>(tie_ids.b, picks * cols);
     bool order = true;
@@ -782,7 +880,7 @@ void test_many_columns() {
     Buf dr(router), dbias(bias), ids(static_cast<std::size_t>(k) * cols), w(static_cast<std::size_t>(k) * cols);
     Tensor tid = ids.tensor({k, cols}, DType::I32), tw = w.tensor({k, cols});
     ninfer::DeviceArena route_arena(ninfer::ops::moe_route_sigmoid_topk_workspace_bytes(e, cols) + 4096);
-    ninfer::ops::moe_route_sigmoid_topk(ta, dr.tensor({h, e}), dbias.tensor({e}), k, 8.0F, route_arena, tid, tw, nullptr);
+    ninfer::ops::moe_route_sigmoid_topk(ta, nullptr, dr.tensor({h, e}), dbias.tensor({e}), k, 8.0F, route_arena, tid, tw, nullptr);
     const auto got_ids = t::from_device<std::int32_t>(ids.b, static_cast<std::size_t>(k) * cols);
     const auto got_w = w.get(static_cast<std::size_t>(k) * cols);
     bool same_route = true;
