@@ -621,11 +621,16 @@ the longest ring. That is about 25 MB of workspace at 65,536 context.
 
 ## FP16 KV rings
 
-**Lossy.** `--kv-dtype fp16` (`EngineOptions::kv_fp16`, `ProgramLimits::kv_fp16`) is opt-in and off by default.
-The default keeps FP32 rings. With FP16 rings the head norms' append rounds each normalized K and V value to
-nearest FP16, and the attention widens the values back to FP32 as it reads them. Scores, softmax and sums stay FP32.
-A position costs 32 KiB across the 8 global visits instead of 64 KiB, so about twice the context fits. Inkling-2
-refuses every other `--kv-dtype` form.
+**Lossy, on by default.** The target's and the drafter's KV rings hold FP16 (`EngineOptions::kv_rings`,
+`ProgramLimits::kv_fp16`); `--kv-dtype fp32` keeps the exact FP32 program, for reproduction. With FP16 rings the
+head norms' append rounds each normalized K and V value to nearest FP16, and the attention widens the values back to
+FP32 as it reads them. Scores, softmax and sums stay FP32. A position costs 32 KiB across the 8 global visits
+instead of 64 KiB, so about twice the context fits. Inkling-2 refuses every other `--kv-dtype` form.
+
+The values suit FP16: the head norms bound them (K is clipped per head, V has unit norm). Over the 30,840-token
+prompt below (1.5e9 values each of K and V), max |K| is 21.7 and max |V| 11.3, none overflows, and 60,305 K and
+102,465 V values (under 0.01%) fall in FP16's subnormal range, 31 and 54 of them to zero. The mean relative
+rounding is 1.76e-4, against BF16's 1.41e-3 (also printed by `NINFER_INKLING2_KV_FP16_KLD`).
 
 It is not a speed option. Decode attention is latency-bound, not bandwidth-bound, so halving the bytes changes
 little.

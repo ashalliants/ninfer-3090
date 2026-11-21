@@ -90,7 +90,8 @@ void dspark_fuse_taps_fp32(std::span<const Tensor* const> taps, const Tensor& fu
  * kernel combines the runs' maxima, denominators and sums in run order, weighted by e^{m_z - max m}. One run (at
  * most 32 keys) writes out directly.
  *
- * q FP32 [D * heads, W]; k_ring, v_ring FP32 [D * kv_heads, capacity] (a - lo <= capacity); k_block, v_block FP32
+ * q FP32 [D * heads, W]; k_ring, v_ring FP32, or both FP16 (widened to FP32 as read), [D * kv_heads, capacity]
+ * (a - lo <= capacity); k_block, v_block FP32
  * [D * kv_heads, W]; out FP32 [D * heads, W]; all contiguous. D = 128. Oracle FP64.
  * Workspace: `workspace` FP32 contiguous device storage (non-null, refused otherwise) of
  * dspark_block_attention_workspace_bytes(shape, W) bytes or more.
@@ -103,6 +104,15 @@ inline constexpr int kDSparkAttentionMaxSplits = 64;
 void dspark_block_attention_fp32(const Tensor& q, const Tensor& k_ring, const Tensor& v_ring, const Tensor& k_block,
                                  const Tensor& v_block, std::int64_t anchor, const DSparkAttentionShape& shape, Tensor& out,
                                  const Tensor& workspace, cudaStream_t stream);
+
+/**
+ * Op: dspark_ring_write (context K or V into a ring)
+ *
+ *   ring[:, (position + t) mod capacity] = src[:, t] for t < n; an FP16 ring rounds to nearest even.
+ *
+ * src FP32 [D, n] contiguous; ring FP32 or FP16 [D, capacity] contiguous, n <= capacity.
+ */
+void dspark_ring_write(const Tensor& src, Tensor& ring, std::int64_t position, cudaStream_t stream);
 
 /**
  * Op: dspark_markov_update_fp32 (the Markov RNN's state transition)

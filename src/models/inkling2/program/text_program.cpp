@@ -35,7 +35,8 @@ void sync(cudaStream_t stream) {
 }
 
 // Every allocation one token costs in a forward call (persistent across visits and per visit), with slack.
-std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk, std::int32_t max_context, bool split_attention) {
+std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk, std::int32_t max_context, bool split_attention,
+                            std::int32_t logit_columns) {
     const std::size_t h = c.hidden_size, q = std::size_t(c.heads) * c.head_dim, kv = std::size_t(c.kv_heads) * c.head_dim;
     const std::size_t per_visit_kept = 6 * h * 4; // ffn_inp, the output and a core visit's four loop messages
     const std::size_t per_visit_temp = 12 * h * 4 + 3 * h * 2 + (2 * q + std::size_t(c.heads) * (c.d_rel + 1)) * 4 +
@@ -45,8 +46,9 @@ std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk, std::int32_
                                        ops::depth_attention_mix_workspace_bytes(i32(c.hidden_size), 1, ops::kDepthAttentionMaxSources) +
                                        ops::loop_controller_workspace_bytes(i32(c.hidden_size), i32(c.loop_gate_rank), 1,
                                                                             ops::kLoopControllerMaxJobs);
-    const std::size_t output = std::size_t(c.vocab_size) * 4 + 4 * h * 4;
+    const std::size_t output = 4 * h * 4;
     const std::size_t per_token = c.num_layer_visits * per_visit_kept + per_visit_temp + output;
+    const std::size_t logits = std::size_t(c.vocab_size) * 4 * static_cast<std::size_t>(logit_columns);
     // Each allocation pads to 256 bytes; a visit makes about 60.
     // The attention's split parts of a call of up to kSplitMaxColumns columns over the ring that shows the most keys
     // (a global one of max_context, or a local window).
@@ -54,7 +56,7 @@ std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk, std::int32_
     const std::int64_t keys = std::max<std::int64_t>(max_context, c.sliding_window);
     const std::size_t split =
         split_attention ? ops::relative_bias_attention_split_bytes(global, std::min(chunk, ops::kSplitMaxColumns), keys) : 0;
-    return per_token * static_cast<std::size_t>(chunk) + split + (c.num_layer_visits * 2 + 64) * kAlign * 4 + (64U << 20);
+    return per_token * static_cast<std::size_t>(chunk) + logits + split + (c.num_layer_visits * 2 + 64) * kAlign * 4 + (64U << 20);
 }
 
 // The limits, validated before anything is sized from them.
@@ -72,7 +74,8 @@ ProgramLimits checked(ProgramLimits limits) {
 
 TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t stream)
     : model_(model), config_(model.config()), limits_(limits), stream_(stream),
-      workspace_(workspace_bytes(model.config(), checked(limits).max_chunk, limits.max_context, limits.split_attention)) {
+      workspace_(workspace_bytes(model.config(), checked(limits).max_chunk, limits.max_context, limits.split_attention,
+                                 limits.last_logits ? std::max(1, limits.max_rollback) : limits.max_chunk)) {
     const TextConfig& c = config_;
     const std::size_t kv = std::size_t(c.kv_heads) * c.head_dim, taps = c.conv_kernel_size - 1;
     const std::size_t local_cap = c.sliding_window - 1 + static_cast<std::size_t>(limits.max_chunk);
@@ -722,8 +725,11 @@ Tensor TextProgram::run(const Tensor& ids, std::int64_t start, const Trace* trac
         sync(stream_);
         (*trace)("result_norm", x);
     }
-    Tensor xb = workspace_.alloc(DType::BF16, {h, cols});
-    ops::cast_fp32_to_bf16(x, xb, stream_);
+    // last_logits: a prefill chunk's logits are its last column's (projection_fp32's columns do not depend on the width).
+    const bool last_only = limits_.last_logits && cols > std::max(1, limits_.max_rollback);
+    const Tensor xs = last_only ? x.slice(1, cols - 1, 1) : x;
+    Tensor xb = workspace_.alloc(DType::BF16, {h, xs.ne[1]});
+    ops::cast_fp32_to_bf16(xs, xb, stream_);
     const WeightId head[] = {model_.weights().head};
     const std::int32_t head_rows[] = {i32(c.vocab_size)};
     Tensor logits = project(xb, head, head_rows);

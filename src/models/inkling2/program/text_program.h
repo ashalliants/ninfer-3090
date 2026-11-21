@@ -46,6 +46,10 @@ struct ProgramLimits {
     // Opt-in, lossy: the KV rings hold FP16 (round to nearest) rather than FP32, half the bytes per position, so
     // about twice the context fits. The attention widens them to FP32 as it reads them.
     bool kv_fp16 = false;
+    // A forward of more than max(1, max_rollback) tokens (a prefill chunk) returns its last column's logits only,
+    // FP32 [vocab_size, 1], the same bits as that column of all of them; saves vocab_size * 4 bytes per chunk column
+    // of workspace. false: every column's.
+    bool last_logits = false;
 };
 
 // Columns [column, column + values.ne[1]) of a forward that take `values` as their input in place of their tokens'
@@ -101,7 +105,8 @@ public:
     // sequence continues from position() = its start + n with every state as if only those tokens had been given.
     void keep(std::int32_t n);
 
-    // Appends tokens at position() and returns their logits: FP32 [vocab_size, T] on the device (rows past
+    // Appends tokens at position() and returns their logits: FP32 [vocab_size, T] on the device ([vocab_size, 1], the
+    // last column's, for a prefill chunk with ProgramLimits::last_logits) (rows past
     // unpadded_vocab_size are padding and never sampled), softcapped. Valid until the next call.
     Tensor forward(std::span<const std::int32_t> tokens, const Trace* trace = nullptr) { return forward(tokens, {}, trace); }
     // As above, with some columns' inputs given as embeddings (ascending, non-overlapping ranges within the chunk).

@@ -41,6 +41,14 @@ Columns columns(const Tensor& t, const char* op, const char* name, bool contiguo
     return {t.ne[0], t.ne[1], stride};
 }
 
+// A context ring: FP32 or FP16 [D, capacity], contiguous.
+Columns ring_columns(const Tensor& t, const char* op, const char* name) {
+    require(t.data != nullptr, op, (std::string(name) + " is null").c_str());
+    require(t.dtype == DType::FP32 || t.dtype == DType::FP16, op, (std::string(name) + " must be FP32 or FP16").c_str());
+    require(t.ne[2] == 1 && t.ne[3] == 1 && t.is_contiguous(), op, (std::string(name) + " must be contiguous rank 2").c_str());
+    return {t.ne[0], t.ne[1], t.ne[0]};
+}
+
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) { v += __shfl_xor_sync(0xFFFFFFFFU, v, o); }
@@ -292,7 +300,7 @@ constexpr int kAttnQueries = 16, kAttnKeys = 32, kAttnStride = 129, kAttnThreads
 
 struct BlockAttentionArgs {
     const float* q;
-    const float *k_ring, *v_ring;
+    const void *k_ring, *v_ring; // FP32, or FP16 with the kernel's Fp16
     const float *k_block, *v_block;
     std::int64_t lo;
     int capacity, n_ctx, w, group, heads, kv, run_keys, splits;
@@ -301,8 +309,9 @@ struct BlockAttentionArgs {
     float* parts; // [W, heads, splits, 2 + D] with splits > 1
 };
 
-// grid (kv_heads, query tiles, runs), 256 threads. Query i of kv head g: head g * group + i / W, column i % W. Run z
+// grid (kv_heads, query tiles, runs), 256 threads; Fp16: the rings hold FP16, widened as they are read. Query i of kv head g: head g * group + i / W, column i % W. Run z
 // takes keys [z * run_keys, min(n, (z + 1) * run_keys)) of the n = n_ctx + W, 32 at a time staged in shared memory.
+template <bool Fp16>
 __global__ void __launch_bounds__(kAttnThreads) block_attention_kernel(BlockAttentionArgs a) {
     __shared__ float qs[kAttnQueries][kAttnStride];
     __shared__ float ks[kAttnKeys][kAttnStride];
@@ -333,10 +342,17 @@ __global__ void __launch_bounds__(kAttnThreads) block_attention_kernel(BlockAtte
             const int j = i / kAttnD, d = i % kAttnD, key = k0 + j;
             float kv = 0.0F, vv = 0.0F;
             if (j < nk) {
-                const std::int64_t at = key < a.n_ctx ? ((a.lo + key) % a.capacity) * a.kv : std::int64_t(key - a.n_ctx) * a.kv;
-                const float* kp = key < a.n_ctx ? a.k_ring : a.k_block;
-                const float* vp = key < a.n_ctx ? a.v_ring : a.v_block;
-                kv = kp[at + g * kAttnD + d], vv = vp[at + g * kAttnD + d];
+                if (key < a.n_ctx) {
+                    const std::int64_t at = ((a.lo + key) % a.capacity) * a.kv + g * kAttnD + d;
+                    if constexpr (Fp16) {
+                        kv = __half2float(static_cast<const __half*>(a.k_ring)[at]), vv = __half2float(static_cast<const __half*>(a.v_ring)[at]);
+                    } else {
+                        kv = static_cast<const float*>(a.k_ring)[at], vv = static_cast<const float*>(a.v_ring)[at];
+                    }
+                } else {
+                    const std::int64_t at = std::int64_t(key - a.n_ctx) * a.kv + g * kAttnD + d;
+                    kv = a.k_block[at], vv = a.v_block[at];
+                }
             }
             ks[j][d] = kv, vs[j][d] = vv;
         }
@@ -420,6 +436,20 @@ __global__ void __launch_bounds__(kAttnD) block_attention_combine_kernel(BlockAt
         acc   = fmaf(part[2 + threadIdx.x], w, acc);
     }
     a.out[row * kAttnD + threadIdx.x] = acc / denom;
+}
+
+// Column t of src into ring slot (position + t) mod capacity; grid (ceil(rows / 256), n).
+template <bool Fp16>
+__global__ void ring_write_kernel(const float* __restrict__ src, void* __restrict__ ring, int rows, int capacity, std::int64_t position) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (i >= rows) { return; }
+    const std::int64_t at = ((position + t) % capacity) * rows + i;
+    const float x = src[static_cast<std::int64_t>(t) * rows + i];
+    if constexpr (Fp16) {
+        static_cast<__half*>(ring)[at] = __float2half_rn(x);
+    } else {
+        static_cast<float*>(ring)[at] = x;
+    }
 }
 
 // --------------------------------------------------------------------------------------------- Markov
@@ -654,7 +684,9 @@ void dspark_block_attention_fp32(const Tensor& q, const Tensor& k_ring, const Te
     constexpr const char* op = "dspark_block_attention_fp32";
     require(s.head_dim == kAttnD && s.kv_heads > 0 && s.heads % s.kv_heads == 0 && s.window >= 0 && anchor >= 0, op, "bad shape");
     const Columns qc = columns(q, op, "q", true), oc = columns(out, op, "out", true);
-    const Columns kr = columns(k_ring, op, "k_ring", true), vr = columns(v_ring, op, "v_ring", true);
+    const bool fp16 = k_ring.dtype == DType::FP16;
+    require(v_ring.dtype == k_ring.dtype, op, "the rings must share a dtype");
+    const Columns kr = ring_columns(k_ring, op, "k_ring"), vr = ring_columns(v_ring, op, "v_ring");
     const Columns kb = columns(k_block, op, "k_block", true), vb = columns(v_block, op, "v_block", true);
     const int kv = s.kv_heads * s.head_dim;
     require(qc.rows == s.heads * s.head_dim && oc.rows == qc.rows && oc.cols == qc.cols, op, "q and out must be [D * heads, W]");
@@ -674,19 +706,36 @@ void dspark_block_attention_fp32(const Tensor& q, const Tensor& k_ring, const Te
     const int splits = (tiles + run_tiles - 1) / run_tiles;
     BlockAttentionArgs a{};
     a.q = static_cast<const float*>(q.data);
-    a.k_ring = static_cast<const float*>(k_ring.data), a.v_ring = static_cast<const float*>(v_ring.data);
+    a.k_ring = k_ring.data, a.v_ring = v_ring.data;
     a.k_block = static_cast<const float*>(k_block.data), a.v_block = static_cast<const float*>(v_block.data);
     a.lo = lo, a.capacity = static_cast<int>(kr.cols), a.n_ctx = static_cast<int>(n_ctx), a.w = static_cast<int>(qc.cols);
     a.group = s.heads / s.kv_heads, a.heads = s.heads, a.kv = kv, a.run_keys = run_tiles * kAttnKeys, a.splits = splits;
     a.scale = 1.0F / std::sqrt(static_cast<float>(s.head_dim));
     a.out = static_cast<float*>(out.data), a.parts = static_cast<float*>(workspace.data);
     const int query_tiles = (a.group * a.w + kAttnQueries - 1) / kAttnQueries;
-    block_attention_kernel<<<dim3(s.kv_heads, query_tiles, splits), kAttnThreads, 0, stream>>>(a);
+    if (fp16) {
+        block_attention_kernel<true><<<dim3(s.kv_heads, query_tiles, splits), kAttnThreads, 0, stream>>>(a);
+    } else {
+        block_attention_kernel<false><<<dim3(s.kv_heads, query_tiles, splits), kAttnThreads, 0, stream>>>(a);
+    }
     check_launch(op);
     if (splits > 1) {
         block_attention_combine_kernel<<<dim3(s.heads, a.w), kAttnD, 0, stream>>>(a);
         check_launch(op);
     }
+}
+
+void dspark_ring_write(const Tensor& src, Tensor& ring, std::int64_t position, cudaStream_t stream) {
+    constexpr const char* op = "dspark_ring_write";
+    const Columns sc = columns(src, op, "src", true), rc = ring_columns(ring, op, "ring");
+    require(sc.rows == rc.rows && sc.cols <= rc.cols && position >= 0, op, "src must be [rows, n <= capacity] of the ring's rows");
+    const dim3 grid((sc.rows + 255) / 256, sc.cols);
+    if (ring.dtype == DType::FP16) {
+        ring_write_kernel<true><<<grid, 256, 0, stream>>>(static_cast<const float*>(src.data), ring.data, sc.rows, rc.cols, position);
+    } else {
+        ring_write_kernel<false><<<grid, 256, 0, stream>>>(static_cast<const float*>(src.data), ring.data, sc.rows, rc.cols, position);
+    }
+    check_launch(op);
 }
 
 void dspark_markov_update_fp32(const Tensor& joint, Tensor& state, Tensor& latent, cudaStream_t stream) {
