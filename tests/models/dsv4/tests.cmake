@@ -47,3 +47,7 @@ ninfer_add_test(ninfer_dsv4_frontend_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_frontend_real.cpp"
   LIBRARIES ninfer_model_loading ninfer_core)
 set_tests_properties(ninfer_dsv4_frontend_real_test PROPERTIES SKIP_RETURN_CODE 77)
+# The residency policy of the expert tiers (RAM slots, VRAM frames); header only, runs without the artifact or a GPU.
+ninfer_add_test(ninfer_dsv4_expert_tiers_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_tiers.cpp"
+  LIBRARIES ninfer_core)

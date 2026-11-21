@@ -17,7 +17,9 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -87,6 +89,15 @@ ConstructedDsv4 construct_dsv4(const EngineOptions& options, DeviceContext& devi
     models::dsv4::FileExpertOptions expert_options;
     expert_options.cache_bytes = wanted.expert_cache_bytes;
     expert_options.max_entries = static_cast<std::int32_t>(config.experts_per_token * wanted.prefill_chunk);
+    // The device tier: what is free after the weights beyond the reserve (NINFER_DSV4_EXPERT_VRAM_MIB overrides it, 0 turns
+    // it off). Parallel reads help drives that serve several requests at once and hurt a hard disk, so they are opt-in
+    // (NINFER_DSV4_READ_THREADS, default 1).
+    expert_options.device_cache_bytes =
+        after_weights > kDsv4ExpertVramReserveBytes ? std::min(after_weights - kDsv4ExpertVramReserveBytes, kDsv4ExpertVramMaxBytes) : 0;
+    if (const char* env = std::getenv("NINFER_DSV4_EXPERT_VRAM_MIB")) { expert_options.device_cache_bytes = std::strtoull(env, nullptr, 10) << 20; }
+    if (const char* env = std::getenv("NINFER_DSV4_READ_THREADS")) {
+        expert_options.read_threads = static_cast<std::uint32_t>(std::max(1L, std::strtol(env, nullptr, 10)));
+    }
     instance->experts =
         std::make_unique<models::dsv4::FileExpertSource>(*instance->reader, banks, instance->model->config().experts, expert_options);
     models::dsv4::ForwardOptions forward_options;

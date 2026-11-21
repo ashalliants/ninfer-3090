@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <mutex>
 
 namespace ninfer::artifact {
 
@@ -60,8 +61,13 @@ struct Reader::Impl {
         geometries.resize(directory.objects.size());
     }
 
+    // Continuation files open on first use; reads may come from several threads (the DSV4 expert source
+    // preads in parallel), so the lazy open is serialized. The returned file is only read afterwards.
+    mutable std::mutex files_mutex;
+
     InputFile& file(std::size_t index) const {
         if (index >= files.size()) { throw ArtifactError("invalid continuation index"); }
+        const std::lock_guard lock(files_mutex);
         if (!files[index]) {
             const auto& record = directory.files[index];
             auto input         = std::make_unique<InputFile>(entry.parent_path() / *record.path);

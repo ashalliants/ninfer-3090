@@ -6,6 +6,11 @@
 // the prompt, a decode step equal to the same token run as part of a longer chunk, and greedy decoding
 // that continues a prompt with the model's own words (NINFER_DSV4_TOKENS: space-separated ids, default
 // "The capital of France is" with a BOS; NINFER_DSV4_NEW: tokens to generate, default 8; prints them).
+// The expert tiers are set by NINFER_DSV4_RAM_GB (pinned RAM tier, default 8), NINFER_DSV4_VRAM_GB (device frame
+// pool, default 12; 0 has none), NINFER_DSV4_READ_THREADS (parallel preads, default 1: on a hard disk concurrent reads slow it down about 4x,
+// on a SATA SSD 8 to 16 threads read 1.5x faster) and NINFER_DSV4_ZC
+// (zero-copy misses of the Op, default 0). Prints the time per token and the tier hit counts of each phase
+// (cold decode, a second decode of the same text with the caches warm, and a fixed-routing probe).
 
 #include "core/device.h"
 #include "models/dsv4/execution/forward.h"
@@ -49,6 +54,22 @@ std::vector<int> top(const std::vector<float>& v, int k) {
     return idx;
 }
 
+double env_number(const char* name, double fallback) {
+    const char* env = std::getenv(name);
+    return env != nullptr ? std::atof(env) : fallback;
+}
+
+void print_tiers(const char* label, const dsv4::FileExpertSource::Stats& s, double seconds, int tokens) {
+    const double routed = static_cast<double>(s.vram_hits + s.ram_hits + s.misses);
+    std::printf("%s: %.1f ms/token; experts: %llu VRAM hits, %llu RAM hits, %llu file reads (%.1f%% / %.1f%% / %.1f%%), %llu promotions, "
+                "%.2f GB read, read %.2f s, ids wait %.2f s\n",
+                label, 1000.0 * seconds / std::max(tokens, 1), static_cast<unsigned long long>(s.vram_hits),
+                static_cast<unsigned long long>(s.ram_hits), static_cast<unsigned long long>(s.misses),
+                100.0 * static_cast<double>(s.vram_hits) / std::max(routed, 1.0), 100.0 * static_cast<double>(s.ram_hits) / std::max(routed, 1.0),
+                100.0 * static_cast<double>(s.misses) / std::max(routed, 1.0), static_cast<unsigned long long>(s.promotions),
+                static_cast<double>(s.bytes_read) / 1e9, s.read_seconds, s.sync_seconds);
+}
+
 double seconds_since(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 }
@@ -80,19 +101,25 @@ int main() {
     std::printf("loaded the dense weights in %.1f s\n", seconds_since(t0));
 
     dsv4::FileExpertOptions options;
-    options.cache_bytes = 8ULL << 30;
+    options.cache_bytes        = static_cast<std::uint64_t>(env_number("NINFER_DSV4_RAM_GB", 8) * double(1ULL << 30));
+    options.device_cache_bytes = static_cast<std::uint64_t>(env_number("NINFER_DSV4_VRAM_GB", 12) * double(1ULL << 30));
+    options.read_threads       = static_cast<std::uint32_t>(env_number("NINFER_DSV4_READ_THREADS", 1));
+    options.zero_copy_misses   = static_cast<std::int32_t>(env_number("NINFER_DSV4_ZC", 0));
     dsv4::FileExpertSource experts(reader, banks, model->config().experts, options);
     cudaStream_t stream = nullptr;
     dsv4::ForwardOptions forward_options;
     forward_options.limits = {.max_context = 2048, .max_chunk = 64};
     dsv4::Forward forward(*model, experts, forward_options, stream);
-    std::printf("forward state and workspace: %.2f GB\n", static_cast<double>(forward.device_bytes()) / 1e9);
+    std::printf("forward state and workspace: %.2f GB; expert tiers: %u RAM slots, %u device frames, %u read threads\n",
+                static_cast<double>(forward.device_bytes()) / 1e9, experts.cache_slots(), experts.device_frames(), options.read_threads);
 
     // Whole prompt in one chunk.
     t0 = std::chrono::steady_clock::now();
     const auto& logits = forward.run(prompt, 0);
     cudaStreamSynchronize(stream);
     std::printf("prefill of %zu tokens: %.1f s (cold expert cache)\n", prompt.size(), seconds_since(t0));
+    print_tiers("cold prefill", experts.stats(), seconds_since(t0), static_cast<int>(prompt.size()));
+    experts.reset_stats();
     const std::vector<float> whole = download(logits);
     bool finite = true;
     for (const float v : whole) { finite = finite && std::isfinite(v); }
@@ -122,7 +149,8 @@ int main() {
     std::vector<std::int32_t> generated;
     std::int32_t position = static_cast<std::int32_t>(prompt.size());
     std::int32_t next     = forward.argmax();
-    t0                    = std::chrono::steady_clock::now();
+    experts.reset_stats();
+    t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < new_tokens; ++i) {
         generated.push_back(next);
         forward.run(std::span<const std::int32_t>(&next, 1), position++);
@@ -154,9 +182,33 @@ int main() {
         check(generated[0] == 11111 && generated[1] == 16, "the default prompt continues with ' Paris' and '.'");
     }
     std::printf("\ndecode: %d tokens in %.2f s (%.2f s/token)\n", new_tokens, decode_seconds, decode_seconds / std::max(new_tokens, 1));
-    const auto& stats = experts.stats();
-    std::printf("expert cache: %llu hits, %llu misses, %.1f GB read\n", static_cast<unsigned long long>(stats.hits),
-                static_cast<unsigned long long>(stats.misses), static_cast<double>(stats.bytes_read) / 1e9);
+    print_tiers("decode after the prefill", experts.stats(), decode_seconds, new_tokens);
+    const std::vector<std::int32_t> first_pass = generated;
+    if (!std::getenv("NINFER_DSV4_TOKENS") && new_tokens >= 4) {
+        const std::int32_t expected[4] = {11111, 16, 4588, 455};
+        check(std::equal(expected, expected + 4, generated.begin()), "greedy ids continue 'The capital of France is' as before");
+    }
+
+    // The same prompt and continuation again with the caches warm: identical tokens, and the speed a
+    // repeated workload sees.
+    for (int pass = 0; pass < 3; ++pass) {
+        experts.reset_stats();
+        forward.run(prompt, 0);
+        cudaStreamSynchronize(stream);
+        std::int32_t pos = static_cast<std::int32_t>(prompt.size());
+        std::int32_t tok = forward.argmax();
+        std::vector<std::int32_t> again;
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < new_tokens; ++i) {
+            again.push_back(tok);
+            forward.run(std::span<const std::int32_t>(&tok, 1), pos++);
+            tok = forward.argmax();
+        }
+        print_tiers(pass == 0 ? "warm decode, pass 1 (same text again)" : pass == 1 ? "warm decode, pass 2" : "warm decode, pass 3", experts.stats(), seconds_since(start), new_tokens);
+        check(again == first_pass, "the second decode of the same text gives the same ids");
+        next     = tok;
+        position = pos;
+    }
 
     // Warm-cache decode speed: the same token fed again for several steps routes to the experts just used,
     // so the steps are served from the cache and the time is the compute and the per-layer host sync.
@@ -170,8 +222,7 @@ int main() {
         cudaStreamSynchronize(stream);
         const double warm = seconds_since(warm_start);
         const auto& w = experts.stats();
-        std::printf("warm decode probe: %d steps in %.3f s (%.1f ms/token), %llu hits, %llu misses\n", warm_steps, warm,
-                    1000.0 * warm / warm_steps, static_cast<unsigned long long>(w.hits), static_cast<unsigned long long>(w.misses));
+        print_tiers("probe, same token repeated (routing drifts)", w, warm, warm_steps);
     }
     std::printf("%s", forward.profile_report().c_str());
     if (failures == 0) { std::printf("PASS\n"); }

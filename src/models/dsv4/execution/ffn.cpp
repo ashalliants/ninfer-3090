@@ -167,7 +167,9 @@ void ffn_forward(const FfnParams& p, const FfnWeights& w, std::uint32_t layer, E
     ops::projection_fp32(x, router, logits, stream);
     ops::moe_route_sqrt_softplus(logits, w.router_bias, K, p.route_scale, p.norm_topk, ids, weights, stream);
 
-    // Routed experts: dispatch, then the records from wherever they live.
+    // Routed experts: dispatch, then the records from wherever they live. The ids start their way to the
+    // host now, and the shared expert (which does not depend on them) is enqueued before the source waits for
+    // them, so a source that reads records from a file overlaps those reads with the shared expert's work.
     ops::MoeRouting routing;
     routing.ids         = ids;
     routing.weights     = weights;
@@ -175,10 +177,7 @@ void ffn_forward(const FfnParams& p, const FfnWeights& w, std::uint32_t layer, E
     const DeviceSpan dispatch_bytes = arena.alloc_bytes(ops::moe_dispatch_bytes(E, entries));
     ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, entries);
     ops::moe_dispatch(routing, E, dispatch, nullptr, stream);
-    const ops::MoeExpertSource source = experts.prepare(layer, static_cast<const std::int32_t*>(ids.data), entries, stream);
-    const DeviceSpan expert_ws        = arena.alloc_bytes(ops::moe_experts_narrow_workspace_bytes(shape_of(p), jobs, entries, T));
-    Tensor routed                     = arena.alloc(DType::BF16, {p.hidden, entries});
-    ops::moe_experts_narrow(shape_of(p), x, dispatch, source, K, jobs, expert_ws.data, routed, stream);
+    experts.begin(layer, static_cast<const std::int32_t*>(ids.data), entries, stream);
 
     // Shared expert: gate and up, the clamped SwiGLU, down.
     Tensor gate = arena.alloc(DType::BF16, {p.intermediate, T}), up = arena.alloc(DType::BF16, {p.intermediate, T}),
@@ -192,6 +191,11 @@ void ffn_forward(const FfnParams& p, const FfnWeights& w, std::uint32_t layer, E
     project(x, w.shared_up, up);
     ops::clamped_swiglu(gate, up, p.clamp_shared, act, stream);
     project(act, w.shared_down, shared);
+
+    const ops::MoeExpertSource source = experts.prepare(layer, static_cast<const std::int32_t*>(ids.data), entries, stream);
+    const DeviceSpan expert_ws        = arena.alloc_bytes(ops::moe_experts_narrow_workspace_bytes(shape_of(p), jobs, entries, T));
+    Tensor routed                     = arena.alloc(DType::BF16, {p.hidden, entries});
+    ops::moe_experts_narrow(shape_of(p), x, dispatch, source, K, jobs, expert_ws.data, routed, stream);
     ops::weighted_slot_sum(routed, weights, shared, y, stream);
 
     // Back into the streams.
