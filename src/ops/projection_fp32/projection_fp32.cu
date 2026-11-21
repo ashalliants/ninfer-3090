@@ -304,7 +304,7 @@ Segments bind_segments(const Tensor& x, std::span<const Tensor* const> weights, 
     const int k = x.ne[0], columns = x.ne[1];
     require(k > 0 && k % 8 == 0 && k <= max_k && columns > 0,
             max_k == kMaxK ? "K must be a multiple of 8 up to 3072" : "K must be a multiple of 8 up to 8192");
-    require(!weights.empty() && weights.size() <= kMaxSegments, "1 to kProjectionMaxWeights (6) weights");
+    require(!weights.empty() && weights.size() <= kMaxSegments, "1 to kProjectionMaxWeights (8) weights");
     require(aligned16(x.data), "x must be 16-byte aligned");
     Segments segments{};
     segments.count = static_cast<int>(weights.size());

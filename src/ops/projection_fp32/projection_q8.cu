@@ -161,7 +161,7 @@ void projection_q8_fp32(const Tensor& x, std::span<const Q8Weight> weights, Tens
             "x must be contiguous, 16-byte aligned BF16 [K, T]");
     const int k = x.ne[0], columns = x.ne[1];
     require(k > 0 && k % 32 == 0 && k <= kMaxK && columns > 0, "K must be a multiple of 32 up to 3072");
-    require(!weights.empty() && weights.size() <= kSegments, "1 to kProjectionMaxWeights (6) weights");
+    require(!weights.empty() && weights.size() <= kSegments, "1 to kProjectionMaxWeights (8) weights");
     Segments segments{};
     segments.count = static_cast<int>(weights.size());
     for (std::size_t i = 0; i < weights.size(); ++i) {
