@@ -39,7 +39,25 @@ void check_cuda(cudaError_t status, const char* what) {
     if (status != cudaSuccess) { throw std::runtime_error(std::string("inkling2 core: ") + what + ": " + cudaGetErrorString(status)); }
 }
 
-constexpr std::int32_t kChunk = 256; // prompt tokens per forward
+// Plain decode steps' taps held for the drafter's next extend.
+constexpr std::int32_t kHeld = 256;
+// The prefill chunks tried at startup, widest first (the tensor-core prefill gains with the width), and the device
+// memory left free after the programs for what the first requests allocate (cuBLAS's handle, say).
+constexpr std::int32_t kChunks[] = {2048, 1024, 512, 256};
+constexpr std::size_t kStartupSpare = 256U << 20;
+// Prefix reuse's granularity: a snapshot keeps a multiple of this many prompt positions, whatever the chunk.
+constexpr std::int32_t kReuseStep = 256;
+
+// The drafter's extend of n taps' columns, in pieces of at most its max_chunk.
+void extend_drafter(ink::DSparkProgram& drafter, std::span<const Tensor> taps, std::int32_t n) {
+    for (std::int32_t s = 0; s < n; s += drafter.max_chunk()) {
+        const std::int32_t len = std::min(drafter.max_chunk(), n - s);
+        std::vector<Tensor> piece;
+        piece.reserve(taps.size());
+        for (const Tensor& t : taps) { piece.push_back(t.slice(1, s, len)); }
+        drafter.extend(piece, len);
+    }
+}
 // <|end_message|><|message_model|><|content_text|>: what a thinking budget injects to close the reasoning.
 constexpr std::uint32_t kCloseTokens = 3;
 // <|message_model|><|content_thinking|>: the model opens its own turn (the template has no generation prompt).
@@ -140,7 +158,7 @@ struct Inkling2Core::Programs {
     std::unique_ptr<ink::DenseWeightsQ8> dense;
     ink::TextProgram text;
     std::unique_ptr<ink::VisionEncoder> vision;
-    // --spec dspark: the drafter, and plain steps' taps held for its next extend (FP32 [hidden, kChunk] each).
+    // --spec dspark: the drafter, and plain steps' taps held for its next extend (FP32 [hidden, kHeld] each).
     std::unique_ptr<ink::DSparkProgram> drafter;
     std::vector<DeviceBuffer> held_memory;
     std::vector<Tensor> held;
@@ -159,6 +177,30 @@ private:
         return limits;
     }
 };
+
+// The text Program at chunk_ and, as configured, the drafter, its held taps, the vision tower and the snapshots.
+void Inkling2Core::build_programs(ink::ProgramLimits limits, std::unique_ptr<ink::DenseWeightsQ8> dense, const ink::VisionConfig* vision,
+                                  bool dspark) {
+    limits.max_chunk = chunk_;
+    programs_ = std::make_unique<Programs>(*model_, std::move(dense), limits, stream_);
+    if (dspark) {
+        // With --dense-q8 the drafter proposes from the target's re-encoded head, the one it verifies against.
+        // Its extends take at most its sliding window; a wider chunk's taps go in pieces (extend_drafter).
+        const std::int32_t draft_chunk = std::min(chunk_, static_cast<std::int32_t>(model_->dspark_config()->sliding_window));
+        programs_->drafter = std::make_unique<ink::DSparkProgram>(*model_, static_cast<std::int32_t>(options_.max_context), draft_chunk, stream_,
+                                                                  programs_->dense ? &programs_->dense->head() : nullptr, limits.kv_fp16);
+        const std::int32_t hidden = static_cast<std::int32_t>(model_->config().hidden_size);
+        for (std::size_t i = 0; i < limits.tap_visits.size(); ++i) {
+            programs_->held_memory.emplace_back(static_cast<std::size_t>(hidden) * kHeld * 4);
+            programs_->held.emplace_back(programs_->held_memory.back().p, DType::FP32, std::initializer_list<std::int32_t>{hidden, kHeld});
+        }
+    }
+    if (vision != nullptr) { programs_->vision = std::make_unique<ink::VisionEncoder>(*model_, stream_); }
+    if (options_.context_cache.enabled) {
+        programs_->snapshot.memory = DeviceBuffer(programs_->text.snapshot_bytes());
+        if (programs_->drafter) { programs_->draft_snapshot.memory = DeviceBuffer(programs_->drafter->snapshot_bytes()); }
+    }
+}
 
 struct Inkling2Core::Job {
     std::uint64_t id = 0;
@@ -272,10 +314,10 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         StartupPhaseScope phase(options_.startup_observer, StartupPhase::ProgramInitialize);
         ink::ProgramLimits limits;
         limits.max_context = static_cast<std::int32_t>(options_.max_context);
-        limits.max_chunk   = kChunk;
         limits.last_logits = true; // prefill reads only the last column (decode below)
         limits.split_attention = options_.split_attention;
         limits.kv_fp16         = options_.kv_rings != KvRings::FP32; // FP16 by default
+        if (options_.prefill_math != PrefillMath::FP32) { limits.prefill_tc = ink::ProgramLimits::TensorCoreParts::all(); }
         const bool dspark  = options_.speculative.backend == SpeculativeBackend::DSpark;
         if (dspark) {
             const ink::DSparkConfig* dc = model_->dspark_config();
@@ -291,22 +333,34 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
             dense = std::make_unique<ink::DenseWeightsQ8>(*model_, options_.dense_q8 == DenseQ8::All ? ink::DenseForm::Q8All : ink::DenseForm::Q8Head,
                                                    stream_);
         }
-        programs_ = std::make_unique<Programs>(*model_, std::move(dense), limits, stream_);
-        if (dspark) {
-            // With --dense-q8 the drafter proposes from the target's re-encoded head, the one it verifies against.
-            programs_->drafter = std::make_unique<ink::DSparkProgram>(*model_, static_cast<std::int32_t>(options_.max_context), kChunk,
-                                                                      stream_, programs_->dense ? &programs_->dense->head() : nullptr,
-                                                                      limits.kv_fp16);
-            const std::int32_t hidden = static_cast<std::int32_t>(model_->config().hidden_size);
-            for (std::size_t i = 0; i < limits.tap_visits.size(); ++i) {
-                programs_->held_memory.emplace_back(static_cast<std::size_t>(hidden) * kChunk * 4);
-                programs_->held.emplace_back(programs_->held_memory.back().p, DType::FP32, std::initializer_list<std::int32_t>{hidden, kChunk});
+        // The widest chunk whose programs fit beside max_context (or --prefill-chunk's alone).
+        std::vector<std::int32_t> chunks;
+        if (options_.prefill_chunk_explicit) {
+            chunks.push_back(static_cast<std::int32_t>(std::min<std::uint32_t>(options_.prefill_chunk, options_.max_context)));
+        } else {
+            for (const std::int32_t c : kChunks) {
+                if (static_cast<std::uint32_t>(c) <= options_.max_context || c == kChunks[std::size(kChunks) - 1]) {
+                    chunks.push_back(std::min<std::int32_t>(c, static_cast<std::int32_t>(options_.max_context)));
+                }
             }
         }
-        if (vision != nullptr) { programs_->vision = std::make_unique<ink::VisionEncoder>(*model_, stream_); }
-        if (options_.context_cache.enabled) {
-            programs_->snapshot.memory = DeviceBuffer(programs_->text.snapshot_bytes());
-            if (programs_->drafter) { programs_->draft_snapshot.memory = DeviceBuffer(programs_->drafter->snapshot_bytes()); }
+        for (std::size_t attempt = 0; attempt < chunks.size(); ++attempt) {
+            const bool last = attempt + 1 == chunks.size();
+            chunk_ = chunks[attempt];
+            try {
+                build_programs(limits, std::move(dense), vision, dspark);
+                std::size_t free_bytes = 0, total_bytes = 0;
+                check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "memory info");
+                if (free_bytes < kStartupSpare && !last) { throw std::runtime_error("inkling2: under the startup spare"); }
+                break;
+            } catch (const std::invalid_argument&) {
+                throw;
+            } catch (const std::exception&) {
+                if (last) { throw; }
+                if (programs_) { dense = std::move(programs_->dense); }
+                programs_.reset();
+                (void)cudaGetLastError(); // a failed allocation's error, not sticky
+            }
         }
         phase.complete();
     } catch (...) {
@@ -319,7 +373,9 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     load_.artifact_id         = artifact::artifact_id_hex(reader.artifact_id());
     load_.weight_formats      = {"bf16", "ggml_q8_0", "ggml_rec_nvfp4_nvfp4", "fp32"};
     if (options_.dense_q8 != DenseQ8::Off) { load_.weight_formats.push_back("q8_g32_fp16 (re-encoded at load)"); }
-    load_.prefill_signature   = "inkling2-fp32";
+    load_.prefill_signature   = options_.prefill_math == PrefillMath::FP32 ? "inkling2-fp32" : "inkling2-tc";
+    load_.notes.push_back("prefill | chunk " + std::to_string(chunk_) + (options_.prefill_chunk_explicit ? " (--prefill-chunk)" : " (widest that fits)") +
+                          " | " + (options_.prefill_math == PrefillMath::FP32 ? "FP32" : "tensor cores (--prefill-math fp32: the exact FP32 prefill)"));
     load_.takes_video         = false;
     load_.load_seconds        = seconds_between(start, Clock::now());
     load_.upload_seconds       = stats.upload_seconds;
@@ -622,12 +678,13 @@ void Inkling2Core::run(Job& job) {
         if (speculate) { drafter->reset(); }
         snapshot.position = -1; // its global caches are about to be overwritten
     }
-    // The state after the last whole chunk that leaves a position to compute, kept for the next prompt.
-    const std::int32_t keep_at = snapshot.memory.p != nullptr ? (n - 1) / kChunk * kChunk : 0;
+    // The state after the last whole kReuseStep positions that leave one to compute, kept for the next prompt: a chunk
+    // ends there, so a prompt's chunks are the same whether it resumes or not.
+    const std::int32_t keep_at = snapshot.memory.p != nullptr ? (n - 1) / kReuseStep * kReuseStep : 0;
     const auto prefill_start = Clock::now();
     const std::size_t hidden = text_cfg.hidden_size;
     Tensor logits;
-    for (std::int32_t s = resume; s < n; s += kChunk) {
+    for (std::int32_t s = resume, len = 0; s < n; s += len) {
         if (job.cancelled) {
             std::lock_guard lock(stats_mutex_);
             ++totals_.cancelled_prefills;
@@ -636,7 +693,7 @@ void Inkling2Core::run(Job& job) {
             out.finish_reason = FinishReason::Cancelled;
             return;
         }
-        const std::int32_t len = std::min(kChunk, n - s);
+        len = std::min({chunk_, n - s, s < keep_at ? keep_at - s : chunk_});
         std::vector<ink::InputEmbeddings> inputs;
         for (std::size_t i = 0; i < prompt.images.size(); ++i) {
             const std::int32_t first = prompt.images[i].column, count = prompt.images[i].image.tokens();
@@ -646,7 +703,7 @@ void Inkling2Core::run(Job& job) {
             inputs.push_back({lo - s, all.slice(1, lo - first, hi - lo)});
         }
         logits = program.forward(std::span(prompt.tokens).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(len)), inputs);
-        if (speculate) { drafter->extend(taps_of(), len); }
+        if (speculate) { extend_drafter(*drafter, taps_of(), len); }
         if (s + len == keep_at && keep_at > resume) {
             program.save(snapshot);
             // The drafter followed the prompt only when this request speculates.
@@ -743,7 +800,7 @@ void Inkling2Core::run(Job& job) {
     const auto close_round = [&] {
         const std::int32_t kept = col + 1; // the anchor and the drafts consumed
         program.keep(kept);
-        drafter->extend(taps_of(), kept);
+        extend_drafter(*drafter, taps_of(), kept);
         count_round();
         accept_ema = 0.8 * accept_ema + 0.2 * col;
         in_round   = false;
@@ -800,7 +857,7 @@ void Inkling2Core::run(Job& job) {
             logits = program.forward(one);
             argmax_stale = true;
             if (speculate) { // a sampled request never drafts, so the drafter needs none of its taps
-                if (held_n == kChunk) { flush_held(); }
+                if (held_n == kHeld) { flush_held(); }
                 for (std::size_t i = 0; i < programs_->held.size(); ++i) {
                     const Tensor tap = program.tap(i);
                     check_cuda(cudaMemcpyAsync(static_cast<float*>(programs_->held[i].data) + static_cast<std::size_t>(held_n) * tap.ne[0],

@@ -155,6 +155,7 @@ struct ControlArgs {
     const __nv_bfloat16* gain[kJ];
     const __nv_bfloat16* forget[kJ];
     int hidden, rank, slices, jobs;
+    int cols;
     float eps;
 };
 
@@ -233,15 +234,32 @@ __global__ void __launch_bounds__(kThreads) control_partial_kernel(ControlArgs a
     }
 }
 
-// Phase 2, grid (T, ceil(H / kApplyRows), jobs): block (t, b, j) forms z of column t of job j from the partials, then
-// outputs d in [b * kApplyRows, (b + 1) * kApplyRows): four lane octets of a warp take the gain and forget rows of
-// two outputs, a lane one 8-value chunk of R.
-__global__ void __launch_bounds__(kThreads) control_apply_kernel(ControlArgs a, const float* __restrict__ partial) {
-    __shared__ float z[kR];
+// Phase 1b, grid (T, jobs): z of column t of job j from the partials into zs[(t * jobs + j) * R + r].
+__global__ void __launch_bounds__(kThreads) control_z_kernel(ControlArgs a, const float* __restrict__ partial, float* __restrict__ zs) {
     const std::int64_t t = blockIdx.x;
+    const int j = blockIdx.y, rank = a.rank, half = a.slices / 2, h = a.hidden;
+    if (threadIdx.x >= rank) { return; }
+    const float* p = partial + (t * a.jobs + j) * a.slices * (rank + 1);
+    float zc = 0.0F, zm = 0.0F, sc = 0.0F, sm = 0.0F;
+#pragma unroll 3
+    for (int s = 0; s < half; ++s) {
+        zc += p[s * (rank + 1) + threadIdx.x];
+        sc += p[s * (rank + 1) + rank];
+        zm += p[(half + s) * (rank + 1) + threadIdx.x];
+        sm += p[(half + s) * (rank + 1) + rank];
+    }
+    const float inv_h = 1.0F / static_cast<float>(h);
+    zs[(t * a.jobs + j) * rank + threadIdx.x] = zc * rsqrtf(sc * inv_h + a.eps) + zm * rsqrtf(sm * inv_h + a.eps);
+}
+
+// Phase 2, grid (T, ceil(H / kApplyRows), jobs): block (t, b, j) loads the gain and forget rows of outputs d in
+// [b * kApplyRows, (b + 1) * kApplyRows) and z of column t of job j, then outputs those d: four lane octets of a warp
+// take the gain and forget rows of two outputs, a lane one 8-value chunk of R.
+__global__ void __launch_bounds__(kThreads) control_apply_kernel(ControlArgs a, const float* __restrict__ zs) {
+    __shared__ float z[kR];
     const int j = blockIdx.z, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const ControlJob job = control_job(a, j);
-    const int h = a.hidden, rank = a.rank, half = a.slices / 2;
+    const int h = a.hidden, rank = a.rank;
     const int octet = lane >> 3, chunk = lane & 7, which = octet & 1; // which: 0 gain, 1 forget
     constexpr int kPasses = kApplyRows / (2 * kThreads / 32);         // 2: a warp takes two outputs a pass
     const __nv_bfloat16* rows = which == 0 ? job.gain : job.forget;
@@ -252,19 +270,8 @@ __global__ void __launch_bounds__(kThreads) control_apply_kernel(ControlArgs a, 
         w[i] = make_uint4(0, 0, 0, 0);
         if (d < h && chunk < rank / 8) { w[i] = __ldg(reinterpret_cast<const uint4*>(rows + static_cast<std::int64_t>(d) * rank) + chunk); }
     }
-    const float* p = partial + (t * a.jobs + j) * a.slices * (rank + 1);
-    if (threadIdx.x < rank) {
-        float zc = 0.0F, zm = 0.0F, sc = 0.0F, sm = 0.0F;
-#pragma unroll 3
-        for (int s = 0; s < half; ++s) {
-            zc += p[s * (rank + 1) + threadIdx.x];
-            sc += p[s * (rank + 1) + rank];
-            zm += p[(half + s) * (rank + 1) + threadIdx.x];
-            sm += p[(half + s) * (rank + 1) + rank];
-        }
-        const float inv_h = 1.0F / static_cast<float>(h);
-        z[threadIdx.x] = zc * rsqrtf(sc * inv_h + a.eps) + zm * rsqrtf(sm * inv_h + a.eps);
-    }
+    const std::int64_t t = blockIdx.x;
+    if (threadIdx.x < rank) { z[threadIdx.x] = zs[(t * a.jobs + j) * rank + threadIdx.x]; }
     __syncthreads();
 #pragma unroll
     for (int i = 0; i < kPasses; ++i) {
@@ -282,6 +289,48 @@ __global__ void __launch_bounds__(kThreads) control_apply_kernel(ControlArgs a, 
             const float g = tanhf(dot), f = tanhf(forget);
             job.out[t * job.os + d] = (1.0F - f) * job.c[t * job.cs + d] + g * job.m[t * job.ms + d];
         }
+    }
+}
+
+
+// Wide calls, grid (ceil(T / 32), ceil(H / 32), jobs): one thread per output (lanes along d), the gain and forget
+// rows and the columns' z staged in shared memory. Each dot is control_apply_kernel's: eight 8-value chunk sums from
+// 0 in order, then its lanes' xor tree ((p0 + p4) + (p2 + p6)) + ((p1 + p5) + (p3 + p7)): the same bits.
+constexpr int kWideTile = 32;
+
+__device__ __forceinline__ float chunked_dot(const float* w, const float* z, int rank) {
+    float p[8];
+#pragma unroll
+    for (int c = 0; c < 8; ++c) {
+        float dot = 0.0F;
+        if (c < rank / 8) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) { dot = fmaf(w[8 * c + e], z[8 * c + e], dot); }
+        }
+        p[c] = dot;
+    }
+    return ((p[0] + p[4]) + (p[2] + p[6])) + ((p[1] + p[5]) + (p[3] + p[7]));
+}
+
+__global__ void __launch_bounds__(kThreads) control_apply_wide_kernel(ControlArgs a, const float* __restrict__ zs) {
+    __shared__ float wg[kWideTile][kR + 1], wf[kWideTile][kR + 1], zt[kWideTile][kR];
+    const int j = blockIdx.z, rank = a.rank, h = a.hidden;
+    const ControlJob job = control_job(a, j);
+    const int d0 = blockIdx.y * kWideTile, t0 = blockIdx.x * kWideTile;
+    for (int i = threadIdx.x; i < kWideTile * rank; i += kThreads) {
+        const int dd = i / rank, r = i % rank, d = d0 + dd, tt = t0 + dd;
+        wg[dd][r] = d < h ? __bfloat162float(job.gain[static_cast<std::int64_t>(d) * rank + r]) : 0.0F;
+        wf[dd][r] = d < h ? __bfloat162float(job.forget[static_cast<std::int64_t>(d) * rank + r]) : 0.0F;
+        zt[dd][r] = tt < a.cols ? zs[(static_cast<std::int64_t>(tt) * a.jobs + j) * rank + r] : 0.0F;
+    }
+    __syncthreads();
+    const int dd = threadIdx.x % kWideTile, d = d0 + dd;
+    if (d >= h) { return; }
+    for (int tt = threadIdx.x / kWideTile; tt < kWideTile; tt += kThreads / kWideTile) {
+        const std::int64_t t = t0 + tt;
+        if (t >= a.cols) { break; }
+        const float g = tanhf(chunked_dot(wg[dd], zt[tt], rank)), f = tanhf(chunked_dot(wf[dd], zt[tt], rank));
+        job.out[t * job.os + d] = (1.0F - f) * job.c[t * job.cs + d] + g * job.m[t * job.ms + d];
     }
 }
 
@@ -330,7 +379,7 @@ std::size_t loop_controller_workspace_bytes(int hidden, int rank, int cols, int 
     require(hidden > 0 && hidden % kSlice == 0 && hidden <= 65536, "H must be a positive multiple of 256, at most 65536");
     require(rank > 0 && rank % 8 == 0 && rank <= kR, "R must be a multiple of 8, at most 64");
     require(cols > 0 && jobs >= 1 && jobs <= kJ, "T must be positive and jobs 1..3");
-    return static_cast<std::size_t>(cols) * jobs * (2 * hidden / kSlice) * (rank + 1) * sizeof(float) + 256;
+    return static_cast<std::size_t>(cols) * jobs * ((2 * hidden / kSlice) * (rank + 1) + rank) * sizeof(float) + 512;
 }
 
 void loop_controller_fp32(std::span<const LoopControllerJob> jobs, float eps, DeviceArena& workspace, cudaStream_t stream) {
@@ -339,7 +388,7 @@ void loop_controller_fp32(std::span<const LoopControllerJob> jobs, float eps, De
     require(jobs[0].c != nullptr && jobs[0].down != nullptr, "a controller job is incomplete");
     ControlArgs a{};
     const std::int32_t h = jobs[0].c->ne[0], cols = jobs[0].c->ne[1], rank = jobs[0].down->ne[1];
-    const std::size_t bytes = loop_controller_workspace_bytes(h, rank, cols, static_cast<int>(jobs.size()));
+    (void)loop_controller_workspace_bytes(h, rank, cols, static_cast<int>(jobs.size())); // validates H, R, T and the jobs
     const auto aligned = [](const Tensor& t) { return reinterpret_cast<std::uintptr_t>(t.data) % 16 == 0; };
     for (std::size_t j = 0; j < jobs.size(); ++j) {
         const LoopControllerJob& job = jobs[j];
@@ -365,10 +414,18 @@ void loop_controller_fp32(std::span<const LoopControllerJob> jobs, float eps, De
     }
     a.hidden = h, a.rank = rank, a.slices = 2 * h / kSlice, a.jobs = static_cast<int>(jobs.size()), a.eps = eps;
     const auto scope = workspace.scope();
-    float* partial = static_cast<float*>(workspace.alloc_bytes(bytes - 256).data);
+    float* partial = static_cast<float*>(workspace.alloc_bytes(static_cast<std::size_t>(cols) * a.jobs * a.slices * (rank + 1) * 4).data);
+    float* zs = static_cast<float*>(workspace.alloc_bytes(static_cast<std::size_t>(cols) * a.jobs * rank * 4).data);
     control_partial_kernel<<<dim3(cols, a.slices, a.jobs * kPartialRowGroups), kThreads, 0, stream>>>(a, partial);
     check_launch();
-    control_apply_kernel<<<dim3(cols, (h + kApplyRows - 1) / kApplyRows, a.jobs), kThreads, 0, stream>>>(a, partial);
+    a.cols = cols;
+    control_z_kernel<<<dim3(cols, a.jobs), kThreads, 0, stream>>>(a, partial, zs);
+    check_launch();
+    if (cols > 8) {
+        control_apply_wide_kernel<<<dim3((cols + kWideTile - 1) / kWideTile, (h + kWideTile - 1) / kWideTile, a.jobs), kThreads, 0, stream>>>(a, zs);
+    } else {
+        control_apply_kernel<<<dim3(cols, (h + kApplyRows - 1) / kApplyRows, a.jobs), kThreads, 0, stream>>>(a, zs);
+    }
     check_launch();
 }
 

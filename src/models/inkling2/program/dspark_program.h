@@ -29,6 +29,7 @@ public:
     // drafts can change, never the verified output.
     DSparkProgram(const Model& model, std::int32_t max_context, std::int32_t max_chunk, cudaStream_t stream,
                   const ops::Q8Weight* head_q8 = nullptr, bool kv_fp16 = false);
+    [[nodiscard]] std::int32_t max_chunk() const noexcept { return max_chunk_; }
     DSparkProgram(const DSparkProgram&)            = delete;
     DSparkProgram& operator=(const DSparkProgram&) = delete;
 

@@ -17,6 +17,7 @@
 #include "ninfer/ops/moe_situ.h"
 #include "ninfer/ops/projection_fp32.h"
 #include "ninfer/ops/relative_bias_attention.h"
+#include "ninfer/ops/tensor_core_fp32.h"
 #include "ninfer/ops/short_conv.h"
 
 #include "core/arena.h"
@@ -430,7 +431,7 @@ void test_batches() {
 // Only positions from check_from on are compared (the FP64 oracle is quadratic in n).
 // With split the calls get a split workspace (calls of at most kSplitMaxColumns columns split their keys).
 void test_attention(int window, int extent, int n, int chunk, const std::string& label, bool device_start = false,
-                    int check_from = 0, bool split = false) {
+                    int check_from = 0, bool split = false, bool tiled = false) {
     const int heads = 24, kvh = 8, d = 128, rel = 16, qw = heads * d, kvw = kvh * d;
     auto q = randoms(qw * n, -0.3F, 0.3F), r = randoms(heads * rel * n), sink = randoms(heads * n, -2, 2), k = randoms(kvw * n),
          v = randoms(kvw * n), table = randoms(extent * rel, -0.5, 0.5);
@@ -464,7 +465,7 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
                                                   &kn, &vn,
                                                   dt.tensor({rel, extent}), tkc, tvc, device_start ? 0 : s,
                                                   device_start ? static_cast<const std::int64_t*>(doff.p) : nullptr, nullptr, to,
-                                                  nullptr, ws_arg, counters_arg);
+                                                  nullptr, ws_arg, counters_arg, tiled);
         Tensor tg = Tensor(gated.p, DType::BF16, {qw, n}).slice(1, s, len);
         const Tensor gate = dg.tensor({qw, n}).slice(1, s, len);
         ninfer::ops::relative_bias_sink_attention({heads, kvh, d, rel, window}, dq.tensor({qw, n}).slice(1, s, len),
@@ -472,7 +473,7 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
                                                   &kn, &vn,
                                                   dt.tensor({rel, extent}), tkc2, tvc2, device_start ? 0 : s,
                                                   device_start ? static_cast<const std::int64_t*>(doff.p) : nullptr, &gate, tg,
-                                                  nullptr, ws_arg, counters_arg);
+                                                  nullptr, ws_arg, counters_arg, tiled);
     }
     if (split_bytes > 0) {
         std::vector<std::int32_t> left(std::size_t(ninfer::ops::kSplitMaxColumns) * heads);
@@ -651,6 +652,43 @@ void test_kv_fp16() {
                 want.insert(want.end(), o.begin(), o.end());
             }
             compare(std::string("attention over ") + name + " rings, 600 keys", out.get(qw * n), want, 2e-6);
+            {
+                // Wide calls on the tensor cores (FP16 Q and softmax weights, FP32 accumulation): chunks of 200 of
+                // every key, and a window of 100 (chunks of 150).
+                for (const int window : {0, 100}) {
+                    const int chunk = window == 0 ? 200 : 150;
+                    Buf out3(static_cast<std::size_t>(qw * n));
+                    for (int s0 = 0; s0 < n; s0 += chunk) {
+                        const int len = std::min(chunk, n - s0);
+                        Tensor to3 = out3.tensor({qw, n}).slice(1, s0, len);
+                        ninfer::ops::relative_bias_sink_attention({heads, kvh, d, rel, window}, dq.tensor({qw, n}).slice(1, s0, len),
+                                                                  dr.tensor({heads * rel, n}).slice(1, s0, len),
+                                                                  ds.tensor({heads, n}).slice(1, s0, len), nullptr, nullptr,
+                                                                  dt.tensor({rel, extent}), tk, tv, s0, nullptr, nullptr, to3, nullptr,
+                                                                  nullptr, nullptr, true);
+                    }
+                    Vec want3 = want;
+                    if (window > 0) {
+                        want3.clear();
+                        for (int p = 0; p < n; ++p) {
+                            std::vector<bool> visible(n);
+                            Vec bias(static_cast<std::size_t>(heads) * n, 0.0);
+                            for (int j = 0; j < n; ++j) {
+                                visible[j] = j <= p && p - j < window;
+                                for (int hh = 0; hh < heads; ++hh) {
+                                    const Vec rr(r.begin() + (p * heads + hh) * rel, r.begin() + (p * heads + hh + 1) * rel);
+                                    bias[hh * n + j] = ref::relative_bias(rr.data(), table64, rel, p - j);
+                                }
+                            }
+                            const Vec o = ref::attention(Vec(q.begin() + p * qw, q.begin() + (p + 1) * qw), kd64, vd64, bias,
+                                                         Vec(sink.begin() + p * heads, sink.begin() + (p + 1) * heads), visible, heads, kvh, d);
+                            want3.insert(want3.end(), o.begin(), o.end());
+                        }
+                    }
+                    compare(std::string("tensor-core attention over FP16 rings, 600 keys, window ") + std::to_string(window), out3.get(qw * n),
+                            want3, 3e-3);
+                }
+            }
             {
                 const ninfer::ops::RelativeBiasAttentionShape shape{heads, kvh, d, rel, 0};
                 const std::size_t split_bytes = ninfer::ops::relative_bias_attention_split_bytes(shape, tail, n);
@@ -1033,6 +1071,18 @@ void test_experts(bool nvfp4, int h, int inter, int experts, const std::string& 
         got_scaled[i] = static_cast<float>(got[i] / scale);
     }
     compare(label, got_scaled, scaled, 1e-5);
+    if (nvfp4 ? h % 128 == 0 && inter % 64 == 0 : h % 8 == 0 && inter % 8 == 0) {
+        // The tensor-core route (FP16 inputs and activations, FP32 accumulation) against the same oracle.
+        ninfer::DeviceArena tc_arena(ninfer::ops::moe_situ_experts_tc_workspace_bytes(bank, entries) + 4096);
+        Buf tc_out(static_cast<std::size_t>(h) * cols);
+        Tensor ttc = tc_out.tensor({h, cols});
+        ninfer::ops::moe_situ_experts_tc(bank, dz.tensor({h, cols}), Tensor(did.p, DType::I32, {k, cols}), &tw, 4.0F, 25.0F, tc_arena, ttc,
+                                         nullptr);
+        const std::vector<float> tc_got = tc_out.get(h * cols);
+        std::vector<float> tc_scaled(tc_got.size());
+        for (std::size_t i = 0; i < tc_got.size(); ++i) { tc_scaled[i] = static_cast<float>(tc_got[i] / scale); }
+        compare(label + " (tensor cores)", tc_scaled, scaled, 3e-3);
+    }
     if (cols > 2) {
         bool same = true;
         for (int c = 0; c < cols; ++c) {
@@ -1167,6 +1217,96 @@ void bench_projection() {
 
 // More columns than a grid's y holds (70000 > 65535): every column is the same, so each must give the first
 // column's bits, and the first must meet the oracle.
+// Wide calls (the column-tiled route scores and controller apply, the segmented convolution) against one call per
+// column: the same bits.
+void test_wide_bits() {
+    const auto same_bits = [](const std::vector<float>& a, const std::vector<float>& b) {
+        return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+    };
+    const int cols = 203;
+    {
+        const int h = 2304, e = 128, k = 8;
+        auto x = randoms(h * cols, -2, 2), gain = randoms(h, 0.5F, 1.5F), router = randoms(e * h, -0.05F, 0.05F), bias = randoms(e, -0.01F, 0.01F);
+        Buf dx(x), dg(gain), dr(router), db(bias);
+        for (const bool with_norm : {false, true}) {
+            Buf ids(static_cast<std::size_t>(k) * cols), w(static_cast<std::size_t>(k) * cols), z(static_cast<std::size_t>(h) * cols);
+            Buf ids1(static_cast<std::size_t>(k) * cols), w1(static_cast<std::size_t>(k) * cols), z1(static_cast<std::size_t>(h) * cols);
+            ninfer::DeviceArena arena(ninfer::ops::moe_route_sigmoid_topk_workspace_bytes(e, cols) + 4096);
+            const Tensor tg = dg.tensor({h});
+            Tensor tz = z.tensor({h, cols});
+            ninfer::ops::RouteInputNorm norm{&tg, 1e-6F, &tz};
+            Tensor tid = ids.tensor({k, cols}, DType::I32), tw = w.tensor({k, cols});
+            ninfer::ops::moe_route_sigmoid_topk(dx.tensor({h, cols}), with_norm ? &norm : nullptr, dr.tensor({h, e}), db.tensor({e}), k, 8.0F, arena,
+                                                tid, tw, nullptr);
+            for (int c = 0; c < cols; ++c) {
+                Tensor tz1 = z1.tensor({h, cols}).slice(1, c, 1);
+                ninfer::ops::RouteInputNorm norm1{&tg, 1e-6F, &tz1};
+                Tensor tid1 = ids1.tensor({k, cols}, DType::I32).slice(1, c, 1), tw1 = w1.tensor({k, cols}).slice(1, c, 1);
+                ninfer::ops::moe_route_sigmoid_topk(dx.tensor({h, cols}).slice(1, c, 1), with_norm ? &norm1 : nullptr, dr.tensor({h, e}),
+                                                    db.tensor({e}), k, 8.0F, arena, tid1, tw1, nullptr);
+            }
+            bool ok = same_bits(ids.get(static_cast<std::size_t>(k) * cols), ids1.get(static_cast<std::size_t>(k) * cols)) &&
+                      same_bits(w.get(static_cast<std::size_t>(k) * cols), w1.get(static_cast<std::size_t>(k) * cols));
+            if (with_norm) { ok = ok && same_bits(z.get(static_cast<std::size_t>(h) * cols), z1.get(static_cast<std::size_t>(h) * cols)); }
+            check(ok, std::string("moe_route_sigmoid_topk") + (with_norm ? " with the norm" : "") + ": the wide call differs from per-column calls");
+        }
+    }
+    {
+        const int h = 2304, rank = 64;
+        auto c = randoms(h * cols), m = randoms(h * cols), down = randoms(rank * 2 * h, -0.02F, 0.02F), gain = randoms(h * rank, -0.1F, 0.1F),
+             forget = randoms(h * rank, -0.1F, 0.1F);
+        t::round_to_bf16(down), t::round_to_bf16(gain), t::round_to_bf16(forget);
+        Buf dc(c), dm(m), out(static_cast<std::size_t>(h) * cols), out1(static_cast<std::size_t>(h) * cols);
+        auto wd = t::to_device_bf16(down), wg = t::to_device_bf16(gain), wf = t::to_device_bf16(forget);
+        const Tensor tdown(wd.p, DType::BF16, {2 * h, rank}), tgain(wg.p, DType::BF16, {rank, h}), tforget(wf.p, DType::BF16, {rank, h});
+        ninfer::DeviceArena arena(ninfer::ops::loop_controller_workspace_bytes(h, rank, cols, 1));
+        {
+            const Tensor tc = dc.tensor({h, cols}), tm = dm.tensor({h, cols});
+            Tensor to = out.tensor({h, cols});
+            const ninfer::ops::LoopControllerJob job{&tc, &tm, &tdown, &tgain, &tforget, &to};
+            ninfer::ops::loop_controller_fp32(std::span(&job, 1), 1e-6F, arena, nullptr);
+        }
+        for (int i = 0; i < cols; ++i) {
+            const Tensor tc = dc.tensor({h, cols}).slice(1, i, 1), tm = dm.tensor({h, cols}).slice(1, i, 1);
+            Tensor to = out1.tensor({h, cols}).slice(1, i, 1);
+            const ninfer::ops::LoopControllerJob job{&tc, &tm, &tdown, &tgain, &tforget, &to};
+            ninfer::ops::loop_controller_fp32(std::span(&job, 1), 1e-6F, arena, nullptr);
+        }
+        check(same_bits(out.get(static_cast<std::size_t>(h) * cols), out1.get(static_cast<std::size_t>(h) * cols)),
+              "loop_controller_fp32: the wide call differs from per-column calls");
+    }
+    {
+        const int channels = 2304, k = 4, top_k = 8;
+        auto x = randoms(channels * cols), taps = randoms(channels * k, -0.5F, 0.5F), hist0 = randoms(channels * (k - 1)),
+             entries = randoms(channels * top_k * cols), weights = randoms(top_k * cols, 0, 0.3F), residual = randoms(channels * cols);
+        Buf dx(x), dt(taps), de(entries), dw(weights), dres(residual);
+        for (const bool combine : {false, true}) {
+            Buf h_wide(hist0), h_col(hist0), sum(static_cast<std::size_t>(channels) * cols), sum1(static_cast<std::size_t>(channels) * cols),
+                xc(static_cast<std::size_t>(channels) * cols), xc1(static_cast<std::size_t>(channels) * cols);
+            const auto run = [&](int s, int len, Buf& hist, Buf& out_sum, Buf& out_x) {
+                Tensor th = hist.tensor({channels, k - 1}), tsum = out_sum.tensor({channels, cols}).slice(1, s, len);
+                const Tensor tx = dx.tensor({channels, cols}).slice(1, s, len), tres = dres.tensor({channels, cols}).slice(1, s, len);
+                const Tensor te(static_cast<float*>(de.b.p) + static_cast<std::size_t>(s) * top_k * channels, DType::FP32, {channels, top_k * len});
+                const Tensor tw(static_cast<float*>(dw.b.p) + static_cast<std::size_t>(s) * top_k, DType::FP32, {top_k, len});
+                Tensor txc = out_x.tensor({channels, cols}).slice(1, s, len);
+                const ninfer::ops::ConvCombine cb{&te, &tw, &txc};
+                ninfer::ops::ShortConvJob job;
+                if (combine) { job.combine = &cb; } else { job.x = &tx; }
+                const Tensor taps_t = dt.tensor({k, channels});
+                job.taps = &taps_t, job.history = &th, job.residual = &tres, job.sum = &tsum;
+                ninfer::ops::short_conv_fp32_batch(std::span(&job, 1), 0, nullptr);
+            };
+            run(0, cols, h_wide, sum, xc);
+            for (int i = 0; i < cols; ++i) { run(i, 1, h_col, sum1, xc1); }
+            bool ok = same_bits(sum.get(static_cast<std::size_t>(channels) * cols), sum1.get(static_cast<std::size_t>(channels) * cols)) &&
+                      same_bits(h_wide.get(static_cast<std::size_t>(channels) * (k - 1)), h_col.get(static_cast<std::size_t>(channels) * (k - 1)));
+            if (combine) { ok = ok && same_bits(xc.get(static_cast<std::size_t>(channels) * cols), xc1.get(static_cast<std::size_t>(channels) * cols)); }
+            check(ok, std::string("short_conv_fp32") + (combine ? " with the combine" : "") + ": the wide call (or its history) differs from per-column calls");
+        }
+    }
+    std::printf("wide route, controller and convolution calls: the bits of one call per column\n");
+}
+
 void test_many_columns() {
     const int h = 64, cols = 70000, e = 16, k = 2;
     const auto col0 = randoms(h, -1, 1), col1 = randoms(h, -2, 2), q = randoms(h, -0.3F, 0.3F);
@@ -1237,6 +1377,7 @@ int main() {
     try {
         test_workspace_queries();
         test_many_columns();
+        test_wide_bits();
         test_rows();
         test_mix_and_control();
         test_short_conv(false);
@@ -1255,6 +1396,10 @@ int main() {
         test_attention(0, 1024, 1300, 4, "attention global split, chunks of 4 (last 4)", false, 1296, true);
         test_attention(0, 1024, 1300, 1, "attention global split, decode, device start (last 4)", true, 1296, true);
         test_attention(1024, 1024, 1300, 4, "attention local window 1024 split, ring wraps (last 4)", false, 1296, true);
+        test_attention(0, 1024, 1300, 260, "attention global tiled, chunks of 260 (last 40)", false, 1260, false, true);
+        test_attention(0, 64, 1300, 100, "attention global tiled, extent 64, chunks of 100 (last 40)", false, 1260, false, true);
+        test_attention(1024, 1024, 2100, 300, "attention local window 1024 tiled, ring wraps (last 40)", false, 2060, false, true);
+        test_attention(4, 4, 40, 19, "attention local window 4 tiled, partial tiles", false, 0, false, true);
         test_attention(0, 64, 200, 1, "attention global, 200 keys with the split workspace: the single block (last 8)", true, 192, true);
         test_head_norm_append();
         test_kv_fp16();

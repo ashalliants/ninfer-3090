@@ -78,7 +78,7 @@ inline constexpr int kLoopControllerMaxRank = 64;
  *   (inkling2_reference.h control) over the BF16 weights.
  *
  * Effects: writes out, which may equal its job's c or m but no other job's operands.
- * Workspace: loop_controller_workspace_bytes(H, R, T, jobs). Execution: two launches; graph capturable.
+ * Workspace: loop_controller_workspace_bytes(H, R, T, jobs). Execution: three launches; graph capturable.
  */
 [[nodiscard]] std::size_t loop_controller_workspace_bytes(int hidden, int rank, int cols, int jobs);
 void loop_controller_fp32(std::span<const LoopControllerJob> jobs, float eps, DeviceArena& workspace, cudaStream_t stream);
