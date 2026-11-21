@@ -115,6 +115,36 @@ void dspark_markov_update_fp32(const Tensor& joint, Tensor& state, Tensor& laten
 void dspark_markov_logits_fp32(const Tensor& base, const Tensor& hb, const Tensor& pt, const Tensor& latent, float cap,
                                Tensor& logits, cudaStream_t stream);
 
+/// P = W_head W_o stored compactly for the drafter. Lossy (P's values change, so drafts may), never the target's
+/// output. Codes are laid out by r: element (v, r) at r * V + v.
+/// - BF16: codes bf16 [R, V];
+/// - Q8: int8 codes [R, V] and an FP32 scale per v and 32 r: scales [R / 32, V], P = scale * code (d = amax / 127);
+/// - Q4: 4-bit codes, 8 v per 32-bit word (word r * V / 8 + v / 8, nibble v % 8, stored code + 8) and scales as Q8,
+///   P = scale * code with code in [-7, 7] (d = amax / 7).
+enum class MarkovForm : std::uint8_t { BF16, Q8, Q4 };
+struct MarkovHead {
+    MarkovForm form    = MarkovForm::BF16;
+    const void* codes  = nullptr;
+    const float* scales = nullptr; // Q8 and Q4
+    std::int32_t v = 0, r = 0;
+};
+
+/// The bytes of a MarkovHead's codes and scales for V (a multiple of 8) and R (a multiple of 32).
+[[nodiscard]] std::size_t markov_head_code_bytes(MarkovForm form, std::int32_t v, std::int32_t r) noexcept;
+[[nodiscard]] std::size_t markov_head_scale_bytes(MarkovForm form, std::int32_t v, std::int32_t r) noexcept;
+
+/**
+ * Op: dspark_markov_quantize: P FP32 [V, R] (as dspark_markov_logits_fp32 takes it) to `head`'s form, rounding to
+ * nearest (BF16: even). head.codes and head.scales are the outputs (device memory of the sizes above).
+ */
+void dspark_markov_quantize(const Tensor& pt, const MarkovHead& head, cudaStream_t stream);
+
+/**
+ * Op: dspark_markov_logits: dspark_markov_logits_fp32 with P decoded from `head` (FP32 sums).
+ */
+void dspark_markov_logits(const Tensor& base, const Tensor& hb, const MarkovHead& head, const Tensor& latent, float cap, Tensor& logits,
+                          cudaStream_t stream);
+
 /**
  * Op: argmax_fp32: out[t] = the lowest v < valid_rows with logits[v, t] maximal (NaN never wins over a number), or
  * `non_finite` when that maximum is not finite (every value NaN, or the maximum infinite): a diverged forward, which

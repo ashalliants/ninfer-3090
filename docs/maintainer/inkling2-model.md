@@ -261,7 +261,7 @@ The DSpark drafter runs greedy speculative decoding (see "DSpark drafter").
 |---|---|---|
 | Config, binding | `config.{h,cpp}`, `model.h`, `load.cpp` | `inkling2_text` config, every parameter by name, all device resident (22.9 GB, 8.6 s on the V100) |
 | Program | `program/text_program.{h,cpp}` | `TextProgram::forward(tokens)`: the visit order, loop restarts and messages of "Forward, in order", any chunk size up to `max_chunk` (256), positions up to `max_context` (8192); optional per-visit trace hook with llama.cpp's names; optional taps (`tap_visits`) and `keep(n)`, which cuts a forward of up to `max_rollback` tokens back to its first n |
-| Drafter | `program/dspark_program.{h,cpp}`, `ops/dspark_fp32.h` | `DSparkProgram::extend(taps, n)` writes the context K/V of committed positions; `draft(anchor)` runs the block and the Markov chain (W_head W_o precomputed in FP32 at start, 0.14 s) |
+| Drafter | `program/dspark_program.{h,cpp}`, `ops/dspark_fp32.h` | `DSparkProgram::extend(taps, n)` writes the context K/V of committed positions; `draft(anchor)` runs the block and the Markov chain (W_head W_o precomputed at start and stored as Q8; see "Compact drafter") |
 | Dense projections | `ops/projection_fp32.h` | BF16 activations x BF16 weights, FP32 out; the head too |
 | Element-wise and norms | `ops/fp32_rows.h` | FP32 RMSNorm (weighted or unit), add, sigmoid gate, tanh softcap, BF16 embedding gather |
 | MIX, CTRL | `ops/depth_attention.h` | depth attention over at most 8 sources and 4 queries; the controller's combine `(1 - tanh f) c + tanh(g) m` (D, G, F are `projection_fp32`) |
@@ -325,6 +325,39 @@ accepts about one draft. Verifying 8 tokens costs about 3 decode steps (43 ms), 
 Drafting fewer (`DSparkProgram::draft(anchor, n)`, llama.cpp PR #394's n_max) and the split Q8_0 projections
 bring a round of n=2 to 4.4 ms drafting and 20.4 ms verifying (T=3), and the serving loop gates rounds on
 measured cost; see "Serving".
+
+**Compact drafter (2026-11-21).** The drafter changes only which tokens are proposed; verify runs the exact
+target, so greedy output is identical whatever the drafter computes. It therefore reads its per-round weights in
+compact, lossy forms:
+
+- `P = W_head W_o` as Q8 (int8 codes with an FP32 scale per vocabulary row and 32 of R: 58 MB instead of 206 MB of
+  FP32 per Markov step; `ops::dspark_markov_quantize`, `ops::dspark_markov_logits`, which also take BF16 and Q4);
+- the base logits through a Q8 copy of the text head (`ops::quantize_q8_g32` at start, 492 MB of VRAM; 926 MB of BF16
+  read per round becomes 492 MB);
+- the block's projections with K up to 3072 (all but the MLP's down) as BF16 activations into
+  `ops::projection_q8_fp32` over the artifact's Q8_0 values, and the joint (BF16) through `ops::projection_fp32`.
+
+Measured (`ninfer_inkling2_dspark_test`, 3 drafts, 128 tokens on the four golden prompts; V100):
+
+| Drafter | draft ms a round | drafts accepted a round (p0 / p1 / p2 / p3) | speculative tok/s |
+|---|---|---|---|
+| FP32 P, BF16 head, split Q8_0 kernels | 4.82 | 1.11 / 2.53 / 1.15 / 0.12 | 70.1 |
+| joint through projection_fp32 | 4.63 | same | 70.5 |
+| P as BF16 / Q8 / Q4 | 4.41 / 4.33 / 4.38 | same (Q4: p3 0.13) | 71.1 / 71.3 / 71.5 |
+| Q8 head copy | 4.55 | same | 70.8 |
+| block projections through projection_q8_fp32 | 4.61 | same | 70.9 |
+| **all (default): Q8 P, Q8 head, BF16 joint, Q8 block** | **3.64** | **same** | **73.1** |
+| all, and the block truncated to the n + 1 positions drafted | 3.12 | 1.08 / 2.34 / 1.15 / 0.11 | 73.8 |
+
+Serving (`ninfer-serve --spec dspark`, 12 greedy chat requests of up to 300 tokens, ABBA, `predicted_per_second`;
+before = the exact drafter): 79.7 against 82.8 tok/s (+3.9%), 50.7% and 49.9% of drafts accepted, and the same text
+on every request. A serve run's acceptance moves by a point or two from run to run on the same binary, and so does a
+single request's, by up to a third. Over the same 12 requests, each form alone
+(BF16 joint, Q8 or Q4 P, Q8 head, Q8 block) accepted 45.2-45.9% against 44.6% and 46.5% for two runs of the exact
+drafter.
+
+Q4 P is no faster than Q8 (the kernel is no longer bound by its bytes). Truncating the block is not used: it changes
+the drafts' attention context and costs acceptance (p1, code, drops 7%).
 
 ninfer's DFlash ([dflash.md](dflash.md)) already has the masked-block, non-causal, context-K/V shape
 with separate context roles. What is new: per-layer softmax tap fusion instead of one feature
