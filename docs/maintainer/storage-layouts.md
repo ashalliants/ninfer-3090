@@ -409,6 +409,9 @@ part is a multiple of 256 bytes and `record_stride` in bytes is:
 (`ggml_rec_iq1_m_iq1_m` through `ggml_rec_iq2_xs_iq2_xs`; the table lists the eight that are registered, a
 blank is not registered.) The expert kernels do not run these downs yet; an artifact can hold them.
 
+`ggml_rec_nvfp4_nvfp4` at Inkling-2-Mini's `[128, 2304, 1152]`: a gate or up row is 36 blocks (1,296 B) and a
+down row 18 blocks (648 B), so each part is 1,492,992 B and `record_stride` is 4,478,976 B.
+
 ## 8. `raw_bytes_v1`
 
 `raw_bytes_v1` is a resource encoding, not a tensor layout. Its enclosing object payload is

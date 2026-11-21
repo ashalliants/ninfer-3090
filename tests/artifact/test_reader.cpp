@@ -138,7 +138,7 @@ void ggml_geometry() {
     constexpr std::array names = {"ggml_q8_0",   "ggml_q6_k",   "ggml_iq2_xxs", "ggml_iq4_nl",
                                   "ggml_iq3_s",  "ggml_iq2_s",  "ggml_iq4_xs",  "ggml_iq1_m",
                                   "ggml_q2_0",   "ggml_iq2_xs", "ggml_iq3_xxs", "ggml_q4_k",
-                                  "ggml_q5_k"};
+                                  "ggml_q5_k",   "ggml_nvfp4"};
     for (const auto* name : names) {
         const auto format = parse_format(name);
         require(is_ggml_block(format) && !is_ggml_record(format) && format_name(format) == name,
@@ -231,6 +231,9 @@ void ggml_geometry() {
                    QType::GGML_IQ4_NL, 704000, 2329600},
         RecordCase{"ggml_rec_iq4_xs_iq4_nl", QType::GGML_REC_IQ4_XS_IQ4_NL, QType::GGML_IQ4_XS,
                    QType::GGML_IQ4_NL, 870400, 2662400},
+        // Inkling-2-Mini's NVFP4 experts: 36 B per 64 values in every part.
+        RecordCase{"ggml_rec_nvfp4_nvfp4", QType::GGML_REC_NVFP4_NVFP4, QType::GGML_NVFP4,
+                   QType::GGML_NVFP4, 921600, 2764800},
     };
     require(parse_layout("ggml_expert_record_v1") == QuantLayout::GgmlExpertRecord &&
                 layout_name(QuantLayout::GgmlExpertRecord) == "ggml_expert_record_v1",

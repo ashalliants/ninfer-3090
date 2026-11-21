@@ -378,6 +378,9 @@ def name_map(tensors: Mapping[str, "TensorLike"], config: Mapping) -> list[Tenso
             shape = (e, 2 * inter, h) if part == "gate_up" else (e, h, inter)
             take(prefix + suffix, expert_bank(layer), shape, part)
         for suffix in sorted(scales):
+            if tensors[prefix + suffix].type != "F32":
+                raise Inkling2Error(f"{prefix + suffix}: type {tensors[prefix + suffix].type}, expected F32 "
+                                    "(the per-expert multiplier is stored as fp32 words)")
             take(prefix + suffix, expert_bank(layer), (e,), _EXPERT_SCALES[suffix], scale=True)
 
     stray = sorted(n for n in tensors if n not in seen)

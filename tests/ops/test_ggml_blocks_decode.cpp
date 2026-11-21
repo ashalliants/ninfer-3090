@@ -45,7 +45,7 @@ constexpr std::array kFormats = {
     std::pair{QType::GGML_IQ4_XS, "ggml_iq4_xs"},   std::pair{QType::GGML_IQ1_M, "ggml_iq1_m"},
     std::pair{QType::GGML_Q2_0, "ggml_q2_0"},       std::pair{QType::GGML_IQ2_XS, "ggml_iq2_xs"},
     std::pair{QType::GGML_IQ3_XXS, "ggml_iq3_xxs"}, std::pair{QType::GGML_Q4_K, "ggml_q4_k"},
-    std::pair{QType::GGML_Q5_K, "ggml_q5_k"},
+    std::pair{QType::GGML_Q5_K, "ggml_q5_k"},       std::pair{QType::GGML_NVFP4, "ggml_nvfp4"},
 };
 
 // Returns the fixture's blocks after checking every decoded bit pattern.
@@ -73,7 +73,9 @@ std::vector<std::byte> golden(QType format, const char* name) {
         }
         nan += (want & 0x7F800000U) == 0x7F800000U && (want & 0x7FFFFFU);
     }
-    require(nan > 0, std::string(name) + ": fixture no longer reaches NaN outputs");
+    // Binary16 scales reach NaN; NVFP4's UE4M3 scales are finite by construction (ggml decodes 0x7F as 0).
+    require(nan > 0 || format == QType::GGML_NVFP4, std::string(name) + ": fixture no longer reaches NaN outputs");
+    require(nan == 0 || format != QType::GGML_NVFP4, std::string(name) + ": an NVFP4 value decoded to NaN");
     std::cout << name << ": " << count << " blocks, " << decoded.size()
               << " values bit-exact (" << nan << " NaN)\n";
     return blocks;
@@ -159,7 +161,8 @@ int run() {
           QType::GGML_REC_IQ3_XXS_IQ4_NL, QType::GGML_REC_IQ3_S_Q2_0, QType::GGML_REC_IQ3_S_IQ4_NL,
           QType::GGML_REC_IQ4_XS_IQ4_NL, QType::GGML_REC_IQ1_M_IQ1_M, QType::GGML_REC_IQ2_XXS_IQ1_M,
           QType::GGML_REC_IQ2_XXS_IQ2_XXS, QType::GGML_REC_IQ2_XS_IQ1_M, QType::GGML_REC_IQ2_XXS_IQ2_XS,
-          QType::GGML_REC_IQ1_M_IQ2_XXS, QType::GGML_REC_IQ2_XS_IQ2_XXS, QType::GGML_REC_IQ2_XS_IQ2_XS}) {
+          QType::GGML_REC_IQ1_M_IQ2_XXS, QType::GGML_REC_IQ2_XS_IQ2_XXS, QType::GGML_REC_IQ2_XS_IQ2_XS,
+          QType::GGML_REC_NVFP4_NVFP4}) {
         const auto parts = ggml_record_parts(record);
         require(of(QType::GGML_Q2_0).size() >= 256 * ggml_block(QType::GGML_Q2_0).bytes,
                 "the Q2_0 fixture has fewer than 256 blocks");

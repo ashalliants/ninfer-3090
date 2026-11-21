@@ -65,6 +65,10 @@ enum class QType : std::uint16_t {
     GGML_REC_IQ1_M_IQ2_XXS = 41,
     GGML_REC_IQ2_XS_IQ2_XXS = 42,
     GGML_REC_IQ2_XS_IQ2_XS = 43,
+    // ggml's NVFP4 (type 40): four UE4M3 scales per 64 values, then E2M1 nibbles. Not NVFP4 above, which has
+    // another layout and a per-tensor divisor. Inkling-2-Mini's experts (docs/maintainer/inkling2-model.md).
+    GGML_NVFP4           = 44,
+    GGML_REC_NVFP4_NVFP4 = 45,
 };
 
 // One GGML block: `values` consecutive K values encoded in `bytes` bytes, scales included.
@@ -102,6 +106,8 @@ struct GgmlBlock {
         return {256, 144};
     case QType::GGML_Q5_K:
         return {256, 176};
+    case QType::GGML_NVFP4:
+        return {64, 36};
     default:
         return {};
     }
@@ -148,6 +154,8 @@ struct GgmlRecordParts {
         return {QType::GGML_IQ4_XS, QType::GGML_IQ4_NL};
     case QType::GGML_REC_IQ1_M_IQ1_M:
         return {QType::GGML_IQ1_M, QType::GGML_IQ1_M};
+    case QType::GGML_REC_NVFP4_NVFP4:
+        return {QType::GGML_NVFP4, QType::GGML_NVFP4};
     case QType::GGML_REC_IQ2_XXS_IQ1_M:
         return {QType::GGML_IQ2_XXS, QType::GGML_IQ1_M};
     case QType::GGML_REC_IQ2_XXS_IQ2_XXS:

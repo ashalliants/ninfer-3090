@@ -57,6 +57,7 @@ The GGML block formats store blocks of ggml's quantization types unchanged (Sect
 | `ggml_iq4_xs` | `IQ4_XS` (23) | 256 | 136 | 4.25 |
 | `ggml_iq1_m` | `IQ1_M` (29) | 256 | 56 | 1.75 |
 | `ggml_q2_0` | `Q2_0` (42) | 64 | 18 | 2.25 |
+| `ggml_nvfp4` | `NVFP4` (40) | 64 | 36 | 4.5 |
 
 The GGML expert record formats store one routed expert as one record of GGML blocks in two block
 formats (Section 3.6):
@@ -84,12 +85,15 @@ formats (Section 3.6):
 | `ggml_rec_iq1_m_iq2_xxs` | `ggml_iq1_m` | `ggml_iq2_xxs` |
 | `ggml_rec_iq2_xs_iq2_xxs` | `ggml_iq2_xs` | `ggml_iq2_xxs` |
 | `ggml_rec_iq2_xs_iq2_xs` | `ggml_iq2_xs` | `ggml_iq2_xs` |
+| `ggml_rec_nvfp4_nvfp4` | `ggml_nvfp4` | `ggml_nvfp4` |
 
 `ggml_rec_q2_0_q2_0` holds the Qwen3.8-Flash-Next MTP drafter's experts (Strata's
 `mtp-q2_0.gguf`, whose fused `gate_up_proj` the converter splits into each record's gate and up
 rows). The last eight pairs are the ones ISTA-DASLab's GSQ-RCO V4.1-Flash IQ2_XXS build picks per layer;
 their down rows are K-quant blocks, so the intermediate size must be a multiple of 256 (V4.1-Flash's is 2,304).
-The expert kernels do not run them yet.
+The expert kernels do not run them yet. `ggml_rec_nvfp4_nvfp4` holds Inkling-2-Mini's experts of
+layers 0-19 ([inkling2-model.md](inkling2-model.md)); each expert's gate/up and down products also have an
+FP32 multiplier, which the converter stores as separate tensors beside the bank. No kernel consumes it yet.
 
 The C++ registry accepts the GGML block and expert record formats and materializes them to Device,
 Host or Pinned memory unchanged. Linear and LinearAdd consume `ggml_iq4_xs`, `ggml_iq3_s`, `ggml_q6_k`,
@@ -392,6 +396,15 @@ reference build does for NaN.
 `ggml_q2_0` is the newest of these types: one binary16 `d` followed by 16 bytes of 2-bit codes per
 64 values. Value `j` uses code `q = (qs[j / 4] >> (2 * (j % 4))) & 3`, least significant pair
 first, and reconstructs as `binary32((q - 1) * d)`, so the codes mean −1, 0, +1 and +2.
+
+`ggml_nvfp4` is ggml's NVFP4: `{u8 d[4]; u8 qs[32]}` per 64 values, four sub-blocks of 16. Sub-block
+`s` has the scale `ggml_ue4m3_to_fp32(d[s])`, which is 0 for the bytes 0x00 and 0x7F and otherwise
+bits 6..0 read as E4M3 and halved, the sign bit ignored (so 0xFF is 240; the scale is never infinite
+or NaN). Value `j < 8` of sub-block `s` is `kvalues_mxfp4[qs[8 s + j] & 0xF]` times the scale, value
+`j + 8` uses the high nibble; `kvalues_mxfp4` is `{0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8,
+-12}`, twice E2M1. One FP32 product per value, as `dequantize_row_nvfp4`; the golden fixture comes from
+that function in unslothai/llama.cpp 8aa2f23f, since b11316 predates the type. It is not the native
+`nvfp4` format, which has another layout and a per-tensor divisor.
 
 `ggml_q4_k` and `ggml_q5_k` are the affine K-quants, the only formats here with an offset. A block
 is `{fp16 d; fp16 dmin; u8 scales[12]; ...}` over eight sub-blocks of 32 values; `get_scale_min_k4`
