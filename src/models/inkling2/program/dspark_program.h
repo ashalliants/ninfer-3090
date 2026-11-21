@@ -2,7 +2,8 @@
 
 // Written for NInfer-3090. Inkling-2-Mini's DSpark drafter (docs/maintainer/inkling2-model.md, "DSpark drafter";
 // llama.cpp's src/models/dspark.cpp graph_inkling2 and common_speculative's draft-dspark): the context K/V of the
-// committed target positions, and one block draft from the anchor. FP32 throughout (include/ninfer/ops/dspark_fp32.h).
+// committed target positions, and one block draft from the anchor. FP32 state and sums; the weights it reads per
+// round in compact forms (Q8 P and head, BF16 activations into the projections), lossy for drafts only.
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -13,7 +14,6 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
-#include <optional>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -72,10 +72,15 @@ private:
     std::vector<Layer> layers_;
     Tensor masks_;      // FP32 [hidden, block]: column 0 unused, the rest the mask embedding
     Tensor joint_in_;   // FP32 [2R + 2H]: state, W1[prev], x_i, the context of the anchor (f_rnn)
-    Tensor pt_, hb_;    // FP32 [V, R] (ne[0] = V) = W_head W_o, and FP32 [V] = W_head b_o
-    std::optional<ops::Q8Weight> head_q8_; // the target's re-encoded head, or BF16 when unset
+    Tensor hb_;         // FP32 [V] = W_head b_o
     Tensor ids_;        // I32 [block]: the anchor, then the drafts
     std::int64_t position_ = 0;
+    // The drafter's compact forms (lossy; they change only drafts): P = W_head W_o as Q8, and the head as Q8 (the
+    // target's re-encoded head when it has one, else the drafter's own copy in head_memory_).
+    ops::MarkovHead markov_{};
+    DeviceBuffer markov_memory_;
+    DeviceBuffer head_memory_;
+    ops::Q8Weight head_q8_{};
     // The Q8_0 matrices in the split form (same values; a faster projection kernel), by their artifact address.
     DeviceBuffer split_memory_;
     std::unordered_map<const void*, ops::DenseMatrix> split_;
