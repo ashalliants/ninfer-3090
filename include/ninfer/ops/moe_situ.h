@@ -27,7 +27,8 @@ namespace ninfer::ops {
  * Supported domain: E at most 256, 1 <= top_k <= min(E, 16), T at most 65535.
  * Numeric: FP32 logits; oracle FP64 (inkling2_reference.h route). A near tie at the k-th place may select
  *   differently from the oracle; the test accepts that only within the FP32 bound of the two scores.
- * Workspace: moe_route_sigmoid_topk_workspace_bytes(E, T) from `workspace`, released on return.
+ * Workspace: moe_route_sigmoid_topk_workspace_bytes(E, T) from `workspace`, released on return; the query
+ *   throws std::invalid_argument outside the supported domain.
  * Execution: graph capturable.
  */
 [[nodiscard]] std::size_t moe_route_sigmoid_topk_workspace_bytes(std::int32_t experts, std::int64_t columns);

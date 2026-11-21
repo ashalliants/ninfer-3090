@@ -46,7 +46,10 @@ std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk) {
 
 // The limits, validated before anything is sized from them.
 ProgramLimits checked(ProgramLimits limits) {
-    if (limits.max_chunk < 1 || limits.max_context < limits.max_chunk) { throw std::invalid_argument("inkling2: invalid program limits"); }
+    // A chunk is one call of every Op; MIX and the route take at most 65535 columns (their grids' y).
+    if (limits.max_chunk < 1 || limits.max_chunk > 65535 || limits.max_context < limits.max_chunk) {
+        throw std::invalid_argument("inkling2: invalid program limits (max_chunk 1..65535, at most max_context)");
+    }
     return limits;
 }
 

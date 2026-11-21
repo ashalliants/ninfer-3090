@@ -450,6 +450,9 @@ std::size_t workspace_for(const SituExpertBank& bank, std::int64_t entries) {
 } // namespace
 
 std::size_t moe_route_sigmoid_topk_workspace_bytes(std::int32_t experts, std::int64_t columns) {
+    const char* op = "moe_route_sigmoid_topk";
+    require(experts > 0 && experts <= kMaxExperts, op, "E must be 1..256");
+    require(columns > 0 && columns <= 65535, op, "T must be 1..65535 (the scoring grid's y)");
     return align256(static_cast<std::uint64_t>(experts) * static_cast<std::uint64_t>(columns) * 4);
 }
 
@@ -461,7 +464,7 @@ void moe_route_sigmoid_topk(const Tensor& z, const Tensor& router, const Tensor&
     require(router.dtype == DType::FP32 && router.is_contiguous() && router.ne[0] == rows, op, "router must be contiguous FP32 [D, E]");
     const int experts = router.ne[1];
     require(experts > 0 && experts <= kMaxExperts, op, "E must be 1..256");
-    require(cols <= 65535, op, "T must be at most 65535 (the scoring grid's y)");
+    require(cols > 0 && cols <= 65535, op, "T must be 1..65535 (the scoring grid's y)");
     require(top_k >= 1 && top_k <= 16 && top_k <= experts, op, "top_k must be 1..min(E, 16)");
     require(bias.dtype == DType::FP32 && bias.is_contiguous() && bias.numel() == experts, op, "bias must be FP32 [E]");
     require(ids.dtype == DType::I32 && ids.is_contiguous() && ids.numel() == static_cast<std::int64_t>(top_k) * cols, op,

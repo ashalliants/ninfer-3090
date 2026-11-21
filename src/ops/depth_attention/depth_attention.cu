@@ -142,6 +142,8 @@ combine_kernel(const float* c, std::int64_t cs, const float* m, std::int64_t ms,
 } // namespace
 
 std::size_t depth_attention_mix_workspace_bytes(std::int32_t rows, std::int64_t columns, int sources) {
+    require(sources >= 1 && sources <= kDepthAttentionMaxSources, "1 to 8 sources");
+    require(rows > 0 && rows <= 8192 && columns > 0 && columns <= 65535, "D must be 1..8192 and T 1..65535");
     return partial_floats(rows, columns, sources) * sizeof(float) + 256; // + the arena's alignment
 }
 

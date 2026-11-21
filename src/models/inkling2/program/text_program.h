@@ -22,7 +22,7 @@ namespace ninfer::models::inkling2 {
 
 struct ProgramLimits {
     std::int32_t max_context = 8192; // positions a sequence may reach (sizes the global KV rings)
-    std::int32_t max_chunk   = 256;  // tokens per forward call
+    std::int32_t max_chunk   = 256;  // tokens per forward call, 1..65535
     // A single-token forward without a trace replays one CUDA graph, captured on the first such call (the
     // position and token are read on the device). Needs a stream other than the legacy default one.
     bool decode_graph = true;

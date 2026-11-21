@@ -38,7 +38,8 @@ inline constexpr int kDepthAttentionMaxQueries = 4;
  *   FP32 reductions, max-subtracted softmax; oracle FP64 (tests/ops/inkling2_reference.h mix).
  *
  * Effects: writes the outputs, which must not overlap a source or each other.
- * Workspace: depth_attention_mix_workspace_bytes(D, T, S) from `workspace`, released on return.
+ * Workspace: depth_attention_mix_workspace_bytes(D, T, S) from `workspace`, released on return; the query
+ *   throws std::invalid_argument outside the supported domain.
  * Execution: stream-ordered; graph capturable.
  */
 [[nodiscard]] std::size_t depth_attention_mix_workspace_bytes(std::int32_t rows, std::int64_t columns, int sources);
