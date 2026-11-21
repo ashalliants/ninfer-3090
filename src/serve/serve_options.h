@@ -70,6 +70,7 @@ struct ServeOptions {
     // Layers per stage, one count per entry of `devices`. Empty lets the engine choose.
     std::vector<std::uint32_t> stage_layers;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
+    DenseQ8 dense_q8                       = DenseQ8::Off; // --dense-q8 head|all (Inkling-2)
     SpeculativeOptions speculative;
     // --relaxed-drafting [P]: EngineOptions::relaxed_drafting (nullopt: off; bare: 0.5).
     std::optional<float> relaxed_drafting;

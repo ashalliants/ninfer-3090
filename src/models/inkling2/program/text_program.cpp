@@ -261,7 +261,18 @@ Tensor TextProgram::project(const Tensor& x, std::span<const WeightId> weights, 
         total += rows[i];
     }
     Tensor out = workspace_.alloc(DType::FP32, {total, cols});
-    ops::projection_fp32(x, std::span<const Tensor* const>(pointers.data(), weights.size()), out, stream_);
+    // A call runs over the re-encoding when every one of its weights has one (all or none, as the forms are made).
+    if (limits_.dense != nullptr && limits_.dense->find(views[0].data) != nullptr) {
+        std::array<ops::Q8Weight, 4> q8;
+        for (std::size_t i = 0; i < weights.size(); ++i) {
+            const ops::Q8Weight* found = limits_.dense->find(views[i].data);
+            if (found == nullptr) { throw std::logic_error("inkling2: a projection call mixes re-encoded and BF16 weights"); }
+            q8[i] = *found;
+        }
+        ops::projection_q8_fp32(x, std::span<const ops::Q8Weight>(q8.data(), weights.size()), out, stream_);
+    } else {
+        ops::projection_fp32(x, std::span<const Tensor* const>(pointers.data(), weights.size()), out, stream_);
+    }
     return out;
 }
 

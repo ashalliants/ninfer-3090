@@ -8,10 +8,12 @@
 #include "core/tensor.h"
 #include "models/inkling2/model.h"
 #include "ninfer/ops/dspark_fp32.h"
+#include "ninfer/ops/projection_fp32.h"
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -20,8 +22,12 @@ namespace ninfer::models::inkling2 {
 
 class DSparkProgram {
 public:
-    // max_context sizes the global layer's ring; max_chunk is the most positions one extend() takes.
-    DSparkProgram(const Model& model, std::int32_t max_context, std::int32_t max_chunk, cudaStream_t stream);
+    // max_context sizes the global layer's ring; max_chunk is the most positions one extend() takes. head_q8, when
+    // the target runs its head over an 8-bit re-encoding (DenseWeightsQ8::head, a view of the owner both Programs read), is
+    // read in place of the BF16 head so the drafts are proposed from the logits the target verifies them with; its
+    // owner must outlive the drafter.
+    DSparkProgram(const Model& model, std::int32_t max_context, std::int32_t max_chunk, cudaStream_t stream,
+                  const ops::Q8Weight* head_q8 = nullptr);
     DSparkProgram(const DSparkProgram&)            = delete;
     DSparkProgram& operator=(const DSparkProgram&) = delete;
 
@@ -67,6 +73,7 @@ private:
     Tensor masks_;      // FP32 [hidden, block]: column 0 unused, the rest the mask embedding
     Tensor joint_in_;   // FP32 [2R + 2H]: state, W1[prev], x_i, the context of the anchor (f_rnn)
     Tensor pt_, hb_;    // FP32 [V, R] (ne[0] = V) = W_head W_o, and FP32 [V] = W_head b_o
+    std::optional<ops::Q8Weight> head_q8_; // the target's re-encoded head, or BF16 when unset
     Tensor ids_;        // I32 [block]: the anchor, then the drafts
     std::int64_t position_ = 0;
     // The Q8_0 matrices in the split form (same values; a faster projection kernel), by their artifact address.

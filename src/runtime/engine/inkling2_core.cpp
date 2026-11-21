@@ -135,6 +135,9 @@ TokenId sample(std::vector<float>& logits, const ResolvedSamplingParameters& p,
 } // namespace
 
 struct Inkling2Core::Programs {
+    // --dense-q8: the re-encoded weights, owned here and read through views by the text Program and the drafter
+    // (declared first, so it outlives both).
+    std::unique_ptr<ink::DenseWeightsQ8> dense;
     ink::TextProgram text;
     std::unique_ptr<ink::VisionEncoder> vision;
     // --spec dspark: the drafter, and plain steps' taps held for its next extend (FP32 [hidden, kChunk] each).
@@ -147,7 +150,14 @@ struct Inkling2Core::Programs {
     ink::TextProgram::Snapshot snapshot;
     std::vector<std::uint64_t> snapshot_keys;
     ink::DSparkProgram::Snapshot draft_snapshot; // the drafter's, with --spec dspark
-    Programs(const ink::Model& model, ink::ProgramLimits limits, cudaStream_t stream) : text(model, std::move(limits), stream) {}
+    Programs(const ink::Model& model, std::unique_ptr<ink::DenseWeightsQ8> dense_q8, ink::ProgramLimits limits, cudaStream_t stream)
+        : dense(std::move(dense_q8)), text(model, with_dense(std::move(limits), dense.get()), stream) {}
+
+private:
+    static ink::ProgramLimits with_dense(ink::ProgramLimits limits, const ink::DenseWeightsQ8* dense) {
+        limits.dense = dense;
+        return limits;
+    }
 };
 
 struct Inkling2Core::Job {
@@ -273,9 +283,16 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
             limits.tap_visits   = dc->target_visits;
             limits.max_rollback = static_cast<std::int32_t>(dc->block_size);
         }
-        programs_ = std::make_unique<Programs>(*model_, limits, stream_);
+        std::unique_ptr<ink::DenseWeightsQ8> dense;
+        if (options_.dense_q8 != DenseQ8::Off) {
+            dense = std::make_unique<ink::DenseWeightsQ8>(*model_, options_.dense_q8 == DenseQ8::All ? ink::DenseForm::Q8All : ink::DenseForm::Q8Head,
+                                                   stream_);
+        }
+        programs_ = std::make_unique<Programs>(*model_, std::move(dense), limits, stream_);
         if (dspark) {
-            programs_->drafter = std::make_unique<ink::DSparkProgram>(*model_, static_cast<std::int32_t>(options_.max_context), kChunk, stream_);
+            // With --dense-q8 the drafter proposes from the target's re-encoded head, the one it verifies against.
+            programs_->drafter = std::make_unique<ink::DSparkProgram>(*model_, static_cast<std::int32_t>(options_.max_context), kChunk,
+                                                                      stream_, programs_->dense ? &programs_->dense->head() : nullptr);
             const std::int32_t hidden = static_cast<std::int32_t>(model_->config().hidden_size);
             for (std::size_t i = 0; i < limits.tap_visits.size(); ++i) {
                 programs_->held_memory.emplace_back(static_cast<std::size_t>(hidden) * kChunk * 4);
@@ -297,6 +314,7 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     load_.model_name          = "Inkling-2-Mini";
     load_.artifact_id         = artifact::artifact_id_hex(reader.artifact_id());
     load_.weight_formats      = {"bf16", "ggml_q8_0", "ggml_rec_nvfp4_nvfp4", "fp32"};
+    if (options_.dense_q8 != DenseQ8::Off) { load_.weight_formats.push_back("q8_g32_fp16 (re-encoded at load)"); }
     load_.prefill_signature   = "inkling2-fp32";
     load_.takes_video         = false;
     load_.load_seconds        = seconds_between(start, Clock::now());
@@ -954,6 +972,11 @@ MemorySummary Inkling2Core::memory_summary() const {
     m.max_context           = options_.max_context;
     m.requested_max_context = options_.max_context;
     m.kv_capacity           = options_.max_context;
+    // The weights on the device: the artifact's device backing (its allocations, alignment included; h2d_bytes is
+    // the payload transferred) and any --dense-q8 re-encoding kept beside it.
+    const std::size_t weights = static_cast<std::size_t>(model_->storage_stats().device_capacity_bytes) +
+                                (programs_->dense ? programs_->dense->bytes() : 0);
+    m.weights = {.capacity_bytes = weights, .used_bytes = weights, .peak_used_bytes = weights};
     return m;
 }
 
