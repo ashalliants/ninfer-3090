@@ -6,6 +6,7 @@
 #include "ninfer/ops/cast.h"
 #include "ninfer/ops/depth_attention.h"
 #include "ninfer/ops/fp32_rows.h"
+#include "ninfer/ops/inkling2_adapters.h"
 #include "ninfer/ops/moe_situ.h"
 #include "ninfer/ops/projection_fp32.h"
 #include "ninfer/ops/relative_bias_attention.h"
@@ -225,6 +226,19 @@ TextProgram::~TextProgram() {
     for (cudaGraphExec_t graph : batch_graph_) {
         if (graph != nullptr) { cudaGraphExecDestroy(graph); }
     }
+}
+
+void TextProgram::set_adapters(AdapterSelection adapters) {
+    if (adapters == adapters_) { return; }
+    for (cudaGraphExec_t& graph : decode_graph_) {
+        if (graph != nullptr) { cudaGraphExecDestroy(graph); }
+        graph = nullptr;
+    }
+    for (cudaGraphExec_t& graph : batch_graph_) {
+        if (graph != nullptr) { cudaGraphExecDestroy(graph); }
+        graph = nullptr;
+    }
+    adapters_ = adapters;
 }
 
 void TextProgram::reset() {
@@ -575,8 +589,17 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     const WeightId ow[] = {w.output};
     const std::int32_t orows[] = {h};
     Tensor a_in = project(gated, ow, orows);
+    // A selected LoRA on this layer's wo_ud: a_in += scale B (A gated), in FP32 (adapters.h).
+    if (adapters_.lora != nullptr && adapters_.lora->a.at(p) != nullptr) {
+        ops::low_rank_update_fp32(gated, adapters_.lora->a[p], adapters_.lora->b[p], adapters_.lora->rank, adapters_.lora->scale, a_in, stream_);
+    }
     Tensor a = workspace_.alloc(DType::FP32, {h, cols});
     const Tensor post_taps = model_.tensor(w.post_conv, {k, h});
+
+    // A selected ablation graft's weights at this visit (adapters.h): a nonzero one removes its direction from the
+    // convolution's output before the residual add, which then runs on its own; zero keeps the fused add.
+    const DeviceAblation* ablation = adapters_.ablation;
+    const float attn_w = ablation != nullptr ? ablation->attn_w.at(v) : 0.0F, mlp_w = ablation != nullptr ? ablation->mlp_w.at(v) : 0.0F;
 
     // 3h: the convolution with the residual and block boundary: a block's first layer starts from a alone.
     {
@@ -587,10 +610,16 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         save_input(st.attn_saved, a_in);
         if (boundary) {
             job.out = &ffn_inp;
+        } else if (attn_w != 0.0F) {
+            job.out = &a;
         } else {
             job.out = &a, job.residual = &cur, job.sum = &ffn_inp;
         }
         ops::short_conv_fp32_batch(std::span<const ops::ShortConvJob>(&job, 1), 1, stream_, columns_);
+        if (attn_w != 0.0F) {
+            // At a boundary the ablated output is ffn_inp itself (in place); otherwise ffn_inp = cur + the ablated a.
+            ops::direction_ablate_fp32(boundary ? ffn_inp : a, ablation->attn_dir[v], attn_w, boundary ? nullptr : &cur, ffn_inp, stream_);
+        }
         if (boundary) { a = ffn_inp; } // for the trace
     }
 
@@ -633,8 +662,14 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         const ops::ConvCombine combine{&entries, &weights, saving_ ? &y : nullptr};
         const Tensor mlp_taps = model_.tensor(w.mlp_post_conv, {k, h});
         ops::ShortConvJob job;
-        job.combine = &combine, job.taps = &mlp_taps, job.history = &st.mlp_hist, job.residual = &ffn_inp, job.sum = &next;
+        job.combine = &combine, job.taps = &mlp_taps, job.history = &st.mlp_hist;
+        if (mlp_w != 0.0F) {
+            job.out = &z; // z (the routing's input) is dead once the experts ran: the convolution's output, then ablated
+        } else {
+            job.residual = &ffn_inp, job.sum = &next;
+        }
         ops::short_conv_fp32_batch(std::span<const ops::ShortConvJob>(&job, 1), 1, stream_, columns_);
+        if (mlp_w != 0.0F) { ops::direction_ablate_fp32(z, ablation->mlp_dir[v], mlp_w, &ffn_inp, next, stream_); }
         save_input(st.mlp_saved, y);
     }
 

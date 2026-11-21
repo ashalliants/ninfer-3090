@@ -2524,7 +2524,8 @@ Startup refuses, naming the adapter and the problem: a Gated DeltaNet (`linear_a
 embedding, head or MoE expert target; DoRA, `rank_pattern`/`alpha_pattern`, LoRA bias, trained
 biases, `modules_to_save`, trainable tokens or aLoRA; a module with only one of `lora_A`/`lora_B`;
 another model's shapes; non-finite values; and a pickled `adapter_model.bin`. Qwen3.8-Flash-Next,
-pipeline (multi-GPU) runs and `--purpose score` refuse `--lora`.
+pipeline (multi-GPU) runs and `--purpose score` refuse `--lora`. Inkling-2 takes one LoRA form of its own, on the
+attention output projection: see [Inkling-2 uncensoring adapters](#inkling-2-uncensoring-adapters).
 
 **GGUF LoRA files** (llama.cpp `convert_lora_to_gguf.py` output) are not loaded: the PEFT directory
 is what trainers publish, holds the exact trained values and the scale, and needs no second converter
@@ -2571,6 +2572,53 @@ template is byte-identical to the official Qwen3.8-27B one (NInfer's template is
 and its tokenizer has the same vocabulary, merges and added tokens. That adapter was trained with
 thinking off, so serve it with `--no-thinking` or send
 `"chat_template_kwargs": {"enable_thinking": false}`.
+
+## Inkling-2 uncensoring adapters
+
+Inkling-2-Mini serves two published uncensoring adapters, **opt-in**: a server loads them with the usual flags and
+only a request that names one runs with it. A request that names none, and a server that loads none, runs the base
+model unchanged, bit for bit.
+
+| | `--lora NAME=DIR` | `--graft NAME=FILE` |
+|---|---|---|
+| What | the [OpenUncensored/Inkling-2-Mini-Uncensored](https://huggingface.co/OpenUncensored/Inkling-2-Mini-Uncensored) PEFT LoRA (r 2, on `attn.wo_ud` of layers 4-23) | the [satellitedown/Inkling-2-Mini-abliterated-ingine](https://huggingface.co/satellitedown/Inkling-2-Mini-abliterated-ingine) per-visit ablation, `inkling-2-mini-abliterated.safetensors` |
+| Licence | Apache-2.0 | Apache-2.0 |
+| A request selects it | `"lora": "NAME"` | `"graft": "NAME"` |
+| Default for every request | `--default-lora NAME` (`"lora": ""` opts out) | `--default-graft NAME` (`"graft": ""` opts out) |
+| Applied | `a += B (A x)` on the attention output projection's result, FP32, unmerged | removes one direction per layer visit from each attention and MLP write (`y - w r (r . y)`), FP32 |
+
+```bash
+ninfer-serve inkling2-mini-q8.ninfer --lora ou=/models/adapters/ou_lora \
+    --graft abliterated=/models/adapters/inkling-2-mini-abliterated.safetensors
+curl http://127.0.0.1:8080/v1/chat/completions -d '{"model": "m", "graft": "abliterated",
+  "messages": [{"role": "user", "content": "hello"}]}'
+```
+
+- A request may select one LoRA and one graft (both apply); grafts do not combine with `+` on Inkling-2.
+- **Other forms are refused at startup**, naming the adapter and the reason: a LoRA on any other module or with a
+  PEFT variant (DoRA, rank or alpha patterns, biases, `modules_to_save`), a GGUF control vector or KV graft, or an
+  ablation file of another layout or scope.
+- **Speculation.** `--spec dspark` drafts without the adapter and verifies with it, so a greedy request's tokens are
+  plain greedy decoding's with the same adapter; only the acceptance rate can change.
+- **Prefix reuse** is keyed on the selection: a prompt prefix computed under one adapter, or none, never serves
+  another.
+- Each adapter costs under 1 MiB of device memory. The first decode step after the selection changes captures that
+  selection's decode graph again.
+
+Measured on a V100 (greedy; 20 prompts of `mlabonne/harmful_behaviors` with `reasoning_effort` `none`, judged by
+refusal markers, so a deflecting answer counts as complied; KLD from the base model over 2,048 tokens of mixed text;
+math with low reasoning effort and two Python tasks with tests):
+
+| | Base | `"lora": "ou"` | `"graft": "sd"` |
+|---|---|---|---|
+| Harmful prompts refused | 20/20 | 0/20 | 0/20 |
+| KLD from base, mean (max) | 0 | 0.0142 (1.18) | 0.0171 (0.78) |
+| Top-1 agreement with base | 1 | 0.969 | 0.962 |
+| Math (4, low effort) | 4/4 | 4/4 | 4/4 |
+| Python tasks (2, tests run) | 2/2 | 2/2 | 2/2 |
+| Output tok/s, plain (`--spec dspark`) | 71.7 (77.1) | 68.9 (68.1) | 68.9 (67.8) |
+
+The [Inkling-2 notes](maintainer/inkling2-model.md#adapters-opt-in-uncensoring) give the hook points and the tests.
 
 ## Authentication and CORS
 

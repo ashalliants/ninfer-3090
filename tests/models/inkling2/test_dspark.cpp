@@ -11,13 +11,16 @@
 //
 // Environment: NINFER_TEST_INKLING2_ARTIFACT (an artifact with component dspark), NINFER_INKLING2_GOLDEN (the
 // golden output directory: its p0, p1, ... tokens.json are the prompts); skips (77) without them.
-// NINFER_INKLING2_SPEC_TOKENS: tokens to generate per prompt (default 64).
+// NINFER_INKLING2_SPEC_TOKENS: tokens to generate per prompt (default 64). NINFER_INKLING2_LORA (a PEFT directory)
+// and NINFER_INKLING2_ABLATION (a per-visit ablation file): both target programs run with those adapters
+// (program/adapters.h), the drafter without them; the speculative tokens must still equal plain greedy's.
 
 #include "artifact/reader.h"
 #include "artifact/schema.h"
 #include "core/device.h"
 #include "core/tensor.h"
 #include "models/inkling2/model.h"
+#include "models/inkling2/program/adapters.h"
 #include "models/inkling2/program/dspark_program.h"
 #include "models/inkling2/program/text_program.h"
 #include "ninfer/ops/dspark_fp32.h"
@@ -29,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <memory>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -98,6 +102,17 @@ int main() {
         limits.tap_visits   = dc.target_visits;
         limits.max_rollback = block;
         ink::TextProgram target(*model, limits, stream);
+        std::unique_ptr<ink::DeviceLora> lora;
+        std::unique_ptr<ink::DeviceAblation> ablation;
+        if (const char* path = std::getenv("NINFER_INKLING2_LORA")) {
+            lora = std::make_unique<ink::DeviceLora>(ink::load_lora_adapter({"lora", path}, model->config()));
+        }
+        if (const char* path = std::getenv("NINFER_INKLING2_ABLATION")) {
+            ablation = std::make_unique<ink::DeviceAblation>(ink::load_visit_ablation({"ablation", path}, model->config()));
+        }
+        plain.set_adapters({lora.get(), ablation.get()});
+        target.set_adapters({lora.get(), ablation.get()});
+        std::printf("adapters: lora %s, ablation %s (the drafter runs without them)\n", lora ? "on" : "off", ablation ? "on" : "off");
         const auto p0 = Clock::now();
         ink::DSparkProgram drafter(*model, kContext, kChunk, stream);
         std::printf("drafter ready in %.2f s (taps at visits %s)\n", since(p0),

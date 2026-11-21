@@ -390,3 +390,7 @@ ninfer_add_op_test(ninfer_dspark_fp32_ops_test
 ninfer_add_op_test(ninfer_vit_fp32_ops_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vit_fp32_ops.cpp"
   LIBRARIES ninfer_ops)
+# Inkling-2-Mini's adapter Ops (inkling2_adapters.h: the LoRA update and the direction ablation) against FP64.
+ninfer_add_op_test(ninfer_inkling2_adapters_ops_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_adapters_ops.cpp"
+  LIBRARIES ninfer_ops)

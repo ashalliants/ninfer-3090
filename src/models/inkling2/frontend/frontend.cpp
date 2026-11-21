@@ -293,14 +293,25 @@ PreparedPrompt Frontend::build(PromptInput input, const PreparationControl& cont
     if (input.options.continuation != PromptContinuationMode::NewAssistantTurn) {
         throw std::invalid_argument("Inkling-2 does not continue a final assistant message");
     }
-    if (!input.options.graft.empty() || !input.options.lora.empty()) {
-        throw std::invalid_argument("Inkling-2 serves no grafts or LoRA adapters");
+    // The adapters (program/adapters.h): a loaded LoRA, and one loaded graft (no '+' combinations).
+    const auto find = [](const std::vector<std::string>& names, const std::string& name, const char* kind) -> std::int32_t {
+        if (name.empty()) { return -1; }
+        const auto at = std::find(names.begin(), names.end(), name);
+        if (at == names.end()) { throw std::invalid_argument(std::string("unknown ") + kind + " '" + name + "'"); }
+        return static_cast<std::int32_t>(at - names.begin());
+    };
+    if (input.options.graft.find('+') != std::string::npos) {
+        throw std::invalid_argument("Inkling-2 takes one graft per request, not a combination ('" + input.options.graft + "')");
     }
+    const std::int32_t lora = find(options_.lora_names, input.options.lora, "LoRA adapter");
+    const std::int32_t graft = find(options_.graft_names, input.options.graft, "graft");
     if (input.options.enable_thinking && input.options.reasoning_effort &&
         *input.options.enable_thinking != (*input.options.reasoning_effort != ReasoningEffort::None)) {
         throw std::invalid_argument("reasoning_effort conflicts with enable_thinking");
     }
     PreparedPrompt out;
+    out.lora  = lora;
+    out.graft = graft;
     // The declared tools (OpenAI's {"type": "function", "function": {...}} or the bare function object): the rendered
     // ones, then those loaded on demand (loaded_tool_jsons: callable, never rendered).
     out.tools.emplace();

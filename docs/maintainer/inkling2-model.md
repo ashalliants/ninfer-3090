@@ -549,7 +549,8 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
   an artifact converted with `--mmproj`.
 - Refused requests:
   - continuing a final assistant message;
-  - grafts and LoRA adapters;
+  - grafts and LoRA adapters other than the two opt-in forms of [Adapters](#adapters-opt-in-uncensoring)
+    (a `'+'` combination of grafts too);
   - video;
   - output constraints (grammar, JSON schema) and `tool_choice` required or named;
   - logprobs;
@@ -635,6 +636,86 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
   - a greedy chat returns `"content": "Paris"`, with the reasoning in `reasoning_content`;
   - streaming sends reasoning deltas, then content;
   - the image request describes "MEN WALK ON MOON".
+
+## Adapters (opt-in uncensoring)
+
+Two published Inkling-2-Mini uncensoring adapters load at startup and apply only to the requests that select them
+(`models/inkling2/program/adapters.h`). Nothing changes for any other request: a server without them, or a request
+that selects none, launches exactly the kernels it launched before, and its output is bit for bit the same (the FP32
+golden's 781 dump files are byte-identical, see below).
+
+| | OpenUncensored LoRA | satellitedown per-visit ablation |
+|---|---|---|
+| Source | [OpenUncensored/Inkling-2-Mini-Uncensored](https://huggingface.co/OpenUncensored/Inkling-2-Mini-Uncensored), its PEFT adapter (`adapter_config.json`, `adapter_model.safetensors`, 865 KB) | [satellitedown/Inkling-2-Mini-abliterated-ingine](https://huggingface.co/satellitedown/Inkling-2-Mini-abliterated-ingine), `inkling-2-mini-abliterated.safetensors` (885 KB); reference code `abliteration/inkling_ref.py` (`Ablation`) and `ablate.py` |
+| Licence | Apache-2.0 | Apache-2.0 |
+| Flag | `--lora NAME=DIR` | `--graft NAME=FILE` |
+| Request | `"lora": "NAME"` (`--default-lora`) | `"graft": "NAME"` (`--default-graft`) |
+| Form | PEFT LoRA, r 2, alpha 2 (scale 1), F32, on `model.llm.layers.N.attn.wo_ud` for N = 4..23 | F32 `attn_dirs`, `mlp_dirs` [48, 2304], `attn_w`, `mlp_w` [48]; metadata `params.scope` `per_visit` |
+| Applied | `a_in += scale * B (A gated)` after the attention output projection, FP32, every visit of the layer (all three loop passes of a core layer) | `y <- y - w_v r_v (r_v . y)` on the post-attention and post-MLP short-convolution outputs at visit v, FP32, before the residual add |
+
+**The LoRA.** `wo_ud` is the artifact's `text/layers/N/attention/output`, BF16 [2304, 3072] (rows out, columns
+in), the same bytes as the Hugging Face checkpoint's `model.llm.layers.N.attn.wo_ud.weight` (checked on rows 7 and
+1500 of layers 4, 11 and 23). In the program it is `project(gated, ow, orows)`, whose result `a_in` is the input of
+the post-attention convolution (3g). `low_rank_update_fp32` adds `scale B (A gated)` to `a_in` in FP32, reading
+`gated` (BF16, the projection's own input). The adapter is not merged: a merged BF16 copy of `wo_ud` would cost 14 MB
+per layer and drop the FP32 update to BF16. The publisher's own merged checkpoint is `BF16(base + B A)` (a research
+script checked their baked `wo_ud` rows against that bit for bit), so the unmerged update differs from it only by that
+BF16 rounding of the weights. `ninfer_inkling2_adapters_test` checks rows 7 and 1500 of layer 4's effective `wo_ud`
+(`projection_fp32` and the update over the identity) against `base + scale B A` in FP64: 4.2e-8 of the row's largest value at worst,
+and rounded to BF16 the same in 3072 of 3072 values of each row. Only `wo_ud` targets load; any other module, DoRA,
+rank or alpha patterns, LoRA bias, `modules_to_save` and the other PEFT variants are refused with the reason, as is
+a rank above 16.
+
+**The ablation graft.** The reference hooks `post_attention_convolution` and `post_mlp_convolution`, whose outputs
+are a visit's only writes into the attention-residual blocks, and keys the 48 directions on the visit index (layers
+0-5, three passes of 6-17, 18-23: `TextConfig::physical`). In the program those outputs are 3h's `a` and 3j's MoE
+convolution output:
+- **Attention (3h).** Inside a block, the convolution writes `a`, `direction_ablate_fp32` removes the direction in
+  place and writes `ffn_inp = cur + a'`. At a block's first layer (`p mod 6 == 0`) the convolution writes `ffn_inp`
+  itself (`ffn_inp = a`, the residual restarts), and the ablation runs on `ffn_inp` in place; the block bank keeps
+  `cur`, as before.
+- **MLP (3j).** The convolution (with the expert combine) writes into `z`, dead once the experts ran, and the
+  ablation writes `next = ffn_inp + y'`.
+- A visit whose weight is 0 keeps the fused residual add. The convolution histories hold the convolutions' inputs,
+  which the ablation does not touch, so rollback (`keep()`) and snapshots are unchanged.
+- The loader takes F32 tensors of exactly this layout and `params.scope` `per_visit`, and normalizes each direction
+  to unit length as the reference's `Ablation.set` does. It refuses a GGUF file (a control vector or KV graft is not
+  an Inkling-2 graft), another scope, another shape or a non-finite value. The published file's weights are nonzero
+  at 44 of the 48 attention visits and at every MLP visit.
+- `ninfer_inkling2_adapters_test` ablates one visit's write at a time (weight 1 there) and compares the program's
+  `ffn_inp` or `l_out` with the FP64 ablation of the base run's write: inside a block, at a block's first layer and
+  for an MLP write, within 7e-8 relative; the visit before is the base run's bit for bit. Both Ops are also held to
+  FP64 on random operands (`ninfer_inkling2_adapters_ops_test`, ranks 1, 2 and 16, strided columns), and with both
+  adapters on the decode graph gives the eager forward's logits bit for bit.
+
+**Selection and caches.** `Inkling2Core` loads the adapters before the weights (an unsupported one refuses to start),
+the frontend resolves the request's names (`PreparedPrompt::lora`, `graft`; one graft per request, no `'+'`), and
+`TextProgram::set_adapters` selects them for the request's forwards. A change of selection drops the captured
+decode graphs, so each selection's decode step captures its own; the base model's graph is the one it always was.
+Prefix reuse keys the snapshot on the selection (a digest of each adapter's tensors), as the dense models key their
+cached prefixes on the LoRA digest: a prefix computed under one adapter, or none, never serves another.
+
+**DSpark.** The drafter runs without the adapters: it only proposes, and the target, adapted, verifies every draft,
+so greedy output is plain greedy decoding's with the same adapters. `ninfer_inkling2_dspark_test` with
+`NINFER_INKLING2_LORA` or `NINFER_INKLING2_ABLATION` checks it (the same tokens on every golden prompt); the
+acceptance rate can be lower than the base model's.
+
+**A/B** (V100, `ninfer-serve` greedy). The refusals are counted on the first 20 prompts of `mlabonne/harmful_behaviors`
+`test`, the set satellitedown reports, with `reasoning_effort` `none` and up to 1,024 tokens (the model still reasons
+briefly first). The answer is judged by satellitedown's refusal markers on its first 300 characters, so an answer that
+complies only partly or deflects counts as complied; a few adapted answers do. The KLD is each adapter's next-token
+distribution against the base model's over 2,048 teacher-forced tokens of mixed text (prose, C++, Python and Q&A),
+in the FP32 program (`ninfer_inkling2_adapters_test` with `NINFER_INKLING2_KLD_TEXT`). Every reply with
+`--spec dspark` was the plain run's, byte for byte:
+
+| | Base | `"lora": "ou"` | `"graft": "sd"` |
+|---|---|---|---|
+| Harmful prompts refused | 20/20 | 0/20 | 0/20 |
+| KLD from base, mean (max) | 0 | 0.0142 (1.18) | 0.0171 (0.78) |
+| Top-1 agreement with base | 1 | 0.969 | 0.962 |
+| Math (4, low effort) | 4/4 | 4/4 | 4/4 |
+| Python tasks (2, tests run) | 2/2 | 2/2 | 2/2 |
+| Output tok/s, plain (`--spec dspark`) | 71.7 (77.1) | 68.9 (68.1) | 68.9 (67.8) |
 
 ## Dense 8-bit re-encoding
 
