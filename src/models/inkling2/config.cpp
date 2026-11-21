@@ -1,0 +1,125 @@
+// Written for NInfer-3090. The pattern follows src/models/dsv4/config.cpp.
+
+#include "models/inkling2/config.h"
+
+#include <cmath>
+#include <limits>
+#include <string>
+
+namespace ninfer::models::inkling2 {
+namespace {
+
+using artifact::ArtifactError;
+using artifact::Json;
+
+constexpr const char* kArchitecture = "inkling2";
+constexpr const char* kModelType    = "inkling2_text";
+
+std::uint32_t integer(const Json& value, std::string_view label, bool positive = true) {
+    const auto n = artifact::require_u64(value, label, positive);
+    if (n > std::numeric_limits<std::uint32_t>::max()) { throw ArtifactError(std::string(label) + ": exceeds u32"); }
+    return static_cast<std::uint32_t>(n);
+}
+
+std::uint32_t dimension(const Json& config, const char* name) { return integer(config.at(name), name); }
+
+float real(const Json& config, const char* name, bool positive = true) {
+    const auto& value = config.at(name);
+    if (!value.is_number()) { throw ArtifactError(std::string(name) + " must be a real value"); }
+    const float result = value.get<float>();
+    if (!std::isfinite(result) || (positive ? result <= 0 : result < 0)) {
+        throw ArtifactError(std::string(name) + " must be finite" + (positive ? " and positive" : " and non-negative"));
+    }
+    return result;
+}
+
+TextConfig text(const Json& v) {
+    if (v.at("architecture") != kArchitecture || v.at("model_type") != kModelType) {
+        throw ArtifactError("text component is not Inkling-2");
+    }
+    TextConfig c;
+    c.hidden_size             = dimension(v, "hidden_size");
+    c.num_hidden_layers       = dimension(v, "num_hidden_layers");
+    c.num_layer_visits        = dimension(v, "num_layer_visits");
+    c.loop_core_start         = integer(v.at("loop_core_start"), "loop_core_start", false);
+    c.loop_core_end           = dimension(v, "loop_core_end");
+    c.loop_num_passes         = dimension(v, "loop_num_passes");
+    c.loop_gate_rank          = dimension(v, "loop_gate_rank");
+    c.vocab_size              = dimension(v, "vocab_size");
+    c.unpadded_vocab_size     = dimension(v, "unpadded_vocab_size");
+    c.max_position_embeddings = dimension(v, "max_position_embeddings");
+    c.rms_norm_eps            = real(v, "rms_norm_eps");
+    c.heads                   = dimension(v, "num_attention_heads");
+    c.kv_heads                = dimension(v, "num_key_value_heads");
+    c.head_dim                = dimension(v, "head_dim");
+    c.sliding_window          = dimension(v, "sliding_window");
+    c.d_rel                   = dimension(v, "d_rel");
+    c.rel_extent              = dimension(v, "rel_extent");
+    c.qk_clip                 = real(v, "qk_clip");
+    c.rel_clip                = real(v, "rel_clip");
+    c.log_scaling_n_floor     = dimension(v, "log_scaling_n_floor");
+    c.log_scaling_alpha       = real(v, "log_scaling_alpha", false);
+    c.conv_kernel_size        = dimension(v, "conv_kernel_size");
+    c.attn_res_block_size     = dimension(v, "attn_res_block_size");
+    c.experts                 = dimension(v, "num_experts");
+    c.experts_per_token       = dimension(v, "num_experts_per_tok");
+    c.moe_intermediate        = dimension(v, "moe_intermediate_size");
+    c.route_scale             = real(v, "route_scale");
+    c.gate_softcap            = real(v, "mlp_gate_softcap");
+    c.up_softcap              = real(v, "mlp_up_softcap");
+    c.final_logit_softcap     = real(v, "final_logit_softcapping");
+
+    if (c.loop_core_start >= c.loop_core_end || c.loop_core_end > c.num_hidden_layers) {
+        throw ArtifactError("the loop core must be a non-empty range of layers");
+    }
+    if (c.num_layer_visits != c.num_hidden_layers + (c.loop_num_passes - 1) * c.core_layers()) {
+        throw ArtifactError("num_layer_visits differs from the loop schedule");
+    }
+    if (c.unpadded_vocab_size > c.vocab_size) { throw ArtifactError("unpadded_vocab_size exceeds vocab_size"); }
+    if (c.heads % c.kv_heads) { throw ArtifactError("query heads are not a multiple of KV heads"); }
+    if (c.experts_per_token > c.experts) { throw ArtifactError("selected experts exceed expert count"); }
+    // MIX at the attention input sees the blocks pushed so far plus the current state; every block boundary
+    // pushes one. The depth-attention Op takes at most eight sources.
+    if (c.num_hidden_layers / c.attn_res_block_size + 1 > 8) { throw ArtifactError("too many attention-residual blocks"); }
+    c.local.assign(c.num_hidden_layers, false);
+    for (const auto& item : v.at("local_layers")) {
+        const auto layer = integer(item, "local_layers", false);
+        if (layer >= c.num_hidden_layers) { throw ArtifactError("local_layers names a layer past the last one"); }
+        c.local[layer] = true;
+    }
+    return c;
+}
+
+} // namespace
+
+std::uint32_t TextConfig::physical(std::uint32_t visit) const {
+    if (visit >= num_layer_visits) { throw std::out_of_range("layer visit out of range"); }
+    if (visit < loop_core_start) { return visit; }
+    if (visit < loop_core_start + loop_num_passes * core_layers()) { return loop_core_start + (visit - loop_core_start) % core_layers(); }
+    return visit - (loop_num_passes - 1) * core_layers();
+}
+
+std::uint32_t TextConfig::pass(std::uint32_t visit) const {
+    if (visit >= loop_core_start && visit < loop_core_start + loop_num_passes * core_layers()) {
+        return (visit - loop_core_start) / core_layers();
+    }
+    return 0;
+}
+
+bool is_inkling2_config(const artifact::Directory& directory) {
+    if (!directory.components.contains("text")) { return false; }
+    const auto& config = directory.component("text").config;
+    return config.contains("model_type") && config.at("model_type") == kModelType;
+}
+
+TextConfig parse_config(const Json& config) {
+    try {
+        return text(config);
+    } catch (const std::exception& error) {
+        throw ArtifactError(std::string("Inkling-2 config: ") + error.what());
+    }
+}
+
+TextConfig parse_config(const artifact::Directory& directory) { return parse_config(directory.component("text").config); }
+
+} // namespace ninfer::models::inkling2
