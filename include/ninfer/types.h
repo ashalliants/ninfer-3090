@@ -2282,6 +2282,9 @@ struct LoadSummary {
     std::string cuda_sync_mode;
     std::vector<std::string> weight_formats;
     std::string prefill_signature;
+    // Conditions of this load the operator should know about (a model running with reduced quality,
+    // say). The application's startup renderer logs each one as a warning once the engine is ready.
+    std::vector<std::string> warnings;
     double load_seconds                = 0.0;
     double upload_seconds              = 0.0;
     std::uint64_t artifact_bytes_read  = 0;

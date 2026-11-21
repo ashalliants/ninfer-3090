@@ -45,6 +45,7 @@ EngineOptions valid() {
     EngineOptions options;
     options.artifact_path = "model.ninfer";
     options.max_context   = 8192;
+    options.kv_capacity   = KvCapacityPolicy::explicit_capacity(8192);
     return options;
 }
 
@@ -58,6 +59,7 @@ void options_defaults() {
     check(plan_dsv4_options(sized).expert_cache_bytes == (3ULL << 30), "--expert-cache-mib sets the cache");
     EngineOptions small = valid();
     small.max_context   = 100;
+    small.kv_capacity   = KvCapacityPolicy::explicit_capacity(100);
     check(plan_dsv4_options(small).prefill_chunk == 100, "a chunk never exceeds the context");
     EngineOptions large = valid();
     large.prefill_chunk = 100000;
@@ -81,8 +83,33 @@ void options_refusals() {
     EngineOptions fit = valid();
     fit.fit_context_floor = 1024;
     check(names(refusal([&] { (void)plan_dsv4_options(fit); }), "--fit-context"), "a context fit is refused");
+    // Options the route would silently ignore are refused, by the flag.
+    EngineOptions dtype = valid();
+    dtype.kv_cache      = KvCacheStorage::Int8Group64;
+    check(names(refusal([&] { (void)plan_dsv4_options(dtype); }), "--kv-dtype"), "a KV dtype is refused");
+    EngineOptions host = valid();
+    host.context_cache.host_capacity_bytes = 1ULL << 30;
+    check(names(refusal([&] { (void)plan_dsv4_options(host); }), "--host-context-mib"), "a host context cache is refused");
+    EngineOptions slices = valid();
+    slices.prefill_schedule.layer_slices = 4;
+    check(names(refusal([&] { (void)plan_dsv4_options(slices); }), "--prefill-layer-slices"), "layer slices are refused");
+    EngineOptions graphs = valid();
+    graphs.use_cuda_graph = false;
+    check(names(refusal([&] { (void)plan_dsv4_options(graphs); }), "--no-cuda-graph"), "--no-cuda-graph is refused");
+    EngineOptions flash = valid();
+    flash.flash_next.hc_int8 = true;
+    flash.flash_next.ngram_keepalive_ms_set = true;
+    const std::string both = refusal([&] { (void)plan_dsv4_options(flash); });
+    check(names(both, "--hc-int8") && names(both, "--ngram-keepalive-ms"), "Flash-Next-only options are all named");
+    EngineOptions cache_only = valid();
+    cache_only.flash_next.expert_cache_bytes = 5ULL << 30;
+    check(refusal([&] { (void)plan_dsv4_options(cache_only); }).empty(), "--expert-cache-mib stays supported");
+    EngineOptions capacity = valid();
+    capacity.kv_capacity   = KvCapacityPolicy::explicit_capacity(16384);
+    check(names(refusal([&] { (void)plan_dsv4_options(capacity); }), "--kv-capacity"), "a KV capacity beyond the context is refused");
     EngineOptions tiny = valid();
     tiny.max_context   = 1;
+    tiny.kv_capacity   = KvCapacityPolicy::explicit_capacity(1);
     check(names(refusal([&] { (void)plan_dsv4_options(tiny); }), "--max-context"), "a one-token context is refused");
 }
 
@@ -101,6 +128,12 @@ void memory_fits() {
 }
 
 std::vector<float> row() { return {0.0F, 1.0F, 5.0F, 4.0F, -1.0F, 5.0F}; }
+
+void context_limit() {
+    check(refusal([&] { check_dsv4_context(8192, 1048576); }).empty(), "a context inside the artifact's positions is accepted");
+    const std::string over = refusal([&] { check_dsv4_context(2000000, 1048576); });
+    check(over.find("--max-context") != std::string::npos, "a context beyond the artifact's positions is refused");
+}
 
 void greedy_selection() {
     std::mt19937_64 rng(1);
@@ -144,6 +177,15 @@ void sampled_selection() {
     bool all_best = true;
     for (int i = 0; i < 50; ++i) { all_best = all_best && sample_host(logits, one, {}, {}, rng) == 2; }
     check(all_best, "top-k 1 always picks the best token");
+    // An explicit top-p of 0 keeps only the best token (every value below 1 filters, as on the device).
+    ResolvedSamplingParameters zero = params;
+    zero.top_p                      = 0.0F;
+    bool best_only                  = true;
+    for (int i = 0; i < 100; ++i) {
+        const auto token = sample_host(logits, zero, {}, {}, rng);
+        best_only        = best_only && token == 2;
+    }
+    check(best_only, "top-p 0 keeps only the best candidate");
     // A tight nucleus keeps the two leading tokens (2 and 5 tie, then 3).
     ResolvedSamplingParameters nucleus = params;
     nucleus.top_p                      = 0.6F;
@@ -182,6 +224,7 @@ int main() {
     options_defaults();
     options_refusals();
     memory_fits();
+    context_limit();
     greedy_selection();
     sampled_selection();
     if (failures == 0) { std::cout << "PASS\n"; }

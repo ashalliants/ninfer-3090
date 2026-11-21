@@ -83,7 +83,7 @@ using TokenCounts = std::unordered_map<std::int32_t, std::uint32_t>;
         const double floor = probability.front() * sampling.min_p;
         while (keep > 1 && probability[keep - 1] < floor) { --keep; }
     }
-    if (sampling.top_p > 0.0F && sampling.top_p < 1.0F) {
+    if (sampling.top_p < 1.0F) { // every value below 1 is active, as in the device sampler: 0 keeps the best token
         double cumulative   = 0.0;
         std::size_t nucleus = 0;
         while (nucleus < keep) {

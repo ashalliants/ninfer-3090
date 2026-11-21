@@ -18,17 +18,11 @@
 #include <cuda_runtime.h>
 
 #include <chrono>
-#include <cstdio>
 #include <stdexcept>
 #include <string>
 
 namespace ninfer::runtime {
 namespace {
-
-void report(const std::string& text) {
-    std::fprintf(stderr, "[deepseek-v4.1-flash] %s\n", text.c_str());
-    std::fflush(stderr);
-}
 
 } // namespace
 
@@ -68,7 +62,8 @@ ConstructedDsv4 construct_dsv4(const EngineOptions& options, DeviceContext& devi
     auto plan = models::dsv4::plan_load(*reader, true);
     binding.complete();
     const auto& config = plan.config();
-    const auto banks   = plan.file_banks();
+    check_dsv4_context(wanted.max_context, config.max_position_embeddings);
+    const auto banks = plan.file_banks();
     const std::uint64_t dense = plan.device_bytes();
 
     // The checks that need no allocation, before anything is pinned or read.
@@ -79,10 +74,6 @@ ConstructedDsv4 construct_dsv4(const EngineOptions& options, DeviceContext& devi
         std::size_t free_bytes = 0, total_bytes = 0;
         if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) { check_dsv4_device_fit(dense, free_bytes); }
     }
-    report("dense weights " + dsv4_gib(dense) + " on the device, routed experts read from the artifact through a " +
-           dsv4_gib(wanted.expert_cache_bytes) + " pinned cache, context " + std::to_string(wanted.max_context) +
-           " tokens, prompt chunk " + std::to_string(wanted.prefill_chunk));
-
     auto model = models::dsv4::materialize_model(std::move(plan), device, &options.startup_observer);
     device.synchronize();
 
@@ -113,12 +104,11 @@ ConstructedDsv4 construct_dsv4(const EngineOptions& options, DeviceContext& devi
     program.complete();
     device.synchronize();
 
+    std::vector<std::string> warnings;
     if (!instance->forward->engram_applied()) {
-        report("WARNING: this artifact has no Engram data yet, so the Engram layers run without their injection and the "
-               "answers are of reduced quality.");
+        warnings.push_back("DeepSeek-V4.1-Flash: this artifact has no Engram data yet, so the Engram layers run without their "
+                           "injection and the answers are of reduced quality");
     }
-    report("forward state and workspace " + dsv4_gib(instance->forward->device_bytes()) + " on the device; " +
-           std::to_string(instance->experts->cache_slots()) + " expert records cached in RAM; one request at a time; no context cache");
 
     auto& resolution                 = instance->kv_capacity_resolution;
     resolution.mode                  = KvCapacityMode::Explicit;
@@ -141,6 +131,7 @@ ConstructedDsv4 construct_dsv4(const EngineOptions& options, DeviceContext& devi
     summary.pinned_weight_bytes  = stats.pinned_bytes;
     summary.device_object_count  = stats.device_object_count;
     summary.host_object_count    = stats.host_object_count;
+    summary.warnings             = std::move(warnings);
     summary.weight_formats       = {"ggml_blocks_v1", "ggml_expert_record_v1", "bf16", "fp32"};
     return {std::move(instance), std::move(summary)};
 }
