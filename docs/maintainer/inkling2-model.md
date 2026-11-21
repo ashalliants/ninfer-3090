@@ -507,12 +507,14 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
 - `max_pending_requests` bounds the queue, and `pending_timeout` refuses a request that waited too long.
 - There is no batching, context store or suspend.
 - Prefix reuse (on unless `context_cache.enabled` is off or a request sets `allow_prefix_reuse` false): after the
-  last whole multiple of 256 prompt positions that leaves a position to compute (a chunk ends there), the core copies the state a forward
+  last whole multiple of the prefill chunk that leaves a position to compute, the core copies the state a forward
   from there needs (`TextProgram::save`: every sliding visit's last 1023 K/V columns and every visit's convolution
   histories, 335 MB; the global caches are indexed by position and stay valid). A next prompt whose first positions
   are the same (token ids, and images by a hash of their pixels) restores it and prefills only the rest, in the same
-  chunks a prefill from 0 runs, so the output is unchanged. With `--spec dspark` the drafter's sliding rings and anchor context are kept with it (`DSparkProgram::save`); a sampled request does not run the drafter, so a greedy one resumes only from a snapshot a greedy one left. Images wholly in the reused prefix are not encoded. The
-  result reports `reused_prompt_tokens`. One snapshot is kept; a prompt that does not resume from it replaces it (or clears it, when shorter than 257 tokens).
+  chunks a prefill from 0 runs: every forward cut falls on a multiple of the chunk (`inkling2_prefill_plan.h`), so the
+  resumed forwards are the cold ones call for call and, as the tensor-core routes dispatch on a call's width, bit for
+  bit. Reuse is therefore chunk-grained (2048 positions at the default chunk 2048; `--prefill-chunk 256` for finer reuse). With `--spec dspark` the drafter's sliding rings and anchor context are kept with it (`DSparkProgram::save`); a sampled request does not run the drafter, so a greedy one resumes only from a snapshot a greedy one left. Images wholly in the reused prefix are not encoded. The
+  result reports `reused_prompt_tokens`. One snapshot is kept; a prompt that does not resume from it replaces it (or clears it, when no longer than one chunk).
 - `--spec dspark` (default 3 drafts) speculates on greedy requests (`Inkling2Core::run`):
   - A round drafts n tokens after the anchor, forwards `[anchor, drafts]`, and consumes each column
     whose input is the token the previous column chose; the first that differs ends the round, and

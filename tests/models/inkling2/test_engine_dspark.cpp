@@ -209,14 +209,23 @@ int main() {
         {
             // Prefix reuse with the drafter: a resumed prompt decodes what a cold one does (the round gating is timed, so
             // the acceptance is reported; test_dspark checks a restored drafter drafts the same).
+            // Reuse is chunk-grained: the prompt passes one whole prefill chunk (the Engine's load note names it).
+            std::uint32_t chunk = 0;
+            for (const std::string& note : engine.load_summary().notes) {
+                if (note.rfind("prefill | chunk ", 0) == 0) { chunk = static_cast<std::uint32_t>(std::stoul(note.substr(16))); }
+            }
+            check(chunk > 0, "the Engine reports its prefill chunk");
             std::string context = "Here is a list of facts.";
-            for (int i = 0; i < 60; ++i) { context += " Fact " + std::to_string(i) + ": the number " + std::to_string(i * 7) + " is noted."; }
+            for (int i = 0; engine.tokenize_text(context).size() <= chunk + 64; ++i) {
+                context += " Fact " + std::to_string(i) + ": the number " + std::to_string(i * 7) + " is noted.";
+            }
             context += " Write the facts about even numbers as a table.";
             auto cold_options                         = greedy(64);
             cold_options.execution.allow_prefix_reuse = false;
             const auto cold  = engine.generate(engine.prepare(user_turn(context)), cold_options);
             const auto again = engine.generate(engine.prepare(user_turn(context)), greedy(64));
-            check(again.reused_prompt_tokens >= 256 && again.generated_token_ids == cold.generated_token_ids,
+            check(again.reused_prompt_tokens >= chunk && again.reused_prompt_tokens % chunk == 0 &&
+                      again.generated_token_ids == cold.generated_token_ids,
                   "a resumed prompt decodes as a cold one does: " + std::to_string(again.reused_prompt_tokens) + " reused");
             std::printf("prefix reuse: %u reused; accepted %llu of %llu drafts resumed, %llu of %llu cold\n", again.reused_prompt_tokens,
                         static_cast<unsigned long long>(again.speculative.accepted_tokens),

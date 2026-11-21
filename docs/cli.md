@@ -205,7 +205,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 |---|---|---:|
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
-| `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024`; Inkling-2: the widest of 2048, 1024, 512 and 256 that fits beside `--max-context` |
+| `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024`; Inkling-2: the widest of 2048, 1024, 512 and 256 that fits beside `--max-context` (prefix reuse resumes at a multiple of the chunk) |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
 | `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8, Linux; see the [README](../README.md#several-gpus-pipeline-stages---devices-ab)); overrides `--device` | none |

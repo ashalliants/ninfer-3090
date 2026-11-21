@@ -1,6 +1,7 @@
 // Written for NInfer-3090. See inkling2_core.h.
 
 #include "runtime/engine/inkling2_core.h"
+#include "runtime/engine/inkling2_prefill_plan.h"
 
 #include "artifact/framing.h"
 #include "artifact/reader.h"
@@ -32,6 +33,8 @@ namespace {
 
 namespace ink = models::inkling2;
 using Clock   = std::chrono::steady_clock;
+using inkling2::prefill_call_width;
+using inkling2::prefill_snapshot_at;
 
 double seconds_between(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double>(b - a).count(); }
 
@@ -45,8 +48,6 @@ constexpr std::int32_t kHeld = 256;
 // memory left free after the programs for what the first requests allocate (cuBLAS's handle, say).
 constexpr std::int32_t kChunks[] = {2048, 1024, 512, 256};
 constexpr std::size_t kStartupSpare = 256U << 20;
-// Prefix reuse's granularity: a snapshot keeps a multiple of this many prompt positions, whatever the chunk.
-constexpr std::int32_t kReuseStep = 256;
 
 // The drafter's extend of n taps' columns, in pieces of at most its max_chunk.
 void extend_drafter(ink::DSparkProgram& drafter, std::span<const Tensor> taps, std::int32_t n) {
@@ -665,7 +666,7 @@ void Inkling2Core::run(Job& job) {
     }
 
     // Prefill in chunks from position 0, or from the reused snapshot's position (a whole number of chunks, so the
-    // forwards are the ones a prefill from 0 runs from there).
+    // forwards are the ones a prefill from 0 runs from there, bit for bit: see inkling2_prefill_plan.h).
     auto& program  = programs_->text;
     // Only a request that drafts reads the taps: a sampled one runs its forwards without the copies.
     program.set_taps(speculate);
@@ -683,9 +684,9 @@ void Inkling2Core::run(Job& job) {
         if (speculate) { drafter->reset(); }
         snapshot.position = -1; // its global caches are about to be overwritten
     }
-    // The state after the last whole kReuseStep positions that leave one to compute, kept for the next prompt: a chunk
-    // ends there, so a prompt's chunks are the same whether it resumes or not.
-    const std::int32_t keep_at = snapshot.memory.p != nullptr ? (n - 1) / kReuseStep * kReuseStep : 0;
+    // The state after the last whole chunk that leaves a position to compute, kept for the next prompt. Every cut is a
+    // multiple of chunk_, so a prompt's forwards are the same whether it resumes or not (reuse is chunk-grained).
+    const std::int32_t keep_at = snapshot.memory.p != nullptr ? prefill_snapshot_at(n, chunk_) : 0;
     const auto prefill_start = Clock::now();
     const std::size_t hidden = text_cfg.hidden_size;
     Tensor logits;
@@ -698,7 +699,7 @@ void Inkling2Core::run(Job& job) {
             out.finish_reason = FinishReason::Cancelled;
             return;
         }
-        len = std::min({chunk_, n - s, s < keep_at ? keep_at - s : chunk_});
+        len = prefill_call_width(s, n, chunk_);
         std::vector<ink::InputEmbeddings> inputs;
         for (std::size_t i = 0; i < prompt.images.size(); ++i) {
             const std::int32_t first = prompt.images[i].column, count = prompt.images[i].image.tokens();
