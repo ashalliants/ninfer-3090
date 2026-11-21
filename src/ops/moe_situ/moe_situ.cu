@@ -41,19 +41,29 @@ __device__ float warp_sum(float v) {
 
 // ------------------------------------------------------------------------------------------------ routing
 
-// grid (ceil(E / kWarps), T): warp w of block b scores expert b * kWarps + w for column t.
-__global__ void __launch_bounds__(kThreads)
+// grid (E, T): block (e, t) scores expert e for column t, kScoreThreads threads over the rows (a decode column
+// is 128 blocks, enough to stream the router at bandwidth).
+constexpr int kScoreThreads = 128;
+
+__global__ void __launch_bounds__(kScoreThreads)
 route_score_kernel(const float* __restrict__ z, std::int64_t zs, const float* __restrict__ router, int rows, int experts,
                    float* __restrict__ scores) {
-    const int t = blockIdx.y, e = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
-    if (e >= experts) { return; }
+    __shared__ float part[kScoreThreads / 32];
+    const int e = blockIdx.x, t = blockIdx.y, lane = threadIdx.x & 31;
     const float* col = z + t * zs;
     const float* w = router + static_cast<std::int64_t>(e) * rows;
     float dot = 0.0F;
-#pragma unroll 4
-    for (int d = lane; d < rows; d += 32) { dot = fmaf(__ldg(w + d), __ldg(col + d), dot); }
+#pragma unroll 6
+    for (int d = threadIdx.x; d < rows; d += kScoreThreads) { dot = fmaf(__ldg(w + d), __ldg(col + d), dot); }
     dot = warp_sum(dot);
-    if (lane == 0) { scores[static_cast<std::int64_t>(t) * experts + e] = 1.0F / (1.0F + expf(-dot)); }
+    if (lane == 0) { part[threadIdx.x >> 5] = dot; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = 0.0F;
+#pragma unroll
+        for (int i = 0; i < kScoreThreads / 32; ++i) { total += part[i]; }
+        scores[static_cast<std::int64_t>(t) * experts + e] = 1.0F / (1.0F + expf(-total));
+    }
 }
 
 // One warp per column: top_k rounds of a warp argmax over score + bias (the lower id wins a tie).
@@ -451,6 +461,7 @@ void moe_route_sigmoid_topk(const Tensor& z, const Tensor& router, const Tensor&
     require(router.dtype == DType::FP32 && router.is_contiguous() && router.ne[0] == rows, op, "router must be contiguous FP32 [D, E]");
     const int experts = router.ne[1];
     require(experts > 0 && experts <= kMaxExperts, op, "E must be 1..256");
+    require(cols <= 65535, op, "T must be at most 65535 (the scoring grid's y)");
     require(top_k >= 1 && top_k <= 16 && top_k <= experts, op, "top_k must be 1..min(E, 16)");
     require(bias.dtype == DType::FP32 && bias.is_contiguous() && bias.numel() == experts, op, "bias must be FP32 [E]");
     require(ids.dtype == DType::I32 && ids.is_contiguous() && ids.numel() == static_cast<std::int64_t>(top_k) * cols, op,
@@ -459,7 +470,7 @@ void moe_route_sigmoid_topk(const Tensor& z, const Tensor& router, const Tensor&
             "weights must be contiguous FP32 [k, T]");
     const auto scope = workspace.scope();
     float* scores = static_cast<float*>(workspace.alloc_bytes(static_cast<std::size_t>(experts) * cols * 4).data);
-    route_score_kernel<<<dim3((experts + kWarps - 1) / kWarps, cols), kThreads, 0, stream>>>(
+    route_score_kernel<<<dim3(experts, cols), kScoreThreads, 0, stream>>>(
         static_cast<const float*>(z.data), zs, static_cast<const float*>(router.data), rows, experts, scores);
     check_launch(op);
     route_select_kernel<<<cols, 32, 0, stream>>>(scores, static_cast<const float*>(bias.data), experts, top_k, scale,
