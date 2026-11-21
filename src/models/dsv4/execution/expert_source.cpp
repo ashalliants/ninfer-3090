@@ -351,7 +351,10 @@ ops::MoeExpertSource FileExpertSource::prepare(std::uint32_t layer, const std::i
             } else {
                 cuda_require(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "cudaEventCreate");
             }
-            cuda_require(cudaEventRecord(event, copy_stream_), "promotion event");
+            if (const cudaError_t status = cudaEventRecord(event, copy_stream_); status != cudaSuccess) {
+                free_events_.push_back(event); // not in flight: keep it for reuse (or the destructor) instead of leaking it
+                cuda_require(status, "promotion event");
+            }
             batches_.push_back({batch_id_, event});
         }
         } catch (...) { // frames admitted but not (all) filled must not stay resident
