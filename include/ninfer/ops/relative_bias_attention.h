@@ -76,12 +76,13 @@ struct RelativeBiasAttentionShape {
  *   For head h (kv head g = h / (heads / kv_heads)) and every visible key position j (j <= p, and p - j < window
  *   when window > 0), with dist = p - j:
  *     s_j = <q[h, t], k_j[g]> / sqrt(d) + (dist < E ? sum_c r[h, t][c] * table[c, dist] : 0)
- *     out[h, t] = sum_j e^{s_j} v_j[g] / (e^{sink[h, t]} + sum_j e^{s_j})
+ *     o[h, t] = sum_j e^{s_j} v_j[g] / (e^{sink[h, t]} + sum_j e^{s_j})
+ *     out[h, t] = gate ? o[h, t] / (1 + e^{-gate[h, t]}) : o[h, t]   (sigmoid_gate_fp32 of o, fused)
  *
  * Logical shapes:
  *   q FP32 [heads * d, T]; r FP32 [heads * d_rel, T]; sink FP32 [heads, T]; k_new, v_new FP32 [kv_heads * d, T];
- *   table FP32 [d_rel, E] contiguous; k_cache, v_cache FP32 [kv_heads * d, capacity] contiguous; out FP32
- *   [heads * d, T].
+ *   table FP32 [d_rel, E] contiguous; k_cache, v_cache FP32 [kv_heads * d, capacity] contiguous; gate FP32
+ *   [heads * d, T] or null; out FP32 [heads * d, T], or BF16 with a gate.
  *
  * Supported domain:
  *   d = 128; d_rel at most 32; heads a multiple of kv_heads; columns at any stride; k_cache 16-byte aligned. The ring must hold every
@@ -92,7 +93,8 @@ struct RelativeBiasAttentionShape {
  *
  * Numeric:
  *   FP32 scores and max-subtracted online softmax with the sink as the initial maximum; oracle FP64
- *   (inkling2_reference.h attention, relative_bias).
+ *   (inkling2_reference.h attention, relative_bias). With a gate, the same bits as sigmoid_gate_fp32 of the
+ *   ungated FP32 output (a BF16 out rounds that to nearest even).
  *
  * Effects: writes the T new cache slots and out. out must not overlap any input or cache.
  * Workspace: none. Execution: stream-ordered; graph capturable (one graph for every position with
@@ -101,6 +103,6 @@ struct RelativeBiasAttentionShape {
 void relative_bias_sink_attention(const RelativeBiasAttentionShape& shape, const Tensor& q, const Tensor& r,
                                   const Tensor& sink, const Tensor& k_new, const Tensor& v_new, const Tensor& table,
                                   Tensor& k_cache, Tensor& v_cache, std::int64_t start,
-                                  const std::int64_t* start_offset, Tensor& out, cudaStream_t stream);
+                                  const std::int64_t* start_offset, const Tensor* gate, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops

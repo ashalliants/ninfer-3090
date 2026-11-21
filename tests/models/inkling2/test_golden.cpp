@@ -315,6 +315,7 @@ int main() {
             auto logits = logit_columns(program.forward(first_prompt), vocab);
             std::int32_t next = static_cast<std::int32_t>(argmax(logits.back().data(), vocab));
             std::string ids = std::to_string(next);
+            std::vector<float> decoded; // every step's logits, for NINFER_INKLING2_DUMP (bit-exact comparisons of decode)
             cudaDeviceSynchronize();
             const auto d0 = std::chrono::steady_clock::now();
             for (int i = 1; i < decode_tokens; ++i) {
@@ -322,8 +323,10 @@ int main() {
                 logits = logit_columns(program.forward(one), vocab);
                 next   = static_cast<std::int32_t>(argmax(logits.back().data(), vocab));
                 ids += " " + std::to_string(next);
+                if (dump_root != nullptr) { decoded.insert(decoded.end(), logits.back().begin(), logits.back().end()); }
             }
             const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - d0).count();
+            if (dump_root != nullptr) { write_file(fs::path(dump_root) / "decode_logits.f32", decoded.data(), decoded.size() * 4); }
             std::printf("greedy continuation of p0: %s\n", ids.c_str());
             std::printf("decode: %d steps in %.2f s = %.2f tok/s (FP32 correctness kernels, logits copied to the host each step)\n",
                         decode_tokens - 1, seconds, (decode_tokens - 1) / seconds);

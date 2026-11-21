@@ -410,11 +410,10 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
 
     // 3g: attention, output gate, output projection and its convolution.
     ops::RelativeBiasAttentionShape shape{heads, i32(c.kv_heads), d, i32(c.d_rel), local ? i32(c.sliding_window) : 0};
-    Tensor o = workspace_.alloc(DType::FP32, {q, cols});
     const Tensor rel_bias = model_.tensor(w.rel_bias, {i32(c.d_rel), i32(c.rel_extent_of(p))});
-    ops::relative_bias_sink_attention(shape, q_t, r_t, sink, kconv, vconv, rel_bias, st.k_cache, st.v_cache, start, start_offset_, o, stream_);
-    Tensor gated = workspace_.alloc(DType::BF16, {q, cols});
-    ops::sigmoid_gate_fp32(o, gate, gated, stream_);
+    Tensor gated = workspace_.alloc(DType::BF16, {q, cols}); // the attention output times sigmoid(gate)
+    ops::relative_bias_sink_attention(shape, q_t, r_t, sink, kconv, vconv, rel_bias, st.k_cache, st.v_cache, start, start_offset_, &gate,
+                                      gated, stream_);
     const WeightId ow[] = {w.output};
     const std::int32_t orows[] = {h};
     Tensor a_in = project(gated, ow, orows);
@@ -455,14 +454,16 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         control(cw, cin, min, cout);
         z = zc;
     }
+    // The FFN norm is formed by the routing launch (the same bits as rmsnorm_fp32), into zn.
     const Tensor ffn_norm = model_.tensor(w.ffn_norm, {h});
-    ops::rmsnorm_fp32(z, &ffn_norm, eps, z, stream_);
+    Tensor zn = workspace_.alloc(DType::FP32, {h, cols});
+    const ops::RouteInputNorm norm{&ffn_norm, eps, &zn};
     const std::int32_t top_k = i32(c.experts_per_token);
     Tensor ids = workspace_.alloc(DType::I32, {top_k, cols}), weights = workspace_.alloc(DType::FP32, {top_k, cols});
-    ops::moe_route_sigmoid_topk(z, model_.tensor(w.router, {h, i32(c.experts)}), model_.tensor(w.router_bias, {i32(c.experts)}), top_k,
-                                c.route_scale, workspace_, ids, weights, stream_);
+    ops::moe_route_sigmoid_topk(z, &norm, model_.tensor(w.router, {h, i32(c.experts)}), model_.tensor(w.router_bias, {i32(c.experts)}),
+                                top_k, c.route_scale, workspace_, ids, weights, stream_);
     Tensor y = workspace_.alloc(DType::FP32, {h, cols});
-    ops::moe_situ_experts(model_.expert_bank(p), z, ids, weights, c.gate_softcap, c.up_softcap, workspace_, y, stream_);
+    ops::moe_situ_experts(model_.expert_bank(p), zn, ids, weights, c.gate_softcap, c.up_softcap, workspace_, y, stream_);
     {
         const Tensor mlp_taps = model_.tensor(w.mlp_post_conv, {k, h});
         ops::ShortConvJob job;
