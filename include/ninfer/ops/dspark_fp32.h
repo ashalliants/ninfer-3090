@@ -116,10 +116,12 @@ void dspark_markov_logits_fp32(const Tensor& base, const Tensor& hb, const Tenso
                                Tensor& logits, cudaStream_t stream);
 
 /**
- * Op: argmax_fp32: out[t] = the lowest v < valid_rows with logits[v, t] maximal (NaN never wins over a number).
+ * Op: argmax_fp32: out[t] = the lowest v < valid_rows with logits[v, t] maximal (NaN never wins over a number), or
+ * `non_finite` when that maximum is not finite (every value NaN, or the maximum infinite): a diverged forward, which
+ * a sampler refuses (kSamplerNonFiniteToken) and a drafter may just draft a token from.
  *
  * logits FP32 [rows, T] (columns at any stride), out I32 [T]. Exact.
  */
-void argmax_fp32(const Tensor& logits, std::int32_t valid_rows, Tensor& out, cudaStream_t stream);
+void argmax_fp32(const Tensor& logits, std::int32_t valid_rows, Tensor& out, cudaStream_t stream, std::int32_t non_finite = 0);
 
 } // namespace ninfer::ops

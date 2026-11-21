@@ -8,6 +8,7 @@
 #include "core/startup.h"
 #include "models/inkling2/program/dspark_program.h"
 #include "ninfer/ops/dspark_fp32.h"
+#include "ninfer/ops/sampling.h"
 #include "models/inkling2/program/text_program.h"
 #include "models/inkling2/program/vision_program.h"
 
@@ -794,13 +795,17 @@ void Inkling2Core::run(Job& job) {
                     argmax_from = col;
                     const auto cols = static_cast<std::int32_t>(logits.ne[1]) - col;
                     Tensor ids(programs_->argmax.p, DType::I32, {cols});
-                    ops::argmax_fp32(logits.slice(1, col, cols), static_cast<std::int32_t>(text_cfg.unpadded_vocab_size), ids, stream_);
+                    ops::argmax_fp32(logits.slice(1, col, cols), static_cast<std::int32_t>(text_cfg.unpadded_vocab_size), ids, stream_,
+                                     ops::kSamplerNonFiniteToken);
                     argmax_host.resize(static_cast<std::size_t>(cols));
                     check_cuda(cudaMemcpyAsync(argmax_host.data(), ids.data, argmax_host.size() * 4, cudaMemcpyDeviceToHost, stream_), "argmax");
                     check_cuda(cudaStreamSynchronize(stream_), "argmax");
                     argmax_stale = false;
                 }
                 next = argmax_host[static_cast<std::size_t>(col - argmax_from)];
+                if (next == ops::kSamplerNonFiniteToken) {
+                    throw RequestError(RequestErrorKind::NumericalFailure, "inkling2: the logits are not finite");
+                }
             } else {
                 const Tensor last = logits.slice(1, col, 1);
                 check_cuda(cudaMemcpyAsync(host.data(), last.data, host.size() * 4, cudaMemcpyDeviceToHost, stream_), "logits");

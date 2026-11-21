@@ -366,7 +366,7 @@ markov_logits_kernel(const float* base, const float* __restrict__ hb, const floa
 }
 
 // grid (T), block 1024.
-__global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ logits, std::int64_t stride, int valid, int* __restrict__ out) {
+__global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ logits, std::int64_t stride, int valid, int non_finite, int* __restrict__ out) {
     __shared__ float best_v[32];
     __shared__ int best_i[32];
     const float* col = logits + blockIdx.x * stride;
@@ -391,7 +391,7 @@ __global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ 
             const int oi   = best_i[w];
             if (oi != valid && (bi == valid || ov > bv || (ov == bv && oi < bi))) { bv = ov, bi = oi; }
         }
-        out[blockIdx.x] = bi == valid ? 0 : bi;
+        out[blockIdx.x] = bi == valid || !isfinite(bv) ? non_finite : bi;
     }
 }
 
@@ -530,12 +530,12 @@ void dspark_markov_logits_fp32(const Tensor& base, const Tensor& hb, const Tenso
     check_launch(op);
 }
 
-void argmax_fp32(const Tensor& logits, std::int32_t valid_rows, Tensor& out, cudaStream_t stream) {
+void argmax_fp32(const Tensor& logits, std::int32_t valid_rows, Tensor& out, cudaStream_t stream, std::int32_t non_finite) {
     constexpr const char* op = "argmax_fp32";
     const Columns c = columns(logits, op, "logits");
     require(valid_rows >= 1 && valid_rows <= c.rows, op, "bad valid_rows");
     require(out.dtype == DType::I32 && out.numel() == c.cols && out.data != nullptr, op, "out must be I32 [T]");
-    argmax_kernel<<<c.cols, 1024, 0, stream>>>(static_cast<const float*>(logits.data), c.stride, valid_rows, static_cast<int*>(out.data));
+    argmax_kernel<<<c.cols, 1024, 0, stream>>>(static_cast<const float*>(logits.data), c.stride, valid_rows, non_finite, static_cast<int*>(out.data));
     check_launch(op);
 }
 

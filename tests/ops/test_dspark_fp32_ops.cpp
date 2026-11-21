@@ -337,6 +337,18 @@ void test_argmax() {
     }
     std::printf("argmax_fp32 got %d %d %d %d, want %d %d %d %d\n", got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
     check(got == want && want[0] == 17 && want[2] == 123456 && want[3] == 0, "argmax_fp32");
+    // No finite maximum: every value NaN (column 0), or an infinite one (column 1); column 2 is ordinary.
+    for (int i = 0; i < rows; ++i) { x[i] = std::numeric_limits<float>::quiet_NaN(); }
+    x[rows + 9] = std::numeric_limits<float>::infinity();
+    Buf dy(x);
+    Tensor ty = dy.tensor({rows, cols});
+    ninfer::ops::argmax_fp32(ty, valid, to, nullptr, -1);
+    const auto flagged = t::from_device<std::int32_t>(out.b, cols);
+    ninfer::ops::argmax_fp32(ty, valid, to, nullptr);
+    const auto defaulted = t::from_device<std::int32_t>(out.b, cols);
+    std::printf("argmax_fp32 non-finite: got %d %d %d, default %d %d\n", flagged[0], flagged[1], flagged[2], defaulted[0], defaulted[1]);
+    check(flagged[0] == -1 && flagged[1] == -1 && flagged[2] == 123456 && defaulted[0] == 0 && defaulted[1] == 0,
+          "argmax_fp32 reports a column with no finite maximum");
 }
 
 } // namespace
