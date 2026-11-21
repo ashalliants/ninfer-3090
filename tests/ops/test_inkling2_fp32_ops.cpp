@@ -23,6 +23,7 @@
 #include "ops/inkling2_reference.h"
 #include "ops/op_tester.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -427,8 +428,9 @@ void test_batches() {
 // Positions 0..n-1 through relative_bias_sink_attention in calls of `chunk`, against the oracle over the whole sequence.
 // With device_start each call passes start 0 and the position as the device offset (how a decode graph runs).
 // Only positions from check_from on are compared (the FP64 oracle is quadratic in n).
+// With split the calls get a split workspace (calls of at most kSplitMaxColumns columns split their keys).
 void test_attention(int window, int extent, int n, int chunk, const std::string& label, bool device_start = false,
-                    int check_from = 0) {
+                    int check_from = 0, bool split = false) {
     const int heads = 24, kvh = 8, d = 128, rel = 16, qw = heads * d, kvw = kvh * d;
     auto q = randoms(qw * n, -0.3F, 0.3F), r = randoms(heads * rel * n), sink = randoms(heads * n, -2, 2), k = randoms(kvw * n),
          v = randoms(kvw * n), table = randoms(extent * rel, -0.5, 0.5);
@@ -441,6 +443,14 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
     Tensor tkc2 = kc2.tensor({kvw, capacity}), tvc2 = vc2.tensor({kvw, capacity});
     ninfer::DeviceBuffer gated(static_cast<std::size_t>(qw) * n * 2), want_gated(static_cast<std::size_t>(qw) * n * 2);
     ninfer::DeviceBuffer doff(sizeof(std::int64_t));
+    const ninfer::ops::RelativeBiasAttentionShape split_shape{heads, kvh, d, rel, window};
+    const std::size_t split_bytes = split ? ninfer::ops::relative_bias_attention_split_bytes(split_shape, chunk, capacity) : 0;
+    Buf ws(std::max<std::size_t>(split_bytes / 4, 1));
+    const Tensor split_ws = ws.tensor({static_cast<std::int32_t>(std::max<std::size_t>(split_bytes / 4, 1))});
+    const Tensor* ws_arg = split_bytes > 0 ? &split_ws : nullptr;
+    ninfer::DeviceBuffer counters(std::size_t(ninfer::ops::kSplitMaxColumns) * heads * 4);
+    counters.fill(0);
+    auto* counters_arg = split_bytes > 0 ? static_cast<std::int32_t*>(counters.p) : nullptr;
     for (int s = 0; s < n; s += chunk) {
         const int len = std::min(chunk, n - s);
         const std::int64_t position = s;
@@ -454,7 +464,7 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
                                                   &kn, &vn,
                                                   dt.tensor({rel, extent}), tkc, tvc, device_start ? 0 : s,
                                                   device_start ? static_cast<const std::int64_t*>(doff.p) : nullptr, nullptr, to,
-                                                  nullptr);
+                                                  nullptr, ws_arg, counters_arg);
         Tensor tg = Tensor(gated.p, DType::BF16, {qw, n}).slice(1, s, len);
         const Tensor gate = dg.tensor({qw, n}).slice(1, s, len);
         ninfer::ops::relative_bias_sink_attention({heads, kvh, d, rel, window}, dq.tensor({qw, n}).slice(1, s, len),
@@ -462,7 +472,12 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
                                                   &kn, &vn,
                                                   dt.tensor({rel, extent}), tkc2, tvc2, device_start ? 0 : s,
                                                   device_start ? static_cast<const std::int64_t*>(doff.p) : nullptr, &gate, tg,
-                                                  nullptr);
+                                                  nullptr, ws_arg, counters_arg);
+    }
+    if (split_bytes > 0) {
+        std::vector<std::int32_t> left(std::size_t(ninfer::ops::kSplitMaxColumns) * heads);
+        counters.copy_to_host(left.data(), left.size() * 4);
+        check(std::all_of(left.begin(), left.end(), [](std::int32_t c) { return c == 0; }), label + ": the split counters are not left zero");
     }
     {
         // A gated BF16 out without storage is refused before the launch (the caches are not appended to).
@@ -559,6 +574,112 @@ void test_head_norm_append() {
         check(refused, "head_norms_fp32 appends to a cache without storage");
     }
     std::printf("head_norms_fp32 with a KvAppend: the plain call's bits, in the wrapped ring slots too\n");
+}
+
+// The FP16 KV rings (opt-in, lossy). head_norms_fp32 with a KvAppend into an FP16 ring: x the plain call's bits and
+// the slots hold those columns rounded to nearest. relative_bias_sink_attention over FP16 rings of n positions: the FP64
+// oracle over the decoded keys and values.
+void test_kv_fp16() {
+    const int heads = 24, kvh = 8, d = 128, rel = 16, qw = heads * d, kvw = kvh * d;
+    {
+        const DType form = DType::FP16;
+        const char* name = "FP16";
+        const int slot_rows = kvw;
+        const std::size_t slot_bytes = static_cast<std::size_t>(slot_rows) * 2;
+        // Host encoding and decoding of one column of kvw values.
+        const auto encode = [&](const float* x, std::uint8_t* slot, float* decoded) {
+            for (int i = 0; i < kvw; ++i) {
+                const __half hv = __float2half_rn(x[i]);
+                std::memcpy(slot + 2 * i, &hv, 2);
+                decoded[i] = __half2float(hv);
+            }
+        };
+        {
+            const int cols = 3, capacity = 4;
+            const auto x = randoms(kvw * cols, -2, 2);
+            Buf a(x), b(x);
+            ninfer::DeviceBuffer ring(slot_bytes * capacity);
+            check(cudaMemset(ring.p, 0, slot_bytes * capacity) == cudaSuccess, "ring clear");
+            Tensor ta = a.tensor({kvw, cols}), tb = b.tensor({kvw, cols}), tc(ring.p, form, {slot_rows, capacity});
+            const ninfer::ops::KvAppend append{&tc, 2, nullptr};
+            ninfer::ops::HeadNormJob ja, jb;
+            ja.x = &ta, jb.x = &tb, ja.head_dim = jb.head_dim = d, ja.threshold = jb.threshold = 3.0F, ja.append = &append;
+            ninfer::ops::head_norms_fp32(std::span<const ninfer::ops::HeadNormJob>(&ja, 1), nullptr);
+            ninfer::ops::head_norms_fp32(std::span<const ninfer::ops::HeadNormJob>(&jb, 1), nullptr);
+            const auto ga = a.get(kvw * cols), gb = b.get(kvw * cols);
+            std::vector<std::uint8_t> got(slot_bytes * capacity), want(slot_bytes * capacity, 0);
+            check(cudaMemcpy(got.data(), ring.p, got.size(), cudaMemcpyDeviceToHost) == cudaSuccess, "ring download");
+            std::vector<float> decoded(kvw);
+            for (int c = 0; c < cols; ++c) { encode(gb.data() + c * kvw, want.data() + ((2 + c) % capacity) * slot_bytes, decoded.data()); }
+            check(std::memcmp(ga.data(), gb.data(), ga.size() * 4) == 0 && got == want,
+                  std::string("head_norms_fp32 append into a ") + name + " ring: x or the slots differ from the host encoding");
+        }
+        {
+            // 600 keys: the last 8 columns also go through the split kernel (three splits).
+            const int n = 600, extent = 64, tail = 8;
+            auto q = randoms(qw * n, -0.3F, 0.3F), r = randoms(heads * rel * n), sink = randoms(heads * n, -2, 2), k = randoms(kvw * n),
+                 v = randoms(kvw * n), table = randoms(extent * rel, -0.5, 0.5);
+            std::vector<std::uint8_t> kring(slot_bytes * n), vring(slot_bytes * n);
+            std::vector<float> kd(k.size()), vd(v.size());
+            for (int t = 0; t < n; ++t) {
+                encode(k.data() + t * kvw, kring.data() + t * slot_bytes, kd.data() + t * kvw);
+                encode(v.data() + t * kvw, vring.data() + t * slot_bytes, vd.data() + t * kvw);
+            }
+            ninfer::DeviceBuffer dk(kring.size()), dv(vring.size());
+            check(cudaMemcpy(dk.p, kring.data(), kring.size(), cudaMemcpyHostToDevice) == cudaSuccess &&
+                      cudaMemcpy(dv.p, vring.data(), vring.size(), cudaMemcpyHostToDevice) == cudaSuccess,
+                  "ring upload");
+            Buf dq(q), dr(r), ds(sink), dt(table), out(static_cast<std::size_t>(qw * n));
+            Tensor tk(dk.p, form, {slot_rows, n}), tv(dv.p, form, {slot_rows, n}), to = out.tensor({qw, n});
+            ninfer::ops::relative_bias_sink_attention({heads, kvh, d, rel, 0}, dq.tensor({qw, n}), dr.tensor({heads * rel, n}),
+                                                      ds.tensor({heads, n}), nullptr, nullptr, dt.tensor({rel, extent}), tk, tv, 0,
+                                                      nullptr, nullptr, to, nullptr);
+            Vec want;
+            const Vec table64 = widen(table), kd64 = widen(kd), vd64 = widen(vd);
+            for (int p = 0; p < n; ++p) {
+                std::vector<bool> visible(n);
+                Vec bias(static_cast<std::size_t>(heads) * n, 0.0);
+                for (int j = 0; j < n; ++j) {
+                    visible[j] = j <= p;
+                    for (int hh = 0; hh < heads; ++hh) {
+                        const Vec rr(r.begin() + (p * heads + hh) * rel, r.begin() + (p * heads + hh + 1) * rel);
+                        bias[hh * n + j] = ref::relative_bias(rr.data(), table64, rel, p - j);
+                    }
+                }
+                const Vec o = ref::attention(Vec(q.begin() + p * qw, q.begin() + (p + 1) * qw), kd64, vd64, bias,
+                                             Vec(sink.begin() + p * heads, sink.begin() + (p + 1) * heads), visible, heads, kvh, d);
+                want.insert(want.end(), o.begin(), o.end());
+            }
+            compare(std::string("attention over ") + name + " rings, 600 keys", out.get(qw * n), want, 2e-6);
+            {
+                const ninfer::ops::RelativeBiasAttentionShape shape{heads, kvh, d, rel, 0};
+                const std::size_t split_bytes = ninfer::ops::relative_bias_attention_split_bytes(shape, tail, n);
+                check(split_bytes > 0, "the FP16 split case splits");
+                Buf ws(split_bytes / 4), out2(static_cast<std::size_t>(qw * tail));
+                const Tensor split_ws = ws.tensor({static_cast<std::int32_t>(split_bytes / 4)});
+                ninfer::DeviceBuffer counters(std::size_t(ninfer::ops::kSplitMaxColumns) * heads * 4);
+                counters.fill(0);
+                Tensor to2 = out2.tensor({qw, tail});
+                ninfer::ops::relative_bias_sink_attention(shape, dq.tensor({qw, n}).slice(1, n - tail, tail),
+                                                          dr.tensor({heads * rel, n}).slice(1, n - tail, tail),
+                                                          ds.tensor({heads, n}).slice(1, n - tail, tail), nullptr, nullptr,
+                                                          dt.tensor({rel, extent}), tk, tv, n - tail, nullptr, nullptr, to2, nullptr,
+                                                          &split_ws, static_cast<std::int32_t*>(counters.p));
+                compare(std::string("split attention over ") + name + " rings, last 8 of 600 keys", out2.get(qw * tail),
+                        Vec(want.end() - static_cast<std::ptrdiff_t>(qw) * tail, want.end()), 2e-6);
+            }
+            // Appending k_new and v_new is FP32 only.
+            const Tensor kn = dq.tensor({kvw, n}), vn = dq.tensor({kvw, n});
+            bool refused = false;
+            try {
+                ninfer::ops::relative_bias_sink_attention({heads, kvh, d, rel, 0}, dq.tensor({qw, n}), dr.tensor({heads * rel, n}),
+                                                          ds.tensor({heads, n}), &kn, &vn, dt.tensor({rel, extent}), tk, tv, 0, nullptr,
+                                                          nullptr, to, nullptr);
+            } catch (const std::invalid_argument&) { refused = true; }
+            check(refused, std::string("relative_bias_sink_attention appends k_new into a ") + name + " ring");
+        }
+    }
+    std::printf("KV rings FP16: appends match the host encoding, attention matches the oracle over the decoded rings\n");
 }
 
 // projection_fp32_inputs: each weight's rows by its own input, the bits of projection_fp32 on that input alone.
@@ -1131,7 +1252,12 @@ int main() {
         test_attention(0, 1024, 1030, 515, "attention global, two key tiles (last 6 of 1030)", false, 1024);
         // Every key of a tile scored: one query sees 40 keys (16-key steps, a partial last one), all compared.
         test_attention(0, 64, 40, 40, "attention global, 40 keys in one call");
+        test_attention(0, 1024, 1300, 4, "attention global split, chunks of 4 (last 4)", false, 1296, true);
+        test_attention(0, 1024, 1300, 1, "attention global split, decode, device start (last 4)", true, 1296, true);
+        test_attention(1024, 1024, 1300, 4, "attention local window 1024 split, ring wraps (last 4)", false, 1296, true);
+        test_attention(0, 64, 200, 1, "attention global, 200 keys with the split workspace: the single block (last 8)", true, 192, true);
         test_head_norm_append();
+        test_kv_fp16();
         test_projection_inputs();
         test_route();
         test_experts(true, 128, 64, 3, "moe_situ_experts NVFP4 small");

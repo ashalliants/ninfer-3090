@@ -798,6 +798,21 @@ int main() {
                           make_engine_options(parse({"ninfer-serve", "model.ninfer", "--dense-q8", "all"})).dense_q8 == ninfer::DenseQ8::All &&
                           make_engine_options(parse({"ninfer-serve", "model.ninfer"})).dense_q8 == ninfer::DenseQ8::Off,
                       "--dense-q8 did not reach the Engine options");
+    // --no-split-attention reaches the Engine options (Inkling-2's single-block attention, the earlier bits).
+    failures += check(!make_engine_options(parse({"ninfer-serve", "model.ninfer", "--no-split-attention"})).split_attention &&
+                          make_engine_options(parse({"ninfer-serve", "model.ninfer"})).split_attention,
+                      "--no-split-attention did not reach the Engine options");
+    // --kv-dtype fp16|fp32 are Inkling-2's KV rings: kv_rings, the KV cache storage left at its default.
+    {
+        using ninfer::KvRings;
+        const auto fp16 = make_engine_options(parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "fp16"}));
+        const auto fp32 = make_engine_options(parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "fp32"}));
+        failures += check(fp16.kv_rings == KvRings::FP16 && fp16.kv_cache == ninfer::KvCacheStorage::BFloat16 &&
+                              fp32.kv_rings == KvRings::FP32 && fp32.kv_cache == ninfer::KvCacheStorage::BFloat16 &&
+                              make_engine_options(parse({"ninfer-serve", "model.ninfer"})).kv_rings == KvRings::Default &&
+                              make_engine_options(parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "int8"})).kv_rings == KvRings::Default,
+                          "--kv-dtype fp16|fp32 did not reach the Engine options");
+    }
     // --spec dspark drafts 3 per round unless --draft-tokens says otherwise (1..7).
     const ninfer::EngineOptions dspark = make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "dspark"}));
     failures += check(dspark.speculative.backend == ninfer::SpeculativeBackend::DSpark && dspark.speculative.draft_tokens == 3,

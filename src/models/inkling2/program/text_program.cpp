@@ -13,6 +13,7 @@
 
 #include "core/copy_batch.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <span>
@@ -34,7 +35,8 @@ void sync(cudaStream_t stream) {
 }
 
 // Every allocation one token costs in a forward call (persistent across visits and per visit), with slack.
-std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk) {
+std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk, std::int32_t max_context, bool split_attention,
+                            std::int32_t logit_columns) {
     const std::size_t h = c.hidden_size, q = std::size_t(c.heads) * c.head_dim, kv = std::size_t(c.kv_heads) * c.head_dim;
     const std::size_t per_visit_kept = 6 * h * 4; // ffn_inp, the output and a core visit's four loop messages
     const std::size_t per_visit_temp = 12 * h * 4 + 3 * h * 2 + (2 * q + std::size_t(c.heads) * (c.d_rel + 1)) * 4 +
@@ -44,10 +46,17 @@ std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk) {
                                        ops::depth_attention_mix_workspace_bytes(i32(c.hidden_size), 1, ops::kDepthAttentionMaxSources) +
                                        ops::loop_controller_workspace_bytes(i32(c.hidden_size), i32(c.loop_gate_rank), 1,
                                                                             ops::kLoopControllerMaxJobs);
-    const std::size_t output = std::size_t(c.vocab_size) * 4 + 4 * h * 4;
+    const std::size_t output = 4 * h * 4;
     const std::size_t per_token = c.num_layer_visits * per_visit_kept + per_visit_temp + output;
+    const std::size_t logits = std::size_t(c.vocab_size) * 4 * static_cast<std::size_t>(logit_columns);
     // Each allocation pads to 256 bytes; a visit makes about 60.
-    return per_token * static_cast<std::size_t>(chunk) + (c.num_layer_visits * 2 + 64) * kAlign * 4 + (64U << 20);
+    // The attention's split parts of a call of up to kSplitMaxColumns columns over the ring that shows the most keys
+    // (a global one of max_context, or a local window).
+    const ops::RelativeBiasAttentionShape global{i32(c.heads), i32(c.kv_heads), i32(c.head_dim), i32(c.d_rel), 0};
+    const std::int64_t keys = std::max<std::int64_t>(max_context, c.sliding_window);
+    const std::size_t split =
+        split_attention ? ops::relative_bias_attention_split_bytes(global, std::min(chunk, ops::kSplitMaxColumns), keys) : 0;
+    return per_token * static_cast<std::size_t>(chunk) + logits + split + (c.num_layer_visits * 2 + 64) * kAlign * 4 + (64U << 20);
 }
 
 // The limits, validated before anything is sized from them.
@@ -65,15 +74,18 @@ ProgramLimits checked(ProgramLimits limits) {
 
 TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t stream)
     : model_(model), config_(model.config()), limits_(limits), stream_(stream),
-      workspace_(workspace_bytes(model.config(), checked(limits).max_chunk)) {
+      workspace_(workspace_bytes(model.config(), checked(limits).max_chunk, limits.max_context, limits.split_attention,
+                                 limits.last_logits ? std::max(1, limits.max_rollback) : limits.max_chunk)) {
     const TextConfig& c = config_;
     const std::size_t kv = std::size_t(c.kv_heads) * c.head_dim, taps = c.conv_kernel_size - 1;
     const std::size_t local_cap = c.sliding_window - 1 + static_cast<std::size_t>(limits.max_chunk);
+    const DType ring = limits.kv_fp16 ? DType::FP16 : DType::FP32; // the KV rings' values
+    const std::size_t ring_bytes = dtype_size(ring);
     std::size_t total = 0;
     std::vector<std::size_t> capacity(c.num_layer_visits);
     for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
         capacity[v] = c.local[c.physical(v)] ? local_cap : static_cast<std::size_t>(limits.max_context);
-        total += 2 * padded(kv * capacity[v] * 4) + 2 * padded(kv * taps * 4) + 2 * padded(std::size_t(c.hidden_size) * taps * 4);
+        total += 2 * padded(kv * capacity[v] * ring_bytes) + 2 * padded(kv * taps * 4) + 2 * padded(std::size_t(c.hidden_size) * taps * 4);
         if (limits.max_rollback > 0) {
             const std::size_t saved = taps + static_cast<std::size_t>(limits.max_rollback);
             total += 2 * padded(kv * saved * 4) + 2 * padded(std::size_t(c.hidden_size) * saved * 4);
@@ -84,17 +96,21 @@ TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t 
         total += padded(std::size_t(c.hidden_size) * static_cast<std::size_t>(limits.max_chunk) * 4);
     }
     state_memory_ = DeviceBuffer(total);
+    if (limits.split_attention) {
+        split_counters_ = DeviceBuffer(std::size_t(ops::kSplitMaxColumns) * c.heads * 4);
+        split_counters_.fill(0);
+    }
     auto* base = static_cast<std::byte*>(state_memory_.p);
     std::size_t offset = 0;
-    const auto carve = [&](std::int32_t rows, std::int32_t cols) {
-        Tensor t(base + offset, DType::FP32, {rows, cols});
+    const auto carve = [&](std::int32_t rows, std::int32_t cols, DType dtype = DType::FP32) {
+        Tensor t(base + offset, dtype, {rows, cols});
         offset += padded(t.bytes());
         return t;
     };
     for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
         VisitState s;
-        s.k_cache   = carve(i32(kv), i32(capacity[v]));
-        s.v_cache   = carve(i32(kv), i32(capacity[v]));
+        s.k_cache   = carve(i32(kv), i32(capacity[v]), ring);
+        s.v_cache   = carve(i32(kv), i32(capacity[v]), ring);
         s.k_hist    = carve(i32(kv), i32(taps));
         s.v_hist    = carve(i32(kv), i32(taps));
         s.attn_hist = carve(i32(c.hidden_size), i32(taps));
@@ -145,7 +161,7 @@ std::size_t TextProgram::snapshot_bytes() const {
         const VisitState& s = state_[v];
         total += s.k_hist.bytes() + s.v_hist.bytes() + s.attn_hist.bytes() + s.mlp_hist.bytes();
         if (config_.local[config_.physical(v)]) {
-            total += 2 * static_cast<std::size_t>(s.k_cache.ne[0]) * 4 * (config_.sliding_window - 1);
+            total += 2 * static_cast<std::size_t>(s.k_cache.nb[1]) * (config_.sliding_window - 1);
         }
     }
     return total;
@@ -163,7 +179,7 @@ void TextProgram::save(Snapshot& snapshot) const {
             out += t->bytes();
         }
         if (!config_.local[config_.physical(v)]) { continue; }
-        const std::size_t column = static_cast<std::size_t>(s.k_cache.ne[0]) * 4;
+        const std::size_t column = static_cast<std::size_t>(s.k_cache.nb[1]);
         for (const Tensor* t : {&s.k_cache, &s.v_cache}) {
             auto* base = out;
             ring_runs(first, position_ - first, t->ne[1], [&](std::int64_t slot, std::int64_t run) {
@@ -190,7 +206,7 @@ void TextProgram::restore(const Snapshot& snapshot) {
             in += t->bytes();
         }
         if (!config_.local[config_.physical(v)]) { continue; }
-        const std::size_t column = static_cast<std::size_t>(s.k_cache.ne[0]) * 4;
+        const std::size_t column = static_cast<std::size_t>(s.k_cache.nb[1]);
         for (Tensor* t : {&s.k_cache, &s.v_cache}) {
             const auto* base = in;
             ring_runs(first, snapshot.position - first, t->ne[1], [&](std::int64_t slot, std::int64_t run) {
@@ -449,8 +465,12 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     ops::RelativeBiasAttentionShape shape{heads, i32(c.kv_heads), d, i32(c.d_rel), local ? i32(c.sliding_window) : 0};
     const Tensor rel_bias = model_.tensor(w.rel_bias, {i32(c.d_rel), i32(c.rel_extent_of(p))});
     Tensor gated = workspace_.alloc(DType::BF16, {q, cols}); // the attention output times sigmoid(gate)
+    const std::size_t split_bytes =
+        limits_.split_attention && graph_split_ ? ops::relative_bias_attention_split_bytes(shape, cols, st.k_cache.ne[1]) : 0;
+    const Tensor split = split_bytes > 0 ? workspace_.alloc(DType::FP32, {i32(split_bytes / 4)}) : Tensor{};
     ops::relative_bias_sink_attention(shape, q_t, r_t, sink, nullptr, nullptr, rel_bias, st.k_cache, st.v_cache, start, start_offset_, &gate,
-                                      gated, stream_);
+                                      gated, stream_, split_bytes > 0 ? &split : nullptr,
+                                      split_bytes > 0 ? static_cast<std::int32_t*>(split_counters_.p) : nullptr);
     const WeightId ow[] = {w.output};
     const std::int32_t orows[] = {h};
     Tensor a_in = project(gated, ow, orows);
@@ -588,8 +608,10 @@ Tensor TextProgram::forward_graph(std::int32_t token) {
     if (cudaMemcpyAsync(step_.p, &host, sizeof host, cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
         throw std::runtime_error("inkling2: step upload failed");
     }
-    // The graph with the tap copies, or the one without (the same graph when there are no taps).
-    const std::size_t g     = taps_on_ && !taps_.empty() ? 1 : 0;
+    // The graph with the tap copies, or the one without (the same graph when there are no taps); with the split
+    // attention once the new column sees more than kSplitMinKeys keys (the graph's grid is sized for the whole ring).
+    const bool split        = limits_.split_attention && position_ + 1 > ops::kSplitMinKeys;
+    const std::size_t g     = (taps_on_ && !taps_.empty() ? 2 : 0) + (split ? 1 : 0);
     cudaGraphExec_t& exec   = decode_graph_[g];
     Tensor& graph_logits    = graph_logits_[g];
     if (exec == nullptr) {
@@ -599,9 +621,11 @@ Tensor TextProgram::forward_graph(std::int32_t token) {
             throw std::runtime_error("inkling2: cannot capture the decode graph");
         }
         start_offset_ = static_cast<const std::int64_t*>(step_.p);
+        graph_split_  = split;
         // Ends the capture and returns its graph; a graph handle is destroyed whatever the capture's result.
         const auto end_capture = [&]() -> cudaGraph_t {
             start_offset_ = nullptr;
+            graph_split_  = true;
             cudaGraph_t graph = nullptr;
             const cudaError_t ended = cudaStreamEndCapture(stream_, &graph);
             if (ended != cudaSuccess) {
@@ -701,8 +725,11 @@ Tensor TextProgram::run(const Tensor& ids, std::int64_t start, const Trace* trac
         sync(stream_);
         (*trace)("result_norm", x);
     }
-    Tensor xb = workspace_.alloc(DType::BF16, {h, cols});
-    ops::cast_fp32_to_bf16(x, xb, stream_);
+    // last_logits: a prefill chunk's logits are its last column's (projection_fp32's columns do not depend on the width).
+    const bool last_only = limits_.last_logits && cols > std::max(1, limits_.max_rollback);
+    const Tensor xs = last_only ? x.slice(1, cols - 1, 1) : x;
+    Tensor xb = workspace_.alloc(DType::BF16, {h, xs.ne[1]});
+    ops::cast_fp32_to_bf16(xs, xb, stream_);
     const WeightId head[] = {model_.weights().head};
     const std::int32_t head_rows[] = {i32(c.vocab_size)};
     Tensor logits = project(xb, head, head_rows);

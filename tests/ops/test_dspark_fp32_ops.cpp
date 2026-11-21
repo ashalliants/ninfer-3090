@@ -235,13 +235,40 @@ void test_fuse_taps() {
     }
 }
 
-void test_attention(std::int64_t anchor, int capacity, int window, const std::string& label, int w = 8) {
+// fp16: the rings are FP16, written by dspark_ring_write from FP32 columns (checked against the host's round to
+// nearest), and the oracle reads the values they hold.
+void test_attention(std::int64_t anchor, int capacity, int window, const std::string& label, int w = 8, bool fp16 = false) {
     const int d = 128, heads = 24, kv_heads = 8, kv = kv_heads * d;
     const auto q = randoms(static_cast<std::size_t>(heads) * d * w, -1, 1);
-    const auto kr = randoms(static_cast<std::size_t>(kv) * capacity, -1, 1), vr = randoms(static_cast<std::size_t>(kv) * capacity, -2, 2);
+    auto kr = randoms(static_cast<std::size_t>(kv) * capacity, -1, 1), vr = randoms(static_cast<std::size_t>(kv) * capacity, -2, 2);
     const auto kb = randoms(static_cast<std::size_t>(kv) * w, -1, 1), vb = randoms(static_cast<std::size_t>(kv) * w, -2, 2);
     Buf dq(q), dkr(kr), dvr(vr), dkb(kb), dvb(vb), out(q.size() * 4);
     Tensor tq = dq.tensor({heads * d, w}), tkr = dkr.tensor({kv, capacity}), tvr = dvr.tensor({kv, capacity});
+    Buf hk(static_cast<std::size_t>(kv) * capacity * 2), hv(static_cast<std::size_t>(kv) * capacity * 2);
+    if (fp16) {
+        // Written from slot 5 on, so the write wraps; the host keeps the same layout.
+        Tensor fk = hk.tensor({kv, capacity}, DType::FP16), fv = hv.tensor({kv, capacity}, DType::FP16);
+        ninfer::ops::dspark_ring_write(tkr, fk, 5, nullptr);
+        ninfer::ops::dspark_ring_write(tvr, fv, 5, nullptr);
+        for (auto [ring, host] : {std::pair{&hk, &kr}, std::pair{&hv, &vr}}) {
+            std::vector<__half> got(static_cast<std::size_t>(kv) * capacity);
+            if (cudaMemcpy(got.data(), ring->b.p, got.size() * 2, cudaMemcpyDeviceToHost) != cudaSuccess) { throw std::runtime_error("copy"); }
+            std::vector<float> placed(host->size());
+            bool exact = true;
+            for (int c = 0; c < capacity; ++c) {
+                const std::size_t slot = static_cast<std::size_t>((c + 5) % capacity);
+                for (int i = 0; i < kv; ++i) {
+                    const __half want = __float2half_rn((*host)[static_cast<std::size_t>(c) * kv + i]);
+                    const __half have = got[slot * kv + i];
+                    exact = exact && std::memcmp(&want, &have, 2) == 0;
+                    placed[slot * kv + i] = __half2float(have);
+                }
+            }
+            check(exact, "dspark_ring_write " + label + ": the FP16 slots are not the host's round to nearest");
+            *host = placed;
+        }
+        tkr = hk.tensor({kv, capacity}, DType::FP16), tvr = hv.tensor({kv, capacity}, DType::FP16);
+    }
     Tensor tkb = dkb.tensor({kv, w}), tvb = dvb.tensor({kv, w}), to = out.tensor({heads * d, w});
     const ninfer::ops::DSparkAttentionShape shape{heads, kv_heads, d, window};
     Buf ws(ninfer::ops::dspark_block_attention_workspace_bytes(shape, w));
@@ -489,6 +516,8 @@ int main() {
         test_attention(3000, 4096, 0, "global, W 16", 16);
         // Past 23,040 keys, the most the single-block form held in shared memory.
         test_attention(30000, 30720, 0, "global, 30,008 keys", 16);
+        test_attention(5000, 1024, 1024, "FP16 rings, local, wrapped ring", 16, true);
+        test_attention(30000, 30720, 0, "FP16 rings, global, 30,008 keys", 16, true);
         test_markov();
         test_markov_compact();
         test_argmax();

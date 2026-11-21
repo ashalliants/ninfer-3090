@@ -41,7 +41,7 @@ const DSparkConfig& require_dspark(const Model& model) {
 } // namespace
 
 DSparkProgram::DSparkProgram(const Model& model, std::int32_t max_context, std::int32_t max_chunk, cudaStream_t stream,
-                             const ops::Q8Weight* head_q8)
+                             const ops::Q8Weight* head_q8, bool kv_fp16)
     : model_(model), config_(require_dspark(model)), text_(model.config()), max_context_(max_context), max_chunk_(max_chunk),
       stream_(stream),
       workspace_((std::size_t(model.config().vocab_size) * require_dspark(model).block_size * 4) +
@@ -59,7 +59,7 @@ DSparkProgram::DSparkProgram(const Model& model, std::int32_t max_context, std::
     std::vector<std::size_t> capacity(c.layers);
     for (std::uint32_t i = 0; i < c.layers; ++i) {
         capacity[i] = c.local[i] ? c.sliding_window : static_cast<std::size_t>(max_context);
-        total += 2 * padded(kv * capacity[i] * 4);
+        total += 2 * padded(kv * capacity[i] * (kv_fp16 ? 2 : 4));
     }
     state_memory_ = DeviceBuffer(total);
     auto* base    = static_cast<std::byte*>(state_memory_.p);
@@ -70,7 +70,8 @@ DSparkProgram::DSparkProgram(const Model& model, std::int32_t max_context, std::
         return t;
     };
     for (std::uint32_t i = 0; i < c.layers; ++i) {
-        layers_.push_back({carve(DType::FP32, {i32(kv), i32(capacity[i])}), carve(DType::FP32, {i32(kv), i32(capacity[i])})});
+        const DType ring = kv_fp16 ? DType::FP16 : DType::FP32;
+        layers_.push_back({carve(ring, {i32(kv), i32(capacity[i])}), carve(ring, {i32(kv), i32(capacity[i])})});
     }
     masks_    = carve(DType::FP32, {i32(h), i32(c.block_size)});
     joint_in_ = carve(DType::FP32, {i32(2 * r + 2 * h)});
@@ -180,20 +181,8 @@ void DSparkProgram::extend(std::span<const Tensor> taps, std::int32_t n) {
         ops::dense_projection_fp32(ctx, matrix(model_.matrix(l.context_v)), nullptr, v, stream_);
         ops::head_rmsnorm_rope_fp32(k, i32(c.head_dim), model_.tensor(l.context_k_norm, {i32(c.head_dim)}), c.rms_norm_eps, true,
                                     position_, c.rope_theta, stream_);
-        // Columns into the ring slots (position mod capacity): at most two contiguous runs.
-        const Layer& layer           = layers_[i];
-        const std::int64_t capacity  = layer.k_ring.ne[1];
-        const std::size_t column     = static_cast<std::size_t>(kv) * 4;
-        for (std::int32_t done = 0; done < n;) {
-            const std::int64_t slot = (position_ + done) % capacity;
-            const std::int32_t run  = static_cast<std::int32_t>(std::min<std::int64_t>(n - done, capacity - slot));
-            for (auto [ring, src] : {std::pair{&layer.k_ring, &k}, std::pair{&layer.v_ring, &v}}) {
-                cuda(cudaMemcpyAsync(static_cast<std::byte*>(ring->data) + slot * column, static_cast<const std::byte*>(src->data) + done * column,
-                                     run * column, cudaMemcpyDeviceToDevice, stream_),
-                     "ring write");
-            }
-            done += run;
-        }
+        ops::dspark_ring_write(k, layers_[i].k_ring, position_, stream_);
+        ops::dspark_ring_write(v, layers_[i].v_ring, position_, stream_);
     }
     // The Markov head's context: the last committed position's fused taps (row `layers`, its own norm).
     std::vector<Tensor> last;
