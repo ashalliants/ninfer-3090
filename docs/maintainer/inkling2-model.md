@@ -619,6 +619,37 @@ max of 1.1e-2.
 The split parts take `relative_bias_attention_split_bytes`: 8 columns × 24 heads × (d + 2) floats per 256 keys of
 the longest ring. That is about 25 MB of workspace at 65,536 context.
 
+## FP16 KV rings
+
+**Lossy.** `--kv-dtype fp16` (`EngineOptions::kv_fp16`, `ProgramLimits::kv_fp16`) is opt-in and off by default.
+The default keeps FP32 rings. With FP16 rings the head norms' append rounds each normalized K and V value to
+nearest FP16, and the attention widens the values back to FP32 as it reads them. Scores, softmax and sums stay FP32.
+A position costs 32 KiB across the 8 global visits instead of 64 KiB, so about twice the context fits. Inkling-2
+refuses every other `--kv-dtype` form.
+
+It is not a speed option. Decode attention is latency-bound, not bandwidth-bound, so halving the bytes changes
+little.
+
+Measured on the V100 (2026-11-21), `ninfer_inkling2_golden_test`, split attention on, A B B A in one hold per
+context. The numbers are the mean of the two runs of each form.
+
+| Context | Prefill FP32 / FP16 (tok/s) | Decode FP32 / FP16 (tok/s) |
+|---|---|---|
+| 1,024 | 370.6 / 377.7 | 67.80 / 68.11 |
+| 16,384 | 288.3 / 309.6 | 61.07 / 62.68 |
+
+KLD(FP32 rings || FP16 rings) is teacher-forced over 30,840 tokens of docs and C++ in chunks of 256
+(`NINFER_INKLING2_KV_FP16_KLD`). It is the same size as an FP32 reordering of the attention sums on this model
+([Split decode attention](#split-decode-attention)): near-tied MoE routing turns any small change into flipped
+experts.
+
+| Positions | KLD mean | KLD median | KLD p99 | KLD max | Argmax agrees |
+|---|---|---|---|---|---|
+| [0, 1024) | 2.70e-3 | 8.52e-4 | 2.38e-2 | 6.44e-2 | 97.36% |
+| [1024, 4096) | 3.65e-3 | 1.41e-3 | 3.24e-2 | 3.98e-1 | 97.07% |
+| [4096, 16384) | 3.47e-3 | 1.27e-3 | 3.14e-2 | 4.50e-1 | 97.78% |
+| [16384, 30840) | 3.49e-3 | 1.33e-3 | 3.14e-2 | 1.91e-1 | 97.36% |
+
 ## GGUF mapping (Unsloth `unsloth/Inkling-2-Mini-GGUF`)
 
 Every UD quant has 734 tensors and the same keys. Read from 20 MB header range reads

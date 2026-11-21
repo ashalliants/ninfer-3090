@@ -274,6 +274,7 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         limits.max_context = static_cast<std::int32_t>(options_.max_context);
         limits.max_chunk   = kChunk;
         limits.split_attention = options_.split_attention;
+        limits.kv_fp16         = options_.kv_fp16;
         const bool dspark  = options_.speculative.backend == SpeculativeBackend::DSpark;
         if (dspark) {
             const ink::DSparkConfig* dc = model_->dspark_config();

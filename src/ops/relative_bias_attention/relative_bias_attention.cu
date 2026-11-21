@@ -3,6 +3,7 @@
 #include "ninfer/ops/relative_bias_attention.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <algorithm>
 #include <cmath>
@@ -39,6 +40,11 @@ std::int64_t column_stride(const Tensor& t, std::int32_t rows, std::int32_t cols
     return cols == 1 ? rows : t.nb[1] / 4;
 }
 
+bool fp16_ring(DType dtype, const char* op) {
+    require(dtype == DType::FP32 || dtype == DType::FP16, op, "a KV ring is FP32 or FP16");
+    return dtype == DType::FP16;
+}
+
 __device__ float warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) { v += __shfl_xor_sync(0xffffffffU, v, o); }
     return v;
@@ -56,7 +62,8 @@ struct HeadArgs {
     float threshold[kHeadNormMaxJobs], alpha[kHeadNormMaxJobs], eps[kHeadNormMaxJobs];
     int head_dim[kHeadNormMaxJobs], kind[kHeadNormMaxJobs]; // kind: 0 clip, 1 clip with log scale, 2 unit rms
     int head_begin[kHeadNormMaxJobs]; // first global head of each job
-    float* cache[kHeadNormMaxJobs];   // or null: the KV ring the normalized column is also written to
+    void* cache[kHeadNormMaxJobs];    // or null: the KV ring the normalized column is also written to
+    bool cache_fp16[kHeadNormMaxJobs]; // the ring holds FP16 (round to nearest) rather than FP32
     std::int64_t cache_start[kHeadNormMaxJobs], capacity[kHeadNormMaxJobs], cache_rows[kHeadNormMaxJobs];
     const std::int64_t* cache_offset[kHeadNormMaxJobs];
     int count, total;
@@ -64,7 +71,7 @@ struct HeadArgs {
 
 // The L2 clip of one head slice v (lane `lane` of its warp).
 // copy (or null) receives the same values as v.
-__device__ void clip_head(float* v, float* copy, int head_dim, const float* scale, float threshold, bool log_scale, double pos,
+__device__ void clip_head(float* v, int head_dim, const float* scale, float threshold, bool log_scale, double pos,
                           std::int64_t floor, float alpha, int lane) {
     float local[8];
     float ss = 0.0F;
@@ -82,18 +89,16 @@ __device__ void clip_head(float* v, float* copy, int head_dim, const float* scal
         const int d = lane + 32 * i;
         if (d < head_dim) {
             v[d] = local[i] * f;
-            if (copy != nullptr) { copy[d] = v[d]; }
         }
     }
 }
 
-__device__ void unit_rms_head(float* v, float* copy, int head_dim, float eps, int lane) {
+__device__ void unit_rms_head(float* v, int head_dim, float eps, int lane) {
     float ss = 0.0F;
     for (int d = lane; d < head_dim; d += 32) { ss = fmaf(v[d], v[d], ss); }
     const float inv = rsqrtf(warp_sum(ss) / static_cast<float>(head_dim) + eps);
     for (int d = lane; d < head_dim; d += 32) {
         v[d] *= inv;
-        if (copy != nullptr) { copy[d] = v[d]; }
     }
 }
 
@@ -109,7 +114,8 @@ __device__ __forceinline__ void head_norm(const HeadArgs& a, int t, int g, int l
     const std::int64_t* offset = a.start_offset[0];
     float threshold = a.threshold[0], alpha = a.alpha[0], eps = a.eps[0];
     int head_dim = a.head_dim[0], kind = a.kind[0], begin = a.head_begin[0];
-    float* cache = a.cache[0];
+    void* cache = a.cache[0];
+    bool fp16 = a.cache_fp16[0];
     std::int64_t cache_start = a.cache_start[0], capacity = a.capacity[0], cache_rows = a.cache_rows[0];
     const std::int64_t* cache_offset = a.cache_offset[0];
 #pragma unroll
@@ -118,24 +124,31 @@ __device__ __forceinline__ void head_norm(const HeadArgs& a, int t, int g, int l
             x = a.x[i], xs = a.xs[i], start = a.start[i], floor = a.floor[i], scale = a.scale[i], offset = a.start_offset[i];
             threshold = a.threshold[i], alpha = a.alpha[i], eps = a.eps[i], head_dim = a.head_dim[i], kind = a.kind[i];
             begin = a.head_begin[i];
-            cache = a.cache[i], cache_start = a.cache_start[i], capacity = a.capacity[i], cache_offset = a.cache_offset[i];
+            cache = a.cache[i], fp16 = a.cache_fp16[i], cache_start = a.cache_start[i], capacity = a.capacity[i], cache_offset = a.cache_offset[i];
             cache_rows = a.cache_rows[i];
         }
     }
     const int h = g - begin;
     float* v = x + t * xs + static_cast<std::int64_t>(h) * head_dim;
-    float* copy = nullptr;
-    if (cache != nullptr) {
-        // relative_bias_sink_attention's append: slot (start + offset + t) mod capacity of a [rows, capacity] ring.
-        const std::int64_t first = cache_start + (cache_offset != nullptr ? *cache_offset : 0);
-        copy = cache + ((first + t) % capacity) * cache_rows + static_cast<std::int64_t>(h) * head_dim;
-    }
     if (kind == 2) {
-        unit_rms_head(v, copy, head_dim, eps, lane);
+        unit_rms_head(v, head_dim, eps, lane);
     } else {
         const double pos = kind == 1 ? static_cast<double>(start + (offset != nullptr ? *offset : 0) + t) : 0.0;
-        clip_head(v, copy, head_dim, scale != nullptr ? scale + static_cast<std::int64_t>(h) * head_dim : nullptr, threshold, kind == 1,
-                  pos, floor, alpha, lane);
+        clip_head(v, head_dim, scale != nullptr ? scale + static_cast<std::int64_t>(h) * head_dim : nullptr, threshold, kind == 1, pos,
+                  floor, alpha, lane);
+    }
+    if (cache != nullptr) {
+        // relative_bias_sink_attention's append: slot (start + offset + t) mod capacity of a [rows, capacity] ring.
+        // Each lane reads back the values it wrote.
+        const std::int64_t first = cache_start + (cache_offset != nullptr ? *cache_offset : 0);
+        const std::int64_t at = ((first + t) % capacity) * cache_rows + static_cast<std::int64_t>(h) * head_dim;
+        if (fp16) {
+            __half* copy = static_cast<__half*>(cache) + at;
+            for (int d = lane; d < head_dim; d += 32) { copy[d] = __float2half_rn(v[d]); }
+        } else {
+            float* copy = static_cast<float*>(cache) + at;
+            for (int d = lane; d < head_dim; d += 32) { copy[d] = v[d]; }
+        }
     }
 }
 
@@ -159,7 +172,8 @@ __global__ void append_kernel(const float* __restrict__ k_new, std::int64_t ks, 
 }
 
 struct AttentionArgs {
-    const float *q, *r, *sink, *table, *k, *v;
+    const float *q, *r, *sink, *table;
+    const void *k, *v; // FP32 or FP16 (the kernel's Fp16 parameter)
     std::int64_t qs, rs, ss, os, gs;
     const float* gate; // or null
     void* out;
@@ -235,11 +249,22 @@ __device__ void finish_split(const AttentionArgs& a, int t, int h, int used) {
     }
 }
 
+// The value of ring slot `slot` at row `col`.
+template <bool Fp16>
+__device__ __forceinline__ float value_at(const AttentionArgs& a, std::int64_t slot, std::int64_t col) {
+    if constexpr (Fp16) {
+        return __half2float(static_cast<const __half*>(a.v)[slot * a.kv_width + col]);
+    } else {
+        return static_cast<const float*>(a.v)[slot * a.kv_width + col];
+    }
+}
+
 // Split: blockIdx.z takes the keys [lo + z * kSplitKeys, lo + (z + 1) * kSplitKeys) of the visible ones and writes
 // its maximum, denominator and unnormalized sums to a.split (the sink counts in split 0); a split past the column's
 // keys does nothing. The last split block to finish combines the parts (finish_split). The keys of one split
 // are one tile, so a column of at most kSplitKeys keys folds them the same way either way.
-template <typename Out, bool Split>
+// Fp16: the rings hold FP16 values, widened to FP32 as they are read.
+template <typename Out, bool Fp16, bool Split>
 __global__ void __launch_bounds__(kThreads) attention_kernel(AttentionArgs a) {
     __shared__ __align__(16) float q[kHeadDim]; // read as float4
     __shared__ float r[kMaxRel];
@@ -278,12 +303,26 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(AttentionArgs a) {
             const bool valid = i < n;
             std::int64_t slot = base_slot + (valid ? i : 0);
             slot -= slot >= a.capacity ? a.capacity : 0;
-            const float4* key = reinterpret_cast<const float4*>(a.k + slot * a.kv_width + static_cast<std::int64_t>(g) * kHeadDim);
             float dot = 0.0F;
+            if constexpr (Fp16) {
+                const uint2* key = reinterpret_cast<const uint2*>(static_cast<const __half*>(a.k) + slot * a.kv_width +
+                                                                  static_cast<std::int64_t>(g) * kHeadDim);
 #pragma unroll
-            for (int m = 0; m < kHeadDim / (4 * kKeyLanes); ++m) {
-                const float4 kv = __ldg(key + sub + kKeyLanes * m), qv = q4[sub + kKeyLanes * m];
-                dot = fmaf(qv.x, kv.x, fmaf(qv.y, kv.y, fmaf(qv.z, kv.z, fmaf(qv.w, kv.w, dot))));
+                for (int m = 0; m < kHeadDim / (4 * kKeyLanes); ++m) {
+                    const uint2 w = __ldg(key + sub + kKeyLanes * m);
+                    const float2 lo = __half22float2(*reinterpret_cast<const __half2*>(&w.x));
+                    const float2 hi = __half22float2(*reinterpret_cast<const __half2*>(&w.y));
+                    const float4 qv = q4[sub + kKeyLanes * m];
+                    dot = fmaf(qv.x, lo.x, fmaf(qv.y, lo.y, fmaf(qv.z, hi.x, fmaf(qv.w, hi.y, dot))));
+                }
+            } else {
+                const float4* key = reinterpret_cast<const float4*>(static_cast<const float*>(a.k) + slot * a.kv_width +
+                                                                    static_cast<std::int64_t>(g) * kHeadDim);
+#pragma unroll
+                for (int m = 0; m < kHeadDim / (4 * kKeyLanes); ++m) {
+                    const float4 kv = __ldg(key + sub + kKeyLanes * m), qv = q4[sub + kKeyLanes * m];
+                    dot = fmaf(qv.x, kv.x, fmaf(qv.y, kv.y, fmaf(qv.z, kv.z, fmaf(qv.w, kv.w, dot))));
+                }
             }
             const std::int64_t dist = pos - (base + i);
             float bias = 0.0F;
@@ -314,13 +353,13 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(AttentionArgs a) {
             for (int u = 0; u < 4; ++u) {
                 std::int64_t slot = base_slot + i + u;
                 slot -= slot >= a.capacity ? a.capacity : 0;
-                part[u] = fmaf(scores[i + u], a.v[slot * a.kv_width + col], part[u]);
+                part[u] = fmaf(scores[i + u], value_at<Fp16>(a, slot, col), part[u]);
             }
         }
         for (; i < n; ++i) {
             std::int64_t slot = base_slot + i;
             slot -= slot >= a.capacity ? a.capacity : 0;
-            part[0] = fmaf(scores[i], a.v[slot * a.kv_width + col], part[0]);
+            part[0] = fmaf(scores[i], value_at<Fp16>(a, slot, col), part[0]);
         }
         acc = fmaf(acc, rescale, (part[0] + part[1]) + (part[2] + part[3]));
         m = top;
@@ -364,11 +403,12 @@ void head_norms_fp32(std::span<const HeadNormJob> jobs, cudaStream_t stream) {
         a.floor[j] = 1;
         if (job.append != nullptr) {
             const KvAppend& ap = *job.append;
-            require(ap.cache != nullptr && ap.cache->data != nullptr && ap.cache->dtype == DType::FP32 && ap.cache->is_contiguous() &&
+            require(ap.cache != nullptr && ap.cache->data != nullptr && ap.cache->is_contiguous() &&
                         ap.cache->ne[0] == x.ne[0] && ap.cache->ne[1] >= cols && ap.cache->ne[2] == 1 && ap.cache->ne[3] == 1 &&
                         ap.start >= 0,
-                    op, "an append's cache must be contiguous FP32 [rows, capacity >= T]");
-            a.cache[j]        = static_cast<float*>(ap.cache->data);
+                    op, "an append's cache must be contiguous FP32 or FP16 [rows, capacity >= T]");
+            a.cache[j]        = ap.cache->data;
+            a.cache_fp16[j]   = fp16_ring(ap.cache->dtype, op);
             a.cache_start[j]  = ap.start;
             a.cache_offset[j] = ap.start_offset;
             a.capacity[j]     = ap.cache->ne[1];
@@ -454,12 +494,14 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     }
     require(table.dtype == DType::FP32 && table.is_contiguous() && table.ne[0] == s.d_rel && table.ne[1] > 0, op,
             "table must be contiguous FP32 [d_rel, E]");
-    require(k_cache.dtype == DType::FP32 && v_cache.dtype == DType::FP32 && k_cache.is_contiguous() && v_cache.is_contiguous() &&
-                k_cache.ne[0] == kv_width && v_cache.ne[0] == kv_width && k_cache.ne[1] == v_cache.ne[1],
-            op, "caches must be contiguous FP32 [kv_heads * d, capacity]");
+    const bool fp16 = fp16_ring(k_cache.dtype, op);
+    require(v_cache.dtype == k_cache.dtype && k_cache.is_contiguous() && v_cache.is_contiguous() && k_cache.ne[0] == kv_width &&
+                v_cache.ne[0] == kv_width && k_cache.ne[1] == v_cache.ne[1],
+            op, "caches must be contiguous [kv_heads * d, capacity], both FP32 or both FP16");
+    require(k_new == nullptr || !fp16, op, "appending k_new and v_new needs FP32 rings (FP16 rings take head_norms_fp32's append)");
     // Both paths read the caches (the pre-appended one, k_new = v_new = null, only reads them), so both need storage.
     require(k_cache.data != nullptr && v_cache.data != nullptr, op, "k_cache and v_cache need storage");
-    require(reinterpret_cast<std::uintptr_t>(k_cache.data) % 16 == 0, op, "k_cache must be 16-byte aligned (float4 key loads)");
+    require(reinterpret_cast<std::uintptr_t>(k_cache.data) % 16 == 0, op, "k_cache must be 16-byte aligned (vector key loads)");
     const std::int64_t capacity = k_cache.ne[1];
     require(s.window > 0 ? capacity >= s.window - 1 + cols : capacity >= start + cols, op, "the KV ring cannot hold the visible keys");
     require((k_new == nullptr) == (v_new == nullptr), op, "k_new and v_new come together");
@@ -474,8 +516,8 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     a.r = static_cast<const float*>(r.data);
     a.sink = static_cast<const float*>(sink.data);
     a.table = static_cast<const float*>(table.data);
-    a.k = static_cast<const float*>(k_cache.data);
-    a.v = static_cast<const float*>(v_cache.data);
+    a.k = k_cache.data;
+    a.v = v_cache.data;
     a.out = out.data;
     a.heads = s.heads;
     a.group = s.heads / s.kv_heads;
@@ -501,14 +543,30 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
         a.counters = split_counters;
         const dim3 parts(cols, s.heads, splits);
         if (out.dtype == DType::BF16) {
-            attention_kernel<__nv_bfloat16, true><<<parts, kThreads, 0, stream>>>(a);
+            if (fp16) {
+                attention_kernel<__nv_bfloat16, true, true><<<parts, kThreads, 0, stream>>>(a);
+            } else {
+                attention_kernel<__nv_bfloat16, false, true><<<parts, kThreads, 0, stream>>>(a);
+            }
         } else {
-            attention_kernel<float, true><<<parts, kThreads, 0, stream>>>(a);
+            if (fp16) {
+                attention_kernel<float, true, true><<<parts, kThreads, 0, stream>>>(a);
+            } else {
+                attention_kernel<float, false, true><<<parts, kThreads, 0, stream>>>(a);
+            }
         }
     } else if (out.dtype == DType::BF16) {
-        attention_kernel<__nv_bfloat16, false><<<grid, kThreads, 0, stream>>>(a);
+        if (fp16) {
+            attention_kernel<__nv_bfloat16, true, false><<<grid, kThreads, 0, stream>>>(a);
+        } else {
+            attention_kernel<__nv_bfloat16, false, false><<<grid, kThreads, 0, stream>>>(a);
+        }
     } else {
-        attention_kernel<float, false><<<grid, kThreads, 0, stream>>>(a);
+        if (fp16) {
+            attention_kernel<float, true, false><<<grid, kThreads, 0, stream>>>(a);
+        } else {
+            attention_kernel<float, false, false><<<grid, kThreads, 0, stream>>>(a);
+        }
     }
     check_launch(op);
 }

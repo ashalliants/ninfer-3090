@@ -45,8 +45,8 @@ void head_l2_clip_fp32(Tensor& x, int head_dim, const Tensor* scale, float thres
 void head_unit_rms_fp32(Tensor& x, int head_dim, float eps, cudaStream_t stream);
 
 /// relative_bias_sink_attention's append done by head_norms_fp32: the job's normalized column t is also written
-/// to slot (start + (start_offset ? *start_offset : 0) + t) mod capacity of `cache` (FP32 [rows, capacity],
-/// contiguous), the same values.
+/// to slot (start + (start_offset ? *start_offset : 0) + t) mod capacity of `cache` ([rows, capacity], contiguous):
+/// the same values in an FP32 ring, rounded to nearest in an FP16 ring.
 struct KvAppend {
     Tensor* cache                    = nullptr;
     std::int64_t start               = 0;
@@ -93,7 +93,8 @@ struct RelativeBiasAttentionShape {
  *
  * Logical shapes:
  *   q FP32 [heads * d, T]; r FP32 [heads * d_rel, T]; sink FP32 [heads, T]; k_new, v_new FP32 [kv_heads * d, T];
- *   table FP32 [d_rel, E] contiguous; k_cache, v_cache FP32 [kv_heads * d, capacity] contiguous, with storage on
+ *   table FP32 [d_rel, E] contiguous; k_cache, v_cache [kv_heads * d, capacity] contiguous, both FP32 or both FP16
+ *   (FP16: opt-in, lossy rings; k_new and v_new must then be null, appended by head_norms_fp32), with storage on
  *   both paths (refused otherwise, before any launch); gate FP32
  *   [heads * d, T] or null; out FP32 [heads * d, T], or BF16 with a gate.
  *
@@ -105,7 +106,8 @@ struct RelativeBiasAttentionShape {
  *   ring bound is then the caller's to keep (the host check sees only `start`).
  *
  * Numeric:
- *   FP32 scores and max-subtracted online softmax with the sink as the initial maximum; oracle FP64
+ *   FP32 scores and max-subtracted online softmax with the sink as the initial maximum (FP16 keys and values
+ *   widened to FP32 as they are read); oracle FP64
  *   (inkling2_reference.h attention, relative_bias). With a gate, the same bits as sigmoid_gate_fp32 of the
  *   ungated FP32 output (a BF16 out rounds that to nearest even).
  *   Split keys: given a `split_workspace`, a call of at most kSplitMaxColumns columns over a ring that can show a
