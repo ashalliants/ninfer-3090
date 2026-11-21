@@ -3,9 +3,10 @@
 // --spec dspark through the public Engine (runtime/engine/inkling2_core.h) on real chat prompts:
 // - greedy output equals a plain Engine's, token for token, for every prompt, also under a thinking budget and a
 //   stop string (each token still goes through the plain loop; a round only saves forwards);
-// - a sampled request runs plain (no rounds) and repeats under a fixed seed;
+// - a sampled request runs plain (no rounds, no fallback steps) and repeats under a fixed seed;
+// - relaxed drafting, which DSpark does not implement, is refused;
 // - reported, not judged: rounds, drafts accepted, plain fallback steps, and decode tok/s of both Engines.
-// Skips without NINFER_TEST_INKLING2_ARTIFACT. NINFER_INKLING2_SPEC_DRAFTS: drafts per round (default 2);
+// Skips without NINFER_TEST_INKLING2_ARTIFACT. NINFER_INKLING2_SPEC_DRAFTS: drafts per round (default 3, the serving default);
 // NINFER_INKLING2_SPEC_TOKENS: output tokens per prompt (default 256).
 
 #include "ninfer/engine.h"
@@ -13,6 +14,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -85,7 +87,7 @@ int main() {
         std::printf("SKIP: set NINFER_TEST_INKLING2_ARTIFACT\n");
         return 77;
     }
-    const std::uint32_t drafts = std::getenv("NINFER_INKLING2_SPEC_DRAFTS") ? std::atoi(std::getenv("NINFER_INKLING2_SPEC_DRAFTS")) : 2;
+    const std::uint32_t drafts = std::getenv("NINFER_INKLING2_SPEC_DRAFTS") ? std::atoi(std::getenv("NINFER_INKLING2_SPEC_DRAFTS")) : 3;
     const std::uint32_t tokens = std::getenv("NINFER_INKLING2_SPEC_TOKENS") ? std::atoi(std::getenv("NINFER_INKLING2_SPEC_TOKENS")) : 256;
     try {
         ninfer::EngineOptions options;
@@ -106,6 +108,15 @@ int main() {
         }
         options.speculative.backend      = ninfer::SpeculativeBackend::DSpark;
         options.speculative.draft_tokens = drafts;
+        {
+            auto relaxed             = options;
+            relaxed.relaxed_drafting = 0.5F;
+            bool refused             = false;
+            try {
+                ninfer::Engine refused_engine(relaxed);
+            } catch (const std::invalid_argument&) { refused = true; }
+            check(refused, "DSpark with relaxed drafting is refused");
+        }
         ninfer::Engine engine(options);
         std::printf("dspark, %u drafts per round:\n", drafts);
         const Run spec = run_all(engine, tokens);
@@ -150,7 +161,7 @@ int main() {
         sampled.execution.requested_output_tokens = 32;
         const auto s1 = engine.generate(engine.prepare(user_turn(kPrompts[2])), sampled);
         const auto s2 = engine.generate(engine.prepare(user_turn(kPrompts[2])), sampled);
-        check(s1.speculative.rounds == 0 && s1.generated_token_ids == s2.generated_token_ids, "a sampled request runs plain and repeats");
+        check(s1.speculative.rounds == 0 && s1.speculative.fallback_steps == 0 && s1.generated_token_ids == s2.generated_token_ids, "a sampled request runs plain and repeats");
         const double plain_rate = (plain.generated - kPrompts.size()) / plain.decode_seconds;
         const double spec_rate  = (spec.generated - kPrompts.size()) / spec.decode_seconds;
         std::printf("plain %.1f tok/s, dspark %.1f tok/s (%.2fx); %llu rounds, %.2f drafts accepted per round, %llu plain steps\n",

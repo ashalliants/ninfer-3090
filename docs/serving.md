@@ -43,7 +43,7 @@ HTTP alias override and does not select or alter model execution.
 Vision is disabled by default: its weights and Vision-specific unified-workspace extent are not
 allocated, and media requests and token-count requests fail with HTTP 400 `vision_disabled`. Add
 `--vision` when the server must accept image or video input. Speculative residency is likewise
-frozen by `--spec mtp|dflash|dflash2` and `--draft-tokens`; omitting `--spec` loads no speculative backend.
+frozen by `--spec mtp|dflash|dflash2|dspark` and `--draft-tokens`; omitting `--spec` loads no speculative backend.
 Any `--spec` also loads the optimized proposal head (`--lm-head-draft` is implied). DFlash on 35B-A3B and DFlash2 on Qwen3.8-27B can be combined
 with `--vision`; each accelerates generated-text decode after multimodal prefill, while Vision encode
 and prefill remain outside speculative acceleration. A later request cannot enable a capability
@@ -144,6 +144,9 @@ different from the Qwen3.5 models:
   50-100 ms; a 1920 x 1200 one, 2,280 tokens, in about 0.4 s. Startup encodes one blank image (about
   2 s) so the first real image does not pay the tower's one-time setup. `--vision-residency` has no
   effect for this model.
+- **DSpark speculation** (Inkling-2, `--spec dspark [--draft-tokens N]`, N from 1 to 7, default 3):
+  greedy requests only, output unchanged token for token; see [cli.md](cli.md#speculative-decoding).
+  About 1.28x plain greedy decode on a Tesla V100 over chat prompts, most on code.
 - **MTP speculation** (`--spec mtp --draft-tokens N`, N from 1 to 7) needs an artifact converted
   with the drafter (`--mtp-gguf`, [weight-conversion.md](weight-conversion.md)); a plain artifact
   refuses with that instruction. The output is the same as without it, token for token (greedy).

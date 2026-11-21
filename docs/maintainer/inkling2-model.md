@@ -320,8 +320,11 @@ match CPU llama.cpp at the same revision (`llama-speculative-simple --spec-type 
 | p3 French narrative | 1.6% | 1.8% |
 
 p2 is the chat prompt (13.9% in ninfer). The two greedy paths differ slightly, so the rates do too. On these
-prompts speculative decoding is slower than plain decoding (36 against 74 tokens/s). A round accepts about one
-draft. Verifying 8 tokens costs about 3 decode steps (43 ms), and drafting takes 9 ms.
+prompts, drafting all 7, speculative decoding is slower than plain decoding (36 against 74 tokens/s). A round
+accepts about one draft. Verifying 8 tokens costs about 3 decode steps (43 ms), and drafting takes 9 ms.
+Drafting fewer (`DSparkProgram::draft(anchor, n)`, llama.cpp PR #394's n_max) and the split Q8_0 projections
+bring a round of n=2 to 4.4 ms drafting and 20.4 ms verifying (T=3), and the serving loop gates rounds on
+measured cost; see "Serving".
 
 ninfer's DFlash ([dflash.md](dflash.md)) already has the masked-block, non-causal, context-K/V shape
 with separate context roles. What is new: per-layer softmax tap fusion instead of one feature
@@ -463,16 +466,26 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
   min-p, then top-p. Temperature 0 is argmax, lowest id first. A seed repeats its output.
 - The defaults follow `generation_config.json`: temperature 1, top-p 1. Top-k is 20.
 - `max_pending_requests` bounds the queue, and `pending_timeout` refuses a request that waited too long.
-- There is no batching, context store, suspend or speculative decoding.
+- There is no batching, context store or suspend.
 - Prefix reuse (on unless `context_cache.enabled` is off or a request sets `allow_prefix_reuse` false): after the
   last whole 256-token chunk of each prompt that leaves a position to compute, the core copies the state a forward
   from there needs (`TextProgram::save`: every sliding visit's last 1023 K/V columns and every visit's convolution
   histories, 335 MB; the global caches are indexed by position and stay valid). A next prompt whose first positions
   are the same (token ids, and images by a hash of their pixels) restores it and prefills only the rest, in the same
-  chunks a prefill from 0 runs, so the output is unchanged. With `--spec dspark` the drafter's sliding rings and anchor context are kept with it (`DSparkProgram::save`). Images wholly in the reused prefix are not encoded. The
+  chunks a prefill from 0 runs, so the output is unchanged. With `--spec dspark` the drafter's sliding rings and anchor context are kept with it (`DSparkProgram::save`); a sampled request does not run the drafter, so a greedy one resumes only from a snapshot a greedy one left. Images wholly in the reused prefix are not encoded. The
   result reports `reused_prompt_tokens`. One snapshot is kept; a prompt that does not resume from it replaces it (or clears it, when shorter than 257 tokens).
-  - DSpark is 2.2x slower than plain decode in the correctness-first build (see "DSpark drafter"), so the
-    server does not use it.
+- `--spec dspark` (default 3 drafts) speculates on greedy requests (`Inkling2Core::run`):
+  - A round drafts n tokens after the anchor, forwards `[anchor, drafts]`, and consumes each column
+    whose input is the token the previous column chose; the first that differs ends the round, and
+    `keep()` cuts the target back. Every token still goes through the plain loop, so the output is
+    plain greedy decoding's.
+  - A round runs only while its cost (EMA) is below (1 + accepted drafts EMA) plain steps; plain steps
+    hold their taps on the device for one deferred drafter extend, and a probe round follows 8, 16, ..
+    64 plain steps.
+  - Greedy requests without penalties take their tokens from a device argmax, one per column.
+  - Sampled requests run plain, without the drafter.
+  - Measured (V100, `ninfer_inkling2_engine_dspark_test`, five chat prompts of 256 tokens): plain 65.0,
+    n=1 73.3, n=2 80.6, n=3 83.3, n=4 81.9 tokens/s.
 
 **Measured** on the V100, 2026-11-21:
 

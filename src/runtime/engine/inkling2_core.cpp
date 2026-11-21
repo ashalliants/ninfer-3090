@@ -526,9 +526,12 @@ void Inkling2Core::run(Job& job) {
     // least one position remains to compute the first token's logits from.
     auto& snapshot          = programs_->snapshot;
     const auto keys         = prompt_keys(prompt);
+    // Greedy requests speculate (DSpark); the drafter follows the prompt only for them, so they resume only from a
+    // snapshot that kept the drafter's state too.
+    const bool speculate = programs_->drafter != nullptr && job.options.execution.sampling.temperature <= 0.0F;
     const std::int32_t resume = [&] {
         if (!options_.context_cache.enabled || !job.options.execution.allow_prefix_reuse || snapshot.position <= 0 ||
-            snapshot.position >= n) {
+            snapshot.position >= n || (speculate && programs_->draft_snapshot.position != snapshot.position)) {
             return 0;
         }
         const auto length = static_cast<std::size_t>(snapshot.position);
@@ -588,10 +591,10 @@ void Inkling2Core::run(Job& job) {
     };
     if (resume > 0) {
         program.restore(snapshot);
-        if (drafter != nullptr) { drafter->restore(programs_->draft_snapshot); }
+        if (speculate) { drafter->restore(programs_->draft_snapshot); }
     } else {
         program.reset();
-        if (drafter != nullptr) { drafter->reset(); }
+        if (speculate) { drafter->reset(); }
         snapshot.position = -1; // its global caches are about to be overwritten
     }
     // The state after the last whole chunk that leaves a position to compute, kept for the next prompt.
@@ -618,10 +621,15 @@ void Inkling2Core::run(Job& job) {
             inputs.push_back({lo - s, all.slice(1, lo - first, hi - lo)});
         }
         logits = program.forward(std::span(prompt.tokens).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(len)), inputs);
-        if (drafter != nullptr) { drafter->extend(taps_of(), len); }
+        if (speculate) { drafter->extend(taps_of(), len); }
         if (s + len == keep_at && keep_at > resume) {
             program.save(snapshot);
-            if (drafter != nullptr) { drafter->save(programs_->draft_snapshot); }
+            // The drafter followed the prompt only when this request speculates.
+            if (speculate) {
+                drafter->save(programs_->draft_snapshot);
+            } else if (drafter != nullptr) {
+                programs_->draft_snapshot.position = -1;
+            }
             programs_->snapshot_keys.assign(keys.begin(), keys.begin() + keep_at);
         }
         {
@@ -665,7 +673,6 @@ void Inkling2Core::run(Job& job) {
     // round (keep() cuts the target back). Every token still goes through the loop below one at a time, from the
     // target's logits, so the output is plain greedy decoding's. A round runs only while it pays: its measured cost
     // against (1 + accepted drafts) plain steps; otherwise plain steps run, with a probe round after 8, 16, .. 64.
-    const bool speculate = drafter != nullptr && exec.sampling.temperature <= 0.0F;
     const auto n_drafts  = static_cast<std::int32_t>(options_.speculative.draft_tokens);
     std::vector<TokenId> drafted; // the last forward's inputs at columns 1 ..
     std::vector<std::int32_t> argmax_host; // the last forward's greedy tokens from column argmax_from, when not stale
@@ -749,7 +756,7 @@ void Inkling2Core::run(Job& job) {
             const std::int32_t one[1] = {next};
             logits = program.forward(one);
             argmax_stale = true;
-            if (drafter != nullptr) {
+            if (speculate) { // a sampled request never drafts, so the drafter needs none of its taps
                 if (held_n == kChunk) { flush_held(); }
                 for (std::size_t i = 0; i < programs_->held.size(); ++i) {
                     const Tensor tap = program.tap(i);
@@ -758,7 +765,7 @@ void Inkling2Core::run(Job& job) {
                                "tap hold");
                 }
                 ++held_n;
-                if (speculate) { ++out.speculative.fallback_steps; }
+                ++out.speculative.fallback_steps;
             }
         }
         col = 0;

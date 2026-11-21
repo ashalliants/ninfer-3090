@@ -691,6 +691,12 @@ private:
         if (options.speculative.backend != SpeculativeBackend::None && options.speculative.backend != SpeculativeBackend::DSpark) {
             throw std::invalid_argument("Inkling-2 speculates with its DSpark drafter only (--spec dspark)");
         }
+        // DSpark verifies greedy rows exactly and drafts from its own head: the Qwen drafting options have no meaning.
+        if (options.relaxed_drafting || options.draft_context_rows != 0 || options.speculative.ngram_draft_tokens != 0 ||
+            options.speculative.adaptive_draft_tokens != 0) {
+            throw std::invalid_argument(
+                "Inkling-2 takes no relaxed drafting, draft-context rows, n-gram or adaptive draft windows");
+        }
         auto generation   = std::make_unique<Inkling2Core>(options, device);
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         load              = generation->load_summary();
