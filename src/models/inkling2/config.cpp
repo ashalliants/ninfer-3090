@@ -146,7 +146,9 @@ DSparkConfig parse_dspark_config(const Json& v, const TextConfig& text) {
         }
         for (const auto& item : v.at("target_visits")) { c.target_visits.push_back(integer(item, "target_visits", false)); }
         if (c.hidden_size != text.hidden_size) { throw ArtifactError("hidden_size differs from the text model's"); }
-        if (c.heads % c.kv_heads || c.head_dim % 2) { throw ArtifactError("bad attention geometry"); }
+        // The drafter's Ops (include/ninfer/ops/dspark_fp32.h) take heads of 128 and at most 8 taps.
+        if (c.heads % c.kv_heads || c.head_dim != 128) { throw ArtifactError("the drafter's attention takes heads of 128"); }
+        if (c.target_visits.size() > 8) { throw ArtifactError("at most 8 target_visits"); }
         if (c.block_size < 2) { throw ArtifactError("a block needs a draft position"); }
         if (c.mask_token_id >= text.unpadded_vocab_size) { throw ArtifactError("mask_token_id is not a token"); }
         if (c.final_logit_softcap != text.final_logit_softcap) { throw ArtifactError("softcap differs from the text model's"); }

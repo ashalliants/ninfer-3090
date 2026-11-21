@@ -63,6 +63,12 @@ _INPUTS = {
 }
 _MARKOV_INPUTS = {"dspark/markov/joint": "dspark/markov/joint_input", "dspark/markov/hidden_out": "dspark/markov/latent"}
 _MATRIX_TYPES = {"Q8_0", "BF16"}
+# The Markov head's token table and output projection are read as dense words (src/models/inkling2/program/
+# dspark_program.cpp), so they must be BF16; every other matrix may also be Q8_0 blocks.
+_BF16_ONLY = {"markov_w1.weight", "dspark_hidden_out.weight"}
+# The geometry the drafter's kernels take (include/ninfer/ops/dspark_fp32.h): heads of 128, at most 8 taps.
+HEAD_DIM = 128
+MAX_TAPS = 8
 
 
 def _get(metadata: Mapping, key: str):
@@ -94,6 +100,8 @@ def dspark_config(metadata: Mapping, text: Mapping) -> dict:
     hidden = _int(metadata, "embedding_length")
     heads, kv_heads = _int(metadata, "attention.head_count"), _int(metadata, "attention.head_count_kv")
     head_dim = _int(metadata, "attention.key_length")
+    if head_dim != HEAD_DIM:
+        raise Inkling2Error(f"DSpark GGUF: key length {head_dim}, the drafter's attention takes heads of {HEAD_DIM}")
     if _int(metadata, "attention.value_length") != head_dim or _int(metadata, "rope.dimension_count") != head_dim:
         raise Inkling2Error("DSpark GGUF: value length and RoPE dimensions must equal the key length (full-head RoPE)")
     if heads % kv_heads:
@@ -112,9 +120,9 @@ def dspark_config(metadata: Mapping, text: Mapping) -> dict:
     taps = _get(metadata, "target_layers")
     visits = text["num_layer_visits"]
     if (not isinstance(taps, list) or not taps or any(type(v) is not int for v in taps) or taps != sorted(set(taps))
-            or taps[0] < 0 or taps[-1] != visits):
-        raise Inkling2Error(f"DSpark GGUF: {_KEY}target_layers must be increasing layer visits ending at {visits}, "
-                            f"got {taps!r}")
+            or taps[0] < 0 or taps[-1] != visits or len(taps) > MAX_TAPS):
+        raise Inkling2Error(f"DSpark GGUF: {_KEY}target_layers must be at most {MAX_TAPS} increasing layer visits "
+                            f"ending at {visits}, got {taps!r}")
     block = _int(metadata, "block_size")
     if block < 2:
         raise Inkling2Error(f"DSpark GGUF: block_size {block} has no draft position")
@@ -197,9 +205,9 @@ def add_dspark(model: Model, gguf: GgufModel) -> None:
         if t.shape != shape:
             raise Inkling2Error(f"DSpark GGUF: {name} has shape {t.shape}, expected {shape}")
         matrix = len(shape) == 2 and name != "dspark_fuse.weight"
-        if (t.type.name not in _MATRIX_TYPES) if matrix else (t.type.name != "F32"):
-            raise Inkling2Error(f"DSpark GGUF: {name} is {t.type.name}, expected "
-                                f"{'Q8_0 or BF16' if matrix else 'F32'}")
+        allowed = {"BF16"} if name in _BF16_ONLY else _MATRIX_TYPES if matrix else {"F32"}
+        if t.type.name not in allowed:
+            raise Inkling2Error(f"DSpark GGUF: {name} is {t.type.name}, expected {' or '.join(sorted(allowed, reverse=True))}")
     model.components["dspark"] = {"config": config}
     # The drafter reuses the text head: its base logits come from ``dspark/final_hidden`` and its Markov correction
     # from ``dspark/markov/correction`` (one ``<component>/...`` input per speculative use, as qwen4_exp's MTP).

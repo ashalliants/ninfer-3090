@@ -178,6 +178,7 @@ def write(path: Path, expert_types: dict[int, int] = EXPERT_TYPES, scale_type: i
 # The DSpark drafter (tools/convert/inkling2_dspark.py) at toy sizes over the text model above: two draft layers
 # (one local, one global), blocks of 4, taps at visits 1, 4, 7 and the final state.
 D_LAYERS, D_HEADS, D_KV, D_FF, D_RANK, D_BLOCK, D_TAPS = 2, 2, 1, 128, 8, 4, [1, 4, 7, VISITS]
+D_HEAD_DIM = 128  # the drafter's attention takes heads of 128
 
 
 def dspark_metadata() -> list[tuple[str, int, object]]:
@@ -191,8 +192,8 @@ def dspark_metadata() -> list[tuple[str, int, object]]:
         (k + "attention.head_count_kv", U32, D_KV),
         (k + "rope.freq_base", F32V, 1e6),
         (k + "attention.layer_norm_rms_epsilon", F32V, 1e-6),
-        (k + "attention.key_length", U32, HEAD_DIM),
-        (k + "attention.value_length", U32, HEAD_DIM),
+        (k + "attention.key_length", U32, D_HEAD_DIM),
+        (k + "attention.value_length", U32, D_HEAD_DIM),
         (k + "vocab_size", U32, VOCAB),
         (k + "vocab_size_unpadded", U32, UNPADDED),
         (k + "block_size", U32, D_BLOCK),
@@ -203,7 +204,7 @@ def dspark_metadata() -> list[tuple[str, int, object]]:
         (k + "attention.causal", BOOL, False),
         (k + "attention.sliding_window", U32, WINDOW),
         (k + "attention.sliding_window_pattern", ARRAY, (BOOL, [True, False])),
-        (k + "rope.dimension_count", U32, HEAD_DIM),
+        (k + "rope.dimension_count", U32, D_HEAD_DIM),
         (k + "final_logit_softcapping", F32V, 30.0),
         ("tokenizer.ggml.mask_token_id", U32, 0),
     ]
@@ -213,7 +214,7 @@ def dspark_tensors() -> list[tuple[str, int, tuple[int, ...], bytes]]:
     from tools.convert import inkling2_dspark
 
     config = {"hidden_size": HIDDEN, "intermediate_size": D_FF, "markov_rank": D_RANK, "num_attention_heads": D_HEADS,
-              "num_key_value_heads": D_KV, "head_dim": HEAD_DIM, "target_visits": D_TAPS, "num_layers": D_LAYERS,
+              "num_key_value_heads": D_KV, "head_dim": D_HEAD_DIM, "target_visits": D_TAPS, "num_layers": D_LAYERS,
               "vocab_size": VOCAB}
     out = []
     for seed, (name, shape) in enumerate(inkling2_dspark.expected_shapes(config).items(), 1000):

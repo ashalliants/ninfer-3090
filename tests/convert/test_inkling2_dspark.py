@@ -86,6 +86,9 @@ def test_the_drafter_is_stored_exactly_beside_the_text_model(text_path, tmp_path
     ({"dflash.target_layers": (fixture.I32, [1, 4, 7, 9])}, "target_layers"),
     ({"dflash.attention.sliding_window_pattern": (fixture.BOOL, [True])}, "sliding_window_pattern"),
     ({"dflash.dspark.markov_rank": None}, "markov_rank"),
+    ({"dflash.attention.key_length": 64, "dflash.attention.value_length": 64, "dflash.rope.dimension_count": 64},
+     "heads of 128"),
+    ({"dflash.target_layers": (fixture.I32, list(range(1, fixture.VISITS + 1)))}, "at most 8"),
     ({"tokenizer.ggml.mask_token_id": 95}, "mask_token_id"),
 ])
 def test_metadata_refusals(text_path, tmp_path, changes, match):
@@ -98,6 +101,9 @@ def test_metadata_refusals(text_path, tmp_path, changes, match):
     ({"blk.0.attn_q.weight": (Q8_0, (fixture.HIDDEN, 64))}, "shape"),
     ({"blk.1.ffn_up.weight": (F32, (fixture.HIDDEN, fixture.D_FF))}, "expected Q8_0 or BF16"),
     ({"mask_embd.weight": (BF16, (fixture.HIDDEN,))}, "expected F32"),
+    # (The fixture's rank 8 cannot hold Q8_0 blocks; any type but BF16 is refused the same way.)
+    ({"markov_w1.weight": (F32, (fixture.D_RANK, fixture.VOCAB))}, "expected BF16$"),
+    ({"dspark_hidden_out.weight": (F32, (fixture.D_RANK, fixture.HIDDEN))}, "expected BF16$"),
 ])
 def test_tensor_refusals(text_path, tmp_path, changes, match):
     dspark_path = fixture.write_dspark(tmp_path / "bad.gguf", tensor_changes=changes)
