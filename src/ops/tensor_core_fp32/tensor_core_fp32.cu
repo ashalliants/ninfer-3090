@@ -223,6 +223,8 @@ struct ExpertGemmArgs {
     const std::uint8_t* records;
     std::uint64_t stride, first, second, row_bytes; // gate/up: rows from first (gate) and second (up); down: first
     int k;                                          // the reduced dimension (H for gate/up, I for down)
+    bool tiled;                                     // the records' tiled order (nvfp4_tiled_block), in groups of
+    int group_rows, run_rows;                       // group_rows rows of runs of run_rows
     const ExpertTile* tiles;
     const __half* x;        // FP16 [entries, k], entry-major, in the grouped order
     const float* x_inverse; // per entry (gate/up), or null: x_scale_inverse for all (down)
@@ -260,12 +262,16 @@ __global__ void __launch_bounds__(kEThreads) expert_gemm_kernel(ExpertGemmArgs a
     // The row this thread decodes (two threads per row, 32 values each).
     const int lr = tid >> 1, half_id = tid & 1;
     const std::uint8_t* row;
+    const std::uint8_t* matrix;
+    int r;
     if constexpr (GateUp) {
-        const int r = blockIdx.x * (kEM / 2) + (lr & (kEM / 2 - 1));
-        row = rec + (lr < kEM / 2 ? a.first : a.second) + static_cast<std::uint64_t>(r) * a.row_bytes;
+        r      = blockIdx.x * (kEM / 2) + (lr & (kEM / 2 - 1));
+        matrix = rec + (lr < kEM / 2 ? a.first : a.second);
     } else {
-        row = rec + a.first + static_cast<std::uint64_t>(blockIdx.x * kEM + lr) * a.row_bytes;
+        r      = blockIdx.x * kEM + lr;
+        matrix = rec + a.first;
     }
+    row = matrix + static_cast<std::uint64_t>(r) * a.row_bytes;
     wm::fragment<wm::accumulator, 16, 16, 16, float> acc[2][kNF];
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
@@ -278,7 +284,8 @@ __global__ void __launch_bounds__(kEThreads) expert_gemm_kernel(ExpertGemmArgs a
     unsigned scales = 0, codes[4];
     uint4 bx[kBLoads];
     const auto load = [&](int k0) {
-        const std::uint8_t* blk = row + static_cast<std::uint64_t>(k0 / kEK) * kNvfp4Bytes;
+        const std::uint8_t* blk = a.tiled ? matrix + nvfp4_tiled_block(r, k0 / kEK, a.k / kEK, a.group_rows, a.run_rows) * kNvfp4Bytes
+                                          : row + static_cast<std::uint64_t>(k0 / kEK) * kNvfp4Bytes;
         scales = *reinterpret_cast<const unsigned*>(blk);
 #pragma unroll
         for (int w = 0; w < 4; ++w) { codes[w] = reinterpret_cast<const unsigned*>(blk + 4)[4 * half_id + w]; }
@@ -521,11 +528,14 @@ void moe_situ_experts_tc(const SituExpertBank& bank, const Tensor& z, const Tens
         a.inter = inter, a.gate_cap = gate_cap, a.up_cap = up_cap, a.act_scale = act_scale, a.act = act;
         a.hidden = hidden, a.order = d_order, a.y = y;
         if (!tiles.empty()) {
+            a.tiled = bank.tiled;
             a.first = 0, a.second = g.up_offset, a.row_bytes = g.gate_row_bytes, a.k = hidden;
+            a.group_rows = kNvfp4GateGroupRows, a.run_rows = nvfp4_rows_per_run(hidden / kNvfp4Values);
             a.x = x16, a.x_inverse = x_inv, a.scale_e = bank.gate_up_scale;
             expert_gemm_kernel<true><<<dim3(inter / (kEM / 2), static_cast<unsigned>(tiles.size())), kEThreads, 0, stream>>>(a);
             check_launch(op);
             a.first = g.down_offset, a.second = 0, a.row_bytes = g.down_row_bytes, a.k = inter;
+            a.group_rows = kNvfp4DownGroupRows, a.run_rows = nvfp4_rows_per_run(inter / kNvfp4Values);
             a.x = act, a.x_inverse = nullptr, a.x_scale_inverse = act_inverse, a.scale_e = bank.down_scale;
             expert_gemm_kernel<false><<<dim3(hidden / kEM, static_cast<unsigned>(tiles.size())), kEThreads, 0, stream>>>(a);
             check_launch(op);

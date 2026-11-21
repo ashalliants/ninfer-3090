@@ -4,8 +4,11 @@
 
 #include "artifact/binder.h"
 #include "artifact/views.h"
+#include "core/arena.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -255,6 +258,34 @@ void check_dspark_formats(const std::vector<BoundWeight>& bound, const DSparkWei
 Model::Model(TextConfig config, TextWeights weights, std::vector<BoundWeight> bound, artifact::MaterializedArtifact backing)
     : backing_(std::move(backing)), config_(std::move(config)), weights_(std::move(weights)), bound_(std::move(bound)) {
     for (const auto& layer : weights_.layers) { banks_.push_back(bind_bank(bound_, layer, config_)); }
+    tile_expert_records();
+}
+
+// The NVFP4 experts' records, resident in device memory, are repacked once into the order their decode reads
+// (ops::nvfp4_tile_records: a permutation of the blocks, so every result is the same bits).
+void Model::tile_expert_records() {
+    std::uint64_t scratch_bytes = 0;
+    for (const ops::SituExpertBank& bank : banks_) {
+        if (bank.format == QType::GGML_REC_NVFP4_NVFP4) { scratch_bytes = std::max(scratch_bytes, bank.record_stride); }
+    }
+    if (scratch_bytes == 0) { return; }
+    DeviceBuffer scratch(scratch_bytes);
+    std::vector<const std::uint8_t*> done;
+    for (ops::SituExpertBank& bank : banks_) {
+        if (bank.format != QType::GGML_REC_NVFP4_NVFP4) { continue; }
+        if (std::find(done.begin(), done.end(), bank.records) != done.end()) { // a bank another layer shares
+            bank.tiled = true;
+            continue;
+        }
+        cudaPointerAttributes attributes{};
+        if (cudaPointerGetAttributes(&attributes, bank.records) != cudaSuccess || attributes.type != cudaMemoryTypeDevice) {
+            (void)cudaGetLastError();
+            throw ArtifactError("inkling2: NVFP4 expert records must be resident in device memory");
+        }
+        ops::nvfp4_tile_records(bank, const_cast<std::uint8_t*>(bank.records), scratch.p, nullptr);
+        done.push_back(bank.records);
+    }
+    if (cudaStreamSynchronize(nullptr) != cudaSuccess) { throw std::runtime_error("inkling2: tiling the expert records failed"); }
 }
 
 Model::~Model() = default;

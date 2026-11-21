@@ -1134,6 +1134,66 @@ void test_experts(bool nvfp4, int h, int inter, int experts, const std::string& 
 
 // NINFER_INKLING2_OP_BENCH=1: decode-shaped timing (T = 1, top 8 of 32 resident experts at the model's shape, each
 // call a different 8 so nothing stays in L2), printed as microseconds and effective weight bandwidth. Not a criterion.
+// nvfp4_tile_records: the tiled records give the same bits as the untiled ones through every NVFP4 route (per
+// entry, grouped by expert, tensor cores), for the run shapes 1/2 (H 2304, I 1152) and 2/4 (H 1152, I 192).
+void test_tiled_experts(int h, int inter, const char* label) {
+    const int experts = 8, k = 4;
+    const std::uint64_t gate_row = h / 64 * 36, down_row = inter / 64 * 36, gate_bytes = gate_row * inter;
+    const std::uint64_t up_off = align256(gate_bytes), down_off = align256(up_off + gate_bytes), stride = align256(down_off + down_row * h);
+    std::vector<std::uint8_t> host(stride * experts, 0);
+    for (int e = 0; e < experts; ++e) {
+        for (const auto [offset, n] : {std::pair{std::uint64_t{0}, gate_bytes}, std::pair{up_off, gate_bytes}, std::pair{down_off, down_row * h}}) {
+            const auto blocks = nvfp4_blocks(n / 36);
+            std::copy(blocks.begin(), blocks.end(), host.begin() + e * stride + offset);
+        }
+    }
+    ninfer::DeviceBuffer records = t::to_device(host);
+    Buf sc(randoms(2 * experts, 0.5F, 1.5F));
+    ninfer::ops::SituExpertBank bank;
+    bank.format = ninfer::QType::GGML_REC_NVFP4_NVFP4, bank.experts = experts, bank.hidden = h, bank.intermediate = inter;
+    bank.records = static_cast<const std::uint8_t*>(records.p), bank.record_stride = stride;
+    bank.gate_up_scale = static_cast<const float*>(sc.b.p), bank.down_scale = static_cast<const float*>(sc.b.p) + experts;
+    // The same inputs for both passes.
+    const std::vector<float> z1 = randoms(static_cast<std::size_t>(h) * 17), w1 = randoms(static_cast<std::size_t>(k) * 17, 0.1F, 1.0F);
+    const auto run_all = [&](const ninfer::ops::SituExpertBank& b) {
+        std::vector<std::vector<float>> outs;
+        for (const int cols : {1, 17}) {
+            std::vector<int> ids(static_cast<std::size_t>(k) * cols);
+            for (int c = 0; c < cols; ++c)
+                for (int j = 0; j < k; ++j) { ids[c * k + j] = (c * 3 + j * 2) % experts; }
+            Buf z(std::vector<float>(z1.begin(), z1.begin() + std::size_t(h) * cols)), w(std::vector<float>(w1.begin(), w1.begin() + std::size_t(k) * cols)),
+                out(static_cast<std::size_t>(h) * cols);
+            ninfer::DeviceBuffer did = t::to_device_i32(ids);
+            const Tensor tid(did.p, DType::I32, {k, cols}), tw = w.tensor({k, cols});
+            Tensor tout = out.tensor({h, cols});
+            ninfer::DeviceArena arena(std::max(ninfer::ops::moe_situ_experts_workspace_bytes(b, std::int64_t(k) * cols),
+                                               ninfer::ops::moe_situ_experts_tc_workspace_bytes(b, std::int64_t(k) * cols)) + 4096);
+            ninfer::ops::moe_situ_experts(b, z.tensor({h, cols}), tid, &tw, 4.0F, 25.0F, arena, tout, nullptr);
+            outs.push_back(out.get(static_cast<std::size_t>(h) * cols));
+            if (cols > 1) {
+                ninfer::ops::moe_situ_experts_tc(b, z.tensor({h, cols}), tid, &tw, 4.0F, 25.0F, arena, tout, nullptr);
+                outs.push_back(out.get(static_cast<std::size_t>(h) * cols));
+            }
+        }
+        return outs;
+    };
+    // The grouped route needs at least 64 entries: 17 columns of 4 is 68.
+    const auto before = run_all(bank);
+    ninfer::DeviceBuffer scratch(stride);
+    ninfer::ops::nvfp4_tile_records(bank, static_cast<std::uint8_t*>(records.p), scratch.p, nullptr);
+    check(cudaDeviceSynchronize() == cudaSuccess && bank.tiled, std::string(label) + ": tiling");
+    const auto after = run_all(bank);
+    bool same = before.size() == after.size();
+    for (std::size_t i = 0; same && i < before.size(); ++i) {
+        same = before[i].size() == after[i].size() && std::memcmp(before[i].data(), after[i].data(), before[i].size() * 4) == 0;
+    }
+    check(same, std::string(label) + ": tiled records changed a result");
+    std::vector<std::uint8_t> tiled(host.size());
+    check(cudaMemcpy(tiled.data(), records.p, tiled.size(), cudaMemcpyDeviceToHost) == cudaSuccess && tiled != host,
+          std::string(label) + ": the records were not repacked");
+    std::printf("%-44s tiled == untiled (T 1, T 17 grouped, T 17 tensor cores)\n", label);
+}
+
 void bench_experts(bool nvfp4, int cols = 1) {
     const int h = 2304, inter = 1152, experts = cols > 1 ? 128 : 32, k = 8, iters = cols > 1 ? 5 : 40;
     ninfer::ops::SituExpertBank bank;
@@ -1159,6 +1219,11 @@ void bench_experts(bool nvfp4, int cols = 1) {
         bank.gate_up_scale = static_cast<const float*>(scales.p);
         bank.down_scale    = static_cast<const float*>(scales.p) + experts;
         per_expert         = 2 * gate_bytes + down_row * h;
+        if (std::getenv("NINFER_INKLING2_OP_BENCH_UNTILED") == nullptr) { // the records as the engine holds them
+            ninfer::DeviceBuffer scratch(stride);
+            ninfer::ops::nvfp4_tile_records(bank, static_cast<std::uint8_t*>(records.p), scratch.p, nullptr);
+            cudaDeviceSynchronize();
+        }
     } else {
         bgu = t::to_device_bf16(randoms(static_cast<std::size_t>(experts) * 2 * inter * h, -0.05F, 0.05F));
         bd  = t::to_device_bf16(randoms(static_cast<std::size_t>(experts) * h * inter, -0.05F, 0.05F));
@@ -1446,6 +1511,8 @@ int main() {
         // H = 8192: the grouped kernels' staged activations exceed shared memory, so every entry runs alone.
         test_experts(true, 8192, 128, 4, "moe_situ_experts NVFP4 [4, 8192, 128] T 17 per entry", 17);
         test_experts(false, 8192, 128, 4, "moe_situ_experts BF16 [4, 8192, 128] T 17 per entry", 17);
+        test_tiled_experts(2304, 1152, "nvfp4_tile_records [2304, 1152]");
+        test_tiled_experts(1152, 192, "nvfp4_tile_records [1152, 192]");
         if (const char* bench = std::getenv("NINFER_INKLING2_OP_BENCH"); bench != nullptr && *bench == '1') {
             bench_experts(true);
             bench_experts(false);

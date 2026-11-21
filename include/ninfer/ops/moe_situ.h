@@ -57,7 +57,35 @@ struct SituExpertBank {
     const void* gate_up         = nullptr; // BF16 banks
     const void* down            = nullptr;
     std::int32_t experts = 0, hidden = 0, intermediate = 0;
+    bool tiled = false; // NVFP4: the records are in the tiled order of nvfp4_tile_records
 };
+
+/**
+ * NVFP4 tiled records (SituExpertBank::tiled). The decode kernels read each matrix in groups of `group_rows` rows
+ * (4 for gate and up, 8 for down), a group as runs of `run_rows` consecutive rows, and in each step 4 * run_rows
+ * blocks of every run of a group. The tiled order stores each step's blocks of a group contiguously (the group's
+ * runs in order, each run's blocks in order), so a warp's step is one contiguous slab instead of one short span per
+ * run. It is a permutation of the 36-byte blocks of each matrix: lossless, and the kernels do the same arithmetic.
+ */
+[[nodiscard]] __host__ __device__ inline int nvfp4_rows_per_run(int blocks) { return blocks % 4 == 0 ? 1 : blocks % 2 == 0 ? 2 : 4; }
+inline constexpr int kNvfp4GateGroupRows = 4, kNvfp4DownGroupRows = 8;
+/// The block index, in its matrix, of block b of row r in the tiled order (row r's untiled block index: r * blocks + b).
+[[nodiscard]] __host__ __device__ inline std::uint64_t nvfp4_tiled_block(int r, int b, int blocks, int group_rows, int run_rows) {
+    const int lanes = 4 * run_rows, run_blocks = run_rows * blocks;
+    const int group = r / group_rows, run = (r % group_rows) / run_rows, c = (r % run_rows) * blocks + b;
+    const int step = c / lanes, width = run_blocks - lanes * step < lanes ? run_blocks - lanes * step : lanes;
+    return static_cast<std::uint64_t>(group) * group_rows * blocks + static_cast<std::uint64_t>(step) * (group_rows / run_rows) * lanes +
+           static_cast<std::uint64_t>(run) * width + c % lanes;
+}
+
+/**
+ * Op: nvfp4_tile_records
+ *
+ * Effects: rewrites an untiled NVFP4 bank's records in place in the tiled order and sets bank.tiled; `scratch` holds
+ *   at least bank.record_stride bytes of device memory. Refuses a bank that is not NVFP4 records or is already tiled.
+ * Execution: asynchronous on `stream`; not graph capturable (one copy and launch per expert).
+ */
+void nvfp4_tile_records(SituExpertBank& bank, std::uint8_t* records, void* scratch, cudaStream_t stream);
 
 /**
  * Op: moe_situ_experts

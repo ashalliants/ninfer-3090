@@ -227,6 +227,13 @@ For NVFP4 experts, `Wgu_e` and `Wd_e` are the GGML blocks times a per-expert F32
 (`ffn_gate_up_exps.scale`, `ffn_down_exps.scale`), applied to the product ([Lg]
 `build_lora_mm_id(..., up_exps_s)`, [Lg] `llama-model.cpp:1942`).
 
+In device memory the engine holds each expert record's blocks in a tiled order. At load,
+`ops::nvfp4_tile_records` permutes the 36-byte blocks of each matrix so that one step of a decode warp is one
+contiguous slab: 4 (gate, up) or 8 (down) rows, each run's next 4 x P blocks (`nvfp4_tiled_block`). Before, a step
+read 8 separate 144- or 288-byte spans. The arithmetic does not change: golden byte-equal (781 files, 0 differ).
+On the V100 the op bench (T 1, top 8) goes from 75.2 to 72.2 us and decode at a 1,024 context from 65.61 to
+66.09 tok/s (ABBA).
+
 ### 4. Output ([L] 494-520, [H] 1293-1294 and 1371-1373)
 
 ```text

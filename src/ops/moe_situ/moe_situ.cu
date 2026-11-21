@@ -415,7 +415,6 @@ constexpr int kBlockWords = kNvfp4Bytes / 4; // 9
 constexpr int kStageWords = 32 * kBlockWords; // one block per lane
 
 // The rows of P blocks-per-row multiples of 4 blocks: P rows of `blocks` blocks then start 16-byte aligned.
-inline int nvfp4_rows_per_run(int blocks) { return blocks % 4 == 0 ? 1 : blocks % 2 == 0 ? 2 : 4; }
 
 // kGroups (1 or 2) groups of Q * kRowsPerGroup NVFP4 rows of `blocks` blocks each, the rows of a group contiguous
 // from groups[g], dotted with staged activations. Plane q is rows [q * kRowsPerGroup, (q + 1) * kRowsPerGroup) of
@@ -434,9 +433,11 @@ struct Nvfp4Runs {
     static_assert(kGroups == 1 || kGroups == 2, "one or two groups");
     static_assert(kRowsPerGroup % P == 0 && kRows % P == 0 && 32 % kRuns == 0 && kLanes % 4 == 0, "runs must tile the warp");
     static_assert(kRuns * kRunVectors == kVectors, "a step is one stage");
-    const uint4* run_start[3]; // plane 0's run of each of this lane's vectors
+    const uint4* run_start[3]; // plane 0's run (tiled: its group) of each of this lane's vectors
     int offset[3];             // and the vector's place in the run's step
-    int blocks, run_blocks, steps, plane_vectors;
+    int run_in_group[3];       // tiled: the run's place in its group's step slab
+    int blocks, run_blocks, steps, plane_vectors, step_vectors;
+    bool tiled;
     uint4 next[Q][3];
 
     __device__ __forceinline__ void load(int j) {
@@ -447,15 +448,17 @@ struct Nvfp4Runs {
 #pragma unroll
             for (int m = 0; m < 3; ++m) {
                 if (m < 2 || (threadIdx.x & 31) + 64 < kVectors) {
-                    next[q][m] = __ldg(run_start[m] + q * plane_vectors + j * kRunVectors + min(offset[m], last));
+                    next[q][m] = __ldg(run_start[m] + q * plane_vectors + j * step_vectors + (tiled ? run_in_group[m] * (last + 1) : 0) +
+                                       min(offset[m], last));
                 }
             }
         }
     }
 
-    __device__ __forceinline__ Nvfp4Runs(const std::uint8_t* const (&groups)[kGroups], int blocks_per_row)
+    __device__ __forceinline__ Nvfp4Runs(const std::uint8_t* const (&groups)[kGroups], int blocks_per_row, bool tiled_layout = false)
         : blocks(blocks_per_row), run_blocks(P * blocks_per_row), steps((P * blocks_per_row + kLanes - 1) / kLanes),
-          plane_vectors(kRowsPerGroup * blocks_per_row * kBlockWords / 4) {
+          plane_vectors(kRowsPerGroup * blocks_per_row * kBlockWords / 4),
+          step_vectors(tiled_layout ? kRuns / kGroups * kRunVectors : kRunVectors), tiled(tiled_layout) {
         const int lane = threadIdx.x & 31;
         constexpr int kRunsPerGroup = kRuns / kGroups;
 #pragma unroll
@@ -464,8 +467,9 @@ struct Nvfp4Runs {
             const std::uint8_t* base = groups[0];
 #pragma unroll
             for (int i = 1; i < kGroups; ++i) { base = g == i ? groups[i] : base; }
-            run_start[m] = reinterpret_cast<const uint4*>(base + static_cast<std::size_t>(run % kRunsPerGroup) * run_blocks * kNvfp4Bytes);
-            offset[m]    = v % kRunVectors;
+            run_start[m]    = reinterpret_cast<const uint4*>(base + (tiled_layout ? 0 : static_cast<std::size_t>(run % kRunsPerGroup) * run_blocks * kNvfp4Bytes));
+            offset[m]       = v % kRunVectors;
+            run_in_group[m] = run % kRunsPerGroup;
         }
         load(0);
     }
@@ -591,7 +595,7 @@ __device__ __forceinline__ float bf16_row_dot(const __nv_bfloat16* __restrict__ 
 }
 
 struct BankArgs {
-    bool nvfp4;
+    bool nvfp4, tiled;
     const std::uint8_t* records;
     std::uint64_t stride, up_offset, down_offset, gate_row_bytes, down_row_bytes;
     const float *gate_up_scale, *down_scale;
@@ -604,8 +608,8 @@ __device__ __forceinline__ float situ(float g, float u, float gate_cap, float up
 }
 
 // Intermediate rows per warp: NVFP4 does kGateRows gate and up rows at once (8 rows of H/64 blocks), BF16 one.
-constexpr int kGateRows = 4;
-constexpr int kDownRows = 8;
+constexpr int kGateRows = kNvfp4GateGroupRows;
+constexpr int kDownRows = kNvfp4DownGroupRows;
 
 int gate_rows_per_warp(const BankArgs& b) { return b.nvfp4 ? kGateRows : 1; }
 int down_rows_per_warp(const BankArgs& b) { return b.nvfp4 ? kDownRows : 1; }
@@ -630,7 +634,7 @@ gate_up_kernel(BankArgs b, const float* __restrict__ z, std::int64_t zs, const s
         const std::uint8_t* rec = b.records + static_cast<std::uint64_t>(e) * b.stride;
         const std::uint8_t* groups[2] = {rec + static_cast<std::uint64_t>(row0) * b.gate_row_bytes,
                                          rec + b.up_offset + static_cast<std::uint64_t>(row0) * b.gate_row_bytes};
-        Nvfp4Runs<2, kGateRows, P> rows(groups, b.hidden / kNvfp4Values);
+        Nvfp4Runs<2, kGateRows, P> rows(groups, b.hidden / kNvfp4Values, b.tiled);
         fill_tables(lut);
         stage_padded(col, b.hidden, x);
         __syncthreads();
@@ -669,7 +673,7 @@ down_kernel(BankArgs b, const std::int32_t* __restrict__ ids, const float* __res
         const int first = (blockIdx.y * kWarps + warp) * kDownRows, row0 = first < b.hidden ? first : 0;
         const std::uint8_t* rec = b.records + static_cast<std::uint64_t>(e) * b.stride + b.down_offset;
         const std::uint8_t* groups[1] = {rec + static_cast<std::uint64_t>(row0) * b.down_row_bytes};
-        Nvfp4Runs<1, kDownRows, P> rows(groups, b.inter / kNvfp4Values);
+        Nvfp4Runs<1, kDownRows, P> rows(groups, b.inter / kNvfp4Values, b.tiled);
         fill_tables(lut);
         stage_padded(src, b.inter, a);
         __syncthreads();
@@ -753,7 +757,7 @@ gate_up_grouped_kernel(BankArgs b, const float* __restrict__ z, std::int64_t zs,
     const float scale = b.gate_up_scale != nullptr ? b.gate_up_scale[e] : 1.0F;
     fill_tables(lut);
     for (int tile = 0; tile < n; tile += kGroupTokens) {
-        Nvfp4Runs<2, kGateRows, P, kGroupPlanes> rows(groups, b.hidden / kNvfp4Values);
+        Nvfp4Runs<2, kGateRows, P, kGroupPlanes> rows(groups, b.hidden / kNvfp4Values, b.tiled);
         __syncthreads(); // the previous tile's activations are read
         int entry[kGroupTokens];
 #pragma unroll
@@ -801,7 +805,7 @@ down_grouped_kernel(BankArgs b, const int* __restrict__ counts, const int* __res
     const float scale = b.down_scale != nullptr ? b.down_scale[e] : 1.0F;
     fill_tables(lut);
     for (int tile = 0; tile < n; tile += kGroupTokens) {
-        Nvfp4Runs<1, kDownRows, P, kGroupPlanes> rows(groups, b.inter / kNvfp4Values);
+        Nvfp4Runs<1, kDownRows, P, kGroupPlanes> rows(groups, b.inter / kNvfp4Values, b.tiled);
         __syncthreads();
         int entry[kGroupTokens];
 #pragma unroll
@@ -946,6 +950,7 @@ BankArgs bank_args(const SituExpertBank& bank) {
         require(bank.hidden % kNvfp4Values == 0 && bank.intermediate % kNvfp4Values == 0, op, "H and I must be multiples of 64");
         require(bank.intermediate % kGateRows == 0 && bank.hidden % kDownRows == 0, op, "NVFP4 banks need I a multiple of 4 and H of 8");
         b.nvfp4 = true;
+        b.tiled = bank.tiled;
         b.records = bank.records;
         b.gate_row_bytes = static_cast<std::uint64_t>(bank.hidden / kNvfp4Values) * kNvfp4Bytes;
         b.down_row_bytes = static_cast<std::uint64_t>(bank.intermediate / kNvfp4Values) * kNvfp4Bytes;
@@ -1159,6 +1164,45 @@ void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor&
                                                                                    top_k, static_cast<float*>(out.data));
         check_launch(op);
     }
+}
+
+// One thread per 36-byte block of a matrix of `rows` x `blocks`: untiled `src` to tiled `dst`.
+__global__ void tile_matrix_kernel(const std::uint32_t* __restrict__ src, std::uint32_t* __restrict__ dst, int rows, int blocks, int group_rows,
+                                   int run_rows) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= static_cast<std::int64_t>(rows) * blocks) { return; }
+    const int r = static_cast<int>(i / blocks), b = static_cast<int>(i % blocks);
+    const std::uint32_t* from = src + i * kBlockWords;
+    std::uint32_t* to         = dst + nvfp4_tiled_block(r, b, blocks, group_rows, run_rows) * kBlockWords;
+#pragma unroll
+    for (int w = 0; w < kBlockWords; ++w) { to[w] = from[w]; }
+}
+
+void nvfp4_tile_records(SituExpertBank& bank, std::uint8_t* records, void* scratch, cudaStream_t stream) {
+    const char* op = "nvfp4_tile_records";
+    require(bank.format == QType::GGML_REC_NVFP4_NVFP4 && records != nullptr && records == bank.records, op, "the bank must be NVFP4 records");
+    require(!bank.tiled, op, "the bank is already tiled");
+    const BankArgs b = bank_args(bank);
+    const int gate_blocks = bank.hidden / kNvfp4Values, down_blocks = bank.intermediate / kNvfp4Values;
+    const int gate_p = nvfp4_rows_per_run(gate_blocks), down_p = nvfp4_rows_per_run(down_blocks);
+    auto* tmp = static_cast<std::uint8_t*>(scratch);
+    const auto launch = [&](std::uint64_t offset, int rows, int blocks, int group_rows, int run_rows, std::uint8_t* rec) {
+        const std::int64_t n = static_cast<std::int64_t>(rows) * blocks;
+        tile_matrix_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(reinterpret_cast<const std::uint32_t*>(tmp + offset),
+                                                                                      reinterpret_cast<std::uint32_t*>(rec + offset), rows, blocks,
+                                                                                      group_rows, run_rows);
+    };
+    for (int e = 0; e < bank.experts; ++e) {
+        std::uint8_t* rec = records + static_cast<std::uint64_t>(e) * b.stride;
+        if (cudaMemcpyAsync(tmp, rec, b.stride, cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
+            throw std::runtime_error(std::string(op) + ": the record copy failed");
+        }
+        launch(0, bank.intermediate, gate_blocks, kGateRows, gate_p, rec);
+        launch(b.up_offset, bank.intermediate, gate_blocks, kGateRows, gate_p, rec);
+        launch(b.down_offset, bank.hidden, down_blocks, kDownRows, down_p, rec);
+        check_launch(op);
+    }
+    bank.tiled = true;
 }
 
 } // namespace ninfer::ops

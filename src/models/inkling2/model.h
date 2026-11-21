@@ -134,6 +134,7 @@ private:
     TextWeights weights_;
     std::vector<BoundWeight> bound_;
     std::vector<ops::SituExpertBank> banks_;
+    void tile_expert_records();
 };
 
 // True when the artifact's text component is Inkling-2.
