@@ -4,7 +4,7 @@
 // - greedy output equals a plain Engine's, token for token, for every prompt, also under a thinking budget and a
 //   stop string (each token still goes through the plain loop; a round only saves forwards);
 // - a sampled request runs plain (no rounds, no fallback steps) and repeats under a fixed seed;
-// - relaxed drafting, which DSpark does not implement, is refused;
+// - relaxed drafting, which DSpark does not implement, and draft counts outside 1..7 are refused;
 // - reported, not judged: rounds, drafts accepted, plain fallback steps, and decode tok/s of both Engines.
 // Skips without NINFER_TEST_INKLING2_ARTIFACT. NINFER_INKLING2_SPEC_DRAFTS: drafts per round (default 3, the serving default);
 // NINFER_INKLING2_SPEC_TOKENS: output tokens per prompt (default 256).
@@ -116,6 +116,15 @@ int main() {
                 ninfer::Engine refused_engine(relaxed);
             } catch (const std::invalid_argument&) { refused = true; }
             check(refused, "DSpark with relaxed drafting is refused");
+        }
+        for (const std::uint32_t bad : {0U, 8U, 0xFFFFFFFFU}) {
+            auto wide                        = options;
+            wide.speculative.draft_tokens    = bad;
+            bool refused                     = false;
+            try {
+                ninfer::Engine refused_engine(wide);
+            } catch (const std::invalid_argument&) { refused = true; }
+            check(refused, "DSpark with " + std::to_string(bad) + " drafts is refused");
         }
         ninfer::Engine engine(options);
         std::printf("dspark, %u drafts per round:\n", drafts);

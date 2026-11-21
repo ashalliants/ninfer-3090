@@ -266,7 +266,7 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         if (dspark) {
             const ink::DSparkConfig* dc = model_->dspark_config();
             if (dc == nullptr) { throw std::invalid_argument("--spec dspark: this Inkling-2 artifact has no DSpark drafter"); }
-            if (options_.speculative.draft_tokens < 1 || options_.speculative.draft_tokens + 1 > dc->block_size) {
+            if (options_.speculative.draft_tokens < 1 || options_.speculative.draft_tokens >= dc->block_size) {
                 throw std::invalid_argument("--spec dspark takes --draft-tokens 1 to " + std::to_string(dc->block_size - 1));
             }
             limits.tap_visits   = dc->target_visits;

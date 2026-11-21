@@ -691,6 +691,11 @@ private:
         if (options.speculative.backend != SpeculativeBackend::None && options.speculative.backend != SpeculativeBackend::DSpark) {
             throw std::invalid_argument("Inkling-2 speculates with its DSpark drafter only (--spec dspark)");
         }
+        // The CLI's range, checked before the load (the core also bounds it by the artifact's block).
+        if (options.speculative.backend == SpeculativeBackend::DSpark &&
+            (options.speculative.draft_tokens < 1 || options.speculative.draft_tokens > 7)) {
+            throw std::invalid_argument("--spec dspark takes --draft-tokens 1 to 7");
+        }
         // DSpark verifies greedy rows exactly and drafts from its own head: the Qwen drafting options have no meaning.
         if (options.relaxed_drafting || options.draft_context_rows != 0 || options.speculative.ngram_draft_tokens != 0 ||
             options.speculative.adaptive_draft_tokens != 0) {
