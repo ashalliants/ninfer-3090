@@ -383,38 +383,52 @@ struct Nvfp4Runs {
     }
 };
 
-// A BF16 row of n values (n a multiple of 8, 16-byte aligned) dotted with NT columns of x (unpadded, in shared
-// memory, column i at x + i * x_step): each column the same arithmetic as NT = 1; every lane gets every sum.
-template <int NT>
-__device__ void bf16_row_dot(const __nv_bfloat16* __restrict__ row, int n, const float* x, int x_step, float (&out)[NT]) {
+// R BF16 rows of n values (row r at rows[r]; n a multiple of 8, 16-byte aligned) dotted with NT columns of x
+// (unpadded, in shared memory, column i at x + i * x_step): each (row, column) the same arithmetic as R = NT = 1,
+// the activations loaded once for all R rows; every lane gets every sum.
+template <int R, int NT>
+__device__ void bf16_row_dot(const __nv_bfloat16* const (&rows)[R], int n, const float* x, int x_step, float (&out)[R][NT]) {
     const int lane = threadIdx.x & 31;
-    float acc[NT];
+    float acc[R][NT];
 #pragma unroll
-    for (int i = 0; i < NT; ++i) { acc[i] = 0.0F; }
-    const uint4* chunks = reinterpret_cast<const uint4*>(row);
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int i = 0; i < NT; ++i) { acc[r][i] = 0.0F; }
+    }
 #pragma unroll 3
     for (int c = lane; c < n / 8; c += 32) {
-        const uint4 w = __ldg(chunks + c);
-        const std::uint32_t words[4] = {w.x, w.y, w.z, w.w};
+        std::uint32_t words[R][4];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint4 w = __ldg(reinterpret_cast<const uint4*>(rows[r]) + c);
+            words[r][0] = w.x, words[r][1] = w.y, words[r][2] = w.z, words[r][3] = w.w;
+        }
 #pragma unroll
         for (int t = 0; t < NT; ++t) {
             const float4 x0 = *reinterpret_cast<const float4*>(x + t * x_step + 8 * c), x1 = *reinterpret_cast<const float4*>(x + t * x_step + 8 * c + 4);
             const float xs[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                acc[t] = fmaf(__uint_as_float(words[i] << 16), xs[2 * i], acc[t]);
-                acc[t] = fmaf(__uint_as_float(words[i] & 0xFFFF0000U), xs[2 * i + 1], acc[t]);
+            for (int r = 0; r < R; ++r) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    acc[r][t] = fmaf(__uint_as_float(words[r][i] << 16), xs[2 * i], acc[r][t]);
+                    acc[r][t] = fmaf(__uint_as_float(words[r][i] & 0xFFFF0000U), xs[2 * i + 1], acc[r][t]);
+                }
             }
         }
     }
 #pragma unroll
-    for (int t = 0; t < NT; ++t) { out[t] = warp_sum(acc[t]); }
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int t = 0; t < NT; ++t) { out[r][t] = warp_sum(acc[r][t]); }
+    }
 }
 
 __device__ __forceinline__ float bf16_row_dot(const __nv_bfloat16* __restrict__ row, int n, const float* x) {
-    float out[1];
-    bf16_row_dot<1>(row, n, x, 0, out);
-    return out[0];
+    const __nv_bfloat16* rows[1] = {row};
+    float out[1][1];
+    bf16_row_dot<1, 1>(rows, n, x, 0, out);
+    return out[0][0];
 }
 
 struct BankArgs {
@@ -653,8 +667,10 @@ down_grouped_kernel(BankArgs b, const int* __restrict__ counts, const int* __res
     }
 }
 
-// BF16 banks, grouped: grid (ceil(I / kWarps), E): warp w of block (g, e) takes expert e's intermediate row
-// g * kWarps + w over its entries, kGroupTokens at a time (the per-entry kernel's arithmetic for each).
+// BF16 banks, grouped: grid (ceil(I / (kWarps * kBf16Rows)), E): warp w of block (g, e) takes expert e's
+// intermediate rows (g * kWarps + w) * kBf16Rows + (0 ..) (their gate and up rows) over its entries, kGroupTokens
+// at a time (the per-entry kernel's arithmetic for each).
+constexpr int kBf16Rows = 2;
 __global__ void __launch_bounds__(kThreads)
 gate_up_grouped_bf16_kernel(BankArgs b, const float* __restrict__ z, std::int64_t zs, const int* __restrict__ counts,
                             const int* __restrict__ offsets, const int* __restrict__ order, int top_k, float gate_cap, float up_cap,
@@ -664,8 +680,15 @@ gate_up_grouped_bf16_kernel(BankArgs b, const float* __restrict__ z, std::int64_
     const int e = blockIdx.y, n = counts[e];
     if (n == 0) { return; }
     const int* list = order + offsets[e];
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, i = blockIdx.x * kWarps + warp;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, first = (blockIdx.x * kWarps + warp) * kBf16Rows;
     const __nv_bfloat16* base = b.gate_up + static_cast<std::int64_t>(e) * 2 * b.inter * b.hidden;
+    const __nv_bfloat16* rows[2 * kBf16Rows];
+#pragma unroll
+    for (int r = 0; r < kBf16Rows; ++r) {
+        const int i = min(first + r, b.inter - 1);
+        rows[r]             = base + static_cast<std::int64_t>(i) * b.hidden;
+        rows[kBf16Rows + r] = base + static_cast<std::int64_t>(b.inter + i) * b.hidden;
+    }
     for (int tile = 0; tile < n; tile += kGroupTokens) {
         __syncthreads();
         int entry[kGroupTokens];
@@ -678,19 +701,24 @@ gate_up_grouped_bf16_kernel(BankArgs b, const float* __restrict__ z, std::int64_
             }
         }
         __syncthreads();
-        if (i < b.inter) {
-            float g[kGroupTokens], u[kGroupTokens];
-            bf16_row_dot<kGroupTokens>(base + static_cast<std::int64_t>(i) * b.hidden, b.hidden, x, b.hidden, g);
-            bf16_row_dot<kGroupTokens>(base + static_cast<std::int64_t>(b.inter + i) * b.hidden, b.hidden, x, b.hidden, u);
+        if (first < b.inter) {
+            float gu[2 * kBf16Rows][kGroupTokens];
+            bf16_row_dot<2 * kBf16Rows, kGroupTokens>(rows, b.hidden, x, b.hidden, gu);
 #pragma unroll
-            for (int t = 0; t < kGroupTokens; ++t) {
-                if (lane == 0 && entry[t] >= 0) { act[static_cast<std::int64_t>(entry[t]) * b.inter + i] = situ(g[t], u[t], gate_cap, up_cap); }
+            for (int r = 0; r < kBf16Rows; ++r) {
+#pragma unroll
+                for (int t = 0; t < kGroupTokens; ++t) {
+                    if (lane == 0 && entry[t] >= 0 && first + r < b.inter) {
+                        act[static_cast<std::int64_t>(entry[t]) * b.inter + first + r] = situ(gu[r][t], gu[kBf16Rows + r][t], gate_cap, up_cap);
+                    }
+                }
             }
         }
     }
 }
 
-// grid (ceil(H / kWarps), E): warp w of block (g, e) takes expert e's hidden row g * kWarps + w over its entries.
+// grid (ceil(H / (kWarps * 2 * kBf16Rows)), E): warp w of block (g, e) takes expert e's hidden rows
+// (g * kWarps + w) * 2 * kBf16Rows + (0 ..) over its entries.
 __global__ void __launch_bounds__(kThreads)
 down_grouped_bf16_kernel(BankArgs b, const int* __restrict__ counts, const int* __restrict__ offsets, const int* __restrict__ order,
                          const float* __restrict__ act, float* __restrict__ y) {
@@ -699,7 +727,11 @@ down_grouped_bf16_kernel(BankArgs b, const int* __restrict__ counts, const int* 
     const int e = blockIdx.y, n = counts[e];
     if (n == 0) { return; }
     const int* list = order + offsets[e];
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, h = blockIdx.x * kWarps + warp;
+    constexpr int kRows = 2 * kBf16Rows;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, first = (blockIdx.x * kWarps + warp) * kRows;
+    const __nv_bfloat16* rows[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) { rows[r] = b.down + (static_cast<std::int64_t>(e) * b.hidden + min(first + r, b.hidden - 1)) * b.inter; }
     for (int tile = 0; tile < n; tile += kGroupTokens) {
         __syncthreads();
         int entry[kGroupTokens];
@@ -712,12 +744,15 @@ down_grouped_bf16_kernel(BankArgs b, const int* __restrict__ counts, const int* 
             }
         }
         __syncthreads();
-        if (h < b.hidden) {
-            float v[kGroupTokens];
-            bf16_row_dot<kGroupTokens>(b.down + (static_cast<std::int64_t>(e) * b.hidden + h) * b.inter, b.inter, x, b.inter, v);
+        if (first < b.hidden) {
+            float v[kRows][kGroupTokens];
+            bf16_row_dot<kRows, kGroupTokens>(rows, b.inter, x, b.inter, v);
 #pragma unroll
-            for (int t = 0; t < kGroupTokens; ++t) {
-                if (lane == 0 && entry[t] >= 0) { y[static_cast<std::int64_t>(entry[t]) * b.hidden + h] = v[t]; }
+            for (int r = 0; r < kRows; ++r) {
+#pragma unroll
+                for (int t = 0; t < kGroupTokens; ++t) {
+                    if (lane == 0 && entry[t] >= 0 && first + r < b.hidden) { y[static_cast<std::int64_t>(entry[t]) * b.hidden + first + r] = v[r][t]; }
+                }
             }
         }
     }
@@ -862,11 +897,12 @@ void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor&
                 cudaFuncSetAttribute(gate_up_grouped_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024) == cudaSuccess &&
                 cudaFuncSetAttribute(down_grouped_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024) == cudaSuccess;
             require(bf16_configured, op, "the grouped kernels' shared memory could not be configured");
-            gate_up_grouped_bf16_kernel<<<dim3((bank.intermediate + kWarps - 1) / kWarps, bank.experts), kThreads, gs, stream>>>(
+            gate_up_grouped_bf16_kernel<<<dim3((bank.intermediate + kWarps * kBf16Rows - 1) / (kWarps * kBf16Rows), bank.experts), kThreads,
+                                          gs, stream>>>(
                 b, zp, zs, counts, offsets, order, top_k, gate_cap, up_cap, act);
             check_launch(op);
-            down_grouped_bf16_kernel<<<dim3((bank.hidden + kWarps - 1) / kWarps, bank.experts), kThreads, ds, stream>>>(b, counts, offsets,
-                                                                                                                       order, act, y);
+            down_grouped_bf16_kernel<<<dim3((bank.hidden + 2 * kWarps * kBf16Rows - 1) / (2 * kWarps * kBf16Rows), bank.experts), kThreads,
+                                       ds, stream>>>(b, counts, offsets, order, act, y);
             check_launch(op);
             combine_kernel<<<dim3(cols, (bank.hidden + 255) / 256), 256, 0, stream>>>(y, static_cast<const float*>(weights.data),
                                                                                        bank.hidden, top_k, static_cast<float*>(out.data));
