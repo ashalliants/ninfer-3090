@@ -610,9 +610,22 @@ ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dspark
 ```
 
 The [model card](model-cards/Inkling-2-Mini-NInfer-V100/README.md) has the file hashes and sources. To
-convert it yourself from Unsloth's GGUFs, run `python3 -m tools.convert --recipe inkling2_gguf` with
-`--mtp-gguf` for the DSpark drafter and `--mmproj` for the vision tower. The design, the conversion map
-and every measurement are in [docs/maintainer/inkling2-model.md](docs/maintainer/inkling2-model.md).
+convert it yourself, take the three GGUFs from `unsloth/Inkling-2-Mini-GGUF` and the tokenizer files and
+chat template from the `thinkingmachines/Inkling-2-Mini` checkpoint (`CKPT` below), then:
+
+```bash
+python3 -m tools.convert --recipe inkling2_gguf --device cpu \
+  --model Inkling-2-Mini-UD-Q8_K_XL.gguf \
+  --mtp-gguf dspark-Inkling-2-Mini-Q8_0.gguf \
+  --mmproj mmproj-BF16.gguf \
+  --resource tokenizer.json=$CKPT/tokenizer.json \
+  --resource tokenizer_config.json=$CKPT/tokenizer_config.json \
+  --resource chat_template.jinja=$CKPT/chat_template.jinja \
+  --out models/inkling2-mini-q8.ninfer
+```
+
+The design, the conversion map and every measurement are in
+[docs/maintainer/inkling2-model.md](docs/maintainer/inkling2-model.md).
 
 ## Performance on an RTX 3090
 
