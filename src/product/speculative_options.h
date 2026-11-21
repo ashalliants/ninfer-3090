@@ -96,6 +96,9 @@ inline void apply_speculative_cli_defaults(SpeculativeOptions& options, bool dra
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
     validate_ngram_cli_options(options);
     validate_adaptive_cli_options(options);
+    if (options.dspark_window_explicit && options.backend != SpeculativeBackend::DSpark) {
+        throw std::invalid_argument("--dspark-window requires --spec dspark (Inkling-2)");
+    }
     switch (options.backend) {
     case SpeculativeBackend::None:
         if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full) {

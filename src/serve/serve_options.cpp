@@ -1054,6 +1054,7 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
         } else if (arg == "--dspark-window") {
             const char* form = require_value("--dspark-window");
+            options.speculative.dspark_window_explicit = true;
             options.speculative.dspark_window = std::string_view(form) == "auto"
                                                     ? SpeculativeOptions::kDSparkWindowAuto
                                                     : static_cast<std::uint32_t>(parse_nonnegative_int(form, "dspark-window"));

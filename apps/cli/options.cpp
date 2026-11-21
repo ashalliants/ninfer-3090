@@ -303,6 +303,7 @@ Options parse_options(int argc, char** argv) {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
         } else if (arg == "--dspark-window") {
             const std::string_view form = value(arg);
+            options.speculative.dspark_window_explicit = true;
             options.speculative.dspark_window = form == "auto" ? SpeculativeOptions::kDSparkWindowAuto
                                                                : parse_u32(std::string(form).c_str(), "dspark-window", true);
         } else if (arg == "--ngram-draft-tokens") {

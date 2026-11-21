@@ -143,6 +143,9 @@ struct SpeculativeOptions {
     // context when the programs fit beside max_context, else 32768, else 16384 (Inkling-2 picks at startup).
     static constexpr std::uint32_t kDSparkWindowAuto = 0xFFFFFFFFU;
     std::uint32_t dspark_window = kDSparkWindowAuto;
+    // --dspark-window was given (auto included): it is refused unless the route is Inkling-2 with --spec dspark, so a
+    // window is never accepted and then ignored.
+    bool dspark_window_explicit = false;
     ProposalHead proposal_head = ProposalHead::Full;
     // N-gram copy drafting beside DFlash2: when the committed text's tail already occurred in the
     // request (its prompt, a tool result or its own output), a round verifies what followed it,

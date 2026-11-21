@@ -125,6 +125,7 @@ std::pair<const std::byte*, const std::byte*> overlay_range(const Model& model) 
 
 std::size_t overlay_bytes(const Model& model) {
     const auto [lo, hi] = overlay_range(model);
+    if (lo == nullptr) { return 0; } // resident vision: no overlay objects, nothing to subtract
     return static_cast<std::size_t>(hi - lo);
 }
 

@@ -192,13 +192,19 @@ int main() {
                       "CLI accepted an unknown --prefill-math form");
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"}).speculative.dspark_window ==
                               ninfer::SpeculativeOptions::kDSparkWindowAuto &&
-                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--dspark-window", "auto"}).speculative.dspark_window ==
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dspark", "--dspark-window", "auto"}).speculative.dspark_window ==
                               ninfer::SpeculativeOptions::kDSparkWindowAuto &&
-                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--dspark-window", "0"}).speculative.dspark_window == 0 &&
-                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--dspark-window", "16384"}).speculative.dspark_window == 16384,
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dspark", "--dspark-window", "0"}).speculative.dspark_window == 0 &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dspark", "--dspark-window", "16384"}).speculative.dspark_window == 16384,
                       "CLI --dspark-window was not parsed");
     failures += check(rejects([&] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--dspark-window", "x"}); }),
                       "CLI accepted a malformed --dspark-window");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dspark", "--dspark-window", "auto"})
+                              .speculative.dspark_window_explicit &&
+                          !parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dspark"}).speculative.dspark_window_explicit &&
+                          rejects([&] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--dspark-window", "0"}); }) &&
+                          rejects([&] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--dspark-window", "auto"}); }),
+                      "CLI --dspark-window without --spec dspark was accepted, or its presence not marked");
     failures += check(rejects([&] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--dense-q8", "q4"}); }),
                       "CLI accepted an unknown --dense-q8 form");
     // --spec dspark: an omitted --draft-tokens takes 3; an explicit one is kept and must be in [1,7].

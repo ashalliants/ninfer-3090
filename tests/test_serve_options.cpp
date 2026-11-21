@@ -860,6 +860,18 @@ int main() {
             (void)parse({"ninfer-serve", "model.ninfer", "--dspark-window", "-1"});
         } catch (const std::exception&) { refused = true; }
         failures += check(refused, "--dspark-window accepted a negative window");
+        // Given without --spec dspark (auto included) it is refused, not stored and ignored.
+        for (const char* form : {"0", "auto"}) {
+            bool alone = false;
+            try {
+                (void)parse({"ninfer-serve", "model.ninfer", "--dspark-window", form});
+            } catch (const std::invalid_argument&) { alone = true; }
+            failures += check(alone, (std::string("--dspark-window ") + form + " without --spec dspark was accepted").c_str());
+        }
+        failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--dspark-window", "auto"}))
+                                  .speculative.dspark_window_explicit &&
+                              !make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "dspark"})).speculative.dspark_window_explicit,
+                          "--dspark-window's presence did not reach the Engine options");
     }
     // N-gram copy drafting: 0 or 15 beside DFlash2 at one lane, carried into the Engine options.
     const ServeOptions ngram =
