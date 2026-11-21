@@ -34,6 +34,8 @@ void check_cuda(cudaError_t status, const char* what) {
 }
 
 constexpr std::int32_t kChunk = 256; // prompt tokens per forward
+// <|end_message|><|message_model|><|content_text|>: what a thinking budget injects to close the reasoning.
+constexpr std::uint32_t kCloseTokens = 3;
 
 // One token from the last column's logits (OpenAI presence and frequency penalties over the generated tokens, then
 // temperature, top-k, min-p and top-p). Temperature 0 is argmax, the lowest id among equals.
@@ -167,7 +169,12 @@ GenerationResult Inkling2Core::Submission::wait(OutputSink* sink, const Cancella
 }
 
 std::optional<std::uint32_t> Inkling2Core::Submission::effective_thinking_budget() const noexcept {
-    return job_ ? job_->options.execution.thinking.budget : std::nullopt;
+    return job_ ? job_->options.execution.thinking.effective_budget : std::nullopt;
+}
+
+Inkling2Core::Submission::~Submission() {
+    // Dropped without wait(): the job is abandoned (skipped if still queued, stopped at its next step if running).
+    if (job_) { job_->cancelled = true; }
 }
 
 Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) : options_(options), device_(device) {
@@ -223,6 +230,20 @@ Inkling2Core::Submission Inkling2Core::submit(ink::PreparedPrompt prompt, Prompt
         throw std::invalid_argument("Inkling-2 serves tool_choice auto or none only");
     }
     if (failed_) { throw RequestError(RequestErrorKind::Unavailable, "the Inkling-2 Engine has failed"); }
+    const auto submitted = Clock::now();
+    if (pending_deadline == Clock::time_point{}) {
+        pending_deadline = submitted + std::chrono::milliseconds(options_.pending_timeout_ms);
+    }
+    if (submitted >= pending_deadline) {
+        throw RequestError(RequestErrorKind::QueueTimeout, "inference request expired before submission");
+    }
+    // A thinking budget closes the reasoning with kCloseTokens control tokens, and the answer needs at least one
+    // more: the budget takes effect only where those fit in the output limit (the effective budget).
+    if (const auto budget = options.execution.thinking.budget) {
+        const std::uint32_t limit = options.execution.requested_output_tokens;
+        options.execution.thinking.effective_budget =
+            limit > kCloseTokens + 1 ? std::optional(std::min(*budget, limit - kCloseTokens - 1)) : std::nullopt;
+    }
     auto job             = std::make_shared<Job>();
     job->id              = next_id_++;
     job->prompt          = std::move(prompt);
@@ -231,11 +252,12 @@ Inkling2Core::Submission Inkling2Core::submit(ink::PreparedPrompt prompt, Prompt
     job->options         = std::move(options);
     job->mode            = consumer_mode;
     job->observation     = std::move(observation);
-    job->submitted       = Clock::now();
+    job->submitted       = submitted;
     job->deadline        = pending_deadline;
     {
         std::lock_guard lock(mutex_);
-        if (queue_.size() >= options_.max_pending_requests + 1) {
+        // One running request and max_pending_requests waiting, as the Engine core admits with one lane.
+        if (queue_.size() + (running_ ? 1U : 0U) >= std::size_t{options_.max_pending_requests} + 1U) {
             throw RequestError(RequestErrorKind::Overloaded, "the Inkling-2 queue is full");
         }
         queue_.push_back(job);
@@ -267,6 +289,7 @@ void Inkling2Core::worker() {
             }
             job = std::move(queue_.front());
             queue_.pop_front();
+            running_ = true;
         }
         try {
             run(*job);
@@ -280,6 +303,10 @@ void Inkling2Core::worker() {
             job->done = true;
         }
         job->changed.notify_all();
+        {
+            std::lock_guard lock(mutex_);
+            running_ = false;
+        }
     }
 }
 
@@ -290,7 +317,7 @@ void Inkling2Core::run(Job& job) {
     out.prompt            = job.summary;
     out.timings.prepare_seconds        = job.prepare_seconds;
     out.thinking.requested_budget      = job.options.execution.thinking.budget;
-    out.thinking.effective_budget      = job.options.execution.thinking.budget;
+    out.thinking.effective_budget      = job.options.execution.thinking.effective_budget;
     out.engine_timing.queue_wait_seconds = seconds_between(job.submitted, began);
     if (job.deadline != Clock::time_point{} && began > job.deadline) {
         throw RequestError(RequestErrorKind::QueueTimeout, "the request waited past its deadline");
@@ -355,7 +382,7 @@ void Inkling2Core::run(Job& job) {
     const auto& stop  = job.options.stop;
     std::vector<TokenId> stop_ids = stop.token_ids;
     if (stop.include_model_defaults) { stop_ids.push_back(ink::token::kEndSampling); }
-    ink::OutputDecoder decoder(*frontend_, stop.strings);
+    ink::OutputDecoder decoder(*frontend_, stop.strings, job.options.tool_choice.mode != ToolChoiceMode::None);
     std::mt19937_64 rng(exec.sampling.seed);
     std::unordered_map<TokenId, std::uint32_t> counts;
     std::vector<float> host(text_cfg.unpadded_vocab_size);
@@ -410,10 +437,12 @@ void Inkling2Core::run(Job& job) {
             out.matched_stop_string = decoder.matched_stop();
             break;
         }
-        if (exec.thinking.budget && decoder.in_reasoning() && forced.empty() && thinking_tokens >= *exec.thinking.budget) {
+        if (exec.thinking.effective_budget && decoder.in_reasoning() && forced.empty() && !out.thinking.applied &&
+            thinking_tokens >= *exec.thinking.effective_budget &&
+            program.position() + 2 + kCloseTokens < static_cast<std::int64_t>(options_.max_context)) {
             forced                    = {ink::token::kEndMessage, ink::token::kMessageModel, ink::token::kContentText};
             out.thinking.applied      = true;
-            out.thinking.injected_tokens += 3;
+            out.thinking.injected_tokens += kCloseTokens;
         }
         if (job.observation.live_timings && streaming) {
             const auto now = Clock::now();

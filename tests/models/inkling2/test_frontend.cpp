@@ -227,6 +227,39 @@ int main() {
             check(!none.stopped && none.content == "one two STOP three", "held-back text is published at the end");
         }
 
+        // Malformed bytes become U+FFFD; a character split across tokens is published whole.
+        {
+            // The tokenizer takes only valid text, so the lone bytes come from the byte-level tokens themselves.
+            const auto byte_token = [&](unsigned char b) {
+                for (TokenId id = 0; id < 200000; ++id) {
+                    if (frontend.token_bytes(id) == std::string_view(reinterpret_cast<const char*>(&b), 1)) { return id; }
+                }
+                throw std::runtime_error("no byte token");
+            };
+            const auto ids = cat({{ink::token::kMessageModel, ink::token::kContentText}, words("a"), {byte_token(0xFF)}, words("b"),
+                                  {byte_token(0x80)}, words("c"), {byte_token(0xE2), byte_token(0x82)}});
+            const Decoded d = decode(frontend, ids);
+            check(d.content == "a\xEF\xBF\xBD" "b\xEF\xBF\xBD" "c\xEF\xBF\xBD", "malformed UTF-8 is replaced");
+            check(d.deltas_valid, "malformed UTF-8 never reaches a delta");
+            const Decoded euro = decode(frontend, cat({{ink::token::kMessageModel, ink::token::kContentText}, {byte_token(0xE2), byte_token(0x82), byte_token(0xAC)},
+                                                       {ink::token::kEndMessage}}));
+            check(euro.content == "\xe2\x82\xac" && euro.deltas_valid, "a character split across tokens");
+        }
+        // tool_choice none: a call stays text.
+        {
+            ink::OutputDecoder decoder(frontend, {}, false);
+            const std::string call = R"({"name":"get_weather","args":{}})";
+            for (const TokenId id : cat({{ink::token::kMessageModel, ink::token::kInvokeToolJson}, words(call), {ink::token::kEndMessage}})) {
+                (void)decoder.push(id);
+            }
+            (void)decoder.finish();
+            check(decoder.tool_calls().empty() && decoder.content() == call, "tool_choice none keeps a call as text");
+        }
+        try {
+            (void)frontend.prepare_tokens({});
+            check(false, "an empty token prompt is refused");
+        } catch (const std::invalid_argument&) {}
+
         // Refusals.
         const auto refused = [&](const ink::Frontend& f, ninfer::PromptInput input, const std::string& what) {
             try {

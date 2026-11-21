@@ -133,6 +133,32 @@ int main() {
             engine.generate(engine.prepare(question()), greedy(64), nullptr, ninfer::CancellationView([] { return true; }));
         check(cancelled.finish_reason == ninfer::FinishReason::Cancelled, "cancellation");
 
+        // A thinking budget closes the reasoning only where the close and one answer token fit the limit.
+        {
+            auto budget                          = greedy(8);
+            budget.execution.thinking.budget     = 2;
+            const auto closed                    = engine.generate(engine.prepare(question()), budget);
+            check(closed.generated_token_ids.size() <= 8 && closed.thinking.applied && closed.thinking.effective_budget == 2u,
+                  "a thinking budget within the limit");
+            auto tight                      = greedy(4);
+            tight.execution.thinking.budget = 1;
+            const auto open                 = engine.generate(engine.prepare(question()), tight);
+            check(open.generated_token_ids.size() <= 4 && !open.thinking.applied && !open.thinking.effective_budget,
+                  "no close past the limit");
+        }
+        // A dropped handle is abandoned; the next request runs.
+        {
+            const auto t = Clock::now();
+            (void)engine.submit(engine.prepare(question()), greedy(2000), ninfer::OutputConsumerMode::Aggregate, {});
+            const auto next = engine.generate(engine.prepare(question()), greedy(4));
+            const double s  = std::chrono::duration<double>(Clock::now() - t).count();
+            check(next.generated_token_ids.size() == 4 && s < 10.0, "a dropped request does not run to its limit");
+        }
+        try {
+            (void)engine.prepare_tokens({});
+            check(false, "an empty token prompt is refused");
+        } catch (const std::invalid_argument&) {}
+
         // The image prompt.
         if (const char* root = std::getenv("NINFER_INKLING2_VISION"); root != nullptr && fs::exists(fs::path(root) / "test1.jpeg")) {
             std::ifstream in(fs::path(root) / "test1.jpeg", std::ios::binary);

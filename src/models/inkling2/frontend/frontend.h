@@ -83,11 +83,13 @@ private:
     ModelSamplingDefaults sampling_;
 };
 
-// One request's output: control tokens switch the channel, the rest is text in it. Text is published in whole
-// UTF-8 characters, held back while it could still become a stop string.
+// One request's output: control tokens switch the channel, the rest is text in it. The text is valid UTF-8 (a
+// malformed sequence becomes U+FFFD) and published in whole characters, held back while it could still become a
+// stop string.
 class OutputDecoder {
 public:
-    OutputDecoder(const Frontend& frontend, std::vector<StopString> stops);
+    // `tools` false (tool_choice none): a tool call the model writes stays content text.
+    OutputDecoder(const Frontend& frontend, std::vector<StopString> stops, bool tools = true);
 
     struct Step {
         std::vector<OutputDelta> deltas;
@@ -115,7 +117,9 @@ private:
     const Frontend& frontend_;
     std::vector<StopString> stops_;
     Channel channel_ = Channel::None;
-    std::string text_[2];          // content, reasoning
+    bool tools_ = true;
+    std::string text_[2];          // content, reasoning: valid UTF-8
+    std::string raw_[2];           // their last bytes that do not yet make a whole character
     std::size_t published_[2] = {0, 0};
     std::string tool_json_;
     std::vector<GeneratedToolCall> calls_;

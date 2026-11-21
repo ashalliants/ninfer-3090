@@ -112,14 +112,56 @@ Json template_context(const PromptInput& input, std::size_t& images) {
     return context;
 }
 
-std::size_t incomplete_utf8_tail(std::string_view s) {
-    for (std::size_t back = 1; back <= std::min<std::size_t>(3, s.size()); ++back) {
-        const auto c = static_cast<unsigned char>(s[s.size() - back]);
-        if ((c & 0xC0) == 0x80) { continue; }
-        const std::size_t need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
-        return need > back ? back : 0;
+// The longest prefix of `raw` that is whole UTF-8, with each malformed sequence (its maximal valid subpart, or one
+// byte) replaced by U+FFFD, as the Unicode standard recommends. Unless `final`, an incomplete but so far valid
+// sequence at the end is left in `raw` for the next token's bytes.
+std::string take_utf8(std::string& raw, bool final) {
+    constexpr std::string_view kReplacement = "\xEF\xBF\xBD";
+    std::string out;
+    std::size_t i = 0;
+    const auto byte = [&](std::size_t k) { return static_cast<unsigned char>(raw[k]); };
+    while (i < raw.size()) {
+        const unsigned char c = byte(i);
+        if (c < 0x80) {
+            out += static_cast<char>(c);
+            ++i;
+            continue;
+        }
+        std::size_t need = 0;
+        unsigned char lo = 0x80, hi = 0xBF; // the second byte's range
+        if (c >= 0xC2 && c <= 0xDF) {
+            need = 1;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            need = 2;
+            if (c == 0xE0) { lo = 0xA0; }
+            if (c == 0xED) { hi = 0x9F; }
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            need = 3;
+            if (c == 0xF0) { lo = 0x90; }
+            if (c == 0xF4) { hi = 0x8F; }
+        } else {
+            out += kReplacement;
+            ++i;
+            continue;
+        }
+        std::size_t k = 1;
+        while (k <= need && i + k < raw.size()) {
+            const unsigned char b = byte(i + k);
+            if (k == 1 ? (b < lo || b > hi) : (b < 0x80 || b > 0xBF)) { break; }
+            ++k;
+        }
+        if (k == need + 1) {
+            out.append(raw, i, k);
+            i += k;
+        } else if (i + k == raw.size() && !final) {
+            break; // incomplete so far: wait for the next bytes
+        } else {
+            out += kReplacement;
+            i += k;
+        }
     }
-    return 0;
+    raw.erase(0, i);
+    return out;
 }
 
 } // namespace
@@ -220,6 +262,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                                std::to_string(options_.max_context) + " and the reply needs at least one");
     }
     out.summary.prompt_tokens = static_cast<std::uint32_t>(out.tokens.size());
+    // The model opens its turn with <|content_thinking|> unless thinking is off: the Engine and the server read this
+    // (a thinking budget applies only to a prompt that starts in reasoning).
+    out.summary.starts_in_reasoning = out.thinking;
     out.summary.has_media     = !out.images.empty();
     out.summary.vision_items  = static_cast<std::uint32_t>(out.images.size());
     out.stats.seconds         = seconds_since(start);
@@ -227,6 +272,12 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
 }
 
 PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> tokens) const {
+    if (tokens.empty()) { throw std::invalid_argument("a prompt needs at least one token"); }
+    if (tokens.size() >= options_.max_context) {
+        throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                           "the prompt has " + std::to_string(tokens.size()) + " tokens; max_context is " +
+                               std::to_string(options_.max_context) + " and the reply needs at least one");
+    }
     PreparedPrompt out;
     for (const TokenId id : tokens) {
         if (!tokenizer_->is_valid_token(id) || id == token::kImagePlaceholder) {
@@ -247,13 +298,19 @@ std::string_view Frontend::token_bytes(TokenId id) const { return tokenizer_->de
 
 bool Frontend::is_special(TokenId id) const noexcept { return tokenizer_->is_special_token(id); }
 
-OutputDecoder::OutputDecoder(const Frontend& frontend, std::vector<StopString> stops)
-    : frontend_(frontend), stops_(std::move(stops)) {
+OutputDecoder::OutputDecoder(const Frontend& frontend, std::vector<StopString> stops, bool tools)
+    : frontend_(frontend), stops_(std::move(stops)), tools_(tools) {
     std::erase_if(stops_, [](const StopString& s) { return s.text.empty(); });
 }
 
 void OutputDecoder::close_tool_call() {
     parse_.marker_seen = true;
+    if (!tools_) {
+        // tool_choice none: a call the request does not allow stays text.
+        text_[0] += take_utf8(tool_json_, true);
+        tool_json_.clear();
+        return;
+    }
     const Json call    = Json::parse(tool_json_, nullptr, false);
     if (call.is_object() && call.contains("name") && call["name"].is_string() &&
         (!call.contains("args") || call["args"].is_object())) {
@@ -262,7 +319,7 @@ void OutputDecoder::close_tool_call() {
     } else {
         // Malformed: kept as text, as a free parser does.
         parse_.fallback_reason = ToolCallParseFallbackReason::MalformedStructure;
-        text_[0] += tool_json_;
+        text_[0] += take_utf8(tool_json_, true);
     }
     tool_json_.clear();
 }
@@ -270,6 +327,10 @@ void OutputDecoder::close_tool_call() {
 OutputDecoder::Step OutputDecoder::push(TokenId id) {
     Step step;
     const bool was_reasoning = channel_ == Channel::Reasoning;
+    if (frontend_.is_special(id)) {
+        // A control token ends any character a channel's last bytes left open.
+        for (std::size_t c = 0; c < 2; ++c) { text_[c] += take_utf8(raw_[c], true); }
+    }
     switch (id) {
     case token::kMessageModel: channel_ = Channel::Header; break;
     case token::kContentThinking: channel_ = Channel::Reasoning; break;
@@ -303,7 +364,8 @@ OutputDecoder::Step OutputDecoder::push(TokenId id) {
 void OutputDecoder::append(std::size_t channel, std::string_view bytes, Step& step) {
     std::string& text      = text_[channel];
     const std::size_t from = text.size();
-    text += bytes;
+    raw_[channel] += bytes;
+    text += take_utf8(raw_[channel], false);
     const OutputChannel which = channel == 0 ? OutputChannel::Content : OutputChannel::Reasoning;
     for (const StopString& stop : stops_) {
         if (stop.channel != which) { continue; }
@@ -323,7 +385,6 @@ void OutputDecoder::publish(std::size_t channel, bool all, std::vector<OutputDel
     const std::string& text = text_[channel];
     std::size_t end         = text.size();
     if (!all) {
-        end -= incomplete_utf8_tail(text);
         // Hold back what could still be the start of a stop string.
         const OutputChannel which = channel == 0 ? OutputChannel::Content : OutputChannel::Reasoning;
         for (const StopString& stop : stops_) {
@@ -347,9 +408,10 @@ std::vector<OutputDelta> OutputDecoder::finish() {
         // A call the turn did not close is not a call.
         parse_.marker_seen     = true;
         parse_.fallback_reason = ToolCallParseFallbackReason::MalformedStructure;
-        text_[0] += tool_json_;
+        text_[0] += take_utf8(tool_json_, true);
         tool_json_.clear();
     }
+    for (std::size_t c = 0; c < 2; ++c) { text_[c] += take_utf8(raw_[c], true); }
     channel_ = Channel::None;
     std::vector<OutputDelta> out;
     publish(1, true, out);

@@ -32,6 +32,11 @@ public:
     class Submission {
     public:
         explicit Submission(std::shared_ptr<Job> job) : job_(std::move(job)) {}
+        ~Submission();
+        Submission(Submission&&) noexcept            = default;
+        Submission& operator=(Submission&&) noexcept = default;
+        Submission(const Submission&)                = delete;
+        Submission& operator=(const Submission&)     = delete;
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation);
         [[nodiscard]] std::optional<std::uint32_t> effective_thinking_budget() const noexcept;
 
@@ -77,7 +82,8 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable wake_;
     std::deque<std::shared_ptr<Job>> queue_;
-    bool stop_ = false;
+    bool stop_    = false;
+    bool running_ = false; // the worker has a request
     std::atomic<bool> failed_{false};
     std::atomic<std::uint64_t> next_id_{1};
     std::atomic<std::uint64_t> prompt_tokens_{0}, generated_tokens_{0};
