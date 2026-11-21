@@ -178,13 +178,21 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         xk = ck;
         xv = cv;
     }
-    Tensor nq = workspace_.alloc(DType::BF16, {h, cols}), nk = workspace_.alloc(DType::BF16, {h, cols}),
-           nv = workspace_.alloc(DType::BF16, {h, cols});
+    // A local visit without loop messages has one input for q, k and v (one MIX query, one norm): normalize it once
+    // and project k and v in one call.
+    const bool one_input = local && messages == nullptr;
+    Tensor nq = workspace_.alloc(DType::BF16, {h, cols}), nk = nq, nv = nq;
+    if (!one_input) {
+        nk = workspace_.alloc(DType::BF16, {h, cols});
+        nv = workspace_.alloc(DType::BF16, {h, cols});
+    }
     if (local) {
         const Tensor gamma = model_.tensor(w.norm, {h});
         ops::rmsnorm_fp32(xq, &gamma, eps, nq, stream_);
-        ops::rmsnorm_fp32(xk, &gamma, eps, nk, stream_);
-        ops::rmsnorm_fp32(xv, &gamma, eps, nv, stream_);
+        if (!one_input) {
+            ops::rmsnorm_fp32(xk, &gamma, eps, nk, stream_);
+            ops::rmsnorm_fp32(xv, &gamma, eps, nv, stream_);
+        }
     } else {
         const Tensor gq = model_.tensor(w.q_norm, {h}), gk = model_.tensor(w.k_norm, {h}), gv = model_.tensor(w.v_norm, {h});
         ops::rmsnorm_fp32(xq, &gq, eps, nq, stream_);
@@ -200,9 +208,19 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     const std::int32_t dyn_rows = i32(c.kv_heads) * k;
     Tensor kconv = workspace_.alloc(DType::FP32, {kv, cols}), vconv = workspace_.alloc(DType::FP32, {kv, cols});
     if (local) {
-        const WeightId kw[] = {w.k}, vw[] = {w.v};
-        const std::int32_t kr[] = {kv};
-        Tensor pk = project(nk, kw, kr), pv = project(nv, vw, kr);
+        Tensor pk, pv;
+        if (one_input) {
+            const WeightId kvw[] = {w.k, w.v};
+            const std::int32_t kvr[] = {kv, kv};
+            const Tensor both = project(nk, kvw, kvr);
+            pk = both.slice(0, 0, kv);
+            pv = both.slice(0, kv, kv);
+        } else {
+            const WeightId kw[] = {w.k}, vw[] = {w.v};
+            const std::int32_t kr[] = {kv};
+            pk = project(nk, kw, kr);
+            pv = project(nv, vw, kr);
+        }
         ops::short_conv_fp32(pk, model_.tensor(w.k_conv, {k, kv}), nullptr, d, st.k_hist, kconv, stream_);
         ops::short_conv_fp32(pv, model_.tensor(w.v_conv, {k, kv}), nullptr, d, st.v_hist, vconv, stream_);
     } else {
