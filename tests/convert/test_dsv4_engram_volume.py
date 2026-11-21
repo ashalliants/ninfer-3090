@@ -71,3 +71,18 @@ def test_a_folder_with_files_is_not_overwritten(gguf_path, tmp_path):  # noqa: F
     with GgufModel(gguf_path) as gguf, pytest.raises(sidecar.EngramVolumeError):
         sidecar.write(gguf, tmp_path / "e", log=lambda _: None)
     assert (tmp_path / "e" / "keep").read_text() == "x"
+
+
+def test_the_digest_is_the_canonical_utf8_form_the_runtime_recomputes():
+    import hashlib
+
+    manifest = {"b": 1, "a": {"file": "mod\u00e8le-\u4e2d.gguf"}, "digest": "x"}
+    expected = hashlib.sha256('{"a":{"file":"mod\u00e8le-\u4e2d.gguf"},"b":1}'.encode("utf-8")).hexdigest()
+    assert sidecar.manifest_digest(manifest) == expected
+
+
+def test_a_non_first_shard_is_refused(tmp_path):
+    from tools.convert.sources.gguf import GgufError
+
+    with pytest.raises(GgufError):
+        GgufModel(tmp_path / "m-00002-of-00006.gguf")

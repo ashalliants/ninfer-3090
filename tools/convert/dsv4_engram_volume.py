@@ -2,7 +2,7 @@
 
     python3 -m tools.convert.dsv4_engram_volume GGUF OUTDIR [--check-only]
 
-``GGUF`` is the first shard (or any shard) of the split GGUF whose last shard holds the Engram table
+``GGUF`` is the FIRST shard (``-00001-of-0000N``) of the split GGUF, whose last shard holds the Engram table; any other shard is refused
 (``per_layer_token_embd.weight``); ``OUTDIR`` is a new folder. It receives
 
 * ``engram.volume``       the n-gram volume (``tools/artifact/ngram_volume.py``), the table's rows
@@ -95,9 +95,10 @@ def _header_sha256(path: Path) -> str:
 
 
 def manifest_digest(manifest: dict) -> str:
-    """sha256 over the manifest without its own ``digest`` field, in canonical JSON."""
+    """sha256 over the manifest without its own ``digest`` field, in canonical JSON (sorted keys, no whitespace, raw UTF-8:
+    the form nlohmann's dump() produces, which the runtime loader recomputes)."""
     body = {k: v for k, v in manifest.items() if k != "digest"}
-    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 def build_manifest(gguf: GgufModel, params: dict, record: dict, volume: Path, token_map_file: Path) -> dict:
