@@ -3,6 +3,8 @@
 #include "models/dsv4/execution/forward.h"
 
 #include "core/weight_view.h"
+#include "models/dsv4/execution/engram.h"
+#include "models/dsv4/execution/engram_sidecar.h"
 #include "ninfer/ops/cast.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/hc_sinkhorn.h"
@@ -13,6 +15,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -24,6 +27,24 @@ void cuda_ok(cudaError_t error, const char* what) {
 }
 
 constexpr std::size_t kSlack = 1 << 20;
+
+// The Engram folder's checked contents, or nothing without a folder (the layers then run uninjected).
+std::optional<EngramSidecar> load_sidecar(const Model& model, const ForwardOptions& options) {
+    if (options.engram_dir.empty()) { return std::nullopt; }
+    return load_engram_sidecar(options.engram_dir, model.config());
+}
+
+std::unique_ptr<qwen4_exp::NgramVolume> open_volume(const std::optional<EngramSidecar>& sidecar) {
+    if (!sidecar) { return nullptr; }
+    return std::make_unique<qwen4_exp::NgramVolume>(sidecar->volume_path, sidecar->table);
+}
+
+// The layer's Engram weights and how its injection runs.
+struct EngramLayer {
+    Weight kv;
+    Tensor gate;
+    ops::LinearPolicy policy = ops::LinearPolicy::AllowA8;
+};
 
 } // namespace
 
@@ -41,6 +62,14 @@ struct Forward::Impl {
     std::vector<DeviceBuffer> owned;     // BF16 copy of the output norm
     Tensor output_norm;
     Weight embedding_table, head;
+
+    // The Engram (declared before the workspace, whose size includes the injection's scratch).
+    std::optional<EngramSidecar> sidecar;
+    std::unique_ptr<qwen4_exp::NgramVolume> engram_volume;
+    std::unique_ptr<Engram> engram;
+    EngramHasher::History engram_history;
+    std::vector<std::optional<EngramLayer>> engram_layers; // per model layer; engaged on Engram layers
+    std::vector<std::uint32_t> engram_index;               // per model layer: the Engram's own index
 
     AttentionState state;
     DeviceBuffer residual_buffer, mixes_buffer, identity_buffer, logits_buffer, tokens_buffer;
@@ -72,7 +101,7 @@ struct Forward::Impl {
         stage_seconds[stage] += std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
     }
 
-    static std::size_t workspace_bytes(const Model& model, const ForwardOptions& options) {
+    static std::size_t workspace_bytes(const Model& model, const ForwardOptions& options, std::size_t engram_bytes) {
         const TextConfig& c = model.config();
         const std::int32_t T = static_cast<std::int32_t>(options.limits.max_chunk);
         std::size_t attention_bytes = attention_workspace_bytes(c, options.limits);
@@ -83,7 +112,7 @@ struct Forward::Impl {
         const std::size_t H = c.hidden_size;
         // collapsed + normed activations of both sublayers, the attention output, the final norm and head.
         const std::size_t activations = 4 * H * T * 2 + 2 * H * 2 + std::size_t(c.vocab_size) * 4;
-        return std::max(attention_bytes, ffn_bytes) + activations + 8 * kSlack;
+        return std::max({attention_bytes, ffn_bytes, engram_bytes}) + activations + 8 * kSlack;
     }
 
     Tensor norm_bf16(WeightId id, std::int32_t n) {
@@ -97,7 +126,12 @@ struct Forward::Impl {
 
     Impl(const Model& m, ExpertSource& e, ForwardOptions o, cudaStream_t s)
         : model(m), experts(e), options(o), stream(s), config(m.config()), ffn_params_(ffn_params(m.config(), 0)),
-          state(m.config(), o.limits), workspace(workspace_bytes(m, o)) {
+          sidecar(load_sidecar(m, o)), engram_volume(open_volume(sidecar)),
+          engram(sidecar ? std::make_unique<Engram>(m.config(), sidecar->params, *engram_volume, static_cast<std::uint32_t>(o.limits.max_chunk))
+                         : nullptr),
+          state(m.config(), o.limits),
+          workspace(workspace_bytes(
+              m, o, engram ? engram->apply_workspace_bytes(static_cast<std::uint32_t>(o.limits.max_chunk), ops::LinearPolicy::AllowA8) : 0)) {
         const std::int32_t H = static_cast<std::int32_t>(config.hidden_size), S = static_cast<std::int32_t>(config.hc_streams),
                            T = static_cast<std::int32_t>(options.limits.max_chunk);
         if (S != ops::kHcSinkhornStreams) { throw std::invalid_argument("dsv4 forward: four hyper-connection streams are required"); }
@@ -108,6 +142,20 @@ struct Forward::Impl {
             attention.push_back(bind_attention_views(model, b.attention, stream));
             ffn_norms.emplace_back();
             ffn.push_back(bind_ffn_weights(model, l, ffn_norms.back()));
+        }
+        engram_layers.resize(config.num_hidden_layers);
+        engram_index.assign(config.num_hidden_layers, 0);
+        if (engram) {
+            engram_history     = engram->hasher().start();
+            std::uint32_t next = 0;
+            for (std::uint32_t l = 0; l < config.num_hidden_layers; ++l) {
+                const BlockWeights& b = model.weights().layers[l];
+                if (!config.layers[l].engram) { continue; }
+                if (!b.engram) { throw std::invalid_argument("dsv4 forward: an Engram layer has no Engram weights"); }
+                engram_index[l]  = next++;
+                engram_layers[l] = EngramLayer{native_weight(model.weight(b.engram->kv).view), weight_tensor(model.weight(b.engram->gate).view, {S, H}),
+                                               model.weight(b.engram->kv).policy};
+            }
         }
         output_norm     = norm_bf16(model.weights().output_norm, H);
         embedding_table = native_weight(model.weight(model.weights().token_embedding).view);
@@ -146,6 +194,8 @@ Forward::Forward(const Model& model, ExpertSource& experts, ForwardOptions optio
 
 Forward::~Forward() = default;
 
+bool Forward::engram_applied() const noexcept { return impl_->engram != nullptr; }
+
 std::string Forward::profile_report() const {
     const Impl& s = *impl_;
     std::string out;
@@ -183,6 +233,22 @@ const Tensor& Forward::run(std::span<const std::int32_t> tokens, std::int32_t st
     if (std::int64_t(start) + T > s.options.limits.max_context) { throw std::invalid_argument("dsv4 forward: context exceeds max_context"); }
     cudaStream_t stream = s.stream;
 
+    // Engram: the hash history restarts with a sequence; the rows of every Engram layer for these tokens are read
+    // from the volume on the host before any device work is queued (the ids depend on the tokens alone). A call
+    // that fails leaves the history where it was, so a retry at the same start hashes alike.
+    struct HistoryGuard {
+        EngramHasher::History& history;
+        EngramHasher::History saved;
+        bool done = false;
+        ~HistoryGuard() {
+            if (!done) { history = saved; }
+        }
+    } history_guard{s.engram_history, s.engram_history};
+    if (s.engram) {
+        if (start == 0) { s.engram_history = s.engram->hasher().start(); }
+        const Engram::Run run{&s.engram_history, tokens};
+        s.engram->stage(std::span<const Engram::Run>(&run, 1));
+    }
     // Embedding into one stream, then copied into the others.
     s.recording = s.profile && T == 1 && start >= 16;
     s.begin();
@@ -212,6 +278,12 @@ const Tensor& Forward::run(std::span<const std::int32_t> tokens, std::int32_t st
 
     for (std::uint32_t l = 0; l < c.num_hidden_layers; ++l) {
         const BlockWeights& b = s.model.weights().layers[l];
+        if (s.engram_layers[l]) {
+            // The residual streams receive the layer's gated n-gram value before its block.
+            EngramLayer& e = *s.engram_layers[l];
+            auto scope     = s.workspace.scope();
+            (void)s.engram->apply(s.engram_index[l], e.kv, e.gate, residual, e.policy, s.workspace, stream);
+        }
         // Attention sublayer.
         {
             auto scope = s.workspace.scope();
@@ -257,6 +329,7 @@ const Tensor& Forward::run(std::span<const std::int32_t> tokens, std::int32_t st
     if (s.recording) { ++s.stage_calls; }
     s.position     = start + T;
     s.last_columns = T;
+    history_guard.done = true;
     return s.logits;
 }
 

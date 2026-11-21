@@ -36,6 +36,8 @@
 #include "core/device.h"
 #include "models/dsv4/config.h"
 #include "models/dsv4/execution/engram.h"
+#include "models/dsv4/execution/engram_sidecar.h"
+#include "models/qwen3_5/frontend/digest.h"
 #include "ninfer/ops/linear.h"
 #include "ops/ggml_blocks_decode.h"
 #include "ops/op_tester.h"
@@ -810,6 +812,107 @@ void test_synthetic(cudaStream_t stream) {
     }
 }
 
+// ---------------------------------------------------------------------------------------- the sidecar folder
+
+std::string sha_hex(const void* data, std::size_t n) {
+    namespace fe = ninfer::models::qwen3_5::frontend;
+    return fe::sha256_hex(fe::sha256(std::span<const std::uint8_t>(static_cast<const std::uint8_t*>(data), n)));
+}
+
+// The folder tools/convert/dsv4_engram_volume.py writes, at a small table: engram.json, the volume and the token map.
+void test_sidecar() {
+    std::vector<std::uint64_t> sizes;
+    for (std::uint64_t p = 1001; sizes.size() < 48; ++p) {
+        bool prime = true;
+        for (std::uint64_t d = 2; d * d <= p && prime; ++d) { prime = p % d != 0; }
+        if (prime) { sizes.push_back(p); }
+    }
+    dsv4::TextConfig config = text_config(sizes, 2, 1e-6F);
+    config.vocab_size       = 5000;
+    const std::vector<std::int64_t> multipliers{3, 5, 7, 9, 11, 13, 15, 17};
+    std::vector<std::int32_t> token_map(config.vocab_size);
+    for (std::size_t i = 0; i < token_map.size(); ++i) { token_map[i] = static_cast<std::int32_t>(i % 2000); }
+
+    const auto dir = std::filesystem::temp_directory_path() / "ninfer_dsv4_sidecar_test";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const std::array<std::uint8_t, 16> id{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    const auto table = write_volume(dir / "engram.volume", random_iq4_rows(config.engram.table_rows, 3), config.engram.table_rows, id);
+    {
+        std::ofstream out(dir / "engram.token_map.i32", std::ios::binary);
+        out.write(reinterpret_cast<const char*>(token_map.data()), static_cast<std::streamsize>(token_map.size() * 4));
+    }
+    const auto header = read_file(dir / "engram.volume");
+    Json record{{"format", "ggml_iq4_nl"}, {"rows", table.rows}, {"row_bytes", table.row_bytes}, {"rows_per_block", table.rows_per_block},
+                {"block_bytes", 4096}, {"header_bytes", 4096}, {"blocks", table.blocks}, {"file_bytes", table.file_bytes},
+                {"volume_id", "0102030405060708090a0b0c0d0e0f10"}};
+    const Json manifest{
+        {"format", "ninfer-dsv4-engram"}, {"version", 1},
+        {"volume", {{"file", "engram.volume"}, {"table", record}, {"header_sha256", sha_hex(header.data(), 4096)}}},
+        {"hash",
+         {{"layers", {1, 14}}, {"ngram_size", 4}, {"heads", 8}, {"row_width", 256}, {"pad_token_id", 2}, {"head_vocab_sizes", sizes},
+          {"multipliers", multipliers}, {"token_map_count", token_map.size()},
+          {"token_map", {{"file", "engram.token_map.i32"}, {"sha256", sha_hex(token_map.data(), token_map.size() * 4)}}}}}};
+    // The writer's digest: sha256 of the manifest without it, canonical JSON.
+    const auto sealed = [&](Json m) {
+        m.erase("digest");
+        const std::string text = m.dump();
+        m["digest"]            = sha_hex(text.data(), text.size());
+        return m;
+    };
+    const auto write_manifest = [&](const Json& m) { std::ofstream(dir / "engram.json") << sealed(m).dump(); };
+    write_manifest(manifest);
+
+    const dsv4::EngramSidecar loaded = dsv4::load_engram_sidecar(dir, config);
+    check(loaded.params.token_map == token_map && loaded.params.multipliers == multipliers, "the sidecar's token map and multipliers load");
+    check(loaded.table.rows == config.engram.table_rows && loaded.volume_path == dir / "engram.volume", "the sidecar names the volume");
+    {
+        const q4::NgramVolume volume(loaded.volume_path, loaded.table); // the header's id matches the manifest's
+        const dsv4::EngramHasher hasher(config.engram, 2, loaded.params);
+        check(hasher.table_rows() == volume.table().rows, "the sidecar's hash addresses the volume's rows");
+    }
+
+    const auto refused = [&](const char* label, const Json& m, const dsv4::TextConfig& c) {
+        write_manifest(m);
+        check(throws([&] { (void)dsv4::load_engram_sidecar(dir, c); }), label);
+    };
+    Json bad = manifest;
+    bad["hash"]["pad_token_id"] = 3;
+    refused("a pad token that differs from the model's is refused", bad, config);
+    bad = manifest;
+    bad["hash"]["head_vocab_sizes"][0] = 1;
+    refused("bucket counts that differ from the model's are refused", bad, config);
+    bad = manifest;
+    bad["hash"]["layers"] = Json::array({1, 15});
+    refused("other Engram layers are refused", bad, config);
+    bad = manifest;
+    bad["volume"]["header_sha256"] = std::string(64, '0');
+    refused("a volume header that is not the manifest's is refused", bad, config);
+    {
+        // Edited after sealing: the digest no longer matches (the multipliers are covered by nothing else).
+        Json tampered                 = sealed(manifest);
+        tampered["hash"]["multipliers"][0] = 5;
+        std::ofstream(dir / "engram.json") << tampered.dump();
+        check(throws([&] { (void)dsv4::load_engram_sidecar(dir, config); }), "a manifest edited after it was written is refused");
+    }
+    bad = manifest;
+    bad["version"] = 2;
+    refused("another manifest version is refused", bad, config);
+    dsv4::TextConfig other = config;
+    other.vocab_size       = 4999;
+    refused("a token map of another length than the vocabulary is refused", manifest, other);
+    write_manifest(manifest);
+    {
+        std::fstream map(dir / "engram.token_map.i32", std::ios::in | std::ios::out | std::ios::binary);
+        map.seekp(40);
+        map.put('\x7f');
+    }
+    check(throws([&] { (void)dsv4::load_engram_sidecar(dir, config); }), "a damaged token map is refused");
+    std::filesystem::remove(dir / "engram.json");
+    check(throws([&] { (void)dsv4::load_engram_sidecar(dir, config); }), "a folder without engram.json is refused");
+    std::filesystem::remove_all(dir);
+}
+
 // ---------------------------------------------------------------------------------------- 3. real
 // weights
 
@@ -932,6 +1035,7 @@ void test_real(const std::filesystem::path& dir, cudaStream_t stream) {
 int main() {
     try {
         test_hash_golden();
+        test_sidecar();
         if (t::cuda_unavailable()) {
             std::printf("SKIP the device part: no CUDA device\n");
             return failures == 0 ? 0 : 1;

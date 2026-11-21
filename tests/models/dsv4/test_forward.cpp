@@ -11,6 +11,9 @@
 // on a SATA SSD 8 to 16 threads read 1.5x faster) and NINFER_DSV4_ZC
 // (zero-copy misses of the Op, default 0). Prints the time per token and the tier hit counts of each phase
 // (cold decode, a second decode of the same text with the caches warm, and a fixed-routing probe).
+// NINFER_DSV4_ENGRAM_DIR: the Engram folder (tools/convert/dsv4_engram_volume.py); layers 1 and 14 then inject, and the
+// default prompt is only required to continue with ' Paris' (the exact ids of the uninjected run differ). Chunked
+// prefill and decode then also check that the hash history carries across calls.
 
 #include "core/device.h"
 #include "models/dsv4/execution/forward.h"
@@ -109,7 +112,9 @@ int main() {
     cudaStream_t stream = nullptr;
     dsv4::ForwardOptions forward_options;
     forward_options.limits = {.max_context = 2048, .max_chunk = 64};
+    if (const char* env = std::getenv("NINFER_DSV4_ENGRAM_DIR"); env != nullptr && env[0] != '\0') { forward_options.engram_dir = env; }
     dsv4::Forward forward(*model, experts, forward_options, stream);
+    std::printf("Engram injection: %s\n", forward.engram_applied() ? "applied" : "not applied (reduced quality)");
     std::printf("forward state and workspace: %.2f GB; expert tiers: %u RAM slots, %u device frames, %u read threads\n",
                 static_cast<double>(forward.device_bytes()) / 1e9, experts.cache_slots(), experts.device_frames(), options.read_threads);
 
@@ -125,7 +130,7 @@ int main() {
     for (const float v : whole) { finite = finite && std::isfinite(v); }
     check(finite, "the logits are finite");
     std::printf("top tokens:");
-    for (const int id : top(whole, 5)) { std::printf(" %d(%.2f)", id, whole[id]); }
+    for (const int id : top(whole, 5)) { std::printf(" %d(%.4f)", id, whole[id]); }
     std::printf("\n");
 
     // The same prompt in two chunks must give the same logits (the state carries across the boundary).
@@ -179,12 +184,13 @@ int main() {
         }
     }
     if (std::getenv("NINFER_DSV4_TOKENS") == nullptr && generated.size() >= 2) {
-        check(generated[0] == 11111 && generated[1] == 16, "the default prompt continues with ' Paris' and '.'");
+        check(generated[0] == 11111, "the default prompt continues with ' Paris'");
+        if (!forward.engram_applied()) { check(generated[1] == 16, "the uninjected default prompt continues with ' Paris' and '.'"); }
     }
     std::printf("\ndecode: %d tokens in %.2f s (%.2f s/token)\n", new_tokens, decode_seconds, decode_seconds / std::max(new_tokens, 1));
     print_tiers("decode after the prefill", experts.stats(), decode_seconds, new_tokens);
     const std::vector<std::int32_t> first_pass = generated;
-    if (!std::getenv("NINFER_DSV4_TOKENS") && new_tokens >= 4) {
+    if (!std::getenv("NINFER_DSV4_TOKENS") && new_tokens >= 4 && !forward.engram_applied()) {
         const std::int32_t expected[4] = {11111, 16, 4588, 455};
         check(std::equal(expected, expected + 4, generated.begin()), "greedy ids continue 'The capital of France is' as before");
     }

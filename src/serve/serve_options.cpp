@@ -251,7 +251,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
            "[--moe-fused-route] [--cpu-verify-misses] [--prefill-cpu-share F [--prefill-cpu-all-columns N] [--prefill-cpu-max-columns N]] [--cpu-verify-workers N] [--gdn-async-commit] [--hc-int8 [--hc-fused-read]] "
            "[--ngram-flag-wait] [--partial-ram-residency] [--ggml-decode-mma] "
-           "[--ram-headroom-mib N] [--allow-unlocked-host-memory] [--expert-cache-mib N] [--context-nvme-mib N [--context-nvme-dir DIR]] "
+           "[--ram-headroom-mib N] [--allow-unlocked-host-memory] [--expert-cache-mib N] [--engram-dir DIR] [--context-nvme-mib N [--context-nvme-dir DIR]] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
            "[--gdn-state-fp16] [--numeric-tripwire [--numeric-tripwire-limit F|inf]] "
@@ -369,6 +369,9 @@ std::string serve_usage_text(const char* argv0) {
            "--context-nvme-mib N, in a scratch file of up to N MiB on local disk (removed at exit; "
            "--context-nvme-dir DIR, default beside the model) with --host-context-mib as its RAM "
            "cache (0: disk only); --context-store DIR keeps it across restarts; "
+           "DeepSeek-V4.1-Flash reads its Engram tables from --engram-dir DIR (or NINFER_DSV4_ENGRAM_DIR), the folder "
+           "python3 -m tools.convert.dsv4_engram_volume writes; without one layers 1 and 14 run without their injection "
+           "and the answers are of reduced quality; "
            "--ngram-volume FILE is its n-gram table (default <model>.ngram); --ngram-keepalive-ms N "
            "reads a block from it after N ms of idleness so the drive stays awake (default 40, "
            "0 turns it off, at most 60000); --ngram-ram-mib N|auto holds up to N MiB of the n-gram table in RAM "
@@ -1091,6 +1094,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.use_cuda_graph = false;
         } else if (arg == "--ngram-volume") {
             options.flash_next.ngram_volume_path = require_value("--ngram-volume");
+        } else if (arg == "--engram-dir") {
+            options.flash_next.engram_dir = require_value("--engram-dir");
         } else if (arg == "--ngram-keepalive-ms") {
             const int ms = parse_nonnegative_int(require_value("--ngram-keepalive-ms"), "ngram-keepalive-ms");
             if (static_cast<std::uint32_t>(ms) > kNgramKeepaliveWindowMs) {

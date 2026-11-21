@@ -13,8 +13,12 @@
 //   logits = head(norm(collapse(h, pre)))[last position]
 //
 // A call takes a chunk of tokens (any length up to the limits) at positions start .. start + T - 1 and
-// leaves the sequence's state advanced; start = 0 begins a new sequence. Engram injections are not part of
-// this class yet (their layers run without them), which `engram_applied()` reports.
+// leaves the sequence's state advanced; start = 0 begins a new sequence.
+//
+// Engram: with `ForwardOptions::engram_dir` set (the folder tools/convert/dsv4_engram_volume.py writes), every
+// call first hashes its tokens and stages their volume rows on the host (the hash history persists across
+// calls; start = 0 resets it), and the Engram layers (1 and 14) then inject before their block. Without it those
+// layers run without the injection and `engram_applied()` is false: the answers are of reduced quality.
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -26,6 +30,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <span>
 #include <string>
@@ -35,6 +40,7 @@ namespace ninfer::models::dsv4 {
 
 struct ForwardOptions {
     AttentionLimits limits; // max_context and max_chunk
+    std::filesystem::path engram_dir; // empty: no Engram injection
 };
 
 class Forward {
@@ -57,7 +63,8 @@ public:
     // NINFER_DSV4_PROFILE=1: per-stage host timing of the decode steps from position 16 on (empty otherwise).
     [[nodiscard]] std::string profile_report() const;
 
-    [[nodiscard]] bool engram_applied() const noexcept { return false; }
+    // Whether the Engram layers inject (an Engram folder was bound).
+    [[nodiscard]] bool engram_applied() const noexcept;
     [[nodiscard]] std::size_t device_bytes() const noexcept;
 
 private:

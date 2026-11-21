@@ -102,8 +102,15 @@ ConstructedDsv4 construct_dsv4(const EngineOptions& options, DeviceContext& devi
         std::make_unique<models::dsv4::FileExpertSource>(*instance->reader, banks, instance->model->config().experts, expert_options);
     models::dsv4::ForwardOptions forward_options;
     forward_options.limits = {.max_context = wanted.max_context, .max_chunk = wanted.prefill_chunk};
+    // The Engram folder: --engram-dir, else NINFER_DSV4_ENGRAM_DIR, else none.
+    forward_options.engram_dir = options.flash_next.engram_dir;
+    if (forward_options.engram_dir.empty()) {
+        if (const char* env = std::getenv("NINFER_DSV4_ENGRAM_DIR"); env != nullptr && env[0] != '\0') { forward_options.engram_dir = env; }
+    }
     try {
         instance->forward = std::make_unique<models::dsv4::Forward>(*instance->model, *instance->experts, forward_options, device.stream);
+    } catch (const artifact::ArtifactError&) {
+        throw; // the Engram folder is inconsistent with the model: its message says how
     } catch (const std::exception& error) {
         throw std::runtime_error(std::string("DeepSeek-V4.1-Flash: the forward's state and workspace for --max-context ") +
                                  std::to_string(wanted.max_context) + " and --prefill-chunk " + std::to_string(wanted.prefill_chunk) +
@@ -119,8 +126,9 @@ ConstructedDsv4 construct_dsv4(const EngineOptions& options, DeviceContext& devi
 
     std::vector<std::string> warnings;
     if (!instance->forward->engram_applied()) {
-        warnings.push_back("DeepSeek-V4.1-Flash: this artifact has no Engram data yet, so the Engram layers run without their "
-                           "injection and the answers are of reduced quality");
+        warnings.push_back("DeepSeek-V4.1-Flash: no Engram folder was given (--engram-dir DIR or NINFER_DSV4_ENGRAM_DIR; write one with "
+                           "python3 -m tools.convert.dsv4_engram_volume), so the Engram layers run without their injection and the "
+                           "answers are of reduced quality");
     }
 
     auto& resolution                 = instance->kv_capacity_resolution;
