@@ -189,8 +189,8 @@ def test_the_public_cli_converts_an_inkling2_gguf(gguf_path, tmp_path):
         main(["--model", str(gguf_path), "--recipe", "inkling2_gguf", "--device", "cpu",
               "--out", str(tmp_path / "y.ninfer"), *resources[:2]])
     with pytest.raises(ValueError, match="takes none of"):
-        main(["--model", str(gguf_path), "--recipe", "inkling2_gguf", "--device", "cpu", "--mmproj", str(gguf_path),
-              "--out", str(tmp_path / "x.ninfer")])
+        main(["--model", str(gguf_path), "--recipe", "inkling2_gguf", "--device", "cpu", "--ngram-out",
+              str(tmp_path / "x.ngram"), "--out", str(tmp_path / "x.ninfer")])
 
 
 def test_the_reference_reads_the_same_weights_from_the_artifact(gguf_path, tmp_path):
