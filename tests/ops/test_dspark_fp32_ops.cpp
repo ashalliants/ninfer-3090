@@ -246,6 +246,15 @@ void test_attention(std::int64_t anchor, int capacity, int window, const std::st
     const ninfer::ops::DSparkAttentionShape shape{heads, kv_heads, d, window};
     Buf ws(ninfer::ops::dspark_block_attention_workspace_bytes(shape, w));
     Tensor tws = ws.tensor({static_cast<std::int32_t>(ninfer::ops::dspark_block_attention_workspace_bytes(shape, w) / 4)});
+    {
+        // A workspace of the right size without storage is refused before either kernel runs.
+        const Tensor no_ws(nullptr, DType::FP32, {tws.ne[0]});
+        bool refused = false;
+        try {
+            ninfer::ops::dspark_block_attention_fp32(tq, tkr, tvr, tkb, tvb, anchor, shape, to, no_ws, nullptr);
+        } catch (const std::invalid_argument&) { refused = true; }
+        check(refused, "dspark_block_attention_fp32 takes a workspace without storage (" + label + ")");
+    }
     ninfer::ops::dspark_block_attention_fp32(tq, tkr, tvr, tkb, tvb, anchor, shape, to, tws, nullptr);
     const std::int64_t lo = window > 0 ? std::max<std::int64_t>(0, anchor - window) : 0;
     Vec want(q.size());

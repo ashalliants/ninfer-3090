@@ -664,9 +664,9 @@ void dspark_block_attention_fp32(const Tensor& q, const Tensor& k_ring, const Te
     const std::int64_t n_ctx = anchor - lo;
     require(n_ctx <= kr.cols, op, "the visible context exceeds the ring");
     require(n_ctx + qc.cols <= INT32_MAX, op, "too many keys");
-    require(workspace.dtype == DType::FP32 && workspace.is_contiguous() &&
+    require(workspace.data != nullptr && workspace.dtype == DType::FP32 && workspace.is_contiguous() &&
                 workspace.bytes() >= dspark_block_attention_workspace_bytes(s, static_cast<int>(qc.cols)),
-            op, "workspace must be contiguous FP32 of dspark_block_attention_workspace_bytes");
+            op, "workspace must be contiguous FP32 storage of dspark_block_attention_workspace_bytes");
     const auto n = static_cast<int>(n_ctx + qc.cols);
     // Runs of whole tiles, as few as give every run kAttnKeys or more, at most kDSparkAttentionMaxSplits.
     const int tiles = (n + kAttnKeys - 1) / kAttnKeys;
