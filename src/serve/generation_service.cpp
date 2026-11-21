@@ -455,6 +455,8 @@ GenerationService::GenerationService(
     // A context fit may have lowered the context; every request limit follows what was resolved.
     options_.max_context = engine_->options().max_context;
     options_.kv_capacity = engine_->options().kv_capacity;
+    // So does admission: a model may run fewer requests at once than asked (Inkling-2 runs one).
+    options_.max_concurrency = engine_->options().max_concurrency;
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
     start_idle_sleeper();

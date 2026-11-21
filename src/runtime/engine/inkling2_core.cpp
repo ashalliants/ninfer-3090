@@ -231,9 +231,7 @@ Inkling2Core::~Inkling2Core() {
     if (stream_ != nullptr) { cudaStreamDestroy(stream_); }
 }
 
-Inkling2Core::Submission Inkling2Core::submit(ink::PreparedPrompt prompt, PromptSummary summary, double prepare_seconds,
-                                              ResolvedRequestOptions options, OutputConsumerMode consumer_mode,
-                                              GenerationObservationOptions observation, Clock::time_point pending_deadline) {
+void Inkling2Core::check_request(const ResolvedRequestOptions& options) {
     if (options.constraint) { throw std::invalid_argument("Inkling-2 serves no output constraints yet"); }
     if (options.tool_choice.mode == ToolChoiceMode::Required || options.tool_choice.allowed_names) {
         throw std::invalid_argument("Inkling-2 serves tool_choice auto or none only");
@@ -244,6 +242,12 @@ Inkling2Core::Submission Inkling2Core::submit(ink::PreparedPrompt prompt, Prompt
     if (options.execution.thinking.loop != ReasoningLoopAction::Off) {
         throw std::invalid_argument("Inkling-2 has no reasoning-loop guard: run without --reasoning-loop");
     }
+}
+
+Inkling2Core::Submission Inkling2Core::submit(ink::PreparedPrompt prompt, PromptSummary summary, double prepare_seconds,
+                                              ResolvedRequestOptions options, OutputConsumerMode consumer_mode,
+                                              GenerationObservationOptions observation, Clock::time_point pending_deadline) {
+    check_request(options);
     // allow_prefix_reuse only permits reuse: with no context cache every request runs from position 0, which honours it.
     const auto submitted = Clock::now();
     if (pending_deadline == Clock::time_point{}) {

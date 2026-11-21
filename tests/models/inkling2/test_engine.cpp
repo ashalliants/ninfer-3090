@@ -83,6 +83,7 @@ int main() {
         options.artifact_path = artifact_path;
         options.max_context   = 4096;
         options.enable_vision = true;
+        options.max_concurrency = 4; // Inkling-2 runs one: the Engine reports what it runs
         {
             ninfer::EngineOptions unbounded   = options;
             unbounded.max_pending_requests    = 0;
@@ -105,8 +106,9 @@ int main() {
         std::printf("engine ready in %.1f s (%s)\n", std::chrono::duration<double>(Clock::now() - t0).count(),
                     engine.load_summary().architecture.c_str());
         check(engine.load_summary().architecture == "inkling2", "the Engine loads Inkling-2");
-        check(!engine.options().context_cache.enabled && !engine.load_summary().takes_video,
-              "no context cache and no video is reported");
+        check(!engine.options().context_cache.enabled && !engine.load_summary().takes_video &&
+                  engine.options().max_concurrency == 1,
+              "no context cache, no video and one request at a time is reported");
 
         const auto question = [] { return user_turn({text("Name three primary colours.")}); };
         // Aggregate, twice, and streaming.
@@ -193,6 +195,13 @@ int main() {
             looped.execution.thinking.loop      = ninfer::ReasoningLoopAction::Conclude;
             (void)engine.generate(engine.prepare(question()), looped);
             check(false, "a reasoning-loop guard is refused");
+        } catch (const std::invalid_argument&) {}
+        try {
+            // Also where the Engine answers without the core.
+            auto none                         = greedy(0);
+            none.execution.thinking.loop      = ninfer::ReasoningLoopAction::Conclude;
+            (void)engine.generate(engine.prepare(question()), none);
+            check(false, "a zero-output request is checked too");
         } catch (const std::invalid_argument&) {}
         for (int which = 0; which < 2; ++which) {
             try {

@@ -26,6 +26,10 @@ namespace ninfer::runtime {
 
 class Inkling2Core {
 public:
+    // What a request may ask of Inkling-2; throws std::invalid_argument. The Engine runs it for every request, also
+    // those it answers without the core (no output tokens).
+    static void check_request(const ResolvedRequestOptions& options);
+
     struct Job;
 
     // What GenerationHandle holds: wait() streams the job's events to the sink and returns its result.

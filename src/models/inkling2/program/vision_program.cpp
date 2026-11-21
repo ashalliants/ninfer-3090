@@ -16,9 +16,11 @@ namespace {
 std::int32_t align_up(std::int32_t v, std::int32_t a) { return (v + a - 1) / a * a; }
 
 // Bilinear (half-pixel centres, edges clamped), rounded to the nearest byte.
-std::vector<std::uint8_t> resize_bilinear(std::span<const std::uint8_t> rgb, int w, int h, int ow, int oh) {
+std::vector<std::uint8_t> resize_bilinear(std::span<const std::uint8_t> rgb, int w, int h, int ow, int oh,
+                                          const std::function<void()>& checkpoint) {
     std::vector<std::uint8_t> out(static_cast<std::size_t>(ow) * oh * 3);
     for (int y = 0; y < oh; ++y) {
+        if (checkpoint) { checkpoint(); }
         const double v = std::clamp((y + 0.5) * h / oh - 0.5, 0.0, h - 1.0);
         const int y0 = static_cast<int>(v), y1 = std::min(y0 + 1, h - 1);
         const double fy = v - y0;
@@ -55,12 +57,13 @@ ImageSize encoded_size(const VisionConfig& config, std::int32_t width, std::int3
     return {w, h, true};
 }
 
-PreparedImage prepare_image(const VisionConfig& config, std::int32_t width, std::int32_t height, std::span<const std::uint8_t> rgb) {
+PreparedImage prepare_image(const VisionConfig& config, std::int32_t width, std::int32_t height, std::span<const std::uint8_t> rgb,
+                            const std::function<void()>& checkpoint) {
     if (rgb.size() != static_cast<std::size_t>(width) * height * 3) { throw std::invalid_argument("inkling2 vision: rgb size differs"); }
     const ImageSize size = encoded_size(config, width, height);
     std::vector<std::uint8_t> resized;
     if (size.resized) {
-        resized = resize_bilinear(rgb, width, height, size.width, size.height);
+        resized = resize_bilinear(rgb, width, height, size.width, size.height, checkpoint);
         rgb     = resized;
     }
     const std::int32_t a = static_cast<std::int32_t>(config.align()), p = static_cast<std::int32_t>(config.patch_size);
@@ -75,6 +78,7 @@ PreparedImage prepare_image(const VisionConfig& config, std::int32_t width, std:
         // As llama.cpp: mean and std scaled by 255 in FP32, then (v - mean) / std in FP32; padding is -1 before it.
         const float mean = config.image_mean[c] * 255.0F, std = config.image_std[c] * 255.0F;
         for (int y = 0; y < image.height; ++y) {
+            if (checkpoint) { checkpoint(); }
             for (int x = 0; x < image.width; ++x) {
                 const float v = x < size.width && y < size.height ? float(rgb[(static_cast<std::size_t>(y) * size.width + x) * 3 + c]) : -1.0F;
                 image.pixels[c * plane + static_cast<std::size_t>(y) * image.width + x] = (v - mean) / std;

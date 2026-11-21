@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -131,6 +132,18 @@ int main() {
                                               ink::parse_config(reader.directory()));
         }
         const ink::Frontend frontend(resources, {.max_context = 8192, .vision = vision ? &*vision : nullptr});
+        if (vision) {
+            // Preprocessing checks its checkpoint as it goes: a 2048x2048 image (resized, then normalized) stops early.
+            const std::vector<std::uint8_t> big(std::size_t{2048} * 2048 * 3, 128);
+            int calls = 0;
+            try {
+                (void)ink::prepare_image(*vision, 2048, 2048, big, [&] {
+                    if (++calls == 3) { throw std::runtime_error("stop"); }
+                });
+                check(false, "the preprocessing checkpoint stops it");
+            } catch (const std::runtime_error&) {}
+            check(calls == 3, "the checkpoint runs per row");
+        }
         const ink::Frontend text_only(resources, {.max_context = 64});
 
         // Against llama.cpp: its prompt with the image, and the same without it.
@@ -309,7 +322,13 @@ int main() {
             std::string many;
             for (int i = 0; i < 100; ++i) { many += "word "; }
             refused(text_only, user_turn({text(many)}), "a prompt past max_context");
-            for (const char* key : {"tools", "messages", "bos_token", "add_generation_prompt"}) {
+            {
+                auto conflict                     = user_turn({text("hi")});
+                conflict.options.enable_thinking  = false;
+                conflict.options.reasoning_effort = ninfer::ReasoningEffort::High;
+                refused(frontend, conflict, "enable_thinking false with a reasoning effort");
+            }
+            for (const char* key : {"tools", "messages", "bos_token", "add_generation_prompt", "reasoning_effort", "enable_thinking"}) {
                 auto kwargs = user_turn({text("hi")});
                 kwargs.options.chat_template_kwargs_json = std::string("{\"") + key + "\": []}";
                 refused(frontend, kwargs, std::string("chat_template_kwargs setting ") + key);

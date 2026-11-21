@@ -651,6 +651,8 @@ private:
         }
         // Every request runs from position 0: there is no context cache to report or size.
         options.context_cache.enabled = false;
+        // One worker runs one request at a time; the rest wait in its max_pending_requests queue.
+        options.max_concurrency = 1;
         auto generation   = std::make_unique<Inkling2Core>(options, device);
         load              = generation->load_summary();
         load.cuda_sync_mode = device.sync_mode();
@@ -1223,6 +1225,7 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             context_capacity_error(prompt_summary.prompt_tokens, impl_->options.max_context));
     }
     const double prepare_seconds = prompt.impl_->prepare.seconds;
+    if (impl_->inkling2 != nullptr) { runtime::Inkling2Core::check_request(resolved_options); }
     if (resolved_options.execution.requested_output_tokens == 0) {
         struct ImmediateSubmission {
             GenerationResult result;

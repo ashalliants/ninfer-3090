@@ -101,7 +101,9 @@ Json template_context(const PromptInput& input, std::size_t& images) {
     for (const auto& item : context.items()) {
         const std::string& key = item.key();
         if (key == "messages" || key == "tools" || key == "add_generation_prompt" || key == "continue_final_message" ||
-            key.ends_with("_token") || key == "additional_special_tokens") {
+            key.ends_with("_token") || key == "additional_special_tokens" || key == "reasoning_effort" ||
+            key == "enable_thinking") {
+            // reasoning_effort and enable_thinking come typed (PromptOptions), so the prompt and its summary agree.
             throw std::invalid_argument("chat_template_kwargs cannot override " + key);
         }
     }
@@ -221,6 +223,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     if (!input.options.graft.empty() || !input.options.lora.empty()) {
         throw std::invalid_argument("Inkling-2 serves no grafts or LoRA adapters");
     }
+    if (input.options.enable_thinking && input.options.reasoning_effort &&
+        *input.options.enable_thinking != (*input.options.reasoning_effort != ReasoningEffort::None)) {
+        throw std::invalid_argument("reasoning_effort conflicts with enable_thinking");
+    }
     PreparedPrompt out;
     out.thinking = input.options.enable_thinking != false &&
                    input.options.reasoning_effort != ReasoningEffort::None;
@@ -247,8 +253,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                                                                                            : RequestErrorKind::InvalidMedia,
                                    error.what());
             }
-            check_control(control);
-            images.push_back(prepare_image(*options_.vision, rgb.width, rgb.height, rgb.rgb));
+            images.push_back(prepare_image(*options_.vision, rgb.width, rgb.height, rgb.rgb, [&] { check_control(control); }));
             out.stats.media_bytes += part.media.bytes.size();
         }
     }
