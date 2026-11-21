@@ -1,0 +1,359 @@
+// Written for NInfer-3090.
+//
+// The FP32 Ops of Inkling-2-Mini's DSpark drafter (include/ninfer/ops/dspark_fp32.h) against FP64 oracles written
+// here from the header's formulas, at the drafter's shapes (H 2304, 24/8 heads of 128, FFN 9216, rank 256, blocks
+// of 8) plus edge cases (a wrapped context ring, a window shorter than the context, an anchor at 0, argmax ties).
+//
+// Criterion: every output within tol * (1 + |ref|) of the oracle, finite, with tol 2e-6 (chains of at most a few
+// thousand terms); a projection within 1e-7 * (1 + sum |terms|) (its random terms cancel, so |ref| says little);
+// argmax exact.
+
+#include "ninfer/ops/dspark_fp32.h"
+
+#include "ops/op_tester.h"
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <string>
+#include <vector>
+
+namespace {
+
+namespace t = ninfer::test;
+using ninfer::DType;
+using ninfer::Tensor;
+using Vec = std::vector<double>;
+
+int failures = 0;
+
+void check(bool ok, const std::string& what) {
+    if (!ok) {
+        std::fprintf(stderr, "FAIL: %s\n", what.c_str());
+        ++failures;
+    }
+}
+
+std::uint32_t seed_state = 777;
+float uniform(float lo = -1.0F, float hi = 1.0F) {
+    seed_state = seed_state * 1664525U + 1013904223U;
+    return lo + (hi - lo) * static_cast<float>(seed_state >> 8) / static_cast<float>(1 << 24);
+}
+std::vector<float> randoms(std::size_t n, float lo = -1.0F, float hi = 1.0F) {
+    std::vector<float> v(n);
+    for (auto& x : v) { x = uniform(lo, hi); }
+    return v;
+}
+
+struct Buf {
+    ninfer::DeviceBuffer b;
+    explicit Buf(const std::vector<float>& v) : b(t::to_device(v)) {}
+    explicit Buf(std::size_t bytes) : b(bytes) { b.fill(0); }
+    Tensor tensor(std::initializer_list<std::int32_t> ne, DType dtype = DType::FP32) { return Tensor(b.p, dtype, ne); }
+    std::vector<float> get(std::size_t n) const { return t::from_device<float>(b, n); }
+};
+
+ninfer::DeviceBuffer bytes_to_device(const std::vector<std::uint8_t>& v) {
+    ninfer::DeviceBuffer b(v.size());
+    if (cudaMemcpy(b.p, v.data(), v.size(), cudaMemcpyHostToDevice) != cudaSuccess) { throw std::runtime_error("copy"); }
+    return b;
+}
+
+// Error scaled by 1 + bound[i] (default |want[i]|).
+void compare(const std::string& label, const std::vector<float>& got, const Vec& want, double tol, const Vec* bound = nullptr) {
+    check(got.size() == want.size(), label + ": size");
+    double worst = 0;
+    std::size_t at = 0;
+    for (std::size_t i = 0; i < std::min(got.size(), want.size()); ++i) {
+        if (!std::isfinite(got[i])) {
+            check(false, label + ": non-finite output");
+            return;
+        }
+        const double e = std::fabs(double(got[i]) - want[i]) / (1.0 + (bound ? (*bound)[i] : std::fabs(want[i])));
+        if (e > worst) { worst = e, at = i; }
+    }
+    std::printf("%-48s max scaled error %.2e (index %zu: %.9g vs %.9g)\n", label.c_str(), worst, at, double(got[at]), want[at]);
+    check(worst <= tol, label + ": outside tolerance");
+}
+
+// A random matrix [n, k] as Q8_0 blocks or BF16 words, and its exact values.
+struct Matrix {
+    std::vector<std::uint8_t> bytes;
+    std::vector<double> values;
+};
+
+Matrix make_matrix(bool q8, int n, int k) {
+    Matrix m;
+    m.values.resize(static_cast<std::size_t>(n) * k);
+    if (q8) {
+        for (int r = 0; r < n; ++r) {
+            for (int b = 0; b < k / 32; ++b) {
+                const __half d       = __float2half(uniform(0.001F, 0.02F));
+                const std::uint16_t w = __half_as_ushort(d);
+                m.bytes.push_back(static_cast<std::uint8_t>(w & 0xFF));
+                m.bytes.push_back(static_cast<std::uint8_t>(w >> 8));
+                for (int i = 0; i < 32; ++i) {
+                    const auto q = static_cast<std::int8_t>(static_cast<int>(uniform(-128.0F, 127.99F)));
+                    m.bytes.push_back(static_cast<std::uint8_t>(q));
+                    m.values[static_cast<std::size_t>(r) * k + 32 * b + i] = double(__half2float(d)) * q;
+                }
+            }
+        }
+    } else {
+        m.bytes.resize(static_cast<std::size_t>(n) * k * 2);
+        for (std::size_t i = 0; i < m.values.size(); ++i) {
+            float f = uniform(-0.05F, 0.05F);
+            std::uint32_t u;
+            std::memcpy(&u, &f, 4);
+            const auto word = static_cast<std::uint16_t>(u >> 16);
+            u               = static_cast<std::uint32_t>(word) << 16;
+            std::memcpy(&f, &u, 4);
+            m.values[i] = f;
+            std::memcpy(m.bytes.data() + 2 * i, &word, 2);
+        }
+    }
+    return m;
+}
+
+void test_projection(bool q8, int n, int k, int cols, bool bias, double tol) {
+    const std::string label = std::string("dense_projection_fp32 ") + (q8 ? "Q8_0" : "BF16") + " [" + std::to_string(n) + ", " +
+                              std::to_string(k) + "] T " + std::to_string(cols) + (bias ? " + bias" : "");
+    const Matrix m = make_matrix(q8, n, k);
+    // x as a strided view: columns k + 32 floats apart.
+    const int stride = k + 32;
+    const auto x = randoms(static_cast<std::size_t>(stride) * cols, -2, 2);
+    const auto b = randoms(n, -1, 1);
+    auto dw      = bytes_to_device(m.bytes);
+    Buf dx(x), db(b), out(static_cast<std::size_t>(n) * cols * 4);
+    Tensor tx = dx.tensor({stride, cols}).slice(0, 0, k);
+    Tensor tb = db.tensor({n}), to = out.tensor({n, cols});
+    ninfer::ops::dense_projection_fp32(tx, {dw.p, q8 ? ninfer::QType::GGML_Q8_0 : ninfer::QType::BF16, n, k}, bias ? &tb : nullptr, to,
+                                      nullptr);
+    Vec want(static_cast<std::size_t>(n) * cols), magnitude(want.size());
+    for (int c = 0; c < cols; ++c) {
+        for (int r = 0; r < n; ++r) {
+            double s = bias ? b[r] : 0.0, a = bias ? std::fabs(b[r]) : 0.0;
+            for (int i = 0; i < k; ++i) {
+                const double term = m.values[static_cast<std::size_t>(r) * k + i] * x[static_cast<std::size_t>(c) * stride + i];
+                s += term;
+                a += std::fabs(term);
+            }
+            want[static_cast<std::size_t>(c) * n + r] = s;
+            magnitude[static_cast<std::size_t>(c) * n + r] = a;
+        }
+    }
+    // Scaled by the sum of the terms' magnitudes: random terms cancel, so |want| alone says little.
+    compare(label, out.get(want.size()), want, tol, &magnitude);
+}
+
+void test_head_norm_rope() {
+    for (const bool rope : {true, false}) {
+        const int d = 128, heads = 24, cols = 8;
+        const std::int64_t start = 70001;
+        const auto x = randoms(static_cast<std::size_t>(d) * heads * cols, -3, 3), w = randoms(d, 0.5, 1.5);
+        Buf dx(x), dw(w);
+        Tensor tx = dx.tensor({d * heads, cols}), tw = dw.tensor({d});
+        ninfer::ops::head_rmsnorm_rope_fp32(tx, d, tw, 1e-6F, rope, start, 1e6F, nullptr);
+        Vec want(x.size());
+        for (int c = 0; c < cols; ++c) {
+            for (int h = 0; h < heads; ++h) {
+                const std::size_t o = (static_cast<std::size_t>(c) * heads + h) * d;
+                double ss = 0;
+                for (int i = 0; i < d; ++i) { ss += double(x[o + i]) * x[o + i]; }
+                const double r = 1.0 / std::sqrt(ss / d + double(1e-6F));
+                std::vector<double> y(d);
+                for (int i = 0; i < d; ++i) { y[i] = x[o + i] * r * w[i]; }
+                for (int i = 0; i < d / 2; ++i) {
+                    const double a = double(start + c) * std::pow(1e6, -2.0 * i / d);
+                    want[o + i]         = rope ? y[i] * std::cos(a) - y[i + d / 2] * std::sin(a) : y[i];
+                    want[o + i + d / 2] = rope ? y[i + d / 2] * std::cos(a) + y[i] * std::sin(a) : y[i + d / 2];
+                }
+            }
+        }
+        compare(rope ? "head_rmsnorm_rope_fp32 (position 70001)" : "head_rmsnorm_rope_fp32 norm only", dx.get(x.size()), want, 2e-6);
+    }
+}
+
+void test_silu() {
+    const auto g = randoms(9216 * 8, -8, 8), u = randoms(9216 * 8, -2, 2);
+    Buf dg(g), du(u), out(g.size() * 4);
+    Tensor tg = dg.tensor({9216, 8}), tu = du.tensor({9216, 8}), to = out.tensor({9216, 8});
+    ninfer::ops::silu_mul_fp32(tg, tu, to, nullptr);
+    Vec want(g.size());
+    for (std::size_t i = 0; i < g.size(); ++i) { want[i] = g[i] / (1.0 + std::exp(-double(g[i]))) * u[i]; }
+    compare("silu_mul_fp32", out.get(g.size()), want, 2e-6);
+}
+
+void test_fuse_taps() {
+    const int h = 2304, cols = 5, n = 4, rows = 4;
+    std::vector<std::vector<float>> taps;
+    std::vector<Buf> bufs;
+    for (int i = 0; i < n; ++i) {
+        taps.push_back(randoms(static_cast<std::size_t>(h) * cols, -4, 4));
+        bufs.emplace_back(taps.back());
+    }
+    const auto fuse = randoms(rows * n, -2, 2), norm = randoms(h, 0.5, 1.5);
+    Buf df(fuse), dn(norm), out(static_cast<std::size_t>(h) * cols * 4);
+    std::vector<Tensor> tensors;
+    for (auto& b : bufs) { tensors.push_back(b.tensor({h, cols})); }
+    std::vector<const Tensor*> ptrs;
+    for (auto& tt : tensors) { ptrs.push_back(&tt); }
+    Tensor tf = df.tensor({n, rows}), tn = dn.tensor({h}), to = out.tensor({h, cols});
+    for (const int row : {0, 3}) {
+        ninfer::ops::dspark_fuse_taps_fp32(ptrs, tf, row, tn, 1e-6F, to, nullptr);
+        double m = -1e300, total = 0;
+        for (int i = 0; i < n; ++i) { m = std::max(m, double(fuse[row * n + i])); }
+        Vec s(n);
+        for (int i = 0; i < n; ++i) { total += s[i] = std::exp(fuse[row * n + i] - m); }
+        Vec want(static_cast<std::size_t>(h) * cols);
+        for (int c = 0; c < cols; ++c) {
+            double ss = 0;
+            Vec y(h);
+            for (int d = 0; d < h; ++d) {
+                for (int i = 0; i < n; ++i) { y[d] += s[i] / total * taps[i][static_cast<std::size_t>(c) * h + d]; }
+                ss += y[d] * y[d];
+            }
+            const double r = 1.0 / std::sqrt(ss / h + double(1e-6F));
+            for (int d = 0; d < h; ++d) { want[static_cast<std::size_t>(c) * h + d] = y[d] * r * norm[d]; }
+        }
+        compare("dspark_fuse_taps_fp32 row " + std::to_string(row), out.get(want.size()), want, 2e-6);
+    }
+}
+
+void test_attention(std::int64_t anchor, int capacity, int window, const std::string& label) {
+    const int d = 128, heads = 24, kv_heads = 8, w = 8, kv = kv_heads * d;
+    const auto q = randoms(static_cast<std::size_t>(heads) * d * w, -1, 1);
+    const auto kr = randoms(static_cast<std::size_t>(kv) * capacity, -1, 1), vr = randoms(static_cast<std::size_t>(kv) * capacity, -2, 2);
+    const auto kb = randoms(static_cast<std::size_t>(kv) * w, -1, 1), vb = randoms(static_cast<std::size_t>(kv) * w, -2, 2);
+    Buf dq(q), dkr(kr), dvr(vr), dkb(kb), dvb(vb), out(q.size() * 4);
+    Tensor tq = dq.tensor({heads * d, w}), tkr = dkr.tensor({kv, capacity}), tvr = dvr.tensor({kv, capacity});
+    Tensor tkb = dkb.tensor({kv, w}), tvb = dvb.tensor({kv, w}), to = out.tensor({heads * d, w});
+    ninfer::ops::dspark_block_attention_fp32(tq, tkr, tvr, tkb, tvb, anchor, {heads, kv_heads, d, window}, to, nullptr);
+    const std::int64_t lo = window > 0 ? std::max<std::int64_t>(0, anchor - window) : 0;
+    Vec want(q.size());
+    for (int t = 0; t < w; ++t) {
+        for (int h = 0; h < heads; ++h) {
+            const int g = h / (heads / kv_heads);
+            std::vector<const float*> keys, values;
+            for (std::int64_t j = lo; j < anchor; ++j) {
+                keys.push_back(kr.data() + (j % capacity) * kv + g * d);
+                values.push_back(vr.data() + (j % capacity) * kv + g * d);
+            }
+            for (int j = 0; j < w; ++j) {
+                keys.push_back(kb.data() + static_cast<std::size_t>(j) * kv + g * d);
+                values.push_back(vb.data() + static_cast<std::size_t>(j) * kv + g * d);
+            }
+            Vec s(keys.size());
+            double m = -1e300;
+            for (std::size_t j = 0; j < keys.size(); ++j) {
+                for (int i = 0; i < d; ++i) { s[j] += double(q[(static_cast<std::size_t>(t) * heads + h) * d + i]) * keys[j][i]; }
+                s[j] /= std::sqrt(double(d));
+                m = std::max(m, s[j]);
+            }
+            double total = 0;
+            for (auto& v : s) { total += v = std::exp(v - m); }
+            for (int i = 0; i < d; ++i) {
+                double acc = 0;
+                for (std::size_t j = 0; j < keys.size(); ++j) { acc += s[j] * values[j][i]; }
+                want[(static_cast<std::size_t>(t) * heads + h) * d + i] = acc / total;
+            }
+        }
+    }
+    compare("dspark_block_attention_fp32 " + label, out.get(want.size()), want, 2e-6);
+}
+
+void test_markov() {
+    const int r = 256, v = 201024;
+    const auto joint = randoms(3 * r, -4, 4), state = randoms(r, -1, 1);
+    Buf dj(joint), ds(state), dl(r * 4);
+    Tensor tj = dj.tensor({3 * r}), ts = ds.tensor({r}), tl = dl.tensor({r});
+    ninfer::ops::dspark_markov_update_fp32(tj, ts, tl, nullptr);
+    Vec want_s(r), want_l(r);
+    for (int i = 0; i < r; ++i) {
+        const double gate = 1.0 / (1.0 + std::exp(-double(joint[i]))), c = std::tanh(double(joint[r + i]));
+        want_s[i] = c + gate * (state[i] - c);
+        want_l[i] = std::tanh(double(joint[2 * r + i]));
+    }
+    compare("dspark_markov_update_fp32 state", ds.get(r), want_s, 2e-6);
+    compare("dspark_markov_update_fp32 latent", dl.get(r), want_l, 2e-6);
+
+    const auto base = randoms(v, -40, 40), hb = randoms(v, -1, 1), pt = randoms(static_cast<std::size_t>(r) * v, -0.2F, 0.2F);
+    const auto latent = dl.get(r);
+    Buf dbase(base), dhb(hb), dpt(pt), dlat(latent), out(static_cast<std::size_t>(v) * 4);
+    Tensor tb = dbase.tensor({v}), th = dhb.tensor({v}), tp = dpt.tensor({v, r}), tlat = dlat.tensor({r}), to = out.tensor({v});
+    ninfer::ops::dspark_markov_logits_fp32(tb, th, tp, tlat, 30.0F, to, nullptr);
+    Vec want(v), magnitude(v);
+    for (int i = 0; i < v; ++i) {
+        double acc = 0, a = std::fabs(base[i]) + std::fabs(hb[i]);
+        for (int k = 0; k < r; ++k) {
+            const double term = double(pt[static_cast<std::size_t>(k) * v + i]) * latent[k];
+            acc += term;
+            a += std::fabs(term);
+        }
+        want[i]      = 30.0 * std::tanh((double(base[i]) + hb[i] + acc) / 30.0);
+        magnitude[i] = a; // the logit's argument cancels; tanh' <= 1
+    }
+    compare("dspark_markov_logits_fp32", out.get(v), want, 1e-6, &magnitude);
+    // In place over base, as the drafter runs it.
+    ninfer::ops::dspark_markov_logits_fp32(tb, th, tp, tlat, 30.0F, tb, nullptr);
+    compare("dspark_markov_logits_fp32 in place", dbase.get(v), want, 1e-6, &magnitude);
+}
+
+void test_argmax() {
+    const int rows = 201024, valid = 200058, cols = 4;
+    auto x = randoms(static_cast<std::size_t>(rows) * cols, -10, 10);
+    // Column 0: a tie between 17 and 150000 (the lower wins). Column 1: the maximum in padding (ignored). Column 2:
+    // NaNs everywhere but one value. Column 3: all equal (row 0).
+    x[17] = x[150000] = 50.0F;
+    x[rows + valid + 5] = 99.0F;
+    for (int i = 0; i < rows; ++i) { x[2 * static_cast<std::size_t>(rows) + i] = std::numeric_limits<float>::quiet_NaN(); }
+    x[2 * static_cast<std::size_t>(rows) + 123456] = -5.0F;
+    for (int i = 0; i < rows; ++i) { x[3 * static_cast<std::size_t>(rows) + i] = 1.0F; }
+    Buf dx(x), out(cols * 4);
+    Tensor tx = dx.tensor({rows, cols}), to = out.tensor({cols}, DType::I32);
+    ninfer::ops::argmax_fp32(tx, valid, to, nullptr);
+    const auto got = t::from_device<std::int32_t>(out.b, cols);
+    std::vector<std::int32_t> want(cols);
+    for (int c = 0; c < cols; ++c) {
+        int best = -1;
+        for (int i = 0; i < valid; ++i) {
+            const float v = x[static_cast<std::size_t>(c) * rows + i];
+            if (!std::isnan(v) && (best < 0 || v > x[static_cast<std::size_t>(c) * rows + best])) { best = i; }
+        }
+        want[c] = best;
+    }
+    std::printf("argmax_fp32 got %d %d %d %d, want %d %d %d %d\n", got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+    check(got == want && want[0] == 17 && want[2] == 123456 && want[3] == 0, "argmax_fp32");
+}
+
+} // namespace
+
+int main() {
+    try {
+        test_projection(true, 3072, 2304, 8, false, 1e-7);
+        test_projection(true, 2304, 9216, 8, false, 1e-7);
+        test_projection(true, 1000, 64, 3, true, 1e-7); // rows not a multiple of the block's 8
+        test_projection(false, 768, 5120, 1, true, 1e-7);
+        test_projection(false, 2304, 256, 20, true, 1e-7); // 3 column tiles
+        test_head_norm_rope();
+        test_silu();
+        test_fuse_taps();
+        test_attention(0, 1024, 1024, "anchor 0 (block only)");
+        test_attention(700, 1024, 1024, "local, short context");
+        test_attention(5000, 1024, 1024, "local, wrapped ring");
+        test_attention(3000, 4096, 0, "global");
+        test_markov();
+        test_argmax();
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "FAIL: %s\n", error.what());
+        return 1;
+    }
+    std::printf(failures ? "FAILED (%d)\n" : "PASS\n", failures);
+    return failures ? 1 : 0;
+}
