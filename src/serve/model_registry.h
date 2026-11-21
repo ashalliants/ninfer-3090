@@ -58,6 +58,7 @@ struct ModelStatusSnapshot {
     // What discovery advertises, known before the model loads.
     std::uint32_t max_context = 0;
     bool vision               = false;
+    bool video                = false; // vision, and the model takes video (not Inkling-2)
     // The last load or wake failed; cleared by the next success.
     bool failed = false;
     std::string last_error;
@@ -254,6 +255,8 @@ private:
         bool held = false;
         // The context limit of the last load, kept after unload; zero until one succeeds.
         std::uint32_t effective_context = 0;
+        // Read from the artifact when the model is registered (ninfer::artifact_takes_video).
+        bool takes_video = true;
     };
 
     [[nodiscard]] ModelStatusSnapshot snapshot_locked(const Slot& slot) const;

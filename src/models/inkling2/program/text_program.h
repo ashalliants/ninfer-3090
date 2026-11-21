@@ -61,6 +61,20 @@ public:
     // Tap i of the last forward: FP32 [hidden, T] on the device, valid until the next forward.
     [[nodiscard]] Tensor tap(std::size_t i) const;
 
+    // The state a forward from a position needs, copied (prefix reuse): every sliding visit's K/V for the last
+    // sliding_window - 1 positions and every visit's convolution histories. The global visits' caches are indexed by
+    // position and not copied: they stay valid while no forward writes below the snapshot's position.
+    struct Snapshot {
+        DeviceBuffer memory; // snapshot_bytes()
+        std::int64_t position = -1; // -1: holds nothing
+    };
+    [[nodiscard]] std::size_t snapshot_bytes() const;
+    // Copies the state at position() into `snapshot` (its memory snapshot_bytes() or more).
+    void save(Snapshot& snapshot) const;
+    // Continues from the snapshot's position with the state it copied; the global caches below that position must
+    // be as they were when it was saved. Forwards from there compute what a sequence never cut would.
+    void restore(const Snapshot& snapshot);
+
     // Keeps only the first n tokens of the last forward (1 <= n <= its T, T <= max_rollback when n < T): the
     // sequence continues from position() = its start + n with every state as if only those tokens had been given.
     void keep(std::int32_t n);

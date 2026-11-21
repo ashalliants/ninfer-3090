@@ -25,6 +25,7 @@
 #include <iterator>
 #include <optional>
 #include <sstream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -267,6 +268,38 @@ int main() {
             const Decoded euro = decode(frontend, cat({{ink::token::kMessageModel, ink::token::kContentText}, {byte_token(0xE2), byte_token(0x82), byte_token(0xAC)},
                                                        {ink::token::kEndMessage}}));
             check(euro.content == "\xe2\x82\xac" && euro.deltas_valid, "a character split across tokens");
+        }
+        // Declared tools: a call to an undeclared name stays text; arguments are checked against the parameter schema.
+        {
+            const std::vector<ink::ToolDeclaration> declared{
+                {.name = "get_weather",
+                 .parameters_json = R"({"type":"object","properties":{"city":{"type":"string"},"unit":{"enum":["c","f"]},)"
+                                    R"("days":{"type":"integer"}},"required":["city"]})"}};
+            const auto run = [&](const std::string& call) {
+                auto decoder = std::make_unique<ink::OutputDecoder>(frontend, std::vector<ninfer::StopString>{}, true, declared);
+                for (const TokenId id : cat({{ink::token::kMessageModel, ink::token::kInvokeToolJson}, words(call), {ink::token::kEndMessage}})) {
+                    (void)decoder->push(id);
+                }
+                (void)decoder->finish();
+                return decoder;
+            };
+            const auto good = run(R"({"name":"get_weather","args":{"city":"Paris","unit":"c","days":3}})");
+            check(good->tool_calls().size() == 1 && good->tool_call_parse().schema_mismatch_arguments == 0, "a call that fits its schema");
+            const auto bad = run(R"({"name":"get_weather","args":{"unit":"k","days":1.5,"extra":true}})");
+            check(bad->tool_calls().size() == 1 && bad->tool_call_parse().schema_mismatch_arguments == 4,
+                  "schema departures are counted: " + std::to_string(bad->tool_call_parse().schema_mismatch_arguments));
+            const std::string other = R"({"name":"send_email","args":{}})";
+            const auto undeclared   = run(other);
+            check(undeclared->tool_calls().empty() && undeclared->content() == other &&
+                      undeclared->tool_call_parse().fallback_reason == ninfer::ToolCallParseFallbackReason::UndeclaredTool,
+                  "an undeclared tool stays text");
+            ninfer::PromptInput input;
+            input.messages.push_back({.role = ninfer::ChatRole::User, .parts = {{.kind = ninfer::MessagePartKind::Text, .text = "hi"}}});
+            input.options.tool_jsons.push_back(R"({"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}})");
+            const auto prepared = frontend.prepare(input);
+            check(prepared.tools && prepared.tools->size() == 1 && (*prepared.tools)[0].name == "get_weather" &&
+                      (*prepared.tools)[0].parameters_json == R"({"type":"object"})",
+                  "prepare() records the declared tools");
         }
         // tool_choice none: a call stays text.
         {

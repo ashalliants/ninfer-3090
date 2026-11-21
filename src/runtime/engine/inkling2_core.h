@@ -74,6 +74,7 @@ private:
     void worker();
     void fail_queued_locked(const char* why); // with mutex_ held
     void run(Job& job);
+    void release_stream() noexcept; // the programs, then the stream they run on
 
     EngineOptions options_;
     DeviceContext& device_;
@@ -91,7 +92,8 @@ private:
     bool running_ = false; // the worker has a request
     std::atomic<bool> failed_{false};
     std::atomic<std::uint64_t> next_id_{1};
-    std::atomic<std::uint64_t> prompt_tokens_{0}, generated_tokens_{0};
+    std::uint32_t consecutive_failures_ = 0; // the worker's streak of faulted requests (EngineFaultEvent)
+    std::atomic<std::uint64_t> prompt_tokens_{0}, generated_tokens_{0}, reused_tokens_{0}, reuse_selections_{0};
     std::thread thread_;
 };
 

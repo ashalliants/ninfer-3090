@@ -257,6 +257,30 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
     return impl->wait(sink, cancellation);
 }
 
+namespace {
+// Inkling-2 keeps its context cache as one device snapshot (Inkling2Core, "Prefix reuse"): there is no host tier or
+// slot count to size, so setting one is refused (before normalization fills the slot count in).
+EngineOptions refuse_inkling2_cache_tiers(EngineOptions options) {
+    if (!runtime::artifact_is_inkling2(options.artifact_path)) { return options; }
+    const ContextCacheOptions defaults;
+    const auto& cache = options.context_cache;
+    std::string set;
+    for (const auto& [name, is_set] : {std::pair{"device_state_slots", cache.device_state_slots.has_value()},
+                                       std::pair{"host_capacity_bytes", cache.host_capacity_bytes.has_value()},
+                                       std::pair{"auto_host_cache", cache.auto_host_cache},
+                                       std::pair{"host_pause_reserve_bytes", cache.host_pause_reserve_bytes != 0},
+                                       std::pair{"host_cache_reserve_bytes", cache.host_cache_reserve_bytes != defaults.host_cache_reserve_bytes},
+                                       std::pair{"host_cache_max_bytes", cache.host_cache_max_bytes.has_value()},
+                                       std::pair{"host_cache_percent", cache.host_cache_percent.has_value()}}) {
+        if (is_set) { set += std::string(set.empty() ? "" : ", ") + name; }
+    }
+    if (!set.empty()) {
+        throw std::invalid_argument("Inkling-2 keeps its context cache on the device: no state slots or host cache options (" + set + ")");
+    }
+    return options;
+}
+} // namespace
+
 class Engine::Impl {
 public:
     using GenerationCore = runtime::EngineCore<runtime::ModelInstance>;
@@ -279,7 +303,7 @@ public:
                               std::unique_ptr<Inkling2Core>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(runtime::normalize_engine_options(std::move(engine_options))),
+        : options(runtime::normalize_engine_options(refuse_inkling2_cache_tiers(std::move(engine_options)))),
           device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         if (runtime::artifact_is_qwen4_exp(options.artifact_path)) {
@@ -649,16 +673,19 @@ private:
             throw std::invalid_argument(
                 "Inkling-2 runs on one device with no context store, model suspend, LoRA adapters or grafts");
         }
-        // Every request runs from position 0: there is no context cache to report or size.
-        options.context_cache.enabled = false;
+        // The context cache is one device snapshot of the last prompt (Inkling2Core, "Prefix reuse"; the host-tier
+        // options were refused before normalization): it holds one state, the request's own.
+        options.context_cache.device_state_slots = 1;
         // One worker runs one request at a time; the rest wait in its max_pending_requests queue.
         options.max_concurrency = 1;
         auto generation   = std::make_unique<Inkling2Core>(options, device);
+        StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         load              = generation->load_summary();
         load.cuda_sync_mode = device.sync_mode();
         sampling_defaults = generation->frontend().sampling_defaults();
         inkling2          = generation.get();
         core              = std::move(generation);
+        finalize_phase.complete();
     }
 
     // Opens the context store and hands the generation core its hooks (both cores: the Qwen3.5
@@ -1427,5 +1454,7 @@ void Engine::reset_memory_peaks() noexcept {
         },
         impl_->core);
 }
+
+bool artifact_takes_video(const std::filesystem::path& artifact) noexcept { return !runtime::artifact_is_inkling2(artifact); }
 
 } // namespace ninfer

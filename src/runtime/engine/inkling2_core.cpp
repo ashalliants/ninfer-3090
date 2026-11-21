@@ -5,6 +5,7 @@
 #include "artifact/framing.h"
 #include "artifact/reader.h"
 #include "core/arena.h"
+#include "core/startup.h"
 #include "models/inkling2/program/text_program.h"
 #include "models/inkling2/program/vision_program.h"
 
@@ -43,6 +44,25 @@ constexpr std::uint32_t kOpenTokens = 2;
 
 // One token from the last column's logits (OpenAI presence and frequency penalties over the generated tokens, then
 // temperature, top-k, min-p and top-p). Temperature 0 is argmax, the lowest id among equals.
+// One key per prompt position for prefix reuse: the token id, or for an image's placeholder a hash of the image
+// (its pixels and grid) and the placeholder's index in it, with the top bit set so it never equals a token id.
+std::vector<std::uint64_t> prompt_keys(const ink::PreparedPrompt& prompt) {
+    std::vector<std::uint64_t> keys(prompt.tokens.begin(), prompt.tokens.end());
+    for (const ink::PromptImage& image : prompt.images) {
+        std::uint64_t h = 1469598103934665603ULL; // FNV-1a
+        const auto mix  = [&](const void* data, std::size_t bytes) {
+            for (std::size_t i = 0; i < bytes; ++i) { h = (h ^ static_cast<const unsigned char*>(data)[i]) * 1099511628211ULL; }
+        };
+        const std::int32_t dims[4] = {image.image.width, image.image.height, image.image.grid_w, image.image.grid_h};
+        mix(dims, sizeof dims);
+        mix(image.image.pixels.data(), image.image.pixels.size() * sizeof(float));
+        for (std::int32_t j = 0; j < image.image.tokens(); ++j) {
+            keys[static_cast<std::size_t>(image.column + j)] = (h + 0x9E3779B97F4A7C15ULL * static_cast<std::uint64_t>(j)) | (1ULL << 63);
+        }
+    }
+    return keys;
+}
+
 TokenId sample(std::vector<float>& logits, const ResolvedSamplingParameters& p,
                const std::unordered_map<TokenId, std::uint32_t>& counts, std::mt19937_64& rng) {
     if (p.presence_penalty != 0.0F || p.frequency_penalty != 0.0F) {
@@ -55,27 +75,39 @@ TokenId sample(std::vector<float>& logits, const ResolvedSamplingParameters& p,
         if (std::isnan(y)) { return !std::isnan(x) || a < b; }
         return x > y || (x == y && a < b);
     };
+    // A diverged forward (an all-NaN row, or an infinite maximum) is a numerical failure, not a token, as the
+    // sampling Ops report it (ops::kSamplerNonFiniteToken): the selected token's own logit must be finite.
+    const auto finite_or_fail = [&](std::int32_t id) {
+        if (!std::isfinite(logits[static_cast<std::size_t>(id)])) {
+            throw RequestError(RequestErrorKind::NumericalFailure, "inkling2: the logits are not finite");
+        }
+        return id;
+    };
     if (p.temperature <= 0.0F) {
         std::int32_t best = 0;
         for (std::int32_t v = 1; v < static_cast<std::int32_t>(logits.size()); ++v) {
             if (better(v, best)) { best = v; }
         }
-        return best;
+        return finite_or_fail(best);
     }
     const std::size_t k = static_cast<std::size_t>(std::clamp<std::int32_t>(p.top_k, 1, static_cast<std::int32_t>(logits.size())));
     std::vector<std::int32_t> ids(logits.size());
     std::iota(ids.begin(), ids.end(), 0);
     std::partial_sort(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(k), ids.end(), better);
     ids.resize(k);
-    std::vector<double> prob(k);
+    (void)finite_or_fail(ids[0]);
+    // NaN candidates sort last; they are never drawn (an infinite top already failed above, -inf weighs 0).
+    while (std::isnan(logits[static_cast<std::size_t>(ids.back())])) { ids.pop_back(); }
+    const std::size_t kept_k = ids.size();
+    std::vector<double> prob(kept_k);
     const double top = logits[static_cast<std::size_t>(ids[0])];
     double sum       = 0.0;
-    for (std::size_t i = 0; i < k; ++i) {
+    for (std::size_t i = 0; i < kept_k; ++i) {
         prob[i] = std::exp((logits[static_cast<std::size_t>(ids[i])] - top) / p.temperature);
         sum += prob[i];
     }
     for (double& q : prob) { q /= sum; }
-    std::size_t keep = k;
+    std::size_t keep = kept_k;
     if (p.min_p > 0.0F) {
         while (keep > 1 && prob[keep - 1] < p.min_p * prob[0]) { --keep; }
     }
@@ -102,6 +134,10 @@ TokenId sample(std::vector<float>& logits, const ResolvedSamplingParameters& p,
 struct Inkling2Core::Programs {
     ink::TextProgram text;
     std::unique_ptr<ink::VisionEncoder> vision;
+    // Prefix reuse (context_cache.enabled): the state at the last prompt's last whole chunk, and the keys
+    // (prompt_keys) of the positions before it.
+    ink::TextProgram::Snapshot snapshot;
+    std::vector<std::uint64_t> snapshot_keys;
     Programs(const ink::Model& model, ink::ProgramLimits limits, cudaStream_t stream) : text(model, std::move(limits), stream) {}
 };
 
@@ -114,6 +150,7 @@ struct Inkling2Core::Job {
     OutputConsumerMode mode = OutputConsumerMode::Aggregate;
     GenerationObservationOptions observation;
     Clock::time_point submitted, deadline;
+    const char* unit = "admission"; // where run() is: admission, prefill or decode (EngineFaultEvent::unit)
 
     using Event = std::variant<GenerationStart, PromptProgress, GenerationTimingObservation, OutputDelta,
                                GenerationFirstTokenObservation>;
@@ -192,21 +229,37 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     if (options_.purpose != EnginePurpose::Generation) { throw std::invalid_argument("Inkling-2 serves generation only"); }
     if (options_.devices.size() > 1) { throw std::invalid_argument("Inkling-2 runs on one device"); }
     const auto start = Clock::now();
+    StartupPhaseScope inspect(options_.startup_observer, StartupPhase::ArtifactInspect);
     const artifact::Reader reader(options_.artifact_path);
     if (options_.enable_vision && !reader.directory().components.contains("vision")) {
         throw std::invalid_argument("--vision: this Inkling-2 artifact has no vision tower (convert it with --mmproj)");
     }
-    // Only the tower a --vision server uses is uploaded; the drafter is not used.
+    inspect.complete();
+    // Only the tower a --vision server uses is uploaded; the drafter is not used. (load_model reports the weights'
+    // materialize phase itself.)
     model_ = ink::load_model(reader, device_, {.vision = options_.enable_vision, .dspark = false}, &options_.startup_observer);
     const ink::VisionConfig* vision = options_.enable_vision ? model_->vision_config() : nullptr;
-    ink::FrontendOptions frontend_options{.max_context = options_.max_context, .vision = vision};
-    frontend_ = std::make_unique<ink::Frontend>(model_->resources(), frontend_options);
+    {
+        StartupPhaseScope phase(options_.startup_observer, StartupPhase::FrontendInitialize);
+        ink::FrontendOptions frontend_options{.max_context = options_.max_context, .vision = vision};
+        frontend_ = std::make_unique<ink::Frontend>(model_->resources(), frontend_options);
+        phase.complete();
+    }
     check_cuda(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream");
-    ink::ProgramLimits limits;
-    limits.max_context = static_cast<std::int32_t>(options_.max_context);
-    limits.max_chunk   = kChunk;
-    programs_          = std::make_unique<Programs>(*model_, limits, stream_);
-    if (vision != nullptr) { programs_->vision = std::make_unique<ink::VisionEncoder>(*model_, stream_); }
+    // From here a failure releases the programs and then the stream (the destructor does not run).
+    try {
+        StartupPhaseScope phase(options_.startup_observer, StartupPhase::ProgramInitialize);
+        ink::ProgramLimits limits;
+        limits.max_context = static_cast<std::int32_t>(options_.max_context);
+        limits.max_chunk   = kChunk;
+        programs_          = std::make_unique<Programs>(*model_, limits, stream_);
+        if (vision != nullptr) { programs_->vision = std::make_unique<ink::VisionEncoder>(*model_, stream_); }
+        if (options_.context_cache.enabled) { programs_->snapshot.memory = DeviceBuffer(programs_->text.snapshot_bytes()); }
+        phase.complete();
+    } catch (...) {
+        release_stream();
+        throw;
+    }
     const auto& stats         = model_->storage_stats();
     load_.architecture        = "inkling2";
     load_.model_name          = "Inkling-2-Mini";
@@ -238,7 +291,16 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         bound.get();
     } catch (...) {
         thread_.join();
+        release_stream();
         throw;
+    }
+}
+
+void Inkling2Core::release_stream() noexcept {
+    programs_.reset();
+    if (stream_ != nullptr) {
+        cudaStreamDestroy(stream_);
+        stream_ = nullptr;
     }
 }
 
@@ -249,8 +311,7 @@ Inkling2Core::~Inkling2Core() {
     }
     wake_.notify_all();
     if (thread_.joinable()) { thread_.join(); }
-    programs_.reset();
-    if (stream_ != nullptr) { cudaStreamDestroy(stream_); }
+    release_stream();
 }
 
 void Inkling2Core::check_request(const ResolvedRequestOptions& options) const {
@@ -275,7 +336,6 @@ Inkling2Core::Submission Inkling2Core::submit(ink::PreparedPrompt prompt, Prompt
                                               ResolvedRequestOptions options, OutputConsumerMode consumer_mode,
                                               GenerationObservationOptions observation, Clock::time_point pending_deadline) {
     check_request(options);
-    // allow_prefix_reuse only permits reuse: with no context cache every request runs from position 0, which honours it.
     const auto submitted = Clock::now();
     if (pending_deadline == Clock::time_point{}) {
         pending_deadline = submitted + std::chrono::milliseconds(options_.pending_timeout_ms);
@@ -343,14 +403,43 @@ void Inkling2Core::worker() {
             queue_.pop_front();
             running_ = true;
         }
+        std::optional<EngineFaultEvent> fault;
         try {
             run(*job);
+            consecutive_failures_ = 0;
         } catch (...) {
             job->error = std::current_exception();
+            // A worker failure is anything but a refusal of the request (RequestError and the other invalid_argument),
+            // and a numerical failure, which is the device's.
+            std::string message = "unknown failure";
+            bool is_fault       = true;
+            try {
+                throw;
+            } catch (const RequestError& e) {
+                message  = e.what();
+                is_fault = e.kind() == RequestErrorKind::NumericalFailure;
+            } catch (const std::invalid_argument& e) {
+                message  = e.what();
+                is_fault = false;
+            } catch (const std::exception& e) { message = e.what(); } catch (...) {}
+            if (is_fault) {
+                fault.emplace();
+                fault->message                      = std::move(message);
+                fault->unit                         = job->unit;
+                fault->request_ids                  = {job->id};
+                fault->lanes                        = {0};
+                fault->consecutive_failures         = ++consecutive_failures_;
+                fault->maximum_consecutive_failures = 0; // no count latches: only a CUDA failure does
+            }
             // A CUDA failure leaves the device state unknown: no later request runs, queued ones fail now.
             if (cudaGetLastError() != cudaSuccess || cudaStreamQuery(stream_) == cudaErrorIllegalAddress) {
                 std::lock_guard lock(mutex_);
                 failed_ = true;
+                if (fault) {
+                    for (const auto& waiting : queue_) { fault->queued_request_ids.push_back(waiting->id); }
+                    fault->latched      = true;
+                    fault->latch_reason = "a CUDA failure leaves the device state unknown";
+                }
                 fail_queued_locked("the Inkling-2 Engine has failed");
             }
         }
@@ -359,6 +448,12 @@ void Inkling2Core::worker() {
             job->done = true;
         }
         job->changed.notify_all();
+        // After every affected request is final.
+        if (fault && options_.fault_listener) {
+            try {
+                options_.fault_listener(*fault);
+            } catch (...) {}
+        }
         {
             std::lock_guard lock(mutex_);
             running_ = false;
@@ -379,36 +474,64 @@ void Inkling2Core::run(Job& job) {
         throw RequestError(RequestErrorKind::QueueTimeout, "the request waited past its deadline");
     }
     const bool streaming = job.mode == OutputConsumerMode::Streaming;
+    const auto& prompt   = job.prompt;
+    const auto& text_cfg = model_->config();
+    const std::int32_t n = static_cast<std::int32_t>(prompt.tokens.size());
+    // Prefix reuse: the snapshot's prompt positions are this prompt's first ones (tokens and images alike), and at
+    // least one position remains to compute the first token's logits from.
+    auto& snapshot          = programs_->snapshot;
+    const auto keys         = prompt_keys(prompt);
+    const std::int32_t resume = [&] {
+        if (!options_.context_cache.enabled || !job.options.execution.allow_prefix_reuse || snapshot.position <= 0 ||
+            snapshot.position >= n) {
+            return 0;
+        }
+        const auto length = static_cast<std::size_t>(snapshot.position);
+        return std::equal(keys.begin(), keys.begin() + static_cast<std::ptrdiff_t>(length), programs_->snapshot_keys.begin())
+                   ? static_cast<std::int32_t>(snapshot.position)
+                   : 0;
+    }();
+    out.reused_prompt_tokens = static_cast<std::uint32_t>(resume);
     // A stream starts exactly once, also when it was cancelled while queued.
-    if (streaming) { job.post(GenerationStart{.prompt = job.summary}); }
+    if (streaming) { job.post(GenerationStart{.prompt = job.summary, .reused_prompt_tokens = static_cast<std::uint32_t>(resume)}); }
     if (job.cancelled) {
         out.finish_reason = FinishReason::Cancelled;
         return;
     }
-    const auto& prompt   = job.prompt;
-    const auto& text_cfg = model_->config();
-    const std::int32_t n = static_cast<std::int32_t>(prompt.tokens.size());
 
     // Images: each encoding copied out, since a chunk may need the end of one and the start of the next.
+    job.unit = "prefill"; // the image encodes and the prompt's forwards
     const auto vision_start = Clock::now();
     std::vector<DeviceBuffer> encoded;
     for (const ink::PromptImage& image : prompt.images) {
+        if (image.column + image.image.tokens() <= resume) { // wholly in the reused prefix
+            encoded.emplace_back();
+            continue;
+        }
         const Tensor emb = programs_->vision->encode(image.image);
         encoded.emplace_back(emb.bytes());
         check_cuda(cudaMemcpyAsync(encoded.back().p, emb.data, emb.bytes(), cudaMemcpyDeviceToDevice, stream_), "image copy");
     }
-    if (!prompt.images.empty()) {
+    if (std::any_of(encoded.begin(), encoded.end(), [](const DeviceBuffer& b) { return b.p != nullptr; })) {
         check_cuda(cudaStreamSynchronize(stream_), "vision");
         out.timings.vision_seconds = seconds_between(vision_start, Clock::now());
     }
 
-    // Prefill from position 0, in chunks.
+    // Prefill in chunks from position 0, or from the reused snapshot's position (a whole number of chunks, so the
+    // forwards are the ones a prefill from 0 runs from there).
     auto& program = programs_->text;
-    program.reset();
+    if (resume > 0) {
+        program.restore(snapshot);
+    } else {
+        program.reset();
+        snapshot.position = -1; // its global caches are about to be overwritten
+    }
+    // The state after the last whole chunk that leaves a position to compute, kept for the next prompt.
+    const std::int32_t keep_at = snapshot.memory.p != nullptr ? (n - 1) / kChunk * kChunk : 0;
     const auto prefill_start = Clock::now();
     const std::size_t hidden = text_cfg.hidden_size;
     Tensor logits;
-    for (std::int32_t s = 0; s < n; s += kChunk) {
+    for (std::int32_t s = resume; s < n; s += kChunk) {
         if (job.cancelled) {
             out.finish_reason = FinishReason::Cancelled;
             return;
@@ -423,23 +546,31 @@ void Inkling2Core::run(Job& job) {
             inputs.push_back({lo - s, all.slice(1, lo - first, hi - lo)});
         }
         logits = program.forward(std::span(prompt.tokens).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(len)), inputs);
+        if (s + len == keep_at && keep_at > resume) {
+            program.save(snapshot);
+            programs_->snapshot_keys.assign(keys.begin(), keys.begin() + keep_at);
+        }
         if (job.observation.prompt_progress && streaming) {
             check_cuda(cudaStreamSynchronize(stream_), "prefill");
             job.post(PromptProgress{.total_prompt_tokens     = static_cast<std::uint32_t>(n),
+                                    .reused_prompt_tokens    = static_cast<std::uint32_t>(resume),
                                     .processed_prompt_tokens = static_cast<std::uint32_t>(s + len),
                                     .elapsed_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                                                  Clock::now() - prefill_start).count())});
         }
     }
-    out.computed_prefill_tokens = static_cast<std::uint32_t>(n);
-    prompt_tokens_ += static_cast<std::uint64_t>(n);
+    out.computed_prefill_tokens = static_cast<std::uint32_t>(n - resume);
+    prompt_tokens_ += static_cast<std::uint64_t>(n); // reused tokens included, as RuntimeStats counts them
+    reused_tokens_ += static_cast<std::uint64_t>(resume);
+    if (resume > 0) { ++reuse_selections_; }
 
     // Decode.
+    job.unit = "decode";
     const auto& exec  = job.options.execution;
     const auto& stop  = job.options.stop;
     std::vector<TokenId> stop_ids = stop.token_ids;
     if (stop.include_model_defaults) { stop_ids.push_back(ink::token::kEndSampling); }
-    ink::OutputDecoder decoder(*frontend_, stop.strings, job.options.tool_choice.mode != ToolChoiceMode::None);
+    ink::OutputDecoder decoder(*frontend_, stop.strings, job.options.tool_choice.mode != ToolChoiceMode::None, prompt.tools);
     std::mt19937_64 rng(exec.sampling.seed);
     std::unordered_map<TokenId, std::uint32_t> counts;
     std::vector<float> host(text_cfg.unpadded_vocab_size);
@@ -565,6 +696,8 @@ RuntimeStats Inkling2Core::runtime_stats() const {
     RuntimeStats s;
     s.prompt_tokens    = prompt_tokens_;
     s.generated_tokens = generated_tokens_;
+    s.reused_prompt_tokens = reused_tokens_;
+    s.root_selections      = reuse_selections_;
     return s;
 }
 

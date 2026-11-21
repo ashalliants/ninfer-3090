@@ -101,14 +101,24 @@ int main() {
                 check(false, "model suspend is refused");
             } catch (const std::invalid_argument&) {}
         }
+        for (const auto set : {+[](ninfer::ContextCacheOptions& c) { c.auto_host_cache = true; },
+                               +[](ninfer::ContextCacheOptions& c) { c.device_state_slots = 2U; },
+                               +[](ninfer::ContextCacheOptions& c) { c.host_capacity_bytes = std::size_t{1} << 30; }}) {
+            ninfer::EngineOptions tiered = options;
+            set(tiered.context_cache);
+            try {
+                ninfer::Engine refused(tiered);
+                check(false, "a host-tier context cache option is refused");
+            } catch (const std::invalid_argument&) {}
+        }
         const auto t0         = Clock::now();
         ninfer::Engine engine(options);
         std::printf("engine ready in %.1f s (%s)\n", std::chrono::duration<double>(Clock::now() - t0).count(),
                     engine.load_summary().architecture.c_str());
         check(engine.load_summary().architecture == "inkling2", "the Engine loads Inkling-2");
-        check(!engine.options().context_cache.enabled && !engine.load_summary().takes_video &&
-                  engine.options().max_concurrency == 1,
-              "no context cache, no video and one request at a time is reported");
+        check(engine.options().context_cache.enabled && engine.options().context_cache.device_state_slots == 1U &&
+                  !engine.load_summary().takes_video && engine.options().max_concurrency == 1,
+              "a one-snapshot context cache, no video and one request at a time is reported");
 
         const auto question = [] { return user_turn({text("Name three primary colours.")}); };
         // Aggregate, twice, and streaming.
@@ -186,6 +196,7 @@ int main() {
             check(edge.generated_token_ids.size() == 2 && edge.finish_reason == ninfer::FinishReason::ContextCapacity,
                   "the last context position still yields a token: " + std::to_string(edge.generated_token_ids.size()));
         }
+        check(!ninfer::artifact_takes_video(artifact_path), "discovery reads that Inkling-2 takes no video");
         {
             // Counting reports a prompt's length also when it leaves no room for a reply (generation refuses it).
             std::string text;
@@ -303,6 +314,47 @@ int main() {
             std::printf("image: vision %.3f s, prefill %.3f s; greedy matches llama.cpp's for %zu of %zu tokens (reported)\n",
                         r.timings.vision_seconds, r.timings.prefill_seconds, match, want.size());
             std::printf("  ids: %s\n  reasoning: %s\n", ids_text(r.generated_token_ids).c_str(), r.reasoning.c_str());
+            // An image prompt past one chunk resumes with the image in the reused prefix, which is then not encoded.
+            std::string longer = "Describe this image in one paragraph, then list every object in it.";
+            for (int i = 0; i < 12; ++i) { longer += " Mention colours, shapes, text and layout, and be precise."; }
+            auto no_reuse                         = greedy(16);
+            no_reuse.execution.allow_prefix_reuse = false;
+            const auto cold  = engine.generate(engine.prepare(user_turn({image, text(longer)})), no_reuse);
+            const auto again = engine.generate(engine.prepare(user_turn({image, text(longer)})), greedy(16));
+            check(cold.prompt.prompt_tokens > 256 && again.reused_prompt_tokens >= 256 && again.timings.vision_seconds == 0.0 &&
+                      again.generated_token_ids == cold.generated_token_ids,
+                  "an image prompt resumes from its snapshot: " + std::to_string(again.reused_prompt_tokens) + " reused, vision " +
+                      std::to_string(again.timings.vision_seconds) + " s, same output " +
+                      std::to_string(again.generated_token_ids == cold.generated_token_ids));
+        }
+        // Prefix reuse: a prompt that repeats the last one's first whole chunks resumes from their snapshot and
+        // decodes what a prefill from 0 does; a request that forbids reuse, or an unrelated prompt, does not.
+        {
+            std::string context = "Here is a list of facts.";
+            for (int i = 0; i < 60; ++i) { context += " Fact " + std::to_string(i) + ": the number " + std::to_string(i * 7) + " is noted."; }
+            const auto ask = [&](const std::string& tail, bool reuse) {
+                auto o                              = greedy(24);
+                o.execution.allow_prefix_reuse = reuse;
+                return engine.generate(engine.prepare(user_turn({text(context + tail)})), o);
+            };
+            (void)engine.generate(engine.prepare(question()), greedy(4)); // any snapshot is another prompt's
+            const auto cold  = ask(" What is fact 3?", false); // takes none, leaves one
+            const auto again = ask(" What is fact 3?", true);
+            check(cold.reused_prompt_tokens == 0 && cold.prompt.prompt_tokens > 512, "a request that forbids reuse reuses nothing");
+            check(again.reused_prompt_tokens > 0 && again.reused_prompt_tokens % 256 == 0 &&
+                      again.reused_prompt_tokens < again.prompt.prompt_tokens &&
+                      again.computed_prefill_tokens == again.prompt.prompt_tokens - again.reused_prompt_tokens,
+                  "the same prompt resumes from its snapshot: " + std::to_string(again.reused_prompt_tokens));
+            check(again.generated_token_ids == cold.generated_token_ids, "a resumed prompt decodes what a cold one does");
+            const auto other = ask(" Which fact is about 42?", true);
+            const auto other_cold = ask(" Which fact is about 42?", false);
+            check(other.reused_prompt_tokens > 0 && other.generated_token_ids == other_cold.generated_token_ids,
+                  "a prompt sharing the first chunks resumes and decodes what a cold one does");
+            const auto unrelated = engine.generate(engine.prepare(question()), greedy(8));
+            check(unrelated.reused_prompt_tokens == 0, "an unrelated prompt reuses nothing");
+            check(ask(" What is fact 3?", true).reused_prompt_tokens == 0, "an unrelated prompt replaced the snapshot");
+            std::printf("prefix reuse: %u of %u prompt tokens reused; prefill %.3f s cold, %.3f s resumed\n", again.reused_prompt_tokens,
+                        again.prompt.prompt_tokens, cold.timings.prefill_seconds, again.timings.prefill_seconds);
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

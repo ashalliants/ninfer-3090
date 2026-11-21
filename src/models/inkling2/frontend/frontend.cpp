@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <stdexcept>
 #include <utility>
 
@@ -45,6 +46,54 @@ std::string_view role_name(ChatRole role) {
     case ChatRole::Tool: return "tool";
     }
     return "user";
+}
+
+// Whether `value` has JSON Schema type `type` ("integer" takes whole numbers, "number" any number).
+bool has_type(const Json& value, const std::string& type) {
+    if (type == "string") { return value.is_string(); }
+    if (type == "integer") { return value.is_number_integer() || (value.is_number_float() && std::trunc(value.get<double>()) == value.get<double>()); }
+    if (type == "number") { return value.is_number(); }
+    if (type == "boolean") { return value.is_boolean(); }
+    if (type == "array") { return value.is_array(); }
+    if (type == "object") { return value.is_object(); }
+    if (type == "null") { return value.is_null(); }
+    return true; // a type this check does not know
+}
+
+// The arguments' departures from a tool's parameter schema, one per property: not in `properties` (when the schema
+// lists them), a missing `required` one, a `type` or `enum` it breaks. A schema that is not an object checks nothing.
+std::uint32_t schema_mismatches(const Json& args, const Json& schema) {
+    if (!schema.is_object()) { return 0; }
+    std::uint32_t n = 0;
+    const Json* properties = schema.contains("properties") && schema["properties"].is_object() ? &schema["properties"] : nullptr;
+    for (const auto& item : args.items()) {
+        if (properties == nullptr) { continue; }
+        if (!properties->contains(item.key())) {
+            ++n;
+            continue;
+        }
+        const Json& p = (*properties)[item.key()];
+        if (!p.is_object()) { continue; }
+        bool bad = false;
+        if (p.contains("type")) {
+            const Json& t = p["type"];
+            if (t.is_string()) {
+                bad = !has_type(item.value(), t.get<std::string>());
+            } else if (t.is_array()) {
+                bad = std::none_of(t.begin(), t.end(), [&](const Json& one) { return one.is_string() && has_type(item.value(), one.get<std::string>()); });
+            }
+        }
+        if (!bad && p.contains("enum") && p["enum"].is_array()) {
+            bad = std::find(p["enum"].begin(), p["enum"].end(), item.value()) == p["enum"].end();
+        }
+        n += bad ? 1U : 0U;
+    }
+    if (schema.contains("required") && schema["required"].is_array()) {
+        for (const Json& r : schema["required"]) {
+            if (r.is_string() && !args.contains(r.get<std::string>())) { ++n; }
+        }
+    }
+    return n;
 }
 
 Json parse_object(const std::string& text, std::string_view what) {
@@ -176,10 +225,19 @@ std::string take_utf8(std::string& raw, bool final) {
 
 } // namespace
 
-Frontend::Frontend(const Model::Resources& resources, FrontendOptions options)
+namespace {
+const Model::Resources& require_resources(const Model::Resources& r) {
+    if (r.tokenizer_json.empty() || r.tokenizer_config_json.empty() || r.chat_template_jinja.empty() || r.generation_config_json.empty()) {
+        throw std::invalid_argument("this Inkling-2 artifact has no tokenizer and chat resources (convert it with them to serve it)");
+    }
+    return r;
+}
+} // namespace
+
+Frontend::Frontend(const Model::Resources& given, FrontendOptions options)
     : tokenizer_(std::make_shared<const qf::Tokenizer>(qf::TokenizerResources{
-          resources.tokenizer_json, resources.tokenizer_config_json, resources.generation_config_json})),
-      template_(std::make_shared<const text::JinjaTemplate>(std::string(resources.chat_template_jinja), "chat_template.jinja")),
+          require_resources(given).tokenizer_json, require_resources(given).tokenizer_config_json, require_resources(given).generation_config_json})),
+      template_(std::make_shared<const text::JinjaTemplate>(std::string(require_resources(given).chat_template_jinja), "chat_template.jinja")),
       options_(options) {
     if (tokenizer_->pipeline() != qf::Pipeline::Inkling2) { throw std::runtime_error("inkling2: the tokenizer is not Inkling-2's"); }
     check_control_tokens(*tokenizer_);
@@ -238,6 +296,15 @@ PreparedPrompt Frontend::build(PromptInput input, const PreparationControl& cont
         throw std::invalid_argument("reasoning_effort conflicts with enable_thinking");
     }
     PreparedPrompt out;
+    // The declared tools (OpenAI's {"type": "function", "function": {...}} or the bare function object).
+    out.tools.emplace();
+    for (const std::string& text : input.options.tool_jsons) {
+        const Json tool = parse_object(text, "a tool");
+        const Json& f   = tool.contains("function") && tool["function"].is_object() ? tool["function"] : tool;
+        if (!f.contains("name") || !f["name"].is_string()) { throw std::invalid_argument("a tool has no name"); }
+        out.tools->push_back({.name            = f["name"].get<std::string>(),
+                              .parameters_json = f.contains("parameters") ? f["parameters"].dump() : "{}"});
+    }
     out.thinking = input.options.enable_thinking != false &&
                    input.options.reasoning_effort != ReasoningEffort::None;
 
@@ -331,8 +398,9 @@ std::string_view Frontend::token_bytes(TokenId id) const { return tokenizer_->de
 
 bool Frontend::is_special(TokenId id) const noexcept { return tokenizer_->is_special_token(id); }
 
-OutputDecoder::OutputDecoder(const Frontend& frontend, std::vector<StopString> stops, bool tools)
-    : frontend_(frontend), stops_(std::move(stops)), tools_(tools) {
+OutputDecoder::OutputDecoder(const Frontend& frontend, std::vector<StopString> stops, bool tools,
+                             std::optional<std::vector<ToolDeclaration>> declared)
+    : frontend_(frontend), stops_(std::move(stops)), tools_(tools), declared_(std::move(declared)) {
     std::erase_if(stops_, [](const StopString& s) { return s.text.empty(); });
 }
 
@@ -345,9 +413,25 @@ void OutputDecoder::close_tool_call(Step& step) {
         return;
     }
     const Json call    = Json::parse(tool_json_, nullptr, false);
+    const ToolDeclaration* tool = nullptr;
+    if (call.is_object() && call.contains("name") && call["name"].is_string() && declared_) {
+        const std::string name = call["name"].get<std::string>();
+        for (const ToolDeclaration& d : *declared_) {
+            if (d.name == name) { tool = &d; }
+        }
+        if (tool == nullptr) {
+            // A call to a tool the prompt does not declare: kept as text, as a free parser does.
+            parse_.fallback_reason = ToolCallParseFallbackReason::UndeclaredTool;
+            append(0, tool_json_, step, true);
+            tool_json_.clear();
+            return;
+        }
+    }
     if (call.is_object() && call.contains("name") && call["name"].is_string() &&
         (!call.contains("args") || call["args"].is_object())) {
-        calls_.push_back({call["name"].get<std::string>(), call.contains("args") ? call["args"].dump() : "{}"});
+        const Json args = call.contains("args") ? call["args"] : Json::object();
+        if (tool != nullptr) { parse_.schema_mismatch_arguments += schema_mismatches(args, Json::parse(tool->parameters_json, nullptr, false)); }
+        calls_.push_back({call["name"].get<std::string>(), args.dump()});
         ++parse_.structured_call_count;
     } else {
         // Malformed: kept as text, as a free parser does.

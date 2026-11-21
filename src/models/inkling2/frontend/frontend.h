@@ -45,8 +45,16 @@ struct PromptImage {
     PreparedImage image;
 };
 
+// A tool the prompt declares: its name and its parameters' JSON Schema ("{}" when it gives none).
+struct ToolDeclaration {
+    std::string name;
+    std::string parameters_json = "{}";
+};
+
 struct PreparedPrompt {
     std::vector<std::int32_t> tokens;
+    // The declared tools; nullopt for a token prompt (prepare_tokens), whose tools are unknown.
+    std::optional<std::vector<ToolDeclaration>> tools;
     std::vector<PromptImage> images; // ascending columns
     PromptSummary summary;
     PromptPreparationStats stats;
@@ -94,8 +102,12 @@ private:
 // stop string.
 class OutputDecoder {
 public:
-    // `tools` false (tool_choice none): a tool call the model writes stays content text.
-    OutputDecoder(const Frontend& frontend, std::vector<StopString> stops, bool tools = true);
+    // `tools` false (tool_choice none): a tool call the model writes stays content text. `declared`: the prompt's
+    // tools; a call to a name it lacks stays content text (fallback UndeclaredTool), and arguments that break the
+    // tool's parameter schema (an unknown or missing required property, a wrong type or enum value) are counted in
+    // tool_call_parse().schema_mismatch_arguments. nullopt checks nothing (the tools are unknown).
+    OutputDecoder(const Frontend& frontend, std::vector<StopString> stops, bool tools = true,
+                  std::optional<std::vector<ToolDeclaration>> declared = std::nullopt);
 
     struct Step {
         std::vector<OutputDelta> deltas;
@@ -126,6 +138,7 @@ private:
     std::vector<StopString> stops_;
     Channel channel_ = Channel::None;
     bool tools_ = true;
+    std::optional<std::vector<ToolDeclaration>> declared_;
     std::string text_[2];          // content, reasoning: valid UTF-8
     std::string raw_[2];           // their last bytes that do not yet make a whole character
     std::size_t published_[2] = {0, 0};

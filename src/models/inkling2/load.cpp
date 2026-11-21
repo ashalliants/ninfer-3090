@@ -287,7 +287,10 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext&
         vision         = parse_vision_config(reader.directory().component("vision").config, config);
         vision_weights = bind_vision(bindings, *vision);
     }
-    const auto resource = [&](std::string_view role) {
+    // The tokenizer and chat files are optional here (a Program-only artifact has none); the Frontend requires them.
+    const auto& text_resources = reader.directory().component("text").resources;
+    const auto resource = [&](std::string_view role) -> std::string_view {
+        if (!text_resources.contains(role)) { return {}; }
         const auto bytes = binder.host_object(binder.resource("text", role));
         return std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     };

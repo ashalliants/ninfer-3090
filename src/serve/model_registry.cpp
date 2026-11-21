@@ -1,6 +1,7 @@
 #include "serve/model_registry.h"
 
 #include "core/device_snapshot.h"
+#include "ninfer/engine.h"
 
 #include <algorithm>
 #include <exception>
@@ -120,7 +121,8 @@ ModelRegistry::ModelRegistry(std::vector<ModelDefinition> models, RegistryPolicy
         throw std::invalid_argument("single-model mode serves exactly one model");
     }
     for (ModelDefinition& definition : models) {
-        models_.push_back(Slot{.definition = std::move(definition)});
+        const bool takes_video = artifact_takes_video(definition.options.artifact_path);
+        models_.push_back(Slot{.definition = std::move(definition), .takes_video = takes_video});
     }
     // A router also watches for models whose Engine failed, which it unloads.
     if (router_ || policy_.sleep_idle.count() > 0 || policy_.unload_idle.count() > 0) {
@@ -514,6 +516,7 @@ ModelStatusSnapshot ModelRegistry::snapshot_locked(const Slot& slot) const {
                                .max_context = slot.effective_context != 0 ? slot.effective_context
                                                          : slot.definition.options.max_context,
                                .vision      = slot.definition.options.enable_vision,
+                               .video       = slot.definition.options.enable_vision && slot.takes_video,
                                .failed     = slot.failed,
                                .last_error = slot.last_error,
                                .leases     = slot.leases,

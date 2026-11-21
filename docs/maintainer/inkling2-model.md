@@ -463,7 +463,14 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
   min-p, then top-p. Temperature 0 is argmax, lowest id first. A seed repeats its output.
 - The defaults follow `generation_config.json`: temperature 1, top-p 1. Top-k is 20.
 - `max_pending_requests` bounds the queue, and `pending_timeout` refuses a request that waited too long.
-- There is no prefix reuse, batching, context store, suspend or speculative decoding.
+- There is no batching, context store, suspend or speculative decoding.
+- Prefix reuse (on unless `context_cache.enabled` is off or a request sets `allow_prefix_reuse` false): after the
+  last whole 256-token chunk of each prompt that leaves a position to compute, the core copies the state a forward
+  from there needs (`TextProgram::save`: every sliding visit's last 1023 K/V columns and every visit's convolution
+  histories, 335 MB; the global caches are indexed by position and stay valid). A next prompt whose first positions
+  are the same (token ids, and images by a hash of their pixels) restores it and prefills only the rest, in the same
+  chunks a prefill from 0 runs, so the output is unchanged. Images wholly in the reused prefix are not encoded. The
+  result reports `reused_prompt_tokens`. One snapshot is kept; a prompt that does not resume from it replaces it (or clears it, when shorter than 257 tokens).
   - DSpark is 2.2x slower than plain decode in the correctness-first build (see "DSpark drafter"), so the
     server does not use it.
 
