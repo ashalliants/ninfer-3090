@@ -42,7 +42,14 @@ void require_string_hint(const Json& body, const char* key, std::size_t max_byte
 // often large.
 void require_client_tool_name(const std::string& name, const char* what, const char* param) {
     const auto printable = [](const std::string& text) {
-        std::string shown = text.substr(0, 80);
+        // Cut on a UTF-8 character boundary: a split multi-byte character would make the error
+        // body invalid UTF-8, and serialising it would throw instead of returning the 400.
+        std::size_t cut = std::min<std::size_t>(text.size(), 80);
+        while (cut > 0 && cut < text.size() &&
+               (static_cast<unsigned char>(text[cut]) & 0xC0U) == 0x80U) {
+            --cut;
+        }
+        std::string shown = text.substr(0, cut);
         for (char& character : shown) {
             if (static_cast<unsigned char>(character) < 0x20) { character = '?'; }
         }

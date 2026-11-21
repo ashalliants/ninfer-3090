@@ -28,6 +28,12 @@ std::size_t record_envelope_bytes(const StoredOpenAIResponse& record) {
     for (const nlohmann::json& item : record.input_items) {
         bytes += sizeof(nlohmann::json) + item.dump().size();
     }
+    // The chain's tool identity map is copied into every stored descendant.
+    for (const auto& [engine_name, identity] : record.tool_identities) {
+        bytes += sizeof(std::pair<const std::string, OpenAIResponsesFunctionIdentity>) +
+                 engine_name.size() + identity.name.size() +
+                 (identity.wire_namespace ? identity.wire_namespace->size() : 0);
+    }
     return bytes;
 }
 

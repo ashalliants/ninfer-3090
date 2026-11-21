@@ -884,22 +884,63 @@ int test_namespace_tools() {
                       "shortening is deterministic");
 
     // A continuation cannot reuse the Engine name its parent chain bound to another client tool.
-    const OpenAIResponsesFunctionIdentity long_identity{.name           = long_name,
-                                                       .wire_namespace = long_namespace};
-    const OpenAIResponsesFunctionIdentity direct_identity{.name = engine_name};
-    const std::unordered_map<std::string, OpenAIResponsesFunctionIdentity> parent_map{
-        {engine_name, long_identity}};
-    failures += check(merge_openai_responses_tool_identities(parent_map, parent_map).size() == 1,
-                      "a continuation may redeclare the same tool the parent chain used");
-    bool collided = false;
-    try {
-        (void)merge_openai_responses_tool_identities(parent_map, {{engine_name, direct_identity}});
-    } catch (const ApiException& exception) {
-        collided = exception.error().code == "duplicate_tool_name";
+    // The map goes through the store and resolve_openai_responses_prompt, the same path the
+    // aggregate and streaming handlers read it back on.
+    {
+        const OpenAIResponsesFunctionIdentity long_identity{.name           = long_name,
+                                                           .wire_namespace = long_namespace};
+        StoredOpenAIResponse parent = stored_parent(nullptr);
+        parent.tool_identities      = {{engine_name, long_identity}};
+        OpenAIResponsesStore parent_store(8, 1ULL << 20);
+        parent_store.put(std::move(parent));
+
+        const auto child_request = [&](const Json& tools) {
+            Json child = body;
+            child["input"]                = "next";
+            child["previous_response_id"] = "resp_parent";
+            child["tool_choice"]          = "auto";
+            child["tools"]                = tools;
+            return parse_openai_responses_create_request(child, limits());
+        };
+        const auto resolve_and_merge = [&](const OpenAIResponsesCreateRequest& request) {
+            const auto resolved = resolve_openai_responses_prompt(request.prompt, parent_store,
+                                                                  "resp_child", true);
+            return merge_openai_responses_tool_identities(resolved.parent_tool_identities,
+                                                          request.tool_identities);
+        };
+
+        failures += check(resolve_openai_responses_prompt(child_request(oversized["tools"]).prompt,
+                                                          parent_store, "resp_child", true)
+                                  .parent_tool_identities.at(engine_name) == long_identity,
+                          "resolving a child loads the parent chain's stored tool identities");
+        failures += check(resolve_and_merge(child_request(oversized["tools"])).size() == 1,
+                          "a continuation may redeclare the same tool the parent chain used");
+        bool collided = false;
+        try {
+            (void)resolve_and_merge(child_request(
+                Json::array({Json{{"type", "function"}, {"name", engine_name}}})));
+        } catch (const ApiException& exception) {
+            collided = exception.error().code == "duplicate_tool_name";
+        }
+        failures += check(collided,
+                          "a continuation cannot declare a different client tool under an Engine "
+                          "name the parent chain already bound");
     }
-    failures += check(collided,
-                      "a continuation cannot declare a different client tool under an Engine name "
-                      "the parent chain already bound");
+
+    // Over-long names are cut on a character boundary, so the error body stays valid UTF-8.
+    {
+        Json multibyte = body;
+        std::string name(79, 'a');
+        name += "\xC3\xA9";  // 'e' with acute: its two bytes straddle the 80-byte cut
+        name += std::string(600, 'b');
+        multibyte["tools"] = Json::array({Json{{"type", "function"}, {"name", name}}});
+        const ApiError error = api_error([&] {
+            (void)parse_openai_responses_create_request(multibyte, limits());
+        });
+        failures += check(error.code == "invalid_tool_name" &&
+                              Json{{"m", error.message}}.dump().size() > 0,
+                          "an over-long multibyte tool name yields a serialisable 400");
+    }
 
     // A name with characters outside [A-Za-z0-9_-] is sanitised the same way.
     Json dotted             = body;
