@@ -165,6 +165,22 @@ int main() {
         if (golden_fp16) { std::printf("KV rings: FP16\n"); }
         ink::TextProgram program(*model, main_limits, stream);
         if (dense != nullptr) { std::printf("dense projections: 8-bit re-encoding (%s)\n", dense_env.c_str()); }
+        // --dense-q8 all re-encodes every weight project() reads, so it takes precedence over the tensor-core dense
+        // route at every width: a 128-column prefill with prefill_tc.dense gives the bits of one without.
+        if (dense != nullptr && dense->form() == ink::DenseForm::Q8All) {
+            ink::ProgramLimits plain_limits{1024, 128};
+            plain_limits.dense = dense;
+            ink::ProgramLimits tc_limits = plain_limits;
+            tc_limits.prefill_tc.dense   = true;
+            ink::TextProgram plain(*model, plain_limits, stream), tc(*model, tc_limits, stream);
+            std::vector<std::int32_t> ids(128);
+            for (std::size_t i = 0; i < ids.size(); ++i) { ids[i] = static_cast<std::int32_t>(1000 + 37 * i); }
+            const auto a = logit_columns(plain.forward(ids), vocab), b = logit_columns(tc.forward(ids), vocab);
+            bool same = a.size() == b.size();
+            for (std::size_t t = 0; same && t < a.size(); ++t) { same = std::memcmp(a[t].data(), b[t].data(), a[t].size() * 4) == 0; }
+            check(same, "--dense-q8 all: a wide prefill with the tensor-core dense route differs from the re-encoded one");
+            if (same) { std::printf("dense Q8 (all) over a 128-column prefill: the tensor-core dense route defers to it, bit-exact\n"); }
+        }
 
         // NINFER_INKLING2_DENSE_KLD=<file of token ids>: the 8-bit dense forms against the BF16 one over that text,
         // teacher-forced in chunks of 256: KLD(BF16 || Q8) per position and the argmax agreement.

@@ -153,8 +153,8 @@ TokenId sample(std::vector<float>& logits, const ResolvedSamplingParameters& p,
 } // namespace
 
 struct Inkling2Core::Programs {
-    // --dense-q8: the re-encoded weights, owned here and read through views by the text Program and the drafter
-    // (declared first, so it outlives both).
+    // --dense-q8: the re-encoded weights, owned here once the programs are built (build_programs hands them over
+    // last) and read through views by the text Program and the drafter (declared first, so it outlives both).
     std::unique_ptr<ink::DenseWeightsQ8> dense;
     ink::TextProgram text;
     std::unique_ptr<ink::VisionEncoder> vision;
@@ -168,8 +168,9 @@ struct Inkling2Core::Programs {
     ink::TextProgram::Snapshot snapshot;
     std::vector<std::uint64_t> snapshot_keys;
     ink::DSparkProgram::Snapshot draft_snapshot; // the drafter's, with --spec dspark
-    Programs(const ink::Model& model, std::unique_ptr<ink::DenseWeightsQ8> dense_q8, ink::ProgramLimits limits, cudaStream_t stream)
-        : dense(std::move(dense_q8)), text(model, with_dense(std::move(limits), dense.get()), stream) {}
+    // dense_q8 is a view: the caller keeps the owner until build_programs succeeds, so a failed attempt never takes it.
+    Programs(const ink::Model& model, const ink::DenseWeightsQ8* dense_q8, ink::ProgramLimits limits, cudaStream_t stream)
+        : text(model, with_dense(std::move(limits), dense_q8), stream) {}
 
 private:
     static ink::ProgramLimits with_dense(ink::ProgramLimits limits, const ink::DenseWeightsQ8* dense) {
@@ -179,16 +180,18 @@ private:
 };
 
 // The text Program at chunk_ and, as configured, the drafter, its held taps, the vision tower and the snapshots.
-void Inkling2Core::build_programs(ink::ProgramLimits limits, std::unique_ptr<ink::DenseWeightsQ8> dense, const ink::VisionConfig* vision,
+// `dense` stays the caller's until every allocation has succeeded; only then does it move into programs_, so a
+// throw (an attempt at a chunk that does not fit) leaves the caller holding it for the next attempt.
+void Inkling2Core::build_programs(ink::ProgramLimits limits, std::unique_ptr<ink::DenseWeightsQ8>& dense, const ink::VisionConfig* vision,
                                   bool dspark) {
     limits.max_chunk = chunk_;
-    programs_ = std::make_unique<Programs>(*model_, std::move(dense), limits, stream_);
+    programs_ = std::make_unique<Programs>(*model_, dense.get(), limits, stream_);
     if (dspark) {
         // With --dense-q8 the drafter proposes from the target's re-encoded head, the one it verifies against.
         // Its extends take at most its sliding window; a wider chunk's taps go in pieces (extend_drafter).
         const std::int32_t draft_chunk = std::min(chunk_, static_cast<std::int32_t>(model_->dspark_config()->sliding_window));
         programs_->drafter = std::make_unique<ink::DSparkProgram>(*model_, static_cast<std::int32_t>(options_.max_context), draft_chunk, stream_,
-                                                                  programs_->dense ? &programs_->dense->head() : nullptr, limits.kv_fp16);
+                                                                  dense ? &dense->head() : nullptr, limits.kv_fp16);
         const std::int32_t hidden = static_cast<std::int32_t>(model_->config().hidden_size);
         for (std::size_t i = 0; i < limits.tap_visits.size(); ++i) {
             programs_->held_memory.emplace_back(static_cast<std::size_t>(hidden) * kHeld * 4);
@@ -200,6 +203,7 @@ void Inkling2Core::build_programs(ink::ProgramLimits limits, std::unique_ptr<ink
         programs_->snapshot.memory = DeviceBuffer(programs_->text.snapshot_bytes());
         if (programs_->drafter) { programs_->draft_snapshot.memory = DeviceBuffer(programs_->drafter->snapshot_bytes()); }
     }
+    programs_->dense = std::move(dense);
 }
 
 struct Inkling2Core::Job {
@@ -348,7 +352,7 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
             const bool last = attempt + 1 == chunks.size();
             chunk_ = chunks[attempt];
             try {
-                build_programs(limits, std::move(dense), vision, dspark);
+                build_programs(limits, dense, vision, dspark);
                 std::size_t free_bytes = 0, total_bytes = 0;
                 check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "memory info");
                 if (free_bytes < kStartupSpare && !last) { throw std::runtime_error("inkling2: under the startup spare"); }
@@ -357,7 +361,8 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                 throw;
             } catch (const std::exception&) {
                 if (last) { throw; }
-                if (programs_) { dense = std::move(programs_->dense); }
+                // A throw inside build_programs left `dense` here; one after it (the spare check) takes it back.
+                if (programs_ && programs_->dense) { dense = std::move(programs_->dense); }
                 programs_.reset();
                 (void)cudaGetLastError(); // a failed allocation's error, not sticky
             }

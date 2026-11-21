@@ -89,11 +89,15 @@ std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk, std::int32_
     const std::int64_t keys = std::max<std::int64_t>(max_context, c.sliding_window);
     const std::size_t split =
         split_attention ? ops::relative_bias_attention_split_bytes(global, std::min(chunk, ops::kSplitMaxColumns), keys) : 0;
-    // The tensor-core route's staging: the widest dense weight and the chunk in FP16, or the experts' entries.
+    // The tensor-core route's staging: the widest dense weight and the chunk in FP16, or the experts' entries. The
+    // head goes through project() too: when its call is wide enough for the tensor cores (every column's logits kept,
+    // last_logits off), its vocab_size rows are the widest weight.
     ops::SituExpertBank bank;
     bank.format = expert_format, bank.hidden = i32(h), bank.intermediate = i32(c.moe_intermediate), bank.experts = i32(c.experts);
+    const std::size_t widest =
+        std::max({q, h, logit_columns >= kTensorCoreMinColumns ? static_cast<std::size_t>(c.vocab_size) : std::size_t{0}});
     const std::size_t staging =
-        std::max(tc.dense ? ops::projection_tc_workspace_bytes(i32(std::max(q, h)), i32(std::max(q, h)), chunk) : 0,
+        std::max(tc.dense ? ops::projection_tc_workspace_bytes(i32(std::max(q, h)), i32(widest), chunk) : 0,
                  tc.experts ? ops::moe_situ_experts_tc_workspace_bytes(bank, std::int64_t(c.experts_per_token) * chunk) : 0);
     return per_token * static_cast<std::size_t>(chunk) + logits + split + staging + (c.num_layer_visits * 2 + 64) * kAlign * 4 +
            (64U << 20);
@@ -347,11 +351,9 @@ Tensor TextProgram::project(const Tensor& x, std::span<const WeightId> weights, 
         total += rows[i];
     }
     Tensor out = workspace_.alloc(DType::FP32, {total, cols});
-    // A call runs over the re-encoding when every one of its weights has one (all or none, as the forms are made).
-    if (limits_.prefill_tc.dense && cols >= kTensorCoreMinColumns) {
-        const Tensor* input[] = {&x};
-        ops::projection_tc_fp32(input, std::span<const Tensor* const>(pointers.data(), weights.size()), out, workspace_, stream_);
-    } else if (limits_.dense != nullptr && limits_.dense->find(views[0].data) != nullptr) {
+    // A call runs over the re-encoding when every one of its weights has one (all or none, as the forms are made),
+    // at every width: --dense-q8 takes precedence over the tensor cores, so prefill and decode read the same weights.
+    if (limits_.dense != nullptr && limits_.dense->find(views[0].data) != nullptr) {
         std::array<ops::Q8Weight, ops::kProjectionMaxWeights> q8;
         for (std::size_t i = 0; i < weights.size(); ++i) {
             const ops::Q8Weight* found = limits_.dense->find(views[i].data);
@@ -359,6 +361,9 @@ Tensor TextProgram::project(const Tensor& x, std::span<const WeightId> weights, 
             q8[i] = *found;
         }
         ops::projection_q8_fp32(x, std::span<const ops::Q8Weight>(q8.data(), weights.size()), out, stream_);
+    } else if (limits_.prefill_tc.dense && cols >= kTensorCoreMinColumns) {
+        const Tensor* input[] = {&x};
+        ops::projection_tc_fp32(input, std::span<const Tensor* const>(pointers.data(), weights.size()), out, workspace_, stream_);
     } else {
         ops::projection_fp32(x, std::span<const Tensor* const>(pointers.data(), weights.size()), out, stream_);
     }
