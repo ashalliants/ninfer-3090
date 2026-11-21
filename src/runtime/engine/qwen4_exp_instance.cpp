@@ -200,6 +200,9 @@ void validate(const EngineOptions& options) {
                "window and needs --mtp-joint-acceptance: add --mtp-joint-acceptance or remove "
                "--mtp-rows-verify");
     }
+    if (!next.engram_dir.empty()) {
+        refuse("--engram-dir is read by DeepSeek-V4.1-Flash only; this model has no Engram tables: remove --engram-dir");
+    }
     if (next.moe_gate_up_registers && !next.moe_precast_input) {
         refuse("--moe-gate-up-registers reads the input that --moe-precast-input casts once per call and needs it: "
                "add --moe-precast-input or remove --moe-gate-up-registers");
