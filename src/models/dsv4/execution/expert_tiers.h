@@ -133,6 +133,20 @@ public:
         return Admission{victim, evicted};
     }
 
+    // Undo of acquire_ram / admit_frame for a record that could not be filled: the key no longer owns the slot or frame.
+    void drop_ram(std::uint32_t key) {
+        Key& k = key_.at(key);
+        if (k.ram < 0) { return; }
+        ram_[static_cast<std::size_t>(k.ram)] = Ram{};
+        k.ram                                 = kNone;
+    }
+    void drop_frame(std::uint32_t key) {
+        Key& k = key_.at(key);
+        if (k.frame < 0) { return; }
+        frame_[static_cast<std::size_t>(k.frame)] = Frame{};
+        k.frame                                   = kNone;
+    }
+
     // Forgets everything (a cold start); the counters of the caller are its own.
     void clear() {
         for (auto& k : key_) { k = Key{}; }

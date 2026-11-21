@@ -117,6 +117,21 @@ void aging_follows_the_workload() {
     check(p.admit_frame(7).has_value(), "the new key displaces the faded one");
 }
 
+void failed_fills_roll_back() {
+    ExpertTierPolicy p(8, 2, 1);
+    route(p, {0});
+    check(p.ram_of(0) >= 0, "key 0 got a slot");
+    p.drop_ram(0);
+    check(p.ram_of(0) < 0, "a dropped RAM slot is no longer resident");
+    route(p, {1, 2});
+    check(p.ram_of(1) >= 0 && p.ram_of(2) >= 0, "the dropped slot is reusable");
+    check(p.admit_frame(1).has_value(), "key 1 gets the frame");
+    p.drop_frame(1);
+    check(p.frame_of(1) < 0, "a dropped frame is no longer resident");
+    route(p, {2});
+    check(p.admit_frame(2).has_value(), "the dropped frame is reusable");
+}
+
 void no_frames_never_admits() {
     ExpertTierPolicy p(8, 2, 0);
     route(p, {0});
@@ -133,6 +148,7 @@ int main() {
     frames_fill_then_frequency();
     frames_are_protected_within_a_call();
     aging_follows_the_workload();
+    failed_fills_roll_back();
     no_frames_never_admits();
     if (failures == 0) { std::printf("PASS\n"); }
     return failures == 0 ? 0 : 1;

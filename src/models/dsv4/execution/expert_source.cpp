@@ -37,16 +37,14 @@ double seconds_since(Clock::time_point t) { return std::chrono::duration<double>
 class FileExpertSource::ReadPool {
 public:
     explicit ReadPool(std::uint32_t threads) {
-        for (std::uint32_t t = 1; t < threads; ++t) { workers_.emplace_back([this] { loop(); }); }
-    }
-    ~ReadPool() {
-        {
-            std::lock_guard lock(mutex_);
-            stop_ = true;
+        try {
+            for (std::uint32_t t = 1; t < threads; ++t) { workers_.emplace_back([this] { loop(); }); }
+        } catch (...) { // a std::thread destroyed joinable terminates: stop and join the ones already started
+            shutdown();
+            throw;
         }
-        wake_.notify_all();
-        for (auto& w : workers_) { w.join(); }
     }
+    ~ReadPool() { shutdown(); }
     void run(std::size_t n, const std::function<void(std::size_t)>& job) {
         if (workers_.empty() || n < 2) {
             for (std::size_t i = 0; i < n; ++i) { job(i); }
@@ -69,6 +67,16 @@ public:
     }
 
 private:
+    void shutdown() {
+        {
+            std::lock_guard lock(mutex_);
+            stop_ = true;
+        }
+        wake_.notify_all();
+        for (auto& w : workers_) {
+            if (w.joinable()) { w.join(); }
+        }
+    }
     void drain() {
         for (;;) {
             const std::size_t i = next_.fetch_add(1);
@@ -286,11 +294,16 @@ ops::MoeExpertSource FileExpertSource::prepare(std::uint32_t layer, const std::i
     }
     stats_.hits = stats_.vram_hits + stats_.ram_hits;
     t0          = Clock::now();
-    pool_->run(reads.size(), [&](std::size_t i) {
-        auto* destination = reinterpret_cast<std::byte*>(cache_host_ + static_cast<std::uint64_t>(reads[i].slot) * slot_bytes_);
-        reader_.read_into(bank.artifact_offset + static_cast<std::uint64_t>(reads[i].expert) * bank.record_stride,
-                          std::span<std::byte>(destination, static_cast<std::size_t>(bank.record_stride)));
-    });
+    try {
+        pool_->run(reads.size(), [&](std::size_t i) {
+            auto* destination = reinterpret_cast<std::byte*>(cache_host_ + static_cast<std::uint64_t>(reads[i].slot) * slot_bytes_);
+            reader_.read_into(bank.artifact_offset + static_cast<std::uint64_t>(reads[i].expert) * bank.record_stride,
+                              std::span<std::byte>(destination, static_cast<std::size_t>(bank.record_stride)));
+        });
+    } catch (...) { // a slot whose read failed or was skipped holds no valid record: it must not stay resident
+        for (const Read& r : reads) { policy_.drop_ram(static_cast<std::uint32_t>(base + r.expert)); }
+        throw;
+    }
     stats_.read_seconds += seconds_since(t0);
 
     // This call's tables: the device frame of an expert that has one, else the address of its RAM record (the
@@ -312,11 +325,14 @@ ops::MoeExpertSource FileExpertSource::prepare(std::uint32_t layer, const std::i
     // Promote hot records to frames (after the tables: this call's Op still reads them from RAM).
     if (frames_ > 0) {
         std::uint32_t promoted = 0;
+        std::vector<std::uint32_t> admitted;
+        try {
         for (std::uint32_t e = 0; e < experts_ && promoted < options_.max_promotions; ++e) {
             const auto key = static_cast<std::uint32_t>(base + e);
             if (routed[e] == 0 || policy_.frame_of(key) >= 0) { continue; }
             const auto admission = policy_.admit_frame(key);
             if (!admission) { continue; }
+            admitted.push_back(key);
             if (promoted == 0) { ++batch_id_; }
             const std::int32_t slot = policy_.ram_of(key);
             policy_.hold_ram(slot, batch_id_);
@@ -337,6 +353,12 @@ ops::MoeExpertSource FileExpertSource::prepare(std::uint32_t layer, const std::i
             }
             cuda_require(cudaEventRecord(event, copy_stream_), "promotion event");
             batches_.push_back({batch_id_, event});
+        }
+        } catch (...) { // frames admitted but not (all) filled must not stay resident
+            cudaStreamSynchronize(copy_stream_);
+            policy_.set_completed(batch_id_);
+            for (const std::uint32_t key : admitted) { policy_.drop_frame(key); }
+            throw;
         }
     }
 
