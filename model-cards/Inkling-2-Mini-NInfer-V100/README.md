@@ -19,6 +19,11 @@ tags:
 
 # Inkling-2-Mini for NInfer on the Tesla V100
 
+[![GitHub: ashalliants/ninfer-3090](https://img.shields.io/badge/GitHub-ashalliants%2Fninfer--3090-2a78d6?logo=github)](https://github.com/ashalliants/ninfer-3090)
+[![Stars](https://img.shields.io/github/stars/ashalliants/ninfer-3090?style=flat&color=2a78d6)](https://github.com/ashalliants/ninfer-3090/stargazers)
+[![Release](https://img.shields.io/github/v/release/ashalliants/ninfer-3090?label=release&color=2a78d6)](https://github.com/ashalliants/ninfer-3090/releases/latest)
+[![License](https://img.shields.io/github/license/ashalliants/ninfer-3090?color=2a78d6)](https://github.com/ashalliants/ninfer-3090/blob/master/LICENSE)
+
 > **Maintained at [ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090)**: the engine, converter and builds this artifact is made and tested with. Releases, issues and updates live there, and a star helps others find it.
 
 This model card is the version-controlled source for
@@ -32,6 +37,21 @@ container without re-quantizing anything, plus the model's own DSpark speculativ
 tower, in one file. It is not a Transformers checkpoint, Safetensors distribution or GGUF file, and it
 needs NInfer's executables. It runs on one **Tesla V100 32 GB** (`sm_70`, Linux, built from source). It
 takes text and images; the model has no video input.
+
+## Get NInfer
+
+This artifact runs only on **[NInfer-3090](https://github.com/ashalliants/ninfer-3090)**, a
+from-scratch C++/CUDA inference engine built for and tuned on exactly two cards: the **RTX 3090** and
+the **Tesla V100 32 GB**. On those cards it serves Qwen3.8-27B at up to 140 tok/s on a 3090, the
+512-expert Qwen3.8-Flash-Next with 262K context on a V100, and now Inkling-2-Mini. It provides drop-in
+OpenAI and Anthropic APIs, so Claude Code, Codex, Cursor, Cline and other tools can point at your own GPU.
+
+- **[Source, build guides and docs](https://github.com/ashalliants/ninfer-3090)**. The
+  [V100 guide](https://github.com/ashalliants/ninfer-3090/blob/master/docs/tesla-v100.md) covers this model's build.
+- **[Releases](https://github.com/ashalliants/ninfer-3090/releases/latest)**: prebuilt RTX 3090 archives for Windows and Linux.
+- **[Issues](https://github.com/ashalliants/ninfer-3090/issues)**: bug reports, model requests and questions.
+- **[Star the repo](https://github.com/ashalliants/ninfer-3090/stargazers)** if this is useful. It's
+  how other 3090 and V100 owners find it.
 
 ## The model
 
@@ -82,11 +102,14 @@ Sources (Unsloth's `unsloth/Inkling-2-Mini-GGUF`, files as published on 2026-11-
 
 ## Running it
 
-Build NInfer for the V100 from source on Linux ([V100 guide](https://github.com/ashalliants/ninfer-3090/blob/master/docs/tesla-v100.md),
+Get [NInfer-3090](https://github.com/ashalliants/ninfer-3090) and build it for the V100 from source on Linux ([V100 guide](https://github.com/ashalliants/ninfer-3090/blob/master/docs/tesla-v100.md),
 `scripts/v100_build.sh`), then:
 
 ```bash
-ninfer-serve inkling2-mini-q8.ninfer --vision --spec dspark   # DSpark with 3 drafts by default
+git clone https://github.com/ashalliants/ninfer-3090 && cd ninfer-3090
+BUILD_DIR=$HOME/build-v100 scripts/v100_build.sh ninfer ninfer-serve
+scripts/download-model.sh inkling2-mini                         # this repository, pinned and verified
+~/build-v100/apps/ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dspark   # DSpark, 3 drafts by default
 ```
 
 `ninfer-serve` serves the OpenAI chat, Anthropic messages and Responses routes, with streaming, tool
@@ -134,3 +157,9 @@ Apache 2.0, as the base model. Model by [Thinking Machines](https://thinkingmach
 conversion, DSpark drafter files and the llama.cpp reference implementation by
 [Unsloth](https://huggingface.co/unsloth); this `.ninfer` conversion and the V100 engine by the
 [NInfer-3090](https://github.com/ashalliants/ninfer-3090) project.
+
+---
+
+**Running a 3090 or a V100?** [NInfer-3090 on GitHub](https://github.com/ashalliants/ninfer-3090) has
+every model this project supports, measured figures for each card, and the launchers to serve them.
+Issues and PRs are welcome, and a ⭐ helps others find it.
