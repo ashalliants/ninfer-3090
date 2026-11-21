@@ -200,14 +200,16 @@ def control(current: np.ndarray, message: np.ndarray, down: np.ndarray, gain: np
     return (1.0 - np.tanh(hidden @ forget.T)) * current + np.tanh(hidden @ gain.T) * message
 
 
-def route(z: np.ndarray, router: np.ndarray, bias: np.ndarray, top_k: int, scale: float) -> tuple[np.ndarray, np.ndarray]:
+def route(z: np.ndarray, router: np.ndarray, bias: np.ndarray, top_k: int, scale: float,
+          forced: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Sigmoid scores, bias-steered top-k (lower id wins ties), weights normalized over the chosen and scaled.
 
-    z [T, H] -> (ids [T, k], weights [T, k]).
+    z [T, H] -> (ids [T, k], weights [T, k]). ``forced`` [T, k], when given, replaces the selection (another
+    implementation's, to compare past a near tie); the weights are still this one's scores of those experts.
     """
     scores = 1.0 / (1.0 + np.exp(-(z @ router.T)))
     steered = scores + bias
-    ids = np.argsort(-steered, axis=-1, kind="stable")[:, :top_k]
+    ids = np.argsort(-steered, axis=-1, kind="stable")[:, :top_k] if forced is None else np.asarray(forced)
     chosen = np.take_along_axis(scores, ids, axis=-1)
     return ids, scale * chosen / (chosen.sum(axis=-1, keepdims=True) + 1e-20)
 
@@ -217,12 +219,12 @@ def situ(gate: np.ndarray, up: np.ndarray, gate_cap: float, up_cap: float) -> np
     return gate_cap * np.tanh(gate / gate_cap) / (1.0 + np.exp(-gate)) * up_cap * np.tanh(up / up_cap)
 
 
-def moe(z: np.ndarray, layer: dict, config: dict) -> np.ndarray:
+def moe(z: np.ndarray, layer: dict, config: dict, forced_ids: np.ndarray | None = None) -> np.ndarray:
     """Routed experts; gate_up [E, 2I, H] (gate rows first), down [E, H, I], optional per-expert multipliers.
 
     Each chosen expert is read once (``layer["gate_up"][e]``), so a bank may decode experts lazily.
     """
-    ids, weights = route(z, layer["router"], layer["router_bias"], config["top_k"], config["route_scale"])
+    ids, weights = route(z, layer["router"], layer["router_bias"], config["top_k"], config["route_scale"], forced_ids)
     inter = config["inter"]
     gu_scale, down_scale = layer.get("gate_up_scale"), layer.get("down_scale")
     out = np.zeros_like(z)
@@ -276,11 +278,14 @@ class Model:
         return [VisitState() for _ in range(self.visits)]
 
     def forward(self, tokens: np.ndarray, state: list[VisitState], start: int,
-                trace: dict | None = None) -> tuple[np.ndarray, dict]:
+                trace: dict | None = None, routes: dict | None = None) -> tuple[np.ndarray, dict]:
         """Tokens at positions start.. -> (logits [T, unpadded vocab], taps {visit: cur at the visit's input}).
 
         ``trace``, when given, receives llama.cpp's callback names per visit v: ``attn_out-v`` (after the output
-        convolution), ``ffn_inp-v`` and ``l_out-v``, and ``result_norm``; each is [T, H].
+        convolution), ``ffn_inp-v`` and ``l_out-v``, and ``result_norm``; each is [T, H]; and ``route_ids-v`` [T, k]
+        and ``route_gap-v`` [T], the experts this reference picks and the margin of the k-th over the next. ``routes``, when given,
+        maps a visit to the experts [T, k] its MoE must use (another implementation's routing, to compare the rest
+        of the arithmetic past a near tie); a visit it does not name routes itself.
         """
         c, w = self.config, self.weights
         tokens = np.asarray(tokens)
@@ -310,7 +315,8 @@ class Model:
                 m_kv = mix(bank + [bank_last], w["loop_kv_query"][2 * j: 2 * j + 2])
                 messages = {"attn": m_attn[0], "mlp": m_attn[1], "k": m_kv[0], "v": m_kv[1]}
             taps[visit] = cur
-            cur, blocks = self._visit(visit, p, layer, cur, blocks, messages, positions, state[visit], trace)
+            forced = None if routes is None else routes.get(visit)
+            cur, blocks = self._visit(visit, p, layer, cur, blocks, messages, positions, state[visit], trace, forced)
             if trace is not None:
                 trace[f"l_out-{visit}"] = cur
         x = rms(mix(blocks + [cur], w["output_query"][None, :])[0], w["output_norm"])
@@ -321,7 +327,7 @@ class Model:
             trace["result_norm"] = x
         return logits[:, : c["unpadded_vocab"]], taps
 
-    def _visit(self, visit, p, layer, cur, blocks, messages, positions, st: VisitState, trace=None):
+    def _visit(self, visit, p, layer, cur, blocks, messages, positions, st: VisitState, trace=None, forced_ids=None):
         c = self.config
         local = p in c["local_layers"]
         if p == 0:
@@ -388,7 +394,12 @@ class Model:
         if messages is not None:
             z = control(z, messages["mlp"], *layer["loop"]["mlp"])
         z = rms(z, layer["ffn_norm"])
-        y, hist_m = short_conv(moe(z, layer, c), hist.get("mlp", zeros(c["hidden"])), layer["mlp_conv"])
+        if trace is not None:  # this visit's own routing and its margin: steered score k minus score k+1
+            ids, _ = route(z, layer["router"], layer["router_bias"], c["top_k"], c["route_scale"])
+            steered = np.sort(1.0 / (1.0 + np.exp(-(z @ layer["router"].T))) + layer["router_bias"], axis=-1)[:, ::-1]
+            trace[f"route_ids-{visit}"] = ids
+            trace[f"route_gap-{visit}"] = steered[:, c["top_k"] - 1] - steered[:, c["top_k"]]
+        y, hist_m = short_conv(moe(z, layer, c, forced_ids), hist.get("mlp", zeros(c["hidden"])), layer["mlp_conv"])
         st.conv = {"k": hist_k, "v": hist_v, "attn": hist_a, "mlp": hist_m}
         return ffn_inp + y, blocks
 

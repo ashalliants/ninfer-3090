@@ -111,6 +111,21 @@ def test_route_normalizes_the_unbiased_scores():
     np.testing.assert_allclose(w[0], 8 * s / s.sum())
 
 
+def test_forced_routing_keeps_the_scores_of_the_forced_experts():
+    rng = np.random.default_rng(8)
+    z, router, bias = rng.standard_normal((3, 6)), rng.standard_normal((5, 6)), np.zeros(5)
+    ids, w = ref.route(z, router, bias, 2, 8.0)
+    same_ids, same_w = ref.route(z, router, bias, 2, 8.0, ids)
+    np.testing.assert_array_equal(same_ids, ids)
+    np.testing.assert_array_equal(same_w, w)
+    other = (ids + 1) % 5
+    forced_ids, forced_w = ref.route(z, router, bias, 2, 8.0, other)
+    scores = 1 / (1 + np.exp(-(z @ router.T)))
+    chosen = np.take_along_axis(scores, other, axis=-1)
+    np.testing.assert_array_equal(forced_ids, other)
+    np.testing.assert_allclose(forced_w, 8 * chosen / chosen.sum(axis=-1, keepdims=True))
+
+
 def test_situ_caps():
     assert abs(ref.situ(np.array([1e3]), np.array([1e4]), 4.0, 25.0)[0] - 100.0) < 1e-9
 
@@ -189,6 +204,23 @@ def test_compare_golden_requires_every_trace(model, tmp_path, monkeypatch):
     _toy_golden(model, golden, np.array([4, 2, 7, 1, 3]))
     report = compare_golden.compare(Path("unused.gguf"), golden)
     assert all(r["rel"] < 1e-6 for r in report["tensors"].values()) and all(report["logits"]["argmax_agree"])
+    assert "routes" not in report  # a llama.cpp golden has no routing
+    # --routes: the golden's own routing (the reference's) changes nothing; one missing visit is refused.
+    trace = {}
+    model.forward(np.array([4, 2, 7, 1, 3]), model.new_state(), 0, trace)
+    for visit in range(model.visits):
+        trace[f"route_ids-{visit}"].astype(np.int32).tofile(golden / f"route_ids-{visit}.i32")
+    forced = compare_golden.compare(Path("unused.gguf"), golden, routes=golden)
+    assert forced["tensors"] == report["tensors"] and forced["logits"]["kld"] == report["logits"]["kld"]
+    assert forced["routes"] == {"decisions": 50, "differ": []}
+    other = trace["route_ids-4"].copy()
+    other[2] = (other[2] + 1) % model.config["experts"]
+    other.astype(np.int32).tofile(golden / "route_ids-4.i32")
+    (differ,) = compare_golden.compare(Path("unused.gguf"), golden)["routes"]["differ"]
+    assert differ["visit"] == 4 and differ["token"] == 2 and differ["gap"] >= 0
+    (golden / "route_ids-3.i32").unlink()
+    with pytest.raises(ValueError, match="no route_ids-3"):
+        compare_golden.compare(Path("unused.gguf"), golden, routes=golden)
     (golden / "l_out-7.f32").unlink()
     with pytest.raises(ValueError, match="no l_out-7"):
         compare_golden.compare(Path("unused.gguf"), golden)
