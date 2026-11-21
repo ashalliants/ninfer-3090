@@ -312,6 +312,74 @@ void test_markov() {
     compare("dspark_markov_logits_fp32 in place", dbase.get(v), want, 1e-6, &magnitude);
 }
 
+// The drafter's compact P (lossy by design): the codes follow the stated rounding exactly, and the logits equal the
+// FP64 sum over the decoded values.
+void test_markov_compact() {
+    const int r = 256, v = 4104; // V a multiple of 8, not of 256
+    const auto base = randoms(v, -40, 40), hb = randoms(v, -1, 1), pt = randoms(static_cast<std::size_t>(r) * v, -0.2F, 0.2F);
+    const auto latent = randoms(r, -1, 1);
+    Buf dbase(base), dhb(hb), dpt(pt), dlat(latent), out(static_cast<std::size_t>(v) * 4);
+    Tensor tb = dbase.tensor({v}), th = dhb.tensor({v}), tp = dpt.tensor({v, r}), tlat = dlat.tensor({r}), to = out.tensor({v});
+    using ninfer::ops::MarkovForm;
+    for (const MarkovForm form : {MarkovForm::BF16, MarkovForm::Q8, MarkovForm::Q4}) {
+        const char* name = form == MarkovForm::BF16 ? "BF16" : form == MarkovForm::Q8 ? "Q8" : "Q4";
+        const std::size_t code_bytes = ninfer::ops::markov_head_code_bytes(form, v, r), scale_bytes = ninfer::ops::markov_head_scale_bytes(form, v, r);
+        ninfer::DeviceBuffer codes(code_bytes), scales(std::max<std::size_t>(scale_bytes, 4));
+        const ninfer::ops::MarkovHead head{form, codes.p, static_cast<const float*>(scales.p), v, r};
+        ninfer::ops::dspark_markov_quantize(tp, head, nullptr);
+        std::vector<std::uint8_t> hc(code_bytes);
+        std::vector<float> hs(std::max<std::size_t>(scale_bytes, 4) / 4);
+        cudaMemcpy(hc.data(), codes.p, code_bytes, cudaMemcpyDeviceToHost);
+        cudaMemcpy(hs.data(), scales.p, hs.size() * 4, cudaMemcpyDeviceToHost);
+        // Decode, checking each code against the host rounding.
+        std::vector<double> p(static_cast<std::size_t>(r) * v);
+        bool codes_exact = true;
+        for (int g = 0; g < r / 32; ++g) {
+            for (int i = 0; i < v; ++i) {
+                float amax = 0.0F;
+                for (int k = 32 * g; k < 32 * g + 32; ++k) { amax = std::max(amax, std::fabs(pt[static_cast<std::size_t>(k) * v + i])); }
+                const float levels = form == MarkovForm::Q8 ? 127.0F : 7.0F, d = amax / levels, inv = d > 0.0F ? 1.0F / d : 0.0F;
+                if (form != MarkovForm::BF16) { codes_exact &= hs[static_cast<std::size_t>(g) * v + i] == d; }
+                for (int k = 32 * g; k < 32 * g + 32; ++k) {
+                    const std::size_t at = static_cast<std::size_t>(k) * v + i;
+                    if (form == MarkovForm::BF16) {
+                        std::uint16_t word;
+                        std::memcpy(&word, hc.data() + 2 * at, 2);
+                        std::uint32_t bits;
+                        std::memcpy(&bits, &pt[at], 4);
+                        const std::uint32_t rounded = (bits + 0x7FFFU + ((bits >> 16) & 1U)) >> 16;
+                        codes_exact &= word == rounded;
+                        const std::uint32_t back = std::uint32_t(word) << 16;
+                        float f;
+                        std::memcpy(&f, &back, 4);
+                        p[at] = f;
+                    } else {
+                        const float lim = levels, want = std::min(std::max(std::rint(pt[at] * inv), -lim), lim);
+                        const int code = form == MarkovForm::Q8 ? static_cast<std::int8_t>(hc[at])
+                                                                : static_cast<int>((hc[at / 2] >> (4 * (at % 2))) & 15U) - 8;
+                        codes_exact &= code == static_cast<int>(want);
+                        p[at] = double(d) * code;
+                    }
+                }
+            }
+        }
+        check(codes_exact, std::string("dspark_markov_quantize ") + name + ": codes or scales differ from the rounding rule");
+        ninfer::ops::dspark_markov_logits(tb, th, head, tlat, 30.0F, to, nullptr);
+        Vec want(v), magnitude(v);
+        for (int i = 0; i < v; ++i) {
+            double acc = 0, a = std::fabs(base[i]) + std::fabs(hb[i]);
+            for (int k = 0; k < r; ++k) {
+                const double term = p[static_cast<std::size_t>(k) * v + i] * latent[k];
+                acc += term;
+                a += std::fabs(term);
+            }
+            want[i]      = 30.0 * std::tanh((double(base[i]) + hb[i] + acc) / 30.0);
+            magnitude[i] = a;
+        }
+        compare(std::string("dspark_markov_logits ") + name, out.get(v), want, 1e-6, &magnitude);
+    }
+}
+
 void test_argmax() {
     const int rows = 201024, valid = 200058, cols = 4;
     auto x = randoms(static_cast<std::size_t>(rows) * cols, -10, 10);
@@ -372,6 +440,7 @@ int main() {
         test_attention(5000, 1024, 1024, "local, wrapped ring");
         test_attention(3000, 4096, 0, "global");
         test_markov();
+        test_markov_compact();
         test_argmax();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
