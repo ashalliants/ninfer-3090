@@ -47,10 +47,38 @@ void require_same(const Columns& a, const Columns& b, const char* op) {
 __device__ __forceinline__ void store(float* p, float v) { *p = v; }
 __device__ __forceinline__ void store(__nv_bfloat16* p, float v) { *p = __float2bfloat16_rn(v); }
 
+struct RmsArgs {
+    const float* x[kRmsNormMaxJobs];
+    std::int64_t xs[kRmsNormMaxJobs];
+    const float* w[kRmsNormMaxJobs];
+    void* out[kRmsNormMaxJobs];
+    std::int64_t os[kRmsNormMaxJobs];
+    int rows;
+    float eps;
+};
+
+// grid (T, jobs): block (t, j) normalizes column t of job j. x and out may be the same columns (in place).
 template <typename Out>
-__global__ void __launch_bounds__(kThreads)
-rmsnorm_kernel(const float* x, std::int64_t xs, const float* __restrict__ w, float eps, int rows, Out* out,
-               std::int64_t os) { // x and out may be the same columns (the contract allows in place)
+__global__ void __launch_bounds__(kThreads) rmsnorm_kernel(RmsArgs a) {
+    // The job's operands by compile-time compares (a runtime index into the parameters would copy them to
+    // local memory).
+    const float* x = a.x[0];
+    const float* w = a.w[0];
+    void* out_any  = a.out[0];
+    std::int64_t xs = a.xs[0], os = a.os[0];
+#pragma unroll
+    for (int j = 1; j < kRmsNormMaxJobs; ++j) {
+        if (blockIdx.y == j) {
+            x       = a.x[j];
+            w       = a.w[j];
+            out_any = a.out[j];
+            xs      = a.xs[j];
+            os      = a.os[j];
+        }
+    }
+    Out* out = static_cast<Out*>(out_any);
+    const int rows = a.rows;
+    const float eps = a.eps;
     const float* col = x + static_cast<std::int64_t>(blockIdx.x) * xs;
     float ss = 0.0F;
     for (int d = threadIdx.x; d < rows; d += kThreads) { ss = fmaf(col[d], col[d], ss); }
@@ -119,26 +147,49 @@ void elementwise(const char* op, const Tensor& a, const Tensor* b, float cap, Te
 
 } // namespace
 
-void rmsnorm_fp32(const Tensor& x, const Tensor* weight, float eps, Tensor& out, cudaStream_t stream) {
+void rmsnorm_fp32_batch(std::span<const RmsNormJob> jobs, float eps, cudaStream_t stream) {
     const char* op = "rmsnorm_fp32";
-    const Columns cx = columns(x, DType::FP32, op, "x");
-    require(out.dtype == DType::FP32 || out.dtype == DType::BF16, op, "out must be FP32 or BF16");
-    const Columns co = columns(out, out.dtype, op, "out");
-    require_same(cx, co, op);
+    require(!jobs.empty() && jobs.size() <= static_cast<std::size_t>(kRmsNormMaxJobs), op, "1 to 4 jobs");
     require(eps > 0.0F, op, "eps must be positive");
-    require(cx.rows <= 65536, op, "D above 65536");
-    if (weight != nullptr) {
-        require(weight->dtype == DType::FP32 && weight->is_contiguous() && weight->numel() == cx.rows, op, "weight must be FP32 [D]");
+    require(jobs[0].x != nullptr && jobs[0].out != nullptr, op, "a job's x or out is null");
+    const DType dtype = jobs[0].out->dtype;
+    require(dtype == DType::FP32 || dtype == DType::BF16, op, "out must be FP32 or BF16");
+    RmsArgs a{};
+    Columns first{};
+    for (std::size_t j = 0; j < jobs.size(); ++j) {
+        const RmsNormJob& job = jobs[j];
+        require(job.x != nullptr && job.out != nullptr, op, "a job's x or out is null");
+        require(job.out->dtype == dtype, op, "every job's out must have one dtype");
+        const Columns cx = columns(*job.x, DType::FP32, op, "x");
+        const Columns co = columns(*job.out, dtype, op, "out");
+        require_same(cx, co, op);
+        if (j == 0) { first = cx; }
+        require_same(first, cx, op);
+        if (job.weight != nullptr) {
+            require(job.weight->dtype == DType::FP32 && job.weight->is_contiguous() && job.weight->numel() == cx.rows, op,
+                    "weight must be FP32 [D]");
+        }
+        a.x[j]   = static_cast<const float*>(job.x->data);
+        a.xs[j]  = cx.stride;
+        a.w[j]   = job.weight != nullptr ? static_cast<const float*>(job.weight->data) : nullptr;
+        a.out[j] = job.out->data;
+        a.os[j]  = co.stride;
     }
-    const float* w = weight != nullptr ? static_cast<const float*>(weight->data) : nullptr;
-    if (out.dtype == DType::FP32) {
-        rmsnorm_kernel<float><<<cx.cols, kThreads, 0, stream>>>(static_cast<const float*>(x.data), cx.stride, w, eps, cx.rows,
-                                                               static_cast<float*>(out.data), co.stride);
+    require(first.rows <= 65536, op, "D above 65536");
+    a.rows = first.rows;
+    a.eps  = eps;
+    const dim3 grid(first.cols, static_cast<unsigned>(jobs.size()));
+    if (dtype == DType::FP32) {
+        rmsnorm_kernel<float><<<grid, kThreads, 0, stream>>>(a);
     } else {
-        rmsnorm_kernel<__nv_bfloat16><<<cx.cols, kThreads, 0, stream>>>(static_cast<const float*>(x.data), cx.stride, w, eps, cx.rows,
-                                                                       static_cast<__nv_bfloat16*>(out.data), co.stride);
+        rmsnorm_kernel<__nv_bfloat16><<<grid, kThreads, 0, stream>>>(a);
     }
     check_launch(op);
+}
+
+void rmsnorm_fp32(const Tensor& x, const Tensor* weight, float eps, Tensor& out, cudaStream_t stream) {
+    const RmsNormJob job{&x, weight, &out};
+    rmsnorm_fp32_batch(std::span<const RmsNormJob>(&job, 1), eps, stream);
 }
 
 void add_fp32(const Tensor& a, const Tensor& b, Tensor& out, cudaStream_t stream) {

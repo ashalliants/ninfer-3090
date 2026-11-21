@@ -29,6 +29,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -255,6 +257,128 @@ void test_clips() {
         unit.insert(unit.end(), u.begin(), u.end());
     }
     compare("head_unit_rms_fp32", dy.get(x.size()), unit, 2e-6);
+}
+
+bool same_bits(const std::vector<float>& a, const std::vector<float>& b) {
+    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+}
+
+// The batched launches give each job the same bits as its own call.
+void test_batches() {
+    namespace ops = ninfer::ops;
+    const int h = 2304, cols = 3;
+    {
+        // Three weighted norms, BF16 out (the q, k, v norms), the second in a strided slice.
+        std::vector<Buf> xs, ws;
+        for (int j = 0; j < 3; ++j) {
+            xs.emplace_back(randoms(h * cols, -3, 3));
+            ws.emplace_back(randoms(h, 0.5, 1.5));
+        }
+        Buf batched(3 * h * cols), single(3 * h * cols); // BF16 [H, T] x 3 fits in half of each
+        std::vector<Tensor> tx, tw, tb, ts;
+        for (int j = 0; j < 3; ++j) {
+            tx.push_back(xs[j].tensor({h, cols}));
+            tw.push_back(ws[j].tensor({h}));
+            const auto out = [&](Buf& b) {
+                Tensor wide(static_cast<char*>(b.b.p) + static_cast<std::size_t>(j) * h * cols * 2 * 2, DType::BF16, {2 * h, cols});
+                return j == 1 ? wide.slice(0, h, h) : Tensor(wide.data, DType::BF16, {h, cols});
+            };
+            tb.push_back(out(batched));
+            ts.push_back(out(single));
+        }
+        const ops::RmsNormJob jobs[] = {{&tx[0], &tw[0], &tb[0]}, {&tx[1], &tw[1], &tb[1]}, {&tx[2], nullptr, &tb[2]}};
+        ops::rmsnorm_fp32_batch(jobs, 1e-6F, nullptr);
+        ops::rmsnorm_fp32(tx[0], &tw[0], 1e-6F, ts[0], nullptr);
+        ops::rmsnorm_fp32(tx[1], &tw[1], 1e-6F, ts[1], nullptr);
+        ops::rmsnorm_fp32(tx[2], nullptr, 1e-6F, ts[2], nullptr);
+        check(same_bits(batched.get(3 * h * cols), single.get(3 * h * cols)), "rmsnorm_fp32_batch: bits differ from single calls");
+        std::printf("%-44s bit-exact\n", "rmsnorm_fp32_batch (3 jobs, BF16, strided)");
+    }
+    {
+        // q clip with log scale, r clip with log scale (d 16), k clip, v unit rms: one launch.
+        const int heads = 24, kv = 8, d = 128, dr = 16;
+        auto q = randoms(heads * d * cols, -4, 4), r = randoms(heads * dr * cols, -4, 4), k = randoms(kv * d * cols, -40, 40),
+             v = randoms(kv * d * cols, -3, 3);
+        auto qs = randoms(heads * d, 0.5, 2), rs = randoms(heads * dr, 0.5, 2);
+        Buf bq(q), br(r), bk(k), bv(v), sq(q), sr(r), sk(k), sv(v), dqs(qs), drs(rs);
+        const Tensor tqs = dqs.tensor({d, heads}), trs = drs.tensor({dr, heads});
+        const ops::PositionLogScale tau{20000, 8192, 0.1F, nullptr};
+        Tensor a[] = {bq.tensor({heads * d, cols}), br.tensor({heads * dr, cols}), bk.tensor({kv * d, cols}), bv.tensor({kv * d, cols})};
+        Tensor b[] = {sq.tensor({heads * d, cols}), sr.tensor({heads * dr, cols}), sk.tensor({kv * d, cols}), sv.tensor({kv * d, cols})};
+        ops::HeadNormJob jobs[4];
+        jobs[0].x = &a[0], jobs[0].head_dim = d, jobs[0].scale = &tqs, jobs[0].threshold = 22.6F, jobs[0].log_scale = &tau;
+        jobs[1].x = &a[1], jobs[1].head_dim = dr, jobs[1].scale = &trs, jobs[1].threshold = 5.0F, jobs[1].log_scale = &tau;
+        jobs[2].x = &a[2], jobs[2].head_dim = d, jobs[2].threshold = 22.6F;
+        jobs[3].x = &a[3], jobs[3].head_dim = d, jobs[3].unit_rms = true, jobs[3].eps = 1e-6F;
+        ops::head_norms_fp32(jobs, nullptr);
+        ops::head_l2_clip_fp32(b[0], d, &tqs, 22.6F, &tau, nullptr);
+        ops::head_l2_clip_fp32(b[1], dr, &trs, 5.0F, &tau, nullptr);
+        ops::head_l2_clip_fp32(b[2], d, nullptr, 22.6F, nullptr, nullptr);
+        ops::head_unit_rms_fp32(b[3], d, 1e-6F, nullptr);
+        const bool ok = same_bits(bq.get(q.size()), sq.get(q.size())) && same_bits(br.get(r.size()), sr.get(r.size())) &&
+                        same_bits(bk.get(k.size()), sk.get(k.size())) && same_bits(bv.get(v.size()), sv.get(v.size()));
+        check(ok, "head_norms_fp32: bits differ from single calls");
+        // And the batch against the oracle for the k clip (no scale): every head clipped to 22.6.
+        Vec want;
+        for (int i = 0; i < kv * cols; ++i) {
+            const Vec u = ref::l2_clip(Vec(k.begin() + i * d, k.begin() + (i + 1) * d), 22.6, nullptr);
+            want.insert(want.end(), u.begin(), u.end());
+        }
+        compare("head_norms_fp32 (4 jobs) k clip vs oracle", bk.get(k.size()), want, 2e-6);
+    }
+    {
+        // Two dynamic convolutions (k and v), then a static one fused with its residual add, over 2 + 1 columns.
+        const int channels = 1024, k = 4, head = 128, heads = channels / head;
+        Buf x0(randoms(channels * cols)), x1(randoms(channels * cols)), t0(randoms(channels * k, -0.5F, 0.5F)),
+            t1(randoms(channels * k, -0.5F, 0.5F)), dyn0(randoms(heads * k * cols, -0.5F, 0.5F)), dyn1(randoms(heads * k * cols, -0.5F, 0.5F)),
+            res(randoms(channels * cols, -2, 2));
+        Buf hb0(channels * (k - 1)), hb1(channels * (k - 1)), hs0(channels * (k - 1)), hs1(channels * (k - 1)), hb2(channels * (k - 1)),
+            hs2(channels * (k - 1));
+        Buf ob0(channels * cols), ob1(channels * cols), os0(channels * cols), os1(channels * cols), sumb(channels * cols),
+            outs(channels * cols), sums(channels * cols);
+        const Tensor tt0 = t0.tensor({k, channels}), tt1 = t1.tensor({k, channels});
+        Tensor thb0 = hb0.tensor({channels, k - 1}), thb1 = hb1.tensor({channels, k - 1}), ths0 = hs0.tensor({channels, k - 1}),
+               ths1 = hs1.tensor({channels, k - 1}), thb2 = hb2.tensor({channels, k - 1}), ths2 = hs2.tensor({channels, k - 1});
+        for (int part = 0; part < 2; ++part) {
+            const int s = part == 0 ? 0 : 2, len = part == 0 ? 2 : 1;
+            const auto cut = [&](Buf& b, int rows) { return b.tensor({rows, cols}).slice(1, s, len); };
+            const Tensor tx0 = cut(x0, channels), tx1 = cut(x1, channels), td0 = cut(dyn0, heads * k), td1 = cut(dyn1, heads * k),
+                         tr = cut(res, channels);
+            Tensor tob0 = cut(ob0, channels), tob1 = cut(ob1, channels), tos0 = cut(os0, channels), tos1 = cut(os1, channels),
+                   tsb = cut(sumb, channels), tout = cut(outs, channels), tss = cut(sums, channels);
+            ops::ShortConvJob jobs[2];
+            jobs[0].x = &tx0, jobs[0].taps = &tt0, jobs[0].dynamic = &td0, jobs[0].history = &thb0, jobs[0].out = &tob0;
+            jobs[1].x = &tx1, jobs[1].taps = &tt1, jobs[1].dynamic = &td1, jobs[1].history = &thb1, jobs[1].out = &tob1;
+            ops::short_conv_fp32_batch(jobs, head, nullptr);
+            ops::short_conv_fp32(tx0, tt0, &td0, head, ths0, tos0, nullptr);
+            ops::short_conv_fp32(tx1, tt1, &td1, head, ths1, tos1, nullptr);
+            ops::ShortConvJob fused;
+            fused.x = &tx0, fused.taps = &tt1, fused.history = &thb2, fused.residual = &tr, fused.sum = &tsb;
+            ops::short_conv_fp32_batch(std::span<const ops::ShortConvJob>(&fused, 1), 1, nullptr);
+            ops::short_conv_fp32(tx0, tt1, nullptr, 1, ths2, tout, nullptr);
+            ops::add_fp32(tr, tout, tss, nullptr);
+        }
+        const std::size_t n = static_cast<std::size_t>(channels) * cols, nh = static_cast<std::size_t>(channels) * (k - 1);
+        check(same_bits(ob0.get(n), os0.get(n)) && same_bits(ob1.get(n), os1.get(n)), "short_conv_fp32_batch: outputs differ");
+        check(same_bits(hb0.get(nh), hs0.get(nh)) && same_bits(hb1.get(nh), hs1.get(nh)) && same_bits(hb2.get(nh), hs2.get(nh)),
+              "short_conv_fp32_batch: histories differ");
+        check(same_bits(sumb.get(n), sums.get(n)), "short_conv_fp32_batch: fused sum differs from conv + add_fp32");
+        std::printf("%-44s bit-exact\n", "head_norms / short_conv batches, fused sum");
+    }
+    // Refusals: mismatched T, too many jobs, sum without residual.
+    {
+        Buf a(h * 2), b(h * 3), o(h * 3);
+        Tensor ta = a.tensor({h, 2}), tb = b.tensor({h, 3}), to = o.tensor({h, 3}), to2 = o.tensor({h, 2});
+        const ops::RmsNormJob mixed[] = {{&ta, nullptr, &to2}, {&tb, nullptr, &to}};
+        bool threw = false;
+        try { ops::rmsnorm_fp32_batch(mixed, 1e-6F, nullptr); } catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "rmsnorm_fp32_batch accepted jobs of different T");
+        ops::HeadNormJob many[5];
+        for (auto& job : many) { job.x = &tb, job.head_dim = 128, job.threshold = 1.0F; }
+        threw = false;
+        try { ops::head_norms_fp32(many, nullptr); } catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "head_norms_fp32 accepted 5 jobs");
+    }
 }
 
 // Positions 0..n-1 through relative_bias_sink_attention in calls of `chunk`, against the oracle over the whole sequence.
@@ -595,6 +719,7 @@ int main() {
         test_short_conv(false);
         test_short_conv(true);
         test_clips();
+        test_batches();
         test_attention(1024, 1024, 12, 5, "attention window 1024 > context (5+5+2)");
         test_attention(0, 4, 12, 5, "attention global, extent 4 < context");
         test_attention(4, 4, 13, 3, "attention local window 4, ring wraps");

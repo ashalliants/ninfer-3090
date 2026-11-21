@@ -39,40 +39,77 @@ __device__ float warp_sum(float v) {
     return v;
 }
 
-// One warp per (head, column).
-__global__ void clip_kernel(float* x, std::int64_t xs, int head_dim, int heads, const float* __restrict__ scale, float threshold,
-                            std::int64_t start, const std::int64_t* start_offset, std::int64_t floor, float alpha,
-                            bool log_scale) {
-    const int t = blockIdx.x, h = blockIdx.y, lane = threadIdx.x; // T on x: no 65535 cap
-    float* v = x + t * xs + static_cast<std::int64_t>(h) * head_dim;
+// The jobs of one head_norms_fp32 launch.
+struct HeadArgs {
+    float* x[kHeadNormMaxJobs];
+    std::int64_t xs[kHeadNormMaxJobs];
+    const float* scale[kHeadNormMaxJobs];
+    const std::int64_t* start_offset[kHeadNormMaxJobs];
+    std::int64_t start[kHeadNormMaxJobs], floor[kHeadNormMaxJobs];
+    float threshold[kHeadNormMaxJobs], alpha[kHeadNormMaxJobs], eps[kHeadNormMaxJobs];
+    int head_dim[kHeadNormMaxJobs], kind[kHeadNormMaxJobs]; // kind: 0 clip, 1 clip with log scale, 2 unit rms
+    int head_begin[kHeadNormMaxJobs + 1]; // first global head of each job, then the total
+    int count;
+};
+
+// The L2 clip of one head slice v (lane `lane` of its warp).
+__device__ void clip_head(float* v, int head_dim, const float* scale, float threshold, bool log_scale, double pos,
+                          std::int64_t floor, float alpha, int lane) {
     float local[8];
     float ss = 0.0F;
     for (int i = 0; i < 8; ++i) {
         const int d = lane + 32 * i;
         local[i] = 0.0F;
         if (d < head_dim) {
-            local[i] = v[d] * (scale != nullptr ? scale[static_cast<std::int64_t>(h) * head_dim + d] : 1.0F);
+            local[i] = v[d] * (scale != nullptr ? scale[d] : 1.0F);
             ss = fmaf(local[i], local[i], ss);
         }
     }
     float f = fminf(1.0F, threshold / (sqrtf(warp_sum(ss)) + 1e-6F));
-    if (log_scale) {
-        const double pos = static_cast<double>(start + (start_offset != nullptr ? *start_offset : 0) + t);
-        f *= static_cast<float>(1.0 + alpha * log(fmax(1.0, (pos + 1.0) / static_cast<double>(floor))));
-    }
+    if (log_scale) { f *= static_cast<float>(1.0 + alpha * log(fmax(1.0, (pos + 1.0) / static_cast<double>(floor)))); }
     for (int i = 0; i < 8; ++i) {
         const int d = lane + 32 * i;
         if (d < head_dim) { v[d] = local[i] * f; }
     }
 }
 
-__global__ void unit_rms_kernel(float* x, std::int64_t xs, int head_dim, float eps) {
-    const int t = blockIdx.x, h = blockIdx.y, lane = threadIdx.x; // T on x: no 65535 cap
-    float* v = x + t * xs + static_cast<std::int64_t>(h) * head_dim;
+__device__ void unit_rms_head(float* v, int head_dim, float eps, int lane) {
     float ss = 0.0F;
     for (int d = lane; d < head_dim; d += 32) { ss = fmaf(v[d], v[d], ss); }
     const float inv = rsqrtf(warp_sum(ss) / static_cast<float>(head_dim) + eps);
     for (int d = lane; d < head_dim; d += 32) { v[d] *= inv; }
+}
+
+// grid (T, total heads of every job), one warp: block (t, g) normalizes global head g of column t.
+__global__ void head_norms_kernel(HeadArgs a) {
+    const int t = blockIdx.x, g = blockIdx.y, lane = threadIdx.x; // T on x: no 65535 cap
+    // The job by compile-time compares (a runtime index into the parameters would copy them to local memory).
+    int j = 0;
+#pragma unroll
+    for (int i = 1; i < kHeadNormMaxJobs; ++i) { j = i < a.count && g >= a.head_begin[i] ? i : j; }
+    float* x = a.x[0];
+    std::int64_t xs = a.xs[0], start = a.start[0], floor = a.floor[0];
+    const float* scale = a.scale[0];
+    const std::int64_t* offset = a.start_offset[0];
+    float threshold = a.threshold[0], alpha = a.alpha[0], eps = a.eps[0];
+    int head_dim = a.head_dim[0], kind = a.kind[0], begin = a.head_begin[0];
+#pragma unroll
+    for (int i = 1; i < kHeadNormMaxJobs; ++i) {
+        if (j == i) {
+            x = a.x[i], xs = a.xs[i], start = a.start[i], floor = a.floor[i], scale = a.scale[i], offset = a.start_offset[i];
+            threshold = a.threshold[i], alpha = a.alpha[i], eps = a.eps[i], head_dim = a.head_dim[i], kind = a.kind[i];
+            begin = a.head_begin[i];
+        }
+    }
+    const int h = g - begin;
+    float* v = x + t * xs + static_cast<std::int64_t>(h) * head_dim;
+    if (kind == 2) {
+        unit_rms_head(v, head_dim, eps, lane);
+    } else {
+        const double pos = kind == 1 ? static_cast<double>(start + (offset != nullptr ? *offset : 0) + t) : 0.0;
+        clip_head(v, head_dim, scale != nullptr ? scale + static_cast<std::int64_t>(h) * head_dim : nullptr, threshold, kind == 1,
+                  pos, floor, alpha, lane);
+    }
 }
 
 __global__ void append_kernel(const float* __restrict__ src, std::int64_t ss, int rows, std::int64_t start,
@@ -196,35 +233,65 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(AttentionArgs a) {
 
 } // namespace
 
-void head_l2_clip_fp32(Tensor& x, int head_dim, const Tensor* scale, float threshold, const PositionLogScale* log_scale,
-                       cudaStream_t stream) {
-    const char* op = "head_l2_clip_fp32";
-    require(head_dim > 0 && head_dim <= 256 && x.ne[0] % head_dim == 0, op, "rows must be whole heads of at most 256");
-    const int heads = x.ne[0] / head_dim;
-    const std::int64_t xs = column_stride(x, x.ne[0], x.ne[1], op, "x");
-    if (scale != nullptr) {
-        require(scale->dtype == DType::FP32 && scale->is_contiguous() && scale->numel() == x.ne[0], op, "scale must be FP32 [d, heads]");
+void head_norms_fp32(std::span<const HeadNormJob> jobs, cudaStream_t stream) {
+    const char* op = "head_norms_fp32";
+    require(!jobs.empty() && jobs.size() <= static_cast<std::size_t>(kHeadNormMaxJobs), op, "1 to 4 jobs");
+    HeadArgs a{};
+    a.count = static_cast<int>(jobs.size());
+    std::int32_t cols = 0;
+    int heads_total = 0;
+    for (std::size_t j = 0; j < jobs.size(); ++j) {
+        const HeadNormJob& job = jobs[j];
+        require(job.x != nullptr, op, "a job's x is null");
+        Tensor& x = *job.x;
+        const int head_dim = job.head_dim;
+        require(head_dim > 0 && head_dim <= 256 && x.ne[0] % head_dim == 0, op, "rows must be whole heads of at most 256");
+        if (j == 0) { cols = x.ne[1]; }
+        require(x.ne[1] == cols, op, "every job must have the same T");
+        a.x[j]        = static_cast<float*>(x.data);
+        a.xs[j]       = column_stride(x, x.ne[0], x.ne[1], op, "x");
+        a.head_dim[j] = head_dim;
+        a.head_begin[j] = heads_total;
+        heads_total += x.ne[0] / head_dim;
+        a.floor[j] = 1;
+        if (job.unit_rms) {
+            require(job.eps > 0.0F, op, "eps must be positive");
+            a.kind[j] = 2;
+            a.eps[j]  = job.eps;
+            continue;
+        }
+        if (job.scale != nullptr) {
+            require(job.scale->dtype == DType::FP32 && job.scale->is_contiguous() && job.scale->numel() == x.ne[0], op,
+                    "scale must be FP32 [d, heads]");
+            a.scale[j] = static_cast<const float*>(job.scale->data);
+        }
+        require(job.threshold > 0.0F, op, "threshold must be positive");
+        a.threshold[j] = job.threshold;
+        a.kind[j]      = job.log_scale != nullptr ? 1 : 0;
+        if (job.log_scale != nullptr) {
+            require(job.log_scale->floor > 0 && job.log_scale->start >= 0, op, "invalid log scale");
+            a.start[j]        = job.log_scale->start;
+            a.start_offset[j] = job.log_scale->start_offset;
+            a.floor[j]        = job.log_scale->floor;
+            a.alpha[j]        = job.log_scale->alpha;
+        }
     }
-    require(threshold > 0.0F, op, "threshold must be positive");
-    if (log_scale != nullptr) { require(log_scale->floor > 0 && log_scale->start >= 0, op, "invalid log scale"); }
-    const dim3 grid(x.ne[1], heads);
-    clip_kernel<<<grid, 32, 0, stream>>>(static_cast<float*>(x.data), xs, head_dim, heads,
-                                         scale != nullptr ? static_cast<const float*>(scale->data) : nullptr, threshold,
-                                         log_scale != nullptr ? log_scale->start : 0,
-                                         log_scale != nullptr ? log_scale->start_offset : nullptr,
-                                         log_scale != nullptr ? log_scale->floor : 1,
-                                         log_scale != nullptr ? log_scale->alpha : 0.0F, log_scale != nullptr);
+    a.head_begin[jobs.size()] = heads_total;
+    head_norms_kernel<<<dim3(cols, heads_total), 32, 0, stream>>>(a);
     check_launch(op);
 }
 
+void head_l2_clip_fp32(Tensor& x, int head_dim, const Tensor* scale, float threshold, const PositionLogScale* log_scale,
+                       cudaStream_t stream) {
+    HeadNormJob job;
+    job.x = &x, job.head_dim = head_dim, job.scale = scale, job.threshold = threshold, job.log_scale = log_scale;
+    head_norms_fp32(std::span<const HeadNormJob>(&job, 1), stream);
+}
+
 void head_unit_rms_fp32(Tensor& x, int head_dim, float eps, cudaStream_t stream) {
-    const char* op = "head_unit_rms_fp32";
-    require(head_dim > 0 && head_dim <= 256 && x.ne[0] % head_dim == 0, op, "rows must be whole heads of at most 256");
-    require(eps > 0.0F, op, "eps must be positive");
-    const std::int64_t xs = column_stride(x, x.ne[0], x.ne[1], op, "x");
-    const dim3 grid(x.ne[1], x.ne[0] / head_dim);
-    unit_rms_kernel<<<grid, 32, 0, stream>>>(static_cast<float*>(x.data), xs, head_dim, eps);
-    check_launch(op);
+    HeadNormJob job;
+    job.x = &x, job.head_dim = head_dim, job.unit_rms = true, job.eps = eps;
+    head_norms_fp32(std::span<const HeadNormJob>(&job, 1), stream);
 }
 
 void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Tensor& q, const Tensor& r, const Tensor& sink,
