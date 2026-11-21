@@ -693,12 +693,13 @@ private:
             throw std::invalid_argument("--draft-tokens needs --spec dspark");
         }
         // DSpark verifies greedy rows exactly and drafts from its own head: the Qwen drafting options have no meaning,
-        // so they are refused, not ignored, with or without DSpark.
+        // so they are refused, not ignored, with or without DSpark. The proposal head is the exception under DSpark:
+        // ninfer serve sets it for every backend (product::apply_speculative_defaults), and DSpark never reads it.
         const SpeculativeOptions defaults;
         const auto& spec = options.speculative;
         if (options.relaxed_drafting || options.draft_context_rows != 0 || spec.ngram_draft_tokens != 0 ||
             spec.adaptive_draft_tokens != 0 || spec.ngram_min_match != defaults.ngram_min_match ||
-            spec.proposal_head != defaults.proposal_head) {
+            (spec.backend != SpeculativeBackend::DSpark && spec.proposal_head != defaults.proposal_head)) {
             throw std::invalid_argument("Inkling-2 takes no relaxed drafting, draft-context rows, n-gram or adaptive "
                                         "draft windows, n-gram match lengths or proposal heads");
         }

@@ -11,6 +11,7 @@
 // NINFER_INKLING2_SPEC_TOKENS: output tokens per prompt (default 256).
 
 #include "ninfer/engine.h"
+#include "product/speculative_options.h"
 
 #include <algorithm>
 #include <chrono>
@@ -110,6 +111,8 @@ int main() {
         }
         options.speculative.backend      = ninfer::SpeculativeBackend::DSpark;
         options.speculative.draft_tokens = drafts;
+        // As ninfer serve normalizes it (an LM-head proposal for every backend), which DSpark has no use for.
+        ninfer::product::apply_speculative_defaults(options.speculative);
         {
             auto relaxed             = options;
             relaxed.relaxed_drafting = 0.5F;
