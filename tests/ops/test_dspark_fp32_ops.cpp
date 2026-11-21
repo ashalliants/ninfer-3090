@@ -17,10 +17,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -378,6 +380,37 @@ void test_markov_compact() {
         }
         compare(std::string("dspark_markov_logits ") + name, out.get(v), want, 1e-6, &magnitude);
     }
+    // Refusals: an incomplete or overlapping descriptor never reaches a kernel.
+    ninfer::DeviceBuffer codes(ninfer::ops::markov_head_code_bytes(MarkovForm::Q8, v, r) + 8);
+    ninfer::DeviceBuffer scales(ninfer::ops::markov_head_scale_bytes(MarkovForm::Q8, v, r));
+    const auto* sp = static_cast<const float*>(scales.p);
+    const auto refused = [&](const ninfer::ops::MarkovHead& head, Tensor& logits, const char* what) {
+        bool quantize = false, logits_refused = false;
+        try {
+            ninfer::ops::dspark_markov_quantize(tp, head, nullptr);
+        } catch (const std::invalid_argument&) { quantize = true; }
+        try {
+            ninfer::ops::dspark_markov_logits(tb, th, head, tlat, 30.0F, logits, nullptr);
+        } catch (const std::invalid_argument&) { logits_refused = true; }
+        check(quantize && logits_refused, std::string("dspark_markov_quantize and dspark_markov_logits refuse ") + what);
+    };
+    refused({MarkovForm::Q8, nullptr, sp, v, r}, to, "null codes");
+    refused({MarkovForm::Q8, codes.p, nullptr, v, r}, to, "null Q8 scales");
+    refused({MarkovForm::Q4, codes.p, nullptr, v, r}, to, "null Q4 scales");
+    refused({static_cast<MarkovForm>(7), codes.p, sp, v, r}, to, "an unknown form");
+    refused({MarkovForm::Q8, static_cast<std::byte*>(codes.p) + 4, sp, v, r}, to, "misaligned codes");
+    refused({MarkovForm::Q8, codes.p, sp, v, 2048}, to, "R past 1024");
+    bool overlap = false;
+    try {
+        ninfer::ops::dspark_markov_quantize(tp, {MarkovForm::Q8, codes.p, static_cast<const float*>(codes.p), v, r}, nullptr);
+    } catch (const std::invalid_argument&) { overlap = true; }
+    check(overlap, "dspark_markov_quantize refuses scales overlapping the codes");
+    Tensor onto_hb = dhb.tensor({v});
+    bool aliased = false;
+    try {
+        ninfer::ops::dspark_markov_logits(tb, th, {MarkovForm::Q8, codes.p, sp, v, r}, tlat, 30.0F, onto_hb, nullptr);
+    } catch (const std::invalid_argument&) { aliased = true; }
+    check(aliased, "dspark_markov_logits refuses logits aliasing hb");
 }
 
 void test_argmax() {
