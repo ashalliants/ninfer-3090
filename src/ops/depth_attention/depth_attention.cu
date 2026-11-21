@@ -143,7 +143,8 @@ std::size_t partial_floats(std::int32_t rows, std::int64_t columns, int sources)
 // The loop controller. A slice is 256 of the 2H inputs [c; m], one 16-byte chunk (8 values) a lane.
 constexpr int kSlice = 256;
 constexpr int kJ = kLoopControllerMaxJobs, kR = kLoopControllerMaxRank;
-constexpr int kApplyRows = 64; // outputs d per apply block
+constexpr int kApplyRows = 32; // outputs d per apply block
+constexpr int kPartialRowGroups = 2; // phase 1 splits the R rows over this many blocks
 
 struct ControlArgs {
     const float* c[kJ];
@@ -188,20 +189,23 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
-// Phase 1, grid (T, slices, jobs): block (t, s, j) dots slice s of [c; m] (column t of job j) with every down row,
-// and sums its squares, into partial[((t * jobs + j) * slices + s) * (R + 1) + ...] (rows 0..R-1, then the squares).
+// Phase 1, grid (T, slices, jobs * kPartialRowGroups): block (t, s, j * kPartialRowGroups + g) dots slice s of [c; m]
+// (column t of job j) with down rows g * kR / kPartialRowGroups + (0 ..), and group 0 sums its squares, into
+// partial[((t * jobs + j) * slices + s) * (R + 1) + ...] (rows 0..R-1, then the squares).
 __global__ void __launch_bounds__(kThreads) control_partial_kernel(ControlArgs a, float* __restrict__ partial) {
     const std::int64_t t = blockIdx.x; // T on x: no 65535 cap
-    const int s = blockIdx.y, j = blockIdx.z, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int s = blockIdx.y, j = blockIdx.z / kPartialRowGroups, group = blockIdx.z % kPartialRowGroups;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const ControlJob job = control_job(a, j);
     const int h = a.hidden, rank = a.rank, half = a.slices / 2;
     const int k = s * kSlice + 8 * lane; // the lane's first input of [c; m]
     // The weight loads first (row r = warp + 8 i), then the inputs.
-    constexpr int kRowsPerWarp = kR / (kThreads / 32);
+    constexpr int kRowsPerWarp = kR / kPartialRowGroups / (kThreads / 32);
+    const int first_row = group * (kR / kPartialRowGroups);
     uint4 w[kRowsPerWarp];
 #pragma unroll
     for (int i = 0; i < kRowsPerWarp; ++i) {
-        const int r = warp + 8 * i;
+        const int r = first_row + warp + 8 * i;
         if (r < rank) { w[i] = __ldg(reinterpret_cast<const uint4*>(job.down + static_cast<std::int64_t>(r) * 2 * h + k)); }
     }
     const float* src = s < half ? job.c + t * job.cs + k : job.m + t * job.ms + (k - h);
@@ -210,7 +214,7 @@ __global__ void __launch_bounds__(kThreads) control_partial_kernel(ControlArgs a
     float* p = partial + ((t * a.jobs + j) * a.slices + s) * (rank + 1);
 #pragma unroll
     for (int i = 0; i < kRowsPerWarp; ++i) {
-        const int r = warp + 8 * i;
+        const int r = first_row + warp + 8 * i;
         if (r >= rank) { break; } // uniform per warp
         float wf[8];
         widen8(w[i], wf);
@@ -220,7 +224,7 @@ __global__ void __launch_bounds__(kThreads) control_partial_kernel(ControlArgs a
         dot = warp_sum(dot);
         if (lane == 0) { p[r] = dot; }
     }
-    if (warp == 0) {
+    if (group == 0 && warp == 0) {
         float ss = 0.0F;
 #pragma unroll
         for (int e = 0; e < 8; ++e) { ss = fmaf(x[e], x[e], ss); }
@@ -239,7 +243,7 @@ __global__ void __launch_bounds__(kThreads) control_apply_kernel(ControlArgs a, 
     const ControlJob job = control_job(a, j);
     const int h = a.hidden, rank = a.rank, half = a.slices / 2;
     const int octet = lane >> 3, chunk = lane & 7, which = octet & 1; // which: 0 gain, 1 forget
-    constexpr int kPasses = kApplyRows / (2 * kThreads / 32);         // 4: a warp's two outputs per pass
+    constexpr int kPasses = kApplyRows / (2 * kThreads / 32);         // 2: a warp takes two outputs a pass
     const __nv_bfloat16* rows = which == 0 ? job.gain : job.forget;
     uint4 w[kPasses];
 #pragma unroll
@@ -251,6 +255,7 @@ __global__ void __launch_bounds__(kThreads) control_apply_kernel(ControlArgs a, 
     const float* p = partial + (t * a.jobs + j) * a.slices * (rank + 1);
     if (threadIdx.x < rank) {
         float zc = 0.0F, zm = 0.0F, sc = 0.0F, sm = 0.0F;
+#pragma unroll 3
         for (int s = 0; s < half; ++s) {
             zc += p[s * (rank + 1) + threadIdx.x];
             sc += p[s * (rank + 1) + rank];
@@ -361,7 +366,7 @@ void loop_controller_fp32(std::span<const LoopControllerJob> jobs, float eps, De
     a.hidden = h, a.rank = rank, a.slices = 2 * h / kSlice, a.jobs = static_cast<int>(jobs.size()), a.eps = eps;
     const auto scope = workspace.scope();
     float* partial = static_cast<float*>(workspace.alloc_bytes(bytes - 256).data);
-    control_partial_kernel<<<dim3(cols, a.slices, a.jobs), kThreads, 0, stream>>>(a, partial);
+    control_partial_kernel<<<dim3(cols, a.slices, a.jobs * kPartialRowGroups), kThreads, 0, stream>>>(a, partial);
     check_launch();
     control_apply_kernel<<<dim3(cols, (h + kApplyRows - 1) / kApplyRows, a.jobs), kThreads, 0, stream>>>(a, partial);
     check_launch();
