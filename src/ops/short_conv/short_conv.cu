@@ -37,6 +37,12 @@ struct ConvArgs {
     std::int64_t rs[kShortConvMaxJobs];
     float* sum[kShortConvMaxJobs];
     std::int64_t ss[kShortConvMaxJobs];
+    // The combine of job 0 (x null there): entries [C, k * T], weights [k, T], combined [C, T] or null.
+    const float* entries;
+    const float* weights;
+    float* combined;
+    std::int64_t cs;
+    int top_k;
     int head_width, channels, cols;
     float scale;
 };
@@ -68,7 +74,17 @@ __global__ void __launch_bounds__(kThreads) conv_kernel(ConvArgs a) {
     for (int i = 0; i < K; ++i) { w[i] = taps[static_cast<std::int64_t>(c) * K + i]; }
     const int head = dyn != nullptr ? c / head_width : 0;
     for (int t = 0; t < cols; ++t) {
-        const float cur = x[t * xs + c];
+        float cur;
+        if (x != nullptr) {
+            cur = x[t * xs + c];
+        } else {
+            // moe_situ_experts' combine_kernel, the same FMAs in the same order.
+            cur = 0.0F;
+            for (int i = 0; i < a.top_k; ++i) {
+                cur = fmaf(a.weights[t * a.top_k + i], a.entries[(static_cast<std::int64_t>(t) * a.top_k + i) * channels + c], cur);
+            }
+            if (a.combined != nullptr) { a.combined[t * a.cs + c] = cur; }
+        }
         window[K - 1] = cur;
         float acc = cur;
         for (int lag = 0; lag < K; ++lag) {
@@ -93,10 +109,32 @@ void short_conv_fp32_batch(std::span<const ShortConvJob> jobs, int head_width, c
     bool dynamic = false;
     for (std::size_t j = 0; j < jobs.size(); ++j) {
         const ShortConvJob& job = jobs[j];
-        require(job.x != nullptr && job.taps != nullptr && job.history != nullptr, "a job's x, taps or history is null");
+        require((job.x != nullptr) != (job.combine != nullptr), "a job has x or a combine, one of them");
+        require(job.combine == nullptr || (j == 0 && jobs.size() == 1), "a combine is a one-job batch");
+        require(job.taps != nullptr && job.history != nullptr, "a job's taps or history is null");
+        Tensor combined_shape;
+        if (job.combine != nullptr) {
+            const ConvCombine& cb = *job.combine;
+            require(cb.entries != nullptr && cb.weights != nullptr, "a combine needs entries and weights");
+            const Tensor &e = *cb.entries, &w = *cb.weights;
+            require(w.data != nullptr && w.dtype == DType::FP32 && w.is_contiguous() && w.ne[2] == 1 && w.ne[3] == 1 && w.ne[1] > 0 &&
+                        w.ne[0] > 0,
+                    "combine weights must be FP32 [k, T]");
+            require(e.data != nullptr && e.dtype == DType::FP32 && e.is_contiguous() && e.ne[1] == w.ne[0] * w.ne[1] && e.ne[2] == 1 &&
+                        e.ne[3] == 1,
+                    "combine entries must be FP32 [C, k * T]");
+            a.entries = static_cast<const float*>(e.data);
+            a.weights = static_cast<const float*>(w.data);
+            a.top_k = w.ne[0];
+            combined_shape = Tensor(e.data, DType::FP32, {e.ne[0], w.ne[1]});
+            if (cb.x != nullptr) {
+                a.cs = column_stride(*cb.x, e.ne[0], w.ne[1], "combine x");
+                a.combined = static_cast<float*>(cb.x->data);
+            }
+        }
         require(job.out != nullptr || job.sum != nullptr, "a job writes neither out nor sum");
         require((job.residual == nullptr) == (job.sum == nullptr), "residual and sum come together");
-        const Tensor &x = *job.x, &taps = *job.taps;
+        const Tensor &x = job.x != nullptr ? *job.x : combined_shape, &taps = *job.taps;
         Tensor& history = *job.history;
         const std::int32_t channels = x.ne[0], cols = x.ne[1];
         require(channels > 0 && cols > 0, "empty input");
@@ -105,7 +143,7 @@ void short_conv_fp32_batch(std::span<const ShortConvJob> jobs, int head_width, c
         }
         require(channels == a.channels && cols == a.cols && taps.ne[0] == k && (job.dynamic != nullptr) == dynamic,
                 "every job must have the same C, T, K and dynamic-ness");
-        a.xs[j] = column_stride(x, channels, cols, "x");
+        if (job.x != nullptr) { a.xs[j] = column_stride(x, channels, cols, "x"); }
         if (job.out != nullptr) { a.os[j] = column_stride(*job.out, channels, cols, "out"); }
         if (job.sum != nullptr) {
             a.rs[j] = column_stride(*job.residual, channels, cols, "residual");
@@ -120,7 +158,7 @@ void short_conv_fp32_batch(std::span<const ShortConvJob> jobs, int head_width, c
             a.ds[j]  = column_stride(*job.dynamic, channels / head_width * k, cols, "dynamic");
             a.dyn[j] = static_cast<const float*>(job.dynamic->data);
         }
-        a.x[j]        = static_cast<const float*>(x.data);
+        a.x[j]        = job.x != nullptr ? static_cast<const float*>(x.data) : nullptr;
         a.taps[j]     = static_cast<const float*>(taps.data);
         a.history[j]  = static_cast<float*>(history.data);
         a.out[j]      = job.out != nullptr ? static_cast<float*>(job.out->data) : nullptr;

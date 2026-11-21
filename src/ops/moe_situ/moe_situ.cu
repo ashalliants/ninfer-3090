@@ -961,7 +961,7 @@ std::size_t moe_situ_experts_workspace_bytes(const SituExpertBank& bank, std::in
     return workspace_for(bank, entries);
 }
 
-void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor& ids, const Tensor& weights, float gate_cap, float up_cap,
+void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor& ids, const Tensor* weights, float gate_cap, float up_cap,
                       DeviceArena& workspace, Tensor& out, cudaStream_t stream) {
     const char* op = "moe_situ_experts";
     const BankArgs b = bank_args(bank);
@@ -969,15 +969,20 @@ void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor&
     const std::int64_t zs = column_stride(z, bank.hidden, cols, op, "z");
     require(ids.dtype == DType::I32 && ids.is_contiguous() && ids.ne[1] == cols, op, "ids must be contiguous I32 [k, T]");
     const int top_k = ids.ne[0];
-    require(weights.dtype == DType::FP32 && weights.is_contiguous() && weights.ne[0] == top_k && weights.ne[1] == cols, op,
-            "weights must be contiguous FP32 [k, T]");
-    require(out.dtype == DType::FP32 && out.is_contiguous() && out.ne[0] == bank.hidden && out.ne[1] == cols, op,
-            "out must be contiguous FP32 [H, T]");
+    require(weights == nullptr ||
+                (weights->dtype == DType::FP32 && weights->is_contiguous() && weights->ne[0] == top_k && weights->ne[1] == cols),
+            op, "weights must be contiguous FP32 [k, T]");
+    // Exactly rank 2: [H, T] with weights, [H, k * T] without (the entries' outputs are written there directly).
+    require(out.data != nullptr && out.dtype == DType::FP32 && out.is_contiguous() && out.ne[0] == bank.hidden &&
+                out.ne[1] == cols * (weights != nullptr ? 1 : top_k) && out.ne[2] == 1 && out.ne[3] == 1,
+            op, "out must be contiguous FP32 storage [H, T], or [H, k * T] without weights");
     require(gate_cap > 0.0F && up_cap > 0.0F, op, "caps must be positive");
     const int entries = top_k * cols;
     const auto scope = workspace.scope();
     float* act = static_cast<float*>(workspace.alloc_bytes(static_cast<std::size_t>(entries) * bank.intermediate * 4).data);
-    float* y = static_cast<float*>(workspace.alloc_bytes(static_cast<std::size_t>(entries) * bank.hidden * 4).data);
+    // Without weights the entries' outputs are the result: y is out and nothing combines them.
+    float* y = weights != nullptr ? static_cast<float*>(workspace.alloc_bytes(static_cast<std::size_t>(entries) * bank.hidden * 4).data)
+                                  : static_cast<float*>(out.data);
     const auto* id = static_cast<const std::int32_t*>(ids.data);
     const int gate_per_block = kWarps * gate_rows_per_warp(b), down_per_block = kWarps * down_rows_per_warp(b);
     const auto staged = [](int n, int columns = 1) {
@@ -1019,9 +1024,11 @@ void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor&
             down_grouped_bf16_kernel<<<dim3((bank.hidden + 2 * kWarps * kBf16Rows - 1) / (2 * kWarps * kBf16Rows), bank.experts), kThreads,
                                        ds, stream>>>(b, counts, offsets, order, act, y);
             check_launch(op);
-            combine_kernel<<<dim3(cols, (bank.hidden + 255) / 256), 256, 0, stream>>>(y, static_cast<const float*>(weights.data),
-                                                                                       bank.hidden, top_k, static_cast<float*>(out.data));
-            check_launch(op);
+            if (weights != nullptr) {
+                combine_kernel<<<dim3(cols, (bank.hidden + 255) / 256), 256, 0, stream>>>(y, static_cast<const float*>(weights->data), bank.hidden,
+                                                                                           top_k, static_cast<float*>(out.data));
+                check_launch(op);
+            }
             return;
         }
         const int gate_rows = kWarps * kGroupPlanes * kGateRows, down_rows = kWarps * kGroupPlanes * kDownRows;
@@ -1049,9 +1056,11 @@ void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor&
         default: down_grouped_kernel<4><<<dg, kThreads, ds, stream>>>(b, counts, offsets, order, act, y); break;
         }
         check_launch(op);
-        combine_kernel<<<dim3(cols, (bank.hidden + 255) / 256), 256, 0, stream>>>(y, static_cast<const float*>(weights.data), bank.hidden,
-                                                                                   top_k, static_cast<float*>(out.data));
-        check_launch(op);
+        if (weights != nullptr) {
+            combine_kernel<<<dim3(cols, (bank.hidden + 255) / 256), 256, 0, stream>>>(y, static_cast<const float*>(weights->data), bank.hidden,
+                                                                                       top_k, static_cast<float*>(out.data));
+            check_launch(op);
+        }
         return;
     }
     switch (gate_p) {
@@ -1066,9 +1075,11 @@ void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor&
     default: down_kernel<4><<<down_grid, kThreads, staged(bank.intermediate), stream>>>(b, id, act, y); break;
     }
     check_launch(op);
-    combine_kernel<<<dim3(cols, (bank.hidden + 255) / 256), 256, 0, stream>>>(y, static_cast<const float*>(weights.data), bank.hidden,
-                                                                               top_k, static_cast<float*>(out.data));
-    check_launch(op);
+    if (weights != nullptr) {
+        combine_kernel<<<dim3(cols, (bank.hidden + 255) / 256), 256, 0, stream>>>(y, static_cast<const float*>(weights->data), bank.hidden,
+                                                                                   top_k, static_cast<float*>(out.data));
+        check_launch(op);
+    }
 }
 
 } // namespace ninfer::ops
