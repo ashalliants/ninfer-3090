@@ -4,6 +4,7 @@
 // MoE-output streams (docs/maintainer/inkling2-model.md 3e, 3g and 3j), with its persistent history.
 
 #include "core/tensor.h"
+#include "ninfer/ops/column_sequences.h"
 
 #include <cuda_runtime.h>
 
@@ -63,7 +64,13 @@ inline constexpr int kShortConvMaxJobs = 4;
  * the same bits as its own call), each optionally fused with the residual add that follows it. Every job
  * has the same C, T, K and dynamic-ness (and head_width); sum must not overlap x, dynamic, history or out,
  * and no job's outputs may overlap another job's operands.
+ *
+ * With `columns` (batched decode, T at most kShortConvMaxColumnSequences): every column is its own sequence. Column t's
+ * window comes from its own history (each job's history plus slots[t] * slot_stride bytes), never from the
+ * column before it, and that history alone is replaced: the same FMAs as a one-column call over it. positions are not read.
  */
-void short_conv_fp32_batch(std::span<const ShortConvJob> jobs, int head_width, cudaStream_t stream);
+void short_conv_fp32_batch(std::span<const ShortConvJob> jobs, int head_width, cudaStream_t stream,
+                           const ColumnSequences* columns = nullptr);
+inline constexpr int kShortConvMaxColumnSequences = 63;
 
 } // namespace ninfer::ops

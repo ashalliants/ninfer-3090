@@ -10,12 +10,14 @@
 #include "core/tensor.h"
 #include "models/inkling2/model.h"
 #include "models/inkling2/program/dense_q8.h"
+#include "ninfer/ops/column_sequences.h"
 #include "ninfer/ops/projection_fp32.h"
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
 #include <functional>
+#include <stdexcept>
 #include <span>
 #include <string>
 #include <utility>
@@ -55,6 +57,11 @@ struct ProgramLimits {
     // ops::moe_situ_experts_tc and their attention on relative_bias_sink_attention's wide tensor-core route.
     // At least this much workspace (the vision tower encodes in it between forwards).
     std::size_t min_workspace_bytes = 0;
+    // Sequences the Program holds at once (batched decode): each slot has its own KV rings, convolution histories and
+    // position, max_context positions each. select() picks the slot the single-sequence calls below act on;
+    // forward_batch() decodes one token for each of several slots in one forward. The taps and the rollback state
+    // (max_rollback) are one copy, the selected slot's.
+    std::int32_t slots = 1;
     struct TensorCoreParts {
         bool dense = false, experts = false, attention = false;
         [[nodiscard]] bool any() const { return dense || experts || attention; }
@@ -63,6 +70,9 @@ struct ProgramLimits {
 };
 
 inline constexpr std::int32_t kTensorCoreMinColumns = 64;
+// The most slots forward_batch() takes at once: every column of a decode forward then keeps its one-column bits
+// (the split attention's limit, ops::kSplitMaxColumns; far below kTensorCoreMinColumns).
+inline constexpr std::int32_t kMaxBatchColumns = 8;
 
 // Columns [column, column + values.ne[1]) of a forward that take `values` as their input in place of their tokens'
 // normed embeddings: FP32 [hidden, n] on the device, columns contiguous (an image's embeddings; their tokens are
@@ -87,11 +97,28 @@ public:
 
     // Layer visit v's K and V rings (diagnostics): [kv_heads * head_dim, capacity], FP32 or FP16 (ProgramLimits::kv_fp16),
     // position p in column p % capacity.
-    [[nodiscard]] std::pair<Tensor, Tensor> kv_rings(std::uint32_t v) const { return {state_.at(v).k_cache, state_.at(v).v_cache}; }
+    [[nodiscard]] std::pair<Tensor, Tensor> kv_rings(std::uint32_t v) const {
+        const VisitState& s = state_[v < state_.size() ? v : throw std::out_of_range("inkling2: no such visit")];
+        return {s.k_cache, s.v_cache};
+    }
 
-    // Forgets the sequence: position 0, zero convolution histories (the KV rings need no clearing).
+    // Forgets the selected slot's sequence: position 0, zero convolution histories (the KV rings need no clearing).
     void reset();
     [[nodiscard]] std::int64_t position() const noexcept { return position_; }
+
+    // The slot (0 .. limits.slots - 1) that position(), reset(), save(), restore(), keep(), kv_rings() and forward()
+    // act on; 0 at construction. Switching drops what keep() could cut back.
+    void select(std::int32_t slot);
+    [[nodiscard]] std::int32_t selected() const noexcept { return slot_; }
+    [[nodiscard]] std::int32_t slots() const noexcept { return limits_.slots; }
+    [[nodiscard]] std::int64_t position_of(std::int32_t slot) const { return slot == slot_ ? position_ : positions_.at(static_cast<std::size_t>(slot)); }
+
+    // Batched decode: appends tokens[i] to slot slots[i]'s sequence for each i (1 to kMaxBatchColumns distinct
+    // slots) in one forward, and returns their logits: FP32 [vocab_size, B] on the device, column i slot slots[i]'s,
+    // each column the same bits as a forward() of that one token in that slot (the Ops keep every column's math its
+    // own: ops::ColumnSequences). Single-token graph forwards replay one CUDA graph per B (captured on first use; the
+    // slots, positions and tokens are read on the device). No taps; keep() cannot cut it back. Valid until the next call.
+    Tensor forward_batch(std::span<const std::int32_t> slots, std::span<const std::int32_t> tokens);
 
     // Tap i of the last forward: FP32 [hidden, T] on the device, valid until the next forward. Refused when that
     // forward ran with the taps off.
@@ -136,6 +163,8 @@ private:
 
     Tensor run(const Tensor& ids, std::int64_t start, const Trace* trace); // the forward after the token upload
     Tensor forward_graph(std::int32_t token);
+    // forward_batch's forward once its step table is on the device (columns_ set).
+    Tensor run_batch(std::int32_t cols);
     // Writes the visit's output into `next` (FP32 [H, T], not aliasing cur or blocks) and returns it.
     Tensor visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor>& blocks, const Tensor* messages, Tensor next, std::int64_t start,
                  const Trace* trace);
@@ -156,7 +185,14 @@ private:
     DeviceBuffer state_memory_;
     DeviceBuffer split_counters_; // the split attention's counters (ops::relative_bias_sink_attention), zero between calls
     DeviceArena workspace_;
-    std::vector<VisitState> state_;
+    // Every slot's visit states, slot s's at [s * num_layer_visits, (s + 1) * num_layer_visits); slot s's tensors sit
+    // slot_stride_ bytes after slot s - 1's. state_ views the selected slot's (slot 0's inside a batched forward,
+    // whose Ops add each column's offset).
+    std::vector<VisitState> all_state_;
+    std::span<VisitState> state_;
+    std::int64_t slot_stride_ = 0;
+    std::int32_t slot_ = 0;
+    std::vector<std::int64_t> positions_; // per slot; the selected slot's is position_ while it is selected
     std::int64_t position_ = 0;
     std::vector<Tensor> taps_;          // FP32 [hidden, max_chunk] each
     std::int32_t last_cols_ = 0;        // the last forward's T
@@ -173,6 +209,13 @@ private:
     Tensor graph_logits_[4];
     bool graph_split_ = true; // the graph in capture passes the split workspace (eager forwards always do)
     const std::int64_t* start_offset_ = nullptr;
+    // Batched decode: the step table {int64 positions[8], int32 tokens[8], int32 slots[8]} the Ops read, the columns
+    // view of it while a batched forward runs (null otherwise), and the graph and logits per B (index B - 1).
+    DeviceBuffer batch_step_;
+    ops::ColumnSequences batch_columns_;
+    const ops::ColumnSequences* columns_ = nullptr;
+    cudaGraphExec_t batch_graph_[kMaxBatchColumns] = {};
+    Tensor batch_logits_[kMaxBatchColumns];
 };
 
 } // namespace ninfer::models::inkling2

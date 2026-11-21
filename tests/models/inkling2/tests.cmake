@@ -28,3 +28,8 @@ ninfer_add_op_test(ninfer_inkling2_engine_test
 ninfer_add_op_test(ninfer_inkling2_engine_dspark_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dspark.cpp"
   LIBRARIES ninfer_engine ninfer_core)
+# Batched decode (TextProgram::forward_batch) against each request alone: staggered arrivals at 2, 4 and 8 in
+# flight, every logit byte-equal to the solo run's (real artifact; skips without it).
+ninfer_add_op_test(ninfer_inkling2_batch_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_batch.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_ops ninfer_core)

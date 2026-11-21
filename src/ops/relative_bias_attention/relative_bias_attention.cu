@@ -68,6 +68,10 @@ struct HeadArgs {
     std::int64_t cache_start[kHeadNormMaxJobs], capacity[kHeadNormMaxJobs], cache_rows[kHeadNormMaxJobs];
     const std::int64_t* cache_offset[kHeadNormMaxJobs];
     int count, total;
+    // Batched decode (ColumnSequences), or null: column t's position, and its rings at + slots[t] * slot_stride bytes.
+    const std::int64_t* col_pos;
+    const std::int32_t* col_slot;
+    std::int64_t slot_stride;
 };
 
 // The L2 clip of one head slice v (lane `lane` of its warp).
@@ -134,15 +138,18 @@ __device__ __forceinline__ void head_norm(const HeadArgs& a, int t, int g, int l
     if (kind == 2) {
         unit_rms_head(v, head_dim, eps, lane);
     } else {
-        const double pos = kind == 1 ? static_cast<double>(start + (offset != nullptr ? *offset : 0) + t) : 0.0;
+        const std::int64_t at = a.col_pos != nullptr ? a.col_pos[t] : start + (offset != nullptr ? *offset : 0) + t;
+        const double pos = kind == 1 ? static_cast<double>(at) : 0.0;
         clip_head(v, head_dim, scale != nullptr ? scale + static_cast<std::int64_t>(h) * head_dim : nullptr, threshold, kind == 1, pos,
                   floor, alpha, lane);
     }
     if (cache != nullptr) {
         // relative_bias_sink_attention's append: slot (start + offset + t) mod capacity of a [rows, capacity] ring.
         // Each lane reads back the values it wrote.
-        const std::int64_t first = cache_start + (cache_offset != nullptr ? *cache_offset : 0);
-        const std::int64_t at = ((first + t) % capacity) * cache_rows + static_cast<std::int64_t>(h) * head_dim;
+        const std::int64_t position =
+            a.col_pos != nullptr ? a.col_pos[t] : cache_start + (cache_offset != nullptr ? *cache_offset : 0) + t;
+        const std::int64_t at = (position % capacity) * cache_rows + static_cast<std::int64_t>(h) * head_dim;
+        if (a.col_slot != nullptr) { cache = static_cast<char*>(cache) + a.col_slot[t] * a.slot_stride; }
         if (fp16) {
             __half* copy = static_cast<__half*>(cache) + at;
             for (int d = lane; d < head_dim; d += 32) { copy[d] = __float2half_rn(v[d]); }
@@ -183,7 +190,21 @@ struct AttentionArgs {
     const std::int64_t* start_offset;
     float* split; // or null: [T, heads, splits, 2 + d] parts (attention_kernel<.., true>)
     int* counters; // with split: [T, heads] finished splits, zero between calls
+    // Batched decode (ColumnSequences), or null: column t's position, and its rings at + slots[t] * slot_stride bytes.
+    const std::int64_t* col_pos;
+    const std::int32_t* col_slot;
+    std::int64_t slot_stride;
 };
+
+// Column t's position (Columns: batched decode, from the ColumnSequences table).
+template <bool Columns>
+__device__ __forceinline__ std::int64_t column_position(const AttentionArgs& a, int t) {
+    if constexpr (Columns) {
+        return a.col_pos[t];
+    } else {
+        return a.start + (a.start_offset != nullptr ? *a.start_offset : 0) + t;
+    }
+}
 
 // The block's maximum (kMax) or sum of v; every thread gets it. `scratch` holds kWarps floats.
 template <bool kMax>
@@ -209,9 +230,9 @@ __device__ __forceinline__ void store_out(__nv_bfloat16* p, float v) { *p = __fl
 // The parts of column t's splits for head h in order, each weighted by e^{m_z - M} (M the largest m_z), then the
 // gate and the store; with one split that weight is 1 and the result the single-block kernel's bits. The parts were
 // written by other blocks of this grid: read them past L1.
-template <typename Out>
+template <typename Out, bool Columns>
 __device__ void combine_parts(const AttentionArgs& a, int t, int h, int splits) {
-    const std::int64_t pos = a.start + (a.start_offset != nullptr ? *a.start_offset : 0) + t;
+    const std::int64_t pos = column_position<Columns>(a, t);
     const std::int64_t lo  = a.window > 0 ? (pos - a.window + 1 > 0 ? pos - a.window + 1 : 0) : 0;
     const int used = static_cast<int>((pos - lo) / kSplitKeys) + 1;
     const float* parts = a.split + (static_cast<std::int64_t>(t) * a.heads + h) * splits * (kHeadDim + 2);
@@ -233,7 +254,7 @@ __device__ void combine_parts(const AttentionArgs& a, int t, int h, int splits) 
 
 // After a split block wrote its part: the last of column t's `used` non-empty splits to finish (head h) combines them
 // and resets the column's counter for the next call.
-template <typename Out>
+template <typename Out, bool Columns>
 __device__ void finish_split(const AttentionArgs& a, int t, int h, int used) {
     __shared__ int last;
     __threadfence(); // the part is visible before the count says so
@@ -246,17 +267,17 @@ __device__ void finish_split(const AttentionArgs& a, int t, int h, int used) {
     __syncthreads();
     if (last) {
         __threadfence();
-        combine_parts<Out>(a, t, h, static_cast<int>(gridDim.z));
+        combine_parts<Out, Columns>(a, t, h, static_cast<int>(gridDim.z));
     }
 }
 
 // The value of ring slot `slot` at row `col`.
 template <bool Fp16>
-__device__ __forceinline__ float value_at(const AttentionArgs& a, std::int64_t slot, std::int64_t col) {
+__device__ __forceinline__ float value_at(const AttentionArgs& a, const void* v, std::int64_t slot, std::int64_t col) {
     if constexpr (Fp16) {
-        return __half2float(static_cast<const __half*>(a.v)[slot * a.kv_width + col]);
+        return __half2float(static_cast<const __half*>(v)[slot * a.kv_width + col]);
     } else {
-        return static_cast<const float*>(a.v)[slot * a.kv_width + col];
+        return static_cast<const float*>(v)[slot * a.kv_width + col];
     }
 }
 
@@ -265,7 +286,7 @@ __device__ __forceinline__ float value_at(const AttentionArgs& a, std::int64_t s
 // keys does nothing. The last split block to finish combines the parts (finish_split). The keys of one split
 // are one tile, so a column of at most kSplitKeys keys folds them the same way either way.
 // Fp16: the rings hold FP16 values, widened to FP32 as they are read.
-template <typename Out, bool Fp16, bool Split>
+template <typename Out, bool Fp16, bool Split, bool Columns>
 __global__ void __launch_bounds__(kThreads) attention_kernel(AttentionArgs a) {
     __shared__ __align__(16) float q[kHeadDim]; // read as float4
     __shared__ float r[kMaxRel];
@@ -276,14 +297,29 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(AttentionArgs a) {
     q[threadIdx.x] = a.q[t * a.qs + static_cast<std::int64_t>(h) * kHeadDim + threadIdx.x];
     if (threadIdx.x < a.d_rel) { r[threadIdx.x] = a.r[t * a.rs + static_cast<std::int64_t>(h) * a.d_rel + threadIdx.x]; }
     __syncthreads();
-    const std::int64_t pos = a.start + (a.start_offset != nullptr ? *a.start_offset : 0) + t;
+    const std::int64_t pos = column_position<Columns>(a, t);
     const std::int64_t lo  = a.window > 0 ? (pos - a.window + 1 > 0 ? pos - a.window + 1 : 0) : 0;
+    // Batched decode: the column's own rings, and it splits only where its one-column call would (more than
+    // kSplitMinKeys visible keys); otherwise block z = 0 runs the single block's loop and store.
+    const void* k_ring = a.k;
+    const void* v_ring = a.v;
+    bool split = Split;
+    if constexpr (Columns) {
+        k_ring = static_cast<const char*>(a.k) + a.col_slot[t] * a.slot_stride;
+        v_ring = static_cast<const char*>(a.v) + a.col_slot[t] * a.slot_stride;
+    }
+    if (Split && Columns) {
+        std::int64_t seen = pos + 1 < a.capacity ? pos + 1 : a.capacity;
+        if (a.window > 0 && a.window < seen) { seen = a.window; }
+        split = seen > kSplitMinKeys;
+    }
     const float inv_sqrt_d = rsqrtf(static_cast<float>(kHeadDim));
     const int z = Split ? static_cast<int>(blockIdx.z) : 0;
+    if (Split && !split && z > 0) { return; }
     const std::int64_t first = lo + static_cast<std::int64_t>(z) * kSplitKeys;
-    const std::int64_t last  = Split ? (first + kSplitKeys - 1 < pos ? first + kSplitKeys - 1 : pos) : pos;
-    float* part_out = Split ? a.split + ((static_cast<std::int64_t>(t) * a.heads + h) * gridDim.z + z) * (kHeadDim + 2) : nullptr;
-    if (Split && first > pos) { return; } // past the column's keys: no part, not counted
+    const std::int64_t last  = split ? (first + kSplitKeys - 1 < pos ? first + kSplitKeys - 1 : pos) : pos;
+    float* part_out = split ? a.split + ((static_cast<std::int64_t>(t) * a.heads + h) * gridDim.z + z) * (kHeadDim + 2) : nullptr;
+    if (split && first > pos) { return; } // past the column's keys: no part, not counted
     float m     = z == 0 ? a.sink[t * a.ss + h] : -INFINITY;
     float denom = z == 0 ? 1.0F : 0.0F; // e^{sink - m}
     float acc   = 0.0F;
@@ -306,7 +342,7 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(AttentionArgs a) {
             slot -= slot >= a.capacity ? a.capacity : 0;
             float dot = 0.0F;
             if constexpr (Fp16) {
-                const uint2* key = reinterpret_cast<const uint2*>(static_cast<const __half*>(a.k) + slot * a.kv_width +
+                const uint2* key = reinterpret_cast<const uint2*>(static_cast<const __half*>(k_ring) + slot * a.kv_width +
                                                                   static_cast<std::int64_t>(g) * kHeadDim);
 #pragma unroll
                 for (int m = 0; m < kHeadDim / (4 * kKeyLanes); ++m) {
@@ -317,7 +353,7 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(AttentionArgs a) {
                     dot = fmaf(qv.x, lo.x, fmaf(qv.y, lo.y, fmaf(qv.z, hi.x, fmaf(qv.w, hi.y, dot))));
                 }
             } else {
-                const float4* key = reinterpret_cast<const float4*>(static_cast<const float*>(a.k) + slot * a.kv_width +
+                const float4* key = reinterpret_cast<const float4*>(static_cast<const float*>(k_ring) + slot * a.kv_width +
                                                                     static_cast<std::int64_t>(g) * kHeadDim);
 #pragma unroll
                 for (int m = 0; m < kHeadDim / (4 * kKeyLanes); ++m) {
@@ -354,23 +390,25 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(AttentionArgs a) {
             for (int u = 0; u < 4; ++u) {
                 std::int64_t slot = base_slot + i + u;
                 slot -= slot >= a.capacity ? a.capacity : 0;
-                part[u] = fmaf(scores[i + u], value_at<Fp16>(a, slot, col), part[u]);
+                part[u] = fmaf(scores[i + u], value_at<Fp16>(a, v_ring, slot, col), part[u]);
             }
         }
         for (; i < n; ++i) {
             std::int64_t slot = base_slot + i;
             slot -= slot >= a.capacity ? a.capacity : 0;
-            part[0] = fmaf(scores[i], value_at<Fp16>(a, slot, col), part[0]);
+            part[0] = fmaf(scores[i], value_at<Fp16>(a, v_ring, slot, col), part[0]);
         }
         acc = fmaf(acc, rescale, (part[0] + part[1]) + (part[2] + part[3]));
         m = top;
         __syncthreads();
     }
     if constexpr (Split) {
-        part_out[2 + threadIdx.x] = acc;
-        if (threadIdx.x == 0) { part_out[0] = m, part_out[1] = denom; }
-        finish_split<Out>(a, t, h, static_cast<int>((pos - lo) / kSplitKeys) + 1);
-        return;
+        if (split) {
+            part_out[2 + threadIdx.x] = acc;
+            if (threadIdx.x == 0) { part_out[0] = m, part_out[1] = denom; }
+            finish_split<Out, Columns>(a, t, h, static_cast<int>((pos - lo) / kSplitKeys) + 1);
+            return;
+        }
     }
     const std::int64_t at = static_cast<std::int64_t>(h) * kHeadDim + threadIdx.x;
     const float x = acc / denom;
@@ -734,10 +772,14 @@ void launch_flash(const AttentionArgs& a, int cols, int kv_heads, cudaStream_t s
 
 } // namespace
 
-void head_norms_fp32(std::span<const HeadNormJob> jobs, cudaStream_t stream) {
+void head_norms_fp32(std::span<const HeadNormJob> jobs, cudaStream_t stream, const ColumnSequences* columns) {
     const char* op = "head_norms_fp32";
     require(!jobs.empty() && jobs.size() <= static_cast<std::size_t>(kHeadNormMaxJobs), op, "1 to 4 jobs");
     HeadArgs a{};
+    if (columns != nullptr) {
+        require(columns->positions != nullptr && columns->slots != nullptr, op, "columns need positions and slots");
+        a.col_pos = columns->positions, a.col_slot = columns->slots, a.slot_stride = columns->slot_stride;
+    }
     a.count = static_cast<int>(jobs.size());
     std::int32_t cols = 0;
     std::int64_t heads_total = 0;
@@ -820,7 +862,8 @@ std::size_t relative_bias_attention_split_bytes(const RelativeBiasAttentionShape
 void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Tensor& q, const Tensor& r, const Tensor& sink,
                                   const Tensor* k_new, const Tensor* v_new, const Tensor& table, Tensor& k_cache, Tensor& v_cache,
                                   std::int64_t start, const std::int64_t* start_offset, const Tensor* gate, Tensor& out,
-                                  cudaStream_t stream, const Tensor* split_workspace, std::int32_t* split_counters, bool tiled) {
+                                  cudaStream_t stream, const Tensor* split_workspace, std::int32_t* split_counters, bool tiled,
+                                  const ColumnSequences* columns) {
     const char* op = "relative_bias_sink_attention";
     require(s.head_dim == kHeadDim, op, "head_dim must be 128");
     require(s.d_rel > 0 && s.d_rel <= kMaxRel, op, "d_rel must be 1..32");
@@ -885,11 +928,16 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     a.start_offset = start_offset;
     a.capacity = capacity;
     a.kv_width = kv_width;
+    if (columns != nullptr) {
+        require(columns->positions != nullptr && columns->slots != nullptr && cols <= kSplitMaxColumns && k_new == nullptr && !tiled, op,
+                "columns need positions and slots, at most kSplitMaxColumns columns, pre-appended rings and no tiled route");
+        a.col_pos = columns->positions, a.col_slot = columns->slots, a.slot_stride = columns->slot_stride;
+    }
     const dim3 grid(cols, s.heads);
     // A few columns over a long ring split their keys across blocks. The grid covers the most keys a column of this
     // call can see: with a host start, its last column's (at most start + T); with a device start, the ring's.
     std::int64_t keys = s.window > 0 ? std::min<std::int64_t>(capacity, s.window) : capacity;
-    if (start_offset == nullptr) { keys = std::min<std::int64_t>(keys, start + cols); }
+    if (start_offset == nullptr && columns == nullptr) { keys = std::min<std::int64_t>(keys, start + cols); }
     const int splits = static_cast<int>((keys + kSplitKeys - 1) / kSplitKeys);
     require((split_workspace == nullptr) == (split_counters == nullptr), op, "split_workspace and split_counters come together");
     if (split_workspace != nullptr && cols <= kSplitMaxColumns && keys > kSplitMinKeys) {
@@ -901,15 +949,15 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
         const dim3 parts(cols, s.heads, splits);
         if (out.dtype == DType::BF16) {
             if (fp16) {
-                attention_kernel<__nv_bfloat16, true, true><<<parts, kThreads, 0, stream>>>(a);
+                if (columns != nullptr) { attention_kernel<__nv_bfloat16, true, true, true><<<parts, kThreads, 0, stream>>>(a); } else { attention_kernel<__nv_bfloat16, true, true, false><<<parts, kThreads, 0, stream>>>(a); }
             } else {
-                attention_kernel<__nv_bfloat16, false, true><<<parts, kThreads, 0, stream>>>(a);
+                if (columns != nullptr) { attention_kernel<__nv_bfloat16, false, true, true><<<parts, kThreads, 0, stream>>>(a); } else { attention_kernel<__nv_bfloat16, false, true, false><<<parts, kThreads, 0, stream>>>(a); }
             }
         } else {
             if (fp16) {
-                attention_kernel<float, true, true><<<parts, kThreads, 0, stream>>>(a);
+                if (columns != nullptr) { attention_kernel<float, true, true, true><<<parts, kThreads, 0, stream>>>(a); } else { attention_kernel<float, true, true, false><<<parts, kThreads, 0, stream>>>(a); }
             } else {
-                attention_kernel<float, false, true><<<parts, kThreads, 0, stream>>>(a);
+                if (columns != nullptr) { attention_kernel<float, false, true, true><<<parts, kThreads, 0, stream>>>(a); } else { attention_kernel<float, false, true, false><<<parts, kThreads, 0, stream>>>(a); }
             }
         }
     } else if (tiled && cols > kSplitMaxColumns && fp16 && v_aligned && a.group == 3 && s.d_rel <= 16) {
@@ -933,15 +981,15 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
         }
     } else if (out.dtype == DType::BF16) {
         if (fp16) {
-            attention_kernel<__nv_bfloat16, true, false><<<grid, kThreads, 0, stream>>>(a);
+            if (columns != nullptr) { attention_kernel<__nv_bfloat16, true, false, true><<<grid, kThreads, 0, stream>>>(a); } else { attention_kernel<__nv_bfloat16, true, false, false><<<grid, kThreads, 0, stream>>>(a); }
         } else {
-            attention_kernel<__nv_bfloat16, false, false><<<grid, kThreads, 0, stream>>>(a);
+            if (columns != nullptr) { attention_kernel<__nv_bfloat16, false, false, true><<<grid, kThreads, 0, stream>>>(a); } else { attention_kernel<__nv_bfloat16, false, false, false><<<grid, kThreads, 0, stream>>>(a); }
         }
     } else {
         if (fp16) {
-            attention_kernel<float, true, false><<<grid, kThreads, 0, stream>>>(a);
+            if (columns != nullptr) { attention_kernel<float, true, false, true><<<grid, kThreads, 0, stream>>>(a); } else { attention_kernel<float, true, false, false><<<grid, kThreads, 0, stream>>>(a); }
         } else {
-            attention_kernel<float, false, false><<<grid, kThreads, 0, stream>>>(a);
+            if (columns != nullptr) { attention_kernel<float, false, false, true><<<grid, kThreads, 0, stream>>>(a); } else { attention_kernel<float, false, false, false><<<grid, kThreads, 0, stream>>>(a); }
         }
     }
     check_launch(op);
