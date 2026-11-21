@@ -427,8 +427,9 @@ void test_batches() {
 // Positions 0..n-1 through relative_bias_sink_attention in calls of `chunk`, against the oracle over the whole sequence.
 // With device_start each call passes start 0 and the position as the device offset (how a decode graph runs).
 // Only positions from check_from on are compared (the FP64 oracle is quadratic in n).
+// With split the calls get a split workspace (calls of at most kSplitMaxColumns columns split their keys).
 void test_attention(int window, int extent, int n, int chunk, const std::string& label, bool device_start = false,
-                    int check_from = 0) {
+                    int check_from = 0, bool split = false) {
     const int heads = 24, kvh = 8, d = 128, rel = 16, qw = heads * d, kvw = kvh * d;
     auto q = randoms(qw * n, -0.3F, 0.3F), r = randoms(heads * rel * n), sink = randoms(heads * n, -2, 2), k = randoms(kvw * n),
          v = randoms(kvw * n), table = randoms(extent * rel, -0.5, 0.5);
@@ -441,6 +442,14 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
     Tensor tkc2 = kc2.tensor({kvw, capacity}), tvc2 = vc2.tensor({kvw, capacity});
     ninfer::DeviceBuffer gated(static_cast<std::size_t>(qw) * n * 2), want_gated(static_cast<std::size_t>(qw) * n * 2);
     ninfer::DeviceBuffer doff(sizeof(std::int64_t));
+    const ninfer::ops::RelativeBiasAttentionShape split_shape{heads, kvh, d, rel, window};
+    const std::size_t split_bytes = split ? ninfer::ops::relative_bias_attention_split_bytes(split_shape, chunk, capacity) : 0;
+    Buf ws(std::max<std::size_t>(split_bytes / 4, 1));
+    const Tensor split_ws = ws.tensor({static_cast<std::int32_t>(std::max<std::size_t>(split_bytes / 4, 1))});
+    const Tensor* ws_arg = split_bytes > 0 ? &split_ws : nullptr;
+    ninfer::DeviceBuffer counters(std::size_t(ninfer::ops::kSplitMaxColumns) * heads * 4);
+    counters.fill(0);
+    auto* counters_arg = split_bytes > 0 ? static_cast<std::int32_t*>(counters.p) : nullptr;
     for (int s = 0; s < n; s += chunk) {
         const int len = std::min(chunk, n - s);
         const std::int64_t position = s;
@@ -454,7 +463,7 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
                                                   &kn, &vn,
                                                   dt.tensor({rel, extent}), tkc, tvc, device_start ? 0 : s,
                                                   device_start ? static_cast<const std::int64_t*>(doff.p) : nullptr, nullptr, to,
-                                                  nullptr);
+                                                  nullptr, ws_arg, counters_arg);
         Tensor tg = Tensor(gated.p, DType::BF16, {qw, n}).slice(1, s, len);
         const Tensor gate = dg.tensor({qw, n}).slice(1, s, len);
         ninfer::ops::relative_bias_sink_attention({heads, kvh, d, rel, window}, dq.tensor({qw, n}).slice(1, s, len),
@@ -462,7 +471,12 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
                                                   &kn, &vn,
                                                   dt.tensor({rel, extent}), tkc2, tvc2, device_start ? 0 : s,
                                                   device_start ? static_cast<const std::int64_t*>(doff.p) : nullptr, &gate, tg,
-                                                  nullptr);
+                                                  nullptr, ws_arg, counters_arg);
+    }
+    if (split_bytes > 0) {
+        std::vector<std::int32_t> left(std::size_t(ninfer::ops::kSplitMaxColumns) * heads);
+        counters.copy_to_host(left.data(), left.size() * 4);
+        check(std::all_of(left.begin(), left.end(), [](std::int32_t c) { return c == 0; }), label + ": the split counters are not left zero");
     }
     {
         // A gated BF16 out without storage is refused before the launch (the caches are not appended to).
@@ -1146,6 +1160,10 @@ int main() {
         test_attention(0, 1024, 1030, 515, "attention global, two key tiles (last 6 of 1030)", false, 1024);
         // Every key of a tile scored: one query sees 40 keys (16-key steps, a partial last one), all compared.
         test_attention(0, 64, 40, 40, "attention global, 40 keys in one call");
+        test_attention(0, 1024, 1300, 4, "attention global split, chunks of 4 (last 4)", false, 1296, true);
+        test_attention(0, 1024, 1300, 1, "attention global split, decode, device start (last 4)", true, 1296, true);
+        test_attention(1024, 1024, 1300, 4, "attention local window 1024 split, ring wraps (last 4)", false, 1296, true);
+        test_attention(0, 64, 200, 1, "attention global, 200 keys with the split workspace: the single block (last 8)", true, 192, true);
         test_head_norm_append();
         test_projection_inputs();
         test_route();

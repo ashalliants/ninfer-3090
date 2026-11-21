@@ -13,6 +13,7 @@
 
 #include "core/copy_batch.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <span>
@@ -34,7 +35,7 @@ void sync(cudaStream_t stream) {
 }
 
 // Every allocation one token costs in a forward call (persistent across visits and per visit), with slack.
-std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk) {
+std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk, std::int32_t max_context, bool split_attention) {
     const std::size_t h = c.hidden_size, q = std::size_t(c.heads) * c.head_dim, kv = std::size_t(c.kv_heads) * c.head_dim;
     const std::size_t per_visit_kept = 6 * h * 4; // ffn_inp, the output and a core visit's four loop messages
     const std::size_t per_visit_temp = 12 * h * 4 + 3 * h * 2 + (2 * q + std::size_t(c.heads) * (c.d_rel + 1)) * 4 +
@@ -47,7 +48,13 @@ std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk) {
     const std::size_t output = std::size_t(c.vocab_size) * 4 + 4 * h * 4;
     const std::size_t per_token = c.num_layer_visits * per_visit_kept + per_visit_temp + output;
     // Each allocation pads to 256 bytes; a visit makes about 60.
-    return per_token * static_cast<std::size_t>(chunk) + (c.num_layer_visits * 2 + 64) * kAlign * 4 + (64U << 20);
+    // The attention's split parts of a call of up to kSplitMaxColumns columns over the ring that shows the most keys
+    // (a global one of max_context, or a local window).
+    const ops::RelativeBiasAttentionShape global{i32(c.heads), i32(c.kv_heads), i32(c.head_dim), i32(c.d_rel), 0};
+    const std::int64_t keys = std::max<std::int64_t>(max_context, c.sliding_window);
+    const std::size_t split =
+        split_attention ? ops::relative_bias_attention_split_bytes(global, std::min(chunk, ops::kSplitMaxColumns), keys) : 0;
+    return per_token * static_cast<std::size_t>(chunk) + split + (c.num_layer_visits * 2 + 64) * kAlign * 4 + (64U << 20);
 }
 
 // The limits, validated before anything is sized from them.
@@ -65,7 +72,7 @@ ProgramLimits checked(ProgramLimits limits) {
 
 TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t stream)
     : model_(model), config_(model.config()), limits_(limits), stream_(stream),
-      workspace_(workspace_bytes(model.config(), checked(limits).max_chunk)) {
+      workspace_(workspace_bytes(model.config(), checked(limits).max_chunk, limits.max_context, limits.split_attention)) {
     const TextConfig& c = config_;
     const std::size_t kv = std::size_t(c.kv_heads) * c.head_dim, taps = c.conv_kernel_size - 1;
     const std::size_t local_cap = c.sliding_window - 1 + static_cast<std::size_t>(limits.max_chunk);
@@ -84,6 +91,10 @@ TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t 
         total += padded(std::size_t(c.hidden_size) * static_cast<std::size_t>(limits.max_chunk) * 4);
     }
     state_memory_ = DeviceBuffer(total);
+    if (limits.split_attention) {
+        split_counters_ = DeviceBuffer(std::size_t(ops::kSplitMaxColumns) * c.heads * 4);
+        split_counters_.fill(0);
+    }
     auto* base = static_cast<std::byte*>(state_memory_.p);
     std::size_t offset = 0;
     const auto carve = [&](std::int32_t rows, std::int32_t cols) {
@@ -449,8 +460,12 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     ops::RelativeBiasAttentionShape shape{heads, i32(c.kv_heads), d, i32(c.d_rel), local ? i32(c.sliding_window) : 0};
     const Tensor rel_bias = model_.tensor(w.rel_bias, {i32(c.d_rel), i32(c.rel_extent_of(p))});
     Tensor gated = workspace_.alloc(DType::BF16, {q, cols}); // the attention output times sigmoid(gate)
+    const std::size_t split_bytes =
+        limits_.split_attention && graph_split_ ? ops::relative_bias_attention_split_bytes(shape, cols, st.k_cache.ne[1]) : 0;
+    const Tensor split = split_bytes > 0 ? workspace_.alloc(DType::FP32, {i32(split_bytes / 4)}) : Tensor{};
     ops::relative_bias_sink_attention(shape, q_t, r_t, sink, nullptr, nullptr, rel_bias, st.k_cache, st.v_cache, start, start_offset_, &gate,
-                                      gated, stream_);
+                                      gated, stream_, split_bytes > 0 ? &split : nullptr,
+                                      split_bytes > 0 ? static_cast<std::int32_t*>(split_counters_.p) : nullptr);
     const WeightId ow[] = {w.output};
     const std::int32_t orows[] = {h};
     Tensor a_in = project(gated, ow, orows);
@@ -588,8 +603,10 @@ Tensor TextProgram::forward_graph(std::int32_t token) {
     if (cudaMemcpyAsync(step_.p, &host, sizeof host, cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
         throw std::runtime_error("inkling2: step upload failed");
     }
-    // The graph with the tap copies, or the one without (the same graph when there are no taps).
-    const std::size_t g     = taps_on_ && !taps_.empty() ? 1 : 0;
+    // The graph with the tap copies, or the one without (the same graph when there are no taps); with the split
+    // attention once the new column sees more than kSplitMinKeys keys (the graph's grid is sized for the whole ring).
+    const bool split        = limits_.split_attention && position_ + 1 > ops::kSplitMinKeys;
+    const std::size_t g     = (taps_on_ && !taps_.empty() ? 2 : 0) + (split ? 1 : 0);
     cudaGraphExec_t& exec   = decode_graph_[g];
     Tensor& graph_logits    = graph_logits_[g];
     if (exec == nullptr) {
@@ -599,9 +616,11 @@ Tensor TextProgram::forward_graph(std::int32_t token) {
             throw std::runtime_error("inkling2: cannot capture the decode graph");
         }
         start_offset_ = static_cast<const std::int64_t*>(step_.p);
+        graph_split_  = split;
         // Ends the capture and returns its graph; a graph handle is destroyed whatever the capture's result.
         const auto end_capture = [&]() -> cudaGraph_t {
             start_offset_ = nullptr;
+            graph_split_  = true;
             cudaGraph_t graph = nullptr;
             const cudaError_t ended = cudaStreamEndCapture(stream_, &graph);
             if (ended != cudaSuccess) {

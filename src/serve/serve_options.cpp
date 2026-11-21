@@ -244,7 +244,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--context-store-s3-upload-delay-seconds N]]] "
            "[--no-exit-on-engine-failure] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] [--dense-q8 head|all (lossy)] "
+           "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] [--dense-q8 head|all (lossy)] [--no-split-attention] "
            "[--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N]] "
            "[--ngram-draft-tokens 0|15] [--ngram-min-match N] [--adaptive-draft-tokens 0|3] "
            "[--relaxed-drafting [P]] [--draft-context-rows N] "
@@ -1028,6 +1028,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--dense-q8") {
             options.dense_q8 = parse_dense_q8(require_value("--dense-q8"));
+        } else if (arg == "--no-split-attention") {
+            options.split_attention = false;
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));

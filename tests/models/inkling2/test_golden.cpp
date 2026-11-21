@@ -36,6 +36,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <span>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -189,6 +190,104 @@ int main() {
             mean /= static_cast<double>(klds.size());
             std::printf("dense Q8 (%s) vs BF16 over %d tokens: KLD mean %.3e median %.3e p99 %.3e max %.3e; argmax agrees %d/%d (%.2f%%)\n",
                         limits.dense->form() == ink::DenseForm::Q8All ? "all" : "head", n, mean, sorted[sorted.size() / 2], sorted[sorted.size() * 99 / 100], sorted.back(), agree, n, 100.0 * agree / n);
+        }
+
+        // Measurements over a text of token ids (each runs only that, not the golden comparison):
+        // NINFER_INKLING2_ATTENTION_KLD=<ids>: the split decode attention against the single block, teacher-forced
+        //   through 8-token calls (the split form only differs in calls of at most 8 tokens) over [0, 2048),
+        //   [16384, 16896) and [29696, 30208), 256 at a time (not compared) elsewhere; KLD and argmax agreement per
+        //   context range.
+        // NINFER_INKLING2_DECODE_BENCH=<ids>: prefill (chunks of 256) and decode (64 single-token graph steps after
+        //   one untimed step) speed at contexts 1024, 16384 and the whole text less 65 (NINFER_INKLING2_BENCH_CONTEXT:
+        //   only that one); NINFER_INKLING2_SINGLE_BLOCK=1 measures the single-block attention.
+        const auto read_ids = [](const char* path) {
+            std::ifstream in(path);
+            std::vector<std::int32_t> ids;
+            for (std::int32_t id; in >> id;) { ids.push_back(id); }
+            return ids;
+        };
+        // KLD and argmax per range [0, 1024), [1024, 4096), [4096, 16384), [16384, n) of the compared positions.
+        const auto report_ranges = [](const char* label, const std::vector<double>& klds, const std::vector<int>& agrees,
+                                      const std::vector<char>& compared) {
+            const auto n = static_cast<std::int32_t>(klds.size());
+            const std::int32_t edges[] = {0, 1024, 4096, 16384, n};
+            for (std::size_t e = 0; e + 1 < std::size(edges) && edges[e] < n; ++e) {
+                std::vector<double> part;
+                int agree = 0;
+                double mean = 0;
+                for (std::int32_t i = edges[e]; i < std::min(edges[e + 1], n); ++i) {
+                    if (compared[static_cast<std::size_t>(i)] == 0) { continue; }
+                    part.push_back(klds[static_cast<std::size_t>(i)]);
+                    mean += part.back(), agree += agrees[static_cast<std::size_t>(i)];
+                }
+                if (part.empty()) { continue; }
+                std::sort(part.begin(), part.end());
+                const auto count = static_cast<int>(part.size());
+                std::printf("%s, positions [%d, %d): KLD mean %.3e median %.3e p99 %.3e max %.3e; argmax agrees %d/%d (%.2f%%)\n", label,
+                            edges[e], std::min(edges[e + 1], n), mean / count, part[part.size() / 2], part[part.size() * 99 / 100],
+                            part.back(), agree, count, 100.0 * agree / count);
+            }
+        };
+        if (const char* kld_ids = std::getenv("NINFER_INKLING2_ATTENTION_KLD"); kld_ids != nullptr) {
+            const auto text_ids = read_ids(kld_ids);
+            constexpr std::int32_t kChunk = 256;
+            const auto n = static_cast<std::int32_t>(text_ids.size());
+            ink::ProgramLimits limits{n + kChunk, kChunk};
+            limits.decode_graph = false;
+            limits.split_attention = false;
+            ink::TextProgram single(*model, limits, stream);
+            limits.split_attention = true;
+            ink::TextProgram split(*model, limits, stream);
+            const auto narrow = [](std::int32_t at) { return at < 2048 || (at >= 16384 && at < 16896) || (at >= 29696 && at < 30208); };
+            std::vector<double> klds;
+            std::vector<int> agrees;
+            std::vector<char> compared;
+            for (std::int32_t s = 0; s < n;) {
+                const std::int32_t len = std::min(narrow(s) ? 8 : kChunk, n - s);
+                const auto ids = std::span(text_ids).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(len));
+                const auto a = logit_columns(single.forward(ids), vocab);
+                const auto b = logit_columns(split.forward(ids), vocab);
+                for (std::int32_t t = 0; t < len; ++t) {
+                    klds.push_back(kld(a[t].data(), b[t].data(), vocab));
+                    agrees.push_back(argmax(a[t].data(), vocab) == argmax(b[t].data(), vocab) ? 1 : 0);
+                    compared.push_back(narrow(s) ? 1 : 0);
+                }
+                s += len;
+            }
+            report_ranges("split attention vs single block", klds, agrees, compared);
+            return 0;
+        }
+        if (const char* bench_ids = std::getenv("NINFER_INKLING2_DECODE_BENCH"); bench_ids != nullptr) {
+            const auto text_ids = read_ids(bench_ids);
+            constexpr std::int32_t kChunk = 256, kSteps = 64;
+            const auto n = static_cast<std::int32_t>(text_ids.size());
+            ink::ProgramLimits limits{n + kChunk, kChunk};
+            limits.split_attention = std::getenv("NINFER_INKLING2_SINGLE_BLOCK") == nullptr;
+            const char* form = limits.split_attention ? "split attention" : "single-block attention";
+            ink::TextProgram bench(*model, limits, stream);
+            const std::int32_t only = std::getenv("NINFER_INKLING2_BENCH_CONTEXT") ? std::atoi(std::getenv("NINFER_INKLING2_BENCH_CONTEXT")) : 0;
+            for (const std::int32_t context : {1024, 16384, n - kSteps - 1}) {
+                if (context > n - kSteps - 1 || (only > 0 && context != only)) { continue; }
+                bench.reset();
+                cudaStreamSynchronize(stream);
+                const auto p0 = std::chrono::steady_clock::now();
+                for (std::int32_t s = 0; s < context; s += kChunk) {
+                    const std::int32_t len = std::min(kChunk, context - s);
+                    bench.forward(std::span(text_ids).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(len)));
+                }
+                cudaStreamSynchronize(stream);
+                const auto p1 = std::chrono::steady_clock::now();
+                // One untimed step first: the decode graph is captured on the first single-token forward.
+                bench.forward(std::span(text_ids).subspan(static_cast<std::size_t>(context), 1));
+                cudaStreamSynchronize(stream);
+                const auto p1d = std::chrono::steady_clock::now();
+                for (std::int32_t i = 1; i <= kSteps; ++i) { bench.forward(std::span(text_ids).subspan(static_cast<std::size_t>(context + i), 1)); }
+                cudaStreamSynchronize(stream);
+                const auto p2 = std::chrono::steady_clock::now();
+                std::printf("%s, context %d: prefill %.1f tok/s, decode %.2f tok/s\n", form, context,
+                            context / std::chrono::duration<double>(p1 - p0).count(), kSteps / std::chrono::duration<double>(p2 - p1d).count());
+            }
+            return 0;
         }
 
         std::vector<std::int32_t> first_prompt;
