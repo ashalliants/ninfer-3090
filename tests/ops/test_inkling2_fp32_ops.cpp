@@ -688,6 +688,23 @@ void test_kv_fp16() {
                     compare(std::string("tensor-core attention over FP16 rings, 600 keys, window ") + std::to_string(window), out3.get(qw * n),
                             want3, 3e-3);
                 }
+                // A v_cache 8 bytes off a 16-byte boundary (FP16-aligned, not uint4-aligned): the flash route's
+                // vector value loads would fault or misread, so the call takes the tiled route, which loads each value.
+                ninfer::DeviceBuffer dv_off(vring.size() + 16);
+                char* const v_base = static_cast<char*>(dv_off.p) + 8;
+                check(cudaMemcpy(v_base, vring.data(), vring.size(), cudaMemcpyHostToDevice) == cudaSuccess, "offset ring upload");
+                Tensor tv_off(v_base, form, {slot_rows, n});
+                Buf out4(static_cast<std::size_t>(qw * n));
+                for (int s0 = 0; s0 < n; s0 += 200) {
+                    const int len = std::min(200, n - s0);
+                    Tensor to4 = out4.tensor({qw, n}).slice(1, s0, len);
+                    ninfer::ops::relative_bias_sink_attention({heads, kvh, d, rel, 0}, dq.tensor({qw, n}).slice(1, s0, len),
+                                                              dr.tensor({heads * rel, n}).slice(1, s0, len), ds.tensor({heads, n}).slice(1, s0, len),
+                                                              nullptr, nullptr, dt.tensor({rel, extent}), tk, tv_off, s0, nullptr, nullptr, to4,
+                                                              nullptr, nullptr, nullptr, true);
+                }
+                check(cudaDeviceSynchronize() == cudaSuccess, "wide attention over an unaligned v_cache ran");
+                compare("wide attention over FP16 rings with v_cache 8 bytes off 16, 600 keys", out4.get(qw * n), want, 3e-3);
             }
             {
                 const ninfer::ops::RelativeBiasAttentionShape shape{heads, kvh, d, rel, 0};

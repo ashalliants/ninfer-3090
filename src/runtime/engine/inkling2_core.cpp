@@ -340,7 +340,7 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         }
         // The widest chunk whose programs fit beside max_context (or --prefill-chunk's alone).
         std::vector<std::int32_t> chunks;
-        if (options_.prefill_chunk_explicit) {
+        if (!options_.prefill_chunk_auto) {
             chunks.push_back(static_cast<std::int32_t>(std::min<std::uint32_t>(options_.prefill_chunk, options_.max_context)));
         } else {
             for (const std::int32_t c : kChunks) {
@@ -380,7 +380,7 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     load_.weight_formats      = {"bf16", "ggml_q8_0", "ggml_rec_nvfp4_nvfp4", "fp32"};
     if (options_.dense_q8 != DenseQ8::Off) { load_.weight_formats.push_back("q8_g32_fp16 (re-encoded at load)"); }
     load_.prefill_signature   = options_.prefill_math == PrefillMath::FP32 ? "inkling2-fp32" : "inkling2-tc";
-    load_.notes.push_back("prefill | chunk " + std::to_string(chunk_) + (options_.prefill_chunk_explicit ? " (--prefill-chunk)" : " (widest that fits)") +
+    load_.notes.push_back("prefill | chunk " + std::to_string(chunk_) + (options_.prefill_chunk_auto ? " (widest that fits)" : " (--prefill-chunk)") +
                           " | " + (options_.prefill_math == PrefillMath::FP32 ? "FP32" : "tensor cores (--prefill-math fp32: the exact FP32 prefill)"));
     load_.takes_video         = false;
     load_.load_seconds        = seconds_between(start, Clock::now());

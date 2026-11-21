@@ -830,9 +830,9 @@ int main() {
                                   PrefillMath::TensorCores &&
                               make_engine_options(parse({"ninfer-serve", "model.ninfer"})).prefill_math == PrefillMath::Default,
                           "--prefill-math did not reach the Engine options");
-        failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--prefill-chunk", "512"})).prefill_chunk_explicit &&
-                              !make_engine_options(parse({"ninfer-serve", "model.ninfer"})).prefill_chunk_explicit,
-                          "--prefill-chunk was not marked as given");
+        failures += check(!make_engine_options(parse({"ninfer-serve", "model.ninfer", "--prefill-chunk", "512"})).prefill_chunk_auto &&
+                              make_engine_options(parse({"ninfer-serve", "model.ninfer"})).prefill_chunk_auto,
+                          "the auto chunk is on only when --prefill-chunk is omitted");
         bool refused = false;
         try {
             (void)parse({"ninfer-serve", "model.ninfer", "--prefill-math", "fp16"});

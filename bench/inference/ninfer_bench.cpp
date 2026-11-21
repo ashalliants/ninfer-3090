@@ -205,7 +205,6 @@ ninfer::EngineOptions engine_options_for(const ninfer::bench::BenchOptions& opti
     engine_options.kv_capacity =
         ninfer::KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(kv_capacity));
     engine_options.prefill_chunk                     = options.prefill_chunk;
-    engine_options.prefill_chunk_explicit            = true; // the chunk the report records is the one that runs
     engine_options.kv_cache                          = options.kv_cache;
     engine_options.context_cache.enabled             = false;
     engine_options.context_cache.device_state_slots  = 0;

@@ -98,6 +98,7 @@ int main() {
         ninfer::EngineOptions options;
         options.artifact_path = artifact_path;
         options.max_context   = 4096;
+        options.prefill_chunk_auto = true; // the widest chunk that fits, as the CLI and serve run without --prefill-chunk
         Run plain;
         std::vector<ninfer::TokenId> plain_budget, plain_stop;
         // Tight thinking budgets on every prompt: the forced close lands at many points of DSpark's rounds.
@@ -260,6 +261,7 @@ int main() {
         q8_plain.artifact_path = artifact_path;
         q8_plain.max_context   = 4096;
         q8_plain.dense_q8      = ninfer::DenseQ8::Head;
+        q8_plain.prefill_chunk_auto = true;
         auto q8_spec           = q8_plain;
         q8_spec.speculative.backend      = ninfer::SpeculativeBackend::DSpark;
         q8_spec.speculative.draft_tokens = drafts;

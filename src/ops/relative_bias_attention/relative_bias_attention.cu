@@ -856,6 +856,9 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     // Both paths read the caches (the pre-appended one, k_new = v_new = null, only reads them), so both need storage.
     require(k_cache.data != nullptr && v_cache.data != nullptr, op, "k_cache and v_cache need storage");
     require(reinterpret_cast<std::uintptr_t>(k_cache.data) % 16 == 0, op, "k_cache must be 16-byte aligned (vector key loads)");
+    // The flash route also loads values as uint4; a v_cache that is not 16-byte aligned takes the tiled route, which
+    // reads them one at a time.
+    const bool v_aligned = reinterpret_cast<std::uintptr_t>(v_cache.data) % 16 == 0;
     const std::int64_t capacity = k_cache.ne[1];
     require(s.window > 0 ? capacity >= s.window - 1 + cols : capacity >= start + cols, op, "the KV ring cannot hold the visible keys");
     require((k_new == nullptr) == (v_new == nullptr), op, "k_new and v_new come together");
@@ -909,7 +912,7 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
                 attention_kernel<float, false, true><<<parts, kThreads, 0, stream>>>(a);
             }
         }
-    } else if (tiled && cols > kSplitMaxColumns && fp16 && a.group == 3 && s.d_rel <= 16) {
+    } else if (tiled && cols > kSplitMaxColumns && fp16 && v_aligned && a.group == 3 && s.d_rel <= 16) {
         if (out.dtype == DType::BF16) {
             launch_flash<__nv_bfloat16>(a, cols, s.kv_heads, stream);
         } else {

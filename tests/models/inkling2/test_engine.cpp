@@ -103,6 +103,7 @@ int main() {
         options.artifact_path = artifact_path;
         options.max_context   = 4096;
         options.enable_vision = true;
+        options.prefill_chunk_auto = true; // the widest chunk that fits, as the CLI and serve run without --prefill-chunk
         options.max_concurrency = 4; // Inkling-2 runs one: the Engine reports what it runs
         {
             ninfer::EngineOptions unbounded   = options;
@@ -167,7 +168,7 @@ int main() {
             ninfer::EngineOptions chunked   = options;
             chunked.enable_vision           = false;
             chunked.prefill_chunk           = 512;
-            chunked.prefill_chunk_explicit  = true;
+            chunked.prefill_chunk_auto      = false; // a direct caller's chunk runs as set
             ninfer::Engine engine(chunked);
             check(chunk_of(engine) == 512, "--prefill-chunk 512 is the chunk that runs");
             const std::vector<ninfer::TokenId> base = engine.tokenize_text(facts_until(engine, 1100));
