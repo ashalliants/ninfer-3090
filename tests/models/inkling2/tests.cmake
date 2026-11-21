@@ -13,3 +13,8 @@ ninfer_add_op_test(ninfer_inkling2_dspark_test
 ninfer_add_op_test(ninfer_inkling2_vision_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision.cpp"
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_ops ninfer_core)
+# The frontend on the real artifact's tokenizer and chat template: prompts as llama.cpp tokenizes them, the output
+# decoder's channels, tool calls and stop strings, and refusals (no GPU; skips without the artifact).
+ninfer_add_op_test(ninfer_inkling2_frontend_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_frontend.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_artifact ninfer_media_decode ninfer_core)

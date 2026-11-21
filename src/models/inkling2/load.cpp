@@ -286,6 +286,14 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext&
         vision         = parse_vision_config(reader.directory().component("vision").config, config);
         vision_weights = bind_vision(bindings, *vision);
     }
+    const auto resource = [&](std::string_view role) {
+        const auto bytes = binder.host_object(binder.resource("text", role));
+        return std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    };
+    const Model::Resources resources{.tokenizer_json         = resource("tokenizer.json"),
+                                     .tokenizer_config_json  = resource("tokenizer_config.json"),
+                                     .chat_template_jinja    = resource("chat_template.jinja"),
+                                     .generation_config_json = resource("generation_config.json")};
     auto references     = std::move(bindings.references);
     auto plan           = std::move(binder).finish();
     auto backing        = artifact::materialize(*plan.source, std::move(plan), device, observer);
@@ -304,6 +312,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext&
     model->dspark_weights_ = std::move(dspark_weights);
     model->vision_config_  = std::move(vision);
     model->vision_weights_ = std::move(vision_weights);
+    model->resources_      = resources;
     return model;
 }
 
