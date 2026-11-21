@@ -151,7 +151,7 @@ public:
     PendingBatch(PendingBatch&& other) noexcept
         : owner_(std::exchange(other.owner_, nullptr)), transaction_(std::exchange(other.transaction_, 0)),
           token_(other.token_), timing_(std::exchange(other.timing_, {})),
-          constraint_failed_(other.constraint_failed_) {}
+          constraint_failed_(other.constraint_failed_), token_domain_failed_(other.token_domain_failed_) {}
     PendingBatch& operator=(PendingBatch&&)      = delete;
     PendingBatch(const PendingBatch&)            = delete;
     PendingBatch& operator=(const PendingBatch&) = delete;
@@ -162,7 +162,7 @@ public:
     [[nodiscard]] std::span<const std::int32_t> row_counts() const noexcept { return {}; }
     [[nodiscard]] std::uint32_t row_stride() const noexcept { return 1; }
     [[nodiscard]] bool constraint_failed(std::size_t) const noexcept { return constraint_failed_; }
-    [[nodiscard]] bool token_domain_failed(std::size_t) const noexcept { return false; }
+    [[nodiscard]] bool token_domain_failed(std::size_t) const noexcept { return token_domain_failed_; }
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
 
 private:
@@ -170,7 +170,8 @@ private:
     std::uint64_t transaction_ = 0;
     TokenId token_             = 0;
     runtime::ExecutionTiming timing_;
-    bool constraint_failed_ = false;
+    bool constraint_failed_   = false;
+    bool token_domain_failed_ = false; // a licensed logit was not finite: the request fails numerically
     friend class Program;
 };
 
@@ -379,7 +380,7 @@ private:
     // position's logits are then in `logits_`.
     void run_forward(std::size_t from, std::size_t to);
     // Downloads the logits and picks the next token under the lane's sampling and the grammar mask.
-    TokenId sample_next(runtime::TokenMaskProvider* masks, bool& constraint_failed);
+    TokenId sample_next(runtime::TokenMaskProvider* masks, bool& constraint_failed, bool& numerical_failure);
     [[nodiscard]] GenerationTimings timings() const;
 
     Forward& forward_;

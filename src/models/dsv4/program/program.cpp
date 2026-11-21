@@ -197,7 +197,7 @@ void Program::run_forward(std::size_t from, std::size_t to) {
     lane_.state_tokens = static_cast<std::uint32_t>(to);
 }
 
-TokenId Program::sample_next(runtime::TokenMaskProvider* masks, bool& constraint_failed) {
+TokenId Program::sample_next(runtime::TokenMaskProvider* masks, bool& constraint_failed, bool& numerical_failure) {
     // The forward's logits are the last call's (run() returns the same device tensor every time).
     if (logits_ == nullptr) { throw std::logic_error("dsv4 program: sampling before any forward call"); }
     cuda_ok(cudaMemcpyAsync(host_logits_.data(), logits_->data, host_logits_.size() * sizeof(float), cudaMemcpyDeviceToHost, device_.stream),
@@ -205,6 +205,7 @@ TokenId Program::sample_next(runtime::TokenMaskProvider* masks, bool& constraint
     cuda_ok(cudaStreamSynchronize(device_.stream), "logits sync");
     std::span<const std::uint32_t> mask;
     constraint_failed = false;
+    numerical_failure = false;
     if (masks != nullptr && masks->constrained(0)) {
         const std::uint32_t dead = masks->fill(0, {}, std::span<std::uint32_t>(mask_words_));
         masks->uploaded(0, mask_words_.size() * 4);
@@ -212,13 +213,18 @@ TokenId Program::sample_next(runtime::TokenMaskProvider* masks, bool& constraint
         mask              = mask_words_;
     }
     const TokenId token = sample_host(host_logits_, lane_.base->sampling, lane_.generated, mask, lane_.rng);
+    if (token == kNonFiniteLogit) {
+        numerical_failure = true; // the Engine ends the request with a numerical failure
+        return 0;
+    }
     if (token < 0) {
-        // No licensed token with a finite logit: a grammar dead end, or a numerical fault.
-        if (!mask.empty()) {
+        // Nothing licensed: a grammar dead end (without a mask every logit was -infinity: a fault).
+        if (mask.empty()) {
+            numerical_failure = true;
+        } else {
             constraint_failed = true;
-            return 0;
         }
-        throw std::runtime_error("dsv4 program: the logits hold no finite value");
+        return 0;
     }
     return token;
 }
@@ -239,8 +245,8 @@ PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::Execu
         run_forward(lane_.state_tokens, lane_.state_tokens + width);
         out.timing.device_wait_ns = elapsed_ns(wait);
         if (out.complete) {
-            bool failed       = false;
-            pending_token_    = sample_next(masks, failed);
+            bool failed = false, numerical = false;
+            pending_token_    = sample_next(masks, failed, numerical);
             pending_          = ++transaction_;
             lane_.phase       = Phase::Pending;
             PendingBatch batch;
@@ -248,6 +254,7 @@ PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::Execu
             batch.transaction_        = pending_;
             batch.token_              = pending_token_;
             batch.constraint_failed_  = failed;
+            batch.token_domain_failed_ = numerical;
             batch.timing_             = out.timing;
             out.pending.emplace(std::move(batch));
         }
@@ -278,8 +285,8 @@ PendingBatch Program::decode(std::span<const SequenceHandle> sequences, std::spa
         const auto wait = Clock::now();
         run_forward(lane_.state_tokens, lane_.state_tokens + 1); // the last committed token is the input
         timing.device_wait_ns = elapsed_ns(wait);
-        bool failed           = false;
-        pending_token_        = sample_next(masks, failed);
+        bool failed = false, numerical = false;
+        pending_token_        = sample_next(masks, failed, numerical);
         pending_              = ++transaction_;
         lane_.phase           = Phase::Pending;
         timing.submit_host_ns = elapsed_ns(start) - std::min(elapsed_ns(start), timing.device_wait_ns);
@@ -289,6 +296,7 @@ PendingBatch Program::decode(std::span<const SequenceHandle> sequences, std::spa
         batch.transaction_       = pending_;
         batch.token_             = pending_token_;
         batch.constraint_failed_ = failed;
+        batch.token_domain_failed_ = numerical;
         batch.timing_            = timing;
         return batch;
     } catch (...) {
@@ -346,7 +354,7 @@ CommitResult Program::commit(PendingBatch&& pending, std::span<const runtime::Co
     }
     if (decisions.size() != 1) { throw std::logic_error("DeepSeek-V4.1-Flash: commit decisions are not row aligned"); }
     const auto& d                = decisions[0];
-    const bool constraint_failed = pending.constraint_failed_;
+    const bool constraint_failed = pending.constraint_failed_ || pending.token_domain_failed_;
     pending.owner_               = nullptr;
     pending_                     = 0;
     CommitResult out;

@@ -70,12 +70,14 @@ ConstructedDsv4 construct_dsv4(const EngineOptions& options, DeviceContext& devi
     const std::uint64_t minimum_cache =
         dsv4_min_expert_cache_bytes(plan.expert_record_strides(), config.experts, wanted.prefill_chunk, config.experts_per_token);
     check_dsv4_host_fit(wanted.expert_cache_bytes, minimum_cache, host_memory_snapshot().available_physical);
-    {
+    const auto device_free = [] {
         std::size_t free_bytes = 0, total_bytes = 0;
-        if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) { check_dsv4_device_fit(dense, free_bytes); }
-    }
+        return cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess ? static_cast<std::uint64_t>(free_bytes) : std::uint64_t{0};
+    };
+    if (const std::uint64_t free_before = device_free(); free_before != 0) { check_dsv4_device_fit(dense, free_before); }
     auto model = models::dsv4::materialize_model(std::move(plan), device, &options.startup_observer);
     device.synchronize();
+    const std::uint64_t after_weights = device_free();
 
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<Dsv4Instance>(std::move(reader), std::move(model), options);
@@ -117,6 +119,9 @@ ConstructedDsv4 construct_dsv4(const EngineOptions& options, DeviceContext& devi
     resolution.maximum_main_page_groups = resolution.main_page_groups;
     resolution.resolved_tokens       = options.max_context;
     resolution.runtime_reservation_bytes = instance->forward->device_bytes();
+    resolution.available_after_weights_bytes = after_weights;
+    resolution.available_after_startup_bytes = device_free();
+    resolution.planned_slack_bytes = after_weights > resolution.runtime_reservation_bytes ? after_weights - resolution.runtime_reservation_bytes : 0;
 
     const auto& stats = instance->model->storage_stats();
     LoadSummary summary;

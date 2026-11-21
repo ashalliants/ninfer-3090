@@ -33,7 +33,13 @@ using TokenCounts = std::unordered_map<std::int32_t, std::uint32_t>;
     return (static_cast<std::uint64_t>(device()) << 32) ^ device();
 }
 
-// Returns the chosen token, or -1 when no token is licensed (an empty mask, or no finite logit).
+// sample_host's two failures: no token is licensed, and a licensed logit is NaN or +infinity (the row is
+// corrupt: the request fails with a numerical error rather than continuing on a partly corrupt row).
+inline constexpr std::int32_t kNoLicensedToken = -1;
+inline constexpr std::int32_t kNonFiniteLogit  = -2;
+
+// Returns the chosen token, kNoLicensedToken when nothing is licensed (an empty mask, or every licensed
+// logit is -infinity), or kNonFiniteLogit when any licensed logit is NaN or +infinity.
 // `logits` holds the public vocabulary; `mask` is empty (no constraint) or ceil(size / 32) words.
 [[nodiscard]] inline std::int32_t sample_host(std::span<const float> logits, const ResolvedSamplingParameters& sampling,
                                               const TokenCounts& generated, std::span<const std::uint32_t> mask,
@@ -43,7 +49,15 @@ using TokenCounts = std::unordered_map<std::int32_t, std::uint32_t>;
         return mask.empty() || ((v >> 5U) < mask.size() && ((mask[v >> 5U] >> (v & 31U)) & 1U) != 0);
     };
     std::vector<float> value(logits.size());
-    for (std::size_t v = 0; v < logits.size(); ++v) { value[v] = allowed(v) && std::isfinite(logits[v]) ? logits[v] : kNegInf; }
+    for (std::size_t v = 0; v < logits.size(); ++v) {
+        if (!allowed(v)) {
+            value[v] = kNegInf;
+        } else if (std::isnan(logits[v]) || logits[v] == std::numeric_limits<float>::infinity()) {
+            return kNonFiniteLogit;
+        } else {
+            value[v] = logits[v];
+        }
+    }
     if (sampling.presence_penalty != 0.0F || sampling.frequency_penalty != 0.0F) {
         for (const auto& [token, count] : generated) {
             if (token < 0 || static_cast<std::size_t>(token) >= value.size() || value[token] == kNegInf) { continue; }
@@ -55,7 +69,8 @@ using TokenCounts = std::unordered_map<std::int32_t, std::uint32_t>;
     for (std::size_t v = 0; v < value.size(); ++v) {
         if (value[v] != kNegInf && (best < 0 || value[v] > value[best])) { best = static_cast<std::int32_t>(v); }
     }
-    if (best < 0 || sampling.temperature <= 0.0F) { return best; }
+    if (best < 0) { return kNoLicensedToken; }
+    if (sampling.temperature <= 0.0F) { return best; }
 
     std::vector<std::int32_t> order;
     order.reserve(value.size());

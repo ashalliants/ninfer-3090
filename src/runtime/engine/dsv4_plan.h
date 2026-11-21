@@ -61,6 +61,25 @@ inline Dsv4Plan plan_dsv4_options(const EngineOptions& options) {
     };
     const FlashNextOptions& next = options.flash_next;
     const FlashNextOptions unset{};
+    const PrefillScheduleOptions schedule{};
+    const EngineOptions defaults{};
+    note(options.devices.size() > 1 || !options.stage_layers.empty(), "--devices / --stage-layers (one device only)");
+    note(options.prefill_schedule.stall_budget_ms != schedule.stall_budget_ms ||
+             options.prefill_schedule.yield_remaining_ms != schedule.yield_remaining_ms ||
+             options.prefill_schedule.decode_share_percent != schedule.decode_share_percent ||
+             options.prefill_schedule.order != schedule.order,
+         "the --prefill-stall-budget-ms, --prefill-yield-remaining-ms, --prefill-decode-share and --prefill-order options");
+    note(options.context_cache.host_pause_reserve_bytes != 0 || options.context_cache.host_cache_percent.has_value() ||
+             options.context_cache.host_cache_max_bytes.has_value() ||
+             options.context_cache.host_cache_reserve_bytes != defaults.context_cache.host_cache_reserve_bytes,
+         "the host context cache sizing options");
+    note(options.lm_head_q4 || options.lm_head_q6 || options.embedding_q4 || options.embedding_q6 || options.mtp_experts_q4 ||
+             options.gdn_state_fp16,
+         "the load-time weight and state trades (--lm-head-q4, --embedding-q4, ...)");
+    note(options.draft_context_rows != 0, "--draft-context-rows");
+    note(options.scoring_decode_window != 0, "--scoring-decode-window");
+    note(options.vision_residency != defaults.vision_residency || options.vision_max_merged_tokens != defaults.vision_max_merged_tokens,
+         "the vision options");
     note(options.kv_cache != KvCacheStorage::BFloat16, "--kv-dtype");
     note(options.kv_capacity.mode != KvCapacityMode::Explicit || options.kv_capacity.explicit_tokens != options.max_context,
          "--kv-capacity (the context is --max-context)");

@@ -738,6 +738,7 @@ private:
         options.context_cache.auto_host_cache     = false;
         options.context_cache.host_capacity_bytes = 0;
         options.context_cache.enabled             = false;
+        options.context_cache.device_state_slots  = 0U; // no state images: the lane's own state is the Forward's
         auto context_cost = runtime::resolve_context_machine_cost(
             {.hardware_class    = runtime::context_cost_hardware_class(device.props.name, device.props.major,
                                                                        device.props.minor),

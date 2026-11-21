@@ -660,8 +660,10 @@ prepare_context_cache(ContextCacheHints hints, std::size_t message_count,
 ModelSamplingDefaults default_sampling(Architecture architecture) {
     ModelSamplingDefaults sampling;
     if (architecture == Architecture::Dsv4) {
-        // DeepSeek's recommendation for V4: temperature 1.0 over the whole distribution, no penalties.
-        sampling.thinking     = {.temperature = 1.0F, .top_k = 0, .top_p = 1.0F};
+        // DeepSeek's recommendation for V4: temperature 1.0, no nucleus cut, no penalties. The sampling
+        // pipeline's candidate domain is the best 20 tokens (resolve_sampling turns top_k 0 into 20), so
+        // that is stated here rather than implied.
+        sampling.thinking     = {.temperature = 1.0F, .top_k = 20, .top_p = 1.0F};
         sampling.non_thinking = sampling.thinking;
         return sampling;
     }

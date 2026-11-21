@@ -11,6 +11,7 @@
 #include <array>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <random>
 #include <stdexcept>
@@ -98,6 +99,18 @@ void options_refusals() {
     EngineOptions graphs = valid();
     graphs.use_cuda_graph = false;
     check(names(refusal([&] { (void)plan_dsv4_options(graphs); }), "--no-cuda-graph"), "--no-cuda-graph is refused");
+    EngineOptions pipeline = valid();
+    pipeline.devices       = {0, 1};
+    check(names(refusal([&] { (void)plan_dsv4_options(pipeline); }), "--devices"), "a device pipeline is refused");
+    EngineOptions stall = valid();
+    stall.prefill_schedule.stall_budget_ms = 50;
+    check(names(refusal([&] { (void)plan_dsv4_options(stall); }), "--prefill-stall-budget-ms"), "prefill stall options are refused");
+    EngineOptions trades = valid();
+    trades.lm_head_q4    = true;
+    check(names(refusal([&] { (void)plan_dsv4_options(trades); }), "--lm-head-q4"), "weight trades are refused");
+    EngineOptions reserve = valid();
+    reserve.context_cache.host_pause_reserve_bytes = 1;
+    check(names(refusal([&] { (void)plan_dsv4_options(reserve); }), "host context cache"), "host cache sizing options are refused");
     EngineOptions flash = valid();
     flash.flash_next.hc_int8 = true;
     flash.flash_next.ngram_keepalive_ms_set = true;
@@ -147,7 +160,15 @@ void greedy_selection() {
     const std::array<std::uint32_t, 1> mask{(1U << 1) | (1U << 3) | (1U << 4)};
     check(sample_host(logits, greedy, {}, mask, rng) == 3, "the grammar mask excludes unlicensed tokens");
     const std::array<std::uint32_t, 1> none{0};
-    check(sample_host(logits, greedy, {}, none, rng) == -1, "an empty mask licenses nothing");
+    check(sample_host(logits, greedy, {}, none, rng) == ninfer::models::dsv4::kNoLicensedToken, "an empty mask licenses nothing");
+    // A corrupt licensed logit fails the row; the same value under the mask does not matter.
+    auto bad = logits;
+    bad[1]   = std::numeric_limits<float>::quiet_NaN();
+    check(sample_host(bad, greedy, {}, {}, rng) == ninfer::models::dsv4::kNonFiniteLogit, "a NaN logit is a numerical failure");
+    bad[1] = std::numeric_limits<float>::infinity();
+    check(sample_host(bad, greedy, {}, {}, rng) == ninfer::models::dsv4::kNonFiniteLogit, "a +inf logit is a numerical failure");
+    const std::array<std::uint32_t, 1> without_one{~(1U << 1)};
+    check(sample_host(bad, greedy, {}, without_one, rng) == 2, "a corrupt logit the grammar excludes is ignored");
     TokenCounts generated{{2, 3}};
     ResolvedSamplingParameters penalised = greedy;
     penalised.frequency_penalty          = 2.0F;
