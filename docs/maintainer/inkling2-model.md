@@ -342,7 +342,7 @@ compact, lossy forms:
 - the block's projections with K up to 3072 (all but the MLP's down) as BF16 activations into
   `ops::projection_q8_fp32` over the artifact's Q8_0 values, and the joint (BF16) through `ops::projection_fp32`.
 
-Measured (`ninfer_inkling2_dspark_test`, 3 drafts, 128 tokens on the four golden prompts; V100):
+Measured (`ninfer_inkling2_dspark_test` at its defaults, 3 drafts and 128 tokens on the four golden prompts; `NINFER_INKLING2_SPEC_DRAFTS=all` drafts the whole block; V100):
 
 | Drafter | draft ms a round | drafts accepted a round (p0 / p1 / p2 / p3) | speculative tok/s |
 |---|---|---|---|
