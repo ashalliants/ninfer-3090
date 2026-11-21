@@ -559,6 +559,29 @@ void test_route() {
         Tensor shifted = tzn;
         shifted.data   = static_cast<float*>(zn.b.p) + 1; // one element into z: never read, the Op refuses first
         check(route_refuses(tzn, {&tg, 1e-6F, &shifted}), "moe_route_sigmoid_topk takes a normalized z overlapping z");
+        if (experts >= cols) { // the router's first columns as the normalized z (never written: the Op refuses first)
+            Tensor on_router = drt.tensor({rows, experts}).slice(1, 0, cols);
+            check(route_refuses(dx.tensor({rows, cols}), {&tg, 1e-6F, &on_router}), "moe_route_sigmoid_topk takes a normalized z on the router");
+        }
+        {
+            // z and the normalized z interleaved in one allocation, column by column: their bounding spans overlap but
+            // no byte is shared, so the Op runs, and routes as with separate buffers.
+            Buf both(static_cast<std::size_t>(2 * rows) * cols);
+            check(cudaMemcpy2D(both.b.p, static_cast<std::size_t>(2 * rows) * 4, dx.b.p, static_cast<std::size_t>(rows) * 4,
+                               static_cast<std::size_t>(rows) * 4, cols, cudaMemcpyDeviceToDevice) == cudaSuccess,
+                  "interleave z");
+            const Tensor whole = both.tensor({2 * rows, cols});
+            Tensor zi = whole.slice(0, 0, rows), zo = whole.slice(0, rows, rows);
+            const ninfer::ops::RouteInputNorm interleaved{&tg, 1e-6F, &zo};
+            bool ran = true;
+            try {
+                ninfer::ops::moe_route_sigmoid_topk(zi, &interleaved, drt.tensor({rows, experts}), dbs.tensor({experts}), kk, 8.0F, arena2,
+                                                    ti2, tw2, nullptr);
+            } catch (const std::invalid_argument&) { ran = false; }
+            const bool same = ran && std::memcmp(w2.get(kk * cols).data(), w3.get(kk * cols).data(), static_cast<std::size_t>(kk) * cols * 4) == 0 &&
+                              t::from_device<std::int32_t>(ids2.b, kk * cols) == t::from_device<std::int32_t>(ids3.b, kk * cols);
+            check(same, "moe_route_sigmoid_topk refuses or misroutes a normalized z interleaved with z");
+        }
         std::printf("moe_route_sigmoid_topk D %d E %d with the input norm: the bits of rmsnorm_fp32, then routing\n", rows, experts);
     }
 

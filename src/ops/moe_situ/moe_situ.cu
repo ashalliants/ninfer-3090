@@ -37,20 +37,44 @@ std::int64_t column_stride(const Tensor& t, std::int32_t rows, std::int32_t cols
     return cols == 1 ? rows : t.nb[1] / 4;
 }
 
-// The bytes a tensor's elements span, from its first to one past its last (its strides, not its padding at the end).
-std::pair<std::uintptr_t, std::uintptr_t> byte_span(const Tensor& t) {
-    const auto begin = reinterpret_cast<std::uintptr_t>(t.data);
-    std::uintptr_t last = begin;
-    for (int d = 0; d < 4; ++d) {
-        if (t.ne[d] > 1) { last += static_cast<std::uintptr_t>(t.ne[d] - 1) * static_cast<std::uintptr_t>(t.nb[d]); }
+// The bytes a tensor holds, as `count` intervals of `length` bytes `stride` apart: a 2-D tensor's columns (their
+// padding between is not held), or one interval for a contiguous tensor. Any other layout is taken as its whole span.
+struct Intervals {
+    std::int64_t base = 0, length = 0, stride = 0, count = 1;
+};
+
+Intervals intervals_of(const Tensor& t) {
+    const auto base = static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(t.data));
+    const auto size = static_cast<std::int64_t>(dtype_size(t.dtype));
+    if (t.is_contiguous()) { return {base, t.numel() * size, 0, 1}; }
+    if (t.ne[2] == 1 && t.ne[3] == 1 && t.nb[0] == size) {
+        return {base, std::int64_t{t.ne[0]} * size, t.nb[1], t.ne[1]};
     }
-    return {begin, last + dtype_size(t.dtype)};
+    std::int64_t last = base;
+    for (int d = 0; d < 4; ++d) {
+        if (t.ne[d] > 1) { last += std::int64_t{t.ne[d] - 1} * t.nb[d]; }
+    }
+    return {base, last + size - base, 0, 1};
 }
 
-bool overlaps(const Tensor& a, const Tensor& b) {
-    const auto [a0, a1] = byte_span(a);
-    const auto [b0, b1] = byte_span(b);
-    return a0 < b1 && b0 < a1;
+std::int64_t floor_div(std::int64_t a, std::int64_t b) { return a / b - ((a % b != 0) && ((a < 0) != (b < 0)) ? 1 : 0); }
+
+// Whether some byte is held by both: per interval of the one with fewer, the other's intervals k with
+// base + k * stride < end and base + k * stride + length > begin.
+bool overlaps(const Tensor& x, const Tensor& y) {
+    Intervals a = intervals_of(x), b = intervals_of(y);
+    if (a.count > b.count) { std::swap(a, b); }
+    for (std::int64_t j = 0; j < a.count; ++j) {
+        const std::int64_t begin = a.base + j * a.stride, end = begin + a.length;
+        if (b.count == 1 || b.stride == 0) {
+            if (begin < b.base + (b.count - 1) * b.stride + b.length && b.base < end) { return true; }
+            continue;
+        }
+        const std::int64_t k_min = std::max<std::int64_t>(0, floor_div(begin - b.length - b.base, b.stride) + 1);
+        const std::int64_t k_max = std::min<std::int64_t>(b.count - 1, floor_div(end - b.base - 1, b.stride));
+        if (k_min <= k_max) { return true; }
+    }
+    return false;
 }
 
 __device__ float warp_sum(float v) {
@@ -912,9 +936,11 @@ void moe_route_sigmoid_topk(const Tensor& z, const RouteInputNorm* norm, const T
         require(norm->eps > 0.0F, op, "eps must be positive");
         require(norm->z != nullptr, op, "the normalized z is missing");
         const std::int64_t norm_stride = column_stride(*norm->z, rows, cols, op, "the normalized z");
-        // The score blocks read z while others write the normalized z, and the selection writes ids and weights.
-        require(!overlaps(*norm->z, z) && !overlaps(*norm->z, ids) && !overlaps(*norm->z, weights), op,
-                "the normalized z must not overlap z, ids or weights");
+        // The score blocks read z, the router and the norm weight while others write the normalized z; the selection
+        // reads the bias and writes ids and weights.
+        for (const Tensor* other : std::initializer_list<const Tensor*>{&z, &router, &bias, norm->weight, &ids, &weights}) {
+            require(!overlaps(*norm->z, *other), op, "the normalized z must not overlap z, router, bias, the norm weight, ids or weights");
+        }
         const RouteNorm n{static_cast<const float*>(norm->weight->data), norm->eps, static_cast<float*>(norm->z->data),
                           norm_stride};
         route_score_kernel<true><<<dim3(cols, experts), kScoreThreads, 0, stream>>>(
