@@ -166,4 +166,8 @@ private:
     std::shared_ptr<Impl> impl_;
 };
 
+// Whether the model in `artifact` takes video input once loaded with vision (LoadSummary::takes_video), read from
+// the artifact without loading it, for discovery that answers before a load. False for Inkling-2.
+[[nodiscard]] bool artifact_takes_video(const std::filesystem::path& artifact) noexcept;
+
 } // namespace ninfer

@@ -255,12 +255,12 @@ Json model_json(const ModelDescription& model, std::int64_t created) {
     // configured context limit.
     //
     // Modalities follow the OpenRouter `architecture` object, which llama.cpp's router-mode
-    // /models also emits: clients that gate image attachments on it see image and video input only
-    // when the server was started with --vision.
+    // /models also emits: clients that gate image attachments on it see image input only when the
+    // server was started with --vision, and video too when the model takes it (not Inkling-2).
     Json input = Json::array({"text"});
     if (model.vision) {
         input.push_back("image");
-        input.push_back("video");
+        if (model.video) { input.push_back("video"); }
     }
     return Json{{"id", model.id},
                 {"object", "model"},

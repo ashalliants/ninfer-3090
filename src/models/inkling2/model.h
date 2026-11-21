@@ -17,6 +17,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::models::inkling2 {
@@ -97,6 +98,11 @@ public:
     // The DSpark drafter, when the artifact has one (null otherwise).
     [[nodiscard]] const DSparkConfig* dspark_config() const noexcept { return dspark_config_ ? &*dspark_config_ : nullptr; }
     [[nodiscard]] const DSparkWeights& dspark_weights() const noexcept { return dspark_weights_; }
+    // The text component's tokenizer and chat files (host bytes, valid while the Model lives).
+    struct Resources {
+        std::string_view tokenizer_json, tokenizer_config_json, chat_template_jinja, generation_config_json;
+    };
+    [[nodiscard]] const Resources& resources() const noexcept { return resources_; }
     // The vision tower, when the artifact has one (null otherwise).
     [[nodiscard]] const VisionConfig* vision_config() const noexcept { return vision_config_ ? &*vision_config_ : nullptr; }
     [[nodiscard]] const VisionWeights& vision_weights() const noexcept { return vision_weights_; }
@@ -110,12 +116,13 @@ public:
     [[nodiscard]] Matrix matrix(WeightId id) const;
 
 private:
-    friend std::unique_ptr<Model> load_model(const artifact::Reader&, DeviceContext&, const StartupObserver*);
+    friend std::unique_ptr<Model> load_model(const artifact::Reader&, DeviceContext&, const struct LoadComponents&, const StartupObserver*);
     Model(TextConfig config, TextWeights weights, std::vector<BoundWeight> bound, artifact::MaterializedArtifact backing);
     std::optional<DSparkConfig> dspark_config_;
     DSparkWeights dspark_weights_;
     std::optional<VisionConfig> vision_config_;
     VisionWeights vision_weights_;
+    Resources resources_;
 
     artifact::MaterializedArtifact backing_;
     TextConfig config_;
@@ -127,8 +134,14 @@ private:
 // True when the artifact's text component is Inkling-2.
 [[nodiscard]] bool is_inkling2(const artifact::Reader& reader);
 
-// Binds every parameter and materializes it in device memory.
+// The optional components to bind; an absent one is never read or uploaded (the artifact may lack it either way).
+struct LoadComponents {
+    bool vision = true;
+    bool dspark = true;
+};
+
+// Binds the text model's parameters and those of the components asked for, and materializes them in device memory.
 [[nodiscard]] std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext& device,
-                                                const StartupObserver* observer = nullptr);
+                                                const LoadComponents& components = {}, const StartupObserver* observer = nullptr);
 
 } // namespace ninfer::models::inkling2

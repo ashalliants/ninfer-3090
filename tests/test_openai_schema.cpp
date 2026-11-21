@@ -1605,6 +1605,10 @@ int test_common_objects() {
                                                                     ["input_modalities"] ==
                               vision_input,
                       "a --vision server did not advertise image and video input");
+    const ModelDescription images_only{.id = "inkling", .max_model_len = 8192, .vision = true, .video = false};
+    failures += check(Json::parse(make_model_object(images_only, 7))["architecture"]["input_modalities"] ==
+                          Json::array({"text", "image"}),
+                      "a model that takes no video advertised it");
     const Json error = Json::parse(make_error_body(
         ApiError{.status = 400, .message = "bad", .param = "messages", .code = "invalid"}));
     failures += check(error["error"]["param"] == "messages" && error["error"]["code"] == "invalid",

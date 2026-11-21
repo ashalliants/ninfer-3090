@@ -92,7 +92,7 @@ Json model_entry(const ModelStatusSnapshot& status) {
     }
     // The same schema a single-model server advertises, so a client reads one shape either way.
     Json entry = Json::parse(make_model_object(
-        ModelDescription{.id = status.id, .max_model_len = status.max_context, .vision = status.vision},
+        ModelDescription{.id = status.id, .max_model_len = status.max_context, .vision = status.vision, .video = status.video},
         unix_time_now()));
     entry["aliases"] = status.aliases;
     entry["status"]  = std::move(state);

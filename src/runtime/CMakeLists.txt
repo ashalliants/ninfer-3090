@@ -17,6 +17,7 @@ target_link_libraries(ninfer_runtime_support PUBLIC ninfer_core PRIVATE ninfer::
 add_library(ninfer_engine STATIC
   engine/model_instance.cpp
   engine/qwen4_exp_instance.cpp
+  engine/inkling2_core.cpp
   contract/sampling.cpp
   engine/engine.cpp
 )

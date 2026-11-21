@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <vector>
@@ -39,9 +40,11 @@ struct ImageSize {
 [[nodiscard]] ImageSize encoded_size(const VisionConfig& config, std::int32_t width, std::int32_t height);
 
 // rgb: width x height pixels of 3 bytes, rows top to bottom. An image above the limit is resized to encoded_size()
-// bilinearly (llama.cpp resizes bicubically, so such images' pixels differ slightly from its own).
+// bilinearly (llama.cpp resizes bicubically, so such images' pixels differ slightly from its own). `checkpoint`, when
+// set, runs once per row of each pass and may throw to stop the work (a request's cancellation or deadline).
 [[nodiscard]] PreparedImage prepare_image(const VisionConfig& config, std::int32_t width, std::int32_t height,
-                                          std::span<const std::uint8_t> rgb);
+                                          std::span<const std::uint8_t> rgb,
+                                          const std::function<void()>& checkpoint = {});
 
 class VisionEncoder {
 public:

@@ -70,6 +70,7 @@ struct ModelDescription {
     std::string id;
     std::uint32_t max_model_len = 0; // --max-context, each sequence's ceiling
     bool vision                 = false;
+    bool video                  = true; // with vision: video input too
 };
 
 std::string make_models_list(const ModelDescription& model, std::int64_t created);

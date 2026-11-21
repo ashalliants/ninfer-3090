@@ -10,7 +10,9 @@
 #include "runtime/engine/compaction/summary_strategy.h"
 #include "runtime/engine/context_store_binding.h"
 #include "runtime/engine/engine_core.h"
+#include "runtime/engine/inkling2_core.h"
 #include "runtime/engine/model_instance.h"
+#include "runtime/engine/validate_options.h"
 #include "runtime/engine/qwen4_exp_instance.h"
 
 #include <algorithm>
@@ -145,11 +147,17 @@ public:
          models::qwen3_5::PreparedPrompt prepared)
         : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
           value(std::move(prepared)) {}
+    // An Inkling-2 prompt (its own frontend's); `value` stays empty.
+    explicit Impl(models::inkling2::PreparedPrompt prepared)
+        : summary(prepared.summary), prepare(prepared.stats),
+          sampling_mode(prepared.thinking ? SamplingMode::Thinking : SamplingMode::NonThinking),
+          inkling2(std::move(prepared)) {}
 
     PromptSummary summary;
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
     models::qwen3_5::PreparedPrompt value;
+    std::optional<models::inkling2::PreparedPrompt> inkling2;
     // Summary strategy: what it did for this prompt (summary_strategy.h); unset when it did not
     // look at it (off, or too short to probe).
     std::optional<runtime::compaction::SummaryRecord> summary_record;
@@ -249,6 +257,30 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
     return impl->wait(sink, cancellation);
 }
 
+namespace {
+// Inkling-2 keeps its context cache as one device snapshot (Inkling2Core, "Prefix reuse"): there is no host tier or
+// slot count to size, so setting one is refused (before normalization fills the slot count in).
+EngineOptions refuse_inkling2_cache_tiers(EngineOptions options) {
+    if (!runtime::artifact_is_inkling2(options.artifact_path)) { return options; }
+    const ContextCacheOptions defaults;
+    const auto& cache = options.context_cache;
+    std::string set;
+    for (const auto& [name, is_set] : {std::pair{"device_state_slots", cache.device_state_slots.has_value()},
+                                       std::pair{"host_capacity_bytes", cache.host_capacity_bytes.has_value()},
+                                       std::pair{"auto_host_cache", cache.auto_host_cache},
+                                       std::pair{"host_pause_reserve_bytes", cache.host_pause_reserve_bytes != 0},
+                                       std::pair{"host_cache_reserve_bytes", cache.host_cache_reserve_bytes != defaults.host_cache_reserve_bytes},
+                                       std::pair{"host_cache_max_bytes", cache.host_cache_max_bytes.has_value()},
+                                       std::pair{"host_cache_percent", cache.host_cache_percent.has_value()}}) {
+        if (is_set) { set += std::string(set.empty() ? "" : ", ") + name; }
+    }
+    if (!set.empty()) {
+        throw std::invalid_argument("Inkling-2 keeps its context cache on the device: no state slots or host cache options (" + set + ")");
+    }
+    return options;
+}
+} // namespace
+
 class Engine::Impl {
 public:
     using GenerationCore = runtime::EngineCore<runtime::ModelInstance>;
@@ -264,15 +296,22 @@ public:
     // Token log-probabilities: the Qwen3.5 Program carries them, qwen4_exp does not.
     static_assert(GenerationCore::kLogprobsCapable);
     static_assert(!Qwen4ExpCore::kLogprobsCapable);
+    // Inkling-2: its own core and frontend (runtime/engine/inkling2_core.h).
+    using Inkling2Core = runtime::Inkling2Core;
     using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
-                              std::unique_ptr<ScoringCore>, std::unique_ptr<Qwen4ExpCore>>;
+                              std::unique_ptr<ScoringCore>, std::unique_ptr<Qwen4ExpCore>,
+                              std::unique_ptr<Inkling2Core>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(runtime::normalize_engine_options(std::move(engine_options))),
+        : options(runtime::normalize_engine_options(refuse_inkling2_cache_tiers(std::move(engine_options)))),
           device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         if (runtime::artifact_is_qwen4_exp(options.artifact_path)) {
             construct_qwen4_exp();
+            return;
+        }
+        if (runtime::artifact_is_inkling2(options.artifact_path)) {
+            construct_inkling2();
             return;
         }
         auto constructed    = runtime::construct_model(options, device);
@@ -380,12 +419,14 @@ public:
     using CheckpointImage = runtime::ModelInstance::ModelContract::CheckpointImage;
 
     [[nodiscard]] const models::qwen3_5::Frontend& frontend() const {
+        if (inkling2 != nullptr) { throw std::logic_error("an Inkling-2 Engine has no Qwen3.5 frontend"); }
         return qwen4 != nullptr ? qwen4->frontend : active->frontend;
     }
 
-    [[nodiscard]] bool returns_logprobs() const { return qwen4 == nullptr; }
+    [[nodiscard]] bool returns_logprobs() const { return qwen4 == nullptr && inkling2 == nullptr; }
 
     [[nodiscard]] std::uint32_t capacity() const {
+        if (inkling2 != nullptr) { return options.max_context; }
         return qwen4 != nullptr ? qwen4->capacity : active->capacity;
     }
 
@@ -456,6 +497,8 @@ public:
     std::unique_ptr<runtime::ModelInstance> active;
     // Set instead of `active` for a Qwen3.8-Flash-Next artifact.
     std::unique_ptr<runtime::Qwen4ExpInstance> qwen4;
+    // Set (and owned by `core`) instead of either for an Inkling-2 artifact.
+    runtime::Inkling2Core* inkling2 = nullptr;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
     // Declared before `core`: the worker holds hooks that reach the store and the writer queue,
@@ -620,6 +663,38 @@ private:
         }
         core = std::move(generation);
         if (store) { restore_from_store(); }
+        finalize_phase.complete();
+    }
+
+    void construct_inkling2() {
+        runtime::validate_engine_options(options); // the bounds every model's route shares
+        if (options.context_store.enabled() || !options.loras.empty() || !options.grafts.empty() ||
+            options.devices.size() > 1 || options.suspend.enabled) {
+            throw std::invalid_argument(
+                "Inkling-2 runs on one device with no context store, model suspend, LoRA adapters or grafts");
+        }
+        // This core decodes plainly: a speculative setting is refused, not ignored.
+        const SpeculativeOptions plain;
+        const auto& spec = options.speculative;
+        if (spec.backend != SpeculativeBackend::None || spec.draft_tokens != 0 || spec.ngram_draft_tokens != 0 ||
+            spec.adaptive_draft_tokens != 0 || spec.ngram_min_match != plain.ngram_min_match ||
+            spec.proposal_head != plain.proposal_head || options.relaxed_drafting || options.draft_context_rows != 0) {
+            throw std::invalid_argument("Inkling-2 decodes without speculation: no --spec or drafting options");
+        }
+        // The context cache is one device snapshot of the last prompt (Inkling2Core, "Prefix reuse"; the host-tier
+        // options were refused before normalization): one extra state when it is on, none when it is off.
+        options.context_cache.device_state_slots = options.context_cache.enabled ? 1U : 0U;
+        // Resolved like every other route's options (the request log's server-start record reads it): no Host tier.
+        options.context_cache.host_capacity_bytes = 0;
+        // One worker runs one request at a time; the rest wait in its max_pending_requests queue.
+        options.max_concurrency = 1;
+        auto generation   = std::make_unique<Inkling2Core>(options, device);
+        StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
+        load              = generation->load_summary();
+        load.cuda_sync_mode = device.sync_mode();
+        sampling_defaults = generation->frontend().sampling_defaults();
+        inkling2          = generation.get();
+        core              = std::move(generation);
         finalize_phase.complete();
     }
 
@@ -1018,6 +1093,10 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling2 != nullptr) {
+        return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
+            impl_->inkling2->frontend().prepare(std::move(input), control)));
+    }
     // Lossy prefill's summary strategy may replace the middle of a cold long conversation with a
     // summary (or substitute one recorded for an earlier turn); otherwise one ordinary prepare.
     Impl::SummaryOps ops{*impl_, control};
@@ -1054,6 +1133,10 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
         throw RequestError(RequestErrorKind::ContextLengthExceeded,
                            context_capacity_error(token_ids.size(), impl_->capacity()));
     }
+    if (impl_->inkling2 != nullptr) {
+        return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
+            impl_->inkling2->frontend().prepare_tokens(std::move(token_ids))));
+    }
     auto prepared =
         impl_->frontend().prepare_tokens(std::move(token_ids), allow_prefix_identity);
     PromptSummary info = prepared.summary();
@@ -1067,6 +1150,7 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
 
 std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling2 != nullptr) { return impl_->inkling2->frontend().tokenize_text(text); }
     return impl_->frontend().tokenize_text(text);
 }
 
@@ -1120,6 +1204,9 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
 
 std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling2 != nullptr) {
+        return impl_->inkling2->frontend().count_tokens(std::move(input), control);
+    }
     return impl_->frontend().count_tokens(std::move(input), control);
 }
 
@@ -1155,8 +1242,13 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     }
 
     const PromptSummary prompt_summary = prompt.impl_->summary;
-    if (const auto external = models::qwen3_5::PreparedPromptAccess::view(prompt.impl_->value)
-                                  .external_prefix_tokens;
+    if (prompt.impl_->inkling2.has_value() != (impl_->inkling2 != nullptr)) {
+        throw std::invalid_argument("PreparedPrompt was prepared by another model's Engine");
+    }
+    if (const auto external = prompt.impl_->inkling2
+                                  ? 0U
+                                  : models::qwen3_5::PreparedPromptAccess::view(prompt.impl_->value)
+                                        .external_prefix_tokens;
         external != 0 && (!resolved_options.execution.allow_prefix_reuse ||
                           external >= prompt_summary.prompt_tokens)) {
         // A direct graft exists only as its installed checkpoint, which only reuse can bind.
@@ -1170,6 +1262,7 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             context_capacity_error(prompt_summary.prompt_tokens, impl_->options.max_context));
     }
     const double prepare_seconds = prompt.impl_->prepare.seconds;
+    if (impl_->inkling2 != nullptr) { impl_->inkling2->check_request(resolved_options); }
     if (resolved_options.execution.requested_output_tokens == 0) {
         struct ImmediateSubmission {
             GenerationResult result;
@@ -1209,6 +1302,12 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                 throw std::logic_error("Engine core is unavailable");
             } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
                 throw std::logic_error("Engine generation core is unavailable");
+            } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::Inkling2Core>>) {
+                auto submission = core->submit(std::move(*prompt.impl_->inkling2), prompt_summary,
+                                               prepare_seconds, std::move(resolved_options), consumer_mode,
+                                               std::move(observation), pending_deadline);
+                return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
+                    impl_, std::move(submission), resolved_sampling));
             } else {
                 auto submission =
                     core->submit(std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
@@ -1255,6 +1354,7 @@ MemorySummary Engine::memory_summary() const {
 
 MediaCacheSummary Engine::media_cache_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling2 != nullptr) { return {}; }
     return impl_->frontend().media_cache_summary();
 }
 
@@ -1364,5 +1464,7 @@ void Engine::reset_memory_peaks() noexcept {
         },
         impl_->core);
 }
+
+bool artifact_takes_video(const std::filesystem::path& artifact) noexcept { return !runtime::artifact_is_inkling2(artifact); }
 
 } // namespace ninfer

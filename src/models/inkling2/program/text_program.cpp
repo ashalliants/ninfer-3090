@@ -126,6 +126,84 @@ void TextProgram::reset() {
     last_cols_ = 0;
 }
 
+namespace {
+// Calls f(slot, count) for the ring slots of positions [first, first + n) of a ring of `capacity` (at most two runs).
+template <class F> void ring_runs(std::int64_t first, std::int64_t n, std::int64_t capacity, F&& f) {
+    while (n > 0) {
+        const std::int64_t slot = first % capacity, run = std::min(n, capacity - slot);
+        f(slot, run);
+        first += run, n -= run;
+    }
+}
+} // namespace
+
+std::size_t TextProgram::snapshot_bytes() const {
+    std::size_t total = 0;
+    for (std::uint32_t v = 0; v < config_.num_layer_visits; ++v) {
+        const VisitState& s = state_[v];
+        total += s.k_hist.bytes() + s.v_hist.bytes() + s.attn_hist.bytes() + s.mlp_hist.bytes();
+        if (config_.local[config_.physical(v)]) {
+            total += 2 * static_cast<std::size_t>(s.k_cache.ne[0]) * 4 * (config_.sliding_window - 1);
+        }
+    }
+    return total;
+}
+
+void TextProgram::save(Snapshot& snapshot) const {
+    if (snapshot.memory.bytes < snapshot_bytes()) { throw std::invalid_argument("inkling2: the snapshot is too small"); }
+    auto* out = static_cast<std::byte*>(snapshot.memory.p);
+    CopyBatch copies(stream_);
+    const std::int64_t first = std::max<std::int64_t>(0, position_ - (config_.sliding_window - 1));
+    for (std::uint32_t v = 0; v < config_.num_layer_visits; ++v) {
+        const VisitState& s = state_[v];
+        for (const Tensor* t : {&s.k_hist, &s.v_hist, &s.attn_hist, &s.mlp_hist}) {
+            copies.add(out, t->data, t->bytes());
+            out += t->bytes();
+        }
+        if (!config_.local[config_.physical(v)]) { continue; }
+        const std::size_t column = static_cast<std::size_t>(s.k_cache.ne[0]) * 4;
+        for (const Tensor* t : {&s.k_cache, &s.v_cache}) {
+            auto* base = out;
+            ring_runs(first, position_ - first, t->ne[1], [&](std::int64_t slot, std::int64_t run) {
+                copies.add(base, static_cast<const std::byte*>(t->data) + static_cast<std::size_t>(slot) * column,
+                           static_cast<std::size_t>(run) * column);
+                base += static_cast<std::size_t>(run) * column;
+            });
+            out += column * (config_.sliding_window - 1);
+        }
+    }
+    copies.flush();
+    snapshot.position = position_;
+}
+
+void TextProgram::restore(const Snapshot& snapshot) {
+    if (snapshot.position < 0 || snapshot.position > limits_.max_context) { throw std::invalid_argument("inkling2: an empty snapshot"); }
+    const auto* in = static_cast<const std::byte*>(snapshot.memory.p);
+    CopyBatch copies(stream_);
+    const std::int64_t first = std::max<std::int64_t>(0, snapshot.position - (config_.sliding_window - 1));
+    for (std::uint32_t v = 0; v < config_.num_layer_visits; ++v) {
+        VisitState& s = state_[v];
+        for (Tensor* t : {&s.k_hist, &s.v_hist, &s.attn_hist, &s.mlp_hist}) {
+            copies.add(t->data, in, t->bytes());
+            in += t->bytes();
+        }
+        if (!config_.local[config_.physical(v)]) { continue; }
+        const std::size_t column = static_cast<std::size_t>(s.k_cache.ne[0]) * 4;
+        for (Tensor* t : {&s.k_cache, &s.v_cache}) {
+            const auto* base = in;
+            ring_runs(first, snapshot.position - first, t->ne[1], [&](std::int64_t slot, std::int64_t run) {
+                copies.add(static_cast<std::byte*>(t->data) + static_cast<std::size_t>(slot) * column, base,
+                           static_cast<std::size_t>(run) * column);
+                base += static_cast<std::size_t>(run) * column;
+            });
+            in += column * (config_.sliding_window - 1);
+        }
+    }
+    copies.flush();
+    position_  = snapshot.position;
+    last_cols_ = 0;
+}
+
 Tensor TextProgram::tap(std::size_t i) const {
     if (i >= taps_.size() || last_cols_ < 1) { throw std::out_of_range("inkling2: no such tap"); }
     return taps_[i].slice(1, 0, last_cols_);

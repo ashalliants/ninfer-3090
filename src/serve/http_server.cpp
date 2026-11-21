@@ -677,7 +677,8 @@ void HttpServer::handle_props(const httplib::Request&, httplib::Response& res) c
 ModelDescription HttpServer::model_description() const {
     return ModelDescription{.id            = public_model_id_,
                             .max_model_len = options_.max_context,
-                            .vision        = service_->engine_options().enable_vision};
+                            .vision        = service_->engine_options().enable_vision,
+                            .video         = service_->load_summary().takes_video};
 }
 
 namespace {
