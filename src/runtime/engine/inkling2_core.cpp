@@ -584,6 +584,8 @@ void Inkling2Core::run(Job& job) {
     // Prefill in chunks from position 0, or from the reused snapshot's position (a whole number of chunks, so the
     // forwards are the ones a prefill from 0 runs from there).
     auto& program  = programs_->text;
+    // Only a request that drafts reads the taps: a sampled one runs its forwards without the copies.
+    program.set_taps(speculate);
     auto* drafter  = programs_->drafter.get();
     const auto taps_of = [&] {
         std::vector<Tensor> taps;
@@ -749,7 +751,10 @@ void Inkling2Core::run(Job& job) {
         if (round && plain_seconds == 0.0) { round = false; }
         if (round && !pays) {
             round = ++since_probe >= probe_interval;
-            if (round) { probe_interval = std::min(2 * probe_interval, 64); }
+            if (round) { // a probe: the next one comes after twice as many plain steps (8, 16, 32, 64)
+                since_probe    = 0;
+                probe_interval = std::min(2 * probe_interval, 64);
+            }
         }
         if (round && pays) { since_probe = 0, probe_interval = 8; }
         forward_at        = now;

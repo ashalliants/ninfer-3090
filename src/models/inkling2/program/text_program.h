@@ -58,8 +58,11 @@ public:
     void reset();
     [[nodiscard]] std::int64_t position() const noexcept { return position_; }
 
-    // Tap i of the last forward: FP32 [hidden, T] on the device, valid until the next forward.
+    // Tap i of the last forward: FP32 [hidden, T] on the device, valid until the next forward. Refused when that
+    // forward ran with the taps off.
     [[nodiscard]] Tensor tap(std::size_t i) const;
+    // Whether forwards copy the taps (on by default): a request that never drafts turns them off and saves the copies.
+    void set_taps(bool on) noexcept { taps_on_ = on; }
 
     // The state a forward from a position needs, copied (prefix reuse): every sliding visit's K/V for the last
     // sliding_window - 1 positions and every visit's convolution histories. The global visits' caches are indexed by
@@ -115,13 +118,16 @@ private:
     std::int64_t position_ = 0;
     std::vector<Tensor> taps_;          // FP32 [hidden, max_chunk] each
     std::int32_t last_cols_ = 0;        // the last forward's T
+    bool taps_on_           = true;     // forwards copy the taps (set_taps)
+    bool last_tapped_       = false;    // the last forward copied them
     bool saving_            = false;    // the forward in progress saves its convolution inputs
     std::span<const InputEmbeddings> inputs_; // the forward in progress's embedding columns
     // The decode graph: step_ holds {int64 position, int32 token} it reads; start_offset_ points at that position
     // while the graph is captured (the Ops add it to their host start of 0), and is null otherwise.
     DeviceBuffer step_;
-    cudaGraphExec_t decode_graph_ = nullptr;
-    Tensor graph_logits_;
+    // The decode graphs, without and with the tap copies (each captured on its first use), and their logits.
+    cudaGraphExec_t decode_graph_[2] = {nullptr, nullptr};
+    Tensor graph_logits_[2];
     const std::int64_t* start_offset_ = nullptr;
 };
 

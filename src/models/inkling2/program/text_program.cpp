@@ -113,7 +113,9 @@ TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t 
 }
 
 TextProgram::~TextProgram() {
-    if (decode_graph_ != nullptr) { cudaGraphExecDestroy(decode_graph_); }
+    for (cudaGraphExec_t graph : decode_graph_) {
+        if (graph != nullptr) { cudaGraphExecDestroy(graph); }
+    }
 }
 
 void TextProgram::reset() {
@@ -205,11 +207,12 @@ void TextProgram::restore(const Snapshot& snapshot) {
 }
 
 Tensor TextProgram::tap(std::size_t i) const {
-    if (i >= taps_.size() || last_cols_ < 1) { throw std::out_of_range("inkling2: no such tap"); }
+    if (i >= taps_.size() || last_cols_ < 1 || !last_tapped_) { throw std::out_of_range("inkling2: no such tap"); }
     return taps_[i].slice(1, 0, last_cols_);
 }
 
 void TextProgram::copy_tap(std::uint32_t visit, const Tensor& value) {
+    if (!taps_on_) { return; }
     for (std::size_t i = 0; i < taps_.size(); ++i) {
         if (limits_.tap_visits[i] != visit) { continue; }
         const std::size_t column = std::size_t(config_.hidden_size) * 4;
@@ -516,7 +519,8 @@ Tensor TextProgram::forward(std::span<const std::int32_t> tokens, std::span<cons
     saving_ = false;
     inputs_ = {};
     position_ += cols;
-    last_cols_ = cols;
+    last_cols_   = cols;
+    last_tapped_ = taps_on_;
     return logits;
 }
 
@@ -531,7 +535,11 @@ Tensor TextProgram::forward_graph(std::int32_t token) {
     if (cudaMemcpyAsync(step_.p, &host, sizeof host, cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
         throw std::runtime_error("inkling2: step upload failed");
     }
-    if (decode_graph_ == nullptr) {
+    // The graph with the tap copies, or the one without (the same graph when there are no taps).
+    const std::size_t g     = taps_on_ && !taps_.empty() ? 1 : 0;
+    cudaGraphExec_t& exec   = decode_graph_[g];
+    Tensor& graph_logits    = graph_logits_[g];
+    if (exec == nullptr) {
         workspace_.reset();
         const Tensor ids(static_cast<char*>(step_.p) + offsetof(Step, token), DType::I32, {1});
         if (cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
@@ -550,24 +558,25 @@ Tensor TextProgram::forward_graph(std::int32_t token) {
             return graph;
         };
         try {
-            graph_logits_ = run(ids, 0, nullptr);
+            graph_logits = run(ids, 0, nullptr);
         } catch (...) {
             if (cudaGraph_t graph = end_capture()) { cudaGraphDestroy(graph); }
             throw;
         }
         cudaGraph_t graph = end_capture();
         if (graph == nullptr) { throw std::runtime_error("inkling2: decode graph capture failed"); }
-        const cudaError_t made = cudaGraphInstantiate(&decode_graph_, graph, 0);
+        const cudaError_t made = cudaGraphInstantiate(&exec, graph, 0);
         cudaGraphDestroy(graph);
         if (made != cudaSuccess) {
-            decode_graph_ = nullptr;
+            exec = nullptr;
             throw std::runtime_error(std::string("inkling2: cannot instantiate the decode graph: ") + cudaGetErrorString(made));
         }
     }
-    if (cudaGraphLaunch(decode_graph_, stream_) != cudaSuccess) { throw std::runtime_error("inkling2: decode graph launch failed"); }
+    if (cudaGraphLaunch(exec, stream_) != cudaSuccess) { throw std::runtime_error("inkling2: decode graph launch failed"); }
     position_ += 1;
-    last_cols_ = 1;
-    return graph_logits_;
+    last_cols_   = 1;
+    last_tapped_ = taps_on_;
+    return graph_logits;
 }
 
 Tensor TextProgram::run(const Tensor& ids, std::int64_t start, const Trace* trace) {

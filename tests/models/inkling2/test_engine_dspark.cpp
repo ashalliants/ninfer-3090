@@ -107,10 +107,16 @@ int main() {
             return o;
         };
         std::vector<std::vector<ninfer::TokenId>> plain_budgets;
+        ninfer::RequestOptions sampled;
+        sampled.execution.sampling.temperature    = 0.8F;
+        sampled.execution.sampling.seed           = 7;
+        sampled.execution.requested_output_tokens = 32;
+        std::vector<ninfer::TokenId> plain_sampled;
         {
             ninfer::Engine engine(options);
             std::printf("plain:\n");
             plain = run_all(engine, tokens);
+            plain_sampled = engine.generate(engine.prepare(user_turn(kPrompts[2])), sampled).generated_token_ids;
             auto budget                      = greedy(96);
             budget.execution.thinking.budget = 24;
             plain_budget = engine.generate(engine.prepare(user_turn(kPrompts[0])), budget).generated_token_ids;
@@ -216,15 +222,17 @@ int main() {
                         static_cast<unsigned long long>(cold.speculative.accepted_tokens),
                         static_cast<unsigned long long>(cold.speculative.drafted_tokens));
         }
-        ninfer::RequestOptions sampled;
-        sampled.execution.sampling.temperature    = 0.8F;
-        sampled.execution.sampling.seed           = 7;
-        sampled.execution.requested_output_tokens = 32;
         const auto s1 = engine.generate(engine.prepare(user_turn(kPrompts[2])), sampled);
         const auto s2 = engine.generate(engine.prepare(user_turn(kPrompts[2])), sampled);
         check(s1.speculative.rounds == 0 && s1.speculative.fallback_steps == 0 && s1.generated_token_ids == s2.generated_token_ids, "a sampled request runs plain and repeats");
         check(s1.speculative.backend == ninfer::SpeculativeBackend::DSpark && s1.speculative.draft_window == drafts,
               "a sampled request reports the configured backend");
+        // A sampled request runs without the drafter's tap copies (and their decode graph): its output is the plain
+        // Engine's, and a greedy request after it drafts from taps again.
+        check(s1.generated_token_ids == plain_sampled, "a sampled request without the taps samples what a plain Engine does");
+        const auto after = engine.generate(engine.prepare(user_turn(kPrompts[0])), greedy(tokens));
+        check(after.generated_token_ids == plain.tokens[0] && after.speculative.rounds > 0,
+              "a greedy request after a sampled one drafts and yields plain greedy's tokens");
         const double plain_rate = (plain.generated - kPrompts.size()) / plain.decode_seconds;
         const double spec_rate  = (spec.generated - kPrompts.size()) / spec.decode_seconds;
         std::printf("plain %.1f tok/s, dspark %.1f tok/s (%.2fx); %llu rounds, %.2f drafts accepted per round, %llu plain steps\n",
