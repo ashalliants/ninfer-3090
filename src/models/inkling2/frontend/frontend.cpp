@@ -97,6 +97,14 @@ Json template_context(const PromptInput& input, std::size_t& images) {
         messages.push_back(std::move(m));
     }
     Json context = parse_object(input.options.chat_template_kwargs_json, "chat_template_kwargs");
+    // The frontend owns the conversation, the tools and the special tokens, as the Qwen3.5 frontend does.
+    for (const auto& item : context.items()) {
+        const std::string& key = item.key();
+        if (key == "messages" || key == "tools" || key == "add_generation_prompt" || key == "continue_final_message" ||
+            key.ends_with("_token") || key == "additional_special_tokens") {
+            throw std::invalid_argument("chat_template_kwargs cannot override " + key);
+        }
+    }
     context["messages"] = std::move(messages);
     if (!input.options.tool_jsons.empty()) {
         Json tools = Json::array();

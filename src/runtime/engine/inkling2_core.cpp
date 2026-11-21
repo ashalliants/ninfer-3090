@@ -201,6 +201,7 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     load_.artifact_id         = artifact::artifact_id_hex(reader.artifact_id());
     load_.weight_formats      = {"bf16", "ggml_q8_0", "ggml_rec_nvfp4_nvfp4", "fp32"};
     load_.prefill_signature   = "inkling2-fp32";
+    load_.takes_video         = false;
     load_.load_seconds        = seconds_between(start, Clock::now());
     load_.upload_seconds       = stats.upload_seconds;
     load_.artifact_bytes_read  = stats.read_bytes;
@@ -229,7 +230,6 @@ Inkling2Core::Submission Inkling2Core::submit(ink::PreparedPrompt prompt, Prompt
     if (options.tool_choice.mode == ToolChoiceMode::Required || options.tool_choice.allowed_names) {
         throw std::invalid_argument("Inkling-2 serves tool_choice auto or none only");
     }
-    if (failed_) { throw RequestError(RequestErrorKind::Unavailable, "the Inkling-2 Engine has failed"); }
     const auto submitted = Clock::now();
     if (pending_deadline == Clock::time_point{}) {
         pending_deadline = submitted + std::chrono::milliseconds(options_.pending_timeout_ms);
@@ -256,6 +256,7 @@ Inkling2Core::Submission Inkling2Core::submit(ink::PreparedPrompt prompt, Prompt
     job->deadline        = pending_deadline;
     {
         std::lock_guard lock(mutex_);
+        if (failed_) { throw RequestError(RequestErrorKind::Unavailable, "the Inkling-2 Engine has failed"); }
         // One running request and max_pending_requests waiting, as the Engine core admits with one lane.
         if (queue_.size() + (running_ ? 1U : 0U) >= std::size_t{options_.max_pending_requests} + 1U) {
             throw RequestError(RequestErrorKind::Overloaded, "the Inkling-2 queue is full");
@@ -266,6 +267,18 @@ Inkling2Core::Submission Inkling2Core::submit(ink::PreparedPrompt prompt, Prompt
     return Submission(std::move(job));
 }
 
+void Inkling2Core::fail_queued_locked(const char* why) {
+    for (const auto& waiting : queue_) {
+        {
+            std::lock_guard job_lock(waiting->mutex);
+            waiting->error = std::make_exception_ptr(RequestError(RequestErrorKind::Unavailable, why));
+            waiting->done  = true;
+        }
+        waiting->changed.notify_all();
+    }
+    queue_.clear();
+}
+
 void Inkling2Core::worker() {
     device_.bind_to_current_thread();
     for (;;) {
@@ -273,19 +286,11 @@ void Inkling2Core::worker() {
         {
             std::unique_lock lock(mutex_);
             wake_.wait(lock, [&] { return stop_ || !queue_.empty(); });
-            if (stop_) {
-                // The Engine is going: what still waits is not run.
-                for (const auto& waiting : queue_) {
-                    {
-                        std::lock_guard job_lock(waiting->mutex);
-                        waiting->error = std::make_exception_ptr(
-                            RequestError(RequestErrorKind::Unavailable, "the Inkling-2 Engine is shutting down"));
-                        waiting->done = true;
-                    }
-                    waiting->changed.notify_all();
-                }
-                queue_.clear();
-                return;
+            if (stop_ || failed_) {
+                // The Engine is going, or the device failed: what still waits is not run.
+                fail_queued_locked(stop_ ? "the Inkling-2 Engine is shutting down" : "the Inkling-2 Engine has failed");
+                if (stop_) { return; }
+                continue;
             }
             job = std::move(queue_.front());
             queue_.pop_front();
@@ -295,8 +300,12 @@ void Inkling2Core::worker() {
             run(*job);
         } catch (...) {
             job->error = std::current_exception();
-            // A CUDA failure leaves the device state unknown: no later request runs.
-            if (cudaGetLastError() != cudaSuccess || cudaStreamQuery(stream_) == cudaErrorIllegalAddress) { failed_ = true; }
+            // A CUDA failure leaves the device state unknown: no later request runs, queued ones fail now.
+            if (cudaGetLastError() != cudaSuccess || cudaStreamQuery(stream_) == cudaErrorIllegalAddress) {
+                std::lock_guard lock(mutex_);
+                failed_ = true;
+                fail_queued_locked("the Inkling-2 Engine has failed");
+            }
         }
         {
             std::lock_guard lock(job->mutex);

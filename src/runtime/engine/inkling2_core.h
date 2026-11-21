@@ -68,6 +68,7 @@ public:
 
 private:
     void worker();
+    void fail_queued_locked(const char* why); // with mutex_ held
     void run(Job& job);
 
     EngineOptions options_;

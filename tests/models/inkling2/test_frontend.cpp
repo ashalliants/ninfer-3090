@@ -278,6 +278,11 @@ int main() {
             std::string many;
             for (int i = 0; i < 100; ++i) { many += "word "; }
             refused(text_only, user_turn({text(many)}), "a prompt past max_context");
+            for (const char* key : {"tools", "messages", "bos_token", "add_generation_prompt"}) {
+                auto kwargs = user_turn({text("hi")});
+                kwargs.options.chat_template_kwargs_json = std::string("{\"") + key + "\": []}";
+                refused(frontend, kwargs, std::string("chat_template_kwargs setting ") + key);
+            }
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

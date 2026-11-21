@@ -82,11 +82,22 @@ int main() {
         options.artifact_path = artifact_path;
         options.max_context   = 4096;
         options.enable_vision = true;
+        {
+            // What Inkling-2 cannot do is refused at construction, not left to fail later.
+            ninfer::EngineOptions suspended = options;
+            suspended.suspend.enabled       = true;
+            try {
+                ninfer::Engine refused(suspended);
+                check(false, "model suspend is refused");
+            } catch (const std::invalid_argument&) {}
+        }
         const auto t0         = Clock::now();
         ninfer::Engine engine(options);
         std::printf("engine ready in %.1f s (%s)\n", std::chrono::duration<double>(Clock::now() - t0).count(),
                     engine.load_summary().architecture.c_str());
         check(engine.load_summary().architecture == "inkling2", "the Engine loads Inkling-2");
+        check(!engine.options().context_cache.enabled && !engine.load_summary().takes_video,
+              "no context cache and no video is reported");
 
         const auto question = [] { return user_turn({text("Name three primary colours.")}); };
         // Aggregate, twice, and streaming.

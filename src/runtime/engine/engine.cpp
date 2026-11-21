@@ -643,10 +643,12 @@ private:
 
     void construct_inkling2() {
         if (options.context_store.enabled() || !options.loras.empty() || !options.grafts.empty() ||
-            options.devices.size() > 1) {
+            options.devices.size() > 1 || options.suspend.enabled) {
             throw std::invalid_argument(
-                "Inkling-2 runs on one device with no context store, LoRA adapters or grafts");
+                "Inkling-2 runs on one device with no context store, model suspend, LoRA adapters or grafts");
         }
+        // Every request runs from position 0: there is no context cache to report or size.
+        options.context_cache.enabled = false;
         auto generation   = std::make_unique<Inkling2Core>(options, device);
         load              = generation->load_summary();
         load.cuda_sync_mode = device.sync_mode();
