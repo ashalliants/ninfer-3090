@@ -37,6 +37,12 @@ constexpr std::string_view kDsv4WordPattern =
     "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| "
     "?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
 
+// Inkling-2's word regex, as its tokenizer.json spells it.
+constexpr std::string_view kInkling2SplitPattern =
+    R"ink([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?)ink"
+    R"ink(|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?)ink"
+    R"ink(|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)ink";
+
 Pipeline validate_pipeline(const Json& root, const Json& model) {
     const auto require = [](bool valid, const char* field) {
         if (!valid) {
@@ -60,7 +66,26 @@ Pipeline validate_pipeline(const Json& root, const Json& model) {
     // Omitted pipeline descriptions use the architecture's fixed tokenizer semantics.
     // An explicit description must agree with the implemented transformations.
     Pipeline pipeline = Pipeline::Qwen;
-    if (root.contains("pre_tokenizer") && root["pre_tokenizer"].is_object() &&
+    const bool no_normalizer =
+        !root.contains("normalizer") || root["normalizer"].is_null() ||
+        (type(root["normalizer"], "Sequence") && root["normalizer"].contains("normalizers") &&
+         root["normalizer"]["normalizers"].is_array() && root["normalizer"]["normalizers"].empty());
+    const auto split_pattern = [](const Json& pre) {
+        if (!pre.is_object() || !pre.contains("pretokenizers") || !pre["pretokenizers"].is_array() ||
+            pre["pretokenizers"].size() != 2 || !pre["pretokenizers"][0].is_object() ||
+            !pre["pretokenizers"][0].contains("pattern") || !pre["pretokenizers"][0]["pattern"].is_object()) {
+            return std::string{};
+        }
+        return pre["pretokenizers"][0]["pattern"].value("Regex", std::string{});
+    };
+    if (root.contains("pre_tokenizer") && split_pattern(root["pre_tokenizer"]) == kInkling2SplitPattern) {
+        const auto& pre = root["pre_tokenizer"];
+        require(type(pre, "Sequence") && is_split(pre["pretokenizers"][0], kInkling2SplitPattern),
+                "pre_tokenizer.Split");
+        require(is_plain_byte_level(pre["pretokenizers"][1]), "pre_tokenizer.ByteLevel");
+        require(no_normalizer, "normalizer");
+        pipeline = Pipeline::Inkling2;
+    } else if (root.contains("pre_tokenizer") && root["pre_tokenizer"].is_object() &&
         root["pre_tokenizer"].contains("pretokenizers") &&
         root["pre_tokenizer"]["pretokenizers"].is_array() &&
         root["pre_tokenizer"]["pretokenizers"].size() == 4) {
@@ -70,10 +95,6 @@ Pipeline validate_pipeline(const Json& root, const Json& model) {
                     is_plain_byte_level(stages[3]),
                 "pre_tokenizer");
         // No normalizer: text reaches the pre-tokenizer unchanged (an empty Sequence or null is the same).
-        const bool no_normalizer =
-            !root.contains("normalizer") || root["normalizer"].is_null() ||
-            (type(root["normalizer"], "Sequence") && root["normalizer"].contains("normalizers") &&
-             root["normalizer"]["normalizers"].is_array() && root["normalizer"]["normalizers"].empty());
         require(no_normalizer, "normalizer");
         pipeline = Pipeline::Dsv4;
     } else {
@@ -97,7 +118,10 @@ Pipeline validate_pipeline(const Json& root, const Json& model) {
     for (const char* field : {"continuing_subword_prefix", "end_of_word_suffix"}) {
         require(!model.contains(field) || model[field].is_null() || model[field] == "", field);
     }
-    require(model.value("ignore_merges", Json(false)) == false, "model.ignore_merges");
+    // Inkling-2's BPE looks a whole word up in the vocabulary before merging; the others always merge.
+    require(model.value("ignore_merges", Json(false)) == (pipeline == Pipeline::Inkling2), "model.ignore_merges");
+    require(pipeline != Pipeline::Inkling2 || model.value("byte_fallback", Json(false)) == false,
+            "model.byte_fallback");
     return pipeline;
 }
 
@@ -248,15 +272,15 @@ AddedToken parse_added_token_decoder_entry(int id, const Json& item, std::string
     return token;
 }
 
-// `normalized` asks for the normalizer to run over the token before matching; a pipeline without one (Dsv4)
-// makes it irrelevant, so it is accepted there.
+// `normalized` asks for the normalizer to run over the token before matching; a pipeline without one (Dsv4,
+// Inkling2) makes it irrelevant, so it is accepted there.
 void validate_supported_added_token(const AddedToken& token, std::string_view label, Pipeline pipeline) {
     if (token.content.empty()) {
         throw std::invalid_argument("added token content must not be empty in " +
                                     std::string(label));
     }
     if (token.single_word || token.lstrip || token.rstrip ||
-        (token.normalized && pipeline != Pipeline::Dsv4)) {
+        (token.normalized && pipeline == Pipeline::Qwen)) {
         throw std::invalid_argument("Tokenizer only supports added tokens with single_word=false, "
                                     "lstrip=false, rstrip=false, and normalized=false in " +
                                     std::string(label));
@@ -710,6 +734,117 @@ std::size_t dsv4_word_end(std::string_view text, std::size_t begin, std::size_t&
     return limit;
 }
 
+// ---------------------------------------------------------------- Inkling-2 pre-tokenizer
+//
+// One Split (Isolated) with the word regex kInkling2SplitPattern; its alternatives, in order, at a piece start:
+//   1. P? U* L+ C?   2. P? U+ L* C?   3. \p{N}{1,3}   4. ' '? O+ [\r\n/]*   5. \s*[\r\n]+   6. \s+(?!\S)   7. \s+
+// with P one code point that is not CR, LF, a letter or a number; U = [Lu Lt Lm Lo M]; L = [Ll Lm Lo M]; C a
+// contraction ('s 't 're 've 'm 'll 'd, case-insensitive); O = not whitespace, letter or number. Every code
+// point starts some alternative, so there are no gaps. `inkling2_word_end` returns where the piece starting at
+// `begin` ends, as a backtracking regex engine would: the first alternative that matches, greedy within it.
+
+bool inkling2_is_upper(std::int32_t cp) noexcept {
+    return uni::is_mark(cp) || (uni::is_letter(cp) && !uni::is_lower_letter(cp));
+}
+bool inkling2_is_lower(std::int32_t cp) noexcept {
+    return uni::is_mark(cp) || (uni::is_letter(cp) && !uni::is_upper_or_title_letter(cp));
+}
+bool inkling2_is_space(std::int32_t cp) noexcept { return uni::is_whitespace(cp) || cp == 0x85; }
+bool inkling2_is_other(std::int32_t cp) noexcept {
+    return !inkling2_is_space(cp) && !uni::is_letter(cp) && !uni::is_number(cp);
+}
+
+template <class Predicate>
+std::size_t inkling2_run_end(std::string_view text, std::size_t at, Predicate&& in_class) {
+    while (at < text.size()) {
+        const uni::CodepointSpan value = qwen_codepoint_at(text, at);
+        if (!in_class(value.value)) { break; }
+        at += value.length;
+    }
+    return at;
+}
+
+std::size_t inkling2_contraction_end(std::string_view text, std::size_t at) {
+    if (at >= text.size() || text[at] != '\'') { return at; }
+    for (std::string_view suffix : {"s", "t", "re", "ve", "m", "ll", "d"}) {
+        if (ascii_ci_matches(text, at + 1, suffix)) { return at + 1 + suffix.size(); }
+    }
+    // (?i) folds by Unicode: U+017F LATIN SMALL LETTER LONG S matches s too (no other code point folds to one of these).
+    if (text.substr(at + 1, 2) == "\xc5\xbf") { return at + 3; }
+    return at;
+}
+
+// Alternative 1 from `at` (after the optional prefix): U* L+ C?, or npos.
+std::size_t inkling2_lower_word(std::string_view text, std::size_t at) {
+    const std::size_t upper_end = inkling2_run_end(text, at, inkling2_is_upper);
+    if (upper_end < text.size() && inkling2_is_lower(qwen_codepoint_at(text, upper_end).value)) {
+        return inkling2_contraction_end(text, inkling2_run_end(text, upper_end, inkling2_is_lower));
+    }
+    // U* gives back code points until L+ can start: the last code point of the run that is also in L.
+    std::size_t last_lower = std::string_view::npos;
+    for (std::size_t p = at; p < upper_end;) {
+        const uni::CodepointSpan value = qwen_codepoint_at(text, p);
+        if (inkling2_is_lower(value.value)) { last_lower = p + value.length; }
+        p += value.length;
+    }
+    return last_lower == std::string_view::npos ? last_lower : inkling2_contraction_end(text, last_lower);
+}
+
+// Alternative 2 from `at`: U+ L* C?, or npos.
+std::size_t inkling2_upper_word(std::string_view text, std::size_t at) {
+    const std::size_t upper_end = inkling2_run_end(text, at, inkling2_is_upper);
+    if (upper_end == at) { return std::string_view::npos; }
+    return inkling2_contraction_end(text, inkling2_run_end(text, upper_end, inkling2_is_lower));
+}
+
+std::size_t inkling2_word_end(std::string_view text, std::size_t begin) {
+    const uni::CodepointSpan first = qwen_codepoint_at(text, begin);
+    const std::size_t after_first  = begin + first.length;
+    const std::int32_t cp          = first.value;
+    const bool prefix = !is_newline(cp) && !uni::is_letter(cp) && !uni::is_number(cp);
+    for (const auto word : {inkling2_lower_word, inkling2_upper_word}) {
+        if (prefix && after_first < text.size()) {
+            const std::size_t end = word(text, after_first);
+            if (end != std::string_view::npos) { return end; }
+        }
+        const std::size_t end = word(text, begin);
+        if (end != std::string_view::npos) { return end; }
+    }
+    if (uni::is_number(cp)) {
+        std::size_t end = after_first;
+        for (int count = 1; count < 3 && end < text.size(); ++count) {
+            const uni::CodepointSpan value = qwen_codepoint_at(text, end);
+            if (!uni::is_number(value.value)) { break; }
+            end += value.length;
+        }
+        return end;
+    }
+    const bool space_led = cp == ' ' && after_first < text.size() &&
+                           inkling2_is_other(qwen_codepoint_at(text, after_first).value);
+    if (space_led || inkling2_is_other(cp)) {
+        const std::size_t end = inkling2_run_end(text, space_led ? after_first : begin, inkling2_is_other);
+        return inkling2_run_end(text, end, [](std::int32_t c) { return is_newline(c) || c == '/'; });
+    }
+    // Whitespace (alternatives 5 to 7): through the last newline of the run; else the run, less its last code
+    // point when a non-space follows and the run is longer than one.
+    std::size_t end              = begin;
+    std::size_t last_begin       = begin;
+    std::size_t last_newline_end = std::string_view::npos;
+    std::size_t count            = 0;
+    while (end < text.size()) {
+        const uni::CodepointSpan value = qwen_codepoint_at(text, end);
+        if (!inkling2_is_space(value.value)) { break; }
+        last_begin = end;
+        end += value.length;
+        ++count;
+        if (is_newline(value.value)) { last_newline_end = end; }
+    }
+    if (count == 0) { return after_first; }
+    if (last_newline_end != std::string_view::npos) { return last_newline_end; }
+    if (end == text.size()) { return end; }
+    return count >= 2 ? last_begin : end;
+}
+
 // Walks a text word by word. Stateful for DeepSeek-V4 (the stage 1/2 piece end, see dsv4_word_end); Qwen's
 // splitter looks at one word at a time.
 class WordCursor {
@@ -717,7 +852,15 @@ public:
     WordCursor(Pipeline pipeline, std::string_view text) : pipeline_(pipeline), text_(text) {}
     // The end of the word starting at `begin`; words must be asked for in order, each starting where the last ended.
     std::size_t next(std::size_t begin) {
-        return pipeline_ == Pipeline::Dsv4 ? dsv4_word_end(text_, begin, limit_) : qwen_word_end(text_, begin);
+        switch (pipeline_) {
+        case Pipeline::Dsv4:
+            return dsv4_word_end(text_, begin, limit_);
+        case Pipeline::Inkling2:
+            return inkling2_word_end(text_, begin);
+        case Pipeline::Qwen:
+            break;
+        }
+        return qwen_word_end(text_, begin);
     }
 
 private:
@@ -726,9 +869,9 @@ private:
     std::size_t limit_ = 0;
 };
 
-// NFC for Qwen; DeepSeek-V4 has no normalizer, so its text passes through unchanged.
+// NFC for Qwen; DeepSeek-V4 and Inkling-2 have no normalizer, so their text passes through unchanged.
 std::string normalize_text(Pipeline pipeline, std::string_view text) {
-    return pipeline == Pipeline::Dsv4 ? std::string(text) : uni::normalize_nfc(text);
+    return pipeline == Pipeline::Qwen ? uni::normalize_nfc(text) : std::string(text);
 }
 
 bool is_stop_token_id(std::span<const int> stop_token_ids, int id) {
@@ -786,14 +929,33 @@ bool append_normalized_bpe_ids(Pipeline pipeline, std::vector<int>& ids, std::st
                                const BpeMergeTable& merge_rules,
                                const std::array<int, 256>& byte_token_ids, std::size_t max_tokens,
                                BpeScratch& scratch, std::vector<std::size_t>* token_ends = nullptr,
-                               std::vector<BpeWordEnd>* word_ends = nullptr) {
+                               std::vector<BpeWordEnd>* word_ends = nullptr,
+                               const std::unordered_map<std::string, int>* whole_words = nullptr) {
     if (normalized.empty()) { return true; }
+    static const std::array<std::string, 256> byte_encoder = build_byte_level_encoder();
+    std::string mapped;
     if (ids.size() == max_tokens) { return false; }
 
     WordCursor words(pipeline, normalized);
     for (std::size_t begin = 0; begin < normalized.size();) {
         const std::size_t end = words.next(begin);
         const std::string_view word(normalized.data() + begin, end - begin);
+        // ignore_merges: a word that is itself a vocabulary token is that one token, whatever the merges would make.
+        if (whole_words != nullptr) {
+            mapped.clear();
+            for (const char byte : word) { mapped += byte_encoder[static_cast<unsigned char>(byte)]; }
+            const auto found = whole_words->find(mapped);
+            if (found != whole_words->end()) {
+                ids.push_back(found->second);
+                if (token_ends != nullptr) { token_ends->push_back(end); }
+                if (ids.size() == max_tokens) { return false; }
+                if (word_ends != nullptr) {
+                    word_ends->push_back(BpeWordEnd{.normalized_offset = end, .token_frontier = ids.size()});
+                }
+                begin = end;
+                continue;
+            }
+        }
         auto& nodes = scratch.nodes;
         nodes.clear();
         nodes.reserve(word.size());
@@ -884,7 +1046,7 @@ bool append_ordinary_text(Pipeline pipeline, BoundaryEncodedText& encoded, std::
                           std::size_t text_offset, std::span<const IndexedByteBoundary> boundaries,
                           const BpeMergeTable& merge_rules,
                           const std::array<int, 256>& byte_token_ids, std::size_t max_tokens,
-                          BpeScratch& scratch) {
+                          BpeScratch& scratch, const std::unordered_map<std::string, int>* whole_words) {
     const std::size_t token_base = encoded.input_ids.size();
     if (text.empty()) {
         for (const IndexedByteBoundary boundary : boundaries) {
@@ -906,7 +1068,7 @@ bool append_ordinary_text(Pipeline pipeline, BoundaryEncodedText& encoded, std::
     if (!append_normalized_bpe_ids(pipeline, encoded.input_ids, normalized, merge_rules, byte_token_ids,
                                    max_tokens, scratch,
                                    has_internal_boundary ? &token_ends : nullptr,
-                                   has_internal_boundary ? &word_ends : nullptr)) {
+                                   has_internal_boundary ? &word_ends : nullptr, whole_words)) {
         return false;
     }
     const std::size_t token_end = encoded.input_ids.size();
@@ -1085,7 +1247,8 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(
             append_ordinary_text(pipeline_, encoded, text.substr(begin, end - begin), begin,
                                  std::span<const IndexedByteBoundary>(boundaries)
                                      .subspan(boundary_cursor, request_end - boundary_cursor),
-                                 bpe_merge_rules_, byte_token_ids_, options.max_tokens, scratch);
+                                 bpe_merge_rules_, byte_token_ids_, options.max_tokens, scratch,
+                                 pipeline_ == Pipeline::Inkling2 ? &vocab_token_to_id_ : nullptr);
         boundary_cursor = request_end;
         return complete;
     };

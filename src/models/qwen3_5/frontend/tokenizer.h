@@ -129,8 +129,10 @@ struct BoundaryEncodedText {
 
 // The text pipeline a tokenizer.json describes. Qwen: NFC, then one Split with the Qwen regex, then byte
 // level. Dsv4 (DeepSeek-V4): no normalizer, then three Splits (runs of up to three digits, runs of CJK and
-// kana, a word regex) and byte level. Anything else is refused when the tokenizer is loaded.
-enum class Pipeline : std::uint8_t { Qwen, Dsv4 };
+// kana, a word regex) and byte level. Inkling2 (Inkling-2): no normalizer, then one Split with an o200k-style word
+// regex (case runs, contractions, digits in threes) and byte level, and BPE with ignore_merges (a word that is a
+// vocabulary token is that token). Anything else is refused when the tokenizer is loaded.
+enum class Pipeline : std::uint8_t { Qwen, Dsv4, Inkling2 };
 
 // Where the pipeline's pre-tokenizer ends each piece of `text` (byte offsets, increasing, the last is
 // text.size()); the encoder runs BPE inside each piece. NFC is NOT applied first. Public for tests.

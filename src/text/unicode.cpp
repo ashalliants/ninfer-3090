@@ -161,4 +161,15 @@ bool is_symbol(std::int32_t codepoint) noexcept {
     }
 }
 
+bool is_upper_or_title_letter(std::int32_t codepoint) noexcept {
+    if (static_cast<std::uint32_t>(codepoint) < 0x80U) { return codepoint >= 'A' && codepoint <= 'Z'; }
+    const auto category = utf8proc_category(codepoint);
+    return category == UTF8PROC_CATEGORY_LU || category == UTF8PROC_CATEGORY_LT;
+}
+
+bool is_lower_letter(std::int32_t codepoint) noexcept {
+    if (static_cast<std::uint32_t>(codepoint) < 0x80U) { return codepoint >= 'a' && codepoint <= 'z'; }
+    return utf8proc_category(codepoint) == UTF8PROC_CATEGORY_LL;
+}
+
 } // namespace ninfer::text::unicode_internal
