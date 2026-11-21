@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,18 @@ struct TextWeights {
     std::vector<LayerWeights> layers;
 };
 
+// The DSpark drafter: Q8_0 (or BF16) matrices, FP32 vectors; the Markov head's BF16 matrices.
+struct DSparkLayerWeights {
+    WeightId attn_norm, q, k, v, output, q_norm, k_norm, context_k, context_v, context_k_norm, context_norm;
+    WeightId ffn_norm, gate, up, down;
+};
+
+struct DSparkWeights {
+    WeightId fuse, rnn_context_norm, mask_embedding, output_norm;
+    WeightId markov_embedding, joint, joint_bias, hidden_out, hidden_out_bias;
+    std::vector<DSparkLayerWeights> layers;
+};
+
 struct BoundWeight {
     std::string name;
     WeightView view;
@@ -68,10 +81,23 @@ public:
     // Layer `layer`'s routed experts as the moe_situ_experts bank view.
     [[nodiscard]] const ops::SituExpertBank& expert_bank(std::uint32_t layer) const { return banks_.at(layer); }
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept { return backing_.stats(); }
+    // The DSpark drafter, when the artifact has one (null otherwise).
+    [[nodiscard]] const DSparkConfig* dspark_config() const noexcept { return dspark_config_ ? &*dspark_config_ : nullptr; }
+    [[nodiscard]] const DSparkWeights& dspark_weights() const noexcept { return dspark_weights_; }
+    // A matrix's resident bytes and format (GGML_Q8_0 blocks or BF16 words, rows of `cols` values), checked
+    // against its bound shape.
+    struct Matrix {
+        const void* data = nullptr;
+        QType format     = QType::FP32;
+        std::int32_t rows = 0, cols = 0;
+    };
+    [[nodiscard]] Matrix matrix(WeightId id) const;
 
 private:
     friend std::unique_ptr<Model> load_model(const artifact::Reader&, DeviceContext&, const StartupObserver*);
     Model(TextConfig config, TextWeights weights, std::vector<BoundWeight> bound, artifact::MaterializedArtifact backing);
+    std::optional<DSparkConfig> dspark_config_;
+    DSparkWeights dspark_weights_;
 
     artifact::MaterializedArtifact backing_;
     TextConfig config_;

@@ -35,8 +35,19 @@ struct TextConfig {
     [[nodiscard]] std::uint32_t pass(std::uint32_t visit) const;
 };
 
+// The DSpark drafter (component dspark; tools/convert/inkling2_dspark.py dspark_config).
+struct DSparkConfig {
+    std::uint32_t layers = 0, hidden_size = 0, intermediate_size = 0, heads = 0, kv_heads = 0, head_dim = 0;
+    float rms_norm_eps = 0, rope_theta = 0, final_logit_softcap = 0;
+    std::uint32_t sliding_window = 0, block_size = 0, markov_rank = 0, mask_token_id = 0;
+    std::vector<bool> local;                  // per draft layer
+    std::vector<std::uint32_t> target_visits; // tap v < visits: the input of visit v; v == visits: the final normed state
+};
+
 [[nodiscard]] bool is_inkling2_config(const artifact::Directory& directory);
 [[nodiscard]] TextConfig parse_config(const artifact::Json& config);
 [[nodiscard]] TextConfig parse_config(const artifact::Directory& directory);
+// Checked against the text config whose embedding, embedding norm and head the drafter borrows.
+[[nodiscard]] DSparkConfig parse_dspark_config(const artifact::Json& config, const TextConfig& text);
 
 } // namespace ninfer::models::inkling2

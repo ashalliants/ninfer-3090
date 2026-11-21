@@ -122,4 +122,44 @@ TextConfig parse_config(const Json& config) {
 
 TextConfig parse_config(const artifact::Directory& directory) { return parse_config(directory.component("text").config); }
 
+DSparkConfig parse_dspark_config(const Json& v, const TextConfig& text) {
+    try {
+        DSparkConfig c;
+        c.layers              = dimension(v, "num_layers");
+        c.hidden_size         = dimension(v, "hidden_size");
+        c.intermediate_size   = dimension(v, "intermediate_size");
+        c.heads               = dimension(v, "num_attention_heads");
+        c.kv_heads            = dimension(v, "num_key_value_heads");
+        c.head_dim            = dimension(v, "head_dim");
+        c.rms_norm_eps        = real(v, "rms_norm_eps");
+        c.rope_theta          = real(v, "rope_theta");
+        c.final_logit_softcap = real(v, "final_logit_softcapping");
+        c.sliding_window      = dimension(v, "sliding_window");
+        c.block_size          = dimension(v, "block_size");
+        c.markov_rank         = dimension(v, "markov_rank");
+        c.mask_token_id       = integer(v.at("mask_token_id"), "mask_token_id", false);
+        c.local.assign(c.layers, false);
+        for (const auto& item : v.at("local_layers")) {
+            const auto layer = integer(item, "local_layers", false);
+            if (layer >= c.layers) { throw ArtifactError("local_layers names a layer past the last one"); }
+            c.local[layer] = true;
+        }
+        for (const auto& item : v.at("target_visits")) { c.target_visits.push_back(integer(item, "target_visits", false)); }
+        if (c.hidden_size != text.hidden_size) { throw ArtifactError("hidden_size differs from the text model's"); }
+        if (c.heads % c.kv_heads || c.head_dim % 2) { throw ArtifactError("bad attention geometry"); }
+        if (c.block_size < 2) { throw ArtifactError("a block needs a draft position"); }
+        if (c.mask_token_id >= text.unpadded_vocab_size) { throw ArtifactError("mask_token_id is not a token"); }
+        if (c.final_logit_softcap != text.final_logit_softcap) { throw ArtifactError("softcap differs from the text model's"); }
+        if (c.target_visits.empty() || c.target_visits.back() != text.num_layer_visits) {
+            throw ArtifactError("the last tap must be the final state");
+        }
+        for (std::size_t i = 1; i < c.target_visits.size(); ++i) {
+            if (c.target_visits[i] <= c.target_visits[i - 1]) { throw ArtifactError("target_visits must increase"); }
+        }
+        return c;
+    } catch (const std::exception& error) {
+        throw ArtifactError(std::string("Inkling-2 DSpark config: ") + error.what());
+    }
+}
+
 } // namespace ninfer::models::inkling2
