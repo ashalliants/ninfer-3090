@@ -43,14 +43,24 @@ struct ProgramLimits {
     // another order, so past 256 visible keys the logits differ from the single-block kernel's in the last bits.
     // false: the single block per column and head (bit-exact with earlier builds).
     bool split_attention = true;
-    // Opt-in, lossy: the KV rings hold FP16 (round to nearest) rather than FP32, half the bytes per position, so
-    // about twice the context fits. The attention widens them to FP32 as it reads them.
+    // Lossy (the Engine's default): the KV rings hold FP16 (round to nearest) rather than FP32, half the bytes per
+    // position, so about twice the context fits. The attention widens them to FP32 as it reads them.
     bool kv_fp16 = false;
     // A forward of more than max(1, max_rollback) tokens (a prefill chunk) returns its last column's logits only,
     // FP32 [vocab_size, 1], the same bits as that column of all of them; saves vocab_size * 4 bytes per chunk column
     // of workspace. false: every column's.
     bool last_logits = false;
+    // Not bit-exact (FP16 inputs on the tensor cores, FP32 accumulation): forwards of kTensorCoreMinColumns or more
+    // columns run, per part, their BF16 projections through ops::projection_tc_fp32, their experts through
+    // ops::moe_situ_experts_tc and their attention on relative_bias_sink_attention's wide tensor-core route.
+    struct TensorCoreParts {
+        bool dense = false, experts = false, attention = false;
+        [[nodiscard]] bool any() const { return dense || experts || attention; }
+        [[nodiscard]] static TensorCoreParts all() { return {true, true, true}; }
+    } prefill_tc;
 };
+
+inline constexpr std::int32_t kTensorCoreMinColumns = 64;
 
 // Columns [column, column + values.ne[1]) of a forward that take `values` as their input in place of their tokens'
 // normed embeddings: FP32 [hidden, n] on the device, columns contiguous (an image's embeddings; their tokens are
@@ -122,7 +132,8 @@ private:
 
     Tensor run(const Tensor& ids, std::int64_t start, const Trace* trace); // the forward after the token upload
     Tensor forward_graph(std::int32_t token);
-    Tensor visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor>& blocks, const Tensor* messages, std::int64_t start,
+    // Writes the visit's output into `next` (FP32 [H, T], not aliasing cur or blocks) and returns it.
+    Tensor visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor>& blocks, const Tensor* messages, Tensor next, std::int64_t start,
                  const Trace* trace);
     // The loop controllers of one site (q, k and v at once, or the FFN input): out[j] = controller w[j] of (c[j], m[j]).
     void control(std::span<const ControllerWeights* const> w, std::span<const Tensor* const> c, std::span<const Tensor* const> m,

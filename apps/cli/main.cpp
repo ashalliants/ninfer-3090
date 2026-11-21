@@ -342,6 +342,8 @@ int main(int argc, char** argv) {
         engine_options.dense_q8                 = cli.dense_q8;
         engine_options.split_attention          = cli.split_attention;
         engine_options.kv_rings                 = cli.kv_rings;
+        engine_options.prefill_math             = cli.prefill_math;
+        engine_options.prefill_chunk_explicit   = cli.prefill_chunk_explicit;
         engine_options.speculative              = cli.speculative;
         engine_options.enable_vision            = cli.enable_vision;
         engine_options.vision_residency         = cli.vision_residency;

@@ -1,0 +1,62 @@
+#pragma once
+
+#include "core/arena.h"
+#include "core/tensor.h"
+#include "ninfer/ops/moe_situ.h"
+
+#include <cuda_runtime.h>
+
+#include <cstdint>
+#include <span>
+
+namespace ninfer::ops {
+
+/**
+ * Op: projection_tc_fp32 (not bit-exact: projection_fp32 on the FP16 tensor cores)
+ *
+ * Math / indexing:
+ *   out[n, t] = (sum_k W16[n, k] X16[k, t]) 2^-e_n 2^-e_t for the rows n of `weights` concatenated in order, with
+ *   W16 = FP16(w 2^e_n) per weight row (its absmax in [2^14, 2^15)) and X16 = FP16(x 2^e_t) per column of the
+ *   weight's input; the sum is cuBLAS's FP32-accumulating tensor-op GEMM. A BF16 value converts exactly unless its
+ *   scaled magnitude is below FP16's normal range (2^-14; bf16_fp16_inexact counts those), so against
+ *   projection_fp32 the difference is the summation order and those values.
+ *
+ * Logical shapes:
+ *   inputs: one BF16 [K, T] for every weight, or one per weight; weight i BF16 [K, N_i]; out FP32 [sum N_i, T]
+ *   contiguous. K a multiple of 8.
+ *
+ * Workspace: projection_tc_workspace_bytes(K, max N_i, T) from `workspace`, released on return.
+ * Execution: stream-ordered; not graph capturable on the first call of a device (cuBLAS's handle is made then).
+ */
+[[nodiscard]] std::size_t projection_tc_workspace_bytes(std::int32_t k, std::int32_t max_rows, std::int32_t cols);
+void projection_tc_fp32(std::span<const Tensor* const> inputs, std::span<const Tensor* const> weights, Tensor& out,
+                        DeviceArena& workspace, cudaStream_t stream);
+
+/**
+ * Op: moe_situ_experts_tc (not bit-exact: moe_situ_experts on the FP16 tensor cores)
+ *
+ * moe_situ_experts' math with the entries grouped by expert (the ids are read on the host: the call syncs) and the
+ * expert's inputs in FP16 under a power of two per entry (absmax in [2^14, 2^15)).
+ *   NVFP4 banks: every decoded weight value is exact in FP16 unscaled (at most 6 significant bits, magnitudes in
+ *   [2^-10, 2688]). One kernel per matrix runs every expert: a CTA takes 128 rows of one expert by up to 64 of its
+ *   entries, decodes the blocks into shared memory and multiplies on the tensor cores (WMMA, FP32 accumulate). The
+ *   gate/up kernel applies situ to its rows' pairs and stores the activation in FP16 under one power of two for the
+ *   whole call (situ is at most gate_cap up_cap in magnitude); the down kernel scatters each entry's column.
+ *   BF16 banks: each expert's rows in FP16 under a power of two per row, cuBLAS FP32-accumulating GEMMs, the
+ *   activation under a power of two per entry.
+ * The combine over the k slots is moe_situ_experts' (in order, one FMA each from 0). gate_cap and up_cap positive.
+ * Workspace: moe_situ_experts_tc_workspace_bytes(bank, k * T) from `workspace`, released on return.
+ * Execution: stream-ordered; syncs the stream; not graph capturable.
+ */
+[[nodiscard]] std::size_t moe_situ_experts_tc_workspace_bytes(const SituExpertBank& bank, std::int64_t entries);
+void moe_situ_experts_tc(const SituExpertBank& bank, const Tensor& z, const Tensor& ids, const Tensor* weights, float gate_cap,
+                         float up_cap, DeviceArena& workspace, Tensor& out, cudaStream_t stream);
+
+/// The values of NVFP4 rows (records of an expert bank: every gate, up and down row of every expert) that the row
+/// scaling does not carry exactly into FP16 (a diagnostic; syncs).
+[[nodiscard]] std::uint64_t nvfp4_bank_fp16_inexact(const SituExpertBank& bank, cudaStream_t stream);
+
+/// The values of BF16 rows [K, N] that the row scaling above does not carry exactly into FP16 (a diagnostic; syncs).
+[[nodiscard]] std::uint64_t bf16_fp16_inexact(const Tensor& w, cudaStream_t stream);
+
+} // namespace ninfer::ops

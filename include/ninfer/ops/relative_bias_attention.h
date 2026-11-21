@@ -94,7 +94,7 @@ struct RelativeBiasAttentionShape {
  * Logical shapes:
  *   q FP32 [heads * d, T]; r FP32 [heads * d_rel, T]; sink FP32 [heads, T]; k_new, v_new FP32 [kv_heads * d, T];
  *   table FP32 [d_rel, E] contiguous; k_cache, v_cache [kv_heads * d, capacity] contiguous, both FP32 or both FP16
- *   (FP16: opt-in, lossy rings; k_new and v_new must then be null, appended by head_norms_fp32), with storage on
+ *   (FP16: lossy rings; k_new and v_new must then be null, appended by head_norms_fp32), with storage on
  *   both paths (refused otherwise, before any launch); gate FP32
  *   [heads * d, T] or null; out FP32 [heads * d, T], or BF16 with a gate.
  *
@@ -128,7 +128,12 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& shape, const
                                   const Tensor& sink, const Tensor* k_new, const Tensor* v_new, const Tensor& table,
                                   Tensor& k_cache, Tensor& v_cache, std::int64_t start,
                                   const std::int64_t* start_offset, const Tensor* gate, Tensor& out, cudaStream_t stream,
-                                  const Tensor* split_workspace = nullptr, std::int32_t* split_counters = nullptr);
+                                  const Tensor* split_workspace = nullptr, std::int32_t* split_counters = nullptr,
+                                  bool tiled = false);
+// tiled (not bit-exact): a call of more than kSplitMaxColumns columns takes a wide route. Over FP16 rings with a group of 3
+// and d_rel <= 16 it is one-pass flash attention on the FP16 tensor cores (FP32 accumulation; a block takes 32 columns
+// by the 3 heads of a KV group); otherwise key tiles staged in shared memory fold into 16 columns per block (FP32, the
+// sums in another order than the single-block kernel).
 
 /// Calls of at most this many columns split their keys across blocks when given a split workspace.
 inline constexpr std::int32_t kSplitMaxColumns = 8;
