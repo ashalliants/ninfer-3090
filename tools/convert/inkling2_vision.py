@@ -23,6 +23,7 @@ PROJECTOR = "inkling2v"
 # the 2D RoPE base, and at most 4096 merged image tokens per image (larger images are resized down).
 ROPE_THETA = 10000.0
 MAX_IMAGE_TOKENS = 4096
+HEAD_DIM = 64
 
 # GGUF name -> parameter name, outside the layers.
 _GLOBAL = {
@@ -102,8 +103,10 @@ def vision_config(metadata: Mapping, text: Mapping) -> dict:
     if not isinstance(eps, float) or not eps > 0:
         raise Inkling2Error(f"mmproj GGUF: the layer norm epsilon must be a positive real, got {eps!r}")
     hidden, heads = _int(metadata, "clip.vision.embedding_length"), _int(metadata, "clip.vision.attention.head_count")
-    if hidden % heads or (hidden // heads) % 4:
-        raise Inkling2Error(f"mmproj GGUF: {hidden} is not {heads} heads of a multiple of 4 (2D RoPE halves)")
+    # The tower's attention takes heads of HEAD_DIM (vit_attention_fp32, include/ninfer/ops/vit_fp32.h), as
+    # parse_vision_config checks at load.
+    if hidden % heads or hidden // heads != HEAD_DIM:
+        raise Inkling2Error(f"mmproj GGUF: {hidden} is not {heads} heads of {HEAD_DIM}, the tower's attention width")
     patch, image = _int(metadata, "clip.vision.patch_size"), _int(metadata, "clip.vision.image_size")
     if image % patch:
         raise Inkling2Error(f"mmproj GGUF: image_size {image} is not a multiple of patch_size {patch}")

@@ -245,7 +245,7 @@ def write_dspark(path: Path, metadata_changes: dict | None = None,
 
 # The vision tower (mmproj, clip.vision.projector_type inkling2v) at toy sizes: 2 layers of a 32-wide ViT with 2
 # heads, 4x4 patches and a 3x3 position grid, projected into the text model's HIDDEN.
-V_LAYERS, V_HIDDEN, V_HEADS, V_FF, V_PATCH, V_GRID = 2, 32, 2, 48, 4, 3
+V_LAYERS, V_HIDDEN, V_HEADS, V_FF, V_PATCH, V_GRID = 2, 128, 2, 48, 4, 3  # heads of 64, as the tower's attention
 
 
 def vision_metadata() -> list[tuple[str, int, object]]:

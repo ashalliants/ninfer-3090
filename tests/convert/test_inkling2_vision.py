@@ -83,6 +83,7 @@ def test_the_tower_is_stored_exactly_beside_the_text_model(text_path, tmp_path):
     ({"clip.vision.projector_type": "qwen3vl_merger"}, "projector_type"),
     ({"clip.vision.projection_dim": 128}, "projection_dim"),
     ({"clip.vision.attention.head_count": 3}, "heads"),
+    ({"clip.vision.attention.head_count": 4}, "heads of 64"),
     ({"clip.vision.spatial_merge_size": 3}, "spatial_merge_size"),
     ({"clip.vision.image_std": (fixture.F32V, [0.5, 0.5])}, "image_std"),
     ({"clip.vision.attention.layer_norm_epsilon": None}, "epsilon"),
