@@ -109,6 +109,8 @@ private:
     void control(std::span<const ControllerWeights* const> w, std::span<const Tensor* const> c, std::span<const Tensor* const> m,
                  std::span<Tensor* const> out);
     Tensor project(const Tensor& x_bf16, std::span<const WeightId> weights, std::span<const std::int32_t> rows);
+    // Weight i by inputs[i], every row in one launch (decode widths, BF16 weights).
+    Tensor project_inputs(std::span<const Tensor* const> inputs, std::span<const WeightId> weights, std::span<const std::int32_t> rows);
     // With rollback saving on: x (a convolution's input [C, T]) after the saved history.
     void save_input(Tensor& saved, const Tensor& x);
     void copy_tap(std::uint32_t visit, const Tensor& value);
