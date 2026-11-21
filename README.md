@@ -39,7 +39,7 @@ Qwen3.8-27B and Qwen3.8-Flash-Next too, and is the first home of **Inkling-2-Min
 > from another card or estimated. Other NVIDIA GPUs may build and run, but they are not targets:
 > no tuning, no published numbers, no guarantees.
 
-> **New: Inkling-2-Mini** (Thinking Machines, 2026-11-20), a 26B-total, 3.4B-active looped MoE with
+> **New: Inkling-2-Mini** (Thinking Machines, 2026-11-20), a 26B-total looped MoE (5.4B active per token) with
 > 128 experts, now runs on one Tesla V100 with images and its own DSpark speculative drafter, served
 > over the same OpenAI and Anthropic APIs. See [Inkling-2-Mini](#inkling-2-mini-new-v100).
 
@@ -587,7 +587,7 @@ to resume, and is not the artifact the tests or the published figures use.
 ### Inkling-2-Mini (new, V100)
 
 [Inkling-2-Mini](https://thinkingmachines.ai/model-card/inkling-2-mini/) is Thinking Machines'
-26.2B-total, 3.4B-active MoE: 24 layers, of which the middle 12 run three times per token (48 layer
+26.2B-total MoE, 3.4B active per layer pass and 5.4B per token: 24 layers, of which the middle 12 run three times per token (48 layer
 visits), 128 experts with top-8 sigmoid routing, NVFP4 experts on layers 0-19, and a learned
 relative attention bias instead of RoPE. It takes text and images; it has no video input.
 

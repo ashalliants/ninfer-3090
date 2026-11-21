@@ -55,7 +55,7 @@ OpenAI and Anthropic APIs, so Claude Code, Codex, Cursor, Cline and other tools 
 
 ## The model
 
-- 26.2B parameters in total, 3.4B active per token; hidden size 2304; vocabulary of 200,058 tokens.
+- 26.2B parameters in total; 3.4B active per layer pass, 5.4B per token (the middle 12 layers run three times); hidden size 2304; vocabulary of 200,058 tokens.
 - 24 decoder layers, of which layers 6-17 run three times per token (48 layer visits), each visit with
   its own KV and convolution state, steered by a rank-64 loop controller, with depth-attention residuals
   over 6-layer blocks.
