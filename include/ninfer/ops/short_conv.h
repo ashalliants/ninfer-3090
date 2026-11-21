@@ -38,8 +38,17 @@ void short_conv_fp32(const Tensor& x, const Tensor& taps, const Tensor* dynamic,
                      Tensor& out, cudaStream_t stream);
 
 /// One short_conv_fp32 of a batch, optionally also writing sum = residual + out (out may then be null).
+/// A short_conv input formed in the convolution's launch: x[:, t] = sum_i weights[i, t] * entries[:, t * k + i]
+/// (i in order, one FMA each from 0: moe_situ_experts' combine), written to `x` when that is not null.
+struct ConvCombine {
+    const Tensor* entries = nullptr; // FP32 [C, k * T] contiguous
+    const Tensor* weights = nullptr; // FP32 [k, T] contiguous
+    Tensor* x             = nullptr; // FP32 [C, T] or null
+};
+
 struct ShortConvJob {
-    const Tensor* x        = nullptr;
+    const Tensor* x        = nullptr; // null with combine
+    const ConvCombine* combine = nullptr;
     const Tensor* taps     = nullptr;
     const Tensor* dynamic  = nullptr;
     Tensor* history        = nullptr;
