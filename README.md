@@ -552,10 +552,10 @@ a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding wor
 | Qwen3.6-35B-A3B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/ee4495803bc4f8015b8a7e22d4cf9b67de8e27c6) | 21.23 GiB | Carries the DFlash bundle for `--spec dflash` |
 | Qwen3.6-27B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-27B-NInfer/tree/3e3d9a3951c452c1ca80bd7a2860c7f3bfc5a829) | 16.29 GiB | Supported with more runtime headroom |
 | Qwen3.8-Flash-Next (preview) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090/tree/c7dfb9694fc3cb3d40298afbfe2e3a8c172241fa) | 38.20 GiB in two files + 27.13 GiB n-gram volume | Windows, one request at a time (two lanes opt-in), 64 GB RAM. This fork's [exact conversion](model-cards/Qwen3.8-Flash-Next-NInfer-3090/README.md) of the GSQ-RCO IQ2_XS GGUF with the MTP drafter and vision tower. Keep the n-gram volume on NVMe |
-| **Inkling-2-Mini** (new, V100) | converted locally from [Unsloth's UD-Q8_K_XL GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) | 22.27 GiB with DSpark and vision | Tesla V100 32 GB, Linux, one request at a time. An exact conversion: every tensor byte-identical to the GGUFs. See [Inkling-2-Mini](#inkling-2-mini-new-v100) |
+| **Inkling-2-Mini** (new, V100) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Inkling-2-Mini-NInfer-V100/tree/e348ad671599db1db110447b9d9ebfb898070f67) | 22.27 GiB with DSpark and vision | Tesla V100 32 GB, Linux, one request at a time. This fork's [exact conversion](model-cards/Inkling-2-Mini-NInfer-V100/README.md) of Unsloth's UD-Q8_K_XL GGUF: every tensor byte-identical to the GGUFs. See [Inkling-2-Mini](#inkling-2-mini-new-v100) |
 | Qwen3.8-Flash-Next, UD-IQ3_XXS (preview) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090/tree/196f11834dfe4fc21342f0255bcee034a5120ae7) | 53.17 GiB in two files + the 27.13 GiB n-gram volume of the row above | Windows, one request at a time, 64 GB RAM (about 42 GiB available), text only. This fork's [conversion](model-cards/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090/README.md) of Unsloth's Dynamic v3.1 UD-IQ3_XXS GGUF with the MTP drafter: lower perplexity than the row above, about half the speed |
 
-`download-model qwen38-27b`, `bonsai2-27b`, `qwen36-35b-a3b` or `qwen36-27b` (`.bat` on Windows, `.sh` on Linux)
+`download-model qwen38-27b`, `bonsai2-27b`, `qwen36-35b-a3b` or `qwen36-27b` (`.bat` on Windows, `.sh` on Linux; `inkling2-mini` with `.sh` only)
 fetches the pinned revision into `models/` and verifies it. `download-model qwen38-flash-next`
 fetches the Flash-Next model, its second file and the n-gram volume the same way (`qwen38-flash-next-iq3`
 fetches the UD-IQ3_XXS build, which reuses the same volume if it is already there); it asks which folder the volume goes in (`NINFER_NGRAM_DIR` answers in advance), because the volume is
@@ -604,9 +604,15 @@ Responses routes, with streaming, tool calls, reasoning and thinking budgets, an
 - **Not yet:** prefix reuse, more than one lane, the context store, JSON-schema output and logprobs.
   The server refuses requests that need them. Not measured on an RTX 3090.
 
-Convert it from Unsloth's UD-Q8_K_XL GGUF with `tools/convert/inkling2.py` (add the DSpark drafter
-and the `mmproj` vision tower with `--mtp-gguf` and `--mmproj`); the design, the conversion map and
-every measurement are in [docs/maintainer/inkling2-model.md](docs/maintainer/inkling2-model.md).
+```bash
+scripts/download-model.sh inkling2-mini      # WarlaxZ/Inkling-2-Mini-NInfer-V100, 22.3 GiB, pinned and verified
+ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dspark
+```
+
+The [model card](model-cards/Inkling-2-Mini-NInfer-V100/README.md) has the file hashes and sources. To
+convert it yourself from Unsloth's GGUFs, run `python3 -m tools.convert --recipe inkling2_gguf` with
+`--mtp-gguf` for the DSpark drafter and `--mmproj` for the vision tower. The design, the conversion map
+and every measurement are in [docs/maintainer/inkling2-model.md](docs/maintainer/inkling2-model.md).
 
 ## Performance on an RTX 3090
 
