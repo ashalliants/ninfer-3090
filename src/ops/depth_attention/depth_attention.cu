@@ -51,12 +51,12 @@ __device__ float block_sum(float v, float* scratch) {
     return total;
 }
 
-// Phase 1, grid (chunks, S, T): block (c, j, t) sums source j's squares and its dot with every query over rows
+// Phase 1, grid (T, chunks, S): block (c, j, t) sums source j's squares and its dot with every query over rows
 // [c * kChunk, (c + 1) * kChunk) of column t into partial[((t * S + j) * chunks + c) * kPartials + ...].
 __global__ void __launch_bounds__(kThreads) mix_partial_kernel(MixArgs a, float* __restrict__ partial) {
     __shared__ float scratch[kThreads / 32];
-    const int c = blockIdx.x, j = blockIdx.y, chunks = gridDim.x;
-    const std::int64_t t = blockIdx.z;
+    const int c = blockIdx.y, j = blockIdx.z, chunks = gridDim.y;
+    const std::int64_t t = blockIdx.x; // columns on x: the grid's long axis, so T has no 65535 cap
     const int d = c * kChunk + threadIdx.x;
     float v = 0.0F;
     const float* src = a.src[0];
@@ -79,12 +79,12 @@ __global__ void __launch_bounds__(kThreads) mix_partial_kernel(MixArgs a, float*
     }
 }
 
-// Phase 2, grid (chunks, T): every block reduces the column's partials (a few hundred floats), forms the softmax
+// Phase 2, grid (T, chunks): every block reduces the column's partials (a few hundred floats), forms the softmax
 // weights and writes its rows of each output.
 __global__ void __launch_bounds__(kThreads) mix_apply_kernel(MixArgs a, const float* __restrict__ partial, int chunks) {
     __shared__ float sums[kS][kPartials];
-    const std::int64_t t = blockIdx.y;
-    const int d = blockIdx.x * kChunk + threadIdx.x;
+    const std::int64_t t = blockIdx.x;
+    const int d = blockIdx.y * kChunk + threadIdx.x;
     if (threadIdx.x < a.sources * kPartials) {
         const int j = threadIdx.x / kPartials, k = threadIdx.x % kPartials;
         const float* in = partial + (t * a.sources + j) * chunks * kPartials + k;
@@ -141,8 +141,8 @@ std::size_t partial_floats(std::int32_t rows, std::int64_t columns, int sources)
 __global__ void __launch_bounds__(kThreads)
 combine_kernel(const float* c, std::int64_t cs, const float* m, std::int64_t ms, const float* __restrict__ gf, std::int64_t gs,
                int rows, float* out, std::int64_t os) {
-    const std::int64_t t = blockIdx.y;
-    const int d = blockIdx.x * kThreads + threadIdx.x;
+    const std::int64_t t = blockIdx.x;
+    const int d = blockIdx.y * kThreads + threadIdx.x;
     if (d >= rows) { return; }
     const float gain = tanhf(gf[t * gs + d]), forget = tanhf(gf[t * gs + rows + d]);
     out[t * os + d] = (1.0F - forget) * c[t * cs + d] + gain * m[t * ms + d];
@@ -152,7 +152,7 @@ combine_kernel(const float* c, std::int64_t cs, const float* m, std::int64_t ms,
 
 std::size_t depth_attention_mix_workspace_bytes(std::int32_t rows, std::int64_t columns, int sources) {
     require(sources >= 1 && sources <= kDepthAttentionMaxSources, "1 to 8 sources");
-    require(rows > 0 && rows <= 8192 && columns > 0 && columns <= 65535, "D must be 1..8192 and T 1..65535");
+    require(rows > 0 && rows <= 8192 && columns > 0, "D must be 1..8192 and T positive");
     return partial_floats(rows, columns, sources) * sizeof(float) + 256; // + the arena's alignment
 }
 
@@ -162,7 +162,7 @@ void depth_attention_mix(std::span<const Tensor* const> sources, const Tensor& q
     require(!outputs.empty() && outputs.size() <= kDepthAttentionMaxQueries, "1 to 4 queries");
     require(eps > 0.0F, "eps must be positive");
     const std::int32_t rows = sources[0]->ne[0], cols = sources[0]->ne[1];
-    require(rows > 0 && rows <= 8192 && cols > 0 && cols <= 65535, "D must be 1..8192 and T 1..65535");
+    require(rows > 0 && rows <= 8192 && cols > 0, "D must be 1..8192 and T positive");
     require(queries.dtype == DType::FP32 && queries.is_contiguous() && queries.ne[0] == rows &&
                 queries.numel() == static_cast<std::int64_t>(rows) * static_cast<std::int64_t>(outputs.size()),
             "queries must be contiguous FP32 [D, Q]");
@@ -183,9 +183,9 @@ void depth_attention_mix(std::span<const Tensor* const> sources, const Tensor& q
     const int chunks = mix_chunks(rows);
     const auto scope = workspace.scope();
     float* partial = static_cast<float*>(workspace.alloc_bytes(partial_floats(rows, cols, a.sources) * sizeof(float)).data);
-    mix_partial_kernel<<<dim3(chunks, a.sources, cols), kThreads, 0, stream>>>(a, partial);
+    mix_partial_kernel<<<dim3(cols, chunks, a.sources), kThreads, 0, stream>>>(a, partial);
     check_launch();
-    mix_apply_kernel<<<dim3(chunks, cols), kThreads, 0, stream>>>(a, partial, chunks);
+    mix_apply_kernel<<<dim3(cols, chunks), kThreads, 0, stream>>>(a, partial, chunks);
     check_launch();
 }
 
@@ -193,7 +193,7 @@ void forget_gain_combine(const Tensor& c, const Tensor& m, const Tensor& gf, Ten
     const std::int32_t rows = c.ne[0], cols = c.ne[1];
     const std::int64_t cs = column_stride(c, rows, cols, "c"), ms = column_stride(m, rows, cols, "m"),
                        gs = column_stride(gf, 2 * rows, cols, "gf"), os = column_stride(out, rows, cols, "out");
-    const dim3 grid((rows + kThreads - 1) / kThreads, cols);
+    const dim3 grid(cols, (rows + kThreads - 1) / kThreads);
     combine_kernel<<<grid, kThreads, 0, stream>>>(static_cast<const float*>(c.data), cs, static_cast<const float*>(m.data), ms,
                                                   static_cast<const float*>(gf.data), gs, rows, static_cast<float*>(out.data), os);
     check_launch();

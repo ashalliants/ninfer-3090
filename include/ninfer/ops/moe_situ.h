@@ -24,7 +24,7 @@ namespace ninfer::ops {
  *
  * Logical shapes: z FP32 [D, T] (any column stride); router FP32 [D, E] contiguous; bias FP32 [E];
  *   ids I32 [top_k, T] and weights FP32 [top_k, T], contiguous.
- * Supported domain: E at most 256, 1 <= top_k <= min(E, 16), T at most 65535.
+ * Supported domain: E at most 256, 1 <= top_k <= min(E, 16).
  * Numeric: FP32 logits; oracle FP64 (inkling2_reference.h route). A near tie at the k-th place may select
  *   differently from the oracle; the test accepts that only within the FP32 bound of the two scores.
  * Workspace: moe_route_sigmoid_topk_workspace_bytes(E, T) from `workspace`, released on return; the query

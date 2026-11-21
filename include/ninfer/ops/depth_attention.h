@@ -32,7 +32,7 @@ inline constexpr int kDepthAttentionMaxQueries = 4;
  *   sources: S FP32 [D, T]; queries FP32 [D, Q] contiguous; outputs: Q FP32 [D, T].
  *
  * Supported domain:
- *   1 <= S <= kDepthAttentionMaxSources, 1 <= Q <= kDepthAttentionMaxQueries, D at most 8192, T at most 65535.
+ *   1 <= S <= kDepthAttentionMaxSources, 1 <= Q <= kDepthAttentionMaxQueries, D at most 8192.
  *
  * Numeric:
  *   FP32 reductions, max-subtracted softmax; oracle FP64 (tests/ops/inkling2_reference.h mix).

@@ -71,8 +71,8 @@ template <Unary kind, typename Out>
 __global__ void __launch_bounds__(kThreads)
 elementwise_kernel(const float* __restrict__ a, std::int64_t as, const float* __restrict__ b, std::int64_t bs, float cap,
                    int rows, Out* out, std::int64_t os) {
-    const int t = blockIdx.y;
-    const int d = blockIdx.x * kThreads + threadIdx.x;
+    const int t = blockIdx.x; // columns on x: the grid's long axis, so T has no 65535 cap
+    const int d = blockIdx.y * kThreads + threadIdx.x;
     if (d >= rows) { return; }
     const float x = a[t * as + d];
     float y;
@@ -89,7 +89,7 @@ elementwise_kernel(const float* __restrict__ a, std::int64_t as, const float* __
 __global__ void __launch_bounds__(kThreads)
 embedding_kernel(const std::int32_t* __restrict__ ids, const __nv_bfloat16* __restrict__ table, int rows,
                  float* __restrict__ out, std::int64_t os) {
-    const int t = blockIdx.y, d = blockIdx.x * kThreads + threadIdx.x;
+    const int t = blockIdx.x, d = blockIdx.y * kThreads + threadIdx.x;
     if (d >= rows) { return; }
     out[t * os + d] = __bfloat162float(table[static_cast<std::int64_t>(ids[t]) * rows + d]);
 }
@@ -105,7 +105,7 @@ void elementwise(const char* op, const Tensor& a, const Tensor* b, float cap, Te
     require(out.dtype == DType::FP32 || (kind == Unary::SigmoidGate && out.dtype == DType::BF16), op, "unsupported output dtype");
     const Columns co = columns(out, out.dtype, op, "out");
     require_same(ca, co, op);
-    const dim3 grid((ca.rows + kThreads - 1) / kThreads, ca.cols);
+    const dim3 grid(ca.cols, (ca.rows + kThreads - 1) / kThreads);
     const float* bp = b != nullptr ? static_cast<const float*>(b->data) : nullptr;
     if (out.dtype == DType::FP32) {
         elementwise_kernel<kind, float><<<grid, kThreads, 0, stream>>>(static_cast<const float*>(a.data), ca.stride, bp, cb.stride, cap,
@@ -160,7 +160,7 @@ void embedding_bf16_fp32(const Tensor& ids, const Tensor& table, Tensor& out, cu
     require(table.dtype == DType::BF16 && table.is_contiguous() && table.ne[2] == 1, op, "table must be contiguous BF16 [D, V]");
     const Columns co = columns(out, DType::FP32, op, "out");
     require(co.rows == table.ne[0] && co.cols == ids.numel(), op, "out must be [D, T]");
-    const dim3 grid((co.rows + kThreads - 1) / kThreads, co.cols);
+    const dim3 grid(co.cols, (co.rows + kThreads - 1) / kThreads);
     embedding_kernel<<<grid, kThreads, 0, stream>>>(static_cast<const std::int32_t*>(ids.data),
                                                     static_cast<const __nv_bfloat16*>(table.data), co.rows,
                                                     static_cast<float*>(out.data), co.stride);

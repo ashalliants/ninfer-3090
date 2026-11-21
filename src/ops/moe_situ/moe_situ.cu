@@ -41,7 +41,7 @@ __device__ float warp_sum(float v) {
 
 // ------------------------------------------------------------------------------------------------ routing
 
-// grid (E, T): block (e, t) scores expert e for column t, kScoreThreads threads over the rows (a decode column
+// grid (T, E): block (t, e) scores expert e for column t, kScoreThreads threads over the rows (a decode column
 // is 128 blocks, enough to stream the router at bandwidth).
 constexpr int kScoreThreads = 128;
 
@@ -49,7 +49,7 @@ __global__ void __launch_bounds__(kScoreThreads)
 route_score_kernel(const float* __restrict__ z, std::int64_t zs, const float* __restrict__ router, int rows, int experts,
                    float* __restrict__ scores) {
     __shared__ float part[kScoreThreads / 32];
-    const int e = blockIdx.x, t = blockIdx.y, lane = threadIdx.x & 31;
+    const int t = blockIdx.x, e = blockIdx.y, lane = threadIdx.x & 31; // T on x: no 65535 cap
     const float* col = z + t * zs;
     const float* w = router + static_cast<std::int64_t>(e) * rows;
     float dot = 0.0F;
@@ -321,7 +321,7 @@ gate_up_kernel(BankArgs b, const float* __restrict__ z, std::int64_t zs, const s
     Tables* lut          = reinterpret_cast<Tables*>(shared);
     std::uint32_t* stage = reinterpret_cast<std::uint32_t*>(lut + 1);
     float* x             = reinterpret_cast<float*>(stage + kWarps * kStageWords);
-    const int entry = blockIdx.y, t = entry / top_k, e = ids[entry];
+    const int entry = blockIdx.x, t = entry / top_k, e = ids[entry]; // entries on x: no 65535 cap
     const float* col = z + t * zs;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float* a = act + static_cast<std::int64_t>(entry) * b.inter;
@@ -329,7 +329,7 @@ gate_up_kernel(BankArgs b, const float* __restrict__ z, std::int64_t zs, const s
         fill_tables(lut);
         stage_padded(col, b.hidden, x);
         __syncthreads();
-        const int first = (blockIdx.x * kWarps + warp) * kGateRows;
+        const int first = (blockIdx.y * kWarps + warp) * kGateRows;
         if (first >= b.inter) { return; }
         const std::uint8_t* rec = b.records + static_cast<std::uint64_t>(e) * b.stride;
         const std::uint8_t* groups[2] = {rec + static_cast<std::uint64_t>(first) * b.gate_row_bytes,
@@ -350,7 +350,7 @@ gate_up_kernel(BankArgs b, const float* __restrict__ z, std::int64_t zs, const s
     }
     for (int d = threadIdx.x; d < b.hidden; d += kThreads) { x[d] = col[d]; }
     __syncthreads();
-    const int i = blockIdx.x * kWarps + warp;
+    const int i = blockIdx.y * kWarps + warp;
     if (i >= b.inter) { return; }
     const __nv_bfloat16* base = b.gate_up + static_cast<std::int64_t>(e) * 2 * b.inter * b.hidden;
     const float g = bf16_row_dot(base + static_cast<std::int64_t>(i) * b.hidden, b.hidden, x);
@@ -365,7 +365,7 @@ down_kernel(BankArgs b, const std::int32_t* __restrict__ ids, const float* __res
     Tables* lut          = reinterpret_cast<Tables*>(shared);
     std::uint32_t* stage = reinterpret_cast<std::uint32_t*>(lut + 1);
     float* a             = reinterpret_cast<float*>(stage + kWarps * kStageWords);
-    const int entry = blockIdx.y, e = ids[entry];
+    const int entry = blockIdx.x, e = ids[entry];
     const float* src = act + static_cast<std::int64_t>(entry) * b.inter;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float* out = y + static_cast<std::int64_t>(entry) * b.hidden;
@@ -373,7 +373,7 @@ down_kernel(BankArgs b, const std::int32_t* __restrict__ ids, const float* __res
         fill_tables(lut);
         stage_padded(src, b.inter, a);
         __syncthreads();
-        const int first = (blockIdx.x * kWarps + warp) * kDownRows;
+        const int first = (blockIdx.y * kWarps + warp) * kDownRows;
         if (first >= b.hidden) { return; }
         const std::uint8_t* rec = b.records + static_cast<std::uint64_t>(e) * b.stride + b.down_offset;
         const std::uint8_t* groups[1] = {rec + static_cast<std::uint64_t>(first) * b.down_row_bytes};
@@ -390,7 +390,7 @@ down_kernel(BankArgs b, const std::int32_t* __restrict__ ids, const float* __res
     }
     for (int d = threadIdx.x; d < b.inter; d += kThreads) { a[d] = src[d]; }
     __syncthreads();
-    const int h = blockIdx.x * kWarps + warp;
+    const int h = blockIdx.y * kWarps + warp;
     if (h >= b.hidden) { return; }
     const float v = bf16_row_dot(b.down + (static_cast<std::int64_t>(e) * b.hidden + h) * b.inter, b.inter, a);
     if (lane == 0) { out[h] = v; }
@@ -398,7 +398,7 @@ down_kernel(BankArgs b, const std::int32_t* __restrict__ ids, const float* __res
 
 __global__ void combine_kernel(const float* __restrict__ y, const float* __restrict__ weights, int hidden, int top_k,
                                float* __restrict__ out) {
-    const int t = blockIdx.y, h = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.x, h = blockIdx.y * blockDim.x + threadIdx.x;
     if (h >= hidden) { return; }
     float acc = 0.0F;
     for (int i = 0; i < top_k; ++i) {
@@ -452,7 +452,7 @@ std::size_t workspace_for(const SituExpertBank& bank, std::int64_t entries) {
 std::size_t moe_route_sigmoid_topk_workspace_bytes(std::int32_t experts, std::int64_t columns) {
     const char* op = "moe_route_sigmoid_topk";
     require(experts > 0 && experts <= kMaxExperts, op, "E must be 1..256");
-    require(columns > 0 && columns <= 65535, op, "T must be 1..65535 (the scoring grid's y)");
+    require(columns > 0, op, "T must be positive");
     return align256(static_cast<std::uint64_t>(experts) * static_cast<std::uint64_t>(columns) * 4);
 }
 
@@ -464,7 +464,7 @@ void moe_route_sigmoid_topk(const Tensor& z, const Tensor& router, const Tensor&
     require(router.dtype == DType::FP32 && router.is_contiguous() && router.ne[0] == rows, op, "router must be contiguous FP32 [D, E]");
     const int experts = router.ne[1];
     require(experts > 0 && experts <= kMaxExperts, op, "E must be 1..256");
-    require(cols > 0 && cols <= 65535, op, "T must be 1..65535 (the scoring grid's y)");
+    require(cols > 0, op, "T must be positive");
     require(top_k >= 1 && top_k <= 16 && top_k <= experts, op, "top_k must be 1..min(E, 16)");
     require(bias.dtype == DType::FP32 && bias.is_contiguous() && bias.numel() == experts, op, "bias must be FP32 [E]");
     require(ids.dtype == DType::I32 && ids.is_contiguous() && ids.numel() == static_cast<std::int64_t>(top_k) * cols, op,
@@ -473,7 +473,7 @@ void moe_route_sigmoid_topk(const Tensor& z, const Tensor& router, const Tensor&
             "weights must be contiguous FP32 [k, T]");
     const auto scope = workspace.scope();
     float* scores = static_cast<float*>(workspace.alloc_bytes(static_cast<std::size_t>(experts) * cols * 4).data);
-    route_score_kernel<<<dim3(experts, cols), kScoreThreads, 0, stream>>>(
+    route_score_kernel<<<dim3(cols, experts), kScoreThreads, 0, stream>>>(
         static_cast<const float*>(z.data), zs, static_cast<const float*>(router.data), rows, experts, scores);
     check_launch(op);
     route_select_kernel<<<cols, 32, 0, stream>>>(scores, static_cast<const float*>(bias.data), experts, top_k, scale,
@@ -510,13 +510,13 @@ void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor&
         return sizeof(Tables) + kWarps * kStageWords * sizeof(std::uint32_t) +
                static_cast<std::size_t>(n / kNvfp4Values + 1) * kPaddedBlock * sizeof(float);
     };
-    gate_up_kernel<<<dim3((bank.intermediate + gate_per_block - 1) / gate_per_block, entries), kThreads, staged(bank.hidden), stream>>>(
+    gate_up_kernel<<<dim3(entries, (bank.intermediate + gate_per_block - 1) / gate_per_block), kThreads, staged(bank.hidden), stream>>>(
         b, static_cast<const float*>(z.data), zs, id, top_k, gate_cap, up_cap, act);
     check_launch(op);
-    down_kernel<<<dim3((bank.hidden + down_per_block - 1) / down_per_block, entries), kThreads, staged(bank.intermediate), stream>>>(
+    down_kernel<<<dim3(entries, (bank.hidden + down_per_block - 1) / down_per_block), kThreads, staged(bank.intermediate), stream>>>(
         b, id, act, y);
     check_launch(op);
-    combine_kernel<<<dim3((bank.hidden + 255) / 256, cols), 256, 0, stream>>>(y, static_cast<const float*>(weights.data), bank.hidden,
+    combine_kernel<<<dim3(cols, (bank.hidden + 255) / 256), 256, 0, stream>>>(y, static_cast<const float*>(weights.data), bank.hidden,
                                                                                top_k, static_cast<float*>(out.data));
     check_launch(op);
 }

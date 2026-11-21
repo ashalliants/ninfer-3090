@@ -508,6 +508,49 @@ void bench_experts(bool nvfp4) {
 
 } // namespace
 
+// More columns than a grid's y holds (70000 > 65535): every column is the same, so each must give the first
+// column's bits, and the first must meet the oracle.
+void test_many_columns() {
+    const int h = 64, cols = 70000, e = 16, k = 2;
+    const auto col0 = randoms(h, -1, 1), col1 = randoms(h, -2, 2), q = randoms(h, -0.3F, 0.3F);
+    std::vector<float> a, b;
+    for (int c = 0; c < cols; ++c) {
+        a.insert(a.end(), col0.begin(), col0.end());
+        b.insert(b.end(), col1.begin(), col1.end());
+    }
+    Buf da(a), db(b), dq(q), out(static_cast<std::size_t>(h) * cols);
+    const Tensor ta = da.tensor({h, cols}), tb = db.tensor({h, cols});
+    Tensor to = out.tensor({h, cols});
+    const Tensor* sources[] = {&ta, &tb};
+    Tensor* outs[] = {&to};
+    ninfer::DeviceArena arena(ninfer::ops::depth_attention_mix_workspace_bytes(h, cols, 2) + 4096);
+    ninfer::ops::depth_attention_mix(sources, dq.tensor({h, 1}), 1e-6F, arena, outs, nullptr);
+    const auto got = out.get(static_cast<std::size_t>(h) * cols);
+    bool same = true;
+    for (int c = 1; c < cols && same; ++c) { same = std::equal(got.begin(), got.begin() + h, got.begin() + static_cast<std::ptrdiff_t>(c) * h); }
+    check(same, "MIX over 70000 columns: a column differs from the first");
+    compare("depth_attention_mix T = 70000, column 0", std::vector<float>(got.begin(), got.begin() + h),
+            ref::mix({widen(col0), widen(col1)}, widen(q), h), 2e-6);
+
+    const auto router = randoms(e * h, -0.5F, 0.5F), bias = randoms(e, -0.01F, 0.01F);
+    Buf dr(router), dbias(bias), ids(static_cast<std::size_t>(k) * cols), w(static_cast<std::size_t>(k) * cols);
+    Tensor tid = ids.tensor({k, cols}, DType::I32), tw = w.tensor({k, cols});
+    ninfer::DeviceArena route_arena(ninfer::ops::moe_route_sigmoid_topk_workspace_bytes(e, cols) + 4096);
+    ninfer::ops::moe_route_sigmoid_topk(ta, dr.tensor({h, e}), dbias.tensor({e}), k, 8.0F, route_arena, tid, tw, nullptr);
+    const auto got_ids = t::from_device<std::int32_t>(ids.b, static_cast<std::size_t>(k) * cols);
+    const auto got_w = w.get(static_cast<std::size_t>(k) * cols);
+    bool same_route = true;
+    for (int c = 1; c < cols && same_route; ++c) {
+        for (int i = 0; i < k; ++i) { same_route = same_route && got_ids[c * k + i] == got_ids[i] && got_w[c * k + i] == got_w[i]; }
+    }
+    check(same_route, "route over 70000 columns: a column differs from the first");
+    const ref::Route want = ref::route(widen(col0), widen(router), widen(bias), k, 8.0);
+    bool ids_match = true;
+    for (int i = 0; i < k; ++i) { ids_match = ids_match && got_ids[i] == want.ids[i]; }
+    check(ids_match, "route T = 70000: column 0's experts differ from the oracle");
+    std::printf("T = 70000 (past a grid's y): MIX and route give every column the first one's bits\n");
+}
+
 // The workspace queries refuse what the Ops refuse.
 void test_workspace_queries() {
     const auto refuses = [](auto query) {
@@ -519,15 +562,13 @@ void test_workspace_queries() {
     namespace o = ninfer::ops;
     check(refuses([] { return o::depth_attention_mix_workspace_bytes(2304, 0, 2); }), "MIX query takes T = 0");
     check(refuses([] { return o::depth_attention_mix_workspace_bytes(2304, -1, 2); }), "MIX query takes T < 0");
-    check(refuses([] { return o::depth_attention_mix_workspace_bytes(2304, 65536, 2); }), "MIX query takes T > 65535");
     check(refuses([] { return o::depth_attention_mix_workspace_bytes(0, 1, 2); }), "MIX query takes D = 0");
     check(refuses([] { return o::depth_attention_mix_workspace_bytes(2304, 1, 9); }), "MIX query takes 9 sources");
     check(refuses([] { return o::moe_route_sigmoid_topk_workspace_bytes(0, 1); }), "route query takes E = 0");
     check(refuses([] { return o::moe_route_sigmoid_topk_workspace_bytes(257, 1); }), "route query takes E > 256");
     check(refuses([] { return o::moe_route_sigmoid_topk_workspace_bytes(128, 0); }), "route query takes T = 0");
-    check(refuses([] { return o::moe_route_sigmoid_topk_workspace_bytes(128, 65536); }), "route query takes T > 65535");
-    check(!refuses([] { return o::depth_attention_mix_workspace_bytes(2304, 65535, 8); }), "MIX query refuses its domain");
-    check(!refuses([] { return o::moe_route_sigmoid_topk_workspace_bytes(256, 65535); }), "route query refuses its domain");
+    check(!refuses([] { return o::depth_attention_mix_workspace_bytes(2304, 70000, 8); }), "MIX query refuses T > 65535");
+    check(!refuses([] { return o::moe_route_sigmoid_topk_workspace_bytes(256, 70000); }), "route query refuses T > 65535");
     std::printf("workspace queries refuse outside the domain\n");
 }
 
@@ -538,6 +579,7 @@ int main() {
     }
     try {
         test_workspace_queries();
+        test_many_columns();
         test_rows();
         test_mix_and_control();
         test_short_conv(false);

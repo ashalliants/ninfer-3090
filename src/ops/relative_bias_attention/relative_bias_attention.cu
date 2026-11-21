@@ -42,7 +42,7 @@ __device__ float warp_sum(float v) {
 __global__ void clip_kernel(float* x, std::int64_t xs, int head_dim, int heads, const float* __restrict__ scale, float threshold,
                             std::int64_t start, const std::int64_t* start_offset, std::int64_t floor, float alpha,
                             bool log_scale) {
-    const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
+    const int t = blockIdx.x, h = blockIdx.y, lane = threadIdx.x; // T on x: no 65535 cap
     float* v = x + t * xs + static_cast<std::int64_t>(h) * head_dim;
     float local[8];
     float ss = 0.0F;
@@ -66,7 +66,7 @@ __global__ void clip_kernel(float* x, std::int64_t xs, int head_dim, int heads, 
 }
 
 __global__ void unit_rms_kernel(float* x, std::int64_t xs, int head_dim, float eps) {
-    const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
+    const int t = blockIdx.x, h = blockIdx.y, lane = threadIdx.x; // T on x: no 65535 cap
     float* v = x + t * xs + static_cast<std::int64_t>(h) * head_dim;
     float ss = 0.0F;
     for (int d = lane; d < head_dim; d += 32) { ss = fmaf(v[d], v[d], ss); }
@@ -76,7 +76,7 @@ __global__ void unit_rms_kernel(float* x, std::int64_t xs, int head_dim, float e
 
 __global__ void append_kernel(const float* __restrict__ src, std::int64_t ss, int rows, std::int64_t start,
                               const std::int64_t* start_offset, std::int64_t capacity, float* __restrict__ cache) {
-    const int t = blockIdx.y, d = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.x, d = blockIdx.y * blockDim.x + threadIdx.x;
     if (d >= rows) { return; }
     const std::int64_t first = start + (start_offset != nullptr ? *start_offset : 0);
     cache[((first + t) % capacity) * rows + d] = src[t * ss + d];
@@ -114,7 +114,7 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(AttentionArgs a) {
     __shared__ float r[kMaxRel];
     __shared__ float scores[kTile];
     __shared__ float reduce[kWarps];
-    const int h = blockIdx.x, t = blockIdx.y, g = h / a.group;
+    const int t = blockIdx.x, h = blockIdx.y, g = h / a.group;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     q[threadIdx.x] = a.q[t * a.qs + static_cast<std::int64_t>(h) * kHeadDim + threadIdx.x];
     if (threadIdx.x < a.d_rel) { r[threadIdx.x] = a.r[t * a.rs + static_cast<std::int64_t>(h) * a.d_rel + threadIdx.x]; }
@@ -203,7 +203,7 @@ void head_l2_clip_fp32(Tensor& x, int head_dim, const Tensor* scale, float thres
     }
     require(threshold > 0.0F, op, "threshold must be positive");
     if (log_scale != nullptr) { require(log_scale->floor > 0 && log_scale->start >= 0, op, "invalid log scale"); }
-    const dim3 grid(heads, x.ne[1]);
+    const dim3 grid(x.ne[1], heads);
     clip_kernel<<<grid, 32, 0, stream>>>(static_cast<float*>(x.data), xs, head_dim, heads,
                                          scale != nullptr ? static_cast<const float*>(scale->data) : nullptr, threshold,
                                          log_scale != nullptr ? log_scale->start : 0,
@@ -218,7 +218,7 @@ void head_unit_rms_fp32(Tensor& x, int head_dim, float eps, cudaStream_t stream)
     require(head_dim > 0 && head_dim <= 256 && x.ne[0] % head_dim == 0, op, "rows must be whole heads of at most 256");
     require(eps > 0.0F, op, "eps must be positive");
     const std::int64_t xs = column_stride(x, x.ne[0], x.ne[1], op, "x");
-    const dim3 grid(x.ne[0] / head_dim, x.ne[1]);
+    const dim3 grid(x.ne[1], x.ne[0] / head_dim);
     unit_rms_kernel<<<grid, 32, 0, stream>>>(static_cast<float*>(x.data), xs, head_dim, eps);
     check_launch(op);
 }
@@ -246,7 +246,7 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
             op, "caches must be contiguous FP32 [kv_heads * d, capacity]");
     const std::int64_t capacity = k_cache.ne[1];
     require(s.window > 0 ? capacity >= s.window - 1 + cols : capacity >= start + cols, op, "the KV ring cannot hold the visible keys");
-    const dim3 append_grid((kv_width + 255) / 256, cols);
+    const dim3 append_grid(cols, (kv_width + 255) / 256);
     append_kernel<<<append_grid, 256, 0, stream>>>(static_cast<const float*>(k_new.data), ks, kv_width, start, start_offset, capacity,
                                                    static_cast<float*>(k_cache.data));
     append_kernel<<<append_grid, 256, 0, stream>>>(static_cast<const float*>(v_new.data), vs, kv_width, start, start_offset, capacity,
@@ -268,7 +268,7 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     a.start_offset = start_offset;
     a.capacity = capacity;
     a.kv_width = kv_width;
-    attention_kernel<<<dim3(s.heads, cols), kThreads, 0, stream>>>(a);
+    attention_kernel<<<dim3(cols, s.heads), kThreads, 0, stream>>>(a);
     check_launch(op);
 }
 
