@@ -724,9 +724,10 @@ void Inkling2Core::run(Job& job) {
         accept_ema = 0.8 * accept_ema + 0.2 * col;
         in_round   = false;
     };
-    // The next forward, of `next` (and drafts after it when a round pays).
-    const auto advance = [&](TokenId next) {
-        if (in_round && col + 1 < logits.ne[1] && drafted[static_cast<std::size_t>(col)] == next) {
+    // The next forward, of `next` (and drafts after it when a round pays). An `injected` control (a thinking budget's
+    // close) is never a draft's match: it ends the round there and goes through a plain step of the target.
+    const auto advance = [&](TokenId next, bool injected) {
+        if (!injected && in_round && col + 1 < logits.ne[1] && drafted[static_cast<std::size_t>(col)] == next) {
             ++col; // the column whose input is `next` is computed
             return;
         }
@@ -743,7 +744,7 @@ void Inkling2Core::run(Job& job) {
         // take: a round whose drafts could not be emitted would pay the draft and verify cost for nothing.
         const auto budget_left = static_cast<std::int64_t>(exec.requested_output_tokens) - static_cast<std::int64_t>(out.generated_token_ids.size());
         const auto drafts = static_cast<std::int32_t>(std::min<std::int64_t>(n_drafts, budget_left - 1));
-        bool round = speculate && forced.empty() && drafts >= 1 &&
+        bool round = speculate && !injected && forced.empty() && drafts >= 1 &&
                      program.position() + 1 + drafts <= static_cast<std::int64_t>(options_.max_context);
         if (round && plain_seconds == 0.0) { round = false; }
         if (round && !pays) {
@@ -905,7 +906,7 @@ void Inkling2Core::run(Job& job) {
             out.finish_reason = FinishReason::ContextCapacity;
             break;
         }
-        advance(next);
+        advance(next, injected);
     }
     if (in_round) {
         // The request ended inside a round: its drafts consumed so far count. Every exit but cancellation comes after

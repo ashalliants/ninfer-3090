@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -98,6 +99,14 @@ int main() {
         options.max_context   = 4096;
         Run plain;
         std::vector<ninfer::TokenId> plain_budget, plain_stop;
+        // Tight thinking budgets on every prompt: the forced close lands at many points of DSpark's rounds.
+        constexpr std::uint32_t kBudgets[] = {1, 3, 6, 12};
+        const auto budgeted = [](std::uint32_t budget) {
+            auto o                      = greedy(32);
+            o.execution.thinking.budget = budget;
+            return o;
+        };
+        std::vector<std::vector<ninfer::TokenId>> plain_budgets;
         {
             ninfer::Engine engine(options);
             std::printf("plain:\n");
@@ -105,6 +114,11 @@ int main() {
             auto budget                      = greedy(96);
             budget.execution.thinking.budget = 24;
             plain_budget = engine.generate(engine.prepare(user_turn(kPrompts[0])), budget).generated_token_ids;
+            for (const auto& prompt : kPrompts) {
+                for (const std::uint32_t b : kBudgets) {
+                    plain_budgets.push_back(engine.generate(engine.prepare(user_turn(prompt)), budgeted(b)).generated_token_ids);
+                }
+            }
             auto stop = greedy(256);
             stop.stop.strings.push_back({.text = "def ", .channel = ninfer::OutputChannel::Content});
             plain_stop = engine.generate(engine.prepare(user_turn(kPrompts[0])), stop).generated_token_ids;
@@ -164,6 +178,22 @@ int main() {
         budget.execution.thinking.budget = 24;
         const auto b = engine.generate(engine.prepare(user_turn(kPrompts[0])), budget);
         check(b.generated_token_ids == plain_budget && b.thinking.applied, "a thinking budget closes at the same token");
+        {
+            // The injected close is a plain step, never a consumed draft: every forwarded token is a round's anchor, an
+            // accepted draft or a plain step, and the output is plain greedy's.
+            std::size_t i = 0;
+            for (const auto& prompt : kPrompts) {
+                for (const std::uint32_t budget_tokens : kBudgets) {
+                    const auto r     = engine.generate(engine.prepare(user_turn(prompt)), budgeted(budget_tokens));
+                    const auto& spec = r.speculative;
+                    const std::string what = "thinking budget " + std::to_string(budget_tokens) + " on prompt " +
+                                             std::to_string(i / std::size(kBudgets));
+                    check(r.generated_token_ids == plain_budgets[i++], what + " yields plain greedy's tokens");
+                    check(r.generated_token_ids.size() - 1 == spec.rounds + spec.accepted_tokens + spec.fallback_steps,
+                          what + ": the forwarded tokens are anchors, accepted drafts and plain steps");
+                }
+            }
+        }
         auto stop = greedy(256);
         stop.stop.strings.push_back({.text = "def ", .channel = ninfer::OutputChannel::Content});
         const auto s = engine.generate(engine.prepare(user_turn(kPrompts[0])), stop);
