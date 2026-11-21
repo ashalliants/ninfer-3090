@@ -155,6 +155,76 @@ route_score_kernel(const float* __restrict__ z, std::int64_t zs, const float* __
     }
 }
 
+// Wide calls: grid (ceil(T / kWideCols), E / kWideExperts), block (b, g) scores experts g kWideExperts + (0 ..) for
+// columns b kWideCols + (0 ..), reading each router row once per kWideCols columns. Every score is route_score_kernel's
+// FMAs and sums in its order (the same bits); with the norm, block (b, g) writes the rows of passes i with
+// i % (E / kWideExperts) == g.
+constexpr int kWideCols = 4, kWideExperts = 16;
+
+template <bool kNorm>
+__global__ void __launch_bounds__(kScoreThreads)
+route_score_wide_kernel(const float* __restrict__ z, std::int64_t zs, const float* __restrict__ router, int rows, int experts, int cols,
+                        RouteNorm norm, float* __restrict__ scores) {
+    __shared__ float part[kScoreThreads / 32][kWideCols * kWideExperts];
+    __shared__ float part8[8];
+    const int t0 = blockIdx.x * kWideCols, e0 = blockIdx.y * kWideExperts, groups = gridDim.y, lane = threadIdx.x & 31;
+    const int nc = min(kWideCols, cols - t0);
+    float inv[kWideCols];
+#pragma unroll
+    for (int c = 0; c < kWideCols; ++c) {
+        inv[c] = 1.0F;
+        if constexpr (kNorm) {
+            if (c < nc) { inv[c] = rmsnorm_inverse(z + (t0 + c) * zs, rows, norm.eps, part8); }
+            __syncthreads(); // part8 is reused by the next column's norm
+        }
+    }
+    float dot[kWideCols][kWideExperts];
+#pragma unroll
+    for (int c = 0; c < kWideCols; ++c) {
+#pragma unroll
+        for (int e = 0; e < kWideExperts; ++e) { dot[c][e] = 0.0F; }
+    }
+    for (int d = threadIdx.x; d < rows; d += kScoreThreads) {
+        float v[kWideCols];
+#pragma unroll
+        for (int c = 0; c < kWideCols; ++c) {
+            v[c] = 0.0F;
+            if (c < nc) {
+                if constexpr (kNorm) {
+                    v[c] = __ldg(z + (t0 + c) * zs + d) * inv[c] * __ldg(norm.weight + d);
+                    if ((d / kScoreThreads) % groups == static_cast<int>(blockIdx.y)) { norm.z[(t0 + c) * norm.zs + d] = v[c]; }
+                } else {
+                    v[c] = __ldg(z + (t0 + c) * zs + d);
+                }
+            }
+        }
+#pragma unroll
+        for (int e = 0; e < kWideExperts; ++e) {
+            const float w = __ldg(router + static_cast<std::int64_t>(e0 + e) * rows + d);
+#pragma unroll
+            for (int c = 0; c < kWideCols; ++c) { dot[c][e] = fmaf(w, v[c], dot[c][e]); }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < kWideCols; ++c) {
+#pragma unroll
+        for (int e = 0; e < kWideExperts; ++e) {
+            const float sum = warp_sum(dot[c][e]);
+            if (lane == 0) { part[threadIdx.x >> 5][c * kWideExperts + e] = sum; }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < kWideCols * kWideExperts) {
+        const int c = threadIdx.x / kWideExperts, e = threadIdx.x % kWideExperts;
+        if (c < nc) {
+            float total = 0.0F;
+#pragma unroll
+            for (int i = 0; i < kScoreThreads / 32; ++i) { total += part[i][threadIdx.x]; }
+            scores[static_cast<std::int64_t>(t0 + c) * experts + e0 + e] = 1.0F / (1.0F + expf(-total));
+        }
+    }
+}
+
 // One warp per column: top_k rounds of a warp argmax over score + bias (the lower id wins a tie).
 constexpr int kMaxExperts = 256, kPerLane = kMaxExperts / 32;
 
@@ -929,6 +999,7 @@ void moe_route_sigmoid_topk(const Tensor& z, const RouteInputNorm* norm, const T
             "weights must be contiguous FP32 [k, T]");
     const auto scope = workspace.scope();
     float* scores = static_cast<float*>(workspace.alloc_bytes(static_cast<std::size_t>(experts) * cols * 4).data);
+    const bool wide = cols > 8 && experts % kWideExperts == 0;
     if (norm != nullptr) {
         require(norm->weight != nullptr && norm->weight->data != nullptr && norm->weight->dtype == DType::FP32 &&
                     norm->weight->is_contiguous() && norm->weight->numel() == rows,
@@ -943,8 +1014,16 @@ void moe_route_sigmoid_topk(const Tensor& z, const RouteInputNorm* norm, const T
         }
         const RouteNorm n{static_cast<const float*>(norm->weight->data), norm->eps, static_cast<float*>(norm->z->data),
                           norm_stride};
-        route_score_kernel<true><<<dim3(cols, experts), kScoreThreads, 0, stream>>>(
-            static_cast<const float*>(z.data), zs, static_cast<const float*>(router.data), rows, experts, n, scores);
+        if (wide) {
+            route_score_wide_kernel<true><<<dim3((cols + kWideCols - 1) / kWideCols, experts / kWideExperts), kScoreThreads, 0, stream>>>(
+                static_cast<const float*>(z.data), zs, static_cast<const float*>(router.data), rows, experts, cols, n, scores);
+        } else {
+            route_score_kernel<true><<<dim3(cols, experts), kScoreThreads, 0, stream>>>(
+                static_cast<const float*>(z.data), zs, static_cast<const float*>(router.data), rows, experts, n, scores);
+        }
+    } else if (wide) {
+        route_score_wide_kernel<false><<<dim3((cols + kWideCols - 1) / kWideCols, experts / kWideExperts), kScoreThreads, 0, stream>>>(
+            static_cast<const float*>(z.data), zs, static_cast<const float*>(router.data), rows, experts, cols, RouteNorm{}, scores);
     } else {
         route_score_kernel<false><<<dim3(cols, experts), kScoreThreads, 0, stream>>>(
             static_cast<const float*>(z.data), zs, static_cast<const float*>(router.data), rows, experts, RouteNorm{}, scores);

@@ -24,7 +24,9 @@
 #include "core/device.h"
 #include "models/inkling2/model.h"
 #include "models/inkling2/program/text_program.h"
+#include "ninfer/ops/tensor_core_fp32.h"
 
+#include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -388,6 +390,139 @@ int main() {
                             kv == 0 ? 'K' : 'V', static_cast<long long>(t.values), t.max_abs, t.min_abs, t.max_norm,
                             static_cast<long long>(t.subnormal), static_cast<long long>(t.to_zero), static_cast<long long>(t.overflow),
                             static_cast<long long>(t.fp16_sub), static_cast<long long>(t.fp16_inf), t.rel16 / nz, t.rel_bf16 / nz, t.max_rel16);
+            }
+            return 0;
+        }
+        // NINFER_INKLING2_TC_COUNT: the weight values the tensor-core route's FP16 row scaling does not carry exactly.
+        if (std::getenv("NINFER_INKLING2_TC_COUNT") != nullptr) {
+            const std::int32_t h = static_cast<std::int32_t>(c.hidden_size), heads = static_cast<std::int32_t>(c.heads), d = static_cast<std::int32_t>(c.head_dim);
+            const std::int32_t qw = heads * d, rel = heads * static_cast<std::int32_t>(c.d_rel), kvw = static_cast<std::int32_t>(c.kv_heads) * d;
+            const std::int32_t dyn = static_cast<std::int32_t>(c.kv_heads * c.conv_kernel_size);
+            std::uint64_t dense = 0, dense_total = 0, experts = 0, experts_total = 0;
+            for (std::uint32_t p = 0; p < c.num_hidden_layers; ++p) {
+                const auto& w = model->weights().layers.at(p);
+                std::vector<std::pair<ink::WeightId, std::pair<std::int32_t, std::int32_t>>> list = {
+                    {w.q, {h, qw}}, {w.rel, {h, rel}}, {w.gate, {h, qw}}, {w.sink, {h, heads}}, {w.k, {h, kvw}}, {w.v, {h, kvw}}, {w.output, {qw, h}}};
+                if (!c.local[p]) { list.push_back({w.k_conv_proj, {h, dyn}}), list.push_back({w.v_conv_proj, {h, dyn}}); }
+                for (const auto& [id, shape] : list) {
+                    dense += ninfer::ops::bf16_fp16_inexact(model->tensor(id, {shape.first, shape.second}), stream);
+                    dense_total += static_cast<std::uint64_t>(shape.first) * shape.second;
+                }
+                const auto& bank = model->expert_bank(p);
+                const std::uint64_t values = static_cast<std::uint64_t>(bank.experts) * 3 * bank.hidden * bank.intermediate;
+                if (bank.format == ninfer::QType::GGML_REC_NVFP4_NVFP4) {
+                    experts += ninfer::ops::nvfp4_bank_fp16_inexact(bank, stream);
+                    experts_total += values;
+                } else {
+                    dense += ninfer::ops::bf16_fp16_inexact(ninfer::Tensor(const_cast<void*>(bank.gate_up), ninfer::DType::BF16,
+                                                                           {bank.hidden, 2 * bank.intermediate * bank.experts}), stream);
+                    dense += ninfer::ops::bf16_fp16_inexact(ninfer::Tensor(const_cast<void*>(bank.down), ninfer::DType::BF16,
+                                                                           {bank.intermediate, bank.hidden * bank.experts}), stream);
+                    dense_total += values;
+                }
+            }
+            std::printf("tc FP16 row scaling: BF16 values not exact %llu of %llu (%.3e); NVFP4 values not exact %llu of %llu (%.3e)\n",
+                        static_cast<unsigned long long>(dense), static_cast<unsigned long long>(dense_total), double(dense) / double(dense_total),
+                        static_cast<unsigned long long>(experts), static_cast<unsigned long long>(experts_total),
+                        double(experts) / double(std::max<std::uint64_t>(experts_total, 1)));
+        }
+        // NINFER_INKLING2_TC_KLD=<file of token ids>: the tensor-core prefill (ProgramLimits::prefill_tc, chunks of
+        // NINFER_INKLING2_TC_CHUNK, default 1024) against the FP32 one (chunks of 256) at contexts 2048 and 16384: the
+        // logits after the prompt and those of the 64 teacher-forced decode steps after it, and both prefill speeds.
+        // NINFER_INKLING2_PREFILL_BENCH=<ids>: one prefill of NINFER_INKLING2_PREFILL_CONTEXT (default 2048) tokens in chunks of
+        //   NINFER_INKLING2_PREFILL_CHUNK (default 256), tensor cores with NINFER_INKLING2_TC=1, FP16 rings with
+        //   NINFER_INKLING2_KV=fp16; one untimed warm-up prefill, then the timed one inside cudaProfilerStart/Stop.
+        // NINFER_INKLING2_TC_PARTS: a comma list of dense, experts, attention (default all) for the two harnesses below.
+        const auto tc_parts = [] {
+            ink::ProgramLimits::TensorCoreParts parts;
+            const char* env = std::getenv("NINFER_INKLING2_TC_PARTS");
+            const std::string list = env != nullptr ? env : "dense,experts,attention";
+            parts.dense = list.find("dense") != std::string::npos, parts.experts = list.find("experts") != std::string::npos;
+            parts.attention = list.find("attention") != std::string::npos;
+            return parts;
+        };
+        if (const char* pf_ids = std::getenv("NINFER_INKLING2_PREFILL_BENCH"); pf_ids != nullptr) {
+            const auto env_int = [](const char* name, std::int32_t fallback) {
+                return std::getenv(name) != nullptr ? std::atoi(std::getenv(name)) : fallback;
+            };
+            const auto text_ids = read_ids(pf_ids);
+            const std::int32_t context = env_int("NINFER_INKLING2_PREFILL_CONTEXT", 2048), chunk = env_int("NINFER_INKLING2_PREFILL_CHUNK", 256);
+            ink::ProgramLimits limits{context + chunk, chunk};
+            if (std::getenv("NINFER_INKLING2_TC") != nullptr) { limits.prefill_tc = tc_parts(); }
+            limits.kv_fp16     = std::getenv("NINFER_INKLING2_KV") != nullptr && std::string(std::getenv("NINFER_INKLING2_KV")) == "fp16";
+            limits.last_logits = true;
+            ink::TextProgram prog(*model, limits, stream);
+            double seconds = 0;
+            for (int pass = 0; pass < 2; ++pass) {
+                prog.reset();
+                cudaStreamSynchronize(stream);
+                if (pass == 1) { cudaProfilerStart(); }
+                const auto t0 = std::chrono::steady_clock::now();
+                for (std::int32_t s = 0; s < context; s += chunk) {
+                    const std::int32_t len = std::min(chunk, context - s);
+                    (void)prog.forward(std::span(text_ids).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(len)));
+                }
+                cudaStreamSynchronize(stream);
+                seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                if (pass == 1) { cudaProfilerStop(); }
+            }
+            std::printf("prefill %d tokens in chunks of %d (%s, %s rings): %.1f tok/s\n", context, chunk, limits.prefill_tc.any() ? "tensor cores" : "FP32",
+                        limits.kv_fp16 ? "FP16" : "FP32", context / seconds);
+            return 0;
+        }
+        if (const char* tc_ids = std::getenv("NINFER_INKLING2_TC_KLD"); tc_ids != nullptr) {
+            const auto text_ids = read_ids(tc_ids);
+            const std::int32_t tc_chunk = std::getenv("NINFER_INKLING2_TC_CHUNK") ? std::atoi(std::getenv("NINFER_INKLING2_TC_CHUNK")) : 1024;
+            constexpr std::int32_t kSteps = 64;
+            const std::int32_t longest = std::getenv("NINFER_INKLING2_TC_CONTEXT") ? std::atoi(std::getenv("NINFER_INKLING2_TC_CONTEXT")) : 16384;
+            ink::ProgramLimits exact_limits{longest + kSteps + 256, 256};
+            ink::ProgramLimits tc_limits{longest + kSteps + tc_chunk, tc_chunk};
+            tc_limits.prefill_tc = tc_parts();
+            // NINFER_INKLING2_KV=fp16: both on the FP16 rings (the Engine's default).
+            exact_limits.kv_fp16 = tc_limits.kv_fp16 =
+                std::getenv("NINFER_INKLING2_KV") != nullptr && std::string(std::getenv("NINFER_INKLING2_KV")) == "fp16";
+            ink::TextProgram exact(*model, exact_limits, stream);
+            ink::TextProgram fast(*model, tc_limits, stream);
+            for (const std::int32_t context : {2048, longest}) {
+                if (context + kSteps + 1 > static_cast<std::int32_t>(text_ids.size()) || (context != longest && context > longest)) { continue; }
+                std::vector<double> klds;
+                int agree = 0;
+                double seconds[2] = {0, 0};
+                std::vector<std::vector<float>> last(2);
+                ink::TextProgram* programs[2] = {&exact, &fast};
+                for (int which = 0; which < 2; ++which) {
+                    ink::TextProgram& prog = *programs[which];
+                    const std::int32_t chunk = which == 0 ? 256 : tc_chunk;
+                    prog.reset();
+                    cudaStreamSynchronize(stream);
+                    const auto t0 = std::chrono::steady_clock::now();
+                    ninfer::Tensor logits;
+                    for (std::int32_t s = 0; s < context; s += chunk) {
+                        const std::int32_t len = std::min(chunk, context - s);
+                        logits = prog.forward(std::span(text_ids).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(len)));
+                    }
+                    cudaStreamSynchronize(stream);
+                    seconds[which] = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    const auto cols_out = logit_columns(logits, vocab);
+                    last[which] = cols_out.back();
+                }
+                klds.push_back(kld(last[0].data(), last[1].data(), vocab));
+                agree += argmax(last[0].data(), vocab) == argmax(last[1].data(), vocab);
+                const double after_prompt = klds.back();
+                for (std::int32_t i = 0; i < kSteps; ++i) {
+                    const auto one = std::span(text_ids).subspan(static_cast<std::size_t>(context + i), 1);
+                    const auto a = logit_columns(exact.forward(one), vocab);
+                    const auto b = logit_columns(fast.forward(one), vocab);
+                    klds.push_back(kld(a[0].data(), b[0].data(), vocab));
+                    agree += argmax(a[0].data(), vocab) == argmax(b[0].data(), vocab);
+                }
+                double mean = 0, worst = 0;
+                for (double k : klds) { mean += k, worst = std::max(worst, k); }
+                mean /= static_cast<double>(klds.size());
+                std::printf("tc prefill context %d (chunks of %d): %.1f tok/s against FP32 %.1f tok/s; KLD after the prompt %.3e; "
+                            "over it and %d decode steps: mean %.3e max %.3e, argmax agrees %d/%d\n",
+                            context, tc_chunk, context / seconds[1], context / seconds[0], after_prompt, kSteps, mean, worst, agree,
+                            static_cast<int>(klds.size()));
             }
             return 0;
         }

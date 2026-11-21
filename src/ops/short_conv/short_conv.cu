@@ -2,6 +2,7 @@
 
 #include "ninfer/ops/short_conv.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -44,11 +45,24 @@ struct ConvArgs {
     std::int64_t cs;
     int top_k;
     int head_width, channels, cols;
+    int segment; // columns per block (grid z); the history is written by history_kernel when there are several
     float scale;
 };
 
-// grid (channel blocks, jobs): one thread per channel walks the columns in order, keeping the window in
-// registers.
+// Column t's input of channel c: x, or the combine of job 0 (moe_situ_experts' combine_kernel, the same FMAs in the
+// same order).
+__device__ __forceinline__ float conv_input(const ConvArgs& a, const float* x, std::int64_t xs, int t, int c) {
+    if (x != nullptr) { return x[t * xs + c]; }
+    float cur = 0.0F;
+    for (int i = 0; i < a.top_k; ++i) {
+        cur = fmaf(a.weights[t * a.top_k + i], a.entries[(static_cast<std::int64_t>(t) * a.top_k + i) * a.channels + c], cur);
+    }
+    return cur;
+}
+
+// grid (channel blocks, jobs, column segments): one thread per channel walks its segment's columns in order, keeping
+// the window in registers (a segment past the first starts it from the K - 1 inputs before it). Every output is the
+// same FMAs in the same order whatever the segmentation.
 template <int K>
 __global__ void __launch_bounds__(kThreads) conv_kernel(ConvArgs a) {
     // The job's operands by compile-time compares (a runtime index into the parameters would copy them to
@@ -68,23 +82,18 @@ __global__ void __launch_bounds__(kThreads) conv_kernel(ConvArgs a) {
     const float scale = a.scale;
     const int c = blockIdx.x * kThreads + threadIdx.x;
     if (c >= channels) { return; }
+    const int t_begin = blockIdx.z * a.segment, t_end = min(cols, t_begin + a.segment);
     float window[K]; // window[i]: input at lag K-1-i once the current input is in window[K-1]
-    for (int i = 0; i < K - 1; ++i) { window[i] = history[static_cast<std::int64_t>(i) * channels + c]; }
+    for (int i = 0; i < K - 1; ++i) {
+        const int tt = t_begin - (K - 1) + i; // history[i] is column i - (K - 1)
+        window[i] = tt < 0 ? history[static_cast<std::int64_t>(tt + K - 1) * channels + c] : conv_input(a, x, xs, tt, c);
+    }
     float w[K];
     for (int i = 0; i < K; ++i) { w[i] = taps[static_cast<std::int64_t>(c) * K + i]; }
     const int head = dyn != nullptr ? c / head_width : 0;
-    for (int t = 0; t < cols; ++t) {
-        float cur;
-        if (x != nullptr) {
-            cur = x[t * xs + c];
-        } else {
-            // moe_situ_experts' combine_kernel, the same FMAs in the same order.
-            cur = 0.0F;
-            for (int i = 0; i < a.top_k; ++i) {
-                cur = fmaf(a.weights[t * a.top_k + i], a.entries[(static_cast<std::int64_t>(t) * a.top_k + i) * channels + c], cur);
-            }
-            if (a.combined != nullptr) { a.combined[t * a.cs + c] = cur; }
-        }
+    for (int t = t_begin; t < t_end; ++t) {
+        const float cur = conv_input(a, x, xs, t, c);
+        if (x == nullptr && a.combined != nullptr) { a.combined[t * a.cs + c] = cur; }
         window[K - 1] = cur;
         float acc = cur;
         for (int lag = 0; lag < K; ++lag) {
@@ -97,7 +106,23 @@ __global__ void __launch_bounds__(kThreads) conv_kernel(ConvArgs a) {
         if (sum != nullptr) { sum[t * ss + c] = residual[t * rs + c] + value; }
         for (int i = 0; i < K - 1; ++i) { window[i] = window[i + 1]; }
     }
-    for (int i = 0; i < K - 1; ++i) { history[static_cast<std::int64_t>(i) * channels + c] = window[i]; }
+    if (gridDim.z == 1) {
+        for (int i = 0; i < K - 1; ++i) { history[static_cast<std::int64_t>(i) * channels + c] = window[i]; }
+    }
+}
+
+// After a segmented conv_kernel (T >= K - 1): history[i] = column T - (K - 1) + i's input.
+__global__ void __launch_bounds__(kThreads) history_kernel(ConvArgs a, int k) {
+    const float* x = a.x[0];
+    float* history = a.history[0];
+    std::int64_t xs = a.xs[0];
+#pragma unroll
+    for (int j = 1; j < kShortConvMaxJobs; ++j) {
+        if (blockIdx.y == j) { x = a.x[j], history = a.history[j], xs = a.xs[j]; }
+    }
+    const int c = blockIdx.x * kThreads + threadIdx.x;
+    if (c >= a.channels) { return; }
+    for (int i = 0; i < k - 1; ++i) { history[static_cast<std::int64_t>(i) * a.channels + c] = conv_input(a, x, xs, a.cols - (k - 1) + i, c); }
 }
 
 } // namespace
@@ -167,7 +192,10 @@ void short_conv_fp32_batch(std::span<const ShortConvJob> jobs, int head_width, c
     }
     a.head_width = head_width;
     a.scale = 1.0F / std::sqrt(static_cast<float>((dynamic ? 2 : 1) * k + 1));
-    const dim3 grid((a.channels + kThreads - 1) / kThreads, static_cast<unsigned>(jobs.size()));
+    // Wide calls split the columns into segments of at least 32 (the K - 1 inputs before each are read again).
+    const int segments = a.cols >= 64 ? std::min(a.cols / 32, 64) : 1;
+    a.segment = (a.cols + segments - 1) / segments;
+    const dim3 grid((a.channels + kThreads - 1) / kThreads, static_cast<unsigned>(jobs.size()), static_cast<unsigned>(segments));
     switch (k) {
     case 2: conv_kernel<2><<<grid, kThreads, 0, stream>>>(a); break;
     case 3: conv_kernel<3><<<grid, kThreads, 0, stream>>>(a); break;
@@ -177,6 +205,7 @@ void short_conv_fp32_batch(std::span<const ShortConvJob> jobs, int head_width, c
     case 7: conv_kernel<7><<<grid, kThreads, 0, stream>>>(a); break;
     default: conv_kernel<8><<<grid, kThreads, 0, stream>>>(a); break;
     }
+    if (segments > 1) { history_kernel<<<dim3(grid.x, grid.y), kThreads, 0, stream>>>(a, k); }
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) { throw std::runtime_error(std::string("short_conv_fp32: launch failed: ") + cudaGetErrorString(error)); }
 }

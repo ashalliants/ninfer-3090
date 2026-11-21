@@ -302,6 +302,7 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
                         format_pretty_text(load.model_name), format_pretty_duration(total_seconds),
                         format_pretty_bytes(load.host_to_device_bytes), load.cuda_sync_mode);
     for (const std::string& warning : load.warnings) { impl_->logger->warn("{}", warning); }
+    for (const std::string& note : load.notes) { impl_->logger->info("{}", note); }
     impl_->logger->debug(
         "load detail | architecture {} | artifact read {} | H2D {} | staging peak {} | device "
         "objects {} | host objects {}",

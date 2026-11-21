@@ -181,6 +181,15 @@ int main() {
                               to_fp16.kv_cache == ninfer::KvCacheStorage::BFloat16 && !to_fp16.kv_cache_explicit,
                           "CLI --kv-dtype: the last form does not win, or an explicit bf16 is not marked");
     }
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--prefill-math", "fp32"}).prefill_math == ninfer::PrefillMath::FP32 &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--prefill-math", "tc"}).prefill_math ==
+                              ninfer::PrefillMath::TensorCores &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"}).prefill_math == ninfer::PrefillMath::Default &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--prefill-chunk", "512"}).prefill_chunk_explicit &&
+                          !parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"}).prefill_chunk_explicit,
+                      "CLI --prefill-math or --prefill-chunk was not parsed");
+    failures += check(rejects([&] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--prefill-math", "fp16"}); }),
+                      "CLI accepted an unknown --prefill-math form");
     failures += check(rejects([&] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--dense-q8", "q4"}); }),
                       "CLI accepted an unknown --dense-q8 form");
     // --spec dspark: an omitted --draft-tokens takes 3; an explicit one is kept and must be in [1,7].

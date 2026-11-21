@@ -320,6 +320,9 @@ public:
         if (runtime::artifact_is_inkling2(options.artifact_path) && (options.kv_cache != KvCacheStorage::BFloat16 || options.kv_cache_explicit)) {
             throw std::invalid_argument("--kv-dtype: Inkling-2 takes fp16 (default) or fp32");
         }
+        if (options.prefill_math != PrefillMath::Default && !runtime::artifact_is_inkling2(options.artifact_path)) {
+            throw std::invalid_argument("--prefill-math selects Inkling-2's prefill arithmetic; this model has its own prefill options");
+        }
         if (options.kv_rings != KvRings::Default && !runtime::artifact_is_inkling2(options.artifact_path)) {
             throw std::invalid_argument("--kv-dtype fp16|fp32 are Inkling-2's KV ring forms; this model takes bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4");
         }

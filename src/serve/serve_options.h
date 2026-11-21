@@ -52,6 +52,7 @@ struct ServeOptions {
     // callers before they were ever admitted.
     std::uint32_t pending_timeout_ms   = 600000;
     std::uint32_t prefill_chunk        = 1024;
+    bool prefill_chunk_explicit        = false; // --prefill-chunk given
     std::uint32_t progress_anchor_tokens = 0;
     bool progress_anchors_shared         = false;
     std::filesystem::path context_cost_presets;
@@ -74,6 +75,7 @@ struct ServeOptions {
     bool split_attention                   = true;         // --no-split-attention: false (Inkling-2)
     KvRings kv_rings                       = KvRings::Default; // --kv-dtype fp16|fp32 (Inkling-2)
     bool kv_cache_explicit                 = false; // the last --kv-dtype was a kv_cache form (bf16 included)
+    PrefillMath prefill_math               = PrefillMath::Default; // --prefill-math tc|fp32 (Inkling-2)
     SpeculativeOptions speculative;
     // --relaxed-drafting [P]: EngineOptions::relaxed_drafting (nullopt: off; bare: 0.5).
     std::optional<float> relaxed_drafting;
