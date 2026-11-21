@@ -278,6 +278,7 @@ void validate_flash_next_options_unused(const EngineOptions& options) {
         if (changed) { flags.emplace_back(flag); }
     };
     note(!set.ngram_volume_path.empty(), "--ngram-volume");
+    note(!set.engram_dir.empty(), "--engram-dir");
     note(set.ngram_keepalive_ms_set || set.ngram_keepalive_ms != unset.ngram_keepalive_ms, "--ngram-keepalive-ms");
     note(!set.expert_state_path.empty(), "--expert-state");
     note(!set.save_expert_state, "--no-expert-state");

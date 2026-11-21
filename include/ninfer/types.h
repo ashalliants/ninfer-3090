@@ -527,6 +527,10 @@ struct LoraSource {
 // Qwen3.8-Flash-Next (Qwen4ExpForCausalLM) only; a dense model refuses any of these that is set
 // (runtime::validate_flash_next_options_unused) rather than ignoring it.
 struct FlashNextOptions {
+    // DeepSeek-V4.1-Flash only (--engram-dir): the folder `python3 -m tools.convert.dsv4_engram_volume` wrote (the
+    // Engram volume, the token map and engram.json). Empty falls back to NINFER_DSV4_ENGRAM_DIR, then to no Engram
+    // (layers 1 and 14 then run without their injection, at reduced quality).
+    std::filesystem::path engram_dir;
     // The per-layer n-gram embedding volume. Empty uses `<artifact>.ngram`.
     std::filesystem::path ngram_volume_path;
     // Milliseconds of volume idleness after which one 4 KiB block is read to keep the drive from

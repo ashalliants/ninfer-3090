@@ -18,4 +18,5 @@ target_sources(ninfer_model_runtime PRIVATE
 # (Flash-Next's reader) and the device sequence.
 target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/engram.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/execution/engram_sidecar.cpp"
 )

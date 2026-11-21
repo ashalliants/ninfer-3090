@@ -347,6 +347,7 @@ int check_flash_next_options_refused() {
     };
     const Case cases[] = {
         {"--ngram-volume", [](auto& n) { n.ngram_volume_path = "x.ngram"; }},
+        {"--engram-dir", [](auto& n) { n.engram_dir = "engram"; }},
         {"--ngram-keepalive-ms", [](auto& n) { n.ngram_keepalive_ms = 0; }},
         {"--expert-state", [](auto& n) { n.expert_state_path = "x.state"; }},
         {"--no-expert-state", [](auto& n) { n.save_expert_state = false; }},
