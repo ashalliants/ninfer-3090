@@ -45,7 +45,9 @@ DSparkProgram::DSparkProgram(const Model& model, std::int32_t max_context, std::
     : model_(model), config_(require_dspark(model)), text_(model.config()), max_context_(max_context), max_chunk_(max_chunk),
       stream_(stream),
       workspace_((std::size_t(model.config().vocab_size) * require_dspark(model).block_size * 4) +
-                 std::size_t(std::max(max_chunk, std::int32_t(require_dspark(model).block_size))) * 64 * 1024 + (64U << 20)) {
+                 std::size_t(std::max(max_chunk, std::int32_t(require_dspark(model).block_size))) * 64 * 1024 +
+                 ops::dspark_block_attention_workspace_bytes({i32(require_dspark(model).heads), 0, 0, 0}, i32(require_dspark(model).block_size)) +
+                 (64U << 20)) {
     const DSparkConfig& c = config_;
     if (max_chunk < 1 || max_chunk > max_context || max_chunk > i32(c.sliding_window)) {
         throw std::invalid_argument("inkling2 dspark: max_chunk must be in 1..min(max_context, the draft window)");
@@ -253,7 +255,8 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t
                                     c.rope_theta, stream_);
         Tensor attn = workspace_.alloc(DType::FP32, {q, b});
         const ops::DSparkAttentionShape shape{i32(c.heads), i32(c.kv_heads), i32(c.head_dim), c.local[i] ? i32(c.sliding_window) : 0};
-        ops::dspark_block_attention_fp32(qt, layers_[i].k_ring, layers_[i].v_ring, kt, vt, position_, shape, attn, stream_);
+        Tensor parts = workspace_.alloc(DType::FP32, {i32(ops::dspark_block_attention_workspace_bytes(shape, b) / 4)});
+        ops::dspark_block_attention_fp32(qt, layers_[i].k_ring, layers_[i].v_ring, kt, vt, position_, shape, attn, parts, stream_);
         Tensor o = workspace_.alloc(DType::FP32, {h, b});
         project(attn, l.output, o);
         ops::add_fp32(x, o, x, stream_);
