@@ -36,6 +36,12 @@ struct ProgramLimits {
     // Opt-in, lossy: the 8-bit re-encodings (DenseWeightsQ8) the dense projections that have one run over, at every width;
     // null: the artifact's BF16 weights. Not owned: it must outlive the Program.
     const DenseWeightsQ8* dense = nullptr;
+    // A forward of at most ops::kSplitMaxColumns tokens (decode, verification) splits each attention column's keys
+    // into blocks of 256 (ops::relative_bias_sink_attention's split workspace) once a column can see more than
+    // ops::kSplitMinKeys of them. FP32, but the softmax sums run in
+    // another order, so past 256 visible keys the logits differ from the single-block kernel's in the last bits.
+    // false: the single block per column and head (bit-exact with earlier builds).
+    bool split_attention = true;
 };
 
 // Columns [column, column + values.ne[1]) of a forward that take `values` as their input in place of their tokens'
@@ -120,6 +126,7 @@ private:
     ProgramLimits limits_;
     cudaStream_t stream_;
     DeviceBuffer state_memory_;
+    DeviceBuffer split_counters_; // the split attention's counters (ops::relative_bias_sink_attention), zero between calls
     DeviceArena workspace_;
     std::vector<VisitState> state_;
     std::int64_t position_ = 0;
@@ -132,9 +139,11 @@ private:
     // The decode graph: step_ holds {int64 position, int32 token} it reads; start_offset_ points at that position
     // while the graph is captured (the Ops add it to their host start of 0), and is null otherwise.
     DeviceBuffer step_;
-    // The decode graphs, without and with the tap copies (each captured on its first use), and their logits.
-    cudaGraphExec_t decode_graph_[2] = {nullptr, nullptr};
-    Tensor graph_logits_[2];
+    // The decode graphs (each captured on its first use) and their logits: index 2 * taps + split, taps the tap copies,
+    // split the split attention (positions past ops::kSplitMinKeys; the single block before).
+    cudaGraphExec_t decode_graph_[4] = {nullptr, nullptr, nullptr, nullptr};
+    Tensor graph_logits_[4];
+    bool graph_split_ = true; // the graph in capture passes the split workspace (eager forwards always do)
     const std::int64_t* start_offset_ = nullptr;
 };
 

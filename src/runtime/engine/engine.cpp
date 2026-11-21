@@ -314,6 +314,9 @@ public:
         if (options.dense_q8 != DenseQ8::Off && !runtime::artifact_is_inkling2(options.artifact_path)) {
             throw std::invalid_argument("--dense-q8 re-encodes Inkling-2's dense weights; this model has its own weight options");
         }
+        if (!options.split_attention && !runtime::artifact_is_inkling2(options.artifact_path)) {
+            throw std::invalid_argument("--no-split-attention selects Inkling-2's attention kernel; this model has its own");
+        }
         if (runtime::artifact_is_qwen4_exp(options.artifact_path)) {
             construct_qwen4_exp();
             return;

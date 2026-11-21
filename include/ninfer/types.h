@@ -861,6 +861,10 @@ struct EngineOptions {
     bool embedding_q6                      = false;
     // Inkling-2 only (other models refuse anything but Off): DenseQ8 above.
     DenseQ8 dense_q8                       = DenseQ8::Off;
+    // Inkling-2 only (other models refuse false): decode and verification forwards split each attention column's
+    // keys into blocks of 256 (FP32, the softmax sums in another order). false (--no-split-attention): one block per
+    // column and head, the earlier builds' bits.
+    bool split_attention                   = true;
     // Qwen3.6-35B-A3B only: the MTP draft layer's routed experts are stored W8 in the artifact;
     // transcode them to the text layers' formats (Q4 gate_up, Q6 down) at load. Drafts are
     // verified exactly, so this can change acceptance but never the output distribution.

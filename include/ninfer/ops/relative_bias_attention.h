@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 
@@ -107,14 +108,34 @@ struct RelativeBiasAttentionShape {
  *   FP32 scores and max-subtracted online softmax with the sink as the initial maximum; oracle FP64
  *   (inkling2_reference.h attention, relative_bias). With a gate, the same bits as sigmoid_gate_fp32 of the
  *   ungated FP32 output (a BF16 out rounds that to nearest even).
+ *   Split keys: given a `split_workspace`, a call of at most kSplitMaxColumns columns over a ring that can show a
+ *   column more than kSplitMinKeys keys splits each column's keys into blocks of 256 (one CUDA block each, the sink in the
+ *   first); the last of a column's blocks to finish combines their maxima, denominators and sums in order, weighted
+ *   by e^{m_z - max m}. FP32 all the
+ *   way, but the sums run in another order: a column that sees more than 256 keys gets other bits than the
+ *   single-block kernel (a column of at most 256 keys the same bits). Without the workspace, or when no column of
+ *   the call can see more than kSplitMinKeys keys (known on the host without a `start_offset`; with one, the ring
+ *   or window bounds it), the single block: below that the split's extra blocks cost more than they save.
  *
  * Effects: writes the T new cache slots and out. out must not overlap any input or cache.
- * Workspace: none. Execution: stream-ordered; graph capturable (one graph for every position with
- *   `start_offset`).
+ * Workspace: optional `split_workspace`, FP32 contiguous of relative_bias_attention_split_bytes(shape, T, capacity)
+ *   bytes, with `split_counters`: kSplitMaxColumns * heads int32 on the device, zero on entry and left zero (the
+ *   caller keeps them across calls; calls that share them run in stream order). Execution: stream-ordered; graph capturable (one graph for every position with `start_offset`).
  */
 void relative_bias_sink_attention(const RelativeBiasAttentionShape& shape, const Tensor& q, const Tensor& r,
                                   const Tensor& sink, const Tensor* k_new, const Tensor* v_new, const Tensor& table,
                                   Tensor& k_cache, Tensor& v_cache, std::int64_t start,
-                                  const std::int64_t* start_offset, const Tensor* gate, Tensor& out, cudaStream_t stream);
+                                  const std::int64_t* start_offset, const Tensor* gate, Tensor& out, cudaStream_t stream,
+                                  const Tensor* split_workspace = nullptr, std::int32_t* split_counters = nullptr);
+
+/// Calls of at most this many columns split their keys across blocks when given a split workspace.
+inline constexpr std::int32_t kSplitMaxColumns = 8;
+/// Calls whose columns can see at most this many keys run the single block even with a split workspace.
+inline constexpr std::int64_t kSplitMinKeys = 512;
+
+/// The split workspace relative_bias_sink_attention needs for `cols` columns over a ring of `capacity` (0 when
+/// such a call does not split): per column and head, one part of d + 2 floats per 256 keys it can see.
+[[nodiscard]] std::size_t relative_bias_attention_split_bytes(const RelativeBiasAttentionShape& shape, std::int32_t cols,
+                                                              std::int64_t capacity);
 
 } // namespace ninfer::ops
