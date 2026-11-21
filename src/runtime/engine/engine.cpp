@@ -673,14 +673,6 @@ private:
             throw std::invalid_argument(
                 "Inkling-2 runs on one device with no context store, model suspend, LoRA adapters or grafts");
         }
-        // This core decodes plainly: a speculative setting is refused, not ignored.
-        const SpeculativeOptions plain;
-        const auto& spec = options.speculative;
-        if (spec.backend != SpeculativeBackend::None || spec.draft_tokens != 0 || spec.ngram_draft_tokens != 0 ||
-            spec.adaptive_draft_tokens != 0 || spec.ngram_min_match != plain.ngram_min_match ||
-            spec.proposal_head != plain.proposal_head || options.relaxed_drafting || options.draft_context_rows != 0) {
-            throw std::invalid_argument("Inkling-2 decodes without speculation: no --spec or drafting options");
-        }
         // The context cache is one device snapshot of the last prompt (Inkling2Core, "Prefix reuse"; the host-tier
         // options were refused before normalization): one extra state when it is on, none when it is off.
         options.context_cache.device_state_slots = options.context_cache.enabled ? 1U : 0U;
@@ -696,11 +688,19 @@ private:
             (options.speculative.draft_tokens < 1 || options.speculative.draft_tokens > 7)) {
             throw std::invalid_argument("--spec dspark takes --draft-tokens 1 to 7");
         }
-        // DSpark verifies greedy rows exactly and drafts from its own head: the Qwen drafting options have no meaning.
-        if (options.relaxed_drafting || options.draft_context_rows != 0 || options.speculative.ngram_draft_tokens != 0 ||
-            options.speculative.adaptive_draft_tokens != 0) {
-            throw std::invalid_argument(
-                "Inkling-2 takes no relaxed drafting, draft-context rows, n-gram or adaptive draft windows");
+        // Plain decode takes no draft count.
+        if (options.speculative.backend == SpeculativeBackend::None && options.speculative.draft_tokens != 0) {
+            throw std::invalid_argument("--draft-tokens needs --spec dspark");
+        }
+        // DSpark verifies greedy rows exactly and drafts from its own head: the Qwen drafting options have no meaning,
+        // so they are refused, not ignored, with or without DSpark.
+        const SpeculativeOptions defaults;
+        const auto& spec = options.speculative;
+        if (options.relaxed_drafting || options.draft_context_rows != 0 || spec.ngram_draft_tokens != 0 ||
+            spec.adaptive_draft_tokens != 0 || spec.ngram_min_match != defaults.ngram_min_match ||
+            spec.proposal_head != defaults.proposal_head) {
+            throw std::invalid_argument("Inkling-2 takes no relaxed drafting, draft-context rows, n-gram or adaptive "
+                                        "draft windows, n-gram match lengths or proposal heads");
         }
         auto generation   = std::make_unique<Inkling2Core>(options, device);
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
