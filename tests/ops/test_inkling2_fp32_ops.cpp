@@ -447,9 +447,10 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
             check(cudaMemcpy(doff.p, &position, sizeof position, cudaMemcpyHostToDevice) == cudaSuccess, "offset upload");
         }
         Tensor to = out.tensor({qw, n}).slice(1, s, len);
+        const Tensor kn = dk.tensor({kvw, n}).slice(1, s, len), vn = dv.tensor({kvw, n}).slice(1, s, len);
         ninfer::ops::relative_bias_sink_attention({heads, kvh, d, rel, window}, dq.tensor({qw, n}).slice(1, s, len),
                                                   dr.tensor({heads * rel, n}).slice(1, s, len), ds.tensor({heads, n}).slice(1, s, len),
-                                                  dk.tensor({kvw, n}).slice(1, s, len), dv.tensor({kvw, n}).slice(1, s, len),
+                                                  &kn, &vn,
                                                   dt.tensor({rel, extent}), tkc, tvc, device_start ? 0 : s,
                                                   device_start ? static_cast<const std::int64_t*>(doff.p) : nullptr, nullptr, to,
                                                   nullptr);
@@ -457,7 +458,7 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
         const Tensor gate = dg.tensor({qw, n}).slice(1, s, len);
         ninfer::ops::relative_bias_sink_attention({heads, kvh, d, rel, window}, dq.tensor({qw, n}).slice(1, s, len),
                                                   dr.tensor({heads * rel, n}).slice(1, s, len), ds.tensor({heads, n}).slice(1, s, len),
-                                                  dk.tensor({kvw, n}).slice(1, s, len), dv.tensor({kvw, n}).slice(1, s, len),
+                                                  &kn, &vn,
                                                   dt.tensor({rel, extent}), tkc2, tvc2, device_start ? 0 : s,
                                                   device_start ? static_cast<const std::int64_t*>(doff.p) : nullptr, &gate, tg,
                                                   nullptr);
@@ -467,12 +468,12 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
         const int len  = std::min(chunk, n);
         const Tensor gate = dg.tensor({qw, n}).slice(1, 0, len);
         Tensor no_out(nullptr, DType::BF16, {qw, len});
+        const Tensor kn = dk.tensor({kvw, n}).slice(1, 0, len), vn = dv.tensor({kvw, n}).slice(1, 0, len);
         bool refused = false;
         try {
             ninfer::ops::relative_bias_sink_attention({heads, kvh, d, rel, window}, dq.tensor({qw, n}).slice(1, 0, len),
                                                       dr.tensor({heads * rel, n}).slice(1, 0, len), ds.tensor({heads, n}).slice(1, 0, len),
-                                                      dk.tensor({kvw, n}).slice(1, 0, len), dv.tensor({kvw, n}).slice(1, 0, len),
-                                                      dt.tensor({rel, extent}), tkc2, tvc2, 0, nullptr, &gate, no_out, nullptr);
+                                                      &kn, &vn, dt.tensor({rel, extent}), tkc2, tvc2, 0, nullptr, &gate, no_out, nullptr);
         } catch (const std::invalid_argument&) { refused = true; }
         check(refused, "relative_bias_sink_attention takes a BF16 out without storage");
     }
@@ -502,6 +503,35 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
     }
     const auto got = out.get(qw * n);
     compare(label, std::vector<float>(got.begin() + static_cast<std::ptrdiff_t>(check_from) * qw, got.end()), want, 2e-6);
+}
+
+// head_norms_fp32 with a KvAppend: x the bits of the plain call, and the ring slots (start + t) mod capacity
+// (wrapping) hold those columns.
+void test_head_norm_append() {
+    const int rows = 1024, cols = 3, capacity = 4, d = 128;
+    const auto x = randoms(rows * cols, -2, 2);
+    Buf a(x), b(x), cache(static_cast<std::size_t>(rows) * capacity);
+    for (const bool unit : {false, true}) {
+        Tensor ta = a.tensor({rows, cols}), tb = b.tensor({rows, cols}), tc = cache.tensor({rows, capacity});
+        const ninfer::ops::KvAppend append{&tc, 2, nullptr};
+        ninfer::ops::HeadNormJob ja, jb;
+        ja.x = &ta, jb.x = &tb;
+        ja.head_dim = jb.head_dim = d;
+        if (unit) {
+            ja.unit_rms = jb.unit_rms = true;
+            ja.eps = jb.eps = 1e-6F;
+        } else {
+            ja.threshold = jb.threshold = 3.0F;
+        }
+        ja.append = &append;
+        ninfer::ops::head_norms_fp32(std::span<const ninfer::ops::HeadNormJob>(&ja, 1), nullptr);
+        ninfer::ops::head_norms_fp32(std::span<const ninfer::ops::HeadNormJob>(&jb, 1), nullptr);
+        const auto ga = a.get(rows * cols), gb = b.get(rows * cols), gc = cache.get(rows * capacity);
+        bool same = std::memcmp(ga.data(), gb.data(), ga.size() * 4) == 0;
+        for (int c = 0; c < cols; ++c) { same &= std::memcmp(gc.data() + ((2 + c) % capacity) * rows, gb.data() + c * rows, rows * 4) == 0; }
+        check(same, "head_norms_fp32 with an append differs from the plain call or its ring slots");
+    }
+    std::printf("head_norms_fp32 with a KvAppend: the plain call's bits, in the wrapped ring slots too\n");
 }
 
 void test_route() {
@@ -699,15 +729,40 @@ void test_experts(bool nvfp4, int h, int inter, int experts, const std::string& 
     ninfer::DeviceBuffer did = t::to_device_i32(ids);
     ninfer::DeviceArena arena(ninfer::ops::moe_situ_experts_workspace_bytes(bank, entries) + 4096);
     Tensor tout = dout.tensor({h, cols});
-    ninfer::ops::moe_situ_experts(bank, dz.tensor({h, cols}), Tensor(did.p, DType::I32, {k, cols}), dw.tensor({k, cols}), 4.0F, 25.0F,
-                                  arena, tout, nullptr);
+    const Tensor tw = dw.tensor({k, cols});
+    ninfer::ops::moe_situ_experts(bank, dz.tensor({h, cols}), Tensor(did.p, DType::I32, {k, cols}), &tw, 4.0F, 25.0F, arena, tout, nullptr);
+    {
+        // Without weights the entries' outputs come back uncombined; the MLP convolution combining them in its launch
+        // gives the bits of the experts' own combine followed by the convolution (with its residual sum).
+        Buf entries_out(static_cast<std::size_t>(h) * k * cols), combined(static_cast<std::size_t>(h) * cols), taps(randoms(4 * h)),
+            res(randoms(h * cols)), h1(randoms(3 * h)), h2(std::vector<float>(h1.get(3 * h))), s1(static_cast<std::size_t>(h) * cols),
+            s2(static_cast<std::size_t>(h) * cols);
+        Tensor te = entries_out.tensor({h, k * cols}), tcomb = combined.tensor({h, cols}), tt = taps.tensor({4, h}), tr = res.tensor({h, cols}),
+               th1 = h1.tensor({h, 3}), th2 = h2.tensor({h, 3}), ts1 = s1.tensor({h, cols}), ts2 = s2.tensor({h, cols});
+        ninfer::ops::moe_situ_experts(bank, dz.tensor({h, cols}), Tensor(did.p, DType::I32, {k, cols}), nullptr, 4.0F, 25.0F, arena, te,
+                                      nullptr);
+        ninfer::ops::ShortConvJob plain, fused;
+        plain.x = &tout, plain.taps = &tt, plain.history = &th1, plain.residual = &tr, plain.sum = &ts1;
+        const ninfer::ops::ConvCombine cb{&te, &tw, &tcomb};
+        fused.combine = &cb, fused.taps = &tt, fused.history = &th2, fused.residual = &tr, fused.sum = &ts2;
+        ninfer::ops::short_conv_fp32_batch(std::span<const ninfer::ops::ShortConvJob>(&plain, 1), 1, nullptr);
+        ninfer::ops::short_conv_fp32_batch(std::span<const ninfer::ops::ShortConvJob>(&fused, 1), 1, nullptr);
+        const auto eq = [](const Buf& x, const Buf& y, std::size_t n) {
+            const auto a = x.get(n), b = y.get(n);
+            return std::memcmp(a.data(), b.data(), n * 4) == 0;
+        };
+        const std::size_t n = static_cast<std::size_t>(h) * cols;
+        check(eq(dout, combined, n) && eq(s1, s2, n) && eq(h1, h2, 3 * static_cast<std::size_t>(h)),
+              label + ": the convolution's combine differs from the experts' combine then the convolution");
+        std::printf("%-44s combined in the MLP convolution: bit-exact\n", label.c_str());
+    }
     if (nvfp4) { // the vector loads need 16-byte aligned records: an offset base is refused, not read
         auto shifted = bank;
         shifted.records += 4;
         bool refused = false;
         try {
-            ninfer::ops::moe_situ_experts(shifted, dz.tensor({h, cols}), Tensor(did.p, DType::I32, {k, cols}), dw.tensor({k, cols}), 4.0F,
-                                          25.0F, arena, tout, nullptr);
+            ninfer::ops::moe_situ_experts(shifted, dz.tensor({h, cols}), Tensor(did.p, DType::I32, {k, cols}), &tw, 4.0F, 25.0F, arena, tout,
+                                          nullptr);
         } catch (const std::invalid_argument&) { refused = true; }
         check(refused, label + ": unaligned NVFP4 records were accepted");
     }
@@ -728,8 +783,9 @@ void test_experts(bool nvfp4, int h, int inter, int experts, const std::string& 
             Buf one(static_cast<std::size_t>(h));
             Tensor to = one.tensor({h, 1});
             const Tensor zc = dz.tensor({h, cols}).slice(1, c, 1);
-            ninfer::ops::moe_situ_experts(bank, zc, Tensor(static_cast<std::int32_t*>(did.p) + c * k, DType::I32, {k, 1}),
-                                          Tensor(static_cast<float*>(dw.b.p) + c * k, DType::FP32, {k, 1}), 4.0F, 25.0F, arena, to, nullptr);
+            const Tensor wc(static_cast<float*>(dw.b.p) + c * k, DType::FP32, {k, 1});
+            ninfer::ops::moe_situ_experts(bank, zc, Tensor(static_cast<std::int32_t*>(did.p) + c * k, DType::I32, {k, 1}), &wc, 4.0F, 25.0F,
+                                          arena, to, nullptr);
             const auto col = one.get(h);
             same = same && std::memcmp(col.data(), got.data() + static_cast<std::size_t>(c) * h, h * sizeof(float)) == 0;
         }
@@ -787,9 +843,10 @@ void bench_experts(bool nvfp4, int cols = 1) {
     ninfer::DeviceArena arena(ninfer::ops::moe_situ_experts_workspace_bytes(bank, static_cast<std::int64_t>(k) * cols) + 4096);
     Tensor tout = dout.tensor({h, cols});
     const auto run = [&](int i) {
+        const Tensor tw = dw.tensor({k, cols});
         ninfer::ops::moe_situ_experts(bank, dz.tensor({h, cols}),
                                       Tensor(static_cast<std::int32_t*>(did.p) + static_cast<std::size_t>(i) * k * cols, DType::I32, {k, cols}),
-                                      dw.tensor({k, cols}), 4.0F, 25.0F, arena, tout, nullptr);
+                                      &tw, 4.0F, 25.0F, arena, tout, nullptr);
     };
     run(0);
     cudaEvent_t start, stop;
@@ -939,6 +996,7 @@ int main() {
         test_attention(0, 1024, 1030, 515, "attention global, two key tiles (last 6 of 1030)", false, 1024);
         // Every key of a tile scored: one query sees 40 keys (16-key steps, a partial last one), all compared.
         test_attention(0, 64, 40, 40, "attention global, 40 keys in one call");
+        test_head_norm_append();
         test_route();
         test_experts(true, 128, 64, 3, "moe_situ_experts NVFP4 small");
         test_experts(true, 2304, 1152, 3, "moe_situ_experts NVFP4 [3, 2304, 1152]");

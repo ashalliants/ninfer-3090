@@ -43,6 +43,15 @@ void head_l2_clip_fp32(Tensor& x, int head_dim, const Tensor* scale, float thres
  */
 void head_unit_rms_fp32(Tensor& x, int head_dim, float eps, cudaStream_t stream);
 
+/// relative_bias_sink_attention's append done by head_norms_fp32: the job's normalized column t is also written
+/// to slot (start + (start_offset ? *start_offset : 0) + t) mod capacity of `cache` (FP32 [rows, capacity],
+/// contiguous), the same values.
+struct KvAppend {
+    Tensor* cache                    = nullptr;
+    std::int64_t start               = 0;
+    const std::int64_t* start_offset = nullptr;
+};
+
 /// One head_l2_clip_fp32 (unit_rms false) or head_unit_rms_fp32 (unit_rms true) of a batch.
 struct HeadNormJob {
     Tensor* x                          = nullptr;
@@ -52,6 +61,7 @@ struct HeadNormJob {
     float threshold                    = 0.0F;    // clip
     const PositionLogScale* log_scale  = nullptr; // clip
     float eps                          = 0.0F;    // unit rms
+    const KvAppend* append             = nullptr; // or null
 };
 inline constexpr int kHeadNormMaxJobs = 4;
 
@@ -72,7 +82,8 @@ struct RelativeBiasAttentionShape {
  *
  * Math / indexing:
  *   Column t is at position p = start + t; key slot of position j is j mod capacity.
- *   First k_cache[:, (start + t) mod capacity] = k_new[:, t] and likewise v (state transition).
+ *   First k_cache[:, (start + t) mod capacity] = k_new[:, t] and likewise v (state transition). k_new and v_new
+ *   may both be null when the caller has appended them already (head_norms_fp32 with a KvAppend).
  *   For head h (kv head g = h / (heads / kv_heads)) and every visible key position j (j <= p, and p - j < window
  *   when window > 0), with dist = p - j:
  *     s_j = <q[h, t], k_j[g]> / sqrt(d) + (dist < E ? sum_c r[h, t][c] * table[c, dist] : 0)
@@ -101,7 +112,7 @@ struct RelativeBiasAttentionShape {
  *   `start_offset`).
  */
 void relative_bias_sink_attention(const RelativeBiasAttentionShape& shape, const Tensor& q, const Tensor& r,
-                                  const Tensor& sink, const Tensor& k_new, const Tensor& v_new, const Tensor& table,
+                                  const Tensor& sink, const Tensor* k_new, const Tensor* v_new, const Tensor& table,
                                   Tensor& k_cache, Tensor& v_cache, std::int64_t start,
                                   const std::int64_t* start_offset, const Tensor* gate, Tensor& out, cudaStream_t stream);
 

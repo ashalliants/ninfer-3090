@@ -67,11 +67,13 @@ struct SituExpertBank {
  *     [g; u] = (Wgu_e z[:, t]) * gate_up_scale[e]          (scale 1 when absent)
  *     a      = gate_cap * tanh(g / gate_cap) * sigmoid(g) * up_cap * tanh(u / up_cap)
  *     y_i    = (Wd_e a) * down_scale[e]
- *   out[:, t] = sum_i weights[i, t] * y_i
+ *   out[:, t] = sum_i weights[i, t] * y_i    (i in order, one FMA each from 0)
+ *   With weights null, out holds the y_i instead (column t * k + i), for a consumer that combines them in that
+ *   same order (short_conv_fp32_batch's ShortConvJob::combine).
  *   where Wgu_e, Wd_e are the exact decode of the bank's blocks (tensor-formats.md ggml_nvfp4) or its BF16 values.
  *
- * Logical shapes: z FP32 [H, T] (any column stride); ids I32 [k, T], weights FP32 [k, T] contiguous; out FP32
- *   [H, T] contiguous.
+ * Logical shapes: z FP32 [H, T] (any column stride); ids I32 [k, T], weights FP32 [k, T] contiguous or null; out
+ *   FP32 [H, T] (or [H, k * T] with weights null) contiguous.
  * Supported domain: format GGML_REC_NVFP4_NVFP4 (H and I multiples of 64, records and record stride 16-byte
  *   aligned) or BF16 (H and I multiples of 8, banks 16-byte aligned); H and I at most 8192.
  * Numeric: FP32 activations and accumulation (no activation quantization); oracle FP64 over the decoded
@@ -81,7 +83,7 @@ struct SituExpertBank {
  * Execution: graph capturable.
  */
 [[nodiscard]] std::size_t moe_situ_experts_workspace_bytes(const SituExpertBank& bank, std::int64_t entries);
-void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor& ids, const Tensor& weights, float gate_cap,
+void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor& ids, const Tensor* weights, float gate_cap,
                       float up_cap, DeviceArena& workspace, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops
