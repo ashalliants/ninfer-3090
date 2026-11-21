@@ -365,6 +365,30 @@ void test_batches() {
         check(same_bits(sumb.get(n), sums.get(n)), "short_conv_fp32_batch: fused sum differs from conv + add_fp32");
         std::printf("%-44s bit-exact\n", "head_norms / short_conv batches, fused sum");
     }
+    {
+        // More heads than a grid's y holds: two unit-RMS jobs of 40000 one-value heads over 2 columns (each head
+        // becomes its value's sign), and a clip job of 128-value heads after them.
+        const int n = 40000, d = 128, heads = 4;
+        auto u = randoms(static_cast<std::size_t>(n) * cols, -2, 2), w = randoms(static_cast<std::size_t>(n) * cols, -2, 2),
+             c = randoms(static_cast<std::size_t>(heads) * d * cols, -40, 40);
+        Buf bu(u), bw(w), bc(c);
+        Tensor tu = bu.tensor({n, cols}), tw = bw.tensor({n, cols}), tc = bc.tensor({heads * d, cols});
+        ops::HeadNormJob jobs[3];
+        jobs[0].x = &tu, jobs[0].head_dim = 1, jobs[0].unit_rms = true, jobs[0].eps = 1e-6F;
+        jobs[1].x = &tw, jobs[1].head_dim = 1, jobs[1].unit_rms = true, jobs[1].eps = 1e-6F;
+        jobs[2].x = &tc, jobs[2].head_dim = d, jobs[2].threshold = 22.6F;
+        ops::head_norms_fp32(jobs, nullptr);
+        Vec want_u, want_w, want_c;
+        for (float e : u) { want_u.push_back(e / std::sqrt(double(e) * e + 1e-6)); }
+        for (float e : w) { want_w.push_back(e / std::sqrt(double(e) * e + 1e-6)); }
+        for (int i = 0; i < heads * cols; ++i) {
+            const Vec v = ref::l2_clip(Vec(c.begin() + i * d, c.begin() + (i + 1) * d), 22.6, nullptr);
+            want_c.insert(want_c.end(), v.begin(), v.end());
+        }
+        compare("head_norms_fp32 80004 heads: job 0", bu.get(u.size()), want_u, 2e-6);
+        compare("head_norms_fp32 80004 heads: job 1", bw.get(w.size()), want_w, 2e-6);
+        compare("head_norms_fp32 80004 heads: job 2 (past 65535)", bc.get(c.size()), want_c, 2e-6);
+    }
     // Refusals: mismatched T, too many jobs, sum without residual.
     {
         Buf a(h * 2), b(h * 3), o(h * 3);

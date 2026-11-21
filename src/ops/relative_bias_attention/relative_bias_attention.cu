@@ -2,8 +2,10 @@
 
 #include "ninfer/ops/relative_bias_attention.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -39,6 +41,8 @@ __device__ float warp_sum(float v) {
     return v;
 }
 
+constexpr int kMaxGridY = 65535;
+
 // The jobs of one head_norms_fp32 launch.
 struct HeadArgs {
     float* x[kHeadNormMaxJobs];
@@ -48,8 +52,8 @@ struct HeadArgs {
     std::int64_t start[kHeadNormMaxJobs], floor[kHeadNormMaxJobs];
     float threshold[kHeadNormMaxJobs], alpha[kHeadNormMaxJobs], eps[kHeadNormMaxJobs];
     int head_dim[kHeadNormMaxJobs], kind[kHeadNormMaxJobs]; // kind: 0 clip, 1 clip with log scale, 2 unit rms
-    int head_begin[kHeadNormMaxJobs + 1]; // first global head of each job, then the total
-    int count;
+    int head_begin[kHeadNormMaxJobs]; // first global head of each job
+    int count, total;
 };
 
 // The L2 clip of one head slice v (lane `lane` of its warp).
@@ -80,9 +84,8 @@ __device__ void unit_rms_head(float* v, int head_dim, float eps, int lane) {
     for (int d = lane; d < head_dim; d += 32) { v[d] *= inv; }
 }
 
-// grid (T, total heads of every job), one warp: block (t, g) normalizes global head g of column t.
-__global__ void head_norms_kernel(HeadArgs a) {
-    const int t = blockIdx.x, g = blockIdx.y, lane = threadIdx.x; // T on x: no 65535 cap
+// Global head g (of every job's heads in order) of column t.
+__device__ __forceinline__ void head_norm(const HeadArgs& a, int t, int g, int lane) {
     // The job by compile-time compares (a runtime index into the parameters would copy them to local memory).
     int j = 0;
 #pragma unroll
@@ -110,6 +113,12 @@ __global__ void head_norms_kernel(HeadArgs a) {
         clip_head(v, head_dim, scale != nullptr ? scale + static_cast<std::int64_t>(h) * head_dim : nullptr, threshold, kind == 1,
                   pos, floor, alpha, lane);
     }
+}
+
+// grid (T, min(total heads, 65535)), one warp: block (t, y) normalizes global heads y, y + gridDim.y, ... of column t.
+__global__ void head_norms_kernel(HeadArgs a) {
+    const int t = blockIdx.x, lane = threadIdx.x; // T on x: no 65535 cap
+    for (int g = blockIdx.y; g < a.total; g += gridDim.y) { head_norm(a, t, g, lane); }
 }
 
 __global__ void append_kernel(const float* __restrict__ src, std::int64_t ss, int rows, std::int64_t start,
@@ -239,7 +248,7 @@ void head_norms_fp32(std::span<const HeadNormJob> jobs, cudaStream_t stream) {
     HeadArgs a{};
     a.count = static_cast<int>(jobs.size());
     std::int32_t cols = 0;
-    int heads_total = 0;
+    std::int64_t heads_total = 0;
     for (std::size_t j = 0; j < jobs.size(); ++j) {
         const HeadNormJob& job = jobs[j];
         require(job.x != nullptr, op, "a job's x is null");
@@ -251,7 +260,7 @@ void head_norms_fp32(std::span<const HeadNormJob> jobs, cudaStream_t stream) {
         a.x[j]        = static_cast<float*>(x.data);
         a.xs[j]       = column_stride(x, x.ne[0], x.ne[1], op, "x");
         a.head_dim[j] = head_dim;
-        a.head_begin[j] = heads_total;
+        a.head_begin[j] = static_cast<int>(heads_total);
         heads_total += x.ne[0] / head_dim;
         a.floor[j] = 1;
         if (job.unit_rms) {
@@ -276,8 +285,9 @@ void head_norms_fp32(std::span<const HeadNormJob> jobs, cudaStream_t stream) {
             a.alpha[j]        = job.log_scale->alpha;
         }
     }
-    a.head_begin[jobs.size()] = heads_total;
-    head_norms_kernel<<<dim3(cols, heads_total), 32, 0, stream>>>(a);
+    require(heads_total <= std::numeric_limits<int>::max(), op, "too many heads");
+    a.total = static_cast<int>(heads_total);
+    head_norms_kernel<<<dim3(cols, static_cast<unsigned>(std::min<std::int64_t>(heads_total, kMaxGridY))), 32, 0, stream>>>(a);
     check_launch(op);
 }
 
