@@ -100,9 +100,16 @@ __global__ void __launch_bounds__(kThreads) mix_apply_kernel(MixArgs a, const fl
         value[j] = j < a.sources && d < a.rows ? a.src[j][t * a.src_stride[j] + d] : 0.0F;
     }
     const float scale = rsqrtf(static_cast<float>(a.rows));
+#pragma unroll 1
+    for (int i = 0; i < a.query_count; ++i) {
+        // The output by compile-time compares (a runtime index into the parameters would copy them to local memory).
+        float* out = a.out[0];
+        std::int64_t out_stride = a.out_stride[0];
 #pragma unroll
-    for (int i = 0; i < kQ; ++i) {
-        if (i >= a.query_count) { break; }
+        for (int c = 1; c < kQ; ++c) {
+            out        = i == c ? a.out[c] : out;
+            out_stride = i == c ? a.out_stride[c] : out_stride;
+        }
         float weight[kS];
         float top = -INFINITY;
 #pragma unroll
@@ -116,10 +123,12 @@ __global__ void __launch_bounds__(kThreads) mix_apply_kernel(MixArgs a, const fl
             weight[j] = j < a.sources ? expf(weight[j] - top) : 0.0F;
             sum += weight[j];
         }
+        const float to_unit = 1.0F / sum; // one division per query, not one per source (smaller code: Volta's
+                                          // instruction cache missed on this kernel more than anything else)
         float o = 0.0F;
 #pragma unroll
-        for (int j = 0; j < kS; ++j) { o = fmaf(weight[j] / sum * inv[j], value[j], o); }
-        if (d < a.rows) { a.out[i][t * a.out_stride[i] + d] = o; }
+        for (int j = 0; j < kS; ++j) { o = fmaf(weight[j] * to_unit * inv[j], value[j], o); }
+        if (d < a.rows) { out[t * out_stride + d] = o; }
     }
 }
 
