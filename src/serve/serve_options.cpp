@@ -244,7 +244,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--context-store-s3-upload-delay-seconds N]]] "
            "[--no-exit-on-engine-failure] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] [--dense-q8 head|all] "
+           "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] [--dense-q8 head|all (lossy)] "
            "[--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N]] "
            "[--ngram-draft-tokens 0|15] [--ngram-min-match N] [--adaptive-draft-tokens 0|3] "
            "[--relaxed-drafting [P]] [--draft-context-rows N] "

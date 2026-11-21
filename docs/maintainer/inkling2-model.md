@@ -511,7 +511,9 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
 
 ## Dense 8-bit re-encoding
 
-`--dense-q8 head|all` (`EngineOptions::dense_q8`, `ProgramLimits::dense`; opt-in, off by default) re-encodes BF16
+**Lossy.** `--dense-q8 head|all` (`EngineOptions::dense_q8`, `ProgramLimits::dense`; opt-in, off by default: the
+default runs the BF16 weights exactly) changes the target's logits (KLD below), so greedy output can differ from the
+default's. It re-encodes BF16
 dense weights at load with Q8_0's values (`ops::quantize_q8_g32`: per 32 values of a row d = amax / 127 as FP16 and
 int8 codes, ggml's `quantize_row_q8_0_ref` rounding; 8.5 bits a weight; the artifact is unchanged).
 `ops::projection_q8_fp32` runs them with BF16 activations and FP32 sums (oracle `ninfer_projection_q8_test`). `head`
