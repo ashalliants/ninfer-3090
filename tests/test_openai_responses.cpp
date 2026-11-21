@@ -860,16 +860,112 @@ int test_namespace_tools() {
                           !sequential_parsed.prompt.generation.tool_choice.parallel,
                       "responses accepts parallel_tool_calls=false and propagates it");
 
-    Json oversized           = body;
-    oversized["tool_choice"] = "auto";
-    oversized["tools"] =
-        Json::array({Json{{"type", "namespace"},
-                          {"name", std::string(60, 'n')},
-                          {"tools", Json::array({Json{{"type", "function"}, {"name", "tool"}}})}}});
+    // A flattened name over 64 bytes (a real Codex MCP tool) is shortened for the Engine, and the
+    // response restores the client's namespace and name from tool_identities.
+    const std::string long_namespace = "mcp__codex_apps__codex_document_control_";
+    const std::string long_name      = "_execute_document_command";
+    Json oversized                   = body;
+    oversized["tool_choice"]         = "auto";
+    oversized["tools"] = Json::array(
+        {Json{{"type", "namespace"},
+              {"name", long_namespace},
+              {"tools", Json::array({Json{{"type", "function"}, {"name", long_name}}})}}});
+    const auto shortened = parse_openai_responses_create_request(oversized, limits());
+    const std::string engine_name = shortened.prompt.generation.tools.at(0).name;
+    failures += check(engine_name.size() <= 64 && engine_name != long_namespace + "__" + long_name,
+                      "an over-long flattened identity is shortened to fit the Engine");
+    failures += check(shortened.tool_identities.at(engine_name).name == long_name &&
+                          shortened.tool_identities.at(engine_name).wire_namespace ==
+                              std::optional<std::string>(long_namespace),
+                      "the shortened identity maps back to the client's namespace and name");
+    failures += check(parse_openai_responses_create_request(oversized, limits())
+                              .prompt.generation.tools.at(0)
+                              .name == engine_name,
+                      "shortening is deterministic");
+
+    // A continuation cannot reuse the Engine name its parent chain bound to another client tool.
+    // The map goes through the store and resolve_openai_responses_prompt, the same path the
+    // aggregate and streaming handlers read it back on.
+    {
+        const OpenAIResponsesFunctionIdentity long_identity{.name           = long_name,
+                                                           .wire_namespace = long_namespace};
+        StoredOpenAIResponse parent = stored_parent(nullptr);
+        parent.tool_identities      = {{engine_name, long_identity}};
+        OpenAIResponsesStore parent_store(8, 1ULL << 20);
+        parent_store.put(std::move(parent));
+
+        const auto child_request = [&](const Json& tools) {
+            Json child = body;
+            child["input"]                = "next";
+            child["previous_response_id"] = "resp_parent";
+            child["tool_choice"]          = "auto";
+            child["tools"]                = tools;
+            return parse_openai_responses_create_request(child, limits());
+        };
+        const auto resolve_and_merge = [&](const OpenAIResponsesCreateRequest& request) {
+            const auto resolved = resolve_openai_responses_prompt(request.prompt, parent_store,
+                                                                  "resp_child", true);
+            return merge_openai_responses_tool_identities(resolved.parent_tool_identities,
+                                                          request.tool_identities);
+        };
+
+        failures += check(resolve_openai_responses_prompt(child_request(oversized["tools"]).prompt,
+                                                          parent_store, "resp_child", true)
+                                  .parent_tool_identities.at(engine_name) == long_identity,
+                          "resolving a child loads the parent chain's stored tool identities");
+        failures += check(resolve_and_merge(child_request(oversized["tools"])).size() == 1,
+                          "a continuation may redeclare the same tool the parent chain used");
+        bool collided = false;
+        try {
+            (void)resolve_and_merge(child_request(
+                Json::array({Json{{"type", "function"}, {"name", engine_name}}})));
+        } catch (const ApiException& exception) {
+            collided = exception.error().code == "duplicate_tool_name";
+        }
+        failures += check(collided,
+                          "a continuation cannot declare a different client tool under an Engine "
+                          "name the parent chain already bound");
+    }
+
+    // Over-long names are cut on a character boundary, so the error body stays valid UTF-8.
+    {
+        Json multibyte = body;
+        std::string name(79, 'a');
+        name += "\xC3\xA9";  // 'e' with acute: its two bytes straddle the 80-byte cut
+        name += std::string(600, 'b');
+        multibyte["tools"] = Json::array({Json{{"type", "function"}, {"name", name}}});
+        const ApiError error = api_error([&] {
+            (void)parse_openai_responses_create_request(multibyte, limits());
+        });
+        failures += check(error.code == "invalid_tool_name" &&
+                              Json{{"m", error.message}}.dump().size() > 0,
+                          "an over-long multibyte tool name yields a serialisable 400");
+    }
+
+    // A name with characters outside [A-Za-z0-9_-] is sanitised the same way.
+    Json dotted             = body;
+    dotted["tool_choice"]   = "auto";
+    dotted["tools"]         = Json::array({Json{{"type", "function"}, {"name", "git.status:v1"}}});
+    const auto dotted_parsed = parse_openai_responses_create_request(dotted, limits());
+    const std::string dotted_name = dotted_parsed.prompt.generation.tools.at(0).name;
+    failures += check(dotted_name.size() <= 64 && dotted_name.find('.') == std::string::npos &&
+                          dotted_parsed.tool_identities.at(dotted_name).name == "git.status:v1",
+                      "a name with dots and colons is sanitised and restored");
+
+    // Names that sanitise to the same text stay distinct, and genuinely bad names say which.
+    Json twins           = dotted;
+    twins["tools"]       = Json::array({Json{{"type", "function"}, {"name", "a.b"}},
+                                        Json{{"type", "function"}, {"name", "a_b"}}});
+    const auto twin_parsed = parse_openai_responses_create_request(twins, limits());
+    failures += check(twin_parsed.prompt.generation.tools.at(0).name !=
+                          twin_parsed.prompt.generation.tools.at(1).name,
+                      "a.b and a_b do not collide");
+    Json blank           = dotted;
+    blank["tools"]       = Json::array({Json{{"type", "function"}, {"name", "bad\nname"}}});
     failures += check(api_code([&] {
-                          (void)parse_openai_responses_create_request(oversized, limits());
+                          (void)parse_openai_responses_create_request(blank, limits());
                       }) == "invalid_tool_name",
-                      "flattened identities must fit the Engine tool-name contract");
+                      "control characters in a tool name are rejected");
     return failures;
 }
 

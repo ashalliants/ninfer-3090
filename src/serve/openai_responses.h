@@ -22,16 +22,6 @@ namespace ninfer::serve {
 
 struct GenerationOutcome;
 
-struct OpenAIResponsesFunctionIdentity {
-    std::string name;
-    std::optional<std::string> wire_namespace;
-    // A free-form `custom` tool: served to the model as a strict function with one string
-    // parameter, `input`, and returned on the wire as custom_tool_call Items carrying that text.
-    bool custom = false;
-
-    bool operator==(const OpenAIResponsesFunctionIdentity&) const = default;
-};
-
 struct OpenAIResponsesPromptRequest {
     std::string model;
     GenerationRequest generation;
@@ -67,6 +57,8 @@ struct OpenAIResponsesCreateRequest {
 struct OpenAIResponsesResolvedPrompt {
     GenerationRequest generation;
     OpenAIResponseContext parent;
+    // The parent chain's Engine tool name -> client identity map (empty without a parent).
+    std::unordered_map<std::string, OpenAIResponsesFunctionIdentity> parent_tool_identities;
     std::optional<std::string> session_key;
     ContextCacheHints cache_hints;
     bool preserve_thinking_semantic_change = false;
@@ -89,6 +81,13 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Request
 
 OpenAIResponsesPromptRequest
 parse_openai_responses_input_tokens_request(const RequestJson& body, const RequestLimits& limits);
+
+// Merges the current request's Engine-name -> client-identity map into the parent chain's, and
+// throws a 400 duplicate_tool_name when one Engine name would stand for two client tools.
+std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>
+merge_openai_responses_tool_identities(
+    const std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& parent,
+    const std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& current);
 
 OpenAIResponsesResolvedPrompt
 resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,

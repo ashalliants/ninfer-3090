@@ -150,6 +150,30 @@ ChatTurn instruction_turn(const std::string& text) {
 
 } // namespace
 
+// The parent chain's history carries flattened Engine names. A name the current request declares
+// for a different client tool would make two logical tools share one Engine name, and a generated
+// call would be restored to whichever identity the current request holds. Returns the merged map.
+std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>
+merge_openai_responses_tool_identities(
+    const std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& parent,
+    const std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& current) {
+    auto merged = parent;
+    for (const auto& [engine_name, identity] : current) {
+        const auto [position, inserted] = merged.emplace(engine_name, identity);
+        if (!inserted && position->second != identity) {
+            ApiError error;
+            error.status  = 400;
+            error.type    = "invalid_request_error";
+            error.param   = "tools";
+            error.code    = "duplicate_tool_name";
+            error.message = "function identity collision with the previous response's tools: '" +
+                            engine_name + "'";
+            throw ApiException(std::move(error));
+        }
+    }
+    return merged;
+}
+
 OpenAIResponsesResolvedPrompt
 resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
                                 OpenAIResponsesStore& store, std::optional<std::string> response_id,
@@ -161,7 +185,8 @@ resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
     if (request.previous_response_id) {
         parent_record = store.get(*request.previous_response_id);
         if (!parent_record) { response_not_found(*request.previous_response_id); }
-        resolved.parent = parent_record->context;
+        resolved.parent                = parent_record->context;
+        resolved.parent_tool_identities = parent_record->tool_identities;
     }
 
     const std::optional<bool> parent_preserve =

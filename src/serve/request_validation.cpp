@@ -284,4 +284,24 @@ bool valid_tool_name(std::string_view name, std::size_t maximum_length) noexcept
     return true;
 }
 
+std::string engine_tool_name(std::string_view client_name) {
+    if (valid_tool_name(client_name, 64)) { return std::string(client_name); }
+    constexpr std::size_t kEngineMax = 64;
+    constexpr std::size_t kSuffix    = 9; // '_' + 8 hex digits
+    std::string sanitized(client_name.substr(0, kEngineMax - kSuffix));
+    for (char& character : sanitized) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (std::isalnum(byte) == 0 && character != '_' && character != '-') { character = '_'; }
+    }
+    std::uint32_t hash = 2166136261U; // FNV-1a over the whole original
+    for (const unsigned char byte : client_name) {
+        hash ^= byte;
+        hash *= 16777619U;
+    }
+    static constexpr char kHex[] = "0123456789abcdef";
+    sanitized += '_';
+    for (int shift = 28; shift >= 0; shift -= 4) { sanitized += kHex[(hash >> shift) & 0xF]; }
+    return sanitized;
+}
+
 } // namespace ninfer::serve

@@ -36,14 +36,45 @@ void require_string_hint(const Json& body, const char* key, std::size_t max_byte
     }
 }
 
+// Clients may name tools freely (dots, colons, long MCP prefixes). Such names are mapped to Engine
+// names by engine_tool_name and restored on the wire, so only emptiness, length and control
+// characters are refused. The message names the offender, since the client's own tool list is
+// often large.
+void require_client_tool_name(const std::string& name, const char* what, const char* param) {
+    const auto printable = [](const std::string& text) {
+        // Cut on a UTF-8 character boundary: a split multi-byte character would make the error
+        // body invalid UTF-8, and serialising it would throw instead of returning the 400.
+        std::size_t cut = std::min<std::size_t>(text.size(), 80);
+        while (cut > 0 && cut < text.size() &&
+               (static_cast<unsigned char>(text[cut]) & 0xC0U) == 0x80U) {
+            --cut;
+        }
+        std::string shown = text.substr(0, cut);
+        for (char& character : shown) {
+            if (static_cast<unsigned char>(character) < 0x20) { character = '?'; }
+        }
+        return shown + (text.size() > 80 ? "..." : "");
+    };
+    if (name.empty()) { bad_request(std::string(what) + " must not be empty", param); }
+    if (name.size() > kMaxClientToolNameBytes) {
+        bad_request(std::string(what) + " '" + printable(name) + "' is longer than " +
+                        std::to_string(kMaxClientToolNameBytes) + " bytes",
+                    param, "invalid_tool_name");
+    }
+    for (const unsigned char character : name) {
+        if (character < 0x20 || character == 0x7F) {
+            bad_request(std::string(what) + " '" + printable(name) + "' contains a control character",
+                        param, "invalid_tool_name");
+        }
+    }
+}
+
 std::string require_function_name(const Json& object, const char* param) {
     if (!object.contains("name") || !object.at("name").is_string()) {
         bad_request("function name must be a string", param);
     }
-    const std::string name = object.at("name").get<std::string>();
-    if (!valid_tool_name(name, 64)) {
-        bad_request("function name must match [A-Za-z0-9_-]{1,64}", param);
-    }
+    std::string name = object.at("name").get<std::string>();
+    require_client_tool_name(name, "function name", param);
     return name;
 }
 
@@ -52,11 +83,8 @@ std::optional<std::string> optional_namespace_name(const Json& object, const cha
     if (!object.at("namespace").is_string()) {
         bad_request("function namespace must be a string or null", param);
     }
-    const std::string name = object.at("namespace").get<std::string>();
-    if (!valid_tool_name(name, 64)) {
-        bad_request("function namespace must match [A-Za-z0-9_-]{1,64}", param,
-                    "invalid_tool_name");
-    }
+    std::string name = object.at("namespace").get<std::string>();
+    require_client_tool_name(name, "function namespace", param);
     return name;
 }
 
@@ -64,10 +92,8 @@ std::string require_namespace_tool_name(const Json& object) {
     if (!object.contains("name") || !object.at("name").is_string()) {
         bad_request("namespace name must be a string", "tools");
     }
-    const std::string name = object.at("name").get<std::string>();
-    if (!valid_tool_name(name, 64)) {
-        bad_request("namespace name must match [A-Za-z0-9_-]{1,64}", "tools", "invalid_tool_name");
-    }
+    std::string name = object.at("name").get<std::string>();
+    require_client_tool_name(name, "namespace name", "tools");
     return name;
 }
 
@@ -87,13 +113,10 @@ std::string lower_function_identity(
     const OpenAIResponsesFunctionIdentity& identity,
     std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities,
     const char* param) {
-    const std::string engine_name =
-        identity.wire_namespace ? *identity.wire_namespace + "__" + identity.name : identity.name;
-    if (!valid_tool_name(engine_name, 64)) {
-        bad_request("flattened function identity '" + engine_name +
-                        "' exceeds the Engine tool-name contract [A-Za-z0-9_-]{1,64}",
-                    param, "invalid_tool_name");
-    }
+    // Shortened or sanitised when the flattened wire identity does not fit the Engine's contract;
+    // `identities` maps it back, and the response restores the client's name and namespace.
+    const std::string engine_name = engine_tool_name(
+        identity.wire_namespace ? *identity.wire_namespace + "__" + identity.name : identity.name);
     const auto [position, inserted] = identities.emplace(engine_name, identity);
     if (!inserted && position->second != identity) {
         if (position->second.name == identity.name &&

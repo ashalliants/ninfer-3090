@@ -12,11 +12,22 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace ninfer::serve {
+
+struct OpenAIResponsesFunctionIdentity {
+    std::string name;
+    std::optional<std::string> wire_namespace;
+    // A free-form `custom` tool: served to the model as a strict function with one string
+    // parameter, `input`, and returned on the wire as custom_tool_call Items carrying that text.
+    bool custom = false;
+
+    bool operator==(const OpenAIResponsesFunctionIdentity&) const = default;
+};
 
 struct OpenAIResponseContextNode {
     std::shared_ptr<const OpenAIResponseContextNode> parent;
@@ -39,6 +50,9 @@ struct StoredOpenAIResponse {
     std::vector<nlohmann::json> input_items;
     OpenAIResponseContext context;
     std::optional<bool> preserve_thinking;
+    // Flattened Engine tool name -> client identity, merged across the whole response chain, so a
+    // continuation cannot reuse an Engine name the history already bound to another client tool.
+    std::unordered_map<std::string, OpenAIResponsesFunctionIdentity> tool_identities;
 };
 
 class OpenAIResponsesStore {

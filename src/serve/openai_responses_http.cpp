@@ -31,6 +31,7 @@ struct PendingResponseStorage {
     std::vector<ChatTurn> input_turns;
     std::vector<Json> input_items;
     OpenAIResponseContext previous_context;
+    std::unordered_map<std::string, OpenAIResponsesFunctionIdentity> tool_identities;
     std::string session_key;
     bool enabled = false;
 };
@@ -91,6 +92,7 @@ void commit_stored_response(OpenAIResponsesStore& store, PendingResponseStorage 
     stored.context           = terminal_context(std::move(pending.previous_context),
                                                 std::move(pending.input_turns), std::move(output_history));
     stored.preserve_thinking = preserve_thinking;
+    stored.tool_identities   = std::move(pending.tool_identities);
     store.put(std::move(stored));
 }
 
@@ -250,6 +252,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         validate_openai_model(request.prompt.model, public_model_id_);
         resolved = resolve_openai_responses_prompt(request.prompt, openai_responses_store_, id,
                                                    request.store);
+        resolved.parent_tool_identities = merge_openai_responses_tool_identities(
+            resolved.parent_tool_identities, request.tool_identities);
     } catch (const ApiException& exception) {
         write_openai_error(res, responses_error(exception.error()));
         return;
@@ -336,6 +340,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         storage.input_turns      = std::move(request.prompt.input_turns);
         storage.input_items      = std::move(request.prompt.input_items);
         storage.previous_context = std::move(resolved.parent);
+        storage.tool_identities  = std::move(resolved.parent_tool_identities);
         if (resolved.session_key) { storage.session_key = std::move(*resolved.session_key); }
         storage.enabled = request.store;
         try {
@@ -370,6 +375,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         stream->storage.input_turns      = std::move(request.prompt.input_turns);
         stream->storage.input_items      = std::move(request.prompt.input_items);
         stream->storage.previous_context = std::move(resolved.parent);
+        stream->storage.tool_identities  = std::move(resolved.parent_tool_identities);
         if (resolved.session_key) {
             stream->storage.session_key = std::move(*resolved.session_key);
         }
