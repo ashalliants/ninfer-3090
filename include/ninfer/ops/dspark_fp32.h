@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 
@@ -84,15 +85,24 @@ void dspark_fuse_taps_fp32(std::span<const Tensor* const> taps, const Tensor& fu
  *   rings), then the block's W keys. For head h (kv head g = h / (heads / kv_heads)):
  *   out[h, :, t] = sum_j softmax_j(q[h, :, t] . k_j[g] / sqrt(D)) v_j[g]
  *
+ * Any number of keys: they are split into at most kDSparkAttentionMaxSplits runs of whole 32-key tiles; one block per
+ * (kv head, 16 of its heads x W queries, run) folds its run's tiles into an online softmax (FP32), and a second
+ * kernel combines the runs' maxima, denominators and sums in run order, weighted by e^{m_z - max m}. One run (at
+ * most 32 keys) writes out directly.
+ *
  * q FP32 [D * heads, W]; k_ring, v_ring FP32 [D * kv_heads, capacity] (a - lo <= capacity); k_block, v_block FP32
  * [D * kv_heads, W]; out FP32 [D * heads, W]; all contiguous. D = 128. Oracle FP64.
+ * Workspace: `workspace` FP32 contiguous device storage (non-null, refused otherwise) of
+ * dspark_block_attention_workspace_bytes(shape, W) bytes or more.
  */
 struct DSparkAttentionShape {
     int heads = 0, kv_heads = 0, head_dim = 0, window = 0;
 };
+inline constexpr int kDSparkAttentionMaxSplits = 64;
+[[nodiscard]] std::size_t dspark_block_attention_workspace_bytes(const DSparkAttentionShape& shape, int w);
 void dspark_block_attention_fp32(const Tensor& q, const Tensor& k_ring, const Tensor& v_ring, const Tensor& k_block,
                                  const Tensor& v_block, std::int64_t anchor, const DSparkAttentionShape& shape, Tensor& out,
-                                 cudaStream_t stream);
+                                 const Tensor& workspace, cudaStream_t stream);
 
 /**
  * Op: dspark_markov_update_fp32 (the Markov RNN's state transition)

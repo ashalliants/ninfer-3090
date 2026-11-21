@@ -297,6 +297,11 @@ size is 8, made of one anchor plus 7 drafts. The drafter borrows the target's `t
 - **Block forward:** the anchor is `n_{embed_norm}(E[a])`, and the 7 masks are `mask_embd`. Each
   layer is pre-norm attention (q, k: head RMSNorm then RoPE) plus a SiLU MLP. After a final norm,
   `base_i = W_head x_i` (not softcapped yet).
+  The block attention (`ops::dspark_block_attention_fp32`) sees the whole context on the global
+  layer. It splits the keys into at most 64 runs of 32-key tiles, each folded by an online softmax
+  that one block computes for 16 of a KV head's (3 heads x W) queries, and then combines the runs.
+  The keys are not bounded by shared memory: an earlier single-block form kept every score there
+  and refused contexts past 23,040 keys.
 - **Markov RNN head** ([Ld] 946-968, 1100-1110). The state starts at 0 and `prev` starts at the
   anchor. For `i = 1..7`:
   ```text
