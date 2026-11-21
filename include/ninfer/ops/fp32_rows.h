@@ -9,6 +9,8 @@
 
 #include <cuda_runtime.h>
 
+#include <span>
+
 namespace ninfer::ops {
 
 /**
@@ -30,6 +32,21 @@ namespace ninfer::ops {
  * Workspace: none. Execution: stream-ordered; graph capturable.
  */
 void rmsnorm_fp32(const Tensor& x, const Tensor* weight, float eps, Tensor& out, cudaStream_t stream);
+
+/// One rmsnorm_fp32 of a batch.
+struct RmsNormJob {
+    const Tensor* x      = nullptr;
+    const Tensor* weight = nullptr;
+    Tensor* out          = nullptr;
+};
+inline constexpr int kRmsNormMaxJobs = 4;
+
+/**
+ * Op: rmsnorm_fp32_batch: 1 to kRmsNormMaxJobs rmsnorm_fp32 calls in one launch, each job's result the
+ * same bits as its own call. Every job has the same D and T and one output dtype; the in-place rule of
+ * rmsnorm_fp32 holds per job, and no job's out may overlap another job's operands.
+ */
+void rmsnorm_fp32_batch(std::span<const RmsNormJob> jobs, float eps, cudaStream_t stream);
 
 /**
  * Op: add_fp32: out[d, t] = a[d, t] + b[d, t]. FP32 [D, T]; out may equal a or b. No workspace.

@@ -13,6 +13,7 @@
 
 #include <array>
 #include <cstddef>
+#include <span>
 #include <stdexcept>
 #include <string>
 
@@ -120,8 +121,8 @@ void TextProgram::control(const ControllerWeights& w, const Tensor& c, const Ten
     const auto scope = workspace_.scope();
     Tensor both = workspace_.alloc(DType::BF16, {2 * h, cols});
     Tensor first = both.slice(0, 0, h), second = both.slice(0, h, h);
-    ops::rmsnorm_fp32(c, nullptr, config_.rms_norm_eps, first, stream_);
-    ops::rmsnorm_fp32(m, nullptr, config_.rms_norm_eps, second, stream_);
+    const ops::RmsNormJob norms[] = {{&c, nullptr, &first}, {&m, nullptr, &second}};
+    ops::rmsnorm_fp32_batch(norms, config_.rms_norm_eps, stream_);
     const WeightId down[] = {w.down};
     const std::int32_t down_rows[] = {rank};
     Tensor hidden = project(both, down, down_rows);
@@ -185,18 +186,11 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         nk = workspace_.alloc(DType::BF16, {h, cols});
         nv = workspace_.alloc(DType::BF16, {h, cols});
     }
-    if (local) {
-        const Tensor gamma = model_.tensor(w.norm, {h});
-        ops::rmsnorm_fp32(xq, &gamma, eps, nq, stream_);
-        if (!one_input) {
-            ops::rmsnorm_fp32(xk, &gamma, eps, nk, stream_);
-            ops::rmsnorm_fp32(xv, &gamma, eps, nv, stream_);
-        }
-    } else {
-        const Tensor gq = model_.tensor(w.q_norm, {h}), gk = model_.tensor(w.k_norm, {h}), gv = model_.tensor(w.v_norm, {h});
-        ops::rmsnorm_fp32(xq, &gq, eps, nq, stream_);
-        ops::rmsnorm_fp32(xk, &gk, eps, nk, stream_);
-        ops::rmsnorm_fp32(xv, &gv, eps, nv, stream_);
+    {
+        const Tensor gq = model_.tensor(local ? w.norm : w.q_norm, {h});
+        const Tensor gk = local ? gq : model_.tensor(w.k_norm, {h}), gv = local ? gq : model_.tensor(w.v_norm, {h});
+        const ops::RmsNormJob norms[] = {{&xq, &gq, &nq}, {&xk, &gk, &nk}, {&xv, &gv, &nv}};
+        ops::rmsnorm_fp32_batch(std::span<const ops::RmsNormJob>(norms, one_input ? 1 : 3), eps, stream_);
     }
 
     // 3e: projections and short convolutions.
@@ -220,24 +214,37 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
             pk = project(nk, kw, kr);
             pv = project(nv, vw, kr);
         }
-        ops::short_conv_fp32(pk, model_.tensor(w.k_conv, {k, kv}), nullptr, d, st.k_hist, kconv, stream_);
-        ops::short_conv_fp32(pv, model_.tensor(w.v_conv, {k, kv}), nullptr, d, st.v_hist, vconv, stream_);
+        const Tensor kt = model_.tensor(w.k_conv, {k, kv}), vt = model_.tensor(w.v_conv, {k, kv});
+        ops::ShortConvJob jobs[2];
+        jobs[0].x = &pk, jobs[0].taps = &kt, jobs[0].history = &st.k_hist, jobs[0].out = &kconv;
+        jobs[1].x = &pv, jobs[1].taps = &vt, jobs[1].history = &st.v_hist, jobs[1].out = &vconv;
+        ops::short_conv_fp32_batch(jobs, d, stream_);
     } else {
         const WeightId kw[] = {w.k, w.k_conv_proj}, vw[] = {w.v, w.v_conv_proj};
         const std::int32_t kr[] = {kv, dyn_rows};
         Tensor pk = project(nk, kw, kr), pv = project(nv, vw, kr);
         const Tensor kd = pk.slice(0, kv, dyn_rows), vd = pv.slice(0, kv, dyn_rows);
-        ops::short_conv_fp32(pk.slice(0, 0, kv), model_.tensor(w.k_conv, {k, kv}), &kd, d, st.k_hist, kconv, stream_);
-        ops::short_conv_fp32(pv.slice(0, 0, kv), model_.tensor(w.v_conv, {k, kv}), &vd, d, st.v_hist, vconv, stream_);
+        const Tensor kx = pk.slice(0, 0, kv), vx = pv.slice(0, 0, kv);
+        const Tensor kt = model_.tensor(w.k_conv, {k, kv}), vt = model_.tensor(w.v_conv, {k, kv});
+        ops::ShortConvJob jobs[2];
+        jobs[0].x = &kx, jobs[0].taps = &kt, jobs[0].dynamic = &kd, jobs[0].history = &st.k_hist, jobs[0].out = &kconv;
+        jobs[1].x = &vx, jobs[1].taps = &vt, jobs[1].dynamic = &vd, jobs[1].history = &st.v_hist, jobs[1].out = &vconv;
+        ops::short_conv_fp32_batch(jobs, d, stream_);
     }
 
     // 3f: clips, value norm, log scaling of the global layers' q and r.
     const ops::PositionLogScale tau{start, c.log_scaling_n_floor, c.log_scaling_alpha, start_offset_};
     const Tensor q_clip = model_.tensor(w.q_clip, {d, heads}), rel_clip = model_.tensor(w.rel_clip, {i32(c.d_rel), heads});
-    ops::head_l2_clip_fp32(q_t, d, &q_clip, c.qk_clip, local ? nullptr : &tau, stream_);
-    ops::head_l2_clip_fp32(r_t, i32(c.d_rel), &rel_clip, c.rel_clip, local ? nullptr : &tau, stream_);
-    ops::head_l2_clip_fp32(kconv, d, nullptr, c.qk_clip, nullptr, stream_);
-    ops::head_unit_rms_fp32(vconv, d, eps, stream_);
+    {
+        ops::HeadNormJob jobs[4];
+        jobs[0].x = &q_t, jobs[0].head_dim = d, jobs[0].scale = &q_clip, jobs[0].threshold = c.qk_clip;
+        jobs[0].log_scale = local ? nullptr : &tau;
+        jobs[1].x = &r_t, jobs[1].head_dim = i32(c.d_rel), jobs[1].scale = &rel_clip, jobs[1].threshold = c.rel_clip;
+        jobs[1].log_scale = local ? nullptr : &tau;
+        jobs[2].x = &kconv, jobs[2].head_dim = d, jobs[2].threshold = c.qk_clip;
+        jobs[3].x = &vconv, jobs[3].head_dim = d, jobs[3].unit_rms = true, jobs[3].eps = eps;
+        ops::head_norms_fp32(jobs, stream_);
+    }
 
     // 3g: attention, output gate, output projection and its convolution.
     ops::RelativeBiasAttentionShape shape{heads, i32(c.kv_heads), d, i32(c.d_rel), local ? i32(c.sliding_window) : 0};
@@ -250,16 +257,21 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     const std::int32_t orows[] = {h};
     Tensor a_in = project(gated, ow, orows);
     Tensor a = workspace_.alloc(DType::FP32, {h, cols});
-    ops::short_conv_fp32(a_in, model_.tensor(w.post_conv, {k, h}), nullptr, 1, st.attn_hist, a, stream_);
+    const Tensor post_taps = model_.tensor(w.post_conv, {k, h});
 
-    // 3h: residual and block boundary.
-    if (p % c.attn_res_block_size == 0) {
-        blocks.push_back(cur);
-        if (cudaMemcpyAsync(ffn_inp.data, a.data, a.bytes(), cudaMemcpyDeviceToDevice, stream_) != cudaSuccess) {
-            throw std::runtime_error("inkling2: copy failed");
+    // 3h: the convolution with the residual and block boundary: a block's first layer starts from a alone.
+    {
+        const bool boundary = p % c.attn_res_block_size == 0;
+        if (boundary) { blocks.push_back(cur); }
+        ops::ShortConvJob job;
+        job.x = &a_in, job.taps = &post_taps, job.history = &st.attn_hist;
+        if (boundary) {
+            job.out = &ffn_inp;
+        } else {
+            job.out = &a, job.residual = &cur, job.sum = &ffn_inp;
         }
-    } else {
-        ops::add_fp32(cur, a, ffn_inp, stream_);
+        ops::short_conv_fp32_batch(std::span<const ops::ShortConvJob>(&job, 1), 1, stream_);
+        if (boundary) { a = ffn_inp; } // for the trace
     }
 
     // 3i-3j: MoE input by depth attention, loop message, norm, routed experts, output convolution.
@@ -284,9 +296,12 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
                                 c.route_scale, workspace_, ids, weights, stream_);
     Tensor y = workspace_.alloc(DType::FP32, {h, cols});
     ops::moe_situ_experts(model_.expert_bank(p), z, ids, weights, c.gate_softcap, c.up_softcap, workspace_, y, stream_);
-    Tensor mo = workspace_.alloc(DType::FP32, {h, cols});
-    ops::short_conv_fp32(y, model_.tensor(w.mlp_post_conv, {k, h}), nullptr, 1, st.mlp_hist, mo, stream_);
-    ops::add_fp32(ffn_inp, mo, next, stream_);
+    {
+        const Tensor mlp_taps = model_.tensor(w.mlp_post_conv, {k, h});
+        ops::ShortConvJob job;
+        job.x = &y, job.taps = &mlp_taps, job.history = &st.mlp_hist, job.residual = &ffn_inp, job.sum = &next;
+        ops::short_conv_fp32_batch(std::span<const ops::ShortConvJob>(&job, 1), 1, stream_);
+    }
 
     if (trace != nullptr && *trace) {
         sync(stream_);

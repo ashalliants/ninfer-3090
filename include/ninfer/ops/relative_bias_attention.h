@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <span>
 
 namespace ninfer::ops {
 
@@ -41,6 +42,24 @@ void head_l2_clip_fp32(Tensor& x, int head_dim, const Tensor* scale, float thres
  * d at most 256. Oracle FP64 (inkling2_reference.h unit_rms).
  */
 void head_unit_rms_fp32(Tensor& x, int head_dim, float eps, cudaStream_t stream);
+
+/// One head_l2_clip_fp32 (unit_rms false) or head_unit_rms_fp32 (unit_rms true) of a batch.
+struct HeadNormJob {
+    Tensor* x                          = nullptr;
+    int head_dim                       = 0;
+    bool unit_rms                      = false;
+    const Tensor* scale                = nullptr; // clip
+    float threshold                    = 0.0F;    // clip
+    const PositionLogScale* log_scale  = nullptr; // clip
+    float eps                          = 0.0F;    // unit rms
+};
+inline constexpr int kHeadNormMaxJobs = 4;
+
+/**
+ * Op: head_norms_fp32: 1 to kHeadNormMaxJobs of the two head Ops above in one launch, each job's result
+ * the same bits as its own call. Every job has the same T; the jobs' tensors must not overlap.
+ */
+void head_norms_fp32(std::span<const HeadNormJob> jobs, cudaStream_t stream);
 
 struct RelativeBiasAttentionShape {
     int heads = 0, kv_heads = 0, head_dim = 0, d_rel = 0;
