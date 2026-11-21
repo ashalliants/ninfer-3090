@@ -129,18 +129,41 @@ struct MarkovHead {
     std::int32_t v = 0, r = 0;
 };
 
+/// A valid descriptor (checked by both Ops below, std::invalid_argument otherwise): form one of the three; v > 0 a
+/// multiple of 8; r > 0 a multiple of 32 up to 1024; codes non-null, 8-byte aligned, markov_head_code_bytes long;
+/// scales (Q8, Q4) non-null, 4-byte aligned, markov_head_scale_bytes long (ignored for BF16). The descriptor does not
+/// own its storage, which must outlive every call that reads it.
+///
 /// The bytes of a MarkovHead's codes and scales for V (a multiple of 8) and R (a multiple of 32).
 [[nodiscard]] std::size_t markov_head_code_bytes(MarkovForm form, std::int32_t v, std::int32_t r) noexcept;
 [[nodiscard]] std::size_t markov_head_scale_bytes(MarkovForm form, std::int32_t v, std::int32_t r) noexcept;
 
 /**
- * Op: dspark_markov_quantize: P FP32 [V, R] (as dspark_markov_logits_fp32 takes it) to `head`'s form, rounding to
- * nearest (BF16: even). head.codes and head.scales are the outputs (device memory of the sizes above).
+ * Op: dspark_markov_quantize
+ *
+ *   BF16: code[v, r] = bf16_rne(P[v, r])
+ *   Q8/Q4 per v and group g of 32 r:  d = max_r |P[v, r]| / L  (L = 127, 7);  code = clamp(rint(P / d), -L, L)
+ *   (code 0 when d = 0);  scales[g, v] = d
+ *
+ * pt FP32 [V, R] contiguous with ne[0] = V (P[v, r] at r * V + v, as dspark_markov_logits_fp32 takes it); head a
+ * valid descriptor (above) with head.v = V, head.r = R. Writes every code (and, Q8/Q4, every scale) of `head`; reads
+ * nothing else. codes, scales and pt must not overlap. No workspace. Asynchronous on `stream` (one launch, grid
+ * (ceil(V / 256), R / 32)); pt must stay valid until it completes. Exact against the rule above (FP32 d, rintf:
+ * ties to even). Refuses a bad descriptor, shape or overlap with std::invalid_argument.
  */
 void dspark_markov_quantize(const Tensor& pt, const MarkovHead& head, cudaStream_t stream);
 
 /**
- * Op: dspark_markov_logits: dspark_markov_logits_fp32 with P decoded from `head` (FP32 sums).
+ * Op: dspark_markov_logits
+ *
+ *   logits[v] = cap * tanh( (base[v] + hb[v] + sum_g scales[g, v] * sum_{r in g} code[v, r] * latent[r]) / cap )
+ *
+ * (BF16: P[v, r] = code[v, r], no scale.) base, hb, logits FP32 [V] contiguous; latent FP32 [R] contiguous; head a
+ * valid descriptor (above) with head.v = V, head.r = R; cap > 0. logits may be base itself (in place) but must not
+ * otherwise overlap base, hb, latent or the head's storage. Writes logits only. No workspace (R floats of shared
+ * memory). Asynchronous on `stream` (one launch). FP32 sums in r order within each group of 32, the groups in order:
+ * against the FP64 sum of the decoded P, within FP32 rounding of the magnitude sum. Lossy only through `head`'s
+ * form. Refuses a bad descriptor, shape or overlap with std::invalid_argument.
  */
 void dspark_markov_logits(const Tensor& base, const Tensor& hb, const MarkovHead& head, const Tensor& latent, float cap, Tensor& logits,
                           cudaStream_t stream);

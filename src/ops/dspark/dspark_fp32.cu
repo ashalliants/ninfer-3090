@@ -619,12 +619,37 @@ std::size_t markov_head_scale_bytes(MarkovForm form, std::int32_t v, std::int32_
     return form == MarkovForm::BF16 ? 0 : static_cast<std::size_t>(v) * (r / 32) * 4;
 }
 
+namespace {
+
+// The whole descriptor: a known form, V a positive multiple of 8, R a positive multiple of 32 up to 1024, codes
+// 8-byte aligned, and (Q8, Q4) 4-byte aligned scales.
+void check_head(const MarkovHead& head, const char* op) {
+    require(head.form == MarkovForm::BF16 || head.form == MarkovForm::Q8 || head.form == MarkovForm::Q4, op, "unknown MarkovForm");
+    require(head.v > 0 && head.v % 8 == 0 && head.r > 0 && head.r % 32 == 0 && head.r <= 1024, op,
+            "V must be a positive multiple of 8 and R a multiple of 32 up to 1024");
+    require(head.codes != nullptr && reinterpret_cast<std::uintptr_t>(head.codes) % 8 == 0, op, "codes must be non-null and 8-byte aligned");
+    require(head.form == MarkovForm::BF16 || (head.scales != nullptr && reinterpret_cast<std::uintptr_t>(head.scales) % 4 == 0), op,
+            "Q8 and Q4 need non-null, 4-byte aligned scales");
+}
+
+bool overlaps(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes) {
+    const auto x = reinterpret_cast<std::uintptr_t>(a), y = reinterpret_cast<std::uintptr_t>(b);
+    return a_bytes > 0 && b_bytes > 0 && x < y + b_bytes && y < x + a_bytes;
+}
+
+} // namespace
+
 void dspark_markov_quantize(const Tensor& pt, const MarkovHead& head, cudaStream_t stream) {
     constexpr const char* op = "dspark_markov_quantize";
     const Columns p = columns(pt, op, "pt", true);
-    require(p.rows == head.v && p.cols == head.r && head.v % 8 == 0 && head.r % 32 == 0 && head.r <= 1024, op,
-            "pt must be [V, R], V a multiple of 8, R a multiple of 32 up to 1024");
-    require(head.codes != nullptr && (head.form == MarkovForm::BF16 || head.scales != nullptr), op, "codes and scales are required");
+    check_head(head, op);
+    require(p.rows == head.v && p.cols == head.r, op, "pt must be [V, R]");
+    const std::size_t pt_bytes = static_cast<std::size_t>(head.v) * head.r * 4;
+    require(!overlaps(head.codes, markov_head_code_bytes(head.form, head.v, head.r), pt.data, pt_bytes) &&
+                !overlaps(head.scales, markov_head_scale_bytes(head.form, head.v, head.r), pt.data, pt_bytes) &&
+                !overlaps(head.codes, markov_head_code_bytes(head.form, head.v, head.r), head.scales,
+                          markov_head_scale_bytes(head.form, head.v, head.r)),
+            op, "codes, scales and pt must not overlap");
     markov_head_quantize_kernel<<<dim3((head.v + 255) / 256, head.r / 32), 256, 0, stream>>>(static_cast<const float*>(pt.data), head.form,
                                                                                    const_cast<void*>(head.codes), const_cast<float*>(head.scales), head.v);
     check_launch(op);
@@ -636,9 +661,15 @@ void dspark_markov_logits(const Tensor& base, const Tensor& hb, const MarkovHead
     const Columns b = columns(base, op, "base", true), h = columns(hb, op, "hb", true), l = columns(latent, op, "latent", true);
     const Columns o = columns(logits, op, "logits", true);
     require(b.cols == 1 && h.cols == 1 && l.cols == 1 && o.cols == 1, op, "vectors");
-    require(h.rows == b.rows && o.rows == b.rows && head.v == b.rows && head.r == l.rows && head.r % 32 == 0 && head.r <= 1024 &&
-                head.v % 8 == 0 && cap > 0,
-            op, "shapes differ");
+    check_head(head, op);
+    require(h.rows == b.rows && o.rows == b.rows && head.v == b.rows && head.r == l.rows && cap > 0, op, "shapes differ");
+    // logits may be base (in place); it must not overlap the other inputs.
+    const std::size_t out_bytes = static_cast<std::size_t>(o.rows) * 4;
+    require(!overlaps(logits.data, out_bytes, hb.data, out_bytes) && !overlaps(logits.data, out_bytes, latent.data, static_cast<std::size_t>(l.rows) * 4) &&
+                !overlaps(logits.data, out_bytes, head.codes, markov_head_code_bytes(head.form, head.v, head.r)) &&
+                !overlaps(logits.data, out_bytes, head.scales, markov_head_scale_bytes(head.form, head.v, head.r)) &&
+                (logits.data == base.data || !overlaps(logits.data, out_bytes, base.data, out_bytes)),
+            op, "logits may be base but must not overlap hb, latent or the head");
     const int per = head.form == MarkovForm::Q4 ? 8 : 4, threads = (head.v / per + 255) / 256;
     const auto* bp = static_cast<const float*>(base.data);
     const auto* hp = static_cast<const float*>(hb.data);
