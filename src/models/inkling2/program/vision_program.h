@@ -52,15 +52,19 @@ public:
     VisionEncoder(const VisionEncoder&)            = delete;
     VisionEncoder& operator=(const VisionEncoder&) = delete;
 
-    // The image's embeddings: FP32 [text hidden, image.tokens()] on the device, valid until the next encode. The
-    // workspace grows to the largest image seen.
-    Tensor encode(const PreparedImage& image);
+    // The workspace encode() takes for an image of up to max_image_tokens, with the tower's weights when the model
+    // holds them in pinned host memory (Model::vision_overlay).
+    [[nodiscard]] static std::size_t workspace_bytes(const Model& model);
+
+    // The image's embeddings: FP32 [text hidden, image.tokens()] in `workspace` (reset first, and holding at least
+    // workspace_bytes()), valid until the workspace is next reset. Under the overlay, the tower's weights are copied
+    // into the workspace first. The workspace can be another Program's between its calls (the text Program's).
+    Tensor encode(const PreparedImage& image, DeviceArena& workspace);
 
 private:
     const Model& model_;
     const VisionConfig& config_;
     cudaStream_t stream_;
-    std::unique_ptr<DeviceArena> workspace_;
 };
 
 } // namespace ninfer::models::inkling2

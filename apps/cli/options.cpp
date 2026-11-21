@@ -146,7 +146,7 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N] [--devices N,M,...] [--stage-layers A,B,...]\n"
-           "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4|fp16|fp32 (Inkling-2: fp16|fp32)] [--dense-q8 head|all (lossy)] [--no-split-attention] [--prefill-math tc|fp32] [--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N]]\n"
+           "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4|fp16|fp32 (Inkling-2: fp16|fp32)] [--dense-q8 head|all (lossy)] [--no-split-attention] [--prefill-math tc|fp32] [--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N] [--dspark-window N]]\n"
            "       [--ngram-draft-tokens 0|15] [--ngram-min-match N] [--adaptive-draft-tokens 0|3]\n"
            "       [--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4]\n"
            "       [--gdn-state-fp16] [--mlp-a8-decode] [--no-prefill-a8]\n"
@@ -301,6 +301,10 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             draft_tokens_given               = true;
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
+        } else if (arg == "--dspark-window") {
+            const std::string_view form = value(arg);
+            options.speculative.dspark_window = form == "auto" ? SpeculativeOptions::kDSparkWindowAuto
+                                                               : parse_u32(std::string(form).c_str(), "dspark-window", true);
         } else if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens = parse_u32(value(arg), "ngram-draft-tokens", true);
         } else if (arg == "--adaptive-draft-tokens") {

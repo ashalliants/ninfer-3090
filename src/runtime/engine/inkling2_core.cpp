@@ -187,13 +187,21 @@ private:
 void Inkling2Core::build_programs(ink::ProgramLimits limits, std::unique_ptr<ink::DenseWeightsQ8>& dense, const ink::VisionConfig* vision,
                                   bool dspark) {
     limits.max_chunk = chunk_;
+    // The tower encodes in the text Program's workspace, before the prompt's forwards: it holds the larger of the two.
+    if (vision != nullptr) { limits.min_workspace_bytes = ink::VisionEncoder::workspace_bytes(*model_); }
     programs_ = std::make_unique<Programs>(*model_, dense.get(), limits, stream_);
     if (dspark) {
         // With --dense-q8 the drafter proposes from the target's re-encoded head, the one it verifies against.
         // Its extends take at most its sliding window; a wider chunk's taps go in pieces (extend_drafter).
         const std::int32_t draft_chunk = std::min(chunk_, static_cast<std::int32_t>(model_->dspark_config()->sliding_window));
+        const std::uint32_t window = drafter_window_;
+        if (window != 0 && window < model_->dspark_config()->sliding_window) {
+            throw std::invalid_argument("--dspark-window: 0 (the whole context) or at least the drafter's sliding window (" +
+                                        std::to_string(model_->dspark_config()->sliding_window) + ")");
+        }
         programs_->drafter = std::make_unique<ink::DSparkProgram>(*model_, static_cast<std::int32_t>(options_.max_context), draft_chunk, stream_,
-                                                                  dense ? &dense->head() : nullptr, limits.kv_fp16);
+                                                                  dense ? &dense->head() : nullptr, limits.kv_fp16,
+                                                                  static_cast<std::int32_t>(window), drafter_head_copy_);
         const std::int32_t hidden = static_cast<std::int32_t>(model_->config().hidden_size);
         for (std::size_t i = 0; i < limits.tap_visits.size(); ++i) {
             programs_->held_memory.emplace_back(static_cast<std::size_t>(hidden) * kHeld * 4);
@@ -305,7 +313,9 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     // Only the components the server uses are uploaded: the tower with --vision, the drafter with --spec dspark.
     // (load_model reports the weights' materialize phase itself.)
     model_ = ink::load_model(reader, device_,
-                             {.vision = options_.enable_vision, .dspark = options_.speculative.backend == SpeculativeBackend::DSpark},
+                             {.vision         = options_.enable_vision,
+                              .dspark         = options_.speculative.backend == SpeculativeBackend::DSpark,
+                              .vision_overlay = options_.enable_vision && options_.vision_residency == VisionResidency::Overlay},
                              &options_.startup_observer);
     const ink::VisionConfig* vision = options_.enable_vision ? model_->vision_config() : nullptr;
     {
@@ -350,9 +360,33 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                 }
             }
         }
-        for (std::size_t attempt = 0; attempt < chunks.size(); ++attempt) {
-            const bool last = attempt + 1 == chunks.size();
-            chunk_ = chunks[attempt];
+        // Each chunk first with the drafter at its best, then giving up what costs it least: its Q8 copy of the head
+        // (492 MB; the drafts read the target's BF16 head, a slower draft), then (--dspark-window auto) the whole
+        // context for the last 32768 or 16384 positions (fewer drafts may be accepted). Never the output.
+        struct Attempt {
+            std::int32_t chunk;
+            bool head_copy;
+            std::uint32_t window;
+        };
+        const std::uint32_t asked = options_.speculative.dspark_window;
+        const bool auto_window    = asked == SpeculativeOptions::kDSparkWindowAuto;
+        std::vector<Attempt> attempts;
+        for (const std::int32_t c : chunks) {
+            attempts.push_back({c, true, auto_window ? 0U : asked});
+            if (!dspark) { continue; }
+            if (options_.dense_q8 == DenseQ8::Off) { attempts.push_back({c, false, auto_window ? 0U : asked}); }
+            const bool copy = options_.dense_q8 != DenseQ8::Off; // with a Q8 head of the target's the drafter reads it
+            if (auto_window) {
+                for (const std::uint32_t w : {32768U, 16384U}) {
+                    if (w < options_.max_context) { attempts.push_back({c, copy, w}); }
+                }
+            }
+        }
+        for (std::size_t attempt = 0; attempt < attempts.size(); ++attempt) {
+            const bool last = attempt + 1 == attempts.size();
+            chunk_             = attempts[attempt].chunk;
+            drafter_head_copy_ = attempts[attempt].head_copy;
+            drafter_window_    = attempts[attempt].window;
             try {
                 build_programs(limits, dense, vision, dspark);
                 std::size_t free_bytes = 0, total_bytes = 0;
@@ -383,6 +417,10 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     const bool fp32_prefill   = prefill_is_fp32(options_.kv_rings, options_.prefill_math);
     load_.prefill_signature   = fp32_prefill ? "inkling2-fp32" : "inkling2-tc";
     load_.notes.push_back("prefill | chunk " + std::to_string(chunk_) + (options_.prefill_chunk_auto ? " (widest that fits)" : " (--prefill-chunk)") +
+                          " | workspace " + std::to_string(programs_->text.workspace().capacity() >> 20) + " MiB" +
+                          (programs_->drafter ? std::string(drafter_head_copy_ ? " | drafter head Q8 copy" : " | drafter head: the target's BF16") +
+                                                    " | drafter window " + (drafter_window_ == 0 ? std::string("whole context") : std::to_string(drafter_window_))
+                                              : std::string()) +
                           " | " + (fp32_prefill ? "FP32" : "tensor cores (--prefill-math fp32: the exact FP32 prefill)"));
     load_.takes_video         = false;
     load_.load_seconds        = seconds_between(start, Clock::now());
@@ -658,7 +696,7 @@ void Inkling2Core::run(Job& job) {
             encoded.emplace_back();
             continue;
         }
-        const Tensor emb = programs_->vision->encode(image.image);
+        const Tensor emb = programs_->vision->encode(image.image, programs_->text.workspace());
         encoded.emplace_back(emb.bytes());
         check_cuda(cudaMemcpyAsync(encoded.back().p, emb.data, emb.bytes(), cudaMemcpyDeviceToDevice, stream_), "image copy");
     }

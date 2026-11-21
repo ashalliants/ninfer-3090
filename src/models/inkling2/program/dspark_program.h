@@ -26,17 +26,22 @@ public:
     // the target runs its head over an 8-bit re-encoding (DenseWeightsQ8::head, a view of the owner both Programs read), is
     // read in place of the BF16 head so the drafts are proposed from the logits the target verifies them with; its
     // owner must outlive the drafter. kv_fp16: the context rings hold FP16 (round to nearest), half the bytes; only the
-    // drafts can change, never the verified output.
+    // drafts can change, never the verified output. global_window, when positive and under max_context: the global
+    // layers attend over only their last global_window context positions, held in a ring of that many (a fraction of
+    // the bytes at a long context; again only the drafts can change). head_copy false (and no head_q8): the base
+    // logits read the target's BF16 head instead of the drafter's Q8 copy of it (492 MB less, a slower draft).
     DSparkProgram(const Model& model, std::int32_t max_context, std::int32_t max_chunk, cudaStream_t stream,
-                  const ops::Q8Weight* head_q8 = nullptr, bool kv_fp16 = false);
+                  const ops::Q8Weight* head_q8 = nullptr, bool kv_fp16 = false, std::int32_t global_window = 0,
+                  bool head_copy = true);
     [[nodiscard]] std::int32_t max_chunk() const noexcept { return max_chunk_; }
     DSparkProgram(const DSparkProgram&)            = delete;
     DSparkProgram& operator=(const DSparkProgram&) = delete;
 
     void reset() noexcept { position_ = 0; }
 
-    // The drafter's state at position() (prefix reuse, as TextProgram::Snapshot): its sliding layers' rings and the
-    // anchor context. The global layers' rings are indexed by position and not copied.
+    // The drafter's state at position() (prefix reuse, as TextProgram::Snapshot): its rings (the sliding layers', and the
+    // global layers' under a global_window) and the anchor context. Unwindowed global rings are indexed by position and
+    // not copied.
     struct Snapshot {
         DeviceBuffer memory;        // snapshot_bytes()
         std::int64_t position = -1; // -1: holds nothing
@@ -72,6 +77,7 @@ private:
     DeviceBuffer state_memory_;
     DeviceArena workspace_;
     std::vector<Layer> layers_;
+    std::vector<std::int32_t> window_; // per layer: the keys it attends over (0: every context position)
     Tensor masks_;      // FP32 [hidden, block]: column 0 unused, the rest the mask embedding
     Tensor joint_in_;   // FP32 [2R + 2H]: state, W1[prev], x_i, the context of the anchor (f_rnn)
     Tensor hb_;         // FP32 [V] = W_head b_o
@@ -83,8 +89,9 @@ private:
     DeviceBuffer markov_memory_;
     DeviceBuffer head_memory_;
     ops::Q8Weight head_q8_{};
+    ops::DenseMatrix head_bf16_{}; // the base logits' head when there is no Q8 one
     // The Q8_0 matrices in the split form (same values; a faster projection kernel), by their artifact address.
-    DeviceBuffer split_memory_;
+    DeviceBuffer split_memory_, copy_memory_;
     std::unordered_map<const void*, ops::DenseMatrix> split_;
     [[nodiscard]] ops::DenseMatrix matrix(const Model::Matrix& m) const;
 };

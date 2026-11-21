@@ -92,6 +92,8 @@ private:
                         const models::inkling2::VisionConfig* vision, bool dspark);
     std::unique_ptr<Programs> programs_;
     std::int32_t chunk_ = 256; // prompt tokens per forward, chosen at startup
+    bool drafter_head_copy_ = true; // the drafter's Q8 copy of the head, unless memory is short
+    std::uint32_t drafter_window_ = 0; // the drafter's global window (0: the whole context), chosen at startup
 
     mutable std::mutex mutex_;
     std::condition_variable wake_;

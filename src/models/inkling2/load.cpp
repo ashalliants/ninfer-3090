@@ -5,6 +5,7 @@
 #include "artifact/binder.h"
 #include "artifact/views.h"
 
+#include <algorithm>
 #include <string>
 #include <utility>
 
@@ -20,9 +21,12 @@ public:
 
     WeightId parameter(const std::string& name, Shape shape) {
         const WeightId id{references.size()};
-        references.push_back(binder_.parameter(name, std::move(shape), artifact::Residency::Device));
+        references.push_back(binder_.parameter(name, std::move(shape), residency));
         return id;
     }
+
+    // Where the parameters bound next live: on the device, or (vision overlay) in pinned host memory.
+    artifact::Residency residency = artifact::Residency::Device;
 
     [[nodiscard]] bool contains(const std::string& name) const { return binder_.contains(name); }
 
@@ -97,24 +101,32 @@ DSparkWeights bind_dspark(Bindings& b, const DSparkConfig& c, const TextConfig& 
     w.joint_bias       = b.parameter("dspark/markov/joint_bias", {3 * r});
     w.hidden_out       = b.parameter("dspark/markov/hidden_out", {h, r});
     w.hidden_out_bias  = b.parameter("dspark/markov/hidden_out_bias", {h});
+    // The layers' matrices live in pinned host memory: the drafter reads them once, into its own device copies
+    // (DSparkProgram's split Q8 forms), so a device copy here would sit unused.
+    const auto pinned = [&](const std::string& name, Shape shape) {
+        b.residency   = artifact::Residency::Pinned;
+        const auto id = b.parameter(name, std::move(shape));
+        b.residency   = artifact::Residency::Device;
+        return id;
+    };
     for (std::uint32_t i = 0; i < c.layers; ++i) {
         const std::string p = "dspark/layers/" + std::to_string(i) + "/", a = p + "attention/";
         DSparkLayerWeights l;
         l.attn_norm      = b.parameter(a + "norm", {h});
-        l.q              = b.parameter(a + "q", {q, h});
-        l.k              = b.parameter(a + "k", {kv, h});
-        l.v              = b.parameter(a + "v", {kv, h});
-        l.output         = b.parameter(a + "output", {h, q});
+        l.q              = pinned(a + "q", {q, h});
+        l.k              = pinned(a + "k", {kv, h});
+        l.v              = pinned(a + "v", {kv, h});
+        l.output         = pinned(a + "output", {h, q});
         l.q_norm         = b.parameter(a + "q_norm", {d});
         l.k_norm         = b.parameter(a + "k_norm", {d});
-        l.context_k      = b.parameter(a + "context_k", {kv, h});
-        l.context_v      = b.parameter(a + "context_v", {kv, h});
+        l.context_k      = pinned(a + "context_k", {kv, h});
+        l.context_v      = pinned(a + "context_v", {kv, h});
         l.context_k_norm = b.parameter(a + "context_k_norm", {d});
         l.context_norm   = b.parameter(p + "context_norm", {h});
         l.ffn_norm       = b.parameter(p + "ffn/norm", {h});
-        l.gate           = b.parameter(p + "ffn/gate", {f, h});
-        l.up             = b.parameter(p + "ffn/up", {f, h});
-        l.down           = b.parameter(p + "ffn/down", {h, f});
+        l.gate           = pinned(p + "ffn/gate", {f, h});
+        l.up             = pinned(p + "ffn/up", {f, h});
+        l.down           = pinned(p + "ffn/down", {h, f});
         w.layers.push_back(l);
     }
     return w;
@@ -283,9 +295,14 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext&
     }
     std::optional<VisionConfig> vision;
     VisionWeights vision_weights;
+    std::size_t vision_first = 0, vision_end = 0;
     if (components.vision && reader.directory().components.contains("vision")) {
         vision         = parse_vision_config(reader.directory().component("vision").config, config);
+        vision_first   = bindings.references.size();
+        if (components.vision_overlay) { bindings.residency = artifact::Residency::Pinned; }
         vision_weights = bind_vision(bindings, *vision);
+        bindings.residency = artifact::Residency::Device;
+        vision_end         = bindings.references.size();
     }
     // The tokenizer and chat files are optional here (a Program-only artifact has none); the Frontend requires them.
     const auto& text_resources = reader.directory().component("text").resources;
@@ -316,6 +333,15 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext&
     model->dspark_weights_ = std::move(dspark_weights);
     model->vision_config_  = std::move(vision);
     model->vision_weights_ = std::move(vision_weights);
+    if (components.vision_overlay) {
+        for (std::size_t i = vision_first; i < vision_end; ++i) {
+            for (const WeightRegion& part : model->bound_[i].view.parts) {
+                if (std::find(model->vision_overlay_.begin(), model->vision_overlay_.end(), part.parent) == model->vision_overlay_.end()) {
+                    model->vision_overlay_.push_back(part.parent);
+                }
+            }
+        }
+    }
     model->resources_      = resources;
     return model;
 }

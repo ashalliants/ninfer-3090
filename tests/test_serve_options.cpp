@@ -846,6 +846,21 @@ int main() {
     const ninfer::EngineOptions dspark2 =
         make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-tokens", "2"}));
     failures += check(dspark2.speculative.draft_tokens == 2, "--spec dspark --draft-tokens 2 did not reach the Engine options");
+    // --dspark-window auto|N: auto by default, 0 for the whole context.
+    {
+        const auto window = [&](std::vector<std::string> args) { return make_engine_options(parse(std::move(args))).speculative.dspark_window; };
+        failures += check(window({"ninfer-serve", "model.ninfer", "--spec", "dspark"}) == ninfer::SpeculativeOptions::kDSparkWindowAuto &&
+                              window({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--dspark-window", "auto"}) ==
+                                  ninfer::SpeculativeOptions::kDSparkWindowAuto &&
+                              window({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--dspark-window", "0"}) == 0 &&
+                              window({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--dspark-window", "32768"}) == 32768,
+                          "--dspark-window did not reach the Engine options");
+        bool refused = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--dspark-window", "-1"});
+        } catch (const std::exception&) { refused = true; }
+        failures += check(refused, "--dspark-window accepted a negative window");
+    }
     // N-gram copy drafting: 0 or 15 beside DFlash2 at one lane, carried into the Engine options.
     const ServeOptions ngram =
         parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",

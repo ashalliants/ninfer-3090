@@ -245,7 +245,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--no-exit-on-engine-failure] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4|fp16|fp32 (Inkling-2: fp16|fp32)] [--dense-q8 head|all (lossy)] [--no-split-attention] [--prefill-math tc|fp32] "
-           "[--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N]] "
+           "[--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N] [--dspark-window N]] "
            "[--ngram-draft-tokens 0|15] [--ngram-min-match N] [--adaptive-draft-tokens 0|3] "
            "[--relaxed-drafting [P]] [--draft-context-rows N] "
            "[--default-max-tokens N] [--max-output-tokens N] [--default-thinking-budget N] "
@@ -1052,6 +1052,11 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             draft_tokens_given               = true;
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+        } else if (arg == "--dspark-window") {
+            const char* form = require_value("--dspark-window");
+            options.speculative.dspark_window = std::string_view(form) == "auto"
+                                                    ? SpeculativeOptions::kDSparkWindowAuto
+                                                    : static_cast<std::uint32_t>(parse_nonnegative_int(form, "dspark-window"));
         } else if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--ngram-draft-tokens"), "ngram-draft-tokens"));

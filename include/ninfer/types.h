@@ -137,6 +137,12 @@ struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     // Startup-fixed K: 1..15 for MTP, DFlash and DFlash2 (query width K+1).
     std::uint32_t draft_tokens = 0;
+    // DSpark (--dspark-window auto|N): the drafter's global layer attends over only the last N context positions, kept
+    // in a ring of N (0: the whole context). Only the drafts can change, never the output; at a long context it saves
+    // most of the drafter's KV bytes. N is 0 or at least the drafter's sliding window. kDSparkWindowAuto: the whole
+    // context when the programs fit beside max_context, else 32768, else 16384 (Inkling-2 picks at startup).
+    static constexpr std::uint32_t kDSparkWindowAuto = 0xFFFFFFFFU;
+    std::uint32_t dspark_window = kDSparkWindowAuto;
     ProposalHead proposal_head = ProposalHead::Full;
     // N-gram copy drafting beside DFlash2: when the committed text's tail already occurred in the
     // request (its prompt, a tool result or its own output), a round verifies what followed it,
