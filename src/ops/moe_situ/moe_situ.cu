@@ -154,7 +154,26 @@ __device__ __forceinline__ void fill_tables(Tables* t) {
     for (int q = threadIdx.x; q < kLutEntries; q += blockDim.x) { t->scales[q] = ue4m3_half(q); }
 }
 
+// n is a multiple of 64; a 16-byte aligned src is copied with 16-byte loads (all of them issued before any store).
 __device__ __forceinline__ void stage_padded(const float* __restrict__ src, int n, float* dst) {
+    if ((reinterpret_cast<std::uintptr_t>(src) & 15) == 0) {
+        const float4* s4 = reinterpret_cast<const float4*>(src);
+        constexpr int kBatch = 4;
+        for (int base = threadIdx.x; base < n / 4; base += kBatch * blockDim.x) {
+            float4 v[kBatch];
+#pragma unroll
+            for (int i = 0; i < kBatch; ++i) {
+                const int q = base + i * blockDim.x;
+                if (q < n / 4) { v[i] = __ldg(s4 + q); }
+            }
+#pragma unroll
+            for (int i = 0; i < kBatch; ++i) {
+                const int q = base + i * blockDim.x;
+                if (q < n / 4) { *reinterpret_cast<float4*>(dst + (q >> 4) * kPaddedBlock + 4 * (q & 15)) = v[i]; }
+            }
+        }
+        return;
+    }
     for (int d = threadIdx.x; d < n; d += blockDim.x) { dst[(d >> 6) * kPaddedBlock + (d & 63)] = src[d]; }
 }
 
@@ -212,65 +231,95 @@ __device__ __forceinline__ float nvfp4_block_dot(const std::uint32_t* blk, const
 constexpr int kBlockWords = kNvfp4Bytes / 4; // 9
 constexpr int kStageWords = 32 * kBlockWords; // one block per lane
 
-// kGroups (1 or 2) groups of kRowsPerGroup NVFP4 rows, the rows of a group contiguous from groups[g] (a group is
-// kRowsPerGroup * blocks consecutive blocks), each row `blocks` blocks, dotted with the staged x. The
-// warp walks the blocks 32 at a time: it loads the 32 blocks (1152 contiguous bytes, or two runs where a chunk
-// crosses into the next group) coalesced into `stage`, its own kStageWords words, then each lane takes one block.
-// The next chunk's words are loaded while this one is computed. Every lane returns every row's sum.
-template <int kGroups, int kRowsPerGroup>
-__device__ __forceinline__ void nvfp4_rows_dot(const std::uint8_t* const (&groups)[kGroups], int blocks, const float* x, const Tables* t,
-                                               std::uint32_t* stage, float (&out)[kGroups * kRowsPerGroup]) {
-    static_assert(kGroups == 1 || kGroups == 2, "a chunk may span at most two groups");
-    constexpr int kRows = kGroups * kRowsPerGroup;
-    const int lane = threadIdx.x & 31;
-#pragma unroll
-    for (int r = 0; r < kRows; ++r) { out[r] = 0.0F; }
-    const int group_blocks = kRowsPerGroup * blocks, total = kGroups * group_blocks;
-    const std::uint32_t by_row = magic_for(blocks), by_group = magic_for(group_blocks);
-    // A chunk is 32 blocks = 72 16-byte vectors; lane l loads vectors l, l + 32 and (l < 8) l + 64. Rows of a group,
-    // chunk starts and group boundaries are all 16-byte aligned (kRowsPerGroup * blocks is a multiple of 4).
-    constexpr int kVectors = kStageWords / 4;
+// The rows of P blocks-per-row multiples of 4 blocks: P rows of `blocks` blocks then start 16-byte aligned.
+inline int nvfp4_rows_per_run(int blocks) { return blocks % 4 == 0 ? 1 : blocks % 2 == 0 ? 2 : 4; }
+
+// kGroups (1 or 2) groups of kRowsPerGroup NVFP4 rows of `blocks` blocks each, the rows of a group contiguous from
+// groups[g], dotted with the staged x. The warp's rows form kRuns runs of P consecutive rows (P * blocks blocks,
+// 16-byte aligned), and kLanes = 32 / kRuns lanes own each run: in step j the warp loads blocks
+// [kLanes * j, kLanes * (j + 1)) of every run (kLanes * 36 contiguous bytes per run, 1152 bytes in all)
+// coalesced into `stage`, its own kStageWords words, and lane l takes block kLanes * j + l % kLanes of run
+// l / kLanes. Each lane so keeps one sum per row of its run; the kLanes lanes of a run add theirs at the end.
+// The constructor issues the first step's loads, so a kernel can construct it before staging its activations,
+// and the next step's loads are in flight while one is computed.
+template <int kGroups, int kRowsPerGroup, int P>
+struct Nvfp4Runs {
+    static constexpr int kRows = kGroups * kRowsPerGroup, kRuns = kRows / P, kLanes = 32 / kRuns;
+    static constexpr int kRunVectors = kLanes * kBlockWords / 4; // 16-byte vectors of one run per step
+    static constexpr int kVectors = kStageWords / 4;             // 72: lane l loads vectors l, l + 32 and (l < 8) l + 64
+    static_assert(kGroups == 1 || kGroups == 2, "one or two groups");
+    static_assert(kRowsPerGroup % P == 0 && kRows % P == 0 && 32 % kRuns == 0 && kLanes % 4 == 0, "runs must tile the warp");
+    static_assert(kRuns * kRunVectors == kVectors, "a step is one stage");
+    const uint4* run_start[3]; // the run of each of this lane's vectors
+    int offset[3];             // and the vector's place in the run's step
+    int blocks, run_blocks, steps;
     uint4 next[3];
-    const auto load = [&](int k0) {
-        const int g = kGroups == 1 ? 0 : quotient(k0, by_group);
-        const int boundary = (g + 1) * group_blocks - k0; // blocks of this chunk still in group g
-        const uint4* first  = reinterpret_cast<const uint4*>(groups[0]);
-        const uint4* second = first;
-#pragma unroll
-        for (int i = 1; i < kGroups; ++i) {
-            first  = g == i ? reinterpret_cast<const uint4*>(groups[i]) : first;
-            second = g + 1 == i ? reinterpret_cast<const uint4*>(groups[i]) : second;
-        }
-        first += (k0 - g * group_blocks) * kBlockWords / 4;
-        // The last chunk may be short: lanes past its end reload its last vector (unused), so no load branches.
-        const int last = min(total - k0, 32) * kBlockWords / 4 - 1, split = boundary * kBlockWords / 4;
+
+    __device__ __forceinline__ void load(int j) {
+        // The last step may be short: vectors past the run's end reload its last one (unused), so no load branches.
+        const int last = min(kLanes, run_blocks - kLanes * j) * kBlockWords / 4 - 1;
 #pragma unroll
         for (int m = 0; m < 3; ++m) {
-            const int v = min(lane + 32 * m, last);
-            next[m] = __ldg(v < split ? first + v : second + (v - split));
+            if (m < 2 || (threadIdx.x & 31) + 64 < kVectors) { next[m] = __ldg(run_start[m] + j * kRunVectors + min(offset[m], last)); }
         }
-    };
-    load(0);
-    for (int k0 = 0; k0 < total; k0 += 32) {
-        uint4* vectors = reinterpret_cast<uint4*>(stage);
-#pragma unroll
-        for (int m = 0; m < 3; ++m) {
-            if (lane + 32 * m < kVectors) { vectors[lane + 32 * m] = next[m]; }
-        }
-        __syncwarp();
-        if (k0 + 32 < total) { load(k0 + 32); }
-        const int k = k0 + lane;
-        if (k < total) {
-            const int row = quotient(k, by_row), b = k - row * blocks;
-            const float v = nvfp4_block_dot(stage + lane * kBlockWords, x + b * kPaddedBlock, t);
-#pragma unroll
-            for (int r = 0; r < kRows; ++r) { out[r] += row == r ? v : 0.0F; }
-        }
-        __syncwarp();
     }
+
+    __device__ __forceinline__ Nvfp4Runs(const std::uint8_t* const (&groups)[kGroups], int blocks_per_row)
+        : blocks(blocks_per_row), run_blocks(P * blocks_per_row), steps((P * blocks_per_row + kLanes - 1) / kLanes) {
+        const int lane = threadIdx.x & 31;
+        constexpr int kRunsPerGroup = kRuns / kGroups;
 #pragma unroll
-    for (int r = 0; r < kRows; ++r) { out[r] = warp_sum(out[r]); }
-}
+        for (int m = 0; m < 3; ++m) {
+            const int v = min(lane + 32 * m, kVectors - 1), run = v / kRunVectors, g = run / kRunsPerGroup;
+            const std::uint8_t* base = groups[0];
+#pragma unroll
+            for (int i = 1; i < kGroups; ++i) { base = g == i ? groups[i] : base; }
+            run_start[m] = reinterpret_cast<const uint4*>(base + static_cast<std::size_t>(run % kRunsPerGroup) * run_blocks * kNvfp4Bytes);
+            offset[m]    = v % kRunVectors;
+        }
+        load(0);
+    }
+
+    // Lane i < kRows returns row i's dot product.
+    __device__ __forceinline__ float dot(const float* x, const Tables* t, std::uint32_t* stage) {
+        const int lane = threadIdx.x & 31, own = lane % kLanes;
+        float acc[P];
+#pragma unroll
+        for (int r = 0; r < P; ++r) { acc[r] = 0.0F; }
+        uint4* vectors = reinterpret_cast<uint4*>(stage);
+        for (int j = 0; j < steps; ++j) {
+#pragma unroll
+            for (int m = 0; m < 3; ++m) {
+                if (lane + 32 * m < kVectors) { vectors[lane + 32 * m] = next[m]; }
+            }
+            __syncwarp();
+            if (j + 1 < steps) { load(j + 1); }
+            const int b = kLanes * j + own;
+            if (b < run_blocks) {
+                int row = 0;
+#pragma unroll
+                for (int r = 1; r < P; ++r) { row += b >= r * blocks ? 1 : 0; }
+                const float v = nvfp4_block_dot(stage + lane * kBlockWords, x + (b - row * blocks) * kPaddedBlock, t);
+#pragma unroll
+                for (int r = 0; r < P; ++r) { acc[r] += row == r ? v : 0.0F; }
+            }
+            __syncwarp();
+        }
+#pragma unroll
+        for (int r = 0; r < P; ++r) {
+#pragma unroll
+            for (int o = kLanes / 2; o > 0; o >>= 1) { acc[r] += __shfl_xor_sync(0xFFFFFFFFU, acc[r], o); }
+        }
+        const int row = lane % kRows, source = row / P * kLanes;
+        float result = 0.0F;
+#pragma unroll
+        for (int r = 0; r < P; ++r) {
+            const float v = __shfl_sync(0xFFFFFFFFU, acc[r], source);
+            result = row % P == r ? v : result;
+        }
+        return result;
+    }
+};
 
 // A BF16 row of n values (n a multiple of 8, 16-byte aligned) dotted with x (unpadded, in shared memory).
 __device__ float bf16_row_dot(const __nv_bfloat16* __restrict__ row, int n, const float* x) {
@@ -314,6 +363,7 @@ int down_rows_per_warp(const BankArgs& b) { return b.nvfp4 ? kDownRows : 1; }
 
 // grid (ceil(I / (kWarps * rows per warp)), entries): each warp computes its intermediate rows' gate and up and
 // writes the activations.
+template <int P>
 __global__ void __launch_bounds__(kThreads)
 gate_up_kernel(BankArgs b, const float* __restrict__ z, std::int64_t zs, const std::int32_t* __restrict__ ids, int top_k, float gate_cap,
                float up_cap, float* __restrict__ act) {
@@ -326,26 +376,20 @@ gate_up_kernel(BankArgs b, const float* __restrict__ z, std::int64_t zs, const s
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float* a = act + static_cast<std::int64_t>(entry) * b.inter;
     if (b.nvfp4) {
+        // The warp's first weight loads go out before the activations are staged. A warp past the end loads row 0.
+        const int first = (blockIdx.y * kWarps + warp) * kGateRows, row0 = first < b.inter ? first : 0;
+        const std::uint8_t* rec = b.records + static_cast<std::uint64_t>(e) * b.stride;
+        const std::uint8_t* groups[2] = {rec + static_cast<std::uint64_t>(row0) * b.gate_row_bytes,
+                                         rec + b.up_offset + static_cast<std::uint64_t>(row0) * b.gate_row_bytes};
+        Nvfp4Runs<2, kGateRows, P> rows(groups, b.hidden / kNvfp4Values);
         fill_tables(lut);
         stage_padded(col, b.hidden, x);
         __syncthreads();
-        const int first = (blockIdx.y * kWarps + warp) * kGateRows;
         if (first >= b.inter) { return; }
-        const std::uint8_t* rec = b.records + static_cast<std::uint64_t>(e) * b.stride;
-        const std::uint8_t* groups[2] = {rec + static_cast<std::uint64_t>(first) * b.gate_row_bytes,
-                                         rec + b.up_offset + static_cast<std::uint64_t>(first) * b.gate_row_bytes};
-        float dots[2 * kGateRows];
-        nvfp4_rows_dot<2, kGateRows>(groups, b.hidden / kNvfp4Values, x, lut, stage + warp * kStageWords, dots);
+        const float dot = rows.dot(x, lut, stage + warp * kStageWords); // lane r: gate row r, lane kGateRows + r: up row r
+        const float up  = __shfl_down_sync(0xFFFFFFFFU, dot, kGateRows);
         const float scale = b.gate_up_scale != nullptr ? b.gate_up_scale[e] : 1.0F;
-        if (lane < kGateRows && first + lane < b.inter) {
-            float g = dots[0], u = dots[kGateRows];
-#pragma unroll
-            for (int r = 1; r < kGateRows; ++r) {
-                g = lane == r ? dots[r] : g;
-                u = lane == r ? dots[kGateRows + r] : u;
-            }
-            a[first + lane] = situ(g * scale, u * scale, gate_cap, up_cap);
-        }
+        if (lane < kGateRows) { a[first + lane] = situ(dot * scale, up * scale, gate_cap, up_cap); }
         return;
     }
     for (int d = threadIdx.x; d < b.hidden; d += kThreads) { x[d] = col[d]; }
@@ -359,6 +403,7 @@ gate_up_kernel(BankArgs b, const float* __restrict__ z, std::int64_t zs, const s
 }
 
 // grid (ceil(H / (kWarps * rows per warp)), entries): each warp computes its hidden rows of the entry's down product.
+template <int P>
 __global__ void __launch_bounds__(kThreads)
 down_kernel(BankArgs b, const std::int32_t* __restrict__ ids, const float* __restrict__ act, float* __restrict__ y) {
     extern __shared__ float2 shared[];
@@ -370,22 +415,17 @@ down_kernel(BankArgs b, const std::int32_t* __restrict__ ids, const float* __res
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float* out = y + static_cast<std::int64_t>(entry) * b.hidden;
     if (b.nvfp4) {
+        const int first = (blockIdx.y * kWarps + warp) * kDownRows, row0 = first < b.hidden ? first : 0;
+        const std::uint8_t* rec = b.records + static_cast<std::uint64_t>(e) * b.stride + b.down_offset;
+        const std::uint8_t* groups[1] = {rec + static_cast<std::uint64_t>(row0) * b.down_row_bytes};
+        Nvfp4Runs<1, kDownRows, P> rows(groups, b.inter / kNvfp4Values);
         fill_tables(lut);
         stage_padded(src, b.inter, a);
         __syncthreads();
-        const int first = (blockIdx.y * kWarps + warp) * kDownRows;
         if (first >= b.hidden) { return; }
-        const std::uint8_t* rec = b.records + static_cast<std::uint64_t>(e) * b.stride + b.down_offset;
-        const std::uint8_t* groups[1] = {rec + static_cast<std::uint64_t>(first) * b.down_row_bytes};
-        float dots[kDownRows];
-        nvfp4_rows_dot<1, kDownRows>(groups, b.inter / kNvfp4Values, a, lut, stage + warp * kStageWords, dots);
+        const float dot = rows.dot(a, lut, stage + warp * kStageWords);
         const float scale = b.down_scale != nullptr ? b.down_scale[e] : 1.0F;
-        if (lane < kDownRows && first + lane < b.hidden) {
-            float v = dots[0];
-#pragma unroll
-            for (int r = 1; r < kDownRows; ++r) { v = lane == r ? dots[r] : v; }
-            out[first + lane] = v * scale;
-        }
+        if (lane < kDownRows) { out[first + lane] = dot * scale; }
         return;
     }
     for (int d = threadIdx.x; d < b.inter; d += kThreads) { a[d] = src[d]; }
@@ -513,11 +553,23 @@ void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor&
         return sizeof(Tables) + kWarps * kStageWords * sizeof(std::uint32_t) +
                static_cast<std::size_t>(n / kNvfp4Values + 1) * kPaddedBlock * sizeof(float);
     };
-    gate_up_kernel<<<dim3(entries, (bank.intermediate + gate_per_block - 1) / gate_per_block), kThreads, staged(bank.hidden), stream>>>(
-        b, static_cast<const float*>(z.data), zs, id, top_k, gate_cap, up_cap, act);
+    // P rows per run (1, 2 or 4, from the blocks per row) for the NVFP4 kernels; BF16 ignores it.
+    const int gate_p = b.nvfp4 ? nvfp4_rows_per_run(bank.hidden / kNvfp4Values) : 1;
+    const int down_p = b.nvfp4 ? nvfp4_rows_per_run(bank.intermediate / kNvfp4Values) : 1;
+    const dim3 gate_grid(entries, (bank.intermediate + gate_per_block - 1) / gate_per_block);
+    const dim3 down_grid(entries, (bank.hidden + down_per_block - 1) / down_per_block);
+    const auto* zp = static_cast<const float*>(z.data);
+    switch (gate_p) {
+    case 1: gate_up_kernel<1><<<gate_grid, kThreads, staged(bank.hidden), stream>>>(b, zp, zs, id, top_k, gate_cap, up_cap, act); break;
+    case 2: gate_up_kernel<2><<<gate_grid, kThreads, staged(bank.hidden), stream>>>(b, zp, zs, id, top_k, gate_cap, up_cap, act); break;
+    default: gate_up_kernel<4><<<gate_grid, kThreads, staged(bank.hidden), stream>>>(b, zp, zs, id, top_k, gate_cap, up_cap, act); break;
+    }
     check_launch(op);
-    down_kernel<<<dim3(entries, (bank.hidden + down_per_block - 1) / down_per_block), kThreads, staged(bank.intermediate), stream>>>(
-        b, id, act, y);
+    switch (down_p) {
+    case 1: down_kernel<1><<<down_grid, kThreads, staged(bank.intermediate), stream>>>(b, id, act, y); break;
+    case 2: down_kernel<2><<<down_grid, kThreads, staged(bank.intermediate), stream>>>(b, id, act, y); break;
+    default: down_kernel<4><<<down_grid, kThreads, staged(bank.intermediate), stream>>>(b, id, act, y); break;
+    }
     check_launch(op);
     combine_kernel<<<dim3(cols, (bank.hidden + 255) / 256), 256, 0, stream>>>(y, static_cast<const float*>(weights.data), bank.hidden,
                                                                                top_k, static_cast<float*>(out.data));
