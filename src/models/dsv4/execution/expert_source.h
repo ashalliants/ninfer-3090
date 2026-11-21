@@ -84,6 +84,7 @@ struct FileExpertOptions {
     std::uint64_t device_cache_bytes = 0;
     // Threads that pread the missing records of a call (the calling thread is one of them): a drive that
     // serves several requests at once (an SSD) wants 8 or more, a hard disk 1.
+    // Clamped to 1 on Windows, whose artifact file reads do not run concurrently.
     std::uint32_t read_threads = 1;
     // Misses of a one-column call the Op reads zero-copy over PCIe instead of staging them (the Op's
     // zero_copy_misses); 0 stages every miss.

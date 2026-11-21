@@ -177,6 +177,11 @@ FileExpertSource::FileExpertSource(const artifact::Reader& reader, std::span<con
         // A non-blocking stream: the caller's stream may be the legacy default stream, which would serialize with it.
         cuda_require(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking), "cudaStreamCreate");
         cuda_require(cudaEventCreateWithFlags(&ids_event_, cudaEventDisableTiming), "cudaEventCreate");
+#ifdef _WIN32
+        // The Windows InputFile read path is not positioned per handle, so concurrent reads would only queue
+        // behind each other; read on the calling thread there. (Linux preads are independent.)
+        options_.read_threads = 1;
+#endif
         pool_ = std::make_unique<ReadPool>(options_.read_threads);
     } catch (...) { // the destructor does not run for a constructor that throws
         release();
