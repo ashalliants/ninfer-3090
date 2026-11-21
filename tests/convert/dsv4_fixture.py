@@ -33,6 +33,8 @@ COMPRESS_RATIOS = [0, 0, 2, 0, 1]  # layer 2 has a gated compressor, layer 4 an 
 NGRAM, ENGRAM_HEADS, ENGRAM_ROW = 3, 2, 32
 HEAD_VOCAB = [101, 103, 107, 109]  # one Engram layer x 2 heads x (3 - 1) orders
 ENGRAM_ROWS = sum(HEAD_VOCAB)
+TOKEN_MAP = [0, 1, 2, 3, 4, 5, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]  # token id -> compressed id (VOCAB entries)
+MULTIPLIERS = [1000003, 1000033, 1000037]  # one Engram layer x NGRAM look-backs
 
 # A tiny tokenizer shaped like the real one: the first control tokens (BOS, EOS, pad) are in the vocabulary AND the
 # added tokens; further added tokens follow the 12-token base vocabulary. Tokens are byte-level strings.
@@ -145,6 +147,8 @@ def metadata(**changes) -> list[tuple[str, int, object]]:
         a + "embedding_length_per_layer_input": ENGRAM_ROW,
         a + "ple.head_vocab_sizes": HEAD_VOCAB,
         a + "engram.pad_token_id": 2,
+        a + "engram.token_map": TOKEN_MAP,
+        a + "ple.layer_multipliers": MULTIPLIERS,
         "tokenizer.ggml.model": "gpt2",
         "tokenizer.ggml.pre": "joyai-llm",
         "tokenizer.ggml.tokens": TOKENS,
