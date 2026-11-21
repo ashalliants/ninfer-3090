@@ -32,6 +32,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -155,6 +156,11 @@ int main() {
         const ink::DenseWeightsQ8* dense = dense_q8.get();
         ink::ProgramLimits main_limits{4096, 64};
         main_limits.dense = dense;
+        // NINFER_INKLING2_KV=fp16: the FP16 KV rings (the Engine's default) against the golden tolerances; unset, the
+        // exact FP32 program (--kv-dtype fp32), whose dumps are byte-stable.
+        const bool golden_fp16 = std::getenv("NINFER_INKLING2_KV") != nullptr && std::string(std::getenv("NINFER_INKLING2_KV")) == "fp16";
+        main_limits.kv_fp16 = golden_fp16;
+        if (golden_fp16) { std::printf("KV rings: FP16\n"); }
         ink::TextProgram program(*model, main_limits, stream);
         if (dense != nullptr) { std::printf("dense projections: 8-bit re-encoding (%s)\n", dense_env.c_str()); }
 
@@ -425,6 +431,7 @@ int main() {
         }
 
         std::vector<std::int32_t> first_prompt;
+        int all_agree = 0, all_positions = 0; // over every prompt (the FP16 rings' bound)
         for (int index = 0;; ++index) {
             const fs::path dir = fs::path(golden_root) / ("p" + std::to_string(index));
             if (!fs::exists(dir / "tokens.json")) { break; }
@@ -496,7 +503,9 @@ int main() {
             std::printf("p%d (%d tokens): max per-visit rel error %.3e", index, n, max_rel);
             for (const auto& [kind, e] : worst) { std::printf("; %s %.3e (%s)", kind.c_str(), e, worst_at[kind].c_str()); }
             std::printf("\n    KLD mean %.2e max %.2e; argmax %d/%d [%s]\n", sum_kld / n, max_kld, agree, n, argmaxes.c_str());
-            check(agree == n, "p" + std::to_string(index) + ": argmax differs from llama.cpp");
+            all_agree += agree, all_positions += n;
+            // The exact FP32 program matches every argmax; the FP16 rings may flip a near tie (bounded below).
+            if (!golden_fp16) { check(agree == n, "p" + std::to_string(index) + ": argmax differs from llama.cpp"); }
             check(max_kld <= 0.05, "p" + std::to_string(index) + ": KLD above 0.05");
             check(sum_kld / n <= 0.01, "p" + std::to_string(index) + ": mean KLD above 0.01");
 
@@ -516,6 +525,10 @@ int main() {
             check(chunk_diff <= 1e-3, "p" + std::to_string(index) + ": chunked logits differ from the whole run");
         }
         check(!first_prompt.empty(), "no golden prompts found");
+        if (golden_fp16) {
+            std::printf("FP16 rings: argmax agrees with llama.cpp at %d of %d positions\n", all_agree, all_positions);
+            check(all_agree * 10 >= all_positions * 9, "FP16 rings: argmax agrees with llama.cpp at fewer than 90% of the positions");
+        }
 
         if (prefill_tokens > 0 && !first_prompt.empty()) {
             constexpr std::int32_t kChunk = 256;
@@ -547,6 +560,18 @@ int main() {
             program.reset();
             auto logits = logit_columns(program.forward(first_prompt), vocab);
             std::int32_t next = static_cast<std::int32_t>(argmax(logits.back().data(), vocab));
+            {
+                // ProgramLimits::last_logits: the prompt's last column only, the same bits.
+                ink::ProgramLimits last_limits{static_cast<std::int32_t>(first_prompt.size()) + 64,
+                                               static_cast<std::int32_t>(first_prompt.size())};
+                last_limits.last_logits = true;
+                last_limits.dense       = dense;
+                last_limits.kv_fp16     = golden_fp16;
+                ink::TextProgram last(*model, last_limits, stream);
+                const auto only = logit_columns(last.forward(first_prompt), vocab);
+                check(only.size() == 1 && std::memcmp(only[0].data(), logits.back().data(), vocab * 4) == 0,
+                      "last_logits: not the last column of every column's logits");
+            }
             std::string ids = std::to_string(next);
             std::vector<float> decoded; // every step's logits, for NINFER_INKLING2_DUMP (bit-exact comparisons of decode)
             cudaDeviceSynchronize();
@@ -561,6 +586,28 @@ int main() {
             const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - d0).count();
             if (dump_root != nullptr) { write_file(fs::path(dump_root) / "decode_logits.f32", decoded.data(), decoded.size() * 4); }
             std::printf("greedy continuation of p0: %s\n", ids.c_str());
+            if (golden_fp16) {
+                // The FP32 program along the FP16 rings' greedy tokens: its argmax agrees at 90% of the steps or more
+                // (a flip may change one token; the generation does not drift away after it).
+                std::vector<std::int32_t> greedy;
+                {
+                    std::istringstream in(ids);
+                    for (std::int32_t id; in >> id;) { greedy.push_back(id); }
+                }
+                ink::ProgramLimits fp32_limits{4096, 64};
+                fp32_limits.dense = dense;
+                ink::TextProgram fp32(*model, fp32_limits, stream);
+                auto ref = logit_columns(fp32.forward(first_prompt), vocab);
+                int same = argmax(ref.back().data(), vocab) == static_cast<std::size_t>(greedy[0]) ? 1 : 0;
+                for (std::size_t i = 1; i < greedy.size(); ++i) {
+                    const std::int32_t one[] = {greedy[i - 1]};
+                    ref = logit_columns(fp32.forward(one), vocab);
+                    same += argmax(ref.back().data(), vocab) == static_cast<std::size_t>(greedy[i]) ? 1 : 0;
+                }
+                std::printf("FP16 rings: the FP32 program's argmax along their greedy continuation agrees at %d of %zu steps\n", same,
+                            greedy.size());
+                check(static_cast<std::size_t>(same) * 10 >= greedy.size() * 9, "FP16 rings: the greedy continuation drifts from the FP32 program's");
+            }
             std::printf("decode: %d steps in %.2f s = %.2f tok/s (FP32 correctness kernels, logits copied to the host each step)\n",
                         decode_tokens - 1, seconds, (decode_tokens - 1) / seconds);
 
@@ -585,6 +632,7 @@ int main() {
             ink::ProgramLimits eager_limits{4096, 64};
             eager_limits.dense        = dense;
             eager_limits.decode_graph = false;
+            eager_limits.kv_fp16      = golden_fp16;
             ink::TextProgram eager(*model, eager_limits, stream);
             const auto plain = replay(eager);
             float worst = 0.0F;

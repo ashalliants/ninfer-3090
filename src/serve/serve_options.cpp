@@ -244,7 +244,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--context-store-s3-upload-delay-seconds N]]] "
            "[--no-exit-on-engine-failure] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4|fp16 (Inkling-2)] [--dense-q8 head|all (lossy)] [--no-split-attention] "
+           "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4|fp16|fp32 (Inkling-2: fp16|fp32)] [--dense-q8 head|all (lossy)] [--no-split-attention] "
            "[--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N]] "
            "[--ngram-draft-tokens 0|15] [--ngram-min-match N] [--adaptive-draft-tokens 0|3] "
            "[--relaxed-drafting [P]] [--draft-context-rows N] "
@@ -1023,8 +1023,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.stage_layers = parse_stage_layers(require_value("--stage-layers"));
         } else if (arg == "--kv-dtype") {
             const char* form = require_value("--kv-dtype");
-            if (std::string_view(form) == "fp16") {
-                options.kv_fp16 = true; // Inkling-2's FP16 KV rings
+            if (std::string_view(form) == "fp16" || std::string_view(form) == "fp32") { // Inkling-2's KV rings
+                options.kv_rings = std::string_view(form) == "fp16" ? KvRings::FP16 : KvRings::FP32;
             } else {
                 options.kv_cache = parse_kv_dtype(form);
             }

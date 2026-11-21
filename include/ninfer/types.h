@@ -37,6 +37,9 @@ inline constexpr std::size_t kDefaultHostCacheReserveBytes = 3ULL << 30;
 // docs/maintainer/inkling2-model.md, "Dense 8-bit re-encoding", for the measured KLD and speed.
 enum class DenseQ8 : std::uint8_t { Off, Head, All };
 
+// Inkling-2's KV rings (--kv-dtype fp16|fp32): Default is FP16; FP32 reproduces the exact FP32 program.
+enum class KvRings : std::uint8_t { Default, FP16, FP32 };
+
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
     Int8Group64,
@@ -865,9 +868,11 @@ struct EngineOptions {
     // keys into blocks of 256 (FP32, the softmax sums in another order). false (--no-split-attention): one block per
     // column and head, the earlier builds' bits.
     bool split_attention                   = true;
-    // Inkling-2 only (other models refuse it): --kv-dtype fp16, the KV rings in FP16 rather than FP32. Opt-in and
-    // lossy; about twice the context fits. Inkling-2 refuses every other kv_cache form.
-    bool kv_fp16                           = false;
+    // Inkling-2 only (other models refuse anything but Default): its KV rings, target and drafter. Default and FP16
+    // (--kv-dtype fp16) round K and V to FP16 (lossy, at the noise floor of an FP32 reordering; half the bytes of
+    // FP32, so about twice the context fits); FP32 (--kv-dtype fp32) keeps the exact FP32 program. Inkling-2
+    // refuses every other kv_cache form.
+    KvRings kv_rings                       = KvRings::Default;
     // Qwen3.6-35B-A3B only: the MTP draft layer's routed experts are stored W8 in the artifact;
     // transcode them to the text layers' formats (Q4 gate_up, Q6 down) at load. Drafts are
     // verified exactly, so this can change acceptance but never the output distribution.

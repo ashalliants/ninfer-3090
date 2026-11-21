@@ -165,9 +165,10 @@ int main() {
     failures += check(!parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--no-split-attention"}).split_attention &&
                           parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"}).split_attention,
                       "CLI --no-split-attention was not parsed");
-    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "fp16"}).kv_fp16 &&
-                          !parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"}).kv_fp16,
-                      "CLI --kv-dtype fp16 was not parsed");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "fp16"}).kv_rings == ninfer::KvRings::FP16 &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "fp32"}).kv_rings == ninfer::KvRings::FP32 &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"}).kv_rings == ninfer::KvRings::Default,
+                      "CLI --kv-dtype fp16|fp32 was not parsed");
     failures += check(rejects([&] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--dense-q8", "q4"}); }),
                       "CLI accepted an unknown --dense-q8 form");
     // --spec dspark: an omitted --draft-tokens takes 3; an explicit one is kept and must be in [1,7].
