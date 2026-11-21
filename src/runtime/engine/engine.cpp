@@ -12,6 +12,7 @@
 #include "runtime/engine/engine_core.h"
 #include "runtime/engine/inkling2_core.h"
 #include "runtime/engine/model_instance.h"
+#include "runtime/engine/validate_options.h"
 #include "runtime/engine/qwen4_exp_instance.h"
 
 #include <algorithm>
@@ -642,6 +643,7 @@ private:
     }
 
     void construct_inkling2() {
+        runtime::validate_engine_options(options); // the bounds every model's route shares
         if (options.context_store.enabled() || !options.loras.empty() || !options.grafts.empty() ||
             options.devices.size() > 1 || options.suspend.enabled) {
             throw std::invalid_argument(

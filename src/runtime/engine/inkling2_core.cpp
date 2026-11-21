@@ -148,6 +148,8 @@ GenerationResult Inkling2Core::Submission::wait(OutputSink* sink, const Cancella
             events.swap(job->events);
             done = job->done;
         }
+        // A consumer callback that throws ends the request: the worker stops at its next token.
+        try {
         for (Job::Event& event : events) {
             std::visit(
                 [&](auto& e) {
@@ -162,6 +164,10 @@ GenerationResult Inkling2Core::Submission::wait(OutputSink* sink, const Cancella
                     }
                 },
                 event);
+        }
+        } catch (...) {
+            job->cancelled = true;
+            throw;
         }
         if (done) {
             if (job->error) { std::rethrow_exception(job->error); }
@@ -231,6 +237,9 @@ Inkling2Core::Submission Inkling2Core::submit(ink::PreparedPrompt prompt, Prompt
     if (options.constraint) { throw std::invalid_argument("Inkling-2 serves no output constraints yet"); }
     if (options.tool_choice.mode == ToolChoiceMode::Required || options.tool_choice.allowed_names) {
         throw std::invalid_argument("Inkling-2 serves tool_choice auto or none only");
+    }
+    if (options.output.raw || options.stop.publish_stop_token) {
+        throw std::invalid_argument("Inkling-2 publishes decoded text only: no raw output or published stop token");
     }
     if (options.execution.thinking.loop != ReasoningLoopAction::Off) {
         throw std::invalid_argument("Inkling-2 has no reasoning-loop guard: run without --reasoning-loop");
@@ -339,11 +348,13 @@ void Inkling2Core::run(Job& job) {
     if (job.deadline != Clock::time_point{} && began > job.deadline) {
         throw RequestError(RequestErrorKind::QueueTimeout, "the request waited past its deadline");
     }
+    const bool streaming = job.mode == OutputConsumerMode::Streaming;
+    // A stream starts exactly once, also when it was cancelled while queued.
+    if (streaming) { job.post(GenerationStart{.prompt = job.summary}); }
     if (job.cancelled) {
         out.finish_reason = FinishReason::Cancelled;
         return;
     }
-    const bool streaming = job.mode == OutputConsumerMode::Streaming;
     const auto& prompt   = job.prompt;
     const auto& text_cfg = model_->config();
     const std::int32_t n = static_cast<std::int32_t>(prompt.tokens.size());
@@ -360,7 +371,6 @@ void Inkling2Core::run(Job& job) {
         check_cuda(cudaStreamSynchronize(stream_), "vision");
         out.timings.vision_seconds = seconds_between(vision_start, Clock::now());
     }
-    if (streaming) { job.post(GenerationStart{.prompt = job.summary}); }
 
     // Prefill from position 0, in chunks.
     auto& program = programs_->text;

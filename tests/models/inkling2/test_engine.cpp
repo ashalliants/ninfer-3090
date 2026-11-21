@@ -18,6 +18,7 @@
 #include <fstream>
 #include <iterator>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -82,6 +83,14 @@ int main() {
         options.artifact_path = artifact_path;
         options.max_context   = 4096;
         options.enable_vision = true;
+        {
+            ninfer::EngineOptions unbounded   = options;
+            unbounded.max_pending_requests    = 0;
+            try {
+                ninfer::Engine refused(unbounded);
+                check(false, "the shared option bounds are checked");
+            } catch (const std::invalid_argument&) {}
+        }
         {
             // What Inkling-2 cannot do is refused at construction, not left to fail later.
             ninfer::EngineOptions suspended = options;
@@ -185,6 +194,32 @@ int main() {
             (void)engine.generate(engine.prepare(question()), looped);
             check(false, "a reasoning-loop guard is refused");
         } catch (const std::invalid_argument&) {}
+        for (int which = 0; which < 2; ++which) {
+            try {
+                auto raw = greedy(8);
+                (which == 0 ? raw.output.raw : raw.stop.publish_stop_token) = true;
+                (void)engine.generate(engine.prepare(question()), raw);
+                check(false, "raw output and a published stop token are refused");
+            } catch (const std::invalid_argument&) {}
+        }
+        {
+            // A consumer that throws cancels its request, and the Engine serves the next one.
+            struct Throws final : ninfer::OutputSink {
+                void start(ninfer::GenerationStart) override {}
+                void progress(ninfer::PromptProgress) override {}
+                void timing(ninfer::GenerationTimingObservation) override {}
+                void publish(ninfer::OutputDelta) override { throw std::runtime_error("consumer gone"); }
+            } throws;
+            auto handle = engine.submit(engine.prepare(question()), greedy(2000), ninfer::OutputConsumerMode::Streaming, {});
+            const auto t = Clock::now();
+            try {
+                (void)handle.wait(&throws);
+                check(false, "the throwing consumer's error reaches its caller");
+            } catch (const std::runtime_error&) {}
+            const auto next = engine.generate(engine.prepare(question()), greedy(4));
+            check(next.generated_token_ids.size() == 4 && std::chrono::duration<double>(Clock::now() - t).count() < 10.0,
+                  "a failed consumer's request stops instead of decoding 2000 tokens");
+        }
 
         // The image prompt.
         if (const char* root = std::getenv("NINFER_INKLING2_VISION"); root != nullptr && fs::exists(fs::path(root) / "test1.jpeg")) {
