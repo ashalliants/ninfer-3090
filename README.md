@@ -601,8 +601,10 @@ Responses routes, with streaming, tool calls, reasoning and thinking budgets, an
 - **Prefill:** ~377 tok/s at 1K tokens. A 234-token image prompt takes 0.09 s of vision and 0.58 s of prefill.
 - **Accuracy:** greedy text matches CPU llama.cpp (Unsloth's PR at the same revision) on 58 of 58
   checked positions, and image prompts on 48 of 48 tokens from identical pixels.
-- **Not yet:** prefix reuse, more than one lane, the context store, JSON-schema output and logprobs.
-  The server refuses requests that need them. Not measured on an RTX 3090.
+- **Prefix reuse:** on by default. One device snapshot is kept, and a prompt that starts with the same
+  tokens and images resumes from it; the result reports `reused_prompt_tokens`.
+- **Not yet:** more than one lane (requests queue), the context store and host cache tiers, JSON-schema
+  output and logprobs. Not measured on an RTX 3090.
 
 ```bash
 scripts/download-model.sh inkling2-mini      # WarlaxZ/Inkling-2-Mini-NInfer-V100, 22.3 GiB, pinned and verified

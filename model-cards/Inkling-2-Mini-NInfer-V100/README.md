@@ -117,8 +117,11 @@ calls (`parallel_tool_calls` honoured), reasoning and thinking budgets, stop str
 `--vision`. DSpark runs for greedy requests and is switched off automatically on text where its drafts
 are not accepted; sampled requests decode plainly. Greedy output with DSpark is identical to plain decode.
 
-Not supported yet, and refused by the server when a request needs them: prefix reuse, more than one
-request at a time (requests queue), the context store, JSON-schema or grammar output, and logprobs.
+Prefix reuse is on by default: one device snapshot is kept, a prompt that starts with the same tokens
+and images resumes from it, and the result reports `reused_prompt_tokens`.
+
+Not supported yet: more than one request at a time (requests queue), the context store and host cache
+tiers (the server refuses those options), JSON-schema or grammar output, and logprobs.
 
 ## Performance (one Tesla V100-PCIE-32GB, 2026-11-21)
 
