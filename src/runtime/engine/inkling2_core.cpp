@@ -278,7 +278,9 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         }
         programs_ = std::make_unique<Programs>(*model_, limits, stream_);
         if (dspark) {
-            programs_->drafter = std::make_unique<ink::DSparkProgram>(*model_, static_cast<std::int32_t>(options_.max_context), kChunk, stream_);
+            // With --dense-q8 the drafter proposes from the target's re-encoded head, the one it verifies against.
+            programs_->drafter = std::make_unique<ink::DSparkProgram>(*model_, static_cast<std::int32_t>(options_.max_context), kChunk,
+                                                                      stream_, programs_->text.q8_head());
             const std::int32_t hidden = static_cast<std::int32_t>(model_->config().hidden_size);
             for (std::size_t i = 0; i < limits.tap_visits.size(); ++i) {
                 programs_->held_memory.emplace_back(static_cast<std::size_t>(hidden) * kChunk * 4);
@@ -958,6 +960,9 @@ MemorySummary Inkling2Core::memory_summary() const {
     m.max_context           = options_.max_context;
     m.requested_max_context = options_.max_context;
     m.kv_capacity           = options_.max_context;
+    // The weights on the device: the artifact's upload and any --dense-q8 re-encoding kept beside it.
+    const std::size_t weights = static_cast<std::size_t>(model_->storage_stats().h2d_bytes) + programs_->text.dense_q8_bytes();
+    m.weights = {.capacity_bytes = weights, .used_bytes = weights, .peak_used_bytes = weights};
     return m;
 }
 

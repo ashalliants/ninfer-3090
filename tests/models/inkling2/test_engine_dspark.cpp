@@ -93,6 +93,7 @@ int main() {
     }
     const std::uint32_t drafts = std::getenv("NINFER_INKLING2_SPEC_DRAFTS") ? std::atoi(std::getenv("NINFER_INKLING2_SPEC_DRAFTS")) : 3;
     const std::uint32_t tokens = std::getenv("NINFER_INKLING2_SPEC_TOKENS") ? std::atoi(std::getenv("NINFER_INKLING2_SPEC_TOKENS")) : 256;
+    std::size_t bf16_weight_bytes = 0; // a plain BF16 Engine's weights on the device
     try {
         ninfer::EngineOptions options;
         options.artifact_path = artifact_path;
@@ -116,6 +117,7 @@ int main() {
             ninfer::Engine engine(options);
             std::printf("plain:\n");
             plain = run_all(engine, tokens);
+            bf16_weight_bytes = engine.memory_summary().weights.capacity_bytes;
             plain_sampled = engine.generate(engine.prepare(user_turn(kPrompts[2])), sampled).generated_token_ids;
             auto budget                      = greedy(96);
             budget.execution.thinking.budget = 24;
@@ -238,6 +240,34 @@ int main() {
         std::printf("plain %.1f tok/s, dspark %.1f tok/s (%.2fx); %llu rounds, %.2f drafts accepted per round, %llu plain steps\n",
                     plain_rate, spec_rate, spec_rate / plain_rate, static_cast<unsigned long long>(spec.rounds),
                     spec.rounds ? double(spec.accepted) / spec.rounds : 0.0, static_cast<unsigned long long>(spec.fallback));
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "FAIL: %s\n", error.what());
+        return 1;
+    }
+    try { // after the Engines above are gone: one Engine at a time fits the card
+        // --dense-q8 head: the drafter proposes from the target's re-encoded head, so DSpark still yields the plain
+        // Engine's greedy tokens under that head and accepts drafts; the re-encoding is reported with the weights.
+        ninfer::EngineOptions q8_plain;
+        q8_plain.artifact_path = artifact_path;
+        q8_plain.max_context   = 4096;
+        q8_plain.dense_q8      = ninfer::DenseQ8::Head;
+        auto q8_spec           = q8_plain;
+        q8_spec.speculative.backend      = ninfer::SpeculativeBackend::DSpark;
+        q8_spec.speculative.draft_tokens = drafts;
+        ninfer::product::apply_speculative_defaults(q8_spec.speculative);
+        Run want;
+        {
+            ninfer::Engine engine(q8_plain);
+            want = run_all(engine, tokens);
+            check(engine.memory_summary().weights.capacity_bytes > bf16_weight_bytes,
+                  "the --dense-q8 head re-encoding is counted in the weights");
+        }
+        ninfer::Engine engine(q8_spec);
+        const Run got = run_all(engine, tokens);
+        check(got.tokens == want.tokens, "--dense-q8 head: DSpark yields the plain Engine's greedy tokens");
+        check(got.rounds > 0 && got.accepted > 0, "--dense-q8 head: the drafts from the re-encoded head are accepted");
+        std::printf("--dense-q8 head: %llu rounds, %.2f drafts accepted per round\n", static_cast<unsigned long long>(got.rounds),
+                    got.rounds ? double(got.accepted) / got.rounds : 0.0);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

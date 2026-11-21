@@ -112,6 +112,22 @@ TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t 
     if (limits.dense != DenseForm::BF16) {
         const std::int32_t h = i32(c.hidden_size), heads = i32(c.heads), d = i32(c.head_dim), kv = i32(c.kv_heads * c.head_dim);
         const std::int32_t q = heads * d, rel = heads * i32(c.d_rel), dyn = i32(c.kv_heads) * i32(c.conv_kernel_size);
+        {
+            // The re-encodings stay resident beside the BF16 weights: their size is checked against the free device
+            // memory first, so a form that does not fit is refused by name rather than by an allocation failure.
+            std::size_t need = q8_bytes(h, i32(c.vocab_size));
+            for (std::uint32_t p = 0; p < c.num_hidden_layers && limits.dense == DenseForm::Q8All; ++p) {
+                need += q8_bytes(h, q) * 2 + q8_bytes(h, rel) + q8_bytes(h, heads) + q8_bytes(h, kv) * 2 + q8_bytes(q, h);
+                if (!c.local[p]) { need += q8_bytes(h, dyn) * 2; }
+            }
+            std::size_t free = 0, total = 0;
+            if (cudaMemGetInfo(&free, &total) != cudaSuccess) { throw std::runtime_error("inkling2: cannot query the device memory"); }
+            if (need > free) {
+                throw std::runtime_error(std::string("inkling2: --dense-q8 ") + (limits.dense == DenseForm::Q8All ? "all" : "head") +
+                                         " keeps " + std::to_string(need >> 20) + " MiB of re-encoded weights beside the BF16 ones; " +
+                                         std::to_string(free >> 20) + " MiB of device memory are free");
+            }
+        }
         for (std::uint32_t p = 0; p < c.num_hidden_layers && limits.dense == DenseForm::Q8All; ++p) {
             const LayerWeights& w = model.weights().layers.at(p);
             encode_q8(w.q, h, q), encode_q8(w.rel, h, rel), encode_q8(w.gate, h, q), encode_q8(w.sink, h, heads);
@@ -124,11 +140,27 @@ TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t 
     reset();
 }
 
+std::size_t TextProgram::q8_bytes(std::int32_t k, std::int32_t rows) noexcept {
+    const std::size_t values = static_cast<std::size_t>(k) * rows, scales = values / 32 * 2;
+    return (values + 255) / 256 * 256 + scales;
+}
+
+const ops::Q8Weight* TextProgram::q8_head() const {
+    const auto found = q8_.find(model_.tensor(model_.weights().head, {i32(config_.hidden_size), i32(config_.vocab_size)}).data);
+    return found == q8_.end() ? nullptr : &found->second;
+}
+
+std::size_t TextProgram::dense_q8_bytes() const noexcept {
+    std::size_t bytes = 0;
+    for (const DeviceBuffer& b : q8_memory_) { bytes += b.bytes; }
+    return bytes;
+}
+
 void TextProgram::encode_q8(WeightId id, std::int32_t k, std::int32_t rows) {
     const Tensor w = model_.tensor(id, {k, rows});
     if (q8_.contains(w.data)) { return; }
-    const std::size_t values = static_cast<std::size_t>(k) * rows, scales = values / 32 * 2;
-    q8_memory_.emplace_back((values + 255) / 256 * 256 + scales);
+    const std::size_t values = static_cast<std::size_t>(k) * rows;
+    q8_memory_.emplace_back(q8_bytes(k, rows));
     auto* base = static_cast<std::byte*>(q8_memory_.back().p);
     ops::Q8Weight q8{reinterpret_cast<const std::int8_t*>(base), base + (values + 255) / 256 * 256, k, rows};
     ops::quantize_q8_g32(w, reinterpret_cast<std::int8_t*>(base), base + (values + 255) / 256 * 256, stream_);

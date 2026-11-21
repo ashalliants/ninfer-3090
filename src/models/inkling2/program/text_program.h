@@ -70,6 +70,10 @@ public:
     // Tap i of the last forward: FP32 [hidden, T] on the device, valid until the next forward. Refused when that
     // forward ran with the taps off.
     [[nodiscard]] Tensor tap(std::size_t i) const;
+    // With ProgramLimits::dense: the text head's 8-bit re-encoding (the drafter's base logits read it too), or null.
+    [[nodiscard]] const ops::Q8Weight* q8_head() const;
+    // The device bytes the dense re-encodings hold, beside the artifact's weights (0 with DenseForm::BF16).
+    [[nodiscard]] std::size_t dense_q8_bytes() const noexcept;
     // Whether forwards copy the taps (on by default): a request that never drafts turns them off and saves the copies.
     void set_taps(bool on) noexcept { taps_on_ = on; }
 
@@ -119,6 +123,7 @@ private:
 
     // dense: the re-encoded weights by their BF16 data.
     void encode_q8(WeightId id, std::int32_t k, std::int32_t rows);
+    static std::size_t q8_bytes(std::int32_t k, std::int32_t rows) noexcept; // one re-encoding's allocation
     std::vector<DeviceBuffer> q8_memory_;
     std::unordered_map<const void*, ops::Q8Weight> q8_;
 
