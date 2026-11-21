@@ -972,9 +972,10 @@ void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor&
     require(weights == nullptr ||
                 (weights->dtype == DType::FP32 && weights->is_contiguous() && weights->ne[0] == top_k && weights->ne[1] == cols),
             op, "weights must be contiguous FP32 [k, T]");
-    require(out.dtype == DType::FP32 && out.is_contiguous() && out.ne[0] == bank.hidden &&
-                out.numel() == static_cast<std::int64_t>(bank.hidden) * cols * (weights != nullptr ? 1 : top_k),
-            op, "out must be contiguous FP32 [H, T], or [H, k * T] without weights");
+    // Exactly rank 2: [H, T] with weights, [H, k * T] without (the entries' outputs are written there directly).
+    require(out.data != nullptr && out.dtype == DType::FP32 && out.is_contiguous() && out.ne[0] == bank.hidden &&
+                out.ne[1] == cols * (weights != nullptr ? 1 : top_k) && out.ne[2] == 1 && out.ne[3] == 1,
+            op, "out must be contiguous FP32 storage [H, T], or [H, k * T] without weights");
     require(gate_cap > 0.0F && up_cap > 0.0F, op, "caps must be positive");
     const int entries = top_k * cols;
     const auto scope = workspace.scope();

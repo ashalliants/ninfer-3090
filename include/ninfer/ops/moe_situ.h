@@ -73,7 +73,7 @@ struct SituExpertBank {
  *   where Wgu_e, Wd_e are the exact decode of the bank's blocks (tensor-formats.md ggml_nvfp4) or its BF16 values.
  *
  * Logical shapes: z FP32 [H, T] (any column stride); ids I32 [k, T], weights FP32 [k, T] contiguous or null; out
- *   FP32 [H, T] (or [H, k * T] with weights null) contiguous.
+ *   FP32 [H, T] (or [H, k * T] with weights null) contiguous, exactly rank 2, with storage (refused otherwise).
  * Supported domain: format GGML_REC_NVFP4_NVFP4 (H and I multiples of 64, records and record stride 16-byte
  *   aligned) or BF16 (H and I multiples of 8, banks 16-byte aligned); H and I at most 8192.
  * Numeric: FP32 activations and accumulation (no activation quantization); oracle FP64 over the decoded

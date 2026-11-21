@@ -792,6 +792,21 @@ void test_experts(bool nvfp4, int h, int inter, int experts, const std::string& 
             } catch (const std::invalid_argument&) { refused = true; }
             check(refused, label + ": a combine without storage was accepted");
         }
+        // The unweighted route writes its entries straight into out: an out without storage, or of any shape but
+        // exactly [H, k * T] ([H, T] with weights), is refused before the launch.
+        const Tensor no_out(nullptr, DType::FP32, {h, k * cols});
+        Tensor flat(entries_out.b.p, DType::FP32, {h * k * cols}), as_3d(entries_out.b.p, DType::FP32, {h, cols, k});
+        Tensor weighted_wide(entries_out.b.p, DType::FP32, {h, k * cols});
+        const auto experts_refuse = [&](const Tensor* weights, Tensor bad) {
+            try {
+                ninfer::ops::moe_situ_experts(bank, dz.tensor({h, cols}), Tensor(did.p, DType::I32, {k, cols}), weights, 4.0F, 25.0F, arena,
+                                              bad, nullptr);
+            } catch (const std::invalid_argument&) { return true; }
+            return false;
+        };
+        check(experts_refuse(nullptr, no_out) && experts_refuse(nullptr, flat) && experts_refuse(nullptr, as_3d) &&
+                  (k == 1 || experts_refuse(&tw, weighted_wide)),
+              label + ": moe_situ_experts takes an out without storage or of the wrong rank-2 shape");
     }
     if (nvfp4) { // the vector loads need 16-byte aligned records: an offset base is refused, not read
         auto shifted = bank;
