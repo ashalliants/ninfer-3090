@@ -127,7 +127,8 @@ def _nvfp4(ne: tuple[int, ...], seed: int) -> bytes:
     return b.tobytes()
 
 
-def tensors(expert_types: dict[int, int] = EXPERT_TYPES, scale_type: int = F32) -> list[tuple[str, int, tuple[int, ...], bytes]]:
+def tensors(expert_types: dict[int, int] = EXPERT_TYPES, scale_type: int = F32,
+            borrowed_type: int = Q8_0) -> list[tuple[str, int, tuple[int, ...], bytes]]:
     from tools.convert.inkling2 import text_config
 
     config = text_config({key: (value[1] if kind == ARRAY else value) for key, kind, value in metadata()})
@@ -141,9 +142,9 @@ def tensors(expert_types: dict[int, int] = EXPERT_TYPES, scale_type: int = F32) 
         out.append((name, kind, ne, data))
 
     core = CORE[1] - CORE[0]
-    add("token_embd.weight", Q8_0, (VOCAB, HIDDEN))
+    add("token_embd.weight", borrowed_type, (VOCAB, HIDDEN))
     add("token_embd_norm.weight", F32, (HIDDEN,))
-    add("output.weight", Q8_0, (VOCAB, HIDDEN))
+    add("output.weight", borrowed_type, (VOCAB, HIDDEN))
     add("output_norm.weight", F32, (HIDDEN,))
     add("output_res_query.weight", F32, (HIDDEN,))
     add("loop_res_query.weight", F32, (2 * core, HIDDEN))
@@ -170,9 +171,11 @@ def tensors(expert_types: dict[int, int] = EXPERT_TYPES, scale_type: int = F32) 
     return out
 
 
-def write(path: Path, expert_types: dict[int, int] = EXPERT_TYPES, scale_type: int = F32) -> Path:
-    """``scale_type`` sets the type of layer 1's down-projection scales (F32 in every real build)."""
-    return write_gguf(path, metadata(), tensors(expert_types, scale_type))
+def write(path: Path, expert_types: dict[int, int] = EXPERT_TYPES, scale_type: int = F32,
+          borrowed_type: int = Q8_0) -> Path:
+    """``scale_type`` sets the type of layer 1's down-projection scales (F32 in every real build); ``borrowed_type``
+    the token table's and head's (BF16 in UD-Q8_K_XL, which the DSpark drafter needs)."""
+    return write_gguf(path, metadata(), tensors(expert_types, scale_type, borrowed_type))
 
 
 # The DSpark drafter (tools/convert/inkling2_dspark.py) at toy sizes over the text model above: two draft layers

@@ -181,7 +181,7 @@ def build_model(gguf: GgufModel, *, resource_overrides: Mapping[str, str | Path]
             if scale is not None:
                 model.add(_direct(gguf, f"{name}_{part}_scale", scale.gguf, scale.shape))
     if dspark is not None:
-        inkling2_dspark.add_dspark(model, dspark)
+        inkling2_dspark.add_dspark(model, dspark, gguf)
     return model
 
 

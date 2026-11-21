@@ -24,7 +24,7 @@ Q8_0, BF16, F32 = fixture.Q8_0, fixture.BF16, fixture.F32
 
 @pytest.fixture
 def text_path(tmp_path):
-    return fixture.write(tmp_path / "tiny.gguf")
+    return fixture.write(tmp_path / "tiny.gguf", borrowed_type=BF16)
 
 
 def _sha(chunks) -> str:
@@ -108,6 +108,15 @@ def test_metadata_refusals(text_path, tmp_path, changes, match):
 def test_tensor_refusals(text_path, tmp_path, changes, match):
     dspark_path = fixture.write_dspark(tmp_path / "bad.gguf", tensor_changes=changes)
     with GgufModel(text_path) as text, GgufModel(dspark_path) as dspark, pytest.raises(Inkling2Error, match=match):
+        inkling2_model.build_model(text, dspark=dspark)
+
+
+def test_a_text_model_with_q8_0_token_table_or_head_is_refused(tmp_path):
+    # The drafter reads both as BF16; UD-Q4_K_XL stores them as Q8_0.
+    text_path = fixture.write(tmp_path / "q8.gguf")
+    dspark_path = fixture.write_dspark(tmp_path / "dspark.gguf")
+    with GgufModel(text_path) as text, GgufModel(dspark_path) as dspark, pytest.raises(
+            Inkling2Error, match="reads the text model's token_embd.weight as BF16, this GGUF has Q8_0"):
         inkling2_model.build_model(text, dspark=dspark)
 
 

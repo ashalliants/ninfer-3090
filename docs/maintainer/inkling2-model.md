@@ -304,7 +304,7 @@ size is 8, made of one anchor plus 7 drafts. The drafter borrows the target's `t
   `W_head Wo` ([201024 x 256]) and `W_head bo` once. That is exact in real arithmetic and turns
   each step's head read from H = 2304 columns into 256.
 
-**Status (2026-11-21, V100, FP32 kernels).** `ninfer_inkling2_dspark_test` checks that greedy speculative tokens
+**Status (2026-11-21, run on a physical Tesla V100-PCIE-32GB, sm_70, FP32 kernels; see [tesla-v100.md](../tesla-v100.md)).** `ninfer_inkling2_dspark_test` checks that greedy speculative tokens
 equal plain greedy tokens on the four golden prompts (64 tokens each), and they do. Drafts accepted per block of 7
 match CPU llama.cpp at the same revision (`llama-speculative-simple --spec-type draft-dspark`):
 

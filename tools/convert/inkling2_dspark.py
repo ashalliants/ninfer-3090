@@ -192,8 +192,14 @@ def parameter_name(tensor: str) -> str:
     return f"dspark/layers/{layer}/{_LAYER[suffix]}"
 
 
-def add_dspark(model: Model, gguf: GgufModel) -> None:
-    """Adds component ``dspark`` from the drafter's GGUF to the Inkling-2 text model ``model``."""
+def add_dspark(model: Model, gguf: GgufModel, text_gguf: GgufModel) -> None:
+    """Adds component ``dspark`` from the drafter's GGUF to the Inkling-2 text model ``model`` (from ``text_gguf``)."""
+    # The drafter reads the text model's token table and head as BF16 words (embedding_bf16_fp32, and W_head W_o
+    # precomputed in FP32 at start).
+    for borrowed in ("token_embd.weight", "output.weight"):
+        kind = text_gguf.tensor(borrowed).type.name
+        if kind != "BF16":
+            raise Inkling2Error(f"DSpark: the drafter reads the text model's {borrowed} as BF16, this GGUF has {kind}")
     text = model.config
     config = dspark_config(gguf.metadata, text)
     expected = expected_shapes({**config, "vocab_size": text["vocab_size"]})
