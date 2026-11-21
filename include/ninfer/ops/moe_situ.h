@@ -18,22 +18,31 @@ namespace ninfer::ops {
  * Op: moe_route_sigmoid_topk
  *
  * Math / indexing:
+ *   z = norm ? rmsnorm_fp32(x, norm->weight, norm->eps) (written to norm->z) : x
  *   L[e, t] = sum_d router[d, e] * z[d, t];  s = 1 / (1 + exp(-L))
  *   ids[:, t] = the top_k experts by s + bias (descending; the lower id wins a tie)
  *   weights[i, t] = scale * s[ids[i, t], t] / (sum_i s[ids[i, t], t] + 1e-20)
  *
- * Logical shapes: z FP32 [D, T] (any column stride); router FP32 [D, E] contiguous; bias FP32 [E];
- *   ids I32 [top_k, T] and weights FP32 [top_k, T], contiguous.
+ * Logical shapes: x FP32 [D, T] (any column stride); norm->weight FP32 [D]; norm->z FP32 [D, T] (any column
+ *   stride, not overlapping x); router FP32 [D, E] contiguous; bias FP32 [E]; ids I32 [top_k, T] and weights
+ *   FP32 [top_k, T], contiguous.
  * Supported domain: E at most 256, 1 <= top_k <= min(E, 16).
- * Numeric: FP32 logits; oracle FP64 (inkling2_reference.h route). A near tie at the k-th place may select
+ * Numeric: FP32 logits; oracle FP64 (inkling2_reference.h route). norm->z is the same bits as rmsnorm_fp32, and
+ *   the logits are formed from those values. A near tie at the k-th place may select
  *   differently from the oracle; the test accepts that only within the FP32 bound of the two scores.
  * Workspace: moe_route_sigmoid_topk_workspace_bytes(E, T) from `workspace`, released on return; the query
  *   throws std::invalid_argument outside the supported domain.
- * Execution: graph capturable.
+ * Execution: two launches (the norm is formed in the first); graph capturable.
  */
+/// moe_route_sigmoid_topk's optional input norm.
+struct RouteInputNorm {
+    const Tensor* weight = nullptr;
+    float eps            = 0.0F;
+    Tensor* z            = nullptr;
+};
 [[nodiscard]] std::size_t moe_route_sigmoid_topk_workspace_bytes(std::int32_t experts, std::int64_t columns);
-void moe_route_sigmoid_topk(const Tensor& z, const Tensor& router, const Tensor& bias, int top_k, float scale, DeviceArena& workspace,
-                            Tensor& ids, Tensor& weights, cudaStream_t stream);
+void moe_route_sigmoid_topk(const Tensor& x, const RouteInputNorm* norm, const Tensor& router, const Tensor& bias, int top_k, float scale,
+                            DeviceArena& workspace, Tensor& ids, Tensor& weights, cudaStream_t stream);
 
 /// A layer's routed experts, resident in device memory. Either a ggml_expert_record_v1 bank
 /// (`records`, `format` GGML_REC_NVFP4_NVFP4: gate [I, H], up [I, H] and down [H, I] per record,

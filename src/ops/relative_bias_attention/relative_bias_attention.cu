@@ -2,6 +2,8 @@
 
 #include "ninfer/ops/relative_bias_attention.h"
 
+#include <cuda_bf16.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -121,18 +123,24 @@ __global__ void head_norms_kernel(HeadArgs a) {
     for (int g = blockIdx.y; g < a.total; g += gridDim.y) { head_norm(a, t, g, lane); }
 }
 
-__global__ void append_kernel(const float* __restrict__ src, std::int64_t ss, int rows, std::int64_t start,
-                              const std::int64_t* start_offset, std::int64_t capacity, float* __restrict__ cache) {
+// grid (T, ceil(rows / 256), 2): z = 0 appends the keys, z = 1 the values.
+__global__ void append_kernel(const float* __restrict__ k_new, std::int64_t ks, const float* __restrict__ v_new, std::int64_t vs,
+                              int rows, std::int64_t start, const std::int64_t* start_offset, std::int64_t capacity,
+                              float* __restrict__ k_cache, float* __restrict__ v_cache) {
     const int t = blockIdx.x, d = blockIdx.y * blockDim.x + threadIdx.x;
     if (d >= rows) { return; }
     const std::int64_t first = start + (start_offset != nullptr ? *start_offset : 0);
-    cache[((first + t) % capacity) * rows + d] = src[t * ss + d];
+    const bool values = blockIdx.z == 1;
+    const float* src = values ? v_new : k_new;
+    float* cache = values ? v_cache : k_cache;
+    cache[((first + t) % capacity) * rows + d] = src[t * (values ? vs : ks) + d];
 }
 
 struct AttentionArgs {
     const float *q, *r, *sink, *table, *k, *v;
-    std::int64_t qs, rs, ss, os;
-    float* out;
+    std::int64_t qs, rs, ss, os, gs;
+    const float* gate; // or null
+    void* out;
     int heads, group, d_rel, extent, window;
     std::int64_t start, capacity, kv_width;
     const std::int64_t* start_offset;
@@ -156,6 +164,10 @@ __device__ float block_reduce(float v, float* scratch) {
 
 // One block per (head, column): four warps score a tile of keys into shared memory, then every thread folds
 // the tile into its output dimension with the online-softmax rescale.
+__device__ __forceinline__ void store_out(float* p, float v) { *p = v; }
+__device__ __forceinline__ void store_out(__nv_bfloat16* p, float v) { *p = __float2bfloat16_rn(v); }
+
+template <typename Out>
 __global__ void __launch_bounds__(kThreads) attention_kernel(AttentionArgs a) {
     __shared__ float q[kHeadDim];
     __shared__ float r[kMaxRel];
@@ -237,7 +249,11 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(AttentionArgs a) {
         m = top;
         __syncthreads();
     }
-    a.out[t * a.os + static_cast<std::int64_t>(h) * kHeadDim + threadIdx.x] = acc / denom;
+    const std::int64_t at = static_cast<std::int64_t>(h) * kHeadDim + threadIdx.x;
+    const float x = acc / denom;
+    // sigmoid_gate_fp32's expression, so the same bits as that op after an ungated call.
+    const float y = a.gate != nullptr ? x / (1.0F + expf(-a.gate[t * a.gs + at])) : x;
+    store_out(static_cast<Out*>(a.out) + t * a.os + at, y);
 }
 
 } // namespace
@@ -306,7 +322,8 @@ void head_unit_rms_fp32(Tensor& x, int head_dim, float eps, cudaStream_t stream)
 
 void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Tensor& q, const Tensor& r, const Tensor& sink,
                                   const Tensor& k_new, const Tensor& v_new, const Tensor& table, Tensor& k_cache, Tensor& v_cache,
-                                  std::int64_t start, const std::int64_t* start_offset, Tensor& out, cudaStream_t stream) {
+                                  std::int64_t start, const std::int64_t* start_offset, const Tensor* gate, Tensor& out,
+                                  cudaStream_t stream) {
     const char* op = "relative_bias_sink_attention";
     require(s.head_dim == kHeadDim, op, "head_dim must be 128");
     require(s.d_rel > 0 && s.d_rel <= kMaxRel, op, "d_rel must be 1..32");
@@ -318,7 +335,19 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     a.qs = column_stride(q, width, cols, op, "q");
     a.rs = column_stride(r, s.heads * s.d_rel, cols, op, "r");
     a.ss = column_stride(sink, s.heads, cols, op, "sink");
-    a.os = column_stride(out, width, cols, op, "out");
+    require(out.dtype == DType::FP32 || (gate != nullptr && out.dtype == DType::BF16), op, "out must be FP32, or BF16 with a gate");
+    if (out.dtype == DType::BF16) {
+        require(out.ne[0] == width && out.ne[1] == cols && out.ne[2] == 1 && out.ne[3] == 1 && out.nb[0] == 2 && out.nb[1] % 2 == 0 &&
+                    (cols == 1 || out.nb[1] >= width * 2),
+                op, "out has the wrong shape or layout");
+        a.os = cols == 1 ? width : out.nb[1] / 2;
+    } else {
+        a.os = column_stride(out, width, cols, op, "out");
+    }
+    if (gate != nullptr) {
+        a.gs = column_stride(*gate, width, cols, op, "gate");
+        a.gate = static_cast<const float*>(gate->data);
+    }
     const std::int64_t ks = column_stride(k_new, kv_width, cols, op, "k_new"), vs = column_stride(v_new, kv_width, cols, op, "v_new");
     require(table.dtype == DType::FP32 && table.is_contiguous() && table.ne[0] == s.d_rel && table.ne[1] > 0, op,
             "table must be contiguous FP32 [d_rel, E]");
@@ -328,11 +357,9 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     require(reinterpret_cast<std::uintptr_t>(k_cache.data) % 16 == 0, op, "k_cache must be 16-byte aligned (float4 key loads)");
     const std::int64_t capacity = k_cache.ne[1];
     require(s.window > 0 ? capacity >= s.window - 1 + cols : capacity >= start + cols, op, "the KV ring cannot hold the visible keys");
-    const dim3 append_grid(cols, (kv_width + 255) / 256);
-    append_kernel<<<append_grid, 256, 0, stream>>>(static_cast<const float*>(k_new.data), ks, kv_width, start, start_offset, capacity,
-                                                   static_cast<float*>(k_cache.data));
-    append_kernel<<<append_grid, 256, 0, stream>>>(static_cast<const float*>(v_new.data), vs, kv_width, start, start_offset, capacity,
-                                                   static_cast<float*>(v_cache.data));
+    append_kernel<<<dim3(cols, (kv_width + 255) / 256, 2), 256, 0, stream>>>(
+        static_cast<const float*>(k_new.data), ks, static_cast<const float*>(v_new.data), vs, kv_width, start, start_offset, capacity,
+        static_cast<float*>(k_cache.data), static_cast<float*>(v_cache.data));
     check_launch(op);
     a.q = static_cast<const float*>(q.data);
     a.r = static_cast<const float*>(r.data);
@@ -340,7 +367,7 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     a.table = static_cast<const float*>(table.data);
     a.k = static_cast<const float*>(k_cache.data);
     a.v = static_cast<const float*>(v_cache.data);
-    a.out = static_cast<float*>(out.data);
+    a.out = out.data;
     a.heads = s.heads;
     a.group = s.heads / s.kv_heads;
     a.d_rel = s.d_rel;
@@ -350,7 +377,11 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     a.start_offset = start_offset;
     a.capacity = capacity;
     a.kv_width = kv_width;
-    attention_kernel<<<dim3(cols, s.heads), kThreads, 0, stream>>>(a);
+    if (out.dtype == DType::BF16) {
+        attention_kernel<__nv_bfloat16><<<dim3(cols, s.heads), kThreads, 0, stream>>>(a);
+    } else {
+        attention_kernel<float><<<dim3(cols, s.heads), kThreads, 0, stream>>>(a);
+    }
     check_launch(op);
 }
 

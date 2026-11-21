@@ -47,16 +47,62 @@ __device__ float warp_sum(float v) {
 // is 128 blocks, enough to stream the router at bandwidth).
 constexpr int kScoreThreads = 128;
 
+// The input norm of moe_route_rmsnorm_sigmoid_topk: z = rmsnorm_fp32(x, weight, eps), its column t written by the
+// blocks (t, e) between them.
+struct RouteNorm {
+    const float* weight;
+    float eps;
+    float* z;
+    std::int64_t zs;
+};
+
+// rmsnorm_fp32's 1 / rms of column `col` (its kernel's order: 256 threads, thread x sums the squares of rows x,
+// x + 256, ... in order, a warp's xor tree, then the 8 warps in order), with kScoreThreads = 128 threads: thread y
+// takes the sums of threads y and y + 128.
+__device__ __forceinline__ float rmsnorm_inverse(const float* __restrict__ col, int rows, float eps, float* part8) {
+    static_assert(kScoreThreads == 128, "two of the norm's 256 threads per thread");
+    float lo = 0.0F, hi = 0.0F;
+#pragma unroll 3
+    for (int d = threadIdx.x; d < rows; d += 256) {
+        lo = fmaf(__ldg(col + d), __ldg(col + d), lo);
+        if (d + 128 < rows) { hi = fmaf(__ldg(col + d + 128), __ldg(col + d + 128), hi); }
+    }
+    lo = warp_sum(lo);
+    hi = warp_sum(hi);
+    if ((threadIdx.x & 31) == 0) {
+        part8[threadIdx.x >> 5]       = lo;
+        part8[4 + (threadIdx.x >> 5)] = hi;
+    }
+    __syncthreads();
+    float total = 0.0F;
+    for (int i = 0; i < 8; ++i) { total += part8[i]; }
+    return rsqrtf(total / static_cast<float>(rows) + eps);
+}
+
+template <bool kNorm>
 __global__ void __launch_bounds__(kScoreThreads)
 route_score_kernel(const float* __restrict__ z, std::int64_t zs, const float* __restrict__ router, int rows, int experts,
-                   float* __restrict__ scores) {
+                   RouteNorm norm, float* __restrict__ scores) {
     __shared__ float part[kScoreThreads / 32];
+    __shared__ float part8[8];
     const int t = blockIdx.x, e = blockIdx.y, lane = threadIdx.x & 31; // T on x: no 65535 cap
     const float* col = z + t * zs;
     const float* w = router + static_cast<std::int64_t>(e) * rows;
     float dot = 0.0F;
+    if constexpr (kNorm) {
+        // z = x * inv * weight as rmsnorm_fp32 forms it; block e writes the rows of its passes i with i % E == e.
+        const float inv = rmsnorm_inverse(col, rows, norm.eps, part8);
+        float* out = norm.z + t * norm.zs;
 #pragma unroll 6
-    for (int d = threadIdx.x; d < rows; d += kScoreThreads) { dot = fmaf(__ldg(w + d), __ldg(col + d), dot); }
+        for (int d = threadIdx.x; d < rows; d += kScoreThreads) {
+            const float v = __ldg(col + d) * inv * __ldg(norm.weight + d);
+            if ((d / kScoreThreads) % experts == e) { out[d] = v; }
+            dot = fmaf(__ldg(w + d), v, dot);
+        }
+    } else {
+#pragma unroll 6
+        for (int d = threadIdx.x; d < rows; d += kScoreThreads) { dot = fmaf(__ldg(w + d), __ldg(col + d), dot); }
+    }
     dot = warp_sum(dot);
     if (lane == 0) { part[threadIdx.x >> 5] = dot; }
     __syncthreads();
@@ -825,8 +871,8 @@ std::size_t moe_route_sigmoid_topk_workspace_bytes(std::int32_t experts, std::in
     return align256(static_cast<std::uint64_t>(experts) * static_cast<std::uint64_t>(columns) * 4);
 }
 
-void moe_route_sigmoid_topk(const Tensor& z, const Tensor& router, const Tensor& bias, int top_k, float scale, DeviceArena& workspace,
-                            Tensor& ids, Tensor& weights, cudaStream_t stream) {
+void moe_route_sigmoid_topk(const Tensor& z, const RouteInputNorm* norm, const Tensor& router, const Tensor& bias, int top_k, float scale,
+                            DeviceArena& workspace, Tensor& ids, Tensor& weights, cudaStream_t stream) {
     const char* op = "moe_route_sigmoid_topk";
     const std::int32_t rows = z.ne[0], cols = z.ne[1];
     const std::int64_t zs = column_stride(z, rows, cols, op, "z");
@@ -842,8 +888,19 @@ void moe_route_sigmoid_topk(const Tensor& z, const Tensor& router, const Tensor&
             "weights must be contiguous FP32 [k, T]");
     const auto scope = workspace.scope();
     float* scores = static_cast<float*>(workspace.alloc_bytes(static_cast<std::size_t>(experts) * cols * 4).data);
-    route_score_kernel<<<dim3(cols, experts), kScoreThreads, 0, stream>>>(
-        static_cast<const float*>(z.data), zs, static_cast<const float*>(router.data), rows, experts, scores);
+    if (norm != nullptr) {
+        require(norm->weight != nullptr && norm->weight->dtype == DType::FP32 && norm->weight->is_contiguous() && norm->weight->numel() == rows,
+                op, "the norm weight must be FP32 [D]");
+        require(norm->eps > 0.0F, op, "eps must be positive");
+        require(norm->z != nullptr && norm->z->data != z.data, op, "the normalized z must not be x");
+        const RouteNorm n{static_cast<const float*>(norm->weight->data), norm->eps, static_cast<float*>(norm->z->data),
+                          column_stride(*norm->z, rows, cols, op, "z")};
+        route_score_kernel<true><<<dim3(cols, experts), kScoreThreads, 0, stream>>>(
+            static_cast<const float*>(z.data), zs, static_cast<const float*>(router.data), rows, experts, n, scores);
+    } else {
+        route_score_kernel<false><<<dim3(cols, experts), kScoreThreads, 0, stream>>>(
+            static_cast<const float*>(z.data), zs, static_cast<const float*>(router.data), rows, experts, RouteNorm{}, scores);
+    }
     check_launch(op);
     route_select_kernel<<<cols, 32, 0, stream>>>(scores, static_cast<const float*>(bias.data), experts, top_k, scale,
                                                  static_cast<std::int32_t*>(ids.data), static_cast<float*>(weights.data));
