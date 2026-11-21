@@ -37,6 +37,9 @@ set -euo pipefail
 #                    on a terminal, puts the volume in another folder (default: beside the model): a
 #                    faster drive, since prefill from NVMe measured 1.1-1.4x that from a SATA SSD.
 #                    The launcher is then told with NINFER_NGRAM_VOLUME, which the script prints.
+#   inkling2-mini    Inkling-2-Mini (Tesla V100 32 GB, Linux), 22.3 GiB: this fork's exact conversion of
+#                    Unsloth's UD-Q8_K_XL GGUF with the model's DSpark drafter and vision tower
+#                    (WarlaxZ/Inkling-2-Mini-NInfer-V100). One file serves --vision and --spec dspark.
 #
 # To repin a model, edit its block below: take the size and sha256 from what HuggingFace reports for
 # the new revision (X-Linked-Size and X-Linked-ETag on the resolve URL, or the revision's
@@ -52,7 +55,7 @@ set -euo pipefail
 # otherwise. `apt-get install aria2` / `brew install aria2` to opt in.
 
 usage() {
-  printf 'usage: %s <model>\n\n  qwen38-27b (recommended)\n  bonsai2-27b\n  qwen36-27b\n  qwen36-35b-a3b\n  qwen38-flash-next (preview)\n  qwen38-flash-next-iq3 (preview, Unsloth UD-IQ3_XXS)\n' \
+  printf 'usage: %s <model>\n\n  qwen38-27b (recommended)\n  bonsai2-27b\n  qwen36-27b\n  qwen36-35b-a3b\n  qwen38-flash-next (preview)\n  qwen38-flash-next-iq3 (preview, Unsloth UD-IQ3_XXS)\n  inkling2-mini (Tesla V100)\n' \
     "${0##*/}" >&2
 }
 
@@ -98,6 +101,16 @@ case "${1:-}" in
     expected_sha256='3e33297645dc33557751be1a3c407a74ed7c00f34909b5d4e8cfdce91b3dbe84'
     label='the RTX 3090-compatible Qwen3.6-35B-A3B vision model (21.2 GiB)'
     tests_variable='NINFER_QWEN3_6_35B_A3B_WEIGHTS'
+    ;;
+  inkling2-mini)
+    artifact='inkling2-mini-q8.ninfer'
+    owner='WarlaxZ'
+    repo='Inkling-2-Mini-NInfer-V100'
+    revision='e348ad671599db1db110447b9d9ebfb898070f67'
+    expected_size=23914098432
+    expected_sha256='2167c0c0ff2ebb5d9dcf7ea5c8289ce13239bdc5104aac053af79a3b8cf009c1'
+    label='the Inkling-2-Mini model for the Tesla V100 (22.3 GiB)'
+    tests_variable='NINFER_TEST_INKLING2_ARTIFACT'
     ;;
   # The n-gram volume is pinned to the commit that uploaded it; the model file and its part are pinned
   # to the revision that published the model card with them. The volume is unchanged in that revision.
