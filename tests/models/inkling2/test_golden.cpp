@@ -130,6 +130,8 @@ int main() {
     }
     const char* dump_root = std::getenv("NINFER_INKLING2_DUMP");
     const int decode_tokens = std::getenv("NINFER_INKLING2_DECODE") ? std::atoi(std::getenv("NINFER_INKLING2_DECODE")) : 32;
+    // NINFER_INKLING2_PREFILL=N also times an N-token prefill in chunks of 256 (the golden prompts' tokens repeated).
+    const int prefill_tokens = std::getenv("NINFER_INKLING2_PREFILL") ? std::atoi(std::getenv("NINFER_INKLING2_PREFILL")) : 0;
     try {
         ninfer::artifact::Reader reader(artifact_path);
         ninfer::DeviceContext device(0);
@@ -234,6 +236,31 @@ int main() {
             check(chunk_diff <= 1e-3, "p" + std::to_string(index) + ": chunked logits differ from the whole run");
         }
         check(!first_prompt.empty(), "no golden prompts found");
+
+        if (prefill_tokens > 0 && !first_prompt.empty()) {
+            constexpr std::int32_t kChunk = 256;
+            ink::TextProgram long_program(*model, {prefill_tokens + kChunk, kChunk}, stream);
+            std::vector<std::int32_t> tokens;
+            while (static_cast<int>(tokens.size()) < prefill_tokens) {
+                tokens.insert(tokens.end(), first_prompt.begin(), first_prompt.end());
+            }
+            tokens.resize(static_cast<std::size_t>(prefill_tokens));
+            for (int pass = 0; pass < 2; ++pass) { // the first pass warms the kernels
+                long_program.reset();
+                cudaStreamSynchronize(stream);
+                const auto p0 = std::chrono::steady_clock::now();
+                for (int s = 0; s < prefill_tokens; s += kChunk) {
+                    const int len = std::min<int>(kChunk, prefill_tokens - s);
+                    (void)long_program.forward(std::span(tokens).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(len)));
+                }
+                cudaStreamSynchronize(stream);
+                const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - p0).count();
+                if (pass == 1) {
+                    std::printf("prefill: %d tokens in chunks of %d in %.2f s = %.1f tok/s\n", prefill_tokens, kChunk, seconds,
+                                prefill_tokens / seconds);
+                }
+            }
+        }
 
         // Greedy continuation of the first prompt.
         if (!first_prompt.empty() && decode_tokens > 0) {
