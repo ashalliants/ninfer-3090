@@ -117,8 +117,12 @@ void short_conv_fp32_batch(std::span<const ShortConvJob> jobs, int head_width, c
             const ConvCombine& cb = *job.combine;
             require(cb.entries != nullptr && cb.weights != nullptr, "a combine needs entries and weights");
             const Tensor &e = *cb.entries, &w = *cb.weights;
-            require(w.dtype == DType::FP32 && w.is_contiguous() && w.ne[2] == 1 && w.ne[1] > 0 && w.ne[0] > 0, "combine weights must be FP32 [k, T]");
-            require(e.dtype == DType::FP32 && e.is_contiguous() && e.ne[1] == w.ne[0] * w.ne[1] && e.ne[2] == 1, "combine entries must be FP32 [C, k * T]");
+            require(w.data != nullptr && w.dtype == DType::FP32 && w.is_contiguous() && w.ne[2] == 1 && w.ne[3] == 1 && w.ne[1] > 0 &&
+                        w.ne[0] > 0,
+                    "combine weights must be FP32 [k, T]");
+            require(e.data != nullptr && e.dtype == DType::FP32 && e.is_contiguous() && e.ne[1] == w.ne[0] * w.ne[1] && e.ne[2] == 1 &&
+                        e.ne[3] == 1,
+                    "combine entries must be FP32 [C, k * T]");
             a.entries = static_cast<const float*>(e.data);
             a.weights = static_cast<const float*>(w.data);
             a.top_k = w.ne[0];
