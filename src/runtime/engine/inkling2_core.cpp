@@ -263,6 +263,9 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         ink::ProgramLimits limits;
         limits.max_context = static_cast<std::int32_t>(options_.max_context);
         limits.max_chunk   = kChunk;
+        limits.dense       = options_.dense_q8 == DenseQ8::All    ? ink::DenseForm::Q8All
+                             : options_.dense_q8 == DenseQ8::Head ? ink::DenseForm::Q8Head
+                                                                  : ink::DenseForm::BF16;
         const bool dspark  = options_.speculative.backend == SpeculativeBackend::DSpark;
         if (dspark) {
             const ink::DSparkConfig* dc = model_->dspark_config();
@@ -297,6 +300,7 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     load_.model_name          = "Inkling-2-Mini";
     load_.artifact_id         = artifact::artifact_id_hex(reader.artifact_id());
     load_.weight_formats      = {"bf16", "ggml_q8_0", "ggml_rec_nvfp4_nvfp4", "fp32"};
+    if (options_.dense_q8 != DenseQ8::Off) { load_.weight_formats.push_back("q8_g32_fp16 (re-encoded at load)"); }
     load_.prefill_signature   = "inkling2-fp32";
     load_.takes_video         = false;
     load_.load_seconds        = seconds_between(start, Clock::now());

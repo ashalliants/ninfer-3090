@@ -36,6 +36,7 @@ struct Options {
     std::vector<std::uint32_t> stage_layers;
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    DenseQ8 dense_q8        = DenseQ8::Off; // --dense-q8 head|all (Inkling-2)
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     VisionResidency vision_residency       = VisionResidency::Resident;

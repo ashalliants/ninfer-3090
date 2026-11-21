@@ -185,6 +185,12 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
+DenseQ8 parse_dense_q8(std::string_view value) {
+    if (value == "head") { return DenseQ8::Head; }
+    if (value == "all") { return DenseQ8::All; }
+    throw std::invalid_argument("invalid --dense-q8 (head or all): " + std::string(value));
+}
+
 KvCapacityPolicy parse_kv_capacity(const char* text) {
     if (std::string_view(text) == "auto") { return KvCapacityPolicy::automatic(); }
     const int value = parse_nonnegative_int(text, "kv-capacity");
@@ -238,7 +244,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--context-store-s3-upload-delay-seconds N]]] "
            "[--no-exit-on-engine-failure] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] "
+           "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] [--dense-q8 head|all] "
            "[--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N]] "
            "[--ngram-draft-tokens 0|15] [--ngram-min-match N] [--adaptive-draft-tokens 0|3] "
            "[--relaxed-drafting [P]] [--draft-context-rows N] "
@@ -1017,6 +1023,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.stage_layers = parse_stage_layers(require_value("--stage-layers"));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+        } else if (arg == "--dense-q8") {
+            options.dense_q8 = parse_dense_q8(require_value("--dense-q8"));
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));

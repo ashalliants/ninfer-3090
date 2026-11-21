@@ -159,6 +159,11 @@ int main() {
                   }),
                   "CLI accepted an unsupported DFlash2 draft count");
     }
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--dense-q8", "all"}).dense_q8 == ninfer::DenseQ8::All &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--dense-q8", "head"}).dense_q8 == ninfer::DenseQ8::Head,
+                      "CLI --dense-q8 was not parsed");
+    failures += check(rejects([&] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--dense-q8", "q4"}); }),
+                      "CLI accepted an unknown --dense-q8 form");
     // --spec dspark: an omitted --draft-tokens takes 3; an explicit one is kept and must be in [1,7].
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dspark"}).speculative.draft_tokens == 3,
                       "CLI --spec dspark did not default to 3 drafts");

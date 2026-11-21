@@ -109,7 +109,30 @@ TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t 
         state_.push_back(s);
     }
     for (std::size_t i = 0; i < limits.tap_visits.size(); ++i) { taps_.push_back(carve(i32(c.hidden_size), limits.max_chunk)); }
+    if (limits.dense != DenseForm::BF16) {
+        const std::int32_t h = i32(c.hidden_size), heads = i32(c.heads), d = i32(c.head_dim), kv = i32(c.kv_heads * c.head_dim);
+        const std::int32_t q = heads * d, rel = heads * i32(c.d_rel), dyn = i32(c.kv_heads) * i32(c.conv_kernel_size);
+        for (std::uint32_t p = 0; p < c.num_hidden_layers && limits.dense == DenseForm::Q8All; ++p) {
+            const LayerWeights& w = model.weights().layers.at(p);
+            encode_q8(w.q, h, q), encode_q8(w.rel, h, rel), encode_q8(w.gate, h, q), encode_q8(w.sink, h, heads);
+            encode_q8(w.k, h, kv), encode_q8(w.v, h, kv), encode_q8(w.output, q, h);
+            if (!c.local[p]) { encode_q8(w.k_conv_proj, h, dyn), encode_q8(w.v_conv_proj, h, dyn); }
+        }
+        encode_q8(model.weights().head, h, i32(c.vocab_size));
+        if (cudaStreamSynchronize(stream_) != cudaSuccess) { throw std::runtime_error("inkling2: the dense re-encoding failed"); }
+    }
     reset();
+}
+
+void TextProgram::encode_q8(WeightId id, std::int32_t k, std::int32_t rows) {
+    const Tensor w = model_.tensor(id, {k, rows});
+    if (q8_.contains(w.data)) { return; }
+    const std::size_t values = static_cast<std::size_t>(k) * rows, scales = values / 32 * 2;
+    q8_memory_.emplace_back((values + 255) / 256 * 256 + scales);
+    auto* base = static_cast<std::byte*>(q8_memory_.back().p);
+    ops::Q8Weight q8{reinterpret_cast<const std::int8_t*>(base), base + (values + 255) / 256 * 256, k, rows};
+    ops::quantize_q8_g32(w, reinterpret_cast<std::int8_t*>(base), base + (values + 255) / 256 * 256, stream_);
+    q8_.emplace(w.data, q8);
 }
 
 TextProgram::~TextProgram() {
@@ -261,7 +284,14 @@ Tensor TextProgram::project(const Tensor& x, std::span<const WeightId> weights, 
         total += rows[i];
     }
     Tensor out = workspace_.alloc(DType::FP32, {total, cols});
-    ops::projection_fp32(x, std::span<const Tensor* const>(pointers.data(), weights.size()), out, stream_);
+    // A call runs over the re-encoding when every one of its weights has one (all or none, as the forms are made).
+    if (const auto found = q8_.find(views[0].data); found != q8_.end()) {
+        std::array<ops::Q8Weight, 4> q8;
+        for (std::size_t i = 0; i < weights.size(); ++i) { q8[i] = q8_.at(views[i].data); }
+        ops::projection_q8_fp32(x, std::span<const ops::Q8Weight>(q8.data(), weights.size()), out, stream_);
+    } else {
+        ops::projection_fp32(x, std::span<const Tensor* const>(pointers.data(), weights.size()), out, stream_);
+    }
     return out;
 }
 

@@ -32,6 +32,11 @@ inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
 // HTTP and Program setup; two requests added ~30 MB); this keeps a margin over that.
 inline constexpr std::size_t kDefaultHostCacheReserveBytes = 3ULL << 30;
 
+// Inkling-2's opt-in 8-bit re-encoding of its BF16 dense weights at load (the artifact is unchanged; Q8_0's values,
+// 8.5 bits a weight). Head: the LM head. All: the head and every attention projection. Lossy: see
+// docs/maintainer/inkling2-model.md, "Dense 8-bit re-encoding", for the measured KLD and speed.
+enum class DenseQ8 : std::uint8_t { Off, Head, All };
+
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
     Int8Group64,
@@ -854,6 +859,8 @@ struct EngineOptions {
     // Q6G64 token embedding: the narrower-model option where Q4 costs measurable perplexity
     // (the 35B-A3B's 2048-wide table). Mutually exclusive with embedding_q4.
     bool embedding_q6                      = false;
+    // Inkling-2 only (other models refuse anything but Off): DenseQ8 above.
+    DenseQ8 dense_q8                       = DenseQ8::Off;
     // Qwen3.6-35B-A3B only: the MTP draft layer's routed experts are stored W8 in the artifact;
     // transcode them to the text layers' formats (Q4 gate_up, Q6 down) at load. Drafts are
     // verified exactly, so this can change acceptance but never the output distribution.
