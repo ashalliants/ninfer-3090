@@ -157,7 +157,8 @@ void test_mix_and_control() {
     std::vector<Tensor*> op;
     for (auto& s : st) { sp.push_back(&s); }
     for (auto& o : ot) { op.push_back(&o); }
-    ninfer::ops::depth_attention_mix(sp, dq.tensor({h, queries}), 1e-6F, op, nullptr);
+    ninfer::DeviceArena mix_arena(ninfer::ops::depth_attention_mix_workspace_bytes(h, cols, sources) + 4096);
+    ninfer::ops::depth_attention_mix(sp, dq.tensor({h, queries}), 1e-6F, mix_arena, op, nullptr);
     for (int i = 0; i < queries; ++i) {
         Vec want;
         for (int c = 0; c < cols; ++c) {

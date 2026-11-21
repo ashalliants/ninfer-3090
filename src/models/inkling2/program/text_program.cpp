@@ -36,7 +36,8 @@ std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk) {
     const std::size_t per_visit_temp = 12 * h * 4 + 3 * h * 2 + (2 * q + std::size_t(c.heads) * (c.d_rel + 1)) * 4 +
                                        4 * (kv + 64) * 4 + 2 * q * 4 + q * 2 + 4 * h * 2 + 4 * h * 4 + 64 * 4 * 2 +
                                        std::size_t(c.experts_per_token) * (c.moe_intermediate + h) * 4 + 4 * c.experts_per_token * 4 +
-                                       ops::moe_route_sigmoid_topk_workspace_bytes(i32(c.experts), 1);
+                                       ops::moe_route_sigmoid_topk_workspace_bytes(i32(c.experts), 1) +
+                                       ops::depth_attention_mix_workspace_bytes(i32(c.hidden_size), 1, ops::kDepthAttentionMaxSources);
     const std::size_t output = std::size_t(c.vocab_size) * 4 + 4 * h * 4;
     const std::size_t per_token = c.num_layer_visits * per_visit_kept + per_visit_temp + output;
     // Each allocation pads to 256 bytes; a visit makes about 60.
@@ -153,13 +154,13 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         if (local) {
             xq = xk = xv = workspace_.alloc(DType::FP32, {h, cols});
             Tensor* outs[] = {&xq};
-            ops::depth_attention_mix(sources, model_.tensor(w.res_query, {h, 1}), eps, outs, stream_);
+            ops::depth_attention_mix(sources, model_.tensor(w.res_query, {h, 1}), eps, workspace_, outs, stream_);
         } else {
             xq = workspace_.alloc(DType::FP32, {h, cols});
             xk = workspace_.alloc(DType::FP32, {h, cols});
             xv = workspace_.alloc(DType::FP32, {h, cols});
             Tensor* outs[] = {&xq, &xk, &xv};
-            ops::depth_attention_mix(sources, model_.tensor(w.res_query, {h, 3}), eps, outs, stream_);
+            ops::depth_attention_mix(sources, model_.tensor(w.res_query, {h, 3}), eps, workspace_, outs, stream_);
         }
     }
     if (messages != nullptr) {
@@ -246,7 +247,7 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     Tensor z = workspace_.alloc(DType::FP32, {h, cols});
     {
         Tensor* outs[] = {&z};
-        ops::depth_attention_mix(sources, model_.tensor(w.ffn_res_query, {h, 1}), eps, outs, stream_);
+        ops::depth_attention_mix(sources, model_.tensor(w.ffn_res_query, {h, 1}), eps, workspace_, outs, stream_);
     }
     if (messages != nullptr) {
         Tensor zc = workspace_.alloc(DType::FP32, {h, cols});
@@ -325,8 +326,8 @@ Tensor TextProgram::forward(std::span<const std::int32_t> tokens, const Trace* t
             sources.push_back(&bank_last);
             Tensor* attn_mlp[] = {&messages[0], &messages[3]};
             Tensor* k_v[]      = {&messages[1], &messages[2]};
-            ops::depth_attention_mix(sources, loop_q.slice(1, 2 * j, 2), c.rms_norm_eps, attn_mlp, stream_);
-            ops::depth_attention_mix(sources, loop_kv.slice(1, 2 * j, 2), c.rms_norm_eps, k_v, stream_);
+            ops::depth_attention_mix(sources, loop_q.slice(1, 2 * j, 2), c.rms_norm_eps, workspace_, attn_mlp, stream_);
+            ops::depth_attention_mix(sources, loop_kv.slice(1, 2 * j, 2), c.rms_norm_eps, workspace_, k_v, stream_);
         }
         cur = visit(v, cur, blocks, has_messages ? messages.data() : nullptr, start, trace);
     }
@@ -339,7 +340,7 @@ Tensor TextProgram::forward(std::span<const std::int32_t> tokens, const Trace* t
     {
         Tensor* outs[] = {&x};
         const Tensor output_query = model_.tensor(model_.weights().output_res_query, {h, 1});
-        ops::depth_attention_mix(sources, output_query, c.rms_norm_eps, outs, stream_);
+        ops::depth_attention_mix(sources, output_query, c.rms_norm_eps, workspace_, outs, stream_);
     }
     const Tensor out_norm = model_.tensor(model_.weights().output_norm, {h});
     ops::rmsnorm_fp32(x, &out_norm, c.rms_norm_eps, x, stream_);
