@@ -7,7 +7,8 @@
 // that continues a prompt with the model's own words (NINFER_DSV4_TOKENS: space-separated ids, default
 // "The capital of France is" with a BOS; NINFER_DSV4_NEW: tokens to generate, default 8; prints them).
 // The expert tiers are set by NINFER_DSV4_RAM_GB (pinned RAM tier, default 8), NINFER_DSV4_VRAM_GB (device frame
-// pool, default 12; 0 has none), NINFER_DSV4_READ_THREADS (parallel preads, default 8) and NINFER_DSV4_ZC
+// pool, default 12; 0 has none), NINFER_DSV4_READ_THREADS (parallel preads, default 1: on a hard disk concurrent reads slow it down about 4x,
+// on a SATA SSD 8 to 16 threads read 1.5x faster) and NINFER_DSV4_ZC
 // (zero-copy misses of the Op, default 0). Prints the time per token and the tier hit counts of each phase
 // (cold decode, a second decode of the same text with the caches warm, and a fixed-routing probe).
 
@@ -102,7 +103,7 @@ int main() {
     dsv4::FileExpertOptions options;
     options.cache_bytes        = static_cast<std::uint64_t>(env_number("NINFER_DSV4_RAM_GB", 8) * double(1ULL << 30));
     options.device_cache_bytes = static_cast<std::uint64_t>(env_number("NINFER_DSV4_VRAM_GB", 12) * double(1ULL << 30));
-    options.read_threads       = static_cast<std::uint32_t>(env_number("NINFER_DSV4_READ_THREADS", 8));
+    options.read_threads       = static_cast<std::uint32_t>(env_number("NINFER_DSV4_READ_THREADS", 1));
     options.zero_copy_misses   = static_cast<std::int32_t>(env_number("NINFER_DSV4_ZC", 0));
     dsv4::FileExpertSource experts(reader, banks, model->config().experts, options);
     cudaStream_t stream = nullptr;
@@ -190,7 +191,7 @@ int main() {
 
     // The same prompt and continuation again with the caches warm: identical tokens, and the speed a
     // repeated workload sees.
-    {
+    for (int pass = 0; pass < 3; ++pass) {
         experts.reset_stats();
         forward.run(prompt, 0);
         cudaStreamSynchronize(stream);
@@ -203,7 +204,7 @@ int main() {
             forward.run(std::span<const std::int32_t>(&tok, 1), pos++);
             tok = forward.argmax();
         }
-        print_tiers("warm decode (same text again)", experts.stats(), seconds_since(start), new_tokens);
+        print_tiers(pass == 0 ? "warm decode, pass 1 (same text again)" : pass == 1 ? "warm decode, pass 2" : "warm decode, pass 3", experts.stats(), seconds_since(start), new_tokens);
         check(again == first_pass, "the second decode of the same text gives the same ids");
         next     = tok;
         position = pos;
@@ -221,7 +222,7 @@ int main() {
         cudaStreamSynchronize(stream);
         const double warm = seconds_since(warm_start);
         const auto& w = experts.stats();
-        print_tiers("fixed-routing probe (same token repeated)", w, warm, warm_steps);
+        print_tiers("probe, same token repeated (routing drifts)", w, warm, warm_steps);
     }
     std::printf("%s", forward.profile_report().c_str());
     if (failures == 0) { std::printf("PASS\n"); }

@@ -434,6 +434,41 @@ int main() {
             std::printf("T=%d prefill chunk, file-backed (warm): %.2f ms per layer\n", kWide, wide_file_ms);
             check(wide_file == wide_device, "file-backed T=512 equals the resident result bit for bit");
 
+            // The same calls through the tiers (a device frame pool, parallel reads): promotion is asynchronous and a
+            // record is read from a frame from the next call on, and every call gives the same bits.
+            {
+                d4::FileExpertOptions tiered_options;
+                tiered_options.device_cache_bytes = 1ULL << 30;
+                tiered_options.read_threads       = 4;
+                tiered_options.zero_copy_misses   = 6;
+                d4::FileExpertSource tiered(reader, banks, kExperts, tiered_options);
+                std::printf("tiered source: %u RAM slots, %u device frames\n", tiered.cache_slots(), tiered.device_frames());
+                check(tiered.device_frames() > 0, "the tiered source has device frames");
+                for (int pass = 0; pass < 4; ++pass) {
+                    tiered.reset_stats();
+                    run_all(tiered, nullptr, mixes);
+                    const auto st = tiered.stats();
+                    check(download_out() == out_device, "tiered source (T=8) equals the resident result bit for bit");
+                    std::printf("tiered T=%d pass %d: %llu VRAM hits, %llu RAM hits, %llu misses, %llu promotions\n", T, pass,
+                                static_cast<unsigned long long>(st.vram_hits), static_cast<unsigned long long>(st.ram_hits),
+                                static_cast<unsigned long long>(st.misses), static_cast<unsigned long long>(st.promotions));
+                    if (pass == 0) { check(st.misses > 0 && st.vram_hits == 0 && st.promotions > 0, "a cold tiered call reads and promotes"); }
+                    if (pass == 3) { check(st.misses == 0 && st.ram_hits == 0 && st.vram_hits > 0, "a promoted record is read from its frame"); }
+                }
+                tiered.reset_stats();
+                reset();
+                d4::HcMixes one = d4::alloc_hc_mixes(mix_arena, params, 1);
+                for (int c = 0; c < T; ++c) {
+                    Tensor R(residual.bytes() + static_cast<std::size_t>(c) * column_bytes, DType::BF16, {kS * kH, 1});
+                    d4::ffn_forward(params, weights, 0, tiered, {R, nullptr, one}, arena, stream);
+                }
+                t::cuda_check(cudaStreamSynchronize(stream), "ffn tiered T=1");
+                check(download_out() == out_device, "tiered source, one column at a time, equals the resident result bit for bit");
+                std::vector<std::uint16_t> wide_tiered;
+                (void)wide_run(tiered, wide_tiered);
+                check(wide_tiered == wide_device, "tiered source (T=512) equals the resident result bit for bit");
+            }
+
             // The Model-bound path: the artifact's own dense weights (the stored FP32 norm rounded once to BF16 by
             // bind_ffn_weights) and the file-backed experts give the fixture-weight result bit for bit.
             ninfer::DeviceContext device_context(0);
