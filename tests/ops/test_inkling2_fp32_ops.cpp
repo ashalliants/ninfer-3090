@@ -463,6 +463,20 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
                                                   nullptr);
     }
     {
+        // A gated BF16 out without storage is refused before the launch (the caches are not appended to).
+        const int len  = std::min(chunk, n);
+        const Tensor gate = dg.tensor({qw, n}).slice(1, 0, len);
+        Tensor no_out(nullptr, DType::BF16, {qw, len});
+        bool refused = false;
+        try {
+            ninfer::ops::relative_bias_sink_attention({heads, kvh, d, rel, window}, dq.tensor({qw, n}).slice(1, 0, len),
+                                                      dr.tensor({heads * rel, n}).slice(1, 0, len), ds.tensor({heads, n}).slice(1, 0, len),
+                                                      dk.tensor({kvw, n}).slice(1, 0, len), dv.tensor({kvw, n}).slice(1, 0, len),
+                                                      dt.tensor({rel, extent}), tkc2, tvc2, 0, nullptr, &gate, no_out, nullptr);
+        } catch (const std::invalid_argument&) { refused = true; }
+        check(refused, "relative_bias_sink_attention takes a BF16 out without storage");
+    }
+    {
         Tensor tw(want_gated.p, DType::BF16, {qw, n});
         ninfer::ops::sigmoid_gate_fp32(out.tensor({qw, n}), dg.tensor({qw, n}), tw, nullptr);
         std::vector<std::uint16_t> a(static_cast<std::size_t>(qw) * n), b(a.size());
@@ -532,6 +546,19 @@ void test_route() {
         const bool z_same = std::memcmp(a.data(), b.data(), a.size() * 4) == 0, w_same = std::memcmp(wa.data(), wb.data(), wa.size() * 4) == 0;
         const bool ids_same = t::from_device<std::int32_t>(ids2.b, kk * cols) == t::from_device<std::int32_t>(ids3.b, kk * cols);
         check(z_same && w_same && ids_same, "moe_route_sigmoid_topk with its input norm differs from rmsnorm_fp32 then routing");
+        // Refused before any launch: a norm weight without storage, and a normalized z that partly overlaps z.
+        const auto route_refuses = [&](const Tensor& in, const ninfer::ops::RouteInputNorm& bad) {
+            try {
+                ninfer::ops::moe_route_sigmoid_topk(in, &bad, drt.tensor({rows, experts}), dbs.tensor({experts}), kk, 8.0F, arena2, ti2,
+                                                    tw2, nullptr);
+            } catch (const std::invalid_argument&) { return true; }
+            return false;
+        };
+        const Tensor no_gain(nullptr, DType::FP32, {rows});
+        check(route_refuses(dx.tensor({rows, cols}), {&no_gain, 1e-6F, &tzn}), "moe_route_sigmoid_topk takes a null norm weight");
+        Tensor shifted = tzn;
+        shifted.data   = static_cast<float*>(zn.b.p) + 1; // one element into z: never read, the Op refuses first
+        check(route_refuses(tzn, {&tg, 1e-6F, &shifted}), "moe_route_sigmoid_topk takes a normalized z overlapping z");
         std::printf("moe_route_sigmoid_topk D %d E %d with the input norm: the bits of rmsnorm_fp32, then routing\n", rows, experts);
     }
 

@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace ninfer::ops {
 namespace {
@@ -34,6 +35,22 @@ std::int64_t column_stride(const Tensor& t, std::int32_t rows, std::int32_t cols
     require(t.ne[0] == rows && t.ne[1] == cols && t.ne[2] == 1 && t.ne[3] == 1, op, (std::string(name) + " has the wrong shape").c_str());
     require(t.nb[0] == 4 && t.nb[1] % 4 == 0 && (cols == 1 || t.nb[1] >= rows * 4), op, (std::string(name) + ": bad layout").c_str());
     return cols == 1 ? rows : t.nb[1] / 4;
+}
+
+// The bytes a tensor's elements span, from its first to one past its last (its strides, not its padding at the end).
+std::pair<std::uintptr_t, std::uintptr_t> byte_span(const Tensor& t) {
+    const auto begin = reinterpret_cast<std::uintptr_t>(t.data);
+    std::uintptr_t last = begin;
+    for (int d = 0; d < 4; ++d) {
+        if (t.ne[d] > 1) { last += static_cast<std::uintptr_t>(t.ne[d] - 1) * static_cast<std::uintptr_t>(t.nb[d]); }
+    }
+    return {begin, last + dtype_size(t.dtype)};
+}
+
+bool overlaps(const Tensor& a, const Tensor& b) {
+    const auto [a0, a1] = byte_span(a);
+    const auto [b0, b1] = byte_span(b);
+    return a0 < b1 && b0 < a1;
 }
 
 __device__ float warp_sum(float v) {
@@ -889,12 +906,17 @@ void moe_route_sigmoid_topk(const Tensor& z, const RouteInputNorm* norm, const T
     const auto scope = workspace.scope();
     float* scores = static_cast<float*>(workspace.alloc_bytes(static_cast<std::size_t>(experts) * cols * 4).data);
     if (norm != nullptr) {
-        require(norm->weight != nullptr && norm->weight->dtype == DType::FP32 && norm->weight->is_contiguous() && norm->weight->numel() == rows,
+        require(norm->weight != nullptr && norm->weight->data != nullptr && norm->weight->dtype == DType::FP32 &&
+                    norm->weight->is_contiguous() && norm->weight->numel() == rows,
                 op, "the norm weight must be FP32 [D]");
         require(norm->eps > 0.0F, op, "eps must be positive");
-        require(norm->z != nullptr && norm->z->data != z.data, op, "the normalized z must not be x");
+        require(norm->z != nullptr, op, "the normalized z is missing");
+        const std::int64_t norm_stride = column_stride(*norm->z, rows, cols, op, "the normalized z");
+        // The score blocks read z while others write the normalized z, and the selection writes ids and weights.
+        require(!overlaps(*norm->z, z) && !overlaps(*norm->z, ids) && !overlaps(*norm->z, weights), op,
+                "the normalized z must not overlap z, ids or weights");
         const RouteNorm n{static_cast<const float*>(norm->weight->data), norm->eps, static_cast<float*>(norm->z->data),
-                          column_stride(*norm->z, rows, cols, op, "z")};
+                          norm_stride};
         route_score_kernel<true><<<dim3(cols, experts), kScoreThreads, 0, stream>>>(
             static_cast<const float*>(z.data), zs, static_cast<const float*>(router.data), rows, experts, n, scores);
     } else {

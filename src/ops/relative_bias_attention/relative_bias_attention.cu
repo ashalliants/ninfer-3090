@@ -337,6 +337,7 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     a.ss = column_stride(sink, s.heads, cols, op, "sink");
     require(out.dtype == DType::FP32 || (gate != nullptr && out.dtype == DType::BF16), op, "out must be FP32, or BF16 with a gate");
     if (out.dtype == DType::BF16) {
+        require(out.data != nullptr, op, "out has no storage");
         require(out.ne[0] == width && out.ne[1] == cols && out.ne[2] == 1 && out.ne[3] == 1 && out.nb[0] == 2 && out.nb[1] % 2 == 0 &&
                     (cols == 1 || out.nb[1] >= width * 2),
                 op, "out has the wrong shape or layout");
