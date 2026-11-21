@@ -1123,6 +1123,8 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             throw std::invalid_argument("MTP draft window must be in [1,15]");
         }
         break;
+    case SpeculativeBackend::DSpark:
+        throw std::invalid_argument("--spec dspark is Inkling-2's DSpark drafter");
     case SpeculativeBackend::DFlash:
     case SpeculativeBackend::DFlash2:
         if (!parameters.draft || (options.speculative.backend == SpeculativeBackend::DFlash2) !=

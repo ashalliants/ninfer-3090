@@ -26,6 +26,16 @@ public:
     DSparkProgram& operator=(const DSparkProgram&) = delete;
 
     void reset() noexcept { position_ = 0; }
+
+    // The drafter's state at position() (prefix reuse, as TextProgram::Snapshot): its sliding layers' rings and the
+    // anchor context. The global layers' rings are indexed by position and not copied.
+    struct Snapshot {
+        DeviceBuffer memory;        // snapshot_bytes()
+        std::int64_t position = -1; // -1: holds nothing
+    };
+    [[nodiscard]] std::size_t snapshot_bytes() const;
+    void save(Snapshot& snapshot) const;
+    void restore(const Snapshot& snapshot);
     // Target positions committed so far; the next anchor sits here.
     [[nodiscard]] std::int64_t position() const noexcept { return position_; }
     // The target visits whose hidden states extend() takes, in order (the TextProgram's tap_visits).

@@ -434,7 +434,7 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
   no grammar engine (output constraints are refused for the same reason). A call's name and arguments are what
   the model wrote; malformed JSON stays content. `parallel_tool_calls: false` ends the request at the first
   complete call (finish reason stop token, as the model's end token would).
-- A server without `--vision` binds and uploads no vision tower.
+- A server without `--vision` binds and uploads no vision tower, and one without `--spec dspark` no drafter.
 
 **Output.** Control tokens switch the channel, as `tokenizer_config.json`'s `response_template` describes:
 
@@ -469,7 +469,7 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
   from there needs (`TextProgram::save`: every sliding visit's last 1023 K/V columns and every visit's convolution
   histories, 335 MB; the global caches are indexed by position and stay valid). A next prompt whose first positions
   are the same (token ids, and images by a hash of their pixels) restores it and prefills only the rest, in the same
-  chunks a prefill from 0 runs, so the output is unchanged. Images wholly in the reused prefix are not encoded. The
+  chunks a prefill from 0 runs, so the output is unchanged. With `--spec dspark` the drafter's sliding rings and anchor context are kept with it (`DSparkProgram::save`). Images wholly in the reused prefix are not encoded. The
   result reports `reused_prompt_tokens`. One snapshot is kept; a prompt that does not resume from it replaces it (or clears it, when shorter than 257 tokens).
   - DSpark is 2.2x slower than plain decode in the correctness-first build (see "DSpark drafter"), so the
     server does not use it.

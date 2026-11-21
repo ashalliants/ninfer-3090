@@ -688,6 +688,9 @@ private:
         options.context_cache.host_capacity_bytes = 0;
         // One worker runs one request at a time; the rest wait in its max_pending_requests queue.
         options.max_concurrency = 1;
+        if (options.speculative.backend != SpeculativeBackend::None && options.speculative.backend != SpeculativeBackend::DSpark) {
+            throw std::invalid_argument("Inkling-2 speculates with its DSpark drafter only (--spec dspark)");
+        }
         auto generation   = std::make_unique<Inkling2Core>(options, device);
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         load              = generation->load_summary();

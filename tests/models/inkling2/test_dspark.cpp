@@ -210,6 +210,40 @@ int main() {
             }
         }
         if (rounds == 0) { throw std::runtime_error("no prompts"); }
+        {
+            // Snapshots (prefix reuse): restored after more tokens went in, the target and the drafter continue as at
+            // the save: the same next tokens and the same drafts.
+            std::ifstream meta_file(fs::path(golden_root) / "p0" / "tokens.json");
+            std::stringstream text;
+            text << meta_file.rdbuf();
+            const auto prompt = ninfer::artifact::Json::parse(text.str()).at("tokens").get<std::vector<std::int32_t>>();
+            target.reset();
+            drafter.reset();
+            const std::int32_t anchor = greedy(target.forward(prompt), vocab, ids, stream).back();
+            std::vector<ninfer::Tensor> taps;
+            for (std::size_t i = 0; i < dc.target_visits.size(); ++i) { taps.push_back(target.tap(i)); }
+            drafter.extend(taps, static_cast<std::int32_t>(prompt.size()));
+            ink::TextProgram::Snapshot target_snapshot{ninfer::DeviceBuffer(target.snapshot_bytes())};
+            ink::DSparkProgram::Snapshot drafter_snapshot{ninfer::DeviceBuffer(drafter.snapshot_bytes())};
+            target.save(target_snapshot);
+            drafter.save(drafter_snapshot);
+            const auto drafts_before = drafter.draft(anchor, block - 1);
+            const std::int32_t one[] = {anchor};
+            const auto next_before   = greedy(target.forward(one), vocab, ids, stream).back();
+            // More tokens into both, then back.
+            const auto noise = std::vector<std::int32_t>(prompt.begin(), prompt.begin() + std::min<std::size_t>(prompt.size(), 16));
+            (void)target.forward(noise);
+            taps.clear();
+            for (std::size_t i = 0; i < dc.target_visits.size(); ++i) { taps.push_back(target.tap(i)); }
+            drafter.extend(taps, static_cast<std::int32_t>(noise.size()));
+            target.restore(target_snapshot);
+            drafter.restore(drafter_snapshot);
+            const auto drafts_after = drafter.draft(anchor, block - 1);
+            const auto next_after   = greedy(target.forward(one), vocab, ids, stream).back();
+            const bool same = drafts_after == drafts_before && next_after == next_before && target.position() == static_cast<std::int64_t>(prompt.size()) + 1;
+            std::printf("snapshot restore: %s\n", same ? "the same drafts and next token" : "DIFFERENT");
+            if (!same) { ++failures; }
+        }
         std::printf("plain greedy: %.2f tok/s; speculative: %.2f tok/s (%.2f drafts accepted per round, %.1f%% of the time drafting)\n",
                     generated / plain_seconds, generated / spec_seconds, double(accepted) / rounds, 100 * draft_seconds / spec_seconds);
         std::printf("per round: draft %.2f ms, verify %.2f ms; plain step %.2f ms\n", 1e3 * draft_seconds / rounds,

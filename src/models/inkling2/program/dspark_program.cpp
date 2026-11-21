@@ -3,6 +3,7 @@
 
 #include "models/inkling2/program/dspark_program.h"
 
+#include "core/copy_batch.h"
 #include "ninfer/ops/cast.h"
 #include "ninfer/ops/dspark_fp32.h"
 #include "ninfer/ops/fp32_rows.h"
@@ -264,6 +265,48 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t
          "drafts");
     cuda(cudaStreamSynchronize(stream_), "draft");
     return drafts;
+}
+
+std::size_t DSparkProgram::snapshot_bytes() const {
+    std::size_t total = joint_in_.bytes();
+    for (std::size_t i = 0; i < layers_.size(); ++i) {
+        if (config_.local[i]) { total += layers_[i].k_ring.bytes() + layers_[i].v_ring.bytes(); }
+    }
+    return total;
+}
+
+void DSparkProgram::save(Snapshot& snapshot) const {
+    if (snapshot.memory.bytes < snapshot_bytes()) { throw std::invalid_argument("dspark: the snapshot is too small"); }
+    auto* out = static_cast<std::byte*>(snapshot.memory.p);
+    CopyBatch copies(stream_);
+    copies.add(out, joint_in_.data, joint_in_.bytes());
+    out += joint_in_.bytes();
+    for (std::size_t i = 0; i < layers_.size(); ++i) {
+        if (!config_.local[i]) { continue; }
+        for (const Tensor* t : {&layers_[i].k_ring, &layers_[i].v_ring}) {
+            copies.add(out, t->data, t->bytes());
+            out += t->bytes();
+        }
+    }
+    copies.flush();
+    snapshot.position = position_;
+}
+
+void DSparkProgram::restore(const Snapshot& snapshot) {
+    if (snapshot.position < 0) { throw std::invalid_argument("dspark: an empty snapshot"); }
+    const auto* in = static_cast<const std::byte*>(snapshot.memory.p);
+    CopyBatch copies(stream_);
+    copies.add(joint_in_.data, in, joint_in_.bytes());
+    in += joint_in_.bytes();
+    for (std::size_t i = 0; i < layers_.size(); ++i) {
+        if (!config_.local[i]) { continue; }
+        for (const Tensor* t : {&layers_[i].k_ring, &layers_[i].v_ring}) {
+            copies.add(t->data, in, t->bytes());
+            in += t->bytes();
+        }
+    }
+    copies.flush();
+    position_ = snapshot.position;
 }
 
 } // namespace ninfer::models::inkling2

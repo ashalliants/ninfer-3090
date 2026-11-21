@@ -12,6 +12,7 @@ namespace ninfer::product {
     if (value == "mtp") { return SpeculativeBackend::Mtp; }
     if (value == "dflash") { return SpeculativeBackend::DFlash; }
     if (value == "dflash2") { return SpeculativeBackend::DFlash2; }
+    if (value == "dspark") { return SpeculativeBackend::DSpark; }
     throw std::invalid_argument("invalid speculative backend: " + std::string(value));
 }
 
@@ -25,6 +26,8 @@ namespace ninfer::product {
         return "dflash";
     case SpeculativeBackend::DFlash2:
         return "dflash2";
+    case SpeculativeBackend::DSpark:
+        return "dspark";
     }
     return "unknown";
 }
@@ -101,6 +104,14 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     case SpeculativeBackend::DFlash2:
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
             throw std::invalid_argument("--spec dflash2 requires --draft-tokens in [1,15]");
+        }
+        return;
+    case SpeculativeBackend::DSpark:
+        if (options.draft_tokens == 0 || options.draft_tokens > 7) {
+            throw std::invalid_argument("--spec dspark requires --draft-tokens in [1,7] (3 is the measured best on a V100)");
+        }
+        if (options.ngram_draft_tokens != 0 || options.adaptive_draft_tokens != 0) {
+            throw std::invalid_argument("--spec dspark takes no n-gram or adaptive draft windows");
         }
         return;
     }

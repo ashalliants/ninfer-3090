@@ -239,7 +239,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--no-exit-on-engine-failure] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] "
-           "[--spec mtp|dflash|dflash2 --draft-tokens N] "
+           "[--spec mtp|dflash|dflash2|dspark --draft-tokens N] "
            "[--ngram-draft-tokens 0|15] [--ngram-min-match N] [--adaptive-draft-tokens 0|3] "
            "[--relaxed-drafting [P]] [--draft-context-rows N] "
            "[--default-max-tokens N] [--max-output-tokens N] [--default-thinking-budget N] "

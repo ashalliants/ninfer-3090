@@ -81,6 +81,8 @@ struct LoadOptions {
             return "dflash";
         case SpeculativeBackend::DFlash2:
             return "dflash2";
+        case SpeculativeBackend::DSpark:
+            return "dspark";
         }
         return {};
     }
