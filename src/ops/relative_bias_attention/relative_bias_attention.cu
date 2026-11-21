@@ -39,7 +39,8 @@ __device__ float warp_sum(float v) {
 
 // One warp per (head, column).
 __global__ void clip_kernel(float* x, std::int64_t xs, int head_dim, int heads, const float* __restrict__ scale, float threshold,
-                            std::int64_t start, std::int64_t floor, float alpha, bool log_scale) {
+                            std::int64_t start, const std::int64_t* start_offset, std::int64_t floor, float alpha,
+                            bool log_scale) {
     const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
     float* v = x + t * xs + static_cast<std::int64_t>(h) * head_dim;
     float local[8];
@@ -54,7 +55,7 @@ __global__ void clip_kernel(float* x, std::int64_t xs, int head_dim, int heads, 
     }
     float f = fminf(1.0F, threshold / (sqrtf(warp_sum(ss)) + 1e-6F));
     if (log_scale) {
-        const double pos = static_cast<double>(start + t);
+        const double pos = static_cast<double>(start + (start_offset != nullptr ? *start_offset : 0) + t);
         f *= static_cast<float>(1.0 + alpha * log(fmax(1.0, (pos + 1.0) / static_cast<double>(floor))));
     }
     for (int i = 0; i < 8; ++i) {
@@ -72,11 +73,12 @@ __global__ void unit_rms_kernel(float* x, std::int64_t xs, int head_dim, float e
     for (int d = lane; d < head_dim; d += 32) { v[d] *= inv; }
 }
 
-__global__ void append_kernel(const float* __restrict__ src, std::int64_t ss, int rows, std::int64_t start, std::int64_t capacity,
-                              float* __restrict__ cache) {
+__global__ void append_kernel(const float* __restrict__ src, std::int64_t ss, int rows, std::int64_t start,
+                              const std::int64_t* start_offset, std::int64_t capacity, float* __restrict__ cache) {
     const int t = blockIdx.y, d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= rows) { return; }
-    cache[((start + t) % capacity) * rows + d] = src[t * ss + d];
+    const std::int64_t first = start + (start_offset != nullptr ? *start_offset : 0);
+    cache[((first + t) % capacity) * rows + d] = src[t * ss + d];
 }
 
 struct AttentionArgs {
@@ -85,6 +87,7 @@ struct AttentionArgs {
     float* out;
     int heads, group, d_rel, extent, window;
     std::int64_t start, capacity, kv_width;
+    const std::int64_t* start_offset;
 };
 
 // One block per (head, column): four warps score a tile of keys into shared memory, then every thread folds
@@ -98,7 +101,7 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(AttentionArgs a) {
     q[threadIdx.x] = a.q[t * a.qs + static_cast<std::int64_t>(h) * kHeadDim + threadIdx.x];
     if (threadIdx.x < a.d_rel) { r[threadIdx.x] = a.r[t * a.rs + static_cast<std::int64_t>(h) * a.d_rel + threadIdx.x]; }
     __syncthreads();
-    const std::int64_t pos = a.start + t;
+    const std::int64_t pos = a.start + (a.start_offset != nullptr ? *a.start_offset : 0) + t;
     const std::int64_t lo  = a.window > 0 ? (pos - a.window + 1 > 0 ? pos - a.window + 1 : 0) : 0;
     const float inv_sqrt_d = rsqrtf(static_cast<float>(kHeadDim));
     float m     = a.sink[t * a.ss + h];
@@ -152,7 +155,9 @@ void head_l2_clip_fp32(Tensor& x, int head_dim, const Tensor* scale, float thres
     const dim3 grid(heads, x.ne[1]);
     clip_kernel<<<grid, 32, 0, stream>>>(static_cast<float*>(x.data), xs, head_dim, heads,
                                          scale != nullptr ? static_cast<const float*>(scale->data) : nullptr, threshold,
-                                         log_scale != nullptr ? log_scale->start : 0, log_scale != nullptr ? log_scale->floor : 1,
+                                         log_scale != nullptr ? log_scale->start : 0,
+                                         log_scale != nullptr ? log_scale->start_offset : nullptr,
+                                         log_scale != nullptr ? log_scale->floor : 1,
                                          log_scale != nullptr ? log_scale->alpha : 0.0F, log_scale != nullptr);
     check_launch(op);
 }
@@ -169,7 +174,7 @@ void head_unit_rms_fp32(Tensor& x, int head_dim, float eps, cudaStream_t stream)
 
 void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Tensor& q, const Tensor& r, const Tensor& sink,
                                   const Tensor& k_new, const Tensor& v_new, const Tensor& table, Tensor& k_cache, Tensor& v_cache,
-                                  std::int64_t start, Tensor& out, cudaStream_t stream) {
+                                  std::int64_t start, const std::int64_t* start_offset, Tensor& out, cudaStream_t stream) {
     const char* op = "relative_bias_sink_attention";
     require(s.head_dim == kHeadDim, op, "head_dim must be 128");
     require(s.d_rel > 0 && s.d_rel <= kMaxRel, op, "d_rel must be 1..32");
@@ -191,9 +196,9 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     const std::int64_t capacity = k_cache.ne[1];
     require(s.window > 0 ? capacity >= s.window - 1 + cols : capacity >= start + cols, op, "the KV ring cannot hold the visible keys");
     const dim3 append_grid((kv_width + 255) / 256, cols);
-    append_kernel<<<append_grid, 256, 0, stream>>>(static_cast<const float*>(k_new.data), ks, kv_width, start, capacity,
+    append_kernel<<<append_grid, 256, 0, stream>>>(static_cast<const float*>(k_new.data), ks, kv_width, start, start_offset, capacity,
                                                    static_cast<float*>(k_cache.data));
-    append_kernel<<<append_grid, 256, 0, stream>>>(static_cast<const float*>(v_new.data), vs, kv_width, start, capacity,
+    append_kernel<<<append_grid, 256, 0, stream>>>(static_cast<const float*>(v_new.data), vs, kv_width, start, start_offset, capacity,
                                                    static_cast<float*>(v_cache.data));
     check_launch(op);
     a.q = static_cast<const float*>(q.data);
@@ -209,6 +214,7 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     a.extent = table.ne[1];
     a.window = s.window;
     a.start = start;
+    a.start_offset = start_offset;
     a.capacity = capacity;
     a.kv_width = kv_width;
     attention_kernel<<<dim3(s.heads, cols), kThreads, 0, stream>>>(a);

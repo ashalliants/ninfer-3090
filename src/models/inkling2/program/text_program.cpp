@@ -85,7 +85,9 @@ TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t 
     reset();
 }
 
-TextProgram::~TextProgram() = default;
+TextProgram::~TextProgram() {
+    if (decode_graph_ != nullptr) { cudaGraphExecDestroy(decode_graph_); }
+}
 
 void TextProgram::reset() {
     for (auto& s : state_) {
@@ -210,7 +212,7 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     }
 
     // 3f: clips, value norm, log scaling of the global layers' q and r.
-    const ops::PositionLogScale tau{start, c.log_scaling_n_floor, c.log_scaling_alpha};
+    const ops::PositionLogScale tau{start, c.log_scaling_n_floor, c.log_scaling_alpha, start_offset_};
     const Tensor q_clip = model_.tensor(w.q_clip, {d, heads}), rel_clip = model_.tensor(w.rel_clip, {i32(c.d_rel), heads});
     ops::head_l2_clip_fp32(q_t, d, &q_clip, c.qk_clip, local ? nullptr : &tau, stream_);
     ops::head_l2_clip_fp32(r_t, i32(c.d_rel), &rel_clip, c.rel_clip, local ? nullptr : &tau, stream_);
@@ -221,7 +223,7 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     ops::RelativeBiasAttentionShape shape{heads, i32(c.kv_heads), d, i32(c.d_rel), local ? i32(c.sliding_window) : 0};
     Tensor o = workspace_.alloc(DType::FP32, {q, cols});
     const Tensor rel_bias = model_.tensor(w.rel_bias, {i32(c.d_rel), i32(c.rel_extent_of(p))});
-    ops::relative_bias_sink_attention(shape, q_t, r_t, sink, kconv, vconv, rel_bias, st.k_cache, st.v_cache, start, o, stream_);
+    ops::relative_bias_sink_attention(shape, q_t, r_t, sink, kconv, vconv, rel_bias, st.k_cache, st.v_cache, start, start_offset_, o, stream_);
     Tensor gated = workspace_.alloc(DType::BF16, {q, cols});
     ops::sigmoid_gate_fp32(o, gate, gated, stream_);
     const WeightId ow[] = {w.output};
@@ -284,14 +286,63 @@ Tensor TextProgram::forward(std::span<const std::int32_t> tokens, const Trace* t
     for (const auto token : tokens) {
         if (token < 0 || static_cast<std::uint32_t>(token) >= c.unpadded_vocab_size) { throw std::invalid_argument("inkling2: token id out of range"); }
     }
+    const bool tracing = trace != nullptr && *trace;
+    if (cols == 1 && !tracing && limits_.decode_graph && stream_ != nullptr) { return forward_graph(tokens[0]); }
     workspace_.reset();
-    const std::int64_t start = position_;
-
-    // 1: embedding and its norm.
     Tensor ids = workspace_.alloc(DType::I32, {cols});
     if (cudaMemcpyAsync(ids.data, tokens.data(), tokens.size_bytes(), cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
         throw std::runtime_error("inkling2: token upload failed");
     }
+    Tensor logits = run(ids, position_, trace);
+    position_ += cols;
+    return logits;
+}
+
+Tensor TextProgram::forward_graph(std::int32_t token) {
+    struct Step {
+        std::int64_t position;
+        std::int32_t token, pad;
+    };
+    const Step host{position_, token, 0};
+    if (step_.bytes == 0) { step_ = DeviceBuffer(sizeof(Step)); }
+    // From pageable memory: the copy is staged before the call returns, so `host` may go out of scope.
+    if (cudaMemcpyAsync(step_.p, &host, sizeof host, cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
+        throw std::runtime_error("inkling2: step upload failed");
+    }
+    if (decode_graph_ == nullptr) {
+        workspace_.reset();
+        const Tensor ids(static_cast<char*>(step_.p) + offsetof(Step, token), DType::I32, {1});
+        if (cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+            throw std::runtime_error("inkling2: cannot capture the decode graph");
+        }
+        start_offset_ = static_cast<const std::int64_t*>(step_.p);
+        cudaGraph_t graph = nullptr;
+        try {
+            graph_logits_ = run(ids, 0, nullptr);
+        } catch (...) {
+            start_offset_ = nullptr;
+            if (cudaStreamEndCapture(stream_, &graph) == cudaSuccess && graph != nullptr) { cudaGraphDestroy(graph); }
+            throw;
+        }
+        start_offset_ = nullptr;
+        if (cudaStreamEndCapture(stream_, &graph) != cudaSuccess) { throw std::runtime_error("inkling2: decode graph capture failed"); }
+        const cudaError_t made = cudaGraphInstantiate(&decode_graph_, graph, 0);
+        cudaGraphDestroy(graph);
+        if (made != cudaSuccess) {
+            decode_graph_ = nullptr;
+            throw std::runtime_error(std::string("inkling2: cannot instantiate the decode graph: ") + cudaGetErrorString(made));
+        }
+    }
+    if (cudaGraphLaunch(decode_graph_, stream_) != cudaSuccess) { throw std::runtime_error("inkling2: decode graph launch failed"); }
+    position_ += 1;
+    return graph_logits_;
+}
+
+Tensor TextProgram::run(const Tensor& ids, std::int64_t start, const Trace* trace) {
+    const TextConfig& c = config_;
+    const std::int32_t cols = ids.ne[0], h = i32(c.hidden_size);
+
+    // 1: embedding and its norm.
     Tensor cur = workspace_.alloc(DType::FP32, {h, cols});
     ops::embedding_bf16_fp32(ids, model_.tensor(model_.weights().embedding, {h, i32(c.vocab_size)}), cur, stream_);
     const Tensor embed_norm = model_.tensor(model_.weights().embedding_norm, {h});
@@ -354,7 +405,6 @@ Tensor TextProgram::forward(std::span<const std::int32_t> tokens, const Trace* t
     const std::int32_t head_rows[] = {i32(c.vocab_size)};
     Tensor logits = project(xb, head, head_rows);
     ops::tanh_softcap_fp32(logits, c.final_logit_softcap, logits, stream_);
-    position_ += cols;
     return logits;
 }
 

@@ -12,11 +12,14 @@
 
 namespace ninfer::ops {
 
-/// tau(pos) = 1 + alpha * ln(max(1, (pos + 1) / floor)) for column t at pos = start + t.
+/// tau(pos) = 1 + alpha * ln(max(1, (pos + 1) / floor)) for column t at pos = start + t, where start is
+/// `start` plus, when `start_offset` is not null, the device value *start_offset (read when the kernel runs, so a
+/// captured graph serves every decode step).
 struct PositionLogScale {
-    std::int64_t start = 0;
-    std::int64_t floor = 1;
-    float alpha        = 0.0F;
+    std::int64_t start               = 0;
+    std::int64_t floor               = 1;
+    float alpha                      = 0.0F;
+    const std::int64_t* start_offset = nullptr;
 };
 
 /**
@@ -64,18 +67,21 @@ struct RelativeBiasAttentionShape {
  * Supported domain:
  *   d = 128; d_rel at most 32; heads a multiple of kv_heads; columns at any stride. The ring must hold every
  *   key a column of this call can see: capacity >= window - 1 + T with a window, capacity >= start + T without.
- *   Positions before `start` must have been appended by earlier calls (the caller's sequence order).
+ *   Positions before `start` must have been appended by earlier calls (the caller's sequence order). With a
+ *   `start_offset` (a device int64, nullable) the start is start + *start_offset, read when the kernels run; the
+ *   ring bound is then the caller's to keep (the host check sees only `start`).
  *
  * Numeric:
  *   FP32 scores and max-subtracted online softmax with the sink as the initial maximum; oracle FP64
  *   (inkling2_reference.h attention, relative_bias).
  *
  * Effects: writes the T new cache slots and out. out must not overlap any input or cache.
- * Workspace: none. Execution: stream-ordered; graph capturable for a fixed start (start is a host value).
+ * Workspace: none. Execution: stream-ordered; graph capturable (one graph for every position with
+ *   `start_offset`).
  */
 void relative_bias_sink_attention(const RelativeBiasAttentionShape& shape, const Tensor& q, const Tensor& r,
                                   const Tensor& sink, const Tensor& k_new, const Tensor& v_new, const Tensor& table,
-                                  Tensor& k_cache, Tensor& v_cache, std::int64_t start, Tensor& out,
-                                  cudaStream_t stream);
+                                  Tensor& k_cache, Tensor& v_cache, std::int64_t start,
+                                  const std::int64_t* start_offset, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops

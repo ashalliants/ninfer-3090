@@ -23,6 +23,9 @@ namespace ninfer::models::inkling2 {
 struct ProgramLimits {
     std::int32_t max_context = 8192; // positions a sequence may reach (sizes the global KV rings)
     std::int32_t max_chunk   = 256;  // tokens per forward call
+    // A single-token forward without a trace replays one CUDA graph, captured on the first such call (the
+    // position and token are read on the device). Needs a stream other than the legacy default one.
+    bool decode_graph = true;
 };
 
 class TextProgram {
@@ -52,6 +55,8 @@ private:
         Tensor k_hist, v_hist, attn_hist, mlp_hist;    // FP32 [C, K - 1]
     };
 
+    Tensor run(const Tensor& ids, std::int64_t start, const Trace* trace); // the forward after the token upload
+    Tensor forward_graph(std::int32_t token);
     Tensor visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor>& blocks, const Tensor* messages, std::int64_t start,
                  const Trace* trace);
     void control(const ControllerWeights& w, const Tensor& c, const Tensor& m, Tensor& out);
@@ -65,6 +70,12 @@ private:
     DeviceArena workspace_;
     std::vector<VisitState> state_;
     std::int64_t position_ = 0;
+    // The decode graph: step_ holds {int64 position, int32 token} it reads; start_offset_ points at that position
+    // while the graph is captured (the Ops add it to their host start of 0), and is null otherwise.
+    DeviceBuffer step_;
+    cudaGraphExec_t decode_graph_ = nullptr;
+    Tensor graph_logits_;
+    const std::int64_t* start_offset_ = nullptr;
 };
 
 } // namespace ninfer::models::inkling2

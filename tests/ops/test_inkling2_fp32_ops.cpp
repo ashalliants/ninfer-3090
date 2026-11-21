@@ -229,7 +229,11 @@ void test_clips() {
     Buf dx(x), ds(scale);
     Tensor tx = dx.tensor({heads * d, cols});
     const Tensor ts = ds.tensor({d, heads});
-    const ninfer::ops::PositionLogScale tau{20000, 8192, 0.1F};
+    // Position 20000 as a host start of 19000 plus a device offset of 1000.
+    const std::int64_t offset = 1000;
+    ninfer::DeviceBuffer doff(sizeof offset);
+    check(cudaMemcpy(doff.p, &offset, sizeof offset, cudaMemcpyHostToDevice) == cudaSuccess, "offset upload");
+    const ninfer::ops::PositionLogScale tau{19000, 8192, 0.1F, static_cast<const std::int64_t*>(doff.p)};
     ninfer::ops::head_l2_clip_fp32(tx, d, &ts, 16.0F * std::sqrt(2.0F), &tau, nullptr);
     Vec want;
     for (int c = 0; c < cols; ++c)
@@ -253,7 +257,8 @@ void test_clips() {
 }
 
 // Positions 0..n-1 through relative_bias_sink_attention in calls of `chunk`, against the oracle over the whole sequence.
-void test_attention(int window, int extent, int n, int chunk, const std::string& label) {
+// With device_start each call passes start 0 and the position as the device offset (how a decode graph runs).
+void test_attention(int window, int extent, int n, int chunk, const std::string& label, bool device_start = false) {
     const int heads = 24, kvh = 8, d = 128, rel = 16, qw = heads * d, kvw = kvh * d;
     auto q = randoms(qw * n, -0.3F, 0.3F), r = randoms(heads * rel * n), sink = randoms(heads * n, -2, 2), k = randoms(kvw * n),
          v = randoms(kvw * n), table = randoms(extent * rel, -0.5, 0.5);
@@ -261,13 +266,19 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
     Buf dq(q), dr(r), ds(sink), dk(k), dv(v), dt(table), kc(static_cast<std::size_t>(kvw * capacity)),
         vc(static_cast<std::size_t>(kvw * capacity)), out(static_cast<std::size_t>(qw * n));
     Tensor tkc = kc.tensor({kvw, capacity}), tvc = vc.tensor({kvw, capacity});
+    ninfer::DeviceBuffer doff(sizeof(std::int64_t));
     for (int s = 0; s < n; s += chunk) {
         const int len = std::min(chunk, n - s);
+        const std::int64_t position = s;
+        if (device_start) {
+            check(cudaMemcpy(doff.p, &position, sizeof position, cudaMemcpyHostToDevice) == cudaSuccess, "offset upload");
+        }
         Tensor to = out.tensor({qw, n}).slice(1, s, len);
         ninfer::ops::relative_bias_sink_attention({heads, kvh, d, rel, window}, dq.tensor({qw, n}).slice(1, s, len),
                                                   dr.tensor({heads * rel, n}).slice(1, s, len), ds.tensor({heads, n}).slice(1, s, len),
                                                   dk.tensor({kvw, n}).slice(1, s, len), dv.tensor({kvw, n}).slice(1, s, len),
-                                                  dt.tensor({rel, extent}), tkc, tvc, s, to, nullptr);
+                                                  dt.tensor({rel, extent}), tkc, tvc, device_start ? 0 : s,
+                                                  device_start ? static_cast<const std::int64_t*>(doff.p) : nullptr, to, nullptr);
     }
     Vec want;
     for (int p = 0; p < n; ++p) {
@@ -508,6 +519,8 @@ int main() {
         test_attention(0, 4, 12, 5, "attention global, extent 4 < context");
         test_attention(4, 4, 13, 3, "attention local window 4, ring wraps");
         test_attention(4, 4, 13, 1, "attention local window 4, decode steps");
+        test_attention(4, 4, 13, 1, "attention local window 4, decode, device start", true);
+        test_attention(0, 4, 12, 1, "attention global, decode, device start", true);
         test_route();
         test_experts(true, 128, 64, 3, "moe_situ_experts NVFP4 small");
         test_experts(true, 2304, 1152, 3, "moe_situ_experts NVFP4 [3, 2304, 1152]");
