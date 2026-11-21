@@ -869,6 +869,9 @@ struct EngineOptions {
     // keys into blocks of 256 (FP32, the softmax sums in another order). false (--no-split-attention): one block per
     // column and head, the earlier builds' bits.
     bool split_attention                   = true;
+    // Inkling-2 only (other models refuse it): --kv-dtype fp16, the KV rings in FP16 rather than FP32. Opt-in and
+    // lossy; about twice the context fits. Inkling-2 refuses every other kv_cache form.
+    bool kv_fp16                           = false;
     // Qwen3.6-35B-A3B only: the MTP draft layer's routed experts are stored W8 in the artifact;
     // transcode them to the text layers' formats (Q4 gate_up, Q6 down) at load. Drafts are
     // verified exactly, so this can change acceptance but never the output distribution.

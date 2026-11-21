@@ -76,11 +76,13 @@ TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t 
     const TextConfig& c = config_;
     const std::size_t kv = std::size_t(c.kv_heads) * c.head_dim, taps = c.conv_kernel_size - 1;
     const std::size_t local_cap = c.sliding_window - 1 + static_cast<std::size_t>(limits.max_chunk);
+    const DType ring = limits.kv_fp16 ? DType::FP16 : DType::FP32; // the KV rings' values
+    const std::size_t ring_bytes = dtype_size(ring);
     std::size_t total = 0;
     std::vector<std::size_t> capacity(c.num_layer_visits);
     for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
         capacity[v] = c.local[c.physical(v)] ? local_cap : static_cast<std::size_t>(limits.max_context);
-        total += 2 * padded(kv * capacity[v] * 4) + 2 * padded(kv * taps * 4) + 2 * padded(std::size_t(c.hidden_size) * taps * 4);
+        total += 2 * padded(kv * capacity[v] * ring_bytes) + 2 * padded(kv * taps * 4) + 2 * padded(std::size_t(c.hidden_size) * taps * 4);
         if (limits.max_rollback > 0) {
             const std::size_t saved = taps + static_cast<std::size_t>(limits.max_rollback);
             total += 2 * padded(kv * saved * 4) + 2 * padded(std::size_t(c.hidden_size) * saved * 4);
@@ -97,15 +99,15 @@ TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t 
     }
     auto* base = static_cast<std::byte*>(state_memory_.p);
     std::size_t offset = 0;
-    const auto carve = [&](std::int32_t rows, std::int32_t cols) {
-        Tensor t(base + offset, DType::FP32, {rows, cols});
+    const auto carve = [&](std::int32_t rows, std::int32_t cols, DType dtype = DType::FP32) {
+        Tensor t(base + offset, dtype, {rows, cols});
         offset += padded(t.bytes());
         return t;
     };
     for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
         VisitState s;
-        s.k_cache   = carve(i32(kv), i32(capacity[v]));
-        s.v_cache   = carve(i32(kv), i32(capacity[v]));
+        s.k_cache   = carve(i32(kv), i32(capacity[v]), ring);
+        s.v_cache   = carve(i32(kv), i32(capacity[v]), ring);
         s.k_hist    = carve(i32(kv), i32(taps));
         s.v_hist    = carve(i32(kv), i32(taps));
         s.attn_hist = carve(i32(c.hidden_size), i32(taps));
@@ -156,7 +158,7 @@ std::size_t TextProgram::snapshot_bytes() const {
         const VisitState& s = state_[v];
         total += s.k_hist.bytes() + s.v_hist.bytes() + s.attn_hist.bytes() + s.mlp_hist.bytes();
         if (config_.local[config_.physical(v)]) {
-            total += 2 * static_cast<std::size_t>(s.k_cache.ne[0]) * 4 * (config_.sliding_window - 1);
+            total += 2 * static_cast<std::size_t>(s.k_cache.nb[1]) * (config_.sliding_window - 1);
         }
     }
     return total;
@@ -174,7 +176,7 @@ void TextProgram::save(Snapshot& snapshot) const {
             out += t->bytes();
         }
         if (!config_.local[config_.physical(v)]) { continue; }
-        const std::size_t column = static_cast<std::size_t>(s.k_cache.ne[0]) * 4;
+        const std::size_t column = static_cast<std::size_t>(s.k_cache.nb[1]);
         for (const Tensor* t : {&s.k_cache, &s.v_cache}) {
             auto* base = out;
             ring_runs(first, position_ - first, t->ne[1], [&](std::int64_t slot, std::int64_t run) {
@@ -201,7 +203,7 @@ void TextProgram::restore(const Snapshot& snapshot) {
             in += t->bytes();
         }
         if (!config_.local[config_.physical(v)]) { continue; }
-        const std::size_t column = static_cast<std::size_t>(s.k_cache.ne[0]) * 4;
+        const std::size_t column = static_cast<std::size_t>(s.k_cache.nb[1]);
         for (Tensor* t : {&s.k_cache, &s.v_cache}) {
             const auto* base = in;
             ring_runs(first, snapshot.position - first, t->ne[1], [&](std::int64_t slot, std::int64_t run) {

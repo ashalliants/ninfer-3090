@@ -18,6 +18,7 @@
 #include <functional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ninfer::models::inkling2 {
@@ -42,6 +43,9 @@ struct ProgramLimits {
     // another order, so past 256 visible keys the logits differ from the single-block kernel's in the last bits.
     // false: the single block per column and head (bit-exact with earlier builds).
     bool split_attention = true;
+    // Opt-in, lossy: the KV rings hold FP16 (round to nearest) rather than FP32, half the bytes per position, so
+    // about twice the context fits. The attention widens them to FP32 as it reads them.
+    bool kv_fp16 = false;
 };
 
 // Columns [column, column + values.ne[1]) of a forward that take `values` as their input in place of their tokens'
@@ -64,6 +68,10 @@ public:
     ~TextProgram();
     TextProgram(const TextProgram&)            = delete;
     TextProgram& operator=(const TextProgram&) = delete;
+
+    // Layer visit v's K and V rings (diagnostics): [kv_heads * head_dim, capacity], FP32 or FP16 (ProgramLimits::kv_fp16),
+    // position p in column p % capacity.
+    [[nodiscard]] std::pair<Tensor, Tensor> kv_rings(std::uint32_t v) const { return {state_.at(v).k_cache, state_.at(v).v_cache}; }
 
     // Forgets the sequence: position 0, zero convolution histories (the KV rings need no clearing).
     void reset();
@@ -101,7 +109,7 @@ public:
 
 private:
     struct VisitState {
-        Tensor k_cache, v_cache;                       // FP32 [kv_heads * head_dim, capacity]
+        Tensor k_cache, v_cache;                       // FP32 (FP16 with limits.kv_fp16) [kv_heads * head_dim, capacity]
         Tensor k_hist, v_hist, attn_hist, mlp_hist;    // FP32 [C, K - 1]
         // With max_rollback: each history's state before the forward, then the forward's inputs: [C, K - 1 + T].
         Tensor k_saved, v_saved, attn_saved, mlp_saved;

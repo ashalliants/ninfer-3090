@@ -146,7 +146,7 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N] [--devices N,M,...] [--stage-layers A,B,...]\n"
-           "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] [--dense-q8 head|all (lossy)] [--no-split-attention] [--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N]]\n"
+           "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4|fp16 (Inkling-2)] [--dense-q8 head|all (lossy)] [--no-split-attention] [--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N]]\n"
            "       [--ngram-draft-tokens 0|15] [--ngram-min-match N] [--adaptive-draft-tokens 0|3]\n"
            "       [--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4]\n"
            "       [--gdn-state-fp16] [--mlp-a8-decode] [--no-prefill-a8]\n"
@@ -269,7 +269,12 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--stage-layers") {
             options.stage_layers = parse_stage_layers(value(arg));
         } else if (arg == "--kv-dtype") {
-            options.kv_cache = parse_kv_cache(value(arg));
+            const std::string_view form = value(arg);
+            if (form == "fp16") {
+                options.kv_fp16 = true; // Inkling-2's FP16 KV rings
+            } else {
+                options.kv_cache = parse_kv_cache(form);
+            }
         } else if (arg == "--dense-q8") {
             const std::string_view form = value(arg);
             if (form == "head") {

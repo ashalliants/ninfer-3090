@@ -38,6 +38,7 @@
 #include <memory>
 #include <span>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -199,7 +200,10 @@ int main() {
         //   context range.
         // NINFER_INKLING2_DECODE_BENCH=<ids>: prefill (chunks of 256) and decode (64 single-token graph steps after
         //   one untimed step) speed at contexts 1024, 16384 and the whole text less 65 (NINFER_INKLING2_BENCH_CONTEXT:
-        //   only that one); NINFER_INKLING2_SINGLE_BLOCK=1 measures the single-block attention.
+        //   only that one, the text repeated past its end); NINFER_INKLING2_SINGLE_BLOCK=1 measures the single-block attention, NINFER_INKLING2_KV=fp16
+        //   the FP16 KV rings.
+        // NINFER_INKLING2_KV_FP16_KLD=<ids>: the FP16 KV rings against the FP32 ones, teacher-forced (split attention
+        //   on in both); KLD and argmax agreement per context range, and the FP16 encoding's range and rounding per visit.
         const auto read_ids = [](const char* path) {
             std::ifstream in(path);
             std::vector<std::int32_t> ids;
@@ -257,16 +261,146 @@ int main() {
             report_ranges("split attention vs single block", klds, agrees, compared);
             return 0;
         }
+        if (const char* kld_ids = std::getenv("NINFER_INKLING2_KV_FP16_KLD"); kld_ids != nullptr) {
+            // FP16 rings against FP32 ones, split attention on in both: 8-column calls (the split kernel) where
+            // NINFER_INKLING2_ATTENTION_KLD runs them, chunks of 256 (the single-block prefill path) elsewhere. Also what
+            // the FP16 encoding does to every K and V value the FP32 program stores, per layer visit.
+            const auto text_ids = read_ids(kld_ids);
+            constexpr std::int32_t kChunk = 256;
+            const auto n = static_cast<std::int32_t>(text_ids.size());
+            ink::ProgramLimits limits{n + kChunk, kChunk};
+            limits.decode_graph = false;
+            ink::TextProgram fp32(*model, limits, stream);
+            limits.kv_fp16 = true;
+            ink::TextProgram fp16(*model, limits, stream);
+            const auto narrow = [](std::int32_t at) { return at < 2048 || (at >= 16384 && at < 16896) || (at >= 29696 && at < 30208); };
+            const std::uint32_t visits = model->config().num_layer_visits;
+            struct Stats {
+                std::int64_t values = 0, subnormal = 0, to_zero = 0, overflow = 0, zero = 0, fp16_inf = 0, fp16_sub = 0;
+                double max_abs = 0, min_abs = INFINITY, rel16 = 0, rel_bf16 = 0, max_rel16 = 0, max_norm = 0;
+            };
+            std::vector<Stats> stats(visits * 2);
+            // x rounded to nearest even on a grid of 2^(exponent - mantissa_bits), the exponent not below min_exp.
+            const auto round_to = [](double x, int mantissa_bits, int min_exp) {
+                const int e = std::max(static_cast<int>(std::floor(std::log2(std::fabs(x)))), min_exp);
+                const double q = std::ldexp(1.0, e - mantissa_bits);
+                return std::nearbyint(x / q) * q;
+            };
+            const auto columns = [&](const ninfer::Tensor& ring, std::int64_t from, std::int32_t len, std::size_t bytes) {
+                std::vector<std::uint8_t> out(static_cast<std::size_t>(ring.ne[0]) * len * bytes);
+                const std::int64_t cap = ring.ne[1];
+                for (std::int32_t done = 0; done < len;) {
+                    const std::int64_t slot = (from + done) % cap;
+                    const auto run = static_cast<std::int32_t>(std::min<std::int64_t>(len - done, cap - slot));
+                    if (cudaMemcpy2D(out.data() + static_cast<std::size_t>(done) * ring.ne[0] * bytes, ring.ne[0] * bytes,
+                                     static_cast<const std::uint8_t*>(ring.data) + slot * ring.nb[1], ring.nb[1], ring.ne[0] * bytes, run,
+                                     cudaMemcpyDeviceToHost) != cudaSuccess) {
+                        throw std::runtime_error("ring copy failed");
+                    }
+                    done += run;
+                }
+                return out;
+            };
+            const auto head_dim = static_cast<std::int32_t>(model->config().head_dim);
+            std::vector<double> klds;
+            std::vector<int> agrees;
+            std::vector<char> split_calls;
+            for (std::int32_t s = 0; s < n;) {
+                const std::int32_t len = std::min(narrow(s) ? 8 : kChunk, n - s);
+                const auto ids = std::span(text_ids).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(len));
+                const auto a = logit_columns(fp32.forward(ids), vocab);
+                const auto b = logit_columns(fp16.forward(ids), vocab);
+                for (std::int32_t t = 0; t < len; ++t) {
+                    klds.push_back(kld(a[t].data(), b[t].data(), vocab));
+                    agrees.push_back(argmax(a[t].data(), vocab) == argmax(b[t].data(), vocab) ? 1 : 0);
+                    split_calls.push_back(narrow(s) ? 1 : 0);
+                }
+                for (std::uint32_t v = 0; v < visits; ++v) {
+                    const auto [k32, v32] = fp32.kv_rings(v);
+                    const auto [k16, v16] = fp16.kv_rings(v);
+                    const ninfer::Tensor* rings32[] = {&k32, &v32};
+                    const ninfer::Tensor* rings16[] = {&k16, &v16};
+                    for (int kv = 0; kv < 2; ++kv) {
+                        Stats& st = stats[v * 2 + kv];
+                        const auto raw = columns(*rings32[kv], s, len, 4);
+                        const auto* x = reinterpret_cast<const float*>(raw.data());
+                        const std::size_t count = raw.size() / 4;
+                        for (std::size_t i = 0; i < count; i += static_cast<std::size_t>(head_dim)) {
+                            double sq = 0;
+                            for (std::int32_t d = 0; d < head_dim; ++d) { sq += double(x[i + d]) * x[i + d]; }
+                            st.max_norm = std::max(st.max_norm, std::sqrt(sq));
+                        }
+                        for (std::size_t i = 0; i < count; ++i) {
+                            const double y = x[i], ay = std::fabs(y);
+                            ++st.values;
+                            if (ay == 0) { ++st.zero; continue; }
+                            st.max_abs = std::max(st.max_abs, ay), st.min_abs = std::min(st.min_abs, ay);
+                            if (ay >= 65520.0) { ++st.overflow; continue; }
+                            if (ay < std::ldexp(1.0, -14)) { ++st.subnormal; }
+                            if (ay <= std::ldexp(1.0, -25)) { ++st.to_zero; }
+                            const double r16 = std::fabs(round_to(y, 10, -14) - y) / ay, rb = std::fabs(round_to(y, 7, -126) - y) / ay;
+                            st.rel16 += r16, st.rel_bf16 += rb, st.max_rel16 = std::max(st.max_rel16, r16);
+                        }
+                        const auto half = columns(*rings16[kv], s, len, 2);
+                        const auto* hbits = reinterpret_cast<const std::uint16_t*>(half.data());
+                        for (std::size_t i = 0; i < half.size() / 2; ++i) {
+                            const int e = (hbits[i] >> 10) & 31, m = hbits[i] & 1023;
+                            st.fp16_inf += e == 31 ? 1 : 0;
+                            st.fp16_sub += e == 0 && m != 0 ? 1 : 0;
+                        }
+                    }
+                }
+                s += len;
+            }
+            std::vector<char> chunked(split_calls.size());
+            for (std::size_t i = 0; i < chunked.size(); ++i) { chunked[i] = split_calls[i] == 0 ? 1 : 0; }
+            report_ranges("FP16 vs FP32 rings, 8-column split calls", klds, agrees, split_calls);
+            report_ranges("FP16 vs FP32 rings, 256-column chunks", klds, agrees, chunked);
+            std::printf("visit kv: values; max |x|, min |x| != 0, max head L2; FP16 subnormal range / to zero / overflow (from FP32); "
+                        "FP16 ring subnormal / inf-nan; mean rel rounding FP16 vs BF16; max rel FP16\n");
+            Stats total[2];
+            for (std::uint32_t v = 0; v < visits; ++v) {
+                for (int kv = 0; kv < 2; ++kv) {
+                    const Stats& st = stats[v * 2 + kv];
+                    const double nz = static_cast<double>(st.values - st.zero - st.overflow);
+                    std::printf("%2u %c: %lld; %.4g %.3g %.4g; %lld / %lld / %lld; %lld / %lld; %.3e vs %.3e; %.3e\n", v, kv == 0 ? 'K' : 'V',
+                                static_cast<long long>(st.values), st.max_abs, st.min_abs, st.max_norm, static_cast<long long>(st.subnormal),
+                                static_cast<long long>(st.to_zero), static_cast<long long>(st.overflow), static_cast<long long>(st.fp16_sub),
+                                static_cast<long long>(st.fp16_inf), st.rel16 / nz, st.rel_bf16 / nz, st.max_rel16);
+                    Stats& t = total[kv];
+                    t.values += st.values, t.subnormal += st.subnormal, t.to_zero += st.to_zero, t.overflow += st.overflow, t.zero += st.zero;
+                    t.fp16_inf += st.fp16_inf, t.fp16_sub += st.fp16_sub, t.rel16 += st.rel16, t.rel_bf16 += st.rel_bf16;
+                    t.max_abs = std::max(t.max_abs, st.max_abs), t.min_abs = std::min(t.min_abs, st.min_abs);
+                    t.max_rel16 = std::max(t.max_rel16, st.max_rel16), t.max_norm = std::max(t.max_norm, st.max_norm);
+                }
+            }
+            for (int kv = 0; kv < 2; ++kv) {
+                const Stats& t = total[kv];
+                const double nz = static_cast<double>(t.values - t.zero - t.overflow);
+                std::printf("all %c: %lld values; max |x| %.4g, min |x| != 0 %.3g, max head L2 %.4g; FP16 subnormal range %lld, to zero %lld, "
+                            "overflow %lld; FP16 ring subnormal %lld, inf/nan %lld; mean rel rounding FP16 %.3e vs BF16 %.3e; max rel FP16 %.3e\n",
+                            kv == 0 ? 'K' : 'V', static_cast<long long>(t.values), t.max_abs, t.min_abs, t.max_norm,
+                            static_cast<long long>(t.subnormal), static_cast<long long>(t.to_zero), static_cast<long long>(t.overflow),
+                            static_cast<long long>(t.fp16_sub), static_cast<long long>(t.fp16_inf), t.rel16 / nz, t.rel_bf16 / nz, t.max_rel16);
+            }
+            return 0;
+        }
         if (const char* bench_ids = std::getenv("NINFER_INKLING2_DECODE_BENCH"); bench_ids != nullptr) {
-            const auto text_ids = read_ids(bench_ids);
+            auto text_ids = read_ids(bench_ids);
             constexpr std::int32_t kChunk = 256, kSteps = 64;
+            const std::int32_t only = std::getenv("NINFER_INKLING2_BENCH_CONTEXT") ? std::atoi(std::getenv("NINFER_INKLING2_BENCH_CONTEXT")) : 0;
+            // A context past the text repeats it.
+            for (const std::size_t text = text_ids.size(); text_ids.size() < static_cast<std::size_t>(only) + kSteps + 1;) {
+                text_ids.push_back(text_ids[text_ids.size() % text]);
+            }
             const auto n = static_cast<std::int32_t>(text_ids.size());
             ink::ProgramLimits limits{n + kChunk, kChunk};
             limits.split_attention = std::getenv("NINFER_INKLING2_SINGLE_BLOCK") == nullptr;
-            const char* form = limits.split_attention ? "split attention" : "single-block attention";
+            limits.kv_fp16 = std::getenv("NINFER_INKLING2_KV") != nullptr && std::string(std::getenv("NINFER_INKLING2_KV")) == "fp16";
+            const std::string form = std::string(limits.split_attention ? "split attention" : "single-block attention") +
+                                     (limits.kv_fp16 ? ", FP16 KV" : ", FP32 KV");
             ink::TextProgram bench(*model, limits, stream);
-            const std::int32_t only = std::getenv("NINFER_INKLING2_BENCH_CONTEXT") ? std::atoi(std::getenv("NINFER_INKLING2_BENCH_CONTEXT")) : 0;
-            for (const std::int32_t context : {1024, 16384, n - kSteps - 1}) {
+            for (const std::int32_t context : {1024, 16384, only > 0 ? only : n - kSteps - 1}) {
                 if (context > n - kSteps - 1 || (only > 0 && context != only)) { continue; }
                 bench.reset();
                 cudaStreamSynchronize(stream);
@@ -284,7 +418,7 @@ int main() {
                 for (std::int32_t i = 1; i <= kSteps; ++i) { bench.forward(std::span(text_ids).subspan(static_cast<std::size_t>(context + i), 1)); }
                 cudaStreamSynchronize(stream);
                 const auto p2 = std::chrono::steady_clock::now();
-                std::printf("%s, context %d: prefill %.1f tok/s, decode %.2f tok/s\n", form, context,
+                std::printf("%s, context %d: prefill %.1f tok/s, decode %.2f tok/s\n", form.c_str(), context,
                             context / std::chrono::duration<double>(p1 - p0).count(), kSteps / std::chrono::duration<double>(p2 - p1d).count());
             }
             return 0;

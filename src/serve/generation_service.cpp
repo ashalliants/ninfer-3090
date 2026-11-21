@@ -343,6 +343,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.kv_cache                = options.kv_cache;
     engine_options.dense_q8                = options.dense_q8;
     engine_options.split_attention         = options.split_attention;
+    engine_options.kv_fp16                 = options.kv_fp16;
     engine_options.enable_vision            = options.enable_vision;
     engine_options.grafts                   = options.grafts;
     engine_options.loras                    = options.loras;

@@ -802,6 +802,14 @@ int main() {
     failures += check(!make_engine_options(parse({"ninfer-serve", "model.ninfer", "--no-split-attention"})).split_attention &&
                           make_engine_options(parse({"ninfer-serve", "model.ninfer"})).split_attention,
                       "--no-split-attention did not reach the Engine options");
+    // --kv-dtype fp16 is Inkling-2's FP16 KV rings: kv_fp16, the KV cache storage left at its default.
+    {
+        const auto fp16 = make_engine_options(parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "fp16"}));
+        failures += check(fp16.kv_fp16 && fp16.kv_cache == ninfer::KvCacheStorage::BFloat16 &&
+                              !make_engine_options(parse({"ninfer-serve", "model.ninfer"})).kv_fp16 &&
+                              !make_engine_options(parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "int8"})).kv_fp16,
+                          "--kv-dtype fp16 did not reach the Engine options");
+    }
     // --spec dspark drafts 3 per round unless --draft-tokens says otherwise (1..7).
     const ninfer::EngineOptions dspark = make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "dspark"}));
     failures += check(dspark.speculative.backend == ninfer::SpeculativeBackend::DSpark && dspark.speculative.draft_tokens == 3,
