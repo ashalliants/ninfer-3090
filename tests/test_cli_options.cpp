@@ -159,6 +159,16 @@ int main() {
                   }),
                   "CLI accepted an unsupported DFlash2 draft count");
     }
+    // --spec dspark: an omitted --draft-tokens takes 3; an explicit one is kept and must be in [1,7].
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dspark"}).speculative.draft_tokens == 3,
+                      "CLI --spec dspark did not default to 3 drafts");
+    for (const auto k : {0U, 8U}) {
+        failures += check(rejects([&] {
+                              (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dspark",
+                                           "--draft-tokens", std::to_string(k)});
+                          }),
+                          "CLI accepted an unsupported DSpark draft count");
+    }
     const ninfer::cli::Options nvfp4 =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "nvfp4"});
     failures += check(nvfp4.kv_cache == ninfer::KvCacheStorage::Nvfp4Group16,

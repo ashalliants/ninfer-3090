@@ -832,6 +832,8 @@ int main() {
     };
     failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-tokens", "8"}, "[1,7]"),
                       "--spec dspark accepted 8 drafts");
+    failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-tokens", "0"}, "[1,7]"),
+                      "--spec dspark accepted an explicit 0 drafts");
     failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "dflash2",
                                      "--draft-tokens", "7", "--ngram-draft-tokens", "31"},
                                     "31, 63"),

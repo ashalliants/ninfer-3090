@@ -650,6 +650,7 @@ std::vector<std::string> redacted(const std::vector<std::string>& words) {
 ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin>& origins,
                              std::size_t& current) {
     ServeOptions options;
+    bool draft_tokens_given = false; // --draft-tokens on the command line (an omitted one may take a default)
     bool kv_capacity_explicit  = false;
     bool device_explicit       = false;
     bool context_store_tuning  = false;
@@ -1020,6 +1021,7 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
         } else if (arg == "--draft-tokens") {
+            draft_tokens_given               = true;
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
         } else if (arg == "--ngram-draft-tokens") {
@@ -1570,7 +1572,7 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
     }
     models::qwen3_5::validate_lossy_prefill_options(options.lossy_prefill);
     product::apply_speculative_defaults(options.speculative);
-    product::apply_speculative_cli_defaults(options.speculative);
+    product::apply_speculative_cli_defaults(options.speculative, draft_tokens_given);
     product::validate_speculative_cli_options(options.speculative);
     if (options.flash_next.moe_gate_up_registers && !options.flash_next.moe_precast_input) {
         throw std::invalid_argument("--moe-gate-up-registers reads the input that --moe-precast-input casts once "

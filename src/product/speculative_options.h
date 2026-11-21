@@ -85,8 +85,10 @@ inline void validate_ngram_cli_options(const SpeculativeOptions& options) {
 // chat prompts; 2 and 4 drafts 1.24x and 1.26x).
 inline constexpr std::uint32_t kDSparkDefaultDraftTokens = 3;
 
-inline void apply_speculative_cli_defaults(SpeculativeOptions& options) {
-    if (options.backend == SpeculativeBackend::DSpark && options.draft_tokens == 0) {
+// `draft_tokens_given`: --draft-tokens was on the command line. Only an omitted value takes the default; an
+// explicit 0 stays 0 for validation to refuse.
+inline void apply_speculative_cli_defaults(SpeculativeOptions& options, bool draft_tokens_given) {
+    if (options.backend == SpeculativeBackend::DSpark && !draft_tokens_given) {
         options.draft_tokens = kDSparkDefaultDraftTokens;
     }
 }

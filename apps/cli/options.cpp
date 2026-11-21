@@ -219,6 +219,7 @@ std::string usage_text(const char* argv0) {
 
 Options parse_options(int argc, char** argv) {
     Options options;
+    bool draft_tokens_given = false; // --draft-tokens on the command line (an omitted one may take a default)
     if (argc >= 2 && (std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -272,6 +273,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
+            draft_tokens_given               = true;
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
         } else if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens = parse_u32(value(arg), "ngram-draft-tokens", true);
@@ -410,7 +412,7 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
     product::apply_speculative_defaults(options.speculative);
-    product::apply_speculative_cli_defaults(options.speculative);
+    product::apply_speculative_cli_defaults(options.speculative, draft_tokens_given);
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_residency == VisionResidency::Overlay && !options.enable_vision) {
         throw std::invalid_argument("--vision-residency overlay requires --vision");
