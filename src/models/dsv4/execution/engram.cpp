@@ -301,29 +301,43 @@ Tensor Engram::apply(std::uint32_t layer, const Weight& kv, const Tensor& gate, 
     if (staged_ == 0 || residual.ne[1] != static_cast<std::int32_t>(staged_)) {
         throw std::invalid_argument("Engram: the residual's columns differ from the staged call's");
     }
-    bind_stream(stream); // only a call that passed validation binds the instance
-    const std::int32_t T     = static_cast<std::int32_t>(staged_);
-    const std::int32_t cols  = static_cast<std::int32_t>(hasher_.columns());
-    const std::int32_t width = cols * static_cast<std::int32_t>(row_width_);
-    auto scope               = workspace.scope();
-    Tensor rows = workspace.alloc(DType::U8, {static_cast<std::int32_t>(row_bytes_), cols, T});
-    const std::size_t bytes = std::size_t{row_bytes_} * cols * T;
-    CUDA_CHECK(cudaMemcpyAsync(rows.data, pinned_ + static_cast<std::size_t>(layer) * bytes, bytes,
-                               cudaMemcpyHostToDevice, stream));
-    // The fence is recorded right after the copy. Under graph capture it becomes an external event
-    // record node, so it signals when the copy has run, not when the whole graph has finished.
-    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
-    CUDA_CHECK(cudaEventRecordWithFlags(
-        copied_, stream, capture == cudaStreamCaptureStatusNone ? 0U : cudaEventRecordExternal));
-    Tensor embedded = workspace.alloc(DType::BF16, {width, T});
-    ops::ple_embed(rows, format_, embedded, stream);
-    Tensor projected =
-        workspace.alloc(DType::BF16, {static_cast<std::int32_t>((streams_ + 1) * hidden_), T});
-    ops::linear(embedded, kv, projected, policy, workspace, stream);
-    ops::engram_gate_inject(projected, gate, static_cast<std::int32_t>(streams_), eps_, residual,
-                            stream);
-    return projected;
+    // Only a call that passed validation binds the instance, and a launch that fails undoes a
+    // binding it made (after draining the stream, so the fence and the destructor stay correct).
+    const bool newly_bound = !stream_bound_;
+    bind_stream(stream);
+    try {
+        const std::int32_t T     = static_cast<std::int32_t>(staged_);
+        const std::int32_t cols  = static_cast<std::int32_t>(hasher_.columns());
+        const std::int32_t width = cols * static_cast<std::int32_t>(row_width_);
+        auto scope               = workspace.scope();
+        Tensor rows = workspace.alloc(DType::U8, {static_cast<std::int32_t>(row_bytes_), cols, T});
+        const std::size_t bytes = std::size_t{row_bytes_} * cols * T;
+        CUDA_CHECK(cudaMemcpyAsync(rows.data, pinned_ + static_cast<std::size_t>(layer) * bytes,
+                                   bytes, cudaMemcpyHostToDevice, stream));
+        // The fence is recorded right after the copy. Under graph capture it becomes an external
+        // event record node, so it signals when the copy has run, not when the whole graph has
+        // finished.
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+        CUDA_CHECK(cudaEventRecordWithFlags(
+            copied_, stream,
+            capture == cudaStreamCaptureStatusNone ? 0U : cudaEventRecordExternal));
+        Tensor embedded = workspace.alloc(DType::BF16, {width, T});
+        ops::ple_embed(rows, format_, embedded, stream);
+        Tensor projected =
+            workspace.alloc(DType::BF16, {static_cast<std::int32_t>((streams_ + 1) * hidden_), T});
+        ops::linear(embedded, kv, projected, policy, workspace, stream);
+        ops::engram_gate_inject(projected, gate, static_cast<std::int32_t>(streams_), eps_,
+                                residual, stream);
+        return projected;
+    } catch (...) {
+        if (newly_bound) {
+            (void)cudaStreamSynchronize(stream);
+            stream_bound_ = false;
+            stream_       = nullptr;
+        }
+        throw;
+    }
 }
 
 } // namespace ninfer::models::dsv4

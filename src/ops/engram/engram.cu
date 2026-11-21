@@ -73,8 +73,9 @@ __global__ void __launch_bounds__(kThreads)
     const float rx      = 1.0F / sqrtf(sum_xx * inv_h + eps);
     const float rk      = 1.0F / sqrtf(sum_kk * inv_h + eps);
     const float dot     = sum_xwk * rx * rk / sqrtf(static_cast<float>(h));
-    const float g       = copysignf(sqrtf(fmaxf(fabsf(dot), kClamp)), dot);
-    const float gate    = 1.0F / (1.0F + expf(-g));
+    const float g =
+        copysignf(sqrtf(fmaxf(fabsf(dot), kClamp)), dot == 0.0F ? 1.0F : dot); // sign(+-0) = +1
+    const float gate = 1.0F / (1.0F + expf(-g));
     for (int i = 2 * threadIdx.x; i < h; i += 2 * kThreads) {
         const float2 xv = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(x + i));
         const float2 vv = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(value + i));

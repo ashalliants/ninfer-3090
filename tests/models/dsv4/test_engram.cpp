@@ -733,6 +733,31 @@ void test_synthetic(cudaStream_t stream) {
                                          arena, other);
                   }),
                   "a second stream is refused (one copy fence per instance)");
+            {
+                // A launch failure (a refused gate) leaves a fresh instance unbound: another
+                // stream still works.
+                dsv4::Engram fresh(config, params, volume, 8);
+                auto h3 = fresh.hasher().start();
+                const dsv4::Engram::Run one{&h3, std::span<const std::int32_t>(tokens).first(1)};
+                fresh.stage(std::span<const dsv4::Engram::Run>(&one, 1));
+                Tensor r1(d_x.p, DType::BF16, {static_cast<std::int32_t>(kStreams * kHidden), 1});
+                // The last Op refuses a gate of the wrong size, after the copy and the projection
+                // were enqueued.
+                const Tensor bad_gate(gate.data, DType::FP32,
+                                      {static_cast<std::int32_t>(kHidden), 3});
+                check(throws([&] {
+                          (void)fresh.apply(0, weight, bad_gate, r1,
+                                            ninfer::ops::LinearPolicy::AllowA8, arena, stream);
+                      }),
+                      "an apply whose last Op refuses its input fails");
+                check(!throws([&] {
+                    (void)fresh.apply(0, weight, gate, r1, ninfer::ops::LinearPolicy::AllowA8,
+                                      arena, other);
+                }),
+                      "after a failed first apply the instance is not bound to its stream");
+                t::cuda_check(cudaStreamSynchronize(other), "sync");
+            }
+            // after `fresh` (whose destructor synchronizes the stream it is bound to)
             cudaStreamDestroy(other);
             Tensor ok(d_x.p, DType::BF16, {static_cast<std::int32_t>(kStreams * kHidden), 3});
             check(throws([&] {
