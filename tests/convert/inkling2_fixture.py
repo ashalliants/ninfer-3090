@@ -241,3 +241,57 @@ def write_dspark(path: Path, metadata_changes: dict | None = None,
             data = tensor_bytes(kind, ne, 7)
         tensors.append((name, kind, ne, data))
     return write_gguf(path, metadata, tensors)
+
+
+# The vision tower (mmproj, clip.vision.projector_type inkling2v) at toy sizes: 2 layers of a 32-wide ViT with 2
+# heads, 4x4 patches and a 3x3 position grid, projected into the text model's HIDDEN.
+V_LAYERS, V_HIDDEN, V_HEADS, V_FF, V_PATCH, V_GRID = 2, 128, 2, 48, 4, 3  # heads of 64, as the tower's attention
+
+
+def vision_metadata() -> list[tuple[str, int, object]]:
+    k = "clip.vision."
+    return [
+        ("general.architecture", STRING, "clip"),
+        ("clip.has_vision_encoder", BOOL, True),
+        (k + "projection_dim", U32, HIDDEN),
+        (k + "image_size", U32, V_PATCH * V_GRID),
+        (k + "patch_size", U32, V_PATCH),
+        (k + "embedding_length", U32, V_HIDDEN),
+        (k + "feed_forward_length", U32, V_FF),
+        (k + "block_count", U32, V_LAYERS),
+        (k + "attention.head_count", U32, V_HEADS),
+        (k + "image_mean", ARRAY, (F32V, [0.5, 0.5, 0.5])),
+        (k + "image_std", ARRAY, (F32V, [0.5, 0.5, 0.5])),
+        (k + "projector_type", STRING, "inkling2v"),
+        (k + "attention.layer_norm_epsilon", F32V, 1e-5),
+        (k + "spatial_merge_size", U32, 2),
+    ]
+
+
+def vision_tensors() -> list[tuple[str, int, tuple[int, ...], bytes]]:
+    from tools.convert import inkling2_vision
+
+    config = {"hidden_size": V_HIDDEN, "intermediate_size": V_FF, "patch_size": V_PATCH, "position_grid": V_GRID,
+              "spatial_merge_size": 2, "projection_size": HIDDEN, "depth": V_LAYERS}
+    out = []
+    for seed, (name, shape) in enumerate(inkling2_vision.expected_shapes(config).items(), 2000):
+        matrix = len(shape) == 2 and name != "v.position_embd.weight"
+        kind = BF16 if matrix else F32
+        ne = tuple(reversed(shape))
+        out.append((name, kind, ne, tensor_bytes(kind, ne, seed)))
+    return out
+
+
+def write_vision(path: Path, metadata_changes: dict | None = None,
+                 tensor_changes: dict | None = None) -> Path:
+    """``metadata_changes`` replaces (or, with None, drops) keys; ``tensor_changes`` maps names to (kind, ne)."""
+    metadata = [(key, kind, value) for key, kind, value in vision_metadata()
+                if (metadata_changes or {}).get(key, ...) is not None]
+    metadata = [(key, kind, (metadata_changes or {}).get(key, value)) for key, kind, value in metadata]
+    tensors = []
+    for name, kind, ne, data in vision_tensors():
+        if name in (tensor_changes or {}):
+            kind, ne = tensor_changes[name]
+            data = tensor_bytes(kind, ne, 7)
+        tensors.append((name, kind, ne, data))
+    return write_gguf(path, metadata, tensors)

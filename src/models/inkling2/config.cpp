@@ -164,4 +164,38 @@ DSparkConfig parse_dspark_config(const Json& v, const TextConfig& text) {
     }
 }
 
+VisionConfig parse_vision_config(const Json& v, const TextConfig& text) {
+    try {
+        VisionConfig c;
+        c.depth             = dimension(v, "depth");
+        c.hidden_size       = dimension(v, "hidden_size");
+        c.intermediate_size = dimension(v, "intermediate_size");
+        c.heads             = dimension(v, "num_heads");
+        c.patch_size        = dimension(v, "patch_size");
+        c.position_grid     = dimension(v, "position_grid");
+        c.merge             = dimension(v, "spatial_merge_size");
+        c.projection_size   = dimension(v, "projection_size");
+        c.max_image_tokens  = dimension(v, "max_image_tokens");
+        c.layer_norm_eps    = real(v, "layer_norm_eps");
+        c.rope_theta        = real(v, "rope_theta");
+        for (const auto* key : {"image_mean", "image_std"}) {
+            const auto& list = v.at(key);
+            if (!list.is_array() || list.size() != 3) { throw ArtifactError(std::string(key) + " must list three values"); }
+        }
+        for (int i = 0; i < 3; ++i) {
+            c.image_mean[i] = v.at("image_mean").at(i).get<float>();
+            c.image_std[i]  = v.at("image_std").at(i).get<float>();
+            if (!std::isfinite(c.image_mean[i]) || !(c.image_std[i] > 0) || !std::isfinite(c.image_std[i])) {
+                throw ArtifactError("image_mean and image_std must be finite, image_std positive");
+            }
+        }
+        if (c.projection_size != text.hidden_size) { throw ArtifactError("projection_size differs from the text hidden size"); }
+        if (c.hidden_size % c.heads || c.head_dim() != 64) { throw ArtifactError("the tower's heads must be 64 wide"); }
+        if (c.merge != 2) { throw ArtifactError("the merge must be 2 x 2"); }
+        return c;
+    } catch (const std::exception& error) {
+        throw ArtifactError(std::string("Inkling-2 vision config: ") + error.what());
+    }
+}
+
 } // namespace ninfer::models::inkling2

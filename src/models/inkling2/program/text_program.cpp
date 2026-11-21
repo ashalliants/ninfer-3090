@@ -389,7 +389,7 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     return next;
 }
 
-Tensor TextProgram::forward(std::span<const std::int32_t> tokens, const Trace* trace) {
+Tensor TextProgram::forward(std::span<const std::int32_t> tokens, std::span<const InputEmbeddings> embeddings, const Trace* trace) {
     const TextConfig& c = config_;
     const std::int32_t cols = static_cast<std::int32_t>(tokens.size()), h = i32(c.hidden_size);
     if (cols < 1 || cols > limits_.max_chunk) { throw std::invalid_argument("inkling2: chunk size outside 1..max_chunk"); }
@@ -397,8 +397,17 @@ Tensor TextProgram::forward(std::span<const std::int32_t> tokens, const Trace* t
     for (const auto token : tokens) {
         if (token < 0 || static_cast<std::uint32_t>(token) >= c.unpadded_vocab_size) { throw std::invalid_argument("inkling2: token id out of range"); }
     }
+    std::int32_t next = 0;
+    for (const auto& e : embeddings) {
+        const bool shaped = e.values.data != nullptr && e.values.dtype == DType::FP32 && e.values.ne[0] == h && e.values.ne[1] >= 1 &&
+                            e.values.ne[2] == 1 && e.values.ne[3] == 1 && e.values.is_contiguous();
+        if (!shaped || e.column < next || e.column + e.values.ne[1] > cols) {
+            throw std::invalid_argument("inkling2: input embeddings must be FP32 [hidden, n] in ascending columns of the chunk");
+        }
+        next = e.column + e.values.ne[1];
+    }
     const bool tracing = trace != nullptr && *trace;
-    if (cols == 1 && !tracing && limits_.decode_graph && stream_ != nullptr) { return forward_graph(tokens[0]); }
+    if (cols == 1 && embeddings.empty() && !tracing && limits_.decode_graph && stream_ != nullptr) { return forward_graph(tokens[0]); }
     workspace_.reset();
     Tensor ids = workspace_.alloc(DType::I32, {cols});
     if (cudaMemcpyAsync(ids.data, tokens.data(), tokens.size_bytes(), cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
@@ -418,13 +427,16 @@ Tensor TextProgram::forward(std::span<const std::int32_t> tokens, const Trace* t
     }
     last_cols_ = 0;
     Tensor logits;
+    inputs_ = embeddings;
     try {
         logits = run(ids, position_, trace);
     } catch (...) {
         saving_ = false;
+        inputs_ = {};
         throw;
     }
     saving_ = false;
+    inputs_ = {};
     position_ += cols;
     last_cols_ = cols;
     return logits;
@@ -489,6 +501,12 @@ Tensor TextProgram::run(const Tensor& ids, std::int64_t start, const Trace* trac
     ops::embedding_bf16_fp32(ids, model_.tensor(model_.weights().embedding, {h, i32(c.vocab_size)}), cur, stream_);
     const Tensor embed_norm = model_.tensor(model_.weights().embedding_norm, {h});
     ops::rmsnorm_fp32(cur, &embed_norm, c.rms_norm_eps, cur, stream_);
+    for (const auto& e : inputs_) {
+        if (cudaMemcpyAsync(static_cast<float*>(cur.data) + static_cast<std::int64_t>(e.column) * h, e.values.data, e.values.bytes(),
+                            cudaMemcpyDeviceToDevice, stream_) != cudaSuccess) {
+            throw std::runtime_error("inkling2: input embedding copy failed");
+        }
+    }
 
     // 3: the visits, with the loop bookkeeping of 3a.
     std::vector<Tensor> blocks, prelude_blocks, bank;

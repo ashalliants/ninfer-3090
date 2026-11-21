@@ -61,6 +61,19 @@ struct DSparkWeights {
     std::vector<DSparkLayerWeights> layers;
 };
 
+// The vision tower: FP32 vectors, the FP32 patch convolution [D, 3, P, P] and position table [G G, D], BF16
+// matrices.
+struct VisionLayerWeights {
+    WeightId norm1_weight, norm1_bias, q, q_bias, k, k_bias, v, v_bias, output, output_bias, attn_scale;
+    WeightId norm2_weight, norm2_bias, fc1, fc1_bias, fc2, fc2_bias, mlp_scale;
+};
+
+struct VisionWeights {
+    WeightId class_embedding, class_position, patch_embedding, position_embedding, pre_norm_weight, pre_norm_bias;
+    WeightId projector_fc1, projector_fc2;
+    std::vector<VisionLayerWeights> layers;
+};
+
 struct BoundWeight {
     std::string name;
     WeightView view;
@@ -84,8 +97,11 @@ public:
     // The DSpark drafter, when the artifact has one (null otherwise).
     [[nodiscard]] const DSparkConfig* dspark_config() const noexcept { return dspark_config_ ? &*dspark_config_ : nullptr; }
     [[nodiscard]] const DSparkWeights& dspark_weights() const noexcept { return dspark_weights_; }
-    // A matrix's resident bytes and format (GGML_Q8_0 blocks or BF16 words, rows of `cols` values), checked
-    // against its bound shape.
+    // The vision tower, when the artifact has one (null otherwise).
+    [[nodiscard]] const VisionConfig* vision_config() const noexcept { return vision_config_ ? &*vision_config_ : nullptr; }
+    [[nodiscard]] const VisionWeights& vision_weights() const noexcept { return vision_weights_; }
+    // A matrix's resident bytes and format (GGML_Q8_0 blocks, BF16 or FP32 words, rows of `cols` values: the
+    // product of every dimension after the first), checked against its bound shape.
     struct Matrix {
         const void* data = nullptr;
         QType format     = QType::FP32;
@@ -98,6 +114,8 @@ private:
     Model(TextConfig config, TextWeights weights, std::vector<BoundWeight> bound, artifact::MaterializedArtifact backing);
     std::optional<DSparkConfig> dspark_config_;
     DSparkWeights dspark_weights_;
+    std::optional<VisionConfig> vision_config_;
+    VisionWeights vision_weights_;
 
     artifact::MaterializedArtifact backing_;
     TextConfig config_;

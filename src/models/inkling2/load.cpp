@@ -120,6 +120,43 @@ DSparkWeights bind_dspark(Bindings& b, const DSparkConfig& c, const TextConfig& 
     return w;
 }
 
+VisionWeights bind_vision(Bindings& b, const VisionConfig& c) {
+    const std::uint64_t d = c.hidden_size, f = c.intermediate_size, p = c.patch_size, m = 4 * d;
+    VisionWeights w;
+    w.class_embedding    = b.parameter("vision/class_embedding", {d});
+    w.class_position     = b.parameter("vision/class_position_embedding", {d});
+    w.patch_embedding    = b.parameter("vision/patch_embedding", {d, 3, p, p});
+    w.position_embedding = b.parameter("vision/position_embedding", {std::uint64_t(c.position_grid) * c.position_grid, d});
+    w.pre_norm_weight    = b.parameter("vision/pre_norm_weight", {d});
+    w.pre_norm_bias      = b.parameter("vision/pre_norm_bias", {d});
+    w.projector_fc1      = b.parameter("vision/projector/fc1", {m, m});
+    w.projector_fc2      = b.parameter("vision/projector/fc2", {c.projection_size, m});
+    for (std::uint32_t i = 0; i < c.depth; ++i) {
+        const std::string l = "vision/layers/" + std::to_string(i) + "/", a = l + "attention/", f2 = l + "mlp/";
+        VisionLayerWeights x;
+        x.norm1_weight = b.parameter(l + "norm1_weight", {d});
+        x.norm1_bias   = b.parameter(l + "norm1_bias", {d});
+        x.q            = b.parameter(a + "query", {d, d});
+        x.q_bias       = b.parameter(a + "query_bias", {d});
+        x.k            = b.parameter(a + "key", {d, d});
+        x.k_bias       = b.parameter(a + "key_bias", {d});
+        x.v            = b.parameter(a + "value", {d, d});
+        x.v_bias       = b.parameter(a + "value_bias", {d});
+        x.output       = b.parameter(a + "output", {d, d});
+        x.output_bias  = b.parameter(a + "output_bias", {d});
+        x.attn_scale   = b.parameter(a + "layer_scale", {d});
+        x.norm2_weight = b.parameter(l + "norm2_weight", {d});
+        x.norm2_bias   = b.parameter(l + "norm2_bias", {d});
+        x.fc1          = b.parameter(f2 + "fc1", {f, d});
+        x.fc1_bias     = b.parameter(f2 + "fc1_bias", {f});
+        x.fc2          = b.parameter(f2 + "fc2", {d, f});
+        x.fc2_bias     = b.parameter(f2 + "fc2_bias", {d});
+        x.mlp_scale    = b.parameter(f2 + "layer_scale", {d});
+        w.layers.push_back(x);
+    }
+    return w;
+}
+
 TextWeights bind_text(Bindings& b, const TextConfig& c) {
     const std::uint64_t h = c.hidden_size, v = c.vocab_size;
     TextWeights w;
@@ -215,11 +252,13 @@ Model::Matrix Model::matrix(WeightId id) const {
     const auto& parent        = whole_parent(weight);
     const auto& g             = parent.geometry;
     const bool q8 = g.format == QType::GGML_Q8_0 && g.layout == QuantLayout::GgmlBlocks;
-    const bool bf16 = g.format == QType::BF16 && g.layout == QuantLayout::Contiguous;
-    if ((!q8 && !bf16) || weight.view.shape.size() != 2) {
-        throw ArtifactError(weight.name + ": must be a Q8_0 (GGML blocks) or BF16 matrix");
+    const bool words = (g.format == QType::BF16 || g.format == QType::FP32) && g.layout == QuantLayout::Contiguous;
+    if ((!q8 && !words) || weight.view.shape.size() < 2) {
+        throw ArtifactError(weight.name + ": must be a Q8_0 (GGML blocks), BF16 or FP32 matrix");
     }
-    return {parent.data, g.format, static_cast<std::int32_t>(weight.view.shape[0]), static_cast<std::int32_t>(weight.view.shape[1])};
+    std::uint64_t cols = 1;
+    for (std::size_t i = 1; i < weight.view.shape.size(); ++i) { cols *= weight.view.shape[i]; }
+    return {parent.data, g.format, static_cast<std::int32_t>(weight.view.shape[0]), static_cast<std::int32_t>(cols)};
 }
 
 Tensor Model::tensor(WeightId id, std::initializer_list<std::int32_t> ne) const {
@@ -241,6 +280,12 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext&
         dspark         = parse_dspark_config(reader.directory().component("dspark").config, config);
         dspark_weights = bind_dspark(bindings, *dspark, config);
     }
+    std::optional<VisionConfig> vision;
+    VisionWeights vision_weights;
+    if (reader.directory().components.contains("vision")) {
+        vision         = parse_vision_config(reader.directory().component("vision").config, config);
+        vision_weights = bind_vision(bindings, *vision);
+    }
     auto references     = std::move(bindings.references);
     auto plan           = std::move(binder).finish();
     auto backing        = artifact::materialize(*plan.source, std::move(plan), device, observer);
@@ -257,6 +302,8 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext&
     }
     model->dspark_config_  = std::move(dspark);
     model->dspark_weights_ = std::move(dspark_weights);
+    model->vision_config_  = std::move(vision);
+    model->vision_weights_ = std::move(vision_weights);
     return model;
 }
 

@@ -33,6 +33,14 @@ struct ProgramLimits {
     std::int32_t max_rollback = 0;
 };
 
+// Columns [column, column + values.ne[1]) of a forward that take `values` as their input in place of their tokens'
+// normed embeddings: FP32 [hidden, n] on the device, columns contiguous (an image's embeddings; their tokens are
+// placeholders). The embedding norm does not apply to them (llama.cpp's inkling2 graph normalizes token rows only).
+struct InputEmbeddings {
+    std::int32_t column = 0;
+    Tensor values;
+};
+
 class TextProgram {
 public:
     // Called with llama.cpp's names (tools/inkling2/llama_golden.cpp): attn_out-v, ffn_inp-v, l_out-v per layer
@@ -59,7 +67,9 @@ public:
 
     // Appends tokens at position() and returns their logits: FP32 [vocab_size, T] on the device (rows past
     // unpadded_vocab_size are padding and never sampled), softcapped. Valid until the next call.
-    Tensor forward(std::span<const std::int32_t> tokens, const Trace* trace = nullptr);
+    Tensor forward(std::span<const std::int32_t> tokens, const Trace* trace = nullptr) { return forward(tokens, {}, trace); }
+    // As above, with some columns' inputs given as embeddings (ascending, non-overlapping ranges within the chunk).
+    Tensor forward(std::span<const std::int32_t> tokens, std::span<const InputEmbeddings> embeddings, const Trace* trace = nullptr);
 
 private:
     struct VisitState {
@@ -92,6 +102,7 @@ private:
     std::vector<Tensor> taps_;          // FP32 [hidden, max_chunk] each
     std::int32_t last_cols_ = 0;        // the last forward's T
     bool saving_            = false;    // the forward in progress saves its convolution inputs
+    std::span<const InputEmbeddings> inputs_; // the forward in progress's embedding columns
     // The decode graph: step_ holds {int64 position, int32 token} it reads; start_offset_ points at that position
     // while the graph is captured (the Ops add it to their host start of 0), and is null otherwise.
     DeviceBuffer step_;

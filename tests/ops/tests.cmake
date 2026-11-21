@@ -381,3 +381,7 @@ ninfer_add_op_test(ninfer_inkling2_fp32_ops_test
 ninfer_add_op_test(ninfer_dspark_fp32_ops_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dspark_fp32_ops.cpp"
   LIBRARIES ninfer_ops)
+# Inkling-2-Mini's vision tower FP32 Ops (vit_fp32.h) against FP64 oracles at the tower's shapes.
+ninfer_add_op_test(ninfer_vit_fp32_ops_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vit_fp32_ops.cpp"
+  LIBRARIES ninfer_ops)

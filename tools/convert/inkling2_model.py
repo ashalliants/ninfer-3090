@@ -32,7 +32,7 @@ from typing import Mapping
 
 from tools.artifact.formats import ggml_record_format
 
-from . import inkling2, inkling2_dspark, inkling2_tokenizer
+from . import inkling2, inkling2_dspark, inkling2_tokenizer, inkling2_vision
 from .inkling2 import Inkling2Error
 from .methods import import_encoded
 from .model import Model, Parameter
@@ -120,10 +120,12 @@ def resources(metadata: Mapping, config: Mapping, overrides: Mapping[str, str | 
 
 
 def build_model(gguf: GgufModel, *, resource_overrides: Mapping[str, str | Path] | None = None,
-                dspark: GgufModel | None = None) -> Model:
+                dspark: GgufModel | None = None, vision: GgufModel | None = None) -> Model:
     """The logical model of an Inkling-2-Mini GGUF. ``resource_overrides`` maps resource names to the checkpoint's
     files; without any the model carries no resources (tests), with some it must be complete. ``dspark`` is the
-    DSpark drafter's GGUF; it adds the ``dspark`` component (:func:`tools.convert.inkling2_dspark.add_dspark`)."""
+    DSpark drafter's GGUF; it adds the ``dspark`` component (:func:`tools.convert.inkling2_dspark.add_dspark`).
+    ``vision`` is the vision tower's mmproj GGUF; it adds the ``vision`` component
+    (:func:`tools.convert.inkling2_vision.add_vision`)."""
     overrides = dict(resource_overrides or {})
     unknown = overrides.keys() - set(RESOURCE_ROLES)
     if unknown:
@@ -182,6 +184,8 @@ def build_model(gguf: GgufModel, *, resource_overrides: Mapping[str, str | Path]
                 model.add(_direct(gguf, f"{name}_{part}_scale", scale.gguf, scale.shape))
     if dspark is not None:
         inkling2_dspark.add_dspark(model, dspark, gguf)
+    if vision is not None:
+        inkling2_vision.add_vision(model, vision)
     return model
 
 

@@ -8,3 +8,8 @@ ninfer_add_op_test(ninfer_inkling2_golden_test
 ninfer_add_op_test(ninfer_inkling2_dspark_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dspark.cpp"
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_ops ninfer_core)
+# The vision tower against its FP64 reference, and an image prompt through the text model, chunked against whole
+# (real artifact; skips without it).
+ninfer_add_op_test(ninfer_inkling2_vision_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_ops ninfer_core)
