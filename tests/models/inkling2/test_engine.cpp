@@ -187,6 +187,39 @@ int main() {
                   "the last context position still yields a token: " + std::to_string(edge.generated_token_ids.size()));
         }
         {
+            // Counting reports a prompt's length also when it leaves no room for a reply (generation refuses it).
+            std::string text;
+            for (std::uint32_t i = 0; i < options.max_context; ++i) { text += " the"; }
+            const auto counted = engine.count_tokens(user_turn({{.kind = ninfer::MessagePartKind::Text, .text = text}}));
+            check(counted > options.max_context, "a prompt past max_context is counted: " + std::to_string(counted));
+            try {
+                (void)engine.prepare(user_turn({{.kind = ninfer::MessagePartKind::Text, .text = text}}));
+                check(false, "a prompt past max_context is refused for generation");
+            } catch (const ninfer::RequestError&) {}
+        }
+        try {
+            auto bad = greedy(4);
+            bad.stop.token_ids.push_back(1'000'000'000);
+            (void)engine.generate(engine.prepare(question()), bad);
+            check(false, "a stop token outside the vocabulary is refused");
+        } catch (const std::invalid_argument&) {}
+        {
+            // parallel_tool_calls false: the first complete call ends the request.
+            ninfer::PromptInput input = user_turn({{.kind = ninfer::MessagePartKind::Text,
+                                                    .text = "Get the current weather in Paris and in Tokyo. Call the tool once per city."}});
+            input.options.enable_thinking = false;
+            input.options.tool_jsons.push_back(
+                R"({"type":"function","function":{"name":"get_weather","description":"Current weather for a city",)"
+                R"("parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}})");
+            auto tools = greedy(200);
+            const auto free_calls = engine.generate(engine.prepare(input), tools);
+            tools.tool_choice.parallel = false;
+            const auto one_call = engine.generate(engine.prepare(input), tools);
+            std::printf("tool calls: %zu with parallel calls, %zu without\n", free_calls.tool_calls.size(), one_call.tool_calls.size());
+            check(one_call.tool_calls.size() == 1 && one_call.finish_reason == ninfer::FinishReason::StopToken,
+                  "parallel false ends at the first call: " + std::to_string(one_call.tool_calls.size()));
+        }
+        {
             // A wrong sink is refused, and the request it was for is cancelled, not run to its limit.
             auto handle  = engine.submit(engine.prepare(question()), greedy(2000), ninfer::OutputConsumerMode::Aggregate, {});
             const auto t = Clock::now();

@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
+#include <future>
 #include <limits>
 #include <numeric>
 #include <random>
@@ -191,10 +193,11 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     if (options_.devices.size() > 1) { throw std::invalid_argument("Inkling-2 runs on one device"); }
     const auto start = Clock::now();
     const artifact::Reader reader(options_.artifact_path);
-    model_ = ink::load_model(reader, device_, &options_.startup_observer);
-    if (options_.enable_vision && model_->vision_config() == nullptr) {
+    if (options_.enable_vision && !reader.directory().components.contains("vision")) {
         throw std::invalid_argument("--vision: this Inkling-2 artifact has no vision tower (convert it with --mmproj)");
     }
+    // Only the tower a --vision server uses is uploaded; the drafter is not used.
+    model_ = ink::load_model(reader, device_, {.vision = options_.enable_vision, .dspark = false}, &options_.startup_observer);
     const ink::VisionConfig* vision = options_.enable_vision ? model_->vision_config() : nullptr;
     ink::FrontendOptions frontend_options{.max_context = options_.max_context, .vision = vision};
     frontend_ = std::make_unique<ink::Frontend>(model_->resources(), frontend_options);
@@ -218,7 +221,25 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     load_.peak_staging_bytes   = stats.peak_staging_bytes;
     load_.device_object_count  = stats.device_object_count;
     load_.host_object_count    = stats.host_object_count;
-    thread_ = std::thread([this] { worker(); });
+    // The worker binds the device before it takes requests; a failure there fails the construction.
+    std::promise<void> started;
+    auto bound = started.get_future();
+    thread_    = std::thread([this, &started] {
+        try {
+            device_.bind_to_current_thread();
+        } catch (...) {
+            started.set_exception(std::current_exception());
+            return;
+        }
+        started.set_value();
+        worker();
+    });
+    try {
+        bound.get();
+    } catch (...) {
+        thread_.join();
+        throw;
+    }
 }
 
 Inkling2Core::~Inkling2Core() {
@@ -232,7 +253,12 @@ Inkling2Core::~Inkling2Core() {
     if (stream_ != nullptr) { cudaStreamDestroy(stream_); }
 }
 
-void Inkling2Core::check_request(const ResolvedRequestOptions& options) {
+void Inkling2Core::check_request(const ResolvedRequestOptions& options) const {
+    for (const TokenId id : options.stop.token_ids) {
+        if (!frontend_->is_valid_token(id)) {
+            throw std::invalid_argument("stop token " + std::to_string(id) + " is not a token of Inkling-2");
+        }
+    }
     if (options.constraint) { throw std::invalid_argument("Inkling-2 serves no output constraints yet"); }
     if (options.tool_choice.mode == ToolChoiceMode::Required || options.tool_choice.allowed_names) {
         throw std::invalid_argument("Inkling-2 serves tool_choice auto or none only");
@@ -302,7 +328,6 @@ void Inkling2Core::fail_queued_locked(const char* why) {
 }
 
 void Inkling2Core::worker() {
-    device_.bind_to_current_thread();
     for (;;) {
         std::shared_ptr<Job> job;
         {
@@ -461,8 +486,14 @@ void Inkling2Core::run(Job& job) {
             break;
         }
         const bool reasoning_before = decoder.in_reasoning();
+        const std::size_t calls_before = decoder.tool_calls().size();
         auto step = decoder.push(next);
         emit(std::move(step.deltas));
+        if (!job.options.tool_choice.parallel && decoder.tool_calls().size() > calls_before) {
+            // parallel_tool_calls false: the first complete call ends the turn, as the model's end token would.
+            out.finish_reason = FinishReason::StopToken;
+            break;
+        }
         if (reasoning_before && !injected) { ++thinking_tokens; }
         if (step.stop) {
             out.finish_reason       = FinishReason::StopString;

@@ -28,7 +28,7 @@ class Inkling2Core {
 public:
     // What a request may ask of Inkling-2; throws std::invalid_argument. The Engine runs it for every request, also
     // those it answers without the core (no output tokens).
-    static void check_request(const ResolvedRequestOptions& options);
+    void check_request(const ResolvedRequestOptions& options) const;
 
     struct Job;
 

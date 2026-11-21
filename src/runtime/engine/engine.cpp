@@ -1168,7 +1168,7 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
 std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (impl_->inkling2 != nullptr) {
-        return impl_->inkling2->frontend().prepare(std::move(input), control).summary.prompt_tokens;
+        return impl_->inkling2->frontend().count_tokens(std::move(input), control);
     }
     return impl_->frontend().count_tokens(std::move(input), control);
 }
@@ -1225,7 +1225,7 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             context_capacity_error(prompt_summary.prompt_tokens, impl_->options.max_context));
     }
     const double prepare_seconds = prompt.impl_->prepare.seconds;
-    if (impl_->inkling2 != nullptr) { runtime::Inkling2Core::check_request(resolved_options); }
+    if (impl_->inkling2 != nullptr) { impl_->inkling2->check_request(resolved_options); }
     if (resolved_options.execution.requested_output_tokens == 0) {
         struct ImmediateSubmission {
             GenerationResult result;

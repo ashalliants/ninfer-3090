@@ -428,7 +428,13 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
   - video;
   - output constraints (grammar, JSON schema) and `tool_choice` required or named;
   - logprobs;
-  - a prompt that leaves no room for one output token.
+  - a prompt that leaves no room for one output token (token counting still reports its length);
+  - a stop token id outside the vocabulary.
+- Tool calls are free generation: the default `tool_constraints` (`basic`) is not enforced, since the route has
+  no grammar engine (output constraints are refused for the same reason). A call's name and arguments are what
+  the model wrote; malformed JSON stays content. `parallel_tool_calls: false` ends the request at the first
+  complete call (finish reason stop token, as the model's end token would).
+- A server without `--vision` binds and uploads no vision tower.
 
 **Output.** Control tokens switch the channel, as `tokenizer_config.json`'s `response_template` describes:
 

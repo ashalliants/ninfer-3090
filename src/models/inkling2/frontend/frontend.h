@@ -67,6 +67,9 @@ public:
     // do (context length, media, an unknown reasoning effort, continuing an assistant turn).
     [[nodiscard]] PreparedPrompt prepare(PromptInput input, const PreparationControl& control = {}) const;
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> tokens) const;
+    // The prompt's length as prepare() expands it (images included), also when it leaves no room for a reply.
+    [[nodiscard]] std::uint32_t count_tokens(PromptInput input, const PreparationControl& control = {}) const;
+    [[nodiscard]] bool is_valid_token(TokenId id) const;
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
     [[nodiscard]] std::string_view token_bytes(TokenId id) const;
     [[nodiscard]] bool is_special(TokenId id) const noexcept;
@@ -77,6 +80,9 @@ public:
     [[nodiscard]] text::TemplateOutput render(const PromptInput& input, const PreparationControl& control = {}) const;
 
 private:
+    // prepare() with `admit` (the prompt leaves room for a reply), count_tokens() without.
+    [[nodiscard]] PreparedPrompt build(PromptInput input, const PreparationControl& control, bool admit) const;
+
     std::shared_ptr<const qwen3_5::frontend::Tokenizer> tokenizer_;
     std::shared_ptr<const text::JinjaTemplate> template_;
     FrontendOptions options_;

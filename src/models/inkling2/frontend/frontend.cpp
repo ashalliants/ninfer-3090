@@ -216,6 +216,16 @@ text::TemplateOutput Frontend::render(const PromptInput& input, const Preparatio
 }
 
 PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {
+    return build(std::move(input), control, true);
+}
+
+std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl& control) const {
+    return build(std::move(input), control, false).summary.prompt_tokens;
+}
+
+bool Frontend::is_valid_token(TokenId id) const { return tokenizer_->is_valid_token(id); }
+
+PreparedPrompt Frontend::build(PromptInput input, const PreparationControl& control, bool admit) const {
     const auto start = Clock::now();
     if (input.options.continuation != PromptContinuationMode::NewAssistantTurn) {
         throw std::invalid_argument("Inkling-2 does not continue a final assistant message");
@@ -279,7 +289,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     }
     if (next_image != images.size()) { throw std::logic_error("inkling2: fewer image placeholders than images"); }
     out.stats.tokenize_seconds = seconds_since(tokenize_start);
-    if (out.tokens.size() >= options_.max_context) {
+    if (admit && out.tokens.size() >= options_.max_context) {
         throw RequestError(RequestErrorKind::ContextLengthExceeded,
                            "the prompt has " + std::to_string(out.tokens.size()) + " tokens; max_context is " +
                                std::to_string(options_.max_context) + " and the reply needs at least one");

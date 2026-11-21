@@ -116,7 +116,7 @@ public:
     [[nodiscard]] Matrix matrix(WeightId id) const;
 
 private:
-    friend std::unique_ptr<Model> load_model(const artifact::Reader&, DeviceContext&, const StartupObserver*);
+    friend std::unique_ptr<Model> load_model(const artifact::Reader&, DeviceContext&, const struct LoadComponents&, const StartupObserver*);
     Model(TextConfig config, TextWeights weights, std::vector<BoundWeight> bound, artifact::MaterializedArtifact backing);
     std::optional<DSparkConfig> dspark_config_;
     DSparkWeights dspark_weights_;
@@ -134,8 +134,14 @@ private:
 // True when the artifact's text component is Inkling-2.
 [[nodiscard]] bool is_inkling2(const artifact::Reader& reader);
 
-// Binds every parameter and materializes it in device memory.
+// The optional components to bind; an absent one is never read or uploaded (the artifact may lack it either way).
+struct LoadComponents {
+    bool vision = true;
+    bool dspark = true;
+};
+
+// Binds the text model's parameters and those of the components asked for, and materializes them in device memory.
 [[nodiscard]] std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext& device,
-                                                const StartupObserver* observer = nullptr);
+                                                const LoadComponents& components = {}, const StartupObserver* observer = nullptr);
 
 } // namespace ninfer::models::inkling2
