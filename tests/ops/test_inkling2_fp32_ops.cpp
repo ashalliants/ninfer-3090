@@ -531,6 +531,18 @@ void test_head_norm_append() {
         for (int c = 0; c < cols; ++c) { same &= std::memcmp(gc.data() + ((2 + c) % capacity) * rows, gb.data() + c * rows, rows * 4) == 0; }
         check(same, "head_norms_fp32 with an append differs from the plain call or its ring slots");
     }
+    {
+        // An append to a cache without storage is refused before the launch.
+        Tensor ta = a.tensor({rows, cols}), no_cache(nullptr, DType::FP32, {rows, capacity});
+        const ninfer::ops::KvAppend append{&no_cache, 0, nullptr};
+        ninfer::ops::HeadNormJob job;
+        job.x = &ta, job.head_dim = d, job.unit_rms = true, job.eps = 1e-6F, job.append = &append;
+        bool refused = false;
+        try {
+            ninfer::ops::head_norms_fp32(std::span<const ninfer::ops::HeadNormJob>(&job, 1), nullptr);
+        } catch (const std::invalid_argument&) { refused = true; }
+        check(refused, "head_norms_fp32 appends to a cache without storage");
+    }
     std::printf("head_norms_fp32 with a KvAppend: the plain call's bits, in the wrapped ring slots too\n");
 }
 
@@ -755,6 +767,17 @@ void test_experts(bool nvfp4, int h, int inter, int experts, const std::string& 
         check(eq(dout, combined, n) && eq(s1, s2, n) && eq(h1, h2, 3 * static_cast<std::size_t>(h)),
               label + ": the convolution's combine differs from the experts' combine then the convolution");
         std::printf("%-44s combined in the MLP convolution: bit-exact\n", label.c_str());
+        // A combine's entries or weights without storage are refused before the launch.
+        const Tensor no_entries(nullptr, DType::FP32, {h, k * cols}), no_weights(nullptr, DType::FP32, {k, cols});
+        for (const auto& bad : {ninfer::ops::ConvCombine{&no_entries, &tw, &tcomb}, ninfer::ops::ConvCombine{&te, &no_weights, &tcomb}}) {
+            ninfer::ops::ShortConvJob job = fused;
+            job.combine  = &bad;
+            bool refused = false;
+            try {
+                ninfer::ops::short_conv_fp32_batch(std::span<const ninfer::ops::ShortConvJob>(&job, 1), 1, nullptr);
+            } catch (const std::invalid_argument&) { refused = true; }
+            check(refused, label + ": a combine without storage was accepted");
+        }
     }
     if (nvfp4) { // the vector loads need 16-byte aligned records: an offset base is refused, not read
         auto shifted = bank;

@@ -302,8 +302,9 @@ void head_norms_fp32(std::span<const HeadNormJob> jobs, cudaStream_t stream) {
         a.floor[j] = 1;
         if (job.append != nullptr) {
             const KvAppend& ap = *job.append;
-            require(ap.cache != nullptr && ap.cache->dtype == DType::FP32 && ap.cache->is_contiguous() && ap.cache->ne[0] == x.ne[0] &&
-                        ap.cache->ne[1] >= cols && ap.start >= 0,
+            require(ap.cache != nullptr && ap.cache->data != nullptr && ap.cache->dtype == DType::FP32 && ap.cache->is_contiguous() &&
+                        ap.cache->ne[0] == x.ne[0] && ap.cache->ne[1] >= cols && ap.cache->ne[2] == 1 && ap.cache->ne[3] == 1 &&
+                        ap.start >= 0,
                     op, "an append's cache must be contiguous FP32 [rows, capacity >= T]");
             a.cache[j]        = static_cast<float*>(ap.cache->data);
             a.cache_start[j]  = ap.start;
