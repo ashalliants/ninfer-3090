@@ -602,6 +602,8 @@ int main() {
         test_attention(4, 4, 13, 1, "attention local window 4, decode, device start", true);
         test_attention(0, 4, 12, 1, "attention global, decode, device start", true);
         test_attention(0, 1024, 1030, 515, "attention global, two key tiles (last 6 of 1030)", false, 1024);
+        // Every key of a tile scored: one query sees 40 keys (16-key steps, a partial last one), all compared.
+        test_attention(0, 64, 40, 40, "attention global, 40 keys in one call");
         test_route();
         test_experts(true, 128, 64, 3, "moe_situ_experts NVFP4 small");
         test_experts(true, 2304, 1152, 3, "moe_situ_experts NVFP4 [3, 2304, 1152]");

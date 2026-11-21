@@ -16,6 +16,7 @@ constexpr int kWarps   = 4;
 constexpr int kThreads = kWarps * 32;
 constexpr int kTile    = 1024;
 constexpr int kKeyLanes = 8; // lanes that score one key together
+constexpr int kKeysPerStep = kThreads / kKeyLanes; // keys the block scores at once (16)
 
 void require(bool condition, const char* op, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string(op) + ": " + message); }
@@ -134,7 +135,10 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(AttentionArgs a) {
         const std::int64_t base_slot = base % a.capacity;
         // kKeyLanes lanes per key, kThreads / kKeyLanes keys at a time: lane `sub` dots four float4 of the key.
         // The loop bound is uniform per warp (the shuffles need every lane); keys past n score nothing.
-        for (int i0 = warp * (32 / kKeyLanes); i0 < n; i0 += kThreads / kKeyLanes) {
+        // Warp w takes keys 4w..4w+3 of every group of kKeysPerStep = kWarps * 32 / kKeyLanes = 16, so the
+        // four warps cover each group exactly once.
+        static_assert(kKeysPerStep == kWarps * (32 / kKeyLanes), "every key of a step has one 8-lane group");
+        for (int i0 = warp * (32 / kKeyLanes); i0 < n; i0 += kKeysPerStep) {
             const int i = i0 + lane / kKeyLanes;
             const bool valid = i < n;
             std::int64_t slot = base_slot + (valid ? i : 0);
