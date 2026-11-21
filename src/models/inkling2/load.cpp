@@ -84,6 +84,42 @@ LayerWeights bind_layer(Bindings& b, const TextConfig& c, std::uint32_t layer) {
     return w;
 }
 
+DSparkWeights bind_dspark(Bindings& b, const DSparkConfig& c, const TextConfig& text) {
+    const std::uint64_t h = c.hidden_size, f = c.intermediate_size, r = c.markov_rank, d = c.head_dim;
+    const std::uint64_t q = std::uint64_t(c.heads) * d, kv = std::uint64_t(c.kv_heads) * d;
+    DSparkWeights w;
+    w.fuse             = b.parameter("dspark/fuse", {c.layers + 1, c.target_visits.size()});
+    w.rnn_context_norm = b.parameter("dspark/rnn_context_norm", {h});
+    w.mask_embedding   = b.parameter("dspark/mask_embedding", {h});
+    w.output_norm      = b.parameter("dspark/output_norm", {h});
+    w.markov_embedding = b.parameter("dspark/markov/token_embedding", {text.vocab_size, r});
+    w.joint            = b.parameter("dspark/markov/joint", {3 * r, 2 * r + 2 * h});
+    w.joint_bias       = b.parameter("dspark/markov/joint_bias", {3 * r});
+    w.hidden_out       = b.parameter("dspark/markov/hidden_out", {h, r});
+    w.hidden_out_bias  = b.parameter("dspark/markov/hidden_out_bias", {h});
+    for (std::uint32_t i = 0; i < c.layers; ++i) {
+        const std::string p = "dspark/layers/" + std::to_string(i) + "/", a = p + "attention/";
+        DSparkLayerWeights l;
+        l.attn_norm      = b.parameter(a + "norm", {h});
+        l.q              = b.parameter(a + "q", {q, h});
+        l.k              = b.parameter(a + "k", {kv, h});
+        l.v              = b.parameter(a + "v", {kv, h});
+        l.output         = b.parameter(a + "output", {h, q});
+        l.q_norm         = b.parameter(a + "q_norm", {d});
+        l.k_norm         = b.parameter(a + "k_norm", {d});
+        l.context_k      = b.parameter(a + "context_k", {kv, h});
+        l.context_v      = b.parameter(a + "context_v", {kv, h});
+        l.context_k_norm = b.parameter(a + "context_k_norm", {d});
+        l.context_norm   = b.parameter(p + "context_norm", {h});
+        l.ffn_norm       = b.parameter(p + "ffn/norm", {h});
+        l.gate           = b.parameter(p + "ffn/gate", {f, h});
+        l.up             = b.parameter(p + "ffn/up", {f, h});
+        l.down           = b.parameter(p + "ffn/down", {h, f});
+        w.layers.push_back(l);
+    }
+    return w;
+}
+
 TextWeights bind_text(Bindings& b, const TextConfig& c) {
     const std::uint64_t h = c.hidden_size, v = c.vocab_size;
     TextWeights w;
@@ -143,6 +179,28 @@ ops::SituExpertBank bind_bank(const std::vector<BoundWeight>& bound, const Layer
     return bank;
 }
 
+// The drafter's direct reads (dspark_program.cpp): vectors and the fusion weights as FP32 words, the Markov
+// token table, its output projection and the borrowed text token table and head as BF16 words; every other matrix
+// goes through Model::matrix (Q8_0 blocks or BF16). Checked at load, whatever the converter wrote.
+void check_dspark_formats(const std::vector<BoundWeight>& bound, const DSparkWeights& w, const TextWeights& text) {
+    const auto require = [&](WeightId id, QType format, const char* what) {
+        const BoundWeight& weight = bound.at(id.index);
+        const auto& g             = whole_parent(weight).geometry;
+        if (g.format != format || g.layout != QuantLayout::Contiguous) {
+            throw ArtifactError(weight.name + ": the DSpark drafter reads it as contiguous " + what);
+        }
+    };
+    for (const WeightId id : {w.fuse, w.rnn_context_norm, w.mask_embedding, w.output_norm, w.joint_bias, w.hidden_out_bias}) {
+        require(id, QType::FP32, "FP32");
+    }
+    for (const WeightId id : {w.markov_embedding, w.hidden_out, text.embedding, text.head}) { require(id, QType::BF16, "BF16"); }
+    for (const DSparkLayerWeights& l : w.layers) {
+        for (const WeightId id : {l.attn_norm, l.q_norm, l.k_norm, l.context_k_norm, l.context_norm, l.ffn_norm}) {
+            require(id, QType::FP32, "FP32");
+        }
+    }
+}
+
 } // namespace
 
 Model::Model(TextConfig config, TextWeights weights, std::vector<BoundWeight> bound, artifact::MaterializedArtifact backing)
@@ -151,6 +209,18 @@ Model::Model(TextConfig config, TextWeights weights, std::vector<BoundWeight> bo
 }
 
 Model::~Model() = default;
+
+Model::Matrix Model::matrix(WeightId id) const {
+    const BoundWeight& weight = bound_.at(id.index);
+    const auto& parent        = whole_parent(weight);
+    const auto& g             = parent.geometry;
+    const bool q8 = g.format == QType::GGML_Q8_0 && g.layout == QuantLayout::GgmlBlocks;
+    const bool bf16 = g.format == QType::BF16 && g.layout == QuantLayout::Contiguous;
+    if ((!q8 && !bf16) || weight.view.shape.size() != 2) {
+        throw ArtifactError(weight.name + ": must be a Q8_0 (GGML blocks) or BF16 matrix");
+    }
+    return {parent.data, g.format, static_cast<std::int32_t>(weight.view.shape[0]), static_cast<std::int32_t>(weight.view.shape[1])};
+}
 
 Tensor Model::tensor(WeightId id, std::initializer_list<std::int32_t> ne) const {
     const BoundWeight& weight = bound_.at(id.index);
@@ -165,13 +235,29 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext&
     artifact::Binder binder(reader);
     Bindings bindings(binder);
     TextWeights weights = bind_text(bindings, config);
+    std::optional<DSparkConfig> dspark;
+    DSparkWeights dspark_weights;
+    if (reader.directory().components.contains("dspark")) {
+        dspark         = parse_dspark_config(reader.directory().component("dspark").config, config);
+        dspark_weights = bind_dspark(bindings, *dspark, config);
+    }
     auto references     = std::move(bindings.references);
     auto plan           = std::move(binder).finish();
     auto backing        = artifact::materialize(*plan.source, std::move(plan), device, observer);
     std::vector<BoundWeight> bound;
     bound.reserve(references.size());
     for (auto& reference : references) { bound.push_back({reference.name, artifact::bind_view(reference, backing)}); }
-    return std::unique_ptr<Model>(new Model(std::move(config), std::move(weights), std::move(bound), std::move(backing)));
+    auto model = std::unique_ptr<Model>(new Model(std::move(config), std::move(weights), std::move(bound), std::move(backing)));
+    if (dspark) {
+        check_dspark_formats(model->bound_, dspark_weights, model->weights_);
+        for (const DSparkLayerWeights& l : dspark_weights.layers) {
+            for (const WeightId id : {l.q, l.k, l.v, l.output, l.context_k, l.context_v, l.gate, l.up, l.down}) { (void)model->matrix(id); }
+        }
+        (void)model->matrix(dspark_weights.joint);
+    }
+    model->dspark_config_  = std::move(dspark);
+    model->dspark_weights_ = std::move(dspark_weights);
+    return model;
 }
 
 } // namespace ninfer::models::inkling2

@@ -26,6 +26,11 @@ struct ProgramLimits {
     // A single-token forward without a trace replays one CUDA graph, captured on the first such call (the
     // position and token are read on the device). Needs a stream other than the legacy default one.
     bool decode_graph = true;
+    // Taps (for the DSpark drafter): each forward copies, per entry v, the hidden state at the input of layer visit
+    // v (after the pass restart; v == num_layer_visits: the final normed state) into tap(i).
+    std::vector<std::uint32_t> tap_visits;
+    // A forward of 2..max_rollback tokens can be cut back afterwards by keep() (speculative verification).
+    std::int32_t max_rollback = 0;
 };
 
 class TextProgram {
@@ -45,6 +50,13 @@ public:
     void reset();
     [[nodiscard]] std::int64_t position() const noexcept { return position_; }
 
+    // Tap i of the last forward: FP32 [hidden, T] on the device, valid until the next forward.
+    [[nodiscard]] Tensor tap(std::size_t i) const;
+
+    // Keeps only the first n tokens of the last forward (1 <= n <= its T, T <= max_rollback when n < T): the
+    // sequence continues from position() = its start + n with every state as if only those tokens had been given.
+    void keep(std::int32_t n);
+
     // Appends tokens at position() and returns their logits: FP32 [vocab_size, T] on the device (rows past
     // unpadded_vocab_size are padding and never sampled), softcapped. Valid until the next call.
     Tensor forward(std::span<const std::int32_t> tokens, const Trace* trace = nullptr);
@@ -53,6 +65,8 @@ private:
     struct VisitState {
         Tensor k_cache, v_cache;                       // FP32 [kv_heads * head_dim, capacity]
         Tensor k_hist, v_hist, attn_hist, mlp_hist;    // FP32 [C, K - 1]
+        // With max_rollback: each history's state before the forward, then the forward's inputs: [C, K - 1 + T].
+        Tensor k_saved, v_saved, attn_saved, mlp_saved;
     };
 
     Tensor run(const Tensor& ids, std::int64_t start, const Trace* trace); // the forward after the token upload
@@ -63,6 +77,9 @@ private:
     void control(std::span<const ControllerWeights* const> w, std::span<const Tensor* const> c, std::span<const Tensor* const> m,
                  std::span<Tensor* const> out);
     Tensor project(const Tensor& x_bf16, std::span<const WeightId> weights, std::span<const std::int32_t> rows);
+    // With rollback saving on: x (a convolution's input [C, T]) after the saved history.
+    void save_input(Tensor& saved, const Tensor& x);
+    void copy_tap(std::uint32_t visit, const Tensor& value);
 
     const Model& model_;
     const TextConfig& config_;
@@ -72,6 +89,9 @@ private:
     DeviceArena workspace_;
     std::vector<VisitState> state_;
     std::int64_t position_ = 0;
+    std::vector<Tensor> taps_;          // FP32 [hidden, max_chunk] each
+    std::int32_t last_cols_ = 0;        // the last forward's T
+    bool saving_            = false;    // the forward in progress saves its convolution inputs
     // The decode graph: step_ holds {int64 position, int32 token} it reads; start_offset_ points at that position
     // while the graph is captured (the Ops add it to their host start of 0), and is null otherwise.
     DeviceBuffer step_;
