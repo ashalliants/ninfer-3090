@@ -116,30 +116,37 @@ __device__ float ue4m3_half(unsigned byte) {
     return v * 0.5F;
 }
 
-// Value i of an NVFP4 row (blocks of 36 bytes: 4 scale bytes, 32 code bytes; sub-block s of 16 values: j < 8 the
-// low nibble of code byte 8s + j, j + 8 the high one).
-__device__ float nvfp4_value(const std::uint8_t* row, int i) {
-    const std::uint8_t* blk = row + (i / kNvfp4Values) * kNvfp4Bytes;
-    const int v = i % kNvfp4Values, sub = v / 16, j = v % 16;
+// Value v of an NVFP4 block (36 bytes: 4 scale bytes, 32 code bytes; sub-block s of 16 values: j < 8 the low
+// nibble of code byte 8s + j, j + 8 the high one).
+__device__ float nvfp4_block_value(const std::uint8_t* blk, int v) {
+    const int sub = v / 16, j = v % 16;
     const unsigned q = blk[4 + 8 * sub + (j & 7)];
     return nvfp4_code(j < 8 ? q & 0xF : q >> 4) * ue4m3_half(blk[sub]);
 }
 
 // One block per row r of an expert's NVFP4 rows (rows r < split from first, the others from second): FP16(v 2^e)
-// and 2^-e; with `inexact`, counts the values not carried exactly.
+// and 2^-e; with `inexact`, counts the values not carried exactly. With group_rows > 0 the records are in the tiled
+// order (nvfp4_tiled_block, groups of group_rows rows), so a row is read through the permutation: each row's
+// exponent and count are its logical row's, whatever the order.
 __global__ void __launch_bounds__(kThreads)
-nvfp4_rows_to_f16(const std::uint8_t* __restrict__ first, const std::uint8_t* __restrict__ second, int split, std::uint64_t row_bytes, int n,
+nvfp4_rows_to_f16(const std::uint8_t* __restrict__ first, const std::uint8_t* __restrict__ second, int split, int n, int group_rows,
                   __half* __restrict__ dst, float* __restrict__ inverse, unsigned long long* inexact) {
     __shared__ float red[kThreads / 32];
-    const int r = blockIdx.x;
-    const std::uint8_t* row = r < split ? first + static_cast<std::uint64_t>(r) * row_bytes : second + static_cast<std::uint64_t>(r - split) * row_bytes;
+    const int r = blockIdx.x, local = r < split ? r : r - split, blocks = n / kNvfp4Values;
+    const std::uint8_t* matrix = r < split ? first : second;
+    const auto nvfp4_value = [&](int i) {
+        const int b = i / kNvfp4Values;
+        const std::uint64_t index = group_rows > 0 ? nvfp4_tiled_block(local, b, blocks, group_rows, nvfp4_rows_per_run(blocks))
+                                                   : static_cast<std::uint64_t>(local) * blocks + b;
+        return nvfp4_block_value(matrix + index * kNvfp4Bytes, i % kNvfp4Values);
+    };
     float m = 0.0F;
-    for (int i = threadIdx.x; i < n; i += kThreads) { m = fmaxf(m, fabsf(nvfp4_value(row, i))); }
+    for (int i = threadIdx.x; i < n; i += kThreads) { m = fmaxf(m, fabsf(nvfp4_value(i))); }
     const int e = scale_exponent(block_max(m, red));
     __half* out = dst != nullptr ? dst + static_cast<std::int64_t>(r) * n : nullptr;
     unsigned count = 0;
     for (int i = threadIdx.x; i < n; i += kThreads) {
-        const float v = nvfp4_value(row, i);
+        const float v = nvfp4_value(i);
         const __half h = __float2half_rn(ldexpf(v, e));
         if (out != nullptr) { out[i] = h; }
         count += ldexpf(__half2float(h), -e) != v ? 1U : 0U;
@@ -596,10 +603,10 @@ std::uint64_t nvfp4_bank_fp16_inexact(const SituExpertBank& bank, cudaStream_t s
     cudaMemsetAsync(count, 0, sizeof *count, stream);
     for (int e = 0; e < bank.experts; ++e) {
         const std::uint8_t* rec = bank.records + static_cast<std::uint64_t>(e) * g.stride;
-        nvfp4_rows_to_f16<<<2 * bank.intermediate, kThreads, 0, stream>>>(rec, rec + g.up_offset, bank.intermediate, g.gate_row_bytes, bank.hidden, nullptr,
-                                                                          nullptr, count);
-        nvfp4_rows_to_f16<<<bank.hidden, kThreads, 0, stream>>>(rec + g.down_offset, nullptr, bank.hidden, g.down_row_bytes, bank.intermediate, nullptr,
-                                                                nullptr, count);
+        nvfp4_rows_to_f16<<<2 * bank.intermediate, kThreads, 0, stream>>>(rec, rec + g.up_offset, bank.intermediate, bank.hidden,
+                                                                          bank.tiled ? kNvfp4GateGroupRows : 0, nullptr, nullptr, count);
+        nvfp4_rows_to_f16<<<bank.hidden, kThreads, 0, stream>>>(rec + g.down_offset, nullptr, bank.hidden, bank.intermediate,
+                                                                bank.tiled ? kNvfp4DownGroupRows : 0, nullptr, nullptr, count);
     }
     check_launch(op);
     unsigned long long host = 0;

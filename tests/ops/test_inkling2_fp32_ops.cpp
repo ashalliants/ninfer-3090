@@ -1132,8 +1132,6 @@ void test_experts(bool nvfp4, int h, int inter, int experts, const std::string& 
     }
 }
 
-// NINFER_INKLING2_OP_BENCH=1: decode-shaped timing (T = 1, top 8 of 32 resident experts at the model's shape, each
-// call a different 8 so nothing stays in L2), printed as microseconds and effective weight bandwidth. Not a criterion.
 // nvfp4_tile_records: the tiled records give the same bits as the untiled ones through every NVFP4 route (per
 // entry, grouped by expert, tensor cores), for the run shapes 1/2 (H 2304, I 1152) and 2/4 (H 1152, I 192).
 void test_tiled_experts(int h, int inter, const char* label) {
@@ -1179,6 +1177,8 @@ void test_tiled_experts(int h, int inter, const char* label) {
     };
     // The grouped route needs at least 64 entries: 17 columns of 4 is 68.
     const auto before = run_all(bank);
+    // The FP16 exactness diagnostic reads the logical rows through the tiling: the same count either way.
+    const std::uint64_t inexact_before = ninfer::ops::nvfp4_bank_fp16_inexact(bank, nullptr);
     ninfer::DeviceBuffer scratch(stride);
     ninfer::ops::nvfp4_tile_records(bank, static_cast<std::uint8_t*>(records.p), scratch.p, nullptr);
     check(cudaDeviceSynchronize() == cudaSuccess && bank.tiled, std::string(label) + ": tiling");
@@ -1188,12 +1188,18 @@ void test_tiled_experts(int h, int inter, const char* label) {
         same = before[i].size() == after[i].size() && std::memcmp(before[i].data(), after[i].data(), before[i].size() * 4) == 0;
     }
     check(same, std::string(label) + ": tiled records changed a result");
+    const std::uint64_t inexact_after = ninfer::ops::nvfp4_bank_fp16_inexact(bank, nullptr);
+    check(inexact_after == inexact_before, std::string(label) + ": the FP16 exactness count changed with the tiling: " +
+                                               std::to_string(inexact_before) + " untiled, " + std::to_string(inexact_after) + " tiled");
     std::vector<std::uint8_t> tiled(host.size());
     check(cudaMemcpy(tiled.data(), records.p, tiled.size(), cudaMemcpyDeviceToHost) == cudaSuccess && tiled != host,
           std::string(label) + ": the records were not repacked");
-    std::printf("%-44s tiled == untiled (T 1, T 17 grouped, T 17 tensor cores)\n", label);
+    std::printf("%-44s tiled == untiled (T 1, T 17 grouped, T 17 tensor cores; %llu FP16-inexact values either way)\n", label,
+                static_cast<unsigned long long>(inexact_before));
 }
 
+// NINFER_INKLING2_OP_BENCH=1: decode-shaped timing (T = 1, top 8 of 32 resident experts at the model's shape, each
+// call a different 8 so nothing stays in L2), printed as microseconds and effective weight bandwidth. Not a criterion.
 void bench_experts(bool nvfp4, int cols = 1) {
     const int h = 2304, inter = 1152, experts = cols > 1 ? 128 : 32, k = 8, iters = cols > 1 ? 5 : 40;
     ninfer::ops::SituExpertBank bank;
