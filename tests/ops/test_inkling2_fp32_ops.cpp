@@ -430,6 +430,16 @@ void test_experts(bool nvfp4, int h, int inter, int experts, const std::string& 
     Tensor tout = dout.tensor({h, cols});
     ninfer::ops::moe_situ_experts(bank, dz.tensor({h, cols}), Tensor(did.p, DType::I32, {k, cols}), dw.tensor({k, cols}), 4.0F, 25.0F,
                                   arena, tout, nullptr);
+    if (nvfp4) { // the vector loads need 16-byte aligned records: an offset base is refused, not read
+        auto shifted = bank;
+        shifted.records += 4;
+        bool refused = false;
+        try {
+            ninfer::ops::moe_situ_experts(shifted, dz.tensor({h, cols}), Tensor(did.p, DType::I32, {k, cols}), dw.tensor({k, cols}), 4.0F,
+                                          25.0F, arena, tout, nullptr);
+        } catch (const std::invalid_argument&) { refused = true; }
+        check(refused, label + ": unaligned NVFP4 records were accepted");
+    }
     double scale = 0;
     for (double x : want) { scale = std::max(scale, std::fabs(x)); }
     Vec scaled(want.size());

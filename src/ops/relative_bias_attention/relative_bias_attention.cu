@@ -244,6 +244,7 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     require(k_cache.dtype == DType::FP32 && v_cache.dtype == DType::FP32 && k_cache.is_contiguous() && v_cache.is_contiguous() &&
                 k_cache.ne[0] == kv_width && v_cache.ne[0] == kv_width && k_cache.ne[1] == v_cache.ne[1],
             op, "caches must be contiguous FP32 [kv_heads * d, capacity]");
+    require(reinterpret_cast<std::uintptr_t>(k_cache.data) % 16 == 0, op, "k_cache must be 16-byte aligned (float4 key loads)");
     const std::int64_t capacity = k_cache.ne[1];
     require(s.window > 0 ? capacity >= s.window - 1 + cols : capacity >= start + cols, op, "the KV ring cannot hold the visible keys");
     const dim3 append_grid(cols, (kv_width + 255) / 256);

@@ -63,8 +63,8 @@ struct SituExpertBank {
  *
  * Logical shapes: z FP32 [H, T] (any column stride); ids I32 [k, T], weights FP32 [k, T] contiguous; out FP32
  *   [H, T] contiguous.
- * Supported domain: format GGML_REC_NVFP4_NVFP4 (H and I multiples of 64) or BF16 (H and I multiples of 8, banks
- *   16-byte aligned); H and I at most 8192.
+ * Supported domain: format GGML_REC_NVFP4_NVFP4 (H and I multiples of 64, records and record stride 16-byte
+ *   aligned) or BF16 (H and I multiples of 8, banks 16-byte aligned); H and I at most 8192.
  * Numeric: FP32 activations and accumulation (no activation quantization); oracle FP64 over the decoded
  *   weights (inkling2_reference.h decode_nvfp4, situ).
  * Effects: writes out; it must not overlap z.

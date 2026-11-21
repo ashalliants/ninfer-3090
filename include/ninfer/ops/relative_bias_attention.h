@@ -65,7 +65,7 @@ struct RelativeBiasAttentionShape {
  *   [heads * d, T].
  *
  * Supported domain:
- *   d = 128; d_rel at most 32; heads a multiple of kv_heads; columns at any stride. The ring must hold every
+ *   d = 128; d_rel at most 32; heads a multiple of kv_heads; columns at any stride; k_cache 16-byte aligned. The ring must hold every
  *   key a column of this call can see: capacity >= window - 1 + T with a window, capacity >= start + T without.
  *   Positions before `start` must have been appended by earlier calls (the caller's sequence order). With a
  *   `start_offset` (a device int64, nullable) the start is start + *start_offset, read when the kernels run; the

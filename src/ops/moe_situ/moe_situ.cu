@@ -418,6 +418,9 @@ BankArgs bank_args(const SituExpertBank& bank) {
     b.down_scale = bank.down_scale;
     if (bank.format == QType::GGML_REC_NVFP4_NVFP4) {
         require(bank.records != nullptr, op, "records are null");
+        // The experts read the records with 16-byte vector loads (the loader aligns banks and records to 256 bytes).
+        require(reinterpret_cast<std::uintptr_t>(bank.records) % 16 == 0 && bank.record_stride % 16 == 0, op,
+                "NVFP4 records and their stride must be 16-byte aligned");
         require(bank.hidden % kNvfp4Values == 0 && bank.intermediate % kNvfp4Values == 0, op, "H and I must be multiples of 64");
         require(bank.intermediate % kGateRows == 0 && bank.hidden % kDownRows == 0, op, "NVFP4 banks need I a multiple of 4 and H of 8");
         b.nvfp4 = true;
