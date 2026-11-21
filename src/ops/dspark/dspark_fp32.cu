@@ -365,6 +365,86 @@ markov_logits_kernel(const float* base, const float* __restrict__ hb, const floa
     logits[v] = cap * tanhf((base[v] + hb[v] + acc) / cap);
 }
 
+// Compact P: thread j takes kPer consecutive v (kPer = 4 for BF16 and Q8, 8 for Q4), one load of their codes per r.
+template <MarkovForm F>
+__global__ void __launch_bounds__(256)
+markov_head_logits_kernel(const float* base, const float* __restrict__ hb, const void* __restrict__ codes, const float* __restrict__ scales,
+                          const float* __restrict__ latent, int r, int v_rows, float cap, float* logits) {
+    constexpr int kPer = F == MarkovForm::Q4 ? 8 : 4;
+    __shared__ float lat[1024];
+    for (int i = threadIdx.x; i < r; i += blockDim.x) { lat[i] = latent[i]; }
+    __syncthreads();
+    const int v0 = (blockIdx.x * blockDim.x + threadIdx.x) * kPer;
+    if (v0 >= v_rows) { return; }
+    float acc[kPer];
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) { acc[j] = 0.0F; }
+    for (int g = 0; g < r; g += 32) {
+        float part[kPer];
+#pragma unroll
+        for (int j = 0; j < kPer; ++j) { part[j] = 0.0F; }
+#pragma unroll 16
+        for (int i = g; i < g + 32; ++i) {
+            const float l = lat[i];
+            if constexpr (F == MarkovForm::BF16) {
+                const uint2 w = __ldg(reinterpret_cast<const uint2*>(codes) + (static_cast<std::int64_t>(i) * v_rows + v0) / 4);
+                part[0] = fmaf(__uint_as_float(w.x << 16), l, part[0]);
+                part[1] = fmaf(__uint_as_float(w.x & 0xFFFF0000U), l, part[1]);
+                part[2] = fmaf(__uint_as_float(w.y << 16), l, part[2]);
+                part[3] = fmaf(__uint_as_float(w.y & 0xFFFF0000U), l, part[3]);
+            } else if constexpr (F == MarkovForm::Q8) {
+                const char4 q = __ldg(reinterpret_cast<const char4*>(codes) + (static_cast<std::int64_t>(i) * v_rows + v0) / 4);
+                part[0] = fmaf(static_cast<float>(q.x), l, part[0]);
+                part[1] = fmaf(static_cast<float>(q.y), l, part[1]);
+                part[2] = fmaf(static_cast<float>(q.z), l, part[2]);
+                part[3] = fmaf(static_cast<float>(q.w), l, part[3]);
+            } else {
+                const std::uint32_t w = __ldg(reinterpret_cast<const std::uint32_t*>(codes) + (static_cast<std::int64_t>(i) * v_rows + v0) / 8);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) { part[j] = fmaf(static_cast<float>(static_cast<int>((w >> (4 * j)) & 15U) - 8), l, part[j]); }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < kPer; ++j) {
+            const float d = F == MarkovForm::BF16 ? 1.0F : scales[static_cast<std::int64_t>(g / 32) * v_rows + v0 + j];
+            acc[j] = fmaf(part[j], d, acc[j]);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+        const int v = v0 + j;
+        logits[v] = cap * tanhf((base[v] + hb[v] + acc[j]) / cap);
+    }
+}
+
+// grid (ceil(V / 256), R / 32): thread v of block (b, g) encodes P[v, 32g .. 32g + 31].
+__global__ void markov_head_quantize_kernel(const float* __restrict__ pt, MarkovForm form, void* codes, float* scales, int v_rows) {
+    const int g = blockIdx.y, v = min(static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x), v_rows - 1);
+    const bool live = blockIdx.x * blockDim.x + threadIdx.x < static_cast<unsigned>(v_rows); // all lanes stay for Q4's shuffles
+    float amax = 0.0F;
+    for (int i = 0; i < 32; ++i) { amax = fmaxf(amax, fabsf(pt[static_cast<std::int64_t>(32 * g + i) * v_rows + v])); }
+    const float levels = form == MarkovForm::Q8 ? 127.0F : 7.0F, d = amax / levels, inv = d > 0.0F ? 1.0F / d : 0.0F;
+    if (form != MarkovForm::BF16 && live) { scales[static_cast<std::int64_t>(g) * v_rows + v] = d; }
+    for (int i = 0; i < 32; ++i) {
+        const std::int64_t at = static_cast<std::int64_t>(32 * g + i) * v_rows + v;
+        const float x = pt[at];
+        if (form == MarkovForm::BF16) {
+            if (live) reinterpret_cast<__nv_bfloat16*>(codes)[at] = __float2bfloat16_rn(x);
+        } else if (form == MarkovForm::Q8) {
+            if (live) reinterpret_cast<std::int8_t*>(codes)[at] = static_cast<std::int8_t>(fminf(fmaxf(rintf(x * inv), -127.0F), 127.0F));
+        } else {
+            const int q = static_cast<int>(fminf(fmaxf(rintf(x * inv), -7.0F), 7.0F)) + 8;
+            // Eight threads (v0 .. v0 + 7) share a word: gather the nibbles in the warp.
+            const unsigned lane = threadIdx.x & 31U;
+            unsigned word = static_cast<unsigned>(q) << (4 * (lane & 7U));
+            word |= __shfl_xor_sync(0xFFFFFFFFU, word, 1);
+            word |= __shfl_xor_sync(0xFFFFFFFFU, word, 2);
+            word |= __shfl_xor_sync(0xFFFFFFFFU, word, 4);
+            if ((lane & 7U) == 0 && live) { reinterpret_cast<std::uint32_t*>(codes)[at / 8] = word; }
+        }
+    }
+}
+
 // grid (T), block 1024.
 __global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ logits, std::int64_t stride, int valid, int non_finite, int* __restrict__ out) {
     __shared__ float best_v[32];
@@ -527,6 +607,85 @@ void dspark_markov_logits_fp32(const Tensor& base, const Tensor& hb, const Tenso
     markov_logits_kernel<<<(b.rows + 255) / 256, 256, static_cast<std::size_t>(l.rows) * 4, stream>>>(
         static_cast<const float*>(base.data), static_cast<const float*>(hb.data), static_cast<const float*>(pt.data),
         static_cast<const float*>(latent.data), l.rows, b.rows, cap, static_cast<float*>(logits.data));
+    check_launch(op);
+}
+
+std::size_t markov_head_code_bytes(MarkovForm form, std::int32_t v, std::int32_t r) noexcept {
+    const std::size_t n = static_cast<std::size_t>(v) * r;
+    return form == MarkovForm::BF16 ? 2 * n : form == MarkovForm::Q8 ? n : n / 2;
+}
+
+std::size_t markov_head_scale_bytes(MarkovForm form, std::int32_t v, std::int32_t r) noexcept {
+    return form == MarkovForm::BF16 ? 0 : static_cast<std::size_t>(v) * (r / 32) * 4;
+}
+
+namespace {
+
+// The whole descriptor: a known form, V a positive multiple of 8, R a positive multiple of 32 up to 1024, codes
+// 8-byte aligned, and (Q8, Q4) 4-byte aligned scales.
+void check_head(const MarkovHead& head, const char* op) {
+    require(head.form == MarkovForm::BF16 || head.form == MarkovForm::Q8 || head.form == MarkovForm::Q4, op, "unknown MarkovForm");
+    require(head.v > 0 && head.v % 8 == 0 && head.r > 0 && head.r % 32 == 0 && head.r <= 1024, op,
+            "V must be a positive multiple of 8 and R a multiple of 32 up to 1024");
+    require(head.codes != nullptr && reinterpret_cast<std::uintptr_t>(head.codes) % 8 == 0, op, "codes must be non-null and 8-byte aligned");
+    require(head.form == MarkovForm::BF16 || (head.scales != nullptr && reinterpret_cast<std::uintptr_t>(head.scales) % 4 == 0), op,
+            "Q8 and Q4 need non-null, 4-byte aligned scales");
+}
+
+bool overlaps(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes) {
+    const auto x = reinterpret_cast<std::uintptr_t>(a), y = reinterpret_cast<std::uintptr_t>(b);
+    return a_bytes > 0 && b_bytes > 0 && x < y + b_bytes && y < x + a_bytes;
+}
+
+} // namespace
+
+void dspark_markov_quantize(const Tensor& pt, const MarkovHead& head, cudaStream_t stream) {
+    constexpr const char* op = "dspark_markov_quantize";
+    const Columns p = columns(pt, op, "pt", true);
+    check_head(head, op);
+    require(p.rows == head.v && p.cols == head.r, op, "pt must be [V, R]");
+    const std::size_t pt_bytes = static_cast<std::size_t>(head.v) * head.r * 4;
+    require(!overlaps(head.codes, markov_head_code_bytes(head.form, head.v, head.r), pt.data, pt_bytes) &&
+                !overlaps(head.scales, markov_head_scale_bytes(head.form, head.v, head.r), pt.data, pt_bytes) &&
+                !overlaps(head.codes, markov_head_code_bytes(head.form, head.v, head.r), head.scales,
+                          markov_head_scale_bytes(head.form, head.v, head.r)),
+            op, "codes, scales and pt must not overlap");
+    markov_head_quantize_kernel<<<dim3((head.v + 255) / 256, head.r / 32), 256, 0, stream>>>(static_cast<const float*>(pt.data), head.form,
+                                                                                   const_cast<void*>(head.codes), const_cast<float*>(head.scales), head.v);
+    check_launch(op);
+}
+
+void dspark_markov_logits(const Tensor& base, const Tensor& hb, const MarkovHead& head, const Tensor& latent, float cap, Tensor& logits,
+                          cudaStream_t stream) {
+    constexpr const char* op = "dspark_markov_logits";
+    const Columns b = columns(base, op, "base", true), h = columns(hb, op, "hb", true), l = columns(latent, op, "latent", true);
+    const Columns o = columns(logits, op, "logits", true);
+    require(b.cols == 1 && h.cols == 1 && l.cols == 1 && o.cols == 1, op, "vectors");
+    check_head(head, op);
+    require(h.rows == b.rows && o.rows == b.rows && head.v == b.rows && head.r == l.rows && cap > 0, op, "shapes differ");
+    // logits may be base (in place); it must not overlap the other inputs.
+    const std::size_t out_bytes = static_cast<std::size_t>(o.rows) * 4;
+    require(!overlaps(logits.data, out_bytes, hb.data, out_bytes) && !overlaps(logits.data, out_bytes, latent.data, static_cast<std::size_t>(l.rows) * 4) &&
+                !overlaps(logits.data, out_bytes, head.codes, markov_head_code_bytes(head.form, head.v, head.r)) &&
+                !overlaps(logits.data, out_bytes, head.scales, markov_head_scale_bytes(head.form, head.v, head.r)) &&
+                (logits.data == base.data || !overlaps(logits.data, out_bytes, base.data, out_bytes)),
+            op, "logits may be base but must not overlap hb, latent or the head");
+    const int per = head.form == MarkovForm::Q4 ? 8 : 4, threads = (head.v / per + 255) / 256;
+    const auto* bp = static_cast<const float*>(base.data);
+    const auto* hp = static_cast<const float*>(hb.data);
+    const auto* lp = static_cast<const float*>(latent.data);
+    auto* op_out   = static_cast<float*>(logits.data);
+    switch (head.form) {
+    case MarkovForm::BF16:
+        markov_head_logits_kernel<MarkovForm::BF16><<<threads, 256, 0, stream>>>(bp, hp, head.codes, head.scales, lp, head.r, head.v, cap, op_out);
+        break;
+    case MarkovForm::Q8:
+        markov_head_logits_kernel<MarkovForm::Q8><<<threads, 256, 0, stream>>>(bp, hp, head.codes, head.scales, lp, head.r, head.v, cap, op_out);
+        break;
+    case MarkovForm::Q4:
+        markov_head_logits_kernel<MarkovForm::Q4><<<threads, 256, 0, stream>>>(bp, hp, head.codes, head.scales, lp, head.r, head.v, cap, op_out);
+        break;
+    }
     check_launch(op);
 }
 
