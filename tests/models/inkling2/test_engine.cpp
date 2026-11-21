@@ -13,6 +13,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -145,6 +146,7 @@ int main() {
 
         const auto question = [] { return user_turn({text("Name three primary colours.")}); };
         // Aggregate, twice, and streaming.
+        const ninfer::RuntimeStats before = engine.runtime_stats();
         const auto a = engine.generate(engine.prepare(question()), greedy(64));
         const auto b = engine.generate(engine.prepare(question()), greedy(64));
         Collect sink;
@@ -152,6 +154,28 @@ int main() {
         observe.prompt_progress = true;
         auto handle             = engine.submit(engine.prepare(question()), greedy(64), ninfer::OutputConsumerMode::Streaming, observe);
         const auto c            = handle.wait(&sink);
+        {
+            // The runtime counters are the three requests' sums, and the lane is idle between requests.
+            const ninfer::RuntimeStats after = engine.runtime_stats();
+            std::uint64_t prompt = 0, generated = 0, computed = 0;
+            for (const auto* r : {&a, &b, &c}) {
+                prompt += r->prompt.prompt_tokens;
+                generated += r->generated_token_ids.size();
+                computed += r->computed_prefill_tokens;
+            }
+            check(after.prompt_tokens - before.prompt_tokens == prompt &&
+                      after.generated_tokens - before.generated_tokens == generated &&
+                      after.computed_prefill_tokens - before.computed_prefill_tokens == computed &&
+                      after.committed_decode_tokens - before.committed_decode_tokens == generated - 3,
+                  "the runtime token counters add up the requests");
+            check(after.decode_rounds - before.decode_rounds == after.decode_row_rounds - before.decode_row_rounds &&
+                      after.decode_rounds > before.decode_rounds && after.decode_seconds_total > before.decode_seconds_total &&
+                      after.prefill_seconds_total > before.prefill_seconds_total,
+                  "decode rounds and prefill and decode time are counted");
+            check(after.lane_count == 1 && after.running_requests == 0 && after.waiting_requests == 0 &&
+                      after.lanes[0].state == ninfer::RuntimeLaneStats::State::Idle,
+                  "an idle Engine reports one idle lane and no waiting requests");
+        }
         std::printf("greedy: %zu tokens, finish %d, reasoning %zu bytes, content %zu bytes, %.1f tok/s\n",
                     a.generated_token_ids.size(), static_cast<int>(a.finish_reason), a.reasoning.size(), a.content.size(),
                     (a.generated_token_ids.size() - 1) / std::max(a.timings.decode_seconds, 1e-9));

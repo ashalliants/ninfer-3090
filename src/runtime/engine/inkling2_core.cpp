@@ -470,7 +470,21 @@ void Inkling2Core::run(Job& job) {
     out.thinking.requested_budget      = job.options.execution.thinking.budget;
     out.thinking.effective_budget      = job.options.execution.thinking.effective_budget;
     out.engine_timing.queue_wait_seconds = seconds_between(job.submitted, began);
+    // However run() leaves, the lane is idle again.
+    struct IdleLane {
+        Inkling2Core& core;
+        ~IdleLane() {
+            std::lock_guard lock(core.stats_mutex_);
+            core.lane_             = {};
+            core.lane_first_token_ = {};
+        }
+    } idle_lane{*this};
     if (job.deadline != Clock::time_point{} && began > job.deadline) {
+        {
+            std::lock_guard lock(stats_mutex_);
+            ++totals_.waiting_expired_requests;
+            totals_.waiting_abandoned_seconds += out.engine_timing.queue_wait_seconds;
+        }
         throw RequestError(RequestErrorKind::QueueTimeout, "the request waited past its deadline");
     }
     const bool streaming = job.mode == OutputConsumerMode::Streaming;
@@ -495,8 +509,23 @@ void Inkling2Core::run(Job& job) {
     // A stream starts exactly once, also when it was cancelled while queued.
     if (streaming) { job.post(GenerationStart{.prompt = job.summary, .reused_prompt_tokens = static_cast<std::uint32_t>(resume)}); }
     if (job.cancelled) {
+        std::lock_guard lock(stats_mutex_);
+        ++totals_.waiting_cancelled_requests;
+        totals_.waiting_abandoned_seconds += out.engine_timing.queue_wait_seconds;
         out.finish_reason = FinishReason::Cancelled;
         return;
+    }
+    // Bound: the prompt counts once, reused tokens included, as RuntimeStats counts it.
+    {
+        std::lock_guard lock(stats_mutex_);
+        totals_.prompt_tokens += static_cast<std::uint64_t>(n);
+        totals_.reused_prompt_tokens += static_cast<std::uint64_t>(resume);
+        if (resume > 0) { ++totals_.root_selections; }
+        lane_ = {.state                = RuntimeLaneStats::State::Prefill,
+                 .request_id           = job.id,
+                 .prompt_tokens        = n,
+                 .reused_prompt_tokens = resume,
+                 .context_tokens       = resume};
     }
 
     // Images: each encoding copied out, since a chunk may need the end of one and the start of the next.
@@ -533,6 +562,10 @@ void Inkling2Core::run(Job& job) {
     Tensor logits;
     for (std::int32_t s = resume; s < n; s += kChunk) {
         if (job.cancelled) {
+            std::lock_guard lock(stats_mutex_);
+            ++totals_.cancelled_prefills;
+            totals_.cancelled_prefill_computed_tokens += static_cast<std::uint64_t>(s - resume);
+            totals_.prefill_seconds_total += seconds_between(prefill_start, Clock::now());
             out.finish_reason = FinishReason::Cancelled;
             return;
         }
@@ -550,6 +583,12 @@ void Inkling2Core::run(Job& job) {
             program.save(snapshot);
             programs_->snapshot_keys.assign(keys.begin(), keys.begin() + keep_at);
         }
+        {
+            std::lock_guard lock(stats_mutex_);
+            totals_.computed_prefill_tokens += static_cast<std::uint64_t>(len);
+            lane_.computed_prompt_tokens = s + len - resume;
+            lane_.context_tokens         = s + len;
+        }
         if (job.observation.prompt_progress && streaming) {
             check_cuda(cudaStreamSynchronize(stream_), "prefill");
             job.post(PromptProgress{.total_prompt_tokens     = static_cast<std::uint32_t>(n),
@@ -560,9 +599,6 @@ void Inkling2Core::run(Job& job) {
         }
     }
     out.computed_prefill_tokens = static_cast<std::uint32_t>(n - resume);
-    prompt_tokens_ += static_cast<std::uint64_t>(n); // reused tokens included, as RuntimeStats counts them
-    reused_tokens_ += static_cast<std::uint64_t>(resume);
-    if (resume > 0) { ++reuse_selections_; }
 
     // Decode.
     job.unit = "decode";
@@ -577,6 +613,7 @@ void Inkling2Core::run(Job& job) {
     std::deque<TokenId> forced; // a thinking budget's close: end the reasoning, open the answer
     const auto decode_start = Clock::now();
     Clock::time_point first_token{};
+    Clock::time_point decode_mark{}; // where the decode time counted so far ends
     std::uint32_t thinking_tokens = 0;
     const auto emit = [&](std::vector<OutputDelta> deltas) {
         if (!streaming) { return; }
@@ -602,6 +639,13 @@ void Inkling2Core::run(Job& job) {
         }
         if (first_token == Clock::time_point{}) {
             first_token = Clock::now();
+            decode_mark = first_token;
+            {
+                std::lock_guard lock(stats_mutex_);
+                totals_.prefill_seconds_total += seconds_between(prefill_start, first_token);
+                lane_.state       = RuntimeLaneStats::State::Decoding;
+                lane_first_token_ = first_token;
+            }
             out.timings.prefill_seconds     = seconds_between(prefill_start, first_token);
             out.timings.first_token_seconds = seconds_between(job.submitted, first_token) + job.prepare_seconds;
             job.post(GenerationFirstTokenObservation{.prepare_seconds              = job.prepare_seconds,
@@ -611,7 +655,22 @@ void Inkling2Core::run(Job& job) {
         const bool is_stop = !injected && std::find(stop_ids.begin(), stop_ids.end(), next) != stop_ids.end();
         out.generated_token_ids.push_back(next);
         ++counts[next];
-        ++generated_tokens_;
+        {
+            // Every committed token, injected controls included; those after the first are decode's.
+            const auto now = Clock::now();
+            std::lock_guard lock(stats_mutex_);
+            ++totals_.generated_tokens;
+            ++lane_.generated_tokens;
+            ++lane_.context_tokens;
+            if (out.generated_token_ids.size() > 1) {
+                ++totals_.committed_decode_tokens;
+                totals_.decode_seconds_total += seconds_between(decode_mark, now);
+                decode_mark = now;
+                const double since_first = seconds_between(first_token, now);
+                lane_.decode_tokens_per_second =
+                    since_first > 0.0 ? static_cast<double>(lane_.generated_tokens - 1) / since_first : 0.0;
+            }
+        }
         if (is_stop) {
             out.finish_reason = FinishReason::StopToken;
             break;
@@ -656,6 +715,11 @@ void Inkling2Core::run(Job& job) {
         }
         const std::int32_t one[1] = {next};
         logits = program.forward(one);
+        {
+            std::lock_guard lock(stats_mutex_);
+            ++totals_.decode_rounds;
+            ++totals_.decode_row_rounds; // a batch of one
+        }
     }
     emit(decoder.finish());
     if (decoder.matched_stop() && out.finish_reason != FinishReason::StopString) {
@@ -694,10 +758,24 @@ MemorySummary Inkling2Core::memory_summary() const {
 
 RuntimeStats Inkling2Core::runtime_stats() const {
     RuntimeStats s;
-    s.prompt_tokens    = prompt_tokens_;
-    s.generated_tokens = generated_tokens_;
-    s.reused_prompt_tokens = reused_tokens_;
-    s.root_selections      = reuse_selections_;
+    const auto now = Clock::now();
+    std::lock_guard lock(mutex_); // the queue, then the counters and the lane (stats_mutex_ comes after mutex_)
+    {
+        std::lock_guard stats_lock(stats_mutex_);
+        s = totals_;
+        s.lanes[0] = lane_;
+    }
+    s.lane_count            = 1;
+    s.running_requests      = s.lanes[0].state != RuntimeLaneStats::State::Idle ? 1U : 0U;
+    s.prefilling_requests   = s.lanes[0].state == RuntimeLaneStats::State::Prefill ? 1U : 0U;
+    s.decode_ready_requests = s.lanes[0].state == RuntimeLaneStats::State::Decoding ? 1U : 0U;
+    s.waiting_requests      = static_cast<std::uint32_t>(queue_.size());
+    for (const auto& waiting : queue_) {
+        if (s.waiting.size() == kMaximumReportedWaitingRequests) { break; }
+        s.waiting.push_back({.request_id     = waiting->id,
+                             .prompt_tokens  = static_cast<std::int64_t>(waiting->prompt.tokens.size()),
+                             .waited_seconds = seconds_between(waiting->submitted, now)});
+    }
     return s;
 }
 

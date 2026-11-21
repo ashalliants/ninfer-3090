@@ -93,7 +93,12 @@ private:
     std::atomic<bool> failed_{false};
     std::atomic<std::uint64_t> next_id_{1};
     std::uint32_t consecutive_failures_ = 0; // the worker's streak of faulted requests (EngineFaultEvent)
-    std::atomic<std::uint64_t> prompt_tokens_{0}, generated_tokens_{0}, reused_tokens_{0}, reuse_selections_{0};
+    // runtime_stats(): the monotonic counters and the one lane's gauges, which the worker updates as it runs a
+    // request. Taken alone or after mutex_, never before it.
+    mutable std::mutex stats_mutex_;
+    RuntimeStats totals_;   // the counters; its gauges and lanes are filled in by runtime_stats()
+    RuntimeLaneStats lane_; // Idle between requests
+    std::chrono::steady_clock::time_point lane_first_token_{};
     std::thread thread_;
 };
 
