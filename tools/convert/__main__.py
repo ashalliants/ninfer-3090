@@ -158,7 +158,7 @@ def main(argv=None):
     parser.add_argument(
         "--mtp-gguf",
         type=Path,
-        help="GGUF: add the MTP drafter from this GGUF (Strata's mtp-q2_0.gguf), component mtp",
+        help="GGUF: add the drafter from this GGUF, component mtp (Strata's mtp-q2_0.gguf) or dspark (Inkling-2)",
     )
     parser.add_argument(
         "--mmproj",
@@ -210,16 +210,17 @@ def main(argv=None):
                         raise FileExistsError(f"Engram volume already exists: {ngram_out}")
                     dsv4_engram.bind(config, dsv4_engram.new_volume_id())
             elif architecture == inkling2.ARCHITECTURE:
-                # Inkling-2-Mini: text only for now; the drafter (dspark) and vision GGUFs are later components.
-                if args.subset or args.mtp_gguf or args.mmproj or args.ngram_out or args.ngram_reuse:
-                    raise ValueError("an inkling2 GGUF takes none of --subset, --mtp-gguf, --mmproj and --ngram-*")
+                # Inkling-2-Mini: --mtp-gguf takes the DSpark drafter's GGUF; vision is a later component.
+                if args.subset or args.mmproj or args.ngram_out or args.ngram_reuse:
+                    raise ValueError("an inkling2 GGUF takes none of --subset, --mmproj and --ngram-*")
                 missing = sorted({"tokenizer.json", "tokenizer_config.json"} - overrides.keys())
                 if missing:
                     raise ValueError(
                         f"an inkling2 GGUF needs the checkpoint's {missing}: --resource NAME=PATH "
                         "(the artifact's tokenizer and generation resources come from them)"
                     )
-                model = inkling2_model.build_model(base, resource_overrides=overrides)
+                dspark = stack.enter_context(GgufModel(args.mtp_gguf)) if args.mtp_gguf else None
+                model = inkling2_model.build_model(base, resource_overrides=overrides, dspark=dspark)
             else:
                 mtp = stack.enter_context(GgufModel(args.mtp_gguf)) if args.mtp_gguf else None
                 mmproj = stack.enter_context(GgufModel(args.mmproj)) if args.mmproj else None
