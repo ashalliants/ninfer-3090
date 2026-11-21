@@ -153,6 +153,16 @@ int main() {
                   "a thinking budget within the limit");
             auto tight                      = greedy(4);
             tight.execution.thinking.budget = 1;
+            {
+                // The model's own turn opening counts against the limit too: 2 opening + 1 + 3 close + 1 answer.
+                auto seven                      = greedy(7);
+                seven.execution.thinking.budget = 3;
+                const auto r                    = engine.generate(engine.prepare(question()), seven);
+                // The close is the 4th to 6th token, and the 7th is the model's.
+                check(r.generated_token_ids.size() == 7 && r.thinking.applied && r.thinking.effective_budget == 1u &&
+                          r.generated_token_ids[5] == 200004,
+                      "a thinking budget leaves room for an answer token: " + ids_text(r.generated_token_ids));
+            }
             const auto open                 = engine.generate(engine.prepare(question()), tight);
             check(open.generated_token_ids.size() <= 4 && !open.thinking.applied && !open.thinking.effective_budget,
                   "no close past the limit");

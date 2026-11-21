@@ -443,6 +443,7 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
 - Text is published in whole UTF-8 characters.
 - Text that could still become a caller's stop string is held back.
 - A thinking budget closes the reasoning by injecting `<|end_message|><|message_model|><|content_text|>`.
+  The budget applies only where the model's 2-token turn opening, the 3-token close and one answer token fit in the output limit.
 
 **Execution** (`Inkling2Core`).
 - One worker thread takes requests in submission order. Each request:

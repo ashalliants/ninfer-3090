@@ -36,6 +36,8 @@ void check_cuda(cudaError_t status, const char* what) {
 constexpr std::int32_t kChunk = 256; // prompt tokens per forward
 // <|end_message|><|message_model|><|content_text|>: what a thinking budget injects to close the reasoning.
 constexpr std::uint32_t kCloseTokens = 3;
+// <|message_model|><|content_thinking|>: the model opens its own turn (the template has no generation prompt).
+constexpr std::uint32_t kOpenTokens = 2;
 
 // One token from the last column's logits (OpenAI presence and frequency penalties over the generated tokens, then
 // temperature, top-k, min-p and top-p). Temperature 0 is argmax, the lowest id among equals.
@@ -237,12 +239,14 @@ Inkling2Core::Submission Inkling2Core::submit(ink::PreparedPrompt prompt, Prompt
     if (submitted >= pending_deadline) {
         throw RequestError(RequestErrorKind::QueueTimeout, "inference request expired before submission");
     }
-    // A thinking budget closes the reasoning with kCloseTokens control tokens, and the answer needs at least one
-    // more: the budget takes effect only where those fit in the output limit (the effective budget).
+    // A thinking budget counts reasoning tokens after the model's kOpenTokens turn opening, closes the reasoning
+    // with kCloseTokens control tokens, and the answer needs at least one more: the budget takes effect only where
+    // all of those fit in the output limit (the effective budget).
     if (const auto budget = options.execution.thinking.budget) {
-        const std::uint32_t limit = options.execution.requested_output_tokens;
+        constexpr std::uint32_t frame = kOpenTokens + kCloseTokens + 1;
+        const std::uint32_t limit     = options.execution.requested_output_tokens;
         options.execution.thinking.effective_budget =
-            limit > kCloseTokens + 1 ? std::optional(std::min(*budget, limit - kCloseTokens - 1)) : std::nullopt;
+            limit > frame ? std::optional(std::min(*budget, limit - frame)) : std::nullopt;
     }
     auto job             = std::make_shared<Job>();
     job->id              = next_id_++;
@@ -446,8 +450,10 @@ void Inkling2Core::run(Job& job) {
             out.matched_stop_string = decoder.matched_stop();
             break;
         }
+        // The close also comes early when only it and one answer token still fit (a longer opening than kOpenTokens).
+        const bool no_room = out.generated_token_ids.size() + kCloseTokens + 1 >= exec.requested_output_tokens;
         if (exec.thinking.effective_budget && decoder.in_reasoning() && forced.empty() && !out.thinking.applied &&
-            thinking_tokens >= *exec.thinking.effective_budget &&
+            (thinking_tokens >= *exec.thinking.effective_budget || no_room) &&
             program.position() + 2 + kCloseTokens < static_cast<std::int64_t>(options_.max_context)) {
             forced                    = {ink::token::kEndMessage, ink::token::kMessageModel, ink::token::kContentText};
             out.thinking.applied      = true;
