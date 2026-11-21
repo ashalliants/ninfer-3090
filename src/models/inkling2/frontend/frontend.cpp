@@ -454,6 +454,7 @@ void OutputDecoder::close_tool_call(Step& step) {
 OutputDecoder::Step OutputDecoder::push(TokenId id) {
     Step step;
     const bool was_reasoning = channel_ == Channel::Reasoning;
+    const Channel before     = channel_;
     if (frontend_.is_special(id)) {
         // A control token ends any character a channel's last bytes left open.
         for (std::size_t c = 0; c < 2; ++c) { text_[c] += take_utf8(raw_[c], true); }
@@ -480,6 +481,16 @@ OutputDecoder::Step OutputDecoder::push(TokenId id) {
         case Channel::None: append(0, bytes, step); break;
         }
     }
+    // The text channel (0 content, 1 reasoning) a channel writes to, or none.
+    const auto text_channel = [](Channel c) {
+        return c == Channel::Reasoning ? 1 : c == Channel::Content || c == Channel::None ? 0 : -1;
+    };
+    if (!step.stop && text_channel(before) >= 0 && text_channel(before) != text_channel(channel_)) {
+        // The output left this channel: what it held for a stop string is published now, before what comes next.
+        const auto left = static_cast<std::size_t>(text_channel(before));
+        publish(left, true, step.deltas);
+        floor_[left] = text_[left].size();
+    }
     if (was_reasoning) { ++reasoning_tokens_; }
     if (!step.stop) {
         publish(0, false, step.deltas);
@@ -496,10 +507,14 @@ void OutputDecoder::append(std::size_t channel, std::string_view bytes, Step& st
     const OutputChannel which = channel == 0 ? OutputChannel::Content : OutputChannel::Reasoning;
     for (const StopString& stop : stops_) {
         if (stop.channel != which) { continue; }
-        const std::size_t search = from >= stop.text.size() ? from - stop.text.size() + 1 : 0;
+        const std::size_t search =
+            std::max(from >= stop.text.size() ? from - stop.text.size() + 1 : 0, floor_[channel]);
         const std::size_t at     = text.find(stop.text, search);
         if (at == std::string::npos) { continue; }
         text.resize(stop.include_in_output ? at + stop.text.size() : at);
+        // Nothing after the stop is output, including bytes of a character still open.
+        raw_[0].clear();
+        raw_[1].clear();
         matched_   = stop.text;
         step.stop  = true;
         publish(0, true, step.deltas);
@@ -516,7 +531,7 @@ void OutputDecoder::publish(std::size_t channel, bool all, std::vector<OutputDel
         const OutputChannel which = channel == 0 ? OutputChannel::Content : OutputChannel::Reasoning;
         for (const StopString& stop : stops_) {
             if (stop.channel != which) { continue; }
-            for (std::size_t n = std::min(stop.text.size() - 1, text.size()); n > 0; --n) {
+            for (std::size_t n = std::min(stop.text.size() - 1, text.size() - floor_[channel]); n > 0; --n) {
                 if (text.compare(text.size() - n, n, stop.text, 0, n) == 0) {
                     end = std::min(end, text.size() - n);
                     break;

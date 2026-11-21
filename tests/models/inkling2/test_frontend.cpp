@@ -270,6 +270,30 @@ int main() {
                                                        {ink::token::kEndMessage}}));
             check(euro.content == "\xe2\x82\xac" && euro.deltas_valid, "a character split across tokens");
         }
+        // The channel boundary: a channel's held text is published when the output leaves it.
+        {
+            // Reasoning held back as a possible stop string is published when the reasoning ends, before the content.
+            ink::OutputDecoder decoder(frontend, {{.text = "XYZ", .channel = ninfer::OutputChannel::Reasoning}});
+            std::vector<ninfer::OutputDelta> deltas;
+            for (const TokenId id : cat({{ink::token::kMessageModel, ink::token::kContentThinking}, words("think XY"), {ink::token::kEndMessage},
+                                         {ink::token::kMessageModel, ink::token::kContentText}, words("answer"), {ink::token::kEndMessage}})) {
+                auto step = decoder.push(id);
+                deltas.insert(deltas.end(), step.deltas.begin(), step.deltas.end());
+            }
+            const auto rest = decoder.finish();
+            deltas.insert(deltas.end(), rest.begin(), rest.end());
+            std::string reasoning;
+            bool content_seen = false, in_order = true;
+            for (const auto& delta : deltas) {
+                if (delta.channel == ninfer::OutputChannel::Content) { content_seen = true; }
+                if (delta.channel == ninfer::OutputChannel::Reasoning) {
+                    in_order = in_order && !content_seen;
+                    reasoning += delta.text;
+                }
+            }
+            check(in_order && reasoning == decoder.reasoning() && reasoning.ends_with("XY"),
+                  "held reasoning is published before the content that follows it");
+        }
         // Declared tools: a call to an undeclared name stays text; arguments are checked against the parameter schema.
         {
             const std::vector<ink::ToolDeclaration> declared{

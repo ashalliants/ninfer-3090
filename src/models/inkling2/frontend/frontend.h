@@ -142,6 +142,8 @@ private:
     std::string text_[2];          // content, reasoning: valid UTF-8
     std::string raw_[2];           // their last bytes that do not yet make a whole character
     std::size_t published_[2] = {0, 0};
+    // Where a stop string may start: a channel the output left was published whole, so no match reaches back past it.
+    std::size_t floor_[2] = {0, 0};
     std::string tool_json_;
     std::vector<GeneratedToolCall> calls_;
     ToolCallParseDiagnostics parse_;
