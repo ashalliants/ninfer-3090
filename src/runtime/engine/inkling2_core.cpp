@@ -687,7 +687,8 @@ void Inkling2Core::run(Job& job) {
     int since_probe = 0, probe_interval = 8;
     Clock::time_point forward_at{};
     bool forward_was_round = false;
-    if (speculate) {
+    // Every request of a --spec dspark Engine reports the backend; a sampled one runs plain, with no rounds.
+    if (programs_->drafter != nullptr) {
         out.speculative.backend      = SpeculativeBackend::DSpark;
         out.speculative.enabled      = true;
         out.speculative.draft_window = static_cast<std::uint32_t>(n_drafts);
@@ -708,6 +709,12 @@ void Inkling2Core::run(Job& job) {
         out.speculative.drafted_tokens += static_cast<std::uint64_t>(round_drafts);
         out.speculative.accepted_tokens += static_cast<std::uint64_t>(col);
         for (std::int32_t i = 0; i < col; ++i) { ++out.speculative.accepted_per_position[static_cast<std::size_t>(i)]; }
+        std::lock_guard lock(stats_mutex_);
+        ++totals_.speculative_rounds;
+        totals_.speculative_draft_tokens += static_cast<std::uint64_t>(round_drafts);
+        totals_.speculative_accepted_tokens += static_cast<std::uint64_t>(col);
+        lane_.drafted_tokens += static_cast<std::uint64_t>(round_drafts);
+        lane_.accepted_tokens += static_cast<std::uint64_t>(col);
     };
     const auto close_round = [&] {
         const std::int32_t kept = col + 1; // the anchor and the drafts consumed
@@ -774,6 +781,8 @@ void Inkling2Core::run(Job& job) {
                 }
                 ++held_n;
                 ++out.speculative.fallback_steps;
+                std::lock_guard lock(stats_mutex_);
+                ++totals_.speculative_fallback_steps;
             }
         }
         col = 0;

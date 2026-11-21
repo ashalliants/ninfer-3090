@@ -131,6 +131,12 @@ int main() {
         ninfer::Engine engine(options);
         std::printf("dspark, %u drafts per round:\n", drafts);
         const Run spec = run_all(engine, tokens);
+        {
+            const auto stats = engine.runtime_stats();
+            check(stats.speculative_rounds == spec.rounds && stats.speculative_draft_tokens == spec.drafted &&
+                      stats.speculative_accepted_tokens == spec.accepted && stats.speculative_fallback_steps == spec.fallback,
+                  "the Engine's cumulative DSpark counters sum the requests'");
+        }
         for (std::size_t i = 0; i < kPrompts.size(); ++i) {
             const auto& x = spec.tokens[i];
             const auto& y = plain.tokens[i];
@@ -184,6 +190,8 @@ int main() {
         const auto s1 = engine.generate(engine.prepare(user_turn(kPrompts[2])), sampled);
         const auto s2 = engine.generate(engine.prepare(user_turn(kPrompts[2])), sampled);
         check(s1.speculative.rounds == 0 && s1.speculative.fallback_steps == 0 && s1.generated_token_ids == s2.generated_token_ids, "a sampled request runs plain and repeats");
+        check(s1.speculative.backend == ninfer::SpeculativeBackend::DSpark && s1.speculative.draft_window == drafts,
+              "a sampled request reports the configured backend");
         const double plain_rate = (plain.generated - kPrompts.size()) / plain.decode_seconds;
         const double spec_rate  = (spec.generated - kPrompts.size()) / spec.decode_seconds;
         std::printf("plain %.1f tok/s, dspark %.1f tok/s (%.2fx); %llu rounds, %.2f drafts accepted per round, %llu plain steps\n",
