@@ -590,7 +590,8 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
   min-p, then top-p. Temperature 0 is argmax, lowest id first. A seed repeats its output.
 - The defaults follow `generation_config.json`: temperature 1, top-p 1. Top-k is 20.
 - `max_pending_requests` bounds the queue, and `pending_timeout` refuses a request that waited too long.
-- There is no batching, context store or suspend.
+- `--max-concurrency N` (N > 1) decodes up to N requests together ([Batched decode](#batched-decode)). There is no context
+  store or suspend.
 - Prefix reuse (on unless `context_cache.enabled` is off or a request sets `allow_prefix_reuse` false): after the
   last whole multiple of the prefill chunk that leaves a position to compute, the core copies the state a forward
   from there needs (`TextProgram::save`: every sliding visit's last 1023 K/V columns and every visit's convolution
@@ -1185,3 +1186,81 @@ the same for every window), drafts accepted of drafts made:
 
 A task that reads far back loses most of its accepted drafts, so `auto` windows the drafter only when the whole
 context does not fit.
+
+## Batched decode
+
+`--max-concurrency N` (2 to 8; default 1) runs up to N requests at once. Each request gets its own slot in the text
+Program, and every decode step is one forward with one column per decoding request
+(`TextProgram::forward_batch`, `Inkling2Core::worker_batched`). The default (N = 1) is unchanged: one request at a
+time on the single-sequence decode graph, with DSpark when configured.
+
+Exactness: each request's tokens and logits are bit-identical to its solo run.
+
+- Every decode op except the attention and the short convolutions is already column-independent: the projections
+  (per column at every width below the tensor cores' 64), the experts (the per-entry route, and the grouped one from
+  64 entries, which is bit-exact with T = 1), depth mix, loop controllers, norms, routing and the head.
+- The stateful ops take `ops::ColumnSequences`: a device table of each column's position and slot, and the byte
+  stride between slots.
+  - `short_conv_fp32_batch` reads each column's window from that column's own history and writes only that history
+    back.
+  - `head_norms_fp32` takes the log scale from the column's position and appends at that position in the column's
+    ring.
+  - `relative_bias_sink_attention` reads the column's rings and decides per column whether to split its keys. It
+    splits exactly when a one-column call at that position would (more than `kSplitMinKeys` visible keys); otherwise
+    block z = 0 runs the single block's loop and store. So a batch can mix columns of 100 and 100,000 keys and each
+    keeps its solo bits.
+- B is at most 8 (`kMaxBatchColumns`, the split attention's column limit), far below the tensor-core width, so decode
+  never takes a tensor-core route.
+- Tested by `ninfer_inkling2_batch_test`, which compares every logit byte for byte against each prompt's solo run.
+  Requests arrive staggered at 2, 4 and 8 in flight, the prompt lengths straddle the split threshold and the sliding
+  window, and slots are reused.
+- `ninfer_inkling2_engine_batch_test` checks the same through the public Engine: concurrent requests (greedy, a seeded
+  sample, a thinking budget, a stop string, streaming and cancellation) give their one-at-a-time outputs.
+- `ninfer_inkling2_fp32_ops_test` (`test_column_sequences`) checks the three ops' column mode against one-column
+  calls, with no artifact needed.
+
+State: all N slots are laid out identically in one allocation, with slot s at `s * slot_stride` from slot 0. A
+captured graph (one per batch width B, captured on first use) therefore reads the slots, positions and tokens from
+the step table, and serves every combination of slots. Prefill stays one request at a time. A new request prefills one chunk
+(eager, in its own slot) between decode steps, round robin among those still prefilling. The rollback buffers and
+taps are a single copy, but they are unused, because with N > 1 there is no drafter (`--spec dspark` is accepted and
+noted in the startup log, and every request decodes plain). Prefix reuse keeps one snapshot per slot. A prompt
+resumes only from the snapshot of the slot it is given, since the global caches below it are that slot's own. The
+scheduler gives a prompt the free slot whose snapshot it extends (the longest such snapshot), or else an empty slot,
+or else the slot released longest ago.
+
+Memory: `--max-context` stays the per-request ceiling, as on the other routes. Each slot holds its own rings:
+
+| Per slot | Bytes (FP16 rings) |
+|---|---|
+| global KV, 8 visits | 32 KiB x context |
+| local KV, 40 visits (ring of 1023 + chunk) | about 160 MiB at chunk 256, 240 MiB at chunk 1024 |
+| convolution histories | 3.7 MiB |
+| prefix-reuse snapshot (when on) | about 170 MiB |
+
+At startup the core first tries the widest prefill chunk at N x `--max-context`. If no chunk fits, it takes the
+narrowest chunk and lowers the context per slot to the largest multiple of 256 that fits beside the 256 MiB spare,
+found by halving. The Engine's `max_context`, the startup log's `batched decode |` note, and the server's limits and
+`/v1/models` follow it. `kv_capacity` reports N x the context per slot.
+
+
+Measured on the V100 (32 GB, sm_70), Q8 artifact, FP16 rings:
+
+| N (`--max-concurrency`) | aggregate tok/s (serve) | per request tok/s | step bench, aggregate |
+|---|---|---|---|
+| 1 | 71.3 | 72.9 | 67.7 |
+| 2 | 113.5 | 58.4 | 113.6 |
+| 4 | 169.0 | 44.1 | 176.5 |
+| 8 | 169.8 | 22.1 | 198.6 |
+
+- Serve: `ninfer-serve --max-concurrency N` at 8,192 context, N concurrent greedy chat requests of 256 tokens with
+  different prompts. Aggregate is all completion tokens over the wall time, prefill included; per request is the
+  server's `predicted_per_second`. Each request's output is identical at every N.
+- Step bench: `NINFER_INKLING2_BATCH_BENCH=1 ninfer_inkling2_batch_test`, B full columns at about 1,000 positions,
+  one distinct token per column.
+- B = 1 is unchanged. ABBA against the base build gave plain 72.0 vs 72.0 tok/s and DSpark the same within noise.
+- From B = 4 to B = 8 the experts dominate. Eight diverse columns route to up to 8 x 8 distinct experts, and the
+  grouped expert kernels take about 14 ms of the 40 ms step (4 ms at B = 1). The 8-column projections and the
+  attention take most of the rest. N = 4 is the throughput knee today. N = 8 mainly buys more concurrent users.
+- Context per slot when `--max-context 262144` is asked with N = 8: 27,392 positions (8 x 27,392 KV rows, chunk 256),
+  reported by `/v1/models`. Lower N or a smaller `--max-context` keeps more context per slot.

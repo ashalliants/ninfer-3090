@@ -89,6 +89,9 @@ public:
     [[nodiscard]] bool is_special(TokenId id) const noexcept;
     [[nodiscard]] const ModelSamplingDefaults& sampling_defaults() const noexcept { return sampling_; }
     [[nodiscard]] std::uint32_t max_context() const noexcept { return options_.max_context; }
+    // Lowers the context a prompt is admitted against (the Engine fitted a smaller one per request slot at startup,
+    // before any prompt is prepared).
+    void set_max_context(std::uint32_t max_context) noexcept { options_.max_context = max_context; }
 
     // The rendered prompt text, before tokenization (for tests).
     [[nodiscard]] text::TemplateOutput render(const PromptInput& input, const PreparationControl& control = {}) const;

@@ -718,12 +718,13 @@ private:
             throw std::invalid_argument("Inkling-2 runs on one device with no context store or model suspend");
         }
         // The context cache is one device snapshot of the last prompt (Inkling2Core, "Prefix reuse"; the host-tier
-        // options were refused before normalization): one extra state when it is on, none when it is off.
-        options.context_cache.device_state_slots = options.context_cache.enabled ? 1U : 0U;
+        // options were refused before normalization): one extra state per request slot when it is on (one snapshot
+        // each; one at max_concurrency 1), none when it is off.
+        options.context_cache.device_state_slots = options.context_cache.enabled ? std::max(1U, options.max_concurrency) : 0U;
         // Resolved like every other route's options (the request log's server-start record reads it): no Host tier.
         options.context_cache.host_capacity_bytes = 0;
-        // One worker runs one request at a time; the rest wait in its max_pending_requests queue.
-        options.max_concurrency = 1;
+        // max_concurrency requests run at once (1: one at a time, the drafter's; more: batched decode, each in its
+        // own slot of the text Program); the rest wait in the max_pending_requests queue.
         if (options.speculative.backend != SpeculativeBackend::None && options.speculative.backend != SpeculativeBackend::DSpark) {
             throw std::invalid_argument("Inkling-2 speculates with its DSpark drafter only (--spec dspark)");
         }
@@ -752,6 +753,12 @@ private:
                                         "draft windows, n-gram match lengths or proposal heads");
         }
         auto generation   = std::make_unique<Inkling2Core>(options, device);
+        // With several slots the core may have fitted a smaller context per request: every limit follows it.
+        if (generation->max_context() != options.max_context) {
+            options.max_context = generation->max_context();
+            options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+        }
+        options.max_concurrency = generation->max_concurrency();
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         load              = generation->load_summary();
         load.cuda_sync_mode = device.sync_mode();
