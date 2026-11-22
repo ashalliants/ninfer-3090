@@ -1544,6 +1544,15 @@ bool Inkling2Core::prefill_step(Active& a) {
         check_cuda(cudaStreamSynchronize(stream_), "logits");
         next = sample(a.host, exec.sampling, a.counts, a.rng);
     }
+    // A cancellation during the last forward or its logits ends the request before its first token commits.
+    if (job.cancelled) {
+        std::lock_guard lock(stats_mutex_);
+        ++totals_.cancelled_prefills;
+        totals_.cancelled_prefill_computed_tokens += static_cast<std::uint64_t>(a.at - a.resume);
+        totals_.prefill_seconds_total += seconds_between(a.prefill_start, Clock::now());
+        out.finish_reason = FinishReason::Cancelled;
+        return false;
+    }
     if (!commit(a, next, false)) { return false; }
     a.decoding = true;
     return true;
@@ -1709,126 +1718,139 @@ void Inkling2Core::worker_batched() {
         }
         return best;
     };
+    active.reserve(static_cast<std::size_t>(slots_)); // an admission's push_back never allocates (see the catch below)
     for (;;) {
         std::vector<std::shared_ptr<Job>> taken;
-        bool stopping = false, failed = false;
-        {
-            std::unique_lock lock(mutex_);
-            wake_.wait(lock, [&] { return stop_ || !queue_.empty() || !active.empty(); });
-            if (stop_ || failed_) {
-                fail_queued_locked(stop_ ? "the Inkling-2 Engine is shutting down" : "the Inkling-2 Engine has failed");
-                stopping = stop_, failed = true;
-            }
-            while (!failed && !queue_.empty() && active.size() + taken.size() < static_cast<std::size_t>(slots_)) {
-                taken.push_back(std::move(queue_.front()));
-                queue_.pop_front();
-                ++running_;
-            }
-        }
-        if (failed) {
-            // What runs is not finished: the Engine is going, or the device failed.
-            while (!active.empty()) {
-                end(active.size() - 1, std::make_exception_ptr(RequestError(
-                                           RequestErrorKind::Unavailable, stopping ? "the Inkling-2 Engine is shutting down" : "the Inkling-2 Engine has failed")));
-            }
-            if (stopping) { return; }
-            continue;
-        }
-        for (auto& job : taken) {
-            auto a  = std::make_unique<Active>();
-            a->job  = std::move(job);
-            a->slot = choose_slot(*a->job);
-            used[static_cast<std::size_t>(a->slot)] = true;
-            active.push_back(std::move(a));
-            Active& added = *active.back();
-            try {
-                if (!start(added)) { end(active.size() - 1, nullptr); }
-            } catch (...) { end(active.size() - 1, std::current_exception()); }
-        }
-
-        // One prefill chunk.
-        std::vector<std::size_t> prefilling;
-        for (std::size_t i = 0; i < active.size(); ++i) {
-            if (!active[i]->decoding) { prefilling.push_back(i); }
-        }
-        if (!prefilling.empty()) {
-            const std::size_t i = prefilling[prefill_turn++ % prefilling.size()];
-            try {
-                if (!prefill_step(*active[i])) { end(i, nullptr); }
-            } catch (...) { end(i, std::current_exception()); }
-        }
-
-        // One decode step over every request with a token to forward.
-        for (std::size_t i = active.size(); i-- > 0;) {
-            if (active[i]->decoding && active[i]->job->cancelled) {
-                active[i]->job->result.finish_reason = FinishReason::Cancelled;
-                end(i, nullptr);
-            }
-        }
-        std::vector<std::int32_t> slots, tokens;
-        std::vector<Active*> columns;
-        for (auto& a : active) {
-            if (!a->decoding) { continue; }
-            columns.push_back(a.get());
-            slots.push_back(a->slot);
-            tokens.push_back(a->next);
-        }
-        if (columns.empty()) { continue; }
-        Tensor logits;
-        std::vector<std::int32_t> greedy(columns.size(), 0);
+        // Each request has its own boundary below; this one catches a host failure outside them (an allocation in the
+        // scheduling, say). It fails every request this worker holds through end_job, so no handle is left unfinished,
+        // and the worker goes on with what comes next.
         try {
-            logits = programs_->text.forward_batch(slots, tokens);
+            bool stopping = false, failed = false;
             {
-                std::lock_guard lock(stats_mutex_);
-                ++totals_.decode_rounds;
-                totals_.decode_row_rounds += columns.size();
+                std::unique_lock lock(mutex_);
+                wake_.wait(lock, [&] { return stop_ || !queue_.empty() || !active.empty(); });
+                if (stop_ || failed_) {
+                    fail_queued_locked(stop_ ? "the Inkling-2 Engine is shutting down" : "the Inkling-2 Engine has failed");
+                    stopping = stop_, failed = true;
+                }
+                while (!failed && !queue_.empty() && active.size() + taken.size() < static_cast<std::size_t>(slots_)) {
+                    taken.push_back(std::move(queue_.front()));
+                    queue_.pop_front();
+                    ++running_;
+                }
             }
-            // Every column's greedy token in one launch and one download (the sampled columns' are not read).
-            Tensor ids(programs_->argmax.p, DType::I32, {static_cast<std::int32_t>(columns.size())});
-            ops::argmax_fp32(logits, vocab, ids, stream_, ops::kSamplerNonFiniteToken);
-            check_cuda(cudaMemcpyAsync(greedy.data(), ids.data, greedy.size() * 4, cudaMemcpyDeviceToHost, stream_), "argmax");
-            check_cuda(cudaStreamSynchronize(stream_), "argmax");
+            if (failed) {
+                // What runs is not finished: the Engine is going, or the device failed.
+                while (!active.empty()) {
+                    end(active.size() - 1, std::make_exception_ptr(RequestError(
+                                               RequestErrorKind::Unavailable, stopping ? "the Inkling-2 Engine is shutting down" : "the Inkling-2 Engine has failed")));
+                }
+                if (stopping) { return; }
+                continue;
+            }
+            for (auto& job : taken) {
+                const std::int32_t slot = choose_slot(*job);
+                auto a                  = std::make_unique<Active>();
+                a->job                  = std::move(job);
+                a->slot                 = slot;
+                used[static_cast<std::size_t>(a->slot)] = true;
+                active.push_back(std::move(a));
+                Active& added = *active.back();
+                try {
+                    if (!start(added)) { end(active.size() - 1, nullptr); }
+                } catch (...) { end(active.size() - 1, std::current_exception()); }
+            }
+
+            // One prefill chunk.
+            std::vector<std::size_t> prefilling;
+            for (std::size_t i = 0; i < active.size(); ++i) {
+                if (!active[i]->decoding) { prefilling.push_back(i); }
+            }
+            if (!prefilling.empty()) {
+                const std::size_t i = prefilling[prefill_turn++ % prefilling.size()];
+                try {
+                    if (!prefill_step(*active[i])) { end(i, nullptr); }
+                } catch (...) { end(i, std::current_exception()); }
+            }
+
+            // One decode step over every request with a token to forward.
+            for (std::size_t i = active.size(); i-- > 0;) {
+                if (active[i]->decoding && active[i]->job->cancelled) {
+                    active[i]->job->result.finish_reason = FinishReason::Cancelled;
+                    end(i, nullptr);
+                }
+            }
+            std::vector<std::int32_t> slots, tokens;
+            std::vector<Active*> columns;
+            for (auto& a : active) {
+                if (!a->decoding) { continue; }
+                columns.push_back(a.get());
+                slots.push_back(a->slot);
+                tokens.push_back(a->next);
+            }
+            if (columns.empty()) { continue; }
+            Tensor logits;
+            std::vector<std::int32_t> greedy(columns.size(), 0);
+            try {
+                logits = programs_->text.forward_batch(slots, tokens);
+                {
+                    std::lock_guard lock(stats_mutex_);
+                    ++totals_.decode_rounds;
+                    totals_.decode_row_rounds += columns.size();
+                }
+                // Every column's greedy token in one launch and one download (the sampled columns' are not read).
+                Tensor ids(programs_->argmax.p, DType::I32, {static_cast<std::int32_t>(columns.size())});
+                ops::argmax_fp32(logits, vocab, ids, stream_, ops::kSamplerNonFiniteToken);
+                check_cuda(cudaMemcpyAsync(greedy.data(), ids.data, greedy.size() * 4, cudaMemcpyDeviceToHost, stream_), "argmax");
+                check_cuda(cudaStreamSynchronize(stream_), "argmax");
+            } catch (...) {
+                const std::exception_ptr error = std::current_exception();
+                for (Active* a : columns) {
+                    const auto at = std::find_if(active.begin(), active.end(), [&](const auto& p) { return p.get() == a; });
+                    end(static_cast<std::size_t>(at - active.begin()), error);
+                }
+                continue;
+            }
+            for (std::size_t c = 0; c < columns.size(); ++c) {
+                Active& a = *columns[c];
+                bool more = false;
+                std::exception_ptr error;
+                try {
+                    TokenId next  = 0;
+                    bool injected = false;
+                    if (!a.forced.empty()) {
+                        next     = a.forced.front();
+                        injected = true;
+                        a.forced.pop_front();
+                    } else if (a.argmax_on_device) {
+                        next = greedy[c];
+                        if (next == ops::kSamplerNonFiniteToken) { throw RequestError(RequestErrorKind::NumericalFailure, "inkling2: the logits are not finite"); }
+                    } else {
+                        a.host.resize(static_cast<std::size_t>(vocab));
+                        const Tensor col = logits.slice(1, static_cast<std::int32_t>(c), 1);
+                        check_cuda(cudaMemcpyAsync(a.host.data(), col.data, a.host.size() * 4, cudaMemcpyDeviceToHost, stream_), "logits");
+                        check_cuda(cudaStreamSynchronize(stream_), "logits");
+                        next = sample(a.host, a.job->options.execution.sampling, a.counts, a.rng);
+                    }
+                    // A cancellation during the forward or another column's sampling ends this row before its token
+                    // commits, as the single-request path's check after its forward does; the other columns go on.
+                    if (a.job->cancelled) {
+                        a.job->result.finish_reason = FinishReason::Cancelled;
+                    } else {
+                        more = commit(a, next, injected);
+                    }
+                } catch (...) { error = std::current_exception(); }
+                if (!more) {
+                    const auto at = std::find_if(active.begin(), active.end(), [&](const auto& p) { return p.get() == &a; });
+                    end(static_cast<std::size_t>(at - active.begin()), error);
+                }
+            }
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
-            for (Active* a : columns) {
-                const auto at = std::find_if(active.begin(), active.end(), [&](const auto& p) { return p.get() == a; });
-                end(static_cast<std::size_t>(at - active.begin()), error);
+            for (auto& job : taken) {
+                if (job) { end_job(*job, error, 0); }
             }
-            continue;
-        }
-        for (std::size_t c = 0; c < columns.size(); ++c) {
-            Active& a = *columns[c];
-            bool more = false;
-            std::exception_ptr error;
-            try {
-                TokenId next  = 0;
-                bool injected = false;
-                if (!a.forced.empty()) {
-                    next     = a.forced.front();
-                    injected = true;
-                    a.forced.pop_front();
-                } else if (a.argmax_on_device) {
-                    next = greedy[c];
-                    if (next == ops::kSamplerNonFiniteToken) { throw RequestError(RequestErrorKind::NumericalFailure, "inkling2: the logits are not finite"); }
-                } else {
-                    a.host.resize(static_cast<std::size_t>(vocab));
-                    const Tensor col = logits.slice(1, static_cast<std::int32_t>(c), 1);
-                    check_cuda(cudaMemcpyAsync(a.host.data(), col.data, a.host.size() * 4, cudaMemcpyDeviceToHost, stream_), "logits");
-                    check_cuda(cudaStreamSynchronize(stream_), "logits");
-                    next = sample(a.host, a.job->options.execution.sampling, a.counts, a.rng);
-                }
-                // A cancellation during the forward or another column's sampling ends this row before its token
-                // commits, as the single-request path's check after its forward does; the other columns go on.
-                if (a.job->cancelled) {
-                    a.job->result.finish_reason = FinishReason::Cancelled;
-                } else {
-                    more = commit(a, next, injected);
-                }
-            } catch (...) { error = std::current_exception(); }
-            if (!more) {
-                const auto at = std::find_if(active.begin(), active.end(), [&](const auto& p) { return p.get() == &a; });
-                end(static_cast<std::size_t>(at - active.begin()), error);
-            }
+            while (!active.empty()) { end(active.size() - 1, error); }
         }
     }
 }
