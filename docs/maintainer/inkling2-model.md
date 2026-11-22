@@ -1198,8 +1198,18 @@ time on the single-sequence decode graph, with DSpark when configured.
 Exactness: each request's tokens and logits are bit-identical to its solo run.
 
 - Every decode op except the attention and the short convolutions is already column-independent: the projections
-  (per column at every width below the tensor cores' 64), the experts (the per-entry route, and the grouped one from
-  64 entries, which is bit-exact with T = 1), depth mix, loop controllers, norms, routing and the head.
+  (per column at every width below the tensor cores' 64), the experts (the per-entry route, and the expert-major one
+  described below, both bit-exact with T = 1), depth mix, loop controllers, norms, routing and the head.
+- Experts of a call with several columns (`moe_situ_experts`, CUDA cores):
+  - One column runs per entry: a block takes one entry's rows.
+  - Calls of fewer than 64 entries (up to 7 columns at top 8, so batched decode up to B = 7 and DSpark verify) also
+    run per entry. Entries of one expert run at the same time, so its second read mostly hits the L2, and the
+    per-entry kernels' occupancy (64 registers, four blocks an SM) beats the expert-major kernels at these widths.
+  - From 64 entries the call runs expert-major. Block (g, s) takes row group g of the s-th distinct expert in order
+    of first appearance, lists that expert's entries itself (no grouping launch), and stages up to 4 of them at a
+    time. A tile computes exactly its entries, with the per-entry kernel's arithmetic for each.
+  - This replaced the grouped kernels, which computed 4 columns per tile whatever the expert's count and held one
+    block an SM (166-198 registers).
 - The stateful ops take `ops::ColumnSequences`: a device table of each column's position and slot, and the byte
   stride between slots.
   - `short_conv_fp32_batch` reads each column's window from that column's own history and writes only that history
@@ -1261,8 +1271,9 @@ Measured on the V100 (32 GB, sm_70), Q8 artifact, FP16 rings:
 - Step bench: `NINFER_INKLING2_BATCH_BENCH=1 ninfer_inkling2_batch_test`, B full columns at about 1,000 positions,
   one distinct token per column.
 - B = 1 is unchanged. ABBA against the base build gave plain 72.0 vs 72.0 tok/s and DSpark the same within noise.
-- From B = 4 to B = 8 the experts dominate. Eight diverse columns route to up to 8 x 8 distinct experts, and the
-  grouped expert kernels take about 14 ms of the 40 ms step (4 ms at B = 1). The 8-column projections and the
-  attention take most of the rest. N = 4 is the throughput knee today. N = 8 mainly buys more concurrent users.
+- From B = 4 to B = 8 the experts dominate. Eight diverse columns route to up to 8 x 8 distinct experts, and every
+  distinct expert's bytes must be read each step (op bench of the routes against that floor:
+  `NINFER_INKLING2_OP_SWEEP=1 ninfer_inkling2_fp32_ops_test`). The 8-column projections and the attention take
+  most of the rest of the step.
 - Context per slot when `--max-context 262144` is asked with N = 8: 27,392 positions (8 x 27,392 KV rows, chunk 256),
   reported by `/v1/models`. Lower N or a smaller `--max-context` keeps more context per slot.
