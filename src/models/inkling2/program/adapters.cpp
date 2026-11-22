@@ -193,6 +193,7 @@ LoraAdapter load_lora_adapter(const LoraSource& source, const TextConfig& config
     refuse_set(settings, "trainable_token_indices", "trained token embeddings", refusal);
     refuse_set(settings, "target_parameters", "parameter targets", refusal);
     refuse_set(settings, "use_qalora", "QA-LoRA pooling", refusal);
+    refuse_set(settings, "use_bdlora", "block-diagonal LoRA", refusal);
     refusal.require(settings.contains("r") && settings.at("r").is_number_integer(), "adapter_config.json has no integer r");
     refusal.require(settings.contains("lora_alpha") && settings.at("lora_alpha").is_number(), "adapter_config.json has no numeric lora_alpha");
     LoraAdapter out;

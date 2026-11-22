@@ -195,6 +195,13 @@ int main() {
             write(dora / "adapter_config.json", R"({"peft_type":"LORA","r":2,"lora_alpha":2,"use_dora":true})");
             write(dora / "adapter_model.safetensors", safetensors({}, "{}"));
             check(refused([&] { (void)ink::load_lora_adapter({"d", dora}, config); }, "use_dora"), "a DoRA adapter is refused");
+            // Block-diagonal LoRA with ordinary lora_A/lora_B tensors (other mathematics under the same names).
+            const fs::path bdlora = tmp / "bdlora";
+            fs::create_directories(bdlora);
+            write(bdlora / "adapter_config.json", R"({"peft_type":"LORA","r":2,"lora_alpha":2,"use_bdlora":true})");
+            write(bdlora / "adapter_model.safetensors",
+                  safetensors({{"base_model.model.model.llm.layers.4.attn.wo_ud.lora_A.weight", {2, std::uint64_t(config.heads) * config.head_dim}}}, "{}"));
+            check(refused([&] { (void)ink::load_lora_adapter({"b", bdlora}, config); }, "use_bdlora"), "a block-diagonal LoRA adapter is refused");
             write(other / "adapter_config.json", R"({"peft_type":"LORA","r":2,"lora_alpha":2})");
             write(other / "adapter_model.safetensors",
                   safetensors({{"base_model.model.model.llm.layers.4.attn.wq_du.lora_A.weight", {2, config.hidden_size}}}, "{}"));
