@@ -531,6 +531,7 @@ void TextProgram::restore(const Snapshot& snapshot) {
     }
     copies.flush();
     position_  = snapshot.position;
+    aged_      = std::min(aged_, position_); // positions past the snapshot are written again, then aged again
     last_cols_ = 0;
 }
 
@@ -575,6 +576,7 @@ void TextProgram::keep(std::int32_t n) {
     }
     copies.flush();
     position_ -= last_cols_ - n;
+    aged_ = std::min(aged_, position_); // the cut positions are written again, then aged again
     last_cols_ = n;
 }
 

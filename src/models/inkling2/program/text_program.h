@@ -189,6 +189,9 @@ public:
     // Keeps only the first n tokens of the last forward (1 <= n <= its T, T <= max_rollback when n < T): the
     // sequence continues from position() = its start + n with every state as if only those tokens had been given.
     void keep(std::int32_t n);
+    // kv_quant_recent (the simulator): the positions below this one are coded; keep() and restore() bring it back to
+    // at most position(), so the positions written again are coded again once they age past the window.
+    [[nodiscard]] std::int64_t kv_quant_aged() const noexcept { return aged_; }
 
     // Appends tokens at position() and returns their logits: FP32 [vocab_size, T] on the device ([vocab_size, 1], the
     // last column's, for a prefill chunk with ProgramLimits::last_logits) (rows past
@@ -225,7 +228,8 @@ private:
     // save_async's copy: settle_copy() drops it once complete; wait_copy() orders this Program's stream after all of it.
     void settle_copy();
     void wait_copy();
-    // kv_quant_recent: codes the positions that aged past the window since the last call.
+    // kv_quant_recent: codes the positions that aged past the window since the last call. forward() and its graph
+    // replay call it; forward_batch() never needs it (a recent window takes one slot).
     void age_rings();
     std::int64_t aged_ = 0;
 
