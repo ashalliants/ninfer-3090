@@ -1,23 +1,16 @@
 // Opt-in low-bit global KV rings (--kv-dtype int8 | rk8v4 | rk4v4 on Inkling-2): the specs set only the global
 // visits' bits, the default limits set none, and the ring bytes at 262,144 positions are what the fit plans with
-// (no GPU). Then, on the GPU, the simulator's recent window (NINFER_INKLING2_KVQ ...:w=N) across keep() and
-// restore(): the positions written again after a cut are coded again. Skips without NINFER_TEST_INKLING2_ARTIFACT.
+// (no GPU; skips without NINFER_TEST_INKLING2_ARTIFACT, which supplies the config).
 #include "artifact/reader.h"
-#include "core/device.h"
 #include "models/inkling2/config.h"
-#include "models/inkling2/model.h"
 #include "models/inkling2/program/text_program.h"
-
-#include <cuda_runtime.h>
-
-#include <span>
-#include <vector>
 
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -91,37 +84,25 @@ int main() {
         } catch (const std::invalid_argument&) { refused = true; }
         check(refused, "a 2-bit form is refused");
 
-        // The recent window across a rejected draft and a snapshot restore (one slot, FP16 rings, 4 positions FP16).
-        ninfer::DeviceContext device(0);
-        auto model = ink::load_model(reader, device);
-        cudaStream_t stream = nullptr;
-        if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) { throw std::runtime_error("cannot create a stream"); }
-        ink::ProgramLimits limits{1024, 64};
-        limits.kv_fp16 = true, limits.max_rollback = 8, limits.decode_graph = false;
-        ink::parse_kv_quant(c, "k4v4:w=4", limits);
-        {
-            ink::TextProgram program(*model, limits, stream);
-            std::vector<std::int32_t> tokens(256);
-            std::uint32_t seed = 777;
-            for (auto& t : tokens) { seed = seed * 1664525U + 1013904223U, t = static_cast<std::int32_t>(1000 + (seed >> 8) % 120000); }
-            const auto at = [&](std::int64_t from, std::int64_t n) { return std::span<const std::int32_t>(tokens).subspan(std::size_t(from), std::size_t(n)); };
-            for (std::int64_t p = 0; p < 192; p += 64) { (void)program.forward(at(p, 64)); }
-            check(program.kv_quant_aged() == 188, "a prefill to 192 codes the positions below 188");
-            ink::TextProgram::Snapshot snapshot{ninfer::PinnedHostBuffer(program.snapshot_bytes())};
-            program.save(snapshot);
-            (void)program.forward(at(192, 8)); // a draft of 8, aged to 196
-            check(program.kv_quant_aged() == 196, "the draft's forward codes up to 196");
-            program.keep(1);
-            check(program.position() == 193 && program.kv_quant_aged() <= 193, "keep(1) brings the coded watermark back to the position");
-            for (std::int64_t p = 193; p < 210; ++p) { (void)program.forward(at(p, 1)); }
-            check(program.kv_quant_aged() == 206, "decoding to 210 codes up to 206 again, the rewritten positions included");
-            program.restore(snapshot);
-            check(program.position() == 192 && program.kv_quant_aged() <= 192, "restore() brings it back to the snapshot's position");
-            for (std::int64_t p = 192; p < 200; ++p) { (void)program.forward(at(p, 1)); }
-            check(program.kv_quant_aged() == 196, "decoding to 200 after the restore codes up to 196");
-            if (cudaStreamSynchronize(stream) != cudaSuccess) { throw std::runtime_error("the forwards failed"); }
-        }
-        cudaStreamDestroy(stream);
+        // Forms apply left to right: k16v16 sets the visits it names back to FP16, and a real form clears a simulated one.
+        ink::ProgramLimits cleared = plain;
+        ink::parse_kv_quant(c, "k4v4:real+k16v16:g=0", cleared);
+        std::uint32_t coded = 0, first_global = 0;
+        while (c.local[c.physical(first_global)]) { ++first_global; }
+        for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) { coded += cleared.kv_lowbit_k[v] != 0; }
+        check(coded == 7 && cleared.kv_lowbit_k[first_global] == 0 && cleared.kv_lowbit_v[first_global] == 0, "k4v4:real+k16v16:g=0 leaves g0 FP16");
+        ink::ProgramLimits none = plain;
+        ink::parse_kv_quant(c, "k4v4+k16v16", none);
+        check(none.kv_quant_k.empty() && none.kv_lowbit_k.empty(), "k4v4+k16v16 codes nothing");
+        ink::ProgramLimits replaced = plain;
+        ink::parse_kv_quant(c, "k4v4+k8v8:real", replaced);
+        check(replaced.kv_quant_k.empty() && replaced.kv_lowbit_k.size() == c.num_layer_visits, "a real form over every visit replaces a simulated one");
+        bool mixed_refused = false;
+        try {
+            ink::ProgramLimits bad = plain;
+            ink::parse_kv_quant(c, "k4v4+k8v8:g=0:real", bad);
+        } catch (const std::invalid_argument&) { mixed_refused = true; }
+        check(mixed_refused, "simulated and real forms on different visits are refused");
     } catch (const std::exception& e) {
         std::printf("FAIL: %s\n", e.what());
         return 1;

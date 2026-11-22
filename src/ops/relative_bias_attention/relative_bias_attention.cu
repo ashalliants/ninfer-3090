@@ -1536,31 +1536,6 @@ void head_norms_fp32(std::span<const HeadNormJob> jobs, cudaStream_t stream, con
     check_launch(op);
 }
 
-namespace {
-// grid (count, heads): positions first .. first + count - 1 of an FP16 ring, quantized in place (fake_quant_head).
-__global__ void ring_fake_quant_kernel(__half* ring, std::int64_t rows, std::int64_t capacity, std::int64_t first, int quant) {
-    const int lane = threadIdx.x;
-    __half* p = ring + ((first + blockIdx.x) % capacity) * rows + static_cast<std::int64_t>(blockIdx.y) * 128;
-    float y[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) { y[i] = __half2float(p[lane + 32 * i]); }
-    fake_quant_head(y, quant, lane);
-#pragma unroll
-    for (int i = 0; i < 4; ++i) { p[lane + 32 * i] = __float2half_rn(y[i]); }
-}
-} // namespace
-
-void kv_ring_fake_quant(Tensor& ring, int quant, std::int64_t first, std::int64_t count, cudaStream_t stream) {
-    const char* op = "kv_ring_fake_quant";
-    require(ring.dtype == DType::FP16 && ring.is_contiguous() && ring.ne[0] % 128 == 0 && quant != 0 && first >= 0, op,
-            "an FP16 ring of heads of 128 and a quantization");
-    if (count <= 0) { return; }
-    require(count <= ring.ne[1], op, "at most the ring's capacity");
-    ring_fake_quant_kernel<<<dim3(static_cast<unsigned>(count), static_cast<unsigned>(ring.ne[0] / 128)), 32, 0, stream>>>(
-        static_cast<__half*>(ring.data), ring.ne[0], ring.ne[1], first, quant);
-    check_launch(op);
-}
-
 void head_l2_clip_fp32(Tensor& x, int head_dim, const Tensor* scale, float threshold, const PositionLogScale* log_scale,
                        cudaStream_t stream) {
     HeadNormJob job;

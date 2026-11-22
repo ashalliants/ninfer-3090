@@ -68,8 +68,6 @@ inline constexpr int kLowbitKeys4 = 0x11, kLowbitKeys8 = 0x12, kLowbitValues4 = 
 [[nodiscard]] constexpr std::int64_t lowbit_key_bytes(int bits) { return bits == 4 ? 68 : 132; }
 [[nodiscard]] constexpr std::int64_t lowbit_value_bytes(int bits) { return bits == 4 ? 72 : 132; }
 
-/// The same coding applied in place to positions first .. first + count - 1 of an FP16 ring (an aging recent window).
-void kv_ring_fake_quant(Tensor& ring, int quant, std::int64_t first, std::int64_t count, cudaStream_t stream);
 
 /// One head_l2_clip_fp32 (unit_rms false) or head_unit_rms_fp32 (unit_rms true) of a batch.
 struct HeadNormJob {

@@ -50,10 +50,9 @@ struct ProgramLimits {
     // position, so about twice the context fits. The attention widens them to FP32 as it reads them.
     bool kv_fp16 = false;
     // Experimental, lossy (FP16 rings only): a simulated low-bit KV coding per layer visit (ops::KvAppend::quant codes,
-    // one per visit; empty: none). With kv_quant_recent > 0 the last kv_quant_recent positions stay FP16 and each forward
-    // codes the ones that age past them. parse_kv_quant() fills these from a spec.
+    // one per visit; empty: none): each append codes and decodes the values into the FP16 ring. parse_kv_quant()
+    // fills these from a spec.
     std::vector<std::int32_t> kv_quant_k, kv_quant_v;
-    std::int32_t kv_quant_recent = 0;
     // Opt-in, lossy: low-bit global KV rings (ops::kLowbitKeys4 ... : keys rotated and coded in 4 or 8 bits, values in
     // 4 or 8), the bits per layer visit (empty or 0: FP16; only global visits take them). Needs kv_fp16 and one slot.
     std::vector<std::uint8_t> kv_lowbit_k, kv_lowbit_v;
@@ -82,10 +81,12 @@ struct ProgramLimits {
     } prefill_tc;
 };
 
-// Experimental: "k<K>v<V>[:g=i,j,..][:local][:w=N][:real]" (real: K and V each 4 or 8 (16: FP16), global visits, no
-// window: the rings are stored coded, kv_lowbit_k / kv_lowbit_v, instead of simulated), K one of 16 8 4 (rotated INT8, rotated Lloyd-Max 4-bit; 8n, 4n
+// Experimental: forms "k<K>v<V>[:g=i,j,..][:local][:real]" joined by '+', applied left to right, each setting the
+// visits it names (k16v16 sets them back to FP16). K one of 16 8 4 (rotated INT8, rotated Lloyd-Max 4-bit; 8n, 4n
 // unrotated), V one of 16 8 4 (INT8 per 64, int4 per 32), 4l (rotated Lloyd-Max), 4r (rotated int4), 8r; g the global
-// visits (0..7 in visit order, default all), local also the sliding ones, w the FP16 recent window. Throws on a bad spec.
+// visits (0..7 in visit order, default all), local also the sliding ones; real (K and V each 4, 8 or both 16, global
+// visits only) stores the rings coded (kv_lowbit_k / kv_lowbit_v) instead of simulating them. Simulated and real forms
+// do not mix. Throws on a bad spec.
 void parse_kv_quant(const TextConfig& config, const std::string& spec, ProgramLimits& limits);
 // One slot's K and V ring bytes over the layer visits at these limits (global rings max_context positions each, as
 // FP32, FP16 or the low-bit codes kv_lowbit_k/_v name; sliding rings their window plus a chunk), padded as
@@ -189,9 +190,6 @@ public:
     // Keeps only the first n tokens of the last forward (1 <= n <= its T, T <= max_rollback when n < T): the
     // sequence continues from position() = its start + n with every state as if only those tokens had been given.
     void keep(std::int32_t n);
-    // kv_quant_recent (the simulator): the positions below this one are coded; keep() and restore() bring it back to
-    // at most position(), so the positions written again are coded again once they age past the window.
-    [[nodiscard]] std::int64_t kv_quant_aged() const noexcept { return aged_; }
 
     // Appends tokens at position() and returns their logits: FP32 [vocab_size, T] on the device ([vocab_size, 1], the
     // last column's, for a prefill chunk with ProgramLimits::last_logits) (rows past
@@ -228,10 +226,6 @@ private:
     // save_async's copy: settle_copy() drops it once complete; wait_copy() orders this Program's stream after all of it.
     void settle_copy();
     void wait_copy();
-    // kv_quant_recent: codes the positions that aged past the window since the last call. forward() and its graph
-    // replay call it; forward_batch() never needs it (a recent window takes one slot).
-    void age_rings();
-    std::int64_t aged_ = 0;
 
     const Model& model_;
     const TextConfig& config_;

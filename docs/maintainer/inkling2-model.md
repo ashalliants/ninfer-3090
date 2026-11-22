@@ -902,7 +902,8 @@ Greedy output is not token-identical to FP16 (0 of 12 300-token chats match, `in
 near-tied expert choice flips within a few hundred tokens), but answers hold: the maths prompt gives the same 14:43, the code prompt the same
 algorithm and complexity, and the needle at 100K and 200K (depths 0.2, 0.8; 0.3, 0.7) is found 4 of 4 with each.
 
-Variants measured with the simulator (`NINFER_INKLING2_KVQ`, which codes and decodes into the FP16 rings; its
+Variants measured with the simulator (`NINFER_INKLING2_KVQ=<spec>`, forms such as `k4v8:g=4,5` joined by `+`, which
+code and decode each append into the FP16 rings; `:real` stores them coded instead; its
 `k4v4` 1.01e-2 matches the real rings' 9.71e-3) and not shipped:
 
 | Variant | KLD mean | p99 | Top-1 |
@@ -922,7 +923,10 @@ Variants measured with the simulator (`NINFER_INKLING2_KVQ`, which codes and dec
 The early global visits are the sensitive ones (`rk4v4` alone on g0 ... g7: 6.9e-3, 4.4e-3, 2.7e-3, 1.8e-3, 8.9e-4,
 7.8e-4, 6.0e-4, 6.8e-4). A mix saves memory in proportion to the visits it codes (744 MiB a visit at 4 bits, 496 at
 8), so none beats `int8` (at the floor, 3968 MiB) on accuracy per byte. The FP16 recent window only helps while the
-window is a large part of the context (7.06e-3 over [16K, 31K)), and the sliding rings are far too sensitive.
+window is a large part of the context (7.06e-3 over [16K, 31K)), and the sliding rings are far too sensitive. The
+window was simulated by recoding the positions that aged past it after each forward; that is not rollback-safe
+(speculative `keep()`, snapshot `restore()`) and is not in this tree. The trial branch `exp/inkling2-lowbit-kv-trial`
+keeps it (`:w=N`) for reproduction.
 
 **Speed.** `ninfer_inkling2_golden_test` decode bench (`NINFER_INKLING2_DECODE_BENCH`, plain program decode, TC
 prefill chunk 2048), FP16 / `int8` / `rk4v4` as A B C C B A in one hold per context, 2026-11-22, the two legs
