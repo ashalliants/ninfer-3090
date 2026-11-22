@@ -179,7 +179,7 @@ tokens), so DSpark mostly takes plain steps and decodes at plain speed.
 | 4 | 170.5 | 45.6 |
 | 8 | **198.2** | 26.4 |
 
-**Adapters** cost 4-5% of plain decode for the requests that select one (12 chats, greedy, ABBA in one server):
+**Adapters** make decode 4-5% slower for the requests that select one (12 chats, greedy, ABBA in one server):
 none 78.8, `"lora"` 75.4, `"graft"` 75.2 tok/s. With DSpark: none 94.1-94.4, `"lora"` 90.8-91.7, `"graft"`
 91.6-92.7 tok/s, and the output equals the adapter's plain output. The adapters take the refusals on the first 20
 prompts of `mlabonne/harmful_behaviors` from 20/20 to 0/20, at a KLD from the base model of 0.014 (LoRA) and 0.017

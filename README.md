@@ -612,7 +612,7 @@ Gen3 x4 eGPU):
 - **Several requests:** `--max-concurrency` up to 8, **198.2 tok/s** aggregate at 8 (121.8 at 2, 170.5 at 4),
   each request's tokens the same as alone. Requests at N > 1 decode without DSpark.
 - **Adapters:** two opt-in uncensoring adapters (`--lora`, `--graft`, selected per request) take the refusals
-  on 20 harmful prompts from 20/20 to 0/20 at 4-5% of decode speed. Other requests run the base model unchanged.
+  on 20 harmful prompts from 20/20 to 0/20, and decode 4-5% slower than without an adapter. Other requests run the base model unchanged.
 - **Accuracy:** with the exact FP32 program (`--kv-dtype fp32`), greedy text matches CPU llama.cpp (Unsloth's
   PR at the same revision) on 58 of 58 checked positions, and image prompts on 48 of 48 tokens from identical
   pixels. The defaults (FP16 KV, tensor-core prefill) differ from it by about as much as reordering FP32 sums.
