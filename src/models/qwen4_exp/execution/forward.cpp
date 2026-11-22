@@ -29,6 +29,7 @@
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/rows.h"
+#include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
@@ -1968,7 +1969,15 @@ void Forward::mtp_block(const MtpCall& call) {
             // The same ids (its argmax keys are the BF16 roundings) and the draft's probability.
             Tensor probs = call.probs;
             ops::argmax_probability(head, drafts, probs, valid, *work_, s);
-        } else {
+        }
+        if (call.sample_config != nullptr) {
+            // --mtp-sampled-drafts: the draft is the sampler's draw at the position the target
+            // samples it (the argmax for a greedy config), replacing the argmax ids written above.
+            Tensor narrow = work_->alloc(DType::BF16, {dim(config_.vocab_size), T});
+            ops::cast_fp32_to_bf16(head, narrow, s);
+            ops::sample(narrow, drafts, valid, call.sample_config, call.sample_position, ops::kSamplePurposeDecode,
+                        *work_, s);
+        } else if (call.probs.data == nullptr) {
             Tensor narrow = work_->alloc(DType::BF16, {dim(config_.vocab_size), T});
             ops::cast_fp32_to_bf16(head, narrow, s);
             ops::argmax(narrow, drafts, valid, s);
@@ -1979,14 +1988,21 @@ void Forward::mtp_block(const MtpCall& call) {
 }
 
 std::size_t Forward::mtp_workspace_bytes(const TextConfig& c, std::int32_t columns, std::uint32_t max_visible_keys,
-                                         DeviceExecutionView execution, bool moe_precast_input) {
+                                         DeviceExecutionView execution, bool moe_precast_input,
+                                         bool sampled_drafts) {
     const std::size_t t = static_cast<std::size_t>(columns), bf = 2, f = 4;
     const std::size_t h = c.hidden_size, w = c.residual_width(), v = c.vocab_size;
     // A block at `columns` columns (as the text forward sizes one), the fusion's tensors, the
     // FP32 projection rows and the head's logits of one column, then their BF16 cast or the
     // probability Op's scratch in its place.
-    const std::size_t draft = std::max<std::size_t>(
-        v * bf, ops::argmax_probability_workspace_capacity_bytes(static_cast<std::int32_t>(v), 1, 1));
+    // Sampled drafts: the probability Op's scratch (when the joint rule asks for it), then the BF16
+    // cast and the sampler's workspace, all held to the end of the step.
+    const std::size_t probability =
+        ops::argmax_probability_workspace_capacity_bytes(static_cast<std::int32_t>(v), 1, 1);
+    const std::size_t draft =
+        sampled_drafts ? probability + v * bf + ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(v), 1, 1) +
+                             3 * 256
+                       : std::max<std::size_t>(v * bf, probability);
     return workspace_bytes(c, columns, max_visible_keys, execution, moe_precast_input) + (h * 4 + w * 2) * t * bf +
            (2 * std::size_t(c.attention.query_width()) + 2 * std::size_t(c.attention.key_width()) + 1024) * t * f +
            v * f + draft + (8ULL << 20);

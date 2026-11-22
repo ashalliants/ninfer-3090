@@ -25,6 +25,7 @@
 #include "models/qwen4_exp/execution/parameters.h"
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ninfer/ops/qsa.h"
+#include "ninfer/ops/sampling.h"
 
 #include <cstdint>
 #include <memory>
@@ -182,6 +183,12 @@ struct MtpCall {
     // When set (a full step): FP32 [1] receives the draft's softmax probability under the head's FP32
     // logits (ops::argmax_probability, whose ids equal the BF16 argmax the step otherwise runs).
     Tensor probs;
+    // When set (a full step, --mtp-sampled-drafts): the draft is ops::sample's draw from the head's
+    // BF16 logits under this device-resident config at `sample_position` (I32 [1]), purpose
+    // kSamplePurposeDecode, instead of the argmax. A greedy config draws the argmax (the same id);
+    // `probs`, when set, still receives the argmax's probability.
+    const ops::SamplingConfig* sample_config = nullptr;
+    Tensor sample_position;
     const VisionInput* vision = nullptr; // when set: cells whose next token is an image token
     // Optional observation of a full step (reference checks): each set tensor receives a copy.
     struct Tap {
@@ -431,10 +438,11 @@ public:
     // workspace like a forward call (not between run_front and run_back).
     void run_mtp(const MtpCall& call);
     // Workspace of a drafter call of up to `columns` cells (full steps run one), with
-    // ForwardOptions::moe_precast_input as `moe_precast_input`.
+    // ForwardOptions::moe_precast_input as `moe_precast_input`; `sampled_drafts`: full steps draw
+    // their drafts with ops::sample (MtpCall::sample_config).
     [[nodiscard]] static std::size_t mtp_workspace_bytes(const TextConfig& config, std::int32_t columns,
                                                          std::uint32_t max_visible_keys, DeviceExecutionView execution,
-                                                         bool moe_precast_input);
+                                                         bool moe_precast_input, bool sampled_drafts = false);
 
     // FP32 logits [V, n] of batch.logit_columns.
     void run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap = nullptr);

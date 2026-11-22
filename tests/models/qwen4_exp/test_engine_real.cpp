@@ -42,8 +42,13 @@
 // Engine decodes every job, then one MTP Engine per depth K; the ids must be identical.
 //
 //   ninfer_qwen4_exp_engine_real_test --mtp-exact K[,K...] [--max-context N] [--generate N]
-//       [--mtp-fixed | --mtp-joint-acceptance] TOKENS...
+//       [--mtp-fixed | --mtp-joint-acceptance] [--mtp-staged-drafts] [--mtp-sampled-drafts [--sampled T]]
+//       TOKENS...
 //   --mtp-joint-acceptance: the MTP Engines choose their windows by the joint-acceptance rule.
+//   --mtp-sampled-drafts: the MTP Engines draw coupled sampled drafts (FlashNextOptions::
+//   mtp_sampled_drafts). With --sampled T every request samples at temperature T (top-p 0.95,
+//   top-k 20, presence penalty 1.0, seed 1000 + job index), and the sampled MTP ids must equal plain
+//   sampling's under the same seed, token for token.
 //
 // Hot embedding rows (hot_embedding_matches_plain below, --hot-embedding-rows): greedy ids with only
 // the embedding's first N rows in VRAM (the rest read from the pinned block) equal those of an Engine
@@ -272,11 +277,27 @@ private:
     std::uint32_t split_;
 };
 
+// --mtp-exact --sampled T: every request of generate() samples at temperature T (top-p 0.95,
+// top-k 20, presence penalty 1.0, the Flash-Next router's settings) under one seed per job.
+struct SampledRequests {
+    bool on           = false;
+    float temperature = 0.0F;
+    std::uint64_t seed = 0;
+};
+SampledRequests g_sampled;
+
 Run generate(Engine& engine, const std::vector<TokenId>& prompt, std::uint32_t tokens, std::uint32_t split = 0) {
     RequestOptions request;
     request.execution.requested_output_tokens = tokens;
     request.execution.allow_prefix_reuse      = false;
     request.execution.sampling.temperature    = 0.0F;
+    if (g_sampled.on) {
+        request.execution.sampling.temperature      = g_sampled.temperature;
+        request.execution.sampling.top_p            = 0.95F;
+        request.execution.sampling.top_k            = 20;
+        request.execution.sampling.presence_penalty = 1.0F;
+        request.execution.sampling.seed             = g_sampled.seed;
+    }
     request.stop.include_model_defaults       = false;
     request.output.raw                        = true;
     const auto start = std::chrono::steady_clock::now();
@@ -654,7 +675,7 @@ int bench(const std::string& artifact, const std::vector<std::string>& args) {
 // verified drafts (so acceptance, rejection and the commit paths all ran).
 int mtp_exact(const std::string& artifact, const std::vector<std::string>& args) {
     std::uint32_t max_context = 33'792, tokens = 256;
-    bool fixed = false, joint = false;
+    bool fixed = false, joint = false, staged = false, sampled_drafts = false;
     std::vector<std::uint32_t> depths;
     std::vector<std::string> jobs;
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -667,6 +688,13 @@ int mtp_exact(const std::string& artifact, const std::vector<std::string>& args)
             fixed = true;
         } else if (a == "--mtp-joint-acceptance") {
             joint = true;
+        } else if (a == "--mtp-staged-drafts") {
+            staged = true;
+        } else if (a == "--mtp-sampled-drafts") {
+            sampled_drafts = true;
+        } else if (a == "--sampled" && i + 1 < args.size()) {
+            g_sampled.on          = true;
+            g_sampled.temperature = std::stof(args[++i]);
         } else if (depths.empty() && a.find_first_not_of("0123456789,") == std::string::npos) {
             std::stringstream list(a);
             std::string item;
@@ -682,9 +710,11 @@ int mtp_exact(const std::string& artifact, const std::vector<std::string>& args)
         EngineOptions options                = base_options(artifact, max_context);
         options.flash_next.save_expert_state = false;
         Engine engine(options);
-        for (const std::string& job : jobs) {
-            const auto prompt = parse_tokens(job);
-            const Run run     = generate(engine, prompt, tokens);
+        for (std::size_t j = 0; j < jobs.size(); ++j) {
+            const std::string& job = jobs[j];
+            g_sampled.seed         = 1000 + j;
+            const auto prompt      = parse_tokens(job);
+            const Run run          = generate(engine, prompt, tokens);
             print_run(("plain " + job).c_str(), run, prompt.size());
             plain.push_back(run.ids);
         }
@@ -698,8 +728,11 @@ int mtp_exact(const std::string& artifact, const std::vector<std::string>& args)
         options.speculative.draft_tokens     = depth;
         options.flash_next.mtp_fixed_drafts  = fixed;
         options.flash_next.mtp_joint_acceptance = joint;
+        options.flash_next.mtp_staged_drafts    = staged;
+        options.flash_next.mtp_sampled_drafts   = sampled_drafts;
         Engine engine(options);
         for (std::size_t j = 0; j < jobs.size(); ++j) {
+            g_sampled.seed          = 1000 + j;
             const auto prompt       = parse_tokens(jobs[j]);
             const Run run           = generate(engine, prompt, tokens);
             const std::string label = "mtp K=" + std::to_string(depth) + " " + jobs[j];

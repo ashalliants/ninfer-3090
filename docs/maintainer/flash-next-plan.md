@@ -669,6 +669,33 @@ None has been measured on the RTX 3090 yet.
     the threshold (Basalt's conditional draft graph, `verify_kernels.cu:824-827`,
     `src/core/mtp.cpp:1390-1453`). Phase A pays for every draft step even when the window keeps one,
     so it can lose to the acceptance estimate when the rule keeps short windows.
+- **Coupled sampled drafts** (`--mtp-sampled-drafts`, needs `--spec mtp`; off by default). Without
+  it a sampled request drafts the drafter's argmax and verifies by the rejection rule
+  (`ops::speculative_accept_greedy_drafts`, sampled mode): the same distribution as plain sampling,
+  but not the same tokens under a seed. With it:
+  - each drafter step (`Forward::run_mtp`, `MtpCall::sample_config`) samples its head's BF16 logits
+    with `ops::sample` under the request's config with no penalties, counts, mask or relaxed
+    threshold (`stage_sampled_draft_words`), at position S + j and purpose Decode, the uniforms
+    plain decode draws for that position;
+  - verification (`coupled_round`, `sample_coupled_columns`) samples each of the W columns exactly
+    as plain decode samples it: the request's config, position S + j, purpose Decode, its penalties
+    counting the committed tokens plus drafts 0..j-1 (a token-count overlay per column, so the
+    sampler's own increment lands in scratch);
+  - `take_coupled_columns` keeps drafts while each equals its column's draw and licenses the draws
+    through the first that differs (or the bonus), then adds the licensed tokens to the committed
+    counts, as the acceptance Op does.
+  - Flash-Next's verification columns are bitwise those of one-column decode steps, so the licensed
+    tokens are the tokens plain sampling emits under the same seed. Greedy rows, rows with a grammar
+    mask and relaxed drafting keep the acceptance Op.
+  - Memory: `ProgramDevicePlan::mtp_sampled_drafts` (`plan_mtp_sampled_drafts`: configs, positions,
+    sampled tokens and one 4-byte-per-token overlay per column, about 3.8 MiB at draft-tokens 3)
+    plus sampling workspace for W columns. Off plans nothing and the drafter graphs are master's.
+  - With `--mtp-joint-acceptance` the window still estimates from the argmax's probability, not the
+    sampled draft's (an estimate only; the output is unaffected).
+  - Checked on the Tesla V100 (2026-11-22): eight sampled requests (temperature 0.6, top-p 0.95,
+    top-k 20, presence penalty 1.0, fixed seeds) emitted the same text with the option as with
+    plain decoding (no `--spec`). `ninfer_qwen4_exp_engine_real_test --mtp-exact 3
+    --mtp-sampled-drafts --sampled 0.6 TOKENS` is the test-binary form (not run).
 - **N-gram prefetch for the anchor column** (`--ngram-prefetch`, needs `--spec mtp`). Verification's
   `upload_rows` reads W columns of rows (`program/ngram_rows.h`, `ngram_window_rows`) after the front
   half of the verify forward is enqueued; the volume reads are the host's critical path when the rows

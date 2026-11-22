@@ -260,6 +260,31 @@ int main() {
         with_probs.mtp_draft_probs = 28;
         check(with_probs.fixed_bytes() == 528, "fixed_bytes counts the draft probabilities");
 
+        // --mtp-sampled-drafts: the drafter's config, then per verification column a config, a
+        // position, a sampled token and a token-count overlay, each region 256-byte aligned.
+        {
+            q4::ProgramOptions sampled;
+            sampled.max_context      = 32768;
+            sampled.mtp_draft_tokens = 3;
+            check(!sampled.mtp_sampled_drafts, "sampled drafts are off by default");
+            check(q4::plan_mtp_sampled_drafts(sampled, static_cast<std::int32_t>(kVocab)).bytes == 0, "off plans nothing");
+            sampled.mtp_sampled_drafts = true;
+            const auto lay             = q4::plan_mtp_sampled_drafts(sampled, static_cast<std::int32_t>(kVocab));
+            const auto a256            = [](std::uint64_t n) { return (n + 255) / 256 * 256; };
+            const std::uint64_t config = sizeof(ninfer::ops::SamplingConfig);
+            check(lay.columns == 4, "one column per draft plus the bonus");
+            check(lay.draft_config == 0 && lay.configs == a256(config) && lay.positions == lay.configs + a256(4 * config) &&
+                      lay.sampled == lay.positions + 256 && lay.counts == lay.sampled + 256,
+                  "the regions follow one another, 256-byte aligned");
+            check(lay.bytes == lay.counts + 4 * a256(4ULL * kVocab), "one count overlay per column");
+            sampled.mtp_draft_tokens = 0;
+            check(q4::plan_mtp_sampled_drafts(sampled, static_cast<std::int32_t>(kVocab)).bytes == 0, "without MTP there is nothing to sample");
+            q4::ProgramDevicePlan with_sampled;
+            with_sampled.io                 = 500;
+            with_sampled.mtp_sampled_drafts = lay.bytes;
+            check(with_sampled.fixed_bytes() == 500 + lay.bytes, "fixed_bytes counts the sampled drafts");
+        }
+
         // Refusal steering (--graft): the device table is FP32 [vectors][layers][hidden]; nothing
         // is planned without a vector, and fixed_bytes counts it.
         {

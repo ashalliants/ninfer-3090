@@ -639,6 +639,15 @@ struct FlashNextOptions {
     // same; a round pays a host sync per extra step instead of always running --draft-tokens steps.
     // Off: every round drafts --draft-tokens in one graph.
     bool mtp_staged_drafts = false;
+    // Coupled sampled drafts (--mtp-sampled-drafts; needs --spec mtp): a sampled request's drafter
+    // draws each draft with the request's temperature, top-k, top-p and min-p (no penalties) under
+    // the same counter-based uniform the target's sampler uses at that position, and the round
+    // samples every verification column exactly as plain decode would (ops::sample, purpose Decode,
+    // the column's position, penalties counting the drafts before it), keeping the drafts while
+    // they equal the target's draws. A sampled request then emits the tokens plain sampling emits
+    // under the same seed, and greedy requests are unchanged. Off: drafts are the drafter's argmax
+    // and sampled rows take the rejection rule (the same distribution, different draws).
+    bool mtp_sampled_drafts = false;
     // Batches a genuine draft-and-verify across every eligible row when two or more lanes decode
     // together (--mtp-rows-verify; needs --mtp-joint-acceptance), instead of always falling back to
     // a plain round. Off by default: a known bug (docs/maintainer/mtp-multi-row-lanes-design.md)

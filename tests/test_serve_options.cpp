@@ -608,6 +608,21 @@ int main() {
         }
         failures += check(refused, "--mtp-constrained without --spec mtp was not refused naming both flags");
     }
+    failures += check(!defaults.flash_next.mtp_sampled_drafts, "sampled drafts are on by default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                                                 "--mtp-sampled-drafts"}))
+                          .flash_next.mtp_sampled_drafts,
+                      "--mtp-sampled-drafts does not reach the Engine");
+    {
+        bool refused = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--mtp-sampled-drafts"});
+        } catch (const std::invalid_argument& error) {
+            refused = std::string(error.what()).find("--mtp-sampled-drafts") != std::string::npos &&
+                      std::string(error.what()).find("--spec mtp") != std::string::npos;
+        }
+        failures += check(refused, "--mtp-sampled-drafts without --spec mtp was not refused naming both flags");
+    }
     failures += check(!defaults.flash_next.mtp_joint_acceptance, "the joint-acceptance draft length is on by default");
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "7",
                                                  "--mtp-joint-acceptance"}))

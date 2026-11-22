@@ -191,6 +191,10 @@ void validate(const EngineOptions& options) {
         refuse("--mtp-joint-acceptance chooses how many MTP drafts each round verifies and --mtp-fixed "
                "(mtp_fixed_drafts) always verifies --draft-tokens: use one of them");
     }
+    if (next.mtp_sampled_drafts && spec.backend != SpeculativeBackend::Mtp) {
+        refuse("--mtp-sampled-drafts draws the MTP drafts of sampled requests and needs --spec mtp: add "
+               "--spec mtp or remove --mtp-sampled-drafts");
+    }
     if (next.mtp_staged_drafts && !next.mtp_joint_acceptance) {
         refuse("--mtp-staged-drafts stops drafting by the joint-acceptance window and needs "
                "--mtp-joint-acceptance: add --mtp-joint-acceptance or remove --mtp-staged-drafts");
@@ -387,6 +391,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.mtp_joint_acceptance = next.mtp_joint_acceptance;
     program_options.mtp_rows_verify      = next.mtp_rows_verify;
     program_options.mtp_staged_drafts    = next.mtp_staged_drafts;
+    program_options.mtp_sampled_drafts   = next.mtp_sampled_drafts;
     program_options.relaxed_drafting     = options.relaxed_drafting.has_value();
     program_options.ngram_prefetch       = next.ngram_prefetch;
     program_options.vision           = vision;

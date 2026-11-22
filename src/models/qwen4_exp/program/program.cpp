@@ -765,10 +765,12 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
         // sub-chunk's residual rows beside the call's residual. Acceptance's workspace.
         const std::size_t step = execution::Forward::mtp_workspace_bytes(c, 1, d.pages * kPagedKVPageSize,
                                                                          DeviceExecutionView{nullptr, sms},
-                                                                         o.moe_precast_input) +
+                                                                         o.moe_precast_input, o.mtp_sampled_drafts) +
                                  plan_hc_fused_read_workspace(o, c, 1);
         d.work = std::max(d.work, step) + std::size_t(c.residual_width()) * execution::kMtpChunkColumns * 2 * 3 +
                  ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(d.token_domain, 1, d.drafts, 1, 1);
+        // --mtp-sampled-drafts: the coupled acceptance samples the verification's W columns.
+        if (o.mtp_sampled_drafts) { d.work += ops::sampling_workspace_capacity_bytes(d.token_domain, 1, d.drafts + 1); }
     }
     d.sms       = sms;
     d.wide_work = execution::Forward::workspace_bytes(c, d.wide_chunk, d.pages * kPagedKVPageSize,
@@ -785,6 +787,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     b.shared_expert_workspace = plan_shared_expert_workspace(o, c);
     b.mtp_constrained_masks   = plan_mtp_constrained_masks(o, public_tokens);
     b.mtp_draft_probs         = plan_mtp_draft_probs(o);
+    b.mtp_sampled_drafts      = plan_mtp_sampled_drafts(o, d.token_domain).bytes;
     b.hot_embedding           = plan_hot_embedding(c.vocab_size, c.hidden_size, o.hot_embedding_rows,
                                                  o.hot_embedding_format).hot;
     b.cpu_misses              = plan_cpu_misses(o).device;
@@ -980,6 +983,16 @@ public:
             draft_probs_ = DeviceBuffer(plan_.bytes.mtp_draft_probs);
             allocated += plan_.bytes.mtp_draft_probs;
             draft_probs_host_ = PinnedHostBuffer(plan_.bytes.mtp_draft_probs);
+        }
+        sampled_layout_ = plan_mtp_sampled_drafts(options_, plan_.token_domain);
+        if (sampled_layout_.bytes != plan_.bytes.mtp_sampled_drafts) {
+            throw std::logic_error("Qwen3.8-Flash-Next: the sampled drafts' layout differs from its plan");
+        }
+        if (sampled_layout_.bytes != 0) {
+            sampled_drafts_ = DeviceBuffer(sampled_layout_.bytes);
+            allocated += sampled_layout_.bytes;
+            // The configs, positions and sampled tokens (the count overlays stay on the device).
+            sampled_drafts_host_ = PinnedHostBuffer(sampled_layout_.counts);
         }
         if (plan_.bytes.hot_embedding != 0) {
             // --hot-embedding-rows: the token embedding is in the mapped pinned block (the forward reads
@@ -4699,6 +4712,96 @@ private:
         }
         upload_pinned(static_cast<std::byte*>(io_device_.p) + io.draft_cells, host + io.draft_cells,
                       io.draft_anchor + 4 - io.draft_cells, device_.stream);
+        stage_sampled_draft_words(S);
+    }
+
+    // --mtp-sampled-drafts: the drafter's sampling config (the request's filters and seed, no
+    // penalties, counts, mask or relaxed threshold: a greedy request's stays greedy) and the round's
+    // sampling positions, S + j for column j: the position plain decode samples the token after
+    // column j's input at. Draft step j draws at position S + j, the one the target draws its
+    // column j at.
+    void stage_sampled_draft_words(std::int32_t S) {
+        if (sampled_layout_.bytes == 0) { return; }
+        auto* host = static_cast<std::byte*>(sampled_drafts_host_.data());
+        auto* dev  = static_cast<std::byte*>(sampled_drafts_.p);
+        auto& config             = *reinterpret_cast<ops::SamplingConfig*>(host + sampled_layout_.draft_config);
+        config                   = L().sampling;
+        config.presence_penalty  = 0.0F;
+        config.frequency_penalty = 0.0F;
+        config.token_counts      = nullptr;
+        config.mask              = {};
+        config.relaxed_threshold = 0.0F;
+        auto* positions = reinterpret_cast<std::int32_t*>(host + sampled_layout_.positions);
+        for (std::uint32_t j = 0; j < sampled_layout_.columns; ++j) { positions[j] = S + static_cast<std::int32_t>(j); }
+        upload_pinned(dev + sampled_layout_.draft_config, host + sampled_layout_.draft_config, sizeof(ops::SamplingConfig),
+                      device_.stream);
+        upload_pinned(dev + sampled_layout_.positions, host + sampled_layout_.positions, 4ULL * sampled_layout_.columns,
+                      device_.stream);
+    }
+
+    // --mtp-sampled-drafts: whether this single-row verification takes the coupled rule. A sampled
+    // row without a grammar mask and without relaxed drafting; every other row keeps the
+    // acceptance Op (exact for drafts drawn independently of its own draws).
+    bool coupled_round(const ops::SamplingMask& mask) const {
+        return sampled_layout_.bytes != 0 && L().sampling.temperature > 0.0F && mask.words == nullptr &&
+               !(options_.relaxed_drafting && L().sampling.relaxed_threshold > 0.0F);
+    }
+
+    // The coupled rule's draws: column j of the W verification columns is sampled exactly as plain
+    // decode samples that position (ops::sample, kSamplePurposeDecode, position S + j, the request's
+    // config), its penalties counting the committed tokens plus drafts[0..j-1] (a scratch overlay
+    // per column; the sampler's own increment lands there). The draws come back to the host.
+    void sample_coupled_columns(std::int32_t W, const Tensor& logits) {
+        const cudaStream_t s = device_.stream;
+        const auto& lay      = sampled_layout_;
+        auto* host           = static_cast<std::byte*>(sampled_drafts_host_.data());
+        auto* dev            = static_cast<std::byte*>(sampled_drafts_.p);
+        auto* configs        = reinterpret_cast<ops::SamplingConfig*>(host + lay.configs);
+        const std::size_t overlay_stride = align(4ULL * static_cast<std::size_t>(plan_.token_domain));
+        for (std::int32_t j = 0; j < W; ++j) {
+            configs[j]                   = L().sampling;
+            configs[j].mask              = {};
+            configs[j].relaxed_threshold = 0.0F;
+            if (L().sampling.token_counts != nullptr) {
+                auto* overlay = reinterpret_cast<std::int32_t*>(dev + lay.counts + static_cast<std::size_t>(j) * overlay_stride);
+                CUDA_CHECK(cudaMemcpyAsync(overlay, L().sampling.token_counts, 4ULL * plan_.token_domain,
+                                           cudaMemcpyDeviceToDevice, s));
+                if (j > 0) {
+                    Tensor counts(overlay, DType::I32, {plan_.token_domain});
+                    ops::increment_token_counts(spec_word(plan_.spec.w_drafts, j), counts, s);
+                }
+                configs[j].token_counts = overlay;
+            }
+        }
+        upload_pinned(dev + lay.configs, host + lay.configs, sizeof(ops::SamplingConfig) * static_cast<std::size_t>(W), s);
+        auto scope = work_->scope();
+        Tensor sampled(dev + lay.sampled, DType::I32, {W});
+        ops::sample(logits, sampled, plan_.token_domain, reinterpret_cast<const ops::SamplingConfig*>(dev + lay.configs),
+                    Tensor(dev + lay.positions, DType::I32, {W}), ops::kSamplePurposeDecode, *work_, s);
+        CUDA_CHECK(cudaMemcpyAsync(host + lay.sampled, sampled.data, 4ULL * static_cast<std::size_t>(W),
+                                   cudaMemcpyDeviceToHost, s));
+    }
+
+    // After the round's sync: the coupled rule keeps the drafts while each equals the target's draw
+    // at its column, and licenses the draws up to the first that differs (or the bonus column's).
+    // The words are those the acceptance Op would have written (licensed tokens, count, accepted),
+    // and the committed token counts take the licensed tokens, as the Op's do.
+    void take_coupled_columns(std::span<const TokenId> drafts, std::int32_t* words) {
+        const auto& sp       = plan_.spec;
+        const auto* sampled  = reinterpret_cast<const std::int32_t*>(static_cast<const std::byte*>(sampled_drafts_host_.data()) +
+                                                                     sampled_layout_.sampled);
+        const auto K         = static_cast<std::int32_t>(drafts.size());
+        std::int32_t A       = 0;
+        while (A < K && sampled[A] == drafts[static_cast<std::size_t>(A)]) { ++A; }
+        for (std::int32_t j = 0; j <= A; ++j) { words[sp.w_licensed + j] = sampled[j]; }
+        words[sp.w_counts]   = A + 1;
+        words[sp.w_accepted] = A;
+        if (L().sampling.token_counts != nullptr) {
+            const cudaStream_t s = device_.stream;
+            upload_pinned(spec_words_device() + sp.w_licensed, words + sp.w_licensed, 4ULL * static_cast<std::size_t>(A + 1), s);
+            Tensor counts(L().sampling.token_counts, DType::I32, {plan_.token_domain});
+            ops::increment_token_counts(spec_word(sp.w_licensed, A + 1), counts, s);
+        }
     }
 
     execution::MtpCall draft_call(std::int32_t step) const {
@@ -4739,6 +4842,12 @@ private:
         call.drafts       = spec_word(plan_.spec.w_drafts + static_cast<std::size_t>(j), 1);
         if (options_.mtp_joint_acceptance) {
             call.probs = Tensor(static_cast<std::byte*>(draft_probs_.p) + 4 * static_cast<std::size_t>(j), DType::FP32, {1});
+        }
+        if (sampled_layout_.bytes != 0) {
+            // --mtp-sampled-drafts: the draw at the position the target samples this draft's column.
+            auto* dev            = static_cast<std::byte*>(sampled_drafts_.p);
+            call.sample_config   = reinterpret_cast<const ops::SamplingConfig*>(dev + sampled_layout_.draft_config);
+            call.sample_position = Tensor(dev + sampled_layout_.positions + 4 * static_cast<std::size_t>(j), DType::I32, {1});
         }
         forward_->run_mtp(call);
     }
@@ -4932,29 +5041,36 @@ private:
         ops::SamplingMask mask;
         std::uint32_t dead = 0;
         if (masks != nullptr) { dead = stage_verify_masks(*masks, drafts, mask); }
-        // Acceptance from BF16 logits, as plain decode samples them.
-        Tensor target = spec_word(sp.w_target, W);
-        ops::argmax(wide16, target, plan_.token_domain, s);
-        // A positive threshold runs the relaxed acceptance instance (relaxed drafting).
-        const bool relaxed = install_round_config(mask) > 0.0F;
-        {
-            auto scope = work_->scope();
-            Tensor licensed = spec_word(sp.w_licensed, W).view({W, 1});
-            Tensor counts   = spec_word(sp.w_counts, 1);
-            Tensor accepted = spec_word(sp.w_accepted, 1);
-            Tensor lengths  = spec_word(sp.w_lengths, 1);
-            Tensor anchors  = spec_word(sp.w_anchors, 1);
-            Tensor kept     = spec_word(sp.w_relaxed, 1);
-            ops::speculative_accept_greedy_drafts(target.view({W, 1}), wide16.view({vocab_, W, 1}),
-                                                  spec_word(sp.w_drafts, K).view({K, 1}), spec_word(sp.w_extents, 1),
-                                                  lengths, anchors, licensed, counts, accepted, plan_.token_domain,
-                                                  configs_, *work_, s, relaxed ? &kept : nullptr);
-        }
-        CUDA_CHECK(cudaMemcpyAsync(words + sp.w_licensed, spec_words_device() + sp.w_licensed,
-                                   4ULL * (sp.w_accepted + 1 - sp.w_licensed), cudaMemcpyDeviceToHost, s));
-        if (relaxed) {
-            CUDA_CHECK(cudaMemcpyAsync(words + sp.w_relaxed, spec_words_device() + sp.w_relaxed, 4,
-                                       cudaMemcpyDeviceToHost, s));
+        // Acceptance from BF16 logits, as plain decode samples them. --mtp-sampled-drafts: a sampled
+        // row's columns are sampled as plain decode samples them (coupled acceptance).
+        const bool coupled = coupled_round(mask);
+        bool relaxed       = false;
+        if (coupled) {
+            sample_coupled_columns(W, wide16.view({vocab_, W}));
+        } else {
+            Tensor target = spec_word(sp.w_target, W);
+            ops::argmax(wide16, target, plan_.token_domain, s);
+            // A positive threshold runs the relaxed acceptance instance (relaxed drafting).
+            relaxed = install_round_config(mask) > 0.0F;
+            {
+                auto scope = work_->scope();
+                Tensor licensed = spec_word(sp.w_licensed, W).view({W, 1});
+                Tensor counts   = spec_word(sp.w_counts, 1);
+                Tensor accepted = spec_word(sp.w_accepted, 1);
+                Tensor lengths  = spec_word(sp.w_lengths, 1);
+                Tensor anchors  = spec_word(sp.w_anchors, 1);
+                Tensor kept     = spec_word(sp.w_relaxed, 1);
+                ops::speculative_accept_greedy_drafts(target.view({W, 1}), wide16.view({vocab_, W, 1}),
+                                                      spec_word(sp.w_drafts, K).view({K, 1}), spec_word(sp.w_extents, 1),
+                                                      lengths, anchors, licensed, counts, accepted, plan_.token_domain,
+                                                      configs_, *work_, s, relaxed ? &kept : nullptr);
+            }
+            CUDA_CHECK(cudaMemcpyAsync(words + sp.w_licensed, spec_words_device() + sp.w_licensed,
+                                       4ULL * (sp.w_accepted + 1 - sp.w_licensed), cudaMemcpyDeviceToHost, s));
+            if (relaxed) {
+                CUDA_CHECK(cudaMemcpyAsync(words + sp.w_relaxed, spec_words_device() + sp.w_relaxed, 4,
+                                           cudaMemcpyDeviceToHost, s));
+            }
         }
         const auto wait = Clock::now();
         {
@@ -4968,6 +5084,10 @@ private:
         const std::uint32_t flag_error = take_ngram_flag_error();
         check_cpu_verify();
         throw_ngram_flag(flag_error);
+        if (coupled) {
+            take_coupled_columns(drafts, words);
+            ++coupled_rounds_;
+        }
         const std::int32_t LC = words[sp.w_counts], A = words[sp.w_accepted];
         const std::int32_t kept = relaxed ? words[sp.w_relaxed] : 0;
         if (LC < 1 || LC > W || A != LC - 1 || kept < 0 || kept > A) {
@@ -6137,7 +6257,12 @@ private:
                               sp.rounds ? 1.0 + static_cast<double>(sp.accepted_tokens) / static_cast<double>(sp.rounds)
                                         : 0.0,
                               per.c_str());
-                diagnostic(line);
+                std::string text = line;
+                if (sampled_layout_.bytes != 0) {
+                    // --mtp-sampled-drafts: the verification rounds (all requests) that took the coupled rule.
+                    text += "; coupled rounds since start " + std::to_string(coupled_rounds_);
+                }
+                diagnostic(text);
             }
             const auto& s = residency_->stats();
             const auto& a = L().cache_at_admission;
@@ -6242,6 +6367,12 @@ private:
     // --mtp-joint-acceptance: the drafts' probabilities on the device and their pinned staging.
     DeviceBuffer draft_probs_;
     PinnedHostBuffer draft_probs_host_{1};
+    // --mtp-sampled-drafts (plan_mtp_sampled_drafts): the drafter's config, the verification
+    // columns' configs, positions, sampled tokens and count overlays; the pinned staging holds
+    // everything before the overlays. bytes 0: off.
+    SampledDraftsLayout sampled_layout_;
+    DeviceBuffer sampled_drafts_;
+    PinnedHostBuffer sampled_drafts_host_{1};
     // --hot-embedding-rows: the token embedding's first rows (ProgramDevicePlan::hot_embedding).
     DeviceBuffer hot_embedding_;
     const void* cold_embedding_ = nullptr; // the whole table's device pointer in the mapped pinned block
@@ -6391,6 +6522,7 @@ private:
     std::array<bool, kMaximumLanes> round_catch_up_{};
     bool deferred_             = false; // a decode round's cache update awaits its commit
     std::uint64_t decode_rounds_ = 0, rows_rounds_ = 0;
+    std::uint64_t coupled_rounds_ = 0; // --mtp-sampled-drafts: verifications under the coupled rule
     std::uint64_t budget_tokens_ = 0;
     std::vector<std::uint32_t> row_ids_;
     std::vector<std::int32_t> ngram_window_; // ngram_window_rows' token window, kept between calls
@@ -6529,6 +6661,26 @@ std::uint64_t plan_steering(const ProgramOptions& options, const TextConfig& con
 std::uint64_t plan_mtp_draft_probs(const ProgramOptions& options) {
     if (!options.mtp_joint_acceptance || options.mtp_draft_tokens == 0) { return 0; }
     return 4ULL * options.mtp_draft_tokens;
+}
+
+SampledDraftsLayout plan_mtp_sampled_drafts(const ProgramOptions& options, std::int32_t token_domain) {
+    SampledDraftsLayout out;
+    if (!options.mtp_sampled_drafts || options.mtp_draft_tokens == 0 || token_domain <= 0) { return out; }
+    out.columns        = options.mtp_draft_tokens + 1;
+    const auto aligned = [](std::uint64_t n) { return (n + 255) / 256 * 256; };
+    std::uint64_t at   = 0;
+    const auto take    = [&](std::uint64_t bytes) {
+        const std::uint64_t here = at;
+        at                       = aligned(at + bytes);
+        return here;
+    };
+    out.draft_config = take(sizeof(ops::SamplingConfig));
+    out.configs      = take(sizeof(ops::SamplingConfig) * out.columns);
+    out.positions    = take(4ULL * out.columns);
+    out.sampled      = take(4ULL * out.columns);
+    out.counts       = take(aligned(4ULL * static_cast<std::uint64_t>(token_domain)) * out.columns);
+    out.bytes        = at;
+    return out;
 }
 
 CpuMissPlan plan_cpu_misses(const ProgramOptions& options) {

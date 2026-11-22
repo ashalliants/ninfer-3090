@@ -374,6 +374,7 @@ int check_flash_next_options_refused() {
         {"--prefill-cpu-all-columns", [](auto& n) { n.prefill_cpu_all_columns = 1024; }},
         {"--ngram-ram-mib", [](auto& n) { n.ngram_ram_bytes = ninfer::FlashNextOptions::kNgramRamAuto; }},
         {"--mtp-staged-drafts", [](auto& n) { n.mtp_staged_drafts = true; }},
+        {"--mtp-sampled-drafts", [](auto& n) { n.mtp_sampled_drafts = true; }},
         {"--gdn-async-commit", [](auto& n) { n.gdn_async_commit = true; }},
         {"--hc-int8", [](auto& n) { n.hc_int8 = true; }},
         {"--hc-fused-read", [](auto& n) { n.hc_fused_read = true; }},

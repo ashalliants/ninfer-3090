@@ -346,6 +346,10 @@ struct ProgramDevicePlan {
     // --mtp-joint-acceptance: the drafts' probabilities, one FP32 word per draft
     // (plan_mtp_draft_probs; 0 when off or without MTP).
     std::uint64_t mtp_draft_probs = 0;
+    // --mtp-sampled-drafts: the drafter's sampling config, a config, position and sampled token per
+    // verification column, and one token-count overlay per column (plan_mtp_sampled_drafts; 0 when
+    // off or without MTP).
+    std::uint64_t mtp_sampled_drafts = 0;
     // --hot-embedding-rows: the device copy of the token embedding's first rows
     // (plan_hot_embedding(...).hot; 0 when off). The whole table is in the pinned block then.
     std::uint64_t hot_embedding = 0;
@@ -369,7 +373,7 @@ struct ProgramDevicePlan {
 
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept {
         return kv + workspace + staging + state + io + residency + speculation + shared_expert_workspace +
-               mtp_constrained_masks + mtp_draft_probs + hot_embedding + cpu_misses + hc_int8_bytes +
+               mtp_constrained_masks + mtp_draft_probs + mtp_sampled_drafts + hot_embedding + cpu_misses + hc_int8_bytes +
                steering + ngram_flag_wait;
     }
 };
@@ -436,6 +440,14 @@ struct ProgramOptions {
     // graph) and stops once the joint product of the drafts so far is below the threshold. The
     // drafts it makes are the full chain's first ones, bit for bit, and the window is the same.
     bool mtp_staged_drafts = false;
+    // FlashNextOptions::mtp_sampled_drafts: every drafter step draws its draft with ops::sample under
+    // the request's filters (no penalties, no mask) at the position the target samples it, so a
+    // greedy request's drafts stay the argmax bit for bit; a sampled single-row verification
+    // (no grammar mask, no relaxed drafting) then samples each column as plain decode would
+    // (ops::sample, kSamplePurposeDecode, position S + j, the token counts plus drafts[0..j-1])
+    // and keeps the drafts while they equal those draws (coupled acceptance). Every other round
+    // keeps its acceptance rule, which stays exact for drafts drawn independently of its own draws.
+    bool mtp_sampled_drafts = false;
     // FlashNextOptions::mtp_rows_verify: a round with more than one eligible row speculates
     // genuinely in a single batched draft-and-verify (docs/maintainer/mtp-multi-row-lanes-design.md)
     // instead of always falling back to a plain round. Requires mtp_joint_acceptance. Off by
@@ -640,6 +652,15 @@ void require_shared_expert_workspace(std::uint64_t need, std::uint64_t planned, 
 // ProgramDevicePlan::mtp_draft_probs of these options: one FP32 word per draft (mtp_draft_tokens);
 // 0 without mtp_joint_acceptance or MTP.
 [[nodiscard]] std::uint64_t plan_mtp_draft_probs(const ProgramOptions& options);
+// The layout of ProgramDevicePlan::mtp_sampled_drafts over a token domain of `token_domain`: the
+// drafter's SamplingConfig, then for each of the 1 + mtp_draft_tokens verification columns a
+// SamplingConfig, an I32 position, an I32 sampled token and an I32 [token_domain] count overlay, each
+// region 256-byte aligned. bytes is 0 (and nothing is laid out) without mtp_sampled_drafts or MTP.
+struct SampledDraftsLayout {
+    std::uint64_t draft_config = 0, configs = 0, positions = 0, sampled = 0, counts = 0, bytes = 0;
+    std::uint32_t columns = 0;
+};
+[[nodiscard]] SampledDraftsLayout plan_mtp_sampled_drafts(const ProgramOptions& options, std::int32_t token_domain);
 // The GDN replay records of one W-column verification: every GDN layer, one record row. Their key
 // records hold one key head per value head (the copy route), or with gdn_head_map the model's key
 // heads read through the tiled map (spec.head_map Tiled).
