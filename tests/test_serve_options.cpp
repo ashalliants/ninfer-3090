@@ -573,6 +573,26 @@ int main() {
                       "--partial-ram-residency does not reach the Engine");
     failures += check(serve_usage_text("ninfer-serve").find("--partial-ram-residency") != std::string::npos,
                       "the usage text does not name --partial-ram-residency");
+    {
+        using Mode = ninfer::FlashNextOptions::AsyncContextCapture;
+        failures += check(defaults.flash_next.async_context_capture == Mode::Auto,
+                          "async context-cache captures do not default to auto");
+        const std::pair<const char*, Mode> forms[] = {{"auto", Mode::Auto}, {"on", Mode::On}, {"off", Mode::Off}};
+        for (const auto& [form, mode] : forms) {
+            failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--async-context-capture", form}))
+                                      .flash_next.async_context_capture == mode,
+                              (std::string("--async-context-capture ") + form + " does not reach the Engine").c_str());
+        }
+        bool refused = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--async-context-capture", "yes"});
+        } catch (const std::invalid_argument& error) {
+            refused = std::string(error.what()).find("--async-context-capture") != std::string::npos;
+        }
+        failures += check(refused, "--async-context-capture yes was not refused naming the flag");
+        failures += check(serve_usage_text("ninfer-serve").find("--async-context-capture") != std::string::npos,
+                          "the usage text does not name --async-context-capture");
+    }
     failures += check(!defaults.flash_next.gdn_async_commit, "the GDN commit on a side stream is on by default");
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
                                                  "--gdn-async-commit"}))

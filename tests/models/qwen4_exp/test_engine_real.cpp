@@ -1182,7 +1182,9 @@ int mtp_constrained_matches_plain(const std::string& artifact, const std::vector
 // cold run; those are reported with the first differing token, not failed. --mtp K runs both
 // Engines with MTP.
 //   ninfer_qwen4_exp_engine_real_test --cache [--mtp K] [--host-mib N] [--nvme-mib N] [--generate N]
-//       (--nvme-mib: the NVMe tier, the Host tier its RAM cache; --host-mib 0 with it: disk only)
+//       [--async-capture auto|on|off]
+//       (--nvme-mib: the NVMe tier, the Host tier its RAM cache; --host-mib 0 with it: disk only;
+//       --async-capture: --async-context-capture for both Engines, default auto)
 int cache_check(const std::string& artifact, const std::vector<std::string>& args,
                 const std::vector<TokenId>& long_prompt, const std::vector<TokenId>& suffix,
                 const std::vector<TokenId>& tail);
@@ -1331,9 +1333,24 @@ int cache_check(const std::string& artifact, const std::vector<std::string>& arg
     std::uint64_t nvme = 0;
     std::filesystem::path store;
     bool evict = false;
+    auto async_capture = FlashNextOptions::AsyncContextCapture::Auto;
     for (std::size_t i = 0; i < args.size(); ++i) {
         if (args[i] == "--evict") {
             evict = true;
+            continue;
+        }
+        if (args[i] == "--async-capture" && i + 1 < args.size()) {
+            const std::string mode = args[++i];
+            using Mode             = FlashNextOptions::AsyncContextCapture;
+            if (mode == "on") {
+                async_capture = Mode::On;
+            } else if (mode == "off") {
+                async_capture = Mode::Off;
+            } else if (mode == "auto") {
+                async_capture = Mode::Auto;
+            } else {
+                throw std::invalid_argument("--async-capture takes auto, on or off");
+            }
             continue;
         }
         if (args[i] == "--store" && i + 1 < args.size()) {
@@ -1364,6 +1381,7 @@ int cache_check(const std::string& artifact, const std::vector<std::string>& arg
         o.context_cache.enabled              = cache;
         o.context_cache.host_capacity_bytes  = cache ? host : std::optional<std::size_t>(0);
         o.flash_next.context_nvme_bytes      = cache ? nvme : 0;
+        o.flash_next.async_context_capture   = async_capture;
         if (mtp > 0) {
             o.speculative.backend      = SpeculativeBackend::Mtp;
             o.speculative.draft_tokens = mtp;

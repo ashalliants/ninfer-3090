@@ -1,5 +1,6 @@
 #include "models/qwen4_exp/program/context_cache.h"
 
+#include "core/device.h"
 #include "core/host_gather.h"
 #include "core/paged_kv_cache.h"
 #include "runtime/engine/context_cache/recovery_loss.h"
@@ -103,11 +104,13 @@ HostTier::HostTier(std::uint32_t slabs, std::size_t slab_bytes, std::size_t desc
 }
 
 HostTier::~HostTier() {
+    if (drain_descriptors_ != nullptr) { cudaFreeHost(drain_descriptors_); }
     if (descriptors_ != nullptr) { cudaFreeHost(descriptors_); }
     if (memory_ != nullptr) { cudaFreeHost(memory_); }
 }
 
-void HostTier::copy(std::span<const SlabCopy> copies, bool to_tier, cudaStream_t stream) {
+std::size_t HostTier::stage_descriptors(std::span<const SlabCopy> copies, bool to_tier, void*& buffer,
+                                        std::size_t& buffer_bytes, cudaStream_t stream) {
     std::vector<GatherCopy> gather;
     gather.reserve(copies.size());
     for (const SlabCopy& c : copies) {
@@ -119,9 +122,9 @@ void HostTier::copy(std::span<const SlabCopy> copies, bool to_tier, cudaStream_t
     const std::pair<std::byte*, std::size_t> layout{static_cast<std::byte*>(memory_), slab_bytes_};
     translate_slab_copies(copies, slab_bytes_, to_tier, &contiguous_address, &layout, gather);
     split_gather_copies(gather, kGatherPiece);
-    if (gather.empty()) { return; }
+    if (gather.empty()) { return 0; }
     const std::size_t bytes = gather.size() * sizeof(GatherCopy);
-    if (bytes > descriptor_bytes_) {
+    if (bytes > buffer_bytes) {
         // The old descriptors may still be read by an earlier gather.
         if (cudaStreamSynchronize(stream) != cudaSuccess) { throw std::runtime_error("context cache: stream failed"); }
         void* grown = nullptr;
@@ -129,12 +132,142 @@ void HostTier::copy(std::span<const SlabCopy> copies, bool to_tier, cudaStream_t
             (void)cudaGetLastError();
             throw std::runtime_error("cudaHostAlloc of the gather descriptors failed");
         }
-        cudaFreeHost(descriptors_);
-        descriptors_      = grown;
-        descriptor_bytes_ = bytes + bytes / 2;
+        if (buffer != nullptr) { cudaFreeHost(buffer); }
+        buffer       = grown;
+        buffer_bytes = bytes + bytes / 2;
     }
-    std::memcpy(descriptors_, gather.data(), bytes);
-    gather_copies(std::span<const GatherCopy>(static_cast<const GatherCopy*>(descriptors_), gather.size()), stream);
+    std::memcpy(buffer, gather.data(), bytes);
+    return gather.size();
+}
+
+void HostTier::copy(std::span<const SlabCopy> copies, bool to_tier, cudaStream_t stream) {
+    const std::size_t count = stage_descriptors(copies, to_tier, descriptors_, descriptor_bytes_, stream);
+    if (count == 0) { return; }
+    gather_copies(std::span<const GatherCopy>(static_cast<const GatherCopy*>(descriptors_), count), stream);
+}
+
+void HostTier::drain(std::span<const SlabCopy> copies, GatherPace pace, cudaStream_t stream) {
+    const std::size_t count = stage_descriptors(copies, true, drain_descriptors_, drain_descriptor_bytes_, stream);
+    if (count == 0) { return; }
+    gather_copies_paced(std::span<const GatherCopy>(static_cast<const GatherCopy*>(drain_descriptors_), count), pace,
+                        stream);
+}
+
+namespace {
+constexpr std::size_t kStageAlign = 256;
+std::size_t stage_round(std::size_t bytes) { return (bytes + kStageAlign - 1) / kStageAlign * kStageAlign; }
+} // namespace
+
+CaptureDrain::CaptureDrain(std::size_t staging_bytes, GatherPace pace) : capacity_(staging_bytes), pace_(pace) {
+    try {
+        CUDA_CHECK(cudaMalloc(&staging_, staging_bytes));
+        // The default priority: the drain takes what the forward beside it leaves.
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&staged_, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&drained_, cudaEventDisableTiming));
+    } catch (...) {
+        release();
+        throw;
+    }
+}
+
+CaptureDrain::~CaptureDrain() {
+    settle();
+    release();
+}
+
+void CaptureDrain::release() noexcept {
+    if (drained_ != nullptr) { (void)cudaEventDestroy(drained_); }
+    if (staged_ != nullptr) { (void)cudaEventDestroy(staged_); }
+    if (stream_ != nullptr) { (void)cudaStreamDestroy(stream_); }
+    if (descriptors_ != nullptr) { (void)cudaFreeHost(descriptors_); }
+    if (staging_ != nullptr) { (void)cudaFree(staging_); }
+    drained_ = staged_ = nullptr;
+    stream_            = nullptr;
+    descriptors_       = nullptr;
+    staging_           = nullptr;
+}
+
+std::size_t CaptureDrain::staged_bytes(std::span<const SlabCopy> copies) noexcept {
+    std::size_t bytes = 0;
+    for (const SlabCopy& c : copies) { bytes += stage_round(c.width * c.rows); }
+    return bytes;
+}
+
+bool CaptureDrain::stage(std::vector<SlabCopy>& copies, cudaStream_t main) {
+    if (pending_) { throw std::logic_error("context cache: a capture staged while the previous one drains"); }
+    if (staged_bytes(copies) > capacity_) { return false; }
+    std::vector<GatherCopy> gather;
+    gather.reserve(copies.size());
+    std::size_t at = 0;
+    auto* base     = static_cast<std::byte*>(staging_);
+    for (SlabCopy& c : copies) {
+        if (c.rows == 0 || c.width == 0) { continue; }
+        if (c.rows > 1 && c.device_pitch != c.width) {
+            throw std::logic_error("context cache: a staged copy's device rows are not contiguous");
+        }
+        GatherCopy g;
+        g.destination       = base + at;
+        g.source            = c.device;
+        g.destination_pitch = c.width;
+        g.source_pitch      = c.width;
+        g.width             = c.width;
+        g.height            = c.rows;
+        gather.push_back(g);
+        c.device       = base + at;
+        c.device_pitch = c.width;
+        at += stage_round(c.width * c.rows);
+    }
+    split_gather_copies(gather, kGatherPiece);
+    if (!gather.empty()) {
+        const std::size_t bytes = gather.size() * sizeof(GatherCopy);
+        if (bytes > descriptor_bytes_) {
+            // No drain is in flight and the staging gather before it completed with it (wait()).
+            void* grown = nullptr;
+            if (cudaHostAlloc(&grown, bytes + bytes / 2, kMappedPinned) != cudaSuccess) {
+                (void)cudaGetLastError();
+                throw std::runtime_error("cudaHostAlloc of the capture staging descriptors failed");
+            }
+            if (descriptors_ != nullptr) { cudaFreeHost(descriptors_); }
+            descriptors_      = grown;
+            descriptor_bytes_ = bytes + bytes / 2;
+        }
+        std::memcpy(descriptors_, gather.data(), bytes);
+        gather_copies(std::span<const GatherCopy>(static_cast<const GatherCopy*>(descriptors_), gather.size()), main);
+    }
+    CUDA_CHECK(cudaEventRecord(staged_, main));
+    return true;
+}
+
+void CaptureDrain::drain(CheckpointTier& tier, std::span<const SlabCopy> copies) {
+    if (pending_) { throw std::logic_error("context cache: a drain started while another is in flight"); }
+    CUDA_CHECK(cudaStreamWaitEvent(stream_, staged_, 0));
+    // From here whatever reached the side stream is waited for: `drained` follows it even when the
+    // enqueue throws halfway.
+    pending_ = true;
+    try {
+        tier.drain(copies, pace_, stream_);
+    } catch (...) {
+        if (cudaEventRecord(drained_, stream_) != cudaSuccess) { (void)cudaStreamSynchronize(stream_); }
+        throw;
+    }
+    if (const cudaError_t recorded = cudaEventRecord(drained_, stream_); recorded != cudaSuccess) {
+        (void)cudaStreamSynchronize(stream_);
+        CUDA_CHECK(recorded);
+    }
+    ++drains_;
+}
+
+void CaptureDrain::wait() {
+    if (!pending_) { return; }
+    pending_ = false;
+    CUDA_CHECK(cudaEventSynchronize(drained_));
+}
+
+void CaptureDrain::settle() noexcept {
+    if (!pending_) { return; }
+    pending_ = false;
+    if (cudaEventSynchronize(drained_) != cudaSuccess) { (void)cudaStreamSynchronize(stream_); }
 }
 
 std::vector<std::uint32_t> prefill_splits(std::span<const std::uint32_t> capture_frontiers,

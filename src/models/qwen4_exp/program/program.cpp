@@ -1048,6 +1048,8 @@ public:
                                      "driver's sysmem fallback: free VRAM, or lower --max-context or --prefill-chunk");
         }
         measure_link();
+        // --async-context-capture: its staging is taken before the expert cache is sized below.
+        start_capture_drain();
 
         // The VRAM expert cache takes what the fixed allocations, the reserve for graph executables
         // and the display headroom leave.
@@ -1261,10 +1263,14 @@ public:
         device_.synchronize();
         report_startup();
         if (options_.context_cache_bytes != 0 || options_.context_nvme_bytes != 0) { setup_context_cache(); }
+        if (drain_ && (!tier_ || !tier_->can_drain())) {
+            drain_.reset(); // no Host tier to drain to: the staging goes back (the expert cache can grow into it)
+        }
     }
 
     ~ProgramImpl() noexcept {
         settle_gdn_fold(); // the synchronization below then covers the fold in flight
+        if (drain_) { drain_->settle(); } // a checkpoint's background drain lands before the tier goes
         try {
             device_.synchronize();
         } catch (...) {}
@@ -2631,6 +2637,7 @@ public:
             throw std::logic_error("checkpoints cannot be exported during a context transaction");
         }
         if (!cache_) { throw std::invalid_argument("Qwen3.8-Flash-Next: the context cache is off"); }
+        settle_drain(); // the image reads the slabs: a checkpoint drained in the background lands first
         return export_checkpoint_image(*cache_, *tier_, layout_, points, session, binding, std::move(buffer));
     }
 
@@ -2645,6 +2652,7 @@ public:
         }
         if (!cache_) { throw std::invalid_argument("Qwen3.8-Flash-Next: the context cache is off"); }
         const auto start = Clock::now();
+        settle_drain(); // the import writes free slabs, which a drain in flight may still be writing
         auto imported    = import_checkpoint_image(*cache_, *tier_, layout_, image, binding);
         char line[200];
         if (imported) {
@@ -2929,8 +2937,11 @@ private:
         copies_.clear();
         add_page_copies(std::span<const std::uint32_t>(r.pages).subspan(mirrored), mirrored);
         add_image_copies(r.image, logits);
-        run_copies(true);
-        device_.synchronize();
+        last_capture_drained_ = drain_capture();
+        if (!last_capture_drained_) {
+            run_copies(true);
+            device_.synchronize();
+        }
         // The full pages it copied join the mirror (their device KV equals them from now on).
         L().mirror.reserve(full);
         for (std::uint32_t page = mirrored; page < full; ++page) {
@@ -2948,8 +2959,11 @@ private:
         capture_ns_ += ns;
         try {
             char line[200];
-            std::snprintf(line, sizeof(line), "context cache: captured %u tokens in %.1f ms; Host tier %.2f of %.2f GiB",
+            std::snprintf(line, sizeof(line), "context cache: captured %u tokens in %.1f ms%s; Host tier %.2f of %.2f GiB",
                           frontier, static_cast<double>(ns) * 1e-6,
+                          last_capture_drained_     ? " (draining)"
+                          : last_capture_oversized_ ? " (larger than the staging: synchronous)"
+                                                    : "",
                           static_cast<double>(cache_->occupied_bytes()) / (1ULL << 30),
                           static_cast<double>(cache_->capacity_bytes()) / (1ULL << 30));
             diagnostic(line);
@@ -3239,18 +3253,80 @@ private:
         if (logits) { region(lane_logits_ptr(cur_), image_logits_, 2ULL * c_.vocab_size); }
     }
 
-    // Moves the staged copies on the compute stream (after every earlier kernel that wrote or reads
-    // the lane's KV and state). The caller synchronizes before the slabs or descriptors are reused.
-    void run_copies(bool to_tier) {
-        tier_->copy(copies_, to_tier, device_.stream);
+    // --async-context-capture: the capture's copies (copies_) staged into VRAM on the compute stream
+    // and drained to the tier on the drain's side stream; the caller then skips its synchronous copy.
+    // False (copies_ untouched) when off, when the tier cannot drain, or when the capture is larger
+    // than the staging (a long prompt's first checkpoint): the caller copies synchronously. The
+    // previous drain lands first (one in flight; the staging and its slabs are reused).
+    bool drain_capture() {
+        last_capture_oversized_ = false;
+        if (!drain_ || !tier_->can_drain()) { return false; }
+        drain_->wait();
+        if (!drain_->stage(copies_, device_.stream)) {
+            last_capture_oversized_ = true;
+            return false;
+        }
+        drain_->drain(*tier_, copies_);
         copies_.clear();
+        return true;
     }
 
-    // Sizes and opens the tier: the page record (every attention layer's five planes of one page),
-    // the state image, the slabs and the descriptor buffer; the NVMe tier when one is configured (its
-    // RAM cache the Host bytes), else the pinned Host tier. An NVMe tier that cannot be opened falls
-    // back to the Host tier; a tier that cannot be pinned leaves prefix reuse off. Each says so.
-    void setup_context_cache() {
+    // The host waits for the capture drain in flight, if any (--async-context-capture).
+    void settle_drain() const {
+        if (drain_) { drain_->wait(); }
+    }
+
+    // --async-context-capture: makes the staging and the drain's stream when the gate holds (on, or
+    // auto with the link measure_link() read below kAsyncCaptureLinkBytesPerSecond), before the
+    // expert cache takes the free VRAM. Each decision is logged once; a failure to allocate keeps
+    // the synchronous captures.
+    void start_capture_drain() {
+        using Mode      = FlashNextOptions::AsyncContextCapture;
+        const auto mode = options_.async_context_capture;
+        if (mode == Mode::Off || options_.context_cache_bytes == 0) { return; }
+        if (options_.context_nvme_bytes != 0) {
+            if (mode == Mode::On) {
+                diagnostic("context cache: --async-context-capture is not used with the NVMe tier (its writes are host I/O); "
+                           "captures stay synchronous");
+            }
+            return;
+        }
+        char line[300];
+        const bool slow = link_ > 0.0 && link_ < kAsyncCaptureLinkBytesPerSecond;
+        if (mode == Mode::Auto && !slow) {
+            std::snprintf(line, sizeof(line),
+                          "context cache: captures copy synchronously (the %.1f GB/s link is at least %.0f GB/s; "
+                          "--async-context-capture on stages them)",
+                          link_ / 1e9, kAsyncCaptureLinkBytesPerSecond / 1e9);
+            diagnostic(line);
+            return;
+        }
+        (void)context_record_bytes();
+        const std::uint64_t bytes = plan_async_capture_staging(options_, image_bytes_, page_kv_bytes_);
+        if (bytes == 0) { return; }
+        // About 0.6 of the link's D2H rate, in paced blocks of about 2 GB/s (GatherPace's default):
+        // one block on a 3.3 GB/s link.
+        GatherPace pace;
+        const double rate = link_ > 0.0 ? link_ : kAsyncCaptureLinkBytesPerSecond;
+        pace.blocks       = static_cast<unsigned>(std::clamp(std::lround(0.6 * rate / 2e9), 1L, 8L));
+        try {
+            drain_ = std::make_unique<CaptureDrain>(bytes, pace);
+        } catch (const std::exception& error) {
+            diagnostic(std::string("context cache: no VRAM for the capture staging (") + error.what() +
+                       "); captures stay synchronous");
+            return;
+        }
+        std::snprintf(line, sizeof(line),
+                      "context cache: captures drain in the background (%.0f MiB of VRAM staging, %u paced block%s; "
+                      "%s%.1f GB/s link)",
+                      static_cast<double>(bytes) / (1 << 20), pace.blocks, pace.blocks == 1 ? "" : "s",
+                      mode == Mode::On ? "--async-context-capture on, " : "", link_ / 1e9);
+        diagnostic(line);
+    }
+
+    // The page record and state image layout (record_planes_, page_kv_bytes_, image_*) from the
+    // plan; returns the page record's slab size.
+    std::size_t context_record_bytes() {
         std::size_t at = 0;
         page_kv_bytes_ = 0;
         record_planes_.clear();
@@ -3268,6 +3344,23 @@ private:
         image_logits_            = image_saved_ + (plan_.drafts > 0 ? align(2ULL * c_.residual_width()) : 0);
         image_bytes_             = image_logits_ + 2ULL * c_.vocab_size;
         image_slabs_             = static_cast<std::uint32_t>((image_bytes_ + record - 1) / record);
+        return record;
+    }
+
+    // Moves the staged copies on the compute stream (after every earlier kernel that wrote or reads
+    // the lane's KV and state). The caller synchronizes before the slabs or descriptors are reused.
+    void run_copies(bool to_tier) {
+        settle_drain(); // a background drain lands before the tier's slabs are read or written again
+        tier_->copy(copies_, to_tier, device_.stream);
+        copies_.clear();
+    }
+
+    // Sizes and opens the tier: the page record (every attention layer's five planes of one page),
+    // the state image, the slabs and the descriptor buffer; the NVMe tier when one is configured (its
+    // RAM cache the Host bytes), else the pinned Host tier. An NVMe tier that cannot be opened falls
+    // back to the Host tier; a tier that cannot be pinned leaves prefix reuse off. Each says so.
+    void setup_context_cache() {
+        const std::size_t record = context_record_bytes();
         const auto ram_slabs     = static_cast<std::uint32_t>(options_.context_cache_bytes / record);
         const auto disk_slabs    = static_cast<std::uint32_t>(
             std::min<std::uint64_t>(options_.context_nvme_bytes / record, std::numeric_limits<std::uint32_t>::max() / 2));
@@ -6406,6 +6499,11 @@ private:
     std::unique_ptr<CheckpointTier> tier_;
     NvmeTier* nvme_ = nullptr; // tier_ when it is the NVMe tier
     std::unique_ptr<HostCheckpointStore> cache_;
+    // --async-context-capture: the staging and the drain (null when off). Declared after the tier,
+    // so it is destroyed (waiting for the drain in flight) before the tier's slabs are freed.
+    std::unique_ptr<CaptureDrain> drain_;
+    // The last capture_record's route (its log line): staged and draining, or larger than the staging.
+    bool last_capture_drained_ = false, last_capture_oversized_ = false;
     CheckpointLayout layout_;  // the checkpoint images' layout
     std::vector<std::array<std::size_t, 5>> record_planes_;
     std::size_t page_kv_bytes_ = 0;
@@ -6529,6 +6627,17 @@ std::uint64_t plan_steering(const ProgramOptions& options, const TextConfig& con
 std::uint64_t plan_mtp_draft_probs(const ProgramOptions& options) {
     if (!options.mtp_joint_acceptance || options.mtp_draft_tokens == 0) { return 0; }
     return 4ULL * options.mtp_draft_tokens;
+}
+
+std::uint64_t plan_async_capture_staging(const ProgramOptions& options, std::uint64_t image_bytes,
+                                         std::uint64_t page_kv_bytes) {
+    if (options.async_context_capture == FlashNextOptions::AsyncContextCapture::Off ||
+        options.context_cache_bytes == 0 || options.context_nvme_bytes != 0 || image_bytes == 0) {
+        return 0;
+    }
+    constexpr std::uint64_t kMiB = 1ULL << 20;
+    const std::uint64_t bytes    = image_bytes + std::uint64_t{kAsyncCapturePages} * page_kv_bytes;
+    return (bytes + kMiB - 1) / kMiB * kMiB + 4 * kMiB;
 }
 
 CpuMissPlan plan_cpu_misses(const ProgramOptions& options) {

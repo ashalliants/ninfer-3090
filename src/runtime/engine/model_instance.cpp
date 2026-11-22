@@ -313,6 +313,7 @@ void validate_flash_next_options_unused(const EngineOptions& options) {
     note(set.ggml_decode_mma, "--ggml-decode-mma");
     note(set.context_nvme_bytes != 0, "--context-nvme-mib");
     note(!set.context_nvme_dir.empty(), "--context-nvme-dir");
+    note(set.async_context_capture != unset.async_context_capture, "--async-context-capture");
     if (!flags.empty()) {
         std::string list;
         for (const std::string& flag : flags) { list += (list.empty() ? "" : ", ") + flag; }

@@ -751,6 +751,18 @@ struct FlashNextOptions {
     // free space at startup.
     std::uint64_t context_nvme_bytes = 0;
     std::filesystem::path context_nvme_dir;
+    // Context-cache captures that drain to the Host tier in the background
+    // (--async-context-capture auto|on|off): a capture copies its state image and new KV pages into
+    // a VRAM staging buffer on the device stream (well under a millisecond) and a paced gather on a
+    // side stream moves them over PCIe while the next prefill call or decode round runs; a
+    // checkpoint is not read (restore, export, import) before its bytes have landed. The same bytes,
+    // only later. It costs the staging buffer's VRAM (about 170 MiB for Qwen3.8-Flash-Next, out of
+    // the expert cache). Auto (the default) turns it on when the PCIe link measured at startup is
+    // below 8 GB/s (an eGPU's x4 link, where a capture's ~111 MiB takes 36-46 ms); a faster link
+    // keeps the synchronous capture. The NVMe tier and captures larger than the staging buffer stay
+    // synchronous.
+    enum class AsyncContextCapture : std::uint8_t { Auto, On, Off };
+    AsyncContextCapture async_context_capture = AsyncContextCapture::Auto;
 };
 
 // Where a suspended model's retained device state waits in host memory.

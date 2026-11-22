@@ -467,6 +467,10 @@ struct ProgramOptions {
     std::uint64_t context_nvme_bytes = 0;
     std::filesystem::path context_nvme_path;
     std::uint64_t context_bounce_bytes = 128ULL << 20;
+    // FlashNextOptions::async_context_capture: captures stage into VRAM and drain to the Host tier
+    // on a paced side stream (plan_async_capture_staging sizes the staging); Auto decides from the
+    // link measured at startup (below kAsyncCaptureLinkBytesPerSecond).
+    FlashNextOptions::AsyncContextCapture async_context_capture = FlashNextOptions::AsyncContextCapture::Auto;
     // Each MoE block's shared expert on a side stream beside the routed experts (high priority in
     // eager calls; graph replays ignore it) (execution::ForwardOptions::shared_expert_stream).
     // Designed to give the same outputs, bit for bit; not yet checked on a GPU.
@@ -640,6 +644,22 @@ void require_shared_expert_workspace(std::uint64_t need, std::uint64_t planned, 
 // ProgramDevicePlan::mtp_draft_probs of these options: one FP32 word per draft (mtp_draft_tokens);
 // 0 without mtp_joint_acceptance or MTP.
 [[nodiscard]] std::uint64_t plan_mtp_draft_probs(const ProgramOptions& options);
+
+// --async-context-capture: links measured below this rate (bytes per second) turn Auto on. A PCIe
+// Gen3 x4 eGPU (about 3.3 GB/s) or x8 (about 6.5 GB/s) is below it, an x16 slot (12 GB/s or more)
+// is not.
+inline constexpr double kAsyncCaptureLinkBytesPerSecond = 8e9;
+// The KV pages a staged capture holds beside its state image (4,096 tokens): a capture with more
+// pages past the lane's mirror (a long prompt's first checkpoint) is copied synchronously.
+inline constexpr std::uint32_t kAsyncCapturePages = 64;
+// The VRAM staging buffer of --async-context-capture for a state image of `image_bytes` and KV page
+// records of `page_kv_bytes` (the planes' bytes of one page, every attention layer): the image and
+// kAsyncCapturePages pages, rounded up to a MiB, plus 4 MiB for each copy's alignment. 0 when the option is off, without the
+// context cache's Host tier, or with the NVMe tier (whose writes are host I/O). Allocated only when
+// the gate (on, or auto on a slow link) holds, after the link is measured and before the expert
+// cache is sized, so the frames take the rest; not part of ProgramDevicePlan::fixed_bytes().
+[[nodiscard]] std::uint64_t plan_async_capture_staging(const ProgramOptions& options, std::uint64_t image_bytes,
+                                                       std::uint64_t page_kv_bytes);
 // The GDN replay records of one W-column verification: every GDN layer, one record row. Their key
 // records hold one key head per value head (the copy route), or with gdn_head_map the model's key
 // heads read through the tiled map (spec.head_map Tiled).

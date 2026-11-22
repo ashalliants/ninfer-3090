@@ -24,6 +24,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -89,6 +90,14 @@ public:
     virtual void write(std::span<const std::uint32_t> slabs, std::span<const std::byte> bytes) = 0;
     // Nothing references `slab` any longer: its bytes need not be kept.
     virtual void discard(std::uint32_t /*slab*/) noexcept {}
+    // Device -> slabs as a paced background gather (core/host_gather.h) on `stream`, with
+    // descriptors of its own (copy() may run meanwhile on other slabs); the caller waits for the
+    // stream before the next drain(), and before the slabs or device regions are reused. Only a
+    // tier whose slabs the device can write directly supports it (pinned RAM, not the NVMe tier).
+    [[nodiscard]] virtual bool can_drain() const noexcept { return false; }
+    virtual void drain(std::span<const SlabCopy> /*copies*/, GatherPace /*pace*/, cudaStream_t /*stream*/) {
+        throw std::logic_error("context cache: this tier cannot drain in the background");
+    }
 };
 
 // One SlabCopy row's Host address, or null when the slab's bytes are not in the Host memory this
@@ -116,13 +125,69 @@ public:
     void copy(std::span<const SlabCopy> copies, bool to_tier, cudaStream_t stream) override;
     void read(std::span<const std::uint32_t> slabs, std::span<std::byte> bytes) override;
     void write(std::span<const std::uint32_t> slabs, std::span<const std::byte> bytes) override;
+    [[nodiscard]] bool can_drain() const noexcept override { return true; }
+    void drain(std::span<const SlabCopy> copies, GatherPace pace, cudaStream_t stream) override;
 
 private:
+    // The gather descriptors of `copies` in `buffer` (grown when short, after `stream` is idle).
+    std::size_t stage_descriptors(std::span<const SlabCopy> copies, bool to_tier, void*& buffer, std::size_t& bytes,
+                                  cudaStream_t stream);
+
     std::uint32_t slabs_;
     std::size_t slab_bytes_;
     void* memory_ = nullptr;
     void* descriptors_ = nullptr;
     std::size_t descriptor_bytes_ = 0;
+    void* drain_descriptors_ = nullptr; // drain()'s own, allocated at its first use
+    std::size_t drain_descriptor_bytes_ = 0;
+};
+
+// --async-context-capture (FlashNextOptions::async_context_capture): a capture's copies leave the
+// lane's device regions through a VRAM staging buffer. stage() gathers every copy's device bytes
+// into the buffer on the compute stream (the next call may then overwrite the lane's state and its
+// partial page) and points the copies at the staged bytes; drain() moves them to the tier on a side
+// stream that waits for the staging, paced so the forward beside it keeps its SMs and memory
+// bandwidth. One drain at a time: wait() (the host waits for it) comes before the next stage(),
+// before any other read or write of the tier's slabs, and before teardown. The bytes that land are
+// the synchronous capture's, bit for bit; only the time they land differs.
+class CaptureDrain {
+public:
+    // Throws when the staging, the stream or the events cannot be made.
+    CaptureDrain(std::size_t staging_bytes, GatherPace pace);
+    // Waits for the drain in flight, then frees the stream, the events and the buffers.
+    ~CaptureDrain();
+    CaptureDrain(const CaptureDrain&)            = delete;
+    CaptureDrain& operator=(const CaptureDrain&) = delete;
+
+    [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
+    // The staging bytes `copies` take (each copy's rows packed, 256-byte aligned).
+    [[nodiscard]] static std::size_t staged_bytes(std::span<const SlabCopy> copies) noexcept;
+    // Stages `copies` (every copy device_pitch == width or one row) on `main` and rewrites their
+    // device side to the staged bytes. False, with nothing enqueued, when they do not fit. Requires
+    // no drain in flight.
+    bool stage(std::vector<SlabCopy>& copies, cudaStream_t main);
+    // The staged copies to `tier` on the side stream, after the staging; pending until wait().
+    void drain(CheckpointTier& tier, std::span<const SlabCopy> copies);
+    // The host waits for the drain in flight (nothing when none is). Throws on a device error.
+    void wait();
+    // wait() for noexcept paths.
+    void settle() noexcept;
+    [[nodiscard]] bool pending() const noexcept { return pending_; }
+    [[nodiscard]] std::uint64_t drains() const noexcept { return drains_; }
+
+private:
+    void release() noexcept;
+
+    std::size_t capacity_ = 0;
+    GatherPace pace_;
+    void* staging_        = nullptr; // device
+    void* descriptors_    = nullptr; // pinned, mapped: the staging gather's
+    std::size_t descriptor_bytes_ = 0;
+    cudaStream_t stream_  = nullptr;
+    cudaEvent_t staged_   = nullptr;
+    cudaEvent_t drained_  = nullptr;
+    bool pending_         = false;
+    std::uint64_t drains_ = 0;
 };
 
 // One prompt media item, for pricing a prefill: its token spans [begin, begin + count) and patches.

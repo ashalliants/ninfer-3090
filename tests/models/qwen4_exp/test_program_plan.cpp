@@ -260,6 +260,33 @@ int main() {
         with_probs.mtp_draft_probs = 28;
         check(with_probs.fixed_bytes() == 528, "fixed_bytes counts the draft probabilities");
 
+        // --async-context-capture: the staging holds a state image and kAsyncCapturePages KV pages
+        // (rounded up to a MiB, plus 4 MiB of alignment slack); nothing without the Host tier.
+        {
+            using Mode = ninfer::FlashNextOptions::AsyncContextCapture;
+            q4::ProgramOptions capture;
+            capture.context_cache_bytes = 4ULL << 30;
+            check(capture.async_context_capture == Mode::Auto, "async captures default to auto");
+            const std::uint64_t image = 116'391'936, page = 933'888; // Qwen3.8-Flash-Next's
+            const std::uint64_t mib   = 1ULL << 20;
+            const std::uint64_t want  = (image + 64 * page + mib - 1) / mib * mib + 4 * mib;
+            check(q4::kAsyncCapturePages == 64, "the staging holds 64 pages (4,096 tokens)");
+            check(q4::plan_async_capture_staging(capture, image, page) == want, "auto plans the image and 64 pages");
+            check(q4::plan_async_capture_staging(capture, image, page) <= 172 * mib,
+                  "Flash-Next's staging is at most 172 MiB");
+            capture.async_context_capture = Mode::On;
+            check(q4::plan_async_capture_staging(capture, image, page) == want, "on plans the same staging");
+            capture.async_context_capture = Mode::Off;
+            check(q4::plan_async_capture_staging(capture, image, page) == 0, "off plans nothing");
+            capture.async_context_capture = Mode::On;
+            capture.context_nvme_bytes    = 1ULL << 30;
+            check(q4::plan_async_capture_staging(capture, image, page) == 0, "the NVMe tier stays synchronous");
+            capture.context_nvme_bytes  = 0;
+            capture.context_cache_bytes = 0;
+            check(q4::plan_async_capture_staging(capture, image, page) == 0, "no context cache plans nothing");
+            check(q4::kAsyncCaptureLinkBytesPerSecond == 8e9, "auto turns on below 8 GB/s");
+        }
+
         // Refusal steering (--graft): the device table is FP32 [vectors][layers][hidden]; nothing
         // is planned without a vector, and fixed_bytes counts it.
         {

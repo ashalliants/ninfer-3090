@@ -264,7 +264,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
            "[--moe-fused-route] [--cpu-verify-misses] [--prefill-cpu-share F [--prefill-cpu-all-columns N] [--prefill-cpu-max-columns N]] [--cpu-verify-workers N] [--gdn-async-commit] [--hc-int8 [--hc-fused-read]] "
            "[--ngram-flag-wait] [--partial-ram-residency] [--ggml-decode-mma] "
-           "[--ram-headroom-mib N] [--allow-unlocked-host-memory] [--expert-cache-mib N] [--engram-dir DIR] [--context-nvme-mib N [--context-nvme-dir DIR]] "
+           "[--ram-headroom-mib N] [--allow-unlocked-host-memory] [--expert-cache-mib N] [--engram-dir DIR] [--context-nvme-mib N [--context-nvme-dir DIR]] [--async-context-capture auto|on|off] "
            "[--chat-template FILE] "
            "[--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
            "[--gdn-state-fp16] [--numeric-tripwire [--numeric-tripwire-limit F|inf]] "
@@ -382,6 +382,9 @@ std::string serve_usage_text(const char* argv0) {
            "--context-nvme-mib N, in a scratch file of up to N MiB on local disk (removed at exit; "
            "--context-nvme-dir DIR, default beside the model) with --host-context-mib as its RAM "
            "cache (0: disk only); --context-store DIR keeps it across restarts; "
+           "--async-context-capture auto|on|off drains a capture's checkpoint to RAM on a paced side "
+           "stream from a VRAM staging copy instead of waiting for it (the same bytes; about 170 MiB "
+           "of VRAM; auto, the default, is on when the PCIe link measured at startup is below 8 GB/s); "
            "DeepSeek-V4.1-Flash reads its Engram tables from --engram-dir DIR (or NINFER_DSV4_ENGRAM_DIR), the folder "
            "python3 -m tools.convert.dsv4_engram_volume writes; without one layers 1 and 14 run without their injection "
            "and the answers are of reduced quality; "
@@ -1241,6 +1244,18 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
         } else if (arg == "--context-nvme-mib") {
             options.flash_next.context_nvme_bytes =
                 parse_mib_bytes(require_value("--context-nvme-mib"), "context-nvme-mib");
+        } else if (arg == "--async-context-capture") {
+            const std::string value = require_value("--async-context-capture");
+            using Mode = FlashNextOptions::AsyncContextCapture;
+            if (value == "auto") {
+                options.flash_next.async_context_capture = Mode::Auto;
+            } else if (value == "on") {
+                options.flash_next.async_context_capture = Mode::On;
+            } else if (value == "off") {
+                options.flash_next.async_context_capture = Mode::Off;
+            } else {
+                throw std::invalid_argument("--async-context-capture takes auto, on or off");
+            }
         } else if (arg == "--context-nvme-dir") {
             options.flash_next.context_nvme_dir = require_value("--context-nvme-dir");
             if (options.flash_next.context_nvme_dir.empty()) {

@@ -381,6 +381,8 @@ int check_flash_next_options_refused() {
         {"--ggml-decode-mma", [](auto& n) { n.ggml_decode_mma = true; }},
         {"--context-nvme-mib", [](auto& n) { n.context_nvme_bytes = 1ULL << 30; }},
         {"--context-nvme-dir", [](auto& n) { n.context_nvme_dir = "scratch"; }},
+        {"--async-context-capture",
+         [](auto& n) { n.async_context_capture = ninfer::FlashNextOptions::AsyncContextCapture::On; }},
     };
     for (const Case& item : cases) {
         ninfer::EngineOptions edited;

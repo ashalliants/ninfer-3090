@@ -609,6 +609,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const auto ledger    = models::qwen4_exp::plan_host_memory(snapshot, demand);
     program_options.context_cache_bytes = cache_fit.bytes;
     program_options.context_nvme_bytes  = nvme_bytes;
+    program_options.async_context_capture = next.async_context_capture;
     program_options.context_nvme_path   = nvme_path;
     report(ledger.summary());
     report(ledger.describe());
