@@ -342,7 +342,7 @@ compact, lossy forms:
 - the block's projections with K up to 3072 (all but the MLP's down) as BF16 activations into
   `ops::projection_q8_fp32` over the artifact's Q8_0 values, and the joint (BF16) through `ops::projection_fp32`.
 
-Measured (`ninfer_inkling2_dspark_test`, 3 drafts, 128 tokens on the four golden prompts; V100):
+Measured (`ninfer_inkling2_dspark_test` at its defaults, 3 drafts and 128 tokens on the four golden prompts; `NINFER_INKLING2_SPEC_DRAFTS=all` drafts the whole block; V100):
 
 | Drafter | draft ms a round | drafts accepted a round (p0 / p1 / p2 / p3) | speculative tok/s |
 |---|---|---|---|
@@ -964,3 +964,57 @@ The MVP (phases 1-3) is about 2.5 weeks. Everything after it is optional orderin
    3), 1.4e-4 (p1, visit 1), 1.8e-4 (p2, visit 12) and 5.5e-4 (p3, visit 34): within what FP32
    accumulation and BF16 activations move a router score. Later differences also follow from earlier
    ones, through attention and the convolutions.
+
+## Context with DSpark and vision
+
+At startup the engine picks the widest prefill chunk whose programs fit beside `--max-context` with 256 MiB to spare
+(`kStartupSpare`). With `--spec dspark` it tries, for each chunk, the drafter at its best and then gives up what costs
+it least, never the output:
+
+1. the drafter's Q8 copy of the text head (492 MB); without it the base logits read the target's BF16 head
+   (`DSparkProgram`'s `head_copy`), a slower draft;
+2. with `--dspark-window auto` (the default), the whole context for the last 32768, then 16384 positions of the
+   drafter's global layer (`SpeculativeOptions::dspark_window`; its FP16 ring then holds that many positions at
+   4 KiB each instead of `--max-context`). `--dspark-window 0` keeps the whole context, `N` fixes a window
+   of at least the drafter's sliding window.
+
+The startup log's `prefill |` note says what was chosen (chunk, workspace, drafter head, drafter window).
+
+Other memory the stack frees or reserves:
+
+- The drafter's layer matrices are bound in pinned host memory: the drafter only reads them once, into its own split
+  Q8 device copies, so a device copy of the artifact's was unused.
+- The ViT workspace (an image of `max_image_tokens`) is reserved at startup inside the text workspace
+  (`ProgramLimits::min_workspace_bytes`, `VisionEncoder::workspace_bytes`); images are encoded before the prompt's
+  prefill, so the two never overlap. It used to be allocated on the first image, which could fail at an edge
+  context. Its activations share one region (patches, q/k/v, FFN and the merger reuse it in turn).
+- `--vision-residency overlay` keeps the 0.64 GB tower in pinned host memory and copies it into the workspace for
+  each image (one transfer over the tower's range). The embeddings are bit-identical to resident ones. It saves
+  device memory only when the workspace is already larger than the tower plus the ViT's activations (a chunk of 512
+  or more), and costs each image request about 0.2-0.25 s: on the V100, 0.091 against 0.283 s for a 640 x 488 image
+  (208 image tokens) and 0.035 against 0.271 s for 300 x 170 (40).
+
+Measured on the V100 (2026-11-21, `ninfer-serve` startup, FP16 rings, tensor-core prefill):
+
+| Configuration | Largest `--max-context` | Chosen at that context |
+|---|---|---|
+| neither DSpark nor vision | 307,200 | chunk 256 (262,144: chunk 1024) |
+| DSpark and vision, before this stack's drafter and vision changes | 217,088 | chunk 256 |
+| DSpark and vision, `--dspark-window 0` | 238,592 | chunk 256, the target's head |
+| DSpark and vision, `--dspark-window 32768` | 260,096 | chunk 256, the target's head |
+| DSpark and vision, `auto` (default) | 262,144 (265,216 fails) | chunk 256, the target's head, window 16384 |
+| same, `--prefill-chunk 512 --vision-residency overlay` | 262,144 | chunk 512, under the 256 MiB spare |
+
+At 262,144 with DSpark and vision, `--prefill-chunk 512` without the overlay does not start.
+
+The window changes only the drafts. Over two prompts of about 101,850 tokens (256 greedy tokens each, the output
+the same for every window), drafts accepted of drafts made:
+
+| Window | Continue the text | Summarize it |
+|---|---|---|
+| whole context | 9 / 21 | 115 / 159 (45.7 tok/s) |
+| 32768 | 28 / 75 | 12 / 27 (41.0 tok/s) |
+| 8192 | 48 / 80 | 12 / 27 (41.1 tok/s) |
+
+A task that reads far back loses most of its accepted drafts, so `auto` windows the drafter only when the whole
+context does not fit.

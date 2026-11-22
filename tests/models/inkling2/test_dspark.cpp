@@ -33,6 +33,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -72,12 +73,13 @@ int main() {
         std::printf("SKIP: set NINFER_TEST_INKLING2_ARTIFACT and NINFER_INKLING2_GOLDEN\n");
         return 77;
     }
-    const int n_tokens = std::getenv("NINFER_INKLING2_SPEC_TOKENS") ? std::atoi(std::getenv("NINFER_INKLING2_SPEC_TOKENS")) : 64;
-    // NINFER_INKLING2_SPEC_DRAFTS: drafts per round (default all block_size - 1).
+    const int n_tokens = std::getenv("NINFER_INKLING2_SPEC_TOKENS") ? std::atoi(std::getenv("NINFER_INKLING2_SPEC_TOKENS")) : 128;
+    // NINFER_INKLING2_SPEC_DRAFTS: drafts per round (default 3, as `--spec dspark` serves; `all`: block_size - 1).
     const bool adaptive    = std::getenv("NINFER_INKLING2_SPEC_ADAPTIVE") != nullptr;
     const double threshold = adaptive ? std::atof(std::getenv("NINFER_INKLING2_SPEC_ADAPTIVE")) : 0.0;
     const double ema_weight = std::getenv("NINFER_INKLING2_SPEC_EMA") ? std::atof(std::getenv("NINFER_INKLING2_SPEC_EMA")) : 0.3;
-    const int max_drafts = std::getenv("NINFER_INKLING2_SPEC_DRAFTS") ? std::atoi(std::getenv("NINFER_INKLING2_SPEC_DRAFTS")) : 1 << 30;
+    const char* drafts_env = std::getenv("NINFER_INKLING2_SPEC_DRAFTS");
+    const int max_drafts   = drafts_env == nullptr ? 3 : std::string_view(drafts_env) == "all" ? 1 << 30 : std::atoi(drafts_env);
     try {
         ninfer::artifact::Reader reader(artifact_path);
         ninfer::DeviceContext device(0);

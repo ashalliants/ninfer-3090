@@ -123,6 +123,16 @@ int main() {
             } catch (const std::invalid_argument&) {}
         }
         {
+            // --dspark-window without --spec dspark is refused, not ignored.
+            ninfer::EngineOptions windowed              = options;
+            windowed.speculative.dspark_window          = 0;
+            windowed.speculative.dspark_window_explicit = true;
+            try {
+                ninfer::Engine refused(windowed);
+                check(false, "--dspark-window without --spec dspark is refused");
+            } catch (const std::invalid_argument&) {}
+        }
+        {
             // An explicit --kv-dtype bf16 (or any kv_cache form) is refused: Inkling-2's rings are FP16 or FP32.
             ninfer::EngineOptions bf16 = options;
             bf16.kv_cache_explicit     = true;

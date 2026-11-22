@@ -16,6 +16,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -106,6 +107,9 @@ public:
     // The vision tower, when the artifact has one (null otherwise).
     [[nodiscard]] const VisionConfig* vision_config() const noexcept { return vision_config_ ? &*vision_config_ : nullptr; }
     [[nodiscard]] const VisionWeights& vision_weights() const noexcept { return vision_weights_; }
+    // Vision overlay (LoadComponents::vision_overlay): the stored objects that hold the tower's weights, in pinned host
+    // memory, for VisionEncoder to copy to the device per encode; empty when the tower is device resident.
+    [[nodiscard]] std::span<const WeightParent* const> vision_overlay() const noexcept { return vision_overlay_; }
     // A matrix's resident bytes and format (GGML_Q8_0 blocks, BF16 or FP32 words, rows of `cols` values: the
     // product of every dimension after the first), checked against its bound shape.
     struct Matrix {
@@ -122,6 +126,7 @@ private:
     DSparkWeights dspark_weights_;
     std::optional<VisionConfig> vision_config_;
     VisionWeights vision_weights_;
+    std::vector<const WeightParent*> vision_overlay_;
     Resources resources_;
 
     artifact::MaterializedArtifact backing_;
@@ -138,6 +143,7 @@ private:
 struct LoadComponents {
     bool vision = true;
     bool dspark = true;
+    bool vision_overlay = false; // the tower's weights in pinned host memory, not on the device
 };
 
 // Binds the text model's parameters and those of the components asked for, and materializes them in device memory.

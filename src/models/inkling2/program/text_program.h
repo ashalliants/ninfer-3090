@@ -53,6 +53,8 @@ struct ProgramLimits {
     // Not bit-exact (FP16 inputs on the tensor cores, FP32 accumulation): forwards of kTensorCoreMinColumns or more
     // columns run, per part, their BF16 projections through ops::projection_tc_fp32, their experts through
     // ops::moe_situ_experts_tc and their attention on relative_bias_sink_attention's wide tensor-core route.
+    // At least this much workspace (the vision tower encodes in it between forwards).
+    std::size_t min_workspace_bytes = 0;
     struct TensorCoreParts {
         bool dense = false, experts = false, attention = false;
         [[nodiscard]] bool any() const { return dense || experts || attention; }
@@ -105,6 +107,8 @@ public:
         std::int64_t position = -1; // -1: holds nothing
     };
     [[nodiscard]] std::size_t snapshot_bytes() const;
+    // The forward's workspace: sized from the limits at construction, free between forwards.
+    [[nodiscard]] DeviceArena& workspace() noexcept { return workspace_; }
     // Copies the state at position() into `snapshot` (its memory snapshot_bytes() or more).
     void save(Snapshot& snapshot) const;
     // Continues from the snapshot's position with the state it copied; the global caches below that position must

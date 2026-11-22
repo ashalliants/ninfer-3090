@@ -544,7 +544,10 @@ int main() {
         }
         if (const char* bench_ids = std::getenv("NINFER_INKLING2_DECODE_BENCH"); bench_ids != nullptr) {
             auto text_ids = read_ids(bench_ids);
-            constexpr std::int32_t kChunk = 256, kSteps = 64;
+            constexpr std::int32_t kSteps = 64;
+            // NINFER_INKLING2_TC=1: the tensor-core prefill, in chunks of NINFER_INKLING2_BENCH_CHUNK (default 256).
+            const bool tc = std::getenv("NINFER_INKLING2_TC") != nullptr;
+            const std::int32_t kChunk = std::getenv("NINFER_INKLING2_BENCH_CHUNK") ? std::atoi(std::getenv("NINFER_INKLING2_BENCH_CHUNK")) : 256;
             const std::int32_t only = std::getenv("NINFER_INKLING2_BENCH_CONTEXT") ? std::atoi(std::getenv("NINFER_INKLING2_BENCH_CONTEXT")) : 0;
             // A context past the text repeats it.
             for (const std::size_t text = text_ids.size(); text_ids.size() < static_cast<std::size_t>(only) + kSteps + 1;) {
@@ -554,8 +557,11 @@ int main() {
             ink::ProgramLimits limits{n + kChunk, kChunk};
             limits.split_attention = std::getenv("NINFER_INKLING2_SINGLE_BLOCK") == nullptr;
             limits.kv_fp16 = std::getenv("NINFER_INKLING2_KV") != nullptr && std::string(std::getenv("NINFER_INKLING2_KV")) == "fp16";
+            limits.last_logits = true;
+            if (tc) { limits.prefill_tc = ink::ProgramLimits::TensorCoreParts::all(); }
             const std::string form = std::string(limits.split_attention ? "split attention" : "single-block attention") +
-                                     (limits.kv_fp16 ? ", FP16 KV" : ", FP32 KV");
+                                     (limits.kv_fp16 ? ", FP16 KV" : ", FP32 KV") + (tc ? ", TC prefill" : "") + ", chunks of " +
+                                     std::to_string(kChunk);
             ink::TextProgram bench(*model, limits, stream);
             for (const std::int32_t context : {1024, 16384, only > 0 ? only : n - kSteps - 1}) {
                 if (context > n - kSteps - 1 || (only > 0 && context != only)) { continue; }

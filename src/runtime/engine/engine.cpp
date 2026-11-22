@@ -317,6 +317,10 @@ public:
         if (!options.split_attention && !runtime::artifact_is_inkling2(options.artifact_path)) {
             throw std::invalid_argument("--no-split-attention selects Inkling-2's attention kernel; this model has its own");
         }
+        if (options.speculative.dspark_window_explicit &&
+            (!runtime::artifact_is_inkling2(options.artifact_path) || options.speculative.backend != SpeculativeBackend::DSpark)) {
+            throw std::invalid_argument("--dspark-window applies to Inkling-2 with --spec dspark only");
+        }
         if (runtime::artifact_is_inkling2(options.artifact_path) && (options.kv_cache != KvCacheStorage::BFloat16 || options.kv_cache_explicit)) {
             throw std::invalid_argument("--kv-dtype: Inkling-2 takes fp16 (default) or fp32");
         }

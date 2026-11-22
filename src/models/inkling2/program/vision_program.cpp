@@ -9,6 +9,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace ninfer::models::inkling2 {
 namespace {
@@ -95,7 +96,47 @@ VisionEncoder::VisionEncoder(const Model& model, cudaStream_t stream)
       }()),
       stream_(stream) {}
 
-Tensor VisionEncoder::encode(const PreparedImage& image) {
+namespace {
+
+// The floats of encode()'s shared region for n patches: it holds, one phase at a time, the pixels, patches and patch
+// projection; a layer's q, k, v and attention output, then its MLP's hidden activations; the 2 x 2 merge and the
+// projector's hidden activations.
+std::size_t shared_floats(const VisionConfig& c, std::size_t n) {
+    const std::size_t d = c.hidden_size, f = c.intermediate_size, p = c.patch_size, t = n + 1, m = n / 4;
+    return std::max({4 * d * t, f * t, (6 * p * p + d) * n, 8 * d * m});
+}
+
+// encode()'s activations (FP32): the residual stream and the norm output, the shared region and the output, with
+// 256-byte alignment slack per allocation.
+std::size_t activation_bytes(const VisionConfig& c, std::size_t n) {
+    const std::size_t d = c.hidden_size, t = n + 1, m = n / 4;
+    return (2 * d * t + shared_floats(c, n) + c.projection_size * m) * 4 + 8 * 256;
+}
+
+// The host address range holding every overlay object (they share the one pinned block), copied in one transfer.
+std::pair<const std::byte*, const std::byte*> overlay_range(const Model& model) {
+    const std::byte *lo = nullptr, *hi = nullptr;
+    for (const WeightParent* parent : model.vision_overlay()) {
+        if (lo == nullptr || parent->data < lo) { lo = parent->data; }
+        if (hi == nullptr || parent->data + parent->geometry.bytes > hi) { hi = parent->data + parent->geometry.bytes; }
+    }
+    return {lo, hi};
+}
+
+std::size_t overlay_bytes(const Model& model) {
+    const auto [lo, hi] = overlay_range(model);
+    if (lo == nullptr) { return 0; } // resident vision: no overlay objects, nothing to subtract
+    return static_cast<std::size_t>(hi - lo);
+}
+
+} // namespace
+
+std::size_t VisionEncoder::workspace_bytes(const Model& model) {
+    const VisionConfig& c = *model.vision_config();
+    return activation_bytes(c, 4 * static_cast<std::size_t>(c.max_image_tokens)) + overlay_bytes(model) + 256;
+}
+
+Tensor VisionEncoder::encode(const PreparedImage& image, DeviceArena& ws) {
     const VisionConfig& c = config_;
     const std::int32_t d = static_cast<std::int32_t>(c.hidden_size), f = static_cast<std::int32_t>(c.intermediate_size);
     const std::int32_t p = static_cast<std::int32_t>(c.patch_size), hd = static_cast<std::int32_t>(c.head_dim());
@@ -105,41 +146,57 @@ Tensor VisionEncoder::encode(const PreparedImage& image) {
         throw std::invalid_argument("inkling2 vision: malformed prepared image");
     }
     if (static_cast<std::uint32_t>(m) > c.max_image_tokens) { throw std::invalid_argument("inkling2 vision: image above max_image_tokens"); }
-    const std::size_t floats = image.pixels.size() + static_cast<std::size_t>(3 * p * p) * n + static_cast<std::size_t>(d) * n +
-                               static_cast<std::size_t>(d) * t * 6 + static_cast<std::size_t>(f) * t + static_cast<std::size_t>(4 * d) * m * 2 +
-                               static_cast<std::size_t>(out_rows) * m;
-    const std::size_t need = floats * 4 + 16 * 256;
-    if (!workspace_ || workspace_->capacity() < need) {
-        workspace_.reset();
-        workspace_ = std::make_unique<DeviceArena>(need);
+    if (ws.capacity() < activation_bytes(c, static_cast<std::size_t>(n)) + overlay_bytes(model_) + 256) {
+        throw std::invalid_argument("inkling2 vision: the workspace is smaller than the image needs");
     }
-    DeviceArena& ws = *workspace_;
     ws.reset();
-    Tensor pixels = ws.alloc(DType::FP32, {image.width, image.height, 3});
+    // The overlay: the pinned host range holding the tower's weights copied in one transfer, and host addresses in
+    // it mapped to the copy.
+    const auto [lo, hi] = overlay_range(model_);
+    std::byte* copy     = nullptr;
+    if (lo != nullptr) {
+        copy = static_cast<std::byte*>(ws.alloc_bytes(static_cast<std::size_t>(hi - lo)).data);
+        if (cudaMemcpyAsync(copy, lo, static_cast<std::size_t>(hi - lo), cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
+            throw std::runtime_error("inkling2 vision: tower upload failed");
+        }
+    }
+    const auto on_device = [&](const void* data) -> void* {
+        const auto* b = static_cast<const std::byte*>(data);
+        return lo != nullptr && b >= lo && b < hi ? copy + (b - lo) : const_cast<void*>(data);
+    };
+    Tensor h = ws.alloc(DType::FP32, {d, t}), y = ws.alloc(DType::FP32, {d, t});
+    float* shared = static_cast<float*>(ws.alloc_bytes(shared_floats(c, static_cast<std::size_t>(n)) * 4).data);
+    const auto view = [&](std::size_t offset, std::initializer_list<std::int32_t> ne) { return Tensor(shared + offset, DType::FP32, ne); };
+    const std::size_t pp3 = static_cast<std::size_t>(3 * p * p) * n, dt = static_cast<std::size_t>(d) * t;
+    Tensor pixels = view(0, {image.width, image.height, 3});
     if (cudaMemcpyAsync(pixels.data, image.pixels.data(), image.pixels.size() * 4, cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
         throw std::runtime_error("inkling2 vision: pixel upload failed");
     }
     const VisionWeights& w = model_.vision_weights();
-    const auto vec         = [&](WeightId id, std::int32_t len) { return model_.tensor(id, {len}); };
-    const auto linear      = [&](const Tensor& x, WeightId id, const WeightId* bias, Tensor& out) {
+    const auto weight      = [&](WeightId id, std::initializer_list<std::int32_t> ne) {
+        Tensor t = model_.tensor(id, ne);
+        t.data   = on_device(t.data);
+        return t;
+    };
+    const auto vec    = [&](WeightId id, std::int32_t len) { return weight(id, {len}); };
+    const auto linear = [&](const Tensor& x, WeightId id, const WeightId* bias, Tensor& out) {
         const Model::Matrix mat = model_.matrix(id);
         if (mat.cols != x.ne[0] || mat.rows != out.ne[0]) { throw std::logic_error("inkling2 vision: matrix shape"); }
         const Tensor b = bias ? vec(*bias, mat.rows) : Tensor{};
-        ops::vit_linear_fp32(x, mat.data, mat.format, mat.rows, bias ? &b : nullptr, out, stream_);
+        ops::vit_linear_fp32(x, on_device(mat.data), mat.format, mat.rows, bias ? &b : nullptr, out, stream_);
     };
 
-    Tensor patches = ws.alloc(DType::FP32, {3 * p * p, n});
+    Tensor patches = view(pp3, {3 * p * p, n});
     ops::vit_patchify_fp32(pixels, p, patches, stream_);
-    Tensor proj = ws.alloc(DType::FP32, {d, n});
+    Tensor proj = view(2 * pp3, {d, n});
     linear(patches, w.patch_embedding, nullptr, proj);
-    Tensor h = ws.alloc(DType::FP32, {d, t});
     const std::int32_t grid = static_cast<std::int32_t>(c.position_grid);
-    ops::vit_embed_fp32(proj, model_.tensor(w.position_embedding, {d, grid * grid}), grid, vec(w.class_embedding, d),
+    ops::vit_embed_fp32(proj, weight(w.position_embedding, {d, grid * grid}), grid, vec(w.class_embedding, d),
                         vec(w.class_position, d), gw, gh, h, stream_);
     ops::vit_layer_norm_fp32(h, vec(w.pre_norm_weight, d), vec(w.pre_norm_bias, d), c.layer_norm_eps, h, stream_);
 
-    Tensor y = ws.alloc(DType::FP32, {d, t}), q = ws.alloc(DType::FP32, {d, t}), k = ws.alloc(DType::FP32, {d, t});
-    Tensor v = ws.alloc(DType::FP32, {d, t}), a = ws.alloc(DType::FP32, {d, t}), ffn = ws.alloc(DType::FP32, {f, t});
+    // q, k, v and a are dead once a's projection is in y, before the MLP fills ffn over them.
+    Tensor q = view(0, {d, t}), k = view(dt, {d, t}), v = view(2 * dt, {d, t}), a = view(3 * dt, {d, t}), ffn = view(0, {f, t});
     for (const VisionLayerWeights& l : w.layers) {
         ops::vit_layer_norm_fp32(h, vec(l.norm1_weight, d), vec(l.norm1_bias, d), c.layer_norm_eps, y, stream_);
         linear(y, l.q, &l.q_bias, q);
@@ -156,7 +213,7 @@ Tensor VisionEncoder::encode(const PreparedImage& image) {
         linear(ffn, l.fc2, &l.fc2_bias, y);
         ops::vit_scaled_residual_fp32(h, y, vec(l.mlp_scale, d), stream_);
     }
-    Tensor merged = ws.alloc(DType::FP32, {4 * d, m}), hidden = ws.alloc(DType::FP32, {4 * d, m});
+    Tensor merged = view(0, {4 * d, m}), hidden = view(static_cast<std::size_t>(4 * d) * m, {4 * d, m});
     ops::vit_merge_2x2_fp32(h, gw, gh, merged, stream_);
     linear(merged, w.projector_fc1, nullptr, hidden);
     ops::vit_gelu_fp32(hidden, stream_);

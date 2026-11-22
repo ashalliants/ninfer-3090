@@ -131,9 +131,10 @@ ProgramLimits checked(ProgramLimits limits) {
 
 TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t stream)
     : model_(model), config_(model.config()), limits_(limits), stream_(stream),
-      workspace_(workspace_bytes(model.config(), checked(limits).max_chunk, limits.max_context, limits.split_attention,
-                                 limits.last_logits ? std::max(1, limits.max_rollback) : limits.max_chunk, limits.prefill_tc,
-                                 widest_expert_format(model), limits.dense)) {
+      workspace_(std::max(limits.min_workspace_bytes,
+                          workspace_bytes(model.config(), checked(limits).max_chunk, limits.max_context, limits.split_attention,
+                                          limits.last_logits ? std::max(1, limits.max_rollback) : limits.max_chunk, limits.prefill_tc,
+                                          widest_expert_format(model), limits.dense))) {
     const TextConfig& c = config_;
     const std::size_t kv = std::size_t(c.kv_heads) * c.head_dim, taps = c.conv_kernel_size - 1;
     const std::size_t local_cap = c.sliding_window - 1 + static_cast<std::size_t>(limits.max_chunk);

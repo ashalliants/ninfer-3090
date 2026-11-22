@@ -41,7 +41,7 @@ const DSparkConfig& require_dspark(const Model& model) {
 } // namespace
 
 DSparkProgram::DSparkProgram(const Model& model, std::int32_t max_context, std::int32_t max_chunk, cudaStream_t stream,
-                             const ops::Q8Weight* head_q8, bool kv_fp16)
+                             const ops::Q8Weight* head_q8, bool kv_fp16, std::int32_t global_window, bool head_copy)
     : model_(model), config_(require_dspark(model)), text_(model.config()), max_context_(max_context), max_chunk_(max_chunk),
       stream_(stream),
       workspace_((std::size_t(model.config().vocab_size) * require_dspark(model).block_size * 4) +
@@ -53,12 +53,17 @@ DSparkProgram::DSparkProgram(const Model& model, std::int32_t max_context, std::
         throw std::invalid_argument("inkling2 dspark: max_chunk must be in 1..min(max_context, the draft window)");
     }
     if (c.target_visits.size() > 8 || c.head_dim != 128) { throw std::invalid_argument("inkling2 dspark: unsupported geometry"); }
+    if (global_window < 0 || (global_window > 0 && global_window < i32(c.sliding_window))) {
+        throw std::invalid_argument("inkling2 dspark: global_window must be 0 or at least the sliding window");
+    }
+    const bool windowed = global_window > 0 && global_window < max_context;
     const std::size_t kv = std::size_t(c.kv_heads) * c.head_dim, h = c.hidden_size, r = c.markov_rank, v = text_.vocab_size;
     std::size_t total = padded(h * c.block_size * 4) + padded((2 * r + 2 * h) * 4) + padded(v * 4) +
                         padded(std::size_t(c.block_size) * 4);
     std::vector<std::size_t> capacity(c.layers);
     for (std::uint32_t i = 0; i < c.layers; ++i) {
-        capacity[i] = c.local[i] ? c.sliding_window : static_cast<std::size_t>(max_context);
+        window_.push_back(c.local[i] ? i32(c.sliding_window) : windowed ? global_window : 0);
+        capacity[i] = window_[i] > 0 ? static_cast<std::size_t>(window_[i]) : static_cast<std::size_t>(max_context);
         total += 2 * padded(kv * capacity[i] * (kv_fp16 ? 2 : 4));
     }
     state_memory_ = DeviceBuffer(total);
@@ -117,6 +122,8 @@ DSparkProgram::DSparkProgram(const Model& model, std::int32_t max_context, std::
     }
     if (head_q8 != nullptr) {
         head_q8_ = *head_q8;
+    } else if (!head_copy) {
+        head_bf16_ = head_matrix;
     } else {
         const std::size_t values = padded(std::size_t(v) * h);
         head_memory_ = DeviceBuffer(values + std::size_t(v) * (h / 32) * 2);
@@ -126,16 +133,39 @@ DSparkProgram::DSparkProgram(const Model& model, std::int32_t max_context, std::
     }
     const Tensor bo = model_.tensor(w.hidden_out_bias, {i32(h), 1});
     ops::dense_projection_fp32(bo, head_matrix, nullptr, hb_, stream_);
-    // The Q8_0 matrices the block and the context read, split once.
-    std::vector<Model::Matrix> q8;
-    const auto want = [&](WeightId id) {
+    // The Q8_0 matrices the block and the context read, split once. The layers' matrices are in pinned host memory
+    // (the split reads them there); one that is not split is copied to the device as it is.
+    std::vector<Model::Matrix> q8, copied;
+    const auto want = [&](WeightId id, bool host) {
         const Model::Matrix m = model_.matrix(id);
-        if (m.format == QType::GGML_Q8_0 && m.cols % 128 == 0) { q8.push_back(m); }
+        if (m.format == QType::GGML_Q8_0 && m.cols % 128 == 0) {
+            q8.push_back(m);
+        } else if (host) {
+            copied.push_back(m);
+        }
     };
     for (const DSparkLayerWeights& l : w.layers) {
-        for (const WeightId id : {l.q, l.k, l.v, l.output, l.gate, l.up, l.down, l.context_k, l.context_v}) { want(id); }
+        for (const WeightId id : {l.q, l.k, l.v, l.output, l.gate, l.up, l.down, l.context_k, l.context_v}) { want(id, true); }
     }
-    want(w.joint);
+    want(w.joint, false);
+    const auto stored_bytes = [](const Model::Matrix& m) {
+        const std::size_t n = std::size_t(m.rows) * m.cols;
+        switch (m.format) {
+        case QType::GGML_Q8_0: return n / 32 * 34;
+        case QType::BF16: return n * 2;
+        case QType::FP32: return n * 4;
+        default: throw std::invalid_argument("inkling2 dspark: a layer matrix of an unsupported format");
+        }
+    };
+    std::size_t copy_bytes = 0;
+    for (const Model::Matrix& m : copied) { copy_bytes += padded(stored_bytes(m)); }
+    copy_memory_ = DeviceBuffer(std::max<std::size_t>(copy_bytes, 1));
+    for (std::size_t i = 0, at = 0; i < copied.size(); ++i) {
+        auto* to = static_cast<std::byte*>(copy_memory_.p) + at;
+        at += padded(stored_bytes(copied[i]));
+        cuda(cudaMemcpyAsync(to, copied[i].data, stored_bytes(copied[i]), cudaMemcpyHostToDevice, stream_), "layer matrix");
+        split_.emplace(copied[i].data, ops::DenseMatrix{to, copied[i].format, copied[i].rows, copied[i].cols});
+    }
     std::size_t split_bytes = 0;
     for (const Model::Matrix& m : q8) { split_bytes += padded(std::size_t(m.rows) * m.cols) + padded(std::size_t(m.rows) * m.cols / 16); }
     split_memory_ = DeviceBuffer(std::max<std::size_t>(split_bytes, 1));
@@ -261,7 +291,7 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t
         ops::head_rmsnorm_rope_fp32(kt, i32(c.head_dim), model_.tensor(l.k_norm, {i32(c.head_dim)}), c.rms_norm_eps, true, position_,
                                     c.rope_theta, stream_);
         Tensor attn = workspace_.alloc(DType::FP32, {q, b});
-        const ops::DSparkAttentionShape shape{i32(c.heads), i32(c.kv_heads), i32(c.head_dim), c.local[i] ? i32(c.sliding_window) : 0};
+        const ops::DSparkAttentionShape shape{i32(c.heads), i32(c.kv_heads), i32(c.head_dim), window_[i]};
         Tensor parts = workspace_.alloc(DType::FP32, {i32(ops::dspark_block_attention_workspace_bytes(shape, b) / 4)});
         ops::dspark_block_attention_fp32(qt, layers_[i].k_ring, layers_[i].v_ring, kt, vt, position_, shape, attn, parts, stream_);
         Tensor o = workspace_.alloc(DType::FP32, {h, b});
@@ -283,7 +313,11 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t
     Tensor xb = workspace_.alloc(DType::BF16, {h, n_drafts});
     ops::cast_fp32_to_bf16(x.slice(1, 1, n_drafts), xb, stream_);
     Tensor base = workspace_.alloc(DType::FP32, {vocab, n_drafts});
-    ops::projection_q8_fp32(xb, std::span<const ops::Q8Weight>(&head_q8_, 1), base, stream_);
+    if (head_q8_.values != nullptr) {
+        ops::projection_q8_fp32(xb, std::span<const ops::Q8Weight>(&head_q8_, 1), base, stream_);
+    } else {
+        ops::dense_projection_fp32(x.slice(1, 1, n_drafts), head_bf16_, nullptr, base, stream_);
+    }
 
     // The Markov chain: state from 0, prev from the anchor; each step's argmax feeds the next.
     cuda(cudaMemsetAsync(joint_in_.data, 0, static_cast<std::size_t>(r) * 4, stream_), "state");
@@ -329,7 +363,7 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t
 std::size_t DSparkProgram::snapshot_bytes() const {
     std::size_t total = joint_in_.bytes();
     for (std::size_t i = 0; i < layers_.size(); ++i) {
-        if (config_.local[i]) { total += layers_[i].k_ring.bytes() + layers_[i].v_ring.bytes(); }
+        if (window_[i] > 0) { total += layers_[i].k_ring.bytes() + layers_[i].v_ring.bytes(); }
     }
     return total;
 }
@@ -341,7 +375,7 @@ void DSparkProgram::save(Snapshot& snapshot) const {
     copies.add(out, joint_in_.data, joint_in_.bytes());
     out += joint_in_.bytes();
     for (std::size_t i = 0; i < layers_.size(); ++i) {
-        if (!config_.local[i]) { continue; }
+        if (window_[i] == 0) { continue; }
         for (const Tensor* t : {&layers_[i].k_ring, &layers_[i].v_ring}) {
             copies.add(out, t->data, t->bytes());
             out += t->bytes();
@@ -358,7 +392,7 @@ void DSparkProgram::restore(const Snapshot& snapshot) {
     copies.add(joint_in_.data, in, joint_in_.bytes());
     in += joint_in_.bytes();
     for (std::size_t i = 0; i < layers_.size(); ++i) {
-        if (!config_.local[i]) { continue; }
+        if (window_[i] == 0) { continue; }
         for (const Tensor* t : {&layers_[i].k_ring, &layers_[i].v_ring}) {
             copies.add(t->data, in, t->bytes());
             in += t->bytes();

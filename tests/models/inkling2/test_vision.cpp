@@ -139,13 +139,17 @@ int main() {
         const fs::path root(data_root);
         ninfer::artifact::Reader reader(artifact_path);
         ninfer::DeviceContext device(0);
-        auto model = ink::load_model(reader, device);
+        // NINFER_INKLING2_VISION_OVERLAY=1: the tower in pinned host memory, copied in per encode (the same bits).
+        const bool overlay = std::getenv("NINFER_INKLING2_VISION_OVERLAY") != nullptr;
+        auto model = ink::load_model(reader, device, {.vision = true, .dspark = false, .vision_overlay = overlay});
+        if (overlay && model->vision_overlay().empty()) { throw std::runtime_error("the overlay holds no tower weights"); }
         if (model->vision_config() == nullptr) { throw std::runtime_error("the artifact has no vision tower"); }
         const ink::VisionConfig& vc = *model->vision_config();
         const auto& tc              = model->config();
         cudaStream_t stream         = nullptr;
         if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) { throw std::runtime_error("stream"); }
         ink::VisionEncoder encoder(*model, stream);
+        ninfer::DeviceArena vision_ws(ink::VisionEncoder::workspace_bytes(*model));
         ninfer::DeviceBuffer argmax_out(64);
 
         std::vector<std::string> prompt_lines;
@@ -165,8 +169,15 @@ int main() {
             const auto t0  = Clock::now();
             const ink::PreparedImage image =
                 ink::prepare_image(vc, width, height, {reinterpret_cast<const std::uint8_t*>(raw.data()), raw.size()});
-            ninfer::Tensor emb = encoder.encode(image);
+            ninfer::Tensor emb = encoder.encode(image, vision_ws);
             const auto got     = download(emb, stream);
+            std::uint64_t hash = 1469598103934665603ULL;
+            for (const float x : got) {
+                std::uint32_t bits = 0;
+                std::memcpy(&bits, &x, 4);
+                hash = (hash ^ bits) * 1099511628211ULL;
+            }
+            std::printf("%s: embeddings hash %016llx%s\n", name.c_str(), static_cast<unsigned long long>(hash), overlay ? " (overlay)" : "");
             const double secs  = since(t0);
             const Embeddings ref = read_embeddings(root / (name + ".ref.emb"));
             std::printf("%s: %d x %d -> %d x %d patches, %d image tokens, encoded in %.3f s\n", name.c_str(), width, height, image.grid_w,
@@ -176,7 +187,7 @@ int main() {
             const auto [worst, mean] = token_errors(got, ref);
             std::printf("  vs FP64 reference: token relative L2 error max %.3e, mean %.3e\n", worst, mean);
             check(worst <= 3e-4, name + ": embeddings outside 3e-4 of the FP64 reference");
-            const auto again = download(encoder.encode(image), stream);
+            const auto again = download(encoder.encode(image, vision_ws), stream);
             check(again == got, name + ": a second encode differs");
             if (fs::exists(root / (name + ".llama.emb"))) {
                 const auto [lw, lm] = token_errors(got, read_embeddings(root / (name + ".llama.emb")));
