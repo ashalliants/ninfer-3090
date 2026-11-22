@@ -1,7 +1,33 @@
 # CLAUDE.md
 
 `AGENTS.md` holds the project rules and the Windows build recipe. This file adds what Claude sessions
-on this machine need to share the GPU safely.
+need to share the GPU safely, and the rule below for speed changes.
+
+## Speed changes update the published numbers
+
+Any change that makes any model faster (decode, prefill, TTFT, speculative decoding, batching,
+load time, context fit) updates the published figures for that model **in the same PR**, on every
+card it was measured on (RTX 3090 or Tesla V100). A speed PR without its doc update is not done.
+
+Update every place the old figure appears; grep for it rather than trusting this list:
+
+- `README.md`: the model's rows, headline claims and the supported-features wording;
+- `docs/performance.md`, and `docs/tesla-v100.md` for V100 figures;
+- `docs/serving.md` / `docs/cli.md` when a default or a flag's effect changed;
+- the model's maintainer doc under `docs/maintainer/` (its performance and status sections);
+- the model card `model-cards/<repo>/README.md`. Merging to master publishes it to Hugging Face
+  (`.github/workflows/publish-model-cards.yml`), so a stale card goes public;
+- charts in `docs/assets/`: regenerate them, then run `tools/sync_model_cards.py` so each card's copy
+  matches (`--check` runs in CI).
+
+How to report the numbers:
+
+- Lead with the best clean run you measured: correct output, no thermal throttle (`gpu_guard.sh`
+  says so), the fastest valid settings. State its conditions (prompt type, context, flags, power
+  limit), and give the typical range or session spread second.
+- Every figure is a real measurement on that card at the claimed scope (serve-level for tok/s
+  claims). Never extrapolate, round up, or carry a number across cards or builds.
+- Remove "not supported yet" and limitation wording that the change made false.
 
 ## GPU lock (one RTX 3090, many sessions)
 
