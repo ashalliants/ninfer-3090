@@ -104,7 +104,6 @@ int main() {
         options.max_context   = 4096;
         options.enable_vision = true;
         options.prefill_chunk_auto = true; // the widest chunk that fits, as the CLI and serve run without --prefill-chunk
-        options.max_concurrency = 4; // Inkling-2 runs one: the Engine reports what it runs
         {
             ninfer::EngineOptions unbounded   = options;
             unbounded.max_pending_requests    = 0;

@@ -46,3 +46,8 @@ ninfer_add_op_test(ninfer_inkling2_engine_dspark_sampled_test
 ninfer_add_op_test(ninfer_inkling2_adapters_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_adapters.cpp"
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_artifact ninfer_media_decode ninfer_ops ninfer_core)
+# Batched decode through the public Engine (max_concurrency 4): concurrent requests give their one-at-a-time
+# outputs; streaming, cancellation, per-slot prefix reuse, lanes; 8 slots fit a smaller context (skips without it).
+ninfer_add_op_test(ninfer_inkling2_engine_batch_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_batch.cpp"
+  LIBRARIES ninfer_engine ninfer_core)

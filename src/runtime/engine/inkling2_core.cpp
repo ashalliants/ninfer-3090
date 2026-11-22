@@ -50,6 +50,8 @@ constexpr std::int32_t kHeld = 256;
 // memory left free after the programs for what the first requests allocate (cuBLAS's handle, say).
 constexpr std::int32_t kChunks[] = {2048, 1024, 512, 256};
 constexpr std::size_t kStartupSpare = 256U << 20;
+// With several slots, a context that does not fit is lowered in steps of this many positions per slot.
+constexpr std::int32_t kFitStep = 256;
 
 // The drafter's extend of n taps' columns, in pieces of at most its max_chunk.
 void extend_drafter(ink::DSparkProgram& drafter, std::span<const Tensor> taps, std::int32_t n) {
@@ -251,6 +253,10 @@ struct Inkling2Core::Programs {
     std::vector<std::uint64_t> snapshot_keys;
     std::uint64_t snapshot_adapters = 0; // the adapters the snapshot's prompt ran with (adapter_key)
     ink::DSparkProgram::Snapshot draft_snapshot; // the drafter's, with --spec dspark
+    // max_concurrency > 1: one snapshot per slot instead (slot_snapshots[s] is slot s's, its keys beside it): a
+    // snapshot's global caches are its slot's own, so a prompt resumes only in the slot that saved it.
+    std::vector<ink::TextProgram::Snapshot> slot_snapshots;
+    std::vector<std::vector<std::uint64_t>> slot_snapshot_keys;
     // dense_q8 is a view: the caller keeps the owner until build_programs succeeds, so a failed attempt never takes it.
     Programs(const ink::Model& model, const ink::DenseWeightsQ8* dense_q8, ink::ProgramLimits limits, cudaStream_t stream)
         : text(model, with_dense(std::move(limits), dense_q8), stream) {}
@@ -290,7 +296,11 @@ void Inkling2Core::build_programs(ink::ProgramLimits limits, std::unique_ptr<ink
         }
     }
     if (vision != nullptr) { programs_->vision = std::make_unique<ink::VisionEncoder>(*model_, stream_); }
-    if (options_.context_cache.enabled) {
+    if (options_.context_cache.enabled && slots_ > 1) {
+        programs_->slot_snapshots.resize(static_cast<std::size_t>(slots_));
+        programs_->slot_snapshot_keys.resize(static_cast<std::size_t>(slots_));
+        for (auto& snap : programs_->slot_snapshots) { snap.memory = DeviceBuffer(programs_->text.snapshot_bytes()); }
+    } else if (options_.context_cache.enabled) {
         programs_->snapshot.memory = DeviceBuffer(programs_->text.snapshot_bytes());
         if (programs_->drafter) { programs_->draft_snapshot.memory = DeviceBuffer(programs_->drafter->snapshot_bytes()); }
     }
@@ -385,6 +395,12 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     if (options_.purpose != EnginePurpose::Generation) { throw std::invalid_argument("Inkling-2 serves generation only"); }
     if (options_.devices.size() > 1) { throw std::invalid_argument("Inkling-2 runs on one device"); }
     const auto start = Clock::now();
+    // max_concurrency N > 1: N slots of the text Program decoded together (Inkling2Core::worker_batched), no drafter.
+    if (options_.max_concurrency < 1 || options_.max_concurrency > static_cast<std::uint32_t>(ink::kMaxBatchColumns)) {
+        throw std::invalid_argument("Inkling-2 takes --max-concurrency 1 to " + std::to_string(ink::kMaxBatchColumns));
+    }
+    slots_             = static_cast<std::int32_t>(options_.max_concurrency);
+    requested_context_ = options_.max_context;
     StartupPhaseScope inspect(options_.startup_observer, StartupPhase::ArtifactInspect);
     const artifact::Reader reader(options_.artifact_path);
     if (options_.enable_vision && !reader.directory().components.contains("vision")) {
@@ -392,6 +408,13 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     }
     // The adapters are read (and any unsupported one refused) before the weights load; uploaded after it.
     if (options_.loras.size() > 8) { throw std::invalid_argument("Inkling-2 loads at most eight LoRA adapters"); }
+    // The adapters are one Program-wide selection, set per request; batched decode runs several requests in one
+    // forward and cannot apply one request's adapters to its column alone. Refused, not run without them: the CLI and
+    // ninfer serve reach this through EngineOptions (serve's --lora also serves the Qwen3.5 models, which batch it).
+    if (options_.max_concurrency > 1 && (!options_.loras.empty() || !options_.grafts.empty())) {
+        throw std::invalid_argument("Inkling-2 --lora and --graft need --max-concurrency 1: batched decode (--max-concurrency " +
+                                    std::to_string(options_.max_concurrency) + ") cannot apply a request's adapters to its column alone");
+    }
     // A request selects an adapter by name, so each one needs a name of its own: an empty or repeated one would be
     // uploaded yet never selectable. Checked here too, since EngineOptions reaches this without the CLI parser.
     const auto check_names = [](const auto& sources, const char* what) {
@@ -425,7 +448,7 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     // (load_model reports the weights' materialize phase itself.)
     model_ = ink::load_model(reader, device_,
                              {.vision         = options_.enable_vision,
-                              .dspark         = options_.speculative.backend == SpeculativeBackend::DSpark,
+                              .dspark         = options_.speculative.backend == SpeculativeBackend::DSpark && slots_ == 1,
                               .vision_overlay = options_.enable_vision && options_.vision_residency == VisionResidency::Overlay},
                              &options_.startup_observer);
     const ink::VisionConfig* vision = options_.enable_vision ? model_->vision_config() : nullptr;
@@ -455,7 +478,9 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         limits.split_attention = options_.split_attention;
         limits.kv_fp16         = options_.kv_rings != KvRings::FP32; // FP16 by default
         if (!prefill_is_fp32(options_.kv_rings, options_.prefill_math)) { limits.prefill_tc = ink::ProgramLimits::TensorCoreParts::all(); }
-        const bool dspark  = options_.speculative.backend == SpeculativeBackend::DSpark;
+        limits.slots = slots_;
+        // Batched decode runs every request plain: with several slots there is no drafter.
+        const bool dspark  = options_.speculative.backend == SpeculativeBackend::DSpark && slots_ == 1;
         if (dspark) {
             const ink::DSparkConfig* dc = model_->dspark_config();
             if (dc == nullptr) { throw std::invalid_argument("--spec dspark: this Inkling-2 artifact has no DSpark drafter"); }
@@ -502,6 +527,71 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                     if (w < options_.max_context) { attempts.push_back({c, copy, w}); }
                 }
             }
+        }
+        // Several slots: the widest chunk at max_context per slot, else the narrowest chunk at the largest context per
+        // slot (a multiple of kFitStep) that fits, found by halving: the request ceiling follows it.
+        const auto fits = [&](std::int32_t chunk, std::uint32_t context) {
+            chunk_            = std::min<std::int32_t>(chunk, static_cast<std::int32_t>(context));
+            limits.max_context = static_cast<std::int32_t>(context);
+            try {
+                build_programs(limits, dense, vision, false);
+                std::size_t free_bytes = 0, total_bytes = 0;
+                check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "memory info");
+                if (free_bytes < kStartupSpare) { throw std::runtime_error("inkling2: under the startup spare"); }
+                return true;
+            } catch (const std::invalid_argument&) {
+                throw;
+            } catch (const std::exception&) {
+                if (programs_ && programs_->dense) { dense = std::move(programs_->dense); }
+                programs_.reset();
+                (void)cudaGetLastError();
+                return false;
+            }
+        };
+        if (slots_ > 1) {
+            std::size_t total_bytes = 0;
+            check_cuda(cudaMemGetInfo(&free_after_weights_, &total_bytes), "memory info");
+            attempts.clear();
+            bool built = false;
+            for (const std::int32_t c : chunks) {
+                if (fits(c, options_.max_context)) {
+                    built = true;
+                    break;
+                }
+            }
+            if (!built) {
+                // fit_context_floor bounds the search from below: a context under it is refused, not started.
+                const std::uint32_t floor_steps = (options_.fit_context_floor + kFitStep - 1) / kFitStep;
+                // In kFitStep units: lo fits (0: none known), hi does not, or is past max_context. hi rounds up, so with a
+                // max_context off the step the largest multiple under it is still a candidate (only max_context itself
+                // was tried above).
+                std::uint32_t lo = 0, hi = (options_.max_context + kFitStep - 1) / kFitStep;
+                if (floor_steps > 0) {
+                    if (floor_steps >= hi || !fits(chunks.back(), floor_steps * kFitStep)) {
+                        throw std::runtime_error("inkling2: --max-concurrency " + std::to_string(slots_) + ": the context floor of " +
+                                                 std::to_string(options_.fit_context_floor) + " positions per slot does not fit on the device");
+                    }
+                    dense = std::move(programs_->dense);
+                    programs_.reset();
+                    lo = floor_steps;
+                }
+                while (hi > lo + 1) {
+                    const std::uint32_t mid = lo + (hi - lo) / 2;
+                    if (fits(chunks.back(), mid * kFitStep)) {
+                        dense = std::move(programs_->dense);
+                        programs_.reset();
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                if (lo == 0 || !fits(chunks.back(), lo * kFitStep)) {
+                    throw std::runtime_error("inkling2: --max-concurrency " + std::to_string(slots_) + ": not even " +
+                                             std::to_string(kFitStep) + " positions per slot fit on the device");
+                }
+                options_.max_context = lo * kFitStep;
+            }
+            frontend_->set_max_context(options_.max_context);
         }
         for (std::size_t attempt = 0; attempt < attempts.size(); ++attempt) {
             const bool last = attempt + 1 == attempts.size();
@@ -551,6 +641,15 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     for (const auto& graft : grafts) {
         load_.notes.push_back("graft " + graft.name + " | per-visit ablation of the post-attention and post-MLP writes over " +
                               std::to_string(graft.visits) + " visits | opt-in (\"graft\": \"" + graft.name + "\")");
+    }
+    if (slots_ > 1) {
+        load_.notes.push_back("batched decode | " + std::to_string(slots_) + " slots of " + std::to_string(options_.max_context) +
+                              " positions each" +
+                              (options_.max_context < requested_context_
+                                   ? " (fitted to the device; asked " + std::to_string(requested_context_) + ")"
+                                   : std::string()) +
+                              (options_.speculative.backend == SpeculativeBackend::DSpark ? " | DSpark off: every request decodes plain"
+                                                                                           : std::string()));
     }
     load_.takes_video         = false;
     load_.load_seconds        = seconds_between(start, Clock::now());
@@ -651,8 +750,8 @@ Inkling2Core::Submission Inkling2Core::submit(ink::PreparedPrompt prompt, Prompt
     {
         std::lock_guard lock(mutex_);
         if (failed_) { throw RequestError(RequestErrorKind::Unavailable, "the Inkling-2 Engine has failed"); }
-        // One running request and max_pending_requests waiting, as the Engine core admits with one lane.
-        if (queue_.size() + (running_ ? 1U : 0U) >= std::size_t{options_.max_pending_requests} + 1U) {
+        // max_concurrency running requests and max_pending_requests waiting, as the Engine core admits.
+        if (queue_.size() + running_ >= std::size_t{options_.max_pending_requests} + static_cast<std::size_t>(slots_)) {
             throw RequestError(RequestErrorKind::Overloaded, "the Inkling-2 queue is full");
         }
         queue_.push_back(job);
@@ -674,6 +773,10 @@ void Inkling2Core::fail_queued_locked(const char* why) {
 }
 
 void Inkling2Core::worker() {
+    if (slots_ > 1) {
+        worker_batched();
+        return;
+    }
     for (;;) {
         std::shared_ptr<Job> job;
         {
@@ -687,63 +790,70 @@ void Inkling2Core::worker() {
             }
             job = std::move(queue_.front());
             queue_.pop_front();
-            running_ = true;
+            running_ = 1;
         }
-        std::optional<EngineFaultEvent> fault;
+        std::exception_ptr error;
         try {
             run(*job);
-            consecutive_failures_ = 0;
-        } catch (...) {
-            job->error = std::current_exception();
-            // A worker failure is anything but a refusal of the request (RequestError and the other invalid_argument),
-            // and a numerical failure, which is the device's.
-            std::string message = "unknown failure";
-            bool is_fault       = true;
-            try {
-                throw;
-            } catch (const RequestError& e) {
-                message  = e.what();
-                is_fault = e.kind() == RequestErrorKind::NumericalFailure;
-            } catch (const std::invalid_argument& e) {
-                message  = e.what();
-                is_fault = false;
-            } catch (const std::exception& e) { message = e.what(); } catch (...) {}
-            if (is_fault) {
-                fault.emplace();
-                fault->message                      = std::move(message);
-                fault->unit                         = job->unit;
-                fault->request_ids                  = {job->id};
-                fault->lanes                        = {0};
-                fault->consecutive_failures         = ++consecutive_failures_;
-                fault->maximum_consecutive_failures = 0; // no count latches: only a CUDA failure does
-            }
-            // A CUDA failure leaves the device state unknown: no later request runs, queued ones fail now.
-            if (cudaGetLastError() != cudaSuccess || cudaStreamQuery(stream_) == cudaErrorIllegalAddress) {
-                std::lock_guard lock(mutex_);
-                failed_ = true;
-                if (fault) {
-                    for (const auto& waiting : queue_) { fault->queued_request_ids.push_back(waiting->id); }
-                    fault->latched      = true;
-                    fault->latch_reason = "a CUDA failure leaves the device state unknown";
-                }
-                fail_queued_locked("the Inkling-2 Engine has failed");
-            }
+        } catch (...) { error = std::current_exception(); }
+        end_job(*job, error, 0);
+    }
+}
+
+void Inkling2Core::end_job(Job& job, std::exception_ptr error, std::uint32_t lane) {
+    std::optional<EngineFaultEvent> fault;
+    if (!error) {
+        consecutive_failures_ = 0;
+    } else {
+        job.error = error;
+        // A worker failure is anything but a refusal of the request (RequestError and the other invalid_argument),
+        // and a numerical failure, which is the device's.
+        std::string message = "unknown failure";
+        bool is_fault       = true;
+        try {
+            std::rethrow_exception(error);
+        } catch (const RequestError& e) {
+            message  = e.what();
+            is_fault = e.kind() == RequestErrorKind::NumericalFailure;
+        } catch (const std::invalid_argument& e) {
+            message  = e.what();
+            is_fault = false;
+        } catch (const std::exception& e) { message = e.what(); } catch (...) {}
+        if (is_fault) {
+            fault.emplace();
+            fault->message                      = std::move(message);
+            fault->unit                         = job.unit;
+            fault->request_ids                  = {job.id};
+            fault->lanes                        = {lane};
+            fault->consecutive_failures         = ++consecutive_failures_;
+            fault->maximum_consecutive_failures = 0; // no count latches: only a CUDA failure does
         }
-        {
-            std::lock_guard lock(job->mutex);
-            job->done = true;
-        }
-        job->changed.notify_all();
-        // After every affected request is final.
-        if (fault && options_.fault_listener) {
-            try {
-                options_.fault_listener(*fault);
-            } catch (...) {}
-        }
-        {
+        // A CUDA failure leaves the device state unknown: no later request runs, queued ones fail now.
+        if (cudaGetLastError() != cudaSuccess || cudaStreamQuery(stream_) == cudaErrorIllegalAddress) {
             std::lock_guard lock(mutex_);
-            running_ = false;
+            failed_ = true;
+            if (fault) {
+                for (const auto& waiting : queue_) { fault->queued_request_ids.push_back(waiting->id); }
+                fault->latched      = true;
+                fault->latch_reason = "a CUDA failure leaves the device state unknown";
+            }
+            fail_queued_locked("the Inkling-2 Engine has failed");
         }
+    }
+    {
+        std::lock_guard lock(job.mutex);
+        job.done = true;
+    }
+    job.changed.notify_all();
+    // After every affected request is final.
+    if (fault && options_.fault_listener) {
+        try {
+            options_.fault_listener(*fault);
+        } catch (...) {}
+    }
+    {
+        std::lock_guard lock(mutex_);
+        --running_;
     }
 }
 
@@ -761,8 +871,8 @@ void Inkling2Core::run(Job& job) {
         Inkling2Core& core;
         ~IdleLane() {
             std::lock_guard lock(core.stats_mutex_);
-            core.lane_             = {};
-            core.lane_first_token_ = {};
+            core.lanes_[0]             = {};
+            core.lane_first_token_[0] = {};
         }
     } idle_lane{*this};
     if (job.deadline != Clock::time_point{} && began > job.deadline) {
@@ -822,7 +932,7 @@ void Inkling2Core::run(Job& job) {
         totals_.prompt_tokens += static_cast<std::uint64_t>(n);
         totals_.reused_prompt_tokens += static_cast<std::uint64_t>(resume);
         if (resume > 0) { ++totals_.root_selections; }
-        lane_ = {.state                = RuntimeLaneStats::State::Prefill,
+        lanes_[0] = {.state                = RuntimeLaneStats::State::Prefill,
                  .request_id           = job.id,
                  .prompt_tokens        = n,
                  .reused_prompt_tokens = resume,
@@ -909,8 +1019,8 @@ void Inkling2Core::run(Job& job) {
         {
             std::lock_guard lock(stats_mutex_);
             totals_.computed_prefill_tokens += static_cast<std::uint64_t>(len);
-            lane_.computed_prompt_tokens = s + len - resume;
-            lane_.context_tokens         = s + len;
+            lanes_[0].computed_prompt_tokens = s + len - resume;
+            lanes_[0].context_tokens         = s + len;
         }
         if (job.observation.prompt_progress && streaming) {
             check_cuda(cudaStreamSynchronize(stream_), "prefill");
@@ -1003,8 +1113,8 @@ void Inkling2Core::run(Job& job) {
         ++totals_.speculative_rounds;
         totals_.speculative_draft_tokens += static_cast<std::uint64_t>(round_drafts);
         totals_.speculative_accepted_tokens += static_cast<std::uint64_t>(col);
-        lane_.drafted_tokens += static_cast<std::uint64_t>(round_drafts);
-        lane_.accepted_tokens += static_cast<std::uint64_t>(col);
+        lanes_[0].drafted_tokens += static_cast<std::uint64_t>(round_drafts);
+        lanes_[0].accepted_tokens += static_cast<std::uint64_t>(col);
     };
     const auto close_round = [&] {
         const std::int32_t kept = col + 1; // the anchor and the drafts consumed
@@ -1161,8 +1271,8 @@ void Inkling2Core::run(Job& job) {
             {
                 std::lock_guard lock(stats_mutex_);
                 totals_.prefill_seconds_total += seconds_between(prefill_start, first_token);
-                lane_.state       = RuntimeLaneStats::State::Decoding;
-                lane_first_token_ = first_token;
+                lanes_[0].state       = RuntimeLaneStats::State::Decoding;
+                lane_first_token_[0] = first_token;
             }
             out.timings.prefill_seconds     = seconds_between(prefill_start, first_token);
             out.timings.first_token_seconds = seconds_between(job.submitted, first_token) + job.prepare_seconds;
@@ -1178,15 +1288,15 @@ void Inkling2Core::run(Job& job) {
             const auto now = Clock::now();
             std::lock_guard lock(stats_mutex_);
             ++totals_.generated_tokens;
-            ++lane_.generated_tokens;
-            ++lane_.context_tokens;
+            ++lanes_[0].generated_tokens;
+            ++lanes_[0].context_tokens;
             if (out.generated_token_ids.size() > 1) {
                 ++totals_.committed_decode_tokens;
                 totals_.decode_seconds_total += seconds_between(decode_mark, now);
                 decode_mark = now;
                 const double since_first = seconds_between(first_token, now);
-                lane_.decode_tokens_per_second =
-                    since_first > 0.0 ? static_cast<double>(lane_.generated_tokens - 1) / since_first : 0.0;
+                lanes_[0].decode_tokens_per_second =
+                    since_first > 0.0 ? static_cast<double>(lanes_[0].generated_tokens - 1) / since_first : 0.0;
             }
         }
         if (is_stop) {
@@ -1261,6 +1371,516 @@ void Inkling2Core::run(Job& job) {
     out.timings.total_seconds   = seconds_between(job.submitted, end) + job.prepare_seconds;
 }
 
+// ---- Batched decode (max_concurrency > 1) ----
+//
+// The worker keeps up to slots_ requests, each in its own slot of the text Program. Every iteration it prefills one
+// chunk of one request that is still prefilling (round robin; prompts prefill alone, as run() does), then decodes
+// every request that has a token to forward as one column of TextProgram::forward_batch, whose columns have the bits
+// of a one-token forward in their slot. Each request's tokens are chosen and committed (stops, the thinking budget,
+// limits) as run() does them; there is no drafter. Prefix reuse keeps one snapshot per slot: a prompt resumes only
+// from the snapshot of the slot it is given, whose global caches below it are that slot's own.
+
+struct Inkling2Core::Active {
+    std::shared_ptr<Job> job;
+    std::int32_t slot = 0;
+    Clock::time_point began, vision_start, prefill_start;
+    std::vector<std::uint64_t> keys;      // prompt_keys
+    std::vector<DeviceBuffer> encoded;    // the images' embeddings
+    std::int32_t n = 0, resume = 0, keep_at = 0, at = 0; // prompt length, reused positions, the snapshot's, the next
+    bool decoding = false;                // the prompt is prefilled and `next` is the token to forward
+    std::unique_ptr<ink::OutputDecoder> decoder;
+    std::vector<TokenId> stop_ids;
+    std::mt19937_64 rng;
+    std::unordered_map<TokenId, std::uint32_t> counts;
+    std::deque<TokenId> forced; // a thinking budget's close
+    std::vector<float> host;    // a sampled request's logits column
+    Clock::time_point first_token{}, decode_mark{};
+    std::uint32_t thinking_tokens = 0;
+    bool argmax_on_device = false;
+    TokenId next = 0;
+};
+
+bool Inkling2Core::start(Active& a) {
+    Job& job              = *a.job;
+    a.began               = Clock::now();
+    GenerationResult& out = job.result;
+    out.engine_request_id = job.id;
+    out.prompt            = job.summary;
+    out.timings.prepare_seconds          = job.prepare_seconds;
+    out.thinking.requested_budget        = job.options.execution.thinking.budget;
+    out.thinking.effective_budget        = job.options.execution.thinking.effective_budget;
+    out.engine_timing.queue_wait_seconds = seconds_between(job.submitted, a.began);
+    if (job.deadline != Clock::time_point{} && a.began > job.deadline) {
+        {
+            std::lock_guard lock(stats_mutex_);
+            ++totals_.waiting_expired_requests;
+            totals_.waiting_abandoned_seconds += out.engine_timing.queue_wait_seconds;
+        }
+        throw RequestError(RequestErrorKind::QueueTimeout, "the request waited past its deadline");
+    }
+    const bool streaming = job.mode == OutputConsumerMode::Streaming;
+    const auto& prompt   = job.prompt;
+    a.n                  = static_cast<std::int32_t>(prompt.tokens.size());
+    a.keys               = prompt_keys(prompt);
+    auto* snapshot = programs_->slot_snapshots.empty() ? nullptr : &programs_->slot_snapshots[static_cast<std::size_t>(a.slot)];
+    if (snapshot != nullptr && job.options.execution.allow_prefix_reuse && snapshot->position > 0 && snapshot->position < a.n) {
+        const auto length = static_cast<std::size_t>(snapshot->position);
+        const auto& kept  = programs_->slot_snapshot_keys[static_cast<std::size_t>(a.slot)];
+        if (kept.size() == length && std::equal(a.keys.begin(), a.keys.begin() + static_cast<std::ptrdiff_t>(length), kept.begin())) {
+            a.resume = static_cast<std::int32_t>(snapshot->position);
+        }
+    }
+    out.reused_prompt_tokens = static_cast<std::uint32_t>(a.resume);
+    if (streaming) { job.post(GenerationStart{.prompt = job.summary, .reused_prompt_tokens = static_cast<std::uint32_t>(a.resume)}); }
+    if (job.cancelled) {
+        std::lock_guard lock(stats_mutex_);
+        ++totals_.waiting_cancelled_requests;
+        totals_.waiting_abandoned_seconds += out.engine_timing.queue_wait_seconds;
+        out.finish_reason = FinishReason::Cancelled;
+        return false;
+    }
+    {
+        std::lock_guard lock(stats_mutex_);
+        totals_.prompt_tokens += static_cast<std::uint64_t>(a.n);
+        totals_.reused_prompt_tokens += static_cast<std::uint64_t>(a.resume);
+        if (a.resume > 0) { ++totals_.root_selections; }
+        lanes_[static_cast<std::size_t>(a.slot)] = {.state                = RuntimeLaneStats::State::Prefill,
+                                                    .request_id           = job.id,
+                                                    .prompt_tokens        = a.n,
+                                                    .reused_prompt_tokens = a.resume,
+                                                    .context_tokens       = a.resume};
+    }
+    job.unit       = "prefill";
+    a.vision_start = Clock::now();
+    for (const ink::PromptImage& image : prompt.images) {
+        if (image.column + image.image.tokens() <= a.resume) {
+            a.encoded.emplace_back();
+            continue;
+        }
+        const Tensor emb = programs_->vision->encode(image.image, programs_->text.workspace());
+        a.encoded.emplace_back(emb.bytes());
+        check_cuda(cudaMemcpyAsync(a.encoded.back().p, emb.data, emb.bytes(), cudaMemcpyDeviceToDevice, stream_), "image copy");
+    }
+    if (std::any_of(a.encoded.begin(), a.encoded.end(), [](const DeviceBuffer& b) { return b.p != nullptr; })) {
+        check_cuda(cudaStreamSynchronize(stream_), "vision");
+        out.timings.vision_seconds = seconds_between(a.vision_start, Clock::now());
+    }
+    auto& program = programs_->text;
+    program.select(a.slot);
+    program.set_taps(false);
+    if (a.resume > 0) {
+        program.restore(*snapshot);
+    } else {
+        program.reset();
+        if (snapshot != nullptr) { snapshot->position = -1; } // its global caches are about to be overwritten
+    }
+    // The same chunk-multiple cuts as the single-request path (inkling2_prefill_plan.h): resumed forwards are the cold ones.
+    a.keep_at       = snapshot != nullptr ? prefill_snapshot_at(a.n, chunk_) : 0;
+    a.at            = a.resume;
+    a.prefill_start = Clock::now();
+    return true;
+}
+
+bool Inkling2Core::prefill_step(Active& a) {
+    Job& job              = *a.job;
+    GenerationResult& out = job.result;
+    if (job.cancelled) {
+        std::lock_guard lock(stats_mutex_);
+        ++totals_.cancelled_prefills;
+        totals_.cancelled_prefill_computed_tokens += static_cast<std::uint64_t>(a.at - a.resume);
+        totals_.prefill_seconds_total += seconds_between(a.prefill_start, Clock::now());
+        out.finish_reason = FinishReason::Cancelled;
+        return false;
+    }
+    const auto& prompt = job.prompt;
+    auto& program      = programs_->text;
+    program.select(a.slot);
+    const std::int32_t s = a.at, len = prefill_call_width(s, a.n, chunk_);
+    const auto hidden    = static_cast<std::int32_t>(model_->config().hidden_size);
+    std::vector<ink::InputEmbeddings> inputs;
+    for (std::size_t i = 0; i < prompt.images.size(); ++i) {
+        const std::int32_t first = prompt.images[i].column, count = prompt.images[i].image.tokens();
+        const std::int32_t lo = std::max(s, first), hi = std::min(s + len, first + count);
+        if (lo >= hi) { continue; }
+        const Tensor all(a.encoded[i].p, DType::FP32, {hidden, count});
+        inputs.push_back({lo - s, all.slice(1, lo - first, hi - lo)});
+    }
+    const Tensor logits = program.forward(std::span(prompt.tokens).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(len)), inputs);
+    if (s + len == a.keep_at && a.keep_at > a.resume) {
+        program.save(programs_->slot_snapshots[static_cast<std::size_t>(a.slot)]);
+        programs_->slot_snapshot_keys[static_cast<std::size_t>(a.slot)].assign(a.keys.begin(), a.keys.begin() + a.keep_at);
+    }
+    a.at = s + len;
+    {
+        std::lock_guard lock(stats_mutex_);
+        totals_.computed_prefill_tokens += static_cast<std::uint64_t>(len);
+        lanes_[static_cast<std::size_t>(a.slot)].computed_prompt_tokens = a.at - a.resume;
+        lanes_[static_cast<std::size_t>(a.slot)].context_tokens         = a.at;
+    }
+    const bool streaming = job.mode == OutputConsumerMode::Streaming;
+    if (job.observation.prompt_progress && streaming) {
+        check_cuda(cudaStreamSynchronize(stream_), "prefill");
+        job.post(PromptProgress{.total_prompt_tokens     = static_cast<std::uint32_t>(a.n),
+                                .reused_prompt_tokens    = static_cast<std::uint32_t>(a.resume),
+                                .processed_prompt_tokens = static_cast<std::uint32_t>(a.at),
+                                .elapsed_ns = static_cast<std::uint64_t>(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - a.prefill_start).count())});
+    }
+    if (a.at < a.n) { return true; }
+
+    // The prompt is in: the decode state, then the first token from the last column.
+    out.computed_prefill_tokens = static_cast<std::uint32_t>(a.n - a.resume);
+    job.unit          = "decode";
+    const auto& exec  = job.options.execution;
+    const auto& stop  = job.options.stop;
+    a.stop_ids        = stop.token_ids;
+    if (stop.include_model_defaults) { a.stop_ids.push_back(ink::token::kEndSampling); }
+    a.decoder = std::make_unique<ink::OutputDecoder>(*frontend_, stop.strings, job.options.tool_choice.mode != ToolChoiceMode::None, prompt.tools);
+    a.rng.seed(exec.sampling.seed);
+    a.argmax_on_device = exec.sampling.temperature <= 0.0F && exec.sampling.presence_penalty == 0.0F && exec.sampling.frequency_penalty == 0.0F;
+    out.finish_reason  = FinishReason::OutputLimit;
+    TokenId next = 0;
+    const Tensor last = logits.slice(1, logits.ne[1] - 1, 1);
+    const auto vocab  = static_cast<std::int32_t>(model_->config().unpadded_vocab_size);
+    if (a.argmax_on_device) {
+        Tensor ids(programs_->argmax.p, DType::I32, {1});
+        ops::argmax_fp32(last, vocab, ids, stream_, ops::kSamplerNonFiniteToken);
+        check_cuda(cudaMemcpyAsync(&next, ids.data, 4, cudaMemcpyDeviceToHost, stream_), "argmax");
+        check_cuda(cudaStreamSynchronize(stream_), "argmax");
+        if (next == ops::kSamplerNonFiniteToken) { throw RequestError(RequestErrorKind::NumericalFailure, "inkling2: the logits are not finite"); }
+    } else {
+        a.host.resize(static_cast<std::size_t>(vocab));
+        check_cuda(cudaMemcpyAsync(a.host.data(), last.data, a.host.size() * 4, cudaMemcpyDeviceToHost, stream_), "logits");
+        check_cuda(cudaStreamSynchronize(stream_), "logits");
+        next = sample(a.host, exec.sampling, a.counts, a.rng);
+    }
+    // A cancellation during the last forward or its logits ends the request before its first token commits.
+    if (job.cancelled) {
+        std::lock_guard lock(stats_mutex_);
+        ++totals_.cancelled_prefills;
+        totals_.cancelled_prefill_computed_tokens += static_cast<std::uint64_t>(a.at - a.resume);
+        totals_.prefill_seconds_total += seconds_between(a.prefill_start, Clock::now());
+        out.finish_reason = FinishReason::Cancelled;
+        return false;
+    }
+    if (!commit(a, next, false)) { return false; }
+    a.decoding = true;
+    return true;
+}
+
+bool Inkling2Core::commit(Active& a, TokenId next, bool injected) {
+    Job& job              = *a.job;
+    GenerationResult& out = job.result;
+    const auto& exec      = job.options.execution;
+    const bool streaming  = job.mode == OutputConsumerMode::Streaming;
+    auto& lane            = lanes_[static_cast<std::size_t>(a.slot)];
+    if (a.first_token == Clock::time_point{}) {
+        a.first_token = Clock::now();
+        a.decode_mark = a.first_token;
+        {
+            std::lock_guard lock(stats_mutex_);
+            totals_.prefill_seconds_total += seconds_between(a.prefill_start, a.first_token);
+            lane.state                                          = RuntimeLaneStats::State::Decoding;
+            lane_first_token_[static_cast<std::size_t>(a.slot)] = a.first_token;
+        }
+        out.timings.prefill_seconds     = seconds_between(a.prefill_start, a.first_token);
+        out.timings.first_token_seconds = seconds_between(job.submitted, a.first_token) + job.prepare_seconds;
+        job.post(GenerationFirstTokenObservation{.prepare_seconds              = job.prepare_seconds,
+                                                 .elapsed_since_submit_seconds = seconds_between(job.submitted, a.first_token),
+                                                 .queue_wait_seconds           = out.engine_timing.queue_wait_seconds});
+    }
+    const bool is_stop = !injected && std::find(a.stop_ids.begin(), a.stop_ids.end(), next) != a.stop_ids.end();
+    out.generated_token_ids.push_back(next);
+    ++a.counts[next];
+    {
+        const auto now = Clock::now();
+        std::lock_guard lock(stats_mutex_);
+        ++totals_.generated_tokens;
+        ++lane.generated_tokens;
+        ++lane.context_tokens;
+        if (out.generated_token_ids.size() > 1) {
+            ++totals_.committed_decode_tokens;
+            totals_.decode_seconds_total += seconds_between(a.decode_mark, now);
+            a.decode_mark = now;
+            const double since_first = seconds_between(a.first_token, now);
+            lane.decode_tokens_per_second = since_first > 0.0 ? static_cast<double>(lane.generated_tokens - 1) / since_first : 0.0;
+        }
+    }
+    if (is_stop) {
+        out.finish_reason = FinishReason::StopToken;
+        return false;
+    }
+    const bool reasoning_before    = a.decoder->in_reasoning();
+    const std::size_t calls_before = a.decoder->tool_calls().size();
+    auto step                      = a.decoder->push(next);
+    if (streaming) {
+        for (OutputDelta& d : step.deltas) { job.post(std::move(d)); }
+    }
+    if (!job.options.tool_choice.parallel && a.decoder->tool_calls().size() > calls_before) {
+        out.finish_reason = FinishReason::StopToken;
+        return false;
+    }
+    if (reasoning_before && !injected) { ++a.thinking_tokens; }
+    if (step.stop) {
+        out.finish_reason       = FinishReason::StopString;
+        out.matched_stop_string = a.decoder->matched_stop();
+        return false;
+    }
+    const std::int64_t committed = programs_->text.position_of(a.slot); // every chosen token but `next` is forwarded
+    const bool no_room = out.generated_token_ids.size() + kCloseTokens + 1 >= exec.requested_output_tokens;
+    if (exec.thinking.effective_budget && a.decoder->in_reasoning() && a.forced.empty() && !out.thinking.applied &&
+        (a.thinking_tokens >= *exec.thinking.effective_budget || no_room) &&
+        committed + 1 + kCloseTokens <= static_cast<std::int64_t>(options_.max_context)) {
+        a.forced             = {ink::token::kEndMessage, ink::token::kMessageModel, ink::token::kContentText};
+        out.thinking.applied = true;
+        out.thinking.injected_tokens += kCloseTokens;
+    }
+    if (job.observation.live_timings && streaming) {
+        const auto now = Clock::now();
+        job.post(GenerationTimingObservation{
+            .generated_tokens  = static_cast<std::uint32_t>(out.generated_token_ids.size()),
+            .prompt_elapsed_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(a.first_token - a.prefill_start).count()),
+            .generation_elapsed_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - a.first_token).count())});
+    }
+    if (out.generated_token_ids.size() >= exec.requested_output_tokens) { return false; }
+    if (committed + 1 > static_cast<std::int64_t>(options_.max_context)) {
+        out.finish_reason = FinishReason::ContextCapacity;
+        return false;
+    }
+    a.next = next;
+    return true;
+}
+
+void Inkling2Core::finish(Active& a) {
+    Job& job              = *a.job;
+    GenerationResult& out = job.result;
+    if (a.decoder) {
+        auto deltas = a.decoder->finish();
+        if (job.mode == OutputConsumerMode::Streaming) {
+            for (OutputDelta& d : deltas) { job.post(std::move(d)); }
+        }
+        if (a.decoder->matched_stop() && out.finish_reason != FinishReason::StopString) {
+            out.finish_reason       = FinishReason::StopString;
+            out.matched_stop_string = a.decoder->matched_stop();
+        }
+        out.content                        = a.decoder->content();
+        out.reasoning                      = a.decoder->reasoning();
+        out.tool_calls                     = a.decoder->tool_calls();
+        out.tool_call_parse                = a.decoder->tool_call_parse();
+        out.reasoning_tokens               = a.decoder->reasoning_tokens();
+        out.thinking.model_thinking_tokens = a.thinking_tokens;
+    }
+    const auto end                      = Clock::now();
+    out.timings.decode_seconds          = a.first_token == Clock::time_point{} ? 0.0 : seconds_between(a.first_token, end);
+    out.timings.prompt_wall_seconds     = a.first_token == Clock::time_point{} ? 0.0 : seconds_between(a.vision_start, a.first_token);
+    out.timings.generation_wall_seconds = out.timings.decode_seconds;
+    out.timings.total_seconds           = seconds_between(job.submitted, end) + job.prepare_seconds;
+}
+
+void Inkling2Core::worker_batched() {
+    std::vector<std::unique_ptr<Active>> active; // in admission order
+    std::vector<bool> used(static_cast<std::size_t>(slots_), false);
+    std::vector<std::uint64_t> freed_at(static_cast<std::size_t>(slots_), 0); // when each slot was last released
+    std::uint64_t releases = 0;
+    std::size_t prefill_turn = 0;
+    const auto vocab = static_cast<std::int32_t>(model_->config().unpadded_vocab_size);
+    // Ends a request (its result complete, or failed) and frees its slot; whether it ended failed.
+    const auto release = [&](std::size_t i, std::exception_ptr error) {
+        std::unique_ptr<Active> a = std::move(active[i]);
+        active.erase(active.begin() + static_cast<std::ptrdiff_t>(i));
+        if (!error) {
+            try {
+                finish(*a);
+            } catch (...) { error = std::current_exception(); }
+        }
+        {
+            std::lock_guard lock(stats_mutex_);
+            lanes_[static_cast<std::size_t>(a->slot)]             = {};
+            lane_first_token_[static_cast<std::size_t>(a->slot)] = {};
+        }
+        used[static_cast<std::size_t>(a->slot)]     = false;
+        freed_at[static_cast<std::size_t>(a->slot)] = ++releases;
+        const bool failed = error != nullptr;
+        end_job(*a->job, std::move(error), static_cast<std::uint32_t>(a->slot));
+        return failed;
+    };
+    // release, then: a failure end_job latched (a CUDA fault leaves the device state unknown, failed_) stops the round
+    // before any further device work. Latched reaches the catch below, which fails every request this worker holds.
+    struct Latched {};
+    const auto end = [&](std::size_t i, std::exception_ptr error) {
+        if (release(i, std::move(error))) {
+            std::lock_guard lock(mutex_);
+            if (failed_) { throw Latched{}; }
+        }
+    };
+    // The free slot for a prompt: the one whose snapshot it resumes from (the longest), else an empty one, else the
+    // one released longest ago (its snapshot is the oldest).
+    const auto choose_slot = [&](const Job& job) {
+        std::int32_t best = -1;
+        std::int64_t best_length = 0;
+        const bool reuse = !programs_->slot_snapshots.empty() && job.options.execution.allow_prefix_reuse;
+        const auto keys = reuse ? prompt_keys(job.prompt) : std::vector<std::uint64_t>{};
+        for (std::int32_t s = 0; reuse && s < slots_; ++s) {
+            const auto& snap = programs_->slot_snapshots[static_cast<std::size_t>(s)];
+            const auto& kept = programs_->slot_snapshot_keys[static_cast<std::size_t>(s)];
+            if (used[static_cast<std::size_t>(s)] || snap.position <= 0 || snap.position >= static_cast<std::int64_t>(keys.size()) ||
+                kept.size() != static_cast<std::size_t>(snap.position) || snap.position <= best_length) {
+                continue;
+            }
+            if (std::equal(kept.begin(), kept.end(), keys.begin())) { best = s, best_length = snap.position; }
+        }
+        if (best >= 0) { return best; }
+        for (std::int32_t s = 0; s < slots_; ++s) {
+            const bool empty = programs_->slot_snapshots.empty() || programs_->slot_snapshots[static_cast<std::size_t>(s)].position <= 0;
+            if (!used[static_cast<std::size_t>(s)] && empty) { return s; }
+        }
+        for (std::int32_t s = 0; s < slots_; ++s) {
+            if (!used[static_cast<std::size_t>(s)] && (best < 0 || freed_at[static_cast<std::size_t>(s)] < freed_at[static_cast<std::size_t>(best)])) { best = s; }
+        }
+        return best;
+    };
+    active.reserve(static_cast<std::size_t>(slots_)); // an admission's push_back never allocates (see the catch below)
+    for (;;) {
+        std::vector<std::shared_ptr<Job>> taken;
+        // Each request has its own boundary below; this one catches a host failure outside them (an allocation in the
+        // scheduling, say). It fails every request this worker holds through end_job, so no handle is left unfinished,
+        // and the worker goes on with what comes next.
+        try {
+            bool stopping = false, failed = false;
+            {
+                std::unique_lock lock(mutex_);
+                wake_.wait(lock, [&] { return stop_ || !queue_.empty() || !active.empty(); });
+                if (stop_ || failed_) {
+                    fail_queued_locked(stop_ ? "the Inkling-2 Engine is shutting down" : "the Inkling-2 Engine has failed");
+                    stopping = stop_, failed = true;
+                }
+                while (!failed && !queue_.empty() && active.size() + taken.size() < static_cast<std::size_t>(slots_)) {
+                    taken.push_back(std::move(queue_.front()));
+                    queue_.pop_front();
+                    ++running_;
+                }
+            }
+            if (failed) {
+                // What runs is not finished: the Engine is going, or the device failed.
+                while (!active.empty()) {
+                    (void)release(active.size() - 1, std::make_exception_ptr(RequestError(
+                                               RequestErrorKind::Unavailable, stopping ? "the Inkling-2 Engine is shutting down" : "the Inkling-2 Engine has failed")));
+                }
+                if (stopping) { return; }
+                continue;
+            }
+            for (auto& job : taken) {
+                const std::int32_t slot = choose_slot(*job);
+                auto a                  = std::make_unique<Active>();
+                a->job                  = std::move(job);
+                a->slot                 = slot;
+                used[static_cast<std::size_t>(a->slot)] = true;
+                active.push_back(std::move(a));
+                Active& added = *active.back();
+                try {
+                    if (!start(added)) { end(active.size() - 1, nullptr); }
+                } catch (...) { end(active.size() - 1, std::current_exception()); }
+            }
+
+            // One prefill chunk.
+            std::vector<std::size_t> prefilling;
+            for (std::size_t i = 0; i < active.size(); ++i) {
+                if (!active[i]->decoding) { prefilling.push_back(i); }
+            }
+            if (!prefilling.empty()) {
+                const std::size_t i = prefilling[prefill_turn++ % prefilling.size()];
+                try {
+                    if (!prefill_step(*active[i])) { end(i, nullptr); }
+                } catch (...) { end(i, std::current_exception()); }
+            }
+
+            // One decode step over every request with a token to forward.
+            for (std::size_t i = active.size(); i-- > 0;) {
+                if (active[i]->decoding && active[i]->job->cancelled) {
+                    active[i]->job->result.finish_reason = FinishReason::Cancelled;
+                    end(i, nullptr);
+                }
+            }
+            std::vector<std::int32_t> slots, tokens;
+            std::vector<Active*> columns;
+            for (auto& a : active) {
+                if (!a->decoding) { continue; }
+                columns.push_back(a.get());
+                slots.push_back(a->slot);
+                tokens.push_back(a->next);
+            }
+            if (columns.empty()) { continue; }
+            Tensor logits;
+            std::vector<std::int32_t> greedy(columns.size(), 0);
+            try {
+                logits = programs_->text.forward_batch(slots, tokens);
+                {
+                    std::lock_guard lock(stats_mutex_);
+                    ++totals_.decode_rounds;
+                    totals_.decode_row_rounds += columns.size();
+                }
+                // Every column's greedy token in one launch and one download (the sampled columns' are not read).
+                Tensor ids(programs_->argmax.p, DType::I32, {static_cast<std::int32_t>(columns.size())});
+                ops::argmax_fp32(logits, vocab, ids, stream_, ops::kSamplerNonFiniteToken);
+                check_cuda(cudaMemcpyAsync(greedy.data(), ids.data, greedy.size() * 4, cudaMemcpyDeviceToHost, stream_), "argmax");
+                check_cuda(cudaStreamSynchronize(stream_), "argmax");
+            } catch (...) {
+                const std::exception_ptr error = std::current_exception();
+                for (Active* a : columns) {
+                    const auto at = std::find_if(active.begin(), active.end(), [&](const auto& p) { return p.get() == a; });
+                    end(static_cast<std::size_t>(at - active.begin()), error);
+                }
+                continue;
+            }
+            for (std::size_t c = 0; c < columns.size(); ++c) {
+                Active& a = *columns[c];
+                bool more = false;
+                std::exception_ptr error;
+                try {
+                    TokenId next  = 0;
+                    bool injected = false;
+                    if (!a.forced.empty()) {
+                        next     = a.forced.front();
+                        injected = true;
+                        a.forced.pop_front();
+                    } else if (a.argmax_on_device) {
+                        next = greedy[c];
+                        if (next == ops::kSamplerNonFiniteToken) { throw RequestError(RequestErrorKind::NumericalFailure, "inkling2: the logits are not finite"); }
+                    } else {
+                        a.host.resize(static_cast<std::size_t>(vocab));
+                        const Tensor col = logits.slice(1, static_cast<std::int32_t>(c), 1);
+                        check_cuda(cudaMemcpyAsync(a.host.data(), col.data, a.host.size() * 4, cudaMemcpyDeviceToHost, stream_), "logits");
+                        check_cuda(cudaStreamSynchronize(stream_), "logits");
+                        next = sample(a.host, a.job->options.execution.sampling, a.counts, a.rng);
+                    }
+                    // A cancellation during the forward or another column's sampling ends this row before its token
+                    // commits, as the single-request path's check after its forward does; the other columns go on.
+                    if (a.job->cancelled) {
+                        a.job->result.finish_reason = FinishReason::Cancelled;
+                    } else {
+                        more = commit(a, next, injected);
+                    }
+                } catch (...) { error = std::current_exception(); }
+                if (!more) {
+                    const auto at = std::find_if(active.begin(), active.end(), [&](const auto& p) { return p.get() == &a; });
+                    end(static_cast<std::size_t>(at - active.begin()), error);
+                }
+            }
+        } catch (...) {
+            std::exception_ptr error = std::current_exception();
+            try {
+                std::rethrow_exception(error);
+            } catch (const Latched&) {
+                error = std::make_exception_ptr(RequestError(RequestErrorKind::Unavailable, "the Inkling-2 Engine has failed"));
+            } catch (...) {}
+            for (auto& job : taken) {
+                if (job) { end_job(*job, error, 0); }
+            }
+            while (!active.empty()) { (void)release(active.size() - 1, error); }
+        }
+    }
+}
+
 bool artifact_is_inkling2(const std::filesystem::path& artifact) noexcept {
     try {
         const artifact::Reader reader(artifact);
@@ -1272,13 +1892,14 @@ MemorySummary Inkling2Core::memory_summary() const {
     MemorySummary m;
     m.device                = options_.device;
     m.max_context           = options_.max_context;
-    m.requested_max_context = options_.max_context;
-    m.kv_capacity           = options_.max_context;
+    m.requested_max_context = requested_context_;
+    m.kv_capacity           = options_.max_context * static_cast<std::uint32_t>(slots_); // slots_ rings of max_context
     // The weights on the device: the artifact's device backing (its allocations, alignment included; h2d_bytes is
     // the payload transferred) and any --dense-q8 re-encoding kept beside it.
     const std::size_t weights = static_cast<std::size_t>(model_->storage_stats().device_capacity_bytes) +
                                 (programs_->dense ? programs_->dense->bytes() : 0);
     m.weights = {.capacity_bytes = weights, .used_bytes = weights, .peak_used_bytes = weights};
+    m.available_after_weights_bytes = free_after_weights_;
     return m;
 }
 
@@ -1289,12 +1910,15 @@ RuntimeStats Inkling2Core::runtime_stats() const {
     {
         std::lock_guard stats_lock(stats_mutex_);
         s = totals_;
-        s.lanes[0] = lane_;
+        for (std::int32_t i = 0; i < slots_; ++i) { s.lanes[static_cast<std::size_t>(i)] = lanes_[static_cast<std::size_t>(i)]; }
     }
-    s.lane_count            = 1;
-    s.running_requests      = s.lanes[0].state != RuntimeLaneStats::State::Idle ? 1U : 0U;
-    s.prefilling_requests   = s.lanes[0].state == RuntimeLaneStats::State::Prefill ? 1U : 0U;
-    s.decode_ready_requests = s.lanes[0].state == RuntimeLaneStats::State::Decoding ? 1U : 0U;
+    s.lane_count = static_cast<std::uint32_t>(slots_);
+    for (std::int32_t i = 0; i < slots_; ++i) {
+        const auto state = s.lanes[static_cast<std::size_t>(i)].state;
+        s.running_requests += state != RuntimeLaneStats::State::Idle ? 1U : 0U;
+        s.prefilling_requests += state == RuntimeLaneStats::State::Prefill ? 1U : 0U;
+        s.decode_ready_requests += state == RuntimeLaneStats::State::Decoding ? 1U : 0U;
+    }
     s.waiting_requests      = static_cast<std::uint32_t>(queue_.size());
     for (const auto& waiting : queue_) {
         if (s.waiting.size() == kMaximumReportedWaitingRequests) { break; }
