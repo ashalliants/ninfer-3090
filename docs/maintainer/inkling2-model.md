@@ -261,7 +261,8 @@ Qwen3.5 GDN conv state, only smaller.
 
 `src/models/inkling2` binds a converted artifact (`inkling2_gguf` recipe, UD-Q8_K_XL) and runs the
 48-visit schedule for one sequence. It is the correctness baseline the V100 kernels of phase 4 are
-measured against. The public Engine and `ninfer-serve` run it one request at a time (see "Serving").
+measured against. The public Engine and `ninfer-serve` run it one request at a time by default (see "Serving"); `--max-concurrency N`
+(N > 1, opt-in) batches the decode of up to 8 requests (see "Batched decode").
 The DSpark drafter runs speculative decoding on greedy and sampled requests (see "DSpark drafter").
 
 | Piece | Where | What it does now |
@@ -277,7 +278,7 @@ The DSpark drafter runs speculative decoding on greedy and sampled requests (see
 | MoE | `ops/moe_situ.h` | sigmoid top-8 route with bias steering; SITU experts from `ggml_rec_nvfp4_nvfp4` records (layers 0-19) or the BF16 banks (20-23), with the per-expert multipliers |
 | Vision | `program/vision_program.{h,cpp}`, `ops/vit_fp32.h` | `prepare_image` (pad, normalize, resize above 4096 tokens) and `VisionEncoder::encode`; `TextProgram::forward(tokens, embeddings)` puts an image's rows in place of its placeholder tokens (see "Vision tower") |
 | Frontend | `frontend/frontend.{h,cpp}` | the chat template and tokenizer, images to prepared pixels, and the output decoder (see "Serving") |
-| Engine core | `runtime/engine/inkling2_core.{h,cpp}` | one worker thread; requests one at a time from position 0; host sampling (see "Serving") |
+| Engine core | `runtime/engine/inkling2_core.{h,cpp}` | one worker thread; by default requests one at a time from position 0; with `--max-concurrency N` > 1 a batched decode over N slots (`worker_batched`); host sampling (see "Serving") |
 | Tokenizer | `qwen3_5/frontend/tokenizer.{h,cpp}` `Pipeline::Inkling2` | the word regex as a hand-written matcher, no normalizer, BPE with `ignore_merges` |
 
 All Ops are naive FP32 kernels qualified against `tests/ops/inkling2_reference.h`. The KV rings are

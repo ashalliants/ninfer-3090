@@ -1684,8 +1684,8 @@ void Inkling2Core::worker_batched() {
     std::uint64_t releases = 0;
     std::size_t prefill_turn = 0;
     const auto vocab = static_cast<std::int32_t>(model_->config().unpadded_vocab_size);
-    // Ends a request (its result complete, or failed) and frees its slot.
-    const auto end = [&](std::size_t i, std::exception_ptr error) {
+    // Ends a request (its result complete, or failed) and frees its slot; whether it ended failed.
+    const auto release = [&](std::size_t i, std::exception_ptr error) {
         std::unique_ptr<Active> a = std::move(active[i]);
         active.erase(active.begin() + static_cast<std::ptrdiff_t>(i));
         if (!error) {
@@ -1700,7 +1700,18 @@ void Inkling2Core::worker_batched() {
         }
         used[static_cast<std::size_t>(a->slot)]     = false;
         freed_at[static_cast<std::size_t>(a->slot)] = ++releases;
-        end_job(*a->job, error, static_cast<std::uint32_t>(a->slot));
+        const bool failed = error != nullptr;
+        end_job(*a->job, std::move(error), static_cast<std::uint32_t>(a->slot));
+        return failed;
+    };
+    // release, then: a failure end_job latched (a CUDA fault leaves the device state unknown, failed_) stops the round
+    // before any further device work. Latched reaches the catch below, which fails every request this worker holds.
+    struct Latched {};
+    const auto end = [&](std::size_t i, std::exception_ptr error) {
+        if (release(i, std::move(error))) {
+            std::lock_guard lock(mutex_);
+            if (failed_) { throw Latched{}; }
+        }
     };
     // The free slot for a prompt: the one whose snapshot it resumes from (the longest), else an empty one, else the
     // one released longest ago (its snapshot is the oldest).
@@ -1752,7 +1763,7 @@ void Inkling2Core::worker_batched() {
             if (failed) {
                 // What runs is not finished: the Engine is going, or the device failed.
                 while (!active.empty()) {
-                    end(active.size() - 1, std::make_exception_ptr(RequestError(
+                    (void)release(active.size() - 1, std::make_exception_ptr(RequestError(
                                                RequestErrorKind::Unavailable, stopping ? "the Inkling-2 Engine is shutting down" : "the Inkling-2 Engine has failed")));
                 }
                 if (stopping) { return; }
@@ -1856,11 +1867,16 @@ void Inkling2Core::worker_batched() {
                 }
             }
         } catch (...) {
-            const std::exception_ptr error = std::current_exception();
+            std::exception_ptr error = std::current_exception();
+            try {
+                std::rethrow_exception(error);
+            } catch (const Latched&) {
+                error = std::make_exception_ptr(RequestError(RequestErrorKind::Unavailable, "the Inkling-2 Engine has failed"));
+            } catch (...) {}
             for (auto& job : taken) {
                 if (job) { end_job(*job, error, 0); }
             }
-            while (!active.empty()) { end(active.size() - 1, error); }
+            while (!active.empty()) { (void)release(active.size() - 1, error); }
         }
     }
 }
