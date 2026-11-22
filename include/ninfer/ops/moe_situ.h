@@ -109,8 +109,9 @@ void nvfp4_tile_records(SituExpertBank& bank, std::uint8_t* records, void* scrat
  * Effects: writes out; it must not overlap z.
  * Workspace: moe_situ_experts_workspace_bytes(bank, k * T) from `workspace`, released on return.
  * Execution: graph capturable. Entries run one per block, or expert-major (each distinct expert's weights read
- *   once for its entries) for calls of 64 or more entries over 2 or more columns. Every column's bits are those
- *   of its own T = 1 call either way.
+ *   once for its entries) for calls of 64 or more entries over 2 or more columns. NVFP4 calls of up to 16 entries
+ *   run gate_up and down in one launch (plus a clear of its sync counters). Every column's bits are those of its
+ *   own T = 1 call on every route.
  */
 [[nodiscard]] std::size_t moe_situ_experts_workspace_bytes(const SituExpertBank& bank, std::int64_t entries);
 void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor& ids, const Tensor* weights, float gate_cap,

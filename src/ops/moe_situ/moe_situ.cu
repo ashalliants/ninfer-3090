@@ -314,7 +314,14 @@ __device__ __forceinline__ void fill_tables(Tables* t) {
     for (int q = threadIdx.x; q < kLutEntries; q += blockDim.x) { t->scales[q] = ue4m3_half(q); }
 }
 
+// kCoherent loads through the L2 only: for data written by other blocks of the same launch.
+template <bool kCoherent = false>
+__device__ __forceinline__ float4 load4(const float4* p) {
+    if constexpr (kCoherent) { return __ldcg(p); } else { return __ldg(p); }
+}
+
 // n is a multiple of 64; a 16-byte aligned src is copied with 16-byte loads (all of them issued before any store).
+template <bool kCoherent = false>
 __device__ __forceinline__ void stage_padded(const float* __restrict__ src, int n, float* dst) {
     if ((reinterpret_cast<std::uintptr_t>(src) & 15) == 0) {
         const float4* s4 = reinterpret_cast<const float4*>(src);
@@ -324,7 +331,7 @@ __device__ __forceinline__ void stage_padded(const float* __restrict__ src, int 
 #pragma unroll
             for (int i = 0; i < kBatch; ++i) {
                 const int q = base + i * blockDim.x;
-                if (q < n / 4) { v[i] = __ldg(s4 + q); }
+                if (q < n / 4) { v[i] = load4<kCoherent>(s4 + q); }
             }
 #pragma unroll
             for (int i = 0; i < kBatch; ++i) {
@@ -334,7 +341,9 @@ __device__ __forceinline__ void stage_padded(const float* __restrict__ src, int 
         }
         return;
     }
-    for (int d = threadIdx.x; d < n; d += blockDim.x) { dst[(d >> 6) * kPaddedBlock + (d & 63)] = src[d]; }
+    for (int d = threadIdx.x; d < n; d += blockDim.x) {
+        dst[(d >> 6) * kPaddedBlock + (d & 63)] = kCoherent ? __ldcg(src + d) : src[d];
+    }
 }
 
 __device__ __forceinline__ float lane_of(const float4& v, int i) { return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w; }
@@ -695,6 +704,77 @@ down_kernel(BankArgs b, const std::int32_t* __restrict__ ids, const float* __res
 }
 
 constexpr std::size_t kMaxShared = 96 * 1024; // the most dynamic shared memory a block may have on sm_70
+constexpr int kFusedMaxEntries = 16; // NVFP4 calls up to here (T 1-2 at top 8) fuse; from T 4 the two launches are as fast
+
+// ---- One launch for an NVFP4 call's per-entry gate_up and down: entries * gate groups gate items, then the down
+// items, both entry-major so the first entries' down items can start first. Each item does its per-entry kernel's work
+// with the same arithmetic. A block takes the next item by ticket (an atomic in launch order), so every gate item is
+// held by a running block before any down item is taken: a down item can wait for its entry's gate items without
+// deadlock. It issues its weight loads first, then waits on its entry's ready count, so the down weights stream while
+// the gate items finish. sync[0] is the ticket and sync[1 + entry] the entry's finished gate items, zeroed by the
+// caller.
+template <int PG, int PD>
+__global__ void __launch_bounds__(kThreads)
+fused_experts_kernel(BankArgs b, const float* __restrict__ z, std::int64_t zs, const std::int32_t* __restrict__ ids,
+                     int entries, int top_k, float gate_cap, float up_cap, int gate_groups, int down_groups, float* act,
+                     float* __restrict__ y, int* sync) {
+    extern __shared__ float2 shared[];
+    __shared__ int ticket;
+    Tables* lut          = reinterpret_cast<Tables*>(shared);
+    std::uint32_t* stage = reinterpret_cast<std::uint32_t*>(lut + 1);
+    float* x             = reinterpret_cast<float*>(stage + kWarps * kStageWords);
+    if (threadIdx.x == 0) { ticket = atomicAdd(sync, 1); }
+    __syncthreads();
+    const int t = ticket, gate_items = entries * gate_groups;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (t < gate_items) {
+        const int entry = t / gate_groups, group = t % gate_groups, col = entry / top_k, e = __ldg(ids + entry);
+        const int first = (group * kWarps + warp) * kGateRows, row0 = first < b.inter ? first : 0;
+        const std::uint8_t* rec = b.records + static_cast<std::uint64_t>(e) * b.stride;
+        const std::uint8_t* groups[2] = {rec + static_cast<std::uint64_t>(row0) * b.gate_row_bytes,
+                                         rec + b.up_offset + static_cast<std::uint64_t>(row0) * b.gate_row_bytes};
+        Nvfp4Runs<2, kGateRows, PG> rows(groups, b.hidden / kNvfp4Values, b.tiled);
+        fill_tables(lut);
+        stage_padded(z + col * zs, b.hidden, x);
+        __syncthreads();
+        if (first < b.inter) {
+            float dots[1][1];
+            rows.dot<1>(x, 0, lut, stage + warp * kStageWords, dots);
+            const float dot = dots[0][0];
+            const float up  = __shfl_down_sync(0xFFFFFFFFU, dot, kGateRows);
+            const float scale = b.gate_up_scale != nullptr ? b.gate_up_scale[e] : 1.0F;
+            if (lane < kGateRows) {
+                act[static_cast<std::int64_t>(entry) * b.inter + first + lane] = situ(dot * scale, up * scale, gate_cap, up_cap);
+            }
+        }
+        __syncthreads(); // the block's activations are written
+        if (threadIdx.x == 0) {
+            __threadfence();
+            atomicAdd(sync + 1 + entry, 1);
+        }
+    } else {
+        const int u = t - gate_items, entry = u / down_groups, group = u % down_groups, e = __ldg(ids + entry);
+        const int first = (group * kWarps + warp) * kDownRows, row0 = first < b.hidden ? first : 0;
+        const std::uint8_t* rec = b.records + static_cast<std::uint64_t>(e) * b.stride + b.down_offset;
+        const std::uint8_t* groups[1] = {rec + static_cast<std::uint64_t>(row0) * b.down_row_bytes};
+        Nvfp4Runs<1, kDownRows, PD> rows(groups, b.inter / kNvfp4Values, b.tiled);
+        fill_tables(lut);
+        if (threadIdx.x == 0) {
+            volatile int* ready = sync + 1 + entry;
+            while (*ready < gate_groups) { __nanosleep(64); }
+            __threadfence();
+        }
+        __syncthreads();
+        stage_padded<true>(act + static_cast<std::int64_t>(entry) * b.inter, b.inter, x);
+        __syncthreads();
+        if (first < b.hidden) {
+            float dots[1][1];
+            rows.dot<1>(x, 0, lut, stage + warp * kStageWords, dots);
+            const float scale = b.down_scale != nullptr ? b.down_scale[e] : 1.0F;
+            if (lane < kDownRows) { y[static_cast<std::int64_t>(entry) * b.hidden + first + lane] = dots[0][0] * scale; }
+        }
+    }
+}
 
 // ---- Calls of two or more columns: expert-major, so each distinct expert's weights are read once for all the
 // entries routed to it, and a tile computes exactly the entries it has.
@@ -1099,7 +1179,7 @@ BankArgs bank_args(const SituExpertBank& bank) {
 
 std::size_t workspace_for(const SituExpertBank& bank, std::int64_t entries) {
     return align256(static_cast<std::uint64_t>(entries) * bank.intermediate * 4) +
-           align256(static_cast<std::uint64_t>(entries) * bank.hidden * 4);
+           align256(static_cast<std::uint64_t>(entries) * bank.hidden * 4) + align256(static_cast<std::uint64_t>(1 + entries) * 4);
 }
 
 } // namespace
@@ -1227,6 +1307,35 @@ void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor&
         case 3: launch_narrow<3>(l, gate_p, down_p); break;
         default: launch_narrow<4>(l, gate_p, down_p); break;
         }
+    } else if (b.nvfp4 && entries <= kFusedMaxEntries) {
+        int* sync = static_cast<int*>(workspace.alloc_bytes(static_cast<std::size_t>(1 + entries) * 4).data);
+        if (cudaMemsetAsync(sync, 0, static_cast<std::size_t>(1 + entries) * 4, stream) != cudaSuccess) {
+            throw std::runtime_error(std::string(op) + ": the expert sync could not be cleared");
+        }
+        const int gate_groups = (bank.intermediate + gate_per_block - 1) / gate_per_block;
+        const int down_groups = (bank.hidden + down_per_block - 1) / down_per_block;
+        const dim3 grid(entries * (gate_groups + down_groups));
+        const std::size_t shared = std::max(staged(bank.hidden), staged(bank.intermediate));
+        const auto fused = [&](auto gp, auto dp) {
+            fused_experts_kernel<decltype(gp)::value, decltype(dp)::value><<<grid, kThreads, shared, stream>>>(
+                b, zp, zs, id, entries, top_k, gate_cap, up_cap, gate_groups, down_groups, act, y, sync);
+        };
+        using I1 = std::integral_constant<int, 1>;
+        using I2 = std::integral_constant<int, 2>;
+        using I4 = std::integral_constant<int, 4>;
+        const auto by_down = [&](auto gp) {
+            switch (down_p) {
+            case 1: fused(gp, I1{}); break;
+            case 2: fused(gp, I2{}); break;
+            default: fused(gp, I4{}); break;
+            }
+        };
+        switch (gate_p) {
+        case 1: by_down(I1{}); break;
+        case 2: by_down(I2{}); break;
+        default: by_down(I4{}); break;
+        }
+        check_launch(op);
     } else {
         switch (gate_p) {
         case 1: gate_up_kernel<1><<<gate_grid, kThreads, staged(bank.hidden), stream>>>(b, zp, zs, id, top_k, gate_cap, up_cap, act); break;
