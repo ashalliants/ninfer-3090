@@ -1,5 +1,62 @@
 # TODO
 
+## Flash-Next: context-cache captures stall prefill on a slow link (plan only), 2026-11-22
+
+Plan for a draft PR; nothing here is implemented or measured end to end.
+
+**What was measured (Tesla V100, PCIe Gen3 x4 eGPU, 2026-11-22)**
+
+- Every capture is synchronous (`Program::capture_record` in `src/models/qwen4_exp/program/program.cpp`):
+  `run_copies(true)` gathers the new KV pages and the lane's state image into pinned Host slabs on
+  `device_.stream`, then `device_.synchronize()`.
+- The state image is about 111 MiB (FP32 GDN state, the drafter's saved residual, and the logits when
+  asked for). One capture costs 36-46 ms on the x4 link, the link's D2H rate. For example, a 341-token
+  endpoint took 42.3 ms; later ones took 36.2-37.9 ms.
+- An agent turn takes about three captures (the prompt checkpoints while it prefills, and the endpoint
+  at finish), so roughly 110-130 ms of a 0.7-3 s prefill.
+- Copy-engine microbenchmarks (`asyncEngineCount` 7):
+  - Bulk rates are 3.35 GB/s H2D and 3.29 GB/s D2H.
+  - A small D2H copy while a bulk H2D copy runs is unaffected; PCIe is full duplex.
+  - Prefill on this box is bound by expert uploads (H2D), so a D2H capture that overlapped the next
+    chunk would cost nearly nothing on the link.
+  - Caveat: the first small D2H copy after a 64 MiB bulk D2H copy on another stream waited for all
+    of it (20.4 ms). Later ones did not. Any readback the forward needs must therefore not queue
+    behind a bulk capture on the same engine. Order the forward's own readbacks first, or pace the
+    capture with the SM gather (`gather_copies_paced`, about 2 GB/s per block) rather than a CE copy.
+
+**Plan (Flash-Next only; option `--async-context-capture`, default on only when the link measured at
+startup is below 8 GB/s, so the RTX 3090's x16 link keeps today's path)**
+
+1. **Stage into VRAM.** At capture time, D2D-copy the state image and the not-yet-mirrored pages into
+   a device staging buffer on `device_.stream`. The partial last page is staged too, because the next
+   chunk appends to it. This costs about 0.15 ms at 900 GB/s. It takes VRAM from the expert cache:
+   about 111 MiB plus the pages, roughly 80 of 18,114 frames on the V100. Plan it as a
+   `ProgramDevicePlan` term, so that off plans nothing.
+2. **Drain on a side stream.** An event after the staging copy gates the side stream. That stream
+   gathers staging to slabs with its own descriptor buffer (`copies_` and the tier's descriptors are
+   shared today). Use the SM gather with a block count derived from the measured link: about
+   0.6 x link / 2 GB/s, so 1 block on x4. That keeps the uploads' SMs and link share intact.
+3. **Publish only after the copy has landed.** `insert_group` publishes a record that a restore,
+   export or import could read at once. Either record a completion event in the record and wait on it
+   (`cudaEventSynchronize`) in `restore`, the export and import paths, `abandon_capture` and teardown,
+   or defer the publication to the next round boundary that finds the event complete. The mirror's
+   new pages join only after completion.
+4. **Keep the synchronous path** for the NVMe tier (its writes are host I/O), for captures larger
+   than the staging buffer, and while a previous drain is still running. That last rule makes the
+   staging buffer single-use with no queue.
+
+**Expected effect**
+- V100 x4: about 35-45 ms less TTFT per capture during prefill, roughly 100-130 ms per agent turn;
+  the endpoint capture stops delaying a request's finish.
+- RTX 3090 x16: none. A capture there is about 5 ms, and the gate keeps the old path.
+
+**To finish:** implement as above. Run
+`ninfer_qwen4_exp_engine_real_test --cache-check` (reuse must stay bit-identical) and an ABBA of a
+multi-turn agent-like trace on the V100: TTFT and end-to-end per turn, with the option on and off.
+Then a 3090 run with the option forced on and off, to show the gate's choice is right. Update
+docs/serving.md, docs/tesla-v100.md and docs/performance.md as CLAUDE.md "Speed changes update the
+published numbers" says.
+
 ## `--draft-context-rows` above one lane changes committed output, 2026-11-10
 
 Refused at startup (`planning/startup.cpp:validate_target_options`) rather than shipped broken:
