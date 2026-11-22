@@ -2,7 +2,7 @@
 
 Status: **text MVP, correctness first**. `src/models/inkling2` runs the text model on the GPU with
 naive FP32 kernels and matches the llama.cpp golden ("Engine (text MVP, correctness first)" and
-"Validation" below); the DSpark drafter and greedy speculative decoding are in ("DSpark drafter" below, measured on
+"Validation" below); the DSpark drafter and speculative decoding (greedy and sampled) are in ("DSpark drafter" below, measured on
 a physical Tesla V100); so is the vision tower and image prompts ("Vision tower" below). The public Engine and
 `ninfer-serve` run it with its chat template, sampling and output decoder ("Serving" below). This page is the mathematical authority for the work, plus the GGUF
 mapping, reuse map and V100 plan. The
@@ -262,7 +262,7 @@ Qwen3.5 GDN conv state, only smaller.
 `src/models/inkling2` binds a converted artifact (`inkling2_gguf` recipe, UD-Q8_K_XL) and runs the
 48-visit schedule for one sequence. It is the correctness baseline the V100 kernels of phase 4 are
 measured against. The public Engine and `ninfer-serve` run it one request at a time (see "Serving").
-The DSpark drafter runs greedy speculative decoding (see "DSpark drafter").
+The DSpark drafter runs speculative decoding on greedy and sampled requests (see "DSpark drafter").
 
 | Piece | Where | What it does now |
 |---|---|---|
@@ -377,9 +377,11 @@ Two serving options change how many drafts a round verifies, never the output (v
 Both are on by default under `ninfer-serve`/`ninfer-cli --spec dspark`; the Engine options default to off
 (`SpeculativeOptions::draft_min_p`, `dspark_adaptive`).
 
-- **`--draft-min-p P`** (default 0.5; 0 turns it off): `DSparkProgram::draft(anchor, n, &probs)` also
-  returns the drafter's probability of each draft (`ops::dspark_draft_pick`: the argmax and its softmax probability
-  at temperature 1, the same token as `argmax_fp32`), and the round keeps the drafts before the first one under P.
+- **`--draft-min-p P`** (default 0.5; 0 turns it off): `DSparkProgram::draft(anchor, n, pick, uniforms, &probs)` also
+  returns the drafter's probability of each draft (`ops::dspark_draft_pick`), and the round keeps the drafts before
+  the first one under P. For a greedy pick that is the argmax (the same token as `argmax_fp32`) and its softmax
+  probability at temperature 1; for a sampled pick, the coupled draw and its weight over the mass the request's
+  temperature, top-k, min-p and top-p keep (`DraftPick`). P only stops drafting: verify is unchanged either way.
   A round whose first draft is already under P runs as a plain step (a fallback step; its time, which includes the
   draft, is not used for either cost).
 - **`--dspark-adaptive on|off`** (default on): `DraftWidth` (`inkling2_core.cpp`) picks each round's draft count
@@ -414,6 +416,42 @@ with separate context roles. What is new: per-layer softmax tap fusion instead o
 projection, taps counted in visits, the Markov RNN chain instead of per-column argmax, and global
 attention in a draft layer.
 
+### Sampled requests
+
+A sampled request (temperature above 0, with any top-k, top-p, min-p, presence and frequency penalty) speculates
+too, and its tokens are exactly the ones plain sampling draws under the same seed, bit for bit. That needs no
+rejection step, because the host sampler (`sample()` in `inkling2_core.cpp`) already makes each token a
+deterministic function of the target's processed logits at that position and the request's next uniform: it draws
+one `std::uniform_real_distribution` value (one `generate_canonical` of its `mt19937_64`) per sampled token, in
+order, and inverts the CDF over the candidates sorted by logit. A round's columns are verified one at a time
+through that same loop: column c's token is sampled from column c's logits with the next uniform, and the round
+continues only while that token is the draft the next column was computed from. So the uniforms are consumed by
+emitted tokens only, never by drafts, and the logits of each column are the plain decode step's (the verify
+forward computes each column as a decode step does; `ninfer_inkling2_engine_dspark_sampled_test` checks the
+tokens). Forced tokens (a thinking budget's close) draw nothing, in both paths.
+
+The drafts are coupled to those draws (the idea of ninfer-all's Gumbel-max coupled drafts, 2a743592, here with the
+inverse CDF the sampler already uses, so the default sampling keeps its tokens): before a round the core copies the
+generator and reads the next n uniforms, and the drafter draws each draft from its own logits with the request's
+temperature, top-k, top-p and min-p and the uniform of that position (`ops::dspark_draft_pick`: the top-k by a radix
+select, sorted, then the host sampler's arithmetic in FP64). Where the drafter's distribution matches the target's,
+its draft is the token the target is about to sample, so it is accepted at the rate a greedy draft is; penalties are
+not applied to the drafts (they only cost acceptance). `--draft-min-p` reads the drafter's probability of its draw
+under those processors.
+
+Serving, the same 12 chat requests at temperature 0.8 and top-p 0.95, each with its own seed, ABBA against a server
+without `--spec`, `predicted_per_second` averaged over the requests (V100, 2026-11-21). The output md5 is the same
+for plain and DSpark at every temperature, on every leg:
+
+| temperature | plain | `--spec dspark` (defaults) | drafts accepted |
+|---|---|---|---|
+| 0.8 (ABBA) | 69.75 / 69.70 | **80.68 / 80.32 (+15.5%)** | 58.7% / 59.2% |
+| 0.8, a fixed 3 drafts (one leg) | | 76.08 (+9.1%) | 50.4% |
+| 0.6 (one leg each) | 69.70 | 80.78 (+15.9%) | 57.8% |
+| 1.0 (one leg each) | 69.91 | 79.61 (+13.9%) | 61.7% |
+
+Plain sampled decode is slower than plain greedy (about 70 against 72 tok/s): each token downloads its column's
+logits and sorts on the host, and so does each verified column.
 
 ## Vision tower (`mmproj-BF16.gguf`, `clip`, projector `inkling2v`)
 
@@ -559,21 +597,22 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
   are the same (token ids, and images by a hash of their pixels) restores it and prefills only the rest, in the same
   chunks a prefill from 0 runs: every forward cut falls on a multiple of the chunk (`inkling2_prefill_plan.h`), so the
   resumed forwards are the cold ones call for call and, as the tensor-core routes dispatch on a call's width, bit for
-  bit. Reuse is therefore chunk-grained (2048 positions at the default chunk 2048; `--prefill-chunk 256` for finer reuse). With `--spec dspark` the drafter's sliding rings and anchor context are kept with it (`DSparkProgram::save`); a sampled request does not run the drafter, so a greedy one resumes only from a snapshot a greedy one left. Images wholly in the reused prefix are not encoded. The
+  bit. Reuse is therefore chunk-grained (2048 positions at the default chunk 2048; `--prefill-chunk 256` for finer reuse). With `--spec dspark` the drafter's sliding rings and anchor context are kept with it (`DSparkProgram::save`); every request runs the drafter, so it resumes only from a snapshot whose drafter state is at the same position. Images wholly in the reused prefix are not encoded. The
   result reports `reused_prompt_tokens`. One snapshot is kept; a prompt that does not resume from it replaces it (or clears it, when no longer than one chunk).
 - `--spec dspark` (up to 3 drafts, `--draft-min-p 0.5` and `--dspark-adaptive on` by default; see "Draft floor and
-  adaptive width") speculates on greedy requests (`Inkling2Core::run`):
+  adaptive width") speculates on every request, greedy and sampled (`Inkling2Core::run`):
   - A round drafts n tokens after the anchor, forwards `[anchor, drafts]`, and consumes each column
     whose input is the token the previous column chose; the first that differs ends the round, and
     `keep()` cuts the target back. Every token still goes through the plain loop, so the output is
-    plain greedy decoding's.
+    plain decoding's (greedy, or sampled under the request's seed).
   - A round drafts at most the output budget left after the anchor minus one (n drafts yield n + 1 tokens), so a
     round near `max_tokens` drafts fewer and none runs when one token is left; `drafted_tokens` counts what was drafted.
   - A round runs only while its cost (EMA) is below (1 + accepted drafts EMA) plain steps; plain steps
     hold their taps on the device for one deferred drafter extend, and a probe round follows 8, 16, ..
     64 plain steps.
   - Greedy requests without penalties take their tokens from a device argmax, one per column.
-  - Sampled requests run plain, without the drafter.
+  - Sampled requests speculate too, and sample exactly what plain sampling does under the same seed; see
+    "Sampled requests".
   - Measured (V100, `ninfer_inkling2_engine_dspark_test`, five chat prompts of 256 tokens): plain 65.0,
     n=1 73.3, n=2 80.6, n=3 83.3, n=4 81.9 tokens/s.
 

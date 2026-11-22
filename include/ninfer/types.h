@@ -129,7 +129,7 @@ enum class SpeculativeBackend : std::uint8_t {
     Mtp,
     DFlash,
     DFlash2,
-    // Inkling-2's DSpark block drafter (component "dspark"); greedy requests only, draft_tokens 1..7.
+    // Inkling-2's DSpark block drafter (component "dspark"); greedy and sampled requests, draft_tokens 1..7.
     DSpark,
 };
 

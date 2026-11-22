@@ -587,12 +587,16 @@ __global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ 
     }
 }
 
-// dspark_draft_pick: one block of 1024 threads.
-__global__ void __launch_bounds__(1024) draft_pick_kernel(const float* __restrict__ logits, int valid, int* __restrict__ id_out,
-                                                         float* __restrict__ prob_out) {
-    constexpr int kThreads = 1024;
+// dspark_draft_pick: one block of kDraftPickCandidates threads.
+__global__ void __launch_bounds__(kDraftPickCandidates) draft_pick_kernel(const float* __restrict__ logits, int valid, DraftPick pick,
+                                                                          const double* __restrict__ canonical, int* __restrict__ id_out,
+                                                                          float* __restrict__ prob_out) {
+    constexpr int kThreads = kDraftPickCandidates;
     __shared__ float best_v[32];
     __shared__ int best_i[32];
+    __shared__ float cand_v[kThreads];
+    __shared__ int cand_i[kThreads];
+    __shared__ int count;
     __shared__ float top;
     __shared__ int top_id;
     __shared__ double partial[32];
@@ -611,6 +615,7 @@ __global__ void __launch_bounds__(1024) draft_pick_kernel(const float* __restric
     }
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     if (lane == 0) { best_v[warp] = bv, best_i[warp] = bi; }
+    if (threadIdx.x == 0) { count = 0; }
     __syncthreads();
     if (threadIdx.x == 0) {
         for (int w = 1; w < kThreads / 32; ++w) {
@@ -627,21 +632,121 @@ __global__ void __launch_bounds__(1024) draft_pick_kernel(const float* __restric
         if (threadIdx.x == 0) { *id_out = 0, *prob_out = 0.0F; }
         return;
     }
-    double s = 0.0;
+    if (pick.temperature <= 0.0F) {
+        double s = 0.0;
+        for (int v = threadIdx.x; v < valid; v += kThreads) {
+            const float x = logits[v];
+            if (!isnan(x)) { s += exp(static_cast<double>(x) - m); }
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) { s += __shfl_xor_sync(0xFFFFFFFFU, s, o); }
+        if (lane == 0) { partial[warp] = s; }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            double total = 0.0;
+            for (int w = 0; w < kThreads / 32; ++w) { total += partial[w]; }
+            *id_out   = top_id;
+            *prob_out = static_cast<float>(1.0 / total);
+        }
+        return;
+    }
+    // Sampled: the K = min(top_k, kThreads) largest logits by an MSB radix select of their order-preserving keys (the
+    // K-th largest key exactly; NaN keys 0, below every number), then those of them within temperature * 18 of the
+    // maximum.
+    const int want = min(max(pick.top_k, 1), kThreads);
+    const auto key = [](float x) -> unsigned {
+        if (isnan(x)) { return 0U; }
+        const unsigned b = __float_as_uint(x);
+        return (b & 0x80000000U) != 0U ? ~b : b | 0x80000000U;
+    };
+    __shared__ unsigned hist[256];
+    __shared__ unsigned prefix, mask;
+    __shared__ int remaining;
+    if (threadIdx.x == 0) { prefix = 0U, mask = 0U, remaining = want; }
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        if (threadIdx.x < 256) { hist[threadIdx.x] = 0U; }
+        __syncthreads();
+        const unsigned p = prefix, mk = mask;
+        for (int v = threadIdx.x; v < valid; v += kThreads) {
+            const unsigned k = key(logits[v]);
+            if ((k & mk) == p) { atomicAdd(&hist[(k >> shift) & 0xFFU], 1U); }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int above = 0, b = 255;
+            for (; b > 0; --b) {
+                if (above + static_cast<int>(hist[b]) >= remaining) { break; }
+                above += static_cast<int>(hist[b]);
+            }
+            remaining -= above;
+            prefix |= static_cast<unsigned>(b) << shift;
+            mask |= 0xFFU << shift;
+        }
+        __syncthreads();
+    }
+    const unsigned kth = prefix;
+    const float floor = m - pick.temperature * 18.0F;
     for (int v = threadIdx.x; v < valid; v += kThreads) {
         const float x = logits[v];
-        if (!isnan(x)) { s += exp(static_cast<double>(x) - m); }
+        if (key(x) >= kth && x >= floor) {
+            const int at = atomicAdd(&count, 1);
+            if (at < kThreads) { cand_v[at] = x, cand_i[at] = v; }
+        }
     }
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) { s += __shfl_xor_sync(0xFFFFFFFFU, s, o); }
-    if (lane == 0) { partial[warp] = s; }
     __syncthreads();
-    if (threadIdx.x == 0) {
-        double total = 0.0;
-        for (int w = 0; w < kThreads / 32; ++w) { total += partial[w]; }
-        *id_out   = top_id;
-        *prob_out = static_cast<float>(1.0 / total);
+    const int n = min(count, kThreads);
+    if (threadIdx.x >= n) { cand_v[threadIdx.x] = -INFINITY, cand_i[threadIdx.x] = 0x7FFFFFFF; }
+    __syncthreads();
+    // Bitonic sort, logit descending then id ascending ("a before b").
+    for (int size = 2; size <= kThreads; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            const int i = threadIdx.x, j = i ^ stride;
+            if (j > i) {
+                const float vi = cand_v[i], vj = cand_v[j];
+                const int ii = cand_i[i], ij = cand_i[j];
+                const bool j_first = vj > vi || (vj == vi && ij < ii);
+                const bool ascending_block = (i & size) == 0; // this block orders "first" first
+                if (j_first == ascending_block) {
+                    cand_v[i] = vj, cand_v[j] = vi;
+                    cand_i[i] = ij, cand_i[j] = ii;
+                }
+            }
+            __syncthreads();
+        }
     }
+    if (threadIdx.x != 0) { return; }
+    const int k = min(max(pick.top_k, 1), n);
+    const double t = pick.temperature, best = cand_v[0];
+    double sum = 0.0;
+    for (int i = 0; i < k; ++i) { sum += exp((cand_v[i] - best) / t); }
+    // Normalized weights w_i = exp(..) / sum, as the host sampler forms them.
+    int keep = k;
+    if (pick.min_p > 0.0F) {
+        const double w0 = 1.0 / sum;
+        while (keep > 1 && exp((cand_v[keep - 1] - best) / t) / sum < pick.min_p * w0) { --keep; }
+    }
+    if (pick.top_p < 1.0F) {
+        double mass = 0.0;
+        for (int i = 0; i < keep; ++i) {
+            mass += exp((cand_v[i] - best) / t) / sum;
+            if (mass >= pick.top_p) {
+                keep = i + 1;
+                break;
+            }
+        }
+    }
+    double total = 0.0;
+    for (int i = 0; i < keep; ++i) { total += exp((cand_v[i] - best) / t) / sum; }
+    double u     = *canonical * total;
+    int chosen   = keep - 1;
+    for (int i = 0; i < keep; ++i) {
+        if ((u -= exp((cand_v[i] - best) / t) / sum) < 0.0) {
+            chosen = i;
+            break;
+        }
+    }
+    *id_out   = cand_i[chosen];
+    *prob_out = static_cast<float>(exp((cand_v[chosen] - best) / t) / sum / total);
 }
 
 } // namespace
@@ -905,14 +1010,16 @@ void argmax_fp32(const Tensor& logits, std::int32_t valid_rows, Tensor& out, cud
     check_launch(op);
 }
 
-void dspark_draft_pick(const Tensor& logits, std::int32_t valid_rows, Tensor& id, Tensor& prob, cudaStream_t stream) {
+void dspark_draft_pick(const Tensor& logits, std::int32_t valid_rows, const DraftPick& pick, const double* canonical, Tensor& id,
+                       Tensor& prob, cudaStream_t stream) {
     constexpr const char* op = "dspark_draft_pick";
     const Columns c = columns(logits, op, "logits", true);
     require(c.cols == 1 && valid_rows >= 1 && valid_rows <= c.rows, op, "logits must be one column of at least valid_rows");
     require(id.dtype == DType::I32 && id.numel() == 1 && id.data != nullptr, op, "id must be I32 [1]");
     require(prob.dtype == DType::FP32 && prob.numel() == 1 && prob.data != nullptr, op, "prob must be FP32 [1]");
-    draft_pick_kernel<<<1, 1024, 0, stream>>>(static_cast<const float*>(logits.data), valid_rows, static_cast<int*>(id.data),
-                                              static_cast<float*>(prob.data));
+    require(pick.temperature <= 0.0F || canonical != nullptr, op, "a sampled pick needs its uniform");
+    draft_pick_kernel<<<1, kDraftPickCandidates, 0, stream>>>(static_cast<const float*>(logits.data), valid_rows, pick, canonical,
+                                                              static_cast<int*>(id.data), static_cast<float*>(prob.data));
     check_launch(op);
 }
 

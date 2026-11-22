@@ -160,6 +160,11 @@ std::vector<std::uint64_t> prompt_keys(const ink::PreparedPrompt& prompt) {
     return keys;
 }
 
+// The sampler's one uniform draw per token, in [0, 1): sample() scales it by the kept mass, and DSpark's sampled
+// rounds read the same draws ahead off a copy of the generator. One explicit function, so the two consume the generator
+// identically on every standard library (std::uniform_real_distribution's algorithm is not specified).
+double sampler_uniform(std::mt19937_64& rng) { return std::generate_canonical<double, std::numeric_limits<double>::digits>(rng); }
+
 TokenId sample(std::vector<float>& logits, const ResolvedSamplingParameters& p,
                const std::unordered_map<TokenId, std::uint32_t>& counts, std::mt19937_64& rng) {
     if (p.presence_penalty != 0.0F || p.frequency_penalty != 0.0F) {
@@ -219,7 +224,7 @@ TokenId sample(std::vector<float>& logits, const ResolvedSamplingParameters& p,
         }
     }
     const double total = std::accumulate(prob.begin(), prob.begin() + static_cast<std::ptrdiff_t>(keep), 0.0);
-    double u           = std::uniform_real_distribution<double>(0.0, total)(rng);
+    double u           = sampler_uniform(rng) * total;
     for (std::size_t i = 0; i < keep; ++i) {
         if ((u -= prob[i]) < 0.0) { return ids[i]; }
     }
@@ -725,9 +730,9 @@ void Inkling2Core::run(Job& job) {
     // least one position remains to compute the first token's logits from.
     auto& snapshot          = programs_->snapshot;
     const auto keys         = prompt_keys(prompt);
-    // Greedy requests speculate (DSpark); the drafter follows the prompt only for them, so they resume only from a
-    // snapshot that kept the drafter's state too.
-    const bool speculate = programs_->drafter != nullptr && job.options.execution.sampling.temperature <= 0.0F;
+    // Requests speculate (DSpark), greedy and sampled alike: the drafter follows the prompt only for them, so they resume
+    // only from a snapshot that kept the drafter's state too.
+    const bool speculate = programs_->drafter != nullptr;
     const std::int32_t resume = [&] {
         if (!options_.context_cache.enabled || !job.options.execution.allow_prefix_reuse || snapshot.position <= 0 ||
             snapshot.position >= n || (speculate && programs_->draft_snapshot.position != snapshot.position)) {
@@ -870,17 +875,24 @@ void Inkling2Core::run(Job& job) {
         if (!streaming) { return; }
         for (OutputDelta& d : deltas) { job.post(std::move(d)); }
     };
-    // DSpark (greedy requests): a round drafts n tokens after the anchor and verifies [anchor, drafts] in one forward;
-    // each draft the target's own choice agrees with is consumed without a forward, the first that differs ends the
-    // round (keep() cuts the target back). Every token still goes through the loop below one at a time, from the
-    // target's logits, so the output is plain greedy decoding's. A round runs only while it pays: its measured cost
-    // against (1 + accepted drafts) plain steps; otherwise plain steps run, with a probe round after 8, 16, .. 64.
-    // --draft-min-p cuts a round's drafts before the first the drafter gives less than that probability;
-    // --dspark-adaptive picks each round's draft count (DraftWidth).
+    // DSpark: a round drafts n tokens after the anchor and verifies [anchor, drafts] in one forward; each draft the
+    // target's own choice agrees with is consumed without a forward, the first that differs ends the round (keep() cuts
+    // the target back). Every token still goes through the loop below one at a time, from the target's logits, so the
+    // output is plain decoding's: greedy's, or for a sampled request the tokens plain sampling draws under the same
+    // seed (one uniform per sampled token, in order, whichever forward computed its column). A sampled round's drafts
+    // are the drafter's own draws under the uniforms the target will draw next (coupled: a draft is the target's token
+    // wherever the two distributions agree). A round runs only while it pays: its measured cost against (1 + accepted
+    // drafts) plain steps; otherwise plain steps run, with a probe round after 8, 16, .. 64. --draft-min-p cuts a
+    // round's drafts before the first the drafter gives less than that probability; --dspark-adaptive picks each
+    // round's draft count (DraftWidth).
     const auto n_drafts  = static_cast<std::int32_t>(options_.speculative.draft_tokens);
     const float draft_min_p = options_.speculative.draft_min_p;
     std::optional<DraftWidth> width;
     if (options_.speculative.dspark_adaptive) { width.emplace(n_drafts); }
+    const bool sampled = exec.sampling.temperature > 0.0F;
+    const ops::DraftPick pick{.temperature = exec.sampling.temperature, .top_k = exec.sampling.top_k, .top_p = exec.sampling.top_p,
+                              .min_p = exec.sampling.min_p};
+    std::vector<double> uniforms;
     std::vector<float> draft_probs;
     bool forward_unmeasured = false; // a step that drafted and then ran plain (every draft under --draft-min-p)
     std::vector<TokenId> drafted; // the last forward's inputs at columns 1 ..
@@ -985,7 +997,14 @@ void Inkling2Core::run(Job& job) {
         }
         if (round) {
             flush_held();
-            drafted = drafter->draft(next, drafts, draft_min_p > 0.0F ? &draft_probs : nullptr);
+            if (sampled) {
+                // The uniforms the target's sampler draws for the next `drafts` tokens (sampler_uniform, one a token),
+                // read off a copy of its generator: the live one advances only as tokens are emitted.
+                std::mt19937_64 ahead = rng;
+                uniforms.resize(static_cast<std::size_t>(drafts));
+                for (double& u : uniforms) { u = sampler_uniform(ahead); }
+            }
+            drafted = drafter->draft(next, drafts, sampled ? &pick : nullptr, uniforms, draft_min_p > 0.0F ? &draft_probs : nullptr);
             if (draft_min_p > 0.0F) {
                 std::size_t keep = 0;
                 while (keep < drafted.size() && draft_probs[keep] >= draft_min_p) { ++keep; }

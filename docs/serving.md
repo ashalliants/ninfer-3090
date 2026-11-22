@@ -145,11 +145,13 @@ different from the Qwen3.5 models:
   2 s) so the first real image does not pay the tower's one-time setup. `--vision-residency` has no
   effect for this model.
 - **DSpark speculation** (Inkling-2, `--spec dspark [--draft-tokens N] [--draft-min-p P] [--dspark-adaptive on|off]`):
-  greedy requests only, output unchanged token for token; see [cli.md](cli.md#speculative-decoding). `N` (1 to 7, default 3) is the most drafts
+  greedy and sampled requests, output unchanged token for token (a sampled request draws the tokens plain sampling
+  draws under the same seed); see [cli.md](cli.md#speculative-decoding). `N` (1 to 7, default 3) is the most drafts
   a round verifies; by default each round picks its count from the request's recent acceptance and measured round
   costs (`--dspark-adaptive on`) and drops the drafts from the first one the drafter gives under 0.5 probability on
   (`--draft-min-p 0.5`; `0` keeps them all). On a Tesla V100 over 12 chat requests: 88.8 tok/s greedy against 81.9
-  for a fixed 3 drafts and about 72 plain ([measurements](maintainer/inkling2-model.md#draft-floor-and-adaptive-width)).
+  for a fixed 3 drafts and about 72 plain, and 80.5 sampled at temperature 0.8 against 69.7 plain (the same tokens)
+  ([measurements](maintainer/inkling2-model.md#draft-floor-and-adaptive-width)).
 - **MTP speculation** (`--spec mtp --draft-tokens N`, N from 1 to 7) needs an artifact converted
   with the drafter (`--mtp-gguf`, [weight-conversion.md](weight-conversion.md)); a plain artifact
   refuses with that instruction. The output is the same as without it, token for token (greedy).

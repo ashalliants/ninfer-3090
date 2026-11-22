@@ -4,7 +4,8 @@
 // - greedy output equals a plain Engine's, token for token, for every prompt, also under a thinking budget and a
 //   stop string (each token still goes through the plain loop; a round only saves forwards);
 // - a short output budget yields plain greedy's first tokens, and no round drafts more than the budget can emit;
-// - a sampled request runs plain (no rounds, no fallback steps) and repeats under a fixed seed;
+// - a sampled request speculates, repeats under a fixed seed and samples what a plain Engine does (the
+//   configurations are ninfer_inkling2_engine_dspark_sampled_test's);
 // - relaxed drafting, which DSpark does not implement, and draft counts outside 1..7 are refused;
 // - --draft-min-p and --dspark-adaptive yield plain greedy's tokens too;
 // - reported, not judged: rounds, drafts accepted, plain fallback steps, and decode tok/s of both Engines.
@@ -239,12 +240,12 @@ int main() {
         }
         const auto s1 = engine.generate(engine.prepare(user_turn(kPrompts[2])), sampled);
         const auto s2 = engine.generate(engine.prepare(user_turn(kPrompts[2])), sampled);
-        check(s1.speculative.rounds == 0 && s1.speculative.fallback_steps == 0 && s1.generated_token_ids == s2.generated_token_ids, "a sampled request runs plain and repeats");
+        check(s1.speculative.rounds > 0 && s1.generated_token_ids == s2.generated_token_ids, "a sampled request speculates and repeats");
         check(s1.speculative.backend == ninfer::SpeculativeBackend::DSpark && s1.speculative.draft_window == drafts,
               "a sampled request reports the configured backend");
-        // A sampled request runs without the drafter's tap copies (and their decode graph): its output is the plain
-        // Engine's, and a greedy request after it drafts from taps again.
-        check(s1.generated_token_ids == plain_sampled, "a sampled request without the taps samples what a plain Engine does");
+        // A sampled request's output is the plain Engine's under the same seed, and a greedy request after it drafts
+        // and yields plain greedy's tokens.
+        check(s1.generated_token_ids == plain_sampled, "a sampled request samples what a plain Engine does");
         const auto after = engine.generate(engine.prepare(user_turn(kPrompts[0])), greedy(tokens));
         check(after.generated_token_ids == plain.tokens[0] && after.speculative.rounds > 0,
               "a greedy request after a sampled one drafts and yields plain greedy's tokens");

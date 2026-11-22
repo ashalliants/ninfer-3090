@@ -62,9 +62,13 @@ public:
     // The first `n` (1 .. block_size - 1) tokens drafted after `anchor`, the target's next token at position() (>= 1).
     // The block forward always takes all block_size positions (its attention is non-causal); only the Markov chain
     // and the head stop at n, which leaves the n drafts the same as the full block's first n.
-    // `probs`, when not null, receives the drafter's probability of each draft (ops::dspark_draft_pick, the same tokens
-    // as argmax_fp32).
-    std::vector<std::int32_t> draft(std::int32_t anchor, std::int32_t n, std::vector<float>* probs = nullptr);
+    // `pick` (null: greedy) chooses each draft from the drafter's logits (ops::dspark_draft_pick); a sampled pick takes
+    // `canonical`, one uniform per draft: the ones the target's sampler will draw for those positions, so a draft is
+    // the target's own draw wherever the two distributions agree. `probs`, when not null, receives the drafter's
+    // probability of each draft (ops::dspark_draft_pick's prob). Greedy without probs drafts by argmax_fp32, the same
+    // tokens as a greedy pick.
+    std::vector<std::int32_t> draft(std::int32_t anchor, std::int32_t n, const ops::DraftPick* pick = nullptr,
+                                    std::span<const double> canonical = {}, std::vector<float>* probs = nullptr);
 
 private:
     struct Layer {
@@ -85,6 +89,7 @@ private:
     Tensor hb_;         // FP32 [V] = W_head b_o
     Tensor ids_;        // I32 [block]: the anchor, then the drafts
     Tensor probs_;      // FP32 [block]: the drafter's probability of each draft (picked drafts)
+    Tensor draws_;      // FP64 [block] (as I32 [2 * block]): a sampled round's uniforms
     std::int64_t position_ = 0;
     // The drafter's compact forms (lossy; they change only drafts): P = W_head W_o as Q8, and the head as Q8 (the
     // target's re-encoded head when it has one, else the drafter's own copy in head_memory_).

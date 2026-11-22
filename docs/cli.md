@@ -214,7 +214,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--dense-q8 head\|all` | Inkling-2 only. **Lossy**, opt-in: the output can differ from the default's, token for token. Re-encodes the BF16 LM head (`head`) or the head and every attention projection (`all`) to 8 bits at load (the artifact is unchanged). The default keeps the BF16 weights, exact; see [the Inkling-2 notes](maintainer/inkling2-model.md#dense-8-bit-re-encoding) for the measured KLD and speed | off (BF16) |
 | `--no-split-attention` | Inkling-2 only. Decode and DSpark verification split each attention column's keys into blocks of 256 by default (FP32, but the softmax sums run in another order, so the last bits differ past 256 visible keys; 1.4x decode at 1K context, 2.4x at 16K). This flag keeps the single-block kernel and reproduces earlier builds bit for bit; see [the Inkling-2 notes](maintainer/inkling2-model.md#split-decode-attention) | off (split) |
 | `--prefill-math tc\|fp32` | Inkling-2 only. Prefill forwards of 64 or more columns run on the FP16 tensor cores with FP32 accumulation by default (`tc`: about five times the FP32 prefill's speed; **lossy**, at the noise floor of an FP32 reordering of the sums). `fp32` keeps the exact FP32 prefill. With `--kv-dtype fp32` the default is `fp32`; an explicit `tc` there runs the tensor cores over FP32 rings (not exact). Decode is FP32 either way; see [the Inkling-2 notes](maintainer/inkling2-model.md#tensor-core-prefill) | `tc` (with `--kv-dtype fp32`: `fp32`) |
-| `--spec mtp\|dflash\|dflash2\|dspark` | speculative backend; see [Speculative decoding](#speculative-decoding) (`dspark`: Inkling-2, greedy requests, `--draft-tokens` default 3, with `--draft-min-p` and `--dspark-adaptive`) | off |
+| `--spec mtp\|dflash\|dflash2\|dspark` | speculative backend; see [Speculative decoding](#speculative-decoding) (`dspark`: Inkling-2, greedy and sampled requests, `--draft-tokens` default 3, with `--draft-min-p` and `--dspark-adaptive`) | off |
 | `--draft-min-p P` | Inkling-2 `--spec dspark`: a round's drafts stop before the first whose drafter probability is under P, in [0,1); `0` keeps every draft. Only speed changes, never the output | `0.5` |
 | `--dspark-adaptive on\|off` | Inkling-2 `--spec dspark`: each round drafts 1 to `--draft-tokens`, the count recent acceptance and measured round costs favour; `off` drafts `--draft-tokens` every round. Only speed changes | `on` |
 | `--dspark-window auto\|N` | Inkling-2 `--spec dspark` only (refused otherwise, `auto` included): the drafter's global layer attends over the last N context positions (`0`: the whole context; else at least the drafter's sliding window). Only the drafts change, never the output. `auto` keeps the whole context when it fits beside `--max-context` and falls back to 32768, then 16384 | `auto` |
@@ -313,16 +313,18 @@ only when that component is enabled at startup.
 
 `--spec dspark` runs Inkling-2's DSpark block drafter (Inkling-2 artifacts only; the drafter ships in the
 artifact). `--draft-tokens` is optional, 1 through 7, default 3: the most drafts a round verifies.
-Only greedy requests (temperature 0) speculate; sampled requests decode plainly. A greedy request's
-output is the same as without it, token for token, including stop strings, the thinking budget's forced
-close and the context limit. `--dspark-adaptive on` (the default) picks each
+Greedy and sampled requests speculate. The output is the same as without it, token for token, including
+stop strings, the thinking budget's forced close and the context limit; a sampled request draws the
+tokens plain sampling draws under the same seed (its drafts are the drafter's draws under the uniforms
+the target draws next, so they only save forwards). `--dspark-adaptive on` (the default) picks each
 round's draft count from 1 to `--draft-tokens` from the request's recent acceptance and the measured
 round costs, and `--draft-min-p 0.5` (the default; `0` turns it off) drops the drafts from the first
 one the drafter gives under that probability on. A round runs only while its measured cost beats the
 plain steps it replaces; otherwise the request decodes plainly and probes again after 8 to 64 steps.
 Relaxed drafting, `--draft-context-rows`, `--ngram-draft-tokens` and `--adaptive-draft-tokens` are
 refused. Measured on a Tesla V100 over 12 chat requests of 300 tokens (ABBA): 88.8 tok/s greedy with
-the defaults against 81.9 at a fixed 3 drafts (+8.4%); see
+the defaults against 81.9 at a fixed 3 drafts (+8.4%), and 80.5 against 69.7 plain sampled at temperature
+0.8 (+15.5%, the same tokens); see
 [the Inkling-2 notes](maintainer/inkling2-model.md#draft-floor-and-adaptive-width).
 
 ### Choosing a draft count
