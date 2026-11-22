@@ -747,11 +747,12 @@ fused_experts_kernel(BankArgs b, const float* __restrict__ z, std::int64_t zs, c
                 act[static_cast<std::int64_t>(entry) * b.inter + first + lane] = situ(dot * scale, up * scale, gate_cap, up_cap);
             }
         }
-        __syncthreads(); // the block's activations are written
-        if (threadIdx.x == 0) {
-            __threadfence();
-            atomicAdd(sync + 1 + entry, 1);
-        }
+        // Publication: every thread that wrote activations fences its own writes device-wide, then the barrier, then
+        // one increment. A down block that sees the count therefore sees every row of this block (its read side
+        // fences after the spin and reads through the L2).
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) { atomicAdd(sync + 1 + entry, 1); }
     } else {
         const int u = t - gate_items, entry = u / down_groups, group = u % down_groups, e = __ldg(ids + entry);
         const int first = (group * kWarps + warp) * kDownRows, row0 = first < b.hidden ? first : 0;
