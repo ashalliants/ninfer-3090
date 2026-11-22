@@ -109,40 +109,86 @@ Get [NInfer-3090](https://github.com/ashalliants/ninfer-3090) and build it for t
 git clone https://github.com/ashalliants/ninfer-3090 && cd ninfer-3090
 BUILD_DIR=$HOME/build-v100 scripts/v100_build.sh ninfer ninfer-serve
 scripts/download-model.sh inkling2-mini                         # this repository, pinned and verified
-~/build-v100/apps/ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dspark   # DSpark, 3 drafts by default
+~/build-v100/apps/ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dspark   # DSpark, up to 3 drafts a round
 ```
 
 `ninfer-serve` serves the OpenAI chat, Anthropic messages and Responses routes, with streaming, tool
 calls (`parallel_tool_calls` honoured), reasoning and thinking budgets, stop strings, and images with
-`--vision`. DSpark runs for greedy requests and is switched off automatically on text where its drafts
-are not accepted; sampled requests decode plainly. Greedy output with DSpark is identical to plain decode.
+`--vision`. The full 262,144-token context fits with DSpark and vision on.
 
-Prefix reuse is on by default: one device snapshot is kept, a prompt that starts with the same tokens
-and images resumes from it, and the result reports `reused_prompt_tokens`.
+- **DSpark** (`--spec dspark`) speculates on greedy and sampled requests. By default each round drafts 1 to 3
+  tokens, picked from the request's recent acceptance (`--dspark-adaptive on`), and drops drafts the drafter gives
+  under 0.5 probability (`--draft-min-p 0.5`). Greedy output equals plain greedy decode, and a sampled request
+  draws the tokens plain sampling draws under the same seed. Both held on every DSpark request measured below.
+- **Several requests at once:** `--max-concurrency N` (2 to 8) decodes up to N requests together. Each request's
+  tokens are its one-at-a-time tokens. At N > 1 requests decode without DSpark, and `--lora`/`--graft` are refused.
+- **Prefix reuse** is on by default. A prompt that starts with the same tokens and images resumes from a kept
+  device snapshot (one per request slot), and the result reports `reused_prompt_tokens`.
+- **Opt-in uncensoring adapters:** `--lora NAME=DIR` loads the
+  [OpenUncensored](https://huggingface.co/OpenUncensored/Inkling-2-Mini-Uncensored) LoRA and `--graft NAME=FILE`
+  the [satellitedown](https://huggingface.co/satellitedown/Inkling-2-Mini-abliterated-ingine) per-visit ablation.
+  Only a request that names one (`"lora"` or `"graft"`) runs with it. Any other request, and any server that
+  loads none, runs the base model unchanged.
+- **Numerics:** the KV cache is FP16 and prompts of 64 or more tokens prefill on the FP16 tensor cores with FP32
+  accumulation, by default. `--kv-dtype fp32` runs the exact FP32 program and prefill instead (slower; see
+  [Accuracy](#accuracy)).
 
-Not supported yet: more than one request at a time (requests queue), the context store and host cache
-tiers (the server refuses those options), JSON-schema or grammar output, and logprobs.
+Not supported yet: the context store and host cache tiers (the server refuses those options), JSON-schema or
+grammar output, and logprobs.
 
-## Performance (one Tesla V100-PCIE-32GB, 2026-11-21)
+## Performance (one Tesla V100-PCIE-32GB, 2026-11-22)
 
-Measured on a V100 with a 250 W limit over a PCIe Gen3 x4 eGPU link.
+Measured through `ninfer-serve` built from NInfer master `dad1623b`, on a V100 at its 250 W power limit (peak
+draw 236 W) over a PCIe Gen3 x4 eGPU link (OCuLink, 3.3 GB/s), with the default FP16 KV and tensor-core prefill, at the server's default 8,192-token context unless a row says
+otherwise. `gpu_guard.sh` reported no thermal throttle and no power capping in any run used here. Each row gives the best
+clean run first, then the typical range across repeated or ABBA legs.
 
-| | |
-|---|---:|
-| **Load** | 9.1 s |
-| **Decode, plain** | 62-73 tok/s (the spread is GPU clock and thermal state between sessions) |
-| **Decode, DSpark (3 drafts)** | 83 tok/s on average over five chat prompts, 1.28x plain |
-| **Prefill** | ~377 tok/s at a 1K-token prompt |
-| **Image prompt** (234 tokens) | 0.09 s of vision, 0.58 s of prefill |
+| | Best measured | Conditions | Typical range |
+|---|---:|---|---|
+| **Decode, DSpark** | **120.7 tok/s** | maths prompt, greedy, 300 tokens, `--spec dspark` | 114.3-120.7 on maths, 105.5-115.4 on code, 81.2-99.8 on prose and lists |
+| **Decode, DSpark, 12 chats** | **94.4 tok/s** | 12 chat requests of 300 tokens, greedy, mean of each request's tok/s | 93.4-94.4 over four legs, 60.5-60.7% of drafts accepted; plain 78.5-78.8 |
+| **Decode, DSpark, sampled** | **83.5 tok/s** | the same 12 chats at temperature 0.8, top-p 0.95, seeded | 83.4-83.5; plain sampled 74.9 |
+| **Decode, plain** | **78.8 tok/s** | the 12 chats, greedy | 78.2-78.8 |
+| **Batched decode, aggregate** | **198.2 tok/s** | `--max-concurrency 8`, 8 greedy chats of 256 tokens at once, prefill included | 196.8-198.2 at N = 8 (26.4 tok/s each); 170.5 at N = 4, 121.8 at N = 2 |
+| **Prefill** | **1,930 tok/s** | 7,979-token prompt, TTFT 4.1 s, `--max-context 131072` | 1,629 at 1,098 tokens (TTFT 0.67 s), 1,896 at 9,798 (5.2 s), 1,244 at 100,107 (80.5 s); with DSpark and vision on, 1-4% lower (1,900 at 7,979) |
+| **Decode at long context** | **91.2 tok/s** | DSpark, 128 tokens after a 7,979-token prompt (summarize it) | DSpark 84.9-91.2 at 8K and 88.0-89.8 at 10K; plain 71.5 at 8K and 48.1 at 100K (DSpark 47.4-48.0 there) |
+| **Image prompt** | **TTFT 382 ms** | 230-token prompt (llama.cpp's 640 x 488 `test-1.jpeg`, correctly described), vision encode and prefill, `--vision --spec dspark` | 382-425 ms; then 105 tok/s decode |
+| **Load** | **9.2 s** | engine ready, plain server | 9.2-14.2 s over 23 starts; weights read at 1.7-2.5 GiB/s |
+| **Context** | **262,144 tokens** | with DSpark and vision on | |
 
-DSpark by prompt (256 tokens each, plain 65 tok/s): code 121, arithmetic 106, C explanation 77,
-story 70, list 67 tok/s. Drafts per round against speed: 1 draft 73.3, 2 drafts 80.6, **3 drafts 83.3**,
-4 drafts 81.9 tok/s.
+DSpark per prompt type (greedy, 300 tokens, two prompts each, ABBA against plain in one session; the output equals
+plain decode on every request):
+
+| Prompt type | DSpark, best | DSpark, range | Drafts accepted | Plain |
+|---|---:|---:|---:|---:|
+| Maths (arithmetic, equations) | **120.7 tok/s** | 114.3-120.7 | 75-77% | 78.2-78.5 |
+| Code (Python, C) | **115.4 tok/s** | 105.5-115.4 | 68-77% | 78.4-78.5 |
+| List | **99.8 tok/s** | 92.3-99.8 | 56-65% | 78.4-78.6 |
+| Prose (story, description) | **88.2 tok/s** | 81.2-88.2 | 53-57% | 78.5-78.6 |
+
+Over the 12-chat set, DSpark is 1.19x plain greedy (93.4-94.4 against 78.5-78.8 tok/s) and 1.11x plain sampled at
+temperature 0.8 (83.4-83.5 against 74.9). At 100K context on a summary, few rounds pay (10-54 drafts over 128
+tokens), so DSpark mostly takes plain steps and decodes at plain speed.
+
+**Batched decode** (`--max-concurrency N`, plain, outputs identical to one-at-a-time):
+
+| N | Aggregate tok/s | Per request tok/s |
+|---:|---:|---:|
+| 1 | 77.1 | 79.1 |
+| 2 | 121.8 | 63.0 |
+| 4 | 170.5 | 45.6 |
+| 8 | **198.2** | 26.4 |
+
+**Adapters** cost 4-5% of plain decode for the requests that select one (12 chats, greedy, ABBA in one server):
+none 78.8, `"lora"` 75.4, `"graft"` 75.2 tok/s. With DSpark: none 94.1-94.4, `"lora"` 90.8-91.7, `"graft"`
+91.6-92.7 tok/s, and the output equals the adapter's plain output. The adapters take the refusals on the first 20
+prompts of `mlabonne/harmful_behaviors` from 20/20 to 0/20, at a KLD from the base model of 0.014 (LoRA) and 0.017
+(graft).
 
 ## Accuracy
 
 Checked against CPU llama.cpp built from Unsloth's Inkling-2 pull request (`unslothai/llama.cpp` #390 at
-`8aa2f23f`):
+`8aa2f23f`), with the exact FP32 program (FP32 KV and FP32 prefill, now `--kv-dtype fp32`):
 
 - **Text:** the greedy token matches at 58 of 58 checked positions across four prompts. The largest
   per-position KL divergence, 2.2e-2, comes from near-tied expert choices: with the experts forced to
@@ -152,7 +198,14 @@ Checked against CPU llama.cpp built from Unsloth's Inkling-2 pull request (`unsl
   0.7 levels on average, so served answers can diverge from llama.cpp after a few tokens while describing
   the same image.
 - **DSpark:** greedy speculative tokens equal plain greedy tokens on every tested prompt, and its
-  acceptance matches llama.cpp's `draft-dspark` at the same revision.
+  acceptance matches llama.cpp's `draft-dspark` at the same revision. Sampled requests give the same tokens as
+  plain sampling under the same seed (all 12 chats at temperature 0.8, every leg above).
+- **The defaults** (FP16 KV, tensor-core prefill) are not bit-exact with the FP32 program. Teacher-forced over
+  30,840 tokens, FP16 KV gives a KLD mean of 2.7e-3 to 3.7e-3 per position range, with the argmax agreeing at
+  97.1-97.8% of positions. The tensor-core prefill's KLD mean at a 2K prompt is 2.6e-3. Reordering the FP32
+  attention sums alone gives 3.1e-3. Both come from near-tied MoE routing, where a last-bit change flips an expert.
+- **Batched decode:** each request's tokens and logits are bit-identical to its one-at-a-time run (tested at 2, 4
+  and 8 in flight).
 
 ## License and credits
 

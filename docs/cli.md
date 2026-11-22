@@ -322,9 +322,10 @@ round costs, and `--draft-min-p 0.5` (the default; `0` turns it off) drops the d
 one the drafter gives under that probability on. A round runs only while its measured cost beats the
 plain steps it replaces; otherwise the request decodes plainly and probes again after 8 to 64 steps.
 Relaxed drafting, `--draft-context-rows`, `--ngram-draft-tokens` and `--adaptive-draft-tokens` are
-refused. Measured on a Tesla V100 over 12 chat requests of 300 tokens (ABBA): 88.8 tok/s greedy with
-the defaults against 81.9 at a fixed 3 drafts (+8.4%), and 80.5 against 69.7 plain sampled at temperature
-0.8 (+15.5%, the same tokens); see
+refused. With `--max-concurrency` above 1 requests decode without DSpark. Measured on a Tesla V100 (master
+`dad1623b`, 2026-11-22): up to 120.7 tok/s on a maths prompt; over 12 chat requests of 300 tokens (ABBA), 93.4-94.4
+tok/s greedy against 78.5-78.8 plain, and 83.4-83.5 against 74.9 plain sampled at temperature 0.8 (the same tokens).
+The defaults beat a fixed 3 drafts by 8.4% (88.8 against 81.9 tok/s, 2026-11-21); see
 [the Inkling-2 notes](maintainer/inkling2-model.md#draft-floor-and-adaptive-width).
 
 ### Choosing a draft count

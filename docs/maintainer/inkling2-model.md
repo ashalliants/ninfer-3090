@@ -285,7 +285,8 @@ All Ops are naive FP32 kernels qualified against `tests/ops/inkling2_reference.h
 FP32 (8 KiB per token per global visit, twice the FP16 figure above); the KV codec is phase 4.
 Q8_0 experts (UD-Q4_K_XL) are not bound yet. Decode on the V100 runs at 20.6 tokens/s
 (2026-11-20, 15 greedy steps at contexts 6 to 20), against a weight-streaming floor of about 155 tokens/s
-(5.78 GB per token at the nominal 900 GB/s): phase 4 starts from there.
+(5.78 GB per token at the nominal 900 GB/s): phase 4 starts from there. On master `dad1623b` (2026-11-22) plain
+greedy decode through `ninfer-serve` is 78.5-78.8 tokens/s (see "Measured" under "Serving").
 
 ## DSpark drafter ([Ld], `dspark-Inkling-2-Mini-Q8_0.gguf`, `general.architecture = dflash`)
 
@@ -405,6 +406,18 @@ requests, one server per leg, the output md5 the same on every leg and configura
 
 (An earlier ABBA of the same pair: 81.96 / 82.00 against 88.63 / 88.63, +8.1%.)
 
+On master `dad1623b` (2026-11-22, after the expert-major MoE, the fused per-entry experts and the latency-hidden
+decode attention), the same 12 requests, ABBA against a server without `--spec`, the output md5 the same on every leg:
+
+| Server | tok/s | drafts accepted |
+|---|---|---|
+| plain | 78.69 / 78.45 | |
+| **`--spec dspark` (defaults)** | **93.67 / 93.36 (+19.2%)** | 60.6% / 60.7% of 2,947 / 2,915 |
+
+Two more legs of each on the adapter server (no adapter selected) gave 78.83 / 78.78 plain and 94.13 / 94.35 with
+DSpark. By prompt type (two prompts each, 300 tokens, ABBA; plain 78.2-78.6 on all of them): maths 114.3-120.7
+tok/s (75-77% of drafts accepted), code 105.5-115.4 (68-77%), lists 92.3-99.8 (56-65%), prose 81.2-88.2 (53-57%).
+
 Single legs while choosing (the same requests; a leg moves by about 1 tok/s): fixed 3 81.4, min-p 0.1 81.7,
 0.3 83.6, 0.5 86.8, 0.7 87.2; adaptive alone 85.4 and 86.1; adaptive with min-p 0.3 87.0, 0.5 88.4; `--draft-tokens 4`
 and 5 with a fixed width lose (81.9 at min-p 0.5, 84.0 at 0.6), and with the adaptive width 5 ties 3 (88.8 at min-p
@@ -450,8 +463,9 @@ for plain and DSpark at every temperature, on every leg:
 | 0.8, a fixed 3 drafts (one leg) | | 76.08 (+9.1%) | 50.4% |
 | 0.6 (one leg each) | 69.70 | 80.78 (+15.9%) | 57.8% |
 | 1.0 (one leg each) | 69.91 | 79.61 (+13.9%) | 61.7% |
+| 0.8, master `dad1623b` (ABBA, 2026-11-22) | 74.92 / 74.90 | **83.47 / 83.37 (+11.4%)** | 57.6% / 58.3% |
 
-Plain sampled decode is slower than plain greedy (about 70 against 72 tok/s): each token downloads its column's
+Plain sampled decode is slower than plain greedy (about 70 against 72 tok/s; 74.9 against 78.7 on `dad1623b`): each token downloads its column's
 logits and sorts on the host, and so does each verified column.
 
 ## Vision tower (`mmproj-BF16.gguf`, `clip`, projector `inkling2v`)
@@ -616,16 +630,27 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
   - Greedy requests without penalties take their tokens from a device argmax, one per column.
   - Sampled requests speculate too, and sample exactly what plain sampling does under the same seed; see
     "Sampled requests".
-  - Measured (V100, `ninfer_inkling2_engine_dspark_test`, five chat prompts of 256 tokens): plain 65.0,
+  - Measured (V100, 2026-11-21, `ninfer_inkling2_engine_dspark_test`, five chat prompts of 256 tokens, fixed widths): plain 65.0,
     n=1 73.3, n=2 80.6, n=3 83.3, n=4 81.9 tokens/s.
 
-**Measured** on the V100, 2026-11-21:
+**Measured** on the V100 through `ninfer-serve`, master `dad1623b`, 2026-11-22 (250 W limit, peak draw 236 W,
+PCIe Gen3 x4 eGPU, FP16 KV and tensor-core prefill; `gpu_guard.sh` saw no throttle or power capping). Best clean
+run first, then the range over repeated or ABBA legs:
 
-| What | Result |
-|---|---|
-| Load | 9.1 s, with the vision tower |
-| Decode | 71.3 tokens/s greedy, through the Engine |
-| Image prompt, llama.cpp's `test-1.jpeg`, 234 tokens | vision 0.088 s, prefill 0.58 s |
+| What | Best | Range and conditions |
+|---|---|---|
+| Load (engine ready) | 9.2 s | 9.2-14.2 s over 23 starts; weights read at 1.7-2.5 GiB/s |
+| Decode, `--spec dspark` | 120.7 tokens/s | a maths prompt, greedy, 300 tokens; 81.2-120.7 by prompt type (see "Draft floor and adaptive width") |
+| Decode, `--spec dspark`, 12 chats | 94.35 tokens/s | 93.36-94.35 over four legs (greedy, 300 tokens) |
+| Decode, `--spec dspark`, temperature 0.8 | 83.47 tokens/s | 83.37-83.47 (see "Sampled requests") |
+| Decode, plain | 78.83 tokens/s | 78.45-78.83 on the 12 chats; 74.90-74.92 sampled at 0.8 |
+| Prefill (`--max-context 131072`, chunk 2048) | 1,930 tokens/s at 7,979 tokens, TTFT 4.1 s | 1,578-1,629 at 1,098 (TTFT 0.67-0.70 s); 1,895-1,896 at 9,798 (5.2 s); 1,244 at 100,107 (80.5 s). With DSpark and vision on: 1,558-1,621, 1,900, 1,866-1,867 and 1,232 |
+| Decode after a long prompt (128 tokens, summarize) | 91.2 tokens/s, DSpark at 7,979 | DSpark 84.9-91.2 at 7,979, 88.0-89.8 at 9,798, 47.4-47.8 at 100,107; plain 71.5, 70.7 and 48.1 |
+| Batched aggregate | 198.2 tokens/s at `--max-concurrency 8` | see "Batched decode" |
+| Image prompt, llama.cpp's `test-1.jpeg` (640 x 488), 230 tokens | TTFT 382 ms (vision and prefill) | 382-425 ms over three requests; decode 105 tokens/s with DSpark |
+
+As first published (2026-11-21): load 9.1 s, decode 71.3
+tokens/s through the Engine, and the same image at 234 tokens in 0.088 s of vision and 0.58 s of prefill.
 
 - `ninfer_inkling2_frontend_test` checks that a text turn and the image turn tokenize to llama.cpp's own
   prompt ids.
@@ -717,7 +742,8 @@ in the FP32 program (`ninfer_inkling2_adapters_test` with `NINFER_INKLING2_KLD_T
 | Top-1 agreement with base | 1 | 0.969 | 0.962 |
 | Math (4, low effort) | 4/4 | 4/4 | 4/4 |
 | Python tasks (2, tests run) | 2/2 | 2/2 | 2/2 |
-| Output tok/s, plain (`--spec dspark`) | 71.7 (77.1) | 68.9 (68.1) | 68.9 (67.8) |
+| Output tok/s, plain (`--spec dspark`), 2026-11-21 | 71.7 (77.1) | 68.9 (68.1) | 68.9 (67.8) |
+| Output tok/s, plain (`--spec dspark`), master `dad1623b` | 78.83 / 78.78 (94.13 / 94.35) | 75.43 / 75.39 (91.65 / 90.84) | 75.15 / 75.15 (92.71 / 91.56) |
 
 ## Dense 8-bit re-encoding
 
@@ -1032,9 +1058,9 @@ Sizes are rough engineer-days for a person or agent who knows the codebase, incl
 | 1. Golden (done) | CPU llama.cpp (Unsloth SHA above) on UD-Q8_K_XL: logits and per-visit activations for four prompts; the NumPy reference on the real weights against them (see "Validation") | -- |
 | 2. Converter | `inkling2_gguf` recipe writes the artifact: C++ format registry for `ggml_nvfp4` and the new records, per-expert scales, padded vocab, tokenizer and chat resources. Reader test on the real file | 2-3 |
 | 3. Text MVP, correctness first (done, see "Engine") | Model, config and binding. Program with the 48-visit schedule. New Ops with naive FP32 kernels qualified against the oracles: rel-bias sink attention (decode and prefill), conv streams, MIX, CTRL, clips, sigmoid router, resident NVFP4/Q8_0/BF16 MoE. Linear problem registrations. Tokenizer matcher. Greedy text equals the golden. Done except Q8_0 experts and the Linear registrations (the MVP uses `projection_fp32`), which move to phase 4 | 8-12 |
-| 4. V100 decode performance | Fused decode kernels (MIX, CTRL, conv and norms), expert GEMV for NVFP4 via dp4a, global attention on FP16 KV, CUDA Graph per decode width; measure against the bandwidth floor | 5-8 |
-| 5. Prefill | cuBLAS HMMA for the dense and expert GEMMs (dequantize tiles to FP16), flash prefill with the relative bias and sink (extend the vendored `fattn` like [L]'s banded op) | 4-6 |
-| 6. DSpark (done, greedy, correctness first) | Drafter binding, tap capture at visits 5/23/41/48, Markov chain with the precomputed `W_head Wo`, verify of the full block (8) with `keep()` | 4-6 |
+| 4. V100 decode performance (in progress; done so far: decode graphs, split and latency-hidden attention, FP16 rings, fused per-entry and expert-major experts, batched decode; 78.8 tok/s plain serve) | Fused decode kernels (MIX, CTRL, conv and norms), expert GEMV for NVFP4 via dp4a, global attention on FP16 KV, CUDA Graph per decode width; measure against the bandwidth floor | 5-8 |
+| 5. Prefill (done: [Tensor-core prefill](#tensor-core-prefill), 1,930 tok/s at 8K) | cuBLAS HMMA for the dense and expert GEMMs (dequantize tiles to FP16), flash prefill with the relative bias and sink (extend the vendored `fattn` like [L]'s banded op) | 4-6 |
+| 6. DSpark (done, greedy and sampled, adaptive width) | Drafter binding, tap capture at visits 5/23/41/48, Markov chain with the precomputed `W_head Wo`, verify of the full block (8) with `keep()` | 4-6 |
 | 7. Vision (done, correctness first) | mmproj conversion and the ViT (see "Vision tower") | 4-6 |
 | 8. Chat/serving (MVP done) | template, reasoning and tool parsers, effort control (see "Serving") | 2-3 |
 
@@ -1270,14 +1296,16 @@ found by halving, never below `fit_context_floor` (the startup fails when the fl
 `/v1/models` follow it. `kv_capacity` reports N x the context per slot.
 
 
-Measured on the V100 (32 GB, sm_70), Q8 artifact, FP16 rings:
+Measured on the V100 (32 GB, sm_70), Q8 artifact, FP16 rings. The `dad1623b` columns are master `dad1623b`
+(2026-11-22, two runs each, the output of every request the same at every N); the columns marked "at the PR" are this
+section's earlier measurement:
 
-| N (`--max-concurrency`) | aggregate tok/s (serve) | per request tok/s | step bench, aggregate |
-|---|---|---|---|
-| 1 | 71.3 | 72.9 | 67.7 |
-| 2 | 113.5 | 58.4 | 113.6 |
-| 4 | 169.0 | 44.1 | 176.5 |
-| 8 | 169.8 | 22.1 | 198.6 |
+| N (`--max-concurrency`) | aggregate tok/s (serve, at the PR) | aggregate tok/s (serve, `dad1623b`) | per request tok/s (`dad1623b`) | step bench, aggregate (at the PR) |
+|---|---|---|---|---|
+| 1 | 71.3 | 77.1 / 77.1 | 79.1 | 67.7 |
+| 2 | 113.5 | 121.7 / 121.8 | 63.0 | 113.6 |
+| 4 | 169.0 | 169.1 / 170.5 | 45.6 | 176.5 |
+| 8 | 169.8 | **196.8 / 198.2** | 26.4 | 198.6 |
 
 - Serve: `ninfer-serve --max-concurrency N` at 8,192 context, N concurrent greedy chat requests of 256 tokens with
   different prompts. Aggregate is all completion tokens over the wall time, prefill included; per request is the

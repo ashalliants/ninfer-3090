@@ -44,8 +44,9 @@ Qwen3.8-27B and Qwen3.8-Flash-Next too, and is the first home of **Inkling-2-Min
 > run, but they are not targets: no tuning, no published numbers, no guarantees.
 
 > **New: Inkling-2-Mini** (Thinking Machines, 2026-11-20), a 26B-total looped MoE (5.4B active per token) with
-> 128 experts, now runs on one Tesla V100 with images and its own DSpark speculative drafter, served
-> over the same OpenAI and Anthropic APIs. See [Inkling-2-Mini](#inkling-2-mini-new-v100).
+> 128 experts, now runs on one Tesla V100 with images, its full 262,144-token context and its own DSpark
+> speculative drafter (up to 120.7 tok/s), served to up to 8 requests at once over the same OpenAI and
+> Anthropic APIs. See [Inkling-2-Mini](#inkling-2-mini-new-v100).
 
 ### Performance by model and card
 
@@ -60,11 +61,11 @@ Decode is one stream unless the column says otherwise.
 | Qwen3.8-Flash-Next (preview, Windows) | RTX 3090 | 32K default | 2,345-2,422 tok/s at 4K-128K | 108-113 tok/s (MTP), 78-81 plain | |
 | **Qwen3.8-27B** | Tesla V100 32 GB | 262,144 | ~1,020 tok/s at 4.4K | 76-86 tok/s (MTP3) | 79 tok/s at C2 (MTP3) |
 | Qwen3.8-Flash-Next | Tesla V100 32 GB | 262,144 | ~990 tok/s at 3.8K | 72-96 tok/s (MTP3), flat from 10K to 221K context | |
-| **Inkling-2-Mini** (new) | Tesla V100 32 GB | set by `--max-context` | ~377 tok/s at 1K | 65-73 tok/s plain, **83 tok/s average with DSpark** (67-121 by prompt) | one request at a time |
+| **Inkling-2-Mini** (new) | Tesla V100 32 GB | **262,144** with DSpark and vision | **1,930 tok/s** at 8K (1,629 at 1K, 1,244 at 100K) | **120.7 tok/s** (DSpark, maths); 93-94 average over 12 chats, 78.8 plain | **198 tok/s** at C8 (plain) |
 
 RTX 3090 rows use the Linux launcher defaults (`rk4v4` KV) unless marked Windows. The V100 was
 measured over a 3.3 GB/s eGPU link (PCIe Gen3 x4) on a 59 GiB host: Qwen rows on 2026-11-18 (the
-two-lane figure 2026-11-20), Inkling-2-Mini on 2026-11-21. A blank cell has not been measured.
+two-lane figure 2026-11-20), Inkling-2-Mini on 2026-11-22 (master `dad1623b`, 250 W limit). A blank cell has not been measured.
 Full methods: [RTX 3090 benchmarks](#performance-on-an-rtx-3090), [V100 guide](docs/tesla-v100.md),
 [Inkling-2-Mini spec](docs/maintainer/inkling2-model.md).
 
@@ -556,7 +557,7 @@ a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding wor
 | Qwen3.6-35B-A3B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/ee4495803bc4f8015b8a7e22d4cf9b67de8e27c6) | 21.23 GiB | Carries the DFlash bundle for `--spec dflash` |
 | Qwen3.6-27B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-27B-NInfer/tree/3e3d9a3951c452c1ca80bd7a2860c7f3bfc5a829) | 16.29 GiB | Supported with more runtime headroom |
 | Qwen3.8-Flash-Next (preview) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090/tree/c7dfb9694fc3cb3d40298afbfe2e3a8c172241fa) | 38.20 GiB in two files + 27.13 GiB n-gram volume | Windows, one request at a time (two lanes opt-in), 64 GB RAM. This fork's [exact conversion](model-cards/Qwen3.8-Flash-Next-NInfer-3090/README.md) of the GSQ-RCO IQ2_XS GGUF with the MTP drafter and vision tower. Keep the n-gram volume on NVMe |
-| **Inkling-2-Mini** (new, V100) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Inkling-2-Mini-NInfer-V100/tree/e348ad671599db1db110447b9d9ebfb898070f67) | 22.27 GiB with DSpark and vision | Tesla V100 32 GB, Linux, one request at a time. This fork's [exact conversion](model-cards/Inkling-2-Mini-NInfer-V100/README.md) of Unsloth's UD-Q8_K_XL GGUF: lossless, unpacking the expert records reproduces every source tensor byte for byte. See [Inkling-2-Mini](#inkling-2-mini-new-v100) |
+| **Inkling-2-Mini** (new, V100) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Inkling-2-Mini-NInfer-V100/tree/e348ad671599db1db110447b9d9ebfb898070f67) | 22.27 GiB with DSpark and vision | Tesla V100 32 GB, Linux, up to 8 requests at once. This fork's [exact conversion](model-cards/Inkling-2-Mini-NInfer-V100/README.md) of Unsloth's UD-Q8_K_XL GGUF: lossless, unpacking the expert records reproduces every source tensor byte for byte. See [Inkling-2-Mini](#inkling-2-mini-new-v100) |
 | Qwen3.8-Flash-Next, UD-IQ3_XXS (preview) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090/tree/196f11834dfe4fc21342f0255bcee034a5120ae7) | 53.17 GiB in two files + the 27.13 GiB n-gram volume of the row above | Windows, one request at a time, 64 GB RAM (about 42 GiB available), text only. This fork's [conversion](model-cards/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090/README.md) of Unsloth's Dynamic v3.1 UD-IQ3_XXS GGUF with the MTP drafter: lower perplexity than the row above, about half the speed |
 
 `download-model qwen38-27b`, `bonsai2-27b`, `qwen36-35b-a3b` or `qwen36-27b` (`.bat` on Windows, `.sh` on Linux; `inkling2-mini` with `.sh` only)
@@ -597,18 +598,27 @@ relative attention bias instead of RoPE. It takes text and images; it has no vid
 
 On one Tesla V100 32 GB, `ninfer-serve` serves it over the OpenAI chat, Anthropic messages and
 Responses routes, with streaming, tool calls, reasoning and thinking budgets, and images with
-`--vision`. Its own trained block drafter, DSpark, runs greedy speculative decoding
-(`--spec dspark`) with output identical to plain decode.
+`--vision`. Its own trained block drafter, DSpark, speculates on greedy and sampled requests
+(`--spec dspark`); greedy output is plain decoding's, and a sampled request draws plain sampling's tokens
+under the same seed. Measured through `ninfer-serve` on master `dad1623b` (2026-11-22, 250 W limit, PCIe
+Gen3 x4 eGPU):
 
-- **Decode:** 65-73 tok/s plain; with DSpark at 3 drafts, 83 tok/s on average over five chat
-  prompts (code 121, arithmetic 106, explanation 77, story 70, list 67), never slower than plain.
-- **Prefill:** ~377 tok/s at 1K tokens. A 234-token image prompt takes 0.09 s of vision and 0.58 s of prefill.
-- **Accuracy:** greedy text matches CPU llama.cpp (Unsloth's PR at the same revision) on 58 of 58
-  checked positions, and image prompts on 48 of 48 tokens from identical pixels.
-- **Prefix reuse:** on by default. One device snapshot is kept, and a prompt that starts with the same
-  tokens and images resumes from it; the result reports `reused_prompt_tokens`.
-- **Not yet:** more than one lane (requests queue), the context store and host cache tiers, JSON-schema
-  output and logprobs. Not measured on an RTX 3090.
+- **Decode:** up to **120.7 tok/s** with DSpark (a maths prompt; code 115.4, lists 99.8, prose 88.2), and
+  93.4-94.4 tok/s on average over 12 chat requests against 78.5-78.8 plain. Sampled at temperature 0.8,
+  83.5 against 74.9 plain.
+- **Prefill:** up to 1,930 tok/s (a 7,979-token prompt, TTFT 4.1 s); 1,629 tok/s at 1K (TTFT 0.67 s) and
+  1,244 at 100K (TTFT 80.5 s). A 230-token image prompt answers its first token in 382 ms.
+- **Context:** the full 262,144 tokens with DSpark and vision on. Decode at 100K context runs at 48 tok/s.
+- **Several requests:** `--max-concurrency` up to 8, **198.2 tok/s** aggregate at 8 (121.8 at 2, 170.5 at 4),
+  each request's tokens the same as alone. Requests at N > 1 decode without DSpark.
+- **Adapters:** two opt-in uncensoring adapters (`--lora`, `--graft`, selected per request) take the refusals
+  on 20 harmful prompts from 20/20 to 0/20 at 4-5% of decode speed. Other requests run the base model unchanged.
+- **Accuracy:** with the exact FP32 program (`--kv-dtype fp32`), greedy text matches CPU llama.cpp (Unsloth's
+  PR at the same revision) on 58 of 58 checked positions, and image prompts on 48 of 48 tokens from identical
+  pixels. The defaults (FP16 KV, tensor-core prefill) differ from it by about as much as reordering FP32 sums.
+- **Prefix reuse:** on by default; a prompt that starts with the same tokens and images resumes from a kept
+  snapshot, and the result reports `reused_prompt_tokens`.
+- **Not yet:** the context store and host cache tiers, JSON-schema output and logprobs. Not measured on an RTX 3090.
 
 ```bash
 scripts/download-model.sh inkling2-mini      # WarlaxZ/Inkling-2-Mini-NInfer-V100, 22.3 GiB, pinned and verified
