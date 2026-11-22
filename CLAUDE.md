@@ -22,8 +22,9 @@ Update every place the old figure appears; grep for it rather than trusting this
 
 How to report the numbers:
 
-- Lead with the best clean run you measured: correct output, no thermal throttle (`gpu_guard.sh`
-  says so), the fastest valid settings. State its conditions (prompt type, context, flags, power
+- Lead with the best clean run you measured: correct output, the fastest valid settings, and no
+  thermal throttling during the run (sample `nvidia-smi --query-gpu=clocks_throttle_reasons.active
+  --format=csv` while it runs; discard a run that shows thermal slowdown). State its conditions (prompt type, context, flags, power
   limit), and give the typical range or session spread second.
 - Every figure is a real measurement on that card at the claimed scope (serve-level for tok/s
   claims). Never extrapolate, round up, or carry a number across cards or builds.
