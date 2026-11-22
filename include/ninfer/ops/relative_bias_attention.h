@@ -5,6 +5,7 @@
 // per-query profile, and a learned sink logit, over a per-layer-visit KV ring. Columns follow fp32_rows.h.
 
 #include "core/tensor.h"
+#include "ninfer/ops/column_sequences.h"
 
 #include <cuda_runtime.h>
 
@@ -70,7 +71,9 @@ inline constexpr int kHeadNormMaxJobs = 4;
  * Op: head_norms_fp32: 1 to kHeadNormMaxJobs of the two head Ops above in one launch, each job's result
  * the same bits as its own call. Every job has the same T; the jobs' tensors must not overlap.
  */
-void head_norms_fp32(std::span<const HeadNormJob> jobs, cudaStream_t stream);
+void head_norms_fp32(std::span<const HeadNormJob> jobs, cudaStream_t stream, const ColumnSequences* columns = nullptr);
+// With `columns` (batched decode): column t's log scale is tau(positions[t]) and its append goes to slot
+// positions[t] mod capacity of the job's cache plus slots[t] * slot_stride bytes (the starts and offsets are not read).
 
 struct RelativeBiasAttentionShape {
     int heads = 0, kv_heads = 0, head_dim = 0, d_rel = 0;
@@ -129,7 +132,13 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& shape, const
                                   Tensor& k_cache, Tensor& v_cache, std::int64_t start,
                                   const std::int64_t* start_offset, const Tensor* gate, Tensor& out, cudaStream_t stream,
                                   const Tensor* split_workspace = nullptr, std::int32_t* split_counters = nullptr,
-                                  bool tiled = false);
+                                  bool tiled = false, const ColumnSequences* columns = nullptr);
+// columns (batched decode, at most kSplitMaxColumns columns, k_new and v_new null, not tiled): column t sits at
+// positions[t] (start and start_offset are not read) and reads the rings at their addresses plus slots[t] * slot_stride
+// bytes; each ring must hold what its column can see (the caller's bound). With a split workspace each column splits
+// exactly when a one-column call at its position would (when it sees more than kSplitMinKeys keys: min(position + 1,
+// window, capacity) > kSplitMinKeys) and otherwise runs the single block, so every column has the bits of its own
+// one-column call. The split workspace is sized for the ring: relative_bias_attention_split_bytes(shape, T, capacity).
 // tiled (not bit-exact): a call of more than kSplitMaxColumns columns takes a wide route. Over FP16 rings with a group of 3
 // and d_rel <= 16 it is one-pass flash attention on the FP16 tensor cores (FP32 accumulation; a block takes 32 columns
 // by the 3 heads of a KV group); otherwise key tiles staged in shared memory fold into 16 columns per block (FP32, the

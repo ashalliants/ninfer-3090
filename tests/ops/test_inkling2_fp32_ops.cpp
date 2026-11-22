@@ -577,6 +577,129 @@ void test_head_norm_append() {
     std::printf("head_norms_fp32 with a KvAppend: the plain call's bits, in the wrapped ring slots too\n");
 }
 
+// Batched decode (ops::ColumnSequences): column t of one call at its own position over its own slot's state has the
+// bits of a one-column call at that position over that state, for the short convolution (static and dynamic, with
+// the residual sum), head_norms_fp32's log scale and append, and the attention over FP16 rings, global and windowed,
+// with columns on both sides of the split threshold (kSplitMinKeys). The columns map to the slots out of order.
+void test_column_sequences() {
+    namespace o = ninfer::ops;
+    constexpr int kB = 3;
+    const std::int32_t slot_of[kB] = {2, 0, 1};
+    ninfer::DeviceBuffer dslots(sizeof slot_of), dpos(kB * sizeof(std::int64_t));
+    check(cudaMemcpy(dslots.p, slot_of, sizeof slot_of, cudaMemcpyHostToDevice) == cudaSuccess, "slots upload");
+    // Short convolution: histories [C, K - 1] per slot, one after another.
+    for (const bool dynamic : {false, true}) {
+        const int channels = 1024, k = 4, head = 128, heads = channels / head;
+        const std::size_t hist = std::size_t(channels) * (k - 1);
+        auto x = randoms(channels * kB), taps = randoms(channels * k, -0.5F, 0.5F), dyn = randoms(heads * k * kB, -0.5F, 0.5F),
+             res = randoms(channels * kB), histories = randoms(hist * kB);
+        Buf dx(x), dt(taps), dd(dyn), dr(res), batched(histories), alone(histories), out_b(std::size_t(channels) * kB),
+            sum_b(std::size_t(channels) * kB), out_a(std::size_t(channels) * kB), sum_a(std::size_t(channels) * kB);
+        const Tensor tt = dt.tensor({k, channels});
+        {
+            Tensor tx = dx.tensor({channels, kB}), tdyn = dd.tensor({heads * k, kB}), th = batched.tensor({channels, k - 1});
+            Tensor to = out_b.tensor({channels, kB}), tr = dr.tensor({channels, kB}), ts = sum_b.tensor({channels, kB});
+            o::ShortConvJob job;
+            job.x = &tx, job.taps = &tt, job.dynamic = dynamic ? &tdyn : nullptr, job.history = &th, job.out = &to, job.residual = &tr, job.sum = &ts;
+            const o::ColumnSequences cs{nullptr, static_cast<const std::int32_t*>(dslots.p), static_cast<std::int64_t>(hist * 4)};
+            o::short_conv_fp32_batch(std::span<const o::ShortConvJob>(&job, 1), head, nullptr, &cs);
+        }
+        for (int i = 0; i < kB; ++i) {
+            Tensor tx = dx.tensor({channels, kB}).slice(1, i, 1), tdyn = dd.tensor({heads * k, kB}).slice(1, i, 1);
+            Tensor th(static_cast<float*>(alone.b.p) + hist * slot_of[i], DType::FP32, {channels, k - 1});
+            Tensor to = out_a.tensor({channels, kB}).slice(1, i, 1), tr = dr.tensor({channels, kB}).slice(1, i, 1),
+                   ts = sum_a.tensor({channels, kB}).slice(1, i, 1);
+            o::ShortConvJob job;
+            job.x = &tx, job.taps = &tt, job.dynamic = dynamic ? &tdyn : nullptr, job.history = &th, job.out = &to, job.residual = &tr, job.sum = &ts;
+            o::short_conv_fp32_batch(std::span<const o::ShortConvJob>(&job, 1), head, nullptr);
+        }
+        check(same_bits(out_b.get(channels * kB), out_a.get(channels * kB)) && same_bits(sum_b.get(channels * kB), sum_a.get(channels * kB)) &&
+                  same_bits(batched.get(hist * kB), alone.get(hist * kB)),
+              std::string("short_conv_fp32_batch with columns ") + (dynamic ? "(dynamic)" : "(static)") + " differs from one-column calls");
+    }
+    // Head norms and attention over FP16 rings, slot s's K ring then V ring at s * stride.
+    const int heads = 24, kvh = 8, d = 128, rel = 16, qw = heads * d, kvw = kvh * d, extent = 1024;
+    for (const int window : {0, 1024}) {
+        const int capacity = window > 0 ? window - 1 + 8 : 1400;
+        const std::int64_t positions[kB] = {window > 0 ? 1500 : 100, window > 0 ? 300 : 600, window > 0 ? 700 : 1300};
+        check(cudaMemcpy(dpos.p, positions, sizeof positions, cudaMemcpyHostToDevice) == cudaSuccess, "positions upload");
+        const std::size_t ring = std::size_t(kvw) * capacity; // halves
+        const std::int64_t stride = static_cast<std::int64_t>(2 * ring * 2);
+        std::vector<__half> rings(2 * ring * kB);
+        for (auto& h : rings) { h = __float2half(uniform()); }
+        ninfer::DeviceBuffer rb(rings.size() * 2), ra(rings.size() * 2);
+        check(cudaMemcpy(rb.p, rings.data(), rb.bytes, cudaMemcpyHostToDevice) == cudaSuccess &&
+                  cudaMemcpy(ra.p, rings.data(), ra.bytes, cudaMemcpyHostToDevice) == cudaSuccess,
+              "ring upload");
+        const auto ring_at = [&](ninfer::DeviceBuffer& b, int slot, bool values) {
+            return Tensor(static_cast<char*>(b.p) + slot * stride + (values ? ring * 2 : 0), DType::FP16, {kvw, capacity});
+        };
+        const o::ColumnSequences cs{static_cast<const std::int64_t*>(dpos.p), static_cast<const std::int32_t*>(dslots.p), stride};
+        // The new keys and values: a clip with the log scale on q, unit rms with the append on the values, a clip with
+        // the append on the keys.
+        auto qv = randoms(qw * kB, -2, 2), kv = randoms(kvw * kB, -2, 2), vv = randoms(kvw * kB, -2, 2), qclip = randoms(qw, 0.5F, 1.5F);
+        Buf qb(qv), qa(qv), kb(kv), ka(kv), vb(vv), va(vv), dqc(qclip);
+        const Tensor tqc = dqc.tensor({d, heads});
+        const auto norms = [&](Tensor& q, Tensor& k, Tensor& v, Tensor& kr, Tensor& vr, std::int64_t start, const o::ColumnSequences* columns) {
+            const o::PositionLogScale tau{start, 128, 0.1F, nullptr};
+            const o::KvAppend ka_{&kr, start, nullptr}, va_{&vr, start, nullptr};
+            o::HeadNormJob jobs[3];
+            jobs[0].x = &q, jobs[0].head_dim = d, jobs[0].scale = &tqc, jobs[0].threshold = 3.0F, jobs[0].log_scale = &tau;
+            jobs[1].x = &k, jobs[1].head_dim = d, jobs[1].threshold = 3.0F, jobs[1].append = &ka_;
+            jobs[2].x = &v, jobs[2].head_dim = d, jobs[2].unit_rms = true, jobs[2].eps = 1e-6F, jobs[2].append = &va_;
+            o::head_norms_fp32(jobs, nullptr, columns);
+        };
+        {
+            Tensor q = qb.tensor({qw, kB}), k = kb.tensor({kvw, kB}), v = vb.tensor({kvw, kB}), kr = ring_at(rb, 0, false), vr = ring_at(rb, 0, true);
+            norms(q, k, v, kr, vr, 0, &cs);
+        }
+        for (int i = 0; i < kB; ++i) {
+            Tensor q = qa.tensor({qw, kB}).slice(1, i, 1), k = ka.tensor({kvw, kB}).slice(1, i, 1), v = va.tensor({kvw, kB}).slice(1, i, 1);
+            Tensor kr = ring_at(ra, slot_of[i], false), vr = ring_at(ra, slot_of[i], true);
+            norms(q, k, v, kr, vr, positions[i], nullptr);
+        }
+        std::vector<__half> got_b(rings.size()), got_a(rings.size());
+        check(cudaMemcpy(got_b.data(), rb.p, rb.bytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                  cudaMemcpy(got_a.data(), ra.p, ra.bytes, cudaMemcpyDeviceToHost) == cudaSuccess,
+              "ring download");
+        check(same_bits(qb.get(qw * kB), qa.get(qw * kB)) && same_bits(kb.get(kvw * kB), ka.get(kvw * kB)) &&
+                  same_bits(vb.get(kvw * kB), va.get(kvw * kB)) && std::memcmp(got_b.data(), got_a.data(), rb.bytes) == 0,
+              "head_norms_fp32 with columns (window " + std::to_string(window) + ") differs from one-column calls");
+        // The attention, gated into BF16, with the split workspace.
+        auto r = randoms(heads * rel * kB), sink = randoms(heads * kB, -2, 2), gate = randoms(qw * kB, -3, 3), table = randoms(extent * rel, -0.5, 0.5);
+        Buf dr(r), ds(sink), dg(gate), dt(table);
+        const o::RelativeBiasAttentionShape shape{heads, kvh, d, rel, window};
+        const std::size_t split_bytes = o::relative_bias_attention_split_bytes(shape, kB, capacity);
+        Buf ws(split_bytes / 4);
+        const Tensor tws = ws.tensor({static_cast<std::int32_t>(split_bytes / 4)});
+        ninfer::DeviceBuffer counters(std::size_t(o::kSplitMaxColumns) * heads * 4), outb(std::size_t(qw) * kB * 2), outa(std::size_t(qw) * kB * 2);
+        counters.fill(0);
+        {
+            Tensor out(outb.p, DType::BF16, {qw, kB}), kr = ring_at(rb, 0, false), vr = ring_at(rb, 0, true);
+            const Tensor g = dg.tensor({qw, kB});
+            o::relative_bias_sink_attention(shape, qb.tensor({qw, kB}), dr.tensor({heads * rel, kB}), ds.tensor({heads, kB}), nullptr, nullptr,
+                                            dt.tensor({rel, extent}), kr, vr, 0, nullptr, &g, out, nullptr, &tws,
+                                            static_cast<std::int32_t*>(counters.p), false, &cs);
+        }
+        for (int i = 0; i < kB; ++i) {
+            Tensor out = Tensor(outa.p, DType::BF16, {qw, kB}).slice(1, i, 1), kr = ring_at(ra, slot_of[i], false), vr = ring_at(ra, slot_of[i], true);
+            const Tensor g = dg.tensor({qw, kB}).slice(1, i, 1);
+            o::relative_bias_sink_attention(shape, qa.tensor({qw, kB}).slice(1, i, 1), dr.tensor({heads * rel, kB}).slice(1, i, 1),
+                                            ds.tensor({heads, kB}).slice(1, i, 1), nullptr, nullptr, dt.tensor({rel, extent}), kr, vr,
+                                            positions[i], nullptr, &g, out, nullptr, &tws, static_cast<std::int32_t*>(counters.p));
+        }
+        std::vector<std::uint16_t> ob(std::size_t(qw) * kB), oa(ob.size());
+        check(cudaMemcpy(ob.data(), outb.p, ob.size() * 2, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                  cudaMemcpy(oa.data(), outa.p, oa.size() * 2, cudaMemcpyDeviceToHost) == cudaSuccess,
+              "attention download");
+        check(ob == oa, "relative_bias_sink_attention with columns (window " + std::to_string(window) + ") differs from one-column calls");
+        std::vector<std::int32_t> left(std::size_t(o::kSplitMaxColumns) * heads);
+        counters.copy_to_host(left.data(), left.size() * 4);
+        check(std::all_of(left.begin(), left.end(), [](std::int32_t c) { return c == 0; }), "column attention: the split counters are not left zero");
+    }
+    std::printf("ColumnSequences (conv, head norms, attention global and windowed): the bits of one-column calls\n");
+}
+
 // The FP16 KV rings (opt-in, lossy). head_norms_fp32 with a KvAppend into an FP16 ring: x the plain call's bits and
 // the slots hold those columns rounded to nearest. relative_bias_sink_attention over FP16 rings of n positions: the FP64
 // oracle over the decoded keys and values.
@@ -1506,6 +1629,7 @@ int main() {
         test_attention(0, 64, 200, 1, "attention global, 200 keys with the split workspace: the single block (last 8)", true, 192, true);
         test_head_norm_append();
         test_kv_fp16();
+        test_column_sequences();
         test_projection_inputs();
         test_route();
         test_experts(true, 128, 64, 3, "moe_situ_experts NVFP4 small");

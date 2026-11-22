@@ -124,6 +124,7 @@ ProgramLimits checked(ProgramLimits limits) {
     if (limits.max_rollback < 0 || limits.max_rollback > limits.max_chunk) {
         throw std::invalid_argument("inkling2: max_rollback must be in 0..max_chunk");
     }
+    if (limits.slots < 1) { throw std::invalid_argument("inkling2: a Program holds at least one slot"); }
     return limits;
 }
 
@@ -133,28 +134,33 @@ TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t 
     : model_(model), config_(model.config()), limits_(limits), stream_(stream),
       workspace_(std::max(limits.min_workspace_bytes,
                           workspace_bytes(model.config(), checked(limits).max_chunk, limits.max_context, limits.split_attention,
-                                          limits.last_logits ? std::max(1, limits.max_rollback) : limits.max_chunk, limits.prefill_tc,
+                                          std::max(limits.last_logits ? std::max(1, limits.max_rollback) : limits.max_chunk,
+                                                   limits.slots > 1 ? std::min(kMaxBatchColumns, limits.max_chunk) : 0),
+                                          limits.prefill_tc,
                                           widest_expert_format(model), limits.dense))) {
     const TextConfig& c = config_;
     const std::size_t kv = std::size_t(c.kv_heads) * c.head_dim, taps = c.conv_kernel_size - 1;
     const std::size_t local_cap = c.sliding_window - 1 + static_cast<std::size_t>(limits.max_chunk);
     const DType ring = limits.kv_fp16 ? DType::FP16 : DType::FP32; // the KV rings' values
     const std::size_t ring_bytes = dtype_size(ring);
-    std::size_t total = 0;
+    // One slot's state (its rings and histories), then the one copy of the rollback state and taps.
+    std::size_t per_slot = 0, shared = 0;
     std::vector<std::size_t> capacity(c.num_layer_visits);
     for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
         capacity[v] = c.local[c.physical(v)] ? local_cap : static_cast<std::size_t>(limits.max_context);
-        total += 2 * padded(kv * capacity[v] * ring_bytes) + 2 * padded(kv * taps * 4) + 2 * padded(std::size_t(c.hidden_size) * taps * 4);
+        per_slot += 2 * padded(kv * capacity[v] * ring_bytes) + 2 * padded(kv * taps * 4) + 2 * padded(std::size_t(c.hidden_size) * taps * 4);
         if (limits.max_rollback > 0) {
             const std::size_t saved = taps + static_cast<std::size_t>(limits.max_rollback);
-            total += 2 * padded(kv * saved * 4) + 2 * padded(std::size_t(c.hidden_size) * saved * 4);
+            shared += 2 * padded(kv * saved * 4) + 2 * padded(std::size_t(c.hidden_size) * saved * 4);
         }
     }
     for (const auto tap : limits.tap_visits) {
         if (tap > c.num_layer_visits) { throw std::invalid_argument("inkling2: a tap visit past the final state"); }
-        total += padded(std::size_t(c.hidden_size) * static_cast<std::size_t>(limits.max_chunk) * 4);
+        shared += padded(std::size_t(c.hidden_size) * static_cast<std::size_t>(limits.max_chunk) * 4);
     }
-    state_memory_ = DeviceBuffer(total);
+    const auto slots = static_cast<std::size_t>(limits.slots);
+    slot_stride_     = static_cast<std::int64_t>(per_slot);
+    state_memory_    = DeviceBuffer(per_slot * slots + shared);
     if (limits.split_attention) {
         split_counters_ = DeviceBuffer(std::size_t(ops::kSplitMaxColumns) * c.heads * 4);
         split_counters_.fill(0);
@@ -166,29 +172,57 @@ TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t 
         offset += padded(t.bytes());
         return t;
     };
-    for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
-        VisitState s;
-        s.k_cache   = carve(i32(kv), i32(capacity[v]), ring);
-        s.v_cache   = carve(i32(kv), i32(capacity[v]), ring);
-        s.k_hist    = carve(i32(kv), i32(taps));
-        s.v_hist    = carve(i32(kv), i32(taps));
-        s.attn_hist = carve(i32(c.hidden_size), i32(taps));
-        s.mlp_hist  = carve(i32(c.hidden_size), i32(taps));
-        if (limits.max_rollback > 0) {
-            const std::int32_t saved = i32(taps) + limits.max_rollback;
-            s.k_saved    = carve(i32(kv), saved);
-            s.v_saved    = carve(i32(kv), saved);
-            s.attn_saved = carve(i32(c.hidden_size), saved);
-            s.mlp_saved  = carve(i32(c.hidden_size), saved);
+    for (std::size_t slot = 0; slot < slots; ++slot) {
+        offset = slot * per_slot; // every slot's tensors in the same order: slot s's at slot_stride_ * s from slot 0's
+        for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
+            VisitState s;
+            s.k_cache   = carve(i32(kv), i32(capacity[v]), ring);
+            s.v_cache   = carve(i32(kv), i32(capacity[v]), ring);
+            s.k_hist    = carve(i32(kv), i32(taps));
+            s.v_hist    = carve(i32(kv), i32(taps));
+            s.attn_hist = carve(i32(c.hidden_size), i32(taps));
+            s.mlp_hist  = carve(i32(c.hidden_size), i32(taps));
+            all_state_.push_back(s);
         }
-        state_.push_back(s);
+    }
+    offset = slots * per_slot;
+    if (limits.max_rollback > 0) {
+        const std::int32_t saved = i32(taps) + limits.max_rollback;
+        for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
+            VisitState& first = all_state_[v];
+            first.k_saved    = carve(i32(kv), saved);
+            first.v_saved    = carve(i32(kv), saved);
+            first.attn_saved = carve(i32(c.hidden_size), saved);
+            first.mlp_saved  = carve(i32(c.hidden_size), saved);
+            for (std::size_t slot = 1; slot < slots; ++slot) {
+                VisitState& other = all_state_[slot * c.num_layer_visits + v];
+                other.k_saved = first.k_saved, other.v_saved = first.v_saved;
+                other.attn_saved = first.attn_saved, other.mlp_saved = first.mlp_saved;
+            }
+        }
     }
     for (std::size_t i = 0; i < limits.tap_visits.size(); ++i) { taps_.push_back(carve(i32(c.hidden_size), limits.max_chunk)); }
-    reset();
+    positions_.assign(slots, 0);
+    for (std::int32_t slot = i32(static_cast<std::uint32_t>(slots)) - 1; slot >= 0; --slot) {
+        select(slot);
+        reset();
+    }
+}
+
+void TextProgram::select(std::int32_t slot) {
+    if (slot < 0 || slot >= limits_.slots) { throw std::out_of_range("inkling2: no such slot"); }
+    if (!state_.empty()) { positions_[static_cast<std::size_t>(slot_)] = position_; }
+    slot_     = slot;
+    state_    = std::span<VisitState>(all_state_).subspan(static_cast<std::size_t>(slot) * config_.num_layer_visits, config_.num_layer_visits);
+    position_ = positions_[static_cast<std::size_t>(slot)];
+    last_cols_ = 0;
 }
 
 TextProgram::~TextProgram() {
     for (cudaGraphExec_t graph : decode_graph_) {
+        if (graph != nullptr) { cudaGraphExecDestroy(graph); }
+    }
+    for (cudaGraphExec_t graph : batch_graph_) {
         if (graph != nullptr) { cudaGraphExecDestroy(graph); }
     }
 }
@@ -287,7 +321,7 @@ Tensor TextProgram::tap(std::size_t i) const {
 }
 
 void TextProgram::copy_tap(std::uint32_t visit, const Tensor& value) {
-    if (!taps_on_) { return; }
+    if (!taps_on_ || columns_ != nullptr) { return; }
     for (std::size_t i = 0; i < taps_.size(); ++i) {
         if (limits_.tap_visits[i] != visit) { continue; }
         const std::size_t column = std::size_t(config_.hidden_size) * 4;
@@ -394,7 +428,7 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     const TextConfig& c   = config_;
     const std::uint32_t p = c.physical(v);
     const LayerWeights& w = model_.weights().layers.at(p);
-    VisitState& st        = state_.at(v);
+    VisitState& st        = state_[v];
     const bool local      = c.local[p];
     const std::int32_t h = i32(c.hidden_size), cols = cur.ne[1], heads = i32(c.heads), d = i32(c.head_dim),
                        kv = i32(c.kv_heads * c.head_dim), q = heads * d, rel = heads * i32(c.d_rel), k = i32(c.conv_kernel_size);
@@ -488,7 +522,7 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         jobs[1].x = &pv, jobs[1].taps = &vt, jobs[1].history = &st.v_hist, jobs[1].out = &vconv;
         save_input(st.k_saved, pk);
         save_input(st.v_saved, pv);
-        ops::short_conv_fp32_batch(jobs, d, stream_);
+        ops::short_conv_fp32_batch(jobs, d, stream_, columns_);
     } else {
         Tensor pk, pv;
         if (joint) {
@@ -508,7 +542,7 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         jobs[1].x = &vx, jobs[1].taps = &vt, jobs[1].dynamic = &vd, jobs[1].history = &st.v_hist, jobs[1].out = &vconv;
         save_input(st.k_saved, kx);
         save_input(st.v_saved, vx);
-        ops::short_conv_fp32_batch(jobs, d, stream_);
+        ops::short_conv_fp32_batch(jobs, d, stream_, columns_);
     }
 
     // 3f: clips, value norm, log scaling of the global layers' q and r.
@@ -524,7 +558,7 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         const ops::KvAppend k_append{&st.k_cache, start, start_offset_}, v_append{&st.v_cache, start, start_offset_};
         jobs[2].x = &kconv, jobs[2].head_dim = d, jobs[2].threshold = c.qk_clip, jobs[2].append = &k_append;
         jobs[3].x = &vconv, jobs[3].head_dim = d, jobs[3].unit_rms = true, jobs[3].eps = eps, jobs[3].append = &v_append;
-        ops::head_norms_fp32(jobs, stream_);
+        ops::head_norms_fp32(jobs, stream_, columns_);
     }
 
     // 3g: attention, output gate, output projection and its convolution.
@@ -537,7 +571,7 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     ops::relative_bias_sink_attention(shape, q_t, r_t, sink, nullptr, nullptr, rel_bias, st.k_cache, st.v_cache, start, start_offset_, &gate,
                                       gated, stream_, split_bytes > 0 ? &split : nullptr,
                                       split_bytes > 0 ? static_cast<std::int32_t*>(split_counters_.p) : nullptr,
-                                      limits_.prefill_tc.attention && cols >= kTensorCoreMinColumns);
+                                      limits_.prefill_tc.attention && cols >= kTensorCoreMinColumns, columns_);
     const WeightId ow[] = {w.output};
     const std::int32_t orows[] = {h};
     Tensor a_in = project(gated, ow, orows);
@@ -556,7 +590,7 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         } else {
             job.out = &a, job.residual = &cur, job.sum = &ffn_inp;
         }
-        ops::short_conv_fp32_batch(std::span<const ops::ShortConvJob>(&job, 1), 1, stream_);
+        ops::short_conv_fp32_batch(std::span<const ops::ShortConvJob>(&job, 1), 1, stream_, columns_);
         if (boundary) { a = ffn_inp; } // for the trace
     }
 
@@ -600,7 +634,7 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         const Tensor mlp_taps = model_.tensor(w.mlp_post_conv, {k, h});
         ops::ShortConvJob job;
         job.combine = &combine, job.taps = &mlp_taps, job.history = &st.mlp_hist, job.residual = &ffn_inp, job.sum = &next;
-        ops::short_conv_fp32_batch(std::span<const ops::ShortConvJob>(&job, 1), 1, stream_);
+        ops::short_conv_fp32_batch(std::span<const ops::ShortConvJob>(&job, 1), 1, stream_, columns_);
         save_input(st.mlp_saved, y);
     }
 
@@ -632,7 +666,17 @@ Tensor TextProgram::forward(std::span<const std::int32_t> tokens, std::span<cons
         next = e.column + e.values.ne[1];
     }
     const bool tracing = trace != nullptr && *trace;
-    if (cols == 1 && embeddings.empty() && !tracing && limits_.decode_graph && stream_ != nullptr) { return forward_graph(tokens[0]); }
+    // With several slots the one-token forward is a batch of one (the single-sequence graph would hold one slot's
+    // state pointers), unless there are taps to copy: forward_batch copies none, so a tapped forward takes the eager
+    // path below, which copies them for this slot as a single-sequence forward does.
+    const bool copies_taps = taps_on_ && !taps_.empty();
+    if (cols == 1 && embeddings.empty() && !tracing && limits_.decode_graph && stream_ != nullptr && !(limits_.slots > 1 && copies_taps)) {
+        if (limits_.slots > 1) {
+            const std::int32_t slot[] = {slot_};
+            return forward_batch(slot, tokens);
+        }
+        return forward_graph(tokens[0]);
+    }
     workspace_.reset();
     Tensor ids = workspace_.alloc(DType::I32, {cols});
     if (cudaMemcpyAsync(ids.data, tokens.data(), tokens.size_bytes(), cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
@@ -725,6 +769,97 @@ Tensor TextProgram::forward_graph(std::int32_t token) {
     last_cols_   = 1;
     last_tapped_ = taps_on_;
     return graph_logits;
+}
+
+Tensor TextProgram::forward_batch(std::span<const std::int32_t> slots, std::span<const std::int32_t> tokens) {
+    const auto cols = static_cast<std::int32_t>(slots.size());
+    if (cols < 1 || cols > std::min(kMaxBatchColumns, limits_.max_chunk) || tokens.size() != slots.size()) {
+        throw std::invalid_argument("inkling2: forward_batch takes 1 to 8 (slot, token) pairs, at most max_chunk");
+    }
+    struct Step {
+        std::int64_t positions[kMaxBatchColumns];
+        std::int32_t tokens[kMaxBatchColumns];
+        std::int32_t slots[kMaxBatchColumns];
+    };
+    positions_[static_cast<std::size_t>(slot_)] = position_;
+    Step host{};
+    for (std::int32_t i = 0; i < cols; ++i) {
+        const std::int32_t slot = slots[static_cast<std::size_t>(i)], token = tokens[static_cast<std::size_t>(i)];
+        if (slot < 0 || slot >= limits_.slots || std::count(slots.begin(), slots.begin() + i, slot) != 0) {
+            throw std::invalid_argument("inkling2: forward_batch's slots must be distinct slots of the Program");
+        }
+        if (token < 0 || static_cast<std::uint32_t>(token) >= config_.unpadded_vocab_size) { throw std::invalid_argument("inkling2: token id out of range"); }
+        if (positions_[static_cast<std::size_t>(slot)] + 1 > limits_.max_context) {
+            throw std::invalid_argument("inkling2: the sequence would pass max_context");
+        }
+        host.positions[i] = positions_[static_cast<std::size_t>(slot)];
+        host.tokens[i]    = token;
+        host.slots[i]     = slot;
+    }
+    if (batch_step_.bytes == 0) {
+        batch_step_ = DeviceBuffer(sizeof(Step));
+        auto* step  = static_cast<char*>(batch_step_.p);
+        batch_columns_.positions   = reinterpret_cast<const std::int64_t*>(step + offsetof(Step, positions));
+        batch_columns_.slots       = reinterpret_cast<const std::int32_t*>(step + offsetof(Step, slots));
+        batch_columns_.slot_stride = slot_stride_;
+    }
+    // From pageable memory: the copy is staged before the call returns.
+    if (cudaMemcpyAsync(batch_step_.p, &host, sizeof host, cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
+        throw std::runtime_error("inkling2: batch step upload failed");
+    }
+    Tensor logits;
+    if (limits_.decode_graph && stream_ != nullptr) {
+        cudaGraphExec_t& exec = batch_graph_[cols - 1];
+        if (exec == nullptr) {
+            if (cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+                throw std::runtime_error("inkling2: cannot capture the batched decode graph");
+            }
+            cudaGraph_t graph = nullptr;
+            try {
+                batch_logits_[cols - 1] = run_batch(cols);
+            } catch (...) {
+                if (cudaStreamEndCapture(stream_, &graph) == cudaSuccess && graph != nullptr) { cudaGraphDestroy(graph); }
+                throw;
+            }
+            if (cudaStreamEndCapture(stream_, &graph) != cudaSuccess || graph == nullptr) {
+                if (graph != nullptr) { cudaGraphDestroy(graph); }
+                throw std::runtime_error("inkling2: batched decode graph capture failed");
+            }
+            const cudaError_t made = cudaGraphInstantiate(&exec, graph, 0);
+            cudaGraphDestroy(graph);
+            if (made != cudaSuccess) {
+                exec = nullptr;
+                throw std::runtime_error(std::string("inkling2: cannot instantiate the batched decode graph: ") + cudaGetErrorString(made));
+            }
+        }
+        if (cudaGraphLaunch(exec, stream_) != cudaSuccess) { throw std::runtime_error("inkling2: batched decode graph launch failed"); }
+        logits = batch_logits_[cols - 1];
+    } else {
+        logits = run_batch(cols);
+    }
+    for (std::int32_t i = 0; i < cols; ++i) { ++positions_[static_cast<std::size_t>(host.slots[i])]; }
+    position_    = positions_[static_cast<std::size_t>(slot_)];
+    last_cols_   = 0;
+    last_tapped_ = false;
+    return logits;
+}
+
+Tensor TextProgram::run_batch(std::int32_t cols) {
+    // Slot 0's states, at start 0: each Op adds column t's slot offset and reads its position (batch_columns_).
+    const std::span<VisitState> selected = state_;
+    state_   = std::span<VisitState>(all_state_).first(config_.num_layer_visits);
+    columns_ = &batch_columns_;
+    workspace_.reset();
+    const Tensor ids(static_cast<char*>(batch_step_.p) + kMaxBatchColumns * sizeof(std::int64_t), DType::I32, {cols});
+    Tensor logits;
+    try {
+        logits = run(ids, 0, nullptr);
+    } catch (...) {
+        state_ = selected, columns_ = nullptr;
+        throw;
+    }
+    state_ = selected, columns_ = nullptr;
+    return logits;
 }
 
 Tensor TextProgram::run(const Tensor& ids, std::int64_t start, const Trace* trace) {
@@ -821,7 +956,7 @@ Tensor TextProgram::run(const Tensor& ids, std::int64_t start, const Trace* trac
         (*trace)("result_norm", x);
     }
     // last_logits: a prefill chunk's logits are its last column's (projection_fp32's columns do not depend on the width).
-    const bool last_only = limits_.last_logits && cols > std::max(1, limits_.max_rollback);
+    const bool last_only = limits_.last_logits && cols > std::max(1, limits_.max_rollback) && columns_ == nullptr;
     const Tensor xs = last_only ? x.slice(1, cols - 1, 1) : x;
     Tensor xb = workspace_.alloc(DType::BF16, {h, xs.ne[1]});
     ops::cast_fp32_to_bf16(xs, xb, stream_);

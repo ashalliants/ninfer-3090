@@ -364,7 +364,10 @@ void projection_fp32_inputs(std::span<const Tensor* const> inputs, std::span<con
     const int k = inputs[0]->ne[0], columns = inputs[0]->ne[1];
     require(columns <= kColumns, "projection_fp32_inputs serves 1 to 8 columns");
     require(out.ne[0] == rows && out.ne[1] == columns && out.ne[2] == 1 && out.ne[3] == 1, "out must be FP32 [sum N, T]");
-    constexpr int threads = 128, rows_per_warp = 1, rows_per_cta = threads / 32 * rows_per_warp;
+    // As projection_fp32: 8 warps a CTA from 3 columns, when every segment is whole CTAs of 8 rows.
+    bool whole = true;
+    for (const Tensor* w : weights) { whole = whole && w->ne[1] % 8 == 0; }
+    const int threads = columns > 2 && whole ? 256 : 128, rows_per_cta = threads / 32;
     bool distinct = false;
     for (std::size_t i = 0; i < inputs.size(); ++i) {
         const Tensor& x = *inputs[i];
@@ -378,10 +381,11 @@ void projection_fp32_inputs(std::span<const Tensor* const> inputs, std::span<con
         for (const Tensor* w : weights) { require(w->ne[1] % rows_per_cta == 0, "with distinct inputs every N must be a multiple of 4"); }
     }
     const std::size_t staged = static_cast<std::size_t>(columns) * k * sizeof(bf16);
-    auto* kernel = columns == 1   ? projection_kernel<threads, rows_per_warp, 1>
-                   : columns <= 2 ? projection_kernel<threads, rows_per_warp, 2>
-                   : columns <= 4 ? projection_kernel<threads, rows_per_warp, 4>
-                                  : projection_kernel<threads, rows_per_warp>;
+    auto* kernel = columns == 1     ? projection_kernel<128, 1, 1>
+                   : columns <= 2   ? projection_kernel<128, 1, 2>
+                   : threads == 128 ? (columns <= 4 ? projection_kernel<128, 1, 4> : projection_kernel<128, 1, kColumns>)
+                   : columns <= 4   ? projection_kernel<256, 1, 4>
+                                    : projection_kernel<256, 1, kColumns>;
     kernel<<<dim3((rows + rows_per_cta - 1) / rows_per_cta, 1), threads, staged, stream>>>(
         static_cast<const bf16*>(inputs[0]->data), k, columns, segments, Fp32Out{static_cast<float*>(out.data)});
     const cudaError_t error = cudaGetLastError();
@@ -430,11 +434,14 @@ void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Te
                                  kWideThreads, kWideSharedBytes, stream>>>(
             static_cast<const bf16*>(x.data), k, columns, segments, static_cast<float*>(out.data));
     } else if (columns <= kColumns) {
-        constexpr int threads = 128, rows_per_warp = 1, rows_per_cta = threads / 32 * rows_per_warp;
-        auto* kernel = columns == 1   ? projection_kernel<threads, rows_per_warp, 1>
-                       : columns <= 2 ? projection_kernel<threads, rows_per_warp, 2>
-                       : columns <= 4 ? projection_kernel<threads, rows_per_warp, 4>
-                                      : projection_kernel<threads, rows_per_warp>;
+        // One row a warp; 3 to 8 columns stage 4 to 8 times one column's x, so their CTAs take 8 or 16 warps (fewer
+        // CTAs a SM fit the staging; more warps keep the weight loads in flight). Every warp's arithmetic, and so every
+        // bit, is the 4-warp CTA's.
+        const int threads = columns <= 2 ? 128 : columns <= 4 ? 256 : 512, rows_per_cta = threads / 32;
+        auto* kernel = columns == 1   ? projection_kernel<128, 1, 1>
+                       : columns <= 2 ? projection_kernel<128, 1, 2>
+                       : columns <= 4 ? projection_kernel<256, 1, 4>
+                                      : projection_kernel<512, 1, kColumns>;
         kernel<<<dim3((rows + rows_per_cta - 1) / rows_per_cta, column_groups), threads, staged, stream>>>(
             static_cast<const bf16*>(x.data), k, columns, segments, Fp32Out{static_cast<float*>(out.data)});
     } else {
