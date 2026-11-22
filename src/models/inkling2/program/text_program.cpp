@@ -133,7 +133,12 @@ std::size_t result_bytes(const TextConfig& c, std::int32_t cols, std::int32_t lo
 // the narrow forwards (decode, verification, batched decode), whose attention may split its keys.
 std::size_t workspace_bytes(const TextConfig& c, const ProgramLimits& l, QType expert_format) {
     const std::int32_t narrow = std::max({1, l.max_rollback, l.slots > 1 ? kMaxBatchColumns : 1});
-    const auto logit_cols     = [&](std::int32_t cols) { return l.last_logits && cols > std::max(1, l.max_rollback) ? 1 : cols; };
+    // Every column's logits, except with last_logits past the rollback; a batched decode (forward_batch, up to
+    // kMaxBatchColumns slots) returns all of its columns' whatever last_logits says.
+    const auto logit_cols = [&](std::int32_t cols) {
+        const bool batch = l.slots > 1 && cols <= kMaxBatchColumns;
+        return l.last_logits && !batch && cols > std::max(1, l.max_rollback) ? 1 : cols;
+    };
     std::size_t most          = 0;
     for (const std::int32_t cols : {l.max_chunk, std::min(l.max_chunk, narrow), std::min(l.max_chunk, ops::kSplitMaxColumns)}) {
         const bool split = l.split_attention && cols <= ops::kSplitMaxColumns, saving = cols >= 2 && cols <= l.max_rollback;
