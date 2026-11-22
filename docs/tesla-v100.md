@@ -30,6 +30,18 @@ Flash-Next's decode does not slow down with context. From 10K to 221K tokens of 
 27-29 ms per MTP verification round (69-79 tok/s on those prompts). What moves tok/s is how many
 drafted tokens are accepted, which depends on the text, not on the context length.
 
+**Inkling-2-Mini** on the same card (master `dad1623b`, 2026-11-22, 250 W limit, through `ninfer-serve`; the
+[model card](../model-cards/Inkling-2-Mini-NInfer-V100/README.md) has the conditions and ranges):
+
+| | Inkling-2-Mini |
+|---|---:|
+| **Context** | 262,144 tokens with DSpark and vision |
+| **Decode**, one stream, DSpark | **up to 120.7 tok/s** (maths prompt); 93.4-94.4 average over 12 chats |
+| **Decode**, plain | 78.5-78.8 tok/s; 48 tok/s at 100K context |
+| **Decode**, `--max-concurrency 8` | **198.2 tok/s** aggregate (plain) |
+| **Prefill** | **1,930 tok/s** at 8K; 1,629 at 1K, 1,244 at 100K |
+| **Load** | 9.2-14.2 s |
+
 ## What you need
 
 - **GPU:** a Tesla V100 with 32 GB. A 16 GB V100 has not been tried.
@@ -272,7 +284,8 @@ come over the PCIe link when needed.
   CUDA-core kernel run correctly but slowly; these are mainly prompt tails under 129 tokens for the
   27B.
 - **One request at a time** has been measured for Flash-Next. Two lanes (`NINFER_CONCURRENCY=2`)
-  are allowed but have not been tuned on the V100.
+  are allowed but have not been tuned on the V100. Inkling-2-Mini batches up to 8 requests
+  (`--max-concurrency 8`), without DSpark or adapters at N > 1.
 - **Known `sm_70` test failures:**
   - `capped_prefill_steps` and `explicit_positions_equal_rope_delta_path`: workspace `bad_alloc`
     with the cuBLAS prefill route.

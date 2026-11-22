@@ -149,9 +149,11 @@ different from the Qwen3.5 models:
   draws under the same seed); see [cli.md](cli.md#speculative-decoding). `N` (1 to 7, default 3) is the most drafts
   a round verifies; by default each round picks its count from the request's recent acceptance and measured round
   costs (`--dspark-adaptive on`) and drops the drafts from the first one the drafter gives under 0.5 probability on
-  (`--draft-min-p 0.5`; `0` keeps them all). On a Tesla V100 over 12 chat requests: 88.8 tok/s greedy against 81.9
-  for a fixed 3 drafts and about 72 plain, and 80.5 sampled at temperature 0.8 against 69.7 plain (the same tokens)
-  ([measurements](maintainer/inkling2-model.md#draft-floor-and-adaptive-width)).
+  (`--draft-min-p 0.5`; `0` keeps them all). On a Tesla V100 (master `dad1623b`, 2026-11-22), up to 120.7 tok/s on
+  a maths prompt; over 12 chat requests of 300 tokens, 93.4-94.4 tok/s greedy against 78.5-78.8 plain, and 83.4-83.5
+  sampled at temperature 0.8 against 74.9 plain (the same tokens). The defaults beat a fixed 3 drafts by 8.4%
+  (88.8 against 81.9 tok/s, 2026-11-21) ([measurements](maintainer/inkling2-model.md#draft-floor-and-adaptive-width)).
+  With `--max-concurrency` above 1 requests decode without DSpark.
 - **MTP speculation** (`--spec mtp --draft-tokens N`, N from 1 to 7) needs an artifact converted
   with the drafter (`--mtp-gguf`, [weight-conversion.md](weight-conversion.md)); a plain artifact
   refuses with that instruction. The output is the same as without it, token for token (greedy).
@@ -2602,12 +2604,14 @@ curl http://127.0.0.1:8080/v1/chat/completions -d '{"model": "m", "graft": "abli
   plain greedy decoding's with the same adapter; only the acceptance rate can change.
 - **Prefix reuse** is keyed on the selection: a prompt prefix computed under one adapter, or none, never serves
   another.
+- `--max-concurrency` above 1 refuses `--lora` and `--graft`.
 - Each adapter costs under 1 MiB of device memory. The first decode step after the selection changes captures that
   selection's decode graph again.
 
 Measured on a V100 (greedy; 20 prompts of `mlabonne/harmful_behaviors` with `reasoning_effort` `none`, judged by
 refusal markers, so a deflecting answer counts as complied; KLD from the base model over 2,048 tokens of mixed text;
-math with low reasoning effort and two Python tasks with tests):
+math with low reasoning effort and two Python tasks with tests; speed over 12 chat requests of 300 tokens, ABBA on one
+server, master `dad1623b`):
 
 | | Base | `"lora": "ou"` | `"graft": "sd"` |
 |---|---|---|---|
@@ -2616,7 +2620,7 @@ math with low reasoning effort and two Python tasks with tests):
 | Top-1 agreement with base | 1 | 0.969 | 0.962 |
 | Math (4, low effort) | 4/4 | 4/4 | 4/4 |
 | Python tasks (2, tests run) | 2/2 | 2/2 | 2/2 |
-| Output tok/s, plain (`--spec dspark`) | 71.7 (77.1) | 68.9 (68.1) | 68.9 (67.8) |
+| Output tok/s, plain (`--spec dspark`) | 78.8 (94.1-94.4) | 75.4 (90.8-91.7) | 75.2 (91.6-92.7) |
 
 The [Inkling-2 notes](maintainer/inkling2-model.md#adapters-opt-in-uncensoring) give the hook points and the tests.
 
