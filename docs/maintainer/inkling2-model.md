@@ -757,13 +757,23 @@ weighted by e^{m_z - max m}. It applies only once a column can see more than `op
 that the extra blocks cost more than they save. Decode replays one CUDA graph for positions up to 512 (the single
 block) and another past them (split; its grid is sized for the whole ring, and the blocks past a column's keys return
 at once). The single-block kernel walks
-every key of a column in one block of 128 threads, so a decode step ran 24 blocks per visit on 80 SMs and was
-latency-bound. At 16K context, 70% of the step was attention.
+every key of a column in one block (then of 128 threads), so a decode step ran 24 blocks per visit on 80 SMs and
+was latency-bound. At 16K context, 70% of the step was attention.
 
 It is FP32 all the way, with no quantisation. Only the order of the softmax sums changes, so a column that sees more
 than 256 keys gets other bits than the single-block kernel. A column of at most 256 keys gets the same bits: the
 golden test is byte-identical (781 dumped tensors, 0 differ). Prefill chunks (more than 8 columns) keep the single
 block. `--no-split-attention` reproduces the earlier builds exactly.
+
+Inside a block (single or split) the kernel is bound by instruction issue and load latency, not bytes: a
+256-key block moves 128 KB. Since 2026-11-22 a block has 8 warps. Each warp issues the loads of four score steps
+before their arithmetic. The value fold runs as four chains: key j below n & ~3 goes to chain j % 4, and the
+remaining keys go to chain 0, each chain in key order. Warp w runs chain w % 4 over its lanes' dimensions, with
+one 4-byte load of two values per key and the next 16 keys' loads in flight. The chains meet in shared memory as
+(0 + 1) + (2 + 3). Only threads below 128 sum the softmax's exponentials, with the old stride, and the other warps
+add +0. So every FMA, sum and shuffle tree is the 128-thread kernel's, and the bits are unchanged: the golden dumps
+(FP32 and FP16 rings) and the decode and 4-column logits at contexts 300 to 8,192 are byte-identical. The kernel
+was 63 us a call at 256 keys and is now 24 us.
 
 Measured on the V100 (2026-11-21), `ninfer_inkling2_golden_test` with `NINFER_INKLING2_DECODE_BENCH`
 (`NINFER_INKLING2_SINGLE_BLOCK=1` for the single block). The text is
