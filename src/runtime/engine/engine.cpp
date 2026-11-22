@@ -759,6 +759,10 @@ private:
             options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
         }
         options.max_concurrency = generation->max_concurrency();
+        // The KV is shared: max_concurrency rings of max_context each (the memory summary's kv_capacity).
+        if (options.max_concurrency > 1) {
+            options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_concurrency * options.max_context);
+        }
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         load              = generation->load_summary();
         load.cuda_sync_mode = device.sync_mode();

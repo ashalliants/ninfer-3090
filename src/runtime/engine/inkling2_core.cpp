@@ -553,7 +553,18 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                 }
             }
             if (!built) {
+                // fit_context_floor bounds the search from below: a context under it is refused, not started.
+                const std::uint32_t floor_steps = (options_.fit_context_floor + kFitStep - 1) / kFitStep;
                 std::uint32_t lo = 0, hi = options_.max_context / kFitStep; // in kFitStep units: lo fits (0: none known)
+                if (floor_steps > 0) {
+                    if (floor_steps >= hi || !fits(chunks.back(), floor_steps * kFitStep)) {
+                        throw std::runtime_error("inkling2: --max-concurrency " + std::to_string(slots_) + ": the context floor of " +
+                                                 std::to_string(options_.fit_context_floor) + " positions per slot does not fit on the device");
+                    }
+                    dense = std::move(programs_->dense);
+                    programs_.reset();
+                    lo = floor_steps;
+                }
                 while (hi > lo + 1) {
                     const std::uint32_t mid = lo + (hi - lo) / 2;
                     if (fits(chunks.back(), mid * kFitStep)) {
@@ -1806,7 +1817,13 @@ void Inkling2Core::worker_batched() {
                     check_cuda(cudaStreamSynchronize(stream_), "logits");
                     next = sample(a.host, a.job->options.execution.sampling, a.counts, a.rng);
                 }
-                more = commit(a, next, injected);
+                // A cancellation during the forward or another column's sampling ends this row before its token
+                // commits, as the single-request path's check after its forward does; the other columns go on.
+                if (a.job->cancelled) {
+                    a.job->result.finish_reason = FinishReason::Cancelled;
+                } else {
+                    more = commit(a, next, injected);
+                }
             } catch (...) { error = std::current_exception(); }
             if (!more) {
                 const auto at = std::find_if(active.begin(), active.end(), [&](const auto& p) { return p.get() == &a; });

@@ -1240,7 +1240,7 @@ Memory: `--max-context` stays the per-request ceiling, as on the other routes. E
 
 At startup the core first tries the widest prefill chunk at N x `--max-context`. If no chunk fits, it takes the
 narrowest chunk and lowers the context per slot to the largest multiple of 256 that fits beside the 256 MiB spare,
-found by halving. The Engine's `max_context`, the startup log's `batched decode |` note, and the server's limits and
+found by halving, never below `fit_context_floor` (the startup fails when the floor does not fit). The Engine's `max_context`, the startup log's `batched decode |` note, and the server's limits and
 `/v1/models` follow it. `kv_capacity` reports N x the context per slot.
 
 

@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <future>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -70,7 +71,7 @@ std::vector<Case> cases() {
                                "Write a haiku about the sea.", "List the planets of the solar system.",
                                "Explain what a hash map is in two sentences.", "Translate 'good morning' into French and German."};
     for (std::size_t i = 0; i < std::size(questions); ++i) { out.push_back({questions[i], greedy(static_cast<std::uint32_t>(40 + 12 * i))}); }
-    // A long prompt (prefix reuse: past one chunk of 2048, as reuse is chunk-grained), a seeded sample, a thinking
+    // A long prompt (prefix reuse: past one prefill chunk, as reuse is chunk-grained), a seeded sample, a thinking
     // budget and a stop string.
     std::string facts = "Here is a list of facts.";
     for (int i = 0; i < 180; ++i) { facts += " Fact " + std::to_string(i) + ": the number " + std::to_string(i * 7) + " is noted."; }
@@ -123,6 +124,9 @@ int main() {
             check(engine.options().max_concurrency == 4 && engine.options().max_context == 4096 &&
                       engine.options().context_cache.device_state_slots == 4U,
                   "four slots of 4096 positions, one snapshot each");
+            check(engine.options().kv_capacity.explicit_tokens == 4U * 4096U &&
+                      engine.memory_summary().kv_capacity == engine.options().kv_capacity.explicit_tokens,
+                  "the shared KV capacity is four rings of 4096");
             // All of them at once (a few milliseconds apart), more than the slots: the rest wait.
             std::vector<ninfer::GenerationHandle> handles;
             const auto t0 = Clock::now();
@@ -174,9 +178,24 @@ int main() {
                   "a repeated prompt resumes from its slot's snapshot (" + std::to_string(again.reused_prompt_tokens) + " reused) and decodes the same");
         }
         if (std::getenv("NINFER_INKLING2_BATCH_FIT") == nullptr || std::string(std::getenv("NINFER_INKLING2_BATCH_FIT")) != "0") {
-            auto options            = base_options(artifact);
-            options.max_context     = 262144;
-            options.max_concurrency = 8;
+            // A context floor under which the fit refuses to start: one step under 262144 does not fit 8 times.
+            {
+                auto options              = base_options(artifact);
+                options.max_context       = 262144;
+                options.kv_capacity       = ninfer::KvCapacityPolicy::explicit_capacity(262144);
+                options.max_concurrency   = 8;
+                options.fit_context_floor = 262144 - 256;
+                bool refused              = false;
+                try {
+                    ninfer::Engine engine(options);
+                } catch (const std::exception& e) { refused = std::string(e.what()).find("floor") != std::string::npos; }
+                check(refused, "8 slots refuse a context floor that does not fit");
+            }
+            auto options              = base_options(artifact);
+            options.max_context       = 262144;
+            options.kv_capacity       = ninfer::KvCapacityPolicy::explicit_capacity(262144);
+            options.max_concurrency   = 8;
+            options.fit_context_floor = 4096;
             ninfer::Engine engine(options);
             const auto fitted = engine.options().max_context;
             std::string notes;
@@ -184,6 +203,8 @@ int main() {
             std::printf("8 slots asked 262144: %u positions each\n%s", fitted, notes.c_str());
             check(fitted < 262144 && fitted >= 4096 && fitted % 256 == 0 && notes.find("fitted") != std::string::npos,
                   "8 slots fit a smaller context each and report it");
+            check(engine.options().kv_capacity.explicit_tokens == 8U * fitted && engine.memory_summary().kv_capacity == 8U * fitted,
+                  "the fitted shared KV capacity is eight rings of the fitted context");
             const auto r = engine.generate(engine.prepare(user_turn(all[0].prompt)), all[0].options);
             check(r.generated_token_ids == alone[0].generated_token_ids, "the fitted Engine decodes the solo output");
         }
