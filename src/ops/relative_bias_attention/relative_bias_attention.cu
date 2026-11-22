@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -112,9 +113,12 @@ struct HeadArgs {
     void* cache[kHeadNormMaxJobs];    // or null: the KV ring the normalized column is also written to
     bool cache_fp16[kHeadNormMaxJobs]; // the ring holds FP16 (round to nearest) rather than FP32
     int quant[kHeadNormMaxJobs];       // experimental: KvAppend::quant (FP16 rings, head_dim 128)
+    int lowbit[kHeadNormMaxJobs];      // a U8 ring in the rk4v4 coding: 1 keys (rotated Lloyd-Max), 2 values (int4), else 0
+    bool rotate[kHeadNormMaxJobs];     // the job's result is rotated by the normalized Hadamard-128 (queries of a lowbit ring)
     std::int64_t cache_start[kHeadNormMaxJobs], capacity[kHeadNormMaxJobs], cache_rows[kHeadNormMaxJobs];
     const std::int64_t* cache_offset[kHeadNormMaxJobs];
     int count, total;
+    std::int64_t lowbit_heads; // KV heads of a lowbit ring
     // Batched decode (ColumnSequences), or null: column t's position, and its rings at + slots[t] * slot_stride bytes.
     const std::int64_t* col_pos;
     const std::int32_t* col_slot;
@@ -216,6 +220,72 @@ __device__ void fake_quant_head(float (&x)[4], int quant, int lane) {
     if (rotate) { hadamard128(x, lane); } // normalized Sylvester Hadamard: its own inverse
 }
 
+// The rk4v4 coding of a global ring (ops::kLowbitKeyBytes, kLowbitValueBytes): per position, every KV head's 64 code
+// bytes (dimension 2b in byte b's low nibble, 2b + 1 in its high one), then every head's FP16 scales (keys 2 per 64
+// rotated dimensions, values 4 per 32). Keys: the Lloyd-Max index sign << 3 | magnitude of the rotated key (the
+// rk4v4 key codec, least-squares scale); values: signed int4, scale absmax / 7.
+constexpr unsigned kLloydPosLo = 0x2C1F1206U, kLloydPosHi = 0x7F604B3AU, kLloydNegLo = 0xD4E1EEFAU, kLloydNegHi = 0x81A0B5C6U;
+// Four nibbles (the low 16 bits, dimension order) to four INT8 codes.
+__device__ __forceinline__ unsigned lloyd4_expand4(unsigned nibbles) {
+    const unsigned magnitude = nibbles & 0x7777U;
+    const unsigned pos  = __byte_perm(kLloydPosLo, kLloydPosHi, magnitude);
+    const unsigned neg  = __byte_perm(kLloydNegLo, kLloydNegHi, magnitude);
+    const unsigned mask = __byte_perm(0U, 0xFF00U, ((nibbles >> 3) & 0x1111U) | 0x4444U);
+    return (neg & mask) | (pos & ~mask);
+}
+__device__ __forceinline__ float s8_at(unsigned w, int k) { return static_cast<float>(static_cast<std::int8_t>(w >> (8 * k))); }
+__device__ __forceinline__ float s4_at(unsigned w, int k) { return static_cast<float>(static_cast<int>(w << (28 - 4 * k)) >> 28); }
+
+// Lane `lane` of the warp holding one head: its four values x[i] (dimension lane + 32 i) coded into the row's head h
+// (quant: kLowbitKeys4/8, kLowbitValues4/8).
+__device__ void lowbit_store(unsigned char* row, int kv_heads, int h, int quant, float (&x)[4], int lane) {
+    const bool four = quant == kLowbitKeys4 || quant == kLowbitValues4;
+    const int code_bytes = four ? kHeadDim / 2 : kHeadDim;
+    unsigned char* codes = row + h * code_bytes;
+    __half* scales = reinterpret_cast<__half*>(row + kv_heads * code_bytes);
+    int q[4];
+    if ((quant >> 4) != 0) { hadamard128(x, lane); }
+    if (quant == kLowbitKeys4) {
+#pragma unroll
+        for (int g = 0; g < 2; ++g) {
+            const float x0 = x[2 * g], x1 = x[2 * g + 1];
+            const float rms = sqrtf(warp_sum(x0 * x0 + x1 * x1) / 64.0F);
+            const float inv = rms > 0.0F ? 1.0F / rms : 0.0F;
+            const int m0 = lloyd4_magnitude(x0 * inv), m1 = lloyd4_magnitude(x1 * inv);
+            const float c0 = copysignf(lloyd4_code(m0), x0), c1 = copysignf(lloyd4_code(m1), x1);
+            const float xc = warp_sum(x0 * c0 + x1 * c1), cc = warp_sum(c0 * c0 + c1 * c1);
+            q[2 * g] = (x0 < 0.0F ? 8 : 0) | m0, q[2 * g + 1] = (x1 < 0.0F ? 8 : 0) | m1;
+            if (lane == 0) { scales[h * 2 + g] = __float2half_rn(rms > 0.0F ? xc / cc : 0.0F); }
+        }
+    } else if (quant == kLowbitValues4) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const __half sh = __float2half_rn(warp_max_abs(x[i]) / 7.0F);
+            const float sc = __half2float(sh);
+            q[i] = (sc > 0.0F ? static_cast<int>(fminf(7.0F, fmaxf(-7.0F, rintf(x[i] / sc)))) : 0) & 15;
+            if (lane == 0) { scales[h * 4 + i] = sh; }
+        }
+    } else { // INT8 per 64 (keys rotated above)
+#pragma unroll
+        for (int g = 0; g < 2; ++g) {
+            const __half sh = __float2half_rn(warp_max_abs(fmaxf(fabsf(x[2 * g]), fabsf(x[2 * g + 1]))) / 127.0F);
+            const float sc = __half2float(sh);
+#pragma unroll
+            for (int e = 2 * g; e < 2 * g + 2; ++e) { q[e] = sc > 0.0F ? static_cast<int>(fminf(127.0F, fmaxf(-127.0F, rintf(x[e] / sc)))) : 0; }
+            if (lane == 0) { scales[h * 2 + g] = sh; }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        if (four) {
+            const int partner = __shfl_xor_sync(0xffffffffU, q[i], 1);
+            if ((lane & 1) == 0) { codes[(lane + 32 * i) / 2] = static_cast<unsigned char>(q[i] | (partner << 4)); }
+        } else {
+            codes[lane + 32 * i] = static_cast<unsigned char>(static_cast<std::int8_t>(q[i]));
+        }
+    }
+}
+
 // Global head g (of every job's heads in order) of column t.
 __device__ __forceinline__ void head_norm(const HeadArgs& a, int t, int g, int lane) {
     // The job by compile-time compares (a runtime index into the parameters would copy them to local memory).
@@ -230,7 +300,8 @@ __device__ __forceinline__ void head_norm(const HeadArgs& a, int t, int g, int l
     int head_dim = a.head_dim[0], kind = a.kind[0], begin = a.head_begin[0];
     void* cache = a.cache[0];
     bool fp16 = a.cache_fp16[0];
-    int quant = a.quant[0];
+    int quant = a.quant[0], lowbit = a.lowbit[0];
+    bool rotate = a.rotate[0];
     std::int64_t cache_start = a.cache_start[0], capacity = a.capacity[0], cache_rows = a.cache_rows[0];
     const std::int64_t* cache_offset = a.cache_offset[0];
 #pragma unroll
@@ -239,7 +310,7 @@ __device__ __forceinline__ void head_norm(const HeadArgs& a, int t, int g, int l
             x = a.x[i], xs = a.xs[i], start = a.start[i], floor = a.floor[i], scale = a.scale[i], offset = a.start_offset[i];
             threshold = a.threshold[i], alpha = a.alpha[i], eps = a.eps[i], head_dim = a.head_dim[i], kind = a.kind[i];
             begin = a.head_begin[i];
-            cache = a.cache[i], fp16 = a.cache_fp16[i], quant = a.quant[i], cache_start = a.cache_start[i], capacity = a.capacity[i], cache_offset = a.cache_offset[i];
+            cache = a.cache[i], fp16 = a.cache_fp16[i], quant = a.quant[i], lowbit = a.lowbit[i], rotate = a.rotate[i], cache_start = a.cache_start[i], capacity = a.capacity[i], cache_offset = a.cache_offset[i];
             cache_rows = a.cache_rows[i];
         }
     }
@@ -253,6 +324,14 @@ __device__ __forceinline__ void head_norm(const HeadArgs& a, int t, int g, int l
         clip_head(v, head_dim, scale != nullptr ? scale + static_cast<std::int64_t>(h) * head_dim : nullptr, threshold, kind == 1, pos,
                   floor, alpha, lane);
     }
+    if (rotate) {
+        float y[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { y[i] = v[lane + 32 * i]; }
+        hadamard128(y, lane);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { v[lane + 32 * i] = y[i]; }
+    }
     if (cache != nullptr) {
         // relative_bias_sink_attention's append: slot (start + offset + t) mod capacity of a [rows, capacity] ring.
         // Each lane reads back the values it wrote.
@@ -260,7 +339,13 @@ __device__ __forceinline__ void head_norm(const HeadArgs& a, int t, int g, int l
             a.col_pos != nullptr ? a.col_pos[t] : cache_start + (cache_offset != nullptr ? *cache_offset : 0) + t;
         const std::int64_t at = (position % capacity) * cache_rows + static_cast<std::int64_t>(h) * head_dim;
         if (a.col_slot != nullptr) { cache = static_cast<char*>(cache) + a.col_slot[t] * a.slot_stride; }
-        if (fp16 && quant != 0) {
+        if (lowbit != 0) {
+            float y[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) { y[i] = v[lane + 32 * i]; }
+            // cache_rows: the row's bytes; kv heads = the job's rows / 128.
+            lowbit_store(static_cast<unsigned char*>(cache) + (position % capacity) * cache_rows, static_cast<int>(a.lowbit_heads), h, quant, y, lane);
+        } else if (fp16 && quant != 0) {
             float y[4];
 #pragma unroll
             for (int i = 0; i < 4; ++i) { y[i] = v[lane + 32 * i]; }
@@ -312,6 +397,8 @@ struct AttentionArgs {
     const std::int64_t* col_pos;
     const std::int32_t* col_slot;
     std::int64_t slot_stride;
+    // Lowbit rings (rk4v4 coding): bytes per position of each, and the KV heads (where the scales start).
+    int k_row, v_row, kv_heads;
 };
 
 // Column t's position (Columns: batched decode, from the ColumnSequences table).
@@ -610,6 +697,173 @@ __global__ void __launch_bounds__(kThreads, 2) attention_kernel(AttentionArgs a)
     store_out(static_cast<Out*>(a.out) + t * a.os + at, y);
 }
 
+// attention_kernel over lowbit rings (the rk4v4 coding, lowbit_store): the queries are rotated as the keys were. The
+// scores take 8 lanes a key as above, lane `sub` the 16 rotated dimensions 16 sub .. + 16 (8 code bytes, one load,
+// one scale); the value fold runs 8 chains, warp w the keys j = w mod 8 below n & ~7 (the rest in chain 0), each lane 4
+// dimensions (2 code bytes). Split and the store as attention_kernel. One column of the call at a time, no batching.
+// KB, VB: the key and value bits (4 or 8; lowbit_store's layouts).
+template <typename Out, bool Split, int KB, int VB>
+__global__ void __launch_bounds__(kThreads, 2) attention_lowbit_kernel(AttentionArgs a) {
+    constexpr int kKeyCode = KB * kHeadDim / 8, kValueCode = VB * kHeadDim / 8; // code bytes per head
+    __shared__ __align__(16) float q[kHeadDim];
+    __shared__ float r[kMaxRel];
+    __shared__ float scores[kTile];
+    __shared__ __align__(16) float chains[kWarps][kHeadDim];
+    __shared__ float reduce[kWarps];
+    const int t = blockIdx.x, h = blockIdx.y, g = h / a.group;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (threadIdx.x < kHeadDim) { q[threadIdx.x] = a.q[t * a.qs + static_cast<std::int64_t>(h) * kHeadDim + threadIdx.x]; }
+    if (threadIdx.x < a.d_rel) { r[threadIdx.x] = a.r[t * a.rs + static_cast<std::int64_t>(h) * a.d_rel + threadIdx.x]; }
+    __syncthreads();
+    const std::int64_t pos = column_position<false>(a, t);
+    const std::int64_t lo  = a.window > 0 ? (pos - a.window + 1 > 0 ? pos - a.window + 1 : 0) : 0;
+    const float inv_sqrt_d = rsqrtf(static_cast<float>(kHeadDim));
+    const int z = Split ? static_cast<int>(blockIdx.z) : 0;
+    const std::int64_t first = lo + static_cast<std::int64_t>(z) * kSplitKeys;
+    const std::int64_t last  = Split ? (first + kSplitKeys - 1 < pos ? first + kSplitKeys - 1 : pos) : pos;
+    float* part_out = Split ? a.split + ((static_cast<std::int64_t>(t) * a.heads + h) * gridDim.z + z) * (kHeadDim + 2) : nullptr;
+    if (Split && first > pos) { return; }
+    float m     = z == 0 ? a.sink[t * a.ss + h] : -INFINITY;
+    float denom = z == 0 ? 1.0F : 0.0F;
+    float acc   = 0.0F;
+    const float4* q4 = reinterpret_cast<const float4*>(q);
+    const int sub = lane & (kKeyLanes - 1);
+    float4 qw[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { qw[i] = q4[4 * sub + i]; }
+    float rq[kRelPerLane];
+#pragma unroll
+    for (int e = 0; e < kRelPerLane; ++e) { rq[e] = sub + kKeyLanes * e < a.d_rel ? r[sub + kKeyLanes * e] : 0.0F; }
+    int rel_col[kRelPerLane];
+#pragma unroll
+    for (int e = 0; e < kRelPerLane; ++e) { rel_col[e] = sub + kKeyLanes * e < a.d_rel ? sub + kKeyLanes * e : a.d_rel - 1; }
+    const auto* kb = static_cast<const unsigned char*>(a.k);
+    const auto* vb = static_cast<const unsigned char*>(a.v);
+    const int k_code = g * kKeyCode + 2 * KB * sub, k_scale = a.kv_heads * kKeyCode + g * 4 + (sub >> 2) * 2;
+    const int v_code = g * kValueCode + (VB / 2) * lane;
+    const int v_scale = a.kv_heads * kValueCode + (VB == 4 ? g * 8 + (lane >> 3) * 2 : g * 4 + (lane >> 4) * 2);
+    using KeyWord = std::conditional_t<KB == 4, uint2, uint4>;
+    using ValueWord = std::conditional_t<VB == 4, unsigned short, unsigned>;
+    const int capacity32 = static_cast<int>(a.capacity);
+    for (std::int64_t base = first; base <= last; base += kTile) {
+        const int n = static_cast<int>(last - base + 1 < kTile ? last - base + 1 : kTile);
+        const int base_slot32 = static_cast<int>(base % a.capacity), pos_from_base = static_cast<int>(pos - base);
+        for (int i00 = warp * (32 / kKeyLanes); i00 < n; i00 += kKeysPerStep * kScoreSteps) {
+            KeyWord words[kScoreSteps];
+            float kscale[kScoreSteps];
+            float rel[kScoreSteps][kRelPerLane];
+#pragma unroll
+            for (int u = 0; u < kScoreSteps; ++u) {
+                const int i = i00 + u * kKeysPerStep + lane / kKeyLanes;
+                int slot = base_slot32 + (i < n ? i : 0);
+                slot -= slot >= capacity32 ? capacity32 : 0;
+                const unsigned char* row = kb + static_cast<std::int64_t>(slot) * a.k_row;
+                words[u]  = __ldg(reinterpret_cast<const KeyWord*>(row + k_code));
+                kscale[u] = __half2float(__ldg(reinterpret_cast<const __half*>(row + k_scale)));
+                int dist = pos_from_base - i;
+                dist = dist < 0 ? 0 : dist < a.extent ? dist : a.extent - 1;
+                const float* t_row = a.table + dist * a.d_rel;
+#pragma unroll
+                for (int e = 0; e < kRelPerLane; ++e) { rel[u][e] = __ldg(t_row + rel_col[e]); }
+            }
+#pragma unroll
+            for (int u = 0; u < kScoreSteps; ++u) {
+                const int i = i00 + u * kKeysPerStep + lane / kKeyLanes;
+                const bool valid = i < n;
+                unsigned c[4];
+                if constexpr (KB == 4) {
+                    c[0] = lloyd4_expand4(words[u].x), c[1] = lloyd4_expand4(words[u].x >> 16), c[2] = lloyd4_expand4(words[u].y),
+                    c[3] = lloyd4_expand4(words[u].y >> 16);
+                } else {
+                    c[0] = words[u].x, c[1] = words[u].y, c[2] = words[u].z, c[3] = words[u].w;
+                }
+                float dot = 0.0F;
+#pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    dot = fmaf(qw[w].x, s8_at(c[w], 0), fmaf(qw[w].y, s8_at(c[w], 1), fmaf(qw[w].z, s8_at(c[w], 2), fmaf(qw[w].w, s8_at(c[w], 3), dot))));
+                }
+                dot *= kscale[u];
+                const std::int64_t dist = pos - (base + i);
+                float bias = 0.0F;
+                if (valid && dist < a.extent) {
+#pragma unroll
+                    for (int e = 0; e < kRelPerLane; ++e) {
+                        if (sub + kKeyLanes * e < a.d_rel) { bias = fmaf(rq[e], rel[u][e], bias); }
+                    }
+                }
+                for (int o = kKeyLanes / 2; o > 0; o >>= 1) {
+                    dot += __shfl_xor_sync(0xffffffffU, dot, o);
+                    bias += __shfl_xor_sync(0xffffffffU, bias, o);
+                }
+                if (valid && sub == 0) { scores[i] = dot * inv_sqrt_d + bias; }
+            }
+        }
+        __syncthreads();
+        float top = -INFINITY;
+        for (int i = threadIdx.x; i < n; i += kThreads) { top = fmaxf(top, scores[i]); }
+        top = fmaxf(m, block_reduce<true>(top, reduce));
+        const float rescale = expf(m - top);
+        float sum = 0.0F;
+        if (threadIdx.x < kSumThreads) {
+            for (int i = threadIdx.x; i < n; i += kSumThreads) { sum += (scores[i] = expf(scores[i] - top)); }
+        }
+        sum = block_reduce<false>(sum, reduce);
+        denom = fmaf(denom, rescale, sum);
+        float chain[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+        const auto fold = [&](int j, ValueWord codes, float scale) {
+            const float w = scores[j] * scale;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) { chain[e] = fmaf(w, VB == 4 ? s4_at(codes, e) : s8_at(codes, e), chain[e]); }
+        };
+        const auto row_of = [&](int j) {
+            int slot = base_slot32 + j;
+            slot -= slot >= capacity32 ? capacity32 : 0;
+            return vb + static_cast<std::int64_t>(slot) * a.v_row;
+        };
+        const int n8 = n & ~7, chain_keys = n8 / 8;
+        for (int k0 = 0; k0 < chain_keys; k0 += 8) {
+            ValueWord codes[8];
+            float sc[8];
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                const int kk = k0 + u < chain_keys ? k0 + u : chain_keys - 1;
+                const unsigned char* row = row_of(warp + 8 * kk);
+                codes[u] = __ldg(reinterpret_cast<const ValueWord*>(row + v_code));
+                sc[u]    = __half2float(__ldg(reinterpret_cast<const __half*>(row + v_scale)));
+            }
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                if (k0 + u < chain_keys) { fold(warp + 8 * (k0 + u), codes[u], sc[u]); }
+            }
+        }
+        if (warp == 0) {
+            for (int j = n8; j < n; ++j) {
+                const unsigned char* row = row_of(j);
+                fold(j, __ldg(reinterpret_cast<const ValueWord*>(row + v_code)), __half2float(__ldg(reinterpret_cast<const __half*>(row + v_scale))));
+            }
+        }
+#pragma unroll
+        for (int e = 0; e < 4; ++e) { chains[warp][4 * lane + e] = chain[e]; }
+        __syncthreads();
+        const int d = threadIdx.x & (kHeadDim - 1);
+        const float part = ((chains[0][d] + chains[1][d]) + (chains[2][d] + chains[3][d])) + ((chains[4][d] + chains[5][d]) + (chains[6][d] + chains[7][d]));
+        acc = fmaf(acc, rescale, part);
+        m = top;
+        __syncthreads();
+    }
+    if constexpr (Split) {
+        if (threadIdx.x < kHeadDim) { part_out[2 + threadIdx.x] = acc; }
+        if (threadIdx.x == 0) { part_out[0] = m, part_out[1] = denom; }
+        finish_split<Out, false>(a, t, h, static_cast<int>((pos - lo) / kSplitKeys) + 1);
+        return;
+    }
+    if (threadIdx.x >= kHeadDim) { return; }
+    const std::int64_t at = static_cast<std::int64_t>(h) * kHeadDim + threadIdx.x;
+    const float x = acc / denom;
+    const float y = a.gate != nullptr ? x / (1.0F + expf(-a.gate[t * a.gs + at])) : x;
+    store_out(static_cast<Out*>(a.out) + t * a.os + at, y);
+}
+
 // ---- Wide calls (prefill): one block per (kTileQueries columns, head) folds key tiles of kTileKeys staged in shared
 // memory into every column's online softmax, so each key and value is read once per tile of columns. FP32 or FP16
 // rings (Fp16: widened as they are staged); FP32 arithmetic in another order than attention_kernel (not its bits).
@@ -775,7 +1029,9 @@ struct FlashLayout {
     static_assert(kV % 32 == 0 && kS % 32 == 0 && kP % 32 == 0 && kB % 32 == 0 && kTab % 32 == 0 && kR % 32 == 0, "fragment alignment");
 };
 
-template <typename Out, int G>
+// Lowbit: the rings hold the rk4v4 coding (lowbit_store), dequantized to FP16 as they are staged; the queries are
+// rotated as the keys were.
+template <typename Out, int G, bool Lowbit = false, int KB = 4, int VB = 4>
 __global__ void __launch_bounds__(G * kFlashQueries * 2) attention_flash_kernel(AttentionArgs a, int cols) {
     namespace wm = nvcuda::wmma;
     using L = FlashLayout<G>;
@@ -839,7 +1095,37 @@ __global__ void __launch_bounds__(G * kFlashQueries * 2) attention_flash_kernel(
         for (int i = tid; i < kFlashKeys * 32; i += kThreadsF) { // 16 uint4 per row of K, then of V
             const int which = i / (kFlashKeys * 16), j = (i / 16) % kFlashKeys, c = (i % 16) * 8;
             uint4 v = make_uint4(0, 0, 0, 0);
-            if (j < nk) {
+            if constexpr (Lowbit) {
+                if (j < nk) {
+                    const std::int64_t slot = (k0 + j) % a.capacity;
+                    const unsigned char* rowp = static_cast<const unsigned char*>(which == 0 ? a.k : a.v) + slot * (which == 0 ? a.k_row : a.v_row);
+                    const int bits = which == 0 ? KB : VB, code = bits * kHeadDim / 8;
+                    const int scale_at = a.kv_heads * code + (which == 0 || VB == 8 ? g * 4 + (c >> 6) * 2 : g * 8 + (c >> 5) * 2);
+                    const float sc = __half2float(*reinterpret_cast<const __half*>(rowp + scale_at));
+                    float f[8];
+                    if (bits == 8) {
+                        const uint2 w = *reinterpret_cast<const uint2*>(rowp + g * code + c);
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) { f[e] = s8_at(w.x, e) * sc, f[4 + e] = s8_at(w.y, e) * sc; }
+                    } else if (which == 0) {
+                        const unsigned w = *reinterpret_cast<const unsigned*>(rowp + g * code + c / 2);
+                        const unsigned lo4 = lloyd4_expand4(w), hi4 = lloyd4_expand4(w >> 16);
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) { f[e] = s8_at(lo4, e) * sc, f[4 + e] = s8_at(hi4, e) * sc; }
+                    } else {
+                        const unsigned w = *reinterpret_cast<const unsigned*>(rowp + g * code + c / 2);
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) { f[e] = s4_at(w, e) * sc; }
+                    }
+                    unsigned hv[4];
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        const __half2 pair = __floats2half2_rn(f[2 * e], f[2 * e + 1]);
+                        std::memcpy(&hv[e], &pair, 4);
+                    }
+                    v = make_uint4(hv[0], hv[1], hv[2], hv[3]);
+                }
+            } else if (j < nk) {
                 const std::int64_t at = ((k0 + j) % a.capacity) * a.kv_width + gofs + c;
                 v = *reinterpret_cast<const uint4*>(static_cast<const __half*>(which == 0 ? a.k : a.v) + at);
             }
@@ -953,14 +1239,23 @@ __global__ void __launch_bounds__(G * kFlashQueries * 2) attention_flash_kernel(
     }
 }
 
-template <typename Out>
+template <typename Out, bool Lowbit = false, int KB = 4, int VB = 4>
 void launch_flash(const AttentionArgs& a, int cols, int kv_heads, cudaStream_t stream) {
     constexpr int kBytes = FlashLayout<3>::kBytes;
     static const bool configured = [] {
-        return cudaFuncSetAttribute(attention_flash_kernel<Out, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, kBytes) == cudaSuccess;
+        return cudaFuncSetAttribute(attention_flash_kernel<Out, 3, Lowbit, KB, VB>, cudaFuncAttributeMaxDynamicSharedMemorySize, kBytes) == cudaSuccess;
     }();
     if (!configured) { throw std::runtime_error("relative_bias_sink_attention: the tensor-core kernel's shared memory"); }
-    attention_flash_kernel<Out, 3><<<dim3((cols + kFlashQueries - 1) / kFlashQueries, kv_heads), 3 * kFlashQueries * 2, kBytes, stream>>>(a, cols);
+    attention_flash_kernel<Out, 3, Lowbit, KB, VB><<<dim3((cols + kFlashQueries - 1) / kFlashQueries, kv_heads), 3 * kFlashQueries * 2, kBytes, stream>>>(a, cols);
+}
+
+template <bool Split>
+void launch_lowbit(const AttentionArgs& a, dim3 grid, bool bf16, int kb, int vb, cudaStream_t stream) {
+    const auto go = [&]<int KB, int VB>() {
+        if (bf16) { attention_lowbit_kernel<__nv_bfloat16, Split, KB, VB><<<grid, kThreads, 0, stream>>>(a); } else { attention_lowbit_kernel<float, Split, KB, VB><<<grid, kThreads, 0, stream>>>(a); }
+    };
+    if (kb == 4 && vb == 4) { go.template operator()<4, 4>(); } else if (kb == 8 && vb == 8) { go.template operator()<8, 8>(); }
+    else if (kb == 8) { go.template operator()<8, 4>(); } else { go.template operator()<4, 8>(); }
 }
 
 } // namespace
@@ -993,17 +1288,34 @@ void head_norms_fp32(std::span<const HeadNormJob> jobs, cudaStream_t stream, con
         if (job.append != nullptr) {
             const KvAppend& ap = *job.append;
             require(ap.cache != nullptr && ap.cache->data != nullptr && ap.cache->is_contiguous() &&
-                        ap.cache->ne[0] == x.ne[0] && ap.cache->ne[1] >= cols && ap.cache->ne[2] == 1 && ap.cache->ne[3] == 1 &&
+                        (ap.cache->ne[0] == x.ne[0] || ap.cache->dtype == DType::U8) && ap.cache->ne[1] >= cols && ap.cache->ne[2] == 1 && ap.cache->ne[3] == 1 &&
                         ap.start >= 0,
                     op, "an append's cache must be contiguous FP32 or FP16 [rows, capacity >= T]");
             a.cache[j]        = ap.cache->data;
-            a.cache_fp16[j]   = fp16_ring(ap.cache->dtype, op);
             a.cache_start[j]  = ap.start;
             a.cache_offset[j] = ap.start_offset;
             a.capacity[j]     = ap.cache->ne[1];
-            a.cache_rows[j]   = x.ne[0];
-            a.quant[j]        = ap.quant;
-            require(ap.quant == 0 || (a.cache_fp16[j] && head_dim == 128), op, "a simulated low-bit append needs an FP16 ring and heads of 128");
+            if (ap.cache->dtype == DType::U8) {
+                // A lowbit ring (rk4v4 coding): keys from the clip job, values from the unit-rms one.
+                const std::int64_t heads = x.ne[0] / 128;
+                const bool keys = ap.quant == kLowbitKeys4 || ap.quant == kLowbitKeys8, values = ap.quant == kLowbitValues4 || ap.quant == kLowbitValues8;
+                const int bits = ap.quant == kLowbitKeys4 || ap.quant == kLowbitValues4 ? 4 : 8;
+                require(head_dim == 128 && (keys ? !job.unit_rms : values && job.unit_rms) && columns == nullptr &&
+                            ap.cache->ne[0] == heads * (keys ? lowbit_key_bytes(bits) : lowbit_value_bytes(bits)) &&
+                            (j == 0 || a.lowbit_heads == 0 || a.lowbit_heads == heads),
+                        op, "a lowbit ring takes keys (clip) or values (unit rms) of heads of 128, its row bytes, no batched columns");
+                a.lowbit[j] = 1, a.quant[j] = ap.quant, a.lowbit_heads = heads;
+                a.cache_rows[j] = ap.cache->ne[0];
+            } else {
+                a.cache_fp16[j]   = fp16_ring(ap.cache->dtype, op);
+                a.cache_rows[j]   = x.ne[0];
+                a.quant[j]        = ap.quant;
+                require(ap.quant == 0 || (a.cache_fp16[j] && head_dim == 128), op, "a simulated low-bit append needs an FP16 ring and heads of 128");
+            }
+        }
+        if (job.rotate) {
+            require(head_dim == 128 && !job.unit_rms, op, "a rotated job is a clip of heads of 128");
+            a.rotate[j] = true;
         }
         if (job.unit_rms) {
             require(job.eps > 0.0F, op, "eps must be positive");
@@ -1111,6 +1423,51 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     }
     require(table.dtype == DType::FP32 && table.is_contiguous() && table.ne[0] == s.d_rel && table.ne[1] > 0, op,
             "table must be contiguous FP32 [d_rel, E]");
+    if (k_cache.dtype == DType::U8 || v_cache.dtype == DType::U8) {
+        // Lowbit rings (the rk4v4 coding, appended by head_norms_fp32; the queries rotated).
+        const int kb = k_cache.ne[0] == s.kv_heads * lowbit_key_bytes(4) ? 4 : k_cache.ne[0] == s.kv_heads * lowbit_key_bytes(8) ? 8 : 0;
+        const int vb = v_cache.ne[0] == s.kv_heads * lowbit_value_bytes(4) ? 4 : v_cache.ne[0] == s.kv_heads * lowbit_value_bytes(8) ? 8 : 0;
+        require(k_cache.dtype == DType::U8 && v_cache.dtype == DType::U8 && k_cache.is_contiguous() && v_cache.is_contiguous() && kb != 0 &&
+                    vb != 0 && k_cache.ne[1] == v_cache.ne[1] && k_cache.data != nullptr && v_cache.data != nullptr && k_new == nullptr &&
+                    v_new == nullptr && columns == nullptr && reinterpret_cast<std::uintptr_t>(k_cache.data) % 16 == 0 &&
+                    reinterpret_cast<std::uintptr_t>(v_cache.data) % 16 == 0,
+                op, "lowbit rings: U8 [kv_heads * lowbit_key_bytes | lowbit_value_bytes, capacity], pre-appended, aligned, not batched");
+        const std::int64_t capacity = k_cache.ne[1];
+        require(s.window > 0 ? capacity >= s.window - 1 + cols : capacity >= start + cols, op, "the KV ring cannot hold the visible keys");
+        require(capacity * k_cache.ne[0] <= std::numeric_limits<std::int32_t>::max() &&
+                    static_cast<std::int64_t>(table.ne[1]) * s.d_rel <= std::numeric_limits<std::int32_t>::max(),
+                op, "a lowbit ring and table must fit 32-bit offsets");
+        a.q = static_cast<const float*>(q.data), a.r = static_cast<const float*>(r.data), a.sink = static_cast<const float*>(sink.data);
+        a.table = static_cast<const float*>(table.data);
+        a.k = k_cache.data, a.v = v_cache.data, a.out = out.data;
+        a.heads = s.heads, a.group = s.heads / s.kv_heads, a.d_rel = s.d_rel, a.extent = table.ne[1], a.window = s.window;
+        a.start = start, a.start_offset = start_offset, a.capacity = capacity, a.kv_width = kv_width;
+        a.k_row = static_cast<int>(k_cache.ne[0]), a.v_row = static_cast<int>(v_cache.ne[0]), a.kv_heads = s.kv_heads;
+        std::int64_t keys = s.window > 0 ? std::min<std::int64_t>(capacity, s.window) : capacity;
+        if (start_offset == nullptr) { keys = std::min<std::int64_t>(keys, start + cols); }
+        const int splits = static_cast<int>((keys + kSplitKeys - 1) / kSplitKeys);
+        require((split_workspace == nullptr) == (split_counters == nullptr), op, "split_workspace and split_counters come together");
+        const bool bf16 = out.dtype == DType::BF16;
+        if (split_workspace != nullptr && cols <= kSplitMaxColumns && keys > kSplitMinKeys) {
+            require(split_workspace->dtype == DType::FP32 && split_workspace->is_contiguous() &&
+                        split_workspace->bytes() >= relative_bias_attention_split_bytes(s, cols, capacity),
+                    op, "split_workspace must be contiguous FP32 of relative_bias_attention_split_bytes");
+            a.split = static_cast<float*>(split_workspace->data), a.counters = split_counters;
+            const dim3 parts(cols, s.heads, splits);
+            launch_lowbit<true>(a, parts, bf16, kb, vb, stream);
+        } else if (tiled && cols > kSplitMaxColumns) {
+            require(a.group == 3 && s.d_rel <= 16, op, "the lowbit tensor-core route takes groups of 3 and d_rel <= 16");
+            const auto flash = [&]<int KB, int VB>() {
+                if (bf16) { launch_flash<__nv_bfloat16, true, KB, VB>(a, cols, s.kv_heads, stream); } else { launch_flash<float, true, KB, VB>(a, cols, s.kv_heads, stream); }
+            };
+            if (kb == 4 && vb == 4) { flash.template operator()<4, 4>(); } else if (kb == 8 && vb == 8) { flash.template operator()<8, 8>(); }
+            else if (kb == 8) { flash.template operator()<8, 4>(); } else { flash.template operator()<4, 8>(); }
+        } else {
+            launch_lowbit<false>(a, dim3(cols, s.heads), bf16, kb, vb, stream);
+        }
+        check_launch(op);
+        return;
+    }
     const bool fp16 = fp16_ring(k_cache.dtype, op);
     require(v_cache.dtype == k_cache.dtype && k_cache.is_contiguous() && v_cache.is_contiguous() && k_cache.ne[0] == kv_width &&
                 v_cache.ne[0] == kv_width && k_cache.ne[1] == v_cache.ne[1],

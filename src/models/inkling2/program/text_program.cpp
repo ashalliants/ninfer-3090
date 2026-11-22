@@ -168,6 +168,11 @@ ProgramLimits checked(ProgramLimits limits) {
         throw std::invalid_argument("inkling2: max_rollback must be in 0..max_chunk");
     }
     if (limits.slots < 1) { throw std::invalid_argument("inkling2: a Program holds at least one slot"); }
+    const bool lowbit = std::any_of(limits.kv_lowbit_k.begin(), limits.kv_lowbit_k.end(), [](std::uint8_t b) { return b != 0; }) ||
+                        std::any_of(limits.kv_lowbit_v.begin(), limits.kv_lowbit_v.end(), [](std::uint8_t b) { return b != 0; });
+    if (lowbit && (!limits.kv_fp16 || limits.slots > 1 || !limits.kv_quant_k.empty())) {
+        throw std::invalid_argument("inkling2: low-bit KV rings need FP16 rings elsewhere and one slot");
+    }
     if (!limits.kv_quant_k.empty() && (!limits.kv_fp16 || (limits.kv_quant_recent > 0 && limits.slots > 1))) {
         throw std::invalid_argument("inkling2: simulated low-bit KV needs FP16 rings (and one slot with a recent window)");
     }
@@ -187,9 +192,20 @@ TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t 
     // One slot's state (its rings and histories), then the one copy of the rollback state and taps.
     std::size_t per_slot = 0, shared = 0;
     std::vector<std::size_t> capacity(c.num_layer_visits);
+    // A visit's low-bit K and V bits (0: FP16 / FP32 as the ring); only global visits take them, both or neither.
+    const auto kbits = [&](std::uint32_t v) { return v < limits.kv_lowbit_k.size() && !c.local[c.physical(v)] ? int(limits.kv_lowbit_k[v]) : 0; };
+    const auto vbits = [&](std::uint32_t v) { return v < limits.kv_lowbit_v.size() && !c.local[c.physical(v)] ? int(limits.kv_lowbit_v[v]) : 0; };
+    const auto lowbit = [&](std::uint32_t v) { return kbits(v) != 0; };
+    for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
+        if ((kbits(v) != 0) != (vbits(v) != 0) || (kbits(v) != 0 && kbits(v) != 4 && kbits(v) != 8) || (vbits(v) != 0 && vbits(v) != 4 && vbits(v) != 8)) {
+            throw std::invalid_argument("inkling2: a low-bit global ring codes K and V in 4 or 8 bits each");
+        }
+    }
     for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
         capacity[v] = c.local[c.physical(v)] ? local_cap : static_cast<std::size_t>(limits.max_context);
-        per_slot += 2 * padded(kv * capacity[v] * ring_bytes) + 2 * padded(kv * taps * 4) + 2 * padded(std::size_t(c.hidden_size) * taps * 4);
+        const std::size_t rings = lowbit(v) ? padded(c.kv_heads * ops::lowbit_key_bytes(kbits(v)) * capacity[v]) + padded(c.kv_heads * ops::lowbit_value_bytes(vbits(v)) * capacity[v])
+                                            : 2 * padded(kv * capacity[v] * ring_bytes);
+        per_slot += rings + 2 * padded(kv * taps * 4) + 2 * padded(std::size_t(c.hidden_size) * taps * 4);
         if (limits.max_rollback > 0) {
             const std::size_t saved = taps + static_cast<std::size_t>(limits.max_rollback);
             shared += 2 * padded(kv * saved * 4) + 2 * padded(std::size_t(c.hidden_size) * saved * 4);
@@ -217,8 +233,13 @@ TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t 
         offset = slot * per_slot; // every slot's tensors in the same order: slot s's at slot_stride_ * s from slot 0's
         for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
             VisitState s;
-            s.k_cache   = carve(i32(kv), i32(capacity[v]), ring);
-            s.v_cache   = carve(i32(kv), i32(capacity[v]), ring);
+            if (lowbit(v)) {
+                s.k_cache = carve(i32(c.kv_heads * ops::lowbit_key_bytes(kbits(v))), i32(capacity[v]), DType::U8);
+                s.v_cache = carve(i32(c.kv_heads * ops::lowbit_value_bytes(vbits(v))), i32(capacity[v]), DType::U8);
+            } else {
+                s.k_cache = carve(i32(kv), i32(capacity[v]), ring);
+                s.v_cache = carve(i32(kv), i32(capacity[v]), ring);
+            }
             s.k_hist    = carve(i32(kv), i32(taps));
             s.v_hist    = carve(i32(kv), i32(taps));
             s.attn_hist = carve(i32(c.hidden_size), i32(taps));
@@ -792,6 +813,11 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
             // pieces, each piece's just before its attention (below).
             ops::KvAppend k_append{&st.k_cache, start, start_offset_}, v_append{&st.v_cache, start, start_offset_};
             if (!limits_.kv_quant_k.empty() && limits_.kv_quant_recent == 0) { k_append.quant = limits_.kv_quant_k[v], v_append.quant = limits_.kv_quant_v[v]; }
+            if (st.k_cache.dtype == DType::U8) {
+                k_append.quant = limits_.kv_lowbit_k[v] == 4 ? ops::kLowbitKeys4 : ops::kLowbitKeys8;
+                v_append.quant = limits_.kv_lowbit_v[v] == 4 ? ops::kLowbitValues4 : ops::kLowbitValues8;
+                jobs[0].rotate = true; // the queries meet the keys in the rotated basis
+            }
             jobs[2].x = &kconv, jobs[2].head_dim = d, jobs[2].threshold = c.qk_clip, jobs[2].append = &k_append;
             jobs[3].x = &vconv, jobs[3].head_dim = d, jobs[3].unit_rms = true, jobs[3].eps = eps, jobs[3].append = &v_append;
             ops::head_norms_fp32(std::span<const ops::HeadNormJob>(jobs, pieces.size() == 1 ? 4 : 2), stream_, columns_);
@@ -1014,6 +1040,27 @@ void TextProgram::age_rings() {
 }
 
 void parse_kv_quant(const TextConfig& c, const std::string& spec, ProgramLimits& limits) {
+    // Several forms joined by '+' (each on its own visits): later ones take the visits they name.
+    if (const std::size_t plus = spec.find('+'); plus != std::string::npos) {
+        ProgramLimits first = limits, rest = limits;
+        parse_kv_quant(c, spec.substr(0, plus), first);
+        parse_kv_quant(c, spec.substr(plus + 1), rest);
+        const auto merge = [&](auto ProgramLimits::*field) {
+            auto& out = limits.*field;
+            const auto& a = first.*field;
+            const auto& b = rest.*field;
+            out.assign(c.num_layer_visits, 0);
+            for (std::size_t v = 0; v < out.size(); ++v) {
+                const auto x = v < b.size() ? b[v] : 0;
+                out[v] = x != 0 ? x : (v < a.size() ? a[v] : 0);
+            }
+            if (std::all_of(out.begin(), out.end(), [](auto x) { return x == 0; })) { out.clear(); }
+        };
+        merge(&ProgramLimits::kv_quant_k), merge(&ProgramLimits::kv_quant_v);
+        merge(&ProgramLimits::kv_lowbit_k), merge(&ProgramLimits::kv_lowbit_v);
+        limits.kv_quant_recent = std::max(first.kv_quant_recent, rest.kv_quant_recent);
+        return;
+    }
     const auto fail = [&] { throw std::invalid_argument("inkling2: bad low-bit KV spec '" + spec + "'"); };
     std::vector<std::string> parts;
     for (std::size_t from = 0;;) {
@@ -1035,7 +1082,7 @@ void parse_kv_quant(const TextConfig& c, const std::string& spec, ProgramLimits&
         if (!c.local[c.physical(v)]) { globals.push_back(v); }
     }
     std::vector<bool> on(c.num_layer_visits, false);
-    bool chose = false, local = false;
+    bool chose = false, local = false, real = false;
     for (std::size_t i = 1; i < parts.size(); ++i) {
         const std::string& o = parts[i];
         if (o == "local") {
@@ -1053,12 +1100,25 @@ void parse_kv_quant(const TextConfig& c, const std::string& spec, ProgramLimits&
             }
         } else if (o.rfind("w=", 0) == 0) {
             limits.kv_quant_recent = std::stoi(o.substr(2));
+        } else if (o == "real") {
+            real = true;
         } else {
             fail();
         }
     }
     if (!chose) {
         for (const auto v : globals) { on[v] = true; }
+    }
+    if (real) {
+        const int kb = kq == ops::kLowbitKeys4 ? 4 : kq == ops::kLowbitKeys8 ? 8 : kq == 0 ? 16 : 0;
+        const int vb = vq == ops::kLowbitValues4 ? 4 : vq == ops::kLowbitValues8 ? 8 : vq == 0 ? 16 : 0;
+        if (kb == 0 || vb == 0 || (kb == 16) != (vb == 16) || local || limits.kv_quant_recent != 0) { fail(); }
+        limits.kv_lowbit_k.assign(c.num_layer_visits, 0);
+        limits.kv_lowbit_v.assign(c.num_layer_visits, 0);
+        for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
+            if (on[v] && kb != 16) { limits.kv_lowbit_k[v] = static_cast<std::uint8_t>(kb), limits.kv_lowbit_v[v] = static_cast<std::uint8_t>(vb); }
+        }
+        return;
     }
     limits.kv_quant_k.assign(c.num_layer_visits, 0);
     limits.kv_quant_v.assign(c.num_layer_visits, 0);

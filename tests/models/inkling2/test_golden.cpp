@@ -683,6 +683,7 @@ int main() {
             if (std::getenv("NINFER_INKLING2_TC") != nullptr) { limits.prefill_tc = tc_parts(); }
             limits.kv_fp16     = std::getenv("NINFER_INKLING2_KV") != nullptr && std::string(std::getenv("NINFER_INKLING2_KV")) == "fp16";
             limits.last_logits = true;
+            if (const char* kvq = std::getenv("NINFER_INKLING2_KVQ"); kvq != nullptr) { ink::parse_kv_quant(model->config(), kvq, limits); }
             ink::TextProgram prog(*model, limits, stream);
             double seconds = 0;
             for (int pass = 0; pass < 2; ++pass) {
@@ -775,8 +776,10 @@ int main() {
             limits.kv_fp16 = std::getenv("NINFER_INKLING2_KV") != nullptr && std::string(std::getenv("NINFER_INKLING2_KV")) == "fp16";
             limits.last_logits = true;
             if (tc) { limits.prefill_tc = ink::ProgramLimits::TensorCoreParts::all(); }
+            const char* kvq = std::getenv("NINFER_INKLING2_KVQ");
+            if (kvq != nullptr) { ink::parse_kv_quant(model->config(), kvq, limits); }
             const std::string form = std::string(limits.split_attention ? "split attention" : "single-block attention") +
-                                     (limits.kv_fp16 ? ", FP16 KV" : ", FP32 KV") + (tc ? ", TC prefill" : "") + ", chunks of " +
+                                     (limits.kv_fp16 ? ", FP16 KV" : ", FP32 KV") + (kvq != nullptr ? std::string(", KVQ ") + kvq : std::string()) + (tc ? ", TC prefill" : "") + ", chunks of " +
                                      std::to_string(kChunk);
             ink::TextProgram bench(*model, limits, stream);
             for (const std::int32_t context : {1024, 16384, only > 0 ? only : n - kSteps - 1}) {

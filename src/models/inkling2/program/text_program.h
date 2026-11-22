@@ -54,6 +54,9 @@ struct ProgramLimits {
     // codes the ones that age past them. parse_kv_quant() fills these from a spec.
     std::vector<std::int32_t> kv_quant_k, kv_quant_v;
     std::int32_t kv_quant_recent = 0;
+    // Opt-in, lossy: low-bit global KV rings (ops::kLowbitKeys4 ... : keys rotated and coded in 4 or 8 bits, values in
+    // 4 or 8), the bits per layer visit (empty or 0: FP16; only global visits take them). Needs kv_fp16 and one slot.
+    std::vector<std::uint8_t> kv_lowbit_k, kv_lowbit_v;
     // A forward of more than max(1, max_rollback) tokens (a prefill chunk) returns its last column's logits only,
     // FP32 [vocab_size, 1], the same bits as that column of all of them; saves vocab_size * 4 bytes per chunk column
     // of workspace. false: every column's.
@@ -79,7 +82,8 @@ struct ProgramLimits {
     } prefill_tc;
 };
 
-// Experimental: "k<K>v<V>[:g=i,j,..][:local][:w=N]", K one of 16 8 4 (rotated INT8, rotated Lloyd-Max 4-bit; 8n, 4n
+// Experimental: "k<K>v<V>[:g=i,j,..][:local][:w=N][:real]" (real: K and V each 4 or 8 (16: FP16), global visits, no
+// window: the rings are stored coded, kv_lowbit_k / kv_lowbit_v, instead of simulated), K one of 16 8 4 (rotated INT8, rotated Lloyd-Max 4-bit; 8n, 4n
 // unrotated), V one of 16 8 4 (INT8 per 64, int4 per 32), 4l (rotated Lloyd-Max), 4r (rotated int4), 8r; g the global
 // visits (0..7 in visit order, default all), local also the sliding ones, w the FP16 recent window. Throws on a bad spec.
 void parse_kv_quant(const TextConfig& config, const std::string& spec, ProgramLimits& limits);

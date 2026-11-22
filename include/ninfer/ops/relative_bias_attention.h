@@ -57,6 +57,17 @@ struct KvAppend {
     // codec), 2 INT8 per 64, 3 signed int4 per 32 (rk8v4's values). 0: none.
     int quant = 0;
 };
+/// Opt-in, lossy low-bit global rings: a KvAppend whose cache is U8 [kv_heads * row bytes, capacity] codes each
+/// position. Keys (the clip job) are rotated by the normalized Hadamard-128 first, then coded per 64 dimensions with an
+/// FP16 scale: kLowbitKeys4 as 4-bit Lloyd-Max indices (rk4v4's key codec, least-squares scale), kLowbitKeys8 as INT8
+/// (absmax / 127). Values (the unit-rms job) are not rotated: kLowbitValues4 signed int4 per 32 dimensions (absmax / 7,
+/// rk8v4's value plane), kLowbitValues8 INT8 per 64. A row holds every KV head's codes, then every head's scales.
+/// The attention over such rings takes queries rotated the same way (HeadNormJob::rotate).
+inline constexpr int kLowbitKeys4 = 0x11, kLowbitKeys8 = 0x12, kLowbitValues4 = 0x03, kLowbitValues8 = 0x02;
+/// Bytes per position and KV head (FP16: 256 each).
+[[nodiscard]] constexpr std::int64_t lowbit_key_bytes(int bits) { return bits == 4 ? 68 : 132; }
+[[nodiscard]] constexpr std::int64_t lowbit_value_bytes(int bits) { return bits == 4 ? 72 : 132; }
+
 /// The same coding applied in place to positions first .. first + count - 1 of an FP16 ring (an aging recent window).
 void kv_ring_fake_quant(Tensor& ring, int quant, std::int64_t first, std::int64_t count, cudaStream_t stream);
 
@@ -70,6 +81,7 @@ struct HeadNormJob {
     const PositionLogScale* log_scale  = nullptr; // clip
     float eps                          = 0.0F;    // unit rms
     const KvAppend* append             = nullptr; // or null
+    bool rotate                        = false;   // clip, heads of 128: the result rotated by the normalized Hadamard-128
 };
 inline constexpr int kHeadNormMaxJobs = 4;
 
