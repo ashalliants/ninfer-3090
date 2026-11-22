@@ -180,6 +180,9 @@ int main() {
             twice.grafts.push_back({"g", graft_path != nullptr ? graft_path : "missing-b.safetensors"});
             check(refuses_by_name(unnamed), "a LoRA adapter without a name is refused");
             check(refuses_by_name(twice), "two grafts of one name are refused");
+            ninfer::EngineOptions joined = options;
+            joined.grafts.push_back({"a+b", graft_path != nullptr ? graft_path : "missing-c.safetensors"});
+            check(refuses_by_name(joined), "a graft named with '+' (the selection's separator) is refused");
         }
         {
             // An explicit --kv-dtype bf16 (or any kv_cache form) is refused: Inkling-2's rings are FP16 or FP32.

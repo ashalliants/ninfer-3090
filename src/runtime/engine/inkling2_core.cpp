@@ -406,6 +406,13 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     };
     check_names(options_.loras, "LoRA adapter");
     check_names(options_.grafts, "graft");
+    // '+' joins graft names in a selection (Frontend::build refuses a selected one containing it): a graft named with
+    // it could never be selected. The CLI and serve parsers refuse it too.
+    for (const GraftSource& source : options_.grafts) {
+        if (source.name.find('+') != std::string::npos) {
+            throw std::invalid_argument("graft name '" + source.name + "' contains '+', which joins graft names in a selection");
+        }
+    }
     std::vector<ink::LoraAdapter> loras;
     std::vector<ink::VisitAblation> grafts;
     {
