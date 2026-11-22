@@ -7,12 +7,23 @@
 // request at a time (a second request waits in the Engine's queue), the whole request's extent reserved
 // at admission, the forward run synchronously, sampling on the host over the FP32 logits.
 //
+// Prefix reuse: the forward's state belongs to one sequence, and the Program keeps that sequence's tokens
+// (`held_`, the positions the state covers) after the request ends, plus up to kMaxCheckpoints
+// ForwardCheckpoints (a few MiB each) of earlier positions of it, the last one always at the prompt's end less its
+// last token. A request whose prompt starts with the whole held sequence continues from its end; one that agrees
+// with it only up to a checkpoint's position restores that checkpoint (prefix_reuse.h has the rule and the chat
+// shapes it serves). The Engine hears of it as a root source with `reused_tokens` (no CheckpointHandle: nothing
+// is shared or stored, so there is no context cache, no capture and no context store), counts the skipped
+// prompt tokens as reused and runs only the rest of the prefill. A request with allow_prefix_reuse off runs from
+// position 0 and takes no checkpoint.
+//
 // Not here, each refused or reported as absent the way qwen4_exp's Program does for what it lacks: the
-// context cache and every checkpoint (prefix reuse, the context store), pausing, speculation, vision,
-// prompt grafts, log-probabilities, the decode graph. docs/maintainer/dsv4-flash-plan.md, milestones 5-7.
+// context cache and the context store (a stored or shared prefix, several held sequences), pausing,
+// speculation, vision, prompt grafts, log-probabilities. docs/maintainer/dsv4-flash-plan.md.
 
 #include "models/dsv4/execution/forward.h"
 #include "models/dsv4/model.h"
+#include "models/dsv4/program/prefix_reuse.h"
 #include "models/dsv4/program/host_sampling.h"
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/frontend/graft.h"
@@ -377,8 +388,16 @@ private:
     [[nodiscard]] bool valid(SequenceHandle sequence) const noexcept;
     void release_lane() noexcept;
     // Runs history[from, to) through the forward from position `from` and waits for it; the last
-    // position's logits are then in `logits_`.
+    // position's logits are then in `logits_`. `held_` follows the forward's state.
     void run_forward(std::size_t from, std::size_t to);
+    // The reuse a request would get now (nothing when its plan allows none, or the forward's state does not
+    // match `held_`).
+    [[nodiscard]] PrefixReuse plan_reuse(const RequestBasePlan::Impl& base) const;
+    // Forgets the held sequence and its checkpoints: the forward's state no longer matches any tokens.
+    void drop_held() noexcept;
+    // Saves the state at `position` (the forward must stand there) unless a checkpoint already covers it.
+    // Best effort: a device without room for the copy just has no checkpoint.
+    void capture_checkpoint(std::uint32_t position) noexcept;
     // Downloads the logits and picks the next token under the lane's sampling and the grammar mask.
     TokenId sample_next(runtime::TokenMaskProvider* masks, bool& constraint_failed, bool& numerical_failure);
     [[nodiscard]] GenerationTimings timings() const;
@@ -395,6 +414,7 @@ private:
         std::uint32_t state_tokens  = 0; // history tokens the forward has consumed
         std::uint32_t prompt_tokens = 0;
         std::uint32_t extent        = 0;
+        PrefixReuse reuse; // what binding chose: applied when the binding completes
         TokenCounts generated;
         std::mt19937_64 rng;
         runtime::BeginSummary begin;
@@ -408,6 +428,14 @@ private:
     std::uint64_t pending_     = 0; // the open pending batch's transaction, or 0
     TokenId pending_token_     = 0;
     bool binding_              = false;
+    // Prefix reuse: the tokens of the sequence the forward's state holds, and checkpoints of positions of it.
+    static constexpr std::size_t kMaxCheckpoints = 4;
+    struct HeldCheckpoint {
+        std::uint32_t position = 0;
+        ForwardCheckpoint state;
+    };
+    std::vector<TokenId> held_;
+    std::vector<HeldCheckpoint> checkpoints_;
     const Tensor* logits_ = nullptr;
     std::vector<float> host_logits_;
     std::vector<std::uint32_t> mask_words_;

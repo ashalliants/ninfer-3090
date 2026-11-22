@@ -36,6 +36,7 @@ struct RequestBasePlan::Impl {
     qwen3_5::PreparedContextCache context_cache;
     ResolvedSamplingParameters sampling;
     std::vector<TokenId> prompt;
+    bool reuse = false; // the request may start from a held sequence and leaves checkpoints behind
 };
 
 RequestBasePlan::RequestBasePlan(std::shared_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -82,7 +83,8 @@ RequestBasePlan Program::plan_request(PreparedPrompt&& prompt, const runtime::Re
     base->summary.effective_output_tokens  = std::min(options.requested_output_tokens, capacity_output);
     base->summary.effective_limit_reason   = options.requested_output_tokens <= capacity_output ? FinishReason::OutputLimit
                                                                                                  : FinishReason::ContextCapacity;
-    base->summary.publish_continuation     = false; // no context cache
+    base->summary.publish_continuation     = false; // no context cache: nothing is published, only held
+    base->reuse                            = options.allow_prefix_reuse && data.identity.reusable;
     base->context_cache                    = data.context_cache;
     base->sampling                         = options.sampling;
     base->prompt                           = std::move(data.token_ids);
@@ -95,10 +97,43 @@ CheckpointHandle Program::install_external_checkpoint(const qwen3_5::PromptGraft
 
 std::optional<SourceCandidate> Program::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> checkpoint, bool,
                                                        std::span<const CheckpointHandle>, std::span<const CheckpointHandle>) const {
-    if (checkpoint) { return std::nullopt; } // no checkpoint exists
+    if (checkpoint) { return std::nullopt; } // no checkpoint handle exists
     SourceCandidate out;
-    out.remaining_work = prefill_work(base, 0, base.summary().prompt_tokens);
+    out.reused_tokens  = plan_reuse(*base.impl_).tokens;
+    out.remaining_work = prefill_work(base, out.reused_tokens, base.summary().prompt_tokens);
     return out;
+}
+
+PrefixReuse Program::plan_reuse(const RequestBasePlan::Impl& base) const {
+    if (!base.reuse || held_.empty() || held_.size() != static_cast<std::size_t>(forward_.position())) { return {}; }
+    std::vector<std::uint32_t> positions;
+    positions.reserve(checkpoints_.size());
+    for (const auto& checkpoint : checkpoints_) { positions.push_back(checkpoint.position); }
+    return plan_prefix_reuse(base.prompt, held_, positions);
+}
+
+void Program::drop_held() noexcept {
+    held_.clear();
+    checkpoints_.clear();
+}
+
+void Program::capture_checkpoint(std::uint32_t position) noexcept {
+    if (position == 0 || forward_.position() != static_cast<std::int32_t>(position)) { return; }
+    for (const auto& checkpoint : checkpoints_) {
+        if (checkpoint.position == position) { return; }
+    }
+    try {
+        HeldCheckpoint slot;
+        if (checkpoints_.size() >= kMaxCheckpoints) { // the oldest goes; its storage serves the new one
+            slot = std::move(checkpoints_.front());
+            checkpoints_.erase(checkpoints_.begin());
+        }
+        forward_.capture(slot.state);
+        slot.position = position;
+        checkpoints_.push_back(std::move(slot));
+    } catch (const std::exception&) {
+        // No room for a few MiB: this request leaves no checkpoint, which only costs a later request its reuse.
+    }
 }
 
 qwen3_5::PrefixShortlistKey Program::checkpoint_key(CheckpointHandle, std::uint32_t) const {
@@ -114,15 +149,23 @@ runtime::PrefillWork Program::prefill_work(const RequestBasePlan&, std::uint32_t
 BindingReservation Program::start_binding(const RequestBasePlan& plan, runtime::LaneId lane, const SourceCandidate& source,
                                           ResumeState* resume, ExecutionUnitKind, std::uint32_t) {
     BindingReservation out;
-    if (resume != nullptr || source.checkpoint || source.reused_tokens != 0) {
-        out.source_valid = false; // nothing is ever paused or cached here
+    if (resume != nullptr || source.checkpoint) {
+        out.source_valid = false; // nothing is ever paused or stored here
         return out;
     }
     if (lane.value != 0 || lane_.phase != Phase::Free || binding_ || pending_ != 0) {
         throw std::logic_error("DeepSeek-V4.1-Flash: binding on a busy lane (it serves one request at a time)");
     }
-    const auto& base = *plan.impl_;
+    const auto& base  = *plan.impl_;
+    PrefixReuse reuse = plan_reuse(base);
+    // The Engine priced the source when the held sequence was what it is now; a different one is not the source
+    // it chose (the Engine asks again).
+    if (source.reused_tokens != reuse.tokens) {
+        out.source_valid = false;
+        return out;
+    }
     lane_            = Lane{};
+    lane_.reuse      = reuse;
     lane_.phase      = Phase::Binding;
     lane_.base       = plan.impl_;
     lane_.extent     = std::min(options_.max_context, base.summary.prompt_tokens + base.summary.effective_output_tokens);
@@ -147,9 +190,21 @@ ContextProgress Program::poll_context(runtime::CancellationFlagView cancellation
     const auto& base   = *lane_.base;
     lane_.history      = base.prompt;
     lane_.prompt_tokens = base.summary.prompt_tokens;
-    lane_.state_tokens = 0;
+    lane_.state_tokens = lane_.reuse.tokens;
+    if (lane_.reuse.tokens != 0) { // the forward's state is brought to the reused position
+        try {
+            if (lane_.reuse.checkpoint) { forward_.restore(checkpoints_.at(*lane_.reuse.checkpoint).state); }
+        } catch (...) {
+            drop_held();
+            release_lane();
+            throw;
+        }
+        held_.resize(lane_.reuse.tokens);
+    }
     lane_.rng.seed(base.sampling.seed != 0 ? base.sampling.seed : entropy_seed());
-    lane_.begin = {.prompt_tokens = lane_.prompt_tokens, .reused_prompt_tokens = 0, .prefix_reuse_path = PrefixReusePath::Root};
+    lane_.begin = {.prompt_tokens        = lane_.prompt_tokens,
+                   .reused_prompt_tokens = lane_.reuse.tokens,
+                   .prefix_reuse_path    = lane_.reuse.tokens != 0 ? PrefixReusePath::Checkpoint : PrefixReusePath::Root};
     lane_.phase = Phase::Prefill;
     out.published = true;
     out.sequence  = handle();
@@ -187,13 +242,24 @@ void Program::release_lane() noexcept {
 }
 
 void Program::run_forward(std::size_t from, std::size_t to) {
+    // Running from `from` rewrites the state after it: checkpoints of later positions are no longer the sequence's.
+    std::erase_if(checkpoints_, [&](const HeldCheckpoint& checkpoint) { return checkpoint.position > from; });
+    if (from == 0) { drop_held(); }
+    held_.resize(std::min(held_.size(), from));
     std::size_t at = from;
-    while (at < to) {
-        const std::size_t width = std::min<std::size_t>(to - at, options_.prefill_chunk);
-        logits_ = &forward_.run(std::span<const std::int32_t>(lane_.history.data() + at, width), static_cast<std::int32_t>(at));
-        at += width;
+    try {
+        while (at < to) {
+            const std::size_t width = std::min<std::size_t>(to - at, options_.prefill_chunk);
+            logits_ = &forward_.run(std::span<const std::int32_t>(lane_.history.data() + at, width), static_cast<std::int32_t>(at));
+            held_.insert(held_.end(), lane_.history.begin() + static_cast<std::ptrdiff_t>(at),
+                         lane_.history.begin() + static_cast<std::ptrdiff_t>(at + width));
+            at += width;
+        }
+        cuda_ok(cudaStreamSynchronize(device_.stream), "forward");
+    } catch (...) {
+        drop_held(); // the state is partly advanced
+        throw;
     }
-    cuda_ok(cudaStreamSynchronize(device_.stream), "forward");
     lane_.state_tokens = static_cast<std::uint32_t>(to);
 }
 
@@ -235,12 +301,20 @@ PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::Execu
     out.summary = lane_.begin;
     try {
         const std::uint32_t remaining = lane_.prompt_tokens - lane_.state_tokens;
-        const std::uint32_t width     = std::min(remaining, options_.prefill_chunk);
+        std::uint32_t width           = std::min(remaining, options_.prefill_chunk);
+        // A later request that agrees with this prompt up to its last token (a follow-up turn whose template
+        // rewrites the end of this one, or a retry) restarts there: the chunk stops one token short of the end and
+        // the state at that position is saved. The single token that follows is one decode-sized step.
+        const std::uint32_t last = lane_.prompt_tokens - 1;
+        const bool keep_last     = lane_.base->reuse && last != 0;
+        if (keep_last && lane_.state_tokens < last && lane_.state_tokens + width > last) { width = last - lane_.state_tokens; }
+        if (keep_last && lane_.state_tokens == last) { capture_checkpoint(last); }
         out.processed_prompt_tokens   = width;
         out.complete                  = width == remaining;
         const auto wait               = Clock::now();
         run_forward(lane_.state_tokens, lane_.state_tokens + width);
         out.timing.device_wait_ns = elapsed_ns(wait);
+        if (keep_last && lane_.state_tokens == last) { capture_checkpoint(last); }
         if (out.complete) {
             bool failed = false, numerical = false;
             pending_token_    = sample_next(masks, failed, numerical);
@@ -412,6 +486,7 @@ AbortResult Program::abort(SequenceHandle sequence) noexcept {
 
 void Program::fail_all_cleanup() noexcept {
     (void)cudaStreamSynchronize(device_.stream);
+    drop_held();
     pending_ = 0;
     release_lane();
 }
@@ -436,6 +511,7 @@ MemorySummary Program::memory_summary() const noexcept {
     out.kv_capacity_max_page_groups = out.kv_capacity_page_groups;
     out.kv_cache                    = KvCacheStorage::BFloat16;
     out.kv_payload_bytes            = forward_.device_bytes();
+    for (const auto& checkpoint : checkpoints_) { out.kv_payload_bytes += checkpoint.state.device_bytes(); }
     return out;
 }
 

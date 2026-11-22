@@ -64,3 +64,9 @@ ninfer_add_test(ninfer_dsv4_expert_trace_record
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_trace_record.cpp"
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_ops ninfer_core)
 set_tests_properties(ninfer_dsv4_expert_trace_record PROPERTIES SKIP_RETURN_CODE 77)
+
+# Which part of the held sequence a new prompt reuses (the prefix-reuse rule of the Program); header only, runs
+# without the artifact or a GPU.
+ninfer_add_test(ninfer_dsv4_prefix_reuse_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_reuse.cpp"
+  LIBRARIES ninfer_core)

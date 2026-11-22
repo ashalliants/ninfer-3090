@@ -124,6 +124,16 @@ public:
 
     [[nodiscard]] std::size_t device_bytes() const noexcept;
 
+    // The part of the state that reaches back from the sequence's current position and that later positions
+    // overwrite: every layer's carried raw rows (window - 1) and every compressor's pending partial group. The
+    // compressed rows and index keys are append-only: the rows of the positions before the saved one stay valid
+    // for as long as nothing runs from an earlier position, so a checkpoint (this much state, a few MiB) plus the
+    // sequence's tokens up to its position recreates the state of that position. capture() copies it into `dst`
+    // (device memory of checkpoint_bytes()), restore() copies it back; both are stream-ordered.
+    [[nodiscard]] std::size_t checkpoint_bytes() const noexcept;
+    void capture(void* dst, cudaStream_t stream) const;
+    void restore(const void* src, cudaStream_t stream);
+
     // The compressed rows [512, N_max] (rotated) of the layer's kv owner, the owner's index keys
     // [indexer_head_dim, N_max] (rotated), the shared top-k [indexer_top_k, max_chunk] (positions,
     // -1 padded; the last chunk's) and the candidate blocks [candidate_blocks, max_chunk].

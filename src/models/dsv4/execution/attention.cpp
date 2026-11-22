@@ -156,6 +156,8 @@ struct AttentionState::Impl {
     DeviceBuffer candidates;
     std::int32_t topk = 0, candidate_blocks = 0;
     std::size_t total_bytes = 0;
+    std::int64_t keep       = 0; // carried raw rows per layer (window - 1)
+    std::int32_t head_dim   = 0;
 };
 
 AttentionState::AttentionState(const TextConfig& c, AttentionLimits limits)
@@ -167,6 +169,8 @@ AttentionState::AttentionState(const TextConfig& c, AttentionLimits limits)
     Impl& s                     = *impl_;
     const std::uint32_t n       = static_cast<std::uint32_t>(c.layers.size());
     const std::int64_t raw_rows = static_cast<std::int64_t>(c.window) - 1 + limits.max_chunk;
+    s.keep     = static_cast<std::int64_t>(c.window) - 1;
+    s.head_dim = static_cast<std::int32_t>(c.head_dim);
     s.layers.resize(n);
     s.group_of_owner.assign(n, 0);
     std::vector<std::int32_t> group_index(n, -1); // by owner layer
@@ -262,6 +266,48 @@ AttentionState& AttentionState::operator=(AttentionState&&) noexcept = default;
 AttentionState::~AttentionState()                                    = default;
 
 std::size_t AttentionState::device_bytes() const noexcept { return impl_->total_bytes; }
+
+namespace {
+
+// Calls copy(state_pointer, checkpoint_offset, bytes) for each piece of a checkpoint, in layout order: every
+// layer's carried raw rows, then every compressing group's pending kv rows and gate rows.
+template <typename Copy>
+void for_each_checkpoint_piece(const AttentionState::Impl& s, Copy&& copy) {
+    const std::size_t row = static_cast<std::size_t>(s.head_dim) * kBf16;
+    std::size_t offset    = 0;
+    for (const LayerSlot& slot : s.layers) {
+        const std::size_t bytes = static_cast<std::size_t>(s.keep) * row;
+        if (bytes != 0) { copy(bytes_of(s.groups[slot.group].table) + static_cast<std::size_t>(slot.raw_base) * row, offset, bytes); }
+        offset += bytes;
+    }
+    for (const Group& g : s.groups) {
+        if (g.pending_kv.p == nullptr) { continue; }
+        const std::size_t bytes = static_cast<std::size_t>(g.ratio - 1) * row;
+        copy(bytes_of(g.pending_kv), offset, bytes);
+        copy(bytes_of(g.pending_gate), offset + bytes, bytes);
+        offset += 2 * bytes;
+    }
+}
+
+} // namespace
+
+std::size_t AttentionState::checkpoint_bytes() const noexcept {
+    std::size_t total = 0;
+    for_each_checkpoint_piece(*impl_, [&](std::uint8_t*, std::size_t offset, std::size_t bytes) { total = std::max(total, offset + bytes); });
+    return total;
+}
+
+void AttentionState::capture(void* dst, cudaStream_t stream) const {
+    for_each_checkpoint_piece(*impl_, [&](std::uint8_t* from, std::size_t offset, std::size_t bytes) {
+        cuda(cudaMemcpyAsync(static_cast<std::uint8_t*>(dst) + offset, from, bytes, cudaMemcpyDeviceToDevice, stream), "checkpoint capture");
+    });
+}
+
+void AttentionState::restore(const void* src, cudaStream_t stream) {
+    for_each_checkpoint_piece(*impl_, [&](std::uint8_t* to, std::size_t offset, std::size_t bytes) {
+        cuda(cudaMemcpyAsync(to, static_cast<const std::uint8_t*>(src) + offset, bytes, cudaMemcpyDeviceToDevice, stream), "checkpoint restore");
+    });
+}
 
 Tensor AttentionState::compressed_rows(std::uint32_t layer) const {
     const Impl& s = *impl_;
