@@ -720,9 +720,13 @@ private:
             (options.speculative.draft_tokens < 1 || options.speculative.draft_tokens > 7)) {
             throw std::invalid_argument("--spec dspark takes --draft-tokens 1 to 7");
         }
-        // Plain decode takes no draft count.
-        if (options.speculative.backend == SpeculativeBackend::None && options.speculative.draft_tokens != 0) {
-            throw std::invalid_argument("--draft-tokens needs --spec dspark");
+        // Plain decode takes no draft count, draft floor or adaptive width.
+        if (options.speculative.backend == SpeculativeBackend::None &&
+            (options.speculative.draft_tokens != 0 || options.speculative.draft_min_p != 0.0F || options.speculative.dspark_adaptive)) {
+            throw std::invalid_argument("--draft-tokens, --draft-min-p and --dspark-adaptive need --spec dspark");
+        }
+        if (!(options.speculative.draft_min_p >= 0.0F && options.speculative.draft_min_p < 1.0F)) {
+            throw std::invalid_argument("--draft-min-p takes a probability in [0,1)");
         }
         // DSpark verifies greedy rows exactly and drafts from its own head: the Qwen drafting options have no meaning,
         // so they are refused, not ignored, with or without DSpark. The proposal head is the exception under DSpark:

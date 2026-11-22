@@ -371,10 +371,49 @@ drafter.
 Q4 P is no faster than Q8 (the kernel is no longer bound by its bytes). Truncating the block is not used: it changes
 the drafts' attention context and costs acceptance (p1, code, drops 7%).
 
+### Draft floor and adaptive width
+
+Two serving options change how many drafts a round verifies, never the output (verify still licenses every token).
+Both are on by default under `ninfer-serve`/`ninfer-cli --spec dspark`; the Engine options default to off
+(`SpeculativeOptions::draft_min_p`, `dspark_adaptive`).
+
+- **`--draft-min-p P`** (default 0.5; 0 turns it off): `DSparkProgram::draft(anchor, n, &probs)` also
+  returns the drafter's probability of each draft (`ops::dspark_draft_pick`: the argmax and its softmax probability
+  at temperature 1, the same token as `argmax_fp32`), and the round keeps the drafts before the first one under P.
+  A round whose first draft is already under P runs as a plain step (a fallback step; its time, which includes the
+  draft, is not used for either cost).
+- **`--dspark-adaptive on|off`** (default on): `DraftWidth` (`inkling2_core.cpp`) picks each round's draft count
+  from 1 to `--draft-tokens`. It keeps, per position i, an EMA of the chance that draft i is accepted once drafts
+  0 .. i - 1 were, so a round of w drafts is expected to commit `1 + sum_{i<w} prod_{j<=i} s_j` tokens, and an EMA of
+  each width's measured round time (an untimed width is priced on the line through the timed ones). The width with
+  the most expected tokens per second wins against a plain step's one token per plain step time; every 8th round runs
+  a neighbouring width so its cost and survival stay measured. The old gate's probes (8 .. 64 plain steps) remain
+  for a request whose rounds stop paying. The idea is ninfer-all's `--adaptive-mtp` (67a92907) and its DSpark
+  draft floor; the controller here is smaller (one request at a time, no batch).
+
+Serving, 12 greedy chat requests of up to 300 tokens (code, lists, YAML, a haiku, SQL, a
+translation, a bash script, a table, a limerick, a recipe, an explanation), `predicted_per_second` averaged over the
+requests, one server per leg, the output md5 the same on every leg and configuration (V100, 2026-11-21):
+
+| `--spec dspark` and | tok/s | drafts accepted |
+|---|---|---|
+| fixed 3 (before; ABBA A legs) | 81.83 / 82.02 | 50.1% / 50.3% of 2,095 / 2,098 |
+| **`--dspark-adaptive on --draft-min-p 0.5` (default; ABBA B legs)** | **88.86 / 88.73 (+8.4%)** | 60.7% / 61.0% of 2,904 / 2,867 |
+
+(An earlier ABBA of the same pair: 81.96 / 82.00 against 88.63 / 88.63, +8.1%.)
+
+Single legs while choosing (the same requests; a leg moves by about 1 tok/s): fixed 3 81.4, min-p 0.1 81.7,
+0.3 83.6, 0.5 86.8, 0.7 87.2; adaptive alone 85.4 and 86.1; adaptive with min-p 0.3 87.0, 0.5 88.4; `--draft-tokens 4`
+and 5 with a fixed width lose (81.9 at min-p 0.5, 84.0 at 0.6), and with the adaptive width 5 ties 3 (88.8 at min-p
+0.5) while 4 does not help (84.0). Per request the default gains on 11 of 12 (+3.7% to +20.5%) and ties the YAML
+conversion (-0.9%), where fixed rounds already accept 72%. Most of the gain is rounds that the fixed gate turned
+down: the adaptive width drafts 35% more tokens and accepts more of them.
+
 ninfer's DFlash ([dflash.md](dflash.md)) already has the masked-block, non-causal, context-K/V shape
 with separate context roles. What is new: per-layer softmax tap fusion instead of one feature
 projection, taps counted in visits, the Markov RNN chain instead of per-column argmax, and global
 attention in a draft layer.
+
 
 ## Vision tower (`mmproj-BF16.gguf`, `clip`, projector `inkling2v`)
 
@@ -522,7 +561,8 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
   resumed forwards are the cold ones call for call and, as the tensor-core routes dispatch on a call's width, bit for
   bit. Reuse is therefore chunk-grained (2048 positions at the default chunk 2048; `--prefill-chunk 256` for finer reuse). With `--spec dspark` the drafter's sliding rings and anchor context are kept with it (`DSparkProgram::save`); a sampled request does not run the drafter, so a greedy one resumes only from a snapshot a greedy one left. Images wholly in the reused prefix are not encoded. The
   result reports `reused_prompt_tokens`. One snapshot is kept; a prompt that does not resume from it replaces it (or clears it, when no longer than one chunk).
-- `--spec dspark` (default 3 drafts) speculates on greedy requests (`Inkling2Core::run`):
+- `--spec dspark` (up to 3 drafts, `--draft-min-p 0.5` and `--dspark-adaptive on` by default; see "Draft floor and
+  adaptive width") speculates on greedy requests (`Inkling2Core::run`):
   - A round drafts n tokens after the anchor, forwards `[anchor, drafts]`, and consumes each column
     whose input is the token the previous column chose; the first that differs ends the round, and
     `keep()` cuts the target back. Every token still goes through the plain loop, so the output is

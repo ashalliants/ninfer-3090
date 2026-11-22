@@ -81,19 +81,36 @@ inline void validate_ngram_cli_options(const SpeculativeOptions& options) {
     }
 }
 
-// --spec dspark without --draft-tokens drafts 3 per round, the measured best on a V100 (1.28x plain greedy over
-// chat prompts; 2 and 4 drafts 1.24x and 1.26x).
+// --spec dspark without --draft-tokens drafts up to 3 per round, the measured best on a V100 (1.28x plain greedy over
+// chat prompts at a fixed 3; 2 and 4 drafts 1.24x and 1.26x).
 inline constexpr std::uint32_t kDSparkDefaultDraftTokens = 3;
+// --spec dspark without --draft-min-p or --dspark-adaptive: drafts stop under a drafter probability of 0.5 and each
+// round picks its draft count (+8.4% over a fixed 3 on 12 serve chats, ABBA on a V100;
+// docs/maintainer/inkling2-model.md, "Draft floor and adaptive width").
+inline constexpr float kDSparkDefaultDraftMinP = 0.5F;
 
-// `draft_tokens_given`: --draft-tokens was on the command line. Only an omitted value takes the default; an
-// explicit 0 stays 0 for validation to refuse.
-inline void apply_speculative_cli_defaults(SpeculativeOptions& options, bool draft_tokens_given) {
-    if (options.backend == SpeculativeBackend::DSpark && !draft_tokens_given) {
-        options.draft_tokens = kDSparkDefaultDraftTokens;
-    }
+// What the command line set explicitly (an omitted value may take a default).
+struct SpeculativeCliGiven {
+    bool draft_tokens    = false;
+    bool draft_min_p     = false;
+    bool dspark_adaptive = false;
+};
+
+// Only an omitted value takes the default; an explicit 0 stays 0 (for validation to refuse, for --draft-tokens).
+inline void apply_speculative_cli_defaults(SpeculativeOptions& options, const SpeculativeCliGiven& given) {
+    if (options.backend != SpeculativeBackend::DSpark) { return; }
+    if (!given.draft_tokens) { options.draft_tokens = kDSparkDefaultDraftTokens; }
+    if (!given.draft_min_p) { options.draft_min_p = kDSparkDefaultDraftMinP; }
+    if (!given.dspark_adaptive) { options.dspark_adaptive = true; }
 }
 
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
+    if (!(options.draft_min_p >= 0.0F && options.draft_min_p < 1.0F)) {
+        throw std::invalid_argument("--draft-min-p takes a probability in [0,1)");
+    }
+    if ((options.draft_min_p != 0.0F || options.dspark_adaptive) && options.backend != SpeculativeBackend::DSpark) {
+        throw std::invalid_argument("--draft-min-p and --dspark-adaptive need --spec dspark");
+    }
     validate_ngram_cli_options(options);
     validate_adaptive_cli_options(options);
     if (options.dspark_window_explicit && options.backend != SpeculativeBackend::DSpark) {

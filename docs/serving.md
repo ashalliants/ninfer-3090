@@ -144,9 +144,12 @@ different from the Qwen3.5 models:
   50-100 ms; a 1920 x 1200 one, 2,280 tokens, in about 0.4 s. Startup encodes one blank image (about
   2 s) so the first real image does not pay the tower's one-time setup. `--vision-residency` has no
   effect for this model.
-- **DSpark speculation** (Inkling-2, `--spec dspark [--draft-tokens N]`, N from 1 to 7, default 3):
-  greedy requests only, output unchanged token for token; see [cli.md](cli.md#speculative-decoding).
-  About 1.28x plain greedy decode on a Tesla V100 over chat prompts, most on code.
+- **DSpark speculation** (Inkling-2, `--spec dspark [--draft-tokens N] [--draft-min-p P] [--dspark-adaptive on|off]`):
+  greedy requests only, output unchanged token for token; see [cli.md](cli.md#speculative-decoding). `N` (1 to 7, default 3) is the most drafts
+  a round verifies; by default each round picks its count from the request's recent acceptance and measured round
+  costs (`--dspark-adaptive on`) and drops the drafts from the first one the drafter gives under 0.5 probability on
+  (`--draft-min-p 0.5`; `0` keeps them all). On a Tesla V100 over 12 chat requests: 88.8 tok/s greedy against 81.9
+  for a fixed 3 drafts and about 72 plain ([measurements](maintainer/inkling2-model.md#draft-floor-and-adaptive-width)).
 - **MTP speculation** (`--spec mtp --draft-tokens N`, N from 1 to 7) needs an artifact converted
   with the drafter (`--mtp-gguf`, [weight-conversion.md](weight-conversion.md)); a plain artifact
   refuses with that instruction. The output is the same as without it, token for token (greedy).
@@ -2728,6 +2731,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--reasoning-loop off\|stop\|conclude` | reasoning-loop guard for thinking-enabled requests: end the reply or close the thinking when it keeps repeating whole passages (details under [OpenAI Chat Completions](#openai-chat-completions)) | `off` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
+| `--draft-min-p P` | Inkling-2 `--spec dspark`: a round's drafts stop before the first whose drafter probability is under P, in [0,1); `0` keeps every draft. Only speed changes, never the output | `0.5` |
+| `--dspark-adaptive on\|off` | Inkling-2 `--spec dspark`: each round drafts 1 to `--draft-tokens`, the count the request's recent acceptance and the measured round costs favour; `off` drafts `--draft-tokens` every round. Only speed changes, never the output | `on` |
 | `--dspark-window auto\|N` | Inkling-2 `--spec dspark` only (refused otherwise, `auto` included): the drafter's global layer attends over the last N context positions (`0`: the whole context; else at least the drafter's sliding window). Only the drafts change, never the output. `auto` keeps the whole context when it fits beside `--max-context` and falls back to 32768, then 16384 | `auto` |
 | `--vision-residency resident\|overlay` | `overlay` keeps the Vision tower in pinned host memory and encodes each image inside a window borrowed from free KV pages, or from the evict-ranked text weight tail when those fall short, so `--vision` no longer reserves device memory and `--kv-capacity auto` resolves the no-vision capacity; requires `--vision` and CUDA virtual memory management. Inkling-2: the tower stays pinned and is copied into the text workspace for each image (about 0.2 s an image; it saves memory only at a prefill chunk of 512 or more), see [the Inkling-2 notes](maintainer/inkling2-model.md#context-with-dspark-and-vision) | `resident` |
 | `--vision-max-merged N` | merged-token budget of one media item, `[64, 16384]`; larger images and video frame pairs are downscaled at preprocessing instead of being rejected, and the overlay window is sized for it | 16384 |

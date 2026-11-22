@@ -62,7 +62,9 @@ public:
     // The first `n` (1 .. block_size - 1) tokens drafted after `anchor`, the target's next token at position() (>= 1).
     // The block forward always takes all block_size positions (its attention is non-causal); only the Markov chain
     // and the head stop at n, which leaves the n drafts the same as the full block's first n.
-    std::vector<std::int32_t> draft(std::int32_t anchor, std::int32_t n);
+    // `probs`, when not null, receives the drafter's probability of each draft (ops::dspark_draft_pick, the same tokens
+    // as argmax_fp32).
+    std::vector<std::int32_t> draft(std::int32_t anchor, std::int32_t n, std::vector<float>* probs = nullptr);
 
 private:
     struct Layer {
@@ -82,6 +84,7 @@ private:
     Tensor joint_in_;   // FP32 [2R + 2H]: state, W1[prev], x_i, the context of the anchor (f_rnn)
     Tensor hb_;         // FP32 [V] = W_head b_o
     Tensor ids_;        // I32 [block]: the anchor, then the drafts
+    Tensor probs_;      // FP32 [block]: the drafter's probability of each draft (picked drafts)
     std::int64_t position_ = 0;
     // The drafter's compact forms (lossy; they change only drafts): P = W_head W_o as Q8, and the head as Q8 (the
     // target's re-encoded head when it has one, else the drafter's own copy in head_memory_).

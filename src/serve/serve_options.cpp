@@ -245,7 +245,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--no-exit-on-engine-failure] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4|fp16|fp32 (Inkling-2: fp16|fp32)] [--dense-q8 head|all (lossy)] [--no-split-attention] [--prefill-math tc|fp32] "
-           "[--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N] [--dspark-window N]] "
+           "[--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N] [--dspark-window N] [--draft-min-p P] [--dspark-adaptive on|off]] "
            "[--ngram-draft-tokens 0|15] [--ngram-min-match N] [--adaptive-draft-tokens 0|3] "
            "[--relaxed-drafting [P]] [--draft-context-rows N] "
            "[--default-max-tokens N] [--max-output-tokens N] [--default-thinking-budget N] "
@@ -659,7 +659,7 @@ std::vector<std::string> redacted(const std::vector<std::string>& words) {
 ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin>& origins,
                              std::size_t& current) {
     ServeOptions options;
-    bool draft_tokens_given = false; // --draft-tokens on the command line (an omitted one may take a default)
+    product::SpeculativeCliGiven given; // the speculative options on the command line (an omitted one may take a default)
     bool kv_capacity_explicit  = false;
     bool device_explicit       = false;
     bool context_store_tuning  = false;
@@ -1049,7 +1049,7 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
         } else if (arg == "--draft-tokens") {
-            draft_tokens_given               = true;
+            given.draft_tokens               = true;
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
         } else if (arg == "--dspark-window") {
@@ -1058,6 +1058,14 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.speculative.dspark_window = std::string_view(form) == "auto"
                                                     ? SpeculativeOptions::kDSparkWindowAuto
                                                     : static_cast<std::uint32_t>(parse_nonnegative_int(form, "dspark-window"));
+        } else if (arg == "--draft-min-p") {
+            given.draft_min_p               = true;
+            options.speculative.draft_min_p = parse_float_in(require_value("--draft-min-p"), "draft-min-p", 0.0f, 1.0f);
+        } else if (arg == "--dspark-adaptive") {
+            given.dspark_adaptive  = true;
+            const std::string_view form = require_value("--dspark-adaptive");
+            if (form != "on" && form != "off") { throw std::invalid_argument("--dspark-adaptive takes on or off"); }
+            options.speculative.dspark_adaptive = form == "on";
         } else if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--ngram-draft-tokens"), "ngram-draft-tokens"));
@@ -1608,7 +1616,7 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
     }
     models::qwen3_5::validate_lossy_prefill_options(options.lossy_prefill);
     product::apply_speculative_defaults(options.speculative);
-    product::apply_speculative_cli_defaults(options.speculative, draft_tokens_given);
+    product::apply_speculative_cli_defaults(options.speculative, given);
     product::validate_speculative_cli_options(options.speculative);
     if (options.flash_next.moe_gate_up_registers && !options.flash_next.moe_precast_input) {
         throw std::invalid_argument("--moe-gate-up-registers reads the input that --moe-precast-input casts once "

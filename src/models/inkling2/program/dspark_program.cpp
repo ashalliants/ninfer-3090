@@ -59,7 +59,7 @@ DSparkProgram::DSparkProgram(const Model& model, std::int32_t max_context, std::
     const bool windowed = global_window > 0 && global_window < max_context;
     const std::size_t kv = std::size_t(c.kv_heads) * c.head_dim, h = c.hidden_size, r = c.markov_rank, v = text_.vocab_size;
     std::size_t total = padded(h * c.block_size * 4) + padded((2 * r + 2 * h) * 4) + padded(v * 4) +
-                        padded(std::size_t(c.block_size) * 4);
+                        padded(std::size_t(c.block_size) * 4) + padded(std::size_t(c.block_size) * 4);
     std::vector<std::size_t> capacity(c.layers);
     for (std::uint32_t i = 0; i < c.layers; ++i) {
         window_.push_back(c.local[i] ? i32(c.sliding_window) : windowed ? global_window : 0);
@@ -82,6 +82,7 @@ DSparkProgram::DSparkProgram(const Model& model, std::int32_t max_context, std::
     joint_in_ = carve(DType::FP32, {i32(2 * r + 2 * h)});
     hb_       = carve(DType::FP32, {i32(v)});
     ids_      = carve(DType::I32, {i32(c.block_size)});
+    probs_    = carve(DType::FP32, {i32(c.block_size)});
     cuda(cudaMemsetAsync(state_memory_.p, 0, total, stream_), "clear");
 
     const DSparkWeights& w = model_.dspark_weights();
@@ -243,7 +244,7 @@ void DSparkProgram::extend(std::span<const Tensor> taps, std::int32_t n) {
     position_ += n;
 }
 
-std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t n_drafts) {
+std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t n_drafts, std::vector<float>* probs) {
     const DSparkConfig& c = config_;
     if (position_ < 1) { throw std::invalid_argument("inkling2 dspark: drafting needs a committed context"); }
     if (anchor < 0 || static_cast<std::uint32_t>(anchor) >= text_.unpadded_vocab_size) { throw std::invalid_argument("inkling2 dspark: bad anchor"); }
@@ -252,6 +253,9 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t
     if (n_drafts < 1 || n_drafts > i32(c.block_size) - 1) { throw std::invalid_argument("inkling2 dspark: 1 to block_size - 1 drafts"); }
     const DSparkWeights& w = model_.dspark_weights();
     const std::int32_t b = i32(c.block_size);
+    // Drafts that report the drafter's probabilities run dspark_draft_pick; the others keep argmax_fp32 (the same
+    // tokens, without the probability's pass).
+    const bool picked = probs != nullptr;
     workspace_.reset();
     cuda(cudaMemcpyAsync(ids_.data, &anchor, 4, cudaMemcpyHostToDevice, stream_), "anchor upload");
 
@@ -351,11 +355,20 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t
         Tensor logits = base.slice(1, i - 1, 1).reshape({vocab});
         ops::dspark_markov_logits(logits, hb_, markov_, latent, c.final_logit_softcap, logits, stream_);
         Tensor next = ids_.slice(0, i, 1);
-        ops::argmax_fp32(logits.reshape({vocab, 1}), i32(text_.unpadded_vocab_size), next, stream_);
+        if (picked) {
+            Tensor p = probs_.slice(0, i - 1, 1);
+            ops::dspark_draft_pick(logits.reshape({vocab, 1}), i32(text_.unpadded_vocab_size), next, p, stream_);
+        } else {
+            ops::argmax_fp32(logits.reshape({vocab, 1}), i32(text_.unpadded_vocab_size), next, stream_);
+        }
     }
     std::vector<std::int32_t> drafts(static_cast<std::size_t>(n_drafts));
     cuda(cudaMemcpyAsync(drafts.data(), static_cast<const std::int32_t*>(ids_.data) + 1, drafts.size() * 4, cudaMemcpyDeviceToHost, stream_),
          "drafts");
+    if (probs != nullptr) {
+        probs->resize(drafts.size());
+        cuda(cudaMemcpyAsync(probs->data(), probs_.data, drafts.size() * 4, cudaMemcpyDeviceToHost, stream_), "draft probabilities");
+    }
     cuda(cudaStreamSynchronize(stream_), "draft");
     return drafts;
 }

@@ -197,4 +197,14 @@ void dspark_markov_logits(const Tensor& base, const Tensor& hb, const MarkovHead
  */
 void argmax_fp32(const Tensor& logits, std::int32_t valid_rows, Tensor& out, cudaStream_t stream, std::int32_t non_finite = 0);
 
+/**
+ * Op: dspark_draft_pick: the drafter's greedy draft from one column of logits, and its probability.
+ *
+ * logits FP32 [V] contiguous (rows >= valid_rows used); id I32 [1]; prob FP32 [1]. *id = argmax_fp32's token (the
+ * lowest v < valid_rows with a maximal finite logit; 0 when none is finite) and *prob = exp(l[id] - m) /
+ * sum_v exp(l[v] - m) (m the maximum; NaN rows contribute 0; 0 when no logit is finite), the softmax probability of
+ * the draft at temperature 1, with FP64 sums. One block; asynchronous on `stream`.
+ */
+void dspark_draft_pick(const Tensor& logits, std::int32_t valid_rows, Tensor& id, Tensor& prob, cudaStream_t stream);
+
 } // namespace ninfer::ops
