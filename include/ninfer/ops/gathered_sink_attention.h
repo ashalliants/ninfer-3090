@@ -41,6 +41,11 @@ inline constexpr int kGatheredSinkAttentionMaxHeads = 1024;
  *   FP32 accumulation of the BF16 products and an online softmax; the output is rounded to BF16
  *   once. Against the FP64 oracle on the represented inputs the result differs by that rounding and
  *   by FP32 summation order (a few FP32 ulps relative to the output's scale).
+ *   Chunks of 8 or more columns with D = 256 or 512 on a device of compute capability 8.0 or newer
+ *   run on tensor cores: the scores keep that accuracy, but the softmax weights multiply the values
+ *   as BF16 (each weight rounded once, the denominator summing the rounded weights), so each output
+ *   element also differs by at most 2^-8 * (sum_j w_j |kv[d, row j]| / sum_j w_j), w_j the
+ *   unnormalised weights, on top of the BF16 rounding.
  *
  * Effects:
  *   Writes out. Inputs are read only; out must not overlap an input.

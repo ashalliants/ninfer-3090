@@ -2,7 +2,7 @@
 // gathered_sink_attention.h): softmax over each query's listed rows of one shared KV table, the
 // rows serving as both keys and values, with a per-head sink logit added to the denominator only.
 //
-// Cases: DeepSeek-V4.1-Flash's geometry (D = 512, H = 64, K = 640 = 128 window + 512 compressed,
+// Cases (8 or more columns with D = 256 or 512 run on tensor cores, whose BF16 softmax weights widen the criterion by 2^-8 of the weighted mean magnitude of the rows): DeepSeek-V4.1-Flash's geometry (D = 512, H = 64, K = 640 = 128 window + 512 compressed,
 // N = 700 rows) at T = 1 (decode), 3 and 70; a small geometry with an odd head count and a list
 // that is not a multiple of the 4-row group (D = 128, H = 5, K = 7); a one-row table (N = 1); D = 64
 // and 256; lists with invalid (-1) and out-of-range entries and duplicated rows; a column with no
@@ -130,14 +130,15 @@ std::vector<std::uint16_t> run(const Problem& p, cudaStream_t stream, bool graph
 }
 
 // The formula, naively, in FP64 from the represented BF16 inputs. `valid` reports whether the column had a row.
-std::vector<double> oracle(const Problem& p, int column, int head, bool* any_valid) {
+std::vector<double> oracle(const Problem& p, int column, int head, bool* any_valid, std::vector<double>* weighted_abs = nullptr) {
     std::vector<int> rows;
     for (int j = 0; j < p.K; ++j) {
         const std::int32_t r = p.idx[static_cast<std::size_t>(column) * p.K + j];
         if (r >= 0 && r < p.N) { rows.push_back(r); }
     }
     *any_valid = !rows.empty();
-    std::vector<double> out(p.D, 0.0);
+    std::vector<double> out(p.D, 0.0), absmean(p.D, 0.0);
+    if (weighted_abs != nullptr) { weighted_abs->assign(p.D, 0.0); }
     if (rows.empty()) { return out; }
     const std::uint16_t* q = p.q.data() + (static_cast<std::size_t>(column) * p.H + head) * p.D;
     std::vector<double> s(rows.size());
@@ -154,19 +155,33 @@ std::vector<double> oracle(const Problem& p, int column, int head, bool* any_val
     for (std::size_t j = 0; j < rows.size(); ++j) {
         const double e = std::exp(s[j] - m);
         denom += e;
-        for (int d = 0; d < p.D; ++d) { out[d] += e * t::bf16_to_f32(p.kv[static_cast<std::size_t>(rows[j]) * p.D + d]); }
+        for (int d = 0; d < p.D; ++d) {
+            const double v = t::bf16_to_f32(p.kv[static_cast<std::size_t>(rows[j]) * p.D + d]);
+            out[d] += e * v;
+            absmean[d] += e * std::fabs(v);
+        }
     }
     for (auto& v : out) { v /= denom; }
+    // sum_j w_j |v_j| / sum_j w_j (the sink is not a row), the scale of the BF16 weight rounding.
+    double wsum = denom - std::exp(static_cast<double>(p.sink[head]) - m);
+    if (weighted_abs != nullptr) {
+        for (int d = 0; d < p.D; ++d) { (*weighted_abs)[d] = absmean[d] / wsum; }
+    }
     return out;
 }
 
+// The tensor-core route (contract: 8 or more columns, D = 256 or 512) multiplies BF16 softmax weights.
+bool tensor_core_call(const Problem& p) { return p.T >= 8 && (p.D == 256 || p.D == 512); }
+
 void verify(const Problem& p, const std::vector<std::uint16_t>& got, const std::string& label) {
+    const bool tc = tensor_core_call(p);
     double worst = 0;
     int empty_columns = 0;
     for (int c = 0; c < p.T; ++c) {
         for (int h = 0; h < p.H; ++h) {
             bool any = false;
-            const std::vector<double> ref = oracle(p, c, h, &any);
+            std::vector<double> wabs;
+            const std::vector<double> ref = oracle(p, c, h, &any, &wabs);
             double rms = 0;
             for (const double v : ref) { rms += v * v; }
             rms = std::sqrt(rms / p.D);
@@ -183,7 +198,8 @@ void verify(const Problem& p, const std::vector<std::uint16_t>& got, const std::
                 }
                 // Half a BF16 ulp of the reference (the one rounding) plus an FP32 allowance.
                 const double half_ulp = ref[d] == 0.0 ? 0.0 : std::ldexp(1.0, std::ilogb(std::fabs(ref[d])) - 8);
-                worst = std::max(worst, std::fabs(g - ref[d]) / (half_ulp + 2e-5 * rms + 1e-30));
+                const double rounding = tc ? std::ldexp(wabs[d], -8) : 0.0; // BF16 weights
+                worst = std::max(worst, std::fabs(g - ref[d]) / (half_ulp + 2e-5 * rms + rounding + 1e-30));
             }
         }
     }
@@ -243,13 +259,18 @@ int main() {
         }
         cudaStream_t stream = nullptr;
         t::cuda_check(cudaStreamCreate(&stream), "stream");
-        for (const int T : {1, 3, 70}) {
+        for (const int T : {1, 3, 8, 9, 70}) {
             test_case("D=512 H=64 K=640 N=700 T=" + std::to_string(T), {512, 64, T, 640, 700}, 11U + T, stream);
         }
         test_case("D=128 H=5 K=7 N=40 (odd heads, a partial row group)", {128, 5, 4, 7, 40}, 21U, stream);
         test_case("D=128 H=4 K=3 N=1 (one-row table)", {128, 4, 3, 3, 1, 1.0F, 0.0F, 0.3F}, 31U, stream);
         test_case("D=64 H=8 K=33 N=100", {64, 8, 5, 33, 100}, 41U, stream);
         test_case("D=256 H=8 K=33 N=100", {256, 8, 5, 33, 100}, 51U, stream);
+        test_case("tensor cores, D=256 H=40 (a partial head block) K=70 N=100 T=12", {256, 40, 12, 70, 100}, 52U, stream);
+        test_case("tensor cores, D=512 H=64 K=1 N=30 T=9 (a list of one row)", {512, 64, 9, 1, 30, 1.0F, 0.0F, 0.0F}, 53U, stream);
+        test_case("tensor cores, large scores (q x 8)", {512, 64, 10, 130, 200, 8.0F}, 54U, stream);
+        test_case("tensor cores, sink far above the scores", {512, 33, 9, 130, 200, 1.0F, 30.0F}, 55U, stream);
+        test_case("tensor cores, mostly invalid lists", {512, 64, 12, 130, 200, 1.0F, 0.0F, 0.97F}, 56U, stream);
         test_case("large scores (q x 8)", {512, 8, 4, 130, 200, 8.0F}, 61U, stream);
         test_case("sink far above the scores", {512, 8, 3, 130, 200, 1.0F, 30.0F}, 71U, stream);
         test_case("sink far below the scores", {512, 8, 3, 130, 200, 6.0F, -60.0F}, 81U, stream);
@@ -274,6 +295,22 @@ int main() {
             p1.idx.assign(p3.idx.begin() + p3.K, p3.idx.begin() + 2 * p3.K);
             const std::vector<std::uint16_t> one = run(p1, stream);
             check(std::memcmp(one.data(), all.data() + per_column, per_column * 2) == 0, "a column's output does not depend on the other columns");
+        }
+
+        // The tensor-core route: each column's output is its own, whatever the chunk it came in.
+        {
+            const Problem pw = make_problem({512, 64, 20, 640, 700}, 131U);
+            const std::vector<std::uint16_t> whole = run(pw, stream);
+            Problem pn = pw;
+            pn.T = 9;
+            const std::size_t per_column = static_cast<std::size_t>(pw.D) * pw.H;
+            pn.q.assign(pw.q.begin() + 5 * per_column, pw.q.begin() + 14 * per_column);
+            pn.idx.assign(pw.idx.begin() + 5 * pw.K, pw.idx.begin() + 14 * pw.K);
+            const std::vector<std::uint16_t> part = run(pn, stream);
+            check(std::memcmp(part.data(), whole.data() + 5 * per_column, 9 * per_column * 2) == 0,
+                  "a tensor-core column's output does not depend on the other columns");
+            const std::vector<std::uint16_t> graphed = run(pw, stream, true);
+            check(whole == graphed, "a graph-captured tensor-core call is bitwise the eager call");
         }
 
         if (std::getenv("NINFER_BENCH") != nullptr) {

@@ -40,7 +40,10 @@ inline constexpr std::int32_t kScoreMaxPositions = 65535 * 128;
  * Numeric:
  *   FP32 accumulation of the BF16 products; against the FP64 oracle on the represented inputs
  *   |got - ref| <= 2e-6 * sum_h |weights[h]| * |dot[h]| * |weight_scale| (a few FP32 ulps of the
- *   magnitude of the terms).
+ *   magnitude of the terms). Chunks of 8 or more columns run on tensor cores where the head count
+ *   is 16, 32 or 64 and D * H <= 4096 (D = 64, 128 or 256) on a device of compute capability 8.0 or
+ *   newer; the products are exact in BF16 x BF16 and the tensor core sums them in FP32 with its own
+ *   truncating alignment, which the same bound covers.
  *
  * Effects:
  *   Writes scores. Inputs are read only; scores must not overlap an input.
