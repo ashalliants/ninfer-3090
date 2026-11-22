@@ -2,7 +2,7 @@
 
 Status: **text MVP, correctness first**. `src/models/inkling2` runs the text model on the GPU with
 naive FP32 kernels and matches the llama.cpp golden ("Engine (text MVP, correctness first)" and
-"Validation" below); the DSpark drafter and greedy speculative decoding are in ("DSpark drafter" below, measured on
+"Validation" below); the DSpark drafter and speculative decoding (greedy and sampled) are in ("DSpark drafter" below, measured on
 a physical Tesla V100); so is the vision tower and image prompts ("Vision tower" below). The public Engine and
 `ninfer-serve` run it with its chat template, sampling and output decoder ("Serving" below). This page is the mathematical authority for the work, plus the GGUF
 mapping, reuse map and V100 plan. The
@@ -262,7 +262,7 @@ Qwen3.5 GDN conv state, only smaller.
 `src/models/inkling2` binds a converted artifact (`inkling2_gguf` recipe, UD-Q8_K_XL) and runs the
 48-visit schedule for one sequence. It is the correctness baseline the V100 kernels of phase 4 are
 measured against. The public Engine and `ninfer-serve` run it one request at a time (see "Serving").
-The DSpark drafter runs greedy speculative decoding (see "DSpark drafter").
+The DSpark drafter runs speculative decoding on greedy and sampled requests (see "DSpark drafter").
 
 | Piece | Where | What it does now |
 |---|---|---|
@@ -378,8 +378,10 @@ Both are on by default under `ninfer-serve`/`ninfer-cli --spec dspark`; the Engi
 (`SpeculativeOptions::draft_min_p`, `dspark_adaptive`).
 
 - **`--draft-min-p P`** (default 0.5; 0 turns it off): `DSparkProgram::draft(anchor, n, pick, uniforms, &probs)` also
-  returns the drafter's probability of each draft (`ops::dspark_draft_pick`: the argmax and its softmax probability
-  at temperature 1, the same token as `argmax_fp32`), and the round keeps the drafts before the first one under P.
+  returns the drafter's probability of each draft (`ops::dspark_draft_pick`), and the round keeps the drafts before
+  the first one under P. For a greedy pick that is the argmax (the same token as `argmax_fp32`) and its softmax
+  probability at temperature 1; for a sampled pick, the coupled draw and its weight over the mass the request's
+  temperature, top-k, min-p and top-p keep (`DraftPick`). P only stops drafting: verify is unchanged either way.
   A round whose first draft is already under P runs as a plain step (a fallback step; its time, which includes the
   draft, is not used for either cost).
 - **`--dspark-adaptive on|off`** (default on): `DraftWidth` (`inkling2_core.cpp`) picks each round's draft count

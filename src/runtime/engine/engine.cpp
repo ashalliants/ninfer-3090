@@ -740,8 +740,8 @@ private:
         if (!(options.speculative.draft_min_p >= 0.0F && options.speculative.draft_min_p < 1.0F)) {
             throw std::invalid_argument("--draft-min-p takes a probability in [0,1)");
         }
-        // DSpark verifies greedy rows exactly and drafts from its own head: the Qwen drafting options have no meaning,
-        // so they are refused, not ignored, with or without DSpark. The proposal head is the exception under DSpark:
+        // DSpark verifies its rows exactly (greedy, or sampled with the plain sampler's draws) and drafts from its own
+        // head: the Qwen drafting options have no meaning, so they are refused, not ignored, with or without DSpark. The proposal head is the exception under DSpark:
         // ninfer serve sets it for every backend (product::apply_speculative_defaults), and DSpark never reads it.
         const SpeculativeOptions defaults;
         const auto& spec = options.speculative;
