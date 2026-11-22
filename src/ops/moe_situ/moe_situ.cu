@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 namespace ninfer::ops {
@@ -693,232 +694,294 @@ down_kernel(BankArgs b, const std::int32_t* __restrict__ ids, const float* __res
     if (lane == 0) { out[h] = v; }
 }
 
-// ---- Wide calls: the entries grouped by expert, so each expert's weights are read once per kGroupTokens entries.
+constexpr std::size_t kMaxShared = 96 * 1024; // the most dynamic shared memory a block may have on sm_70
 
-constexpr int kGroupTokens      = 4;  // entries staged together (their activations share the weight decode)
-constexpr int kGroupPlanes      = 2;  // row planes a warp takes (they share the activation loads)
-constexpr std::size_t kGroupMaxShared = 96 * 1024; // the most dynamic shared memory a block may have on sm_70
-constexpr int kGroupMinEntries  = 64; // fewer entries take the per-entry kernels (the same bits either way)
+// ---- Calls of two or more columns: expert-major, so each distinct expert's weights are read once for all the
+// entries routed to it, and a tile computes exactly the entries it has.
+//
+// Block (g, s) takes slot s: the s-th distinct expert of ids in order of first appearance (grid y = min(entries, E);
+// slots past the distinct count exit). The block lists that expert's entries itself, in increasing order, so no
+// grouping launch precedes the experts. A tile stages up to kCols of them and computes each with the per-entry
+// kernel's arithmetic (Nvfp4Runs and bf16_row_dot do not depend on how many columns or planes share a call).
+constexpr int kNarrowCols   = 4; // the most entries staged together
+constexpr int kNarrowPlanes = 2; // NVFP4 row planes a warp takes (they share the activation loads)
 
-// One warp: counts[e] and offsets[e] (exclusive scan) of the entries per expert, and order[], the entries sorted by
-// expert, stable (an expert's entries keep their order), so the grouping is deterministic.
-__global__ void __launch_bounds__(32) group_kernel(const std::int32_t* __restrict__ ids, int n, int experts, int* __restrict__ counts,
-                                                   int* __restrict__ offsets, int* __restrict__ order) {
-    __shared__ int count[kMaxExperts], next[kMaxExperts];
-    const int lane = threadIdx.x;
-    for (int e = lane; e < experts; e += 32) { count[e] = 0; }
-    __syncwarp();
-    for (int i = lane; i < n; i += 32) { atomicAdd(&count[ids[i]], 1); }
-    __syncwarp();
-    if (lane == 0) {
-        int running = 0;
-        for (int e = 0; e < experts; ++e) {
-            next[e] = running;
-            running += count[e];
+struct NarrowSlot {
+    int expert, count;
+};
+
+// The words of the entry list, after an expert-major kernel's staged columns in its dynamic shared memory.
+__host__ __device__ __forceinline__ int narrow_list_words(int entries) { return (entries + 3) / 4 * 4; }
+
+// Block-wide (blockDim.x == kThreads, 0 <= ids < kMaxExperts): slot `slot`'s expert (-1 when ids has fewer distinct
+// experts) and its entries in increasing order in list[0, count).
+__device__ __forceinline__ NarrowSlot narrow_slot(const std::int32_t* __restrict__ ids, int n, int slot, int* first, int* list, int* scratch) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const unsigned below = (1U << lane) - 1U;
+    for (int e = threadIdx.x; e < kMaxExperts; e += kThreads) { first[e] = 0x7FFFFFFF; }
+    if (threadIdx.x == 0) { scratch[kWarps] = -1; }
+    __syncthreads();
+    if (n <= kThreads) { // one entry per thread, its id read once
+        const int i = threadIdx.x, id = i < n ? __ldg(ids + i) : -1;
+        if (id >= 0) { atomicMin(first + id, i); }
+        __syncthreads();
+        const bool lead = id >= 0 && first[id] == i;
+        const unsigned leads = __ballot_sync(0xFFFFFFFFU, lead);
+        if (lane == 0) { scratch[warp] = __popc(leads); }
+        __syncthreads();
+        int rank = __popc(leads & below);
+        for (int w = 0; w < warp; ++w) { rank += scratch[w]; }
+        if (lead && rank == slot) { scratch[kWarps] = id; }
+        __syncthreads();
+        const int expert = scratch[kWarps];
+        if (expert < 0) { return {-1, 0}; }
+        const bool mine = id == expert;
+        const unsigned mask = __ballot_sync(0xFFFFFFFFU, mine);
+        if (lane == 0) { scratch[warp] = __popc(mask); }
+        __syncthreads();
+        int pos = __popc(mask & below), count = 0;
+        for (int w = 0; w < kWarps; ++w) {
+            pos += w < warp ? scratch[w] : 0;
+            count += scratch[w];
         }
+        if (mine) { list[pos] = i; }
+        __syncthreads();
+        return {expert, count};
     }
-    __syncwarp();
-    for (int e = lane; e < experts; e += 32) {
-        counts[e]  = count[e];
-        offsets[e] = next[e];
+    for (int i = threadIdx.x; i < n; i += kThreads) { atomicMin(first + __ldg(ids + i), i); }
+    __syncthreads();
+    // The slot's expert: the entry of rank `slot` among the experts' first entries.
+    for (int base = 0, before = 0; base < n && before <= slot; base += kThreads) {
+        const int i = base + static_cast<int>(threadIdx.x), id = i < n ? __ldg(ids + i) : -1;
+        const bool lead = id >= 0 && first[id] == i;
+        const unsigned leads = __ballot_sync(0xFFFFFFFFU, lead);
+        if (lane == 0) { scratch[warp] = __popc(leads); }
+        __syncthreads();
+        int rank = before + __popc(leads & below);
+        for (int w = 0; w < kWarps; ++w) {
+            rank += w < warp ? scratch[w] : 0;
+            before += scratch[w];
+        }
+        if (lead && rank == slot) { scratch[kWarps] = id; }
+        __syncthreads(); // scratch is rewritten by the next chunk
     }
-    for (int base = 0; base < n; base += 32) {
-        const int i = base + lane, e = i < n ? ids[i] : -1;
-        const unsigned same = __match_any_sync(0xFFFFFFFFU, e);
-        const int rank = __popc(same & ((1U << lane) - 1U));
-        if (i < n) { order[next[e] + rank] = i; }
-        __syncwarp();
-        if (i < n && rank == 0) { next[e] += __popc(same); }
-        __syncwarp();
+    const int expert = scratch[kWarps];
+    if (expert < 0) { return {-1, 0}; }
+    int count = 0;
+    for (int base = 0; base < n; base += kThreads) {
+        const int i = base + static_cast<int>(threadIdx.x);
+        const bool mine = i < n && __ldg(ids + i) == expert;
+        const unsigned mask = __ballot_sync(0xFFFFFFFFU, mine);
+        if (lane == 0) { scratch[warp] = __popc(mask); }
+        __syncthreads();
+        int pos = count + __popc(mask & below);
+        for (int w = 0; w < kWarps; ++w) {
+            pos += w < warp ? scratch[w] : 0;
+            count += scratch[w];
+        }
+        if (mine) { list[pos] = i; }
+        __syncthreads();
     }
+    return {expert, count};
 }
 
-// grid (ceil(I / (kWarps * kGroupPlanes * kGateRows)), E): block (g, e) runs expert e's gate and up rows of row group
-// g over its entries, kGroupTokens at a time (the per-entry kernel's arithmetic for each).
-template <int P>
+// grid (ceil(I / (kWarps * Q * kGateRows)), min(entries, E)): slot s's gate and up rows of row group g over its
+// entries, up to kCols at a time, each tile computing exactly its entries (the per-entry kernel's arithmetic each).
+template <int P, int Q, int kCols>
 __global__ void __launch_bounds__(kThreads)
-gate_up_grouped_kernel(BankArgs b, const float* __restrict__ z, std::int64_t zs, const int* __restrict__ counts,
-                       const int* __restrict__ offsets, const int* __restrict__ order, int top_k, float gate_cap, float up_cap,
-                       float* __restrict__ act) {
+gate_up_narrow_kernel(BankArgs b, const float* __restrict__ z, std::int64_t zs, const std::int32_t* __restrict__ ids, int entries, int top_k,
+                      float gate_cap, float up_cap, float* __restrict__ act) {
     extern __shared__ float2 shared[];
+    __shared__ int first[kMaxExperts], scratch[kWarps + 1];
     Tables* lut          = reinterpret_cast<Tables*>(shared);
     std::uint32_t* stage = reinterpret_cast<std::uint32_t*>(lut + 1);
-    float* x             = reinterpret_cast<float*>(stage + kWarps * kGroupPlanes * kStageWords);
-    const int e = blockIdx.y, n = counts[e];
-    if (n == 0) { return; }
-    const int* list = order + offsets[e];
+    float* x             = reinterpret_cast<float*>(stage + kWarps * Q * kStageWords);
+    int* list            = reinterpret_cast<int*>(x + (kCols * (b.hidden / kNvfp4Values) + 1) * kPaddedBlock); // after the staged columns
+    const NarrowSlot s = narrow_slot(ids, entries, blockIdx.y, first, list, scratch);
+    if (s.expert < 0) { return; }
+    const int e = s.expert, n = s.count;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    constexpr int kWarpRows = kGroupPlanes * kGateRows;
-    const int first = (blockIdx.x * kWarps + warp) * kWarpRows, row0 = first < b.inter ? first : 0;
+    constexpr int kWarpRows = Q * kGateRows;
+    const int first_row = (blockIdx.x * kWarps + warp) * kWarpRows, row0 = first_row < b.inter ? first_row : 0;
     const std::uint8_t* rec = b.records + static_cast<std::uint64_t>(e) * b.stride;
     const std::uint8_t* groups[2] = {rec + static_cast<std::uint64_t>(row0) * b.gate_row_bytes,
                                      rec + b.up_offset + static_cast<std::uint64_t>(row0) * b.gate_row_bytes};
-    const int step = b.hidden / kNvfp4Values * kPaddedBlock; // floats between staged columns
+    const int step = b.hidden / kNvfp4Values * kPaddedBlock;
     const float scale = b.gate_up_scale != nullptr ? b.gate_up_scale[e] : 1.0F;
     fill_tables(lut);
-    for (int tile = 0; tile < n; tile += kGroupTokens) {
-        Nvfp4Runs<2, kGateRows, P, kGroupPlanes> rows(groups, b.hidden / kNvfp4Values, b.tiled);
+    for (int tile = 0; tile < n; tile += kCols) {
+        Nvfp4Runs<2, kGateRows, P, Q> rows(groups, b.hidden / kNvfp4Values, b.tiled);
         __syncthreads(); // the previous tile's activations are read
-        int entry[kGroupTokens];
-#pragma unroll
-        for (int i = 0; i < kGroupTokens; ++i) {
-            entry[i] = tile + i < n ? list[tile + i] : -1;
-            if (entry[i] >= 0) { stage_padded(z + (entry[i] / top_k) * zs, b.hidden, x + i * step); }
-        }
+        const int nt = min(kCols, n - tile);
+        for (int i = 0; i < nt; ++i) { stage_padded(z + (list[tile + i] / top_k) * zs, b.hidden, x + i * step); }
         __syncthreads();
-        if (first < b.inter) {
-            float dots[kGroupPlanes][kGroupTokens];
-            rows.dot<kGroupTokens>(x, step, lut, stage + warp * kGroupPlanes * kStageWords, dots);
+        if (first_row >= b.inter) { continue; }
+        const auto run = [&](auto cols) {
+            constexpr int NT = decltype(cols)::value;
+            float dots[Q][NT];
+            rows.template dot<NT>(x, step, lut, stage + warp * Q * kStageWords, dots);
 #pragma unroll
-            for (int q = 0; q < kGroupPlanes; ++q) {
+            for (int q = 0; q < Q; ++q) {
 #pragma unroll
-                for (int i = 0; i < kGroupTokens; ++i) {
+                for (int i = 0; i < NT; ++i) {
                     const float up = __shfl_down_sync(0xFFFFFFFFU, dots[q][i], kGateRows);
-                    const int row = first + q * kGateRows + lane;
-                    if (lane < kGateRows && entry[i] >= 0 && row < b.inter) {
-                        act[static_cast<std::int64_t>(entry[i]) * b.inter + row] = situ(dots[q][i] * scale, up * scale, gate_cap, up_cap);
+                    const int row = first_row + q * kGateRows + lane;
+                    if (lane < kGateRows && row < b.inter) {
+                        act[static_cast<std::int64_t>(list[tile + i]) * b.inter + row] = situ(dots[q][i] * scale, up * scale, gate_cap, up_cap);
                     }
                 }
             }
-        }
+        };
+        if (kCols >= 4 && nt == 4) { run(std::integral_constant<int, kCols >= 4 ? 4 : 1>{}); }
+        else if (kCols >= 3 && nt == 3) { run(std::integral_constant<int, kCols >= 3 ? 3 : 1>{}); }
+        else if (kCols >= 2 && nt == 2) { run(std::integral_constant<int, kCols >= 2 ? 2 : 1>{}); }
+        else { run(std::integral_constant<int, 1>{}); }
     }
 }
 
-// grid (ceil(H / (kWarps * kGroupPlanes * kDownRows)), E): expert e's down rows of row group g over its entries.
-template <int P>
+// grid (ceil(H / (kWarps * Q * kDownRows)), min(entries, E)): slot s's down rows of row group g over its entries.
+template <int P, int Q, int kCols>
 __global__ void __launch_bounds__(kThreads)
-down_grouped_kernel(BankArgs b, const int* __restrict__ counts, const int* __restrict__ offsets, const int* __restrict__ order,
-                    const float* __restrict__ act, float* __restrict__ y) {
+down_narrow_kernel(BankArgs b, const std::int32_t* __restrict__ ids, int entries, const float* __restrict__ act, float* __restrict__ y) {
     extern __shared__ float2 shared[];
+    __shared__ int first[kMaxExperts], scratch[kWarps + 1];
     Tables* lut          = reinterpret_cast<Tables*>(shared);
     std::uint32_t* stage = reinterpret_cast<std::uint32_t*>(lut + 1);
-    float* x             = reinterpret_cast<float*>(stage + kWarps * kGroupPlanes * kStageWords);
-    const int e = blockIdx.y, n = counts[e];
-    if (n == 0) { return; }
-    const int* list = order + offsets[e];
+    float* x             = reinterpret_cast<float*>(stage + kWarps * Q * kStageWords);
+    int* list            = reinterpret_cast<int*>(x + (kCols * (b.inter / kNvfp4Values) + 1) * kPaddedBlock);
+    const NarrowSlot s = narrow_slot(ids, entries, blockIdx.y, first, list, scratch);
+    if (s.expert < 0) { return; }
+    const int e = s.expert, n = s.count;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    constexpr int kWarpRows = kGroupPlanes * kDownRows;
-    const int first = (blockIdx.x * kWarps + warp) * kWarpRows, row0 = first < b.hidden ? first : 0;
+    constexpr int kWarpRows = Q * kDownRows;
+    const int first_row = (blockIdx.x * kWarps + warp) * kWarpRows, row0 = first_row < b.hidden ? first_row : 0;
     const std::uint8_t* rec = b.records + static_cast<std::uint64_t>(e) * b.stride + b.down_offset;
     const std::uint8_t* groups[1] = {rec + static_cast<std::uint64_t>(row0) * b.down_row_bytes};
     const int step = b.inter / kNvfp4Values * kPaddedBlock;
     const float scale = b.down_scale != nullptr ? b.down_scale[e] : 1.0F;
     fill_tables(lut);
-    for (int tile = 0; tile < n; tile += kGroupTokens) {
-        Nvfp4Runs<1, kDownRows, P, kGroupPlanes> rows(groups, b.inter / kNvfp4Values, b.tiled);
+    for (int tile = 0; tile < n; tile += kCols) {
+        Nvfp4Runs<1, kDownRows, P, Q> rows(groups, b.inter / kNvfp4Values, b.tiled);
         __syncthreads();
-        int entry[kGroupTokens];
-#pragma unroll
-        for (int i = 0; i < kGroupTokens; ++i) {
-            entry[i] = tile + i < n ? list[tile + i] : -1;
-            if (entry[i] >= 0) { stage_padded(act + static_cast<std::int64_t>(entry[i]) * b.inter, b.inter, x + i * step); }
-        }
+        const int nt = min(kCols, n - tile);
+        for (int i = 0; i < nt; ++i) { stage_padded(act + static_cast<std::int64_t>(list[tile + i]) * b.inter, b.inter, x + i * step); }
         __syncthreads();
-        if (first < b.hidden) {
-            float dots[kGroupPlanes][kGroupTokens];
-            rows.dot<kGroupTokens>(x, step, lut, stage + warp * kGroupPlanes * kStageWords, dots);
+        if (first_row >= b.hidden) { continue; }
+        const auto run = [&](auto cols) {
+            constexpr int NT = decltype(cols)::value;
+            float dots[Q][NT];
+            rows.template dot<NT>(x, step, lut, stage + warp * Q * kStageWords, dots);
 #pragma unroll
-            for (int q = 0; q < kGroupPlanes; ++q) {
+            for (int q = 0; q < Q; ++q) {
 #pragma unroll
-                for (int i = 0; i < kGroupTokens; ++i) {
-                    const int row = first + q * kDownRows + lane;
-                    if (lane < kDownRows && entry[i] >= 0 && row < b.hidden) {
-                        y[static_cast<std::int64_t>(entry[i]) * b.hidden + row] = dots[q][i] * scale;
-                    }
+                for (int i = 0; i < NT; ++i) {
+                    const int row = first_row + q * kDownRows + lane;
+                    if (lane < kDownRows && row < b.hidden) { y[static_cast<std::int64_t>(list[tile + i]) * b.hidden + row] = dots[q][i] * scale; }
                 }
             }
-        }
+        };
+        if (kCols >= 4 && nt == 4) { run(std::integral_constant<int, kCols >= 4 ? 4 : 1>{}); }
+        else if (kCols >= 3 && nt == 3) { run(std::integral_constant<int, kCols >= 3 ? 3 : 1>{}); }
+        else if (kCols >= 2 && nt == 2) { run(std::integral_constant<int, kCols >= 2 ? 2 : 1>{}); }
+        else { run(std::integral_constant<int, 1>{}); }
     }
 }
 
-// BF16 banks, grouped: grid (ceil(I / (kWarps * kBf16Rows)), E): warp w of block (g, e) takes expert e's
-// intermediate rows (g * kWarps + w) * kBf16Rows + (0 ..) (their gate and up rows) over its entries, kGroupTokens
-// at a time (the per-entry kernel's arithmetic for each).
+// BF16 banks: grid (ceil(I / (kWarps * kBf16Rows)), min(entries, E)): warp w of block (g, s) takes the intermediate
+// rows (g * kWarps + w) * kBf16Rows + (0 ..) (their gate and up rows) of slot s's expert over its entries.
 constexpr int kBf16Rows = 2;
+template <int kCols>
 __global__ void __launch_bounds__(kThreads)
-gate_up_grouped_bf16_kernel(BankArgs b, const float* __restrict__ z, std::int64_t zs, const int* __restrict__ counts,
-                            const int* __restrict__ offsets, const int* __restrict__ order, int top_k, float gate_cap, float up_cap,
-                            float* __restrict__ act) {
+gate_up_narrow_bf16_kernel(BankArgs b, const float* __restrict__ z, std::int64_t zs, const std::int32_t* __restrict__ ids, int entries, int top_k,
+                           float gate_cap, float up_cap, float* __restrict__ act) {
     extern __shared__ float2 shared[];
-    float* x = reinterpret_cast<float*>(shared);
-    const int e = blockIdx.y, n = counts[e];
-    if (n == 0) { return; }
-    const int* list = order + offsets[e];
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, first = (blockIdx.x * kWarps + warp) * kBf16Rows;
+    __shared__ int first[kMaxExperts], scratch[kWarps + 1];
+    float* x  = reinterpret_cast<float*>(shared);
+    int* list = reinterpret_cast<int*>(x + kCols * b.hidden); // after the staged columns
+    const NarrowSlot s = narrow_slot(ids, entries, blockIdx.y, first, list, scratch);
+    if (s.expert < 0) { return; }
+    const int e = s.expert, n = s.count;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, first_row = (blockIdx.x * kWarps + warp) * kBf16Rows;
     const __nv_bfloat16* base = b.gate_up + static_cast<std::int64_t>(e) * 2 * b.inter * b.hidden;
     const __nv_bfloat16* rows[2 * kBf16Rows];
 #pragma unroll
     for (int r = 0; r < kBf16Rows; ++r) {
-        const int i = min(first + r, b.inter - 1);
+        const int i = min(first_row + r, b.inter - 1);
         rows[r]             = base + static_cast<std::int64_t>(i) * b.hidden;
         rows[kBf16Rows + r] = base + static_cast<std::int64_t>(b.inter + i) * b.hidden;
     }
-    for (int tile = 0; tile < n; tile += kGroupTokens) {
+    for (int tile = 0; tile < n; tile += kCols) {
         __syncthreads();
-        int entry[kGroupTokens];
-#pragma unroll
-        for (int t = 0; t < kGroupTokens; ++t) {
-            entry[t] = tile + t < n ? list[tile + t] : -1;
-            if (entry[t] >= 0) {
-                const float* col = z + (entry[t] / top_k) * zs;
-                for (int d = threadIdx.x; d < b.hidden; d += kThreads) { x[t * b.hidden + d] = col[d]; }
-            }
+        const int nt = min(kCols, n - tile);
+        for (int t = 0; t < nt; ++t) {
+            const float* col = z + (list[tile + t] / top_k) * zs;
+            for (int d = threadIdx.x; d < b.hidden; d += kThreads) { x[t * b.hidden + d] = col[d]; }
         }
         __syncthreads();
-        if (first < b.inter) {
-            float gu[2 * kBf16Rows][kGroupTokens];
-            bf16_row_dot<2 * kBf16Rows, kGroupTokens>(rows, b.hidden, x, b.hidden, gu);
+        if (first_row >= b.inter) { continue; }
+        const auto run = [&](auto cols) {
+            constexpr int NT = decltype(cols)::value;
+            float gu[2 * kBf16Rows][NT];
+            bf16_row_dot<2 * kBf16Rows, NT>(rows, b.hidden, x, b.hidden, gu);
 #pragma unroll
             for (int r = 0; r < kBf16Rows; ++r) {
 #pragma unroll
-                for (int t = 0; t < kGroupTokens; ++t) {
-                    if (lane == 0 && entry[t] >= 0 && first + r < b.inter) {
-                        act[static_cast<std::int64_t>(entry[t]) * b.inter + first + r] = situ(gu[r][t], gu[kBf16Rows + r][t], gate_cap, up_cap);
+                for (int t = 0; t < NT; ++t) {
+                    if (lane == 0 && first_row + r < b.inter) {
+                        act[static_cast<std::int64_t>(list[tile + t]) * b.inter + first_row + r] = situ(gu[r][t], gu[kBf16Rows + r][t], gate_cap, up_cap);
                     }
                 }
             }
-        }
+        };
+        if (kCols >= 4 && nt == 4) { run(std::integral_constant<int, kCols >= 4 ? 4 : 1>{}); }
+        else if (kCols >= 3 && nt == 3) { run(std::integral_constant<int, kCols >= 3 ? 3 : 1>{}); }
+        else if (kCols >= 2 && nt == 2) { run(std::integral_constant<int, kCols >= 2 ? 2 : 1>{}); }
+        else { run(std::integral_constant<int, 1>{}); }
     }
 }
 
-// grid (ceil(H / (kWarps * 2 * kBf16Rows)), E): warp w of block (g, e) takes expert e's hidden rows
-// (g * kWarps + w) * 2 * kBf16Rows + (0 ..) over its entries.
+// grid (ceil(H / (kWarps * 2 * kBf16Rows)), min(entries, E)): warp w of block (g, s) takes the hidden rows
+// (g * kWarps + w) * 2 * kBf16Rows + (0 ..) of slot s's expert over its entries.
+template <int kCols>
 __global__ void __launch_bounds__(kThreads)
-down_grouped_bf16_kernel(BankArgs b, const int* __restrict__ counts, const int* __restrict__ offsets, const int* __restrict__ order,
-                         const float* __restrict__ act, float* __restrict__ y) {
+down_narrow_bf16_kernel(BankArgs b, const std::int32_t* __restrict__ ids, int entries, const float* __restrict__ act, float* __restrict__ y) {
     extern __shared__ float2 shared[];
-    float* x = reinterpret_cast<float*>(shared);
-    const int e = blockIdx.y, n = counts[e];
-    if (n == 0) { return; }
-    const int* list = order + offsets[e];
+    __shared__ int first[kMaxExperts], scratch[kWarps + 1];
+    float* x  = reinterpret_cast<float*>(shared);
+    int* list = reinterpret_cast<int*>(x + kCols * b.inter);
+    const NarrowSlot s = narrow_slot(ids, entries, blockIdx.y, first, list, scratch);
+    if (s.expert < 0) { return; }
+    const int e = s.expert, n = s.count;
     constexpr int kRows = 2 * kBf16Rows;
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, first = (blockIdx.x * kWarps + warp) * kRows;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, first_row = (blockIdx.x * kWarps + warp) * kRows;
     const __nv_bfloat16* rows[kRows];
 #pragma unroll
-    for (int r = 0; r < kRows; ++r) { rows[r] = b.down + (static_cast<std::int64_t>(e) * b.hidden + min(first + r, b.hidden - 1)) * b.inter; }
-    for (int tile = 0; tile < n; tile += kGroupTokens) {
+    for (int r = 0; r < kRows; ++r) { rows[r] = b.down + (static_cast<std::int64_t>(e) * b.hidden + min(first_row + r, b.hidden - 1)) * b.inter; }
+    for (int tile = 0; tile < n; tile += kCols) {
         __syncthreads();
-        int entry[kGroupTokens];
-#pragma unroll
-        for (int t = 0; t < kGroupTokens; ++t) {
-            entry[t] = tile + t < n ? list[tile + t] : -1;
-            if (entry[t] >= 0) {
-                const float* src = act + static_cast<std::int64_t>(entry[t]) * b.inter;
-                for (int d = threadIdx.x; d < b.inter; d += kThreads) { x[t * b.inter + d] = src[d]; }
-            }
+        const int nt = min(kCols, n - tile);
+        for (int t = 0; t < nt; ++t) {
+            const float* src = act + static_cast<std::int64_t>(list[tile + t]) * b.inter;
+            for (int d = threadIdx.x; d < b.inter; d += kThreads) { x[t * b.inter + d] = src[d]; }
         }
         __syncthreads();
-        if (first < b.hidden) {
-            float v[kRows][kGroupTokens];
-            bf16_row_dot<kRows, kGroupTokens>(rows, b.inter, x, b.inter, v);
+        if (first_row >= b.hidden) { continue; }
+        const auto run = [&](auto cols) {
+            constexpr int NT = decltype(cols)::value;
+            float v[kRows][NT];
+            bf16_row_dot<kRows, NT>(rows, b.inter, x, b.inter, v);
 #pragma unroll
             for (int r = 0; r < kRows; ++r) {
 #pragma unroll
-                for (int t = 0; t < kGroupTokens; ++t) {
-                    if (lane == 0 && entry[t] >= 0 && first + r < b.hidden) { y[static_cast<std::int64_t>(entry[t]) * b.hidden + first + r] = v[r][t]; }
+                for (int t = 0; t < NT; ++t) {
+                    if (lane == 0 && first_row + r < b.hidden) { y[static_cast<std::int64_t>(list[tile + t]) * b.hidden + first_row + r] = v[r][t]; }
                 }
             }
-        }
+        };
+        if (kCols >= 4 && nt == 4) { run(std::integral_constant<int, kCols >= 4 ? 4 : 1>{}); }
+        else if (kCols >= 3 && nt == 3) { run(std::integral_constant<int, kCols >= 3 ? 3 : 1>{}); }
+        else if (kCols >= 2 && nt == 2) { run(std::integral_constant<int, kCols >= 2 ? 2 : 1>{}); }
+        else { run(std::integral_constant<int, 1>{}); }
     }
 }
 
@@ -931,6 +994,68 @@ __global__ void combine_kernel(const float* __restrict__ y, const float* __restr
         acc = fmaf(weights[t * top_k + i], y[(static_cast<std::int64_t>(t) * top_k + i) * hidden + h], acc);
     }
     out[static_cast<std::int64_t>(t) * hidden + h] = acc;
+}
+
+// The expert-major launches, by staged columns C (NVFP4 with kNarrowPlanes planes and P rows per run).
+struct NarrowLaunch {
+    BankArgs b;
+    const float* z;
+    std::int64_t zs;
+    const std::int32_t* ids;
+    int entries, top_k;
+    float gate_cap, up_cap;
+    float* act;
+    float* y;
+    dim3 gate_grid, down_grid;
+    std::size_t gate_shared, down_shared;
+    cudaStream_t stream;
+};
+
+// The dynamic shared memory an expert-major kernel may take, beside its static grouping arrays.
+constexpr std::size_t kNarrowShared = kMaxShared - 2 * 1024 - 64;
+// Calls of fewer entries run per entry. On the model's decode steps (top 8) per entry is faster up to 4 columns and
+// expert-major at 8: concurrent entries of one expert mostly hit the L2, and the per-entry kernels hold four blocks
+// an SM (64 registers) against one for the NVFP4 expert-major kernels.
+constexpr int kNarrowMinEntries = 64;
+
+template <int C>
+bool configure_narrow() {
+    constexpr int Q = kNarrowPlanes;
+    bool ok = true;
+    for (const void* k : {reinterpret_cast<const void*>(gate_up_narrow_kernel<1, Q, C>), reinterpret_cast<const void*>(gate_up_narrow_kernel<2, Q, C>),
+                          reinterpret_cast<const void*>(gate_up_narrow_kernel<4, Q, C>), reinterpret_cast<const void*>(down_narrow_kernel<1, Q, C>),
+                          reinterpret_cast<const void*>(down_narrow_kernel<2, Q, C>), reinterpret_cast<const void*>(down_narrow_kernel<4, Q, C>),
+                          reinterpret_cast<const void*>(gate_up_narrow_bf16_kernel<C>), reinterpret_cast<const void*>(down_narrow_bf16_kernel<C>)}) {
+        ok = ok && cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kNarrowShared)) == cudaSuccess;
+    }
+    return ok;
+}
+
+template <int C>
+void launch_narrow(const NarrowLaunch& l, int gate_p, int down_p) {
+    constexpr int Q = kNarrowPlanes;
+    static const bool configured = configure_narrow<C>();
+    require(configured, "moe_situ_experts", "the expert-major kernels' shared memory could not be configured");
+    const BankArgs& b = l.b;
+    if (!b.nvfp4) {
+        gate_up_narrow_bf16_kernel<C><<<l.gate_grid, kThreads, l.gate_shared, l.stream>>>(b, l.z, l.zs, l.ids, l.entries, l.top_k, l.gate_cap, l.up_cap, l.act);
+        check_launch("moe_situ_experts");
+        down_narrow_bf16_kernel<C><<<l.down_grid, kThreads, l.down_shared, l.stream>>>(b, l.ids, l.entries, l.act, l.y);
+        check_launch("moe_situ_experts");
+        return;
+    }
+    switch (gate_p) {
+    case 1: gate_up_narrow_kernel<1, Q, C><<<l.gate_grid, kThreads, l.gate_shared, l.stream>>>(b, l.z, l.zs, l.ids, l.entries, l.top_k, l.gate_cap, l.up_cap, l.act); break;
+    case 2: gate_up_narrow_kernel<2, Q, C><<<l.gate_grid, kThreads, l.gate_shared, l.stream>>>(b, l.z, l.zs, l.ids, l.entries, l.top_k, l.gate_cap, l.up_cap, l.act); break;
+    default: gate_up_narrow_kernel<4, Q, C><<<l.gate_grid, kThreads, l.gate_shared, l.stream>>>(b, l.z, l.zs, l.ids, l.entries, l.top_k, l.gate_cap, l.up_cap, l.act); break;
+    }
+    check_launch("moe_situ_experts");
+    switch (down_p) {
+    case 1: down_narrow_kernel<1, Q, C><<<l.down_grid, kThreads, l.down_shared, l.stream>>>(b, l.ids, l.entries, l.act, l.y); break;
+    case 2: down_narrow_kernel<2, Q, C><<<l.down_grid, kThreads, l.down_shared, l.stream>>>(b, l.ids, l.entries, l.act, l.y); break;
+    default: down_narrow_kernel<4, Q, C><<<l.down_grid, kThreads, l.down_shared, l.stream>>>(b, l.ids, l.entries, l.act, l.y); break;
+    }
+    check_launch("moe_situ_experts");
 }
 
 BankArgs bank_args(const SituExpertBank& bank) {
@@ -974,8 +1099,7 @@ BankArgs bank_args(const SituExpertBank& bank) {
 
 std::size_t workspace_for(const SituExpertBank& bank, std::int64_t entries) {
     return align256(static_cast<std::uint64_t>(entries) * bank.intermediate * 4) +
-           align256(static_cast<std::uint64_t>(entries) * bank.hidden * 4) +
-           align256(static_cast<std::uint64_t>(2 * bank.experts + entries) * 4);
+           align256(static_cast<std::uint64_t>(entries) * bank.hidden * 4);
 }
 
 } // namespace
@@ -1079,86 +1203,44 @@ void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor&
     const dim3 gate_grid(entries, (bank.intermediate + gate_per_block - 1) / gate_per_block);
     const dim3 down_grid(entries, (bank.hidden + down_per_block - 1) / down_per_block);
     const auto* zp = static_cast<const float*>(z.data);
-    // The grouped kernels need whole planes (I and H multiples of their rows per warp) and their staged
-    // activations within the shared memory a block may have; otherwise every entry runs alone.
-    const bool whole_planes = !b.nvfp4 || (bank.intermediate % (kGroupPlanes * kGateRows) == 0 && bank.hidden % (kGroupPlanes * kDownRows) == 0);
-    const std::size_t planes = (kGroupPlanes - 1) * kWarps * kStageWords * sizeof(std::uint32_t);
-    const std::size_t group_gate_shared = b.nvfp4 ? staged(bank.hidden, kGroupTokens) + planes
-                                                  : static_cast<std::size_t>(kGroupTokens) * bank.hidden * 4;
-    const std::size_t group_down_shared = b.nvfp4 ? staged(bank.intermediate, kGroupTokens) + planes
-                                                  : static_cast<std::size_t>(kGroupTokens) * bank.intermediate * 4;
-    const bool group_fits = std::max(group_gate_shared, group_down_shared) <= kGroupMaxShared;
-    if (entries >= kGroupMinEntries && bank.experts <= kMaxExperts && whole_planes && group_fits) {
-        // Group the entries by expert, then run each expert's rows over its entries.
-        int* counts  = static_cast<int*>(workspace.alloc_bytes(static_cast<std::size_t>(2 * bank.experts + entries) * 4).data);
-        int* offsets = counts + bank.experts;
-        int* order   = offsets + bank.experts;
-        group_kernel<<<1, 32, 0, stream>>>(id, entries, bank.experts, counts, offsets, order);
-        check_launch(op);
-        if (!b.nvfp4) {
-            const std::size_t gs = group_gate_shared, ds = group_down_shared;
-            static const bool bf16_configured =
-                cudaFuncSetAttribute(gate_up_grouped_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kGroupMaxShared)) == cudaSuccess &&
-                cudaFuncSetAttribute(down_grouped_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kGroupMaxShared)) == cudaSuccess;
-            require(bf16_configured, op, "the grouped kernels' shared memory could not be configured");
-            gate_up_grouped_bf16_kernel<<<dim3((bank.intermediate + kWarps * kBf16Rows - 1) / (kWarps * kBf16Rows), bank.experts), kThreads,
-                                          gs, stream>>>(
-                b, zp, zs, counts, offsets, order, top_k, gate_cap, up_cap, act);
-            check_launch(op);
-            down_grouped_bf16_kernel<<<dim3((bank.hidden + 2 * kWarps * kBf16Rows - 1) / (2 * kWarps * kBf16Rows), bank.experts), kThreads,
-                                       ds, stream>>>(b, counts, offsets, order, act, y);
-            check_launch(op);
-            if (weights != nullptr) {
-                combine_kernel<<<dim3(cols, (bank.hidden + 255) / 256), 256, 0, stream>>>(y, static_cast<const float*>(weights->data), bank.hidden,
-                                                                                           top_k, static_cast<float*>(out.data));
-                check_launch(op);
-            }
-            return;
+    // From kNarrowMinEntries entries over two or more columns: expert-major (each distinct expert read once). It needs
+    // whole planes (I and H multiples of a warp's rows) and its staging within a block's shared memory.
+    const int columns = std::min(cols, kNarrowCols);
+    const std::size_t list_bytes = static_cast<std::size_t>(narrow_list_words(entries)) * 4;
+    const std::size_t planes = static_cast<std::size_t>(kNarrowPlanes - 1) * kWarps * kStageWords * sizeof(std::uint32_t);
+    const std::size_t narrow_gate_shared =
+        list_bytes + (b.nvfp4 ? staged(bank.hidden, columns) + planes : static_cast<std::size_t>(columns) * bank.hidden * 4);
+    const std::size_t narrow_down_shared =
+        list_bytes + (b.nvfp4 ? staged(bank.intermediate, columns) + planes : static_cast<std::size_t>(columns) * bank.intermediate * 4);
+    const bool whole_planes =
+        !b.nvfp4 || (bank.intermediate % (kNarrowPlanes * kGateRows) == 0 && bank.hidden % (kNarrowPlanes * kDownRows) == 0);
+    if (cols >= 2 && entries >= kNarrowMinEntries && bank.experts <= kMaxExperts && whole_planes &&
+        std::max(narrow_gate_shared, narrow_down_shared) <= kNarrowShared) {
+        const int slots = std::min(entries, bank.experts);
+        const int gate_rows = b.nvfp4 ? kWarps * kNarrowPlanes * kGateRows : kWarps * kBf16Rows;
+        const int down_rows = b.nvfp4 ? kWarps * kNarrowPlanes * kDownRows : 2 * kWarps * kBf16Rows;
+        const NarrowLaunch l{b, zp, zs, id, entries, top_k, gate_cap, up_cap, act, y,
+                             dim3((bank.intermediate + gate_rows - 1) / gate_rows, slots), dim3((bank.hidden + down_rows - 1) / down_rows, slots),
+                             narrow_gate_shared, narrow_down_shared, stream};
+        switch (columns) {
+        case 2: launch_narrow<2>(l, gate_p, down_p); break;
+        case 3: launch_narrow<3>(l, gate_p, down_p); break;
+        default: launch_narrow<4>(l, gate_p, down_p); break;
         }
-        const int gate_rows = kWarps * kGroupPlanes * kGateRows, down_rows = kWarps * kGroupPlanes * kDownRows;
-        const dim3 gg((bank.intermediate + gate_rows - 1) / gate_rows, bank.experts), dg((bank.hidden + down_rows - 1) / down_rows, bank.experts);
-        const std::size_t gs = group_gate_shared, ds = group_down_shared;
-        static const bool configured = [] {
-            bool ok = true;
-            for (const void* k : {reinterpret_cast<const void*>(gate_up_grouped_kernel<1>), reinterpret_cast<const void*>(gate_up_grouped_kernel<2>),
-                                  reinterpret_cast<const void*>(gate_up_grouped_kernel<4>), reinterpret_cast<const void*>(down_grouped_kernel<1>),
-                                  reinterpret_cast<const void*>(down_grouped_kernel<2>), reinterpret_cast<const void*>(down_grouped_kernel<4>)}) {
-                ok = ok && cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kGroupMaxShared)) == cudaSuccess;
-            }
-            return ok;
-        }();
-        require(configured, op, "the grouped kernels' shared memory could not be configured");
+    } else {
         switch (gate_p) {
-        case 1: gate_up_grouped_kernel<1><<<gg, kThreads, gs, stream>>>(b, zp, zs, counts, offsets, order, top_k, gate_cap, up_cap, act); break;
-        case 2: gate_up_grouped_kernel<2><<<gg, kThreads, gs, stream>>>(b, zp, zs, counts, offsets, order, top_k, gate_cap, up_cap, act); break;
-        default: gate_up_grouped_kernel<4><<<gg, kThreads, gs, stream>>>(b, zp, zs, counts, offsets, order, top_k, gate_cap, up_cap, act); break;
+        case 1: gate_up_kernel<1><<<gate_grid, kThreads, staged(bank.hidden), stream>>>(b, zp, zs, id, top_k, gate_cap, up_cap, act); break;
+        case 2: gate_up_kernel<2><<<gate_grid, kThreads, staged(bank.hidden), stream>>>(b, zp, zs, id, top_k, gate_cap, up_cap, act); break;
+        default: gate_up_kernel<4><<<gate_grid, kThreads, staged(bank.hidden), stream>>>(b, zp, zs, id, top_k, gate_cap, up_cap, act); break;
         }
         check_launch(op);
         switch (down_p) {
-        case 1: down_grouped_kernel<1><<<dg, kThreads, ds, stream>>>(b, counts, offsets, order, act, y); break;
-        case 2: down_grouped_kernel<2><<<dg, kThreads, ds, stream>>>(b, counts, offsets, order, act, y); break;
-        default: down_grouped_kernel<4><<<dg, kThreads, ds, stream>>>(b, counts, offsets, order, act, y); break;
+        case 1: down_kernel<1><<<down_grid, kThreads, staged(bank.intermediate), stream>>>(b, id, act, y); break;
+        case 2: down_kernel<2><<<down_grid, kThreads, staged(bank.intermediate), stream>>>(b, id, act, y); break;
+        default: down_kernel<4><<<down_grid, kThreads, staged(bank.intermediate), stream>>>(b, id, act, y); break;
         }
         check_launch(op);
-        if (weights != nullptr) {
-            combine_kernel<<<dim3(cols, (bank.hidden + 255) / 256), 256, 0, stream>>>(y, static_cast<const float*>(weights->data), bank.hidden,
-                                                                                       top_k, static_cast<float*>(out.data));
-            check_launch(op);
-        }
-        return;
     }
-    switch (gate_p) {
-    case 1: gate_up_kernel<1><<<gate_grid, kThreads, staged(bank.hidden), stream>>>(b, zp, zs, id, top_k, gate_cap, up_cap, act); break;
-    case 2: gate_up_kernel<2><<<gate_grid, kThreads, staged(bank.hidden), stream>>>(b, zp, zs, id, top_k, gate_cap, up_cap, act); break;
-    default: gate_up_kernel<4><<<gate_grid, kThreads, staged(bank.hidden), stream>>>(b, zp, zs, id, top_k, gate_cap, up_cap, act); break;
-    }
-    check_launch(op);
-    switch (down_p) {
-    case 1: down_kernel<1><<<down_grid, kThreads, staged(bank.intermediate), stream>>>(b, id, act, y); break;
-    case 2: down_kernel<2><<<down_grid, kThreads, staged(bank.intermediate), stream>>>(b, id, act, y); break;
-    default: down_kernel<4><<<down_grid, kThreads, staged(bank.intermediate), stream>>>(b, id, act, y); break;
-    }
-    check_launch(op);
     if (weights != nullptr) {
         combine_kernel<<<dim3(cols, (bank.hidden + 255) / 256), 256, 0, stream>>>(y, static_cast<const float*>(weights->data), bank.hidden,
                                                                                    top_k, static_cast<float*>(out.data));

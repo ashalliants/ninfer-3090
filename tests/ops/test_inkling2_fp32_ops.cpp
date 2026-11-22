@@ -1072,8 +1072,8 @@ std::vector<std::uint8_t> nvfp4_blocks(std::size_t blocks) {
     return b;
 }
 
-// cols > 2 draws the ids at random (k * cols >= 64 entries take the grouped kernels) and also checks every column
-// against its own T = 1 call, bit for bit.
+// cols > 2 draws the ids at random (k * cols >= 64 entries take the expert-major kernels) and also checks every
+// column against its own T = 1 call, bit for bit.
 void test_experts(bool nvfp4, int h, int inter, int experts, const std::string& label, int cols = 2) {
     const int k = 4, entries = k * cols;
     auto z = randoms(h * cols);
@@ -1255,8 +1255,79 @@ void test_experts(bool nvfp4, int h, int inter, int experts, const std::string& 
     }
 }
 
+// Decode widths 1..17 at the model's shape and top 8 over 40 experts at random (so an expert gets from one entry to
+// several tiles' worth): every column of a T-column call, weighted, and every entry's unweighted output are byte-equal
+// to the column's own T = 1 call (the per-entry kernels), for NVFP4 records untiled and tiled and for BF16 banks.
+void test_expert_widths(bool nvfp4) {
+    const int h = 2304, inter = 1152, experts = 40, k = 8, max_cols = 17;
+    ninfer::ops::SituExpertBank bank;
+    bank.experts = experts, bank.hidden = h, bank.intermediate = inter;
+    ninfer::DeviceBuffer records, bgu, bd;
+    Buf sc(randoms(2 * experts, 0.5F, 1.5F));
+    if (nvfp4) {
+        const std::uint64_t gate_row = h / 64 * 36, down_row = inter / 64 * 36, gate_bytes = gate_row * inter;
+        const std::uint64_t up_off = align256(gate_bytes), down_off = align256(up_off + gate_bytes), stride = align256(down_off + down_row * h);
+        std::vector<std::uint8_t> host(stride * experts, 0);
+        for (int e = 0; e < experts; ++e) {
+            for (const auto [offset, n] : {std::pair{std::uint64_t{0}, gate_bytes}, std::pair{up_off, gate_bytes}, std::pair{down_off, down_row * h}}) {
+                const auto blocks = nvfp4_blocks(n / 36);
+                std::copy(blocks.begin(), blocks.end(), host.begin() + e * stride + offset);
+            }
+        }
+        records = t::to_device(host);
+        bank.format = ninfer::QType::GGML_REC_NVFP4_NVFP4, bank.records = static_cast<const std::uint8_t*>(records.p), bank.record_stride = stride;
+        bank.gate_up_scale = static_cast<const float*>(sc.b.p), bank.down_scale = static_cast<const float*>(sc.b.p) + experts;
+    } else {
+        bgu = t::to_device_bf16(randoms(static_cast<std::size_t>(experts) * 2 * inter * h, -0.05F, 0.05F));
+        bd  = t::to_device_bf16(randoms(static_cast<std::size_t>(experts) * h * inter, -0.05F, 0.05F));
+        bank.format = ninfer::QType::BF16, bank.gate_up = bgu.p, bank.down = bd.p;
+    }
+    const auto z = randoms(static_cast<std::size_t>(h) * max_cols), w = randoms(static_cast<std::size_t>(k) * max_cols, 0.1F, 2.0F);
+    Buf dz(z), dw(w), out(static_cast<std::size_t>(h) * max_cols), each(static_cast<std::size_t>(h) * k * max_cols), one(h), one_each(h * k);
+    ninfer::DeviceArena arena(ninfer::ops::moe_situ_experts_workspace_bytes(bank, std::int64_t{k} * max_cols) + 4096);
+    for (const bool tiled : nvfp4 ? std::vector<bool>{false, true} : std::vector<bool>{false}) {
+        if (tiled) {
+            ninfer::DeviceBuffer scratch(bank.record_stride);
+            ninfer::ops::nvfp4_tile_records(bank, static_cast<std::uint8_t*>(records.p), scratch.p, nullptr);
+        }
+        int differ = 0;
+        for (int cols = 1; cols <= max_cols; ++cols) {
+            std::vector<int> ids(static_cast<std::size_t>(k) * cols);
+            for (int c = 0; c < cols; ++c) { // k distinct experts per column, as the router gives
+                for (int i = 0; i < k; ++i) {
+                    int e = 0;
+                    do { e = std::min(experts - 1, static_cast<int>(uniform(0.0F, 1.0F) * experts)); } while (
+                        std::find(ids.begin() + c * k, ids.begin() + c * k + i, e) != ids.begin() + c * k + i);
+                    ids[c * k + i] = e;
+                }
+            }
+            ninfer::DeviceBuffer did = t::to_device_i32(ids);
+            const Tensor tz = dz.tensor({h, max_cols}).slice(1, 0, cols), tw(dw.b.p, DType::FP32, {k, cols}), tid(did.p, DType::I32, {k, cols});
+            Tensor to(out.b.p, DType::FP32, {h, cols}), te(each.b.p, DType::FP32, {h, k * cols});
+            ninfer::ops::moe_situ_experts(bank, tz, tid, &tw, 4.0F, 25.0F, arena, to, nullptr);
+            ninfer::ops::moe_situ_experts(bank, tz, tid, nullptr, 4.0F, 25.0F, arena, te, nullptr);
+            const auto got = out.get(static_cast<std::size_t>(h) * cols), got_each = each.get(static_cast<std::size_t>(h) * k * cols);
+            for (int c = 0; c < cols; ++c) {
+                const Tensor zc = dz.tensor({h, max_cols}).slice(1, c, 1), wc(static_cast<float*>(dw.b.p) + c * k, DType::FP32, {k, 1}),
+                             ic(static_cast<std::int32_t*>(did.p) + c * k, DType::I32, {k, 1});
+                Tensor oc = one.tensor({h, 1}), ec = one_each.tensor({h, k});
+                ninfer::ops::moe_situ_experts(bank, zc, ic, &wc, 4.0F, 25.0F, arena, oc, nullptr);
+                ninfer::ops::moe_situ_experts(bank, zc, ic, nullptr, 4.0F, 25.0F, arena, ec, nullptr);
+                const auto col = one.get(h), col_each = one_each.get(static_cast<std::size_t>(h) * k);
+                const bool same = std::memcmp(col.data(), got.data() + static_cast<std::size_t>(c) * h, h * sizeof(float)) == 0 &&
+                                  std::memcmp(col_each.data(), got_each.data() + static_cast<std::size_t>(c) * h * k, h * k * sizeof(float)) == 0;
+                differ += same ? 0 : 1;
+            }
+            check(cudaDeviceSynchronize() == cudaSuccess, "moe_situ_experts widths: a launch failed");
+        }
+        const std::string label = std::string("moe_situ_experts ") + (nvfp4 ? (tiled ? "NVFP4 tiled" : "NVFP4") : "BF16") + " T 1..17 top 8 of 40";
+        check(differ == 0, label + ": " + std::to_string(differ) + " columns differ from their own T = 1 call");
+        std::printf("%-44s every column and entry bit-exact with T = 1\n", label.c_str());
+    }
+}
+
 // nvfp4_tile_records: the tiled records give the same bits as the untiled ones through every NVFP4 route (per
-// entry, grouped by expert, tensor cores), for the run shapes 1/2 (H 2304, I 1152) and 2/4 (H 1152, I 192).
+// entry, expert-major, tensor cores), for the run shapes 1/2 (H 2304, I 1152) and 2/4 (H 1152, I 192).
 void test_tiled_experts(int h, int inter, const char* label) {
     const int experts = 8, k = 4;
     const std::uint64_t gate_row = h / 64 * 36, down_row = inter / 64 * 36, gate_bytes = gate_row * inter;
@@ -1275,10 +1346,10 @@ void test_tiled_experts(int h, int inter, const char* label) {
     bank.records = static_cast<const std::uint8_t*>(records.p), bank.record_stride = stride;
     bank.gate_up_scale = static_cast<const float*>(sc.b.p), bank.down_scale = static_cast<const float*>(sc.b.p) + experts;
     // The same inputs for both passes.
-    const std::vector<float> z1 = randoms(static_cast<std::size_t>(h) * 17), w1 = randoms(static_cast<std::size_t>(k) * 17, 0.1F, 1.0F);
+    const std::vector<float> z1 = randoms(static_cast<std::size_t>(h) * 32), w1 = randoms(static_cast<std::size_t>(k) * 32, 0.1F, 1.0F);
     const auto run_all = [&](const ninfer::ops::SituExpertBank& b) {
         std::vector<std::vector<float>> outs;
-        for (const int cols : {1, 17}) {
+        for (const int cols : {1, 32}) {
             std::vector<int> ids(static_cast<std::size_t>(k) * cols);
             for (int c = 0; c < cols; ++c)
                 for (int j = 0; j < k; ++j) { ids[c * k + j] = (c * 3 + j * 2) % experts; }
@@ -1298,7 +1369,7 @@ void test_tiled_experts(int h, int inter, const char* label) {
         }
         return outs;
     };
-    // The grouped route needs at least 64 entries: 17 columns of 4 is 68.
+    // The expert-major route needs at least 64 entries: 32 columns of 4 is 128.
     const auto before = run_all(bank);
     // The FP16 exactness diagnostic reads the logical rows through the tiling: the same count either way.
     const std::uint64_t inexact_before = ninfer::ops::nvfp4_bank_fp16_inexact(bank, nullptr);
@@ -1317,14 +1388,15 @@ void test_tiled_experts(int h, int inter, const char* label) {
     std::vector<std::uint8_t> tiled(host.size());
     check(cudaMemcpy(tiled.data(), records.p, tiled.size(), cudaMemcpyDeviceToHost) == cudaSuccess && tiled != host,
           std::string(label) + ": the records were not repacked");
-    std::printf("%-44s tiled == untiled (T 1, T 17 grouped, T 17 tensor cores; %llu FP16-inexact values either way)\n", label,
+    std::printf("%-44s tiled == untiled (T 1, T 32 expert-major, T 32 tensor cores; %llu FP16-inexact values either way)\n", label,
                 static_cast<unsigned long long>(inexact_before));
 }
 
 // NINFER_INKLING2_OP_BENCH=1: decode-shaped timing (T = 1, top 8 of 32 resident experts at the model's shape, each
 // call a different 8 so nothing stays in L2), printed as microseconds and effective weight bandwidth. Not a criterion.
-void bench_experts(bool nvfp4, int cols = 1) {
-    const int h = 2304, inter = 1152, experts = cols > 1 ? 128 : 32, k = 8, iters = cols > 1 ? 5 : 40;
+void bench_experts(bool nvfp4, int width = 1, const std::vector<int>& sweep_widths = {}) {
+    const bool sweep = !sweep_widths.empty();
+    const int h = 2304, inter = 1152, experts = width > 1 || sweep ? 128 : 32, k = 8;
     ninfer::ops::SituExpertBank bank;
     bank.experts = experts;
     bank.hidden = h;
@@ -1361,6 +1433,8 @@ void bench_experts(bool nvfp4, int cols = 1) {
         bank.down    = bd.p;
         per_expert   = 3ULL * inter * h * 2;
     }
+    for (const int cols : sweep ? sweep_widths : std::vector<int>{width}) {
+    const int iters = sweep ? 24 : cols > 1 ? 5 : 40;
     // T = 1: each call a different 8 of the 32 experts. T > 1: every column 8 distinct experts of 128 at random.
     std::vector<int> ids(static_cast<std::size_t>(k) * iters * cols);
     for (int i = 0; i < iters; ++i)
@@ -1369,6 +1443,26 @@ void bench_experts(bool nvfp4, int cols = 1) {
                 ids[(i * cols + c) * k + j] = cols == 1 ? (i * k + j) % experts
                                                         : (static_cast<int>(uniform(0.0F, 1.0F) * 16) + j * 16) % experts;
             }
+    // Sweep: every column 8 distinct experts of 128 uniformly at random (columns may share), as a batch of unrelated
+    // requests routes; the floor is the distinct experts' bytes at 900 GB/s.
+    double distinct = 0;
+    if (sweep) {
+        for (int i = 0; i < iters; ++i) {
+            std::vector<int> seen(experts, 0);
+            for (int c = 0; c < cols; ++c) {
+                std::vector<int> pick;
+                while (static_cast<int>(pick.size()) < k) {
+                    const int e = std::min(experts - 1, static_cast<int>(uniform(0.0F, 1.0F) * experts));
+                    if (std::find(pick.begin(), pick.end(), e) == pick.end()) { pick.push_back(e); }
+                }
+                for (int j = 0; j < k; ++j) {
+                    ids[(i * cols + c) * k + j] = pick[j];
+                    distinct += seen[pick[j]]++ == 0 ? 1 : 0;
+                }
+            }
+        }
+        distinct /= iters;
+    }
     Buf dz(randoms(static_cast<std::size_t>(h) * cols)), dw(std::vector<float>(static_cast<std::size_t>(k) * cols, 1.0F)),
         dout(static_cast<std::size_t>(h) * cols);
     ninfer::DeviceBuffer did = t::to_device_i32(ids);
@@ -1391,13 +1485,18 @@ void bench_experts(bool nvfp4, int cols = 1) {
     float ms = 0;
     cudaEventElapsedTime(&ms, start, stop);
     const double us = 1e3 * ms / iters;
-    if (cols > 1) {
+    if (sweep) {
+        const double floor_us = distinct * per_expert / 900e3;
+        std::printf("sweep moe_situ_experts %s T=%2d: %7.1f us, %5.1f distinct experts, floor %6.1f us (%.0f%%), %4.0f GB/s\n",
+                    nvfp4 ? "NVFP4" : "BF16 ", cols, us, distinct, floor_us, 100.0 * floor_us / us, distinct * per_expert / (us * 1e3));
+    } else if (cols > 1) {
         std::printf("bench moe_situ_experts %s T=%d top 8 of 128: %.1f us, %.1f us a column\n", nvfp4 ? "NVFP4" : "BF16 ", cols, us, us / cols);
     }
-    if (cols == 1) std::printf("bench moe_situ_experts %s T=1 top 8: %.1f us, %.0f GB/s of expert weights\n", nvfp4 ? "NVFP4" : "BF16 ", us,
+    if (!sweep && cols == 1) std::printf("bench moe_situ_experts %s T=1 top 8: %.1f us, %.0f GB/s of expert weights\n", nvfp4 ? "NVFP4" : "BF16 ", us,
                 k * per_expert / (us * 1e3));
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
+    }
 }
 
 // projection_fp32 at Inkling-2's decode shapes (T = 1): time per call and weight bandwidth.
@@ -1635,12 +1734,15 @@ int main() {
         test_experts(true, 128, 64, 3, "moe_situ_experts NVFP4 small");
         test_experts(true, 2304, 1152, 3, "moe_situ_experts NVFP4 [3, 2304, 1152]");
         test_experts(false, 2304, 1152, 3, "moe_situ_experts BF16 [3, 2304, 1152]");
-        test_experts(true, 128, 64, 8, "moe_situ_experts NVFP4 small, T 24 grouped", 24);
-        test_experts(true, 2304, 1152, 16, "moe_situ_experts NVFP4 [16, 2304, 1152] T 17 grouped", 17);
-        test_experts(false, 2304, 1152, 8, "moe_situ_experts BF16 [8, 2304, 1152] T 17 grouped", 17);
-        // H = 8192: the grouped kernels' staged activations exceed shared memory, so every entry runs alone.
+        test_experts(true, 128, 64, 8, "moe_situ_experts NVFP4 small, T 40 expert-major", 40);
+        test_experts(true, 2304, 1152, 16, "moe_situ_experts NVFP4 [16, 2304, 1152] T 9 per entry", 9);
+        test_experts(true, 2304, 1152, 16, "moe_situ_experts NVFP4 [16, 2304, 1152] T 17 expert-major", 17);
+        test_experts(false, 2304, 1152, 8, "moe_situ_experts BF16 [8, 2304, 1152] T 17 expert-major", 17);
+        // H = 8192: the expert-major kernels' staged activations exceed shared memory, so every entry runs alone.
         test_experts(true, 8192, 128, 4, "moe_situ_experts NVFP4 [4, 8192, 128] T 17 per entry", 17);
         test_experts(false, 8192, 128, 4, "moe_situ_experts BF16 [4, 8192, 128] T 17 per entry", 17);
+        test_expert_widths(true);
+        test_expert_widths(false);
         test_tiled_experts(2304, 1152, "nvfp4_tile_records [2304, 1152]");
         test_tiled_experts(1152, 192, "nvfp4_tile_records [1152, 192]");
         if (const char* bench = std::getenv("NINFER_INKLING2_OP_BENCH"); bench != nullptr && *bench == '1') {
@@ -1648,6 +1750,10 @@ int main() {
             bench_experts(false);
             bench_experts(true, 256);
             bench_projection();
+        }
+        // NINFER_INKLING2_OP_SWEEP=1: decode widths 1..17 at random routes, NVFP4 and BF16, against the distinct-expert floor.
+        if (const char* sweep = std::getenv("NINFER_INKLING2_OP_SWEEP"); sweep != nullptr && *sweep == '1') {
+            for (const bool nvfp4 : {true, false}) { bench_experts(nvfp4, 1, {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 17, 24, 32}); }
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
