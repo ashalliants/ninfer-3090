@@ -68,6 +68,7 @@ struct Problem {
     std::vector<std::uint16_t> q, kv;
     std::vector<std::int32_t> idx;
     std::vector<float> sink;
+    std::size_t kv_offset = 0; // bytes the kv table starts past a 16-byte boundary
 };
 
 struct Shape {
@@ -100,13 +101,13 @@ Problem make_problem(const Shape& s, std::uint32_t seed) {
 
 std::vector<std::uint16_t> run(const Problem& p, cudaStream_t stream, bool graph = false) {
     const std::size_t out_count = p.q.size();
-    Device qd(p.q.size() * 2), kd(p.kv.size() * 2), id(p.idx.size() * 4), sd(p.sink.size() * 4), od(out_count * 2);
+    Device qd(p.q.size() * 2), kd(p.kv.size() * 2 + 16), id(p.idx.size() * 4), sd(p.sink.size() * 4), od(out_count * 2);
     qd.put(p.q);
-    kd.put(p.kv);
+    t::cuda_check(cudaMemcpy(static_cast<char*>(kd.p) + p.kv_offset, p.kv.data(), p.kv.size() * 2, cudaMemcpyHostToDevice), "put kv");
     id.put(p.idx);
     sd.put(p.sink);
     t::cuda_check(cudaMemset(od.p, 0xFF, out_count * 2), "poison out");
-    const Tensor Q(qd.p, DType::BF16, {p.D, p.H, p.T}), KV(kd.p, DType::BF16, {p.D, p.N}), I(id.p, DType::I32, {p.K, p.T}),
+    const Tensor Q(qd.p, DType::BF16, {p.D, p.H, p.T}), KV(static_cast<char*>(kd.p) + p.kv_offset, DType::BF16, {p.D, p.N}), I(id.p, DType::I32, {p.K, p.T}),
         S(sd.p, DType::FP32, {p.H});
     Tensor out(od.p, DType::BF16, {p.D, p.H, p.T});
     const auto call = [&] { ninfer::ops::gathered_sink_attention(Q, KV, I, S, p.scale, out, stream); };
@@ -171,7 +172,7 @@ std::vector<double> oracle(const Problem& p, int column, int head, bool* any_val
 }
 
 // The tensor-core route (contract: 8 or more columns, D = 256 or 512) multiplies BF16 softmax weights.
-bool tensor_core_call(const Problem& p) { return p.T >= 8 && (p.D == 256 || p.D == 512); }
+bool tensor_core_call(const Problem& p) { return p.T >= 8 && p.kv_offset % 16 == 0 && (p.D == 256 || p.D == 512); }
 
 void verify(const Problem& p, const std::vector<std::uint16_t>& got, const std::string& label) {
     const bool tc = tensor_core_call(p);
@@ -259,7 +260,7 @@ int main() {
         }
         cudaStream_t stream = nullptr;
         t::cuda_check(cudaStreamCreate(&stream), "stream");
-        for (const int T : {1, 3, 8, 9, 70}) {
+        for (const int T : {1, 3, 7, 8, 9, 70}) {
             test_case("D=512 H=64 K=640 N=700 T=" + std::to_string(T), {512, 64, T, 640, 700}, 11U + T, stream);
         }
         test_case("D=128 H=5 K=7 N=40 (odd heads, a partial row group)", {128, 5, 4, 7, 40}, 21U, stream);
@@ -268,6 +269,7 @@ int main() {
         test_case("D=256 H=8 K=33 N=100", {256, 8, 5, 33, 100}, 51U, stream);
         test_case("tensor cores, D=256 H=40 (a partial head block) K=70 N=100 T=12", {256, 40, 12, 70, 100}, 52U, stream);
         test_case("tensor cores, D=512 H=64 K=1 N=30 T=9 (a list of one row)", {512, 64, 9, 1, 30, 1.0F, 0.0F, 0.0F}, 53U, stream);
+        test_case("tensor cores, D=512 H=64 K=33 N=100 T=8 (a list ending inside a tile, the route seam)", {512, 64, 8, 33, 100}, 57U, stream);
         test_case("tensor cores, large scores (q x 8)", {512, 64, 10, 130, 200, 8.0F}, 54U, stream);
         test_case("tensor cores, sink far above the scores", {512, 33, 9, 130, 200, 1.0F, 30.0F}, 55U, stream);
         test_case("tensor cores, mostly invalid lists", {512, 64, 12, 130, 200, 1.0F, 0.0F, 0.97F}, 56U, stream);
@@ -295,6 +297,13 @@ int main() {
             p1.idx.assign(p3.idx.begin() + p3.K, p3.idx.begin() + 2 * p3.K);
             const std::vector<std::uint16_t> one = run(p1, stream);
             check(std::memcmp(one.data(), all.data() + per_column, per_column * 2) == 0, "a column's output does not depend on the other columns");
+        }
+
+        {
+            // A kv table only 4-byte aligned (the contract admits it) is served by the CUDA-core kernel.
+            Problem p = make_problem({512, 64, 12, 640, 700}, 141U);
+            p.kv_offset = 4;
+            verify(p, run(p, stream), "kv 4-byte aligned, T=12 (CUDA-core fallback)");
         }
 
         // The tensor-core route: each column's output is its own, whatever the chunk it came in.

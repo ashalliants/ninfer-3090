@@ -97,7 +97,7 @@ ScoreCase make_scores(int D, int H, int T, int N, std::vector<std::int32_t> vali
     return c;
 }
 
-std::vector<float> run_scores(const ScoreCase& c, cudaStream_t stream) {
+std::vector<float> run_scores(const ScoreCase& c, cudaStream_t stream, bool graph = false) {
     Device qd(c.q.size() * 2), kd(c.k.size() * 2), wd(c.w.size() * 2), vd(c.valid.size() * 4),
         od(static_cast<std::size_t>(c.N) * c.T * 4);
     qd.put(c.q);
@@ -107,7 +107,19 @@ std::vector<float> run_scores(const ScoreCase& c, cudaStream_t stream) {
     const Tensor Q(qd.p, DType::BF16, {c.D, c.H, c.T}), K(kd.p, DType::BF16, {c.D, c.N}), W(wd.p, DType::BF16, {c.H, c.T}),
         V(vd.p, DType::I32, {c.T});
     Tensor out(od.p, DType::FP32, {c.N, c.T});
-    ninfer::ops::weighted_relu_dot_scores(Q, K, W, V, c.scale, out, stream);
+    if (graph) {
+        cudaGraph_t g        = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        t::cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
+        ninfer::ops::weighted_relu_dot_scores(Q, K, W, V, c.scale, out, stream);
+        t::cuda_check(cudaStreamEndCapture(stream, &g), "end capture");
+        t::cuda_check(cudaGraphInstantiate(&exec, g, 0), "instantiate");
+        t::cuda_check(cudaGraphLaunch(exec, stream), "launch");
+        cudaGraphExecDestroy(exec);
+        cudaGraphDestroy(g);
+    } else {
+        ninfer::ops::weighted_relu_dot_scores(Q, K, W, V, c.scale, out, stream);
+    }
     t::cuda_check(cudaStreamSynchronize(stream), "sync");
     return od.get<float>(static_cast<std::size_t>(c.N) * c.T);
 }
@@ -296,6 +308,15 @@ int main() {
         {
             const ScoreCase c = make_scores(128, 32, 16, 400, std::vector<std::int32_t>(16, 0), 83U);
             verify_scores(c, run_scores(c, stream), "scores T=16 nothing reachable (tensor cores)");
+        }
+        // The route seam (8 columns) and its neighbours, the scoring call captured in a graph.
+        for (const int T : {7, 8, 9}) {
+            std::vector<std::int32_t> lengths(T);
+            for (int i = 0; i < T; ++i) { lengths[i] = 300 - 17 * i; }
+            const ScoreCase c = make_scores(128, 32, T, 300, lengths, 70U + T);
+            const std::vector<float> eager = run_scores(c, stream);
+            verify_scores(c, eager, "scores D=128 H=32 N=300 T=" + std::to_string(T) + " (route seam)");
+            check(run_scores(c, stream, true) == eager, "a graph-captured scores call is bitwise the eager call at T=" + std::to_string(T));
         }
         for (const int H : {16, 32, 64}) {
             for (const int D : {64, 128, 256}) {

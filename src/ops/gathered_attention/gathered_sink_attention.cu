@@ -4,6 +4,7 @@
 
 #include "ninfer/ops/gathered_sink_attention.h"
 
+#include "core/device.h"
 #include "ops/common/smem_limit.h"
 #include "ops/gathered_attention/gathered_sink_attention_mma.cuh"
 
@@ -198,11 +199,14 @@ void launch_split(const Tensor& q, const Tensor& kv, const Tensor& idx, const Te
 // it a column's two head blocks cannot fill the card and the CUDA-core kernel's shares do better.
 constexpr int kMmaMinColumns = 8;
 
-bool tensor_core_route(int dim, int columns) {
+bool tensor_core_route(int dim, int columns, const Tensor& kv) {
 #if defined(NINFER_SM70)
     return false; // Volta emulates the BF16 MMA: the CUDA-core kernel is faster there
 #else
-    if (columns < kMmaMinColumns || (dim != 256 && dim != 512)) { return false; }
+    // The kernel copies kv rows with 16-byte cp.async; the contract admits 4-byte aligned tensors.
+    if (columns < kMmaMinColumns || (dim != 256 && dim != 512) || reinterpret_cast<std::uintptr_t>(kv.data) % 16 != 0) {
+        return false;
+    }
     int device = 0, major = 0;
     return cudaGetDevice(&device) == cudaSuccess &&
            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess && major >= 8;
@@ -214,7 +218,9 @@ void launch_mma(const Tensor& q, const Tensor& kv, const Tensor& idx, const Tens
                 int heads, int columns, cudaStream_t stream) {
     constexpr int bytes = gathered_mma::Layout<D>::bytes;
     static_assert(bytes <= kMaxDynamicSharedBytes);
-    cudaFuncSetAttribute(gathered_mma::attention_mma_kernel<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+    configure_cuda_device_once([] {
+        return cudaFuncSetAttribute(gathered_mma::attention_mma_kernel<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+    });
     const dim3 grid(static_cast<unsigned>(columns), static_cast<unsigned>((heads + gathered_mma::kHeads - 1) / gathered_mma::kHeads));
     gathered_mma::attention_mma_kernel<D><<<grid, gathered_mma::kThreads, bytes, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(kv.data),
@@ -227,7 +233,7 @@ template <int D>
 void launch(const Tensor& q, const Tensor& kv, const Tensor& idx, const Tensor& sink, float scale, Tensor& out,
             int heads, int columns, cudaStream_t stream) {
     if constexpr (D == 256 || D == 512) {
-        if (tensor_core_route(D, columns)) {
+        if (tensor_core_route(D, columns, kv)) {
             launch_mma<D>(q, kv, idx, sink, scale, out, heads, columns, stream);
             return;
         }
