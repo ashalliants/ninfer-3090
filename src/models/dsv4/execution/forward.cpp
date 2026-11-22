@@ -29,6 +29,58 @@ void cuda_ok(cudaError_t error, const char* what) {
 
 constexpr std::size_t kSlack = 1 << 20;
 
+// Owners of a CUDA stream and event, so a constructor that fails part-way releases what it had made.
+struct OwnedStream {
+    cudaStream_t handle = nullptr;
+    OwnedStream() = default;
+    OwnedStream(const OwnedStream&) = delete;
+    OwnedStream& operator=(const OwnedStream&) = delete;
+    ~OwnedStream() {
+        if (handle != nullptr) { cudaStreamDestroy(handle); }
+    }
+    void create(const char* what) { cuda_ok(cudaStreamCreateWithFlags(&handle, cudaStreamNonBlocking), what); }
+};
+
+struct OwnedEvent {
+    cudaEvent_t handle = nullptr;
+    OwnedEvent() = default;
+    OwnedEvent(const OwnedEvent&) = delete;
+    OwnedEvent& operator=(const OwnedEvent&) = delete;
+    ~OwnedEvent() {
+        if (handle != nullptr) { cudaEventDestroy(handle); }
+    }
+    void create(const char* what) { cuda_ok(cudaEventCreateWithFlags(&handle, cudaEventDisableTiming), what); }
+};
+
+// A branch of work on `aux` forked from `main`: the constructor makes `aux` wait for what `main` has queued, and the
+// branch is joined back (`main` waits for `aux`) by join() or, if the body throws, by the destructor. A stream capture
+// must see every forked branch joined before it ends, and a failed capture is then ended cleanly by its caller.
+class ForkJoin {
+public:
+    ForkJoin(cudaStream_t main, cudaStream_t aux, cudaEvent_t fork, cudaEvent_t join) : main_(main), aux_(aux), join_(join) {
+        cuda_ok(cudaEventRecord(fork, main), "fork event");
+        cuda_ok(cudaStreamWaitEvent(aux, fork, 0), "fork wait");
+    }
+    ForkJoin(const ForkJoin&) = delete;
+    ForkJoin& operator=(const ForkJoin&) = delete;
+    ~ForkJoin() {
+        if (!joined_) { (void)try_join(); }
+    }
+    void join() {
+        joined_ = true;
+        cuda_ok(try_join(), "join");
+    }
+
+private:
+    cudaError_t try_join() noexcept {
+        const cudaError_t recorded = cudaEventRecord(join_, aux_);
+        return recorded != cudaSuccess ? recorded : cudaStreamWaitEvent(main_, join_, 0);
+    }
+    cudaStream_t main_, aux_;
+    cudaEvent_t join_;
+    bool joined_ = false;
+};
+
 // The Engram folder's checked contents, or nothing without a folder (the layers then run uninjected).
 std::optional<EngramSidecar> load_sidecar(const Model& model, const ForwardOptions& options) {
     if (options.engram_dir.empty()) { return std::nullopt; }
@@ -105,8 +157,8 @@ struct Forward::Impl {
     // The shared expert of a decode step runs beside the routed experts inside the tail graph: its kernels stream
     // weights while the routed experts' are bound by integer decode work, so the two overlap on the GPU. It runs on
     // aux_stream, forked from and joined to the captured stream by these events.
-    cudaStream_t aux_stream = nullptr;
-    cudaEvent_t fork_event = nullptr, join_event = nullptr;
+    OwnedStream aux_stream;
+    OwnedEvent fork_event, join_event;
     std::vector<LayerGraphs> layer_graphs;
     bool warmed = false; // one eager one-column step has run
     DeviceBuffer tail_collapsed, tail_normed;
@@ -132,9 +184,6 @@ struct Forward::Impl {
             }
         }
         if (capture_stream != nullptr) { cudaStreamDestroy(capture_stream); }
-        if (aux_stream != nullptr) { cudaStreamDestroy(aux_stream); }
-        if (fork_event != nullptr) { cudaEventDestroy(fork_event); }
-        if (join_event != nullptr) { cudaEventDestroy(join_event); }
     }
 
     // Runs `body(stream)`: directly, or (`use`) as the graph `exec`, captured from `body(capture_stream)` the
@@ -248,9 +297,9 @@ struct Forward::Impl {
         tail_normed    = DeviceBuffer(std::size_t(H) * 2);
         layer_graphs.resize(config.num_hidden_layers);
         cuda_ok(cudaStreamCreateWithFlags(&capture_stream, cudaStreamNonBlocking), "capture stream");
-        cuda_ok(cudaStreamCreateWithFlags(&aux_stream, cudaStreamNonBlocking), "shared expert stream");
-        cuda_ok(cudaEventCreateWithFlags(&fork_event, cudaEventDisableTiming), "fork event");
-        cuda_ok(cudaEventCreateWithFlags(&join_event, cudaEventDisableTiming), "join event");
+        aux_stream.create("shared expert stream");
+        fork_event.create("fork event");
+        join_event.create("join event");
     }
 
     // Mixes of T columns carved from one of the three sets.
@@ -438,14 +487,13 @@ const Tensor& Forward::run(std::span<const std::int32_t> tokens, std::int32_t st
         const bool next_front = !last && !s.engram_layers[l + 1];
         const Tensor mixes_pre = mixes.pre;
         s.segment(g.tail, use_graphs, [&](cudaStream_t st) {
+            std::optional<ForkJoin> shared_branch;
             if (overlap_shared) {
-                cuda_ok(cudaEventRecord(s.fork_event, st), "fork event");
-                cuda_ok(cudaStreamWaitEvent(s.aux_stream, s.fork_event, 0), "fork wait");
-                ffn_shared(fp, s.ffn[l], call, s.workspace, s.aux_stream);
-                cuda_ok(cudaEventRecord(s.join_event, s.aux_stream), "join event");
+                shared_branch.emplace(st, s.aux_stream.handle, s.fork_event.handle, s.join_event.handle);
+                ffn_shared(fp, s.ffn[l], call, s.workspace, s.aux_stream.handle);
             }
             ffn_routed(fp, call, source, st);
-            if (overlap_shared) { cuda_ok(cudaStreamWaitEvent(st, s.join_event, 0), "join wait"); }
+            if (shared_branch) { shared_branch->join(); }
             ffn_combine(call, input, st);
             if (next_front) {
                 attn_front(l + 1, mixes_pre, collapsed, x, st);

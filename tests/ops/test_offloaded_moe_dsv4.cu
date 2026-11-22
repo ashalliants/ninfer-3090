@@ -235,7 +235,7 @@ std::vector<std::uint16_t> run(const Bank& bank, const Placement& p, const Route
     d_frames.copy_from_host(frames.data(), frames.size() * 4);
     std::unique_ptr<DeviceBuffer> staging;
     if (p.staging_slots > 0) { staging = std::make_unique<DeviceBuffer>(bank.stride * p.staging_slots); }
-    DeviceBuffer workspace(ops::moe_experts_narrow_workspace_bytes(om::kDsv4Shape, max_jobs, k * columns, columns));
+    DeviceBuffer workspace(ops::moe_experts_narrow_workspace_bytes(om::kDsv4Shape, max_jobs, k * columns, columns, p.precast));
     cuda_ok(cudaMemset(workspace.p, 0xA5, workspace.bytes), "poison the workspace");
     DeviceBuffer outputs(static_cast<std::size_t>(k) * columns * kH * 2);
     cuda_ok(cudaMemset(outputs.p, 0xFF, outputs.bytes), "poison the outputs");
@@ -380,7 +380,7 @@ void bench_format(QType format, std::mt19937& rng) {
         DeviceBuffer x_dev(x.size() * 2);
         x_dev.copy_from_host(x.data(), x.size() * 2);
         const int max_jobs = std::min(kExperts, kTopK * columns);
-        DeviceBuffer workspace(ops::moe_experts_narrow_workspace_bytes(om::kDsv4Shape, max_jobs, kTopK * columns, columns));
+        DeviceBuffer workspace(ops::moe_experts_narrow_workspace_bytes(om::kDsv4Shape, max_jobs, kTopK * columns, columns, true));
         DeviceBuffer outputs(static_cast<std::size_t>(kTopK) * columns * kH * 2);
         ops::MoeExpertSource source;
         source.format         = bank.format;
