@@ -3664,6 +3664,28 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
     return failures;
 }
 
+// DeepSeek-V4's template has no ChatML markers: a thinking turn ends "<｜Assistant｜><think>" and the
+// model continues inside its reasoning, so the prompt must say so (the output is then split at </think>).
+int test_deepseek_style_template_starts_in_reasoning() {
+    const std::string source =
+        "{%- set thinking = enable_thinking if enable_thinking is defined else true -%}"
+        "{%- for m in messages -%}{%- if m.role == 'user' -%}<\uff5cUser\uff5c>{{ m.content }}{%- endif -%}{%- endfor -%}"
+        "{%- if add_generation_prompt -%}<\uff5cAssistant\uff5c>{{ '<think>' if thinking else '</think>' }}{%- endif -%}";
+    const auto compiled = fi::CompiledChatTemplate::resolve(source);
+    std::vector<fi::ChatMessage> messages{chat_message(ninfer::ChatRole::User, "question")};
+    fi::ChatRenderOptions options;
+    options.add_generation_prompt = true;
+    int failures                  = 0;
+    const auto thinking           = compiled.render(messages, options);
+    failures += check(thinking.text.ends_with("<\uff5cAssistant\uff5c><think>") && thinking.starts_in_reasoning,
+                      "a DeepSeek-style thinking prompt starts in reasoning");
+    options.enable_thinking = false;
+    const auto chat         = compiled.render(messages, options);
+    failures += check(chat.text.ends_with("<\uff5cAssistant\uff5c></think>") && !chat.starts_in_reasoning,
+                      "a DeepSeek-style chat prompt does not start in reasoning");
+    return failures;
+}
+
 int test_disabled_vision() {
     auto source = resources();
     source.preprocessor_config_json.clear();
@@ -4022,5 +4044,6 @@ int main() {
     failures += test_media_preparation_cancellation();
     failures += test_invalid_media_classification();
     failures += test_disabled_vision();
+    failures += test_deepseek_style_template_starts_in_reasoning();
     return failures == 0 ? 0 : 1;
 }
