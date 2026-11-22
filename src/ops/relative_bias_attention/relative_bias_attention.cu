@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -864,6 +865,196 @@ __global__ void __launch_bounds__(kThreads, 2) attention_lowbit_kernel(Attention
     store_out(static_cast<Out*>(a.out) + t * a.os + at, y);
 }
 
+// The split decode over lowbit rings with the GQA group in one block: grid (T, kv_heads, splits), block (t, g, z) takes
+// the keys [lo + 256 z, lo + 256 (z + 1)) of the group's kGroupHeads heads, so each key and value is loaded and
+// dequantized once for the three. Scores as attention_lowbit_kernel (8 lanes a key, 16 rotated dimensions a lane), the
+// value fold 8 chains (warp w the keys j = w mod 8), parts in the split layout per head; the last of the column's
+// group blocks to finish (one counter per column and group, head g * kGroupHeads's) combines each head's parts.
+constexpr int kGroupHeads = 3;
+template <typename Out, int KB, int VB>
+__global__ void __launch_bounds__(kThreads, 2) attention_lowbit_group_kernel(AttentionArgs a) {
+    constexpr int G = kGroupHeads, kKeyCode = KB * kHeadDim / 8, kValueCode = VB * kHeadDim / 8;
+    __shared__ __align__(16) float q[G][kHeadDim];
+    __shared__ float r[G][kMaxRel];
+    __shared__ float scores[G][kSplitKeys];
+    __shared__ __align__(16) float chains[kWarps][G][kHeadDim];
+    __shared__ float reduce[kWarps];
+    __shared__ int last_block;
+    const int t = blockIdx.x, g = blockIdx.y, z = static_cast<int>(blockIdx.z), h0 = g * G;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    for (int i = threadIdx.x; i < G * kHeadDim; i += kThreads) {
+        q[i / kHeadDim][i % kHeadDim] = a.q[t * a.qs + static_cast<std::int64_t>(h0 + i / kHeadDim) * kHeadDim + i % kHeadDim];
+    }
+    for (int i = threadIdx.x; i < G * kMaxRel; i += kThreads) {
+        const int hh = i / kMaxRel, c = i % kMaxRel;
+        r[hh][c] = c < a.d_rel ? a.r[t * a.rs + static_cast<std::int64_t>(h0 + hh) * a.d_rel + c] : 0.0F;
+    }
+    __syncthreads();
+    const std::int64_t pos = column_position<false>(a, t);
+    const std::int64_t lo  = a.window > 0 ? (pos - a.window + 1 > 0 ? pos - a.window + 1 : 0) : 0;
+    const std::int64_t first = lo + static_cast<std::int64_t>(z) * kSplitKeys;
+    if (first > pos) { return; }
+    const int n = static_cast<int>(pos - first + 1 < kSplitKeys ? pos - first + 1 : kSplitKeys);
+    const float inv_sqrt_d = rsqrtf(static_cast<float>(kHeadDim));
+    const int sub = lane & (kKeyLanes - 1);
+    float4 qw[G][4];
+    float rq[G][kRelPerLane];
+#pragma unroll
+    for (int hh = 0; hh < G; ++hh) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { qw[hh][i] = reinterpret_cast<const float4*>(q[hh])[4 * sub + i]; }
+#pragma unroll
+        for (int e = 0; e < kRelPerLane; ++e) { rq[hh][e] = r[hh][sub + kKeyLanes * e]; }
+    }
+    int rel_col[kRelPerLane];
+#pragma unroll
+    for (int e = 0; e < kRelPerLane; ++e) { rel_col[e] = sub + kKeyLanes * e < a.d_rel ? sub + kKeyLanes * e : a.d_rel - 1; }
+    const auto* kb = static_cast<const unsigned char*>(a.k);
+    const auto* vb = static_cast<const unsigned char*>(a.v);
+    const int k_code = g * kKeyCode + 2 * KB * sub, k_scale = a.kv_heads * kKeyCode + g * 4 + (sub >> 2) * 2;
+    const int v_code = g * kValueCode + (VB / 2) * lane;
+    const int v_scale = a.kv_heads * kValueCode + (VB == 4 ? g * 8 + (lane >> 3) * 2 : g * 4 + (lane >> 4) * 2);
+    using KeyWord = std::conditional_t<KB == 4, uint2, uint4>;
+    using ValueWord = std::conditional_t<VB == 4, unsigned short, unsigned>;
+    const int capacity32 = static_cast<int>(a.capacity), base_slot32 = static_cast<int>(first % a.capacity);
+    const int pos_from_base = static_cast<int>(pos - first);
+    constexpr int kSteps = 2;
+    for (int i00 = warp * (32 / kKeyLanes); i00 < n; i00 += kKeysPerStep * kSteps) {
+        KeyWord words[kSteps];
+        float kscale[kSteps], rel[kSteps][kRelPerLane];
+#pragma unroll
+        for (int u = 0; u < kSteps; ++u) {
+            const int i = i00 + u * kKeysPerStep + lane / kKeyLanes;
+            int slot = base_slot32 + (i < n ? i : 0);
+            slot -= slot >= capacity32 ? capacity32 : 0;
+            const unsigned char* row = kb + static_cast<std::int64_t>(slot) * a.k_row;
+            words[u]  = __ldg(reinterpret_cast<const KeyWord*>(row + k_code));
+            kscale[u] = __half2float(__ldg(reinterpret_cast<const __half*>(row + k_scale)));
+            int dist = pos_from_base - i;
+            dist = dist < 0 ? 0 : dist < a.extent ? dist : a.extent - 1;
+            const float* t_row = a.table + dist * a.d_rel;
+#pragma unroll
+            for (int e = 0; e < kRelPerLane; ++e) { rel[u][e] = __ldg(t_row + rel_col[e]); }
+        }
+#pragma unroll
+        for (int u = 0; u < kSteps; ++u) {
+            const int i = i00 + u * kKeysPerStep + lane / kKeyLanes;
+            const bool valid = i < n;
+            unsigned c[4];
+            if constexpr (KB == 4) {
+                c[0] = lloyd4_expand4(words[u].x), c[1] = lloyd4_expand4(words[u].x >> 16), c[2] = lloyd4_expand4(words[u].y),
+                c[3] = lloyd4_expand4(words[u].y >> 16);
+            } else {
+                c[0] = words[u].x, c[1] = words[u].y, c[2] = words[u].z, c[3] = words[u].w;
+            }
+            float kf[16];
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) { kf[4 * w + e] = s8_at(c[w], e); }
+            }
+            const bool biased = valid && pos_from_base - i < a.extent;
+            float dot[G], bias[G];
+#pragma unroll
+            for (int hh = 0; hh < G; ++hh) {
+                float d0 = 0.0F;
+#pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    d0 = fmaf(qw[hh][w].x, kf[4 * w], fmaf(qw[hh][w].y, kf[4 * w + 1], fmaf(qw[hh][w].z, kf[4 * w + 2], fmaf(qw[hh][w].w, kf[4 * w + 3], d0))));
+                }
+                dot[hh] = d0 * kscale[u];
+                float b = 0.0F;
+                if (biased) {
+#pragma unroll
+                    for (int e = 0; e < kRelPerLane; ++e) { b = fmaf(rq[hh][e], rel[u][e], b); } // r is 0 past d_rel
+                }
+                bias[hh] = b;
+            }
+#pragma unroll
+            for (int hh = 0; hh < G; ++hh) {
+                for (int o = kKeyLanes / 2; o > 0; o >>= 1) {
+                    dot[hh] += __shfl_xor_sync(0xffffffffU, dot[hh], o);
+                    bias[hh] += __shfl_xor_sync(0xffffffffU, bias[hh], o);
+                }
+                if (valid && sub == 0) { scores[hh][i] = dot[hh] * inv_sqrt_d + bias[hh]; }
+            }
+        }
+    }
+    __syncthreads();
+    float m[G], denom[G];
+#pragma unroll
+    for (int hh = 0; hh < G; ++hh) {
+        const float m0 = z == 0 ? a.sink[t * a.ss + h0 + hh] : -INFINITY;
+        const float top = fmaxf(m0, block_reduce<true>(threadIdx.x < n ? scores[hh][threadIdx.x] : -INFINITY, reduce));
+        float e = 0.0F;
+        if (threadIdx.x < n) { e = scores[hh][threadIdx.x] = expf(scores[hh][threadIdx.x] - top); }
+        const float sum = block_reduce<false>(e, reduce); // its barriers also publish the exponentials
+        m[hh] = top;
+        denom[hh] = (z == 0 ? expf(m0 - top) : 0.0F) + sum;
+    }
+    float chain[G][4] = {};
+    const auto row_of = [&](int j) {
+        int slot = base_slot32 + j;
+        slot -= slot >= capacity32 ? capacity32 : 0;
+        return vb + static_cast<std::int64_t>(slot) * a.v_row;
+    };
+    for (int j0 = warp; j0 < n; j0 += 8 * kWarps) {
+        ValueWord codes[8];
+        float sc[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const int j = j0 + 8 * u < n ? j0 + 8 * u : j0;
+            const unsigned char* row = row_of(j);
+            codes[u] = __ldg(reinterpret_cast<const ValueWord*>(row + v_code));
+            sc[u]    = __half2float(__ldg(reinterpret_cast<const __half*>(row + v_scale)));
+        }
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const int j = j0 + 8 * u;
+            if (j < n) {
+                float v[4];
+#pragma unroll
+                for (int e = 0; e < 4; ++e) { v[e] = (VB == 4 ? s4_at(codes[u], e) : s8_at(codes[u], e)) * sc[u]; }
+#pragma unroll
+                for (int hh = 0; hh < G; ++hh) {
+                    const float w = scores[hh][j];
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) { chain[hh][e] = fmaf(w, v[e], chain[hh][e]); }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int hh = 0; hh < G; ++hh) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) { chains[warp][hh][4 * lane + e] = chain[hh][e]; }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < G * kHeadDim; i += kThreads) {
+        const int hh = i / kHeadDim, d = i % kHeadDim;
+        float part = 0.0F;
+#pragma unroll
+        for (int w = 0; w < kWarps; ++w) { part += chains[w][hh][d]; }
+        float* out = a.split + ((static_cast<std::int64_t>(t) * a.heads + h0 + hh) * gridDim.z + z) * (kHeadDim + 2);
+        out[2 + d] = part;
+        if (d == 0) { out[0] = m[hh], out[1] = denom[hh]; }
+    }
+    __threadfence();
+    __syncthreads();
+    const int used = static_cast<int>((pos - lo) / kSplitKeys) + 1;
+    if (threadIdx.x == 0) {
+        int* counter = a.counters + static_cast<std::int64_t>(t) * a.heads + h0;
+        last_block = atomicAdd(counter, 1) == used - 1;
+        if (last_block) { *counter = 0; }
+    }
+    __syncthreads();
+    if (last_block) {
+        __threadfence();
+#pragma unroll
+        for (int hh = 0; hh < G; ++hh) { combine_parts<Out, false>(a, t, h0 + hh, static_cast<int>(gridDim.z)); }
+    }
+}
+
 // ---- Wide calls (prefill): one block per (kTileQueries columns, head) folds key tiles of kTileKeys staged in shared
 // memory into every column's online softmax, so each key and value is read once per tile of columns. FP32 or FP16
 // rings (Fp16: widened as they are staged); FP32 arithmetic in another order than attention_kernel (not its bits).
@@ -1453,8 +1644,17 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
                         split_workspace->bytes() >= relative_bias_attention_split_bytes(s, cols, capacity),
                     op, "split_workspace must be contiguous FP32 of relative_bias_attention_split_bytes");
             a.split = static_cast<float*>(split_workspace->data), a.counters = split_counters;
-            const dim3 parts(cols, s.heads, splits);
-            launch_lowbit<true>(a, parts, bf16, kb, vb, stream);
+            if (a.group == kGroupHeads && std::getenv("NINFER_LOWBIT_PER_HEAD") == nullptr) {
+                const dim3 parts(cols, s.kv_heads, splits);
+                const auto go = [&]<int KB, int VB>() {
+                    if (bf16) { attention_lowbit_group_kernel<__nv_bfloat16, KB, VB><<<parts, kThreads, 0, stream>>>(a); } else { attention_lowbit_group_kernel<float, KB, VB><<<parts, kThreads, 0, stream>>>(a); }
+                };
+                if (kb == 4 && vb == 4) { go.template operator()<4, 4>(); } else if (kb == 8 && vb == 8) { go.template operator()<8, 8>(); }
+                else if (kb == 8) { go.template operator()<8, 4>(); } else { go.template operator()<4, 8>(); }
+            } else {
+                const dim3 parts(cols, s.heads, splits);
+                launch_lowbit<true>(a, parts, bf16, kb, vb, stream);
+            }
         } else if (tiled && cols > kSplitMaxColumns) {
             require(a.group == 3 && s.d_rel <= 16, op, "the lowbit tensor-core route takes groups of 3 and d_rel <= 16");
             const auto flash = [&]<int KB, int VB>() {
