@@ -162,6 +162,12 @@ struct SpeculativeOptions {
     // captured graph executes every column whatever the live extent), hence two graphs. 0 disables
     // it. Must be below `draft_tokens`; the product flag accepts 0 or 3. Requires DFlash2.
     std::uint32_t adaptive_draft_tokens = 0;
+    // DSpark (--draft-min-p P): a round's drafts stop before the first whose drafter probability is below P, in [0, 1)
+    // (0: off). Only speed changes, never the output.
+    float draft_min_p = 0.0F;
+    // DSpark (--dspark-adaptive): each round drafts 1 .. draft_tokens, the count a request's recent acceptance and the
+    // measured round costs favour. Only speed changes, never the output.
+    bool dspark_adaptive = false;
 };
 
 enum class StartupPhase : std::uint8_t {

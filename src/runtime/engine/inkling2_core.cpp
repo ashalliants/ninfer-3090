@@ -65,6 +65,80 @@ constexpr std::uint32_t kCloseTokens = 3;
 // <|message_model|><|content_thinking|>: the model opens its own turn (the template has no generation prompt).
 constexpr std::uint32_t kOpenTokens = 2;
 
+// --spec dspark --dspark-adaptive: each round's draft count, from how far a request's drafts survive and what a round
+// of each width has cost it. survive[i] is the chance that draft i is accepted once drafts 0 .. i - 1 were; a round of
+// w drafts is expected to yield 1 + sum_{i < w} prod_{j <= i} survive[j] tokens. The width with the most expected
+// tokens per second wins, against a plain step's one token; widths not yet timed are priced from the timed ones.
+class DraftWidth {
+public:
+    explicit DraftWidth(std::int32_t n_max) : n_max_(n_max) {
+        for (std::int32_t i = 0; i < kMax; ++i) { survive_[i] = i == 0 ? 0.6 : 0.75; }
+    }
+    // A verified round: `drafted` drafts, the first `accepted` of them consumed.
+    void observe(std::int32_t drafted, std::int32_t accepted) {
+        for (std::int32_t i = 0; i < drafted && i <= accepted && i < kMax; ++i) {
+            survive_[i] += kAlpha * ((i < accepted ? 1.0 : 0.0) - survive_[i]);
+        }
+    }
+    // A round's measured cost at the width it verified.
+    void time(std::int32_t width, double seconds) {
+        if (width < 1 || width > kMax) { return; }
+        double& c = cost_[width - 1];
+        c = c == 0.0 ? seconds : 0.8 * c + 0.2 * seconds;
+    }
+    [[nodiscard]] double expected(std::int32_t width) const {
+        double e = 1.0, chain = 1.0;
+        for (std::int32_t i = 0; i < width; ++i) {
+            chain *= survive_[i];
+            e += chain;
+        }
+        return e;
+    }
+    // A width's cost: measured, else on the line through the timed widths (one timed: the line through a plain step's
+    // cost at width 0 and that width's).
+    [[nodiscard]] double cost(std::int32_t width, double plain) const {
+        if (cost_[width - 1] != 0.0) { return cost_[width - 1]; }
+        std::int32_t a = 0, b = 0;
+        for (std::int32_t w = 1; w <= kMax; ++w) {
+            if (cost_[w - 1] == 0.0) { continue; }
+            if (a == 0 || std::abs(w - width) < std::abs(a - width)) {
+                b = a, a = w;
+            } else if (b == 0 || std::abs(w - width) < std::abs(b - width)) {
+                b = w;
+            }
+        }
+        if (a == 0) { return 0.0; }
+        if (b == 0) { return cost_[a - 1] + (cost_[a - 1] - plain) / a * (width - a); }
+        return cost_[a - 1] + (cost_[a - 1] - cost_[b - 1]) / (a - b) * (width - a);
+    }
+    // The width to draft (1 .. limit), or 0 when a plain step is expected to commit tokens faster. Every kProbe rounds
+    // a neighbour of the best width runs instead, so its cost and the survival past it stay measured.
+    [[nodiscard]] std::int32_t pick(std::int32_t limit, double plain) {
+        limit = std::min(limit, n_max_);
+        if (limit < 1) { return 0; }
+        std::int32_t best = 0;
+        double rate = plain > 0.0 ? 1.0 / plain : 0.0;
+        if (std::all_of(std::begin(cost_), std::end(cost_), [](double c) { return c == 0.0; })) { return limit; } // nothing timed: the widest
+        for (std::int32_t w = 1; w <= limit; ++w) {
+            const double c = cost(w, plain);
+            if (c > 0.0 && expected(w) / c > rate) { best = w, rate = expected(w) / c; }
+        }
+        if (best != 0 && ++rounds_ % kProbe == 0) {
+            const std::int32_t other = (rounds_ / kProbe) % 2 == 0 ? best + 1 : best - 1;
+            if (other >= 1 && other <= limit) { return other; }
+        }
+        return best;
+    }
+
+private:
+    static constexpr std::int32_t kMax = 7, kProbe = 8;
+    static constexpr double kAlpha = 0.1;
+    std::int32_t n_max_;
+    std::uint32_t rounds_ = 0;
+    double survive_[kMax]{};
+    double cost_[kMax]{};
+};
+
 // One token from the last column's logits (OpenAI presence and frequency penalties over the generated tokens, then
 // temperature, top-k, min-p and top-p). Temperature 0 is argmax, the lowest id among equals.
 // One key per prompt position for prefix reuse: the token id, or for an image's placeholder a hash of the image
@@ -801,7 +875,14 @@ void Inkling2Core::run(Job& job) {
     // round (keep() cuts the target back). Every token still goes through the loop below one at a time, from the
     // target's logits, so the output is plain greedy decoding's. A round runs only while it pays: its measured cost
     // against (1 + accepted drafts) plain steps; otherwise plain steps run, with a probe round after 8, 16, .. 64.
+    // --draft-min-p cuts a round's drafts before the first the drafter gives less than that probability;
+    // --dspark-adaptive picks each round's draft count (DraftWidth).
     const auto n_drafts  = static_cast<std::int32_t>(options_.speculative.draft_tokens);
+    const float draft_min_p = options_.speculative.draft_min_p;
+    std::optional<DraftWidth> width;
+    if (options_.speculative.dspark_adaptive) { width.emplace(n_drafts); }
+    std::vector<float> draft_probs;
+    bool forward_unmeasured = false; // a step that drafted and then ran plain (every draft under --draft-min-p)
     std::vector<TokenId> drafted; // the last forward's inputs at columns 1 ..
     std::vector<std::int32_t> argmax_host; // the last forward's greedy tokens from column argmax_from, when not stale
     std::int32_t argmax_from = 0;
@@ -809,6 +890,9 @@ void Inkling2Core::run(Job& job) {
     std::int32_t col     = static_cast<std::int32_t>(logits.ne[1]) - 1; // the column the next token is read from
     bool in_round        = false;
     std::int32_t round_drafts = 0; // the drafts the current round forwards (fewer than n_drafts near the output limit)
+    // The width the current round drafted (DSparkProgram::draft runs that many steps): --draft-min-p may keep fewer
+    // of them, but the round's time is that width's cost.
+    std::int32_t round_width = 0;
     std::int32_t held_n  = 0;
     double accept_ema = 1.0, round_seconds = 0.0, plain_seconds = 0.0;
     int since_probe = 0, probe_interval = 8;
@@ -848,6 +932,7 @@ void Inkling2Core::run(Job& job) {
         program.keep(kept);
         extend_drafter(*drafter, taps_of(), kept);
         count_round();
+        if (width) { width->observe(round_drafts, col); }
         accept_ema = 0.8 * accept_ema + 0.2 * col;
         in_round   = false;
     };
@@ -860,20 +945,29 @@ void Inkling2Core::run(Job& job) {
         }
         if (in_round) { close_round(); }
         const auto now = Clock::now();
-        if (forward_at != Clock::time_point{}) {
+        if (forward_at != Clock::time_point{} && !forward_unmeasured) {
             double& cost = forward_was_round ? round_seconds : plain_seconds;
             const double elapsed = seconds_between(forward_at, now);
             cost = cost == 0.0 ? elapsed : 0.8 * cost + 0.2 * elapsed;
+            if (forward_was_round && width) { width->time(round_width, elapsed); }
         }
+        forward_unmeasured = false;
         // The first step runs plain and the next as a round, so both costs are measured before they are compared.
-        const bool pays = plain_seconds != 0.0 && (round_seconds == 0.0 || (1.0 + accept_ema) * plain_seconds >= round_seconds);
+        bool pays = plain_seconds != 0.0 && (round_seconds == 0.0 || (1.0 + accept_ema) * plain_seconds >= round_seconds);
         // A round's n drafts yield n + 1 tokens, so it drafts no more than the output budget left after `next` can
         // take: a round whose drafts could not be emitted would pay the draft and verify cost for nothing.
         const auto budget_left = static_cast<std::int64_t>(exec.requested_output_tokens) - static_cast<std::int64_t>(out.generated_token_ids.size());
-        const auto drafts = static_cast<std::int32_t>(std::min<std::int64_t>(n_drafts, budget_left - 1));
+        auto drafts = static_cast<std::int32_t>(std::min<std::int64_t>(n_drafts, budget_left - 1));
         bool round = speculate && !injected && forced.empty() && drafts >= 1 &&
                      program.position() + 1 + drafts <= static_cast<std::int64_t>(options_.max_context);
         if (round && plain_seconds == 0.0) { round = false; }
+        if (round && width && round_seconds != 0.0) {
+            // The adaptive width replaces the gate's single round cost with each width's; 0 is a plain step, which
+            // the probes below still interrupt.
+            const std::int32_t w = width->pick(drafts, plain_seconds);
+            pays = w != 0;
+            if (w != 0) { drafts = w; }
+        }
         if (round && !pays) {
             round = ++since_probe >= probe_interval;
             if (round) { // a probe: the next one comes after twice as many plain steps (8, 16, 32, 64)
@@ -891,8 +985,23 @@ void Inkling2Core::run(Job& job) {
         }
         if (round) {
             flush_held();
-            round_drafts = drafts;
-            drafted      = drafter->draft(next, round_drafts);
+            drafted = drafter->draft(next, drafts, draft_min_p > 0.0F ? &draft_probs : nullptr);
+            if (draft_min_p > 0.0F) {
+                std::size_t keep = 0;
+                while (keep < drafted.size() && draft_probs[keep] >= draft_min_p) { ++keep; }
+                drafted.resize(keep);
+            }
+            round_width  = drafts;
+            round_drafts = static_cast<std::int32_t>(drafted.size());
+            if (round_drafts == 0) {
+                // Every draft under --draft-min-p: a plain step (a fallback step), whose time (with the draft's) times
+                // neither.
+                round              = false;
+                forward_was_round  = false;
+                forward_unmeasured = true;
+            }
+        }
+        if (round) {
             std::vector<std::int32_t> in{next};
             in.insert(in.end(), drafted.begin(), drafted.end());
             logits   = program.forward(in);

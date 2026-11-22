@@ -846,6 +846,29 @@ int main() {
     const ninfer::EngineOptions dspark2 =
         make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-tokens", "2"}));
     failures += check(dspark2.speculative.draft_tokens == 2, "--spec dspark --draft-tokens 2 did not reach the Engine options");
+    // --spec dspark: drafts under 0.5 cut and adaptive widths by default; --draft-min-p 0 and --dspark-adaptive off
+    // restore a fixed width of every draft; both need --spec dspark.
+    failures += check(dspark.speculative.draft_min_p == 0.5F && dspark.speculative.dspark_adaptive,
+                      "--spec dspark does not default to --draft-min-p 0.5 and adaptive widths");
+    {
+        const ninfer::EngineOptions fixed = make_engine_options(
+            parse({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-min-p", "0", "--dspark-adaptive", "off"}));
+        failures += check(fixed.speculative.draft_min_p == 0.0F && !fixed.speculative.dspark_adaptive,
+                          "--draft-min-p 0 --dspark-adaptive off did not reach the Engine options");
+        const auto refused = [&](std::vector<std::string> args) {
+            try {
+                (void)make_engine_options(parse(std::move(args)));
+            } catch (const std::invalid_argument&) { return true; }
+            return false;
+        };
+        failures += check(refused({"ninfer-serve", "model.ninfer", "--draft-min-p", "0.3"}) &&
+                              refused({"ninfer-serve", "model.ninfer", "--dspark-adaptive", "on"}) &&
+                              refused({"ninfer-serve", "model.ninfer", "--draft-min-p", "0"}) &&
+                              refused({"ninfer-serve", "model.ninfer", "--dspark-adaptive", "off"}) &&
+                              refused({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-min-p", "1"}) &&
+                              refused({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--dspark-adaptive", "yes"}),
+                          "--draft-min-p and --dspark-adaptive accepted without --spec dspark or out of range");
+    }
     // --dspark-window auto|N: auto by default, 0 for the whole context.
     {
         const auto window = [&](std::vector<std::string> args) { return make_engine_options(parse(std::move(args))).speculative.dspark_window; };

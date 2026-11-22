@@ -6,6 +6,7 @@
 // - a short output budget yields plain greedy's first tokens, and no round drafts more than the budget can emit;
 // - a sampled request runs plain (no rounds, no fallback steps) and repeats under a fixed seed;
 // - relaxed drafting, which DSpark does not implement, and draft counts outside 1..7 are refused;
+// - --draft-min-p and --dspark-adaptive yield plain greedy's tokens too;
 // - reported, not judged: rounds, drafts accepted, plain fallback steps, and decode tok/s of both Engines.
 // Skips without NINFER_TEST_INKLING2_ARTIFACT. NINFER_INKLING2_SPEC_DRAFTS: drafts per round (default 3, the serving default);
 // NINFER_INKLING2_SPEC_TOKENS: output tokens per prompt (default 256).
@@ -27,6 +28,7 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 int g_failures = 0;
+std::vector<std::vector<ninfer::TokenId>> g_plain_tokens; // the plain Engine's greedy tokens per prompt
 void check(bool ok, const std::string& what) {
     if (!ok) {
         std::fprintf(stderr, "FAILED: %s\n", what.c_str());
@@ -118,6 +120,7 @@ int main() {
             ninfer::Engine engine(options);
             std::printf("plain:\n");
             plain = run_all(engine, tokens);
+            g_plain_tokens = plain.tokens;
             bf16_weight_bytes = engine.memory_summary().weights.capacity_bytes;
             plain_sampled = engine.generate(engine.prepare(user_turn(kPrompts[2])), sampled).generated_token_ids;
             auto budget                      = greedy(96);
@@ -250,6 +253,36 @@ int main() {
         std::printf("plain %.1f tok/s, dspark %.1f tok/s (%.2fx); %llu rounds, %.2f drafts accepted per round, %llu plain steps\n",
                     plain_rate, spec_rate, spec_rate / plain_rate, static_cast<unsigned long long>(spec.rounds),
                     spec.rounds ? double(spec.accepted) / spec.rounds : 0.0, static_cast<unsigned long long>(spec.fallback));
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "FAIL: %s\n", error.what());
+        return 1;
+    }
+    try { // --draft-min-p and --dspark-adaptive (the serving defaults) change only how many drafts a round verifies
+        ninfer::EngineOptions options;
+        options.artifact_path               = artifact_path;
+        options.max_context                 = 4096;
+        options.speculative.backend         = ninfer::SpeculativeBackend::DSpark;
+        options.speculative.draft_tokens    = 5;
+        options.speculative.draft_min_p     = 0.5F;
+        options.speculative.dspark_adaptive = true;
+        ninfer::product::apply_speculative_defaults(options.speculative);
+        for (const float bad : {-0.1F, 1.0F}) {
+            auto refused_options                    = options;
+            refused_options.speculative.draft_min_p = bad;
+            bool refused                            = false;
+            try {
+                ninfer::Engine refused_engine(refused_options);
+            } catch (const std::invalid_argument&) { refused = true; }
+            check(refused, "--draft-min-p " + std::to_string(bad) + " is refused");
+        }
+        ninfer::Engine engine(options);
+        std::printf("dspark, up to 5 drafts, --draft-min-p 0.5, adaptive:\n");
+        const Run adaptive = run_all(engine, tokens);
+        check(adaptive.tokens == g_plain_tokens, "--draft-min-p and --dspark-adaptive yield plain greedy's tokens");
+        check(adaptive.rounds > 0 && adaptive.accepted > 0 && adaptive.drafted <= adaptive.rounds * 5, "adaptive rounds run and are counted");
+        std::printf("adaptive: %llu rounds, %.2f drafts accepted per round, %.1f tok/s\n", static_cast<unsigned long long>(adaptive.rounds),
+                    adaptive.rounds ? double(adaptive.accepted) / adaptive.rounds : 0.0,
+                    (adaptive.generated - kPrompts.size()) / adaptive.decode_seconds);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

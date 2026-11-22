@@ -491,6 +491,28 @@ void test_argmax() {
           "argmax_fp32 reports a column with no finite maximum");
 }
 
+
+void test_draft_pick() {
+    const int rows = 201024, valid = 200058;
+    // A softcapped column: noise in [-10, 10], 60 tokens in a band near the top and one far ahead of them, and a
+    // larger value in padding (ignored). The draft is argmax_fp32's token, with its softmax probability.
+    auto x = randoms(rows, -10, 10);
+    for (int i = 0; i < 60; ++i) { x[3 + 3331 * i] = 14.0F + 0.11F * static_cast<float>((i * 37) % 60); }
+    x[777] = 22.0F;
+    x[valid + 3] = 29.0F;
+    Buf dx(x), id(4), prob(4);
+    Tensor tx = dx.tensor({rows}), ti = id.tensor({1}, DType::I32), tp = prob.tensor({1});
+    ninfer::ops::dspark_draft_pick(tx, valid, ti, tp, nullptr);
+    {
+        double s = 0;
+        for (int i = 0; i < valid; ++i) { s += std::exp(double(x[i]) - 22.0); }
+        const int g = t::from_device<std::int32_t>(id.b, 1)[0];
+        const float pr = t::from_device<float>(prob.b, 1)[0];
+        std::printf("dspark_draft_pick greedy: %d p %.6f (want 777 p %.6f)\n", g, pr, 1.0 / s);
+        check(g == 777 && std::abs(pr - 1.0 / s) < 1e-6, "dspark_draft_pick greedy");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -521,6 +543,7 @@ int main() {
         test_markov();
         test_markov_compact();
         test_argmax();
+        test_draft_pick();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

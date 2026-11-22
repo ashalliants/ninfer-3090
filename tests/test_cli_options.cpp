@@ -210,6 +210,19 @@ int main() {
     // --spec dspark: an omitted --draft-tokens takes 3; an explicit one is kept and must be in [1,7].
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dspark"}).speculative.draft_tokens == 3,
                       "CLI --spec dspark did not default to 3 drafts");
+    {
+        const auto d = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dspark"}).speculative;
+        const auto f = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dspark", "--draft-min-p", "0.2",
+                              "--dspark-adaptive", "off"}).speculative;
+        failures += check(d.draft_min_p == 0.5F && d.dspark_adaptive && f.draft_min_p == 0.2F && !f.dspark_adaptive,
+                          "CLI --draft-min-p and --dspark-adaptive defaults or values");
+        failures += check(rejects([&] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--draft-min-p", "0.2"}); }),
+                          "CLI accepted --draft-min-p without --spec dspark");
+        // The disabling forms too: given without --spec dspark they are refused, not ignored.
+        failures += check(rejects([&] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--draft-min-p", "0"}); }) &&
+                              rejects([&] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--dspark-adaptive", "off"}); }),
+                          "CLI accepted --draft-min-p 0 or --dspark-adaptive off without --spec dspark");
+    }
     for (const auto k : {0U, 8U}) {
         failures += check(rejects([&] {
                               (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dspark",

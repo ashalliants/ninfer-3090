@@ -146,7 +146,7 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N] [--devices N,M,...] [--stage-layers A,B,...]\n"
-           "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4|fp16|fp32 (Inkling-2: fp16|fp32)] [--dense-q8 head|all (lossy)] [--no-split-attention] [--prefill-math tc|fp32] [--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N] [--dspark-window N]]\n"
+           "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4|fp16|fp32 (Inkling-2: fp16|fp32)] [--dense-q8 head|all (lossy)] [--no-split-attention] [--prefill-math tc|fp32] [--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N] [--dspark-window N] [--draft-min-p P] [--dspark-adaptive on|off]]\n"
            "       [--ngram-draft-tokens 0|15] [--ngram-min-match N] [--adaptive-draft-tokens 0|3]\n"
            "       [--lm-head-draft] [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4]\n"
            "       [--gdn-state-fp16] [--mlp-a8-decode] [--no-prefill-a8]\n"
@@ -219,7 +219,7 @@ std::string usage_text(const char* argv0) {
 
 Options parse_options(int argc, char** argv) {
     Options options;
-    bool draft_tokens_given = false; // --draft-tokens on the command line (an omitted one may take a default)
+    product::SpeculativeCliGiven given; // the speculative options on the command line (an omitted one may take a default)
     if (argc >= 2 && (std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -299,13 +299,21 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
-            draft_tokens_given               = true;
+            given.draft_tokens               = true;
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
         } else if (arg == "--dspark-window") {
             const std::string_view form = value(arg);
             options.speculative.dspark_window_explicit = true;
             options.speculative.dspark_window = form == "auto" ? SpeculativeOptions::kDSparkWindowAuto
                                                                : parse_u32(std::string(form).c_str(), "dspark-window", true);
+        } else if (arg == "--draft-min-p") {
+            given.draft_min_p               = true;
+            options.speculative.draft_min_p = parse_float(value(arg), "draft-min-p", 0.0F, 1.0F);
+        } else if (arg == "--dspark-adaptive") {
+            given.dspark_adaptive = true;
+            const std::string_view form = value(arg);
+            if (form != "on" && form != "off") { throw std::invalid_argument("--dspark-adaptive takes on or off"); }
+            options.speculative.dspark_adaptive = form == "on";
         } else if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens = parse_u32(value(arg), "ngram-draft-tokens", true);
         } else if (arg == "--adaptive-draft-tokens") {
@@ -443,8 +451,8 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
     product::apply_speculative_defaults(options.speculative);
-    product::apply_speculative_cli_defaults(options.speculative, draft_tokens_given);
-    product::validate_speculative_cli_options(options.speculative);
+    product::apply_speculative_cli_defaults(options.speculative, given);
+    product::validate_speculative_cli_options(options.speculative, given);
     if (options.vision_residency == VisionResidency::Overlay && !options.enable_vision) {
         throw std::invalid_argument("--vision-residency overlay requires --vision");
     }

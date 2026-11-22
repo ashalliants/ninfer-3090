@@ -587,6 +587,63 @@ __global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ 
     }
 }
 
+// dspark_draft_pick: one block of 1024 threads.
+__global__ void __launch_bounds__(1024) draft_pick_kernel(const float* __restrict__ logits, int valid, int* __restrict__ id_out,
+                                                         float* __restrict__ prob_out) {
+    constexpr int kThreads = 1024;
+    __shared__ float best_v[32];
+    __shared__ int best_i[32];
+    __shared__ float top;
+    __shared__ int top_id;
+    __shared__ double partial[32];
+    // The maximum and its lowest id, as argmax_kernel.
+    float bv = -INFINITY;
+    int bi   = valid;
+    for (int v = threadIdx.x; v < valid; v += kThreads) {
+        const float x = logits[v];
+        if (x > bv || (bi == valid && !isnan(x))) { bv = x, bi = v; }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xFFFFFFFFU, bv, o);
+        const int oi   = __shfl_xor_sync(0xFFFFFFFFU, bi, o);
+        if (oi != valid && (bi == valid || ov > bv || (ov == bv && oi < bi))) { bv = ov, bi = oi; }
+    }
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) { best_v[warp] = bv, best_i[warp] = bi; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int w = 1; w < kThreads / 32; ++w) {
+            const float ov = best_v[w];
+            const int oi   = best_i[w];
+            if (oi != valid && (bi == valid || ov > bv || (ov == bv && oi < bi))) { bv = ov, bi = oi; }
+        }
+        top    = bv;
+        top_id = bi == valid || !isfinite(bv) ? -1 : bi;
+    }
+    __syncthreads();
+    const float m = top;
+    if (top_id < 0) { // no finite maximum: a diverged column drafts token 0, which verify rejects or accepts as any other
+        if (threadIdx.x == 0) { *id_out = 0, *prob_out = 0.0F; }
+        return;
+    }
+    double s = 0.0;
+    for (int v = threadIdx.x; v < valid; v += kThreads) {
+        const float x = logits[v];
+        if (!isnan(x)) { s += exp(static_cast<double>(x) - m); }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) { s += __shfl_xor_sync(0xFFFFFFFFU, s, o); }
+    if (lane == 0) { partial[warp] = s; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        double total = 0.0;
+        for (int w = 0; w < kThreads / 32; ++w) { total += partial[w]; }
+        *id_out   = top_id;
+        *prob_out = static_cast<float>(1.0 / total);
+    }
+}
+
 } // namespace
 
 void dense_projection_fp32(const Tensor& x, const DenseMatrix& w, const Tensor* bias, Tensor& out, cudaStream_t stream) {
@@ -845,6 +902,17 @@ void argmax_fp32(const Tensor& logits, std::int32_t valid_rows, Tensor& out, cud
     require(valid_rows >= 1 && valid_rows <= c.rows, op, "bad valid_rows");
     require(out.dtype == DType::I32 && out.numel() == c.cols && out.data != nullptr, op, "out must be I32 [T]");
     argmax_kernel<<<c.cols, 1024, 0, stream>>>(static_cast<const float*>(logits.data), c.stride, valid_rows, non_finite, static_cast<int*>(out.data));
+    check_launch(op);
+}
+
+void dspark_draft_pick(const Tensor& logits, std::int32_t valid_rows, Tensor& id, Tensor& prob, cudaStream_t stream) {
+    constexpr const char* op = "dspark_draft_pick";
+    const Columns c = columns(logits, op, "logits", true);
+    require(c.cols == 1 && valid_rows >= 1 && valid_rows <= c.rows, op, "logits must be one column of at least valid_rows");
+    require(id.dtype == DType::I32 && id.numel() == 1 && id.data != nullptr, op, "id must be I32 [1]");
+    require(prob.dtype == DType::FP32 && prob.numel() == 1 && prob.data != nullptr, op, "prob must be FP32 [1]");
+    draft_pick_kernel<<<1, 1024, 0, stream>>>(static_cast<const float*>(logits.data), valid_rows, static_cast<int*>(id.data),
+                                              static_cast<float*>(prob.data));
     check_launch(op);
 }
 
