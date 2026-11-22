@@ -294,6 +294,8 @@ void validate(const EngineOptions& options) {
 
 } // namespace
 
+void validate_qwen4_exp_options(const EngineOptions& options) { validate(options); }
+
 bool artifact_is_qwen4_exp(const std::filesystem::path& artifact) noexcept {
     try {
         const artifact::Reader reader(artifact);
@@ -331,7 +333,7 @@ Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> sou
 Qwen4ExpInstance::~Qwen4ExpInstance() = default;
 
 ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device) {
-    validate(options);
+    validate_qwen4_exp_options(options);
     const auto start = std::chrono::steady_clock::now();
     const auto& next = options.flash_next;
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);

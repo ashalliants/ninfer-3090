@@ -53,6 +53,9 @@ struct ConstructedQwen4Exp {
 // (the Qwen3.5 construction then reports it).
 [[nodiscard]] bool artifact_is_qwen4_exp(const std::filesystem::path& artifact) noexcept;
 
+// Throws std::invalid_argument naming every option this model refuses (run first by construct_qwen4_exp).
+void validate_qwen4_exp_options(const EngineOptions& options);
+
 // Checks the options this model supports, plans the Host RAM and device memory before anything is
 // pinned or read, loads the model and starts its Program. `options` is the Engine's, normalized.
 [[nodiscard]] ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device);
