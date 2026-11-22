@@ -218,6 +218,10 @@ int main() {
                           "CLI --draft-min-p and --dspark-adaptive defaults or values");
         failures += check(rejects([&] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--draft-min-p", "0.2"}); }),
                           "CLI accepted --draft-min-p without --spec dspark");
+        // The disabling forms too: given without --spec dspark they are refused, not ignored.
+        failures += check(rejects([&] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--draft-min-p", "0"}); }) &&
+                              rejects([&] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--dspark-adaptive", "off"}); }),
+                          "CLI accepted --draft-min-p 0 or --dspark-adaptive off without --spec dspark");
     }
     for (const auto k : {0U, 8U}) {
         failures += check(rejects([&] {

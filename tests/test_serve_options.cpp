@@ -863,6 +863,8 @@ int main() {
         };
         failures += check(refused({"ninfer-serve", "model.ninfer", "--draft-min-p", "0.3"}) &&
                               refused({"ninfer-serve", "model.ninfer", "--dspark-adaptive", "on"}) &&
+                              refused({"ninfer-serve", "model.ninfer", "--draft-min-p", "0"}) &&
+                              refused({"ninfer-serve", "model.ninfer", "--dspark-adaptive", "off"}) &&
                               refused({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-min-p", "1"}) &&
                               refused({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--dspark-adaptive", "yes"}),
                           "--draft-min-p and --dspark-adaptive accepted without --spec dspark or out of range");

@@ -452,7 +452,7 @@ Options parse_options(int argc, char** argv) {
     }
     product::apply_speculative_defaults(options.speculative);
     product::apply_speculative_cli_defaults(options.speculative, given);
-    product::validate_speculative_cli_options(options.speculative);
+    product::validate_speculative_cli_options(options.speculative, given);
     if (options.vision_residency == VisionResidency::Overlay && !options.enable_vision) {
         throw std::invalid_argument("--vision-residency overlay requires --vision");
     }

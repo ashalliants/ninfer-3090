@@ -133,6 +133,18 @@ int main() {
             } catch (const std::invalid_argument&) {}
         }
         {
+            // DSpark's draft floor and adaptive width without --spec dspark are refused, not ignored.
+            for (const bool adaptive : {false, true}) {
+                ninfer::EngineOptions plain_spec       = options;
+                plain_spec.speculative.dspark_adaptive = adaptive;
+                plain_spec.speculative.draft_min_p     = adaptive ? 0.0F : 0.5F;
+                try {
+                    ninfer::Engine refused(plain_spec);
+                    check(false, "--draft-min-p or --dspark-adaptive without --spec dspark is refused");
+                } catch (const std::invalid_argument&) {}
+            }
+        }
+        {
             // An explicit --kv-dtype bf16 (or any kv_cache form) is refused: Inkling-2's rings are FP16 or FP32.
             ninfer::EngineOptions bf16 = options;
             bf16.kv_cache_explicit     = true;

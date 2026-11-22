@@ -1617,7 +1617,7 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
     models::qwen3_5::validate_lossy_prefill_options(options.lossy_prefill);
     product::apply_speculative_defaults(options.speculative);
     product::apply_speculative_cli_defaults(options.speculative, given);
-    product::validate_speculative_cli_options(options.speculative);
+    product::validate_speculative_cli_options(options.speculative, given);
     if (options.flash_next.moe_gate_up_registers && !options.flash_next.moe_precast_input) {
         throw std::invalid_argument("--moe-gate-up-registers reads the input that --moe-precast-input casts once "
                                     "per call: add --moe-precast-input");

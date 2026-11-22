@@ -321,6 +321,10 @@ public:
             (!runtime::artifact_is_inkling2(options.artifact_path) || options.speculative.backend != SpeculativeBackend::DSpark)) {
             throw std::invalid_argument("--dspark-window applies to Inkling-2 with --spec dspark only");
         }
+        if ((options.speculative.draft_min_p != 0.0F || options.speculative.dspark_adaptive) &&
+            (options.speculative.backend != SpeculativeBackend::DSpark || !runtime::artifact_is_inkling2(options.artifact_path))) {
+            throw std::invalid_argument("--draft-min-p and --dspark-adaptive apply to Inkling-2 with --spec dspark only");
+        }
         if (runtime::artifact_is_inkling2(options.artifact_path) && (options.kv_cache != KvCacheStorage::BFloat16 || options.kv_cache_explicit)) {
             throw std::invalid_argument("--kv-dtype: Inkling-2 takes fp16 (default) or fp32");
         }

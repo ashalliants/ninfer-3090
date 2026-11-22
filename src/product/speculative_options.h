@@ -104,11 +104,14 @@ inline void apply_speculative_cli_defaults(SpeculativeOptions& options, const Sp
     if (!given.dspark_adaptive) { options.dspark_adaptive = true; }
 }
 
-inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
+// `given`: what the command line set, so an explicit --draft-min-p 0 or --dspark-adaptive off without --spec dspark is
+// refused like any other value rather than accepted and ignored.
+inline void validate_speculative_cli_options(const SpeculativeOptions& options, const SpeculativeCliGiven& given = {}) {
     if (!(options.draft_min_p >= 0.0F && options.draft_min_p < 1.0F)) {
         throw std::invalid_argument("--draft-min-p takes a probability in [0,1)");
     }
-    if ((options.draft_min_p != 0.0F || options.dspark_adaptive) && options.backend != SpeculativeBackend::DSpark) {
+    if ((options.draft_min_p != 0.0F || options.dspark_adaptive || given.draft_min_p || given.dspark_adaptive) &&
+        options.backend != SpeculativeBackend::DSpark) {
         throw std::invalid_argument("--draft-min-p and --dspark-adaptive need --spec dspark");
     }
     validate_ngram_cli_options(options);
