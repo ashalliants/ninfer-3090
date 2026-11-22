@@ -63,6 +63,10 @@ struct ProgramLimits {
     // forward_batch() decodes one token for each of several slots in one forward. The taps and the rollback state
     // (max_rollback) are one copy, the selected slot's.
     std::int32_t slots = 1;
+    // Bytes at the top of the workspace that another Program may use between forwards (the DSpark drafter's workspace,
+    // TextProgram::lent()): no forward leaves anything it returns there (its logits; the taps are in the state), and the
+    // workspace grows if needed to keep the region clear of them.
+    std::size_t lend_bytes = 0;
     struct TensorCoreParts {
         bool dense = false, experts = false, attention = false;
         [[nodiscard]] bool any() const { return dense || experts || attention; }
@@ -71,6 +75,13 @@ struct ProgramLimits {
 };
 
 inline constexpr std::int32_t kTensorCoreMinColumns = 64;
+// A local (sliding) visit attends a wider chunk in pieces of this many columns, each appending its keys first, so its
+// KV ring holds sliding_window - 1 + local_ring_chunk(max_chunk) positions rather than sliding_window - 1 + max_chunk.
+// Only the pieces' sizes change, not any column's bits (TextProgram::visit).
+inline constexpr std::int32_t kLocalAttentionSlice = 256;
+[[nodiscard]] constexpr std::int32_t local_ring_chunk(std::int32_t max_chunk) {
+    return max_chunk < kLocalAttentionSlice + kTensorCoreMinColumns ? max_chunk : kLocalAttentionSlice + kTensorCoreMinColumns - 1;
+}
 // The most slots forward_batch() takes at once: every column of a decode forward then keeps its one-column bits
 // (the split attention's limit, ops::kSplitMaxColumns; far below kTensorCoreMinColumns).
 inline constexpr std::int32_t kMaxBatchColumns = 8;
@@ -141,6 +152,8 @@ public:
     [[nodiscard]] std::size_t snapshot_bytes() const;
     // The forward's workspace: sized from the limits at construction, free between forwards.
     [[nodiscard]] DeviceArena& workspace() noexcept { return workspace_; }
+    // Its top limits.lend_bytes (empty without): free between forwards even while a forward's results are being read.
+    [[nodiscard]] DeviceSpan lent() noexcept;
     // Copies the state at position() into `snapshot` (its memory snapshot_bytes() or more).
     void save(Snapshot& snapshot) const;
     // Continues from the snapshot's position with the state it copied; the global caches below that position must
@@ -171,8 +184,9 @@ private:
     // forward_batch's forward once its step table is on the device (columns_ set).
     Tensor run_batch(std::int32_t cols);
     // Writes the visit's output into `next` (FP32 [H, T], not aliasing cur or blocks) and returns it.
-    Tensor visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor>& blocks, const Tensor* messages, Tensor next, std::int64_t start,
-                 const Trace* trace);
+    // loop_sources: a later pass's core layer's loop-message sources (the previous pass's bank and output), else empty.
+    Tensor visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor>& blocks, std::span<const Tensor* const> loop_sources, Tensor next,
+                 std::int64_t start, const Trace* trace);
     // The loop controllers of one site (q, k and v at once, or the FFN input): out[j] = controller w[j] of (c[j], m[j]).
     void control(std::span<const ControllerWeights* const> w, std::span<const Tensor* const> c, std::span<const Tensor* const> m,
                  std::span<Tensor* const> out);

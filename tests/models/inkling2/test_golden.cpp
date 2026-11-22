@@ -234,6 +234,124 @@ int main() {
             for (std::int32_t id; in >> id;) { ids.push_back(id); }
             return ids;
         };
+        // NINFER_INKLING2_LAYOUT_HASH=<ids>: byte hashes of everything the Engine's single-sequence program returns, to
+        //   compare builds whose workspace layout differs (the bits must not): a prefill of NINFER_INKLING2_LAYOUT_TOKENS
+        //   (default 6000; the text repeated) in chunks of NINFER_INKLING2_LAYOUT_CHUNK (default 2048) with an embedding
+        //   input over columns [100, 300), every chunk's logits and taps; 24 graph decode steps; a 5-column verify cut
+        //   back to 3 and 8 more steps; and a resume from a snapshot at the first chunk (which must equal the cold run).
+        //   The Engine's limits (FP16 rings, tensor cores, last logits, DSpark taps and rollback) unless
+        //   NINFER_INKLING2_KV=fp32 (FP32 rings and prefill); NINFER_INKLING2_LAYOUT_CONTEXT sets max_context (16384).
+        if (const char* hash_ids = std::getenv("NINFER_INKLING2_LAYOUT_HASH"); hash_ids != nullptr) {
+            const auto env_int = [](const char* name, std::int32_t fallback) {
+                return std::getenv(name) != nullptr ? std::atoi(std::getenv(name)) : fallback;
+            };
+            const auto text   = read_ids(hash_ids);
+            const auto chunk  = env_int("NINFER_INKLING2_LAYOUT_CHUNK", 2048);
+            const auto tokens = env_int("NINFER_INKLING2_LAYOUT_TOKENS", 6000);
+            const bool fp32   = std::getenv("NINFER_INKLING2_KV") != nullptr && std::string(std::getenv("NINFER_INKLING2_KV")) == "fp32";
+            ink::ProgramLimits limits{env_int("NINFER_INKLING2_LAYOUT_CONTEXT", 16384), chunk};
+            limits.kv_fp16     = !fp32;
+            limits.last_logits = true;
+            if (!fp32) { limits.prefill_tc = ink::ProgramLimits::TensorCoreParts::all(); }
+            if (model->dspark_config() != nullptr) {
+                limits.tap_visits   = model->dspark_config()->target_visits;
+                limits.max_rollback = static_cast<std::int32_t>(model->dspark_config()->block_size);
+            }
+            ink::TextProgram prog(*model, limits, stream);
+            std::vector<std::int32_t> ids(static_cast<std::size_t>(tokens));
+            for (std::size_t i = 0; i < ids.size(); ++i) { ids[i] = text[i % text.size()]; }
+            const std::int32_t h = static_cast<std::int32_t>(c.hidden_size);
+            std::vector<float> host_emb(static_cast<std::size_t>(h) * 200);
+            for (std::size_t i = 0; i < host_emb.size(); ++i) { host_emb[i] = 0.05F * std::sin(0.001F * static_cast<float>(i)); }
+            ninfer::DeviceBuffer emb_memory(host_emb.size() * 4);
+            emb_memory.copy_from_host(host_emb.data(), host_emb.size() * 4);
+            const ninfer::Tensor emb(emb_memory.p, ninfer::DType::FP32, {h, 200});
+            const auto fnv = [](std::uint64_t seed, const std::vector<float>& v) {
+                const auto* b = reinterpret_cast<const unsigned char*>(v.data());
+                for (std::size_t i = 0; i < v.size() * 4; ++i) { seed = (seed ^ b[i]) * 1099511628211ULL; }
+                return seed;
+            };
+            constexpr std::uint64_t kSeed = 1469598103934665603ULL;
+            const auto argmax_of = [&](const ninfer::Tensor& logits) {
+                const auto cols = logit_columns(logits, vocab);
+                return static_cast<std::int32_t>(argmax(cols.back().data(), static_cast<std::size_t>(vocab)));
+            };
+            // The prefill from position `from` (0 or a snapshot's), hashing each chunk's logits and taps.
+            const auto prefill = [&](std::int32_t from, std::vector<std::uint64_t>& per_chunk) {
+                ninfer::Tensor logits;
+                for (std::int32_t s = from; s < tokens; s += chunk) {
+                    const std::int32_t len = std::min(chunk, tokens - s);
+                    std::vector<ink::InputEmbeddings> inputs;
+                    if (s < 300 && s + len > 100) {
+                        const std::int32_t lo = std::max(s, 100), hi = std::min(s + len, 300);
+                        inputs.push_back({lo - s, emb.slice(1, lo - 100, hi - lo)});
+                    }
+                    logits = prog.forward(std::span(ids).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(len)), inputs);
+                    std::uint64_t hc = fnv(kSeed, to_host(logits));
+                    for (std::size_t i = 0; i < limits.tap_visits.size(); ++i) { hc = fnv(hc, to_host(prog.tap(i))); }
+                    per_chunk.push_back(hc);
+                }
+                return logits;
+            };
+            std::vector<std::uint64_t> cold;
+            prog.reset();
+            ninfer::Tensor logits = prefill(0, cold);
+            std::uint64_t all = kSeed;
+            for (std::size_t i = 0; i < cold.size(); ++i) {
+                std::printf("layout hash chunk %zu: %016llx\n", i, static_cast<unsigned long long>(cold[i]));
+                all = (all ^ cold[i]) * 1099511628211ULL;
+            }
+            std::int32_t next = argmax_of(logits);
+            std::uint64_t decode = kSeed;
+            for (int i = 0; i < 24; ++i) {
+                const std::int32_t one[] = {next};
+                logits = prog.forward(one);
+                const auto v = to_host(logits);
+                decode = fnv(decode, v);
+                next = argmax_of(logits);
+            }
+            std::printf("layout hash 24 decode steps: %016llx\n", static_cast<unsigned long long>(decode));
+            std::uint64_t verify = kSeed;
+            {
+                const std::int32_t five[] = {next, ids[7], ids[8], ids[9], ids[10]};
+                logits = prog.forward(five);
+                verify = fnv(verify, to_host(logits));
+                for (std::size_t i = 0; i < limits.tap_visits.size(); ++i) { verify = fnv(verify, to_host(prog.tap(i))); }
+                prog.keep(3);
+                next = ids[9];
+                for (int i = 0; i < 8; ++i) {
+                    const std::int32_t one[] = {next};
+                    logits = prog.forward(one);
+                    verify = fnv(verify, to_host(logits));
+                    next = argmax_of(logits);
+                }
+            }
+            std::printf("layout hash verify and 8 steps: %016llx\n", static_cast<unsigned long long>(verify));
+            if (tokens > chunk) {
+                ink::TextProgram::Snapshot snap;
+                snap.memory = ninfer::DeviceBuffer(prog.snapshot_bytes());
+                prog.reset();
+                std::vector<ink::InputEmbeddings> inputs{{100, emb.slice(1, 0, std::min(200, chunk - 100))}};
+                (void)prog.forward(std::span(ids).subspan(0, static_cast<std::size_t>(chunk)), chunk > 100 ? inputs : std::vector<ink::InputEmbeddings>{});
+                prog.save(snap);
+                // Three other tokens after the snapshot: the restore must replace their state. (The global caches hold
+                // every position, so a snapshot resumes over the same prefix, as the Engine's does.)
+                const std::int32_t other[] = {ids[3], ids[4], ids[5]};
+                (void)prog.forward(other);
+                prog.restore(snap);
+                std::vector<std::uint64_t> resumed;
+                (void)prefill(chunk, resumed);
+                bool same = resumed.size() + 1 == cold.size();
+                for (std::size_t i = 0; same && i < resumed.size(); ++i) { same = resumed[i] == cold[i + 1]; }
+                check(same, "layout hash: a prefill resumed from the first chunk's snapshot differs from the cold one");
+                std::printf("layout hash resume from the first chunk: %s\n", same ? "equal to cold" : "DIFFERS");
+            }
+            std::printf("layout hash (chunk %d, %d tokens, %s, workspace %.1f of %.1f MiB): prefill %016llx decode %016llx verify %016llx\n",
+                        chunk, tokens, fp32 ? "FP32" : "FP16 rings, tensor cores", prog.workspace().peak_used() / 1048576.0,
+                        prog.workspace().capacity() / 1048576.0, static_cast<unsigned long long>(all), static_cast<unsigned long long>(decode),
+                        static_cast<unsigned long long>(verify));
+            return failures == 0 ? 0 : 1;
+        }
         // KLD and argmax per range [0, 1024), [1024, 4096), [4096, 16384), [16384, n) of the compared positions.
         const auto report_ranges = [](const char* label, const std::vector<double>& klds, const std::vector<int>& agrees,
                                       const std::vector<char>& compared) {

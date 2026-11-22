@@ -614,7 +614,7 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
   are the same (token ids, and images by a hash of their pixels) restores it and prefills only the rest, in the same
   chunks a prefill from 0 runs: every forward cut falls on a multiple of the chunk (`inkling2_prefill_plan.h`), so the
   resumed forwards are the cold ones call for call and, as the tensor-core routes dispatch on a call's width, bit for
-  bit. Reuse is therefore chunk-grained (2048 positions at the default chunk 2048; `--prefill-chunk 256` for finer reuse). With `--spec dspark` the drafter's sliding rings and anchor context are kept with it (`DSparkProgram::save`); every request runs the drafter, so it resumes only from a snapshot whose drafter state is at the same position. Images wholly in the reused prefix are not encoded. The
+  bit. Reuse is therefore chunk-grained (2048 positions at chunk 2048, 256 at chunk 256, the chunk the engine picks at 262,144 with DSpark and vision; `--prefill-chunk 256` for finer reuse). With `--spec dspark` the drafter's sliding rings and anchor context are kept with it (`DSparkProgram::save`); every request runs the drafter, so it resumes only from a snapshot whose drafter state is at the same position. Images wholly in the reused prefix are not encoded. The
   result reports `reused_prompt_tokens`. One snapshot is kept; a prompt that does not resume from it replaces it (or clears it, when no longer than one chunk).
 - `--spec dspark` (up to 3 drafts, `--draft-min-p 0.5` and `--dspark-adaptive on` by default; see "Draft floor and
   adaptive width") speculates on every request, greedy and sampled (`Inkling2Core::run`):
@@ -645,6 +645,7 @@ run first, then the range over repeated or ABBA legs:
 | Decode, `--spec dspark`, temperature 0.8 | 83.47 tokens/s | 83.37-83.47 (see "Sampled requests") |
 | Decode, plain | 78.83 tokens/s | 78.45-78.83 on the 12 chats; 74.90-74.92 sampled at 0.8 |
 | Prefill (`--max-context 131072`, chunk 2048) | 1,930 tokens/s at 7,979 tokens, TTFT 4.1 s | 1,578-1,629 at 1,098 (TTFT 0.67-0.70 s); 1,895-1,896 at 9,798 (5.2 s); 1,244 at 100,107 (80.5 s). With DSpark and vision on: 1,558-1,621, 1,900, 1,866-1,867 and 1,232 |
+| Prefill (`--max-context 262144 --spec dspark --vision`, both adapters loaded, `--prefill-chunk 2048`; 2026-11-22) | 1,869 tokens/s at 7,979 tokens, TTFT 4.3 s | 1,572-1,579 at 1,098 (0.70 s); 1,861-1,869 at 7,979; 1,619 at 34,701 (21.4 s); 1,219 at 100,107 (82.1 s). The same server without `--prefill-chunk` (chunk 256): 699-703, 782-786, 739-743 and 629-632 (see "Context with DSpark and vision") |
 | Decode after a long prompt (128 tokens, summarize) | 91.2 tokens/s, DSpark at 7,979 | DSpark 84.9-91.2 at 7,979, 88.0-89.8 at 9,798, 47.4-47.8 at 100,107; plain 71.5, 70.7 and 48.1 |
 | Batched aggregate | 198.2 tokens/s at `--max-concurrency 8` | see "Batched decode" |
 | Image prompt, llama.cpp's `test-1.jpeg` (640 x 488), 230 tokens | TTFT 382 ms (vision and prefill) | 382-425 ms over three requests; decode 105 tokens/s with DSpark |
@@ -928,7 +929,8 @@ Speed on the V100 (2026-11-21), FP16 rings, `NINFER_INKLING2_PREFILL_BENCH`:
 
 The engine picks the widest chunk of 2048, 1024, 512 and 256 whose programs (with the drafter and the vision tower
 when they are on) fit beside `--max-context`, leaving 256 MiB free. It logs the choice at startup. `--prefill-chunk
-N` sets the chunk instead.
+N` sets the chunk instead. At 262,144 with DSpark and vision no chunk leaves the spare, so the engine falls back to
+256; `--prefill-chunk 2048` starts there with 64 MiB free (see "Context with DSpark and vision").
 
 ## GGUF mapping (Unsloth `unsloth/Inkling-2-Mini-GGUF`)
 
@@ -1210,7 +1212,55 @@ Measured on the V100 (2026-11-21, `ninfer-serve` startup, FP16 rings, tensor-cor
 | DSpark and vision, `auto` (default) | 262,144 (265,216 fails) | chunk 256, the target's head, window 16384 |
 | same, `--prefill-chunk 512 --vision-residency overlay` | 262,144 | chunk 512, under the 256 MiB spare |
 
-At 262,144 with DSpark and vision, `--prefill-chunk 512` without the overlay does not start.
+Before the layout below (2026-11-22), `--prefill-chunk 512` without the overlay did not start at 262,144 with DSpark
+and vision. Now every chunk does, though none leaves the 256 MiB spare, so `auto` still picks 256 there:
+
+| `--max-context 262144 --spec dspark --vision`, both adapters | Free after startup | Workspace |
+|---|---|---|
+| master before this layout, auto (chunk 256) | about 78 MiB (nvidia-smi: 94 MiB more used than now) | 420 MiB (the ViT's), and the drafter's own |
+| auto (chunk 256) | 172 MiB | 420 MiB |
+| `--prefill-chunk 512` | 152 MiB | 420 MiB |
+| `--prefill-chunk 1024` | 134 MiB | 420 MiB |
+| `--prefill-chunk 2048` | 64 MiB (46 MiB after the first requests' decode graphs) | 454 MiB, 416 at its peak |
+
+(cudaMemGetInfo after the programs and the prefix-reuse snapshots. Below about 24 MiB the first request's decode
+graph cannot be instantiated: the spare is not idle.)
+
+### Prefill memory at 262,144
+
+Where the device memory goes with DSpark and vision at chunk 2048 (drafter window 16384, the target's head):
+
+| What | MiB |
+|---|---:|
+| CUDA context, before the weights | 586 |
+| weights (text, vision tower, drafter's device part) | 22,516 |
+| global KV rings, 8 visits x 262,144 x 4 KiB | 8,192 |
+| local KV rings, 40 visits x (1023 + 319) x 4 KiB | 210 |
+| text workspace (forward temporaries; the ViT's activations; the drafter's workspace, lent) | 454 |
+| DSpark taps (4 x FP32 [2304, 2048]), rollback state, convolution histories | 92 |
+| drafter (rings, split Q8 layers, Q8 Markov head) | 396 |
+| held taps | 16 |
+| prefix-reuse snapshots (text 165, drafter 73) | 238 |
+
+The text workspace at chunk 2048 was 1,744 MiB at 16,384 context (more at 262,144: the decode's split-attention
+parts were added to the prefill's), and the drafter's own workspace 145 MiB more. What changed, each a layout or
+lifetime change (the layout-hash harness below compares every byte of the logits, taps, decode and verify against
+master at chunks 256, 577, 600, 1024 and 2048):
+
+- The workspace is the largest of one visit's stages, not their sum: `TextProgram::visit` releases the loop
+  messages, mixed inputs and controller outputs after the q/k/v projections, the projections after the attention
+  output, and the routing's temporaries before the experts (`forward_bytes`). Decode's split-attention parts are
+  counted for the narrow forwards only.
+- A local visit attends a chunk of 320 or more in pieces of 256 columns (`kLocalAttentionSlice`), each appending
+  its keys first, so its ring holds 1023 + 319 positions instead of 1023 + chunk. The flash attention's tiles take
+  keys by absolute position, so a piece computes every column as the whole call did (0.4% slower at chunk 1024).
+- The drafter borrows the top of the text workspace (`TextProgram::lent()`, `ProgramLimits::lend_bytes`): it runs
+  only between forwards, and no forward's results reach that far.
+- The tensor-core experts keep one FP16 input per column (NVFP4: every entry of a column reads its row) and, for the
+  BF16 banks, convert one expert's entries at a time; each entry gets the same values.
+
+`NINFER_INKLING2_LAYOUT_HASH=<ids>` (`ninfer_inkling2_golden_test`, with `NINFER_INKLING2_LAYOUT_CHUNK`, `_TOKENS`,
+`_CONTEXT` and `NINFER_INKLING2_KV=fp32`) prints those hashes and the workspace peak against its capacity.
 
 The window changes only the drafts. Over two prompts of about 101,850 tokens (256 greedy tokens each, the output
 the same for every window), drafts accepted of drafts made:
@@ -1286,7 +1336,7 @@ Memory: `--max-context` stays the per-request ceiling, as on the other routes. E
 | Per slot | Bytes (FP16 rings) |
 |---|---|
 | global KV, 8 visits | 32 KiB x context |
-| local KV, 40 visits (ring of 1023 + chunk) | about 160 MiB at chunk 256, 240 MiB at chunk 1024 |
+| local KV, 40 visits (ring of 1023 + chunk, at most 1023 + 319) | 200 MiB at chunk 256, 210 MiB at a chunk of 320 or more |
 | convolution histories | 3.7 MiB |
 | prefix-reuse snapshot (when on) | about 170 MiB |
 

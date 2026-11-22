@@ -276,11 +276,14 @@ void Inkling2Core::build_programs(ink::ProgramLimits limits, std::unique_ptr<ink
     limits.max_chunk = chunk_;
     // The tower encodes in the text Program's workspace, before the prompt's forwards: it holds the larger of the two.
     if (vision != nullptr) { limits.min_workspace_bytes = ink::VisionEncoder::workspace_bytes(*model_); }
+    // Its extends take at most its sliding window; a wider chunk's taps go in pieces (extend_drafter).
+    const std::int32_t draft_chunk = std::min(chunk_, static_cast<std::int32_t>(model_->dspark_config() != nullptr ? model_->dspark_config()->sliding_window : 1));
+    // The drafter runs between the text Program's forwards, so its workspace is the text workspace's lent top: never
+    // where a forward's results are (TextProgram::lent()), and free while the drafter runs.
+    if (dspark) { limits.lend_bytes = ink::DSparkProgram::workspace_bytes(*model_, draft_chunk); }
     programs_ = std::make_unique<Programs>(*model_, dense.get(), limits, stream_);
     if (dspark) {
         // With --dense-q8 the drafter proposes from the target's re-encoded head, the one it verifies against.
-        // Its extends take at most its sliding window; a wider chunk's taps go in pieces (extend_drafter).
-        const std::int32_t draft_chunk = std::min(chunk_, static_cast<std::int32_t>(model_->dspark_config()->sliding_window));
         const std::uint32_t window = drafter_window_;
         if (window != 0 && window < model_->dspark_config()->sliding_window) {
             throw std::invalid_argument("--dspark-window: 0 (the whole context) or at least the drafter's sliding window (" +
@@ -288,7 +291,7 @@ void Inkling2Core::build_programs(ink::ProgramLimits limits, std::unique_ptr<ink
         }
         programs_->drafter = std::make_unique<ink::DSparkProgram>(*model_, static_cast<std::int32_t>(options_.max_context), draft_chunk, stream_,
                                                                   dense ? &dense->head() : nullptr, limits.kv_fp16,
-                                                                  static_cast<std::int32_t>(window), drafter_head_copy_);
+                                                                  static_cast<std::int32_t>(window), drafter_head_copy_, programs_->text.lent());
         const std::int32_t hidden = static_cast<std::int32_t>(model_->config().hidden_size);
         for (std::size_t i = 0; i < limits.tap_visits.size(); ++i) {
             programs_->held_memory.emplace_back(static_cast<std::size_t>(hidden) * kHeld * 4);
