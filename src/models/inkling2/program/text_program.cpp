@@ -666,9 +666,10 @@ Tensor TextProgram::forward(std::span<const std::int32_t> tokens, std::span<cons
         next = e.column + e.values.ne[1];
     }
     const bool tracing = trace != nullptr && *trace;
-    if (cols == 1 && embeddings.empty() && !tracing && limits_.decode_graph && stream_ != nullptr) {
-        // With several slots the one-token forward is a batch of one: the single-sequence graph would hold one
-        // slot's state pointers.
+    // With several slots the one-token forward is a batch of one (the single-sequence graph would hold one slot's
+    // state pointers), unless the taps are on: forward_batch copies none, so a tapped forward takes the eager path
+    // below, which copies them for this slot as a single-sequence forward does.
+    if (cols == 1 && embeddings.empty() && !tracing && limits_.decode_graph && stream_ != nullptr && !(limits_.slots > 1 && taps_on_)) {
         if (limits_.slots > 1) {
             const std::int32_t slot[] = {slot_};
             return forward_batch(slot, tokens);

@@ -224,6 +224,28 @@ int main() {
                         mismatched == 0 ? "every logit byte-equal to the solo runs" : (std::to_string(mismatched) + " columns differ").c_str());
         }
 
+        if (only == 0) {
+            // A tapped one-token forward() in a multi-slot Program (the DSpark target's plain step) keeps its taps:
+            // it runs the single-sequence path for its slot, with the same logits and taps as a one-slot Program.
+            ink::ProgramLimits tapped = limits;
+            tapped.tap_visits         = {2, c.num_layer_visits / 2};
+            ink::ProgramLimits tapped_slots = tapped;
+            tapped_slots.slots              = 2;
+            ink::TextProgram single(*model, tapped, stream), multi(*model, tapped_slots, stream);
+            multi.select(1);
+            std::vector<float> last_single, last_multi;
+            prefill(single, prompts[1], kChunk, last_single, vocab, stream);
+            prefill(multi, prompts[1], kChunk, last_multi, vocab, stream);
+            const std::int32_t one[] = {argmax(last_single)};
+            const auto ls = column(single.forward(one), 0, vocab, stream), lm = column(multi.forward(one), 0, vocab, stream);
+            bool same = ls == lm;
+            for (std::size_t i = 0; same && i < tapped.tap_visits.size(); ++i) {
+                const ninfer::Tensor ts = single.tap(i), tm = multi.tap(i);
+                same = ts.ne[1] == 1 && tm.ne[1] == 1 && column(ts, 0, ts.ne[0], stream) == column(tm, 0, tm.ne[0], stream);
+            }
+            check(same, "a tapped one-token forward in a multi-slot Program keeps the single-slot logits and taps");
+        }
+
         if (bench) {
             // Full batches at about 1,000 positions each: aggregate tok/s per B. Each column decodes a different token
             // (one shared token would route every column to the same experts, which flatters the wider batches).
