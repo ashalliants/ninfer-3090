@@ -280,6 +280,22 @@ EngineOptions refuse_inkling2_cache_tiers(EngineOptions options) {
     }
     return options;
 }
+
+// DSpark's own options are refused off its route, not ignored. This runs before normalize_engine_options, which clears
+// a CausalScoring Engine's speculative options: those values would otherwise vanish without a refusal there too.
+EngineOptions refuse_off_route_dspark_options(EngineOptions options) {
+    const auto& spec = options.speculative;
+    if (!spec.dspark_window_explicit && spec.draft_min_p == 0.0F && !spec.dspark_adaptive) { return options; }
+    const bool on_route = options.purpose == EnginePurpose::Generation && spec.backend == SpeculativeBackend::DSpark &&
+                          runtime::artifact_is_inkling2(options.artifact_path);
+    if (!on_route && spec.dspark_window_explicit) {
+        throw std::invalid_argument("--dspark-window applies to Inkling-2 generation with --spec dspark only");
+    }
+    if (!on_route) {
+        throw std::invalid_argument("--draft-min-p and --dspark-adaptive apply to Inkling-2 generation with --spec dspark only");
+    }
+    return options;
+}
 } // namespace
 
 class Engine::Impl {
@@ -308,7 +324,7 @@ public:
                               std::unique_ptr<Inkling2Core>, std::unique_ptr<Dsv4Core>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(runtime::normalize_engine_options(refuse_inkling2_cache_tiers(std::move(engine_options)))),
+        : options(runtime::normalize_engine_options(refuse_off_route_dspark_options(refuse_inkling2_cache_tiers(std::move(engine_options))))),
           device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         if (options.dense_q8 != DenseQ8::Off && !runtime::artifact_is_inkling2(options.artifact_path)) {
@@ -316,14 +332,6 @@ public:
         }
         if (!options.split_attention && !runtime::artifact_is_inkling2(options.artifact_path)) {
             throw std::invalid_argument("--no-split-attention selects Inkling-2's attention kernel; this model has its own");
-        }
-        if (options.speculative.dspark_window_explicit &&
-            (!runtime::artifact_is_inkling2(options.artifact_path) || options.speculative.backend != SpeculativeBackend::DSpark)) {
-            throw std::invalid_argument("--dspark-window applies to Inkling-2 with --spec dspark only");
-        }
-        if ((options.speculative.draft_min_p != 0.0F || options.speculative.dspark_adaptive) &&
-            (options.speculative.backend != SpeculativeBackend::DSpark || !runtime::artifact_is_inkling2(options.artifact_path))) {
-            throw std::invalid_argument("--draft-min-p and --dspark-adaptive apply to Inkling-2 with --spec dspark only");
         }
         if (runtime::artifact_is_inkling2(options.artifact_path) && (options.kv_cache != KvCacheStorage::BFloat16 || options.kv_cache_explicit)) {
             throw std::invalid_argument("--kv-dtype: Inkling-2 takes fp16 (default) or fp32");

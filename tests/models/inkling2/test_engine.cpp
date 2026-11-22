@@ -143,6 +143,25 @@ int main() {
                     check(false, "--draft-min-p or --dspark-adaptive without --spec dspark is refused");
                 } catch (const std::invalid_argument&) {}
             }
+            // A CausalScoring Engine clears its speculative options when it normalizes them: DSpark's own are refused
+            // before that, by name, even with --spec dspark.
+            const auto refused_by_name = [](const ninfer::EngineOptions& o, const char* name) {
+                try {
+                    ninfer::Engine refused(o);
+                } catch (const std::invalid_argument& error) { return std::string(error.what()).find(name) != std::string::npos; }
+                return false;
+            };
+            ninfer::EngineOptions scoring             = options;
+            scoring.purpose                           = ninfer::EnginePurpose::CausalScoring;
+            scoring.speculative.backend               = ninfer::SpeculativeBackend::DSpark;
+            scoring.speculative.draft_tokens          = 3;
+            ninfer::EngineOptions scoring_min_p       = scoring, scoring_adaptive = scoring, scoring_window = scoring;
+            scoring_min_p.speculative.draft_min_p     = 0.5F;
+            scoring_adaptive.speculative.dspark_adaptive = true;
+            scoring_window.speculative.dspark_window_explicit = true;
+            check(refused_by_name(scoring_min_p, "--draft-min-p") && refused_by_name(scoring_adaptive, "--dspark-adaptive") &&
+                      refused_by_name(scoring_window, "--dspark-window"),
+                  "a CausalScoring Engine refuses DSpark's options instead of clearing them");
         }
         {
             // An explicit --kv-dtype bf16 (or any kv_cache form) is refused: Inkling-2's rings are FP16 or FP32.
