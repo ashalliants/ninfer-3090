@@ -138,68 +138,84 @@ std::size_t ffn_workspace_bytes(const FfnParams& p, const FfnWeights& w, std::in
     return total + 4 * kAlign;
 }
 
-void ffn_forward(const FfnParams& p, const FfnWeights& w, std::uint32_t layer, ExpertSource& experts, FfnInput in, DeviceArena& arena,
-                 cudaStream_t stream) {
+FfnCall ffn_carve(const FfnParams& p, std::int32_t T, DeviceArena& arena) {
     require_supported(p);
+    const std::int32_t K = p.top_k, E = p.experts, entries = K * T, jobs = max_jobs(p, T);
+    FfnCall call;
+    call.columns   = T;
+    call.collapsed = arena.alloc(DType::BF16, {p.hidden, T});
+    call.x         = arena.alloc(DType::BF16, {p.hidden, T});
+    call.logits    = arena.alloc(DType::FP32, {E, T});
+    call.ids       = arena.alloc(DType::I32, {K, T});
+    call.weights   = arena.alloc(DType::FP32, {K, T});
+    call.routing.ids         = call.ids;
+    call.routing.weights     = call.weights;
+    call.routing.shared_gate = arena.alloc(DType::FP32, {T}); // unused: V4's shared expert is not gated
+    const DeviceSpan dispatch_bytes = arena.alloc_bytes(ops::moe_dispatch_bytes(E, entries));
+    call.dispatch                   = ops::carve_moe_dispatch(dispatch_bytes.data, E, entries);
+    call.gate      = arena.alloc(DType::BF16, {p.intermediate, T});
+    call.up        = arena.alloc(DType::BF16, {p.intermediate, T});
+    call.act       = arena.alloc(DType::BF16, {p.intermediate, T});
+    call.shared    = arena.alloc(DType::BF16, {p.hidden, T});
+    call.y         = arena.alloc(DType::BF16, {p.hidden, T});
+    call.expert_ws = arena.alloc_bytes(ops::moe_experts_narrow_workspace_bytes(shape_of(p), jobs, entries, T));
+    call.routed    = arena.alloc(DType::BF16, {p.hidden, entries});
+    return call;
+}
+
+void ffn_route(const FfnParams& p, const FfnWeights& w, FfnCall& call, FfnInput in, cudaStream_t stream) {
     Tensor& residual = in.residual;
-    const std::int32_t T = residual.ne[1];
-    if (residual.ne[0] != p.streams * p.hidden) { throw std::invalid_argument("dsv4 ffn: residual is not [streams * hidden, T]"); }
+    if (residual.ne[0] != p.streams * p.hidden || residual.ne[1] != call.columns) {
+        throw std::invalid_argument("dsv4 ffn: residual is not [streams * hidden, T]");
+    }
     if (in.collapse_pre != nullptr && (overlaps(*in.collapse_pre, in.mixes.pre) || overlaps(*in.collapse_pre, in.mixes.post) ||
                                        overlaps(*in.collapse_pre, in.mixes.comb))) {
         throw std::invalid_argument("dsv4 ffn: collapse_pre must not overlap any of this call's own mixes buffers (double-buffer the mixes)");
     }
-    const auto scope     = arena.scope();
-    const std::int32_t K = p.top_k, E = p.experts, entries = K * T, jobs = max_jobs(p, T);
-
     // Mixes of this sublayer, then the collapsed, normalised input.
     ops::hc_sinkhorn_mixes(residual, w.hc_fn, w.hc_scale, w.hc_base, p.norm_eps, p.hc_eps, p.hc_iterations, in.mixes.pre, in.mixes.post,
                            in.mixes.comb, stream);
-    Tensor collapsed = arena.alloc(DType::BF16, {p.hidden, T});
-    Tensor x         = arena.alloc(DType::BF16, {p.hidden, T});
-    ops::hc_collapse(residual, in.collapse_pre != nullptr ? *in.collapse_pre : in.mixes.pre, collapsed, stream);
-    ops::rmsnorm(collapsed, w.norm, p.norm_eps, false, x, stream);
-
+    ops::hc_collapse(residual, in.collapse_pre != nullptr ? *in.collapse_pre : in.mixes.pre, call.collapsed, stream);
+    ops::rmsnorm(call.collapsed, w.norm, p.norm_eps, false, call.x, stream);
     // Router: FP32 logits from the BF16 weights, then the selection.
-    Tensor logits  = arena.alloc(DType::FP32, {E, T});
-    Tensor ids     = arena.alloc(DType::I32, {K, T});
-    Tensor weights = arena.alloc(DType::FP32, {K, T});
     const Tensor* router[] = {&w.router};
-    ops::projection_fp32(x, router, logits, stream);
-    ops::moe_route_sqrt_softplus(logits, w.router_bias, K, p.route_scale, p.norm_topk, ids, weights, stream);
+    ops::projection_fp32(call.x, router, call.logits, stream);
+    ops::moe_route_sqrt_softplus(call.logits, w.router_bias, p.top_k, p.route_scale, p.norm_topk, call.ids, call.weights, stream);
+    ops::moe_dispatch(call.routing, p.experts, call.dispatch, nullptr, stream);
+}
 
-    // Routed experts: dispatch, then the records from wherever they live. The ids start their way to the
-    // host now, and the shared expert (which does not depend on them) is enqueued before the source waits for
-    // them, so a source that reads records from a file overlaps those reads with the shared expert's work.
-    ops::MoeRouting routing;
-    routing.ids         = ids;
-    routing.weights     = weights;
-    routing.shared_gate = arena.alloc(DType::FP32, {T}); // unused: V4's shared expert is not gated
-    const DeviceSpan dispatch_bytes = arena.alloc_bytes(ops::moe_dispatch_bytes(E, entries));
-    ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, entries);
-    ops::moe_dispatch(routing, E, dispatch, nullptr, stream);
-    experts.begin(layer, static_cast<const std::int32_t*>(ids.data), entries, stream);
-
-    // Shared expert: gate and up, the clamped SwiGLU, down.
-    Tensor gate = arena.alloc(DType::BF16, {p.intermediate, T}), up = arena.alloc(DType::BF16, {p.intermediate, T}),
-           act = arena.alloc(DType::BF16, {p.intermediate, T}), shared = arena.alloc(DType::BF16, {p.hidden, T}),
-           y = arena.alloc(DType::BF16, {p.hidden, T});
+void ffn_shared(const FfnParams& p, const FfnWeights& w, FfnCall& call, DeviceArena& arena, cudaStream_t stream) {
     const auto project = [&](const Tensor& from, const Weight& weight, Tensor& to) {
-        const auto call = arena.scope(); // the Op's transient storage, stream-ordered before the next call reuses it
+        const auto scope = arena.scope(); // the Op's transient storage, stream-ordered before the next call reuses it
         ops::linear(from, weight, to, w.shared_policy, arena, stream);
     };
-    project(x, w.shared_gate, gate);
-    project(x, w.shared_up, up);
-    ops::clamped_swiglu(gate, up, p.clamp_shared, act, stream);
-    project(act, w.shared_down, shared);
+    project(call.x, w.shared_gate, call.gate);
+    project(call.x, w.shared_up, call.up);
+    ops::clamped_swiglu(call.gate, call.up, p.clamp_shared, call.act, stream);
+    project(call.act, w.shared_down, call.shared);
+}
 
-    const ops::MoeExpertSource source = experts.prepare(layer, static_cast<const std::int32_t*>(ids.data), entries, stream);
-    const DeviceSpan expert_ws        = arena.alloc_bytes(ops::moe_experts_narrow_workspace_bytes(shape_of(p), jobs, entries, T));
-    Tensor routed                     = arena.alloc(DType::BF16, {p.hidden, entries});
-    ops::moe_experts_narrow(shape_of(p), x, dispatch, source, K, jobs, expert_ws.data, routed, stream);
-    ops::weighted_slot_sum(routed, weights, shared, y, stream);
-
+void ffn_experts(const FfnParams& p, FfnCall& call, const ops::MoeExpertSource& source, FfnInput in, cudaStream_t stream) {
+    const std::int32_t jobs = max_jobs(p, call.columns);
+    ops::moe_experts_narrow(shape_of(p), call.x, call.dispatch, source, p.top_k, jobs, call.expert_ws.data, call.routed, stream);
+    ops::weighted_slot_sum(call.routed, call.weights, call.shared, call.y, stream);
     // Back into the streams.
-    ops::hc_expand_mix(y, in.mixes.post, in.mixes.comb, residual, stream);
+    ops::hc_expand_mix(call.y, in.mixes.post, in.mixes.comb, in.residual, stream);
+}
+
+void ffn_forward(const FfnParams& p, const FfnWeights& w, std::uint32_t layer, ExpertSource& experts, FfnInput in, DeviceArena& arena,
+                 cudaStream_t stream) {
+    const auto scope = arena.scope();
+    FfnCall call     = ffn_carve(p, in.residual.ne[1], arena);
+    ffn_route(p, w, call, in, stream);
+    const std::int32_t entries = p.top_k * call.columns;
+    // The ids start their way to the host now, and the shared expert (which does not depend on them) is
+    // enqueued before the source waits for them, so a source that reads records from a file overlaps those
+    // reads with the shared expert's work.
+    experts.begin(layer, static_cast<const std::int32_t*>(call.ids.data), entries, stream);
+    ffn_shared(p, w, call, arena, stream);
+    const ops::MoeExpertSource source = experts.prepare(layer, static_cast<const std::int32_t*>(call.ids.data), entries, stream);
+    ffn_experts(p, call, source, in, stream);
 }
 
 } // namespace ninfer::models::dsv4

@@ -15,6 +15,15 @@
 // A call takes a chunk of tokens (any length up to the limits) at positions start .. start + T - 1 and
 // leaves the sequence's state advanced; start = 0 begins a new sequence.
 //
+// Decode graphs: a one-token call (after one eager one-token call has initialised the Ops) runs each layer as
+// CUDA graphs captured on first use, around the steps that cannot be captured: the attention's position
+// arguments (its position-dependent kernels, the compressor's pooling and the indexer stay eager), and the host's
+// read of the routed expert ids, the one host synchronization of a layer (the shared expert's graph runs while
+// the host reads the records the ids name). Per layer: [attention front] -> eager position steps -> [attention
+// back] -> [attention expand + FFN route] -> ids to the host -> [shared expert] -> host: records -> [experts +
+// expand + the next layer's attention front, or the head]. The graphs run the same Ops on the same tensors as the eager path.
+// NINFER_DSV4_GRAPHS=0 turns them off; NINFER_DSV4_PROFILE=1 times the stages.
+//
 // Engram: with `ForwardOptions::engram_dir` set (the folder tools/convert/dsv4_engram_volume.py writes), every
 // call first hashes its tokens and stages their volume rows on the host (the hash history persists across
 // calls; start = 0 resets it), and the Engram layers (1 and 14) then inject before their block. Without it those
@@ -62,6 +71,8 @@ public:
 
     // NINFER_DSV4_PROFILE=1: per-stage host timing of the decode steps from position 16 on (empty otherwise).
     [[nodiscard]] std::string profile_report() const;
+    // Zeroes the profile counters (NINFER_DSV4_PROFILE=1), so a report covers only what ran after.
+    void reset_profile() noexcept;
 
     // Whether the Engram layers inject (an Engram folder was bound).
     [[nodiscard]] bool engram_applied() const noexcept;

@@ -79,6 +79,26 @@ struct FfnInput {
 // Arena bytes ffn_forward needs for `columns` columns (bounds every allocation including alignment).
 [[nodiscard]] std::size_t ffn_workspace_bytes(const FfnParams& params, const FfnWeights& weights, std::int32_t columns);
 
+// The tensors one FFN call passes between its phases, all carved from the caller's arena: a caller that keeps
+// the arena scope open (or carves the same way each call) gets the same addresses, which is what lets it
+// capture each phase in its own CUDA graph once and replay it.
+struct FfnCall {
+    Tensor collapsed, x, logits, ids, weights, gate, up, act, shared, routed, y;
+    ops::MoeRouting routing;
+    ops::MoeDispatch dispatch;
+    DeviceSpan expert_ws;
+    std::int32_t columns = 0;
+};
+
+// Carves the call's tensors from `arena` (the caller owns the scope); no device work.
+[[nodiscard]] FfnCall ffn_carve(const FfnParams& params, std::int32_t columns, DeviceArena& arena);
+// Phase 1: mixes, collapse, norm, router, dispatch (no host work, capturable).
+void ffn_route(const FfnParams& params, const FfnWeights& weights, FfnCall& call, FfnInput input, cudaStream_t stream);
+// Phase 2: the shared expert (capturable). Its Op scratch is carved from `arena` and released inside.
+void ffn_shared(const FfnParams& params, const FfnWeights& weights, FfnCall& call, DeviceArena& arena, cudaStream_t stream);
+// Phase 3: the routed experts from `source`, the weighted sum and the expansion back into the streams (capturable).
+void ffn_experts(const FfnParams& params, FfnCall& call, const ops::MoeExpertSource& source, FfnInput input, cudaStream_t stream);
+
 // Runs the sublayer on `stream`. Scratch is carved from `workspace` inside a scope and released on return.
 void ffn_forward(const FfnParams& params, const FfnWeights& weights, std::uint32_t layer, ExpertSource& experts,
                  FfnInput input, DeviceArena& workspace, cudaStream_t stream);

@@ -197,7 +197,8 @@ int main() {
 
     // The same prompt and continuation again with the caches warm: identical tokens, and the speed a
     // repeated workload sees.
-    for (int pass = 0; pass < 3; ++pass) {
+    for (int pass = 0; pass < 5; ++pass) {
+        if (pass == 4) { forward.reset_profile(); } // the report below covers the last, fully warm pass
         experts.reset_stats();
         forward.run(prompt, 0);
         cudaStreamSynchronize(stream);
@@ -210,8 +211,9 @@ int main() {
             forward.run(std::span<const std::int32_t>(&tok, 1), pos++);
             tok = forward.argmax();
         }
-        print_tiers(pass == 0 ? "warm decode, pass 1 (same text again)" : pass == 1 ? "warm decode, pass 2" : "warm decode, pass 3", experts.stats(), seconds_since(start), new_tokens);
+        print_tiers(pass == 0 ? "warm decode, pass 1 (same text again)" : pass == 1 ? "warm decode, pass 2" : pass == 2 ? "warm decode, pass 3" : pass == 3 ? "warm decode, pass 4" : "warm decode, pass 5", experts.stats(), seconds_since(start), new_tokens);
         check(again == first_pass, "the second decode of the same text gives the same ids");
+        if (pass == 4) { std::printf("%s", forward.profile_report().c_str()); }
         next     = tok;
         position = pos;
     }
@@ -230,7 +232,6 @@ int main() {
         const auto& w = experts.stats();
         print_tiers("probe, same token repeated (routing drifts)", w, warm, warm_steps);
     }
-    std::printf("%s", forward.profile_report().c_str());
     if (failures == 0) { std::printf("PASS\n"); }
     return failures == 0 ? 0 : 1;
 }

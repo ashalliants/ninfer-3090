@@ -401,7 +401,7 @@ std::size_t attention_workspace_bytes(const TextConfig& c, AttentionLimits limit
 
 void attention_layer(const TextConfig& c, std::uint32_t layer, const AttentionLayerViews& w,
                      AttentionState& state, const Tensor& x, std::int32_t start, Tensor& out,
-                     WorkspaceArena& work, cudaStream_t stream) {
+                     WorkspaceArena& work, cudaStream_t stream, AttentionRunner* runner) {
     AttentionState::Impl& st = *state.impl_;
     require(layer < c.layers.size() && layer < st.layers.size(), "layer out of range");
     const LayerPlan& plan = c.layers[layer];
@@ -442,34 +442,67 @@ void attention_layer(const TextConfig& c, std::uint32_t layer, const AttentionLa
     const std::int32_t raw_base = static_cast<std::int32_t>(slot.raw_base);
     const std::int64_t keep     = window - 1; // raw rows carried between chunks
 
-    auto scope       = work.scope();
+    auto scope = work.scope();
+    // A one-token call of a layer whose compression ratio is not 1 may run its position-independent
+    // stretches as graphs (AttentionRunner); everything those read or write lives at a fixed address, so the
+    // tensors they share with the rest of the call are carved first, in an order that does not depend on the
+    // position.
+    const bool staged = runner != nullptr && T == 1 && !(plan.kv_source && ratio == 1);
+    const auto stretch = [&](int which, const auto& body) {
+        if (staged) {
+            runner->run(which, [&](cudaStream_t st) { body(st); });
+        } else {
+            body(stream);
+        }
+    };
     Tensor positions = work.alloc(DType::I32, {T});
+    Tensor qa = work.alloc(DType::BF16, {rank, T}), qn = work.alloc(DType::BF16, {rank, T});
+    Tensor q  = work.alloc(DType::BF16, {heads * D, T});
+    Tensor kvr = work.alloc(DType::BF16, {D, T});
+    const std::int32_t width = window + (reads_compressed ? st.topk : 0);
+    Tensor rows              = work.alloc(DType::I32, {width, T});
+    Tensor o                 = work.alloc(DType::BF16, {D, heads, T});
+    const std::int32_t groups    = static_cast<std::int32_t>(c.o_groups),
+                       group_in  = heads * D / groups,
+                       group_out = static_cast<std::int32_t>(c.o_lora_rank);
+    Tensor projected = work.alloc(DType::BF16, {groups * group_out, T});
+    Tensor gather    = T > 1 ? work.alloc(DType::BF16, {group_in, T}) : Tensor();
+    Tensor scatter   = T > 1 ? work.alloc(DType::BF16, {group_out, T}) : Tensor();
     o_::fill_i32_positions(positions, start, stream);
 
-    const auto run_linear = [&](const Tensor& in, const Weight& weight, Tensor& result) {
-        o_::linear(in, weight, result, w.policy, work, stream);
+    const auto run_linear = [&](const Tensor& in, const Weight& weight, Tensor& result, cudaStream_t s) {
+        o_::linear(in, weight, result, w.policy, work, s);
     };
 
-    // Query.
-    Tensor qa = work.alloc(DType::BF16, {rank, T}), qn = work.alloc(DType::BF16, {rank, T});
-    run_linear(x, w.q_a, qa);
-    o_::rmsnorm(qa, w.q_a_norm, eps, false, qn, stream);
-    Tensor q = work.alloc(DType::BF16, {heads * D, T});
-    run_linear(qn, w.q_b, q);
-    Tensor q3(q.data, DType::BF16, {D, heads, T});
-    o_::rope_pairs(positions, freq, rope, false, q3, stream);
-
-    // The raw key/value row of each token: straight into the layer's raw rows after the carried
-    // ones.
     void* table   = group.table.p;
     Tensor kv_now = columns_of(table, D, slot.raw_base + keep, T);
-    {
-        Tensor kvr = work.alloc(DType::BF16, {D, T});
-        run_linear(x, w.kv, kvr);
-        o_::rmsnorm(kvr, w.kv_norm, eps, false, kv_now, stream);
-        Tensor kv3(kv_now.data, DType::BF16, {D, 1, T});
-        o_::rope_pairs(positions, freq, rope, false, kv3, stream);
+    Tensor q3(q.data, DType::BF16, {D, heads, T});
+    // Pending rows of the compressor (ratio above 1): the staging columns after the carried ones.
+    const bool pools = plan.kv_source && ratio > 1;
+    Tensor pending_kv, pending_gate;
+    if (pools) {
+        const std::int64_t carried = ratio - 1;
+        pending_kv                 = columns_of(group.pending_kv.p, D, carried, T);
+        pending_gate               = columns_of(group.pending_gate.p, D, carried, T);
     }
+
+    stretch(0, [&](cudaStream_t s) {
+        // Query.
+        run_linear(x, w.q_a, qa, s);
+        o_::rmsnorm(qa, w.q_a_norm, eps, false, qn, s);
+        run_linear(qn, w.q_b, q, s);
+        o_::rope_pairs(positions, freq, rope, false, q3, s);
+        // The raw key/value row of each token: straight into the layer's raw rows after the carried ones.
+        run_linear(x, w.kv, kvr, s);
+        o_::rmsnorm(kvr, w.kv_norm, eps, false, kv_now, s);
+        Tensor kv3(kv_now.data, DType::BF16, {D, 1, T});
+        o_::rope_pairs(positions, freq, rope, false, kv3, s);
+        // The compressor's projections of this chunk's tokens.
+        if (pools) {
+            project_bf16(x, w.compressor->kv, pending_kv, work, s);
+            project_bf16(x, *w.compressor->gate, pending_gate, work, s);
+        }
+    });
 
     // The compressor of a kv source: whole groups of `ratio` tokens completed by this chunk.
     if (plan.kv_source) {
@@ -483,10 +516,6 @@ void attention_layer(const TextConfig& c, std::uint32_t layer, const AttentionLa
             o_::rmsnorm(wide, comp.norm, eps, false, rows, stream);
         } else {
             const std::int64_t carried = ratio - 1;
-            Tensor pending_kv          = columns_of(group.pending_kv.p, D, carried, T),
-                   pending_gate        = columns_of(group.pending_gate.p, D, carried, T);
-            project_bf16(x, comp.kv, pending_kv, work, stream);
-            project_bf16(x, *comp.gate, pending_gate, work, stream);
             if (done > 0) {
                 const std::int64_t e0 =
                     carried - (start % ratio); // staging column of the first group's first token
@@ -497,9 +526,6 @@ void attention_layer(const TextConfig& c, std::uint32_t layer, const AttentionLa
                 Tensor rows = columns_of(table, D, first, done);
                 o_::rmsnorm(pooled, comp.norm, eps, false, rows, stream);
             }
-            // The last (ratio - 1) tokens' rows are the next chunk's carried ones.
-            move_columns(group.pending_kv.p, D, T, 0, carried, work, stream);
-            move_columns(group.pending_gate.p, D, T, 0, carried, work, stream);
         }
         if (done > 0) {
             Tensor latent         = columns_of(table, D, first, done);
@@ -570,8 +596,6 @@ void attention_layer(const TextConfig& c, std::uint32_t layer, const AttentionLa
     }
 
     // Attention over each query's rows: its window, then the compressed rows it selected.
-    const std::int32_t width = window + (reads_compressed ? topk : 0);
-    Tensor rows              = work.alloc(DType::I32, {width, T});
     if (reads_compressed) {
         require(topk > 0, "a compressing layer needs an index source before it");
         const Tensor selected(st.shared_topk.p, DType::I32, {topk, T});
@@ -579,50 +603,45 @@ void attention_layer(const TextConfig& c, std::uint32_t layer, const AttentionLa
     } else {
         o_::attention_row_lists(nullptr, start, window, raw_base, 0, rows, stream);
     }
-    Tensor o = work.alloc(DType::BF16, {D, heads, T});
     const Tensor all_kv(table, DType::BF16, {D, static_cast<std::int32_t>(group.table_rows)});
-    o_::gathered_sink_attention(q3, all_kv, rows, w.sinks, 1.0F / std::sqrt(static_cast<float>(D)),
-                                o, stream);
-    o_::rope_pairs(positions, freq, rope, true, o, stream);
-
-    // The grouped output projection: group g reads the features of heads g * heads / groups ... and
-    // writes the 1024 outputs of rows [1024 g, 1024 (g + 1)) of out_a's weight.
-    const std::int32_t groups    = static_cast<std::int32_t>(c.o_groups),
-                       group_in  = heads * D / groups,
-                       group_out = static_cast<std::int32_t>(c.o_lora_rank);
     require(w.out_a.n == groups * group_out && w.out_a.k == group_in,
             "out_a does not match the grouped geometry");
-    Tensor projected = work.alloc(DType::BF16, {groups * group_out, T});
-    auto* o_bytes    = static_cast<std::uint8_t*>(o.data);
-    auto* p_bytes    = static_cast<std::uint8_t*>(projected.data);
-    Tensor gather    = T > 1 ? work.alloc(DType::BF16, {group_in, T}) : Tensor();
-    Tensor scatter   = T > 1 ? work.alloc(DType::BF16, {group_out, T}) : Tensor();
-    for (std::int32_t g = 0; g < groups; ++g) {
-        const Weight slice = row_slice(w.out_a, g * group_out, group_out);
-        if (T == 1) { // one column is contiguous in both directions
-            const Tensor in(o_bytes + static_cast<std::size_t>(g) * group_in * kBf16, DType::BF16,
-                            {group_in, 1});
-            Tensor result(p_bytes + static_cast<std::size_t>(g) * group_out * kBf16, DType::BF16,
-                          {group_out, 1});
-            run_linear(in, slice, result);
-        } else {
-            cuda(cudaMemcpy2DAsync(gather.data, group_in * kBf16,
-                                   o_bytes + static_cast<std::size_t>(g) * group_in * kBf16,
-                                   static_cast<std::size_t>(heads) * D * kBf16, group_in * kBf16, T,
-                                   cudaMemcpyDeviceToDevice, stream),
-                 "gather group");
-            run_linear(gather, slice, scatter);
-            cuda(cudaMemcpy2DAsync(p_bytes + static_cast<std::size_t>(g) * group_out * kBf16,
-                                   static_cast<std::size_t>(groups) * group_out * kBf16,
-                                   scatter.data, group_out * kBf16, group_out * kBf16, T,
-                                   cudaMemcpyDeviceToDevice, stream),
-                 "scatter group");
-        }
-    }
-    run_linear(projected, w.out_b, out);
 
-    // The last (window - 1) raw rows are the next chunk's carried ones.
-    move_columns(table, D, slot.raw_base + T, slot.raw_base, keep, work, stream);
+    stretch(1, [&](cudaStream_t s) {
+        o_::gathered_sink_attention(q3, all_kv, rows, w.sinks, 1.0F / std::sqrt(static_cast<float>(D)), o, s);
+        o_::rope_pairs(positions, freq, rope, true, o, s);
+
+        // The grouped output projection: group g reads the features of heads g * heads / groups ... and
+        // writes the 1024 outputs of rows [1024 g, 1024 (g + 1)) of out_a's weight.
+        auto* o_bytes = static_cast<std::uint8_t*>(o.data);
+        auto* p_bytes = static_cast<std::uint8_t*>(projected.data);
+        for (std::int32_t g = 0; g < groups; ++g) {
+            const Weight slice = row_slice(w.out_a, g * group_out, group_out);
+            if (T == 1) { // one column is contiguous in both directions
+                const Tensor in(o_bytes + static_cast<std::size_t>(g) * group_in * kBf16, DType::BF16, {group_in, 1});
+                Tensor result(p_bytes + static_cast<std::size_t>(g) * group_out * kBf16, DType::BF16, {group_out, 1});
+                run_linear(in, slice, result, s);
+            } else {
+                cuda(cudaMemcpy2DAsync(gather.data, group_in * kBf16, o_bytes + static_cast<std::size_t>(g) * group_in * kBf16,
+                                       static_cast<std::size_t>(heads) * D * kBf16, group_in * kBf16, T, cudaMemcpyDeviceToDevice, s),
+                     "gather group");
+                run_linear(gather, slice, scatter, s);
+                cuda(cudaMemcpy2DAsync(p_bytes + static_cast<std::size_t>(g) * group_out * kBf16,
+                                       static_cast<std::size_t>(groups) * group_out * kBf16, scatter.data, group_out * kBf16,
+                                       group_out * kBf16, T, cudaMemcpyDeviceToDevice, s),
+                     "scatter group");
+            }
+        }
+        run_linear(projected, w.out_b, out, s);
+
+        // The last (window - 1) raw rows are the next chunk's carried ones, and so are the compressor's last
+        // (ratio - 1) pending tokens.
+        move_columns(table, D, slot.raw_base + T, slot.raw_base, keep, work, s);
+        if (pools) {
+            move_columns(group.pending_kv.p, D, T, 0, ratio - 1, work, s);
+            move_columns(group.pending_gate.p, D, T, 0, ratio - 1, work, s);
+        }
+    });
 }
 
 } // namespace ninfer::models::dsv4
