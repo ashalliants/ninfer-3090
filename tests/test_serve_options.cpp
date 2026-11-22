@@ -1983,6 +1983,26 @@ int main() {
         } catch (const ApiException& error) { unknown_code = error.error().code; }
         failures += check(unknown_code == "unknown_graft",
                           "a graft the server did not load was not rejected");
+
+        // Inkling-2 serves one graft per request: a '+'-joined default is refused at startup there,
+        // kept for other routes, and a single default is fine everywhere.
+        const ServeOptions combined = parse({"ninfer-serve", "model.ninfer", "--graft", "a=a.bin",
+                                             "--graft", "b=b.bin", "--default-graft", "a+b"});
+        bool combined_refused = false;
+        try {
+            validate_route_defaults(combined, "inkling2");
+        } catch (const std::invalid_argument&) { combined_refused = true; }
+        bool others_ok = true, single_ok = true;
+        try {
+            validate_route_defaults(combined, "qwen3_5");
+        } catch (const std::invalid_argument&) { others_ok = false; }
+        const ServeOptions single = parse({"ninfer-serve", "model.ninfer", "--graft", "a=a.bin",
+                                           "--default-graft", "a"});
+        try {
+            validate_route_defaults(single, "inkling2");
+        } catch (const std::invalid_argument&) { single_ok = false; }
+        failures += check(combined_refused && others_ok && single_ok,
+                          "an Inkling-2 '+' --default-graft was not refused, or another default was");
         graft_request.graft.reset();
         failures += check(resolve_prompt_semantics(graft_request, grafted).graft.empty(),
                           "a request without a graft selected one with no default configured");

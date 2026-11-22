@@ -2584,7 +2584,7 @@ model unchanged, bit for bit.
 | What | the [OpenUncensored/Inkling-2-Mini-Uncensored](https://huggingface.co/OpenUncensored/Inkling-2-Mini-Uncensored) PEFT LoRA (r 2, on `attn.wo_ud` of layers 4-23) | the [satellitedown/Inkling-2-Mini-abliterated-ingine](https://huggingface.co/satellitedown/Inkling-2-Mini-abliterated-ingine) per-visit ablation, `inkling-2-mini-abliterated.safetensors` |
 | Licence | Apache-2.0 | Apache-2.0 |
 | A request selects it | `"lora": "NAME"` | `"graft": "NAME"` |
-| Default for every request | `--default-lora NAME` (`"lora": ""` opts out) | `--default-graft NAME` (`"graft": ""` opts out) |
+| Default for every request | `--default-lora NAME` (`"lora": ""` opts out) | `--default-graft NAME` (`"graft": ""` opts out; one name: a `+` combination is refused at startup, as Inkling-2 applies one graft a request) |
 | Applied | `a += B (A x)` on the attention output projection's result, FP32, unmerged | removes one direction per layer visit from each attention and MLP write (`y - w r (r . y)`), FP32 |
 
 ```bash
