@@ -61,7 +61,7 @@ Decode is one stream unless the column says otherwise.
 | Qwen3.8-Flash-Next (preview, Windows) | RTX 3090 | 32K default | 2,345-2,422 tok/s at 4K-128K | 108-113 tok/s (MTP), 78-81 plain | |
 | **Qwen3.8-27B** | Tesla V100 32 GB | 262,144 | ~1,020 tok/s at 4.4K | 76-86 tok/s (MTP3) | 79 tok/s at C2 (MTP3) |
 | Qwen3.8-Flash-Next | Tesla V100 32 GB | 262,144 | ~990 tok/s at 3.8K | 72-96 tok/s (MTP3), flat from 10K to 221K context | |
-| **Inkling-2-Mini** (new) | Tesla V100 32 GB | **262,144** with DSpark and vision | **1,930 tok/s** at 8K (1,629 at 1K, 1,244 at 100K) | **120.7 tok/s** (DSpark, maths); 93-94 average over 12 chats, 78.8 plain | **198 tok/s** at C8 (plain) |
+| **Inkling-2-Mini** (new) | Tesla V100 32 GB | **262,144** with DSpark and vision | **1,930 tok/s** at 8K, 131,072 context (1,629 at 1K, 1,244 at 100K); at 262,144 with `--prefill-chunk 2048` 1,869 at 8K, at the default chunk 256 786 | **120.7 tok/s** (DSpark, maths); 93-94 average over 12 chats, 78.8 plain | **198 tok/s** at C8 (plain) |
 
 RTX 3090 rows use the Linux launcher defaults (`rk4v4` KV) unless marked Windows. The V100 was
 measured over a 3.3 GB/s eGPU link (PCIe Gen3 x4) on a 59 GiB host: Qwen rows on 2026-11-18 (the
@@ -606,8 +606,11 @@ Gen3 x4 eGPU):
 - **Decode:** up to **120.7 tok/s** with DSpark (a maths prompt; code 115.4, lists 99.8, prose 88.2), and
   93.4-94.4 tok/s on average over 12 chat requests against 78.5-78.8 plain. Sampled at temperature 0.8,
   83.5 against 74.9 plain.
-- **Prefill:** up to 1,930 tok/s (a 7,979-token prompt, TTFT 4.1 s); 1,629 tok/s at 1K (TTFT 0.67 s) and
-  1,244 at 100K (TTFT 80.5 s). A 230-token image prompt answers its first token in 382 ms.
+- **Prefill:** up to 1,930 tok/s (a 7,979-token prompt, TTFT 4.1 s, at `--max-context 131072`, where the
+  engine picks chunk 2048); 1,629 tok/s at 1K (TTFT 0.67 s) and 1,244 at 100K (TTFT 80.5 s). At the full 262,144
+  with DSpark and vision the default chunk is 256 (786 tok/s at 8K, 632 at 100K): `--prefill-chunk 2048` runs
+  there too, below the 256 MiB startup spare, at 1,869 tok/s at 8K (TTFT 4.3 s) and 1,219 at 100K (82.1 s). A
+  230-token image prompt answers its first token in 375-392 ms.
 - **Context:** the full 262,144 tokens with DSpark and vision on. Decode at 100K context runs at 48 tok/s.
 - **Several requests:** `--max-concurrency` up to 8, **198.2 tok/s** aggregate at 8 (121.8 at 2, 170.5 at 4),
   each request's tokens the same as alone. Requests at N > 1 decode without DSpark.

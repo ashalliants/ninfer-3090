@@ -30,9 +30,14 @@ public:
     // layers attend over only their last global_window context positions, held in a ring of that many (a fraction of
     // the bytes at a long context; again only the drafts can change). head_copy false (and no head_q8): the base
     // logits read the target's BF16 head instead of the drafter's Q8 copy of it (492 MB less, a slower draft).
+    // workspace, when given (at least workspace_bytes(model, max_chunk)), is borrowed instead of allocated: a region
+    // nothing else holds data in while extend() or draft() runs (the text Program's lent region, TextProgram::lent());
+    // neither leaves anything there once it returns.
     DSparkProgram(const Model& model, std::int32_t max_context, std::int32_t max_chunk, cudaStream_t stream,
                   const ops::Q8Weight* head_q8 = nullptr, bool kv_fp16 = false, std::int32_t global_window = 0,
-                  bool head_copy = true);
+                  bool head_copy = true, DeviceSpan workspace = {});
+    // The workspace extend() (of up to max_chunk positions) and draft() take.
+    [[nodiscard]] static std::size_t workspace_bytes(const Model& model, std::int32_t max_chunk);
     [[nodiscard]] std::int32_t max_chunk() const noexcept { return max_chunk_; }
     DSparkProgram(const DSparkProgram&)            = delete;
     DSparkProgram& operator=(const DSparkProgram&) = delete;

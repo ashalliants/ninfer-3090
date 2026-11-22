@@ -40,14 +40,26 @@ const DSparkConfig& require_dspark(const Model& model) {
 
 } // namespace
 
+std::size_t DSparkProgram::workspace_bytes(const Model& model, std::int32_t max_chunk) {
+    const DSparkConfig& c = require_dspark(model);
+    return std::size_t(model.config().vocab_size) * c.block_size * 4 + std::size_t(std::max(max_chunk, std::int32_t(c.block_size))) * 64 * 1024 +
+           ops::dspark_block_attention_workspace_bytes({i32(c.heads), 0, 0, 0}, i32(c.block_size)) + (64U << 20);
+}
+
+namespace {
+// The drafter's own workspace, or the borrowed region (refused when it is smaller than the drafter needs).
+DeviceArena drafter_workspace(const Model& model, std::int32_t max_chunk, DeviceSpan borrowed) {
+    const std::size_t bytes = DSparkProgram::workspace_bytes(model, max_chunk);
+    if (borrowed.data == nullptr) { return DeviceArena(bytes); }
+    if (borrowed.bytes < bytes) { throw std::invalid_argument("inkling2 dspark: the borrowed workspace is smaller than the drafter needs"); }
+    return DeviceArena(borrowed);
+}
+} // namespace
+
 DSparkProgram::DSparkProgram(const Model& model, std::int32_t max_context, std::int32_t max_chunk, cudaStream_t stream,
-                             const ops::Q8Weight* head_q8, bool kv_fp16, std::int32_t global_window, bool head_copy)
+                             const ops::Q8Weight* head_q8, bool kv_fp16, std::int32_t global_window, bool head_copy, DeviceSpan workspace)
     : model_(model), config_(require_dspark(model)), text_(model.config()), max_context_(max_context), max_chunk_(max_chunk),
-      stream_(stream),
-      workspace_((std::size_t(model.config().vocab_size) * require_dspark(model).block_size * 4) +
-                 std::size_t(std::max(max_chunk, std::int32_t(require_dspark(model).block_size))) * 64 * 1024 +
-                 ops::dspark_block_attention_workspace_bytes({i32(require_dspark(model).heads), 0, 0, 0}, i32(require_dspark(model).block_size)) +
-                 (64U << 20)) {
+      stream_(stream), workspace_(drafter_workspace(model, max_chunk, workspace)) {
     const DSparkConfig& c = config_;
     if (max_chunk < 1 || max_chunk > max_context || max_chunk > i32(c.sliding_window)) {
         throw std::invalid_argument("inkling2 dspark: max_chunk must be in 1..min(max_context, the draft window)");

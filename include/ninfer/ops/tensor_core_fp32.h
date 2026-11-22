@@ -45,10 +45,14 @@ void projection_tc_fp32(std::span<const Tensor* const> inputs, std::span<const T
  *   BF16 banks: each expert's rows in FP16 under a power of two per row, cuBLAS FP32-accumulating GEMMs, the
  *   activation under a power of two per entry.
  * The combine over the k slots is moe_situ_experts' (in order, one FMA each from 0). gate_cap and up_cap positive.
- * Workspace: moe_situ_experts_tc_workspace_bytes(bank, k * T) from `workspace`, released on return.
+ * Workspace: moe_situ_experts_tc_workspace_bytes(bank, k * T) from `workspace`, released on return. The FP16 inputs
+ *   take one row per column (NVFP4) or per entry of the expert with the most (BF16 banks, whose GEMM results take as
+ *   many); given `columns` T (a column's k ids distinct, so no expert has more than T entries) and `combined` false
+ *   (weights null: out holds the entries) the bound is tighter.
  * Execution: stream-ordered; syncs the stream; not graph capturable.
  */
-[[nodiscard]] std::size_t moe_situ_experts_tc_workspace_bytes(const SituExpertBank& bank, std::int64_t entries);
+[[nodiscard]] std::size_t moe_situ_experts_tc_workspace_bytes(const SituExpertBank& bank, std::int64_t entries, std::int64_t columns = 0,
+                                                              bool combined = true);
 void moe_situ_experts_tc(const SituExpertBank& bank, const Tensor& z, const Tensor& ids, const Tensor* weights, float gate_cap,
                          float up_cap, DeviceArena& workspace, Tensor& out, cudaStream_t stream);
 

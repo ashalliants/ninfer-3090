@@ -67,45 +67,86 @@ std::int32_t max_live_outputs(const TextConfig& c) {
     return static_cast<std::int32_t>(peak);
 }
 
-// Every allocation one token costs in a forward call (persistent across visits and per visit), with slack.
-std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk, std::int32_t max_context, bool split_attention,
-                            std::int32_t logit_columns, const ProgramLimits::TensorCoreParts& tc, QType expert_format,
-                            const DenseWeightsQ8* dense) {
+// The most workspace one forward of `cols` columns takes, `logit_cols` of them with logits, `split` true when its
+// attention may split its keys (at most ops::kSplitMaxColumns columns), `saving` when it saves its convolution inputs
+// (a forward of 2..max_rollback columns). Per column: the persistent part (the embedding, the pooled visit outputs) and
+// what crosses a visit's stages (ffn_inp, a, the MoE's loop message), then the largest of the stages, whose
+// temporaries TextProgram::visit releases before the next one allocates its own, and of the output; with slack.
+std::size_t forward_bytes(const TextConfig& c, std::int32_t cols, std::int32_t logit_cols, bool split, bool saving, std::int32_t max_context,
+                          const ProgramLimits::TensorCoreParts& tc, QType expert_format, const DenseWeightsQ8* dense) {
     const std::size_t h = c.hidden_size, q = std::size_t(c.heads) * c.head_dim, kv = std::size_t(c.kv_heads) * c.head_dim;
-    const std::size_t kept = static_cast<std::size_t>(max_live_outputs(c)) * h * 4; // the pooled visit outputs
-    // A visit's own (ffn_inp and the four loop messages among them) are released when it returns.
-    const std::size_t per_visit_temp = 17 * h * 4 + 3 * h * 2 + (2 * q + std::size_t(c.heads) * (c.d_rel + 1)) * 4 +
-                                       4 * (kv + 64) * 4 + 2 * q * 4 + q * 2 + 4 * h * 2 + 4 * h * 4 + 64 * 4 * 2 +
-                                       std::size_t(c.experts_per_token) * (c.moe_intermediate + h) * 4 + 4 * c.experts_per_token * 4 +
-                                       ops::moe_route_sigmoid_topk_workspace_bytes(i32(c.experts), 1) +
-                                       ops::depth_attention_mix_workspace_bytes(i32(c.hidden_size), 1, ops::kDepthAttentionMaxSources) +
-                                       ops::loop_controller_workspace_bytes(i32(c.hidden_size), i32(c.loop_gate_rank), 1,
-                                                                            ops::kLoopControllerMaxJobs);
-    const std::size_t output = 4 * h * 4;
-    const std::size_t per_token = kept + per_visit_temp + output;
-    const std::size_t logits = std::size_t(c.vocab_size) * 4 * static_cast<std::size_t>(logit_columns);
-    // Each allocation pads to 256 bytes; a visit makes about 60.
-    // The attention's split parts of a call of up to kSplitMaxColumns columns over the ring that shows the most keys
-    // (a global one of max_context, or a local window).
-    const ops::RelativeBiasAttentionShape global{i32(c.heads), i32(c.kv_heads), i32(c.head_dim), i32(c.d_rel), 0};
-    const std::int64_t keys = std::max<std::int64_t>(max_context, c.sliding_window);
-    const std::size_t split =
-        split_attention ? ops::relative_bias_attention_split_bytes(global, std::min(chunk, ops::kSplitMaxColumns), keys) : 0;
-    // The tensor-core route's staging: the widest dense weight and the chunk in FP16, or the experts' entries. The
-    // head goes through project() too: when its call is wide enough for the tensor cores (every column's logits kept,
-    // last_logits off), its vocab_size rows are the widest weight. A re-encoded weight runs over its Q8 copy instead
-    // (project() takes it first): either --dense-q8 form re-encodes the head, and Q8All every dense projection, so
-    // nothing dense is staged.
+    const std::size_t t = static_cast<std::size_t>(cols), top_k = c.experts_per_token;
+    const std::size_t dyn = std::size_t(c.kv_heads) * c.conv_kernel_size, rel = std::size_t(c.heads) * c.d_rel;
+    const std::size_t col = h * 4 * t; // one FP32 [hidden, cols]
+    const std::size_t mix = ops::depth_attention_mix_workspace_bytes(i32(c.hidden_size), cols, ops::kDepthAttentionMaxSources);
+    const auto control    = [&](int jobs) { return ops::loop_controller_workspace_bytes(i32(c.hidden_size), i32(c.loop_gate_rank), cols, jobs); };
+    const std::size_t persistent = (static_cast<std::size_t>(max_live_outputs(c)) + 1) * col + padded(t * 4);
+    const std::size_t crossing   = 3 * col;
+    const std::size_t normed     = 3 * h * 2 * t; // the BF16 inputs of q, k and v
+    // The inputs: three loop messages, the mixed inputs and the controllers' outputs.
+    const std::size_t inputs = normed + 9 * col + std::max(mix, control(ops::kLoopControllerMaxJobs));
+    // The attention: the projections (q, rel, gate, sink, and k and v with their dynamic rows, in the q call or their
+    // own), the convolutions' outputs, the gated attention output and wo's; the split parts of a narrow call.
+    const bool wide          = cols >= kTensorCoreMinColumns;
+    const bool dense_tc      = tc.dense && wide && (dense == nullptr || dense->form() != DenseForm::Q8All);
+    const std::size_t widest = std::max(q, h);
+    const std::size_t attention =
+        normed + (2 * q + rel + c.heads + 2 * (kv + dyn)) * 4 * t + 2 * (kv + dyn) * 4 * t + 2 * kv * 4 * t + q * 2 * t + col +
+        (dense_tc ? ops::projection_tc_workspace_bytes(i32(widest), i32(widest), cols) : 0) +
+        (split ? ops::relative_bias_attention_split_bytes({i32(c.heads), i32(c.kv_heads), i32(c.head_dim), i32(c.d_rel), 0},
+                                                          std::min(cols, ops::kSplitMaxColumns),
+                                                          std::max<std::int64_t>(max_context, c.sliding_window))
+               : 0);
+    // The MoE half: the normed input and the route throughout; z and its controller's output until routed; then the
+    // entries' outputs, the combined y (saving) and the experts' own workspace: the tensor cores' route at prefill
+    // widths, else moe_situ_experts' (CUDA cores: per entry its activation and output, and the order; its formula for a
+    // bank of this geometry, either format).
     ops::SituExpertBank bank;
     bank.format = expert_format, bank.hidden = i32(h), bank.intermediate = i32(c.moe_intermediate), bank.experts = i32(c.experts);
-    const bool head_tc  = logit_columns >= kTensorCoreMinColumns && dense == nullptr;
-    const bool dense_tc = tc.dense && (dense == nullptr || dense->form() != DenseForm::Q8All);
-    const std::size_t widest = std::max({q, h, head_tc ? static_cast<std::size_t>(c.vocab_size) : std::size_t{0}});
-    const std::size_t staging =
-        std::max(dense_tc ? ops::projection_tc_workspace_bytes(i32(std::max(q, h)), i32(widest), chunk) : 0,
-                 tc.experts ? ops::moe_situ_experts_tc_workspace_bytes(bank, std::int64_t(c.experts_per_token) * chunk) : 0);
-    return per_token * static_cast<std::size_t>(chunk) + logits + split + staging + (c.num_layer_visits * 2 + 64) * kAlign * 4 +
-           (64U << 20);
+    const std::int64_t entries = static_cast<std::int64_t>(top_k * t);
+    const std::size_t routed   = col + 2 * padded(top_k * t * 4);
+    const std::size_t route    = 2 * col + std::max({mix, ops::moe_route_sigmoid_topk_workspace_bytes(i32(c.experts), cols), control(1)});
+    const std::size_t experts  = tc.experts && wide ? ops::moe_situ_experts_tc_workspace_bytes(bank, entries, cols, false)
+                                                    : padded(top_k * t * c.moe_intermediate * 4) + padded(top_k * t * h * 4) + padded((1 + top_k * t) * 4);
+    const std::size_t moe      = routed + std::max(route, top_k * col + (saving ? col : 0) + experts);
+    // The output: its mix and norm, the head's BF16 input and the logits (the head is the widest weight a tensor-core
+    // call stages when every column's logits are kept; --dense-q8 re-encodes it, so nothing is staged then).
+    const std::size_t lc = static_cast<std::size_t>(logit_cols);
+    const bool head_tc   = tc.dense && logit_cols >= kTensorCoreMinColumns && dense == nullptr;
+    const std::size_t output = col + mix + h * 2 * lc + std::size_t(c.vocab_size) * 4 * lc +
+                               (head_tc ? ops::projection_tc_workspace_bytes(i32(h), i32(c.vocab_size), logit_cols) : 0);
+    // Each allocation pads to 256 bytes; a visit makes about 60. The stages are each an upper bound (the golden test's
+    // layout harness prints the peak against it), so the margin is small.
+    return persistent + std::max(crossing + std::max({inputs, attention, moe}), output) + (c.num_layer_visits * 2 + 64) * kAlign * 4 +
+           (16U << 20);
+}
+
+// The most a forward of `cols` columns leaves allocated when it returns, from the workspace's start: its token ids,
+// the embedding and the pooled visit outputs, the output's mixed state and BF16 head input, and the logits (run()).
+std::size_t result_bytes(const TextConfig& c, std::int32_t cols, std::int32_t logit_cols) {
+    const std::size_t h = c.hidden_size, t = static_cast<std::size_t>(cols), lc = static_cast<std::size_t>(logit_cols);
+    return padded(t * 4) + (static_cast<std::size_t>(max_live_outputs(c)) + 1) * padded(h * 4 * t) + padded(h * 4 * t) + padded(h * 2 * lc) +
+           padded(std::size_t(c.vocab_size) * 4 * lc) + 16 * kAlign;
+}
+
+// The workspace of every forward the limits allow: a prefill chunk (its last column's logits with last_logits) and
+// the narrow forwards (decode, verification, batched decode), whose attention may split its keys.
+std::size_t workspace_bytes(const TextConfig& c, const ProgramLimits& l, QType expert_format) {
+    const std::int32_t narrow = std::max({1, l.max_rollback, l.slots > 1 ? kMaxBatchColumns : 1});
+    // Every column's logits, except with last_logits past the rollback; a batched decode (forward_batch, up to
+    // kMaxBatchColumns slots) returns all of its columns' whatever last_logits says.
+    const auto logit_cols = [&](std::int32_t cols) {
+        const bool batch = l.slots > 1 && cols <= kMaxBatchColumns;
+        return l.last_logits && !batch && cols > std::max(1, l.max_rollback) ? 1 : cols;
+    };
+    std::size_t most          = 0;
+    for (const std::int32_t cols : {l.max_chunk, std::min(l.max_chunk, narrow), std::min(l.max_chunk, ops::kSplitMaxColumns)}) {
+        const bool split = l.split_attention && cols <= ops::kSplitMaxColumns, saving = cols >= 2 && cols <= l.max_rollback;
+        most = std::max(most, forward_bytes(c, cols, logit_cols(cols), split, saving, l.max_context, l.prefill_tc, expert_format, l.dense));
+        // The lent region sits above every result.
+        if (l.lend_bytes > 0) { most = std::max(most, result_bytes(c, cols, logit_cols(cols)) + padded(l.lend_bytes)); }
+    }
+    return most;
 }
 
 // BF16 when any layer's experts are BF16 banks (their tensor-core route stages more), else the records' format.
@@ -133,15 +174,10 @@ ProgramLimits checked(ProgramLimits limits) {
 
 TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t stream)
     : model_(model), config_(model.config()), limits_(limits), stream_(stream),
-      workspace_(std::max(limits.min_workspace_bytes,
-                          workspace_bytes(model.config(), checked(limits).max_chunk, limits.max_context, limits.split_attention,
-                                          std::max(limits.last_logits ? std::max(1, limits.max_rollback) : limits.max_chunk,
-                                                   limits.slots > 1 ? std::min(kMaxBatchColumns, limits.max_chunk) : 0),
-                                          limits.prefill_tc,
-                                          widest_expert_format(model), limits.dense))) {
+      workspace_(std::max(limits.min_workspace_bytes, workspace_bytes(model.config(), checked(limits), widest_expert_format(model)))) {
     const TextConfig& c = config_;
     const std::size_t kv = std::size_t(c.kv_heads) * c.head_dim, taps = c.conv_kernel_size - 1;
-    const std::size_t local_cap = c.sliding_window - 1 + static_cast<std::size_t>(limits.max_chunk);
+    const std::size_t local_cap = c.sliding_window - 1 + static_cast<std::size_t>(local_ring_chunk(limits.max_chunk));
     const DType ring = limits.kv_fp16 ? DType::FP16 : DType::FP32; // the KV rings' values
     const std::size_t ring_bytes = dtype_size(ring);
     // One slot's state (its rings and histories), then the one copy of the rollback state and taps.
@@ -208,6 +244,12 @@ TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t 
         select(slot);
         reset();
     }
+}
+
+DeviceSpan TextProgram::lent() noexcept {
+    if (limits_.lend_bytes == 0) { return {}; }
+    const std::size_t bytes = padded(limits_.lend_bytes);
+    return {static_cast<std::byte*>(workspace_.base()) + (workspace_.capacity() - bytes) / kAlign * kAlign, bytes};
 }
 
 void TextProgram::select(std::int32_t slot) {
@@ -437,7 +479,8 @@ void TextProgram::control(std::span<const ControllerWeights* const> w, std::span
     ops::loop_controller_fp32(std::span<const ops::LoopControllerJob>(jobs.data(), w.size()), config_.rms_norm_eps, workspace_, stream_);
 }
 
-Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor>& blocks, const Tensor* messages, Tensor next, std::int64_t start,
+Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor>& blocks, std::span<const Tensor* const> loop_sources, Tensor next,
+                          std::int64_t start,
                           const Trace* trace) {
     const TextConfig& c   = config_;
     const std::uint32_t p = c.physical(v);
@@ -448,207 +491,265 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
                        kv = i32(c.kv_heads * c.head_dim), q = heads * d, rel = heads * i32(c.d_rel), k = i32(c.conv_kernel_size);
     const float eps = c.rms_norm_eps;
 
-    // The output is the caller's (blocks and the loop bookkeeping keep it); everything else is scoped.
-    const auto scope = workspace_.scope();
-    Tensor ffn_inp = workspace_.alloc(DType::FP32, {h, cols});
-
-    // 3b-3d: attention inputs by depth attention, loop messages, input norms.
-    Tensor xq = cur, xk = cur, xv = cur;
-    if (p > 0) {
-        std::vector<const Tensor*> sources;
-        for (const Tensor& b : blocks) { sources.push_back(&b); }
-        sources.push_back(&cur);
-        if (local) {
-            xq = xk = xv = workspace_.alloc(DType::FP32, {h, cols});
-            Tensor* outs[] = {&xq};
-            ops::depth_attention_mix(sources, model_.tensor(w.res_query, {h, 1}), eps, workspace_, outs, stream_);
-        } else {
-            xq = workspace_.alloc(DType::FP32, {h, cols});
-            xk = workspace_.alloc(DType::FP32, {h, cols});
-            xv = workspace_.alloc(DType::FP32, {h, cols});
-            Tensor* outs[] = {&xq, &xk, &xv};
-            ops::depth_attention_mix(sources, model_.tensor(w.res_query, {h, 3}), eps, workspace_, outs, stream_);
-        }
-    }
-    if (messages != nullptr) {
-        Tensor cq = workspace_.alloc(DType::FP32, {h, cols}), ck = workspace_.alloc(DType::FP32, {h, cols}),
-               cv = workspace_.alloc(DType::FP32, {h, cols});
-        const ControllerWeights* cw[] = {&w.loop[0], &w.loop[1], &w.loop[2]};
-        const Tensor* cin[] = {&xq, &xk, &xv};
-        const Tensor* min[] = {&messages[0], &messages[1], &messages[2]};
-        Tensor* cout[] = {&cq, &ck, &cv};
-        control(cw, cin, min, cout);
-        xq = cq;
-        xk = ck;
-        xv = cv;
-    }
-    // A local visit without loop messages has one input for q, k and v (one MIX query, one norm): normalize it once
-    // and project k and v in one call.
-    const bool one_input = local && messages == nullptr;
-    Tensor nq = workspace_.alloc(DType::BF16, {h, cols}), nk = nq, nv = nq;
-    if (!one_input) {
-        nk = workspace_.alloc(DType::BF16, {h, cols});
-        nv = workspace_.alloc(DType::BF16, {h, cols});
-    }
-    {
-        const Tensor gq = model_.tensor(local ? w.norm : w.q_norm, {h});
-        const Tensor gk = local ? gq : model_.tensor(w.k_norm, {h}), gv = local ? gq : model_.tensor(w.v_norm, {h});
-        const ops::RmsNormJob norms[] = {{&xq, &gq, &nq}, {&xk, &gk, &nk}, {&xv, &gv, &nv}};
-        ops::rmsnorm_fp32_batch(std::span<const ops::RmsNormJob>(norms, one_input ? 1 : 3), eps, stream_);
-    }
-
-    // 3e: projections and short convolutions.
-    // One input for q, k and v: k and v ride in the q call (one launch, one longer read; a row's bits depend only on K).
-    const WeightId q_weights[] = {w.q, w.rel, w.gate, w.sink, w.k, w.v};
-    const std::int32_t q_rows[] = {q, rel, q, heads, kv, kv};
-    const std::int32_t dyn_rows = i32(c.kv_heads) * k;
-    // Separate k and v inputs at decode widths: every projection of the visit in one launch too (each row by its own
-    // input, the same bits), unless the weights run over the 8-bit re-encoding.
-    const bool reencoded = limits_.dense != nullptr && limits_.dense->find(model_.tensor(w.q, {h, q}).data) != nullptr;
-    const bool joint     = !one_input && cols <= 8 && !reencoded;
-    Tensor pq;
-    if (joint) {
-        const WeightId all[] = {w.q, w.rel, w.gate, w.sink, w.k, local ? w.v : w.k_conv_proj, w.v, w.v_conv_proj};
-        const std::int32_t all_rows[] = {q, rel, q, heads, kv, local ? kv : dyn_rows, kv, dyn_rows};
-        const Tensor* inputs[] = {&nq, &nq, &nq, &nq, &nk, local ? &nv : &nk, &nv, &nv};
-        pq = project_inputs(std::span<const Tensor* const>(inputs, local ? 6 : 8), std::span<const WeightId>(all, local ? 6 : 8),
-                            std::span<const std::int32_t>(all_rows, local ? 6 : 8));
-    } else {
-        pq = project(nq, std::span<const WeightId>(q_weights, one_input ? 6 : 4), std::span<const std::int32_t>(q_rows, one_input ? 6 : 4));
-    }
-    Tensor q_t = pq.slice(0, 0, q), r_t = pq.slice(0, q, rel), gate = pq.slice(0, q + rel, q), sink = pq.slice(0, 2 * q + rel, heads);
-    const std::int32_t tail = 2 * q + rel + heads; // the first row after the q group
-    Tensor kconv = workspace_.alloc(DType::FP32, {kv, cols}), vconv = workspace_.alloc(DType::FP32, {kv, cols});
-    if (local) {
-        Tensor pk, pv;
-        if (one_input || joint) {
-            pk = pq.slice(0, tail, kv);
-            pv = pq.slice(0, tail + kv, kv);
-        } else {
-            const WeightId kw[] = {w.k}, vw[] = {w.v};
-            const std::int32_t kr[] = {kv};
-            pk = project(nk, kw, kr);
-            pv = project(nv, vw, kr);
-        }
-        const Tensor kt = model_.tensor(w.k_conv, {k, kv}), vt = model_.tensor(w.v_conv, {k, kv});
-        ops::ShortConvJob jobs[2];
-        jobs[0].x = &pk, jobs[0].taps = &kt, jobs[0].history = &st.k_hist, jobs[0].out = &kconv;
-        jobs[1].x = &pv, jobs[1].taps = &vt, jobs[1].history = &st.v_hist, jobs[1].out = &vconv;
-        save_input(st.k_saved, pk);
-        save_input(st.v_saved, pv);
-        ops::short_conv_fp32_batch(jobs, d, stream_, columns_);
-    } else {
-        Tensor pk, pv;
-        if (joint) {
-            pk = pq.slice(0, tail, kv + dyn_rows);
-            pv = pq.slice(0, tail + kv + dyn_rows, kv + dyn_rows);
-        } else {
-            const WeightId kw[] = {w.k, w.k_conv_proj}, vw[] = {w.v, w.v_conv_proj};
-            const std::int32_t kr[] = {kv, dyn_rows};
-            pk = project(nk, kw, kr);
-            pv = project(nv, vw, kr);
-        }
-        const Tensor kd = pk.slice(0, kv, dyn_rows), vd = pv.slice(0, kv, dyn_rows);
-        const Tensor kx = pk.slice(0, 0, kv), vx = pv.slice(0, 0, kv);
-        const Tensor kt = model_.tensor(w.k_conv, {k, kv}), vt = model_.tensor(w.v_conv, {k, kv});
-        ops::ShortConvJob jobs[2];
-        jobs[0].x = &kx, jobs[0].taps = &kt, jobs[0].dynamic = &kd, jobs[0].history = &st.k_hist, jobs[0].out = &kconv;
-        jobs[1].x = &vx, jobs[1].taps = &vt, jobs[1].dynamic = &vd, jobs[1].history = &st.v_hist, jobs[1].out = &vconv;
-        save_input(st.k_saved, kx);
-        save_input(st.v_saved, vx);
-        ops::short_conv_fp32_batch(jobs, d, stream_, columns_);
-    }
-
-    // 3f: clips, value norm, log scaling of the global layers' q and r.
-    const ops::PositionLogScale tau{start, c.log_scaling_n_floor, c.log_scaling_alpha, start_offset_};
-    const Tensor q_clip = model_.tensor(w.q_clip, {d, heads}), rel_clip = model_.tensor(w.rel_clip, {i32(c.d_rel), heads});
-    {
-        ops::HeadNormJob jobs[4];
-        jobs[0].x = &q_t, jobs[0].head_dim = d, jobs[0].scale = &q_clip, jobs[0].threshold = c.qk_clip;
-        jobs[0].log_scale = local ? nullptr : &tau;
-        jobs[1].x = &r_t, jobs[1].head_dim = i32(c.d_rel), jobs[1].scale = &rel_clip, jobs[1].threshold = c.rel_clip;
-        jobs[1].log_scale = local ? nullptr : &tau;
-        // The k and v norms also append the normalized columns to the visit's ring (the attention then does not).
-        const ops::KvAppend k_append{&st.k_cache, start, start_offset_}, v_append{&st.v_cache, start, start_offset_};
-        jobs[2].x = &kconv, jobs[2].head_dim = d, jobs[2].threshold = c.qk_clip, jobs[2].append = &k_append;
-        jobs[3].x = &vconv, jobs[3].head_dim = d, jobs[3].unit_rms = true, jobs[3].eps = eps, jobs[3].append = &v_append;
-        ops::head_norms_fp32(jobs, stream_, columns_);
-    }
-
-    // 3g: attention, output gate, output projection and its convolution.
-    ops::RelativeBiasAttentionShape shape{heads, i32(c.kv_heads), d, i32(c.d_rel), local ? i32(c.sliding_window) : 0};
-    const Tensor rel_bias = model_.tensor(w.rel_bias, {i32(c.d_rel), i32(c.rel_extent_of(p))});
-    Tensor gated = workspace_.alloc(DType::BF16, {q, cols}); // the attention output times sigmoid(gate)
-    const std::size_t split_bytes =
-        limits_.split_attention && graph_split_ ? ops::relative_bias_attention_split_bytes(shape, cols, st.k_cache.ne[1]) : 0;
-    const Tensor split = split_bytes > 0 ? workspace_.alloc(DType::FP32, {i32(split_bytes / 4)}) : Tensor{};
-    ops::relative_bias_sink_attention(shape, q_t, r_t, sink, nullptr, nullptr, rel_bias, st.k_cache, st.v_cache, start, start_offset_, &gate,
-                                      gated, stream_, split_bytes > 0 ? &split : nullptr,
-                                      split_bytes > 0 ? static_cast<std::int32_t*>(split_counters_.p) : nullptr,
-                                      limits_.prefill_tc.attention && cols >= kTensorCoreMinColumns, columns_);
-    const WeightId ow[] = {w.output};
-    const std::int32_t orows[] = {h};
-    Tensor a_in = project(gated, ow, orows);
-    // A selected LoRA on this layer's wo_ud: a_in += scale B (A gated), in FP32 (adapters.h).
-    if (adapters_.lora != nullptr && adapters_.lora->a.at(p) != nullptr) {
-        ops::low_rank_update_fp32(gated, adapters_.lora->a[p], adapters_.lora->b[p], adapters_.lora->rank, adapters_.lora->scale, a_in, stream_);
-    }
-    Tensor a = workspace_.alloc(DType::FP32, {h, cols});
-    const Tensor post_taps = model_.tensor(w.post_conv, {k, h});
-
+    // The output is the caller's (blocks and the loop bookkeeping keep it); everything else is scoped, each temporary
+    // released once its stage is done: the mixed inputs and controller outputs once normed, the attention half's
+    // temporaries before the MoE half allocates its own (only ffn_inp, a and the MoE's loop message cross over), the
+    // routing's input once routed. Only the addresses depend on this (forward_bytes sizes it).
+    const auto scope        = workspace_.scope();
+    const bool boundary     = p % c.attn_res_block_size == 0; // a block's first layer starts from a alone (3h)
+    const bool has_messages = !loop_sources.empty();
+    Tensor ffn_inp          = workspace_.alloc(DType::FP32, {h, cols});
+    Tensor a                = boundary ? ffn_inp : workspace_.alloc(DType::FP32, {h, cols}); // at a boundary a is ffn_inp
+    // 3a: the loop messages of a later pass's core layer (attn, k, v, mlp), mixed from the previous pass's bank.
+    std::array<Tensor, 4> messages;
+    if (has_messages) { messages[3] = workspace_.alloc(DType::FP32, {h, cols}); }
     // A selected ablation graft's weights at this visit (adapters.h): a nonzero one removes its direction from the
     // convolution's output before the residual add, which then runs on its own; zero keeps the fused add.
     const DeviceAblation* ablation = adapters_.ablation;
     const float attn_w = ablation != nullptr ? ablation->attn_w.at(v) : 0.0F, mlp_w = ablation != nullptr ? ablation->mlp_w.at(v) : 0.0F;
-
-    // 3h: the convolution with the residual and block boundary: a block's first layer starts from a alone.
     {
-        const bool boundary = p % c.attn_res_block_size == 0;
-        if (boundary) { blocks.push_back(cur); }
-        ops::ShortConvJob job;
-        job.x = &a_in, job.taps = &post_taps, job.history = &st.attn_hist;
-        save_input(st.attn_saved, a_in);
-        if (boundary) {
-            job.out = &ffn_inp;
-        } else if (attn_w != 0.0F) {
-            job.out = &a;
+        const auto attention_scope = workspace_.scope();
+
+        // A local visit without loop messages has one input for q, k and v (one MIX query, one norm): normalize it once
+        // and project k and v in one call.
+        const bool one_input = local && !has_messages;
+        Tensor nq = workspace_.alloc(DType::BF16, {h, cols}), nk = nq, nv = nq;
+        if (!one_input) {
+            nk = workspace_.alloc(DType::BF16, {h, cols});
+            nv = workspace_.alloc(DType::BF16, {h, cols});
+        }
+        {
+            const auto inputs_scope = workspace_.scope(); // the messages but the MoE's, the mixed and controlled inputs
+            // 3b-3d: attention inputs by depth attention, loop messages, input norms.
+            Tensor xq = cur, xk = cur, xv = cur;
+            if (p > 0) {
+                std::vector<const Tensor*> sources;
+                for (const Tensor& b : blocks) { sources.push_back(&b); }
+                sources.push_back(&cur);
+                if (local) {
+                    xq = xk = xv = workspace_.alloc(DType::FP32, {h, cols});
+                    Tensor* outs[] = {&xq};
+                    ops::depth_attention_mix(sources, model_.tensor(w.res_query, {h, 1}), eps, workspace_, outs, stream_);
+                } else {
+                    xq = workspace_.alloc(DType::FP32, {h, cols});
+                    xk = workspace_.alloc(DType::FP32, {h, cols});
+                    xv = workspace_.alloc(DType::FP32, {h, cols});
+                    Tensor* outs[] = {&xq, &xk, &xv};
+                    ops::depth_attention_mix(sources, model_.tensor(w.res_query, {h, 3}), eps, workspace_, outs, stream_);
+                }
+            }
+            if (has_messages) {
+                const std::int32_t jc = i32(p - c.loop_core_start);
+                for (const std::size_t m : {0U, 1U, 2U}) { messages[m] = workspace_.alloc(DType::FP32, {h, cols}); }
+                Tensor* attn_mlp[] = {&messages[0], &messages[3]};
+                Tensor* k_v[]      = {&messages[1], &messages[2]};
+                const Tensor loop_q  = model_.tensor(model_.weights().loop_res_query, {h, i32(2 * c.core_layers())});
+                const Tensor loop_kv = model_.tensor(model_.weights().loop_kv_res_query, {h, i32(2 * c.core_layers())});
+                ops::depth_attention_mix(loop_sources, loop_q.slice(1, 2 * jc, 2), eps, workspace_, attn_mlp, stream_);
+                ops::depth_attention_mix(loop_sources, loop_kv.slice(1, 2 * jc, 2), eps, workspace_, k_v, stream_);
+                Tensor cq = workspace_.alloc(DType::FP32, {h, cols}), ck = workspace_.alloc(DType::FP32, {h, cols}),
+                       cv = workspace_.alloc(DType::FP32, {h, cols});
+                const ControllerWeights* cw[] = {&w.loop[0], &w.loop[1], &w.loop[2]};
+                const Tensor* cin[] = {&xq, &xk, &xv};
+                const Tensor* min[] = {&messages[0], &messages[1], &messages[2]};
+                Tensor* cout[] = {&cq, &ck, &cv};
+                control(cw, cin, min, cout);
+                xq = cq;
+                xk = ck;
+                xv = cv;
+            }
+            {
+                const Tensor gq = model_.tensor(local ? w.norm : w.q_norm, {h});
+                const Tensor gk = local ? gq : model_.tensor(w.k_norm, {h}), gv = local ? gq : model_.tensor(w.v_norm, {h});
+                const ops::RmsNormJob norms[] = {{&xq, &gq, &nq}, {&xk, &gk, &nk}, {&xv, &gv, &nv}};
+                ops::rmsnorm_fp32_batch(std::span<const ops::RmsNormJob>(norms, one_input ? 1 : 3), eps, stream_);
+            }
+        }
+
+        // 3e: projections and short convolutions.
+        // One input for q, k and v: k and v ride in the q call (one launch, one longer read; a row's bits depend only on K).
+        const WeightId q_weights[] = {w.q, w.rel, w.gate, w.sink, w.k, w.v};
+        const std::int32_t q_rows[] = {q, rel, q, heads, kv, kv};
+        const std::int32_t dyn_rows = i32(c.kv_heads) * k;
+        // Separate k and v inputs at decode widths: every projection of the visit in one launch too (each row by its own
+        // input, the same bits), unless the weights run over the 8-bit re-encoding.
+        const bool reencoded = limits_.dense != nullptr && limits_.dense->find(model_.tensor(w.q, {h, q}).data) != nullptr;
+        const bool joint     = !one_input && cols <= 8 && !reencoded;
+        Tensor pq;
+        if (joint) {
+            const WeightId all[] = {w.q, w.rel, w.gate, w.sink, w.k, local ? w.v : w.k_conv_proj, w.v, w.v_conv_proj};
+            const std::int32_t all_rows[] = {q, rel, q, heads, kv, local ? kv : dyn_rows, kv, dyn_rows};
+            const Tensor* inputs[] = {&nq, &nq, &nq, &nq, &nk, local ? &nv : &nk, &nv, &nv};
+            pq = project_inputs(std::span<const Tensor* const>(inputs, local ? 6 : 8), std::span<const WeightId>(all, local ? 6 : 8),
+                                std::span<const std::int32_t>(all_rows, local ? 6 : 8));
         } else {
-            job.out = &a, job.residual = &cur, job.sum = &ffn_inp;
+            pq = project(nq, std::span<const WeightId>(q_weights, one_input ? 6 : 4), std::span<const std::int32_t>(q_rows, one_input ? 6 : 4));
         }
-        ops::short_conv_fp32_batch(std::span<const ops::ShortConvJob>(&job, 1), 1, stream_, columns_);
-        if (attn_w != 0.0F) {
-            // At a boundary the ablated output is ffn_inp itself (in place); otherwise ffn_inp = cur + the ablated a.
-            ops::direction_ablate_fp32(boundary ? ffn_inp : a, ablation->attn_dir[v], attn_w, boundary ? nullptr : &cur, ffn_inp, stream_);
+        Tensor q_t = pq.slice(0, 0, q), r_t = pq.slice(0, q, rel), gate = pq.slice(0, q + rel, q), sink = pq.slice(0, 2 * q + rel, heads);
+        const std::int32_t tail = 2 * q + rel + heads; // the first row after the q group
+        Tensor kconv = workspace_.alloc(DType::FP32, {kv, cols}), vconv = workspace_.alloc(DType::FP32, {kv, cols});
+        if (local) {
+            Tensor pk, pv;
+            if (one_input || joint) {
+                pk = pq.slice(0, tail, kv);
+                pv = pq.slice(0, tail + kv, kv);
+            } else {
+                const WeightId kw[] = {w.k}, vw[] = {w.v};
+                const std::int32_t kr[] = {kv};
+                pk = project(nk, kw, kr);
+                pv = project(nv, vw, kr);
+            }
+            const Tensor kt = model_.tensor(w.k_conv, {k, kv}), vt = model_.tensor(w.v_conv, {k, kv});
+            ops::ShortConvJob jobs[2];
+            jobs[0].x = &pk, jobs[0].taps = &kt, jobs[0].history = &st.k_hist, jobs[0].out = &kconv;
+            jobs[1].x = &pv, jobs[1].taps = &vt, jobs[1].history = &st.v_hist, jobs[1].out = &vconv;
+            save_input(st.k_saved, pk);
+            save_input(st.v_saved, pv);
+            ops::short_conv_fp32_batch(jobs, d, stream_, columns_);
+        } else {
+            Tensor pk, pv;
+            if (joint) {
+                pk = pq.slice(0, tail, kv + dyn_rows);
+                pv = pq.slice(0, tail + kv + dyn_rows, kv + dyn_rows);
+            } else {
+                const WeightId kw[] = {w.k, w.k_conv_proj}, vw[] = {w.v, w.v_conv_proj};
+                const std::int32_t kr[] = {kv, dyn_rows};
+                pk = project(nk, kw, kr);
+                pv = project(nv, vw, kr);
+            }
+            const Tensor kd = pk.slice(0, kv, dyn_rows), vd = pv.slice(0, kv, dyn_rows);
+            const Tensor kx = pk.slice(0, 0, kv), vx = pv.slice(0, 0, kv);
+            const Tensor kt = model_.tensor(w.k_conv, {k, kv}), vt = model_.tensor(w.v_conv, {k, kv});
+            ops::ShortConvJob jobs[2];
+            jobs[0].x = &kx, jobs[0].taps = &kt, jobs[0].dynamic = &kd, jobs[0].history = &st.k_hist, jobs[0].out = &kconv;
+            jobs[1].x = &vx, jobs[1].taps = &vt, jobs[1].dynamic = &vd, jobs[1].history = &st.v_hist, jobs[1].out = &vconv;
+            save_input(st.k_saved, kx);
+            save_input(st.v_saved, vx);
+            ops::short_conv_fp32_batch(jobs, d, stream_, columns_);
         }
-        if (boundary) { a = ffn_inp; } // for the trace
-    }
+
+        // 3f: clips, value norm, log scaling of the global layers' q and r.
+        const ops::PositionLogScale tau{start, c.log_scaling_n_floor, c.log_scaling_alpha, start_offset_};
+        const Tensor q_clip = model_.tensor(w.q_clip, {d, heads}), rel_clip = model_.tensor(w.rel_clip, {i32(c.d_rel), heads});
+        // A local visit's prefill chunk wider than kLocalAttentionSlice + kTensorCoreMinColumns - 1 appends its keys and
+        // attends in pieces of kLocalAttentionSlice columns (the last one longer, at least kTensorCoreMinColumns), so its
+        // ring holds sliding_window - 1 + local_ring_chunk(max_chunk) positions instead of a whole chunk more. Every piece
+        // starts at a multiple of 32 columns and takes the same route as the whole call: each column's keys and sums are
+        // the ones the whole call gives it (the attention reads its keys and tiles by absolute position).
+        std::vector<std::pair<std::int32_t, std::int32_t>> pieces; // (first column, columns)
+        {
+            std::int32_t first = 0;
+            if (local) {
+                while (cols - first >= kLocalAttentionSlice + kTensorCoreMinColumns) {
+                    pieces.emplace_back(first, kLocalAttentionSlice);
+                    first += kLocalAttentionSlice;
+                }
+            }
+            pieces.emplace_back(first, cols - first);
+        }
+        const auto piece_of = [](const Tensor& t, std::pair<std::int32_t, std::int32_t> piece) {
+            return piece.first == 0 && piece.second == t.ne[1] ? t : t.slice(1, piece.first, piece.second);
+        };
+        {
+            ops::HeadNormJob jobs[4];
+            jobs[0].x = &q_t, jobs[0].head_dim = d, jobs[0].scale = &q_clip, jobs[0].threshold = c.qk_clip;
+            jobs[0].log_scale = local ? nullptr : &tau;
+            jobs[1].x = &r_t, jobs[1].head_dim = i32(c.d_rel), jobs[1].scale = &rel_clip, jobs[1].threshold = c.rel_clip;
+            jobs[1].log_scale = local ? nullptr : &tau;
+            // The k and v norms also append the normalized columns to the visit's ring (the attention then does not); with
+            // pieces, each piece's just before its attention (below).
+            const ops::KvAppend k_append{&st.k_cache, start, start_offset_}, v_append{&st.v_cache, start, start_offset_};
+            jobs[2].x = &kconv, jobs[2].head_dim = d, jobs[2].threshold = c.qk_clip, jobs[2].append = &k_append;
+            jobs[3].x = &vconv, jobs[3].head_dim = d, jobs[3].unit_rms = true, jobs[3].eps = eps, jobs[3].append = &v_append;
+            ops::head_norms_fp32(std::span<const ops::HeadNormJob>(jobs, pieces.size() == 1 ? 4 : 2), stream_, columns_);
+        }
+
+        // 3g: attention, output gate, output projection and its convolution.
+        ops::RelativeBiasAttentionShape shape{heads, i32(c.kv_heads), d, i32(c.d_rel), local ? i32(c.sliding_window) : 0};
+        const Tensor rel_bias = model_.tensor(w.rel_bias, {i32(c.d_rel), i32(c.rel_extent_of(p))});
+        Tensor gated = workspace_.alloc(DType::BF16, {q, cols}); // the attention output times sigmoid(gate)
+        const std::size_t split_bytes =
+            limits_.split_attention && graph_split_ ? ops::relative_bias_attention_split_bytes(shape, cols, st.k_cache.ne[1]) : 0;
+        const Tensor split = split_bytes > 0 ? workspace_.alloc(DType::FP32, {i32(split_bytes / 4)}) : Tensor{};
+        const bool tiled = limits_.prefill_tc.attention && cols >= kTensorCoreMinColumns;
+        if (pieces.size() == 1) {
+            ops::relative_bias_sink_attention(shape, q_t, r_t, sink, nullptr, nullptr, rel_bias, st.k_cache, st.v_cache, start, start_offset_, &gate,
+                                              gated, stream_, split_bytes > 0 ? &split : nullptr,
+                                              split_bytes > 0 ? static_cast<std::int32_t*>(split_counters_.p) : nullptr, tiled, columns_);
+        } else {
+            for (const auto& piece : pieces) {
+                Tensor kp = piece_of(kconv, piece), vp = piece_of(vconv, piece);
+                const std::int64_t at = start + piece.first;
+                const ops::KvAppend k_append{&st.k_cache, at, nullptr}, v_append{&st.v_cache, at, nullptr};
+                ops::HeadNormJob jobs[2];
+                jobs[0].x = &kp, jobs[0].head_dim = d, jobs[0].threshold = c.qk_clip, jobs[0].append = &k_append;
+                jobs[1].x = &vp, jobs[1].head_dim = d, jobs[1].unit_rms = true, jobs[1].eps = eps, jobs[1].append = &v_append;
+                ops::head_norms_fp32(jobs, stream_, nullptr);
+                const Tensor qp = piece_of(q_t, piece), rp = piece_of(r_t, piece), sp = piece_of(sink, piece), gp = piece_of(gate, piece);
+                Tensor op = piece_of(gated, piece);
+                ops::relative_bias_sink_attention(shape, qp, rp, sp, nullptr, nullptr, rel_bias, st.k_cache, st.v_cache, at, nullptr, &gp, op, stream_,
+                                                  nullptr, nullptr, tiled, nullptr);
+            }
+        }
+        const WeightId ow[] = {w.output};
+        const std::int32_t orows[] = {h};
+        Tensor a_in = project(gated, ow, orows);
+        // A selected LoRA on this layer's wo_ud: a_in += scale B (A gated), in FP32 (adapters.h).
+        if (adapters_.lora != nullptr && adapters_.lora->a.at(p) != nullptr) {
+            ops::low_rank_update_fp32(gated, adapters_.lora->a[p], adapters_.lora->b[p], adapters_.lora->rank, adapters_.lora->scale, a_in, stream_);
+        }
+        const Tensor post_taps = model_.tensor(w.post_conv, {k, h});
+
+        // 3h: the convolution with the residual and block boundary: a block's first layer starts from a alone.
+        {
+            if (boundary) { blocks.push_back(cur); }
+            ops::ShortConvJob job;
+            job.x = &a_in, job.taps = &post_taps, job.history = &st.attn_hist;
+            save_input(st.attn_saved, a_in);
+            if (boundary) {
+                job.out = &ffn_inp;
+            } else if (attn_w != 0.0F) {
+                job.out = &a;
+            } else {
+                job.out = &a, job.residual = &cur, job.sum = &ffn_inp;
+            }
+            ops::short_conv_fp32_batch(std::span<const ops::ShortConvJob>(&job, 1), 1, stream_, columns_);
+            if (attn_w != 0.0F) {
+                // At a boundary the ablated output is ffn_inp itself (in place); otherwise ffn_inp = cur + the ablated a.
+                ops::direction_ablate_fp32(boundary ? ffn_inp : a, ablation->attn_dir[v], attn_w, boundary ? nullptr : &cur, ffn_inp, stream_);
+            }
+        }
+    } // the attention half's temporaries
 
     // 3i-3j: MoE input by depth attention, loop message, norm, routed experts, output convolution.
     std::vector<const Tensor*> sources;
     for (const Tensor& b : blocks) { sources.push_back(&b); }
     sources.push_back(&ffn_inp);
-    Tensor z = workspace_.alloc(DType::FP32, {h, cols});
-    {
-        Tensor* outs[] = {&z};
-        ops::depth_attention_mix(sources, model_.tensor(w.ffn_res_query, {h, 1}), eps, workspace_, outs, stream_);
-    }
-    if (messages != nullptr) {
-        Tensor zc = workspace_.alloc(DType::FP32, {h, cols});
-        const ControllerWeights* cw[] = {&w.loop[3]};
-        const Tensor* cin[] = {&z};
-        const Tensor* min[] = {&messages[3]};
-        Tensor* cout[] = {&zc};
-        control(cw, cin, min, cout);
-        z = zc;
-    }
     // The FFN norm is formed by the routing launch (the same bits as rmsnorm_fp32), into zn.
     const Tensor ffn_norm = model_.tensor(w.ffn_norm, {h});
     Tensor zn = workspace_.alloc(DType::FP32, {h, cols});
     const ops::RouteInputNorm norm{&ffn_norm, eps, &zn};
     const std::int32_t top_k = i32(c.experts_per_token);
     Tensor ids = workspace_.alloc(DType::I32, {top_k, cols}), weights = workspace_.alloc(DType::FP32, {top_k, cols});
-    ops::moe_route_sigmoid_topk(z, &norm, model_.tensor(w.router, {h, i32(c.experts)}), model_.tensor(w.router_bias, {i32(c.experts)}),
-                                top_k, c.route_scale, workspace_, ids, weights, stream_);
+    {
+        const auto route_scope = workspace_.scope(); // z (and its controller's output), dead once routed
+        Tensor z = workspace_.alloc(DType::FP32, {h, cols});
+        {
+            Tensor* outs[] = {&z};
+            ops::depth_attention_mix(sources, model_.tensor(w.ffn_res_query, {h, 1}), eps, workspace_, outs, stream_);
+        }
+        if (has_messages) {
+            Tensor zc = workspace_.alloc(DType::FP32, {h, cols});
+            const ControllerWeights* cw[] = {&w.loop[3]};
+            const Tensor* cin[] = {&z};
+            const Tensor* min[] = {&messages[3]};
+            Tensor* cout[] = {&zc};
+            control(cw, cin, min, cout);
+            z = zc;
+        }
+        ops::moe_route_sigmoid_topk(z, &norm, model_.tensor(w.router, {h, i32(c.experts)}), model_.tensor(w.router_bias, {i32(c.experts)}),
+                                    top_k, c.route_scale, workspace_, ids, weights, stream_);
+    }
     // The experts' outputs are combined by the output convolution's launch (the same FMAs as the experts' own
     // combine); the combined y is written out only when the convolution inputs are being saved.
     Tensor entries = workspace_.alloc(DType::FP32, {h, top_k * cols});
@@ -664,12 +765,12 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         ops::ShortConvJob job;
         job.combine = &combine, job.taps = &mlp_taps, job.history = &st.mlp_hist;
         if (mlp_w != 0.0F) {
-            job.out = &z; // z (the routing's input) is dead once the experts ran: the convolution's output, then ablated
+            job.out = &zn; // zn (the experts' input) is dead once they ran: the convolution's output, then ablated
         } else {
             job.residual = &ffn_inp, job.sum = &next;
         }
         ops::short_conv_fp32_batch(std::span<const ops::ShortConvJob>(&job, 1), 1, stream_, columns_);
-        if (mlp_w != 0.0F) { ops::direction_ablate_fp32(z, ablation->mlp_dir[v], mlp_w, &ffn_inp, next, stream_); }
+        if (mlp_w != 0.0F) { ops::direction_ablate_fp32(zn, ablation->mlp_dir[v], mlp_w, &ffn_inp, next, stream_); }
         save_input(st.mlp_saved, y);
     }
 
@@ -938,8 +1039,6 @@ Tensor TextProgram::run(const Tensor& ids, std::int64_t start, const Trace* trac
         }
         throw std::logic_error("inkling2: the visit output pool is exhausted");
     };
-    const Tensor loop_q = model_.tensor(model_.weights().loop_res_query, {h, i32(2 * c.core_layers())});
-    const Tensor loop_kv = model_.tensor(model_.weights().loop_kv_res_query, {h, i32(2 * c.core_layers())});
     for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
         const std::uint32_t p = c.physical(v), pass = c.pass(v);
         const bool core = c.is_core(p);
@@ -955,22 +1054,14 @@ Tensor TextProgram::run(const Tensor& ids, std::int64_t start, const Trace* trac
             }
         }
         Tensor next = take_slot();
-        const auto visit_scope = workspace_.scope(); // the loop messages and the visit's temporaries
-        std::array<Tensor, 4> messages; // attn, k, v, mlp
-        const bool has_messages = core && pass > 0;
-        if (has_messages) {
-            const std::int32_t j = i32(p - c.loop_core_start);
-            for (Tensor& m : messages) { m = workspace_.alloc(DType::FP32, {h, cols}); }
-            std::vector<const Tensor*> sources;
-            for (const Tensor& b : bank) { sources.push_back(&b); }
-            sources.push_back(&bank_last);
-            Tensor* attn_mlp[] = {&messages[0], &messages[3]};
-            Tensor* k_v[]      = {&messages[1], &messages[2]};
-            ops::depth_attention_mix(sources, loop_q.slice(1, 2 * j, 2), c.rms_norm_eps, workspace_, attn_mlp, stream_);
-            ops::depth_attention_mix(sources, loop_kv.slice(1, 2 * j, 2), c.rms_norm_eps, workspace_, k_v, stream_);
+        // A later pass's core layer mixes its loop messages from the previous pass's bank (inside visit()).
+        std::vector<const Tensor*> loop_sources;
+        if (core && pass > 0) {
+            for (const Tensor& b : bank) { loop_sources.push_back(&b); }
+            loop_sources.push_back(&bank_last);
         }
         copy_tap(v, cur);
-        cur = visit(v, cur, blocks, has_messages ? messages.data() : nullptr, next, start, trace);
+        cur = visit(v, cur, blocks, loop_sources, next, start, trace);
     }
 
     // 4: output.
