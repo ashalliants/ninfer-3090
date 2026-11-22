@@ -1,5 +1,60 @@
 # TODO
 
+## Per-layer KV precision for the 27B, measurement first, 2026-11-22
+
+Open, nothing implemented. Draft PR `exp/qwen-per-layer-kv-precision` carries this plan and its
+handoff. Idea (from Inkling-2-Mini, `docs/maintainer/inkling2-model.md`): per-visit KV sensitivity
+fell about 10x from the first to the last global visit (KLD 6.9e-3 to 0.6e-3 at 4 bits), and
+rotated K8V8 sat at the FP16 noise floor. If the 27B's 16 full-attention layers (indices 3, 7, ...,
+63) behave alike, the early layers could keep `int8` while the later ones take `rk4v4`, freeing KV
+for context at a smaller quality cost than all-`rk4v4`. Lossy, so opt-in only; `--kv-dtype` and
+every default stay as they are. Not applicable to Flash-Next: it accepts only INT8-G64
+(`runtime/engine/qwen4_exp_instance.cpp`) and its QSA reads at most a 2,048-token budget per query.
+
+**Step 1, the measurement, needs per-layer storage too.** There is no lossy-one-layer mode to borrow:
+the storage format is chosen once per cache, so "only layer L lossy" already needs the cache layout
+to differ by layer. The Ops do not: every attention and append Op takes its format from the
+`PagedKVLayerView`/`PagedKVBatchLayerView` it is given (`core/paged_kv_cache.h`), and nothing in
+`models/qwen3_5/execution` reads a model-wide format. So the measurement build is the per-layer
+layout below, reached from `ninfer-perplexity` only, with everything that persists or replays KV
+refused while a mix is set:
+
+1. `models/qwen3_5/state/decoder_state.{h,cpp}`: `DecoderStateSpec::kv_storage` and
+   `PagedKVCacheLayout::storage` become one format per full-attention layer.
+   `plan_cache` builds each layer's planes from its own `ops::d256_kv_cache_profile` (2 planes, or 4
+   when scaled); `PagedKVCache::layer_view`/`layer_rank` compute plane offsets from a per-layer prefix
+   instead of `layer * (scaled ? 4 : 2)`. The MTP cache keeps one format.
+2. Sizing: `load.cpp` (`default_stage_layers`, `StageSizing::kv_storage`) and the startup plan's KV
+   bytes per token (`program/planning/startup.cpp`, `kv_capacity_increment_bytes`) sum the
+   per-layer page sizes.
+3. Workspace and routes: `program/planning/startup.cpp:build_workspace_plan` passes
+   `plan.kv_storage` to `causal_softmax_attention_workspace_capacity_bytes` (target layers, MTP core,
+   draft-context rows, MTP decode core); per layer, take each layer's format (the MTP block keeps the
+   MTP cache's). `planning/graph_profiles.h` (`storage`, which selects the attention routes an MTP
+   or DFlash round captures) and `program/graphs.cpp` / `score_decode.cpp` (`.storage = kv_storage`)
+   need the per-layer formats or the union.
+4. Refused under a mix until each is extended: the context cache and store
+   (`storage/checkpoint_image.cpp` writes one `kv_storage` u32 into the image config;
+   `transactions/context_transaction.cpp:enqueue_layered_restore` assumes `planes % layers == 0`;
+   `storage/host_kv_store.h`, `logical_kv_store.h`), graft KV (`storage/graft_checkpoint.cpp` keys on
+   the one format), the pipeline stages, and lossy long prefill. `context_kv_materialize` already
+   reads the view's format.
+5. `apps/perplexity/main.cpp`: `--kv-dtype-layers L=DTYPE[,L=DTYPE...]` beside `--kv-dtype` (the
+   default for the others), layer numbers being full-attention ordinals 0-15; validation in a
+   host-only test (`tests/cmake/HostOnlyTests.cmake`).
+6. sm_70: `ops/launcher/gqa_attention_volta_flash.cu` has Volta routes for `bf16` and `int8` only;
+   check which route each other format takes on the V100 before measuring its speed there.
+
+**Step 2, only if step 1 finds a mix worth it:** extend (4) so the mix can serve, then expose it on
+`ninfer-serve`/`ninfer` (`EngineOptions`, `docs/cli.md`), still opt-in.
+
+Measure (27B artifact `qwen38-27b`, 17.7 GiB; not on the V100 box today): per layer L and format
+F in {`rk8v4`, `rk4v4`}, layer L at F and the rest at `int8`, `ninfer-perplexity --corpus` on both
+corpora at `--context 65536 --stride 32768`, plus the decode-path `--kld-base` gate against the
+all-`int8` run's summary. Then candidate mixes (first k layers `int8`, the rest `rk4v4`). Decide on
+KV freed against PPL/KLD added, then serve-level context fit and decode/prefill speed on both the
+RTX 3090 and the V100.
+
 ## `--draft-context-rows` above one lane changes committed output, 2026-11-10
 
 Refused at startup (`planning/startup.cpp:validate_target_options`) rather than shipped broken:
